@@ -1,0 +1,21 @@
+[package]
+name = "cyxia-kernel"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cyxia-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+selftest = []
+
+[dependencies]
+cyxia-contracts = { path = "../crates/contracts" }
+cyxia-kernel-core = { path = "../crates/kernel-core" }
+cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }
+cyxia-platform-virt = { path = "../crates/platform-virt" }
+cyxia-driver-pl011 = { path = "../crates/driver-pl011" }
+cyxia-driver-gicv2 = { path = "../crates/driver-gicv2" }

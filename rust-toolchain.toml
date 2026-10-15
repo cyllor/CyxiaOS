@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["aarch64-unknown-none-softfloat"]

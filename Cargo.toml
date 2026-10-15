@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/contracts", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2", "kernel"]
+default-members = ["crates/contracts", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
