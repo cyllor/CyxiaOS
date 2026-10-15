@@ -1,0 +1,2999 @@
+{
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "text": "名称CyxiaOS",
+      "status": "REVIEWED",
+      "domains": [
+        "D01"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-002",
+      "text": "全新内核且不基于Linux",
+      "status": "REVIEWED",
+      "domains": [
+        "D01",
+        "D02"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-003",
+      "text": "本地模型在客体OS内部推理",
+      "status": "REVIEWED",
+      "domains": [
+        "D01",
+        "D09"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-004",
+      "text": "AI主导调度与资源决策",
+      "status": "REVIEWED",
+      "domains": [
+        "D01",
+        "D07",
+        "D14"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-005",
+      "text": "首版单核ARM",
+      "status": "REVIEWED",
+      "domains": [
+        "D01",
+        "D02"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-006",
+      "text": "总体架构跨平台",
+      "status": "REVIEWED",
+      "domains": [
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-007",
+      "text": "总体架构多核扩展",
+      "status": "REVIEWED",
+      "domains": [
+        "D08"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "REQ-008",
+      "text": "模块解耦",
+      "status": "REVIEWED",
+      "domains": [
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "REQ-009",
+      "text": "审核递归至无未关闭设计问题",
+      "status": "REVIEWED",
+      "domains": [
+        "D16"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "CyxiaOS-architecture-review-ledger.json",
+        "CyxiaOS-architecture-review-report.md"
+      ],
+      "scope": "CURRENT",
+      "conclusion": "所有已识别问题独立关闭，两个完整终审相同设计散列；不是运行缺陷证明"
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-01",
+      "status": "REVIEWED",
+      "domains": [
+        "D05",
+        "D08"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D08"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-02",
+      "status": "REVIEWED",
+      "domains": [
+        "D04",
+        "D11"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-03",
+      "status": "REVIEWED",
+      "domains": [
+        "D05",
+        "D11"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-04",
+      "status": "REVIEWED",
+      "domains": [
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-05",
+      "status": "REVIEWED",
+      "domains": [
+        "D05",
+        "D10"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-06",
+      "status": "REVIEWED",
+      "domains": [
+        "D07",
+        "D12",
+        "D15"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-07",
+      "status": "REVIEWED",
+      "domains": [
+        "D12"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-08",
+      "status": "REVIEWED",
+      "domains": [
+        "D15"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-09",
+      "status": "REVIEWED",
+      "domains": [
+        "D08"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "INV-10",
+      "status": "REVIEWED",
+      "domains": [
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    }
+  ],
+  "domains": [
+    {
+      "id": "D01",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D02",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D03",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D04",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D05",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D06",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D07",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D08",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "D09",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D10",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D11",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D12",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D13",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D14",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "id": "D15",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "D16",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    }
+  ],
+  "sections": [
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "CyxiaOS AI 原生操作系统设计文档",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "1. 设计目标与需求来源",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "2. 目标、非目标与失败判据",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "2.1 目标",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "2.2 第一版不包含",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "2.3 失败判据",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "3. 技术路线与边界",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "3.1 路线比较",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4. 系统总体架构",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4.1 内核",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4.2 AI 资源控制器",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4.3 低频目标规划器",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4.4 跨平台与解耦约束",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "4.5 多核目标结构",
+      "domains": [
+        "D03",
+        "D08",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "5. 启动与控制器运行机会",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "6. 状态、动作和接口",
+      "domains": [
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "6.1 状态快照",
+      "domains": [
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "6.2 CPU 动作提案",
+      "domains": [
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "6.3 第一版最小 ABI",
+      "domains": [
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "6.4 后续资源接口",
+      "domains": [
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "7. 模型、训练与目标函数",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "8. 安全约束与故障恢复",
+      "domains": [
+        "D11",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "9. 观测、审计与复现",
+      "domains": [
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "10. 首版验收方案",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "11. 开发阶段与交付门槛",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "12. 风险与设计决策记录",
+      "domains": [
+        "D01",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "13. 文档适用范围",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "v0.6 递归审核修订",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-design.md",
+      "heading": "v0.7 发送进展修订",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "CyxiaOS 详细设计",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "1. 设计基线与阅读规则",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "1.1 必须保持的系统不变量",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "1.2 版本与冲突处理",
+      "domains": [
+        "D01"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "2. 平台、启动和可信边界",
+      "domains": [
+        "D02",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "2.1 CPU 原型配置",
+      "domains": [
+        "D02",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "2.2 启动阶段和失败输出",
+      "domains": [
+        "D02",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "2.3 可信计算基础",
+      "domains": [
+        "D02",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D11",
+        "architecture-review/rounds/R04/C.json#D02"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3. 模块职责与依赖",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3.1 分层与依赖方向",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3.2 平台接口契约",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3.3 平台能力与配置",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3.4 每 CPU 状态与同步基础",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "3.5 内核、模型与用户 ABI 的解耦",
+      "domains": [
+        "D03",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "4. 内存、地址空间与装载",
+      "domains": [
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "4.1 物理内存分区",
+      "domains": [
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "4.2 虚拟地址规则",
+      "domains": [
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "4.3 程序映像",
+      "domains": [
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "5. 任务、能力与 IPC",
+      "domains": [
+        "D05",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D06"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "5.0 身份、代际与计数耗尽",
+      "domains": [
+        "D05",
+        "D10"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "5.1 任务控制块",
+      "domains": [
+        "D05",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D06"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "5.2 能力对象",
+      "domains": [
+        "D05",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D06"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "5.3 IPC 语义",
+      "domains": [
+        "D05",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D06"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "6. 用户 ABI 与模型协议",
+      "domains": [
+        "D10",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "6.1 系统调用约定",
+      "domains": [
+        "D10",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "6.2 序列化规则",
+      "domains": [
+        "D10",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "6.3 快照 v1",
+      "domains": [
+        "D10",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "6.4 动作 v1",
+      "domains": [
+        "D10",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7. 调度控制环与时间预算",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7.1 两个独立状态机",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7.2 调度点的处理优先级",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7.3 定时器与预算精确定义",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7.4 快照至动作提交的时序",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "7.5 公平性与预算的约束关系",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8. 本地模型详细设计",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8.1 模型选型建议",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8.2 输入特征 v1",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8.3 整数推理规则",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8.4 模型包与自检",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "8.5 训练与策略发布",
+      "domains": [
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "9. 故障恢复与资源清理",
+      "domains": [
+        "D12",
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "9.1 通用内核工作与回收前进性",
+      "domains": [
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10. 内存、存储与网络的后续决策接口",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.1 统一控制事务",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.2 内存策略",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.3 存储策略",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.4 网络策略",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.5 联合控制与多核",
+      "domains": [
+        "D13",
+        "D14",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6 多核执行与并发协议",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.1 启动、拓扑和配置切换",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.2 每核模型与全局协调",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.3 预算和计量",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.4 归属、就绪队列与远端唤醒",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.5 迁移协议与唯一执行",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.6 快照与动作协议 v2",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.7 锁、对象生命周期与 TLB 回收",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "10.6.8 故障域和可移植边界",
+      "domains": [
+        "D08",
+        "D04",
+        "D06"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "11. 本地低频规划模型",
+      "domains": [
+        "D09",
+        "D11"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/B.json#D11"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "12. 审计格式、指标与复现",
+      "domains": [
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "12.1 记录种类",
+      "domains": [
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "12.2 指标口径",
+      "domains": [
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "12.3 有界日志与重放",
+      "domains": [
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "13. 验证矩阵与基准工作负载",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "13.1 必测项目",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "13.2 正常工作负载集",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "13.3 对照设计",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "13.4 解耦、移植与多核验收",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "14. 分阶段设计交付与退出条件",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "15. 当前决策与尚待验证项",
+      "domains": [
+        "D01",
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D01"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "file": "CyxiaOS-detailed-design.md",
+      "heading": "16. 参考资料与变更记录",
+      "domains": [
+        "D16"
+      ],
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "budget_boundary",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "wake_before_block",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "late_wake_next_wait",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "migration_lost_ack",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "mapping_reclaim_race",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "irq_lock_order",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "protocol_overflow",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "multi_controller_budget",
+      "status": "REVIEWED",
+      "evidence": [
+        "architecture-review/rounds/R03/coordinator-traces.md",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "full_inbox_idle",
+      "status": "REVIEWED",
+      "domains": [
+        "D06",
+        "D08"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "log_backpressure_dictionary",
+      "status": "REVIEWED",
+      "domains": [
+        "D13",
+        "D15"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15",
+        "architecture-review/rounds/R04/C.json#D13",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "id": "last_task_reaper_tx",
+      "status": "REVIEWED",
+      "domains": [
+        "D07",
+        "D12",
+        "D13"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/C.json#D13",
+        "architecture-review/rounds/R04/coordinator-traces.md"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    }
+  ],
+  "validation_matrix": [
+    {
+      "id": "V00",
+      "scenario": "ARM 入口级别、低到高地址跳转、IRQ 与 SVC 返回",
+      "expected": "入口为 EL1；切换用户页表后内核继续运行；SVC 返回不跳过下一条指令；定时器正确接管 EL0",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V01",
+      "scenario": "断网、无宿主模型服务启动",
+      "expected": "BOOT 到 AI_ACTIVE，模型来自启动映像",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V02",
+      "scenario": "ELF 段越界、重叠和 W+X",
+      "expected": "装载拒绝，写出具体错误，无部分映射遗留",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V03",
+      "scenario": "跨任务/内核地址访问",
+      "expected": "仅违规任务终止，独立任务计数继续增长",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V04",
+      "scenario": "普通任务和模型各自死循环",
+      "expected": "前者可抢占，后者超时降级，记录接管延迟",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V05",
+      "scenario": "旧 epoch、旧代际、重复动作、非零保留字段",
+      "expected": "全部拒绝；不执行伪造目标",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V06",
+      "scenario": "模型运行期间新任务唤醒或目标被撤销",
+      "expected": "前者不使所有提案失效；后者 STALE_STATE 回退",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V07",
+      "scenario": "连续非法 2 次、合法 1 次、再非法 2 次",
+      "expected": "合法提交正确重置连续计数，不错误降级",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V08",
+      "scenario": "第 3 次连续非法及第二次模型故障",
+      "expected": "首次触发唯一重建，重复故障锁定降级",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V08a",
+      "scenario": "持续计算负载下重建与自检，且同周期完成状态转换",
+      "expected": "维护/自检持续取得受限进展，共享账本不重置、不重复发放；健康任务仍前进",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V09",
+      "scenario": "10 ms 边界及 500 μs 间隔",
+      "expected": "不启动预算不够或尾部不足的窗口；计费无遗漏",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V10",
+      "scenario": "立即 yield、消息风暴、反复 timeout",
+      "expected": "调用/推理额度生效；另一正常任务有可测进展",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V11",
+      "scenario": "64 普通槽、不同模型时间片",
+      "expected": "最大就绪等待满足目标，所有保护派发可追溯",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V12",
+      "scenario": "大量任务退出及控制器重建",
+      "expected": "页与对象计数回到预期，旧能力不可复用",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V13",
+      "scenario": "IPC 队列满、到期与消息同刻",
+      "expected": "无双重完成、重复消息或无界队列",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V14",
+      "scenario": "整数推理边界与量化测试",
+      "expected": "主机参考与 CyxiaOS 输出逐项一致",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D09"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D09",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V15",
+      "scenario": "完整短片段重放与日志覆盖",
+      "expected": "重放一致，覆盖准确计数且不阻塞调度",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V16",
+      "scenario": "混合负载持续 1 小时",
+      "expected": "无内核崩溃、对象泄漏或控制器内存增长",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V17",
+      "scenario": "A 写模式后退出，B 反复分配全页；ELF 页尾/栈/失败装载回滚",
+      "expected": "新授权页无旧内容；脏页从不可分配，未清完返回 AGAIN",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D04"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V18",
+      "scenario": "固定 QEMU 后端填满，消费者保持连接但暂停读取",
+      "expected": "独立业务计数继续；宿主缺帧可识别；同时记录客体丢失与宿主覆盖",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V19",
+      "scenario": "持续 RX、空 TX、卡住 pending、未知 IRQ、通知风暴；正常大队列跨预算续发、TXIC 后重启、空→非空",
+      "expected": "无无限重入；源隔离/续行受预算；定时器与健康任务前进，接管延迟可测",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D13"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V20",
+      "scenario": "AI_ACTIVE/LATCHED 下最后普通任务退出，清零队列拥塞及引用延迟",
+      "expected": "回收独立运行、队列公平、同一共享账本无额外额度；ACK 前不释放",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V21",
+      "scenario": "缩小所有身份计数位宽并注入耗尽",
+      "expected": "拒绝/退役/隔离符合 §5.0；无绕回、旧消息复活或无法终结的已启动事务",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D07",
+        "D12"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D12",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V22",
+      "scenario": "多次环覆盖、保留引用、字典满和中途导出",
+      "expected": "每条可追溯记录可解析身份；容量不足拒绝新注册，缺片明确标记",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D15"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D15",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "V23",
+      "scenario": "P5 配额 0→正、小数值增长、停用资源、全局容量不足",
+      "expected": "granule 生效且硬约束不破坏；无隐式重新授权；失败保持旧配置",
+      "stage": "P5",
+      "domains": [
+        "D16",
+        "D14"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "id": "A01",
+      "scenario": "P0/P4 通用层依赖检查",
+      "expected": "kernel-core 不导入 arch/板卡/模型运行库；仅组合入口依赖具体实现",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "A02",
+      "scenario": "P4 平台替身测试",
+      "expected": "使用假时钟、假中断、假上下文执行同一调度/预算状态机；不读取 ARM 寄存器",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "A03",
+      "scenario": "P4 协议边界",
+      "expected": "不同 native 指针布局不改变消息编码；未知版本和能力明确拒绝",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "A04",
+      "scenario": "P4 单核同步检查",
+      "expected": "全局可变当前任务被 CpuLocal 替代；共享对象注明所有权、锁与回收规则",
+      "stage": "P0–P4",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "id": "S01",
+      "scenario": "P4-S 2/4 核启动",
+      "expected": "所有 ONLINE 核完成独立栈/中断/时钟初始化；未确认核不能被派发任务",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S02",
+      "scenario": "P4-S 多核竞争选同一任务",
+      "expected": "归属与版本检查确保同一任务没有重叠 RUNNING 区间",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S03",
+      "scenario": "P4-S 唤醒先于 BLOCKED 提交、旧唤醒迟于下一代等待、满容量唤醒",
+      "expected": "每次等待只完成一次，提前到达结果不丢失；阻塞任务保留容量并能重新入队",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S04",
+      "scenario": "P4-S COMMIT/ACK 丢失、重复与迟到，以及满容量回滚",
+      "expected": "事务幂等；只有最终 owner 执行；源核回滚槽未被重用，无双重入队或无槽遗失",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S05",
+      "scenario": "P4-S 远端 TLB 失效延迟",
+      "expected": "未收到全部所需 ACK 前旧页不能释放或重新授权",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S06",
+      "scenario": "P4-S 本核模型故障",
+      "expected": "本核降级，其他核继续；恢复不重复领取预算",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S07",
+      "scenario": "P4-S 并行推理与协调器",
+      "expected": "各核账本及全机 CPU 容量口径一致；协调器无隐含额外预算",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S08",
+      "scenario": "P4-S 锁序和弱内存压力",
+      "expected": "无持锁等待 ACK、无反向取锁；共享发布有对应同步，压力下无双执行/丢唤醒",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "S09",
+      "scenario": "P4-S 无用户 timer 的 idle 核、收件箱满、IPI 合并/丢失、睡眠边界唤醒",
+      "expected": "pending 经握手或维护 tick 消费，有界批次仍续行，无永久休眠",
+      "stage": "P4-S",
+      "domains": [
+        "D16",
+        "D08"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D08",
+        "architecture-review/rounds/R04/B.json#D16"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "X01",
+      "scenario": "P4-X 第二架构构建与启动",
+      "expected": "修改集中在适配层及组合配置；通用状态机、权限语义和消息协议复用",
+      "stage": "P4-X",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "EXTENSION"
+    },
+    {
+      "id": "X02",
+      "scenario": "P4-X 模型与 ABI 一致性",
+      "expected": "相同输入的整数模型输出与协议编码一致；各架构寄存器入口单独验证",
+      "stage": "P4-X",
+      "domains": [
+        "D16",
+        "D03"
+      ],
+      "status": "REVIEWED",
+      "execution_status": "NOT_RUN",
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D16",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "EXTENSION"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "BootInfo",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "CpuTopology",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "ContextOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "AddressSpaceOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "ClockSource",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "ClockEvent",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "InterruptOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "IdleOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "CpuLifecycle",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "Cache/TlbOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "ConsoleOps",
+      "section": "详细 §3.2",
+      "status": "REVIEWED",
+      "domains": [
+        "D02",
+        "D03",
+        "D13"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/C.json#D02",
+        "architecture-review/rounds/R04/C.json#D03",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT/EXTENSION"
+    },
+    {
+      "name": "abi_info",
+      "call_number": 0,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "task_exit",
+      "call_number": 1,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "yield",
+      "call_number": 2,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "sleep_until",
+      "call_number": 3,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "read_clock",
+      "call_number": 4,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "ipc_send",
+      "call_number": 5,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D06"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "ipc_recv",
+      "call_number": 6,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D06"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D06",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "map_owned_pages",
+      "call_number": 7,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D04"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "unmap_owned_pages",
+      "call_number": 8,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D04"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/C.json#D04"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "read_snapshot",
+      "call_number": 32,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "submit_schedule",
+      "call_number": 33,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "selftest_step",
+      "call_number": 34,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D05",
+        "D07"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/A.json#D05",
+        "architecture-review/rounds/R04/A.json#D07",
+        "architecture-review/rounds/R04/B.json#D10"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "audit_read",
+      "call_number": 48,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D15"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/B.json#D15"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "console_write",
+      "call_number": 49,
+      "section": "详细 §6.1",
+      "status": "REVIEWED",
+      "domains": [
+        "D10",
+        "D13"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D10",
+        "architecture-review/rounds/R04/C.json#D13"
+      ],
+      "scope": "CURRENT"
+    },
+    {
+      "name": "resource transaction",
+      "section": "详细 §10.1–10.4",
+      "status": "REVIEWED",
+      "domains": [
+        "D14"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "name": "memory policy",
+      "section": "详细 §10.1–10.4",
+      "status": "REVIEWED",
+      "domains": [
+        "D14"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "name": "block queue",
+      "section": "详细 §10.1–10.4",
+      "status": "REVIEWED",
+      "domains": [
+        "D14"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14"
+      ],
+      "scope": "FUTURE"
+    },
+    {
+      "name": "network queue",
+      "section": "详细 §10.1–10.4",
+      "status": "REVIEWED",
+      "domains": [
+        "D14"
+      ],
+      "evidence": [
+        "architecture-review/rounds/R04/B.json#D14"
+      ],
+      "scope": "FUTURE"
+    }
+  ],
+  "final_baseline_hashes": {
+    "CyxiaOS-design.md": "b494a41b509ed7254562cfc48d01eaddf5c82251ae772e6d34db4d1b03d18035",
+    "CyxiaOS-detailed-design.md": "01d6c734144a1e2643543e155d325e0dc86c9050c1de375c0f372438dfaa76de"
+  },
+  "status": "REVIEW_COMPLETE",
+  "meaning": "REVIEWED为设计规范审核，execution_status NOT_RUN不代表运行通过",
+  "applicability": {
+    "reviewed_design_version": "0.7",
+    "current_working_design_version": "0.9",
+    "current_working_design_review_status": "AI_CENTRIC_INCREMENT_NOT_FULLY_REVIEWED",
+    "note": "历史完整审核与散列保持有效，仅适用于冻结快照；新增需求尚未全域归零"
+  }
+}

@@ -1,0 +1,232 @@
+{
+  "channel": "A",
+  "round": "R01",
+  "baseline_hashes": {
+    "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+    "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+  },
+  "domains": [
+    "D01",
+    "D02",
+    "D03",
+    "D04",
+    "D13"
+  ],
+  "findings": [
+    {
+      "local_id": "A-001",
+      "title": "普通页跨所有者复用缺少统一清零准入条件",
+      "severity": "Critical",
+      "sections": [
+        "CyxiaOS-detailed-design.md §4.1（行160—168）",
+        "CyxiaOS-detailed-design.md §4.2（行180—184）",
+        "CyxiaOS-detailed-design.md §6.1 map_owned_pages/unmap_owned_pages（行245—255）",
+        "CyxiaOS-detailed-design.md §9（行426—432）"
+      ],
+      "evidence": [
+        "§6.1 只在显式 unmap_owned_pages 上规定“同步后清零再回收”；§9 普通任务退出路径只规定分批解除映射和回收，§4.1 分配器与 map_owned_pages 未规定页重新授权前必须已清零。",
+        "§4.3 的 BSS 清零只覆盖映像 BSS，不涵盖退出回收页、新栈/堆/匿名页或 ELF 页尾未被文件覆盖的字节。控制器重建清零也不能覆盖普通页池。"
+      ],
+      "trigger_trace": [
+        "任务 A 在自己的普通页 P 写入秘密。",
+        "A 退出；按 §9 撤销映射并同步后，P 进入普通空闲页池。该路径没有明确要求清零。",
+        "仍存活的任务 B 通过合法 map_owned_pages 在其配额内获得 P；页所有权和权限检查全部通过。",
+        "B 读取 P 中未初始化的字节，得到 A 的旧内容；没有同时所有权冲突，INV-02 的现有措辞无法独自阻断。"
+      ],
+      "violated_requirement_or_invariant": "总体 §2.1.3 的应用隔离与 §8 的恶意用户任务威胁边界；INV-02 的页所有权需补足跨所有者生命周期的内容隔离。",
+      "impact": "设计允许通过合法页分配读取其他任务遗留内容，属于隔离突破；不需要动态创建任务、特权能力或模型错误。",
+      "resolution": "在 memory 模块建立统一页生命周期：撤销全部映射/引用并完成 TLB 同步后进入 DIRTY_FREE，清零完成才进入 CLEAN_FREE；或保证在任何新所有者可见映射发布前完成整页清零。所有退出、装载失败回滚、显式 unmap、控制器重建路径必须复用该规则。共享不可变页作为显式共享例外，不能被清零破坏。清零以有界批次执行并计入相应预算；不足时返回/保持等待，不提前公布页。增加 A 写模式→退出→B 反复分配全页扫描、ELF 页尾与栈初始化验证。",
+      "affected_domains": [
+        "D04",
+        "D05",
+        "D11",
+        "D12",
+        "D16"
+      ]
+    },
+    {
+      "local_id": "A-002",
+      "title": "QEMU 串口后端背压可绕过客体非阻塞日志队列而停住虚拟机",
+      "severity": "High",
+      "sections": [
+        "CyxiaOS-design.md §9（日志消费者关闭不得影响客体）",
+        "CyxiaOS-design.md §10（日志消费者停止验收）",
+        "CyxiaOS-detailed-design.md §2.1（QEMU 机器配置）",
+        "CyxiaOS-detailed-design.md §3.2 ConsoleOps",
+        "CyxiaOS-detailed-design.md §6.1（行251—255）",
+        "CyxiaOS-detailed-design.md §12.3"
+      ],
+      "evidence": [
+        "设计给出客体串口发送队列、每次 64 字节及不忙等规则，但未约束 QEMU chardev 后端。",
+        "QEMU v9.2.0 官方 hw/char/pl011.c 的 pl011_write_txdata 调用 qemu_chr_fe_write_all；同一函数注释明确该写入会阻塞整个线程。这是 UARTDR MMIO 写自身的宿主执行路径，客体检查 FIFO 或给队列设上限不能使它可抢占。",
+        "官方源码：https://raw.githubusercontent.com/qemu/qemu/v9.2.0/hw/char/pl011.c ，pl011_write_txdata；https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-fe.c ，qemu_chr_fe_write_all；https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char.c ，qemu_chr_write。",
+        "可用修订依据：QEMU v9.2.0 官方 https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-ringbuf.c 的 ringbuf_chr_write 在固定容量中写入并推进 cons 覆盖旧字节，返回 len，不等待消费者；默认 65536 字节，容量要求 2 的幂；qmp_ringbuf_read 可另行读取。"
+      ],
+      "trigger_trace": [
+        "按当前未限定的后端配置，将 PL011 接到有背压的宿主管道/连接，日志消费者保持连接但停止读取。",
+        "诊断服务持续合法输出；客体队列有界且 console_write 可返回 AGAIN。",
+        "发送中断或 drain 路径写 UARTDR，宿主后端缓冲最终填满。",
+        "QEMU 的 write_all 路径等待后端；vCPU 无法完成这一次 MMIO 写，客体定时器不能靠中断抢占宿主阻塞，业务任务停止推进。"
+      ],
+      "violated_requirement_or_invariant": "总体 §8 日志不能阻塞调度、§9/§10 消费者停止仍运行；详细 ConsoleOps 的有界非阻塞契约及 INV-06 的独立计量/恢复要求。",
+      "impact": "“日志消费者停止”这一明确首版场景可能停住整个单核客体，故障截止与恢复也不能执行；仅验证关闭连接不能覆盖连接仍在但不消费的背压场景。",
+      "resolution": "把宿主串口后端纳入 UP-ARM 平台契约：P0 固定经验证的无消费者背压配置，例如具有固定容量、溢出丢弃语义的内存后端/独立输出链；不得把阻塞型管道或 socket 直接作为满足正常日志生存性保证的后端。独立记录宿主输出丢失，明确宿主整体故障在信任基础之外。新增填满后端且消费者暂停读取的验收，检查独立客体计数持续推进，而非仅测试断连。选择具体后端时须检验固定 QEMU 版本的实现。 已核对 ringbuf 后端可作为候选：固定容量并以 QMP ringbuf-read 异步取出；读取采用 base64 避免二进制/截断 UTF-8 问题。ringbuf 按字节覆盖，不提供完整记录或精确丢失条数，应以带长度/序号的可重新同步帧发现日志缺口，不能将宿主缓冲覆盖误报为完整审计；禁止附加同步 logfile 等重新引入背压的选项。",
+      "affected_domains": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ]
+    },
+    {
+      "local_id": "A-003",
+      "title": "串口 IRQ 的单次字节上限缺少持续中断源的抑制与重新启用契约",
+      "severity": "Medium",
+      "sections": [
+        "CyxiaOS-detailed-design.md §3.2 InterruptOps/ConsoleOps",
+        "CyxiaOS-detailed-design.md §6.1（行255）",
+        "CyxiaOS-detailed-design.md §7.2（行308—318）",
+        "CyxiaOS-detailed-design.md §7.3（行322）",
+        "CyxiaOS-design.md §5（系统调用与中断成本控制）"
+      ],
+      "evidence": [
+        "串口每次中断最多 64 字节限制单次工作量；没有规定该批处理后中断仍为 pending 时的屏蔽、延迟续行、总 IRQ 预算及重新启用条件。",
+        "计时器路径明确先解除电平再 EOI，但串口未定义空 TX 队列时关闭 TX IRQ、未使用 RX/错误源的屏蔽或持续事件风暴的退避。",
+        "Arm PL011 TRM DDI 0183G §2.8.2—2.8.6 与 §3.3.10/13：RX/TX/错误可产生组合中断，需设备端清除或屏蔽；GIC EOI 不等于清除设备源。官方依据：https://documentation-service.arm.com/static/5e8e36c2fd977155116a90b5 。"
+      ],
+      "trigger_trace": [
+        "串口源被启用，输入/错误事件持续到达，或发送结束后设备源仍保持 pending。",
+        "处理器每次处理不超过 64 字节并执行 GIC EOI，满足现有单次批次限制。",
+        "未清除/未屏蔽的源立即再次触发，或新事件持续补充；再次进入同样有界处理。",
+        "无限多个有界批次仍可占满 CPU，普通任务与恢复窗口没有可证明的运行机会；普通任务系统调用 64 次限额不能限制外设中断。"
+      ],
+      "violated_requirement_or_invariant": "总体 §2.3 不长期饿死任务、§5 中断成本控制；INV-04/INV-06 的控制器截止与恢复运行机会；审核计划强制中断风暴场景。",
+      "impact": "当前接口不能区分“每次 IRQ 有界”和“累计 IRQ 开销受控”，实现者可能满足明文批次条件仍无法完成风暴生存性验收。由于具体中断使能方案尚未固定，按重要接口缺口列 Medium，不宣称已实现驱动必然存在死循环。",
+      "resolution": "定义首版中断源白名单，未使用 RX/错误源保持屏蔽；TX 仅在有待发数据时启用、空队列即屏蔽。达到字节/时间预算或源无法解除时屏蔽该非关键源，保存待处理事实，由有预算的延迟工作/定时器续行并在安全条件满足时重新启用；持续异常达到阈值时保留诊断计数并停用该源。禁止屏蔽调度定时器以实现退避。补充持续 RX、空 TX、卡住 pending 与未知 IRQ 的故障测试，检查健康任务计数和控制截止接管。",
+      "affected_domains": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ]
+    }
+  ],
+  "coverage_notes": [
+    {
+      "domain": "D01",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "确认要求与建议选型分离",
+          "evidence": "总体 §1—3、§11—13；详细 §1、§14—15。两文档均确认新内核、本地模型、首版单核 ARM、跨平台/多核/解耦，并把 AArch64、Cortex-A53、Rust 与性能数值标为建议。未要求用户先决定第二架构。",
+          "result": "未见需求删减或把建议选型误写成已确认要求。"
+        },
+        {
+          "item": "阶段及 AI 主体性不变量",
+          "evidence": "总体 §1、§4.2—4.5、§6.4、§7、§10—11；详细 §1.1、§7、§10—11、§13—15。CPU 闭环与后续多资源区分；本地推理不依赖宿主；确定性恢复与公平保护单独标识。",
+          "result": "INV-01/03/04/05/07/08/09/10 有对应机制；INV-02 现有所有权规则不涵盖页内容复用隔离，见 A-001；日志/IRQ 跨域前进性见 A-002/A-003。其余调度、协议具体竞争由 B/C 通道独立审核。"
+        }
+      ]
+    },
+    {
+      "domain": "D02",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "ELF/DTB 启动与 MMU 切换",
+          "evidence": "详细 §2.1—2.3、§4.2、§6.1；QEMU 官方 virt 文档 Hardware configuration information for bare-metal programming：https://www.qemu.org/docs/master/system/arm/virt.html 。",
+          "result": "官方资料确认裸机 DTB 在 RAM 起始 0x40000000，非 ELF 的 Linux boot protocol 才由 x0/r2 传参；文档没有混用。入口检查 EL1、DTB 与物理段不重叠、低地址临时映射转高地址内核并迁移栈/VBAR，再切用户 TTBR0 的顺序闭合。P0 应冻结实际版本/命令，当前不是启动测试通过。"
+        },
+        {
+          "item": "异常、计时器与启动失败",
+          "evidence": "详细 §2.2 B0—B5、§6.1、§7.3。",
+          "result": "用户态前先具备陷阱/定时器；SVC 返回不加4；完整通用寄存器保存、16字节栈对齐、FP/SIMD 禁用及 softfloat 一致；Generic Timer 先解除到期电平再 GIC EOI。B0 无串口时由宿主超时识别、其他阶段诊断/停机边界明确。串口宿主后端约束与 IRQ 累计工作量有 A-002/A-003。"
+        },
+        {
+          "item": "SMP 启动不是 UP 隐含能力",
+          "evidence": "详细 §10.6.1、§13.4 S01、总体 §4.5/§11。",
+          "result": "CPU-start 必须固定平台协议，ONLINE 前需独立栈、向量、时钟与 ack；明确 UP ELF/EL1 不保证从核启动。因此未将缺少当前 SMP 实现列为问题。"
+        }
+      ]
+    },
+    {
+      "domain": "D03",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "依赖方向与 ABI/模型分离",
+          "evidence": "总体 §4.4—4.5；详细 §3.1—3.5、§6.2—6.4、§13.4 A01—A04/X01—X02。",
+          "result": "kernel-core 只依赖 contracts/ABI；底层回调不得读调度私有状态；不透明上下文、逻辑 CPU/地址/时间类型及四个版本域隔离寄存器、设备树和模型格式，禁止核心 cfg(target_arch)。未见明确循环依赖。"
+        },
+        {
+          "item": "页大小、位宽、原子与时钟替身",
+          "evidence": "详细 §3.2—3.4、§10.6.3/8。",
+          "result": "基础页尺寸构建固定并启动验证；共享消息固定宽度且不含 usize/指针；逻辑缓冲按平台页上取整；32 位单列能力审查，MMU/原子/时钟不满足则拒绝。SMP 需要可比较时钟。A02/A03 覆盖假时钟与 native 布局差异。P4-X 是验证义务，不要求现在选第二架构。"
+        },
+        {
+          "item": "平台接口可实施边界",
+          "evidence": "详细 §3.2 要求 IRQ/锁/最大工作量声明、§6.1 串口实现建议。",
+          "result": "核心与平台边界总体清晰，ConsoleOps 的有界性依赖宿主后端和 IRQ 抑制，需按 A-002/A-003 修订。"
+        }
+      ]
+    },
+    {
+      "domain": "D04",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "页所有权与映像约束",
+          "evidence": "详细 §1.1 INV-02、§4.1—4.3、§5.2、§6.1、§9。",
+          "result": "保留 DTB/映像页、按每任务配额准入、固定内核对象、不交换；ELF 固定静态 EM_AARCH64 小端，校验段边界/溢出/入口/重叠；拒绝 W+X 和可写代码别名；用户复制先验证并使用内核映射。统一跨所有者清零准入缺失见 A-001。"
+        },
+        {
+          "item": "内存容量与恢复",
+          "evidence": "详细 §4.1、§8.3、§9、§10.6.1。",
+          "result": "16 MiB 内核目标、4 MiB 控制器池包含全部代码/缓冲/权重、1 MiB 审计、普通任务从剩余分配；64 普通槽包含诊断；恢复复用原池、分批清零不申请第二完整池；SMP 要重新算总量且共享权重不能省略每核工作区。没有发现必须分配而无预算出处的对象类别；最终大小仍须编译计数。"
+        },
+        {
+          "item": "映射撤销与远端 TLB 生命周期",
+          "evidence": "详细 §4.2、§10.6.7—8。",
+          "result": "UP 先撤映射、维护后回收；有效映射更新遵循 break-before-make，执行页需 D/I cache 维护。SMP 以空间锁串行 active 集与 mapping_epoch，离开前本地失效，远端 ACK 不齐则保留页，失联不视为成功；引用/消息存活独立于代际。未发现本域直接反例，具体锁交错由 B 通道复核。"
+        }
+      ]
+    },
+    {
+      "domain": "D13",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "正常日志/串口有界性",
+          "evidence": "详细 §3.2、§6.1、§12.3；总体 §8—10。",
+          "result": "审计环满覆盖完整记录计丢失、console_write 最大64字节、4 KiB 队列满返回 AGAIN、audit_read 最大256字节；没有要求调度等待日志。设备 IRQ 及 QEMU 宿主阻塞是剩余缺口 A-002/A-003。"
+        },
+        {
+          "item": "未来 DMA/块设备/网络边界",
+          "evidence": "总体 §6.4/§8；详细 §3.5、§10.1—10.5、§14 P5。",
+          "result": "首版不挂 block/net/GPU，无隐藏 DMA 驱动依赖。后续驱动隔离需显式 IRQ/DMA 授权协议，不能把 CPU 页表当 DMA 隔离；内存回收不碰固定/DMA页。块调度只选满足依赖的请求，flush/屏障/同区写顺序不可覆盖，无文件系统不声称持久一致性。网络访问控制独立于模型速率；联合动作区分配置原子性与不可回滚 I/O。未来实现需专项规格，不以未实现本身报缺陷。"
+        }
+      ]
+    },
+    {
+      "domain": "CROSS_DOMAIN",
+      "status": "REVIEWED",
+      "checks": [
+        {
+          "item": "强制跨域场景覆盖",
+          "evidence": "详细 §4.2/§10.6.7 地址空间切换与远端回收；§3.2—3.5 页大小/位宽/ABI差异；§6.1/§7.3/§12.3 日志与IRQ。",
+          "result": "检查 TLB ACK 延迟不复用页、已退出 CPU 必须先失效、页大小不泄露到协议、日志消费者停顿与 IRQ 持续重入。前两类已有安全契约，后两类发现 A-002/A-003。预算边界、IPC 等待和迁移完整交错交由负责域 B/C，不把本通道摘要当作那些域终审。"
+        }
+      ]
+    }
+  ],
+  "blocked": [],
+  "validation_obligations": [
+    "没有 OS 代码，本轮只判断文档机制与具体反例；未进行编译、启动、QEMU 实验或硬件验证。",
+    "P0 固定平台/工具链版本、页表维护具体序列、镜像实际布局与非阻塞串口后端，并进行 V00/A01 验证。",
+    "P4 验证页跨任务复用内容隔离、串口消费者背压与 IRQ 风暴；P4-S/P4-X 分别验证实际硬件内存序/TLB与平台替换，不能以平台替身代替。"
+  ]
+}

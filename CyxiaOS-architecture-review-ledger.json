@@ -1,0 +1,1189 @@
+{
+  "plan": "CyxiaOS-architecture-review-plan.md",
+  "status": "COMPLETE_DESIGN_REVIEW",
+  "rulings": [
+    "用户已明确授权立即审核并修订。",
+    "当前为无Git的设计文档项目；使用不可变快照和内容散列，不初始化Git、不创建代码工作树、不把文档推演冒充运行测试。",
+    "本次按专门审核计划执行多轮独立复核；不采用编码技能的一次修订上限或延期保留小问题。"
+  ],
+  "rounds": [
+    {
+      "id": "R01",
+      "kind": "INITIAL_FULL",
+      "hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "status": "FINDINGS_REVISED_PENDING_REVIEW"
+    },
+    {
+      "id": "R02",
+      "kind": "FULL_FIX_VERIFICATION",
+      "hashes": {
+        "CyxiaOS-design.md": "336c346a620eb8ad97b97347ac7977b64639acab38b7d7f8f438e087f152f8da",
+        "CyxiaOS-detailed-design.md": "c4ce1a2d53509bfa759ad2b840a8f841262889e4396216b67d8d217fde828db0"
+      },
+      "status": "REOPENED_FINDING",
+      "reopened": [
+        "CYX-AR-0003"
+      ]
+    },
+    {
+      "id": "R03",
+      "kind": "FULL_FINAL_CANDIDATE",
+      "hashes": {
+        "CyxiaOS-design.md": "b494a41b509ed7254562cfc48d01eaddf5c82251ae772e6d34db4d1b03d18035",
+        "CyxiaOS-detailed-design.md": "01d6c734144a1e2643543e155d325e0dc86c9050c1de375c0f372438dfaa76de"
+      },
+      "status": "CLEAN_FULL",
+      "final_label": "FINAL-1"
+    },
+    {
+      "id": "R04",
+      "kind": "FULL_FINAL_REVERSE_REVIEW",
+      "hashes": {
+        "CyxiaOS-design.md": "b494a41b509ed7254562cfc48d01eaddf5c82251ae772e6d34db4d1b03d18035",
+        "CyxiaOS-detailed-design.md": "01d6c734144a1e2643543e155d325e0dc86c9050c1de375c0f372438dfaa76de"
+      },
+      "status": "CLEAN_FULL",
+      "final_label": "FINAL-2"
+    }
+  ],
+  "findings": [
+    {
+      "id": "CYX-AR-0001",
+      "title": "普通页跨所有者复用缺少统一清零准入条件",
+      "severity": "Critical",
+      "domain_ids": [
+        "D04",
+        "D05",
+        "D11",
+        "D12",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/A.json#A-001",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §4.1（行160—168）",
+        "CyxiaOS-detailed-design.md §4.2（行180—184）",
+        "CyxiaOS-detailed-design.md §6.1 map_owned_pages/unmap_owned_pages（行245—255）",
+        "CyxiaOS-detailed-design.md §9（行426—432）"
+      ],
+      "evidence": [
+        "§6.1 只在显式 unmap_owned_pages 上规定“同步后清零再回收”；§9 普通任务退出路径只规定分批解除映射和回收，§4.1 分配器与 map_owned_pages 未规定页重新授权前必须已清零。",
+        "§4.3 的 BSS 清零只覆盖映像 BSS，不涵盖退出回收页、新栈/堆/匿名页或 ELF 页尾未被文件覆盖的字节。控制器重建清零也不能覆盖普通页池。"
+      ],
+      "trigger_trace": [
+        "任务 A 在自己的普通页 P 写入秘密。",
+        "A 退出；按 §9 撤销映射并同步后，P 进入普通空闲页池。该路径没有明确要求清零。",
+        "仍存活的任务 B 通过合法 map_owned_pages 在其配额内获得 P；页所有权和权限检查全部通过。",
+        "B 读取 P 中未初始化的字节，得到 A 的旧内容；没有同时所有权冲突，INV-02 的现有措辞无法独自阻断。"
+      ],
+      "violated_requirement_or_invariant": "总体 §2.1.3 的应用隔离与 §8 的恶意用户任务威胁边界；INV-02 的页所有权需补足跨所有者生命周期的内容隔离。",
+      "impact": "设计允许通过合法页分配读取其他任务遗留内容，属于隔离突破；不需要动态创建任务、特权能力或模型错误。",
+      "proposed_resolution": "在 memory 模块建立统一页生命周期：撤销全部映射/引用并完成 TLB 同步后进入 DIRTY_FREE，清零完成才进入 CLEAN_FREE；或保证在任何新所有者可见映射发布前完成整页清零。所有退出、装载失败回滚、显式 unmap、控制器重建路径必须复用该规则。共享不可变页作为显式共享例外，不能被清零破坏。清零以有界批次执行并计入相应预算；不足时返回/保持等待，不提前公布页。增加 A 写模式→退出→B 反复分配全页扫描、ELF 页尾与栈初始化验证。",
+      "affected_domains": [
+        "D04",
+        "D05",
+        "D11",
+        "D12",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V17"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0001",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §1.1 INV-02、§4.1 明确 OWNED→REVOKING→DIRTY_FREE→CLEAN_FREE→OWNED；必须撤销全部映射和引用并完成 TLB 确认，整页清零后才向新所有者发布。总体 §13 v0.6 同步此规则。",
+          "详细 §4.1 覆盖启动剩余 RAM、任务退出、显式 unmap、失败装载回滚、控制器重建、栈/堆/匿名页及页表页；ELF 只在洁净整页复制字节，页尾、BSS、空洞均为零。共享页最后引用释放前不清零，控制器池不流入普通池。",
+          "详细 §6.1 预检整批映射，缺洁净页返回 AGAIN；§9.1 在模型健康、锁定降级、无普通任务时仍分批清零，§10.6.7 不以超时或已发 IPI 代替全部 ACK。"
+        ],
+        "scenarios": [
+          "V17：A 写私有内容→退出/撤销→尚有引用或 TLB ACK 时保持隔离→完成后入脏页队列→清零→B 获得新所有权。B 在清零完成前只能获其他洁净页或 AGAIN。",
+          "V02/V17：ELF 段不足一页、装载中途失败和旧内核栈复用均走同一生命周期；禁止 W+X/可写别名，不能用另一映射绕过执行页保护。",
+          "V20/S05：最后任务退出、清零队列满或远端核失联不触发提前复用；pending 保留，等待引用/ACK 与可执行工作分开，恢复预算不能强迫释放未知安全状态页。均为设计推演，未运行测试。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/B.json#CYX-AR-0001",
+        "architecture-review/rounds/R03/A.json#CYX-AR-0001",
+        "architecture-review/rounds/R04/A.json#CYX-AR-0001",
+        "architecture-review/rounds/R04/C.json#CYX-AR-0001"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/B.json",
+          "evidence": [
+            "§1.1 INV-02 与 §4.1 统一规定 OWNED→REVOKING→DIRTY_FREE→CLEAN_FREE→OWNED；全部映射/引用和 TLB 完成后才清零，新所有者发布只能取洁净页。",
+            "§4.1 明确覆盖退出、显式 unmap、失败装载、控制器重建、栈/堆/匿名及页表页，ELF 文件字节复制前整页洁净；共享页最后引用释放后才清零，专用池不流入普通池。",
+            "§6.1 批量映射预检和 AGAIN、§9.1 分批清零的预算/续行及 §10.6.7 延期回收共同阻断先发布后清零和 ACK 前复用；总体 §13 v0.6 同步该规则。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/A.json",
+          "evidence": [
+            "详细 §1.1 INV-02、§4.1 把整页清零列为新所有者发布的强制准入条件；撤销全部映射/引用并完成 TLB 确认后才从 REVOKING 进入 DIRTY_FREE，清零完成才进入 CLEAN_FREE。",
+            "详细 §4.1 显式覆盖启动剩余 RAM、普通退出、unmap、失败装载回滚、控制器重建、栈/堆/匿名页和页表页；ELF 先取洁净整页再复制文件字节。显式共享只读页在最后引用撤销前不得清零，控制器池不借给普通池。",
+            "详细 §6.1 的批量映射预检、§9.1 的独立清零执行器与 §10.6.7 的引用/TLB 延期回收形成完整入口和出口；总体 §13 v0.6 同步这一规则。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/A.json",
+          "evidence": [
+            "跨域复核详细 §4.1、§9、§9.1、§10.6.7：退出先不可调度，撤销全部映射/引用及 TLB 确认后才能进入 DIRTY_FREE；整页清零才进入 CLEAN_FREE，新所有者发布以此为准入条件。",
+            "总体 §13 v0.6、详细 INV-02 和 V17 同步；失败装载、栈/页尾及控制器专用池明确纳入，代际不能替代引用存活。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/C.json",
+          "evidence": [
+            "详细 §1.1 INV-02、§4.1 明确 OWNED→REVOKING→DIRTY_FREE→CLEAN_FREE→OWNED；必须撤销全部映射和引用并完成 TLB 确认，整页清零后才向新所有者发布。总体 §13 v0.6 同步此规则。",
+            "详细 §4.1 覆盖启动剩余 RAM、任务退出、显式 unmap、失败装载回滚、控制器重建、栈/堆/匿名页及页表页；ELF 只在洁净整页复制字节，页尾、BSS、空洞均为零。共享页最后引用释放前不清零，控制器池不流入普通池。",
+            "详细 §6.1 预检整批映射，缺洁净页返回 AGAIN；§9.1 在模型健康、锁定降级、无普通任务时仍分批清零，§10.6.7 不以超时或已发 IPI 代替全部 ACK。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/A.json#A-001"
+      },
+      "fix_sections": [
+        "详细 §4.1",
+        "详细 §9.1"
+      ]
+    },
+    {
+      "id": "CYX-AR-0002",
+      "title": "QEMU 串口后端背压可绕过客体非阻塞日志队列而停住虚拟机",
+      "severity": "High",
+      "domain_ids": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/A.json#A-002",
+      "file_sections": [
+        "CyxiaOS-design.md §9（日志消费者关闭不得影响客体）",
+        "CyxiaOS-design.md §10（日志消费者停止验收）",
+        "CyxiaOS-detailed-design.md §2.1（QEMU 机器配置）",
+        "CyxiaOS-detailed-design.md §3.2 ConsoleOps",
+        "CyxiaOS-detailed-design.md §6.1（行251—255）",
+        "CyxiaOS-detailed-design.md §12.3"
+      ],
+      "evidence": [
+        "设计给出客体串口发送队列、每次 64 字节及不忙等规则，但未约束 QEMU chardev 后端。",
+        "QEMU v9.2.0 官方 hw/char/pl011.c 的 pl011_write_txdata 调用 qemu_chr_fe_write_all；同一函数注释明确该写入会阻塞整个线程。这是 UARTDR MMIO 写自身的宿主执行路径，客体检查 FIFO 或给队列设上限不能使它可抢占。",
+        "官方源码：https://raw.githubusercontent.com/qemu/qemu/v9.2.0/hw/char/pl011.c ，pl011_write_txdata；https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-fe.c ，qemu_chr_fe_write_all；https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char.c ，qemu_chr_write。",
+        "可用修订依据：QEMU v9.2.0 官方 https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-ringbuf.c 的 ringbuf_chr_write 在固定容量中写入并推进 cons 覆盖旧字节，返回 len，不等待消费者；默认 65536 字节，容量要求 2 的幂；qmp_ringbuf_read 可另行读取。"
+      ],
+      "trigger_trace": [
+        "按当前未限定的后端配置，将 PL011 接到有背压的宿主管道/连接，日志消费者保持连接但停止读取。",
+        "诊断服务持续合法输出；客体队列有界且 console_write 可返回 AGAIN。",
+        "发送中断或 drain 路径写 UARTDR，宿主后端缓冲最终填满。",
+        "QEMU 的 write_all 路径等待后端；vCPU 无法完成这一次 MMIO 写，客体定时器不能靠中断抢占宿主阻塞，业务任务停止推进。"
+      ],
+      "violated_requirement_or_invariant": "总体 §8 日志不能阻塞调度、§9/§10 消费者停止仍运行；详细 ConsoleOps 的有界非阻塞契约及 INV-06 的独立计量/恢复要求。",
+      "impact": "“日志消费者停止”这一明确首版场景可能停住整个单核客体，故障截止与恢复也不能执行；仅验证关闭连接不能覆盖连接仍在但不消费的背压场景。",
+      "proposed_resolution": "把宿主串口后端纳入 UP-ARM 平台契约：P0 固定经验证的无消费者背压配置，例如具有固定容量、溢出丢弃语义的内存后端/独立输出链；不得把阻塞型管道或 socket 直接作为满足正常日志生存性保证的后端。独立记录宿主输出丢失，明确宿主整体故障在信任基础之外。新增填满后端且消费者暂停读取的验收，检查独立客体计数持续推进，而非仅测试断连。选择具体后端时须检验固定 QEMU 版本的实现。 已核对 ringbuf 后端可作为候选：固定容量并以 QMP ringbuf-read 异步取出；读取采用 base64 避免二进制/截断 UTF-8 问题。ringbuf 按字节覆盖，不提供完整记录或精确丢失条数，应以带长度/序号的可重新同步帧发现日志缺口，不能将宿主缓冲覆盖误报为完整审计；禁止附加同步 logfile 等重新引入背压的选项。",
+      "affected_domains": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V18"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0002",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §2.1 固定 1 MiB ringbuf chardev、独立显示/监控、无隐含 stdio 多路复用且无同步 logfile；QMP base64 异步采集。保证明确覆盖消费者仍连接但停读，不含宿主进程整体暂停/资源耗尽。",
+          "详细 §2.1 保留 QEMU v9.2.0 PL011 与 ringbuf 源码依据，P0 固定实际版本并重核调用链，升级重跑 V18。本轮是冻结设计反向审核，未将已有源码依据等同于新运行实验。",
+          "详细 §12.3 规定可重同步帧、长度/校验/序号、HOST_TRANSPORT_LOSS 与客体 AUDIT_LOSS 分开；字典不完整明确不能完整追溯。总体 §9/§10/§13 与之相容。"
+        ],
+        "scenarios": [
+          "V18：连接保持但采集停止→客体输出超过后端容量→固定内存环覆盖旧字节→不因消费者等待而阻塞。直接使用可背压 pipe/socket 或同步 logfile 不符合当前平台契约。",
+          "V15/V18/V22：覆盖截断帧或字典→重同步并报告缺口/身份不完整，不能以客体环没有丢失声称传输完整。",
+          "平台升级：实际 QEMU 版本/后端行为变更必须重核并重跑 V18；仍需测量健康任务与计时器前进。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/B.json#CYX-AR-0002",
+        "architecture-review/rounds/R03/A.json#CYX-AR-0002",
+        "architecture-review/rounds/R04/C.json#CYX-AR-0002"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/B.json",
+          "evidence": [
+            "§2.1 固定 1 MiB ringbuf chardev，禁止隐含 stdio 复用和同步 logfile，QMP 异步 base64 导出；消费者停读与宿主整体故障的边界明确。",
+            "已核对 QEMU v9.2.0 官方 char-ringbuf.c 的 ringbuf_chr_write（52—67）：固定数组覆盖最旧字节并返回 len，不等待消费者。https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-ringbuf.c",
+            "§12.3 给出重同步帧、序号缺口、HOST_TRANSPORT_LOSS 与客体 AUDIT_LOSS 分开及字典不完整限制；总体 §9/§13 与该后端契约一致。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/A.json",
+          "evidence": [
+            "详细 §2.1 将 UP-ARM 串口后端固定为 1 MiB ringbuf，禁用隐含 stdio 多路复用和同步 logfile；采集经 QMP 异步 base64。消费者停止读取与宿主进程整体暂停/资源耗尽的保证边界已明确。",
+            "本轮独立复核官方 QEMU v9.2.0 pl011_write_txdata 的同步 write_all 路径与 ringbuf_chr_write 的有限数组覆盖写实现：固定 ringbuf 不因消费者停读而等待。源码 https://raw.githubusercontent.com/qemu/qemu/v9.2.0/hw/char/pl011.c ，https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-ringbuf.c 。",
+            "详细 §12.3 以帧长度、序号、校验及重同步识别宿主字节覆盖，HOST_TRANSPORT_LOSS 与 AUDIT_LOSS 分开；缺少身份字典不能宣称完整追溯。总体 §9/§13 的消费者停止要求与此平台约束一致。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/C.json",
+          "evidence": [
+            "详细 §2.1 固定 1 MiB ringbuf chardev、独立显示/监控、无隐含 stdio 多路复用且无同步 logfile；QMP base64 异步采集。保证明确覆盖消费者仍连接但停读，不含宿主进程整体暂停/资源耗尽。",
+            "详细 §2.1 保留 QEMU v9.2.0 PL011 与 ringbuf 源码依据，P0 固定实际版本并重核调用链，升级重跑 V18。本轮是冻结设计反向审核，未将已有源码依据等同于新运行实验。",
+            "详细 §12.3 规定可重同步帧、长度/校验/序号、HOST_TRANSPORT_LOSS 与客体 AUDIT_LOSS 分开；字典不完整明确不能完整追溯。总体 §9/§10/§13 与之相容。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/A.json#A-002"
+      },
+      "fix_sections": [
+        "详细 §2.1",
+        "详细 §12.3"
+      ]
+    },
+    {
+      "id": "CYX-AR-0003",
+      "title": "串口 IRQ 的单次字节上限缺少持续中断源的抑制与重新启用契约",
+      "severity": "Medium",
+      "domain_ids": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/A.json#A-003",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §3.2 InterruptOps/ConsoleOps",
+        "CyxiaOS-detailed-design.md §6.1（行255）",
+        "CyxiaOS-detailed-design.md §7.2（行308—318）",
+        "CyxiaOS-detailed-design.md §7.3（行322）",
+        "CyxiaOS-design.md §5（系统调用与中断成本控制）"
+      ],
+      "evidence": [
+        "串口每次中断最多 64 字节限制单次工作量；没有规定该批处理后中断仍为 pending 时的屏蔽、延迟续行、总 IRQ 预算及重新启用条件。",
+        "计时器路径明确先解除电平再 EOI，但串口未定义空 TX 队列时关闭 TX IRQ、未使用 RX/错误源的屏蔽或持续事件风暴的退避。",
+        "Arm PL011 TRM DDI 0183G §2.8.2—2.8.6 与 §3.3.10/13：RX/TX/错误可产生组合中断，需设备端清除或屏蔽；GIC EOI 不等于清除设备源。官方依据：https://documentation-service.arm.com/static/5e8e36c2fd977155116a90b5 。"
+      ],
+      "trigger_trace": [
+        "串口源被启用，输入/错误事件持续到达，或发送结束后设备源仍保持 pending。",
+        "处理器每次处理不超过 64 字节并执行 GIC EOI，满足现有单次批次限制。",
+        "未清除/未屏蔽的源立即再次触发，或新事件持续补充；再次进入同样有界处理。",
+        "无限多个有界批次仍可占满 CPU，普通任务与恢复窗口没有可证明的运行机会；普通任务系统调用 64 次限额不能限制外设中断。"
+      ],
+      "violated_requirement_or_invariant": "总体 §2.3 不长期饿死任务、§5 中断成本控制；INV-04/INV-06 的控制器截止与恢复运行机会；审核计划强制中断风暴场景。",
+      "impact": "当前接口不能区分“每次 IRQ 有界”和“累计 IRQ 开销受控”，实现者可能满足明文批次条件仍无法完成风暴生存性验收。由于具体中断使能方案尚未固定，按重要接口缺口列 Medium，不宣称已实现驱动必然存在死循环。",
+      "proposed_resolution": "定义首版中断源白名单，未使用 RX/错误源保持屏蔽；TX 仅在有待发数据时启用、空队列即屏蔽。达到字节/时间预算或源无法解除时屏蔽该非关键源，保存待处理事实，由有预算的延迟工作/定时器续行并在安全条件满足时重新启用；持续异常达到阈值时保留诊断计数并停用该源。禁止屏蔽调度定时器以实现退避。补充持续 RX、空 TX、卡住 pending 与未知 IRQ 的故障测试，检查健康任务计数和控制截止接管。",
+      "affected_domains": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.7",
+      "verification_scenarios": [
+        "V19"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0003",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §6.1 仅启用 TX，RX/接收超时/错误屏蔽；空 TX 队列关闭 TX IRQ，IRQ 入口先设备屏蔽，再确认/清除；GIC EOI 不替代设备源处理。",
+          "每批最多 64 字节并检查时间，普通外设顶半部共享 50 μs/1 ms 目标额度；预算耗尽保留 pending 并进入 KernelWork，调度定时器不屏蔽。IRQ/KernelWork 执行分类互斥，不重复计费。",
+          "空→非空在同一驱动短临界区发布 pending 与工作期限；屏蔽状态 tx_service 主动写数据。跨预算续行亦主动发送，不等待首次 IRQ、阈值边沿或 raw TX pending 自行消失。",
+          "队列消费按设备接受字节更新；队列检查、pending 清除及入队用同一临界区。未获预算且未执行探测不计失败；连续三个间隔至少 100 ms 的已执行无进展探测才隔离，正常最慢排空时间在 P0 核对。隔离丢弃并计数，后续 CLOSED，不重复登记失败设备。",
+          "详细 §7.2/§7.3/§9.1 保留期限与预算，模型 LATCHED 或无普通 runnable 仍可续行；总体 §13 v0.7 和 V19 覆盖主动启动/续行修订。"
+        ],
+        "scenarios": [
+          "初次启动：TXIC 已清且未来没有 IRQ，console_write 将空队列变非空→登记 KernelWork→预算允许后 masked tx_service 主动写首字节，原等待首 IRQ 的停滞链不成立。",
+          "风暴：持续 RX/错误被白名单屏蔽；TX 重复 pending 每批先屏蔽，额度耗尽不重新无界进入，工作在下个可执行期限续行；未知源屏蔽并只记摘要，伪中断依控制器契约处理。",
+          "跨预算：软件队列长于一批、raw TX=1 或 TXIC 清除后不再出现边沿→保存 pending 和期限→KernelWork 在屏蔽态主动接受字节→有进展，不能据 raw pending 将健康设备隔离。",
+          "预算等待：本周期 1 ms 共享额度耗尽→保留待发事实→下一周期并满足 500 μs 间隔/尾部规则才探测；未实际运行的等待不递增失败次数。",
+          "空队列交错：最后发送先清 pending，则之后入队重新 kick；入队先发生，则发送方在同一临界区重查非空并保持续行。不存在未受保护的清位覆盖新入队。",
+          "设备真失效：三个满足间隔且无字节接受的实际探测→隔离→计丢失并返回 CLOSED，不重复工作；正常发送速率及最小原语超调须由 P0/V19 测量，未宣称硬实时或硬件已验证。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R03/A.json#CYX-AR-0003",
+        "architecture-review/rounds/R04/C.json#CYX-AR-0003"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "REOPENED",
+          "review": "architecture-review/rounds/R02/B.json",
+          "evidence": [
+            "白名单、50 μs/1 ms 外设目标额度、设备源屏蔽和独立调度定时器已阻断原无限 IRQ 重入反例。",
+            "但重新启用仅在源已解除时发生，缺少主动 TX kick 与正常 pending 的进展识别；见 R02-B-001 的官方依据和两个反例。"
+          ]
+        },
+        {
+          "round": "R02",
+          "status": "FIXED_PENDING_REVIEW",
+          "fix": "v0.7 §6.1 masked bounded TX service and progress-based recovery; V19 extended"
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/A.json",
+          "evidence": [
+            "详细 §6.1 首版仅 TX 可启用，RX/接收超时/错误保持屏蔽；每次最多 64 字节并检查时间，普通外设顶半部共享 50 μs/1 ms 目标额度，达到额度在设备侧屏蔽而非只执行 GIC EOI。关键调度定时器不受退避屏蔽。",
+            "v0.7 明确空→非空在驱动 IRQ 保护短临界区登记 pending/KernelWork 到期；tx_service 在屏蔽 TX 时主动发送。跨批次/预算后的续行也主动发送，不以 raw TX pending 自行消失或下一阈值边沿为前提。",
+            "软件队列按设备接受字节同步消费，正常 TX pending 不计失败；预算等待未执行探测不计失败。连续三个间隔至少 100 ms 的已执行无进展探测才进入隔离，隔离丢弃并计损失、后续 CLOSED，不循环登记失败工作。P0 需核对正常最慢排空时间。",
+            "队列检查/pending 清除/入队共享驱动短临界区，空队列关闭 TX IRQ；§7.2—7.3/§9.1 为延迟工作保留预算、期限和公平续行，IRQ 与 KernelWork 计费分类互斥。总体 §13 v0.7 同步主动发送/进展隔离，V19 包含正常跨预算续发和 TXIC 后重启。",
+            "本轮核对 Arm PL011 DDI 0183G §2.8.3、§3.3.10：初始发送不能仅依赖开中断，TX 阈值通知须由写入/排空推进，设备 mask 与清除有独立语义。https://documentation-service.arm.com/static/5e8e36c2fd977155116a90b5 。QEMU v9.2.0 pl011.c 写数据置 INT_TX、ICR 清除、IMSC 只改 mask；本版主动续行适配两者。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/C.json",
+          "evidence": [
+            "详细 §6.1 仅启用 TX，RX/接收超时/错误屏蔽；空 TX 队列关闭 TX IRQ，IRQ 入口先设备屏蔽，再确认/清除；GIC EOI 不替代设备源处理。",
+            "每批最多 64 字节并检查时间，普通外设顶半部共享 50 μs/1 ms 目标额度；预算耗尽保留 pending 并进入 KernelWork，调度定时器不屏蔽。IRQ/KernelWork 执行分类互斥，不重复计费。",
+            "空→非空在同一驱动短临界区发布 pending 与工作期限；屏蔽状态 tx_service 主动写数据。跨预算续行亦主动发送，不等待首次 IRQ、阈值边沿或 raw TX pending 自行消失。",
+            "队列消费按设备接受字节更新；队列检查、pending 清除及入队用同一临界区。未获预算且未执行探测不计失败；连续三个间隔至少 100 ms 的已执行无进展探测才隔离，正常最慢排空时间在 P0 核对。隔离丢弃并计数，后续 CLOSED，不重复登记失败设备。",
+            "详细 §7.2/§7.3/§9.1 保留期限与预算，模型 LATCHED 或无普通 runnable 仍可续行；总体 §13 v0.7 和 V19 覆盖主动启动/续行修订。"
+          ]
+        }
+      ],
+      "reopen_evidence": "architecture-review/rounds/R02/B.json#R02-B-001",
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/A.json#A-003"
+      },
+      "fix_sections": [
+        "详细 §6.1",
+        "详细 §9.1",
+        "详细 V19"
+      ]
+    },
+    {
+      "id": "CYX-AR-0004",
+      "title": "远端 pending 唤醒与空闲进入之间缺少有界进展契约",
+      "severity": "High",
+      "domain_ids": [
+        "D02",
+        "D03",
+        "D05",
+        "D06",
+        "D07",
+        "D08",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/B.json#B-01",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §7.2 第6项",
+        "CyxiaOS-detailed-design.md §7.3 软件截止时间集合",
+        "CyxiaOS-detailed-design.md §10.6.4 远端唤醒及收件箱满处理",
+        "CyxiaOS-detailed-design.md §3.2 ClockEvent/InterruptOps"
+      ],
+      "evidence": "收件箱满时保存 pending_wake 与待扫描标志，并允许“随后 IPI 或周期调度点继续处理”。但 idle 只等待最近定时事件，软件截止集合没有要求在线空闲核的维护周期；也没有规定跨核 pending 发布与本核最后一次检查、进入 idle 的握手。持久化事实可避免数据丢失，不能单独保证接收核再次执行。",
+      "trigger_trace": [
+        "目标核 B 无普通 RUNNABLE 任务，现有 IPC 等待无有限截止，自检/恢复也没有待续行任务；B 决定 idle。",
+        "源核 A 完成 B 所属任务 T 的 WaitCell；目标收件箱满，A 正确保存 pending_wake 和待扫描位。",
+        "A 采用文档允许的“周期调度点继续处理”分支；B 依照 §7.2 没有下一软件定时事件。",
+        "B 没有被保证的 IPI 或维护 tick；T 的 COMPLETED 结果永久存在但不被消费，T 不能重新入队。即使采用 IPI，idle 最后检查与睡眠之间也需明确平台级握手以封闭检查后到达窗口。"
+      ],
+      "violated_requirement_or_invariant": "INV-06/INV-09；远端等待完成必须有独立于模型与用户定时器的后续消费路径。",
+      "impact": "在承诺的 SMP 扩展中，合法 IPC 完成可以永久不能转为任务进展。不是容量丢失，而是事件保存后缺少保证发生的消费调度点。",
+      "proposed_resolution": "规定 pending/收件箱以同步发布后必须触发目标核通知；明确目标核 idle 前在本地 IRQ 约束下重查全部 pending，使用能封闭检查后入睡窗口的平台 idle 原语。为每个 ONLINE 核保留有界维护 deadline 或等效可靠通知确认机制，写明最大扫描批次及余项续行；增加“目标核无用户定时器、收件箱满、唤醒恰逢 idle”交错用例。",
+      "affected_domains": [
+        "D02",
+        "D03",
+        "D05",
+        "D06",
+        "D07",
+        "D08",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "S09"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0004",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §10.6.4 将满收件箱退化为 pending_wake/有界任务位集，而非丢弃；Release 发布后必须通知，ONLINE 核始终保留至多 1 ms 维护 tick，单批最多 64 项且残留登记续行。",
+          "详细 §3.2 IdleOps、§7.2(7)、§7.3 把最终 Acquire 检查、中断可唤醒睡眠握手及维护截止纳入平台与调度契约；总体 §5 与之同步。",
+          "详细 §6.1、§10.6.7 禁止 IPI handler 等待归属锁，事件消费发生在正常调度路径；通知的合并不会取消保存的完成事实。"
+        ],
+        "scenarios": [
+          "S03/S09 反向从永久睡眠推演：B 无用户 timer，A 已完成 B 的 WaitCell，收件箱满。保存 pending 后首次无→有发 IPI；若 B 最终检查在发布之后，取消 idle；若在发布之前，平台握手保证待决中断可唤醒。",
+          "若 IPI 丢失或合并：B 的独立维护 tick 仍到期；Acquire 扫描取得事实，已归属阻塞任务保留容量，可以入队。故原反例不能仅因用户 timer 缺失成立。",
+          "若单批达到上限：未处理位与续行期限保留，不能无限 drain，也不能消耗唯一事实后取消所有未来执行机会。真正失联 CPU 按故障路径处理，未将其混为可恢复通知丢失。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/C.json#CYX-AR-0004",
+        "architecture-review/rounds/R03/B.json#CYX-AR-0004",
+        "architecture-review/rounds/R04/A.json#CYX-AR-0004"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/C.json",
+          "evidence": [
+            "详细 §3.2 IdleOps：最终 Acquire 检查与可被中断唤醒的睡眠形成平台握手。",
+            "详细 §7.2(7)、§7.3、§10.6.4：每 ONLINE CPU 至多 1 ms 维护 tick，软件期限不得在无用户 timer 时取消；发布 pending 后必须通知，批次最多 64 项且余项登记续行。",
+            "总体 §5：同步声明发布—通知—空闲握手和在线核维护 tick。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/B.json",
+          "evidence": [
+            "详细 §3.2 IdleOps、§7.2(7)、§7.3 与 §10.6.4 明确 Release 发布后通知、最终 Acquire 检查与可中断睡眠握手、每 ONLINE 核至多 1 ms 维护 tick、最多 64 项批次及残留续行。总体 §5 同步在线维护与空闲握手。",
+            "IPI 顶半部只记录 pending，不等待归属锁；共享锁 irq-save 与后续正常调度路径处理共同避免中断阻塞在被中断者的锁上。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/A.json",
+          "evidence": [
+            "详细 §10.6.4 将满收件箱退化为 pending_wake/有界任务位集，而非丢弃；Release 发布后必须通知，ONLINE 核始终保留至多 1 ms 维护 tick，单批最多 64 项且残留登记续行。",
+            "详细 §3.2 IdleOps、§7.2(7)、§7.3 把最终 Acquire 检查、中断可唤醒睡眠握手及维护截止纳入平台与调度契约；总体 §5 与之同步。",
+            "详细 §6.1、§10.6.7 禁止 IPI handler 等待归属锁，事件消费发生在正常调度路径；通知的合并不会取消保存的完成事实。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/B.json#B-01"
+      },
+      "fix_sections": [
+        "详细 §3.2",
+        "详细 §10.6.4"
+      ]
+    },
+    {
+      "id": "CYX-AR-0005",
+      "title": "普通任务分批退出清理没有进入调度循环的执行与续行规则",
+      "severity": "Medium",
+      "domain_ids": [
+        "D04",
+        "D05",
+        "D07",
+        "D08",
+        "D12",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/B.json#B-02",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §5.1 EXITED→REAPED",
+        "CyxiaOS-detailed-design.md §7.2 第5—7项",
+        "CyxiaOS-detailed-design.md §9 普通任务退出",
+        "CyxiaOS-detailed-design.md §10.6.7 延期回收"
+      ],
+      "evidence": "§9 要求任务先不可调度，再分批解除映射与回收；§10.6.7 使用显式引用与延期回收队列。§7.2 的维护入口却只在 SELF_TEST 或 RECOVERING 执行，§7.3 共享保留账本只明确推理、自检、恢复维护；没有普通 EXITED 对象的回收执行者、续行 deadline 或预算归属。",
+      "trigger_trace": [
+        "普通任务 T 在 AI_ACTIVE 状态退出，第一批完成不可调度、能力撤销及部分页清理；仍有多批清理或待解除引用。",
+        "T 已不能再次被派发；控制器健康状态仍是 AI_ACTIVE。",
+        "其他普通任务也退出或无限期阻塞。调度点既不满足 SELF_TEST/RECOVERING 维护分支，也没有 runnable 任务，于是 idle。",
+        "普通回收队列尚非空，但没有规则保证下一清理批次会运行；即使稍后 ACK 到达使引用数归零，也没有定义如何重新安排回收。"
+      ],
+      "violated_requirement_or_invariant": "INV-06；任务退出清理与资源回收不能依赖控制器故障或普通任务继续运行。",
+      "impact": "普通退出资源可能永久留在 EXITED/延期回收队列；实现者只能另行发明后台执行和计费规则，或将全部清理塞入退出路径破坏有界性。",
+      "proposed_resolution": "将普通退出/延期回收定义为有界内核工作类，指定队列所有者、每批上限、可执行调度点、独立或明确共享的预算、等待引用/ACK后的重新激活方式，以及队列非空时的下一维护 deadline。该工作不应依赖控制器健康状态，也不能忙轮询未完成 ACK；V12 增加“最后可运行任务退出”与 AI_ACTIVE/LATCHED 两种健康状态。",
+      "affected_domains": [
+        "D04",
+        "D05",
+        "D07",
+        "D08",
+        "D12",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V20"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0005",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §9.1 明确 EXITED 即登记通用 KernelWork，满队列仍保留 pending；可执行集合与等待引用/TLB ACK 集合分开，条件满足重新发布并通知 owner。",
+          "详细 §7.2(5—7)、§7.3、§9.1 给出任何模型状态和无普通 runnable 时的执行入口，既有 1 ms/10 ms 内保留一次 250 μs，不新增预算；500 μs 间隔、周期尾部和超调计费同样适用。",
+          "固定类别轮转、最小原语后检查时间并保存游标、后到工作不插队；总体 §5 已声明通用清理/驱动工作共享额度及独立推进。"
+        ],
+        "scenarios": [
+          "V12/V20 从资源永久滞留反推：最后一个普通任务退出且模型 LATCHED，EXITED 登记仍有效；通用工作入口位于 idle 前，未完成游标和下一可执行/预算刷新期限保留，故不依赖再有普通任务运行。",
+          "本周期 1 ms 已全部消费后新退出：只登记下一周期，不重复发放保留；下一周期有工作先保留 250 μs，模型/自检/恢复只能竞争余量，状态切换不能刷新余额。",
+          "引用或 ACK 延迟：任务不进入忙轮询的可执行队列，也不提前 REAPED；解除最后条件后重新发布，清零完成后才回到可授权页池。",
+          "驱动 TX 长队列与大量清零并存：使用同一工作类别轮转与账本，不能因每次新 TX kick 永久挤走旧清理。实际墙钟进度仍须 V19/V20 测量。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/C.json#CYX-AR-0005",
+        "architecture-review/rounds/R03/B.json#CYX-AR-0005",
+        "architecture-review/rounds/R04/A.json#CYX-AR-0005"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/C.json",
+          "evidence": [
+            "详细 §9.1：EXITED 即登记 KernelWork，容量覆盖所有对象，满队列仍保留可扫描 pending；执行与等待引用/ACK 两集合分离。",
+            "详细 §7.2(5—7)、§7.3、§9.1：通用工作在任何模型状态和无 runnable 时运行，共享既有 1 ms/10 ms 账本，保留一次 250 μs，类别轮转及游标有界续行；无工作不闲置保留，额度用尽后到达等待下一周期。",
+            "详细 §4.1、§9、§10.6.7：解除引用/TLB 完成后才可进入清零与复用；总体 §5 对共享账本及通用回收独立推进一致。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/B.json",
+          "evidence": [
+            "详细 §9.1 的 EXITED→KernelWork、可执行/等引用与 ACK 分集、满队列 pending 后备、重新发布通知，给出完整执行和续行路径。",
+            "§7.2(5—7)、§7.3、§9.1：任意模型状态及无普通 runnable 均可执行；每 10 ms 的既有 1 ms 内保留一次 250 μs，所有批次共享 500 μs 间隔、周期尾部拒绝和实际计费。",
+            "§9.1 固定工作类别轮转与保存游标；§6.1 新 TX 主动续行属于已有驱动工作类，不新设私有额度，预算等待不记设备失败；隔离停止重复登记。总体 §5 与此一致。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/A.json",
+          "evidence": [
+            "详细 §9.1 明确 EXITED 即登记通用 KernelWork，满队列仍保留 pending；可执行集合与等待引用/TLB ACK 集合分开，条件满足重新发布并通知 owner。",
+            "详细 §7.2(5—7)、§7.3、§9.1 给出任何模型状态和无普通 runnable 时的执行入口，既有 1 ms/10 ms 内保留一次 250 μs，不新增预算；500 μs 间隔、周期尾部和超调计费同样适用。",
+            "固定类别轮转、最小原语后检查时间并保存游标、后到工作不插队；总体 §5 已声明通用清理/驱动工作共享额度及独立推进。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/B.json#B-02"
+      },
+      "fix_sections": [
+        "详细 §7.2",
+        "详细 §9.1"
+      ]
+    },
+    {
+      "id": "CYX-AR-0006",
+      "title": "防重放代际的溢出策略仅覆盖 TCB 槽位",
+      "severity": "Low",
+      "domain_ids": [
+        "D05",
+        "D06",
+        "D08",
+        "D10",
+        "D12",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/B.json#B-03",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §5.1 task generation 溢出",
+        "CyxiaOS-detailed-design.md §5.2 能力槽代际",
+        "CyxiaOS-detailed-design.md §6.3—6.4 controller_epoch/decision_seq",
+        "CyxiaOS-detailed-design.md §10.6.4 wait_generation/owner_version",
+        "CyxiaOS-detailed-design.md §10.6.7 mapping_epoch"
+      ],
+      "evidence": "§5.1 明确任务 generation 溢出永久退役槽位，其余用于识别旧操作的有限宽度 epoch/sequence/version 未给出递增耗尽的统一处理。v1 controller_epoch 和 decision_seq 已明确为 u64；能力槽与等待等代际甚至没有给出宽度或耗尽契约。",
+      "trigger_trace": [
+        "某有限宽度身份计数达到其最大值；为检验可使用缩小位宽的状态机而非实际等待 u64 耗尽。",
+        "下一次操作需要新代际；现有文档没有规定拒绝、退役、受控重启或扩大身份域。",
+        "若按整数回绕生成新身份，先前保留的同字段身份重新匹配；若实现自行拒绝，则失败路径与对象状态同样未定义。"
+      ],
+      "violated_requirement_or_invariant": "INV-05/INV-09；旧身份永不重新有效，迁移和回收必须保持可验证所有权。",
+      "impact": "防重放接口在耗尽边界未闭合；u64 使当前运行中的现实发生概率极低，因此按 Low 处理，不宣称存在近期可利用攻击。",
+      "proposed_resolution": "增加统一 checked-increment/no-reuse 规则，列出所有能力槽、等待、归属、模型实例、决策、映射和迁移身份；耗尽时停止产生新事务并退役对象或进入明确受控重启路径，不回绕。对 boot_epoch 的重启复用说明必须先隔离旧消息/旧实例，采用缩小位宽模拟验证边界。",
+      "affected_domains": [
+        "D05",
+        "D06",
+        "D08",
+        "D10",
+        "D12",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V21"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0006",
+        "result": "CLOSED",
+        "evidence": [
+          "详细 §5.0 为 task/capability/wait/wake/owner/migration/mapping/controller/decision/config/model/audit 身份统一规定检查式递增、不绕回、0 无效，事务开始前预留成功/取消/回滚所需身份。",
+          "耗尽分别导致槽退役、新等待 EXHAUSTED、保持 owner 并拒绝迁移、控制器 LATCHED、映射隔离且禁止重新授权、配置拒绝及审计 exhausted；不是仅把 u64 足够大作为论据。",
+          "boot_epoch 只能在隔离所有旧 CPU、内存消息和实例的冷启动后重置，导出 capture_id 区分启动；总体 §13 v0.6 与 V21 覆盖对应边界。"
+        ],
+        "scenarios": [
+          "缩位宽令等待/迁移身份到最大值：若不能预留完整终结所需身份，在开始事务前拒绝；源任务仍可运行，未把失败推迟到无身份回滚的 MIGRATING 状态。",
+          "已启动迁移遇下一次身份耗尽：原事务预留仍可完成或取消，源回滚槽仍在；旧 owner_version 或 migration_id 不会循环再生。",
+          "映射撤销代际耗尽：隔离空间、保留页并进入受控故障，不能重新授权旧页；已必需的安全隔离不能被耗尽拒绝。",
+          "决策身份耗尽关闭提交能力；能力/任务槽永久退役。旧句柄和迟到完成无合法重用身份；审计耗尽停止新记录且单独保留标记。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/C.json#CYX-AR-0006",
+        "architecture-review/rounds/R03/B.json#CYX-AR-0006",
+        "architecture-review/rounds/R04/A.json#CYX-AR-0006"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/C.json",
+          "evidence": [
+            "详细 §5.0：统一列举 capability/task/wait/wake/owner/migration/mapping/controller/decision/config/model/audit 身份，检查式递增、不绕回、0 无效；事务开始预留成功/取消/回滚所需新代际。",
+            "详细 §5.0、§5.1：槽退役、拒绝新等待/迁移、控制器 LATCHED、映射隔离、配置拒绝、审计 exhausted 均有明确结果；boot_epoch 重置须隔离全部旧实例/CPU/消息。",
+            "总体 v0.6 摘要声明所有代际/序号耗尽处理；详细 V21 明确缩小位宽覆盖已开始事务终结。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/B.json",
+          "evidence": [
+            "详细 §5.0 明确全部防复用身份 checked 递增、0 无效、禁止绕回，并在事务开始预留成功/取消/回滚所需身份。",
+            "§5.0 为任务/能力槽退役、等待拒绝 EXHAUSTED、迁移保持 owner、控制器 LATCHED、映射隔离保留、配置拒绝与审计 exhausted 分别给出结果。",
+            "boot_epoch 重置前须隔离旧 CPU、消息与实例；跨启动 capture_id 不混淆本地身份。总体 §13 v0.6 摘要和 V21 同步。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/A.json",
+          "evidence": [
+            "详细 §5.0 为 task/capability/wait/wake/owner/migration/mapping/controller/decision/config/model/audit 身份统一规定检查式递增、不绕回、0 无效，事务开始前预留成功/取消/回滚所需身份。",
+            "耗尽分别导致槽退役、新等待 EXHAUSTED、保持 owner 并拒绝迁移、控制器 LATCHED、映射隔离且禁止重新授权、配置拒绝及审计 exhausted；不是仅把 u64 足够大作为论据。",
+            "boot_epoch 只能在隔离所有旧 CPU、内存消息和实例的冷启动后重置，导出 capture_id 区分启动；总体 §13 v0.6 与 V21 覆盖对应边界。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/B.json#B-03"
+      },
+      "fix_sections": [
+        "详细 §5.0"
+      ]
+    },
+    {
+      "id": "CYX-AR-0007",
+      "title": "整数特征与缩放格式缺少可唯一执行的数值语义",
+      "severity": "Medium",
+      "domain_ids": [
+        "D03",
+        "D09",
+        "D10",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/C.json#R01-C-01",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §6.3",
+        "CyxiaOS-detailed-design.md §8.2—8.4",
+        "CyxiaOS-detailed-design.md §13.1 V14、§13.4 X02",
+        "CyxiaOS-design.md §7"
+      ],
+      "evidence": [
+        "§8.2规定 clamp(value / cap, 0, 1) 后转为非负Q15，但没有给整数除法/乘法顺序、舍入方式、截断前溢出规则或目标权重的整数表示。",
+        "§8.3要求按模型格式定义的舍入规则执行，§8.4只列缩放参数版本，没有实际给出乘数位宽、允许移位范围和舍入规则。当前两文档中没有该被引用的数值契约。",
+        "§6.3列出的头部及任务原始计量没有明确承载§8.2的上次用户推理耗时、三个目标权重等全部全局特征；控制器不能用read_clock等普通调用自行补测（§6.1）。",
+        "V14/X02要求主机、客体及第二架构逐项一致，因此缺失的不是模型性能测量，而是三方必须共同实现的输入与整数语义。"
+      ],
+      "trigger_trace": [
+        "主机实现对125ms/250ms归一化采用最近舍入，得到16384；客体实现采用截断，得到16383；二者都符合当前“确定性整数实现”文字。",
+        "为接近评分/时间片平分边界的合法网络输入运行两实现，单个输入或缩放末位不同即可改变argmax。",
+        "有限已知答案向量若不覆盖该中间值，部署自检通过仍不能解决规范中两种合法解释；换架构后相同原始状态可能改变派发。"
+      ],
+      "violated_requirement_or_invariant": "跨平台一致性要求与 V14/X02；相同原始输入须有唯一整数输出规范。",
+      "impact": "训练、客体推理和重放没有唯一参考语义；跨平台逐项一致及模型来源重放难以据现有契约实施。该问题不意味着现有int32累加必然溢出，也不要求提前实测推理性能。",
+      "proposed_resolution": "冻结一个版本化的整数数值契约：例如先对原始无符号值限幅，再以足够宽度计算floor(min(value,cap)*32767/cap)；明确目标权重编码与总和规则、乘数有符号位宽、移位范围、负值舍入与饱和次序，并拒绝非法缩放参数。给出完整全局特征来源/快照字段表。增加半单位、负半单位、最大乘积、越界移位和冷启动的参考向量；该格式可以是建议v1，但不能只引用不存在的定义。",
+      "affected_domains": [
+        "D03",
+        "D09",
+        "D10",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V14",
+        "X02"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0007",
+        "result": "CLOSED",
+        "evidence": [
+          "详细§6.3显式承载16项任务原始计量及8项全局特征，包含上次普通推理耗时、Q15目标权重和缺失历史零值；§8.2先限幅再乘32767整除，cap限制使u64乘法安全。",
+          "详细§8.3固定逐输入累加、int64偏置界检查、m=1..2147483647、s=0..31、半值远离零、隐藏层/输出层饱和及窄化次序；未知版本和超界参数拒绝。总体§13 v0.6同步数值规则。",
+          "独立核算1396参数、1344 MAC/任务、86016 MAC/64任务，初始权重和32767；保守缩放及舍入上界4611686015206162433小于int64最大值9223372036854775807。"
+        ],
+        "scenarios": [
+          "125ms/250ms只允许16383；不能以平台默认最近舍入变成16384。",
+          "p=±1且s=1得到±1；s=0无移位，s=31仍按正绝对值算式，不依赖负数右移。",
+          "INT32_MIN偏置以int64取绝对值后拒绝越界；无候选不执行推理，控制器不需非法调用read_clock补齐特征。",
+          "跨架构/主机重放共用V14、X02黄金向量；当前关闭为规范闭合，测试尚未运行。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/A.json#CYX-AR-0007",
+        "architecture-review/rounds/R03/C.json#CYX-AR-0007",
+        "architecture-review/rounds/R04/B.json#CYX-AR-0007"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/A.json",
+          "evidence": [
+            "详细 §6.3 明确完整全局计量、上次普通推理 EL0 时间、三项 u16 Q15 权重及总和，任务条目须承载 §8 全部 16 项原始特征；§8.2 给定非负整数 floor(min(raw,cap)*32767/cap)、cap 上界、冷启动零值与窗口切分。",
+            "详细 §8.3 固定输入/权重/累加宽度，int64 校验 abs(bias)+dim*32767*128，m=1..2147483647、s=0..31、负半值远离零舍入、隐藏层和输出层饱和次序，拒绝未知版本和非法参数。总体 §13 v0.6 同步说明整数语义。",
+            "静态核算：24→32→16→4 为 1396 参数、1344 MAC/任务、86016 MAC/64任务；Q15 权重 16384+9830+6553=32767。最大 abs(z*m)+舍入增量上界 4611686015206162433，小于 int64 最大值；偏置验证使用 int64，避免 abs(INT32_MIN) 本身溢出。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/C.json",
+          "evidence": [
+            "详细§6.3要求快照承载全部16项任务特征原始计量、8项全局特征及Q15权重；§8.2固定先限幅、乘32767、整除向下取整，cap上界确保u64乘法安全，历史缺失为0。",
+            "详细§8.3固定int8权重、int16激活、int32有界累加、int64偏置界验证及缩放，m和s范围、半值远离零及先饱和再窄化均唯一确定；总体§13 v0.6同步。",
+            "独立核算1396参数、1344 MAC/任务、86016 MAC/64任务；权重和32767；abs(z*m)+最大舍入增量上界4611686015206162433，小于9223372036854775807。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/B.json",
+          "evidence": [
+            "详细§6.3显式承载16项任务原始计量及8项全局特征，包含上次普通推理耗时、Q15目标权重和缺失历史零值；§8.2先限幅再乘32767整除，cap限制使u64乘法安全。",
+            "详细§8.3固定逐输入累加、int64偏置界检查、m=1..2147483647、s=0..31、半值远离零、隐藏层/输出层饱和及窄化次序；未知版本和超界参数拒绝。总体§13 v0.6同步数值规则。",
+            "独立核算1396参数、1344 MAC/任务、86016 MAC/64任务，初始权重和32767；保守缩放及舍入上界4611686015206162433小于int64最大值9223372036854775807。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/C.json#R01-C-01"
+      },
+      "fix_sections": [
+        "详细 §6.3",
+        "详细 §8.2",
+        "详细 §8.3"
+      ]
+    },
+    {
+      "id": "CYX-AR-0008",
+      "title": "按原值10%限制配额调整使零配额无法重新启用",
+      "severity": "Medium",
+      "domain_ids": [
+        "D10",
+        "D12",
+        "D14",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/C.json#R01-C-02",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §10.2",
+        "CyxiaOS-detailed-design.md §10.4—10.5",
+        "CyxiaOS-design.md §6.4、§12"
+      ],
+      "evidence": [
+        "§10.5规定“每轮不超过原值的10%，并设置两轮观察期”。",
+        "内存软预算、网络速率与缓冲配额均可调整，但没有禁止零值或定义零值到正值的激活例外；紧急例外仅描述内存压力保护。",
+        "这是已选择的未来接口约束中的活性问题，不是要求现在实现P5。"
+      ],
+      "trigger_trace": [
+        "未来网络队列或缓存任务以合法的0配额启动，或管理员暂停后保留0配额。",
+        "随后资源可用，模型提出从0增加到正数的合法总预算内提案。",
+        "按每轮增量<=旧值*10%校验，允许增量始终为0；等任意多轮观察期仍不能恢复该对象。",
+        "若配额以页数或请求数为整数单位，较小正值也可能因步长向下取整出现相同停滞。"
+      ],
+      "violated_requirement_or_invariant": "详细 §10.2–10.5 的合法资源调整/恢复目标；硬限额内零配额必须有可实施的激活路径。",
+      "impact": "联合控制的稳定性保护反而永久阻止合法资源启用/恢复；新增资源无法通过已描述接口获得初始额度。",
+      "proposed_resolution": "定义零值的语义与显式激活路径；调整界限采用有单位的最小绝对步长与相对步长组合，或将首次授予/管理员恢复列为经过总预算和权限检查的例外。明确整数取整和两轮观察期按哪个控制器时钟计。增加0→正值、单页配额、暂停后恢复和总预算不足的P5契约测试。",
+      "affected_domains": [
+        "D10",
+        "D12",
+        "D14",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V23"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0008",
+        "result": "CLOSED",
+        "evidence": [
+          "详细§10.5的max(ceil(old/10),granule)给零值与小整数配额明确非零步长；granule为各资源规格冻结的正最小单位。",
+          "同节分离授权/启停与配额，零到正值必须预留全局容量并服从对象硬上限，容量不足拒绝配置；两轮观察按各资源周期，联合更新等待全部受影响资源完成。",
+          "详细§10.1区分配置原子发布与异步设备效果，§10.2禁止通过软预算收缩丢弃匿名/固定/DMA页；总体§6.4、§13 v0.6以及V23一致。"
+        ],
+        "scenarios": [
+          "old=0、granule=1可增至1；old=1也可增加1，不再永久卡零或因整数截断停滞。",
+          "禁用队列不能被模型增配恢复授权；已授权队列也需全局容量，失败保持旧配置。",
+          "收缩预算不等于释放在用物理资源；部分I/O执行后回退配置不宣称撤销已发包或写盘。",
+          "CPU高频窗口不能提前消耗内存/网络两轮观察期；稳定性实验作为P5义务保留。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/A.json#CYX-AR-0008",
+        "architecture-review/rounds/R03/C.json#CYX-AR-0008",
+        "architecture-review/rounds/R04/B.json#CYX-AR-0008"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/A.json",
+          "evidence": [
+            "详细 §10.5 改为 max(ceil(old/10),granule)，granule 为在资源规格冻结的正最小单位。零值及小整数额度均有非零增长步长。",
+            "授权/启停与数值配额分离，零到正需已授权且预留全局容量，不能启动管理员禁用对象；更新仍服从对象硬上限及总额。",
+            "两轮观察以各资源冻结的决策周期计，联合配置等待每个受影响资源各自完成两轮；§10.1 区分配置原子发布和异步 I/O 已发生的效果。总体 §13 v0.6 与 V23 同步。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/C.json",
+          "evidence": [
+            "详细§10.5规定max(ceil(old/10),granule)，granule为冻结的资源正最小单位；授权、启停和数值配额分离。",
+            "零到正值需原有授权、预留全局容量并满足对象硬上限；容量不足拒绝整项配置。观察期按各资源冻结周期，联合配置等待所有受影响资源完成两轮。",
+            "详细§10.1的配置原子发布与异步I/O结果分离，§10.2不能因软预算收缩丢弃匿名/固定/DMA页；总体§6.4、§13及V23保持一致。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/B.json",
+          "evidence": [
+            "详细§10.5的max(ceil(old/10),granule)给零值与小整数配额明确非零步长；granule为各资源规格冻结的正最小单位。",
+            "同节分离授权/启停与配额，零到正值必须预留全局容量并服从对象硬上限，容量不足拒绝配置；两轮观察按各资源周期，联合更新等待全部受影响资源完成。",
+            "详细§10.1区分配置原子发布与异步设备效果，§10.2禁止通过软预算收缩丢弃匿名/固定/DMA页；总体§6.4、§13 v0.6以及V23一致。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/C.json#R01-C-02"
+      },
+      "fix_sections": [
+        "详细 §10.5"
+      ]
+    },
+    {
+      "id": "CYX-AR-0009",
+      "title": "审计环覆盖模型注册记录后缺少强制保留的身份解析路径",
+      "severity": "Low",
+      "domain_ids": [
+        "D09",
+        "D10",
+        "D15",
+        "D16"
+      ],
+      "baseline_hashes": {
+        "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+        "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+      },
+      "round_found": "R01",
+      "source": "architecture-review/rounds/R01/C.json#R01-C-03",
+      "file_sections": [
+        "CyxiaOS-detailed-design.md §12.1、§12.3",
+        "CyxiaOS-design.md §1、§9"
+      ],
+      "evidence": [
+        "§12.1规定模型hash只在注册记录保存，后续记录使用内核分配的model_id关联。",
+        "§12.3允许持续审计覆盖完整旧记录；未规定保留注册字典、导出当前模型注册表或在捕获开始时重发模型身份记录。",
+        "总体§1要求能说明每次资源决策来自哪个模型；§9要求记录关联模型版本。完整短片段模式要求保存模型版本，但不能自动覆盖持续模式中早期注册记录被覆写的情况。"
+      ],
+      "trigger_trace": [
+        "启动写入MODEL_LOAD/注册记录并分配model_id。",
+        "持续负载填满1MiB环，最早注册记录被正常覆盖。",
+        "诊断消费者之后才连接，导出仍存活的DECISION/DISPATCH；这些记录只包含model_id，所依赖的hash记录已经不存在。",
+        "没有已规定的注册表导出或捕获前身份字典，消费者不能仅凭导出材料解析该id对应的模型内容。"
+      ],
+      "violated_requirement_or_invariant": "总体 §1、§9 的可追溯目标；仍保留的决策必须能够关联到具体模型身份。",
+      "impact": "系统继续安全调度，但保留下来的审计事件不能独立归因到具体模型。外部实验清单可以补救单次实验，不是当前协议保证的持续审计解析路径。",
+      "proposed_resolution": "给环外有界模型/配置注册字典及导出接口，或规定每次捕获的前导字典必须包含仍可能被记录引用的身份，并与本次启动关联；若关联材料已丢失则明确标注不可归因，不能输出完整归因声明。V15加入先覆盖注册记录再接入消费者的情形。",
+      "affected_domains": [
+        "D09",
+        "D10",
+        "D15",
+        "D16"
+      ],
+      "status": "CLOSED",
+      "fix_revision": "v0.6",
+      "verification_scenarios": [
+        "V22"
+      ],
+      "reviewer_result": {
+        "id": "CYX-AR-0009",
+        "result": "CLOSED",
+        "evidence": [
+          "详细§12.1、§12.3用不随事件环覆盖的会话字典保存模型/运行时/清单摘要及版本；活跃项和被保留事件引用的项不得删除，MODEL_LOAD不再是唯一身份凭据。",
+          "128×512字节字典加960KiB事件环等于1048576字节，与总体§9的1MiB预算一致；字典满先拒绝新注册，身份不复用。",
+          "导出固定字典与事件范围，附capture_id、丢失数及exhausted；主机字节覆盖与客体事件丢失分别报告，缺字典片段不可声称完整模型追溯。"
+        ],
+        "scenarios": [
+          "多轮覆盖MODEL_LOAD后再连接消费者，仍存活DECISION使用会话字典解析模型身份。",
+          "旧模型不再活跃但事件仍引用时不能释放；最后引用消失后可释放条目但不能重用ID。",
+          "同内容重建沿用字典身份而controller_epoch递增；冷启动同值局部ID由外部分配capture_id区分。",
+          "导出中途停止、宿主环覆盖及串口隔离均不能伪称完整；主动TX续行不影响身份保留规则。"
+        ]
+      },
+      "closure_evidence": [
+        "architecture-review/rounds/R02/A.json#CYX-AR-0009",
+        "architecture-review/rounds/R03/C.json#CYX-AR-0009",
+        "architecture-review/rounds/R04/B.json#CYX-AR-0009"
+      ],
+      "history": [
+        {
+          "round": "R02",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R02/A.json",
+          "evidence": [
+            "详细 §12.1/§12.3 将身份从事件环移到固定会话字典，MODEL_LOAD 不再是唯一身份凭据；字典含 model_id、模型/运行时/启动清单摘要及包/特征/算子/策略版本。",
+            "64KiB 字典=128×512字节，与960KiB事件环合计1MiB。活跃及保留事件引用条目不得删除，环覆盖以有界引用计数更新；ID不复用，满时拒绝新注册而非先启用。",
+            "导出固定字典及事件范围，采用暂停该捕获段写入或受控短片段停止，附 capture_id、丢失数及耗尽标志；字典不全明确不可完整追溯。总体 §9 同步预算划分与身份保留，V22 覆盖边界。"
+          ]
+        },
+        {
+          "round": "R03",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R03/C.json",
+          "evidence": [
+            "详细§12.1、§12.3固定环外身份字典，MODEL_LOAD不是唯一解析来源；保留活跃与仍被事件引用的项，ID不复用。",
+            "128×512=65536字节，另加960KiB事件环共1048576字节，与总体§9一致；字典满先拒绝新注册，不先启用后丢身份。",
+            "导出固定字典与事件范围的快照，附capture_id、loss、exhausted；字节帧重同步和字典不全的不可完整追溯标记明确。"
+          ]
+        },
+        {
+          "round": "R04",
+          "status": "CLOSED",
+          "review": "architecture-review/rounds/R04/B.json",
+          "evidence": [
+            "详细§12.1、§12.3用不随事件环覆盖的会话字典保存模型/运行时/清单摘要及版本；活跃项和被保留事件引用的项不得删除，MODEL_LOAD不再是唯一身份凭据。",
+            "128×512字节字典加960KiB事件环等于1048576字节，与总体§9的1MiB预算一致；字典满先拒绝新注册，身份不复用。",
+            "导出固定字典与事件范围，附capture_id、丢失数及exhausted；主机字节覆盖与客体事件丢失分别报告，缺字典片段不可声称完整模型追溯。"
+          ]
+        }
+      ],
+      "adjudication": {
+        "result": "CONFIRMED",
+        "reason": "原冻结基线允许所列触发轨迹或存在必要契约缺失；按对应通道证据接受，未缩小用户需求或以未实施为由回避。",
+        "source": "architecture-review/rounds/R01/C.json#R01-C-03"
+      },
+      "fix_sections": [
+        "详细 §12.1",
+        "详细 §12.3"
+      ]
+    }
+  ],
+  "open_count": 0,
+  "clean_full_rounds": 2,
+  "validation_obligations": [
+    {
+      "source": "architecture-review/rounds/R04/A.json",
+      "items": [
+        {
+          "id": "R04-A-VO1",
+          "stage": "P2/P4",
+          "condition": "任务、IPC、能力和回收实现可运行后",
+          "method": "V12/V13/V17/V20/V21 与交错注入，覆盖消息/超时/退出、登记后立即完成、旧唤醒、新所有者整页扫描、缩位宽身份耗尽。",
+          "pass_condition": "一次等待最多一次结果；旧身份不可复活；引用/ACK 未解除不可释放，新授权页洁净；可执行清理最终推进或明确隔离。",
+          "failure_action": "相应阶段保持未通过，回到状态机/回收协议修订与独立复审。"
+        },
+        {
+          "id": "R04-A-VO2",
+          "stage": "P3/P4",
+          "condition": "固定工具链与平台上的真实调度/定时/维护路径可运行后",
+          "method": "V04/V08a/V09/V10/V11/V19/V20；在 10 ms 边界切换健康状态，测量最长不可抢占原语、截止接管延迟、连续公平保护及驱动/清零积压；A02 假时钟仅辅助逻辑检查。",
+          "pass_condition": "账本无漏计增发，普通任务与维护有进展；冻结正常负载分别验证 250 ms、5%、95% 目标，对抗负载独立完整报告。",
+          "failure_action": "不宣称硬实时或性能达标，修订模型/预算/实现后重新冻结实验并复审跨域影响。"
+        },
+        {
+          "id": "R04-A-VO3",
+          "stage": "P4-S",
+          "condition": "2/4 核启动机制、缓存一致性与可比较时钟配置固定后",
+          "method": "S01—S09；消息丢失/重复/迟到、满容量、idle 最终检查边界、通知合并、弱内存压力、地址空间进入/退出与 TLB 撤销交错；记录锁图与持锁时长。",
+          "pass_condition": "无双执行、永久丢唤醒或反向锁序；所有相关 ACK 前不重新授权页；CPU 未确认停止不透明接管；各核及总预算口径一致。",
+          "failure_action": "SMP 仍标设计中，相关页/对象保持隔离；修订协议或平台适配后重新执行验收。"
+        },
+        {
+          "id": "R04-A-VO4",
+          "stage": "P0/P4/P4-X",
+          "condition": "ABI 编码和平台实现冻结或升级时",
+          "method": "A01—A04、X01—X02，检查原子能力、ClockSource 单位、ClockEvent/IdleOps IRQ 语义、消息长度与容量；实际芯片另测抢占/屏障/TLB 行为。",
+          "pass_condition": "通用状态机与权限语义复用，协议不随 native 指针或页尺寸改变，未知能力/版本明确拒绝；平台支持仅在相应验收后标记。",
+          "failure_action": "拒绝不满足契约的平台，不能降低隔离或把替身测试作为真实硬件正确性证明。"
+        }
+      ]
+    },
+    {
+      "source": "architecture-review/rounds/R04/B.json",
+      "items": [
+        {
+          "stage": "P0/P3/P4",
+          "condition": "采用当前CPU原型与整数模型规格",
+          "method": "冻结快照编码偏移和长度、平台/工具链版本；执行V14边界黄金向量和包解析拒绝测试，测4MiB完整映像及控制路径耗时。",
+          "failure_action": "修订并版本化编码/模型/预算，不宣称已满足容量或截止。"
+        },
+        {
+          "stage": "P2—P4",
+          "condition": "实现控制、回收、IRQ与串口路径",
+          "method": "V08a/V09/V10/V17—V22注入周期边界、故障、身份耗尽、满队列、停止消费者和清理拥塞；测最小不可抢占原语及维护进展。",
+          "failure_action": "维持安全隔离/确定性降级；修复机制并重验，预算透支与丢失照实记录。"
+        },
+        {
+          "stage": "P4",
+          "condition": "模型、基线及负载冻结",
+          "method": "W1—W6重复实验，分别报告功能、主体性、最大等待、控制开销和收益；完整片段重放与持续日志丢失分开验收。",
+          "failure_action": "不删回退记录、不改最终测试集；未达目标修订模型或架构并保留负面结果。"
+        },
+        {
+          "stage": "P4-S/P4-X",
+          "condition": "选择并实现SMP平台或第二架构",
+          "method": "S01—S09检查弱内存、唯一执行、迁移回滚、TLB确认、idle握手与总预算；X01/X02检查适配边界及整数一致。",
+          "failure_action": "相关能力仍标设计中；未知CPU状态隔离相关资源，禁止透明接管或提前回收。"
+        },
+        {
+          "stage": "P5/P6",
+          "condition": "启用多资源控制、低频规划器、可更新模型或实体设备",
+          "method": "V23及独立资源基线/故障/振荡试验；新组件先做总预算、授权、DMA、更新信任与持久化专项设计。",
+          "failure_action": "拒绝不满足准入的新能力/配置，保留旧安全配置；不声称回滚已发生外部I/O。"
+        }
+      ]
+    },
+    {
+      "source": "architecture-review/rounds/R04/C.json",
+      "items": [
+        {
+          "id": "C-VO-01",
+          "stage": "P0/P1/P4",
+          "condition": "采用所建议 UP-ARM 平台",
+          "method": "固定 QEMU 版本、机器命令、ringbuf 调用链及禁止同步日志选项，运行 V00/V18；验证 EL1/DTB/高地址入口/向量/SVC/定时器及保持连接但停读的独立业务计数。",
+          "failure_handling": "不宣称平台可用；修订适配或后端并重新审核/验收。"
+        },
+        {
+          "id": "C-VO-02",
+          "stage": "P2/P4",
+          "condition": "实现私有页映射、回收和 ELF 装载",
+          "method": "V02/V03/V12/V17/V20 验证整页模式清除、BSS/段尾、栈、失败回滚、零洁净页 AGAIN、最后任务退出和清零拥塞；检查固定池容量及游标进展。",
+          "failure_handling": "阻止新所有者发布和阶段退出，修复并复测。"
+        },
+        {
+          "id": "C-VO-03",
+          "stage": "P0/P1/P4",
+          "condition": "串口顶半部和 KernelWork 实现",
+          "method": "V19 注入 RX/空 TX/卡住 pending/未知 IRQ，正常长队列跨预算、TXIC 后再启动、空队列入队交错、无预算与无普通任务；测最慢正常排空、实际探测间隔、接管延迟、不可抢占超调及互斥计费。",
+          "failure_handling": "不能将 50 μs/250 μs 目标宣称已达；调整批次/平台驱动或配置，避免将正常慢设备误隔离。"
+        },
+        {
+          "id": "C-VO-04",
+          "stage": "P4/P4-S/P4-X",
+          "condition": "扩展 SMP 或第二架构",
+          "method": "A01—A04 依赖和替身测试；S01/S05/S08/S09 在真实并发执行下验证启动、active/epoch/TLB、弱内存和 idle 握手；X01/X02 核验逻辑 ABI、页大小和整数一致性。",
+          "failure_handling": "未通过前能力保持设计中；无法证明撤销完成时隔离保留页，不提前复用或透明接管未知 CPU。"
+        },
+        {
+          "id": "C-VO-05",
+          "stage": "P5/P6",
+          "condition": "增加块/网/DMA 或用户态驱动",
+          "method": "先补设备完成/错误、缓冲所有权、DMA 隔离、IRQ 授权和持久化语义专项设计，再独立故障/基线测试；AI 不能绕过 I/O 依赖和管理员授权。",
+          "failure_handling": "不启用未满足安全依赖的资源功能，不把 CPU 原型成功宣称为这些能力已交付。"
+        }
+      ]
+    }
+  ],
+  "completed_at": "2026-10-15T13:15:38.807090+00:00",
+  "applicability": {
+    "reviewed_design_version": "0.7",
+    "current_working_design_version": "0.9",
+    "current_working_design_review_status": "AI_CENTRIC_INCREMENT_NOT_FULLY_REVIEWED",
+    "note": "历史完整审核与散列保持有效，仅适用于冻结快照；新增需求尚未全域归零"
+  }
+}

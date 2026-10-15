@@ -1,0 +1,274 @@
+{
+  "scope": "DOCUMENT STRUCTURE AND EVIDENCE CONSISTENCY ONLY; NO OS EXECUTION",
+  "checks": [
+    {
+      "check": "R01 baseline immutable",
+      "passed": true
+    },
+    {
+      "check": "R01-A report exists",
+      "passed": true
+    },
+    {
+      "check": "R01-A same input",
+      "passed": true
+    },
+    {
+      "check": "R01-A unblocked",
+      "passed": true
+    },
+    {
+      "check": "R01-B report exists",
+      "passed": true
+    },
+    {
+      "check": "R01-B same input",
+      "passed": true
+    },
+    {
+      "check": "R01-B unblocked",
+      "passed": true
+    },
+    {
+      "check": "R01-C report exists",
+      "passed": true
+    },
+    {
+      "check": "R01-C same input",
+      "passed": true
+    },
+    {
+      "check": "R01-C unblocked",
+      "passed": true
+    },
+    {
+      "check": "R02 baseline immutable",
+      "passed": true
+    },
+    {
+      "check": "R02-A report exists",
+      "passed": true
+    },
+    {
+      "check": "R02-A same input",
+      "passed": true
+    },
+    {
+      "check": "R02-A unblocked",
+      "passed": true
+    },
+    {
+      "check": "R02-B report exists",
+      "passed": true
+    },
+    {
+      "check": "R02-B same input",
+      "passed": true
+    },
+    {
+      "check": "R02-B unblocked",
+      "passed": true
+    },
+    {
+      "check": "R02-C report exists",
+      "passed": true
+    },
+    {
+      "check": "R02-C same input",
+      "passed": true
+    },
+    {
+      "check": "R02-C unblocked",
+      "passed": true
+    },
+    {
+      "check": "R03 baseline immutable",
+      "passed": true
+    },
+    {
+      "check": "R03-A report exists",
+      "passed": true
+    },
+    {
+      "check": "R03-A same input",
+      "passed": true
+    },
+    {
+      "check": "R03-A unblocked",
+      "passed": true
+    },
+    {
+      "check": "R03-B report exists",
+      "passed": true
+    },
+    {
+      "check": "R03-B same input",
+      "passed": true
+    },
+    {
+      "check": "R03-B unblocked",
+      "passed": true
+    },
+    {
+      "check": "R03-C report exists",
+      "passed": true
+    },
+    {
+      "check": "R03-C same input",
+      "passed": true
+    },
+    {
+      "check": "R03-C unblocked",
+      "passed": true
+    },
+    {
+      "check": "R04 baseline immutable",
+      "passed": true
+    },
+    {
+      "check": "R04-A report exists",
+      "passed": true
+    },
+    {
+      "check": "R04-A same input",
+      "passed": true
+    },
+    {
+      "check": "R04-A unblocked",
+      "passed": true
+    },
+    {
+      "check": "R04-B report exists",
+      "passed": true
+    },
+    {
+      "check": "R04-B same input",
+      "passed": true
+    },
+    {
+      "check": "R04-B unblocked",
+      "passed": true
+    },
+    {
+      "check": "R04-C report exists",
+      "passed": true
+    },
+    {
+      "check": "R04-C same input",
+      "passed": true
+    },
+    {
+      "check": "R04-C unblocked",
+      "passed": true
+    },
+    {
+      "check": "all findings independently closed",
+      "passed": true
+    },
+    {
+      "check": "ledger has unique IDs",
+      "passed": true
+    },
+    {
+      "check": "zero open count",
+      "passed": true
+    },
+    {
+      "check": "two final full rounds",
+      "passed": true
+    },
+    {
+      "check": "finals identical",
+      "passed": true
+    },
+    {
+      "check": "working files unchanged",
+      "passed": true
+    },
+    {
+      "check": "R03 all 16 domains",
+      "passed": true
+    },
+    {
+      "check": "R03 no new or reopened findings",
+      "passed": true
+    },
+    {
+      "check": "R04 all 16 domains",
+      "passed": true
+    },
+    {
+      "check": "R04 no new or reopened findings",
+      "passed": true
+    },
+    {
+      "check": "requirements fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "invariants fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "domains fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "sections fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "scenarios fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "validation_matrix fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "interfaces fully reviewed",
+      "passed": true
+    },
+    {
+      "check": "CyxiaOS-design.md all headings mapped",
+      "passed": true
+    },
+    {
+      "check": "CyxiaOS-detailed-design.md all headings mapped",
+      "passed": true
+    },
+    {
+      "check": "action v1 is 64 bytes",
+      "passed": true
+    },
+    {
+      "check": "network parameter and MAC counts",
+      "passed": true
+    },
+    {
+      "check": "Q15 weight sum",
+      "passed": true
+    },
+    {
+      "check": "int64 rescale bound",
+      "passed": true
+    },
+    {
+      "check": "audit partition",
+      "passed": true
+    },
+    {
+      "check": "local document links resolve",
+      "passed": true
+    }
+  ],
+  "passed": 65,
+  "failed": [],
+  "broken_links": [],
+  "finding_counts": {
+    "Critical": 1,
+    "High": 2,
+    "Medium": 4,
+    "Low": 2
+  }
+}

@@ -1,0 +1,18 @@
+# R02 协调者跨域推演
+
+输入：baselines/R02/manifest.json 所列 v0.6。此记录是文档反例推演，未运行 OS。
+
+| 场景 ID | 有序事件、状态、线性化点与归属 | 推演结果与相关证据 |
+|---|---|---|
+| budget_boundary | 9.8ms 请求窗口→尾部不足250μs拒绝→10ms刷新同一账本→维护先保留250μs→普通模型只能消费其余额度；同周期 RECOVERING→SELF_TEST→AI_ACTIVE 不刷新 | §7.2/7.3、9.1；预留与实际结算分开，最小原语超调据实计费；V08a/V09/V20。性能硬界仍待测 |
+| wake_before_block | owner 分配 wait g→Endpoint→WaitCell 注册→释放；消息先将g置COMPLETED→释放对象锁→发布WAKE；owner按Placement→WaitCell提交时见完成，不进入BLOCKED；旧g晚至g+1被拒绝 | §5.3/10.6.4。完成 CAS/锁下状态变化为一次性完成点；超时先赢则消息留队，退出先撤销能力/登记，引用解除前不释放WaitCell；V13/S03 |
+| full_inbox | 远端等待完成→收件箱满→pending Release发布→通知；目标idle最终Acquire重查，或待决IRQ唤醒；通知丢失时在线维护tick继续扫描→owner入队 | §3.2 IdleOps、7.2、10.6.4；每批最多64项，残留不清除，BLOCKED任务仍占本地准入槽；S09。底层idle实现尚待平台验收 |
+| migration | PREPARE保留目标槽→源安全点停执行并保留回滚槽→Placement锁下MIGRATING及版本变化→COMMIT使目标成为owner并入队→ACK丢失→源查询，不再执行；若超时先使事务失效，迟到COMMIT拒绝 | §10.6.5/7；归属提交是线性化点；无持锁等ACK，源真正失联不能假定停止；旧模型动作owner_version失效；S02/S04/S08 |
+| tlb_lifetime | 空间锁下撤销/映射代际及active集合→锁外发送失效→核切入与登记在同一空间锁串行→用户返回前复查→所有ACK后DIRTY_FREE→批量清零→CLEAN_FREE→新owner映射 | §4.1/4.2/10.6.7；切离空间先失效再清active。任何未知执行CPU/未解除引用都保留旧页；共享页最后引用才回收；V17/S05 |
+| interrupts_locks | IRQ打断持锁路径→只合并pending，不等待该锁→线程安全点按既定锁图处理；外设累计额度耗尽→屏蔽设备源→驱动延迟工作 | §6.1/9.1/10.6.7；Placement→WaitCell及Endpoint→WaitCell无逆向边，分配器锁不跨映射提交；V19/S08。串口TX电平重新使能条件交B独立核对，不提前判通过 |
+| protocol_platform | 未知主版本/保留位/越界长度→解码拒绝；规范化先clip后u64乘除；int32乘加界验包、int64缩放、正负半值统一→平台差异只能在适配层 | §3/5.0/6/8；identity耗尽预留所有终结所需值后才开始事务，普通统计饱和；逻辑缓冲按平台页大小映射，不共享usize；V05/V14/V21/A03/X02 |
+| multi_resource_budget | N核各1ms/10ms→总Nms除以10Nms CPU容量；协调器从承载核额度划拨→无隐藏新增；零配额有授权与资源预留后最小步长激活→全局不足拒绝 | §10.1/10.5/10.6.3；配额发布原子性不等于撤销已发IO；各资源完成两轮自身观察周期；S07/V23 |
+| log_backpressure | 消费者仍连接但不读取→固定ringbuf覆盖旧字节→客体串口写无消费者等待→输出缺帧独立标记；事件环覆盖MODEL_LOAD→字典仍被存活事件引用→导出同一捕获范围字典 | §2.1/12.1/12.3；不附加同步logfile；未知完整性不得宣称零丢失，模型/策略登记容量不足拒绝；V18/V22 |
+| reaper_without_tasks | 最后普通任务退出→不可调度并登记KernelWork→无runnable仍保留工作/预算期限→按批次撤销映射与引用→dirty页清零→REAPED；模型为LATCHED也走同一队列 | §7.2/9.1；队列类别轮转和游标避免新工作插队，等待ACK项目移至等待集不忙轮询；V20 |
+
+与独立 A/B/C 结果共同裁定；此表不覆盖未运行的性能、真实内存序或硬件时序保证。

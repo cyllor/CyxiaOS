@@ -1,0 +1,156 @@
+{
+  "channel": "B",
+  "baseline_hashes": {
+    "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+    "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+  },
+  "domains": [
+    "D05",
+    "D06",
+    "D07",
+    "D08"
+  ],
+  "findings": [
+    {
+      "local_id": "B-01",
+      "title": "远端 pending 唤醒与空闲进入之间缺少有界进展契约",
+      "severity": "High",
+      "sections": [
+        "CyxiaOS-detailed-design.md §7.2 第6项",
+        "CyxiaOS-detailed-design.md §7.3 软件截止时间集合",
+        "CyxiaOS-detailed-design.md §10.6.4 远端唤醒及收件箱满处理",
+        "CyxiaOS-detailed-design.md §3.2 ClockEvent/InterruptOps"
+      ],
+      "evidence": "收件箱满时保存 pending_wake 与待扫描标志，并允许“随后 IPI 或周期调度点继续处理”。但 idle 只等待最近定时事件，软件截止集合没有要求在线空闲核的维护周期；也没有规定跨核 pending 发布与本核最后一次检查、进入 idle 的握手。持久化事实可避免数据丢失，不能单独保证接收核再次执行。",
+      "trigger_trace": [
+        "目标核 B 无普通 RUNNABLE 任务，现有 IPC 等待无有限截止，自检/恢复也没有待续行任务；B 决定 idle。",
+        "源核 A 完成 B 所属任务 T 的 WaitCell；目标收件箱满，A 正确保存 pending_wake 和待扫描位。",
+        "A 采用文档允许的“周期调度点继续处理”分支；B 依照 §7.2 没有下一软件定时事件。",
+        "B 没有被保证的 IPI 或维护 tick；T 的 COMPLETED 结果永久存在但不被消费，T 不能重新入队。即使采用 IPI，idle 最后检查与睡眠之间也需明确平台级握手以封闭检查后到达窗口。"
+      ],
+      "violated_requirement_or_invariant": "§5.3/§10.6.4 合法完成必须令阻塞任务重新可运行；S03 不丢唤醒；INV-06 的调度进展不能依赖模型。",
+      "impact": "在承诺的 SMP 扩展中，合法 IPC 完成可以永久不能转为任务进展。不是容量丢失，而是事件保存后缺少保证发生的消费调度点。",
+      "resolution": "规定 pending/收件箱以同步发布后必须触发目标核通知；明确目标核 idle 前在本地 IRQ 约束下重查全部 pending，使用能封闭检查后入睡窗口的平台 idle 原语。为每个 ONLINE 核保留有界维护 deadline 或等效可靠通知确认机制，写明最大扫描批次及余项续行；增加“目标核无用户定时器、收件箱满、唤醒恰逢 idle”交错用例。",
+      "affected_domains": [
+        "D02",
+        "D03",
+        "D05",
+        "D06",
+        "D07",
+        "D08",
+        "D16"
+      ]
+    },
+    {
+      "local_id": "B-02",
+      "title": "普通任务分批退出清理没有进入调度循环的执行与续行规则",
+      "severity": "Medium",
+      "sections": [
+        "CyxiaOS-detailed-design.md §5.1 EXITED→REAPED",
+        "CyxiaOS-detailed-design.md §7.2 第5—7项",
+        "CyxiaOS-detailed-design.md §9 普通任务退出",
+        "CyxiaOS-detailed-design.md §10.6.7 延期回收"
+      ],
+      "evidence": "§9 要求任务先不可调度，再分批解除映射与回收；§10.6.7 使用显式引用与延期回收队列。§7.2 的维护入口却只在 SELF_TEST 或 RECOVERING 执行，§7.3 共享保留账本只明确推理、自检、恢复维护；没有普通 EXITED 对象的回收执行者、续行 deadline 或预算归属。",
+      "trigger_trace": [
+        "普通任务 T 在 AI_ACTIVE 状态退出，第一批完成不可调度、能力撤销及部分页清理；仍有多批清理或待解除引用。",
+        "T 已不能再次被派发；控制器健康状态仍是 AI_ACTIVE。",
+        "其他普通任务也退出或无限期阻塞。调度点既不满足 SELF_TEST/RECOVERING 维护分支，也没有 runnable 任务，于是 idle。",
+        "普通回收队列尚非空，但没有规则保证下一清理批次会运行；即使稍后 ACK 到达使引用数归零，也没有定义如何重新安排回收。"
+      ],
+      "violated_requirement_or_invariant": "§9 清理完成后回收页与槽位的生命周期契约、V12 页与对象计数回到预期；要求有界清理而不是停在 EXITED。",
+      "impact": "普通退出资源可能永久留在 EXITED/延期回收队列；实现者只能另行发明后台执行和计费规则，或将全部清理塞入退出路径破坏有界性。",
+      "resolution": "将普通退出/延期回收定义为有界内核工作类，指定队列所有者、每批上限、可执行调度点、独立或明确共享的预算、等待引用/ACK后的重新激活方式，以及队列非空时的下一维护 deadline。该工作不应依赖控制器健康状态，也不能忙轮询未完成 ACK；V12 增加“最后可运行任务退出”与 AI_ACTIVE/LATCHED 两种健康状态。",
+      "affected_domains": [
+        "D04",
+        "D05",
+        "D07",
+        "D08",
+        "D12",
+        "D16"
+      ]
+    },
+    {
+      "local_id": "B-03",
+      "title": "防重放代际的溢出策略仅覆盖 TCB 槽位",
+      "severity": "Low",
+      "sections": [
+        "CyxiaOS-detailed-design.md §5.1 task generation 溢出",
+        "CyxiaOS-detailed-design.md §5.2 能力槽代际",
+        "CyxiaOS-detailed-design.md §6.3—6.4 controller_epoch/decision_seq",
+        "CyxiaOS-detailed-design.md §10.6.4 wait_generation/owner_version",
+        "CyxiaOS-detailed-design.md §10.6.7 mapping_epoch"
+      ],
+      "evidence": "§5.1 明确任务 generation 溢出永久退役槽位，其余用于识别旧操作的有限宽度 epoch/sequence/version 未给出递增耗尽的统一处理。v1 controller_epoch 和 decision_seq 已明确为 u64；能力槽与等待等代际甚至没有给出宽度或耗尽契约。",
+      "trigger_trace": [
+        "某有限宽度身份计数达到其最大值；为检验可使用缩小位宽的状态机而非实际等待 u64 耗尽。",
+        "下一次操作需要新代际；现有文档没有规定拒绝、退役、受控重启或扩大身份域。",
+        "若按整数回绕生成新身份，先前保留的同字段身份重新匹配；若实现自行拒绝，则失败路径与对象状态同样未定义。"
+      ],
+      "violated_requirement_or_invariant": "INV-05 单次决策身份与旧代际永不重新有效，以及 §10.6.4 旧等待不能完成新等待。",
+      "impact": "防重放接口在耗尽边界未闭合；u64 使当前运行中的现实发生概率极低，因此按 Low 处理，不宣称存在近期可利用攻击。",
+      "resolution": "增加统一 checked-increment/no-reuse 规则，列出所有能力槽、等待、归属、模型实例、决策、映射和迁移身份；耗尽时停止产生新事务并退役对象或进入明确受控重启路径，不回绕。对 boot_epoch 的重启复用说明必须先隔离旧消息/旧实例，采用缩小位宽模拟验证边界。",
+      "affected_domains": [
+        "D05",
+        "D06",
+        "D08",
+        "D10",
+        "D12",
+        "D16"
+      ]
+    }
+  ],
+  "coverage_notes": [
+    {
+      "domain": "D05",
+      "status": "REVIEWED_WITH_FINDINGS",
+      "checked": [
+        "TCB 普通槽/控制器槽分离、身份 generation、能力静态授予与禁止任意转移",
+        "退出先不可调度再撤销/回收、显式引用和延期释放、任务状态图"
+      ],
+      "basis": "§4.1 给出 64 普通槽含诊断及控制器独立槽；§5.1 TCB 代际溢出退役；§5.2 自身能力表检查；§9 与 §10.6.7 要求引用清理后释放，审计不保留裸指针。安全上的先撤销后回收已有规则；回收进展及其他代际耗尽见 B-02/B-03。"
+    },
+    {
+      "domain": "D06",
+      "status": "REVIEWED_WITH_FINDINGS",
+      "checked": [
+        "消息早于 BLOCKED 提交",
+        "超时与 MESSAGE 竞争完成",
+        "旧 wait_generation 晚到",
+        "端点队列满/超时后消息保留",
+        "WaitCell 清理、任务退出时仍有在途引用",
+        "本地归属满容量的合法唤醒"
+      ],
+      "basis": "§10.6.4 WaitCell 的 PENDING→COMPLETED 在锁内只有一个胜者，owner 以 Placement→WaitCell 在 BLOCKED 提交前重查；提前完成直接返回，之后完成才唤醒。端点→WaitCell 与定时器单锁竞争统一结果，败者不消费消息。取消登记及解除引用先于存储复用；所有 BLOCKED/THROTTLED 仍计入归属容量，所以唤醒无需重新准入。剩余进展与耗尽问题见 B-01/B-03。"
+    },
+    {
+      "domain": "D07",
+      "status": "REVIEWED_WITH_FINDINGS",
+      "checked": [
+        "10 ms 周期边界、250 μs 入场预留、500 μs 最小间隔",
+        "自检→AI_ACTIVE 与恢复→自检同周期交接",
+        "普通任务持续 runnable 时的自检/恢复",
+        "无 runnable 任务时的自检续行",
+        "公平保护优先级、最终提交重查公平阈值",
+        "调用限额与迁移计费"
+      ],
+      "basis": "§7.1—7.3 状态转换不刷新共享账本/最小间隔，周期尾部禁止启动250 μs窗口，迟到执行据实按周期归属；§7.2 自检/恢复在轮转前获得机会且保留下一唤醒期限。公平保护优先于模型，§7.4 最终提交时再次审查跨阈值情况。每任务64次/10 ms，yield及迁移不刷新额度。严格墙钟时延与模型性能明确留作测量义务；没有将250 ms或5%误认为已证实上界。普通清理/idle关联缺口见 B-01/B-02。"
+    },
+    {
+      "domain": "D08",
+      "status": "REVIEWED_WITH_FINDINGS",
+      "checked": [
+        "PREPARE 拒绝/目标满槽",
+        "COMMIT/ACK 丢失、重复、迟到",
+        "源回滚槽保留、迁移旧模型动作拒绝",
+        "TLB 撤销与地址空间切入/切出",
+        "远端 ACK 延迟、失联 CPU",
+        "锁图与对象存活引用",
+        "每核控制器及协调器总预算"
+      ],
+      "basis": "§10.6.5 源端在取得令牌前保留任务，MIGRATING 时任何核不能派发；目标以同一归属锁提交，ACK 丢失只能查询；仅同事务仍 MIGRATING 才可回滚，源保留槽阻止无槽恢复，已归属目标不能源重派。§10.6.7 归属锁不嵌套端点/收件箱/分配器；Placement→WaitCell 与 Endpoint→WaitCell 无反向边，持锁不等远端 ACK。TLB 撤销发布与 active 登记以地址空间锁串行化，恢复用户态前复查代际；切离及本地失效后才清 active，全部相关 ACK 前禁止释放旧页，失联不透明接管。以上为逻辑契约审核，架构专用屏障序列仍属后续硬件验证。SMP预算 N ms/10 ms 对 N 核容量，协调器从承载核既有保留额度划拨，没有隐含新增额度。B-01/B-02/B-03需递归回查上述接口。"
+    }
+  ],
+  "blocked": [],
+  "review_limits": "仅审阅 R01 冻结文档，不修改设计，不声称实现、硬件时序或性能通过。未发现需外部事实才能裁定的本通道阻塞项；对特定 Arm 指令/缓存屏障不新增未经核验的硬件结论。"
+}

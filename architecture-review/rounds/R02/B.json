@@ -1,0 +1,154 @@
+{
+  "channel": "B",
+  "round": "R02",
+  "baseline_hashes": {
+    "CyxiaOS-design.md": "336c346a620eb8ad97b97347ac7977b64639acab38b7d7f8f438e087f152f8da",
+    "CyxiaOS-detailed-design.md": "c4ce1a2d53509bfa759ad2b840a8f841262889e4396216b67d8d217fde828db0"
+  },
+  "domains": [
+    "D01",
+    "D02",
+    "D03",
+    "D04",
+    "D13"
+  ],
+  "findings": [
+    {
+      "local_id": "R02-B-001",
+      "title": "REOPEN_OF:CYX-AR-0003 — TX 退避以源自行解除为前提，缺少正常发送的主动启动与续行",
+      "severity": "Medium",
+      "sections": [
+        "CyxiaOS-detailed-design.md §6.1 正常串口 IRQ 与延迟工作",
+        "CyxiaOS-detailed-design.md §9.1 KernelWork",
+        "CyxiaOS-detailed-design.md §13.1 V19"
+      ],
+      "evidence": [
+        "§6.1 规定预算恢复后探测一次，源已解除且队列有数据才重新使能，连续 3 个维护周期仍异常则隔离。未规定屏蔽期间主动向 UARTDR 发送，也未规定空队列变非空的 kick。",
+        "Arm PL011 TRM DDI 0183G §2.8.3（PDF 第45页）：TX pending 由 FIFO 阈值转换产生；写数据或 ICR 可清除；仅开 UART/IRQ 而未写数据不会产生初始发送中断。官方：https://documentation-service.arm.com/static/5e8e36c2fd977155116a90b5",
+        "QEMU v9.2.0 pl011.c：pl011_write_txdata 写出后置 INT_TX；UARTIMSC 只改 mask；UARTICR 清 raw pending；reset 将 int_level 置零。没有自主发送事件会因开 mask 而生成。官方：https://raw.githubusercontent.com/qemu/qemu/v9.2.0/hw/char/pl011.c （210—228、438—445、600—617）"
+      ],
+      "trigger_trace": [
+        "健康串口待发队列仍有数据；一次受限 TX 批次已推进发送，但预算耗尽，此时 QEMU 正常 INT_TX pending 仍为 1。驱动屏蔽 TX 并登记 KernelWork。",
+        "维护预算恢复；按现有文字只探测源是否解除。屏蔽并不清 raw pending，且未规定此处继续写数据，因此不满足重新使能条件。",
+        "连续三次同样探测将健康串口当作异常隔离，待发数据永远滞留。若为满足“源已解除”先清 TXIC 再开 mask，QEMU 不会凭空产生下一发送事件，同样可能停发。",
+        "独立边界：队列为空且 TX pending 已清后，console_write 仅入队并开 TX mask；没有显式首字节 kick 时也不能保证产生初始 IRQ。"
+      ],
+      "impact": "风暴抑制的安全性已有改善，但正常日志/审计发送可能停止或被误隔离。该反例属于原 IRQ 重新启用契约的修订回归，应重开 0003，不另计不同根因的新问题；不声称已运行的驱动存在此缺陷。",
+      "resolution": "延迟工作在 TX 屏蔽状态按字节/时间和共享预算有界主动 kick/drain；空→非空也登记或执行一次有界 kick。明确设备 TX pending 的 ACK/清除及 GIC EOI 次序；以实际队列字节消费/设备可发送状态判断进展，正常 TX pending 不能累计为三轮故障。无预算保持 pending 和下一期限，有真实连续无进展才隔离；V19 增加正常大队列跨预算续发、TXIC 后重启及空→非空。",
+      "affected_domains": [
+        "D02",
+        "D07",
+        "D12",
+        "D13",
+        "D15",
+        "D16"
+      ]
+    }
+  ],
+  "fix_verification": [
+    {
+      "id": "CYX-AR-0001",
+      "result": "CLOSED",
+      "evidence": [
+        "§1.1 INV-02 与 §4.1 统一规定 OWNED→REVOKING→DIRTY_FREE→CLEAN_FREE→OWNED；全部映射/引用和 TLB 完成后才清零，新所有者发布只能取洁净页。",
+        "§4.1 明确覆盖退出、显式 unmap、失败装载、控制器重建、栈/堆/匿名及页表页，ELF 文件字节复制前整页洁净；共享页最后引用释放后才清零，专用池不流入普通池。",
+        "§6.1 批量映射预检和 AGAIN、§9.1 分批清零的预算/续行及 §10.6.7 延期回收共同阻断先发布后清零和 ACK 前复用；总体 §13 v0.6 同步该规则。"
+      ],
+      "scenarios": [
+        "V17：A 写模式→退出→B 合法分配读全页，B 仅能得到完成清零的页；无洁净页返回 AGAIN。",
+        "V02/V17：ELF 段尾、BSS、装载失败回滚和用户栈未初始化字节不能泄露旧页内容。",
+        "V20/S05：最后任务退出或 ACK 延迟，工作继续/等待且不能提前发布。"
+      ]
+    },
+    {
+      "id": "CYX-AR-0002",
+      "result": "CLOSED",
+      "evidence": [
+        "§2.1 固定 1 MiB ringbuf chardev，禁止隐含 stdio 复用和同步 logfile，QMP 异步 base64 导出；消费者停读与宿主整体故障的边界明确。",
+        "已核对 QEMU v9.2.0 官方 char-ringbuf.c 的 ringbuf_chr_write（52—67）：固定数组覆盖最旧字节并返回 len，不等待消费者。https://raw.githubusercontent.com/qemu/qemu/v9.2.0/chardev/char-ringbuf.c",
+        "§12.3 给出重同步帧、序号缺口、HOST_TRANSPORT_LOSS 与客体 AUDIT_LOSS 分开及字典不完整限制；总体 §9/§13 与该后端契约一致。"
+      ],
+      "scenarios": [
+        "V18：消费者仍连接但不读，写入超过 1 MiB 后覆盖旧字节，无消费者背压等待。",
+        "V15/V22：截断后校验/重同步，缺失字典片段不得称完整追溯。",
+        "P0 固定实际 QEMU 版本并重核调用链；运行前进性仍待实施验证。"
+      ]
+    },
+    {
+      "id": "CYX-AR-0003",
+      "result": "REOPENED",
+      "evidence": [
+        "白名单、50 μs/1 ms 外设目标额度、设备源屏蔽和独立调度定时器已阻断原无限 IRQ 重入反例。",
+        "但重新启用仅在源已解除时发生，缺少主动 TX kick 与正常 pending 的进展识别；见 R02-B-001 的官方依据和两个反例。"
+      ],
+      "scenarios": [
+        "V19：正常 TX 持续队列跨 IRQ/维护预算，必须继续发送而非误隔离。",
+        "V19：空→非空及 TXIC 清零后重新发送必须有启动动作。",
+        "V19：真实卡住、RX/未知源与通知风暴继续验证隔离及健康任务前进。"
+      ]
+    }
+  ],
+  "coverage_notes": {
+    "D01": {
+      "reviewed": [
+        "总体 §1—3、§4—6、§8、§11—13；详细 §1/§1.1/§1.2、§14—16"
+      ],
+      "conclusion": "已确认的名称、自研内核、本地 AI、单核 ARM、跨平台/多核/解耦均保留；ARM64/A53/Rust/研究定位仍为建议。首版 CPU 闭环与未来内存/IO/规划模型分期，没有将宿主训练或 QEMU 当运行推理服务。INV-01/05/09 经 Placement、一次性提交及引用/TLB边界承接；INV-02 新增跨所有者清零；INV-03/04/06/07/08 经能力/控制窗口/恢复与派发标签承接；INV-10 经接口版本和依赖图承接。未发现需求冲突或删范围归零。"
+    },
+    "D02": {
+      "reviewed": [
+        "详细 §2、§3.2—3.4、§4.2、§6.1、§7.2—7.3、§10.6.1/4/7/8；总体 §3、§5"
+      ],
+      "conclusion": "裸机 ELF 的 DTB 位置、EL1检查、保留区、低→高地址切换、异常/定时器早于 EL0、自检失败降级和软件截止均有明确路径。UP 不偷用 SMP 固件入口；平台缺必需能力失败而不弱化隔离。idle/维护 tick 与 pending 发布解除无普通定时器的休眠缺口。非阻塞后端复核关闭；TX 续行重开 0003。寄存器精确序列与实际机器版本在 P0 冻结属于明确验证义务。"
+    },
+    "D03": {
+      "reviewed": [
+        "总体 §4.4—4.5；详细 §3 全节、§6.2—6.4、§8.2—8.4、§10.6、§13.4"
+      ],
+      "conclusion": "kernel-core 只依赖 contracts/ABI 语义，组合入口选择 arch/platform/drivers；模型不读 TCB，内核不解析网络层。逻辑 ID、地址、PageSize、TimeNs、不透明上下文隔离寄存器与指针布局；4 KiB/39位为配置，映射上取整不改变 wire 长度。能力不足拒绝、32位/无MMU/SMP准入限制及四版本域有边界；新增 IdleOps/KernelWork 无引入板级地址到通用层。A01—04/X01—02 仍需实现。"
+    },
+    "D04": {
+      "reviewed": [
+        "详细 §4 全节、§5.0—5.3 生命周期边界、§6.1 映射调用、§9 全节、§10.2/§10.6.7；总体 §4.1—4.2、§6.4、§8"
+      ],
+      "conclusion": "RAM/保留区先核算，16MiB内核、4MiB控制器和1MiB审计不混同全部可分配RAM；SMP重做预算。ELF段边界/重叠/入口/权限校验、RX/RW分离、guard、PXN/UXN与可写别名禁令闭合。clean-page规则有统一所有权状态和失败回滚，显式共享不错误清零；用户指针受限复制不触发缺页分配。撤销/active-CPU登记经空间锁串行，ACK前不释放；计数耗尽也不能重新授权。无交换时不丢匿名/DMA页。0001设计关闭，性能与缓存维护序列不宣称已验证。"
+    },
+    "D13": {
+      "reviewed": [
+        "详细 §2.1、§3.2、§6.1、§7.3、§9.1、§10.3—10.5、§12.3；总体 §4.1、§6.4、§8"
+      ],
+      "conclusion": "首版仅UART/Timer/GIC且RX屏蔽，普通IRQ预算不屏蔽关键定时器/IPI；KernelWork保留和类别轮转承接驱动延迟工作。ringbuf后端解决宿主消费者背压，丢字节与丢客体记录分开。发现TX正常续行反例并重开0003。VirtIO块/网络明确FUTURE依赖：合法请求集合/flush顺序、在途上限、发送速率与缓冲配额，DMA阶段须单独设计隔离；当前不依赖文件系统、网络或实体DMA，不以未实现这些功能为缺陷。"
+    }
+  },
+  "blocked": [],
+  "validation_obligations": [
+    {
+      "id": "R02-B-VO1",
+      "phase": "P0/P1/P2",
+      "condition": "实际采用建议 UP-ARM 配置",
+      "method": "固定 QEMU/工具链/映像布局；执行 V00/V02/V03，验证 EL1入口、DTB保留、低高切换、W^X/别名、SVC/IRQ和禁止SIMD。",
+      "failure_handling": "不进入用户态或停止相应阶段，修订平台契约后重验。"
+    },
+    {
+      "id": "R02-B-VO2",
+      "phase": "P2/P4/P4-S",
+      "condition": "页回收/清零和SMP撤销实现后",
+      "method": "V17/V20/S05 覆盖旧内容、失败回滚、最后任务退出、ACK迟到与维护预算拥塞；测量清零原语和锁持有/超调。",
+      "failure_handling": "保持脏页/待ACK页不可分配，失败配置不声明通过。"
+    },
+    {
+      "id": "R02-B-VO3",
+      "phase": "P0/P4",
+      "condition": "固定后端与修订后TX驱动实现后",
+      "method": "V18/V19：消费者停读、ringbuf覆盖、正常跨预算发送、empty→nonempty、TXIC后重启、真实无进展、未知IRQ；核对业务计数和宿主/客体丢失。",
+      "failure_handling": "隔离确实异常设备；正常流量停发须修订设计/驱动，不得用全部停用日志代替通过。"
+    },
+    {
+      "id": "R02-B-VO4",
+      "phase": "P4/P4-S/P4-X/P5",
+      "condition": "相应扩展实现前后",
+      "method": "A01—04/S01/S05/S08/S09/X01—02验证依赖、原子/时钟/缓存及idle；P5另做VirtIO/DMA/请求顺序与配额专项验收。",
+      "failure_handling": "能力不满足拒绝配置；未测试支持矩阵保留设计中。"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "round": "R01",
+  "hashes": {
+    "CyxiaOS-design.md": "23d1dd6149067d9fc63fc25a98971ccb3c945ac0505f2c486b779e9fa2b50762",
+    "CyxiaOS-detailed-design.md": "0e84f348fdfad7aaeb817ef455f12c3973cb77b6da86a224745d7d394568df42"
+  },
+  "snapshot_file_mtime_utc": {
+    "CyxiaOS-design.md": "2026-10-15T12:44:56.876466+00:00",
+    "CyxiaOS-detailed-design.md": "2026-10-15T12:44:56.876972+00:00"
+  },
+  "timestamp_note": "文件系统最后写入时间；非重新执行审核或测试的时间"
+}
