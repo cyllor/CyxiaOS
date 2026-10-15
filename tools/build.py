@@ -1,10 +1,11 @@
 import argparse
 from pathlib import Path
 import subprocess
-from doctor import ROOT,RUST_BIN,TARGET,env
+from doctor import ROOT,RUST_BIN,TARGET,env,inspect
 from check_elf import inspect_elf
 
 def build(profile='dev',selftest=True):
+    if not inspect()['ready']:raise RuntimeError('Pinned environment mismatch; run tools/doctor.py')
     args=[str(RUST_BIN/'cargo'),'build','-p','cyxia-kernel','--target',TARGET]
     if selftest:args+=['--features','selftest']
     if profile=='release':args+=['--release']

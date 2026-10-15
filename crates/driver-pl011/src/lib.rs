@@ -7,7 +7,7 @@ impl Pl011 {
     /// # Safety
     /// Resource must be an exclusively owned mapped PL011 device with Device attributes.
     pub unsafe fn new(resource: UartResource) -> Result<Self, PlatformError> {
-        if resource.len < 0x1000 || resource.base.0 % 4096 != 0 {
+        if resource.len < 0x1000 || !resource.base.0.is_multiple_of(4096) {
             return Err(PlatformError::Invalid);
         };
         let s = Self {

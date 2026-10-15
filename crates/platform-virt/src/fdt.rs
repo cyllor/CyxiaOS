@@ -201,8 +201,8 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
     if so < 40
         || st < 40
         || ro < 40
-        || so % 4 != 0
-        || ro % 8 != 0
+        || !so.is_multiple_of(4)
+        || !ro.is_multiple_of(8)
         || se > total
         || te > total
         || so < te && st < se
@@ -339,7 +339,7 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
     }
     let mut pages = 0u64;
     for r in &info.ram[..info.ram_count] {
-        if r.start.0 % 4096 != 0 || r.len % 4096 != 0 {
+        if !r.start.0.is_multiple_of(4096) || !r.len.is_multiple_of(4096) {
             return Err(FdtError::Bounds);
         }
         pages = pages.checked_add(r.len / 4096).ok_or(FdtError::Capacity)?;
@@ -360,7 +360,7 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
             len: *l,
             kind: RegionKind::Device,
         };
-        if a % 4096 != 0 || info.ram[..info.ram_count].iter().any(|x| x.overlaps(r)) {
+        if !a.is_multiple_of(4096) || info.ram[..info.ram_count].iter().any(|x| x.overlaps(r)) {
             return Err(FdtError::Overlap);
         }
         for (b, n) in &dev[..i] {

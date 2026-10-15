@@ -7,11 +7,39 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import struct
 import tempfile
 import time
 try:from .doctor import ROOT,env
 except ImportError:from doctor import ROOT,env
+try:from .transport import FrameDecoder
+except ImportError:from transport import FrameDecoder
 CASES={'boot-entry':['BOOT_ENTRY','PLATFORM_OK'],'pages':['PAGE_SELFTEST_OK'],'mmu':['HIGH_VA_OK','IDENTITY_UNMAPPED','WX_SELFTEST_OK'],'timer':['MMU_TIMER_OK','IRQ_SELFTEST_OK'],'all':['BOOT_ENTRY','PLATFORM_OK','PAGE_SELFTEST_OK','HIGH_VA_OK','IDENTITY_UNMAPPED','WX_SELFTEST_OK','MMU_TIMER_OK','IRQ_SELFTEST_OK']}
+CASES['pressure']=CASES['all']
+
+def validate_progress(before,after):
+ if before[0]!=0x43595850524f4731 or after[0]!=before[0] or before[5]!=1 or after[5]!=1:raise ValueError('invalid progress page')
+ if after[1]<=before[1] or after[2]<=before[2]:raise ValueError('guest did not advance')
+ if after[3]-before[3]<=2*1048576:raise ValueError('backend not filled twice')
+ return True
+
+def pressure(qmp,elf,output,deadline):
+ try:from .check_elf import symbol
+ except ImportError:from check_elf import symbol
+ location=symbol(elf.read_bytes(),'TEST_PROGRESS');pa=location['pa']
+ if pa%4096 or location['size']!=4096:raise ValueError('invalid progress symbol')
+ def snapshot(name):
+  qmp.execute('stop')
+  try:qmp.execute('pmemsave',{'val':pa,'size':4096,'filename':str((output/name).resolve())})
+  finally:qmp.execute('cont')
+  return struct.unpack_from('<6Q',(output/name).read_bytes())
+ before=snapshot('progress-before.bin')
+ while time.monotonic()<deadline:
+  time.sleep(.1);after=snapshot('progress-after.bin')
+  if after[3]-before[3]>2*1048576:
+   validate_progress(before,after);return {'before':before,'after':after,'physical_address':pa}
+ raise TimeoutError('pressure scenario made insufficient progress')
+
 class JsonLines:
  def __init__(self):self.buffer=b''
  def feed(self,data):
@@ -47,10 +75,10 @@ class Qmp:
    if 'error' in response:raise RuntimeError(response['error'])
    return response['return']
 def required_markers(data,case):
- return b'FAIL' not in data and all(x.encode() in data for x in CASES[case])
+ return b'FAIL' not in data and all(any(line.startswith(x.encode()+b' ') or line==x.encode() for line in data.splitlines()) for x in CASES[case])
 def run(elf,case='all',output=None,timeout=30):
  elf=Path(elf).resolve();output=Path(output or ROOT/'artifacts'/('run-'+str(time.time_ns())));output.mkdir(parents=True,exist_ok=True)
- result={'case':case,'status':'FAIL','timeout_seconds':timeout,'elf_sha256':hashlib.sha256(elf.read_bytes()).hexdigest()};data=bytearray();proc=None;sock=None;qmp=None
+ result={'case':case,'status':'FAIL','timeout_seconds':timeout,'elf_sha256':hashlib.sha256(elf.read_bytes()).hexdigest()};data=bytearray();decoded=bytearray();decoder=FrameDecoder();proc=None;sock=None;qmp=None
  # macOS Unix socket names have a short fixed length. Keep sockets out of long project paths.
  with tempfile.TemporaryDirectory(prefix='cyx-') as td, (output/'qemu-stderr.log').open('wb') as err:
   path=str(Path(td)/'q.sock')
@@ -69,9 +97,17 @@ def run(elf,case='all',output=None,timeout=30):
    if 'QMP' not in qmp.receive(deadline):raise RuntimeError('missing QMP greeting')
    qmp.execute('qmp_capabilities')
    while time.monotonic()<deadline:
-    chunk=qmp.execute('ringbuf-read',{'device':'cyxlog','size':65536,'format':'base64'});data.extend(base64.b64decode(chunk,validate=True))
-    if b'FAIL' in data:raise RuntimeError('guest selftest failed')
-    if required_markers(data,case):result['status']='PASS';break
+    chunk=qmp.execute('ringbuf-read',{'device':'cyxlog','size':65536,'format':'base64'});raw=base64.b64decode(chunk,validate=True);data.extend(raw)
+    for payload in decoder.feed(raw):decoded.extend(payload+b'\n')
+    if len(data)>8*1024*1024:raise ValueError('serial capture limit')
+    if b'FAIL' in decoded:raise RuntimeError('guest selftest failed')
+    if required_markers(decoded,case):
+     if case=='pressure':
+      result['progress']=pressure(qmp,elf,output,deadline)
+      chunk=qmp.execute('ringbuf-read',{'device':'cyxlog','size':1048576,'format':'base64'});raw=base64.b64decode(chunk,validate=True);data.extend(raw)
+      for payload in decoder.feed(raw):decoded.extend(payload+b'\n')
+      if decoder.loss==0:raise ValueError('expected transport loss after overwrite')
+     result['status']='PASS';break
     if proc.poll() is not None:raise RuntimeError('guest exited')
     time.sleep(.01)
    else:raise TimeoutError('required guest markers missing')
@@ -88,6 +124,6 @@ def run(elf,case='all',output=None,timeout=30):
      except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=2)
     result['qemu_exit']=proc.returncode
    if sock:sock.close()
- (output/'serial.bin').write_bytes(data);result['serial_sha256']=hashlib.sha256(data).hexdigest();(output/'summary.json').write_text(json.dumps(result,indent=2));return result
+ (output/'serial.txt').write_bytes(decoded);result['transport']={'frames':decoder.frames,'lost_records':decoder.loss,'corrupt_bytes_or_frames':decoder.corrupt,'complete':decoder.loss==0 and decoder.corrupt==0};(output/'serial.bin').write_bytes(data);result['serial_sha256']=hashlib.sha256(data).hexdigest();(output/'summary.json').write_text(json.dumps(result,indent=2));return result
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--elf',required=True);p.add_argument('--case',choices=CASES,default='all');p.add_argument('--output');p.add_argument('--timeout',type=float,default=30);a=p.parse_args();r=run(a.elf,a.case,a.output,a.timeout);print(json.dumps(r,indent=2));raise SystemExit(0 if r['status']=='PASS' else 1)
