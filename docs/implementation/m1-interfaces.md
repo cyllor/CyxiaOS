@@ -10,7 +10,7 @@
 
 TaskId/Generation/PlanId/GrantId/RedemptionId 非零；CpuId(0) 有效。DecisionOrigin 的模型来源须有非零模型版本，AiPlan 还须有计划 ID。来源元数据不是授权凭据。
 
-GrantLedger 使用 64 个授予槽、128 个兑现槽。提交时预留未来每页一次兑现所需元数据，避免已经承诺的容量因元数据不足而无法兑现。余额满足 free + reserved_unredeemed + in_use = capacity。取消只退还未兑现容量；已兑现部分须有完整撤销回执才释放。每次兑现有唯一 ID，整笔完成后回执不能重放。M1 不支持部分兑现记录释放，不把 BudgetLimit 或 PlanAllowance 当作已占用资源。
+GrantLedger 使用 64 个授予槽、128 个兑现槽。提交时预留未来每页一次兑现所需元数据及剩余兑现编号容量，避免已经承诺的容量因元数据不足而无法兑现。余额满足 free + reserved_unredeemed + in_use = capacity。取消只退还未兑现容量；已兑现部分须有完整撤销回执才释放。每次兑现有唯一 ID，整笔完成后回执不能重放。M1 不支持部分兑现记录释放，不把 BudgetLimit 或 PlanAllowance 当作已占用资源。
 
 Trusted boot admission 与撤销回执构造为带明确安全前提的 unsafe 接口，不能直接暴露给未来用户态。未来 M2/M5 需要接入真实能力和映射生命周期。测试替身 AI 请求只存在于 crate 单元测试。
 

@@ -122,6 +122,12 @@ impl GrantLedger {
         if r.pages > s.free {
             return Err(GrantError::Capacity);
         }
+        // Reserve identity space for the worst case: every promised page is
+        // redeemed separately. checked_add deliberately never issues MAX.
+        let promised_ids = u64::from(s.reserved_unredeemed) + u64::from(r.pages);
+        if promised_ids > u64::MAX - self.next_redemption {
+            return Err(GrantError::Exhausted);
+        }
         // One future redemption record per unredeemed page guarantees bounded metadata.
         let records = self.redemptions.iter().flatten().count();
         if records as u64 + s.reserved_unredeemed as u64 + r.pages as u64 > REDEMPTIONS as u64 {
@@ -283,5 +289,34 @@ mod tests {
         assert!(now > plan.expires);
         l.redeem(g, owner, PageCount(1)).unwrap();
         assert_eq!(l.snapshot().reserved_unredeemed, 79);
+    }
+    #[test]
+    fn commit_reserves_redemption_ids_for_all_promised_pages() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let mut l = GrantLedger::new(PageCount(4));
+        l.next_redemption = u64::MAX - 2;
+        let g = l
+            .commit(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1)) })
+            .unwrap();
+        let before = l.snapshot();
+        assert_eq!(
+            l.commit(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(2)) }),
+            Err(GrantError::Exhausted)
+        );
+        assert_eq!(l.snapshot(), before);
+        l.redeem(g, owner, PageCount(1)).unwrap();
+        let g2 = l
+            .commit(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1)) })
+            .unwrap();
+        l.redeem(g2, owner, PageCount(1)).unwrap();
+        let before = l.snapshot();
+        assert_eq!(
+            l.commit(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1)) }),
+            Err(GrantError::Exhausted)
+        );
+        assert_eq!(l.snapshot(), before);
     }
 }

@@ -17,3 +17,7 @@ class ElfTests(unittest.TestCase):
   with self.assertRaises(ValueError):inspect_elf(fixture(pa=0x40000000))
  def test_segment_overflow(self):
   with self.assertRaises(ValueError):inspect_elf(fixture(mem=2**64-1))
+ def test_nonempty_file_with_zero_memory_is_rejected(self):
+  b=bytearray(fixture());struct.pack_into('<H',b,56,2)
+  struct.pack_into('<IIQQQQQQ',b,120,1,7,256,0x40000000,0x40000000,16,0,1)
+  with self.assertRaises(ValueError):inspect_elf(b)

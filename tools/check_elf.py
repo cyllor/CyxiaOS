@@ -16,8 +16,9 @@ def inspect_elf(b):
     loads=[]
     for i in range(phnum):
         typ,fl,off,va,pa,fs,ms,al=struct.unpack_from('<IIQQQQQQ',b,phoff+i*56)
-        if typ!=1 or ms==0:continue
+        if typ!=1:continue
         need(fs<=ms and off+fs<=len(b) and pa+ms<LIMIT and va+ms<LIMIT,'segment overflow')
+        if ms==0:continue
         need(0x40200000<=pa<pa+ms<=0x41000000,'load outside reserved kernel pool / DTB collision')
         need(not (fl&2 and fl&1),'writable executable segment')
         need(al in (0,1) or (al&(al-1)==0 and va%al==off%al),'invalid segment alignment')

@@ -54,7 +54,7 @@ class JsonLines:
     out.append(value)
   return out
 class Qmp:
- def __init__(self,sock):self.sock=sock;self.lines=JsonLines();self.pending=[];self.seq=0
+ def __init__(self,sock):self.sock=sock;self.lines=JsonLines();self.pending=[];self.seq=0;self.transcript=[]
  def receive(self,deadline):
   while not self.pending:
    left=deadline-time.monotonic()
@@ -63,11 +63,14 @@ class Qmp:
    try:data=self.sock.recv(65536)
    except socket.timeout:continue
    if not data:raise RuntimeError('QMP disconnected')
-   self.pending+=self.lines.feed(data)
+   messages=self.lines.feed(data)
+   self.transcript.extend({'direction':'receive','message':m} for m in messages)
+   self.pending+=messages
   return self.pending.pop(0)
  def execute(self,command,args=None):
   self.seq+=1;ident=self.seq;msg={'execute':command,'id':ident}
   if args is not None:msg['arguments']=args
+  self.transcript.append({'direction':'send','message':msg})
   self.sock.sendall(json.dumps(msg).encode()+b'\n');deadline=time.monotonic()+5
   while True:
    response=self.receive(deadline)
@@ -106,6 +109,7 @@ def run(elf,case='all',output=None,timeout=30):
       result['progress']=pressure(qmp,elf,output,deadline)
       chunk=qmp.execute('ringbuf-read',{'device':'cyxlog','size':1048576,'format':'base64'});raw=base64.b64decode(chunk,validate=True);data.extend(raw)
       for payload in decoder.feed(raw):decoded.extend(payload+b'\n')
+      if b'FAIL' in decoded:raise RuntimeError('guest selftest failed in final pressure capture')
       if decoder.loss==0:raise ValueError('expected transport loss after overwrite')
      result['status']='PASS';break
     if proc.poll() is not None:raise RuntimeError('guest exited')
@@ -124,6 +128,7 @@ def run(elf,case='all',output=None,timeout=30):
      except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=2)
     result['qemu_exit']=proc.returncode
    if sock:sock.close()
+   if qmp:(output/'qmp.jsonl').write_text(''.join(json.dumps(m)+'\n' for m in qmp.transcript))
  (output/'serial.txt').write_bytes(decoded);result['transport']={'frames':decoder.frames,'lost_records':decoder.loss,'corrupt_bytes_or_frames':decoder.corrupt,'complete':decoder.loss==0 and decoder.corrupt==0};(output/'serial.bin').write_bytes(data);result['serial_sha256']=hashlib.sha256(data).hexdigest();(output/'summary.json').write_text(json.dumps(result,indent=2));return result
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--elf',required=True);p.add_argument('--case',choices=CASES,default='all');p.add_argument('--output');p.add_argument('--timeout',type=float,default=30);a=p.parse_args();r=run(a.elf,a.case,a.output,a.timeout);print(json.dumps(r,indent=2));raise SystemExit(0 if r['status']=='PASS' else 1)

@@ -13,6 +13,7 @@ python3 tools/doctor.py --json
 python3 tools/build.py --profile dev
 python3 tools/run_qemu.py --elf target/aarch64-unknown-none-softfloat/debug/cyxia-kernel --case all
 python3 tools/verify_m1.py --output artifacts/m1-final
+python3 tools/coverage.py
 ```
 
 环境：Rust/Cargo 1.95.0、目标 aarch64-unknown-none-softfloat、rustfmt/clippy/llvm-tools-preview；QEMU 10.2.2。当前使用已安装 stable 并强制版本校验，避免重复安装；如果本机 stable 升级，须使用精确 1.95.0 工具链或重新验收，不能绕过 doctor。

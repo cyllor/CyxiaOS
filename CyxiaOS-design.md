@@ -2,7 +2,9 @@
 
 版本：0.9 · 日期：2026-10-15 · 状态：全系统 AI 决策原则增量草案；v0.7 终审不覆盖新增学习与全域决策契约
 
-配套文件：[CyxiaOS 详细设计](CyxiaOS-detailed-design.md)。本文件描述总体目标与边界；配套文件细化模块职责、状态机、接口、模型结构与验证方法。数值与接口均为建议设计，尚未以实现验证。
+代码实施状态（2026-10-15）：M1 单核 ARM 基础内核已通过指定 QEMU 验证，详见 [M1 实现结果](docs/implementation/m1-status.md)。本地 AI、学习及其他系统服务尚未实现；下文其余内容仍是设计约束，不代表已通过运行验证。
+
+配套文件：[CyxiaOS 详细设计](CyxiaOS-detailed-design.md)。本文件描述总体目标与边界；配套文件细化模块职责、状态机、接口、模型结构与验证方法。数值与接口为设计约束；运行验证范围仅限 M1 实现结果中明确列出的部分。
 
 交互入口：[全系统机制原型](CyxiaOS-system-prototype.html) · [原型范围说明](CyxiaOS-system-prototype-design.md) · [原型验证记录](CyxiaOS-system-prototype-verification.md)。这些是浏览器模拟，不代表客体操作系统已实现。
 
