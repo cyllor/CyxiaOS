@@ -31,7 +31,9 @@ def assess(facts):
     checks = {
         'rust': {'ready': pinned(facts.get('rust', ''), 'rustc 1.95.0')},
         'cargo': {'ready': pinned(facts.get('cargo', ''), 'cargo 1.95.0')},
-        'qemu': {'ready': facts.get('qemu', '').splitlines()[0:1] == ['QEMU emulator version 10.2.2']},
+        'qemu': {'ready': facts.get('qemu', '').splitlines()[0:1] in (
+            ['QEMU emulator version 10.2.2'],
+            ['QEMU emulator version 10.2.2 (v10.2.2)'])},
         'baremetal_target': {'ready': TARGET in facts.get('targets', [])},
         'llvm': {'ready': bool(facts.get('llvm'))},
     }

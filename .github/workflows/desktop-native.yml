@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   native-build:
@@ -44,7 +45,26 @@ jobs:
           path: |
             ${{ runner.temp }}/cyxia-rust-1.95.0.tar.gz
             ${{ runner.temp }}/native-evidence/rust-archive.sha256
+      - name: Restore previously verified emulator when available
+        id: qemu-restore
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Verify and unpack cached emulator
+        if: steps.qemu-restore.outcome == 'success'
+        run: |
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          cp "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" "$RUNNER_TEMP/"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-evidence/qemu-version.txt"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" > "$RUNNER_TEMP/native-evidence/qemu-archive.sha256"
       - name: Build exact QEMU 10.2.2 with native scanout support
+        if: steps.qemu-restore.outcome != 'success'
         run: |
           set -o pipefail
           git clone --depth=1 --branch v10.2.2 --single-branch https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"

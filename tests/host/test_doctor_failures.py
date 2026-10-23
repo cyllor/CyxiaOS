@@ -59,6 +59,16 @@ class DoctorFailureTests(unittest.TestCase):
             self.assertFalse(doctor.assess({'cargo': value})['cargo']['ready'])
         self.assertTrue(doctor.assess({'cargo': 'cargo 1.95.0 (abc 2026-10-01)'})['cargo']['ready'])
 
+    def test_official_qemu_tag_suffix_is_allowed_but_other_builds_are_not(self):
+        for line in ('QEMU emulator version 10.2.2',
+                     'QEMU emulator version 10.2.2 (v10.2.2)'):
+            self.assertTrue(doctor.assess({'qemu': line + '\nCopyright notice'})['qemu']['ready'])
+        for line in ('QEMU emulator version 10.2.21', 'QEMU emulator version 10.2.3',
+                     'QEMU emulator version 10.2.2 (v10.2.2-1-gabcdef)',
+                     'QEMU emulator version 10.2.2 (v10.2.2-dirty)',
+                     'QEMU emulator version 10.2.2-rc1', ''):
+            self.assertFalse(doctor.assess({'qemu': line})['qemu']['ready'])
+
     def test_cargo_home_is_honored_without_installation(self):
         with tempfile.TemporaryDirectory() as temp:
             environment = dict(os.environ, CARGO_HOME=temp, PYTHONDONTWRITEBYTECODE='1')
