@@ -20,16 +20,45 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned host Rust compiler
+        id: toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      - name: Prepare exact protocol archive required by host tests
+        shell: python
+        run: |
+          import hashlib, json, pathlib, urllib.request
+          root = pathlib.Path.cwd()
+          names = ('dynamic', 'interactive', 'multi', 'resize', 'xdg')
+          pins = [json.loads((root / ('ports/cosmic/smithay-' + name + '-client-source.json')).read_text())['crate'] for name in names]
+          pin = pins[0]
+          if any(item != pin for item in pins):
+              raise SystemExit('Client protocol archive pins disagree')
+          expected_url = 'https://static.crates.io/crates/wayland-protocols/wayland-protocols-0.32.13.crate'
+          if pin['url'] != expected_url or pin['bytes'] != 162090:
+              raise SystemExit('Unexpected protocol fixture source or size')
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise ValueError('Protocol fixture redirects are forbidden')
+          with urllib.request.build_opener(NoRedirect()).open(expected_url, timeout=30) as response:
+              data = response.read(pin['bytes'] + 1)
+          if len(data) != pin['bytes'] or hashlib.sha256(data).hexdigest() != pin['sha256']:
+              raise SystemExit('Protocol fixture integrity check failed')
+          target = root / 'artifacts/smithay-wayland-research/wayland-protocols-0.32.13.crate'
+          target.parent.mkdir(parents=True, exist_ok=True)
+          with target.open('xb') as stream:
+              stream.write(data)
+          print('Verified protocol fixture:', len(data), hashlib.sha256(data).hexdigest())
       - name: Python host tests
         run: python3 -B -m unittest discover -s tests/host -v
       - name: Native connection registry unit tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           rustc +1.95.0 --edition=2024 --test ports/cosmic/smithay-dynamic/clients.rs -o "$RUNNER_TEMP/cyxia-client-registry-tests"
           "$RUNNER_TEMP/cyxia-client-registry-tests"
       - name: Default Rust workspace tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo +1.95.0 test --locked --offline
       - name: Desktop POSIX memory configuration tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo +1.95.0 test --locked --offline -p cyxia-posix --features large-memory
       - name: Record verification scope
         if: always()
