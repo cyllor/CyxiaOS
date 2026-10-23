@@ -1,0 +1,37 @@
+name: Desktop port host checks
+
+on:
+  pull_request:
+    branches: [m1-kernel]
+
+permissions:
+  contents: read
+
+jobs:
+  host-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned host Rust compiler
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      - name: Python host tests
+        run: python3 -B -m unittest discover -s tests/host -v
+      - name: Native connection registry unit tests
+        run: |
+          rustc +1.95.0 --edition=2024 --test ports/cosmic/smithay-dynamic/clients.rs -o "$RUNNER_TEMP/cyxia-client-registry-tests"
+          "$RUNNER_TEMP/cyxia-client-registry-tests"
+      - name: Default Rust workspace tests
+        run: cargo +1.95.0 test --locked --offline
+      - name: Desktop POSIX memory configuration tests
+        run: cargo +1.95.0 test --locked --offline -p cyxia-posix --features large-memory
+      - name: Record verification scope
+        if: always()
+        run: |
+          echo 'Host checks only. This workflow does not build the complete target SDK, boot ARM/QEMU, verify scanout, or certify COSMIC.' >> "$GITHUB_STEP_SUMMARY"

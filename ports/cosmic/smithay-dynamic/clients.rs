@@ -48,11 +48,21 @@ impl<C: PartialEq, const N: usize> Registry<C, N> {
         if peer.pid <= 0 {
             return Err(Error::Peer);
         }
+        // An exhausted empty slot is retired, not a reason to deny another
+        // usable slot. Never wrap its generation or revive a stale key.
         let slot = self
             .slots
             .iter()
-            .position(Option::is_none)
-            .ok_or(Error::Full)?;
+            .enumerate()
+            .find(|(slot, entry)| entry.is_none() && self.generations[*slot] < u32::MAX)
+            .map(|(slot, _)| slot)
+            .ok_or_else(|| {
+                if self.slots.iter().any(Option::is_none) {
+                    Error::Exhausted
+                } else {
+                    Error::Full
+                }
+            })?;
         let generation = self.generations[slot]
             .checked_add(1)
             .ok_or(Error::Exhausted)?;
@@ -200,6 +210,43 @@ mod tests {
         assert_eq!(registry.reserve(peer(2)), Err(Error::Exhausted));
         assert_eq!(registry.len(), 0);
         assert_eq!(registry.next_id, 1);
+    }
+    #[test]
+    fn retired_slot_does_not_block_another_free_slot() {
+        let mut registry = Registry::<u32, 2>::new();
+        registry.generations[0] = u32::MAX;
+        let key = registry.reserve(peer(2)).unwrap();
+        assert_eq!(key.slot, 1);
+        assert_eq!(key.generation, 1);
+        assert_eq!(key.id, 1);
+        registry.bind(key, 20).unwrap();
+        assert_eq!(registry.get(key, &20).unwrap().peer, peer(2));
+        assert_eq!(registry.generations[0], u32::MAX);
+        assert_eq!(registry.reserve(peer(3)), Err(Error::Exhausted));
+        assert_eq!(registry.next_id, 2);
+        registry.remove(key, &20).unwrap();
+        let next = registry.reserve(peer(3)).unwrap();
+        assert_eq!(next.slot, 1);
+        assert_eq!(next.generation, 2);
+        assert_eq!(next.id, 2);
+        assert_eq!(registry.get(key, &20).unwrap_err(), Error::Stale);
+    }
+    #[test]
+    fn retiring_last_generation_preserves_live_owners_and_is_atomic() {
+        let mut registry = Registry::<u32, 2>::new();
+        registry.generations[0] = u32::MAX - 1;
+        let last = registry.reserve(peer(2)).unwrap();
+        assert_eq!(last.generation, u32::MAX);
+        registry.bind(last, 20).unwrap();
+        let other = registry.reserve(peer(3)).unwrap();
+        registry.bind(other, 30).unwrap();
+        assert_eq!(registry.reserve(peer(4)), Err(Error::Full));
+        registry.remove(last, &20).unwrap();
+        assert_eq!(registry.reserve(peer(4)), Err(Error::Exhausted));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.next_id, 3);
+        assert_eq!(registry.get(other, &30).unwrap().key, other);
+        assert_eq!(registry.get(last, &20).unwrap_err(), Error::Stale);
     }
     #[test]
     fn forged_slot_and_generation_cannot_address_another_connection() {
