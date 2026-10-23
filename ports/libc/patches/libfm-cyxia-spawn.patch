@@ -1,0 +1,44 @@
+--- a/src/base/fm-app-info.c
++++ b/src/base/fm-app-info.c
+@@ -219,6 +219,7 @@
+     pid_t pgid;
+ };
+ 
++#ifndef __CYXIA_CATALOG_SPAWN__
+ static void child_setup(gpointer user_data)
+ {
+     struct ChildSetup* data = (struct ChildSetup*)user_data;
+@@ -227,6 +228,8 @@
+     /* Move child to grandparent group so it will not die with parent */
+     setpgid(0, data->pgid);
+ }
++
++#endif
+ 
+ static void child_watch(GPid pid, gint status, gpointer user_data)
+ {
+@@ -354,11 +357,24 @@
+         else
+             path = NULL;
+ 
++#ifdef __CYXIA_CATALOG_SPAWN__
++        /* No fork callback is run in the parent. Prepare startup notification
++         * in the child's copied environment; process-group relocation is not
++         * supported by this bounded catalog-process profile. */
++        gchar **child_env = g_get_environ();
++        if (data.sn_id)
++            child_env = g_environ_setenv(child_env, "DESKTOP_STARTUP_ID", data.sn_id, TRUE);
++        ret = g_spawn_async((path && path[0] == '/') ? path : NULL, argv, child_env,
++                            G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
++                            NULL, NULL, &pid, err);
++        g_strfreev(child_env);
++#else
+         data.pgid = getpgid(getppid());
+                         /* only absolute path is usable, ignore others */
+         ret = g_spawn_async((path && path[0] == '/') ? path : NULL, argv, NULL,
+                             G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                             child_setup, &data, &pid, err);
++#endif
+         if (ret)
+             /* Ensure that we don't double fork and break pkexec */
+             g_child_watch_add(pid, child_watch, NULL);

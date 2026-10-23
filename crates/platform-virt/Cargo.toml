@@ -3,5 +3,8 @@ name = "cyxia-platform-virt"
 version.workspace = true
 edition.workspace = true
 
+[features]
+large-memory = []
+
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

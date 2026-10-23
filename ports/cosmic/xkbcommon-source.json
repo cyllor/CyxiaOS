@@ -1,0 +1,29 @@
+{
+  "name": "libxkbcommon",
+  "version": "1.13.2",
+  "source_url": "https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-1.13.2.tar.gz",
+  "expected_sha256": "acc4d5f7c3cbba5f9f8d08d8bdbeede84ecede46792f47929aa9321873385528",
+  "source_commit": null,
+  "archive_root": "libxkbcommon-xkbcommon-1.13.2",
+  "license_file": "LICENSE",
+  "license_description": "MIT/X11-derived licenses; preserve the complete upstream LICENSE and per-file SPDX notices",
+  "hash_source": "Locally computed from the official GitHub release-tag archive; tag identity is also recorded below. Signature verification is not claimed.",
+  "upstream_tag": "xkbcommon-1.13.2",
+  "upstream_tag_object": "322bf223710e9d3a646dd345896eb4e7a83f8c41",
+  "upstream_commit": "d1442aaa6b635551182e83c3b55037f4c118c962",
+  "depends_on": [],
+  "scope": "Static core keymap/state library; embedded probe keymap only, no complete desktop layout database or compositor-input integration claim",
+  "host_tools": [
+    {
+      "name": "bison",
+      "version": "3.8.2",
+      "source_url": "https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz",
+      "expected_sha256": "9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2",
+      "source_commit": null,
+      "archive_root": "bison-3.8.2",
+      "license_file": "COPYING",
+      "hash_source": "https://lists.gnu.org/archive/html/bug-bison/2021-09/msg00056.html",
+      "depends_on": []
+    }
+  ]
+}

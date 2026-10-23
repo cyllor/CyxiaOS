@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "scope": "Static AArch64 musl cross-build inputs. No guest execution or GTK desktop compatibility claim.",
+  "reused_manifests": [
+    "ports/libc/manifest.json",
+    "ports/libc/xorg-bootstrap.json",
+    "ports/libc/pixman-source.json",
+    "ports/libc/openbox-foundation.json",
+    "ports/libc/openbox-fonts.json"
+  ],
+  "packages": [
+    {
+      "name": "libpng",
+      "version": "1.6.56",
+      "source_url": "https://download.sourceforge.net/libpng/libpng-1.6.56.tar.xz",
+      "expected_sha256": "f7d8bf1601b7804f583a254ab343a6549ca6cf27d255c302c47af2d9d36a6f18",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libpng-1.6.56",
+      "license_file": "LICENSE",
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/libpng/libpng.hash",
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libjpeg-turbo",
+      "version": "3.1.2",
+      "source_url": "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.2/libjpeg-turbo-3.1.2.tar.gz",
+      "expected_sha256": "8f0012234b464ce50890c490f18194f913a7b1f4e6a03d6644179fa0f867d0cf",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libjpeg-turbo-3.1.2",
+      "license_file": "LICENSE.md",
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/jpeg-turbo/jpeg-turbo.hash",
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "cairo",
+      "version": "1.18.4",
+      "source_url": "https://www.cairographics.org/releases/cairo-1.18.4.tar.xz",
+      "expected_sha256": "445ed8208a6e4823de1226a74ca319d3600e83f6369f99b14265006599c32ccb",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "cairo-1.18.4",
+      "license_file": "COPYING",
+      "hash_source": "https://www.cairographics.org/releases/cairo-1.18.4.tar.xz.sha256sum",
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "gdk-pixbuf",
+      "version": "2.42.12",
+      "source_url": "https://download.gnome.org/sources/gdk-pixbuf/2.42/gdk-pixbuf-2.42.12.tar.xz",
+      "expected_sha256": "b9505b3445b9a7e48ced34760c3bcb73e966df3ac94c95a148cb669ab748e3c7",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "gdk-pixbuf-2.42.12",
+      "license_file": "COPYING",
+      "hash_source": "https://download.gnome.org/sources/gdk-pixbuf/2.42/gdk-pixbuf-2.42.12.sha256sum",
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "atk",
+      "version": "2.38.0",
+      "source_url": "https://download.gnome.org/sources/atk/2.38/atk-2.38.0.tar.xz",
+      "expected_sha256": "ac4de2a4ef4bd5665052952fe169657e65e895c5057dffb3c2a810f6191a0c36",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "atk-2.38.0",
+      "license_file": "COPYING",
+      "hash_source": "https://download.gnome.org/sources/atk/2.38/atk-2.38.0.sha256sum",
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "pango",
+      "version": "1.56.4",
+      "source_url": "https://download.gnome.org/sources/pango/1.56/pango-1.56.4.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "17065e2fcc5f5a5bdbffc884c956bfc7c451a96e8c4fb2f8ad837c6413cb5a01",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/pango/1.56.4/meson.build",
+        "https://download.gnome.org/sources/pango/1.56/pango-1.56.4.sha256sum"
+      ],
+      "depends_on": [],
+      "options": [],
+      "notes": [
+        "Verified minima: GLib 2.82, Cairo 1.18, Fontconfig 2.15, HarfBuzz 8.4, FriBidi 1.0.6. Disable optional libthai and introspection initially; verify options."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "archive_root": "pango-1.56.4",
+      "license_file": "COPYING"
+    },
+    {
+      "name": "libXfixes",
+      "version": "6.0.2",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libXfixes-6.0.2.tar.xz",
+      "expected_sha256": "39f115d72d9c5f8111e4684164d3d68cc1fd21f9b27ff2401b08fddfc0f409ba",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libXfixes-6.0.2",
+      "license_file": "COPYING",
+      "cyxia_runtime_verified": false,
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/x11r7/xlib_libXfixes/xlib_libXfixes.hash"
+    },
+    {
+      "name": "libXrandr",
+      "version": "1.5.4",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libXrandr-1.5.4.tar.xz",
+      "expected_sha256": "1ad5b065375f4a85915aa60611cc6407c060492a214d7f9daf214be752c3b4d3",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libXrandr-1.5.4",
+      "license_file": "COPYING",
+      "cyxia_runtime_verified": false,
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/x11r7/xlib_libXrandr/xlib_libXrandr.hash"
+    },
+    {
+      "name": "libXi",
+      "version": "1.8.2",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libXi-1.8.2.tar.xz",
+      "expected_sha256": "d0e0555e53d6e2114eabfa44226ba162d2708501a25e18d99cfb35c094c6c104",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libXi-1.8.2",
+      "license_file": "COPYING",
+      "cyxia_runtime_verified": false,
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/x11r7/xlib_libXi/xlib_libXi.hash"
+    },
+    {
+      "name": "libepoxy",
+      "version": "1.5.10",
+      "source_url": "https://download.gnome.org/sources/libepoxy/1.5/libepoxy-1.5.10.tar.xz",
+      "expected_sha256": "072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "libepoxy-1.5.10",
+      "license_file": "COPYING",
+      "cyxia_runtime_verified": false,
+      "hash_source": "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/libepoxy/libepoxy.hash"
+    },
+    {
+      "name": "gtk",
+      "version": "3.24.52",
+      "source_url": "https://download.gnome.org/sources/gtk/3.24/gtk-3.24.52.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "80931fa472a77b9a164f6740e3c0b444fac6770054632d35a7ff9d679e5e7b9f",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/gtk/3.24.52/meson.build",
+        "https://download.gnome.org/sources/gtk/3.24/gtk-3.24.52.sha256sum"
+      ],
+      "depends_on": [],
+      "options": [],
+      "notes": [
+        "X11 only; Wayland/Broadway/Quartz/Win32, printing and introspection disabled after option verification.",
+        "GTK requires libepoxy even for a software-rendered desktop; do not omit it by assumption."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "archive_root": "gtk-3.24.52",
+      "license_file": "COPYING"
+    }
+  ]
+}

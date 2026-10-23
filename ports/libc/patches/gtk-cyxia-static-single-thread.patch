@@ -1,0 +1,81 @@
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -11,6 +11,8 @@
+   description : 'Enable the macOS gdk backend (only when building on macOS)')
+ 
+ # Optional dependencies
++option('cyxia_single_thread_compose', type: 'boolean', value: false,
++  description: 'Load the real Compose table synchronously for the CyxiaOS single-thread target')
+ option('atk_bridge', type: 'boolean', value: true,
+   description: 'Enable the AT-SPI accessibility bus bridge (requires a working session bus)')
+ option('xinerama', type: 'combo', choices : ['yes', 'no', 'auto'], value : 'auto',
+--- a/meson.build
++++ b/meson.build
+@@ -184,6 +184,7 @@
+ gtk_mplocaledir = join_paths(gtk_prefix, get_option('localedir'))
+ 
+ cdata = configuration_data()
++cdata.set('CYXIA_SINGLE_THREAD_COMPOSE', get_option('cyxia_single_thread_compose'))
+ cdata.set_quoted('PACKAGE_VERSION', meson.project_version())
+ cdata.set_quoted('GTK_LOCALEDIR', gtk_localedir)
+ cdata.set_quoted('GTK_DATADIR', gtk_datadir)
+--- a/gtk/gtkimcontextsimple.c
++++ b/gtk/gtkimcontextsimple.c
+@@ -121,9 +121,13 @@
+                                                           GdkWindow                *window);
+ 
+ 
++#ifdef CYXIA_SINGLE_THREAD_COMPOSE
++static void gtk_im_context_simple_init_compose_table (void);
++#else
+ static void init_compose_table_async (GCancellable         *cancellable,
+                                       GAsyncReadyCallback   callback,
+                                       gpointer              user_data);
++#endif
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (GtkIMContextSimple, gtk_im_context_simple, GTK_TYPE_IM_CONTEXT)
+ 
+@@ -139,7 +143,12 @@
+   im_context_class->set_client_window = gtk_im_context_simple_set_client_window;
+   gobject_class->finalize = gtk_im_context_simple_finalize;
+ 
++#ifdef CYXIA_SINGLE_THREAD_COMPOSE
++  /* Execute the real loader on the AI-scheduled caller; no worker is created. */
++  gtk_im_context_simple_init_compose_table ();
++#else
+   init_compose_table_async (NULL, NULL, NULL);
++#endif
+ }
+ 
+ static char *
+@@ -241,6 +250,7 @@
+   g_clear_pointer (&path, g_free);
+ }
+ 
++#ifndef CYXIA_SINGLE_THREAD_COMPOSE
+ static void
+ init_compose_table_thread_cb (GTask            *task,
+                               gpointer          source_object,
+@@ -267,6 +277,8 @@
+   g_task_run_in_thread (task, init_compose_table_thread_cb);
+   g_object_unref (task);
+ }
++
++#endif /* !CYXIA_SINGLE_THREAD_COMPOSE */
+ 
+ static void
+ gtk_im_context_simple_init (GtkIMContextSimple *context_simple)
+--- a/gtk/gtkmodules.c
++++ b/gtk/gtkmodules.c
+@@ -586,6 +586,11 @@
+   else
+     module = module_to_check;
+ 
++  /* A static libc may not support opening the main executable as a module.
++   * Without a handle, this optional mixed-version check is unavailable. */
++  if (module == NULL)
++    return FALSE;
++
+   if (g_module_symbol (module, "gtk_progress_get_type", &func))
+     result = TRUE;
+   else

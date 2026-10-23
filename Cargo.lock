@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "cyxia-ai-fs"
+version = "0.1.0"
+dependencies = [
+ "cyxia-contracts",
+]
+
+[[package]]
+name = "cyxia-ai-runtime"
+version = "0.1.0"
+dependencies = [
+ "cyxia-contracts",
+ "cyxia-kernel-core",
+]
+
+[[package]]
 name = "cyxia-arch-aarch64"
 version = "0.1.0"
 dependencies = [
@@ -28,15 +43,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyxia-driver-virtio"
+version = "0.1.0"
+
+[[package]]
 name = "cyxia-kernel"
 version = "0.1.0"
 dependencies = [
+ "cyxia-ai-fs",
+ "cyxia-ai-runtime",
  "cyxia-arch-aarch64",
  "cyxia-contracts",
  "cyxia-driver-gicv2",
  "cyxia-driver-pl011",
+ "cyxia-driver-virtio",
  "cyxia-kernel-core",
  "cyxia-platform-virt",
+ "cyxia-posix",
+ "cyxia-shell",
 ]
 
 [[package]]
@@ -51,4 +75,20 @@ name = "cyxia-platform-virt"
 version = "0.1.0"
 dependencies = [
  "cyxia-contracts",
+]
+
+[[package]]
+name = "cyxia-posix"
+version = "0.1.0"
+dependencies = [
+ "cyxia-ai-fs",
+]
+
+[[package]]
+name = "cyxia-shell"
+version = "0.1.0"
+dependencies = [
+ "cyxia-ai-fs",
+ "cyxia-ai-runtime",
+ "cyxia-posix",
 ]

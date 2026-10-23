@@ -1,0 +1,35 @@
+--- a/xkb/ddxLoad.c
++++ b/xkb/ddxLoad.c
+@@ -466,6 +466,32 @@
+     XkbComponentNamesRec kccgst = { 0 };
+     char name[PATH_MAX];
+ 
++#ifdef CYXIA_OS
++    /* Native bootstrap uses an upstream-xkbcomp-produced XKM asset. It supports
++     * exactly the declared pc105/us layout; other layouts require a real
++     * compiler process and must not silently receive this keymap. */
++    if ((rmlvo->model && strcmp(rmlvo->model, "pc105")) ||
++        (rmlvo->layout && strcmp(rmlvo->layout, "us")) ||
++        (rmlvo->variant && rmlvo->variant[0]) ||
++        (rmlvo->options && rmlvo->options[0])) {
++        LogMessage(X_ERROR, "CyxiaOS: only the compiled pc105/us keymap is available\n");
++        return NULL;
++    }
++    FILE *compiled = fopen("/usr/share/X11/xkb/cyxia-us.xkm", "rb");
++    if (!compiled) {
++        LogMessage(X_ERROR, "CyxiaOS: compiled XKM asset is missing\n");
++        return NULL;
++    }
++    unsigned missing = XkmReadFile(compiled, need, XkmAllIndicesMask, &xkb);
++    fclose(compiled);
++    if (!xkb || (missing & need)) {
++        if (xkb) XkbFreeKeyboard(xkb, 0, TRUE);
++        LogMessage(X_ERROR, "CyxiaOS: compiled XKM asset lacks required components\n");
++        return NULL;
++    }
++    return xkb;
++#endif
++
+     if (XkbRMLVOtoKcCGST(dev, rmlvo, &kccgst)) {
+         provided =
+             XkbDDXLoadKeymapByNames(dev, &kccgst, XkmAllIndicesMask, need, &xkb,

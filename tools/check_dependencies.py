@@ -8,8 +8,9 @@ def validate_graph(metadata):
  names={p['id']:p['name'] for p in metadata['packages']}
  graph={n['id']:n['dependencies'] for n in metadata['resolve']['nodes']}
  for start in names:
-  if names[start] not in ('cyxia-contracts','cyxia-kernel-core'):continue
-  allowed={'cyxia-contracts'};seen={start};todo=list(graph[start])
+  allowed_by_root={'cyxia-contracts':{'cyxia-contracts'},'cyxia-kernel-core':{'cyxia-contracts'},'cyxia-ai-runtime':{'cyxia-contracts','cyxia-kernel-core'},'cyxia-ai-fs':{'cyxia-contracts'},'cyxia-posix':{'cyxia-ai-fs','cyxia-contracts'}}
+  if names[start] not in allowed_by_root:continue
+  allowed=allowed_by_root[names[start]];seen={start};todo=list(graph[start])
   while todo:
    dep=todo.pop()
    if dep in seen:continue

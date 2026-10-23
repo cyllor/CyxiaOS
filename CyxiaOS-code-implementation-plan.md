@@ -8,7 +8,9 @@
 
 **Tech Stack:** 建议冻结 Rust 1.95.0 `no_std`、少量 AArch64 汇编、`aarch64-unknown-none-softfloat`、QEMU 10.2.2 `virt-10.2` / Cortex-A53 / TCG / 1 CPU / 256 MiB、Python 标准库测试驱动。模型首版为自研整数运行时，无云模型依赖。
 
-**Spec:** [总体设计 v0.9](CyxiaOS-design.md)、[详细设计 v0.9](CyxiaOS-detailed-design.md)、[全系统 AI 决策契约](CyxiaOS-ai-decision-contract.md)、[学习设计](CyxiaOS-learning-prototype-design.md)。
+**Spec:** [总体设计 v0.12](CyxiaOS-design.md)、[详细设计 v0.12](CyxiaOS-detailed-design.md)、[全系统 AI 决策契约](CyxiaOS-ai-decision-contract.md)、[学习设计](CyxiaOS-learning-prototype-design.md)。
+
+POSIX 正式规格：[POSIX 兼容需求与架构](CyxiaOS-posix-design.md)，含 PX-R01—12、S1—S6 及 PX-T01—12。POSIX 专项以源码兼容为目标；新增 Linux 应用目标由独立兼容专项承接，认证另行决定。
 
 ## Global Constraints
 
@@ -21,7 +23,8 @@
 - 学习/验证共同后台额度建议 2 ms/100 ms，分片目标不超过 250 μs；完整整数算法与发布 ABI 在对应阶段冻结。
 - 物理页 OWNED → REVOKING → DIRTY_FREE → CLEAN_FREE → OWNED；清零和撤销未完成不能给新所有者。
 - BudgetLimit、PlanAllowance、ResourceGrant 分型；计划失效不撤销已提交资源授予的履约义务。
-- 现有 HTML 不可当作内核或正式模型实现；已有 v0.7 审核不证明 v0.9 完整通过。
+- 现有 HTML 不可当作内核或正式模型实现；已有 v0.7 审核不证明 v0.10 完整通过。
+- POSIX 可观察语义是硬约束，AI 优化不得改变数据、权限、FD/同步和返回契约；研究 ABI 与实验 POSIX ABI 必须隔离配置。
 - 保留现有文档、原型和历史审核快照；不引入 Linux 内核、宿主模型代算或联网推理。
 
 ## Review Focus
@@ -32,7 +35,7 @@
 4. 设备/日志持续中断及消费者停读：不得用长日志打印掩盖停机；M1 中断测试、M3 V18—V20。
 5. 文件/网络物理副作用部分完成：不能把额度回滚当数据回滚；M6 持久化测试、M8/M9 幂等和部分失败测试。
 
-当前执行状态（2026-10-15）：用户已确认并完成 M1，见 [M1 实现结果](docs/implementation/m1-status.md)。以下环境盘点和规划门槛保留为原始计划记录；M2—M9 尚未实施。
+当前执行状态（2026-10-15）：用户已确认并完成 M1，见 [M1 实现结果](docs/implementation/m1-status.md)。以下环境盘点和规划门槛保留为原始计划记录；随后按用户要求提前交付 [Shell 与 AI 文件系统切片](docs/implementation/shell-ai-fs.md)：EL1 Shell、RAMFS、文件域模型与显式学习发布。又按用户要求增加 [AI 内存/任务/设备切片](docs/implementation/ai-resource-management.md)，包含真实有界页池、协作式 EL1 任务及 UART/Timer 队列。其余 M2—M9 范围尚未完成，尤其不等同于完整 M6 或全系统 AI 调度。
 
 ## 1. 当前事实与规划范围
 
@@ -135,3 +138,44 @@ M7 的通用设备策略可以独立推进；M6 所需基础块驱动、M8 所�
 本轮完成的是规划与只读环境核查。计划按 ECC 2.2.3 的 `commands/plan.md` 流程生成；该指令要求先确认计划再写实现。等待用户确认后，在当前会话执行 M1，不默认派发子代理，也不擅自开始所有后续阶段。
 
 计划自查：现有实现约定缺失已明确；前提、来源、风险、阶段依赖和测试证据均列出。每个未实现域保留可见状态，不承诺不存在待解决设计问题。
+
+## POSIX 第一阶段实现进展
+
+已增加独立 EL0 地址映射、静态 C ELF、SVC/IRQ 上下文返回、用户指针验证、FD 与 POSIX 文件接口子集；本地模型控制准入和派发预算。仍无多进程、完整 exec/fork/wait、IPC、信号或全套 libc，不将 M2 全部标记完成。见 [实现范围与验证](docs/implementation/posix-compatibility.md)。
+
+## POSIX 正式需求的后续实施门槛
+
+S1 现有 15 接口/单 ELF 切片的证据见 [实现说明](docs/implementation/posix-compatibility.md)，不将 S2—S6 或整个 M2 标为完成。以下按专项矩阵追踪：
+
+- [ ] S2 / M2、M5：多地址空间、通用受控装载、fork/exec/wait、用户堆/映射和 ABI 配置绑定；PX-T02/03/05/06。
+- [ ] S3 / M6、M7：VFS 元数据/路径、信号/管道/终端/等待 I/O；PX-T04/07/08。
+- [ ] S4 / M5、M9：pthread/TLS、同步/时间与对应 SMP 共享状态；PX-T09/11。
+- [ ] S5 / M6—M8：SDK、C 库、真实应用移植及所选网络选项；PX-T12。
+- [ ] S6：Shell/工具与所声明兼容配置的全部必需项/已选选项证据；PX-T01—12，不用“支持若干函数”替代整体结论。
+
+各阶段同步资源总账和 AI 来源契约；每次学习/模型切换均保留兼容性回归门槛 PX-T10。通用应用运行配置必须移除未经授权的测试寿命上限；新的软件/硬件能力单独验收。
+
+## 轻量桌面与 Linux 应用实施分支（规划）
+
+采用 [LXDE/X11 桌面设计](CyxiaOS-gui-design.md)与 [Linux 应用兼容设计](CyxiaOS-linux-compatibility-design.md)。本分支替代 LVGL G0—G5 路线，不修改前文历史交付记录。二进制范围在 L0 冻结，当前假设直接运行 ARM64 Linux 用户态程序；未实现或验收。
+
+- [ ] D0/L0：冻结桌面/运行库/应用清单、源码与包哈希、许可、ABI、依赖、资源总账和二进制/源码兼容范围。
+- [ ] D1：VirtIO GPU/Input 和独立图形启动配置；串口回归及 DMA 故障恢复。
+- [ ] L1：通用多进程、映射/ELF/TLS/FP 上下文与 Linux ABI，真实静态 Linux ELF。
+- [ ] L2：动态运行库、线程/信号、事件/Unix socket、VFS/PTY，真实动态 Linux CLI。
+- [ ] D2/L3：原生 X.Org 后端和多客户端；接入 Linux X11 客户端并验证 AI 资源计量。
+- [ ] D3/L4/D4：Openbox、LXPanel、PCManFM、LXSession、终端；GTK/Qt 应用按固定工作流验收。
+- [ ] D5/L5：扩充软件矩阵、Wayland/Xwayland、网络/音频/加速和受限学习；大型应用逐项关闭依赖差距。
+
+D1 可独立推进；原生桌面移植与 Linux 二进制兼容可分步验收，最终都依赖真实进程和资源机制。现有 256 MiB 内核配置保留，另行评估桌面集成内存；旧 24 MiB LVGL 预算不适用。第一实施动作应为依赖与 ABI 清单冻结，不直接下载整套发行版后宣称兼容。
+
+D1 实施进展：Rust 现代 VirtIO MMIO、GPU 2D 彩条和原始键鼠事件已在指定 QEMU 的 dev/release 验证；缺设备回退 Shell。仍无桌面/完整输入服务/运行期 AI 图形调度，D1 不整体勾选。详见 [切片证据与限制](docs/implementation/graphics-bringup.md)。
+
+D2 基础进展（2026-10-16）：新增最多 3 个同时活动的固定 ELF 独立 EL0 进程、本地模型选择/预算、私有双向 IPC、等待/唤醒和独立故障回收；原生 Rust 服务不继承 C 测试 500 ms 寿命限制。详见 [实现和证据](docs/implementation/desktop-process-foundation.md)。通用映射/装载、C 运行库、本地 socket、X.Org 和 LXDE 尚缺，D2/L1/S2 均不整体勾选。
+
+
+桌面增量（2026-10-18）：第一版组合已包括真实 X.Org/Openbox、PCManFM、LXPanel、原生 PTY 终端/shell 和图形保存，单核 ARM 512 MiB；默认 256 MiB 内核继续保留。同一候选 `f432d168…` 的菜单启动、任务栏、文件重命名、终端写读/缩放/中断/退出、两次 flush 后保存成功和新 VM 恢复均已通过，证据见 [第一版轻量桌面](docs/implementation/lightweight-desktop.md)。八槽最多准入七进程；桌面常驻四进程，终端与 shell 增至六，保存窗口短时为七；实际资源路径经过本地模型及 grant ledger。大池每槽 16 MiB 匿名额度、512 条映射记录；内嵌目录上限 52 MiB，内核物理保留区仍为 64 MiB。RAMFS 仍为 64 节点/每文件 4 KiB，有 UTF-8 名称、普通文件原子重命名和显式持久检查点。
+
+- [x] 第一版轻量桌面：真实上游窗口/面板/文件组件、静态菜单启动、原生终端与文件保存重启恢复。
+- [ ] 完整 LXDE 服务集合：LXSession、动态 menu-cache、VTE/LXTerminal；当前启动器/静态菜单/原生终端不冒充这些组件。
+- [ ] L4/D4：动态链接、通用 Linux 原二进制与 GTK/Qt 广泛应用兼容，按独立固定工作流验收。

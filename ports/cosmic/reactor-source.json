@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-unknown-linux-musl",
+  "cosmic_comp_commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "cosmic_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "scope": "Genuine pinned Mio reactor foundation; calloop, polling and COSMIC runtime remain separate gates",
+  "related_lock_versions": {
+    "mio": "1.1.1",
+    "polling": "3.11.0",
+    "calloop": "0.14.4"
+  },
+  "crates": [
+    {
+      "name": "libc",
+      "version": "0.2.182",
+      "url": "https://static.crates.io/crates/libc/libc-0.2.182.crate",
+      "bytes": 814873,
+      "sha256": "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112",
+      "features": [
+        "default",
+        "std"
+      ],
+      "dependencies": []
+    },
+    {
+      "name": "log",
+      "version": "0.4.29",
+      "url": "https://static.crates.io/crates/log/log-0.4.29.crate",
+      "bytes": 51515,
+      "sha256": "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897",
+      "features": [],
+      "dependencies": []
+    },
+    {
+      "name": "mio",
+      "version": "1.1.1",
+      "url": "https://static.crates.io/crates/mio/mio-1.1.1.crate",
+      "bytes": 105630,
+      "sha256": "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc",
+      "features": [
+        "default",
+        "log",
+        "os-poll",
+        "os-ext",
+        "net"
+      ],
+      "dependencies": [
+        "libc",
+        "log"
+      ]
+    }
+  ],
+  "budgets": {
+    "max_download_bytes": 1000000,
+    "max_expanded_bytes": 33554432,
+    "max_build_bytes": 268435456,
+    "min_free_bytes": 2147483648,
+    "timeout_seconds": 180
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "name": "smithay-dynamic-client",
+  "protocol": "xdg-shell",
+  "wire_version": 1,
+  "crate": {
+    "name": "wayland-protocols",
+    "version": "0.32.13",
+    "sha256": "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6",
+    "url": "https://static.crates.io/crates/wayland-protocols/wayland-protocols-0.32.13.crate",
+    "bytes": 162090
+  },
+  "xml_member": "wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml",
+  "xml_sha256": "7ba7f9c8473deee674cb1f154a18abd0bb0cc072604fc055b0c15e459fc4c7df",
+  "scope": "Independent environment-discovered libwayland clients use an actual named socket and SO_PEERCRED, live two-slot admission and EOF capacity rejection, replacement slot reuse, shared SHM frames and abrupt disconnect with live objects; native runtime validation required."
+}

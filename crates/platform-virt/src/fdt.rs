@@ -41,6 +41,8 @@ struct Node<'a> {
     psc: u32,
     reserved: bool,
     child_seen: bool,
+    enabled: bool,
+    direct: bool,
 }
 impl Node<'_> {
     const EMPTY: Self = Self {
@@ -54,6 +56,8 @@ impl Node<'_> {
         psc: 1,
         reserved: false,
         child_seen: false,
+        enabled: true,
+        direct: false,
     };
 }
 fn has(list: &[u8], s: &[u8]) -> bool {
@@ -113,6 +117,9 @@ fn push(
     Ok(())
 }
 fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
+    if !n.enabled {
+        return Ok(());
+    }
     if n.name.starts_with(b"memory@") {
         regions(n, |a, l| {
             push(&mut info.ram, &mut info.ram_count, a, l, RegionKind::Ram)
@@ -143,6 +150,20 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
             });
             Ok(())
         })?;
+    } else if has(n.compat, b"arm,pl031") {
+        if info.rtc.is_some() || !n.direct {
+            return Err(FdtError::Unsupported);
+        }
+        regions(n, |a, len| {
+            if info.rtc.is_some() || len < 4096 || !a.is_multiple_of(4096) {
+                return Err(FdtError::Unsupported);
+            }
+            info.rtc = Some(RtcResource {
+                base: PhysAddr(a),
+                len,
+            });
+            Ok(())
+        })?;
     } else if has(n.compat, b"arm,cortex-a15-gic") {
         if info.gic.is_some() {
             return Err(FdtError::Overlap);
@@ -166,6 +187,33 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
             cpu: PhysAddr(regs[1].0),
             cpu_len: regs[1].1,
         });
+    } else if has(n.compat, b"virtio,mmio") {
+        // This board profile supports root-level resources only: no silent bus translation.
+        if !n.direct
+            || n.irq.len() != 12
+            || word(n.irq, 0)? != 0
+            || word(n.irq, 4)? > 987
+            || !matches!(word(n.irq, 8)?, 1 | 4)
+        {
+            return Err(FdtError::Unsupported);
+        }
+        let mut resource = None;
+        regions(n, |a, len| {
+            if resource.is_some() || len < 0x200 || !a.is_multiple_of(0x200) {
+                return Err(FdtError::Unsupported);
+            }
+            resource = Some(VirtioMmioResource {
+                base: PhysAddr(a),
+                len,
+                irq: word(n.irq, 4)? + 32,
+            });
+            Ok(())
+        })?;
+        if info.virtio_count == info.virtio.len() {
+            return Err(FdtError::Capacity);
+        }
+        info.virtio[info.virtio_count] = resource.ok_or(FdtError::Missing)?;
+        info.virtio_count += 1;
     } else if has(n.compat, b"arm,armv8-timer") {
         if info.timer_irq.is_some() || n.irq.len() < 24 || !n.irq.len().is_multiple_of(12) {
             return Err(FdtError::Unsupported);
@@ -265,6 +313,8 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
                         pac: parent.ac,
                         psc: parent.sc,
                         reserved: parent.reserved || parent.name == b"reserved-memory",
+                        enabled: parent.enabled,
+                        direct: depth == 1,
                         ..Node::EMPTY
                     };
                     stack[depth] = node;
@@ -315,6 +365,12 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
                     }
                     b"reg" => n.reg = v,
                     b"interrupts" => n.irq = v,
+                    b"status" => {
+                        if v.last() != Some(&0) {
+                            return Err(FdtError::String);
+                        }
+                        n.enabled &= v == b"okay\0" || v == b"ok\0";
+                    }
                     _ => {}
                 }
             }
@@ -344,7 +400,7 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
         }
         pages = pages.checked_add(r.len / 4096).ok_or(FdtError::Capacity)?;
     }
-    if pages > 65536 {
+    if pages > crate::RAM_MIB * 256 {
         return Err(FdtError::Capacity);
     }
     let u = info.uart.unwrap();
@@ -353,8 +409,12 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
         (u.base.0, u.len),
         (g.distributor.0, g.distributor_len),
         (g.cpu.0, g.cpu_len),
+        info.rtc.map(|r| (r.base.0, r.len)).unwrap_or((0, 0)),
     ];
     for (i, (a, l)) in dev.iter().enumerate() {
+        if *l == 0 {
+            continue;
+        }
         let r = MemoryRegion {
             start: PhysAddr(*a),
             len: *l,
@@ -371,6 +431,34 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
             }) {
                 return Err(FdtError::Overlap);
             }
+        }
+    }
+    for (index, v) in info.virtio[..info.virtio_count].iter().enumerate() {
+        let r = MemoryRegion {
+            start: v.base,
+            len: v.len,
+            kind: RegionKind::Device,
+        };
+        if info.ram[..info.ram_count]
+            .iter()
+            .chain(info.reserved[..info.reserved_count].iter())
+            .any(|x| x.overlaps(r))
+            || dev.iter().any(|(a, n)| {
+                r.overlaps(MemoryRegion {
+                    start: PhysAddr(*a),
+                    len: *n,
+                    kind: RegionKind::Device,
+                })
+            })
+            || info.virtio[..index].iter().any(|x| {
+                r.overlaps(MemoryRegion {
+                    start: x.base,
+                    len: x.len,
+                    kind: RegionKind::Device,
+                })
+            })
+        {
+            return Err(FdtError::Overlap);
         }
     }
     Ok(info)

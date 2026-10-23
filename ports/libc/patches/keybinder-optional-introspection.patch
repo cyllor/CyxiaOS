@@ -1,0 +1,21 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -72,7 +72,17 @@
+ AC_SUBST(GTKPACKAGEDEP)
+ 
+ dnl * gobject-introspection
+-GOBJECT_INTROSPECTION_CHECK([0.6.7])
++m4_ifdef([GOBJECT_INTROSPECTION_CHECK], [
++  GOBJECT_INTROSPECTION_CHECK([0.6.7])
++], [
++  AC_ARG_ENABLE([introspection],
++    AS_HELP_STRING([--enable-introspection], [build introspection metadata]),
++    [], [enable_introspection=no])
++  AS_IF([test "x$enable_introspection" != "xno"],
++    [AC_MSG_ERROR([gobject-introspection build macros are required])])
++  found_introspection=no
++  AM_CONDITIONAL([HAVE_INTROSPECTION], [false])
++])
+ 
+ dnl ***********************************
+ dnl * Require XKB

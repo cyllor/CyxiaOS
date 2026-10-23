@@ -1,0 +1,25 @@
+--- a/libmenu-cache/menu-cache.c
++++ b/libmenu-cache/menu-cache.c
+@@ -1556,7 +1556,8 @@
+ 
+     if (!g_file_test (MENUCACHE_LIBEXECDIR "/menu-cached", G_FILE_TEST_IS_EXECUTABLE))
+     {
+-        g_error("failed to find menu-cached");
++        g_warning("menu-cached is unavailable; application menu cannot be loaded");
++        return FALSE;
+     }
+ 
+     /* Start daemon */
+@@ -1739,7 +1740,11 @@
+         if((rc == ECONNREFUSED || rc == ENOENT) && retries == 0)
+         {
+             DEBUG("no running server found, starting it");
+-            fork_server(addr.sun_path);
++            if (!fork_server(addr.sun_path))
++            {
++                G_UNLOCK(connect);
++                return FALSE;
++            }
+             ++retries;
+             goto retry;
+         }

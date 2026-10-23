@@ -1,0 +1,86 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -97,6 +97,8 @@
+ backend_gbm_has_fd_for_plane = []
+ backend_gbm_has_create_with_modifiers2 = []
+ backend_egl = ["gl_generator", "libloading"]
++# CyxiaOS static Mesa: keep the same generated API without a dynamic loader.
++backend_egl_static = ["backend_egl"]
+ backend_libinput = ["input"]
+ backend_session = []
+ backend_udev = ["udev", "input/udev"]
+--- a/src/backend/egl/ffi.rs
++++ b/src/backend/egl/ffi.rs
+@@ -73,8 +73,7 @@
+ /// This normally happens automatically during [`EGLDisplay`](super::EGLDisplay) initialization.
+ pub fn make_sure_egl_is_loaded() -> Result<Vec<String>, Error> {
+     use std::{
+-        ffi::{CStr, CString},
+-        ptr,
++        ffi::CStr,
+     };
+ 
+     fn constrain<F>(f: F) -> F
+@@ -83,9 +82,13 @@
+     {
+         f
+     }
++    #[cfg(not(feature = "backend_egl_static"))]
++    use std::{ffi::CString, ptr};
++
+     let proc_address = constrain(|sym| unsafe { super::get_proc_address(sym) });
+ 
+     egl::LOAD.call_once(|| unsafe {
++        #[cfg(not(feature = "backend_egl_static"))]
+         egl::load_with(|sym| {
+             let name = CString::new(sym).unwrap();
+             let symbol = egl::LIB.get::<*mut c_void>(name.as_bytes());
+@@ -94,6 +97,8 @@
+                 Err(_) => ptr::null(),
+             }
+         });
++        #[cfg(feature = "backend_egl_static")]
++        egl::load_with(egl::static_proc_address);
+         egl::load_with(&proc_address);
+         egl::BindWaylandDisplayWL::load_with(&proc_address);
+         egl::UnbindWaylandDisplayWL::load_with(&proc_address);
+@@ -141,11 +146,37 @@
+ #[allow(clippy::all, missing_debug_implementations, unsafe_op_in_unsafe_fn)]
+ pub mod egl {
+     use super::*;
++    #[cfg(not(feature = "backend_egl_static"))]
+     use libloading::Library;
+-    use std::sync::{LazyLock, Once};
+-
++    #[cfg(not(feature = "backend_egl_static"))]
++    use std::sync::LazyLock;
++    use std::sync::Once;
++
++    #[cfg(not(feature = "backend_egl_static"))]
+     pub static LIB: LazyLock<Library> =
+         LazyLock::new(|| unsafe { Library::new("libEGL.so.1") }.expect("Failed to load LibEGL"));
++
++    // The linked Mesa entry point is the only bootstrap symbol. It returns
++    // actual driver functions, including EGL core entry points; missing symbols
++    // retain the generated binding loader's normal null handling.
++    #[cfg(feature = "backend_egl_static")]
++    pub(super) fn static_proc_address(symbol: &str) -> *const c_void {
++        unsafe extern "C" {
++            #[link_name = "eglGetProcAddress"]
++            fn linked_get_proc_address(
++                name: *const std::ffi::c_char,
++            ) -> Option<unsafe extern "system" fn()>;
++        }
++        let Ok(name) = std::ffi::CString::new(symbol) else {
++            return std::ptr::null();
++        };
++        // SAFETY: The name is NUL terminated and lives through the call. This
++        // library owns the linked Mesa implementation for the process lifetime.
++        unsafe {
++            linked_get_proc_address(name.as_ptr())
++                .map_or(std::ptr::null(), |function| function as *const c_void)
++        }
++    }
+ 
+     pub static LOAD: Once = Once::new();
+     pub static DEBUG: Once = Once::new();

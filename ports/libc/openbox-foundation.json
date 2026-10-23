@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-linux-musl",
+  "scope": "GLib foundation and Openbox source; remaining Pango/Xft/font dependencies not closed",
+  "packages": [
+    {
+      "name": "libffi",
+      "version": "3.4.8",
+      "source_url": "https://github.com/libffi/libffi/releases/download/v3.4.8/libffi-3.4.8.tar.gz",
+      "expected_sha256": "bc9842a18898bfacb0ed1252c4febcc7e78fa139fd27fdc7a3e30d9d9356119b",
+      "archive_root": "libffi-3.4.8",
+      "license_file": "LICENSE",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/libffi/libffi.hash"
+      ],
+      "verification": "SHA256 pinned before retrieval; upstream runtime not verified"
+    },
+    {
+      "name": "pcre2",
+      "version": "10.47",
+      "source_url": "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.bz2",
+      "expected_sha256": "47fe8c99461250d42f89e6e8fdaeba9da057855d06eb7fc08d9ca03fd08d7bc7",
+      "archive_root": "pcre2-10.47",
+      "license_file": "LICENCE.md",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/pcre2/pcre2.hash"
+      ],
+      "verification": "SHA256 pinned before retrieval; upstream runtime not verified"
+    },
+    {
+      "name": "glib",
+      "version": "2.86.5",
+      "source_url": "https://download.gnome.org/sources/glib/2.86/glib-2.86.5.tar.xz",
+      "expected_sha256": "ce85a947bb8b3c0204dbeff79aec39bcb46371c6fafb64ba5b8726c71e038d5f",
+      "archive_root": "glib-2.86.5",
+      "license_file": "COPYING",
+      "evidence_urls": [
+        "https://download.gnome.org/sources/glib/2.86/glib-2.86.5.sha256sum"
+      ],
+      "verification": "SHA256 pinned before retrieval; upstream runtime not verified"
+    },
+    {
+      "name": "openbox",
+      "version": "3.6.1",
+      "source_url": "https://openbox.org/dist/openbox/openbox-3.6.1.tar.xz",
+      "expected_sha256": "abe75855cc5616554ffd47134ad15291fe37ebbebf1a80b69cbde9d670f0e26d",
+      "archive_root": "openbox-3.6.1",
+      "license_file": "COPYING",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/buildroot/buildroot/6f8f031cef37ac39a39241bd7871caf542f549be/package/openbox/openbox.hash"
+      ],
+      "verification": "SHA256 pinned before retrieval; upstream runtime not verified"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+[package]
+name = "cyxia-ai-fs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cyxia-contracts = { path = "../contracts" }

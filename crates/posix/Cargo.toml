@@ -1,0 +1,10 @@
+[package]
+name = "cyxia-posix"
+version.workspace = true
+edition.workspace = true
+
+[features]
+large-memory = []
+
+[dependencies]
+cyxia-ai-fs = { path = "../ai-fs" }

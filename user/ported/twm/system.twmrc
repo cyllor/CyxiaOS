@@ -1,0 +1,34 @@
+# CyxiaOS integration session; built-in X.Org fonts require no external font tree.
+NoGrabServer
+DecorateTransients
+RandomPlacement
+NoTitleFocus
+TitleFont "fixed"
+ResizeFont "fixed"
+MenuFont "fixed"
+IconFont "fixed"
+IconManagerFont "fixed"
+BorderWidth 2
+Color {
+    BorderColor "#304660"
+    DefaultBackground "#182538"
+    DefaultForeground "#e3eaf5"
+    TitleBackground "#244968"
+    TitleForeground "#ffffff"
+    MenuBackground "#182538"
+    MenuForeground "#e3eaf5"
+    MenuTitleBackground "#244968"
+    MenuTitleForeground "#ffffff"
+}
+Button1 = : title : f.move
+Button3 = : title : f.resize
+Button1 = : root : f.menu "desktop"
+Button1 = : icon : f.iconify
+menu "desktop" {
+    "CyxiaOS / TWM" f.title
+    "Move window" f.move
+    "Resize window" f.resize
+    "Minimize window" f.iconify
+    "Raise window" f.raise
+    "Close window" f.delete
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-linux-musl",
+  "scope": "Real static LXPanel GTK3 with upstream built-in panel plugins; guest execution is a separate gate.",
+  "packages": [
+    {
+      "name": "libwnck", "version": "43.3",
+      "source_url": "https://download.gnome.org/sources/libwnck/43/libwnck-43.3.tar.xz",
+      "expected_sha256": "6af8ac41a8f067ade1d3caaed254a83423b5f61ad3f7a460fcacbac2e192bdf7",
+      "source_commit": null, "archive_root": "libwnck-43.3", "license_file": "COPYING",
+      "hash_source": "https://download.gnome.org/sources/libwnck/43/libwnck-43.3.sha256sum",
+      "depends_on": []
+    },
+    {
+      "name": "keybinder", "version": "0.3.2",
+      "source_url": "https://github.com/kupferlauncher/keybinder/archive/04ae06724d914c7d4fec6a2723edf9c6320ec502.tar.gz",
+      "source_git_url": "https://github.com/kupferlauncher/keybinder.git",
+      "source_commit": "04ae06724d914c7d4fec6a2723edf9c6320ec502",
+      "expected_sha256": null, "license_file": "COPYING",
+      "version_source": "https://github.com/kupferlauncher/keybinder/releases/tag/keybinder-3.0-v0.3.2",
+      "depends_on": []
+    }
+  ],
+  "lxpanel_source_manifest": "ports/desktop/manifest.json",
+  "profile": {"gtk": 3, "shared_libraries": false, "plugin_loading": false, "dynamic_plugins": [], "alsa": false, "indicators": false}
+}

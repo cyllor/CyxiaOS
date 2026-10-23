@@ -1,0 +1,50 @@
+--- a/meson.build
++++ b/meson.build
+@@ -163,6 +163,10 @@
+ if get_option('cyxia-demand-texture-cache')
+   assert(cyxia_static_softpipe, 'Demand texture caches require the Cyxia softpipe profile')
+   pre_args += '-DCYXIA_DEMAND_TEXTURE_CACHE'
++endif
++if get_option('cyxia-nir-small-slabs')
++  assert(cyxia_static_softpipe, 'Small NIR slabs require the Cyxia softpipe profile')
++  pre_args += '-DCYXIA_NIR_SMALL_SLABS'
+ endif
+ if get_option('cyxia-compute-oom')
+   assert(cyxia_static_softpipe, 'Compute OOM reporting requires the Cyxia softpipe profile')
+--- a/meson.options
++++ b/meson.options
+@@ -922,6 +922,8 @@
+        description : 'CyxiaOS static EGL/GLES softpipe-only port')
+ option('cyxia-demand-texture-cache', type : 'boolean', value : false,
+        description : 'Allocate real softpipe caches with sampler views, not all possible slots')
++option('cyxia-nir-small-slabs', type : 'boolean', value : false,
++       description : 'Use 4 KiB NIR GC slabs for the bounded Cyxia process heap')
+ option('cyxia-compute-oom', type : 'boolean', value : false,
+        description : 'Transactional softpipe compute preflight with real frontend OOM errors')
+ option('cyxia-probe-source', type : 'string', value : '',
+--- a/src/util/ralloc.c
++++ b/src/util/ralloc.c
+@@ -585,7 +585,13 @@
+ #define NUM_FREELIST_BUCKETS (MAX_FREELIST_SIZE / FREELIST_ALIGNMENT)
+ 
+ /* The size of a slab. */
++#ifdef CYXIA_NIR_SMALL_SLABS
++/* Reduce per-shader retained slab slack under the fixed Cyxia heap policy.
++ * Object sizes, bucket selection, alignment and GC ownership are unchanged. */
++#define SLAB_SIZE (4 * 1024)
++#else
+ #define SLAB_SIZE (32 * 1024)
++#endif
+ 
+ #define GC_CONTEXT_CANARY 0xAF6B6C83
+ #define GC_CANARY 0xAF6B5B72
+@@ -734,6 +740,9 @@
+ }
+ 
+ static_assert(UINT32_MAX >= SLAB_SIZE, "SLAB_SIZE use uint32_t");
++static_assert(SLAB_SIZE <= UINT16_MAX, "GC slab offsets must fit in uint16_t");
++static_assert(SLAB_SIZE >= sizeof(gc_slab) + MAX_FREELIST_SIZE,
++              "Every GC freelist bucket must fit at least one object");
+ 
+ static uint32_t
+ gc_bucket_num_objs(uint32_t bucket)

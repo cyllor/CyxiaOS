@@ -1,0 +1,488 @@
+--- a/meson.build
++++ b/meson.build
+@@ -163,6 +163,10 @@
+ if get_option('cyxia-demand-texture-cache')
+   assert(cyxia_static_softpipe, 'Demand texture caches require the Cyxia softpipe profile')
+   pre_args += '-DCYXIA_DEMAND_TEXTURE_CACHE'
++endif
++if get_option('cyxia-compute-oom')
++  assert(cyxia_static_softpipe, 'Compute OOM reporting requires the Cyxia softpipe profile')
++  pre_args += '-DCYXIA_COMPUTE_OOM'
+ endif
+ # The target triple describes the musl ABI, not the kernel's device ABI.
+ system_has_kms_drm = not cyxia_static_softpipe and ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
+--- a/meson.options
++++ b/meson.options
+@@ -922,5 +922,7 @@
+        description : 'CyxiaOS static EGL/GLES softpipe-only port')
+ option('cyxia-demand-texture-cache', type : 'boolean', value : false,
+        description : 'Allocate real softpipe caches with sampler views, not all possible slots')
++option('cyxia-compute-oom', type : 'boolean', value : false,
++       description : 'Transactional softpipe compute preflight with real frontend OOM errors')
+ option('cyxia-probe-source', type : 'string', value : '',
+        description : 'Explicit CyxiaOS foundation probe source (empty disables)')
+--- a/src/gallium/include/pipe/p_context.h
++++ b/src/gallium/include/pipe/p_context.h
+@@ -126,6 +126,14 @@
+     */
+    struct util_debug_callback debug;
+ 
++#ifdef CYXIA_COMPUTE_OOM
++   /* Mandatory synchronous frontend error sink for the opt-in Cyxia profile.
++    * Unlike KHR_debug/reset notification this records a normal GL error even
++    * on contexts without debug or reset-notification flags. */
++   void (*cyxia_compute_error)(void *data, enum pipe_error error);
++   void *cyxia_compute_error_data;
++#endif
++
+    void (*destroy)(struct pipe_context *);
+ 
+    /**
+--- a/src/mesa/state_tracker/st_context.c
++++ b/src/mesa/state_tracker/st_context.c
+@@ -28,6 +28,9 @@
+ 
+ #include "main/accum.h"
+ #include "main/context.h"
++#ifdef CYXIA_COMPUTE_OOM
++#include "main/errors.h"
++#endif
+ #include "main/debug_output.h"
+ #include "main/framebuffer.h"
+ #include "main/glthread.h"
+@@ -344,6 +347,10 @@
+ static void
+ st_destroy_context_priv(struct st_context *st, bool destroy_pipe)
+ {
++#ifdef CYXIA_COMPUTE_OOM
++   st->pipe->cyxia_compute_error = NULL;
++   st->pipe->cyxia_compute_error_data = NULL;
++#endif
+    cso_unbind_context(st->cso_context);
+    st_destroy_draw(st);
+    st_destroy_clear(st);
+@@ -441,6 +448,17 @@
+           pipe->wait_intel_perf_query && pipe->is_intel_perf_query_ready &&
+           pipe->get_intel_perf_query_data;
+ }
++
++#ifdef CYXIA_COMPUTE_OOM
++static void
++st_cyxia_compute_error(void *data, enum pipe_error error)
++{
++   struct gl_context *ctx = data;
++   _mesa_error(ctx, error == PIPE_ERROR_OUT_OF_MEMORY ?
++               GL_OUT_OF_MEMORY : GL_INVALID_OPERATION,
++               "Cyxia softpipe compute preflight");
++}
++#endif
+ 
+ static struct st_context *
+ st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
+@@ -791,6 +809,10 @@
+    }
+ 
+    st_debug_init();
++#ifdef CYXIA_COMPUTE_OOM
++   pipe->cyxia_compute_error = st_cyxia_compute_error;
++   pipe->cyxia_compute_error_data = ctx;
++#endif
+ 
+    if (pipe->screen->get_disk_shader_cache)
+       ctx->Cache = pipe->screen->get_disk_shader_cache(pipe->screen);
+@@ -803,6 +825,10 @@
+ 
+    st = st_create_context_priv(ctx, pipe, options);
+    if (!st) {
++#ifdef CYXIA_COMPUTE_OOM
++      pipe->cyxia_compute_error = NULL;
++      pipe->cyxia_compute_error_data = NULL;
++#endif
+       _mesa_free_context_data(ctx, true);
+       align_free(ctx);
+    }
+@@ -947,6 +973,11 @@
+     * These threads will be terminated by _mesa_free_context_data and
+     * st_destroy_context_priv.
+     */
++#ifdef CYXIA_COMPUTE_OOM
++   /* glthread has finished; no callback may reference freed context data. */
++   st->pipe->cyxia_compute_error = NULL;
++   st->pipe->cyxia_compute_error_data = NULL;
++#endif
+    _mesa_free_context_data(ctx, false);
+ 
+    st_context_free_zombie_objects(st);
+--- a/src/gallium/drivers/softpipe/sp_compute.c
++++ b/src/gallium/drivers/softpipe/sp_compute.c
+@@ -32,8 +32,11 @@
+ #include "sp_texture.h"
+ #include "sp_tex_sample.h"
+ #include "sp_tex_tile_cache.h"
+-
+-static void
++#ifdef CYXIA_COMPUTE_OOM
++#include <limits.h>
++#endif
++
++static enum pipe_error
+ cs_prepare(const struct sp_compute_shader *cs,
+            struct tgsi_exec_machine *machine,
+            int local_x, int local_y, int local_z,
+@@ -47,9 +50,17 @@
+    /*
+     * Bind tokens/shader to the interpreter's machine state.
+     */
++#ifdef CYXIA_COMPUTE_OOM
++   enum pipe_error error =
++      tgsi_exec_machine_bind_compute_shader_checked(machine, cs->tokens,
++                                                    sampler, image, buffer);
++   if (error != PIPE_OK)
++      return error;
++#else
+    tgsi_exec_machine_bind_shader(machine,
+                                  cs->tokens,
+                                  sampler, image, buffer);
++#endif
+ 
+    if (machine->SysSemanticToIndex[TGSI_SEMANTIC_THREAD_ID] != -1) {
+       unsigned i = machine->SysSemanticToIndex[TGSI_SEMANTIC_THREAD_ID];
+@@ -77,6 +88,7 @@
+          machine->SystemValue[i].xyzw[2].i[j] = b_d;
+       }
+    }
++   return PIPE_OK;
+ }
+ 
+ static bool
+@@ -124,6 +136,7 @@
+    } while (restart_threads);
+ }
+ 
++#ifndef CYXIA_COMPUTE_OOM
+ static void
+ cs_delete(const struct sp_compute_shader *cs,
+           struct tgsi_exec_machine *machine)
+@@ -132,19 +145,20 @@
+       tgsi_exec_machine_bind_shader(machine, NULL, NULL, NULL, NULL);
+    }
+ }
+-
+-static void
++#endif
++
++static bool
+ fill_grid_size(struct pipe_context *context,
+                const struct pipe_grid_info *info,
+                uint32_t grid_size[3])
+ {
+-   struct pipe_transfer *transfer;
++   struct pipe_transfer *transfer = NULL;
+    uint32_t *params;
+    if (!info->indirect) {
+       grid_size[0] = info->grid[0];
+       grid_size[1] = info->grid[1];
+       grid_size[2] = info->grid[2];
+-      return;
++      return true;
+    }
+    params = pipe_buffer_map_range(context, info->indirect,
+                                   info->indirect_offset,
+@@ -152,19 +166,127 @@
+                                   PIPE_MAP_READ,
+                                   &transfer);
+ 
+-   if (!transfer)
+-      return;
++   if (!transfer || !params) {
++      if (transfer)
++         pipe_buffer_unmap(context, transfer);
++      return false;
++   }
+ 
+    grid_size[0] = params[0];
+    grid_size[1] = params[1];
+    grid_size[2] = params[2];
+    pipe_buffer_unmap(context, transfer);
++   return true;
+ }
+ 
+ void
+ softpipe_launch_grid(struct pipe_context *context,
+                      const struct pipe_grid_info *info)
+ {
++#ifdef CYXIA_COMPUTE_OOM
++   struct softpipe_context *softpipe = softpipe_context(context);
++   const struct sp_compute_shader *cs = softpipe->cs;
++   struct tgsi_exec_machine **machines = NULL;
++   void *local_mem = NULL;
++   unsigned initialized = 0;
++   enum pipe_error error = PIPE_OK;
++   uint32_t grid_size[3] = {0};
++   unsigned block[3];
++   unsigned invocations = 1;
++   const struct pipe_compute_caps *caps = &context->screen->compute_caps;
++   const unsigned block_properties[3] = {
++      TGSI_PROPERTY_CS_FIXED_BLOCK_WIDTH, TGSI_PROPERTY_CS_FIXED_BLOCK_HEIGHT,
++      TGSI_PROPERTY_CS_FIXED_BLOCK_DEPTH
++   };
++
++   /* This profile requires the state tracker error sink on every context;
++    * debug flags and reset-notification modes cannot disable GL errors. */
++   assert(context->cyxia_compute_error);
++   if (!cs || !cs->tokens)
++      goto bad_input;
++   if (!fill_grid_size(context, info, grid_size))
++      goto out_of_memory;
++   if (!grid_size[0] || !grid_size[1] || !grid_size[2])
++      return;
++   for (unsigned i = 0; i < 3; i++) {
++      block[i] = cs->info.properties[block_properties[i]];
++      if (!block[i] || block[i] > caps->max_block_size[i] ||
++          grid_size[i] > caps->max_grid_size[i] ||
++          block[i] > INT_MAX || grid_size[i] > INT_MAX ||
++          invocations > caps->max_threads_per_block / block[i])
++         goto bad_input;
++      invocations *= block[i];
++   }
++   size_t count = ((size_t)block[0] + TGSI_QUAD_SIZE - 1) / TGSI_QUAD_SIZE;
++   if (count > INT_MAX / block[1])
++      goto out_of_memory;
++   count *= block[1];
++   if (count > INT_MAX / block[2])
++      goto out_of_memory;
++   count *= block[2];
++   if (count > SIZE_MAX / sizeof(*machines))
++      goto out_of_memory;
++   const uint64_t shared_size = (uint64_t)cs->shader.static_shared_mem +
++                               info->variable_shared_mem;
++   if (shared_size > caps->max_local_size || shared_size > UINT_MAX ||
++       shared_size > SIZE_MAX)
++      goto bad_input;
++   if (shared_size && !(local_mem = CALLOC(1, (size_t)shared_size)))
++      goto out_of_memory;
++   machines = CALLOC(count, sizeof(*machines));
++   if (!machines)
++      goto out_of_memory;
++
++   softpipe_update_compute_samplers(softpipe);
++   for (unsigned z = 0; z < block[2]; z++) {
++      for (unsigned y = 0; y < block[1]; y++) {
++         for (unsigned x = 0; x < block[0]; x += TGSI_QUAD_SIZE) {
++            struct tgsi_exec_machine *machine =
++               tgsi_exec_machine_create(MESA_SHADER_COMPUTE);
++            if (!machine)
++               goto out_of_memory;
++            machines[initialized++] = machine;
++            machine->LocalMem = local_mem;
++            machine->LocalMemSize = shared_size;
++            machine->NonHelperMask =
++               (1 << MIN2(TGSI_QUAD_SIZE, block[0] - x)) - 1;
++            error = cs_prepare(cs, machine, x, y, z,
++                               grid_size[0], grid_size[1], grid_size[2],
++                               block[0], block[1], block[2],
++                               (struct tgsi_sampler *)softpipe->tgsi.sampler[MESA_SHADER_COMPUTE],
++                               (struct tgsi_image *)softpipe->tgsi.image[MESA_SHADER_COMPUTE],
++                               (struct tgsi_buffer *)softpipe->tgsi.buffer[MESA_SHADER_COMPUTE]);
++            if (error != PIPE_OK)
++               goto cleanup;
++            tgsi_exec_set_constant_buffers(machine, PIPE_MAX_CONSTANT_BUFFERS,
++                                           softpipe->mapped_constants[MESA_SHADER_COMPUTE]);
++         }
++      }
++   }
++
++   /* Commit: no workgroup or image/buffer store ran during allocation. */
++   for (unsigned z = 0; z < grid_size[2]; z++)
++      for (unsigned y = 0; y < grid_size[1]; y++)
++         for (unsigned x = 0; x < grid_size[0]; x++)
++            run_workgroup(cs, x, y, z, initialized, machines);
++   if (softpipe->active_statistics_queries)
++      softpipe->pipeline_statistics.cs_invocations +=
++         (uint64_t)grid_size[0] * grid_size[1] * grid_size[2];
++   goto cleanup;
++
++out_of_memory:
++   error = PIPE_ERROR_OUT_OF_MEMORY;
++   goto cleanup;
++bad_input:
++   error = PIPE_ERROR_BAD_INPUT;
++cleanup:
++   for (unsigned i = 0; i < initialized; i++)
++      tgsi_exec_machine_destroy(machines[i]);
++   FREE(machines);
++   FREE(local_mem);
++   if (error != PIPE_OK)
++      context->cyxia_compute_error(context->cyxia_compute_error_data, error);
++#else
+    struct softpipe_context *softpipe = softpipe_context(context);
+    struct sp_compute_shader *cs = softpipe->cs;
+    int num_threads_in_group;
+@@ -238,4 +360,5 @@
+ 
+    FREE(local_mem);
+    FREE(machines);
+-}
++#endif
++}
+--- a/src/gallium/auxiliary/tgsi/tgsi_exec.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_exec.c
+@@ -63,6 +63,9 @@
+ #include "util/u_memory.h"
+ #include "util/u_math.h"
+ #include "util/rounding.h"
++#ifdef CYXIA_COMPUTE_OOM
++#include <limits.h>
++#endif
+ 
+ 
+ #define DEBUG_EXECUTION 0
+@@ -1206,6 +1209,127 @@
+    mach->NumInstructions = numInstructions;
+ }
+ 
++
++#ifdef CYXIA_COMPUTE_OOM
++enum pipe_error
++tgsi_exec_machine_bind_compute_shader_checked(
++   struct tgsi_exec_machine *mach, const struct tgsi_token *tokens,
++   struct tgsi_sampler *sampler, struct tgsi_image *image,
++   struct tgsi_buffer *buffer)
++{
++   struct tgsi_parse_context parse;
++   struct tgsi_full_declaration *declarations = NULL;
++   struct tgsi_full_instruction *instructions = NULL;
++   float4 *imms = NULL;
++   unsigned counts[3] = {0};
++   unsigned used[3] = {0};
++   unsigned semantics[TGSI_SEMANTIC_COUNT];
++   unsigned num_outputs = 0;
++   enum pipe_error error = PIPE_ERROR_OUT_OF_MEMORY;
++
++   assert(mach->ShaderType == MESA_SHADER_COMPUTE);
++   if (!tokens || tgsi_parse_init(&parse, tokens) != TGSI_PARSE_OK)
++      return PIPE_ERROR_BAD_INPUT;
++
++   /* Count first. Exact-size allocations avoid every unchecked realloc in
++    * the legacy binder and leave the machine untouched until commit. */
++   while (!tgsi_parse_end_of_tokens(&parse)) {
++      unsigned index;
++      tgsi_parse_token(&parse);
++      switch (parse.FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_DECLARATION: index = 0; break;
++      case TGSI_TOKEN_TYPE_INSTRUCTION: index = 1; break;
++      case TGSI_TOKEN_TYPE_IMMEDIATE: index = 2; break;
++      default: continue;
++      }
++      if (counts[index] == UINT_MAX)
++         goto fail_parse;
++      counts[index]++;
++   }
++   tgsi_parse_free(&parse);
++
++   if (counts[0] > SIZE_MAX / sizeof(*declarations) ||
++       counts[1] > SIZE_MAX / sizeof(*instructions) ||
++       counts[2] > SIZE_MAX / sizeof(*imms))
++      return PIPE_ERROR_OUT_OF_MEMORY;
++   if (counts[0] && !(declarations = MALLOC(counts[0] * sizeof(*declarations))))
++      goto fail;
++   if (counts[1] && !(instructions = MALLOC(counts[1] * sizeof(*instructions))))
++      goto fail;
++   if (counts[2] && !(imms = CALLOC(counts[2], sizeof(*imms))))
++      goto fail;
++   for (unsigned i = 0; i < TGSI_SEMANTIC_COUNT; i++)
++      semantics[i] = ~0u;
++   error = PIPE_ERROR_BAD_INPUT;
++   if (tgsi_parse_init(&parse, tokens) != TGSI_PARSE_OK)
++      goto fail;
++   while (!tgsi_parse_end_of_tokens(&parse)) {
++      tgsi_parse_token(&parse);
++      switch (parse.FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_DECLARATION: {
++         const struct tgsi_full_declaration *decl = &parse.FullToken.FullDeclaration;
++         if (used[0] >= counts[0])
++            goto fail_parse;
++         declarations[used[0]++] = *decl;
++         if (decl->Declaration.File == TGSI_FILE_OUTPUT)
++            num_outputs = MAX2(num_outputs, decl->Range.Last + 1);
++         if (decl->Declaration.File == TGSI_FILE_SYSTEM_VALUE) {
++            if (decl->Semantic.Name >= TGSI_SEMANTIC_COUNT ||
++                decl->Range.First >= ARRAY_SIZE(mach->SystemValue))
++               goto fail_parse;
++            semantics[decl->Semantic.Name] = decl->Range.First;
++         }
++         break;
++      }
++      case TGSI_TOKEN_TYPE_INSTRUCTION:
++         if (used[1] >= counts[1])
++            goto fail_parse;
++         instructions[used[1]++] = parse.FullToken.FullInstruction;
++         break;
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const unsigned nr_tokens = parse.FullToken.FullImmediate.Immediate.NrTokens;
++         if (nr_tokens < 1 || nr_tokens > 5 || used[2] >= counts[2])
++            goto fail_parse;
++         const unsigned size = nr_tokens - 1;
++         for (unsigned i = 0; i < size; i++)
++            imms[used[2]][i] = parse.FullToken.FullImmediate.u[i].Float;
++         used[2]++;
++         break;
++      }
++      default:
++         break; /* Compute properties are consumed by the driver scanner. */
++      }
++   }
++   tgsi_parse_free(&parse);
++   if (memcmp(used, counts, sizeof(counts)))
++      goto fail;
++
++   FREE(mach->Declarations);
++   FREE(mach->Instructions);
++   FREE(mach->Imms);
++   mach->Declarations = declarations;
++   mach->NumDeclarations = counts[0];
++   mach->Instructions = instructions;
++   mach->NumInstructions = counts[1];
++   mach->Imms = imms;
++   mach->ImmsReserved = mach->ImmLimit = counts[2];
++   mach->NumOutputs = num_outputs;
++   memcpy(mach->SysSemanticToIndex, semantics, sizeof(semantics));
++   mach->Tokens = tokens;
++   mach->Sampler = sampler;
++   mach->Image = image;
++   mach->Buffer = buffer;
++   return PIPE_OK;
++
++fail_parse:
++   tgsi_parse_free(&parse);
++fail:
++   FREE(declarations);
++   FREE(instructions);
++   FREE(imms);
++   return error;
++}
++#endif
+ 
+ struct tgsi_exec_machine *
+ tgsi_exec_machine_create(mesa_shader_stage shader_type)
+--- a/src/gallium/auxiliary/tgsi/tgsi_exec.h
++++ b/src/gallium/auxiliary/tgsi/tgsi_exec.h
+@@ -422,6 +422,18 @@
+    struct tgsi_image *image,
+    struct tgsi_buffer *buffer);
+ 
++#ifdef CYXIA_COMPUTE_OOM
++/* Compute-only checked variant. A failure leaves machine state unchanged.
++ * Existing graphics callers retain their original binding implementation. */
++enum pipe_error
++tgsi_exec_machine_bind_compute_shader_checked(
++   struct tgsi_exec_machine *mach,
++   const struct tgsi_token *tokens,
++   struct tgsi_sampler *sampler,
++   struct tgsi_image *image,
++   struct tgsi_buffer *buffer);
++#endif
++
+ uint
+ tgsi_exec_machine_run(
+    struct tgsi_exec_machine *mach, int start_pc );

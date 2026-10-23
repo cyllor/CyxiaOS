@@ -44,9 +44,13 @@ _start:
  ldr x1, ={uart_base}
  orr x1, x1, x2
  str x1, [x0, #576]
+ // virt board VirtIO MMIO window; only DTB-discovered resources are accessed.
+ ldr x1, =0x0a000000
+ orr x1, x1, x2
+ str x1, [x0, #640]
  ldr x0, =ram_l2
  ldr x1, =ram_l3
- mov x2, #128
+ mov x2, #{ram_table_count}
 5: orr x3, x1, #3
  str x3, [x0], #8
  add x1, x1, #4096
@@ -54,7 +58,7 @@ _start:
  b.ne 5b
  ldr x0, =ram_l3
  ldr x1, ={ram_base}
- ldr x2, =0x50000000
+ ldr x2, ={ram_end}
  ldr x3, =__text_phys_start
  ldr x4, =__text_phys_end
  ldr x5, =__ro_phys_start
@@ -120,7 +124,7 @@ low_l1: .skip 4096
 high_l1: .skip 4096
 dev_l2: .skip 4096
 ram_l2: .skip 4096
-ram_l3: .skip 524288
+ram_l3: .skip {ram_tables_bytes}
 .section .text.highentry,"ax"
 high_entry:
  ldr x0, =exception_vectors

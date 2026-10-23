@@ -1,0 +1,239 @@
+--- a/meson.options
++++ b/meson.options
+@@ -1,3 +1,6 @@
++option('cyxia_spawn', type: 'boolean', value: false,
++       description: 'Use explicit CyxiaOS catalog spawn and wait ABI')
++
+ option('runtime_libdir',
+        type : 'string',
+        value : '',
+--- a/meson.build
++++ b/meson.build
+@@ -275,6 +275,12 @@
+ # Configuration begins #
+ ########################
+ glib_conf = configuration_data()
++if get_option('cyxia_spawn')
++  if host_machine.cpu_family() != 'aarch64'
++    error('CyxiaOS spawn ABI currently requires AArch64')
++  endif
++  glib_conf.set('CYXIA_SPAWN', 1)
++endif
+ glibconfig_conf = configuration_data()
+ 
+ # accumulated list of defines as we check for them, so we can easily
+--- a/glib/gmain.c
++++ b/glib/gmain.c
+@@ -5909,12 +5909,12 @@
+       struct sigaction action;
+       action.sa_handler = g_unix_signal_handler;
+       sigemptyset (&action.sa_mask);
+-#ifdef SA_RESTART
++#if defined(SA_RESTART) && !defined(CYXIA_SPAWN)
+       action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+ #else
+       action.sa_flags = SA_NOCLDSTOP;
+ #endif
+-#ifdef SA_ONSTACK
++#if defined(SA_ONSTACK) && !defined(CYXIA_SPAWN)
+       action.sa_flags |= SA_ONSTACK;
+ #endif
+       sigaction (signum, &action, NULL);
+--- a/glib/gspawn-posix.c
++++ b/glib/gspawn-posix.c
+@@ -1245,6 +1245,8 @@
+           _g_spawn_invalid_source_fd (pipefd->fds[G_UNIX_PIPE_END_WRITE], source_fds, n_fds, error));
+ }
+ 
++#include "gspawn-cyxia.inc"
++
+ static gboolean
+ fork_exec (gboolean              intermediate_child,
+            const gchar          *working_directory,
+@@ -1328,6 +1330,20 @@
+     }
+ 
+   child_close_fds[n_child_close_fds++] = -1;
++
++#ifdef CYXIA_SPAWN
++  status = do_cyxia_spawn (intermediate_child, working_directory, argv, envp,
++                           close_descriptors, search_path, search_path_from_envp,
++                           stdout_to_null, stderr_to_null, child_inherits_stdin,
++                           file_and_argv_zero, child_setup, child_pid,
++                           child_close_fds, stdin_fd, stdout_fd, stderr_fd,
++                           source_fds, target_fds, n_fds);
++  if (status == 0)
++    goto success;
++  g_set_error (error, G_SPAWN_ERROR, _g_spawn_exec_err_to_g_error (status),
++               _("Failed to spawn child process “%s” (%s)"), argv[0], g_strerror (status));
++  goto cleanup_and_fail;
++#endif
+ 
+ #ifdef POSIX_SPAWN_AVAILABLE
+   if (!intermediate_child && working_directory == NULL && !close_descriptors &&
+--- a/glib/gspawn-cyxia.inc
++++ b/glib/gspawn-cyxia.inc
+@@ -0,0 +1,129 @@
++/* Explicit CyxiaOS catalog-process backend. SPDX-License-Identifier: LGPL-2.1-or-later
++ * This ABI creates a real isolated process; it does not emulate fork callbacks.
++ * Keep the request layout synchronized with kernel/src/user/spawn.rs.
++ */
++#ifdef CYXIA_SPAWN
++#define CYXIA_SPAWN_SYSCALL 0x43595810UL
++#define CYXIA_OPEN_MAX 16
++
++typedef struct { gint32 source; gint32 target; } CyxiaFdMap;
++typedef struct {
++  guint32 size, flags;
++  guint64 path, argv, envp, cwd, mappings;
++  guint32 mapping_count, reserved;
++  guint64 reserved2;
++} CyxiaSpawn;
++G_STATIC_ASSERT (sizeof (CyxiaSpawn) == 64);
++G_STATIC_ASSERT (sizeof (CyxiaFdMap) == 8);
++
++static gint
++cyxia_inherited_fd (gint fd)
++{
++  gint flags = fcntl (fd, F_GETFD);
++  return flags < 0 || (flags & FD_CLOEXEC) ? -1 : fd;
++}
++
++static gint
++do_cyxia_spawn (gboolean intermediate_child,
++                const gchar *working_directory,
++                const gchar * const *argv,
++                const gchar * const *envp,
++                gboolean close_descriptors,
++                gboolean search_path,
++                gboolean search_path_from_envp,
++                gboolean stdout_to_null,
++                gboolean stderr_to_null,
++                gboolean child_inherits_stdin,
++                gboolean file_and_argv_zero,
++                GSpawnChildSetupFunc child_setup,
++                GPid *child_pid,
++                const gint *child_close_fds,
++                gint stdin_fd, gint stdout_fd, gint stderr_fd,
++                const gint *source_fds, const gint *target_fds, gsize n_fds)
++{
++  gint sources[CYXIA_OPEN_MAX];
++  gboolean specified[CYXIA_OPEN_MAX] = { FALSE };
++  CyxiaFdMap mappings[CYXIA_OPEN_MAX];
++  CyxiaSpawn request = { 0 };
++  const gchar *chosen_path = NULL;
++  const gchar * const *argv_pass = file_and_argv_zero ? argv + 1 : argv;
++  gsize n_maps = 0;
++  gint status = ENOENT;
++  long pid = -1;
++
++  if (child_setup != NULL)
++    return ENOTSUP;
++  if (n_fds > CYXIA_OPEN_MAX || argv_pass[0] == NULL)
++    return EINVAL;
++  for (gint fd = 0; fd < CYXIA_OPEN_MAX; ++fd)
++    sources[fd] = close_descriptors ? -1 : cyxia_inherited_fd (fd);
++  /* The parent-only ends of newly created pipes must never be inherited. */
++  for (gsize i = 0; child_close_fds[i] >= 0; ++i)
++    if (child_close_fds[i] < CYXIA_OPEN_MAX)
++      sources[child_close_fds[i]] = -1;
++  /* dup2() redirects these and upstream marks their originals close-on-exec. */
++  const gint std_fds[] = { stdin_fd, stdout_fd, stderr_fd };
++  for (gsize i = 0; i < G_N_ELEMENTS (std_fds); ++i)
++    if (std_fds[i] >= 3 && std_fds[i] < CYXIA_OPEN_MAX)
++      sources[std_fds[i]] = -1;
++  sources[0] = stdin_fd >= 0 ? stdin_fd : (child_inherits_stdin ? cyxia_inherited_fd (0) : -2);
++  sources[1] = stdout_fd >= 0 ? stdout_fd : (stdout_to_null ? -2 : cyxia_inherited_fd (1));
++  sources[2] = stderr_fd >= 0 ? stderr_fd : (stderr_to_null ? -2 : cyxia_inherited_fd (2));
++  for (gsize i = 0; i < n_fds; ++i)
++    {
++      if (source_fds[i] < 0 || source_fds[i] >= CYXIA_OPEN_MAX)
++        return EBADF;
++      if (target_fds[i] < 0 || target_fds[i] >= CYXIA_OPEN_MAX || specified[target_fds[i]])
++        return EINVAL;
++      specified[target_fds[i]] = TRUE;
++      sources[target_fds[i]] = source_fds[i];
++    }
++  for (gint fd = 0; fd < CYXIA_OPEN_MAX; ++fd)
++    if (sources[fd] != -1)
++      mappings[n_maps++] = (CyxiaFdMap) { sources[fd], fd };
++
++  request.size = sizeof (request);
++  request.flags = intermediate_child ? 1 : 0;
++  request.argv = (guint64) (guintptr) argv_pass;
++  request.envp = (guint64) (guintptr) (envp != NULL ? envp : (const gchar * const *) environ);
++  request.cwd = (guint64) (guintptr) working_directory;
++  request.mappings = (guint64) (guintptr) mappings;
++  request.mapping_count = n_maps;
++  if (search_path_from_envp)
++    chosen_path = g_environ_getenv ((gchar **) envp, "PATH");
++  if (search_path && chosen_path == NULL)
++    chosen_path = g_getenv ("PATH");
++  if ((search_path || search_path_from_envp) && chosen_path == NULL)
++    chosen_path = "/bin:/usr/bin:.";
++
++  if (strchr (argv[0], '/') != NULL || chosen_path == NULL || chosen_path[0] == '\0')
++    {
++      request.path = (guint64) (guintptr) argv[0];
++      pid = syscall (CYXIA_SPAWN_SYSCALL, &request);
++      status = pid < 0 ? errno : 0;
++    }
++  else
++    {
++      gchar **paths = g_strsplit (chosen_path, ":", -1);
++      gboolean denied = FALSE;
++      for (gsize i = 0; paths[i] != NULL; ++i)
++        {
++          gchar *path = paths[i][0] != '\0' ? g_build_filename (paths[i], argv[0], NULL) : g_strdup (argv[0]);
++          request.path = (guint64) (guintptr) path;
++          pid = syscall (CYXIA_SPAWN_SYSCALL, &request);
++          status = pid < 0 ? errno : 0;
++          g_free (path);
++          if (status == EACCES)
++            denied = TRUE;
++          else if (status != ENOENT && status != ENOTDIR)
++            break;
++        }
++      g_strfreev (paths);
++      if ((status == ENOENT || status == ENOTDIR) && denied)
++        status = EACCES;
++    }
++  if (status == 0 && child_pid != NULL)
++    *child_pid = (GPid) pid;
++  return status;
++}
++#endif /* CYXIA_SPAWN */
+--- a/gio/gdesktopappinfo.c
++++ b/gio/gdesktopappinfo.c
+@@ -159,7 +159,9 @@
+ static DesktopFileDir *desktop_file_dir_user_config = NULL;  /* (owned) */
+ static DesktopFileDir *desktop_file_dir_user_data = NULL;  /* (owned) */
+ static GMutex          desktop_file_dir_lock;
++#ifndef CYXIA_SPAWN
+ static const gchar    *gio_launch_desktop_path = NULL;
++#endif
+ 
+ /* Monitor 'changed' signal handler {{{2 */
+ static void desktop_file_dir_reset (DesktopFileDir *dir);
+@@ -3031,6 +3033,12 @@
+           g_free (program);
+         }
+ 
++#ifdef CYXIA_SPAWN
++      /* CyxiaOS creates the final catalog process directly. The Unix helper
++       * requires execve(), which is outside this explicit platform profile. */
++      wrapped_argv = argv;
++      argv = NULL;
++#else
+       if (g_once_init_enter_pointer (&gio_launch_desktop_path))
+         {
+           const gchar *tmp = NULL;
+@@ -3059,6 +3067,8 @@
+       wrapped_argv[i + 1] = NULL;
+       g_free (argv);
+       argv = NULL;
++
++#endif
+ 
+       if (!g_spawn_async_with_fds (info->path,
+                                    wrapped_argv,

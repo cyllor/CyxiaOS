@@ -100,6 +100,9 @@ pub fn start(info: &BootInfo) -> ! {
         log(b"IRQ_SELFTEST_OK WFI REGISTERS UNKNOWN_MASKED\n");
         TEST_PROGRESS.ready.store(1, Ordering::Relaxed);
     }
+    #[cfg(not(feature = "selftest"))]
+    super::shell::run(info);
+    #[cfg(feature = "selftest")]
     loop {
         TEST_PROGRESS.foreground.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "selftest")]

@@ -1,0 +1,13 @@
+{
+  "name": "wayland",
+  "version": "1.24.0",
+  "source_url": "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz",
+  "expected_sha256": "82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536",
+  "source_commit": null,
+  "archive_root": "wayland-1.24.0",
+  "license": "MIT",
+  "license_file": "COPYING",
+  "hash_source": "https://lore.freedesktop.org/wayland-devel/plU5smxin5VXbiedTGtL7CNHe0t2mHtgQlQ3-xwREmSSNYaClAcZpEBV8L7JvMT8JHwdD_a_uSFkDUaP45CAWyL545iZh5gInAdToX6hgt4=@emersion.fr/T/",
+  "depends_on": ["libffi"],
+  "scope": "Static target client/server libraries and native host scanner; no compositor, shared-memory buffer transport, EGL or COSMIC session claim."
+}

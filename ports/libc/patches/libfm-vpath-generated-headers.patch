@@ -1,0 +1,34 @@
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -17,6 +17,8 @@
+ endif
+ 
+ AM_CPPFLAGS = \
++	-I$(builddir)/base \
++	-I$(builddir)/gtk \
+ 	-I$(srcdir)/base \
+ 	-I$(srcdir)/job \
+ 	-DPACKAGE_LOCALE_DIR=\""$(prefix)/$(DATADIRNAME)/locale"\" \
+--- a/src/tests/Makefile.am
++++ b/src/tests/Makefile.am
+@@ -3,6 +3,8 @@
+ NULL=
+ 
+ AM_CPPFLAGS = \
++	-I$(top_builddir)/src \
++	-I$(top_builddir)/src/base \
+ 	-I$(top_srcdir)/src \
+ 	-I$(top_srcdir)/src/base \
+ 	-I$(top_srcdir)/src/extra \
+--- a/src/modules/Makefile.am
++++ b/src/modules/Makefile.am
+@@ -3,6 +3,9 @@
+ NULL =
+ # we use glib/gio/libfm only by default
+ AM_CPPFLAGS = \
++	-I$(top_builddir)/src \
++	-I$(top_builddir)/src/base \
++	-I$(top_builddir)/src/gtk \
+ 	-I$(top_srcdir)/src \
+ 	-I$(top_srcdir)/src/base -I$(top_srcdir)/src/job \
+ 	-Werror-implicit-function-declaration \

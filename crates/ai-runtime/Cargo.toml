@@ -1,0 +1,8 @@
+[package]
+name = "cyxia-ai-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cyxia-contracts = { path = "../contracts" }
+cyxia-kernel-core = { path = "../kernel-core" }

@@ -1,0 +1,12 @@
+--- a/modules/printbackends/meson.build
++++ b/modules/printbackends/meson.build
+@@ -35,7 +35,8 @@
+ print_backends = []
+ 
+ if not enabled_print_backends.contains('file')
+-  if os_unix
++  # An explicit empty backend list supports static deployments without printing.
++  if os_unix and get_option('print_backends') != ''
+     error('\'file\' print backed needs to be enabled')
+   endif
+ else

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "scope": "Real LXPanel static menu, taskbar, workspace pager, show-desktop and PL031-backed UTC clock resources. Guest launch/control acceptance is a separate gate.",
+  "file_count": 8,
+  "total_bytes": 129512,
+  "directories": [
+    "/etc",
+    "/etc/xdg",
+    "/etc/xdg/lxpanel",
+    "/etc/xdg/lxpanel/default",
+    "/etc/xdg/lxpanel/default/panels",
+    "/usr",
+    "/usr/share",
+    "/usr/share/lxpanel",
+    "/usr/share/lxpanel/images",
+    "/usr/share/lxpanel/ui"
+  ],
+  "command": [
+    "lxpanel"
+  ],
+  "environment": {
+    "DISPLAY": ":0",
+    "GIO_USE_VFS": "local",
+    "GSETTINGS_BACKEND": "memory",
+    "GTK_USE_PORTAL": "0",
+    "GTK_IM_MODULE": "simple",
+    "TZ": "UTC"
+  },
+  "omitted": [
+    "Dynamic plugins and system application menu",
+    "Unavailable volume/network/CPU device plugins"
+  ],
+  "runtime_requirements": [
+    "Real pthread/GThreadPool/GTask support from libfm",
+    "Openbox or another EWMH window manager",
+    "Explicit CyxiaOS GLib/libfm spawn profile and real catalog-process spawn/wait ABI for static menu actions",
+    "Real PL031-backed CLOCK_REALTIME/gettimeofday and TZ=UTC for clock display"
+  ],
+  "files": [
+    {
+      "target": "/usr/share/lxpanel/ui/panel-pref.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/ui/panel-pref.ui",
+      "bytes": 91272,
+      "sha256": "4b94234f9aaae5ecac7bc1bec08356d433b3484c9fee5ec735fda01a8ecd4e1a"
+    },
+    {
+      "target": "/usr/share/lxpanel/ui/launchtaskbar.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/ui/launchtaskbar.ui",
+      "bytes": 28886,
+      "sha256": "0833eb6885b4658f671088f46af51597f4e89a1ce4304a293857ad440beb3f2f"
+    },
+    {
+      "target": "/usr/share/lxpanel/images/gnome-fs-desktop.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/images/gnome-fs-desktop.png",
+      "bytes": 2329,
+      "sha256": "4c0ee3a1544bd86244f71995017eaef3e197939ce921d38aee8e576755bedb9d"
+    },
+    {
+      "target": "/usr/share/lxpanel/images/file-manager.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/images/file-manager.png",
+      "bytes": 2561,
+      "sha256": "2e1e37ad4fd8c0fb0cba2da5c26622e417522d735de4d4ac10a7e225f098b1bc"
+    },
+    {
+      "target": "/usr/share/lxpanel/images/clock.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/images/clock.png",
+      "bytes": 1129,
+      "sha256": "545734b0200d853f76869b48afc2eb6ae50cee84df93d09c95b59938301136eb"
+    },
+    {
+      "target": "/etc/xdg/lxpanel/default/panels/panel",
+      "source": "ports/desktop/lxpanel-rootfs/panel",
+      "bytes": 1394,
+      "sha256": "4734d1efeec75f58b36988978d89198eff051110463a6fdb227be0827fd946e0"
+    },
+    {
+      "target": "/etc/xdg/lxpanel/default/config",
+      "source": "ports/desktop/lxpanel-rootfs/config",
+      "bytes": 30,
+      "sha256": "b13ae39bbd945e71578c4b0c25938c51670f9852c7326a8ca0da081049c98ae4"
+    },
+    {
+      "target": "/usr/share/lxpanel/images/my-computer.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/lxpanel/images/my-computer.png",
+      "bytes": 1911,
+      "sha256": "1dfb5b023492aa7f3d83bc5290672eac0c57794abbac03e3e1b7867af574eb91"
+    }
+  ]
+}

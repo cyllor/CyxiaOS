@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-linux-musl",
+  "packages": [
+    {
+      "name": "musl",
+      "version": "1.2.6",
+      "source_url": "https://musl.libc.org/releases/musl-1.2.6.tar.gz",
+      "expected_sha256": "d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "musl-1.2.6",
+      "license_file": "COPYRIGHT",
+      "license_sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
+      "hash_source": "https://gitlab.com/buildroot.org/buildroot/-/raw/6f8f031cef37ac39a39241bd7871caf542f549be/package/musl/musl.hash",
+      "hash_provenance": "Buildroot maintainer published hash after checking upstream signature; this project checks SHA256, not PGP",
+      "upstream_signature": "https://musl.libc.org/releases/musl-1.2.6.tar.gz.asc",
+      "known_limitations": [
+        "CVE-2026-6042 iconv denial of service is not patched in this baseline; do not treat this as production-ready libc",
+        "CVE-2026-40200 qsort affects 32-bit targets; current build is AArch64"
+      ]
+    },
+    {
+      "name": "compiler-rt",
+      "version": "20.1.8",
+      "source_url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/compiler-rt-20.1.8.src.tar.xz",
+      "expected_sha256": "15277402f6fd63397c0917a5c7171cda82d16d226094b828c1ed0f58f73b9c69",
+      "source_commit": null,
+      "depends_on": [],
+      "archive_root": "compiler-rt-20.1.8.src",
+      "license_file": "LICENSE.TXT",
+      "hash_source": "https://api.github.com/repos/llvm/llvm-project/releases/tags/llvmorg-20.1.8",
+      "hash_provenance": "SHA256 digest on the upstream GitHub release asset",
+      "scope": "GENERIC_SOURCES + GENERIC_TF_SOURCES; AArch64 fp_mode replaces generic fp_mode; no outline atomics, CPU dispatch, SME, sanitizers or emulated TLS"
+    }
+  ]
+}

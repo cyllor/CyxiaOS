@@ -1,0 +1,59 @@
+--- a/pango/pangofc-fontmap.c
++++ b/pango/pangofc-fontmap.c
+@@ -1047,7 +1047,13 @@
+   g_mutex_init (&pats->mutex);
+   g_cond_init (&pats->cond);
+ 
++#ifdef __CYXIA_SINGLE_THREAD_FONTCONFIG__
++  /* CyxiaOS port: perform the real match synchronously on the AI-scheduled
++   * caller until the target provides pthread/clone. No fake thread handle. */
++  match_in_thread (thread_data_new (FC_MATCH, pats));
++#else
+   g_async_queue_push (fontmap->priv->queue, thread_data_new (FC_MATCH, pats));
++#endif
+ 
+   g_hash_table_insert (fontmap->priv->patterns_hash, pats->pattern, pats);
+ 
+@@ -1223,7 +1229,11 @@
+       before = PANGO_TRACE_CURRENT_TIME;
+ 
+       if (!pats->fontset)
++#ifdef __CYXIA_SINGLE_THREAD_FONTCONFIG__
++        sort_in_thread (thread_data_new (FC_SORT, pats));
++#else
+         g_async_queue_push (pats->fontmap->priv->queue, thread_data_new (FC_SORT, pats));
++#endif
+ 
+       g_mutex_lock (&pats->mutex);
+ 
+@@ -1524,6 +1534,12 @@
+ static void
+ start_fontconfig_thread (PangoFcFontMap *fcfontmap)
+ {
++#ifdef __CYXIA_SINGLE_THREAD_FONTCONFIG__
++  (void) fcfontmap;
++  /* Single target thread; init_in_thread acquires its own state mutex. */
++  if (fc_initialized == DEFAULT_CONFIG_NOT_INITIALIZED)
++    init_in_thread (thread_data_new (FC_INIT, NULL));
++#else
+   GThread *thread;
+ 
+   g_mutex_lock (&fc_init_mutex);
+@@ -1539,6 +1555,7 @@
+     }
+ 
+   g_mutex_unlock (&fc_init_mutex);
++#endif
+ }
+ 
+ static void
+@@ -1629,7 +1646,9 @@
+   priv->n_families = -1;
+   priv->families = NULL;
+ 
++#ifndef __CYXIA_SINGLE_THREAD_FONTCONFIG__
+   g_async_queue_push (fcfontmap->priv->queue, thread_data_new (FC_END, NULL));
++#endif
+ 
+   g_async_queue_unref (priv->queue);
+   priv->queue = NULL;

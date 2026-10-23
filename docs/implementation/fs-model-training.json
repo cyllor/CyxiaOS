@@ -1,0 +1,32 @@
+{
+  "seed": 4413784,
+  "epochs": 8,
+  "admission_samples": 1105,
+  "admission_domain": {
+    "free": [
+      0,
+      64
+    ],
+    "growth_256byte_units": [
+      0,
+      16
+    ]
+  },
+  "admission_epochs": 32,
+  "reuse_samples": 1500,
+  "heldout_samples": 7184,
+  "admission_weights": [
+    1,
+    93,
+    -23,
+    0
+  ],
+  "reuse_weights": [
+    38,
+    10,
+    -15,
+    -21
+  ],
+  "heldout_correct": 5660,
+  "limitation": "Synthetic workload only; no production performance claim."
+}

@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-unknown-linux-musl",
+  "epoch_commit": "364341d52454bf3a016d03185c6aff887247aab7",
+  "status": "bootstrap bounds and explicit experiment criteria; COSMIC capacity is not validated",
+  "current_guest": {
+    "architecture": "AArch64",
+    "cores": 1,
+    "ram_bytes": 536870912,
+    "process_slots": 8,
+    "process_admitted_max": 7,
+    "threads_per_process": 8,
+    "fds_per_process": 16,
+    "epoll_instances": 2,
+    "epoll_watches_each": 16,
+    "private_heap_bytes": 16777216,
+    "max_single_heap_request_pages": 2048,
+    "image_pool_bytes": 16777216,
+    "initial_stack_charged_bytes": 262144,
+    "ramfs_nodes": 64,
+    "ramfs_file_bytes": 4096,
+    "ramfs_path_bytes_excluding_nul": 95,
+    "boot_catalog_bytes": 54525952,
+    "boot_entries_max": 128
+  },
+  "constraint_sources": [
+    "crates/posix/src/usermem.rs",
+    "kernel/src/user/threads.rs",
+    "crates/posix/src/lib.rs",
+    "crates/posix/src/epoll.rs",
+    "crates/posix/src/vm.rs",
+    "crates/posix/src/executable.rs",
+    "crates/ai-fs/src/lib.rs",
+    "kernel/build.rs"
+  ],
+  "model_domains": {
+    "8193": {
+      "free_max": 64,
+      "request_max": 8
+    },
+    "8194": {
+      "free_max": 4096,
+      "request_max": 2048
+    },
+    "8195": {
+      "free_max": 4096,
+      "request_max": 4096
+    },
+    "cpu_candidates_max": 8,
+    "note": "New capacity requires matching model/schema/training/accounting changes; do not clamp or silently bypass."
+  },
+  "source_measurements": {
+    "component_count": 30,
+    "root_cargo_locks": 27,
+    "cargo_manifests": 94,
+    "verified_selected_text_bytes": 6531041,
+    "git_tree_blob_bytes": 53284860,
+    "note": "Git blob sizes are not installed size or resident memory. LFS, generated and dependency payloads are not included."
+  },
+  "existing_artifact_measurements": [
+    {
+      "path": "artifacts/cosmic-bootstrap-r3/cyxia-kernel.elf",
+      "bytes": 59761080,
+      "sha256": "0d31c3fcb2668b67b31a9e1388c62579f32025aefc47babbb121560c595e2b5d",
+      "scope": "existing foundation, not a COSMIC executable"
+    },
+    {
+      "path": "artifacts/sysroot/aarch64-musl/rust-std-probe.elf",
+      "bytes": 483968,
+      "sha256": "7aa8359308a7255e50ce152ad233828a5c79ada022006d2c4103748e3b9d8176",
+      "scope": "existing foundation, not a COSMIC executable"
+    },
+    {
+      "path": "artifacts/sysroot/aarch64-musl/wayland-probe.elf",
+      "bytes": 141696,
+      "sha256": "5fb2335f663ebd5ec207af1a54be0d0d504590d110e15c874aada828be2ad5b9",
+      "scope": "existing foundation, not a COSMIC executable"
+    },
+    {
+      "path": "artifacts/sysroot/aarch64-musl/xkbcommon-probe.elf",
+      "bytes": 333304,
+      "sha256": "a708f5a154423a4014c15e0e3706fe67ff6824caf3511f4e31911e7197c8184d",
+      "scope": "existing foundation, not a COSMIC executable"
+    }
+  ],
+  "session_startup_lower_bound": {
+    "process_intents_including_session": 14,
+    "additional_required": [
+      "D-Bus service",
+      "enabled panel applets",
+      "pop-launcher and plugins",
+      "user applications",
+      "recovery capacity"
+    ],
+    "kind": "source launch intents, not measured simultaneous process peak",
+    "source": "https://github.com/pop-os/cosmic-session/blob/8093b59bb1262b0612d814e6540ba936303f735a/src/main.rs"
+  },
+  "unknown": {
+    "cosmic_elf_bytes": null,
+    "cosmic_bss_bytes": null,
+    "session_resident_peak_bytes": null,
+    "shared_buffer_peak_bytes": null,
+    "heap_peak_bytes": null,
+    "session_process_peak": null,
+    "session_thread_peak": null,
+    "session_fd_peak": null,
+    "installed_asset_bytes": null,
+    "build_peak_bytes": null,
+    "software_render_frame_latency_ms": null,
+    "inference_overhead_percent": null
+  },
+  "build_profiles": {
+    "static-bootstrap": {
+      "target_runtime_validated": false,
+      "purpose": "One static ET_EXEC compile/link experiment using existing loader bounds. No compositor recipe is approved yet.",
+      "jobs_max": 1,
+      "min_free_bytes": 2147483648,
+      "max_build_bytes": 2147483648,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 16777216,
+      "image_bytes": 16777216,
+      "stack_bytes": 262144
+    }
+  },
+  "host_resource_observation": {
+    "free_bytes": 11040120832,
+    "when": "2026-10-18; rebuild rechecks actual free space",
+    "reservation_policy": "Require reserve plus build budget before launch; poll actual reserve/output size during execution; this is not a filesystem quota or OS sandbox."
+  },
+  "experiment_criteria": {
+    "status": "fixed initial experiment thresholds, not achieved performance claims",
+    "resolution": {
+      "width": 1024,
+      "height": 768,
+      "bytes_per_pixel": 4,
+      "one_frame_bytes": 3145728
+    },
+    "correctness": {
+      "reference_pixel_mismatches": 0,
+      "leaked_object_references": 0,
+      "resource_ledger_mismatch": 0,
+      "input_or_protocol_loss": 0
+    },
+    "interaction": {
+      "minimum_measured_samples": 100,
+      "input_to_present_p95_max_ms": 250,
+      "startup_ready_deadline_seconds": 60,
+      "steady_state_measurement_seconds": 60
+    },
+    "failure_policy": "A failed criterion remains failed. Change workload/profile/threshold only in a new reviewed version before rerun; keep original evidence."
+  },
+  "future_profiles": {
+    "ram_mib_candidates": [
+      1024,
+      2048
+    ],
+    "validated": false,
+    "condition": "P2 physical memory, VA/page tables, capacities, AI domains and recovery reserve must be updated before running larger guests."
+  },
+  "baseline_kernel_sha256": "0d31c3fcb2668b67b31a9e1388c62579f32025aefc47babbb121560c595e2b5d",
+  "current_guest_scope": "Frozen cosmic-bootstrap-r3 baseline; later P2 changes need a new measured profile"
+}

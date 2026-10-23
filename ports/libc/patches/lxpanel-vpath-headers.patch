@@ -1,0 +1,20 @@
+--- a/plugins/Makefile.am
++++ b/plugins/Makefile.am
+@@ -4,6 +4,7 @@
+ AM_CPPFLAGS = \
+ 	-I$(top_srcdir) \
+ 	-I$(top_srcdir)/src \
++	-I$(top_builddir)/src \
+ 	$(GTK_CFLAGS) \
+ 	$(PACKAGE_CFLAGS) \
+ 	$(G_CAST_CHECKS)
+--- a/data/Makefile.am
++++ b/data/Makefile.am
+@@ -25,6 +25,7 @@
+ 
+ # Purge GtkBuilder UI files
+ .glade.ui:
++	$(MKDIR_P) $(dir $@)
+ 	sed 's/<!--.*-->//' < $< | sed ':a;N;$$!ba;s/ *\n *</</g' > $@
+ 
+ CLEANFILES = \

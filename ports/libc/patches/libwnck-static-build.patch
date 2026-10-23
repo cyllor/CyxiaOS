@@ -1,0 +1,42 @@
+--- a/libwnck/meson.build
++++ b/libwnck/meson.build
+@@ -123,7 +123,7 @@
+   sources: headers + [enum_types[1]],
+ )
+ 
+-libwnck_lib = shared_library(LIBNAME,
++libwnck_lib = library(LIBNAME,
+   dependencies: libwnck_dep,
+   sources: sources + a11y_sources + enum_types + resources,
+   version: '@0@.@1@.@2@'.format(LIBWNCK_SOVERSION, LIBWNCK_CURRENT, LIBWNCK_REVISION),
+--- a/libwnck-3.0.pc.in
++++ b/libwnck-3.0.pc.in
+@@ -7,7 +7,7 @@
+ Description: Window Navigator Construction Kit library
+ Version: @VERSION@
+ Requires: glib-2.0 gobject-2.0 gtk+-3.0
+-Requires.private: @X11_PACKAGE@ pango cairo @STARTUP_NOTIFICATION_PACKAGE@ @XRES_PACKAGE@
++Requires.private: @X11_PACKAGE@ xi pango cairo @STARTUP_NOTIFICATION_PACKAGE@ @XRES_PACKAGE@
+ Libs: -L${libdir} -lwnck-3
+ Cflags: -I${includedir}/libwnck-3.0
+ 
+--- a/libwnck/xutils.c
++++ b/libwnck/xutils.c
+@@ -35,6 +35,7 @@
+ #include "window.h"
+ #include "private.h"
+ #include "wnck-handle-private.h"
++#include "libwnck-resources.h"
+ 
+ gboolean
+ _wnck_get_cardinal (Screen *screen,
+@@ -1505,6 +1506,9 @@
+ {
+   GdkPixbuf *base;
+ 
++  /* Retain the generated resource object and its constructor in static links. */
++  (void) libwnck_get_resource ();
++
+   base = gdk_pixbuf_new_from_resource ("/org/gnome/libwnck/default_icon.png", NULL);
+ 
+   g_assert (base);

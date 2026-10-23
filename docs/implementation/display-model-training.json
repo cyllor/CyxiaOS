@@ -1,0 +1,19 @@
+{
+  "model": 24577,
+  "version": 1,
+  "seed": 1129928772,
+  "epochs": 256,
+  "weights": [
+    -323,
+    3,
+    39,
+    0
+  ],
+  "exhaustive_feature_training_samples": 153,
+  "training_correct": 153,
+  "validation_raw_observations": 4096,
+  "validation_correct": 4096,
+  "max_delay_ms": 1,
+  "min_completed_between_waits": 8,
+  "limitation": "Synthetic teacher conformance. Validation uses unseen raw observations mapped to trained bounded features; not held-out workload performance or online learning. Actual foreground scheduling can add queue latency."
+}

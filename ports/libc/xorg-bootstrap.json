@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "scope": "First X.Org target header and authentication-library closure, not the full desktop",
+  "packages": [
+    {
+      "name": "xorgproto", "version": "2024.1",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/proto/xorgproto-2024.1.tar.xz",
+      "expected_sha256": "372225fd40815b8423547f5d890c5debc72e88b91088fbfb13158c20495ccb59",
+      "source_commit": null, "depends_on": [],
+      "archive_root": "xorgproto-2024.1", "license_file": "COPYING-x11proto",
+      "hash_source": "https://lists.x.org/archives/xorg-announce/2024-March/003495.html"
+    },
+    {
+      "name": "xtrans", "version": "1.6.0",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/xtrans-1.6.0.tar.xz",
+      "expected_sha256": "faafea166bf2451a173d9d593352940ec6404145c5d1da5c213423ce4d359e92",
+      "source_commit": null, "depends_on": [],
+      "archive_root": "xtrans-1.6.0", "license_file": "COPYING",
+      "hash_source": "https://www.mail-archive.com/xorg-announce@lists.x.org/msg01797.html"
+    },
+    {
+      "name": "libXau", "version": "1.0.12",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libXau-1.0.12.tar.xz",
+      "expected_sha256": "74d0e4dfa3d39ad8939e99bda37f5967aba528211076828464d2777d477fc0fb",
+      "source_commit": null, "depends_on": ["xorgproto"],
+      "archive_root": "libXau-1.0.12", "license_file": "COPYING",
+      "hash_source": "https://lists.x.org/archives/xorg-announce/2024-December/003570.html"
+    },
+    {
+      "name": "xcb-proto", "version": "1.17.0",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/proto/xcb-proto-1.17.0.tar.xz",
+      "expected_sha256": "2c1bacd2110f4799f74de6ebb714b94cf6f80fb112316b1219480fd22562148c",
+      "source_commit": null, "depends_on": [],
+      "archive_root": "xcb-proto-1.17.0", "license_file": "COPYING",
+      "hash_source": "https://lists.x.org/archives/xorg-announce/2024-April/003506.html"
+    },
+    {
+      "name": "libxcb", "version": "1.17.0",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libxcb-1.17.0.tar.xz",
+      "expected_sha256": "599ebf9996710fea71622e6e184f3a8ad5b43d0e5fa8c4e407123c88a59a6d55",
+      "source_commit": null, "depends_on": ["xcb-proto", "libXau"],
+      "archive_root": "libxcb-1.17.0", "license_file": "COPYING",
+      "hash_source": "https://lists.x.org/archives/xorg-announce/2024-April/003507.html"
+    },
+    {
+      "name": "libX11", "version": "1.8.12",
+      "source_url": "https://xorg.freedesktop.org/archive/individual/lib/libX11-1.8.12.tar.xz",
+      "expected_sha256": "fa026f9bb0124f4d6c808f9aef4057aad65e7b35d8ff43951cef0abe06bb9a9a",
+      "source_commit": null, "depends_on": ["xorgproto", "xtrans", "libxcb"],
+      "archive_root": "libX11-1.8.12", "license_file": "COPYING",
+      "hash_source": "https://www.mail-archive.com/xorg-announce@lists.x.org/msg01796.html"
+    }
+  ]
+}

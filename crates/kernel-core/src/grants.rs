@@ -1,7 +1,8 @@
 //! Capacity accounting only. Physical mapping/revocation belongs to the caller.
 use cyxia_contracts::*;
-const GRANTS: usize = 64;
-const REDEMPTIONS: usize = 128;
+// Small services retain the default bound; anonymous heaps reserve a larger
+// table explicitly. Metadata capacity never changes the page admission limit.
+pub type GrantLedger = BoundedGrantLedger<128>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantError {
     Invalid,
@@ -35,6 +36,23 @@ impl AuthorizedGrantRequest {
     }
     pub fn from_ai() -> Result<Self, GrantError> {
         Err(GrantError::NotReady)
+    }
+    /// # Safety
+    /// Only a trusted resource service may call this after authenticating the
+    /// model and validating its current decision, owner and resource request.
+    /// AI provenance alone is not authorization. Never expose this to tasks.
+    pub unsafe fn validated_ai(
+        owner: Owner,
+        pages: PageCount,
+        model: u64,
+    ) -> Result<Self, GrantError> {
+        let origin = DecisionOrigin::new(DecisionSource::AiDirect, Some(model), None, None)
+            .map_err(|_| GrantError::Invalid)?;
+        Ok(Self {
+            owner,
+            pages: pages.0,
+            origin,
+        })
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -83,19 +101,19 @@ pub struct LedgerSnapshot {
     pub reserved_unredeemed: u32,
     pub in_use: u32,
 }
-pub struct GrantLedger {
+pub struct BoundedGrantLedger<const RECORDS: usize> {
     capacity: u32,
-    grants: [Option<ResourceGrant>; GRANTS],
-    redemptions: [Option<Redemption>; REDEMPTIONS],
+    grants: [Option<ResourceGrant>; RECORDS],
+    redemptions: [Option<Redemption>; RECORDS],
     next_grant: u64,
     next_redemption: u64,
 }
-impl GrantLedger {
+impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     pub const fn new(capacity: PageCount) -> Self {
         Self {
             capacity: capacity.0,
-            grants: [None; GRANTS],
-            redemptions: [None; REDEMPTIONS],
+            grants: [None; RECORDS],
+            redemptions: [None; RECORDS],
             next_grant: 1,
             next_redemption: 1,
         }
@@ -130,7 +148,7 @@ impl GrantLedger {
         }
         // One future redemption record per unredeemed page guarantees bounded metadata.
         let records = self.redemptions.iter().flatten().count();
-        if records as u64 + s.reserved_unredeemed as u64 + r.pages as u64 > REDEMPTIONS as u64 {
+        if records as u64 + s.reserved_unredeemed as u64 + r.pages as u64 > RECORDS as u64 {
             return Err(GrantError::Metadata);
         }
         let slot = self
@@ -152,6 +170,66 @@ impl GrantLedger {
             closed: false,
         });
         self.next_grant = next;
+        Ok(id)
+    }
+    /// Atomically admit and redeem one indivisible allocation. Unlike commit(),
+    /// no promise of later page-by-page redemption is created, so a large region
+    /// needs one redemption record. All failures leave the ledger unchanged.
+    pub fn commit_and_redeem(
+        &mut self,
+        r: AuthorizedGrantRequest,
+    ) -> Result<RedemptionId, GrantError> {
+        if r.pages == 0 {
+            return Err(GrantError::Invalid);
+        }
+        let snapshot = self.snapshot();
+        if r.pages > snapshot.free {
+            return Err(GrantError::Capacity);
+        }
+        let promised_ids = u64::from(snapshot.reserved_unredeemed) + 1;
+        if promised_ids > u64::MAX - self.next_redemption {
+            return Err(GrantError::Exhausted);
+        }
+        let records = self.redemptions.iter().flatten().count();
+        if records as u64 + promised_ids > RECORDS as u64 {
+            return Err(GrantError::Metadata);
+        }
+        let grant_slot = self
+            .grants
+            .iter()
+            .position(Option::is_none)
+            .ok_or(GrantError::Metadata)?;
+        let redemption_slot = self
+            .redemptions
+            .iter()
+            .position(Option::is_none)
+            .ok_or(GrantError::Metadata)?;
+        let next_grant = self
+            .next_grant
+            .checked_add(1)
+            .ok_or(GrantError::Exhausted)?;
+        let next_redemption = self
+            .next_redemption
+            .checked_add(1)
+            .ok_or(GrantError::Exhausted)?;
+        let grant = GrantId::new(self.next_grant).map_err(|_| GrantError::Exhausted)?;
+        let id = RedemptionId::new(self.next_redemption).map_err(|_| GrantError::Exhausted)?;
+        self.grants[grant_slot] = Some(ResourceGrant {
+            id: grant,
+            owner: r.owner,
+            remaining: 0,
+            in_use: r.pages,
+            origin: r.origin,
+            closed: true,
+        });
+        self.redemptions[redemption_slot] = Some(Redemption {
+            id,
+            grant,
+            owner: r.owner,
+            pages: r.pages,
+        });
+        self.next_grant = next_grant;
+        self.next_redemption = next_redemption;
         Ok(id)
     }
     fn index(&self, id: GrantId, owner: Owner) -> Result<usize, GrantError> {
@@ -243,6 +321,60 @@ impl GrantLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_atomic_redemption_is_one_record_and_capacity_failures_are_atomic() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let mut ledger = GrantLedger::new(PageCount(4096));
+        let first = ledger
+            .commit_and_redeem(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1024)) })
+            .unwrap();
+        let second = ledger
+            .commit_and_redeem(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(3072)) })
+            .unwrap();
+        assert_eq!(ledger.snapshot().free, 0);
+        let snapshot = ledger.snapshot();
+        assert_eq!(
+            ledger.commit_and_redeem(unsafe {
+                AuthorizedGrantRequest::bootstrap(owner, PageCount(1))
+            }),
+            Err(GrantError::Capacity)
+        );
+        assert_eq!(ledger.snapshot(), snapshot);
+        let receipt = unsafe { ReleaseReceipt::after_revoke(first, owner, PageCount(1024)) };
+        ledger.release_completed(receipt).unwrap();
+        assert_eq!(ledger.release_completed(receipt), Err(GrantError::Stale));
+        ledger
+            .release_completed(unsafe {
+                ReleaseReceipt::after_revoke(second, owner, PageCount(3072))
+            })
+            .unwrap();
+        assert_eq!(ledger.snapshot().free, 4096);
+    }
+    #[test]
+    fn atomic_redemption_preserves_promised_identity_space() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let mut ledger = GrantLedger::new(PageCount(4096));
+        ledger.next_redemption = u64::MAX - 2;
+        let promised = ledger
+            .commit(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(2)) })
+            .unwrap();
+        let snapshot = ledger.snapshot();
+        assert_eq!(
+            ledger.commit_and_redeem(unsafe {
+                AuthorizedGrantRequest::bootstrap(owner, PageCount(100))
+            }),
+            Err(GrantError::Exhausted)
+        );
+        assert_eq!(ledger.snapshot(), snapshot);
+        ledger.redeem(promised, owner, PageCount(1)).unwrap();
+        ledger.redeem(promised, owner, PageCount(1)).unwrap();
+    }
     #[test]
     fn exhausted_ids_do_not_mutate() {
         let owner = Owner {

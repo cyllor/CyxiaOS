@@ -1,0 +1,6 @@
+[package]
+name = "cyxia-driver-virtio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

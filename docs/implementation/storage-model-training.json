@@ -1,0 +1,28 @@
+{
+  "model_id": 20481,
+  "schema_version": 1,
+  "seed": 1129928787,
+  "epochs": 32,
+  "features": [
+    "bias",
+    "runnable_work"
+  ],
+  "domain": {
+    "runnable_work": [
+      0,
+      8
+    ]
+  },
+  "samples": 9,
+  "domain_correct": 9,
+  "weights": [
+    1,
+    -1
+  ],
+  "operations_per_window": [
+    1,
+    4
+  ],
+  "window_ms": 8,
+  "limitation": "Exhaustive fit to a synthetic target; no held-out workload or performance benefit claim; no online learning."
+}

@@ -1,0 +1,20 @@
+--- a/gdk-pixbuf/meson.build
++++ b/gdk-pixbuf/meson.build
+@@ -164,7 +164,7 @@
+                          include_directories: [ root_inc, gdk_pixbuf_inc ],
+                          c_args: common_cflags + gdk_pixbuf_cflags + cflags + cflag_for_included_loader)
+ 
+-    included_loaders_deps += declare_dependency(link_with: mod)
++    included_loaders_deps += declare_dependency(link_with: mod, dependencies: loaders_deps)
+   endif
+ endforeach
+ 
+@@ -189,7 +189,7 @@
+                          include_directories: [ root_inc, gdk_pixbuf_inc ],
+                          c_args: common_cflags + gdk_pixbuf_cflags + cflag_for_included_loader)
+ 
+-    included_loaders_deps += declare_dependency(link_with: mod)
++    included_loaders_deps += declare_dependency(link_with: mod, dependencies: loaders_deps)
+   endif
+ endif
+ 

@@ -1,0 +1,480 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-unknown-linux-musl",
+  "audit_date_utc": "2026-10-18T12:14:33.508015+00:00",
+  "epoch": {
+    "name": "cosmic-epoch",
+    "repository": "https://github.com/pop-os/cosmic-epoch.git",
+    "commit": "364341d52454bf3a016d03185c6aff887247aab7",
+    "commit_time": "2026-10-08T15:24:57+02:00",
+    "directory": "cosmic-epoch"
+  },
+  "components": [
+    {
+      "name": "cosmic-app-library",
+      "repository": "https://github.com/pop-os/cosmic-applibrary",
+      "commit": "1107375789e3f60e120b6dc5b81379771ecaa811",
+      "directory": "cosmic-app-library"
+    },
+    {
+      "name": "cosmic-applets",
+      "repository": "https://github.com/pop-os/cosmic-applets",
+      "commit": "406d1b7d627138fdf4078f654268d3d8774e50f1",
+      "directory": "cosmic-applets"
+    },
+    {
+      "name": "cosmic-bg",
+      "repository": "https://github.com/pop-os/cosmic-bg.git",
+      "commit": "91d525b7310f5a497c9fd09a25d2710eb9f8a6f7",
+      "directory": "cosmic-bg"
+    },
+    {
+      "name": "cosmic-comp",
+      "repository": "https://github.com/pop-os/cosmic-comp",
+      "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+      "directory": "cosmic-comp-epoch"
+    },
+    {
+      "name": "cosmic-edit",
+      "repository": "https://github.com/pop-os/cosmic-edit",
+      "commit": "5ddf5115995e02fd71851a42bf0e6a9c9b5a1ce5",
+      "directory": "cosmic-edit"
+    },
+    {
+      "name": "cosmic-files",
+      "repository": "https://github.com/pop-os/cosmic-files.git",
+      "commit": "ac5cef76fa60b5a329bfda3d30825489ec28af53",
+      "directory": "cosmic-files"
+    },
+    {
+      "name": "cosmic-greeter",
+      "repository": "https://github.com/pop-os/cosmic-greeter",
+      "commit": "98df07df93df1cb091c95451f7162dca1a2ae2dd",
+      "directory": "cosmic-greeter"
+    },
+    {
+      "name": "cosmic-icons",
+      "repository": "https://github.com/pop-os/cosmic-icons.git",
+      "commit": "f1a282a0822aed1f0083dd2ab2e6c65bd5b401eb",
+      "directory": "cosmic-icons"
+    },
+    {
+      "name": "cosmic-idle",
+      "repository": "https://github.com/pop-os/cosmic-idle.git",
+      "commit": "21e983c63e75640ab0055495e768a5c616742c19",
+      "directory": "cosmic-idle"
+    },
+    {
+      "name": "cosmic-initial-setup",
+      "repository": "https://github.com/pop-os/cosmic-initial-setup",
+      "commit": "8b025bc9eec4844d8c01fb238e5298b3db920b3f",
+      "directory": "cosmic-initial-setup"
+    },
+    {
+      "name": "cosmic-launcher",
+      "repository": "https://github.com/pop-os/cosmic-launcher",
+      "commit": "03195ddb097c6ad83c4072917d60d900b8bd944f",
+      "directory": "cosmic-launcher"
+    },
+    {
+      "name": "cosmic-monitor",
+      "repository": "https://github.com/pop-os/cosmic-monitor.git",
+      "commit": "a79ce9e7d2259a82150d56978fb7a094bd4ec2f0",
+      "directory": "cosmic-monitor"
+    },
+    {
+      "name": "cosmic-notifications",
+      "repository": "https://github.com/pop-os/cosmic-notifications",
+      "commit": "1e4c1f11fdcae273d6954fd0bfc54749a6145267",
+      "directory": "cosmic-notifications"
+    },
+    {
+      "name": "cosmic-osd",
+      "repository": "https://github.com/pop-os/cosmic-osd.git",
+      "commit": "9b14ee017fb8fdb7d03d73da597cf17b89d890f7",
+      "directory": "cosmic-osd"
+    },
+    {
+      "name": "cosmic-osk",
+      "repository": "https://github.com/pop-os/cosmic-osk",
+      "commit": "1b7ec698b79d248d6a59ff426f453fc7ce3edc91",
+      "directory": "cosmic-osk"
+    },
+    {
+      "name": "cosmic-panel",
+      "repository": "https://github.com/pop-os/cosmic-panel",
+      "commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+      "directory": "cosmic-panel"
+    },
+    {
+      "name": "cosmic-player",
+      "repository": "https://github.com/pop-os/cosmic-player.git",
+      "commit": "900453787f999ec151b8d58683923e3110b727e1",
+      "directory": "cosmic-player"
+    },
+    {
+      "name": "cosmic-randr",
+      "repository": "https://github.com/pop-os/cosmic-randr.git",
+      "commit": "85efc7febb99876094cf90af6dbce0927ad8cca7",
+      "directory": "cosmic-randr"
+    },
+    {
+      "name": "cosmic-screenshot",
+      "repository": "https://github.com/pop-os/cosmic-screenshot",
+      "commit": "07e27587eb387ecf38cb4692ccbf25ad20760d22",
+      "directory": "cosmic-screenshot"
+    },
+    {
+      "name": "cosmic-session",
+      "repository": "https://github.com/pop-os/cosmic-session",
+      "commit": "8093b59bb1262b0612d814e6540ba936303f735a",
+      "directory": "cosmic-session"
+    },
+    {
+      "name": "cosmic-settings",
+      "repository": "https://github.com/pop-os/cosmic-settings",
+      "commit": "58aeb65244b8830880e8b6ced89dcd25663f20b1",
+      "directory": "cosmic-settings"
+    },
+    {
+      "name": "cosmic-settings-daemon",
+      "repository": "https://github.com/pop-os/cosmic-settings-daemon",
+      "commit": "9e4ae69fc175191f15789d35423806ea0f093c9d",
+      "directory": "cosmic-settings-daemon"
+    },
+    {
+      "name": "cosmic-sound-theme",
+      "repository": "https://github.com/pop-os/cosmic-sound-theme.git",
+      "commit": "bf5335fe1af0cb3bee83e1ad2371410ee434658d",
+      "directory": "cosmic-sound-theme"
+    },
+    {
+      "name": "cosmic-store",
+      "repository": "https://github.com/pop-os/cosmic-store.git",
+      "commit": "c7b36a2fdccf1ce88944793af67c3664413ee560",
+      "directory": "cosmic-store"
+    },
+    {
+      "name": "cosmic-term",
+      "repository": "https://github.com/pop-os/cosmic-term.git",
+      "commit": "3bfca1eb804de2f069e62d0709982beca908cb01",
+      "directory": "cosmic-term"
+    },
+    {
+      "name": "cosmic-viewer",
+      "repository": "https://github.com/pop-os/cosmic-viewer.git",
+      "commit": "77ba62deb7027217efab1999e90670f3c89c5a02",
+      "directory": "cosmic-viewer"
+    },
+    {
+      "name": "cosmic-wallpapers",
+      "repository": "https://github.com/pop-os/cosmic-wallpapers.git",
+      "commit": "da595bba495cb8fc57f26505621fc25000218349",
+      "directory": "cosmic-wallpapers"
+    },
+    {
+      "name": "cosmic-workspaces-epoch",
+      "repository": "https://github.com/pop-os/cosmic-workspaces-epoch/",
+      "commit": "cb953ea0e6fb45ac8f62f9c52f1347c971388e03",
+      "directory": "cosmic-workspaces-epoch"
+    },
+    {
+      "name": "pop-launcher",
+      "repository": "https://github.com/pop-os/launcher.git",
+      "commit": "8a09fa50a9fbbe66a97afe3865b5e61dd1d0432c",
+      "directory": "pop-launcher"
+    },
+    {
+      "name": "xdg-desktop-portal-cosmic",
+      "repository": "https://github.com/pop-os/xdg-desktop-portal-cosmic.git",
+      "commit": "9d35e6300b69cf06da723a502a9a56604a022786",
+      "directory": "xdg-desktop-portal-cosmic"
+    }
+  ],
+  "initial_comp_audit": {
+    "repository": "https://github.com/pop-os/cosmic-comp.git",
+    "commit": "742b800b518f0dafd89d0c1ace4de4935334ed18",
+    "directory": "cosmic-comp",
+    "selected_for_port": false
+  },
+  "compositor": {
+    "component": "cosmic-comp",
+    "commit_time": "2026-10-05T21:13:31+02:00",
+    "rust_version": "1.93",
+    "cargo_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+    "cargo_lock_package_count": 698,
+    "cargo_git_sources": [
+      "git+https://github.com/Drakulix/id-tree.git?branch=feature%2Fcopy_clone#632a57d6d49160e18d7300fa7edae52281ec5482",
+      "git+https://github.com/Smithay/smithay-egui.git?rev=6511552#65115521c756f356a7bcac8f1eeb715817a4666f",
+      "git+https://github.com/iced-rs/cryoglyph.git?rev=e429a025df36ab8145708acb309080ae3deec17a#e429a025df36ab8145708acb309080ae3deec17a",
+      "git+https://github.com/jackpot51/rust-atomicwrites#043ab4859d53ffd3d55334685303d8df39c9f768",
+      "git+https://github.com/pop-os//cosmic-protocols?branch=main#c0cff4db14c37ed954983158e4055aa94c7741d9",
+      "git+https://github.com/pop-os/cosmic-randr/#6e8e795970fa06d434af22775e415b517f7552d3",
+      "git+https://github.com/pop-os/cosmic-settings-daemon#e37160f14d1e7ee428f973cd2848b4e95f83dfe1",
+      "git+https://github.com/pop-os/dbus-settings-bindings#eed01dd3609e90e3c8cd043656734c500956c793",
+      "git+https://github.com/pop-os/freedesktop-icons#ab4c57b8e416c6af9297cb04d101889896fd9a92",
+      "git+https://github.com/pop-os/libcosmic#d922ac380134c00208d2acf93947d44fb217eec5",
+      "git+https://github.com/pop-os/smithay-clipboard?tag=sctk-0.20#859b02c88f45c554049a67c6ddeec1692ce0e20b",
+      "git+https://github.com/pop-os/softbuffer?tag=cosmic-4.0#c2b2c19ddb38ff17495643699f97cb1f2064a1be",
+      "git+https://github.com/pop-os/window_clipboard.git?tag=sctk-0.20#f68595ee0e62fbd6589f4709b5aaa5c3c7ea5f6c",
+      "git+https://github.com/smithay/smithay.git?rev=e3d461a#e3d461a057ba244d213a8498ec372b0799cca103"
+    ],
+    "lock_scope": "Complete compositor Cargo.lock is pinned by SHA256 and includes registry checksums; other epoch component transitive dependencies are not yet audited or vendored."
+  },
+  "backend": {
+    "candidate": "winit-software-egl",
+    "implemented": false,
+    "renderer": "upstream GlowRenderer/GLES, backed by a real Mesa software EGL provider",
+    "candidate_environment": {
+      "COSMIC_BACKEND": "winit",
+      "WINIT_UNIX_BACKEND": "x11",
+      "LIBGL_ALWAYS_SOFTWARE": "1",
+      "GALLIUM_DRIVER": "softpipe"
+    },
+    "arguments": [
+      "--no-xwayland"
+    ],
+    "environment_is_not_a_working_launcher": true
+  },
+  "target_libraries": [
+    {
+      "name": "EGL",
+      "filenames": [
+        "libEGL.a",
+        "libEGL.so",
+        "libEGL.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "GLESv2",
+      "filenames": [
+        "libGLESv2.a",
+        "libGLESv2.so",
+        "libGLESv2.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "xkbcommon",
+      "filenames": [
+        "libxkbcommon.a",
+        "libxkbcommon.so",
+        "libxkbcommon.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "X11",
+      "filenames": [
+        "libX11.a",
+        "libX11.so",
+        "libX11.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "Xcursor",
+      "filenames": [
+        "libXcursor.a",
+        "libXcursor.so",
+        "libXcursor.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "Xi",
+      "filenames": [
+        "libXi.a",
+        "libXi.so",
+        "libXi.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "Xrandr",
+      "filenames": [
+        "libXrandr.a",
+        "libXrandr.so",
+        "libXrandr.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "xcb",
+      "filenames": [
+        "libxcb.a",
+        "libxcb.so",
+        "libxcb.so.*"
+      ],
+      "scope": "winit-software-candidate",
+      "note": ""
+    },
+    {
+      "name": "wayland-client",
+      "filenames": [
+        "libwayland-client.a",
+        "libwayland-client.so",
+        "libwayland-client.so.*"
+      ],
+      "scope": "wayland-c-foundation",
+      "note": "C compatibility inventory; Smithay can use its Rust Wayland server backend."
+    },
+    {
+      "name": "wayland-server",
+      "filenames": [
+        "libwayland-server.a",
+        "libwayland-server.so",
+        "libwayland-server.so.*"
+      ],
+      "scope": "wayland-c-foundation",
+      "note": "C compatibility inventory; Smithay can use its Rust Wayland server backend."
+    },
+    {
+      "name": "wayland-egl",
+      "filenames": [
+        "libwayland-egl.a",
+        "libwayland-egl.so",
+        "libwayland-egl.so.*"
+      ],
+      "scope": "wayland-c-foundation",
+      "note": "C compatibility inventory; Smithay can use its Rust Wayland server backend."
+    },
+    {
+      "name": "dbus-1",
+      "filenames": [
+        "libdbus-1.a",
+        "libdbus-1.so",
+        "libdbus-1.so.*"
+      ],
+      "scope": "session-inventory",
+      "note": "COSMIC uses Rust zbus; libdbus-1 is not a required compositor link library. A real bus service is a separate session requirement."
+    },
+    {
+      "name": "libinput",
+      "filenames": [
+        "libinput.a",
+        "libinput.so",
+        "libinput.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "udev",
+      "filenames": [
+        "libudev.a",
+        "libudev.so",
+        "libudev.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "drm",
+      "filenames": [
+        "libdrm.a",
+        "libdrm.so",
+        "libdrm.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "gbm",
+      "filenames": [
+        "libgbm.a",
+        "libgbm.so",
+        "libgbm.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "seat",
+      "filenames": [
+        "libseat.a",
+        "libseat.so",
+        "libseat.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "display-info",
+      "filenames": [
+        "libdisplay-info.a",
+        "libdisplay-info.so",
+        "libdisplay-info.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    },
+    {
+      "name": "pixman-1",
+      "filenames": [
+        "libpixman-1.a",
+        "libpixman-1.so",
+        "libpixman-1.so.*"
+      ],
+      "scope": "uncut-upstream",
+      "note": "Current upstream enables Linux KMS dependencies even with --no-default-features; a narrowed port must explicitly separate them."
+    }
+  ],
+  "required_work": [
+    {
+      "id": "backend-feature-port",
+      "scope": "build",
+      "detail": "Separate unconditional Smithay KMS/GBM/udev/libinput/libseat/Vulkan and renderer-multi source dependencies; --no-default-features only removes systemd defaults."
+    },
+    {
+      "id": "real-egl-loader",
+      "scope": "build-runtime",
+      "detail": "Provide real EGL/GLES and its driver. Smithay loads libEGL.so.1 via libloading; current static musl profile needs a real dynamic loader or explicit static EGL binding port, including winit/Xlib loading."
+    },
+    {
+      "id": "rust-std-guest",
+      "scope": "runtime",
+      "detail": "The bounded std startup/TLS/thread/futex/allocator subset passed cosmic-bootstrap-r3. Validate the actual COSMIC dependency closure and remaining runtime APIs separately; see docs/implementation/rust-std-foundation.md."
+    },
+    {
+      "id": "wayland-fd-shm",
+      "scope": "runtime",
+      "detail": "Guest-verify Unix SCM_RIGHTS ownership/truncation, shared file-backed buffers, mmap lifecycle, peer credentials and readiness. A byte-only roundtrip is not wl_shm support."
+    },
+    {
+      "id": "event-loop",
+      "scope": "runtime",
+      "detail": "Level/oneshot epoll and stream-message gates passed cosmic-bootstrap-r3. CLOCK_MONOTONIC timerfd with counted periodic reads, shared OFDs and blocking/reuse checks passed cosmic-timer-r2. Edge-triggering, nested epoll, clock/cancellation extensions and complete calloop/Tokio requirements remain; see docs/implementation/timerfd.md."
+    },
+    {
+      "id": "shader-present",
+      "scope": "runtime",
+      "detail": "Create a real EGL/GLES context, compile upstream shaders, render/read back exact pixels and present through the guest Xorg before claiming the software path works."
+    },
+    {
+      "id": "session-services",
+      "scope": "full-session",
+      "detail": "Port and validate cosmic-session/panel/applets/config/service/process spawning and D-Bus services separately; a compositor or one toolkit window is not the full desktop."
+    },
+    {
+      "id": "resource-budget",
+      "scope": "runtime",
+      "detail": "Measure final ELF, resident memory, threads, process/FD slots and rendering cost against CyxiaOS admission budgets; do not assume the existing desktop allocation is sufficient."
+    }
+  ],
+  "epoch_unlinked_submodules": [
+    {
+      "name": "simple-wrapper",
+      "repository": "https://github.com/pop-os/simple-wrapper",
+      "reason": "Listed in .gitmodules but no gitlink exists in this epoch tree; no commit is fabricated."
+    }
+  ]
+}

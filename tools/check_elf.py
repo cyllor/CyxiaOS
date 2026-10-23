@@ -1,4 +1,4 @@
-"""Strict ELF64 load validation for the pinned 256 MiB virt configuration."""
+"""Strict ELF64 load validation and versioned CyxiaOS boot profile."""
 import json
 from pathlib import Path
 import struct
@@ -19,7 +19,7 @@ def inspect_elf(b):
         if typ!=1:continue
         need(fs<=ms and off+fs<=len(b) and pa+ms<LIMIT and va+ms<LIMIT,'segment overflow')
         if ms==0:continue
-        need(0x40200000<=pa<pa+ms<=0x41000000,'load outside reserved kernel pool / DTB collision')
+        need(0x40200000<=pa<pa+ms<=0x44000000,'load outside reserved kernel pool / DTB collision')
         need(not (fl&2 and fl&1),'writable executable segment')
         need(al in (0,1) or (al&(al-1)==0 and va%al==off%al),'invalid segment alignment')
         for s in loads:
@@ -44,5 +44,26 @@ def symbol(b,name):
                     if seg['va']<=value and value+length<=seg['va']+seg['mem']:
                         return dict(va=value,pa=value-seg['va']+seg['pa'],size=length)
     raise ValueError('missing symbol '+name)
+
+
+def boot_profile(b):
+    """Read the retained boot ABI symbol; legacy images have the 256 MiB ABI."""
+    loads = inspect_elf(b)['loads']
+    try:
+        entry = symbol(b, 'CYXIA_BOOT_PROFILE')
+    except ValueError as error:
+        if str(error) == 'missing symbol CYXIA_BOOT_PROFILE':
+            return dict(version=0, ram_mib=256, heap_pages=2048)
+        raise
+    if entry['size'] != 24:
+        raise ValueError('invalid boot profile size')
+    for segment in loads:
+        delta = entry['pa'] - segment['pa']
+        if 0 <= delta and delta+24 <= segment['size']:
+            version, ram_mib, heap_pages = struct.unpack_from('<QQQ', b, segment['offset']+delta)
+            if version != 1 or (ram_mib, heap_pages) not in ((256, 2048), (512, 4096)):
+                raise ValueError('unsupported boot profile')
+            return dict(version=version, ram_mib=ram_mib, heap_pages=heap_pages)
+    raise ValueError('boot profile is not backed by loaded bytes')
 if __name__=='__main__':
     print(json.dumps(inspect_elf(Path(sys.argv[1]).read_bytes()),indent=2))

@@ -1,5 +1,9 @@
 # M1 实现与验证结果
 
+> 最新 EL0 与 POSIX 子集进展见 [POSIX 第一阶段说明](posix-compatibility.md)；以下保留原切片的历史范围。
+
+本报告仅记录 M1 基线；后续已实现 [Shell 与 AI 文件系统切片](shell-ai-fs.md)，不改变以下历史验收范围。
+
 日期：2026-10-15。状态：**KERNEL_BASE_READY**；AI 状态：**NOT_IMPLEMENTED**。
 
 代码位于项目本地 `m1-kernel` 分支。原设计、浏览器原型和历史审核快照均保留。

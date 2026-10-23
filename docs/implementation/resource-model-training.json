@@ -1,0 +1,90 @@
+{
+  "seed": 1129928786,
+  "models": {
+    "MEMORY": {
+      "version": 1,
+      "weights": [
+        -39,
+        42,
+        -47,
+        0
+      ],
+      "train": 211,
+      "heldout": 53,
+      "correct": 53
+    },
+    "CPU": {
+      "version": 1,
+      "weights": [
+        0,
+        90,
+        175,
+        -25
+      ],
+      "train": 2400,
+      "heldout": 600,
+      "correct": 599
+    },
+    "QUANTUM": {
+      "version": 1,
+      "weights": [
+        54,
+        -79,
+        13,
+        0
+      ],
+      "train": 102,
+      "heldout": 26,
+      "correct": 23
+    },
+    "DEVICE": {
+      "version": 1,
+      "weights": [
+        0,
+        25,
+        13,
+        -8
+      ],
+      "train": 2400,
+      "heldout": 600,
+      "correct": 599
+    },
+    "USER_QUANTUM": {
+      "version": 1,
+      "weights": [
+        -1,
+        1,
+        -8,
+        0
+      ],
+      "train": 14,
+      "heldout": 4,
+      "correct": 4
+    },
+    "USER_MEMORY": {
+      "version": 1,
+      "weights": [
+        -433,
+        431,
+        -434,
+        0
+      ],
+      "train": 26316,
+      "heldout": 6580,
+      "correct": 6580
+    },
+    "EXEC_MEMORY": {
+      "version": 1,
+      "weights": [
+        -267,
+        420,
+        -426,
+        0
+      ],
+      "train": 52633,
+      "heldout": 13159,
+      "correct": 13107
+    }
+  },
+  "limitation": "Synthetic policy distillation; not workload performance validation."
+}

@@ -1,0 +1,939 @@
+{
+  "schema_version": 1,
+  "profile": "cyxia-aarch64-lxde-x11-software-integration",
+  "reviewed_on": "2026-10-16",
+  "status": "candidate-version-freeze-incomplete-closure",
+  "release_ready": false,
+  "closure_complete": false,
+  "target": {
+    "architecture": "aarch64",
+    "os": "CyxiaOS",
+    "kernel": "native Rust/no_std",
+    "application_mode": "source ports of X.Org and LXDE; not Linux ABI acceptance",
+    "graphics": "native CyxiaOS DDX to VirtIO GPU/Input",
+    "toolkit": "GTK 3",
+    "memory_profile": "unmeasured; keep current 256 MiB regression profile; separate desktop profile pending"
+  },
+  "integrity_policy": {
+    "mutable_branches_allowed": false,
+    "notes": "Expected hashes from upstream are not local archive verification. Git commits are observed peeled tag targets, not signature verification. The source preparation tool can fetch one explicitly selected pinned package even when the full desktop closure is incomplete; check reports closure blockers and no build/installer is provided.",
+    "unpinned_source_download_allowed": false,
+    "allowed_pin_methods": [
+      "sha256-archive",
+      "git-commit"
+    ]
+  },
+  "packages": [
+    {
+      "name": "lxpanel",
+      "version": "0.11.1",
+      "source_url": "https://github.com/lxde/lxpanel/archive/b90d169002d4ac9c8b24a577c8be8f2e654409a8.tar.gz",
+      "source_commit": "b90d169002d4ac9c8b24a577c8be8f2e654409a8",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/lxpanel/0.11.1/configure.ac"
+      ],
+      "depends_on": [
+        "gtk",
+        "libfm",
+        "libwnck",
+        "keybinder",
+        "menu-cache",
+        "lxmenu-data",
+        "libX11"
+      ],
+      "options": [
+        "--enable-gtk3",
+        "--with-plugins=none",
+        "--disable-alsa",
+        "--disable-indicator-support"
+      ],
+      "notes": [
+        "AC_DISABLE_STATIC remains; dynamic library support is still needed. No network, audio, weather or power plugin in the initial profile."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/lxpanel.git"
+    },
+    {
+      "name": "pcmanfm",
+      "version": "1.3.2",
+      "source_url": "https://github.com/lxde/pcmanfm/archive/94e7f39699014e1661ce2402de8e965722beee99.tar.gz",
+      "source_commit": "94e7f39699014e1661ce2402de8e965722beee99",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/pcmanfm/1.3.2/configure.ac"
+      ],
+      "depends_on": [
+        "libfm",
+        "gtk",
+        "pango",
+        "libX11"
+      ],
+      "options": [
+        "--with-gtk=3"
+      ],
+      "notes": [
+        "Real writable files and desktop icons are required for acceptance."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/pcmanfm.git"
+    },
+    {
+      "name": "libfm",
+      "version": "1.3.2",
+      "source_url": "https://github.com/lxde/libfm/archive/695d3e863440b50c50c53ff7287b24b42a624a9e.tar.gz",
+      "source_commit": "695d3e863440b50c50c53ff7287b24b42a624a9e",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/libfm/1.3.2/configure.ac"
+      ],
+      "depends_on": [
+        "glib",
+        "gtk",
+        "pango",
+        "cairo",
+        "menu-cache"
+      ],
+      "options": [
+        "--with-gtk=3",
+        "--disable-old-actions",
+        "--disable-udisks",
+        "--disable-exif"
+      ],
+      "notes": [
+        "First build libfm-extra using --with-extra-only, then menu-cache, then full libfm; package-level graph has an intentional bootstrap cycle."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/libfm.git"
+    },
+    {
+      "name": "lxsession",
+      "version": "0.5.5",
+      "source_url": "https://github.com/lxde/lxsession/archive/9f123db9f9a00ff6fee2468ddbcdb42ab7a07efb.tar.gz",
+      "source_commit": "9f123db9f9a00ff6fee2468ddbcdb42ab7a07efb",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/lxsession/0.5.5/configure.ac"
+      ],
+      "depends_on": [
+        "glib",
+        "libX11",
+        "dbus",
+        "dbus-glib"
+      ],
+      "options": [
+        "--disable-gtk",
+        "--disable-man"
+      ],
+      "notes": [
+        "First profile runs the actual headless session manager, without its GTK settings/clipboard/polkit programs. Enabling GTK unconditionally checks polkit-agent-1 even when built-in polkit is disabled. Vala remains a build requirement."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/lxsession.git"
+    },
+    {
+      "name": "lxterminal",
+      "version": "0.4.0",
+      "source_url": "https://github.com/lxde/lxterminal/archive/a497ff4b69e46b3beed4b2a9092cfb7072f29bd1.tar.gz",
+      "source_commit": "a497ff4b69e46b3beed4b2a9092cfb7072f29bd1",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/lxterminal/0.4.0/configure.ac"
+      ],
+      "depends_on": [
+        "gtk",
+        "glib",
+        "vte",
+        "libX11"
+      ],
+      "options": [
+        "--enable-gtk3",
+        "--disable-man"
+      ],
+      "notes": [
+        "Requires a real PTY/termios implementation and a guest shell."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/lxterminal.git"
+    },
+    {
+      "name": "menu-cache",
+      "version": "1.1.0",
+      "source_url": "https://github.com/lxde/menu-cache/archive/3a44b8179009eb212fd762d5b1ce0153f00ec09e.tar.gz",
+      "source_commit": "3a44b8179009eb212fd762d5b1ce0153f00ec09e",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/menu-cache/1.1.0/configure.ac"
+      ],
+      "depends_on": [
+        "glib",
+        "libfm"
+      ],
+      "options": [],
+      "notes": [
+        "Consumes libfm-extra only; see staged bootstrap order."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/menu-cache.git"
+    },
+    {
+      "name": "lxmenu-data",
+      "version": "0.1.5",
+      "source_url": "https://github.com/lxde/lxmenu-data/archive/3b14415ff9862e6b79577fd4b9a097965001b270.tar.gz",
+      "source_commit": "3b14415ff9862e6b79577fd4b9a097965001b270",
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "tag-peeled-commit-and-configure-verified",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/lxde/lxmenu-data/0.1.5/configure.ac"
+      ],
+      "depends_on": [],
+      "options": [],
+      "notes": [
+        "Install actual XDG application menu data."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false,
+      "source_git_url": "https://github.com/lxde/lxmenu-data.git"
+    },
+    {
+      "name": "openbox",
+      "version": "3.6.1",
+      "source_url": "https://openbox.org/dist/openbox/openbox-3.6.1.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-link-and-tagged-configure-read",
+      "evidence_urls": [
+        "https://openbox.org/download",
+        "https://openbox.org/help/Installing",
+        "https://raw.githubusercontent.com/Mikachu/openbox/release-3.6.1/configure.ac"
+      ],
+      "depends_on": [
+        "glib",
+        "pango",
+        "libxml2",
+        "libX11",
+        "libXext",
+        "libXrandr",
+        "libXcursor"
+      ],
+      "options": [
+        "--disable-startup-notification",
+        "--disable-imlib2",
+        "--disable-librsvg"
+      ],
+      "notes": [
+        "Tagged configure requires GLib >= 2.14, pango AND pangoxft >= 1.8, libxml2 >= 2.6; Pango must include its Xft backend. Native archive hash, configure execution and optional-dependency closure remain unverified."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "xorg-server",
+      "version": "21.1.25",
+      "source_url": "https://www.x.org/releases/individual/xserver/xorg-server-21.1.25.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "upstream-build-file-read",
+      "evidence_urls": [
+        "https://gitlab.freedesktop.org/xorg/xserver/-/raw/xorg-server-21.1.25/meson.build"
+      ],
+      "depends_on": [
+        "xorgproto",
+        "xtrans",
+        "pixman",
+        "libXfont2",
+        "libxkbfile",
+        "xkbcomp",
+        "xkeyboard-config",
+        "libXau",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Requires a new CyxiaOS DDX/platform backend and guest display/input descriptors. Start with software fb rendering; disable Linux DRM/udev/logind, GLX/DRI/glamor and TCP transport. Exact Meson option profile must be checked against this release before build."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "gtk",
+      "version": "3.24.52",
+      "source_url": "https://download.gnome.org/sources/gtk/3.24/gtk-3.24.52.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "80931fa472a77b9a164f6740e3c0b444fac6770054632d35a7ff9d679e5e7b9f",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/gtk/3.24.52/meson.build",
+        "https://download.gnome.org/sources/gtk/3.24/gtk-3.24.52.sha256sum"
+      ],
+      "depends_on": [
+        "glib",
+        "pango",
+        "cairo",
+        "gdk-pixbuf",
+        "atk",
+        "libepoxy",
+        "libX11",
+        "libXext",
+        "libXrandr",
+        "libXi",
+        "libXcursor",
+        "libXfixes",
+        "libXcomposite",
+        "libXdamage",
+        "libXinerama"
+      ],
+      "options": [],
+      "notes": [
+        "X11 only; Wayland/Broadway/Quartz/Win32, printing and introspection disabled after option verification.",
+        "GTK requires libepoxy even for a software-rendered desktop; do not omit it by assumption."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "glib",
+      "version": "2.86.5",
+      "source_url": "https://download.gnome.org/sources/glib/2.86/glib-2.86.5.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "ce85a947bb8b3c0204dbeff79aec39bcb46371c6fafb64ba5b8726c71e038d5f",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/glib/2.86.5/meson.build",
+        "https://download.gnome.org/sources/glib/2.86/glib-2.86.5.sha256sum"
+      ],
+      "depends_on": [
+        "libc",
+        "libffi",
+        "pcre2",
+        "zlib",
+        "gettext",
+        "libiconv"
+      ],
+      "options": [],
+      "notes": [
+        "Requires actual pthreads, poll, file metadata and process creation. iconv/gettext can be supplied by libc or separate libraries; resolve once libc is chosen."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "pango",
+      "version": "1.56.4",
+      "source_url": "https://download.gnome.org/sources/pango/1.56/pango-1.56.4.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "17065e2fcc5f5a5bdbffc884c956bfc7c451a96e8c4fb2f8ad837c6413cb5a01",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/pango/1.56.4/meson.build",
+        "https://download.gnome.org/sources/pango/1.56/pango-1.56.4.sha256sum"
+      ],
+      "depends_on": [
+        "glib",
+        "cairo",
+        "fontconfig",
+        "freetype",
+        "harfbuzz",
+        "fribidi",
+        "libXft"
+      ],
+      "options": [],
+      "notes": [
+        "Verified minima: GLib 2.82, Cairo 1.18, Fontconfig 2.15, HarfBuzz 8.4, FriBidi 1.0.6. Disable optional libthai and introspection initially; verify options."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "vte",
+      "version": "0.78.7",
+      "source_url": "https://download.gnome.org/sources/vte/0.78/vte-0.78.7.tar.xz",
+      "source_commit": null,
+      "expected_sha256": "6fd1edc332d9f9519ce4c0f07135fdf72d64dfd990dc4fabc6ce91b1b7e83dd0",
+      "downloaded_sha256": null,
+      "verification": "build-file-and-upstream-published-checksum-read-not-downloaded",
+      "evidence_urls": [
+        "https://raw.githubusercontent.com/GNOME/vte/0.78.7/meson.build",
+        "https://download.gnome.org/sources/vte/0.78/vte-0.78.7.sha256sum"
+      ],
+      "depends_on": [
+        "gtk",
+        "glib",
+        "pango",
+        "cairo",
+        "pcre2",
+        "lz4",
+        "fribidi",
+        "libcxx"
+      ],
+      "options": [],
+      "notes": [
+        "GTK3 vte-2.91 API; C++20 toolchain/runtime required. Disable GTK4, GNUTLS, ICU, systemd and introspection only through verified upstream options."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "xorgproto",
+      "version": "2024.1",
+      "source_url": "https://www.x.org/releases/individual/proto/xorgproto-2024.1.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/proto/"
+      ],
+      "depends_on": [],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "xtrans",
+      "version": "1.6.0",
+      "source_url": "https://www.x.org/releases/individual/lib/xtrans-1.6.0.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libX11",
+      "version": "1.8.12",
+      "source_url": "https://www.x.org/releases/individual/lib/libX11-1.8.12.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "xorgproto",
+        "xtrans",
+        "libxcb",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libXau",
+      "version": "1.0.12",
+      "source_url": "https://www.x.org/releases/individual/lib/libXau-1.0.12.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "xorgproto",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libXfont2",
+      "version": "2.0.7",
+      "source_url": "https://www.x.org/releases/individual/lib/libXfont2-2.0.7.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "xorgproto",
+        "libfontenc",
+        "freetype",
+        "zlib",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libfontenc",
+      "version": "1.1.8",
+      "source_url": "https://www.x.org/releases/individual/lib/libfontenc-1.1.8.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "xorgproto",
+        "zlib",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libxkbfile",
+      "version": "1.1.3",
+      "source_url": "https://www.x.org/releases/individual/lib/libxkbfile-1.1.3.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/lib/"
+      ],
+      "depends_on": [
+        "libX11",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "xkbcomp",
+      "version": "1.4.7",
+      "source_url": "https://www.x.org/releases/individual/app/xkbcomp-1.4.7.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.x.org/releases/individual/app/"
+      ],
+      "depends_on": [
+        "libX11",
+        "libxkbfile",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "xcb-proto",
+      "version": "1.17.0",
+      "source_url": "https://xcb.freedesktop.org/dist/xcb-proto-1.17.0.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://xcb.freedesktop.org/dist/"
+      ],
+      "depends_on": [],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "libxcb",
+      "version": "1.17.0",
+      "source_url": "https://xcb.freedesktop.org/dist/libxcb-1.17.0.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://xcb.freedesktop.org/dist/"
+      ],
+      "depends_on": [
+        "xcb-proto",
+        "libXau",
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "pixman",
+      "version": "0.46.4",
+      "source_url": "https://www.cairographics.org/releases/pixman-0.46.4.tar.gz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.cairographics.org/releases/"
+      ],
+      "depends_on": [
+        "libc"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    },
+    {
+      "name": "cairo",
+      "version": "1.18.4",
+      "source_url": "https://www.cairographics.org/releases/cairo-1.18.4.tar.xz",
+      "source_commit": null,
+      "expected_sha256": null,
+      "downloaded_sha256": null,
+      "verification": "official-release-index-listed",
+      "evidence_urls": [
+        "https://www.cairographics.org/releases/"
+      ],
+      "depends_on": [
+        "pixman",
+        "glib",
+        "freetype",
+        "fontconfig",
+        "libpng",
+        "zlib",
+        "libX11",
+        "libXrender",
+        "libxcb"
+      ],
+      "options": [],
+      "notes": [
+        "Release filename verified; package configure constraints and full optional-dependency closure not yet audited."
+      ],
+      "cyxia_build_verified": false,
+      "cyxia_runtime_verified": false
+    }
+  ],
+  "unresolved_dependencies": [
+    {
+      "name": "libc",
+      "version": null,
+      "source_url": null,
+      "reason": "Native CyxiaOS libc, loader, libm and pthread implementation/port not yet selected; musl is Linux-dependent and cannot be linked unchanged to the private ABI."
+    },
+    {
+      "name": "libcxx",
+      "version": null,
+      "source_url": null,
+      "reason": "Native C++20 runtime/ABI/unwinder not selected; needed by VTE and some text dependencies."
+    },
+    {
+      "name": "libffi",
+      "version": null,
+      "source_url": null,
+      "reason": "GLib object invocation dependency."
+    },
+    {
+      "name": "pcre2",
+      "version": null,
+      "source_url": null,
+      "reason": "GLib and VTE regular expressions."
+    },
+    {
+      "name": "zlib",
+      "version": null,
+      "source_url": null,
+      "reason": "Compression and fonts."
+    },
+    {
+      "name": "gettext",
+      "version": null,
+      "source_url": null,
+      "reason": "Target libintl plus separate host translation tools, unless supplied by libc."
+    },
+    {
+      "name": "libiconv",
+      "version": null,
+      "source_url": null,
+      "reason": "Character conversion unless supplied by libc."
+    },
+    {
+      "name": "fontconfig",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 2.15.0 for Pango 1.56.4."
+    },
+    {
+      "name": "freetype",
+      "version": null,
+      "source_url": null,
+      "reason": "Font rasterization; GTK checks >= 2.7.1 when pangoft2 is present."
+    },
+    {
+      "name": "harfbuzz",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 8.4.0 for Pango 1.56.4."
+    },
+    {
+      "name": "fribidi",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 1.0.6 for Pango 1.56.4."
+    },
+    {
+      "name": "gdk-pixbuf",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 2.30.0; PNG loader, MIME and cache tools required."
+    },
+    {
+      "name": "atk",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 2.35.1; choose standalone ATK or AT-SPI2 monorepo, and verify GTK bridge profile."
+    },
+    {
+      "name": "libepoxy",
+      "version": null,
+      "source_url": null,
+      "reason": "Select >= 1.4; exact no-GL/Mesa profile still requires validation."
+    },
+    {
+      "name": "libxml2",
+      "version": null,
+      "source_url": null,
+      "reason": "Openbox configuration parsing; choose compatible API version before porting."
+    },
+    {
+      "name": "libwnck",
+      "version": null,
+      "source_url": null,
+      "reason": "GTK3 libwnck-3.0 API for LXPanel."
+    },
+    {
+      "name": "keybinder",
+      "version": null,
+      "source_url": null,
+      "reason": "keybinder-3.0 API for LXPanel."
+    },
+    {
+      "name": "dbus",
+      "version": null,
+      "source_url": null,
+      "reason": "Actual guest session bus, socket credentials and authentication."
+    },
+    {
+      "name": "dbus-glib",
+      "version": null,
+      "source_url": null,
+      "reason": "LXSession Vala package/build/runtime usage requires full audit."
+    },
+    {
+      "name": "xkeyboard-config",
+      "version": null,
+      "source_url": null,
+      "reason": "Pinned XKB keyboard data compatible with chosen server and xkbcomp."
+    },
+    {
+      "name": "libXext",
+      "version": null,
+      "source_url": null,
+      "reason": "X11 extensions."
+    },
+    {
+      "name": "libXrandr",
+      "version": null,
+      "source_url": null,
+      "reason": "Monitor configuration protocol."
+    },
+    {
+      "name": "libXi",
+      "version": null,
+      "source_url": null,
+      "reason": "XInput2."
+    },
+    {
+      "name": "libXcursor",
+      "version": null,
+      "source_url": null,
+      "reason": "Cursor images."
+    },
+    {
+      "name": "libXfixes",
+      "version": null,
+      "source_url": null,
+      "reason": "XFixes."
+    },
+    {
+      "name": "libXcomposite",
+      "version": null,
+      "source_url": null,
+      "reason": "XComposite client library; no compositing desktop assumed."
+    },
+    {
+      "name": "libXdamage",
+      "version": null,
+      "source_url": null,
+      "reason": "XDamage."
+    },
+    {
+      "name": "libXinerama",
+      "version": null,
+      "source_url": null,
+      "reason": "Xinerama client library."
+    },
+    {
+      "name": "libXft",
+      "version": null,
+      "source_url": null,
+      "reason": "Pango/Openbox text path."
+    },
+    {
+      "name": "libXrender",
+      "version": null,
+      "source_url": null,
+      "reason": "Cairo/Xft render protocol."
+    },
+    {
+      "name": "libpng",
+      "version": null,
+      "source_url": null,
+      "reason": "PNG images; actual source version/hash required."
+    },
+    {
+      "name": "lz4",
+      "version": null,
+      "source_url": null,
+      "reason": "VTE requires liblz4 >= 1.9."
+    },
+    {
+      "name": "shared-mime-info",
+      "version": null,
+      "source_url": null,
+      "reason": "Required usable file associations; target data generation and host cache tools must be separated."
+    },
+    {
+      "name": "hicolor-icon-theme",
+      "version": null,
+      "source_url": null,
+      "reason": "Fallback icon theme and index."
+    },
+    {
+      "name": "font-assets",
+      "version": null,
+      "source_url": null,
+      "reason": "At least one pinned licensed font, including chosen UI character coverage."
+    },
+    {
+      "name": "guest-shell",
+      "version": null,
+      "source_url": null,
+      "reason": "A real guest shell connected to PTY; current UART foreground shell is not an EL0 /bin/sh."
+    }
+  ],
+  "bootstrap_order": [
+    "native ABI and libc/threads/libm/loader",
+    "X protocol headers and XCB generator data",
+    "minimal X client libraries and pixman/font stack",
+    "native X.Org DDX and two independent X clients",
+    "GLib/text/GTK3",
+    "Openbox",
+    "libfm-extra from libfm source",
+    "menu-cache",
+    "full libfm-gtk3",
+    "PCManFM and LXPanel with lxmenu-data",
+    "session D-Bus and LXSession --disable-gtk",
+    "C++20 runtime, VTE, LXTerminal and guest shell"
+  ],
+  "upstream_security_review": "not performed; selected versions are an integration baseline, not a statement of current support or security status",
+  "host_observation": {
+    "available_mib_at_initial_read": 240,
+    "existing_target_mib": 465,
+    "present": [
+      "clang",
+      "pkg-config",
+      "autoconf",
+      "automake",
+      "glibtoolize",
+      "python3",
+      "git",
+      "qemu-system-aarch64",
+      "bison",
+      "flex"
+    ],
+    "not_on_path": [
+      "meson",
+      "ninja",
+      "cmake",
+      "intltoolize",
+      "valac"
+    ],
+    "native_macos_packages_are_target_dependencies": false
+  },
+  "acceptance": [
+    "Two independent guest EL0 clients connect to native X.Org and render/read input.",
+    "Actual Openbox controls move/resize/focus/close.",
+    "Actual LXPanel launches actual PCManFM and terminal as distinct guest processes.",
+    "PCManFM edits a file and sees it after guest reboot.",
+    "Terminal uses guest PTY, shell input, resize and interrupt signals.",
+    "AI admission/scheduling grants are observed for the real server and applications.",
+    "Host never runs desktop applications for the acceptance test."
+  ],
+  "source_cache_status": "Availability and verification are recorded in each cache provenance.json; this manifest is not a local cache database."
+}

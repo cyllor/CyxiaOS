@@ -11,7 +11,7 @@ SECTIONS {
  .text : AT(ADDR(.text)-HIGH) { *(.text .text.*) } :text
  . = ALIGN(4096); __text_end = .;
  __ro_start = .;
- .rodata : AT(ADDR(.rodata)-HIGH) { *(.rodata .rodata.*) } :ro
+ .rodata : AT(ADDR(.rodata)-HIGH) { KEEP(*(.cyxia.boot)) *(.rodata .rodata.*) } :ro
  . = ALIGN(4096); __ro_end = .;
  .data : AT(ADDR(.data)-HIGH) { *(.data .data.*) *(.got .got.*) } :data
  .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) { . = ALIGN(16); __bss_start = .; *(.bss .bss.*) *(COMMON) . = ALIGN(16); __bss_end = .; }
@@ -20,6 +20,7 @@ SECTIONS {
  . = ALIGN(4096);
  .test_progress (NOLOAD) : AT(ADDR(.test_progress)-HIGH) { KEEP(*(.test_progress)) . = ALIGN(4096); } :data
  __kernel_end = .;
+ ASSERT(__kernel_end - HIGH <= 0x44000000, "kernel exceeds boot/DMA arena")
  __bss_phys_start = __bss_start-HIGH;
  __bss_phys_end = __bss_end-HIGH;
  __text_phys_start = __text_start-HIGH;

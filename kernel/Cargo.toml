@@ -11,6 +11,26 @@ bench = false
 
 [features]
 selftest = []
+graphics = []
+ported = []
+openbox = ["ported"]
+gtk = ["openbox"]
+pcmanfm = ["openbox"]
+lxpanel = ["pcmanfm"]
+spawn-test = ["ported"]
+mesa-probe = ["ported", "large-memory"]
+rust-egl-probe = ["ported", "large-memory"]
+rust-reactor-probe = ["ported", "large-memory"]
+smithay-probe = ["ported", "large-memory"]
+smithay-wayland-probe = ["ported", "large-memory", "graphics"]
+smithay-xdg-probe = ["ported", "large-memory", "graphics"]
+smithay-multi-probe = ["ported", "large-memory", "graphics"]
+smithay-interactive-probe = ["ported", "large-memory", "graphics"]
+smithay-resize-probe = ["ported", "large-memory", "graphics"]
+smithay-dynamic-probe = ["ported", "large-memory", "graphics"]
+wayland-shm-probe = ["ported", "large-memory"]
+abi-trace = []
+large-memory = ["cyxia-posix/large-memory", "cyxia-platform-virt/large-memory"]
 
 [dependencies]
 cyxia-contracts = { path = "../crates/contracts" }
@@ -19,3 +39,8 @@ cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }
 cyxia-platform-virt = { path = "../crates/platform-virt" }
 cyxia-driver-pl011 = { path = "../crates/driver-pl011" }
 cyxia-driver-gicv2 = { path = "../crates/driver-gicv2" }
+cyxia-shell = { path = "../crates/shell" }
+cyxia-ai-runtime = { path = "../crates/ai-runtime" }
+cyxia-posix = { path = "../crates/posix" }
+cyxia-ai-fs = { path = "../crates/ai-fs" }
+cyxia-driver-virtio = { path = "../crates/driver-virtio" }

@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "scope": "Minimal real PCManFM/libfm UI and fallback image assets. No guest execution claim.",
+  "file_count": 19,
+  "total_bytes": 443802,
+  "directories": [
+    "/etc",
+    "/etc/xdg",
+    "/etc/xdg/libfm",
+    "/etc/xdg/pcmanfm",
+    "/etc/xdg/pcmanfm/default",
+    "/usr",
+    "/usr/share",
+    "/usr/share/libfm",
+    "/usr/share/libfm/images",
+    "/usr/share/libfm/ui",
+    "/usr/share/pcmanfm",
+    "/usr/share/pcmanfm/ui"
+  ],
+  "environment": {
+    "GIO_USE_VFS": "local",
+    "GSETTINGS_BACKEND": "memory",
+    "GTK_USE_PORTAL": "0",
+    "GTK_IM_MODULE": "simple"
+  },
+  "configuration_changes": [
+    "show_thumbnail=0",
+    "mount_on_startup=0",
+    "mount_removable=0",
+    "autorun=0",
+    "desktop_bg=#1b2738",
+    "Blank desktop right-click forwards to the actual Openbox root menu (show_wm_menu=1); dynamic application scanning is not provided."
+  ],
+  "omitted": [
+    "Dynamic modules",
+    "Translations",
+    "Large icon themes",
+    "Application menu data and daemon (not needed for a local-directory first window)"
+  ],
+  "runtime_blockers": [
+    "Real pthread/GThreadPool/GTask; these settings do not replace worker support.",
+    "MIME associations and persistent storage require separate acceptance."
+  ],
+  "files": [
+    {
+      "target": "/usr/share/libfm/archivers.list",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/archivers.list",
+      "bytes": 5381,
+      "sha256": "2e793679ab2d97473e9da5614dd70a2cbc52ba495e59651755a460063430c6f6"
+    },
+    {
+      "target": "/usr/share/libfm/images/folder.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/images/folder.png",
+      "bytes": 3167,
+      "sha256": "0e27210a8804d29cfb1586f446ccb7203d898b810e7940793f5db7e389b1fc38"
+    },
+    {
+      "target": "/usr/share/libfm/images/unknown.png",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/images/unknown.png",
+      "bytes": 1671,
+      "sha256": "e36d77543fcca94bbcb702d2b28c35d8cf0831c0c111b23150e8ac8101350e88"
+    },
+    {
+      "target": "/usr/share/libfm/terminals.list",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/terminals.list",
+      "bytes": 1051,
+      "sha256": "d221fe21b8a32bfcc3aa3a1ef44343f0425aee7e1f6052c2ce5146931abc05f6"
+    },
+    {
+      "target": "/usr/share/libfm/ui/app-chooser.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/app-chooser.ui",
+      "bytes": 19285,
+      "sha256": "c53969e2242c0fb3504debced919c6186689adab9cd478795e4a91c032bea0e5"
+    },
+    {
+      "target": "/usr/share/libfm/ui/ask-rename.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/ask-rename.ui",
+      "bytes": 14470,
+      "sha256": "bcfdf8eb654af48694b26e2ba720e906073d11c0cdc95a8ab0d133bb3474675d"
+    },
+    {
+      "target": "/usr/share/libfm/ui/choose-icon.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/choose-icon.ui",
+      "bytes": 10208,
+      "sha256": "e87a965ed820b8b782480b3fdb21e04f2bc54f42d9c3a34224980022b3e364ff"
+    },
+    {
+      "target": "/usr/share/libfm/ui/exec-file.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/exec-file.ui",
+      "bytes": 5181,
+      "sha256": "5367367fe1e75ebea01160b240e8c152208f5a60d487d99ffe45b6b9975054c9"
+    },
+    {
+      "target": "/usr/share/libfm/ui/file-prop.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/file-prop.ui",
+      "bytes": 54137,
+      "sha256": "207c0aa426021f08507c021f1d846aec2a2f863996634f050ab241d91b7496a3"
+    },
+    {
+      "target": "/usr/share/libfm/ui/filesearch.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/filesearch.ui",
+      "bytes": 59946,
+      "sha256": "28c7b5d34a6661974b250909ac77f76a529920034ddb74f8ea260204eb6c75b4"
+    },
+    {
+      "target": "/usr/share/libfm/ui/preferred-apps.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/preferred-apps.ui",
+      "bytes": 13827,
+      "sha256": "1cc09fa4d68961d9a96d83528cbf4fe30713967a34d899c3780f6b4c746941cd"
+    },
+    {
+      "target": "/usr/share/libfm/ui/progress.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/libfm/ui/progress.ui",
+      "bytes": 15684,
+      "sha256": "0b824df0c2df46893b20436abb043b3ac5159d827b48175d60d5ce0819965dd2"
+    },
+    {
+      "target": "/usr/share/pcmanfm/ui/about.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/pcmanfm/ui/about.ui",
+      "bytes": 2591,
+      "sha256": "84500473947463c74d3ed7348a11132b7023ca01f4e6bb575d36a534b091f4e5"
+    },
+    {
+      "target": "/usr/share/pcmanfm/ui/autorun.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/pcmanfm/ui/autorun.ui",
+      "bytes": 11254,
+      "sha256": "23928ccae3107c2c69447f307ef879f6ea5fc21115fc4b5d0bf97ec49af2fe27"
+    },
+    {
+      "target": "/usr/share/pcmanfm/ui/connect.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/pcmanfm/ui/connect.ui",
+      "bytes": 14898,
+      "sha256": "fd7a5315c32331695b9cf9cdd9b4c062998303fa9ccfa5ca21f6a42b6410d3a6"
+    },
+    {
+      "target": "/usr/share/pcmanfm/ui/desktop-pref.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/pcmanfm/ui/desktop-pref.ui",
+      "bytes": 45707,
+      "sha256": "48026270ccf092c0486f50b86d479256b330cfe2133453ce756cd5808856d306"
+    },
+    {
+      "target": "/usr/share/pcmanfm/ui/pref.ui",
+      "source": "artifacts/sysroot/aarch64-musl/sysroot/usr/share/pcmanfm/ui/pref.ui",
+      "bytes": 164840,
+      "sha256": "3fbaf92abc8f4d205ba47c44889a0db56eab4028219de16e575aeb8f29af514a"
+    },
+    {
+      "target": "/etc/xdg/libfm/libfm.conf",
+      "source": "ports/desktop/pcmanfm-rootfs/libfm.conf",
+      "bytes": 183,
+      "sha256": "d589aafdf0a9da187cb24a9b2f5e6ebdab25720a5a8b7766ac35074b0bdcb1e6"
+    },
+    {
+      "target": "/etc/xdg/pcmanfm/default/pcmanfm.conf",
+      "source": "ports/desktop/pcmanfm-rootfs/pcmanfm.conf",
+      "bytes": 321,
+      "sha256": "730357db411817108c3749961387da5818b516d718176460b88b2ce24740f902"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "name": "meson",
+    "version": "1.8.3",
+    "metadata": "https://pypi.org/pypi/meson/1.8.3/json",
+    "filename": "meson-1.8.3-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/4b/bf/1a2f345a6e8908cd0b17c2f0a3c4f41667f724def84276ff1ce87d003594/meson-1.8.3-py3-none-any.whl",
+    "sha256": "ef02b806ce0c5b6becd5bb5dc9fa67662320b29b337e7ace73e4354500590233"
+  },
+  {
+    "name": "ninja",
+    "version": "1.13.0",
+    "metadata": "https://pypi.org/pypi/ninja/1.13.0/json",
+    "filename": "ninja-1.13.0-py3-none-macosx_10_9_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/3c/74/d02409ed2aa865e051b7edda22ad416a39d81a84980f544f8de717cab133/ninja-1.13.0-py3-none-macosx_10_9_universal2.whl",
+    "sha256": "fa2a8bfc62e31b08f83127d1613d10821775a0eb334197154c4d6067b7068ff1"
+  }
+]

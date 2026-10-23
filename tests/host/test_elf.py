@@ -1,6 +1,6 @@
 import struct
 import unittest
-from tools.check_elf import inspect_elf
+from tools.check_elf import inspect_elf, boot_profile
 
 def fixture(flags=5,pa=0x40200000,mem=4096):
  b=bytearray(512)
@@ -21,3 +21,25 @@ class ElfTests(unittest.TestCase):
   b=bytearray(fixture());struct.pack_into('<H',b,56,2)
   struct.pack_into('<IIQQQQQQ',b,120,1,7,256,0x40000000,0x40000000,16,0,1)
   with self.assertRaises(ValueError):inspect_elf(b)
+
+class BootProfileTests(unittest.TestCase):
+ def image(self, version=1, ram=512, heap=4096, size=24, backed=True):
+  b=bytearray(fixture())+bytearray(512)
+  struct.pack_into('<Q', b, 40, 512)
+  struct.pack_into('<H', b, 60, 3)
+  struct.pack_into('<Q', b, 64+32, 32 if backed else 16)
+  struct.pack_into('<QQQ', b, 264, version, ram, heap)
+  struct.pack_into('<IIQQQQIIQQ', b, 576, 0, 2, 0, 0, 800, 24, 2, 0, 8, 24)
+  name=b'\0CYXIA_BOOT_PROFILE\0'
+  struct.pack_into('<IIQQQQIIQQ', b, 640, 0, 3, 0, 0, 900, len(name), 0, 0, 1, 0)
+  struct.pack_into('<IBBHQQ', b, 800, 1, 0x11, 0, 1, 0x40200008, size)
+  b[900:900+len(name)]=name
+  return b
+ def test_legacy_and_explicit_profiles(self):
+  self.assertEqual(boot_profile(fixture()), dict(version=0, ram_mib=256, heap_pages=2048))
+  self.assertEqual(boot_profile(self.image()), dict(version=1, ram_mib=512, heap_pages=4096))
+  self.assertEqual(boot_profile(self.image(ram=256,heap=2048))['ram_mib'],256)
+ def test_unsupported_or_unbacked_profile_rejected(self):
+  for options in ({'version':2}, {'ram':256}, {'heap':2048}, {'size':16}, {'backed':False}):
+   with self.subTest(options=options), self.assertRaises(ValueError):
+    boot_profile(self.image(**options))

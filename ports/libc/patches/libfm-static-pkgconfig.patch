@@ -1,0 +1,10 @@
+--- a/libfm.pc.in
++++ b/libfm.pc.in
+@@ -6,6 +6,7 @@
+ Name: libfm
+ Description: A glib/gio-based lib used to develop file managers providing some file management utilities.
+ Requires: gthread-2.0 gio-unix-2.0 glib-2.0 >= 2.22.0
++Requires.private: libmenu-cache >= 0.3.2
+ Version: @VERSION@
+ Libs: -L${libdir} -lfm
+ Cflags: @FMINCLUDEADD@

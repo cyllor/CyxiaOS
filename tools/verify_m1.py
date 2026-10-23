@@ -17,21 +17,32 @@ except ImportError:
  from check_elf import inspect_elf
  from run_qemu import run
 
-def inspect_instructions(text):
- count=0
+def inspect_instructions(text, allow_user_context=False):
+ # Only the two handwritten context transitions may access user FP state.
+ # Interrupt handlers, Rust code and compiler helpers remain soft-float.
+ transitions={'cyxia_enter_user', 'cyxia_user_return'}
+ count=0;symbol=None
  for line in text.splitlines():
+  label=re.match(r'^\s*[0-9a-f]+ <([^>]+)>:\s*$',line)
+  if label:
+   symbol=label.group(1);continue
   m=re.match(r'\s*[0-9a-f]+:\s+(.*)',line)
   if not m:continue
-  insn=re.sub(r'^(?:[0-9a-f]{2}\s+){4}', '', m.group(1)).strip()
+  insn=re.sub(r'^(?:[0-9a-f]{2}\s+){4}', '', m.group(1)).strip().lower()
   if insn.startswith(('.word','.xword','.long')):continue
-  if '<unknown>' in insn or re.search(r'\b(?:[vqdshb][0-9]+|fpcr|fpsr)\b',insn) or re.match(r'f[a-z]',insn):raise ValueError('FP/SIMD/unknown instruction: '+line)
+  if '<unknown>' in insn:raise ValueError('unknown instruction: '+line)
+  fp=bool(re.search(r'\b(?:[vqdshb][0-9]+|fpcr|fpsr)\b',insn) or re.match(r'f[a-z]',insn))
+  # State load/store only: allowing FP arithmetic here would permit accidental
+  # clobber before save. Unknown instructions always fail even in a transition.
+  context_move=bool(re.match(r'(?:ldp|stp)\s+q\d+,\s*q\d+,|(?:mrs|msr)\s+.*\b(?:fpcr|fpsr)\b',insn))
+  if fp and not (allow_user_context and symbol in transitions and context_move):raise ValueError('FP/SIMD outside context save/restore: '+line)
   count+=1
  if count==0:raise ValueError('no executable instructions inspected')
  return count
 
 def verify(output):
  output=Path(output).resolve();output.mkdir(parents=True,exist_ok=True)
- report={'status':'FAIL','ai_state':'NOT_IMPLEMENTED','checks':[]}
+ report={'status':'FAIL','ai_state':'NOT_EVALUATED_BY_M1_GATE','checks':[]}
  def record(name,work):
   try:detail=work();report['checks'].append({'name':name,'status':'PASS','detail':detail});print(name+': PASS',flush=True);return detail
   except Exception as e:report['checks'].append({'name':name,'status':'FAIL','error':str(e)});print(name+': FAIL '+str(e),flush=True);raise

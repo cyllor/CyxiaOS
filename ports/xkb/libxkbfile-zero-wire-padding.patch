@@ -1,0 +1,162 @@
+--- a/src/xkmout.c
++++ b/src/xkmout.c
+@@ -315,9 +315,9 @@
+     register unsigned i, n;
+     XkbDescPtr xkb;
+     XkbKeyTypePtr type;
+-    xkmKeyTypeDesc wire;
++    xkmKeyTypeDesc wire = {0};
+     XkbKTMapEntryPtr entry;
+-    xkmKTMapEntryDesc wire_entry;
++    xkmKTMapEntryDesc wire_entry = {0};
+     Atom *names;
+     Display *dpy;
+     unsigned tmp, size = 0;
+@@ -354,7 +354,7 @@
+         }
+         size += xkmPutCountedString(file, XkbAtomGetString(dpy, type->name));
+         if (type->preserve) {
+-            xkmModsDesc p_entry;
++            xkmModsDesc p_entry = {0};
+ 
+             XkbModsPtr pre;
+ 
+@@ -428,7 +428,7 @@
+     char *name;
+     XkbDescPtr xkb;
+     XkbSymInterpretPtr interp;
+-    xkmSymInterpretDesc wire;
++    xkmSymInterpretDesc wire = {0};
+     Display *dpy;
+     unsigned tmp, size = 0;
+ 
+@@ -463,7 +463,7 @@
+     if (info->group_compat) {
+         register unsigned bit;
+ 
+-        xkmModsDesc modsWire;
++        xkmModsDesc modsWire = {0};
+ 
+         for (i = 0, bit = 1; i < XkbNumKbdGroups; i++, bit <<= 1) {
+             if (info->group_compat & bit) {
+@@ -548,7 +548,7 @@
+     Display *dpy;
+     XkbDescPtr xkb;
+     register int i, n;
+-    xkmKeySymMapDesc wireMap;
++    xkmKeySymMapDesc wireMap = {0};
+     char *name;
+     unsigned tmp, size = 0;
+ 
+@@ -638,7 +638,7 @@
+             }
+         }
+         if (wireMap.flags & XkmKeyHasBehavior) {
+-            xkmBehaviorDesc b;
++            xkmBehaviorDesc b = {0};
+ 
+             b.type = xkb->server->behaviors[i].type;
+             b.data = xkb->server->behaviors[i].data;
+@@ -647,7 +647,7 @@
+         }
+     }
+     if (info->total_vmodmaps > 0) {
+-        xkmVModMapDesc v;
++        xkmVModMapDesc v = {0};
+ 
+         for (i = xkb->min_key_code; i <= xkb->max_key_code; i++) {
+             if (xkb->server->vmodmap[i] != 0) {
+@@ -717,7 +717,7 @@
+     Display *dpy;
+     XkbDescPtr xkb;
+     register unsigned i;
+-    xkmIndicatorMapDesc wire;
++    xkmIndicatorMapDesc wire = {0};
+     unsigned tmp, size = 0;
+ 
+     xkb = result->xkb;
+@@ -901,7 +901,7 @@
+ {
+     Display *dpy;
+     XkbDescPtr xkb;
+-    xkmDoodadDesc doodadWire;
++    xkmDoodadDesc doodadWire = {0};
+     unsigned tmp, size = 0;
+ 
+     xkb = result->xkb;
+@@ -959,9 +959,9 @@
+     Display *dpy;
+     XkbDescPtr xkb;
+     XkbOverlayRowPtr row;
+-    xkmOverlayDesc olWire;
+-    xkmOverlayRowDesc rowWire;
+-    xkmOverlayKeyDesc keyWire;
++    xkmOverlayDesc olWire = {0};
++    xkmOverlayRowDesc rowWire = {0};
++    xkmOverlayKeyDesc keyWire = {0};
+     unsigned tmp, size = 0;
+ 
+     xkb = result->xkb;
+@@ -996,7 +996,7 @@
+     register int i;
+     Display *dpy;
+     XkbDescPtr xkb;
+-    xkmSectionDesc sectionWire;
++    xkmSectionDesc sectionWire = {0};
+     unsigned tmp, size = 0;
+ 
+     xkb = result->xkb;
+@@ -1016,9 +1016,9 @@
+     if (section->rows) {
+         register unsigned k;
+         XkbRowPtr row;
+-        xkmRowDesc rowWire;
++        xkmRowDesc rowWire = {0};
+         XkbKeyPtr key;
+-        xkmKeyDesc keyWire;
++        xkmKeyDesc keyWire = {0};
+ 
+         for (i = 0, row = section->rows; i < section->num_rows; i++, row++) {
+             rowWire.top = row->top;
+@@ -1063,7 +1063,7 @@
+     Display *dpy;
+     XkbDescPtr xkb;
+     XkbGeometryPtr geom;
+-    xkmGeometryDesc wire;
++    xkmGeometryDesc wire = {0};
+     unsigned tmp, size = 0;
+ 
+     xkb = result->xkb;
+@@ -1103,12 +1103,12 @@
+     }
+     if (geom->shapes) {
+         XkbShapePtr shape;
+-        xkmShapeDesc shapeWire;
++        xkmShapeDesc shapeWire = {0};
+ 
+         for (i = 0, shape = geom->shapes; i < geom->num_shapes; i++, shape++) {
+             register int n;
+             XkbOutlinePtr ol;
+-            xkmOutlineDesc olWire;
++            xkmOutlineDesc olWire = {0};
+ 
+             bzero((char *) &shapeWire, sizeof(xkmShapeDesc));
+             size += xkmPutCountedAtomString(dpy, file, shape->name);
+@@ -1127,7 +1127,7 @@
+                  n++, ol++) {
+                 register int p;
+                 XkbPointPtr pt;
+-                xkmPointDesc ptWire;
++                xkmPointDesc ptWire = {0};
+ 
+                 olWire.num_points = ol->num_points;
+                 olWire.corner_radius = ol->corner_radius;
+@@ -1361,7 +1361,7 @@
+     XkmInfo info;
+     int size_toc, i;
+     unsigned hdr, present;
+-    xkmFileInfo fileInfo;
++    xkmFileInfo fileInfo = {0};
+     xkmSectionInfo toc[MAX_TOC];
+ 
+     int (*getTOC) (XkbFileInfo *        /* result */ ,

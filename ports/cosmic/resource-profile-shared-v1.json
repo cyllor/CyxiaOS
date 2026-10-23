@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "profile_id": "shared-foundation-v1",
+  "observed_date": "2026-10-20",
+  "status": "validated bounded OFD/SCM/memfd/wl_shm foundation; not a COSMIC session capacity profile",
+  "baseline": {
+    "path": "ports/cosmic/resource-profile.json",
+    "sha256": "2c33a507e7590022f51f7f2c6efb3421a121e166a9f1f1b1115d6f34b7219c13",
+    "immutable_scope": "cosmic-bootstrap-r3"
+  },
+  "guest": {
+    "architecture": "AArch64",
+    "cores": 1,
+    "ram_bytes": 536870912,
+    "process_slots": 8,
+    "process_admitted_max": 7,
+    "threads_per_process": 8,
+    "fds_per_process": 16,
+    "epoll_watches_each": 16,
+    "max_single_heap_request_pages": 2048,
+    "initial_stack_charged_bytes": 262144,
+    "ramfs_nodes": 64,
+    "ramfs_file_bytes": 4096,
+    "ramfs_path_bytes_excluding_nul": 95,
+    "boot_catalog_bytes": 54525952,
+    "boot_entries_max": 128,
+    "global_open_descriptions": 128,
+    "global_epoll_instances": 16,
+    "epoll_instances_per_creator": 2,
+    "shared_pool_bytes": 16777216,
+    "shared_page_bytes": 4096,
+    "shared_objects": 16,
+    "shared_object_max_bytes": 8388608,
+    "shared_mappings_per_process": 16,
+    "shared_va_start": 100663296,
+    "shared_va_end": 117440512,
+    "ancillary_messages": 16,
+    "ancillary_references": 64,
+    "rights_per_message": 8,
+    "private_heap_bytes_per_process": 16777216,
+    "image_and_stack_budget_bytes_per_process": 16777216,
+    "heap_physical_pool_bytes": 134217728,
+    "image_physical_pool_bytes": 134217728
+  },
+  "model_domains": {
+    "8193": {
+      "free_max": 64,
+      "request_max": 8
+    },
+    "8194": {
+      "free_max": 4096,
+      "request_max": 2048
+    },
+    "8195": {
+      "free_max": 4096,
+      "request_max": 4096
+    },
+    "cpu_candidates_max": 8,
+    "note": "New capacity requires matching model/schema/training/accounting changes; do not clamp or silently bypass."
+  },
+  "ai_scope": {
+    "8193": [
+      "shared_objects",
+      "shared_mappings",
+      "ancillary_messages",
+      "ancillary_references"
+    ],
+    "8194": [
+      "shared_pages"
+    ],
+    "physical_page_accounting": "one allocation grant per object page, independent of mapping aliases; nonallocating resize is mechanism only",
+    "limits": "mechanism maxima; model reserve may reject earlier; trained input domains unchanged"
+  },
+  "kernel": {
+    "path": "artifacts/cosmic-shared-r3/cyxia-kernel.elf",
+    "sha256": "294218fb9c8557e25b8478993b78eff51382873871f800a239184fc6f5dd40e5",
+    "bytes": 56253984,
+    "features": [
+      "graphics",
+      "lxpanel",
+      "large-memory",
+      "spawn-test",
+      "wayland-shm-probe"
+    ]
+  },
+  "wl_shm_measurement": {
+    "report": "artifacts/cosmic-shared-r3/wayland-shm-final/summary.json",
+    "sha256": "3de228728a0f4a9e73f124f0e8c43519d9fcab4eb48809b92f9573d7339c6e85",
+    "independent_boots": 3,
+    "clients_per_boot": 2,
+    "frames_per_boot": 4,
+    "compared_pixels_per_boot": 9696,
+    "shared_pages_after": 0,
+    "shared_free_pages_after": 4096,
+    "grant_units_per_boot": {
+      "shared_objects": 6,
+      "shared_pages": 12,
+      "shared_mappings": 10,
+      "ancillary_messages": 6,
+      "ancillary_references": 6
+    },
+    "scope": "fixed fresh pools, actual protocol callbacks and keymap transport; not rendering or physical keyboard input"
+  },
+  "source_identity": {
+    "crates/posix/src/open_description.rs": "bef690a444857b1cb9853b30584de683659e5d4083a9029ba8e45af0d7f9679b",
+    "crates/posix/src/epoll.rs": "8da7ed20429cab4205d4dcbeca3423e442fefa6207a33fec2d488e951d5b8c30",
+    "crates/posix/src/shared_memory.rs": "8088aa4605991140b1662d05afbb3bb3a797968c1b5b7e8ee4bf499eccf4c803",
+    "crates/posix/src/ancillary.rs": "af368469ff59bd4a2516c281ce00294acda3f494eda940d21fab215d6fcd3467",
+    "kernel/src/shared_memory.rs": "d64aa5c140da3d4307a00773dfbdfb76b0d52c3e618c6db101e8949545c2df60",
+    "kernel/src/user/shared_memory.rs": "873d079b12926966ce092045f7e9f585030278b7dc2761ee10b25310666da987",
+    "kernel/src/ai.rs": "83c902ec81356a94f90a8b1d96473c8cabebf4fa45fce473aa1418c06a6b8725",
+    "crates/platform-virt/src/lib.rs": "bc24131e2db500c9b46f798b519ae7a8c7a7e16c697327c85ebd8ae3334dfc06",
+    "crates/ai-runtime/src/lib.rs": "a6a72f60a3e5e48722999b26861a9ba57f480ba4300a28bec61f0f0d4f7c0c19",
+    "crates/ai-runtime/src/weights.rs": "458c95483d38e21f0c501f1f837bcea08e916724331093976eef803f5d0d5c45"
+  },
+  "known_limits": [
+    "No dynamic pool resize/mremap, partial unmap or truncation SIGBUS",
+    "Per-process FD, process, thread, anonymous and image limits have not been raised",
+    "Full compositor/session build and runtime are unverified",
+    "No COSMIC latency, concurrent peak or complete shader workload measurement"
+  ],
+  "cosmic_capacity_validated": false,
+  "g_shm_complete": false,
+  "g_egl_complete": false,
+  "cosmic_comp_running": false,
+  "cosmic_session_running": false,
+  "model_domain_units": {
+    "scope": "model_domains numeric bounds describe accepted policy API inputs, not raw trained features",
+    "8193": "accepts free<=64, request1..8; existing conservative feature conversion min(free,32), unchanged by shared foundation",
+    "8194": "API values are 4KiB pages; trained features floor(free/16), ceil(request/16), free0..256 and request1..128",
+    "8195": "API values are 4KiB pages; features floor(free/16), ceil(request/16), free0..256 and request1..256"
+  }
+}

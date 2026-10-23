@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-unknown-linux-musl",
+  "cosmic_comp_commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "cosmic_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "smithay_commit": "e3d461a057ba244d213a8498ec372b0799cca103",
+  "smithay_files": [
+    {
+      "path": "build.rs",
+      "url": "https://raw.githubusercontent.com/Smithay/smithay/e3d461a057ba244d213a8498ec372b0799cca103/build.rs",
+      "bytes": 4804,
+      "sha256": "e2111ea79aacff5561b69dfc8e3617c22bdac97c3cd254a85ddffe7fcb9d1165"
+    },
+    {
+      "path": "Cargo.toml",
+      "url": "https://raw.githubusercontent.com/Smithay/smithay/e3d461a057ba244d213a8498ec372b0799cca103/Cargo.toml",
+      "bytes": 6039,
+      "sha256": "8d6473bf969166dbc0eff5d51fc9b3f1220e7dbc1378d2cfe119ed4f0b0f313c"
+    },
+    {
+      "path": "src/backend/egl/ffi.rs",
+      "url": "https://raw.githubusercontent.com/Smithay/smithay/e3d461a057ba244d213a8498ec372b0799cca103/src/backend/egl/ffi.rs",
+      "bytes": 12743,
+      "sha256": "2a13f8e29d8c30a154af5cd23d5f072632391377a5914ec110ce647c1babe873"
+    },
+    {
+      "path": "LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/Smithay/smithay/e3d461a057ba244d213a8498ec372b0799cca103/LICENSE.txt",
+      "bytes": 1094,
+      "sha256": "331891ba7afe9ea12e7f9834bdb37db7abd9131183ed85215f6b4109b0303877"
+    }
+  ],
+  "host_crates": [
+    {
+      "name": "gl_generator",
+      "version": "0.14.0",
+      "url": "https://static.crates.io/crates/gl_generator/gl_generator-0.14.0.crate",
+      "bytes": 22330,
+      "sha256": "1a95dfc23a2b4a9a2f5ab41d194f8bfda3cabec42af4e39f08c339eb2a0c124d"
+    },
+    {
+      "name": "khronos_api",
+      "version": "3.1.0",
+      "url": "https://static.crates.io/crates/khronos_api/khronos_api-3.1.0.crate",
+      "bytes": 599718,
+      "sha256": "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+    },
+    {
+      "name": "log",
+      "version": "0.4.29",
+      "url": "https://static.crates.io/crates/log/log-0.4.29.crate",
+      "bytes": 51515,
+      "sha256": "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+    },
+    {
+      "name": "xml-rs",
+      "version": "0.8.28",
+      "url": "https://static.crates.io/crates/xml-rs/xml-rs-0.8.28.crate",
+      "bytes": 52826,
+      "sha256": "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
+    }
+  ],
+  "host_features": [
+    "backend_egl",
+    "renderer_gl"
+  ],
+  "target_crates": [],
+  "budgets": {
+    "max_download_bytes": 16777216,
+    "max_expanded_bytes": 33554432,
+    "max_build_bytes": 268435456,
+    "min_free_bytes": 1073741824,
+    "timeout_seconds": 180
+  },
+  "scope": "Unmodified pinned Smithay generated EGL/GLES bindings plus real static Mesa loader; not Smithay EGLContext, compositor, or COSMIC session."
+}

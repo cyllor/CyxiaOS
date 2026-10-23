@@ -1,0 +1,79 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -99,6 +99,9 @@
+ backend_egl = ["gl_generator", "libloading"]
+ # CyxiaOS static Mesa: keep the same generated API without a dynamic loader.
+ backend_egl_static = ["backend_egl"]
++# Explicit bounded CyxiaOS frontend adaptations.
++cyxia_sync_shm_drop = ["wayland_frontend"]
++cyxia_precompiled_keymap = ["wayland_frontend"]
+ backend_libinput = ["input"]
+ backend_session = []
+ backend_udev = ["udev", "input/udev"]
+--- a/src/wayland/shm/pool.rs
++++ b/src/wayland/shm/pool.rs
+@@ -5,11 +5,12 @@
+     os::unix::io::{AsFd, BorrowedFd, OwnedFd},
+     ptr,
+     sync::{
+-        LazyLock, OnceLock, RwLock,
+-        mpsc::{Sender, channel},
++        OnceLock, RwLock,
+     },
+-    thread,
+ };
++
++#[cfg(not(feature = "cyxia_sync_shm_drop"))]
++use std::{sync::{LazyLock, mpsc::{Sender, channel}}, thread};
+ 
+ use rustix::mm;
+ use tracing::{debug, instrument, trace};
+@@ -25,6 +26,7 @@
+ //
+ // To work around this problem, we spawn a separate thread whose sole purpose is dropping stuff we
+ // send it through a channel. Conveniently, Pool is already Send, so there's no problem doing this.
++#[cfg(not(feature = "cyxia_sync_shm_drop"))]
+ static DROP_THIS: LazyLock<Sender<InnerPool>> = LazyLock::new(|| {
+     let (tx, rx) = channel();
+     thread::Builder::new()
+@@ -194,7 +196,13 @@
+ 
+ impl Drop for Pool {
+     fn drop(&mut self) {
++        #[cfg(not(feature = "cyxia_sync_shm_drop"))]
+         let _ = DROP_THIS.send(self.inner.take().unwrap());
++        // The bounded CyxiaOS profile drops the actual mapping and owned fd on
++        // the compositor thread. No unbounded queue or persistent worker is
++        // created. This trades deferred-drop latency for deterministic cleanup.
++        #[cfg(feature = "cyxia_sync_shm_drop")]
++        drop(self.inner.take());
+     }
+ }
+ 
+--- a/src/input/keyboard/xkb_config.rs
++++ b/src/input/keyboard/xkb_config.rs
+@@ -11,6 +11,10 @@
+ /// [docs]: https://xkbcommon.org/doc/current/structxkb__rule__names.html
+ #[derive(Clone, Debug, Default)]
+ pub struct XkbConfig<'a> {
++    /// Complete XKB text parsed by libxkbcommon instead of resolving rules files.
++    /// Enabled only by the explicit CyxiaOS precompiled-keymap profile.
++    #[cfg(feature = "cyxia_precompiled_keymap")]
++    pub keymap_text: Option<&'a str>,
+     /// The rules file to use.
+     ///
+     /// The rules file describes how to interpret the values of the model, layout, variant and
+@@ -31,6 +35,13 @@
+ 
+ impl XkbConfig<'_> {
+     pub(crate) fn compile_keymap(&self, context: &xkb::Context) -> Result<xkb::Keymap, ()> {
++        #[cfg(feature = "cyxia_precompiled_keymap")]
++        if let Some(text) = self.keymap_text {
++            return xkb::Keymap::new_from_string(
++                context, text.to_owned(), xkb::KEYMAP_FORMAT_TEXT_V1,
++                xkb::KEYMAP_COMPILE_NO_FLAGS,
++            ).ok_or(());
++        }
+         xkb::Keymap::new_from_names(
+             context,
+             self.rules,

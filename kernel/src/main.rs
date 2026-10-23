@@ -2,11 +2,41 @@
 #![no_main]
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_contracts::*;
+#[cfg(not(feature = "selftest"))]
+mod ai;
+mod clock;
+#[cfg(all(feature = "ported", not(feature = "selftest")))]
+mod entropy;
+#[cfg(all(feature = "ported", not(feature = "selftest")))]
+mod exec_memory;
+#[cfg(feature = "graphics")]
+mod graphics;
 mod interrupts;
 #[cfg(feature = "selftest")]
 mod selftest;
+#[cfg(all(feature = "ported", not(feature = "selftest")))]
+mod shared_memory;
+#[cfg(not(feature = "selftest"))]
+mod shell;
+#[cfg(not(feature = "selftest"))]
+mod storage;
+#[cfg(not(feature = "selftest"))]
+mod user;
+#[cfg(not(feature = "selftest"))]
+mod user_heap;
+#[cfg(any(feature = "graphics", not(feature = "selftest")))]
+mod virtio_platform;
 const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
-core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/entry.S"),ram_base=const cyxia_platform_virt::RAM_BASE,entry=const cyxia_platform_virt::ENTRY,gic_base=const 0x08000000,uart_base=const 0x09000000);
+core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/entry.S"),ram_base=const cyxia_platform_virt::RAM_BASE,entry=const cyxia_platform_virt::ENTRY,gic_base=const 0x08000000,uart_base=const 0x09000000,ram_end=const cyxia_platform_virt::USER_RAM_END,ram_table_count=const cyxia_platform_virt::RAM_MIB/2,ram_tables_bytes=const cyxia_platform_virt::RAM_MIB/2*4096);
+// Versioned loader contract, retained in the ELF's read-only load segment.
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".cyxia.boot")]
+static CYXIA_BOOT_PROFILE: [u64; 3] = [
+    1,
+    cyxia_platform_virt::RAM_MIB,
+    cyxia_posix::vm::PAGE_COUNT as u64,
+];
 core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/vectors.S"));
 unsafe extern "C" {
     static __kernel_end: u8;
@@ -27,40 +57,51 @@ static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static LOG_LOSS: AtomicU64 = AtomicU64::new(0);
 fn log(s: &[u8]) {
+    if let Err(PlatformError::Again) = try_log(s) {
+        // Best-effort diagnostic caller drops this record; keep that loss visible.
+        LOG_LOSS.fetch_add(1, Ordering::Relaxed);
+        LOG_SEQUENCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1))
+            .unwrap_or_else(|_| halt());
+    }
+}
+fn try_log(s: &[u8]) -> Result<(), PlatformError> {
     let a = UART.load(Ordering::Relaxed);
     if a == 0 {
-        return;
+        return Err(PlatformError::Invalid);
     }
     let seq = LOG_SEQUENCE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1))
         .unwrap_or_else(|_| halt());
-    let mut frame = [0u8; 128];
-    let Ok(n) = cyxia_contracts::transport::encode(1, seq, s, &mut frame) else {
-        LOG_LOSS.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
     let mut uart = unsafe {
-        cyxia_driver_pl011::Pl011::new(UartResource {
+        cyxia_driver_pl011::Pl011::attach(UartResource {
             base: PhysAddr(a),
             len: 4096,
         })
     }
     .unwrap();
-    for chunk in frame[..n].chunks(64) {
-        match uart.try_write(chunk) {
-            Ok(w) => {
+    use cyxia_kernel_core::console::{TransmitError, write_frame};
+    match write_frame(&mut uart, 1, seq, s) {
+        Ok(written) => {
+            interrupts::TEST_PROGRESS
+                .bytes
+                .fetch_add(written as u64, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(TransmitError::Again) => {
+            // CPU0 foreground is the sole nonfatal writer. No byte escaped, so
+            // a later attempt can use the same sequence without an artificial gap.
+            LOG_SEQUENCE.store(seq, Ordering::Relaxed);
+            Err(PlatformError::Again)
+        }
+        Err(error) => {
+            if let TransmitError::Failed(written) = error {
                 interrupts::TEST_PROGRESS
                     .bytes
-                    .fetch_add(w as u64, Ordering::Relaxed);
-                if w != chunk.len() {
-                    LOG_LOSS.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
+                    .fetch_add(written as u64, Ordering::Relaxed);
             }
-            Err(_) => {
-                LOG_LOSS.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+            LOG_LOSS.fetch_add(1, Ordering::Relaxed);
+            Err(PlatformError::Invalid)
         }
     }
 }
@@ -75,6 +116,20 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
+    #[cfg(not(feature = "selftest"))]
+    if kind == 8 || kind == 9 {
+        if kind == 9 {
+            interrupts::handle();
+        }
+        // Only AArch64 EL0 sync/IRQ vectors may return to the suspended caller.
+        if let Some(pc) =
+            unsafe { cyxia_arch_aarch64::user::capture(f.regs, f.elr, f.spsr, f.esr, f.far, kind) }
+        {
+            f.elr = pc;
+            f.spsr = 0x3c5;
+            return;
+        }
+    }
     if kind == 5 {
         interrupts::handle();
         return;
@@ -149,8 +204,17 @@ extern "C" fn boot_entry() -> ! {
     assert_eq!(u.base.0, 0x09000000);
     assert_eq!(info.ram_count, 1);
     assert_eq!(info.ram[0].start.0, 0x40000000);
-    assert_eq!(info.ram[0].len, 256 * 1024 * 1024);
+    assert_eq!(info.ram[0].len, cyxia_platform_virt::RAM_MIB * 1024 * 1024);
     UART.store(u.base.0 + HIGH, Ordering::Relaxed);
+    // The only configuration write. Subsequent log/console handles attach without
+    // resetting incoming bytes. All console operations run on CPU0 foreground.
+    let _ = unsafe {
+        cyxia_driver_pl011::Pl011::new(UartResource {
+            base: PhysAddr(u.base.0 + HIGH),
+            len: u.len,
+        })
+    }
+    .unwrap();
     log(b"BOOT_ENTRY v1 EL1 CPU0 BOOTSTRAP\n");
     log(b"PLATFORM_OK DTB RAM UART GIC TIMER BOOTSTRAP\n");
     let sp: u64;
@@ -162,6 +226,7 @@ extern "C" fn boot_entry() -> ! {
     assert!(sp >= HIGH && boot_entry as *const () as u64 >= HIGH);
     assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);
     log(b"HIGH_VA_OK BOOTSTRAP\n");
+    clock::init(&info);
     #[cfg(feature = "selftest")]
     {
         fault_probe(cyxia_platform_virt::ENTRY, false);
@@ -176,6 +241,36 @@ extern "C" fn boot_entry() -> ! {
             panic!("pages")
         }
     }
+    #[cfg(not(feature = "selftest"))]
+    let info = {
+        let mut info = info;
+        match user_heap::init(&mut info) {
+            Ok(()) => {
+                #[cfg(not(feature = "large-memory"))]
+                log(b"USER_HEAP_RESERVED 64MiB BOOTSTRAP\n");
+                #[cfg(feature = "large-memory")]
+                log(b"USER_HEAP_RESERVED 128MiB BOOTSTRAP\n");
+            }
+            Err(_) => log(b"USER_HEAP_UNAVAILABLE BOOTSTRAP\n"),
+        }
+        #[cfg(feature = "ported")]
+        match exec_memory::init(&mut info) {
+            Ok(()) => log(b"EXEC_MEMORY_RESERVED 128MiB BOOTSTRAP\n"),
+            Err(_) => log(b"EXEC_MEMORY_UNAVAILABLE BOOTSTRAP\n"),
+        }
+        #[cfg(feature = "ported")]
+        match shared_memory::init(&mut info) {
+            Ok(()) => log(b"SHARED_MEMORY_RESERVED 16MiB BOOTSTRAP\n"),
+            Err(_) => log(b"SHARED_MEMORY_UNAVAILABLE BOOTSTRAP\n"),
+        }
+        info
+    };
+    #[cfg(feature = "graphics")]
+    graphics::init(&info);
+    #[cfg(all(feature = "ported", not(feature = "selftest")))]
+    entropy::init(&info);
+    #[cfg(not(feature = "selftest"))]
+    storage::init(&info);
     interrupts::start(&info);
 }
 fn halt() -> ! {

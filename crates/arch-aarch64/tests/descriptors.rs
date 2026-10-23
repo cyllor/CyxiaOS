@@ -33,3 +33,17 @@ fn invalid_pa_rejected() {
         );
     }
 }
+
+#[test]
+fn user_pages_are_el0_accessible_kernel_xn_and_wx_enforced() {
+    use cyxia_arch_aarch64::mmu::encode_user_leaf;
+    let rx = encode_user_leaf(cyxia_contracts::PhysAddr(0x40400000), false, true).unwrap();
+    assert_ne!(rx & (1 << 6), 0);
+    assert_ne!(rx & (1 << 7), 0);
+    assert_ne!(rx & (1 << 53), 0);
+    assert_eq!(rx & (1 << 54), 0);
+    let rw = encode_user_leaf(cyxia_contracts::PhysAddr(0x40401000), true, false).unwrap();
+    assert_eq!(rw & (1 << 7), 0);
+    assert_ne!(rw & (1 << 54), 0);
+    assert!(encode_user_leaf(cyxia_contracts::PhysAddr(0x40400000), true, true).is_err());
+}

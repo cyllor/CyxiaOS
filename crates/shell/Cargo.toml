@@ -1,0 +1,9 @@
+[package]
+name = "cyxia-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cyxia-ai-fs = { path = "../ai-fs" }
+cyxia-ai-runtime = { path = "../ai-runtime" }
+cyxia-posix = { path = "../posix" }

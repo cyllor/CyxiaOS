@@ -1,0 +1,177 @@
+--- a/meson.options
++++ b/meson.options
+@@ -920,5 +920,7 @@
+ # This opt-in profile builds genuine Mesa software implementations statically.
+ option('cyxia-static-softpipe', type : 'boolean', value : false,
+        description : 'CyxiaOS static EGL/GLES softpipe-only port')
++option('cyxia-demand-texture-cache', type : 'boolean', value : false,
++       description : 'Allocate real softpipe caches with sampler views, not all possible slots')
+ option('cyxia-probe-source', type : 'string', value : '',
+        description : 'Explicit CyxiaOS foundation probe source (empty disables)')
+--- a/meson.build
++++ b/meson.build
+@@ -160,6 +160,10 @@
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+ cyxia_static_softpipe = get_option('cyxia-static-softpipe')
++if get_option('cyxia-demand-texture-cache')
++  assert(cyxia_static_softpipe, 'Demand texture caches require the Cyxia softpipe profile')
++  pre_args += '-DCYXIA_DEMAND_TEXTURE_CACHE'
++endif
+ # The target triple describes the musl ABI, not the kernel's device ABI.
+ system_has_kms_drm = not cyxia_static_softpipe and ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
+ if cyxia_static_softpipe
+--- a/src/gallium/drivers/softpipe/sp_context.c
++++ b/src/gallium/drivers/softpipe/sp_context.c
+@@ -90,7 +90,12 @@
+ 
+    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+       for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++         /* Borrowed from the referenced view; its destructor owns the cache. */
++         softpipe->tex_cache[sh][i] = NULL;
++#else
+          sp_destroy_tex_tile_cache(softpipe->tex_cache[sh][i]);
++#endif
+          pipe_sampler_view_reference(&softpipe->sampler_views[sh][i], NULL);
+       }
+    }
+@@ -238,6 +243,7 @@
+       softpipe->cbuf_cache[i] = sp_create_tile_cache( &softpipe->pipe );
+    softpipe->zsbuf_cache = sp_create_tile_cache( &softpipe->pipe );
+ 
++#ifndef CYXIA_DEMAND_TEXTURE_CACHE
+    /* Allocate texture caches */
+    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+       for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
+@@ -246,6 +252,8 @@
+             goto fail;
+       }
+    }
++
++#endif
+ 
+    softpipe->fs_machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
+ 
+--- a/src/gallium/drivers/softpipe/sp_state_sampler.c
++++ b/src/gallium/drivers/softpipe/sp_state_sampler.c
+@@ -90,6 +90,11 @@
+ softpipe_sampler_view_destroy(struct pipe_context *pipe,
+                               struct pipe_sampler_view *view)
+ {
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++   struct sp_sampler_view *sview = (struct sp_sampler_view *)view;
++   sp_tex_tile_cache_set_sampler_view(sview->cache, NULL);
++   sp_destroy_tex_tile_cache(sview->cache);
++#endif
+    pipe_resource_reference(&view->texture, NULL);
+    FREE(view);
+ }
+@@ -118,9 +123,24 @@
+          &softpipe->tgsi.sampler[shader]->sp_sview[start + i];
+       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
+ 
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++      /* One immutable view may be bound in several slots or stages. Its cache
++       * holds only texture/format state; shader-dependent lambda stays below.
++       * No allocation can fail in this void binding callback. */
++      softpipe->tex_cache[shader][start + i] = NULL;
++      pipe_sampler_view_reference(pview, views[i]);
++      softpipe->tex_cache[shader][start + i] =
++         *pview ? ((struct sp_sampler_view *)*pview)->cache : NULL;
++      /* Retained unbound views were absent from barrier flushes. Image
++       * stores do not advance the resource timestamp; compute bindings
++       * also do not run the graphics timestamp validation path. */
++      if (*pview)
++         sp_flush_tex_tile_cache(softpipe->tex_cache[shader][start + i]);
++#else
+       pipe_sampler_view_reference(pview, views[i]);
+       sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+                                          views[i]);
++#endif
+       /*
+        * We don't really have variants, however some bits are different per shader,
+        * so just copy?
+@@ -138,9 +153,16 @@
+    }
+    for (; i < num + unbind_num_trailing_slots; i++) {
+       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++      softpipe->tex_cache[shader][start + i] = NULL;
++      memset(&softpipe->tgsi.sampler[shader]->sp_sview[start + i], 0,
++             sizeof(struct sp_sampler_view));
++      pipe_sampler_view_reference(pview, NULL);
++#else
+       pipe_sampler_view_reference(pview, NULL);
+       sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+                                          NULL);
++#endif
+    }
+ 
+ 
+--- a/src/gallium/drivers/softpipe/sp_tex_sample.c
++++ b/src/gallium/drivers/softpipe/sp_tex_sample.c
+@@ -3589,6 +3589,16 @@
+    const struct softpipe_resource *spr = (struct softpipe_resource *)resource;
+ 
+    if (sview) {
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++      /* Allocate before acquiring resource references. Returning NULL is a
++       * real Gallium creation failure, reported as GL_OUT_OF_MEMORY by the
++       * Cyxia state-tracker path; never substitute a black success result. */
++      sview->cache = sp_create_tex_tile_cache(pipe);
++      if (!sview->cache) {
++         FREE(sview);
++         return NULL;
++      }
++#endif
+       struct pipe_sampler_view *view = &sview->base;
+       *view = *templ;
+       view->reference.count = 1;
+@@ -3640,6 +3650,9 @@
+       sview->ypot = util_logbase2( resource->height0 );
+ 
+       sview->oneval = util_format_is_pure_integer(view->format) ? uif(1) : 1.0f;
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++      sp_tex_tile_cache_set_sampler_view(sview->cache, view);
++#endif
+    }
+ 
+    return (struct pipe_sampler_view *) sview;
+--- a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
++++ b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
+@@ -166,6 +166,11 @@
+ sp_flush_tex_tile_cache(struct softpipe_tex_tile_cache *tc)
+ {
+    int pos;
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++   /* Unbound sampler slots intentionally have no cache allocation. */
++   if (!tc)
++      return;
++#endif
+ 
+    if (tc->texture) {
+       /* caching a texture, mark all entries as empty */
+--- a/src/mesa/state_tracker/st_sampler_view.c
++++ b/src/mesa/state_tracker/st_sampler_view.c
+@@ -28,6 +28,9 @@
+ #include "util/u_inlines.h"
+ 
+ #include "main/context.h"
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++#include "main/errors.h"
++#endif
+ #include "main/macros.h"
+ #include "main/mtypes.h"
+ #include "main/teximage.h"
+@@ -170,6 +173,10 @@
+ out:
+    if (!locked)
+       simple_mtx_unlock(&stObj->validate_mutex);
++#ifdef CYXIA_DEMAND_TEXTURE_CACHE
++   if (!view)
++      _mesa_error(st->ctx, GL_OUT_OF_MEMORY, "Cyxia softpipe sampler view/cache");
++#endif
+    return view;
+ }
+ 

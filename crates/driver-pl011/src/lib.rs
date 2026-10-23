@@ -4,6 +4,18 @@ pub struct Pl011 {
     base: usize,
 }
 impl Pl011 {
+    /// Attach to an initialized console without resetting its receive FIFO.
+    /// # Safety
+    /// The resource must remain mapped as Device memory; callers must serialize
+    /// all access and must not initialize or reconfigure it while this handle is used.
+    pub unsafe fn attach(resource: UartResource) -> Result<Self, PlatformError> {
+        if resource.len < 0x1000 || !resource.base.0.is_multiple_of(4096) {
+            return Err(PlatformError::Invalid);
+        }
+        Ok(Self {
+            base: resource.base.0 as usize,
+        })
+    }
     /// # Safety
     /// Resource must be an exclusively owned mapped PL011 device with Device attributes.
     pub unsafe fn new(resource: UartResource) -> Result<Self, PlatformError> {
@@ -26,6 +38,17 @@ impl Pl011 {
     }
     unsafe fn write(&self, offset: usize, value: u32) {
         unsafe { core::ptr::write_volatile((self.base + offset) as *mut u32, value) }
+    }
+    pub fn try_read(&mut self) -> Result<Option<u8>, PlatformError> {
+        if unsafe { core::ptr::read_volatile((self.base + 0x18) as *const u32) } & 0x10 != 0 {
+            return Ok(None);
+        }
+        let value = unsafe { core::ptr::read_volatile(self.base as *const u32) };
+        if value & 0xf00 != 0 {
+            unsafe { self.write(4, 0) }; // Clear receive error flags; never execute a damaged command.
+            return Err(PlatformError::Invalid);
+        }
+        Ok(Some(value as u8))
     }
 }
 impl ConsoleOps for Pl011 {

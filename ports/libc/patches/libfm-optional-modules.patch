@@ -1,0 +1,32 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -30,6 +30,14 @@
+ )
+ AM_CONDITIONAL(EXTRALIB_ONLY, [test x$extra_only = xyes])
+ 
++AC_ARG_ENABLE([modules],
++    [AS_HELP_STRING([--disable-modules],
++        [omit optional dynamically loaded libfm modules])],
++    [], [enable_modules=yes])
++AS_CASE([$enable_modules], [yes|no], [],
++    [AC_MSG_ERROR([--enable-modules accepts only yes or no])])
++AM_CONDITIONAL(ENABLE_MODULES, [test x$enable_modules = xyes])
++
+ # Vala
+ AC_ARG_ENABLE(old-actions,
+     [AC_HELP_STRING([--disable-old-actions],
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -10,8 +10,10 @@
+ 	$(NULL)
+ 
+ if !EXTRALIB_ONLY
+-SUBDIRS += \
+-	modules \
++if ENABLE_MODULES
++SUBDIRS += modules
++endif
++SUBDIRS += \
+ 	tests \
+ 	$(NULL)
+ endif

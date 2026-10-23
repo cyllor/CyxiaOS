@@ -1,0 +1,148 @@
+--- a/meson.options
++++ b/meson.options
+@@ -915,3 +915,10 @@
+   value : false,
+   description : 'Build panfrost Rust components.'
+ )
++
++# CyxiaOS has a Linux userspace personality, but no KMS/DRM or dynamic loader.
++# This opt-in profile builds genuine Mesa software implementations statically.
++option('cyxia-static-softpipe', type : 'boolean', value : false,
++       description : 'CyxiaOS static EGL/GLES softpipe-only port')
++option('cyxia-probe-source', type : 'string', value : '',
++       description : 'Explicit CyxiaOS foundation probe source (empty disables)')
+--- a/meson.build
++++ b/meson.build
+@@ -159,7 +159,14 @@
+ 
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++cyxia_static_softpipe = get_option('cyxia-static-softpipe')
++# The target triple describes the musl ABI, not the kernel's device ABI.
++system_has_kms_drm = not cyxia_static_softpipe and ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++if cyxia_static_softpipe
++  assert(get_option('gallium-drivers') == ['softpipe'], 'Cyxia static profile supports softpipe only')
++  assert(get_option('vulkan-drivers').length() == 0, 'Cyxia static profile has no Vulkan device backend')
++  assert(get_option('glx') == 'disabled' and get_option('gbm').disabled(), 'Cyxia static profile requires GLX and GBM disabled')
++endif
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+@@ -361,7 +368,7 @@
+ ].contains(true)
+ 
+ with_dri = false
+-if with_gallium and (system_has_kms_drm or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin')))
++if with_gallium and (cyxia_static_softpipe or system_has_kms_drm or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin')))
+   _glx = get_option('glx')
+   _egl = get_option('egl')
+   if _glx == 'dri' or _egl.enabled() or (_glx == 'disabled' and _egl.allowed())
+@@ -2308,6 +2315,9 @@
+ if with_platform_x11
+   dep_xcb = dependency('xcb')
+   dep_xcb_xrandr = dependency('xcb-randr')
++  if cyxia_static_softpipe
++    dep_xcb_shm = dependency('xcb-shm')
++  endif
+   if with_glx == 'xlib'
+     dep_x11 = dependency('x11', version : dep_xlib_version)
+     dep_xext = dependency('xext')
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -204,7 +204,7 @@
+   c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
+ endif
+ 
+-libegl = shared_library(
++libegl = library(
+   egl_lib_name,
+   files_egl,
+   c_args : [
+@@ -217,6 +217,7 @@
+   link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
+   link_depends : [link_deps_for_egl],
+   dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
++  override_options : ['default_library=' + (cyxia_static_softpipe ? 'static' : 'shared')],
+   install : true,
+   version : egl_lib_version,
+   soversion : egl_lib_soversion,
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -39,7 +39,7 @@
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
+-libgallium_dri = shared_library(
++libgallium_dri = library(
+   libgallium_name,
+   files('dri_target.c'),
+   include_directories : [
+@@ -63,8 +63,9 @@
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+     driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+   ],
++  override_options : ['default_library=' + (cyxia_static_softpipe ? 'static' : 'shared')],
+   install : true,
+-  name_suffix : libname_suffix,
++  name_suffix : cyxia_static_softpipe ? 'a' : libname_suffix,
+ )
+ 
+ shared_glapi_lib = libgallium_dri
+--- a/src/mesa/glapi/es2api/meson.build
++++ b/src/mesa/glapi/es2api/meson.build
+@@ -22,7 +22,7 @@
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libgles2 = shared_library(
++libgles2 = library(
+   'GLESv2' + get_option('gles-lib-suffix'),
+   ['libgles2_public.c', es2_glapi_mapi_tmp_h],
+   vs_module_defs : gles2_def,
+@@ -40,6 +40,7 @@
+   version : '2.0.0',
+   darwin_versions : '3.0.0',
+   name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
++  override_options : ['default_library=' + (cyxia_static_softpipe ? 'static' : 'shared')],
+   install : true,
+ )
+ 
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -161,7 +161,8 @@
+   subdir('egl')
+ endif
+ if with_gallium
+-  if with_glx == 'dri' or with_platform_x11
++  # Legacy external DRI modules are not used by this static EGL profile.
++  if not cyxia_static_softpipe and (with_glx == 'dri' or with_platform_x11)
+     subdir('gallium/targets/dril')
+   endif
+ endif
+@@ -191,3 +192,14 @@
+ )
+ 
+ subdir('tool')
++
++# Link the actual EGL/GLES implementation and its complete Meson dependency graph.
++# No target program is executed by this build.
++if cyxia_static_softpipe and get_option('cyxia-probe-source') != ''
++  executable('cyxia-egl-probe', get_option('cyxia-probe-source'),
++    include_directories : inc_include,
++    link_with : [libegl, libgles2],
++    dependencies : [dep_x11_xcb, dep_xcb],
++    link_args : ['-Wl,--gc-sections'],
++    install : false)
++endif
+--- a/src/gallium/frontends/dri/meson.build
++++ b/src/gallium/frontends/dri/meson.build
+@@ -32,7 +32,7 @@
+   files_libdri += files('drisw.c')
+ endif
+ 
+-if with_dri2
++if with_dri2 or cyxia_static_softpipe
+   files_libdri += files('dri2.c')
+ endif
+ 

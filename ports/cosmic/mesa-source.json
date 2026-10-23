@@ -1,0 +1,184 @@
+{
+  "name": "mesa",
+  "version": "26.2.3",
+  "source_url": "https://archive.mesa3d.org/mesa-26.2.3.tar.xz",
+  "expected_sha256": "1628058a8d2c0615975de5a15ab7bbb9638c50000b5bed9456ff423ea034a81f",
+  "source_commit": "31e9a6b2e95e30d84bf3177d1f497d063e59b6b2",
+  "source_git_url": "https://gitlab.freedesktop.org/mesa/mesa.git",
+  "archive_root": "mesa-26.2.3",
+  "license_file": "docs/license.rst",
+  "license_description": "MIT and per-file licenses; preserve upstream source notices and license.rst",
+  "hash_source": "https://docs.mesa3d.org/relnotes/26.2.3.html",
+  "depends_on": [
+    "libX11",
+    "libxcb",
+    "zlib"
+  ],
+  "scope": "Real softpipe EGL/GLES3 candidate for AArch64 musl; cross-build success is not guest EGL or COSMIC acceptance",
+  "source_max_bytes": 100663296,
+  "source_bytes": 68561540,
+  "expanded_max_bytes": 1073741824,
+  "host_python": [
+    "Mako==1.3.10",
+    "MarkupSafe==3.0.3",
+    "packaging==26.0",
+    "PyYAML==6.0.3"
+  ],
+  "patches": [
+    "ports/cosmic/patches/mesa-26.2.3-cyxia-static-softpipe.patch",
+    "ports/cosmic/patches/mesa-26.2.3-cyxia-demand-texture-cache.patch",
+    "ports/cosmic/patches/mesa-26.2.3-cyxia-compute-oom.patch",
+    "ports/cosmic/patches/mesa-26.2.3-cyxia-nir-small-slabs.patch"
+  ],
+  "candidate": {
+    "gallium_drivers": [
+      "softpipe"
+    ],
+    "llvm": false,
+    "glx": false,
+    "platforms": [
+      "x11",
+      "surfaceless"
+    ],
+    "loading": "explicit static library packaging and upstream dispatch; no dynamic-loading success stubs",
+    "guest_runtime_verified": false,
+    "texture_cache": "Real 16-entry caches owned by sampler views; no eager allocation for unbound slots"
+  },
+  "target_uapi": {
+    "version": "6.12",
+    "source_commit": "adc218676eef25575469234709c2d87185ca223a",
+    "source_url": "https://raw.githubusercontent.com/torvalds/linux/adc218676eef25575469234709c2d87185ca223a/",
+    "architecture": "arm64",
+    "files": {
+      "linux/types.h": {
+        "source_path": "include/uapi/linux/types.h",
+        "sha256": "fed77a624a108eef218c82bc29a9f3565a3e517a9cec327d7adeb89e1ca0417c"
+      },
+      "asm-generic/types.h": {
+        "source_path": "include/uapi/asm-generic/types.h",
+        "sha256": "e768a8355242ccf2c18e629ff7cebd9cbeda19e7f6823e16f163efa02ce29d35"
+      },
+      "asm-generic/int-ll64.h": {
+        "source_path": "include/uapi/asm-generic/int-ll64.h",
+        "sha256": "faca16150492e943a43c83e6b3069531dd498ef15dc612fb2051b88f7da83afc"
+      },
+      "asm/bitsperlong.h": {
+        "source_path": "arch/arm64/include/uapi/asm/bitsperlong.h",
+        "sha256": "84fc9dd6bb62530cda94516a8cc023483dcfc29ba55566c0a551b98159da400e"
+      },
+      "asm-generic/bitsperlong.h": {
+        "source_path": "include/uapi/asm-generic/bitsperlong.h",
+        "sha256": "fa25db88dc972820b72f8baf9cea6f39ca7f5bd0cf39182089409f6676fa90b6"
+      },
+      "linux/posix_types.h": {
+        "source_path": "include/uapi/linux/posix_types.h",
+        "sha256": "bc68636a383418f235d3457e4b21cf27cefc7c7f3edea4c1f6706f1018db196f"
+      },
+      "linux/stddef.h": {
+        "source_path": "include/uapi/linux/stddef.h",
+        "sha256": "c398fab40ff99f811d1e2f7e894a5e3ef961434bfc1d8c8919639295ac77fd2a"
+      },
+      "asm/posix_types.h": {
+        "source_path": "arch/arm64/include/uapi/asm/posix_types.h",
+        "sha256": "ef6ce264aa33309c5b69ad09c2bd293c9bb79a6fc2c3cd22f34dbbd8f5acfb1f"
+      },
+      "asm-generic/posix_types.h": {
+        "source_path": "include/uapi/asm-generic/posix_types.h",
+        "sha256": "059c34f03abc8247a9ad9fbbfc86b12f56b9b620a81fa3b84c0c7dd9214068ab"
+      },
+      "linux/ioctl.h": {
+        "source_path": "include/uapi/linux/ioctl.h",
+        "sha256": "ba73b5892de6605e6c40b151820e367dfcb98cbdb3f8f468c5ef2bd8437df873"
+      },
+      "asm-generic/ioctl.h": {
+        "source_path": "include/uapi/asm-generic/ioctl.h",
+        "sha256": "5764a3378f017c826ab55382386c5e477c8c8d34ff026cc9e02cff10f2a23bdb"
+      },
+      "linux/futex.h": {
+        "source_path": "include/uapi/linux/futex.h",
+        "sha256": "8482b5e9522268e617e155fd85e1fad3137eb4c0e6672ebb34c07c4c322d5438"
+      },
+      "linux/memfd.h": {
+        "source_path": "include/uapi/linux/memfd.h",
+        "sha256": "e8d31a91125828cee9e0c723c12e71011017047cf708278eeffc0ab23340eaeb"
+      },
+      "asm-generic/hugetlb_encode.h": {
+        "source_path": "include/uapi/asm-generic/hugetlb_encode.h",
+        "sha256": "5729768670c725f24359cea8da0e5520fbdff157c3303a54b1e00797a96aa943"
+      },
+      "linux/fcntl.h": {
+        "source_path": "include/uapi/linux/fcntl.h",
+        "sha256": "7986f796768373c01ae19564fa4c1c7fec1dc239eff53d42577384d6a2ea0016"
+      },
+      "asm/fcntl.h": {
+        "source_path": "arch/arm64/include/uapi/asm/fcntl.h",
+        "sha256": "6d43602d5db08d4f4acda256ba09009c43b9d93b9283ad9dd75ce7c9dd2b6864"
+      },
+      "asm-generic/fcntl.h": {
+        "source_path": "include/uapi/asm-generic/fcntl.h",
+        "sha256": "0908276bc4c3da9314d4986bd07c19f9ce8f403f602d40a8be0599249db95515"
+      },
+      "linux/openat2.h": {
+        "source_path": "include/uapi/linux/openat2.h",
+        "sha256": "1c694c33d2d60cb8767c34bf52e536dc9e30dc78b90cbeaf73ac9c6b2271a23c"
+      }
+    },
+    "generic_wrappers": {
+      "asm/types.h": "asm-generic/types.h",
+      "asm/ioctl.h": "asm-generic/ioctl.h"
+    },
+    "provenance": {
+      "scripts/headers_install.sh": "67588ef43a09b582cda5105db6c8072da12b14fca3d6334093b0726542ac65e4",
+      "scripts/unifdef.c": "3d3523b648e4f8a76d443e8b3e0bc9b1a286a24736dc12c21c6d8379ff265dde",
+      "scripts/Makefile.asm-headers": "a41518fb74c884e12f0b6a3addb974d13d76f008582f4e0e7c332a5e8201e325",
+      "include/uapi/asm-generic/Kbuild": "7f798a9dee418ae8169e28cfcfd4646cfdbf265e74907ce99191c1029a5cc1c0",
+      "arch/arm64/include/uapi/asm/Kbuild": "80ea7d9bb46731c0ddf368714430e69508fa0e1489779ac0d2fdda2f2351955f",
+      "LICENSES/exceptions/Linux-syscall-note": "8e378ab93586eb55135d3bc119cce787f7324f48394777d00c34fa3d0be3303f",
+      "LICENSES/preferred/GPL-2.0": "f6b78c087c3ebdf0f3c13415070dd480a3f35d8fc76f3d02180a407c1c812f79"
+    },
+    "scope": "Exported UAPI types/constants only; no Linux kernel code or device implementation"
+  },
+  "target_cxx": {
+    "source_commit": "87f0227cb60147a26a1eeb4fb06e3b505e9c7261",
+    "packages": [
+      {
+        "name": "libcxx",
+        "version": "20.1.8",
+        "source_url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/libcxx-20.1.8.src.tar.xz",
+        "expected_sha256": "3e12992e3d1a0e648dc2e1c8c6b1dd31717ac8e684a25a302773667f47f75546",
+        "source_bytes": 4455756,
+        "source_max_bytes": 8388608,
+        "expanded_max_bytes": 134217728,
+        "archive_root": "libcxx-20.1.8.src",
+        "license_file": "LICENSE.TXT",
+        "hash_source": "https://api.github.com/repos/llvm/llvm-project/releases/tags/llvmorg-20.1.8"
+      },
+      {
+        "name": "libcxxabi",
+        "version": "20.1.8",
+        "source_url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/libcxxabi-20.1.8.src.tar.xz",
+        "expected_sha256": "b4f6d3f9c802ea9e5db260e3e13177f63e8f8feef48618a8d53d4f7d4fcbb07f",
+        "source_bytes": 585796,
+        "source_max_bytes": 8388608,
+        "expanded_max_bytes": 134217728,
+        "archive_root": "libcxxabi-20.1.8.src",
+        "license_file": "LICENSE.TXT",
+        "hash_source": "https://api.github.com/repos/llvm/llvm-project/releases/tags/llvmorg-20.1.8"
+      }
+    ],
+    "sources": [
+      "libcxx/src/new.cpp",
+      "libcxx/src/new_helpers.cpp",
+      "libcxx/src/new_handler.cpp",
+      "libcxx/src/mutex.cpp",
+      "libcxx/src/mutex_destructor.cpp",
+      "libcxx/src/hash.cpp",
+      "libcxx/src/verbose_abort.cpp",
+      "libcxx/src/system_error.cpp",
+      "libcxxabi/src/cxa_guard.cpp",
+      "libcxxabi/src/cxa_virtual.cpp",
+      "libcxxabi/src/abort_message.cpp"
+    ],
+    "scope": "Actual upstream libc++/libc++abi implementation subset required by Mesa; no exceptions/RTTI/unwinder; not a complete general C++ standard library"
+  }
+}
