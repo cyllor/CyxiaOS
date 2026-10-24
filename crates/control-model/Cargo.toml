@@ -1,0 +1,4 @@
+[package]
+name = "cyxia-control-model"
+version.workspace = true
+edition.workspace = true

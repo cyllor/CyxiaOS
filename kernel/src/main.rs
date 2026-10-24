@@ -1,5 +1,12 @@
 #![no_std]
 #![no_main]
+#[cfg(all(
+    feature = "smp-selftest",
+    any(feature = "ported", feature = "graphics", feature = "large-memory")
+))]
+compile_error!("smp-selftest cannot certify the CPU0-only desktop/ported profile");
+#[cfg(feature = "smp-selftest")]
+mod smp;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_contracts::*;
 #[cfg(not(feature = "selftest"))]
@@ -11,8 +18,9 @@ mod entropy;
 mod exec_memory;
 #[cfg(feature = "graphics")]
 mod graphics;
+#[cfg_attr(feature = "smp-selftest", allow(dead_code))]
 mod interrupts;
-#[cfg(feature = "selftest")]
+#[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
 mod selftest;
 #[cfg(all(feature = "ported", not(feature = "selftest")))]
 mod shared_memory;
@@ -39,20 +47,26 @@ static CYXIA_BOOT_PROFILE: [u64; 3] = [
 ];
 core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/vectors.S"));
 unsafe extern "C" {
+    #[cfg(not(feature = "smp-selftest"))]
     static __kernel_end: u8;
+    #[cfg(not(feature = "smp-selftest"))]
     static __stack_guard: u8;
     static exception_vectors: u8;
-    #[cfg(feature = "selftest")]
+    #[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
     static probe_read_fault: u8;
+    #[cfg(not(feature = "smp-selftest"))]
     static probe_write_fault: u8;
-    #[cfg(feature = "selftest")]
+    #[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
     fn probe_read(p: u64);
-    #[cfg(feature = "selftest")]
+    #[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
     fn probe_write(p: u64);
 }
 static UART: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "smp-selftest"))]
 static EXPECTED_PC: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "smp-selftest"))]
 static EXPECTED_FAR: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "smp-selftest"))]
 static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static LOG_LOSS: AtomicU64 = AtomicU64::new(0);
@@ -116,6 +130,15 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
+    #[cfg(feature = "smp-selftest")]
+    {
+        smp::exception(f, kind);
+    }
+    #[cfg(not(feature = "smp-selftest"))]
+    exception_dispatch_primary(f, kind);
+}
+#[cfg(not(feature = "smp-selftest"))]
+fn exception_dispatch_primary(f: &mut ExceptionFrame, kind: u64) {
     #[cfg(not(feature = "selftest"))]
     if kind == 8 || kind == 9 {
         if kind == 9 {
@@ -162,6 +185,7 @@ extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
     log(b"FAIL unexpected exception\n");
     halt()
 }
+#[cfg(not(feature = "smp-selftest"))]
 fn hex(v: u64) {
     let mut b = *b"0000000000000000\n";
     for (i, x) in b[..16].iter_mut().enumerate() {
@@ -169,7 +193,7 @@ fn hex(v: u64) {
     }
     log(&b);
 }
-#[cfg(feature = "selftest")]
+#[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
 fn fault_probe(addr: u64, write: bool) {
     EXPECTED_FAR.store(addr, Ordering::Relaxed);
     EXPECTED_PC.store(
@@ -227,6 +251,13 @@ extern "C" fn boot_entry() -> ! {
     assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);
     log(b"HIGH_VA_OK BOOTSTRAP\n");
     clock::init(&info);
+    #[cfg(feature = "smp-selftest")]
+    smp::run(&info);
+    #[cfg(not(feature = "smp-selftest"))]
+    primary_services(info)
+}
+#[cfg(not(feature = "smp-selftest"))]
+fn primary_services(info: BootInfo) -> ! {
     #[cfg(feature = "selftest")]
     {
         fault_probe(cyxia_platform_virt::ENTRY, false);
@@ -280,6 +311,10 @@ fn halt() -> ! {
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    #[cfg(feature = "smp-selftest")]
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        smp::fatal(99);
+    }
     log(b"FAIL panic\n");
     halt()
 }

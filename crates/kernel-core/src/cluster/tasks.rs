@@ -253,6 +253,9 @@ impl<const T: usize> Book<T> {
         Ok(())
     }
     pub fn query(&self, task: ObjectId, activation: u64) -> Result<(Status, Option<Outcome>)> {
+        if self.poisoned {
+            return Err(Error::Reconcile);
+        }
         let i = self.index(task, activation)?;
         let e = self.entries[i].ok_or(Error::NotReady)?;
         let status = if self.recovered[i] && e.status == Status::Running {
@@ -349,7 +352,7 @@ impl<const T: usize> Book<T> {
         let mut next = self.entries;
         next[i] = Some(e);
         self.save(store, next)?;
-        let permit = match endpoint.begin(lease, active, lease.consumer, now) {
+        let permit = match endpoint.begin(lease, ledger, active, lease.consumer, now) {
             Ok(p) => p,
             Err(error) => {
                 e.status = Status::NotStarted;

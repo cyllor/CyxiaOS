@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/contracts", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2", "crates/driver-virtio", "crates/ai-fs", "crates/ai-runtime", "crates/shell", "crates/posix", "kernel"]
-default-members = ["crates/contracts", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2", "crates/driver-virtio", "crates/ai-fs", "crates/ai-runtime", "crates/shell", "crates/posix"]
+members = ["crates/contracts", "crates/control-model", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2", "crates/driver-virtio", "crates/ai-fs", "crates/ai-runtime", "crates/shell", "crates/posix", "kernel"]
+default-members = ["crates/contracts", "crates/control-model", "crates/kernel-core", "crates/arch-aarch64", "crates/platform-virt", "crates/driver-pl011", "crates/driver-gicv2", "crates/driver-virtio", "crates/ai-fs", "crates/ai-runtime", "crates/shell", "crates/posix"]
 
 [workspace.package]
 version = "0.1.0"

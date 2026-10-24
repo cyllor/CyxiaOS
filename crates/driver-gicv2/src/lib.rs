@@ -37,6 +37,29 @@ impl Gic {
         }
         Ok(g)
     }
+    /// Attach a secondary CPU without resetting the shared distributor/SPIs.
+    /// # Safety
+    /// Primary initialization must be complete. This CPU exclusively owns its
+    /// banked PPI registers and CPU interface; both MMIO ranges are Device-mapped.
+    pub unsafe fn attach_cpu(r: GicResource) -> Result<Self, PlatformError> {
+        if r.distributor_len < 4096 || r.cpu_len < 4096 {
+            return Err(PlatformError::Invalid);
+        }
+        let mut g = Self {
+            dist: r.distributor.0 as usize,
+            cpu: r.cpu.0 as usize,
+            lines: 0,
+        };
+        unsafe {
+            g.lines = (32 * ((g.read(g.dist, 4) & 31) + 1)).min(1020);
+            g.write(g.dist, 0x180, 0xffff0000); // banked PPIs only
+            g.write(g.dist, 0x280, 0xffff0000);
+            g.write(g.cpu, 4, 0xff);
+            g.write(g.cpu, 8, 0);
+            g.write(g.cpu, 0, 1);
+        }
+        Ok(g)
+    }
     unsafe fn read(&self, base: usize, offset: usize) -> u32 {
         unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
     }

@@ -1,0 +1,1 @@
+CyxiaOS.core-head.experimental.v1;le64;input44;output24;monotonic-sample-window-start-end;exact-epochs-masks;features64-Q15:pressure,latency,benefit,business_pressure,reserved4,cpu8x(online,control,protected_control,protected_business,spare,efficiency,reserved);output:all-five-epochs-and-window,hold-grow-shrink-logits,desired-mask;no-implicit-authority
