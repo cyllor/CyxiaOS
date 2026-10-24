@@ -13,6 +13,8 @@ use cyxia_prototype::{
 mod ipi;
 #[path = "domain_platform/irq_metrics.rs"]
 mod irq_metrics;
+#[path = "domain_platform/read_snapshot.rs"]
+pub(crate) mod read_snapshot;
 pub use ipi::{consume_ipi, ipi_enter, ipi_result, register_ipi_cpu, request_ipi};
 use irq_metrics::{Histogram, Snapshot};
 const IRQ_SLOTS: usize = 32;
@@ -67,6 +69,26 @@ const TIMER_SERVICE: ObjectKey = ObjectKey {
 };
 static mut TIMER_POLICY: Option<(ApplyId, PolicyStamp, u16)> = None;
 static TIMER_USED_VERSION: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone,Copy)]
+struct ControlView {
+    published_ns:u64,measurement_core:u64,
+    irq:[Option<[u64;4]>;IRQ_SLOTS],timer:Option<[u64;4]>,soft_timers:usize,
+    timer_policy:Option<(ApplyId,PolicyStamp,u16)>,
+}
+static CONTROL_VIEW:read_snapshot::ReadSnapshot<ControlView>=read_snapshot::ReadSnapshot::new();
+fn owner_view()->ControlView{
+    owner();
+    ControlView{published_ns:now_ns(),measurement_core:unsafe{*core::ptr::addr_of!(WINDOW_CORE)},
+        irq:unsafe{*core::ptr::addr_of!(IRQ_MEASUREMENTS)},timer:unsafe{*core::ptr::addr_of!(TIMER_MEASUREMENTS)},
+        soft_timers:unsafe{(&*core::ptr::addr_of!(TIMERS)).soft_observation().0},timer_policy:unsafe{*core::ptr::addr_of!(TIMER_POLICY)}}
+}
+fn publish_view(){let _=CONTROL_VIEW.publish(owner_view());}
+fn read_view()->Result<ControlView,Error>{
+    if cpu::slot()==0{return Ok(owner_view())}
+    let view=CONTROL_VIEW.read().map_err(|_|Error::Busy)?.ok_or(Error::NotReady)?;
+    let now=now_ns();if now<view.published_ns || now-view.published_ns>50_000_000{return Err(Error::NotReady)}
+    Ok(view)
+}
 fn owner() {
     assert_eq!(cpu::slot(), 0);
 }
@@ -151,6 +173,7 @@ pub fn init(info: &BootInfo) -> Result<(), Error> {
         *core::ptr::addr_of_mut!(WINDOW_AT) = now_ns();
     }
     READY.store(true, Ordering::Release);
+    publish_view();
     Ok(())
 }
 pub fn publish_context(core: u64, ledger: u64, business: u64, draining: u64) -> Result<(), Error> {
@@ -491,6 +514,7 @@ pub fn register_timer(
         (*core::ptr::addr_of_mut!(TIMER_KEYS))[i] = Some(key);
         (*core::ptr::addr_of_mut!(CALLBACKS))[i] = Some(callback);
     }
+    publish_view();
     Ok(())
 }
 pub fn arm_timer(key: ObjectKey, deadline: u64, now: u64) -> Result<TimerArm, Error> {
@@ -568,6 +592,7 @@ pub fn poll(now: u64) -> Result<(), Error> {
         sample_observations(now);
         Ok(())
     })();
+    publish_view();
     POLLING.store(false, Ordering::Release);
     result
 }
@@ -646,10 +671,10 @@ fn sample_observations(now: u64) {
     }
 }
 fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
-    owner();
+    if !READY.load(Ordering::Acquire){return None}
     if domain == 7 {
         return (ordinal == 0
-            && unsafe { (&*core::ptr::addr_of!(TIMERS)).soft_observation().0 } != 0)
+            && read_view().ok()?.soft_timers != 0)
             .then_some(TIMER_SERVICE);
     }
     (0..COUNT.load(Ordering::Acquire))
@@ -658,27 +683,27 @@ fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
         .and_then(|i| registered_irq(i).map(|v| v.0))
 }
 fn control_observe(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
-    owner();
+    let view=read_view()?;
+    if view.measurement_core!=CORE_GENERATION.load(Ordering::Acquire){return Err(Error::NotReady)}
     if domain == 7 {
         if key != TIMER_SERVICE {
             return Err(Error::Stale);
         }
-        return unsafe { *core::ptr::addr_of!(TIMER_MEASUREMENTS) }.ok_or(Error::NotReady);
+        return view.timer.ok_or(Error::NotReady);
     }
     if key.generation != 1 {
         return Err(Error::Stale);
     }
     let i = slot(u32::try_from(key.id).map_err(|_| Error::Range)?)?;
-    unsafe { (*core::ptr::addr_of!(IRQ_MEASUREMENTS))[i] }.ok_or(Error::NotReady)
+    view.irq[i].ok_or(Error::NotReady)
 }
 fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error> {
-    owner();
     if domain == 7 {
         if key != TIMER_SERVICE {
             return Err(Error::Stale);
         }
         return Ok(Action::SoftCoalesce(
-            unsafe { *core::ptr::addr_of!(TIMER_POLICY) }
+            read_view()?.timer_policy
                 .filter(|(_, s, _)| s.live(now_ns()))
                 .map_or(0, |(_, _, v)| v),
         ));
@@ -691,10 +716,9 @@ fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error>
     ))
 }
 fn control_legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
-    owner();
     action.validate()?;
     match action {
-        Action::SoftCoalesce(_) if key == TIMER_SERVICE && timer_observation().0 != 0 => Ok(()),
+        Action::SoftCoalesce(_) if key == TIMER_SERVICE && read_view()?.soft_timers != 0 => Ok(()),
         Action::IrqTarget(cpu) if key.generation == 1 => {
             let i = slot(u32::try_from(key.id).map_err(|_| Error::Range)?)?;
             let t = topology(i)?;
@@ -729,6 +753,7 @@ fn control_apply(
     stamp: PolicyStamp,
     now: u64,
 ) -> Result<ExecutionState, Error> {
+    owner();
     control_legal(action, apply.target, now)?;
     match action {
         Action::IrqTarget(target) => {
@@ -747,6 +772,7 @@ fn control_apply(
             unsafe {
                 *core::ptr::addr_of_mut!(TIMER_POLICY) = Some((apply, stamp, value));
             }
+            publish_view();
             Ok(ExecutionState::Pending)
         }
         _ => Err(Error::Unsupported),

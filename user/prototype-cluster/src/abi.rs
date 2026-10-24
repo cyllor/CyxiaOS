@@ -26,6 +26,9 @@ pub const OP_STORE_FLUSH: u64 = 9;
 pub const OP_TASK: u64 = 10;
 pub const OP_TRACE: u64 = 11;
 pub const OP_YIELD: u64 = 12;
+/// OP_TRACE arg0 distinguishes a terminal service failure from an ordinary event.
+/// This is a value convention; the shared page layout and ABI version are unchanged.
+pub const TRACE_FATAL_BIT: u64 = 1 << 63;
 /// POLL value: 0 disconnected, 1 connected. Epoch changes on every connection.
 /// STORE offset selects a record chunk; arg0 record key; arg1 total record
 /// bytes. PUT arg2 transaction phase: 0 stage,1 commit after complete staging.

@@ -64,6 +64,41 @@ fn expiration_never_reduces_existing_promises() {
     assert_eq!(b.set_commitment(key(), 250, POLICY_NS), Err(Error::Busy));
     assert!(b.reserve(key(), 1_000_000, POLICY_NS).is_ok());
 }
+#[test]
+fn read_only_optional_projection_keeps_owner_state_and_existing_promises() {
+    for committed in [50, 200] {
+        let mut b = BackgroundBudgets::new();
+        b.register(key(), 400, committed, 0).unwrap();
+        b.install(key(), 400, PolicyStamp::new(1, 0, 0).unwrap(), 0)
+            .unwrap();
+        let old = b.status(key()).unwrap();
+        let projected = b.peek_status(key(), POLICY_NS).unwrap();
+        assert_eq!(
+            projected.budget_milli,
+            if committed <= 100 { 100 } else { 400 }
+        );
+        assert_eq!(projected.freeze_admission, committed > 100);
+        assert_eq!(b.status(key()).unwrap(), old);
+        assert_eq!(b.peek_status(key(), POLICY_NS).unwrap(), projected);
+        assert_eq!(b.current_status(key(), POLICY_NS).unwrap(), projected);
+    }
+}
+#[test]
+fn read_only_optional_projection_cannot_settle_debits_or_clear_overruns() {
+    let mut b = BackgroundBudgets::new();
+    b.register(key(), 100, 0, 0).unwrap();
+    let credit = b.reserve(key(), 10, WINDOW_NS - 5).unwrap();
+    let held = b.status(key()).unwrap();
+    assert_eq!(b.peek_status(key(), WINDOW_NS), Err(Error::Busy));
+    assert_eq!(b.status(key()).unwrap(), held);
+    assert_eq!(b.complete(credit, 11, WINDOW_NS + 6), Err(Error::Budget));
+    let settled = b.status(key()).unwrap();
+    let projected = b.peek_status(key(), WINDOW_NS + 7).unwrap();
+    assert_eq!(projected.spent_ns, 11);
+    assert!(projected.overrun && projected.freeze_admission);
+    assert_eq!(b.status(key()).unwrap(), settled);
+    assert_eq!(b.current_status(key(), WINDOW_NS + 7).unwrap(), projected);
+}
 #[derive(Default)]
 struct Service {
     starts: usize,

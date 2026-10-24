@@ -1,7 +1,8 @@
-//! CPU0 owns publication. Isolated EL0 scores immutable candidates; executors
+//! Control CPUs own proposal publication. Isolated EL0 scores immutable candidates; executors
 //! report real completion independently, with no inference in business paths.
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cyxia_prototype::{
+    domains::stability::{Boundary, Guard as StabilityGuard, ServiceWindow, WindowOutcome},
     domains::{Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS},
     features::{RawFeatures, TargetFeatures},
     policy::{
@@ -45,18 +46,12 @@ pub struct Context {
 #[derive(Clone, Copy)]
 struct Desired {
     action: Action,
-    previous: Action,
     apply: ApplyId,
     stamp: PolicyStamp,
     state: ExecutionState,
     execution_observed: bool,
     started: bool,
     published: u64,
-    last_change: u64,
-    direction: i8,
-    reversal_start: u64,
-    reversals: u8,
-    frozen: bool,
     evidence: usize,
     job: u64,
     dependencies: [Option<BoundDependency>; 2],
@@ -66,6 +61,8 @@ struct Desired {
 struct Owner {
     families: [Option<Family>; 18],
     desired: [Option<Desired>; 512],
+    stability: [Option<StabilityGuard>; 512],
+    stability_high: usize,
     context: Context,
     prepared: [usize; 16],
     prepared_count: usize,
@@ -74,6 +71,7 @@ struct Owner {
     execution_observers: [Option<ExecutionObserver>; 16],
 }
 struct Job {
+    cpu: usize,
     set: CandidateSet,
     sequence: u64,
     controller: u64,
@@ -100,6 +98,8 @@ static mut STATE: State = State {
     owner: Owner {
         families: [None; 18],
         desired: [None; 512],
+        stability: [None; 512],
+        stability_high: 0,
         context: Context {
             core_generation: 0,
             ledger_generation: 0,
@@ -130,7 +130,7 @@ impl Drop for Guard {
     }
 }
 fn with<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
-    if cyxia_arch_aarch64::cpu::slot() != 0 {
+    if cyxia_arch_aarch64::cpu::slot() >= 4 {
         return Err(Error::Auth);
     }
     if CLAIMED
@@ -144,6 +144,16 @@ fn with<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
 }
 fn now() -> u64 {
     crate::domain_platform::now_ns()
+}
+fn require_control(owner: &Owner) -> Result<(), Error> {
+    let bit = 1u64 << cyxia_arch_aarch64::cpu::slot();
+    if owner.context.control_mask & owner.context.healthy_mask & !owner.context.draining_mask & bit
+        == 0
+    {
+        Err(Error::Auth)
+    } else {
+        Ok(())
+    }
 }
 fn family_index(domain: u16, kind: u16) -> Result<usize, Error> {
     match (domain, kind) {
@@ -257,7 +267,7 @@ pub fn register_execution_observer(domain: u16, observer: ExecutionObserver) -> 
         Ok(())
     })
 }
-fn execution_blocks_replacement(d: Desired) -> bool {
+fn execution_blocks_replacement(d: &Desired) -> bool {
     !d.state.terminal() || d.state == ExecutionState::Applied && !d.execution_observed
 }
 fn observe_execution(s: &mut State, d: &mut Desired) {
@@ -351,12 +361,76 @@ pub fn publish_context(context: Context) -> Result<(), Error> {
     })
 }
 fn locate(owner: &Owner, action: Action, key: ObjectKey) -> Option<usize> {
-    owner.desired.iter().position(|d| {
-        d.is_some_and(|d| {
-            d.action.domain() == action.domain()
-                && d.action.kind() == action.kind()
-                && d.apply.target == key
+    locate_family(owner, action.domain(), action.kind(), key)
+}
+fn locate_family(owner: &Owner, domain: u16, kind: u16, key: ObjectKey) -> Option<usize> {
+    owner.stability[..owner.stability_high]
+        .iter()
+        .position(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(|guard| guard.family() == (domain, kind) && guard.target() == key)
         })
+}
+fn ensure_stability(
+    owner: &mut Owner,
+    action: Action,
+    key: ObjectKey,
+    at: u64,
+) -> Result<usize, Error> {
+    if let Some(slot) = locate(owner, action, key) {
+        return Ok(slot);
+    }
+    let slot = owner.stability[..owner.stability_high]
+        .iter()
+        .enumerate()
+        .position(|(i, guard)| guard.is_none() && owner.desired[i].is_none())
+        .unwrap_or(owner.stability_high);
+    if slot == owner.stability.len() {
+        return Err(Error::Capacity);
+    }
+    owner.stability[slot] = Some(StabilityGuard::new(key, action, at)?);
+    owner.stability_high = owner.stability_high.max(slot + 1);
+    Ok(slot)
+}
+/// A protected service owner freezes its measurement bounds before the first
+/// window. There are no synthetic default throughput or latency observations.
+pub fn register_service_boundary(
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+    boundary: Boundary,
+    starts_at_ns: u64,
+) -> Result<(), Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    with(|s| {
+        let f = s.owner.families[family_index(domain, kind)?].ok_or(Error::NotReady)?;
+        let current = (f.current)(domain, kind, target)?;
+        let at = now();
+        let slot = ensure_stability(&mut s.owner, current, target, at)?;
+        s.owner.stability[slot]
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .register_boundary(boundary, starts_at_ns, at)
+    })
+}
+/// Consume owner-measured complete windows; partial and missing evidence never
+/// becomes a successful service-boundary observation. Freeze preserves APPLY.
+pub fn observe_service_window(window: ServiceWindow) -> Result<WindowOutcome, Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    with(|s| {
+        let f =
+            s.owner.families[family_index(window.domain, window.kind)?].ok_or(Error::NotReady)?;
+        let current = (f.current)(window.domain, window.kind, window.target)?;
+        let slot = locate(&s.owner, current, window.target).ok_or(Error::NotReady)?;
+        s.owner.stability[slot]
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .observe_service(window, now())
     })
 }
 fn tiers(current: Action) -> ([Option<Action>; 32], usize) {
@@ -465,9 +539,72 @@ fn categorical(action: Action) -> bool {
         Action::IrqTarget(_) | Action::RecoveryRecipe(_) | Action::Placement(_)
     )
 }
+fn validate_selection(
+    owner: &Owner,
+    f: Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+) -> Result<(), Error> {
+    let slot = locate(owner, action, target).ok_or(Error::Stale)?;
+    let guard = owner.stability[slot].as_ref().ok_or(Error::Stale)?;
+    let current = (f.current)(action.domain(), action.kind(), target)?;
+    if action == current {
+        return Ok(());
+    }
+    if guard.frozen() {
+        return Err(Error::Busy);
+    }
+    if categorical(action) {
+        return Ok(());
+    }
+    let hold = if matches!(action, Action::ControlSet(_) | Action::UnauthRate(_)) {
+        1_000_000_000
+    } else {
+        WINDOW_NS
+    };
+    if at.saturating_sub(guard.last_change_ns()) < hold {
+        return Err(Error::Busy);
+    }
+    let (options, n) = tiers(current);
+    let mut legal = [None; 32];
+    let mut count = 0;
+    for option in options[..n].iter().flatten().copied() {
+        match (f.legal)(option, target, at) {
+            Ok(()) => {
+                legal[count] = Some(option);
+                count += 1;
+            }
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Stale
+                | Error::NotFound),
+            ) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    legal[..count].sort_unstable_by_key(|a| a.map(Action::order));
+    let previous = legal[..count]
+        .iter()
+        .position(|a| *a == Some(current))
+        .ok_or(Error::Stale)?;
+    let selected = legal[..count]
+        .iter()
+        .position(|a| *a == Some(action))
+        .ok_or(Error::Conflict)?;
+    if selected.abs_diff(previous) != 1 {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
 fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
     // The current evaluation has not started yet. Other released slots count
     // only when their registered owner exposes an actual, unblocked object.
+    // A released evaluation does not require the object's policy to be read
+    // here a second time. Fresh observations, current policy, legality and
+    // dependencies are checked when that queued evaluation actually starts.
     // Each mandatory evaluation includes its frozen 2 ms + 0.5 ms bound.
     let mut jobs = 1u64;
     for index in 0..18 {
@@ -482,11 +619,8 @@ fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
         else {
             continue;
         };
-        let Ok(current) = (f.current)(f.domain, f.kind, target) else {
-            continue;
-        };
-        if locate(&s.owner, current, target)
-            .and_then(|i| s.owner.desired[i])
+        if locate_family(&s.owner, f.domain, f.kind, target)
+            .and_then(|i| s.owner.desired[i].as_ref())
             .is_some_and(execution_blocks_replacement)
         {
             continue;
@@ -497,6 +631,7 @@ fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
 }
 pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
     with(|s| {
+        require_control(&s.owner)?;
         if s.boot == 0 || s.job.is_some() || s.registry.optimization_stopped() {
             return Ok(None);
         }
@@ -506,7 +641,7 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
                 .change_publisher(s.registry.publisher(), publisher(controller_epoch))?;
         }
         let start_cursor = s.family_cursor;
-        for turn in 0..18 {
+        'families: for turn in 0..18 {
             let index = (start_cursor + turn) % 18;
             if started < s.due[index] {
                 continue;
@@ -543,10 +678,14 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
                 Err(Error::Busy | Error::Again | Error::NotReady) => continue,
                 Err(e) => return Err(e),
             };
-            let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i]);
+            let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
             if old.is_some_and(execution_blocks_replacement) {
                 continue;
             }
+            let stability_slot = ensure_stability(&mut s.owner, current, target, started)?;
+            let stability = s.owner.stability[stability_slot]
+                .as_ref()
+                .ok_or(Error::Stale)?;
             let dependencies = match bind_dependencies(&s.owner, current, target, started) {
                 Ok(v) => v,
                 Err(
@@ -558,9 +697,19 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             let mut legal = [None; 32];
             let mut legal_count = 0;
             for option in options[..n].iter().flatten() {
-                if (f.legal)(*option, target, started).is_ok() {
-                    legal[legal_count] = Some(*option);
-                    legal_count += 1;
+                match (f.legal)(*option, target, started) {
+                    Ok(()) => {
+                        legal[legal_count] = Some(*option);
+                        legal_count += 1;
+                    }
+                    Err(
+                        Error::Busy
+                        | Error::Again
+                        | Error::NotReady
+                        | Error::Stale
+                        | Error::NotFound,
+                    ) => continue 'families,
+                    Err(_) => {}
                 }
             }
             legal[..legal_count].sort_unstable_by_key(|a| a.map(Action::order));
@@ -575,7 +724,7 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             } else {
                 WINDOW_NS
             };
-            let held = started.saturating_sub(old.map_or(s.started, |d| d.last_change)) >= hold;
+            let held = started.saturating_sub(stability.last_change_ns()) >= hold;
             let queued_wcet_us = queued_control_wcet_us(s, index, started);
             let mut choices = [Candidate {
                 action: current,
@@ -584,14 +733,20 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             let mut count = 0;
             for (i, action) in legal[..legal_count].iter().flatten().copied().enumerate() {
                 if action != current
-                    && (old.is_some_and(|d| d.frozen)
+                    && (stability.frozen()
                         || (!categorical(action) && (!held || i.abs_diff(current_index) > 1)))
                 {
                     continue;
                 }
                 let mut target_features = match (f.target_features)(action, target) {
                     Ok(v) => v,
-                    Err(Error::Busy | Error::Again | Error::NotReady) => continue,
+                    Err(
+                        Error::Busy
+                        | Error::Again
+                        | Error::NotReady
+                        | Error::Stale
+                        | Error::NotFound,
+                    ) => continue 'families,
                     Err(e) => return Err(e),
                 };
                 if let Action::ControlSet(mask) = action {
@@ -716,6 +871,7 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             crate::domain_evidence::begin(evidence, &input, hash.finalize().into());
             s.sequence = sequence;
             s.job = Some(Job {
+                cpu: cyxia_arch_aarch64::cpu::slot(),
                 set,
                 sequence,
                 controller: controller_epoch,
@@ -742,6 +898,7 @@ struct Executor<'a> {
     job: u64,
     boot: u64,
     publication_started: u64,
+    wall_deadline: u64,
     dependencies: [Option<BoundDependency>; 2],
 }
 impl policy::Executor for Executor<'_> {
@@ -759,28 +916,23 @@ impl policy::Executor for Executor<'_> {
             return Err(Error::Stale);
         }
         if let Some(i) = locate(self.owner, d.action, d.envelope.target) {
-            let old = self.owner.desired[i].ok_or(Error::Stale)?;
-            if execution_blocks_replacement(old) {
-                return Err(Error::Busy);
-            }
-            let current = (f.current)(d.action.domain(), d.action.kind(), d.envelope.target)?;
-            if old.frozen && current != d.action {
+            if self.owner.desired[i]
+                .as_ref()
+                .is_some_and(execution_blocks_replacement)
+            {
                 return Err(Error::Busy);
             }
         }
+        validate_selection(self.owner, f, d.action, d.envelope.target, now)?;
         Ok(())
     }
     fn prepare(&mut self, plan: &Plan, _: u64) -> Result<(), Error> {
         self.owner.prepared_count = 0;
         for d in plan.iter() {
-            let i = locate(self.owner, d.action, d.envelope.target)
-                .or_else(|| {
-                    self.owner.desired.iter().enumerate().position(|(i, d)| {
-                        d.is_none()
-                            && !self.owner.prepared[..self.owner.prepared_count].contains(&i)
-                    })
-                })
-                .ok_or(Error::Capacity)?;
+            let i = locate(self.owner, d.action, d.envelope.target).ok_or(Error::Stale)?;
+            if self.owner.prepared[..self.owner.prepared_count].contains(&i) {
+                return Err(Error::Conflict);
+            }
             self.owner.prepared[self.owner.prepared_count] = i;
             self.owner.prepared_count += 1;
         }
@@ -797,6 +949,7 @@ impl policy::Executor for Executor<'_> {
             let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                 .ok_or(Error::Unsupported)?;
             (f.legal)(d.action, d.envelope.target, now)?;
+            validate_selection(self.owner, f, d.action, d.envelope.target, now)?;
             if bind_dependencies(self.owner, d.action, d.envelope.target, now)? != self.dependencies
             {
                 return Err(Error::Stale);
@@ -805,11 +958,11 @@ impl policy::Executor for Executor<'_> {
         Ok(())
     }
     fn publish(&mut self, plan: &Plan, version: u64, at: u64) -> Result<(), Error> {
+        require_control(self.owner)?;
         if self.owner.prepared_count != plan.len() {
             return Err(Error::Conflict);
         }
         let mut stamps = [PolicyStamp::default(); 16];
-        let mut previous = [Action::CpuWeight(1); 16];
         for (index, d) in plan.iter().enumerate() {
             stamps[index] = PolicyStamp::new(
                 version,
@@ -828,13 +981,15 @@ impl policy::Executor for Executor<'_> {
             )?;
             let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                 .ok_or(Error::Unsupported)?;
-            previous[index] = (f.current)(d.action.domain(), d.action.kind(), d.envelope.target)?;
+            validate_selection(self.owner, f, d.action, d.envelope.target, at)?;
         }
         let commit_ns = now();
         if commit_ns < at {
             return Err(Error::Range);
         }
-        if plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns) {
+        if commit_ns > self.wall_deadline
+            || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
+        {
             return Err(Error::Expired);
         }
         if commit_ns.saturating_sub(self.publication_started) > policy::PUBLICATION_BUDGET_NS {
@@ -842,11 +997,9 @@ impl policy::Executor for Executor<'_> {
         }
         for (index, d) in plan.iter().enumerate() {
             let slot = self.owner.prepared[index];
-            let old = self.owner.desired[slot];
             let stamp = stamps[index];
             self.owner.desired[slot] = Some(Desired {
                 action: d.action,
-                previous: previous[index],
                 apply: ApplyId {
                     boot_epoch: self.boot,
                     controller_epoch: plan.header.controller_epoch,
@@ -859,11 +1012,6 @@ impl policy::Executor for Executor<'_> {
                 execution_observed: false,
                 started: false,
                 published: commit_ns,
-                last_change: old.map_or(0, |d| d.last_change),
-                direction: old.map_or(0, |d| d.direction),
-                reversal_start: old.map_or(at, |d| d.reversal_start),
-                reversals: old.map_or(0, |d| d.reversals),
-                frozen: old.is_some_and(|d| d.frozen),
                 evidence: self.evidence,
                 job: self.job,
                 dependencies: self.dependencies,
@@ -890,6 +1038,10 @@ impl policy::Executor for Executor<'_> {
 }
 pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
     with(|s| {
+        require_control(&s.owner)?;
+        if s.job.as_ref().ok_or(Error::Stale)?.cpu != cyxia_arch_aarch64::cpu::slot() {
+            return Err(Error::Auth);
+        }
         let job = s.job.take().ok_or(Error::Stale)?;
         let begin = now();
         let mut selected = u64::MAX;
@@ -983,12 +1135,14 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 job: job.sequence,
                 boot: s.boot,
                 publication_started: begin,
+                wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 dependencies: job.dependencies,
             };
-            let receipt = s.registry.submit_bounded(
+            let receipt = s.registry.submit_job(
                 publisher(job.controller),
                 &bytes[..n],
                 begin,
+                job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut NativeClock,
                 &mut executor,
             )?;
@@ -1043,6 +1197,12 @@ pub fn pending_job() -> Result<bool, Error> {
 }
 pub fn abort(cpu_ns: u64) -> Result<(), Error> {
     with(|s| {
+        if s.job
+            .as_ref()
+            .is_some_and(|job| job.cpu != cyxia_arch_aarch64::cpu::slot())
+        {
+            return Err(Error::Auth);
+        }
         if let Some(job) = s.job.take() {
             crate::domain_evidence::finish(
                 job.evidence,
@@ -1061,17 +1221,20 @@ pub fn abort(cpu_ns: u64) -> Result<(), Error> {
         Ok(())
     })
 }
-pub fn poll(at: u64) -> Result<(), Error> {
+pub fn poll(_at: u64) -> Result<(), Error> {
     with(|s| {
-        for scanned in 0..s.owner.desired.len() {
-            let i = (s.owner.poll_cursor + scanned) % s.owner.desired.len();
+        // A control CPU may have completed publication since CPU0 captured
+        // its outer-loop timestamp. APPLY and stability use a fresh clock.
+        let at = now();
+        for scanned in 0..s.owner.stability_high {
+            let i = (s.owner.poll_cursor + scanned) % s.owner.stability_high;
             let Some(mut d) = s.owner.desired[i] else {
                 continue;
             };
-            if d.state.terminal() && !execution_blocks_replacement(d) {
+            if d.state.terminal() && !execution_blocks_replacement(&d) {
                 continue;
             }
-            s.owner.poll_cursor = (i + 1) % s.owner.desired.len();
+            s.owner.poll_cursor = (i + 1) % s.owner.stability_high;
             if d.state == ExecutionState::Applied {
                 observe_execution(s, &mut d);
                 s.owner.desired[i] = Some(d);
@@ -1127,27 +1290,6 @@ pub fn poll(at: u64) -> Result<(), Error> {
                     d.state = ExecutionState::Failed(Error::Again);
                 }
             }
-            if d.state == ExecutionState::Applied && d.previous != d.action {
-                d.last_change = at;
-                let direction = match d.action.order().cmp(&d.previous.order()) {
-                    core::cmp::Ordering::Greater => 1,
-                    core::cmp::Ordering::Less => -1,
-                    _ => 0,
-                };
-                if at.saturating_sub(d.reversal_start) >= 1_000_000_000 {
-                    d.reversal_start = at;
-                    d.reversals = 0;
-                }
-                if direction != 0 && d.direction != 0 && direction != d.direction {
-                    d.reversals = d.reversals.saturating_add(1);
-                    if d.reversals > 4 {
-                        d.frozen = true;
-                    }
-                }
-                if direction != 0 {
-                    d.direction = direction;
-                }
-            }
             s.owner.desired[i] = Some(d);
             ADMISSION.publish(
                 i,
@@ -1161,22 +1303,33 @@ pub fn poll(at: u64) -> Result<(), Error> {
             );
             s.registry.reconcile(d.apply, d.stamp.version, d.state)?;
             crate::domain_evidence::progress(d.evidence, d.job, d.stamp.version, d.state, at);
+            let stability_result = s.owner.stability[i]
+                .as_mut()
+                .ok_or(Error::Stale)
+                .and_then(|guard| guard.observe_execution(d.stamp.version, d.action, d.state, at));
+            if let Err(error) = stability_result {
+                s.registry.stop_optimization();
+                crate::domain_evidence::stability_failed(d.action.domain(), d.stamp.version, error);
+            }
             observe_execution(s, &mut d);
             s.owner.desired[i] = Some(d);
             break;
         }
         // Reclaim only an owner-proven dead, terminal object; unknown work is pinned.
-        for i in 0..s.owner.desired.len() {
-            if let Some(d) = s.owner.desired[i]
-                && d.state.terminal()
+        for i in 0..s.owner.stability_high {
+            if let Some(guard) = s.owner.stability[i].as_ref()
+                && s.owner.desired[i]
+                    .as_ref()
+                    .is_none_or(|d| d.state.terminal())
             {
-                let f = s.owner.families[family_index(d.action.domain(), d.action.kind())?]
-                    .ok_or(Error::Unsupported)?;
+                let (domain, kind) = guard.family();
+                let f = s.owner.families[family_index(domain, kind)?].ok_or(Error::Unsupported)?;
                 if matches!(
-                    (f.current)(d.action.domain(), d.action.kind(), d.apply.target),
+                    (f.current)(domain, kind, guard.target()),
                     Err(Error::Stale | Error::NotFound)
                 ) {
                     s.owner.desired[i] = None;
+                    s.owner.stability[i] = None;
                     ADMISSION.retire(i);
                     break;
                 }

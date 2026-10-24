@@ -1,7 +1,12 @@
+import hashlib
+import json
+from pathlib import Path
 import struct
+import subprocess
+import tempfile
 import unittest
 
-from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, IPI_MAGIC, UNIFIED_MAGIC, diagnostics, parse_control, parse_ipi, parse_tasks, parse_unified
+from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_ipi, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
 
 
 def encode(values):
@@ -16,6 +21,29 @@ def control():
 
 
 class EvidenceParserTests(unittest.TestCase):
+    def source_build(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+        for name in ("kernel/src/smp.rs", "crates/arch-aarch64/src/user.rs", "Cargo.lock", "tools/build_unified.py"):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("source fixture\n")
+        sources = code_source_map(root)
+        digest = hashlib.sha256(json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        data = {
+            "schema_version": 1, "status": "BUILT_NOT_RUN", "profiles": {"selftest": True},
+            "own_private_key_only_verified": True, "code_source_map": sources,
+            "code_source_sha256": digest, "builder_sha256": sha(root / "tools/build_unified.py"),
+            "artifacts": {"node-a.elf": {"sha256": "a" * 64}, "node-b.elf": {"sha256": "b" * 64}},
+            "nodes": {"a": {"node_id": "a" * 64, "peer_node_id": "b" * 64},
+                      "b": {"node_id": "b" * 64, "peer_node_id": "a" * 64}},
+        }
+        path = root / "build-manifest.json"
+        path.write_text(json.dumps(data))
+        return path, root, data
+
     def test_truncated_capture_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "size"):
             parse_control(encode(control())[:-8])
@@ -54,6 +82,18 @@ class EvidenceParserTests(unittest.TestCase):
         values = [0] * 512
         values[0:2] = [UNIFIED_MAGIC, 7]
         with self.assertRaisesRegex(ValueError, "enabled ordinary EL0 file probe"):
+            parse_unified(encode(values))
+
+    def test_completed_probe_does_not_hide_cluster_service_fatal(self):
+        values = [0] * 512
+        values[0:2] = [UNIFIED_MAGIC, 7]
+        values[6] = 2
+        values[16:21] = [1, 4096, 4, 1, 0]
+        values[32:36] = [1, 1, 0x107, 2]
+        with self.assertRaisesRegex(ValueError, "fatal event"):
+            parse_unified(encode(values))
+        values[34] = (1 << 63) | 0x500
+        with self.assertRaisesRegex(ValueError, "fatal event"):
             parse_unified(encode(values))
 
     def test_business_core_quarantine_cannot_hide_behind_control_progress(self):
@@ -104,6 +144,39 @@ class EvidenceParserTests(unittest.TestCase):
         values[9] = 1
         self.assertTrue(parse_ipi(encode(values))["wake_verified"])
 
+    def test_c_credit_receipt_rejects_even_when_periodic_task_record_is_clean(self):
+        receipt = [0] * 64
+        receipt[:2] = [CONTROL_CREDIT_MAGIC, 1]
+        receipt[2:24] = [2, 1, 7, 1, 9, 900_000_000, 900_010_000,
+                          902_600_000, 2_500_000, 2_590_000, 5_000_000,
+                          5_090_000, 5_000_000, 5_090_000, 6, 120,
+                          700_000, 900_011_000, 2, 1, 1, 7]
+        parsed = parse_control_credit(encode(receipt))
+        self.assertEqual(parsed[0]["actual_ns"], 2_590_000)
+        self.assertEqual(parsed[0]["last_phase"], 6)
+        guest = {}
+        with self.assertRaisesRegex(ValueError, "native C credit failure"):
+            diagnostics(guest, {"UNIFIED_EVIDENCE": encode([0] * 512),
+                                "CONTROL_CREDIT_EVIDENCE": encode(receipt),
+                                "DOMAIN_TASK_EVIDENCE": encode([0] * 32)})
+        self.assertEqual(guest["control_credit"], parsed)
+
+    def test_incomplete_c_credit_failure_is_not_a_successful_capture(self):
+        receipt = [0] * 64
+        receipt[24] = 1
+        with self.assertRaisesRegex(ValueError, "native C credit failure"):
+            diagnostics({}, {"UNIFIED_EVIDENCE": encode([0] * 512),
+                             "CONTROL_CREDIT_EVIDENCE": encode(receipt)})
+
+    def test_runtime_sticky_control_fault_survives_partial_snapshot(self):
+        runtime = [0] * 1024
+        runtime[:3] = [RUNTIME_MAGIC, 3, 5]
+        runtime[38] = 1
+        with self.assertRaisesRegex(ValueError, "control worker fault count 1"):
+            parse_runtime(encode(runtime))
+        runtime[38] = 0
+        self.assertIsNone(parse_runtime(encode(runtime)))
+
     def test_ipi_receipt_must_have_real_handler_and_consume(self):
         values = [0] * 512
         values[:5] = [IPI_MAGIC, 1, 15, 1, 3]
@@ -114,6 +187,26 @@ class EvidenceParserTests(unittest.TestCase):
         values[13] = 2
         with self.assertRaisesRegex(ValueError, "IPI receipt error 2"):
             parse_ipi(encode(values))
+
+    def test_build_binding_checks_actual_source_and_image_not_only_manifest(self):
+        path, root, data = self.source_build()
+        proof = verify_source_build(path, root, ["a" * 64, "b" * 64])
+        self.assertEqual(proof["code_source_sha256"], data["code_source_sha256"])
+        with self.assertRaisesRegex(ValueError, "image differs"):
+            verify_source_build(path, root, ["a" * 64, "c" * 64])
+        (root / "kernel/src/smp.rs").write_text("changed after build\n")
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            verify_source_build(path, root, ["a" * 64, "b" * 64])
+
+    def test_build_binding_rejects_unbound_source_and_same_node_identity(self):
+        path, root, data = self.source_build()
+        data["nodes"]["b"] = data["nodes"]["a"]
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "distinct reciprocal identities"):
+            verify_source_build(path, root, ["a" * 64, "b" * 64])
+        (root / "kernel/src/new.rs").write_text("new compiled source\n")
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            verify_source_build(path, root, ["a" * 64, "b" * 64])
 
 
 if __name__ == "__main__":

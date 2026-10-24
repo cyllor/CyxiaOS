@@ -26,6 +26,19 @@ static mut SYNC_BINS: [u64; 64] = [0; 64];
 static mut SYNC_WINDOW: u64 = 0;
 static FS_ID: AtomicU64 = AtomicU64::new(0);
 static FS_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy)]
+struct FileView {
+    at: u64,
+    metrics: Metrics,
+    cache: [u64; 4],
+    action: Action,
+    action_until: u64,
+    cache_until: Option<u64>,
+    backing: Option<(u64, u32)>,
+    fsync_p99: u64,
+}
+static FILE_VIEW: crate::domain_platform::read_snapshot::ReadSnapshot<FileView> =
+    crate::domain_platform::read_snapshot::ReadSnapshot::new();
 const NOTIFIERS: usize = 2;
 pub const NET_NOTIFY: usize = 1;
 pub const RNG_NOTIFY: usize = 2;
@@ -63,6 +76,16 @@ fn with_files<R>(f: impl FnOnce(&mut FileSystem<4096>) -> Result<R, Error>) -> R
     publish(files);
     r
 }
+/// Loaded inode metadata remains on its actual CPU0 owner. Control workers use
+/// FILE_VIEW instead and therefore cannot make the file pump Busy by reading.
+fn read_files<R>(f: impl FnOnce(&FileSystem<4096>) -> Result<R, Error>) -> Result<R, Error> {
+    owner()?;
+    ready_read()?;
+    BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| Error::Busy)?;
+    let _guard = Guard;
+    unsafe { f(&*core::ptr::addr_of!(FILES)) }
+}
 fn publish(files: &FileSystem<4096>) {
     let m = files.metrics();
     let c = files.cache_usage();
@@ -92,6 +115,32 @@ fn publish(files: &FileSystem<4096>) {
         METRICS[i].store(v, Ordering::Relaxed);
     }
     METRICS[18].store(now, Ordering::Release);
+    let (base, len) = files.cache_backing();
+    let backing = Board
+        .physical(base, len)
+        .ok()
+        .map(|pa| (pa, (len / 4096) as u32));
+    let _ = FILE_VIEW.publish(FileView {
+        at: now,
+        metrics: m,
+        cache: c.map(|n| n as u64),
+        action: files.current_action(now),
+        action_until: files.policy_deadline_ns(),
+        cache_until: files.cache_partition_deadline_ns(),
+        backing,
+        fsync_p99: METRICS[15].load(Ordering::Acquire),
+    });
+}
+fn file_view(now: u64) -> Result<FileView, Error> {
+    ready_read()?;
+    let view = FILE_VIEW
+        .read()
+        .map_err(|_| Error::Busy)?
+        .ok_or(Error::NotReady)?;
+    if now < view.at || now - view.at >= 50_000_000 {
+        return Err(Error::Busy);
+    }
+    Ok(view)
 }
 pub fn init() -> Result<(), Error> {
     owner()?;
@@ -118,6 +167,9 @@ pub fn init() -> Result<(), Error> {
 }
 fn ready() -> Result<(), Error> {
     owner()?;
+    ready_read()
+}
+fn ready_read() -> Result<(), Error> {
     if READY.load(Ordering::Acquire) {
         Ok(())
     } else {
@@ -142,16 +194,23 @@ pub fn cache_usage() -> [u64; 4] {
     core::array::from_fn(|i| METRICS[i].load(Ordering::Acquire))
 }
 pub fn cache_partition_status() -> Result<[u64; 4], Error> {
-    ready()?;
-    with_files(|f| Ok(f.cache_usage().map(|v| v as u64)))
+    let now = Board.now_ns();
+    let view = file_view(now)?;
+    if view.cache_until.is_some_and(|until| now >= until) {
+        return Err(Error::Busy);
+    }
+    Ok(view.cache)
 }
 pub fn cache_backing() -> Result<(u64, u32), Error> {
-    ready()?;
-    with_files(|f| {
-        let (va, len) = f.cache_backing();
-        let pa = Board.physical(va, len).map_err(|_| Error::Range)?;
-        Ok((pa, (len / 4096) as u32))
-    })
+    ready_read()?;
+    // The static physical span cannot change during this boot. Startup may
+    // inspect it before periodic service refreshes mutable admission facts.
+    FILE_VIEW
+        .read()
+        .map_err(|_| Error::Busy)?
+        .ok_or(Error::NotReady)?
+        .backing
+        .ok_or(Error::NotReady)
 }
 pub fn set_cache_partition(pages: u32, batch: u16) -> Result<(), Error> {
     ready()?;
@@ -169,21 +228,23 @@ pub fn set_cache_partition_expiring(
 }
 pub fn cache_reclaim_turn() -> Result<usize, Error> {
     ready()?;
-    with_files(|f| Ok(f.reclaim_cache()))
+    let freed = with_files(|f| Ok(f.reclaim_cache()))?;
+    storage::refresh_control_observation(Board.now_ns())?;
+    Ok(freed)
 }
 pub fn validate_file_object(key: ObjectKey) -> Result<(), Error> {
-    ready()?;
-    if storage::facts()[31] != 0 {
+    ready_read()?;
+    if storage::facts_read()?[31] != 0 {
         return Err(Error::Io);
     }
-    with_files(|f| f.stat_object(key).map(|_| ()))
+    read_files(|f| f.stat_object(key).map(|_| ()))
 }
 pub fn stat_file_object(key: ObjectKey) -> Result<u64, Error> {
-    ready()?;
-    if storage::facts()[31] != 0 {
+    ready_read()?;
+    if storage::facts_read()?[31] != 0 {
         return Err(Error::Io);
     }
-    with_files(|f| f.stat_object(key).map(|v| v.size))
+    read_files(|f| f.stat_object(key).map(|v| v.size))
 }
 pub fn read_cache_page(key: ObjectKey, page: u64, out: &mut [u8; 4096]) -> Result<(), Error> {
     ready()?;
@@ -481,7 +542,8 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
     let now = Board.now_ns();
     match domain {
         4 => {
-            let m = metrics();
+            let view = file_view(now)?;
+            let m = view.metrics;
             let total = m.read_bytes.saturating_add(m.write_bytes);
             Ok([
                 if total == 0 {
@@ -490,7 +552,7 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
                     ((u128::from(m.read_bytes) * 1000) / u128::from(total)) as u64
                 },
                 u64::from(m.dirty_pages),
-                METRICS[15].load(Ordering::Acquire),
+                view.fsync_p99,
                 if m.readahead_pages == 0 {
                     0
                 } else {
@@ -500,7 +562,7 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
             ])
         }
         9 => {
-            let f = storage::facts();
+            let f = storage::facts_read()?;
             let total = f[10].saturating_add(f[11]);
             let recent = now / 100_000_000 == f[28] / 100_000_000;
             Ok([
@@ -515,7 +577,7 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
             ])
         }
         11 if slot == 0 => {
-            let f = storage::facts();
+            let f = storage::facts_read()?;
             Ok([
                 f[21],
                 f[24],
@@ -547,7 +609,17 @@ pub fn current_action(domain: u16, key: ObjectKey) -> Result<Action, Error> {
     let slot = target_slot(domain, key)?;
     let now = Board.now_ns();
     match domain {
-        4 => with_files(|f| Ok(f.current_action(now))),
+        4 => {
+            let view = file_view(now)?;
+            Ok(if now < view.action_until {
+                view.action
+            } else {
+                Action::Filesystem {
+                    readahead: 0,
+                    flush: 4,
+                }
+            })
+        }
         9 => storage::current_io_action(now),
         11 if slot == 0 => Ok(Action::NotifyBatch(storage::current_notify_batch(now)?)),
         11 => Ok(Action::NotifyBatch(
@@ -557,21 +629,21 @@ pub fn current_action(domain: u16, key: ObjectKey) -> Result<Action, Error> {
     }
 }
 pub fn validate_action(action: Action, key: ObjectKey, now: u64) -> Result<(), Error> {
-    ready()?;
+    ready_read()?;
     action.validate()?;
     let slot = target_slot(action.domain(), key)?;
     match action {
         Action::Filesystem { readahead, flush } => {
-            let c = cache_usage();
+            let c = cache_partition_status()?;
             if u64::from(readahead) > c[2] || u64::from(flush) > c[3] {
                 return Err(Error::Capacity);
             }
-            if storage::facts()[31] != 0 {
+            if storage::facts_read()?[31] != 0 {
                 return Err(Error::Io);
             }
         }
         Action::IoShare(_) => {
-            let f = storage::facts();
+            let f = storage::facts_read()?;
             if f[2] < 2 {
                 return Err(Error::Capacity);
             }
@@ -581,7 +653,7 @@ pub fn validate_action(action: Action, key: ObjectKey, now: u64) -> Result<(), E
         }
         Action::NotifyBatch(v) => {
             let (cap, failed) = if slot == 0 {
-                let f = storage::facts();
+                let f = storage::facts_read()?;
                 (f[2], f[31])
             } else {
                 let d = &DEVICES[slot - 1];
@@ -689,6 +761,7 @@ pub fn apply(
     stamp: PolicyStamp,
     now: u64,
 ) -> Result<ExecutionState, Error> {
+    owner()?;
     validate_action(action, id.target, now)?;
     let slot = index(action, id.target)?;
     if let Some(old) = unsafe { (*core::ptr::addr_of!(INSTALLED))[slot] } {
@@ -751,13 +824,13 @@ pub fn register_control() -> Result<(), Error> {
 }
 
 fn dependencies(key: ObjectKey) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error> {
-    ready()?;
+    ready_read()?;
     if enumerate_target(4, 0) != Some(key) {
         return Err(Error::Stale);
     }
     let memory = crate::domain_tasks::memory_key()?;
     let disk = enumerate_target(9, 0).ok_or(Error::NotReady)?;
-    if storage::facts()[31] != 0 {
+    if storage::facts_read()?[31] != 0 {
         return Err(Error::Io);
     }
     Ok([

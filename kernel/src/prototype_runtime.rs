@@ -911,7 +911,7 @@ pub(super) fn stop_turn(worker: &mut Worker) {
     {
         // A returned EL0 context is not yet a stop proof while its CPU bill or
         // a task/PTE owner remains in custody. Each operation is retried later.
-        if !native::settle(worker)
+        if !native::stop_ready(worker)
             || crate::domain_tasks::close_cpu(2).is_err()
             || !crate::domain_tasks::quiescent(2)
         {

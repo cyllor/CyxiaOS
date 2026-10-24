@@ -124,7 +124,7 @@ pub fn close() {
     let _ = request(OP_CLOSE, &[], &mut [], 0, [0; 3]);
 }
 pub fn fatal(code: u64) -> ! {
-    trace(code);
+    trace(TRACE_FATAL_BIT | code);
     loop {
         yield_now();
     }

@@ -7,4 +7,5 @@ pub mod filesystem;
 pub mod io;
 pub mod maintenance;
 pub mod platform;
+pub mod stability;
 pub mod tasks;

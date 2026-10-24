@@ -235,6 +235,28 @@ impl Scheduler {
             250
         })
     }
+    /// Validity of a read-only copy of current_action. Window transitions and
+    /// TTL can change it without a new policy installation; no grant is made.
+    pub fn control_view_until_ns(&self, now: u64) -> Result<u64, Error> {
+        let next_window = (now / WINDOW_NS)
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(WINDOW_NS))
+            .ok_or(Error::Overflow)?;
+        let policy_end = if self.window == Some(now / WINDOW_NS) {
+            if self.window_version != 0 {
+                self.window_until
+            } else {
+                0
+            }
+        } else {
+            self.stamp.installed_until_ns
+        };
+        Ok(if policy_end > now {
+            next_window.min(policy_end)
+        } else {
+            next_window
+        })
+    }
     pub fn usage(&self) -> Usage {
         self.usage
     }

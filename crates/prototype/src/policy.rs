@@ -554,6 +554,19 @@ impl Registry {
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
+        self.submit_job(publisher, bytes, started_ns, u64::MAX, clock, executor)
+    }
+    /// A control job may have a tighter wall deadline than its snapshot TTL.
+    /// Recheck it after every fallible validation callback, before publication.
+    pub fn submit_job<E: Executor, C: Clock>(
+        &mut self,
+        publisher: Publisher,
+        bytes: &[u8],
+        started_ns: u64,
+        wall_deadline_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
         let plan = policy_wire::decode_plan(bytes)?;
         self.authorize(publisher)?;
         if plan.header.controller_epoch != publisher.controller_epoch {
@@ -623,6 +636,9 @@ impl Registry {
         let first = clock.now_ns();
         let mut prepared = false;
         let result = (|| {
+            if first > wall_deadline_ns {
+                return Err(Error::Expired);
+            }
             self.validate(&plan, first, executor)?;
             publication_budget(started_ns, first)?;
             prepared = true;
@@ -639,9 +655,10 @@ impl Registry {
             if publish_ns < now {
                 return Err(Error::Range);
             }
-            if plan
-                .iter()
-                .any(|d| publish_ns > d.envelope.expires_local_ns)
+            if publish_ns > wall_deadline_ns
+                || plan
+                    .iter()
+                    .any(|d| publish_ns > d.envelope.expires_local_ns)
             {
                 return Err(Error::Expired);
             }
@@ -668,7 +685,9 @@ impl Registry {
         // Once PUBLISH succeeded it cannot be represented as a rejected plan,
         // even if its callback exceeded the cap. Retain the real receipt and
         // stop further optimization while existing APPLY/RECONCILE continues.
-        if publication_budget(started_ns, clock.now_ns()).is_err()
+        let finished_ns = clock.now_ns();
+        if publication_budget(started_ns, finished_ns).is_err()
+            || record.receipt.version != 0 && finished_ns > wall_deadline_ns
             || matches!(result, Err(Error::Budget | Error::Range))
         {
             self.optimization_stopped = true;

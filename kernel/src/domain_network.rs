@@ -15,6 +15,50 @@ struct Desired {
     stamp: PolicyStamp,
 }
 static READY: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy)]
+struct ReadView {
+    published_ns: u64,
+    ready: bool,
+    network: Option<(u64, ObjectKey)>,
+    effective: [Option<Desired>; 3],
+    feedback: DomainFeedback,
+}
+static READ_VIEW: crate::domain_platform::read_snapshot::ReadSnapshot<ReadView> =
+    crate::domain_platform::read_snapshot::ReadSnapshot::new();
+fn owner_view() -> ReadView {
+    owner();
+    ReadView {
+        published_ns: crate::domain_platform::now_ns(),
+        ready: READY.load(Ordering::Acquire),
+        network: unsafe { *core::ptr::addr_of!(NETWORK) },
+        effective: unsafe { *core::ptr::addr_of!(EFFECTIVE) },
+        feedback: unsafe { *core::ptr::addr_of!(FEEDBACK) },
+    }
+}
+fn publish_view() {
+    let _ = READ_VIEW.publish(owner_view());
+}
+// Keep the fresh CPU0 owner copy out of the control reader's stack frame. C
+// projects only the fields it needs from the immutable published observation.
+#[inline(never)]
+fn inspect_owner<R>(inspect: impl FnOnce(&ReadView) -> Result<R, Error>) -> Result<R, Error> {
+    inspect(&owner_view())
+}
+fn inspect_view<R>(inspect: impl FnOnce(&ReadView) -> Result<R, Error>) -> Result<R, Error> {
+    if cyxia_arch_aarch64::cpu::slot() == 0 {
+        return inspect_owner(inspect);
+    }
+    READ_VIEW
+        .inspect(|view| {
+            let now = crate::domain_platform::now_ns();
+            if now < view.published_ns || now - view.published_ns > 50_000_000 {
+                return Err(Error::NotReady);
+            }
+            inspect(view)
+        })
+        .map_err(|_| Error::Busy)?
+        .ok_or(Error::NotReady)?
+}
 // This is the endpoint which actually owns the current ciphertext prefix.
 // It changes only after the previous TCP generation has been retired.
 static mut NETWORK: Option<(u64, ObjectKey)> = None;
@@ -81,12 +125,12 @@ pub fn bind_network(epoch: u64, endpoint: Option<ObjectKey>) -> Result<(), Error
             *core::ptr::addr_of_mut!(NETWORK) = None;
         }
     }
+    publish_view();
     Ok(())
 }
 fn network_dependencies(
     key: ObjectKey,
 ) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error> {
-    owner();
     if key
         != (ObjectKey {
             id: abi::TX_SERVICE_ID,
@@ -95,7 +139,9 @@ fn network_dependencies(
     {
         return Err(Error::Stale);
     }
-    let (epoch, target) = unsafe { *core::ptr::addr_of!(NETWORK) }.ok_or(Error::NotReady)?;
+    let (epoch, target) = inspect_view(|view| view.network.ok_or(Error::NotReady))?;
+    // The snapshot gate is released before consulting the actual endpoint
+    // owner, so it never nests an executor's gate under the read projection.
     if crate::domain_tasks::network_key(epoch)? != target {
         return Err(Error::Stale);
     }
@@ -150,6 +196,7 @@ pub fn prepare(shared: &mut Shared) {
     shared.domains.core_generation = core;
     shared.domains.ledger_generation = ledger;
     READY.store(true, Ordering::Release);
+    publish_view();
 }
 pub fn observe(shared: &Shared) {
     owner();
@@ -179,6 +226,7 @@ pub fn observe(shared: &Shared) {
                 }
             }
         }
+        publish_view();
     }
 }
 fn matching_receipt(desired: Desired, receipt: PolicyReceiptWire) -> bool {
@@ -194,12 +242,14 @@ fn applied_value(slot: usize, action: Action, receipt: PolicyReceiptWire) -> boo
         && (receipt.actual == value(action) || (slot == 2 && receipt.actual <= value(action)))
 }
 fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
-    owner();
-    if !READY.load(Ordering::Acquire) {
+    inspect_view(|view| Ok(target_in(view, domain, kind, ordinal))).ok()?
+}
+fn target_in(view: &ReadView, domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
+    if !view.ready {
         return None;
     }
     if domain == 16 && kind == 2 {
-        let feedback = unsafe { *core::ptr::addr_of!(FEEDBACK) };
+        let feedback = &view.feedback;
         let waiting = feedback.waiting.get(ordinal)?;
         return (waiting.request_generation != 0).then_some(ObjectKey {
             id: waiting.request_id,
@@ -218,65 +268,67 @@ fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     Some(ObjectKey { id, generation: 1 })
 }
 fn measurements(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
-    owner();
-    let f = unsafe { *core::ptr::addr_of!(FEEDBACK) };
-    let (bit, mut values) = match domain {
-        10 => (1, f.network),
-        12 => (2, f.security),
-        16 => (4, f.cluster),
-        _ => return Err(Error::Unsupported),
-    };
-    let now = crate::domain_platform::now_ns() / 1_000_000;
-    if f.measurement_valid & bit == 0 || now < f.measurement_ms || now - f.measurement_ms > 100 {
-        return Err(Error::NotReady);
-    }
-    if domain == 16
-        && key
-            != (ObjectKey {
-                id: abi::OFFER_SERVICE_ID,
-                generation: 1,
-            })
-    {
-        values[3] = f
-            .waiting
-            .iter()
-            .find(|request| {
-                request.request_id == key.id && request.request_generation == key.generation
-            })
-            .ok_or(Error::Stale)?
-            .queued_us;
-    }
-    Ok(values)
+    inspect_view(|view| {
+        let f = &view.feedback;
+        let (bit, mut values) = match domain {
+            10 => (1, f.network),
+            12 => (2, f.security),
+            16 => (4, f.cluster),
+            _ => return Err(Error::Unsupported),
+        };
+        let now = crate::domain_platform::now_ns() / 1_000_000;
+        if f.measurement_valid & bit == 0 || now < f.measurement_ms || now - f.measurement_ms > 100
+        {
+            return Err(Error::NotReady);
+        }
+        if domain == 16
+            && key
+                != (ObjectKey {
+                    id: abi::OFFER_SERVICE_ID,
+                    generation: 1,
+                })
+        {
+            values[3] = f
+                .waiting
+                .iter()
+                .find(|request| {
+                    request.request_id == key.id && request.request_generation == key.generation
+                })
+                .ok_or(Error::Stale)?
+                .queued_us;
+        }
+        Ok(values)
+    })
 }
 fn current(domain: u16, kind: u16, key: ObjectKey) -> Result<Action, Error> {
-    owner();
-    let baseline = match (domain, kind) {
-        (10, 1) => Action::TxBatch(4),
-        (12, 1) => Action::UnauthRate(16),
-        (16, 1) => Action::OfferCpu(100),
-        (16, 2) => Action::Placement(2),
-        _ => return Err(Error::Unsupported),
-    };
-    if !(0..32).any(|ordinal| target(domain, kind, ordinal) == Some(key)) {
-        return Err(Error::Stale);
-    }
-    let effective = unsafe {
-        (*core::ptr::addr_of!(EFFECTIVE))
-            .get(index(baseline)?)
-            .copied()
-            .flatten()
-    };
-    Ok(effective
-        .filter(|d| d.apply.target == key && d.stamp.live(crate::domain_platform::now_ns()))
-        .map_or(baseline, |d| d.action))
+    inspect_view(|view| {
+        let baseline = match (domain, kind) {
+            (10, 1) => Action::TxBatch(4),
+            (12, 1) => Action::UnauthRate(16),
+            (16, 1) => Action::OfferCpu(100),
+            (16, 2) => Action::Placement(2),
+            _ => return Err(Error::Unsupported),
+        };
+        if !(0..32).any(|ordinal| target_in(view, domain, kind, ordinal) == Some(key)) {
+            return Err(Error::Stale);
+        }
+        let effective = view.effective.get(index(baseline)?).copied().flatten();
+        Ok(effective
+            .filter(|d| d.apply.target == key && d.stamp.live(crate::domain_platform::now_ns()))
+            .map_or(baseline, |d| d.action))
+    })
 }
 fn legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
+    inspect_view(|view| legal_in(view, action, key))
+}
+fn legal_in(view: &ReadView, action: Action, key: ObjectKey) -> Result<(), Error> {
     action.validate()?;
-    if !(0..32).any(|ordinal| target(action.domain(), action.kind(), ordinal) == Some(key)) {
+    if !(0..32).any(|ordinal| target_in(view, action.domain(), action.kind(), ordinal) == Some(key))
+    {
         return Err(Error::Stale);
     }
     if action == Action::Placement(1) {
-        let f = unsafe { *core::ptr::addr_of!(FEEDBACK) };
+        let f = &view.feedback;
         if !f.waiting.iter().any(|request| {
             request.request_id == key.id
                 && request.request_generation == key.generation
@@ -290,15 +342,17 @@ fn legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
     Ok(())
 }
 fn target_features(action: Action, key: ObjectKey) -> Result<TargetFeatures, Error> {
-    legal(action, key, crate::domain_platform::now_ns())?;
-    if action == Action::Placement(1) {
-        let f = unsafe { *core::ptr::addr_of!(FEEDBACK) };
-        Ok(TargetFeatures {
-            values: [Some(f.peer_cpu_milli), None, None, Some(1)],
-        })
-    } else {
-        Ok(TargetFeatures::default())
-    }
+    inspect_view(|view| {
+        legal_in(view, action, key)?;
+        if action == Action::Placement(1) {
+            let f = &view.feedback;
+            Ok(TargetFeatures {
+                values: [Some(f.peer_cpu_milli), None, None, Some(1)],
+            })
+        } else {
+            Ok(TargetFeatures::default())
+        }
+    })
 }
 fn apply(
     action: Action,

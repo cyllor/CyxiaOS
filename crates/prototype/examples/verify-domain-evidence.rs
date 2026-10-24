@@ -44,6 +44,7 @@ fn main() -> Result<(), String> {
         "all eighteen action families must be registered",
     )?;
     require(words[25] == 0, "native resource confirmation failed")?;
+    require(words[28] == 0, "native stability receipt failed")?;
     let package = if args.len() == 3 {
         fs::read(&args[2]).map_err(|e| e.to_string())?
     } else {
@@ -207,7 +208,7 @@ fn main() -> Result<(), String> {
         }
         require(versions.insert(r[13]), "duplicate publication version")?;
         require(
-            r[9] - r[8] <= 50_000_000 + r[12]
+            r[9] - r[8] <= 50_000_000
                 && r[10].saturating_add(r[11]).saturating_add(r[29]) <= 2_000_000,
             "published inference exceeded admission budget",
         )?;

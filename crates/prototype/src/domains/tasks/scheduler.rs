@@ -2,6 +2,7 @@ use super::{MAX_GROUPS, MAX_THREADS, UNSET, valid_key};
 use crate::domains::{Action, Error, ObjectKey, PolicyStamp, WINDOW_NS};
 
 pub const CPU_BUDGET_NS: u64 = WINDOW_NS * 9 / 10;
+pub const CONTROL_BUDGET_NS: u64 = WINDOW_NS * 7 / 10;
 pub const FAIR_WAIT_NS: u64 = WINDOW_NS;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuLayout {
@@ -52,6 +53,19 @@ pub struct Dispatch {
     pub waited_ns: u64,
     pub policy_version: u64,
 }
+/// A real reservation on one current control CPU. It is independent of the
+/// business thread table and survives ownership changes until exact settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlCredit {
+    pub sequence: u64,
+    pub cpu: u16,
+    pub core_generation: u64,
+    pub window: u64,
+    pub started_ns: u64,
+    pub reserved_ns: u64,
+    pub control_total_ns: u64,
+    pub physical_total_ns: u64,
+}
 #[derive(Clone, Copy)]
 struct Group {
     key: ObjectKey,
@@ -75,6 +89,8 @@ struct Cpu {
     spent: u64,
     groups: [u64; MAX_GROUPS],
     active: Option<Dispatch>,
+    control: Option<ControlCredit>,
+    control_spent: u64,
     quarantine_generation: u64,
     recovery_after: u64,
 }
@@ -84,6 +100,8 @@ impl Cpu {
         spent: 0,
         groups: [0; MAX_GROUPS],
         active: None,
+        control: None,
+        control_spent: 0,
         quarantine_generation: 0,
         recovery_after: 0,
     };
@@ -155,6 +173,7 @@ impl Scheduler {
             return Ok(());
         }
         if self.cpus[cpu].active.is_some()
+            || self.cpus[cpu].control.is_some()
             || self.cpus.iter().any(|c| {
                 c.active.is_some_and(|d| {
                     self.threads
@@ -169,6 +188,7 @@ impl Scheduler {
         let c = &mut self.cpus[cpu];
         c.window = window;
         c.spent = 0;
+        c.control_spent = 0;
         c.groups = [0; MAX_GROUPS];
         for t in self
             .threads
@@ -227,6 +247,9 @@ impl Scheduler {
         }
         if self.cpus[cpu].quarantine_generation != 0 {
             return Err(Error::NotReady);
+        }
+        if self.cpus[cpu].control.is_some() {
+            return Err(Error::Busy);
         }
         self.roll(cpu, now)?;
         if spec.budget_ns == 0 || spec.budget_ns > CPU_BUDGET_NS || spec.minimum_ns > spec.budget_ns
@@ -339,7 +362,7 @@ impl Scheduler {
         if self.cpus[cpu].quarantine_generation != 0 {
             return Err(Error::NotReady);
         }
-        if self.cpus[cpu].active.is_some() {
+        if self.cpus[cpu].active.is_some() || self.cpus[cpu].control.is_some() {
             return Err(Error::Busy);
         }
         self.roll(cpu, now)?;
@@ -481,6 +504,7 @@ impl Scheduler {
             return Err(Error::NotReady);
         }
         if self.cpus[cpu].active.is_some()
+            || self.cpus[cpu].control.is_some()
             || self
                 .cpus
                 .iter()
@@ -688,7 +712,7 @@ impl Scheduler {
             return Err(Error::Auth);
         }
         let c = &self.cpus[cpu];
-        if c.active.is_some() {
+        if c.active.is_some() || c.control.is_some() {
             return Err(Error::Busy);
         }
         if c.quarantine_generation == 0 || layout.generation <= c.quarantine_generation {
@@ -726,6 +750,7 @@ impl Scheduler {
             .iter()
             .any(|c| c.active.is_some_and(|d| d.thread == key))
             || self.cpus[cpu].active.is_some()
+            || self.cpus[cpu].control.is_some()
         {
             return Err(Error::Busy);
         }
@@ -824,8 +849,8 @@ impl Scheduler {
         self.cpus.get(cpu).map(|c| c.spent).ok_or(Error::Range)
     }
     /// Physical CPU usage is not reset by a control/business ownership change.
-    /// A caller reserving control execution must retain that reservation until
-    /// `record_control_cost` accepts its receipt, before reopening business use.
+    /// Pending control and business credits remain visible after a clock roll
+    /// or ownership change until their exact completion has been accounted.
     pub fn cpu_window_usage(&self, cpu: usize, now: u64) -> Result<(u64, u64), Error> {
         let c = self.cpus.get(cpu).ok_or(Error::Range)?;
         if c.window == u64::MAX {
@@ -834,11 +859,123 @@ impl Scheduler {
         if now / WINDOW_NS < c.window {
             return Err(Error::Stale);
         }
-        if now / WINDOW_NS > c.window && c.active.is_none() && now >= c.recovery_after {
+        if now / WINDOW_NS > c.window
+            && c.active.is_none()
+            && c.control.is_none()
+            && now >= c.recovery_after
+        {
             return Ok((0, 0));
         }
-        let reserved = c.active.map_or(0, |d| d.reserved_ns);
+        let reserved =
+            c.active.map_or(0, |d| d.reserved_ns) + c.control.map_or(0, |d| d.reserved_ns);
         Ok((c.spent.saturating_sub(reserved), reserved))
+    }
+    /// Prepay one complete bounded control turn on its actual physical CPU.
+    /// Both the 70 ms control ceiling and 90 ms shared physical ceiling use the
+    /// same aligned window. Returning None grants no execution rights.
+    pub fn reserve_control(
+        &mut self,
+        cpu: usize,
+        layout: CpuLayout,
+        now: u64,
+        required_ns: u64,
+    ) -> Result<Option<ControlCredit>, Error> {
+        if cpu >= 64
+            || layout.generation == 0
+            || layout.healthy_mask & (1u64 << cpu) == 0
+            || layout.business_mask & (1u64 << cpu) != 0
+        {
+            return Err(Error::Auth);
+        }
+        if required_ns == 0 || required_ns > CONTROL_BUDGET_NS {
+            return Err(Error::Range);
+        }
+        self.time(now)?;
+        if self.cpus[cpu].active.is_some() || self.cpus[cpu].control.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.cpus[cpu].quarantine_generation != 0 {
+            return Err(Error::NotReady);
+        }
+        self.roll(cpu, now)?;
+        let c = self.cpus[cpu];
+        if required_ns > CPU_BUDGET_NS.saturating_sub(c.spent)
+            || required_ns > CONTROL_BUDGET_NS.saturating_sub(c.control_spent)
+            || required_ns > WINDOW_NS - now % WINDOW_NS
+        {
+            return Ok(None);
+        }
+        let sequence = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
+        let credit = ControlCredit {
+            sequence,
+            cpu: cpu as u16,
+            core_generation: layout.generation,
+            window: now / WINDOW_NS,
+            started_ns: now,
+            reserved_ns: required_ns,
+            control_total_ns: c.control_spent + required_ns,
+            physical_total_ns: c.spent + required_ns,
+        };
+        self.cpus[cpu].spent += required_ns;
+        self.cpus[cpu].control_spent += required_ns;
+        self.cpus[cpu].control = Some(credit);
+        self.sequence = sequence;
+        Ok(Some(credit))
+    }
+    /// Settle exactly once, even if a later ownership context has been
+    /// published. Budget consumes the actual bill and quarantines this CPU;
+    /// malformed or stale receipts do not retire the real reservation.
+    pub fn complete_control(
+        &mut self,
+        credit: ControlCredit,
+        actual_ns: u64,
+        finished_ns: u64,
+    ) -> Result<(), Error> {
+        let cpu = usize::from(credit.cpu);
+        let c = self.cpus.get(cpu).ok_or(Error::Range)?;
+        if c.control != Some(credit) {
+            return Err(Error::Stale);
+        }
+        if finished_ns < credit.started_ns
+            || actual_ns > finished_ns.saturating_sub(credit.started_ns)
+        {
+            return Err(Error::Range);
+        }
+        let end = credit
+            .window
+            .checked_add(1)
+            .and_then(|w| w.checked_mul(WINDOW_NS))
+            .ok_or(Error::Overflow)?;
+        let c = &mut self.cpus[cpu];
+        c.spent = c
+            .spent
+            .saturating_sub(credit.reserved_ns)
+            .saturating_add(actual_ns);
+        c.control_spent = c
+            .control_spent
+            .saturating_sub(credit.reserved_ns)
+            .saturating_add(actual_ns);
+        c.control = None;
+        self.last_now = self.last_now.max(finished_ns);
+        if actual_ns > credit.reserved_ns
+            || finished_ns > end
+            || c.spent > CPU_BUDGET_NS
+            || c.control_spent > CONTROL_BUDGET_NS
+        {
+            c.quarantine_generation = c.quarantine_generation.max(credit.core_generation);
+            c.recovery_after = if finished_ns % WINDOW_NS == 0 {
+                finished_ns
+            } else {
+                finished_ns.saturating_add(WINDOW_NS - finished_ns % WINDOW_NS)
+            };
+            self.stats.quarantine_mask |= 1u64 << cpu;
+            self.stats.overruns = self.stats.overruns.saturating_add(1);
+            return Err(Error::Budget);
+        }
+        Ok(())
+    }
+    pub fn control_active(&self, cpu: usize) -> Option<ControlCredit> {
+        self.cpus.get(cpu).and_then(|c| c.control)
     }
     /// Record actual isolated-control CPU time after its separate control
     /// budget has prepaid it. The CPU must already be quiescent for business.
@@ -854,7 +991,7 @@ impl Scheduler {
         if cpu >= 64 || generation == 0 || actual > finished {
             return Err(Error::Range);
         }
-        if self.cpus[cpu].active.is_some() {
+        if self.cpus[cpu].active.is_some() || self.cpus[cpu].control.is_some() {
             return Err(Error::Busy);
         }
         let started = finished - actual;
@@ -868,7 +1005,11 @@ impl Scheduler {
         self.roll(cpu, started)?;
         self.last_now = self.last_now.max(finished);
         self.cpus[cpu].spent = self.cpus[cpu].spent.saturating_add(actual);
-        if self.cpus[cpu].spent > CPU_BUDGET_NS || finished > end {
+        self.cpus[cpu].control_spent = self.cpus[cpu].control_spent.saturating_add(actual);
+        if self.cpus[cpu].spent > CPU_BUDGET_NS
+            || self.cpus[cpu].control_spent > CONTROL_BUDGET_NS
+            || finished > end
+        {
             self.cpus[cpu].quarantine_generation =
                 self.cpus[cpu].quarantine_generation.max(generation);
             self.cpus[cpu].recovery_after = if finished % WINDOW_NS == 0 {

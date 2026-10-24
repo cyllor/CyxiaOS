@@ -760,6 +760,15 @@ pub fn run(info: &BootInfo) -> ! {
                     terminal_since.get_or_insert(Board.now_ms());
                 }
                 abi::OP_TRACE => {
+                    if p.arg0 & abi::TRACE_FATAL_BIT != 0 {
+                        let code = (p.arg0 & !abi::TRACE_FATAL_BIT).max(1);
+                        let _ = UNIFIED_EVIDENCE.words[15].compare_exchange(
+                            0,
+                            code,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
+                    }
                     let n = UNIFIED_EVIDENCE.words[6].fetch_add(1, Ordering::Relaxed) as usize;
                     if n < 200 {
                         UNIFIED_EVIDENCE.words[32 + n * 2].store(p.arg0, Ordering::Relaxed);

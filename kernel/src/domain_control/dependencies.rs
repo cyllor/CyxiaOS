@@ -38,8 +38,8 @@ impl AdmissionView {
             entries: [const { Entry::empty() }; CAPACITY],
         }
     }
-    /// The protected CPU0 coordinator is the sole writer. Publish the intent
-    /// before allowing an executor to change its actual resource parameters.
+    /// The coordinator gate serializes control-CPU publication and CPU0
+    /// executor receipts. Publish intent before allowing a resource change.
     pub fn publish(
         &self,
         slot: usize,

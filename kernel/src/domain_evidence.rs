@@ -211,3 +211,10 @@ pub fn observer_failed(domain: u16, version: u64, failure: Error) {
         DOMAIN_CONTROL_EVIDENCE.0[25].store(error(failure), Ordering::Release);
     }
 }
+pub fn stability_failed(domain: u16, version: u64, failure: Error) {
+    if get(28) == 0 {
+        put(29, u64::from(domain));
+        put(30, version);
+        DOMAIN_CONTROL_EVIDENCE.0[28].store(error(failure), Ordering::Release);
+    }
+}

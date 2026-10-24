@@ -250,6 +250,33 @@ impl BackgroundBudgets {
     pub fn status(&self, key: ObjectKey) -> Result<OptionalStatus, Error> {
         Ok(self.groups[self.index(key)?].ok_or(Error::Stale)?.status)
     }
+    /// Project the current legal parameters for a control-plane observation.
+    /// This never rolls the owner's accounting window or consumes carry-over.
+    /// An unsettled old-window debit remains explicitly unreadable for a new
+    /// window instead of being erased or replaced with a zero-cost sample.
+    pub fn peek_status(&self, key: ObjectKey, now: u64) -> Result<OptionalStatus, Error> {
+        let group = self.groups[self.index(key)?].ok_or(Error::Stale)?;
+        let window = now / WINDOW_NS;
+        if window < group.window {
+            return Err(Error::Range);
+        }
+        let mut status = group.status;
+        if window > group.window {
+            if self.debits.iter().flatten().any(|debit| debit.key == key) {
+                return Err(Error::Busy);
+            }
+            status.spent_ns = group.carry_ns;
+            status.freeze_admission = status.overrun;
+        }
+        if group.stamp.version != 0 && !group.stamp.live(now) {
+            if status.committed_milli <= 100 {
+                status.budget_milli = 100;
+            } else {
+                status.freeze_admission = true;
+            }
+        }
+        Ok(status)
+    }
     pub fn current_status(&mut self, key: ObjectKey, now: u64) -> Result<OptionalStatus, Error> {
         let i = self.index(key)?;
         let r = self.refresh(i, now);

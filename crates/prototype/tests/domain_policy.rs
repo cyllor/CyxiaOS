@@ -133,6 +133,46 @@ fn clock() -> Times {
 }
 
 #[test]
+fn job_deadline_is_rechecked_after_validation_before_publish() {
+    let (mut registry, set, mut owner) = ready();
+    let bytes = frame(&set, 1, 0);
+    let receipt = registry
+        .submit_job(
+            publisher(),
+            &bytes,
+            49_900_000,
+            50_000_000,
+            &mut Times {
+                first: 49_900_000,
+                second: 50_100_000,
+                calls: 0,
+            },
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(receipt.version, 0);
+    assert_eq!(receipt.actions[0], ExecutionState::Failed(Error::Expired));
+    assert_eq!(owner.prepares, 1);
+    assert_eq!(owner.cancels, 1);
+    assert_eq!(owner.publishes, 0);
+    assert!(!registry.optimization_stopped());
+    // The failed identity remains queryable; a late retry cannot revive it.
+    assert_eq!(
+        registry
+            .submit_job(
+                publisher(),
+                &bytes,
+                60_000_000,
+                50_000_000,
+                &mut clock(),
+                &mut owner
+            )
+            .unwrap(),
+        receipt
+    );
+}
+
+#[test]
 fn exact_numeric_candidate_order_and_current_are_bound() {
     let set = candidates();
     assert_eq!(

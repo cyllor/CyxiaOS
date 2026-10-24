@@ -288,6 +288,9 @@ impl<const C: usize> FileSystem<C> {
             }
         }
     }
+    pub fn policy_deadline_ns(&self) -> u64 {
+        self.stamp.installed_until_ns
+    }
     pub fn cache_usage(&self) -> [usize; 4] {
         [
             self.resident,
@@ -295,6 +298,19 @@ impl<const C: usize> FileSystem<C> {
             self.cache_budget,
             C,
         ]
+    }
+    /// A control-plane reader cannot perform the owner's TTL transition. Until
+    /// that owner actually closes expired admission, do not report baseline as
+    /// if it had already been installed or release any charged cache pages.
+    pub fn cache_partition_status(&self, now: u64) -> Result<[usize; 4], Error> {
+        if self.cache_policy_active && !self.cache_stamp.live(now) {
+            return Err(Error::Busy);
+        }
+        Ok(self.cache_usage())
+    }
+    pub fn cache_partition_deadline_ns(&self) -> Option<u64> {
+        self.cache_policy_active
+            .then_some(self.cache_stamp.installed_until_ns)
     }
     /// Actual page-aligned backing, excluding inode and cache metadata storage.
     pub fn cache_backing(&self) -> (usize, usize) {

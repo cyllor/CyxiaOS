@@ -18,6 +18,18 @@ use cyxia_prototype::{
 };
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 static BORROWED: AtomicBool = AtomicBool::new(false);
+static DEVICE_READY: AtomicBool = AtomicBool::new(false);
+#[path = "domain_platform/read_snapshot.rs"]
+mod read_snapshot;
+#[derive(Clone, Copy)]
+struct ControlView {
+    at: u64,
+    until: u64,
+    facts: [u64; 38],
+    io: Action,
+    notify: u8,
+}
+static CONTROL_VIEW: read_snapshot::ReadSnapshot<ControlView> = read_snapshot::ReadSnapshot::new();
 static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 static mut DISK: Option<NativeDisk> = None;
 static mut SCHEDULER: Scheduler = Scheduler::new(16, 16);
@@ -46,6 +58,7 @@ pub struct NativeDisk {
     permit: Option<BytePermit>,
     background: Option<Admission>,
     first_admission: Option<Admission>,
+    notify_until_ns: u64,
     failed: bool,
     pub reads: u64,
     pub writes: u64,
@@ -137,6 +150,19 @@ impl NativeDisk {
             FACTS[i].store(value, Ordering::Relaxed);
         }
         FACTS[28].store(now, Ordering::Release);
+        let mut until = self.scheduler.control_view_until_ns(now).unwrap_or(now);
+        if self.notify_until_ns > now {
+            until = until.min(self.notify_until_ns);
+        }
+        // A failed short snapshot publication never blocks the CPU0 owner.
+        // The next completion or service turn publishes again; C rejects stale.
+        let _ = CONTROL_VIEW.publish(ControlView {
+            at: now,
+            until,
+            facts: v,
+            io: self.scheduler.current_action(now),
+            notify: self.device.current_batch(now),
+        });
     }
     fn clock(&mut self, now: u64) {
         if now / 100_000_000 != self.window {
@@ -517,6 +543,7 @@ fn attach(info: &BootInfo) -> NativeDisk {
         permit: None,
         background: None,
         first_admission: None,
+        notify_until_ns: 0,
         failed: false,
         reads: 0,
         writes: 0,
@@ -577,6 +604,7 @@ pub fn boot(info: &BootInfo) -> BootIdentity {
         *core::ptr::addr_of_mut!(DISK) = Some(disk);
         *core::ptr::addr_of_mut!(IDENTITY) = Some(identity);
     }
+    DEVICE_READY.store(true, Ordering::Release);
     crate::log(b"STORAGE_V13_BOOT_DURABLE\n");
     identity
 }
@@ -603,6 +631,21 @@ impl Drop for Guard {
     fn drop(&mut self) {
         BORROWED.store(false, Ordering::Release);
     }
+}
+/// C copies only an already-published immutable view. It never takes BORROWED:
+/// legacy synchronous CPU0 owners cannot be made Busy by policy observation.
+fn control_view(now: u64) -> Result<ControlView, DomainError> {
+    if !DEVICE_READY.load(Ordering::Acquire) {
+        return Err(DomainError::NotReady);
+    }
+    let view = CONTROL_VIEW
+        .read()
+        .map_err(|_| DomainError::Busy)?
+        .ok_or(DomainError::NotReady)?;
+    if now < view.at || now - view.at >= 50_000_000 || now >= view.until {
+        return Err(DomainError::Busy);
+    }
+    Ok(view)
 }
 pub fn try_with_journal<R>(
     f: impl FnOnce(&mut Journal, &mut NativeDisk, &mut [u8; 8192]) -> R,
@@ -676,14 +719,23 @@ pub fn with_progress<R>(
 pub fn facts() -> [u64; 38] {
     core::array::from_fn(|i| FACTS[i].load(Ordering::Acquire))
 }
+/// A coherent snapshot for canonical policy inputs; active I/O yields Busy.
+/// The owner can continue to publish independent atomic diagnostic facts.
+pub fn facts_read() -> Result<[u64; 38], DomainError> {
+    Ok(control_view(Board.now_ns())?.facts)
+}
 pub fn identity() -> Option<BootIdentity> {
-    if cyxia_arch_aarch64::cpu::slot() != 0 {
+    if !DEVICE_READY.load(Ordering::Acquire) {
         return None;
     }
+    // Written once before DEVICE_READY Release; never changed during this boot.
     unsafe { *core::ptr::addr_of!(IDENTITY) }
 }
 pub fn install_io(action: Action, stamp: PolicyStamp, now: u64) -> Result<(), DomainError> {
     try_with_journal(|_, d, _| {
+        if d.failed {
+            return Err(DomainError::Io);
+        }
         d.scheduler.validate_apply(action, stamp, now)?;
         if let Some(grant) = d.background {
             // A newer resource policy can retire only a never-started grant.
@@ -737,16 +789,24 @@ pub fn cancel_background() -> Result<(), DomainError> {
     })?
 }
 pub fn current_io_action(now: u64) -> Result<Action, DomainError> {
-    try_with_journal(|_, d, _| d.scheduler.current_action(now))
+    Ok(control_view(now)?.io)
 }
 pub fn current_notify_batch(now: u64) -> Result<u8, DomainError> {
-    try_with_journal(|_, d, _| d.device.current_batch(now))
+    Ok(control_view(now)?.notify)
+}
+/// CPU0 refreshes idle observations too. Metering is not a byte/credit grant.
+pub fn refresh_control_observation(now: u64) -> Result<(), DomainError> {
+    try_with_journal(|_, d, _| d.publish(now))
 }
 pub fn install_notify(batch: u8, stamp: PolicyStamp, now: u64) -> Result<(), DomainError> {
     try_with_journal(|_, d, _| {
+        if d.failed {
+            return Err(DomainError::Io);
+        }
         d.device
             .set_notify_policy(batch, stamp.version, stamp.installed_until_ns, now)
             .map_err(|_| DomainError::Capacity)?;
+        d.notify_until_ns = stamp.installed_until_ns;
         d.publish(now);
         Ok(())
     })?

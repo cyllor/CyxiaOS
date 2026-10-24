@@ -176,6 +176,83 @@ fn expired_cache_partition_closes_admission_and_required_writeback_drains_dirty_
     });
 }
 
+#[test]
+fn control_reads_do_not_perform_cache_expiry_or_release_actual_dirty_occupancy() {
+    large(|| {
+        let (mut d, mut j) = fixture();
+        let mut s = [0; 8192];
+        let mut fs = FileSystem::<64>::new();
+        fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.set_cache_partition(4, 2).unwrap();
+        let stamp = PolicyStamp::new(1, 0, 0).unwrap();
+        fs.set_cache_partition_expiring(32, 4, stamp, 0).unwrap();
+        fs.create("/snapshot-debt", &mut j, &mut d, &mut s).unwrap();
+        let handle = fs
+            .open(
+                "/snapshot-debt",
+                OpenMode::ReadWrite,
+                &mut j,
+                &mut d,
+                &mut s,
+            )
+            .unwrap();
+        fs.write(handle, 0, &[0x4a; 65536], &mut j, &mut d, &mut s)
+            .unwrap();
+        let usage = fs.cache_usage();
+        let disk_counts = (d.reads, d.writes, d.flushes);
+        assert_eq!(
+            fs.cache_partition_deadline_ns(),
+            Some(stamp.installed_until_ns)
+        );
+        assert_eq!(
+            fs.cache_partition_status(stamp.installed_until_ns - 1),
+            Ok(usage)
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                fs.cache_partition_status(stamp.installed_until_ns),
+                Err(Error::Busy)
+            );
+        }
+        assert_eq!(fs.cache_usage(), usage);
+        assert_eq!((d.reads, d.writes, d.flushes), disk_counts);
+        // Only the actual CPU0/cache-owner transition can publish baseline.
+        fs.refresh_cache_partition(stamp.installed_until_ns);
+        assert_eq!(fs.cache_partition_deadline_ns(), None);
+        assert_eq!(
+            fs.cache_partition_status(stamp.installed_until_ns),
+            Ok([16, 16, 4, 64])
+        );
+        assert_eq!((d.reads, d.writes, d.flushes), disk_counts);
+    });
+}
+
+#[test]
+fn io_control_view_has_a_window_deadline_and_never_grants_resources() {
+    let mut io = Scheduler::new(16, 16);
+    let stamp = PolicyStamp::new(1, 5, 5).unwrap();
+    io.apply(Action::IoShare(750), stamp, 5).unwrap();
+    let initial = io.usage();
+    for now in [5, 10, 99_999_999] {
+        assert_eq!(io.current_action(now), Action::IoShare(750));
+        assert_eq!(io.control_view_until_ns(now), Ok(100_000_000));
+        assert_eq!(io.reserved_bytes(), 0);
+        assert_eq!(io.reserved_slots(), 0);
+        assert_eq!(io.usage(), initial);
+    }
+    assert_eq!(
+        io.control_view_until_ns(10_000_000_000),
+        Ok(stamp.installed_until_ns)
+    );
+    assert_eq!(
+        io.current_action(stamp.installed_until_ns),
+        Action::IoShare(250)
+    );
+    assert_eq!(io.control_view_until_ns(u64::MAX), Err(Error::Overflow));
+    assert_eq!((io.stats().submitted, io.stats().completed), (0, 0));
+    assert_eq!(io.usage(), initial);
+}
+
 #[derive(Default)]
 struct Disk {
     durable: BTreeMap<u32, Box<[u8; 4096]>>,

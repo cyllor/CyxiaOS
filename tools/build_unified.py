@@ -21,21 +21,22 @@ ROOT_BUILD_FILES={'Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchai
 EXCLUDED_COMPONENTS={'tests','docs','target','__pycache__','.git'}
 
 
-def code_source_map():
+def code_source_map(source_root=None):
     # Bind every potentially included source/asset, not an extension allowlist:
     # ring includes .inl, and models/packages can have arbitrary suffixes.
     # Filter the build scope before requiring each file. An intentionally sparse
     # test fixture does not participate in these native images; missing compiled
     # sources and symlinks still fail instead of silently disappearing.
+    source_root=Path(source_root or ROOT).resolve(strict=True)
     result=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard'],
-                          cwd=ROOT,capture_output=True,check=True,timeout=10)
+                          cwd=source_root,capture_output=True,check=True,timeout=10)
     names=sorted(set(name for name in result.stdout.decode('utf-8').split('\0') if name
                      and (name in ROOT_BUILD_FILES or Path(name).parts[0] in CODE_ROOTS)
                      and not any(part in EXCLUDED_COMPONENTS for part in Path(name).parts)))
     require({'kernel/src/smp.rs','crates/arch-aarch64/src/user.rs','Cargo.lock'}<=set(names),
             'incomplete native source checkout')
-    files=[ROOT/name for name in names]
-    require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(ROOT) for p in files),
+    files=[source_root/name for name in names]
+    require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(source_root) for p in files),
             'missing, linked, or external native build source')
     return {name:sha(path) for name,path in zip(names,files)}
 

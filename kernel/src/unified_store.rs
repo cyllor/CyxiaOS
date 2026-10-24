@@ -4,6 +4,8 @@ use cyxia_prototype::cluster::{
     MAX_EFFECT,
     volume::{Cursor, Volume, VolumeScratch},
 };
+#[path = "unified_store/identity.rs"]
+mod identity;
 static mut WORK: VolumeScratch = [[0; 4096]; 16];
 static mut VOLUME: Option<Volume> = None;
 static mut STAGE: [u8; MAX_EFFECT] = [0; MAX_EFFECT];
@@ -66,9 +68,11 @@ pub fn request(
             let body = &(&*core::ptr::addr_of!(STAGE))[..stage.1];
             // Only known recovery/closing event kinds may consume the closing reserve.
             if key == 0
-                && (body.len() != 85
-                    || &body[..5] != b"CXID1"
-                    || (&*core::ptr::addr_of!(VOLUME)).as_ref().unwrap().used() != 0)
+                && !identity::initial_identity_allowed(
+                    key,
+                    (&*core::ptr::addr_of!(VOLUME)).as_ref().unwrap().used(),
+                    body,
+                )
             {
                 return (3, 0, 0);
             }

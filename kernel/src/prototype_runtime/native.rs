@@ -4,13 +4,20 @@ use super::*;
 use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDOW_NS};
 
 const PREPAY_NS: u64 = 2_500_000;
-const CONTROL_NS: u64 = 70_000_000;
-const PHYSICAL_NS: u64 = 90_000_000;
 const WALL_NS: u64 = 50_000_000;
 static READY: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicU64 = AtomicU64::new(1);
 static JOB_CPU: AtomicU64 = AtomicU64::new(0);
 static FAILED_CPUS: AtomicU64 = AtomicU64::new(0);
+static CONTROLLER_EPOCH: AtomicU64 = AtomicU64::new(1);
+static STARTED_JOBS: AtomicU64 = AtomicU64::new(0);
+static RESULT_VERSION: AtomicU64 = AtomicU64::new(0);
+#[repr(C, align(64))]
+struct ControlCreditEvidence([AtomicU64; 64]);
+#[used]
+#[unsafe(no_mangle)]
+static CONTROL_CREDIT_EVIDENCE: ControlCreditEvidence =
+    ControlCreditEvidence([const { AtomicU64::new(0) }; 64]);
 pub(super) fn ready() -> bool {
     READY.load(Ordering::Acquire)
 }
@@ -25,49 +32,136 @@ fn ticks(ns: u64) -> u64 {
 }
 #[derive(Clone, Copy)]
 struct Bill {
+    credit: cyxia_prototype::domains::tasks::ControlCredit,
+    body_started: u64,
     actual: u64,
     finished: u64,
+    phase: u64,
+    phase_mask: u64,
+}
+#[derive(Clone, Copy)]
+enum Completion {
+    Empty,
+    Reply(u64),
+    Fault,
 }
 pub(super) struct WorkerState {
     bill: Option<Bill>,
+    completion: Option<Completion>,
     probe: u8,
     probe_started: u64,
     probing: bool,
     in_job: bool,
+    publish_pending: bool,
+    abort_pending: bool,
+    job_started: u64,
     cpu_ns: u64,
     failed: bool,
+    phase: u64,
+    phase_mask: u64,
 }
 impl WorkerState {
     pub(super) const fn new() -> Self {
         Self {
             bill: None,
+            completion: None,
             probe: 0,
             probe_started: 0,
             probing: false,
             in_job: false,
+            publish_pending: false,
+            abort_pending: false,
+            job_started: 0,
             cpu_ns: 0,
             failed: false,
+            phase: 0,
+            phase_mask: 0,
         }
     }
     pub(super) fn discard(&mut self) {
-        self.in_job = false;
+        // The stop path proves there is no bill or root-owned job first.
         self.probing = false;
     }
+    fn phase(&mut self, phase: u64) {
+        self.phase = phase;
+        self.phase_mask |= 1u64 << phase;
+    }
 }
-/// `Busy` is unconsumed; `Budget` has already charged and isolated the CPU.
-/// A failed/stale bill stays owned and cannot be hidden by closing a gate.
+fn credit_failure(worker: &Worker, bill: Bill, error: DomainError) {
+    let slot = usize::from(bill.credit.cpu);
+    if !matches!(slot, 1 | 2) {
+        return;
+    }
+    let base = if slot == 1 { 2 } else { 24 };
+    let words = &CONTROL_CREDIT_EVIDENCE.0;
+    if words[base]
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let c = bill.credit;
+    let control = c
+        .control_total_ns
+        .saturating_sub(c.reserved_ns)
+        .saturating_add(bill.actual);
+    let physical = c
+        .physical_total_ns
+        .saturating_sub(c.reserved_ns)
+        .saturating_add(bill.actual);
+    let end = c.window.saturating_add(1).saturating_mul(WINDOW_NS);
+    let flags = u64::from(bill.actual > c.reserved_ns)
+        | (u64::from(bill.finished > end) << 1)
+        | (u64::from(control > 70_000_000) << 2)
+        | (u64::from(physical > 90_000_000) << 3);
+    for (i, value) in [
+        slot as u64,
+        c.sequence,
+        c.core_generation,
+        c.window,
+        c.started_ns,
+        bill.body_started,
+        bill.finished,
+        c.reserved_ns,
+        bill.actual,
+        c.control_total_ns,
+        control,
+        c.physical_total_ns,
+        physical,
+        bill.phase,
+        bill.phase_mask,
+        worker.native.cpu_ns,
+        worker.native.job_started,
+        REQUEST.load(Ordering::Acquire),
+        worker.preemptions,
+        flags,
+        error as u64 + 1,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        words[base + 1 + i].store(value, Ordering::Relaxed);
+    }
+    words[base].store(2, Ordering::Release);
+    words[1].store(1, Ordering::Relaxed);
+    words[0].store(0x4359_4343_5245_4401, Ordering::Release);
+}
+/// Busy has not consumed the exact physical reservation. Budget has consumed
+/// the bill, retained its actual cost and quarantined this physical CPU.
 pub(super) fn settle(worker: &mut Worker) -> bool {
     let Some(bill) = worker.native.bill else {
         return true;
     };
-    match crate::domain_tasks::record_control_cost(cpu::slot(), bill.actual, bill.finished) {
+    match crate::domain_tasks::complete_control(bill.credit, bill.actual, bill.finished) {
         Ok(()) => worker.native.bill = None,
         Err(DomainError::Budget) => {
+            credit_failure(worker, bill, DomainError::Budget);
             worker.native.bill = None;
             fail_worker(worker);
         }
         Err(DomainError::Busy | DomainError::NotReady) => return false,
-        Err(_) => {
+        Err(error) => {
+            credit_failure(worker, bill, error);
             fail_worker(worker);
             return false;
         }
@@ -81,17 +175,35 @@ fn fail_worker(worker: &mut Worker) {
         CONTROL_OVERRUNS.fetch_add(1, Ordering::Relaxed);
     }
 }
-fn finish(worker: &mut Worker, valid: bool) {
+fn conclude(worker: &mut Worker, completion: Completion) {
     if let Some(context) = worker.context.as_ref() {
         RESULT_KIND.store(context.kind, Ordering::Relaxed);
         RESULT_ESR.store(context.esr, Ordering::Relaxed);
     }
+    worker.context = None;
+    worker.native.in_job = false;
+    worker.native.publish_pending = false;
+    worker.native.abort_pending = false;
+    worker.native.completion = Some(completion);
+}
+fn publish_completion(worker: &mut Worker) {
+    if worker.native.bill.is_some() {
+        return;
+    }
+    let Some(completion) = worker.native.completion.take() else {
+        return;
+    };
+    let (state, version) = match completion {
+        Completion::Empty => (5, 0),
+        Completion::Reply(version) => (3, version),
+        Completion::Fault => (4, 0),
+    };
+    RESULT_VERSION.store(version, Ordering::Relaxed);
     RESULT_PREEMPTIONS.store(worker.preemptions, Ordering::Relaxed);
     REQUEST_END.store(timer::ticks(), Ordering::Relaxed);
     JOB_CPU.store(worker.native.cpu_ns, Ordering::Relaxed);
-    worker.context = None;
-    worker.native.in_job = false;
-    REQUEST.store(if valid { 3 } else { 4 }, Ordering::Release);
+    // No consumer or ownership handoff observes completion before settlement.
+    REQUEST.store(state, Ordering::Release);
 }
 fn clear_private(slot: usize) {
     unsafe {
@@ -112,22 +224,63 @@ fn clear_private(slot: usize) {
         core::arch::asm!("dsb ish", options(nostack));
     }
 }
-pub(super) fn step(worker: &mut Worker) {
-    let slot = cpu::slot();
-    if !matches!(slot, 1 | 2) || !READY.load(Ordering::Acquire) || !settle(worker) {
-        return;
-    }
-    if worker.native.failed {
-        if worker.native.in_job {
-            finish(worker, false);
+fn root_return(worker: &mut Worker, slot: usize) {
+    if worker.native.abort_pending {
+        worker.native.phase(7);
+        if crate::domain_control::abort(worker.native.cpu_ns).is_ok() {
+            conclude(worker, Completion::Fault);
         }
         return;
     }
-    let now = crate::domain_tasks::now_ns();
-    // Process a captured return only after its actual CPU bill was accepted.
+    worker.native.phase(6);
+    // This CPU's EL0 context is stopped. The other C worker has a disjoint
+    // private output page, and CPU0 never writes either page after startup.
+    let output: &[u64; 512] = unsafe {
+        let page = if slot == 1 {
+            core::ptr::addr_of!(OUTPUT)
+        } else {
+            core::ptr::addr_of!(SECOND_OUTPUT)
+        };
+        &(*page).0
+    };
+    let result = crate::domain_control::accept(output, worker.native.cpu_ns);
+    if let Err(error) = result {
+        match crate::domain_control::pending_job() {
+            Ok(false) => {}
+            Ok(true) => {
+                // A changed current-C authorization can reject before taking
+                // the job. Its original owner must still explicitly abort it.
+                if error != DomainError::Busy {
+                    worker.native.publish_pending = false;
+                    worker.native.abort_pending = true;
+                }
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+    // An accepted root version remains a success even if later cost settlement
+    // detects an overrun. Its existing executor obligations cannot be undone.
+    conclude(worker, Completion::Reply(result.unwrap_or(0)));
+}
+fn run_turn(
+    worker: &mut Worker,
+    credit: cyxia_prototype::domains::tasks::ControlCredit,
+    begin: u64,
+) {
+    let slot = cpu::slot();
+    let now = ns(timer::ticks());
+    if worker.native.in_job && now.saturating_sub(worker.native.job_started) >= WALL_NS {
+        worker.native.abort_pending = true;
+    }
+    if worker.native.in_job && (worker.native.publish_pending || worker.native.abort_pending) {
+        root_return(worker, slot);
+        return;
+    }
     if let Some(context) = worker.context.as_ref() {
         if context.kind != 0 {
             if worker.native.probing {
+                worker.native.phase(8);
                 if context.kind != 9 {
                     let (address, fsc) = [
                         (abi::INPUT_VA, 0x4f),
@@ -152,23 +305,20 @@ pub(super) fn step(worker: &mut Worker) {
                     fail_worker(worker);
                     return;
                 }
-            } else if worker.native.in_job {
-                let expired =
-                    now.saturating_sub(ns(REQUEST_START.load(Ordering::Relaxed))) >= WALL_NS;
-                if context.kind != 9 || expired {
-                    let valid = !expired
-                        && context.kind == 8
-                        && context.esr >> 26 == 0x15
-                        && context.esr & 0xffff == abi::SUBMIT
-                        && context.regs[0] == abi::OUTPUT_VA
-                        && context.regs[1] == 4096;
-                    finish(worker, valid);
-                    return;
-                }
+            } else if worker.native.in_job && context.kind != 9 {
+                worker.native.publish_pending = context.kind == 8
+                    && context.esr >> 26 == 0x15
+                    && context.esr & 0xffff == abi::SUBMIT
+                    && context.regs[0] == abi::OUTPUT_VA
+                    && context.regs[1] == 4096;
+                worker.native.abort_pending = !worker.native.publish_pending;
+                root_return(worker, slot);
+                return;
             }
         }
     }
     if !worker.probed && worker.context.is_none() {
+        worker.native.phase(1);
         clear_private(slot);
         worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
         worker.native.probing = true;
@@ -182,88 +332,148 @@ pub(super) fn step(worker: &mut Worker) {
         {
             return;
         }
-        clear_private(slot);
-        let sequence = unsafe {
-            if slot == 1 {
-                (*core::ptr::addr_of!(INPUT)).0[2]
-            } else {
-                (*core::ptr::addr_of!(SECOND_INPUT)).0[2]
+        worker.preemptions = 0;
+        worker.native.cpu_ns = 0;
+        REQUEST_START.store(timer::ticks(), Ordering::Relaxed);
+        worker.native.phase(3);
+        let input = match crate::domain_control::next(CONTROLLER_EPOCH.load(Ordering::Acquire)) {
+            Ok(Some(input)) => input,
+            _ => {
+                conclude(worker, Completion::Empty);
+                return;
             }
         };
-        worker.context = Some(fresh(if FAULT_MODE == 1 && sequence == 5 {
+        worker.native.in_job = true;
+        worker.native.job_started = input[4];
+        STARTED_JOBS.fetch_add(1, Ordering::Release);
+        worker.native.phase(4);
+        let copy_start = timer::ticks();
+        unsafe {
+            let page = if slot == 1 {
+                core::ptr::addr_of_mut!(INPUT)
+            } else {
+                core::ptr::addr_of_mut!(SECOND_INPUT)
+            };
+            (*page).0.copy_from_slice(&input);
+            core::arch::asm!("dsb ish", options(nostack));
+        }
+        clear_private(slot);
+        worker.context = Some(fresh(if FAULT_MODE == 1 && input[2] == 5 {
             5
         } else {
             0
         }));
-        worker.native.in_job = true;
-        worker.native.cpu_ns = 0;
-        worker.preemptions = 0;
+        worker.native.cpu_ns = worker
+            .native
+            .cpu_ns
+            .saturating_add(ns(timer::ticks() - copy_start));
     }
-    if worker.native.in_job
-        && now.saturating_sub(ns(REQUEST_START.load(Ordering::Relaxed))) >= WALL_NS
-    {
-        finish(worker, false);
+    // Account encoding and private-page preparation before choosing a slice.
+    // A turn with less than the full return envelope yields without entering EL0.
+    let entered = timer::ticks();
+    if ns(entered.saturating_sub(begin)).saturating_add(1_000_000) > credit.reserved_ns {
         return;
     }
-    let window = now / WINDOW_NS;
-    if worker.window != window {
-        worker.window = window;
-        worker.charged = 0;
-    }
-    let end_window = match (window + 1).checked_mul(WINDOW_NS) {
-        Some(v) => v,
-        None => return,
-    };
-    if worker.charged.saturating_add(PREPAY_NS) > CONTROL_NS
-        || now.saturating_add(PREPAY_NS) > end_window
-    {
-        return;
-    }
-    let Ok((spent, reserved)) = crate::domain_tasks::cpu_window_usage(slot, now) else {
+    let Some(context) = worker.context.as_mut() else {
         return;
     };
-    if spent.saturating_add(reserved).saturating_add(PREPAY_NS) > PHYSICAL_NS {
-        return;
-    }
-    let begin = timer::ticks();
-    if ns(begin).saturating_add(PREPAY_NS) > end_window {
-        return;
-    }
-    worker.charged += PREPAY_NS;
-    CONTROL_MAX_DEBIT.fetch_max(worker.charged / 100_000, Ordering::Relaxed);
-    CONTROL_TOTAL_DEBIT.fetch_add(PREPAY_NS / 100_000, Ordering::Relaxed);
-    let context = worker.context.as_mut().unwrap();
-    // Clear only the captured exception classification; all saved registers,
-    // SIMD state and PC are preserved across timer returns.
     context.kind = 0;
+    worker
+        .native
+        .phase(if worker.native.probing { 2 } else { 5 });
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot * 2 + 1) as u64 };
     unsafe {
         enter_service(
             context,
             phys(root),
-            begin.saturating_add(ticks(250_000).max(1)),
+            entered.saturating_add(ticks(250_000).max(1)),
         );
     }
     let end = timer::ticks();
-    let actual = ns(end - begin);
-    let finished = ns(end);
-    worker.charged = worker
-        .charged
-        .saturating_sub(PREPAY_NS)
-        .saturating_add(actual);
-    CONTROL_TICKS.fetch_add(end - begin, Ordering::Relaxed);
-    MAX_SLICE[slot].fetch_max(end - begin, Ordering::Relaxed);
+    let actual = ns(end - entered);
+    MAX_SLICE[slot].fetch_max(end - entered, Ordering::Relaxed);
     if worker.native.in_job {
         worker.native.cpu_ns = worker.native.cpu_ns.saturating_add(actual);
     }
     if context.kind == 9 {
         worker.preemptions = worker.preemptions.saturating_add(1);
     }
-    worker.native.bill = Some(Bill { actual, finished });
-    if actual > PREPAY_NS || finished > end_window || worker.charged > CONTROL_NS {
-        fail_worker(worker);
-    }
+}
+fn charge_turn(
+    worker: &mut Worker,
+    credit: cyxia_prototype::domains::tasks::ControlCredit,
+    begin: u64,
+) {
+    let end = timer::ticks();
+    let actual = ns(end - begin);
+    worker.window = credit.window;
+    worker.charged = credit
+        .control_total_ns
+        .saturating_sub(credit.reserved_ns)
+        .saturating_add(actual);
+    CONTROL_TICKS.fetch_add(end - begin, Ordering::Relaxed);
+    worker.native.bill = Some(Bill {
+        credit,
+        body_started: ns(begin),
+        actual,
+        finished: ns(end),
+        phase: worker.native.phase,
+        phase_mask: worker.native.phase_mask,
+    });
     let _ = settle(worker);
+    publish_completion(worker);
+}
+pub(super) fn step(worker: &mut Worker) {
+    let slot = cpu::slot();
+    if !matches!(slot, 1 | 2) || !READY.load(Ordering::Acquire) || !settle(worker) {
+        return;
+    }
+    publish_completion(worker);
+    if worker.native.failed {
+        return;
+    }
+    // Do not burn control budget polling when this worker has no owned context
+    // or explicit scheduling opportunity. Root still owns exactly one job.
+    if worker.probed
+        && worker.context.is_none()
+        && !worker.native.in_job
+        && (REQUEST.load(Ordering::Acquire) != 1 || TARGET.load(Ordering::Acquire) != slot as u64)
+    {
+        return;
+    }
+    let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, false) else {
+        return;
+    };
+    let begin = timer::ticks();
+    worker.native.phase = 0;
+    worker.native.phase_mask = 0;
+    CONTROL_MAX_DEBIT.fetch_max(credit.control_total_ns / 100_000, Ordering::Relaxed);
+    CONTROL_TOTAL_DEBIT.fetch_add(credit.reserved_ns / 100_000, Ordering::Relaxed);
+    run_turn(worker, credit, begin);
+    charge_turn(worker, credit, begin);
+}
+/// A closed gate never substitutes for settlement or cancellation of the
+/// original root job. Only its actual C owner can issue this abort.
+pub(super) fn stop_ready(worker: &mut Worker) -> bool {
+    if !settle(worker) {
+        return false;
+    }
+    publish_completion(worker);
+    if worker.native.in_job {
+        let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
+            return false;
+        };
+        let begin = timer::ticks();
+        worker.native.phase = 0;
+        worker.native.phase_mask = 0;
+        worker.native.abort_pending = true;
+        root_return(worker, cpu::slot());
+        charge_turn(worker, credit, begin);
+        if worker.native.in_job || worker.native.bill.is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -580,42 +790,27 @@ pub(super) fn poll(c: &mut Coordinator) {
     if published {
         let _ = crate::domain_control::poll(now);
     }
+    c.requests = STARTED_JOBS.load(Ordering::Acquire);
     match REQUEST.load(Ordering::Acquire) {
-        state @ (3 | 4) => {
-            let cpu_ns = JOB_CPU.load(Ordering::Relaxed);
-            let result = if state == 3 {
-                let output: [u64; 512] = core::array::from_fn(|i| unsafe {
-                    let page = if TARGET.load(Ordering::Relaxed) == 1 {
-                        core::ptr::addr_of!(OUTPUT)
-                    } else {
-                        core::ptr::addr_of!(SECOND_OUTPUT)
-                    };
-                    (*page).0.as_ptr().add(i).read_volatile()
-                });
-                crate::domain_control::accept(&output, cpu_ns)
-            } else {
-                crate::domain_control::abort(cpu_ns).map(|_| 0)
-            };
-            let consumed = match result {
-                Err(DomainError::Busy) => {
-                    crate::domain_control::pending_job().is_ok_and(|pending| !pending)
+        state @ (3 | 4 | 5) => {
+            c.preemptions = c
+                .preemptions
+                .saturating_add(RESULT_PREEMPTIONS.load(Ordering::Relaxed));
+            match state {
+                3 if RESULT_VERSION.load(Ordering::Relaxed) != 0 => c.successes += 1,
+                3 => c.stale += 1,
+                4 => {
+                    c.faults += 1;
+                    c.service_generation = c.service_generation.saturating_add(1);
                 }
-                _ => true,
-            };
-            if consumed {
-                c.preemptions = c
-                    .preemptions
-                    .saturating_add(RESULT_PREEMPTIONS.load(Ordering::Relaxed));
-                match result {
-                    Ok(version) if version != 0 => c.successes += 1,
-                    _ if state == 4 => {
-                        c.faults += 1;
-                        c.service_generation = c.service_generation.saturating_add(1);
-                    }
-                    _ => c.stale += 1,
-                }
-                REQUEST.store(0, Ordering::Release);
+                _ => {}
             }
+            REQUEST.store(0, Ordering::Release);
+            // Expose an actual idle boundary to core_turn on the next poll.
+            // Reissuing an empty opportunity here would starve an accepted
+            // CoreSet forever even though every old job had completed.
+            evidence(c, tick);
+            return;
         }
         _ => {}
     }
@@ -639,25 +834,14 @@ pub(super) fn poll(c: &mut Coordinator) {
             0
         };
         if slot != 0 {
-            if let Ok(Some(input)) = crate::domain_control::next(c.service_generation) {
-                unsafe {
-                    let page = if slot == 1 {
-                        core::ptr::addr_of_mut!(INPUT)
-                    } else {
-                        core::ptr::addr_of_mut!(SECOND_INPUT)
-                    };
-                    (*page).0.copy_from_slice(&input);
-                    core::arch::asm!("dsb ish", options(nostack));
-                }
-                c.requests = c.requests.saturating_add(1);
-                c.request_at = timer::ticks();
-                REQUEST_START.store(c.request_at, Ordering::Relaxed);
-                JOB_CPU.store(0, Ordering::Relaxed);
-                TARGET.store(slot as u64, Ordering::Relaxed);
-                REQUEST.store(1, Ordering::Release);
-                c.native.next_cpu = if slot == 1 { 2 } else { 1 };
-                wake_workers();
-            }
+            // Only an opportunity is published here. The actual C owner must
+            // prepay its full turn before creating/encoding a protected job.
+            c.request_at = timer::ticks();
+            CONTROLLER_EPOCH.store(c.service_generation, Ordering::Relaxed);
+            TARGET.store(slot as u64, Ordering::Relaxed);
+            REQUEST.store(1, Ordering::Release);
+            c.native.next_cpu = if slot == 1 { 2 } else { 1 };
+            wake_workers();
         }
     }
     evidence(c, tick);

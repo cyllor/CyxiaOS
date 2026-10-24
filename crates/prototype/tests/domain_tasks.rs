@@ -1233,3 +1233,121 @@ fn crossed_control_receipt_closes_the_tail_instead_of_refilling_on_plane_change(
     scheduler.recover_cpu(1, layout(5), 2 * WINDOW_NS).unwrap();
     assert_eq!(scheduler.cpu_window_usage(1, 2 * WINDOW_NS), Ok((0, 0)));
 }
+
+fn control_layout(generation: u64) -> CpuLayout {
+    CpuLayout {
+        business_mask: 1,
+        healthy_mask: 3,
+        generation,
+    }
+}
+
+#[test]
+fn complete_control_chain_is_prepaid_on_its_actual_cpu_and_refunded_once() {
+    let mut s = Scheduler::new();
+    let c = s
+        .reserve_control(1, control_layout(1), 0, 2_500_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.cpu_window_usage(1, 0), Ok((0, 2_500_000)));
+    assert_eq!(s.cpu_window_usage(0, 0), Ok((0, 0)));
+    assert_eq!(
+        s.reserve_control(1, control_layout(1), 0, 1),
+        Err(Error::Busy)
+    );
+    assert_eq!(s.dispatch(1, layout(2), 0, 1), Err(Error::Busy));
+    let mut forged = c;
+    forged.sequence += 1;
+    assert_eq!(s.complete_control(forged, 0, 0), Err(Error::Stale));
+    assert_eq!(s.control_active(1), Some(c));
+    s.complete_control(c, 1_000_000, 1_000_000).unwrap();
+    assert_eq!(
+        s.complete_control(c, 1_000_000, 1_000_000),
+        Err(Error::Stale)
+    );
+    assert_eq!(s.cpu_window_usage(1, 1_000_000), Ok((1_000_000, 0)));
+    assert_eq!(
+        s.stats().actual_ns,
+        0,
+        "control must not inflate business-thread CPU"
+    );
+}
+
+#[test]
+fn control_seventy_ms_and_shared_ninety_ms_survive_plane_round_trip() {
+    let mut s = Scheduler::new();
+    for turn in 0..28 {
+        let at = turn * 2_500_000;
+        let c = s
+            .reserve_control(1, control_layout(1), at, 2_500_000)
+            .unwrap()
+            .unwrap();
+        s.complete_control(c, 2_500_000, at + 2_500_000).unwrap();
+    }
+    assert_eq!(
+        s.reserve_control(1, control_layout(1), 70_000_000, 1),
+        Ok(None)
+    );
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(1, 1, 1, 0, 20_000_000), layout(2), 70_000_000)
+        .unwrap();
+    let mut now = 70_000_000;
+    while now < 90_000_000 {
+        let b = s.dispatch(1, layout(2), now, 20_000_000).unwrap().unwrap();
+        now += b.reserved_ns;
+        s.complete(b, b.reserved_ns, RunState::Runnable, now)
+            .unwrap();
+    }
+    assert_eq!(s.cpu_window_usage(1, now), Ok((90_000_000, 0)));
+    assert_eq!(s.reserve_control(1, control_layout(3), now, 1), Ok(None));
+    let c = s
+        .reserve_control(1, control_layout(3), WINDOW_NS, 2_500_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.control_total_ns, 2_500_000);
+    assert_eq!(s.cpu_window_usage(1, WINDOW_NS), Ok((0, 2_500_000)));
+    s.complete_control(c, 0, WINDOW_NS).unwrap();
+}
+
+#[test]
+fn pending_control_receipt_cannot_roll_away_or_release_a_crossed_window() {
+    let mut s = Scheduler::new();
+    let c = s
+        .reserve_control(1, control_layout(1), 98_000_000, 2_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.cpu_window_usage(1, WINDOW_NS), Ok((0, 2_000_000)));
+    assert_eq!(
+        s.reserve_control(1, control_layout(2), WINDOW_NS, 1),
+        Err(Error::Busy)
+    );
+    assert_eq!(s.dispatch(1, layout(2), WINDOW_NS, 1), Err(Error::Busy));
+    assert_eq!(
+        s.complete_control(c, 3_000_000, 101_000_000),
+        Err(Error::Budget)
+    );
+    assert_eq!(s.control_active(1), None);
+    assert_eq!(s.cpu_window_usage(1, 102_000_000), Ok((3_000_000, 0)));
+    assert_eq!(s.stats().quarantine_mask, 2);
+    assert_eq!(s.stats().overruns, 1);
+}
+
+#[test]
+fn control_work_never_starts_with_only_partial_window_credit() {
+    let mut s = Scheduler::new();
+    assert_eq!(
+        s.reserve_control(0, control_layout(1), 0, 2_500_000),
+        Err(Error::Auth)
+    );
+    assert_eq!(
+        s.reserve_control(1, control_layout(1), 99_000_000, 2_500_000),
+        Ok(None)
+    );
+    assert_eq!(s.cpu_window_usage(1, 99_000_000), Ok((0, 0)));
+    assert!(s.control_active(1).is_none());
+    assert!(
+        s.reserve_control(1, control_layout(1), WINDOW_NS, 2_500_000)
+            .unwrap()
+            .is_some()
+    );
+}

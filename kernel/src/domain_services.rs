@@ -85,6 +85,34 @@ struct State {
     recovery: RecoverySupervisor,
     services: [Option<Recoverable>; 2],
 }
+#[derive(Clone, Copy)]
+struct ServiceView {
+    key: ObjectKey,
+    recipe: u16,
+    since: u64,
+    last_restart: Option<u64>,
+    active: bool,
+    errors: u64,
+    error_window: u64,
+    isolated: Result<bool, Error>,
+    restarts: Result<u64, Error>,
+}
+#[derive(Clone, Copy)]
+struct ReadView {
+    at: u64,
+    boot: u64,
+    cores: CoreFacts,
+    core_pending: bool,
+    services: [Option<ServiceView>; 2],
+    console_key: ObjectKey,
+    console_window: u64,
+    console_metrics: [u64; 4],
+    console_action: u16,
+    console_until: u64,
+    console_poisoned: bool,
+}
+static READ_VIEW: crate::domain_platform::read_snapshot::ReadSnapshot<ReadView> =
+    crate::domain_platform::read_snapshot::ReadSnapshot::new();
 static mut STATE: State = State {
     boot: 0,
     console_key: ZERO,
@@ -126,7 +154,74 @@ fn with<R>(f: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
     LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .map_err(|_| Error::Busy)?;
     let _guard = Guard;
-    unsafe { f(&mut *core::ptr::addr_of_mut!(STATE)) }
+    unsafe {
+        let state = &mut *core::ptr::addr_of_mut!(STATE);
+        let result = f(state);
+        publish_view(state);
+        result
+    }
+}
+fn publish_view(state: &State) {
+    let now = now_ns();
+    let calls = state.console.calls.saturating_sub(state.console_calls);
+    let full = state.console.full.saturating_sub(state.console_full);
+    let view = ReadView {
+        at: now,
+        boot: state.boot,
+        cores: state.cores,
+        core_pending: state
+            .core_records
+            .iter()
+            .flatten()
+            .any(|r| !r.state.terminal()),
+        services: state.services.map(|slot| {
+            slot.map(|s| ServiceView {
+                key: s.key,
+                recipe: s.recipe,
+                since: s.since,
+                last_restart: s.last_restart,
+                active: s.active.is_some(),
+                errors: s.errors,
+                error_window: s.error_window,
+                isolated: state.recovery.isolated(s.key),
+                restarts: state.recovery.restarts(s.key),
+            })
+        }),
+        console_key: state.console_key,
+        console_window: state.console_window,
+        console_metrics: [
+            state.console.queued() as u64,
+            if calls == 0 {
+                0
+            } else {
+                ((u128::from(full) * 1000) / u128::from(calls)).min(u128::from(u64::MAX)) as u64
+            },
+            state.console.cpu_ns.saturating_sub(state.console_cpu) / 1000,
+            state.console_wait / 1000,
+        ],
+        console_action: state.console.current(now),
+        console_until: state
+            .console_record
+            .map_or(0, |r| r.stamp.installed_until_ns),
+        console_poisoned: state.console.poisoned(),
+    };
+    let _ = READ_VIEW.publish(view);
+}
+/// C copies a small immutable snapshot and releases its separate short gate.
+/// It never holds the live service/UART/recovery gate while CPU0 is progressing.
+fn read<R>(f: impl FnOnce(&ReadView) -> Result<R, Error>) -> Result<R, Error> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(Error::NotReady);
+    }
+    let view = READ_VIEW
+        .read()
+        .map_err(|_| Error::Busy)?
+        .ok_or(Error::NotReady)?;
+    let now = now_ns();
+    if now < view.at || now - view.at >= 50_000_000 {
+        return Err(Error::Busy);
+    }
+    f(&view)
 }
 fn now_ns() -> u64 {
     crate::domain_platform::now_ns()
@@ -531,9 +626,9 @@ fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     if !READY.load(Ordering::Acquire) {
         return None;
     }
-    with(|s| {
+    read(|s| {
         Ok(match (domain, kind) {
-            (1, 2) if ordinal == 0 && s.cores.core_generation != 0 => Some(core_key(s)),
+            (1, 2) if ordinal == 0 && s.cores.core_generation != 0 => Some(core_view_key(s)),
             (14, 1) => s.services.get(ordinal).and_then(|e| e.map(|v| v.key)),
             (15, 1) if ordinal == 0 => Some(s.console_key),
             _ => None,
@@ -542,6 +637,18 @@ fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     .ok()
     .flatten()
 }
+fn core_view_key(s: &ReadView) -> ObjectKey {
+    ObjectKey {
+        id: CORE_ID,
+        generation: s.boot,
+    }
+}
+fn service_view_index(s: &ReadView, target: ObjectKey) -> Result<usize, Error> {
+    s.services
+        .iter()
+        .position(|v| v.is_some_and(|v| v.key == target))
+        .ok_or(Error::Stale)
+}
 fn service_index(s: &State, target: ObjectKey) -> Result<usize, Error> {
     s.services
         .iter()
@@ -549,10 +656,10 @@ fn service_index(s: &State, target: ObjectKey) -> Result<usize, Error> {
         .ok_or(Error::Stale)
 }
 fn observation(domain: u16, target: ObjectKey) -> Result<[u64; 4], Error> {
-    with(|s| match domain {
-        1 if target == core_key(s) => crate::domain_tasks::node_scheduler_observation(),
+    read(|s| match domain {
+        1 if target == core_view_key(s) => crate::domain_tasks::node_scheduler_observation(),
         14 => {
-            let service = s.services[service_index(s, target)?].ok_or(Error::Stale)?;
+            let service = s.services[service_view_index(s, target)?].ok_or(Error::Stale)?;
             let now = now_ns();
             let heartbeat = crate::domain_tasks::heartbeat_ns(target)?;
             Ok([
@@ -566,45 +673,38 @@ fn observation(domain: u16, target: ObjectKey) -> Result<[u64; 4], Error> {
                 } else {
                     0
                 },
-                s.recovery.restarts(target)?,
-                s.services
-                    .iter()
-                    .flatten()
-                    .filter(|v| v.active.is_some())
-                    .count() as u64,
+                service.restarts?,
+                s.services.iter().flatten().filter(|v| v.active).count() as u64,
             ])
         }
         15 if target == s.console_key => {
             let live = now_ns() / 100_000_000 == s.console_window;
-            let calls = s.console.calls.saturating_sub(s.console_calls);
             Ok([
-                s.console.queued() as u64,
-                if live && calls != 0 {
-                    s.console.full.saturating_sub(s.console_full) * 1000 / calls
-                } else {
-                    0
-                },
-                if live {
-                    s.console.cpu_ns.saturating_sub(s.console_cpu) / 1000
-                } else {
-                    0
-                },
-                if live { s.console_wait / 1000 } else { 0 },
+                s.console_metrics[0],
+                if live { s.console_metrics[1] } else { 0 },
+                if live { s.console_metrics[2] } else { 0 },
+                if live { s.console_metrics[3] } else { 0 },
             ])
         }
         _ => Err(Error::Stale),
     })
 }
 fn current(domain: u16, kind: u16, target: ObjectKey) -> Result<Action, Error> {
-    with(|s| match (domain, kind) {
-        (1, 2) if target == core_key(s) && s.cores.core_generation != 0 => {
+    read(|s| match (domain, kind) {
+        (1, 2) if target == core_view_key(s) && s.cores.core_generation != 0 => {
             Ok(Action::ControlSet(s.cores.control))
         }
         (14, 1) => {
-            service_index(s, target)?;
+            service_view_index(s, target)?;
             Ok(Action::RecoveryRecipe(0))
         }
-        (15, 1) if target == s.console_key => Ok(Action::ConsoleBatch(s.console.current(now_ns()))),
+        (15, 1) if target == s.console_key => {
+            Ok(Action::ConsoleBatch(if now_ns() < s.console_until {
+                s.console_action
+            } else {
+                8
+            }))
+        }
         _ => Err(Error::Stale),
     })
 }
@@ -666,11 +766,65 @@ fn legal_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Resul
     }
 }
 fn legal(action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
-    with(|s| legal_locked(s, action, target, now))
+    read(|s| legal_view(s, action, target, now))
+}
+fn legal_view(s: &ReadView, action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
+    action.validate()?;
+    match action {
+        Action::ControlSet(mask) => {
+            if target != core_view_key(s) || s.cores.core_generation == 0 {
+                return Err(Error::Stale);
+            }
+            if ![2, 6].contains(&mask)
+                || mask & s.cores.healthy != mask
+                || mask & s.cores.draining != 0
+                || s.cores.business & s.cores.healthy & !s.cores.draining & !mask == 0
+            {
+                return Err(Error::Budget);
+            }
+            if mask != s.cores.control {
+                if (mask ^ s.cores.control) != 4 {
+                    return Err(Error::Range);
+                }
+                if s.core_pending {
+                    return Err(Error::Busy);
+                }
+                crate::domain_tasks::can_control_move(2)?;
+            }
+            Ok(())
+        }
+        Action::RecoveryRecipe(recipe) => {
+            let service = s.services[service_view_index(s, target)?].ok_or(Error::Stale)?;
+            if recipe == 0 {
+                return Ok(());
+            }
+            if recipe != service.recipe {
+                return Err(Error::Auth);
+            }
+            if service.active || service.isolated? {
+                return Err(Error::Busy);
+            }
+            if service
+                .last_restart
+                .is_some_and(|at| now < at || now - at < 1_000_000_000)
+            {
+                return Err(Error::Again);
+            }
+            Ok(())
+        }
+        Action::ConsoleBatch(_) if target == s.console_key => {
+            if s.console_poisoned {
+                Err(Error::Io)
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(Error::Unsupported),
+    }
 }
 fn target_features(action: Action, target: ObjectKey) -> Result<TargetFeatures, Error> {
-    with(|s| {
-        legal_locked(s, action, target, now_ns())?;
+    read(|s| {
+        legal_view(s, action, target, now_ns())?;
         Ok(if let Action::ControlSet(mask) = action {
             TargetFeatures {
                 // The controller adds P199's queued mandatory WCET estimate

@@ -32,7 +32,7 @@ pub(crate) fn advance_network<P>(
 #[cfg(not(test))]
 use crate::broker;
 #[cfg(not(test))]
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 use cyxia_cluster_transport::tls::Error;
 #[cfg(not(test))]
 use cyxia_cluster_transport::tls::{Buffers, IdentitySigner, Pairing, node_id, public_key};
@@ -168,7 +168,9 @@ pub fn run() -> ! {
     )
     .unwrap_or_else(|_| broker::fatal(0x107));
     broker::trace(2);
-    let mut buffers = Box::new(Buffers::new());
+    // Buffers owns four fixed-capacity heap allocations. Keeping only these
+    // handles on the bounded service stack avoids a 96 KiB temporary frame.
+    let mut buffers = Buffers::new();
     let mut input = [0u8; PAYLOAD];
     let mut ingress =
         TlsIngress::new(broker::clock_ns() / 1_000_000).unwrap_or_else(|_| broker::fatal(0x110));

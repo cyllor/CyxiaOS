@@ -3,7 +3,7 @@
 //! user/prototype-cluster service supplies these with a narrow EL1 broker.
 extern crate alloc;
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use ring::digest;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError,
@@ -305,18 +305,26 @@ impl Pairing {
 }
 
 pub struct Buffers {
-    input: [u8; RECORD_BUFFER],
-    output: [u8; RECORD_BUFFER],
-    received: [u8; PLAINTEXT_BUFFER],
-    sending: [u8; PLAINTEXT_BUFFER],
+    input: Box<[u8; RECORD_BUFFER]>,
+    output: Box<[u8; RECORD_BUFFER]>,
+    received: Box<[u8; PLAINTEXT_BUFFER]>,
+    sending: Box<[u8; PLAINTEXT_BUFFER]>,
 }
 impl Buffers {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        // Box::new([0; N]) can materialize N bytes in the caller's permanent
+        // frame. The native service's never-returning run frame was 120400 B,
+        // leaving insufficient space for a real TLS key-schedule call. Vec's
+        // repeated-byte constructor initializes the allocator-owned region
+        // directly; the checked boxed-slice conversion moves only a pointer.
+        fn zeros<const N:usize>()->Box<[u8;N]>{
+            vec![0u8;N].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!("fixed buffer length"))
+        }
         Self {
-            input: [0; RECORD_BUFFER],
-            output: [0; RECORD_BUFFER],
-            received: [0; PLAINTEXT_BUFFER],
-            sending: [0; PLAINTEXT_BUFFER],
+            input: zeros(),
+            output: zeros(),
+            received: zeros(),
+            sending: zeros(),
         }
     }
 }
@@ -471,14 +479,14 @@ impl<'a> Session<'a> {
         let result = match &mut self.connection {
             Connection::Client(c) => step(
                 c.process_tls_records(incoming),
-                &mut self.buffers.output,
-                &mut self.buffers.received,
+                &mut self.buffers.output[..],
+                &mut self.buffers.received[..],
                 &self.buffers.sending[..self.sending],
             ),
             Connection::Server(c) => step(
                 c.process_tls_records(incoming),
-                &mut self.buffers.output,
-                &mut self.buffers.received,
+                &mut self.buffers.output[..],
+                &mut self.buffers.received[..],
                 &self.buffers.sending[..self.sending],
             ),
         };

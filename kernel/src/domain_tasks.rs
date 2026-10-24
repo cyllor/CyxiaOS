@@ -655,6 +655,7 @@ pub fn close_cpu(slot: usize) -> Result<(), Error> {
         }
         s.draining |= 1u64 << slot;
         if s.active[slot].is_some()
+            || s.scheduler.control_active(slot).is_some()
             || COMPLETE_READY[slot].load(Ordering::Acquire)
             || s.tasks
                 .iter()
@@ -670,6 +671,7 @@ pub fn quiescent(slot: usize) -> bool {
     locked(|s| {
         Ok(slot < 64
             && s.active[slot].is_none()
+            && s.scheduler.control_active(slot).is_none()
             && !s
                 .tasks
                 .iter()
@@ -958,6 +960,37 @@ pub fn complete_service(actual_ns: u64, finished_ns: u64) -> Result<(), Error> {
 pub fn cpu_window_usage(slot: usize, now: u64) -> Result<(u64, u64), Error> {
     locked(|s| s.scheduler.cpu_window_usage(slot, now))
 }
+/// Only the real C worker on this CPU may spend this credit. During a drain,
+/// cleanup may settle/abort its existing job before the stop acknowledgement.
+pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCredit>, Error> {
+    let slot = cpu::slot();
+    if !matches!(slot, 1 | 2) {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        if s.draining & (1u64 << slot) != 0 && !cleanup {
+            return Err(Error::Busy);
+        }
+        s.scheduler
+            .reserve_control(slot, s.layout, now_ns(), required_ns)
+    })
+}
+pub fn complete_control(
+    credit: ControlCredit,
+    actual_ns: u64,
+    finished_ns: u64,
+) -> Result<(), Error> {
+    if usize::from(credit.cpu) != cpu::slot() {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        let result = s.scheduler.complete_control(credit, actual_ns, finished_ns);
+        if result == Err(Error::Budget) {
+            publish_evidence(s);
+        }
+        result
+    })
+}
 pub fn record_control_cost(slot: usize, actual_ns: u64, finished_ns: u64) -> Result<(), Error> {
     locked(|s| {
         if slot >= 64 {
@@ -1107,7 +1140,7 @@ pub fn current_action(domain: u16, target: ObjectKey) -> Result<Action, Error> {
             }
             8 if target == SERVICE_KEY => Ok(Action::ServiceBatch(s.services.policy(now))),
             13 => Ok(Action::BackgroundBudget(
-                s.background.current_status(target, now)?.budget_milli,
+                s.background.peek_status(target, now)?.budget_milli,
             )),
             _ => Err(Error::Stale),
         }
@@ -1183,7 +1216,7 @@ pub fn observation(domain: u16, target: ObjectKey) -> Result<[u64; 4], Error> {
             }
             13 => {
                 group_index(s, target)?;
-                let status = s.background.current_status(target, now)?;
+                let status = s.background.peek_status(target, now)?;
                 let cores = (s.layout.business_mask
                     & s.layout.healthy_mask
                     & !s.draining

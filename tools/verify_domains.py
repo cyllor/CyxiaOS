@@ -25,11 +25,13 @@ import tempfile
 import time
 
 try:
+    from .build_unified import code_source_map
     from .check_elf import boot_profile, inspect_elf, symbol
     from .doctor import ROOT
     from .run_qemu import Qmp
     from .transport import FrameDecoder
 except ImportError:
+    from build_unified import code_source_map
     from check_elf import boot_profile, inspect_elf, symbol
     from doctor import ROOT
     from run_qemu import Qmp
@@ -38,8 +40,15 @@ except ImportError:
 CONTROL_MAGIC = 0x435958444F4D3031
 UNIFIED_MAGIC = 0x435958554E493031
 IPI_MAGIC = 0x4359495049000001
+CONTROL_CREDIT_MAGIC = 0x4359434352454401
+RUNTIME_MAGIC = 0x43595852554E3133
 CONTROL_WORDS = 512 + 64 * 640
 ALL_FAMILIES = (1 << 18) - 1
+# Older service images reported these startup errors through OP_TRACE and then
+# yielded forever. Never accept that as a healthy service just because another
+# domain's ordinary probe and control loop made progress.
+LEGACY_FATAL_EVENTS = {0xFE, 0xFF, 0x101, 0x102, 0x104, 0x105, 0x106,
+                       0x107, 0x108, 0x109, 0x110, 0x111}
 REQUIRED = {
     "UNIFIED_EVIDENCE": 4096,
     "DOMAIN_CONTROL_EVIDENCE": CONTROL_WORDS * 8,
@@ -47,6 +56,7 @@ REQUIRED = {
     "STORAGE_V13_EVIDENCE": 4096,
     "DOMAIN_TASK_EVIDENCE": 256,
     "TASK_OVERRUN_EVIDENCE": 256,
+    "CONTROL_CREDIT_EVIDENCE": 512,
     "IPI_EVIDENCE": 4096,
 }
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64,
@@ -78,6 +88,9 @@ def parse_unified(data):
         return None
     require(u[0] == UNIFIED_MAGIC and u[1] > 0, "invalid unified header")
     require(u[6] <= 200, "unified event trace overflow")
+    events = list(u[32:32 + 2 * u[6]:2])
+    require(not any(event in LEGACY_FATAL_EVENTS or event & (1 << 63) for event in events),
+            "EL0 service reported a fatal event")
     require(u[16] == 1 and u[17] > 0 and u[18] > 0,
             "image does not contain an enabled ordinary EL0 file probe")
     require(u[19] in (0, 1), "invalid probe completion flag")
@@ -86,7 +99,7 @@ def parse_unified(data):
     return {
         "boot_epoch": u[1], "el0_returns": u[2],
         "sent_bytes": u[4], "received_bytes": u[5],
-        "events": list(u[32:32 + 2 * u[6]:2]),
+        "events": events,
         "probe_object": [u[17], u[18]], "probe_completed": bool(u[19]),
         "probe_exit_code": u[20],
     }
@@ -100,6 +113,7 @@ def parse_control(data, boot_epoch=None):
             "invalid domain control header")
     require(w[12:14] == (64, 640), "unsupported domain evidence layout")
     require(w[25] == 0, f"native resource confirmation error {w[25]} in domain {w[26]}")
+    require(w[28] == 0, f"native stability receipt error {w[28]} in domain {w[29]}")
     if boot_epoch is not None:
         require(w[2] == boot_epoch, "domain/unified BootEpoch mismatch")
     require(w[3] & ~ALL_FAMILIES == 0, "unknown registered family")
@@ -113,6 +127,8 @@ def parse_control(data, boot_epoch=None):
         require(r[0] == r[1] and r[7] == w[2], "record identity mismatch")
         require(1 <= r[14] <= 4, "invalid executor state")
         if r[13] > 0:
+            require(r[9] >= r[8] and r[9] - r[8] <= 50_000_000,
+                    "published control job exceeded 50 ms wall deadline")
             require(r[12] <= 500_000 and r[18] == 0,
                     "published policy exceeded 0.5 ms publication budget")
             require(r[10] + r[11] + r[29] <= 2_000_000,
@@ -169,15 +185,61 @@ def parse_ipi(data):
     }
 
 
+def parse_control_credit(data):
+    w = words(data, 64)
+    require(w[0] in (0, CONTROL_CREDIT_MAGIC), "invalid control credit evidence header")
+    if w[0]:
+        require(w[1] == 1, "unsupported control credit evidence version")
+    failures = []
+    names = ("cpu", "sequence", "core_generation", "window", "grant_start_ns",
+             "body_start_ns", "finish_ns", "reserved_ns", "actual_ns",
+             "control_prepaid_ns", "control_actual_ns", "physical_prepaid_ns",
+             "physical_actual_ns", "last_phase", "phase_bits", "evaluation_cpu_ns",
+             "job_start_ns", "request_state", "preemptions", "flags", "error")
+    for cpu, offset in ((1, 2), (2, 24)):
+        row = w[offset:offset + 22]
+        require(row[0] in (0, 1, 2), "invalid control credit receipt state")
+        if not row[0]:
+            continue
+        if row[0] == 1:
+            failures.append({"cpu": cpu, "complete": False})
+            continue
+        require(row[1] == cpu and row[2] > 0 and row[8] > 0 and row[21] > 0,
+                "invalid completed control credit receipt")
+        failures.append(dict(zip(names, row[1:]), complete=True))
+    return failures
+
+
+def parse_runtime(data):
+    w = words(data, 1024)
+    # This counter is sticky even when the periodic record's seqlock is odd.
+    require(w[38] == 0, f"native control worker fault count {w[38]}")
+    if w[0] == 0 or w[2] & 1:
+        return None
+    require(w[0] == RUNTIME_MAGIC and w[1] == 3, "invalid native runtime header")
+    return {"control_mask": w[6], "business_mask": w[7],
+            "quarantined_mask": w[9], "core_generation": w[10],
+            "control_max_debit": w[35], "control_ticks": w[36],
+            "control_faults": w[38], "failed_cpus": w[56]}
+
+
 def diagnostics(guest, bundle):
     guest["unified_words"] = list(words(bundle["UNIFIED_EVIDENCE"], 512)[:32])
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
+                                    ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
+                                    ("RUNTIME_V13_EVIDENCE", "runtime_evidence", 1024),
                                     ("TASK_SLICE_EVIDENCE", "slice_evidence", 128),
                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
                                     ("PANIC_EVIDENCE", "panic_evidence", 8)):
         if symbol_name in bundle:
             guest[key] = list(words(bundle[symbol_name], count))
+    if "CONTROL_CREDIT_EVIDENCE" in bundle:
+        guest["control_credit"] = parse_control_credit(bundle["CONTROL_CREDIT_EVIDENCE"])
+        require(not guest["control_credit"],
+                "native C credit failure: " + json.dumps(guest["control_credit"], separators=(",", ":")))
+    if "RUNTIME_V13_EVIDENCE" in bundle:
+        guest["runtime"] = parse_runtime(bundle["RUNTIME_V13_EVIDENCE"])
     if "DOMAIN_TASK_EVIDENCE" in bundle:
         guest["tasks"] = parse_tasks(bundle["DOMAIN_TASK_EVIDENCE"])
     if "IPI_EVIDENCE" in bundle:
@@ -278,6 +340,36 @@ def replay(verifier, capture_path, model):
     return proof
 
 
+def verify_source_build(manifest_path, source_root, image_hashes):
+    """Check the local builder's frozen source/image record, not just HEAD."""
+    require(manifest_path.stat().st_size <= 4 * 1024 * 1024, "build manifest too large")
+    manifest = json.loads(manifest_path.read_text())
+    require(manifest.get("schema_version") == 1 and manifest.get("status") == "BUILT_NOT_RUN",
+            "unsupported native build manifest")
+    require(manifest.get("profiles", {}).get("selftest") is True
+            and manifest.get("own_private_key_only_verified") is True,
+            "build lacks the ordinary probe or separate identity audit")
+    actual_sources = code_source_map(source_root)
+    require(actual_sources == manifest.get("code_source_map"), "native source changed after build")
+    source_hash = hashlib.sha256(json.dumps(actual_sources, sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+    require(source_hash == manifest.get("code_source_sha256"), "native source manifest hash mismatch")
+    require(sha(source_root / "tools/build_unified.py") == manifest.get("builder_sha256"),
+            "native builder changed after build")
+    artifacts = manifest.get("artifacts", {})
+    for index, image_hash in enumerate(image_hashes):
+        name = f"node-{'ab'[index]}.elf"
+        require(artifacts.get(name, {}).get("sha256") == image_hash,
+                "native image differs from build manifest: " + name)
+    nodes = manifest.get("nodes", {})
+    require(nodes.get("a", {}).get("node_id") and nodes.get("b", {}).get("node_id")
+            and nodes["a"]["node_id"] != nodes["b"]["node_id"]
+            and nodes["a"].get("peer_node_id") == nodes["b"]["node_id"]
+            and nodes["b"].get("peer_node_id") == nodes["a"]["node_id"],
+            "native build does not bind two distinct reciprocal identities")
+    return {"manifest_sha256": sha(manifest_path), "code_source_sha256": source_hash}
+
+
 def run(args):
     require(1 <= args.timeout <= 600 and 0 <= args.hold <= 60,
             "invalid functional observation deadline")
@@ -287,6 +379,10 @@ def run(args):
     images = [args.elf.resolve(strict=True)]
     if not args.single:
         images.append(args.peer_elf.resolve(strict=True))
+    require(bool(args.build_manifest) == bool(args.source_root),
+            "--build-manifest and --source-root must be provided together")
+    manifest_path = args.build_manifest.resolve(strict=True) if args.build_manifest else None
+    source_root = args.source_root.resolve(strict=True) if args.source_root else None
     verifier = args.verifier.resolve(strict=True)
     formatter = args.formatter.resolve(strict=True)
     model = args.model.resolve(strict=True) if args.model else None
@@ -315,6 +411,8 @@ def run(args):
     previous_umask = os.umask(0o077)
     print(json.dumps({"output": str(output), "nodes": len(images)}), flush=True)
     try:
+        if manifest_path:
+            report["source_build"] = verify_source_build(manifest_path, source_root, report["elf_sha256"])
         report["qemu_version"] = subprocess.check_output(
             [str(binary), "--version"], text=True, timeout=10).splitlines()[0]
         with tempfile.TemporaryDirectory(prefix="cyx-domains-") as temporary, ExitStack() as files:
@@ -475,6 +573,10 @@ def run(args):
                            "applied_domains": sorted({d for proof in checked for d in proof["applied_domains"]})})
         require([sha(image) for image in images] == report["elf_sha256"], "ELF changed during native run")
         require(sha(verifier) == report["verifier_sha256"], "host verifier changed during native run")
+        if manifest_path:
+            require(verify_source_build(manifest_path, source_root, report["elf_sha256"])
+                    == report["source_build"], "native build record changed during execution")
+            report["source_build_attested"] = True
         report.update(status="PASS", host_replay=proofs)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
         report["error"] = type(error).__name__ + ": " + str(error)
@@ -484,7 +586,8 @@ def run(args):
         report["wall_seconds"] = time.monotonic() - started
         report["observations"] = [{key: guest.get(key) for key in
                                   ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "overrun_evidence", "panic_evidence",
-                                   "ipi_evidence", "slice_evidence",
+                                   "ipi_evidence", "slice_evidence", "runtime", "runtime_evidence",
+                                   "control_credit", "control_credit_evidence",
                                    "registers", "stack_pa", "final_parse_error")}
                                  for guest in guests]
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -502,6 +605,8 @@ def main():
     parser.add_argument("--formatter", type=Path, default=ROOT / "target/debug/examples/prototype-disk")
     parser.add_argument("--verifier", type=Path, default=ROOT / "target/debug/examples/verify-domain-evidence")
     parser.add_argument("--model", type=Path, help="raw model package used by the native controller")
+    parser.add_argument("--build-manifest", type=Path, help="frozen native build record to verify")
+    parser.add_argument("--source-root", type=Path, help="exact source checkout used for that build")
     parser.add_argument("--qemu", help="path to qemu-system-aarch64")
     parser.add_argument("--timeout", type=float, default=150)
     parser.add_argument("--hold", type=float, default=2, help="wall seconds after all functional conditions hold")
