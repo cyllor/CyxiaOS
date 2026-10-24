@@ -2,8 +2,15 @@
 #![no_main]
 //! Restartable isolated controller; each invocation evaluates a live snapshot.
 mod abi;
+#[path = "../../crates/prototype/src/domains/types.rs"]
+mod domains;
+#[path = "../../crates/prototype/src/features.rs"]
+mod features;
 #[path = "../../crates/prototype/src/model.rs"]
 mod model;
+mod native;
+#[path = "../../crates/prototype/src/policy_wire.rs"]
+mod policy_wire;
 use abi::*;
 use core::arch::asm;
 #[used]
@@ -35,6 +42,23 @@ extern "C" fn _start(mode: u64) -> ! {
         },
         0 => (),
         _ => abort(),
+    }
+    if unsafe { ((INPUT_VA as *const u64).add(1)).read_volatile() } == native::ABI {
+        let input: [u64; native::INPUT_WORDS] =
+            core::array::from_fn(|i| unsafe { (INPUT_VA as *const u64).add(i).read_volatile() });
+        let mut output = [0u64; native::OUTPUT_WORDS];
+        let model =
+            model::Model::parse(core::hint::black_box(&RUNTIME_MODEL)).unwrap_or_else(|_| abort());
+        native::evaluate(&input, &model, &mut output).unwrap_or_else(|_| abort());
+        for (i, value) in output.into_iter().enumerate() {
+            unsafe {
+                (OUTPUT_VA as *mut u64).add(i).write_volatile(value);
+            }
+        }
+        unsafe {
+            asm!("svc #0x541", in("x0") OUTPUT_VA, in("x1") 512u64, options(nostack));
+        }
+        abort()
     }
     let input: [u64; INPUT_WORDS] =
         core::array::from_fn(|i| unsafe { (INPUT_VA as *const u64).add(i).read_volatile() });

@@ -1,7 +1,7 @@
 //! Durable boot counter in an ordinary, allocated root file.
 //!
 //! This minimal provisioner accepts a fresh filesystem or its own existing
-//! `.cyxia-boot` and strictly validated reserved cluster regular files. It is not a general filesystem allocator. The boot owner
+//! `.cyxia-boot`, reserved cluster files and globally validated ordinary files. The boot owner
 //! constructs one `BootSession` and passes the returned identity to restarted
 //! services; they must never allocate another epoch within the same boot.
 use crate::{
@@ -61,6 +61,8 @@ impl BootSession {
         if !journal.is_writable() {
             return Err(Error::Layout);
         }
+        crate::domains::filesystem::validate_volume(journal, device, scratch, work)
+            .map_err(|_| Error::Layout)?;
         let uuid = journal.superblock().fs_uuid;
         journal
             .read_block(device, INODE_START, &mut work[0], scratch)
@@ -83,53 +85,6 @@ impl BootSession {
                 }
                 *blocks = inode.extents[0].block_count;
                 cluster_files += 1;
-            }
-        }
-        // Only explicitly reserved regular files are accepted; orphan files and
-        // allocations outside their exact contiguous extents remain fatal.
-        // Check the whole inode table and bitmap before publishing authority;
-        // other live files need the future general allocator/ownership validator.
-        for table in 0..16_u32 {
-            journal
-                .read_block(device, INODE_START + table, &mut work[2], scratch)
-                .map_err(Error::Journal)?;
-            for slot in 0..16_u32 {
-                let id = table * 16 + slot;
-                if id == 0 || (id == 1 && !fresh) || (id >= 2 && id < 2 + cluster_files as u32) {
-                    continue;
-                }
-                let at = slot as usize * 256;
-                if Inode::decode(id, &work[2][at..at + 256])
-                    .map_err(Error::Format)?
-                    .kind
-                    != InodeKind::Free
-                {
-                    return Err(Error::Layout);
-                }
-            }
-        }
-        for map in 0..4_u32 {
-            journal
-                .read_block(device, BITMAP_START + map, &mut work[2], scratch)
-                .map_err(Error::Journal)?;
-            for (index, &byte) in work[2].iter().enumerate() {
-                let mut expected = 0;
-                for bit in 0..8 {
-                    let block = map * 32768 + index as u32 * 8 + bit;
-                    if block < DATA_START
-                        || (!fresh && block < DATA_START + 2)
-                        || cluster_blocks.iter().enumerate().any(|(i, &n)| {
-                            let start = crate::cluster::volume::START
-                                + i as u32 * crate::cluster::volume::FILE_BLOCKS;
-                            block >= start && block < start + n
-                        })
-                    {
-                        expected |= 1 << bit;
-                    }
-                }
-                if byte != expected {
-                    return Err(Error::Layout);
-                }
             }
         }
         let epoch;
@@ -170,8 +125,8 @@ impl BootSession {
             .map_err(Error::Format)?;
             epoch = 1;
         } else {
-            if root.size != (1 + cluster_files as u64) * 128
-                || root.extent_count != 1
+            if root.size < (1 + cluster_files as u64) * 128
+                || root.extent_count == 0
                 || root.extents[0]
                     != (Extent {
                         logical_start: 0,
@@ -197,12 +152,6 @@ impl BootSession {
             journal
                 .read_block(device, DATA_START, &mut work[2], scratch)
                 .map_err(Error::Journal)?;
-            if work[2][(1 + cluster_files) * 128..]
-                .iter()
-                .any(|&byte| byte != 0)
-            {
-                return Err(Error::Layout);
-            }
             if DirectoryEntry::decode(&work[2][..128]).map_err(Error::Format)?
                 != (DirectoryEntry {
                     inode_id: 1,

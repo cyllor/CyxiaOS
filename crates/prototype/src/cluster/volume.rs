@@ -155,10 +155,16 @@ impl Volume {
         }
         if fresh {
             let mut root = Inode::decode(0, &w[12][..256]).map_err(Error::Format)?;
-            if root.size != (file as u64 + 1) * 128 {
+            if root.kind != InodeKind::Directory || root.extent_count == 0
+                || root.extents[0].physical_start != DATA_START || root.size < 128 {
                 return Err(Error::Layout);
             }
-            root.size += 128;
+            let slot = (file + 1) * 128;
+            if slot < root.size as usize
+                && DirectoryEntry::decode(&w[14][slot..slot + 128]).map_err(Error::Format)? != DirectoryEntry::EMPTY {
+                return Err(Error::Layout);
+            }
+            root.size = root.size.max((file as u64 + 2) * 128);
             root.durable_write_seq = root
                 .durable_write_seq
                 .checked_add(1)

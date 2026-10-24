@@ -25,6 +25,14 @@ pub trait BlockDevice {
     fn read_block(&mut self, block: u32, output: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error>;
     fn write_block(&mut self, block: u32, bytes: &[u8; BLOCK_SIZE]) -> Result<(), Self::Error>;
     fn flush(&mut self) -> Result<(), Self::Error>;
+    /// Enter the independent progress reservation for checkpoint/recovery I/O.
+    fn recovery_enter(&mut self) {}
+    fn recovery_exit(&mut self) {}
+    /// Reserve the complete ordinary send entitlement before writing BEGIN.
+    /// This hook must have no media side effects on rejection.
+    fn transaction_begin(&mut self, _bytes: u64) -> Result<(), Self::Error> { Ok(()) }
+    /// Failed/unknown commits retain their in-flight custody at the adapter.
+    fn transaction_end(&mut self, _success: bool) {}
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -335,6 +343,8 @@ impl Journal {
             log_epoch: self.superblock.log_epoch,
             txid: self.next_txid,
         };
+        device.transaction_begin(u64::from(needed) * BLOCK_SIZE as u64).map_err(Error::Io)?;
+        let result = (|| {
         self.writable = false;
         let mut cursor = self.next_block;
         write_record(
@@ -402,6 +412,9 @@ impl Journal {
         self.last_commit_lsn = commit_lsn;
         self.writable = true;
         Ok(CommitReceipt { key, commit_lsn })
+        })();
+        device.transaction_end(result.is_ok());
+        result
     }
 
     /// Read the newest committed image, including data not yet checkpointed.
@@ -440,10 +453,15 @@ impl Journal {
         if !self.writable {
             return Err(Error::Poisoned);
         }
-        self.writable = false;
-        self.checkpoint_inner(device, scratch)?;
-        self.writable = true;
-        Ok(self.superblock)
+        device.recovery_enter();
+        let result = (|| {
+            self.writable = false;
+            self.checkpoint_inner(device, scratch)?;
+            self.writable = true;
+            Ok(self.superblock)
+        })();
+        device.recovery_exit();
+        result
     }
 
     fn checkpoint_inner<D: BlockDevice>(
