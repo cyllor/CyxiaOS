@@ -11,6 +11,9 @@ bench = false
 
 [features]
 selftest = []
+# Four-vCPU native mechanism acceptance; not the desktop production boot.
+smp-selftest = ["selftest"]
+ai-control-selftest = ["smp-selftest"]
 graphics = []
 ported = []
 openbox = ["ported"]
@@ -44,3 +47,4 @@ cyxia-ai-runtime = { path = "../crates/ai-runtime" }
 cyxia-posix = { path = "../crates/posix" }
 cyxia-ai-fs = { path = "../crates/ai-fs" }
 cyxia-driver-virtio = { path = "../crates/driver-virtio" }
+cyxia-control-model = { path = "../crates/control-model" }

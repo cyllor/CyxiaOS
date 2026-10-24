@@ -5,7 +5,7 @@
 use super::{
     Clock, Error, Incarnation, ObjectId, Result,
     codec::{Bytes, Reader},
-    contracts::{InstallIntent, LeaseToken},
+    contracts::{InstallIntent, LeaseToken, Ledger},
     membership::Active,
     storage::{self, Key, Store},
 };
@@ -214,15 +214,22 @@ impl<const O: usize> Endpoint<O> {
         }
         Ok(())
     }
-    pub fn begin(
+    /// An installed fence is necessary but not sufficient. New effects also
+    /// require a live GRANTED ledger entry, never GrantIntent or Revoking.
+    pub fn begin<const N: usize>(
         &mut self,
         token: LeaseToken,
+        ledger: &Ledger<N>,
         active: &Active<'_>,
         actor: Incarnation,
         now: u64,
     ) -> Result<Permit> {
         self.clock.observe(now)?;
         self.check(token, active, actor, now)?;
+        let (authorized, _) = ledger.execution(token.contract, self, active, now)?;
+        if authorized != token {
+            return Err(Error::Stale);
+        }
         let slot = self
             .operations
             .iter()

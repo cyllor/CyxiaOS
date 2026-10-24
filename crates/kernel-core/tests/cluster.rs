@@ -605,7 +605,8 @@ fn reboot_rejoin_requires_both_new_config_signatures() {
     let mut c = claims(1);
     c.identity.boot = 2;
     let ps = [peer(c), peer(claims(2))];
-    let new = config(ps, 2);
+    let new = Config::new(&TestCrypto, id(9), 2, ps, [[31; 32], [32; 32]], [33; 32]).unwrap();
+    a.isolate(&mut f.da).unwrap();
     let b = a.prepare(&mut f.da, new, ps).unwrap();
     let mut bad = signs(new, &b);
     bad[1] = signs(f.cfg, &confirm_bytes(f.cfg).unwrap())[1];
@@ -785,7 +786,7 @@ fn in_flight_operation_blocks_reclamation_and_unfenceable_target_is_refused() {
     let t = w.token();
     let p = w
         .endpoint
-        .begin(t, &w.f.a.active().unwrap(), inc(2), 4)
+        .begin(t, &w.ledger, &w.f.a.active().unwrap(), inc(2), 4)
         .unwrap();
     w.endpoint.revoke(&mut w.f.da, t).unwrap();
     assert_eq!(
@@ -864,18 +865,18 @@ fn clock_regression_latches_endpoint_closed_to_new_operations() {
     let t = w.token();
     let p = w
         .endpoint
-        .begin(t, &w.f.a.active().unwrap(), inc(2), 10)
+        .begin(t, &w.ledger, &w.f.a.active().unwrap(), inc(2), 10)
         .unwrap();
     w.endpoint.finish(p).unwrap();
     assert_eq!(
         w.endpoint
-            .begin(t, &w.f.a.active().unwrap(), inc(2), 9)
+            .begin(t, &w.ledger, &w.f.a.active().unwrap(), inc(2), 9)
             .err(),
         Some(Error::Clock)
     );
     assert_eq!(
         w.endpoint
-            .begin(t, &w.f.a.active().unwrap(), inc(2), 11)
+            .begin(t, &w.ledger, &w.f.a.active().unwrap(), inc(2), 11)
             .err(),
         Some(Error::Clock)
     );
@@ -1282,7 +1283,7 @@ fn replica_write_persists_actual_bytes_before_exposing_signable_ack() {
     let spec = write_spec(&w.f, b"real payload");
     let token = w.token();
     let a = w.f.a.active().unwrap();
-    let p = w.endpoint.begin(token, &a, inc(2), 5).unwrap();
+    let p = w.endpoint.begin(token, &w.ledger, &a, inc(2), 5).unwrap();
     let before = w.f.da.writes;
     replication::persist_replica(
         &mut w.f.da,
@@ -1310,7 +1311,7 @@ fn replica_store_failure_never_returns_an_ack_and_retry_reloads_durable_state() 
     let spec = write_spec(&w.f, b"data");
     let t = w.token();
     let a = w.f.a.active().unwrap();
-    let p = w.endpoint.begin(t, &a, inc(2), 5).unwrap();
+    let p = w.endpoint.begin(t, &w.ledger, &a, inc(2), 5).unwrap();
     w.f.da.fail = Some(Fail::After);
     assert_eq!(
         replication::persist_replica(
@@ -1346,7 +1347,7 @@ fn newer_uncommitted_replica_does_not_erase_older_acked_data() {
     let old = write_spec(&w.f, b"old");
     let t = w.token();
     let a = w.f.a.active().unwrap();
-    let p = w.endpoint.begin(t, &a, inc(2), 5).unwrap();
+    let p = w.endpoint.begin(t, &w.ledger, &a, inc(2), 5).unwrap();
     replication::persist_replica(
         &mut w.f.da,
         &TestCrypto,
@@ -1386,7 +1387,7 @@ fn conflicting_replica_version_and_data_digest_are_rejected() {
     let old = write_spec(&w.f, b"old");
     let t = w.token();
     let a = w.f.a.active().unwrap();
-    let p = w.endpoint.begin(t, &a, inc(2), 5).unwrap();
+    let p = w.endpoint.begin(t, &w.ledger, &a, inc(2), 5).unwrap();
     replication::persist_replica(
         &mut w.f.da,
         &TestCrypto,
@@ -1583,10 +1584,10 @@ fn endpoint_operation_capacity_and_double_finish_are_checked() {
     let a = w.f.a.active().unwrap();
     let mut ps = Vec::new();
     for _ in 0..4 {
-        ps.push(w.endpoint.begin(t, &a, inc(2), 5).unwrap());
+        ps.push(w.endpoint.begin(t, &w.ledger, &a, inc(2), 5).unwrap());
     }
     assert_eq!(
-        w.endpoint.begin(t, &a, inc(2), 5).err(),
+        w.endpoint.begin(t, &w.ledger, &a, inc(2), 5).err(),
         Some(Error::Capacity)
     );
     w.endpoint.finish_ref(&ps[0]).unwrap();
@@ -2019,10 +2020,10 @@ fn full_owner_flow_replica_quorum_task_ack_loss_partition_and_drain() {
     let ta = w.token();
     let pa = w
         .endpoint
-        .begin(ta, &w.f.a.active().unwrap(), inc(2), 5)
+        .begin(ta, &w.ledger, &w.f.a.active().unwrap(), inc(2), 5)
         .unwrap();
     let pb = endpoint_b
-        .begin(tb, &w.f.b.active().unwrap(), inc(1), 5)
+        .begin(tb, &ledger_b, &w.f.b.active().unwrap(), inc(1), 5)
         .unwrap();
     let data = b"checkpoint payload shared by two native identities";
     let spec = write_spec(&w.f, data);
@@ -2183,9 +2184,339 @@ fn failed_fence_revocation_blocks_new_effects_and_does_not_release_capacity() {
     assert_eq!(w.endpoint.revoke(&mut w.f.da, t), Err(Error::Storage));
     assert_eq!(
         w.endpoint
-            .begin(t, &w.f.a.active().unwrap(), inc(2), 5)
+            .begin(t, &w.ledger, &w.f.a.active().unwrap(), inc(2), 5)
             .err(),
         Some(Error::Reconcile)
     );
     assert_eq!(w.ledger.used().unwrap(), w.q.quota);
+}
+
+// Audit regressions: assertions fail on the unmodified 8c295c8 source tree.
+#[test]
+fn audit_installed_intent_is_not_a_granted_operation() {
+    let mut w = World::reserved();
+    let a = w.f.a.active().unwrap();
+    let intent = w.ledger.begin_grant(&mut w.f.da, &a, w.q.id, 3).unwrap();
+    w.endpoint.install(&mut w.f.da, &intent, &a, 3).unwrap();
+    assert!(
+        w.endpoint
+            .begin(intent.token(), &w.ledger, &a, inc(2), 4)
+            .is_err()
+    );
+    assert_eq!(w.endpoint.in_flight(), 0);
+}
+#[test]
+fn audit_revoking_ledger_stops_new_endpoint_operations() {
+    let mut w = World::granted();
+    let token = w.token();
+    w.ledger.mark_revoking(&mut w.f.da, w.q.id, 4).unwrap();
+    assert!(
+        w.endpoint
+            .begin(token, &w.ledger, &w.f.a.active().unwrap(), inc(2), 5)
+            .is_err()
+    );
+    assert_eq!(w.endpoint.in_flight(), 0);
+}
+#[test]
+fn audit_poisoned_task_query_cannot_report_old_ram_state() {
+    for fail in [Fail::Before, Fail::After] {
+        let mut w = World::granted();
+        let mut book = prepared_task(&mut w);
+        w.f.da.fail = Some(fail);
+        let mut exec = Exec::default();
+        assert_eq!(
+            start_task(&mut book, &mut w, &mut exec, 5),
+            Err(Error::Storage)
+        );
+        assert_eq!(book.query(task().task, 1), Err(Error::Reconcile));
+        assert_eq!(exec.launches, 0);
+    }
+}
+#[test]
+fn audit_formation_id_cannot_be_rebound_to_another_config() {
+    let mut f = Formation::prepared();
+    let another = config(f.ps, 2); // Deliberately reuses both nonces.
+    assert_eq!(another.formation(), f.cfg.formation());
+    assert_ne!(another.digest(), f.cfg.digest());
+    assert_eq!(
+        f.a.prepare(&mut f.da, another, f.ps).err(),
+        Some(Error::Conflict)
+    );
+}
+#[test]
+fn audit_replication_operation_reuse_is_rejected_after_intervening_commit() {
+    let mut f = Formation::active();
+    let original = write_spec(&f, b"first");
+    for version in 1..=3 {
+        let write = replication::Write {
+            version,
+            operation: if version == 2 {
+                id(82)
+            } else {
+                original.operation
+            },
+            ..original
+        };
+        let a = f.a.active().unwrap();
+        let mut tracker = replication::Tracker::new(&a, write, 2).unwrap();
+        for n in [1, 2] {
+            tracker.add(&TestCrypto, &a, durable_ack(write, n)).unwrap();
+        }
+        if version < 3 {
+            tracker.finalize(&mut f.da, &a).unwrap();
+        } else {
+            assert_eq!(tracker.finalize(&mut f.da, &a).err(), Some(Error::Conflict));
+        }
+    }
+}
+#[test]
+fn audit_poisoned_ledger_cannot_export_stale_capacity_or_status() {
+    let mut w = World::reserved();
+    let mut q = w.q;
+    q.id = id(11);
+    q.resource = id(21);
+    let ad = admission::Admission::new(&w.bank, subject(), [0, 1, 2], 0);
+    w.f.da.fail = Some(Fail::After);
+    assert_eq!(
+        w.ledger
+            .prepare(&mut w.f.da, &w.f.a.active().unwrap(), q, &ad, policy_env(3)),
+        Err(Error::Storage)
+    );
+    assert_eq!(w.ledger.used(), Err(Error::Reconcile));
+    assert_eq!(w.ledger.status(w.q.id), Err(Error::Reconcile));
+}
+#[test]
+fn audit_subject_policy_budget_cannot_be_reused_by_multiple_contracts() {
+    let mut w = World::reserved();
+    let publisher = cp::Identity {
+        id: 99,
+        generation: 1,
+    };
+    w.bank
+        .accept(
+            publisher,
+            1,
+            policy::Proposal {
+                epochs: policy_env(3).epochs,
+                subject: subject(),
+                domain: 1,
+                sequence: 2,
+                valid_from: 1,
+                expires_at: 100,
+                plane: cp::Plane::Business,
+                cpus: 1,
+                units: 30,
+                budget_ticks: 100,
+            },
+            policy_env(3),
+        )
+        .unwrap();
+    let ad = admission::Admission::new(&w.bank, subject(), [0, 1, 2], 0);
+    let mut q = w.q;
+    q.id = id(11);
+    q.resource = id(21);
+    // Two 20-page reservations fit physical capacity=100, but exceed AI budget=30.
+    assert_eq!(
+        w.ledger
+            .prepare(&mut w.f.da, &w.f.a.active().unwrap(), q, &ad, policy_env(4)),
+        Err(Error::Policy)
+    );
+    assert_eq!(w.ledger.used().unwrap(), w.q.quota);
+}
+
+fn audit_new_config(ps: [Peer; 2], epoch: u64) -> Config {
+    Config::new(
+        &TestCrypto,
+        id(9),
+        epoch,
+        ps,
+        [[(epoch * 2) as u8; 32], [(epoch * 2 + 1) as u8; 32]],
+        [33; 32],
+    )
+    .unwrap()
+}
+#[test]
+fn audit_formation_binding_survives_reload_and_nonadjacent_reuse() {
+    let mut f = Formation::prepared();
+    f.a.isolate(&mut f.da).unwrap();
+    let next = audit_new_config(f.ps, 2);
+    f.a.prepare(&mut f.da, next, f.ps).unwrap();
+    f.a.isolate(&mut f.da).unwrap();
+    let mut restored = Membership::open(&mut f.da, &TestCrypto, inc(1)).unwrap();
+    let rebound = config(f.ps, 3); // Original nonces/FormationID, changed digest.
+    let before = f.da.writes;
+    assert_eq!(
+        restored.prepare(&mut f.da, rebound, f.ps).err(),
+        Some(Error::Conflict)
+    );
+    assert_eq!(restored.config(), Some(next));
+    assert_eq!(f.da.writes, before);
+}
+#[test]
+fn audit_pending_formation_needs_durable_isolation_before_replacement() {
+    let mut f = Formation::prepared();
+    let next = audit_new_config(f.ps, 2);
+    assert_eq!(f.a.prepare(&mut f.da, next, f.ps).err(), Some(Error::Busy));
+    assert_eq!(f.a.config(), Some(f.cfg));
+    f.da.fail = Some(Fail::After);
+    assert_eq!(f.a.isolate(&mut f.da), Err(Error::Storage));
+    assert_eq!(
+        f.a.prepare(&mut f.da, next, f.ps).err(),
+        Some(Error::Reconcile)
+    );
+    let mut restored = Membership::open(&mut f.da, &TestCrypto, inc(1)).unwrap();
+    restored.prepare(&mut f.da, next, f.ps).unwrap();
+}
+#[test]
+fn audit_formation_history_capacity_never_evicts_prior_bindings() {
+    let mut f = Formation::prepared();
+    for epoch in 2..=MAX_FORMATIONS as u64 {
+        f.a.isolate(&mut f.da).unwrap();
+        f.a.prepare(&mut f.da, audit_new_config(f.ps, epoch), f.ps)
+            .unwrap();
+    }
+    f.a.isolate(&mut f.da).unwrap();
+    let before = f.da.writes;
+    let old = f.a.config();
+    assert_eq!(
+        f.a.prepare(
+            &mut f.da,
+            audit_new_config(f.ps, MAX_FORMATIONS as u64 + 1),
+            f.ps
+        )
+        .err(),
+        Some(Error::Capacity)
+    );
+    assert_eq!(f.da.writes, before);
+    assert_eq!(f.a.config(), old);
+    let restored = Membership::open(&mut f.da, &TestCrypto, inc(1)).unwrap();
+    assert_eq!(restored.config(), old);
+    assert!(restored.active().is_err());
+}
+#[test]
+fn audit_legacy_membership_storage_is_not_silently_reinitialized() {
+    let mut f = Formation::prepared();
+    let k = Key {
+        kind: 1,
+        id: node(1).0,
+    };
+    f.da.records.get_mut(&k).unwrap().1[8..10].copy_from_slice(&1u16.to_le_bytes());
+    let before = f.da.records.clone();
+    assert_eq!(
+        Membership::open(&mut f.da, &TestCrypto, inc(1)).err(),
+        Some(Error::Version)
+    );
+    assert_eq!(f.da.records, before);
+}
+fn audit_tracker(f: &Formation, write: replication::Write) -> replication::Tracker {
+    let a = f.a.active().unwrap();
+    let mut tracker = replication::Tracker::new(&a, write, 2).unwrap();
+    for n in [1, 2] {
+        tracker.add(&TestCrypto, &a, durable_ack(write, n)).unwrap();
+    }
+    tracker
+}
+#[test]
+fn audit_replication_history_replays_exact_result_without_rewriting() {
+    let mut f = Formation::active();
+    let first = write_spec(&f, b"one");
+    let a = audit_tracker(&f, first);
+    a.finalize(&mut f.da, &f.a.active().unwrap()).unwrap();
+    let second = replication::Write {
+        version: 2,
+        operation: id(82),
+        data_digest: [83; 32],
+        ..first
+    };
+    let b = audit_tracker(&f, second);
+    b.finalize(&mut f.da, &f.a.active().unwrap()).unwrap();
+    let before = f.da.writes;
+    let reloaded = audit_tracker(&f, first);
+    assert_eq!(
+        reloaded
+            .finalize(&mut f.da, &f.a.active().unwrap())
+            .unwrap()
+            .write(),
+        first
+    );
+    assert_eq!(f.da.writes, before);
+}
+#[test]
+fn audit_replication_history_exhaustion_preserves_prior_results() {
+    let mut f = Formation::active();
+    let first = write_spec(&f, b"one");
+    for version in 1..=replication::MAX_COMMITS as u64 {
+        let w = replication::Write {
+            version,
+            operation: id(80 + version as u8),
+            ..first
+        };
+        audit_tracker(&f, w)
+            .finalize(&mut f.da, &f.a.active().unwrap())
+            .unwrap();
+    }
+    let before = f.da.records.clone();
+    let w = replication::Write {
+        version: replication::MAX_COMMITS as u64 + 1,
+        operation: id(120),
+        ..first
+    };
+    assert_eq!(
+        audit_tracker(&f, w)
+            .finalize(&mut f.da, &f.a.active().unwrap())
+            .err(),
+        Some(Error::Capacity)
+    );
+    assert_eq!(f.da.records, before);
+    assert_eq!(
+        audit_tracker(&f, first)
+            .finalize(&mut f.da, &f.a.active().unwrap())
+            .unwrap()
+            .write(),
+        first
+    );
+}
+#[test]
+fn audit_legacy_commit_history_is_rejected_without_reset() {
+    let mut f = Formation::active();
+    let w = write_spec(&f, b"one");
+    let tracker = audit_tracker(&f, w);
+    tracker.finalize(&mut f.da, &f.a.active().unwrap()).unwrap();
+    let record =
+        f.da.records
+            .iter_mut()
+            .find(|(k, _)| k.kind == 6)
+            .unwrap()
+            .1;
+    record.1[8..10].copy_from_slice(&1u16.to_le_bytes());
+    let before = f.da.records.clone();
+    assert_eq!(
+        tracker.finalize(&mut f.da, &f.a.active().unwrap()).err(),
+        Some(Error::Version)
+    );
+    assert_eq!(f.da.records, before);
+}
+#[test]
+fn audit_recovered_or_poisoned_ledger_cannot_start_endpoint_effects() {
+    let mut w = World::granted();
+    let token = w.token();
+    let restored = Ledger::<4>::open(&mut w.f.da, inc(1), capacity(), 200).unwrap();
+    assert_eq!(
+        w.endpoint
+            .begin(token, &restored, &w.f.a.active().unwrap(), inc(2), 5)
+            .err(),
+        Some(Error::Reconcile)
+    );
+    w.f.da.fail = Some(Fail::After);
+    assert_eq!(
+        w.ledger.mark_revoking(&mut w.f.da, w.q.id, 6),
+        Err(Error::Storage)
+    );
+    assert_eq!(
+        w.endpoint
+            .begin(token, &w.ledger, &w.f.a.active().unwrap(), inc(2), 6)
+            .err(),
+        Some(Error::Reconcile)
+    );
+    assert_eq!(w.endpoint.in_flight(), 0);
 }

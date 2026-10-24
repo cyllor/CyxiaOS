@@ -12,6 +12,13 @@ use super::{
 };
 const REPLICA: u16 = 5;
 const COMMIT: u16 = 6;
+const COMMIT_VERSION: u16 = 2;
+pub const MAX_COMMITS: usize = 16;
+#[derive(Clone, Copy)]
+struct CommitRecord {
+    write: Write,
+    signatures: [Signature; 2],
+}
 pub const MAX_DATA: usize = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Write {
@@ -217,33 +224,70 @@ impl Tracker {
         }
         let k = key(COMMIT, self.write.resource);
         let mut revision = 0;
+        let mut history: [Option<CommitRecord>; MAX_COMMITS] = [None; MAX_COMMITS];
+        let mut count = 0;
         if let Some((rev, b)) = storage::load(store, k)? {
             revision = rev;
             let mut r = Reader::new(b.as_slice());
-            storage::read_header(&mut r, COMMIT)?;
-            let old = Write::read(&mut r)?;
-            let _old_sigs: [Signature; 2] = [r.get()?, r.get()?];
+            // v1 retained only the last operation. Do not invent missing replay
+            // history: operators must reconcile/export legacy state offline.
+            storage::read_header_version(&mut r, COMMIT, COMMIT_VERSION)?;
+            count = r.u16()? as usize;
+            if count == 0 || count > MAX_COMMITS {
+                return Err(Error::Corrupt);
+            }
+            for i in 0..count {
+                let write = Write::read(&mut r)?;
+                let signatures = [r.get()?, r.get()?];
+                if write.scope.cluster != self.write.scope.cluster
+                    || write.resource != self.write.resource
+                    || write.version != i as u64 + 1
+                    || history[..i]
+                        .iter()
+                        .flatten()
+                        .any(|v| v.write.operation == write.operation)
+                {
+                    return Err(Error::Corrupt);
+                }
+                history[i] = Some(CommitRecord { write, signatures });
+            }
             r.end()?;
-            if old == self.write {
-                return Ok(Committed {
+        }
+        if let Some(old) = history
+            .iter()
+            .flatten()
+            .find(|v| v.write.operation == self.write.operation)
+        {
+            return if old.write == self.write {
+                Ok(Committed {
                     write: self.write,
                     store_revision: revision,
-                });
-            }
-            if old.scope.cluster != self.write.scope.cluster
-                || old.version.checked_add(1) != Some(self.write.version)
-                || old.operation == self.write.operation
-            {
-                return Err(Error::Stale);
-            }
-        } else if self.write.version != 1 {
+                })
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if self.write.version != count as u64 + 1 {
             return Err(Error::Stale);
         }
+        if count == MAX_COMMITS {
+            return Err(Error::Capacity);
+        }
+        history[count] = Some(CommitRecord {
+            write: self.write,
+            signatures: [
+                self.acks[0].ok_or(Error::NotReady)?,
+                self.acks[1].ok_or(Error::NotReady)?,
+            ],
+        });
         let mut b = Bytes::new();
-        storage::header(&mut b, COMMIT)?;
-        self.write.write(&mut b)?;
-        for signature in self.acks {
-            b.put(&signature.ok_or(Error::NotReady)?)?;
+        storage::header_version(&mut b, COMMIT, COMMIT_VERSION)?;
+        b.u16((count + 1) as u16)?;
+        for record in history.iter().flatten() {
+            record.write.write(&mut b)?;
+            for signature in record.signatures {
+                b.put(&signature)?;
+            }
         }
         let mut poisoned = false;
         storage::save(store, k, &mut revision, &mut poisoned, &b)?;

@@ -35,6 +35,11 @@ struct Node<'a> {
     compat: &'a [u8],
     reg: &'a [u8],
     irq: &'a [u8],
+    device_type: &'a [u8],
+    enable_method: &'a [u8],
+    method: &'a [u8],
+    cpu_child: bool,
+    seen: u16,
     ac: u32,
     sc: u32,
     pac: u32,
@@ -50,6 +55,11 @@ impl Node<'_> {
         compat: &[],
         reg: &[],
         irq: &[],
+        device_type: &[],
+        enable_method: &[],
+        method: &[],
+        cpu_child: false,
+        seen: 0,
         ac: 2,
         sc: 1,
         pac: 2,
@@ -120,7 +130,46 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
     if !n.enabled {
         return Ok(());
     }
-    if n.name.starts_with(b"memory@") {
+    if n.device_type == b"cpu\0" || (n.cpu_child && n.name.starts_with(b"cpu@")) {
+        if !n.cpu_child
+            || n.device_type != b"cpu\0"
+            || n.psc != 0
+            || !(1..=2).contains(&n.pac)
+            || n.reg.len() != n.pac as usize * 4
+        {
+            return Err(FdtError::Unsupported);
+        }
+        let affinity = number(n.reg, n.pac)?;
+        if affinity & !0x0000_00ff_00ff_ffff != 0 {
+            return Err(FdtError::Unsupported);
+        }
+        if info.cpus[..info.cpu_count]
+            .iter()
+            .any(|c| c.affinity == affinity)
+        {
+            return Err(FdtError::Overlap);
+        }
+        if info.cpu_count == info.cpus.len() {
+            return Err(FdtError::Capacity);
+        }
+        if !n.enable_method.is_empty() && n.enable_method != b"psci\0" {
+            return Err(FdtError::Unsupported);
+        }
+        info.cpus[info.cpu_count] = CpuResource {
+            affinity,
+            psci: n.enable_method == b"psci\0",
+        };
+        info.cpu_count += 1;
+    } else if has(n.compat, b"arm,psci-0.2") || has(n.compat, b"arm,psci-1.0") {
+        if !n.direct || info.psci.is_some() {
+            return Err(FdtError::Unsupported);
+        }
+        info.psci = Some(match n.method {
+            b"hvc\0" => PsciConduit::Hvc,
+            b"smc\0" => PsciConduit::Smc,
+            _ => return Err(FdtError::Unsupported),
+        });
+    } else if n.name.starts_with(b"memory@") {
         regions(n, |a, l| {
             push(&mut info.ram, &mut info.ram_count, a, l, RegionKind::Ram)
         })?;
@@ -315,6 +364,7 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
                         reserved: parent.reserved || parent.name == b"reserved-memory",
                         enabled: parent.enabled,
                         direct: depth == 1,
+                        cpu_child: parent.direct && parent.name == b"cpus",
                         ..Node::EMPTY
                     };
                     stack[depth] = node;
@@ -344,6 +394,21 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
                 if n.child_seen {
                     return Err(FdtError::Structure);
                 }
+                let bit = match name {
+                    b"reg" => 1,
+                    b"compatible" => 2,
+                    b"device_type" => 4,
+                    b"enable-method" => 8,
+                    b"method" => 16,
+                    b"#address-cells" => 32,
+                    b"#size-cells" => 64,
+                    b"status" => 128,
+                    _ => 0,
+                };
+                if bit != 0 && n.seen & bit != 0 {
+                    return Err(FdtError::Structure);
+                }
+                n.seen |= bit;
                 match name {
                     b"#address-cells" => {
                         if len != 4 {
@@ -362,6 +427,16 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
                             return Err(FdtError::String);
                         }
                         n.compat = v;
+                    }
+                    b"device_type" | b"enable-method" | b"method" => {
+                        if v.last() != Some(&0) || v[..v.len() - 1].contains(&0) {
+                            return Err(FdtError::String);
+                        }
+                        match name {
+                            b"device_type" => n.device_type = v,
+                            b"enable-method" => n.enable_method = v,
+                            _ => n.method = v,
+                        }
                     }
                     b"reg" => n.reg = v,
                     b"interrupts" => n.irq = v,

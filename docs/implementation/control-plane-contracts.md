@@ -44,3 +44,14 @@
 下载器 25 项离线 Python 测试通过；网络回应是明确的测试对象，不代表完成真实源站下载或 Mesa 编译。另有 3 项 PTY 回归在行纪律抽取 harness 中执行：旧逻辑全部失败，补丁后全部通过。该 harness 保留被测 receive 方法和相关环形缓冲/读写逻辑，使用测试专用 errno/常量，并省略无关生命周期字段和方法；不是完整 POSIX crate 运行证明。
 
 尚未运行完整仓库测试、真实 Mesa/Smithay/COSMIC 构建、QEMU 双平面隔离、真实 EL0 对抗测试、跨核故障注入或桌面会话验收。任何工作包或主机测试通过均不能把 hardware_isolation_active、cosmic_runtime_verified 或 desktop_session_ready 置为 true。
+
+
+## 2026-10-24 故障遏制修复
+
+`Manager::fault` / `Ownership::fault` 不再因输入时间戳小于已观察水位而跳过已知故障核心的隔离；遏制使用 `max(now,last_time)` 保持水位，不给租约续期。普通策略和核心迁移仍拒绝倒退时间。此修复只保证软件归属表不再允许派发故障核，真实 stop/IPI/页表与调度器强制约束仍须架构后端实现。
+
+本轮规范追踪新增 `prototype-requirements.json`。它不把这组内核库接口或其主机测试自动升级为 A01–A16 的原生运行 PASS；详细缺口见 `prototype-gap-review.md`。
+
+## 后续原生机制增量
+
+独立 `smp-selftest` profile 已接入真实次级核启动、每核上下文、EL0 页表、定时器抢占和原子派发栅栏。上文“尚未启动次级 CPU”等描述针对首次软件管理核心交付；默认生产桌面仍未改为多核隔离。详见 `native-smp-mechanism.md`。测试中的核心集合来自脚本提案，不是 AI，不关闭 A01–A04 的完整验收门槛。

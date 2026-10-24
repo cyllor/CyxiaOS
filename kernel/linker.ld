@@ -3,7 +3,8 @@ HIGH = 0xffffffc000000000;
 PHDRS { boot PT_LOAD FLAGS(5); tables PT_LOAD FLAGS(6); text PT_LOAD FLAGS(5); ro PT_LOAD FLAGS(4); data PT_LOAD FLAGS(6); }
 SECTIONS {
  . = 0x40200000;
- .boot : { KEEP(*(.text.boot)) } :boot
+ .boot : { KEEP(*(.text.boot.primary)) KEEP(*(.text.boot)) KEEP(*(.text.boot.secondary)) } :boot
+ ASSERT(SIZEOF(.boot) <= 4096, "all physical bootstrap entries must fit the executable boot page")
  . = ALIGN(4096);
  .boot_tables (NOLOAD) : { __boot_bss_start = .; *(.boot.bss) __boot_bss_end = .; } :tables
  . = HIGH + ALIGN(.,4096);
