@@ -1,0 +1,128 @@
+name: Native SMP mechanism gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [m1-kernel]
+    paths:
+      - '.github/workflows/smp-native.yml'
+      - 'crates/contracts/**'
+      - 'crates/arch-aarch64/**'
+      - 'crates/platform-virt/**'
+      - 'crates/kernel-core/src/control_plane/**'
+      - 'crates/driver-gicv2/**'
+      - 'kernel/**'
+      - 'tools/verify_smp.py'
+      - 'tools/transport.py'
+      - 'tools/run_qemu.py'
+      - 'tests/host/test_verify_smp.py'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-smp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned native toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-evidence/source-commit.txt"
+          rustc -vV > "$RUNNER_TEMP/native-evidence/rust-version.txt"
+      - name: Restore previously verified emulator when available
+        id: qemu-restore
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          merge-multiple: true
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Verify and unpack cached emulator
+        if: steps.qemu-restore.outcome == 'success'
+        run: |
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          cp "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" "$RUNNER_TEMP/"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-evidence/qemu-version.txt"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" > "$RUNNER_TEMP/native-evidence/qemu-archive.sha256"
+      - name: Build exact QEMU 10.2.2 with native scanout support
+        if: steps.qemu-restore.outcome != 'success'
+        run: |
+          set -o pipefail
+          git clone --depth=1 --branch v10.2.2 --single-branch https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          mkdir "$RUNNER_TEMP/qemu-build"
+          cd "$RUNNER_TEMP/qemu-build"
+          "$RUNNER_TEMP/qemu-source/configure" --prefix="$RUNNER_TEMP/qemu-tools" --target-list=aarch64-softmmu --without-default-features --enable-tcg --enable-pixman --enable-fdt --disable-docs --disable-werror 2>&1 | tee "$RUNNER_TEMP/native-evidence/qemu-configure.log"
+          make -j4 2>&1 | tee "$RUNNER_TEMP/native-evidence/qemu-build.log"
+          make install
+          mkdir -p "$RUNNER_TEMP/qemu-tools/lib"
+          cp -L /usr/lib/x86_64-linux-gnu/libfdt.so.1 "$RUNNER_TEMP/qemu-tools/lib/"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-evidence/qemu-version.txt"
+          ldd "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" > "$RUNNER_TEMP/native-evidence/qemu-libraries.txt"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" qemu-tools
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" > "$RUNNER_TEMP/native-evidence/qemu-archive.sha256"
+      - name: Retain exact emulator
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cyxia-qemu-10.2.2-linux
+          retention-days: 7
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/cyxia-qemu-10.2.2.tar.gz
+            ${{ runner.temp }}/native-evidence/qemu-archive.sha256
+      - name: Check native and host code
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+          cargo test --locked --offline -p cyxia-kernel-core --test dispatch
+          cargo test --locked --offline -p cyxia-platform-virt
+          python3 -B -m unittest discover -s tests/host -p test_verify_smp.py -v
+      - name: Build and boot both profiles on four vCPUs
+        run: |
+          for profile in debug release; do
+            flags=()
+            if [ "$profile" = release ]; then flags+=(--release); fi
+            cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest --target-dir "$RUNNER_TEMP/smp-target" "${flags[@]}"
+            for iteration in 1 2 3; do
+              python3 tools/verify_smp.py --elf "$RUNNER_TEMP/smp-target/aarch64-unknown-none-softfloat/$profile/cyxia-kernel" --output "$RUNNER_TEMP/native-evidence/$profile-$iteration"
+            done
+          done
+      - name: Require single-vCPU rejection
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess, sys
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])
+          destination = out / 'native-evidence/negative-single-cpu'
+          result = subprocess.run([sys.executable, 'tools/verify_smp.py', '--elf', str(out / 'smp-target/aarch64-unknown-none-softfloat/release/cyxia-kernel'), '--output', str(destination), '--cpus', '1'], timeout=60)
+          report = json.loads((destination / 'summary.json').read_text())
+          serial = (destination / 'serial.txt').read_text()
+          if result.returncode != 1 or report['status'] != 'FAIL' or report.get('error') != 'ValueError: guest failure' or 'SMP_REJECT_CPU_COUNT a=1 b=4 c=0\n' not in serial:
+              raise SystemExit('single-CPU guest did not explicitly reject the profile')
+      - name: Retain raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-smp-mechanism-evidence
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ runner.temp }}/native-evidence/
+      - name: Record scope
+        if: always()
+        run: echo 'Native mechanism fixture only. No model-driven scaling, production desktop isolation, physical host exclusivity, or network-cluster certification.' >> "$GITHUB_STEP_SUMMARY"

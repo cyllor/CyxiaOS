@@ -280,7 +280,7 @@ impl<'a> Process<'a> {
             Description {
                 object: Object::ReadOnly(inode, bytes, mode),
                 offset: 0,
-                flags: flags & !O_CLOEXEC,
+                flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
             },
         )?;
         self.fds[fd] = Some(slot);
@@ -541,7 +541,18 @@ impl<'a> Process<'a> {
         Ok(self.objects.get(self.description(fd)?)?.flags)
     }
     pub fn set_flags(&mut self, fd: i32, flags: u32) -> Result<(), Errno> {
-        if flags & !(3 | O_APPEND | O_NONBLOCK) != 0 {
+        // Access/open-time bits are ignored, never permissions upgrades or
+        // a second create/truncate. Accept the immutable bits returned by GETFL.
+        let known = 3
+            | O_APPEND
+            | O_NONBLOCK
+            | O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_CLOEXEC
+            | O_DIRECTORY
+            | O_NOFOLLOW;
+        if flags & !known != 0 {
             return Err(Errno::Inval);
         }
         let slot = self.description(fd)?;
@@ -690,7 +701,7 @@ impl<'a> Process<'a> {
                 Description {
                     object: Object::Directory { inode, path: p },
                     offset: 0,
-                    flags: flags & !O_CLOEXEC,
+                    flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
                 },
             )?;
             self.fds[fd] = Some(slot);
@@ -735,7 +746,7 @@ impl<'a> Process<'a> {
             Description {
                 object: Object::File(inode),
                 offset: 0,
-                flags: flags & !O_CLOEXEC,
+                flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
             },
         )?;
         self.fds[fd] = Some(slot);

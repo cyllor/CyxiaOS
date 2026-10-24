@@ -289,3 +289,141 @@ fn translated_bus_and_invalid_irq_fail_closed() {
         Err(FdtError::Unsupported)
     );
 }
+
+fn smp_blob(cpus: &[(u64, bool)], method: &[u8], duplicate_reg: bool, width: u32) -> Vec<u8> {
+    fn begin(s: &mut Vec<u8>, name: &[u8]) {
+        w(s, 1);
+        s.extend(name);
+        s.push(0);
+        while !s.len().is_multiple_of(4) {
+            s.push(0);
+        }
+    }
+    fn prop(s: &mut Vec<u8>, names: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+        let offset = names.len();
+        names.extend(key);
+        names.push(0);
+        w(s, 3);
+        w(s, value.len() as u32);
+        w(s, offset as u32);
+        s.extend(value);
+        while !s.len().is_multiple_of(4) {
+            s.push(0);
+        }
+    }
+    let base = devices(0, false, false, 16);
+    let so = u32::from_be_bytes(base[8..12].try_into().unwrap()) as usize;
+    let sl = u32::from_be_bytes(base[36..40].try_into().unwrap()) as usize;
+    let st = u32::from_be_bytes(base[12..16].try_into().unwrap()) as usize;
+    let mut s = base[so..so + sl - 8].to_vec();
+    let mut names = base[st..].to_vec();
+    begin(&mut s, b"cpus");
+    prop(&mut s, &mut names, b"#address-cells", &width.to_be_bytes());
+    prop(&mut s, &mut names, b"#size-cells", &0u32.to_be_bytes());
+    for (affinity, enabled) in cpus {
+        begin(&mut s, format!("cpu@{affinity:x}").as_bytes());
+        prop(&mut s, &mut names, b"device_type", b"cpu\0");
+        prop(&mut s, &mut names, b"enable-method", b"psci\0");
+        let value = affinity.to_be_bytes();
+        let value = if width == 1 { &value[4..] } else { &value[..] };
+        prop(&mut s, &mut names, b"reg", value);
+        if duplicate_reg {
+            prop(&mut s, &mut names, b"reg", value);
+        }
+        if !enabled {
+            prop(&mut s, &mut names, b"status", b"disabled\0");
+        }
+        w(&mut s, 2);
+    }
+    w(&mut s, 2);
+    if !method.is_empty() {
+        begin(&mut s, b"psci");
+        prop(
+            &mut s,
+            &mut names,
+            b"compatible",
+            b"arm,psci-1.0\0arm,psci-0.2\0",
+        );
+        prop(&mut s, &mut names, b"method", method);
+        w(&mut s, 2);
+    }
+    w(&mut s, 2);
+    w(&mut s, 9);
+    mini(&s, &names, &[])
+}
+#[test]
+fn native_smp_topology_preserves_full_affinities_and_moves_boot_slot_first() {
+    let b = smp_blob(
+        &[(0x100, true), (0, true), (0x1_00000000, true), (1, true)],
+        b"hvc\0",
+        false,
+        2,
+    );
+    let info = parse_fdt(&b).unwrap();
+    let topo = cyxia_platform_virt::cpu_topology(&info, 0).unwrap();
+    assert_eq!(topo.count, 4);
+    assert_eq!(&topo.affinity[..4], &[0, 0x100, 0x1_00000000, 1]);
+    assert_eq!(info.psci, Some(cyxia_contracts::PsciConduit::Hvc));
+}
+#[test]
+fn disabled_cpu_not_started_and_smc_conduit_is_explicit() {
+    let b = smp_blob(&[(0, true), (1, false), (2, true)], b"smc\0", false, 1);
+    let info = parse_fdt(&b).unwrap();
+    assert_eq!(info.cpu_count, 2);
+    assert_eq!(
+        &cyxia_platform_virt::cpu_topology(&info, 0)
+            .unwrap()
+            .affinity[..2],
+        &[0, 2]
+    );
+    assert_eq!(info.psci, Some(cyxia_contracts::PsciConduit::Smc));
+}
+#[test]
+fn duplicate_cpu_affinity_and_property_are_rejected() {
+    assert_eq!(
+        parse_fdt(&smp_blob(&[(0, true), (0, true)], b"hvc\0", false, 1)),
+        Err(FdtError::Overlap)
+    );
+    assert_eq!(
+        parse_fdt(&smp_blob(&[(0, true), (1, true)], b"hvc\0", true, 1)),
+        Err(FdtError::Structure)
+    );
+}
+#[test]
+fn malformed_cpu_affinity_conduit_or_width_are_rejected() {
+    assert!(
+        parse_fdt(&smp_blob(
+            &[(0, true), (0x1000000, true)],
+            b"hvc\0",
+            false,
+            2
+        ))
+        .is_err()
+    );
+    assert!(parse_fdt(&smp_blob(&[(0, true), (1, true)], b"random\0", false, 1)).is_err());
+    assert!(parse_fdt(&smp_blob(&[(0, true), (1, true)], b"hvc\0", false, 3)).is_err());
+}
+#[test]
+fn missing_psci_or_boot_cpu_and_excessive_cpu_count_fail_shut() {
+    let info = parse_fdt(&smp_blob(&[(0, true), (1, true)], b"", false, 1)).unwrap();
+    assert!(cyxia_platform_virt::cpu_topology(&info, 0).is_err());
+    let info = parse_fdt(&smp_blob(&[(1, true), (2, true)], b"hvc\0", false, 1)).unwrap();
+    assert!(cyxia_platform_virt::cpu_topology(&info, 0).is_err());
+    let cpus: Vec<_> = (0..9).map(|i| (i, true)).collect();
+    assert_eq!(
+        parse_fdt(&smp_blob(&cpus, b"hvc\0", false, 1)),
+        Err(FdtError::Capacity)
+    );
+}
+#[test]
+fn smp_parser_every_truncation_fails_without_panic() {
+    let b = smp_blob(
+        &[(0, true), (1, true), (2, true), (3, true)],
+        b"hvc\0",
+        false,
+        1,
+    );
+    for n in 0..b.len() {
+        assert!(parse_fdt(&b[..n]).is_err());
+    }
+}

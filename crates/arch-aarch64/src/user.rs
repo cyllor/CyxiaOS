@@ -1,4 +1,4 @@
-//! CPU0-only EL0 transitions. All memory management and policy belongs to the caller.
+//! Per-CPU EL0 transitions. All memory management and policy belongs to the caller.
 //!
 //! EL0 owns the complete Advanced SIMD/FP register bank while entered. Kernel Rust,
 //! exception handlers and every routine they call must use the soft-float ABI and
@@ -65,13 +65,14 @@ const _: () = {
     assert!(core::mem::size_of::<Context>() == 832);
     assert!(core::mem::align_of::<Context>() == 16);
 };
-static ACTIVE: AtomicPtr<Context> = AtomicPtr::new(core::ptr::null_mut());
+static ACTIVE: [AtomicPtr<Context>; super::cpu::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; super::cpu::MAX_CPUS];
 unsafe extern "C" {
     fn cyxia_enter_user(context: *mut Context);
     fn cyxia_user_return();
 }
 /// # Safety
-/// CPU0, no nested entry. Context and EL1 stack remain pinned until return. The
+/// A registered CPU with a private pinned EL1 stack, no nested entry. Context and EL1 stack remain pinned until return. The
 /// supplied TTBR0 must map only this process's validated user pages. IRQs must work.
 /// All EL1 code, including interrupt handlers and memory intrinsics, must be built
 /// for the soft-float ABI with no FP/SIMD instructions outside user.S. Higher ELs
@@ -80,16 +81,25 @@ unsafe extern "C" {
 /// initialized or reset before reuse by a different process so its full
 /// integer, FP/SIMD and TLS state belongs exclusively to the entered process.
 pub unsafe fn enter(context: &mut Context, root: u64) {
-    assert!(ACTIVE.load(Ordering::Relaxed).is_null());
+    let saved_daif: u64;
+    // Do not expose a half-installed ACTIVE/TTBR0 pair to an IRQ.
+    unsafe {
+        asm!("mrs {}, daif", "msr daifset, #15", out(reg) saved_daif, options(nostack));
+    }
+    let active = &ACTIVE[super::cpu::slot()];
+    assert!(active.load(Ordering::Relaxed).is_null());
     context.status &= 0xf0000000; // NZCV only; always EL0t, IRQ enabled, no privileged PSTATE.
-    ACTIVE.store(core::ptr::from_mut(context), Ordering::Relaxed);
+    active.store(core::ptr::from_mut(context), Ordering::Relaxed);
     unsafe {
         asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
         cyxia_enter_user(core::ptr::from_mut(context));
         // user.S has disabled low walks, completed TLBI, saved all user state,
         // and restored the original EL1 CPACR/TLS before returning to Rust.
     }
-    ACTIVE.store(core::ptr::null_mut(), Ordering::Relaxed);
+    active.store(core::ptr::null_mut(), Ordering::Relaxed);
+    unsafe {
+        asm!("msr daif, {}", in(reg) saved_daif, options(nostack, preserves_flags));
+    }
 }
 /// # Safety
 /// Called only from a synchronous/IRQ AArch64 lower-EL vector, while enter() is
@@ -104,7 +114,7 @@ pub unsafe fn capture(
     far: u64,
     kind: u64,
 ) -> Option<u64> {
-    let p = ACTIVE.load(Ordering::Relaxed);
+    let p = ACTIVE[super::cpu::slot()].load(Ordering::Relaxed);
     if p.is_null() || status & 15 != 0 {
         return None;
     }

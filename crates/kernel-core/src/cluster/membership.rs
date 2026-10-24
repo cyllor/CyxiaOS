@@ -9,6 +9,14 @@ use super::{
     storage::{self, Key, Store},
 };
 const KIND: u16 = 1;
+const STORAGE_VERSION: u16 = 2;
+/// No tombstone eviction: exhausted history requires an explicit reviewed migration.
+pub const MAX_FORMATIONS: usize = 16;
+#[derive(Clone, Copy)]
+struct Binding {
+    formation: Digest,
+    digest: Digest,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Member {
     pub identity: Incarnation,
@@ -238,6 +246,7 @@ struct State {
     phase: Phase,
     activation: u64,
     confirms: Option<[Signature; 2]>,
+    bindings: [Option<Binding>; MAX_FORMATIONS],
 }
 pub struct Membership {
     local: Incarnation,
@@ -261,7 +270,7 @@ impl Membership {
         };
         let (revision, state) = if let Some((rev, b)) = storage::load(store, key)? {
             let mut r = Reader::new(b.as_slice());
-            storage::read_header(&mut r, KIND)?;
+            storage::read_header_version(&mut r, KIND, STORAGE_VERSION)?;
             if NodeId(r.get()?) != local.node {
                 return Err(Error::Corrupt);
             }
@@ -274,6 +283,34 @@ impl Membership {
                 1 => Some([r.get()?, r.get()?]),
                 _ => return Err(Error::Corrupt),
             };
+            let count = r.u16()? as usize;
+            if count == 0 || count > MAX_FORMATIONS {
+                return Err(Error::Corrupt);
+            }
+            let mut bindings: [Option<Binding>; MAX_FORMATIONS] = [None; MAX_FORMATIONS];
+            for i in 0..count {
+                let binding = Binding {
+                    formation: r.get()?,
+                    digest: r.get()?,
+                };
+                if binding.formation == [0; 32]
+                    || binding.digest == [0; 32]
+                    || bindings[..i]
+                        .iter()
+                        .flatten()
+                        .any(|b| b.formation == binding.formation)
+                {
+                    return Err(Error::Corrupt);
+                }
+                bindings[i] = Some(binding);
+            }
+            if !bindings
+                .iter()
+                .flatten()
+                .any(|b| b.formation == config.formation && b.digest == config.digest)
+            {
+                return Err(Error::Corrupt);
+            }
             r.end()?;
             if matches!(
                 phase,
@@ -299,6 +336,7 @@ impl Membership {
                     phase,
                     activation,
                     confirms,
+                    bindings,
                 }),
             )
         } else {
@@ -341,7 +379,7 @@ impl Membership {
     }
     fn persist(&mut self, store: &mut impl Store, next: State) -> Result<()> {
         let mut b = Bytes::new();
-        storage::header(&mut b, KIND)?;
+        storage::header_version(&mut b, KIND, STORAGE_VERSION)?;
         b.put(&self.local.node.0)?;
         next.config.write(&mut b)?;
         b.u8(next.phase as u8)?;
@@ -352,6 +390,11 @@ impl Membership {
             b.put(&s[1])?;
         } else {
             b.u8(0)?;
+        }
+        b.u16(next.bindings.iter().flatten().count() as u16)?;
+        for binding in next.bindings.iter().flatten() {
+            b.put(&binding.formation)?;
+            b.put(&binding.digest)?;
         }
         storage::save(
             store,
@@ -378,10 +421,34 @@ impl Membership {
         if !config.peers_match(peers) || config.member(self.local.node)?.identity != self.local {
             return Err(Error::Authentication);
         }
+        let mut bindings = self.state.map_or([None; MAX_FORMATIONS], |s| s.bindings);
+        if let Some(bound) = bindings
+            .iter()
+            .flatten()
+            .find(|b| b.formation == config.formation)
+        {
+            if bound.digest != config.digest {
+                return Err(Error::Conflict);
+            }
+        } else {
+            let free = bindings
+                .iter_mut()
+                .find(|b| b.is_none())
+                .ok_or(Error::Capacity)?;
+            *free = Some(Binding {
+                formation: config.formation,
+                digest: config.digest,
+            });
+        }
         if let Some(old) = self.state {
             if old.config == config {
                 self.authenticated = true;
                 return confirm_bytes(config);
+            }
+            // Never replace a still-pending signed intention implicitly. An
+            // explicit durable isolation/reconciliation boundary is mandatory.
+            if old.phase != Phase::Isolated {
+                return Err(Error::Busy);
             }
             // Reconfiguration here is ONLY same two voters, same cluster, next
             // epoch. Membership replacement/leave requires a separate protocol.
@@ -411,6 +478,7 @@ impl Membership {
                 phase: Phase::Prepared,
                 activation: 0,
                 confirms: None,
+                bindings,
             },
         )?;
         self.authenticated = true;

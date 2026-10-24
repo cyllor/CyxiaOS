@@ -328,6 +328,9 @@ impl<const N: usize> Ledger<N> {
         Ok(())
     }
     pub fn used(&self) -> Result<Quota> {
+        if self.poisoned {
+            return Err(Error::Reconcile);
+        }
         let mut total = Quota::default();
         for e in self.entries.iter().flatten() {
             if e.stage != Stage::Released {
@@ -337,9 +340,15 @@ impl<const N: usize> Ledger<N> {
         Ok(total)
     }
     pub fn status(&self, id: ObjectId) -> Result<Stage> {
+        if self.poisoned {
+            return Err(Error::Reconcile);
+        }
         Ok(self.entries[self.index(id)?].ok_or(Error::NotReady)?.stage)
     }
     pub fn needs_reconcile(&self, id: ObjectId) -> Result<bool> {
+        if self.poisoned {
+            return Ok(true);
+        }
         let i = self.index(id)?;
         Ok(self.poisoned
             || (!self.eligible[i] && self.entries[i].is_some_and(|e| e.stage != Stage::Released)))
@@ -374,16 +383,22 @@ impl<const N: usize> Ledger<N> {
                 Err(Error::Conflict)
             };
         }
-        let policy_until = admission.check(request.quota, env)?;
+        if !self.used()?.checked_add(request.quota)?.fits(self.capacity) {
+            return Err(Error::Capacity);
+        }
+        let mut subject_total = request.quota;
+        for entry in self.entries.iter().flatten() {
+            if entry.stage != Stage::Released && entry.request.subject == request.subject {
+                subject_total = subject_total.checked_add(entry.request.quota)?;
+            }
+        }
+        let policy_until = admission.check(subject_total, env)?;
         if request.reservation_until <= env.now
             || request.reservation_until > policy_until
             || request.lease_until <= env.now
             || request.lease_until - env.now > self.max_lease
         {
             return Err(Error::Expired);
-        }
-        if !self.used()?.checked_add(request.quota)?.fits(self.capacity) {
-            return Err(Error::Capacity);
         }
         if self
             .entries

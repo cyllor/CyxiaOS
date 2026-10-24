@@ -73,6 +73,14 @@ posix run preempt
 
 桌面上游版本和真实剩余依赖见 [移植清单](docs/implementation/desktop-port-inventory.md)。源码身份、构建和运行验收分别记录；获取到上游源码不代表已经移植成功。
 
+## 最小原型规范与安全核心
+
+`crates/kernel-core/src/control_plane` 和 `cluster` 包含有界控制/集群安全管理逻辑及主机回归测试，但尚未接入独立控制 EL0 服务、次级 CPU、原生网络与集群执行后端。源码合入和主机 CI 通过不代表四核双平面、双原生客体或完整 COSMIC 已验收。
+
+[全系统代码与规范缺口复核](docs/implementation/prototype-gap-review.md) 区分本轮已修缺陷、架构接入缺口和文档歧义；[要求追踪目录](docs/implementation/prototype-requirements.json) 覆盖 A/T/AI/V/组合故障及16个同等地位的一级子系统。`tools/check_prototype_evidence.py` 只检查证据完整性和文件身份，不认证运行真实性；`--release` 在强制项缺少 PASS 证据时拒绝通过。
+
+**持久格式注意：**本轮成员绑定和复制提交历史使用存储版本2，旧版本1因缺少历史返回 `Version`；不能删库重建绕过，生产迁移工具尚未交付。详见 [集群安全核心边界](docs/implementation/cluster-safety-core.md)。正式集群成员仍须原生运行 CyxiaOS，不引入宿主系统代理节点。
+
 ## 构建与验证
 
 在项目目录执行，Python 仅需标准库：
@@ -113,3 +121,14 @@ python3 tools/run_qemu.py --elf target/aarch64-unknown-none-softfloat/release/cy
 ## 全系统 AI 强化状态
 
 在 CyxiaOS 串口 shell 执行 `ai system`，查看进程/线程、CPU、内存、文件缓存、存储、IPC、显示的真实模型与执行计数、学习状态和未实现项。新增显示提交节奏与存储块请求额度，修正提案/执行混计；全部使用客体本地模型。详见 [落地清单与证据](docs/implementation/system-ai-status.md)。目前只有文件缓存支持受限在线学习；全局协调、全域学习、网络和多核尚未完成。
+
+## 原生多核机制工作包（未替代生产桌面）
+
+新增 `smp-selftest` 在四 vCPU 原生客体执行分离 EL0 上下文、私有定时器抢占、派发排空与测试提案的 1→2→1 核迁移。控制程序是测试 fixture，不是模型；不宣称生产隔离、物理独占、原生集群或完整 COSMIC 已完成。执行及证据范围见 [原生多核机制说明](docs/implementation/native-smp-mechanism.md)。
+
+### 独立 EL0 模型控制服务（显式原生集成配置）
+
+`ai-control-selftest` 在四核原生 CyxiaOS 客体中运行独立编译的 Rust 模型服务，
+经受信任边界校验后执行模型提出的核心扩缩容，并检查故障隔离和新代际恢复。
+输入为冻结合成遥测，不声明真实性能收益、完整16域模型、默认桌面隔离或联网集群完成。
+构建、故障程序和取证方法见 `docs/implementation/native-ai-control-service.md`。

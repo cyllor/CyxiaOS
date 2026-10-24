@@ -71,9 +71,24 @@ pub(crate) fn save(
     Ok(())
 }
 pub(crate) fn header(b: &mut Bytes, kind: u16) -> Result<()> {
+    header_version(b, kind, 1)
+}
+pub(crate) fn header_version(b: &mut Bytes, kind: u16, version: u16) -> Result<()> {
     b.put(b"CYXCLST1")?;
-    b.u16(1)?;
+    b.u16(version)?;
     b.u16(kind)
+}
+pub(crate) fn read_header_version(r: &mut Reader<'_>, kind: u16, version: u16) -> Result<()> {
+    if r.get::<8>()? != *b"CYXCLST1" {
+        return Err(Error::Corrupt);
+    }
+    if r.u16()? != version {
+        return Err(Error::Version);
+    }
+    if r.u16()? != kind {
+        return Err(Error::Corrupt);
+    }
+    Ok(())
 }
 pub(crate) fn read_header(r: &mut Reader<'_>, kind: u16) -> Result<()> {
     if r.get::<8>()? != *b"CYXCLST1" || r.u16()? != 1 || r.u16()? != kind {
