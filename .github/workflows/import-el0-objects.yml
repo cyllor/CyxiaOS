@@ -1,0 +1,32 @@
+name: One-time verified EL0 source object import
+on:
+  push:
+    branches: [integration/import-el0-20261024]
+permissions:
+  contents: write
+jobs:
+  import-objects:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out transport branch without retained credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Copy verified import inputs outside checkout
+        run: |
+          mkdir "$RUNNER_TEMP/cyxia-import"
+          cp .integration/part-*.xz .integration/import_objects.py "$RUNNER_TEMP/cyxia-import/"
+      - name: Validate source and create immutable Git objects only
+        env:
+          IMPORT_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -I "$RUNNER_TEMP/cyxia-import/import_objects.py"
+      - name: Retain object identity receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: el0-source-object-import-receipt
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ runner.temp }}/cyxia-import/receipt.json
