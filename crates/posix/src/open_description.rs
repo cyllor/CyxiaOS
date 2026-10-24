@@ -313,10 +313,8 @@ mod tests {
         child.set_close_on_exec(5, true).unwrap();
         assert_eq!(child.close_on_exec(6), Ok(false));
         child.set_flags(5, O_NONBLOCK | O_APPEND).unwrap();
-        assert_eq!(
-            parent.flags(file),
-            Ok(O_RDWR | O_NONBLOCK | O_APPEND | O_CREAT)
-        );
+        // F_GETFL exposes access/status flags, not the one-time O_CREAT request.
+        assert_eq!(parent.flags(file), Ok(O_RDWR | O_NONBLOCK | O_APPEND));
         let mut bytes = [0; 2];
         parent.read(&mut fs, file, &mut bytes).unwrap();
         assert_eq!(&bytes, b"ab");

@@ -44,6 +44,25 @@ impl VirtioMmioResource {
         irq: 0,
     };
 }
+/// Maximum CPU descriptions in this bounded boot ABI, not a fixed AI core count.
+pub const BOOT_CPUS: usize = 8;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsciConduit {
+    Hvc,
+    Smc,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuResource {
+    /// Full MPIDR affinity: Aff3[39:32], Aff2[23:16], Aff1[15:8], Aff0[7:0].
+    pub affinity: u64,
+    pub psci: bool,
+}
+impl CpuResource {
+    pub const EMPTY: Self = Self {
+        affinity: 0,
+        psci: false,
+    };
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootInfo {
     pub ram: [MemoryRegion; 8],
@@ -57,6 +76,9 @@ pub struct BootInfo {
     pub virtio: [VirtioMmioResource; 32],
     pub virtio_count: usize,
     pub dtb_len: usize,
+    pub cpus: [CpuResource; BOOT_CPUS],
+    pub cpu_count: usize,
+    pub psci: Option<PsciConduit>,
 }
 impl BootInfo {
     pub const EMPTY: Self = Self {
@@ -71,5 +93,8 @@ impl BootInfo {
         virtio: [VirtioMmioResource::EMPTY; 32],
         virtio_count: 0,
         dtb_len: 0,
+        cpus: [CpuResource::EMPTY; BOOT_CPUS],
+        cpu_count: 0,
+        psci: None,
     };
 }

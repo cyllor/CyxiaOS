@@ -52,3 +52,47 @@ pub fn reserve_user_pool(
     }
     Err(PlatformError::Again)
 }
+
+/// Logical slot map for the bounded native bootstrap. Slot zero is the boot CPU;
+/// other slots retain complete affinity values instead of truncating MPIDR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuTopology {
+    pub affinity: [u64; cyxia_contracts::BOOT_CPUS],
+    pub count: usize,
+    pub conduit: cyxia_contracts::PsciConduit,
+}
+pub fn cpu_topology(
+    info: &cyxia_contracts::BootInfo,
+    boot: u64,
+) -> Result<CpuTopology, cyxia_contracts::PlatformError> {
+    use cyxia_contracts::PlatformError;
+    if !(2..=cyxia_contracts::BOOT_CPUS).contains(&info.cpu_count)
+        || boot & !0x0000_00ff_00ff_ffff != 0
+    {
+        return Err(PlatformError::Unsupported);
+    }
+    let conduit = info.psci.ok_or(PlatformError::Unsupported)?;
+    let nodes = &info.cpus[..info.cpu_count];
+    if !nodes.iter().any(|c| c.affinity == boot) || nodes.iter().any(|c| !c.psci) {
+        return Err(PlatformError::Unsupported);
+    }
+    let mut result = CpuTopology {
+        affinity: [0; cyxia_contracts::BOOT_CPUS],
+        count: info.cpu_count,
+        conduit,
+    };
+    result.affinity[0] = boot;
+    let mut next = 1;
+    for (i, cpu) in nodes.iter().enumerate() {
+        if cpu.affinity & !0x0000_00ff_00ff_ffff != 0
+            || nodes[..i].iter().any(|c| c.affinity == cpu.affinity)
+        {
+            return Err(PlatformError::Invalid);
+        }
+        if cpu.affinity != boot {
+            result.affinity[next] = cpu.affinity;
+            next += 1;
+        }
+    }
+    Ok(result)
+}

@@ -55,6 +55,61 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CYXIA_PORTED_ELF");
     println!("cargo:rerun-if-env-changed=CYXIA_EGL_PROBE_ELF");
     println!("cargo:rerun-if-env-changed=CYXIA_WAYLAND_SHM_PROBE_ELF");
+    println!("cargo:rerun-if-env-changed=CYXIA_CONTROL_FAULT");
+    if env::var_os("CARGO_FEATURE_AI_CONTROL_SELFTEST").is_some() {
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+        for path in [
+            "user/control-service",
+            "crates/control-model",
+            "ports/control-service",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let fault = env::var("CYXIA_CONTROL_FAULT").unwrap_or_else(|_| "none".into());
+        assert!(
+            ["none", "hang", "bad-mask", "snapshot-write", "model-write"].contains(&fault.as_str()),
+            "invalid test fault"
+        );
+        let mut cmd = Command::new(env::var("RUSTC").unwrap());
+        cmd.arg(root.join("user/control-service/main.rs"))
+            .args([
+                "--edition=2024",
+                "--target",
+                "aarch64-unknown-none-softfloat",
+                "--crate-name",
+                "cyxia_control_service",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "panic=abort",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "overflow-checks=yes",
+                "-C",
+                "link-arg=--build-id=none",
+                "-C",
+                "link-arg=-zmax-page-size=4096",
+                "-A",
+                "dead_code",
+            ])
+            .arg("--cfg")
+            .arg(format!("service_fault=\"{fault}\""))
+            .arg("-C")
+            .arg(format!(
+                "link-arg=-T{}",
+                root.join("user/control-service/linker.ld").display()
+            ))
+            .arg("-o")
+            .arg(out.join("control-service.elf"));
+        checked(&mut cmd);
+        let mode = ["none", "hang", "bad-mask", "snapshot-write", "model-write"]
+            .iter()
+            .position(|v| *v == fault)
+            .unwrap();
+        std::fs::write(out.join("control-mode.rs"), mode.to_string()).unwrap();
+    }
     if env::var_os("CARGO_FEATURE_SELFTEST").is_some() {
         return;
     }
