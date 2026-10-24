@@ -1,0 +1,79 @@
+name: Import verified delivered source objects
+
+on:
+  push:
+    branches: ['transfer/el0-ai-smp-audit-20261024']
+
+permissions:
+  contents: write
+
+jobs:
+  import-objects:
+    if: github.repository == 'cyllor/CyxiaOS'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read the transfer commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Verify and import into an isolated staging branch
+        shell: python
+        run: |
+          import base64, bz2, hashlib, json, os, pathlib, subprocess
+          BASE = '8c295c814068299010ec39bbe18e2fe8a3c21ea3'
+          TREE = 'af767e071a51d668d681a61bb1dcc899115ae2be'
+          PATCH = '5a739410f51a74d1baeb48283182286ca63c23aa1d47f709b6e19e21932357d0'
+          STAGE = 'staging/el0-ai-smp-source-objects-20261024'
+          def git(*args, data=None):
+              return subprocess.check_output(['git', *args], input=data).decode().strip()
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+          paths = sorted(pathlib.Path('integration-transfer').glob('payload-*.b64'))
+          require([p.name for p in paths] == [f'payload-{i:02}.b64' for i in range(13)], 'Incomplete transfer')
+          encoded = b''.join(p.read_bytes().strip() for p in paths)
+          require(len(encoded) == 96016, 'Wrong encoded length')
+          payload = bz2.decompress(base64.b64decode(encoded, validate=True))
+          require(len(payload) == 324302 and hashlib.sha256(payload).hexdigest() == PATCH, 'Patch hash mismatch')
+          remote = git('ls-remote', '--heads', 'origin', 'refs/heads/m1-kernel').split()
+          require(remote and remote[0] == BASE, 'Mainline moved; do not overwrite or rebase silently')
+          git('checkout', '--detach', BASE)
+          git('apply', '--check', '--binary', '--unidiff-zero', '-', data=payload)
+          git('apply', '--binary', '--unidiff-zero', '-', data=payload)
+          git('add', '-A')
+          require(git('write-tree') == TREE, 'Reconstructed source differs from tested source')
+          changed = git('diff', '--cached', '--name-only', BASE).splitlines()
+          require(len(changed) == 71, 'Wrong changed-file count')
+          # The staging push stores workflow blobs as ordinary files. The user's
+          # authenticated GitHub connector places those existing blobs at the
+          # final paths and creates the reviewed candidate tree. This workflow
+          # NEVER updates mainline or pushes changed workflows.
+          aliases = pathlib.Path('integration-workflow-objects')
+          require(not aliases.exists(), 'Unexpected alias directory')
+          aliases.mkdir()
+          workflow_paths = [p for p in changed if p.startswith('.github/workflows/')]
+          require(len(workflow_paths) == 3, 'Unexpected workflow delta')
+          for i, path in enumerate(workflow_paths):
+              (aliases / f'{i}.blob').write_bytes(pathlib.Path(path).read_bytes())
+          git('restore', '--source', BASE, '--staged', '--worktree', '--', '.github')
+          git('add', str(aliases))
+          require(not git('diff', '--cached', '--name-only', BASE, '--', '.github'), 'Workflow changed in staging')
+          stage_tree = git('write-tree')
+          git('config', 'user.name', 'CyxiaOS integration')
+          git('config', 'user.email', 'integration@cyxiaos.invalid')
+          commit = git('commit-tree', stage_tree, '-p', BASE, '-m', 'Stage verified source objects for owner-requested integration')
+          existing = git('ls-remote', '--heads', 'origin', 'refs/heads/' + STAGE).split()
+          if existing:
+              git('fetch', 'origin', 'refs/heads/' + STAGE)
+              require(git('rev-parse', 'FETCH_HEAD^{tree}') == stage_tree, 'Existing staging branch differs')
+              commit = existing[0]
+          else:
+              git('push', 'origin', commit + ':refs/heads/' + STAGE)
+          receipt = dict(base=BASE, candidate_tree=TREE, patch_sha256=PATCH,
+                         changed_files=71, staging_branch=STAGE,
+                         staging_commit=commit, staging_tree=stage_tree,
+                         mainline_updated=False)
+          text = json.dumps(receipt, indent=2)
+          print(text)
+          pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('```json\n' + text + '\n```\n')
