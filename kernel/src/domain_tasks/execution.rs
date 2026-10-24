@@ -1,0 +1,1473 @@
+use super::memory::{Pages, copy_from, copy_to, frame_phys, frame_ptr, prepare, synchronize};
+use super::*;
+
+struct Creator<'a> {
+    tasks: &'a mut [Task; TASKS],
+    launches: &'a [Launch; LAUNCHES],
+    memory: &'a mut Memory<PAGES, 512>,
+    scheduler: &'a mut Scheduler,
+    services: &'a mut ServiceBatch,
+    ipc: &'a mut Ipc<IPC_BYTES>,
+    background: &'a mut BackgroundBudgets,
+    layout: CpuLayout,
+    remote: Option<Remote>,
+    generation: &'a mut u64,
+}
+impl Creator<'_> {
+    fn launch(&self, r: &SpawnRequest) -> Result<usize, Error> {
+        self.launches
+            .iter()
+            .position(|l| l.request == Some(*r))
+            .ok_or(Error::Stale)
+    }
+    fn build(&mut self, r: &SpawnRequest, slot: usize, key: ObjectKey) -> Result<(), Error> {
+        let launch = &self.launches[self.launch(r)?];
+        let client = r.package == CLIENT_PACKAGE;
+        let local = r.caller == CLUSTER_CALLER;
+        if launch.deadline <= now_ns() {
+            return Err(Error::Expired);
+        }
+        let inherited = task_index(self.tasks, r.caller).map_or(ZERO, |i| self.tasks[i].endpoint);
+        self.tasks[slot] = Task {
+            key,
+            group: r.group,
+            parent: r.caller,
+            package: r.package,
+            spawn_id: r.request_id,
+            cpu: launch.cpu,
+            life: Life::Ready,
+            deadline: launch.deadline,
+            optional: matches!(r.group.id, 15 | 16),
+            recipe: launch.recipe,
+            pending: true,
+            ..Task::EMPTY
+        };
+        self.tasks[slot].caps[0] = inherited;
+        unsafe {
+            for frame in slot * 3..slot * 3 + 3 {
+                core::ptr::write_bytes(frame_ptr(frame)?, 0, 4096);
+            }
+            frame_ptr(slot * 3)?
+                .cast::<u64>()
+                .write(frame_phys(slot * 3 + 1)? | 3);
+            frame_ptr(slot * 3 + 1)?
+                .cast::<u64>()
+                .write(frame_phys(slot * 3 + 2)? | 3);
+            let (first, count) = if client {
+                (CLIENT_CODE_FRAME, 4)
+            } else {
+                (CODE_FRAME, 1)
+            };
+            for page in 0..count {
+                frame_ptr(slot * 3 + 2)?.cast::<u64>().add(16 + page).write(
+                    mmu::encode_user_leaf(PhysAddr(frame_phys(first + page)?), false, true)
+                        .map_err(|_| Error::Range)?,
+                );
+            }
+        }
+        if r.recovery {
+            self.memory.register_progress_owner(key, 4)?;
+        } else {
+            self.memory
+                .register_owner(key, if client || local { 16 } else { 64 })?;
+        }
+        if local || r.recovery {
+            self.memory.commit_pages(key)?;
+        }
+        for (base, pages, write) in [
+            (0x20000, 1, false),
+            (0x21000, 1, false),
+            (0x30000, 1, true),
+            (
+                if client { 0x39000 } else { 0x40000 },
+                if client { 8 } else { 1 },
+                true,
+            ),
+        ] {
+            self.memory.reserve(key, base, pages, write)?;
+            let t = &mut self.tasks[slot];
+            t.regions[t.region_count] = base;
+            t.region_count += 1;
+        }
+        prepare(self.memory, self.tasks, self.remote, key, 0x20000, 8, false)?;
+        prepare(
+            self.memory,
+            self.tasks,
+            self.remote,
+            key,
+            0x21000,
+            launch.len,
+            false,
+        )?;
+        copy_to(
+            self.memory,
+            key,
+            0x20000,
+            &(launch.len as u64).to_le_bytes(),
+        )?;
+        copy_to(self.memory, key, 0x21000, &launch.input[..launch.len])?;
+        let cap = self.services.grant(key, key, TASK_SERVICE, 2)?;
+        self.tasks[slot].own_query_cap = cap;
+        if launch.recipe != 0 {
+            self.tasks[slot].endpoint = self.ipc.open(key, true)?;
+            self.background.set_commitment(r.group, 0, now_ns())?;
+        }
+        self.scheduler.admit(
+            ThreadSpec {
+                key,
+                group: r.group,
+                cpu: launch.cpu,
+                allowed_mask: 12,
+                minimum_ns: if local { 10_000_000 } else { 0 },
+                budget_ns: if matches!(r.group.id, 15 | 16) {
+                    20_000_000
+                } else if client || local {
+                    10_000_000
+                } else {
+                    1_000_000
+                },
+            },
+            self.layout,
+            now_ns(),
+        )?;
+        unsafe {
+            let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
+                .cast::<user::Context>()
+                .add(slot);
+            *context = user::Context::empty();
+            context.pc = 0x10000;
+            context.sp = 0x41000;
+            if client {
+                let file =
+                    crate::domain_file_abi::grant(key, crate::domain_file_abi::abi::ALL_RIGHTS)?;
+                context.regs[0] = file.id;
+                context.regs[1] = file.generation;
+            } else {
+                context.regs[0] = cap;
+                context.regs[1] = inherited.id;
+                context.regs[2] = inherited.generation;
+            }
+        }
+        synchronize();
+        Ok(())
+    }
+    fn rollback(&mut self, slot: usize, key: ObjectKey) -> Result<(), Error> {
+        match self.scheduler.remove(key) {
+            Ok(()) | Err(Error::Stale) => {}
+            Err(error) => return Err(error),
+        }
+        crate::domain_file_abi::exit(key)?;
+        self.services.revoke_owner(key);
+        self.services.revoke_object(key);
+        let mut wake = 0;
+        self.ipc.exit(
+            key,
+            &mut abi::Mailbox {
+                tasks: self.tasks,
+                wake: &mut wake,
+                received: &mut [],
+                used: 0,
+            },
+        );
+        let mut pages = Pages {
+            tasks: self.tasks,
+            remote: self.remote,
+            load: None,
+        };
+        for base in self.tasks[slot].regions[..self.tasks[slot].region_count]
+            .iter()
+            .copied()
+        {
+            match self.memory.unmap_step(key, base, 64, &mut pages) {
+                Ok(progress) if progress.remaining == 0 => {}
+                Err(Error::NotFound) => {}
+                _ => return Err(Error::Busy),
+            }
+        }
+        match self.memory.unregister_owner(key) {
+            Ok(()) | Err(Error::Stale) => {}
+            Err(error) => return Err(error),
+        }
+        unsafe {
+            for frame in slot * 3..slot * 3 + 3 {
+                core::ptr::write_bytes(frame_ptr(frame)?, 0, 4096);
+            }
+            *core::ptr::addr_of_mut!(CONTEXTS)
+                .cast::<user::Context>()
+                .add(slot) = user::Context::empty();
+        }
+        synchronize();
+        self.tasks[slot] = Task::EMPTY;
+        Ok(())
+    }
+}
+impl TaskBackend for Creator<'_> {
+    fn authorize(&mut self, r: &SpawnRequest) -> Result<(), Error> {
+        if r.package != PACKAGE
+            && !(r.package == CLIENT_PACKAGE && r.caller == KERNEL_CALLER && SELFTEST_ENABLED)
+        {
+            return Err(Error::Auth);
+        }
+        let launch = &self.launches[self.launch(r)?];
+        if r.recovery && r.caller != KERNEL_CALLER {
+            return Err(Error::Auth);
+        }
+        if r.caller != KERNEL_CALLER && r.caller != CLUSTER_CALLER {
+            let parent = &self.tasks[task_index(self.tasks, r.caller)?];
+            if parent.closed || parent.group != r.group {
+                return Err(Error::Auth);
+            }
+        }
+        if r.caller == CLUSTER_CALLER
+            && (r.group != group(5) || r.recovery || r.package != PACKAGE || launch.cpu != 3)
+        {
+            return Err(Error::Auth);
+        }
+        if !(2..=3).contains(&launch.cpu)
+            || self.layout.business_mask & self.layout.healthy_mask & (1u64 << launch.cpu) == 0
+        {
+            return Err(Error::NotReady);
+        }
+        if launch.deadline <= now_ns() {
+            return Err(Error::Expired);
+        }
+        Ok(())
+    }
+    fn create(&mut self, r: &SpawnRequest) -> CreateOutcome {
+        let range = if r.recovery {
+            ORDINARY_TASKS..TASKS
+        } else {
+            0..ORDINARY_TASKS
+        };
+        let Some(slot) = range
+            .into_iter()
+            .find(|i| self.tasks[*i].life == Life::Free && self.tasks[*i].recipe == 0)
+        else {
+            return CreateOutcome::Rejected(Error::Capacity);
+        };
+        let Some(generation) = self.generation.checked_add(1) else {
+            return CreateOutcome::Rejected(Error::Overflow);
+        };
+        *self.generation = generation;
+        let key = ObjectKey {
+            id: 0x1000 + slot as u64,
+            generation,
+        };
+        match self.build(r, slot, key) {
+            Ok(()) => CreateOutcome::Created(key),
+            Err(error) => {
+                if self.rollback(slot, key).is_ok() {
+                    CreateOutcome::Rejected(error)
+                } else {
+                    self.tasks[slot].life = Life::Exiting;
+                    self.tasks[slot].failure = Some(error);
+                    CreateOutcome::Uncertain
+                }
+            }
+        }
+    }
+}
+fn effective_layout(s: &State) -> CpuLayout {
+    CpuLayout {
+        business_mask: s.layout.business_mask & !s.draining,
+        ..s.layout
+    }
+}
+pub(super) fn submit_locked(
+    s: &mut State,
+    caller: ObjectKey,
+    id: u64,
+    target: ObjectKey,
+    input: &[u8],
+    cpu: u16,
+    deadline: u64,
+    recovery: bool,
+    recipe: u16,
+) -> Result<SpawnState, Error> {
+    s.facts.attempts = s.facts.attempts.saturating_add(1);
+    if (1..=16).contains(&target.id) {
+        s.facts.spawn[(target.id - 1) as usize].add(now_ns(), 1);
+    }
+    let result = submit_package(
+        s, PACKAGE, caller, id, target, input, cpu, deadline, recovery, recipe,
+    );
+    if matches!(result, Err(_) | Ok(SpawnState::Failed(_))) {
+        s.facts.rejected = s.facts.rejected.saturating_add(1);
+    }
+    result
+}
+fn submit_package(
+    s: &mut State,
+    package: ObjectKey,
+    caller: ObjectKey,
+    id: u64,
+    target: ObjectKey,
+    input: &[u8],
+    cpu: u16,
+    deadline: u64,
+    recovery: bool,
+    recipe: u16,
+) -> Result<SpawnState, Error> {
+    if input.is_empty() || input.len() > 4096 || !input.len().is_multiple_of(8) || id == 0 {
+        return Err(Error::Format);
+    }
+    let mut hash = Sha256::new();
+    hash.update(input);
+    hash.update(cpu.to_le_bytes());
+    hash.update(deadline.to_le_bytes());
+    hash.update(recipe.to_le_bytes());
+    let request = SpawnRequest {
+        caller,
+        request_id: id,
+        package,
+        group: target,
+        payload_hash: hash.finalize().into(),
+        recovery,
+    };
+    if let Ok(old) = s.admission.request(caller, id) {
+        return if old == request {
+            s.admission.query(caller, id)
+        } else {
+            Err(Error::Conflict)
+        };
+    }
+    let now = now_ns();
+    if deadline <= now || (recipe == 0 && deadline.saturating_sub(now) > 60_000_000_000) {
+        return Err(Error::Range);
+    }
+    if cpu >= 64 || s.draining & (1u64 << cpu) != 0 {
+        return Err(Error::NotReady);
+    }
+    let range = if recovery { 64..LAUNCHES } else { 0..64 };
+    let slot = range
+        .into_iter()
+        .find(|i| s.launches[*i].request.is_none())
+        .ok_or(Error::Again)?;
+    let launch = &mut s.launches[slot];
+    launch.request = Some(request);
+    launch.cpu = cpu;
+    launch.deadline = deadline;
+    launch.len = input.len();
+    launch.recipe = recipe;
+    launch.input[..input.len()].copy_from_slice(input);
+    let layout = effective_layout(s);
+    let mut backend = Creator {
+        tasks: &mut s.tasks,
+        launches: &s.launches,
+        memory: &mut s.memory,
+        scheduler: &mut s.scheduler,
+        services: &mut s.services,
+        ipc: &mut s.ipc,
+        background: &mut s.background,
+        layout,
+        remote: s.remote,
+        generation: &mut s.generation,
+    };
+    let result = s.admission.submit(request, now_ns(), &mut backend);
+    if !matches!(result, Ok(SpawnState::Queued)) {
+        s.launches[slot].input.fill(0);
+        s.launches[slot].request = None;
+    }
+    result
+}
+pub fn submit_spawn(
+    caller: ObjectKey,
+    id: u64,
+    target: ObjectKey,
+    input: &[u8],
+    cpu: u16,
+    deadline: u64,
+    recovery: bool,
+) -> Result<SpawnState, Error> {
+    locked(|s| submit_locked(s, caller, id, target, input, cpu, deadline, recovery, 0))
+}
+pub fn query_spawn(caller: ObjectKey, id: u64) -> Result<SpawnState, Error> {
+    locked(|s| s.admission.query(caller, id))
+}
+pub fn cancel_spawn(caller: ObjectKey, id: u64) -> Result<SpawnState, Error> {
+    locked(|s| s.admission.cancel(caller, id))
+}
+pub fn submit_local(id: u64, input: &[u8], deadline: u64) -> Result<SpawnState, Error> {
+    if cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        submit_locked(
+            s,
+            CLUSTER_CALLER,
+            id,
+            group(5),
+            input,
+            3,
+            deadline,
+            false,
+            0,
+        )
+    })
+}
+pub fn query_local(id: u64) -> Result<SpawnState, Error> {
+    locked(|s| s.admission.query(CLUSTER_CALLER, id))
+}
+
+pub(super) fn wake_task(s: &mut State, i: usize) {
+    let key = s.tasks[i].key;
+    if s.throttled.iter().flatten().any(|(k, _)| *k == key) {
+        return;
+    }
+    if s.tasks[i].blocked {
+        if let Ok(group) = group_index(s, s.tasks[i].group) {
+            s.facts.wakes[group].add(now_ns(), 1);
+        }
+        s.tasks[i].blocked = false;
+    }
+    if s.tasks[i].life == Life::Ready {
+        let _ = s.scheduler.set_runnable(key, true, now_ns());
+    }
+    if let Some(active) = s
+        .active
+        .get_mut(usize::from(s.tasks[i].cpu))
+        .and_then(Option::as_mut)
+        && active.dispatch.thread == key
+    {
+        active.state = RunState::Runnable;
+    }
+}
+fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
+    let key = s.tasks[i].key;
+    if FILE_BUSY[i].load(Ordering::Acquire)
+        || s.active.iter().flatten().any(|a| a.dispatch.thread == key)
+    {
+        return Err(Error::Busy);
+    }
+    if s.tasks[i].exit_code == 0 && !s.tasks[i].terminal_seen {
+        s.tasks[i].exit_code = 5;
+    }
+    let exit_slot = if s.tasks[i].recipe == 0 && s.tasks[i].failure.is_none() {
+        Some(
+            s.exits
+                .iter()
+                .position(|record| record.is_none_or(|record| record.key == key))
+                .ok_or(Error::Capacity)?,
+        )
+    } else {
+        None
+    };
+    crate::domain_file_abi::exit(key)?;
+    match s.scheduler.remove(key) {
+        Ok(()) | Err(Error::Stale) => {}
+        Err(e) => return Err(e),
+    }
+    s.services.revoke_owner(key);
+    s.services.revoke_object(key);
+    abi::release_vector_leases(s, i)?;
+    s.vectors[i] = None;
+    s.ipc.exit(
+        key,
+        &mut abi::Mailbox {
+            tasks: &s.tasks,
+            wake: &mut s.wake,
+            received: &mut [],
+            used: 0,
+        },
+    );
+    let mut pages = Pages {
+        tasks: &s.tasks,
+        remote: s.remote,
+        load: None,
+    };
+    for base in s.tasks[i].regions[..s.tasks[i].region_count]
+        .iter()
+        .copied()
+    {
+        match s.memory.unmap_step(key, base, 64, &mut pages) {
+            Ok(p) if p.remaining == 0 => {}
+            Err(Error::NotFound) => {}
+            _ => return Err(Error::Busy),
+        }
+    }
+    match s.memory.unregister_owner(key) {
+        Ok(()) | Err(Error::Stale) => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(error) = s.tasks[i].failure {
+        let _ = s.admission.reconcile(
+            s.tasks[i].parent,
+            s.tasks[i].spawn_id,
+            CreateOutcome::Rejected(error),
+        );
+    } else {
+        let _ = s.admission.exited(key);
+    }
+    if s.tasks[i].optional {
+        s.background.set_commitment(s.tasks[i].group, 0, now_ns())?;
+    }
+    unsafe {
+        for frame in i * 3..i * 3 + 3 {
+            core::ptr::write_bytes(frame_ptr(frame)?, 0, 4096);
+        }
+        *core::ptr::addr_of_mut!(CONTEXTS)
+            .cast::<user::Context>()
+            .add(i) = user::Context::empty();
+    }
+    synchronize();
+    RETURN_PENDING[i].store(false, Ordering::Release);
+    FILE_PENDING[i].store(false, Ordering::Release);
+    FILE_DONE[i].store(false, Ordering::Release);
+    if s.probe_key == Some(key) {
+        s.probe_exit = Some(s.tasks[i].exit_code);
+    }
+    if let Some(slot) = exit_slot {
+        s.exits[slot] = Some(ExitRecord {
+            key,
+            parent: s.tasks[i].parent,
+            code: s.tasks[i].exit_code,
+            value: s.tasks[i].response,
+        });
+    }
+    s.generation = s.generation.checked_add(1).ok_or(Error::Overflow)?;
+    if s.tasks[i].recipe == 0 {
+        s.tasks[i] = Task::EMPTY;
+    } else {
+        s.tasks[i].life = Life::Free;
+        s.tasks[i].region_count = 0;
+        s.tasks[i].endpoint = ZERO;
+        s.tasks[i].pending = false;
+    }
+    Ok(())
+}
+fn advance_admission(s: &mut State) -> Result<(), Error> {
+    for _ in 0..4 {
+        let layout = effective_layout(s);
+        let mut backend = Creator {
+            tasks: &mut s.tasks,
+            launches: &s.launches,
+            memory: &mut s.memory,
+            scheduler: &mut s.scheduler,
+            services: &mut s.services,
+            ipc: &mut s.ipc,
+            background: &mut s.background,
+            layout,
+            remote: s.remote,
+            generation: &mut s.generation,
+        };
+        match s.admission.service_one(now_ns(), &mut backend)? {
+            None => break,
+            Some((_, SpawnState::Failed(_))) => {
+                s.facts.rejected = s.facts.rejected.saturating_add(1)
+            }
+            Some(_) => {}
+        }
+    }
+    for launch in &mut s.launches {
+        if let Some(request) = launch.request
+            && !matches!(
+                s.admission.query(request.caller, request.request_id),
+                Ok(SpawnState::Queued | SpawnState::Unknown)
+            )
+        {
+            launch.input.fill(0);
+            launch.request = None;
+        }
+    }
+    Ok(())
+}
+fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
+    let task = s.tasks[i];
+    if task.recipe == 0
+        || task.life != Life::Ready
+        || task.pending
+        || s.active
+            .iter()
+            .flatten()
+            .any(|a| a.dispatch.thread == task.key)
+    {
+        return Ok(());
+    }
+    let mut bytes = [0u8; 40];
+    let mut backend = abi::Mailbox {
+        tasks: &s.tasks,
+        wake: &mut s.wake,
+        received: &mut bytes,
+        used: 0,
+    };
+    let count = s
+        .ipc
+        .receive_batch(task.key, task.endpoint, now_ns(), &mut backend)?;
+    if count == 0 {
+        return Ok(());
+    }
+    let sequence = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| Error::Format)?);
+    prepare(
+        &mut s.memory,
+        &s.tasks,
+        s.remote,
+        task.key,
+        0x21000,
+        8,
+        false,
+    )?;
+    copy_to(&s.memory, task.key, 0x21000, &bytes[32..40])?;
+    unsafe {
+        let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
+            .cast::<user::Context>()
+            .add(i);
+        *context = user::Context::empty();
+        context.pc = 0x10000;
+        context.sp = 0x41000;
+    }
+    s.tasks[i].pending = true;
+    s.tasks[i].pending_sequence = sequence;
+    wake_task(s, i);
+    Ok(())
+}
+pub fn service(_now: u64, progress: &mut dyn FnMut()) {
+    if !READY.load(Ordering::Acquire) || cpu::slot() != 0 {
+        return;
+    }
+    let _ = locked(|s| {
+        for slot in 0..64 {
+            if COMPLETE_READY[slot].load(Ordering::Acquire) {
+                let _ = complete_locked(s, slot);
+            }
+        }
+        for i in 0..TASKS {
+            if RETURN_PENDING[i].load(Ordering::Acquire)
+                && !s
+                    .active
+                    .iter()
+                    .flatten()
+                    .any(|a| a.dispatch.thread == s.tasks[i].key)
+            {
+                unsafe {
+                    process_return(
+                        s,
+                        i,
+                        &mut *core::ptr::addr_of_mut!(CONTEXTS)
+                            .cast::<user::Context>()
+                            .add(i),
+                    );
+                }
+            }
+            if FILE_DONE[i].swap(false, Ordering::AcqRel) {
+                FILE_BUSY[i].store(false, Ordering::Release);
+                if !FILE_PENDING[i].load(Ordering::Acquire) && s.tasks[i].life == Life::Waiting {
+                    s.tasks[i].life = Life::Ready;
+                    wake_task(s, i);
+                }
+            }
+            if !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
+                && now_ns() >= s.tasks[i].deadline
+                && !FILE_BUSY[i].load(Ordering::Acquire)
+            {
+                s.tasks[i].exit_code = 110;
+                s.tasks[i].life = Life::Exiting;
+            }
+            if s.tasks[i].life == Life::Exiting {
+                let _ = cleanup(s, i);
+            }
+        }
+        let _ = advance_admission(s);
+        refresh_throttled(s, now_ns());
+        for i in 0..TASKS {
+            if s.tasks[i].life == Life::Free || s.tasks[i].life == Life::Exiting {
+                continue;
+            }
+            let _ = recipe_turn(s, i);
+            let can_step = s.vectors[i].as_ref().is_some_and(|v| !v.complete())
+                && abi::prepare_vector_leases(s, i).unwrap_or(false);
+            if let Some(vector) = s.vectors[i].as_mut()
+                && !vector.complete()
+                && can_step
+            {
+                let mut transport = abi::Transport {
+                    tasks: &s.tasks,
+                    validate: s.validate_file,
+                    stat: s.stat_file,
+                    ipc: &mut s.ipc,
+                    task_endpoint: s.task_endpoint,
+                    file_endpoint: s.file_endpoint,
+                    sequence: &mut s.service_sequence,
+                    lease: &mut s.vector_leases[i],
+                };
+                let _ = s.services.step(vector, now_ns(), &mut transport);
+            }
+            if !s.facts.vector_measured[i]
+                && s.vectors[i].as_ref().is_some_and(SubmitVector::complete)
+            {
+                s.facts
+                    .vector_latency
+                    .add(now_ns().saturating_sub(s.facts.vector_started[i]));
+                s.facts.vector_measured[i] = true;
+            }
+            if s.vectors[i].as_ref().is_some_and(SubmitVector::complete) {
+                let _ = abi::release_vector_leases(s, i);
+            }
+            if s.wake & (1u64 << i) != 0 {
+                s.wake &= !(1u64 << i);
+                if s.tasks[i].life == Life::Ready && (!s.tasks[i].optional || s.tasks[i].pending) {
+                    wake_task(s, i);
+                }
+            }
+        }
+        // A cancelled reserved cell may make a sender runnable without any
+        // queued message/dequeue event. Poll one actual endpoint independently
+        // of receiver activity and AI, including the separate recovery slots.
+        for offset in 0..TASKS {
+            let i = (s.cursor + offset) % TASKS;
+            if s.tasks[i].life == Life::Free || s.tasks[i].endpoint == ZERO {
+                continue;
+            }
+            let endpoint = s.tasks[i].endpoint;
+            s.cursor = (i + 1) % TASKS;
+            let _ = s.ipc.service_waiters(
+                endpoint,
+                now_ns(),
+                &mut abi::Mailbox {
+                    tasks: &s.tasks,
+                    wake: &mut s.wake,
+                    received: &mut [],
+                    used: 0,
+                },
+            );
+            break;
+        }
+        s.ipc.flush_notifications(&mut abi::Mailbox {
+            tasks: &s.tasks,
+            wake: &mut s.wake,
+            received: &mut [],
+            used: 0,
+        });
+        let begin = now_ns();
+        memory::synchronize_cache(s);
+        let _ = s.memory.reclaim_step(
+            0,
+            now_ns(),
+            &mut Pages {
+                tasks: &s.tasks,
+                remote: s.remote,
+                load: None,
+            },
+        );
+        s.facts
+            .reclaim_ns
+            .add(now_ns(), now_ns().saturating_sub(begin));
+        let faults = s.memory.stats().faults;
+        s.facts
+            .faults
+            .add(now_ns(), faults.saturating_sub(s.facts.last_faults));
+        s.facts.last_faults = faults;
+        for ordinal in 0..32 {
+            if let Some(key) = s.ipc.endpoint_at(ordinal)
+                && let Ok(stats) = s.ipc.stats(key)
+            {
+                let i = (key.id - 1) as usize;
+                if s.facts.ipc_generation[i] != key.generation {
+                    s.facts.ipc_generation[i] = key.generation;
+                    s.facts.ipc_admitted[i] = 0;
+                    s.facts.ipc_messages[i] = Rate::EMPTY;
+                }
+                s.facts.ipc_messages[i].add(
+                    now_ns(),
+                    stats.admitted.saturating_sub(s.facts.ipc_admitted[i]),
+                );
+                s.facts.ipc_admitted[i] = stats.admitted;
+            }
+        }
+        publish_evidence(s);
+        Ok(())
+    });
+    let begin = now_ns();
+    let _ = crate::domain_storage::cache_reclaim_turn();
+    let elapsed = now_ns().saturating_sub(begin);
+    let _ = locked(|s| {
+        s.facts.reclaim_ns.add(now_ns(), elapsed);
+        Ok(())
+    });
+    service_file(progress);
+}
+fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
+    let key = s.tasks[i].key;
+    let mut state = RunState::Runnable;
+    if s.tasks[i].life == Life::Exiting {
+        state = RunState::Exited;
+    } else if now_ns() >= s.tasks[i].deadline {
+        s.tasks[i].exit_code = 110;
+        s.tasks[i].life = Life::Exiting;
+        state = RunState::Exited;
+    } else if c.kind == 9 {
+        s.tasks[i].life = Life::Ready;
+    } else if c.kind == 8 && c.esr >> 26 == 0x15 && c.esr & 0xffff == 0x44 {
+        s.tasks[i].terminal_seen = true;
+        let mut output = [0u8; 16];
+        let result = copy_from(&s.memory, &s.tasks, key, 0x30000, &mut output);
+        let status = u64::from_le_bytes(output[..8].try_into().unwrap());
+        if s.tasks[i].recipe != 0 && result.is_ok() && status == 0 {
+            let task = &mut s.tasks[i];
+            task.response = u64::from_le_bytes(output[8..].try_into().unwrap());
+            task.completed_sequence = task.pending_sequence;
+            task.pending = false;
+            task.life = Life::Ready;
+            task.heartbeat_ns = now_ns();
+            state = RunState::Blocked;
+        } else {
+            s.tasks[i].exit_code = if result.is_ok() { status } else { 5 };
+            s.tasks[i].response = u64::from_le_bytes(output[8..].try_into().unwrap());
+            s.tasks[i].life = Life::Exiting;
+            state = RunState::Exited;
+        }
+    } else if c.kind == 8 && c.esr >> 26 == 0x15 && c.esr & 0xffff == 0x45 {
+        if c.regs[8] == 0x40 {
+            s.tasks[i].life = Life::Waiting;
+            state = RunState::Blocked;
+            FILE_PENDING[i].store(true, Ordering::Release);
+        } else {
+            if let Err(error) = abi::syscall_locked(s, i, c) {
+                c.regs[0] = error_word(error);
+            }
+            if s.tasks[i].life == Life::Exiting {
+                state = RunState::Exited;
+            } else {
+                s.tasks[i].life = Life::Ready;
+            }
+        }
+    } else if abi::fault_locked(s, key, c).is_ok() {
+        s.tasks[i].life = Life::Ready;
+    } else {
+        s.tasks[i].life = Life::Exiting;
+        s.tasks[i].exit_code = 14;
+        state = RunState::Exited;
+    }
+    if let Some(active) = s
+        .active
+        .iter_mut()
+        .flatten()
+        .find(|a| a.dispatch.thread == key)
+    {
+        active.state = state;
+    } else {
+        let _ = s
+            .scheduler
+            .set_runnable(key, state == RunState::Runnable, now_ns());
+    }
+    s.tasks[i].blocked = state != RunState::Runnable;
+    RETURN_PENDING[i].store(false, Ordering::Release);
+}
+pub fn dispatch(slot: usize) -> bool {
+    if slot >= 64 || CREDIT_KIND[slot].load(Ordering::Acquire) != 3 {
+        return false;
+    }
+    let selected = locked(|s| {
+        let active = s.active[slot].ok_or(Error::Stale)?;
+        let i = task_index(&s.tasks, active.dispatch.thread)?;
+        if s.tasks[i].life == Life::Exiting {
+            if let Some(a) = s.active[slot].as_mut() {
+                a.state = RunState::Exited;
+            }
+            return Ok(None);
+        }
+        if RETURN_PENDING[i].load(Ordering::Acquire) || FILE_BUSY[i].load(Ordering::Acquire) {
+            return Err(Error::Busy);
+        }
+        s.tasks[i].life = Life::Running;
+        s.tasks[i].entered = true;
+        if let Some(a) = s.active[slot].as_mut() {
+            a.state = RunState::Blocked;
+        }
+        Ok(Some((i, frame_phys(i * 3)?, s.tasks[i].deadline)))
+    });
+    let Ok(Some((i, root, deadline))) = selected else {
+        return true;
+    };
+    unsafe {
+        let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
+            .cast::<user::Context>()
+            .add(i);
+        let end = ((u128::from(deadline) * u128::from(timer::frequency())) / 1_000_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        crate::smp::enter_service(
+            context,
+            root,
+            timer::ticks().saturating_add(slice_ticks(slot)).min(end),
+        );
+    }
+    RETURN_PENDING[i].store(true, Ordering::Release);
+    let _ = locked(|s| {
+        unsafe {
+            process_return(
+                s,
+                i,
+                &mut *core::ptr::addr_of_mut!(CONTEXTS)
+                    .cast::<user::Context>()
+                    .add(i),
+            );
+        }
+        Ok(())
+    });
+    true
+}
+fn service_file(progress: &mut dyn FnMut()) {
+    let next = locked(|s| {
+        // A completed but undelivered receipt owns the file staging buffer.
+        // Deliver it before admitting another caller, regardless of slot order.
+        for priority in [true, false] {
+            for i in 0..TASKS {
+                if FILE_PENDING[i].load(Ordering::Acquire)
+                    && s.tasks[i].life == Life::Waiting
+                    && (!priority || crate::domain_file_abi::pending_delivery(s.tasks[i].key))
+                    && !s
+                        .active
+                        .iter()
+                        .flatten()
+                        .any(|a| a.dispatch.thread == s.tasks[i].key)
+                {
+                    FILE_PENDING[i].store(false, Ordering::Release);
+                    FILE_BUSY[i].store(true, Ordering::Release);
+                    return Ok(Some((i, s.tasks[i].key)));
+                }
+            }
+        }
+        Ok(None)
+    });
+    let Ok(Some((i, key))) = next else {
+        return;
+    };
+    let credit = begin_file_credit(key);
+    if let Err(error @ (Error::Budget | Error::Auth | Error::Conflict | Error::Stale)) = credit {
+        // A caller whose configured hard budget cannot ever cover a segment
+        // is rejected before the file ABI executes any effect.
+        unsafe {
+            (*core::ptr::addr_of_mut!(CONTEXTS)
+                .cast::<user::Context>()
+                .add(i))
+            .regs[0] = error_word(error);
+        }
+        FILE_DONE[i].store(true, Ordering::Release);
+        return;
+    }
+    if !matches!(credit, Ok(Some(_))) {
+        // No file operation has started. Preserve the captured SVC and its PTEs
+        // until the caller and CPU0 both have physical execution credit.
+        FILE_PENDING[i].store(true, Ordering::Release);
+        FILE_BUSY[i].store(false, Ordering::Release);
+        return;
+    }
+    let mut segment_started = timer::ticks();
+    let mut file_progress = || {
+        let finished = timer::ticks();
+        let actual = ((u128::from(finished.saturating_sub(segment_started)) * 1_000_000_000)
+            / u128::from(timer::frequency())) as u64;
+        let at = ((u128::from(finished) * 1_000_000_000) / u128::from(timer::frequency())) as u64;
+        let _ = complete_builtin(0, actual, at);
+        // The operation remains in custody across budget windows. Completion,
+        // network and policy progress run outside both its credit and Task gate;
+        // the same suspended operation resumes only after another real grant.
+        loop {
+            progress();
+            if matches!(begin_file_credit(key), Ok(Some(_))) {
+                segment_started = timer::ticks();
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    };
+    unsafe {
+        let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
+            .cast::<user::Context>()
+            .add(i);
+        if !crate::domain_file_abi::dispatch(key, context, &mut file_progress) {
+            context.regs[0] = error_word(Error::Unsupported);
+        }
+        if crate::domain_file_abi::pending_delivery(key) {
+            FILE_PENDING[i].store(true, Ordering::Release);
+        }
+    }
+    let finished = timer::ticks();
+    let actual = ((u128::from(finished.saturating_sub(segment_started)) * 1_000_000_000)
+        / u128::from(timer::frequency())) as u64;
+    let at = ((u128::from(finished) * 1_000_000_000) / u128::from(timer::frequency())) as u64;
+    let _ = complete_builtin(0, actual, at);
+    FILE_DONE[i].store(true, Ordering::Release);
+}
+
+pub fn remote_capacity() -> [u64; 4] {
+    locked(|s| {
+        let healthy = s.layout.business_mask
+            & s.layout.healthy_mask
+            & !s.draining
+            & !s.scheduler.stats().quarantine_mask;
+        let ready = s.remote.is_none()
+            && healthy & 8 != 0
+            && s.scheduler.thread_count() < 64
+            && s.scheduler.committed_ns(3) <= 80_000_000
+            && s.memory.progress_free_pages() >= 3;
+        Ok([
+            if ready { 100 } else { 0 },
+            if ready { 16 } else { 0 },
+            s.layout.generation,
+            s.generation,
+        ])
+    })
+    .unwrap_or([0; 4])
+}
+pub fn remote_start(token: u64, leaf: u64) -> Result<(), Error> {
+    locked(|s| {
+        if token == 0 || leaf < crate::HIGH || !leaf.is_multiple_of(4096) {
+            return Err(Error::Format);
+        }
+        let key = ObjectKey {
+            id: REMOTE_ID,
+            generation: token,
+        };
+        if let Some(remote) = s.remote {
+            return if remote.key == key {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        if s.draining & 8 != 0 || s.memory.progress_free_pages() < 3 {
+            return Err(Error::Capacity);
+        }
+        s.remote = Some(Remote {
+            key,
+            leaf,
+            ended: false,
+        });
+        let result = (|| {
+            s.memory.register_progress_owner(key, 3)?;
+            s.memory.commit_pages(key)?;
+            s.memory.reserve(key, 0x30000, 1, true)?;
+            s.memory.reserve(key, 0x40000, 1, true)?;
+            s.scheduler.admit(
+                ThreadSpec {
+                    key,
+                    group: group(3),
+                    cpu: 3,
+                    allowed_mask: 8,
+                    minimum_ns: 10_000_000,
+                    budget_ns: 10_000_000,
+                },
+                s.layout,
+                now_ns(),
+            )?;
+            s.scheduler.set_runnable(key, false, now_ns())?;
+            s.generation = s.generation.checked_add(1).ok_or(Error::Overflow)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = s.scheduler.remove(key);
+            let mut pages = Pages {
+                tasks: &s.tasks,
+                remote: s.remote,
+                load: None,
+            };
+            for base in [0x30000, 0x40000] {
+                let _ = s.memory.unmap_step(key, base, 2, &mut pages);
+            }
+            let _ = s.memory.unregister_owner(key);
+            s.remote = None;
+        }
+        result
+    })
+}
+pub fn remote_selected(slot: usize) -> bool {
+    slot < 64 && CREDIT_KIND[slot].load(Ordering::Acquire) == 2
+}
+pub fn remote_activate(token: u64) -> Result<(), Error> {
+    locked(|s| {
+        let remote = s
+            .remote
+            .as_mut()
+            .filter(|r| r.key.generation == token)
+            .ok_or(Error::Stale)?;
+        remote.ended = false;
+        s.scheduler.set_runnable(remote.key, true, now_ns())
+    })
+}
+pub fn remote_stopped(token: u64) -> Result<(), Error> {
+    locked(|s| {
+        let remote = s
+            .remote
+            .as_mut()
+            .filter(|r| r.key.generation == token)
+            .ok_or(Error::Stale)?;
+        remote.ended = true;
+        if let Some(active) = s.active[3]
+            .as_mut()
+            .filter(|a| a.dispatch.thread == remote.key)
+        {
+            active.state = RunState::Blocked;
+            Ok(())
+        } else {
+            s.scheduler.set_runnable(remote.key, false, now_ns())
+        }
+    })
+}
+pub fn remote_release(token: u64) -> Result<(), Error> {
+    locked(|s| {
+        let remote = s
+            .remote
+            .filter(|r| r.key.generation == token)
+            .ok_or(Error::Stale)?;
+        if !remote.ended
+            || s.active
+                .iter()
+                .flatten()
+                .any(|a| a.dispatch.thread == remote.key)
+        {
+            return Err(Error::Busy);
+        }
+        match s.scheduler.remove(remote.key) {
+            Ok(()) | Err(Error::Stale) => {}
+            Err(error) => return Err(error),
+        }
+        let mut pages = Pages {
+            tasks: &s.tasks,
+            remote: s.remote,
+            load: None,
+        };
+        for base in [0x30000, 0x40000] {
+            match s.memory.unmap_step(remote.key, base, 2, &mut pages) {
+                Ok(p) if p.remaining == 0 => {}
+                Err(Error::NotFound) => {}
+                _ => return Err(Error::Busy),
+            }
+        }
+        s.memory.unregister_owner(remote.key)?;
+        s.remote = None;
+        s.generation = s.generation.checked_add(1).ok_or(Error::Overflow)?;
+        Ok(())
+    })
+}
+pub fn remote_fault(token: u64, context: &user::Context) -> Result<(), Error> {
+    locked(|s| {
+        let remote = s
+            .remote
+            .filter(|r| r.key.generation == token && !r.ended)
+            .ok_or(Error::Stale)?;
+        abi::fault_locked(s, remote.key, context)
+    })
+}
+pub fn remote_word(token: u64, address: u64) -> Result<u64, Error> {
+    locked(|s| {
+        let remote = s
+            .remote
+            .filter(|r| r.key.generation == token)
+            .ok_or(Error::Stale)?;
+        let mut bytes = [0u8; 8];
+        copy_from(&s.memory, &s.tasks, remote.key, address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    })
+}
+
+pub fn init_recoverable() -> Result<(), Error> {
+    locked(|s| {
+        for recipe in [1u16, 2] {
+            if s.tasks.iter().any(|t| t.recipe == recipe) {
+                continue;
+            }
+            if let SpawnState::Failed(error) = submit_locked(
+                s,
+                KERNEL_CALLER,
+                0xd1400000 + u64::from(recipe),
+                group(u64::from(recipe) + 14),
+                &0u64.to_le_bytes(),
+                3,
+                u64::MAX,
+                true,
+                recipe,
+            )? {
+                return Err(error);
+            }
+        }
+        advance_admission(s)?;
+        for recipe in [1u16, 2] {
+            match s
+                .admission
+                .query(KERNEL_CALLER, 0xd1400000 + u64::from(recipe))?
+            {
+                SpawnState::Created(_) => {}
+                SpawnState::Failed(e) => return Err(e),
+                SpawnState::Cancelled => return Err(Error::Conflict),
+                _ => return Err(Error::Again),
+            }
+        }
+        Ok(())
+    })
+}
+pub fn recoverable_key(recipe: u16) -> Option<ObjectKey> {
+    locked(|s| {
+        Ok(s.tasks
+            .iter()
+            .find(|t| t.recipe == recipe && recipe != 0)
+            .map(|t| t.key))
+    })
+    .ok()
+    .flatten()
+}
+pub fn recoverable_submit(recipe: u16, id: u64, value: u64) -> Result<u64, Error> {
+    locked(|s| {
+        let i = s
+            .tasks
+            .iter()
+            .position(|t| t.recipe == recipe && t.life != Life::Free && !t.closed)
+            .ok_or(Error::NotReady)?;
+        let data = if recipe == 1 {
+            s.facts
+                .cpu
+                .iter()
+                .map(|r| r.get(now_ns()))
+                .fold(0u64, u64::saturating_add)
+        } else {
+            value
+        };
+        s.ipc.send(
+            KERNEL_CALLER,
+            s.tasks[i].endpoint,
+            id,
+            &data.to_le_bytes(),
+            now_ns(),
+            &mut abi::Mailbox {
+                tasks: &s.tasks,
+                wake: &mut s.wake,
+                received: &mut [],
+                used: 0,
+            },
+        )
+    })
+}
+pub fn recoverable_result(key: ObjectKey, sequence: u64) -> Result<u64, Error> {
+    locked(|s| {
+        if sequence == 0 {
+            return Err(Error::Range);
+        }
+        let t = &s.tasks[task_index(&s.tasks, key)?];
+        if t.completed_sequence == sequence {
+            Ok(t.response)
+        } else if t.completed_sequence > sequence {
+            Err(Error::Stale)
+        } else {
+            Err(Error::Again)
+        }
+    })
+}
+fn recovery_index(s: &State, key: ObjectKey) -> Result<usize, Error> {
+    s.tasks
+        .iter()
+        .position(|t| t.key == key && t.recipe != 0)
+        .ok_or(Error::Auth)
+}
+pub fn close_admission(key: ObjectKey, apply: ApplyId) -> Result<(), Error> {
+    locked(|s| {
+        if apply.target != key {
+            return Err(Error::Auth);
+        }
+        let i = recovery_index(s, key)?;
+        let t = &mut s.tasks[i];
+        if t.stop_apply.is_some_and(|old| old != apply) {
+            return Err(Error::Conflict);
+        }
+        t.closed = true;
+        t.stop_apply = Some(apply);
+        Ok(())
+    })
+}
+pub fn readonly_drained(key: ObjectKey) -> Result<bool, Error> {
+    locked(|s| {
+        let i = recovery_index(s, key)?;
+        let t = &s.tasks[i];
+        Ok(t.closed
+            && !t.pending
+            && !FILE_BUSY[i].load(Ordering::Acquire)
+            && s.vectors[i].as_ref().is_none_or(SubmitVector::complete)
+            && (t.endpoint == ZERO || s.ipc.stats(t.endpoint)?.depth == 0)
+            && !s.active.iter().flatten().any(|a| a.dispatch.thread == key))
+    })
+}
+pub fn request_stop(key: ObjectKey, apply: ApplyId) -> Result<(), Error> {
+    locked(|s| {
+        let i = recovery_index(s, key)?;
+        let t = &mut s.tasks[i];
+        if !t.closed || t.stop_apply != Some(apply) {
+            return Err(Error::Auth);
+        }
+        if t.life != Life::Free {
+            t.life = Life::Exiting;
+        }
+        Ok(())
+    })
+}
+pub fn stopped(key: ObjectKey) -> Result<bool, Error> {
+    locked(|s| {
+        let i = recovery_index(s, key)?;
+        Ok(s.tasks[i].life == Life::Free
+            && s.tasks[i].endpoint == ZERO
+            && s.memory.owner_pages(key) == Err(Error::Stale)
+            && !s.active.iter().flatten().any(|a| a.dispatch.thread == key))
+    })
+}
+pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(), Error> {
+    locked(|s| {
+        let expected = ObjectKey {
+            id: old.id,
+            generation: next,
+        };
+        if let Some(t) = s
+            .tasks
+            .iter()
+            .find(|t| t.key == expected && t.start_apply == Some(apply))
+        {
+            return if t.life != Life::Free {
+                Ok(())
+            } else {
+                Err(Error::NotReady)
+            };
+        }
+        let i = recovery_index(s, old)?;
+        let prior = s.tasks[i];
+        let resource_generation = s.generation.checked_add(1).ok_or(Error::Overflow)?;
+        if prior.life != Life::Free
+            || prior.stop_apply != Some(apply)
+            || old.generation.checked_add(1) != Some(next)
+        {
+            return Err(Error::Conflict);
+        }
+        if s.active
+            .iter()
+            .flatten()
+            .any(|a| a.dispatch.group == prior.group)
+        {
+            return Err(Error::Busy);
+        }
+        let now = now_ns();
+        if s.recovery_window != now / 100_000_000 {
+            s.recovery_window = now / 100_000_000;
+            s.recovery_started = 0;
+        }
+        if s.recovery_started >= 8 {
+            return Err(Error::Again);
+        }
+        s.background.recover_stopped(prior.group, now)?;
+        let slot = (64..LAUNCHES)
+            .find(|j| s.launches[*j].request.is_none())
+            .ok_or(Error::Capacity)?;
+        let request = SpawnRequest {
+            caller: KERNEL_CALLER,
+            request_id: next,
+            package: PACKAGE,
+            group: prior.group,
+            payload_hash: [0; 32],
+            recovery: true,
+        };
+        let launch = &mut s.launches[slot];
+        launch.request = Some(request);
+        launch.cpu = prior.cpu;
+        launch.deadline = u64::MAX;
+        launch.len = 8;
+        launch.input[..8].fill(0);
+        launch.recipe = prior.recipe;
+        s.recovery_started += 1;
+        let layout = effective_layout(s);
+        let mut backend = Creator {
+            tasks: &mut s.tasks,
+            launches: &s.launches,
+            memory: &mut s.memory,
+            scheduler: &mut s.scheduler,
+            services: &mut s.services,
+            ipc: &mut s.ipc,
+            background: &mut s.background,
+            layout,
+            remote: s.remote,
+            generation: &mut s.generation,
+        };
+        let result = backend.build(&request, i, expected);
+        if let Err(error) = result {
+            if backend.rollback(i, expected).is_ok() {
+                backend.tasks[i] = prior;
+            } else {
+                backend.tasks[i].life = Life::Exiting;
+                backend.tasks[i].failure = Some(error);
+            }
+        }
+        s.launches[slot].input.fill(0);
+        s.launches[slot].request = None;
+        result?;
+        s.tasks[i].start_apply = Some(apply);
+        s.generation = resource_generation.max(next);
+        Ok(())
+    })
+}
+pub fn running(key: ObjectKey) -> Result<bool, Error> {
+    locked(|s| {
+        let t = &s.tasks[recovery_index(s, key)?];
+        Ok(matches!(t.life, Life::Ready | Life::Running)
+            && t.heartbeat_ns != 0
+            && t.endpoint != ZERO
+            && s.memory.owner_pages(key).is_ok())
+    })
+}
+pub fn heartbeat_ns(key: ObjectKey) -> Result<u64, Error> {
+    locked(|s| Ok(s.tasks[recovery_index(s, key)?].heartbeat_ns))
+}
+pub fn start_probe_client() -> Result<ObjectKey, Error> {
+    if !SELFTEST_ENABLED {
+        return Err(Error::Unsupported);
+    }
+    if cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        if let Some(key) = s.probe_key {
+            return Ok(key);
+        }
+        let id = 0xd0a10001;
+        match s.admission.query(KERNEL_CALLER, id) {
+            Ok(SpawnState::Created(key)) => {
+                s.probe_key = Some(key);
+                return Ok(key);
+            }
+            Ok(SpawnState::Failed(e)) => return Err(e),
+            Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
+            Ok(_) => {}
+            Err(Error::NotFound) => {
+                let deadline = now_ns()
+                    .checked_add(60_000_000_000)
+                    .ok_or(Error::Overflow)?;
+                s.facts.attempts = s.facts.attempts.saturating_add(1);
+                s.facts.spawn[3].add(now_ns(), 1);
+                if let SpawnState::Failed(e) = submit_package(
+                    s,
+                    CLIENT_PACKAGE,
+                    KERNEL_CALLER,
+                    id,
+                    group(4),
+                    &0u64.to_le_bytes(),
+                    3,
+                    deadline,
+                    false,
+                    0,
+                )? {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        advance_admission(s)?;
+        match s.admission.query(KERNEL_CALLER, id)? {
+            SpawnState::Created(key) => {
+                s.probe_key = Some(key);
+                Ok(key)
+            }
+            SpawnState::Failed(e) => Err(e),
+            _ => Err(Error::Again),
+        }
+    })
+}
+pub fn probe_status() -> Result<Option<u64>, Error> {
+    locked(|s| {
+        if s.probe_key.is_none() {
+            return Err(Error::NotFound);
+        }
+        Ok(s.probe_exit)
+    })
+}

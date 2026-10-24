@@ -12,6 +12,7 @@ pub mod input_buffer;
 pub mod net;
 pub mod rng;
 pub mod snapshot;
+pub mod queue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -38,6 +39,8 @@ pub unsafe trait Platform {
     unsafe fn sync(&self, address: usize, len: usize);
     fn barrier(&self);
     fn now_ms(&self) -> u64;
+    /// A board with a finer clock overrides this for the 50us publication cap.
+    fn now_ns(&self) -> u64 { self.now_ms().saturating_mul(1_000_000) }
 }
 
 #[repr(C, align(4096))]

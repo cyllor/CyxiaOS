@@ -3,6 +3,29 @@ use cyxia_prototype_cluster::abi::*;
 fn page() -> *mut Shared {
     SHARED_VA as *mut Shared
 }
+pub fn clock_ns() -> u64 {
+    unsafe { core::ptr::addr_of!((*page()).monotonic_ns).read_volatile() }
+}
+pub fn domains() -> DomainInput {
+    unsafe { core::ptr::addr_of!((*page()).domains).read_volatile() }
+}
+pub fn domain_feedback(feedback: DomainFeedback) {
+    unsafe {
+        let shared = page();
+        let sequence = core::ptr::addr_of_mut!((*shared).feedback_sequence);
+        let base = sequence.read_volatile() & !1;
+        let Some(completed) = base.checked_add(2) else {
+            return;
+        };
+        sequence.write_volatile(base + 1);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        asm!("dmb ish", options(nostack, preserves_flags));
+        core::ptr::addr_of_mut!((*shared).domain_feedback).write_volatile(feedback);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        asm!("dmb ish", options(nostack, preserves_flags));
+        sequence.write_volatile(completed);
+    }
+}
 pub fn boot() -> (u64, [u8; 16], [u8; 32], [u8; 32]) {
     let p = page();
     unsafe {

@@ -37,14 +37,22 @@ fn repeated_disconnect_allocation_cycles_restore_entire_quota() {
 #[test]
 fn advertised_result_and_tombstone_capacity_fits_bounded_eight_mib_quota() {
     let mut arena = Arena::new(0x4000000, 8 * 1024 * 1024);
+    let placements = arena
+        .allocate(PLACEMENT_STORAGE_BYTES, 4096)
+        .expect("placement history is part of the same 8MiB quota");
     // 128 retained maximum-size results plus bounded tombstones and TLS work.
     let mut held = Vec::new();
-    for _ in 0..128 { held.push(arena.allocate(32768, 64).unwrap()); }
+    for _ in 0..128 {
+        held.push(arena.allocate(32768, 64).unwrap());
+    }
     let tombstones = arena.allocate(4096 * 256, 64).unwrap();
     let tls_and_protocol = arena.allocate(2 * 1024 * 1024, 4096).unwrap();
-    for address in held { arena.release(address, 32768); }
+    for address in held {
+        arena.release(address, 32768);
+    }
     arena.release(tombstones, 4096 * 256);
     arena.release(tls_and_protocol, 2 * 1024 * 1024);
+    arena.release(placements, PLACEMENT_STORAGE_BYTES);
     assert_eq!(arena.allocate(8 * 1024 * 1024, 4096), Some(0x4000000));
     assert!(arena.allocate(1, 64).is_none());
 }

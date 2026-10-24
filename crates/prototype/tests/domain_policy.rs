@@ -75,7 +75,7 @@ struct Times {
 impl Clock for Times {
     fn now_ns(&mut self) -> u64 {
         self.calls += 1;
-        if self.calls == 1 {
+        if self.calls <= 2 {
             self.first
         } else {
             self.second
@@ -419,4 +419,74 @@ fn arbitrary_dependency_edges_are_rejected() {
     assert!(dependency_allowed(5, 10));
     assert!(!dependency_allowed(10, 3));
     assert!(!dependency_allowed(1, 13));
+}
+
+struct ScriptClock(std::collections::VecDeque<u64>);
+impl Clock for ScriptClock {
+    fn now_ns(&mut self) -> u64 {
+        self.0.pop_front().expect("unexpected clock read")
+    }
+}
+
+#[test]
+fn publication_checks_time_after_revalidation() {
+    let (mut registry, set, mut owner) = ready();
+    let mut time = ScriptClock([11, 12, 13, 500_012, 500_013].into());
+    let receipt = registry
+        .submit(publisher(), &frame(&set, 1, 0), &mut time, &mut owner)
+        .unwrap();
+    assert_eq!(receipt.state(), ExecutionState::Failed(Error::Budget));
+    assert_eq!(receipt.version, 0);
+    assert_eq!((owner.prepares, owner.publishes, owner.cancels), (1, 0, 1));
+    assert!(registry.optimization_stopped());
+}
+
+#[test]
+fn installed_publication_survives_overrun_and_blocks_new_optimization() {
+    let (mut registry, set, mut owner) = ready();
+    let bytes = frame(&set, 1, 0);
+    let mut time = ScriptClock([11, 12, 13, 14, 500_012].into());
+    let receipt = registry
+        .submit(publisher(), &bytes, &mut time, &mut owner)
+        .unwrap();
+    assert_eq!(receipt.version, 1);
+    assert_eq!(receipt.state(), ExecutionState::Pending);
+    assert_eq!((owner.publishes, owner.cancels), (1, 0));
+    assert!(registry.optimization_stopped());
+    let mut retry_clock = ScriptClock([u64::MAX].into());
+    assert_eq!(
+        registry.submit(publisher(), &bytes, &mut retry_clock, &mut owner),
+        Ok(receipt)
+    );
+    let mut new_clock = ScriptClock([20].into());
+    assert_eq!(
+        registry.submit(publisher(), &frame(&set, 2, 1), &mut new_clock, &mut owner),
+        Err(Error::Budget)
+    );
+    let apply = ApplyId {
+        boot_epoch: 11,
+        controller_epoch: 9,
+        plan_seq: 1,
+        action_index: 0,
+        target: set.target,
+    };
+    assert_eq!(
+        registry
+            .reconcile(apply, 1, ExecutionState::Applied)
+            .unwrap()
+            .state(),
+        ExecutionState::Applied
+    );
+}
+
+#[test]
+fn protected_predecode_cost_is_inside_publication_budget() {
+    let (mut registry, set, mut owner) = ready();
+    let mut time = ScriptClock([500_012, 500_013].into());
+    let receipt = registry
+        .submit_bounded(publisher(), &frame(&set, 1, 0), 11, &mut time, &mut owner)
+        .unwrap();
+    assert_eq!(receipt.state(), ExecutionState::Failed(Error::Budget));
+    assert_eq!(owner.prepares, 0);
+    assert_eq!(owner.publishes, 0);
 }

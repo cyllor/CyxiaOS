@@ -206,7 +206,7 @@ impl SpawnAdmission {
                 MAX_SPAWNS
             }
         {
-            return Err(Error::Capacity);
+            return Err(Error::Again);
         }
         let range = if request.recovery {
             NORMAL_RECEIPTS..RECEIPTS

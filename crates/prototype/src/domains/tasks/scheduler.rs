@@ -36,6 +36,7 @@ pub enum DispatchReason {
     Minimum,
     Weighted,
     FairRecovery,
+    Service,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dispatch {
@@ -149,14 +150,23 @@ impl Scheduler {
             .ok_or(Error::Stale)
     }
     fn roll(&mut self, cpu: usize, now: u64) -> Result<(), Error> {
-        let c = &mut self.cpus[cpu];
         let window = now / WINDOW_NS;
-        if c.window == window {
+        if self.cpus[cpu].window == window {
             return Ok(());
         }
-        if c.active.is_some() {
+        if self.cpus[cpu].active.is_some()
+            || self.cpus.iter().any(|c| {
+                c.active.is_some_and(|d| {
+                    self.threads
+                        .iter()
+                        .flatten()
+                        .any(|t| t.spec.key == d.thread && usize::from(t.spec.cpu) == cpu)
+                })
+            })
+        {
             return Err(Error::Busy);
         }
+        let c = &mut self.cpus[cpu];
         c.window = window;
         c.spent = 0;
         c.groups = [0; MAX_GROUPS];
@@ -279,9 +289,10 @@ impl Scheduler {
         self.time(now)?;
         let i = self.thread(key)?;
         let t = self.threads[i].as_mut().ok_or(Error::Stale)?;
-        if self.cpus[usize::from(t.spec.cpu)]
-            .active
-            .is_some_and(|d| d.thread == key)
+        if self
+            .cpus
+            .iter()
+            .any(|c| c.active.is_some_and(|d| d.thread == key))
         {
             return Err(Error::Busy);
         }
@@ -300,10 +311,10 @@ impl Scheduler {
     }
     pub fn remove(&mut self, key: ObjectKey) -> Result<(), Error> {
         let i = self.thread(key)?;
-        let t = self.threads[i].ok_or(Error::Stale)?;
-        if self.cpus[usize::from(t.spec.cpu)]
-            .active
-            .is_some_and(|d| d.thread == key)
+        if self
+            .cpus
+            .iter()
+            .any(|c| c.active.is_some_and(|d| d.thread == key))
         {
             return Err(Error::Busy);
         }
@@ -441,6 +452,114 @@ impl Scheduler {
         }
         Ok(Some(dispatch))
     }
+    /// A trusted kernel service may execute a blocked caller's syscall on a
+    /// broker CPU without migrating its user context or lending its affinity.
+    /// Actual time is charged once to that physical CPU and once to the caller's
+    /// thread budget. Existing broker-thread promises retain their full credit.
+    pub fn dispatch_service(
+        &mut self,
+        caller: ObjectKey,
+        cpu: usize,
+        layout: CpuLayout,
+        now: u64,
+        maximum_ns: u64,
+    ) -> Result<Option<Dispatch>, Error> {
+        self.time(now)?;
+        let i = self.thread(caller)?;
+        let t = self.threads[i].ok_or(Error::Stale)?;
+        let source = usize::from(t.spec.cpu);
+        if !layout.permits(cpu) || !layout.permits(source) {
+            return Err(Error::Auth);
+        }
+        if t.state != RunState::Blocked {
+            return Err(Error::Conflict);
+        }
+        if maximum_ns == 0 {
+            return Err(Error::Range);
+        }
+        if self.cpus[cpu].quarantine_generation != 0 {
+            return Err(Error::NotReady);
+        }
+        if self.cpus[cpu].active.is_some()
+            || self
+                .cpus
+                .iter()
+                .any(|c| c.active.is_some_and(|d| d.thread == caller))
+        {
+            return Err(Error::Busy);
+        }
+        self.roll(source, now)?;
+        self.roll(cpu, now)?;
+        let protected: u64 = self
+            .threads
+            .iter()
+            .flatten()
+            .filter(|t| usize::from(t.spec.cpu) == cpu && t.spec.key != caller)
+            .map(|t| t.spec.budget_ns.saturating_sub(t.spent))
+            .sum();
+        let physical = CPU_BUDGET_NS
+            .saturating_sub(self.cpus[cpu].spent)
+            .saturating_sub(protected);
+        let t = self.threads[i].as_mut().ok_or(Error::Stale)?;
+        let end = (now / WINDOW_NS)
+            .checked_add(1)
+            .and_then(|w| w.checked_mul(WINDOW_NS))
+            .ok_or(Error::Overflow)?;
+        let reserved = maximum_ns
+            .min(physical)
+            .min(end - now)
+            .min(t.spec.budget_ns.saturating_sub(t.spent));
+        if reserved == 0 {
+            return Ok(None);
+        }
+        let sequence = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
+        let d = Dispatch {
+            sequence,
+            thread: caller,
+            group: t.spec.group,
+            cpu: cpu as u16,
+            core_generation: layout.generation,
+            window: now / WINDOW_NS,
+            started_ns: now,
+            reserved_ns: reserved,
+            reason: DispatchReason::Service,
+            waited_ns: 0,
+            // Explicit syscall service did not choose an AI group weight.
+            policy_version: 0,
+        };
+        let extra = t.spent.saturating_sub(t.spec.minimum_ns);
+        t.spent += reserved;
+        t.last_dispatch = sequence;
+        self.cpus[cpu].spent += reserved;
+        self.cpus[cpu].groups[t.group] += t.spent.saturating_sub(t.spec.minimum_ns) - extra;
+        self.cpus[cpu].active = Some(d);
+        self.sequence = sequence;
+        self.stats.dispatches = self.stats.dispatches.saturating_add(1);
+        Ok(Some(d))
+    }
+    /// Reserve a complete non-preemptible service segment. A partial tail is
+    /// refunded before returning and never authorizes execution of the body.
+    pub fn dispatch_service_exact(
+        &mut self,
+        caller: ObjectKey,
+        cpu: usize,
+        layout: CpuLayout,
+        now: u64,
+        required_ns: u64,
+    ) -> Result<Option<Dispatch>, Error> {
+        let i = self.thread(caller)?;
+        if self.threads[i].ok_or(Error::Stale)?.spec.budget_ns < required_ns {
+            return Err(Error::Budget);
+        }
+        let Some(d) = self.dispatch_service(caller, cpu, layout, now, required_ns)? else {
+            return Ok(None);
+        };
+        if d.reserved_ns != required_ns {
+            self.complete(d, 0, RunState::Blocked, now)?;
+            return Ok(None);
+        }
+        Ok(Some(d))
+    }
     pub fn resize_dispatch(&mut self, d: Dispatch, reserved_ns: u64) -> Result<Dispatch, Error> {
         let cpu = usize::from(d.cpu);
         if cpu >= 64 || self.cpus[cpu].active != Some(d) {
@@ -450,6 +569,16 @@ impl Scheduler {
             return Err(Error::Range);
         }
         let i = self.thread(d.thread)?;
+        let protected = if d.reason == DispatchReason::Service {
+            self.threads
+                .iter()
+                .flatten()
+                .filter(|t| usize::from(t.spec.cpu) == cpu && t.spec.key != d.thread)
+                .map(|t| t.spec.budget_ns.saturating_sub(t.spent))
+                .sum::<u64>()
+        } else {
+            0
+        };
         let t = self.threads[i].as_mut().ok_or(Error::Stale)?;
         let base = t.spent.checked_sub(d.reserved_ns).ok_or(Error::Conflict)?;
         let cpu_base = self.cpus[cpu]
@@ -462,17 +591,27 @@ impl Scheduler {
             .and_then(|w| w.checked_mul(WINDOW_NS))
             .ok_or(Error::Overflow)?;
         if reserved_ns > t.spec.budget_ns.saturating_sub(base)
-            || reserved_ns > CPU_BUDGET_NS.saturating_sub(cpu_base)
+            || reserved_ns
+                > CPU_BUDGET_NS
+                    .saturating_sub(cpu_base)
+                    .saturating_sub(protected)
             || reserved_ns > end.saturating_sub(d.started_ns)
         {
             return Err(Error::Budget);
         }
-        let extra = t.spent.saturating_sub(t.spec.minimum_ns);
+        let extra = t
+            .spent
+            .saturating_sub(t.spec.minimum_ns)
+            .saturating_sub(base.saturating_sub(t.spec.minimum_ns));
         t.spent = base + reserved_ns;
         self.cpus[cpu].spent = cpu_base + reserved_ns;
         self.cpus[cpu].groups[t.group] = self.cpus[cpu].groups[t.group]
             .saturating_sub(extra)
-            .saturating_add(t.spent.saturating_sub(t.spec.minimum_ns));
+            .saturating_add(
+                t.spent
+                    .saturating_sub(t.spec.minimum_ns)
+                    .saturating_sub(base.saturating_sub(t.spec.minimum_ns)),
+            );
         let next = Dispatch { reserved_ns, ..d };
         self.cpus[cpu].active = Some(next);
         Ok(next)
@@ -499,7 +638,11 @@ impl Scheduler {
             .and_then(|w| w.checked_mul(WINDOW_NS))
             .ok_or(Error::Overflow)?;
         self.last_now = self.last_now.max(finished_ns);
-        let extra = t.spent.saturating_sub(t.spec.minimum_ns);
+        let base = t.spent.saturating_sub(d.reserved_ns);
+        let extra = t
+            .spent
+            .saturating_sub(t.spec.minimum_ns)
+            .saturating_sub(base.saturating_sub(t.spec.minimum_ns));
         t.spent = t
             .spent
             .saturating_sub(d.reserved_ns)
@@ -510,7 +653,11 @@ impl Scheduler {
             .saturating_add(actual_ns);
         self.cpus[cpu].groups[t.group] = self.cpus[cpu].groups[t.group]
             .saturating_sub(extra)
-            .saturating_add(t.spent.saturating_sub(t.spec.minimum_ns));
+            .saturating_add(
+                t.spent
+                    .saturating_sub(t.spec.minimum_ns)
+                    .saturating_sub(base.saturating_sub(t.spec.minimum_ns)),
+            );
         t.actual = t.actual.saturating_add(actual_ns);
         t.state = state;
         t.ready_since = finished_ns;
@@ -574,7 +721,11 @@ impl Scheduler {
         if !layout.permits(cpu) || initial.spec.allowed_mask & (1u64 << cpu) == 0 {
             return Err(Error::Auth);
         }
-        if self.cpus[old].active.is_some_and(|d| d.thread == key) || self.cpus[cpu].active.is_some()
+        if self
+            .cpus
+            .iter()
+            .any(|c| c.active.is_some_and(|d| d.thread == key))
+            || self.cpus[cpu].active.is_some()
         {
             return Err(Error::Busy);
         }

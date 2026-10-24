@@ -56,7 +56,8 @@ extern "C" fn _start(mode: u64) -> ! {
             }
         }
         unsafe {
-            asm!("svc #0x541", in("x0") OUTPUT_VA, in("x1") 512u64, options(nostack));
+            asm!("svc #0x541", in("x0") OUTPUT_VA,
+                in("x1") (native::OUTPUT_WORDS * 8) as u64, options(nostack));
         }
         abort()
     }

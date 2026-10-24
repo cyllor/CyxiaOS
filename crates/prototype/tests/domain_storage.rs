@@ -7,9 +7,174 @@ use cyxia_prototype::{
         io::{Class, ORDINARY_BYTES, Request, Scheduler, Submission},
     },
     journal::{self, AfterImage, BlockDevice, Journal},
-    storage::{BLOCK_SIZE, INODE_START, Inode, TOTAL_BLOCKS},
+    storage::{INODE_START, Inode, TOTAL_BLOCKS},
 };
 use std::collections::BTreeMap;
+
+#[test]
+fn byte_grant_owns_real_credits_without_a_fake_completion() {
+    let mut io = Scheduler::new(16, 16);
+    io.recovery_reserve(2, 2).unwrap();
+    let first = Request {
+        object: ObjectKey {
+            id: 1,
+            generation: 1,
+        },
+        class: Class::Background,
+        bytes: 512,
+        pages: 2,
+        descriptors: 2,
+    };
+    let recovery = io
+        .enqueue(
+            Request {
+                class: Class::Recovery,
+                ..first
+            },
+            0,
+        )
+        .unwrap();
+    io.cancel(recovery).unwrap();
+    let stamp = PolicyStamp::new(1, 1, 1).unwrap();
+    io.apply(Action::IoShare(100), stamp, 1).unwrap();
+    assert_eq!(
+        io.apply(Action::IoShare(750), stamp, 1),
+        Err(Error::Conflict)
+    );
+    assert_eq!(io.reserve_admission(first, 4096, 1, 1), Err(Error::Again));
+    assert_eq!(io.usage().ordinary_credits, 0);
+    let grant = io.reserve_admission(first, 4096, 1, 100_000_000).unwrap();
+    assert_eq!(grant.policy_version, 1);
+    assert_eq!(io.reserved_bytes(), 4096);
+    assert_eq!(
+        (
+            io.usage().submit_credits,
+            io.usage().ordinary_credits,
+            io.usage().pages,
+            io.usage().descriptors
+        ),
+        (1, 1, 2, 2)
+    );
+    assert_eq!(
+        (
+            io.stats().submitted,
+            io.stats().completed,
+            io.usage().background_bytes
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        io.complete(grant.ticket, Ok(()), 100_000_001),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        io.enqueue(Request { pages: 13, ..first }, 100_000_001),
+        Err(Error::Again)
+    );
+    let recovery = io
+        .enqueue(
+            Request {
+                class: Class::Recovery,
+                ..first
+            },
+            100_000_001,
+        )
+        .unwrap();
+    io.cancel(recovery).unwrap();
+    io.cancel_admission(grant).unwrap();
+    assert_eq!(io.reserved_bytes(), 0);
+    assert_eq!(
+        (
+            io.usage().submit_credits,
+            io.usage().ordinary_credits,
+            io.usage().pages
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn granted_slot_becomes_the_real_first_request_and_unknown_retains_it() {
+    let mut io = Scheduler::new(16, 16);
+    let first = Request {
+        object: ObjectKey {
+            id: 1,
+            generation: 1,
+        },
+        class: Class::Background,
+        bytes: 512,
+        pages: 2,
+        descriptors: 2,
+    };
+    io.apply(Action::IoShare(250), PolicyStamp::new(7, 0, 0).unwrap(), 0)
+        .unwrap();
+    let grant = io.reserve_admission(first, 4096, 7, 0).unwrap();
+    io.begin_admission(grant, 1024).unwrap();
+    let a = io.activate_admission(grant, first, 1).unwrap();
+    assert_eq!(a, grant.ticket);
+    assert_eq!(io.reserved_slots(), 0);
+    assert_eq!(
+        io.dispatch(1, |_, _| true, |_, _| Submission::Unknown)
+            .unwrap(),
+        Some(a)
+    );
+    assert_eq!(io.cancel_admission(grant), Err(Error::Busy));
+    assert_eq!(io.finish_transaction(grant.permit), Err(Error::Busy));
+    let b = io.enqueue_transaction(first, grant.permit, 2).unwrap();
+    assert_eq!(
+        io.dispatch(2, |_, _| true, |_, _| Submission::Accepted)
+            .unwrap(),
+        Some(b)
+    );
+    assert_eq!(io.reserved_bytes(), 0);
+    io.complete(b, Ok(()), 3).unwrap();
+    assert_eq!(io.acknowledge(b).unwrap().policy_version, 7);
+    assert_eq!(io.usage().ordinary_credits, 1);
+    io.complete(a, Ok(()), 4).unwrap();
+    assert_eq!(io.acknowledge(a).unwrap().policy_version, 7);
+    io.finish_transaction(grant.permit).unwrap();
+    assert_eq!((io.stats().submitted, io.stats().completed), (2, 2));
+    assert_eq!((io.usage().ordinary_credits, io.usage().pages), (0, 0));
+}
+
+#[test]
+fn expired_cache_partition_closes_admission_and_required_writeback_drains_dirty_debt() {
+    large(|| {
+        let (mut d, mut j) = fixture();
+        let mut s = [0; 8192];
+        let mut fs = FileSystem::<64>::new();
+        fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.set_cache_partition(4, 2).unwrap();
+        let stamp = PolicyStamp::new(1, 0, 0).unwrap();
+        fs.set_cache_partition_expiring(32, 4, stamp, 0).unwrap();
+        fs.create("/debt", &mut j, &mut d, &mut s).unwrap();
+        let h = fs
+            .open("/debt", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
+            .unwrap();
+        fs.write(h, 0, &[3; 65536], &mut j, &mut d, &mut s).unwrap();
+        fs.refresh_cache_partition(10_000_000_000);
+        assert_eq!(fs.cache_usage(), [16, 16, 4, 64]);
+        fs.set_cache_partition_expiring(32, 4, stamp, 10_000_000_000)
+            .unwrap();
+        assert_eq!(fs.cache_usage()[2], 4); // an exact retry does not renew TTL
+        assert_eq!(
+            fs.write(h, 65536, &[1; 4096], &mut j, &mut d, &mut s),
+            Err(Error::Again)
+        );
+        let mut out = [0; 16];
+        fs.read(h, 0, &mut out, 10_000_000_000, &mut j, &mut d, &mut s)
+            .unwrap();
+        assert_eq!(out, [3; 16]);
+        let receipt = fs
+            .reclaim_flush_one(&mut j, &mut d, &mut s)
+            .unwrap()
+            .unwrap();
+        assert_eq!((receipt.pages, receipt.policy_version), (16, 0));
+        assert_eq!(fs.metrics().last_flush_version, 0);
+        assert_eq!(fs.reclaim_cache(), 2);
+        assert_eq!(fs.cache_usage(), [14, 0, 4, 64]);
+    });
+}
 
 #[derive(Default)]
 struct Disk {
@@ -332,8 +497,15 @@ fn selected_readahead_and_writeback_versions_execute_real_io() {
             2,
         )
         .unwrap();
-        let before = d.reads;
         let mut out = [0; 4096];
+        // A pending prerequisite closes only new optional use. Demand data
+        // remains readable, while the blocked policy earns no read receipt.
+        fs.read_admitted(h, 10 * 4096, &mut out, 2, false, &mut j, &mut d, &mut s)
+            .unwrap();
+        assert_eq!(out, [9; 4096]);
+        assert_eq!(fs.metrics().readahead_pages, 0);
+        assert_eq!(fs.metrics().last_read_version, 0);
+        let before = d.reads;
         fs.read(h, 0, &mut out, 2, &mut j, &mut d, &mut s).unwrap();
         assert!(d.reads >= before + 9);
         assert_eq!(fs.metrics().readahead_pages, 8);
@@ -352,6 +524,9 @@ fn cache_shrink_is_bounded_and_never_discards_dirty_data() {
         let (mut d, mut j) = fixture();
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
+        let (base, bytes) = fs.cache_backing();
+        assert_eq!(base % 4096, 0);
+        assert_eq!(bytes, 64 * 4096);
         fs.mount(&mut j, &mut d, &mut s).unwrap();
         fs.create("/cache", &mut j, &mut d, &mut s).unwrap();
         let h = fs
@@ -699,4 +874,26 @@ fn recovery_and_zero_byte_completion_cannot_acknowledge_ordinary_byte_policy() {
         ),
         (512, 512, 512)
     );
+}
+
+#[test]
+fn expiration_inside_a_byte_window_preserves_spent_bytes_and_inflight_version() {
+    let mut io = Scheduler::new(16, 16);
+    let stamp = PolicyStamp::new(7, 1, 1).unwrap();
+    io.apply(Action::IoShare(750), stamp, 1).unwrap();
+    let before = 10_000_000_000;
+    let first = io.enqueue(req(1, Class::Background), before).unwrap();
+    io.dispatch(before, |_, _| true, |_, _| Submission::Accepted)
+        .unwrap();
+    let after = stamp.installed_until_ns;
+    let second = io.enqueue(req(2, Class::Background), after).unwrap();
+    assert_eq!(io.current_action(after), Action::IoShare(250));
+    assert_eq!(io.usage().background_bytes, 65536);
+    io.dispatch(after, |_, _| true, |_, _| Submission::Accepted)
+        .unwrap();
+    io.complete(first, Ok(()), after).unwrap();
+    io.complete(second, Ok(()), after).unwrap();
+    assert_eq!(io.acknowledge(first).unwrap().policy_version, 7);
+    assert_eq!(io.acknowledge(second).unwrap().policy_version, 0);
+    assert_eq!(io.usage().background_bytes, 131072);
 }

@@ -27,6 +27,105 @@ fn spec(id: u64, group: u64, cpu: u16, minimum_ns: u64, budget_ns: u64) -> Threa
 }
 
 #[test]
+fn delegated_syscall_uses_caller_budget_and_broker_physical_cpu_once() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.register_group(key(2)).unwrap();
+    s.admit(spec(10, 1, 1, 0, 10_000_000), layout(1), 0)
+        .unwrap();
+    s.admit(spec(20, 2, 0, 20_000_000, 60_000_000), layout(1), 0)
+        .unwrap();
+    s.set_runnable(key(10), false, 0).unwrap();
+    let d = s
+        .dispatch_service(key(10), 0, layout(1), 0, 2_500_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.reason, DispatchReason::Service);
+    assert_eq!(d.cpu, 0);
+    assert_eq!(s.remove(key(10)), Err(Error::Busy));
+    assert_eq!(s.set_runnable(key(10), true, 0), Err(Error::Busy));
+    assert_eq!(s.dispatch(0, layout(1), 0, 1), Err(Error::Busy));
+    s.complete(d, 1_000_000, RunState::Blocked, 1_000_000)
+        .unwrap();
+    assert_eq!(s.cpu_window_usage(0, 1_000_000), Ok((1_000_000, 0)));
+    assert_eq!(s.cpu_window_usage(1, 1_000_000), Ok((0, 0)));
+    assert_eq!(s.thread_cpu_ns(key(10)), Ok(1_000_000));
+    assert_eq!(s.thread_cpu_ns(key(20)), Ok(0));
+    assert_eq!(s.stats().actual_ns, 1_000_000);
+    s.set_runnable(key(10), true, 1_000_000).unwrap();
+    let remaining = s
+        .dispatch(1, layout(1), 1_000_000, 20_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.reserved_ns, 9_000_000);
+    assert_eq!(remaining.thread, key(10));
+}
+
+#[test]
+fn delegated_syscall_preserves_broker_promises_and_cannot_double_enter() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.register_group(key(2)).unwrap();
+    s.admit(spec(10, 1, 1, 0, 80_000_000), layout(1), 0)
+        .unwrap();
+    s.admit(spec(20, 2, 0, 20_000_000, 60_000_000), layout(1), 0)
+        .unwrap();
+    assert_eq!(
+        s.dispatch_service(key(10), 0, layout(1), 0, 1),
+        Err(Error::Conflict)
+    );
+    s.set_runnable(key(10), false, 0).unwrap();
+    let d = s
+        .dispatch_service(key(10), 0, layout(1), 0, 80_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.reserved_ns, 30_000_000);
+    assert_eq!(s.resize_dispatch(d, 30_000_001), Err(Error::Budget));
+    assert_eq!(
+        s.dispatch_service(key(10), 0, layout(1), 0, 1),
+        Err(Error::Busy)
+    );
+    s.complete(d, 30_000_000, RunState::Blocked, 30_000_000)
+        .unwrap();
+    assert_eq!(
+        s.dispatch_service(key(10), 0, layout(1), 30_000_000, 1),
+        Ok(None)
+    );
+    let tls = s
+        .dispatch(0, layout(1), 30_000_000, 60_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tls.thread, key(20));
+    assert_eq!(tls.reserved_ns, 20_000_000);
+}
+
+#[test]
+fn delegated_late_completion_cannot_be_erased_by_source_cpu_window_roll() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 1, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    s.set_runnable(key(10), false, 0).unwrap();
+    let d = s
+        .dispatch_service(key(10), 0, layout(1), WINDOW_NS - 10, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.dispatch(1, layout(1), WINDOW_NS, 1), Err(Error::Busy));
+    assert_eq!(
+        s.complete(d, 11, RunState::Blocked, WINDOW_NS + 1),
+        Err(Error::Budget)
+    );
+    assert_eq!(s.stats().quarantine_mask, 1);
+    assert_eq!(s.stats().actual_ns, 11);
+    assert_eq!(s.thread_cpu_ns(key(10)), Ok(11));
+    assert_eq!(s.dispatch(1, layout(1), WINDOW_NS + 2, 1), Ok(None));
+    assert_eq!(
+        s.dispatch_service(key(10), 0, layout(1), WINDOW_NS + 2, 1),
+        Err(Error::NotReady)
+    );
+}
+
+#[test]
 fn scheduler_executes_minima_before_weighted_surplus() {
     let mut s = Scheduler::new();
     for (i, weight) in [1, 2, 4, 8].into_iter().enumerate() {
@@ -59,6 +158,50 @@ fn scheduler_executes_minima_before_weighted_surplus() {
     assert!(extra[3] > extra[0] * 5, "{extra:?}");
     assert!(extra[2] > extra[1] && extra[1] > extra[0], "{extra:?}");
     assert_eq!(s.stats().actual_ns, 40_000_000);
+}
+
+#[test]
+fn nonpreemptible_file_segment_never_executes_on_a_partial_tail() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 1, 0, 5_000_000), layout(1), 0).unwrap();
+    s.set_runnable(key(10), false, 0).unwrap();
+    for i in 0..3 {
+        let start = i * 900_000;
+        let d = s
+            .dispatch_service_exact(key(10), 0, layout(1), start, 2_500_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.reserved_ns, 2_500_000);
+        s.complete(d, 900_000, RunState::Blocked, start + 900_000)
+            .unwrap();
+    }
+    assert_eq!(
+        s.dispatch_service_exact(key(10), 0, layout(1), 2_700_000, 2_500_000),
+        Ok(None)
+    );
+    assert_eq!(s.cpu_window_usage(0, 2_700_000), Ok((2_700_000, 0)));
+    assert_eq!(s.thread_cpu_ns(key(10)), Ok(2_700_000));
+    assert_eq!(
+        s.dispatch_service_exact(key(10), 0, layout(1), WINDOW_NS - 1, 2_500_000),
+        Ok(None)
+    );
+    assert!(
+        s.dispatch_service_exact(key(10), 0, layout(1), WINDOW_NS, 2_500_000)
+            .unwrap()
+            .is_some()
+    );
+    let mut short = Scheduler::new();
+    short.register_group(key(1)).unwrap();
+    short
+        .admit(spec(10, 1, 1, 0, 1_000_000), layout(1), 0)
+        .unwrap();
+    short.set_runnable(key(10), false, 0).unwrap();
+    assert_eq!(
+        short.dispatch_service_exact(key(10), 0, layout(1), 0, 2_500_000),
+        Err(Error::Budget)
+    );
+    assert_eq!(short.cpu_window_usage(0, 0), Ok((0, 0)));
 }
 
 #[test]
@@ -293,10 +436,8 @@ fn spawn_burst_tokens_are_overwritten_without_refilling_same_window() {
             Ok(SpawnState::Queued)
         );
     }
-    assert_eq!(
-        a.submit(request(65, false), 0, &mut b),
-        Err(Error::Capacity)
-    );
+    assert_eq!(a.submit(request(65, false), 0, &mut b), Err(Error::Again));
+    assert_eq!(a.query(key(1), 65), Err(Error::NotFound));
     for _ in 0..2 {
         assert!(a.service_one(0, &mut b).unwrap().is_some());
     }

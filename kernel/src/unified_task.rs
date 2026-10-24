@@ -5,9 +5,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::PhysAddr;
 use cyxia_kernel_core::control_plane::task_admission::{Authority, Terms, expire_quiescent};
+use cyxia_prototype::domains::Error;
 use sha2::{Digest, Sha256};
 static mut AUTHORITY: Authority = Authority::new();
-static TASK_WINDOW: AtomicU64 = AtomicU64::new(u64::MAX);
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-task.elf"));
 #[repr(C, align(4096))]
 struct Page([u64; 512]);
@@ -15,10 +15,8 @@ static mut TABLES: [Page; 3] = [const { Page([0; 512]) }; 3];
 static mut CODE: Page = Page([0; 512]);
 static mut META: Page = Page([0; 512]);
 static mut INPUT: [Page; 8] = [const { Page([0; 512]) }; 8];
-static mut OUTPUT: Page = Page([0; 512]);
-static mut STACK: Page = Page([0; 512]);
 static mut CONTEXT: user::Context = user::Context::empty();
-// 0 free,1reserved,2queued,3running,4done,5failed/cancelled.
+// 0 free,1reserved,2queued,3running,4done,5failed,6terminal awaiting receipt.
 static STATE: AtomicU64 = AtomicU64::new(0);
 static TOKEN: AtomicU64 = AtomicU64::new(0);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +28,7 @@ static FINISHES: AtomicU64 = AtomicU64::new(0);
 static DEBITS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static MAX_SLICE: AtomicU64 = AtomicU64::new(0);
+static LEDGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 fn phys(p: u64) -> u64 {
     p.checked_sub(crate::HIGH).unwrap()
 }
@@ -73,18 +72,8 @@ pub fn init() {
             )
             .unwrap();
         }
-        tables[2].0[48] = mmu::encode_user_leaf(
-            PhysAddr(phys(core::ptr::addr_of!(OUTPUT) as u64)),
-            true,
-            false,
-        )
-        .unwrap();
-        tables[2].0[64] = mmu::encode_user_leaf(
-            PhysAddr(phys(core::ptr::addr_of!(STACK) as u64)),
-            true,
-            false,
-        )
-        .unwrap();
+        // Writable output and stack are backed by the common VM owner. They
+        // remain invalid until a real EL0 translation fault zeroes/maps them.
         for offset in (0..4096).step_by(64) {
             core::arch::asm!("dc cvau, {}",in(reg)code.add(offset),options(nostack));
         }
@@ -93,40 +82,40 @@ pub fn init() {
 }
 /// CPU3 only, called inside an actual business gate and already-debited quantum.
 pub fn step(slot: usize) -> bool {
-    if slot != 3 {
+    if crate::domain_tasks::dispatch(slot) {
+        return true;
+    }
+    if slot != 3 || !crate::domain_tasks::remote_selected(slot) {
         return false;
     }
     let state = STATE.load(Ordering::Acquire);
+    let token = TOKEN.load(Ordering::Relaxed);
+    if state == 6 {
+        finish_terminal(token);
+        return true;
+    }
     if state != 2 && state != 3 {
-        return false;
+        if matches!(state, 4 | 5) {
+            let _ = crate::domain_tasks::remote_stopped(token);
+        }
+        return true;
     }
     if CANCEL.load(Ordering::Acquire)
         || timer::ticks() / (timer::frequency() / 1000) >= DEADLINE.load(Ordering::Relaxed)
     {
         STATE.store(5, Ordering::Release);
+        let _ = crate::domain_tasks::remote_stopped(token);
         return true;
     }
-    // Dedicated remote CPU subledger: one prepaid 10ms upper bound per aligned
-    // 100ms window (100 milli). The surrounding business ledger also debits it.
-    let now = timer::ticks();
-    let quantum = timer::frequency() / 100;
-    let origin = crate::smp::prototype_runtime::budget_origin();
-    let window = (now - origin) / (timer::frequency() / 10);
-    if TASK_WINDOW.load(Ordering::Relaxed) == window
-        || now + quantum > origin + (window + 1) * (timer::frequency() / 10)
-    {
-        return false;
-    }
-    TASK_WINDOW.store(window, Ordering::Relaxed);
-    DEBITS.fetch_add(100, Ordering::Relaxed);
+    // The enclosing business gate owns the sole prepaid Scheduler credit.
+    // This counter is evidence only; no second window or debit is issued here.
+    DEBITS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         let context = &mut *core::ptr::addr_of_mut!(CONTEXT);
         if state == 2 {
             *context = user::Context::empty();
             context.pc = 0x10000;
             context.sp = 0x41000;
-            (*core::ptr::addr_of_mut!(OUTPUT)).0.fill(0);
-            (*core::ptr::addr_of_mut!(STACK)).0.fill(0);
             STATE.store(3, Ordering::Release);
         }
         let deadline = DEADLINE
@@ -137,28 +126,56 @@ pub fn step(slot: usize) -> bool {
         let begin = timer::ticks();
         if begin >= deadline {
             STATE.store(5, Ordering::Release);
+            let _ = crate::domain_tasks::remote_stopped(token);
             return true;
         }
-        timer::arm((begin + timer::frequency() / 1000).min(deadline));
         if state == 2 {
             STARTS.fetch_add(1, Ordering::Relaxed);
         }
-        user::enter(context, phys(core::ptr::addr_of!(TABLES) as u64));
-        cpu::disable_timer();
+        crate::smp::enter_service(
+            context,
+            phys(core::ptr::addr_of!(TABLES) as u64),
+            begin
+                .saturating_add(crate::domain_tasks::slice_ticks(slot))
+                .min(deadline),
+        );
         let spent = timer::ticks() - begin;
         TICKS.fetch_add(spent, Ordering::Relaxed);
         MAX_SLICE.fetch_max(spent, Ordering::Relaxed);
         if CANCEL.load(Ordering::Acquire) || timer::ticks() >= deadline {
             STATE.store(5, Ordering::Release);
         } else if context.kind == 8 && context.esr >> 26 == 0x15 && context.esr & 0xffff == 0x44 {
-            let ok = (*core::ptr::addr_of!(OUTPUT)).0[0] == 0;
-            FINISHES.fetch_add(1, Ordering::Relaxed);
-            STATE.store(if ok { 4 } else { 5 }, Ordering::Release);
+            STATE.store(6, Ordering::Release);
+            finish_terminal(token);
         } else if context.kind != 9 {
-            STATE.store(5, Ordering::Release);
+            match crate::domain_tasks::remote_fault(token, context) {
+                Ok(()) | Err(Error::Busy) => {}
+                Err(_) => STATE.store(5, Ordering::Release),
+            }
         }
     }
+    if matches!(STATE.load(Ordering::Acquire), 4 | 5) {
+        let _ = crate::domain_tasks::remote_stopped(token);
+    }
     true
+}
+
+fn finish_terminal(token: u64) {
+    if STATE.load(Ordering::Acquire) != 6 {
+        return;
+    }
+    match crate::domain_tasks::remote_word(token, 0x30000) {
+        Ok(status) => {
+            FINISHES.fetch_add(1, Ordering::Relaxed);
+            STATE.store(if status == 0 { 4 } else { 5 }, Ordering::Release);
+            let _ = crate::domain_tasks::remote_stopped(token);
+        }
+        Err(Error::Busy | Error::NotReady) => {}
+        Err(_) => {
+            STATE.store(5, Ordering::Release);
+            let _ = crate::domain_tasks::remote_stopped(token);
+        }
+    }
 }
 
 /// CPU3 calls this while no task EL0 context is executing, even when its
@@ -176,6 +193,25 @@ pub fn expire_idle(slot: usize) {
         timer::ticks() / (timer::frequency() / 1000),
         &DEADLINE,
     );
+    let token = TOKEN.load(Ordering::Relaxed);
+    if STATE.load(Ordering::Acquire) == 6 {
+        finish_terminal(token);
+    }
+    if matches!(STATE.load(Ordering::Acquire), 4 | 5) {
+        let _ = crate::domain_tasks::remote_stopped(token);
+    }
+}
+
+/// Fresh physical/CPU admission state. The single immutable remote package
+/// owns thirteen static pages and three private progress frames (sixteen total).
+pub fn capacity() -> [u64; 4] {
+    let mut result = crate::domain_tasks::remote_capacity();
+    if STATE.load(Ordering::Acquire) != 0 || LEDGER_GENERATION.load(Ordering::Acquire) == u64::MAX {
+        result[0] = 0;
+        result[1] = 0;
+    }
+    result[3] = LEDGER_GENERATION.load(Ordering::Acquire);
+    result
 }
 /// CPU0 broker. Returns (ABI status, bytes, returned token). Inputs are copied;
 /// phase2 is the actual final admission point after durable STARTED intent.
@@ -191,6 +227,15 @@ pub fn request(
 ) -> (u64, usize, u64) {
     assert_eq!(cpu::slot(), 0);
     let state = STATE.load(Ordering::Acquire);
+    if matches!(phase, 11 | 12) {
+        return crate::local_placement::request(phase, payload, len, Sha256::digest(ELF).into());
+    }
+    if phase == 10 {
+        for (i, value) in capacity().into_iter().enumerate() {
+            payload[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        return (0, 32, 0);
+    }
     if phase == 6 {
         if len < 32 {
             return (3, 0, 0);
@@ -213,6 +258,9 @@ pub fn request(
         if len != 104 {
             return (3, 0, 0);
         }
+        if LEDGER_GENERATION.load(Ordering::Acquire) == u64::MAX {
+            return (3, 0, 0);
+        }
         let n = |at| u64::from_le_bytes(payload[at..at + 8].try_into().unwrap());
         let terms = Terms {
             cpu_milli: n(0),
@@ -231,11 +279,28 @@ pub fn request(
         }) else {
             return (3, 0, 0);
         };
+        let leaf = unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Page>().add(2) } as u64;
+        if let Err(error) = crate::domain_tasks::remote_start(next, leaf) {
+            let _ = unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(next) };
+            return (
+                if matches!(
+                    error,
+                    Error::Busy | Error::Again | Error::Budget | Error::Capacity | Error::NotReady
+                ) {
+                    1
+                } else {
+                    3
+                },
+                0,
+                0,
+            );
+        }
         TOKEN.store(next, Ordering::Relaxed);
         EPOCH.store(epoch, Ordering::Relaxed);
         LENGTH.store(0, Ordering::Relaxed);
         CANCEL.store(false, Ordering::Relaxed);
         STATE.store(1, Ordering::Release);
+        LEDGER_GENERATION.fetch_add(1, Ordering::AcqRel);
         return (0, 0, next);
     }
     if token == 0 || TOKEN.load(Ordering::Relaxed) != token {
@@ -284,6 +349,17 @@ pub fn request(
                 ))
                 .into()
             };
+            if let Err(error) = crate::domain_tasks::remote_activate(token) {
+                return (
+                    if matches!(error, Error::Busy | Error::Again) {
+                        1
+                    } else {
+                        3
+                    },
+                    0,
+                    token,
+                );
+            }
             if unsafe {
                 (&mut *core::ptr::addr_of_mut!(AUTHORITY)).start(
                     token,
@@ -297,6 +373,7 @@ pub fn request(
             }
             .is_err()
             {
+                let _ = crate::domain_tasks::remote_stopped(token);
                 return (3, 0, 0);
             }
             unsafe {
@@ -311,7 +388,11 @@ pub fn request(
                 if len < 8 {
                     return (3, 0, 0);
                 }
-                let result = unsafe { (*core::ptr::addr_of!(OUTPUT)).0[1] };
+                let result = match crate::domain_tasks::remote_word(token, 0x30008) {
+                    Ok(value) => value,
+                    Err(Error::Busy | Error::NotReady) => return (1, 0, token),
+                    Err(_) => return (3, 0, token),
+                };
                 payload[..8].copy_from_slice(&result.to_le_bytes());
                 (0, 8, token)
             } else if state == 5 {
@@ -324,6 +405,19 @@ pub fn request(
             if !matches!(state, 1 | 4 | 5) {
                 return (1, 0, token);
             }
+            if let Err(error) = crate::domain_tasks::remote_stopped(token)
+                .and_then(|()| crate::domain_tasks::remote_release(token))
+            {
+                return (
+                    if matches!(error, Error::Busy | Error::Again) {
+                        1
+                    } else {
+                        3
+                    },
+                    0,
+                    token,
+                );
+            }
             unsafe {
                 core::ptr::write_bytes(core::ptr::addr_of_mut!(INPUT).cast::<u8>(), 0, 32768);
             }
@@ -331,6 +425,9 @@ pub fn request(
                 return (3, 0, 0);
             }
             STATE.store(0, Ordering::Release);
+            let _ = LEDGER_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                old.checked_add(1)
+            });
             (0, 0, token)
         }
         5 => {

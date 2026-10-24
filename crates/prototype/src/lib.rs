@@ -6,6 +6,7 @@ pub mod boot;
 pub mod cores;
 pub mod journal;
 pub mod model;
+pub mod learning;
 pub mod storage;
 
 pub mod cluster;

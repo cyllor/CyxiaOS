@@ -8,17 +8,22 @@ use core::{
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_cluster_transport::{
     device::VirtioPort,
-    tcp::{BUFFER_SIZE, Config, Storage, Tcp},
+    tcp::{BUFFER_SIZE, Config, Error as TcpError, State as TcpState, Storage, Tcp, reconnect_due},
 };
 use cyxia_contracts::{BootInfo, PhysAddr};
-use cyxia_driver_virtio::{Platform, QueueMemory, Transport, net::Net};
+use cyxia_driver_virtio::{
+    Platform, Transport, net::BatchedNet as Net, queue::BatchMemory as QueueMemory,
+};
 use cyxia_kernel_core::control_plane::service_image::{BASE, Image, LIMIT};
+use cyxia_prototype::domains::Error;
 #[path = "../../user/prototype-cluster/src/abi.rs"]
-mod abi;
+pub(crate) mod abi;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cluster-service.elf"));
 const LOCAL: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/local.pin32"));
 const PEER: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/peer.pin32"));
 const UNIX: u64 = include!(concat!(env!("OUT_DIR"), "/cluster-unix.rs"));
+const SELFTEST: bool = include!(concat!(env!("OUT_DIR"), "/domain-selftest.rs"));
+type NativeTcp<'a> = Tcp<'static, VirtioPort<'a, Board, Net>>;
 #[repr(C, align(4096))]
 struct Page([u64; 512]);
 #[repr(C, align(4096))]
@@ -77,8 +82,14 @@ fn isolate(coordinator: &mut crate::smp::prototype_runtime::Coordinator, code: u
     line(format_args!(
         "UNIFIED_ISOLATED code={code} local_control_continues\n"
     ));
+    let mut offline = None;
     loop {
         coordinator.poll();
+        let _ = crate::domain_platform::poll(Board.now_ns());
+        crate::domain_tasks::service(Board.now_ns(), &mut || coordinator.poll());
+        let _ = service_work(coordinator, &mut offline, 0, |advance| {
+            crate::domain_services::service(Board.now_ns(), advance)
+        });
         core::hint::spin_loop();
     }
 }
@@ -189,28 +200,203 @@ fn attach(info: &BootInfo) -> Net {
             if selected.is_some() {
                 fail(1)
             }
-            selected = Some(t);
+            selected = Some((t, resource.base.0, resource.irq));
         }
     }
     // SAFETY: one lifetime owner, pinned DMA pages, never recycled on errors.
-    unsafe {
+    let (transport, id, irq) = selected.unwrap_or_else(|| fail(2));
+    let mut net = unsafe {
         Net::initialize(
-            selected.unwrap_or_else(|| fail(2)),
+            transport,
             &mut *core::ptr::addr_of_mut!(RX),
             &mut *core::ptr::addr_of_mut!(TX),
             &Board,
         )
     }
-    .unwrap_or_else(|_| fail(3))
+    .unwrap_or_else(|_| fail(3));
+    crate::domain_storage::register_notify_device(
+        crate::domain_storage::NET_NOTIFY,
+        id,
+        net.capacity(),
+        irq,
+    )
+    .unwrap_or_else(|_| fail(23));
+    net.set_notify_hooks(
+        crate::domain_storage::net_notify_command,
+        crate::domain_storage::net_notify_feedback,
+    );
+    net.set_completion_interrupts(true, &Board);
+    crate::domain_platform::enable_device_irq(irq).unwrap_or_else(|_| fail(24));
+    net
+}
+
+fn startup<T>(stage: u64, mut action: impl FnMut() -> Result<T, Error>) -> T {
+    UNIFIED_EVIDENCE.words[24].store(stage, Ordering::Release);
+    let until = Board.now_ms().saturating_add(5000);
+    loop {
+        match action() {
+            Ok(value) => {
+                UNIFIED_EVIDENCE.words[25].store(0, Ordering::Release);
+                return value;
+            }
+            Err(error) => {
+                UNIFIED_EVIDENCE.words[25].store(error as u64 + 1, Ordering::Release);
+                if !matches!(error, Error::Busy | Error::Again | Error::NotReady)
+                    || Board.now_ms() >= until
+                {
+                    fail(100 + stage);
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+fn drain_network(tcp: &mut NativeTcp<'_>, epoch: u64) {
+    if epoch == 0 {
+        return;
+    }
+    // The queue still owns each prefix until this exact, all-or-nothing TCP
+    // enqueue succeeds. Dependency changes close only new admission.
+    let _ = crate::domain_tasks::network_drain(epoch, Board.now_ns(), &mut |bytes| {
+        tcp.send_exact(bytes).map_err(|e| match e {
+            TcpError::WouldBlock => Error::Again,
+            _ => Error::Io,
+        })?;
+        UNIFIED_EVIDENCE.words[4].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[26].fetch_add(1, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[27].fetch_add(bytes.len() as u64, Ordering::Release);
+        Ok(())
+    });
+}
+
+fn network_turn(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
+    let state = match tcp.as_mut() {
+        Some(link) => link.poll(Board.now_ms()),
+        None => Ok(TcpState::Closed),
+    };
+    let connected = matches!(state, Ok(TcpState::Established));
+    crate::unified_task::transport(connected && epoch != 0);
+    if connected && let Some(link) = tcp.as_mut() {
+        drain_network(link, epoch);
+    }
+    state
+}
+
+fn progress(
+    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
+    tcp: &mut Option<NativeTcp<'_>>,
+    epoch: u64,
+) {
+    coordinator.poll();
+    let _ = crate::domain_platform::poll(Board.now_ns());
+    let _ = network_turn(tcp, epoch);
+}
+
+fn finish_service(started: u64) {
+    let finished = Board.now_ns();
+    match crate::domain_tasks::complete_service(finished.saturating_sub(started), finished) {
+        Ok(()) | Err(Error::Budget) => {}
+        Err(_) => fail(30),
+    }
+}
+
+/// A synchronous operation retains its own journal/DMA obligation while CPU
+/// credit is released at every bounded progress point. Time spent advancing
+/// another owner or waiting for a later budget window is not charged as its CPU.
+fn service_work<R>(
+    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
+    tcp: &mut Option<NativeTcp<'_>>,
+    epoch: u64,
+    work: impl FnOnce(&mut dyn FnMut()) -> R,
+) -> R {
+    let mut started = service_start(coordinator, tcp, epoch);
+    let mut advance = || {
+        finish_service(started);
+        progress(coordinator, tcp, epoch);
+        started = service_start(coordinator, tcp, epoch);
+    };
+    let result = work(&mut advance);
+    drop(advance);
+    finish_service(started);
+    result
+}
+
+fn service_start(
+    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
+    tcp: &mut Option<NativeTcp<'_>>,
+    epoch: u64,
+) -> u64 {
+    loop {
+        if crate::domain_tasks::begin_service(Board.now_ns()).is_some() {
+            return Board.now_ns();
+        }
+        progress(coordinator, tcp, epoch);
+    }
+}
+
+fn update_probe() {
+    if SELFTEST
+        && UNIFIED_EVIDENCE.words[19].load(Ordering::Acquire) == 0
+        && let Ok(Some(code)) = crate::domain_tasks::probe_status()
+    {
+        UNIFIED_EVIDENCE.words[20].store(code, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[21].store(Board.now_ns(), Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[19].store(1, Ordering::Release);
+    }
+}
+
+fn close_network(epoch: u64, coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
+    if epoch == 0 {
+        return;
+    }
+    crate::domain_network::bind_network(epoch, None).unwrap_or_else(|_| fail(31));
+    loop {
+        match crate::domain_tasks::close_network(epoch) {
+            Ok(()) => return,
+            Err(Error::Busy | Error::Again) => coordinator.poll(),
+            Err(_) => fail(32),
+        }
+    }
 }
 
 pub fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
+    // Register the DTB's physical sources before any driver enables a queue.
+    startup(1, || crate::domain_platform::init(info));
+    UNIFIED_EVIDENCE.words[24].store(2, Ordering::Release);
     let boot = crate::prototype_storage::boot(info);
     crate::entropy::init(info);
+    startup(3, crate::domain_tasks::init);
+    startup(4, crate::domain_storage::init);
+    startup(5, || {
+        crate::domain_tasks::set_file_service(
+            crate::domain_storage::validate_file_object,
+            crate::domain_storage::stat_file_object,
+        )
+    });
+    startup(6, || {
+        crate::domain_tasks::set_cache_loader(crate::domain_storage::read_cache_page)
+    });
     crate::unified_store::init();
     crate::unified_task::init();
+    startup(7, || crate::domain_control::init(boot.epoch));
+    startup(8, crate::domain_services::init);
+    let mut net = attach(info);
+    startup(9, crate::prototype_storage::enable_block_interrupts);
+    // An unavailable or poisoned RNG leaves the service offline; it never
+    // substitutes a deterministic seed or releases the existing DMA backing.
+    match crate::entropy::enable_interrupts() {
+        Ok(()) | Err(Error::NotReady) => {}
+        Err(_) => fail(33),
+    }
+    startup(10, crate::domain_tasks::register_control);
+    startup(11, crate::domain_storage::register_control);
+    startup(12, crate::domain_platform::register_control);
+    startup(13, crate::domain_network::register_control);
+    startup(14, crate::domain_services::register_control);
     let mut coordinator = crate::smp::prototype_runtime::Coordinator::new(boot);
+    crate::smp::prototype_runtime::register_broker_devices();
     let mut context = unsafe { load() };
     unsafe {
         let p = &mut *shared();
@@ -221,15 +407,23 @@ pub fn run(info: &BootInfo) -> ! {
         p.local_node = *LOCAL;
         p.peer_node = *PEER;
     }
+    if SELFTEST {
+        let key = startup(15, crate::domain_tasks::start_probe_client);
+        UNIFIED_EVIDENCE.words[16].store(1, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[17].store(key.id, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[18].store(key.generation, Ordering::Release);
+    }
+    unsafe {
+        cpu::disable_timer();
+    }
     crate::smp::enable_service_timer();
     UNIFIED_EVIDENCE.words[1].store(boot.epoch, Ordering::Relaxed);
+    UNIFIED_EVIDENCE.words[24].store(16, Ordering::Relaxed);
     UNIFIED_EVIDENCE.words[0].store(0x435958554e493031, Ordering::Release);
-    let mut net = attach(info);
     let node = net.mac()[5];
     if !(1..=2).contains(&node) || net.mac() != [2, 0, 0, 0, 0, node] || LOCAL == PEER {
         fail(6)
     }
-    crate::smp::prototype_runtime::register_broker_devices();
     let initiator = LOCAL < PEER;
     let mut config = Config {
         mac: net.mac(),
@@ -238,7 +432,7 @@ pub fn run(info: &BootInfo) -> ! {
         prefix_len: 24,
         local_port: if initiator { 40001 } else { 8443 },
         peer_port: if initiator { 8443 } else { 40001 },
-        random_seed: 1, // Replaced by fresh guest entropy before every TCP construction.
+        random_seed: 1, // Always replaced by real fresh guest entropy below.
     };
     line(format_args!(
         "UNIFIED_START node={node} boot={} initiator={} EL0_TLS\n",
@@ -247,12 +441,17 @@ pub fn run(info: &BootInfo) -> ! {
     let mut sequence = 0u64;
     let mut connection_epoch = 0u64;
     let mut entropy_failed = false;
+    let mut refresh_input = true;
     loop {
-        // The prior socket borrow has ended; discard its state and use fresh
-        // guest entropy for every TCP generation (including retries).
+        // Only TCP state is reconstructed. The NIC and all DMA buffers retain
+        // their original owner for the entire boot, including poisoned queues.
         let mut fresh = [0; 8];
         if !entropy_failed
-            && crate::entropy::fill_progress(&mut fresh, &mut || coordinator.poll()).is_err()
+            && crate::entropy::fill_progress(&mut fresh, &mut || {
+                coordinator.poll();
+                let _ = crate::domain_platform::poll(Board.now_ns());
+            })
+            .is_err()
         {
             entropy_failed = true;
             crate::unified_task::transport(false);
@@ -286,49 +485,114 @@ pub fn run(info: &BootInfo) -> ! {
                 .unwrap_or_else(|_| fail(7)),
             )
         };
-        if let Some(tcp) = tcp.as_mut() {
-            if initiator {
-                tcp.connect()
+        if let Some(link) = tcp.as_mut() {
+            (if initiator {
+                link.connect()
             } else {
-                tcp.listen()
-            }
+                link.listen()
+            })
             .unwrap_or_else(|_| fail(8));
         }
-        let mut was_connected = false;
-        let connecting_since = Board.now_ms();
+        let mut stream_epoch = 0;
+        let mut terminal_since = None;
         loop {
             coordinator.poll();
+            let _ = crate::domain_platform::poll(Board.now_ns());
+            let state = network_turn(&mut tcp, stream_epoch);
             let now = Board.now_ms();
-            let state = tcp
-                .as_mut()
-                .map(|tcp| tcp.poll(now))
-                .unwrap_or(Ok(cyxia_cluster_transport::tcp::State::Closed));
-            let connected = matches!(state, Ok(cyxia_cluster_transport::tcp::State::Established));
-            crate::unified_task::transport(connected);
-            if !entropy_failed
-                && matches!(state, Ok(cyxia_cluster_transport::tcp::State::Closed))
-                && now.saturating_sub(connecting_since) > 1000
-            {
-                break;
+            let connected = matches!(state, Ok(TcpState::Established));
+            if connected && stream_epoch == 0 {
+                let next = connection_epoch.checked_add(1).unwrap_or_else(|| fail(10));
+                match crate::domain_tasks::open_network(next) {
+                    Ok(key) => {
+                        match crate::domain_network::bind_network(next, Some(key)) {
+                            Ok(()) => {}
+                            Err(Error::Busy | Error::Again) => continue,
+                            Err(_) => fail(34),
+                        }
+                        stream_epoch = next;
+                        connection_epoch = next;
+                    }
+                    Err(Error::Busy | Error::Again) => continue,
+                    Err(_) => fail(35),
+                }
             }
-            if connected && !was_connected {
-                connection_epoch = connection_epoch.checked_add(1).unwrap_or_else(|| fail(10));
+            crate::unified_task::transport(connected && stream_epoch != 0);
+            if reconnect_due(state, 1000, !entropy_failed) {
+                let since = *terminal_since.get_or_insert(now);
+                if reconnect_due(state, now.saturating_sub(since), !entropy_failed) {
+                    break;
+                }
+            } else {
+                terminal_since = None;
             }
-            was_connected = connected;
+
+            // These pumps own their own bounded CPU segments. Their progress
+            // callback advances mechanisms only, so no active file/owner is
+            // recursively borrowed and no waiting wall time becomes CPU usage.
+            crate::domain_tasks::service(Board.now_ns(), &mut || {
+                progress(&mut coordinator, &mut tcp, stream_epoch)
+            });
+            let _ = service_work(&mut coordinator, &mut tcp, stream_epoch, |advance| {
+                crate::domain_services::service(Board.now_ns(), advance)
+            });
+            update_probe();
+            coordinator.poll();
+            let Some(_credit) = crate::domain_tasks::begin_service(Board.now_ns()) else {
+                core::hint::spin_loop();
+                continue;
+            };
+            let entered = Board.now_ns();
             unsafe {
-                let p = &mut *shared();
-                p.monotonic_ms = now;
-                p.unix_seconds = UNIX.checked_add(now / 1000).unwrap_or_else(|| fail(14));
-                p.connection_epoch = connection_epoch;
-                p.boot_epoch = boot.epoch;
-                p.uuid = boot.filesystem;
-                p.local_node = *LOCAL;
-                p.peer_node = *PEER;
-                timer::arm(timer::ticks() + timer::frequency() / 1000);
-                user::enter(&mut context, phys(core::ptr::addr_of!(ROOT) as u64));
-                cpu::disable_timer();
+                if refresh_input {
+                    // An IRQ can interrupt an EL0 structure copy. Keep input
+                    // immutable until the next broker SVC boundary so a copy
+                    // cannot combine fields from two policy publications.
+                    let p = &mut *shared();
+                    let now = Board.now_ms();
+                    p.monotonic_ms = now;
+                    p.unix_seconds = UNIX.checked_add(now / 1000).unwrap_or_else(|| fail(14));
+                    p.connection_epoch = connection_epoch;
+                    p.boot_epoch = boot.epoch;
+                    p.uuid = boot.filesystem;
+                    p.local_node = *LOCAL;
+                    p.peer_node = *PEER;
+                    crate::domain_network::prepare(p);
+                    p.domains.peer_ipv4 = u64::from(u32::from_be_bytes(config.peer));
+                    let observation = tcp
+                        .as_ref()
+                        .map(|link| link.observation())
+                        .unwrap_or_default();
+                    let depth = if stream_epoch == 0 {
+                        Ok(0)
+                    } else {
+                        crate::domain_tasks::network_pending(stream_epoch)
+                    };
+                    p.domains.network_valid = if depth.is_ok() { observation.valid } else { 0 };
+                    p.domains.network_sample_ms = observation.sample_ms;
+                    p.domains.network_rtt_us = observation.rtt_us;
+                    p.domains.network_retrans_milli = observation.retrans_milli;
+                    p.domains.network_queued_bytes = observation.queued_bytes;
+                    p.domains.network_queue_depth = depth.unwrap_or(0) as u64;
+                    p.domains.network_active = observation.active;
+                    refresh_input = false;
+                }
+                let slice = crate::domain_tasks::active_slice_ticks(0).unwrap_or_else(|| fail(36));
+                let hard =
+                    timer::ticks().saturating_add(slice.min((timer::frequency() / 1000).max(1)));
+                crate::smp::enter_service(
+                    &mut context,
+                    phys(core::ptr::addr_of!(ROOT) as u64),
+                    crate::domain_platform::next_deadline_ticks(hard),
+                );
             }
+            finish_service(entered);
             UNIFIED_EVIDENCE.words[2].fetch_add(1, Ordering::Relaxed);
+            // Feedback is accepted only at a completed, unchanged even
+            // publication sequence; an IRQ may interrupt the EL0 writer.
+            unsafe {
+                crate::domain_network::observe(&*shared());
+            }
             if context.kind == 9 {
                 UNIFIED_EVIDENCE.words[3].fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -341,6 +605,8 @@ pub fn run(info: &BootInfo) -> ! {
                     "UNIFIED_EL0_FAULT kind={} esr={} far={} pc={}\n",
                     context.kind, context.esr, context.far, context.pc
                 ));
+                drop(tcp);
+                close_network(stream_epoch, &mut coordinator);
                 isolate(&mut coordinator, 11)
             }
             let now = Board.now_ms();
@@ -349,17 +615,19 @@ pub fn run(info: &BootInfo) -> ! {
                 || p.version != abi::VERSION
                 || p.sequence != sequence.checked_add(1).unwrap_or_else(|| fail(12))
                 || !abi::valid_request(p.op, p.len, p.offset)
+                || (p.op == abi::OP_WRITE && p.arg0 > 1)
             {
                 fail(13)
             }
             sequence = p.sequence;
+            refresh_input = true;
             let len = p.len as usize;
             p.status = abi::OK;
             match p.op {
                 abi::OP_ENTROPY => {
                     if entropy_failed
-                        || crate::entropy::fill_progress(&mut p.payload[..len], &mut || {
-                            coordinator.poll()
+                        || service_work(&mut coordinator, &mut tcp, stream_epoch, |advance| {
+                            crate::entropy::fill_progress(&mut p.payload[..len], advance)
                         })
                         .is_err()
                     {
@@ -367,48 +635,88 @@ pub fn run(info: &BootInfo) -> ! {
                         p.status = abi::FAILED;
                     }
                 }
-                abi::OP_TIME | abi::OP_YIELD => {
-                    p.len = 0;
-                }
+                abi::OP_TIME | abi::OP_YIELD => p.len = 0,
                 abi::OP_POLL => {
                     p.len = 0;
-                    p.arg0 = u64::from(connected);
+                    p.arg0 = u64::from(
+                        matches!(
+                            network_turn(&mut tcp, stream_epoch),
+                            Ok(TcpState::Established)
+                        ) && stream_epoch != 0,
+                    );
                 }
                 abi::OP_READ => match tcp
                     .as_mut()
-                    .map(|tcp| tcp.receive_tls(&mut p.payload[..len]))
-                    .unwrap_or(Err(cyxia_cluster_transport::tcp::Error::Closed))
+                    .map(|link| link.receive_tls(&mut p.payload[..len]))
+                    .unwrap_or(Err(TcpError::Closed))
                 {
                     Ok(n) => {
                         p.len = n as u64;
                         UNIFIED_EVIDENCE.words[5].fetch_add(n as u64, Ordering::Relaxed);
                     }
-                    Err(cyxia_cluster_transport::tcp::Error::WouldBlock) => p.status = abi::AGAIN,
+                    Err(TcpError::WouldBlock) => p.status = abi::AGAIN,
                     Err(_) => p.status = abi::EOF,
                 },
-                abi::OP_WRITE => match tcp
-                    .as_mut()
-                    .map(|tcp| tcp.send_tls(&p.payload[..len]))
-                    .unwrap_or(Err(cyxia_cluster_transport::tcp::Error::Closed))
-                {
-                    Ok(n) => {
-                        p.len = n as u64;
-                        UNIFIED_EVIDENCE.words[4].fetch_add(n as u64, Ordering::Relaxed);
+                abi::OP_WRITE => {
+                    if stream_epoch == 0 || tcp.is_none() {
+                        p.status = abi::EOF;
+                    } else if p.arg0 == 0 {
+                        // The endpoint owner first holds a real cancellable
+                        // D05 cell, then waits for its root-confirmed receipt
+                        // and checks D10 dependencies before enqueueing that
+                        // same grant. A rejected retry owns no accepted bytes.
+                        // Equal-prefix retries reuse its original grant/ID,
+                        // even though this SVC sequence has advanced.
+                        let result = crate::domain_tasks::network_write(
+                            stream_epoch, sequence, &p.payload[..len],
+                        );
+                        match result {
+                            Ok(n) => p.len = n as u64,
+                            Err(
+                                Error::Busy
+                                | Error::Again
+                                | Error::Capacity
+                                | Error::Budget
+                                | Error::NotReady
+                                | Error::Conflict,
+                            ) => p.status = abi::AGAIN,
+                            Err(_) => p.status = abi::EOF,
+                        }
+                    } else {
+                        // Record encryption assigns a strict stream order.
+                        // Reserved ciphertext must never bypass an earlier
+                        // ordinary ciphertext prefix still owned by IPC.
+                        let link = tcp.as_mut().unwrap();
+                        drain_network(link, stream_epoch);
+                        match crate::domain_tasks::network_pending(stream_epoch) {
+                            Ok(0) => match link.send_tls(&p.payload[..len]) {
+                                Ok(n) => {
+                                    p.len = n as u64;
+                                    UNIFIED_EVIDENCE.words[4]
+                                        .fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                                Err(TcpError::WouldBlock) => p.status = abi::AGAIN,
+                                Err(_) => p.status = abi::EOF,
+                            },
+                            Ok(_) | Err(Error::Busy | Error::Again) => p.status = abi::AGAIN,
+                            Err(_) => p.status = abi::EOF,
+                        }
                     }
-                    Err(cyxia_cluster_transport::tcp::Error::WouldBlock) => p.status = abi::AGAIN,
-                    Err(_) => p.status = abi::EOF,
-                },
+                }
                 abi::OP_STORE_GET | abi::OP_STORE_PUT => {
-                    let (status, n, value) = crate::unified_store::request(
-                        p.op == abi::OP_STORE_PUT,
-                        p.arg0,
-                        p.arg1,
-                        p.arg2,
-                        p.offset,
-                        &mut p.payload,
-                        len,
-                        &mut || coordinator.poll(),
-                    );
+                    let (status, n, value) =
+                        service_work(&mut coordinator, &mut tcp, stream_epoch, |advance| {
+                            crate::unified_store::request(
+                                p.op == abi::OP_STORE_PUT,
+                                p.arg0,
+                                p.arg1,
+                                p.arg2,
+                                p.offset,
+                                &mut p.payload,
+                                len,
+                                advance,
+                            )
+                        });
                     p.status = status;
                     p.len = n as u64;
                     p.arg0 = value;
@@ -416,10 +724,12 @@ pub fn run(info: &BootInfo) -> ! {
                         UNIFIED_EVIDENCE.words[7].fetch_add(1, Ordering::Release);
                     }
                 }
-                abi::OP_STORE_FLUSH => {
-                    p.len = 0;
-                } // each accepted PUT already includes COMMIT→FLUSH
+                abi::OP_STORE_FLUSH => p.len = 0, // PUT already committed and FLUSHed.
                 abi::OP_TASK => {
+                    let live = matches!(
+                        network_turn(&mut tcp, stream_epoch),
+                        Ok(TcpState::Established)
+                    ) && stream_epoch != 0;
                     let (status, n, value) = crate::unified_task::request(
                         p.arg0,
                         p.arg1,
@@ -427,7 +737,7 @@ pub fn run(info: &BootInfo) -> ! {
                         &mut p.payload,
                         len,
                         now,
-                        connected,
+                        live,
                         connection_epoch,
                     );
                     p.status = status;
@@ -444,10 +754,10 @@ pub fn run(info: &BootInfo) -> ! {
                 abi::OP_CLOSE => {
                     p.len = 0;
                     crate::unified_task::transport(false);
-                    if let Some(tcp) = tcp.as_mut() {
-                        tcp.close(Board.now_ms());
-                        break;
+                    if let Some(link) = tcp.as_mut() {
+                        link.close(Board.now_ms());
                     }
+                    terminal_since.get_or_insert(Board.now_ms());
                 }
                 abi::OP_TRACE => {
                     let n = UNIFIED_EVIDENCE.words[6].fetch_add(1, Ordering::Relaxed) as usize;
@@ -461,10 +771,13 @@ pub fn run(info: &BootInfo) -> ! {
                     ));
                     p.len = 0;
                 }
-                _ => {
-                    p.status = abi::FAILED;
-                }
+                _ => p.status = abi::FAILED,
             }
         }
+        crate::unified_task::transport(false);
+        // End the socket and NIC mutable borrow before discarding IPC prefixes;
+        // otherwise a new connection could receive an old stream's bytes.
+        drop(tcp);
+        close_network(stream_epoch, &mut coordinator);
     }
 }

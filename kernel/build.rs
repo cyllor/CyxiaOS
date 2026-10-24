@@ -160,6 +160,9 @@ fn main() {
         for path in [
             "user/prototype-runtime",
             "crates/prototype/src/model.rs",
+            "crates/prototype/src/features.rs",
+            "crates/prototype/src/policy_wire.rs",
+            "crates/prototype/src/domains/types.rs",
             "ports/prototype",
         ] {
             println!("cargo:rerun-if-changed={}", root.join(path).display());
@@ -173,7 +176,11 @@ fn main() {
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         std::fs::write(
             out.join("runtime-fault.rs"),
-            match fault.as_str() { "hang-once" => "1", "no-stop-ack" => "2", _ => "0" },
+            match fault.as_str() {
+                "hang-once" => "1",
+                "no-stop-ack" => "2",
+                _ => "0",
+            },
         )
         .unwrap();
         checked(
@@ -215,27 +222,102 @@ fn main() {
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_SERVICE_ELF");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");
+        println!("cargo:rerun-if-env-changed=CYXIA_DOMAIN_SELFTEST");
+        println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
-        println!("cargo:rerun-if-changed={}", root.join("user/prototype-task").display());
-        checked(Command::new(env::var("RUSTC").unwrap())
-            .arg(root.join("user/prototype-task/main.rs"))
-            .args(["--edition=2024", "--target", "aarch64-unknown-none-softfloat", "--crate-name", "cyxia_prototype_task",
-                "-C", "opt-level=2", "-C", "panic=abort", "-C", "relocation-model=static", "-C", "link-arg=--build-id=none", "-C", "link-arg=-zmax-page-size=4096"])
-            .arg("-C").arg(format!("link-arg=-T{}",root.join("user/prototype-task/linker.ld").display()))
-            .arg("-o").arg(out.join("prototype-task.elf")));
-        let service = PathBuf::from(env::var("CYXIA_CLUSTER_SERVICE_ELF").expect("build the per-node EL0 cluster service first"));
-        let identity = PathBuf::from(env::var("CYXIA_CLUSTER_IDENTITY").expect("per-node provisioned identity directory"));
+        for name in ["prototype-task", "prototype-client"] {
+            let source = root.join("user").join(name);
+            println!("cargo:rerun-if-changed={}", source.display());
+            checked(
+                Command::new(env::var("RUSTC").unwrap())
+                    .arg(source.join("main.rs"))
+                    .args([
+                        "--edition=2024",
+                        "--target",
+                        "aarch64-unknown-none-softfloat",
+                        "--crate-name",
+                    ])
+                    .arg(format!("cyxia_{}", name.replace('-', "_")))
+                    .args([
+                        "-C",
+                        "opt-level=2",
+                        "-C",
+                        "panic=abort",
+                        "-C",
+                        "overflow-checks=yes",
+                        "-C",
+                        "relocation-model=static",
+                        "-C",
+                        "link-arg=--build-id=none",
+                        "-C",
+                        "link-arg=-zmax-page-size=4096",
+                    ])
+                    .arg("-C")
+                    .arg(format!("link-arg=-T{}", source.join("linker.ld").display()))
+                    .arg("-o")
+                    .arg(out.join(format!("{name}.elf"))),
+            );
+        }
+        for path in [
+            "kernel/src/domain_tasks",
+            "kernel/src/domain_platform",
+            "kernel/src/domain_control",
+            "kernel/src/domain_services.rs",
+            "kernel/src/domain_storage.rs",
+            "kernel/src/domain_network.rs",
+            "kernel/src/domain_tasks.rs",
+            "kernel/src/domain_platform.rs",
+            "kernel/src/domain_control.rs",
+            "kernel/src/local_placement.rs",
+            "kernel/src/unified.rs",
+            "kernel/src/prototype_runtime.rs",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+        let selftest = env::var("CYXIA_DOMAIN_SELFTEST").unwrap_or_else(|_| "0".into());
+        assert!(
+            ["0", "1"].contains(&selftest.as_str()),
+            "CYXIA_DOMAIN_SELFTEST must be 0 or 1"
+        );
+        std::fs::write(
+            out.join("domain-selftest.rs"),
+            if selftest == "1" { "true" } else { "false" },
+        )
+        .unwrap();
+        let service = PathBuf::from(
+            env::var("CYXIA_CLUSTER_SERVICE_ELF")
+                .expect("build the per-node EL0 cluster service first"),
+        );
+        let identity = PathBuf::from(
+            env::var("CYXIA_CLUSTER_IDENTITY").expect("per-node provisioned identity directory"),
+        );
         println!("cargo:rerun-if-changed={}", service.display());
         std::fs::copy(service, out.join("cluster-service.elf")).unwrap();
         for name in ["local.pin", "peer.pin"] {
             let source = identity.join(name);
             println!("cargo:rerun-if-changed={}", source.display());
             let bytes = std::fs::read(source).unwrap();
-            assert_eq!(bytes.len(), 32, "NodeID must be SHA256 of raw Ed25519 public key");
+            assert_eq!(
+                bytes.len(),
+                32,
+                "NodeID must be SHA256 of raw Ed25519 public key"
+            );
             std::fs::write(out.join(format!("{name}32")), bytes).unwrap();
         }
-        let unix = env::var("CYXIA_CLUSTER_UNIX_SECONDS").unwrap_or_else(|_| "1792800000".into()).parse::<u64>().expect("provisioned clock epoch");
+        let unix = env::var("CYXIA_CLUSTER_UNIX_SECONDS")
+            .or_else(|_| env::var("SOURCE_DATE_EPOCH"))
+            .map(|v| v.parse::<u64>().expect("provisioned clock epoch"))
+            .unwrap_or_else(|_| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("UTC clock")
+                    .as_secs()
+            });
+        assert!(
+            unix > 0 && unix < (1u64 << 63),
+            "provisioned UTC epoch range"
+        );
         std::fs::write(out.join("cluster-unix.rs"), unix.to_string()).unwrap();
     }
     if env::var_os("CARGO_FEATURE_SELFTEST").is_some() {

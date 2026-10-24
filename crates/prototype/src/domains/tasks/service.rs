@@ -238,14 +238,16 @@ impl ServiceBatch {
     }
     /// Copies and preflights the entire vector before any service callback. Bad
     /// capabilities are item errors, but bad flags/op/tags reject the vector.
-    pub fn submit(
-        &mut self,
+    pub fn preflight(
+        &self,
         caller: ObjectKey,
         items: &[ServiceItem],
         deadline_ns: u64,
         now: u64,
-    ) -> Result<SubmitVector, Error> {
-        self.time(now)?;
+    ) -> Result<(), Error> {
+        if now < self.last_now {
+            return Err(Error::Stale);
+        }
         valid_key(caller)?;
         if items.is_empty() || items.len() > MAX_VECTOR {
             return Err(Error::Format);
@@ -253,6 +255,25 @@ impl ServiceBatch {
         if deadline_ns <= now {
             return Err(Error::Expired);
         }
+        for (i, item) in items.iter().enumerate() {
+            if item.flags != 0
+                || !matches!(item.op, FILE_STAT_BY_CAP | TASK_QUERY_BY_CAP)
+                || items[..i].iter().any(|p| p.tag == item.tag)
+            {
+                return Err(Error::Format);
+            }
+        }
+        Ok(())
+    }
+    pub fn submit(
+        &mut self,
+        caller: ObjectKey,
+        items: &[ServiceItem],
+        deadline_ns: u64,
+        now: u64,
+    ) -> Result<SubmitVector, Error> {
+        self.preflight(caller, items, deadline_ns, now)?;
+        self.time(now)?;
         let mut vector = SubmitVector {
             caller,
             items: [ServiceItem::EMPTY; MAX_VECTOR],
@@ -263,12 +284,6 @@ impl ServiceBatch {
         };
         vector.items[..items.len()].copy_from_slice(items);
         for (i, item) in vector.items[..vector.count].iter().enumerate() {
-            if item.flags != 0
-                || !matches!(item.op, FILE_STAT_BY_CAP | TASK_QUERY_BY_CAP)
-                || vector.items[..i].iter().any(|p| p.tag == item.tag)
-            {
-                return Err(Error::Format);
-            }
             vector.results[i].tag = item.tag;
         }
         self.stats.vectors = self.stats.vectors.saturating_add(1);

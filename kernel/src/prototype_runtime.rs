@@ -11,6 +11,9 @@ mod abi;
 mod dynamic;
 #[path = "../../user/prototype-runtime/idle.rs"]
 mod idle;
+#[cfg(feature = "unified-runtime")]
+#[path = "prototype_runtime/native.rs"]
+mod native;
 use cyxia_kernel_core::control_plane::image::{BASE, Image, PAGES};
 use cyxia_prototype::cores::{CoreSet, Cores, Plane as OwnerPlane, ThreadSpec};
 use dynamic::{Handoff, NativeStop};
@@ -161,6 +164,8 @@ pub(super) struct Worker {
     probed: bool,
     window: u64,
     charged: u64,
+    #[cfg(feature = "unified-runtime")]
+    native: native::WorkerState,
 }
 impl Worker {
     pub(super) const fn new() -> Self {
@@ -170,12 +175,19 @@ impl Worker {
             probed: false,
             window: 0,
             charged: 0,
+            #[cfg(feature = "unified-runtime")]
+            native: native::WorkerState::new(),
         }
     }
 }
 /// One bounded scheduling turn on the control CPU. A stalled model returns on
 /// every timer tick; its old context is discarded only after user::enter returns.
 pub(super) fn step(worker: &mut Worker) {
+    #[cfg(feature = "unified-runtime")]
+    {
+        native::step(worker);
+        return;
+    }
     if cpu::slot() == 2 {
         secondary_control_step(worker);
         return;
@@ -299,6 +311,13 @@ pub(super) fn step(worker: &mut Worker) {
 }
 pub(super) fn business_enter(slot: usize) -> bool {
     assert!((2..4).contains(&slot));
+    #[cfg(feature = "unified-runtime")]
+    {
+        if !native::ready() {
+            return false;
+        }
+        return crate::domain_tasks::begin_builtin(slot, crate::domain_tasks::now_ns()).is_some();
+    }
     if DISPATCH[slot]
         .compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -317,6 +336,15 @@ pub(super) fn business_enter(slot: usize) -> bool {
 pub(super) fn business_complete(slot: usize, start: u64) {
     let end = timer::ticks();
     let elapsed = end - start;
+    #[cfg(feature = "unified-runtime")]
+    {
+        MAX_SLICE[slot].fetch_max(elapsed, Ordering::Relaxed);
+        TOTAL_TICKS[slot].fetch_add(elapsed, Ordering::Relaxed);
+        // The selected credit belongs to exactly one dynamic, remote, or
+        // builtin thread. Its deferred completion cannot grant a second slice.
+        let _ = crate::domain_tasks::complete_builtin(slot, native::ns(elapsed), native::ns(end));
+        return;
+    }
     ELAPSED[slot].store(elapsed, Ordering::Relaxed);
     MAX_SLICE[slot].fetch_max(elapsed, Ordering::Relaxed);
     TOTAL_TICKS[slot].fetch_add(elapsed, Ordering::Relaxed);
@@ -350,6 +378,8 @@ pub(super) fn run(info: &BootInfo) -> ! {
     }
 }
 pub(crate) struct Coordinator {
+    #[cfg(feature = "unified-runtime")]
+    native: native::CoordinatorState,
     boot: cyxia_prototype::boot::BootIdentity,
     frequency: u64,
     origin: u64,
@@ -443,6 +473,8 @@ impl Coordinator {
         let records = [[0u64; RECORD_WORDS]; RECORDS];
         let publication = 0u64;
         Self {
+            #[cfg(feature = "unified-runtime")]
+            native: native::CoordinatorState::new(origin),
             boot,
             frequency,
             origin,
@@ -489,6 +521,11 @@ impl Coordinator {
     }
     /// One bounded CPU0 mechanism turn. Device/network work belongs between turns.
     pub(crate) fn poll(&mut self) {
+        #[cfg(feature = "unified-runtime")]
+        {
+            native::poll(self);
+            return;
+        }
         check_failures();
         let now = timer::ticks();
         let elapsed = now - self.origin;
@@ -870,6 +907,18 @@ pub(super) fn stop_turn(worker: &mut Worker) {
     if operation == 0 || STOP_ACK.load(Ordering::Acquire) == operation || !GATES[2].quiescent() {
         return;
     }
+    #[cfg(feature = "unified-runtime")]
+    {
+        // A returned EL0 context is not yet a stop proof while its CPU bill or
+        // a task/PTE owner remains in custody. Each operation is retried later.
+        if !native::settle(worker)
+            || crate::domain_tasks::close_cpu(2).is_err()
+            || !crate::domain_tasks::quiescent(2)
+        {
+            return;
+        }
+        worker.native.discard();
+    }
     worker.context = None;
     if matches!(SECOND_REQUEST.load(Ordering::Acquire), 1 | 2) {
         SECOND_REQUEST.store(4, Ordering::Release);
@@ -879,6 +928,8 @@ pub(super) fn stop_turn(worker: &mut Worker) {
         return;
     }
     STOP_TASK_ACK.store(operation, Ordering::Release);
+    #[cfg(feature = "unified-runtime")]
+    heartbeat(false);
     unsafe {
         cpu::disable_timer();
     }
@@ -910,6 +961,8 @@ pub(super) fn stop_turn(worker: &mut Worker) {
 }
 pub(super) fn resume_turn(slot: usize) {
     if slot == 2 && STOP_MASKED.swap(false, Ordering::AcqRel) {
+        #[cfg(feature = "unified-runtime")]
+        heartbeat(true);
         gic()
             .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
             .unwrap();

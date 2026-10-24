@@ -176,13 +176,28 @@ struct History {
 // Retain the full immutable request once. Duplicating its two hashes inside
 // every intent would exceed the shared 8MiB quota at 4096 retained outcomes.
 #[derive(Clone, Copy)]
-struct IntentMeta { choice: PlacementChoice, apply: Option<ApplyId>, decided_ns: u64 }
+struct IntentMeta {
+    choice: PlacementChoice,
+    apply: Option<ApplyId>,
+    decided_ns: u64,
+}
 impl From<PlacementIntent> for IntentMeta {
-    fn from(intent: PlacementIntent) -> Self { Self { choice: intent.choice, apply: intent.apply, decided_ns: intent.decided_ns } }
+    fn from(intent: PlacementIntent) -> Self {
+        Self {
+            choice: intent.choice,
+            apply: intent.apply,
+            decided_ns: intent.decided_ns,
+        }
+    }
 }
 impl History {
     fn intent(self) -> Option<PlacementIntent> {
-        self.intent.map(|meta| PlacementIntent { request: self.request, choice: meta.choice, apply: meta.apply, decided_ns: meta.decided_ns })
+        self.intent.map(|meta| PlacementIntent {
+            request: self.request,
+            choice: meta.choice,
+            apply: meta.apply,
+            decided_ns: meta.decided_ns,
+        })
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -339,12 +354,15 @@ impl<const H: usize> PlacementQueue<H> {
             pending.phase = Phase::Deferred;
             return Ok(PlacementStatus::Deferred);
         }
-        self.history[h].as_mut().unwrap().intent = Some(PlacementIntent {
-            request,
-            choice,
-            apply: Some(apply),
-            decided_ns: now,
-        }.into());
+        self.history[h].as_mut().unwrap().intent = Some(
+            PlacementIntent {
+                request,
+                choice,
+                apply: Some(apply),
+                decided_ns: now,
+            }
+            .into(),
+        );
         pending.phase = Phase::Intent;
         Ok(PlacementStatus::Unknown)
     }
@@ -383,12 +401,15 @@ impl<const H: usize> PlacementQueue<H> {
                     continue;
                 }
                 let request = self.history[h].unwrap().request;
-                self.history[h].as_mut().unwrap().intent = Some(PlacementIntent {
-                    request,
-                    choice: PlacementChoice::Local,
-                    apply: None,
-                    decided_ns: now,
-                }.into());
+                self.history[h].as_mut().unwrap().intent = Some(
+                    PlacementIntent {
+                        request,
+                        choice: PlacementChoice::Local,
+                        apply: None,
+                        decided_ns: now,
+                    }
+                    .into(),
+                );
                 pending.phase = Phase::Intent;
                 self.fallbacks = self.fallbacks.saturating_add(1);
             }

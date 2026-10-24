@@ -34,6 +34,7 @@ pub enum Submission {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
+    Reserved,
     Queued,
     Inflight,
     Unknown,
@@ -84,6 +85,16 @@ pub struct Completion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BytePermit {
     generation: u64,
+}
+/// A real upstream allocation for a future bounded transaction. The queue
+/// slot, DMA capacity and both ordinary credits are owned, but no device
+/// submission or completion has occurred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Admission {
+    pub permit: BytePermit,
+    pub ticket: Ticket,
+    pub bytes: u64,
+    pub policy_version: u64,
 }
 #[derive(Clone, Copy)]
 struct Escrow {
@@ -187,13 +198,28 @@ impl Scheduler {
         Ok(())
     }
     pub fn apply(&mut self, action: Action, stamp: PolicyStamp, now: u64) -> Result<(), Error> {
+        self.validate_apply(action, stamp, now)?;
+        let Action::IoShare(share) = action else {
+            return Err(Error::Schema);
+        };
+        self.stamp = stamp;
+        self.share = share;
+        Ok(())
+    }
+    pub fn validate_apply(
+        &self,
+        action: Action,
+        stamp: PolicyStamp,
+        now: u64,
+    ) -> Result<(), Error> {
         action.validate()?;
         let Action::IoShare(share) = action else {
             return Err(Error::Schema);
         };
         self.stamp.accepts(stamp, now)?;
-        self.stamp = stamp;
-        self.share = share;
+        if self.stamp == stamp && self.share != share {
+            return Err(Error::Conflict);
+        }
         Ok(())
     }
     pub fn current_action(&self, now: u64) -> Action {
@@ -231,6 +257,21 @@ impl Scheduler {
         }
         self.recovery_pages = pages;
         self.recovery_descriptors = descriptors;
+        Ok(())
+    }
+    /// Configure the real pinned device pool before any request is admitted.
+    /// This supports initialization in static storage without a large stack copy.
+    pub fn configure_capacity(&mut self, pages: u32, descriptors: u32) -> Result<(), Error> {
+        if pages == 0 || descriptors == 0 {
+            return Err(Error::Capacity);
+        }
+        if self.slots.iter().any(Option::is_some) || self.escrow.is_some() {
+            return Err(Error::Busy);
+        }
+        self.page_capacity = pages;
+        self.descriptor_capacity = descriptors;
+        self.recovery_pages = pages / 4;
+        self.recovery_descriptors = descriptors / 4;
         Ok(())
     }
     fn allowance(&self, class: Class, bytes: u64, other: bool) -> bool {
@@ -306,6 +347,113 @@ impl Scheduler {
         }
         self.escrow = None;
         Ok(())
+    }
+    /// Allocate bytes and the first genuine send/completion/DMA slot before
+    /// downstream admission. The expected version must already govern this
+    /// aligned byte window; installing a future parameter alone cannot earn
+    /// a resource receipt.
+    pub fn reserve_admission(
+        &mut self,
+        first: Request,
+        bytes: u64,
+        expected_version: u64,
+        now: u64,
+    ) -> Result<Admission, Error> {
+        if first.class == Class::Recovery || first.bytes == 0 || bytes < u64::from(first.bytes) {
+            return Err(Error::Format);
+        }
+        self.clock(now)?;
+        if self.window_version != expected_version {
+            return Err(Error::Again);
+        }
+        let permit = self.reserve_transaction(first.class, bytes, now)?;
+        let ticket = match self.enqueue_transaction(first, permit, now) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.escrow = None;
+                return Err(error);
+            }
+        };
+        self.slots[usize::from(ticket.slot)].as_mut().unwrap().state = State::Reserved;
+        self.usage.queued -= 1;
+        Ok(Admission {
+            permit,
+            ticket,
+            bytes,
+            policy_version: self.window_version,
+        })
+    }
+    fn held_admission(&self, admission: Admission) -> Result<(&Slot, Escrow), Error> {
+        let slot = self.slot(admission.ticket)?;
+        let escrow = self
+            .escrow
+            .filter(|e| e.generation == admission.permit.generation)
+            .ok_or(Error::Stale)?;
+        if slot.state != State::Reserved
+            || slot.reservation != Some(escrow.generation)
+            || escrow.class != slot.request.class
+            || escrow.version != admission.policy_version
+        {
+            return Err(Error::Busy);
+        }
+        Ok((slot, escrow))
+    }
+    /// The selected closure can be smaller than the reserved upper bound.
+    /// Return only unused, never submitted bytes while retaining all credits.
+    pub fn begin_admission(&mut self, admission: Admission, bytes: u64) -> Result<(), Error> {
+        let (slot, escrow) = self.held_admission(admission)?;
+        if bytes < u64::from(slot.request.bytes)
+            || bytes > escrow.remaining
+            || escrow.remaining != admission.bytes
+        {
+            return Err(Error::Budget);
+        }
+        self.escrow.as_mut().unwrap().remaining = bytes;
+        Ok(())
+    }
+    /// Bind the already owned first slot to its actual device request.
+    pub fn activate_admission(
+        &mut self,
+        admission: Admission,
+        request: Request,
+        now: u64,
+    ) -> Result<Ticket, Error> {
+        self.clock(now)?;
+        let (slot, escrow) = self.held_admission(admission)?;
+        if request != slot.request || u64::from(request.bytes) > escrow.remaining {
+            return Err(Error::Conflict);
+        }
+        let slot = self.slots[usize::from(admission.ticket.slot)]
+            .as_mut()
+            .unwrap();
+        slot.state = State::Queued;
+        slot.queued_at = now;
+        self.usage.queued += 1;
+        Ok(admission.ticket)
+    }
+    /// Cancellation is possible only before the first request is published.
+    /// A queued/inflight/unknown/completed request still owns its resources.
+    pub fn cancel_admission(&mut self, admission: Admission) -> Result<(), Error> {
+        let (_, escrow) = self.held_admission(admission)?;
+        if escrow.remaining != admission.bytes
+            || self.slots.iter().enumerate().any(|(i, s)| {
+                i != usize::from(admission.ticket.slot)
+                    && s.is_some_and(|s| s.reservation == Some(escrow.generation))
+            })
+        {
+            return Err(Error::Busy);
+        }
+        self.usage.submit_credits -= 1;
+        self.release(admission.ticket);
+        self.escrow = None;
+        Ok(())
+    }
+    pub fn reserved_slots(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|s| s.state == State::Reserved)
+            .count()
     }
     pub fn enqueue_transaction(
         &mut self,

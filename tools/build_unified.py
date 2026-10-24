@@ -11,8 +11,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 from doctor import ROOT,env
-from verify_smp import manifest,require
+from verify_smp import require
 
 
 CODE_ROOTS={'kernel','crates','user','.cargo'}
@@ -23,9 +24,20 @@ EXCLUDED_COMPONENTS={'tests','docs','target','__pycache__','.git'}
 def code_source_map():
     # Bind every potentially included source/asset, not an extension allowlist:
     # ring includes .inl, and models/packages can have arbitrary suffixes.
-    return {name:digest for name,digest in manifest().items()
-            if (name in ROOT_BUILD_FILES or Path(name).parts[0] in CODE_ROOTS)
-            and not any(part in EXCLUDED_COMPONENTS for part in Path(name).parts)}
+    # Filter the build scope before requiring each file. An intentionally sparse
+    # test fixture does not participate in these native images; missing compiled
+    # sources and symlinks still fail instead of silently disappearing.
+    result=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard'],
+                          cwd=ROOT,capture_output=True,check=True,timeout=10)
+    names=sorted(set(name for name in result.stdout.decode('utf-8').split('\0') if name
+                     and (name in ROOT_BUILD_FILES or Path(name).parts[0] in CODE_ROOTS)
+                     and not any(part in EXCLUDED_COMPONENTS for part in Path(name).parts)))
+    require({'kernel/src/smp.rs','crates/arch-aarch64/src/user.rs','Cargo.lock'}<=set(names),
+            'incomplete native source checkout')
+    files=[ROOT/name for name in names]
+    require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(ROOT) for p in files),
+            'missing, linked, or external native build source')
+    return {name:sha(path) for name,path in zip(names,files)}
 
 
 def sha(path):
@@ -69,8 +81,11 @@ def tool_version(argv,environment):
     return result.stdout.strip()
 
 
-def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds=1792800000):
+def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds=None,
+          selftest=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
+    if unix_seconds is None:
+        unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
     require(0<unix_seconds<(1<<63),'invalid provisioned UTC epoch')
     identities=[Path(identity_a).resolve(strict=True),Path(identity_b).resolve(strict=True)]
     require(all(not p.is_relative_to(ROOT) for p in identities),'private identities must be outside the source checkout')
@@ -80,26 +95,30 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
     require(not output.exists() or (output.is_dir() and not any(output.iterdir())),'refuse to overwrite an existing build/evidence directory')
     output.mkdir(parents=True,mode=0o700,exist_ok=True);output.chmod(0o700)
     before=code_source_map()
-    environment=env();environment['CARGO_TARGET_DIR']=str(ROOT/'target')
+    environment=env()
+    cargo=cargo or environment.get('CARGO','cargo')
+    cc=cc or environment.get('CC_aarch64_unknown_none',environment.get('CYXIA_CC',environment.get('CC','clang')))
+    target_dir=Path(target_dir or environment.get('CARGO_TARGET_DIR',ROOT/'target')).expanduser().resolve()
+    environment.update(CARGO=str(cargo),CC_aarch64_unknown_none=str(cc),CYXIA_CC=str(cc),CARGO_TARGET_DIR=str(target_dir))
     environment['CARGO_NET_OFFLINE']='true'
     environment.pop('RUSTFLAGS',None);environment.pop('CARGO_ENCODED_RUSTFLAGS',None)
     versions={name:tool_version(argv,environment) for name,argv in {
-        'cargo':['cargo','--version'],'rustc':['rustc','--version','--verbose'],
-        'clang':['clang','--version'],'openssl':['openssl','version'],
+        'cargo':[str(cargo),'--version'],'rustc':[environment.get('RUSTC','rustc'),'--version','--verbose'],
+        'clang':[str(cc),'--version'],'openssl':['openssl','version'],
         'installed_targets':['rustup','target','list','--installed']}.items()}
     require('aarch64-unknown-none\n' in versions['installed_targets']+'\n' and 'aarch64-unknown-none-softfloat' in versions['installed_targets'],'install both standard EL0 and softfloat EL1 Rust targets before building')
     keys=[(p/'key.der').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None
     for index,name in enumerate(('a','b')):
-        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault)
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
         commands.append(dict(node=name,stage='service',argv=service_command))
         print(f'Building node {name} EL0 service',flush=True)
         run_logged(service_command,per_node,output/f'service-{name}.log')
         service=output/f'service-{name}.elf'
-        shutil.copyfile(ROOT/'target/aarch64-unknown-none/release/cyxia-prototype-cluster',service);service.chmod(0o600)
+        shutil.copyfile(target_dir/'aarch64-unknown-none/release/cyxia-prototype-cluster',service);service.chmod(0o600)
         per_node['CYXIA_CLUSTER_SERVICE_ELF']=str(service)
-        kernel_command=['cargo','build','--locked','--offline','--release','-p','cyxia-kernel','--target','aarch64-unknown-none-softfloat','--no-default-features','--features','unified-runtime','--message-format=json-render-diagnostics']
+        kernel_command=[str(cargo),'build','--locked','--offline','--release','-p','cyxia-kernel','--target','aarch64-unknown-none-softfloat','--no-default-features','--features','unified-runtime','--message-format=json-render-diagnostics']
         commands.append(dict(node=name,stage='kernel',argv=kernel_command))
         print(f'Building node {name} EL1 kernel',flush=True)
         text=run_logged(kernel_command,per_node,output/f'kernel-{name}.log')
@@ -118,7 +137,7 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
     require(code_source_map()==before,'code changed while building; preserve this failed build and rebuild from a source freeze')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=sha(Path(__file__)),tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,scope='Reproducible source/image binding and separate private identities; native execution and acceptance require the independent runner.')
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=sha(Path(__file__)),tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,scope='Reproducible source/image binding and separate private identities; native execution and acceptance require the independent runner.')
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
@@ -130,9 +149,14 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--fault',choices=('normal','hang-once','no-stop-ack'),default='normal')
     parser.add_argument('--leave',action='store_true')
-    parser.add_argument('--unix-seconds',type=int,default=int(os.environ.get('SOURCE_DATE_EPOCH','1792800000')))
+    parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
+    parser.add_argument('--cargo',default=os.environ.get('CARGO'),help='Cargo executable (also accepts CARGO)')
+    parser.add_argument('--cc',help='bare-metal C compiler (also accepts CC_aarch64_unknown_none or CC)')
+    parser.add_argument('--target-dir',type=Path,help='build cache directory (also accepts CARGO_TARGET_DIR)')
+    parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
     args=parser.parse_args()
-    build(args.identity_a,args.identity_b,args.output,fault=args.fault,leave=args.leave,unix_seconds=args.unix_seconds)
+    build(args.identity_a,args.identity_b,args.output,fault=args.fault,leave=args.leave,unix_seconds=args.unix_seconds,
+          selftest=args.selftest,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
     print(args.output/'build-manifest.json')
 
 

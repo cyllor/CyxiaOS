@@ -5,7 +5,7 @@ pub const STACK_TOP: u64 = 0x01ff_0000;
 pub const STACK_BYTES: usize = 128 * 1024;
 pub const SVC: u16 = 0x43;
 pub const MAGIC: u64 = 0x4359_5843_4c53_3031;
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 pub const PAYLOAD: usize = 4096;
 pub const OK: u64 = 0;
 pub const AGAIN: u64 = 1;
@@ -31,6 +31,111 @@ pub const OP_YIELD: u64 = 12;
 /// bytes. PUT arg2 transaction phase: 0 stage,1 commit after complete staging.
 /// GET/PUT offsets and total record sizes are bounded by MAX_RECORD.
 pub const MAX_RECORD: u64 = 1024 * 1024;
+pub const TX_SERVICE_ID: u64 = 10;
+pub const UNAUTH_SERVICE_ID: u64 = 12;
+pub const OFFER_SERVICE_ID: u64 = 16;
+pub const DOMAIN_PENDING: u64 = 0;
+pub const DOMAIN_APPLIED: u64 = 1;
+pub const DOMAIN_REJECTED: u64 = 2;
+pub const DOMAIN_UNKNOWN: u64 = 3;
+pub const DOMAIN_EXPIRED: u64 = 4;
+pub const PLACEMENT_STORAGE_BYTES: usize =
+    core::mem::size_of::<cyxia_prototype::domains::platform::PlacementQueue>().div_ceil(4096)
+        * 4096;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicyWire {
+    pub version: u64,
+    pub snapshot_ns: u64,
+    pub installed_until_ns: u64,
+    pub value: u64,
+    pub plan_seq: u64,
+    pub controller_epoch: u64,
+    pub action_index: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DomainInput {
+    pub tx: PolicyWire,
+    pub unauth: PolicyWire,
+    pub offer: PolicyWire,
+    pub placement: PolicyWire,
+    pub placement_request_id: u64,
+    pub placement_request_generation: u64,
+    pub peer_ipv4: u64,
+    pub available_cpu_milli: u64,
+    pub memory_pages: u64,
+    pub core_generation: u64,
+    pub ledger_generation: u64,
+    pub network_valid: u64,
+    pub network_sample_ms: u64,
+    pub network_rtt_us: u64,
+    pub network_retrans_milli: u64,
+    pub network_queued_bytes: u64,
+    pub network_queue_depth: u64,
+    pub network_active: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicyReceiptWire {
+    pub version: u64,
+    pub actual: u64,
+    pub outcome: u64,
+    pub plan_seq: u64,
+    pub controller_epoch: u64,
+    pub action_index: u64,
+    pub request_id: u64,
+    pub request_generation: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PendingPlacementWire {
+    pub request_id: u64,
+    pub request_generation: u64,
+    pub queued_us: u64,
+    pub cpu_milli: u64,
+    pub memory_pages: u64,
+    pub peer_ready: u64,
+}
+impl PendingPlacementWire {
+    pub const EMPTY: Self = Self {
+        request_id: 0,
+        request_generation: 0,
+        queued_us: 0,
+        cpu_milli: 0,
+        memory_pages: 0,
+        peer_ready: 0,
+    };
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DomainFeedback {
+    pub tx: PolicyReceiptWire,
+    pub unauth: PolicyReceiptWire,
+    pub offer: PolicyReceiptWire,
+    pub placement: PolicyReceiptWire,
+    pub tx_ordinary: u64,
+    pub tx_reserved: u64,
+    pub auth_attempts: u64,
+    pub auth_rejected: u64,
+    pub auth_failures: u64,
+    pub auth_slots: u64,
+    pub recovery_slots: u64,
+    pub pending_placements: u64,
+    pub waiting_request_id: u64,
+    pub waiting_request_generation: u64,
+    pub peer_cpu_milli: u64,
+    pub peer_memory_pages: u64,
+    pub placement_fallbacks: u64,
+    pub measurement_ms: u64,
+    pub measurement_valid: u64,
+    pub network: [u64; 4],
+    pub security: [u64; 4],
+    pub cluster: [u64; 4],
+    pub tx_last_ordinary: u64,
+    pub tx_last_reserved: u64,
+    pub waiting: [PendingPlacementWire; 32],
+}
 #[repr(C, align(4096))]
 pub struct Shared {
     pub magic: u64,
@@ -50,7 +155,13 @@ pub struct Shared {
     pub uuid: [u8; 16],
     pub local_node: [u8; 32],
     pub peer_node: [u8; 32],
+    pub domains: DomainInput,
+    pub domain_feedback: DomainFeedback,
     pub payload: [u8; PAYLOAD],
+    pub monotonic_ns: u64,
+    /// Odd while EL0 is publishing feedback, nonzero even when complete.
+    /// Timer/SPI preemption can return to EL1 between any two payload stores.
+    pub feedback_sequence: u64,
 }
 pub fn valid_request(op: u64, len: u64, offset: u64) -> bool {
     if len > PAYLOAD as u64 {

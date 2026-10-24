@@ -1,6 +1,23 @@
 //! Boot-discovered VirtIO RNG. The hypervisor supplies entropy, not the AI model.
 use super::virtio_platform::Board;
-use cyxia_driver_virtio::{Queue, QueueMemory, Transport, rng::Rng};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use cyxia_driver_virtio::{Transport, queue::BatchMemory as QueueMemory, rng::BatchedRng as Rng};
+static BUSY: AtomicBool = AtomicBool::new(false);
+static IRQ: AtomicU64 = AtomicU64::new(0);
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+fn acquire() -> Result<Guard, Errno> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Errno::Again);
+    }
+    BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| Errno::Again)?;
+    Ok(Guard)
+}
 use cyxia_posix::Errno;
 static mut MEMORY: QueueMemory = QueueMemory::zeroed();
 static mut RNG: Option<Rng> = None;
@@ -17,7 +34,7 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
         }
         // SAFETY: DTB resource is inside this board's mapped Device window;
         // only CPU0 foreground probes/owns it, and only RNG device 4 is retained.
-        let Ok(mut transport) = (unsafe {
+        let Ok(transport) = (unsafe {
             Transport::attach(
                 (super::HIGH + resource.base.0) as usize,
                 resource.len as usize,
@@ -29,13 +46,29 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
             continue;
         }
         let result = (|| {
-            transport.negotiate(&Board)?;
             let memory = unsafe { &mut *core::ptr::addr_of_mut!(MEMORY) };
-            let queue = Queue::configure(&mut transport, memory, 0, &Board)?;
-            transport.start(&Board)?;
-            Rng::new(transport, queue)
+            Rng::attach(transport, memory, &Board)
         })();
         if let Ok(mut rng) = result {
+            IRQ.store(u64::from(resource.irq), Ordering::Release);
+            #[cfg(feature = "unified-runtime")]
+            {
+                if crate::domain_storage::register_notify_device(
+                    crate::domain_storage::RNG_NOTIFY,
+                    resource.base.0,
+                    rng.capacity(),
+                    resource.irq,
+                )
+                .is_err()
+                {
+                    super::log(b"ENTROPY_ERROR REGISTRY\n");
+                    return;
+                }
+                rng.set_notify_hooks(
+                    crate::domain_storage::rng_notify_command,
+                    crate::domain_storage::rng_notify_feedback,
+                );
+            }
             // Submit at boot; no spin or invented seed. Completion is polled
             // once by a nonblocking consumer or by the bounded blocking fill.
             if rng.prefetch(&Board).is_err() {
@@ -55,6 +88,7 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
     super::log(b"ENTROPY_UNAVAILABLE MECHANISM\n");
 }
 pub fn fill(out: &mut [u8]) -> Result<(), Errno> {
+    let _guard = acquire()?;
     // SAFETY: all calls are serialized by CPU0 foreground; IRQs never use RNG.
     let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) }
         .as_mut()
@@ -73,6 +107,7 @@ pub fn read(out: &mut [u8], nonblocking: bool) -> Result<usize, Errno> {
         fill(out)?;
         return Ok(out.len());
     }
+    let _guard = acquire()?;
     // SAFETY: CPU0 foreground is the only owner, as in fill/init above.
     let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) }
         .as_mut()
@@ -89,6 +124,7 @@ pub fn read(out: &mut [u8], nonblocking: bool) -> Result<usize, Errno> {
 #[cfg(feature = "unified-runtime")]
 pub fn fill_progress(out: &mut [u8], progress: &mut dyn FnMut()) -> Result<(), Errno> {
     use cyxia_driver_virtio::Platform;
+    let _guard = acquire()?;
     let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) }
         .as_mut()
         .ok_or(Errno::Nodev)?;
@@ -113,4 +149,14 @@ pub fn fill_progress(out: &mut [u8], progress: &mut dyn FnMut()) -> Result<(), E
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "unified-runtime")]
+pub fn enable_interrupts() -> Result<(), cyxia_prototype::domains::Error> {
+    let _guard = acquire().map_err(|_| cyxia_prototype::domains::Error::Busy)?;
+    let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) }
+        .as_mut()
+        .ok_or(cyxia_prototype::domains::Error::NotReady)?;
+    rng.set_completion_interrupts(true, &Board);
+    crate::domain_platform::enable_device_irq(IRQ.load(Ordering::Acquire) as u32)
 }

@@ -19,6 +19,9 @@ struct Node {
     task_state: u64,
     expire_after_stage: bool,
     fail_nonce_once: bool,
+    domains: cyxia_prototype_cluster::abi::DomainInput,
+    local_submits: usize,
+    local_request: Option<([u8; 16], [u8; 32])>,
 }
 #[derive(Default)]
 struct Context {
@@ -30,6 +33,15 @@ thread_local! {static CTX:RefCell<Context>=RefCell::new(Context::default());}
 mod broker {
     use super::*;
     use cyxia_prototype_cluster::abi::*;
+    pub fn clock_ns() -> u64 {
+        CTX.with(|c| c.borrow().now * 1_000_000)
+    }
+    pub fn domains() -> DomainInput {
+        CTX.with(|c| {
+            let c = c.borrow();
+            c.nodes[c.node].domains
+        })
+    }
     pub fn request(
         op: u64,
         input: &[u8],
@@ -65,6 +77,47 @@ mod broker {
                     Ok((input.len(), args[0]))
                 }
                 OP_TASK => match args[0] {
+                    10 => {
+                        for (i, value) in [
+                            if n.reserved { 0u64 } else { 100 },
+                            if n.reserved { 0 } else { 16 },
+                            1,
+                            1,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            out[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                        }
+                        Ok((32, 0))
+                    }
+                    11 => {
+                        let key: [u8; 16] = input[..16].try_into().unwrap();
+                        let hash: [u8; 32] = input[40..72].try_into().unwrap();
+                        if let Some(old) = n.local_request {
+                            if old != (key, hash) {
+                                return Err(FAILED);
+                            }
+                        } else {
+                            n.local_request = Some((key, hash));
+                            n.local_submits += 1;
+                        }
+                        for (i, value) in [1u64, 51, 1].into_iter().enumerate() {
+                            out[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                        }
+                        Ok((24, 0))
+                    }
+                    12 => {
+                        let key = input[..16].try_into().unwrap();
+                        let hash = input[16..48].try_into().unwrap();
+                        if n.local_request != Some((key, hash)) {
+                            return Err(NOT_FOUND);
+                        }
+                        for (i, value) in [1u64, 51, 1].into_iter().enumerate() {
+                            out[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                        }
+                        Ok((24, 0))
+                    }
                     0 => {
                         if n.reserved {
                             return Err(AGAIN);
@@ -185,6 +238,184 @@ fn select(i: usize, now: u64) {
         c.node = i;
         c.now = now;
     })
+}
+fn native_setup(boot: u64) -> (driver::Driver, driver::Driver) {
+    use cyxia_prototype::domains::platform::PlacementQueue;
+    let (sa, pa, na) = identity(1);
+    let (sb, pb, nb) = identity(2);
+    select(0, 0);
+    let a = driver::Driver::new_native(
+        boot,
+        [1; 16],
+        na,
+        nb,
+        sa,
+        pb,
+        Box::leak(Box::new(PlacementQueue::new())),
+    )
+    .unwrap();
+    select(1, 0);
+    let b = driver::Driver::new_native(
+        boot,
+        [2; 16],
+        nb,
+        na,
+        sb,
+        pa,
+        Box::leak(Box::new(PlacementQueue::new())),
+    )
+    .unwrap();
+    (a, b)
+}
+#[test]
+fn native_local_fallback_is_durable_and_reboot_does_not_submit_again() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            CTX.with(|c| *c.borrow_mut() = Context::default());
+            let (mut a, mut b) = native_setup(1);
+            for ms in [0u64, 3999, 4000, 4001, 5000] {
+                select(0, ms);
+                a.domain_tick(ms * 1_000_000).unwrap();
+                select(1, ms);
+                b.domain_tick(ms * 1_000_000).unwrap();
+            }
+            CTX.with(|c| {
+                let c = c.borrow();
+                assert_eq!(c.nodes.iter().map(|n| n.local_submits).sum::<usize>(), 1);
+                assert_eq!(
+                    c.nodes
+                        .iter()
+                        .flat_map(|n| &n.records)
+                        .filter(|b| b.starts_with(b"CXDP2"))
+                        .count(),
+                    2
+                );
+            });
+            assert_eq!(
+                a.domain_feedback(5_000_000_000).pending_placements
+                    + b.domain_feedback(5_000_000_000).pending_placements,
+                0
+            );
+            drop(a);
+            drop(b);
+            let (mut a, mut b) = native_setup(2);
+            select(0, 0);
+            a.domain_tick(0).unwrap();
+            select(1, 0);
+            b.domain_tick(0).unwrap();
+            CTX.with(|c| {
+                assert_eq!(
+                    c.borrow()
+                        .nodes
+                        .iter()
+                        .map(|n| n.local_submits)
+                        .sum::<usize>(),
+                    1
+                )
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+#[test]
+fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            use cyxia_prototype_cluster::abi::*;
+            CTX.with(|c| *c.borrow_mut() = Context::default());
+            let (mut a, mut b) = native_setup(1);
+            CTX.with(|c| {
+                for n in &mut c.borrow_mut().nodes {
+                    n.domains.offer = PolicyWire {
+                        version: 1,
+                        snapshot_ns: 0,
+                        installed_until_ns: 10_000_000_000,
+                        value: 250,
+                        plan_seq: 1,
+                        controller_epoch: 1,
+                        action_index: 0,
+                    };
+                }
+            });
+            select(0, 0);
+            a.connect([31; 32], 0).unwrap();
+            select(1, 0);
+            b.connect([32; 32], 0).unwrap();
+            let mut selected = None;
+            for now in 0u64..2000 {
+                for (i, driver) in [(0, &mut a), (1, &mut b)] {
+                    select(i, now);
+                    driver.domain_tick(now * 1_000_000).unwrap();
+                    driver.tick(now).unwrap();
+                    let f = driver.domain_feedback(now * 1_000_000);
+                    if selected.is_none() && f.waiting[0].peer_ready == 1 {
+                        assert_eq!(f.peer_cpu_milli, 100);
+                        assert_eq!(f.peer_memory_pages, 16);
+                        CTX.with(|c| {
+                            let mut c = c.borrow_mut();
+                            let d = &mut c.nodes[i].domains;
+                            d.placement = PolicyWire {
+                                version: 2,
+                                snapshot_ns: now * 1_000_000,
+                                installed_until_ns: now * 1_000_000 + 10_000_000_000,
+                                value: 1,
+                                plan_seq: 2,
+                                controller_epoch: 1,
+                                action_index: 0,
+                            };
+                            d.placement_request_id = f.waiting[0].request_id;
+                            d.placement_request_generation = f.waiting[0].request_generation;
+                        });
+                        selected = Some(i);
+                    }
+                }
+                for from in 0..2 {
+                    let (src, dst) = if from == 0 {
+                        (&mut a, &mut b)
+                    } else {
+                        (&mut b, &mut a)
+                    };
+                    let n = src.outgoing().len().min(251);
+                    if n > 0 {
+                        let data = src.outgoing()[..n].to_vec();
+                        src.consume_outgoing(n);
+                        select(1 - from, now);
+                        assert_eq!(dst.ingest(&data, now), Ok(n), "turn {now} from {from}");
+                    }
+                }
+                if selected.is_some_and(|i| {
+                    [
+                        a.domain_feedback(now * 1_000_000),
+                        b.domain_feedback(now * 1_000_000),
+                    ][i]
+                        .placement
+                        .outcome
+                        == DOMAIN_APPLIED
+                }) {
+                    break;
+                }
+            }
+            let i = selected.expect("a capacity-backed peer quote must become eligible");
+            let feedback = [
+                a.domain_feedback(2_000_000_000),
+                b.domain_feedback(2_000_000_000),
+            ];
+            assert_eq!(feedback[i].placement.outcome, DOMAIN_APPLIED);
+            assert_eq!(feedback[i].placement.actual, 1);
+            assert_eq!(feedback[1 - i].offer.outcome, DOMAIN_APPLIED);
+            assert_eq!(feedback[1 - i].offer.actual, 100);
+            CTX.with(|c| {
+                let c = c.borrow();
+                assert_eq!(c.nodes.iter().map(|n| n.starts).sum::<usize>(), 1);
+                assert_eq!(c.nodes.iter().map(|n| n.local_submits).sum::<usize>(), 0);
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 #[test]
 fn real_signed_two_driver_streams_form_and_persist_unique_result_custody() {

@@ -16,6 +16,7 @@ pub const FIRST_ORDINARY_BLOCK: u32 =
     crate::cluster::volume::START + 2 * crate::cluster::volume::FILE_BLOCKS;
 const MAP_BYTES: usize = TOTAL_BLOCKS as usize / 8;
 const TX_CAPACITY: usize = 40;
+pub const BACKGROUND_RESERVATION_BYTES: u64 = (2 + 2 * TX_CAPACITY as u64) * BLOCK_SIZE as u64;
 const EMPTY_INODE: Inode = Inode {
     kind: InodeKind::Free,
     generation: 1,
@@ -113,7 +114,6 @@ struct Cache {
     inode: usize,
     logical: u32,
     physical: u32,
-    data: [u8; BLOCK_SIZE],
 }
 impl Cache {
     const EMPTY: Self = Self {
@@ -124,9 +124,11 @@ impl Cache {
         inode: 0,
         logical: 0,
         physical: 0,
-        data: [0; BLOCK_SIZE],
     };
 }
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct CachePage([u8; BLOCK_SIZE]);
 
 pub struct FileSystem<const CACHE: usize = 64> {
     ready: bool,
@@ -137,8 +139,14 @@ pub struct FileSystem<const CACHE: usize = 64> {
     handles: [Option<Open>; 64],
     handle_generation: u64,
     cache: [Cache; CACHE],
+    resident: usize,
+    pages: [CachePage; CACHE],
     cache_budget: usize,
     reclaim_batch: usize,
+    cache_baseline: (usize, usize),
+    cache_selected: (usize, usize),
+    cache_stamp: PolicyStamp,
+    cache_policy_active: bool,
     reclaim_cursor: usize,
     evict_cursor: usize,
     tx: [[u8; BLOCK_SIZE]; TX_CAPACITY],
@@ -165,8 +173,18 @@ impl<const C: usize> FileSystem<C> {
             handles: [None; 64],
             handle_generation: 0,
             cache: [Cache::EMPTY; C],
+            resident: 0,
+            pages: [CachePage([0; BLOCK_SIZE]); C],
             cache_budget: if C < 256 { C } else { 256 },
             reclaim_batch: 16,
+            cache_baseline: (if C < 256 { C } else { 256 }, 16),
+            cache_selected: (if C < 256 { C } else { 256 }, 16),
+            cache_stamp: PolicyStamp {
+                version: 0,
+                snapshot_ns: 0,
+                installed_until_ns: 0,
+            },
+            cache_policy_active: false,
             reclaim_cursor: 0,
             evict_cursor: 0,
             tx: [[0; BLOCK_SIZE]; TX_CAPACITY],
@@ -249,6 +267,9 @@ impl<const C: usize> FileSystem<C> {
             return Err(Error::Schema);
         };
         self.stamp.accepts(stamp, now)?;
+        if self.stamp == stamp && (self.readahead != readahead || self.flush_pages != flush) {
+            return Err(Error::Conflict);
+        }
         self.stamp = stamp;
         self.readahead = readahead;
         self.flush_pages = flush;
@@ -269,11 +290,15 @@ impl<const C: usize> FileSystem<C> {
     }
     pub fn cache_usage(&self) -> [usize; 4] {
         [
-            self.cache.iter().filter(|p| p.valid).count(),
+            self.resident,
             self.metrics.dirty_pages as usize,
             self.cache_budget,
             C,
         ]
+    }
+    /// Actual page-aligned backing, excluding inode and cache metadata storage.
+    pub fn cache_backing(&self) -> (usize, usize) {
+        (self.pages.as_ptr() as usize, C * BLOCK_SIZE)
     }
     pub fn set_cache_partition(&mut self, pages: usize, batch: usize) -> Result<(), Error> {
         if pages == 0 || pages > C || batch == 0 || batch > 64 {
@@ -281,7 +306,43 @@ impl<const C: usize> FileSystem<C> {
         }
         self.cache_budget = pages;
         self.reclaim_batch = batch;
+        self.cache_baseline = (pages, batch);
+        self.cache_policy_active = false;
         Ok(())
+    }
+    pub fn set_cache_partition_expiring(
+        &mut self,
+        pages: usize,
+        batch: usize,
+        stamp: PolicyStamp,
+        now: u64,
+    ) -> Result<(), Error> {
+        if pages == 0 || pages > C || batch == 0 || batch > 64 {
+            return Err(Error::Capacity);
+        }
+        self.cache_stamp.accepts(stamp, now)?;
+        self.refresh_cache_partition(now);
+        if self.cache_stamp == stamp {
+            return if self.cache_selected == (pages, batch) {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        self.cache_stamp = stamp;
+        self.cache_selected = (pages, batch);
+        self.cache_policy_active = true;
+        self.cache_budget = pages;
+        self.reclaim_batch = batch;
+        Ok(())
+    }
+    /// Close expired new admission at the cache owner's gate. Existing dirty
+    /// and referenced pages remain charged; only bounded clean reclaim frees them.
+    pub fn refresh_cache_partition(&mut self, now: u64) {
+        if self.cache_policy_active && !self.cache_stamp.live(now) {
+            self.cache_policy_active = false;
+            (self.cache_budget, self.reclaim_batch) = self.cache_baseline;
+        }
     }
     pub fn set_cache_budget(&mut self, pages: usize) -> Result<(), Error> {
         self.set_cache_partition(pages, 64)?;
@@ -300,6 +361,7 @@ impl<const C: usize> FileSystem<C> {
             let page = &mut self.cache[at];
             if page.valid && !page.dirty && !page.pinned {
                 *page = Cache::EMPTY;
+                self.resident -= 1;
                 resident -= 1;
                 freed += 1;
             }
@@ -831,12 +893,18 @@ impl<const C: usize> FileSystem<C> {
                 .find(|&i| self.cache[i].valid && !self.cache[i].dirty && !self.cache[i].pinned)
         })
         .ok_or(Error::Again)?;
+        if self.cache[at].valid {
+            self.resident -= 1;
+        }
         self.cache[at] = Cache::EMPTY;
         if !zero {
-            j.read_block(d, home, &mut self.cache[at].data, s)
+            j.read_block(d, home, &mut self.pages[at].0, s)
                 .map_err(journal_error)?;
+        } else {
+            self.pages[at].0.fill(0);
         }
         self.cache[at].valid = true;
+        self.resident += 1;
         self.cache[at].inode = id;
         self.cache[at].logical = logical;
         self.cache[at].physical = home;
@@ -853,6 +921,22 @@ impl<const C: usize> FileSystem<C> {
         offset: u64,
         out: &mut [u8],
         now: u64,
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+    ) -> Result<usize, Error> {
+        self.read_admitted(h, offset, out, now, true, j, d, s)
+    }
+    /// Dependency admission is checked by the owner before borrowing the file
+    /// service. A closed prerequisite suppresses only new optional prefetch;
+    /// demand reads and already owned dirty/cache pages retain their progress.
+    pub fn read_admitted<D: BlockDevice>(
+        &mut self,
+        h: Handle,
+        offset: u64,
+        out: &mut [u8],
+        now: u64,
+        prefetch_admitted: bool,
         j: &mut Journal,
         d: &mut D,
         s: &mut Scratch,
@@ -878,17 +962,17 @@ impl<const C: usize> FileSystem<C> {
             let at = self.page(open.inode, logical, home, false, false, j, d, s)?;
             let n = (BLOCK_SIZE - pos % BLOCK_SIZE).min(len - done);
             out[done..done + n]
-                .copy_from_slice(&self.cache[at].data[pos % BLOCK_SIZE..pos % BLOCK_SIZE + n]);
+                .copy_from_slice(&self.pages[at].0[pos % BLOCK_SIZE..pos % BLOCK_SIZE + n]);
             done += n;
         }
         self.metrics.read_bytes = self.metrics.read_bytes.saturating_add(done as u64);
         let first = (offset + done as u64).div_ceil(BLOCK_SIZE as u64) as u32;
-        let count = if self.stamp.live(now) {
+        let count = if prefetch_admitted && self.stamp.live(now) {
             self.readahead
         } else {
             0
         };
-        if self.stamp.live(now) {
+        if prefetch_admitted && self.stamp.live(now) {
             self.metrics.last_read_version = self.stamp.version;
         }
         for logical in
@@ -924,7 +1008,7 @@ impl<const C: usize> FileSystem<C> {
         let home = physical(&self.inodes[key.id as usize], page as u32)?;
         if let Some(at) = self.cached(key.id as usize, page as u32, home) {
             self.metrics.cache_hits += 1;
-            out.copy_from_slice(&self.cache[at].data);
+            out.copy_from_slice(&self.pages[at].0);
         } else {
             self.metrics.cache_misses += 1;
             j.read_block(d, home, out, s).map_err(journal_error)?;
@@ -1003,6 +1087,7 @@ impl<const C: usize> FileSystem<C> {
                 p.pinned = false;
                 if p.valid && p.inode == id && blocks[..count].contains(&p.physical) {
                     *p = Cache::EMPTY;
+                    self.resident -= 1;
                 }
             }
             return Err(e);
@@ -1015,7 +1100,7 @@ impl<const C: usize> FileSystem<C> {
                 .cached(id, logical, physical(&inode, logical)?)
                 .ok_or(Error::Conflict)?;
             let n = (BLOCK_SIZE - pos % BLOCK_SIZE).min(data.len() - done);
-            self.cache[at].data[pos % BLOCK_SIZE..pos % BLOCK_SIZE + n]
+            self.pages[at].0[pos % BLOCK_SIZE..pos % BLOCK_SIZE + n]
                 .copy_from_slice(&data[done..done + n]);
             if !self.cache[at].dirty {
                 self.cache[at].dirty = true;
@@ -1111,7 +1196,7 @@ impl<const C: usize> FileSystem<C> {
         };
         for &at in &selected[..count] {
             let slot = self.tx_load(self.cache[at].physical, true, j, d, s)?;
-            self.tx[slot].copy_from_slice(&self.cache[at].data);
+            self.tx[slot].copy_from_slice(&self.pages[at].0);
         }
         for logical in
             old.size.div_ceil(BLOCK_SIZE as u64) as u32..size.div_ceil(BLOCK_SIZE as u64) as u32
@@ -1126,7 +1211,7 @@ impl<const C: usize> FileSystem<C> {
         }
         self.inodes[id].durable_write_seq = published.durable_write_seq;
         self.metrics.flushed_pages += count as u64;
-        self.metrics.last_flush_version = version;
+        self.metrics.last_flush_version = self.metrics.last_flush_version.max(version);
         Ok(Some(FlushReceipt {
             object: ObjectKey {
                 id: id as u64,
@@ -1191,6 +1276,28 @@ impl<const C: usize> FileSystem<C> {
         };
         self.flush_inode(id, limit, version, j, d, s)
     }
+    /// Required cache reclamation uses the protected progress path. It cannot
+    /// be stopped by an optional writeback policy or earn that policy a receipt.
+    pub fn reclaim_flush_one<D: BlockDevice>(
+        &mut self,
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+    ) -> Result<Option<FlushReceipt>, Error> {
+        self.check_journal(j)?;
+        if self.resident <= self.cache_budget {
+            return Ok(None);
+        }
+        let Some(id) = self
+            .cache
+            .iter()
+            .find(|p| p.valid && p.dirty)
+            .map(|p| p.inode)
+        else {
+            return Ok(None);
+        };
+        self.flush_inode(id, 32, 0, j, d, s)
+    }
     pub fn unlink<D: BlockDevice>(
         &mut self,
         path: &str,
@@ -1248,6 +1355,7 @@ impl<const C: usize> FileSystem<C> {
                     self.metrics.dirty_pages -= 1;
                 }
                 *page = Cache::EMPTY;
+                self.resident -= 1;
             }
         }
         self.inodes[parent] = parent_inode;

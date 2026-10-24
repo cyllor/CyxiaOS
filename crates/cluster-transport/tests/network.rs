@@ -113,9 +113,100 @@ fn tcp_roundtrip(drop_syn: bool) {
         }
     }
     assert_eq!(received, payload);
+    let observed = a.observation();
+    assert_eq!(observed.valid, 3);
+    assert_eq!(observed.active, 1);
+    assert!(observed.rtt_us < 1_000_000);
     assert!(link.borrow().seen_arp && link.borrow().seen_ipv4);
     assert_eq!(a.poll(0), Err(Error::Clock));
     assert_eq!(a.send_tls(b"stale"), Err(Error::Closed));
+}
+
+#[test]
+fn reconnect_retains_backoff_and_entropy_gates_for_terminal_errors() {
+    use cyxia_cluster_transport::tcp::{State, reconnect_due};
+    for state in [
+        Ok(State::Closed),
+        Err(Error::Closed),
+        Err(Error::Peer),
+        Err(Error::Device),
+        Err(Error::Clock),
+        Err(Error::Socket),
+    ] {
+        assert!(!reconnect_due(state, 999, true));
+        assert!(!reconnect_due(state, 1000, false));
+        assert!(reconnect_due(state, 1000, true));
+    }
+    for state in [
+        Ok(State::Established),
+        Ok(State::SynSent),
+        Err(Error::Configuration),
+        Err(Error::WouldBlock),
+    ] {
+        assert!(!reconnect_due(state, 5000, true));
+    }
+}
+
+#[test]
+fn exact_send_backpressure_does_not_enqueue_any_prefix() {
+    let link = Rc::new(RefCell::new(Link::default()));
+    let (mut arx, mut atx, mut brx, mut btx) = (
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+    );
+    let (mut sa, mut sb) = ([Storage::EMPTY], [Storage::EMPTY]);
+    let mut a = Tcp::new(
+        TestPort {
+            link: link.clone(),
+            a: true,
+        },
+        config(true),
+        0,
+        &mut arx,
+        &mut atx,
+        &mut sa,
+    )
+    .unwrap();
+    let mut b = Tcp::new(
+        TestPort { link, a: false },
+        config(false),
+        0,
+        &mut brx,
+        &mut btx,
+        &mut sb,
+    )
+    .unwrap();
+    assert_eq!(a.observation().valid, 0);
+    b.listen().unwrap();
+    a.connect().unwrap();
+    for ms in 0..20 {
+        a.poll(ms).unwrap();
+        b.poll(ms).unwrap();
+    }
+    let payload = [7; BUFFER_SIZE - 2];
+    a.send_exact(&payload).unwrap();
+    let depth = a.observation().queued_bytes;
+    assert_eq!(a.send_exact(&[1, 2, 3]), Err(Error::WouldBlock));
+    assert_eq!(a.observation().queued_bytes, depth);
+    a.send_exact(&[8, 9]).unwrap();
+    assert_eq!(a.observation().queued_bytes, BUFFER_SIZE as u64);
+    let mut output = Vec::new();
+    for ms in 20..2000 {
+        a.poll(ms).unwrap();
+        b.poll(ms).unwrap();
+        let mut bytes = [0; 4096];
+        if let Ok(n) = b.receive_tls(&mut bytes) {
+            output.extend_from_slice(&bytes[..n]);
+        }
+        if output.len() == BUFFER_SIZE {
+            break;
+        }
+    }
+    assert_eq!(output.len(), BUFFER_SIZE);
+    assert!(output[..BUFFER_SIZE - 2].iter().all(|b| *b == 7));
+    assert_eq!(&output[BUFFER_SIZE - 2..], &[8, 9]);
 }
 #[test]
 fn native_stack_arp_tcp_fragmentation_and_backpressure() {

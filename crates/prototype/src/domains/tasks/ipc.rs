@@ -5,6 +5,7 @@ pub const RECOVERY_ENDPOINTS: usize = 2;
 const ENDPOINTS: usize = MAX_ENDPOINTS + RECOVERY_ENDPOINTS;
 const NORMAL_WAITERS: usize = 64;
 const WAITERS: usize = NORMAL_WAITERS + 8;
+pub const SEND_GRANTS: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcOperation {
     Send,
@@ -63,6 +64,7 @@ pub trait IpcBackend<const B: usize> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IpcStats {
     pub depth: usize,
+    pub reserved: usize,
     pub admitted: u64,
     pub delivered: u64,
     pub notifications: u64,
@@ -77,11 +79,17 @@ struct Endpoint {
     recovery: bool,
     stamp: PolicyStamp,
     applied_version: u64,
+    confirmed_version: u64,
     budget: usize,
     batch: usize,
     sequence: u64,
     head: usize,
     len: usize,
+    reserved: usize,
+    // FIFO order is separate from physical payload cells. A grant owns its
+    // exact cell even while later unreserved sends use other free cells.
+    order: [u8; MAX_MESSAGES],
+    occupied: [u64; 2],
     wake: bool,
     stats: IpcStats,
     since: [u64; MAX_MESSAGES],
@@ -94,14 +102,19 @@ impl Endpoint {
             recovery,
             stamp: UNSET,
             applied_version: 0,
+            confirmed_version: 0,
             budget: 32,
             batch: 4,
             sequence: 0,
             head: 0,
             len: 0,
+            reserved: 0,
+            order: [0; MAX_MESSAGES],
+            occupied: [0; 2],
             wake: false,
             stats: IpcStats {
                 depth: 0,
+                reserved: 0,
                 admitted: 0,
                 delivered: 0,
                 notifications: 0,
@@ -125,27 +138,97 @@ impl Endpoint {
     fn enqueue<const B: usize>(
         &mut self,
         messages: &mut [Message<B>; MAX_MESSAGES],
-        mut m: Message<B>,
+        m: Message<B>,
         now: u64,
     ) -> Result<u64, Error> {
-        if self.len >= self.limits(now).0 {
+        if self.len + self.reserved >= self.limits(now).0 {
             return Err(Error::Again);
+        }
+        self.sequence.checked_add(1).ok_or(Error::Overflow)?;
+        let cell = self.free_cell().ok_or(Error::Capacity)?;
+        self.set_owned(cell, true);
+        let version = if self.stamp.live(now) {
+            self.stamp.version
+        } else {
+            0
+        };
+        match self.enqueue_cell(messages, cell, m, now, version) {
+            Ok(sequence) => Ok(sequence),
+            Err(error) => {
+                self.set_owned(cell, false);
+                Err(error)
+            }
+        }
+    }
+    fn free_cell(&self) -> Option<usize> {
+        (0..MAX_MESSAGES).find(|i| !self.owns(*i))
+    }
+    fn owns(&self, cell: usize) -> bool {
+        cell < MAX_MESSAGES && self.occupied[cell / 64] & (1 << (cell % 64)) != 0
+    }
+    fn set_owned(&mut self, cell: usize, owned: bool) {
+        let mask = 1 << (cell % 64);
+        if owned {
+            self.occupied[cell / 64] |= mask;
+        } else {
+            self.occupied[cell / 64] &= !mask;
+        }
+    }
+    fn enqueue_cell<const B: usize>(
+        &mut self,
+        messages: &mut [Message<B>; MAX_MESSAGES],
+        cell: usize,
+        mut m: Message<B>,
+        now: u64,
+        policy_version: u64,
+    ) -> Result<u64, Error> {
+        if self.len >= MAX_MESSAGES || !self.owns(cell) {
+            return Err(Error::Conflict);
         }
         let sequence = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
         m.sequence = sequence;
-        messages[(self.head + self.len) % MAX_MESSAGES] = m;
-        self.since[(self.head + self.len) % MAX_MESSAGES] = now;
+        messages[cell] = m;
+        self.since[cell] = now;
+        self.order[(self.head + self.len) % MAX_MESSAGES] = cell as u8;
         if self.len == 0 {
             self.wake = true;
         }
         self.len += 1;
         self.sequence = sequence;
         self.stats.admitted = self.stats.admitted.saturating_add(1);
-        if self.stamp.live(now) {
-            self.applied_version = self.stamp.version;
-        }
+        self.applied_version = self.applied_version.max(policy_version);
         Ok(sequence)
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendGrant {
+    slot: u16,
+    generation: u64,
+    policy_version: u64,
+}
+impl SendGrant {
+    /// The version that actually reserved this cell. A copied token alone is
+    /// not proof that its reservation remains live; use validate_send_grant
+    /// before authorizing a dependent operation.
+    pub const fn policy_version(self) -> u64 {
+        self.policy_version
+    }
+}
+#[derive(Clone, Copy)]
+struct SendReservation {
+    grant: SendGrant,
+    actor: ObjectKey,
+    endpoint: ObjectKey,
+    request_id: u64,
+    cell: usize,
+    version: u64,
+    confirmed: bool,
+}
+#[derive(Clone, Copy)]
+struct GrantHighWater {
+    actor: ObjectKey,
+    endpoint: ObjectKey,
+    request_id: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitTicket {
@@ -174,6 +257,9 @@ pub struct Ipc<const BYTES: usize = 64> {
     // this const-initialized pool in static storage; open only sets metadata.
     messages: [[Message<BYTES>; MAX_MESSAGES]; ENDPOINTS],
     waiters: [Option<Waiter<BYTES>>; WAITERS],
+    send_grants: [Option<SendReservation>; SEND_GRANTS],
+    grant_high: [Option<GrantHighWater>; SEND_GRANTS],
+    grant_generation: u64,
     generation: u64,
     waiter_sequence: u64,
     last_now: u64,
@@ -189,6 +275,9 @@ impl<const B: usize> Ipc<B> {
             endpoints: [const { None }; ENDPOINTS],
             messages: [[Message::EMPTY; MAX_MESSAGES]; ENDPOINTS],
             waiters: [const { None }; WAITERS],
+            send_grants: [None; SEND_GRANTS],
+            grant_high: [None; SEND_GRANTS],
+            grant_generation: 0,
             generation: 0,
             waiter_sequence: 0,
             last_now: 0,
@@ -302,6 +391,14 @@ impl<const B: usize> Ipc<B> {
         let i = self.index(key)?;
         backend.authorize(sender, key, IpcOperation::Send)?;
         if self
+            .send_grants
+            .iter()
+            .flatten()
+            .any(|g| g.actor == sender && g.endpoint == key && g.request_id == request_id)
+        {
+            return Err(Error::Conflict);
+        }
+        if self
             .waiters
             .iter()
             .flatten()
@@ -319,6 +416,234 @@ impl<const B: usize> Ipc<B> {
         // send error. A pending notification remains independently serviceable.
         Ok(sequence)
     }
+    /// Reserve a concrete payload cell before a downstream resource gate.
+    /// Request IDs are monotonic per live (actor, endpoint) pair. Repeating an
+    /// outstanding identity returns the same grant; retired identities never
+    /// silently allocate again. The bounded identity table is released only
+    /// when that actor or endpoint is explicitly retired.
+    pub fn reserve_send(
+        &mut self,
+        actor: ObjectKey,
+        key: ObjectKey,
+        request_id: u64,
+        now: u64,
+        backend: &mut impl IpcBackend<B>,
+    ) -> Result<SendGrant, Error> {
+        self.time(now)?;
+        valid_key(actor)?;
+        if B == 0 || request_id == 0 {
+            return Err(Error::Range);
+        }
+        let i = self.index(key)?;
+        backend.authorize(actor, key, IpcOperation::Send)?;
+        if let Some(old) = self
+            .send_grants
+            .iter()
+            .flatten()
+            .find(|g| g.actor == actor && g.endpoint == key && g.request_id == request_id)
+        {
+            return Ok(old.grant);
+        }
+        if self.waiters.iter().flatten().any(|w| {
+            w.ticket.endpoint == key
+                && w.ticket.sender == actor
+                && w.message.request_id == request_id
+        }) {
+            return Err(Error::Conflict);
+        }
+        if self
+            .waiters
+            .iter()
+            .flatten()
+            .any(|w| w.ticket.endpoint == key && w.state == WaitResult::Pending)
+        {
+            return Err(Error::Again);
+        }
+        let high = match self
+            .grant_high
+            .iter()
+            .position(|h| h.is_some_and(|h| h.actor == actor && h.endpoint == key))
+        {
+            Some(high) => {
+                if request_id <= self.grant_high[high].unwrap().request_id {
+                    return Err(Error::Stale);
+                }
+                high
+            }
+            None => self
+                .grant_high
+                .iter()
+                .position(Option::is_none)
+                .ok_or(Error::Capacity)?,
+        };
+        let e = self.endpoints[i].as_ref().ok_or(Error::Stale)?;
+        if e.len + e.reserved >= e.limits(now).0 {
+            return Err(Error::Again);
+        }
+        let cell = e.free_cell().ok_or(Error::Capacity)?;
+        let slot = self
+            .send_grants
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::Capacity)?;
+        let generation = self
+            .grant_generation
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        let version = if e.stamp.live(now) {
+            e.stamp.version
+        } else {
+            0
+        };
+        let grant = SendGrant {
+            slot: slot as u16,
+            generation,
+            policy_version: version,
+        };
+        let e = self.endpoints[i].as_mut().ok_or(Error::Stale)?;
+        e.set_owned(cell, true);
+        e.reserved += 1;
+        e.applied_version = e.applied_version.max(version);
+        self.send_grants[slot] = Some(SendReservation {
+            grant,
+            actor,
+            endpoint: key,
+            request_id,
+            cell,
+            version,
+            confirmed: version == 0 || e.confirmed_version == version,
+        });
+        self.grant_high[high] = Some(GrantHighWater {
+            actor,
+            endpoint: key,
+            request_id,
+        });
+        self.grant_generation = generation;
+        Ok(grant)
+    }
+    fn send_grant(&self, grant: SendGrant) -> Result<SendReservation, Error> {
+        let held = self
+            .send_grants
+            .get(usize::from(grant.slot))
+            .and_then(|v| *v)
+            .filter(|g| g.grant == grant)
+            .ok_or(Error::Stale)?;
+        let i = self.index(held.endpoint)?;
+        let endpoint = self.endpoints[i].as_ref().ok_or(Error::Stale)?;
+        if endpoint.reserved == 0
+            || !endpoint.owns(held.cell)
+            || self.messages[i][held.cell] != Message::EMPTY
+            || (0..endpoint.len).any(|n| {
+                usize::from(endpoint.order[(endpoint.head + n) % MAX_MESSAGES]) == held.cell
+            })
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(held)
+    }
+    /// Validate actual custody, exact generations, and current send authority.
+    /// A policy update or TTL cannot confiscate a cell already reserved for
+    /// this obligation, so this deliberately does not consult current limits.
+    pub fn validate_send_grant(
+        &self,
+        grant: SendGrant,
+        actor: ObjectKey,
+        endpoint: ObjectKey,
+        backend: &mut impl IpcBackend<B>,
+    ) -> Result<u64, Error> {
+        let held = self.send_grant(grant)?;
+        if held.actor != actor || held.endpoint != endpoint {
+            return Err(Error::Auth);
+        }
+        backend.authorize(actor, endpoint, IpcOperation::Send)?;
+        Ok(held.version)
+    }
+    /// Root calls this only after recording APPLIED for this exact version.
+    /// Confirmation is retained in every live grant, so later Pending intents
+    /// cannot hide obligations already backed and acknowledged. A version hole
+    /// is never accepted merely because a higher version has executed.
+    pub fn confirm_policy_version(&mut self, key: ObjectKey, version: u64) -> Result<(), Error> {
+        let i = self.index(key)?;
+        let endpoint = self.endpoints[i].as_ref().ok_or(Error::Stale)?;
+        if version != 0
+            && endpoint.applied_version != version
+            && endpoint.confirmed_version != version
+            && !self
+                .send_grants
+                .iter()
+                .flatten()
+                .any(|g| g.endpoint == key && g.version == version)
+        {
+            return Err(Error::NotReady);
+        }
+        for held in self.send_grants.iter_mut().flatten() {
+            if held.endpoint == key && held.version == version {
+                held.confirmed = true;
+            }
+        }
+        let endpoint = self.endpoints[i].as_mut().ok_or(Error::Stale)?;
+        endpoint.confirmed_version = endpoint.confirmed_version.max(version);
+        Ok(())
+    }
+    /// The caller must own a live, still-authorized ticket whose exact version
+    /// root has acknowledged. The token's historical getter alone is not
+    /// sufficient. Baseline tickets are confirmed by actual endpoint creation.
+    pub fn validate_confirmed_send_grant(
+        &self,
+        grant: SendGrant,
+        actor: ObjectKey,
+        endpoint: ObjectKey,
+        backend: &mut impl IpcBackend<B>,
+    ) -> Result<u64, Error> {
+        let version = self.validate_send_grant(grant, actor, endpoint, backend)?;
+        if !self.send_grant(grant)?.confirmed {
+            return Err(Error::NotReady);
+        }
+        Ok(version)
+    }
+    /// Consume only after successful FIFO publication. TTL/shrink affects new
+    /// grants, not this already-owned cell. All fallible validation precedes
+    /// publication; notification errors retain a separate wake obligation.
+    pub fn send_reserved(
+        &mut self,
+        grant: SendGrant,
+        request_id: u64,
+        bytes: &[u8],
+        now: u64,
+        backend: &mut impl IpcBackend<B>,
+    ) -> Result<u64, Error> {
+        self.time(now)?;
+        let held = self.send_grant(grant)?;
+        if request_id != held.request_id {
+            return Err(Error::Conflict);
+        }
+        let message = Message::new(held.actor, request_id, bytes)?;
+        let i = self.index(held.endpoint)?;
+        backend.authorize(held.actor, held.endpoint, IpcOperation::Send)?;
+        let e = self.endpoints[i].as_mut().ok_or(Error::Stale)?;
+        if e.reserved == 0 {
+            return Err(Error::Conflict);
+        }
+        let sequence =
+            e.enqueue_cell(&mut self.messages[i], held.cell, message, now, held.version)?;
+        e.reserved -= 1;
+        self.send_grants[usize::from(grant.slot)] = None;
+        self.notify_endpoint(i, backend);
+        Ok(sequence)
+    }
+    pub fn cancel_send(&mut self, grant: SendGrant) -> Result<(), Error> {
+        let held = self.send_grant(grant)?;
+        let i = self.index(held.endpoint)?;
+        let e = self.endpoints[i].as_mut().ok_or(Error::Stale)?;
+        if e.reserved == 0 || !e.owns(held.cell) {
+            return Err(Error::Conflict);
+        }
+        self.messages[i][held.cell] = Message::EMPTY;
+        e.set_owned(held.cell, false);
+        e.reserved -= 1;
+        self.send_grants[usize::from(grant.slot)] = None;
+        Ok(())
+    }
     pub fn wait_send(
         &mut self,
         sender: ObjectKey,
@@ -332,6 +657,14 @@ impl<const B: usize> Ipc<B> {
         let message = Message::new(sender, request_id, data)?;
         let i = self.index(key)?;
         backend.authorize(sender, key, IpcOperation::Send)?;
+        if self
+            .send_grants
+            .iter()
+            .flatten()
+            .any(|g| g.actor == sender && g.endpoint == key && g.request_id == request_id)
+        {
+            return Err(Error::Conflict);
+        }
         for w in self.waiters.iter().flatten() {
             if w.ticket.sender == sender
                 && w.ticket.endpoint == key
@@ -381,7 +714,7 @@ impl<const B: usize> Ipc<B> {
         let key = self.endpoints[endpoint].as_ref().ok_or(Error::Stale)?.key;
         for _ in 0..16 {
             let e = self.endpoints[endpoint].as_ref().ok_or(Error::Stale)?;
-            if e.len >= e.limits(now).0 {
+            if e.len + e.reserved >= e.limits(now).0 {
                 break;
             }
             let Some(i) = self
@@ -474,7 +807,8 @@ impl<const B: usize> Ipc<B> {
         let count = e.len.min(e.limits(now).1);
         let mut delivered = 0;
         for _ in 0..count {
-            let message = &self.messages[i][e.head];
+            let cell = usize::from(e.order[e.head]);
+            let message = &self.messages[i][cell];
             if let Err(error) = backend.deliver(receiver, key, message) {
                 // Earlier items remain completed; the failing head remains in
                 // FIFO order. Report progress rather than invite a batch replay.
@@ -486,13 +820,14 @@ impl<const B: usize> Ipc<B> {
             e.stats.receive_wait_ns = e
                 .stats
                 .receive_wait_ns
-                .saturating_add(now.saturating_sub(e.since[e.head]));
-            self.messages[i][e.head] = Message::EMPTY;
+                .saturating_add(now.saturating_sub(e.since[cell]));
+            self.messages[i][cell] = Message::EMPTY;
+            e.set_owned(cell, false);
             e.head = (e.head + 1) % MAX_MESSAGES;
             e.len -= 1;
             e.stats.delivered = e.stats.delivered.saturating_add(1);
             if e.stamp.live(now) {
-                e.applied_version = e.stamp.version;
+                e.applied_version = e.applied_version.max(e.stamp.version);
             }
             delivered += 1;
         }
@@ -512,6 +847,16 @@ impl<const B: usize> Ipc<B> {
         let i = self.index(key)?;
         if self.endpoints[i].as_ref().is_none_or(|e| e.owner != owner) {
             return Err(Error::Auth);
+        }
+        for grant in &mut self.send_grants {
+            if grant.is_some_and(|g| g.endpoint == key) {
+                *grant = None;
+            }
+        }
+        for high in &mut self.grant_high {
+            if high.is_some_and(|h| h.endpoint == key) {
+                *high = None;
+            }
         }
         for w in self
             .waiters
@@ -545,6 +890,18 @@ impl<const B: usize> Ipc<B> {
                 *w = None;
             }
         }
+        for i in 0..SEND_GRANTS {
+            if let Some(grant) = self.send_grants[i]
+                && grant.actor == owner
+            {
+                let _ = self.cancel_send(grant.grant);
+            }
+        }
+        for high in &mut self.grant_high {
+            if high.is_some_and(|h| h.actor == owner) {
+                *high = None;
+            }
+        }
     }
     pub fn stats(&self, key: ObjectKey) -> Result<IpcStats, Error> {
         let e = self.endpoints[self.index(key)?]
@@ -552,6 +909,7 @@ impl<const B: usize> Ipc<B> {
             .ok_or(Error::Stale)?;
         Ok(IpcStats {
             depth: e.len,
+            reserved: e.reserved,
             ..e.stats
         })
     }

@@ -1,5 +1,7 @@
 //! VirtIO entropy source. No invented seed or deterministic fallback.
 use crate::{Error, Platform, Queue, Transport};
+mod batched;
+pub use batched::BatchedRng;
 pub struct Rng {
     transport: Transport,
     queue: Queue,

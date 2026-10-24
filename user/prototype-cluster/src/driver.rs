@@ -8,6 +8,9 @@ use cyxia_prototype::cluster::{
     wire::{Config, Header, Proof},
 };
 use cyxia_prototype_cluster::abi::*;
+#[path = "driver/domain.rs"]
+mod domain;
+use domain::NativeDomains;
 struct RingCrypto {
     signer: IdentitySigner,
     own_public: [u8; 32],
@@ -94,6 +97,10 @@ pub struct Driver {
     snapshot_id: u64,
     out_snapshot: Option<OutSnapshot>,
     in_snapshot: Option<InSnapshot>,
+    native: Option<NativeDomains>,
+    native_mode: bool,
+    outgoing_input: Vec<u8>,
+    native_started: Vec<TaskKey>,
 }
 impl Driver {
     pub fn new(
@@ -103,6 +110,17 @@ impl Driver {
         peer: [u8; 32],
         signer: IdentitySigner,
         peer_public: [u8; 32],
+    ) -> Result<Self, ()> {
+        Self::construct(boot, uuid, local, peer, signer, peer_public, None)
+    }
+    fn construct(
+        boot: u64,
+        uuid: [u8; 16],
+        local: [u8; 32],
+        peer: [u8; 32],
+        signer: IdentitySigner,
+        peer_public: [u8; 32],
+        mut native: Option<NativeDomains>,
     ) -> Result<Self, ()> {
         let own_public = signer.public_key();
         let crypto = RingCrypto {
@@ -116,7 +134,7 @@ impl Driver {
             return Err(());
         }
         let mut engine = Engine::new(local, peer, boot, crypto).map_err(|_| ())?;
-        let mut identity = b"CXID1".to_vec();
+        let mut identity = if native.is_some() { b"CXID2" } else { b"CXID1" }.to_vec();
         identity.extend_from_slice(&uuid);
         identity.extend_from_slice(&local);
         identity.extend_from_slice(&peer);
@@ -130,7 +148,11 @@ impl Driver {
         }
         let mut ordinal = 2;
         while let Some(record) = read_record(ordinal)? {
-            engine.recover_event(&record).map_err(|_| ())?;
+            if record.starts_with(cyxia_prototype_cluster::domain_placement::MAGIC) {
+                native.as_mut().ok_or(())?.recover(&record)?;
+            } else {
+                engine.recover_event(&record).map_err(|_| ())?;
+            }
             ordinal += 1;
             if ordinal > 32768 {
                 return Err(());
@@ -146,10 +168,15 @@ impl Driver {
                 .frozen_leave()
                 .map(|(record, _)| record[40..56].try_into().unwrap())
         });
+        let native_mode = native.is_some();
         Ok(Self {
             engine,
             input: Vec::new(),
-            output: Vec::new(),
+            output: if native_mode {
+                Vec::with_capacity(2 * 131264)
+            } else {
+                Vec::new()
+            },
             sent: 0,
             sequence: 0,
             request: 0,
@@ -185,6 +212,10 @@ impl Driver {
             snapshot_id: 0,
             out_snapshot: None,
             in_snapshot: None,
+            native,
+            native_mode,
+            outgoing_input: Vec::new(),
+            native_started: Vec::new(),
         })
     }
     pub fn connect(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
@@ -250,6 +281,9 @@ impl Driver {
         self.send(32, b, None)
     }
     pub fn disconnect(&mut self) {
+        if let Some(native) = self.native.as_mut() {
+            native.disconnect();
+        }
         if let Some(id) = self
             .engine
             .contracts
@@ -321,7 +355,17 @@ impl Driver {
         Ok(bytes.len())
     }
     fn send(&mut self, kind: u16, body: Vec<u8>, reply: Option<[u8; 16]>) -> Result<(), ()> {
-        if body.len() > 65536 || self.output.len() + 96 + body.len() > 131264 {
+        if body.len() > 65536 {
+            return Err(());
+        }
+        if self.native_mode {
+            self.compact_complete_frames()?;
+            let reserved = cyxia_prototype_cluster::domain_ingress::reserved_rpc(kind);
+            let (used, count) = self.queued_class(reserved)?;
+            if count >= 32 || used + 96 + body.len() > 131264 {
+                return Err(());
+            }
+        } else if self.output.len() + 96 + body.len() > 131264 {
             return Err(());
         }
         self.sequence = self.sequence.checked_add(1).ok_or(())?;
@@ -394,7 +438,12 @@ impl Driver {
         let Some(snapshot) = self.out_snapshot.as_ref() else {
             return Ok(());
         };
-        if self.outgoing().len() > 96 * 1024 {
+        if (if self.native_mode {
+            self.queued_class(true)?.0
+        } else {
+            self.outgoing().len()
+        }) > 96 * 1024
+        {
             return Ok(());
         }
         let mut b = Vec::new();
@@ -511,7 +560,7 @@ impl Driver {
                     nodes: [self.engine.local, self.engine.peer],
                     counters: [self.engine.formation_counter, self.peer_counter],
                     nonces: [self.local_nonce, self.peer_nonce],
-                    schema: self.engine.crypto.sha256(b"CX-RPC-native-schema-1"),
+                    schema: self.schema(),
                     policy: self.engine.crypto.sha256(b"pure-vector-sum-only"),
                     epoch: self
                         .engine
@@ -540,7 +589,7 @@ impl Driver {
                 let c = Config::decode(b).map_err(|_| ())?;
                 if self.engine.local < self.engine.peer
                     || c.trust_domain != self.engine.crypto.sha256(b"CyxiaOS paired native v1")
-                    || c.schema != self.engine.crypto.sha256(b"CX-RPC-native-schema-1")
+                    || c.schema != self.schema()
                     || c.policy != self.engine.crypto.sha256(b"pure-vector-sum-only")
                 {
                     return Err(());
@@ -753,6 +802,9 @@ impl Driver {
                 if !b.is_empty() || !self.engine.ready() {
                     return Err(());
                 }
+                if self.native.is_some() {
+                    return self.native_quote_response(h, now);
+                }
                 let hash = package_hash()?;
                 let mut out = self.engine.boot.to_le_bytes().to_vec();
                 out.extend_from_slice(&2000u32.to_le_bytes());
@@ -760,6 +812,9 @@ impl Driver {
                 self.send(0x8010, out, Some(h.request))?;
             }
             (16, true) => {
+                if self.native.is_some() {
+                    return self.native_quote_reply(h, b, now);
+                }
                 if b.len() != 44 {
                     return Err(());
                 }
@@ -799,9 +854,17 @@ impl Driver {
                 let t = read_terms(&mut r)?;
                 let hash = r.arr()?;
                 let owner_boot = r.u64()?;
+                let offer_seq = if self.native.is_some() {
+                    Some(r.u64()?)
+                } else {
+                    None
+                };
                 r.end()?;
                 if owner_boot != self.engine.boot || t.package_hash != package_hash()? {
                     return Err(());
+                }
+                if let Some(seq) = offer_seq {
+                    self.native_validate_prepare(t, seq, broker::clock_ns())?;
                 }
                 let mut reserve = Vec::new();
                 reserve.extend_from_slice(&(t.cpu_milli as u64).to_le_bytes());
@@ -907,7 +970,11 @@ impl Driver {
                 out.extend_from_slice(&self.contract_hash);
                 out.extend_from_slice(&owner_boot.to_le_bytes());
                 out.extend_from_slice(&grant_epoch.to_le_bytes());
-                let input = task_input();
+                let input = if self.native.is_some() {
+                    self.outgoing_input.clone()
+                } else {
+                    task_input()
+                };
                 out.extend_from_slice(&(input.len() as u32).to_le_bytes());
                 out.extend_from_slice(&input);
                 self.send(19, out, None)?;
@@ -977,7 +1044,11 @@ impl Driver {
                     return Err(());
                 }
                 broker::trace(0x214);
+                if self.native.is_some() {
+                    self.send(0x8013, key_bytes(key), Some(h.request))?;
+                }
             }
+            (19, true) if self.native.is_some() => self.native_started_reply(b)?,
             (20, false) => {
                 let mut r = Reader::new(b);
                 let key = read_key(&mut r)?;
@@ -996,7 +1067,8 @@ impl Driver {
                 }
                 let body = r.take(len)?;
                 r.end()?;
-                if state == TaskState::Done && body != 10i64.to_le_bytes() {
+                if self.native.is_none() && state == TaskState::Done && body != 10i64.to_le_bytes()
+                {
                     return Err(());
                 }
                 let e = self
@@ -1154,6 +1226,7 @@ impl Driver {
             self.last_status = now;
         }
         if self.engine.ready()
+            && self.native.is_none()
             && self.engine.local < self.engine.peer
             && !self.quoted
             && self.engine.contracts.is_empty()
@@ -1161,6 +1234,9 @@ impl Driver {
         {
             self.send(16, Vec::new(), None)?;
             self.quoted = true;
+        }
+        if self.native.is_some() {
+            self.native_quote_request(now)?;
         }
         if option_env!("CYXIA_CLUSTER_LEAVE") == Some("1")
             && self.engine.local < self.engine.peer
@@ -1230,12 +1306,12 @@ impl Driver {
             })
             .map(|r| (r.key, 96usize + 141 + r.body.len()));
         if let Some((key, frame_bytes)) = next {
-            if self
-                .output
-                .len()
-                .checked_add(frame_bytes)
-                .is_some_and(|n| n <= 131264)
-            {
+            let (used, limit) = if self.native_mode {
+                (self.queued_class(true)?.0, 131264 - 8192)
+            } else {
+                (self.output.len(), 131264)
+            };
+            if used.checked_add(frame_bytes).is_some_and(|n| n <= limit) {
                 self.send_result(key)?;
             }
         }
@@ -1417,6 +1493,9 @@ fn read_key(r: &mut Reader<'_>) -> Result<TaskKey, ()> {
     })
 }
 
+#[cfg(test)]
+#[path = "../tests/support/native_checks.rs"]
+mod native_checks;
 #[cfg(test)]
 #[path = "../tests/support/recovery_checks.rs"]
 mod recovery_checks;

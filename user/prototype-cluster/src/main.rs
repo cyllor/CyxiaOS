@@ -9,10 +9,20 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
 };
+use cyxia_prototype::domains::platform::PlacementQueue;
 use cyxia_prototype_cluster::arena::{Arena, HEAP_BYTES};
+const ALLOC_BYTES: usize = HEAP_BYTES - cyxia_prototype_cluster::abi::PLACEMENT_STORAGE_BYTES;
 #[repr(C, align(4096))]
-struct Heap([u8; HEAP_BYTES]);
-static mut HEAP: Heap = Heap([0; HEAP_BYTES]);
+struct PlacementStorage(PlacementQueue);
+static mut PLACEMENTS: PlacementStorage = PlacementStorage(PlacementQueue::new());
+static PLACEMENTS_TAKEN: AtomicBool = AtomicBool::new(false);
+pub(crate) fn placement_queue() -> &'static mut PlacementQueue {
+    assert!(!PLACEMENTS_TAKEN.swap(true, Ordering::AcqRel));
+    unsafe { &mut (*core::ptr::addr_of_mut!(PLACEMENTS)).0 }
+}
+#[repr(C, align(4096))]
+struct Heap([u8; ALLOC_BYTES]);
+static mut HEAP: Heap = Heap([0; ALLOC_BYTES]);
 struct Allocator {
     lock: AtomicBool,
     arena: UnsafeCell<Arena>,
@@ -47,7 +57,7 @@ static ALLOCATOR: Allocator = Allocator {
 #[unsafe(link_section = ".text.entry")]
 extern "C" fn _start() -> ! {
     unsafe {
-        *ALLOCATOR.arena.get() = Arena::new(core::ptr::addr_of_mut!(HEAP) as usize, HEAP_BYTES);
+        *ALLOCATOR.arena.get() = Arena::new(core::ptr::addr_of_mut!(HEAP) as usize, ALLOC_BYTES);
     }
     broker::trace(1);
     runtime::run()

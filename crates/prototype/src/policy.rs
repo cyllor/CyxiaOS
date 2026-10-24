@@ -10,6 +10,18 @@ pub const MAX_CANDIDATES: usize = 32;
 pub const MAX_REGISTERED: usize = 64;
 pub const MAX_PENDING: usize = 64;
 pub const TERMINAL_HISTORY: usize = 256;
+pub const PUBLICATION_BUDGET_NS: u64 = 500_000;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Prerequisite {
+    pub domain: u16,
+    pub target: ObjectKey,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundDependency {
+    pub prerequisite: Prerequisite,
+    /// Zero denotes the owner's verified, initialized deterministic baseline.
+    pub version: u64,
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ModelBinding {
     pub generation: u64,
@@ -267,6 +279,7 @@ pub struct Registry {
     active: [Option<StoredPlan>; MAX_PENDING],
     history: [Option<StoredPlan>; TERMINAL_HISTORY],
     history_cursor: usize,
+    optimization_stopped: bool,
 }
 impl Registry {
     pub const fn empty() -> Self {
@@ -292,6 +305,7 @@ impl Registry {
             active: [None; MAX_PENDING],
             history: [None; TERMINAL_HISTORY],
             history_cursor: 0,
+            optimization_stopped: false,
         }
     }
     pub fn new(boot_epoch: u64, publisher: Publisher, model: ModelBinding) -> Result<Self, Error> {
@@ -324,6 +338,15 @@ impl Registry {
     }
     pub const fn version(&self) -> u64 {
         self.version
+    }
+    /// A publication overrun never cancels an installed root or its obligations.
+    /// It closes admission of subsequent optimization until recovery can prove
+    /// the controller healthy; query and reconciliation remain available.
+    pub const fn optimization_stopped(&self) -> bool {
+        self.optimization_stopped
+    }
+    pub fn stop_optimization(&mut self) {
+        self.optimization_stopped = true;
     }
     pub const fn model(&self) -> ModelBinding {
         self.model
@@ -518,6 +541,19 @@ impl Registry {
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
+        let started_ns = clock.now_ns();
+        self.submit_bounded(publisher, bytes, started_ns, clock, executor)
+    }
+    /// `started_ns` comes from the protected caller before IPC decoding and
+    /// validation, so those costs cannot be hidden outside the publication cap.
+    pub fn submit_bounded<E: Executor, C: Clock>(
+        &mut self,
+        publisher: Publisher,
+        bytes: &[u8],
+        started_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
         let plan = policy_wire::decode_plan(bytes)?;
         self.authorize(publisher)?;
         if plan.header.controller_epoch != publisher.controller_epoch {
@@ -535,6 +571,9 @@ impl Registry {
             } else {
                 Err(Error::Conflict)
             };
+        }
+        if self.optimization_stopped {
+            return Err(Error::Budget);
         }
         for d in plan.iter() {
             if self.records().any(|r| {
@@ -585,6 +624,7 @@ impl Registry {
         let mut prepared = false;
         let result = (|| {
             self.validate(&plan, first, executor)?;
+            publication_budget(started_ns, first)?;
             prepared = true;
             executor.prepare(&plan, next_version)?;
             let now = clock.now_ns();
@@ -593,9 +633,22 @@ impl Registry {
             }
             self.validate(&plan, now, executor)?;
             executor.revalidate(&plan, now)?;
+            // Revalidation may itself take time or wait for an owner. Take a
+            // fresh protected timestamp after all callbacks, before PUBLISH.
+            let publish_ns = clock.now_ns();
+            if publish_ns < now {
+                return Err(Error::Range);
+            }
+            if plan
+                .iter()
+                .any(|d| publish_ns > d.envelope.expires_local_ns)
+            {
+                return Err(Error::Expired);
+            }
+            publication_budget(started_ns, publish_ns)?;
             // Publication is one atomic root change under the owner's resource gate.
-            executor.publish(&plan, next_version, now)?;
-            Ok(now)
+            executor.publish(&plan, next_version, publish_ns)?;
+            Ok(publish_ns)
         })();
         match result {
             Ok(now) => {
@@ -612,6 +665,14 @@ impl Registry {
         }
         self.active[slot] = Some(record);
         self.finish(slot);
+        // Once PUBLISH succeeded it cannot be represented as a rejected plan,
+        // even if its callback exceeded the cap. Retain the real receipt and
+        // stop further optimization while existing APPLY/RECONCILE continues.
+        if publication_budget(started_ns, clock.now_ns()).is_err()
+            || matches!(result, Err(Error::Budget | Error::Range))
+        {
+            self.optimization_stopped = true;
+        }
         Ok(record.receipt)
     }
     pub fn stamp(
@@ -627,6 +688,15 @@ impl Registry {
             .find(|s| s.hash == decision.envelope.candidate_set_hash)
             .ok_or(Error::Stale)?;
         PolicyStamp::new(version, set.snapshot.taken_ns, published_ns)
+    }
+}
+
+fn publication_budget(started_ns: u64, now_ns: u64) -> Result<(), Error> {
+    let elapsed = now_ns.checked_sub(started_ns).ok_or(Error::Range)?;
+    if elapsed > PUBLICATION_BUDGET_NS {
+        Err(Error::Budget)
+    } else {
+        Ok(())
     }
 }
 

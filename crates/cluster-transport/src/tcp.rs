@@ -1,6 +1,9 @@
 //! A single statically provisioned TCP stream over native Ethernet/ARP/IPv4.
 //! Its plaintext bytes must be consumed only by the TLS engine.
 use crate::device::{Ethernet, Port};
+mod observe;
+pub use observe::Observation;
+use observe::ObservedPort;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage},
     socket::tcp::{Socket, SocketBuffer},
@@ -23,6 +26,22 @@ pub enum Error {
     WouldBlock,
 }
 
+/// Retire only the failed TCP generation after a bounded backoff. The caller
+/// retains the same pinned device owner; a poisoned device remains failed.
+pub fn reconnect_due(
+    state: Result<State, Error>,
+    elapsed_ms: u64,
+    entropy_available: bool,
+) -> bool {
+    entropy_available
+        && elapsed_ms >= 1000
+        && matches!(
+            state,
+            Ok(State::Closed)
+                | Err(Error::Clock | Error::Device | Error::Socket | Error::Closed | Error::Peer)
+        )
+}
+
 #[derive(Clone, Copy)]
 pub struct Config {
     pub mac: [u8; 6],
@@ -38,7 +57,7 @@ pub struct Config {
 /// The caller owns fixed buffers and socket storage for this stream's lifetime.
 /// Dropping this object never frees the NIC's pinned DMA storage.
 pub struct Tcp<'a, P> {
-    device: Ethernet<P>,
+    device: Ethernet<ObservedPort<P>>,
     interface: Interface,
     sockets: SocketSet<'a>,
     socket: SocketHandle,
@@ -84,7 +103,7 @@ impl<'a, P: Port> Tcp<'a, P> {
                 return Err(Error::Configuration);
             }
         }
-        let mut device = Ethernet::new(port);
+        let mut device = Ethernet::new(ObservedPort::new(port, config, now_ms));
         let mut iface_config = InterfaceConfig::new(mac.into());
         iface_config.random_seed = config.random_seed;
         let mut interface = Interface::new(
@@ -152,16 +171,42 @@ impl<'a, P: Port> Tcp<'a, P> {
             return Err(Error::Clock);
         }
         self.last_ms = now_ms;
+        self.device.port_mut().set_time(now_ms);
         if self.device.service().is_err() {
             self.abort();
             return Err(Error::Device);
         }
+        if self.device.port_mut().flush().is_err() {
+            self.abort();
+            return Err(Error::Device);
+        }
         let now = Instant::from_millis(now_ms as i64);
-        self.interface
+        let before = self.sockets.get::<Socket>(self.socket);
+        let queued = before.send_queue();
+        let state = before.state();
+        let ingress = self
+            .interface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
-        self.interface
-            .poll_egress(now, &mut self.device, &mut self.sockets);
-        if self.device.service().is_err() {
+        let after = self.sockets.get::<Socket>(self.socket);
+        if ingress != smoltcp::iface::PollIngressSingleResult::None {
+            self.device.port_mut().ingress_processed(
+                after.send_queue() < queued
+                    || (matches!(state, State::SynSent | State::SynReceived)
+                        && after.state() == State::Established),
+            );
+        }
+        // A hardware multichain port can accept multiple independent frames.
+        // Bound the producer pass by its real queue capacity, then ring once;
+        // an isolated frame is still flushed at the end of this same turn.
+        for _ in 0..self.device.port().burst_capacity().clamp(1, 8) {
+            self.interface
+                .poll_egress(now, &mut self.device, &mut self.sockets);
+            if self.device.service().is_err() {
+                self.abort();
+                return Err(Error::Device);
+            }
+        }
+        if self.device.port_mut().flush().is_err() {
             self.abort();
             return Err(Error::Device);
         }
@@ -189,6 +234,35 @@ impl<'a, P: Port> Tcp<'a, P> {
         socket.send_slice(bytes).map_err(|_| Error::Socket)
     }
 
+    /// All-or-nothing enqueue for an IPC message. Insufficient socket capacity
+    /// has no side effects, allowing the real IPC head to remain queued.
+    pub fn send_exact(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.healthy()?;
+        let socket = self.sockets.get::<Socket>(self.socket);
+        if !socket.may_send() {
+            return Err(Error::Closed);
+        }
+        if bytes.len() > socket.send_capacity().saturating_sub(socket.send_queue()) {
+            return Err(Error::WouldBlock);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.send_tls(bytes)? != bytes.len() {
+            // A violated socket capacity contract must never duplicate a prefix.
+            self.abort();
+            return Err(Error::Socket);
+        }
+        Ok(())
+    }
+
+    pub fn observation(&self) -> Observation {
+        let socket = self.sockets.get::<Socket>(self.socket);
+        let active =
+            !self.failed && matches!(socket.state(), State::Established | State::CloseWait);
+        self.device.port().observation(socket.send_queue(), active)
+    }
+
     pub fn receive_tls(&mut self, bytes: &mut [u8]) -> Result<usize, Error> {
         self.healthy()?;
         let socket = self.sockets.get_mut::<Socket>(self.socket);
@@ -210,8 +284,13 @@ impl<'a, P: Port> Tcp<'a, P> {
     pub fn close(&mut self, now_ms: u64) {
         self.sockets.get_mut::<Socket>(self.socket).abort();
         if !self.failed && now_ms >= self.last_ms && now_ms <= i64::MAX as u64 {
-            self.interface.poll_egress(Instant::from_millis(now_ms as i64), &mut self.device, &mut self.sockets);
+            self.interface.poll_egress(
+                Instant::from_millis(now_ms as i64),
+                &mut self.device,
+                &mut self.sockets,
+            );
             let _ = self.device.service();
+            let _ = self.device.port_mut().flush();
         }
         self.failed = true;
     }
