@@ -1,9 +1,10 @@
 // This bootstrap is bound to the virt board via constants passed by the kernel.
-.section .text.boot,"ax"
+.section .text.boot.primary,"ax"
 .global _start
 _start:
  msr daifset, #15
  msr spsel, #1
+ msr tpidr_el1, xzr
  mrs x0, CurrentEL
  cmp x0, #4
  b.ne boot_halt
@@ -121,9 +122,11 @@ boot_halt:
 .balign 4096
 .global low_l1
 low_l1: .skip 4096
+.global high_l1
 high_l1: .skip 4096
 dev_l2: .skip 4096
 ram_l2: .skip 4096
+.global ram_l3
 ram_l3: .skip {ram_tables_bytes}
 .section .text.highentry,"ax"
 high_entry:
