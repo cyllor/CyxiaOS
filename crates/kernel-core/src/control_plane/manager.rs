@@ -204,7 +204,8 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         Ok(result)
     }
     pub fn fault(&mut self, cpu: usize, now: u64) -> Result<Ticket, Error> {
-        self.check_time(now)?;
+        // Safety notification: late delivery cannot suppress CPU quarantine.
+        let now = now.max(self.last_time);
         let result = self.ownership.fault(cpu, now);
         if result.is_ok() || self.snapshot().phase == super::cores::Phase::Halted {
             self.pending = None;

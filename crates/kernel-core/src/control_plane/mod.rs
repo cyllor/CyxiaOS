@@ -63,3 +63,8 @@ impl Epochs {
 }
 pub mod manager;
 pub mod wire;
+
+pub mod dispatch;
+pub mod exchange;
+pub mod image;
+pub mod service;

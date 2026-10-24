@@ -1,0 +1,1106 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "8c295c814068299010ec39bbe18e2fe8a3c21ea3",
+  "baseline_tree": "838b6931f370f5feb779de227e71176c4337efb7",
+  "specs": {
+    "system": "2df965ba7604a444acf08d519e430c65429aebdf757fe3de29969dc7b9e2a35a",
+    "cluster": "198a63231025dc58872d1c27edc21cd0613e2321d30f1fd34b999f878b324db3"
+  },
+  "requirements": [
+    {
+      "id": "A01",
+      "requirement": "4 vCPU 原生 CyxiaOS 启动；EL0 控制面和业务面同时运行。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "新增 ai-control-selftest 已在专用客体核心运行独立 Rust EL0 模型服务并与业务并行；默认生产进程调度/事件循环尚未接入，不能据此关闭完整系统验收。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs",
+        "kernel/src/smp.rs",
+        "crates/kernel-core/src/control_plane/dispatch.rs",
+        "tools/verify_smp.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A02",
+      "requirement": "独占核心集合与业务核集合不重叠，持续运行期间无越界调度。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "独立服务与业务实际使用派发栅栏和分离映射，辅助控制核也执行真实推理；默认生产桌面尚未接入持续多核隔离。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs",
+        "kernel/src/smp.rs",
+        "crates/kernel-core/src/control_plane/dispatch.rs",
+        "tools/verify_smp.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A03",
+      "requirement": "实际 AI 模型驱动控制面至少完成 1→2→1 核扩缩容。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "新增原生配置中，冻结训练模型经 EL0 推理输出核心提案并实际完成 1→2→1；遥测仍为合成压力窗口，生产采样、统一模型与完整门禁仍未齐全。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs",
+        "kernel/src/smp.rs",
+        "crates/kernel-core/src/control_plane/dispatch.rs",
+        "tools/verify_smp.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A04",
+      "requirement": "非法扩缩容/IRQ 无法迁移时不出现核心双重所有权。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "原生负面程序已检查非法 mask、写只读快照/模型、服务卡死；生产不可迁移 IRQ、DMA、RCU 等联合故障仍未覆盖。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs",
+        "kernel/src/smp.rs",
+        "crates/kernel-core/src/control_plane/dispatch.rs",
+        "tools/verify_smp.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A05",
+      "requirement": "统一模型在客体内运行，全部一级子系统各有一项真实可执行 AI 动作。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A06",
+      "requirement": "全部基础机制在其职责范围内消费 AI 合法配置，正确性操作不依赖同步推理。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A07",
+      "requirement": "全模块均留存输入快照、决策 ID、批准版本、执行反馈和至少一项效果指标。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A08",
+      "requirement": "模块级基线/Active 对比真实可复现，负收益也必须记录。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A09",
+      "requirement": "内存地址空间隔离、映射权限、缺页与回收正确。",
+      "clause": "主规范 §12",
+      "status": "NOT_RUN",
+      "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A10",
+      "requirement": "文件系统完成日志持久化、重启挂载恢复，已确认数据满足约定条件。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
+      "code": [
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A11",
+      "requirement": "页缓存、回写和 I/O 不产生循环等待或双重资源计费。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs",
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A12",
+      "requirement": "两台原生 CyxiaOS 自动发现、身份认证、协商并提交一致成员配置。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A13",
+      "requirement": "至少一项跨节点任务通过资源合同成功执行与反馈。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A14",
+      "requirement": "失联后本地独立业务继续，不能出现共享写入双主。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A15",
+      "requirement": "模型失效与非法提案不会破坏业务基本进度或安全语义。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "独立 EL0 模型服务真实故障/预算耗尽时业务继续；新代际重启拒绝旧回复。生产路径及跨域故障组合仍待接入验证。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs",
+        "kernel/src/smp.rs",
+        "crates/kernel-core/src/control_plane/dispatch.rs",
+        "tools/verify_smp.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "A16",
+      "requirement": "每一测试记录镜像版本、模型 hash、平台配置、输入场景、结果和复现实验脚本。",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "新增验证器绑定ELF/模型/Schema/源码哈希、原始串口和QMP物理页；只覆盖该配置，不代替全部规定测试及生产镜像证据。",
+      "code": [
+        "tools/verify_ai_system.py",
+        "tools/verify_storage.py",
+        "tools/check_prototype_evidence.py",
+        "crates/control-model/src/abi.rs",
+        "crates/control-model/src/model.rs",
+        "crates/kernel-core/src/control_plane/service.rs",
+        "kernel/src/control_service.rs",
+        "tools/verify_ai_control.py"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "AI-X01",
+      "requirement": "16个模块模型输出合法和非法动作；强类型动作生效/拒绝证据齐全",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "CLU-X01",
+      "requirement": "建群双方证明写入不对称 + 重启；仅一致证明可激活",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "CLU-X02",
+      "requirement": "资源Commit ACK丢失 + 重新报价；同额度不双重授予",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "CLU-X03",
+      "requirement": "任务Activate ACK丢失 + 非幂等模拟设备；operation_id 防重复副作用",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D01",
+      "requirement": "CPU 与调度：CPU 与调度",
+      "clause": "主规范 §7.1",
+      "status": "BLOCKED",
+      "gap": "已有同步整数模型派发；独立 EL0 控制服务、不可变计划接入真实调度器及四核验证未完成。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D02",
+      "requirement": "进程与线程管理：进程与线程管理",
+      "clause": "主规范 §7.2",
+      "status": "BLOCKED",
+      "gap": "已有进程/线程和受限准入；规范 spawn_tokens/group_parallelism 动作与执行回执未接入。",
+      "code": [
+        "kernel/src/user/spawn.rs",
+        "kernel/src/user/threads.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D03",
+      "requirement": "内存管理：内存管理",
+      "clause": "主规范 §7.3",
+      "status": "BLOCKED",
+      "gap": "已有页所有权、共享映射与有界池；规范回收/缓存动作、跨核 TLB 及内存压力恢复未闭合。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D04",
+      "requirement": "文件系统：文件系统",
+      "clause": "主规范 §7.4",
+      "status": "BLOCKED",
+      "gap": "已有 RAMFS 检查点和 VirtIO 双槽持久化；不能替代规范日志事务、页缓存回写和逐崩溃点验收。",
+      "code": [
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D05",
+      "requirement": "IPC 与同步：IPC 与同步",
+      "clause": "主规范 §7.5",
+      "status": "BLOCKED",
+      "gap": "已有 Unix IPC/futex/固定 SPSC；原生控制服务紧急通道、批处理策略实际效果与抗饥饿验证待接入。",
+      "code": [
+        "crates/posix/src/unix.rs",
+        "crates/kernel-core/src/control_plane/queue.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D06",
+      "requirement": "中断与异常：中断与异常",
+      "clause": "主规范 §7.6",
+      "status": "BLOCKED",
+      "gap": "已有 GIC/IRQ 分发；多核 IRQ 归属交接、不可迁保护及模型亲和性动作未接入。",
+      "code": [
+        "kernel/src/interrupts.rs",
+        "crates/driver-gicv2/src/lib.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D07",
+      "requirement": "定时器与时间管理：定时器与时间管理",
+      "clause": "主规范 §7.7",
+      "status": "BLOCKED",
+      "gap": "已有单调时间/timerfd；显式 slack 的模型合并动作及硬截止保护验证未完成。",
+      "code": [
+        "kernel/src/clock.rs",
+        "crates/posix/src/timerfd.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D08",
+      "requirement": "系统调用与 ABI：系统调用与 ABI",
+      "clause": "主规范 §7.8",
+      "status": "BLOCKED",
+      "gap": "已有 POSIX/Linux personality；按规范白名单执行 service_batch 动作及独立权限/顺序证据未完成。",
+      "code": [
+        "kernel/src/user.rs",
+        "crates/posix/src/lib.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D09",
+      "requirement": "I/O 与存储设备管理：I/O 与存储设备管理",
+      "clause": "主规范 §7.9",
+      "status": "BLOCKED",
+      "gap": "已有真实块设备与后台 checkpoint 策略；规范队列份额、合并动作及 flush/FUA 并发门禁仍待验收。",
+      "code": [
+        "kernel/src/storage.rs",
+        "crates/ai-runtime/src/storage_policy.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D10",
+      "requirement": "网络系统：网络系统",
+      "clause": "主规范 §7.10",
+      "status": "BLOCKED",
+      "gap": "生产状态明确 network=absent；签名报文库不是 NIC/IP/可靠传输栈，不能关闭网络 AI 域。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/kernel-core/src/cluster/wire.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D11",
+      "requirement": "设备与驱动管理：设备与驱动管理",
+      "clause": "主规范 §7.11",
+      "status": "BLOCKED",
+      "gap": "已有 VirtIO 图形/输入/块设备；批次/队列策略和 DMA 生命周期联合动作尚未按本规范验证。",
+      "code": [
+        "crates/driver-virtio/src/lib.rs",
+        "kernel/src/virtio_platform.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D12",
+      "requirement": "安全与隔离：安全与隔离",
+      "clause": "主规范 §7.12",
+      "status": "BLOCKED",
+      "gap": "已有权限/W^X/挑战鉴权接口；独立 EL0 控制能力、真实启动信任和限流动作仍需实现接入。",
+      "code": [
+        "crates/kernel-core/src/cluster/auth.rs",
+        "crates/arch-aarch64/src/mmu.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D13",
+      "requirement": "能耗与热管理：能耗与热管理",
+      "clause": "主规范 §7.13",
+      "status": "BLOCKED",
+      "gap": "没有完成 duty-cycle AI 执行与 CPU 活动代理对比；不得以 QEMU 声称实体功耗优化。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/arch-aarch64/src/timer.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D14",
+      "requirement": "监控诊断与故障恢复：监控诊断与故障恢复",
+      "clause": "主规范 §7.14",
+      "status": "BLOCKED",
+      "gap": "已有计数和故障管理状态机；真实受控恢复配方、紧急 IPC/内存恢复路径与动作效果未接入。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/kernel-core/src/control_plane/manager.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D15",
+      "requirement": "HAL 与平台管理：HAL 与平台管理",
+      "clause": "主规范 §7.15",
+      "status": "BLOCKED",
+      "gap": "已有 FDT/平台适配；HAL 自有 poll_budget 动作与运行证据未完成，拓扑描述不等于 AI 动作。",
+      "code": [
+        "crates/platform-virt/src/fdt.rs",
+        "kernel/src/virtio_platform.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "D16",
+      "requirement": "自治集群与联合调度：自治集群与联合调度",
+      "clause": "主规范 §7.16",
+      "status": "BLOCKED",
+      "gap": "已有两节点安全状态机；真实发现/网络/密码/持久事务/任务执行后端及双原生客体验收未完成。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "SEC-X01",
+      "requirement": "旧epoch节点复连 + 旧令牌写入；资源端拒绝fencing token",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "SYS-X01",
+      "requirement": "AI缩容 + 迁移IPI ACK丢失；无双归属；失败核心保持隔离",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "SYS-X02",
+      "requirement": "页表撤销 + 任务退出 + 远端TLB超时；未 ACK 页不得释放",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "SYS-X03",
+      "requirement": "内存耗尽 + Log fsync + CACP崩溃；最低进度及持久化承诺不破坏",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs",
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-ACTION-01",
+      "requirement": "提交越界 queue_budget → OUT_OF_RANGE，执行器状态不变；正确性",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-ACTION-02",
+      "requirement": "重复 decision_id → 一次生效，重复返回原回执；幂等",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-CLUSTER-01",
+      "requirement": "两台原生 CyxiaOS 自动发现、双方授权后接纳；未授权对端不得加入；认证",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-CLUSTER-02",
+      "requirement": "重复 Prepare/Commit 仅生成一个有效合同；丢失连接不得擅自独占写；分布式",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-CORE-01",
+      "requirement": "4 vCPU，AI 生成 1→2→1，迁移期间 CONTROL∩BUSINESS=∅；隔离",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-CORE-02",
+      "requirement": "受保护 IRQ 不可转移时核心归属保持前代际；故障",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-DOMAIN-ALL",
+      "requirement": "每个领域用固定刺激证明动作值改变且执行侧效果可追踪；同时输出 Baseline/Active 差异；全覆盖",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-FS-01",
+      "requirement": "write/fsync 后强制重启，已确认内容存在且日志可重放；持久化",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
+      "code": [
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-IPC-01",
+      "requirement": "控制 IPC 批处理阈值，验证消息总量/顺序/授权；语义",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-IRQ-01",
+      "requirement": "可迁移 IRQ 改亲和性生效；关键 timer IRQ 拒绝迁移；平台",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-MODEL-01",
+      "requirement": "替换 feature_schema_hash → BAD_SCHEMA；服务崩溃后业务仍进展；正确性",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-POWER-01",
+      "requirement": "AI 改变后台 duty cycle，显示 CPU 时间代理且明确不声称真实耗电；证据",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T-XDOMAIN-01",
+      "requirement": "并发内存+文件缓存计划超账本预算 → 无越额授予；资源",
+      "clause": "主规范 §12 .2 组合故障",
+      "status": "BLOCKED",
+      "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs",
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T01",
+      "requirement": "双方正常认证并建群；相同 ClusterID、ConfigDigest 与可验证 CommitProof",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T02",
+      "requirement": "发现消息重放与伪造；旧 nonce/未经认证身份不能取得成员权",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T03",
+      "requirement": "对等双方不同协商摘要；不可激活；有限轮数退出",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T04",
+      "requirement": "PREPARED 后 A 宕机；B 无提交证明不得启用共享资源",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T05",
+      "requirement": "CONFIRMED 后 B 宕机；恢复/对账收敛到一致结果或安全冻结",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T06",
+      "requirement": "CommitProof ACK 丢失并重发；不产生第二配置与额外授予",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T07",
+      "requirement": "双节点 1+1 分区；无双主共享写入；本地独立服务继续",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T08",
+      "requirement": "旧成员纪元及 fencing token 重放；执行端拒绝旧独占写入",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T09",
+      "requirement": "资源报价后本地资源被占用；PREPARE 拒绝；总账无超额",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T10",
+      "requirement": "并行合同争夺相同资源；最多合法容量被授予",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T11",
+      "requirement": "Activate 成功，ACK 丢失；幂等状态返回，无重复副作用",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T12",
+      "requirement": "不可重放机器人动作失败；禁止自动重试，进入人工/设备对账",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T13",
+      "requirement": "原生 ABI 与 ISA 不兼容；准入前拒绝且无任务进程运行",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T14",
+      "requirement": "AI 输出持续冲突或超时；协商终止或恢复基线，业务不等待",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T15",
+      "requirement": "动态控制核心缩容与集群合同并行；不违反本地业务容量和核心归属",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T16",
+      "requirement": "节点重启/重新发现；保留 ClusterID 并按纪元恢复合同",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T17",
+      "requirement": "集群正常退出且存在唯一数据副本；退出被阻止或先完成合格迁移",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "正式离群、唯一副本检查及数据迁移协议尚未实现；禁止以断网/删除成员替代安全退出。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T18",
+      "requirement": "网络断开后误切换为 STANDALONE；状态机拒绝，保留 ISOLATED",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T19",
+      "requirement": "断电/重启时日志截断与坏校验；检测损坏，阻止不确定配置激活",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "T20",
+      "requirement": "失效成员恢复带旧任务执行记录；经代际对账，不重复执行业务",
+      "clause": "主规范 §12",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-ABI-01",
+      "requirement": "16域各给一份golden特征/模型；解码动作与预期逐字节一致",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-AI-07",
+      "requirement": "16模块合法动作与非法动作；有效动作可观察改变执行参数，非法动作被拒绝",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
+      "code": [
+        "kernel/src/ai.rs",
+        "crates/ai-runtime/src/lib.rs",
+        "kernel/src/user/ai.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-CL-06",
+      "requirement": "A已CommitProof而B重启；两端恢复同一ClusterID或安全停顿，无双配置",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "已实现部分集群安全状态机；缺少原生网络、存储/密码/执行后端及两台原生客体对应故障注入证据。",
+      "code": [
+        "crates/kernel-core/src/cluster/membership.rs",
+        "crates/kernel-core/src/cluster/contracts.rs",
+        "crates/kernel-core/src/cluster/tasks.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-CORE-02",
+      "requirement": "4 vCPU AI决策1→2→1，注入IRQ阻止迁移；拒绝非法迁移且归属单调一致",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-FS-05",
+      "requirement": "逐日志记录与检查点故障注入；已ACK持久内容可恢复，未提交尾部不执行",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
+      "code": [
+        "kernel/src/storage.rs",
+        "crates/ai-fs/src/checkpoint.rs",
+        "crates/driver-virtio/src/snapshot.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-LOCK-03",
+      "requirement": "对象退出+IPI丢失+TLB回收交错；无释放后引用或过早物理页复用",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
+      "code": [
+        "crates/posix/src/vm.rs",
+        "kernel/src/shared_memory.rs",
+        "crates/arch-aarch64/src/mmu.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-REC-08",
+      "requirement": "CACP崩溃+内存压力+网络断链；最低本地服务持续，未授权跨节点写入被拒绝",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "V-TX-04",
+      "requirement": "策略发布后部分执行成功并崩溃；对账后资源账本无双授予",
+      "clause": "主规范 §12 .1 实施向量",
+      "status": "BLOCKED",
+      "gap": "库级逻辑与主机测试已有基础；独立原生控制服务、四核执行及该场景的镜像/模型/故障日志证据未绑定。",
+      "code": [
+        "crates/kernel-core/src/control_plane/manager.rs",
+        "crates/arch-aarch64/src/entry.S",
+        "kernel/src/user.rs"
+      ],
+      "evidence": null
+    }
+  ]
+}

@@ -749,3 +749,13 @@ fn restarted_controller_can_start_new_scale_sequence_but_old_epoch_cannot() {
         Ok(Receipt::Draining(_))
     ));
 }
+
+#[test]
+fn audit_stale_timestamp_cannot_suppress_fault_containment() {
+    let mut m = manager();
+    m.submit(id(10), 0, Request::Policy(plan()).encode(), 10)
+        .unwrap();
+    let _ = m.fault(0, 9);
+    assert!(!m.snapshot().permits(0, Plane::Control));
+    assert_ne!(m.snapshot().quarantined & 1, 0);
+}

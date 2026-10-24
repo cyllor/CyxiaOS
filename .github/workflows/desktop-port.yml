@@ -51,6 +51,10 @@ jobs:
         run: |
           set -o pipefail
           python3 -B -m unittest discover -s tests/host -v 2>&1 | tee "$RUNNER_TEMP/python-tests.log"
+      - name: Prototype catalogue integrity (not native runtime acceptance)
+        run: |
+          set -o pipefail
+          python3 -B tools/check_prototype_evidence.py --source-tree "$(git rev-parse HEAD^{tree})" | tee "$RUNNER_TEMP/prototype-catalogue.json"
       - name: Native connection registry unit tests
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
@@ -85,6 +89,7 @@ jobs:
             ${{ runner.temp }}/source-commit.txt
             ${{ runner.temp }}/source-sha256.txt
             ${{ runner.temp }}/python-tests.log
+            ${{ runner.temp }}/prototype-catalogue.json
             ${{ runner.temp }}/client-registry-tests.log
             ${{ runner.temp }}/rust-workspace-tests.log
             ${{ runner.temp }}/rust-large-memory-tests.log

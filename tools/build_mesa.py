@@ -279,7 +279,7 @@ def target_cxx(builder: Builder, package: dict, fetch: bool) -> dict:
                 record = desktop_ports.fetch(item, desktop_ports.DEFAULT_CACHE, offline_file=archive,
                                              max_bytes=item["source_max_bytes"])
             elif fetch:
-                record = desktop_ports.fetch(item, desktop_ports.DEFAULT_CACHE,
+                record = desktop_ports.fetch(item, desktop_ports.DEFAULT_CACHE, online=True,
                                              max_bytes=item["source_max_bytes"])
             else:
                 raise BuildError("Missing pinned C++ source: " + item["name"])

@@ -484,7 +484,10 @@ impl<const N: usize> Ownership<N> {
     /// Faults quarantine the whole physical group, never just one SMT sibling.
     pub fn fault(&mut self, cpu: usize, now: u64) -> Result<Ticket, Error> {
         self.check_cpu(cpu, self.online)?;
-        self.quarantine(self.groups[cpu], now)
+        // Containment is not a lease renewal or normal policy admission. A late
+        // fault report must never leave its CPU dispatchable. Preserve the last
+        // trusted time watermark; all normal transitions still reject rollback.
+        self.quarantine(self.groups[cpu], now.max(self.last_time))
     }
     pub fn expire(&mut self, now: u64) -> Result<Option<Ticket>, Error> {
         self.time(now)?;
