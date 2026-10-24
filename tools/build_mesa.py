@@ -131,47 +131,18 @@ def prepare_source(builder: Builder, package: dict, fetch: bool, resume: bool) -
 
 
 def download_mesa(package: dict) -> Path:
-    """Bounded HTTPS ranges, assembled only after the release SHA256 matches.
+    """Retry rate-limited exact ranges without relaxing the pinned release hash."""
+    from range_download import DownloadError, download_ranges
 
-    Four small requests avoid the archive server's slow long-stream transfers.
-    Neither a range nor an incomplete archive is accepted as a verified source.
-    """
-    size = package["source_bytes"]
-    if not 0 < size <= package["source_max_bytes"]:
-        raise BuildError("Invalid Mesa download size")
-    archive = WORK / "mesa-verified-download.tar.xz"
-    if archive.is_file() and archive.stat().st_size == size and digest(archive) == package["expected_sha256"]:
-        return archive
-    parts = WORK / "download-parts"
-    parts.mkdir(exist_ok=True)
-    chunk = 2 * 1024 * 1024
-
-    def acquire(start: int) -> Path:
-        end = min(start + chunk, size) - 1
-        path = parts / f"{start}-{end}.part"
-        if path.is_symlink():
-            raise BuildError("Refusing linked download part")
-        if path.is_file() and path.stat().st_size == end - start + 1:
-            return path
-        request = Request(package["source_url"], headers={"Range": f"bytes={start}-{end}",
-                                                         "User-Agent": "CyxiaOS-mesa-port/1"})
-        with build_opener(desktop_ports.HTTPSRedirects()).open(request, timeout=30) as response:
-            if response.status != 206 or response.headers.get("Content-Range") != f"bytes {start}-{end}/{size}":
-                raise BuildError("Mesa server did not honor the exact bounded byte range")
-            content = response.read(chunk + 1)
-        if len(content) != end - start + 1:
-            raise BuildError("Truncated or oversized Mesa range")
-        path.write_bytes(content)
-        return path
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        ordered = list(pool.map(acquire, range(0, size, chunk)))
-    with archive.open("wb") as output:
-        for path in ordered:
-            output.write(path.read_bytes())
-    if archive.stat().st_size != size or digest(archive) != package["expected_sha256"]:
-        raise BuildError("Mesa assembled archive differs from the official release SHA256")
-    return archive
+    try:
+        return download_ranges(
+            package["source_url"], WORK / "mesa-verified-download.tar.xz",
+            size=package["source_bytes"], sha256=package["expected_sha256"],
+            max_bytes=package["source_max_bytes"],
+            opener=build_opener(desktop_ports.HTTPSRedirects()),
+        )
+    except DownloadError as error:
+        raise BuildError(str(error)) from error
 
 
 def target_uapi(builder: Builder, package: dict, fetch: bool) -> dict:
@@ -220,7 +191,7 @@ def target_uapi(builder: Builder, package: dict, fetch: bool) -> dict:
     # Equivalent POSIX spellings change no header contents or export rules.
     export_script = WORK / "bin/uapi-headers-install.sh"
     export_script.write_text((source / "scripts/headers_install.sh").read_text()
-        .replace('/!p}\"', '/!p;}\"')
+        .replace('/!p}"', '/!p;}"')
         .replace('compiler(|_types)', 'compiler(_types)?'))
     for index, (header, item) in enumerate(lock["files"].items()):
         path = PurePosixPath(header)

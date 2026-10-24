@@ -10,16 +10,32 @@ class RunnerTests(unittest.TestCase):
 
 class CleanupTests(unittest.TestCase):
  def test_timeout_reaps_only_owned_qemu(self):
-  import subprocess,sys,tempfile
+  # Test the actual subprocess lifecycle, not availability of an emulator or
+  # support for a particular QEMU machine version. This helper never boots a guest.
+  import os,shlex,subprocess,sys,tempfile
   from pathlib import Path
+  from unittest.mock import patch
   from test_elf import fixture
   from tools.run_qemu import run
   with tempfile.TemporaryDirectory() as td:
    p=Path(td);elf=p/'silent.elf';elf.write_bytes(fixture())
-   other=subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'])
+   pidfile=p/'owned.pid'
+   helper=p/'no-qmp-helper'
+   program='import os,time; from pathlib import Path; Path('+repr(str(pidfile))+').write_text(str(os.getpid())); time.sleep(30)'
+   helper.write_text('#!/bin/sh\nexec '+shlex.quote(sys.executable)+' -c '+shlex.quote(program)+'\n')
+   helper.chmod(0o700)
+   other=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
    try:
-    r=run(elf,'boot-entry',p/'out',timeout=.2)
-    self.assertEqual(r['status'],'FAIL');self.assertIsNotNone(r['qemu_exit']);self.assertIsNone(other.poll())
+    with patch('tools.run_qemu.shutil.which',return_value=str(helper)):
+     r=run(elf,'boot-entry',p/'out',timeout=1)
+    self.assertEqual(r['status'],'FAIL')
+    self.assertIn('QMP startup',r.get('error',''))
+    self.assertIsNotNone(r['qemu_exit'])
+    self.assertLess(r['qemu_exit'],0)
+    owned=int(pidfile.read_text())
+    self.assertNotEqual(owned,other.pid)
+    with self.assertRaises(ProcessLookupError):os.kill(owned,0)
+    self.assertIsNone(other.poll())
    finally:other.terminate();other.wait(timeout=2)
 
 class FinalCaptureTests(unittest.TestCase):

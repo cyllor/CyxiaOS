@@ -1,0 +1,173 @@
+name: Native desktop build and guest gate
+
+on:
+  pull_request:
+    branches: [m1-kernel]
+    paths:
+      - '.github/workflows/desktop-native.yml'
+      - 'ports/libc/build-tools.lock'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust targets and native build prerequisites
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --component rustfmt --component clippy --target aarch64-unknown-none-softfloat --target aarch64-unknown-linux-musl
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make cmake pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv autoconf automake libtool gettext texinfo bison flex
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          rustc -vV > "$RUNNER_TEMP/native-evidence/rust-version.txt"
+          dpkg-query -W > "$RUNNER_TEMP/native-evidence/host-packages.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-evidence/source-commit.txt"
+      - name: Package explicit compiler allowlist for offline reproduction
+        run: |
+          tar -C "$HOME" -czf "$RUNNER_TEMP/cyxia-rust-1.95.0.tar.gz" .cargo/bin/rustup .rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu
+          sha256sum "$RUNNER_TEMP/cyxia-rust-1.95.0.tar.gz" > "$RUNNER_TEMP/native-evidence/rust-archive.sha256"
+      - name: Retain offline cross-compiler
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cyxia-rust-1.95.0-linux
+          retention-days: 7
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/cyxia-rust-1.95.0.tar.gz
+            ${{ runner.temp }}/native-evidence/rust-archive.sha256
+      - name: Restore previously verified emulator when available
+        id: qemu-restore
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          merge-multiple: true
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Verify and unpack cached emulator
+        if: steps.qemu-restore.outcome == 'success'
+        run: |
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          cp "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" "$RUNNER_TEMP/"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-evidence/qemu-version.txt"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" > "$RUNNER_TEMP/native-evidence/qemu-archive.sha256"
+      - name: Build exact QEMU 10.2.2 with native scanout support
+        if: steps.qemu-restore.outcome != 'success'
+        run: |
+          set -o pipefail
+          git clone --depth=1 --branch v10.2.2 --single-branch https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          mkdir "$RUNNER_TEMP/qemu-build"
+          cd "$RUNNER_TEMP/qemu-build"
+          "$RUNNER_TEMP/qemu-source/configure" --prefix="$RUNNER_TEMP/qemu-tools" --target-list=aarch64-softmmu --without-default-features --enable-tcg --enable-pixman --enable-fdt --disable-docs --disable-werror 2>&1 | tee "$RUNNER_TEMP/native-evidence/qemu-configure.log"
+          make -j4 2>&1 | tee "$RUNNER_TEMP/native-evidence/qemu-build.log"
+          make install
+          mkdir -p "$RUNNER_TEMP/qemu-tools/lib"
+          cp -L /usr/lib/x86_64-linux-gnu/libfdt.so.1 "$RUNNER_TEMP/qemu-tools/lib/"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-evidence/qemu-version.txt"
+          ldd "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" > "$RUNNER_TEMP/native-evidence/qemu-libraries.txt"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" qemu-tools
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2.tar.gz" > "$RUNNER_TEMP/native-evidence/qemu-archive.sha256"
+      - name: Retain exact emulator
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cyxia-qemu-10.2.2-linux
+          retention-days: 7
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/cyxia-qemu-10.2.2.tar.gz
+            ${{ runner.temp }}/native-evidence/qemu-archive.sha256
+      - name: Check native toolchain and prepare hash-locked build tools
+        run: |
+          set -o pipefail
+          python3 tools/doctor.py | tee "$RUNNER_TEMP/native-evidence/doctor.json"
+          python3 -m venv artifacts/sysroot/build-tools
+          artifacts/sysroot/build-tools/bin/python -m pip install --require-hashes --only-binary=:all: -r ports/libc/build-tools.lock
+      - name: Build target libc and X11 dependencies
+        run: |
+          set -o pipefail
+          python3 tools/build_sysroot.py build --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/sysroot.log"
+          python3 tools/build_sysroot.py xorg-bootstrap --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/xorg-foundation.log"
+          python3 tools/build_sysroot.py server-bootstrap --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/xorg-server.log"
+      - name: Build native Wayland and keyboard target libraries
+        run: |
+          set -o pipefail
+          python3 tools/build_openbox.py foundation --only libffi --fetch 2>&1 | tee "$RUNNER_TEMP/native-evidence/libffi.log"
+          python3 tools/build_wayland.py build --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/wayland.log"
+          python3 tools/build_xkbcommon.py build --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/xkbcommon.log"
+      - name: Build genuine Mesa static software renderer
+        run: |
+          set -o pipefail
+          python3 tools/build_mesa.py build --fetch --jobs 4 2>&1 | tee "$RUNNER_TEMP/native-evidence/mesa.log"
+      - name: Resolve pinned compositor lock and independent client protocol
+        run: |
+          set -o pipefail
+          python3 tools/cosmic_ports.py fetch --component cosmic-comp 2>&1 | tee "$RUNNER_TEMP/native-evidence/cosmic-source.log"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, urllib.request
+          root = pathlib.Path.cwd()
+          spec = json.loads((root/'ports/cosmic/smithay-dynamic-client-source.json').read_text())['crate']
+          target = root/'artifacts/smithay-wayland-research/wayland-protocols-0.32.13.crate'
+          target.parent.mkdir(parents=True, exist_ok=True)
+          with urllib.request.urlopen(spec['url'], timeout=30) as response:
+              data = response.read(spec['bytes'] + 1)
+          if len(data) != spec['bytes'] or hashlib.sha256(data).hexdigest() != spec['sha256']:
+              raise SystemExit('Protocol archive integrity failure')
+          with target.open('xb') as stream:
+              stream.write(data)
+          PY
+      - name: Build and execute the actual native guest acceptance
+        run: |
+          set -o pipefail
+          python3 tools/port_smithay_dynamic.py --output artifacts/native-wayland-ci --cache artifacts/native-wayland-cache --mesa-report artifacts/sysroot/aarch64-musl/mesa-port/latest-report.json --protocol-crate artifacts/smithay-wayland-research/wayland-protocols-0.32.13.crate --fetch --iterations 3 2>&1 | tee "$RUNNER_TEMP/native-evidence/guest-pipeline.log"
+      - name: Package reproducible target SDK and failure evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, tarfile
+          root = pathlib.Path.cwd()
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])
+          # Exact generated directories only, never credentials or the runner home.
+          names = ['artifacts/sysroot', 'artifacts/desktop-sources', 'artifacts/cosmic-sources', 'artifacts/native-wayland-cache', 'artifacts/native-wayland-ci', 'artifacts/smithay-wayland-research']
+          def allowed(info):
+              if pathlib.PurePosixPath(info.name).suffix.lower() in {'.ttf','.otf','.woff','.woff2','.ttc'}:
+                  return None
+              return info
+          with tarfile.open(out/'cyxia-native-sdk.tar.gz', 'w:gz', compresslevel=1) as archive:
+              for name in names:
+                  if (root/name).exists():
+                      archive.add(root/name, arcname=name, filter=allowed)
+          h=hashlib.sha256()
+          with (out/'cyxia-native-sdk.tar.gz').open('rb') as source:
+              for block in iter(lambda: source.read(1024*1024), b''): h.update(block)
+          (out/'native-evidence/sdk-archive.json').write_text(json.dumps({'sha256':h.hexdigest(),'original_root':str(root),'scope':'build outputs and logs, not a desktop completion claim'},indent=2))
+          PY
+      - name: Retain target artifacts and raw evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cyxia-native-sdk-and-evidence
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/cyxia-native-sdk.tar.gz
+            ${{ runner.temp }}/native-evidence/
+      - name: Record unambiguous scope
+        if: always()
+        run: echo 'Only an actual passing guest receipt certifies the dynamic Wayland work package. This workflow does not certify cosmic-comp or a complete COSMIC session.' >> "$GITHUB_STEP_SUMMARY"

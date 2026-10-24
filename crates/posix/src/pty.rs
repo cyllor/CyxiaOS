@@ -289,8 +289,10 @@ impl Pty {
             if self.line_len != 0 {
                 let n = if echo && t.local & ECHOE != 0 {
                     3
+                } else if echo {
+                    self.output_size(byte)
                 } else {
-                    usize::from(echo)
+                    0
                 };
                 if self.output.free() < n {
                     return Err(Errno::Again);
@@ -309,7 +311,19 @@ impl Pty {
             return Ok(());
         }
         if t.cc[3] != 0 && byte == t.cc[3] {
-            if echo && self.output.free() < 3 {
+            // Reserve the fully transformed echo before mutating the line.
+            // A newline kill character plus ECHOK can emit four bytes.
+            let echo_len = if echo {
+                self.output_size(byte)
+                    + if t.local & ECHOK != 0 {
+                        self.output_size(b'\n')
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            };
+            if self.output.free() < echo_len {
                 return Err(Errno::Again);
             }
             self.line.fill(0);
