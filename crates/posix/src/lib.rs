@@ -540,6 +540,18 @@ impl<'a> Process<'a> {
     pub fn flags(&self, fd: i32) -> Result<u32, Errno> {
         Ok(self.objects.get(self.description(fd)?)?.flags)
     }
+    /// FIONBIO for the supported socket personality. File status belongs to
+    /// the shared open description; per-descriptor close-on-exec is untouched.
+    pub fn set_socket_nonblocking(&mut self, fd: i32, value: i32) -> Result<(), Errno> {
+        if self.socket(fd)?.is_none() {
+            return Err(Errno::Notty);
+        }
+        let flags = self.flags(fd)?;
+        self.set_flags(
+            fd,
+            if value == 0 { flags & !O_NONBLOCK } else { flags | O_NONBLOCK },
+        )
+    }
     pub fn set_flags(&mut self, fd: i32, flags: u32) -> Result<(), Errno> {
         // Access/open-time bits are ignored, never permissions upgrades or
         // a second create/truncate. Accept the immutable bits returned by GETFL.

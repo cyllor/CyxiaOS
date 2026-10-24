@@ -9,6 +9,7 @@ use core::{
 pub mod block;
 pub mod gpu;
 pub mod input_buffer;
+pub mod net;
 pub mod rng;
 pub mod snapshot;
 
@@ -303,6 +304,13 @@ impl Queue {
         if index == self.used {
             return Ok(None);
         }
+        // Acquire the published used index before reading the used element.
+        // A pre-index cache invalidation can race the device's final writes.
+        platform.barrier();
+        unsafe {
+            platform.sync(m.used.address(), 4096);
+        }
+        platform.barrier();
         let at = 4 + usize::from(self.used % 8) * 8;
         let length = m.used.get32(at + 4);
         if index.wrapping_sub(self.used) != 1 || m.used.get32(at) != 0 || length > self.writable {
@@ -412,6 +420,12 @@ impl EventQueue {
         if end == q.used {
             return Ok(None);
         }
+        // As above, invalidate elements again after acquiring the device's index.
+        platform.barrier();
+        unsafe {
+            platform.sync(q.memory.used.address(), 4096);
+        }
+        platform.barrier();
         // Snapshot the entire currently completed batch before re-posting any
         // ID. Otherwise a duplicate used ID could be mistaken for a fresh event.
         let count = end.wrapping_sub(q.used) as usize;
@@ -510,6 +524,49 @@ mod tests {
         assert_eq!(q.poll(&mut t, &mut output, &Host), Ok(Some(4)));
         assert_eq!(&output[..4], &0x12345678u32.to_le_bytes());
         assert_eq!(q.poll(&mut t, &mut output, &Host), Ok(None));
+    }
+    #[test]
+    fn completion_metadata_is_resynchronized_after_index_acquire() {
+        use core::cell::Cell;
+        struct Cached {
+            used: usize,
+            synchronizations: Cell<usize>,
+        }
+        // SAFETY: synchronous single-threaded emulation of pinned queue memory.
+        unsafe impl Platform for Cached {
+            fn physical(&self, p: usize, _: usize) -> Result<u64, Error> {
+                Ok(p as u64)
+            }
+            unsafe fn sync(&self, p: usize, _: usize) {
+                if p == self.used {
+                    let count = self.synchronizations.get() + 1;
+                    self.synchronizations.set(count);
+                    if count == 2 {
+                        // Device metadata becomes visible only on post-index sync.
+                        unsafe {
+                            core::ptr::write_volatile((p + 8) as *mut u32, 4_u32.to_le());
+                        }
+                    }
+                }
+            }
+            fn barrier(&self) {}
+            fn now_ms(&self) -> u64 {
+                0
+            }
+        }
+        let (mut t, mut q) = fixture();
+        q.submit(&mut t, b"request", 8, &Host).unwrap();
+        q.memory.response.put32(0, 0x12345678);
+        q.memory.used.put32(8, 999); // stale cache line before index publication
+        q.memory.used.put16(2, 1);
+        let host = Cached {
+            used: q.memory.used.address(),
+            synchronizations: Cell::new(0),
+        };
+        let mut output = [0; 8];
+        assert_eq!(q.poll(&mut t, &mut output, &host), Ok(Some(4)));
+        assert_eq!(&output[..4], &0x12345678_u32.to_le_bytes());
+        assert_eq!(host.synchronizations.get(), 2);
     }
     #[test]
     fn invalid_used_length_quarantines_queue() {

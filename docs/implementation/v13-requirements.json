@@ -1,0 +1,472 @@
+{
+  "schema_version": 1,
+  "spec": {
+    "path": "CyxiaOS_Minimal_Prototype_Design_Final.docx",
+    "version": "1.3",
+    "sha256": "01f8c315018d8117c0b43671add6527fe76d0b83caabe865b5d714a99fa135a0"
+  },
+  "deviations": [
+    {
+      "id": "LANG-RUST",
+      "clause": "1.2",
+      "authorized": true,
+      "decision": "User approved Rust plus AArch64 assembly on 2026-10-24. The original C11 deviation is retained as decision history; the 2026-10-24 1.3 Rust revision incorporates this language choice."
+    }
+  ],
+  "cases": [
+    {
+      "id": "A01",
+      "scenario": "冷启动、模型自检失败及 BootEpoch 分配/FLUSH 失败",
+      "required_outcome": "4 vCPU 与 EL0/EL1 正确建立；新 BootEpoch 持久后才产生新 AI 决策键。自检或 epoch 分配失败保留 SAFE_EXEC，不开放新 AI 发布或集群授权，不依赖云端模型。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A02",
+      "scenario": "普通业务试图绑定控制核",
+      "required_outcome": "准入被拒绝；完整调度轨迹中无业务执行于 C/T/Q。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A03",
+      "scenario": "控制负载先升后降",
+      "required_outcome": "模型选出的集合完成 1→2→1；动作与实际核心所有权线性化对应。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A04",
+      "scenario": "在 DRAIN/QUIESCED/PUBLISH 注入故障并交错 IRQ/DMA 路由",
+      "required_outcome": "代际变化拒绝/对账，无双重归属；无 ACK 保留原 C/B 并置 suspect，不假装停止、不计新容量。仅可靠停止证据可转 Q；相关页/义务保持，普通 IRQ 不被新派发到 C/T/Q、suspect 或 draining 核。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A05",
+      "scenario": "16域18动作族各至少两组可区分负载",
+      "required_outcome": "每个动作族至少两个不同合法选择，完整输入/候选/运行时输出、批准版本和执行器回执可关联；对应实际行为差异，缺链或仅有提案不算AI生效。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A06",
+      "scenario": "对象并发撤销、FP/SIMD 抢占与旧 APPLY 延迟",
+      "required_outcome": "任务/能力旧代际拒绝；TLB 未确认页不重用，锁内不等待外部事件；跨任务寄存器图样、FPCR/FPSR 正确保留且无泄漏。新 desired 生效前尚未开始的旧动作不得覆盖；已开始操作与新版本串行并各自回执，未涉及对象配置及租期不被其他域发布改写。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A07",
+      "scenario": "畸形 ABI、伪调用者、旧候选/根/模型代际、重复键与超容量",
+      "required_outcome": "精确校验 64/144 字节头、6464 字节上限、索引、长度、摘要与代际；非法新提交无资源变化。已受理键在期限过后或模型/根更新后返回原状态；同键异摘要冲突，淘汰旧键不重做。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A08",
+      "scenario": "同种子、同初态的基线/Active配对回放",
+      "required_outcome": "按第6.3及8章固定工作单元、10 s观测窗和惩罚延迟保存原始计数；trial关联首次动作及全部合法同值续期，不重复造标签。全部域报告真实延迟、拒绝/超时、完整策略链路及所控执行器CPU、内存和负结果；核对D13 OPTIONAL去重、原始U/C_raw与clip后的C及1.3奖励版本。配对条件破坏的窗留完整原因后重放。首次动作及有界收尾CPU不得漏计；同吞吐/延迟且C_raw<1时，增加执行CPU必须降低R。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A09",
+      "scenario": "匿名哨兵+页缓存压力",
+      "required_outcome": "地址空间隔离、清零、权限与所有权正确；无交换时匿名内容不丢失。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A10",
+      "scenario": "redo/COMMIT/超级块每个边界断电",
+      "required_outcome": "已成功 fsync 的序号恢复；未确认事务只按完整提交链决定；同一 home 块多次提交并乱序完成设备请求后仍保留最高 COMMIT LSN 版本；持久 ACK 后跨端点读取及驱逐缓存再读可见，重放中再次断电仍能恢复。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A11",
+      "scenario": "满内存、普通完成槽/消费者阻塞、维护份额已借出并同时模型停机",
+      "required_outcome": "新普通请求在副作用前背压，reserved+inflight+queued≤capacity 且完成事实不丢；恢复槽独立可用，必要维护就绪后按优先级收回借用时间，记录 100 ms 窗口实际计费。超额明确退化，无循环等待或重复记账。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A12",
+      "scenario": "两个原生节点独立开机",
+      "required_outcome": "受控发现、认证、同一配置证明与原生任务准入成功。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A13",
+      "scenario": "远程纯计算任务与回复丢失",
+      "required_outcome": "同合同不同 TaskID/attempt 至多一个绑定，同键不重复启动；在 STARTED 意图落盘前后与实际投递临界区注入 CLOSE、到期、失联或会话代际变化，关闭的启动门不放行，CANCELLED 必须有未投递证据，容量不提前释放；持久结果可查询。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A14",
+      "scenario": "断开集群链路",
+      "required_outcome": "本地任务继续，旧成员身份保留；记录断链、检测、受理与提交时刻，ISOLATED 线性化之后拒绝新远程准入，此前 GRANT_PENDING 按持久事实收敛，未开始任务仍受最终启动门限制。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A15",
+      "scenario": "推理超时、候选越权、控制队列满，扩核后杀死 CACP",
+      "required_outcome": "无热路径等待模型；受理截止不取消在途操作，参数在快照时刻+10000 ms 到期并按当前硬约束回退。IRQ 基线只选健康且非 draining 的 B_h；安全执行和控制恢复资源不被耗尽。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "A16",
+      "scenario": "本地训练、Shadow/Canary及模型切换/回退",
+      "required_outcome": "重现1.3版本144/72分组数据、合法种子及“梯度裁剪→同时更新→逐步参数投影”，越界种子不改Active；固定学习边界、完整量化MLP的MSE及参数hash绑定精确黄金向量通过。Shadow无副作用；Canary越额/越权、零执行、UNKNOWN不得晋升，退出撤许可并恢复合法基线；合格APPLIED后hash改变。切换与PUBLISH交错及A→B→A时旧代际提案拒绝，已发布义务按原证据收尾。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T01",
+      "scenario": "正常协商、签名与证明传播",
+      "required_outcome": "两端最终拥有相同 Config/ClusterID；没有要求同时瞬时进入 BOUND。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T02",
+      "scenario": "伪发现、旧 nonce、旧 TLS 会话",
+      "required_outcome": "旧 nonce、取消协商证明、已消费 counter、已退出 CommitProof 和旧 TLS 会话均不能恢复成员身份、授予资源或重放新任务。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T03",
+      "scenario": "四轮报价仍不能接受",
+      "required_outcome": "CONFIRMED 前有界退出；不假造双方同意。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T04",
+      "scenario": "一端未签确认即断电",
+      "required_outcome": "对端不能制造双签证明。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T05",
+      "scenario": "一端已 CONFIRMED 后失联",
+      "required_outcome": "保持配置锁，安全阻塞；不单方改签。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T06",
+      "scenario": "CommitProof/READY 消息丢失",
+      "required_outcome": "证明重传幂等；双方对账后主动发送 READY，不因互等而停住；只有本端已发送且收到当前会话的有效伙伴 READY 后开放准入，READY 本身不充当资源权。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T07",
+      "scenario": "1+1 网络分区",
+      "required_outcome": "检测延迟内已受理请求按原状态机提交或对账，不重复授予；本端进入ISOLATED后拒绝新PREPARE/COMMIT/ACTIVATE，本地业务与允许的历史收尾继续。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T08",
+      "scenario": "旧会话头、旧授予新执行及历史查询",
+      "required_outcome": "旧会话头以及用旧 boot/grant 启动或增额的请求被最终所有者拒绝；PREPARE 不要求尚未产生的 grant_epoch。当前认证会话中的历史 STATUS/RESULT/ACK_RESULT/CLOSE 按访问权处理，不因历史查询键的旧代际本身拒绝，也不能恢复执行权。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T09",
+      "scenario": "报价后资源被本地占用",
+      "required_outcome": "PREPARE 重新准入，拒绝超额。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T10",
+      "scenario": "并行 COMMIT 与预留到期",
+      "required_outcome": "单一账本裁决；持久提交不被超时线程误释放。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T11",
+      "scenario": "DONE 持久但结果 ACK 丢失",
+      "required_outcome": "查询返回原结果，无第二次同键执行；合同释放及两端重启后仍能按历史键查询。请求方持久接收、发送 ACK、所有者持久 ACK 及回收正文各边界断电时，DONE 正文至少由一方持久保有；无正文的失败终态及摘要同样可恢复。重复同摘要 ACK 幂等，不同摘要 ACK 拒绝。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T12",
+      "scenario": "提交带机器人/设备副作用权限任务",
+      "required_outcome": "在启动前 E_UNSUPPORTED，无物理执行。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T13",
+      "scenario": "错误 ISA/ABI/包 hash",
+      "required_outcome": "启动前拒绝，不收取执行容量。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T14",
+      "scenario": "AI 协商超预算或越权报价",
+      "required_outcome": "有界拒绝；没有新成员签名或非法合同。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T15",
+      "scenario": "核心扩容与远程合同并发",
+      "required_outcome": "容量、core_gen、ledger_gen 一致校验，无重复承诺。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T16",
+      "scenario": "节点重启且存在 GRANTED",
+      "required_outcome": "旧会话失效，承诺进入对账；不重新解释旧绝对期限。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T17",
+      "scenario": "离群仍有任务或未领取必要结果",
+      "required_outcome": "签名前先持久 LEAVING 并关闭新准入；有在途任务、未释放合同或未 ACK 结果时保持 LEAVING，但历史 RESULT/ACK_RESULT 可推进。全部条件满足后，同一 leave_id 双签并本地持久即允许退出；单签重启仍拒绝新授权，退出后重放旧 CommitProof 不能重新绑定。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T18",
+      "scenario": "失联后请求自动变单机",
+      "required_outcome": "状态机拒绝清除 BOUND/CONFIRMED 历史。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T19",
+      "scenario": "成员/合同文件日志损坏或截断",
+      "required_outcome": "不能据不完整证据恢复授权；只读/隔离。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "T20",
+      "scenario": "任务 STARTED 后崩溃、去重表满",
+      "required_outcome": "无完整终态时所有者持久标为LOST并收尾，请求者未获证据记UNKNOWN；表满拒绝新任务，不删除未关闭键。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E01",
+      "scenario": "同域两个不同目标均generation1",
+      "required_outcome": "不同action_index/target_id分别产生回执，不互相去重。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E02",
+      "scenario": "同一CPU亲和的两个线程各600milli",
+      "required_outcome": "即使其他CPU空闲也拒绝不可放置的总预算；迁移过程无重复执行。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E03",
+      "scenario": "DRAIN期间新IRQ/DMA/任务指向源核",
+      "required_outcome": "全部受同一draining门控与core/ledger代际保护。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E04",
+      "scenario": "普通完成credit全满并集中完成",
+      "required_outcome": "终态不丢，未受理请求无副作用，恢复credit仍可推进。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E05",
+      "scenario": "请求解析/阻塞期间修改或unmap用户缓冲",
+      "required_outcome": "只使用受保护副本，无越权；输出失败可查询原副作用。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E06",
+      "scenario": "伪造report_result与旧执行器代际",
+      "required_outcome": "拒绝伪回执，不开放依赖准入或释放资源。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E07",
+      "scenario": "提案受理≤100ms、CoreSet受理后200ms、参数快照时刻+10000ms分别到期",
+      "required_outcome": "只触发相应状态转换；续期不重置最短保持。根发布时余期9.9–10s，执行器采用时沿用原到期点；均不清空合同或在途义务。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E08",
+      "scenario": "发布/读侧抢占/迁核/中断交错",
+      "required_outcome": "无悬空指针、锁反入与过时代际执行。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E09",
+      "scenario": "同合同两个 TaskKey 并发 ACTIVATE，同时 CLOSE、到期或 ISOLATED",
+      "required_outcome": "最多绑定一次；START_PENDING、FLUSH、最终门校验与实际投递各边界无释放后启动；缺少确定未投递证据不能伪造 CANCELLED 并释放。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E10",
+      "scenario": "DONE应答丢失后目标重启",
+      "required_outcome": "新会话能查旧结果并ACK；旧ACTIVATE仍拒绝。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E11",
+      "scenario": "结果/墓碑临满，反复COMMIT后不激活即CLOSE",
+      "required_outcome": "已承诺终态有预算；4096合同额度不被未激活合同绕过。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E12",
+      "scenario": "旧PROOF/READY重放，counter复用与溢出",
+      "required_outcome": "成员状态不回退，旧配置不复活；溢出安全拒绝。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E13",
+      "scenario": "IRQ移核后原核转C再到期；OPTIONAL已有200milli承诺再到期",
+      "required_outcome": "SAFE_EXEC重验当前硬约束，不回旧控制核、不压低承诺、不凭空扩缓存。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E14",
+      "scenario": "学习/Shadow/Canary与控制高负载并发",
+      "required_outcome": "控制模型全部角色仅在C运行；低优先级工作不侵占61ms必需集合和70ms总上限。",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "E15",
+      "scenario": "检查点后空日志重启；线程槽被本地创建竞争",
+      "required_outcome": "事务完整键不复用；已PREPARE的线程/子账/终态额度不被竞争者夺走。",
+      "status": "NOT_RUN",
+      "evidence": null
+    }
+  ],
+  "action_families": [
+    {
+      "id": "D01_WEIGHT",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D01_CORESET",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D02",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D03",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D04",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D05",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D06",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D07",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D08",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D09",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D10",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D11",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D12",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D13",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D14",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D15",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D16_QUOTE",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "id": "D16_PLACE",
+      "status": "NOT_RUN",
+      "evidence": null
+    }
+  ],
+  "filesystem_fault_matrix": {
+    "frozen": false,
+    "evidence": null,
+    "reason": "Native redo format, independent image checker and enumerated write/FLUSH fault matrix are not implemented."
+  }
+}

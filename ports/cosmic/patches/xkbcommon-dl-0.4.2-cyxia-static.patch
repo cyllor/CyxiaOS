@@ -1,0 +1,48 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,7 @@
+ version = "0.2.0"
+ 
+ [features]
++static-link = []
+ x11 = []
+ 
+ [badges]
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,7 +11,35 @@
+ use std::os::raw::{c_char, c_int, c_uint, c_void};
+ 
+ use bitflags::bitflags;
++#[cfg(not(feature = "static-link"))]
+ use dlib::dlopen_external_library;
++
++// Keep the public function-table API while binding to real target libraries.
++// Unresolved entry points are link errors, not successful loader substitutes.
++#[cfg(feature = "static-link")]
++macro_rules! dlopen_external_library {
++    ($name:ident, functions: $(fn $function:ident($($argument:ty),*) -> $result:ty,)+) => {
++        pub struct $name {
++            $(pub $function: unsafe extern "C" fn($($argument),*) -> $result,)+
++        }
++        impl $name {
++            pub unsafe fn open(_name: &str) -> Result<Self, dlib::DlError> {
++                extern "C" {
++                    $(fn $function($(_: $argument),*) -> $result;)+
++                }
++                Ok(Self { $($function,)+ })
++            }
++        }
++    };
++}
++
++#[cfg(feature = "static-link")]
++#[link(name = "xkbcommon", kind = "static")]
++extern "C" {}
++#[cfg(all(feature = "static-link", feature = "x11"))]
++#[link(name = "xkbcommon-x11", kind = "static")]
++extern "C" {}
++
+ use log::info;
+ use once_cell::sync::OnceCell;
+ 

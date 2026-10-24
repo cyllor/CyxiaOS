@@ -1,0 +1,69 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,6 +39,8 @@
+ all-features = true
+ 
+ [features]
++# Explicit static target binding takes precedence over transitive dl-libxcb.
++cyxia-static = ["allow-unsafe-code"]
+ all-extensions = [
+     "x11rb-protocol/all-extensions",
+     "composite",
+--- a/src/xcb_ffi/mod.rs
++++ b/src/xcb_ffi/mod.rs
+@@ -30,7 +30,7 @@
+ mod raw_ffi;
+ 
+ use atomic_u64::AtomicU64;
+-#[cfg(all(not(test), feature = "dl-libxcb"))]
++#[cfg(all(not(test), all(feature = "dl-libxcb", not(feature = "cyxia-static"))))]
+ pub use raw_ffi::libxcb_library::load_libxcb;
+ 
+ type Buffer = <XCBConnection as RequestConnection>::Buf;
+--- a/src/xcb_ffi/raw_ffi/ffi.rs
++++ b/src/xcb_ffi/raw_ffi/ffi.rs
+@@ -12,7 +12,7 @@
+     xcb_generic_event_t, xcb_protocol_request_t, xcb_setup_t, xcb_void_cookie_t,
+ };
+ 
+-#[cfg(feature = "dl-libxcb")]
++#[cfg(all(feature = "dl-libxcb", not(feature = "cyxia-static")))]
+ pub(crate) mod libxcb_library {
+     use super::LibxcbFuncs;
+     use crate::errors::LibxcbLoadError;
+@@ -102,7 +102,7 @@
+             fn $fn_name:ident($($fn_arg_name:ident: $fn_arg_type:ty),*) $(-> $fn_ret_ty:ty)?;
+         )*
+     } => {
+-        #[cfg(not(feature = "dl-libxcb"))]
++        #[cfg(not(all(feature = "dl-libxcb", not(feature = "cyxia-static"))))]
+         #[link(name = "xcb")]
+         extern "C" {
+             $(
+@@ -111,7 +111,7 @@
+             )*
+         }
+ 
+-        #[cfg(feature = "dl-libxcb")]
++        #[cfg(all(feature = "dl-libxcb", not(feature = "cyxia-static")))]
+         struct LibxcbFuncs {
+             $(
+                 $(#[$fn_attr])*
+@@ -119,7 +119,7 @@
+             )*
+         }
+ 
+-        #[cfg(feature = "dl-libxcb")]
++        #[cfg(all(feature = "dl-libxcb", not(feature = "cyxia-static")))]
+         impl LibxcbFuncs {
+             unsafe fn new(library: &libloading::Library) -> Result<Self, (&'static [u8], libloading::Error)> {
+                 Ok(Self {
+@@ -132,7 +132,7 @@
+         }
+ 
+         $(
+-            #[cfg(feature = "dl-libxcb")]
++            #[cfg(all(feature = "dl-libxcb", not(feature = "cyxia-static")))]
+             $(#[$fn_attr])*
+             pub(crate) unsafe fn $fn_name($($fn_arg_name: $fn_arg_type),*) $(-> $fn_ret_ty)? {
+                 (libxcb_library::get_libxcb().funcs.$fn_name)($($fn_arg_name),*)

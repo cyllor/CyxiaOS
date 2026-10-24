@@ -110,6 +110,134 @@ fn main() {
             .unwrap();
         std::fs::write(out.join("control-mode.rs"), mode.to_string()).unwrap();
     }
+    if env::var_os("CARGO_FEATURE_MODEL_V13_SELFTEST").is_some() {
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+        for path in [
+            "user/prototype-control",
+            "crates/prototype/src/model.rs",
+            "ports/prototype",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+        checked(
+            Command::new(env::var("RUSTC").unwrap())
+                .arg(root.join("user/prototype-control/main.rs"))
+                .args([
+                    "--edition=2024",
+                    "--target",
+                    "aarch64-unknown-none-softfloat",
+                    "--crate-name",
+                    "cyxia_prototype_control",
+                    "-C",
+                    "opt-level=2",
+                    "-C",
+                    "strip=debuginfo",
+                    "-C",
+                    "panic=abort",
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "overflow-checks=yes",
+                    "-C",
+                    "link-arg=--build-id=none",
+                    "-C",
+                    "link-arg=-zmax-page-size=4096",
+                    "-A",
+                    "dead_code",
+                ])
+                .arg("-C")
+                .arg(format!(
+                    "link-arg=-T{}",
+                    root.join("user/prototype-control/linker.ld").display()
+                ))
+                .arg("-o")
+                .arg(out.join("prototype-control.elf")),
+        );
+    }
+    if env::var_os("CARGO_FEATURE_PROTOTYPE_RUNTIME").is_some() {
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+        for path in [
+            "user/prototype-runtime",
+            "crates/prototype/src/model.rs",
+            "ports/prototype",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+        println!("cargo:rerun-if-env-changed=CYXIA_RUNTIME_FAULT");
+        let fault = env::var("CYXIA_RUNTIME_FAULT").unwrap_or_else(|_| "none".into());
+        assert!(
+            ["none", "hang-once", "no-stop-ack"].contains(&fault.as_str()),
+            "invalid runtime fault"
+        );
+        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+        std::fs::write(
+            out.join("runtime-fault.rs"),
+            match fault.as_str() { "hang-once" => "1", "no-stop-ack" => "2", _ => "0" },
+        )
+        .unwrap();
+        checked(
+            Command::new(env::var("RUSTC").unwrap())
+                .arg(root.join("user/prototype-runtime/main.rs"))
+                .args([
+                    "--edition=2024",
+                    "--target",
+                    "aarch64-unknown-none-softfloat",
+                    "--crate-name",
+                    "cyxia_prototype_runtime",
+                    "-C",
+                    "opt-level=2",
+                    "-C",
+                    "strip=debuginfo",
+                    "-C",
+                    "panic=abort",
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "overflow-checks=yes",
+                    "-C",
+                    "link-arg=--build-id=none",
+                    "-C",
+                    "link-arg=-zmax-page-size=4096",
+                    "-A",
+                    "dead_code",
+                ])
+                .arg("-C")
+                .arg(format!(
+                    "link-arg=-T{}",
+                    root.join("user/prototype-runtime/linker.ld").display()
+                ))
+                .arg("-o")
+                .arg(out.join("prototype-runtime.elf")),
+        );
+    }
+    if env::var_os("CARGO_FEATURE_UNIFIED_RUNTIME").is_some() {
+        println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_SERVICE_ELF");
+        println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
+        println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");
+        let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+        println!("cargo:rerun-if-changed={}", root.join("user/prototype-task").display());
+        checked(Command::new(env::var("RUSTC").unwrap())
+            .arg(root.join("user/prototype-task/main.rs"))
+            .args(["--edition=2024", "--target", "aarch64-unknown-none-softfloat", "--crate-name", "cyxia_prototype_task",
+                "-C", "opt-level=2", "-C", "panic=abort", "-C", "relocation-model=static", "-C", "link-arg=--build-id=none", "-C", "link-arg=-zmax-page-size=4096"])
+            .arg("-C").arg(format!("link-arg=-T{}",root.join("user/prototype-task/linker.ld").display()))
+            .arg("-o").arg(out.join("prototype-task.elf")));
+        let service = PathBuf::from(env::var("CYXIA_CLUSTER_SERVICE_ELF").expect("build the per-node EL0 cluster service first"));
+        let identity = PathBuf::from(env::var("CYXIA_CLUSTER_IDENTITY").expect("per-node provisioned identity directory"));
+        println!("cargo:rerun-if-changed={}", service.display());
+        std::fs::copy(service, out.join("cluster-service.elf")).unwrap();
+        for name in ["local.pin", "peer.pin"] {
+            let source = identity.join(name);
+            println!("cargo:rerun-if-changed={}", source.display());
+            let bytes = std::fs::read(source).unwrap();
+            assert_eq!(bytes.len(), 32, "NodeID must be SHA256 of raw Ed25519 public key");
+            std::fs::write(out.join(format!("{name}32")), bytes).unwrap();
+        }
+        let unix = env::var("CYXIA_CLUSTER_UNIX_SECONDS").unwrap_or_else(|_| "1792800000".into()).parse::<u64>().expect("provisioned clock epoch");
+        std::fs::write(out.join("cluster-unix.rs"), unix.to_string()).unwrap();
+    }
     if env::var_os("CARGO_FEATURE_SELFTEST").is_some() {
         return;
     }

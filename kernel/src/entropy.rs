@@ -82,3 +82,35 @@ pub fn read(out: &mut [u8], nonblocking: bool) -> Result<usize, Errno> {
         count => Ok(count),
     }
 }
+
+/// Cluster broker fill keeps the independent scheduler progressing while DMA is
+/// pending. It accepts the ABI's bounded 4KiB request as <=256-byte pool reads;
+/// partial entropy is erased on every failure and never returned as success.
+#[cfg(feature = "unified-runtime")]
+pub fn fill_progress(out: &mut [u8], progress: &mut dyn FnMut()) -> Result<(), Errno> {
+    use cyxia_driver_virtio::Platform;
+    let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) }
+        .as_mut()
+        .ok_or(Errno::Nodev)?;
+    if out.len() > 4096 {
+        return Err(Errno::Inval);
+    }
+    let start = Board.now_ms();
+    let mut done = 0;
+    while done < out.len() {
+        progress();
+        if Board.now_ms().saturating_sub(start) >= 250 {
+            out.fill(0);
+            return Err(Errno::Io);
+        }
+        let end = (done + 256).min(out.len());
+        match rng.try_fill(&mut out[done..end], &Board) {
+            Ok(n) => done += n,
+            Err(_) => {
+                out.fill(0);
+                return Err(Errno::Io);
+            }
+        }
+    }
+    Ok(())
+}

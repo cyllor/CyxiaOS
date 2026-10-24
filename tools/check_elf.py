@@ -31,16 +31,24 @@ def inspect_elf(b):
     return dict(entry=entry,loads=loads)
 
 def symbol(b,name):
+    loads=inspect_elf(b)['loads']
     h=struct.unpack_from('<16sHHIQQQIHHHHHH',b);off=h[6];size=h[11];count=h[12]
     if size!=64 or count>1024 or off+count*size>len(b):raise ValueError('bad sections')
     sections=[struct.unpack_from('<IIQQQQIIQQ',b,off+i*size) for i in range(count)]
     for s in sections:
         if s[1]!=2:continue
+        if s[6]>=count or s[9]!=24 or s[5]%24 or s[4]+s[5]>len(b):
+            raise ValueError('bad symbol table')
         strings=sections[s[6]];table=b[strings[4]:strings[4]+strings[5]]
+        if strings[1]!=3 or strings[4]+strings[5]>len(b):
+            raise ValueError('bad symbol string table')
         for p in range(s[4],s[4]+s[5],24):
             n,info,other,idx,value,length=struct.unpack_from('<IBBHQQ',b,p)
-            if table[n:].split(b'\0',1)[0].decode('utf8')==name:
-                for seg in inspect_elf(b)['loads']:
+            if n>=len(table):raise ValueError('symbol name outside string table')
+            end=table.find(b'\0',n)
+            if end<0:raise ValueError('unterminated symbol name')
+            if table[n:end]==name.encode('utf8'):
+                for seg in loads:
                     if seg['va']<=value and value+length<=seg['va']+seg['mem']:
                         return dict(va=value,pa=value-seg['va']+seg['pa'],size=length)
     raise ValueError('missing symbol '+name)
@@ -61,7 +69,7 @@ def boot_profile(b):
         delta = entry['pa'] - segment['pa']
         if 0 <= delta and delta+24 <= segment['size']:
             version, ram_mib, heap_pages = struct.unpack_from('<QQQ', b, segment['offset']+delta)
-            if version != 1 or (ram_mib, heap_pages) not in ((256, 2048), (512, 4096)):
+            if version != 1 or (ram_mib, heap_pages) not in ((256, 2048), (512, 4096), (1024, 2048)):
                 raise ValueError('unsupported boot profile')
             return dict(version=version, ram_mib=ram_mib, heap_pages=heap_pages)
     raise ValueError('boot profile is not backed by loaded bytes')

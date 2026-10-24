@@ -1,0 +1,66 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -33,3 +33,6 @@
+ 
+ [build-dependencies.pkg-config]
+ version = "0.3.24"
++
++[features]
++static-link = []
+--- a/build.rs
++++ b/build.rs
+@@ -10,6 +10,14 @@
+ use std::path::Path;
+ 
+ fn main() {
++    // These are the X11 libraries used by the Winit X11 backend. Optional
++    // x11-dl modules require their own real static libraries if referenced.
++    if env::var_os("CARGO_FEATURE_STATIC_LINK").is_some() {
++        for library in ["x11", "x11-xcb", "xi"] {
++            pkg_config::Config::new().statik(true).probe(library)
++                .expect("target static X11 library unavailable");
++        }
++    }
+     let libraries = [
+         // lib           pkgconfig name
+         ("xext", "xext"),
+--- a/src/link.rs
++++ b/src/link.rs
+@@ -34,6 +34,27 @@
+     unsafe impl Sync for $struct_name {}
+ 
+     impl $struct_name {
++      // Static mode resolves the real symbols at final link time. Missing
++      // target libraries fail the link; no runtime loader or fallback is used.
++      #[cfg(feature = "static-link")]
++      pub fn open () -> Result<$struct_name, $crate::error::OpenError> {
++        // Upstream opaque C handles are intentionally incomplete Rust types;
++        // they are only used through pointers in these foreign declarations.
++        #[allow(improper_ctypes)]
++        extern "C" {
++          $(fn $fn_name ($($param_name : $param_type),*) -> $ret_type;)*
++          $(fn $vfn_name ($($vparam_name : $vparam_type),+, ...) -> $vret_type;)*
++          $(static mut $var_name : $var_type;)*
++        }
++        Ok($struct_name {
++          _private: (),
++          $($fn_name,)*
++          $($vfn_name,)*
++          $($var_name: ::std::ptr::addr_of_mut!($var_name),)*
++        })
++      }
++
++      #[cfg(not(feature = "static-link"))]
+       pub fn open () -> Result<$struct_name, $crate::error::OpenError> {
+         /// Cached function pointers and global variables for X11 libraries.
+         static CACHED: once_cell::sync::OnceCell<($crate::link::DynamicLibrary, $struct_name)> = once_cell::sync::OnceCell::new();
+--- a/src/xlib_xcb.rs
++++ b/src/xlib_xcb.rs
+@@ -8,6 +8,7 @@
+     globals:
+ }
+ 
++#[repr(C)]
+ pub enum XEventQueueOwner {
+     XlibOwnsEventQueue = 0,
+     XCBOwnsEventQueue = 1,

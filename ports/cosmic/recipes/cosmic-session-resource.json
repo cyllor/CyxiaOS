@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-unknown-linux-musl",
+  "build_profiles": {
+    "session-static-bootstrap": {
+      "target_runtime_validated": false,
+      "purpose": "Unmodified upstream cosmic-session without optional systemd/logind. 512 MiB is an enforced experimental output bound, not a measured successful build peak. Runtime still requires a session bus and real COSMIC child executables.",
+      "jobs_max": 1,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 536870912,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 16777216,
+      "image_bytes": 16777216,
+      "stack_bytes": 262144
+    }
+  }
+}

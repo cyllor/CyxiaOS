@@ -75,7 +75,7 @@ posix run preempt
 
 ## 最小原型规范与安全核心
 
-`crates/kernel-core/src/control_plane` 和 `cluster` 包含有界控制/集群安全管理逻辑及主机回归测试，但尚未接入独立控制 EL0 服务、次级 CPU、原生网络与集群执行后端。源码合入和主机 CI 通过不代表四核双平面、双原生客体或完整 COSMIC 已验收。
+`unified-runtime` 已将独立 EL0 控制服务、动态核心分配、客体 TLS、持久成员和合同任务执行接入同一原生启动路径。四核双节点的构建、联合验收及故障边界见 [控制面与集群联合实现](docs/implementation/unified-native-control-cluster.md)。该显式配置与默认桌面分开，不代表完整 COSMIC、全部 1.3 条款或物理硬实时已验收。
 
 [全系统代码与规范缺口复核](docs/implementation/prototype-gap-review.md) 区分本轮已修缺陷、架构接入缺口和文档歧义；[要求追踪目录](docs/implementation/prototype-requirements.json) 覆盖 A/T/AI/V/组合故障及16个同等地位的一级子系统。`tools/check_prototype_evidence.py` 只检查证据完整性和文件身份，不认证运行真实性；`--release` 在强制项缺少 PASS 证据时拒绝通过。
 
@@ -116,11 +116,11 @@ python3 tools/run_qemu.py --elf target/aarch64-unknown-none-softfloat/release/cy
 - [实现状态](docs/implementation/m1-status.md)
 - [AI 决策契约](CyxiaOS-ai-decision-contract.md)
 
-源码按 contracts / kernel-core / arch / platform / drivers / kernel 分层。跨平台和多核已有接口边界，但本轮仅验证上述单核 QEMU 配置，未验证实体硬件。
+源码按 contracts / kernel-core / arch / platform / drivers / kernel 分层。上述桌面路径使用单核 QEMU；独立原生配置另验证四个虚拟核心和双节点，未验证实体硬件。
 
 ## 全系统 AI 强化状态
 
-在 CyxiaOS 串口 shell 执行 `ai system`，查看进程/线程、CPU、内存、文件缓存、存储、IPC、显示的真实模型与执行计数、学习状态和未实现项。新增显示提交节奏与存储块请求额度，修正提案/执行混计；全部使用客体本地模型。详见 [落地清单与证据](docs/implementation/system-ai-status.md)。目前只有文件缓存支持受限在线学习；全局协调、全域学习、网络和多核尚未完成。
+在 CyxiaOS 串口 shell 执行 `ai system`，查看进程/线程、CPU、内存、文件缓存、存储、IPC、显示的真实模型与执行计数、学习状态和未实现项。新增显示提交节奏与存储块请求额度，修正提案/执行混计；全部使用客体本地模型。详见 [落地清单与证据](docs/implementation/system-ai-status.md)。目前只有文件缓存支持受限在线学习；全局协调、全域学习和默认桌面的多核/集群接入仍待完成。`unified-runtime` 的本地引导模型及其联合证据单独记录。
 
 ## 原生多核机制工作包（未替代生产桌面）
 

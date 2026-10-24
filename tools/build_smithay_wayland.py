@@ -105,6 +105,17 @@ def project_manifest(source, manifest, cosmic_packages):
                 removed_dev_dependencies=True, retained_mandatory_dependencies=True)
 
 
+def workspace_preflight_environment(environment, cargo_home):
+    """Keep upstream vendoring private; resolve trusted workspace crates offline.
+
+    The workspace lock can include packages outside the pinned Smithay vendor
+    projection. Reuse the operator's existing registry cache only for this
+    trusted local model executable, retaining private target files and source
+    binding. Cargo's --locked/--offline arguments remain mandatory at the call.
+    """
+    return {**environment, "CARGO_HOME": str(cargo_home), "CARGO_NET_OFFLINE": "true"}
+
+
 def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
     manifest_path, probe = profile.manifest, profile.source
     manifest = json.loads(manifest_path.read_text())
@@ -301,7 +312,8 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
             raise ValueError("ELF plus mandatory 64 stack pages exceeds 4096-page admission budget")
         run([cargo, "run", "--quiet", "--locked", "--offline", "--manifest-path", ROOT / "Cargo.toml",
              "-p", "cyxia-ai-runtime", "--example", "check_exec_admission", "--",
-             "4096", str(report["admission_pages"])], "model-preflight", ROOT)
+             "4096", str(report["admission_pages"])], "model-preflight", ROOT,
+            workspace_preflight_environment(env, Path.home() / ".cargo"))
         report["model_preflight"] = json.loads((output / "logs/model-preflight.log").read_text())
         preflight = output / "target/debug/examples/check_exec_admission"
         report["model_preflight_executable_sha256"] = {str(preflight.relative_to(output)): digest(preflight)}

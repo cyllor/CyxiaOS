@@ -5,14 +5,81 @@
     any(feature = "ported", feature = "graphics", feature = "large-memory")
 ))]
 compile_error!("smp-selftest cannot certify the CPU0-only desktop/ported profile");
+#[cfg(all(feature = "net-selftest", feature = "ai-control-selftest"))]
+compile_error!("net-selftest and ai-control-selftest have separate evidence scopes");
+#[cfg(all(
+    feature = "model-v13-selftest",
+    any(feature = "ai-control-selftest", feature = "net-selftest")
+))]
+compile_error!("model-v13-selftest must run as a separate evidence profile");
+#[cfg(all(
+    feature = "storage-v13-selftest",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime"
+    )
+))]
+compile_error!("storage-v13-selftest must run as a separate evidence profile");
+#[cfg(all(
+    feature = "prototype-runtime",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest"
+    )
+))]
+compile_error!("prototype-runtime must run as a separate evidence profile");
+#[cfg(any(
+    feature = "storage-v13-selftest",
+    feature = "prototype-runtime",
+    feature = "tcp-v13-selftest"
+))]
+mod prototype_storage;
+#[cfg(all(
+    feature = "tcp-v13-selftest",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "storage-v13-selftest"
+    )
+))]
+compile_error!("tcp-v13-selftest must run as a separate evidence profile");
+#[cfg(feature = "tcp-v13-selftest")]
+mod cluster_transport;
+#[cfg(feature = "unified-runtime")]
+mod unified;
+#[cfg(feature = "unified-runtime")]
+mod unified_task;
+#[cfg(feature = "unified-runtime")]
+mod unified_store;
+#[cfg(feature = "net-selftest")]
+mod net_selftest;
 #[cfg(feature = "smp-selftest")]
+#[cfg_attr(
+    any(
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "tcp-v13-selftest"
+    ),
+    allow(dead_code)
+)]
 mod smp;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_contracts::*;
 #[cfg(not(feature = "selftest"))]
 mod ai;
 mod clock;
-#[cfg(all(feature = "ported", not(feature = "selftest")))]
+#[cfg(any(
+    feature = "tcp-v13-selftest",
+    feature = "unified-runtime",
+    all(feature = "ported", not(feature = "selftest"))
+))]
 mod entropy;
 #[cfg(all(feature = "ported", not(feature = "selftest")))]
 mod exec_memory;
@@ -32,7 +99,14 @@ mod storage;
 mod user;
 #[cfg(not(feature = "selftest"))]
 mod user_heap;
-#[cfg(any(feature = "graphics", not(feature = "selftest")))]
+#[cfg(any(
+    feature = "graphics",
+    feature = "storage-v13-selftest",
+    feature = "tcp-v13-selftest",
+    feature = "prototype-runtime",
+    feature = "net-selftest",
+    not(feature = "selftest")
+))]
 mod virtio_platform;
 const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
 core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/entry.S"),ram_base=const cyxia_platform_virt::RAM_BASE,entry=const cyxia_platform_virt::ENTRY,gic_base=const 0x08000000,uart_base=const 0x09000000,ram_end=const cyxia_platform_virt::USER_RAM_END,ram_table_count=const cyxia_platform_virt::RAM_MIB/2,ram_tables_bytes=const cyxia_platform_virt::RAM_MIB/2*4096);

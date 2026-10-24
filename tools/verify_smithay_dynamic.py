@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Verify independent named-socket clients, capacity rejection, slot reuse and abrupt cleanup."""
+import sys
+
+if sys.flags.optimize:
+    raise RuntimeError("Native dynamic acceptance requires Python assertions; do not use -O/-OO")
+
 import argparse
 import hashlib
 import json

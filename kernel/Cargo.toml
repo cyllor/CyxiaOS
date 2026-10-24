@@ -14,6 +14,15 @@ selftest = []
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
 ai-control-selftest = ["smp-selftest"]
+# Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
+net-selftest = ["smp-selftest", "prototype-memory"]
+model-v13-selftest = ["smp-selftest", "prototype-memory"]
+storage-v13-selftest = ["smp-selftest", "prototype-memory"]
+tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-transport"]
+prototype-runtime = ["smp-selftest", "prototype-memory"]
+# Continuous AI core scheduling and protected authenticated cluster service together.
+unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2"]
+prototype-memory = ["cyxia-platform-virt/prototype-memory"]
 graphics = []
 ported = []
 openbox = ["ported"]
@@ -36,6 +45,9 @@ abi-trace = []
 large-memory = ["cyxia-posix/large-memory", "cyxia-platform-virt/large-memory"]
 
 [dependencies]
+sha2 = { version = "=0.10.9", default-features = false, optional = true }
+cyxia-cluster-transport = { path = "../crates/cluster-transport", optional = true }
+cyxia-prototype = { path = "../crates/prototype" }
 cyxia-contracts = { path = "../crates/contracts" }
 cyxia-kernel-core = { path = "../crates/kernel-core" }
 cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }

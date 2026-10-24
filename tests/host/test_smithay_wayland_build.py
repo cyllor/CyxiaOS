@@ -10,6 +10,20 @@ import build_smithay_xdg as xdg_builder
 
 
 class SmithayWaylandBuildTests(unittest.TestCase):
+    def test_trusted_workspace_preflight_resolves_its_own_locked_offline_closure(self):
+        upstream = {"CARGO_HOME": "/fresh/server/cargo-home",
+                    "CARGO_TARGET_DIR": "/fresh/server/target",
+                    "CARGO_NET_OFFLINE": "true", "PATH": "/trusted/bin"}
+        trusted = builder.workspace_preflight_environment(upstream, Path("/trusted/cargo"))
+        self.assertEqual(trusted["CARGO_HOME"], "/trusted/cargo")
+        self.assertEqual(trusted["CARGO_TARGET_DIR"], "/fresh/server/target")
+        self.assertEqual(trusted["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(trusted["PATH"], "/trusted/bin")
+        self.assertEqual(upstream["CARGO_HOME"], "/fresh/server/cargo-home")
+        trusted["PATH"] = "/changed"
+        self.assertEqual(upstream["PATH"], "/trusted/bin")
+
+
     def test_modules_cannot_overwrite_main_or_each_other(self):
         for modules in ((Path("nested/main.rs"),),
                         (Path("one/native.rs"), Path("two/native.rs")),
