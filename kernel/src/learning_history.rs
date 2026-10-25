@@ -525,7 +525,9 @@ pub fn record_proposal(
         }
         if decision_seq == 0
             || set.len() > 32
-            || <[u8; 32]>::from(Sha256::digest(input)) != input_hash
+            || cyxia_arch_aarch64::sha256::digest_page(input)
+                .unwrap_or_else(|| Sha256::digest(input).into())
+                != input_hash
         {
             return fail(learning::Error::Evidence);
         }

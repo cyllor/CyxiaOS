@@ -522,6 +522,9 @@ fn run_turn(
                     worker.context = None;
                     worker.native.probing = false;
                     worker.probed = worker.native.probe == 4;
+                    // The final probe completion is its own prepaid recovery turn.
+                    // A fresh 2.5 ms model turn must acquire and encode the first job.
+                    return;
                 } else if now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS {
                     fail_worker(worker);
                     return;

@@ -241,6 +241,9 @@ pub fn init(boot: u64) -> Result<(), Error> {
     if boot == 0 {
         return Err(Error::Auth);
     }
+    if !cyxia_arch_aarch64::sha256::selftest() {
+        return Err(Error::Schema);
+    }
     // The actual driver remains idle without protected replay data. Do this
     // before publishing boot readiness so a Busy startup can retry its loan.
     learning_driver::init()?;
@@ -1169,7 +1172,8 @@ fn encode_job(
     }
     const _: () = assert!(cfg!(target_endian = "little"));
     let input_bytes = unsafe { &*((&input as *const [u64; 512]).cast::<[u8; 4096]>()) };
-    let input_hash = Sha256::digest(input_bytes).into();
+    let input_hash = cyxia_arch_aarch64::sha256::digest_page(input_bytes)
+        .unwrap_or_else(|| Sha256::digest(input_bytes).into());
     if let Some(work) = work {
         core_replay::bind(work, sequence, cyxia_arch_aarch64::cpu::slot(), input_hash)?;
     }
@@ -1541,7 +1545,8 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         let begin = now();
         const _: () = assert!(cfg!(target_endian = "little"));
         let bytes = unsafe { &*((output as *const [u64; 512]).cast::<[u8; 4096]>()) };
-        let output_hash = Sha256::digest(bytes).into();
+        let output_hash = cyxia_arch_aarch64::sha256::digest_page(bytes)
+            .unwrap_or_else(|| Sha256::digest(bytes).into());
         let mut selected = u64::MAX;
         let mut decoded_ns = None;
         let result = (|| {
