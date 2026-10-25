@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
@@ -15,47 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  repair-stack-gate:
-    if: github.event.head_commit.message == 'apply stack safe preparation patch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      RUSTUP_TOOLCHAIN: '1.95.0'
-      PYTHONDONTWRITEBYTECODE: '1'
-    steps:
-      - name: Check out writable source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
-          cargo fetch --locked
-      - name: Apply stack-safe preparation patch and format workspace
-        run: |
-          set -euo pipefail
-          git apply --check .github/codex/patches/070-stack-safe-prepared.diff
-          git apply .github/codex/patches/070-stack-safe-prepared.diff
-          cargo fmt --all
-      - name: Run focused stack and control gates
-        run: |
-          python3 -B -m unittest -v tools.test_check_v13_preparation_stack
-          cargo test --locked --offline -p cyxia-prototype \
-            --test native_target_batch \
-            --test native_preparation_debit \
-            --test domain_policy \
-            --test native_core_replay
-          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
-      - name: Commit exact formatted source
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'fix(control): preserve prepared stack proof'
-          git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
-
   validate:
+    if: ${{ !startsWith(github.event.head_commit.message, 'diagnostic:') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -102,6 +63,7 @@ jobs:
           path: ${{ runner.temp }}/validate-evidence/
 
   native-replay:
+    if: ${{ !startsWith(github.event.head_commit.message, 'diagnostic:') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -179,3 +141,99 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           path: ${{ runner.temp }}/native-replay-evidence/
+
+  tcg-wallclock-diagnostic:
+    if: ${{ startsWith(github.event.head_commit.message, 'diagnostic:') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned native toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          cargo fetch --locked
+          mkdir -p "$RUNNER_TEMP/tcg-diagnostic"
+          git rev-parse HEAD > "$RUNNER_TEMP/tcg-diagnostic/source-commit.txt"
+          rustc -vV > "$RUNNER_TEMP/tcg-diagnostic/rust-version.txt"
+      - name: Restore and verify QEMU 10.2.2
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          merge-multiple: true
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Build one exact native pair
+        run: |
+          set -euo pipefail
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/tcg-diagnostic/qemu-version.txt"
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair" > "$RUNNER_TEMP/tcg-diagnostic/provision.log" 2>&1
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk --example verify-domain-evidence > "$RUNNER_TEMP/tcg-diagnostic/replay-tools-build.log" 2>&1
+          python3 tools/build_unified.py \
+            --identity-a "$RUNNER_TEMP/pair/a" \
+            --identity-b "$RUNNER_TEMP/pair/b" \
+            --output "$RUNNER_TEMP/unified-build" \
+            --selftest > "$RUNNER_TEMP/tcg-diagnostic/unified-build.log" 2>&1
+          cp "$RUNNER_TEMP/unified-build/node-a-stack.json" "$RUNNER_TEMP/tcg-diagnostic/"
+          cp "$RUNNER_TEMP/unified-build/node-b-stack.json" "$RUNNER_TEMP/tcg-diagnostic/"
+      - name: Compare single and multi TCG wallclock accounting
+        run: |
+          set -uo pipefail
+          for mode in single multi; do
+            out="$RUNNER_TEMP/tcg-diagnostic/$mode"
+            log="$RUNNER_TEMP/tcg-diagnostic/$mode.log"
+            status=0
+            python3 tools/verify_domains.py \
+              --elf "$RUNNER_TEMP/unified-build/node-a.elf" \
+              --peer-elf "$RUNNER_TEMP/unified-build/node-b.elf" \
+              --build-manifest "$RUNNER_TEMP/unified-build/build-manifest.json" \
+              --source-root . \
+              --qemu "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" \
+              --output "$out" \
+              --timeout 240 --hold 1 --sample-ms 250 \
+              --clock-profile wallclock --tcg-threads "$mode" \
+              --replay-pairs 1 2>&1 | tee "$log" || status=${PIPESTATUS[0]}
+            printf '%s\n' "$status" > "$RUNNER_TEMP/tcg-diagnostic/$mode.status"
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'tcg-diagnostic'
+          summary = {}
+          for mode in ('single', 'multi'):
+              result = root / mode / 'result.json'
+              status_file = root / f'{mode}.status'
+              item = {'exit_status': int(status_file.read_text().strip())}
+              if result.exists():
+                  payload = json.loads(result.read_text())
+                  item.update({key: payload.get(key) for key in ('status', 'scope', 'error', 'wall_seconds')})
+              summary[mode] = item
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+      - name: Remove large mutable disk images
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/tcg-diagnostic" -type f \
+            \( -name 'disk.raw' -o -name '*.img' -o -size +32M \) -delete || true
+          du -ah "$RUNNER_TEMP/tcg-diagnostic" | sort -h | tail -40
+      - name: Retain compact TCG comparison evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tcg-wallclock-diagnostic-${{ github.sha }}
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+          path: ${{ runner.temp }}/tcg-diagnostic/
