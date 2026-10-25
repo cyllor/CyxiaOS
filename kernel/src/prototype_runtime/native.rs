@@ -5,6 +5,7 @@ use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDO
 
 const PREPAY_NS: u64 = 2_500_000;
 const WALL_NS: u64 = 50_000_000;
+const PRIVATE_CLEAR_PAGES: u8 = 9;
 static READY: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicU64 = AtomicU64::new(1);
 static JOB_CPU: AtomicU64 = AtomicU64::new(0);
@@ -81,6 +82,7 @@ pub(super) struct WorkerState {
     measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
     probe_started: u64,
+    clear_next: u8,
     probing: bool,
     in_job: bool,
     publish_pending: bool,
@@ -103,6 +105,7 @@ impl WorkerState {
             measurement: None,
             probe: 0,
             probe_started: 0,
+            clear_next: 0,
             probing: false,
             in_job: false,
             publish_pending: false,
@@ -116,6 +119,7 @@ impl WorkerState {
     }
     pub(super) fn discard(&mut self) {
         // The stop path proves there is no bill or root-owned job first.
+        self.clear_next = 0;
         self.probing = false;
     }
     fn phase(&mut self, phase: u64) {
@@ -222,6 +226,7 @@ fn conclude(worker: &mut Worker, completion: Completion) {
         worker.native.model_mapped = false;
     }
     worker.native.in_job = false;
+    worker.native.clear_next = 0;
     worker.native.returned = None;
     worker.native.publish_pending = false;
     worker.native.abort_pending = false;
@@ -296,24 +301,42 @@ fn release_model(worker: &mut Worker) -> bool {
         }
     }
 }
-fn clear_private(slot: usize) {
+fn clear_private_page(slot: usize, page: u8) {
+    debug_assert!(page < PRIVATE_CLEAR_PAGES);
     unsafe {
-        let output = if slot == 1 {
-            output_ptr(1)
+        let address = if page == 0 {
+            output_ptr(slot)
         } else {
-            output_ptr(2)
+            stack_ptr(slot).cast::<Page>().add(usize::from(page - 1))
         };
-        (*output).0.fill(0);
-        let stack = if slot == 1 {
-            stack_ptr(1)
-        } else {
-            stack_ptr(2)
-        };
-        for n in 0..8 {
-            (*stack.cast::<Page>().add(n)).0.fill(0);
-        }
+        (*address).0.fill(0);
         core::arch::asm!("dsb ish", options(nostack));
     }
+}
+fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
+    let next = worker.native.clear_next;
+    if next == 0 {
+        return true;
+    }
+    worker
+        .native
+        .phase(if worker.native.probing { 1 } else { 4 });
+    let started = timer::ticks();
+    clear_private_page(slot, next - 1);
+    if worker.native.in_job {
+        worker.native.cpu_ns = worker
+            .native
+            .cpu_ns
+            .saturating_add(ns(timer::ticks() - started));
+    }
+    worker.native.clear_next = if next == PRIVATE_CLEAR_PAGES {
+        0
+    } else {
+        next + 1
+    };
+    // Never combine the just-cleared page with EL0 entry. The following paid
+    // turn receives the full envelope for mapping/preparation and its slice.
+    false
 }
 fn finish_root_return(
     worker: &mut Worker,
@@ -462,12 +485,18 @@ fn run_turn(
             }
         }
     }
-    if !worker.probed && worker.context.is_none() {
+    if !worker.probed && worker.context.is_none() && !worker.native.probing {
         worker.native.phase(1);
-        clear_private(slot);
-        worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+        worker.native.clear_next = 1;
         worker.native.probing = true;
         worker.native.probe_started = now;
+    }
+    if worker.native.probing
+        && worker.context.is_none()
+        && now.saturating_sub(worker.native.probe_started) >= WALL_NS
+    {
+        fail_worker(worker);
+        return;
     }
     if worker.probed && worker.context.is_none() && !worker.native.in_job {
         if TARGET.load(Ordering::Acquire) != slot as u64
@@ -512,11 +541,18 @@ fn run_turn(
             (*page).0.copy_from_slice(&input);
             core::arch::asm!("dsb ish", options(nostack));
         }
-        clear_private(slot);
+        worker.native.clear_next = 1;
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
             .saturating_add(ns(timer::ticks() - copy_start));
+        return;
+    }
+    if !continue_private_clear(worker, slot) {
+        return;
+    }
+    if worker.native.probing && worker.context.is_none() {
+        worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
     }
     if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
         let preparation = timer::ticks();
