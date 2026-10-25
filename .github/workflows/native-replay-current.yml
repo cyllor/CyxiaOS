@@ -1,4 +1,4 @@
-# Probe generation 8: protected SHA evidence path with exact FP/SIMD preservation
+# Probe generation 9: report exact active domain on strict credit failure
 name: Native replay current
 
 on:
