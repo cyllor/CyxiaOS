@@ -1,0 +1,186 @@
+name: Apply bounded native private clear slicing
+
+on:
+  push:
+    branches:
+      - fix/first-level-subsystems-20261024
+    paths:
+      - '.github/workflows/apply-native-clear-slicing.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-native-clear-slicing
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/first-level-subsystems-20261024
+          fetch-depth: 0
+      - name: Install pinned formatter
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+      - name: Slice private clearing across paid turns and self-remove
+        env:
+          BRANCH: fix/first-level-subsystems-20261024
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('kernel/src/prototype_runtime/native.rs')
+          source = path.read_text()
+
+          replacements = [
+              (
+                  'const WALL_NS: u64 = 50_000_000;\n',
+                  'const WALL_NS: u64 = 50_000_000;\nconst PRIVATE_CLEAR_PAGES: u8 = 9;\n',
+              ),
+              (
+                  '    probe: u8,\n    probe_started: u64,\n    probing: bool,\n',
+                  '    probe: u8,\n    probe_started: u64,\n    clear_next: u8,\n    probing: bool,\n',
+              ),
+              (
+                  '            probe: 0,\n            probe_started: 0,\n            probing: false,\n',
+                  '            probe: 0,\n            probe_started: 0,\n            clear_next: 0,\n            probing: false,\n',
+              ),
+              (
+                  '        // The stop path proves there is no bill or root-owned job first.\n        self.probing = false;\n',
+                  '        // The stop path proves there is no bill or root-owned job first.\n        self.clear_next = 0;\n        self.probing = false;\n',
+              ),
+              (
+                  '    worker.native.in_job = false;\n    worker.native.returned = None;\n',
+                  '    worker.native.in_job = false;\n    worker.native.clear_next = 0;\n    worker.native.returned = None;\n',
+              ),
+              (
+                  '''fn clear_private(slot: usize) {
+              unsafe {
+                  let output = if slot == 1 {
+                      output_ptr(1)
+                  } else {
+                      output_ptr(2)
+                  };
+                  (*output).0.fill(0);
+                  let stack = if slot == 1 {
+                      stack_ptr(1)
+                  } else {
+                      stack_ptr(2)
+                  };
+                  for n in 0..8 {
+                      (*stack.cast::<Page>().add(n)).0.fill(0);
+                  }
+                  core::arch::asm!("dsb ish", options(nostack));
+              }
+          }
+          ''',
+                  '''fn clear_private_page(slot: usize, page: u8) {
+              debug_assert!(page < PRIVATE_CLEAR_PAGES);
+              unsafe {
+                  let address = if page == 0 {
+                      output_ptr(slot)
+                  } else {
+                      stack_ptr(slot).cast::<Page>().add(usize::from(page - 1))
+                  };
+                  (*address).0.fill(0);
+                  core::arch::asm!("dsb ish", options(nostack));
+              }
+          }
+          fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
+              let next = worker.native.clear_next;
+              if next == 0 {
+                  return true;
+              }
+              worker
+                  .native
+                  .phase(if worker.native.probing { 1 } else { 4 });
+              let started = timer::ticks();
+              clear_private_page(slot, next - 1);
+              if worker.native.in_job {
+                  worker.native.cpu_ns = worker
+                      .native
+                      .cpu_ns
+                      .saturating_add(ns(timer::ticks() - started));
+              }
+              worker.native.clear_next = if next == PRIVATE_CLEAR_PAGES {
+                  0
+              } else {
+                  next + 1
+              };
+              // Never combine the just-cleared page with EL0 entry. The following paid
+              // turn receives the full envelope for mapping/preparation and its slice.
+              false
+          }
+          ''',
+              ),
+              (
+                  '''    if !worker.probed && worker.context.is_none() {
+              worker.native.phase(1);
+              clear_private(slot);
+              worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+              worker.native.probing = true;
+              worker.native.probe_started = now;
+          }
+          ''',
+                  '''    if !worker.probed && worker.context.is_none() && !worker.native.probing {
+              worker.native.phase(1);
+              worker.native.clear_next = 1;
+              worker.native.probing = true;
+              worker.native.probe_started = now;
+          }
+          if worker.native.probing
+              && worker.context.is_none()
+              && now.saturating_sub(worker.native.probe_started) >= WALL_NS
+          {
+              fail_worker(worker);
+              return;
+          }
+          ''',
+              ),
+              (
+                  '''        clear_private(slot);
+              worker.native.cpu_ns = worker
+                  .native
+                  .cpu_ns
+                  .saturating_add(ns(timer::ticks() - copy_start));
+          }
+          if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
+          ''',
+                  '''        worker.native.clear_next = 1;
+              worker.native.cpu_ns = worker
+                  .native
+                  .cpu_ns
+                  .saturating_add(ns(timer::ticks() - copy_start));
+              return;
+          }
+          if !continue_private_clear(worker, slot) {
+              return;
+          }
+          if worker.native.probing && worker.context.is_none() {
+              worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+          }
+          if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
+          ''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f'unexpected native clear source shape: {count} matches for {old[:80]!r}')
+              source = source.replace(old, new, 1)
+
+          path.write_text(source)
+          PY
+          cargo +1.95.0 fmt --all
+          rm -f .github/workflows/apply-native-clear-slicing.yml
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix: slice native private zeroing across control credits"
+          git push origin "HEAD:$BRANCH"
