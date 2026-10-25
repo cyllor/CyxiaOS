@@ -80,7 +80,10 @@ pub fn normalize(value: u64, upper: u64) -> Result<(i16, bool), Error> {
     let value_in_range = value.min(upper);
     if upper <= u64::MAX / 513 {
         // value_in_range <= upper, so both numerator and denominator fit.
-        return Ok((((512 * value_in_range + upper) / (2 * upper)) as i16, value > upper));
+        return Ok((
+            ((512 * value_in_range + upper) / (2 * upper)) as i16,
+            value > upper,
+        ));
     }
     let v = u128::from(value_in_range);
     let h = u128::from(upper);

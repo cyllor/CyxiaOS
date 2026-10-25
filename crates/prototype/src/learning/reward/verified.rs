@@ -32,15 +32,33 @@ pub struct VerifiedReplay {
 }
 
 impl VerifiedReplay {
-    pub fn kind(&self) -> ReplayKind { self.kind }
-    pub fn trial_id(&self) -> u64 { self.trial_id }
-    pub fn family(&self) -> Family { self.family }
-    pub fn group(&self) -> ReplayGroup { self.group }
-    pub fn evidence_hash(&self) -> [u8; 32] { self.canonical_digest }
-    pub fn schedule_hash(&self) -> [u8; 32] { self.schedule_hash }
-    pub fn performance(&self) -> Performance { self.performance }
-    pub fn cpu(&self) -> CostTotals { self.cpu }
-    pub fn candidate_set_hash(&self) -> Option<[u8; 32]> { self.probe_hash }
+    pub fn kind(&self) -> ReplayKind {
+        self.kind
+    }
+    pub fn trial_id(&self) -> u64 {
+        self.trial_id
+    }
+    pub fn family(&self) -> Family {
+        self.family
+    }
+    pub fn group(&self) -> ReplayGroup {
+        self.group
+    }
+    pub fn evidence_hash(&self) -> [u8; 32] {
+        self.canonical_digest
+    }
+    pub fn schedule_hash(&self) -> [u8; 32] {
+        self.schedule_hash
+    }
+    pub fn performance(&self) -> Performance {
+        self.performance
+    }
+    pub fn cpu(&self) -> CostTotals {
+        self.cpu
+    }
+    pub fn candidate_set_hash(&self) -> Option<[u8; 32]> {
+        self.probe_hash
+    }
 }
 
 /// Called while the original native capture and publication journal are still
@@ -52,8 +70,7 @@ pub fn verify_replay(
     authority: &impl EvidenceAuthority,
     work: &mut RewardWorkspace,
 ) -> Result<VerifiedReplay, Error> {
-    let (canonical_digest, input) =
-        verify_trial(trial, kind == ReplayKind::Candidate, authority)?;
+    let (canonical_digest, input) = verify_trial(trial, kind == ReplayKind::Candidate, authority)?;
     let performance = performance(trial.requests, trial.observation_ns, work)?;
     let cpu = union_cpu(trial.family, trial.cpu, trial.coverage, work)?;
     let mut schedule = Sha256::new();
@@ -61,19 +78,35 @@ pub fn verify_replay(
     number(&mut schedule, trial.requests.len() as u64);
     for request in trial.requests {
         number(&mut schedule, request.id);
-        number(&mut schedule, request.arrived_ns.checked_sub(trial.observation_ns)
-            .ok_or(Error::Evidence)?);
+        number(
+            &mut schedule,
+            request
+                .arrived_ns
+                .checked_sub(trial.observation_ns)
+                .ok_or(Error::Evidence)?,
+        );
     }
     let mut nodes = Sha256::new();
     nodes.update(b"CYXIA_FROZEN_REPLAY_NODES_1.3\0");
     number(&mut nodes, trial.controlled_nodes.len() as u64);
-    for node in trial.controlled_nodes { nodes.update(node); }
+    for node in trial.controlled_nodes {
+        nodes.update(node);
+    }
     Ok(VerifiedReplay {
-        kind, trial_id: trial.id, family: trial.family, group: trial.group,
-        frozen_other_domains: trial.frozen_other_domains, schemas: trial.schemas,
-        local_node: trial.local_node, controlled_nodes_hash: nodes.finalize().into(),
-        requests: trial.requests.len(), schedule_hash: schedule.finalize().into(),
-        canonical_digest, input, performance, cpu,
+        kind,
+        trial_id: trial.id,
+        family: trial.family,
+        group: trial.group,
+        frozen_other_domains: trial.frozen_other_domains,
+        schemas: trial.schemas,
+        local_node: trial.local_node,
+        controlled_nodes_hash: nodes.finalize().into(),
+        requests: trial.requests.len(),
+        schedule_hash: schedule.finalize().into(),
+        canonical_digest,
+        input,
+        performance,
+        cpu,
         probe_hash: trial.adoptions.first().map(|v| v.candidates.hash()),
     })
 }
@@ -85,12 +118,18 @@ pub fn pair_verified(
     candidate: &VerifiedReplay,
     baseline: &VerifiedReplay,
 ) -> Result<AcceptedSample, Error> {
-    if candidate.kind != ReplayKind::Candidate || baseline.kind != ReplayKind::Baseline
-        || candidate.group != baseline.group || candidate.family != baseline.family
+    if candidate.kind != ReplayKind::Candidate
+        || baseline.kind != ReplayKind::Baseline
+        || candidate.group != baseline.group
+        || candidate.family != baseline.family
         || candidate.frozen_other_domains != baseline.frozen_other_domains
-        || candidate.schemas != baseline.schemas || candidate.local_node != baseline.local_node
+        || candidate.schemas != baseline.schemas
+        || candidate.local_node != baseline.local_node
         || candidate.controlled_nodes_hash != baseline.controlled_nodes_hash
-        || candidate.requests != baseline.requests || candidate.schedule_hash != baseline.schedule_hash
-    { return Err(Error::Evidence); }
+        || candidate.requests != baseline.requests
+        || candidate.schedule_hash != baseline.schedule_hash
+    {
+        return Err(Error::Evidence);
+    }
     make_sample(candidate, baseline)
 }

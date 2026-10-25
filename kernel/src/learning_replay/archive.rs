@@ -527,14 +527,19 @@ impl Archive {
         let mut at = offset - HEADER;
         if self.peer_padded != 0 {
             if at < self.peer_padded {
-                return super::archive_packet::chunk(self.peer_packet_bytes, at, out, |offset, bytes| {
-                    if let Some(prep) = self.prepared_peer {
-                        crate::peer_replay::copy_prepared_packet(prep, offset, bytes)
-                    } else {
-                        crate::peer_replay::copy_seal_packet(self.seal.key, offset, bytes)
-                            .map_err(super::domain_error)
-                    }
-                });
+                return super::archive_packet::chunk(
+                    self.peer_packet_bytes,
+                    at,
+                    out,
+                    |offset, bytes| {
+                        if let Some(prep) = self.prepared_peer {
+                            crate::peer_replay::copy_prepared_packet(prep, offset, bytes)
+                        } else {
+                            crate::peer_replay::copy_seal_packet(self.seal.key, offset, bytes)
+                                .map_err(super::domain_error)
+                        }
+                    },
+                );
             }
             at -= self.peer_padded;
         }

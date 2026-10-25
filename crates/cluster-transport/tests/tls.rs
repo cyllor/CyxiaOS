@@ -117,25 +117,36 @@ fn fixed_record_capacity_does_not_require_record_sized_stack_temporaries() {
     // buffer bundles must be initialized on the allocator, including while
     // a real TLS handshake is running on this deliberately bounded stack.
     assert!(core::mem::size_of::<Buffers>() <= 64);
-    std::thread::Builder::new().stack_size(128 * 1024).spawn(|| {
-        let [small,large]=pairings(Arc::new(Time(AtomicBool::new(true))));
-        let mut first=Buffers::new();let mut second=Buffers::new();
-        let mut client=small.client(&mut first,0).unwrap();
-        let mut server=large.server(&mut second,0).unwrap();
-        handshake(&mut client,&mut server).unwrap();
-        let message=vec![0x5a;16_384];
-        let mut received=Vec::with_capacity(message.len());
-        client.send_plaintext(&message).unwrap();
-        for _ in 0..20000 {
-            client.pump(0).unwrap();server.pump(0).unwrap();
-            transfer(&mut client,&mut server,113).unwrap();transfer(&mut server,&mut client,53).unwrap();
-            received.extend_from_slice(server.plaintext());
-            let accepted=server.plaintext().len();server.consume_plaintext(accepted).unwrap();
-            if received.len()==message.len(){break;}
-        }
-        assert_eq!(received.len(),message.len());
-        assert!(received==message);
-    }).unwrap().join().unwrap();
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let [small, large] = pairings(Arc::new(Time(AtomicBool::new(true))));
+            let mut first = Buffers::new();
+            let mut second = Buffers::new();
+            let mut client = small.client(&mut first, 0).unwrap();
+            let mut server = large.server(&mut second, 0).unwrap();
+            handshake(&mut client, &mut server).unwrap();
+            let message = vec![0x5a; 16_384];
+            let mut received = Vec::with_capacity(message.len());
+            client.send_plaintext(&message).unwrap();
+            for _ in 0..20000 {
+                client.pump(0).unwrap();
+                server.pump(0).unwrap();
+                transfer(&mut client, &mut server, 113).unwrap();
+                transfer(&mut server, &mut client, 53).unwrap();
+                received.extend_from_slice(server.plaintext());
+                let accepted = server.plaintext().len();
+                server.consume_plaintext(accepted).unwrap();
+                if received.len() == message.len() {
+                    break;
+                }
+            }
+            assert_eq!(received.len(), message.len());
+            assert!(received == message);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 #[test]
 fn authentication_rejects_unpaired_client_even_with_valid_signature() {

@@ -860,7 +860,9 @@ fn cleanup(s: &mut State) -> Result<bool, Error> {
 /// enter/run the independently mapped EL0 context instead of busy-polling it.
 pub fn driver_turn() -> Result<bool, DomainError> {
     runtime::authorize_learning_turn()?;
-    if crate::learning_canary::control_step()? { return Ok(true); }
+    if crate::learning_canary::control_step()? {
+        return Ok(true);
+    }
     match crate::learning_session::turn()? {
         crate::learning_session::Turn::Idle => (),
         crate::learning_session::Turn::Progress => return Ok(true),
@@ -870,8 +872,11 @@ pub fn driver_turn() -> Result<bool, DomainError> {
     // The producer borrows the same real scoring input only while the
     // numerical driver has no current job or loan. It returns the loan before
     // exposing its frozen source through Provider::next.
-    if with(|s| Ok(s.phase==Phase::Idle && s.input.is_none() && s.binding.is_none()))?
-        && crate::learning_replay::control_step()? { return Ok(true); }
+    if with(|s| Ok(s.phase == Phase::Idle && s.input.is_none() && s.binding.is_none()))?
+        && crate::learning_replay::control_step()?
+    {
+        return Ok(true);
+    }
     with(|s| {
         let Some(provider) = s.provider else {
             return Ok(false);

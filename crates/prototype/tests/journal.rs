@@ -1,7 +1,7 @@
 use cyxia_prototype::journal::{self, AfterImage, BlockDevice, Error, Journal, Scratch};
 use cyxia_prototype::storage::{
-    self, Inode, InodeKind, LogPayload, Record, Superblock, BITMAP_START, BLOCK_SIZE, DATA_START,
-    INODE_START, TOTAL_BLOCKS,
+    self, BITMAP_START, BLOCK_SIZE, DATA_START, INODE_START, Inode, InodeKind, LogPayload, Record,
+    Superblock, TOTAL_BLOCKS,
 };
 use std::collections::BTreeMap;
 

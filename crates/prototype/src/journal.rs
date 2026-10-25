@@ -30,7 +30,9 @@ pub trait BlockDevice {
     fn recovery_exit(&mut self) {}
     /// Reserve the complete ordinary send entitlement before writing BEGIN.
     /// This hook must have no media side effects on rejection.
-    fn transaction_begin(&mut self, _bytes: u64) -> Result<(), Self::Error> { Ok(()) }
+    fn transaction_begin(&mut self, _bytes: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
     /// Failed/unknown commits retain their in-flight custody at the adapter.
     fn transaction_end(&mut self, _success: bool) {}
 }
@@ -343,75 +345,77 @@ impl Journal {
             log_epoch: self.superblock.log_epoch,
             txid: self.next_txid,
         };
-        device.transaction_begin(u64::from(needed) * BLOCK_SIZE as u64).map_err(Error::Io)?;
+        device
+            .transaction_begin(u64::from(needed) * BLOCK_SIZE as u64)
+            .map_err(Error::Io)?;
         let result = (|| {
-        self.writable = false;
-        let mut cursor = self.next_block;
-        write_record(
-            device,
-            cursor,
-            Record {
-                txid: key.txid,
-                lsn: self.next_lsn,
-                log_epoch: key.log_epoch,
-                payload: LogPayload::Begin { redo_count: count },
-            },
-            scratch,
-        )?;
-        cursor += 1;
-        let mut digest = Sha256::new();
-        for (index, change) in changes.iter().enumerate() {
-            digest.update(u64::from(change.home_block).to_le_bytes());
-            digest.update(change.bytes);
+            self.writable = false;
+            let mut cursor = self.next_block;
             write_record(
                 device,
                 cursor,
                 Record {
                     txid: key.txid,
-                    lsn: self.next_lsn + index as u64 + 1,
+                    lsn: self.next_lsn,
                     log_epoch: key.log_epoch,
-                    payload: LogPayload::Redo {
-                        home_block: u64::from(change.home_block),
-                        index: index as u32,
-                        count,
-                        after_image: change.bytes,
+                    payload: LogPayload::Begin { redo_count: count },
+                },
+                scratch,
+            )?;
+            cursor += 1;
+            let mut digest = Sha256::new();
+            for (index, change) in changes.iter().enumerate() {
+                digest.update(u64::from(change.home_block).to_le_bytes());
+                digest.update(change.bytes);
+                write_record(
+                    device,
+                    cursor,
+                    Record {
+                        txid: key.txid,
+                        lsn: self.next_lsn + index as u64 + 1,
+                        log_epoch: key.log_epoch,
+                        payload: LogPayload::Redo {
+                            home_block: u64::from(change.home_block),
+                            index: index as u32,
+                            count,
+                            after_image: change.bytes,
+                        },
+                    },
+                    scratch,
+                )?;
+                cursor += 2;
+            }
+            device.flush().map_err(Error::Io)?;
+            write_record(
+                device,
+                cursor,
+                Record {
+                    txid: key.txid,
+                    lsn: commit_lsn,
+                    log_epoch: key.log_epoch,
+                    payload: LogPayload::Commit {
+                        begin_lsn: self.next_lsn,
+                        last_redo_lsn: commit_lsn - 1,
+                        redo_count: count,
+                        ordered_digest: digest.finalize().into(),
                     },
                 },
                 scratch,
             )?;
-            cursor += 2;
-        }
-        device.flush().map_err(Error::Io)?;
-        write_record(
-            device,
-            cursor,
-            Record {
-                txid: key.txid,
-                lsn: commit_lsn,
-                log_epoch: key.log_epoch,
-                payload: LogPayload::Commit {
-                    begin_lsn: self.next_lsn,
-                    last_redo_lsn: commit_lsn - 1,
-                    redo_count: count,
-                    ordered_digest: digest.finalize().into(),
-                },
-            },
-            scratch,
-        )?;
-        device.flush().map_err(Error::Io)?;
-        // All possible bounds/counter failures were rejected before BEGIN.
-        for (index, change) in changes.iter().enumerate() {
-            self.publish(IndexEntry {
-                home: change.home_block,
-                record: self.next_block + 1 + 2 * index as u32,
-            })?;
-        }
-        self.next_block = cursor + 1;
-        self.next_lsn = after_lsn;
-        self.next_txid = after_txid;
-        self.last_commit_lsn = commit_lsn;
-        self.writable = true;
-        Ok(CommitReceipt { key, commit_lsn })
+            device.flush().map_err(Error::Io)?;
+            // All possible bounds/counter failures were rejected before BEGIN.
+            for (index, change) in changes.iter().enumerate() {
+                self.publish(IndexEntry {
+                    home: change.home_block,
+                    record: self.next_block + 1 + 2 * index as u32,
+                })?;
+            }
+            self.next_block = cursor + 1;
+            self.next_lsn = after_lsn;
+            self.next_txid = after_txid;
+            self.last_commit_lsn = commit_lsn;
+            self.writable = true;
+            Ok(CommitReceipt { key, commit_lsn })
         })();
         device.transaction_end(result.is_ok());
         result

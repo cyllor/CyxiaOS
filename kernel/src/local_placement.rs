@@ -51,14 +51,22 @@ fn admit(entry: &mut Entry, input: &[u8]) -> Result<(), ()> {
     let result = crate::domain_network::replay::claim_local(entry.key, entry.spawn_id)
         .and_then(|()| crate::domain_tasks::submit_local(entry.spawn_id, input, entry.deadline_ns));
     let outcome = match result {
-        Err(cyxia_prototype::domains::Error::Busy
+        Err(
+            cyxia_prototype::domains::Error::Busy
             | cyxia_prototype::domains::Error::Again
-            | cyxia_prototype::domains::Error::NotReady) => {
+            | cyxia_prototype::domains::Error::NotReady,
+        ) => {
             entry.retryable = true;
             Err(())
         }
-        Ok(state) => { entry.state = state; Ok(()) }
-        Err(error) => { entry.state = SpawnState::Failed(error); Ok(()) }
+        Ok(state) => {
+            entry.state = state;
+            Ok(())
+        }
+        Err(error) => {
+            entry.state = SpawnState::Failed(error);
+            Ok(())
+        }
     };
     crate::domain_tasks::bind_local_failure_request(entry.spawn_id, entry.key, entry.deadline_ns);
     outcome
@@ -104,7 +112,11 @@ pub fn request(
             if entry.completion.is_none() {
                 match crate::domain_tasks::local_result(entry.spawn_id) {
                     Ok(Some(value)) => entry.completion = Some(Ok(value)),
-                    Ok(None) | Err(cyxia_prototype::domains::Error::Busy | cyxia_prototype::domains::Error::Again) => return (1, 0, 0),
+                    Ok(None)
+                    | Err(
+                        cyxia_prototype::domains::Error::Busy
+                        | cyxia_prototype::domains::Error::Again,
+                    ) => return (1, 0, 0),
                     Err(error) => entry.completion = Some(Err(error)),
                 }
             }
@@ -112,12 +124,16 @@ pub fn request(
             // the bounded task-exit receipt slot. A lost broker reply reads
             // these same bytes and never re-runs the task.
             if !entry.acknowledged && matches!(entry.state, SpawnState::Created(_)) {
-                if crate::domain_tasks::acknowledge_local_result(entry.spawn_id).is_err() { return (1, 0, 0); }
+                if crate::domain_tasks::acknowledge_local_result(entry.spawn_id).is_err() {
+                    return (1, 0, 0);
+                }
                 entry.acknowledged = true;
             }
             return match entry.completion.unwrap() {
                 Ok((sum, finished)) => {
-                    payload[..8].copy_from_slice(&sum.to_le_bytes()); payload[8..16].copy_from_slice(&finished.to_le_bytes()); (0, 16, 0)
+                    payload[..8].copy_from_slice(&sum.to_le_bytes());
+                    payload[8..16].copy_from_slice(&finished.to_le_bytes());
+                    (0, 16, 0)
                 }
                 Err(_) => (3, 0, 0),
             };
@@ -182,6 +198,8 @@ pub fn request(
         acknowledged: false,
     });
     let entry = entries[index].as_mut().unwrap();
-    if admit(entry, &payload[112..len]).is_err() { return (1, 0, 0); }
+    if admit(entry, &payload[112..len]).is_err() {
+        return (1, 0, 0);
+    }
     answer(payload, entry.state)
 }

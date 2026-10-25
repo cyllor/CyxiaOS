@@ -549,7 +549,11 @@ impl<'a> Process<'a> {
         let flags = self.flags(fd)?;
         self.set_flags(
             fd,
-            if value == 0 { flags & !O_NONBLOCK } else { flags | O_NONBLOCK },
+            if value == 0 {
+                flags & !O_NONBLOCK
+            } else {
+                flags | O_NONBLOCK
+            },
         )
     }
     pub fn set_flags(&mut self, fd: i32, flags: u32) -> Result<(), Errno> {

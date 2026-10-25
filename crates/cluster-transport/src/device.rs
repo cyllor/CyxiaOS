@@ -1,6 +1,9 @@
 //! Bounded bridge between a polling NIC and smoltcp. One pending frame each
 //! way; backpressure never overwrites DMA or a staged TCP packet.
-use cyxia_driver_virtio::{Error as DriverError, Platform, net::{Net,BatchedNet}};
+use cyxia_driver_virtio::{
+    Error as DriverError, Platform,
+    net::{BatchedNet, Net},
+};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
@@ -18,43 +21,83 @@ pub enum Error {
 pub trait Port {
     fn send(&mut self, frame: &[u8]) -> Result<(), Error>;
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error>;
-    fn flush(&mut self) -> Result<(),Error> { Ok(()) }
-    fn burst_capacity(&self) -> usize { 1 }
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn burst_capacity(&self) -> usize {
+        1
+    }
 }
 
 pub trait VirtioLink {
-    fn transmit(&mut self,frame:&[u8],p:&impl Platform)->Result<(),DriverError>;
-    fn poll_transmit(&mut self,p:&impl Platform)->Result<bool,DriverError>;
-    fn receive_frame(&mut self,out:&mut[u8],p:&impl Platform)->Result<Option<usize>,DriverError>;
-    fn finish_turn(&mut self,p:&impl Platform)->Result<(),DriverError>;
-    fn burst_capacity(&self)->usize;
+    fn transmit(&mut self, frame: &[u8], p: &impl Platform) -> Result<(), DriverError>;
+    fn poll_transmit(&mut self, p: &impl Platform) -> Result<bool, DriverError>;
+    fn receive_frame(
+        &mut self,
+        out: &mut [u8],
+        p: &impl Platform,
+    ) -> Result<Option<usize>, DriverError>;
+    fn finish_turn(&mut self, p: &impl Platform) -> Result<(), DriverError>;
+    fn burst_capacity(&self) -> usize;
 }
 impl VirtioLink for Net {
-    fn transmit(&mut self,f:&[u8],p:&impl Platform)->Result<(),DriverError>{self.send(f,p)}
-    fn poll_transmit(&mut self,p:&impl Platform)->Result<bool,DriverError>{self.poll_tx(p)}
-    fn receive_frame(&mut self,o:&mut[u8],p:&impl Platform)->Result<Option<usize>,DriverError>{self.receive(o,p)}
-    fn finish_turn(&mut self,_:&impl Platform)->Result<(),DriverError>{Ok(())}
-    fn burst_capacity(&self)->usize{1}
+    fn transmit(&mut self, f: &[u8], p: &impl Platform) -> Result<(), DriverError> {
+        self.send(f, p)
+    }
+    fn poll_transmit(&mut self, p: &impl Platform) -> Result<bool, DriverError> {
+        self.poll_tx(p)
+    }
+    fn receive_frame(
+        &mut self,
+        o: &mut [u8],
+        p: &impl Platform,
+    ) -> Result<Option<usize>, DriverError> {
+        self.receive(o, p)
+    }
+    fn finish_turn(&mut self, _: &impl Platform) -> Result<(), DriverError> {
+        Ok(())
+    }
+    fn burst_capacity(&self) -> usize {
+        1
+    }
 }
 impl VirtioLink for BatchedNet {
-    fn transmit(&mut self,f:&[u8],p:&impl Platform)->Result<(),DriverError>{self.send_queued(f,p)}
-    fn poll_transmit(&mut self,p:&impl Platform)->Result<bool,DriverError>{self.poll_tx(p)}
-    fn receive_frame(&mut self,o:&mut[u8],p:&impl Platform)->Result<Option<usize>,DriverError>{self.receive(o,p)}
-    fn finish_turn(&mut self,p:&impl Platform)->Result<(),DriverError>{self.flush_tx(p)}
-    fn burst_capacity(&self)->usize{self.capacity()}
+    fn transmit(&mut self, f: &[u8], p: &impl Platform) -> Result<(), DriverError> {
+        self.send_queued(f, p)
+    }
+    fn poll_transmit(&mut self, p: &impl Platform) -> Result<bool, DriverError> {
+        self.poll_tx(p)
+    }
+    fn receive_frame(
+        &mut self,
+        o: &mut [u8],
+        p: &impl Platform,
+    ) -> Result<Option<usize>, DriverError> {
+        self.receive(o, p)
+    }
+    fn finish_turn(&mut self, p: &impl Platform) -> Result<(), DriverError> {
+        self.flush_tx(p)
+    }
+    fn burst_capacity(&self) -> usize {
+        self.capacity()
+    }
 }
-pub struct VirtioPort<'a, P,N=Net> {
+pub struct VirtioPort<'a, P, N = Net> {
     pub net: &'a mut N,
     pub platform: &'a P,
 }
 
-impl<P: Platform,N:VirtioLink> Port for VirtioPort<'_, P,N> {
+impl<P: Platform, N: VirtioLink> Port for VirtioPort<'_, P, N> {
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.net.poll_transmit(self.platform).map_err(|_| Error::Device)?;
-        self.net.transmit(frame, self.platform).map_err(|e| match e {
-            DriverError::Busy => Error::WouldBlock,
-            _ => Error::Device,
-        })
+        self.net
+            .poll_transmit(self.platform)
+            .map_err(|_| Error::Device)?;
+        self.net
+            .transmit(frame, self.platform)
+            .map_err(|e| match e {
+                DriverError::Busy => Error::WouldBlock,
+                _ => Error::Device,
+            })
     }
 
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error> {
@@ -62,8 +105,14 @@ impl<P: Platform,N:VirtioLink> Port for VirtioPort<'_, P,N> {
             .receive_frame(frame, self.platform)
             .map_err(|_| Error::Device)
     }
-    fn flush(&mut self)->Result<(),Error>{self.net.finish_turn(self.platform).map_err(|_|Error::Device)}
-    fn burst_capacity(&self)->usize{self.net.burst_capacity()}
+    fn flush(&mut self) -> Result<(), Error> {
+        self.net
+            .finish_turn(self.platform)
+            .map_err(|_| Error::Device)
+    }
+    fn burst_capacity(&self) -> usize {
+        self.net.burst_capacity()
+    }
 }
 
 struct Slot {
@@ -88,8 +137,12 @@ pub struct Ethernet<P> {
 }
 
 impl<P: Port> Ethernet<P> {
-    pub(crate) fn port(&self) -> &P { &self.port }
-    pub(crate) fn port_mut(&mut self) -> &mut P { &mut self.port }
+    pub(crate) fn port(&self) -> &P {
+        &self.port
+    }
+    pub(crate) fn port_mut(&mut self) -> &mut P {
+        &mut self.port
+    }
 
     pub fn new(port: P) -> Self {
         Self {

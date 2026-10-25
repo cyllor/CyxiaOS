@@ -18,11 +18,11 @@ use cyxia_prototype::{
     policy_wire,
 };
 use sha2::{Digest, Sha256};
-#[path = "learning_history/replay.rs"]
-pub mod replay;
 #[path = "learning_history/rejection.rs"]
 #[cfg_attr(test, allow(dead_code))]
 mod rejection;
+#[path = "learning_history/replay.rs"]
+pub mod replay;
 
 pub const RECORDS: usize = 64;
 // A full ordinary journal must still retain the root's first terminal
@@ -797,7 +797,11 @@ pub fn record_shared_policy(decision_seq: u64, intervals: &[CpuInterval]) -> Res
     })
 }
 
-fn adoption_metadata(run: RunKey, adoption: &Adoption<'_>, verify_payload: bool) -> Result<ReplayChecks, Error> {
+fn adoption_metadata(
+    run: RunKey,
+    adoption: &Adoption<'_>,
+    verify_payload: bool,
+) -> Result<ReplayChecks, Error> {
     with(|owner, storage| {
         let scope = owner.scope.ok_or(Error::NotReady)?;
         if scope.key != run {
@@ -824,7 +828,8 @@ fn adoption_metadata(run: RunKey, adoption: &Adoption<'_>, verify_payload: bool)
             || snapshot(r) != adoption.candidates.snapshot
             || target(r) != adoption.candidates.target
             || model(r) != adoption.candidates.model
-            || (verify_payload && <[u8; 32]>::from(Sha256::digest(adoption.model)) != model(r).model_hash)
+            || (verify_payload
+                && <[u8; 32]>::from(Sha256::digest(adoption.model)) != model(r).model_hash)
             || u16_at(r, 206) != adoption.selected
             || action(r, adoption.selected as usize)? != adoption.actual
             || adoption.executed != ExecutionState::Applied
@@ -1029,14 +1034,20 @@ pub fn record_rejected(
         _ => Error::Capture(learning::Error::Evidence),
     })?;
     let facts = rejection::Facts {
-        receipt: proof.receipt(), snapshot: proof.snapshot(), header: proof.header(),
-        decision: proof.decision(), model: proof.model(), received_ns: proof.received_ns(),
-        observed_ns: proof.observed_ns(), wall_deadline_ns: proof.wall_deadline_ns(),
+        receipt: proof.receipt(),
+        snapshot: proof.snapshot(),
+        header: proof.header(),
+        decision: proof.decision(),
+        model: proof.model(),
+        received_ns: proof.received_ns(),
+        observed_ns: proof.observed_ns(),
+        wall_deadline_ns: proof.wall_deadline_ns(),
         plan_hash: proof.plan_hash(),
     };
     with(|owner, storage| {
         let scope = owner.scope.ok_or(Error::NotReady)?;
-        if scope.key != run || owner.sealed.is_some()
+        if scope.key != run
+            || owner.sealed.is_some()
             || proof.token().boot_epoch != run.boot_epoch
             || facts.receipt.id.boot_epoch != run.boot_epoch
             || facts.decision.envelope.target != scope.target
@@ -1048,10 +1059,12 @@ pub fn record_rejected(
         {
             return Err(Error::Stale);
         }
-        let added = rejection::append(&mut storage.bytes, &mut owner.used, &facts)
-            .map_err(|error| match error {
-                cyxia_prototype::domains::Error::Capacity => Error::Capacity,
-                _ => Error::Capture(learning::Error::Evidence),
+        let added =
+            rejection::append(&mut storage.bytes, &mut owner.used, &facts).map_err(|error| {
+                match error {
+                    cyxia_prototype::domains::Error::Capacity => Error::Capacity,
+                    _ => Error::Capture(learning::Error::Evidence),
+                }
             })?;
         owner.fault.get_or_insert(learning::Error::DataIncomplete);
         Ok(added)
@@ -1097,7 +1110,9 @@ fn verify_scope_coverage(
 // Only the native replay authority can supply a partner proof, after checking
 // the protected peer bank. Ordinary local attestation always passes None.
 fn scope_metadata(
-    trial: &Trial<'_>, seal: Seal, coverage: learning::reward::CpuCoverage,
+    trial: &Trial<'_>,
+    seal: Seal,
+    coverage: learning::reward::CpuCoverage,
     partner: Option<(learning::reward::CpuCoverage, [u8; 32])>,
 ) -> Result<(FrozenScope, ReplayChecks), Error> {
     #[cfg(not(test))]
@@ -1151,7 +1166,9 @@ fn scope_metadata(
     })
 }
 fn verify_scope_with_partner(
-    trial: &Trial<'_>, seal: Seal, coverage: learning::reward::CpuCoverage,
+    trial: &Trial<'_>,
+    seal: Seal,
+    coverage: learning::reward::CpuCoverage,
     partner: Option<(learning::reward::CpuCoverage, [u8; 32])>,
 ) -> Result<(), learning::Error> {
     let (scope, checks) = scope_metadata(trial, seal, coverage, partner).map_err(learn)?;

@@ -69,29 +69,29 @@ mod domain_storage;
 #[cfg(feature = "unified-runtime")]
 mod domain_tasks;
 #[cfg(feature = "unified-runtime")]
+mod learning_canary;
+#[cfg(feature = "unified-runtime")]
 mod learning_evidence;
 #[cfg(feature = "unified-runtime")]
 mod learning_history;
 #[cfg(feature = "unified-runtime")]
-mod learning_session;
-#[cfg(feature = "unified-runtime")]
-mod learning_canary;
+mod learning_prewarm;
 #[cfg(feature = "unified-runtime")]
 mod learning_replay;
 #[cfg(feature = "unified-runtime")]
+mod learning_session;
+#[cfg(feature = "unified-runtime")]
 mod learning_workload;
 #[cfg(feature = "unified-runtime")]
-mod learning_prewarm;
+mod local_placement;
+#[cfg(feature = "unified-runtime")]
+mod model_bank;
+#[cfg(feature = "net-selftest")]
+mod net_selftest;
 #[cfg(feature = "unified-runtime")]
 mod peer_replay;
 #[cfg(feature = "unified-runtime")]
 mod service_windows;
-#[cfg(feature = "unified-runtime")]
-mod model_bank;
-#[cfg(feature = "unified-runtime")]
-mod local_placement;
-#[cfg(feature = "net-selftest")]
-mod net_selftest;
 #[cfg(feature = "smp-selftest")]
 #[cfg_attr(
     any(

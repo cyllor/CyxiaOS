@@ -25,15 +25,24 @@ mod session;
 mod support;
 pub const HIGH: u64 = 0;
 pub mod domain_services {
-    pub fn canary_target() -> Result<cyxia_prototype::learning::governance::TargetRegistration, cyxia_prototype::domains::Error> {
+    pub fn canary_target() -> Result<
+        cyxia_prototype::learning::governance::TargetRegistration,
+        cyxia_prototype::domains::Error,
+    > {
         Err(cyxia_prototype::domains::Error::NotReady)
     }
 }
 pub mod learning_canary {
     use super::*;
-    pub fn prepare_baseline(_: ObjectKey) -> Result<bool, Error> { Err(Error::DataIncomplete) }
-    pub fn begin(_: CanaryPermit) -> Result<(), Error> { Err(Error::DataIncomplete) }
-    pub fn changed_permit(_: CanaryPermit) -> Result<(), Error> { Err(Error::DataIncomplete) }
+    pub fn prepare_baseline(_: ObjectKey) -> Result<bool, Error> {
+        Err(Error::DataIncomplete)
+    }
+    pub fn begin(_: CanaryPermit) -> Result<(), Error> {
+        Err(Error::DataIncomplete)
+    }
+    pub fn changed_permit(_: CanaryPermit) -> Result<(), Error> {
+        Err(Error::DataIncomplete)
+    }
     pub fn request_release() {}
 }
 pub mod cpu {
@@ -382,7 +391,13 @@ pub mod domain_control {
         pub fn extend(_: &mut Governance<'_, '_>, _: u16) -> Result<(), Error> {
             Err(Error::DataIncomplete)
         }
-        pub fn observe_second_bounded(_: &mut Governance<'_, '_>, _:u16, _:&[WorkRequest], _:&[WorkRequest], _:&mut[u64])->Result<(),Error> {
+        pub fn observe_second_bounded(
+            _: &mut Governance<'_, '_>,
+            _: u16,
+            _: &[WorkRequest],
+            _: &[WorkRequest],
+            _: &mut [u64],
+        ) -> Result<(), Error> {
             Err(Error::DataIncomplete)
         }
         pub fn safety_tick(g: &mut Governance<'_, '_>) -> Result<(), Error> {

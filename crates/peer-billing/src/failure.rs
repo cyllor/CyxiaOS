@@ -1,6 +1,6 @@
 //! An actual protected root failure is distinct from an incomplete transport
 //! operation. The negative fact cannot cancel START or claim work completed.
-use super::{Binding, Error, Reader, Writer, BINDING_BYTES};
+use super::{BINDING_BYTES, Binding, Error, Reader, Writer};
 use cyxia_prototype::{
     domains::{Error as DomainError, ObjectKey},
     policy::{ExecutionState, PlanId, PlanReceipt, Snapshot},

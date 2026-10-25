@@ -74,18 +74,26 @@ fn hash(input: &[u64; INPUT_WORDS], at: usize) -> [u8; 32] {
 /// Only D16's stopped-quote baseline has a representation outside Action ABI.
 pub fn prior(input: &[u64; INPUT_WORDS]) -> Result<Action, Error> {
     let len = usize::try_from(input[404]).map_err(|_| Error::Range)?;
-    if !(3..=16).contains(&len) { return Err(Error::Format); }
+    if !(3..=16).contains(&len) {
+        return Err(Error::Format);
+    }
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&input[405].to_le_bytes());
     bytes[8..].copy_from_slice(&input[406].to_le_bytes());
-    if bytes[len..].iter().any(|b| *b != 0) { return Err(Error::Format); }
+    if bytes[len..].iter().any(|b| *b != 0) {
+        return Err(Error::Format);
+    }
     if (input[8], input[9]) == (16, 1) && bytes[..len] == [0; 4] {
         return Ok(Action::OfferCpu(0));
     }
     let (action, index) = policy_wire::decode_payload(
         u16::try_from(input[8]).map_err(|_| Error::Range)?,
-        u16::try_from(input[9]).map_err(|_| Error::Range)?, &bytes[..len])?;
-    if index != 0 { return Err(Error::Conflict); }
+        u16::try_from(input[9]).map_err(|_| Error::Range)?,
+        &bytes[..len],
+    )?;
+    if index != 0 {
+        return Err(Error::Conflict);
+    }
     Ok(action)
 }
 pub fn evaluate(
@@ -104,7 +112,9 @@ pub fn evaluate(
     }
     let count = input[15] as usize;
     let current = prior(input)?;
-    if current == Action::OfferCpu(0) && count != 1 { return Err(Error::Conflict); }
+    if current == Action::OfferCpu(0) && count != 1 {
+        return Err(Error::Conflict);
+    }
     let mut selected = 0;
     let mut best = i16::MIN;
     let mut scores = [0i16; 32];

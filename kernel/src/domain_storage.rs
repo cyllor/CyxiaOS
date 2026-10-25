@@ -837,8 +837,10 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target,
-            observe: |domain, target| observation(domain, target)
-                .map(cyxia_prototype::features::DomainObservation::complete),
+            observe: |domain, target| {
+                observation(domain, target)
+                    .map(cyxia_prototype::features::DomainObservation::complete)
+            },
             current: control_current,
             legal: validate_action,
             target_features,

@@ -69,8 +69,14 @@ pub struct QuoteStopWire {
     pub issued_ns: u64,
 }
 impl QuoteStopWire {
-    pub const EMPTY: Self = Self { boot_epoch: 0, replay_id: 0, owner_id: 0,
-        owner_generation: 0, sequence: 0, issued_ns: 0 };
+    pub const EMPTY: Self = Self {
+        boot_epoch: 0,
+        replay_id: 0,
+        owner_id: 0,
+        owner_generation: 0,
+        sequence: 0,
+        issued_ns: 0,
+    };
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,8 +88,13 @@ pub struct QuoteStopReceiptWire {
     pub outcome: u64,
 }
 impl QuoteStopReceiptWire {
-    pub const EMPTY: Self = Self { command: QuoteStopWire::EMPTY, offer_version: 0,
-        started_ns: 0, finished_ns: 0, outcome: DOMAIN_PENDING };
+    pub const EMPTY: Self = Self {
+        command: QuoteStopWire::EMPTY,
+        offer_version: 0,
+        started_ns: 0,
+        finished_ns: 0,
+        outcome: DOMAIN_PENDING,
+    };
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

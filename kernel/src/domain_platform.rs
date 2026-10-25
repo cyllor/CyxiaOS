@@ -13,12 +13,12 @@ use cyxia_prototype::{
 mod ipi;
 #[path = "domain_platform/irq_metrics.rs"]
 mod irq_metrics;
+#[path = "domain_platform/irq_replay.rs"]
+pub mod irq_replay;
 #[path = "domain_platform/read_snapshot.rs"]
 pub(crate) mod read_snapshot;
 #[path = "domain_platform/replay.rs"]
 pub mod replay;
-#[path = "domain_platform/irq_replay.rs"]
-pub mod irq_replay;
 pub use ipi::{consume_ipi, ipi_enter, ipi_result, register_ipi_cpu, request_ipi};
 use irq_metrics::{Histogram, Snapshot};
 const IRQ_SLOTS: usize = 32;
@@ -73,20 +73,30 @@ const TIMER_SERVICE: ObjectKey = ObjectKey {
 };
 static mut TIMER_POLICY: Option<(ApplyId, PolicyStamp, u16)> = None;
 static TIMER_USED_VERSION: AtomicU64 = AtomicU64::new(0);
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy)]
 struct ControlView {
-    published_ns:u64,measurement_core:u64,
-    irq:[Option<[u64;4]>;IRQ_SLOTS],timer:Option<[u64;4]>,soft_timers:usize,
-    timer_policy:Option<(ApplyId,PolicyStamp,u16)>,
+    published_ns: u64,
+    measurement_core: u64,
+    irq: [Option<[u64; 4]>; IRQ_SLOTS],
+    timer: Option<[u64; 4]>,
+    soft_timers: usize,
+    timer_policy: Option<(ApplyId, PolicyStamp, u16)>,
 }
-static CONTROL_VIEW:read_snapshot::ReadSnapshot<ControlView>=read_snapshot::ReadSnapshot::new();
-fn owner_view()->ControlView{
+static CONTROL_VIEW: read_snapshot::ReadSnapshot<ControlView> = read_snapshot::ReadSnapshot::new();
+fn owner_view() -> ControlView {
     owner();
-    ControlView{published_ns:now_ns(),measurement_core:unsafe{*core::ptr::addr_of!(WINDOW_CORE)},
-        irq:unsafe{*core::ptr::addr_of!(IRQ_MEASUREMENTS)},timer:unsafe{*core::ptr::addr_of!(TIMER_MEASUREMENTS)},
-        soft_timers:unsafe{(&*core::ptr::addr_of!(TIMERS)).soft_observation().0},timer_policy:unsafe{*core::ptr::addr_of!(TIMER_POLICY)}}
+    ControlView {
+        published_ns: now_ns(),
+        measurement_core: unsafe { *core::ptr::addr_of!(WINDOW_CORE) },
+        irq: unsafe { *core::ptr::addr_of!(IRQ_MEASUREMENTS) },
+        timer: unsafe { *core::ptr::addr_of!(TIMER_MEASUREMENTS) },
+        soft_timers: unsafe { (&*core::ptr::addr_of!(TIMERS)).soft_observation().0 },
+        timer_policy: unsafe { *core::ptr::addr_of!(TIMER_POLICY) },
+    }
 }
-fn publish_view(){let _=CONTROL_VIEW.publish(owner_view());}
+fn publish_view() {
+    let _ = CONTROL_VIEW.publish(owner_view());
+}
 // Keep the IRQ measurement array in its protected snapshot. Timer candidate
 // revalidation needs just one scalar or policy stamp, and must not copy all
 // IRQ observations on every legality/current-parameter check.
@@ -410,7 +420,10 @@ pub fn unknown_irq() {
     increment(&UNKNOWN);
 }
 pub fn irq_key(irq: u32) -> Option<ObjectKey> {
-    slot(irq).ok().map(|_| ObjectKey { id: u64::from(irq), generation: 1 })
+    slot(irq).ok().map(|_| ObjectKey {
+        id: u64::from(irq),
+        generation: 1,
+    })
 }
 #[derive(Clone, Copy)]
 pub struct IrqObservation {
@@ -576,14 +589,23 @@ pub fn poll(now: u64) -> Result<(), Error> {
             if !LIVE[i].load(Ordering::Acquire) {
                 continue;
             }
-            let key = ObjectKey { id: IDS[i].load(Ordering::Acquire), generation: 1 };
-            crate::learning_evidence::measure(key,
-                cyxia_prototype::learning::reward::CpuClass::ExecutorAction, || poll_route(i, now))?;
+            let key = ObjectKey {
+                id: IDS[i].load(Ordering::Acquire),
+                generation: 1,
+            };
+            crate::learning_evidence::measure(
+                key,
+                cyxia_prototype::learning::reward::CpuClass::ExecutorAction,
+                || poll_route(i, now),
+            )?;
         }
-        crate::learning_evidence::measure(TIMER_SERVICE,
-            cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || unsafe {
+        crate::learning_evidence::measure(
+            TIMER_SERVICE,
+            cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+            || unsafe {
                 (&mut *core::ptr::addr_of_mut!(TIMERS)).poll(now, TIMER_SLOTS, &mut TimerEvents)
-            })?;
+            },
+        )?;
         for i in 0..TIMER_SLOTS {
             let event = unsafe { (*core::ptr::addr_of_mut!(EVENTS))[i].take() };
             if let Some(key) = event
@@ -603,15 +625,22 @@ fn poll_route(i: usize, now: u64) -> Result<(), Error> {
     let router = unsafe { (*core::ptr::addr_of_mut!(ROUTERS))[i].as_mut().unwrap() };
     let progress = router.poll(now, &mut Hardware);
     if let Ok(progress) = progress {
-        unsafe { (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress); }
-        if progress == IrqProgress::Pending { return Ok(()); }
+        unsafe {
+            (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress);
+        }
+        if progress == IrqProgress::Pending {
+            return Ok(());
+        }
     }
     let current = topology(i)?;
     let legal = IRQ_ALLOWED & current.healthy_business & !current.draining;
-    let needed = ROUTE_BLOCKED[i].load(Ordering::Acquire) || legal == 0
+    let needed = ROUTE_BLOCKED[i].load(Ordering::Acquire)
+        || legal == 0
         || legal.trailing_zeros() as u64 != TARGET[i].load(Ordering::Acquire);
-    if needed && (router.policy_expired(now) || matches!(progress, Ok(IrqProgress::Degraded(_))))
-        && now >= unsafe { (*core::ptr::addr_of!(NEXT_RETRY))[i] } {
+    if needed
+        && (router.policy_expired(now) || matches!(progress, Ok(IrqProgress::Degraded(_))))
+        && now >= unsafe { (*core::ptr::addr_of!(NEXT_RETRY))[i] }
+    {
         let progress = router.force_baseline(now, &mut Hardware)?;
         unsafe {
             (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress);
@@ -695,10 +724,11 @@ fn sample_observations(now: u64) {
     }
 }
 fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
-    if !READY.load(Ordering::Acquire){return None}
+    if !READY.load(Ordering::Acquire) {
+        return None;
+    }
     if domain == 7 {
-        return (ordinal == 0
-            && inspect_view(|view| Ok(view.soft_timers != 0)).ok()?)
+        return (ordinal == 0 && inspect_view(|view| Ok(view.soft_timers != 0)).ok()?)
             .then_some(TIMER_SERVICE);
     }
     (0..COUNT.load(Ordering::Acquire))
@@ -734,11 +764,13 @@ fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error>
         if key != TIMER_SERVICE {
             return Err(Error::Stale);
         }
-        return inspect_view(|view| Ok(Action::SoftCoalesce(
-            view.timer_policy
-                .filter(|(_, s, _)| s.live(now_ns()))
-                .map_or(0, |(_, _, v)| v),
-        )));
+        return inspect_view(|view| {
+            Ok(Action::SoftCoalesce(
+                view.timer_policy
+                    .filter(|(_, s, _)| s.live(now_ns()))
+                    .map_or(0, |(_, _, v)| v),
+            ))
+        });
     }
     if key.generation != 1 {
         return Err(Error::Stale);
@@ -750,8 +782,11 @@ fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error>
 fn control_legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
     action.validate()?;
     match action {
-        Action::SoftCoalesce(_) if key == TIMER_SERVICE
-            && inspect_view(|view| Ok(view.soft_timers != 0))? => Ok(()),
+        Action::SoftCoalesce(_)
+            if key == TIMER_SERVICE && inspect_view(|view| Ok(view.soft_timers != 0))? =>
+        {
+            Ok(())
+        }
         Action::IrqTarget(cpu) if key.generation == 1 => {
             let i = slot(u32::try_from(key.id).map_err(|_| Error::Range)?)?;
             let t = topology(i)?;
@@ -851,8 +886,10 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target: control_target,
-            observe: |domain, target| control_observe(domain, target)
-                .map(cyxia_prototype::features::DomainObservation::complete),
+            observe: |domain, target| {
+                control_observe(domain, target)
+                    .map(cyxia_prototype::features::DomainObservation::complete)
+            },
             current: control_current,
             legal: control_legal,
             target_features: |action, key| {

@@ -170,9 +170,12 @@ fn with<R>(f: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
     }
 }
 fn publish_view(state: &State) {
-    replay_sources::publish(state.console_key, state.services.map(|item| {
-        item.map(|service| (service.key, service.recipe))
-    }));
+    replay_sources::publish(
+        state.console_key,
+        state
+            .services
+            .map(|item| item.map(|service| (service.key, service.recipe))),
+    );
     let now = now_ns();
     let calls = state.console.calls.saturating_sub(state.console_calls);
     let full = state.console.full.saturating_sub(state.console_full);
@@ -319,7 +322,9 @@ pub fn console_ready() -> bool {
 /// Only the ordinary framed console pump is a Canary target. Critical boot
 /// and panic UART paths do not use this queued batch policy.
 pub fn canary_target() -> Result<cyxia_prototype::learning::governance::TargetRegistration, Error> {
-    if !console_ready() { return Err(Error::NotReady); }
+    if !console_ready() {
+        return Err(Error::NotReady);
+    }
     read(|view| console_baseline::registration(view.console_key, view.console_poisoned))
 }
 struct Frame {
@@ -368,15 +373,26 @@ pub(crate) fn replay_console_enqueue(bytes: &[u8]) -> Result<u64, Error> {
     crate::domain_tasks::authorize_service_turn()?;
     with(|s| {
         s.console.enqueue(bytes, now_ns())?;
-        s.console.written.checked_add(s.console.queued() as u64).ok_or(Error::Overflow)
+        s.console
+            .written
+            .checked_add(s.console.queued() as u64)
+            .ok_or(Error::Overflow)
     })
 }
 pub(crate) fn replay_console_state() -> Result<(ObjectKey, u64, usize, bool), Error> {
     crate::domain_tasks::authorize_service_turn()?;
-    with(|s| Ok((s.console_key, s.console.written, s.console.queued(), s.console.poisoned())))
+    with(|s| {
+        Ok((
+            s.console_key,
+            s.console.written,
+            s.console.queued(),
+            s.console.poisoned(),
+        ))
+    })
 }
 /// The executor's actual accepted installation, before any UART receipt.
-pub(crate) fn replay_console_installation() -> Result<Option<(PolicyStamp, ExecutionState)>, Error> {
+pub(crate) fn replay_console_installation() -> Result<Option<(PolicyStamp, ExecutionState)>, Error>
+{
     crate::domain_tasks::authorize_service_turn()?;
     with(|s| Ok(s.console_record.map(|r| (r.stamp, r.state))))
 }
@@ -428,10 +444,18 @@ fn pump_console(s: &mut State, now: u64) -> Result<(), Error> {
         s.console_wait = 0;
     }
     let before = s.console.written;
-    let receipt = crate::learning_evidence::measure(s.console_key,
-        cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || s.console.pump(
-            now, &mut Uart { base: crate::UART.load(Ordering::Acquire) },
-        ));
+    let receipt = crate::learning_evidence::measure(
+        s.console_key,
+        cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+        || {
+            s.console.pump(
+                now,
+                &mut Uart {
+                    base: crate::UART.load(Ordering::Acquire),
+                },
+            )
+        },
+    );
     crate::interrupts::TEST_PROGRESS
         .bytes
         .fetch_add(s.console.written.saturating_sub(before), Ordering::Relaxed);
@@ -570,23 +594,26 @@ fn poll_services(s: &mut State, now: u64) -> Result<(), Error> {
             continue;
         };
         if let Some(apply) = service.active {
-            crate::learning_evidence::measure(apply.target,
-                cyxia_prototype::learning::reward::CpuClass::ExecutorAction, || {
-                let old = s.recovery.query(apply)?;
-                let receipt = s.recovery.poll(apply, now, &mut Recovery { apply })?;
-                if receipt.state.terminal() {
-                    service.active = None;
-                    if receipt.state == ExecutionState::Applied {
-                        service.key.generation = receipt.generation;
-                        service.pending_probe = None;
-                        service.next_probe = now;
-                        service.since = now;
-                    } else if old.state != receipt.state {
-                        count_error(service, now);
+            crate::learning_evidence::measure(
+                apply.target,
+                cyxia_prototype::learning::reward::CpuClass::ExecutorAction,
+                || {
+                    let old = s.recovery.query(apply)?;
+                    let receipt = s.recovery.poll(apply, now, &mut Recovery { apply })?;
+                    if receipt.state.terminal() {
+                        service.active = None;
+                        if receipt.state == ExecutionState::Applied {
+                            service.key.generation = receipt.generation;
+                            service.pending_probe = None;
+                            service.next_probe = now;
+                            service.since = now;
+                        } else if old.state != receipt.state {
+                            count_error(service, now);
+                        }
                     }
-                }
-                Ok::<(), Error>(())
-            })?;
+                    Ok::<(), Error>(())
+                },
+            )?;
         }
         // Real readonly IPC requests and EL0 replies supply liveness. No timer
         // callback or generation assignment manufactures a heartbeat.
@@ -609,7 +636,10 @@ fn poll_services(s: &mut State, now: u64) -> Result<(), Error> {
                     }
                 }
             }
-        } else if service.active.is_none() && now >= service.next_probe && !replay::owns(service.recipe) {
+        } else if service.active.is_none()
+            && now >= service.next_probe
+            && !replay::owns(service.recipe)
+        {
             let id = service.request;
             let next = id.checked_add(1).ok_or(Error::Overflow)?;
             match crate::domain_tasks::recoverable_submit(service.recipe, id, id) {
@@ -794,7 +824,9 @@ fn legal_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Resul
             if recipe != service.recipe {
                 return Err(Error::Auth);
             }
-            if replay::preparing(service.recipe) { return Err(Error::Busy); }
+            if replay::preparing(service.recipe) {
+                return Err(Error::Busy);
+            }
             if service.active.is_some() || s.recovery.isolated(target)? {
                 return Err(Error::Busy);
             }
@@ -852,7 +884,9 @@ fn legal_view(s: &ReadView, action: Action, target: ObjectKey, now: u64) -> Resu
             if recipe != service.recipe {
                 return Err(Error::Auth);
             }
-            if replay::preparing(service.recipe) { return Err(Error::Busy); }
+            if replay::preparing(service.recipe) {
+                return Err(Error::Busy);
+            }
             if service.active || service.isolated? {
                 return Err(Error::Busy);
             }
@@ -1062,8 +1096,10 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind,
             target,
-            observe: |domain, target| observation(domain, target)
-                .map(cyxia_prototype::features::DomainObservation::complete),
+            observe: |domain, target| {
+                observation(domain, target)
+                    .map(cyxia_prototype::features::DomainObservation::complete)
+            },
             current,
             legal,
             target_features,

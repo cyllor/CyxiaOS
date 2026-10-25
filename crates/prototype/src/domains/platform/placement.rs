@@ -284,7 +284,9 @@ impl<const H: usize> PlacementQueue<H> {
             }
             return self.status(request.key);
         }
-        if submitted_ns > now { return Err(Error::Range); }
+        if submitted_ns > now {
+            return Err(Error::Range);
+        }
         let deadline = submitted_ns
             .checked_add(PLACEMENT_TIMEOUT_NS)
             .ok_or(Error::Overflow)?;
@@ -472,11 +474,16 @@ impl<const H: usize> PlacementQueue<H> {
                             }
                         })
                     }
-                    PlacementAdmission::Retry => { pending.phase = Phase::Admission; None }
+                    PlacementAdmission::Retry => {
+                        pending.phase = Phase::Admission;
+                        None
+                    }
                     PlacementAdmission::Rejected(error) => Some(PlacementOutcome::Rejected(error)),
                     PlacementAdmission::Unknown => None,
                 };
-                if pending.outcome.is_some() { pending.phase = Phase::Receipt; }
+                if pending.outcome.is_some() {
+                    pending.phase = Phase::Receipt;
+                }
             }
             if pending.phase == Phase::Receipt {
                 let outcome = pending.outcome.ok_or(Error::Conflict)?;

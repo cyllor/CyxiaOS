@@ -111,7 +111,9 @@ impl Guard {
         if target.id == 0 || target.generation == 0 {
             return Err(Error::Stale);
         }
-        if baseline != Action::OfferCpu(0) { baseline.validate()?; }
+        if baseline != Action::OfferCpu(0) {
+            baseline.validate()?;
+        }
         Ok(Self {
             target,
             current: baseline,
@@ -159,7 +161,9 @@ impl Guard {
     /// a conservative new hold when that real stopped state is observed.
     pub fn observe_stopped_offer(&mut self, now_ns: u64) -> Result<(), Error> {
         self.time(now_ns)?;
-        if self.family() != (16, 1) { return Err(Error::Conflict); }
+        if self.family() != (16, 1) {
+            return Err(Error::Conflict);
+        }
         if self.current != Action::OfferCpu(0) {
             self.current = Action::OfferCpu(0);
             self.last_change_ns = now_ns;
@@ -440,13 +444,23 @@ impl Guard {
 /// One adjacent step in the owner's sorted legal set. Stopped quotes are
 /// owner state, never a candidate: reopening admits only the first positive
 /// legal tier. Callers still enforce their hold, freeze, and authority gates.
-pub fn adjacent(current: Action, selected: Action, legal: &[Option<Action>]) -> Result<bool, Error> {
+pub fn adjacent(
+    current: Action,
+    selected: Action,
+    legal: &[Option<Action>],
+) -> Result<bool, Error> {
     selected.validate()?;
-    let selected_index = legal.iter().position(|a| *a == Some(selected)).ok_or(Error::Conflict)?;
+    let selected_index = legal
+        .iter()
+        .position(|a| *a == Some(selected))
+        .ok_or(Error::Conflict)?;
     if current == Action::OfferCpu(0) {
         return Ok(matches!(selected, Action::OfferCpu(_))
             && legal.iter().position(Option::is_some) == Some(selected_index));
     }
-    let previous = legal.iter().position(|a| *a == Some(current)).ok_or(Error::Stale)?;
+    let previous = legal
+        .iter()
+        .position(|a| *a == Some(current))
+        .ok_or(Error::Stale)?;
     Ok(selected_index.abs_diff(previous) <= 1)
 }

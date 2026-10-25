@@ -82,7 +82,15 @@ fn initialized_volume_admits_unsequenced_application_and_placement_journals_only
     for bytes in [b"CXAPP1".as_slice(), b"CXDP2"] {
         assert!(identity::append_allowed(0, 101, bytes));
     }
-    for bytes in [b"CXAPP0".as_slice(), b"CXAPP2", b"CXDP1", b"CXDP3", b"CXE1", b"other", b""] {
+    for bytes in [
+        b"CXAPP0".as_slice(),
+        b"CXAPP2",
+        b"CXDP1",
+        b"CXDP3",
+        b"CXE1",
+        b"other",
+        b"",
+    ] {
         assert!(!identity::append_allowed(0, 101, bytes));
     }
     assert!(identity::append_allowed(1, 101, b"CXE1"));

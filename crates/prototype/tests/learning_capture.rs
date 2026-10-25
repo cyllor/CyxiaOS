@@ -167,54 +167,95 @@ fn late_real_completion_is_retained_without_faking_fixed_window_success() {
 #[test]
 fn scheduled_custody_keeps_release_and_actual_admission_separate() {
     let mut capture = Capture::<32, 100>::empty();
-    capture.start(config(false, 1), &sources(false), &requests()).unwrap();
+    capture
+        .start(config(false, 1), &sources(false), &requests())
+        .unwrap();
     for request in requests() {
-        capture.arm_scheduled(request.owner, request.id, FIRST).unwrap();
-        capture.arm_scheduled(request.owner, request.id, FIRST).unwrap();
+        capture
+            .arm_scheduled(request.owner, request.id, FIRST)
+            .unwrap();
+        capture
+            .arm_scheduled(request.owner, request.id, FIRST)
+            .unwrap();
     }
     let actual = OBS + 250_000_000;
-    capture.result(owner(10), 1, RequestResult::Completed { finished_ns: actual }).unwrap();
+    capture
+        .result(
+            owner(10),
+            1,
+            RequestResult::Completed {
+                finished_ns: actual,
+            },
+        )
+        .unwrap();
     let timing = capture.request_timing(0).unwrap();
     assert!(timing.scheduled);
     assert_eq!(timing.frozen.arrived_ns, OBS);
     assert_eq!(timing.issued_observed_ns, Some(FIRST));
     assert_eq!(capture.requests()[0].arrived_ns, OBS);
-    assert_eq!(capture.actual_result(1), Some(RequestResult::Completed { finished_ns: actual }));
+    assert_eq!(
+        capture.actual_result(1),
+        Some(RequestResult::Completed {
+            finished_ns: actual
+        })
+    );
     closed(&mut capture, false);
     assert!(capture.seal(END + 2_000).unwrap().exclusion.is_none());
 
     let mut late = Capture::<32, 100>::empty();
-    late.start(config(false, 2), &sources(false), &requests()).unwrap();
-    assert_eq!(late.arm_scheduled(owner(10), 1, OBS + 1), Err(Error::Deadline));
+    late.start(config(false, 2), &sources(false), &requests())
+        .unwrap();
+    assert_eq!(
+        late.arm_scheduled(owner(10), 1, OBS + 1),
+        Err(Error::Deadline)
+    );
     assert!(late.status().fault.is_some());
 
     let mut observed = Capture::<32, 100>::empty();
-    observed.start(config(false, 3), &sources(false), &requests()).unwrap();
+    observed
+        .start(config(false, 3), &sources(false), &requests())
+        .unwrap();
     assert_eq!(observed.issued(owner(10), 1, OBS + 1), Err(Error::Evidence));
-    assert_eq!(observed.request_timing(0).unwrap().issued_observed_ns, Some(OBS + 1));
+    assert_eq!(
+        observed.request_timing(0).unwrap().issued_observed_ns,
+        Some(OBS + 1)
+    );
     assert!(!observed.request_timing(0).unwrap().scheduled);
 }
 
 #[test]
 fn foreign_trace_staging_never_changes_the_local_seal_or_coverage() {
     let mut capture = Capture::<32, 100>::empty();
-    capture.start(config(false, 1), &sources(false), &requests()).unwrap();
+    capture
+        .start(config(false, 1), &sources(false), &requests())
+        .unwrap();
     let policy = capture.source(owner(1), CpuClass::Policy).unwrap();
     capture.record(policy, 1, FIRST, FIRST + 100).unwrap();
-    issued(&mut capture); closed(&mut capture, false);
+    issued(&mut capture);
+    closed(&mut capture, false);
     let seal = capture.seal(END + 2_000).unwrap();
     let coverage = capture.coverage(seal).unwrap();
     let local = capture.intervals().to_vec();
     let foreign = cyxia_prototype::learning::reward::CpuInterval {
-        node: [2; 32], core: 3, start_ns: OBS, end_ns: OBS + 50, class: CpuClass::ExecutorWork,
+        node: [2; 32],
+        core: 3,
+        start_ns: OBS,
+        end_ns: OBS + 50,
+        class: CpuClass::ExecutorWork,
     };
     capture.stage_intervals(seal, 0, &[foreign]).unwrap();
     assert_eq!(capture.sealed(), Some(seal));
     assert_eq!(capture.coverage(seal).unwrap(), coverage);
     assert_eq!(capture.intervals(), local);
-    assert_eq!(capture.staged_intervals(seal, 1).unwrap(), &[local[0], foreign]);
+    assert_eq!(
+        capture.staged_intervals(seal, 1).unwrap(),
+        &[local[0], foreign]
+    );
     assert_eq!(seal.intervals, 1);
-    assert_eq!(capture.stage_intervals(seal, 32, &[foreign]), Err(Error::Capacity));
+    assert_eq!(
+        capture.stage_intervals(seal, 32, &[foreign]),
+        Err(Error::Capacity)
+    );
     assert_eq!(capture.staged_intervals(seal, 32), Err(Error::Capacity));
 }
 

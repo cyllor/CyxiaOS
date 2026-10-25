@@ -76,10 +76,14 @@ const PRODUCER: ObjectKey = ObjectKey {
     generation: 7,
 };
 pub mod learning_canary {
-    pub fn control_step() -> Result<bool, cyxia_prototype::domains::Error> { Ok(false) }
+    pub fn control_step() -> Result<bool, cyxia_prototype::domains::Error> {
+        Ok(false)
+    }
 }
 pub mod learning_replay {
-    pub fn control_step() -> Result<bool, cyxia_prototype::domains::Error> { Ok(false) }
+    pub fn control_step() -> Result<bool, cyxia_prototype::domains::Error> {
+        Ok(false)
+    }
 }
 fn key(id: u64) -> ObjectKey {
     ObjectKey { id, generation: 1 }

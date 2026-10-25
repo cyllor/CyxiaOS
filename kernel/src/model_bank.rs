@@ -140,8 +140,12 @@ impl<M: Memory> ModelBank<M> {
             .ok_or(Error::NotReady)
     }
     pub fn provenance(&self, binding: ModelBinding) -> Result<Provenance, Error> {
-        self.models.iter().flatten().find(|model| model.binding == binding)
-            .map(|model| model.provenance).ok_or(Error::Stale)
+        self.models
+            .iter()
+            .flatten()
+            .find(|model| model.binding == binding)
+            .map(|model| model.provenance)
+            .ok_or(Error::Stale)
     }
     pub fn schemas(&self) -> Result<Schemas, Error> {
         self.identity
@@ -249,20 +253,32 @@ impl<M: Memory> ModelBank<M> {
         }
         // Identical bytes can exist in an old pinned bank and a newly validated
         // candidate after A -> B -> A. Hash alone must not select that stale B.
-        let same_model = |model: Stored| model.binding.model_hash == next.model_hash
-            && model.binding.schema_hash == next.schema_hash;
+        let same_model = |model: Stored| {
+            model.binding.model_hash == next.model_hash
+                && model.binding.schema_hash == next.schema_hash
+        };
         let i = match kind {
-            ChangeKind::Promotion => self.models.iter().enumerate().find_map(|(i, model)| {
-                let model = (*model)?;
-                if same_model(model) && model.binding.generation == active.generation
-                    && matches!(model.provenance, Provenance::Validated { parent, .. }
-                        if parent == active.model_hash) {
-                    Some(i)
-                } else { None }
-            }).ok_or(Error::Auth)?,
-            ChangeKind::Rollback => self.previous.filter(|&i| {
-                self.models[i].is_some_and(same_model)
-            }).ok_or(Error::Stale)?,
+            ChangeKind::Promotion => self
+                .models
+                .iter()
+                .enumerate()
+                .find_map(|(i, model)| {
+                    let model = (*model)?;
+                    if same_model(model)
+                        && model.binding.generation == active.generation
+                        && matches!(model.provenance, Provenance::Validated { parent, .. }
+                        if parent == active.model_hash)
+                    {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(Error::Auth)?,
+            ChangeKind::Rollback => self
+                .previous
+                .filter(|&i| self.models[i].is_some_and(same_model))
+                .ok_or(Error::Stale)?,
         };
         if self
             .memory

@@ -233,19 +233,28 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
             }
             #[cfg(feature = "unified-runtime")]
             IrqAck::Active { id, .. } => {
-                let owner = crate::domain_platform::irq_key(id).unwrap_or(cyxia_prototype::domains::ObjectKey {
-                    id: u64::from(id), generation: 1,
-                });
-                crate::learning_evidence::measure(owner,
-                    cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || {
-                    let registered = crate::domain_platform::irq_enter(gic(), id, slot, irq_started);
-                    if !registered {
-                        let _ = gic().mask(id);
-                        crate::domain_platform::unknown_irq();
-                    }
-                    gic().end(ack);
-                    if registered { crate::domain_platform::irq_complete(id); }
-                });
+                let owner = crate::domain_platform::irq_key(id).unwrap_or(
+                    cyxia_prototype::domains::ObjectKey {
+                        id: u64::from(id),
+                        generation: 1,
+                    },
+                );
+                crate::learning_evidence::measure(
+                    owner,
+                    cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+                    || {
+                        let registered =
+                            crate::domain_platform::irq_enter(gic(), id, slot, irq_started);
+                        if !registered {
+                            let _ = gic().mask(id);
+                            crate::domain_platform::unknown_irq();
+                        }
+                        gic().end(ack);
+                        if registered {
+                            crate::domain_platform::irq_complete(id);
+                        }
+                    },
+                );
                 prototype_runtime::irq_exit(slot);
             }
             #[cfg(feature = "unified-runtime")]

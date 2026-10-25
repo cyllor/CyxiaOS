@@ -1174,7 +1174,14 @@ impl<'a, 'model> Governance<'a, 'model> {
         work: &mut RewardWorkspace,
         authority: &impl GovernanceAuthority,
     ) -> Result<(), Error> {
-        self.observe_second_bounded(gate, second, baseline, candidate, work.latency_scratch(), authority)
+        self.observe_second_bounded(
+            gate,
+            second,
+            baseline,
+            candidate,
+            work.latency_scratch(),
+            authority,
+        )
     }
     /// A one-second comparison needs only one latency per request. The native
     /// owner uses its real 100-entry scratch instead of allocating CPU-union

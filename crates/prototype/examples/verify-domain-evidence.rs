@@ -193,12 +193,12 @@ fn main() -> Result<(), String> {
         // elapsed/CPU overflow or a changed protected snapshot generation. The
         // raw reply still must replay exactly, and no version may be published.
         // Every decoded or published selection must retain the exact index.
-        let rejected_before_selection = r[13] == 0
-            && r[14] == 3
-            && matches!(r[15], 4 | 8 | 19)
-            && r[17] == u64::MAX;
-        require(r[17] == expected[4] || rejected_before_selection,
-            "selected candidate receipt binding")?;
+        let rejected_before_selection =
+            r[13] == 0 && r[14] == 3 && matches!(r[15], 4 | 8 | 19) && r[17] == u64::MAX;
+        require(
+            r[17] == expected[4] || rejected_before_selection,
+            "selected candidate receipt binding",
+        )?;
         replayed += 1;
         domains.insert(r[2]);
         if r[13] == 0 {

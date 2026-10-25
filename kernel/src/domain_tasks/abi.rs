@@ -547,14 +547,19 @@ pub(super) fn syscall_locked(
         }
         19 => {
             let len = usize::try_from(args[2]).map_err(|_| Error::Range)?;
-            if args[0] == 0 || len == 0 || len > 3984 || !len.is_multiple_of(8)
-                || args[3] != 0 || args[4] != 0
+            if args[0] == 0
+                || len == 0
+                || len > 3984
+                || !len.is_multiple_of(8)
+                || args[3] != 0
+                || args[4] != 0
             {
                 return Err(Error::Range);
             }
             let mut bytes = [0; 3984];
             read(s, task.key, args[1], &mut bytes[..len])?;
-            let key = crate::domain_network::submit_placement_request(task.key, args[0], &bytes[..len])?;
+            let key =
+                crate::domain_network::submit_placement_request(task.key, args[0], &bytes[..len])?;
             context.regs[1] = key.id;
             context.regs[2] = key.generation;
         }
@@ -562,9 +567,13 @@ pub(super) fn syscall_locked(
             if args[2..].iter().any(|value| *value != 0) {
                 return Err(Error::Format);
             }
-            let result = crate::domain_network::placement_request_status(task.key, ObjectKey {
-                id: args[0], generation: args[1],
-            })?;
+            let result = crate::domain_network::placement_request_status(
+                task.key,
+                ObjectKey {
+                    id: args[0],
+                    generation: args[1],
+                },
+            )?;
             context.regs[1..4].copy_from_slice(&result);
         }
         _ => return Err(Error::Unsupported),

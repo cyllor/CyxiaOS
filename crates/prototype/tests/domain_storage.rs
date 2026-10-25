@@ -763,34 +763,94 @@ fn foreground_demand_distinguishes_disk_misses_from_cached_and_zero_filled_work(
 fn replay_cold_reset_requires_real_durability_and_preserves_other_objects() {
     large(|| {
         let (mut disk, mut journal) = fixture();
-        let mut scratch = [0; 8192]; let mut fs = FileSystem::<64>::new();
+        let mut scratch = [0; 8192];
+        let mut fs = FileSystem::<64>::new();
         fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
-        let object = fs.create("/replay", &mut journal, &mut disk, &mut scratch).unwrap();
-        let other = fs.create("/ordinary", &mut journal, &mut disk, &mut scratch).unwrap();
-        let h = fs.open("/replay", OpenMode::ReadWrite, &mut journal, &mut disk, &mut scratch).unwrap();
-        let o = fs.open("/ordinary", OpenMode::ReadWrite, &mut journal, &mut disk, &mut scratch).unwrap();
-        fs.write(h, 0, &[17; 8192], &mut journal, &mut disk, &mut scratch).unwrap();
-        fs.write(o, 0, &[91; 4096], &mut journal, &mut disk, &mut scratch).unwrap();
-        assert_eq!(fs.discard_clean_object_cache(object, 0, 64), Err(Error::Busy));
+        let object = fs
+            .create("/replay", &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        let other = fs
+            .create("/ordinary", &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        let h = fs
+            .open(
+                "/replay",
+                OpenMode::ReadWrite,
+                &mut journal,
+                &mut disk,
+                &mut scratch,
+            )
+            .unwrap();
+        let o = fs
+            .open(
+                "/ordinary",
+                OpenMode::ReadWrite,
+                &mut journal,
+                &mut disk,
+                &mut scratch,
+            )
+            .unwrap();
+        fs.write(h, 0, &[17; 8192], &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        fs.write(o, 0, &[91; 4096], &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        assert_eq!(
+            fs.discard_clean_object_cache(object, 0, 64),
+            Err(Error::Busy)
+        );
         assert_eq!(fs.metrics().dirty_pages, 3);
         let receipt = fs.fsync(h, &mut journal, &mut disk, &mut scratch).unwrap();
-        assert_eq!(fs.stat_object(object).unwrap().durable_write_seq, receipt.write_seq);
+        assert_eq!(
+            fs.stat_object(object).unwrap().durable_write_seq,
+            receipt.write_seq
+        );
         let before = fs.cache_usage();
         let mut cursor = 0;
-        while cursor != 64 { cursor = fs.discard_clean_object_cache(object, cursor, 3).unwrap(); }
+        while cursor != 64 {
+            cursor = fs.discard_clean_object_cache(object, cursor, 3).unwrap();
+        }
         assert_eq!(fs.cache_usage()[0], before[0] - 2);
         assert_eq!(fs.metrics().dirty_pages, 1);
-        let mut bytes = [0; 8192]; let reads = disk.reads;
-        fs.read(o, 0, &mut bytes[..4096], 0, &mut journal, &mut disk, &mut scratch).unwrap();
-        assert_eq!(&bytes[..4096], &[91; 4096]); assert_eq!(disk.reads, reads);
-        fs.read(h, 0, &mut bytes, 0, &mut journal, &mut disk, &mut scratch).unwrap();
-        assert_eq!(bytes, [17; 8192]); assert!(disk.reads > reads);
+        let mut bytes = [0; 8192];
+        let reads = disk.reads;
+        fs.read(
+            o,
+            0,
+            &mut bytes[..4096],
+            0,
+            &mut journal,
+            &mut disk,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(&bytes[..4096], &[91; 4096]);
+        assert_eq!(disk.reads, reads);
+        fs.read(h, 0, &mut bytes, 0, &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        assert_eq!(bytes, [17; 8192]);
+        assert!(disk.reads > reads);
         assert_eq!(fs.metrics().last_read_version, 0);
         assert_eq!(fs.metrics().last_flush_version, 0);
         assert_eq!(fs.stat_object(other).unwrap().durable_write_seq, 0);
-        assert_eq!(fs.discard_clean_object_cache(ObjectKey { generation: object.generation + 1, ..object }, 0, 1), Err(Error::Stale));
-        assert_eq!(fs.discard_clean_object_cache(object, 65, 1), Err(Error::Range));
-        assert_eq!(fs.discard_clean_object_cache(object, 0, 0), Err(Error::Range));
+        assert_eq!(
+            fs.discard_clean_object_cache(
+                ObjectKey {
+                    generation: object.generation + 1,
+                    ..object
+                },
+                0,
+                1
+            ),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            fs.discard_clean_object_cache(object, 65, 1),
+            Err(Error::Range)
+        );
+        assert_eq!(
+            fs.discard_clean_object_cache(object, 0, 0),
+            Err(Error::Range)
+        );
     });
 }
 

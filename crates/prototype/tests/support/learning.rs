@@ -129,8 +129,13 @@ pub fn set(
 ) -> CandidateSet {
     set_schemas(model, family, snapshot, sequence, schemas())
 }
-pub fn set_schemas(model: &[u8; MODEL_BYTES], family: Family, snapshot: u64,
-    sequence: u64, bindings: Schemas) -> CandidateSet {
+pub fn set_schemas(
+    model: &[u8; MODEL_BYTES],
+    family: Family,
+    snapshot: u64,
+    sequence: u64,
+    bindings: Schemas,
+) -> CandidateSet {
     let actions = choices(family);
     let entries: Vec<_> = actions
         .iter()
@@ -201,7 +206,12 @@ pub fn sample(
     faults: Faults,
 ) -> Result<AcceptedSample, Error> {
     with_trials(family, group_seed, id, faults, |candidate, baseline| {
-        pair(candidate, baseline, &TestAuthority, &mut RewardWorkspace::new())
+        pair(
+            candidate,
+            baseline,
+            &TestAuthority,
+            &mut RewardWorkspace::new(),
+        )
     })
 }
 pub fn with_trials<T>(
@@ -213,9 +223,14 @@ pub fn with_trials<T>(
 ) -> Result<T, Error> {
     with_trials_schemas(family, group_seed, id, faults, schemas(), run)
 }
-pub fn with_trials_schemas<T>(family: Family, group_seed: u64, id: u64,
-    faults: Faults, bindings: Schemas,
-    run: impl FnOnce(&Trial<'_>, &Trial<'_>) -> Result<T, Error>) -> Result<T, Error> {
+pub fn with_trials_schemas<T>(
+    family: Family,
+    group_seed: u64,
+    id: u64,
+    faults: Faults,
+    bindings: Schemas,
+    run: impl FnOnce(&Trial<'_>, &Trial<'_>) -> Result<T, Error>,
+) -> Result<T, Error> {
     let seed = UntrainedSeed::new(0);
     let model = seed.bytes();
     let obs = 3_000_000_000;

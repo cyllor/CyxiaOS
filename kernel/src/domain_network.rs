@@ -9,11 +9,11 @@ use cyxia_prototype::{
 };
 mod dependencies;
 mod placement_legal;
-mod requests;
 mod quote_stop;
 pub mod replay;
+mod requests;
 pub use quote_stop::{baseline_stop_custody, baseline_stop_quotes};
-pub use requests::{submit as submit_placement_request, status as placement_request_status};
+pub use requests::{status as placement_request_status, submit as submit_placement_request};
 
 pub fn application_request(phase: u64, payload: &mut [u8; 4096], len: usize) -> (u64, usize, u64) {
     owner();
@@ -46,11 +46,28 @@ fn owner_view() -> ReadView {
     owner();
     let mut feedback = unsafe { *core::ptr::addr_of!(FEEDBACK) };
     if let Some(key) = replay::advertised() {
-        if !feedback.waiting.iter().any(|v| v.request_id == key.id && v.request_generation == key.generation) {
-            if let Some(row) = feedback.waiting.iter_mut().find(|v| v.request_generation == 0) {
-                *row = abi::PendingPlacementWire { request_id: key.id, request_generation: key.generation,
-                    queued_us: 0, cpu_milli: 100, memory_pages: 16,
-                    peer_ready: u64::from(feedback.measurement_valid & 4 != 0 && feedback.peer_cpu_milli >= 100 && feedback.peer_memory_pages >= 16) };
+        if !feedback
+            .waiting
+            .iter()
+            .any(|v| v.request_id == key.id && v.request_generation == key.generation)
+        {
+            if let Some(row) = feedback
+                .waiting
+                .iter_mut()
+                .find(|v| v.request_generation == 0)
+            {
+                *row = abi::PendingPlacementWire {
+                    request_id: key.id,
+                    request_generation: key.generation,
+                    queued_us: 0,
+                    cpu_milli: 100,
+                    memory_pages: 16,
+                    peer_ready: u64::from(
+                        feedback.measurement_valid & 4 != 0
+                            && feedback.peer_cpu_milli >= 100
+                            && feedback.peer_memory_pages >= 16,
+                    ),
+                };
             }
         }
     }
@@ -307,7 +324,11 @@ fn measurements(domain: u16, key: ObjectKey) -> Result<DomainObservation, Error>
         let f = &view.feedback;
         let now = crate::domain_platform::now_ns() / 1_000_000;
         if domain == 16
-            && key != (ObjectKey { id: abi::OFFER_SERVICE_ID, generation: 1 })
+            && key
+                != (ObjectKey {
+                    id: abi::OFFER_SERVICE_ID,
+                    generation: 1,
+                })
         {
             return placement_legal::observation(key, f, now);
         }
@@ -336,7 +357,9 @@ fn current(domain: u16, kind: u16, key: ObjectKey) -> Result<Action, Error> {
         if !(0..32).any(|ordinal| target_in(view, domain, kind, ordinal) == Some(key)) {
             return Err(Error::Stale);
         }
-        if domain == 16 && kind == 1 && view.feedback.quotes_stopped == 1 { return Ok(baseline); }
+        if domain == 16 && kind == 1 && view.feedback.quotes_stopped == 1 {
+            return Ok(baseline);
+        }
         let effective = view.effective.get(index(baseline)?).copied().flatten();
         Ok(effective
             .filter(|d| d.apply.target == key && d.stamp.live(crate::domain_platform::now_ns()))
@@ -353,7 +376,12 @@ fn legal_in(view: &ReadView, action: Action, key: ObjectKey) -> Result<(), Error
         return Err(Error::Stale);
     }
     if let Action::Placement(choice) = action {
-        placement_legal::legal(choice, key, &view.feedback, crate::domain_platform::now_ns() / 1_000_000)?;
+        placement_legal::legal(
+            choice,
+            key,
+            &view.feedback,
+            crate::domain_platform::now_ns() / 1_000_000,
+        )?;
     }
     Ok(())
 }
@@ -405,7 +433,9 @@ fn apply(
     } else {
         PolicyStamp::default().accepts_action(action, stamp, now)?;
     }
-    if matches!(action, Action::Placement(_)) { replay::release_target(apply.target)?; }
+    if matches!(action, Action::Placement(_)) {
+        replay::release_target(apply.target)?;
+    }
     unsafe {
         (*core::ptr::addr_of_mut!(DESIRED))[slot] = Some(Desired {
             action,

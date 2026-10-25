@@ -124,7 +124,9 @@ impl RewardWorkspace {
             latencies: [0; MAX_REQUESTS],
         }
     }
-    pub(crate) fn latency_scratch(&mut self) -> &mut [u64] { &mut self.latencies }
+    pub(crate) fn latency_scratch(&mut self) -> &mut [u64] {
+        &mut self.latencies
+    }
 }
 const _: () = assert!(core::mem::size_of::<RewardWorkspace>() <= 1024 * 1024);
 
@@ -587,8 +589,14 @@ fn verify_baseline(t: &Trial<'_>, hash: &mut Sha256) -> Result<(), Error> {
             {
                 return Err(Error::Evidence);
             }
-            if stopped_offer && t.baseline.len() != 1 { return Err(Error::Evidence); }
-            until = until.max(if stopped_offer { t.observation_end_ns } else { b.installed_until_ns });
+            if stopped_offer && t.baseline.len() != 1 {
+                return Err(Error::Evidence);
+            }
+            until = until.max(if stopped_offer {
+                t.observation_end_ns
+            } else {
+                b.installed_until_ns
+            });
         }
         for value in [
             b.owner_boot,

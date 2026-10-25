@@ -13,28 +13,28 @@ mod abi;
 mod execution;
 #[path = "domain_tasks/memory.rs"]
 mod memory;
-#[path = "domain_tasks/service_authority.rs"]
-mod service_authority;
 #[path = "domain_tasks/publication.rs"]
 mod publication;
+#[path = "domain_tasks/service_authority.rs"]
+mod service_authority;
 pub(crate) use publication::{BaselinePublication, reserve_baseline_publication};
 #[path = "domain_tasks/local_evidence.rs"]
 mod local_evidence;
 #[path = "domain_tasks/replay.rs"]
 pub mod replay;
-pub use local_evidence::bind_local_failure_request;
 pub use abi::{
     close_network, fault, grant_endpoint, grant_file_cap, network_drain, network_key,
     network_pending, network_write, open_network, syscall,
 };
 pub use execution::{
-    cancel_spawn, close_admission, dispatch, heartbeat_ns, init_recoverable, probe_status,
-    query_local, local_result, acknowledge_local_result, query_spawn, readonly_drained, recoverable_key, recoverable_result,
-    recoverable_submit, remote_activate, remote_capacity, remote_fault, remote_release,
-    remote_selected, remote_start, remote_stopped, remote_word, request_stop, running, service,
-    start_generation, start_probe_client, stopped, submit_local, submit_spawn,
-    service_io_piece,
+    acknowledge_local_result, cancel_spawn, close_admission, dispatch, heartbeat_ns,
+    init_recoverable, local_result, probe_status, query_local, query_spawn, readonly_drained,
+    recoverable_key, recoverable_result, recoverable_submit, remote_activate, remote_capacity,
+    remote_fault, remote_release, remote_selected, remote_start, remote_stopped, remote_word,
+    request_stop, running, service, service_io_piece, start_generation, start_probe_client,
+    stopped, submit_local, submit_spawn,
 };
+pub use local_evidence::bind_local_failure_request;
 pub use memory::{
     cache_read, copyin, copyout, invalidate_file, probe_user, set_cache_loader, set_file_service,
 };
@@ -724,7 +724,8 @@ static CAPTURES: Captures = Captures(core::cell::UnsafeCell::new([const { None }
 struct WarmCaptures(core::cell::UnsafeCell<[Option<crate::learning_prewarm::Attempt>; 64]>);
 // The same per-CPU ownership as CAPTURES; IRQs never access these cells.
 unsafe impl Sync for WarmCaptures {}
-static WARM_CAPTURES: WarmCaptures = WarmCaptures(core::cell::UnsafeCell::new([const { None }; 64]));
+static WARM_CAPTURES: WarmCaptures =
+    WarmCaptures(core::cell::UnsafeCell::new([const { None }; 64]));
 fn track_credit(
     slot: usize,
     result: Result<Option<Credit>, Error>,
@@ -742,15 +743,28 @@ fn track_credit(
                 .add(slot);
             let old = cell.replace(attempt);
             drop(old);
-            let warm = WARM_CAPTURES.0.get().cast::<Option<crate::learning_prewarm::Attempt>>().add(slot);
+            let warm = WARM_CAPTURES
+                .0
+                .get()
+                .cast::<Option<crate::learning_prewarm::Attempt>>()
+                .add(slot);
             drop(warm.replace(crate::learning_prewarm::attempt_task(credit.thread)));
         }
     }
     result
 }
 fn finish_capture(slot: usize, first: u64, last: u64) {
-    let warm = unsafe { WARM_CAPTURES.0.get().cast::<Option<crate::learning_prewarm::Attempt>>().add(slot).replace(None) };
-    if let Some(mut warm) = warm { let _ = crate::learning_prewarm::finish(&mut warm, first, last); }
+    let warm = unsafe {
+        WARM_CAPTURES
+            .0
+            .get()
+            .cast::<Option<crate::learning_prewarm::Attempt>>()
+            .add(slot)
+            .replace(None)
+    };
+    if let Some(mut warm) = warm {
+        let _ = crate::learning_prewarm::finish(&mut warm, first, last);
+    }
     let attempt = unsafe {
         CAPTURES
             .0
@@ -975,16 +989,28 @@ pub fn begin_service_segment() -> Option<Credit> {
 /// Authority for a bounded CPU0 mechanism piece, including exact baseline
 /// restoration after an optional numerical worker has failed. Merely running
 /// on CPU0, an EL0 TLS slice or an already submitted bill is insufficient.
-pub(crate) struct PaidServiceWitness { _private: () }
+pub(crate) struct PaidServiceWitness {
+    _private: (),
+}
 fn service_witness_locked(s: &State) -> Result<PaidServiceWitness, Error> {
-    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) { return Err(Error::Auth); }
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
+        return Err(Error::Auth);
+    }
     let active = s.active[0].as_ref().ok_or(Error::NotReady)?;
-    service_authority::authorize(service_authority::View {
-        cpu: cpu::slot(), held: active.dispatch, actual: s.scheduler.active(0), layout: s.layout,
-        draining: s.draining, quarantine: s.scheduler.stats().quarantine_mask,
-        kind: CREDIT_KIND[0].load(Ordering::Acquire), published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
-        settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
-    }, now_ns())?;
+    service_authority::authorize(
+        service_authority::View {
+            cpu: cpu::slot(),
+            held: active.dispatch,
+            actual: s.scheduler.active(0),
+            layout: s.layout,
+            draining: s.draining,
+            quarantine: s.scheduler.stats().quarantine_mask,
+            kind: CREDIT_KIND[0].load(Ordering::Acquire),
+            published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
+            settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
+        },
+        now_ns(),
+    )?;
     Ok(PaidServiceWitness { _private: () })
 }
 pub fn authorize_service_turn() -> Result<(), Error> {
@@ -1691,8 +1717,10 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target: control_target,
-            observe: |domain, target| observation(domain, target)
-                .map(cyxia_prototype::features::DomainObservation::complete),
+            observe: |domain, target| {
+                observation(domain, target)
+                    .map(cyxia_prototype::features::DomainObservation::complete)
+            },
             current: control_current,
             legal: validate_action,
             target_features: control_features,

@@ -13,7 +13,9 @@ use cyxia_prototype::{
         manifest::{ModelManifest, Origin, SealedModel, UntrainedSeed},
         train::{self, TrainedModel, Trainer},
         validate::*,
-        worker::{CompletionAuthority, CompletionClaim, Encoder, EncoderState, PreparedJob, Worker},
+        worker::{
+            CompletionAuthority, CompletionClaim, Encoder, EncoderState, PreparedJob, Worker,
+        },
         worker_wire::{self as wire, Header, JobBinding, JobIdentity, Packet, Report},
     },
     model::MODEL_BYTES,
@@ -242,7 +244,9 @@ fn output_loan_can_end_after_every_encoding_step_without_changing_the_job() {
         // This independent access is legal because no output borrow survives
         // a step. The actual owner keeps this allocation exclusively pinned.
         assert!(input[n..].iter().all(|byte| *byte == 0xa5));
-        if step.done { break; }
+        if step.done {
+            break;
+        }
     }
     let prepared = state.finish(&input).unwrap();
     assert_eq!(&input[..n], &expected);
@@ -275,7 +279,10 @@ fn validated_identity_can_move_to_an_identical_immutable_bank_copy() {
         assert_eq!(retained.comparison(), candidate.comparison());
         assert_eq!(retained.parent_hash(), candidate.parent_hash());
         assert_eq!(retained.registration_hash(), candidate.registration_hash());
-        assert_ne!(retained.model().bytes().as_ptr(), candidate.model().bytes().as_ptr());
+        assert_ne!(
+            retained.model().bytes().as_ptr(),
+            candidate.model().bytes().as_ptr()
+        );
     });
 }
 

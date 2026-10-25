@@ -109,7 +109,8 @@ impl CandidateSet {
             out.count += 1;
         }
         if let Some(current) = current {
-            let opening_offer = current == Action::OfferCpu(0) && out.count == 1
+            let opening_offer = current == Action::OfferCpu(0)
+                && out.count == 1
                 && matches!(first.action, Action::OfferCpu(_));
             if !opening_offer && !out.iter().any(|c| c.action == current) {
                 return Err(Error::Conflict);

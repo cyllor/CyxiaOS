@@ -64,23 +64,46 @@ fn stopped_quote_baseline_opens_only_first_legal_tier_and_keeps_actual_hold() {
     let legal = [100, 250, 500, 1000].map(|n| Some(Action::OfferCpu(n)));
     let mut g = Guard::new(key(16), Action::OfferCpu(0), 100).unwrap();
     assert!(Action::OfferCpu(0).validate().is_err());
-    assert_eq!(adjacent(g.current(), Action::OfferCpu(100), &legal), Ok(true));
-    assert_eq!(adjacent(g.current(), Action::OfferCpu(250), &legal), Ok(false));
-    assert_eq!(adjacent(g.current(), Action::OfferCpu(0), &legal), Err(Error::Range));
-    g.observe_execution(1, Action::OfferCpu(100), ExecutionState::Unknown, 200).unwrap();
+    assert_eq!(
+        adjacent(g.current(), Action::OfferCpu(100), &legal),
+        Ok(true)
+    );
+    assert_eq!(
+        adjacent(g.current(), Action::OfferCpu(250), &legal),
+        Ok(false)
+    );
+    assert_eq!(
+        adjacent(g.current(), Action::OfferCpu(0), &legal),
+        Err(Error::Range)
+    );
+    g.observe_execution(1, Action::OfferCpu(100), ExecutionState::Unknown, 200)
+        .unwrap();
     assert_eq!(g.current(), Action::OfferCpu(0));
     assert_eq!(g.last_change_ns(), 100);
-    g.observe_execution(1, Action::OfferCpu(100), ExecutionState::Applied, 300).unwrap();
+    g.observe_execution(1, Action::OfferCpu(100), ExecutionState::Applied, 300)
+        .unwrap();
     assert_eq!(g.last_change_ns(), 300);
-    assert_eq!(adjacent(g.current(), Action::OfferCpu(250), &legal), Ok(true));
-    assert_eq!(adjacent(g.current(), Action::OfferCpu(500), &legal), Ok(false));
+    assert_eq!(
+        adjacent(g.current(), Action::OfferCpu(250), &legal),
+        Ok(true)
+    );
+    assert_eq!(
+        adjacent(g.current(), Action::OfferCpu(500), &legal),
+        Ok(false)
+    );
     g.observe_stopped_offer(400).unwrap();
     assert_eq!(g.applied_version(), 1);
     assert_eq!(g.last_change_ns(), 400);
     g.observe_stopped_offer(450).unwrap();
     assert_eq!(g.last_change_ns(), 400, "polling cannot renew the hold");
-    assert_eq!(g.observe_execution(2, Action::OfferCpu(0), ExecutionState::Applied, 500), Err(Error::Range));
-    assert_eq!(g.observe_execution(2, Action::OfferCpu(100), ExecutionState::Applied, 500), Ok(ExecutionEffect::Changed));
+    assert_eq!(
+        g.observe_execution(2, Action::OfferCpu(0), ExecutionState::Applied, 500),
+        Err(Error::Range)
+    );
+    assert_eq!(
+        g.observe_execution(2, Action::OfferCpu(100), ExecutionState::Applied, 500),
+        Ok(ExecutionEffect::Changed)
+    );
     assert_eq!(g.last_change_ns(), 500);
 }
 

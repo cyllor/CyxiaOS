@@ -1,4 +1,5 @@
 //! Hash-bound, immutable model packages. A useful seed is still untrained.
+pub use super::seed::UNTRAINED_SEED0_BYTES;
 use super::{
     Error, Schemas,
     train::{self, TrainedModel, TrainingRecord},
@@ -6,7 +7,6 @@ use super::{
 };
 use crate::{features, model::MODEL_BYTES};
 use sha2::{Digest, Sha256};
-pub use super::seed::UNTRAINED_SEED0_BYTES;
 
 /// Operator/package ABI, independent of the outer Plan/Shared IPC ABI.
 pub const RUNTIME_ABI: u32 = 1;
@@ -172,8 +172,16 @@ pub struct SealedModel<'a> {
     manifest_hash: [u8; 32],
 }
 impl<'a> SealedModel<'a> {
-    pub(super) fn from_worker(bytes: &'a [u8; MODEL_BYTES], manifest: ModelManifest, manifest_hash: [u8; 32]) -> Self {
-        Self { bytes, manifest, manifest_hash }
+    pub(super) fn from_worker(
+        bytes: &'a [u8; MODEL_BYTES],
+        manifest: ModelManifest,
+        manifest_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            bytes,
+            manifest,
+            manifest_hash,
+        }
     }
     pub fn seal(
         bytes: &'a [u8; MODEL_BYTES],
@@ -238,7 +246,10 @@ impl UntrainedSeed {
     /// An explicit, deterministic starting point with action/target-sensitive
     /// frozen layers. No rewards, samples or trained provenance are invented.
     pub const fn new(seed: u64) -> Self {
-        Self { bytes: super::seed::untrained_seed_bytes(seed), seed }
+        Self {
+            bytes: super::seed::untrained_seed_bytes(seed),
+            seed,
+        }
     }
     pub const fn bytes(&self) -> &[u8; MODEL_BYTES] {
         &self.bytes

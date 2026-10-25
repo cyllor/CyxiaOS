@@ -317,8 +317,11 @@ impl Buffers {
         // leaving insufficient space for a real TLS key-schedule call. Vec's
         // repeated-byte constructor initializes the allocator-owned region
         // directly; the checked boxed-slice conversion moves only a pointer.
-        fn zeros<const N:usize>()->Box<[u8;N]>{
-            vec![0u8;N].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!("fixed buffer length"))
+        fn zeros<const N: usize>() -> Box<[u8; N]> {
+            vec![0u8; N]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("fixed buffer length"))
         }
         Self {
             input: zeros(),

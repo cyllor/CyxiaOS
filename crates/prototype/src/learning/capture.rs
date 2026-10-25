@@ -579,8 +579,7 @@ impl<const I: usize, const R: usize> Capture<I, R> {
     pub fn issued(&mut self, owner: ObjectKey, id: u64, actual_ns: u64) -> Result<(), Error> {
         let i = self.request_index(owner, id)?;
         if self.request_state[i].issued {
-            return if !self.request_state[i].scheduled
-                && self.requests[i].arrived_ns == actual_ns {
+            return if !self.request_state[i].scheduled && self.requests[i].arrived_ns == actual_ns {
                 Ok(())
             } else {
                 self.fail(Error::Conflict)
@@ -599,13 +598,20 @@ impl<const I: usize, const R: usize> Capture<I, R> {
     /// caller must already own the queued workload and promise its frozen
     /// release. Processing delay is measured from that release; backdating a
     /// queue admission after the release is rejected and taints this capture.
-    pub fn arm_scheduled(&mut self, owner: ObjectKey, id: u64, observed_ns: u64) -> Result<(), Error> {
+    pub fn arm_scheduled(
+        &mut self,
+        owner: ObjectKey,
+        id: u64,
+        observed_ns: u64,
+    ) -> Result<(), Error> {
         let i = self.request_index(owner, id)?;
         let state = self.request_state[i];
         if state.issued {
             return if state.scheduled && state.issued_observed_ns == observed_ns {
                 Ok(())
-            } else { self.fail(Error::Conflict) };
+            } else {
+                self.fail(Error::Conflict)
+            };
         }
         if observed_ns > state.frozen.arrived_ns {
             return self.fail(Error::Deadline);
@@ -613,7 +619,16 @@ impl<const I: usize, const R: usize> Capture<I, R> {
         self.request_state[i].issued = true;
         self.request_state[i].scheduled = true;
         self.request_state[i].issued_observed_ns = observed_ns;
-        self.event(10, &[id, owner.id, owner.generation, state.frozen.arrived_ns, observed_ns]);
+        self.event(
+            10,
+            &[
+                id,
+                owner.id,
+                owner.generation,
+                state.frozen.arrived_ns,
+                observed_ns,
+            ],
+        );
         Ok(())
     }
     pub fn result(
@@ -865,16 +880,38 @@ impl<const I: usize, const R: usize> Capture<I, R> {
     /// local seal, event hash, interval count, coverage, or exported local view.
     /// A separate protected partner authority must authenticate them before a
     /// reward verifier may include them in a multi-node trial.
-    pub fn stage_intervals(&mut self, seal: Seal, offset: usize, values: &[CpuInterval]) -> Result<(), Error> {
-        if self.sealed != Some(seal) { return Err(Error::Stale); }
-        if values.len() > 16 { return Err(Error::Capacity); }
-        let start = self.interval_count.checked_add(offset).ok_or(Error::Capacity)?;
-        let end = start.checked_add(values.len()).filter(|end| *end <= I).ok_or(Error::Capacity)?;
-        self.intervals[start..end].copy_from_slice(values); Ok(())
+    pub fn stage_intervals(
+        &mut self,
+        seal: Seal,
+        offset: usize,
+        values: &[CpuInterval],
+    ) -> Result<(), Error> {
+        if self.sealed != Some(seal) {
+            return Err(Error::Stale);
+        }
+        if values.len() > 16 {
+            return Err(Error::Capacity);
+        }
+        let start = self
+            .interval_count
+            .checked_add(offset)
+            .ok_or(Error::Capacity)?;
+        let end = start
+            .checked_add(values.len())
+            .filter(|end| *end <= I)
+            .ok_or(Error::Capacity)?;
+        self.intervals[start..end].copy_from_slice(values);
+        Ok(())
     }
     pub fn staged_intervals(&self, seal: Seal, extra: usize) -> Result<&[CpuInterval], Error> {
-        if self.sealed != Some(seal) { return Err(Error::Stale); }
-        let end = self.interval_count.checked_add(extra).filter(|end| *end <= I).ok_or(Error::Capacity)?;
+        if self.sealed != Some(seal) {
+            return Err(Error::Stale);
+        }
+        let end = self
+            .interval_count
+            .checked_add(extra)
+            .filter(|end| *end <= I)
+            .ok_or(Error::Capacity)?;
         Ok(&self.intervals[..end])
     }
     pub fn requests(&self) -> &[WorkRequest] {
@@ -902,11 +939,15 @@ impl<const I: usize, const R: usize> Capture<I, R> {
         Some((self.requests[index], state.issued.then_some(state.actual)))
     }
     pub fn request_timing(&self, index: usize) -> Option<RequestTiming> {
-        if index >= self.request_count { return None; }
+        if index >= self.request_count {
+            return None;
+        }
         let state = self.request_state[index];
-        Some(RequestTiming { frozen: state.frozen,
+        Some(RequestTiming {
+            frozen: state.frozen,
             issued_observed_ns: state.issued.then_some(state.issued_observed_ns),
-            scheduled: state.scheduled })
+            scheduled: state.scheduled,
+        })
     }
     pub fn actual_result(&self, id: u64) -> Option<RequestResult> {
         self.request_state[..self.request_count]

@@ -30,8 +30,12 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static MAX_SLICE: AtomicU64 = AtomicU64::new(0);
 static LEDGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static RELEASE_STAGE: AtomicU64 = AtomicU64::new(0);
-pub fn replay_idle() -> bool { STATE.load(Ordering::Acquire) == 0 }
-pub fn package_digest() -> [u8; 32] { Sha256::digest(ELF).into() }
+pub fn replay_idle() -> bool {
+    STATE.load(Ordering::Acquire) == 0
+}
+pub fn package_digest() -> [u8; 32] {
+    Sha256::digest(ELF).into()
+}
 fn phys(p: u64) -> u64 {
     p.checked_sub(crate::HIGH).unwrap()
 }
@@ -289,10 +293,23 @@ pub fn request(
             return (3, 0, 0);
         };
         let leaf = unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Page>().add(2) } as u64;
-        if let Err(error) = crate::peer_replay::accept_remote(terms.contract, terms.input_hash, terms.package_hash, next) {
+        if let Err(error) = crate::peer_replay::accept_remote(
+            terms.contract,
+            terms.input_hash,
+            terms.package_hash,
+            next,
+        ) {
             crate::peer_replay::abort_remote(next);
             let _ = unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(next) };
-            return (if matches!(error, Error::Busy | Error::Again | Error::NotReady) { 1 } else { 3 }, 0, 0);
+            return (
+                if matches!(error, Error::Busy | Error::Again | Error::NotReady) {
+                    1
+                } else {
+                    3
+                },
+                0,
+                0,
+            );
         }
         if let Err(error) = crate::domain_tasks::remote_start(next, leaf) {
             crate::peer_replay::abort_remote(next);
@@ -428,7 +445,15 @@ pub fn request(
                 if let Err(error) = crate::domain_tasks::remote_stopped(token)
                     .and_then(|()| crate::domain_tasks::remote_release(token))
                 {
-                    return (if matches!(error, Error::Busy | Error::Again) { 1 } else { 3 }, 0, token);
+                    return (
+                        if matches!(error, Error::Busy | Error::Again) {
+                            1
+                        } else {
+                            3
+                        },
+                        0,
+                        token,
+                    );
                 }
                 RELEASE_STAGE.store(1, Ordering::Release);
             }
@@ -436,10 +461,14 @@ pub fn request(
                 core::ptr::write_bytes(core::ptr::addr_of_mut!(INPUT).cast::<u8>(), 0, 32768);
             }
             if RELEASE_STAGE.load(Ordering::Acquire) == 1 {
-                if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(token) }.is_err() { return (3, 0, 0); }
+                if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(token) }.is_err() {
+                    return (3, 0, 0);
+                }
                 RELEASE_STAGE.store(2, Ordering::Release);
             }
-            if crate::peer_replay::close_remote(token).is_err() { return (1, 0, token); }
+            if crate::peer_replay::close_remote(token).is_err() {
+                return (1, 0, token);
+            }
             STATE.store(0, Ordering::Release);
             RELEASE_STAGE.store(3, Ordering::Release);
             let _ = LEDGER_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
