@@ -63,7 +63,10 @@ class UnifiedBuilder(unittest.TestCase):
     def test_identity_metadata_checks_actual_public_pin_without_private_bytes(self):
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp);public=bytes(range(32));peer=bytes(range(32,64))
-            for name,data in {'own.pub':public,'local.pin':hashlib.sha256(public).digest(),'peer.pub':peer,'peer.pin':hashlib.sha256(peer).digest(),'cert.der':b'public certificate','key.der':b'PRIVATE-KEY-MUST-NOT-LEAK'}.items():(p/name).write_bytes(data)
+            billing_seed=bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60')
+            billing_public=bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')
+            peer_billing_public=bytes.fromhex('3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c')
+            for name,data in {'own.pub':public,'local.pin':hashlib.sha256(public).digest(),'peer.pub':peer,'peer.pin':hashlib.sha256(peer).digest(),'cert.der':b'public certificate','key.der':b'PRIVATE-KEY-MUST-NOT-LEAK','billing.seed':billing_seed,'billing.pub':billing_public,'peer.billing.pub':peer_billing_public}.items():(p/name).write_bytes(data)
             result=build.identity_metadata(p)
             self.assertEqual(result['node_id'],hashlib.sha256(public).hexdigest())
             self.assertNotIn('PRIVATE-KEY',json.dumps(result));self.assertNotIn('key.der',json.dumps(result))
