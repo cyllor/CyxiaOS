@@ -36,13 +36,6 @@ pub struct Query {
     pub kind: u16,
     pub ordinal: usize,
 }
-#[derive(Clone, Copy)]
-pub struct Released {
-    pub source: Source,
-    pub query: Query,
-    pub due_ns: u64,
-}
-
 pub fn resolve(
     queries: &[Query],
     output: &mut [Option<ObjectKey>],
@@ -66,51 +59,27 @@ pub fn resolve(
     Ok(())
 }
 
+/// Deterministic remaining mandatory-control WCET for the current evaluation.
+///
+/// Every released action-family slot is itself a required control job, even when
+/// its object walk later records EMPTY or discovers that current hard constraints
+/// admit no candidate. Counting only targets that can be projected up front both
+/// under-counts those mandatory visits and makes one evaluation synchronously read
+/// every owner publication. The estimate is a scoring input only; real admission,
+/// owner generations and the 70 ms control ceiling are revalidated separately.
 pub fn queued_wcet_us(
     active: usize,
     at: u64,
-    mut released: impl FnMut(usize) -> Option<Released>,
-    mut read: impl FnMut(Source, &[Query], &mut [Option<ObjectKey>]) -> Result<(), Error>,
-    mut eligible: impl FnMut(usize, ObjectKey) -> bool,
+    mut due_ns: impl FnMut(usize) -> Option<u64>,
 ) -> Result<u64, Error> {
     if active >= FAMILIES {
         return Err(Error::Range);
     }
-    let pending: [Option<Released>; FAMILIES] = core::array::from_fn(|index| {
-        if index == active {
-            None
-        } else {
-            released(index).filter(|f| f.due_ns <= at)
-        }
-    });
-    let mut targets = [None; FAMILIES];
-    for source in Source::ALL {
-        let mut queries = [Query::default(); FAMILIES];
-        let mut families = [0; FAMILIES];
-        let mut count = 0;
-        for (index, family) in pending.iter().enumerate() {
-            if let Some(family) = family.filter(|f| f.source == source) {
-                queries[count] = family.query;
-                families[count] = index;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            continue;
-        }
-        let mut output = [None; FAMILIES];
-        // An unavailable source invalidates the whole estimate. No eligibility
-        // callback sees a partial queue, and nothing survives this invocation.
-        read(source, &queries[..count], &mut output[..count])?;
-        for index in 0..count {
-            targets[families[index]] = output[index];
+    let mut jobs = 1u64;
+    for index in 0..FAMILIES {
+        if index != active && due_ns(index).is_some_and(|due| due <= at) {
+            jobs = jobs.checked_add(1).ok_or(Error::Overflow)?;
         }
     }
-    let mut jobs = 1;
-    for (index, target) in targets.into_iter().enumerate() {
-        if target.is_some_and(|target| eligible(index, target)) {
-            jobs += 1;
-        }
-    }
-    Ok(jobs * 2_500)
+    jobs.checked_mul(2_500).ok_or(Error::Overflow)
 }

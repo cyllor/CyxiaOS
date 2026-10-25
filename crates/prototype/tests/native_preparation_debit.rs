@@ -134,34 +134,13 @@ fn terminal_preparation_retires_once_and_releases_other_families() {
         fresh.domain = 15;
         assert_eq!(next_sequence(retired.sequence, fresh), Ok(()));
         assert_eq!(journal.total, 1);
-        let queued = target_batch::queued_wcet_us(
-            retired.next_family,
-            60_000_100,
-            |family| {
-                Some(target_batch::Released {
-                    source: target_batch::Source::Tasks,
-                    query: target_batch::Query {
-                        domain: family as u16 + 1,
-                        kind: 1,
-                        ordinal: 0,
-                    },
-                    due_ns: if family == retired.family {
-                        retired.due_ns
-                    } else {
-                        0
-                    },
-                })
-            },
-            |_, queries, output| {
-                target_batch::resolve(queries, output, |q| {
-                    Some(ObjectKey {
-                        id: q.domain as u64,
-                        generation: 1,
-                    })
-                })
-            },
-            |_, _| true,
-        );
+        let queued = target_batch::queued_wcet_us(retired.next_family, 60_000_100, |family| {
+            Some(if family == retired.family {
+                retired.due_ns
+            } else {
+                0
+            })
+        });
         assert_eq!(
             queued,
             Ok(42_500),

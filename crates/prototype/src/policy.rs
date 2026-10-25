@@ -251,6 +251,21 @@ pub struct Publisher {
     pub object: ObjectKey,
     pub controller_epoch: u64,
 }
+/// Opaque proof that one ordinary candidate set was constructed under this
+/// registry's current boot, publisher and Active model. The set remains
+/// unregistered until `Registry::commit_candidates`, so fallible preparation
+/// before that point cannot evict an unrelated retained registration.
+pub struct PreparedCandidateSet {
+    boot_epoch: u64,
+    publisher: Publisher,
+    set: CandidateSet,
+}
+impl PreparedCandidateSet {
+    /// Read-only access for scoring and independent pre-registration checks.
+    pub const fn candidate_set(&self) -> &CandidateSet {
+        &self.set
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlanId {
     pub boot_epoch: u64,
@@ -551,6 +566,49 @@ impl Registry {
             return Err(Error::Conflict);
         }
         self.store_registered(Self::registered_set(set, set.digest, None))
+    }
+    /// Construct an ordinary candidate set once while binding its immutable
+    /// bytes to the current registry authority. No registration-table entry is
+    /// changed until the opaque value is committed.
+    pub fn prepare_candidates(
+        &self,
+        publisher: Publisher,
+        snapshot: Snapshot,
+        target: ObjectKey,
+        model: ModelBinding,
+        choices: &[Candidate],
+        current: Option<Action>,
+    ) -> Result<PreparedCandidateSet, Error> {
+        self.authorize(publisher)?;
+        if model != self.model {
+            return Err(Error::Stale);
+        }
+        Ok(PreparedCandidateSet {
+            boot_epoch: self.boot_epoch,
+            publisher,
+            set: CandidateSet::new(snapshot, target, model, choices, current)?,
+        })
+    }
+    /// Commit exactly the set produced by `prepare_candidates` without hashing
+    /// its complete feature matrix a second time. The opaque value cannot be
+    /// constructed or mutated outside this module; all authority is rechecked
+    /// here in case model or publisher generations changed in between.
+    pub fn commit_candidates(
+        &mut self,
+        publisher: Publisher,
+        prepared: PreparedCandidateSet,
+    ) -> Result<CandidateSet, Error> {
+        self.authorize(publisher)?;
+        if prepared.boot_epoch != self.boot_epoch
+            || prepared.publisher != publisher
+            || prepared.set.model != self.model
+            || prepared.set.canary.is_some()
+        {
+            return Err(Error::Stale);
+        }
+        let set = prepared.set;
+        self.store_registered(Self::registered_set(&set, set.digest, None))?;
+        Ok(set)
     }
     /// Register one deterministic action without claiming that absent domain
     /// measurements were observed as zero or that a model selected it. This

@@ -177,6 +177,86 @@ fn registered_action_requires_retained_exact_hash_and_bounded_index() {
 }
 
 #[test]
+fn prepared_candidate_set_is_invisible_until_exact_commit() {
+    let source = candidates();
+    let choices = source.iter().collect::<Vec<_>>();
+    let mut registry = Registry::new(11, publisher(), binding()).unwrap();
+    let prepared = registry
+        .prepare_candidates(
+            publisher(),
+            source.snapshot,
+            source.target,
+            source.model,
+            &choices,
+            Some(Action::CpuWeight(2)),
+        )
+        .unwrap();
+    let hash = prepared.candidate_set().hash();
+    assert_eq!(hash, source.hash());
+    assert_eq!(registry.registered_action(hash, 0), Err(Error::Stale));
+
+    let committed = registry.commit_candidates(publisher(), prepared).unwrap();
+    assert_eq!(committed.hash(), hash);
+    assert_eq!(
+        registry.registered_action(hash, 0),
+        Ok(Action::CpuWeight(1))
+    );
+}
+
+#[test]
+fn prepared_candidate_commit_rechecks_model_and_publisher_authority() {
+    let source = candidates();
+    let choices = source.iter().collect::<Vec<_>>();
+
+    let mut model_registry = Registry::new(11, publisher(), binding()).unwrap();
+    let model_prepared = model_registry
+        .prepare_candidates(
+            publisher(),
+            source.snapshot,
+            source.target,
+            source.model,
+            &choices,
+            Some(Action::CpuWeight(2)),
+        )
+        .unwrap();
+    let mut next_model = binding();
+    next_model.generation += 1;
+    model_registry
+        .change_model(publisher(), next_model)
+        .unwrap();
+    assert!(matches!(
+        model_registry.commit_candidates(publisher(), model_prepared),
+        Err(Error::Stale)
+    ));
+
+    let mut publisher_registry = Registry::new(11, publisher(), binding()).unwrap();
+    let publisher_prepared = publisher_registry
+        .prepare_candidates(
+            publisher(),
+            source.snapshot,
+            source.target,
+            source.model,
+            &choices,
+            Some(Action::CpuWeight(2)),
+        )
+        .unwrap();
+    let next_publisher = Publisher {
+        object: ObjectKey {
+            id: publisher().object.id,
+            generation: publisher().object.generation + 1,
+        },
+        controller_epoch: publisher().controller_epoch + 1,
+    };
+    publisher_registry
+        .change_publisher(publisher(), next_publisher)
+        .unwrap();
+    assert!(matches!(
+        publisher_registry.commit_candidates(publisher(), publisher_prepared),
+        Err(Error::Auth)
+    ));
+}
+
+#[test]
 fn job_deadline_is_rechecked_after_validation_before_publish() {
     let (mut registry, set, mut owner) = ready();
     let bytes = frame(&set, 1, 0);
