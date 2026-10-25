@@ -2,6 +2,11 @@
 //! CPU, clock, root publications, and UART are explicit host fixtures; these
 //! tests do not manufacture accepted replay labels or claim a native run.
 extern crate self as cyxia_arch_aarch64;
+pub mod sha256 {
+    pub fn digest_page(_: &[u8; 4096]) -> Option<[u8; 32]> {
+        None
+    }
+}
 pub mod cpu {
     pub fn slot() -> usize {
         0

@@ -1,6 +1,11 @@
 //! Host execution of the actual protected history/collector sources. CPU,
 //! time, pool and replay-owner witnesses here are explicitly synthetic.
 extern crate self as cyxia_arch_aarch64;
+pub mod sha256 {
+    pub fn digest_page(_: &[u8; 4096]) -> Option<[u8; 32]> {
+        None
+    }
+}
 pub mod cpu {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static CPU: AtomicUsize = AtomicUsize::new(0);
