@@ -15,11 +15,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
       - name: Pack source tree
-        run: tar --exclude=.git -czf cyxiaos-source.tgz .
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/cyxiaos-source.tgz" .
       - name: Upload source tree
         uses: actions/upload-artifact@v4
         with:
           name: cyxiaos-source
-          path: cyxiaos-source.tgz
+          path: ${{ runner.temp }}/cyxiaos-source.tgz
           if-no-files-found: error
           retention-days: 1
