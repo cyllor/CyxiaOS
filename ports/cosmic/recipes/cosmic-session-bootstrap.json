@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-session",
+  "commit": "8093b59bb1262b0612d814e6540ba936303f735a",
+  "target": "aarch64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-session",
+  "binary": "cosmic-session",
+  "resource_profile": "session-static-bootstrap",
+  "default_features": false,
+  "features": [],
+  "source_lock_sha256": "8cda0355e1b1b55abe8d71f7446a040e5e872cd9c5a1c03147e9c25a94157afd",
+  "effective_lock_sha256": "8cda0355e1b1b55abe8d71f7446a040e5e872cd9c5a1c03147e9c25a94157afd",
+  "patches": [],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "43b8f730b191fc2f6ff889847840f06020144ce54f34aedc8603e1dd42795f8b"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-aarch64.a",
+      "sha256": "bd6ad4e791c254c4da692cdd68026f9d1579c9c662206509cba6828351723ada"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "687cfa8fd90758f1e4a341f7557b4130fb2df9c06c4018149e2bd1ad41914a03"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "fd8c571278b14776c7ea5f1d3b7b7271f004ef7725140d2c278c172197f545a6"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "6e48509204cc7be18e5d0a2b4bc41a7c9c71dd623edee8b120128b4009cadd46"
+    }
+  ]
+}

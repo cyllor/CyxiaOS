@@ -17,7 +17,7 @@ SECTIONS {
  .data : AT(ADDR(.data)-HIGH) { *(.data .data.*) *(.got .got.*) } :data
  .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) { . = ALIGN(16); __bss_start = .; *(.bss .bss.*) *(COMMON) . = ALIGN(16); __bss_end = .; }
  . = ALIGN(4096);
- .stack (NOLOAD) : AT(ADDR(.stack)-HIGH) { __stack_guard = .; . += 4096; . += 65536; __stack_top = .; } :data
+ .stack (NOLOAD) : AT(ADDR(.stack)-HIGH) { __stack_guard = .; . += 4096; . += 262144; __stack_top = .; } :data
  . = ALIGN(4096);
  .test_progress (NOLOAD) : AT(ADDR(.test_progress)-HIGH) { KEEP(*(.test_progress)) . = ALIGN(4096); } :data
  __kernel_end = .;

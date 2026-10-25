@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Build native per-node images; identities remain external and keys stay private.
+
+Example: python3 tools/build_unified.py --identity-a /private/pair/a
+ --identity-b /private/pair/b --output artifacts/unified-build --fault normal
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+from doctor import ROOT,env
+from verify_smp import require
+
+
+CODE_ROOTS={'kernel','crates','user','ports','.cargo'}
+ROOT_BUILD_FILES={'Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchain'}
+EXCLUDED_COMPONENTS={'tests','docs','target','__pycache__','.git'}
+
+
+def code_source_map(source_root=None):
+    # Bind every potentially included source/asset, not an extension allowlist:
+    # ring includes .inl, and models/packages can have arbitrary suffixes.
+    # Filter the build scope before requiring each file. An intentionally sparse
+    # test fixture does not participate in these native images; missing compiled
+    # sources and symlinks still fail instead of silently disappearing.
+    source_root=Path(source_root or ROOT).resolve(strict=True)
+    result=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard'],
+                          cwd=source_root,capture_output=True,check=True,timeout=10)
+    names=sorted(set(name for name in result.stdout.decode('utf-8').split('\0') if name
+                     and (name in ROOT_BUILD_FILES or Path(name).parts[0] in CODE_ROOTS)
+                     and not any(part in EXCLUDED_COMPONENTS for part in Path(name).parts)))
+    require({'kernel/src/smp.rs','crates/arch-aarch64/src/user.rs','Cargo.lock'}<=set(names),
+            'incomplete native source checkout')
+    files=[source_root/name for name in names]
+    require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(source_root) for p in files),
+            'missing, linked, or external native build source')
+    return {name:sha(path) for name,path in zip(names,files)}
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def identity_metadata(directory):
+    directory=Path(directory)
+    public=(directory/'own.pub').read_bytes();peer=(directory/'peer.pub').read_bytes()
+    local=(directory/'local.pin').read_bytes();pin=(directory/'peer.pin').read_bytes()
+    require(len(public)==len(peer)==len(local)==len(pin)==32,'identity public keys and pins must be 32 bytes')
+    require(hashlib.sha256(public).digest()==local and hashlib.sha256(peer).digest()==pin and local!=pin,'identity public key/NodeID pin mismatch')
+    require((directory/'key.der').is_file() and (directory/'key.der').stat().st_size>0,'own identity key is missing')
+    billing=(directory/'billing.pub').read_bytes();peer_billing=(directory/'peer.billing.pub').read_bytes()
+    require(len(billing)==len(peer_billing)==len((directory/'billing.seed').read_bytes())==32,'provision separate 32-byte EL1 billing identities')
+    require(billing!=peer_billing and billing not in (public,peer) and peer_billing not in (public,peer),'billing and TLS identities must be independent')
+    derived=subprocess.run(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],
+                           input=bytes.fromhex('302e020100300506032b657004220420')+(directory/'billing.seed').read_bytes(),
+                           capture_output=True,timeout=15)
+    require(derived.returncode==0 and derived.stdout==bytes.fromhex('302a300506032b6570032100')+billing,
+            'billing private identity does not match its provisioned public key')
+    return dict(node_id=local.hex(),peer_node_id=pin.hex(),public_hex=public.hex(),public_sha256=hashlib.sha256(public).hexdigest(),certificate_sha256=sha(directory/'cert.der'),billing_public_hex=billing.hex(),peer_billing_public_hex=peer_billing.hex())
+
+
+def audit_private_images(service,image,own_tls,peer_tls,own_billing,peer_billing):
+    for data in (service,image):
+        require(own_tls in data and peer_tls not in data,'image own-private-key-only audit failed')
+    require(own_billing not in service and peer_billing not in service,'EL0 service contains an EL1 billing private key')
+    require(own_billing in image and peer_billing not in image,'kernel billing key isolation audit failed')
+
+
+def parse_cargo_build_messages(text):
+    executable,out_dir=None,None
+    for line in text.splitlines():
+        try:message=json.loads(line)
+        except json.JSONDecodeError:continue
+        if message.get('reason')=='build-script-executed' and 'cyxia-kernel' in message.get('package_id',''):
+            out_dir=Path(message['out_dir'])
+        if message.get('reason')=='compiler-artifact' and message.get('target',{}).get('name')=='cyxia-kernel' and message.get('executable'):
+            executable=Path(message['executable'])
+    require(executable is not None and out_dir is not None,'Cargo did not report the kernel executable and actual build output directory')
+    return executable,out_dir
+
+
+def run_logged(argv,environment,log):
+    result=subprocess.run(argv,cwd=ROOT,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=600)
+    require(len(result.stdout)<=4*1024*1024,'build log exceeded budget')
+    log.write_bytes(result.stdout);log.chmod(0o600)
+    require(result.returncode==0,f'build failed; inspect {log}')
+    return result.stdout.decode('utf-8','replace')
+
+
+def tool_version(argv,environment):
+    result=subprocess.run(argv,cwd=ROOT,env=environment,capture_output=True,text=True,timeout=15)
+    require(result.returncode==0,'cannot obtain build tool version: '+argv[0])
+    return result.stdout.strip()
+
+
+def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds=None,
+          selftest=False,cargo=None,cc=None,target_dir=None):
+    require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
+    if unix_seconds is None:
+        unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
+    require(0<unix_seconds<(1<<63),'invalid provisioned UTC epoch')
+    identities=[Path(identity_a).resolve(strict=True),Path(identity_b).resolve(strict=True)]
+    require(all(not p.is_relative_to(ROOT) for p in identities),'private identities must be outside the source checkout')
+    metadata=[identity_metadata(p) for p in identities]
+    require(all(metadata[i]['billing_public_hex']==metadata[1-i]['peer_billing_public_hex'] for i in range(2)),'billing public-key trust lists are not mutual')
+    require(metadata[0]['node_id']!=metadata[1]['node_id'],'nodes must have distinct own private identities')
+    output=Path(output).resolve()
+    require(not output.exists() or (output.is_dir() and not any(output.iterdir())),'refuse to overwrite an existing build/evidence directory')
+    output.mkdir(parents=True,mode=0o700,exist_ok=True);output.chmod(0o700)
+    before=code_source_map()
+    environment=env()
+    cargo=cargo or environment.get('CARGO','cargo')
+    cc=cc or environment.get('CC_aarch64_unknown_none',environment.get('CYXIA_CC',environment.get('CC','clang')))
+    target_dir=Path(target_dir or environment.get('CARGO_TARGET_DIR',ROOT/'target')).expanduser().resolve()
+    environment.update(CARGO=str(cargo),CC_aarch64_unknown_none=str(cc),CYXIA_CC=str(cc),CARGO_TARGET_DIR=str(target_dir))
+    environment['CARGO_NET_OFFLINE']='true'
+    environment.pop('RUSTFLAGS',None);environment.pop('CARGO_ENCODED_RUSTFLAGS',None)
+    versions={name:tool_version(argv,environment) for name,argv in {
+        'cargo':[str(cargo),'--version'],'rustc':[environment.get('RUSTC','rustc'),'--version','--verbose'],
+        'clang':[str(cc),'--version'],'openssl':['openssl','version'],
+        'installed_targets':['rustup','target','list','--installed']}.items()}
+    require('aarch64-unknown-none\n' in versions['installed_targets']+'\n' and 'aarch64-unknown-none-softfloat' in versions['installed_targets'],'install both standard EL0 and softfloat EL1 Rust targets before building')
+    keys=[(p/'key.der').read_bytes() for p in identities]
+    billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
+    artifacts={};commands=[];task_hash=None
+    for index,name in enumerate(('a','b')):
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0')
+        service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
+        commands.append(dict(node=name,stage='service',argv=service_command))
+        print(f'Building node {name} EL0 service',flush=True)
+        run_logged(service_command,per_node,output/f'service-{name}.log')
+        service=output/f'service-{name}.elf'
+        shutil.copyfile(target_dir/'aarch64-unknown-none/release/cyxia-prototype-cluster',service);service.chmod(0o600)
+        per_node['CYXIA_CLUSTER_SERVICE_ELF']=str(service)
+        kernel_command=[str(cargo),'build','--locked','--offline','--release','-p','cyxia-kernel','--target','aarch64-unknown-none-softfloat','--no-default-features','--features','unified-runtime','--message-format=json-render-diagnostics']
+        commands.append(dict(node=name,stage='kernel',argv=kernel_command))
+        print(f'Building node {name} EL1 kernel',flush=True)
+        text=run_logged(kernel_command,per_node,output/f'kernel-{name}.log')
+        kernel,actual_out=parse_cargo_build_messages(text)
+        image=output/f'node-{name}.elf';shutil.copyfile(kernel,image);image.chmod(0o600)
+        package=actual_out/'prototype-task.elf'
+        found_hash=sha(package)
+        require(task_hash is None or found_hash==task_hash,'nodes contain different pure-task packages')
+        if task_hash is None:shutil.copyfile(package,output/'task.elf');(output/'task.elf').chmod(0o600)
+        task_hash=found_hash
+        public=output/f'node-{name}.pub';public.write_bytes((identities[index]/'own.pub').read_bytes());public.chmod(0o600)
+        audit_private_images(service.read_bytes(),image.read_bytes(),keys[index],keys[1-index],billing_seeds[index],billing_seeds[1-index])
+        billing_public=output/f'node-{name}.billing.pub';billing_public.write_bytes((identities[index]/'billing.pub').read_bytes());billing_public.chmod(0o600)
+    require([identity_metadata(p) for p in identities]==metadata and all((p/'key.der').read_bytes()==keys[i] for i,p in enumerate(identities)),'external identity changed during the build')
+    require(all((p/'billing.seed').read_bytes()==billing_seeds[i] for i,p in enumerate(identities)),'billing identity changed during the build')
+    require(code_source_map()==before,'code changed while building; preserve this failed build and rebuild from a source freeze')
+    for path in sorted(output.iterdir()):
+        if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=sha(Path(__file__)),tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,scope='Reproducible source/image binding and separate private identities; native execution and acceptance require the independent runner.')
+    (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
+    return report
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--identity-a',type=Path,required=True)
+    parser.add_argument('--identity-b',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--fault',choices=('normal','hang-once','no-stop-ack'),default='normal')
+    parser.add_argument('--leave',action='store_true')
+    parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
+    parser.add_argument('--cargo',default=os.environ.get('CARGO'),help='Cargo executable (also accepts CARGO)')
+    parser.add_argument('--cc',help='bare-metal C compiler (also accepts CC_aarch64_unknown_none or CC)')
+    parser.add_argument('--target-dir',type=Path,help='build cache directory (also accepts CARGO_TARGET_DIR)')
+    parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
+    args=parser.parse_args()
+    build(args.identity_a,args.identity_b,args.output,fault=args.fault,leave=args.leave,unix_seconds=args.unix_seconds,
+          selftest=args.selftest,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
+    print(args.output/'build-manifest.json')
+
+
+if __name__=='__main__':main()

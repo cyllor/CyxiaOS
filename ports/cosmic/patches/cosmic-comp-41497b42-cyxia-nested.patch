@@ -1,0 +1,1364 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,8 +13,7 @@
+ anyhow = { version = "1.0.102", features = ["backtrace"] }
+ bitflags = "2.11.0"
+ calloop = { version = "0.14.4", features = ["executor", "stream"] }
+-cosmic-comp-config = { path = "cosmic-comp-config", features = [
+-    "libdisplay-info",
++cosmic-comp-config = { path = "cosmic-comp-config", default-features = false, features = [
+     "output",
+ ] }
+ cosmic-config = { git = "https://github.com/pop-os/libcosmic", features = [
+@@ -31,7 +30,7 @@
+ cosmic-text = { version = "0.19", features = [
+     "shape-run-cache",
+ ] }
+-libdisplay-info = "0.3.0"
++libdisplay-info = { version = "0.3.0", optional = true }
+ egui = { version = "0.31.1", optional = true }
+ egui_plot = { version = "0.31.0", optional = true }
+ i18n-embed = { version = "0.16", features = [
+@@ -96,18 +95,10 @@
+ default-features = false
+ features = [
+     "backend_drm",
+-    "backend_gbm",
+     "backend_egl",
+     "backend_libei",
+-    "backend_libinput",
+-    "backend_session_libseat",
+-    "backend_udev",
+-    "backend_winit",
+-    "backend_vulkan",
+-    "backend_x11",
+     "desktop",
+     "renderer_glow",
+-    "renderer_multi",
+     "renderer_pixman",
+     "wayland_frontend",
+     "xwayland",
+@@ -119,9 +110,20 @@
+ optional = true
+ 
+ [features]
+-debug = ["egui", "egui_plot", "smithay-egui", "anyhow/backtrace"]
+-default = ["systemd"]
+-logind = ["logind-zbus"]
++debug = ["egui", "egui_plot", "smithay-egui", "anyhow/backtrace", "backend-kms"]
++default = ["systemd", "backend-kms", "backend-winit", "backend-x11"]
++# Nested Winit uses the existing COSMIC shell and Glow renderer. Software EGL is
++# selected by the EGL implementation, not by a replacement compositor.
++backend-winit = ["smithay/backend_winit"]
++backend-x11 = ["smithay/backend_x11", "smithay/backend_vulkan"]
++backend-kms = [
++    "smithay/backend_gbm", "smithay/backend_libinput",
++    "smithay/backend_session_libseat", "smithay/backend_udev",
++    "smithay/backend_vulkan", "smithay/renderer_multi",
++    "dep:libdisplay-info", "cosmic-comp-config/libdisplay-info",
++    "cosmic-comp-config/libinput",
++]
++logind = ["logind-zbus", "smithay/backend_session"]
+ systemd = ["libsystemd", "logind", "tracing-journald"]
+ profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default"]
+ profile-with-tracy-gpu = ["profile-with-tracy", "smithay/tracy_gpu_profiling"]
+--- a/build.rs
++++ b/build.rs
+@@ -1,9 +1,48 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+-use std::process::Command;
++use std::{env, path::Path, process::Command};
++
++fn valid_commit(commit: &str) -> bool {
++    commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
++}
++
++fn git_output(directory: &Path, argument: &str) -> Option<String> {
++    let output = Command::new("git")
++        .arg("-C")
++        .arg(directory)
++        .args(["rev-parse", argument])
++        .output()
++        .ok()?;
++    output.status.success().then_some(())?;
++    Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
++}
++
++fn checkout_commit(directory: &Path) -> Option<String> {
++    // An exported compositor may live inside another Git repository. Its
++    // ancestor's revision is not the compositor's upstream identity.
++    let top = git_output(directory, "--show-toplevel")?;
++    if Path::new(&top).canonicalize().ok()? != directory.canonicalize().ok()? {
++        return None;
++    }
++    let commit = git_output(directory, "HEAD")?;
++    valid_commit(&commit).then_some(commit)
++}
+ 
+ fn main() {
+-    if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
+-        let git_hash = String::from_utf8(output.stdout).unwrap();
+-        println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+-    }
++    println!("cargo:rerun-if-env-changed=CYXIA_COSMIC_UPSTREAM_COMMIT");
++    let commit = match env::var("CYXIA_COSMIC_UPSTREAM_COMMIT") {
++        Ok(commit) => {
++            assert!(
++                valid_commit(&commit),
++                "CYXIA_COSMIC_UPSTREAM_COMMIT must be exactly 40 hex digits"
++            );
++            commit
++        }
++        Err(env::VarError::NotPresent) => env::var_os("CARGO_MANIFEST_DIR")
++            .and_then(|directory| checkout_commit(Path::new(&directory)))
++            .unwrap_or_else(|| "unknown".to_owned()),
++        Err(env::VarError::NotUnicode(_)) => {
++            panic!("CYXIA_COSMIC_UPSTREAM_COMMIT must be ASCII hex")
++        }
++    };
++    println!("cargo:rustc-env=GIT_HASH={commit}");
+ }
+--- a/cosmic-comp-config/Cargo.toml
++++ b/cosmic-comp-config/Cargo.toml
+@@ -6,7 +6,7 @@
+ [dependencies]
+ cosmic-config = { git = "https://github.com/pop-os/libcosmic/" }
+ cosmic-randr-shell = { git = "https://github.com/pop-os/cosmic-randr/", optional = true }
+-input = "0.10.0"
++input = { version = "0.10.0", optional = true }
+ libdisplay-info = { version = "0.3.0", optional = true }
+ serde = { version = "1", features = ["derive"] }
+ ron = { version = "0.12", optional = true }
+@@ -16,6 +16,7 @@
+ ], optional = true }
+ 
+ [features]
+-default = []
++default = ["libinput"]
++libinput = ["dep:input"]
+ output = ["ron", "tracing"]
+ randr = ["cosmic-randr-shell", "output"]
+--- a/cosmic-comp-config/src/input.rs
++++ b/cosmic-comp-config/src/input.rs
+@@ -2,8 +2,38 @@
+ 
+ #![allow(non_snake_case)]
+ 
++#[cfg(feature = "libinput")]
+ pub use input::{AccelProfile, ClickMethod, ScrollMethod, TapButtonMap};
+ use serde::{Deserialize, Serialize};
++
++// Backend-independent configuration values. Their RON representation is exactly
++// the same as the native libinput enums below; no device API is emulated.
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AccelProfile {
++    Flat,
++    Adaptive,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ClickMethod {
++    ButtonAreas,
++    Clickfinger,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ScrollMethod {
++    NoScroll,
++    TwoFinger,
++    Edge,
++    OnButtonDown,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum TapButtonMap {
++    LeftRightMiddle,
++    LeftMiddleRight,
++}
+ 
+ // Note: For the following values, None is used to represent the system default
+ // Configuration for input devices
+@@ -74,7 +104,7 @@
+ }
+ 
+ mod ClickMethodDef {
+-    use input::ClickMethod as ClickMethodOrig;
++    use super::ClickMethod as ClickMethodOrig;
+     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ 
+     #[derive(Debug, Serialize, Deserialize)]
+@@ -108,7 +138,7 @@
+ }
+ 
+ mod AccelProfileDef {
+-    use input::AccelProfile as AccelProfileOrig;
++    use super::AccelProfile as AccelProfileOrig;
+     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ 
+     #[derive(Debug, Serialize, Deserialize)]
+@@ -142,7 +172,7 @@
+ }
+ 
+ mod ScrollMethodDef {
+-    use input::ScrollMethod as ScrollMethodOrig;
++    use super::ScrollMethod as ScrollMethodOrig;
+     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ 
+     #[derive(Debug, Serialize, Deserialize)]
+@@ -182,7 +212,7 @@
+ }
+ 
+ mod TapButtonMapDef {
+-    use input::TapButtonMap as TapButtonMapOrig;
++    use super::TapButtonMap as TapButtonMapOrig;
+     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ 
+     #[derive(Debug, Serialize, Deserialize)]
+@@ -214,3 +244,42 @@
+         Option::serialize(&arg, ser)
+     }
+ }
++
++#[cfg(all(test, feature = "output"))]
++mod tests {
++    use super::*;
++
++    // The same persisted configuration must work with native input and a nested
++    // Winit input source. This exercises the actual remote-serde adapters.
++    #[test]
++    fn input_configuration_roundtrips_without_device_libraries() {
++        let config: InputConfig = ron::from_str(
++            r#"(
++            state: Enabled,
++            acceleration: Some((profile: Some(Adaptive), speed: 0.25)),
++            click_method: Some(Clickfinger),
++            scroll_config: Some((method: Some(TwoFinger), natural_scroll: Some(true),
++                scroll_button: None, scroll_factor: Some(1.5))),
++            tap_config: Some((enabled: true, button_map: Some(LeftMiddleRight),
++                drag: true, drag_lock: false)),
++        )"#,
++        )
++        .expect("existing native configuration schema");
++        assert_eq!(config.click_method, Some(ClickMethod::Clickfinger));
++        assert_eq!(
++            config.acceleration.as_ref().unwrap().profile,
++            Some(AccelProfile::Adaptive)
++        );
++        assert_eq!(
++            config.scroll_config.as_ref().unwrap().method,
++            Some(ScrollMethod::TwoFinger)
++        );
++        assert_eq!(
++            config.tap_config.as_ref().unwrap().button_map,
++            Some(TapButtonMap::LeftMiddleRight)
++        );
++        let encoded = ron::to_string(&config).expect("serialize configuration");
++        let restored: InputConfig = ron::from_str(&encoded).expect("restore configuration");
++        assert_eq!(config, restored);
++    }
++}
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -10,9 +10,13 @@
+ use tracing::{info, warn};
+ 
+ pub mod render;
++mod selection;
+ 
++#[cfg(feature = "backend-kms")]
+ pub mod kms;
++#[cfg(feature = "backend-winit")]
+ pub mod winit;
++#[cfg(feature = "backend-x11")]
+ pub mod x11;
+ // TODO
+ // pub mod wayland; // tbd in smithay
+@@ -22,28 +26,26 @@
+     event_loop: &mut EventLoop<'static, State>,
+     state: &mut State,
+ ) -> Result<()> {
+-    let res = match std::env::var("COSMIC_BACKEND") {
+-        Ok(x) if x == "x11" => x11::init_backend(dh, event_loop, state),
+-        Ok(x) if x == "winit" => winit::init_backend(dh, event_loop, state),
+-        Ok(x) if x == "kms" => kms::init_backend(dh, event_loop, state),
+-        Ok(_) => unimplemented!("There is no backend with this identifier"),
+-        Err(_) => {
+-            if std::env::var_os("DISPLAY").is_some()
+-                || std::env::var_os("WAYLAND_DISPLAY").is_some()
+-            {
+-                match x11::init_backend(dh, event_loop, state) {
+-                    Ok(_) => Ok(()),
+-                    Err(err) => {
+-                        warn!(?err, "Initializing X11 Backend failed.");
+-                        info!("Falling back to winit backend.");
+-                        winit::init_backend(dh, event_loop, state)
+-                    }
+-                }
+-            } else {
+-                kms::init_backend(dh, event_loop, state)
+-            }
++    let requested = std::env::var("COSMIC_BACKEND").ok();
++    let nested_display =
++        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
++    let candidates = selection::candidates(requested.as_deref(), nested_display)
++        .map_err(|err| anyhow!("{err}"))?;
++    let mut res = Err(anyhow!("No COSMIC backend could be initialized"));
++    for backend in candidates {
++        res = match backend {
++            #[cfg(feature = "backend-x11")]
++            selection::Backend::X11 => x11::init_backend(dh, event_loop, state),
++            #[cfg(feature = "backend-winit")]
++            selection::Backend::Winit => winit::init_backend(dh, event_loop, state),
++            #[cfg(feature = "backend-kms")]
++            selection::Backend::Kms => kms::init_backend(dh, event_loop, state),
++        };
++        if res.is_ok() {
++            break;
+         }
+-    };
++        warn!(?backend, error = ?res.as_ref().err(), "Initializing backend failed");
++    }
+ 
+     if res.is_ok() {
+         let output = state
+--- a/src/backend/render/element.rs
++++ b/src/backend/render/element.rs
+@@ -1,8 +1,5 @@
+ use crate::{
+-    backend::{
+-        kms::render::gles::GbmGlowBackend,
+-        render::{GlMultiError, wayland::SurfaceRenderElement},
+-    },
++    backend::render::wayland::SurfaceRenderElement,
+     shell::{CosmicMappedRenderElement, WorkspaceRenderElement},
+     utils::iced::IcedRenderElement,
+ };
+@@ -21,7 +18,6 @@
+             },
+             gles::{GlesError, GlesRenderbuffer, GlesTexture, element::TextureShaderElement},
+             glow::{GlowFrame, GlowRenderer},
+-            multigpu::MultiTexture,
+             utils::{CommitCounter, DamageSet, OpaqueRegions},
+         },
+     },
+@@ -30,7 +26,13 @@
+     },
+ };
+ 
+-use super::{GlMultiRenderer, cursor::CursorRenderElement};
++use super::cursor::CursorRenderElement;
++#[cfg(feature = "backend-kms")]
++use super::{GlMultiError, GlMultiRenderer};
++#[cfg(feature = "backend-kms")]
++use crate::backend::kms::render::gles::GbmGlowBackend;
++#[cfg(feature = "backend-kms")]
++use smithay::backend::renderer::multigpu::MultiTexture;
+ 
+ pub enum CosmicElement<R>
+ where
+@@ -442,6 +444,7 @@
+     }
+ }
+ 
++#[cfg(feature = "backend-kms")]
+ impl AsGlowRenderer for GlMultiRenderer<'_> {
+     fn glow_renderer(&self) -> &GlowRenderer {
+         self.as_ref()
+--- a/src/backend/render/mod.rs
++++ b/src/backend/render/mod.rs
+@@ -12,17 +12,14 @@
+ #[cfg(feature = "debug")]
+ use crate::debug::fps_ui;
+ use crate::{
+-    backend::{
+-        kms::render::gles::GbmGlowBackend,
+-        render::{
+-            element::DamageElement,
+-            shadow::{SHADOW_SHADER, ShadowShader},
+-            wayland::{
+-                SurfaceRenderElement,
+-                blur_effect::BlurShaders,
+-                clipped_surface::{CLIPPING_SHADER, ClippingShader},
+-                push_render_elements_from_surface_tree,
+-            },
++    backend::render::{
++        element::DamageElement,
++        shadow::{SHADOW_SHADER, ShadowShader},
++        wayland::{
++            SurfaceRenderElement,
++            blur_effect::BlurShaders,
++            clipped_surface::{CLIPPING_SHADER, ClippingShader},
++            push_render_elements_from_surface_tree,
+         },
+     },
+     config::ScreenFilter,
+@@ -71,7 +68,6 @@
+                 element::{PixelShaderElement, TextureShaderElement},
+             },
+             glow::GlowRenderer,
+-            multigpu::{Error as MultiError, MultiFrame, MultiRenderer},
+             sync::SyncPoint,
+         },
+     },
+@@ -94,16 +90,28 @@
+ pub mod wayland;
+ use self::element::{AsGlowRenderer, CosmicElement};
+ 
++#[cfg(feature = "backend-kms")]
+ use super::kms::Timings;
+-
++#[cfg(feature = "backend-kms")]
++use super::kms::render::gles::GbmGlowBackend;
++#[cfg(feature = "backend-kms")]
++use smithay::backend::renderer::multigpu::{Error as MultiError, MultiFrame, MultiRenderer};
++
++#[cfg(feature = "backend-kms")]
+ pub type GlMultiRenderer<'a> =
+     MultiRenderer<'a, 'a, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
++#[cfg(feature = "backend-kms")]
+ pub type GlMultiFrame<'a, 'frame, 'buffer> =
+     MultiFrame<'a, 'a, 'frame, 'buffer, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
++#[cfg(feature = "backend-kms")]
+ pub type GlMultiError = MultiError<GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
++
++#[cfg(not(feature = "backend-kms"))]
++pub type GlMultiError = smithay::backend::renderer::gles::GlesError;
+ 
+ pub enum RendererRef<'a> {
+     Glow(&'a mut GlowRenderer),
++    #[cfg(feature = "backend-kms")]
+     GlMulti(GlMultiRenderer<'a>),
+ }
+ 
+@@ -111,6 +119,7 @@
+     fn as_ref(&self) -> &GlowRenderer {
+         match self {
+             Self::Glow(renderer) => renderer,
++            #[cfg(feature = "backend-kms")]
+             Self::GlMulti(renderer) => renderer.as_ref(),
+         }
+     }
+@@ -120,6 +129,7 @@
+     fn as_mut(&mut self) -> &mut GlowRenderer {
+         match self {
+             Self::Glow(renderer) => renderer,
++            #[cfg(feature = "backend-kms")]
+             Self::GlMulti(renderer) => renderer.as_mut(),
+         }
+     }
+@@ -619,6 +629,7 @@
+     LayerShellOnly,
+ }
+ 
++#[cfg(feature = "backend-kms")]
+ pub fn output_elements<R>(
+     _gpu: Option<&DrmNode>,
+     renderer: &mut R,
+--- /dev/null
++++ b/src/backend/selection.rs
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Feature-aware selection, shared by normal startup and host regression tests.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum Backend {
++    #[cfg(feature = "backend-x11")]
++    X11,
++    #[cfg(feature = "backend-winit")]
++    Winit,
++    #[cfg(feature = "backend-kms")]
++    Kms,
++}
++
++pub(super) fn candidates(
++    requested: Option<&str>,
++    nested: bool,
++) -> Result<&'static [Backend], &'static str> {
++    if let Some(requested) = requested {
++        return match requested {
++            #[cfg(feature = "backend-x11")]
++            "x11" => Ok(&[Backend::X11]),
++            #[cfg(feature = "backend-winit")]
++            "winit" => Ok(&[Backend::Winit]),
++            #[cfg(feature = "backend-kms")]
++            "kms" => Ok(&[Backend::Kms]),
++            "x11" | "winit" | "kms" => Err("Requested COSMIC backend is disabled at build time"),
++            _ => Err("Unknown COSMIC_BACKEND value"),
++        };
++    }
++    if nested {
++        let candidates: &'static [Backend] = &[
++            #[cfg(feature = "backend-x11")]
++            Backend::X11,
++            #[cfg(feature = "backend-winit")]
++            Backend::Winit,
++        ];
++        return if candidates.is_empty() {
++            Err("No nested COSMIC backend is enabled")
++        } else {
++            Ok(candidates)
++        };
++    }
++    #[cfg(feature = "backend-kms")]
++    {
++        Ok(&[Backend::Kms])
++    }
++    #[cfg(not(feature = "backend-kms"))]
++    {
++        Err("Nested COSMIC requires DISPLAY or WAYLAND_DISPLAY")
++    }
++}
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -23,13 +23,7 @@
+     backend::input::{self as smithay_input, KeyState},
+     input::keyboard::{Keysym, ModifiersState, keysyms as KeySyms},
+     output::{Mode, Output},
+-    reexports::{
+-        calloop::LoopHandle,
+-        input::{
+-            AccelProfile, ClickMethod, Device as InputDevice, ScrollMethod, SendEventsMode,
+-            TapButtonMap,
+-        },
+-    },
++    reexports::calloop::LoopHandle,
+     utils::{Logical, Physical, Point, SERIAL_COUNTER, Size, Transform},
+ };
+ use std::{
+@@ -42,6 +36,11 @@
+ };
+ use tracing::{error, warn};
+ 
++#[cfg(feature = "backend-kms")]
++pub use smithay::reexports::input::{
++    AccelProfile, ClickMethod, Device as InputDevice, ScrollMethod, SendEventsMode, TapButtonMap,
++};
++#[cfg(feature = "backend-kms")]
+ mod input_config;
+ pub mod key_bindings;
+ mod types;
+@@ -639,11 +638,13 @@
+         self.cosmic_conf.xkb_config.clone()
+     }
+ 
++    #[cfg(feature = "backend-kms")]
+     pub fn read_device(&self, device: &mut InputDevice) {
+         let (device_config, default_config) = self.get_device_config(device);
+         input_config::update_device(device, device_config.as_ref(), default_config);
+     }
+ 
++    #[cfg(feature = "backend-kms")]
+     pub fn scroll_factor(&self, device: &InputDevice) -> f64 {
+         let (device_config, default_config) = self.get_device_config(device);
+         input_config::get_config(device_config.as_ref(), default_config, |x| {
+@@ -652,6 +653,7 @@
+         .map_or(1.0, |x| x.0)
+     }
+ 
++    #[cfg(feature = "backend-kms")]
+     pub fn map_to_output(&self, device: &InputDevice) -> Option<String> {
+         let (device_config, default_config) = self.get_device_config(device);
+         Some(
+@@ -662,6 +664,7 @@
+         )
+     }
+ 
++    #[cfg(feature = "backend-kms")]
+     fn get_device_config(&self, device: &InputDevice) -> (Option<InputConfig>, &InputConfig) {
+         let is_touchpad = device.config_tap_finger_count() > 0;
+ 
+@@ -783,6 +786,7 @@
+ }
+ 
+ fn update_input(state: &mut State) {
++    #[cfg(feature = "backend-kms")]
+     if let BackendData::Kms(kms_state) = &mut state.backend {
+         for device in kms_state.input_devices.values_mut() {
+             state.common.config.read_device(device);
+--- a/src/dbus/mod.rs
++++ b/src/dbus/mod.rs
+@@ -100,6 +100,7 @@
+ async fn init_system(state: &DBusState) -> zbus::Result<()> {
+     let conn = state.system_conn().await?.clone();
+     let evlh = state.0.evlh.clone();
++    #[cfg(feature = "backend-kms")]
+     state.spawn(async move {
+         if let Err(err) = power_hot_plug_task(conn, evlh).await {
+             tracing::warn!(?err, "Failed to initialize dbus handlers");
+@@ -108,6 +109,7 @@
+     Ok(())
+ }
+ 
++#[cfg(feature = "backend-kms")]
+ async fn power_hot_plug_task(
+     conn: zbus::Connection,
+     evlh: LoopHandle<'static, State>,
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -1,3 +1,5 @@
++#[cfg(feature = "backend-kms")]
++use smithay::reexports::input::Device as InputDevice;
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ use crate::{
+@@ -68,10 +70,7 @@
+         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
+     },
+     output::Output,
+-    reexports::{
+-        input::Device as InputDevice,
+-        wayland_server::{Resource as _, protocol::wl_surface::WlSurface},
+-    },
++    reexports::wayland_server::{Resource as _, protocol::wl_surface::WlSurface},
+     utils::{Clock, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
+     wayland::{
+         compositor::CompositorHandler,
+@@ -1076,6 +1075,9 @@
+                 }
+             }
+             InputEvent::PointerAxis { event, .. } => {
++                #[cfg(not(feature = "backend-kms"))]
++                let scroll_factor = 1.0;
++                #[cfg(feature = "backend-kms")]
+                 let scroll_factor =
+                     if let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(&event.device()) {
+                         self.common.config.scroll_factor(device)
+@@ -2604,6 +2606,7 @@
+         }
+ 
+         // Handle VT switches
++        #[cfg(feature = "backend-kms")]
+         if key_state == KeyState::Pressed
+             && (Keysym::XF86_Switch_VT_1.raw()..=Keysym::XF86_Switch_VT_12.raw())
+                 .contains(&handle.modified_sym().raw())
+@@ -3233,6 +3236,9 @@
+     shell: &'a Shell,
+     device: &D,
+ ) -> Option<&'a Output> {
++    #[cfg(not(feature = "backend-kms"))]
++    let map_to_output: Option<&Output> = None;
++    #[cfg(feature = "backend-kms")]
+     let map_to_output = if let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(device) {
+         config
+             .map_to_output(device)
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,6 +36,12 @@
+ 
+ use std::error::Error;
+ 
++#[cfg(not(any(
++    feature = "backend-kms",
++    feature = "backend-winit",
++    feature = "backend-x11"
++)))]
++compile_error!("Enable at least one COSMIC backend");
+ pub mod backend;
+ pub mod config;
+ pub mod dbus;
+@@ -67,6 +73,7 @@
+         // into systemd and the session?
+         self.ready.call_once(|| {
+             // potentially tell systemd we are setup now
++            #[cfg(feature = "backend-kms")]
+             if let state::BackendData::Kms(_) = &self.backend {
+                 #[cfg(feature = "systemd")]
+                 systemd::ready(&self.common);
+@@ -254,6 +261,7 @@
+     // Mesa's atexit handlers run and corrupt the heap (issue #2375). Safe here
+     // because the event loop has stopped; an unconditional join in Surface::Drop
+     // would instead deadlock against apply_config_for_outputs.
++    #[cfg(feature = "backend-kms")]
+     if let BackendData::Kms(kms) = &mut state.backend {
+         // Release master first so the surface drop path skips its blocking commit.
+         for device in kms.drm_devices.values_mut() {
+--- a/src/libei.rs
++++ b/src/libei.rs
+@@ -142,6 +142,7 @@
+                                 let backend_id =
+                                     InputBackendId::Ei(connection.eis_connection().clone());
+                                 data.process_input_event(other, backend_id);
++                                #[cfg(feature = "backend-kms")]
+                                 if matches!(data.backend, BackendData::Kms(_)) {
+                                     for output in data.common.shell.read().outputs() {
+                                         data.backend.kms().schedule_render(output);
+--- a/src/shell/seats.rs
++++ b/src/shell/seats.rs
+@@ -1,3 +1,5 @@
++#[cfg(feature = "backend-kms")]
++use smithay::reexports::input::Device as InputDevice;
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+ use std::{any::Any, cell::RefCell, collections::HashMap, sync::Mutex};
+@@ -17,10 +19,7 @@
+         pointer::{CursorImageAttributes, CursorImageStatus},
+     },
+     output::Output,
+-    reexports::{
+-        input::Device as InputDevice,
+-        wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
+-    },
++    reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
+     utils::{Buffer, IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Time, Transform},
+     wayland::compositor::with_states,
+ };
+@@ -129,6 +128,7 @@
+             .collect::<Vec<_>>();
+         map.insert((backend_id.clone(), id), caps);
+ 
++        #[cfg(feature = "backend-kms")]
+         if device.has_capability(DeviceCapability::Keyboard)
+             && let Some(device) = <dyn Any>::downcast_ref::<InputDevice>(device)
+         {
+@@ -154,9 +154,12 @@
+     ) -> Vec<DeviceCapability> {
+         let id = device.id();
+ 
+-        let mut keyboards = self.keyboards.borrow_mut();
+-        if let Some(idx) = keyboards.iter().position(|x| x.id() == id) {
+-            keyboards.remove(idx);
++        #[cfg(feature = "backend-kms")]
++        {
++            let mut keyboards = self.keyboards.borrow_mut();
++            if let Some(idx) = keyboards.iter().position(|x| x.id() == id) {
++                keyboards.remove(idx);
++            }
+         }
+ 
+         let mut map = self.capabilities.borrow_mut();
+@@ -168,6 +171,7 @@
+     }
+ 
+     pub fn update_led_state(&self, led_state: LedState) {
++        #[cfg(feature = "backend-kms")]
+         for keyboard in self.keyboards.borrow_mut().iter_mut() {
+             keyboard.led_update(led_state.into());
+         }
+@@ -179,6 +183,7 @@
+     // Keyed by `(backend, device_id)`
+     capabilities: RefCell<HashMap<(InputBackendId, String), Vec<DeviceCapability>>>,
+     // Used for updating keyboard leds on kms backend
++    #[cfg(feature = "backend-kms")]
+     keyboards: RefCell<Vec<InputDevice>>,
+ }
+ 
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -1,12 +1,13 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++#[cfg(feature = "backend-kms")]
++use crate::backend::kms::{KmsGuard, KmsState};
++#[cfg(feature = "backend-winit")]
++use crate::backend::winit::WinitState;
++#[cfg(feature = "backend-x11")]
++use crate::backend::x11::X11State;
+ use crate::{
+-    backend::{
+-        kms::{KmsGuard, KmsState},
+-        render::{GlMultiError, RendererRef},
+-        winit::WinitState,
+-        x11::X11State,
+-    },
++    backend::render::{GlMultiError, RendererRef},
+     config::{CompOutputConfig, Config, ScreenFilter},
+     dbus::DBusState,
+     input::{PointerFocusState, gestures::GestureState},
+@@ -177,6 +178,7 @@
+     fn initialized(&self, _client_id: ClientId) {}
+     fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
+         self.evlh.insert_idle(move |state| {
++            #[cfg(feature = "backend-kms")]
+             if let BackendData::Kms(kms_state) = &mut state.backend {
+                 for device in kms_state.drm_devices.values_mut() {
+                     if device.inner.active_clients.remove(&client_id)
+@@ -332,8 +334,11 @@
+ #[derive(Debug)]
+ #[allow(clippy::large_enum_variant)]
+ pub enum BackendData {
++    #[cfg(feature = "backend-x11")]
+     X11(X11State),
++    #[cfg(feature = "backend-winit")]
+     Winit(WinitState),
++    #[cfg(feature = "backend-kms")]
+     Kms(KmsState),
+     // TODO
+     // Wayland(WaylandState),
+@@ -341,8 +346,11 @@
+ }
+ 
+ pub enum LockedBackend<'a> {
++    #[cfg(feature = "backend-x11")]
+     X11(&'a mut X11State),
++    #[cfg(feature = "backend-winit")]
+     Winit(&'a mut WinitState),
++    #[cfg(feature = "backend-kms")]
+     Kms(KmsGuard<'a>),
+ }
+ 
+@@ -366,22 +374,28 @@
+ }
+ 
+ impl BackendData {
++    #[cfg(feature = "backend-kms")]
+     pub fn kms(&mut self) -> &mut KmsState {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(kms_state) => kms_state,
+             _ => unreachable!("Called kms in non kms backend"),
+         }
+     }
+ 
++    #[cfg(feature = "backend-x11")]
+     pub fn x11(&mut self) -> &mut X11State {
+         match self {
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(x11_state) => x11_state,
+             _ => unreachable!("Called x11 in non x11 backend"),
+         }
+     }
+ 
++    #[cfg(feature = "backend-winit")]
+     pub fn winit(&mut self) -> &mut WinitState {
+         match self {
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(winit_state) => winit_state,
+             _ => unreachable!("Called winit in non winit backend"),
+         }
+@@ -389,10 +403,13 @@
+ 
+     pub fn schedule_render(&mut self, output: &Output) {
+         match self {
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(_) => {} // We cannot do this on the winit backend.
+             // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
+             // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(state) => state.schedule_render(output),
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => state.schedule_render(output),
+             _ => unreachable!("No backend was initialized"),
+         }
+@@ -405,12 +422,15 @@
+         dmabuf: Dmabuf,
+     ) -> Result<Option<DrmNode>, anyhow::Error> {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => {
+                 return state.dmabuf_imported(client, global, dmabuf).map(Some);
+             }
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(state) => {
+                 state.backend.renderer().import_dmabuf(&dmabuf, None)?;
+             }
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(state) => {
+                 state.renderer.import_dmabuf(&dmabuf, None)?;
+             }
+@@ -424,14 +444,14 @@
+     /// `kms_node_cb` callback use used to determine nodes to render with when using kms backend.
+     /// If this returns `None`, it will attempt to use llvmpipe, then panic if no renderer is
+     /// found.
+-    pub fn offscreen_renderer<N: Into<KmsNodes>, F: FnOnce(&mut KmsState) -> Option<N>>(
++    pub fn offscreen_renderer(
+         &mut self,
+-        kms_node_cb: F,
++        #[cfg(feature = "backend-kms")] kms_node_cb: impl FnOnce(&mut KmsState) -> Option<KmsNodes>,
+     ) -> Result<RendererRef<'_>, GlMultiError> {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(kms) => {
+                 if let Some(nodes) = kms_node_cb(kms) {
+-                    let nodes = nodes.into();
+                     Ok(RendererRef::GlMulti(kms.api.renderer(
+                         &nodes.render_node,
+                         &nodes.target_node,
+@@ -445,7 +465,9 @@
+                     ))
+                 }
+             }
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(winit) => Ok(RendererRef::Glow(winit.backend.renderer())),
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(x11) => Ok(RendererRef::Glow(&mut x11.renderer)),
+             _ => unreachable!("No backend set when getting offscreen renderer"),
+         }
+@@ -453,8 +475,11 @@
+ 
+     pub fn update_screen_filter(&mut self, screen_filter: &ScreenFilter) -> anyhow::Result<()> {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => state.update_screen_filter(screen_filter),
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(state) => state.update_screen_filter(screen_filter),
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(state) => state.update_screen_filter(screen_filter),
+             _ => unreachable!("No backend set when setting screen filters"),
+         }
+@@ -462,8 +487,11 @@
+ 
+     pub fn lock(&mut self) -> LockedBackend<'_> {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => LockedBackend::Kms(state.lock_devices()),
++            #[cfg(feature = "backend-x11")]
+             BackendData::X11(state) => LockedBackend::X11(state),
++            #[cfg(feature = "backend-winit")]
+             BackendData::Winit(state) => LockedBackend::Winit(state),
+             _ => unreachable!("Tried to lock unset backend"),
+         }
+@@ -473,8 +501,11 @@
+ impl LockedBackend<'_> {
+     pub fn all_outputs(&self) -> Vec<Output> {
+         match self {
++            #[cfg(feature = "backend-kms")]
+             LockedBackend::Kms(state) => state.all_outputs(),
++            #[cfg(feature = "backend-x11")]
+             LockedBackend::X11(state) => state.all_outputs(),
++            #[cfg(feature = "backend-winit")]
+             LockedBackend::Winit(state) => state.all_outputs(),
+         }
+     }
+@@ -553,6 +584,7 @@
+         }
+ 
+         match self {
++            #[cfg(feature = "backend-kms")]
+             LockedBackend::Kms(state) => state.apply_config_for_outputs(
+                 test_only,
+                 loop_handle,
+@@ -561,7 +593,9 @@
+                 startup_done,
+                 clock,
+             ),
++            #[cfg(feature = "backend-winit")]
+             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
++            #[cfg(feature = "backend-x11")]
+             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
+         }?;
+ 
+@@ -605,10 +639,13 @@
+ 
+         for output in active_outputs {
+             match self {
++                #[cfg(feature = "backend-winit")]
+                 LockedBackend::Winit(_) => {} // We cannot do this on the winit backend.
+                 // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
+                 // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
++                #[cfg(feature = "backend-x11")]
+                 LockedBackend::X11(state) => state.schedule_render(&output),
++                #[cfg(feature = "backend-kms")]
+                 LockedBackend::Kms(state) => state.schedule_render(&output),
+             }
+         }
+@@ -853,6 +890,7 @@
+         ClientState {
+             compositor_client_state: CompositorClientState::default(),
+             advertised_drm_node: match &self.backend {
++                #[cfg(feature = "backend-kms")]
+                 BackendData::Kms(kms_state) => *kms_state.primary_node.read().unwrap(),
+                 _ => None,
+             },
+@@ -865,11 +903,13 @@
+     fn update_inhibitor_locks(&mut self) {
+         #[cfg(feature = "logind")]
+         {
++            #[cfg(feature = "backend-kms")]
+             use smithay::backend::session::Session;
+             use tracing::{debug, error, warn};
+ 
+             let outputs = self.backend.lock().all_outputs();
+             let is_active = match &self.backend {
++                #[cfg(feature = "backend-kms")]
+                 BackendData::Kms(kms) => kms.session.is_active(),
+                 _ => true,
+             };
+--- a/src/utils/screenshot.rs
++++ b/src/utils/screenshot.rs
+@@ -99,13 +99,18 @@
+     if let Some(wl_surface) = surface.wl_surface() {
+         let res = state
+             .backend
+-            .offscreen_renderer(|kms| {
+-                advertised_node_for_surface(&wl_surface, &state.common.display_handle)
+-                    .or(*kms.primary_node.read().unwrap())
+-            })
++            .offscreen_renderer(
++                #[cfg(feature = "backend-kms")]
++                |kms| {
++                    advertised_node_for_surface(&wl_surface, &state.common.display_handle)
++                        .or(*kms.primary_node.read().unwrap())
++                        .map(Into::into)
++                },
++            )
+             .with_context(|| "Failed to get renderer for screenshot")
+             .and_then(|renderer| match renderer {
+                 RendererRef::Glow(renderer) => render_window(renderer, surface),
++                #[cfg(feature = "backend-kms")]
+                 RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface),
+             });
+         if let Err(err) = res {
+--- a/src/wayland/handlers/dmabuf.rs
++++ b/src/wayland/handlers/dmabuf.rs
+@@ -42,38 +42,46 @@
+         surface: &WlSurface,
+         _global: &DmabufGlobal,
+     ) -> Option<DmabufFeedback> {
++        #[cfg(feature = "backend-kms")]
+         let BackendData::Kms(kms) = &self.backend else {
+             return None;
+         };
+-        let shell = self.common.shell.read();
++        #[cfg(not(feature = "backend-kms"))]
++        {
++            None
++        }
++        #[cfg(feature = "backend-kms")]
++        {
++            let shell = self.common.shell.read();
+ 
+-        let (handle, output) = shell.workspace_for_surface(surface)?;
+-        let is_fullscreen = shell
+-            .workspaces
+-            .space_for_handle(&handle)?
+-            .fullscreen_surfaces
+-            .iter()
+-            .any(|f| {
+-                f.ended_at.is_none() && f.surface.has_surface(surface, WindowSurfaceType::all())
+-            });
++            let (handle, output) = shell.workspace_for_surface(surface)?;
++            let is_fullscreen = shell
++                .workspaces
++                .space_for_handle(&handle)?
++                .fullscreen_surfaces
++                .iter()
++                .any(|f| {
++                    f.ended_at.is_none() && f.surface.has_surface(surface, WindowSurfaceType::all())
++                });
+ 
+-        let node = kms.primary_node.read().unwrap().unwrap();
+-        let kms_surface = kms
+-            .drm_devices
+-            .values()
+-            .find_map(|device| device.inner.surfaces.values().find(|s| s.output == output))?;
+-        let feedback = kms_surface.feedback.get(&node)?.clone();
++            let node = kms.primary_node.read().unwrap().unwrap();
++            let kms_surface = kms
++                .drm_devices
++                .values()
++                .find_map(|device| device.inner.surfaces.values().find(|s| s.output == output))?;
++            let feedback = kms_surface.feedback.get(&node)?.clone();
+ 
+-        Some(with_states(surface, |data| {
+-            if is_fullscreen {
+-                feedback.primary_scanout_feedback
+-            } else if frame_time_filter_fn(data) == Kind::ScanoutCandidate {
+-                feedback
+-                    .overlay_scanout_feedback
+-                    .unwrap_or(feedback.render_feedback)
+-            } else {
+-                feedback.render_feedback
+-            }
+-        }))
++            Some(with_states(surface, |data| {
++                if is_fullscreen {
++                    feedback.primary_scanout_feedback
++                } else if frame_time_filter_fn(data) == Kind::ScanoutCandidate {
++                    feedback
++                        .overlay_scanout_feedback
++                        .unwrap_or(feedback.render_feedback)
++                } else {
++                    feedback.render_feedback
++                }
++            }))
++        }
+     }
+ }
+--- a/src/wayland/handlers/image_copy_capture/mod.rs
++++ b/src/wayland/handlers/image_copy_capture/mod.rs
+@@ -399,10 +399,14 @@
+     };
+ 
+     let mut renderer = backend
+-        .offscreen_renderer(|kms| {
+-            kms.target_node_for_output(output)
+-                .or(*kms.primary_node.read().unwrap())
+-        })
++        .offscreen_renderer(
++            #[cfg(feature = "backend-kms")]
++            |kms| {
++                kms.target_node_for_output(output)
++                    .or(*kms.primary_node.read().unwrap())
++                    .map(Into::into)
++            },
++        )
+         .unwrap();
+     Some(constraints_for_renderer(mode, renderer.as_mut()))
+ }
+@@ -415,16 +419,22 @@
+     let wl_surface = surface.wl_surface()?;
+ 
+     let mut renderer = backend
+-        .offscreen_renderer(|kms| {
+-            let dma_node = with_renderer_surface_state(&wl_surface, |state| {
+-                let buffer = state.buffer()?;
+-                let dmabuf = get_dmabuf(buffer).ok()?;
+-                dmabuf.node()
+-            })
+-            .flatten();
+-
+-            dma_node.or(*kms.primary_node.read().unwrap())
+-        })
++        .offscreen_renderer(
++            #[cfg(feature = "backend-kms")]
++            |kms| {
++                let dma_node = with_renderer_surface_state(&wl_surface, |state| {
++                    let buffer = state.buffer()?;
++                    let dmabuf = get_dmabuf(buffer).ok()?;
++                    dmabuf.node()
++                })
++                .flatten();
++
++                dma_node
++                    .or(*kms.primary_node.read().unwrap())
++                    .map(Into::into)
++                    .map(Into::into)
++            },
++        )
+         .unwrap();
+ 
+     Some(constraints_for_renderer(size, renderer.as_mut()))
+--- a/src/wayland/handlers/image_copy_capture/render.rs
++++ b/src/wayland/handlers/image_copy_capture/render.rs
+@@ -433,30 +433,33 @@
+     let transform = output.current_transform();
+     let common = &mut state.common;
+ 
+-    let renderer = match state.backend.offscreen_renderer(|kms| {
+-        let render_node = kms
+-            .target_node_for_output(&output)
+-            .or(*kms.primary_node.read().unwrap())?;
+-        let target_node = get_dmabuf(&buffer)
+-            .ok()
+-            .and_then(|dma| dma.node())
+-            .unwrap_or(render_node);
+-
+-        let buffer_format = match buffer_type(&buffer) {
+-            Some(BufferType::Dma) => Some(get_dmabuf(&buffer).unwrap().format().code),
+-            Some(BufferType::Shm) => {
+-                with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+-                    .unwrap()
+-            }
+-            _ => None,
+-        };
+-
+-        Some(KmsNodes {
+-            render_node,
+-            target_node,
+-            copy_format: buffer_format.unwrap_or(Fourcc::Abgr8888),
+-        })
+-    }) {
++    let renderer = match state.backend.offscreen_renderer(
++        #[cfg(feature = "backend-kms")]
++        |kms| {
++            let render_node = kms
++                .target_node_for_output(&output)
++                .or(*kms.primary_node.read().unwrap())?;
++            let target_node = get_dmabuf(&buffer)
++                .ok()
++                .and_then(|dma| dma.node())
++                .unwrap_or(render_node);
++
++            let buffer_format = match buffer_type(&buffer) {
++                Some(BufferType::Dma) => Some(get_dmabuf(&buffer).unwrap().format().code),
++                Some(BufferType::Shm) => {
++                    with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
++                        .unwrap()
++                }
++                _ => None,
++            };
++
++            Some(KmsNodes {
++                render_node,
++                target_node,
++                copy_format: buffer_format.unwrap_or(Fourcc::Abgr8888),
++            })
++        },
++    ) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+@@ -493,6 +496,7 @@
+                 }
+             }
+         }
++        #[cfg(feature = "backend-kms")]
+         RendererRef::GlMulti(mut renderer) => {
+             match render_session(
+                 &mut renderer,
+@@ -711,24 +715,28 @@
+     let common = &mut state.common;
+     let draw_cursor = session.draw_cursor();
+ 
+-    let renderer = match state.backend.offscreen_renderer(|kms| {
+-        get_dmabuf(&buffer)
+-            .ok()
+-            .and_then(|dmabuf| dmabuf.node())
+-            .or_else(|| {
+-                toplevel
+-                    .wl_surface()
+-                    .and_then(|wl_surface| {
+-                        with_renderer_surface_state(&wl_surface, |state| {
+-                            let buffer = state.buffer()?;
+-                            let dmabuf = get_dmabuf(buffer).ok()?;
+-                            dmabuf.node()
++    let renderer = match state.backend.offscreen_renderer(
++        #[cfg(feature = "backend-kms")]
++        |kms| {
++            get_dmabuf(&buffer)
++                .ok()
++                .and_then(|dmabuf| dmabuf.node())
++                .or_else(|| {
++                    toplevel
++                        .wl_surface()
++                        .and_then(|wl_surface| {
++                            with_renderer_surface_state(&wl_surface, |state| {
++                                let buffer = state.buffer()?;
++                                let dmabuf = get_dmabuf(buffer).ok()?;
++                                dmabuf.node()
++                            })
+                         })
+-                    })
+-                    .flatten()
+-            })
+-            .or(*kms.primary_node.read().unwrap())
+-    }) {
++                        .flatten()
++                })
++                .or(*kms.primary_node.read().unwrap())
++                .map(Into::into)
++        },
++    ) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+@@ -763,6 +771,7 @@
+                 None
+             }
+         },
++        #[cfg(feature = "backend-kms")]
+         RendererRef::GlMulti(mut renderer) => match render_session(
+             &mut renderer,
+             session.user_data().get::<SessionData>().unwrap(),
+@@ -891,10 +900,10 @@
+     }
+ 
+     let common = &mut state.common;
+-    let renderer = match state
+-        .backend
+-        .offscreen_renderer(|kms| *kms.primary_node.read().unwrap())
+-    {
++    let renderer = match state.backend.offscreen_renderer(
++        #[cfg(feature = "backend-kms")]
++        |kms| kms.primary_node.read().unwrap().map(Into::into),
++    ) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+@@ -929,6 +938,7 @@
+                 }
+             }
+         }
++        #[cfg(feature = "backend-kms")]
+         RendererRef::GlMulti(mut renderer) => {
+             match render_session(
+                 &mut renderer,
+--- a/src/wayland/handlers/mod.rs
++++ b/src/wayland/handlers/mod.rs
+@@ -10,7 +10,9 @@
+ pub mod decoration;
+ pub mod dmabuf;
+ pub mod drm;
++#[cfg(feature = "backend-kms")]
+ pub mod drm_lease;
++#[cfg(feature = "backend-kms")]
+ pub mod drm_syncobj;
+ pub mod foreign_toplevel_list;
+ pub mod fractional_scale;
+--- a/src/wayland/handlers/output_power.rs
++++ b/src/wayland/handlers/output_power.rs
+@@ -1,9 +1,10 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++#[cfg(feature = "backend-kms")]
++use crate::backend::kms::Surface;
+ use smithay::output::Output;
+ 
+ use crate::{
+-    backend::kms::Surface,
+     state::{BackendData, State},
+     utils::prelude::OutputExt,
+     wayland::protocols::output_power::{
+@@ -11,6 +12,7 @@
+     },
+ };
+ 
++#[cfg(feature = "backend-kms")]
+ pub fn set_all_surfaces_dpms_on(state: &mut State) {
+     let mut changed = false;
+     for surface in kms_surfaces(state) {
+@@ -30,6 +32,7 @@
+     }
+ }
+ 
++#[cfg(feature = "backend-kms")]
+ fn kms_surfaces(state: &mut State) -> impl Iterator<Item = &mut Surface> {
+     if let BackendData::Kms(kms_state) = &mut state.backend {
+         Some(
+@@ -46,6 +49,7 @@
+ }
+ 
+ // Get KMS `Surface` for output, and for all outputs mirroring it
++#[cfg(feature = "backend-kms")]
+ fn kms_surfaces_for_output<'a>(
+     state: &'a mut State,
+     output: &'a Output,
+@@ -56,6 +60,7 @@
+ }
+ 
+ // Get KMS `Surface` for output
++#[cfg(feature = "backend-kms")]
+ fn primary_kms_surface_for_output<'a>(
+     state: &'a mut State,
+     output: &Output,
+@@ -63,17 +68,28 @@
+     kms_surfaces(state).find(|surface| surface.output == *output)
+ }
+ 
++#[cfg(not(feature = "backend-kms"))]
++pub fn set_all_surfaces_dpms_on(_state: &mut State) {}
++
+ impl OutputPowerHandler for State {
+     fn output_power_state(&mut self) -> &mut OutputPowerState {
+         &mut self.common.output_power_state
+     }
+ 
+     fn get_dpms(&mut self, output: &Output) -> Option<bool> {
+-        let surface = primary_kms_surface_for_output(self, output)?;
+-        Some(surface.get_dpms())
++        #[cfg(feature = "backend-kms")]
++        {
++            Some(primary_kms_surface_for_output(self, output)?.get_dpms())
++        }
++        #[cfg(not(feature = "backend-kms"))]
++        {
++            let _ = output;
++            None
++        }
+     }
+ 
+     fn set_dpms(&mut self, output: &Output, on: bool) {
++        #[cfg(feature = "backend-kms")]
+         for surface in kms_surfaces_for_output(self, output) {
+             surface.set_dpms(on);
+         }

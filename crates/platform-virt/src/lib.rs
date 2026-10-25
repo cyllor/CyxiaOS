@@ -6,8 +6,10 @@ pub const ENTRY: u64 = 0x40200000;
 /// End of the pinned boot image/DMA arena (DTB occupies the first 2 MiB).
 pub const KERNEL_POOL_END: u64 = 0x44000000;
 pub const HIGH_BASE: u64 = 0xffffffc000000000;
-/// End of the 256 MiB RAM range pinned by this initial QEMU board.
-pub const RAM_MIB: u64 = if cfg!(feature = "large-memory") {
+/// Explicit board profile: initial 256 MiB, desktop 512 MiB, prototype 1 GiB.
+pub const RAM_MIB: u64 = if cfg!(feature = "prototype-memory") {
+    1024
+} else if cfg!(feature = "large-memory") {
     512
 } else {
     256

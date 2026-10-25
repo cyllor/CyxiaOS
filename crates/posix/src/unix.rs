@@ -22,6 +22,12 @@ pub const CONNECTIONS: usize = 32;
 pub const BUFFER_BYTES: usize = 4096;
 pub const PATH_BYTES: usize = 108;
 pub const BACKLOG_MAX: usize = 8;
+/// Linux listen(2) consumes an int, then caps its unsigned representation.
+/// Rust's UnixListener uses -1 to request the platform maximum. The native
+/// mechanism stays bounded; this adapter never grows its pending queue.
+pub fn linux_listen_backlog(raw: u64) -> usize {
+    (raw as u32 as usize).clamp(1, BACKLOG_MAX)
+}
 const GENERATION_MAX: u64 = u64::MAX >> 8;
 
 /// Opaque endpoint identity, not a Unix file descriptor. The low byte is a slot;

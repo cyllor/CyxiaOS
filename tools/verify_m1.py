@@ -18,9 +18,10 @@ except ImportError:
  from run_qemu import run
 
 def inspect_instructions(text, allow_user_context=False):
- # Only the two handwritten context transitions may access user FP state.
- # Interrupt handlers, Rust code and compiler helpers remain soft-float.
+ # Only the two handwritten user transitions and the exact reviewed SHA
+ # transition may access FP/SIMD state. Other kernel code remains soft-float.
  transitions={'cyxia_enter_user', 'cyxia_user_return'}
+ sha_transition='cyxia_sha256_compress_hw'
  count=0;symbol=None
  for line in text.splitlines():
   label=re.match(r'^\s*[0-9a-f]+ <([^>]+)>:\s*$',line)
@@ -35,7 +36,8 @@ def inspect_instructions(text, allow_user_context=False):
   # State load/store only: allowing FP arithmetic here would permit accidental
   # clobber before save. Unknown instructions always fail even in a transition.
   context_move=bool(re.match(r'(?:ldp|stp)\s+q\d+,\s*q\d+,|(?:mrs|msr)\s+.*\b(?:fpcr|fpsr)\b',insn))
-  if fp and not (allow_user_context and symbol in transitions and context_move):raise ValueError('FP/SIMD outside context save/restore: '+line)
+  sha_allowed=symbol==sha_transition and bool(re.match(r'(?:stp|ldp)\s+q\d+,\s*q\d+,|(?:mrs|msr)\s+.*\b(?:fpcr|fpsr)\b|(?:ld1|st1|rev32|add|mov|sha256h2?|sha256su[01])\b',insn))
+  if fp and not ((allow_user_context and symbol in transitions and context_move) or sha_allowed):raise ValueError('FP/SIMD outside reviewed transition: '+line)
   count+=1
  if count==0:raise ValueError('no executable instructions inspected')
  return count

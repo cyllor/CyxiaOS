@@ -19,6 +19,12 @@ class VerifyTests(unittest.TestCase):
   for text in ['4000 <cyxia_enter_user>:\n 4000: fmov d0, x0', '4000 <cyxia_user_return>:\n 4000: <unknown>', '4000 <irq_handler>:\n 4000: stp q0, q1, [x0]', '4000 <cyxia_enter_user_extra>:\n 4000: ldp q0, q1, [x0]', ' 4000: ldp q0, q1, [x0]', '4000 <cyxia_enter_user>:\n 4000: ret\n4010 <ordinary_fn>:\n 4010: mrs x0, fpcr']:
    with self.subTest(text=text):
     with self.assertRaises(ValueError):inspect_instructions(text, allow_user_context=True)
+ def test_bounded_sha_transition_is_exactly_scoped(self):
+  text='4000 <cyxia_sha256_compress_hw>:\n 4000: stp q0, q1, [sp, #16]\n 4004: ld1 { v4.16b }, [x1], #16\n 4008: sha256h q0, q1, v15.4s'
+  self.assertEqual(inspect_instructions(text),3)
+  for bad in ['4000 <ordinary_fn>:\n 4000: sha256h q0, q1, v2.4s', '4000 <cyxia_sha256_compress_hw>:\n 4000: fmov d0, x0', '4000 <cyxia_sha256_compress_hw_extra>:\n 4000: sha256h q0, q1, v2.4s']:
+   with self.subTest(text=bad):
+    with self.assertRaises(ValueError):inspect_instructions(bad)
  def test_llvm_uppercase_fp_registers_cannot_bypass_scan(self):
   for instruction in ['msr FPCR, x9', 'mrs x9, FPSR']:
    with self.assertRaises(ValueError):inspect_instructions('4000 <irq>:\n 4000: '+instruction, allow_user_context=True)

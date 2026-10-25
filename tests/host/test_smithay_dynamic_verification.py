@@ -1,5 +1,6 @@
 """Reject false independent admission, stale identities and premature disconnect claims."""
 import copy
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -103,6 +104,14 @@ def resource_fixture():
 
 
 class SmithayDynamicVerificationTests(unittest.TestCase):
+    def test_optimized_interpreter_cannot_disable_native_acceptance_checks(self):
+        script = Path(gate.__file__).resolve()
+        result = subprocess.run([sys.executable, "-O", str(script), "--help"],
+                                capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0,
+                            "Optimized Python must not run assertion-based acceptance")
+        self.assertIn("requires Python assertions", result.stderr)
+
     def test_real_independent_admission_lifecycle(self):
         result=gate.validate(valid_log());self.assertEqual((result["scenes"],result["commits"],result["configures"]),(12,8,7))
         self.assertEqual((result["admitted_clients"],result["capacity_rejections"],result["reused_slots"]),(3,1,1))

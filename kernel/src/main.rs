@@ -5,14 +5,121 @@
     any(feature = "ported", feature = "graphics", feature = "large-memory")
 ))]
 compile_error!("smp-selftest cannot certify the CPU0-only desktop/ported profile");
+#[cfg(all(feature = "net-selftest", feature = "ai-control-selftest"))]
+compile_error!("net-selftest and ai-control-selftest have separate evidence scopes");
+#[cfg(all(
+    feature = "model-v13-selftest",
+    any(feature = "ai-control-selftest", feature = "net-selftest")
+))]
+compile_error!("model-v13-selftest must run as a separate evidence profile");
+#[cfg(all(
+    feature = "storage-v13-selftest",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime"
+    )
+))]
+compile_error!("storage-v13-selftest must run as a separate evidence profile");
+#[cfg(all(
+    feature = "prototype-runtime",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest"
+    )
+))]
+compile_error!("prototype-runtime must run as a separate evidence profile");
+#[cfg(any(
+    feature = "storage-v13-selftest",
+    feature = "prototype-runtime",
+    feature = "tcp-v13-selftest"
+))]
+mod prototype_storage;
+#[cfg(all(
+    feature = "tcp-v13-selftest",
+    any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "storage-v13-selftest"
+    )
+))]
+compile_error!("tcp-v13-selftest must run as a separate evidence profile");
+#[cfg(feature = "tcp-v13-selftest")]
+mod cluster_transport;
+#[cfg(feature = "unified-runtime")]
+mod control_pool;
+#[cfg(feature = "unified-runtime")]
+mod domain_control;
+#[cfg(feature = "unified-runtime")]
+mod domain_evidence;
+#[cfg(feature = "unified-runtime")]
+mod domain_file_abi;
+#[cfg(feature = "unified-runtime")]
+mod domain_network;
+#[cfg(feature = "unified-runtime")]
+mod domain_platform;
+#[cfg(feature = "unified-runtime")]
+mod domain_services;
+#[cfg(feature = "unified-runtime")]
+mod domain_storage;
+#[cfg(feature = "unified-runtime")]
+mod domain_tasks;
+#[cfg(feature = "unified-runtime")]
+mod learning_canary;
+#[cfg(feature = "unified-runtime")]
+mod learning_evidence;
+#[cfg(feature = "unified-runtime")]
+mod learning_history;
+#[cfg(feature = "unified-runtime")]
+mod learning_prewarm;
+#[cfg(feature = "unified-runtime")]
+mod learning_replay;
+#[cfg(feature = "unified-runtime")]
+mod learning_session;
+#[cfg(feature = "unified-runtime")]
+mod learning_workload;
+#[cfg(feature = "unified-runtime")]
+mod local_placement;
+#[cfg(feature = "unified-runtime")]
+mod model_bank;
+#[cfg(feature = "net-selftest")]
+mod net_selftest;
+#[cfg(feature = "unified-runtime")]
+mod peer_replay;
+#[cfg(feature = "unified-runtime")]
+mod service_windows;
 #[cfg(feature = "smp-selftest")]
+#[cfg_attr(
+    any(
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "tcp-v13-selftest"
+    ),
+    allow(dead_code)
+)]
 mod smp;
+#[cfg(feature = "unified-runtime")]
+mod unified;
+#[cfg(feature = "unified-runtime")]
+mod unified_store;
+#[cfg(feature = "unified-runtime")]
+mod unified_task;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_contracts::*;
 #[cfg(not(feature = "selftest"))]
 mod ai;
 mod clock;
-#[cfg(all(feature = "ported", not(feature = "selftest")))]
+#[cfg(any(
+    feature = "tcp-v13-selftest",
+    feature = "unified-runtime",
+    all(feature = "ported", not(feature = "selftest"))
+))]
 mod entropy;
 #[cfg(all(feature = "ported", not(feature = "selftest")))]
 mod exec_memory;
@@ -32,7 +139,14 @@ mod storage;
 mod user;
 #[cfg(not(feature = "selftest"))]
 mod user_heap;
-#[cfg(any(feature = "graphics", not(feature = "selftest")))]
+#[cfg(any(
+    feature = "graphics",
+    feature = "storage-v13-selftest",
+    feature = "tcp-v13-selftest",
+    feature = "prototype-runtime",
+    feature = "net-selftest",
+    not(feature = "selftest")
+))]
 mod virtio_platform;
 const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
 core::arch::global_asm!(include_str!("../../crates/arch-aarch64/src/entry.S"),ram_base=const cyxia_platform_virt::RAM_BASE,entry=const cyxia_platform_virt::ENTRY,gic_base=const 0x08000000,uart_base=const 0x09000000,ram_end=const cyxia_platform_virt::USER_RAM_END,ram_table_count=const cyxia_platform_virt::RAM_MIB/2,ram_tables_bytes=const cyxia_platform_virt::RAM_MIB/2*4096);
@@ -70,6 +184,17 @@ static EXPECTED_FAR: AtomicU64 = AtomicU64::new(0);
 static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static LOG_LOSS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "unified-runtime")]
+#[repr(C, align(64))]
+pub struct PanicEvidence {
+    pub words: [AtomicU64; 8],
+}
+#[cfg(feature = "unified-runtime")]
+#[used]
+#[unsafe(no_mangle)]
+pub static PANIC_EVIDENCE: PanicEvidence = PanicEvidence {
+    words: [const { AtomicU64::new(0) }; 8],
+};
 fn log(s: &[u8]) {
     if let Err(PlatformError::Again) = try_log(s) {
         // Best-effort diagnostic caller drops this record; keep that loss visible.
@@ -87,6 +212,20 @@ fn try_log(s: &[u8]) -> Result<(), PlatformError> {
     let seq = LOG_SEQUENCE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1))
         .unwrap_or_else(|_| halt());
+    #[cfg(feature = "unified-runtime")]
+    if domain_services::console_ready() {
+        return match domain_services::enqueue_frame(1, seq, s) {
+            Ok(()) => Ok(()),
+            Err(cyxia_prototype::domains::Error::Busy | cyxia_prototype::domains::Error::Again) => {
+                LOG_SEQUENCE.store(seq, Ordering::Relaxed);
+                Err(PlatformError::Again)
+            }
+            Err(_) => {
+                LOG_LOSS.fetch_add(1, Ordering::Relaxed);
+                Err(PlatformError::Invalid)
+            }
+        };
+    }
     let mut uart = unsafe {
         cyxia_driver_pl011::Pl011::attach(UartResource {
             base: PhysAddr(a),
@@ -310,11 +449,56 @@ fn halt() -> ! {
     }
 }
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    #[cfg(feature = "unified-runtime")]
+    {
+        // Panic diagnostics never need the ordinary console/task/policy gate.
+        // First writer keeps the original failure if a secondary also panics.
+        if PANIC_EVIDENCE.words[0]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let (elr, esr, far): (u64, u64, u64);
+            unsafe {
+                core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nostack, preserves_flags));
+                core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nostack, preserves_flags));
+                core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nostack, preserves_flags));
+            }
+            let (line, column, file) = info.location().map_or((0, 0, 0), |location| {
+                let mut hash = 0xcbf29ce484222325u64;
+                for byte in location.file().bytes() {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+                }
+                (
+                    u64::from(location.line()),
+                    u64::from(location.column()),
+                    hash,
+                )
+            });
+            for (i, value) in [
+                cyxia_arch_aarch64::cpu::slot() as u64,
+                line,
+                column,
+                file,
+                elr,
+                esr,
+                far,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                PANIC_EVIDENCE.words[i + 1].store(value, Ordering::Relaxed);
+            }
+            PANIC_EVIDENCE.words[0].store(0x435950414e490001, Ordering::Release);
+        }
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    let _ = info;
     #[cfg(feature = "smp-selftest")]
     if cyxia_arch_aarch64::cpu::slot() != 0 {
         smp::fatal(99);
     }
+    #[cfg(not(feature = "unified-runtime"))]
     log(b"FAIL panic\n");
     halt()
 }

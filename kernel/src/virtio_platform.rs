@@ -38,4 +38,10 @@ unsafe impl Platform for Board {
     fn now_ms(&self) -> u64 {
         cyxia_arch_aarch64::timer::ticks() / (cyxia_arch_aarch64::timer::frequency() / 1000).max(1)
     }
+    fn now_ns(&self) -> u64 {
+        let ticks = cyxia_arch_aarch64::timer::ticks();
+        let frequency = cyxia_arch_aarch64::timer::frequency().max(1);
+        ((u128::from(ticks) * 1_000_000_000) / u128::from(frequency)).min(u128::from(u64::MAX))
+            as u64
+    }
 }

@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 cyxia-contracts = { path = "../contracts" }
 cyxia-control-model = { path = "../control-model" }
+
+[dev-dependencies]
+cyxia-prototype = { path = "../prototype" }

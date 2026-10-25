@@ -21,7 +21,9 @@ jobs:
           persist-credentials: false
       - name: Install pinned host Rust compiler
         id: toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          cargo +1.95.0 fetch --locked
       - name: Prepare exact protocol archive required by host tests
         shell: python
         run: |

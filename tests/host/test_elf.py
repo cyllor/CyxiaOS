@@ -1,6 +1,6 @@
 import struct
 import unittest
-from tools.check_elf import inspect_elf, boot_profile
+from tools.check_elf import inspect_elf, boot_profile, symbol
 
 def fixture(flags=5,pa=0x40200000,mem=4096):
  b=bytearray(512)
@@ -39,7 +39,19 @@ class BootProfileTests(unittest.TestCase):
   self.assertEqual(boot_profile(fixture()), dict(version=0, ram_mib=256, heap_pages=2048))
   self.assertEqual(boot_profile(self.image()), dict(version=1, ram_mib=512, heap_pages=4096))
   self.assertEqual(boot_profile(self.image(ram=256,heap=2048))['ram_mib'],256)
+ def test_native_prototype_profile(self):
+  self.assertEqual(boot_profile(self.image(ram=1024,heap=2048)),
+                   dict(version=1,ram_mib=1024,heap_pages=2048))
  def test_unsupported_or_unbacked_profile_rejected(self):
   for options in ({'version':2}, {'ram':256}, {'heap':2048}, {'size':16}, {'backed':False}):
    with self.subTest(options=options), self.assertRaises(ValueError):
     boot_profile(self.image(**options))
+ def test_malformed_symbol_tables_fail_with_value_error(self):
+  changes=[(576+40,'<I',3), (576+56,'<Q',16), (576+32,'<Q',25),
+           (576+24,'<Q',1020), (800,'<I',1000), (640+4,'<I',1)]
+  for offset,encoding,value in changes:
+   b=self.image();struct.pack_into(encoding,b,offset,value)
+   with self.subTest(offset=offset,value=value),self.assertRaises(ValueError):
+    symbol(b,'CYXIA_BOOT_PROFILE')
+  for length in range(64):
+   with self.assertRaises(ValueError):symbol(bytes(length),'CYXIA_BOOT_PROFILE')

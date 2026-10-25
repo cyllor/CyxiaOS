@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 large-memory = []
+prototype-memory = []
 
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

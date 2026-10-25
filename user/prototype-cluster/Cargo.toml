@@ -1,0 +1,29 @@
+[package]
+name = "cyxia-prototype-cluster"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+[workspace]
+[features]
+guest = []
+[dependencies]
+cyxia-cluster-transport = { path = "../../crates/cluster-transport", features = ["tls"] }
+cyxia-prototype = { path = "../../crates/prototype", features = ["cluster-engine"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
+ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"] }
+getrandom = { version = "=0.2.17", default-features = false, features = ["custom"] }
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+
+[[bin]]
+name = "cyxia-prototype-cluster"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["guest"]
+
+[patch.crates-io]
+ring = { path = "vendor/ring" }

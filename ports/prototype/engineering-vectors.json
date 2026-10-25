@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "synthetic": true,
+  "trained": false,
+  "model_count": 6,
+  "model_bytes": 2772,
+  "cases": 8,
+  "candidates": 16,
+  "format": "W1/W2/W3 int8; b1/b2/b3 little-endian int32",
+  "cases_description": [
+    "sparse multilayer",
+    "sparse zero input",
+    "negative halves",
+    "hidden1 saturation",
+    "hidden2 saturation",
+    "first maximum negative tie",
+    "full-range accumulation",
+    "all-candidate tie"
+  ],
+  "model_sha256": [
+    "2d4c86dd24f6b3809256c3bcdb5aa4ff36dba89dfe2dab078a7651a5c3859290",
+    "1eeced90bf77097bfaf987b20f3ac90753ad9a149f204e89a863f039c091d502",
+    "9d48cae7ba2e96b0a964fab7d9f2e42ec2af67c05c36827a048a9f0c9de3bdad",
+    "77d3614753178cef5edb3e47bdcc2eb9515d8d1a8f1afc088208cc96edb7a6d8",
+    "25268f8be617058d7285aefa93ba3078c9ccb34c0d33e9420e2c003509f9246e",
+    "de26972120aa3e3f19203473a3cfdb43186ee63b98d40cfee6a1003b6535a39a"
+  ],
+  "bundle_sha256": "dfae2abb956d3867ae0cde418dd9e69cd5ae0112a5a68c62854f05f27a17fac1",
+  "requests_sha256": "00c3dfa38c39fd2d2ab1c850ec19df4f786b1cd53e9c87a6d36833acedb7caf1"
+}

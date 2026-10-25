@@ -873,7 +873,7 @@ impl Runner {
                     s.listen_for(
                         owner,
                         super::unix::handle(raw),
-                        count(b)?.clamp(1, 8),
+                        cyxia_posix::unix::linux_listen_backlog(b),
                         self.status.pid,
                     )
                 })?;
@@ -1288,7 +1288,14 @@ impl Runner {
                 Ok(len as u64)
             }
             29 => {
-                if let Some(raw) = self.process.pty(fd(a)?)? {
+                if b == 0x5421 && self.process.socket(fd(a)?)?.is_some() {
+                    self.copy_from(c, &mut bytes[..4])?;
+                    self.process.set_socket_nonblocking(
+                        fd(a)?,
+                        i32::from_le_bytes(bytes[..4].try_into().map_err(|_| Errno::Inval)?),
+                    )?;
+                    Ok(0)
+                } else if let Some(raw) = self.process.pty(fd(a)?)? {
                     self.pty_ioctl(raw, self.process.backend_owner(fd(a)?)?, b, c)
                 } else if b == 0x541b
                     && let Some(raw) = self.process.pipe(fd(a)?)?

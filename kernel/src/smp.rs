@@ -2,8 +2,10 @@
 //! existing CPU0 desktop/shell. Only this bounded workload is certified here.
 //! The base control-role program is a deterministic fixture. The explicit
 //! ai-control-selftest feature substitutes the independent EL0 model service.
-//! No device DMA, remote resources, RCU readers or production workers exist in
-//! this profile. The resulting proof provider MUST NOT be used by production.
+//! The independent net-selftest branch adds CPU0-owned DMA for EL1 Ethernet
+//! bring-up and does not run the core-transition proof fixture. No remote
+//! resources, RCU readers or production workers exist in this profile. The
+//! resulting proof provider MUST NOT be used by production.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::{BootInfo, GicResource, PhysAddr};
@@ -16,6 +18,12 @@ use cyxia_kernel_core::control_plane::{
 #[cfg(feature = "ai-control-selftest")]
 #[path = "control_service.rs"]
 mod controller;
+#[cfg(feature = "model-v13-selftest")]
+#[path = "prototype_model.rs"]
+mod prototype_model;
+#[cfg(feature = "prototype-runtime")]
+#[path = "prototype_runtime.rs"]
+pub(crate) mod prototype_runtime;
 const C: usize = cyxia_contracts::BOOT_CPUS;
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
@@ -70,6 +78,19 @@ pub static SMP_EVIDENCE: Evidence = Evidence {
     words: [const { AtomicU64::new(0) }; 512],
 };
 static LAST_FAR: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
+#[cfg(feature = "unified-runtime")]
+static HEARTBEAT: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
+#[cfg(feature = "unified-runtime")]
+#[repr(C, align(64))]
+struct SliceTiming {
+    words: [AtomicU64; 128],
+}
+#[cfg(feature = "unified-runtime")]
+#[used]
+#[unsafe(no_mangle)]
+static TASK_SLICE_EVIDENCE: SliceTiming = SliceTiming {
+    words: [const { AtomicU64::new(0) }; 128],
+};
 unsafe extern "C" {
     static cyxia_secondary_start: u8;
     static smp_user_start: u8;
@@ -92,7 +113,7 @@ fn deadline() -> u64 {
         .checked_add(timer::frequency() * 5)
         .expect("deadline")
 }
-fn gic() -> &'static Gic {
+pub(crate) fn gic() -> &'static Gic {
     // Each slot is initialized on its own CPU before it enables interrupts.
     unsafe {
         (&*core::ptr::addr_of!(GICS)
@@ -125,7 +146,7 @@ fn report(label: &str, a: u64, b: u64, c: u64) {
     writeln!(&mut text, "{label} a={a} b={b} c={c}").unwrap();
     super::log(&text.data[..text.n]);
 }
-fn check_failures() {
+pub(super) fn check_failures() {
     for i in 1..REQUIRED {
         let error = FAILURES[i].load(Ordering::Acquire);
         if error != 0 {
@@ -164,19 +185,88 @@ pub fn fatal(code: u64) -> ! {
 /// IRQ singleton or CPU0 user scheduler is touched by a secondary CPU.
 pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
     let slot = cpu::slot();
+    #[cfg(feature = "unified-runtime")]
+    if slot < 4 && matches!(kind, 8 | 9) {
+        let row = 2 + slot * 30;
+        TASK_SLICE_EVIDENCE.words[row + 7].store(timer::ticks(), Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 8].store(kind, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 9].store(frame.esr, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 10].store(frame.far, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 11].store(frame.elr, Ordering::Relaxed);
+    }
     LAST_ESR[slot].store(frame.esr, Ordering::Relaxed);
     LAST_FAR[slot].store(frame.far, Ordering::Relaxed);
     if kind == 9 || kind == 5 {
+        #[cfg(feature = "unified-runtime")]
+        let irq_started = timer::ticks();
+        #[cfg(feature = "prototype-runtime")]
+        prototype_runtime::irq_enter(slot);
         let ack = gic().acknowledge();
         match ack {
             IrqAck::Active { id, .. } if id as u64 == TIMER_IRQ.load(Ordering::Relaxed) => {
                 unsafe {
+                    #[cfg(feature = "unified-runtime")]
+                    if HEARTBEAT[slot].load(Ordering::Acquire) {
+                        timer::arm(timer::ticks().saturating_add(heartbeat_ticks()));
+                    } else {
+                        cpu::disable_timer();
+                    }
+                    #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
+                }
+                #[cfg(feature = "unified-runtime")]
+                if slot < 4 {
+                    TASK_SLICE_EVIDENCE.words[2 + slot * 30 + 20]
+                        .store(irq_started, Ordering::Relaxed);
+                    TASK_SLICE_EVIDENCE.words[2 + slot * 30 + 21].fetch_add(1, Ordering::Relaxed);
                 }
                 IRQS[slot].fetch_add(1, Ordering::Relaxed);
                 gic().end(ack);
+                #[cfg(feature = "prototype-runtime")]
+                prototype_runtime::irq_exit(slot);
             }
+            #[cfg(feature = "unified-runtime")]
+            IrqAck::Active { id: 0, .. } => {
+                gic().end(ack);
+                crate::domain_platform::ipi_enter(slot);
+                prototype_runtime::irq_exit(slot);
+            }
+            #[cfg(feature = "unified-runtime")]
+            IrqAck::Active { id, .. } => {
+                let owner = crate::domain_platform::irq_key(id).unwrap_or(
+                    cyxia_prototype::domains::ObjectKey {
+                        id: u64::from(id),
+                        generation: 1,
+                    },
+                );
+                crate::learning_evidence::measure(
+                    owner,
+                    cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+                    || {
+                        let registered =
+                            crate::domain_platform::irq_enter(gic(), id, slot, irq_started);
+                        if !registered {
+                            let _ = gic().mask(id);
+                            crate::domain_platform::unknown_irq();
+                        }
+                        gic().end(ack);
+                        if registered {
+                            crate::domain_platform::irq_complete(id);
+                        }
+                    },
+                );
+                prototype_runtime::irq_exit(slot);
+            }
+            #[cfg(feature = "unified-runtime")]
+            IrqAck::Spurious => {
+                prototype_runtime::irq_exit(slot);
+            }
+            #[cfg(not(feature = "unified-runtime"))]
             _ => fatal(10 + kind),
+        }
+        #[cfg(feature = "unified-runtime")]
+        if kind == 5 {
+            return;
         }
     }
     if (kind == 8 || kind == 9)
@@ -244,12 +334,25 @@ fn context(i: usize) -> user::Context {
 }
 fn execute(ctx: &mut user::Context, i: usize) {
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(i) as u64 };
+    let quantum = (timer::frequency() / 1000).max(1);
+    #[cfg(feature = "unified-runtime")]
+    let quantum = if matches!(cpu::slot(), 2 | 3) && !matches!(i, 3 | 5) {
+        crate::domain_tasks::active_slice_ticks(cpu::slot())
+            .map_or(quantum, |slice| quantum.min(slice.max(1)))
+    } else {
+        quantum
+    };
     // IRQs stay masked in EL1; only user::enter enables EL0 interrupt delivery.
     // A non-yielding user program must be forcibly returned by the private PPI.
     unsafe {
-        timer::arm(timer::ticks() + timer::frequency() / 1000);
-        user::enter(ctx, phys(root));
-        cpu::disable_timer();
+        #[cfg(feature = "unified-runtime")]
+        enter_service(ctx, phys(root), timer::ticks().saturating_add(quantum));
+        #[cfg(not(feature = "unified-runtime"))]
+        {
+            timer::arm(timer::ticks().saturating_add(quantum));
+            user::enter(ctx, phys(root));
+            cpu::disable_timer();
+        }
     }
 }
 fn probes(slot: usize, i: usize) {
@@ -305,17 +408,40 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             .cast::<Option<Gic>>()
             .add(slot) = Some(controller);
     }
+    #[cfg(feature = "unified-runtime")]
+    {
+        crate::domain_platform::register_ipi_cpu(gic(), slot).expect("IPI CPU registration");
+        // A real fixed hard tick remains armed while EL1 does bounded setup or
+        // waits for work. Timer/IRQ progress cannot depend on an EL0 admission.
+        heartbeat(true);
+        unsafe {
+            timer::enable_irqs();
+        }
+    }
     ONLINE.fetch_or(1 << slot, Ordering::Release);
     let mut contexts = [context(slot * 2), context(slot * 2 + 1)];
     let mut tested = [false; 2];
+    #[cfg(feature = "prototype-runtime")]
+    let mut runtime_worker = prototype_runtime::Worker::new();
     #[cfg(feature = "ai-control-selftest")]
     let mut service_context = controller::context();
     while !QUIT.load(Ordering::Acquire) {
         let view = GATES[slot].view();
         if !view.enabled {
+            #[cfg(feature = "prototype-runtime")]
+            if slot == 2 {
+                // Retire contexts before publishing task/reference stop events.
+                contexts = [context(slot * 2), context(slot * 2 + 1)];
+                prototype_runtime::stop_turn(&mut runtime_worker);
+            }
+            #[cfg(feature = "prototype-runtime")]
+            prototype_runtime::idle_worker();
+            #[cfg(not(feature = "prototype-runtime"))]
             core::hint::spin_loop();
             continue;
         }
+        #[cfg(feature = "prototype-runtime")]
+        prototype_runtime::resume_turn(slot);
         let Some(token) = view.token else {
             fatal(3);
         };
@@ -324,6 +450,19 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         };
         let role = usize::from(token.plane == Plane::Control);
         let i = index(slot, token.plane);
+        #[cfg(feature = "model-v13-selftest")]
+        if role == 1 {
+            prototype_model::step();
+            drop(permit);
+            continue;
+        }
+        #[cfg(feature = "prototype-runtime")]
+        if role == 1 {
+            prototype_runtime::step(&mut runtime_worker);
+            drop(permit);
+            prototype_runtime::idle_worker();
+            continue;
+        }
         if !tested[role] {
             probes(slot, i);
             tested[role] = true;
@@ -334,7 +473,27 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             drop(permit);
             continue;
         }
+        #[cfg(feature = "unified-runtime")]
+        super::unified_task::expire_idle(slot);
+        #[cfg(feature = "prototype-runtime")]
+        if !prototype_runtime::business_enter(slot) {
+            drop(permit);
+            prototype_runtime::idle_worker();
+            continue;
+        }
+        #[cfg(feature = "unified-runtime")]
+        {
+            let runtime_start = timer::ticks();
+            if super::unified_task::step(slot) {
+                prototype_runtime::business_complete(slot, runtime_start);
+                drop(permit);
+                prototype_runtime::idle_worker();
+                continue;
+            }
+        }
         let ctx = &mut contexts[role];
+        #[cfg(feature = "prototype-runtime")]
+        let runtime_start = timer::ticks();
         execute(ctx, i);
         if ctx.kind != 9
             || ctx.regs[0] != cookie(i)
@@ -349,6 +508,8 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         }
         // All user writes completed before user::enter returned its TLB barrier.
         PROGRESS[i].fetch_add(1, Ordering::Release);
+        #[cfg(feature = "prototype-runtime")]
+        prototype_runtime::business_complete(slot, runtime_start);
         drop(permit);
     }
     unsafe {
@@ -478,9 +639,17 @@ pub fn run(info: &BootInfo) -> ! {
     unsafe {
         *core::ptr::addr_of_mut!(RESOURCE) = Some(resource);
         *core::ptr::addr_of_mut!(GICS).cast::<Option<Gic>>() = Some(Gic::new(resource).unwrap());
+        #[cfg(feature = "unified-runtime")]
+        crate::domain_platform::register_ipi_cpu(gic(), 0).expect("IPI bootstrap registration");
+        #[cfg(feature = "unified-runtime")]
+        enable_service_timer();
         init_memory();
         #[cfg(feature = "ai-control-selftest")]
         controller::init();
+        #[cfg(feature = "model-v13-selftest")]
+        prototype_model::init();
+        #[cfg(feature = "prototype-runtime")]
+        prototype_runtime::init();
     }
     for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
         affinity.store(topo.affinity[slot], Ordering::Release);
@@ -509,8 +678,6 @@ pub fn run(info: &BootInfo) -> ! {
         ONLINE.load(Ordering::Acquire),
         0,
     );
-    let ownership =
-        Ownership::<C>::new(15, 2, [1; C], core::array::from_fn(|i| 1 << i), limits()).unwrap();
     for (slot, gate) in GATES.iter().enumerate().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,
@@ -518,12 +685,49 @@ pub fn run(info: &BootInfo) -> ! {
         })
         .unwrap();
     }
+    #[cfg(feature = "prototype-runtime")]
+    prototype_runtime::wake_workers();
+    #[cfg(feature = "tcp-v13-selftest")]
+    super::cluster_transport::run(info);
+    #[cfg(feature = "storage-v13-selftest")]
+    super::prototype_storage::run(info);
+    #[cfg(feature = "unified-runtime")]
+    super::unified::run(info);
+    #[cfg(all(feature = "prototype-runtime", not(feature = "unified-runtime")))]
+    prototype_runtime::run(info);
+    #[cfg(feature = "net-selftest")]
+    super::net_selftest::run(info);
+    #[cfg(feature = "model-v13-selftest")]
+    prototype_model::run();
+    #[cfg(not(any(
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest"
+    )))]
+    let ownership =
+        Ownership::<C>::new(15, 2, [1; C], core::array::from_fn(|i| 1 << i), limits()).unwrap();
     #[cfg(feature = "ai-control-selftest")]
     controller::run(ownership);
-    #[cfg(not(feature = "ai-control-selftest"))]
+    #[cfg(not(any(
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "prototype-runtime",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest"
+    )))]
     fixture(ownership)
 }
-#[cfg(not(feature = "ai-control-selftest"))]
+#[cfg(not(any(
+    feature = "ai-control-selftest",
+    feature = "net-selftest",
+    feature = "model-v13-selftest",
+    feature = "prototype-runtime",
+    feature = "storage-v13-selftest",
+    feature = "tcp-v13-selftest"
+)))]
 fn fixture(mut ownership: Ownership<C>) -> ! {
     wait(|| {
         PROGRESS[3].load(Ordering::Acquire) >= 4
@@ -629,4 +833,85 @@ fn fixture(mut ownership: Ownership<C>) -> ! {
     super::log(b"SMP_SCOPE model=fixture production_isolation=false physical_isolation=false\n");
     super::log(b"SMP_SELFTEST_PASS cpus=4\n");
     super::halt()
+}
+
+#[cfg(feature = "unified-runtime")]
+pub(crate) fn enable_service_timer() {
+    assert_eq!(cpu::slot(), 0);
+    gic()
+        .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
+        .unwrap();
+    // Registered device sources self-mask in the deterministic IRQ handler.
+    // Their original owner alone polls/ACKs and unmasks; no driver is reentered.
+    unsafe {
+        heartbeat(true);
+        timer::enable_irqs();
+    }
+}
+
+#[cfg(feature = "unified-runtime")]
+fn heartbeat_ticks() -> u64 {
+    (timer::frequency() / 4000).max(1)
+}
+#[cfg(feature = "unified-runtime")]
+fn heartbeat(enabled: bool) {
+    let slot = cpu::slot();
+    HEARTBEAT[slot].store(enabled, Ordering::Release);
+    unsafe {
+        if enabled {
+            timer::arm(timer::ticks().saturating_add(heartbeat_ticks()));
+        } else {
+            cpu::disable_timer();
+        }
+    }
+}
+
+#[cfg(feature = "unified-runtime")]
+/// # Safety
+/// The context and address-space root must satisfy user::enter's contract.
+pub(crate) unsafe fn enter_service(context: &mut user::Context, root: u64, deadline: u64) {
+    let saved_daif: u64;
+    let slot = cpu::slot();
+    let row = 2 + slot * 30;
+    if slot < 4 {
+        TASK_SLICE_EVIDENCE.words[0].store(0x4359_534c_4943_4501, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[1].store(1, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row].fetch_add(1, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 1].store(timer::ticks(), Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 14].store(0, Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row + 4].store(deadline, Ordering::Relaxed);
+    }
+    unsafe {
+        core::arch::asm!("mrs {}, daif", "msr daifset, #2", "isb", out(reg) saved_daif, options(nostack, preserves_flags));
+        if slot < 4 {
+            TASK_SLICE_EVIDENCE.words[row + 2].store(saved_daif, Ordering::Relaxed);
+            TASK_SLICE_EVIDENCE.words[row + 3].store(timer::ticks(), Ordering::Relaxed);
+        }
+        timer::arm(deadline);
+        if slot < 4 {
+            let ctl: u64;
+            let cval: u64;
+            core::arch::asm!("mrs {}, cntp_ctl_el0", "mrs {}, cntp_cval_el0",out(reg)ctl,out(reg)cval,options(nostack));
+            TASK_SLICE_EVIDENCE.words[row + 15].store(ctl, Ordering::Relaxed);
+            TASK_SLICE_EVIDENCE.words[row + 16].store(cval, Ordering::Relaxed);
+            TASK_SLICE_EVIDENCE.words[row + 5].store(timer::ticks(), Ordering::Relaxed);
+            TASK_SLICE_EVIDENCE.words[row + 6].store(timer::ticks(), Ordering::Relaxed);
+        }
+        user::enter(context, root);
+        if slot < 4 {
+            TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);
+        }
+        if HEARTBEAT[slot].load(Ordering::Acquire) {
+            heartbeat(true);
+        } else {
+            cpu::disable_timer();
+        }
+        if slot < 4 {
+            TASK_SLICE_EVIDENCE.words[row + 13].store(timer::ticks(), Ordering::Relaxed);
+        }
+        core::arch::asm!("msr daif, {}", "isb", in(reg) saved_daif, options(nostack, preserves_flags));
+    }
+    if slot < 4 {
+        TASK_SLICE_EVIDENCE.words[row + 14].store(timer::ticks(), Ordering::Release);
+    }
 }

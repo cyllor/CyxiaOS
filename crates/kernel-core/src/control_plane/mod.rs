@@ -68,3 +68,7 @@ pub mod dispatch;
 pub mod exchange;
 pub mod image;
 pub mod service;
+
+pub mod service_image;
+
+pub mod task_admission;

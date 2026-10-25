@@ -1,6 +1,8 @@
 //! Modern VirtIO 1.2 block requests. One 512-byte request may be in flight.
 //! Queue DMA pages stay pinned after any error; only successful FLUSH is durable.
 use crate::{Error, Platform, Queue, QueueMemory, Transport};
+mod batched;
+pub use batched::{BatchedBlock, BlockCompletion};
 
 pub const SECTOR_BYTES: usize = 512;
 const FLUSH: u32 = 1 << 9;
