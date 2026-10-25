@@ -32,6 +32,15 @@ pub struct Terms {
     pub input_hash: [u8; 32],
     pub package_hash: [u8; 32],
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartRequest {
+    pub token: u64,
+    pub contract: [u8; 16],
+    pub grant: u64,
+    pub deadline: u64,
+    pub session: u64,
+    pub input_hash: [u8; 32],
+}
 #[derive(Clone, Copy)]
 struct Reservation {
     token: u64,
@@ -69,7 +78,7 @@ impl Authority {
     }
     pub fn disconnect(&mut self) {
         if self.level != 0 {
-            self.generation = self.generation.checked_add(1).unwrap_or(u64::MAX);
+            self.generation = self.generation.saturating_add(1);
             self.level = 0;
         }
     }
@@ -161,31 +170,22 @@ impl Authority {
         r.grant = grant;
         Ok(())
     }
-    pub fn start(
-        &mut self,
-        token: u64,
-        contract: [u8; 16],
-        grant: u64,
-        deadline: u64,
-        session: u64,
-        input_hash: [u8; 32],
-        now: u64,
-    ) -> Result<(), Error> {
+    pub fn start(&mut self, request: StartRequest, now: u64) -> Result<(), Error> {
         self.ready(now)?;
         let r = self.reservation.as_mut().ok_or(Error::NotReady)?;
-        if r.token != token
-            || r.terms.contract != contract
-            || r.grant != grant
-            || r.deadline != Some(deadline)
-            || r.session != session
-            || session != self.epoch
+        if r.token != request.token
+            || r.terms.contract != request.contract
+            || r.grant != request.grant
+            || r.deadline != Some(request.deadline)
+            || r.session != request.session
+            || request.session != self.epoch
             || r.generation != self.generation
-            || r.terms.input_hash != input_hash
+            || r.terms.input_hash != request.input_hash
             || r.started
         {
             return Err(Error::Stale);
         }
-        if now >= deadline {
+        if now >= request.deadline {
             return Err(Error::Expired);
         }
         r.started = true;
