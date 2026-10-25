@@ -1,4 +1,4 @@
-# Probe generation 6: timer-bounded private zeroing and DC ZVA acceleration
+# Probe generation 7: split boot-probe transition and reserve its recovery slice
 name: Native replay current
 
 on:
