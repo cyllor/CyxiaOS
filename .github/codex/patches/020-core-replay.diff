@@ -1,0 +1,17 @@
+diff --git a/kernel/src/domain_control/core_replay.rs b/kernel/src/domain_control/core_replay.rs
+index 10a3fd6..8313de8 100644
+--- a/kernel/src/domain_control/core_replay.rs
++++ b/kernel/src/domain_control/core_replay.rs
+@@ -809,11 +809,10 @@ pub(super) fn next(
+         controller,
+         started,
+         snapshot,
+-        set,
++        super::JobCandidates::ReadOnly(set),
+         current,
+         [None; 2],
+         Some(id),
+-        true,
+         input,
+     )
+     .map(|()| true)
