@@ -1,0 +1,50 @@
+name: Validate current implementation
+
+on:
+  push:
+    branches:
+      - fix/first-level-subsystems-20261024
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+      - name: Check formatting and native clippy gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Run Rust workspace tests
+        run: cargo test --locked --offline --workspace --exclude cyxia-kernel
+      - name: Run host Python tests
+        run: python3 -B -m unittest discover -s tests/host -p 'test_*.py' -v
+      - name: Capture exact source
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/source"
+          git rev-parse HEAD > "$RUNNER_TEMP/source/source-commit.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/source/CyxiaOS-source.tar.gz" HEAD
+          sha256sum "$RUNNER_TEMP/source/CyxiaOS-source.tar.gz" > "$RUNNER_TEMP/source/CyxiaOS-source.tar.gz.sha256"
+      - name: Retain exact source
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validate-current-source-${{ github.sha }}
+          retention-days: 1
+          compression-level: 0
+          path: ${{ runner.temp }}/source/
