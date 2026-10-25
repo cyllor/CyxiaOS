@@ -38,6 +38,7 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          cargo fetch --locked
           mkdir -p "$RUNNER_TEMP/native-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/native-evidence/source-commit.txt"
           rustc -vV > "$RUNNER_TEMP/native-evidence/rust-version.txt"
