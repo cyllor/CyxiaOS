@@ -4,6 +4,9 @@ use super::*;
 use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDOW_NS};
 
 const PREPAY_NS: u64 = 2_500_000;
+// The boot mapping self-test is recovery/setup work, not one model proposal.
+// It keeps exact actual accounting but reserves the design's 8 ms recovery slice.
+const PROBE_PREPAY_NS: u64 = 8_000_000;
 const WALL_NS: u64 = 50_000_000;
 // The mapping probe is a boot self-test that spans separately prepaid turns;
 // it is not a proposal whose single-turn wall deadline may be extended.
@@ -553,6 +556,9 @@ fn run_turn(
         worker.native.clear_next = 1;
         worker.native.probing = true;
         worker.native.probe_started = now;
+        // Do not combine the ownership/state transition with the first private
+        // memory touch. The next independently prepaid turn performs the clear.
+        return;
     }
     if worker.native.probing
         && worker.context.is_none()
@@ -755,10 +761,15 @@ pub(super) fn step(worker: &mut Worker) {
         learning::step(&mut worker.extra);
         return;
     }
-    if !learning::allow_mandatory(&worker.extra, PREPAY_NS, ns(timer::ticks())) {
+    let reservation_ns = if worker.probed && !worker.native.probing {
+        PREPAY_NS
+    } else {
+        PROBE_PREPAY_NS
+    };
+    if !learning::allow_mandatory(&worker.extra, reservation_ns, ns(timer::ticks())) {
         return;
     }
-    let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, false) else {
+    let Ok(Some(credit)) = crate::domain_tasks::begin_control(reservation_ns, false) else {
         return;
     };
     let begin = timer::ticks();
