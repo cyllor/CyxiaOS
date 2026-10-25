@@ -1,4 +1,4 @@
-name: Apply stack-safe preparation patch
+name: Apply borrowed candidate stack patch
 
 on:
   push:
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   repair:
-    if: ${{ startsWith(github.event.head_commit.message, 'apply stack safe preparation patch') }}
+    if: ${{ startsWith(github.event.head_commit.message, 'apply borrowed candidate stack patch') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -29,15 +29,17 @@ jobs:
           persist-credentials: true
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update \
+            --component rustfmt --component clippy --component llvm-tools-preview \
+            --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
           cargo fetch --locked
-      - name: Apply stack-safe patch and format workspace
+      - name: Apply borrowed-candidate patch and format workspace
         run: |
           set -euo pipefail
-          git apply --check .github/codex/patches/070-stack-safe-prepared.diff
-          git apply .github/codex/patches/070-stack-safe-prepared.diff
+          git apply --check .github/codex/patches/080-borrow-candidate-set.diff
+          git apply .github/codex/patches/080-borrow-candidate-set.diff
           cargo fmt --all
-      - name: Run focused gates
+      - name: Run focused host gates
         run: |
           python3 -B -m unittest -v test_check_v13_preparation_stack
           cargo test --locked --offline -p cyxia-prototype \
@@ -45,11 +47,23 @@ jobs:
             --test native_preparation_debit \
             --test domain_policy \
             --test native_core_replay
-          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+          cargo clippy --locked --offline -p cyxia-kernel \
+            --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Build both native images and enforce the real ELF stack gate
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair"
+          python3 tools/build_unified.py \
+            --identity-a "$RUNNER_TEMP/pair/a" \
+            --identity-b "$RUNNER_TEMP/pair/b" \
+            --output "$RUNNER_TEMP/unified-build" \
+            --selftest
+          cat "$RUNNER_TEMP/unified-build/node-a-stack.json"
+          cat "$RUNNER_TEMP/unified-build/node-b-stack.json"
       - name: Commit validated formatted source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'fix(control): preserve prepared stack proof'
+          git commit -m 'fix(control): keep read-only candidates off wrapper stack'
           git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
