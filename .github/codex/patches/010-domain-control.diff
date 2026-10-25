@@ -1,5 +1,5 @@
 diff --git a/kernel/src/domain_control.rs b/kernel/src/domain_control.rs
-index 7f62b66..d816356 100644
+index 7f62b66..937cec9 100644
 --- a/kernel/src/domain_control.rs
 +++ b/kernel/src/domain_control.rs
 @@ -7,7 +7,8 @@ use cyxia_prototype::{
@@ -88,13 +88,14 @@ index 7f62b66..d816356 100644
 -        let work = core_replay::primary(&set)?;
 +        let work = core_replay::primary(prepared.candidate_set())?;
          preparation_detail(10);
-         return encode_job(
+-        return encode_job(
++        return encode_prepared_job(
              s,
              controller_epoch,
              started,
              snapshot,
 -            set,
-+            JobCandidates::Ordinary(prepared),
++            prepared,
              current,
              dependencies,
              work,
@@ -102,37 +103,80 @@ index 7f62b66..d816356 100644
              input,
          )
          .map(|()| true);
-@@ -1376,21 +1341,34 @@ fn next_normal(
+@@ -1376,6 +1341,42 @@ fn next_normal(
      }
      Ok(false)
  }
 +enum JobCandidates {
-+    Ordinary(PreparedCandidateSet),
-+    ReadOnly(CandidateSet),
++    Prepared(PreparedCandidateSet),
++    CandidateSet(CandidateSet),
 +}
 +impl JobCandidates {
 +    fn candidate_set(&self) -> &CandidateSet {
 +        match self {
-+            Self::Ordinary(prepared) => prepared.candidate_set(),
-+            Self::ReadOnly(set) => set,
++            Self::Prepared(prepared) => prepared.candidate_set(),
++            Self::CandidateSet(set) => set,
 +        }
 +    }
++}
++fn encode_prepared_job(
++    s: &mut State,
++    controller_epoch: u64,
++    started: u64,
++    snapshot: Snapshot,
++    prepared: PreparedCandidateSet,
++    current: Action,
++    dependencies: [Option<BoundDependency>; 2],
++    work: Option<core_replay::WorkId>,
++    input: &mut [u64; 512],
++) -> Result<(), Error> {
++    encode_job_inner(
++        s,
++        controller_epoch,
++        started,
++        snapshot,
++        JobCandidates::Prepared(prepared),
++        current,
++        dependencies,
++        work,
++        false,
++        input,
++    )
 +}
  fn encode_job(
      s: &mut State,
      controller_epoch: u64,
-     started: u64,
-     snapshot: Snapshot,
--    set: CandidateSet,
-+    candidates: JobCandidates,
-     current: Action,
-     dependencies: [Option<BoundDependency>; 2],
+@@ -1387,10 +1388,36 @@ fn encode_job(
      work: Option<core_replay::WorkId>,
--    read_only: bool,
+     read_only: bool,
      input: &mut [u64; 512],
++) -> Result<(), Error> {
++    encode_job_inner(
++        s,
++        controller_epoch,
++        started,
++        snapshot,
++        JobCandidates::CandidateSet(set),
++        current,
++        dependencies,
++        work,
++        read_only,
++        input,
++    )
++}
++fn encode_job_inner(
++    s: &mut State,
++    controller_epoch: u64,
++    started: u64,
++    snapshot: Snapshot,
++    candidates: JobCandidates,
++    current: Action,
++    dependencies: [Option<BoundDependency>; 2],
++    work: Option<core_replay::WorkId>,
++    read_only: bool,
++    input: &mut [u64; 512],
  ) -> Result<(), Error> {
      preparation_phase(1);
-+    let read_only = matches!(&candidates, JobCandidates::ReadOnly(_));
 +    let pending_set = candidates.candidate_set();
      let sequence = snapshot.sequence;
 -    let target = set.target;
@@ -140,7 +184,7 @@ index 7f62b66..d816356 100644
      let preparation_identity = preparation_identity(
          s,
          controller_epoch,
-@@ -1417,9 +1395,12 @@ fn encode_job(
+@@ -1417,9 +1444,17 @@ fn encode_job(
              .ok_or(Error::Busy)?,
          )
      };
@@ -148,10 +192,15 @@ index 7f62b66..d816356 100644
 -        s.registry.register(publisher(controller_epoch), &set)?;
 -    }
 +    let set = match candidates {
-+        JobCandidates::Ordinary(prepared) => s
++        JobCandidates::Prepared(prepared) => s
 +            .registry
 +            .commit_candidates(publisher(controller_epoch), prepared)?,
-+        JobCandidates::ReadOnly(set) => set,
++        JobCandidates::CandidateSet(set) => {
++            if !read_only {
++                s.registry.register(publisher(controller_epoch), &set)?;
++            }
++            set
++        }
 +    };
      preparation_phase(2);
      input.fill(0);
