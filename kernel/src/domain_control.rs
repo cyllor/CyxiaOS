@@ -1341,11 +1341,11 @@ fn next_normal(
     }
     Ok(false)
 }
-enum JobCandidates {
+enum JobCandidates<'a> {
     Prepared(PreparedCandidateSet),
-    CandidateSet(CandidateSet),
+    CandidateSet(&'a CandidateSet),
 }
-impl JobCandidates {
+impl JobCandidates<'_> {
     fn candidate_set(&self) -> &CandidateSet {
         match self {
             Self::Prepared(prepared) => prepared.candidate_set(),
@@ -1384,7 +1384,7 @@ fn encode_job(
     controller_epoch: u64,
     started: u64,
     snapshot: Snapshot,
-    set: CandidateSet,
+    set: &CandidateSet,
     current: Action,
     dependencies: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
@@ -1410,7 +1410,7 @@ fn encode_job_inner(
     controller_epoch: u64,
     started: u64,
     snapshot: Snapshot,
-    candidates: JobCandidates,
+    candidates: JobCandidates<'_>,
     current: Action,
     dependencies: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
@@ -1447,15 +1447,17 @@ fn encode_job_inner(
             .ok_or(Error::Busy)?,
         )
     };
-    let set = match candidates {
-        JobCandidates::Prepared(prepared) => s
-            .registry
-            .commit_candidates(publisher(controller_epoch), prepared)?,
+    let set = match &candidates {
+        JobCandidates::Prepared(prepared) => {
+            s.registry
+                .commit_candidates(publisher(controller_epoch), prepared)?;
+            prepared.candidate_set()
+        }
         JobCandidates::CandidateSet(set) => {
             if !read_only {
-                s.registry.register(publisher(controller_epoch), &set)?;
+                s.registry.register(publisher(controller_epoch), set)?;
             }
-            set
+            *set
         }
     };
     preparation_phase(2);
@@ -1568,7 +1570,7 @@ fn encode_job_inner(
     s.sequence = s.sequence.max(sequence);
     s.job = Some(Job {
         cpu: cyxia_arch_aarch64::cpu::slot(),
-        set,
+        set: *set,
         sequence,
         controller: controller_epoch,
         base_version: s.registry.version(),

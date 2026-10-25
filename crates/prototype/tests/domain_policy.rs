@@ -195,8 +195,7 @@ fn prepared_candidate_set_is_invisible_until_exact_commit() {
     assert_eq!(hash, source.hash());
     assert_eq!(registry.registered_action(hash, 0), Err(Error::Stale));
 
-    let committed = registry.commit_candidates(publisher(), prepared).unwrap();
-    assert_eq!(committed.hash(), hash);
+    registry.commit_candidates(publisher(), &prepared).unwrap();
     assert_eq!(
         registry.registered_action(hash, 0),
         Ok(Action::CpuWeight(1))
@@ -225,7 +224,7 @@ fn prepared_candidate_commit_rechecks_model_and_publisher_authority() {
         .change_model(publisher(), next_model)
         .unwrap();
     assert!(matches!(
-        model_registry.commit_candidates(publisher(), model_prepared),
+        model_registry.commit_candidates(publisher(), &model_prepared),
         Err(Error::Stale)
     ));
 
@@ -251,7 +250,7 @@ fn prepared_candidate_commit_rechecks_model_and_publisher_authority() {
         .change_publisher(publisher(), next_publisher)
         .unwrap();
     assert!(matches!(
-        publisher_registry.commit_candidates(publisher(), publisher_prepared),
+        publisher_registry.commit_candidates(publisher(), &publisher_prepared),
         Err(Error::Auth)
     ));
 }

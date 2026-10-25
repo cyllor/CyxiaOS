@@ -596,8 +596,8 @@ impl Registry {
     pub fn commit_candidates(
         &mut self,
         publisher: Publisher,
-        prepared: PreparedCandidateSet,
-    ) -> Result<CandidateSet, Error> {
+        prepared: &PreparedCandidateSet,
+    ) -> Result<(), Error> {
         self.authorize(publisher)?;
         if prepared.boot_epoch != self.boot_epoch
             || prepared.publisher != publisher
@@ -606,9 +606,11 @@ impl Registry {
         {
             return Err(Error::Stale);
         }
-        let set = prepared.set;
-        self.store_registered(Self::registered_set(&set, set.digest, None))?;
-        Ok(set)
+        self.store_registered(Self::registered_set(
+            prepared.candidate_set(),
+            prepared.set.digest,
+            None,
+        ))
     }
     /// Register one deterministic action without claiming that absent domain
     /// measurements were observed as zero or that a model selected it. This

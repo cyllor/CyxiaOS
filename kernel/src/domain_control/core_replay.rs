@@ -809,7 +809,7 @@ pub(super) fn next(
         controller,
         started,
         snapshot,
-        set,
+        &set,
         current,
         [None; 2],
         Some(id),

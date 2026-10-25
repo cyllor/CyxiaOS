@@ -323,7 +323,7 @@ fn encode_job(
     controller: u64,
     started: u64,
     snapshot: Snapshot,
-    set: CandidateSet,
+    set: &CandidateSet,
     _: Action,
     _: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
