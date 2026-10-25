@@ -1,59 +1,141 @@
-name: Codex v0.1 control preparation patch
+name: Validate complete prototype branch
 
 on:
   push:
     branches:
       - codex/cyxiaos-v0.1-complete-prototype
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: complete-prototype-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  apply-test-commit:
+  validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: '1.95.0'
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Check out exact branch head
+      - name: Check out exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
           cargo fetch --locked
-      - name: Apply bounded preparation patches
+      - name: Check formatting and native clippy gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Run Rust workspace tests
+        run: cargo test --locked --offline --workspace --exclude cyxia-kernel
+      - name: Prepare pinned host test inputs
+        run: python3 -B tools/prepare_host_tests.py --fetch
+      - name: Run host Python tests
+        run: python3 -B -m unittest discover -s tests/host -p 'test_*.py' -v
+      - name: Run native evidence tool tests
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Capture exact source and validation metadata
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/validate-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/validate-evidence/source-commit.txt"
+          rustc -vV > "$RUNNER_TEMP/validate-evidence/rust-version.txt"
+          git status --short > "$RUNNER_TEMP/validate-evidence/git-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/validate-evidence/CyxiaOS-source.tar.gz" HEAD
+          sha256sum "$RUNNER_TEMP/validate-evidence/CyxiaOS-source.tar.gz" > "$RUNNER_TEMP/validate-evidence/CyxiaOS-source.tar.gz.sha256"
+      - name: Retain exact validation source
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: complete-prototype-validation-${{ github.sha }}
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+          path: ${{ runner.temp }}/validate-evidence/
+
+  native-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned native toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          cargo fetch --locked
+          mkdir -p "$RUNNER_TEMP/native-replay-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-replay-evidence/source-commit.txt"
+          rustc -vV > "$RUNNER_TEMP/native-replay-evidence/rust-version.txt"
+      - name: Restore verified QEMU 10.2.2
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          merge-multiple: true
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Verify cached emulator
+        run: |
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-replay-evidence/qemu-version.txt"
+      - name: Build exact native pair and replay tools
+        run: |
+          set -o pipefail
+          retain_unified_logs() {
+            mkdir -p "$RUNNER_TEMP/native-replay-evidence/unified-build"
+            if [ -d "$RUNNER_TEMP/unified-build" ]; then
+              find "$RUNNER_TEMP/unified-build" -maxdepth 1 -type f \
+                \( -name '*.log' -o -name '*-stack.json' -o -name 'build-manifest.json' \) \
+                -exec cp -f {} "$RUNNER_TEMP/native-replay-evidence/unified-build/" \;
+            fi
+          }
+          trap retain_unified_logs EXIT
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair" 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/provision.log"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk --example verify-domain-evidence 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/replay-tools-build.log"
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/pair/a" --identity-b "$RUNNER_TEMP/pair/b" --output "$RUNNER_TEMP/unified-build" --selftest 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/unified-build.log"
+      - name: Recompute both native preparation stack paths
         run: |
           set -euo pipefail
-          for patch in .github/codex/patches/*.diff; do
-            git apply --check "$patch"
-            git apply "$patch"
+          for node in a b; do
+            python3 tools/check_v13_preparation_stack.py \
+              "$RUNNER_TEMP/unified-build/node-$node.elf" \
+              > "$RUNNER_TEMP/native-replay-evidence/ci-node-$node-stack.json"
           done
-          cargo fmt --all
-      - name: Run focused Rust tests
+      - name: Run first protected native replay pair
         run: |
-          cargo test --locked --offline -p cyxia-prototype \
-            --test native_target_batch \
-            --test native_preparation_debit \
-            --test domain_policy \
-            --test native_core_replay
-      - name: Run kernel clippy gate
-        run: cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
-      - name: Run related host integrity gates
-        run: python3 -B -m unittest -v tests.host.test_preparation_stack_gate tests.host.test_prototype_evidence
-      - name: Commit validated source changes
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add kernel/src/domain_control.rs \
-            kernel/src/domain_control/core_replay.rs \
-            kernel/src/domain_control/target_batch.rs \
-            crates/prototype/src/policy.rs \
-            crates/prototype/tests/domain_policy.rs \
-            crates/prototype/tests/native_preparation_debit.rs \
-            crates/prototype/tests/native_target_batch.rs
-          git commit -m 'perf(control): bound native candidate preparation'
-          git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
+          set -o pipefail
+          python3 tools/verify_domains.py \
+            --elf "$RUNNER_TEMP/unified-build/node-a.elf" \
+            --peer-elf "$RUNNER_TEMP/unified-build/node-b.elf" \
+            --build-manifest "$RUNNER_TEMP/unified-build/build-manifest.json" \
+            --source-root . \
+            --qemu "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" \
+            --output "$RUNNER_TEMP/native-replay-evidence/run" \
+            --timeout 600 --hold 1 --sample-ms 250 --clock-profile wallclock \
+            --replay-pairs 1 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/native-replay.log"
+      - name: Retain raw native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: complete-prototype-native-${{ github.sha }}
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
+          path: ${{ runner.temp }}/native-replay-evidence/
