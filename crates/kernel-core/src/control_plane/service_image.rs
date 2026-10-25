@@ -76,7 +76,7 @@ impl<'a> Image<'a> {
             let end = address
                 .checked_add(memory_size as u64)
                 .ok_or(Error::Invalid)?;
-            if !matches!(flags, 4 | 5 | 6)
+            if !matches!(flags, 4..=6)
                 || file_size > memory_size
                 || memory_size == 0
                 || address < BASE
