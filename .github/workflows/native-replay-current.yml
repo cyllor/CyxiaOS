@@ -1,4 +1,4 @@
-# Probe generation 4: bounded private-page clearing across paid turns
+# Probe generation 5: isolated timer-return bookkeeping and 100 us EL0 slices
 name: Native replay current
 
 on:
