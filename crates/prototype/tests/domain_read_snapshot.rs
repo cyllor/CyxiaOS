@@ -11,11 +11,14 @@ fn published_owner_snapshot_is_consistent_across_actual_concurrent_readers() {
     let view = Arc::new(ReadSnapshot::<[u64; 256]>::new());
     assert_eq!(view.read().unwrap(), None);
     let finished = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(std::sync::Barrier::new(4));
     let mut readers = Vec::new();
     for _ in 0..3 {
         let view = Arc::clone(&view);
         let finished = Arc::clone(&finished);
+        let start = Arc::clone(&start);
         readers.push(std::thread::spawn(move || {
+            start.wait();
             let mut seen = 0;
             while !finished.load(Ordering::Acquire) {
                 if let Ok(Some(words)) = view.read() {
@@ -26,6 +29,7 @@ fn published_owner_snapshot_is_consistent_across_actual_concurrent_readers() {
             seen
         }));
     }
+    start.wait();
     for generation in 1..5000 {
         while view.publish([generation; 256]).is_err() {
             std::thread::yield_now();
