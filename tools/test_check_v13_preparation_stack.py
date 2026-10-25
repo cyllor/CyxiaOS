@@ -16,23 +16,23 @@ def chain(nested):
     functions = [
         function("secondary_entry", 0x1000, 7264, [0x2000]),
         function("run_turn", 0x2000, 10176, [0x3000]),
-        function("next_input", 0x3000, 30688 if nested else 512,
-                 [0x5000, 0x6000, 0x7000] if nested else [0x4000, 0x5000]),
+        function("next_input", 0x3000, 30688 if nested else 512, [0x4000, 0x5000]),
         function("read_only", 0x5000, 27728, [0x6000, 0x7000]),
         function("candidate_new", 0x6000, 7248),
-        function("encode_job", 0x7000, 4848),
+        function("encode_job", 0x7000, 64, [0x7200]),
+        function("encode_prepared_job", 0x7100, 64, [0x7200]),
+        function("encode_job_inner", 0x7200, 4784),
+        function("next_normal", 0x4000, 30688, [0x6000, 0x7100]),
     ]
-    if not nested:
-        functions.append(function("next_normal", 0x4000, 30688, [0x6000, 0x7000]))
     return "\n\n".join(functions)
 
 
 class PreparationStackTests(unittest.TestCase):
-    def test_nested_replay_retains_both_large_frames(self):
+    def test_large_parent_frame_retains_large_preparation_child(self):
         result = inspect(chain(True))
         self.assertFalse(result["passed"])
-        self.assertEqual(result["peak"]["frame_bytes"], 83104)
-        self.assertEqual(result["peak"]["path"][-2:], ["read_only", "candidate_new"])
+        self.assertEqual(result["peak"]["frame_bytes"], 86064)
+        self.assertEqual(result["peak"]["path"][-2:], ["next_normal", "candidate_new"])
 
     def test_sibling_preparation_frames_are_not_summed(self):
         result = inspect(chain(False))

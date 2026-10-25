@@ -255,7 +255,9 @@ impl Creator<'_> {
             matches!(r.group.id, 15 | 16),
         )?;
         if client && crate::storage_fault_capture::PROFILE {
-            if launch.len != 32 { return Err(Error::Format); }
+            if launch.len != 32 {
+                return Err(Error::Format);
+            }
             let role = u64::from_le_bytes(launch.input[16..24].try_into().unwrap());
             if !crate::storage_fault_capture::register(role as usize, key) {
                 return Err(Error::Conflict);
@@ -1970,7 +1972,9 @@ pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
     if !SELFTEST_ENABLED || !crate::storage_fault_capture::PROFILE || !(1..=2).contains(&role) {
         return Err(Error::Unsupported);
     }
-    if cpu::slot() != 0 { return Err(Error::Auth); }
+    if cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
     locked(|s| {
         let id = 0xd0a11000 + role;
         match s.admission.query(KERNEL_CALLER, id) {
@@ -1979,13 +1983,25 @@ pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
             Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
             Ok(_) => {}
             Err(Error::NotFound) => {
-                let deadline = now_ns().checked_add(180_000_000_000).ok_or(Error::Overflow)?;
+                let deadline = now_ns()
+                    .checked_add(180_000_000_000)
+                    .ok_or(Error::Overflow)?;
                 s.facts.attempts = s.facts.attempts.saturating_add(1);
                 s.facts.spawn[3].add(now_ns(), 1);
                 if let SpawnState::Failed(e) = submit_package(
-                    s, CLIENT_PACKAGE, KERNEL_CALLER, id, group(4),
-                    &crate::storage_fault_capture::launch(role), 3, deadline, false, 0,
-                )? { return Err(e); }
+                    s,
+                    CLIENT_PACKAGE,
+                    KERNEL_CALLER,
+                    id,
+                    group(4),
+                    &crate::storage_fault_capture::launch(role),
+                    3,
+                    deadline,
+                    false,
+                    0,
+                )? {
+                    return Err(e);
+                }
             }
             Err(e) => return Err(e),
         }

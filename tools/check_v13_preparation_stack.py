@@ -27,7 +27,9 @@ NAMES = {
     "next_normal": "cyxia_kernel::domain_control::next_normal::",
     "read_only": "cyxia_kernel::domain_control::core_replay::next::",
     "candidate_new": "cyxia_prototype::policy::CandidateSet::new::",
+    "encode_prepared_job": "cyxia_kernel::domain_control::encode_prepared_job::",
     "encode_job": "cyxia_kernel::domain_control::encode_job::",
+    "encode_job_inner": "cyxia_kernel::domain_control::encode_job_inner::",
 }
 
 
@@ -179,7 +181,10 @@ def inspect(disassembly):
                 if key in selected:
                     raise ValueError(f"ambiguous function {key}")
                 selected[key] = dict(address=address, frame_bytes=frame_size(code), code=code)
-    for required in ("secondary_entry", "run_turn", "next_input", "candidate_new", "encode_job"):
+    for required in (
+        "secondary_entry", "run_turn", "next_input", "candidate_new",
+        "encode_prepared_job", "encode_job", "encode_job_inner",
+    ):
         if required not in selected:
             raise ValueError(f"missing function {required}")
     by_address = {v["address"]: key for key, v in selected.items()}

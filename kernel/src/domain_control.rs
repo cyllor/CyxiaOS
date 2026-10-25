@@ -1353,6 +1353,7 @@ impl JobCandidates {
         }
     }
 }
+#[inline(never)]
 fn encode_prepared_job(
     s: &mut State,
     controller_epoch: u64,
@@ -1377,6 +1378,7 @@ fn encode_prepared_job(
         input,
     )
 }
+#[inline(never)]
 fn encode_job(
     s: &mut State,
     controller_epoch: u64,
@@ -1402,6 +1404,7 @@ fn encode_job(
         input,
     )
 }
+#[inline(never)]
 fn encode_job_inner(
     s: &mut State,
     controller_epoch: u64,
