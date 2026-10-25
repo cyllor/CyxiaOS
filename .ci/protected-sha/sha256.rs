@@ -8,7 +8,7 @@
 mod imp {
     use core::arch::asm;
 
-    core::arch::global_asm!(include_str!("sha256.S"));
+    core::arch::global_asm!(include_str!("sha256.S"), options(raw));
 
     const INITIAL: [u32; 8] = [
         0x6a09_e667,
