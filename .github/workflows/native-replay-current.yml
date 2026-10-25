@@ -1,4 +1,4 @@
-# Probe generation 7: split boot-probe transition and reserve its recovery slice
+# Probe generation 8: protected SHA evidence path with exact FP/SIMD preservation
 name: Native replay current
 
 on:
@@ -8,9 +8,11 @@ on:
     paths:
       - '.github/workflows/native-replay-current.yml'
       - 'kernel/**'
+      - 'crates/arch-aarch64/**'
       - 'crates/prototype/**'
       - 'user/prototype-cluster/**'
       - 'tools/verify_domains.py'
+      - 'tools/verify_m1.py'
       - 'tools/build_unified.py'
   workflow_dispatch:
 
