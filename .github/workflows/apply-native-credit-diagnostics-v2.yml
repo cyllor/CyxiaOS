@@ -1,0 +1,43 @@
+name: Apply native credit diagnostics v2
+
+on:
+  push:
+    branches:
+      - fix/first-level-subsystems-20261024
+    paths:
+      - '.github/workflows/apply-native-credit-diagnostics-v2.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-native-credit-diagnostics-v2
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/first-level-subsystems-20261024
+          fetch-depth: 0
+      - name: Apply tested diagnostic patch
+        env:
+          BRANCH: fix/first-level-subsystems-20261024
+          PATCH_B64: 'ZGlmZiAtLWdpdCBhL3Rvb2xzL3ZlcmlmeV9kb21haW5zLnB5IGIvdG9vbHMvdmVyaWZ5X2RvbWFpbnMucHkKaW5kZXggMmI5MDFiMi4uNzA0ZjNjYyAxMDA2NDQKLS0tIGEvdG9vbHMvdmVyaWZ5X2RvbWFpbnMucHkKKysrIGIvdG9vbHMvdmVyaWZ5X2RvbWFpbnMucHkKQEAgLTE1OCw2ICsxNTgsMjYgQEAgZGVmIHBhcnNlX2NvbnRyb2woZGF0YSwgYm9vdF9lcG9jaD1Ob25lKToKICAgICB9CiAKIAorZGVmIGFjdGl2ZV9jb250cm9sX3JlY29yZHMoZGF0YSk6CisgICAgaWYgbGVuKGRhdGEpICE9IENPTlRST0xfV09SRFMgKiA4OgorICAgICAgICByZXR1cm4gW10KKyAgICB3ID0gd29yZHMoZGF0YSwgQ09OVFJPTF9XT1JEUykKKyAgICBpZiB3WzBdICE9IENPTlRST0xfTUFHSUMgb3Igd1sxXSAhPSAxOgorICAgICAgICByZXR1cm4gW10KKyAgICBhY3RpdmUgPSBbXQorICAgIGZvciBzbG90IGluIHJhbmdlKDY0KToKKyAgICAgICAgciA9IHdbNTEyICsgc2xvdCAqIDY0MDo1MTIgKyAoc2xvdCArIDEpICogNjQwXQorICAgICAgICBpZiByWzYzOV0gJiAxIG9yIHJbMF0gPT0gMDoKKyAgICAgICAgICAgIGNvbnRpbnVlCisgICAgICAgIGFjdGl2ZS5hcHBlbmQoeworICAgICAgICAgICAgInNsb3QiOiBzbG90LCAic2VxdWVuY2UiOiByWzBdLCAiZG9tYWluIjogclsyXSwgImtpbmQiOiByWzNdLAorICAgICAgICAgICAgInRhcmdldF9pZCI6IHJbNF0sICJ0YXJnZXRfZ2VuZXJhdGlvbiI6IHJbNV0sCisgICAgICAgICAgICAiY2FuZGlkYXRlX2NvdW50IjogclsxNl0sICJhcHByb3ZlZF92ZXJzaW9uIjogclsxM10sCisgICAgICAgICAgICAiZXhlY3V0b3Jfc3RhdGUiOiByWzE0XSwgImNvbXBsZXRlIjogYm9vbChyWzMwXSksCisgICAgICAgIH0pCisgICAgcmV0dXJuIGFjdGl2ZQorCisKIGRlZiBwYXJzZV90YXNrcyhkYXRhKToKICAgICB3ID0gd29yZHMoZGF0YSwgMzIpCiAgICAgaWYgd1swXSA9PSAwOgpAQCAtNDY5LDggKzQ4OSwxMyBAQCBkZWYgZGlhZ25vc3RpY3MoZ3Vlc3QsIGJ1bmRsZSk6CiAgICAgICAgIGlmIHN5bWJvbF9uYW1lIGluIGJ1bmRsZToKICAgICAgICAgICAgIHJlYWQoa2V5LCBsYW1iZGE6IHBhcnNlcihidW5kbGVbc3ltYm9sX25hbWVdKSkKICAgICAgICAgICAgIGlmIGtleSA9PSAiY29udHJvbF9jcmVkaXQiOgorICAgICAgICAgICAgICAgIGRldGFpbCA9IHsKKyAgICAgICAgICAgICAgICAgICAgImZhaWx1cmVzIjogZ3Vlc3Rba2V5XSwKKyAgICAgICAgICAgICAgICAgICAgImFjdGl2ZV9yZWNvcmRzIjogYWN0aXZlX2NvbnRyb2xfcmVjb3JkcygKKyAgICAgICAgICAgICAgICAgICAgICAgIGJ1bmRsZS5nZXQoIkRPTUFJTl9DT05UUk9MX0VWSURFTkNFIiwgYiIiKSksCisgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgIGNoZWNrKGtleSwgbm90IGd1ZXN0W2tleV0sCi0gICAgICAgICAgICAgICAgICAgICAgIm5hdGl2ZSBDIGNyZWRpdCBmYWlsdXJlOiAiICsganNvbi5kdW1wcyhndWVzdFtrZXldLCBzZXBhcmF0b3JzPSgiLCIsICI6IikpKQorICAgICAgICAgICAgICAgICAgICAgICJuYXRpdmUgQyBjcmVkaXQgZmFpbHVyZTogIiArIGpzb24uZHVtcHMoZGV0YWlsLCBzZXBhcmF0b3JzPSgiLCIsICI6IikpKQogICAgICMgQSBzeW5jaHJvbm91cyBmaWxlIG9wZXJhdGlvbiBtYXkgcmV0YWluIGl0cyBjYWxsZXIgd2hpbGUgd2FpdGluZyBmb3IgYQogICAgICMgbmV3IGNyZWRpdC4gSXRzIHBlcmlvZGljIHRhc2sgc25hcHNob3QgY2FuIHRoZW4gYmUgb2xkZXIgdGhhbiB0aGUgYWN0dWFsCiAgICAgIyBjb21wbGV0aW9uIGZhdWx0OyB0aGUgaW5kZXBlbmRlbnQgc3RpY2t5IHJlY29yZCBtdXN0IHN0aWxsIGZhaWwgdGhlIHJ1bi4K'
+        run: |
+          set -euo pipefail
+          printf '%s' "$PATCH_B64" | base64 --decode > "$RUNNER_TEMP/native-credit.patch"
+          git apply --check "$RUNNER_TEMP/native-credit.patch"
+          git apply "$RUNNER_TEMP/native-credit.patch"
+          PYTHONPATH=tools python3 -B -m unittest tools.test_verify_domains -v
+          rm -f .github/workflows/apply-native-credit-diagnostics.yml
+          rm -f .github/workflows/apply-native-credit-diagnostics-v2.yml
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "test: report active domain on native credit failure"
+          git push origin "HEAD:$BRANCH"
