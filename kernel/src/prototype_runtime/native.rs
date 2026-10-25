@@ -5,7 +5,13 @@ use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDO
 
 const PREPAY_NS: u64 = 2_500_000;
 const WALL_NS: u64 = 50_000_000;
-const PRIVATE_CLEAR_PAGES: u8 = 9;
+// The mapping probe is a boot self-test that spans separately prepaid turns;
+// it is not a proposal whose single-turn wall deadline may be extended.
+const PROBE_WALL_NS: u64 = 1_000_000_000;
+const PRIVATE_CLEAR_PAGES: usize = 9;
+const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
+const PRIVATE_CLEAR_SLICE_NS: u64 = 500_000;
+const FALLBACK_ZERO_BLOCK_BYTES: usize = 64;
 const SERVICE_SLICE_NS: u64 = 100_000;
 const RETURN_ENVELOPE_NS: u64 = 2_000_000;
 static READY: AtomicBool = AtomicBool::new(false);
@@ -84,7 +90,7 @@ pub(super) struct WorkerState {
     measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
     probe_started: u64,
-    clear_next: u8,
+    clear_next: u32,
     probing: bool,
     in_job: bool,
     publish_pending: bool,
@@ -303,16 +309,41 @@ fn release_model(worker: &mut Worker) -> bool {
         }
     }
 }
-fn clear_private_page(slot: usize, page: u8) {
-    debug_assert!(page < PRIVATE_CLEAR_PAGES);
+fn private_zero_block_bytes() -> Option<usize> {
+    let dczid: u64;
     unsafe {
-        let address = if page == 0 {
+        core::arch::asm!(
+            "mrs {dczid}, dczid_el0",
+            dczid = out(reg) dczid,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if dczid & (1 << 4) != 0 {
+        return None;
+    }
+    let bytes = 4usize.checked_shl((dczid & 0xf) as u32)?;
+    (bytes != 0 && bytes <= 4096 && bytes.is_power_of_two() && 4096usize.is_multiple_of(bytes))
+        .then_some(bytes)
+}
+fn clear_private_block(slot: usize, offset: usize, block_bytes: usize, use_zero_block: bool) {
+    debug_assert!(offset < PRIVATE_CLEAR_BYTES);
+    debug_assert!(block_bytes != 0 && block_bytes <= 4096);
+    let page = offset / 4096;
+    let within = offset % 4096;
+    debug_assert!(page < PRIVATE_CLEAR_PAGES);
+    debug_assert!(within + block_bytes <= 4096);
+    unsafe {
+        let page = if page == 0 {
             output_ptr(slot)
         } else {
-            stack_ptr(slot).cast::<Page>().add(usize::from(page - 1))
+            stack_ptr(slot).cast::<Page>().add(page - 1)
         };
-        (*address).0.fill(0);
-        core::arch::asm!("dsb ish", options(nostack));
+        let address = page.cast::<u8>().add(within);
+        if use_zero_block && (address as usize).is_multiple_of(block_bytes) {
+            core::arch::asm!("dc zva, {address}", address = in(reg) address, options(nostack));
+        } else {
+            core::ptr::write_bytes(address, 0, block_bytes);
+        }
     }
 }
 fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
@@ -324,19 +355,36 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         .native
         .phase(if worker.native.probing { 1 } else { 4 });
     let started = timer::ticks();
-    clear_private_page(slot, next - 1);
+    let slice_ticks = ticks(PRIVATE_CLEAR_SLICE_NS).max(1);
+    let zero_block_bytes = private_zero_block_bytes();
+    let block_bytes = zero_block_bytes.unwrap_or(FALLBACK_ZERO_BLOCK_BYTES);
+    let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
+    while offset < PRIVATE_CLEAR_BYTES {
+        let within = offset % 4096;
+        let bytes = block_bytes
+            .min(4096 - within)
+            .min(PRIVATE_CLEAR_BYTES - offset);
+        clear_private_block(slot, offset, bytes, zero_block_bytes == Some(bytes));
+        offset += bytes;
+        if timer::ticks().saturating_sub(started) >= slice_ticks {
+            break;
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack));
+    }
     if worker.native.in_job {
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
             .saturating_add(ns(timer::ticks() - started));
     }
-    worker.native.clear_next = if next == PRIVATE_CLEAR_PAGES {
+    worker.native.clear_next = if offset == PRIVATE_CLEAR_BYTES {
         0
     } else {
-        next + 1
+        u32::try_from(offset + 1).unwrap_or(0)
     };
-    // Never combine the just-cleared page with EL0 entry. The following paid
+    // Never combine the just-cleared range with EL0 entry. The following paid
     // turn receives the full envelope for mapping/preparation and its slice.
     false
 }
@@ -471,7 +519,7 @@ fn run_turn(
                     worker.context = None;
                     worker.native.probing = false;
                     worker.probed = worker.native.probe == 4;
-                } else if now.saturating_sub(worker.native.probe_started) >= WALL_NS {
+                } else if now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS {
                     fail_worker(worker);
                     return;
                 } else {
@@ -508,7 +556,7 @@ fn run_turn(
     }
     if worker.native.probing
         && worker.context.is_none()
-        && now.saturating_sub(worker.native.probe_started) >= WALL_NS
+        && now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS
     {
         fail_worker(worker);
         return;
