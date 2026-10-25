@@ -1,4 +1,4 @@
-# Probe generation 5: isolated timer-return bookkeeping and 100 us EL0 slices
+# Probe generation 6: timer-bounded private zeroing and DC ZVA acceleration
 name: Native replay current
 
 on:
