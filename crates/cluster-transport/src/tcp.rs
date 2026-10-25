@@ -162,6 +162,13 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
     }
 
+    /// Read the actual socket state without advancing timers or consuming any
+    /// device work. A scheduler turn with no CPU credit is not a disconnect.
+    pub fn state(&self) -> Result<State, Error> {
+        self.healthy()?;
+        Ok(self.sockets.get::<Socket>(self.socket).state())
+    }
+
     /// One ingress frame, bounded egress, no blocking network wait. The timer
     /// must be the same boot's monotonic clock, including reconnects.
     pub fn poll(&mut self, now_ms: u64) -> Result<State, Error> {
@@ -218,7 +225,7 @@ impl<'a, P: Port> Tcp<'a, P> {
             self.abort();
             return Err(Error::Peer);
         }
-        Ok(self.sockets.get::<Socket>(self.socket).state())
+        self.state()
     }
 
     /// These are encrypted TLS record bytes, never an authenticated RPC API.

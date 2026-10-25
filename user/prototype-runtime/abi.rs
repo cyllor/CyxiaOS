@@ -9,6 +9,14 @@ pub const INPUT_WORDS: usize = 16;
 pub const OUTPUT_WORDS: usize = 8;
 pub const SUBMIT: u64 = 0x541;
 pub const MODEL_BYTES: usize = 2772;
+#[path = "../../crates/prototype/src/learning/seed.rs"]
+mod domain_seed;
+/// Candidate-sensitive initialization for the unified eighteen-family path.
+/// This remains explicitly untrained. Standalone diagnostic ABI 1/2 keeps its
+/// original known-vector fixture; normal ABI 3 jobs map the registered bank.
+pub const fn domain_model_bytes() -> [u8; MODEL_BYTES] {
+    domain_seed::UNTRAINED_SEED0_BYTES
+}
 /// Hand-authored bootstrap model: score the positive observed service deficit.
 /// It is deliberately labelled untrained and cannot certify 1.3 model governance.
 pub const fn model_bytes() -> [u8; MODEL_BYTES] {

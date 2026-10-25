@@ -329,6 +329,7 @@ struct Service {
 #[derive(Clone, Copy)]
 struct Recovery {
     receipt: RecoveryReceipt,
+    policy: Option<PolicyStamp>,
     phase: u8,
     issued: bool,
     order: u64,
@@ -393,6 +394,40 @@ impl RecoverySupervisor {
             .find(|r| r.receipt.apply == apply)
             .map(|r| r.receipt)
             .ok_or(Error::Stale)
+    }
+    /// Model-selected recovery retains its exact zero-lease admission stamp.
+    /// The independent non-model recovery entry remains available to safety
+    /// work, and a retry cannot replace its identity or extend a policy window.
+    pub fn begin_policy(
+        &mut self,
+        apply: ApplyId,
+        recipe: u16,
+        stamp: PolicyStamp,
+        now: u64,
+    ) -> Result<RecoveryReceipt, Error> {
+        let action = Action::RecoveryRecipe(recipe);
+        if let Some(old) = self
+            .records
+            .iter()
+            .flatten()
+            .find(|r| r.receipt.apply == apply)
+        {
+            return if old.receipt.recipe == recipe && old.policy == Some(stamp) {
+                stamp.validate_action(action)?;
+                Ok(old.receipt)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        PolicyStamp::default().accepts_action(action, stamp, now)?;
+        let receipt = self.begin(apply, recipe, now)?;
+        self.records
+            .iter_mut()
+            .flatten()
+            .find(|r| r.receipt.apply == apply)
+            .ok_or(Error::Stale)?
+            .policy = Some(stamp);
+        Ok(receipt)
     }
     pub fn begin(
         &mut self,
@@ -482,6 +517,7 @@ impl RecoverySupervisor {
         };
         self.records[slot] = Some(Recovery {
             receipt,
+            policy: None,
             phase: 0,
             issued: false,
             order: self.sequence,

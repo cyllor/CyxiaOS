@@ -51,6 +51,8 @@ compile_error!("tcp-v13-selftest must run as a separate evidence profile");
 #[cfg(feature = "tcp-v13-selftest")]
 mod cluster_transport;
 #[cfg(feature = "unified-runtime")]
+mod control_pool;
+#[cfg(feature = "unified-runtime")]
 mod domain_control;
 #[cfg(feature = "unified-runtime")]
 mod domain_evidence;
@@ -66,6 +68,16 @@ mod domain_services;
 mod domain_storage;
 #[cfg(feature = "unified-runtime")]
 mod domain_tasks;
+#[cfg(feature = "unified-runtime")]
+mod learning_evidence;
+#[cfg(feature = "unified-runtime")]
+mod learning_history;
+#[cfg(feature = "unified-runtime")]
+mod learning_session;
+#[cfg(feature = "unified-runtime")]
+mod service_windows;
+#[cfg(feature = "unified-runtime")]
+mod model_bank;
 #[cfg(feature = "unified-runtime")]
 mod local_placement;
 #[cfg(feature = "net-selftest")]

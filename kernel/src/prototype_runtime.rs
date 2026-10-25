@@ -12,6 +12,9 @@ mod dynamic;
 #[path = "../../user/prototype-runtime/idle.rs"]
 mod idle;
 #[cfg(feature = "unified-runtime")]
+#[path = "prototype_runtime/learning.rs"]
+mod learning;
+#[cfg(feature = "unified-runtime")]
 #[path = "prototype_runtime/native.rs"]
 mod native;
 use cyxia_kernel_core::control_plane::image::{BASE, Image, PAGES};
@@ -36,11 +39,24 @@ struct RuntimeEvidence([AtomicU64; 1024]);
 #[used]
 #[unsafe(no_mangle)]
 static RUNTIME_V13_EVIDENCE: RuntimeEvidence = RuntimeEvidence([const { AtomicU64::new(0) }; 1024]);
+#[cfg(not(feature = "unified-runtime"))]
 static mut IMAGE: [Page; PAGES] = [const { Page::ZERO }; PAGES];
+#[cfg(not(feature = "unified-runtime"))]
 static mut INPUT: Page = Page::ZERO;
+#[cfg(not(feature = "unified-runtime"))]
 static mut SECOND_INPUT: Page = Page::ZERO;
+#[cfg(not(feature = "unified-runtime"))]
 static mut SECOND_OUTPUT: Page = Page::ZERO;
+#[cfg(not(feature = "unified-runtime"))]
 static mut SECOND_STACK: [Page; 8] = [const { Page::ZERO }; 8];
+#[cfg(feature = "unified-runtime")]
+static POOL_IMAGE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "unified-runtime")]
+static POOL_PRIVATE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "unified-runtime")]
+static mut POOL_ALLOCATIONS: [Option<crate::control_pool::Allocation>; 3] = [None; 3];
+#[cfg(feature = "unified-runtime")]
+static mut POOL_PINS: [Option<crate::control_pool::Lease>; 3] = [const { None }; 3];
 static SECOND_REQUEST: AtomicU64 = AtomicU64::new(0);
 static SECOND_START: AtomicU64 = AtomicU64::new(0);
 static STOP_OPERATION: AtomicU64 = AtomicU64::new(0);
@@ -57,7 +73,9 @@ static DMA_OWNERS: AtomicU64 = AtomicU64::new(0);
 static DEVICE_IRQ_OWNERS: AtomicU64 = AtomicU64::new(0);
 static DEVICE_REGISTRY_READY: AtomicBool = AtomicBool::new(false);
 static COORDINATOR_CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(feature = "unified-runtime"))]
 static mut OUTPUT: Page = Page::ZERO;
+#[cfg(not(feature = "unified-runtime"))]
 static mut STACK_PAGES: [Page; 8] = [const { Page::ZERO }; 8];
 static ENTRY: AtomicU64 = AtomicU64::new(0);
 // 0 idle; 1 request published; 2 owned by CPU1; 3 reply; 4 failure.
@@ -81,12 +99,92 @@ static CONTROL_TOTAL_DEBIT: AtomicU64 = AtomicU64::new(0);
 static CONTROL_OVERRUNS: AtomicU64 = AtomicU64::new(0);
 static MAX_SLICE: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
 
+fn image_ptr() -> *mut Page {
+    #[cfg(feature = "unified-runtime")]
+    {
+        POOL_IMAGE.load(Ordering::Acquire) as *mut Page
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    {
+        core::ptr::addr_of_mut!(IMAGE).cast::<Page>()
+    }
+}
+fn input_ptr(slot: usize) -> *mut Page {
+    #[cfg(feature = "unified-runtime")]
+    {
+        POOL_PRIVATE[slot - 1].load(Ordering::Acquire) as *mut Page
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    {
+        if slot == 1 {
+            core::ptr::addr_of_mut!(INPUT)
+        } else {
+            core::ptr::addr_of_mut!(SECOND_INPUT)
+        }
+    }
+}
+fn output_ptr(slot: usize) -> *mut Page {
+    #[cfg(feature = "unified-runtime")]
+    {
+        input_ptr(slot).wrapping_add(1)
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    {
+        if slot == 1 {
+            core::ptr::addr_of_mut!(OUTPUT)
+        } else {
+            core::ptr::addr_of_mut!(SECOND_OUTPUT)
+        }
+    }
+}
+fn stack_ptr(slot: usize) -> *mut Page {
+    #[cfg(feature = "unified-runtime")]
+    {
+        input_ptr(slot).wrapping_add(2)
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    {
+        if slot == 1 {
+            core::ptr::addr_of_mut!(STACK_PAGES).cast::<Page>()
+        } else {
+            core::ptr::addr_of_mut!(SECOND_STACK).cast::<Page>()
+        }
+    }
+}
+#[cfg(feature = "unified-runtime")]
+fn reserve_pool() {
+    use crate::control_pool as pool;
+    use cyxia_prototype::domains::ObjectKey;
+    assert_eq!(cpu::slot(), 0);
+    for (index, pages) in [PAGES, 10, 10].into_iter().enumerate() {
+        let allocation = pool::allocate(
+            ObjectKey {
+                id: 0x4352_5400 + index as u64,
+                generation: 1,
+            },
+            pages,
+        )
+        .expect("runtime control backing");
+        let (address, _, _) = pool::span(allocation).expect("runtime control span");
+        unsafe {
+            (*core::ptr::addr_of_mut!(POOL_ALLOCATIONS))[index] = Some(allocation);
+        }
+        if index == 0 {
+            POOL_IMAGE.store(address as u64, Ordering::Release)
+        } else {
+            POOL_PRIVATE[index - 1].store(address as u64, Ordering::Release)
+        }
+    }
+}
+
 pub(super) unsafe fn init() {
+    #[cfg(feature = "unified-runtime")]
+    reserve_pool();
     let image = Image::parse(&RUNTIME_SERVICE_ELF).expect("runtime EL0 image");
     unsafe {
         let leaf = &mut *core::ptr::addr_of_mut!(LEAVES).cast::<Page>().add(3);
         leaf.0.fill(0);
-        let arena = core::ptr::addr_of_mut!(IMAGE).cast::<u8>();
+        let arena = image_ptr().cast::<u8>();
         for segment in image.segments.iter().take(image.count) {
             let offset = (segment.address - BASE) as usize;
             core::ptr::copy_nonoverlapping(
@@ -107,20 +205,12 @@ pub(super) unsafe fn init() {
             core::arch::asm!("dc cvau, {}", in(reg) arena.add(offset), options(nostack));
         }
         core::arch::asm!("dsb ish", options(nostack));
-        leaf.0[abi::INPUT_VA as usize / 4096] = mmu::encode_user_leaf(
-            PhysAddr(phys(core::ptr::addr_of!(INPUT) as u64)),
-            false,
-            false,
-        )
-        .unwrap();
-        leaf.0[abi::OUTPUT_VA as usize / 4096] = mmu::encode_user_leaf(
-            PhysAddr(phys(core::ptr::addr_of!(OUTPUT) as u64)),
-            true,
-            false,
-        )
-        .unwrap();
+        leaf.0[abi::INPUT_VA as usize / 4096] =
+            mmu::encode_user_leaf(PhysAddr(phys(input_ptr(1) as u64)), false, false).unwrap();
+        leaf.0[abi::OUTPUT_VA as usize / 4096] =
+            mmu::encode_user_leaf(PhysAddr(phys(output_ptr(1) as u64)), true, false).unwrap();
         for n in 0..8 {
-            let address = core::ptr::addr_of!(STACK_PAGES).cast::<Page>().add(n);
+            let address = stack_ptr(1).cast::<Page>().add(n);
             leaf.0[0xb1 + n] =
                 mmu::encode_user_leaf(PhysAddr(phys(address as u64)), true, false).unwrap();
         }
@@ -130,26 +220,34 @@ pub(super) unsafe fn init() {
             let source = core::ptr::addr_of!(LEAVES).cast::<Page>().add(3);
             let leaf = &mut *core::ptr::addr_of_mut!(LEAVES).cast::<Page>().add(5);
             leaf.0.copy_from_slice(&(*source).0);
-            leaf.0[abi::INPUT_VA as usize / 4096] = mmu::encode_user_leaf(
-                PhysAddr(phys(core::ptr::addr_of!(SECOND_INPUT) as u64)),
-                false,
-                false,
-            )
-            .unwrap();
-            leaf.0[abi::OUTPUT_VA as usize / 4096] = mmu::encode_user_leaf(
-                PhysAddr(phys(core::ptr::addr_of!(SECOND_OUTPUT) as u64)),
-                true,
-                false,
-            )
-            .unwrap();
+            leaf.0[abi::INPUT_VA as usize / 4096] =
+                mmu::encode_user_leaf(PhysAddr(phys(input_ptr(2) as u64)), false, false).unwrap();
+            leaf.0[abi::OUTPUT_VA as usize / 4096] =
+                mmu::encode_user_leaf(PhysAddr(phys(output_ptr(2) as u64)), true, false).unwrap();
             for n in 0..8 {
-                let page = core::ptr::addr_of!(SECOND_STACK).cast::<Page>().add(n);
+                let page = stack_ptr(2).cast::<Page>().add(n);
                 leaf.0[0xb1 + n] =
                     mmu::encode_user_leaf(PhysAddr(phys(page as u64)), true, false).unwrap();
             }
         }
     }
     ENTRY.store(image.entry, Ordering::Release);
+    #[cfg(feature = "unified-runtime")]
+    {
+        for index in 0..3 {
+            let allocation = unsafe {
+                (*core::ptr::addr_of!(POOL_ALLOCATIONS))[index].expect("runtime pool allocation")
+            };
+            if index == 0 {
+                crate::control_pool::seal(allocation).expect("seal control image");
+            }
+            let pin = crate::control_pool::pin(allocation).expect("pin control image");
+            unsafe {
+                (*core::ptr::addr_of_mut!(POOL_PINS))[index] = Some(pin);
+            }
+        }
+        learning::init().expect("learning control pool");
+    }
 }
 fn fresh(mode: u64) -> user::Context {
     let mut context = user::Context::empty();
@@ -166,6 +264,8 @@ pub(super) struct Worker {
     charged: u64,
     #[cfg(feature = "unified-runtime")]
     native: native::WorkerState,
+    #[cfg(feature = "unified-runtime")]
+    extra: learning::Worker,
 }
 impl Worker {
     pub(super) const fn new() -> Self {
@@ -177,8 +277,122 @@ impl Worker {
             charged: 0,
             #[cfg(feature = "unified-runtime")]
             native: native::WorkerState::new(),
+            #[cfg(feature = "unified-runtime")]
+            extra: learning::Worker::new(),
         }
     }
+}
+#[cfg(feature = "unified-runtime")]
+pub use learning::InputLoan as LearningInputLoan;
+#[cfg(feature = "unified-runtime")]
+pub use learning::Registration as LearningRegistration;
+#[cfg(feature = "unified-runtime")]
+pub use learning::{Request as LearningRequest, Status as LearningStatus};
+#[cfg(feature = "unified-runtime")]
+pub fn learning_driver_workspace()
+-> Result<crate::control_pool::Allocation, cyxia_prototype::domains::Error> {
+    learning::driver_workspace()
+}
+#[cfg(feature = "unified-runtime")]
+pub fn learning_session_workspace()
+-> Result<crate::control_pool::Allocation, cyxia_prototype::domains::Error> {
+    learning::session_workspace()
+}
+#[cfg(feature = "unified-runtime")]
+pub fn borrow_learning_input() -> Result<LearningInputLoan, cyxia_prototype::domains::Error> {
+    learning::borrow_input()
+}
+#[cfg(feature = "unified-runtime")]
+pub fn learning_input_span(
+    loan: &LearningInputLoan,
+) -> Result<(usize, usize), cyxia_prototype::domains::Error> {
+    learning::input_span(loan)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn seal_learning_input(
+    loan: &mut LearningInputLoan,
+) -> Result<crate::control_pool::Allocation, cyxia_prototype::domains::Error> {
+    learning::seal_input(loan)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn abandon_learning_input(
+    loan: &mut LearningInputLoan,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::abandon_input(loan)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn authorize_learning_turn() -> Result<(), cyxia_prototype::domains::Error> {
+    learning::require_extra_caller()
+}
+#[cfg(feature = "unified-runtime")]
+pub fn register_learning_driver(
+    turn: fn() -> Result<bool, cyxia_prototype::domains::Error>,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::register_driver(turn)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn learning_registration(
+    role: cyxia_prototype::learning::worker_wire::Role,
+) -> Result<LearningRegistration, cyxia_prototype::domains::Error> {
+    learning::registration(role)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn install_learning_capture(
+    node: [u8; 32],
+    boot: u64,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::install_capture(node, boot)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn verify_learning_completion(
+    claim: &cyxia_prototype::learning::worker::CompletionClaim,
+) -> Result<(), cyxia_prototype::learning::Error> {
+    learning::verify_completion(claim)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn verify_learning_score_completion(
+    claim: &cyxia_prototype::learning::worker::CompletionClaim,
+    receipt: &cyxia_prototype::learning::governance::WorkReceipt,
+) -> Result<(), cyxia_prototype::learning::Error> {
+    learning::verify_score_completion(claim, receipt)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn take_learning_score_receipt(
+    key: cyxia_prototype::domains::ObjectKey,
+) -> Result<cyxia_prototype::learning::governance::WorkReceipt, cyxia_prototype::domains::Error> {
+    learning::take_score_receipt(key)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn submit_learning(
+    request: LearningRequest,
+) -> Result<cyxia_prototype::domains::ObjectKey, cyxia_prototype::domains::Error> {
+    learning::submit(request)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn query_learning(
+    key: cyxia_prototype::domains::ObjectKey,
+) -> Result<LearningStatus, cyxia_prototype::domains::Error> {
+    learning::query(key)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn read_learning_result(
+    key: cyxia_prototype::domains::ObjectKey,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::read_result(key, offset, out)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn acknowledge_learning(
+    key: cyxia_prototype::domains::ObjectKey,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::acknowledge(key)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn cancel_learning(
+    key: cyxia_prototype::domains::ObjectKey,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::cancel(key)
 }
 /// One bounded scheduling turn on the control CPU. A stalled model returns on
 /// every timer tick; its old context is discarded only after user::enter returns.
@@ -238,13 +452,11 @@ pub(super) fn step(worker: &mut Worker) {
         {
             return;
         }
-        let sequence = unsafe { (*core::ptr::addr_of!(INPUT)).0[2] };
+        let sequence = unsafe { (*input_ptr(1)).0[2] };
         unsafe {
-            (*core::ptr::addr_of_mut!(OUTPUT)).0.fill(0);
+            (*output_ptr(1)).0.fill(0);
             for n in 0..8 {
-                (*core::ptr::addr_of_mut!(STACK_PAGES).cast::<Page>().add(n))
-                    .0
-                    .fill(0);
+                (*stack_ptr(1).cast::<Page>().add(n)).0.fill(0);
             }
             core::arch::asm!("dsb ish", options(nostack));
         }
@@ -624,11 +836,7 @@ impl Coordinator {
                 let state = REQUEST.load(Ordering::Relaxed);
                 let accepted_at = timer::ticks();
                 let output: [u64; abi::OUTPUT_WORDS] = core::array::from_fn(|n| unsafe {
-                    (*core::ptr::addr_of!(OUTPUT))
-                        .0
-                        .as_ptr()
-                        .add(n)
-                        .read_volatile()
+                    (*output_ptr(1)).0.as_ptr().add(n).read_volatile()
                 });
                 let end = REQUEST_END.load(Ordering::Relaxed);
                 let start = REQUEST_START.load(Ordering::Relaxed);
@@ -749,8 +957,7 @@ impl Coordinator {
             ];
             self.last_progress = current_progress;
             unsafe {
-                (&mut (*core::ptr::addr_of_mut!(INPUT)).0)[..abi::INPUT_WORDS]
-                    .copy_from_slice(&self.input);
+                (&mut (*input_ptr(1)).0)[..abi::INPUT_WORDS].copy_from_slice(&self.input);
                 core::arch::asm!("dsb ish", options(nostack));
             }
             self.request_at = now;
@@ -911,10 +1118,21 @@ pub(super) fn stop_turn(worker: &mut Worker) {
     {
         // A returned EL0 context is not yet a stop proof while its CPU bill or
         // a task/PTE owner remains in custody. Each operation is retried later.
-        if !native::stop_ready(worker)
-            || crate::domain_tasks::close_cpu(2).is_err()
-            || !crate::domain_tasks::quiescent(2)
-        {
+        if !native::stop_ready(worker) {
+            return;
+        }
+        // Control-job cleanup already owns its P credit/capture. The local
+        // task/IRQ/PTE stop and its acknowledgement are separate E_action CPU.
+        native::measure_stop_tail(operation, || stop_action_tail(worker, operation));
+        return;
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    stop_action_tail(worker, operation);
+}
+fn stop_action_tail(worker: &mut Worker, operation: u64) {
+    #[cfg(feature = "unified-runtime")]
+    {
+        if crate::domain_tasks::close_cpu(2).is_err() || !crate::domain_tasks::quiescent(2) {
             return;
         }
         worker.native.discard();
@@ -962,11 +1180,17 @@ pub(super) fn stop_turn(worker: &mut Worker) {
 pub(super) fn resume_turn(slot: usize) {
     if slot == 2 && STOP_MASKED.swap(false, Ordering::AcqRel) {
         #[cfg(feature = "unified-runtime")]
-        heartbeat(true);
-        gic()
-            .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
-            .unwrap();
+        native::measure_stop_tail(STOP_OPERATION.load(Ordering::Acquire), resume_action_tail);
+        #[cfg(not(feature = "unified-runtime"))]
+        resume_action_tail();
     }
+}
+fn resume_action_tail() {
+    #[cfg(feature = "unified-runtime")]
+    heartbeat(true);
+    gic()
+        .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
+        .unwrap();
 }
 
 fn secondary_control_step(worker: &mut Worker) {
@@ -995,11 +1219,9 @@ fn secondary_control_step(worker: &mut Worker) {
             return;
         }
         unsafe {
-            (*core::ptr::addr_of_mut!(SECOND_OUTPUT)).0.fill(0);
+            (*output_ptr(2)).0.fill(0);
             for n in 0..8 {
-                (*core::ptr::addr_of_mut!(SECOND_STACK).cast::<Page>().add(n))
-                    .0
-                    .fill(0);
+                (*stack_ptr(2).cast::<Page>().add(n)).0.fill(0);
             }
         }
         worker.context = Some(fresh(0));
@@ -1067,6 +1289,8 @@ impl Coordinator {
         self.handoff_model_sequence = self.requests;
         self.handoff = Some(handoff);
         // Revocation is one bounded CAS per turn; no busy wait or cross-module lock.
+        #[cfg(feature = "unified-runtime")]
+        native::publish_stop_measure(self.handoff_sequence, &self.native);
         STOP_OPERATION.store(self.handoff_sequence, Ordering::Release);
         wake_workers();
         self.last_handoff_ms = Some(ms);
@@ -1189,11 +1413,7 @@ impl Coordinator {
         match SECOND_REQUEST.load(Ordering::Acquire) {
             3 => {
                 let output: [u64; abi::OUTPUT_WORDS] = core::array::from_fn(|n| unsafe {
-                    (*core::ptr::addr_of!(SECOND_OUTPUT))
-                        .0
-                        .as_ptr()
-                        .add(n)
-                        .read_volatile()
+                    (*output_ptr(2)).0.as_ptr().add(n).read_volatile()
                 });
                 if output[..4]
                     == [
@@ -1234,8 +1454,7 @@ impl Coordinator {
         self.secondary_input[14] = self.boot.epoch;
         self.secondary_input[15] = self.control_work;
         unsafe {
-            (&mut (*core::ptr::addr_of_mut!(SECOND_INPUT)).0)[..abi::INPUT_WORDS]
-                .copy_from_slice(&self.secondary_input);
+            (&mut (*input_ptr(2)).0)[..abi::INPUT_WORDS].copy_from_slice(&self.secondary_input);
             core::arch::asm!("dsb ish", options(nostack));
         }
         SECOND_REQUEST.store(1, Ordering::Release);

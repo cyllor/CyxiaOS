@@ -38,6 +38,21 @@ fn candidates() -> CandidateSet {
     )
     .unwrap()
 }
+#[test]
+fn immutable_candidate_integrity_detects_public_binding_changes_without_rebuilding() {
+    let original = candidates();
+    assert_eq!(original.verify_integrity(), Ok(()));
+    let mut snapshot = original;
+    snapshot.snapshot.taken_ns += 1;
+    assert_eq!(snapshot.verify_integrity(), Err(Error::Conflict));
+    let mut target = original;
+    target.target.generation += 1;
+    assert_eq!(target.verify_integrity(), Err(Error::Conflict));
+    let mut model = original;
+    model.model.model_hash[0] ^= 1;
+    assert_eq!(model.verify_integrity(), Err(Error::Conflict));
+    assert_eq!(original.verify_integrity(), Ok(()));
+}
 fn frame(set: &CandidateSet, sequence: u64, base: u64) -> Vec<u8> {
     let header = PlanHeader {
         plan_seq: sequence,
@@ -130,6 +145,35 @@ fn clock() -> Times {
         second: 12,
         calls: 0,
     }
+}
+
+#[test]
+fn registered_action_requires_retained_exact_hash_and_bounded_index() {
+    let set = candidates();
+    let mut registry = Registry::new(11, publisher(), binding()).unwrap();
+    assert_eq!(registry.registered_action(set.hash(), 0), Err(Error::Stale));
+    registry.register(publisher(), &set).unwrap();
+    for (index, candidate) in set.iter().enumerate() {
+        assert_eq!(
+            registry.registered_action(set.hash(), index),
+            Ok(candidate.action)
+        );
+    }
+    assert_eq!(
+        registry.registered_action(set.hash(), set.len()),
+        Err(Error::Range)
+    );
+    assert_eq!(
+        registry.registered_action(set.hash(), usize::MAX),
+        Err(Error::Range)
+    );
+    let mut altered = set.hash();
+    altered[0] ^= 1;
+    assert_eq!(registry.registered_action(altered, 0), Err(Error::Stale));
+    let mut next = binding();
+    next.generation += 1;
+    registry.change_model(publisher(), next).unwrap();
+    assert_eq!(registry.registered_action(set.hash(), 0), Err(Error::Stale));
 }
 
 #[test]
@@ -485,7 +529,7 @@ fn publication_checks_time_after_revalidation() {
 fn installed_publication_survives_overrun_and_blocks_new_optimization() {
     let (mut registry, set, mut owner) = ready();
     let bytes = frame(&set, 1, 0);
-    let mut time = ScriptClock([11, 12, 13, 14, 500_012].into());
+    let mut time = ScriptClock([11, 12, 13, 14, 15, 500_012].into());
     let receipt = registry
         .submit(publisher(), &bytes, &mut time, &mut owner)
         .unwrap();
@@ -529,4 +573,164 @@ fn protected_predecode_cost_is_inside_publication_budget() {
     assert_eq!(receipt.state(), ExecutionState::Failed(Error::Budget));
     assert_eq!(owner.prepares, 0);
     assert_eq!(owner.publishes, 0);
+}
+
+struct RestoreOwner {
+    target: ObjectKey,
+    baseline: Action,
+    authorizations: usize,
+    owner: Owner,
+}
+impl Executor for RestoreOwner {
+    fn authorize_recovery(
+        &mut self,
+        active: ModelBinding,
+        plan: &Plan,
+        _: u64,
+    ) -> Result<(), Error> {
+        self.authorizations += 1;
+        let decision = plan.iter().next().ok_or(Error::Auth)?;
+        if active == binding()
+            && plan.len() == 1
+            && decision.envelope.target == self.target
+            && decision.action == self.baseline
+            && decision.envelope.model_hash == active.model_hash
+        {
+            Ok(())
+        } else {
+            Err(Error::Auth)
+        }
+    }
+    fn check(&mut self, d: Decision, s: &RegisteredSet, now: u64) -> Result<(), Error> {
+        self.owner.check(d, s, now)
+    }
+    fn prepare(&mut self, p: &Plan, version: u64) -> Result<(), Error> {
+        self.owner.prepare(p, version)
+    }
+    fn revalidate(&mut self, p: &Plan, now: u64) -> Result<(), Error> {
+        self.owner.revalidate(p, now)
+    }
+    fn publish(&mut self, p: &Plan, version: u64, now: u64) -> Result<(), Error> {
+        self.owner.publish(p, version, now)
+    }
+    fn cancel_prepared(&mut self, p: &Plan) {
+        self.owner.cancel_prepared(p)
+    }
+}
+fn stopped_console() -> (Registry, CandidateSet, RestoreOwner) {
+    let set = CandidateSet::new(
+        candidates().snapshot,
+        ObjectKey {
+            id: 15,
+            generation: 1,
+        },
+        binding(),
+        &[1, 8].map(|n| Candidate {
+            action: Action::ConsoleBatch(n),
+            features: RawFeatures::default(),
+        }),
+        Some(Action::ConsoleBatch(8)),
+    )
+    .unwrap();
+    let mut registry = Registry::new(11, publisher(), binding()).unwrap();
+    registry.register(publisher(), &set).unwrap();
+    let mut owner = Owner::default();
+    let receipt = registry
+        .submit(
+            publisher(),
+            &frame(&set, 1, 0),
+            &mut ScriptClock([11, 12, 13, 14, 15, 500_012].into()),
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(receipt.version, 1);
+    registry
+        .reconcile(
+            ApplyId {
+                boot_epoch: 11,
+                controller_epoch: 9,
+                plan_seq: 1,
+                action_index: 0,
+                target: set.target,
+            },
+            1,
+            ExecutionState::Applied,
+        )
+        .unwrap();
+    assert!(registry.optimization_stopped());
+    let restore = RestoreOwner {
+        target: set.target,
+        baseline: Action::ConsoleBatch(8),
+        authorizations: 0,
+        owner: Owner::default(),
+    };
+    (registry, set, restore)
+}
+#[test]
+fn stopped_optimizer_requires_explicit_restore_authority_and_stays_stopped() {
+    let (mut registry, set, mut restore) = stopped_console();
+    let bytes = frame(&set, 2, 1);
+    assert_eq!(
+        registry.submit(
+            publisher(),
+            &bytes,
+            &mut ScriptClock([600_000].into()),
+            &mut Owner::default()
+        ),
+        Err(Error::Budget)
+    );
+    let receipt = registry
+        .submit(
+            publisher(),
+            &bytes,
+            &mut ScriptClock([600_000, 600_001, 600_002, 600_003, 600_004, 600_005].into()),
+            &mut restore,
+        )
+        .unwrap();
+    assert_eq!(receipt.version, 2);
+    assert_eq!(registry.query_model(publisher(), receipt.id), Ok(binding()));
+    assert_eq!((restore.authorizations, restore.owner.publishes), (1, 1));
+    assert!(registry.optimization_stopped());
+    assert_eq!(
+        registry.submit(
+            publisher(),
+            &bytes,
+            &mut ScriptClock([u64::MAX].into()),
+            &mut Owner::default()
+        ),
+        Ok(receipt)
+    );
+    assert_eq!(
+        registry.submit(
+            publisher(),
+            &frame(&set, 3, 2),
+            &mut ScriptClock([700_000].into()),
+            &mut Owner::default()
+        ),
+        Err(Error::Budget)
+    );
+}
+#[test]
+fn authorized_restore_still_obeys_the_fresh_publication_cpu_limit() {
+    let (mut registry, set, mut restore) = stopped_console();
+    let receipt = registry
+        .submit(
+            publisher(),
+            &frame(&set, 2, 1),
+            &mut ScriptClock([600_000, 600_001, 600_002, 1_100_001, 1_100_002].into()),
+            &mut restore,
+        )
+        .unwrap();
+    assert_eq!(receipt.version, 0);
+    assert_eq!(receipt.state(), ExecutionState::Failed(Error::Budget));
+    assert_eq!(
+        (
+            restore.authorizations,
+            restore.owner.prepares,
+            restore.owner.publishes,
+            restore.owner.cancels
+        ),
+        (1, 1, 0, 1)
+    );
+    assert!(registry.optimization_stopped());
 }

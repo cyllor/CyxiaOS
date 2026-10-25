@@ -124,6 +124,7 @@ pub struct Scheduler {
     last_ns: u64,
     escrow: Option<Escrow>,
     escrow_generation: u64,
+    upstream: [bool; 2],
 }
 impl Scheduler {
     pub const fn new(pages: u32, descriptors: u32) -> Self {
@@ -169,6 +170,21 @@ impl Scheduler {
             last_ns: 0,
             escrow: None,
             escrow_generation: 0,
+            upstream: [false; 2],
+        }
+    }
+    /// The serialized block owner reports real upstream ordinary work before
+    /// each new admission. It must retain true while that class has validated
+    /// disk work waiting above this queue; unknown observations also forbid
+    /// borrowing. This changes neither credits nor already issued escrow.
+    pub fn set_upstream_demand(&mut self, foreground: bool, background: bool) {
+        self.upstream = [foreground, background];
+    }
+    fn upstream_other(&self, class: Class) -> bool {
+        match class {
+            Class::Foreground => self.upstream[1],
+            Class::Background => self.upstream[0],
+            Class::Recovery => false,
         }
     }
     fn clock(&mut self, now: u64) -> Result<(), Error> {
@@ -315,7 +331,7 @@ impl Scheduler {
             .escrow
             .filter(|e| e.class == class)
             .map_or(0, |e| e.remaining);
-        !other || bytes <= share.saturating_sub(used + reserved)
+        !(other || self.upstream_other(class)) || bytes <= share.saturating_sub(used + reserved)
     }
     pub fn reserve_transaction(
         &mut self,

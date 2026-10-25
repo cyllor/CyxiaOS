@@ -218,6 +218,9 @@ pub struct TrainedModel {
     record: TrainingRecord,
 }
 impl TrainedModel {
+    pub(super) fn from_worker(bytes: [u8; MODEL_BYTES], record: TrainingRecord) -> Self {
+        Self { bytes, record }
+    }
     pub fn bytes(&self) -> &[u8; MODEL_BYTES] {
         &self.bytes
     }

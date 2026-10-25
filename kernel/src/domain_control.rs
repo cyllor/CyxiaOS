@@ -4,7 +4,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cyxia_prototype::{
     domains::stability::{Boundary, Guard as StabilityGuard, ServiceWindow, WindowOutcome},
     domains::{Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS},
-    features::{RawFeatures, TargetFeatures},
+    features::{DomainObservation, RawFeatures, TargetFeatures},
+    learning::{self, SchemaBinding, Schemas, governance::CommitGate},
     policy::{
         self, Candidate, CandidateSet, ExecutionState, ModelBinding, Publisher, Registry, Snapshot,
     },
@@ -13,6 +14,12 @@ use cyxia_prototype::{
 use sha2::{Digest, Sha256};
 #[path = "domain_control/dependencies.rs"]
 mod dependencies;
+#[path = "domain_control/learning.rs"]
+pub mod learning_coordinator;
+#[path = "domain_control/learning_driver.rs"]
+pub mod learning_driver;
+#[path = "domain_control/governance.rs"]
+pub mod governance;
 pub use cyxia_prototype::policy::{BoundDependency, Prerequisite};
 type DependencyResolver = fn(ObjectKey) -> Result<[Option<Prerequisite>; 2], Error>;
 type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
@@ -26,7 +33,7 @@ pub struct Family {
     pub domain: u16,
     pub kind: u16,
     pub target: fn(u16, u16, usize) -> Option<ObjectKey>,
-    pub observe: fn(u16, ObjectKey) -> Result<[u64; 4], Error>,
+    pub observe: fn(u16, ObjectKey) -> Result<DomainObservation, Error>,
     pub current: fn(u16, u16, ObjectKey) -> Result<Action, Error>,
     pub legal: fn(Action, ObjectKey, u64) -> Result<(), Error>,
     pub target_features: fn(Action, ObjectKey) -> Result<TargetFeatures, Error>,
@@ -51,15 +58,19 @@ struct Desired {
     state: ExecutionState,
     execution_observed: bool,
     started: bool,
+    first_entry_ns: Option<u64>,
+    observed_ns: u64,
     published: u64,
-    evidence: usize,
+    evidence: Option<usize>,
     job: u64,
+    model: ModelBinding,
     dependencies: [Option<BoundDependency>; 2],
     core_generation: u64,
     ledger_generation: u64,
 }
 struct Owner {
     families: [Option<Family>; 18],
+    family_epochs: [u64; 18],
     desired: [Option<Desired>; 512],
     stability: [Option<StabilityGuard>; 512],
     stability_high: usize,
@@ -83,6 +94,11 @@ struct Job {
 }
 struct State {
     registry: Registry,
+    models: crate::model_bank::ModelBank<crate::model_bank::NativeMemory>,
+    model_gate: Option<CommitGate>,
+    learning_jobs: learning_coordinator::Jobs,
+    governance_jobs: governance::Jobs,
+    worker_sequence: u64,
     owner: Owner,
     boot: u64,
     sequence: u64,
@@ -95,8 +111,14 @@ struct State {
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 static mut STATE: State = State {
     registry: Registry::empty(),
+    models: crate::model_bank::ModelBank::new(crate::model_bank::NativeMemory),
+    model_gate: None,
+    learning_jobs: learning_coordinator::Jobs::new(),
+    governance_jobs: governance::Jobs::new(),
+    worker_sequence: 0,
     owner: Owner {
         families: [None; 18],
+        family_epochs: [0; 18],
         desired: [None; 512],
         stability: [None; 512],
         stability_high: 0,
@@ -175,6 +197,11 @@ fn publisher(epoch: u64) -> Publisher {
     }
 }
 pub fn init(boot: u64) -> Result<(), Error> {
+    if boot == 0 { return Err(Error::Auth); }
+    // The actual driver remains idle without protected replay data. Do this
+    // before publishing boot readiness so a Busy startup can retry its loan.
+    learning_driver::init()?;
+    crate::service_windows::init()?;
     with(|s| {
         if s.boot != 0 {
             return if s.boot == boot {
@@ -185,19 +212,59 @@ pub fn init(boot: u64) -> Result<(), Error> {
         }
         let model = ModelBinding {
             generation: 1,
-            model_hash: Sha256::digest(abi::model_bytes()).into(),
+            model_hash: Sha256::digest(abi::domain_model_bytes()).into(),
             schema_hash: Sha256::digest(include_bytes!("../../crates/prototype/src/features.rs"))
                 .into(),
         };
+        let schemas = Schemas {
+            feature: SchemaBinding { version: 13, hash: model.schema_hash },
+            action: SchemaBinding {
+                version: 13,
+                hash: Sha256::digest(include_bytes!("../../crates/prototype/src/policy_wire.rs")).into(),
+            },
+            reward: learning::reward_schema(),
+            learning: learning::learning_config(),
+        };
+        // Provision the actual four-bank backing before exposing Registry. A
+        // Busy retry retains every already allocated page and exact identity.
+        s.models.initialize(boot, model, schemas, &abi::domain_model_bytes())?;
+        let gate = CommitGate::new(boot, model).map_err(|_| Error::Schema)?;
         s.registry.initialize(boot, publisher(1), model)?;
+        s.model_gate = Some(gate);
         s.boot = boot;
         s.started = now();
         crate::domain_evidence::initialize(boot, model);
         Ok(())
     })
 }
+pub type NativeModelPin = crate::model_bank::ModelPin<crate::control_pool::Lease>;
+/// The immutable parameters are selected by the exact outstanding job, never
+/// by an EL0 pointer, echoed model hash, or the newest Active after a restart.
+pub fn pin_job_model(sequence: u64, controller: u64) -> Result<NativeModelPin, Error> {
+    with(|s| {
+        require_control(&s.owner)?;
+        let job = s.job.as_ref().ok_or(Error::NotReady)?;
+        if job.cpu != cyxia_arch_aarch64::cpu::slot()
+            || job.sequence != sequence || job.controller != controller {
+            return Err(Error::Auth);
+        }
+        let gate = s.model_gate.as_ref().ok_or(Error::NotReady)?;
+        if gate.active() != s.registry.model() || s.models.active()? != s.registry.model() {
+            return Err(Error::Stale);
+        }
+        gate.check_active_publication(job.set.model, job.set.target).map_err(|_| Error::Stale)?;
+        s.models.pin(job.set.model)
+    })
+}
+/// Runtime calls this after the exact context has stopped, its model mapping
+/// and TLB entry are revoked, and the final physical/control bill has settled.
+/// Busy leaves the caller's original, non-clonable pin live for retry.
+pub fn release_job_model(pin: &NativeModelPin) -> Result<(), Error> {
+    with(|s| s.models.release(pin))
+}
 pub fn register(family: Family) -> Result<(), Error> {
     with(|s| {
+        if s.boot == 0 { return Err(Error::NotReady); }
         let i = family_index(family.domain, family.kind)?;
         if let Some(old) = s.owner.families[i] {
             return if old.domain == family.domain
@@ -216,6 +283,9 @@ pub fn register(family: Family) -> Result<(), Error> {
             };
         }
         s.owner.families[i] = Some(family);
+        // Registered callbacks are fixed for this boot. This is the executor's
+        // protected registration epoch, independent of each target's lifetime.
+        s.owner.family_epochs[i] = s.boot;
         crate::domain_evidence::registered(i);
         Ok(())
     })
@@ -619,6 +689,10 @@ fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
         else {
             continue;
         };
+        if s.model_gate.as_ref().is_none_or(|gate|
+            gate.check_active_publication(s.registry.model(), target).is_err()) {
+            continue;
+        }
         if locate_family(&s.owner, f.domain, f.kind, target)
             .and_then(|i| s.owner.desired[i].as_ref())
             .is_some_and(execution_blocks_replacement)
@@ -632,7 +706,8 @@ fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
 pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
     with(|s| {
         require_control(&s.owner)?;
-        if s.boot == 0 || s.job.is_some() || s.registry.optimization_stopped() {
+        if s.boot == 0 || s.job.is_some() || s.registry.optimization_stopped()
+            || s.governance_jobs.reserves_publication(now()) {
             return Ok(None);
         }
         let started = now();
@@ -666,6 +741,12 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             let Some(target) = target else {
                 continue;
             };
+            // An exclusive Canary or restoration reservation suppresses new
+            // Active proposals before encoding and inference spend their CPU.
+            if s.model_gate.as_ref().is_none_or(|gate|
+                gate.check_active_publication(s.registry.model(), target).is_err()) {
+                continue;
+            }
             let current = match (f.current)(f.domain, f.kind, target) {
                 Ok(v) => v,
                 Err(
@@ -763,7 +844,8 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
                     action,
                     features: RawFeatures {
                         common,
-                        domain: observed,
+                        domain: observed.values,
+                        domain_present: observed.present,
                         target: target_features,
                         control_capacity: if let Action::ControlSet(mask) = action {
                             Some(u64::from(mask.count_ones()) * 1000)
@@ -819,6 +901,7 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
             let raw = set.get(0).ok_or(Error::NotReady)?.features;
             input[24..32].copy_from_slice(&raw.common);
             input[32..36].copy_from_slice(&raw.domain);
+            input[40] = u64::from(raw.domain_present);
             input[36..40].copy_from_slice(&[
                 sequence,
                 sequence,
@@ -864,11 +947,14 @@ pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
                 }
             }
             let evidence = (sequence as usize - 1) % crate::domain_evidence::SLOTS;
-            let mut hash = Sha256::new();
-            for value in input {
-                hash.update(value.to_le_bytes());
-            }
-            crate::domain_evidence::begin(evidence, &input, hash.finalize().into());
+            // This native target is little-endian; the array has no padding.
+            // Hash one contiguous immutable view rather than 512 tiny updates.
+            const _: () = assert!(cfg!(target_endian = "little"));
+            let input_bytes = unsafe { &*((&input as *const [u64; 512]).cast::<[u8; 4096]>()) };
+            let input_hash = Sha256::digest(input_bytes).into();
+            crate::domain_evidence::begin(evidence, &input, input_hash);
+            // Missing/capacity/Busy evidence stays incomplete in its owner.
+            let _ = crate::learning_history::record_proposal(sequence, &set, input_bytes, input_hash);
             s.sequence = sequence;
             s.job = Some(Job {
                 cpu: cyxia_arch_aarch64::cpu::slot(),
@@ -892,16 +978,60 @@ impl policy::Clock for NativeClock {
         now()
     }
 }
-struct Executor<'a> {
+trait PublicationScope {
+    fn authorize_executor(&self, owner: &Owner) -> Result<(), Error> { require_control(owner) }
+    fn authorize_recovery(&mut self, _: ModelBinding, _: &Plan, _: u64) -> Result<(), Error> {
+        Err(Error::Budget)
+    }
+    fn authorize(&mut self, active: ModelBinding, set: &policy::RegisteredSet, at: u64)
+        -> Result<(), Error>;
+    fn selection(&self, owner: &Owner, f: Family, action: Action, target: ObjectKey, at: u64)
+        -> Result<(), Error> {
+        validate_selection(owner, f, action, target, at)
+    }
+    /// All fallible scope checks precede the common infallible desired-root
+    /// writes. A Canary consumes its exact score receipt and quota here.
+    fn commit(&mut self, owner: &Owner, model: ModelBinding, plan: &Plan,
+        stamps: &[PolicyStamp], boot: u64, at: u64) -> Result<(), Error>;
+}
+struct ActiveScope<'a>(&'a CommitGate);
+impl PublicationScope for ActiveScope<'_> {
+    fn authorize(&mut self, active: ModelBinding, set: &policy::RegisteredSet, at: u64)
+        -> Result<(), Error> {
+        if set.canary_permit().is_some() { return Err(Error::Auth); }
+        set.authorize_with_gate(active, self.0, at)
+    }
+    fn commit(&mut self, _: &Owner, model: ModelBinding, plan: &Plan,
+        _: &[PolicyStamp], _: u64, _: u64) -> Result<(), Error> {
+        for d in plan.iter() {
+            self.0.check_active_publication(model, d.envelope.target).map_err(|_| Error::Busy)?;
+        }
+        Ok(())
+    }
+}
+struct Executor<'a, S: PublicationScope> {
     owner: &'a mut Owner,
-    evidence: usize,
+    scope: S,
+    model: ModelBinding,
+    evidence: Option<usize>,
     job: u64,
     boot: u64,
     publication_started: u64,
     wall_deadline: u64,
     dependencies: [Option<BoundDependency>; 2],
+    scores: [i16; 32],
+    score_count: usize,
 }
-impl policy::Executor for Executor<'_> {
+impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
+    fn authorize_recovery(&mut self, active: ModelBinding, plan: &Plan, at: u64) -> Result<(), Error> {
+        self.scope.authorize_recovery(active, plan, at)
+    }
+    fn authorize_model(
+        &mut self, active: ModelBinding, set: &policy::RegisteredSet, at: u64,
+    ) -> Result<(), Error> {
+        if set.model != self.model { return Err(Error::Stale); }
+        self.scope.authorize(active, set, at)
+    }
     fn check(&mut self, d: Decision, _: &policy::RegisteredSet, now: u64) -> Result<(), Error> {
         let c = self.owner.context;
         if d.envelope.core_generation != c.core_generation
@@ -923,7 +1053,7 @@ impl policy::Executor for Executor<'_> {
                 return Err(Error::Busy);
             }
         }
-        validate_selection(self.owner, f, d.action, d.envelope.target, now)?;
+        self.scope.selection(self.owner, f, d.action, d.envelope.target, now)?;
         Ok(())
     }
     fn prepare(&mut self, plan: &Plan, _: u64) -> Result<(), Error> {
@@ -949,7 +1079,7 @@ impl policy::Executor for Executor<'_> {
             let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                 .ok_or(Error::Unsupported)?;
             (f.legal)(d.action, d.envelope.target, now)?;
-            validate_selection(self.owner, f, d.action, d.envelope.target, now)?;
+            self.scope.selection(self.owner, f, d.action, d.envelope.target, now)?;
             if bind_dependencies(self.owner, d.action, d.envelope.target, now)? != self.dependencies
             {
                 return Err(Error::Stale);
@@ -958,13 +1088,14 @@ impl policy::Executor for Executor<'_> {
         Ok(())
     }
     fn publish(&mut self, plan: &Plan, version: u64, at: u64) -> Result<(), Error> {
-        require_control(self.owner)?;
+        self.scope.authorize_executor(self.owner)?;
         if self.owner.prepared_count != plan.len() {
             return Err(Error::Conflict);
         }
         let mut stamps = [PolicyStamp::default(); 16];
         for (index, d) in plan.iter().enumerate() {
-            stamps[index] = PolicyStamp::new(
+            stamps[index] = PolicyStamp::for_action(
+                d.action,
                 version,
                 if d.action.one_shot() {
                     d.envelope
@@ -981,7 +1112,7 @@ impl policy::Executor for Executor<'_> {
             )?;
             let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                 .ok_or(Error::Unsupported)?;
-            validate_selection(self.owner, f, d.action, d.envelope.target, at)?;
+            self.scope.selection(self.owner, f, d.action, d.envelope.target, at)?;
         }
         let commit_ns = now();
         if commit_ns < at {
@@ -995,6 +1126,13 @@ impl policy::Executor for Executor<'_> {
         if commit_ns.saturating_sub(self.publication_started) > policy::PUBLICATION_BUDGET_NS {
             return Err(Error::Budget);
         }
+        for d in plan.iter() {
+            if d.envelope.model_hash != self.model.model_hash
+                || plan.header.active_model_generation != self.model.generation {
+                return Err(Error::Stale);
+            }
+        }
+        self.scope.commit(self.owner, self.model, plan, &stamps[..plan.len()], self.boot, commit_ns)?;
         for (index, d) in plan.iter().enumerate() {
             let slot = self.owner.prepared[index];
             let stamp = stamps[index];
@@ -1011,9 +1149,12 @@ impl policy::Executor for Executor<'_> {
                 state: ExecutionState::Pending,
                 execution_observed: false,
                 started: false,
+                first_entry_ns: None,
+                observed_ns: commit_ns,
                 published: commit_ns,
                 evidence: self.evidence,
                 job: self.job,
+                model: self.model,
                 dependencies: self.dependencies,
                 core_generation: d.envelope.core_generation,
                 ledger_generation: d.envelope.ledger_generation,
@@ -1028,6 +1169,23 @@ impl policy::Executor for Executor<'_> {
                 stamp.installed_until_ns,
                 ExecutionState::Pending,
             );
+        }
+        let mut concurrent = [ApplyId::default(); 16];
+        for (index, d) in plan.iter().enumerate() {
+            concurrent[index] = ApplyId { boot_epoch: self.boot,
+                controller_epoch: plan.header.controller_epoch, plan_seq: plan.header.plan_seq,
+                action_index: index as u16, target: d.envelope.target };
+        }
+        for (index, d) in plan.iter().enumerate() {
+            let _ = crate::learning_history::record_publish(crate::learning_history::Publish {
+                decision_seq: d.envelope.decision_seq, apply: concurrent[index], plan_version: version,
+                stamp: stamps[index], model: self.model, selected: d.candidate_index,
+                scores: &self.scores[..self.score_count], received_ns: self.publication_started,
+                published_ns: commit_ns, expires_local_ns: d.envelope.expires_local_ns,
+                active_until_local_ns: plan.header.active_until_local_ns,
+                approved_deadline_ns: commit_ns.saturating_add(execution_limit(d.action)),
+                concurrent: &concurrent[..plan.len()],
+            });
         }
         self.owner.prepared_count = 0;
         Ok(())
@@ -1069,8 +1227,10 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             let candidate = job.set.get(index).ok_or(Error::Range)?;
             let mut best = 0;
             let mut best_score = i16::MIN;
+            let mut scores = [0i16; 32];
             for i in 0..32 {
                 let score = ((output[8 + i / 4] >> (16 * (i % 4))) as u16) as i16;
+                scores[i] = score;
                 if i < job.set.len() {
                     if i == 0 || score > best_score {
                         best = i;
@@ -1131,12 +1291,16 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             }
             let mut executor = Executor {
                 owner: &mut s.owner,
-                evidence: job.evidence,
+                scope: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
+                model: job.set.model,
+                evidence: Some(job.evidence),
                 job: job.sequence,
                 boot: s.boot,
                 publication_started: begin,
                 wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 dependencies: job.dependencies,
+                scores,
+                score_count: job.set.len(),
             };
             let receipt = s.registry.submit_job(
                 publisher(job.controller),
@@ -1221,6 +1385,14 @@ pub fn abort(cpu_ns: u64) -> Result<(), Error> {
         Ok(())
     })
 }
+fn execution_limit(action: Action) -> u64 {
+    match action {
+        Action::ControlSet(_) => 200_000_000,
+        Action::RecoveryRecipe(_) => 1_000_000_000,
+        Action::Placement(_) => 4_000_000_000,
+        _ => 50_000_000,
+    }
+}
 pub fn poll(_at: u64) -> Result<(), Error> {
     with(|s| {
         // A control CPU may have completed publication since CPU0 captured
@@ -1240,8 +1412,8 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 s.owner.desired[i] = Some(d);
                 break;
             }
-            let f = s.owner.families[family_index(d.action.domain(), d.action.kind())?]
-                .ok_or(Error::Unsupported)?;
+            let family_slot = family_index(d.action.domain(), d.action.kind())?;
+            let f = s.owner.families[family_slot].ok_or(Error::Unsupported)?;
             let was_started = d.started;
             let dependency_status = if d.started {
                 Ok(())
@@ -1258,13 +1430,24 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     }
                 })
             };
-            let result = if let Err(error) = dependency_status {
-                Err(error)
-            } else if d.started {
-                (f.reconcile)(d.action, d.apply, d.stamp, at)
-            } else {
-                d.started = true;
-                (f.apply)(d.action, d.apply, d.stamp, at)
+            let mut actual_entry = None;
+            let result = if let Err(error) = dependency_status { Err(error) } else {
+                let mut cost = crate::learning_evidence::attempt(d.apply.target,
+                    learning::reward::CpuClass::ExecutorAction).ok().flatten();
+                let entered = now();
+                let result = if d.started {
+                    (f.reconcile)(d.action, d.apply, d.stamp, entered)
+                } else {
+                    actual_entry = Some(entered);
+                    d.first_entry_ns.get_or_insert(entered);
+                    d.started = true;
+                    (f.apply)(d.action, d.apply, d.stamp, entered)
+                };
+                let finished = now();
+                if let Some(cost) = cost.as_mut() {
+                    let _ = crate::learning_evidence::finish_attempt(cost, entered, finished);
+                }
+                result
             };
             d.state = match result {
                 Ok(state) => state,
@@ -1275,13 +1458,9 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 Err(Error::Io | Error::NotReady) => ExecutionState::Unknown,
                 Err(error) => ExecutionState::Failed(error),
             };
-            let deadline = match d.action {
-                Action::ControlSet(_) => 200_000_000,
-                Action::RecoveryRecipe(_) => 1_000_000_000,
-                Action::Placement(_) => 4_000_000_000,
-                _ => 50_000_000,
-            };
-            if !d.state.terminal() && at.saturating_sub(d.published) >= deadline {
+            let observed = now();
+            d.observed_ns = observed;
+            if !d.state.terminal() && observed.saturating_sub(d.published) >= execution_limit(d.action) {
                 if d.started {
                     d.state = ExecutionState::Unknown;
                 } else {
@@ -1290,6 +1469,11 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.state = ExecutionState::Failed(Error::Again);
                 }
             }
+            let _ = crate::learning_history::record_execution(crate::learning_history::Execution {
+                apply: d.apply, stamp: d.stamp, state: d.state, observed_ns: observed,
+                started_ns: actual_entry,
+                executor_generation: actual_entry.map(|_| s.owner.family_epochs[family_slot]),
+            });
             s.owner.desired[i] = Some(d);
             ADMISSION.publish(
                 i,
@@ -1302,11 +1486,13 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 d.state,
             );
             s.registry.reconcile(d.apply, d.stamp.version, d.state)?;
-            crate::domain_evidence::progress(d.evidence, d.job, d.stamp.version, d.state, at);
+            if let Some(evidence) = d.evidence {
+                crate::domain_evidence::progress(evidence, d.job, d.stamp.version, d.state, observed);
+            }
             let stability_result = s.owner.stability[i]
                 .as_mut()
                 .ok_or(Error::Stale)
-                .and_then(|guard| guard.observe_execution(d.stamp.version, d.action, d.state, at));
+                .and_then(|guard| guard.observe_execution(d.stamp.version, d.action, d.state, observed));
             if let Err(error) = stability_result {
                 s.registry.stop_optimization();
                 crate::domain_evidence::stability_failed(d.action.domain(), d.stamp.version, error);

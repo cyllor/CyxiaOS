@@ -12,6 +12,9 @@ use crate::domains::ObjectKey;
 use core::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
+pub mod init;
+pub use init::{CaptureInit, InitComplete, InitPiece, InitValue};
+
 pub const MAX_SOURCES: usize = 32;
 pub const MAX_OPEN: usize = 128;
 static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
@@ -83,20 +86,23 @@ pub struct Status {
     pub sealed: Option<Seal>,
 }
 #[derive(Clone, Copy)]
-struct SourceState {
+#[doc(hidden)]
+pub struct SourceState {
     source: Source,
     closed: bool,
     last_ns: u64,
 }
 #[derive(Clone, Copy)]
-struct Open {
+#[doc(hidden)]
+pub struct Open {
     serial: u64,
     source: usize,
     core: u16,
     start_ns: u64,
 }
 #[derive(Clone, Copy)]
-struct RequestState {
+#[doc(hidden)]
+pub struct RequestState {
     frozen: FrozenRequest,
     issued: bool,
     actual: RequestResult,

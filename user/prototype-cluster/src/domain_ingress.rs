@@ -4,7 +4,7 @@ use crate::abi::*;
 use cyxia_cluster_transport::tls::{Error as TlsError, PLAINTEXT_BUFFER, Session};
 use cyxia_prototype::{
     cluster::wire::Header,
-    domains::{Error, ObjectKey, PolicyStamp, platform::*},
+    domains::{Action, Error, ObjectKey, PolicyStamp, platform::*},
 };
 fn ns(ms: u64) -> Result<u64, Error> {
     ms.checked_mul(1_000_000).ok_or(Error::Overflow)
@@ -22,6 +22,29 @@ pub fn policy_stamp(p: PolicyWire) -> Result<PolicyStamp, Error> {
         snapshot_ns: p.snapshot_ns,
         installed_until_ns: p.installed_until_ns,
     })
+}
+/// Placement is an invocation, not an installed setting. Its immutable wire
+/// lease is zero; admission freshness and exact retries still use the stamp.
+pub fn accept_placement_policy(
+    previous: PolicyWire,
+    next: PolicyWire,
+    now_ns: u64,
+) -> Result<PolicyStamp, Error> {
+    let value = u16::try_from(next.value).map_err(|_| Error::Range)?;
+    if value > 2 {
+        return Err(Error::Range);
+    }
+    if previous.version == next.version && previous != next {
+        return Err(Error::Conflict);
+    }
+    let old = if previous.version == 0 {
+        PolicyStamp::default()
+    } else {
+        policy_stamp(previous)?
+    };
+    let stamp = policy_stamp(next)?;
+    old.accepts_action(Action::Placement(value), stamp, now_ns)?;
+    Ok(stamp)
 }
 pub fn receipt(
     p: PolicyWire,

@@ -219,6 +219,50 @@ fn main() {
         );
     }
     if env::var_os("CARGO_FEATURE_UNIFIED_RUNTIME").is_some() {
+        // The independent learning image uses the same no_std arithmetic crate
+        // as the host verifier. Its target directory is private to this build,
+        // so nested Cargo never waits for the outer kernel's target lock.
+        let learning_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../user/prototype-learning");
+        let learning_out = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let learning_target = learning_out.join("learning-target");
+        println!("cargo:rerun-if-changed={}", learning_root.display());
+        println!("cargo:rerun-if-changed=../crates/prototype/src/learning");
+        checked(
+            Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .args([
+                    "rustc",
+                    "--release",
+                    "--locked",
+                    "--offline",
+                    "--target",
+                    "aarch64-unknown-none-softfloat",
+                    "--manifest-path",
+                ])
+                .arg(learning_root.join("Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &learning_target)
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTFLAGS")
+                .arg("--")
+                .args([
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "link-arg=--build-id=none",
+                    "-C",
+                    "link-arg=-zmax-page-size=4096",
+                ])
+                .arg("-C")
+                .arg(format!(
+                    "link-arg=-T{}",
+                    learning_root.join("linker.ld").display()
+                )),
+        );
+        std::fs::copy(
+            learning_target.join("aarch64-unknown-none-softfloat/release/prototype-learning"),
+            learning_out.join("prototype-learning.elf"),
+        )
+        .expect("copy independent learning image");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_SERVICE_ELF");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");

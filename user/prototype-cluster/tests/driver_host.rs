@@ -321,9 +321,16 @@ fn native_local_fallback_is_durable_and_reboot_does_not_submit_again() {
 }
 #[test]
 fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
+    native_peer_selection(false);
+}
+#[test]
+fn native_peer_selection_rejects_leased_policy_before_a_fresh_zero_lease_invocation() {
+    native_peer_selection(true);
+}
+fn native_peer_selection(reject_nonzero_lease: bool) {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             use cyxia_prototype_cluster::abi::*;
             CTX.with(|c| *c.borrow_mut() = Context::default());
             let (mut a, mut b) = native_setup(1);
@@ -345,6 +352,7 @@ fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
             select(1, 0);
             b.connect([32; 32], 0).unwrap();
             let mut selected = None;
+            let mut rejected_turns = 0;
             for now in 0u64..2000 {
                 for (i, driver) in [(0, &mut a), (1, &mut b)] {
                     select(i, now);
@@ -360,7 +368,13 @@ fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
                             d.placement = PolicyWire {
                                 version: 2,
                                 snapshot_ns: now * 1_000_000,
-                                installed_until_ns: now * 1_000_000 + 10_000_000_000,
+                                // A placement is one invocation, so its wire
+                                // lease is zero even though the offer is leased.
+                                installed_until_ns: if reject_nonzero_lease {
+                                    now * 1_000_000 + 10_000_000_000
+                                } else {
+                                    0
+                                },
                                 value: 1,
                                 plan_seq: 2,
                                 controller_epoch: 1,
@@ -370,6 +384,38 @@ fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
                             d.placement_request_generation = f.waiting[0].request_generation;
                         });
                         selected = Some(i);
+                    } else if reject_nonzero_lease && selected == Some(i) && rejected_turns < 3 {
+                        assert_eq!(f.placement.version, 2);
+                        assert_eq!(f.placement.plan_seq, 2);
+                        assert_eq!(f.placement.outcome, DOMAIN_REJECTED);
+                        assert!(f.waiting.iter().any(|request| {
+                            request.request_id == f.placement.request_id
+                                && request.request_generation == f.placement.request_generation
+                        }));
+                        CTX.with(|c| {
+                            let c = c.borrow();
+                            // Drive the real queue and both protocol endpoints
+                            // for repeated rejected turns: no task may acquire
+                            // execution custody, including through LOCAL fallback.
+                            assert!(c.nodes.iter().all(|n| !n.reserved));
+                            assert_eq!(c.nodes.iter().map(|n| n.starts).sum::<usize>(), 0);
+                            assert_eq!(c.nodes.iter().map(|n| n.local_submits).sum::<usize>(), 0);
+                            assert!(
+                                !c.nodes.iter().flat_map(|n| &n.records)
+                                    .any(|record| record.starts_with(b"CXDP2"))
+                            );
+                        });
+                        rejected_turns += 1;
+                        if rejected_turns == 3 {
+                            CTX.with(|c| {
+                                let mut c = c.borrow_mut();
+                                let p = &mut c.nodes[i].domains.placement;
+                                p.version = 3;
+                                p.plan_seq = 3;
+                                p.snapshot_ns = now * 1_000_000;
+                                p.installed_until_ns = 0;
+                            });
+                        }
                     }
                 }
                 for from in 0..2 {
@@ -403,6 +449,12 @@ fn native_peer_selection_uses_real_quote_and_actual_started_custody() {
                 a.domain_feedback(2_000_000_000),
                 b.domain_feedback(2_000_000_000),
             ];
+            assert_eq!(rejected_turns, if reject_nonzero_lease { 3 } else { 0 });
+            assert_eq!(
+                feedback[i].placement.version,
+                if reject_nonzero_lease { 3 } else { 2 }
+            );
+            assert_eq!(feedback[i].placement.plan_seq, feedback[i].placement.version);
             assert_eq!(feedback[i].placement.outcome, DOMAIN_APPLIED);
             assert_eq!(feedback[i].placement.actual, 1);
             assert_eq!(feedback[1 - i].offer.outcome, DOMAIN_APPLIED);

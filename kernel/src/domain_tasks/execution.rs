@@ -1,5 +1,7 @@
 use super::memory::{Pages, copy_from, copy_to, frame_phys, frame_ptr, prepare, synchronize};
 use super::*;
+#[path = "lifecycle.rs"]
+mod lifecycle;
 
 struct Creator<'a> {
     tasks: &'a mut [Task; TASKS],
@@ -536,7 +538,10 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
     Ok(())
 }
 fn advance_admission(s: &mut State) -> Result<(), Error> {
-    for _ in 0..4 {
+    advance_admission_bounded(s, 4, LAUNCHES)
+}
+fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> Result<(), Error> {
+    for _ in 0..maximum {
         let layout = effective_layout(s);
         let mut backend = Creator {
             tasks: &mut s.tasks,
@@ -558,7 +563,10 @@ fn advance_admission(s: &mut State) -> Result<(), Error> {
             Some(_) => {}
         }
     }
-    for launch in &mut s.launches {
+    for _ in 0..cleanup {
+        let index = s.launch_cursor;
+        s.launch_cursor = (index + 1) % LAUNCHES;
+        let launch = &mut s.launches[index];
         if let Some(request) = launch.request
             && !matches!(
                 s.admission.query(request.caller, request.request_id),
@@ -624,167 +632,232 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     if !READY.load(Ordering::Acquire) || cpu::slot() != 0 {
         return;
     }
-    let _ = locked(|s| {
-        for slot in 0..64 {
-            if COMPLETE_READY[slot].load(Ordering::Acquire) {
-                let _ = complete_locked(s, slot);
-            }
-        }
-        for i in 0..TASKS {
-            if RETURN_PENDING[i].load(Ordering::Acquire)
-                && !s
-                    .active
-                    .iter()
-                    .flatten()
-                    .any(|a| a.dispatch.thread == s.tasks[i].key)
-            {
-                unsafe {
-                    process_return(
-                        s,
-                        i,
-                        &mut *core::ptr::addr_of_mut!(CONTEXTS)
-                            .cast::<user::Context>()
-                            .add(i),
-                    );
+    // One bounded owner piece per pass. A deferred piece retains its cursor;
+    // file/DMA waits run in service_file's separately billed caller segments.
+    let _ = service_segment(|| {
+        let external = locked(|s| {
+            let phase = s.service_phase;
+            s.service_phase = (phase + 1) % 9;
+            match phase {
+                0 => {
+                    for slot in 0..64 {
+                        if COMPLETE_READY[slot].load(Ordering::Acquire) {
+                            let _ = complete_locked(s, slot);
+                        }
+                    }
+                    // Expired blocked callers share the same bounded rotation
+                    // as real returns/receipts. Continuous activity from other
+                    // tasks cannot keep their deadline cleanup off the queue.
+                    let i = lifecycle::select::<TASKS>(s.lifecycle_cursor, now_ns(), |i| {
+                        lifecycle::View {
+                            occupied: !matches!(s.tasks[i].life, Life::Free | Life::Exiting),
+                            exiting: s.tasks[i].life == Life::Exiting,
+                            deadline_ns: s.tasks[i].deadline,
+                            return_pending: RETURN_PENDING[i].load(Ordering::Acquire),
+                            file_done: FILE_DONE[i].load(Ordering::Acquire),
+                            file_busy: FILE_BUSY[i].load(Ordering::Acquire),
+                        }
+                    });
+                    s.lifecycle_cursor = (i + 1) % TASKS;
+                    lifecycle_piece(s, i);
                 }
-            }
-            if FILE_DONE[i].swap(false, Ordering::AcqRel) {
-                FILE_BUSY[i].store(false, Ordering::Release);
-                if !FILE_PENDING[i].load(Ordering::Acquire) && s.tasks[i].life == Life::Waiting {
-                    s.tasks[i].life = Life::Ready;
-                    wake_task(s, i);
+                1 => {
+                    let _ = advance_admission_bounded(s, 1, 1);
                 }
-            }
-            if !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
-                && now_ns() >= s.tasks[i].deadline
-                && !FILE_BUSY[i].load(Ordering::Acquire)
-            {
-                s.tasks[i].exit_code = 110;
-                s.tasks[i].life = Life::Exiting;
-            }
-            if s.tasks[i].life == Life::Exiting {
-                let _ = cleanup(s, i);
-            }
-        }
-        let _ = advance_admission(s);
-        refresh_throttled(s, now_ns());
-        for i in 0..TASKS {
-            if s.tasks[i].life == Life::Free || s.tasks[i].life == Life::Exiting {
-                continue;
-            }
-            let _ = recipe_turn(s, i);
-            let can_step = s.vectors[i].as_ref().is_some_and(|v| !v.complete())
-                && abi::prepare_vector_leases(s, i).unwrap_or(false);
-            if let Some(vector) = s.vectors[i].as_mut()
-                && !vector.complete()
-                && can_step
-            {
-                let mut transport = abi::Transport {
-                    tasks: &s.tasks,
-                    validate: s.validate_file,
-                    stat: s.stat_file,
-                    ipc: &mut s.ipc,
-                    task_endpoint: s.task_endpoint,
-                    file_endpoint: s.file_endpoint,
-                    sequence: &mut s.service_sequence,
-                    lease: &mut s.vector_leases[i],
-                };
-                let _ = s.services.step(vector, now_ns(), &mut transport);
-            }
-            if !s.facts.vector_measured[i]
-                && s.vectors[i].as_ref().is_some_and(SubmitVector::complete)
-            {
-                s.facts
-                    .vector_latency
-                    .add(now_ns().saturating_sub(s.facts.vector_started[i]));
-                s.facts.vector_measured[i] = true;
-            }
-            if s.vectors[i].as_ref().is_some_and(SubmitVector::complete) {
-                let _ = abi::release_vector_leases(s, i);
-            }
-            if s.wake & (1u64 << i) != 0 {
-                s.wake &= !(1u64 << i);
-                if s.tasks[i].life == Life::Ready && (!s.tasks[i].optional || s.tasks[i].pending) {
-                    wake_task(s, i);
+                2 => {
+                    let next = (0..TASKS)
+                        .map(|n| (s.vector_cursor + n) % TASKS)
+                        .find(|&i| {
+                            !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
+                                && (s.vectors[i].as_ref().is_some_and(|v| !v.complete())
+                                    || s.wake & (1u64 << i) != 0
+                                    || s.tasks[i].recipe != 0 && !s.tasks[i].pending)
+                        });
+                    let i = next.unwrap_or(s.vector_cursor);
+                    s.vector_cursor = (i + 1) % TASKS;
+                    vector_piece(s, i);
                 }
+                3 => ipc_piece(s),
+                4 => memory_piece(s),
+                5 | 7 | 8 => {}
+                _ => metrics_piece(s),
             }
-        }
-        // A cancelled reserved cell may make a sender runnable without any
-        // queued message/dequeue event. Poll one actual endpoint independently
-        // of receiver activity and AI, including the separate recovery slots.
-        for offset in 0..TASKS {
-            let i = (s.cursor + offset) % TASKS;
-            if s.tasks[i].life == Life::Free || s.tasks[i].endpoint == ZERO {
-                continue;
-            }
-            let endpoint = s.tasks[i].endpoint;
-            s.cursor = (i + 1) % TASKS;
-            let _ = s.ipc.service_waiters(
-                endpoint,
-                now_ns(),
-                &mut abi::Mailbox {
-                    tasks: &s.tasks,
-                    wake: &mut s.wake,
-                    received: &mut [],
-                    used: 0,
-                },
-            );
-            break;
-        }
-        s.ipc.flush_notifications(&mut abi::Mailbox {
-            tasks: &s.tasks,
-            wake: &mut s.wake,
-            received: &mut [],
-            used: 0,
+            publish_evidence(s);
+            Ok(phase)
         });
-        let begin = now_ns();
-        memory::synchronize_cache(s);
-        let _ = s.memory.reclaim_step(
-            0,
-            now_ns(),
-            &mut Pages {
-                tasks: &s.tasks,
-                remote: s.remote,
-                load: None,
-            },
-        );
-        s.facts
-            .reclaim_ns
-            .add(now_ns(), now_ns().saturating_sub(begin));
-        let faults = s.memory.stats().faults;
-        s.facts
-            .faults
-            .add(now_ns(), faults.saturating_sub(s.facts.last_faults));
-        s.facts.last_faults = faults;
-        for ordinal in 0..32 {
-            if let Some(key) = s.ipc.endpoint_at(ordinal)
-                && let Ok(stats) = s.ipc.stats(key)
-            {
-                let i = (key.id - 1) as usize;
-                if s.facts.ipc_generation[i] != key.generation {
-                    s.facts.ipc_generation[i] = key.generation;
-                    s.facts.ipc_admitted[i] = 0;
-                    s.facts.ipc_messages[i] = Rate::EMPTY;
-                }
-                s.facts.ipc_messages[i].add(
-                    now_ns(),
-                    stats.admitted.saturating_sub(s.facts.ipc_admitted[i]),
-                );
-                s.facts.ipc_admitted[i] = stats.admitted;
-            }
+        if external == Ok(5) {
+            // This owner call only evicts clean, unpinned pages. Dirty writeback
+            // is progressed by the storage service with its own I/O callbacks.
+            let begin = now_ns();
+            let _ = crate::domain_storage::cache_reclaim_turn();
+            let elapsed = now_ns().saturating_sub(begin);
+            let _ = locked(|s| {
+                s.facts.reclaim_ns.add(now_ns(), elapsed);
+                record_cache_receipt(s, now_ns());
+                Ok(())
+            });
         }
-        publish_evidence(s);
-        Ok(())
-    });
-    let begin = now_ns();
-    let _ = crate::domain_storage::cache_reclaim_turn();
-    let elapsed = now_ns().saturating_sub(begin);
-    let _ = locked(|s| {
-        s.facts.reclaim_ns.add(now_ns(), elapsed);
-        Ok(())
+        if external == Ok(7) {
+            // Runs with this exact still-live kind-5 service reservation,
+            // outside the task gate. Safety work can restore an exact baseline
+            // even when the optional C1 worker's extra ledger is faulted.
+            // It neither acknowledges unknown numerical work nor frees pins.
+            let _ = crate::learning_session::safety_turn();
+        }
+        if external == Ok(8) {
+            // The registered, immutable service boundary consumes actual
+            // capture rows under this independently prepaid owner turn.
+            // Its cursor and any incomplete window survive a Busy return.
+            let _ = crate::service_windows::poll();
+        }
     });
     service_file(progress);
 }
+fn lifecycle_piece(s: &mut State, i: usize) {
+    if RETURN_PENDING[i].load(Ordering::Acquire)
+        && !s
+            .active
+            .iter()
+            .flatten()
+            .any(|a| a.dispatch.thread == s.tasks[i].key)
+    {
+        unsafe {
+            process_return(
+                s,
+                i,
+                &mut *core::ptr::addr_of_mut!(CONTEXTS)
+                    .cast::<user::Context>()
+                    .add(i),
+            );
+        }
+    }
+    if FILE_DONE[i].swap(false, Ordering::AcqRel) {
+        FILE_BUSY[i].store(false, Ordering::Release);
+        if !FILE_PENDING[i].load(Ordering::Acquire) && s.tasks[i].life == Life::Waiting {
+            s.tasks[i].life = Life::Ready;
+            wake_task(s, i);
+        }
+    }
+    if !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
+        && now_ns() >= s.tasks[i].deadline
+        && !FILE_BUSY[i].load(Ordering::Acquire)
+    {
+        s.tasks[i].exit_code = 110;
+        s.tasks[i].life = Life::Exiting;
+    }
+    if s.tasks[i].life == Life::Exiting {
+        let _ = cleanup(s, i);
+    }
+}
+fn vector_piece(s: &mut State, i: usize) {
+    if matches!(s.tasks[i].life, Life::Free | Life::Exiting) {
+        return;
+    }
+    let _ = recipe_turn(s, i);
+    let can_step = s.vectors[i].as_ref().is_some_and(|v| !v.complete())
+        && abi::prepare_vector_leases(s, i).unwrap_or(false);
+    if let Some(vector) = s.vectors[i].as_mut()
+        && !vector.complete()
+        && can_step
+    {
+        let mut transport = abi::Transport {
+            tasks: &s.tasks,
+            validate: s.validate_file,
+            stat: s.stat_file,
+            ipc: &mut s.ipc,
+            task_endpoint: s.task_endpoint,
+            file_endpoint: s.file_endpoint,
+            sequence: &mut s.service_sequence,
+            lease: &mut s.vector_leases[i],
+        };
+        let _ = s.services.step(vector, now_ns(), &mut transport);
+    }
+    if !s.facts.vector_measured[i] && s.vectors[i].as_ref().is_some_and(SubmitVector::complete) {
+        s.facts
+            .vector_latency
+            .add(now_ns().saturating_sub(s.facts.vector_started[i]));
+        s.facts.vector_measured[i] = true;
+    }
+    if s.vectors[i].as_ref().is_some_and(SubmitVector::complete) {
+        let _ = abi::release_vector_leases(s, i);
+    }
+    if s.wake & (1u64 << i) != 0 {
+        s.wake &= !(1u64 << i);
+        if s.tasks[i].life == Life::Ready && (!s.tasks[i].optional || s.tasks[i].pending) {
+            wake_task(s, i);
+        }
+    }
+}
+fn ipc_piece(s: &mut State) {
+    // Cancellation can release the only occupied cell without a dequeue.
+    // Polling real endpoints independently guarantees pending sender progress.
+    for offset in 0..TASKS {
+        let i = (s.cursor + offset) % TASKS;
+        if s.tasks[i].life == Life::Free || s.tasks[i].endpoint == ZERO {
+            continue;
+        }
+        let endpoint = s.tasks[i].endpoint;
+        s.cursor = (i + 1) % TASKS;
+        let _ = s.ipc.service_waiters(
+            endpoint,
+            now_ns(),
+            &mut abi::Mailbox {
+                tasks: &s.tasks,
+                wake: &mut s.wake,
+                received: &mut [],
+                used: 0,
+            },
+        );
+        break;
+    }
+    s.ipc.flush_notifications(&mut abi::Mailbox {
+        tasks: &s.tasks,
+        wake: &mut s.wake,
+        received: &mut [],
+        used: 0,
+    });
+}
+fn memory_piece(s: &mut State) {
+    let begin = now_ns();
+    memory::synchronize_cache(s);
+    let _ = s.memory.reclaim_step(
+        0,
+        now_ns(),
+        &mut Pages {
+            tasks: &s.tasks,
+            remote: s.remote,
+            load: None,
+        },
+    );
+    s.facts
+        .reclaim_ns
+        .add(now_ns(), now_ns().saturating_sub(begin));
+    let faults = s.memory.stats().faults;
+    s.facts
+        .faults
+        .add(now_ns(), faults.saturating_sub(s.facts.last_faults));
+    s.facts.last_faults = faults;
+}
+fn metrics_piece(s: &mut State) {
+    let ordinal = s.metrics_cursor;
+    s.metrics_cursor = (ordinal + 1) % 32;
+    if let Some(key) = s.ipc.endpoint_at(ordinal)
+        && let Ok(stats) = s.ipc.stats(key)
+    {
+        let i = (key.id - 1) as usize;
+        if s.facts.ipc_generation[i] != key.generation {
+            s.facts.ipc_generation[i] = key.generation;
+            s.facts.ipc_admitted[i] = 0;
+            s.facts.ipc_messages[i] = Rate::EMPTY;
+        }
+        s.facts.ipc_messages[i].add(
+            now_ns(),
+            stats.admitted.saturating_sub(s.facts.ipc_admitted[i]),
+        );
+        s.facts.ipc_admitted[i] = stats.admitted;
+    }
+}
+
 fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
     let key = s.tasks[i].key;
     let mut state = RunState::Runnable;
@@ -906,28 +979,32 @@ pub fn dispatch(slot: usize) -> bool {
     true
 }
 fn service_file(progress: &mut dyn FnMut()) {
-    let next = locked(|s| {
-        // A completed but undelivered receipt owns the file staging buffer.
-        // Deliver it before admitting another caller, regardless of slot order.
-        for priority in [true, false] {
-            for i in 0..TASKS {
-                if FILE_PENDING[i].load(Ordering::Acquire)
-                    && s.tasks[i].life == Life::Waiting
-                    && (!priority || crate::domain_file_abi::pending_delivery(s.tasks[i].key))
-                    && !s
-                        .active
-                        .iter()
-                        .flatten()
-                        .any(|a| a.dispatch.thread == s.tasks[i].key)
-                {
-                    FILE_PENDING[i].store(false, Ordering::Release);
-                    FILE_BUSY[i].store(true, Ordering::Release);
-                    return Ok(Some((i, s.tasks[i].key)));
+    let Some(next) = service_segment(|| {
+        locked(|s| {
+            // A completed but undelivered receipt owns the file staging buffer.
+            // Deliver it before admitting another caller, regardless of slot order.
+            for priority in [true, false] {
+                for i in 0..TASKS {
+                    if FILE_PENDING[i].load(Ordering::Acquire)
+                        && s.tasks[i].life == Life::Waiting
+                        && (!priority || crate::domain_file_abi::pending_delivery(s.tasks[i].key))
+                        && !s
+                            .active
+                            .iter()
+                            .flatten()
+                            .any(|a| a.dispatch.thread == s.tasks[i].key)
+                    {
+                        FILE_PENDING[i].store(false, Ordering::Release);
+                        FILE_BUSY[i].store(true, Ordering::Release);
+                        return Ok(Some((i, s.tasks[i].key)));
+                    }
                 }
             }
-        }
-        Ok(None)
-    });
+            Ok(None)
+        })
+    }) else {
+        return;
+    };
     let Ok(Some((i, key))) = next else {
         return;
     };

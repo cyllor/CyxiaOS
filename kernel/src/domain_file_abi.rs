@@ -209,7 +209,7 @@ fn authorize(owner: ObjectKey, f: &Frame) -> Result<usize, Error> {
     }
     Ok(at)
 }
-fn validate(owner: ObjectKey, address: u64, f: &Frame) -> Result<(), Error> {
+fn validate_shape(address: u64, f: &Frame) -> Result<(), Error> {
     if f.u64(OFF_MAGIC) != MAGIC
         || f.u16(OFF_VERSION) != VERSION
         || usize::from(f.u16(OFF_LENGTH)) != FRAME_BYTES
@@ -241,7 +241,6 @@ fn validate(owner: ObjectKey, address: u64, f: &Frame) -> Result<(), Error> {
     if op == READDIR && len < DIRENT_BYTES {
         return Err(Error::Range);
     }
-    domain_tasks::probe_user(owner, address, FRAME_BYTES, true)?;
     if uses_data && len != 0 {
         let data = f.u64(OFF_DATA);
         let end = data.checked_add(len as u64).ok_or(Error::Range)?;
@@ -251,9 +250,57 @@ fn validate(owner: ObjectKey, address: u64, f: &Frame) -> Result<(), Error> {
         if data < frame_end && address < end {
             return Err(Error::Format);
         }
-        domain_tasks::probe_user(owner, data, len, op != WRITE)?;
     }
     Ok(())
+}
+fn validate(owner: ObjectKey, address: u64, f: &Frame) -> Result<(), Error> {
+    validate_shape(address, f)?;
+    domain_tasks::probe_user(owner, address, FRAME_BYTES, true)?;
+    let op = f.u16(OFF_OPERATION);
+    let len = f.u32(OFF_DATA_LENGTH) as usize;
+    if matches!(op, READ | WRITE | READDIR) && len != 0 {
+        domain_tasks::probe_user(owner, f.u64(OFF_DATA), len, op != WRITE)?;
+    }
+    Ok(())
+}
+/// Only stopped, pending file requests can compete with background disk work.
+/// Inspect immutable copied frames and loaded inode/cache metadata; this does
+/// not run requests, consume request IDs, create handles, or issue disk I/O.
+pub(crate) fn pending_block_demand() -> Result<bool, Error> {
+    let _guard = acquire()?;
+    let requests = domain_tasks::pending_file_requests()?;
+    for (owner, address) in requests.into_iter().flatten() {
+        if pending_delivery(owner) {
+            continue;
+        }
+        let mut frame = Frame {
+            bytes: [0; FRAME_BYTES],
+        };
+        let demand = (|| {
+            domain_tasks::copyin(owner, address, &mut frame.bytes)?;
+            validate_shape(address, &frame)?;
+            authorize(owner, &frame)?;
+            let offset = frame.u64(OFF_OFFSET);
+            let length = frame.u32(OFF_DATA_LENGTH) as usize;
+            match frame.u16(OFF_OPERATION) {
+                // These real implementations refresh reserved metadata before
+                // pathname resolution, including a lookup of the root itself.
+                OPEN | STAT => Ok(true),
+                READ => storage::read_io_demand(handle(owner, &frame)?.1.file, offset, length),
+                WRITE => storage::write_io_demand(handle(owner, &frame)?.1.file, offset, length),
+                READDIR => storage::readdir_io_demand(handle(owner, &frame)?.1.file),
+                // Close, capability/stat-by-cap, and cache-only writes do no
+                // ordinary I/O. fsync/create/unlink use the separate Recovery path.
+                _ => Ok(false),
+            }
+        })();
+        match demand {
+            Ok(true) => return Ok(true),
+            Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => return Err(error),
+            Ok(false) | Err(_) => (), // Rejected/stale calls cannot require a block grant.
+        }
+    }
+    Ok(false)
 }
 fn run(
     owner: ObjectKey,

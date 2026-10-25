@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{features, model::MODEL_BYTES};
 use sha2::{Digest, Sha256};
+pub use super::seed::UNTRAINED_SEED0_BYTES;
 
 /// Operator/package ABI, independent of the outer Plan/Shared IPC ABI.
 pub const RUNTIME_ABI: u32 = 1;
@@ -171,6 +172,9 @@ pub struct SealedModel<'a> {
     manifest_hash: [u8; 32],
 }
 impl<'a> SealedModel<'a> {
+    pub(super) fn from_worker(bytes: &'a [u8; MODEL_BYTES], manifest: ModelManifest, manifest_hash: [u8; 32]) -> Self {
+        Self { bytes, manifest, manifest_hash }
+    }
     pub fn seal(
         bytes: &'a [u8; MODEL_BYTES],
         manifest: ModelManifest,
@@ -233,38 +237,16 @@ pub struct UntrainedSeed {
 impl UntrainedSeed {
     /// An explicit, deterministic starting point with action/target-sensitive
     /// frozen layers. No rewards, samples or trained provenance are invented.
-    pub fn new(seed: u64) -> Self {
-        let mut bytes = [0u8; MODEL_BYTES];
-        // Preserve contextual channels and, critically, the candidate action.
-        // All copied channels are non-negative normalized features. Small
-        // contextual weights cannot saturate away candidate distinctions.
-        let inputs = [
-            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 41, 42, 56, 58,
-        ];
-        for (row, input) in inputs.into_iter().enumerate() {
-            bytes[row * 64 + input] = 64;
-            bytes[2048 + row * 32 + row] = 64;
-            bytes[2560 + row] = if row == 12 {
-                64
-            } else if row == 13 {
-                16
-            } else {
-                1
-            };
-        }
-        bytes[14 * 64 + 57] = 16;
-        bytes[15 * 64 + 59] = 16;
-        // Seed variation is bounded and does not erase the action channel.
-        bytes[2560] = (1 + (seed & 3)) as u8;
-        Self { bytes, seed }
+    pub const fn new(seed: u64) -> Self {
+        Self { bytes: super::seed::untrained_seed_bytes(seed), seed }
     }
-    pub fn bytes(&self) -> &[u8; MODEL_BYTES] {
+    pub const fn bytes(&self) -> &[u8; MODEL_BYTES] {
         &self.bytes
     }
-    pub fn seed(&self) -> u64 {
+    pub const fn seed(&self) -> u64 {
         self.seed
     }
-    pub fn status(&self) -> Error {
+    pub const fn status(&self) -> Error {
         Error::Untrained
     }
 }

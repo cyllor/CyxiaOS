@@ -19,6 +19,24 @@ use cyxia_prototype::{
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 static BORROWED: AtomicBool = AtomicBool::new(false);
 static DEVICE_READY: AtomicBool = AtomicBool::new(false);
+static FOREGROUND_DEMAND: AtomicBool = AtomicBool::new(false);
+static BACKGROUND_DEMAND: AtomicBool = AtomicBool::new(false);
+/// CPU0 reports validated file requests and real dirty writeback demand. These
+/// are borrowing guards, not descriptor grants or completed I/O counters.
+pub(crate) fn set_foreground_demand(ready: bool) -> Result<(), DomainError> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(DomainError::Auth);
+    }
+    FOREGROUND_DEMAND.store(ready, Ordering::Release);
+    Ok(())
+}
+pub(crate) fn set_background_demand(ready: bool) -> Result<(), DomainError> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(DomainError::Auth);
+    }
+    BACKGROUND_DEMAND.store(ready, Ordering::Release);
+    Ok(())
+}
 #[path = "domain_platform/read_snapshot.rs"]
 mod read_snapshot;
 #[derive(Clone, Copy)]
@@ -165,6 +183,10 @@ impl NativeDisk {
         });
     }
     fn clock(&mut self, now: u64) {
+        self.scheduler.set_upstream_demand(
+            FOREGROUND_DEMAND.load(Ordering::Acquire),
+            BACKGROUND_DEMAND.load(Ordering::Acquire),
+        );
         if now / 100_000_000 != self.window {
             self.window = now / 100_000_000;
             self.busy_ns = 0;
@@ -212,6 +234,7 @@ impl NativeDisk {
         let start = Board.now_ns();
         loop {
             let now = Board.now_ns();
+            self.clock(now);
             match self.scheduler.reserve_transaction(self.class, bytes, now) {
                 Ok(p) => {
                     self.permit = Some(p);
@@ -753,6 +776,7 @@ pub fn prepare_background(bytes: u64, expected_version: u64, now: u64) -> Result
         if d.failed {
             return Err(DomainError::Io);
         }
+        d.clock(now);
         if let Some(grant) = d.background {
             if grant.policy_version == expected_version && grant.bytes == bytes {
                 return Ok(grant.policy_version);

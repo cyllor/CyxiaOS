@@ -47,8 +47,13 @@ extern "C" fn _start(mode: u64) -> ! {
         let input: [u64; native::INPUT_WORDS] =
             core::array::from_fn(|i| unsafe { (INPUT_VA as *const u64).add(i).read_volatile() });
         let mut output = [0u64; native::OUTPUT_WORDS];
-        let model =
-            model::Model::parse(core::hint::black_box(&RUNTIME_MODEL)).unwrap_or_else(|_| abort());
+        // EL1 maps a pinned immutable bank at this fixed RO address for this
+        // invocation. Volatile loads prevent the compiler from substituting
+        // the link-time standalone fixture when Active changes.
+        let parameters: [u8; MODEL_BYTES] = core::array::from_fn(|i| unsafe {
+            (MODEL_VA as *const u8).add(i).read_volatile()
+        });
+        let model = model::Model::parse(&parameters).unwrap_or_else(|_| abort());
         native::evaluate(&input, &model, &mut output).unwrap_or_else(|_| abort());
         for (i, value) in output.into_iter().enumerate() {
             unsafe {

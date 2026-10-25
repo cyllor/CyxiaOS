@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,15 +11,55 @@ import build_unified as build
 
 
 class UnifiedBuilder(unittest.TestCase):
+    def source_tree(self, entries):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
+        sources = {'Cargo.lock': 'lock', 'kernel/src/smp.rs': 'smp',
+                   'crates/arch-aarch64/src/user.rs': 'user', **entries}
+        for name, content in sources.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        return root
+
     def test_code_manifest_retains_build_and_crypto_but_excludes_mutable_evidence(self):
         entries={'Cargo.lock':'a','kernel/build.rs':'b','kernel/src/unified.rs':'c','user/prototype-cluster/vendor/ring/build.rs':'d','user/prototype-cluster/vendor/ring/pregenerated/a.S':'e','user/prototype-cluster/tools/build.sh':'f','user/prototype-cluster/vendor/ring/crypto/limbs/limbs.inl':'f1','user/prototype-cluster/vendor/ring/crypto/fipsmodule/ec/ecp_nistz384.inl':'f2','user/custom/model.weights':'f3','.cargo/config.toml':'f4','rust-toolchain.toml':'f5','docs/evidence.md':'g','tools/verify_unified.py':'h','tests/host/test_v13_disk.py':'i','crates/prototype/tests/foo.rs':'j'}
-        with patch.object(build,'manifest',return_value=entries):result=build.code_source_map()
-        self.assertEqual(set(result),set(list(entries)[:11]))
+        root = self.source_tree(entries)
+        result = build.code_source_map(root)
+        self.assertEqual(set(result), set(list(entries)[:11]) |
+                         {'kernel/src/smp.rs', 'crates/arch-aarch64/src/user.rs'})
+        for name, digest in result.items():
+            self.assertEqual(digest, hashlib.sha256((root / name).read_bytes()).hexdigest())
+
     def test_included_crypto_inline_mutation_changes_code_binding(self):
         name='user/prototype-cluster/vendor/ring/crypto/limbs/limbs.inl'
-        with patch.object(build,'manifest',return_value={name:'before'}):before=build.code_source_map()
-        with patch.object(build,'manifest',return_value={name:'after'}):after=build.code_source_map()
+        root = self.source_tree({name: 'before'})
+        before = build.code_source_map(root)
+        (root / name).write_text('after')
+        after = build.code_source_map(root)
         self.assertNotEqual(before,after)
+        self.assertNotEqual(before[name], after[name])
+
+    def test_missing_excluded_fixture_does_not_hide_missing_compiled_source(self):
+        fixture = 'crates/prototype/tests/fixture.bin'
+        compiled = 'user/custom/model.weights'
+        root = self.source_tree({fixture: 'test fixture', compiled: 'model'})
+        subprocess.run(['git', 'add', '.'], cwd=root, check=True)
+        (root / fixture).unlink()
+        self.assertIn(compiled, build.code_source_map(root))
+        (root / compiled).unlink()
+        with self.assertRaisesRegex(ValueError, 'missing, linked, or external'):
+            build.code_source_map(root)
+
+    def test_compiled_source_symlink_is_rejected(self):
+        root = self.source_tree({})
+        link = root / 'user/model.weights'
+        link.parent.mkdir()
+        link.symlink_to(root / 'Cargo.lock')
+        with self.assertRaisesRegex(ValueError, 'missing, linked, or external'):
+            build.code_source_map(root)
     def test_identity_metadata_checks_actual_public_pin_without_private_bytes(self):
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp);public=bytes(range(32));peer=bytes(range(32,64))

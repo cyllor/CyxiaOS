@@ -336,6 +336,19 @@ pub struct ValidatedCandidate<'a> {
     registration_hash: [u8; 32],
 }
 impl<'a> ValidatedCandidate<'a> {
+    pub(super) fn from_worker(
+        model: SealedModel<'a>,
+        comparison: Comparison,
+        parent_hash: [u8; 32],
+        registration_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            model,
+            comparison,
+            parent_hash,
+            registration_hash,
+        }
+    }
     pub fn register(
         old: &[u8; MODEL_BYTES],
         candidate: SealedModel<'a>,
@@ -387,6 +400,29 @@ impl<'a> ValidatedCandidate<'a> {
     }
     pub fn model(&self) -> &SealedModel<'a> {
         &self.model
+    }
+    /// Move this exact validated identity to an immutable copy owned by a
+    /// different bank loan. This cannot validate new parameters or a new
+    /// manifest; the existing independent validation proof is preserved.
+    pub fn rebind<'b>(
+        &self,
+        frozen: &'b [u8; MODEL_BYTES],
+    ) -> Result<ValidatedCandidate<'b>, Error> {
+        if frozen != self.model.bytes()
+            || <[u8; 32]>::from(Sha256::digest(frozen)) != self.model.manifest().parameters_hash
+        {
+            return Err(Error::Evidence);
+        }
+        Ok(ValidatedCandidate {
+            model: SealedModel::from_worker(
+                frozen,
+                self.model.manifest().clone(),
+                self.model.hash(),
+            ),
+            comparison: self.comparison,
+            parent_hash: self.parent_hash,
+            registration_hash: self.registration_hash,
+        })
     }
     pub fn comparison(&self) -> Comparison {
         self.comparison

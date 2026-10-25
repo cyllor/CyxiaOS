@@ -6,12 +6,42 @@ pub struct TargetFeatures {
     pub values: [Option<u64>; 4],
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub const DOMAIN_PRESENT_ALL: u8 = 0b1111;
+
+/// An absent measurement is distinct from a measured zero. Adapters must
+/// leave absent values at zero and preserve this mask through inference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DomainObservation {
+    pub values: [u64; 4],
+    pub present: u8,
+}
+impl DomainObservation {
+    pub const fn complete(values: [u64; 4]) -> Self {
+        Self {
+            values,
+            present: DOMAIN_PRESENT_ALL,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawFeatures {
     pub common: [u64; 8],
     pub domain: [u64; 4],
+    pub domain_present: u8,
     pub target: TargetFeatures,
     pub control_capacity: Option<u64>,
+}
+impl Default for RawFeatures {
+    fn default() -> Self {
+        Self {
+            common: [0; 8],
+            domain: [0; 4],
+            domain_present: DOMAIN_PRESENT_ALL,
+            target: TargetFeatures::default(),
+            control_capacity: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +83,24 @@ pub fn normalize(value: u64, upper: u64) -> Result<(i16, bool), Error> {
 
 pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
     action.validate()?;
+    if raw.domain_present & !DOMAIN_PRESENT_ALL != 0
+        || raw
+            .domain
+            .iter()
+            .enumerate()
+            .any(|(i, value)| raw.domain_present & (1 << i) == 0 && *value != 0)
+    {
+        return Err(Error::Format);
+    }
+    // A fresh local placement request needs its queue age. Peer metrics are
+    // required only for REMOTE; every other family still requires all four.
+    let required = match action {
+        Action::Placement(0 | 2) => 0b1000,
+        _ => DOMAIN_PRESENT_ALL,
+    };
+    if raw.domain_present & required != required {
+        return Err(Error::NotReady);
+    }
     if raw.common[7] > 1
         || (action.domain() == 6 && raw.domain[3] > 1)
         || raw.target.values[3].is_some_and(|v| v > 1)
@@ -76,11 +124,13 @@ pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
         set(16 + i, raw.common[i], COMMON_LIMITS[i])?;
     }
     for i in 0..4 {
-        set(
-            24 + i,
-            raw.domain[i],
-            DOMAIN_LIMITS[usize::from(action.domain() - 1)][i],
-        )?;
+        if raw.domain_present & (1 << i) != 0 {
+            set(
+                24 + i,
+                raw.domain[i],
+                DOMAIN_LIMITS[usize::from(action.domain() - 1)][i],
+            )?;
+        }
     }
     let (a1, h1, a2, h2) = match action {
         Action::ControlSet(mask) => (
@@ -117,7 +167,9 @@ pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
         }
     }
     for i in 0..4 {
-        out.values[32 + i] = 256;
+        if raw.domain_present & (1 << i) != 0 {
+            out.values[32 + i] = 256;
+        }
     }
     out.values[48] = 256;
     out.values[49] = 256;

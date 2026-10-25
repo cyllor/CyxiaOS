@@ -10,6 +10,25 @@ static TARGET: AtomicU64 = AtomicU64::new(1);
 static JOB_CPU: AtomicU64 = AtomicU64::new(0);
 static FAILED_CPUS: AtomicU64 = AtomicU64::new(0);
 static CONTROLLER_EPOCH: AtomicU64 = AtomicU64::new(1);
+static OWNER_CONTEXT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+// The exact target accompanies the real stop operation, published before its
+// CPU2 notification. It is not a duration or a fabricated stop receipt.
+static STOP_MEASURE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(super) fn learning_context() -> Result<(u64, u64), DomainError> {
+    let first = OWNER_CONTEXT[0].load(Ordering::Acquire);
+    if first == 0 || first & 1 != 0 {
+        return Err(DomainError::NotReady);
+    }
+    let core = OWNER_CONTEXT[1].load(Ordering::Acquire);
+    let task = OWNER_CONTEXT[2].load(Ordering::Acquire);
+    let ledger = OWNER_CONTEXT[3].load(Ordering::Acquire);
+    let actual = crate::domain_tasks::control_owner_context(1)?;
+    if first != OWNER_CONTEXT[0].load(Ordering::Acquire) || actual != (core, task) {
+        return Err(DomainError::NotReady);
+    }
+    Ok((core, ledger))
+}
+
 static STARTED_JOBS: AtomicU64 = AtomicU64::new(0);
 static RESULT_VERSION: AtomicU64 = AtomicU64::new(0);
 #[repr(C, align(64))]
@@ -22,6 +41,12 @@ pub(super) fn ready() -> bool {
     READY.load(Ordering::Acquire)
 }
 
+pub(super) fn capture_owner(slot: usize) -> cyxia_prototype::domains::ObjectKey {
+    cyxia_prototype::domains::ObjectKey {
+        id: 0x4354_524c_0000 + slot as u64,
+        generation: CONTROLLER_EPOCH.load(Ordering::Acquire),
+    }
+}
 pub(super) fn ns(ticks: u64) -> u64 {
     ((u128::from(ticks) * 1_000_000_000) / u128::from(timer::frequency())).min(u128::from(u64::MAX))
         as u64
@@ -48,6 +73,9 @@ enum Completion {
 pub(super) struct WorkerState {
     bill: Option<Bill>,
     completion: Option<Completion>,
+    model: Option<crate::domain_control::NativeModelPin>,
+    model_mapped: bool,
+    capture: Option<crate::learning_evidence::OwnerAttempt>,
     probe: u8,
     probe_started: u64,
     probing: bool,
@@ -65,6 +93,9 @@ impl WorkerState {
         Self {
             bill: None,
             completion: None,
+            model: None,
+            model_mapped: false,
+            capture: None,
             probe: 0,
             probe_started: 0,
             probing: false,
@@ -181,13 +212,17 @@ fn conclude(worker: &mut Worker, completion: Completion) {
         RESULT_ESR.store(context.esr, Ordering::Relaxed);
     }
     worker.context = None;
+    if worker.native.model_mapped {
+        model_mapping(cpu::slot(), None);
+        worker.native.model_mapped = false;
+    }
     worker.native.in_job = false;
     worker.native.publish_pending = false;
     worker.native.abort_pending = false;
     worker.native.completion = Some(completion);
 }
 fn publish_completion(worker: &mut Worker) {
-    if worker.native.bill.is_some() {
+    if worker.native.bill.is_some() || worker.native.model.is_some() || worker.native.model_mapped {
         return;
     }
     let Some(completion) = worker.native.completion.take() else {
@@ -205,18 +240,56 @@ fn publish_completion(worker: &mut Worker) {
     // No consumer or ownership handoff observes completion before settlement.
     REQUEST.store(state, Ordering::Release);
 }
+fn model_mapping(slot: usize, physical: Option<u64>) {
+    // This leaf's sole C owner has stopped its EL0 context. Revocation reaches
+    // the local TLB before the immutable bank pin can be released.
+    unsafe {
+        let leaf = &mut *core::ptr::addr_of_mut!(LEAVES)
+            .cast::<Page>()
+            .add(slot * 2 + 1);
+        leaf.0[abi::MODEL_VA as usize / 4096] = physical.map_or(0, |address| {
+            mmu::encode_user_leaf(PhysAddr(address), false, false).expect("pinned model page")
+        });
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+}
+fn release_model(worker: &mut Worker) -> bool {
+    if worker.context.is_some() || worker.native.in_job || worker.native.model_mapped {
+        return false;
+    }
+    let Some(pin) = worker.native.model.as_ref() else {
+        return true;
+    };
+    match crate::domain_control::release_job_model(pin) {
+        Ok(()) => {
+            worker.native.model = None;
+            true
+        }
+        Err(DomainError::Busy | DomainError::Again | DomainError::NotReady) => false,
+        Err(_) => {
+            fail_worker(worker);
+            false
+        }
+    }
+}
 fn clear_private(slot: usize) {
     unsafe {
         let output = if slot == 1 {
-            core::ptr::addr_of_mut!(OUTPUT)
+            output_ptr(1)
         } else {
-            core::ptr::addr_of_mut!(SECOND_OUTPUT)
+            output_ptr(2)
         };
         (*output).0.fill(0);
         let stack = if slot == 1 {
-            core::ptr::addr_of_mut!(STACK_PAGES)
+            stack_ptr(1)
         } else {
-            core::ptr::addr_of_mut!(SECOND_STACK)
+            stack_ptr(2)
         };
         for n in 0..8 {
             (*stack.cast::<Page>().add(n)).0.fill(0);
@@ -237,9 +310,9 @@ fn root_return(worker: &mut Worker, slot: usize) {
     // private output page, and CPU0 never writes either page after startup.
     let output: &[u64; 512] = unsafe {
         let page = if slot == 1 {
-            core::ptr::addr_of!(OUTPUT)
+            output_ptr(1)
         } else {
-            core::ptr::addr_of!(SECOND_OUTPUT)
+            output_ptr(2)
         };
         &(*page).0
     };
@@ -263,6 +336,13 @@ fn root_return(worker: &mut Worker, slot: usize) {
     // detects an overrun. Its existing executor obligations cannot be undone.
     conclude(worker, Completion::Reply(result.unwrap_or(0)));
 }
+/// Candidate encoding has sizeable bounded scratch. Its lifetime must not
+/// become the permanent frame of the sibling learning/validation dispatch.
+#[inline(never)]
+fn next_input(controller: u64) -> Result<Option<[u64; 512]>, DomainError> {
+    crate::domain_control::next(controller)
+}
+#[inline(never)]
 fn run_turn(
     worker: &mut Worker,
     credit: cyxia_prototype::domains::tasks::ControlCredit,
@@ -270,6 +350,13 @@ fn run_turn(
 ) {
     let slot = cpu::slot();
     let now = ns(timer::ticks());
+    if worker.native.completion.is_some() && !worker.native.in_job {
+        // step() settled the preceding context bill. This separate prepaid
+        // owner piece releases only the already revoked immutable bank pin.
+        worker.native.phase(8);
+        let _ = release_model(worker);
+        return;
+    }
     if worker.native.in_job && now.saturating_sub(worker.native.job_started) >= WALL_NS {
         worker.native.abort_pending = true;
     }
@@ -324,7 +411,7 @@ fn run_turn(
         worker.native.probing = true;
         worker.native.probe_started = now;
     }
-    if worker.probed && worker.context.is_none() {
+    if worker.probed && worker.context.is_none() && !worker.native.in_job {
         if TARGET.load(Ordering::Acquire) != slot as u64
             || REQUEST
                 .compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed)
@@ -336,7 +423,7 @@ fn run_turn(
         worker.native.cpu_ns = 0;
         REQUEST_START.store(timer::ticks(), Ordering::Relaxed);
         worker.native.phase(3);
-        let input = match crate::domain_control::next(CONTROLLER_EPOCH.load(Ordering::Acquire)) {
+        let input = match next_input(CONTROLLER_EPOCH.load(Ordering::Acquire)) {
             Ok(Some(input)) => input,
             _ => {
                 conclude(worker, Completion::Empty);
@@ -350,14 +437,45 @@ fn run_turn(
         let copy_start = timer::ticks();
         unsafe {
             let page = if slot == 1 {
-                core::ptr::addr_of_mut!(INPUT)
+                input_ptr(1)
             } else {
-                core::ptr::addr_of_mut!(SECOND_INPUT)
+                input_ptr(2)
             };
             (*page).0.copy_from_slice(&input);
             core::arch::asm!("dsb ish", options(nostack));
         }
         clear_private(slot);
+        worker.native.cpu_ns = worker
+            .native
+            .cpu_ns
+            .saturating_add(ns(timer::ticks() - copy_start));
+    }
+    if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
+        let preparation = timer::ticks();
+        let input = unsafe { &(*input_ptr(slot)).0 };
+        if worker.native.model.is_none() {
+            let result = crate::domain_control::pin_job_model(input[2], input[3]);
+            if result.is_err() {
+                // A retry is real protected preparation CPU, even when no
+                // model capability has been acquired yet. Keep it in the
+                // same encode/infer/decode bill as the eventual success.
+                worker.native.cpu_ns = worker
+                    .native
+                    .cpu_ns
+                    .saturating_add(ns(timer::ticks() - preparation));
+            }
+            match result {
+                Ok(pin) => worker.native.model = Some(pin),
+                Err(DomainError::Busy | DomainError::Again | DomainError::NotReady) => return,
+                Err(_) => {
+                    worker.native.abort_pending = true;
+                    return;
+                }
+            }
+        }
+        let pin = worker.native.model.as_ref().expect("owned job model");
+        model_mapping(slot, Some(pin.physical_address()));
+        worker.native.model_mapped = true;
         worker.context = Some(fresh(if FAULT_MODE == 1 && input[2] == 5 {
             5
         } else {
@@ -366,7 +484,7 @@ fn run_turn(
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
-            .saturating_add(ns(timer::ticks() - copy_start));
+            .saturating_add(ns(timer::ticks() - preparation));
     }
     // Account encoding and private-page preparation before choosing a slice.
     // A turn with less than the full return envelope yields without entering EL0.
@@ -406,12 +524,16 @@ fn charge_turn(
 ) {
     let end = timer::ticks();
     let actual = ns(end - begin);
+    if let Some(mut capture) = worker.native.capture.take() {
+        let _ = crate::learning_evidence::finish_attempt(&mut capture, ns(begin), ns(end));
+    }
     worker.window = credit.window;
     worker.charged = credit
         .control_total_ns
         .saturating_sub(credit.reserved_ns)
         .saturating_add(actual);
     CONTROL_TICKS.fetch_add(end - begin, Ordering::Relaxed);
+    learning::mandatory(&mut worker.extra, credit.started_ns, actual);
     worker.native.bill = Some(Bill {
         credit,
         body_started: ns(begin),
@@ -425,7 +547,11 @@ fn charge_turn(
 }
 pub(super) fn step(worker: &mut Worker) {
     let slot = cpu::slot();
-    if !matches!(slot, 1 | 2) || !READY.load(Ordering::Acquire) || !settle(worker) {
+    if !matches!(slot, 1 | 2)
+        || !READY.load(Ordering::Acquire)
+        || !settle(worker)
+        || !learning::settle(&mut worker.extra)
+    {
         return;
     }
     publish_completion(worker);
@@ -437,13 +563,25 @@ pub(super) fn step(worker: &mut Worker) {
     if worker.probed
         && worker.context.is_none()
         && !worker.native.in_job
+        && worker.native.completion.is_none()
+        && worker.native.model.is_none()
         && (REQUEST.load(Ordering::Acquire) != 1 || TARGET.load(Ordering::Acquire) != slot as u64)
     {
+        learning::step(&mut worker.extra);
+        return;
+    }
+    if !learning::allow_mandatory(&worker.extra, PREPAY_NS, ns(timer::ticks())) {
         return;
     }
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, false) else {
         return;
     };
+    worker.native.capture = crate::learning_evidence::attempt(
+        capture_owner(cpu::slot()),
+        cyxia_prototype::learning::reward::CpuClass::Policy,
+    )
+    .ok()
+    .flatten();
     let begin = timer::ticks();
     worker.native.phase = 0;
     worker.native.phase_mask = 0;
@@ -455,7 +593,7 @@ pub(super) fn step(worker: &mut Worker) {
 /// A closed gate never substitutes for settlement or cancellation of the
 /// original root job. Only its actual C owner can issue this abort.
 pub(super) fn stop_ready(worker: &mut Worker) -> bool {
-    if !settle(worker) {
+    if !settle(worker) || !learning::quiescent(&mut worker.extra) {
         return false;
     }
     publish_completion(worker);
@@ -463,6 +601,12 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
         let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
             return false;
         };
+        worker.native.capture = crate::learning_evidence::attempt(
+            capture_owner(cpu::slot()),
+            cyxia_prototype::learning::reward::CpuClass::Policy,
+        )
+        .ok()
+        .flatten();
         let begin = timer::ticks();
         worker.native.phase = 0;
         worker.native.phase_mask = 0;
@@ -473,7 +617,22 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
             return false;
         }
     }
-    true
+    if worker.native.model.is_some() {
+        let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
+            return false;
+        };
+        worker.native.capture = crate::learning_evidence::attempt(
+            capture_owner(cpu::slot()),
+            cyxia_prototype::learning::reward::CpuClass::Policy,
+        )
+        .ok()
+        .flatten();
+        let begin = timer::ticks();
+        worker.native.phase(8);
+        let _ = release_model(worker);
+        charge_turn(worker, credit, begin);
+    }
+    worker.native.model.is_none() && worker.native.bill.is_none()
 }
 
 #[derive(Clone, Copy)]
@@ -496,6 +655,37 @@ pub(super) struct CoordinatorState {
     business_ns: u64,
     control_ratio: u64,
     business_ratio: u64,
+}
+pub(super) fn publish_stop_measure(operation: u64, state: &CoordinatorState) {
+    STOP_MEASURE[0].store(0, Ordering::Release);
+    if let Some(action) = state.core {
+        STOP_MEASURE[1].store(action.apply.target.id, Ordering::Relaxed);
+        STOP_MEASURE[2].store(action.apply.target.generation, Ordering::Relaxed);
+        STOP_MEASURE[0].store(operation, Ordering::Release);
+    }
+}
+pub(super) fn measure_stop_tail<R>(operation: u64, body: impl FnOnce() -> R) -> R {
+    let first = STOP_MEASURE[0].load(Ordering::Acquire);
+    let owner = cyxia_prototype::domains::ObjectKey {
+        id: STOP_MEASURE[1].load(Ordering::Relaxed),
+        generation: STOP_MEASURE[2].load(Ordering::Relaxed),
+    };
+    // A missing/mixed tag remains missing evidence during a real replay; it
+    // cannot silently borrow a different operation's owner registration.
+    let owner =
+        if first == operation && first != 0 && STOP_MEASURE[0].load(Ordering::Acquire) == first {
+            owner
+        } else {
+            cyxia_prototype::domains::ObjectKey {
+                id: 0,
+                generation: 0,
+            }
+        };
+    crate::learning_evidence::measure(
+        owner,
+        cyxia_prototype::learning::reward::CpuClass::ExecutorAction,
+        body,
+    )
 }
 impl CoordinatorState {
     pub(super) fn new(now: u64) -> Self {
@@ -534,9 +724,10 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
         }
     }
     let s = c.owner.snapshot();
+    let task_generation = crate::domain_tasks::resource_generation()?;
     let ledger_generation = s
         .ledger_generation
-        .checked_add(crate::domain_tasks::resource_generation()?)
+        .checked_add(task_generation)
         .ok_or(DomainError::Overflow)?;
     put(61, 3);
     let healthy = s.online.bits()
@@ -614,6 +805,15 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
             u64::from(draining != 0),
         ],
     })?;
+    let sequence = OWNER_CONTEXT[0]
+        .load(Ordering::Relaxed)
+        .checked_add(2)
+        .ok_or(DomainError::Overflow)?;
+    OWNER_CONTEXT[0].store(sequence - 1, Ordering::Release);
+    OWNER_CONTEXT[1].store(s.core_generation, Ordering::Relaxed);
+    OWNER_CONTEXT[2].store(task_generation, Ordering::Relaxed);
+    OWNER_CONTEXT[3].store(ledger_generation, Ordering::Relaxed);
+    OWNER_CONTEXT[0].store(sequence, Ordering::Release);
     c.native.context_at = now;
     put(61, 8);
     READY.store(true, Ordering::Release);
@@ -631,9 +831,16 @@ fn core_turn(c: &mut Coordinator, tick: u64, now: u64) {
             });
         }
     }
-    let Some(mut action) = c.native.core else {
+    let Some(action) = c.native.core else {
         return;
     };
+    crate::learning_evidence::measure(
+        action.apply.target,
+        cyxia_prototype::learning::reward::CpuClass::ExecutorAction,
+        || core_action_turn(c, tick, now, action),
+    );
+}
+fn core_action_turn(c: &mut Coordinator, tick: u64, now: u64, mut action: CoreAction) {
     if action.result.is_none() && !action.started {
         let state = c.owner.snapshot();
         if action.target == state.control.bits()

@@ -212,6 +212,90 @@ fn exact_send_backpressure_does_not_enqueue_any_prefix() {
 fn native_stack_arp_tcp_fragmentation_and_backpressure() {
     tcp_roundtrip(false);
 }
+
+#[test]
+fn deferred_cpu_turn_preserves_stream_and_terminal_reconnect_backoff() {
+    use cyxia_cluster_transport::tcp::{State, reconnect_due};
+    let link = Rc::new(RefCell::new(Link::default()));
+    let (mut arx, mut atx, mut brx, mut btx) = (
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+        [0; BUFFER_SIZE],
+    );
+    let (mut sa, mut sb) = ([Storage::EMPTY], [Storage::EMPTY]);
+    let mut a = Tcp::new(
+        TestPort {
+            link: link.clone(),
+            a: true,
+        },
+        config(true),
+        0,
+        &mut arx,
+        &mut atx,
+        &mut sa,
+    )
+    .unwrap();
+    let mut b = Tcp::new(
+        TestPort {
+            link: link.clone(),
+            a: false,
+        },
+        config(false),
+        0,
+        &mut brx,
+        &mut btx,
+        &mut sb,
+    )
+    .unwrap();
+    b.listen().unwrap();
+    a.connect().unwrap();
+    for ms in 0..20 {
+        a.poll(ms).unwrap();
+        b.poll(ms).unwrap();
+    }
+    let first = [0x16; 196];
+    a.send_exact(&first).unwrap();
+    let queued = a.observation().queued_bytes;
+    let frames = {
+        let l = link.borrow();
+        (l.a.len(), l.b.len())
+    };
+    // This is the broker's no-credit path. Reading state must neither make
+    // POLL report a disconnect nor silently advance unbilled device work.
+    for elapsed in 0..1000 {
+        assert_eq!(a.state(), Ok(State::Established));
+        assert_eq!(b.state(), Ok(State::Established));
+        assert!(!reconnect_due(a.state(), elapsed, true));
+        assert_eq!(a.observation().queued_bytes, queued);
+    }
+    assert_eq!(
+        {
+            let l = link.borrow();
+            (l.a.len(), l.b.len())
+        },
+        frames
+    );
+    let mut received = Vec::new();
+    for ms in 1020..1100 {
+        a.poll(ms).unwrap();
+        b.poll(ms).unwrap();
+        let mut out = [0; 97];
+        if let Ok(n) = b.receive_tls(&mut out) {
+            received.extend_from_slice(&out[..n]);
+        }
+    }
+    assert_eq!(received, first);
+    a.close(1100);
+    let since = 1100;
+    for now in 1100..2100 {
+        assert_eq!(a.state(), Err(Error::Closed));
+        assert!(!reconnect_due(a.state(), now - since, true));
+    }
+    // Skipped CPU turns retain the true terminal state and its original
+    // backoff; WouldBlock here used to reset it forever in the native broker.
+    assert!(reconnect_due(a.state(), 2100 - since, true));
+}
 #[test]
 fn tcp_retransmits_a_dropped_syn() {
     tcp_roundtrip(true);

@@ -4,9 +4,11 @@ use crate::unified::abi::{self, DomainFeedback, PolicyReceiptWire, PolicyWire, S
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_prototype::{
     domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp},
-    features::TargetFeatures,
+    features::{DomainObservation, TargetFeatures},
     policy::ExecutionState,
 };
+mod dependencies;
+mod placement_legal;
 
 #[derive(Clone, Copy)]
 struct Desired {
@@ -139,12 +141,14 @@ fn network_dependencies(
     {
         return Err(Error::Stale);
     }
-    let (epoch, target) = inspect_view(|view| view.network.ok_or(Error::NotReady))?;
-    // The snapshot gate is released before consulting the actual endpoint
-    // owner, so it never nests an executor's gate under the read projection.
-    if crate::domain_tasks::network_key(epoch)? != target {
-        return Err(Error::Stale);
-    }
+    let published = inspect_view(|view| view.network.ok_or(Error::NotReady))?;
+    // The read gate is released first. C consumes CPU0's bounded-freshness
+    // identity without entering a CPU0-only owner; CPU0 still checks directly.
+    let target = dependencies::endpoint(
+        published,
+        cyxia_arch_aarch64::cpu::slot() == 0,
+        crate::domain_tasks::network_key,
+    )?;
     Ok([
         Some(crate::domain_control::Prerequisite { domain: 5, target }),
         None,
@@ -267,37 +271,26 @@ fn target_in(view: &ReadView, domain: u16, kind: u16, ordinal: usize) -> Option<
     };
     Some(ObjectKey { id, generation: 1 })
 }
-fn measurements(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
+fn measurements(domain: u16, key: ObjectKey) -> Result<DomainObservation, Error> {
     inspect_view(|view| {
         let f = &view.feedback;
-        let (bit, mut values) = match domain {
+        let now = crate::domain_platform::now_ns() / 1_000_000;
+        if domain == 16
+            && key != (ObjectKey { id: abi::OFFER_SERVICE_ID, generation: 1 })
+        {
+            return placement_legal::observation(key, f, now);
+        }
+        let (bit, values) = match domain {
             10 => (1, f.network),
             12 => (2, f.security),
             16 => (4, f.cluster),
             _ => return Err(Error::Unsupported),
         };
-        let now = crate::domain_platform::now_ns() / 1_000_000;
         if f.measurement_valid & bit == 0 || now < f.measurement_ms || now - f.measurement_ms > 100
         {
             return Err(Error::NotReady);
         }
-        if domain == 16
-            && key
-                != (ObjectKey {
-                    id: abi::OFFER_SERVICE_ID,
-                    generation: 1,
-                })
-        {
-            values[3] = f
-                .waiting
-                .iter()
-                .find(|request| {
-                    request.request_id == key.id && request.request_generation == key.generation
-                })
-                .ok_or(Error::Stale)?
-                .queued_us;
-        }
-        Ok(values)
+        Ok(DomainObservation::complete(values))
     })
 }
 fn current(domain: u16, kind: u16, key: ObjectKey) -> Result<Action, Error> {
@@ -327,17 +320,8 @@ fn legal_in(view: &ReadView, action: Action, key: ObjectKey) -> Result<(), Error
     {
         return Err(Error::Stale);
     }
-    if action == Action::Placement(1) {
-        let f = &view.feedback;
-        if !f.waiting.iter().any(|request| {
-            request.request_id == key.id
-                && request.request_generation == key.generation
-                && request.peer_ready == 1
-                && f.peer_cpu_milli >= request.cpu_milli
-                && f.peer_memory_pages >= request.memory_pages
-        }) {
-            return Err(Error::NotReady);
-        }
+    if let Action::Placement(choice) = action {
+        placement_legal::legal(choice, key, &view.feedback, crate::domain_platform::now_ns() / 1_000_000)?;
     }
     Ok(())
 }
@@ -361,9 +345,10 @@ fn apply(
     now: u64,
 ) -> Result<ExecutionState, Error> {
     owner();
-    legal(action, apply.target, now)?;
     let slot = index(action)?;
     let old = unsafe { (*core::ptr::addr_of!(DESIRED))[slot] };
+    // A completed placement leaves the live waiting queue. An exact old
+    // invocation must still query its retained receipt, never re-admit it.
     if let Some(old) = old {
         if old.apply == apply {
             if old.action != action || old.stamp != stamp {
@@ -371,7 +356,10 @@ fn apply(
             }
             return reconcile(action, apply, stamp, now);
         }
-        old.stamp.accepts(stamp, now)?;
+    }
+    legal(action, apply.target, now)?;
+    if let Some(old) = old {
+        old.stamp.accepts_action(action, stamp, now)?;
         // An unresolved one-shot may not be replaced just because the remote
         // adapter is taking longer than the control service's 50ms budget.
         if slot == 3
@@ -383,7 +371,7 @@ fn apply(
             return Err(Error::Busy);
         }
     } else {
-        PolicyStamp::default().accepts(stamp, now)?;
+        PolicyStamp::default().accepts_action(action, stamp, now)?;
     }
     unsafe {
         (*core::ptr::addr_of_mut!(DESIRED))[slot] = Some(Desired {

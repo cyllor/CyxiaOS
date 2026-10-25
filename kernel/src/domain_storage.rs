@@ -89,6 +89,10 @@ fn read_files<R>(f: impl FnOnce(&FileSystem<4096>) -> Result<R, Error>) -> Resul
 fn publish(files: &FileSystem<4096>) {
     let m = files.metrics();
     let c = files.cache_usage();
+    // Dirty debt above the cache partition is necessary Recovery writeback,
+    // not an ordinary background competitor. No clean/anonymous cache page
+    // or merely runnable service is advertised as pending disk work.
+    let _ = storage::set_background_demand(m.dirty_pages != 0 && c[0] <= c[2]);
     let now = Board.now_ns();
     let (action_a, action_b) = match files.current_action(now) {
         Action::Filesystem { readahead, flush } => (readahead, flush),
@@ -276,6 +280,18 @@ pub fn handle_object(h: Handle) -> Result<ObjectKey, Error> {
     ready()?;
     with_files(|f| f.handle_object(h))
 }
+pub(crate) fn read_io_demand(h: Handle, offset: u64, length: usize) -> Result<bool, Error> {
+    ready_read()?;
+    let prefetch = enumerate_target(4, 0)
+        .is_some_and(|key| crate::domain_control::admit_dependencies(4, key).is_ok());
+    read_files(|f| f.read_io_demand(h, offset, length, Board.now_ns(), prefetch))
+}
+pub(crate) fn write_io_demand(h: Handle, offset: u64, length: usize) -> Result<bool, Error> {
+    read_files(|f| f.write_io_demand(h, offset, length))
+}
+pub(crate) fn readdir_io_demand(h: Handle) -> Result<bool, Error> {
+    read_files(|f| f.readdir_io_demand(h))
+}
 pub fn read(h: Handle, offset: u64, out: &mut [u8], p: &mut dyn FnMut()) -> Result<usize, Error> {
     ready()?;
     let key = enumerate_target(4, 0).ok_or(Error::NotReady)?;
@@ -361,6 +377,15 @@ pub fn unlink(path: &str, p: &mut dyn FnMut()) -> Result<(), Error> {
 pub fn background_flush(now: u64, p: &mut dyn FnMut()) -> Result<Option<FlushReceipt>, Error> {
     ready()?;
     let usage = cache_partition_status()?;
+    // Read the stopped file callers before borrowing FILES or the disk. Busy
+    // is not proof of an empty foreground queue, so it forbids borrowing but
+    // still permits this class's own byte share and all Recovery progress.
+    let foreground = match crate::domain_file_abi::pending_block_demand() {
+        Ok(ready) => ready,
+        Err(Error::Busy | Error::Again | Error::NotReady) => true,
+        Err(error) => return Err(error),
+    };
+    storage::set_foreground_demand(foreground)?;
     if usage[1] == 0 {
         storage::cancel_background()?;
         return Ok(None);
@@ -675,7 +700,12 @@ fn control_current(domain: u16, _kind: u16, key: ObjectKey) -> Result<Action, Er
     current_action(domain, key)
 }
 fn target_features(action: Action, key: ObjectKey) -> Result<TargetFeatures, Error> {
-    validate_action(action, key, Board.now_ns())?;
+    // This family has no action-dependent target fields. The same proposal
+    // has already passed legal(), and publication rechecks legality against
+    // the current owners. Re-reading cache/disk admission for every encoded
+    // candidate adds no feature information and consumes the inference cap.
+    ready_read()?;
+    target_slot(action.domain(), key)?;
     Ok(TargetFeatures::default())
 }
 fn index(action: Action, key: ObjectKey) -> Result<usize, Error> {
@@ -812,7 +842,8 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target,
-            observe: observation,
+            observe: |domain, target| observation(domain, target)
+                .map(cyxia_prototype::features::DomainObservation::complete),
             current: control_current,
             legal: validate_action,
             target_features,

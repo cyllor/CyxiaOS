@@ -13,6 +13,8 @@ mod abi;
 mod execution;
 #[path = "domain_tasks/memory.rs"]
 mod memory;
+#[path = "domain_tasks/service_authority.rs"]
+mod service_authority;
 pub use abi::{
     close_network, fault, grant_endpoint, grant_file_cap, network_drain, network_key,
     network_pending, network_write, open_network, syscall,
@@ -391,6 +393,11 @@ struct State {
     service_admitted: bool,
     wake: u64,
     cursor: usize,
+    service_phase: u8,
+    lifecycle_cursor: usize,
+    vector_cursor: usize,
+    launch_cursor: usize,
+    metrics_cursor: usize,
     task_endpoint: ObjectKey,
     file_endpoint: ObjectKey,
     service_sequence: u64,
@@ -402,6 +409,8 @@ struct State {
     recovery_started: u16,
     cache_epoch: u64,
     cache_stamp: PolicyStamp,
+    cache_action: Option<Action>,
+    cache_receipt: Option<(PolicyStamp, Action)>,
     spawn_receipts: [u64; 16],
     background_receipts: [u64; 16],
     probe_key: Option<ObjectKey>,
@@ -439,6 +448,11 @@ impl State {
             service_admitted: false,
             wake: 0,
             cursor: 0,
+            service_phase: 0,
+            lifecycle_cursor: 0,
+            vector_cursor: 0,
+            launch_cursor: 0,
+            metrics_cursor: 0,
             task_endpoint: ZERO,
             file_endpoint: ZERO,
             service_sequence: 0,
@@ -450,6 +464,8 @@ impl State {
             recovery_started: 0,
             cache_epoch: 1,
             cache_stamp: NO_POLICY,
+            cache_action: None,
+            cache_receipt: None,
             spawn_receipts: [0; 16],
             background_receipts: [0; 16],
             probe_key: None,
@@ -685,6 +701,47 @@ pub struct Credit {
     pub sequence: u64,
     pub thread: ObjectKey,
     pub reserved_ns: u64,
+    optional: bool,
+}
+struct Captures(core::cell::UnsafeCell<[Option<crate::learning_evidence::OwnerAttempt>; 64]>);
+// Slot i is accessed only by CPU i, and never by an interrupt handler.
+unsafe impl Sync for Captures {}
+static CAPTURES: Captures = Captures(core::cell::UnsafeCell::new([const { None }; 64]));
+fn track_credit(
+    slot: usize,
+    result: Result<Option<Credit>, Error>,
+) -> Result<Option<Credit>, Error> {
+    if let Ok(Some(credit)) = &result {
+        debug_assert_eq!(cpu::slot(), slot);
+        let attempt = crate::learning_evidence::attempt_work(credit.thread, credit.optional)
+            .ok()
+            .flatten();
+        unsafe {
+            let cell = CAPTURES
+                .0
+                .get()
+                .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
+                .add(slot);
+            let old = cell.replace(attempt);
+            drop(old);
+        }
+    }
+    result
+}
+fn finish_capture(slot: usize, first: u64, last: u64) {
+    let attempt = unsafe {
+        CAPTURES
+            .0
+            .get()
+            .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
+            .add(slot)
+            .replace(None)
+    };
+    if let Some(mut attempt) = attempt {
+        // A busy exit is explicitly excluded by OwnerAttempt::drop, including
+        // the exact measured duration; it can never become missing-free data.
+        let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, last);
+    }
 }
 fn throttle(s: &mut State, key: ObjectKey, now: u64) {
     if let Some(slot) = s
@@ -717,170 +774,297 @@ fn refresh_throttled(s: &mut State, now: u64) {
     }
 }
 pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
-    if !READY.load(Ordering::Acquire) || slot >= 64 {
+    if !READY.load(Ordering::Acquire) || slot >= 64 || cpu::slot() != slot {
         return None;
     }
-    locked(|s| {
-        if COMPLETE_READY[slot].load(Ordering::Acquire) {
-            let _ = complete_locked(s, slot);
-        }
-        if s.draining & (1u64 << slot) != 0 || s.active[slot].is_some() {
-            return Ok(None);
-        }
-        let now = now_ns();
-        if slot == 0 {
-            match admit_service(s, now) {
-                Ok(()) => {}
-                Err(Error::Budget | Error::Busy) => return Ok(None),
-                Err(e) => return Err(e),
+    track_credit(
+        slot,
+        locked(|s| {
+            if COMPLETE_READY[slot].load(Ordering::Acquire) {
+                let _ = complete_locked(s, slot);
             }
-        }
-        refresh_throttled(s, now);
-        let Some(mut d) = s.scheduler.dispatch(slot, s.layout, now, 10_000_000)? else {
-            return Ok(None);
-        };
-        let safety = match task_index(&s.tasks, d.thread) {
-            Ok(i)
-                if !s.tasks[i].optional
-                    && s.probe_key != Some(d.thread)
-                    && s.tasks[i].parent != CLUSTER_CALLER =>
-            {
-                1_000_000
+            if s.draining & (1u64 << slot) != 0 || s.active[slot].is_some() {
+                return Ok(None);
             }
-            _ => 2_000_000,
-        };
-        if d.reserved_ns < safety {
-            match s.scheduler.resize_dispatch(d, safety) {
-                Ok(next) => d = next,
-                Err(_) => {
-                    s.scheduler.complete(d, 0, RunState::Blocked, now)?;
-                    throttle(s, d.thread, now);
-                    return Ok(None);
+            let now = now_ns();
+            if slot == 0 {
+                match admit_service(s, now) {
+                    Ok(()) => {}
+                    Err(Error::Budget | Error::Busy) => return Ok(None),
+                    Err(e) => return Err(e),
                 }
             }
-        }
-        let optional = task_index(&s.tasks, d.thread).is_ok_and(|i| s.tasks[i].optional);
-        let debit = if optional {
-            if let Err(error) = crate::domain_control::admit_dependency(
-                crate::domain_control::Prerequisite {
-                    domain: 13,
-                    target: d.group,
-                },
-                1,
-                now,
-            ) {
-                s.scheduler.complete(d, 0, RunState::Blocked, now)?;
-                throttle(s, d.thread, now);
-                return Err(error);
+            refresh_throttled(s, now);
+            let Some(mut d) = s.scheduler.dispatch(slot, s.layout, now, 10_000_000)? else {
+                return Ok(None);
+            };
+            let safety = match task_index(&s.tasks, d.thread) {
+                Ok(i)
+                    if !s.tasks[i].optional
+                        && s.probe_key != Some(d.thread)
+                        && s.tasks[i].parent != CLUSTER_CALLER =>
+                {
+                    1_000_000
+                }
+                _ => 2_000_000,
+            };
+            if d.reserved_ns < safety {
+                match s.scheduler.resize_dispatch(d, safety) {
+                    Ok(next) => d = next,
+                    Err(_) => {
+                        s.scheduler.complete(d, 0, RunState::Blocked, now)?;
+                        throttle(s, d.thread, now);
+                        return Ok(None);
+                    }
+                }
             }
-            let status = match s.background.current_status(d.group, now) {
-                Ok(status) => status,
-                Err(error) => {
+            let optional = task_index(&s.tasks, d.thread).is_ok_and(|i| s.tasks[i].optional);
+            let debit = if optional {
+                if let Err(error) = crate::domain_control::admit_dependency(
+                    crate::domain_control::Prerequisite {
+                        domain: 13,
+                        target: d.group,
+                    },
+                    1,
+                    now,
+                ) {
                     s.scheduler.complete(d, 0, RunState::Blocked, now)?;
                     throttle(s, d.thread, now);
                     return Err(error);
                 }
-            };
-            let remaining = (u64::from(status.budget_milli) * 100_000)
-                .saturating_sub(status.spent_ns)
-                .saturating_sub(status.reserved_ns);
-            if remaining < safety {
-                s.scheduler.complete(d, 0, RunState::Blocked, now)?;
-                throttle(s, d.thread, now);
-                return Ok(None);
-            }
-            if d.reserved_ns > remaining {
-                match s.scheduler.resize_dispatch(d, remaining) {
-                    Ok(next) => d = next,
+                let status = match s.background.current_status(d.group, now) {
+                    Ok(status) => status,
                     Err(error) => {
                         s.scheduler.complete(d, 0, RunState::Blocked, now)?;
                         throttle(s, d.thread, now);
                         return Err(error);
                     }
-                }
-            }
-            match s.background.reserve(d.group, d.reserved_ns, now) {
-                Ok(debit) => Some(debit),
-                Err(_) => {
+                };
+                let remaining = (u64::from(status.budget_milli) * 100_000)
+                    .saturating_sub(status.spent_ns)
+                    .saturating_sub(status.reserved_ns);
+                if remaining < safety {
                     s.scheduler.complete(d, 0, RunState::Blocked, now)?;
                     throttle(s, d.thread, now);
                     return Ok(None);
                 }
-            }
-        } else {
-            None
-        };
-        s.active[slot] = Some(Active {
-            dispatch: d,
-            state: RunState::Runnable,
-            optional: debit,
-        });
-        if let Ok(i) = group_index(s, d.group) {
-            s.facts.wait[i].add(d.waited_ns);
-            s.facts.node_wait.add(d.waited_ns);
-        }
-        CREDIT_NS[slot].store(d.reserved_ns, Ordering::Relaxed);
-        CREDIT_KIND[slot].store(
-            if d.thread.id == REMOTE_ID {
-                2
-            } else if d.thread.id >= 0x1000 {
-                3
+                if d.reserved_ns > remaining {
+                    match s.scheduler.resize_dispatch(d, remaining) {
+                        Ok(next) => d = next,
+                        Err(error) => {
+                            s.scheduler.complete(d, 0, RunState::Blocked, now)?;
+                            throttle(s, d.thread, now);
+                            return Err(error);
+                        }
+                    }
+                }
+                match s.background.reserve(d.group, d.reserved_ns, now) {
+                    Ok(debit) => Some(debit),
+                    Err(_) => {
+                        s.scheduler.complete(d, 0, RunState::Blocked, now)?;
+                        throttle(s, d.thread, now);
+                        return Ok(None);
+                    }
+                }
             } else {
-                1
-            },
-            Ordering::Release,
-        );
-        Ok(Some(Credit {
-            sequence: d.sequence,
-            thread: d.thread,
-            reserved_ns: d.reserved_ns,
-        }))
-    })
+                None
+            };
+            s.active[slot] = Some(Active {
+                dispatch: d,
+                state: RunState::Runnable,
+                optional: debit,
+            });
+            if let Ok(i) = group_index(s, d.group) {
+                s.facts.wait[i].add(d.waited_ns);
+                s.facts.node_wait.add(d.waited_ns);
+            }
+            CREDIT_NS[slot].store(d.reserved_ns, Ordering::Relaxed);
+            CREDIT_KIND[slot].store(
+                if d.thread.id == REMOTE_ID {
+                    2
+                } else if d.thread.id >= 0x1000 {
+                    3
+                } else {
+                    1
+                },
+                Ordering::Release,
+            );
+            Ok(Some(Credit {
+                sequence: d.sequence,
+                thread: d.thread,
+                reserved_ns: d.reserved_ns,
+                optional,
+            }))
+        }),
+    )
     .ok()
     .flatten()
 }
 pub fn begin_service(now: u64) -> Option<Credit> {
     begin_builtin(0, now)
 }
-fn begin_file_credit(owner: ObjectKey) -> Result<Option<Credit>, Error> {
+/// A non-preemptible mechanism piece needs the whole bounded envelope. A
+/// short remainder is returned without running the body or blocking its thread.
+pub fn begin_service_segment() -> Option<Credit> {
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    track_credit(
+        0,
+        locked(|s| {
+            if COMPLETE_READY[0].load(Ordering::Acquire) {
+                let _ = complete_locked(s, 0);
+            }
+            if s.active[0].is_some() || s.draining & 1 != 0 {
+                return Ok(None);
+            }
+            let now = now_ns();
+            admit_service(s, now)?;
+            let Some(mut d) = s.scheduler.dispatch(0, s.layout, now, 2_500_000)? else {
+                return Ok(None);
+            };
+            if d.thread == group(0x101) && d.reserved_ns < 2_500_000 {
+                if let Ok(full) = s.scheduler.resize_dispatch(d, 2_500_000) {
+                    d = full;
+                }
+            }
+            if d.thread != group(0x101) || d.reserved_ns != 2_500_000 {
+                s.scheduler.complete(d, 0, RunState::Runnable, now)?;
+                return Ok(None);
+            }
+            s.active[0] = Some(Active {
+                dispatch: d,
+                state: RunState::Runnable,
+                optional: None,
+            });
+            CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
+            CREDIT_KIND[0].store(5, Ordering::Release);
+            Ok(Some(Credit {
+                sequence: d.sequence,
+                thread: d.thread,
+                reserved_ns: d.reserved_ns,
+                optional: false,
+            }))
+        }),
+    )
+    .ok()
+    .flatten()
+}
+/// Authority for a bounded CPU0 mechanism piece, including exact baseline
+/// restoration after an optional numerical worker has failed. Merely running
+/// on CPU0, an EL0 TLS slice or an already submitted bill is insufficient.
+pub fn authorize_service_turn() -> Result<(), Error> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return Err(Error::Auth);
     }
     locked(|s| {
-        if COMPLETE_READY[0].load(Ordering::Acquire) {
-            let _ = complete_locked(s, 0);
-        }
-        if s.active[0].is_some() || s.draining & 1 != 0 {
-            return Ok(None);
-        }
-        let i = task_index(&s.tasks, owner)?;
-        if s.tasks[i].life != Life::Waiting || !FILE_BUSY[i].load(Ordering::Acquire) {
-            return Err(Error::Conflict);
-        }
-        let now = now_ns();
-        let layout = CpuLayout {
-            business_mask: s.layout.business_mask & !s.draining,
-            ..s.layout
-        };
-        let Some(d) = s
-            .scheduler
-            .dispatch_service_exact(owner, 0, layout, now, 2_500_000)?
-        else {
-            return Ok(None);
-        };
-        s.active[0] = Some(Active {
-            dispatch: d,
-            state: RunState::Blocked,
-            optional: None,
-        });
-        CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
-        CREDIT_KIND[0].store(4, Ordering::Release);
-        Ok(Some(Credit {
-            sequence: d.sequence,
-            thread: owner,
-            reserved_ns: d.reserved_ns,
-        }))
+        let active = s.active[0].as_ref().ok_or(Error::NotReady)?;
+        let d = active.dispatch;
+        service_authority::authorize(
+            service_authority::View {
+                cpu: cpu::slot(),
+                held: d,
+                actual: s.scheduler.active(0),
+                layout: s.layout,
+                draining: s.draining,
+                quarantine: s.scheduler.stats().quarantine_mask,
+                kind: CREDIT_KIND[0].load(Ordering::Acquire),
+                published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
+                settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
+            },
+            now_ns(),
+        )
     })
+}
+/// Actual stopped file syscalls awaiting the CPU0 owner. This is demand, not
+/// permission to replay a request: completion custody and in-flight requests
+/// are excluded, and the file service still validates the complete user frame.
+pub fn pending_file_requests() -> Result<[Option<(ObjectKey, u64)>; TASKS], Error> {
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        let mut requests = [None; TASKS];
+        for (i, out) in requests.iter_mut().enumerate() {
+            let task = &s.tasks[i];
+            if task.life != Life::Waiting
+                || !FILE_PENDING[i].load(Ordering::Acquire)
+                || FILE_DONE[i].load(Ordering::Acquire)
+                || FILE_BUSY[i].load(Ordering::Acquire)
+                || s.active
+                    .iter()
+                    .flatten()
+                    .any(|a| a.dispatch.thread == task.key)
+            {
+                continue;
+            }
+            // A Waiting file caller has stopped EL0 and cannot be dispatched
+            // while FILE_PENDING is held. Copy only the saved frame address.
+            let context = unsafe { &*core::ptr::addr_of!(CONTEXTS).cast::<user::Context>().add(i) };
+            if context.kind == 8
+                && context.esr >> 26 == 0x15
+                && context.esr & 0xffff == 0x45
+                && context.regs[8] == 0x40
+            {
+                *out = Some((task.key, context.regs[1]));
+            }
+        }
+        Ok(requests)
+    })
+}
+/// Executes one bounded, nonblocking owner piece against real CPU0 capacity.
+/// Blocking I/O must split at its progress callback and use a retained request.
+pub fn service_segment<R>(body: impl FnOnce() -> R) -> Option<R> {
+    begin_service_segment()?;
+    let started = now_ns();
+    let result = body();
+    let finished = now_ns();
+    let _ = complete_service(finished.saturating_sub(started), finished);
+    Some(result)
+}
+fn begin_file_credit(owner: ObjectKey) -> Result<Option<Credit>, Error> {
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
+        return Err(Error::Auth);
+    }
+    track_credit(
+        0,
+        locked(|s| {
+            if COMPLETE_READY[0].load(Ordering::Acquire) {
+                let _ = complete_locked(s, 0);
+            }
+            if s.active[0].is_some() || s.draining & 1 != 0 {
+                return Ok(None);
+            }
+            let i = task_index(&s.tasks, owner)?;
+            if s.tasks[i].life != Life::Waiting || !FILE_BUSY[i].load(Ordering::Acquire) {
+                return Err(Error::Conflict);
+            }
+            let now = now_ns();
+            let layout = CpuLayout {
+                business_mask: s.layout.business_mask & !s.draining,
+                ..s.layout
+            };
+            let Some(d) = s
+                .scheduler
+                .dispatch_service_exact(owner, 0, layout, now, 2_500_000)?
+            else {
+                return Ok(None);
+            };
+            s.active[0] = Some(Active {
+                dispatch: d,
+                state: RunState::Blocked,
+                optional: None,
+            });
+            CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
+            CREDIT_KIND[0].store(4, Ordering::Release);
+            Ok(Some(Credit {
+                sequence: d.sequence,
+                thread: owner,
+                reserved_ns: d.reserved_ns,
+                optional: false,
+            }))
+        }),
+    )
 }
 fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
     if !COMPLETE_READY[slot].load(Ordering::Acquire) {
@@ -946,6 +1130,7 @@ pub fn complete_builtin(slot: usize, actual_ns: u64, finished_ns: u64) -> Result
     if COMPLETE_READY[slot].load(Ordering::Acquire) {
         return Err(Error::Busy);
     }
+    finish_capture(slot, finished_ns.saturating_sub(actual_ns), finished_ns);
     COMPLETE_ACTUAL[slot].store(actual_ns, Ordering::Relaxed);
     COMPLETE_AT[slot].store(finished_ns, Ordering::Relaxed);
     COMPLETE_READY[slot].store(true, Ordering::Release);
@@ -959,6 +1144,23 @@ pub fn complete_service(actual_ns: u64, finished_ns: u64) -> Result<(), Error> {
 }
 pub fn cpu_window_usage(slot: usize, now: u64) -> Result<(u64, u64), Error> {
     locked(|s| s.scheduler.cpu_window_usage(slot, now))
+}
+/// Actual healthy, non-draining C ownership for a protected role registration.
+pub fn control_owner_context(slot: usize) -> Result<(u64, u64), Error> {
+    if !matches!(slot, 1 | 2) {
+        return Err(Error::Range);
+    }
+    locked(|s| {
+        let bit = 1u64 << slot;
+        if s.layout.business_mask & bit != 0
+            || s.layout.healthy_mask & bit == 0
+            || s.draining & bit != 0
+            || s.scheduler.stats().quarantine_mask & bit != 0
+        {
+            return Err(Error::NotReady);
+        }
+        Ok((s.layout.generation, s.generation))
+    })
 }
 /// Only the real C worker on this CPU may spend this credit. During a drain,
 /// cleanup may settle/abort its existing job before the stop acknowledgement.
@@ -1096,6 +1298,8 @@ pub fn install(
                 s.memory
                     .install_cache_partition(pages, batch, grant, 64, stamp, now)?;
                 s.cache_stamp = stamp;
+                s.cache_action = Some(action);
+                record_cache_receipt(s, now);
                 Ok(())
             }
             Action::Ipc { budget, batch } => s.ipc.install(target, budget, batch, stamp, now),
@@ -1349,6 +1553,25 @@ pub fn common_metrics() -> Result<[u64; 3], Error> {
     })
 }
 
+#[path = "domain_tasks/receipts.rs"]
+mod receipts;
+fn record_cache_receipt(s: &mut State, now: u64) {
+    let Some(action @ Action::Cache { pages, .. }) = s.cache_action else {
+        return;
+    };
+    if !s.cache_stamp.live(now) {
+        return;
+    }
+    let grant = (pages / 4).min(256) as usize;
+    let fs = crate::domain_storage::cache_usage();
+    if s.memory.cache_authorized_pages(now) == grant
+        && fs[2] == u64::from(pages) - grant as u64
+        && s.memory.stats().cache_pages <= grant
+        && fs[0] <= fs[2]
+    {
+        s.cache_receipt = Some((s.cache_stamp, action));
+    }
+}
 fn completion(
     action: Action,
     target: ObjectKey,
@@ -1356,23 +1579,26 @@ fn completion(
 ) -> Result<cyxia_prototype::policy::ExecutionState, Error> {
     locked(|s| {
         use cyxia_prototype::policy::ExecutionState;
-        if !stamp.live(now_ns()) {
-            return Ok(ExecutionState::Failed(Error::Expired));
-        }
+        let now = now_ns();
         if let Action::Cache { .. } = action {
+            if s.cache_receipt == Some((stamp, action)) {
+                return Ok(ExecutionState::Applied);
+            }
             if s.cache_stamp != stamp {
                 return Err(Error::Stale);
             }
+            record_cache_receipt(s, now);
+            if s.cache_receipt == Some((stamp, action)) {
+                return Ok(ExecutionState::Applied);
+            }
             let fs = crate::domain_storage::cache_usage();
-            return Ok(
-                if s.memory.stats().cache_pages <= s.memory.cache_authorized_pages(now_ns())
-                    && fs[0] <= fs[2]
-                {
-                    ExecutionState::Applied
-                } else {
-                    ExecutionState::Pending
-                },
-            );
+            // An expired shrink still owns old resident/dirty references until
+            // both actual owners have restored and reached their baseline.
+            let debt = s.memory.stats().cache_pages > 64
+                || s.memory.cache_authorized_pages(now) != 64
+                || fs[2] != 192
+                || fs[0] > 192;
+            return Ok(receipts::reconcile(0, stamp, now, debt));
         }
         let version = match action {
             Action::CpuWeight(_) => s.scheduler.policy_receipt(target)?,
@@ -1382,11 +1608,12 @@ fn completion(
             Action::BackgroundBudget(_) => s.background_receipts[group_index(s, target)?],
             _ => return Err(Error::Unsupported),
         };
-        Ok(if version == stamp.version {
-            ExecutionState::Applied
-        } else {
-            ExecutionState::Pending
-        })
+        let in_flight = matches!(action, Action::CpuWeight(_))
+            && s.active
+                .iter()
+                .flatten()
+                .any(|a| a.dispatch.group == target && a.dispatch.policy_version == stamp.version);
+        Ok(receipts::reconcile(version, stamp, now, in_flight))
     })
 }
 fn control_target(domain: u16, _kind: u16, ordinal: usize) -> Option<ObjectKey> {
@@ -1428,7 +1655,8 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target: control_target,
-            observe: observation,
+            observe: |domain, target| observation(domain, target)
+                .map(cyxia_prototype::features::DomainObservation::complete),
             current: control_current,
             legal: validate_action,
             target_features: control_features,

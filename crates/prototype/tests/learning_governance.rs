@@ -608,3 +608,261 @@ fn insufficient_windows_need_independent_preexpiry_extension_and_three_bad_secon
         assert_eq!(gate.restoration_pending(), Some(console()));
     });
 }
+
+#[test]
+fn real_unaligned_canary_start_reserves_a_future_window_and_keeps_relative_quota() {
+    support::with_candidate(|candidate, old| {
+        let original = ModelBinding {
+            generation: 7,
+            model_hash: candidate.parent_hash(),
+            schema_hash: support::schemas().feature.hash,
+        };
+        let mut gate = CommitGate::new(1, original).unwrap();
+        let mut g = Governance::new(&gate, candidate, old, 0).unwrap();
+        let mut budget = ExtraBudget::new();
+        shadow(&mut g, &gate, &mut budget);
+        let real_now = 10 * WINDOW_NS + 123;
+        let permit = g
+            .begin_canary(
+                &mut gate,
+                TargetRegistration {
+                    key: console(),
+                    baseline: Action::ConsoleBatch(1),
+                },
+                real_now,
+                &Owners { extend: true },
+            )
+            .unwrap();
+        assert_eq!(permit.start_ns, 11 * WINDOW_NS);
+        assert_eq!(permit.expires_ns, permit.start_ns + 10_000_000_000);
+        assert_eq!(
+            gate.check_active_publication(original, console()),
+            Err(Error::State)
+        );
+        let binding = cyxia_prototype::learning::worker_wire::JobBinding {
+            boot_epoch: 1,
+            job_id: 100,
+            controller_epoch: 3,
+            core_generation: 1,
+            model_generation: 7,
+            data_generation: 7,
+            role_context: ObjectKey {
+                id: 99,
+                generation: 1,
+            },
+            image_hash: [9; 32],
+            ledger_generation: 1,
+        };
+        let model = ModelBinding {
+            model_hash: permit.candidate_hash,
+            ..original
+        };
+        let mut set = candidates(
+            Family {
+                domain: 15,
+                kind: 1,
+            },
+            model,
+            real_now,
+            console(),
+        );
+        let publisher = cyxia_prototype::policy::Publisher {
+            object: ObjectKey {
+                id: 7,
+                generation: 1,
+            },
+            controller_epoch: 3,
+        };
+        let mut registry = cyxia_prototype::policy::Registry::new(1, publisher, original).unwrap();
+        assert!(
+            registry
+                .register_canary(publisher, &mut set, permit, &gate, real_now)
+                .is_err()
+        );
+        assert!(
+            g.prepare_score(&set, Role::Canary, binding, 1024 * 1024, real_now)
+                .is_err()
+        );
+        publish(&mut g, &mut gate, &mut budget, permit.start_ns + 1, 1).unwrap();
+        let submission = g.submissions().next().unwrap();
+        g.reconcile(
+            &mut gate,
+            receipt(submission, ExecutionState::Applied),
+            &Owners { extend: true },
+        )
+        .unwrap();
+        let now = permit.start_ns + 20_000;
+        let mut set = candidates(
+            Family {
+                domain: 15,
+                kind: 1,
+            },
+            model,
+            now,
+            console(),
+        );
+        registry
+            .register_canary(publisher, &mut set, permit, &gate, now)
+            .unwrap();
+        assert_eq!(
+            g.prepare_score(&set, Role::Canary, binding, 1024 * 1024, now)
+                .err()
+                .map(|e| e),
+            Some(Error::Budget)
+        );
+    });
+}
+
+#[test]
+fn expired_publish_permission_becomes_bounded_closing_and_can_finish_after_the_end_instant() {
+    support::with_candidate(|candidate, old| {
+        let original = ModelBinding {
+            generation: 7,
+            model_hash: candidate.parent_hash(),
+            schema_hash: support::schemas().feature.hash,
+        };
+        let mut gate = CommitGate::new(1, original).unwrap();
+        let mut g = Governance::new(&gate, candidate, old, 0).unwrap();
+        let mut budget = ExtraBudget::new();
+        shadow(&mut g, &gate, &mut budget);
+        let permit = g
+            .begin_canary(
+                &mut gate,
+                TargetRegistration {
+                    key: console(),
+                    baseline: Action::ConsoleBatch(1),
+                },
+                10 * WINDOW_NS,
+                &Owners { extend: true },
+            )
+            .unwrap();
+        publish(&mut g, &mut gate, &mut budget, permit.start_ns + 1, 1).unwrap();
+        let submission = g.submissions().next().unwrap();
+        g.reconcile(
+            &mut gate,
+            receipt(submission, ExecutionState::Applied),
+            &Owners { extend: true },
+        )
+        .unwrap();
+        let mut work = RewardWorkspace::new();
+        for second in 0..10 {
+            let start = permit.start_ns + second * 1_000_000_000;
+            g.observe_second(
+                &mut gate,
+                second as u16,
+                &observations(start, 100, 1000, 0),
+                &observations(start, 100, 900, 0),
+                &mut work,
+                &Owners { extend: true },
+            )
+            .unwrap();
+        }
+        g.tick(&mut gate, permit.expires_ns + 1_000_000);
+        assert_eq!(g.stage(), Stage::Frozen);
+        assert_eq!(gate.permit(), None);
+        assert_eq!(gate.closing(), Some(permit));
+        assert_eq!(
+            g.closing_deadline_ns(),
+            Some(permit.expires_ns + CLOSING_NS)
+        );
+        assert_eq!(
+            gate.check_active_publication(original, console()),
+            Err(Error::State)
+        );
+        assert!(
+            g.extend(
+                &mut gate,
+                permit.expires_ns + 1,
+                200,
+                &Owners { extend: true }
+            )
+            .is_err()
+        );
+        let promoted = g.promote(&mut gate, permit.expires_ns + 2_000_000).unwrap();
+        assert_eq!(promoted.generation, 8);
+        assert_eq!(gate.closing(), None);
+        assert_eq!(gate.permit(), None);
+        assert_eq!(g.submissions().next().unwrap().stamp, submission.stamp); // no implicit TTL renewal
+    });
+}
+
+#[test]
+fn closing_never_restarts_the_fifty_ms_action_or_finalization_deadline() {
+    support::with_candidate(|candidate, old| {
+        let original = ModelBinding {
+            generation: 7,
+            model_hash: candidate.parent_hash(),
+            schema_hash: support::schemas().feature.hash,
+        };
+        let mut gate = CommitGate::new(1, original).unwrap();
+        let mut g = Governance::new(&gate, candidate, old, 0).unwrap();
+        let mut budget = ExtraBudget::new();
+        shadow(&mut g, &gate, &mut budget);
+        let permit = g
+            .begin_canary(
+                &mut gate,
+                TargetRegistration {
+                    key: console(),
+                    baseline: Action::ConsoleBatch(1),
+                },
+                10 * WINDOW_NS,
+                &Owners { extend: true },
+            )
+            .unwrap();
+        publish(
+            &mut g,
+            &mut gate,
+            &mut budget,
+            permit.expires_ns - 20_000_000,
+            1,
+        )
+        .unwrap();
+        let submitted = g.submissions().next().unwrap();
+        g.tick(&mut gate, permit.expires_ns);
+        assert_eq!(g.stage(), Stage::Frozen);
+        assert_eq!(
+            g.promote(&mut gate, permit.expires_ns + 1),
+            Err(Error::Unknown)
+        );
+        g.tick(&mut gate, submitted.apply_deadline_ns + 1);
+        assert_eq!(g.stage(), Stage::Restoring);
+        assert_eq!(gate.closing(), None);
+        assert_eq!(gate.permit(), None);
+        assert_eq!(gate.restoration_pending(), Some(console()));
+        assert_eq!(
+            g.submissions().next().unwrap().state,
+            ExecutionState::Unknown
+        );
+        assert_eq!(g.submissions().next().unwrap().apply, submitted.apply);
+    });
+    support::with_candidate(|candidate, old| {
+        let original = ModelBinding {
+            generation: 7,
+            model_hash: candidate.parent_hash(),
+            schema_hash: support::schemas().feature.hash,
+        };
+        let mut gate = CommitGate::new(1, original).unwrap();
+        let mut g = Governance::new(&gate, candidate, old, 0).unwrap();
+        let mut budget = ExtraBudget::new();
+        shadow(&mut g, &gate, &mut budget);
+        let permit = g
+            .begin_canary(
+                &mut gate,
+                TargetRegistration {
+                    key: console(),
+                    baseline: Action::ConsoleBatch(1),
+                },
+                10 * WINDOW_NS,
+                &Owners { extend: true },
+            )
+            .unwrap();
+        g.tick(&mut gate, permit.expires_ns + CLOSING_NS + 1);
+        assert_eq!(g.stage(), Stage::Restoring);
+        assert_eq!(g.reason(), Some(Error::Deadline));
+        assert_eq!(gate.closing(), None);
+        assert!(
+            g.promote(&mut gate, permit.expires_ns + CLOSING_NS + 2)
+                .is_err()
+        );
+    });
+}

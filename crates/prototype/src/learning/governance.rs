@@ -14,6 +14,8 @@ use crate::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
+mod init;
+pub use init::{GovernanceInit, InitComplete, InitPiece, InitValue};
 
 // Credits are capabilities of one live ledger, not merely a serial number.
 // Exhaustion never wraps to an earlier identity; that instance starts faulted.
@@ -24,6 +26,9 @@ pub const EXTRA_NS: u64 = 9_000_000;
 pub const MANDATORY_NS: u64 = 61_000_000;
 pub const CONTROL_NS: u64 = 70_000_000;
 pub const MAX_SUBMISSIONS: usize = 300;
+/// Final receipts/last-window verification after observation stops. This is
+/// not an execution lease, another publication window or a TTL extension.
+pub const CLOSING_NS: u64 = 50_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Training,
@@ -64,6 +69,30 @@ pub struct WorkReceipt {
     actual_ns: u64,
     cpu: u16,
     core_generation: u64,
+}
+/// Read-only identifying facts, not a constructor for a settled receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkIdentity {
+    pub ledger_id: u64,
+    pub serial: u64,
+    pub role: Role,
+    pub window: u64,
+    pub actual_ns: u64,
+    pub cpu: u16,
+    pub core_generation: u64,
+}
+impl WorkReceipt {
+    pub fn identity(&self) -> WorkIdentity {
+        WorkIdentity {
+            ledger_id: self.ledger_id,
+            serial: self.serial,
+            role: self.role,
+            window: self.window,
+            actual_ns: self.actual_ns,
+            cpu: self.cpu,
+            core_generation: self.core_generation,
+        }
+    }
 }
 /// All four extra roles share this single ledger. Losing a credit reply cannot
 /// reset a window or obtain another credit. Overruns remain sticky and billed.
@@ -238,6 +267,7 @@ pub struct CommitGate {
     boot_epoch: u64,
     active: ModelBinding,
     permit: Option<CanaryPermit>,
+    closing: Option<CanaryPermit>,
     restore: Option<RestorationRequest>,
     next_permit: u64,
     next_restore: u64,
@@ -255,6 +285,7 @@ impl CommitGate {
             boot_epoch,
             active,
             permit: None,
+            closing: None,
             restore: None,
             next_permit: 0,
             next_restore: 0,
@@ -265,6 +296,9 @@ impl CommitGate {
     }
     pub fn permit(&self) -> Option<CanaryPermit> {
         self.permit
+    }
+    pub fn closing(&self) -> Option<CanaryPermit> {
+        self.closing
     }
     pub fn restoration_pending(&self) -> Option<ObjectKey> {
         self.restore.map(|request| request.target.key)
@@ -283,6 +317,7 @@ impl CommitGate {
             return Err(Error::Stale);
         }
         if self.permit.is_some_and(|p| p.target == target)
+            || self.closing.is_some_and(|p| p.target == target)
             || self.restore.is_some_and(|r| r.target.key == target)
         {
             return Err(Error::State);
@@ -296,16 +331,28 @@ impl CommitGate {
             target,
         })
     }
+    fn freeze_permit(&mut self, permit: CanaryPermit) -> Result<(), Error> {
+        if self.closing == Some(permit) && self.permit.is_none() {
+            return Ok(());
+        }
+        if self.permit != Some(permit) || self.closing.is_some() || self.restore.is_some() {
+            return Err(Error::Stale);
+        }
+        self.permit = None;
+        self.closing = Some(permit);
+        Ok(())
+    }
     fn revoke_and_restore(
         &mut self,
         permit: CanaryPermit,
         target: TargetRegistration,
     ) -> Result<RestorationRequest, Error> {
-        if self.permit != Some(permit) || self.restore.is_some() {
+        if (self.permit != Some(permit) && self.closing != Some(permit)) || self.restore.is_some() {
             return Err(Error::Stale);
         }
         let request = self.next_restoration(target)?;
         self.permit = None;
+        self.closing = None;
         self.next_restore = request.id;
         self.restore = Some(request);
         Ok(request)
@@ -316,7 +363,11 @@ impl CommitGate {
         hash: [u8; 32],
         permit: Option<CanaryPermit>,
     ) -> Result<ModelBinding, Error> {
-        if self.active != expected || self.permit != permit || self.restore.is_some() {
+        let exact = match permit {
+            Some(p) => self.permit == Some(p) || (self.permit.is_none() && self.closing == Some(p)),
+            None => self.permit.is_none() && self.closing.is_none(),
+        };
+        if self.active != expected || !exact || self.restore.is_some() {
             return Err(Error::Stale);
         }
         if hash == expected.model_hash {
@@ -329,6 +380,7 @@ impl CommitGate {
             schema_hash: expected.schema_hash,
         };
         self.permit = None;
+        self.closing = None;
         Ok(self.active)
     }
 }
@@ -412,8 +464,49 @@ pub struct ScoreProof {
     target: ObjectKey,
     snapshot_ns: u64,
     model: ModelBinding,
+    candidate_set_hash: [u8; 32],
+    selected_index: u16,
     selected: Action,
+    score_count: u16,
+    scores: [i16; 32],
     hash: [u8; 32],
+}
+impl ScoreProof {
+    /// Complete scores authenticated with this exact set/model/scope. Root
+    /// history must retain these values rather than inventing another vector
+    /// which happens to have the same selected index.
+    pub fn scores(&self) -> &[i16] {
+        &self.scores[..usize::from(self.score_count)]
+    }
+    pub fn selected_index(&self) -> u16 {
+        self.selected_index
+    }
+    /// Bind the exact registered/scoped decision before the root commits a
+    /// Canary publication. A credit for one score cannot authorize another
+    /// legal action from the same target or a different permit's candidate set.
+    pub fn verify_selection(
+        &self,
+        candidate_set_hash: [u8; 32],
+        model: ModelBinding,
+        target: ObjectKey,
+        snapshot_ns: u64,
+        selected_index: u16,
+        action: Action,
+    ) -> Result<(), Error> {
+        if self.role != Role::Canary {
+            return Err(Error::State);
+        }
+        if self.candidate_set_hash != candidate_set_hash
+            || self.model != model
+            || self.target != target
+            || self.snapshot_ns != snapshot_ns
+            || self.selected_index != selected_index
+            || self.selected != action
+        {
+            return Err(Error::Evidence);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Submission {
@@ -454,6 +547,7 @@ pub struct Governance<'a, 'model> {
     shadow_families: u32,
     target: Option<TargetRegistration>,
     permit: Option<CanaryPermit>,
+    closing_deadline_ns: Option<u64>,
     restoration: Option<RestorationRequest>,
     last_submit_window: Option<u64>,
     history: [Option<Submission>; MAX_SUBMISSIONS],
@@ -468,12 +562,12 @@ pub struct Governance<'a, 'model> {
     reason: Option<Error>,
 }
 impl<'a, 'model> Governance<'a, 'model> {
-    pub fn new(
+    fn validate_new(
         gate: &CommitGate,
-        candidate: &'a ValidatedCandidate<'model>,
-        old: &'a [u8; MODEL_BYTES],
+        candidate: &ValidatedCandidate<'_>,
+        old: &[u8; MODEL_BYTES],
         start_window: u64,
-    ) -> Result<Self, Error> {
+    ) -> Result<(), Error> {
         start_window
             .checked_add(10)
             .and_then(|window| window.checked_mul(WINDOW_NS))
@@ -482,10 +576,20 @@ impl<'a, 'model> Governance<'a, 'model> {
             || gate.active.schema_hash != candidate.model().manifest().schemas.feature.hash
             || Sha256::digest(old).as_slice() != gate.active.model_hash
             || gate.permit.is_some()
+            || gate.closing.is_some()
             || gate.restore.is_some()
         {
             return Err(Error::Stale);
         }
+        Ok(())
+    }
+    pub fn new(
+        gate: &CommitGate,
+        candidate: &'a ValidatedCandidate<'model>,
+        old: &'a [u8; MODEL_BYTES],
+        start_window: u64,
+    ) -> Result<Self, Error> {
+        Self::validate_new(gate, candidate, old, start_window)?;
         Ok(Self {
             candidate,
             old,
@@ -498,6 +602,7 @@ impl<'a, 'model> Governance<'a, 'model> {
             shadow_families: 0,
             target: None,
             permit: None,
+            closing_deadline_ns: None,
             restoration: None,
             last_submit_window: None,
             history: [None; MAX_SUBMISSIONS],
@@ -511,6 +616,23 @@ impl<'a, 'model> Governance<'a, 'model> {
             degraded_run: 0,
             reason: None,
         })
+    }
+    pub fn original_binding(&self) -> ModelBinding {
+        self.original
+    }
+    pub fn candidate_hash(&self) -> [u8; 32] {
+        self.candidate.model().manifest().parameters_hash
+    }
+    pub fn registration_hash(&self) -> [u8; 32] {
+        self.candidate.registration_hash()
+    }
+    pub fn validation_data(&self) -> super::data::DataManifest {
+        match self.candidate.model().manifest().origin {
+            super::manifest::Origin::Learned(record) => record.data,
+            // ValidatedCandidate has no public unchecked constructor; its
+            // independent registration always rejects an untrained origin.
+            super::manifest::Origin::Untrained { .. } => unreachable!("validated candidate origin"),
+        }
     }
     pub fn stage(&self) -> Stage {
         self.stage
@@ -526,6 +648,135 @@ impl<'a, 'model> Governance<'a, 'model> {
     }
     pub fn incomplete_second(&self, index: usize) -> Option<IncompleteSecond> {
         self.incomplete_seconds.get(index).copied().flatten()
+    }
+    /// Preparation performs bounded encoding and identity checks only. The
+    /// complete old/new MLP executes in a separately scheduled EL0 Score role.
+    pub fn prepare_score<'s>(
+        &'s self,
+        set: &'s CandidateSet,
+        role: Role,
+        binding: super::worker_wire::JobBinding,
+        workspace_bytes: u32,
+        now_ns: u64,
+    ) -> Result<super::score::EncoderState<'s>, Error> {
+        let role = match role {
+            Role::Shadow => super::worker_wire::Role::ShadowScore,
+            Role::Canary => super::worker_wire::Role::CanaryScore,
+            _ => return Err(Error::State),
+        };
+        let encoder = super::score::EncoderState::new(
+            self.candidate,
+            self.old,
+            set,
+            role,
+            binding,
+            workspace_bytes,
+            now_ns,
+        )?;
+        self.score_context(encoder.header(), now_ns)?;
+        Ok(encoder)
+    }
+    fn score_context(&self, h: super::score_wire::Header, now_ns: u64) -> Result<(), Error> {
+        if h.registration_hash != self.candidate.registration_hash()
+            || h.manifest_hash != self.candidate.model().hash()
+            || h.parent_hash != self.original.model_hash
+            || h.candidate_hash != self.candidate_hash()
+            || h.model.generation != self.original.generation
+            || h.model.schema_hash != self.original.schema_hash
+            || now_ns < h.prepared_ns
+            || now_ns < h.snapshot.taken_ns
+            || now_ns - h.snapshot.taken_ns > 50_000_000
+        {
+            return Err(Error::Stale);
+        }
+        match h.role {
+            super::worker_wire::Role::ShadowScore
+                if self.stage == Stage::Shadow
+                    && now_ns / WINDOW_NS == self.shadow_next
+                    && h.model == self.original
+                    && h.permit.is_none() =>
+            {
+                Ok(())
+            }
+            super::worker_wire::Role::CanaryScore if self.stage == Stage::Canary => {
+                let p = self.permit.ok_or(Error::State)?;
+                if h.permit != Some(p)
+                    || h.target != p.target
+                    || h.model.model_hash != p.candidate_hash
+                    || h.family
+                        != (Family {
+                            domain: 15,
+                            kind: 1,
+                        })
+                    || now_ns < p.start_ns
+                    || now_ns >= p.expires_ns
+                {
+                    return Err(Error::Stale);
+                }
+                if self.pending.is_some() {
+                    return Err(Error::Unknown);
+                }
+                if self.last_submit_window == Some((now_ns - p.start_ns) / WINDOW_NS)
+                    || self.submitted >= usize::from(p.quota)
+                {
+                    return Err(Error::Budget);
+                }
+                Ok(())
+            }
+            _ => Err(Error::State),
+        }
+    }
+    /// Import is bounded identity/output checking; it never replays an MLP in
+    /// EL1. The runtime authenticates exact stopped-job custody and this same
+    /// settled receipt, which record_shadow/PUBLISH must subsequently consume.
+    pub fn accept_score(
+        &self,
+        job: &mut super::score::PreparedScore,
+        output: &[u8],
+        cost: &WorkReceipt,
+        authority: &impl super::worker::CompletionAuthority,
+        now_ns: u64,
+    ) -> Result<super::score::Scored, Error> {
+        let h = job.header();
+        self.score_context(h, now_ns)?;
+        let report = job.authenticate(output, cost, authority, now_ns)?;
+        let receipt = cost.identity();
+        let role = match h.role {
+            super::worker_wire::Role::ShadowScore => Role::Shadow,
+            super::worker_wire::Role::CanaryScore => Role::Canary,
+            _ => return Err(Error::State),
+        };
+        let selected = job.action(report.selected)?;
+        let mut hash = Sha256::new();
+        hash.update(b"CYXIA_PROTECTED_SCORE_PROOF_1.3\0");
+        hash.update(report.identity.input_hash);
+        hash.update(report.transcript_hash);
+        hash.update(h.set_hash);
+        hash.update(h.registration_hash);
+        hash.update(report.selected.to_le_bytes());
+        for v in &report.scores[..usize::from(report.count)] {
+            hash.update(v.to_le_bytes());
+        }
+        let proof = ScoreProof {
+            ledger_id: receipt.ledger_id,
+            registration_hash: h.registration_hash,
+            credit_serial: receipt.serial,
+            window: receipt.window,
+            role,
+            cpu: receipt.cpu,
+            core_generation: receipt.core_generation,
+            family: h.family,
+            target: h.target,
+            snapshot_ns: h.snapshot.taken_ns,
+            model: h.model,
+            candidate_set_hash: h.set_hash,
+            selected_index: report.selected,
+            selected,
+            score_count: report.count,
+            scores: report.scores,
+            hash: hash.finalize().into(),
+        };
+        Ok(super::score::Scored::new(proof, report))
     }
     fn score(
         &self,
@@ -563,6 +814,7 @@ impl<'a, 'model> Governance<'a, 'model> {
         let old = Model::parse(self.old).map_err(|_| Error::Model)?;
         let mut best = 0;
         let mut score = i16::MIN;
+        let mut all_scores = [0; 32];
         let mut hash = Sha256::new();
         hash.update(set.hash());
         hash.update(self.candidate.registration_hash());
@@ -573,6 +825,7 @@ impl<'a, 'model> Governance<'a, 'model> {
                 .map_err(|_| Error::Evidence)?
                 .values;
             let trace = runtime.trace(&input);
+            all_scores[index] = trace.output;
             if trace != integer_reference(self.candidate.model().bytes(), &input) {
                 return Err(Error::Validation);
             }
@@ -598,7 +851,14 @@ impl<'a, 'model> Governance<'a, 'model> {
             Some(first.action),
         )
         .map_err(|_| Error::Evidence)?;
-        if rebuilt.hash() != set.hash() {
+        let rebuilt_hash = match set.canary_permit() {
+            Some(permit) if role == Role::Canary && self.permit == Some(permit) => rebuilt
+                .hash_for_canary(permit)
+                .map_err(|_| Error::Evidence)?,
+            Some(_) => return Err(Error::Stale),
+            None => rebuilt.hash(),
+        };
+        if rebuilt_hash != set.hash() {
             return Err(Error::Evidence);
         }
         hash.update((best as u16).to_le_bytes());
@@ -614,7 +874,11 @@ impl<'a, 'model> Governance<'a, 'model> {
             target: set.target,
             snapshot_ns: set.snapshot.taken_ns,
             model: expected,
+            candidate_set_hash: set.hash(),
+            selected_index: best as u16,
             selected: set.get(best).ok_or(Error::Evidence)?.action,
+            score_count: set.len() as u16,
+            scores: all_scores,
             hash: hash.finalize().into(),
         })
     }
@@ -689,8 +953,8 @@ impl<'a, 'model> Governance<'a, 'model> {
         if self.stage != Stage::Ready
             || gate.active != self.original
             || gate.permit.is_some()
+            || gate.closing.is_some()
             || gate.restore.is_some()
-            || now_ns % WINDOW_NS != 0
             || now_ns < shadow_finished
         {
             return Err(Error::State);
@@ -704,17 +968,27 @@ impl<'a, 'model> Governance<'a, 'model> {
         target.baseline.validate().map_err(|_| Error::Schema)?;
         authority.registered_noncritical_console(target)?;
         authority.legal_console(target.key, target.baseline, now_ns)?;
-        gate.next_permit = gate.next_permit.checked_add(1).ok_or(Error::Numeric)?;
+        let remainder = now_ns % WINDOW_NS;
+        let start_ns = if remainder == 0 {
+            now_ns
+        } else {
+            now_ns
+                .checked_add(WINDOW_NS - remainder)
+                .ok_or(Error::Numeric)?
+        };
+        let expires_ns = start_ns.checked_add(10_000_000_000).ok_or(Error::Numeric)?;
+        let next_permit = gate.next_permit.checked_add(1).ok_or(Error::Numeric)?;
         let permit = CanaryPermit {
-            id: gate.next_permit,
+            id: next_permit,
             active_generation: self.original.generation,
             candidate_hash: self.candidate.model().manifest().parameters_hash,
             target: target.key,
-            start_ns: now_ns,
-            expires_ns: now_ns.checked_add(10_000_000_000).ok_or(Error::Numeric)?,
+            start_ns,
+            expires_ns,
             windows: 100,
             quota: 100,
         };
+        gate.next_permit = next_permit;
         gate.permit = Some(permit);
         self.permit = Some(permit);
         self.target = Some(target);
@@ -733,6 +1007,10 @@ impl<'a, 'model> Governance<'a, 'model> {
                 .is_none_or(|c| c.action.domain() != 15 || c.action.kind() != 1)
         {
             return Err(Error::State);
+        }
+        let permit = self.permit.ok_or(Error::State)?;
+        if credit.start_ns < permit.start_ns || credit.start_ns >= permit.expires_ns {
+            return Err(Error::Deadline);
         }
         self.score(set, credit, Role::Canary)
     }
@@ -1017,14 +1295,50 @@ impl<'a, 'model> Governance<'a, 'model> {
         self.stage = Stage::Frozen;
         Ok(())
     }
+    /// Native end-of-observation transition, in the root commit critical
+    /// section. It revokes all new Canary publication while retaining a
+    /// distinct exact token for bounded, already-owned finalization only.
+    pub fn freeze_at(&mut self, gate: &mut CommitGate, now_ns: u64) -> Result<(), Error> {
+        if !matches!(self.stage, Stage::Canary | Stage::Frozen) {
+            return Err(Error::State);
+        }
+        let permit = self.permit.ok_or(Error::State)?;
+        if now_ns < permit.start_ns {
+            return Err(Error::Deadline);
+        }
+        let deadline = match self.closing_deadline_ns {
+            Some(deadline) => deadline,
+            None => now_ns
+                .min(permit.expires_ns)
+                .checked_add(CLOSING_NS)
+                .ok_or(Error::Numeric)?,
+        };
+        gate.freeze_permit(permit)?;
+        self.closing_deadline_ns = Some(deadline);
+        self.stage = Stage::Frozen;
+        if now_ns > deadline {
+            self.abort(gate, Error::Deadline);
+            return Err(Error::Deadline);
+        }
+        Ok(())
+    }
+    pub fn closing_deadline_ns(&self) -> Option<u64> {
+        self.closing_deadline_ns
+    }
     pub fn promote(&mut self, gate: &mut CommitGate, now_ns: u64) -> Result<ModelBinding, Error> {
         let permit = self.permit.ok_or(Error::State)?;
         if self.stage != Stage::Frozen {
             return Err(Error::State);
         }
-        if now_ns < permit.start_ns + 10_000_000_000 || now_ns > permit.expires_ns {
+        if now_ns
+            < permit
+                .start_ns
+                .checked_add(10_000_000_000)
+                .ok_or(Error::Numeric)?
+        {
             return Err(Error::Deadline);
         }
+        self.freeze_at(gate, now_ns)?;
         if self.pending.is_some()
             || self.history[..self.submitted]
                 .iter()
@@ -1080,10 +1394,11 @@ impl<'a, 'model> Governance<'a, 'model> {
                 }
             }
         }
-        if matches!(self.stage, Stage::Canary | Stage::Frozen)
-            && self.permit.is_some_and(|p| now_ns > p.expires_ns)
+        if self.stage == Stage::Frozen
+            || (self.stage == Stage::Canary && self.permit.is_some_and(|p| now_ns >= p.expires_ns))
         {
-            self.abort(gate, Error::Deadline);
+            // Late polling never restarts the closing interval at `now`.
+            let _ = self.freeze_at(gate, now_ns);
         }
     }
     pub fn restored(

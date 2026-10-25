@@ -83,11 +83,27 @@ fn owner_view()->ControlView{
         soft_timers:unsafe{(&*core::ptr::addr_of!(TIMERS)).soft_observation().0},timer_policy:unsafe{*core::ptr::addr_of!(TIMER_POLICY)}}
 }
 fn publish_view(){let _=CONTROL_VIEW.publish(owner_view());}
-fn read_view()->Result<ControlView,Error>{
-    if cpu::slot()==0{return Ok(owner_view())}
-    let view=CONTROL_VIEW.read().map_err(|_|Error::Busy)?.ok_or(Error::NotReady)?;
-    let now=now_ns();if now<view.published_ns || now-view.published_ns>50_000_000{return Err(Error::NotReady)}
-    Ok(view)
+// Keep the IRQ measurement array in its protected snapshot. Timer candidate
+// revalidation needs just one scalar or policy stamp, and must not copy all
+// IRQ observations on every legality/current-parameter check.
+#[inline(never)]
+fn inspect_owner<R>(inspect: impl FnOnce(&ControlView) -> Result<R, Error>) -> Result<R, Error> {
+    inspect(&owner_view())
+}
+fn inspect_view<R>(inspect: impl FnOnce(&ControlView) -> Result<R, Error>) -> Result<R, Error> {
+    if cpu::slot() == 0 {
+        return inspect_owner(inspect);
+    }
+    CONTROL_VIEW
+        .inspect(|view| {
+            let now = now_ns();
+            if now < view.published_ns || now - view.published_ns > 50_000_000 {
+                return Err(Error::NotReady);
+            }
+            inspect(view)
+        })
+        .map_err(|_| Error::Busy)?
+        .ok_or(Error::NotReady)?
 }
 fn owner() {
     assert_eq!(cpu::slot(), 0);
@@ -387,6 +403,9 @@ pub fn irq_complete(irq: u32) {
 pub fn unknown_irq() {
     increment(&UNKNOWN);
 }
+pub fn irq_key(irq: u32) -> Option<ObjectKey> {
+    slot(irq).ok().map(|_| ObjectKey { id: u64::from(irq), generation: 1 })
+}
 #[derive(Clone, Copy)]
 pub struct IrqObservation {
     pub handled: u64,
@@ -551,32 +570,9 @@ pub fn poll(now: u64) -> Result<(), Error> {
             if !LIVE[i].load(Ordering::Acquire) {
                 continue;
             }
-            let router = unsafe { (*core::ptr::addr_of_mut!(ROUTERS))[i].as_mut().unwrap() };
-            let progress = router.poll(now, &mut Hardware);
-            if let Ok(progress) = progress {
-                unsafe {
-                    (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress);
-                }
-                if progress == IrqProgress::Pending {
-                    continue;
-                }
-            }
-            let current = topology(i)?;
-            let legal = IRQ_ALLOWED & current.healthy_business & !current.draining;
-            let needed = ROUTE_BLOCKED[i].load(Ordering::Acquire)
-                || legal == 0
-                || legal.trailing_zeros() as u64 != TARGET[i].load(Ordering::Acquire);
-            if needed
-                && (router.policy_expired(now) || matches!(progress, Ok(IrqProgress::Degraded(_))))
-                && now >= unsafe { (*core::ptr::addr_of!(NEXT_RETRY))[i] }
-            {
-                let progress = router.force_baseline(now, &mut Hardware)?;
-                unsafe {
-                    (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress);
-                    (*core::ptr::addr_of_mut!(NEXT_RETRY))[i] =
-                        now.saturating_add(IRQ_ROUTE_TIMEOUT_NS);
-                }
-            }
+            let key = ObjectKey { id: IDS[i].load(Ordering::Acquire), generation: 1 };
+            crate::learning_evidence::measure(key,
+                cyxia_prototype::learning::reward::CpuClass::ExecutorAction, || poll_route(i, now))?;
         }
         unsafe {
             (&mut *core::ptr::addr_of_mut!(TIMERS)).poll(now, TIMER_SLOTS, &mut TimerEvents)?;
@@ -595,6 +591,27 @@ pub fn poll(now: u64) -> Result<(), Error> {
     publish_view();
     POLLING.store(false, Ordering::Release);
     result
+}
+fn poll_route(i: usize, now: u64) -> Result<(), Error> {
+    let router = unsafe { (*core::ptr::addr_of_mut!(ROUTERS))[i].as_mut().unwrap() };
+    let progress = router.poll(now, &mut Hardware);
+    if let Ok(progress) = progress {
+        unsafe { (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress); }
+        if progress == IrqProgress::Pending { return Ok(()); }
+    }
+    let current = topology(i)?;
+    let legal = IRQ_ALLOWED & current.healthy_business & !current.draining;
+    let needed = ROUTE_BLOCKED[i].load(Ordering::Acquire) || legal == 0
+        || legal.trailing_zeros() as u64 != TARGET[i].load(Ordering::Acquire);
+    if needed && (router.policy_expired(now) || matches!(progress, Ok(IrqProgress::Degraded(_))))
+        && now >= unsafe { (*core::ptr::addr_of!(NEXT_RETRY))[i] } {
+        let progress = router.force_baseline(now, &mut Hardware)?;
+        unsafe {
+            (*core::ptr::addr_of_mut!(ROUTE_RESULT))[i] = Some(progress);
+            (*core::ptr::addr_of_mut!(NEXT_RETRY))[i] = now.saturating_add(IRQ_ROUTE_TIMEOUT_NS);
+        }
+    }
+    Ok(())
 }
 fn sample_observations(now: u64) {
     let elapsed = now.saturating_sub(unsafe { *core::ptr::addr_of!(WINDOW_AT) });
@@ -674,7 +691,7 @@ fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
     if !READY.load(Ordering::Acquire){return None}
     if domain == 7 {
         return (ordinal == 0
-            && read_view().ok()?.soft_timers != 0)
+            && inspect_view(|view| Ok(view.soft_timers != 0)).ok()?)
             .then_some(TIMER_SERVICE);
     }
     (0..COUNT.load(Ordering::Acquire))
@@ -683,30 +700,38 @@ fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
         .and_then(|i| registered_irq(i).map(|v| v.0))
 }
 fn control_observe(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
-    let view=read_view()?;
-    if view.measurement_core!=CORE_GENERATION.load(Ordering::Acquire){return Err(Error::NotReady)}
     if domain == 7 {
         if key != TIMER_SERVICE {
             return Err(Error::Stale);
         }
-        return view.timer.ok_or(Error::NotReady);
+        return inspect_view(|view| {
+            if view.measurement_core != CORE_GENERATION.load(Ordering::Acquire) {
+                return Err(Error::NotReady);
+            }
+            view.timer.ok_or(Error::NotReady)
+        });
     }
     if key.generation != 1 {
         return Err(Error::Stale);
     }
     let i = slot(u32::try_from(key.id).map_err(|_| Error::Range)?)?;
-    view.irq[i].ok_or(Error::NotReady)
+    inspect_view(|view| {
+        if view.measurement_core != CORE_GENERATION.load(Ordering::Acquire) {
+            return Err(Error::NotReady);
+        }
+        view.irq[i].ok_or(Error::NotReady)
+    })
 }
 fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error> {
     if domain == 7 {
         if key != TIMER_SERVICE {
             return Err(Error::Stale);
         }
-        return Ok(Action::SoftCoalesce(
-            read_view()?.timer_policy
+        return inspect_view(|view| Ok(Action::SoftCoalesce(
+            view.timer_policy
                 .filter(|(_, s, _)| s.live(now_ns()))
                 .map_or(0, |(_, _, v)| v),
-        ));
+        )));
     }
     if key.generation != 1 {
         return Err(Error::Stale);
@@ -718,7 +743,8 @@ fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error>
 fn control_legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
     action.validate()?;
     match action {
-        Action::SoftCoalesce(_) if key == TIMER_SERVICE && read_view()?.soft_timers != 0 => Ok(()),
+        Action::SoftCoalesce(_) if key == TIMER_SERVICE
+            && inspect_view(|view| Ok(view.soft_timers != 0))? => Ok(()),
         Action::IrqTarget(cpu) if key.generation == 1 => {
             let i = slot(u32::try_from(key.id).map_err(|_| Error::Range)?)?;
             let t = topology(i)?;
@@ -818,7 +844,8 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind: 1,
             target: control_target,
-            observe: control_observe,
+            observe: |domain, target| control_observe(domain, target)
+                .map(cyxia_prototype::features::DomainObservation::complete),
             current: control_current,
             legal: control_legal,
             target_features: |action, key| {

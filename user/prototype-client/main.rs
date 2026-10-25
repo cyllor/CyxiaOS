@@ -134,6 +134,85 @@ fn mixed_vector(file_cap: u64, generation: u64, deadline: u64) -> u64 {
     0
 }
 
+/// Ordinary bounded demand for the installed file/cache policies. Dirty pages
+/// remain eligible for the background owner between calls; this client never
+/// fabricates a policy receipt or waits synchronously for an AI decision.
+#[inline(never)]
+fn file_workload(authority: file::Capability, deadline: u64) -> u64 {
+    let mut frame = file::Frame::new(file::OPEN, 18, authority);
+    frame.set_path("/domain-probe/value");
+    frame.set_u16(file::OFF_MODE, file::MODE_READ_WRITE);
+    if !file_call(&mut frame, deadline) || frame.result() != 0 {
+        return 132;
+    }
+    let (id, generation) = (
+        frame.u64(file::OFF_HANDLE_ID),
+        frame.u64(file::OFF_HANDLE_GENERATION),
+    );
+    let mut request = 19;
+    for turn in 0..8u64 {
+        let offset = (turn % 4) * 4096;
+        for word in 0..512u64 {
+            put(
+                0x50000 + word * 8,
+                0xc0ff_ee00_0000_0000 | (turn << 16) | word,
+            );
+        }
+        frame = file::Frame::new(file::WRITE, request, authority);
+        request += 1;
+        handle(&mut frame, id, generation);
+        frame.set_u64(file::OFF_OFFSET, offset);
+        frame.set_u64(file::OFF_DATA, 0x50000);
+        frame.set_u32(file::OFF_DATA_LENGTH, 4096);
+        if !file_call(&mut frame, deadline)
+            || frame.result() != 0
+            || frame.u64(file::OFF_COUNT) != 4096
+        {
+            return 133;
+        }
+        // Yield through the ordinary scheduler, leaving the storage owner free
+        // to execute its own admitted background work before the next read.
+        if !waiting(deadline) {
+            return 134;
+        }
+        for word in 0..512u64 {
+            put(0x50000 + word * 8, 0);
+        }
+        frame = file::Frame::new(file::READ, request, authority);
+        request += 1;
+        handle(&mut frame, id, generation);
+        frame.set_u64(file::OFF_OFFSET, offset);
+        frame.set_u64(file::OFF_DATA, 0x50000);
+        frame.set_u32(file::OFF_DATA_LENGTH, 4096);
+        if !file_call(&mut frame, deadline)
+            || frame.result() != 0
+            || frame.u64(file::OFF_COUNT) != 4096
+        {
+            return 135;
+        }
+        for word in 0..512u64 {
+            if get(0x50000 + word * 8) != 0xc0ff_ee00_0000_0000 | (turn << 16) | word {
+                return 136;
+            }
+        }
+    }
+    frame = file::Frame::new(file::FSYNC, request, authority);
+    handle(&mut frame, id, generation);
+    if !file_call(&mut frame, deadline)
+        || frame.result() != 0
+        || frame.u64(file::OFF_WRITE_SEQ) == 0
+        || frame.u64(file::OFF_WRITE_SEQ) != frame.u64(file::OFF_DURABLE_SEQ)
+    {
+        return 137;
+    }
+    frame = file::Frame::new(file::CLOSE, request + 1, authority);
+    handle(&mut frame, id, generation);
+    if !file_call(&mut frame, deadline) || frame.result() != 0 {
+        return 138;
+    }
+    0
+}
+
 #[inline(never)]
 fn files(authority: file::Capability, deadline: u64) -> u64 {
     let mut frame = file::Frame::new(file::MKDIR, 1, authority);
@@ -281,12 +360,16 @@ fn files(authority: file::Capability, deadline: u64) -> u64 {
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 118;
     }
-    frame = file::Frame::new(file::UNLINK, 16, authority);
+    let workload = file_workload(authority, deadline);
+    if workload != 0 {
+        return workload;
+    }
+    frame = file::Frame::new(file::UNLINK, 100, authority);
     frame.set_path("/domain-probe/value");
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 119;
     }
-    frame = file::Frame::new(file::UNLINK, 17, authority);
+    frame = file::Frame::new(file::UNLINK, 101, authority);
     frame.set_path("/domain-probe");
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 120;

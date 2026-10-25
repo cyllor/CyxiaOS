@@ -16,7 +16,11 @@ pub fn candidate(input: &[u64; INPUT_WORDS], index: usize) -> Result<(Action, Ra
     }
     let at = 64 + index * 10;
     let len = usize::try_from(input[at]).map_err(|_| Error::Range)?;
-    if !(3..=16).contains(&len) || input[at + 7] & !15 != 0 || input[at + 9] != 0 {
+    if !(3..=16).contains(&len)
+        || input[at + 7] & !15 != 0
+        || input[at + 9] != 0
+        || input[40] & !u64::from(features::DOMAIN_PRESENT_ALL) != 0
+    {
         return Err(Error::Format);
     }
     let mut payload = [0; 16];
@@ -52,6 +56,7 @@ pub fn candidate(input: &[u64; INPUT_WORDS], index: usize) -> Result<(Action, Ra
     let raw = RawFeatures {
         common: input[24..32].try_into().map_err(|_| Error::Format)?,
         domain: input[32..36].try_into().map_err(|_| Error::Format)?,
+        domain_present: input[40] as u8,
         target,
         control_capacity,
     };

@@ -12,6 +12,9 @@ use cyxia_prototype::{
     policy::ExecutionState,
 };
 
+#[path = "domain_services/console_baseline.rs"]
+mod console_baseline;
+
 const CORE_ID: u64 = 0x434f5245;
 const BACKGROUND_TIMER_ID: u64 = 2;
 const BACKGROUND_PERIOD: u64 = 10_000_000;
@@ -305,6 +308,12 @@ pub fn init() -> Result<(), Error> {
 pub fn console_ready() -> bool {
     CONSOLE_READY.load(Ordering::Acquire)
 }
+/// Only the ordinary framed console pump is a Canary target. Critical boot
+/// and panic UART paths do not use this queued batch policy.
+pub fn canary_target() -> Result<cyxia_prototype::learning::governance::TargetRegistration, Error> {
+    if !console_ready() { return Err(Error::NotReady); }
+    read(|view| console_baseline::registration(view.console_key, view.console_poisoned))
+}
 struct Frame {
     bytes: [u8; 128],
     used: usize,
@@ -526,19 +535,23 @@ fn poll_services(s: &mut State, now: u64) -> Result<(), Error> {
             continue;
         };
         if let Some(apply) = service.active {
-            let old = s.recovery.query(apply)?;
-            let receipt = s.recovery.poll(apply, now, &mut Recovery { apply })?;
-            if receipt.state.terminal() {
-                service.active = None;
-                if receipt.state == ExecutionState::Applied {
-                    service.key.generation = receipt.generation;
-                    service.pending_probe = None;
-                    service.next_probe = now;
-                    service.since = now;
-                } else if old.state != receipt.state {
-                    count_error(service, now);
+            crate::learning_evidence::measure(apply.target,
+                cyxia_prototype::learning::reward::CpuClass::ExecutorAction, || {
+                let old = s.recovery.query(apply)?;
+                let receipt = s.recovery.poll(apply, now, &mut Recovery { apply })?;
+                if receipt.state.terminal() {
+                    service.active = None;
+                    if receipt.state == ExecutionState::Applied {
+                        service.key.generation = receipt.generation;
+                        service.pending_probe = None;
+                        service.next_probe = now;
+                        service.since = now;
+                    } else if old.state != receipt.state {
+                        count_error(service, now);
+                    }
                 }
-            }
+                Ok::<(), Error>(())
+            })?;
         }
         // Real readonly IPC requests and EL0 replies supply liveness. No timer
         // callback or generation assignment manufactures a heartbeat.
@@ -858,6 +871,7 @@ fn core_apply(
     if (apply.controller_epoch, apply.plan_seq) <= s.core_seen {
         return Err(Error::Stale);
     }
+    PolicyStamp::default().accepts_action(Action::ControlSet(mask), stamp, now)?;
     legal_locked(s, Action::ControlSet(mask), apply.target, now)?;
     if s.core_records.iter().flatten().any(|r| !r.state.terminal()) {
         return Err(Error::Busy);
@@ -910,16 +924,15 @@ fn apply(
         match action {
             Action::ControlSet(mask) => core_apply(s, mask, id, stamp, now),
             Action::RecoveryRecipe(recipe) => {
-                if let Ok(old) = s.recovery.query(id) {
-                    return if old.recipe == recipe {
-                        Ok(old.state)
-                    } else {
-                        Err(Error::Conflict)
-                    };
+                if s.recovery.query(id).is_ok() {
+                    return s
+                        .recovery
+                        .begin_policy(id, recipe, stamp, now)
+                        .map(|r| r.state);
                 }
                 legal_locked(s, action, id.target, now)?;
                 let i = service_index(s, id.target)?;
-                let receipt = s.recovery.begin(id, recipe, now)?;
+                let receipt = s.recovery.begin_policy(id, recipe, stamp, now)?;
                 if recipe != 0 {
                     let service = s.services[i].as_mut().ok_or(Error::Stale)?;
                     service.last_restart = Some(now);
@@ -1010,7 +1023,8 @@ pub fn register_control() -> Result<(), Error> {
             domain,
             kind,
             target,
-            observe: observation,
+            observe: |domain, target| observation(domain, target)
+                .map(cyxia_prototype::features::DomainObservation::complete),
             current,
             legal,
             target_features,

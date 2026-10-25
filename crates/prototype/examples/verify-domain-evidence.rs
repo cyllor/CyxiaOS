@@ -48,7 +48,7 @@ fn main() -> Result<(), String> {
     let package = if args.len() == 3 {
         fs::read(&args[2]).map_err(|e| e.to_string())?
     } else {
-        abi::model_bytes().to_vec()
+        abi::domain_model_bytes().to_vec()
     };
     let parsed = model::Model::parse(&package).map_err(|e| format!("model: {e:?}"))?;
     let model_hash: [u8; 32] = Sha256::digest(&package).into();
@@ -195,7 +195,16 @@ fn main() -> Result<(), String> {
             expected[..64] == r[544..608],
             "EL0 reply differs from exact schema/model/Plan replay",
         )?;
-        require(r[17] == expected[4], "selected candidate receipt binding")?;
+        // Admission can reject an authentic reply before decoding a selection:
+        // elapsed/CPU overflow or a changed protected snapshot generation. The
+        // raw reply still must replay exactly, and no version may be published.
+        // Every decoded or published selection must retain the exact index.
+        let rejected_before_selection = r[13] == 0
+            && r[14] == 3
+            && matches!(r[15], 4 | 8 | 19)
+            && r[17] == u64::MAX;
+        require(r[17] == expected[4] || rejected_before_selection,
+            "selected candidate receipt binding")?;
         replayed += 1;
         domains.insert(r[2]);
         if r[13] == 0 {

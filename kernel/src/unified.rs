@@ -271,6 +271,10 @@ fn drain_network(tcp: &mut NativeTcp<'_>, epoch: u64) {
 }
 
 fn network_turn(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
+    crate::domain_tasks::service_segment(|| network_turn_owned(tcp, epoch))
+        .unwrap_or_else(|| tcp.as_ref().map_or(Ok(TcpState::Closed), Tcp::state))
+}
+fn network_turn_owned(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
     let state = match tcp.as_mut() {
         Some(link) => link.poll(Board.now_ms()),
         None => Ok(TcpState::Closed),
@@ -328,7 +332,7 @@ fn service_start(
     epoch: u64,
 ) -> u64 {
     loop {
-        if crate::domain_tasks::begin_service(Board.now_ns()).is_some() {
+        if crate::domain_tasks::begin_service_segment().is_some() {
             return Board.now_ns();
         }
         progress(coordinator, tcp, epoch);
@@ -442,6 +446,7 @@ pub fn run(info: &BootInfo) -> ! {
     let mut connection_epoch = 0u64;
     let mut entropy_failed = false;
     let mut refresh_input = true;
+    let mut learning_installed = false;
     loop {
         // Only TCP state is reconstructed. The NIC and all DMA buffers retain
         // their original owner for the entire boot, including poisoned queues.
@@ -497,6 +502,21 @@ pub fn run(info: &BootInfo) -> ! {
         let mut terminal_since = None;
         loop {
             coordinator.poll();
+            if !learning_installed {
+                match crate::domain_tasks::service_segment(|| {
+                    crate::smp::prototype_runtime::install_learning_capture(*LOCAL, boot.epoch)
+                }) {
+                    Some(Ok(())) => {
+                        learning_installed = true;
+                        UNIFIED_EVIDENCE.words[28].store(1, Ordering::Release);
+                    }
+                    None | Some(Err(Error::Busy | Error::Again | Error::NotReady)) => {}
+                    Some(Err(error)) => {
+                        UNIFIED_EVIDENCE.words[29].store(error as u64 + 1, Ordering::Release);
+                        fail(37);
+                    }
+                }
+            }
             let _ = crate::domain_platform::poll(Board.now_ns());
             let state = network_turn(&mut tcp, stream_epoch);
             let now = Board.now_ms();
@@ -586,13 +606,13 @@ pub fn run(info: &BootInfo) -> ! {
                     crate::domain_platform::next_deadline_ticks(hard),
                 );
             }
-            finish_service(entered);
             UNIFIED_EVIDENCE.words[2].fetch_add(1, Ordering::Relaxed);
             // Feedback is accepted only at a completed, unchanged even
             // publication sequence; an IRQ may interrupt the EL0 writer.
             unsafe {
                 crate::domain_network::observe(&*shared());
             }
+            finish_service(entered);
             if context.kind == 9 {
                 UNIFIED_EVIDENCE.words[3].fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -645,19 +665,24 @@ pub fn run(info: &BootInfo) -> ! {
                         ) && stream_epoch != 0,
                     );
                 }
-                abi::OP_READ => match tcp
-                    .as_mut()
-                    .map(|link| link.receive_tls(&mut p.payload[..len]))
-                    .unwrap_or(Err(TcpError::Closed))
-                {
-                    Ok(n) => {
-                        p.len = n as u64;
-                        UNIFIED_EVIDENCE.words[5].fetch_add(n as u64, Ordering::Relaxed);
+                abi::OP_READ => {
+                    let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
+                    match tcp
+                        .as_mut()
+                        .map(|link| link.receive_tls(&mut p.payload[..len]))
+                        .unwrap_or(Err(TcpError::Closed))
+                    {
+                        Ok(n) => {
+                            p.len = n as u64;
+                            UNIFIED_EVIDENCE.words[5].fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(TcpError::WouldBlock) => p.status = abi::AGAIN,
+                        Err(_) => p.status = abi::EOF,
                     }
-                    Err(TcpError::WouldBlock) => p.status = abi::AGAIN,
-                    Err(_) => p.status = abi::EOF,
-                },
+                    finish_service(started);
+                }
                 abi::OP_WRITE => {
+                    let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
                     if stream_epoch == 0 || tcp.is_none() {
                         p.status = abi::EOF;
                     } else if p.arg0 == 0 {
@@ -668,7 +693,9 @@ pub fn run(info: &BootInfo) -> ! {
                         // Equal-prefix retries reuse its original grant/ID,
                         // even though this SVC sequence has advanced.
                         let result = crate::domain_tasks::network_write(
-                            stream_epoch, sequence, &p.payload[..len],
+                            stream_epoch,
+                            sequence,
+                            &p.payload[..len],
                         );
                         match result {
                             Ok(n) => p.len = n as u64,
@@ -702,6 +729,7 @@ pub fn run(info: &BootInfo) -> ! {
                             Err(_) => p.status = abi::EOF,
                         }
                     }
+                    finish_service(started);
                 }
                 abi::OP_STORE_GET | abi::OP_STORE_PUT => {
                     let (status, n, value) =
@@ -726,17 +754,22 @@ pub fn run(info: &BootInfo) -> ! {
                 }
                 abi::OP_STORE_FLUSH => p.len = 0, // PUT already committed and FLUSHed.
                 abi::OP_TASK => {
-                    let live = matches!(
-                        network_turn(&mut tcp, stream_epoch),
-                        Ok(TcpState::Established)
-                    ) && stream_epoch != 0;
+                    let _ = network_turn(&mut tcp, stream_epoch);
+                    let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
+                    // Waiting for the full mechanism credit may advance a
+                    // socket or a contract deadline. Revalidate at admission,
+                    // never using the earlier SVC capture time/connectivity.
+                    let live = tcp
+                        .as_ref()
+                        .is_some_and(|link| link.state() == Ok(TcpState::Established))
+                        && stream_epoch != 0;
                     let (status, n, value) = crate::unified_task::request(
                         p.arg0,
                         p.arg1,
                         p.arg2,
                         &mut p.payload,
                         len,
-                        now,
+                        Board.now_ms(),
                         live,
                         connection_epoch,
                     );
@@ -750,16 +783,20 @@ pub fn run(info: &BootInfo) -> ! {
                     UNIFIED_EVIDENCE.words[12].store(max, Ordering::Release);
                     UNIFIED_EVIDENCE.words[8].store(starts, Ordering::Relaxed);
                     UNIFIED_EVIDENCE.words[9].store(finishes, Ordering::Release);
+                    finish_service(started);
                 }
                 abi::OP_CLOSE => {
+                    let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
                     p.len = 0;
                     crate::unified_task::transport(false);
                     if let Some(link) = tcp.as_mut() {
                         link.close(Board.now_ms());
                     }
                     terminal_since.get_or_insert(Board.now_ms());
+                    finish_service(started);
                 }
                 abi::OP_TRACE => {
+                    let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
                     if p.arg0 & abi::TRACE_FATAL_BIT != 0 {
                         let code = (p.arg0 & !abi::TRACE_FATAL_BIT).max(1);
                         let _ = UNIFIED_EVIDENCE.words[15].compare_exchange(
@@ -779,6 +816,7 @@ pub fn run(info: &BootInfo) -> ! {
                         p.arg0, p.arg1, p.arg2, now
                     ));
                     p.len = 0;
+                    finish_service(started);
                 }
                 _ => p.status = abi::FAILED,
             }

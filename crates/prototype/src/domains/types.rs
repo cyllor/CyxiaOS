@@ -49,6 +49,17 @@ pub struct PolicyStamp {
 
 impl PolicyStamp {
     pub fn new(version: u64, snapshot_ns: u64, now_ns: u64) -> Result<Self, Error> {
+        Self::for_action(Action::CpuWeight(1), version, snapshot_ns, now_ns)
+    }
+
+    /// One-shot actions have an admission deadline, but no installed lease.
+    /// Their execution and outstanding obligations follow the action owner.
+    pub fn for_action(
+        action: Action,
+        version: u64,
+        snapshot_ns: u64,
+        now_ns: u64,
+    ) -> Result<Self, Error> {
         if version == 0 {
             return Err(Error::Stale);
         }
@@ -61,7 +72,11 @@ impl PolicyStamp {
         Ok(Self {
             version,
             snapshot_ns,
-            installed_until_ns: snapshot_ns.checked_add(POLICY_NS).ok_or(Error::Overflow)?,
+            installed_until_ns: if action.one_shot() {
+                0
+            } else {
+                snapshot_ns.checked_add(POLICY_NS).ok_or(Error::Overflow)?
+            },
         })
     }
 
@@ -71,12 +86,16 @@ impl PolicyStamp {
 
     /// Exact retry is idempotent, including after expiry. It never extends TTL.
     pub fn accepts(self, next: Self, now_ns: u64) -> Result<(), Error> {
+        self.accepts_action(Action::CpuWeight(1), next, now_ns)
+    }
+
+    pub fn accepts_action(self, action: Action, next: Self, now_ns: u64) -> Result<(), Error> {
         if next.version == 0 {
             return Err(Error::Stale);
         }
         if next.version == self.version {
             return if self == next {
-                Ok(())
+                next.validate_action(action)
             } else {
                 Err(Error::Conflict)
             };
@@ -84,7 +103,27 @@ impl PolicyStamp {
         if next.version < self.version {
             return Err(Error::Stale);
         }
-        if next != Self::new(next.version, next.snapshot_ns, now_ns)? {
+        next.validate_action(action)?;
+        if next != Self::for_action(action, next.version, next.snapshot_ns, now_ns)? {
+            return Err(Error::Format);
+        }
+        Ok(())
+    }
+
+    /// Validate immutable shape independently of current time, so an exact
+    /// old receipt remains reconcilable without renewing its admission window.
+    pub fn validate_action(self, action: Action) -> Result<(), Error> {
+        if self.version == 0 {
+            return Err(Error::Stale);
+        }
+        let expected = if action.one_shot() {
+            0
+        } else {
+            self.snapshot_ns
+                .checked_add(POLICY_NS)
+                .ok_or(Error::Overflow)?
+        };
+        if self.installed_until_ns != expected {
             return Err(Error::Format);
         }
         Ok(())

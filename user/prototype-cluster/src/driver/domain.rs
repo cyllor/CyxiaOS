@@ -2,10 +2,10 @@
 //! LOCAL broker; a lost reply remains UNKNOWN and is subsequently only queried.
 use super::*;
 use cyxia_prototype::domains::{
-    ApplyId, Error as DomainError, ObjectKey, PolicyStamp, platform::*,
+    ApplyId, Error as DomainError, ObjectKey, platform::*,
 };
 use cyxia_prototype_cluster::{
-    domain_ingress::{policy_stamp, receipt},
+    domain_ingress::{accept_placement_policy, policy_stamp, receipt},
     domain_placement::{self as journal, QuoteWire, Record},
 };
 
@@ -143,13 +143,7 @@ impl NativeDomains {
             generation: input.placement_request_generation,
         };
         let result = (|| {
-            let stamp = policy_stamp(p)?;
-            let old = if self.placement.version == 0 {
-                PolicyStamp::default()
-            } else {
-                policy_stamp(self.placement)?
-            };
-            old.accepts(stamp, now)?;
+            accept_placement_policy(self.placement, p, now)?;
             if self.placement.version == p.version {
                 return Err(DomainError::Conflict);
             }

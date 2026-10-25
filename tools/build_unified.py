@@ -16,7 +16,7 @@ from doctor import ROOT,env
 from verify_smp import require
 
 
-CODE_ROOTS={'kernel','crates','user','.cargo'}
+CODE_ROOTS={'kernel','crates','user','ports','.cargo'}
 ROOT_BUILD_FILES={'Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchain'}
 EXCLUDED_COMPONENTS={'tests','docs','target','__pycache__','.git'}
 

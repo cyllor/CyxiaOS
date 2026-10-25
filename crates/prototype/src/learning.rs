@@ -5,9 +5,14 @@ pub mod data;
 pub mod governance;
 pub mod manifest;
 pub mod reward;
+pub mod score;
+pub mod score_wire;
+pub mod seed;
 pub mod softfloat;
 pub mod train;
 pub mod validate;
+pub mod worker;
+pub mod worker_wire;
 
 pub const FAMILIES: usize = 18;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

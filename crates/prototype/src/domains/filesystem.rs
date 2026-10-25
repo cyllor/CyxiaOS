@@ -870,6 +870,98 @@ impl<const C: usize> FileSystem<C> {
             p.valid && p.inode == id && p.logical == logical && p.physical == physical
         })
     }
+    /// Inspect a stopped caller's actual read without loading pages or changing
+    /// cache recency. Pure cache hits, EOF, and cache admission blocked by dirty
+    /// debt do not advertise a DMA demand to the ordinary I/O arbiter.
+    pub fn read_io_demand(
+        &self,
+        h: Handle,
+        offset: u64,
+        length: usize,
+        now: u64,
+        prefetch_admitted: bool,
+    ) -> Result<bool, Error> {
+        let open = self.opened(h)?;
+        if !matches!(open.mode, OpenMode::Read | OpenMode::ReadWrite) {
+            return Err(Error::Auth);
+        }
+        if length > MAX_IO {
+            return Err(Error::Range);
+        }
+        let inode = self.inodes[open.inode];
+        if length == 0 || offset >= inode.size {
+            return Ok(false);
+        }
+        let end = offset + (length as u64).min(inode.size - offset);
+        let first = offset / BLOCK_SIZE as u64;
+        let demand_end = end.div_ceil(BLOCK_SIZE as u64);
+        let extra = if prefetch_admitted && self.stamp.live(now) {
+            u64::from(self.readahead)
+        } else {
+            0
+        };
+        let last = (demand_end + extra).min(inode.size.div_ceil(BLOCK_SIZE as u64));
+        self.range_io_demand(open.inode, first as u32, last as u32, false)
+    }
+    /// Newly extended zero-filled pages are only dirty memory until writeback.
+    /// A write needs foreground disk reads solely for an uncached old page.
+    pub fn write_io_demand(&self, h: Handle, offset: u64, length: usize) -> Result<bool, Error> {
+        let open = self.opened(h)?;
+        if !matches!(open.mode, OpenMode::Write | OpenMode::ReadWrite) {
+            return Err(Error::Auth);
+        }
+        let inode = self.inodes[open.inode];
+        if length > MAX_IO || offset > inode.size {
+            return Err(Error::Range);
+        }
+        let end = offset.checked_add(length as u64).ok_or(Error::Overflow)?;
+        if end > MAX_FILE_SIZE {
+            return Err(Error::Range);
+        }
+        if length == 0 {
+            return Ok(false);
+        }
+        self.range_io_demand(
+            open.inode,
+            (offset / BLOCK_SIZE as u64) as u32,
+            end.div_ceil(BLOCK_SIZE as u64)
+                .min(inode.size.div_ceil(BLOCK_SIZE as u64)) as u32,
+            true,
+        )
+    }
+    pub fn readdir_io_demand(&self, h: Handle) -> Result<bool, Error> {
+        let open = self.opened(h)?;
+        if open.mode != OpenMode::Directory {
+            return Err(Error::NotDirectory);
+        }
+        // readdir always refreshes the reserved directory's durable metadata.
+        Ok(true)
+    }
+    fn range_io_demand(&self, id: usize, first: u32, end: u32, write: bool) -> Result<bool, Error> {
+        let count = end.saturating_sub(first);
+        if count == 0 {
+            return Ok(false);
+        }
+        // A 64KiB demand can cross 17 pages, with at most 64 prefetch pages.
+        if count > 81 {
+            return Err(Error::Range);
+        }
+        if self.resident > self.cache_budget {
+            return Ok(false);
+        }
+        let mut available = self.resident < self.cache_budget;
+        let mut present = 0u128;
+        for page in &self.cache {
+            let inside = page.valid && page.inode == id && (first..end).contains(&page.logical);
+            if inside && physical(&self.inodes[id], page.logical)? == page.physical {
+                present |= 1u128 << (page.logical - first);
+            }
+            // Writes pin their existing destination pages before admitting a
+            // miss, so those pages cannot serve as the eviction backing.
+            available |= page.valid && !page.dirty && !page.pinned && !(write && inside);
+        }
+        Ok(available && present != (1u128 << count) - 1)
+    }
     fn page<D: BlockDevice>(
         &mut self,
         id: usize,

@@ -41,7 +41,13 @@ CONTROL_MAGIC = 0x435958444F4D3031
 UNIFIED_MAGIC = 0x435958554E493031
 IPI_MAGIC = 0x4359495049000001
 CONTROL_CREDIT_MAGIC = 0x4359434352454401
+CONTROL_POOL_MAGIC = 0x435943504F4F4C01
+LEARNING_MAGIC = 0x43594C4541524E01
 RUNTIME_MAGIC = 0x43595852554E3133
+# The actual cluster Driver closes after 1.5 guest seconds without an RPC.
+# Keep the NIC down for at least two guest seconds AND observe that close;
+# elapsed host time alone cannot satisfy either condition under icount.
+RECONNECT_OUTAGE_NS = 2_000_000_000
 CONTROL_WORDS = 512 + 64 * 640
 ALL_FAMILIES = (1 << 18) - 1
 # Older service images reported these startup errors through OP_TRACE and then
@@ -60,7 +66,8 @@ REQUIRED = {
     "IPI_EVIDENCE": 4096,
 }
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64,
-            "TASK_SLICE_EVIDENCE": 1024}
+            "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
+            "LEARNING_V13_EVIDENCE": 1024}
 
 
 def require(condition, message):
@@ -220,7 +227,156 @@ def parse_runtime(data):
     return {"control_mask": w[6], "business_mask": w[7],
             "quarantined_mask": w[9], "core_generation": w[10],
             "control_max_debit": w[35], "control_ticks": w[36],
-            "control_faults": w[38], "failed_cpus": w[56]}
+            "control_faults": w[38], "failed_cpus": w[56],
+            "publication": w[2], "clock_ticks": w[3], "timer_frequency": w[4],
+            "boot_epoch": w[32], "inferences": w[14], "business_cpu3": w[20]}
+
+
+class ReconnectProbe:
+    """A real link transition with independently observed guest progress.
+
+    Every sample is parsed by the usual budget/fault gates before entering this
+    state machine. The post-command baseline deliberately comes from the next
+    capture, so pre-disconnection execution cannot count as outage progress.
+    """
+    def __init__(self):
+        self.phase = "waiting"
+        self.before_down = None
+        self.during_down = None
+        self.before_up = None
+        self.after_up = None
+        self.previous = None
+        self.progress = []
+        self.commands = []
+
+    @staticmethod
+    def snapshot(guest):
+        unified, runtime = guest.get("unified"), guest.get("runtime")
+        if unified is None or runtime is None:
+            return None
+        require(runtime["publication"] > 0 and runtime["timer_frequency"] > 0,
+                "reconnect needs a published guest clock")
+        require(runtime["boot_epoch"] == unified["boot_epoch"],
+                "reconnect runtime/unified BootEpoch mismatch")
+        return {"boot_epoch": unified["boot_epoch"],
+                "ticks": runtime["clock_ticks"], "frequency": runtime["timer_frequency"],
+                "inferences": runtime["inferences"], "business_cpu3": runtime["business_cpu3"],
+                "sent_bytes": unified["sent_bytes"], "received_bytes": unified["received_bytes"],
+                "events": list(unified["events"])}
+
+    def set_links(self, guests, up):
+        for node, guest in enumerate(guests, 1):
+            guest["qmp"].execute("set_link", {"name": "eth0", "up": up})
+            self.commands.append({"node": node, "up": up})
+
+    def step(self, guests, functional_ready):
+        require(len(guests) == 2, "reconnect requires two native guests")
+        samples = [self.snapshot(guest) for guest in guests]
+        if any(sample is None for sample in samples):
+            return False
+        if self.previous is not None:
+            for old, new in zip(self.previous, samples):
+                require((old["boot_epoch"], old["frequency"]) ==
+                        (new["boot_epoch"], new["frequency"]),
+                        "guest identity or timer changed during reconnect")
+                require(all(new[key] >= old[key] for key in
+                            ("ticks", "inferences", "business_cpu3", "sent_bytes", "received_bytes"))
+                        and new["events"][:len(old["events"])] == old["events"],
+                        "guest clock, progress or event history regressed during reconnect")
+        self.previous = samples
+        if self.phase == "waiting":
+            if not functional_ready or not all(3 in s["events"] and 0x212 in s["events"]
+                                               for s in samples):
+                return False
+            self.before_down = samples
+            self.set_links(guests, False)
+            self.phase = "isolating"
+            return False
+        if self.phase == "isolating":
+            self.during_down = samples
+            self.phase = "down"
+            return False
+        if self.phase == "down":
+            elapsed = [(new["ticks"] - old["ticks"]) * 1_000_000_000 // old["frequency"]
+                       for old, new in zip(self.during_down, samples)]
+            if any(duration < RECONNECT_OUTAGE_NS for duration in elapsed):
+                return False
+            if not all(4 in new["events"][len(old["events"]):]
+                       for old, new in zip(self.before_down, samples)):
+                return False
+            progress = []
+            for old, new, duration in zip(self.during_down, samples, elapsed):
+                inference = new["inferences"] - old["inferences"]
+                business = new["business_cpu3"] - old["business_cpu3"]
+                require(inference > 0 and business > 0,
+                        "local AI/business stopped during confirmed link loss")
+                progress.append({"guest_elapsed_ns": duration, "inferences": inference,
+                                 "business_cpu3": business})
+            self.progress = progress
+            self.before_up = samples
+            self.set_links(guests, True)
+            self.phase = "up"
+            return False
+        if self.phase == "up":
+            for old, new in zip(self.before_up, samples):
+                events = new["events"][len(old["events"]):]
+                # READY must follow a newly authenticated session after link
+                # restoration; previous or one-sided success cannot pass.
+                if 3 not in events or 0x212 not in events[events.index(3) + 1:]:
+                    return False
+                if (new["sent_bytes"] <= old["sent_bytes"]
+                        or new["received_bytes"] <= old["received_bytes"]):
+                    return False
+            self.after_up = samples
+            self.phase = "complete"
+        return self.phase == "complete"
+
+    def evidence(self):
+        return {"phase": self.phase, "verified": self.phase == "complete",
+                "minimum_outage_guest_ns": RECONNECT_OUTAGE_NS,
+                "commands": self.commands, "before_link_down": self.before_down,
+                "link_down_baseline": self.during_down, "before_link_up": self.before_up,
+                "after_reauthentication": self.after_up, "link_loss_progress": self.progress}
+
+
+def parse_control_pool(data):
+    w = words(data, 16)
+    if w[0] == 0:
+        return None
+    require(w[0] == CONTROL_POOL_MAGIC and w[1] == 8 * 1024 * 1024,
+            "invalid actual control pool backing")
+    require(w[2] > 0 and w[2] % 4096 == 0 and 0 < w[4] <= 64
+            and w[4] <= w[3] <= 2048 and w[5] <= 128,
+            "control pool allocation/pin bounds")
+    return {"bytes": w[1], "physical_address": w[2], "allocated_pages": w[3],
+            "allocations": w[4], "live_pins": w[5]}
+
+
+def parse_learning(data):
+    w = words(data, 128)
+    # The failure is sticky and cannot be hidden by an interrupted snapshot.
+    require(w[10] == 0, f"native learning worker fault {w[10]}")
+    if w[0] == 0 or w[127] & 1:
+        return None
+    require(w[0] == LEARNING_MAGIC and w[1] == 1 and w[3] == 1,
+            "invalid independent learning role header")
+    require(w[2] <= 7 and w[13] <= 5 and all(w[i] in (0, 1) for i in (14, 15, 25, 26)),
+            "invalid learning mechanism state")
+    require(w[22] == 1024 * 1024, "learning role workspace differs from frozen 1 MiB")
+    require(w[4] <= 9_000_000 and w[5] <= 70_000_000
+            and (w[27] != w[28] or w[4] + w[5] <= 70_000_000),
+            "learning extra or total C window exceeded its actual budget")
+    require(w[17] <= w[16], "learning completion without a real submitted job")
+    ready = w[13] == 5 and w[14] == 1 and w[25] == 1 and w[26] == 1
+    return {"phase": w[2], "cpu": w[3], "extra_window_ns": w[4],
+            "mandatory_window_ns": w[5], "total_extra_cpu_ns": w[6],
+            "extra_window": w[27], "mandatory_window": w[28],
+            "maximum_slice_ns": w[7], "timer_returns": w[8], "svc_yields": w[9],
+            "protection_probes": w[13], "operator_selftest_passed": bool(w[14]),
+            "data_incomplete": bool(w[15]), "jobs": w[16], "completed": w[17],
+            "workspace_bytes": w[22], "capture_ready": bool(w[25]),
+            "capture_loaned": bool(w[26]), "mechanism_ready": ready,
+            "trained_model_verified": False}
 
 
 def diagnostics(guest, bundle):
@@ -231,6 +387,8 @@ def diagnostics(guest, bundle):
                                     ("RUNTIME_V13_EVIDENCE", "runtime_evidence", 1024),
                                     ("TASK_SLICE_EVIDENCE", "slice_evidence", 128),
                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
+                                    ("CONTROL_POOL_EVIDENCE", "control_pool_evidence", 16),
+                                    ("LEARNING_V13_EVIDENCE", "learning_evidence", 128),
                                     ("PANIC_EVIDENCE", "panic_evidence", 8)):
         if symbol_name in bundle:
             guest[key] = list(words(bundle[symbol_name], count))
@@ -244,6 +402,10 @@ def diagnostics(guest, bundle):
         guest["tasks"] = parse_tasks(bundle["DOMAIN_TASK_EVIDENCE"])
     if "IPI_EVIDENCE" in bundle:
         guest["ipi"] = parse_ipi(bundle["IPI_EVIDENCE"])
+    if "CONTROL_POOL_EVIDENCE" in bundle:
+        guest["control_pool"] = parse_control_pool(bundle["CONTROL_POOL_EVIDENCE"])
+    if "LEARNING_V13_EVIDENCE" in bundle:
+        guest["learning"] = parse_learning(bundle["LEARNING_V13_EVIDENCE"])
     # A synchronous file operation may retain its caller while waiting for a
     # new credit. Its periodic task snapshot can then be older than the actual
     # completion fault; the independent sticky record must still fail the run.
@@ -269,6 +431,8 @@ def profile(path):
         else:
             require(location["size"] == size, f"bad {name} size")
             locations[name] = location
+    require(("CONTROL_POOL_EVIDENCE" in locations) == ("LEARNING_V13_EVIDENCE" in locations),
+            "incomplete native learning/control pool evidence symbols")
     return data, locations
 
 
@@ -376,6 +540,9 @@ def run(args):
     require(50 <= args.sample_ms <= 2000, "sample interval must be 50..2000 ms")
     require(args.single != (args.peer_elf is not None),
             "choose --single or provide --peer-elf")
+    reconnect_requested = bool(getattr(args, "reconnect", False))
+    require(not reconnect_requested or not args.single, "--reconnect requires --peer-elf")
+    reconnect = ReconnectProbe() if reconnect_requested else None
     images = [args.elf.resolve(strict=True)]
     if not args.single:
         images.append(args.peer_elf.resolve(strict=True))
@@ -397,6 +564,7 @@ def run(args):
         "nodes": len(images), "physical_realtime_verified": False,
         "all_eighteen_families_two_effective_policies_verified": False,
         "release_acceptance_verified": False, "source_build_attested": False,
+        "reconnect_requested": reconnect_requested, "reconnect_verified": False,
         "clock_profile": args.clock_profile, "sampling": "stopped guest snapshots",
         "elf_sha256": [sha(image) for image in images],
         "verifier_sha256": sha(verifier), "formatter_sha256": sha(formatter),
@@ -496,13 +664,23 @@ def run(args):
                                     control["published"] > 0 and bool(guest["captures"]))
                         if len(guests) == 2 and unified:
                             observed = observed and unified["received_bytes"] > 0 and unified["sent_bytes"] > 0 and 3 in unified["events"]
+                        if "LEARNING_V13_EVIDENCE" in bundle:
+                            observed = (observed and guest.get("control_pool") is not None
+                                        and guest.get("learning") is not None
+                                        and guest["learning"]["mechanism_ready"]
+                                        and guest["unified_words"][28] == 1)
                         ready = ready and observed
                         progress.append({"probe_done": bool(unified and unified["probe_completed"]),
                                          "jobs": control["jobs"] if control else 0,
                                          "applied": control["applied"] if control else 0})
                     now = time.monotonic()
+                    if reconnect is not None:
+                        ready = reconnect.step(guests, ready) and ready
                     if now - last_progress >= 2:
-                        print(json.dumps({"wall_seconds": round(now - started, 2), "progress": progress}), flush=True)
+                        update = {"wall_seconds": round(now - started, 2), "progress": progress}
+                        if reconnect is not None:
+                            update["reconnect_phase"] = reconnect.phase
+                        print(json.dumps(update), flush=True)
                         last_progress = now
                     if ready:
                         ready_at = ready_at or now
@@ -513,7 +691,8 @@ def run(args):
                         ready_at = None
                     time.sleep(args.sample_ms / 1000)
                 else:
-                    raise TimeoutError("native file/control functional observation deadline")
+                    phase = f" (reconnect phase={reconnect.phase})" if reconnect is not None else ""
+                    raise TimeoutError("native file/control functional observation deadline" + phase)
             finally:
                 if guests and all(g["qmp"] and g["proc"].poll() is None for g in guests):
                     try:
@@ -563,6 +742,9 @@ def run(args):
                     if guest["qmp"]:
                         (guest["folder"] / "qmp.json").write_text(json.dumps(guest["qmp"].transcript, indent=2))
         require(not report.get("final_capture_error"), report.get("final_capture_error", ""))
+        if reconnect is not None:
+            require(reconnect.phase == "complete", "native link restoration did not reauthenticate both peers")
+            report["reconnect_verified"] = True
         proofs = []
         for guest in guests:
             require(not guest.get("final_parse_error"), guest.get("final_parse_error", ""))
@@ -584,10 +766,13 @@ def run(args):
         report["error"] = "interrupted by operator"
     finally:
         report["wall_seconds"] = time.monotonic() - started
+        if reconnect is not None:
+            report["reconnect_evidence"] = reconnect.evidence()
         report["observations"] = [{key: guest.get(key) for key in
                                   ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "overrun_evidence", "panic_evidence",
                                    "ipi_evidence", "slice_evidence", "runtime", "runtime_evidence",
                                    "control_credit", "control_credit_evidence",
+                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence",
                                    "registers", "stack_pa", "final_parse_error")}
                                  for guest in guests]
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -612,6 +797,8 @@ def main():
     parser.add_argument("--hold", type=float, default=2, help="wall seconds after all functional conditions hold")
     parser.add_argument("--sample-ms", type=int, default=250)
     parser.add_argument("--clock-profile", choices=("icount", "wallclock"), default="icount")
+    parser.add_argument("--reconnect", action="store_true",
+                        help="verify two-node link loss, guest-clock progress and fresh mutual authentication")
     args = parser.parse_args()
     try:
         result = run(args)

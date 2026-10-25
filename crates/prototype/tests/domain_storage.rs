@@ -651,6 +651,115 @@ fn cache_shrink_is_bounded_and_never_discards_dirty_data() {
 }
 
 #[test]
+fn foreground_demand_distinguishes_disk_misses_from_cached_and_zero_filled_work() {
+    large(|| {
+        let (mut disk, mut journal) = fixture();
+        let mut scratch = [0; 8192];
+        let mut fs = FileSystem::<64>::new();
+        fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        fs.create("/demand", &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        let h = fs
+            .open(
+                "/demand",
+                OpenMode::ReadWrite,
+                &mut journal,
+                &mut disk,
+                &mut scratch,
+            )
+            .unwrap();
+        let before = (disk.reads, disk.writes, disk.flushes);
+        assert!(!fs.write_io_demand(h, 0, 16 * 1024).unwrap());
+        fs.write(h, 0, &[7; 16 * 1024], &mut journal, &mut disk, &mut scratch)
+            .unwrap();
+        assert_eq!((disk.reads, disk.writes, disk.flushes), before);
+        assert!(!fs.read_io_demand(h, 0, 4096, 0, false).unwrap());
+        assert!(!fs.write_io_demand(h, 0, 4096).unwrap());
+        fs.fsync(h, &mut journal, &mut disk, &mut scratch).unwrap();
+        journal.checkpoint(&mut disk, &mut scratch).unwrap();
+
+        let mut fs = FileSystem::<64>::new();
+        fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        let h = fs
+            .open(
+                "/demand",
+                OpenMode::ReadWrite,
+                &mut journal,
+                &mut disk,
+                &mut scratch,
+            )
+            .unwrap();
+        let before = (disk.reads, disk.writes, disk.flushes, fs.cache_usage());
+        assert!(fs.read_io_demand(h, 0, 4096, 0, false).unwrap());
+        assert!(fs.write_io_demand(h, 0, 4096).unwrap());
+        assert!(!fs.read_io_demand(h, 0, 0, 0, false).unwrap());
+        assert!(!fs.read_io_demand(h, 16 * 1024, 1, 0, false).unwrap());
+        assert_eq!(
+            (disk.reads, disk.writes, disk.flushes, fs.cache_usage()),
+            before
+        );
+        fs.read_admitted(
+            h,
+            0,
+            &mut [0; 4096],
+            0,
+            false,
+            &mut journal,
+            &mut disk,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(disk.reads > before.0);
+        assert!(!fs.read_io_demand(h, 0, 4096, 0, false).unwrap());
+        assert!(!fs.write_io_demand(h, 0, 4096).unwrap());
+
+        fs.apply(
+            Action::Filesystem {
+                readahead: 2,
+                flush: 8,
+            },
+            PolicyStamp::new(1, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(fs.read_io_demand(h, 0, 4096, 1, true).unwrap());
+        assert!(!fs.read_io_demand(h, 0, 4096, 1, false).unwrap());
+        let before = disk.reads;
+        fs.read(
+            h,
+            0,
+            &mut [0; 4096],
+            1,
+            &mut journal,
+            &mut disk,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(disk.reads, before + 2);
+        assert!(!fs.read_io_demand(h, 0, 4096, 1, true).unwrap());
+        fs.set_cache_partition(1, 1).unwrap();
+        assert!(!fs.read_io_demand(h, 3 * 4096, 4096, 1, false).unwrap());
+        let before = disk.reads;
+        assert_eq!(
+            fs.read_admitted(
+                h,
+                3 * 4096,
+                &mut [0; 4096],
+                1,
+                false,
+                &mut journal,
+                &mut disk,
+                &mut scratch
+            ),
+            Err(Error::Again)
+        );
+        assert_eq!(disk.reads, before);
+        fs.close(h).unwrap();
+        assert_eq!(fs.read_io_demand(h, 0, 1, 1, false), Err(Error::Stale));
+    });
+}
+
+#[test]
 fn allocation_limits_and_full_volume_owner_validation_are_enforced() {
     large(|| {
         let (mut d, mut j) = fixture();

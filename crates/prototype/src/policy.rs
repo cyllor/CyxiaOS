@@ -2,6 +2,7 @@
 use crate::{
     domains::{Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS},
     features::{self, RawFeatures},
+    learning::governance::{CanaryPermit, CommitGate},
     policy_wire::{self, Decision, Plan},
 };
 use sha2::{Digest, Sha256};
@@ -48,6 +49,7 @@ pub struct CandidateSet {
     entries: [Option<Candidate>; MAX_CANDIDATES],
     count: usize,
     digest: [u8; 32],
+    canary: Option<CanaryPermit>,
 }
 impl CandidateSet {
     pub fn new(
@@ -77,6 +79,7 @@ impl CandidateSet {
             entries: [None; MAX_CANDIDATES],
             count: 0,
             digest: [0; 32],
+            canary: None,
         };
         for candidate in choices {
             features::encode(candidate.action, candidate.features)?;
@@ -84,6 +87,7 @@ impl CandidateSet {
                 || candidate.action.kind() != first.action.kind()
                 || candidate.features.common != first.features.common
                 || candidate.features.domain != first.features.domain
+                || candidate.features.domain_present != first.features.domain_present
             {
                 return Err(Error::Conflict);
             }
@@ -132,6 +136,29 @@ impl CandidateSet {
     pub const fn hash(&self) -> [u8; 32] {
         self.digest
     }
+    /// Verify this set's immutable entries and current public binding against
+    /// its canonical hash without constructing a second candidate array. This
+    /// is an integrity check, not model or publication authorization.
+    pub fn verify_integrity(&self) -> Result<(), Error> {
+        if self.count == 0 || self.count > MAX_CANDIDATES {
+            return Err(Error::Capacity);
+        }
+        if self.recompute_hash()? != self.digest {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    pub const fn canary_permit(&self) -> Option<CanaryPermit> {
+        self.canary
+    }
+    /// Pure canonical hashing for a verifier; this grants no publication right.
+    /// A set already bound to a permit cannot be rebound, even after revocation.
+    pub fn hash_for_canary(&self, permit: CanaryPermit) -> Result<[u8; 32], Error> {
+        if self.canary.is_some_and(|old| old != permit) {
+            return Err(Error::Stale);
+        }
+        self.recompute_hash_scoped(Some(permit))
+    }
     pub fn get(&self, index: usize) -> Option<Candidate> {
         self.entries.get(index).copied().flatten()
     }
@@ -139,6 +166,9 @@ impl CandidateSet {
         self.entries[..self.count].iter().filter_map(|c| *c)
     }
     fn recompute_hash(&self) -> Result<[u8; 32], Error> {
+        self.recompute_hash_scoped(self.canary)
+    }
+    fn recompute_hash_scoped(&self, canary: Option<CanaryPermit>) -> Result<[u8; 32], Error> {
         let mut h = Sha256::new();
         h.update(b"CYXIA_CANDIDATES_V1.3\0");
         for v in [
@@ -165,6 +195,7 @@ impl CandidateSet {
             for v in c.features.common.into_iter().chain(c.features.domain) {
                 h.update(v.to_le_bytes());
             }
+            h.update([c.features.domain_present]);
             for v in c
                 .features
                 .target
@@ -175,6 +206,26 @@ impl CandidateSet {
                 h.update([u8::from(v.is_some())]);
                 h.update(v.unwrap_or(0).to_le_bytes());
             }
+        }
+        // Both scopes bind raw measurements and their presence mask above.
+        // Canary additionally binds this separator, eight u64 little-endian fields in
+        // the order below, then the exact 32-byte candidate parameter hash.
+        // Permit extensions/replacements therefore cannot revive an old set.
+        if let Some(p) = canary {
+            h.update(b"\0CYXIA_CANARY_SCOPE_V1.3\0");
+            for value in [
+                p.id,
+                p.active_generation,
+                p.target.id,
+                p.target.generation,
+                p.start_ns,
+                p.expires_ns,
+                u64::from(p.windows),
+                u64::from(p.quota),
+            ] {
+                h.update(value.to_le_bytes());
+            }
+            h.update(p.candidate_hash);
         }
         Ok(h.finalize().into())
     }
@@ -234,6 +285,7 @@ struct StoredPlan {
     digest: [u8; 32],
     decisions: [u64; 16],
     targets: [ObjectKey; 16],
+    model: Option<ModelBinding>,
 }
 #[derive(Clone, Copy)]
 pub struct RegisteredSet {
@@ -243,6 +295,7 @@ pub struct RegisteredSet {
     pub hash: [u8; 32],
     actions: [Option<Action>; 32],
     count: usize,
+    canary: Option<CanaryPermit>,
 }
 impl RegisteredSet {
     pub fn action(&self, index: usize) -> Option<Action> {
@@ -250,6 +303,69 @@ impl RegisteredSet {
             None
         } else {
             self.actions[index]
+        }
+    }
+    pub const fn canary_permit(&self) -> Option<CanaryPermit> {
+        self.canary
+    }
+    fn validate_model_scope(&self, active: ModelBinding, now_ns: u64) -> Result<(), Error> {
+        match self.canary {
+            None if self.model == active => Ok(()),
+            None => Err(Error::Stale),
+            Some(permit) => {
+                if permit.id == 0
+                    || permit.active_generation != active.generation
+                    || self.model.generation != active.generation
+                    || self.model.schema_hash != active.schema_hash
+                    || permit.candidate_hash == [0; 32]
+                    || permit.candidate_hash == active.model_hash
+                    || self.model.model_hash != permit.candidate_hash
+                    || self.target != permit.target
+                    || permit.start_ns >= permit.expires_ns
+                    || permit.windows == 0
+                    || permit.quota == 0
+                    || self.snapshot.taken_ns < permit.start_ns
+                    || self.snapshot.taken_ns >= permit.expires_ns
+                    || now_ns < permit.start_ns
+                    || now_ns >= permit.expires_ns
+                {
+                    return Err(Error::Stale);
+                }
+                if self.count == 0
+                    || self.actions[..self.count]
+                        .iter()
+                        .any(|action| !matches!(action, Some(Action::ConsoleBatch(_))))
+                {
+                    return Err(Error::Auth);
+                }
+                Ok(())
+            }
+        }
+    }
+    /// Read-only authorization against the actual protected gate. Call under
+    /// the same root lock as Plan PUBLISH. This does not consume a canary window,
+    /// quota or pending slot; Governance::publish does that at the real commit.
+    pub fn authorize_with_gate(
+        &self,
+        active: ModelBinding,
+        gate: &CommitGate,
+        now_ns: u64,
+    ) -> Result<(), Error> {
+        self.validate_model_scope(active, now_ns)?;
+        if gate.active() != active {
+            return Err(Error::Stale);
+        }
+        match self.canary {
+            Some(permit) => {
+                if gate.permit() != Some(permit) || gate.restoration_pending().is_some() {
+                    Err(Error::Stale)
+                } else {
+                    Ok(())
+                }
+            }
+            None => gate
+                .check_active_publication(self.model, self.target)
+                .map_err(|_| Error::Busy),
         }
     }
 }
@@ -260,6 +376,36 @@ pub trait Clock {
 /// PREPARE must reserve all resources without starting physical effects. Failed
 /// publication is effect-free; cancel_prepared releases only those reservations.
 pub trait Executor {
+    /// A stopped optimizer may still owe an exact protected baseline restore.
+    /// The default denies every new publication. An override must verify the
+    /// current restoration request, target, baseline action and Active binding
+    /// under the publication gate, without consuming its receipt or resources.
+    /// This does not bypass any later model, time, capacity or publish checks.
+    fn authorize_recovery(
+        &mut self,
+        _active: ModelBinding,
+        _plan: &Plan,
+        _started_ns: u64,
+    ) -> Result<(), Error> {
+        Err(Error::Budget)
+    }
+    /// An ordinary executor accepts only the current Active model. Canary
+    /// integration must override this using RegisteredSet::authorize_with_gate
+    /// and retain that exact gate's lock through publish. The final publish
+    /// callback must recheck its actual commit time and atomically perform
+    /// Governance::publish before making the prepared root visible.
+    fn authorize_model(
+        &mut self,
+        active: ModelBinding,
+        set: &RegisteredSet,
+        _now_ns: u64,
+    ) -> Result<(), Error> {
+        if set.canary.is_none() && set.model == active {
+            Ok(())
+        } else {
+            Err(Error::Stale)
+        }
+    }
     fn check(&mut self, decision: Decision, set: &RegisteredSet, now_ns: u64) -> Result<(), Error>;
     fn prepare(&mut self, plan: &Plan, version: u64) -> Result<(), Error>;
     fn revalidate(&mut self, plan: &Plan, now_ns: u64) -> Result<(), Error>;
@@ -363,43 +509,115 @@ impl Registry {
     }
     pub fn register(&mut self, publisher: Publisher, set: &CandidateSet) -> Result<(), Error> {
         self.authorize(publisher)?;
-        if set.model != self.model {
+        if set.model != self.model || set.canary.is_some() {
             return Err(Error::Stale);
         }
         if set.digest != set.recompute_hash()? {
             return Err(Error::Conflict);
         }
-        if self
-            .registered
-            .iter()
-            .flatten()
-            .any(|old| old.hash == set.digest)
-        {
-            return Ok(());
+        self.store_registered(Self::registered_set(set, set.digest, None))
+    }
+    /// Bind a candidate set to a permit issued by the actual protected gate.
+    /// Success changes only this set's hash/scope and the registration table,
+    /// never the Active model or canary quota. Infer/encode only after success.
+    /// A failed registration leaves the supplied set unchanged. A previously
+    /// scoped set cannot be rebound to an extended or replacement permit.
+    pub fn register_canary(
+        &mut self,
+        publisher: Publisher,
+        set: &mut CandidateSet,
+        permit: CanaryPermit,
+        gate: &CommitGate,
+        now_ns: u64,
+    ) -> Result<(), Error> {
+        self.authorize(publisher)?;
+        if set.digest != set.recompute_hash()? {
+            return Err(Error::Conflict);
         }
+        if now_ns < set.snapshot.taken_ns {
+            return Err(Error::Range);
+        }
+        if now_ns - set.snapshot.taken_ns > WINDOW_NS {
+            return Err(Error::Expired);
+        }
+        let hash = set.hash_for_canary(permit)?;
+        let registered = Self::registered_set(set, hash, Some(permit));
+        registered.authorize_with_gate(self.model, gate, now_ns)?;
+        self.store_registered(registered)?;
+        set.canary = Some(permit);
+        set.digest = hash;
+        Ok(())
+    }
+    fn registered_set(
+        set: &CandidateSet,
+        hash: [u8; 32],
+        canary: Option<CanaryPermit>,
+    ) -> RegisteredSet {
         let mut actions = [None; 32];
         for (i, c) in set.iter().enumerate() {
             actions[i] = Some(c.action);
         }
-        self.registered[self.registered_cursor] = Some(RegisteredSet {
+        RegisteredSet {
             snapshot: set.snapshot,
             target: set.target,
             model: set.model,
-            hash: set.digest,
+            hash,
             actions,
             count: set.len(),
-        });
+            canary,
+        }
+    }
+    fn store_registered(&mut self, registered: RegisteredSet) -> Result<(), Error> {
+        if let Some(old) = self
+            .registered
+            .iter()
+            .flatten()
+            .find(|old| old.hash == registered.hash)
+        {
+            return if old.canary == registered.canary && old.model == registered.model {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        self.registered[self.registered_cursor] = Some(registered);
         self.registered_cursor = (self.registered_cursor + 1) % MAX_REGISTERED;
         Ok(())
     }
+    /// Resolve only an exact retained candidate-set registration. This read
+    /// does not authorize publication or bypass the final model/permit check.
+    pub fn registered_action(&self, hash: [u8; 32], index: usize) -> Result<Action, Error> {
+        self.registered
+            .iter()
+            .flatten()
+            .find(|set| set.hash == hash)
+            .ok_or(Error::Stale)?
+            .action(index)
+            .ok_or(Error::Range)
+    }
     pub fn change_model(&mut self, publisher: Publisher, next: ModelBinding) -> Result<(), Error> {
+        self.prepare_model_change(publisher, next)?.commit();
+        Ok(())
+    }
+    /// Validate a model switch before another protected owner commits its
+    /// corresponding gate. The exclusive borrow keeps publisher/model state
+    /// stable until commit; dropping the capability changes nothing.
+    ///
+    /// This preserves change_model's strictly increasing-generation contract.
+    /// A coordinating model bank may enforce its stronger exact +1 rule.
+    pub fn prepare_model_change(
+        &mut self,
+        publisher: Publisher,
+        next: ModelBinding,
+    ) -> Result<PreparedModelChange<'_>, Error> {
         self.authorize(publisher)?;
         if next.generation <= self.model.generation {
             return Err(Error::Stale);
         }
-        self.model = next;
-        self.registered.fill(None);
-        Ok(())
+        Ok(PreparedModelChange {
+            registry: self,
+            next,
+        })
     }
     pub fn change_publisher(&mut self, publisher: Publisher, next: Publisher) -> Result<(), Error> {
         self.authorize(publisher)?;
@@ -427,6 +645,17 @@ impl Registry {
             .find(|r| r.receipt.id == id)
             .map(|r| r.receipt)
             .ok_or(Error::Stale)
+    }
+    /// The immutable model used by a successfully published plan. In-flight
+    /// UNKNOWN records keep it independently of candidate/evidence ring reuse,
+    /// Active changes, canary revocation and later model rollback.
+    pub fn query_model(&self, publisher: Publisher, id: PlanId) -> Result<ModelBinding, Error> {
+        self.authorize(publisher)?;
+        self.records()
+            .find(|record| record.receipt.id == id)
+            .ok_or(Error::Stale)?
+            .model
+            .ok_or(Error::NotReady)
     }
     fn finish(&mut self, slot: usize) {
         if self.active[slot].is_some_and(|r| r.receipt.state().terminal()) {
@@ -481,22 +710,51 @@ impl Registry {
         self.finish(slot);
         Ok(receipt)
     }
+    fn registered_decision(&self, decision: Decision) -> Result<&RegisteredSet, Error> {
+        self.registered
+            .iter()
+            .flatten()
+            .find(|set| set.hash == decision.envelope.candidate_set_hash)
+            .ok_or(Error::Stale)
+    }
+    fn model_scope(&self, plan: &Plan, now: u64) -> Result<ModelBinding, Error> {
+        let mut binding = None;
+        for d in plan.iter() {
+            let set = self.registered_decision(d)?;
+            set.validate_model_scope(self.model, now)?;
+            if set.canary.is_some() && plan.len() != 1 {
+                return Err(Error::Auth);
+            }
+            if binding.is_some_and(|old| old != set.model) {
+                return Err(Error::Conflict);
+            }
+            binding = Some(set.model);
+        }
+        binding.ok_or(Error::Format)
+    }
+    fn authorize_models<E: Executor>(
+        &self,
+        plan: &Plan,
+        now: u64,
+        executor: &mut E,
+    ) -> Result<ModelBinding, Error> {
+        let binding = self.model_scope(plan, now)?;
+        for d in plan.iter() {
+            executor.authorize_model(self.model, self.registered_decision(d)?, now)?;
+        }
+        Ok(binding)
+    }
     fn validate<E: Executor>(&self, plan: &Plan, now: u64, executor: &mut E) -> Result<(), Error> {
         if plan.header.active_model_generation != self.model.generation
             || plan.header.base_plan_version != self.version
         {
             return Err(Error::Stale);
         }
+        self.authorize_models(plan, now, executor)?;
         for d in plan.iter() {
             let e = d.envelope;
-            let set = self
-                .registered
-                .iter()
-                .flatten()
-                .find(|s| s.hash == e.candidate_set_hash)
-                .ok_or(Error::Stale)?;
-            if set.model != self.model
-                || e.model_hash != self.model.model_hash
+            let set = self.registered_decision(d)?;
+            if e.model_hash != set.model.model_hash
                 || set.target != e.target
                 || set.snapshot.sequence != e.snapshot_seq
                 || set.snapshot.core_generation != e.core_generation
@@ -586,7 +844,7 @@ impl Registry {
             };
         }
         if self.optimization_stopped {
-            return Err(Error::Budget);
+            executor.authorize_recovery(self.model, &plan, started_ns)?;
         }
         for d in plan.iter() {
             if self.records().any(|r| {
@@ -624,6 +882,7 @@ impl Registry {
                 id: 0,
                 generation: 0,
             }; 16],
+            model: None,
         };
         for (i, d) in plan.iter().enumerate() {
             record.decisions[i] = d.envelope.decision_seq;
@@ -663,15 +922,35 @@ impl Registry {
                 return Err(Error::Expired);
             }
             publication_budget(started_ns, publish_ns)?;
+            // Recheck the actual protected model/lease after all hard-constraint
+            // callbacks. This is read-only: no canary quota or pending slot is
+            // consumed until the executor performs the real atomic publish.
+            let binding = self.authorize_models(&plan, publish_ns, executor)?;
+            let commit_ns = clock.now_ns();
+            if commit_ns < publish_ns {
+                return Err(Error::Range);
+            }
+            if commit_ns > wall_deadline_ns
+                || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
+            {
+                return Err(Error::Expired);
+            }
+            publication_budget(started_ns, commit_ns)?;
+            // The gate remains locked. Time may have passed during its check,
+            // so recheck the immutable permit's bounds at this final timestamp.
+            if self.model_scope(&plan, commit_ns)? != binding {
+                return Err(Error::Stale);
+            }
             // Publication is one atomic root change under the owner's resource gate.
-            executor.publish(&plan, next_version, publish_ns)?;
-            Ok(publish_ns)
+            executor.publish(&plan, next_version, commit_ns)?;
+            Ok((commit_ns, binding))
         })();
         match result {
-            Ok(now) => {
+            Ok((now, binding)) => {
                 self.version = next_version;
                 record.receipt.version = next_version;
                 record.receipt.published_ns = now;
+                record.model = Some(binding);
             }
             Err(error) => {
                 if prepared {
@@ -706,7 +985,31 @@ impl Registry {
             .flatten()
             .find(|s| s.hash == decision.envelope.candidate_set_hash)
             .ok_or(Error::Stale)?;
-        PolicyStamp::new(version, set.snapshot.taken_ns, published_ns)
+        PolicyStamp::for_action(
+            decision.action,
+            version,
+            set.snapshot.taken_ns,
+            published_ns,
+        )
+    }
+}
+
+/// Prepared under the same root gate as CommitGate and the physical model
+/// bank. No fallible checks, allocation or executor callbacks remain here.
+pub struct PreparedModelChange<'a> {
+    registry: &'a mut Registry,
+    next: ModelBinding,
+}
+impl PreparedModelChange<'_> {
+    pub const fn binding(&self) -> ModelBinding {
+        self.next
+    }
+    pub fn commit(self) -> ModelBinding {
+        self.registry.model = self.next;
+        self.registry.registered.fill(None);
+        // Previously published plans retain their original model and receipts.
+        // UNKNOWN obligations are unaffected by this admission-only switch.
+        self.next
     }
 }
 
