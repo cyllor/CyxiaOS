@@ -49,17 +49,42 @@ jobs:
             --test native_core_replay
           cargo clippy --locked --offline -p cyxia-kernel \
             --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
-      - name: Build both native images and enforce the real ELF stack gate
+      - name: Build both native images and expose exact diagnostics
         run: |
-          set -euo pipefail
-          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair"
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/native-repair-evidence"
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair" \
+            > "$RUNNER_TEMP/native-repair-evidence/provision.log" 2>&1
+          status=0
           python3 tools/build_unified.py \
             --identity-a "$RUNNER_TEMP/pair/a" \
             --identity-b "$RUNNER_TEMP/pair/b" \
             --output "$RUNNER_TEMP/unified-build" \
-            --selftest
-          cat "$RUNNER_TEMP/unified-build/node-a-stack.json"
-          cat "$RUNNER_TEMP/unified-build/node-b-stack.json"
+            --selftest \
+            > "$RUNNER_TEMP/native-repair-evidence/build-unified.log" 2>&1 || status=$?
+          if [ -d "$RUNNER_TEMP/unified-build" ]; then
+            cp -a "$RUNNER_TEMP/unified-build/." "$RUNNER_TEMP/native-repair-evidence/unified-build/" 2>/dev/null || true
+          fi
+          for log in "$RUNNER_TEMP/native-repair-evidence"/*.log "$RUNNER_TEMP/native-repair-evidence"/unified-build/*.log; do
+            [ -f "$log" ] || continue
+            echo "===== $log ====="
+            tail -n 500 "$log"
+          done
+          for proof in "$RUNNER_TEMP/native-repair-evidence"/unified-build/*-stack.json; do
+            [ -f "$proof" ] || continue
+            echo "===== $proof ====="
+            cat "$proof"
+          done
+          exit "$status"
+      - name: Retain native repair diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: borrowed-candidate-native-diagnostics-${{ github.sha }}
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+          path: ${{ runner.temp }}/native-repair-evidence/
       - name: Commit validated formatted source
         run: |
           git config user.name 'github-actions[bot]'
