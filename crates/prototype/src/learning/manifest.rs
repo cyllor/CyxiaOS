@@ -24,6 +24,7 @@ pub fn normalization() -> [u64; 76] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Origin {
     /// Explicit engineering initialization, never an admissible Active model.
     Untrained {
@@ -205,8 +206,8 @@ impl<'a> SealedModel<'a> {
         }
         // This does not narrow the ABI's frozen int32 biases, only b3 learning.
         train::Parameters::from_model(bytes)?;
-        if let Origin::Learned(record) = manifest.origin {
-            if record.result_hash != hash
+        if let Origin::Learned(record) = manifest.origin
+            && (record.result_hash != hash
                 || record.frozen_layers_hash != manifest.frozen_layers_hash
                 || record.parent_hash == [0; 32]
                 || record.steps != record.data.training_count
@@ -214,10 +215,9 @@ impl<'a> SealedModel<'a> {
                 || record.data.reward_schema != expected.reward
                 || record.data.learning_config != expected.learning
                 || record.data.feature_schema != expected.feature
-                || record.data.action_schema != expected.action
-            {
-                return Err(Error::Manifest);
-            }
+                || record.data.action_schema != expected.action)
+        {
+            return Err(Error::Manifest);
         }
         super::validate::verify_reference(bytes, vectors)?;
         let manifest_hash = manifest.hash();

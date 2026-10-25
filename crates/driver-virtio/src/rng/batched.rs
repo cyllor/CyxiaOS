@@ -81,13 +81,12 @@ impl BatchedRng {
         self.report(p, false);
     }
     pub fn prefetch(&mut self, p: &impl Platform) -> Result<(), Error> {
-        if let Some((request, _)) = self.hooks {
-            if let Some(c) = request(p.now_ns()) {
-                if c.version != self.command_version {
-                    self.set_notify_policy(c.batch, c.version, c.until_ns, p.now_ns())?;
-                    self.command_version = c.version;
-                }
-            }
+        if let Some((request, _)) = self.hooks
+            && let Some(c) = request(p.now_ns())
+            && c.version != self.command_version
+        {
+            self.set_notify_policy(c.batch, c.version, c.until_ns, p.now_ns())?;
+            self.command_version = c.version;
         }
         if self.failed {
             return Err(Error::Device);

@@ -958,10 +958,11 @@ fn verify_trial(
         number(&mut hash, a.candidates.model.generation);
         action(&mut hash, a.actual)?;
     }
-    if let Some(first) = t.adoptions.first() {
-        if !first.actual.one_shot() && covered_until < t.observation_end_ns {
-            return Err(Error::Evidence);
-        }
+    if let Some(first) = t.adoptions.first()
+        && !first.actual.one_shot()
+        && covered_until < t.observation_end_ns
+    {
+        return Err(Error::Evidence);
     }
     if !model_candidate {
         verify_baseline(t, &mut hash)?;

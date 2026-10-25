@@ -8,6 +8,7 @@ use core::{
     mem::{align_of, offset_of, size_of},
 };
 
+#[allow(clippy::large_enum_variant)]
 pub enum InitValue<'a, 'model> {
     Candidate(&'a ValidatedCandidate<'model>),
     Old(&'a [u8; MODEL_BYTES]),

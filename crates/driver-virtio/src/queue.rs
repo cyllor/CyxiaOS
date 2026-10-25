@@ -265,7 +265,7 @@ impl BatchQueue {
             let at = 4 + usize::from(self.used.wrapping_add(n) % self.size) * 8;
             let id = self.memory.used.get32(at);
             let len = self.memory.used.get32(at + 4);
-            if id % 2 != 0 || id >= u32::from(self.size) {
+            if !id.is_multiple_of(2) || id >= u32::from(self.size) {
                 self.poison(t, p);
                 return Err(Error::Queue);
             }
@@ -456,7 +456,7 @@ impl BatchQueue {
             .filter(|s| s.state == State::Published)
             .count();
         if usize::from(end.wrapping_sub(self.used)) > owned
-            || id % 2 != 0
+            || !id.is_multiple_of(2)
             || id >= u32::from(self.size)
         {
             self.poison(t, p);

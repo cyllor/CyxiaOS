@@ -316,7 +316,7 @@ impl Inode {
             return Err(Error::Identity);
         }
         let maximum = if self.kind == InodeKind::Directory {
-            if self.size % DIRECTORY_SLOT_SIZE as u64 != 0 {
+            if !self.size.is_multiple_of(DIRECTORY_SLOT_SIZE as u64) {
                 return Err(Error::Range);
             }
             MAX_DIRECTORY_SIZE

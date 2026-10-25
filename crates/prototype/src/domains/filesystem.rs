@@ -518,11 +518,11 @@ impl<const C: usize> FileSystem<C> {
         d: &mut D,
         s: &mut Scratch,
     ) -> Result<journal::CommitReceipt, Error> {
-        if j.remaining_log_blocks() < 2 + 2 * self.tx_count as u32 {
-            if let Err(e) = j.checkpoint(d, s) {
-                self.failed = true;
-                return Err(journal_error(e));
-            }
+        if j.remaining_log_blocks() < 2 + 2 * self.tx_count as u32
+            && let Err(e) = j.checkpoint(d, s)
+        {
+            self.failed = true;
+            return Err(journal_error(e));
         }
         let mut images = [AfterImage {
             home_block: 0,
@@ -987,10 +987,12 @@ impl<const C: usize> FileSystem<C> {
             }
             // Writes pin their existing destination pages before admitting a
             // miss, so those pages cannot serve as the eviction backing.
-            available |= page.valid && !page.dirty && !page.pinned && !(write && inside);
+            let evictable = page.valid && !page.dirty && !page.pinned && (!write || !inside);
+            available |= evictable;
         }
         Ok(available && present != (1u128 << count) - 1)
     }
+    #[allow(clippy::too_many_arguments)]
     fn page<D: BlockDevice>(
         &mut self,
         id: usize,
@@ -1052,6 +1054,7 @@ impl<const C: usize> FileSystem<C> {
         }
         Ok(at)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn read<D: BlockDevice>(
         &mut self,
         h: Handle,
@@ -1067,6 +1070,7 @@ impl<const C: usize> FileSystem<C> {
     /// Dependency admission is checked by the owner before borrowing the file
     /// service. A closed prerequisite suppresses only new optional prefetch;
     /// demand reads and already owned dirty/cache pages retain their progress.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_admitted<D: BlockDevice>(
         &mut self,
         h: Handle,

@@ -549,14 +549,15 @@ impl<const I: usize, const R: usize> Capture<I, R> {
                 .interval_count
                 .checked_sub(1)
                 .map(|i| &mut self.intervals[i])
+                && last.class == class
+                && last.core == core
+                && last.end_ns == interval.start_ns
             {
-                if last.class == class && last.core == core && last.end_ns == interval.start_ns {
-                    last.end_ns = interval.end_ns;
-                    if outside {
-                        return self.fail(Error::Deadline);
-                    }
-                    return Ok(());
+                last.end_ns = interval.end_ns;
+                if outside {
+                    return self.fail(Error::Deadline);
                 }
+                return Ok(());
             }
             if self.interval_count == I {
                 return self.fail(Error::Capacity);
@@ -795,10 +796,8 @@ impl<const I: usize, const R: usize> Capture<I, R> {
             }
             self.fault.get_or_insert(Error::DataIncomplete);
         }
-        if !incomplete {
-            if let Some(error) = self.fault {
-                return Err(error);
-            }
+        if !incomplete && let Some(error) = self.fault {
+            return Err(error);
         }
         let end = config.observation_ns + OBSERVATION_NS;
         if now_ns < end

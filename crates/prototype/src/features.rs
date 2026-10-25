@@ -129,16 +129,16 @@ pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
         }
         Ok(())
     };
-    for i in 0..8 {
-        set(16 + i, raw.common[i], COMMON_LIMITS[i])?;
+    for (i, limit) in COMMON_LIMITS.iter().copied().enumerate() {
+        set(16 + i, raw.common[i], limit)?;
     }
-    for i in 0..4 {
+    for (i, limit) in DOMAIN_LIMITS[usize::from(action.domain() - 1)]
+        .iter()
+        .copied()
+        .enumerate()
+    {
         if raw.domain_present & (1 << i) != 0 {
-            set(
-                24 + i,
-                raw.domain[i],
-                DOMAIN_LIMITS[usize::from(action.domain() - 1)][i],
-            )?;
+            set(24 + i, raw.domain[i], limit)?;
         }
     }
     let (a1, h1, a2, h2) = match action {
@@ -170,9 +170,9 @@ pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
     if let Some(v) = a2 {
         set(42, v, h2)?;
     }
-    for i in 0..4 {
+    for (i, limit) in TARGET_LIMITS.iter().copied().enumerate() {
         if let Some(v) = raw.target.values[i] {
-            set(56 + i, v, TARGET_LIMITS[i])?;
+            set(56 + i, v, limit)?;
         }
     }
     for i in 0..4 {

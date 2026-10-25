@@ -92,17 +92,17 @@ impl Volume {
         if count > 12 {
             return Err(Error::Capacity);
         }
-        for i in 0..count {
+        for (i, block) in w.iter_mut().enumerate().take(count) {
             if (first + i) as u64 * (BLOCK_SIZE as u64) < old {
                 j.read_block(
                     d,
                     START + file as u32 * FILE_BLOCKS + (first + i) as u32,
-                    &mut w[i],
+                    block,
                     s,
                 )
                 .map_err(Error::Journal)?;
             } else {
-                w[i].fill(0)
+                block.fill(0)
             }
         }
         let mut header = [0; 16];
@@ -250,6 +250,7 @@ impl Volume {
         c.offset += 16 + len as u64;
         Ok(Some(len))
     }
+    #[allow(clippy::too_many_arguments)]
     fn read<D: BlockDevice>(
         &self,
         j: &mut Journal,

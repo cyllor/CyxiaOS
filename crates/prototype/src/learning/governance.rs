@@ -155,6 +155,7 @@ impl ExtraBudget {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         &mut self,
         role: Role,
@@ -1016,6 +1017,7 @@ impl<'a, 'model> Governance<'a, 'model> {
     }
     /// Called at the actual protected Plan PUBLISH commit point, after its hard
     /// constraint checks. Reserving a score or writing desired is not APPLIED.
+    #[allow(clippy::too_many_arguments)]
     pub fn publish(
         &mut self,
         gate: &mut CommitGate,
@@ -1404,16 +1406,14 @@ impl<'a, 'model> Governance<'a, 'model> {
         }
     }
     pub fn tick(&mut self, gate: &mut CommitGate, now_ns: u64) {
-        if matches!(self.stage, Stage::Canary | Stage::Frozen) {
-            if let Some(index) = self.pending {
-                if let Some(submission) = self.history[index].as_mut() {
-                    if now_ns > submission.apply_deadline_ns {
-                        submission.state = ExecutionState::Unknown;
-                        self.abort(gate, Error::Deadline);
-                        return;
-                    }
-                }
-            }
+        if matches!(self.stage, Stage::Canary | Stage::Frozen)
+            && let Some(index) = self.pending
+            && let Some(submission) = self.history[index].as_mut()
+            && now_ns > submission.apply_deadline_ns
+        {
+            submission.state = ExecutionState::Unknown;
+            self.abort(gate, Error::Deadline);
+            return;
         }
         if self.stage == Stage::Frozen
             || (self.stage == Stage::Canary && self.permit.is_some_and(|p| now_ns >= p.expires_ns))

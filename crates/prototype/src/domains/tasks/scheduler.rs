@@ -754,13 +754,12 @@ impl Scheduler {
         self.stats.actual_ns = self.stats.actual_ns.saturating_add(actual_ns);
         if actual_ns > d.reserved_ns || finished_ns > end {
             self.cpus[cpu].quarantine_generation = d.core_generation;
-            self.cpus[cpu].recovery_after = if finished_ns > end && finished_ns % WINDOW_NS != 0 {
-                finished_ns
-                    .checked_add(WINDOW_NS - finished_ns % WINDOW_NS)
-                    .unwrap_or(u64::MAX)
-            } else {
-                finished_ns
-            };
+            self.cpus[cpu].recovery_after =
+                if finished_ns > end && !finished_ns.is_multiple_of(WINDOW_NS) {
+                    finished_ns.saturating_add(WINDOW_NS - finished_ns % WINDOW_NS)
+                } else {
+                    finished_ns
+                };
             self.stats.overruns = self.stats.overruns.saturating_add(1);
             self.stats.quarantine_mask |= 1u64 << cpu;
             return Err(Error::Budget);
@@ -1046,7 +1045,7 @@ impl Scheduler {
             || c.control_spent > CONTROL_BUDGET_NS
         {
             c.quarantine_generation = c.quarantine_generation.max(credit.core_generation);
-            c.recovery_after = if finished_ns % WINDOW_NS == 0 {
+            c.recovery_after = if finished_ns.is_multiple_of(WINDOW_NS) {
                 finished_ns
             } else {
                 finished_ns.saturating_add(WINDOW_NS - finished_ns % WINDOW_NS)
@@ -1095,7 +1094,7 @@ impl Scheduler {
         {
             self.cpus[cpu].quarantine_generation =
                 self.cpus[cpu].quarantine_generation.max(generation);
-            self.cpus[cpu].recovery_after = if finished % WINDOW_NS == 0 {
+            self.cpus[cpu].recovery_after = if finished.is_multiple_of(WINDOW_NS) {
                 finished
             } else {
                 finished.saturating_add(WINDOW_NS - finished % WINDOW_NS)

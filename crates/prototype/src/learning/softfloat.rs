@@ -154,6 +154,7 @@ impl F64 {
         Self::pack(value < 0, u128::from(value.unsigned_abs()), 0)
             .expect("i64 always has a finite binary64 representation")
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Self) -> Result<Self, FloatError> {
         if self.is_zero() && other.is_zero() {
             return Ok(Self(self.0 & other.0 & SIGN));
@@ -181,14 +182,17 @@ impl F64 {
             Self::pack(sb, b - a, e - 3)
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, other: Self) -> Result<Self, FloatError> {
         self.add(other.neg())
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Self) -> Result<Self, FloatError> {
         let (sa, a, ea) = self.decode();
         let (sb, b, eb) = other.decode();
         Self::pack(sa ^ sb, u128::from(a) * u128::from(b), ea + eb)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: Self) -> Result<Self, FloatError> {
         if other.is_zero() {
             return Err(FloatError::DivisionByZero);

@@ -505,7 +505,7 @@ impl Cores {
         }
     }
     pub fn expire(&mut self, now_ms: u64) -> Result<bool, Error> {
-        if !self.pending.is_some_and(|p| now_ms >= p.deadline) {
+        if self.pending.is_none_or(|p| now_ms < p.deadline) {
             return Ok(false);
         }
         let generation = self.next_core()?;

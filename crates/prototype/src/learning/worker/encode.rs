@@ -75,6 +75,7 @@ impl<'a, 'samples> EncoderState<'a, 'samples> {
         };
         Self::new(parent, None, data, None, &[], header)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn validation(
         binding: JobBinding,
         parent: &'a [u8; MODEL_BYTES],
@@ -397,6 +398,7 @@ impl<'a, 'samples> Encoder<'a, 'samples> {
         let state = EncoderState::training(binding, parent, data, workspace_bytes)?;
         Self::new(state, output)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn validation(
         binding: JobBinding,
         parent: &'a [u8; MODEL_BYTES],

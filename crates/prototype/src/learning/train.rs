@@ -87,9 +87,9 @@ impl Parameters {
         }
         gradients[16] = error.clamp(F64::ONE.neg(), F64::ONE)?;
         let mut next = *self;
-        for j in 0..16 {
+        for (j, gradient) in gradients[..16].iter().copied().enumerate() {
             next.weights[j] = self.weights[j]
-                .sub(rate.mul(gradients[j])?)?
+                .sub(rate.mul(gradient)?)?
                 .clamp(weight_min, weight_max)?;
             if next.weights[j]
                 .sub(self.weights[j])?

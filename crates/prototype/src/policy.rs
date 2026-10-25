@@ -268,9 +268,9 @@ pub struct PlanReceipt {
 impl PlanReceipt {
     pub fn state(&self) -> ExecutionState {
         let states = &self.actions[..usize::from(self.action_count)];
-        if states.iter().any(|s| *s == ExecutionState::Unknown) {
+        if states.contains(&ExecutionState::Unknown) {
             ExecutionState::Unknown
-        } else if states.iter().any(|s| *s == ExecutionState::Pending) {
+        } else if states.contains(&ExecutionState::Pending) {
             ExecutionState::Pending
         } else if let Some(ExecutionState::Failed(e)) = states
             .iter()
