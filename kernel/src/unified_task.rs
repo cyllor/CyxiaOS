@@ -1,6 +1,7 @@
 //! One reserved pure-compute thread on the stable business CPU. EL0 owns no
 //! filesystem/device capability and uses the same AI-issued CPU credits as local
 //! business work. Publication/release use an acquire/release mailbox.
+use crate::unified::abi::{TASK_CUSTODY_INVENTORY, TASK_LOOKUP_CUSTODY, TASK_RESERVE_CUSTODY};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::PhysAddr;
@@ -9,7 +10,11 @@ use cyxia_kernel_core::control_plane::task_admission::{
 };
 use cyxia_prototype::domains::Error;
 use sha2::{Digest, Sha256};
+#[path = "unified_task/custody.rs"]
+mod custody;
 static mut AUTHORITY: Authority = Authority::new();
+static BOOT: AtomicU64 = AtomicU64::new(0);
+static mut REQUESTER: [u8; 32] = [0; 32];
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-task.elf"));
 #[repr(C, align(4096))]
 struct Page([u64; 512]);
@@ -44,8 +49,13 @@ fn phys(p: u64) -> u64 {
 fn word(at: usize) -> u64 {
     u64::from_le_bytes(ELF[at..at + 8].try_into().unwrap())
 }
-pub fn init() {
+pub fn init(boot: u64, requester: [u8; 32]) {
     assert_eq!(cpu::slot(), 0);
+    assert!(boot != 0 && requester != [0; 32]);
+    BOOT.store(boot, Ordering::Relaxed);
+    unsafe {
+        REQUESTER = requester;
+    }
     // The separately linked package is exactly one RX segment and no interpreter,
     // runtime relocations, data segment, or writable executable page.
     assert_eq!(&ELF[..7], b"\x7fELF\x02\x01\x01");
@@ -147,6 +157,12 @@ pub fn step(slot: usize) -> bool {
             begin
                 .saturating_add(crate::domain_tasks::slice_ticks(slot))
                 .min(deadline),
+            crate::a02_capture::Task {
+                id: 0x100,
+                generation: token,
+                role: 1,
+                affinity: 1 << slot,
+            },
         );
         let spent = timer::ticks() - begin;
         TICKS.fetch_add(spent, Ordering::Relaxed);
@@ -242,6 +258,17 @@ pub fn request(
         return crate::peer_replay::broker(phase, token, payload, len, connected, epoch);
     }
     let state = STATE.load(Ordering::Acquire);
+    // Only the dedicated service's SVC dispatcher reaches this broker. The
+    // scope comes from kernel boot identity, never the writable shared page.
+    if phase == TASK_LOOKUP_CUSTODY || phase == TASK_CUSTODY_INVENTORY {
+        return custody::query(
+            unsafe { &*core::ptr::addr_of!(AUTHORITY) },
+            custody_scope(state),
+            phase == TASK_CUSTODY_INVENTORY,
+            payload,
+            len,
+        );
+    }
     if matches!(phase, 11 | 12 | 27) {
         return crate::local_placement::request(phase, payload, len, Sha256::digest(ELF).into());
     }
@@ -266,11 +293,11 @@ pub fn request(
             unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).session(epoch, token, now) };
         return (if result.is_ok() { 0 } else { 3 }, 0, 0);
     }
-    if phase == 0 {
+    if phase == 0 || phase == TASK_RESERVE_CUSTODY {
         if !connected || epoch == 0 || state != 0 {
             return (1, 0, 0);
         }
-        if len != 104 {
+        if len != if phase == 0 { 104 } else { 224 } {
             return (3, 0, 0);
         }
         if LEDGER_GENERATION.load(Ordering::Acquire) == u64::MAX {
@@ -285,13 +312,17 @@ pub fn request(
             input_hash: payload[40..72].try_into().unwrap(),
             package_hash: payload[72..104].try_into().unwrap(),
         };
-        let Ok(next) = (unsafe {
-            (&mut *core::ptr::addr_of_mut!(AUTHORITY)).reserve(
-                terms,
-                Sha256::digest(ELF).into(),
-                now,
-            )
-        }) else {
+        let authority = unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) };
+        let admitted = if phase == TASK_RESERVE_CUSTODY {
+            let key = custody::key(&payload[104..224]);
+            if !custody_scope(state).accepts(key.owner_boot, key.requester) {
+                return (3, 0, 0);
+            }
+            authority.reserve_with_custody(terms, Sha256::digest(ELF).into(), key, now)
+        } else {
+            authority.reserve(terms, Sha256::digest(ELF).into(), now)
+        };
+        let Ok(next) = admitted else {
             return (3, 0, 0);
         };
         let leaf = unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Page>().add(2) } as u64;
@@ -459,13 +490,14 @@ pub fn request(
                 core::ptr::write_bytes(core::ptr::addr_of_mut!(INPUT).cast::<u8>(), 0, 32768);
             }
             if RELEASE_STAGE.load(Ordering::Acquire) == 1 {
+                // Retain the custody index while replay release is retryable.
+                if crate::peer_replay::close_remote(token).is_err() {
+                    return (1, 0, token);
+                }
                 if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(token) }.is_err() {
                     return (3, 0, 0);
                 }
                 RELEASE_STAGE.store(2, Ordering::Release);
-            }
-            if crate::peer_replay::close_remote(token).is_err() {
-                return (1, 0, token);
             }
             STATE.store(0, Ordering::Release);
             RELEASE_STAGE.store(3, Ordering::Release);
@@ -496,6 +528,14 @@ pub fn request(
         }
         8 => (if matches!(state, 1 | 4 | 5) { 0 } else { 1 }, 0, state),
         _ => (3, 0, 0),
+    }
+}
+fn custody_scope(state: u64) -> custody::Scope {
+    custody::Scope {
+        boot: BOOT.load(Ordering::Relaxed),
+        requester: unsafe { *core::ptr::addr_of!(REQUESTER) },
+        state,
+        token: TOKEN.load(Ordering::Relaxed),
     }
 }
 pub fn counts() -> (u64, u64) {

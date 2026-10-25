@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Report the separate 1.3 catalogue without promoting legacy/host evidence.
 
-No complete 1.3 native case verifier is registered yet. PASS/FAIL receipts are
-therefore rejected, not accepted merely because a JSON file says a VM ran.
-Component and bring-up results remain outside this full-case catalogue.
+A02 has a fixed native receipt adapter following a real native run and separate
+receipt replay. It validates raw events, execution provenance and the caller's
+source root; producer PASS booleans and host fixtures cannot establish a result.
+Other cases, native FAIL classification and the filesystem matrix remain
+unenrolled. Coverage registration does not change unrun catalogue entries.
 """
 from __future__ import annotations
 import argparse
@@ -13,6 +15,7 @@ from pathlib import Path
 import sys
 
 from check_prototype_evidence import artifact, exact_keys, read_json, require, safe_path, sha256
+from verify_v13_a02 import verify_native_receipt
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = ROOT / 'docs/implementation/v13-requirements.json'
@@ -47,12 +50,19 @@ def check_rows(rows, expected, label, root, *, descriptions):
             require(row['evidence'] is None, 'NOT_RUN cannot carry a runtime receipt')
         else:
             require(type(row['evidence']) is dict, 'Native result requires a receipt')
-            # A digest can bind bytes, but cannot prove that the complete case
-            # happened. Add an independently reviewed per-case raw-event
-            # verifier before admitting results here. Never use eval/subprocess
-            # on a manifest-supplied checker or a trusted boolean in its JSON.
-            artifact(root, row['evidence'])
-            raise ValueError(f"No complete 1.3 native receipt verifier registered for {row['id']}")
+            receipt = artifact(root, row['evidence'])
+            if row['id'] != 'A02' or not descriptions:
+                raise ValueError(f"No complete 1.3 native receipt verifier registered for {row['id']}")
+            require(row['status'] == 'PASS', 'A02 native FAIL classification is not registered')
+            require(receipt.name == 'summary.json', 'A02 receipt must name summary.json')
+            # Fixed reviewed code only. Neither the manifest nor the receipt
+            # can select a checker, source checkout or executable archive.
+            observed = verify_native_receipt(receipt.parent, source_root=root)
+            require(observed.get('test_id') == 'A02'
+                    and observed.get('native_acceptance_status') == row['status']
+                    and observed.get('native_execution_verified') is True
+                    and observed.get('runtime_truth_attested') is False,
+                    'A02 receipt does not establish the declared native result')
         counts[row['status']] += 1
     return counts
 
@@ -96,7 +106,13 @@ def validate(document, root=ROOT):
             'filesystem_fault_matrix_complete': False,
             'functional_acceptance_complete': False, 'strict_spec_conformance': False,
             'approved_deviations': deviations, 'runtime_truth_attested': False,
-            'scope': 'Catalogue integrity only; native full-case verifiers and filesystem fault matrix remain required.'}
+            'verifier_coverage': {
+                'native_receipt_cases': ['A02'],
+                'raw_contracts': {
+                    'A02': {'verifier': 'tools/verify_v13_a02.py', 'wire_version': 2,
+                            'native_receipt_admitted': True,
+                            'native_verifier_version': 'a02-native-v4'}}},
+            'scope': 'Catalogue integrity and fixed A02 native verification; other cases and filesystem fault matrix remain required.'}
 
 
 def main(argv=None):

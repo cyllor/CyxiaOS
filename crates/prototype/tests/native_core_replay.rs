@@ -11,6 +11,13 @@ use cyxia_prototype::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+static QUEUE_BUSY: AtomicBool = AtomicBool::new(false);
+static ENTRY_PREFIX: AtomicU64 = AtomicU64::new(0);
+static ENCODING_CPU: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_control/preparation.rs"]
+mod preparation;
 pub mod cpu {
     use super::*;
     static CPU: AtomicUsize = AtomicUsize::new(0);
@@ -128,6 +135,7 @@ pub mod learning_evidence {
     }
     pub static ROWS: Mutex<Vec<(ObjectKey, CpuClass, usize, u64, u64)>> = Mutex::new(Vec::new());
     pub fn attempt(owner: ObjectKey, class: CpuClass) -> Result<Option<OwnerAttempt>, Error> {
+        CLOCK.fetch_add(ENTRY_PREFIX.swap(0, Ordering::AcqRel), Ordering::AcqRel);
         Ok(Some(OwnerAttempt {
             owner,
             class,
@@ -223,10 +231,14 @@ impl Registry {
     }
 }
 struct State {
+    boot: u64,
     owner: Owner,
     registry: Registry,
     sequence: u64,
     encoded: Option<JobSource>,
+    preparation: Option<preparation::Pending>,
+    cursor: [usize; 18],
+    encode_ns: u64,
 }
 #[derive(Clone, Copy)]
 struct JobSource {
@@ -238,6 +250,7 @@ fn state() -> State {
     let mut families = [None; 18];
     families[1] = Some(FAMILY);
     State {
+        boot: 1,
         owner: Owner {
             families,
             context: Context {
@@ -249,6 +262,9 @@ fn state() -> State {
         registry: Registry,
         sequence: 0,
         encoded: None,
+        preparation: None,
+        cursor: [0; 18],
+        encode_ns: 0,
     }
 }
 fn with<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
@@ -260,33 +276,81 @@ fn tiers(_: Action) -> ([Option<Action>; 32], usize) {
     out[1] = Some(Action::ControlSet(6));
     (out, 2)
 }
-fn queued_control_wcet_us(_: &State, _: usize, _: u64) -> u64 {
-    2500
+fn queued_control_wcet_us(_: &State, _: usize, _: u64) -> Result<u64, Error> {
+    if QUEUE_BUSY.swap(false, Ordering::AcqRel) {
+        Err(Error::Busy)
+    } else {
+        Ok(2500)
+    }
+}
+fn preparation_identity(
+    s: &State,
+    controller: u64,
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+    sequence: u64,
+    work: Option<core_replay::WorkId>,
+) -> preparation::Identity {
+    preparation::Identity {
+        boot: s.boot,
+        controller,
+        sequence,
+        domain,
+        kind,
+        target,
+        model: s.registry.model(),
+        core_generation: s.owner.context.core_generation,
+        ledger_generation: s.owner.context.ledger_generation,
+        work: work.map(core_replay::WorkId::identity),
+    }
+}
+fn preparation_snapshot(
+    s: &mut State,
+    identity: preparation::Identity,
+    fresh: Snapshot,
+) -> Result<Snapshot, Error> {
+    match s.preparation {
+        Some(pending) => {
+            pending.check(identity, now())?;
+            Ok(pending.snapshot)
+        }
+        None => Ok(fresh),
+    }
 }
 fn encode_job(
     s: &mut State,
-    _: u64,
-    _: u64,
+    controller: u64,
+    started: u64,
     snapshot: Snapshot,
     set: CandidateSet,
     _: Action,
     _: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
     read_only: bool,
-) -> Result<[u64; 512], Error> {
+    input: &mut [u64; 512],
+) -> Result<(), Error> {
     assert!(
         read_only,
         "ordinary work must request the root read-only path"
     );
+    CLOCK.fetch_add(ENCODING_CPU.swap(0, Ordering::AcqRel), Ordering::AcqRel);
+    let identity = preparation_identity(s, controller, 1, 2, set.target, snapshot.sequence, work);
+    s.encode_ns = match s.preparation {
+        Some(pending) => pending.total(identity, now(), now().checked_sub(started).unwrap())?,
+        None => now().checked_sub(started).unwrap(),
+    };
     let id = work.unwrap();
     core_replay::bind(id, snapshot.sequence, cpu::slot(), set.hash())?;
     s.sequence = snapshot.sequence;
+    s.preparation = None;
     s.encoded = Some(JobSource {
         owner: core_replay::CORE_OWNER,
         class: CpuClass::ExecutorWork,
         work,
     });
-    Ok([0; 512]) // Root ABI encoding is exercised separately by native_control.
+    input.fill(0); // Root ABI encoding is exercised separately by native_control.
+    Ok(())
 }
 #[allow(dead_code)]
 #[path = "../../../kernel/src/domain_control/core_replay.rs"]
@@ -319,6 +383,9 @@ fn relative(id: u64) -> u64 {
 }
 #[test]
 fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut input = [0; 512];
+    CLOCK.store(1_000_000_000, Ordering::Release);
     cpu::set(0);
     assert_eq!(core_replay::abort_prepared(), Ok(true));
     core_replay::release_prepared().unwrap();
@@ -330,7 +397,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
     cpu::set(1);
     let credit = domain_tasks::begin(1);
     let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-    assert!(core_replay::next(&mut root, 1, &witness).unwrap().is_some());
+    assert!(core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
     let warm = root.encoded.unwrap().work.unwrap();
     assert_eq!(core_replay::freeze(now()), Err(Error::Busy));
     cpu::set(0);
@@ -370,7 +437,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
         cpu::set(1 + id as usize % 2);
         let credit = domain_tasks::begin(10 + id);
         let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-        assert!(core_replay::next(&mut root, 1, &witness).unwrap().is_some());
+        assert!(core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
         let work = root.encoded.unwrap().work.unwrap();
         assert!(core_replay::result(id).unwrap().is_none());
         at(now() + 1_000);
@@ -426,7 +493,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
     cpu::set(2);
     let credit = domain_tasks::begin(200);
     let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-    assert!(core_replay::next(&mut root, 1, &witness).unwrap().is_none());
+    assert!(!core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
     let choice = Candidate {
         action: Action::ControlSet(2),
         features: RawFeatures {
@@ -482,4 +549,66 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
     };
     assert_eq!(core_replay::release_unactivated(foreign), Err(Error::Busy));
     core_replay::release_unactivated(partial.key).unwrap();
+}
+
+#[test]
+fn successful_readonly_retry_includes_owner_selection_and_measurement_prefix() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut input = [0; 512];
+    for (prior_ns, expected) in [(500_000, Ok(1_400_000)), (1_200_000, Err(Error::Budget))] {
+        cpu::set(0);
+        at(now() + 1_000_000_000);
+        core_replay::prepare(41).unwrap();
+        core_replay::freeze(now()).unwrap();
+        let frozen = scope(41, learning_history::TrialKind::Baseline, now());
+        core_replay::bind_scope(&frozen).unwrap();
+        core_replay::activate(frozen.key).unwrap();
+        let mut root = state();
+        cpu::set(1);
+        let credit = domain_tasks::begin(901);
+        let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
+        let first_started = now();
+        ENTRY_PREFIX.store(prior_ns, Ordering::Release);
+        QUEUE_BUSY.store(true, Ordering::Release);
+        assert_eq!(
+            core_replay::next(&mut root, 1, &witness, first_started, &mut input),
+            Err(Error::Busy)
+        );
+        root.preparation
+            .as_mut()
+            .unwrap()
+            .charge(now() - first_started)
+            .unwrap();
+        let original = root.preparation.unwrap().snapshot;
+        let retry_started = now();
+        ENTRY_PREFIX.store(100_000, Ordering::Release);
+        ENCODING_CPU.store(800_000, Ordering::Release);
+        let result = core_replay::next(&mut root, 1, &witness, retry_started, &mut input);
+        assert_eq!(result.map(|_| root.encode_ns), expected);
+        assert_eq!(now() - retry_started, 900_000);
+        assert_eq!(
+            original.taken_ns, first_started,
+            "deadline must start before entry preparation"
+        );
+        if let Ok(_) = expected {
+            let work = root.encoded.unwrap().work.unwrap();
+            core_replay::evaluated(work, root.sequence, Ok(0), [1; 32]).unwrap();
+            core_replay::report_completed(work, &witness).unwrap();
+            core_replay::retired(work).unwrap();
+        } else {
+            let pending = root.preparation.unwrap();
+            core_replay::reject_preparation(
+                pending.identity.work.unwrap(),
+                pending.identity.sequence,
+                Error::Budget,
+                now(),
+            )
+            .unwrap();
+        }
+        domain_tasks::settle(credit);
+        cpu::set(0);
+        at(frozen.observation_ns + 20_000_000_000);
+        assert_eq!(core_replay::drain(), Ok(true));
+        core_replay::release(frozen.key).unwrap();
+    }
 }

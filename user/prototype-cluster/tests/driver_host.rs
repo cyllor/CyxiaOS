@@ -19,6 +19,10 @@ struct Node {
     entropy: u8,
     fail_task: bool,
     task_state: u64,
+    custody: Option<[u8; 120]>,
+    custody_admitted: bool,
+    task_pending: bool,
+    fail_release_once: bool,
     expire_after_stage: bool,
     fail_nonce_once: bool,
     domains: cyxia_prototype_cluster::abi::DomainInput,
@@ -213,10 +217,31 @@ mod broker {
                         n.bind_calls += 1;
                         if n.bind_busy { Err(AGAIN) } else { Err(NOT_FOUND) }
                     }
-                    0 => {
+                    TASK_LOOKUP_CUSTODY => {
+                        if !n.reserved || n.custody.as_ref().map(|key| &key[..]) != Some(input) {
+                            return Err(NOT_FOUND);
+                        }
+                        out[..8].copy_from_slice(&n.task_state.to_le_bytes());
+                        out[8..16].copy_from_slice(&u64::from(n.custody_admitted).to_le_bytes());
+                        Ok((16, 1))
+                    }
+                    TASK_CUSTODY_INVENTORY => {
+                        let key = n.custody.as_ref().filter(|key| n.reserved
+                            && input[..8] == key[..8] && input[8..40] == key[40..72]).ok_or(NOT_FOUND)?;
+                        out[..120].copy_from_slice(key);
+                        out[120..128].copy_from_slice(&n.task_state.to_le_bytes());
+                        out[128..136].copy_from_slice(&u64::from(n.custody_admitted).to_le_bytes());
+                        Ok((136, 1))
+                    }
+                    0 | TASK_RESERVE_CUSTODY => {
                         if n.reserved {
                             return Err(AGAIN);
                         }
+                        n.custody = if args[0] == TASK_RESERVE_CUSTODY {
+                            assert_eq!(input.len(), 224);
+                            Some(input[104..].try_into().unwrap())
+                        } else { None };
+                        n.custody_admitted = false;
                         n.reserved = true;
                         n.task_state = 1;
                         Ok((0, 1))
@@ -229,11 +254,14 @@ mod broker {
                         Ok((0, 1))
                     }
                     2 => {
+                        assert!(!n.custody_admitted, "task was admitted twice");
+                        n.custody_admitted = true;
                         n.starts += 1;
                         n.task_state = 2;
                         Ok((0, 1))
                     }
                     3 => {
+                        if n.task_pending { return Err(AGAIN); }
                         if n.fail_task {
                             n.task_state = 5;
                             return Err(FAILED);
@@ -248,11 +276,13 @@ mod broker {
                         Ok((8, 1))
                     }
                     4 => {
+                        if n.fail_release_once { n.fail_release_once = false; return Err(AGAIN); }
                         n.reserved = false;
+                        n.custody = None;
                         Ok((0, 1))
                     }
                     5 => {
-                        n.task_state = 5;
+                        if matches!(n.task_state, 1 | 2 | 3) { n.task_state = 5; }
                         Ok((0, 0))
                     }
                     8 => {

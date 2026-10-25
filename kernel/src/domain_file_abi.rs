@@ -34,6 +34,8 @@ struct Delivery {
     frame: Frame,
     data_address: u64,
     data_len: usize,
+    capture_len: usize,
+    capture_misses: u64,
 }
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PENDING_ID: AtomicU64 = AtomicU64::new(0);
@@ -439,6 +441,12 @@ fn deliver(owner: ObjectKey, context: &mut Context) -> Result<(), Error> {
     }
     domain_tasks::copyout(owner, pending.address, &pending.frame.bytes)?;
     context.regs[0] = pending.frame.u64(OFF_RESULT);
+    if crate::storage_fault_capture::selected(owner) {
+        let bytes = unsafe { &*core::ptr::addr_of!(DATA) };
+        crate::storage_fault_capture::delivered(
+            owner, &pending.frame.bytes, &bytes[..pending.capture_len], pending.capture_misses,
+        );
+    }
     clear_pending();
     Ok(())
 }
@@ -512,6 +520,8 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             return true;
         }
     }
+    let capture_selected = crate::storage_fault_capture::selected(owner);
+    let capture_misses_before = if capture_selected { storage::metrics().cache_misses } else { 0 };
     let result = (|| {
         let grant = authorize(owner, &input)?;
         let result = run(owner, &input, &mut output, data, progress);
@@ -543,6 +553,10 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             0
         }
     };
+    let capture_len = if output.u64(OFF_RESULT) == 0
+        && matches!(input.u16(OFF_OPERATION), READ | WRITE) {
+        output.u64(OFF_COUNT) as usize
+    } else { 0 };
     unsafe {
         *core::ptr::addr_of_mut!(PENDING) = Some(Delivery {
             owner,
@@ -550,6 +564,8 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             frame: output,
             data_address: input.u64(OFF_DATA),
             data_len: len,
+            capture_len,
+            capture_misses: if capture_selected { storage::metrics().cache_misses.saturating_sub(capture_misses_before) } else { 0 },
         });
     }
     PENDING_GENERATION.store(owner.generation, Ordering::Relaxed);

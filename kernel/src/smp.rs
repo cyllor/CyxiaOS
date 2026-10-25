@@ -78,6 +78,15 @@ pub static SMP_EVIDENCE: Evidence = Evidence {
     words: [const { AtomicU64::new(0) }; 512],
 };
 static LAST_FAR: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
+/// Sticky original fatal context. CPU0's later secondary-failure panic does
+/// not carry the faulting CPU's ELR/FAR, and its UART frame may still be queued.
+#[cfg(feature = "unified-runtime")]
+#[repr(C, align(64))]
+struct FaultEvidence([AtomicU64; 8 + C * 8]);
+#[cfg(feature = "unified-runtime")]
+#[used]
+#[unsafe(no_mangle)]
+static SMP_FAULT_EVIDENCE: FaultEvidence = FaultEvidence([const { AtomicU64::new(0) }; 8 + C * 8]);
 #[cfg(feature = "unified-runtime")]
 static HEARTBEAT: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
 #[cfg(feature = "unified-runtime")]
@@ -177,6 +186,41 @@ fn wait(mut condition: impl FnMut() -> bool) {
     }
 }
 pub fn fatal(code: u64) -> ! {
+    #[cfg(feature = "unified-runtime")]
+    record_fault(code, 0, None);
+    stop_failed(code)
+}
+#[cfg(feature = "unified-runtime")]
+fn record_fault(code: u64, kind: u64, frame: Option<&super::ExceptionFrame>) {
+    let slot = cpu::slot();
+    if slot >= C {
+        return;
+    }
+    let bank = &SMP_FAULT_EVIDENCE.0;
+    let base = 8 + slot * 8;
+    if bank[base]
+        .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    // Independent rows have a single writer. Code is the row's release seal;
+    // u64::MAX means an incomplete fatal capture, never a healthy snapshot.
+    let context = frame.map_or([0; 5], |f| {
+        [f.esr, f.far, f.elr, f.spsr, f as *const _ as u64]
+    });
+    bank[base + 1].store(timer::ticks(), Ordering::Relaxed);
+    bank[base + 2].store(kind, Ordering::Relaxed);
+    for (index, value) in context.into_iter().enumerate() {
+        bank[base + 3 + index].store(value, Ordering::Relaxed);
+    }
+    bank[1].store(1, Ordering::Relaxed);
+    bank[2].store(C as u64, Ordering::Relaxed);
+    bank[3].store(8, Ordering::Relaxed);
+    bank[base].store(code, Ordering::Release);
+    bank[0].store(0x4359_534d_5046_4131, Ordering::Release);
+}
+fn stop_failed(code: u64) -> ! {
     let slot = cpu::slot();
     FAILURES[slot].store(code, Ordering::Release);
     super::halt()
@@ -280,7 +324,9 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
         frame.spsr = 0x3c5;
         return;
     }
-    fatal(40 + kind)
+    #[cfg(feature = "unified-runtime")]
+    record_fault(40 + kind, kind, Some(frame));
+    stop_failed(40 + kind)
 }
 unsafe fn init_memory() {
     unsafe {
@@ -346,7 +392,17 @@ fn execute(ctx: &mut user::Context, i: usize) {
     // A non-yielding user program must be forcibly returned by the private PPI.
     unsafe {
         #[cfg(feature = "unified-runtime")]
-        enter_service(ctx, phys(root), timer::ticks().saturating_add(quantum));
+        enter_service(
+            ctx,
+            phys(root),
+            timer::ticks().saturating_add(quantum),
+            crate::a02_capture::Task {
+                id: 0x534d_5000 + i as u64,
+                generation: 1,
+                role: if i % 2 == 1 { 2 } else { 1 },
+                affinity: 1 << cpu::slot(),
+            },
+        );
         #[cfg(not(feature = "unified-runtime"))]
         {
             timer::arm(timer::ticks().saturating_add(quantum));
@@ -654,6 +710,8 @@ pub fn run(info: &BootInfo) -> ! {
     for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
         affinity.store(topo.affinity[slot], Ordering::Release);
     }
+    #[cfg(feature = "unified-runtime")]
+    crate::a02_capture::init();
     BOOT_READY.store(true, Ordering::Release);
     unsafe {
         core::arch::asm!("dsb sy", options(nostack));
@@ -869,7 +927,12 @@ fn heartbeat(enabled: bool) {
 #[cfg(feature = "unified-runtime")]
 /// # Safety
 /// The context and address-space root must satisfy user::enter's contract.
-pub(crate) unsafe fn enter_service(context: &mut user::Context, root: u64, deadline: u64) {
+pub(crate) unsafe fn enter_service(
+    context: &mut user::Context,
+    root: u64,
+    deadline: u64,
+    task: crate::a02_capture::Task,
+) {
     let saved_daif: u64;
     let slot = cpu::slot();
     let row = 2 + slot * 30;
@@ -897,7 +960,9 @@ pub(crate) unsafe fn enter_service(context: &mut user::Context, root: u64, deadl
             TASK_SLICE_EVIDENCE.words[row + 5].store(timer::ticks(), Ordering::Relaxed);
             TASK_SLICE_EVIDENCE.words[row + 6].store(timer::ticks(), Ordering::Relaxed);
         }
+        crate::a02_capture::enter(task);
         user::enter(context, root);
+        crate::a02_capture::returned();
         if slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);
         }

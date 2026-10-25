@@ -66,12 +66,13 @@ REQUIRED = {
     "CONTROL_CREDIT_EVIDENCE": 512,
     "IPI_EVIDENCE": 4096,
 }
-OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64,
+OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
             "LEARNING_V13_EVIDENCE": 1024, "REPLAY_V13_EVIDENCE": 512,
             "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
-            "LOCAL_PLACEMENT_EVIDENCE": 256}
+            "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
+            "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_REJECTIONS": 5184}
 
 
 def require(condition, message):
@@ -439,6 +440,57 @@ def replay_ready(value, minimum):
                 and value["durable_archives"] >= 2 * minimum)
 
 
+def parse_preparation_rejections(data):
+    """Decode protected failed attempts; these rows never attest a proposal."""
+    w = words(data, 648)
+    if not any(w) or w[3] & 1:
+        return None
+    require(w[0] == 0x4359505245503133 and w[4:8] == (1, 40, 16, 0),
+            "invalid preparation rejection layout")
+    total = w[1]
+    require(total > 0 and w[2] == max(0, total - 16) and w[3] == 2 * total,
+            "invalid preparation rejection count")
+    names = ("Format", "Auth", "Schema", "Stale", "Capacity", "Budget", "Conflict",
+             "Expired", "Unsupported", "Busy", "Again", "NotFound", "Exists",
+             "NotDirectory", "IsDirectory", "NotEmpty", "Range", "Io", "Overflow", "NotReady")
+    retained = []
+    occupied = set()
+    for ordinal in range(max(1, total - 15), total + 1):
+        slot = (ordinal - 1) % 16
+        occupied.add(slot)
+        r = w[8 + slot * 40:8 + (slot + 1) * 40]
+        domain, kind = r[3:5]
+        require(1 <= domain <= 16 and kind in (1, 2)
+                and (kind == 1 or domain in (1, 16)), "invalid rejected family")
+        family = (0 if kind == 1 else 1) if domain == 1 else (17 if kind == 2 else domain)
+        require(r[15] == family and r[33] == ordinal and not any(r[34:]),
+                "invalid preparation rejection ordinal")
+        require(all(r[i] > 0 for i in (0, 1, 2, 5, 6, 7, 8, 9))
+                and r[30:33] == (r[0], r[8], r[9]) and r[14] >= r[10]
+                and any(r[22:26]) and any(r[26:30]),
+                "invalid preparation rejection identity")
+        require(r[12] in (0, 1) and r[17] in (0, 1)
+                and (r[18] > 0 and r[19] <= 65535 and (r[20] == 1 or r[19] < 100)
+                     and r[20] in (0, 1) and r[21] in (0, 1)
+                     if r[17] else not any(r[18:22])),
+                "invalid preparation rejection custody")
+        require(1 <= r[13] <= len(names) and names[r[13] - 1] not in ("Busy", "Again", "NotReady"),
+                "transient error is not a retired preparation")
+        retained.append({"ordinal": ordinal, "sequence": r[0], "boot_epoch": r[1],
+                         "controller_epoch": r[2], "family": [domain, kind],
+                         "target": list(r[5:7]), "model_generation": r[7],
+                         "core_generation": r[8], "ledger_generation": r[9],
+                         "snapshot_ns": r[10], "cpu_ns": r[11], "overflowed": bool(r[12]),
+                         "error": names[r[13] - 1], "retired_ns": r[14],
+                         "target_ordinal": r[16], "work": list(r[18:22]) if r[17] else None,
+                         "model_hash": struct.pack('<4Q', *r[22:26]).hex(),
+                         "schema_hash": struct.pack('<4Q', *r[26:30]).hex()})
+    require(all(not any(w[8 + slot * 40:8 + (slot + 1) * 40])
+                for slot in range(16) if slot not in occupied),
+            "unexpected preparation rejection outside retained range")
+    return {"total": total, "overwritten": w[2], "retained": retained}
+
+
 def diagnostics(guest, bundle):
     # Every field belongs to this stopped snapshot. One failed parser must
     # neither hide another fresh diagnostic nor retain an older healthy value.
@@ -461,7 +513,11 @@ def diagnostics(guest, bundle):
 
     read("unified_words", lambda: list(words(bundle.get("UNIFIED_EVIDENCE", b""), 512)[:32]))
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
+                                    ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
+                                    ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
+                                    ("DOMAIN_PREPARATION_REJECTIONS", "preparation_rejections", 648),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
+                                    ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
                                     ("RUNTIME_V13_EVIDENCE", "runtime_evidence", 1024),
                                     ("TASK_SLICE_EVIDENCE", "slice_evidence", 128),
@@ -479,6 +535,7 @@ def diagnostics(guest, bundle):
         if symbol_name in bundle:
             read(key, lambda: list(words(bundle[symbol_name], count)))
     for symbol_name, key, parser in (("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
+                                     ("DOMAIN_PREPARATION_REJECTIONS", "rejected_preparations", parse_preparation_rejections),
                                      ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
                                      ("DOMAIN_TASK_EVIDENCE", "tasks", parse_tasks),
                                      ("IPI_EVIDENCE", "ipi", parse_ipi),
@@ -502,6 +559,8 @@ def diagnostics(guest, bundle):
     check("overrun_evidence", not (guest.get("overrun_evidence") or [0])[0],
           "native sticky CPU credit overrun evidence is present")
     check("panic_evidence", not (guest.get("panic_evidence") or [0])[0], "kernel panic evidence is present")
+    check("smp_fault_evidence", not (guest.get("smp_fault_evidence") or [0])[0],
+          "native secondary fatal evidence is present")
     if errors:
         raise errors[0]
 
@@ -659,6 +718,10 @@ def run(args):
     minimum_pairs = getattr(args, "replay_pairs", 0)
     require(0 <= minimum_pairs <= 216, "--replay-pairs must be 0..216")
     require(not reconnect_requested or not args.single, "--reconnect requires --peer-elf")
+    tcg_threads = getattr(args, "tcg_threads", "single")
+    require(tcg_threads in ("single", "multi"), "invalid TCG thread configuration")
+    require(args.clock_profile != "icount" or tcg_threads == "single",
+            "icount requires single-thread TCG")
     reconnect = ReconnectProbe() if reconnect_requested else None
     images = [args.elf.resolve(strict=True)]
     if not args.single:
@@ -683,7 +746,8 @@ def run(args):
         "release_acceptance_verified": False, "source_build_attested": False,
         "reconnect_requested": reconnect_requested, "reconnect_verified": False,
         "minimum_replay_pairs": minimum_pairs, "native_paired_replay_observed": False,
-        "clock_profile": args.clock_profile, "sampling": "stopped guest snapshots",
+        "clock_profile": args.clock_profile, "tcg_threads": tcg_threads,
+        "sampling": "stopped guest snapshots",
         "elf_sha256": [sha(image) for image in images],
         "verifier_sha256": sha(verifier), "formatter_sha256": sha(formatter),
         "qemu_sha256": sha(binary), "output": str(output),
@@ -722,7 +786,7 @@ def run(args):
                                f"socket,id=net0,{'listen' if ordinal == 1 else 'connect'}=127.0.0.1:{port}")
                     command = [str(binary), "-machine", "virt-10.2,gic-version=2,secure=off,virtualization=off",
                                "-cpu", "cortex-a53", "-smp", "4", "-m", "1024M",
-                               "-accel", "tcg,thread=single", "-S", "-display", "none", "-monitor", "none",
+                               "-accel", f"tcg,thread={tcg_threads}", "-S", "-display", "none", "-monitor", "none",
                                "-global", "virtio-mmio.force-legacy=false",
                                "-drive", f"if=none,id=disk0,format=raw,file={disk},cache=writeback",
                                "-device", "virtio-blk-device,drive=disk0", "-netdev", network,
@@ -885,8 +949,8 @@ def run(args):
             report["reconnect_evidence"] = reconnect.evidence()
         report["observations"] = [{key: guest.get(key) for key in
                                   ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "overrun_evidence", "panic_evidence",
-                                   "ipi_evidence", "slice_evidence", "runtime", "runtime_evidence",
-                                   "control_credit", "control_credit_evidence",
+                                   "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
+                                   "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_rejections", "rejected_preparations",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",
                                    "replay_root_evidence", "replay_owner_evidence",
                                    "replay_config_evidence", "replay_capture_evidence",
@@ -915,6 +979,8 @@ def main():
     parser.add_argument("--hold", type=float, default=2, help="wall seconds after all functional conditions hold")
     parser.add_argument("--sample-ms", type=int, default=250)
     parser.add_argument("--clock-profile", choices=("icount", "wallclock"), default="icount")
+    parser.add_argument("--tcg-threads", choices=("single", "multi"), default="single",
+                        help="TCG execution mode; multi requires wallclock and does not certify physical timing")
     parser.add_argument("--reconnect", action="store_true",
                         help="verify two-node link loss, guest-clock progress and fresh mutual authentication")
     parser.add_argument("--replay-pairs", type=int, default=0,

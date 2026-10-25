@@ -70,8 +70,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyxia-contracts"
+version = "0.1.0"
+
+[[package]]
+name = "cyxia-control-model"
+version = "0.1.0"
+
+[[package]]
 name = "cyxia-driver-virtio"
 version = "0.1.0"
+
+[[package]]
+name = "cyxia-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "cyxia-contracts",
+ "cyxia-control-model",
+]
 
 [[package]]
 name = "cyxia-prototype"
@@ -85,6 +101,7 @@ name = "cyxia-prototype-cluster"
 version = "0.1.0"
 dependencies = [
  "cyxia-cluster-transport",
+ "cyxia-kernel-core",
  "cyxia-prototype",
  "getrandom",
  "ring",

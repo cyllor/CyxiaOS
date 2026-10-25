@@ -11,6 +11,15 @@ pub const INPUT_WORDS: usize = 512;
 pub const OUTPUT_WORDS: usize = 512;
 
 pub fn candidate(input: &[u64; INPUT_WORDS], index: usize) -> Result<(Action, RawFeatures), Error> {
+    let (action, raw) = decode_candidate(input, index)?;
+    features::encode(action, raw)?;
+    Ok((action, raw))
+}
+
+fn decode_candidate(
+    input: &[u64; INPUT_WORDS],
+    index: usize,
+) -> Result<(Action, RawFeatures), Error> {
     if index >= 32 || index >= usize::try_from(input[15]).map_err(|_| Error::Range)? {
         return Err(Error::Range);
     }
@@ -60,7 +69,6 @@ pub fn candidate(input: &[u64; INPUT_WORDS], index: usize) -> Result<(Action, Ra
         target,
         control_capacity,
     };
-    features::encode(action, raw)?;
     Ok((action, raw))
 }
 fn hash(input: &[u64; INPUT_WORDS], at: usize) -> [u8; 32] {
@@ -120,7 +128,7 @@ pub fn evaluate(
     let mut scores = [0i16; 32];
     let mut previous = None;
     for (index, score) in scores.iter_mut().take(count).enumerate() {
-        let (action, raw) = candidate(input, index)?;
+        let (action, raw) = decode_candidate(input, index)?;
         if previous.is_some_and(|old| old >= action.order()) {
             return Err(Error::Conflict);
         }

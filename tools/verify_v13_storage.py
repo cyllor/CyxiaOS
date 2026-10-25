@@ -43,7 +43,29 @@ def validate(serial: bytes, page: bytes, cpus: int, epoch: int, identity: bytes)
     return dict(epoch=epoch, uuid=identity.hex(), replayed_blocks=h[6], commit_lsn=h[8],
                 reads=h[11], writes=h[12], flushes=h[13], elapsed_guest_ms=h[14])
 
-def boot(elf: Path, disk: Path, output: Path, timeout: float) -> tuple[bytes, bytes, int]:
+def validate_recovery(serial: bytes, page: bytes, cpus: int, before: dict) -> dict:
+    """Compare native replay with the independently decoded durable prefix."""
+    require(cpus == 4 and len(page) == 4096, 'invalid recovery CPU/evidence profile')
+    h = struct.unpack('<512Q', page)
+    epoch = before['boot_epoch']+1
+    require(h[:3] == (MAGIC, 1, epoch) and page[24:40].hex() == before['uuid'], 'wrong recovered boot identity')
+    require(h[5:8] == (before['committed_transactions'], before['replayed_blocks'], int(before['discarded_tail'])),
+            'native recovery disagrees with independent prefix')
+    require(h[8:11] == (before['last_commit_lsn']+4, before['generation']+1, before['log_epoch']+1),
+            'recovered checkpoint/commit chain mismatch')
+    require(h[11] >= 4096 and h[12] == before['replayed_blocks']+7 and h[13] == 4 and h[14] > 0
+            and not any(h[15:]), 'incomplete recovery I/O evidence')
+    lines = serial.splitlines()
+    expected = [b'STORAGE_V13_BOOT_DURABLE', b'STORAGE_V13_READY', b'SMP_BOOT_OK a=4 b=15 c=0']
+    expected += [f'SMP_CPU_ON a={cpu} b={cpu} c=0'.encode() for cpu in (1, 2, 3)]
+    require(all(lines.count(line) == 1 for line in expected)
+            and not any(s in serial for s in (b'FAIL', b'PANIC', b'SMP_ERROR')), 'incomplete/failed native recovery')
+    return dict(epoch=epoch, uuid=before['uuid'], replayed_blocks=h[6], discarded_tail=bool(h[7]),
+                commit_lsn=h[8], reads=h[11], writes=h[12], flushes=h[13], elapsed_guest_ms=h[14])
+
+
+def boot(elf: Path, disk: Path, output: Path, timeout: float, *,
+         backend_uri: str | None = None, cut_event=None) -> tuple[bytes, bytes, int]:
     output.mkdir()
     data = elf.read_bytes(); inspect_elf(data)
     require(boot_profile(data)['ram_mib'] == 1024, 'requires 1 GiB profile')
@@ -54,7 +76,7 @@ def boot(elf: Path, disk: Path, output: Path, timeout: float) -> tuple[bytes, by
     version = subprocess.check_output([binary, '--version'], text=True, timeout=10)
     require(version.splitlines()[0] in ('QEMU emulator version 10.2.2', 'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU')
     raw = bytearray(); serial = bytearray(); decoder = FrameDecoder()
-    proc = sock = qmp = None; cpus = []; memory = {}; args = []; page = b''
+    proc = sock = qmp = None; cpus = []; memory = {}; args = []; page = b''; power_cut = False
     with tempfile.TemporaryDirectory(prefix='cyx-store-') as td, (output/'stderr.log').open('wb') as errors:
         try:
             path = str(Path(td)/'q.sock')
@@ -63,8 +85,9 @@ def boot(elf: Path, disk: Path, output: Path, timeout: float) -> tuple[bytes, by
                     '-S', '-display', 'none', '-monitor', 'none', '-nic', 'none',
                     '-chardev', 'ringbuf,id=cyxlog,size=1048576', '-serial', 'chardev:cyxlog',
                     '-qmp', f'unix:{path},server=on,wait=off', '-kernel', str(elf), '-no-reboot',
-                    '-drive', f'if=none,id=store,file={disk},format=raw,cache=writeback',
-                    '-global', 'virtio-mmio.force-legacy=false', '-device', 'virtio-blk-device,drive=store']
+                    '-drive', f'if=none,id=store,file={backend_uri or disk},format=raw,cache=writeback',
+                    '-global', 'virtio-mmio.force-legacy=false', '-device',
+                    'virtio-blk-device,drive=store'+(',request-merging=off' if backend_uri is not None else '')]
             end = time.monotonic()+timeout
             proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors, env=env())
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -83,12 +106,24 @@ def boot(elf: Path, disk: Path, output: Path, timeout: float) -> tuple[bytes, by
                 chunk = base64.b64decode(qmp.execute('ringbuf-read', {'device':'cyxlog','size':1048576,'format':'base64'}), validate=True)
                 raw.extend(chunk); require(len(raw) <= 2*1024*1024, 'serial budget')
                 for frame in decoder.feed(chunk): serial.extend(frame)
-                require(not any(s in serial for s in (b'FAIL',b'PANIC',b'SMP_ERROR')), 'guest failure')
-                if b'STORAGE_V13_READY\n' in serial:
+                if cut_event is not None and cut_event.is_set():
                     qmp.execute('stop')
                     qmp.execute('pmemsave', {'val':location['pa'],'size':4096,'filename':str(output/'page.bin')})
                     page = (output/'page.bin').read_bytes()
+                    power_cut = True
+                    proc.kill(); proc.wait(timeout=2)
+                    return bytes(serial), page, len(cpus)
+                require(not any(s in serial for s in (b'FAIL',b'PANIC',b'SMP_ERROR')), 'guest failure')
+                if b'STORAGE_V13_READY\n' in serial:
+                    if backend_uri is None:
+                        qmp.execute('stop')
+                    qmp.execute('pmemsave', {'val':location['pa'],'size':4096,'filename':str(output/'page.bin')})
+                    page = (output/'page.bin').read_bytes()
                     require(decoder.loss == decoder.corrupt == 0 and not decoder.buffer, 'corrupt framed UART')
+                    if backend_uri is not None:
+                        # QMP stop and graceful close issue host-originated FLUSH.
+                        # Preserve precisely the guest's captured durability.
+                        proc.kill(); proc.wait(timeout=2)
                     return bytes(serial), page, len(cpus)
                 time.sleep(.01)
             raise TimeoutError('native storage deadline')
@@ -106,7 +141,8 @@ def boot(elf: Path, disk: Path, output: Path, timeout: float) -> tuple[bytes, by
             (output/'serial.bin').write_bytes(raw); (output/'serial.txt').write_bytes(serial)
             if qmp: (output/'qmp.jsonl').write_text(''.join(json.dumps(m)+'\n' for m in qmp.transcript))
             (output/'launch.json').write_text(json.dumps(dict(argv=args,cpus=cpus,memory=memory,
-                qemu_version=version,qemu_sha256=sha(Path(binary)),exit=proc.returncode if proc else None),indent=2)+'\n')
+                qemu_version=version,qemu_sha256=sha(Path(binary)),power_cut=power_cut,
+                exit=proc.returncode if proc else None),indent=2)+'\n')
 
 def run(elf: Path, output: Path, timeout: float = 120) -> dict:
     require(1 <= timeout <= 300, 'invalid timeout')

@@ -14,6 +14,7 @@ import subprocess
 import time
 from doctor import ROOT,env
 from verify_smp import require
+import check_v13_preparation_stack as preparation_stack
 
 
 CODE_ROOTS={'kernel','crates','user','ports','.cargo'}
@@ -97,9 +98,36 @@ def tool_version(argv,environment):
     return result.stdout.strip()
 
 
+def preparation_stack_gate(images, output, objdump, environment):
+    """Inspect both actual ELFs before issuing a successful build manifest."""
+    require(set(images) == {'a', 'b'}, 'preparation stack gate requires both nodes')
+    results, failed = {}, []
+    for node in ('a', 'b'):
+        image = images[node]
+        try:
+            result = preparation_stack.inspect_elf(image, objdump, environment)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            result = dict(passed=False, error=str(error), elf=str(image), elf_sha256=sha(image),
+                          objdump=objdump, checker_sha256=preparation_stack.CHECKER_SHA256,
+                          scope='selected direct preparation calls; not a complete stack proof')
+        report = output / f'node-{node}-stack.json'
+        report.write_text(json.dumps(result, indent=2) + '\n')
+        report.chmod(0o600)
+        results[node] = dict(report=report.name, elf_sha256=result['elf_sha256'],
+                             peak_bytes=result.get('peak', {}).get('frame_bytes'))
+        if not result['passed']:
+            failed.append(node)
+    require(not failed, 'preparation stack gate failed for node(s) ' + ', '.join(failed))
+    return dict(stack_bytes=preparation_stack.STACK_BYTES,
+                exception_reserve_bytes=preparation_stack.EXCEPTION_RESERVE,
+                checker_sha256=preparation_stack.CHECKER_SHA256, objdump=objdump, nodes=results,
+                scope='selected direct preparation calls; not a complete stack proof')
+
+
 def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds=None,
-          selftest=False,cargo=None,cc=None,target_dir=None):
+          selftest=False,storage_fault=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
+    require(not storage_fault or (selftest and fault == 'normal' and not leave), 'storage fault profile requires selftest, normal runtime and no leave')
     if unix_seconds is None:
         unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
     require(0<unix_seconds<(1<<63),'invalid provisioned UTC epoch')
@@ -123,12 +151,15 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
         'cargo':[str(cargo),'--version'],'rustc':[environment.get('RUSTC','rustc'),'--version','--verbose'],
         'clang':[str(cc),'--version'],'openssl':['openssl','version'],
         'installed_targets':['rustup','target','list','--installed']}.items()}
+    objdump = preparation_stack.toolchain_objdump(environment)
+    versions['llvm_objdump'] = objdump['version']
+    builder_digest = sha(Path(__file__))
     require('aarch64-unknown-none\n' in versions['installed_targets']+'\n' and 'aarch64-unknown-none-softfloat' in versions['installed_targets'],'install both standard EL0 and softfloat EL1 Rust targets before building')
     keys=[(p/'key.der').read_bytes() for p in identities]
     billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None
     for index,name in enumerate(('a','b')):
-        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0')
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
         commands.append(dict(node=name,stage='service',argv=service_command))
         print(f'Building node {name} EL0 service',flush=True)
@@ -150,12 +181,15 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
         public=output/f'node-{name}.pub';public.write_bytes((identities[index]/'own.pub').read_bytes());public.chmod(0o600)
         audit_private_images(service.read_bytes(),image.read_bytes(),keys[index],keys[1-index],billing_seeds[index],billing_seeds[1-index])
         billing_public=output/f'node-{name}.billing.pub';billing_public.write_bytes((identities[index]/'billing.pub').read_bytes());billing_public.chmod(0o600)
+    stack_proof = preparation_stack_gate(
+        {name: output / f'node-{name}.elf' for name in ('a', 'b')}, output, objdump, environment)
     require([identity_metadata(p) for p in identities]==metadata and all((p/'key.der').read_bytes()==keys[i] for i,p in enumerate(identities)),'external identity changed during the build')
     require(all((p/'billing.seed').read_bytes()==billing_seeds[i] for i,p in enumerate(identities)),'billing identity changed during the build')
     require(code_source_map()==before,'code changed while building; preserve this failed build and rebuild from a source freeze')
+    require(sha(Path(__file__)) == builder_digest, 'native builder changed during build')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=sha(Path(__file__)),tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,scope='Reproducible source/image binding and separate private identities; native execution and acceptance require the independent runner.')
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
@@ -168,13 +202,14 @@ def main():
     parser.add_argument('--fault',choices=('normal','hang-once','no-stop-ack'),default='normal')
     parser.add_argument('--leave',action='store_true')
     parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
+    parser.add_argument('--storage-fault',action='store_true',help='dedicated A10 ordinary-file workload (requires --selftest)')
     parser.add_argument('--cargo',default=os.environ.get('CARGO'),help='Cargo executable (also accepts CARGO)')
     parser.add_argument('--cc',help='bare-metal C compiler (also accepts CC_aarch64_unknown_none or CC)')
     parser.add_argument('--target-dir',type=Path,help='build cache directory (also accepts CARGO_TARGET_DIR)')
     parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
     args=parser.parse_args()
     build(args.identity_a,args.identity_b,args.output,fault=args.fault,leave=args.leave,unix_seconds=args.unix_seconds,
-          selftest=args.selftest,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
+          selftest=args.selftest,storage_fault=args.storage_fault,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
     print(args.output/'build-manifest.json')
 
 

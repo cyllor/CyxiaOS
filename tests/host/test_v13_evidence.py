@@ -1,9 +1,11 @@
 """Evidence catalogue tests; fixtures are not native runtime evidence."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +28,83 @@ class EvidenceCatalogue(unittest.TestCase):
         self.assertFalse(result['functional_acceptance_complete'])
         self.assertFalse(result['strict_spec_conformance'])
         self.assertFalse(result['runtime_truth_attested'])
+
+    def test_a02_native_adapter_coverage_does_not_promote_unrun_cases(self):
+        result = self.check.validate(self.document, ROOT)
+        coverage = result.get('verifier_coverage', {})
+        self.assertIn('raw_contracts', coverage, 'Raw verifier coverage is not reported')
+        self.assertEqual(coverage['native_receipt_cases'], ['A02'])
+        self.assertEqual(coverage['raw_contracts']['A02']['native_receipt_admitted'], True)
+        self.assertEqual(coverage['raw_contracts']['A02']['native_verifier_version'], 'a02-native-v4')
+        self.assertEqual(result['states']['NOT_RUN'], 69)
+
+    def native_row(self, root, *, case='A02', filename='summary.json', status='PASS'):
+        receipt = root / filename
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({'test_id': 'A02', 'status': 'PASS',
+                                       'native_execution_verified': True,
+                                       'raw_contract_valid': True}))
+        row = copy.deepcopy(next(r for r in self.document['cases'] if r['id'] == case))
+        row.update(status=status, evidence={'path': filename,
+                    'sha256': hashlib.sha256(receipt.read_bytes()).hexdigest()})
+        return row
+
+    def check_native_row(self, row, root):
+        return self.check.check_rows([row], {row['id']}, 'case set', root, descriptions=True)
+
+    def test_raw_contract_or_producer_pass_boolean_cannot_close_a02(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root)
+            with self.assertRaisesRegex(ValueError, 'incomplete native artifact inventory'):
+                self.check_native_row(row, root)
+
+    def test_a02_adapter_requires_canonical_summary_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, filename='receipt.json')
+            with self.assertRaisesRegex(ValueError, 'A02 receipt must name summary.json'):
+                self.check_native_row(row, root)
+
+    def test_a02_adapter_cannot_certify_native_failure_from_checker_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, status='FAIL')
+            with self.assertRaisesRegex(ValueError, 'A02 native FAIL classification is not registered'):
+                self.check_native_row(row, root)
+
+    def test_a02_receipt_cannot_close_another_case_or_action_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, case='A03')
+            with self.assertRaisesRegex(ValueError, 'No complete 1.3 native receipt verifier'):
+                self.check_native_row(row, root)
+            row = {key: value for key, value in row.items() if key in ('id', 'status', 'evidence')}
+            row['id'] = 'D01_CORESET'
+            with self.assertRaisesRegex(ValueError, 'No complete 1.3 native receipt verifier'):
+                self.check.check_rows([row], {'D01_CORESET'}, 'action family set', root, descriptions=False)
+
+    def test_a02_receipt_rejects_bad_hash_and_symlink_ancestor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, filename='real/summary.json')
+            row['evidence']['sha256'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                self.check_native_row(row, root)
+            row = self.native_row(root, filename='real/summary.json')
+            (root / 'alias').symlink_to(root / 'real', target_is_directory=True)
+            row['evidence']['path'] = 'alias/summary.json'
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                self.check_native_row(row, root)
+
+    def test_manifest_cannot_supply_a_checker_or_source_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for key in ('checker', 'source_root'):
+                row = self.native_row(root)
+                row['evidence'][key] = '/tmp/arbitrary-code'
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.check_native_row(row, root)
 
     def test_cannot_delete_new_implementation_boundaries(self):
         self.document['cases'] = [r for r in self.document['cases'] if r['id'] != 'E15']

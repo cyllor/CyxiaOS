@@ -1351,6 +1351,25 @@ pub(super) fn first(
     let prefix = activate(r.token.ok_or(Error::Stale)?, q, snapshot)?;
     Ok((root().first.ok_or(Error::Stale)?, Some(prefix)))
 }
+/// A first decision that failed before proposal construction cannot restart
+/// the same captured trial under a new sequence or refreshed deadline.
+pub(super) fn reject_preparation(
+    identity: preparation::Identity,
+    snapshot: Snapshot,
+    error: Error,
+) {
+    let r = root_mut();
+    if r.first == Some(snapshot)
+        && r.initial.is_none()
+        && r.request.is_some_and(|q| {
+            q.family.domain == identity.domain
+                && q.family.kind == identity.kind
+                && q.target == identity.target
+        })
+    {
+        fail(r, error);
+    }
+}
 pub(super) fn published(plan: &Plan, boot: u64) -> Result<(), Error> {
     let r = root_mut();
     let Some(q) = r.request else {
@@ -2833,7 +2852,7 @@ pub fn validation_probe(token: Token) -> Result<ValidationProbe, Error> {
             WINDOW_NS
         };
         let held = at.saturating_sub(stability.last_change_ns()) >= hold;
-        let queued = queued_control_wcet_us(s, index, at);
+        let queued = queued_control_wcet_us(s, index, at)?;
         let mut choices = [Candidate {
             action: current,
             features: RawFeatures::default(),

@@ -148,6 +148,40 @@ fn isolation_and_deadline_are_rechecked_after_started_intent() {
     assert_eq!(a.results[0].state, TaskState::Started);
 }
 #[test]
+fn same_boot_custody_reconciliation_only_allows_finishing_the_exact_started_record() {
+    let (mut original, _, mut log) = pair();
+    let t = terms(&original);
+    let hash = original.request_hash(&t);
+    original.prepare(t, hash, [11; 16], 0, 2000).unwrap();
+    let e = original.commit(t.id, [11; 16], hash, 0).unwrap();
+    log.push(commit(&mut original, e));
+    let key = TaskKey {
+        cluster: original.cluster(),
+        contract: t.id,
+        task: [12; 16],
+        attempt: 1,
+    };
+    let e = original.activate(key, hash, b"input", 1, 1, 1).unwrap();
+    log.push(commit(&mut original, e));
+    let mut recovered = Engine::new([1; 32], [2; 32], 1, TestCrypto([1; 32])).unwrap();
+    for event in &log {
+        recovered.recover_event(event).unwrap();
+    }
+    assert!(recovered.finish(key, TaskState::Done, b"result").is_err());
+    assert!(recovered.reconcile_started(key, 2, hash).is_err());
+    assert!(recovered.reconcile_started(key, 1, [0; 32]).is_err());
+    let mut wrong = key;
+    wrong.attempt += 1;
+    assert!(recovered.reconcile_started(wrong, 1, hash).is_err());
+    recovered.reconcile_started(key, 1, hash).unwrap();
+    assert!(!recovered.ready());
+    assert!(recovered.enqueue(key, 1, 1, 2).is_err());
+    let e = recovered.finish(key, TaskState::Done, b"result").unwrap();
+    commit(&mut recovered, e);
+    assert_eq!(recovered.results[0].body, b"result");
+    assert!(recovered.reconcile_started(key, 1, hash).is_err());
+}
+#[test]
 fn recipient_persists_before_ack_owner_persists_tombstone_before_free() {
     let (mut owner, mut recipient, _) = pair();
     let (id, h) = grant(&mut owner);

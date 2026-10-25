@@ -41,6 +41,22 @@ pub struct StartRequest {
     pub session: u64,
     pub input_hash: [u8; 32],
 }
+/// Stable custody identity supplied by the protected authenticated service.
+/// Looking up this identity never refreshes a transport session or grants START.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CustodyKey {
+    pub owner_boot: u64,
+    pub cluster: [u8; 32],
+    pub requester: [u8; 32],
+    pub contract: [u8; 16],
+    pub request_hash: [u8; 32],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Custody {
+    pub key: CustodyKey,
+    pub token: u64,
+    pub started: bool,
+}
 #[derive(Clone, Copy)]
 struct Reservation {
     token: u64,
@@ -51,6 +67,7 @@ struct Reservation {
     deadline: Option<u64>,
     grant: u64,
     started: bool,
+    custody: Option<CustodyKey>,
 }
 pub struct Authority {
     epoch: u64,
@@ -135,8 +152,52 @@ impl Authority {
             deadline: None,
             grant: 0,
             started: false,
+            custody: None,
         });
         Ok(token)
+    }
+    pub fn reserve_with_custody(
+        &mut self,
+        terms: Terms,
+        installed: [u8; 32],
+        key: CustodyKey,
+        now: u64,
+    ) -> Result<u64, Error> {
+        if key.owner_boot == 0
+            || key.cluster == [0; 32]
+            || key.requester == [0; 32]
+            || key.contract != terms.contract
+            || key.request_hash == [0; 32]
+        {
+            return Err(Error::Invalid);
+        }
+        let token = self.reserve(terms, installed, now)?;
+        self.reservation.as_mut().unwrap().custody = Some(key);
+        Ok(token)
+    }
+    pub fn custody(&self, key: CustodyKey) -> Result<Custody, Error> {
+        let r = self.reservation.as_ref().ok_or(Error::NotReady)?;
+        if r.custody != Some(key) {
+            return Err(Error::Stale);
+        }
+        Ok(Custody {
+            key,
+            token: r.token,
+            started: r.started,
+        })
+    }
+    /// The authenticated broker scopes inventory to this boot and paired peer.
+    /// Used when PREPARE was volatile, or CLOSE was durable before release.
+    pub fn inventory(&self, owner_boot: u64, requester: [u8; 32]) -> Result<Custody, Error> {
+        let key = self
+            .reservation
+            .as_ref()
+            .and_then(|r| r.custody)
+            .ok_or(Error::NotReady)?;
+        if key.owner_boot != owner_boot || key.requester != requester {
+            return Err(Error::Stale);
+        }
+        self.custody(key)
     }
     pub fn grant(
         &mut self,

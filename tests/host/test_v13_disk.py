@@ -37,6 +37,23 @@ class BootVolume(unittest.TestCase):
     def corrupt(self,block,at):
         with self.path.open('r+b') as f:
             f.seek(block*4096+at);b=f.read(1);f.seek(-1,1);f.write(bytes([b[0]^1]))
+    def record(self,kind,lsn,payload,home=0,index=0,count=0,txid=1,epoch=2):
+        length=64+len(payload)
+        data=bytearray((length+4095)//4096*4096)
+        struct.pack_into('<IHHIIQQQQII',data,0,0x43594c47,1,kind,length,
+            crc32c(payload),txid,lsn,epoch,home,index,count)
+        struct.pack_into('<I',data,56,crc32c(data[:64]))
+        data[64:64+len(payload)]=payload
+        return data
+    def append_boot_update(self,at=2,txid=1,lsn=7,epoch=2):
+        with self.path.open('rb') as disk:
+            disk.seek(4119*4096);image=disk.read(4096)
+        self.write(at,self.record(1,lsn,struct.pack('<IIQ',1,0,4096),txid=txid,epoch=epoch))
+        self.write(at+1,self.record(2,lsn+1,image,4119,0,1,txid=txid,epoch=epoch))
+        digest=hashlib.sha256(struct.pack('<Q',4119)+image).digest()
+        body=struct.pack('<QQQII',txid,lsn,lsn+1,1,0)+digest
+        self.write(at+3,self.record(3,lsn+2,body,txid=txid,epoch=epoch))
+        return body
     def test_independent_crc_golden_and_checkpointed_boot(self):
         self.assertEqual(crc32c(b'123456789'),0xe3069283)
         result=inspect(self.path);self.assertEqual(result['boot_epoch'],1);self.assertEqual(result['last_commit_lsn'],6)
@@ -56,21 +73,7 @@ class BootVolume(unittest.TestCase):
     def test_complete_redo_chain_checks_sha_even_with_valid_record_crcs(self):
         # The checkpoint fixture uses epoch2/checkpoint6. A one-image commit
         # may rewrite identical bytes; it still requires a complete SHA-bound log.
-        with self.path.open('rb') as disk:
-            disk.seek(4119*4096); image=disk.read(4096)
-        def record(kind,lsn,payload,home=0,index=0,count=0):
-            length=64+len(payload)
-            data=bytearray((length+4095)//4096*4096)
-            struct.pack_into('<IHHIIQQQQII',data,0,0x43594c47,1,kind,length,
-                crc32c(payload),1,lsn,2,home,index,count)
-            struct.pack_into('<I',data,56,crc32c(data[:64]))
-            data[64:64+len(payload)]=payload
-            return data
-        self.write(2,record(1,7,struct.pack('<IIQ',1,0,4096)))
-        self.write(3,record(2,8,image,4119,0,1))
-        digest=hashlib.sha256(struct.pack('<Q',4119)+image).digest()
-        commit=struct.pack('<QQQII',1,7,8,1,0)+digest
-        self.write(5,record(3,9,commit))
+        commit=self.append_boot_update()
         recovered=inspect(self.path)
         self.assertEqual(recovered['committed_transactions'],1)
         self.assertEqual(recovered['last_commit_lsn'],9)
@@ -78,11 +81,46 @@ class BootVolume(unittest.TestCase):
         # Regenerate BOTH CRCs after changing the digest, so a CRC-only checker
         # would incorrectly accept this mutation.
         corrupted=bytearray(commit); corrupted[-1]^=1
-        self.write(5,record(3,9,bytes(corrupted)))
+        self.write(5,self.record(3,9,bytes(corrupted)))
         with self.assertRaisesRegex(ValueError,'COMMIT digest mismatch'):
             inspect(self.path)
-    def test_current_epoch_record_after_gap_rejected(self):
-        data=bytearray(4096);struct.pack_into('<I',data,0,0x43594c47);struct.pack_into('<Q',data,32,2);self.write(44,data)
+    def test_incomplete_final_transaction_retains_the_committed_prefix(self):
+        self.append_boot_update()
+        self.append_boot_update(at=6,txid=2,lsn=10)
+        self.write(9,bytes(4096))
+        result=inspect(self.path)
+        self.assertEqual((result['boot_epoch'],result['last_commit_lsn'],result['committed_transactions']),(1,9,1))
+        self.assertTrue(result['discarded_tail'])
+    def test_torn_final_redo_without_commit_is_discarded(self):
+        self.append_boot_update()
+        self.corrupt(3,100)
+        self.write(5,bytes(4096))
+        result=inspect(self.path)
+        self.assertEqual((result['boot_epoch'],result['last_commit_lsn']),(1,6))
+        self.assertTrue(result['discarded_tail'])
+    def test_damaged_committed_chains_and_valid_commit_after_gap_are_rejected(self):
+        for block,offset in ((2,56),(3,100),(4,0)):
+            self.append_boot_update()
+            self.corrupt(block,offset)
+            with self.subTest(block=block),self.assertRaises(ValueError):inspect(self.path)
+        self.write(2,bytes(4096))
         with self.assertRaises(ValueError):inspect(self.path)
+    def test_corrupt_middle_commit_cannot_hide_a_later_commit(self):
+        self.append_boot_update()
+        self.append_boot_update(at=6,txid=2,lsn=10)
+        self.corrupt(5,100)
+        with self.assertRaises(ValueError):inspect(self.path)
+    def test_old_epoch_residue_and_uncommitted_records_after_gap_are_not_replayed(self):
+        self.append_boot_update(at=44,epoch=1)
+        self.write(48,self.record(1,7,struct.pack('<IIQ',1,0,4096)))
+        result=inspect(self.path)
+        self.assertEqual((result['boot_epoch'],result['last_commit_lsn'],result['committed_transactions']),(1,6,0))
+    def test_malformed_commit_counter_does_not_establish_commitment(self):
+        body=self.append_boot_update()
+        malformed=bytearray(body);struct.pack_into('<Q',malformed,16,99)
+        self.write(5,self.record(3,9,malformed))
+        result=inspect(self.path)
+        self.assertEqual(result['last_commit_lsn'],6)
+        self.assertTrue(result['discarded_tail'])
 
 if __name__=='__main__':unittest.main()

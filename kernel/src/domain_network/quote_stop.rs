@@ -164,7 +164,7 @@ impl<const N: usize> Journal<N> {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 mod native {
     use super::*;
     use crate::domain_control::replay::{Receipt, Token};
@@ -288,5 +288,5 @@ mod native {
         })
     }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub use native::{baseline_stop_custody, baseline_stop_quotes, input, observe};

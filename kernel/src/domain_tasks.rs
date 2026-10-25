@@ -31,7 +31,7 @@ pub use execution::{
     init_recoverable, local_result, probe_status, query_local, query_spawn, readonly_drained,
     recoverable_key, recoverable_result, recoverable_submit, remote_activate, remote_capacity,
     remote_fault, remote_release, remote_selected, remote_start, remote_stopped, remote_word,
-    request_stop, running, service, service_io_piece, start_generation, start_probe_client,
+    request_stop, running, service, service_io_piece, start_generation, start_probe_client, start_storage_client,
     stopped, submit_local, submit_spawn,
 };
 pub use local_evidence::bind_local_failure_request;
@@ -308,32 +308,10 @@ impl Rate {
             .fold(0u64, |sum, (_, n)| sum.saturating_add(*n))
     }
 }
-#[derive(Clone, Copy)]
-struct Samples {
-    values: [u64; 64],
-    count: usize,
-    next: usize,
-}
-impl Samples {
-    const EMPTY: Self = Self {
-        values: [0; 64],
-        count: 0,
-        next: 0,
-    };
-    fn add(&mut self, value: u64) {
-        self.values[self.next] = value;
-        self.next = (self.next + 1) % 64;
-        self.count = (self.count + 1).min(64);
-    }
-    fn p99(&self) -> Result<u64, Error> {
-        if self.count == 0 {
-            return Err(Error::NotReady);
-        }
-        let mut values = self.values;
-        values[..self.count].sort_unstable();
-        Ok(values[(self.count * 99).div_ceil(100) - 1])
-    }
-}
+#[path = "domain_tasks/samples.rs"]
+mod samples;
+use samples::Samples;
+
 struct Facts {
     cpu: [Rate; 16],
     wakes: [Rate; 16],
@@ -1373,18 +1351,30 @@ pub fn install(
     })
 }
 pub fn enumerate_target(domain: u16, ordinal: usize) -> Option<ObjectKey> {
+    locked(|s| Ok(target_locked(s, domain, ordinal)))
+        .ok()
+        .flatten()
+}
+fn target_locked(s: &State, domain: u16, ordinal: usize) -> Option<ObjectKey> {
+    match domain {
+        1 | 2 => s.scheduler.group_at(ordinal),
+        3 => (ordinal == 0).then_some(MEMORY_KEY),
+        5 => s.ipc.endpoint_at(ordinal),
+        8 => (ordinal == 0).then_some(SERVICE_KEY),
+        13 => [group(15), group(16)].get(ordinal).copied(),
+        _ => None,
+    }
+}
+pub(crate) fn queued_targets(
+    queries: &[crate::domain_control::target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    // Pure scheduler/IPC projections from one borrowed owner generation.
     locked(|s| {
-        Ok(match domain {
-            1 | 2 => s.scheduler.group_at(ordinal),
-            3 => (ordinal == 0).then_some(MEMORY_KEY),
-            5 => s.ipc.endpoint_at(ordinal),
-            8 => (ordinal == 0).then_some(SERVICE_KEY),
-            13 => [group(15), group(16)].get(ordinal).copied(),
-            _ => None,
+        crate::domain_control::target_batch::resolve(queries, output, |q| {
+            target_locked(s, q.domain, q.ordinal)
         })
     })
-    .ok()
-    .flatten()
 }
 pub fn current_action(domain: u16, target: ObjectKey) -> Result<Action, Error> {
     locked(|s| current_locked(s, domain, target, now_ns()))
@@ -1716,6 +1706,7 @@ pub fn register_control() -> Result<(), Error> {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
             kind: 1,
+            target_source: crate::domain_control::TargetSource::Tasks,
             target: control_target,
             observe: |domain, target| {
                 observation(domain, target)

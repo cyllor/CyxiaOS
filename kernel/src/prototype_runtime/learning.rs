@@ -1870,6 +1870,9 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
             context.kind = 0;
             let slice =
                 ((u128::from(SLICE_NS) * u128::from(timer::frequency())) / 1_000_000_000) as u64;
+            let role = worker
+                .request
+                .map_or(OWNER, |request| request.identity.binding.role_context);
             unsafe {
                 enter_service(
                     context,
@@ -1879,6 +1882,12 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
                         resources()?.root
                     },
                     entered.saturating_add(slice.max(1)),
+                    crate::a02_capture::Task {
+                        id: role.id,
+                        generation: role.generation,
+                        role: 2,
+                        affinity: 1 << cpu::slot(),
+                    },
                 );
             }
             let end = timer::ticks();

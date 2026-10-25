@@ -90,7 +90,10 @@ pub fn normalize(value: u64, upper: u64) -> Result<(i16, bool), Error> {
     Ok((((512 * v + h) / (2 * h)) as i16, value > upper))
 }
 
-pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
+/// Validate the raw candidate without computing model activations. Protected
+/// candidate registration binds these raw bytes; its caller does not consume
+/// normalized features. Inference still calls the same validation via encode.
+pub fn validate(action: Action, raw: &RawFeatures) -> Result<(), Error> {
     action.validate()?;
     if raw.domain_present & !DOMAIN_PRESENT_ALL != 0
         || raw
@@ -116,6 +119,14 @@ pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
     {
         return Err(Error::Range);
     }
+    if matches!(action, Action::ControlSet(_)) && raw.control_capacity.is_none() {
+        return Err(Error::NotReady);
+    }
+    Ok(())
+}
+
+pub fn encode(action: Action, raw: RawFeatures) -> Result<Encoded, Error> {
+    validate(action, &raw)?;
     let mut out = Encoded {
         values: [0; 64],
         clipped: 0,

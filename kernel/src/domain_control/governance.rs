@@ -251,7 +251,7 @@ fn candidates_into(
         WINDOW_NS
     };
     let held = at.saturating_sub(guard.last_change_ns()) >= hold;
-    let queued = queued_control_wcet_us(state, family_index(f.domain, f.kind)?, at);
+    let queued = queued_control_wcet_us(state, family_index(f.domain, f.kind)?, at)?;
     let mut choices = [Candidate {
         action: current,
         features: RawFeatures::default(),

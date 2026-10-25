@@ -145,6 +145,39 @@ fn commit(journal: &mut Journal, disk: &mut Disk, home: u32, byte: u8) -> journa
         .unwrap()
 }
 
+fn independent_image(disk: &Disk, label: &str, script: &str) -> String {
+    use std::io::{Seek, SeekFrom, Write};
+    let path =
+        std::env::temp_dir().join(format!("cyxia-checker-{label}-{}.raw", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(u64::from(TOTAL_BLOCKS) * BLOCK_SIZE as u64)
+        .unwrap();
+    for (block, bytes) in &disk.stable {
+        file.seek(SeekFrom::Start(u64::from(*block) * BLOCK_SIZE as u64))
+            .unwrap();
+        file.write_all(&bytes[..]).unwrap();
+    }
+    drop(file);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let result = std::process::Command::new("python3")
+        .current_dir(root)
+        .args(["-c", script])
+        .arg(&path)
+        .output()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap().trim().to_owned()
+}
+
 #[test]
 fn formatter_checks_every_block_and_publishes_valid_initial_metadata() {
     let mut disk = Disk::blank();
@@ -378,6 +411,301 @@ fn every_checkpoint_write_and_flush_boundary_recovers_acknowledged_commit() {
             );
         }
     }
+}
+
+#[test]
+fn every_recovery_write_and_flush_boundary_preserves_the_latest_committed_prefix() {
+    let (mut disk, mut journal) = mounted();
+    commit(&mut journal, &mut disk, DATA_START, 1);
+    commit(&mut journal, &mut disk, DATA_START + 1, 2);
+    let acknowledged = commit(&mut journal, &mut disk, DATA_START, 3);
+    assert_eq!(acknowledged.commit_lsn, 9);
+
+    // The next REDO reaches durable media, but its COMMIT has no completed
+    // FLUSH. Recovery must retain the preceding version of this same home.
+    disk.operations.clear();
+    disk.cut = Some(Cut::Before(6));
+    assert_eq!(
+        journal.commit(
+            &mut disk,
+            &[AfterImage {
+                home_block: DATA_START,
+                bytes: &[4; BLOCK_SIZE],
+            }],
+            &mut scratch(),
+        ),
+        Err(Error::Io(Fault::Injected))
+    );
+    disk.power_cut();
+
+    let mut successful = disk.clone();
+    let recovered = Journal::new()
+        .mount(&mut successful, &mut scratch())
+        .unwrap();
+    assert_eq!(recovered.committed_transactions, 3);
+    assert_eq!(recovered.replayed_blocks, 2);
+    assert!(recovered.discarded_tail);
+    let operations = successful.operations;
+    assert_eq!(
+        operations,
+        [
+            Operation::Write(DATA_START),
+            Operation::Write(DATA_START + 1),
+            Operation::Flush,
+            Operation::Write(0),
+            Operation::Flush,
+        ]
+    );
+    for after in [false, true] {
+        for point in 1..=operations.len() {
+            let mut interrupted = disk.clone();
+            interrupted.cut = Some(if after {
+                Cut::After(point)
+            } else {
+                Cut::Before(point)
+            });
+            let mut recovery = Journal::new();
+            assert_eq!(
+                recovery.mount(&mut interrupted, &mut scratch()),
+                Err(Error::Io(Fault::Injected)),
+                "after={after} point={point} operation={:?}",
+                operations[point - 1]
+            );
+            assert!(!recovery.is_writable());
+            assert_eq!(interrupted.operations, operations[..point]);
+
+            // A second power loss discards recovery's own unflushed home or
+            // superblock writes. A fresh owner must independently recover.
+            interrupted.power_cut();
+            let mut recovered = Journal::new();
+            recovered.mount(&mut interrupted, &mut scratch()).unwrap();
+            assert_eq!(recovered.last_commit_lsn(), 9);
+            assert_eq!(
+                read(&mut recovered, &mut interrupted, DATA_START),
+                [3; BLOCK_SIZE]
+            );
+            assert_eq!(
+                read(&mut recovered, &mut interrupted, DATA_START + 1),
+                [2; BLOCK_SIZE]
+            );
+            let next = commit(&mut recovered, &mut interrupted, DATA_START + 2, 5);
+            assert!(next.key.log_epoch > acknowledged.key.log_epoch);
+            assert_eq!(next.commit_lsn, 12);
+        }
+    }
+}
+
+#[test]
+fn every_recovery_write_and_flush_boundary_preserves_acknowledged_fsync_sequence() {
+    use cyxia_prototype::{
+        boot::BootSession,
+        domains::filesystem::{FileSystem, OpenMode, validate_volume},
+    };
+
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut disk, mut journal) = mounted();
+            BootSession::new()
+                .allocate(
+                    &mut journal,
+                    &mut disk,
+                    &mut scratch(),
+                    &mut [[0; BLOCK_SIZE]; 4],
+                )
+                .unwrap();
+            let key = {
+                let mut fs = FileSystem::<64>::new();
+                fs.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
+                let key = fs
+                    .create("/durable", &mut journal, &mut disk, &mut scratch())
+                    .unwrap();
+                let handle = fs
+                    .open(
+                        "/durable",
+                        OpenMode::ReadWrite,
+                        &mut journal,
+                        &mut disk,
+                        &mut scratch(),
+                    )
+                    .unwrap();
+                for (byte, sequence) in [(0x11, 1), (0x22, 2)] {
+                    fs.write(
+                        handle,
+                        0,
+                        &[byte; BLOCK_SIZE],
+                        &mut journal,
+                        &mut disk,
+                        &mut scratch(),
+                    )
+                    .unwrap();
+                    let receipt = fs
+                        .fsync(handle, &mut journal, &mut disk, &mut scratch())
+                        .unwrap();
+                    assert_eq!(receipt.object, key);
+                    assert_eq!(receipt.write_seq, sequence);
+                }
+                fs.write(
+                    handle,
+                    0,
+                    &[0x33; BLOCK_SIZE],
+                    &mut journal,
+                    &mut disk,
+                    &mut scratch(),
+                )
+                .unwrap();
+                let stat = fs.stat_object(key).unwrap();
+                assert_eq!((stat.write_seq, stat.durable_write_seq), (3, 2));
+                key
+            };
+            let acknowledged_lsn = journal.last_commit_lsn();
+            disk.power_cut();
+            let mut successful = disk.clone();
+            let recovery = Journal::new()
+                .mount(&mut successful, &mut scratch())
+                .unwrap();
+            assert!(recovery.committed_transactions > 1);
+            assert!(recovery.replayed_blocks > 1);
+            let operations = successful.operations;
+            for after in [false, true] {
+                for point in 1..=operations.len() {
+                    let mut interrupted = disk.clone();
+                    interrupted.cut = Some(if after {
+                        Cut::After(point)
+                    } else {
+                        Cut::Before(point)
+                    });
+                    let mut first_recovery = Journal::new();
+                    assert_eq!(
+                        first_recovery.mount(&mut interrupted, &mut scratch()),
+                        Err(Error::Io(Fault::Injected)),
+                        "after={after} point={point} operation={:?}",
+                        operations[point - 1]
+                    );
+                    assert!(!first_recovery.is_writable());
+                    assert_eq!(interrupted.operations, operations[..point]);
+                    interrupted.power_cut();
+                    let mut recovered = Journal::new();
+                    recovered.mount(&mut interrupted, &mut scratch()).unwrap();
+                    assert_eq!(recovered.last_commit_lsn(), acknowledged_lsn);
+                    validate_volume(
+                        &mut recovered,
+                        &mut interrupted,
+                        &mut scratch(),
+                        &mut [[0; BLOCK_SIZE]; 4],
+                    )
+                    .unwrap();
+                    let mut fs = FileSystem::<64>::new();
+                    fs.mount(&mut recovered, &mut interrupted, &mut scratch())
+                        .unwrap();
+                    let stat = fs
+                        .stat("/durable", &mut recovered, &mut interrupted, &mut scratch())
+                        .unwrap();
+                    assert_eq!(stat.object, key);
+                    assert_eq!(
+                        (stat.size, stat.write_seq, stat.durable_write_seq),
+                        (4096, 2, 2)
+                    );
+                    let reader = fs
+                        .open(
+                            "/durable",
+                            OpenMode::Read,
+                            &mut recovered,
+                            &mut interrupted,
+                            &mut scratch(),
+                        )
+                        .unwrap();
+                    let mut bytes = [0; BLOCK_SIZE];
+                    assert_eq!(
+                        fs.read(
+                            reader,
+                            0,
+                            &mut bytes,
+                            0,
+                            &mut recovered,
+                            &mut interrupted,
+                            &mut scratch()
+                        )
+                        .unwrap(),
+                        BLOCK_SIZE
+                    );
+                    assert_eq!(bytes, [0x22; BLOCK_SIZE]);
+                    fs.close(reader).unwrap();
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn independent_checker_keeps_real_boot_prefix_when_final_commit_did_not_flush() {
+    use cyxia_prototype::boot::BootSession;
+
+    let (mut disk, mut journal) = mounted();
+    BootSession::new()
+        .allocate(
+            &mut journal,
+            &mut disk,
+            &mut scratch(),
+            &mut [[0; BLOCK_SIZE]; 4],
+        )
+        .unwrap();
+    journal.checkpoint(&mut disk, &mut scratch()).unwrap();
+    disk.operations.clear();
+    // The next BootEpoch updates two home blocks. Its BEGIN and REDOs are
+    // flushed, but the final COMMIT's FLUSH is interrupted before durability.
+    disk.cut = Some(Cut::Before(8));
+    assert!(
+        BootSession::new()
+            .allocate(
+                &mut journal,
+                &mut disk,
+                &mut scratch(),
+                &mut [[0; BLOCK_SIZE]; 4]
+            )
+            .is_err()
+    );
+    assert_eq!(disk.operations[7], Operation::Flush);
+    disk.power_cut();
+
+    let result = independent_image(
+        &disk,
+        "boot-prefix",
+        "import sys; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v13_disk import inspect; r=inspect(Path(sys.argv[1])); print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions'], r['discarded_tail'])",
+    );
+    assert_eq!(result, "1 6 0 True");
+}
+
+#[test]
+fn independent_checker_reads_real_ordinary_fsync_prefix_and_ignores_uncommitted_newer_data() {
+    use cyxia_prototype::{
+        boot::BootSession,
+        domains::filesystem::{FileSystem, OpenMode},
+    };
+    std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+        let (mut disk, mut journal) = mounted();
+        BootSession::new().allocate(&mut journal, &mut disk, &mut scratch(), &mut [[0; BLOCK_SIZE]; 4]).unwrap();
+        let mut files = FileSystem::<64>::new();
+        files.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
+        files.mkdir("/a10", &mut journal, &mut disk, &mut scratch()).unwrap();
+        let object = files.create("/a10/value", &mut journal, &mut disk, &mut scratch()).unwrap();
+        assert_eq!((object.id, object.generation), (5, 2));
+        let handle = files.open("/a10/value", OpenMode::ReadWrite, &mut journal, &mut disk, &mut scratch()).unwrap();
+        for (byte, sequence) in [(0x11, 1), (0x22, 2)] {
+            files.write(handle, 0, &[byte; BLOCK_SIZE], &mut journal, &mut disk, &mut scratch()).unwrap();
+            assert_eq!(files.fsync(handle, &mut journal, &mut disk, &mut scratch()).unwrap().write_seq, sequence);
+        }
+        assert_eq!(journal.last_commit_lsn(), 24);
+        files.write(handle, 0, &[0x33; BLOCK_SIZE], &mut journal, &mut disk, &mut scratch()).unwrap();
+        disk.operations.clear(); disk.cut = Some(Cut::Before(8));
+        assert!(files.fsync(handle, &mut journal, &mut disk, &mut scratch()).is_err());
+        assert_eq!(disk.operations[7], Operation::Flush);
+        disk.power_cut();
+        let result = independent_image(&disk, "ordinary-prefix", "import sys,hashlib; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v13_filesystem import inspect; r=inspect(Path(sys.argv[1])); v=r['files']['/a10/value']; print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions'], r['replayed_blocks'], r['discarded_tail'], v['inode'], v['generation'], v['size'], v['durable_write_seq'], v['sha256']==hashlib.sha256(bytes([0x22])*4096).hexdigest())");
+        assert_eq!(result, "1 24 5 6 True 5 2 4096 2 True");
+    }).unwrap().join().unwrap();
 }
 
 #[test]

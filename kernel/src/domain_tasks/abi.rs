@@ -260,6 +260,13 @@ pub(super) fn syscall_locked(
     match context.regs[8] {
         0 => {}
         1 => {
+            if crate::storage_fault_capture::selected(task.key) {
+                let mut progress = [0; 104];
+                if read(s, task.key, 0x30000, &mut progress).is_err() {
+                    progress.fill(0);
+                }
+                crate::storage_fault_capture::terminal(task.key, args[0], now_ns(), &progress);
+            }
             s.tasks[i].exit_code = args[0];
             s.tasks[i].terminal_seen = true;
             s.tasks[i].life = Life::Exiting;
@@ -575,6 +582,28 @@ pub(super) fn syscall_locked(
                 },
             )?;
             context.regs[1..4].copy_from_slice(&result);
+        }
+        21 => {
+            if args[1..].iter().any(|value| *value != 0) {
+                return Err(Error::Format);
+            }
+            let layout = CpuLayout {
+                business_mask: s.layout.business_mask & !s.draining,
+                ..s.layout
+            };
+            let result = s.scheduler.bind_affinity(task.key, args[0], layout);
+            crate::a02_capture::bind(
+                usize::from(task.cpu),
+                task.key.id,
+                task.key.generation,
+                args[0],
+                match result {
+                    Ok(()) => 0,
+                    Err(Error::Auth) => 1,
+                    Err(_) => 2,
+                },
+            );
+            result?;
         }
         _ => return Err(Error::Unsupported),
     }

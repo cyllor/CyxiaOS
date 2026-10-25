@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/first-level-subsystems-20261024
+      - CyxiaOS-V0.1
   workflow_dispatch:
 
 permissions:
@@ -31,8 +32,12 @@ jobs:
           cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
       - name: Run Rust workspace tests
         run: cargo test --locked --offline --workspace --exclude cyxia-kernel
+      - name: Prepare pinned host test inputs
+        run: python3 -B tools/prepare_host_tests.py --fetch
       - name: Run host Python tests
         run: python3 -B -m unittest discover -s tests/host -p 'test_*.py' -v
+      - name: Run native evidence tool tests
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py' -v
       - name: Capture exact source
         if: always()
         run: |

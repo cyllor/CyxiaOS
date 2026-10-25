@@ -99,8 +99,12 @@ impl<'a> Model<'a> {
         // For at most 64 inputs, |z| <= 64*128*32768 + 64*2147483648
         // = 137707388928. i64 safely holds z, its absolute value, and +32.
         let mut z = i64::from(bias) * 64;
-        for (column, &activation) in input.iter().enumerate() {
-            let weight = self.bytes[weight_offset + column] as i8;
+        // Validate the whole row once, then traverse equally bounded slices.
+        // Per-column indexing otherwise repeats checked offset arithmetic and
+        // bounds tests in the mandatory 32-candidate inference path.
+        let weights = &self.bytes[weight_offset..weight_offset + input.len()];
+        for (&weight, &activation) in weights.iter().zip(input) {
+            let weight = weight as i8;
             z += i64::from(weight) * i64::from(activation);
         }
         let rounded = z.signum() * ((z.abs() + 32) / 64);

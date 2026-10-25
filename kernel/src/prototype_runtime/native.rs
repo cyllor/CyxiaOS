@@ -468,8 +468,10 @@ fn root_return(
 fn next_input(
     controller: u64,
     witness: &crate::domain_control::core_replay::PaidWorkWitness,
-) -> Result<Option<([u64; 512], crate::domain_control::JobSource)>, DomainError> {
-    crate::domain_control::next_paid(controller, witness)
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<Option<crate::domain_control::JobSource>, DomainError> {
+    crate::domain_control::next_paid(controller, witness, started, input)
 }
 #[inline(never)]
 fn run_turn(
@@ -582,8 +584,17 @@ fn run_turn(
         worker.native.cpu_ns = 0;
         REQUEST_START.store(timer::ticks(), Ordering::Relaxed);
         worker.native.phase(3);
-        let (input, source) = match next_input(CONTROLLER_EPOCH.load(Ordering::Acquire), witness) {
-            Ok(Some(input)) => input,
+        // Charge initialization too; no large value-return scratch is retained
+        // while either preparation sibling constructs its candidate set.
+        let preparation_started = ns(timer::ticks());
+        let mut input = [0; 512];
+        let source = match next_input(
+            CONTROLLER_EPOCH.load(Ordering::Acquire),
+            witness,
+            preparation_started,
+            &mut input,
+        ) {
+            Ok(Some(source)) => source,
             _ => {
                 conclude(worker, Completion::Empty);
                 return;
@@ -681,6 +692,12 @@ fn run_turn(
             context,
             phys(root),
             entered.saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
+            crate::a02_capture::Task {
+                id: capture_owner(slot).id,
+                generation: capture_owner(slot).generation,
+                role: 2,
+                affinity: 1 << slot,
+            },
         );
     }
     let end = timer::ticks();
@@ -925,6 +942,17 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
         }
     }
     let s = c.owner.snapshot();
+    crate::a02_capture::publish(
+        s.core_generation,
+        [
+            s.control.bits(),
+            s.business.bits(),
+            s.transition.bits(),
+            s.quarantined.bits(),
+            s.draining.bits(),
+            s.suspect.bits(),
+        ],
+    );
     let task_generation = crate::domain_tasks::resource_generation()?;
     let ledger_generation = s
         .ledger_generation

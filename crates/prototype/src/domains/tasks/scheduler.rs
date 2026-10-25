@@ -792,6 +792,39 @@ impl Scheduler {
         self.stats.quarantine_mask &= !(1u64 << cpu);
         Ok(())
     }
+    /// Ordinary callers may narrow their admitted affinity while retaining the
+    /// current CPU. Moving the context and its reservations remains relocate's
+    /// separate operation; this cannot grant a control or unhealthy CPU.
+    pub fn bind_affinity(
+        &mut self,
+        key: ObjectKey,
+        mask: u64,
+        layout: CpuLayout,
+    ) -> Result<(), Error> {
+        let i = self.thread(key)?;
+        let old = self.threads[i].ok_or(Error::Stale)?.spec;
+        if mask == 0
+            || layout.generation == 0
+            || mask & !(layout.business_mask & layout.healthy_mask & old.allowed_mask) != 0
+        {
+            return Err(Error::Auth);
+        }
+        if mask & (1u64 << old.cpu) == 0 {
+            return Err(Error::Busy);
+        }
+        self.threads[i]
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .spec
+            .allowed_mask = mask;
+        Ok(())
+    }
+    pub fn thread_affinity(&self, key: ObjectKey) -> Result<u64, Error> {
+        Ok(self.threads[self.thread(key)?]
+            .ok_or(Error::Stale)?
+            .spec
+            .allowed_mask)
+    }
     pub fn relocate(
         &mut self,
         key: ObjectKey,

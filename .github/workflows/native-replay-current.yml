@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - fix/first-level-subsystems-20261024
+      - CyxiaOS-V0.1
     paths:
       - '.github/workflows/native-replay-current.yml'
       - 'kernel/**'
@@ -14,6 +15,9 @@ on:
       - 'tools/verify_domains.py'
       - 'tools/verify_m1.py'
       - 'tools/build_unified.py'
+      - 'tools/check_v13_preparation_stack.py'
+      - 'tools/test_check_v13_preparation_stack.py'
+      - 'tests/host/test_preparation_stack_gate.py'
   workflow_dispatch:
 
 permissions:
@@ -34,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: Install pinned native toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
           cargo fetch --locked
@@ -62,7 +66,7 @@ jobs:
             mkdir -p "$RUNNER_TEMP/native-replay-evidence/unified-build"
             if [ -d "$RUNNER_TEMP/unified-build" ]; then
               find "$RUNNER_TEMP/unified-build" -maxdepth 1 -type f \
-                \( -name '*.log' -o -name 'build-manifest.json' \) \
+                \( -name '*.log' -o -name '*-stack.json' -o -name 'build-manifest.json' \) \
                 -exec cp -f {} "$RUNNER_TEMP/native-replay-evidence/unified-build/" \;
             fi
           }
@@ -70,6 +74,14 @@ jobs:
           python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair" 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/provision.log"
           cargo build --locked --offline -p cyxia-prototype --example prototype-disk --example verify-domain-evidence 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/replay-tools-build.log"
           python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/pair/a" --identity-b "$RUNNER_TEMP/pair/b" --output "$RUNNER_TEMP/unified-build" --selftest 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/unified-build.log"
+      - name: Recompute both native preparation stack paths
+        run: |
+          set -euo pipefail
+          for node in a b; do
+            python3 tools/check_v13_preparation_stack.py \
+              "$RUNNER_TEMP/unified-build/node-$node.elf" \
+              > "$RUNNER_TEMP/native-replay-evidence/ci-node-$node-stack.json"
+          done
       - name: Run first protected native replay pair
         run: |
           set -o pipefail

@@ -12,6 +12,8 @@ cyxia-prototype = { path = "../../crates/prototype", features = ["cluster-engine
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"] }
 getrandom = { version = "=0.2.17", default-features = false, features = ["custom"] }
+[dev-dependencies]
+cyxia-kernel-core = { path = "../../crates/kernel-core" }
 [profile.release]
 panic = "abort"
 opt-level = 2

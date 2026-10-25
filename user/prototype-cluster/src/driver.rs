@@ -14,6 +14,8 @@ mod domain;
 mod billing;
 #[path = "driver/replay.rs"]
 mod replay;
+#[path = "driver/custody.rs"]
+mod custody;
 use domain::NativeDomains;
 struct RingCrypto {
     signer: IdentitySigner,
@@ -93,6 +95,7 @@ pub struct Driver {
     kernel_token: Option<u64>,
     kernel_contract: Option<[u8; 16]>,
     kernel_epoch: u64,
+    custody_recovering: bool,
     task_key: Option<TaskKey>,
     deadline: u64,
     sent_results: Vec<TaskKey>,
@@ -181,7 +184,7 @@ impl Driver {
                 .map(|(record, _)| record[40..56].try_into().unwrap())
         });
         let native_mode = native.is_some();
-        Ok(Self {
+        let mut driver = Self {
             engine,
             input: Vec::new(),
             output: if native_mode {
@@ -215,6 +218,7 @@ impl Driver {
             kernel_token: None,
             kernel_contract: None,
             kernel_epoch: 0,
+            custody_recovering: true,
             task_key: None,
             deadline: 0,
             sent_results: Vec::new(),
@@ -230,7 +234,9 @@ impl Driver {
             native_started: Vec::new(),
             billing_incoming: Vec::new(),
             replay: None,
-        })
+        };
+        driver.recover_kernel_custody()?;
+        Ok(driver)
     }
     pub fn connect(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
         self.disconnect();
@@ -910,9 +916,11 @@ impl Driver {
                 reserve.extend_from_slice(&t.id);
                 reserve.extend_from_slice(&t.input_hash);
                 reserve.extend_from_slice(&t.package_hash);
+                reserve.extend_from_slice(&self.custody_key(t.id, hash));
                 broker::entropy(&mut self.reservation).map_err(|_| ())?;
                 let (_, token) =
-                    broker::request(OP_TASK, &reserve, &mut [], 0, [0, 0, 0]).map_err(|_| ())?;
+                    broker::request(OP_TASK, &reserve, &mut [], 0, [TASK_RESERVE_CUSTODY, 0, 0])
+                        .map_err(|_| ())?;
                 self.kernel_token = Some(token);
                 self.kernel_contract = Some(t.id);
                 if self
@@ -1357,6 +1365,7 @@ impl Driver {
         Ok(())
     }
     pub fn offline_tick(&mut self, _now: u64) -> Result<(), ()> {
+        self.recover_kernel_custody()?;
         if self.activated {
             let token = self.kernel_token.ok_or(())?;
             let mut body = [0; 8];

@@ -82,7 +82,7 @@ impl CandidateSet {
             canary: None,
         };
         for candidate in choices {
-            features::encode(candidate.action, candidate.features)?;
+            features::validate(candidate.action, &candidate.features)?;
             if candidate.action.domain() != first.action.domain()
                 || candidate.action.kind() != first.action.kind()
                 || candidate.features.common != first.features.common

@@ -24,6 +24,17 @@ pub const OP_STORE_GET: u64 = 7;
 pub const OP_STORE_PUT: u64 = 8;
 pub const OP_STORE_FLUSH: u64 = 9;
 pub const OP_TASK: u64 = 10;
+/// Extended task custody operations. Phase 0 retains its original 104-byte ABI.
+/// RESERVE: 104-byte terms followed by the 120-byte custody key.
+/// LOOKUP: exact custody key; reply state:u64, admitted:u64; returned arg0 token.
+/// INVENTORY: owner_boot:u64, requester:[u8;32], with 136-byte request capacity;
+/// reply key followed by LOOKUP reply.
+/// Key: owner_boot:u64, cluster:[u8;32], requester:[u8;32], contract:[u8;16], hash:[u8;32].
+/// These read operations require the dedicated service and grant no START authority.
+pub const TASK_RESERVE_CUSTODY: u64 = 31;
+pub const TASK_LOOKUP_CUSTODY: u64 = 32;
+pub const TASK_CUSTODY_INVENTORY: u64 = 33;
+pub const TASK_CUSTODY_KEY_BYTES: usize = 120;
 pub const OP_TRACE: u64 = 11;
 pub const OP_YIELD: u64 = 12;
 /// OP_TRACE arg0 distinguishes a terminal service failure from an ordinary event.

@@ -267,15 +267,24 @@ fn main() {
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");
         println!("cargo:rerun-if-env-changed=CYXIA_DOMAIN_SELFTEST");
+        println!("cargo:rerun-if-env-changed=CYXIA_STORAGE_FAULT_PROBE");
         println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
+        let storage_probe = env::var("CYXIA_STORAGE_FAULT_PROBE").unwrap_or_else(|_| "0".into());
+        assert!(["0", "1"].contains(&storage_probe.as_str()), "CYXIA_STORAGE_FAULT_PROBE must be 0 or 1");
+        assert!(storage_probe != "1" || env::var("CYXIA_DOMAIN_SELFTEST").as_deref() == Ok("1"),
+            "storage fault probe requires ordinary client admission");
+        std::fs::write(out.join("storage-fault-probe.rs"), if storage_probe == "1" { "true" } else { "false" }).unwrap();
         for name in ["prototype-task", "prototype-client"] {
             let source = root.join("user").join(name);
             println!("cargo:rerun-if-changed={}", source.display());
             checked(
                 Command::new(env::var("RUSTC").unwrap())
                     .arg(source.join("main.rs"))
+                    .args(if name == "prototype-client" && storage_probe == "1" {
+                        vec!["--cfg", "storage_fault_probe"]
+                    } else { vec![] })
                     .args([
                         "--edition=2024",
                         "--target",

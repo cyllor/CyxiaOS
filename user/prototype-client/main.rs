@@ -2,6 +2,8 @@
 #![no_main]
 #[path = "../prototype-task/files_abi.rs"]
 mod file;
+#[cfg(storage_fault_probe)]
+mod storage_fault;
 
 #[inline(never)]
 fn call(operation: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> [u64; 4] {
@@ -626,7 +628,15 @@ fn run(authority: file::Capability) -> u64 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 extern "C" fn _start(id: u64, generation: u64) -> ! {
+    #[cfg(storage_fault_probe)]
+    finish(storage_fault::run(file::Capability { id, generation }));
+    #[cfg(not(storage_fault_probe))]
+    {
+    // Ordinary EL0 request through the same protected affinity admission used
+    // by every task. CPU1 initially belongs to C; this must return E_AUTH.
+    if call(21, 2, 0, 0, 0, 0)[0] as i64 != -13 { finish(190); }
     finish(run(file::Capability { id, generation }))
+    }
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {

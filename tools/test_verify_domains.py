@@ -13,6 +13,64 @@ from verify_domains import RECONNECT_OUTAGE_NS, ReconnectProbe, run
 from verify_domains import REPLAY_MAGIC, capture, parse_replay, refresh_snapshot, replay_ready
 
 
+class PreparationRejectionTests(unittest.TestCase):
+    def journal(self, total=1):
+        values = [0x4359505245503133, total, max(0, total - 16), total * 2,
+                  1, 40, 16, 0] + [0] * 640
+        for ordinal in range(max(1, total - 15), total + 1):
+            row = [0] * 40
+            row[:18] = [ordinal + 10, 7, 2, 14, 1, 4, 5, 6, 9, 10,
+                        100, 2_100_000, 0, 6, 3_000_000, 14, 0, 0]
+            row[22:30] = [1] * 8
+            row[30:34] = [row[0], 9, 10, ordinal]
+            base = 8 + ((ordinal - 1) % 16) * 40
+            values[base:base + 40] = row
+        return values
+
+    def parse(self, values):
+        from verify_domains import parse_preparation_rejections
+        return parse_preparation_rejections(encode(values))
+
+    def test_wrapped_journal_keeps_original_cost_identity_and_order(self):
+        parsed = self.parse(self.journal(18))
+        self.assertEqual(parsed['total'], 18)
+        self.assertEqual(parsed['overwritten'], 2)
+        rows = parsed['retained']
+        self.assertEqual([r['ordinal'] for r in rows], list(range(3, 19)))
+        self.assertEqual(rows[0]['sequence'], 13)
+        self.assertEqual(rows[0]['cpu_ns'], 2_100_000)
+        self.assertEqual(rows[0]['snapshot_ns'], 100)
+        self.assertEqual(rows[0]['error'], 'Budget')
+        self.assertEqual(rows[0]['target'], [4, 5])
+        self.assertIsNone(rows[0]['work'])
+
+    def test_empty_and_in_progress_are_not_completed_rejections(self):
+        self.assertIsNone(self.parse([0] * 648))
+        words = self.journal()
+        words[3] |= 1
+        self.assertIsNone(self.parse(words))
+
+    def test_readonly_identity_keeps_zero_slot_and_false_flags(self):
+        words = self.journal()
+        words[8 + 17:8 + 22] = [1, 42, 0, 0, 0]
+        self.assertEqual(self.parse(words)['retained'][0]['work'], [42, 0, 0, 0])
+
+    def test_warm_work_uses_u16_serial_instead_of_request_array_slot(self):
+        words = self.journal()
+        words[8 + 17:8 + 22] = [1, 42, 200, 1, 0]
+        self.assertEqual(self.parse(words)['retained'][0]['work'], [42, 200, 1, 0])
+
+    def test_malformed_retirement_cannot_be_reported_as_evidence(self):
+        for offset, value in [(2, 1), (4, 2), (8 + 13, 10), (8 + 15, 13),
+                              (8 + 30, 999), (8 + 33, 2), (8 + 34, 1),
+                              (8 + 18, 1), (8 + 14, 99)]:
+            with self.subTest(offset=offset, value=value):
+                words = self.journal()
+                words[offset] = value
+                with self.assertRaises(ValueError):
+                    self.parse(words)
+
+
 def encode(values):
     return struct.pack(f"<{len(values)}Q", *values)
 
@@ -25,6 +83,71 @@ def control():
 
 
 class EvidenceParserTests(unittest.TestCase):
+    def test_secondary_fault_retains_original_exception_before_cpu0_panic(self):
+        guest = {}
+        snapshot = self.snapshot()
+        bank = [0x4359534d50464131, 1, 8, 8, 0, 0, 0, 0] + [0] * 64
+        bank[16:24] = [44, 123, 4, 0x96000047, 0xffffffc042cf4000,
+                       0xffffffc040425000, 0x345, 0xffffffc042cf3d50]
+        snapshot['SMP_FAULT_EVIDENCE'] = encode(bank)
+        with self.assertRaisesRegex(ValueError, 'secondary fatal evidence'):
+            refresh_snapshot(guest, snapshot)
+        self.assertEqual(guest.get('smp_fault_evidence'), bank)
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest['smp_fault_evidence'])
+
+    def test_multithread_tcg_rejects_instruction_count_clock_before_launch(self):
+        args = SimpleNamespace(timeout=30, hold=0, sample_ms=250, single=True,
+                               peer_elf=None, replay_pairs=0, reconnect=False,
+                               clock_profile='icount', tcg_threads='multi')
+        with self.assertRaisesRegex(ValueError, 'icount requires single-thread TCG'):
+            run(args)
+
+    def test_preparation_timing_survives_credit_failure_and_clears_when_absent(self):
+        guest = {}
+        snapshot = self.snapshot(overrun=True)
+        timings = [100, 200, 220, 250, 400, 500, 550, 560] + [0] * 8
+        snapshot['DOMAIN_PREPARATION_EVIDENCE'] = encode(timings)
+        with self.assertRaisesRegex(ValueError, 'overrun/quarantine'):
+            refresh_snapshot(guest, snapshot)
+        self.assertEqual(guest.get('preparation_evidence'), timings)
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest['preparation_evidence'])
+
+    def test_preparation_stages_survive_fault_and_reject_truncated_capture(self):
+        guest = {}
+        snapshot = self.snapshot(overrun=True)
+        stages = [100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320] + [0] * 20
+        snapshot['DOMAIN_PREPARATION_DETAIL'] = encode(stages)
+        with self.assertRaisesRegex(ValueError, 'overrun/quarantine'):
+            refresh_snapshot(guest, snapshot)
+        self.assertEqual(guest.get('preparation_detail'), stages)
+        snapshot = self.snapshot()
+        snapshot['DOMAIN_PREPARATION_DETAIL'] = encode(stages[:-1])
+        with self.assertRaises(ValueError):
+            refresh_snapshot(guest, snapshot)
+        self.assertIsNone(guest['preparation_detail'])
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest['preparation_detail'])
+
+    def test_rejected_preparation_keeps_original_cost_after_credit_failure(self):
+        guest = {}
+        snapshot = self.snapshot(overrun=True)
+        journal = PreparationRejectionTests().journal()
+        snapshot['DOMAIN_PREPARATION_REJECTIONS'] = encode(journal)
+        with self.assertRaisesRegex(ValueError, 'overrun/quarantine'):
+            refresh_snapshot(guest, snapshot)
+        self.assertEqual(guest.get('preparation_rejections'), journal)
+        self.assertEqual(guest['rejected_preparations']['retained'][0]['cpu_ns'], 2_100_000)
+        snapshot = self.snapshot()
+        snapshot['DOMAIN_PREPARATION_REJECTIONS'] = encode(journal[:-1])
+        with self.assertRaisesRegex(ValueError, 'incorrect evidence size'):
+            refresh_snapshot(guest, snapshot)
+        self.assertIsNone(guest['preparation_rejections'])
+        self.assertIsNone(guest['rejected_preparations'])
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest['preparation_rejections'])
+
     def snapshot(self, *, returns=100, jobs=1, phase=3, generation=0, overrun=False):
         unified = [0] * 512
         unified[:3] = [UNIFIED_MAGIC, 7, returns]

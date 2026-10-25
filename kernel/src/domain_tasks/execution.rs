@@ -254,6 +254,13 @@ impl Creator<'_> {
             launch.recipe,
             matches!(r.group.id, 15 | 16),
         )?;
+        if client && crate::storage_fault_capture::PROFILE {
+            if launch.len != 32 { return Err(Error::Format); }
+            let role = u64::from_le_bytes(launch.input[16..24].try_into().unwrap());
+            if !crate::storage_fault_capture::register(role as usize, key) {
+                return Err(Error::Conflict);
+            }
+        }
         Ok(())
     }
     fn rollback(&mut self, slot: usize, key: ObjectKey) -> Result<(), Error> {
@@ -1300,9 +1307,19 @@ pub fn dispatch(slot: usize) -> bool {
         if let Some(a) = s.active[slot].as_mut() {
             a.state = RunState::Blocked;
         }
-        Ok(Some((i, frame_phys(i * 3)?, s.tasks[i].deadline)))
+        Ok(Some((
+            i,
+            frame_phys(i * 3)?,
+            s.tasks[i].deadline,
+            crate::a02_capture::Task {
+                id: s.tasks[i].key.id,
+                generation: s.tasks[i].key.generation,
+                role: 1,
+                affinity: s.scheduler.thread_affinity(s.tasks[i].key)?,
+            },
+        )))
     });
-    let Ok(Some((i, root, deadline))) = selected else {
+    let Ok(Some((i, root, deadline, task))) = selected else {
         return true;
     };
     unsafe {
@@ -1315,6 +1332,7 @@ pub fn dispatch(slot: usize) -> bool {
             context,
             root,
             timer::ticks().saturating_add(slice_ticks(slot)).min(end),
+            task,
         );
     }
     RETURN_PENDING[i].store(true, Ordering::Release);
@@ -1941,6 +1959,39 @@ pub fn start_probe_client() -> Result<ObjectKey, Error> {
                 s.probe_key = Some(key);
                 Ok(key)
             }
+            SpawnState::Failed(e) => Err(e),
+            _ => Err(Error::Again),
+        }
+    })
+}
+/// Same ordinary admission, file capability and EL0 package path as the probe.
+/// The dedicated image supplies a bounded, immutable role input only.
+pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
+    if !SELFTEST_ENABLED || !crate::storage_fault_capture::PROFILE || !(1..=2).contains(&role) {
+        return Err(Error::Unsupported);
+    }
+    if cpu::slot() != 0 { return Err(Error::Auth); }
+    locked(|s| {
+        let id = 0xd0a11000 + role;
+        match s.admission.query(KERNEL_CALLER, id) {
+            Ok(SpawnState::Created(key)) => return Ok(key),
+            Ok(SpawnState::Failed(e)) => return Err(e),
+            Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
+            Ok(_) => {}
+            Err(Error::NotFound) => {
+                let deadline = now_ns().checked_add(180_000_000_000).ok_or(Error::Overflow)?;
+                s.facts.attempts = s.facts.attempts.saturating_add(1);
+                s.facts.spawn[3].add(now_ns(), 1);
+                if let SpawnState::Failed(e) = submit_package(
+                    s, CLIENT_PACKAGE, KERNEL_CALLER, id, group(4),
+                    &crate::storage_fault_capture::launch(role), 3, deadline, false, 0,
+                )? { return Err(e); }
+            }
+            Err(e) => return Err(e),
+        }
+        advance_admission(s)?;
+        match s.admission.query(KERNEL_CALLER, id)? {
+            SpawnState::Created(key) => Ok(key),
             SpawnState::Failed(e) => Err(e),
             _ => Err(Error::Again),
         }

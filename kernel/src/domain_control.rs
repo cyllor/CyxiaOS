@@ -12,6 +12,44 @@ use cyxia_prototype::{
     policy_wire::{self, Decision, Envelope, Plan, PlanHeader},
 };
 use sha2::{Digest, Sha256};
+#[repr(C, align(64))]
+struct PreparationEvidence([core::sync::atomic::AtomicU64; 16]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_EVIDENCE: PreparationEvidence =
+    PreparationEvidence([const { core::sync::atomic::AtomicU64::new(0) }; 16]);
+#[repr(C, align(64))]
+struct PreparationDetail([core::sync::atomic::AtomicU64; 32]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
+    PreparationDetail([const { core::sync::atomic::AtomicU64::new(0) }; 32]);
+fn preparation_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let base = (cpu - 1) * 16;
+    if phase == 0 {
+        for word in &DOMAIN_PREPARATION_DETAIL.0[base..base + 16] {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(now(), Ordering::Release);
+}
+fn preparation_phase(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let base = (cpu - 1) * 8;
+    if phase == 0 {
+        for word in &DOMAIN_PREPARATION_EVIDENCE.0[base..base + 8] {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+    DOMAIN_PREPARATION_EVIDENCE.0[base + phase].store(now(), Ordering::Release);
+}
 #[path = "domain_control/core_replay.rs"]
 pub mod core_replay;
 #[path = "domain_control/dependencies.rs"]
@@ -26,6 +64,22 @@ pub mod learning_driver;
 pub mod replay;
 #[path = "domain_control/reply.rs"]
 mod reply;
+#[path = "domain_control/target_batch.rs"]
+pub(crate) mod target_batch;
+pub use target_batch::Source as TargetSource;
+#[path = "domain_control/preparation.rs"]
+mod preparation;
+// Serialized by the same protected control-owner gate as State. This is an
+// explicit negative preparation record, never a proposal or execution receipt.
+static mut PREPARATION_REJECTIONS: preparation::Rejections = preparation::Rejections::new();
+/// Header: magic, count, overwritten, seqlock, version, row words, capacity, 0.
+/// Sixteen 40-word explicit rejected preparations follow; no proposal is implied.
+#[repr(C, align(64))]
+struct PreparationRejections([core::sync::atomic::AtomicU64; 648]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_REJECTIONS: PreparationRejections =
+    PreparationRejections([const { core::sync::atomic::AtomicU64::new(0) }; 648]);
 pub use cyxia_prototype::policy::{BoundDependency, Prerequisite};
 type DependencyResolver = fn(ObjectKey) -> Result<[Option<Prerequisite>; 2], Error>;
 type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
@@ -38,6 +92,7 @@ mod abi;
 pub struct Family {
     pub domain: u16,
     pub kind: u16,
+    pub target_source: TargetSource,
     pub target: fn(u16, u16, usize) -> Option<ObjectKey>,
     pub observe: fn(u16, ObjectKey) -> Result<DomainObservation, Error>,
     pub current: fn(u16, u16, ObjectKey) -> Result<Action, Error>,
@@ -144,6 +199,7 @@ struct State {
     boot: u64,
     sequence: u64,
     job: Option<Job>,
+    preparation: Option<preparation::Pending>,
     due: [u64; 18],
     cursor: [usize; 18],
     family_cursor: usize,
@@ -181,6 +237,7 @@ static mut STATE: State = State {
     boot: 0,
     sequence: 0,
     job: None,
+    preparation: None,
     due: [0; 18],
     cursor: [0; 18],
     family_cursor: 0,
@@ -323,9 +380,13 @@ pub fn register(family: Family) -> Result<(), Error> {
             return Err(Error::NotReady);
         }
         let i = family_index(family.domain, family.kind)?;
+        if TargetSource::for_family(family.domain, family.kind) != Some(family.target_source) {
+            return Err(Error::Conflict);
+        }
         if let Some(old) = s.owner.families[i] {
             return if old.domain == family.domain
                 && old.kind == family.kind
+                && old.target_source == family.target_source
                 && core::ptr::fn_addr_eq(old.target, family.target)
                 && core::ptr::fn_addr_eq(old.observe, family.observe)
                 && core::ptr::fn_addr_eq(old.current, family.current)
@@ -775,82 +836,263 @@ fn validate_selection(
     }
     Ok(())
 }
-fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> u64 {
+fn read_target_batch(
+    source: TargetSource,
+    queries: &[target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    match source {
+        TargetSource::Tasks => crate::domain_tasks::queued_targets(queries, output),
+        TargetSource::Services => crate::domain_services::queued_targets(queries, output),
+        TargetSource::Network => crate::domain_network::queued_targets(queries, output),
+        TargetSource::Storage => crate::domain_storage::queued_targets(queries, output),
+        TargetSource::Platform => crate::domain_platform::queued_targets(queries, output),
+    }
+}
+fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> Result<u64, Error> {
     // The current evaluation has not started yet. Other released slots count
     // only when their registered owner exposes an actual, unblocked object.
     // A released evaluation does not require the object's policy to be read
     // here a second time. Fresh observations, current policy, legality and
     // dependencies are checked when that queued evaluation actually starts.
     // Each mandatory evaluation includes its frozen 2 ms + 0.5 ms bound.
-    let mut jobs = 1u64;
-    for index in 0..18 {
-        if index == active_family || s.due[index] > at {
-            continue;
-        }
-        let Some(f) = s.owner.families[index] else {
-            continue;
-        };
-        let Some(target) = (f.target)(f.domain, f.kind, s.cursor[index])
-            .or_else(|| (f.target)(f.domain, f.kind, 0))
-        else {
-            continue;
-        };
-        if f.domain == 15 && crate::learning_canary::blocks_active() {
-            continue;
-        }
-        if !replay::allows(f.domain, f.kind, target) {
-            continue;
-        }
-        if s.model_gate.as_ref().is_none_or(|gate| {
-            gate.check_active_publication(s.registry.model(), target)
-                .is_err()
-        }) {
-            continue;
-        }
-        if locate_family(&s.owner, f.domain, f.kind, target)
-            .and_then(|i| s.owner.desired[i].as_ref())
-            .is_some_and(execution_blocks_replacement)
-        {
-            continue;
-        }
-        jobs += 1;
-    }
-    jobs * 2_500
+    target_batch::queued_wcet_us(
+        active_family,
+        at,
+        |index| {
+            s.owner.families[index].map(|f| target_batch::Released {
+                source: f.target_source,
+                query: target_batch::Query {
+                    domain: f.domain,
+                    kind: f.kind,
+                    ordinal: s.cursor[index],
+                },
+                due_ns: s.due[index],
+            })
+        },
+        read_target_batch,
+        |index, target| {
+            let f = s.owner.families[index].expect("registered released family");
+            if f.domain == 15 && crate::learning_canary::blocks_active() {
+                return false;
+            }
+            if !replay::allows(f.domain, f.kind, target) {
+                return false;
+            }
+            if s.model_gate.as_ref().is_none_or(|gate| {
+                gate.check_active_publication(s.registry.model(), target)
+                    .is_err()
+            }) {
+                return false;
+            }
+            if locate_family(&s.owner, f.domain, f.kind, target)
+                .and_then(|i| s.owner.desired[i].as_ref())
+                .is_some_and(execution_blocks_replacement)
+            {
+                return false;
+            }
+            true
+        },
+    )
 }
 pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
-    with(|s| next_locked(s, controller_epoch, None))
+    let started = now();
+    let mut input = [0; 512];
+    let ready = with(|s| next_locked(s, controller_epoch, None, started, &mut input))?;
+    Ok(ready.then_some(input))
 }
 pub(crate) fn next_paid(
     controller_epoch: u64,
     witness: &core_replay::PaidWorkWitness,
-) -> Result<Option<([u64; 512], JobSource)>, Error> {
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<Option<JobSource>, Error> {
+    // The sole native caller starts the debit before initializing this private
+    // invocation-owned buffer and consumes its bytes only after Some(source).
     with(|s| {
-        let input = next_locked(s, controller_epoch, Some(witness))?;
-        input
-            .map(|input| Ok((input, job_source(s.job.as_ref().ok_or(Error::Stale)?))))
-            .transpose()
+        if !next_locked(s, controller_epoch, Some(witness), started, input)? {
+            return Ok(None);
+        }
+        Ok(Some(job_source(s.job.as_ref().ok_or(Error::Stale)?)))
     })
 }
 fn next_locked(
     s: &mut State,
     controller_epoch: u64,
     witness: Option<&core_replay::PaidWorkWitness>,
-) -> Result<Option<[u64; 512]>, Error> {
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
+    let result = next_locked_inner(s, controller_epoch, witness, started, input);
+    if let Some(pending) = s.preparation.as_mut() {
+        // Every failed retry retains its actual CPU span. Reward/physical CPU
+        // accounting remains with the original paid Measurement, exactly once.
+        let at = now();
+        let debit = at
+            .checked_sub(started)
+            .ok_or(Error::Range)
+            .and_then(|elapsed| pending.charge(elapsed));
+        let terminal = debit.err().or_else(|| match &result {
+            Err(error) if !matches!(error, Error::Busy | Error::Again | Error::NotReady) => {
+                Some(*error)
+            }
+            _ => None,
+        });
+        if let Some(error) = terminal {
+            retire_preparation(s, error, at)?;
+            return Err(error);
+        }
+        s.due[pending.family] = pending.snapshot.taken_ns;
+        s.cursor[pending.family] = pending.ordinal;
+        s.family_cursor = pending.family;
+    }
+    result
+}
+fn retire_preparation(s: &mut State, reason: Error, at: u64) -> Result<(), Error> {
+    let pending = s.preparation.ok_or(Error::Stale)?;
+    if let Some(work) = pending.identity.work {
+        // A changed WorkId is already outside this attempt's authority; the
+        // rejected old identity is still retained without touching its successor.
+        match core_replay::reject_preparation(work, pending.identity.sequence, reason, at) {
+            Ok(()) | Err(Error::Stale) => (),
+            Err(error) => return Err(error),
+        }
+    } else {
+        replay::reject_preparation(pending.identity, pending.snapshot, reason);
+    }
+    let (retired, total, overwritten) = unsafe {
+        let journal = &mut *core::ptr::addr_of_mut!(PREPARATION_REJECTIONS);
+        (
+            journal.retire(pending, reason, at, s.sequence)?,
+            journal.total,
+            journal.overwritten,
+        )
+    };
+    let bank = &DOMAIN_PREPARATION_REJECTIONS.0;
+    bank[3].fetch_add(1, Ordering::AcqRel);
+    let row = preparation::Rejected {
+        pending,
+        reason,
+        retired_ns: at,
+    }
+    .words(total);
+    let base = 8 + ((total - 1) as usize % 16) * 40;
+    for (destination, value) in bank[base..base + 40].iter().zip(row) {
+        destination.store(value, Ordering::Relaxed);
+    }
+    for (index, value) in [0x4359_5052_4550_3133, total, overwritten]
+        .into_iter()
+        .enumerate()
+    {
+        bank[index].store(value, Ordering::Relaxed);
+    }
+    for (index, value) in [1, 40, 16, 0].into_iter().enumerate() {
+        bank[4 + index].store(value, Ordering::Relaxed);
+    }
+    bank[3].fetch_add(1, Ordering::Release);
+    s.sequence = s.sequence.max(retired.sequence);
+    s.due[retired.family] = retired.due_ns;
+    s.cursor[retired.family] = retired.ordinal;
+    s.family_cursor = retired.next_family;
+    s.preparation = None;
+    Ok(())
+}
+fn preparation_identity(
+    s: &State,
+    controller: u64,
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+    sequence: u64,
+    work: Option<core_replay::WorkId>,
+) -> preparation::Identity {
+    preparation::Identity {
+        boot: s.boot,
+        controller,
+        sequence,
+        domain,
+        kind,
+        target,
+        model: s.registry.model(),
+        core_generation: s.owner.context.core_generation,
+        ledger_generation: s.owner.context.ledger_generation,
+        work: work.map(core_replay::WorkId::identity),
+    }
+}
+fn preparation_snapshot(
+    s: &mut State,
+    identity: preparation::Identity,
+    fresh: Snapshot,
+) -> Result<Snapshot, Error> {
+    let Some(pending) = s.preparation else {
+        return Ok(fresh);
+    };
+    if pending.identity != identity {
+        // An actual owner/model/context change abandons the old attempt. Its
+        // paid CPU is retained globally; no old debit authorizes the new key.
+        return Err(Error::Stale);
+    }
+    pending.check(identity, now())?;
+    Ok(pending.snapshot)
+}
+fn next_locked_inner(
+    s: &mut State,
+    controller_epoch: u64,
+    witness: Option<&core_replay::PaidWorkWitness>,
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
+    preparation_phase(0);
+    preparation_detail(0);
     require_control(&s.owner)?;
     if s.boot == 0
         || s.job.is_some()
         || s.registry.optimization_stopped()
         || s.governance_jobs.reserves_publication(now())
     {
-        return Ok(None);
+        return Ok(false);
     }
-    let started = now();
     if s.registry.publisher() != publisher(controller_epoch) {
         s.registry
             .change_publisher(s.registry.publisher(), publisher(controller_epoch))?;
     }
+    if s.preparation
+        .is_some_and(|p| p.identity.sequence != s.sequence)
+    {
+        return Err(Error::Stale);
+    }
+    if s.preparation.is_some_and(|p| p.identity.work.is_some()) {
+        return core_replay::next(
+            s,
+            controller_epoch,
+            witness.ok_or(Error::Auth)?,
+            started,
+            input,
+        );
+    }
+    match next_normal(s, controller_epoch, witness, started, input) {
+        Ok(false) => (),
+        result => return result,
+    }
+    if let Some(witness) = witness {
+        return core_replay::next(s, controller_epoch, witness, started, input);
+    }
+    Ok(false)
+}
+// Normal and read-only preparation each own sizeable bounded candidate scratch.
+// Keep them in sibling calls: retaining the normal frame while entering replay
+// exceeds the fixed control stack even before an exception adds its frame.
+#[inline(never)]
+fn next_normal(
+    s: &mut State,
+    controller_epoch: u64,
+    witness: Option<&core_replay::PaidWorkWitness>,
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
     let start_cursor = s.family_cursor;
-    'families: for turn in 0..18 {
+    let turns = if s.preparation.is_some() { 1 } else { 18 };
+    'families: for turn in 0..turns {
         let index = (start_cursor + turn) % 18;
         if started < s.due[index] {
             continue;
@@ -865,28 +1107,60 @@ fn next_locked(
         });
         s.family_cursor = (index + 1) % 18;
         let ordinal = s.cursor[index];
-        let target =
-            (f.target)(f.domain, f.kind, ordinal).or_else(|| (f.target)(f.domain, f.kind, 0));
+        let target = if s.preparation.is_some() {
+            // The legacy scalar callback conflates unavailable evidence and
+            // object absence. A retry must never drop its debit on contention.
+            let mut output = [None];
+            read_target_batch(
+                f.target_source,
+                &[target_batch::Query {
+                    domain: f.domain,
+                    kind: f.kind,
+                    ordinal,
+                }],
+                &mut output,
+            )?;
+            output[0]
+        } else {
+            (f.target)(f.domain, f.kind, ordinal).or_else(|| (f.target)(f.domain, f.kind, 0))
+        };
         s.cursor[index] = if (f.target)(f.domain, f.kind, ordinal + 1).is_some() {
             ordinal + 1
         } else {
             0
         };
         let Some(target) = target else {
+            if s.preparation.is_some() {
+                return Err(Error::Stale);
+            }
             continue;
         };
+        preparation_detail(1);
         if f.domain == 15 && crate::learning_canary::blocks_active() {
             continue;
         }
         if !replay::allows(f.domain, f.kind, target) {
             continue;
         }
-        let replay_snapshot = Snapshot {
-            sequence: s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+        let fresh_snapshot = Snapshot {
+            sequence: match s.preparation {
+                Some(pending) => pending.identity.sequence,
+                None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+            },
             taken_ns: started,
             ledger_generation: s.owner.context.ledger_generation,
             core_generation: s.owner.context.core_generation,
         };
+        let preparation_identity = preparation_identity(
+            s,
+            controller_epoch,
+            f.domain,
+            f.kind,
+            target,
+            fresh_snapshot.sequence,
+            None,
+        );
+        let replay_snapshot = preparation_snapshot(s, preparation_identity, fresh_snapshot)?;
         let (replay_snapshot, _replay_prefix) =
             match replay::first(replay_snapshot, f.domain, f.kind, target) {
                 Ok(v) => v,
@@ -914,6 +1188,7 @@ fn next_locked(
         } else {
             None
         };
+        preparation_detail(2);
         // An exclusive Canary or restoration reservation suppresses new
         // Active proposals before encoding and inference spend their CPU.
         if s.model_gate.as_ref().is_none_or(|gate| {
@@ -929,11 +1204,13 @@ fn next_locked(
             }
             Err(e) => return Err(e),
         };
+        preparation_detail(3);
         let observed = match (f.observe)(f.domain, target) {
             Ok(v) => v,
             Err(Error::Busy | Error::Again | Error::NotReady) => continue,
             Err(e) => return Err(e),
         };
+        preparation_detail(4);
         let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
         if old.is_some_and(execution_blocks_replacement) {
             continue;
@@ -949,6 +1226,7 @@ fn next_locked(
             }
             Err(e) => return Err(e),
         };
+        preparation_detail(5);
         let (options, n) = tiers(current);
         let mut legal = [None; 32];
         let mut legal_count = 0;
@@ -965,6 +1243,7 @@ fn next_locked(
             }
         }
         legal[..legal_count].sort_unstable_by_key(|a| a.map(Action::order));
+        preparation_detail(6);
         if current != Action::OfferCpu(0)
             && !legal[..legal_count].iter().any(|a| *a == Some(current))
         {
@@ -976,7 +1255,29 @@ fn next_locked(
             WINDOW_NS
         };
         let held = started.saturating_sub(stability.last_change_ns()) >= hold;
-        let queued_wcet_us = queued_control_wcet_us(s, index, started);
+        let queued_wcet_us = match queued_control_wcet_us(s, index, started) {
+            Ok(value) => value,
+            Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
+                // Retry this same evaluation. replay::first retains its exact
+                // snapshot/deadline; the paid measurement still owns this span.
+                s.due[index] = started;
+                s.cursor[index] = ordinal;
+                s.family_cursor = index;
+                if s.preparation.is_none() {
+                    preparation::next_sequence(s.sequence, preparation_identity)?;
+                    s.sequence = preparation_identity.sequence;
+                    s.preparation = Some(preparation::Pending::new(
+                        preparation_identity,
+                        replay_snapshot,
+                        index,
+                        ordinal,
+                    ));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        preparation_detail(7);
         let mut choices = [Candidate {
             action: current,
             features: RawFeatures::default(),
@@ -1034,7 +1335,11 @@ fn next_locked(
         if count == 0 {
             continue;
         }
-        let sequence = s.sequence.checked_add(1).ok_or(Error::Overflow)?;
+        preparation_detail(8);
+        let sequence = match s.preparation {
+            Some(pending) => pending.identity.sequence,
+            None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+        };
         let snapshot = replay_snapshot;
         if snapshot.sequence != sequence
             || snapshot.ledger_generation != s.owner.context.ledger_generation
@@ -1049,7 +1354,9 @@ fn next_locked(
             &choices[..count],
             Some(current),
         )?;
+        preparation_detail(9);
         let work = core_replay::primary(&set)?;
+        preparation_detail(10);
         return encode_job(
             s,
             controller_epoch,
@@ -1060,13 +1367,14 @@ fn next_locked(
             dependencies,
             work,
             false,
+            input,
         )
-        .map(Some);
+        .map(|()| true);
     }
-    if let Some(witness) = witness {
-        return core_replay::next(s, controller_epoch, witness);
+    if s.preparation.is_some() {
+        return Err(Error::NotReady);
     }
-    Ok(None)
+    Ok(false)
 }
 fn encode_job(
     s: &mut State,
@@ -1078,9 +1386,27 @@ fn encode_job(
     dependencies: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
     read_only: bool,
-) -> Result<[u64; 512], Error> {
+    input: &mut [u64; 512],
+) -> Result<(), Error> {
+    preparation_phase(1);
     let sequence = snapshot.sequence;
     let target = set.target;
+    let preparation_identity = preparation_identity(
+        s,
+        controller_epoch,
+        current.domain(),
+        current.kind(),
+        target,
+        sequence,
+        if read_only { work } else { None },
+    );
+    if let Some(pending) = s.preparation {
+        pending.total(
+            preparation_identity,
+            now(),
+            now().checked_sub(started).ok_or(Error::Range)?,
+        )?;
+    }
     let evidence = if read_only {
         None
     } else {
@@ -1094,7 +1420,8 @@ fn encode_job(
     if !read_only {
         s.registry.register(publisher(controller_epoch), &set)?;
     }
-    let mut input = [0u64; 512];
+    preparation_phase(2);
+    input.fill(0);
     input[..16].copy_from_slice(&[
         abi::INPUT_MAGIC,
         3,
@@ -1171,17 +1498,36 @@ fn encode_job(
         }
     }
     const _: () = assert!(cfg!(target_endian = "little"));
-    let input_bytes = unsafe { &*((&input as *const [u64; 512]).cast::<[u8; 4096]>()) };
+    preparation_phase(3);
+    let input_bytes = unsafe { &*((input as *const [u64; 512]).cast::<[u8; 4096]>()) };
     let input_hash = cyxia_arch_aarch64::sha256::digest_page(input_bytes)
         .unwrap_or_else(|| Sha256::digest(input_bytes).into());
+    preparation_phase(4);
+    if let Some(pending) = s.preparation {
+        pending.total(
+            preparation_identity,
+            now(),
+            now().checked_sub(started).ok_or(Error::Range)?,
+        )?;
+    }
     if let Some(work) = work {
         core_replay::bind(work, sequence, cyxia_arch_aarch64::cpu::slot(), input_hash)?;
     }
     if let Some(evidence) = evidence {
-        crate::domain_evidence::begin(evidence, &input, input_hash);
+        crate::domain_evidence::begin(evidence, input, input_hash);
+        preparation_phase(5);
         let _ = crate::learning_history::record_proposal(sequence, &set, input_bytes, input_hash);
     }
-    s.sequence = sequence;
+    preparation_phase(6);
+    let elapsed = now().checked_sub(started).ok_or(Error::Range)?;
+    let encode_ns = if let Some(pending) = s.preparation {
+        // The admission check above precedes WorkId binding. Any final owner
+        // bookkeeping is still included in the eventual accept-time bound.
+        pending.carried(preparation_identity, elapsed)?
+    } else {
+        elapsed
+    };
+    s.sequence = s.sequence.max(sequence);
     s.job = Some(Job {
         cpu: cyxia_arch_aarch64::cpu::slot(),
         set,
@@ -1189,14 +1535,16 @@ fn encode_job(
         controller: controller_epoch,
         base_version: s.registry.version(),
         started: snapshot.taken_ns,
-        encode_ns: now().saturating_sub(started),
+        encode_ns,
         evidence,
         dependencies,
         work,
         read_only,
         completion: None,
     });
-    Ok(input)
+    s.preparation = None;
+    preparation_phase(7);
+    Ok(())
 }
 
 struct NativeClock;

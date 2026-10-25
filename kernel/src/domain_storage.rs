@@ -549,6 +549,27 @@ fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     }
     enumerate_target(domain, ordinal)
 }
+pub(crate) fn queued_targets(
+    queries: &[crate::domain_control::target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    ready_read()?;
+    let filesystem = ObjectKey {
+        id: FS_ID.load(Ordering::Acquire),
+        generation: FS_GENERATION.load(Ordering::Acquire),
+    };
+    // Identity is fixed for this boot. Read its atomic publication once, and
+    // capture each notifier identity once; do not borrow the live I/O owner.
+    let devices = [device_target(0), device_target(1), device_target(2)];
+    crate::domain_control::target_batch::resolve(queries, output, |q| {
+        match (q.domain, q.kind, q.ordinal) {
+            (4, 1, 0) => Some(filesystem),
+            (9, 1, 0) => devices[0],
+            (11, 1, ordinal) => devices.iter().flatten().nth(ordinal).copied(),
+            _ => None,
+        }
+    })
+}
 fn target_slot(domain: u16, key: ObjectKey) -> Result<usize, Error> {
     if domain == 11 {
         return (0..3)
@@ -836,6 +857,7 @@ pub fn register_control() -> Result<(), Error> {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
             kind: 1,
+            target_source: crate::domain_control::TargetSource::Storage,
             target,
             observe: |domain, target| {
                 observation(domain, target)

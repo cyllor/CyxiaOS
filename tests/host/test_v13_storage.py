@@ -32,4 +32,16 @@ class StorageEvidence(unittest.TestCase):
         with self.assertRaises(ValueError): storage.validate(serial,page[:-1],4,1,identity)
         with self.assertRaises(ValueError): storage.validate(serial,page,1,1,identity)
 
+    def test_interrupted_recovery_must_match_independent_preboot_disk(self):
+        self.assertTrue(callable(getattr(storage, 'validate_recovery', None)), 'missing interrupted-recovery validator')
+        serial,page,identity=self.fixture(2)
+        page=bytearray(page); struct.pack_into('<Q',page,7*8,1)
+        before=dict(uuid=identity.hex(),boot_epoch=1,generation=2,log_epoch=2,
+                    committed_transactions=1,replayed_blocks=4,discarded_tail=True,last_commit_lsn=6)
+        self.assertEqual(storage.validate_recovery(serial,page,4,before)['epoch'],2)
+        for index in (2,3,5,6,7,8,9,10,13,15):
+            changed=bytearray(page);struct.pack_into('<Q',changed,index*8,99)
+            with self.subTest(index=index),self.assertRaises(ValueError):
+                storage.validate_recovery(serial,changed,4,before)
+
 if __name__=='__main__': unittest.main()

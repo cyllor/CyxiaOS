@@ -53,6 +53,16 @@ pub(crate) struct WorkId {
     warm: bool,
     primary: bool,
 }
+impl WorkId {
+    pub(super) fn identity(self) -> [u64; 4] {
+        [
+            self.serial,
+            u64::from(self.slot),
+            u64::from(self.warm),
+            u64::from(self.primary),
+        ]
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Queued,
@@ -549,6 +559,34 @@ pub(super) fn bind(
         Ok(())
     })
 }
+pub(super) fn reject_preparation(
+    identity: [u64; 4],
+    sequence: u64,
+    error: Error,
+    at: u64,
+) -> Result<(), Error> {
+    let id = WorkId {
+        serial: identity[0],
+        slot: u16::try_from(identity[1]).map_err(|_| Error::Range)?,
+        warm: identity[2] != 0,
+        primary: identity[3] != 0,
+    };
+    queue(|q| {
+        let row = row_mut(q, id)?;
+        if row.phase == Phase::Done {
+            return Err(Error::Stale);
+        }
+        if row.phase != Phase::Queued {
+            return Err(Error::Busy);
+        }
+        row.sequence = sequence;
+        row.cpu = cyxia_arch_aarch64::cpu::slot() as u16;
+        row.root_ns = at;
+        row.result = Some(Err(error));
+        row.phase = Phase::Done;
+        Ok(())
+    })
+}
 pub(super) fn evaluated(
     id: WorkId,
     sequence: u64,
@@ -662,13 +700,20 @@ impl Drop for Measurement {
     }
 }
 
+// Keep read-only scratch out of the dispatcher that also invokes next_normal.
+#[inline(never)]
 pub(super) fn next(
     s: &mut State,
     controller: u64,
     witness: &PaidWorkWitness,
-) -> Result<Option<[u64; 512]>, Error> {
+    started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
     let Some(id) = selected()? else {
-        return Ok(None);
+        if s.preparation.is_some() {
+            return Err(Error::Stale);
+        }
+        return Ok(false);
     };
     let source = JobSource {
         owner: CORE_OWNER,
@@ -676,12 +721,30 @@ pub(super) fn next(
         work: Some(id),
     };
     let _measurement = Measurement::new(source, witness)?;
-    let started = now();
     let f = s.owner.families[1].ok_or(Error::NotReady)?;
     let (target, model) = queue(|q| Ok((q.image.ok_or(Error::NotReady)?.target, q.model)))?;
     if s.registry.model() != model {
         return Err(Error::Stale);
     }
+    let fresh_snapshot = Snapshot {
+        sequence: match s.preparation {
+            Some(pending) => pending.identity.sequence,
+            None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+        },
+        taken_ns: started,
+        ledger_generation: s.owner.context.ledger_generation,
+        core_generation: s.owner.context.core_generation,
+    };
+    let identity = preparation_identity(
+        s,
+        controller,
+        1,
+        2,
+        target,
+        fresh_snapshot.sequence,
+        Some(id),
+    );
+    let snapshot = preparation_snapshot(s, identity, fresh_snapshot)?;
     let current = (f.current)(1, 2, target)?;
     let observed = (f.observe)(1, target)?;
     let (options, count) = tiers(current);
@@ -690,11 +753,27 @@ pub(super) fn next(
         features: RawFeatures::default(),
     }; 32];
     let mut n = 0;
-    let queued = queued_control_wcet_us(s, 1, started);
+    let queued = match queued_control_wcet_us(s, 1, started) {
+        Ok(value) => value,
+        Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
+            if s.preparation.is_none() {
+                preparation::next_sequence(s.sequence, identity)?;
+                s.sequence = identity.sequence;
+                s.preparation = Some(preparation::Pending::new(
+                    identity,
+                    snapshot,
+                    1,
+                    s.cursor[1],
+                ));
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     for action in options[..count].iter().flatten().copied() {
         match (f.legal)(action, target, started) {
             Ok(()) => {}
-            Err(Error::Busy | Error::Again | Error::NotReady) => return Ok(None),
+            Err(Error::Busy | Error::Again | Error::NotReady) => return Ok(false),
             Err(_) => continue,
         }
         let Action::ControlSet(mask) = action else {
@@ -722,14 +801,8 @@ pub(super) fn next(
         n += 1;
     }
     if n == 0 {
-        return Ok(None);
+        return Ok(false);
     }
-    let snapshot = Snapshot {
-        sequence: s.sequence.checked_add(1).ok_or(Error::Overflow)?,
-        taken_ns: started,
-        ledger_generation: s.owner.context.ledger_generation,
-        core_generation: s.owner.context.core_generation,
-    };
     let set = CandidateSet::new(snapshot, target, model, &choices[..n], Some(current))?;
     encode_job(
         s,
@@ -741,7 +814,8 @@ pub(super) fn next(
         [None; 2],
         Some(id),
         true,
+        input,
     )
-    .map(Some)
+    .map(|()| true)
 }
 const _: () = assert!(core::mem::size_of::<Queue>() <= META_PAGES * 4096);

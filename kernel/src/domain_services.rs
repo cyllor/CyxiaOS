@@ -702,20 +702,46 @@ pub fn service(now: u64, progress: &mut dyn FnMut()) -> Result<(), Error> {
     }
 }
 
+#[path = "domain_services/target_projection.rs"]
+mod target_projection;
 fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     if !READY.load(Ordering::Acquire) {
         return None;
     }
-    read(|s| {
-        Ok(match (domain, kind) {
-            (1, 2) if ordinal == 0 && s.cores.core_generation != 0 => Some(core_view_key(s)),
-            (14, 1) => s.services.get(ordinal).and_then(|e| e.map(|v| v.key)),
-            (15, 1) if ordinal == 0 => Some(s.console_key),
-            _ => None,
+    target_projection::target(
+        &READ_VIEW,
+        target_projection::Query {
+            domain,
+            kind,
+            ordinal,
+        },
+        now_ns,
+        project_targets,
+    )
+}
+fn project_targets(s: &ReadView) -> target_projection::Targets {
+    target_projection::Targets {
+        published_ns: s.at,
+        core: (s.cores.core_generation != 0).then(|| core_view_key(s)),
+        services: core::array::from_fn(|i| s.services[i].as_ref().map(|service| service.key)),
+        console: s.console_key,
+    }
+}
+pub(crate) fn queued_targets(
+    queries: &[crate::domain_control::target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(Error::NotReady);
+    }
+    let targets = target_projection::targets(&READ_VIEW, now_ns, project_targets)?;
+    crate::domain_control::target_batch::resolve(queries, output, |q| {
+        targets.get(target_projection::Query {
+            domain: q.domain,
+            kind: q.kind,
+            ordinal: q.ordinal,
         })
     })
-    .ok()
-    .flatten()
 }
 fn core_view_key(s: &ReadView) -> ObjectKey {
     ObjectKey {
@@ -1095,6 +1121,7 @@ pub fn register_control() -> Result<(), Error> {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
             kind,
+            target_source: crate::domain_control::TargetSource::Services,
             target,
             observe: |domain, target| {
                 observation(domain, target)

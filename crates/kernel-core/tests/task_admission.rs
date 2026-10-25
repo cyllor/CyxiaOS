@@ -1,4 +1,67 @@
+use cyxia_kernel_core::control_plane::task_admission::CustodyKey;
 use cyxia_kernel_core::control_plane::task_admission::{Authority, StartRequest, Terms};
+
+fn custody_key() -> CustodyKey {
+    CustodyKey {
+        owner_boot: 1,
+        cluster: [4; 32],
+        requester: [5; 32],
+        contract: [1; 16],
+        request_hash: [6; 32],
+    }
+}
+
+#[test]
+fn custody_lookup_survives_service_disconnect_without_restoring_start_authority() {
+    let mut a = Authority::new();
+    a.session(7, 1, 0).unwrap();
+    a.session(7, 2, 0).unwrap();
+    let key = custody_key();
+    let token = a.reserve_with_custody(terms(), [3; 32], key, 0).unwrap();
+    a.grant(token, [1; 16], 1, 50, 0).unwrap();
+    assert!(!a.custody(key).unwrap().started);
+    a.start(start(token, 50, 7, [2; 32]), 1).unwrap();
+    a.disconnect();
+    assert_eq!(a.custody(key).unwrap().token, token);
+    assert!(a.custody(key).unwrap().started);
+    assert!(a.start(start(token, 50, 7, [2; 32]), 2).is_err());
+    for field in 0..5 {
+        let mut wrong = key;
+        match field {
+            0 => wrong.owner_boot += 1,
+            1 => wrong.cluster[0] ^= 1,
+            2 => wrong.requester[0] ^= 1,
+            3 => wrong.contract[0] ^= 1,
+            _ => wrong.request_hash[0] ^= 1,
+        }
+        assert!(a.custody(wrong).is_err());
+    }
+    assert!(a.inventory(2, key.requester).is_err());
+    assert!(a.inventory(1, [7; 32]).is_err());
+    assert_eq!(a.inventory(1, key.requester).unwrap().key, key);
+    a.release(token).unwrap();
+    assert!(a.custody(key).is_err());
+}
+
+#[test]
+fn custody_query_of_unstarted_work_cannot_refresh_expired_session_or_rebind_contract() {
+    let mut a = Authority::new();
+    a.session(7, 1, 0).unwrap();
+    a.session(7, 2, 0).unwrap();
+    let mut wrong = custody_key();
+    wrong.contract = [9; 16];
+    assert!(a.reserve_with_custody(terms(), [3; 32], wrong, 0).is_err());
+    let token = a
+        .reserve_with_custody(terms(), [3; 32], custody_key(), 0)
+        .unwrap();
+    a.grant(token, [1; 16], 1, 50, 0).unwrap();
+    a.disconnect();
+    assert!(!a.custody(custody_key()).unwrap().started);
+    assert!(a.start(start(token, 50, 7, [2; 32]), 1).is_err());
+    a.session(8, 1, 1).unwrap();
+    a.session(8, 2, 1).unwrap();
+    assert!(a.start(start(token, 50, 8, [2; 32]), 2).is_err());
+}
 fn terms() -> Terms {
     Terms {
         cpu_milli: 100,

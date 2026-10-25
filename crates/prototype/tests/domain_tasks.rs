@@ -27,6 +27,39 @@ fn spec(id: u64, group: u64, cpu: u16, minimum_ns: u64, budget_ns: u64) -> Threa
 }
 
 #[test]
+fn ordinary_affinity_cannot_gain_control_or_an_unadmitted_cpu() {
+    let mut scheduler = Scheduler::new();
+    scheduler.register_group(key(1)).unwrap();
+    let current = CpuLayout {
+        business_mask: 13,
+        healthy_mask: 15,
+        generation: 1,
+    };
+    scheduler
+        .admit(spec(10, 1, 3, 0, 10_000_000), current, 0)
+        .unwrap();
+    assert_eq!(
+        scheduler.bind_affinity(key(10), 2, current),
+        Err(Error::Auth)
+    );
+    assert_eq!(
+        scheduler.bind_affinity(key(10), 9, current),
+        Err(Error::Auth)
+    );
+    assert_eq!(scheduler.thread_affinity(key(10)), Ok(8));
+    assert_eq!(scheduler.bind_affinity(key(10), 8, current), Ok(()));
+    let excluded = CpuLayout {
+        healthy_mask: 7,
+        ..current
+    };
+    assert_eq!(
+        scheduler.bind_affinity(key(10), 8, excluded),
+        Err(Error::Auth)
+    );
+    assert_eq!(scheduler.thread_affinity(key(10)), Ok(8));
+}
+
+#[test]
 fn delegated_syscall_uses_caller_budget_and_broker_physical_cpu_once() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();

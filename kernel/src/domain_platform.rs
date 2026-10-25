@@ -736,6 +736,34 @@ fn control_target(domain: u16, _: u16, ordinal: usize) -> Option<ObjectKey> {
         .nth(ordinal)
         .and_then(|i| registered_irq(i).map(|v| v.0))
 }
+pub(crate) fn queued_targets(
+    queries: &[crate::domain_control::target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(Error::NotReady);
+    }
+    let timers = if queries.iter().any(|q| q.domain == 7) {
+        inspect_view(|view| Ok(view.soft_timers != 0))?
+    } else {
+        false
+    };
+    let mut irqs = [None; IRQ_SLOTS];
+    let count = COUNT.load(Ordering::Acquire).min(IRQ_SLOTS);
+    for (index, key) in irqs.iter_mut().enumerate().take(count) {
+        if LIVE[index].load(Ordering::Acquire) {
+            *key = Some(ObjectKey {
+                id: IDS[index].load(Ordering::Relaxed),
+                generation: 1,
+            });
+        }
+    }
+    crate::domain_control::target_batch::resolve(queries, output, |q| match (q.domain, q.kind) {
+        (6, 1) => irqs.iter().flatten().nth(q.ordinal).copied(),
+        (7, 1) if q.ordinal == 0 && timers => Some(TIMER_SERVICE),
+        _ => None,
+    })
+}
 fn control_observe(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
     if domain == 7 {
         if key != TIMER_SERVICE {
@@ -885,6 +913,7 @@ pub fn register_control() -> Result<(), Error> {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
             kind: 1,
+            target_source: crate::domain_control::TargetSource::Platform,
             target: control_target,
             observe: |domain, target| {
                 control_observe(domain, target)

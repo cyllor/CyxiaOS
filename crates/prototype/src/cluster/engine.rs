@@ -805,6 +805,44 @@ impl<C: Crypto> Engine<C> {
         r.result_hash = result_digest(&self.crypto, state, body);
         self.stage(5, &encode_result(&r))
     }
+    /// Restore result custody only after the protected driver has obtained exact
+    /// kernel proof of START admission. This never grants a session or returns
+    /// an Execution; enqueue remains forbidden for this already admitted task.
+    pub fn reconcile_started(
+        &mut self,
+        key: TaskKey,
+        owner_boot: u64,
+        request_hash: [u8; 32],
+    ) -> Result<(), Error> {
+        self.available()?;
+        if owner_boot != self.boot
+            || key.cluster != self.cluster()
+            || !self
+                .results
+                .iter()
+                .any(|r| r.key == key && !r.received && r.state == TaskState::Started)
+        {
+            return Err(Error::Conflict);
+        }
+        let c = self
+            .contracts
+            .iter_mut()
+            .find(|c| c.terms.id == key.contract)
+            .ok_or(Error::NotFound)?;
+        if c.remote
+            || c.owner_boot != owner_boot
+            || c.request_hash != request_hash
+            || c.task != Some(key)
+            || c.state != ContractState::Granted
+        {
+            return Err(Error::Conflict);
+        }
+        c.enqueued = true;
+        Ok(())
+    }
+    pub fn closed_contract(&self, contract: [u8; 16], request_hash: [u8; 32]) -> bool {
+        self.contract_tombstones.contains(&(contract, request_hash))
+    }
     pub fn receive_result(
         &mut self,
         key: TaskKey,

@@ -275,6 +275,7 @@ fn network_turn(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState,
         .unwrap_or_else(|| tcp.as_ref().map_or(Ok(TcpState::Closed), Tcp::state))
 }
 fn network_turn_owned(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
+    UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
     let state = match tcp.as_mut() {
         Some(link) => link.poll(Board.now_ms()),
         None => Ok(TcpState::Closed),
@@ -370,6 +371,8 @@ pub fn run(info: &BootInfo) -> ! {
     startup(1, || crate::domain_platform::init(info));
     UNIFIED_EVIDENCE.words[24].store(2, Ordering::Release);
     let boot = crate::prototype_storage::boot(info);
+    crate::storage_fault_capture::init(boot);
+    crate::a02_capture::init_boot(boot.epoch);
     crate::entropy::init(info);
     startup(3, crate::domain_tasks::init);
     startup(4, crate::domain_storage::init);
@@ -383,7 +386,7 @@ pub fn run(info: &BootInfo) -> ! {
         crate::domain_tasks::set_cache_loader(crate::domain_storage::read_cache_page)
     });
     crate::unified_store::init();
-    crate::unified_task::init();
+    crate::unified_task::init(boot.epoch, *PEER);
     startup(7, || crate::domain_control::init(boot.epoch));
     startup(8, crate::domain_services::init);
     let mut net = attach(info);
@@ -411,7 +414,12 @@ pub fn run(info: &BootInfo) -> ! {
         p.local_node = *LOCAL;
         p.peer_node = *PEER;
     }
-    if SELFTEST {
+    if crate::storage_fault_capture::PROFILE {
+        if crate::storage_fault_capture::mode() != 3 {
+            startup(15, || crate::domain_tasks::start_storage_client(1));
+        }
+        startup(15, || crate::domain_tasks::start_storage_client(2));
+    } else if SELFTEST {
         let key = startup(15, crate::domain_tasks::start_probe_client);
         UNIFIED_EVIDENCE.words[16].store(1, Ordering::Relaxed);
         UNIFIED_EVIDENCE.words[17].store(key.id, Ordering::Relaxed);
@@ -504,8 +512,11 @@ pub fn run(info: &BootInfo) -> ! {
             coordinator.poll();
             if !learning_installed {
                 match crate::domain_tasks::service_segment(|| {
+                    UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
                     crate::smp::prototype_runtime::install_learning_capture(*LOCAL, boot.epoch)?;
+                    UNIFIED_EVIDENCE.words[30].store(2, Ordering::Release);
                     crate::peer_replay::init(boot.epoch)?;
+                    UNIFIED_EVIDENCE.words[30].store(3, Ordering::Release);
                     crate::learning_replay::init()
                 }) {
                     Some(Ok(())) => {
@@ -556,6 +567,7 @@ pub fn run(info: &BootInfo) -> ! {
                 progress(&mut coordinator, &mut tcp, stream_epoch)
             });
             let _ = service_work(&mut coordinator, &mut tcp, stream_epoch, |advance| {
+                UNIFIED_EVIDENCE.words[30].store(5, Ordering::Release);
                 crate::domain_services::service(Board.now_ns(), advance)
             });
             update_probe();
@@ -565,6 +577,7 @@ pub fn run(info: &BootInfo) -> ! {
                 continue;
             };
             let entered = Board.now_ns();
+            UNIFIED_EVIDENCE.words[30].store(6, Ordering::Release);
             unsafe {
                 if refresh_input {
                     // An IRQ can interrupt an EL0 structure copy. Keep input
@@ -606,6 +619,12 @@ pub fn run(info: &BootInfo) -> ! {
                     &mut context,
                     phys(core::ptr::addr_of!(ROOT) as u64),
                     crate::domain_platform::next_deadline_ticks(hard),
+                    crate::a02_capture::Task {
+                        id: 0xffff_ffff_ffff_fef1,
+                        generation: 1,
+                        role: 1,
+                        affinity: 1,
+                    },
                 );
             }
             UNIFIED_EVIDENCE.words[2].fetch_add(1, Ordering::Relaxed);

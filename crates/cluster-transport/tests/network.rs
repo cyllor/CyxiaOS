@@ -12,12 +12,17 @@ struct Link {
     drop_one_ip: bool,
     seen_arp: bool,
     seen_ipv4: bool,
+    burst: usize,
+    receives: [usize; 2],
 }
 struct TestPort {
     link: Rc<RefCell<Link>>,
     a: bool,
 }
 impl Port for TestPort {
+    fn burst_capacity(&self) -> usize {
+        self.link.borrow().burst.max(1)
+    }
     fn send(&mut self, frame: &[u8]) -> Result<(), PortError> {
         let mut link = self.link.borrow_mut();
         link.seen_arp |= frame[12..14] == [8, 6];
@@ -35,6 +40,7 @@ impl Port for TestPort {
     }
     fn receive(&mut self, out: &mut [u8; MTU]) -> Result<Option<usize>, PortError> {
         let mut link = self.link.borrow_mut();
+        link.receives[usize::from(!self.a)] += 1;
         let queue = if self.a { &mut link.a } else { &mut link.b };
         let Some(frame) = queue.pop_front() else {
             return Ok(None);
@@ -42,6 +48,38 @@ impl Port for TestPort {
         out[..frame.len()].copy_from_slice(&frame);
         Ok(Some(frame.len()))
     }
+}
+
+#[test]
+fn idle_multichain_poll_stops_when_egress_has_no_work() {
+    let link = Rc::new(RefCell::new(Link {
+        burst: 8,
+        ..Default::default()
+    }));
+    let (mut rx, mut tx) = ([0; BUFFER_SIZE], [0; BUFFER_SIZE]);
+    let mut storage = [Storage::EMPTY];
+    let mut tcp = Tcp::new(
+        TestPort {
+            link: link.clone(),
+            a: false,
+        },
+        config(false),
+        0,
+        &mut rx,
+        &mut tx,
+        &mut storage,
+    )
+    .unwrap();
+    tcp.listen().unwrap();
+    link.borrow_mut().receives = [0; 2];
+    tcp.poll(1).unwrap();
+    // A larger TX ring must not cause repeated idle NIC/MMIO work in the
+    // same paid turn. Initial ingress plus the final staged-TX service suffice.
+    assert!(
+        link.borrow().receives[1] <= 2,
+        "idle NIC was polled repeatedly: {}",
+        link.borrow().receives[1]
+    );
 }
 fn config(a: bool) -> Config {
     Config {
@@ -55,8 +93,12 @@ fn config(a: bool) -> Config {
     }
 }
 fn tcp_roundtrip(drop_syn: bool) {
+    tcp_roundtrip_with_burst(drop_syn, 1);
+}
+fn tcp_roundtrip_with_burst(drop_syn: bool, burst: usize) {
     let link = Rc::new(RefCell::new(Link {
         drop_one_ip: drop_syn,
+        burst,
         ..Default::default()
     }));
     let (mut arx, mut atx, mut brx, mut btx) = (
@@ -120,6 +162,12 @@ fn tcp_roundtrip(drop_syn: bool) {
     assert!(link.borrow().seen_arp && link.borrow().seen_ipv4);
     assert_eq!(a.poll(0), Err(Error::Clock));
     assert_eq!(a.send_tls(b"stale"), Err(Error::Closed));
+}
+
+#[test]
+fn multichain_poll_preserves_large_payload_and_retransmission() {
+    tcp_roundtrip_with_burst(false, 8);
+    tcp_roundtrip_with_burst(true, 8);
 }
 
 #[test]

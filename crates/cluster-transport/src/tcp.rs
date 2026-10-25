@@ -206,11 +206,19 @@ impl<'a, P: Port> Tcp<'a, P> {
         // Bound the producer pass by its real queue capacity, then ring once;
         // an isolated frame is still flushed at the end of this same turn.
         for _ in 0..self.device.port().burst_capacity().clamp(1, 8) {
-            self.interface
+            let egress = self
+                .interface
                 .poll_egress(now, &mut self.device, &mut self.sockets);
             if self.device.service().is_err() {
                 self.abort();
                 return Err(Error::Device);
+            }
+            // An idle socket or a retained backpressured frame cannot make
+            // progress by repeating the same poll in this paid CPU turn.
+            // The staged TX is serviced above and flushed below; retry on the
+            // next turn, preserving its bytes and normal retransmit timers.
+            if egress == smoltcp::iface::PollResult::None {
+                break;
             }
         }
         if self.device.port_mut().flush().is_err() {

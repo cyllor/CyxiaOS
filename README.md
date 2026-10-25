@@ -83,6 +83,8 @@ posix run preempt
 
 ## 构建与验证
 
+新 checkout 运行主机测试前，先执行 `python3 tools/prepare_host_tests.py --fetch` 准备固定上游测试输入；后续可省略 `--fetch` 离线复查。当前分支的验证修复与尚未关闭的原生预算问题见 [V0.1 验证跟进](docs/implementation/v01-validation-followup.md)。
+
 在项目目录执行，Python 仅需标准库：
 
 ```sh

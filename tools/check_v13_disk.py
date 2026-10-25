@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent read-only decoder of the reserved v1.3 boot volume and redo log."""
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 import struct
 from verify_smp import require
@@ -27,7 +28,9 @@ def superblock(data: bytes) -> dict:
     require(generation>0 and epoch>0 and any(data[16:32]), 'zero disk identity/generation')
     return dict(uuid=data[16:32],generation=generation,checkpoint=checkpoint,epoch=epoch)
 
-def inspect(path: Path) -> dict:
+@contextmanager
+def committed_volume(path: Path):
+    """Read the highest valid committed prefix without modifying the image."""
     require(path.stat().st_size==BLOCK*COUNT, 'wrong boot volume size')
     with path.open('rb') as disk:
         def read(block):
@@ -45,7 +48,7 @@ def inspect(path: Path) -> dict:
             require(old['uuid']==new['uuid'] and old['checkpoint']<=new['checkpoint'] and old['epoch']<=new['epoch'], 'conflicting superblocks')
             require(old['generation']!=new['generation'] or old==new,'equal generation disagreement')
             require(old['generation']==new['generation'] or old['epoch']<new['epoch'],'checkpoint epoch did not advance')
-        sb=copies[-1]; cursor=2; lsn=sb['checkpoint']+1; txid=0; overlays={}; commits=0
+        sb=copies[-1]; cursor=2; lsn=sb['checkpoint']+1; txid=0; overlays={}; commits=0; discarded_tail=False
         def record(block):
             head=read(block); checksum(head[:64],56)
             magic,version,kind,length,payload_crc,r_txid,r_lsn,epoch,home,index,count=struct.unpack_from('<IHHIIQQQQII',head)
@@ -56,15 +59,21 @@ def inspect(path: Path) -> dict:
             body=data[64:64+expected]
             require(crc32c(body)==payload_crc and not any(data[64+expected:]),'invalid redo body/padding')
             require(epoch==sb['epoch'] and r_txid>0 and r_lsn>0,'stale record identity')
+            if kind==1:
+                redos,reserved,total=struct.unpack('<IIQ',body)
+                require(home==index==count==reserved==0 and 1<=redos<=128 and total==redos*BLOCK
+                        and r_lsn+redos+1<2**64,'invalid BEGIN payload')
+            elif kind==2:
+                begin=r_lsn-index-1
+                require(4098<=home<COUNT and 0<=index<count<=128 and begin>0
+                        and begin+count+1<2**64,'invalid REDO fields')
+            else:
+                found,begin,last,redos,reserved=struct.unpack_from('<QQQII',body)
+                require(home==index==count==reserved==0 and found==r_txid and 1<=redos<=128
+                        and begin>0 and begin+redos==last and last+1==r_lsn,'invalid COMMIT fields')
             return kind,r_txid,r_lsn,home,index,count,body
-        while cursor<4098:
-            first=read(cursor)
-            if not any(first) or struct.unpack_from('<Q',first,32)[0]!=sb['epoch']:
-                # A current-epoch record beyond a gap is never silently omitted.
-                for later in range(cursor+1,4098):
-                    tail=read(later)
-                    require(not (tail[:4]==struct.pack('<I',0x43594c47) and struct.unpack_from('<Q',tail,32)[0]==sb['epoch']), 'current-epoch record after log gap')
-                break
+
+        def transaction(cursor,lsn,txid):
             kind,found,seq,home,index,count,body=record(cursor)
             require(kind==1 and found>txid and seq==lsn and home==index==count==0,'invalid BEGIN chain')
             count=struct.unpack_from('<I',body)[0]
@@ -82,8 +91,37 @@ def inspect(path: Path) -> dict:
             k,t,s,h,i,n,body=record(at)
             require((k,t,s,h,i,n)==(3,found,begin+count+1,0,0,0),'invalid COMMIT chain')
             require(struct.unpack_from('<QQQII',body)==(found,begin,begin+count,count,0) and body[32:]==digest.digest(),'COMMIT digest mismatch')
+            return pending,at,s,found
+
+        while cursor<4098:
+            try:
+                pending,at,s,found=transaction(cursor,lsn,txid)
+            except ValueError as failure:
+                # A torn/unflushed final transaction is not durable. Scan every
+                # remaining aligned block before accepting the prior prefix:
+                # even a COMMIT with a mismatched digest proves corruption if
+                # its own record CRCs, counters and reserved fields are valid.
+                for later in range(cursor,4098):
+                    tail=read(later)
+                    if tail[:8]!=struct.pack('<IHH',0x43594c47,1,3):
+                        continue
+                    try:
+                        candidate=record(later)
+                    except ValueError:
+                        continue
+                    require(candidate[2]<lsn, str(failure)+': valid current-epoch COMMIT after broken chain')
+                first=read(cursor)
+                discarded_tail=any(first) and struct.unpack_from('<Q',first,32)[0]==sb['epoch']
+                break
             overlays.update(pending);commits+=1;cursor=at+1;lsn=s+1;txid=found
         def current(block): return overlays[block] if block in overlays else read(block)
+        yield current, dict(uuid=sb['uuid'].hex(),generation=sb['generation'],checkpoint_lsn=sb['checkpoint'],
+                            log_epoch=sb['epoch'],committed_transactions=commits,last_commit_lsn=lsn-1,
+                            replayed_blocks=len(overlays),discarded_tail=discarded_tail)
+
+
+def inspect(path: Path) -> dict:
+    with committed_volume(path) as (current, metadata):
         table=b''.join(current(4102+i) for i in range(16))
         root_size,root_sequence=struct.unpack_from('<QQ',table,16)
         require(root_size in (128,256,384) and root_sequence==root_size//128,'invalid durable root size/sequence')
@@ -123,7 +161,7 @@ def inspect(path: Path) -> dict:
             require(entry[:124]==expected,'invalid reserved directory entry')
         require(not any(directory[root_size:]),'directory unused suffix not zero')
         body=current(4119);epoch=struct.unpack_from('<Q',body,24)[0]
-        require(body[:8]==b'CYXBOOT1' and body[8:24]==sb['uuid'] and epoch>0 and not any(body[36:]),'invalid boot body')
+        require(body[:8]==b'CYXBOOT1' and body[8:24].hex()==metadata['uuid'] and epoch>0 and not any(body[36:]),'invalid boot body')
         require(struct.unpack_from('<I',body,32)[0]==crc32c(body[:32]),'boot CRC mismatch')
         require(struct.unpack_from('<Q',table,256+24)[0]==epoch,'inode and boot epoch disagree')
         bitmap=b''.join(current(4098+i) for i in range(4))
@@ -149,6 +187,5 @@ def inspect(path: Path) -> dict:
                 cluster_records.append(body.hex());at+=length;records+=1
             require(records==seq,'cluster inode durable sequence differs from record count')
         require(bitmap==bytes(expected),'boot/cluster volume allocation mismatch')
-        return dict(uuid=sb['uuid'].hex(),boot_epoch=epoch,checkpoint_lsn=sb['checkpoint'],
-                    log_epoch=sb['epoch'],committed_transactions=commits,last_commit_lsn=lsn-1,
+        return dict(metadata,boot_epoch=epoch,
                     cluster_files=files,cluster_file_sizes=[row[0] for row in sizes],cluster_records=cluster_records)

@@ -1270,18 +1270,20 @@ impl Coordinator {
         if !view.enabled || gate.close(view.token.unwrap()).is_err() {
             return;
         }
-        if handoff
-            .poll_with_thread(
-                &mut self.owner,
-                NativeStop::default(),
-                ms,
-                &mut self.threads[0],
-            )
-            .is_err()
-        {
+        let handoff_result = handoff.poll_with_thread(
+            &mut self.owner,
+            NativeStop::default(),
+            ms,
+            &mut self.threads[0],
+        );
+        #[cfg(feature = "unified-runtime")]
+        self.capture_ownership();
+        if handoff_result.is_err() {
             // An unexpected admission failure leaves the physical fence closed
             // and preserves source obligations, rather than reviving work.
             let _ = self.owner.suspect(2);
+            #[cfg(feature = "unified-runtime")]
+            self.capture_ownership();
             return;
         }
         self.handoff_sequence += 1;
@@ -1299,6 +1301,21 @@ impl Coordinator {
             self.requests,
             target,
             self.handoff_sequence,
+        );
+    }
+    #[cfg(feature = "unified-runtime")]
+    fn capture_ownership(&self) {
+        let s = self.owner.snapshot();
+        crate::a02_capture::publish(
+            s.core_generation,
+            [
+                s.control.bits(),
+                s.business.bits(),
+                s.transition.bits(),
+                s.quarantined.bits(),
+                s.draining.bits(),
+                s.suspect.bits(),
+            ],
         );
     }
     fn poll_handoff(&mut self, now: u64) {
@@ -1331,6 +1348,8 @@ impl Coordinator {
             ms,
             &mut self.threads[0],
         );
+        #[cfg(feature = "unified-runtime")]
+        self.capture_ownership();
         match result {
             Ok(false) => (),
             Ok(true) => {

@@ -296,6 +296,19 @@ fn applied_value(slot: usize, action: Action, receipt: PolicyReceiptWire) -> boo
 fn target(domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     inspect_view(|view| Ok(target_in(view, domain, kind, ordinal))).ok()?
 }
+pub(crate) fn queued_targets(
+    queries: &[crate::domain_control::target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    inspect_view(|view| {
+        if !view.ready {
+            return Err(Error::NotReady);
+        }
+        crate::domain_control::target_batch::resolve(queries, output, |q| {
+            target_in(view, q.domain, q.kind, q.ordinal)
+        })
+    })
+}
 fn target_in(view: &ReadView, domain: u16, kind: u16, ordinal: usize) -> Option<ObjectKey> {
     if !view.ready {
         return None;
@@ -476,6 +489,7 @@ pub fn register_control() -> Result<(), Error> {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
             kind,
+            target_source: crate::domain_control::TargetSource::Network,
             target,
             observe: measurements,
             current,
