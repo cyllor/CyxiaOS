@@ -74,20 +74,18 @@ replace(
  # Interrupt handlers, Rust code and compiler helpers remain soft-float.
  transitions={'cyxia_enter_user', 'cyxia_user_return'}
 ''',
-    ''' # Only the two handwritten user transitions and the reviewed bounded
- # SHA wrapper may access FP/SIMD state. Other kernel code remains soft-float.
+    ''' # Only the two handwritten user transitions and the exact reviewed SHA
+ # transition may access FP/SIMD state. Other kernel code remains soft-float.
  transitions={'cyxia_enter_user', 'cyxia_user_return'}
- sha_wrapper='cyxia_sha256_compress_hw'
- sha_inner='cyxia_sha256_compress_inner'
+ sha_transition='cyxia_sha256_compress_hw'
 ''',
 )
 replace(
     'tools/verify_m1.py',
     '''  if fp and not (allow_user_context and symbol in transitions and context_move):raise ValueError('FP/SIMD outside context save/restore: '+line)
 ''',
-    '''  sha_move=symbol==sha_wrapper and context_move
-  sha_round=symbol==sha_inner
-  if fp and not ((allow_user_context and symbol in transitions and context_move) or sha_move or sha_round):raise ValueError('FP/SIMD outside reviewed transition: '+line)
+    '''  sha_allowed=symbol==sha_transition and bool(re.match(r'(?:stp|ldp)\\s+q\\d+,\\s*q\\d+,|(?:mrs|msr)\\s+.*\\b(?:fpcr|fpsr)\\b|(?:ld1|st1|rev32|add|mov|sha256h2?|sha256su[01])\\b',insn))
+  if fp and not ((allow_user_context and symbol in transitions and context_move) or sha_allowed):raise ValueError('FP/SIMD outside reviewed transition: '+line)
 ''',
 )
 replace(
@@ -95,9 +93,9 @@ replace(
     ''' def test_llvm_uppercase_fp_registers_cannot_bypass_scan(self):
 ''',
     ''' def test_bounded_sha_transition_is_exactly_scoped(self):
-  text='4000 <cyxia_sha256_compress_hw>:\\n 4000: stp q0, q1, [sp, #16]\\n4010 <cyxia_sha256_compress_inner>:\\n 4010: sha256h q0, q1, v2.4s'
-  self.assertEqual(inspect_instructions(text),2)
-  for bad in ['4000 <ordinary_fn>:\\n 4000: sha256h q0, q1, v2.4s', '4000 <cyxia_sha256_compress_hw>:\\n 4000: fmov d0, x0', '4000 <cyxia_sha256_compress_inner_extra>:\\n 4000: sha256h q0, q1, v2.4s']:
+  text='4000 <cyxia_sha256_compress_hw>:\\n 4000: stp q0, q1, [sp, #16]\\n 4004: ld1 { v4.16b }, [x1], #16\\n 4008: sha256h q0, q1, v15.4s'
+  self.assertEqual(inspect_instructions(text),3)
+  for bad in ['4000 <ordinary_fn>:\\n 4000: sha256h q0, q1, v2.4s', '4000 <cyxia_sha256_compress_hw>:\\n 4000: fmov d0, x0', '4000 <cyxia_sha256_compress_hw_extra>:\\n 4000: sha256h q0, q1, v2.4s']:
    with self.subTest(text=bad):
     with self.assertRaises(ValueError):inspect_instructions(bad)
  def test_llvm_uppercase_fp_registers_cannot_bypass_scan(self):
