@@ -1,1 +1,1 @@
-Validation trigger for the stack-safe control preparation commit e6517c7042f38521919f84c7dc8fbb67c239a2cc.
+Validation trigger for the borrowed-candidate stack fix commit 8613a4a4b655c3c539a6748a3714bebf0f5ffa99.
