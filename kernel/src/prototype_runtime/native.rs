@@ -68,14 +68,17 @@ struct Bill {
 enum Completion {
     Empty,
     Reply(u64),
+    ReadOnly,
     Fault,
 }
 pub(super) struct WorkerState {
     bill: Option<Bill>,
     completion: Option<Completion>,
+    returned: Option<Completion>,
     model: Option<crate::domain_control::NativeModelPin>,
     model_mapped: bool,
-    capture: Option<crate::learning_evidence::OwnerAttempt>,
+    source: Option<crate::domain_control::JobSource>,
+    measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
     probe_started: u64,
     probing: bool,
@@ -93,9 +96,11 @@ impl WorkerState {
         Self {
             bill: None,
             completion: None,
+            returned: None,
             model: None,
             model_mapped: false,
-            capture: None,
+            source: None,
+            measurement: None,
             probe: 0,
             probe_started: 0,
             probing: false,
@@ -217,20 +222,33 @@ fn conclude(worker: &mut Worker, completion: Completion) {
         worker.native.model_mapped = false;
     }
     worker.native.in_job = false;
+    worker.native.returned = None;
     worker.native.publish_pending = false;
     worker.native.abort_pending = false;
     worker.native.completion = Some(completion);
 }
 fn publish_completion(worker: &mut Worker) {
-    if worker.native.bill.is_some() || worker.native.model.is_some() || worker.native.model_mapped {
+    if worker.native.bill.is_some()
+        || worker.native.model.is_some()
+        || worker.native.model_mapped
+        || worker.native.measurement.is_some()
+    {
         return;
     }
-    let Some(completion) = worker.native.completion.take() else {
+    let Some(completion) = worker.native.completion else {
         return;
     };
+    if let Some(work) = worker.native.source.and_then(|source| source.work) {
+        if crate::domain_control::core_replay::retired(work).is_err() {
+            return;
+        }
+    }
+    worker.native.completion = None;
+    worker.native.source = None;
     let (state, version) = match completion {
         Completion::Empty => (5, 0),
         Completion::Reply(version) => (3, version),
+        Completion::ReadOnly => (6, 0),
         Completion::Fault => (4, 0),
     };
     RESULT_VERSION.store(version, Ordering::Relaxed);
@@ -297,11 +315,36 @@ fn clear_private(slot: usize) {
         core::arch::asm!("dsb ish", options(nostack));
     }
 }
-fn root_return(worker: &mut Worker, slot: usize) {
+fn finish_root_return(
+    worker: &mut Worker,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
+) {
+    let Some(completion) = worker.native.returned else {
+        return;
+    };
+    if let Some(work) = worker.native.source.and_then(|source| source.work) {
+        // Successful warm work is acknowledged only while this actual credit
+        // remains live; a busy owner keeps the stopped job and exact token.
+        if crate::domain_control::core_replay::report_completed(work, witness).is_err() {
+            return;
+        }
+    }
+    conclude(worker, completion);
+}
+fn root_return(
+    worker: &mut Worker,
+    slot: usize,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
+) {
+    if worker.native.returned.is_some() {
+        finish_root_return(worker, witness);
+        return;
+    }
     if worker.native.abort_pending {
         worker.native.phase(7);
         if crate::domain_control::abort(worker.native.cpu_ns).is_ok() {
-            conclude(worker, Completion::Fault);
+            worker.native.returned = Some(Completion::Fault);
+            finish_root_return(worker, witness);
         }
         return;
     }
@@ -321,8 +364,6 @@ fn root_return(worker: &mut Worker, slot: usize) {
         match crate::domain_control::pending_job() {
             Ok(false) => {}
             Ok(true) => {
-                // A changed current-C authorization can reject before taking
-                // the job. Its original owner must still explicitly abort it.
                 if error != DomainError::Busy {
                     worker.native.publish_pending = false;
                     worker.native.abort_pending = true;
@@ -332,21 +373,34 @@ fn root_return(worker: &mut Worker, slot: usize) {
             Err(_) => return,
         }
     }
-    // An accepted root version remains a success even if later cost settlement
-    // detects an overrun. Its existing executor obligations cannot be undone.
-    conclude(worker, Completion::Reply(result.unwrap_or(0)));
+    // An accepted root version remains a success even if cost settlement
+    // later detects an overrun. Read-only work never claims a policy version.
+    worker.native.returned = Some(
+        if worker.native.source.is_some_and(|source| {
+            source.class == cyxia_prototype::learning::reward::CpuClass::ExecutorWork
+        }) {
+            Completion::ReadOnly
+        } else {
+            Completion::Reply(result.unwrap_or(0))
+        },
+    );
+    finish_root_return(worker, witness);
 }
 /// Candidate encoding has sizeable bounded scratch. Its lifetime must not
 /// become the permanent frame of the sibling learning/validation dispatch.
 #[inline(never)]
-fn next_input(controller: u64) -> Result<Option<[u64; 512]>, DomainError> {
-    crate::domain_control::next(controller)
+fn next_input(
+    controller: u64,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
+) -> Result<Option<([u64; 512], crate::domain_control::JobSource)>, DomainError> {
+    crate::domain_control::next_paid(controller, witness)
 }
 #[inline(never)]
 fn run_turn(
     worker: &mut Worker,
     credit: cyxia_prototype::domains::tasks::ControlCredit,
     begin: u64,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
 ) {
     let slot = cpu::slot();
     let now = ns(timer::ticks());
@@ -357,11 +411,15 @@ fn run_turn(
         let _ = release_model(worker);
         return;
     }
-    if worker.native.in_job && now.saturating_sub(worker.native.job_started) >= WALL_NS {
+    if worker.native.in_job
+        && !worker.native.publish_pending
+        && worker.native.returned.is_none()
+        && now.saturating_sub(worker.native.job_started) >= WALL_NS
+    {
         worker.native.abort_pending = true;
     }
     if worker.native.in_job && (worker.native.publish_pending || worker.native.abort_pending) {
-        root_return(worker, slot);
+        root_return(worker, slot, witness);
         return;
     }
     if let Some(context) = worker.context.as_ref() {
@@ -399,7 +457,7 @@ fn run_turn(
                     && context.regs[0] == abi::OUTPUT_VA
                     && context.regs[1] == 4096;
                 worker.native.abort_pending = !worker.native.publish_pending;
-                root_return(worker, slot);
+                root_return(worker, slot, witness);
                 return;
             }
         }
@@ -423,16 +481,26 @@ fn run_turn(
         worker.native.cpu_ns = 0;
         REQUEST_START.store(timer::ticks(), Ordering::Relaxed);
         worker.native.phase(3);
-        let input = match next_input(CONTROLLER_EPOCH.load(Ordering::Acquire)) {
+        let (input, source) = match next_input(CONTROLLER_EPOCH.load(Ordering::Acquire), witness) {
             Ok(Some(input)) => input,
             _ => {
                 conclude(worker, Completion::Empty);
                 return;
             }
         };
+        worker.native.source = Some(source);
         worker.native.in_job = true;
         worker.native.job_started = input[4];
         STARTED_JOBS.fetch_add(1, Ordering::Release);
+        // Encoding above opened its own exact source before constructing the
+        // immutable job. Subsequent private copy, inference and cleanup share
+        // this protected job source across all real paid turns.
+        worker.native.measurement =
+            crate::domain_control::core_replay::Measurement::new(source, witness).ok();
+        if worker.native.measurement.is_none() {
+            worker.native.abort_pending = true;
+            return;
+        }
         worker.native.phase(4);
         let copy_start = timer::ticks();
         unsafe {
@@ -522,11 +590,9 @@ fn charge_turn(
     credit: cyxia_prototype::domains::tasks::ControlCredit,
     begin: u64,
 ) {
+    finish_measurement(worker);
     let end = timer::ticks();
     let actual = ns(end - begin);
-    if let Some(mut capture) = worker.native.capture.take() {
-        let _ = crate::learning_evidence::finish_attempt(&mut capture, ns(begin), ns(end));
-    }
     worker.window = credit.window;
     worker.charged = credit
         .control_total_ns
@@ -545,10 +611,32 @@ fn charge_turn(
     let _ = settle(worker);
     publish_completion(worker);
 }
+fn finish_measurement(worker: &mut Worker) -> bool {
+    if let Some(measurement) = worker.native.measurement.as_mut() {
+        if measurement.finish() == Err(DomainError::Busy) {
+            return false;
+        }
+        worker.native.measurement = None;
+    }
+    true
+}
+fn begin_measurement(
+    worker: &mut Worker,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
+) -> bool {
+    if let Some(source) = worker.native.source {
+        match crate::domain_control::core_replay::Measurement::new(source, witness) {
+            Ok(measurement) => worker.native.measurement = Some(measurement),
+            Err(_) => return false,
+        }
+    }
+    true
+}
 pub(super) fn step(worker: &mut Worker) {
     let slot = cpu::slot();
     if !matches!(slot, 1 | 2)
         || !READY.load(Ordering::Acquire)
+        || !finish_measurement(worker)
         || !settle(worker)
         || !learning::settle(&mut worker.extra)
     {
@@ -558,8 +646,6 @@ pub(super) fn step(worker: &mut Worker) {
     if worker.native.failed {
         return;
     }
-    // Do not burn control budget polling when this worker has no owned context
-    // or explicit scheduling opportunity. Root still owns exactly one job.
     if worker.probed
         && worker.context.is_none()
         && !worker.native.in_job
@@ -576,24 +662,23 @@ pub(super) fn step(worker: &mut Worker) {
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, false) else {
         return;
     };
-    worker.native.capture = crate::learning_evidence::attempt(
-        capture_owner(cpu::slot()),
-        cyxia_prototype::learning::reward::CpuClass::Policy,
-    )
-    .ok()
-    .flatten();
     let begin = timer::ticks();
     worker.native.phase = 0;
     worker.native.phase_mask = 0;
     CONTROL_MAX_DEBIT.fetch_max(credit.control_total_ns / 100_000, Ordering::Relaxed);
     CONTROL_TOTAL_DEBIT.fetch_add(credit.reserved_ns / 100_000, Ordering::Relaxed);
-    run_turn(worker, credit, begin);
+    if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
+        if begin_measurement(worker, &witness) {
+            run_turn(worker, credit, begin, &witness);
+        }
+    }
+    // A failed witness lookup still returns its real physical reservation.
     charge_turn(worker, credit, begin);
 }
 /// A closed gate never substitutes for settlement or cancellation of the
 /// original root job. Only its actual C owner can issue this abort.
 pub(super) fn stop_ready(worker: &mut Worker) -> bool {
-    if !settle(worker) || !learning::quiescent(&mut worker.extra) {
+    if !finish_measurement(worker) || !settle(worker) || !learning::quiescent(&mut worker.extra) {
         return false;
     }
     publish_completion(worker);
@@ -601,19 +686,20 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
         let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
             return false;
         };
-        worker.native.capture = crate::learning_evidence::attempt(
-            capture_owner(cpu::slot()),
-            cyxia_prototype::learning::reward::CpuClass::Policy,
-        )
-        .ok()
-        .flatten();
         let begin = timer::ticks();
         worker.native.phase = 0;
         worker.native.phase_mask = 0;
-        worker.native.abort_pending = true;
-        root_return(worker, cpu::slot());
+        if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
+            if begin_measurement(worker, &witness) {
+                worker.native.abort_pending = true;
+                root_return(worker, cpu::slot(), &witness);
+            }
+        }
         charge_turn(worker, credit, begin);
-        if worker.native.in_job || worker.native.bill.is_some() {
+        if worker.native.in_job
+            || worker.native.bill.is_some()
+            || worker.native.measurement.is_some()
+        {
             return false;
         }
     }
@@ -621,18 +707,20 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
         let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
             return false;
         };
-        worker.native.capture = crate::learning_evidence::attempt(
-            capture_owner(cpu::slot()),
-            cyxia_prototype::learning::reward::CpuClass::Policy,
-        )
-        .ok()
-        .flatten();
         let begin = timer::ticks();
         worker.native.phase(8);
-        let _ = release_model(worker);
+        if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
+            if begin_measurement(worker, &witness) {
+                let _ = release_model(worker);
+            }
+        }
         charge_turn(worker, credit, begin);
     }
-    worker.native.model.is_none() && worker.native.bill.is_none()
+    publish_completion(worker);
+    worker.native.model.is_none()
+        && worker.native.bill.is_none()
+        && worker.native.measurement.is_none()
+        && worker.native.completion.is_none()
 }
 
 #[derive(Clone, Copy)]
@@ -999,7 +1087,7 @@ pub(super) fn poll(c: &mut Coordinator) {
     }
     c.requests = STARTED_JOBS.load(Ordering::Acquire);
     match REQUEST.load(Ordering::Acquire) {
-        state @ (3 | 4 | 5) => {
+        state @ (3 | 4 | 5 | 6) => {
             c.preemptions = c
                 .preemptions
                 .saturating_add(RESULT_PREEMPTIONS.load(Ordering::Relaxed));

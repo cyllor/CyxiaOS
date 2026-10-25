@@ -384,6 +384,35 @@ impl<const C: usize> FileSystem<C> {
         }
         freed
     }
+    /// Drop a bounded part of one durable object's clean cache. This is an
+    /// explicit owner operation used when restoring a cold workload image;
+    /// it never flushes, discards dirty data, releases pins, or changes policy.
+    /// The caller retains `cursor` and must complete the scan before claiming
+    /// that the object's cache is empty. A blocked cell is retried in place.
+    pub fn discard_clean_object_cache(
+        &mut self,
+        object: ObjectKey,
+        cursor: usize,
+        maximum: usize,
+    ) -> Result<usize, Error> {
+        self.stat_object(object)?;
+        if cursor > C || maximum == 0 || maximum > 64 {
+            return Err(Error::Range);
+        }
+        let inode = usize::try_from(object.id).map_err(|_| Error::Range)?;
+        let end = cursor.saturating_add(maximum).min(C);
+        for at in cursor..end {
+            let page = &mut self.cache[at];
+            if page.valid && page.inode == inode {
+                if page.dirty || page.pinned {
+                    return Err(Error::Busy);
+                }
+                *page = Cache::EMPTY;
+                self.resident = self.resident.checked_sub(1).ok_or(Error::Conflict)?;
+            }
+        }
+        Ok(end)
+    }
     fn allocated(&self, block: u32) -> bool {
         self.bitmap[block as usize / 8] & (1 << (block % 8)) != 0
     }

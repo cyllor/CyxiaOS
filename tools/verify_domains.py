@@ -43,6 +43,7 @@ IPI_MAGIC = 0x4359495049000001
 CONTROL_CREDIT_MAGIC = 0x4359434352454401
 CONTROL_POOL_MAGIC = 0x435943504F4F4C01
 LEARNING_MAGIC = 0x43594C4541524E01
+REPLAY_MAGIC = 0x435952504C593133
 RUNTIME_MAGIC = 0x43595852554E3133
 # The actual cluster Driver closes after 1.5 guest seconds without an RPC.
 # Keep the NIC down for at least two guest seconds AND observe that close;
@@ -67,7 +68,10 @@ REQUIRED = {
 }
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
-            "LEARNING_V13_EVIDENCE": 1024}
+            "LEARNING_V13_EVIDENCE": 1024, "REPLAY_V13_EVIDENCE": 512,
+            "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
+            "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
+            "LOCAL_PLACEMENT_EVIDENCE": 256}
 
 
 def require(condition, message):
@@ -379,8 +383,63 @@ def parse_learning(data):
             "trained_model_verified": False}
 
 
+def parse_replay(data):
+    w = words(data, 64)
+    if w[1] == 0 or w[0] & 1:
+        return None
+    require(w[0] > 0 and w[1] == REPLAY_MAGIC, "invalid native replay header")
+    require(w[2] <= 23 and 1 <= w[3] <= 16 and w[4] in (1, 2)
+            and (w[4] == 1 or w[3] in (1, 16)) and w[5] < 12
+            and w[6] in (1, 2) and w[7] > 0, "invalid native replay state")
+    training, validation = list(w[24:42]), list(w[42:60])
+    require(all(n <= 8 for n in training) and all(n <= 4 for n in validation),
+            "native replay exceeds the frozen family split")
+    require(w[19] == sum(training) + sum(validation), "native replay label count mismatch")
+    require(w[17] >= w[10] + w[11], "native replay retired a side before durable archive")
+    require(w[20] in (0, 1) and w[22] in (0, 1) and w[63] in (0, 1),
+            "invalid native replay custody flag")
+    return {"phase": w[2], "family": [w[3], w[4]], "group": w[5],
+            "side": "candidate" if w[6] == 1 else "baseline", "trial": w[7],
+            "boot_epoch": w[8], "capture_generation": w[9],
+            "verified_sides": w[10], "excluded_sides": w[11], "error": w[12],
+            "root_phase": w[13], "first_ns": w[14], "observation_ns": w[15],
+            "closing_ns": w[16], "durable_archives": w[17], "data_phase": w[18],
+            "labels": w[19], "pending_baseline": bool(w[20]), "data_error": w[21],
+            "peer_paused": bool(w[22]), "signed_peer_intervals": w[23],
+            "training": training, "validation": validation, "sampled_ns": w[60],
+            "history_rows": w[61], "retained_rows": w[62], "archive_complete": bool(w[63])}
+
+
+def replay_ready(value, minimum):
+    # These are the protected native producer's actual accepted pairs and
+    # read-back archives. They are a functional ingress gate, not proof of
+    # complete model validation, Canary promotion, or all-family acceptance.
+    return bool(value and value["labels"] >= minimum
+                and value["verified_sides"] >= 2 * minimum
+                and value["durable_archives"] >= 2 * minimum)
+
+
 def diagnostics(guest, bundle):
-    guest["unified_words"] = list(words(bundle["UNIFIED_EVIDENCE"], 512)[:32])
+    # Every field belongs to this stopped snapshot. One failed parser must
+    # neither hide another fresh diagnostic nor retain an older healthy value.
+    errors = []
+    guest["diagnostic_errors"] = []
+
+    def read(key, parser):
+        guest[key] = None
+        try:
+            guest[key] = parser()
+        except ValueError as error:
+            errors.append(error)
+            guest["diagnostic_errors"].append({"field": key, "error": str(error)})
+
+    def check(key, condition, message):
+        if not condition:
+            error = ValueError(message)
+            errors.append(error)
+            guest["diagnostic_errors"].append({"field": key, "error": str(error)})
+
+    read("unified_words", lambda: list(words(bundle.get("UNIFIED_EVIDENCE", b""), 512)[:32]))
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
@@ -389,29 +448,60 @@ def diagnostics(guest, bundle):
                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
                                     ("CONTROL_POOL_EVIDENCE", "control_pool_evidence", 16),
                                     ("LEARNING_V13_EVIDENCE", "learning_evidence", 128),
+                                    ("REPLAY_V13_EVIDENCE", "replay_evidence", 64),
+                                    ("REPLAY_ROOT_EVIDENCE", "replay_root_evidence", 32),
+                                    ("REPLAY_OWNER_EVIDENCE", "replay_owner_evidence", 32),
+                                    ("REPLAY_CONFIG_EVIDENCE", "replay_config_evidence", 32),
+                                    ("REPLAY_CAPTURE_EVIDENCE", "replay_capture_evidence", 32),
+                                    ("LOCAL_PLACEMENT_EVIDENCE", "local_placement_evidence", 32),
                                     ("PANIC_EVIDENCE", "panic_evidence", 8)):
+        guest[key] = None
         if symbol_name in bundle:
-            guest[key] = list(words(bundle[symbol_name], count))
-    if "CONTROL_CREDIT_EVIDENCE" in bundle:
-        guest["control_credit"] = parse_control_credit(bundle["CONTROL_CREDIT_EVIDENCE"])
-        require(not guest["control_credit"],
-                "native C credit failure: " + json.dumps(guest["control_credit"], separators=(",", ":")))
-    if "RUNTIME_V13_EVIDENCE" in bundle:
-        guest["runtime"] = parse_runtime(bundle["RUNTIME_V13_EVIDENCE"])
-    if "DOMAIN_TASK_EVIDENCE" in bundle:
-        guest["tasks"] = parse_tasks(bundle["DOMAIN_TASK_EVIDENCE"])
-    if "IPI_EVIDENCE" in bundle:
-        guest["ipi"] = parse_ipi(bundle["IPI_EVIDENCE"])
-    if "CONTROL_POOL_EVIDENCE" in bundle:
-        guest["control_pool"] = parse_control_pool(bundle["CONTROL_POOL_EVIDENCE"])
-    if "LEARNING_V13_EVIDENCE" in bundle:
-        guest["learning"] = parse_learning(bundle["LEARNING_V13_EVIDENCE"])
+            read(key, lambda: list(words(bundle[symbol_name], count)))
+    for symbol_name, key, parser in (("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
+                                     ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
+                                     ("DOMAIN_TASK_EVIDENCE", "tasks", parse_tasks),
+                                     ("IPI_EVIDENCE", "ipi", parse_ipi),
+                                     ("CONTROL_POOL_EVIDENCE", "control_pool", parse_control_pool),
+                                     ("LEARNING_V13_EVIDENCE", "learning", parse_learning),
+                                     ("REPLAY_V13_EVIDENCE", "replay", parse_replay)):
+        guest[key] = None
+        if symbol_name in bundle:
+            read(key, lambda: parser(bundle[symbol_name]))
+            if key == "control_credit":
+                check(key, not guest[key],
+                      "native C credit failure: " + json.dumps(guest[key], separators=(",", ":")))
     # A synchronous file operation may retain its caller while waiting for a
     # new credit. Its periodic task snapshot can then be older than the actual
     # completion fault; the independent sticky record must still fail the run.
-    require(not guest.get("overrun_evidence", [0])[0],
-            "native sticky CPU credit overrun evidence is present")
-    require(not guest.get("panic_evidence", [0])[0], "kernel panic evidence is present")
+    check("overrun_evidence", not (guest.get("overrun_evidence") or [0])[0],
+          "native sticky CPU credit overrun evidence is present")
+    check("panic_evidence", not (guest.get("panic_evidence") or [0])[0], "kernel panic evidence is present")
+    if errors:
+        raise errors[0]
+
+
+def refresh_snapshot(guest, bundle):
+    """Refresh ordinary and final diagnostics before raising the first fault."""
+    guest["unified"] = guest["control"] = None
+    errors = []
+    try:
+        diagnostics(guest, bundle)
+    except ValueError as error:
+        errors.append(error)
+    # Both parsers still run after a task/credit/panic fault. A failed unified
+    # parser cannot supply an old BootEpoch to the independently parsed control.
+    for key, parser in (("unified", lambda: parse_unified(bundle["UNIFIED_EVIDENCE"])),
+                        ("control", lambda: parse_control(bundle["DOMAIN_CONTROL_EVIDENCE"],
+                            guest["unified"]["boot_epoch"] if guest["unified"] else None))):
+        try:
+            guest[key] = parser()
+        except (ValueError, KeyError) as error:
+            error = error if isinstance(error, ValueError) else ValueError("missing snapshot evidence: " + str(error))
+            errors.append(error)
+            guest["diagnostic_errors"].append({"field": key, "error": str(error)})
+    if errors:
+        raise errors[0]
 
 
 def profile(path):
@@ -541,6 +631,8 @@ def run(args):
     require(args.single != (args.peer_elf is not None),
             "choose --single or provide --peer-elf")
     reconnect_requested = bool(getattr(args, "reconnect", False))
+    minimum_pairs = getattr(args, "replay_pairs", 0)
+    require(0 <= minimum_pairs <= 216, "--replay-pairs must be 0..216")
     require(not reconnect_requested or not args.single, "--reconnect requires --peer-elf")
     reconnect = ReconnectProbe() if reconnect_requested else None
     images = [args.elf.resolve(strict=True)]
@@ -560,11 +652,12 @@ def run(args):
     require(not output.exists(), "refuse to reuse a test output directory")
     output.mkdir(parents=True, mode=0o700)
     report = {
-        "schema_version": 1, "status": "FAIL", "scope": "native-domain-functional",
+        "schema_version": 1, "status": "FAIL", "scope": "native-replay-functional" if minimum_pairs else "native-domain-functional",
         "nodes": len(images), "physical_realtime_verified": False,
         "all_eighteen_families_two_effective_policies_verified": False,
         "release_acceptance_verified": False, "source_build_attested": False,
         "reconnect_requested": reconnect_requested, "reconnect_verified": False,
+        "minimum_replay_pairs": minimum_pairs, "native_paired_replay_observed": False,
         "clock_profile": args.clock_profile, "sampling": "stopped guest snapshots",
         "elf_sha256": [sha(image) for image in images],
         "verifier_sha256": sha(verifier), "formatter_sha256": sha(formatter),
@@ -651,11 +744,8 @@ def run(args):
                     ready = True
                     progress = []
                     for guest, bundle in zip(guests, bundles):
-                        diagnostics(guest, bundle)
-                        unified = parse_unified(bundle["UNIFIED_EVIDENCE"])
-                        control = parse_control(bundle["DOMAIN_CONTROL_EVIDENCE"],
-                                                unified["boot_epoch"] if unified else None)
-                        guest["unified"], guest["control"] = unified, control
+                        refresh_snapshot(guest, bundle)
+                        unified, control = guest["unified"], guest["control"]
                         archive(guest, bundle["DOMAIN_CONTROL_EVIDENCE"], control)
                         observed = (unified is not None and control is not None and
                                     unified["probe_completed"] and unified["el0_returns"] > 0 and
@@ -669,10 +759,13 @@ def run(args):
                                         and guest.get("learning") is not None
                                         and guest["learning"]["mechanism_ready"]
                                         and guest["unified_words"][28] == 1)
+                        if minimum_pairs:
+                            observed = observed and replay_ready(guest.get("replay"), minimum_pairs)
                         ready = ready and observed
                         progress.append({"probe_done": bool(unified and unified["probe_completed"]),
                                          "jobs": control["jobs"] if control else 0,
-                                         "applied": control["applied"] if control else 0})
+                                         "applied": control["applied"] if control else 0,
+                                         "replay": guest.get("replay")})
                     now = time.monotonic()
                     if reconnect is not None:
                         ready = reconnect.step(guests, ready) and ready
@@ -686,6 +779,7 @@ def run(args):
                         ready_at = ready_at or now
                         if now - ready_at >= args.hold:
                             report["functional_conditions_observed"] = True
+                            report["native_paired_replay_observed"] = bool(minimum_pairs)
                             break
                     else:
                         ready_at = None
@@ -699,12 +793,8 @@ def run(args):
                         final = capture(guests, resume=False)
                         for guest, bundle in zip(guests, final):
                             try:
-                                diagnostics(guest, bundle)
-                                unified = parse_unified(bundle["UNIFIED_EVIDENCE"])
-                                control = parse_control(bundle["DOMAIN_CONTROL_EVIDENCE"],
-                                                        unified["boot_epoch"] if unified else None)
-                                guest["unified"], guest["control"] = unified, control
-                                archive(guest, bundle["DOMAIN_CONTROL_EVIDENCE"], control, force=True)
+                                refresh_snapshot(guest, bundle)
+                                archive(guest, bundle["DOMAIN_CONTROL_EVIDENCE"], guest["control"], force=True)
                             except ValueError as error:
                                 guest["final_parse_error"] = str(error)
                             guest["registers"] = guest["qmp"].execute("human-monitor-command", {"command-line": "info registers -a"})
@@ -772,8 +862,11 @@ def run(args):
                                   ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "overrun_evidence", "panic_evidence",
                                    "ipi_evidence", "slice_evidence", "runtime", "runtime_evidence",
                                    "control_credit", "control_credit_evidence",
-                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence",
-                                   "registers", "stack_pa", "final_parse_error")}
+                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",
+                                   "replay_root_evidence", "replay_owner_evidence",
+                                   "replay_config_evidence", "replay_capture_evidence",
+                                   "local_placement_evidence",
+                                   "registers", "stack_pa", "diagnostic_errors", "final_parse_error")}
                                  for guest in guests]
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         os.umask(previous_umask)
@@ -799,6 +892,8 @@ def main():
     parser.add_argument("--clock-profile", choices=("icount", "wallclock"), default="icount")
     parser.add_argument("--reconnect", action="store_true",
                         help="verify two-node link loss, guest-clock progress and fresh mutual authentication")
+    parser.add_argument("--replay-pairs", type=int, default=0,
+                        help="also require this many actual accepted native pairs and durable side archives per node")
     args = parser.parse_args()
     try:
         result = run(args)

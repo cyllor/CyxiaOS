@@ -49,6 +49,7 @@ use cyxia_prototype::{
         capture::{CaptureInit, FrozenRequest, InitValue, RunKey, Seal, Source},
         reward::{CpuClass, OBSERVATION_NS, RequestResult, WorkRequest},
     },
+    policy::ExecutionState,
 };
 use std::sync::Mutex;
 
@@ -64,12 +65,14 @@ struct Root {
     attempts: Vec<ServiceWindow>,
     windows: Vec<(ServiceWindow, WindowOutcome)>,
     registrations: usize,
+    objects: Vec<(Family, ObjectKey, Result<(), Error>, ExecutionState)>,
 }
 static ROOT: Mutex<Root> = Mutex::new(Root {
     guards: Vec::new(),
     attempts: Vec::new(),
     windows: Vec::new(),
     registrations: 0,
+    objects: Vec::new(),
 });
 static REGISTER_BUSY: AtomicBool = AtomicBool::new(false);
 static OBSERVE_BUSY: AtomicBool = AtomicBool::new(false);
@@ -108,7 +111,22 @@ pub mod domain_control {
         };
         root.guards[i].register_boundary(boundary, origin, domain_platform::now_ns())?;
         root.registrations += 1;
+        if !root.objects.iter().any(|(family, key, _, _)|
+            *family == Family { domain, kind } && *key == target) {
+            root.objects.push((Family { domain, kind }, target, Ok(()), ExecutionState::Applied));
+        }
         Ok(())
+    }
+    pub fn service_target_retired(domain: u16, kind: u16, target: ObjectKey) -> Result<bool, Error> {
+        let root = ROOT.lock().unwrap();
+        let (_, _, current, execution) = root.objects.iter().find(|(family, key, _, _)|
+            *family == Family { domain, kind } && *key == target).ok_or(Error::NotReady)?;
+        if !execution.terminal() { return Err(Error::Busy); }
+        match current {
+            Ok(()) => Ok(false),
+            Err(Error::Stale | Error::NotFound) => Ok(true),
+            Err(error) => Err(*error),
+        }
     }
     pub fn observe_service_window(window: ServiceWindow) -> Result<WindowOutcome, Error> {
         let mut root = ROOT.lock().unwrap();
@@ -274,6 +292,12 @@ fn entry(target: ObjectKey, start: u64) -> (ServiceWindow, WindowOutcome) {
 }
 fn other_consumer(_: RunKey) -> Result<(), learning_evidence::Error> {
     Ok(())
+}
+fn owner_state(family: Family, target: ObjectKey, current: Result<(), Error>, state: ExecutionState) {
+    let mut root = ROOT.lock().unwrap();
+    let object = root.objects.iter_mut().find(|(f, key, _, _)| *f == family && *key == target).unwrap();
+    object.2 = current;
+    object.3 = state;
 }
 
 // Production modules have one boot-lifetime owner. Keep the whole multi-run
@@ -560,21 +584,83 @@ fn native_windows_bind_real_pool_capture_requests_guard_and_retirement() {
     assert_eq!(control_pool::usage(), Ok(usage)); // no per-run/window allocation or pin leak
     assert_eq!(ROOT.lock().unwrap().windows.len(), 20);
 
+    // Fill the real fixed 32-slot window owner. These root-boundary fixtures
+    // explicitly distinguish a destroyed generation from unavailable ownership
+    // and unresolved execution; no registration is retired merely due to age.
+    let replay_boundary = boundary(service_windows::PENALIZED_P99_NS, 0, 10 * SECOND, 10);
+    for id in 6000..6030 {
+        service_windows::register_replay(SERVICE, key(id), replay_boundary).unwrap();
+    }
+    let mut turnover = ObjectKey { id: 7000, generation: 1 };
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Capacity));
+    owner_state(SERVICE, next_target, Err(Error::Stale), ExecutionState::Unknown);
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    owner_state(SERVICE, next_target, Err(Error::Busy), ExecutionState::Applied);
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    owner_state(SERVICE, next_target, Err(Error::Stale), ExecutionState::Applied);
+
+    // The previous scope is fully consumed and its exact target is dead, but
+    // an active (and later sealed) capture still forbids recycling the slot.
+    let held_requests = requests(56 * SECOND, [10; 10]);
+    start(5, SERVICE, 54 * SECOND, 56 * SECOND, [8; 32], &held_requests);
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    for request in held_requests.iter().copied() {
+        issue(request, Some(RequestResult::Completed { finished_ns: request.arrived_ns + 100 }));
+    }
+    let held_seal = finish_capture(66 * SECOND, false);
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    learning_evidence::retire_exported(held_seal).unwrap();
+    learning_evidence::test_support::with_gate(|| {
+        assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    });
+    let registrations = ROOT.lock().unwrap().registrations;
+    REGISTER_BUSY.store(true, Ordering::Release);
+    assert_eq!(service_windows::register_replay(SERVICE, turnover, replay_boundary), Err(Error::Busy));
+    // A failed replacement did not remove or overwrite the old registration.
+    service_windows::register(next_registration).unwrap();
+    assert_eq!(ROOT.lock().unwrap().registrations, registrations);
+    service_windows::register_replay(SERVICE, turnover, replay_boundary).unwrap();
+    assert_eq!(service_windows::poll(), Ok(false));
+
+    // More than the entire table's capacity in exact-generation turnovers.
+    // The production helper reuses one retired slot while every live object's
+    // immutable origin and sticky service-boundary freeze remain intact.
+    for generation in 2..=45 {
+        owner_state(SERVICE, turnover,
+            Err(if generation % 2 == 0 { Error::Stale } else { Error::NotFound }),
+            ExecutionState::Applied);
+        turnover.generation = generation;
+        service_windows::register_replay(SERVICE, turnover, replay_boundary).unwrap();
+    }
+    service_windows::register(registration).unwrap();
+    assert_eq!(ROOT.lock().unwrap().registrations, registrations + 45);
+    let root = ROOT.lock().unwrap();
+    let live = root.guards.iter().find(|guard| guard.target() == target && guard.family() == (IO.domain, IO.kind)).unwrap();
+    assert_eq!(live.boundary(), Some(registration.boundary));
+    assert_eq!(live.window_origin_ns(), Some(registration.origin_ns));
+    assert_eq!(live.freeze_reason(), Some(FreezeReason::ServiceBoundary));
+    drop(root);
+    assert_eq!(control_pool::usage(), Ok(usage));
+    owner_state(SERVICE, turnover, Err(Error::Stale), ExecutionState::Applied);
+
     // First/observation/family can all match while the frozen workload hash
     // differs. Such a run must neither supply a window nor inherit the bound
     // scope's retirement obligation. This also covers an explicit third
     // metric registration without making an invented successful observation.
     let hash_target = key(301);
+    let hash_first = domain_platform::now_ns() + 2 * SECOND;
+    let hash_observation = hash_first + 2 * SECOND;
+    let hash_end = hash_observation + OBSERVATION_NS;
     service_windows::register(service_windows::Registration {
         family: SERVICE,
         target: hash_target,
         boundary: boundary(service_windows::COMPLETED_P99_NS, 0, 500, 1),
-        origin_ns: 62 * SECOND,
+        origin_ns: hash_observation,
     })
     .unwrap();
-    service_windows::prepare(SERVICE, hash_target, [6; 32], 60 * SECOND, 62 * SECOND).unwrap();
-    let mismatched = requests(62 * SECOND, [10; 10]);
-    start(4, SERVICE, 60 * SECOND, 62 * SECOND, [7; 32], &mismatched);
+    service_windows::prepare(SERVICE, hash_target, [6; 32], hash_first, hash_observation).unwrap();
+    let mismatched = requests(hash_observation, [10; 10]);
+    start(6, SERVICE, hash_first, hash_observation, [7; 32], &mismatched);
     for request in mismatched.iter().copied() {
         issue(
             request,
@@ -583,9 +669,29 @@ fn native_windows_bind_real_pool_capture_requests_guard_and_retirement() {
             }),
         );
     }
-    let mismatched_seal = finish_capture(72 * SECOND, false);
+    let mismatched_seal = finish_capture(hash_end, false);
     assert_eq!(service_windows::poll(), Err(Error::Stale));
     assert_eq!(ROOT.lock().unwrap().windows.len(), 20);
     learning_evidence::retire_exported(mismatched_seal).unwrap();
     assert_eq!(control_pool::usage(), Ok(usage));
+
+    // The native producer registers long after boot. A zero origin is stale;
+    // its replay helper must choose a real future origin once and retain it.
+    let replay_target = key(401);
+    // Even a proven-dead generation cannot be recycled while its bound scope
+    // has unconsumed windows. An unrelated capture's retirement is no proof.
+    owner_state(SERVICE, hash_target, Err(Error::NotFound), ExecutionState::Applied);
+    assert_eq!(learning_evidence::current_config().unwrap(), None);
+    assert_eq!(service_windows::register_replay(SERVICE, replay_target, replay_boundary), Err(Error::Busy));
+    owner_state(SERVICE, key(6000), Err(Error::Stale), ExecutionState::Applied);
+    service_windows::register_replay(SERVICE, replay_target, replay_boundary).unwrap();
+    service_windows::register(service_windows::Registration { family: SERVICE,
+        target: replay_target, boundary: replay_boundary, origin_ns: hash_end + SECOND }).unwrap();
+    domain_platform::set(hash_end + 2 * SECOND);
+    service_windows::register_replay(SERVICE, replay_target, replay_boundary).unwrap();
+    let changed = Boundary { maximum: 9 * SECOND, ..replay_boundary };
+    assert_eq!(service_windows::register_replay(SERVICE, replay_target, changed), Err(Error::Conflict));
+    owner_state(SERVICE, key(6001), Err(Error::Stale), ExecutionState::Applied);
+    assert_eq!(service_windows::register(service_windows::Registration { family: SERVICE,
+        target: key(402), boundary: replay_boundary, origin_ns: 0 }), Err(Error::Stale));
 }

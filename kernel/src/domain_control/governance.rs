@@ -132,13 +132,16 @@ fn candidates_into(output: &mut MaybeUninit<CandidateSet>, state: &mut State, f:
         }
     }
     legal[..count].sort_unstable_by_key(|a| a.map(Action::order));
-    let previous = legal[..count].iter().position(|a| *a == Some(current)).ok_or(DomainError::Stale)?;
+    if current != Action::OfferCpu(0) && !legal[..count].iter().any(|a| *a == Some(current)) {
+        return Err(DomainError::Stale);
+    }
     let hold = if matches!(current, Action::ControlSet(_) | Action::UnauthRate(_)) { 1_000_000_000 } else { WINDOW_NS };
     let held = at.saturating_sub(guard.last_change_ns()) >= hold;
     let queued = queued_control_wcet_us(state, family_index(f.domain, f.kind)?, at);
     let mut choices = [Candidate { action: current, features: RawFeatures::default() }; 32]; let mut used = 0;
-    for (i, action) in legal[..count].iter().flatten().copied().enumerate() {
-        if action != current && (guard.frozen() || !categorical(action) && (!held || i.abs_diff(previous) > 1)) { continue; }
+    for action in legal[..count].iter().flatten().copied() {
+        if action != current && (guard.frozen() || !categorical(action) && (!held
+            || !cyxia_prototype::domains::stability::adjacent(current, action, &legal[..count])?)) { continue; }
         let mut target_features = (f.target_features)(action, target)?;
         if let Action::ControlSet(mask) = action {
             let cores = u64::from(mask.count_ones()); if cores == 0 { return Err(DomainError::Range); }
@@ -315,6 +318,7 @@ impl GovernanceAuthority for Authority<'_> {
 }
 pub fn begin_canary(governance: &mut Governance<'_, '_>) -> Result<CanaryPermit, Error> {
     control(|state| {
+        if !super::replay::model_change_allowed() { return Err(Error::Unknown); }
         consistent(state, governance)?;
         let target = crate::domain_services::canary_target().map_err(native_error)?;
         let auth = Authority { owner: &state.owner, checks: state.governance_jobs.checks, restoration: state.governance_jobs.restoration, publication: None };
@@ -406,6 +410,12 @@ pub fn observe_second(governance: &mut Governance<'_, '_>, second: u16, baseline
     control(|state| {
         let auth = Authority { owner: &state.owner, checks: state.governance_jobs.checks, restoration: state.governance_jobs.restoration, publication: None };
         governance.observe_second(state.model_gate.as_mut().ok_or(Error::State)?, second, baseline, candidate, workspace, &auth)
+    })
+}
+pub fn observe_second_bounded(governance: &mut Governance<'_, '_>, second: u16, baseline: &[WorkRequest], candidate: &[WorkRequest], latencies: &mut [u64]) -> Result<(), Error> {
+    control(|state| {
+        let auth = Authority { owner: &state.owner, checks: state.governance_jobs.checks, restoration: state.governance_jobs.restoration, publication: None };
+        governance.observe_second_bounded(state.model_gate.as_mut().ok_or(Error::State)?, second, baseline, candidate, latencies, &auth)
     })
 }
 pub fn extend(governance: &mut Governance<'_, '_>, windows: u16) -> Result<(), Error> {

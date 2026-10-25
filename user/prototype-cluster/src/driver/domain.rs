@@ -8,16 +8,18 @@ use cyxia_prototype_cluster::{
     domain_ingress::{accept_placement_policy, policy_stamp, receipt},
     domain_placement::{self as journal, QuoteWire, Record},
 };
+#[path = "application.rs"]
+mod application;
 
 struct Payload {
     request: PlacementRequest,
     bytes: Vec<u8>,
 }
 #[derive(Clone, Copy)]
-struct PeerQuote {
-    wire: QuoteWire,
-    expires_ms: u64,
-    received_ms: u64,
+pub(super) struct PeerQuote {
+    pub(super) wire: QuoteWire,
+    pub(super) expires_ms: u64,
+    pub(super) received_ms: u64,
     rtt_us: u64,
 }
 #[derive(Clone, Copy)]
@@ -26,18 +28,22 @@ struct IssuedQuote {
     quote: CpuQuote,
 }
 pub(super) struct NativeDomains {
-    queue: &'static mut PlacementQueue,
+    pub(super) queue: &'static mut PlacementQueue,
     payloads: Vec<Payload>,
     quote: QuotePolicy,
+    quote_stop: cyxia_prototype_cluster::quote_stop::Owner,
     offer: PolicyWire,
     placement: PolicyWire,
     offer_receipt: PolicyReceiptWire,
     placement_receipt: PolicyReceiptWire,
-    peer: Option<PeerQuote>,
+    pub(super) peer: Option<PeerQuote>,
     quote_inflight: Option<([u8; 16], u64)>,
     last_quote_ms: u64,
     next_offer: u64,
     issued: [Option<IssuedQuote>; 64],
+    applications: Vec<application::Binding>,
+    incoming: Option<application::Incoming>,
+    application_cursor: usize,
 }
 impl NativeDomains {
     pub(super) fn new(queue: &'static mut PlacementQueue) -> Self {
@@ -45,6 +51,7 @@ impl NativeDomains {
             queue,
             payloads: Vec::new(),
             quote: QuotePolicy::new(),
+            quote_stop: cyxia_prototype_cluster::quote_stop::Owner::new(),
             offer: PolicyWire::default(),
             placement: PolicyWire::default(),
             offer_receipt: PolicyReceiptWire::default(),
@@ -54,6 +61,9 @@ impl NativeDomains {
             last_quote_ms: 0,
             next_offer: 0,
             issued: [None; 64],
+            applications: Vec::new(),
+            incoming: None,
+            application_cursor: 0,
         }
     }
     pub(super) fn recover(&mut self, bytes: &[u8]) -> Result<(), ()> {
@@ -118,7 +128,16 @@ impl NativeDomains {
             );
             if result.is_ok() {
                 self.offer = p;
+                self.quote_stop.installed(p.version);
             }
+        }
+        // Process after the current offer, so replaying that same wire cannot
+        // reopen publication. Outstanding quote promises keep their own TTL.
+        self.quote_stop.apply(input.quote_stop, boot, self.offer.version, now);
+        if self.quote_stop.stopped() && self.offer_receipt.outcome == DOMAIN_PENDING
+            && self.offer_receipt.version != 0
+        {
+            self.offer_receipt.outcome = DOMAIN_REJECTED;
         }
         if self.offer.version != 0
             && self.offer_receipt.outcome == DOMAIN_PENDING
@@ -277,6 +296,18 @@ impl Backend<'_> {
 }
 impl PlacementBackend for Backend<'_> {
     fn persist_intent(&mut self, intent: PlacementIntent) -> PlacementDurability {
+        if intent.choice == PlacementChoice::Peer {
+            let mut binding = intent.request.key.id.to_le_bytes().to_vec();
+            binding.extend_from_slice(&intent.request.key.generation.to_le_bytes());
+            binding.extend_from_slice(&contract_id(intent, self.driver.engine.cluster(), self.driver.engine.local));
+            binding.extend_from_slice(&intent.request.payload_hash); binding.extend_from_slice(&intent.request.package_hash);
+            match broker::request(OP_TASK, &binding, &mut [], 0, [30, 0, 0]) {
+                Ok((0, _)) | Err(NOT_FOUND) => {},
+                // No journal append or external task admission has happened.
+                // Retry this same immutable intent after the signed bind ack.
+                _ => return PlacementDurability::NotCommitted,
+            }
+        }
         let Ok(bytes) = self.record(intent) else {
             return PlacementDurability::NotCommitted;
         };
@@ -328,7 +359,8 @@ impl PlacementBackend for Backend<'_> {
         let mut response = [0; 24];
         match broker::request(OP_TASK, &request, &mut response, 0, [11, 0, 0]) {
             Ok((n, _)) => local_result(&response[..n.min(24)]),
-            Err(AGAIN | REJECTED) => PlacementAdmission::Rejected(DomainError::Again),
+            Err(AGAIN) => PlacementAdmission::Retry,
+            Err(REJECTED) => PlacementAdmission::Rejected(DomainError::Again),
             _ => PlacementAdmission::Unknown,
         }
     }
@@ -395,7 +427,7 @@ impl PlacementBackend for Backend<'_> {
             PlacementChoice::Local => match self.query_local(intent) {
                 PlacementAdmission::Admitted(k) => Some(PlacementOutcome::Local(k)),
                 PlacementAdmission::Rejected(e) => Some(PlacementOutcome::Rejected(e)),
-                PlacementAdmission::Unknown => None,
+                PlacementAdmission::Retry | PlacementAdmission::Unknown => None,
             },
             PlacementChoice::Peer => {
                 let id = contract_id(
@@ -545,6 +577,8 @@ impl Driver {
         if self.native.is_none() {
             return Ok(());
         }
+        self.application_tick(now_ns)?;
+        let now_ns = broker::clock_ns().max(now_ns);
         if self.engine.local < self.engine.peer
             && !self.done
             && self.native.as_ref().unwrap().queue.retained_count() == 0
@@ -569,7 +603,9 @@ impl Driver {
             native.queue.poll(now_ns, 4, &mut backend)
         };
         native.update_receipt();
+        let status = native.publish_application_status();
         self.native = Some(native);
+        status?;
         result.map(|_| ()).map_err(|_| ())
     }
     pub fn domain_feedback(&self, now_ns: u64) -> DomainFeedback {
@@ -578,6 +614,8 @@ impl Driver {
             return f;
         };
         f.offer = n.offer_receipt;
+        f.quote_stop = n.quote_stop.receipt();
+        f.quotes_stopped = u64::from(n.quote_stop.stopped());
         f.placement = n.placement_receipt;
         f.pending_placements = n.queue.pending_count() as u64;
         f.placement_fallbacks = n.queue.fallbacks;
@@ -758,7 +796,9 @@ impl Driver {
                     .map_err(|_| DomainError::Io)
             }
         }
-        let candidate = if slot.is_some() {
+        let candidate = if native.quote_stop.stopped() {
+            Err(DomainError::Busy)
+        } else if slot.is_some() {
             native.next_offer = next;
             native.quote.publish(
                 now_ns,
@@ -844,6 +884,10 @@ impl Driver {
             return Err(());
         }
         if !self.native_started.contains(&key) {
+            // A persisted terminal result already certifies custody. Retire
+            // only those entries, never a STARTED/unknown obligation.
+            self.native_started.retain(|old| !self.engine.results.iter().any(|r|
+                r.received && r.key == *old && r.state != TaskState::Started));
             if self.native_started.len() >= 32 {
                 return Err(());
             }

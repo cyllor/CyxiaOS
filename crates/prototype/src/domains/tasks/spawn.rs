@@ -27,13 +27,17 @@ pub enum CreateOutcome {
     Created(ObjectKey),
     Rejected(Error),
     Uncertain,
+    /// A fresh construction attempt acquired no task, scheduler, memory, or
+    /// capability custody. The original queued request may wait and reauthorize.
+    Deferred,
 }
 pub trait TaskBackend {
     /// Includes registered-package and recovery-authority checks. Runs before a
     /// receipt is admitted, and again immediately before actual construction.
     fn authorize(&mut self, request: &SpawnRequest) -> Result<(), Error>;
-    /// Rejected certifies that no task or resource ownership remains. A backend
-    /// which cannot establish this must return Uncertain, never retry creation.
+    /// Rejected certifies that no task or resource ownership remains. Deferred
+    /// certifies that this attempt never acquired any such ownership. A backend
+    /// which cannot establish either must return Uncertain, never retry creation.
     fn create(&mut self, request: &SpawnRequest) -> CreateOutcome;
 }
 #[derive(Clone, Copy)]
@@ -324,17 +328,32 @@ impl SpawnAdmission {
         let r = self.receipts[i].as_mut().ok_or(Error::Stale)?;
         r.state = SpawnState::Unknown;
         r.occupied = true;
+        let outcome = backend.create(&request);
+        if outcome == CreateOutcome::Deferred {
+            // Only this synchronous no-custody outcome may undo the placeholder.
+            // No construction token was used. Keep the original submission,
+            // request, FIFO sequence, and external deadline intact.
+            r.state = SpawnState::Queued;
+            r.occupied = false;
+            if request.recovery {
+                group.recovery_used -= 1;
+            } else {
+                group.used -= 1;
+            }
+            return Ok(Some((request, SpawnState::Queued)));
+        }
         self.stats.wait_ns = self
             .stats
             .wait_ns
             .saturating_add(now.saturating_sub(r.submitted));
-        let outcome = backend.create(&request);
         let state = self.finish(i, outcome)?;
         Ok(Some((request, state)))
     }
     fn finish(&mut self, i: usize, outcome: CreateOutcome) -> Result<SpawnState, Error> {
         let r = self.receipts[i].as_mut().ok_or(Error::Stale)?;
         match outcome {
+            // An asynchronous/unknown attempt cannot prove that it never began.
+            CreateOutcome::Deferred => return Err(Error::Conflict),
             CreateOutcome::Created(key) => {
                 if valid_key(key).is_err() {
                     return Ok(SpawnState::Unknown);
@@ -389,6 +408,27 @@ impl SpawnAdmission {
             .flatten()
             .filter(|r| r.request.group == key && r.state == SpawnState::Queued)
             .count())
+    }
+    /// Retire receipts only after the protected caller generation has closed
+    /// admission and acknowledged every terminal result. The caller owner must
+    /// never authorize this generation again. Live/uncertain custody blocks the
+    /// whole operation; no partial purge can hide an unresolved task.
+    pub fn retire_closed_caller(&mut self, caller: ObjectKey) -> Result<usize, Error> {
+        valid_key(caller)?;
+        if self.receipts.iter().flatten().any(|r| {
+            r.request.caller == caller
+                && (r.occupied || matches!(r.state, SpawnState::Queued | SpawnState::Unknown))
+        }) {
+            return Err(Error::Busy);
+        }
+        let mut count = 0;
+        for r in &mut self.receipts {
+            if r.is_some_and(|r| r.request.caller == caller) {
+                *r = None;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
     pub fn stats(&self) -> SpawnStats {
         let mut stats = self.stats;

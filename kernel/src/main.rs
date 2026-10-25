@@ -75,6 +75,16 @@ mod learning_history;
 #[cfg(feature = "unified-runtime")]
 mod learning_session;
 #[cfg(feature = "unified-runtime")]
+mod learning_canary;
+#[cfg(feature = "unified-runtime")]
+mod learning_replay;
+#[cfg(feature = "unified-runtime")]
+mod learning_workload;
+#[cfg(feature = "unified-runtime")]
+mod learning_prewarm;
+#[cfg(feature = "unified-runtime")]
+mod peer_replay;
+#[cfg(feature = "unified-runtime")]
 mod service_windows;
 #[cfg(feature = "unified-runtime")]
 mod model_bank;

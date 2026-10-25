@@ -146,6 +146,9 @@ pub enum PlacementDurability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlacementAdmission {
     Admitted(ObjectKey),
+    /// Explicitly not accepted: no execution or resource obligation exists.
+    /// Retry the same durable intent; UNKNOWN never carries this permission.
+    Retry,
     Rejected(Error),
     Unknown,
 }
@@ -206,6 +209,7 @@ enum Phase {
     Deferred,
     Intent,
     IntentUnknown,
+    Admission,
     ExecutionUnknown,
     Receipt,
 }
@@ -262,6 +266,16 @@ impl<const H: usize> PlacementQueue<H> {
         request: PlacementRequest,
         now: u64,
     ) -> Result<PlacementStatus, Error> {
+        self.submit_at(request, now, now)
+    }
+    /// Transport handoff cannot renew the application's original four-second
+    /// placement deadline. Existing exact requests still return their state.
+    pub fn submit_at(
+        &mut self,
+        request: PlacementRequest,
+        submitted_ns: u64,
+        now: u64,
+    ) -> Result<PlacementStatus, Error> {
         request.validate()?;
         self.time(now)?;
         if let Some(h) = self.history_index(request.key) {
@@ -270,7 +284,8 @@ impl<const H: usize> PlacementQueue<H> {
             }
             return self.status(request.key);
         }
-        let deadline = now
+        if submitted_ns > now { return Err(Error::Range); }
+        let deadline = submitted_ns
             .checked_add(PLACEMENT_TIMEOUT_NS)
             .ok_or(Error::Overflow)?;
         let p = self
@@ -290,7 +305,7 @@ impl<const H: usize> PlacementQueue<H> {
         });
         self.pending[p] = Some(Pending {
             history: h,
-            created: now,
+            created: submitted_ns,
             deadline,
             phase: Phase::Waiting,
             last_apply: None,
@@ -422,37 +437,7 @@ impl<const H: usize> PlacementQueue<H> {
                     backend.intent_status(intent)
                 };
                 match durable {
-                    PlacementDurability::Committed => {
-                        // Publish UNKNOWN before calling either admission gate.
-                        // A lost reply cannot drive this branch a second time.
-                        pending.phase = Phase::ExecutionUnknown;
-                        self.pending[p] = Some(pending);
-                        let admitted = match intent.choice {
-                            PlacementChoice::Local => backend.local_admit(intent),
-                            PlacementChoice::Peer if backend.peer_ready(intent.request) => {
-                                backend.peer_prepare(intent)
-                            }
-                            PlacementChoice::Peer => PlacementAdmission::Rejected(Error::NotReady),
-                            PlacementChoice::Defer => return Err(Error::Conflict),
-                        };
-                        pending.outcome = match admitted {
-                            PlacementAdmission::Admitted(key) => {
-                                Some(if intent.choice == PlacementChoice::Local {
-                                    PlacementOutcome::Local(key)
-                                } else {
-                                    PlacementOutcome::Peer {
-                                        node: intent.request.peer.ok_or(Error::Auth)?,
-                                        contract: key,
-                                    }
-                                })
-                            }
-                            PlacementAdmission::Rejected(e) => Some(PlacementOutcome::Rejected(e)),
-                            PlacementAdmission::Unknown => None,
-                        };
-                        if pending.outcome.is_some() {
-                            pending.phase = Phase::Receipt;
-                        }
-                    }
+                    PlacementDurability::Committed => pending.phase = Phase::Admission,
                     PlacementDurability::NotCommitted => pending.phase = Phase::Intent,
                     PlacementDurability::Unknown => pending.phase = Phase::IntentUnknown,
                 }
@@ -461,6 +446,37 @@ impl<const H: usize> PlacementQueue<H> {
                 if pending.outcome.is_some() {
                     pending.phase = Phase::Receipt;
                 }
+            }
+            if pending.phase == Phase::Admission {
+                // Publish UNKNOWN before admission. Only the backend's
+                // explicit no-custody Retry can reopen this phase; a lost
+                // reply and recovered intent remain query-only forever.
+                pending.phase = Phase::ExecutionUnknown;
+                self.pending[p] = Some(pending);
+                let admitted = match intent.choice {
+                    PlacementChoice::Local => backend.local_admit(intent),
+                    PlacementChoice::Peer if backend.peer_ready(intent.request) => {
+                        backend.peer_prepare(intent)
+                    }
+                    PlacementChoice::Peer => PlacementAdmission::Rejected(Error::NotReady),
+                    PlacementChoice::Defer => return Err(Error::Conflict),
+                };
+                pending.outcome = match admitted {
+                    PlacementAdmission::Admitted(key) => {
+                        Some(if intent.choice == PlacementChoice::Local {
+                            PlacementOutcome::Local(key)
+                        } else {
+                            PlacementOutcome::Peer {
+                                node: intent.request.peer.ok_or(Error::Auth)?,
+                                contract: key,
+                            }
+                        })
+                    }
+                    PlacementAdmission::Retry => { pending.phase = Phase::Admission; None }
+                    PlacementAdmission::Rejected(error) => Some(PlacementOutcome::Rejected(error)),
+                    PlacementAdmission::Unknown => None,
+                };
+                if pending.outcome.is_some() { pending.phase = Phase::Receipt; }
             }
             if pending.phase == Phase::Receipt {
                 let outcome = pending.outcome.ok_or(Error::Conflict)?;

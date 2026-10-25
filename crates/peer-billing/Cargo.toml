@@ -1,0 +1,9 @@
+[package]
+name = "cyxia-peer-billing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+cyxia-prototype = { path = "../prototype" }

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, CONTROL_POOL_MAGIC, LEARNING_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_control_pool, parse_learning, parse_ipi, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
 from verify_domains import RECONNECT_OUTAGE_NS, ReconnectProbe, run
+from verify_domains import REPLAY_MAGIC, capture, parse_replay, refresh_snapshot, replay_ready
 
 
 def encode(values):
@@ -24,6 +25,180 @@ def control():
 
 
 class EvidenceParserTests(unittest.TestCase):
+    def snapshot(self, *, returns=100, jobs=1, phase=3, generation=0, overrun=False):
+        unified = [0] * 512
+        unified[:3] = [UNIFIED_MAGIC, 7, returns]
+        unified[6] = 3
+        unified[16:21] = [1, 4096, 4, 0, 0]
+        unified[32:38:2] = [1, 2, 3]
+        ctl = control()
+        ctl[4] = jobs
+        task = [0] * 32
+        task[:4] = [0x43595441534B0001, 3_809_301_008, int(overrun), int(overrun)]
+        replay = [0] * 64
+        replay[:10] = [2, REPLAY_MAGIC, phase, 1, 1, 0, 2, 1, 7, generation]
+        if generation:
+            replay[14:16] = [3_805_891_984, 9_805_891_984]
+        return {"UNIFIED_EVIDENCE": encode(unified), "DOMAIN_CONTROL_EVIDENCE": encode(ctl),
+                "DOMAIN_TASK_EVIDENCE": encode(task), "REPLAY_V13_EVIDENCE": encode(replay)}
+
+    def test_final_fault_snapshot_keeps_new_replay_and_raw_without_old_healthy_fields(self):
+        guest = {}
+        refresh_snapshot(guest, self.snapshot())
+        self.assertEqual(guest["tasks"]["overruns"], 0)
+        self.assertEqual(guest["replay"]["phase"], 3)
+        latest = self.snapshot(returns=2036, jobs=2, phase=4, generation=1, overrun=True)
+        sticky = [0] * 32
+        sticky[:12] = [0x43594F5645520001, 1, 76159, 257, 1, 2_500_000,
+                       3_411_680, 3_805_887_472, 3_809_301_008, 38, 1, 0]
+        latest["TASK_OVERRUN_EVIDENCE"] = encode(sticky)
+
+        class Qmp:
+            def __init__(self, memory):
+                self.memory, self.calls = memory, []
+
+            def execute(self, command, arguments=None):
+                self.calls.append(command)
+                if command == "pmemsave":
+                    data = self.memory[arguments["val"]]
+                    self.assert_size(arguments["size"], len(data))
+                    Path(arguments["filename"]).write_bytes(data)
+
+            @staticmethod
+            def assert_size(expected, actual):
+                if expected != actual:
+                    raise AssertionError("fixture memory size mismatch")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            guest["folder"] = Path(temporary)
+            guest["locations"] = {name: {"pa": i * 0x100000, "size": len(data)}
+                                  for i, (name, data) in enumerate(latest.items(), 1)}
+            guest["qmp"] = Qmp({guest["locations"][name]["pa"]: data for name, data in latest.items()})
+            bundle, = capture([guest], resume=False)
+            with self.assertRaisesRegex(ValueError, "overrun/quarantine: mask=1 overruns=1"):
+                refresh_snapshot(guest, bundle)
+            self.assertEqual(guest["qmp"].calls[0], "stop")
+            self.assertNotIn("cont", guest["qmp"].calls)
+            for name, data in latest.items():
+                self.assertEqual((guest["folder"] / (name + ".bin")).read_bytes(), data)
+        self.assertIsNone(guest["tasks"], "failed task parse must not leave the older zero-overrun result")
+        self.assertEqual(guest["task_evidence"][2:4], [1, 1])
+        self.assertEqual(guest["overrun_evidence"], sticky)
+        self.assertEqual(guest["unified"]["el0_returns"], 2036)
+        self.assertEqual(guest["control"]["jobs"], 2)
+        self.assertEqual(guest["replay"]["phase"], 4)
+        self.assertEqual(guest["replay"]["capture_generation"], 1)
+        self.assertEqual(guest["replay"]["first_ns"], 3_805_891_984)
+        self.assertEqual([e["field"] for e in guest["diagnostic_errors"]], ["tasks", "overrun_evidence"])
+
+    def test_invalid_unified_does_not_hide_new_control_or_supply_an_old_boot_identity(self):
+        guest = {}
+        refresh_snapshot(guest, self.snapshot())
+        latest = self.snapshot(returns=200, jobs=3, phase=4, generation=1)
+        bad_unified = list(struct.unpack("<512Q", latest["UNIFIED_EVIDENCE"]))
+        bad_unified[15] = 37
+        latest["UNIFIED_EVIDENCE"] = encode(bad_unified)
+        new_control = control()
+        new_control[2], new_control[4] = 8, 3
+        latest["DOMAIN_CONTROL_EVIDENCE"] = encode(new_control)
+        with self.assertRaisesRegex(ValueError, "native fatal code 37"):
+            refresh_snapshot(guest, latest)
+        self.assertIsNone(guest["unified"])
+        self.assertEqual(guest["unified_words"][15], 37)
+        self.assertEqual((guest["control"]["boot_epoch"], guest["control"]["jobs"]), (8, 3))
+        self.assertEqual(guest["replay"]["phase"], 4)
+        self.assertEqual([e["field"] for e in guest["diagnostic_errors"]], ["unified"])
+
+    def test_root_failure_diagnostic_survives_other_fault_and_is_never_an_acceptance_gate(self):
+        guest = {"replay_root_evidence": [999] * 32, "replay_owner_evidence": [999] * 32,
+                 "replay_config_evidence": [999] * 32, "replay_capture_evidence": [999] * 32,
+                 "local_placement_evidence": [999] * 32}
+        latest = self.snapshot(overrun=True)
+        root = list(range(32))
+        owner = list(reversed(range(32)))
+        placement = [2 * n for n in range(32)]
+        configuration = [3 * n for n in range(32)]
+        capture_loss = [4 * n for n in range(32)]
+        latest["REPLAY_ROOT_EVIDENCE"] = encode(root)
+        latest["REPLAY_OWNER_EVIDENCE"] = encode(owner)
+        latest["LOCAL_PLACEMENT_EVIDENCE"] = encode(placement)
+        latest["REPLAY_CONFIG_EVIDENCE"] = encode(configuration)
+        latest["REPLAY_CAPTURE_EVIDENCE"] = encode(capture_loss)
+        with self.assertRaisesRegex(ValueError, "overrun/quarantine"):
+            refresh_snapshot(guest, latest)
+        self.assertEqual(guest["replay_root_evidence"], root)
+        self.assertEqual(guest["replay_owner_evidence"], owner)
+        self.assertEqual(guest["local_placement_evidence"], placement)
+        self.assertEqual(guest["replay_config_evidence"], configuration)
+        self.assertEqual(guest["replay_capture_evidence"], capture_loss)
+        self.assertFalse(replay_ready(guest["replay"], 1))
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest["replay_root_evidence"])
+        self.assertIsNone(guest["replay_owner_evidence"])
+        self.assertIsNone(guest["local_placement_evidence"])
+        self.assertIsNone(guest["replay_config_evidence"])
+        self.assertIsNone(guest["replay_capture_evidence"])
+
+    def test_independent_parser_faults_all_refresh_and_incomplete_optional_fields_clear(self):
+        guest = {"runtime": {"old": True}, "learning": {"old": True}, "panic_evidence": [99]}
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest["runtime"])
+        self.assertIsNone(guest["learning"])
+        self.assertIsNone(guest["panic_evidence"])
+        latest = self.snapshot(returns=300, jobs=4, overrun=True)
+        partial = list(struct.unpack("<64Q", latest["REPLAY_V13_EVIDENCE"]))
+        partial[0] = 3
+        latest["REPLAY_V13_EVIDENCE"] = encode(partial)
+        bad_control = control()
+        bad_control[25] = 9
+        latest["DOMAIN_CONTROL_EVIDENCE"] = encode(bad_control)
+        latest["PANIC_EVIDENCE"] = encode([1] + [0] * 7)
+        with self.assertRaisesRegex(ValueError, "overrun/quarantine"):
+            refresh_snapshot(guest, latest)
+        self.assertIsNone(guest["tasks"])
+        self.assertIsNone(guest["control"])
+        self.assertIsNone(guest["replay"], "odd seqlock cannot retain a prior accepted replay snapshot")
+        self.assertEqual(guest["unified"]["el0_returns"], 300)
+        self.assertEqual([e["field"] for e in guest["diagnostic_errors"]], ["tasks", "panic_evidence", "control"])
+
+    def test_preparation_cleanup_has_no_capture_or_accepted_pair(self):
+        values = [0] * 64
+        values[0:8] = [2, REPLAY_MAGIC, 23, 1, 2, 0, 1, 2]
+        values[8] = 7
+        parsed = parse_replay(encode(values))
+        self.assertEqual(parsed["phase"], 23)
+        self.assertEqual(parsed["boot_epoch"], 7)
+        self.assertEqual(parsed["capture_generation"], 0)
+        self.assertFalse(replay_ready(parsed, 1))
+        values[2] = 24
+        with self.assertRaisesRegex(ValueError, "invalid native replay state"):
+            parse_replay(encode(values))
+
+    def test_native_pair_gate_needs_both_actual_sides_and_durable_archives(self):
+        values = [0] * 64
+        values[0:8] = [2, REPLAY_MAGIC, 5, 1, 1, 0, 1, 2]
+        values[10] = 1
+        values[17] = 1
+        values[19] = 1
+        values[24] = 1
+        result = parse_replay(encode(values))
+        self.assertFalse(replay_ready(result, 1))
+        values[10] = values[17] = 2
+        self.assertTrue(replay_ready(parse_replay(encode(values)), 1))
+        self.assertFalse(replay_ready(parse_replay(encode(values)), 2))
+        values[17] = 1
+        with self.assertRaisesRegex(ValueError, "before durable archive"):
+            parse_replay(encode(values))
+
+    def test_partial_replay_snapshot_and_unmatched_label_count_are_not_evidence(self):
+        values = [0] * 64
+        values[0:8] = [3, REPLAY_MAGIC, 5, 1, 1, 0, 1, 2]
+        self.assertIsNone(parse_replay(encode(values)))
+        values[0] = 4
+        values[19] = 1
+        with self.assertRaisesRegex(ValueError, "label count mismatch"):
+            parse_replay(encode(values))
+
     def source_build(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

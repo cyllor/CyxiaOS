@@ -51,3 +51,39 @@ fn truncation_suffixes_unknown_versions_and_header_corruption_are_rejected() {
         assert!(!identity::initial_identity_allowed(0, 0, &record(version)));
     }
 }
+
+#[test]
+fn journal_append_namespaces_cannot_bypass_initial_identity_or_replace_it() {
+    for key in [0, 1, u64::MAX] {
+        for bytes in [b"CXAPP1".as_slice(), b"CXDP2", b"CXE1", b"other"] {
+            assert!(!identity::append_allowed(key, 0, bytes));
+        }
+        for version in [b"CXID1", b"CXID2", b"CXID3"] {
+            let bytes = record(version);
+            for used in [1, 101, u64::MAX] {
+                assert!(!identity::append_allowed(key, used, &bytes));
+                assert!(!identity::append_allowed(key, used, &bytes[..5]));
+                let mut extended = bytes.to_vec();
+                extended.push(0);
+                assert!(!identity::append_allowed(key, used, &extended));
+            }
+        }
+    }
+    for version in [b"CXID1", b"CXID2"] {
+        assert!(identity::append_allowed(0, 0, &record(version)));
+        assert!(!identity::append_allowed(1, 0, &record(version)));
+    }
+}
+
+#[test]
+fn initialized_volume_admits_unsequenced_application_and_placement_journals_only() {
+    // This is only the broker's namespace gate. Driver host tests supply actual
+    // encoded records and require durable input/intent before LOCAL admission.
+    for bytes in [b"CXAPP1".as_slice(), b"CXDP2"] {
+        assert!(identity::append_allowed(0, 101, bytes));
+    }
+    for bytes in [b"CXAPP0".as_slice(), b"CXAPP2", b"CXDP1", b"CXDP3", b"CXE1", b"other", b""] {
+        assert!(!identity::append_allowed(0, 101, bytes));
+    }
+    assert!(identity::append_allowed(1, 101, b"CXE1"));
+}

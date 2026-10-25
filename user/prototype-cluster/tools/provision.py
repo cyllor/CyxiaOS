@@ -26,3 +26,5 @@ with tempfile.TemporaryDirectory() as temp:
         for path in node.iterdir():
             os.chmod(path, 0o600)
         print(name, "NodeID=" + (node / "local.pin").read_bytes().hex())
+from provision_billing import provision
+provision(root)

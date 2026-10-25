@@ -9,6 +9,21 @@ use cyxia_prototype::{
 };
 mod dependencies;
 mod placement_legal;
+mod requests;
+mod quote_stop;
+pub mod replay;
+pub use quote_stop::{baseline_stop_custody, baseline_stop_quotes};
+pub use requests::{submit as submit_placement_request, status as placement_request_status};
+
+pub fn application_request(phase: u64, payload: &mut [u8; 4096], len: usize) -> (u64, usize, u64) {
+    owner();
+    match requests::broker(phase, payload, len) {
+        Ok(bytes) => (abi::OK, bytes, 0),
+        Err(Error::Busy | Error::Again | Error::NotReady) => (abi::AGAIN, 0, 0),
+        Err(Error::Stale | Error::NotFound) => (abi::NOT_FOUND, 0, 0),
+        Err(_) => (abi::FAILED, 0, 0),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Desired {
@@ -29,12 +44,22 @@ static READ_VIEW: crate::domain_platform::read_snapshot::ReadSnapshot<ReadView> 
     crate::domain_platform::read_snapshot::ReadSnapshot::new();
 fn owner_view() -> ReadView {
     owner();
+    let mut feedback = unsafe { *core::ptr::addr_of!(FEEDBACK) };
+    if let Some(key) = replay::advertised() {
+        if !feedback.waiting.iter().any(|v| v.request_id == key.id && v.request_generation == key.generation) {
+            if let Some(row) = feedback.waiting.iter_mut().find(|v| v.request_generation == 0) {
+                *row = abi::PendingPlacementWire { request_id: key.id, request_generation: key.generation,
+                    queued_us: 0, cpu_milli: 100, memory_pages: 16,
+                    peer_ready: u64::from(feedback.measurement_valid & 4 != 0 && feedback.peer_cpu_milli >= 100 && feedback.peer_memory_pages >= 16) };
+            }
+        }
+    }
     ReadView {
         published_ns: crate::domain_platform::now_ns(),
         ready: READY.load(Ordering::Acquire),
         network: unsafe { *core::ptr::addr_of!(NETWORK) },
         effective: unsafe { *core::ptr::addr_of!(EFFECTIVE) },
-        feedback: unsafe { *core::ptr::addr_of!(FEEDBACK) },
+        feedback,
     }
 }
 fn publish_view() {
@@ -95,6 +120,8 @@ static mut FEEDBACK: DomainFeedback = DomainFeedback {
     tx_last_ordinary: 0,
     tx_last_reserved: 0,
     waiting: [abi::PendingPlacementWire::EMPTY; 32],
+    quote_stop: abi::QuoteStopReceiptWire::EMPTY,
+    quotes_stopped: 0,
 };
 const EMPTY: PolicyReceiptWire = PolicyReceiptWire {
     version: 0,
@@ -127,6 +154,7 @@ pub fn bind_network(epoch: u64, endpoint: Option<ObjectKey>) -> Result<(), Error
             *core::ptr::addr_of_mut!(NETWORK) = None;
         }
     }
+    crate::peer_replay::transport(endpoint.map(|_| epoch));
     publish_view();
     Ok(())
 }
@@ -185,6 +213,7 @@ fn wire(desired: Option<Desired>) -> PolicyWire {
 /// network owner supplies peer_ipv4 from its live socket; it is not RPC input.
 pub fn prepare(shared: &mut Shared) {
     owner();
+    let _ = requests::initialize(shared.boot_epoch);
     shared.monotonic_ns = crate::domain_platform::now_ns();
     let desired = unsafe { *core::ptr::addr_of!(DESIRED) };
     shared.domains.tx = wire(desired[0]);
@@ -199,6 +228,7 @@ pub fn prepare(shared: &mut Shared) {
     shared.domains.memory_pages = pages;
     shared.domains.core_generation = core;
     shared.domains.ledger_generation = ledger;
+    shared.domains.quote_stop = quote_stop::input(shared.boot_epoch);
     READY.store(true, Ordering::Release);
     publish_view();
 }
@@ -218,6 +248,7 @@ pub fn observe(shared: &Shared) {
         unsafe {
             *core::ptr::addr_of_mut!(FEEDBACK) = feedback;
         }
+        quote_stop::observe(feedback.quote_stop);
         let receipts = [feedback.tx, feedback.unauth, feedback.offer];
         for (slot, receipt) in receipts.into_iter().enumerate() {
             let desired = unsafe { (*core::ptr::addr_of!(DESIRED))[slot] };
@@ -298,13 +329,14 @@ fn current(domain: u16, kind: u16, key: ObjectKey) -> Result<Action, Error> {
         let baseline = match (domain, kind) {
             (10, 1) => Action::TxBatch(4),
             (12, 1) => Action::UnauthRate(16),
-            (16, 1) => Action::OfferCpu(100),
+            (16, 1) => Action::OfferCpu(0),
             (16, 2) => Action::Placement(2),
             _ => return Err(Error::Unsupported),
         };
         if !(0..32).any(|ordinal| target_in(view, domain, kind, ordinal) == Some(key)) {
             return Err(Error::Stale);
         }
+        if domain == 16 && kind == 1 && view.feedback.quotes_stopped == 1 { return Ok(baseline); }
         let effective = view.effective.get(index(baseline)?).copied().flatten();
         Ok(effective
             .filter(|d| d.apply.target == key && d.stamp.live(crate::domain_platform::now_ns()))
@@ -373,6 +405,7 @@ fn apply(
     } else {
         PolicyStamp::default().accepts_action(action, stamp, now)?;
     }
+    if matches!(action, Action::Placement(_)) { replay::release_target(apply.target)?; }
     unsafe {
         (*core::ptr::addr_of_mut!(DESIRED))[slot] = Some(Desired {
             action,

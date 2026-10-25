@@ -127,6 +127,10 @@ pub fn set(
     snapshot: u64,
     sequence: u64,
 ) -> CandidateSet {
+    set_schemas(model, family, snapshot, sequence, schemas())
+}
+pub fn set_schemas(model: &[u8; MODEL_BYTES], family: Family, snapshot: u64,
+    sequence: u64, bindings: Schemas) -> CandidateSet {
     let actions = choices(family);
     let entries: Vec<_> = actions
         .iter()
@@ -157,7 +161,7 @@ pub fn set(
         ModelBinding {
             generation: 1,
             model_hash: Sha256::digest(model).into(),
-            schema_hash: schemas().feature.hash,
+            schema_hash: bindings.feature.hash,
         },
         &entries,
         Some(actions[0]),
@@ -196,6 +200,22 @@ pub fn sample(
     id: u64,
     faults: Faults,
 ) -> Result<AcceptedSample, Error> {
+    with_trials(family, group_seed, id, faults, |candidate, baseline| {
+        pair(candidate, baseline, &TestAuthority, &mut RewardWorkspace::new())
+    })
+}
+pub fn with_trials<T>(
+    family: Family,
+    group_seed: u64,
+    id: u64,
+    faults: Faults,
+    run: impl FnOnce(&Trial<'_>, &Trial<'_>) -> Result<T, Error>,
+) -> Result<T, Error> {
+    with_trials_schemas(family, group_seed, id, faults, schemas(), run)
+}
+pub fn with_trials_schemas<T>(family: Family, group_seed: u64, id: u64,
+    faults: Faults, bindings: Schemas,
+    run: impl FnOnce(&Trial<'_>, &Trial<'_>) -> Result<T, Error>) -> Result<T, Error> {
     let seed = UntrainedSeed::new(0);
     let model = seed.bytes();
     let obs = 3_000_000_000;
@@ -204,8 +224,8 @@ pub fn sample(
     let one = choices(family)[0].one_shot();
     let first_time = if one { obs } else { 1_000_000_000 };
     let sets = [
-        set(model, family, first_time, 1),
-        set(model, family, 9_000_000_000, 2),
+        set_schemas(model, family, first_time, 1, bindings),
+        set_schemas(model, family, 9_000_000_000, 2, bindings),
     ];
     let scores: Vec<Vec<i16>> = sets
         .iter()
@@ -375,7 +395,7 @@ pub fn sample(
     } else {
         vec![[1; 32]]
     };
-    let mut schema = schemas();
+    let mut schema = bindings;
     if faults.stale_schema {
         schema.reward.hash[0] ^= 1;
     }
@@ -434,12 +454,7 @@ pub fn sample(
         later_workload_cpu_ns: 0,
         peak_workspace_bytes: 64 * 1024,
     };
-    pair(
-        &candidate,
-        &baseline,
-        &TestAuthority,
-        &mut RewardWorkspace::new(),
-    )
+    run(&candidate, &baseline)
 }
 pub fn dataset() -> (Vec<AcceptedSample>, Vec<AcceptedSample>) {
     dataset_with_cost(false)

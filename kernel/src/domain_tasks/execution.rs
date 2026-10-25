@@ -1,5 +1,6 @@
 use super::memory::{Pages, copy_from, copy_to, frame_phys, frame_ptr, prepare, synchronize};
 use super::*;
+use cyxia_prototype::domains::tasks::ThreadReservation;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 
@@ -14,21 +15,78 @@ struct Creator<'a> {
     layout: CpuLayout,
     remote: Option<Remote>,
     generation: &'a mut u64,
+    local_failure: Option<local_evidence::Failure>,
+}
+struct BuildTrace {
+    enabled: bool,
+    stage: u64,
+    entered_ns: u64,
+}
+impl BuildTrace {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, stage: 0, entered_ns: 0 }
+    }
+    fn step(&mut self, stage: u64) {
+        if self.enabled {
+            self.stage = stage;
+            self.entered_ns = now_ns();
+        }
+    }
+}
+fn thread_spec(request: &SpawnRequest, launch: &Launch, key: ObjectKey) -> ThreadSpec {
+    let local = request.caller == CLUSTER_CALLER;
+    ThreadSpec {
+        key,
+        group: request.group,
+        cpu: launch.cpu,
+        allowed_mask: 12,
+        minimum_ns: if local { 10_000_000 } else { 0 },
+        budget_ns: if matches!(request.group.id, 15 | 16) && launch.recipe != 0 {
+            20_000_000
+        } else if request.package == CLIENT_PACKAGE || local {
+            10_000_000
+        } else {
+            1_000_000
+        },
+    }
 }
 impl Creator<'_> {
+    fn failure_facts(
+        &self,
+        request: &SpawnRequest,
+        task: ObjectKey,
+        stage: u64,
+        entered_ns: u64,
+        error: Error,
+    ) -> Option<local_evidence::Failure> {
+        if request.caller != CLUSTER_CALLER {
+            return None;
+        }
+        let launch = self.launch(request).ok().map(|i| &self.launches[i]);
+        Some(local_evidence::Failure::capture(local_evidence::Event {
+            stage,
+            error,
+            observed_ns: now_ns(),
+            spawn_id: request.request_id,
+            deadline_ns: launch.map_or(0, |l| l.deadline),
+            task,
+            cpu: launch.map_or(3, |l| l.cpu),
+            group: request.group,
+            layout: self.layout,
+            entered_ns,
+        }, self.scheduler))
+    }
     fn launch(&self, r: &SpawnRequest) -> Result<usize, Error> {
         self.launches
             .iter()
             .position(|l| l.request == Some(*r))
             .ok_or(Error::Stale)
     }
-    fn build(&mut self, r: &SpawnRequest, slot: usize, key: ObjectKey) -> Result<(), Error> {
+    fn build(&mut self, r: &SpawnRequest, slot: usize, key: ObjectKey, reservation: Option<ThreadReservation>, trace: &mut BuildTrace) -> Result<(), Error> {
+        trace.step(10); // Original immutable launch lookup.
         let launch = &self.launches[self.launch(r)?];
         let client = r.package == CLIENT_PACKAGE;
         let local = r.caller == CLUSTER_CALLER;
-        if launch.deadline <= now_ns() {
-            return Err(Error::Expired);
-        }
         let inherited = task_index(self.tasks, r.caller).map_or(ZERO, |i| self.tasks[i].endpoint);
         self.tasks[slot] = Task {
             key,
@@ -45,6 +103,23 @@ impl Creator<'_> {
             ..Task::EMPTY
         };
         self.tasks[slot].caps[0] = inherited;
+        // A reserved LOCAL thread already has scheduler custody. Keep its
+        // actual parent/request identity before any fallible construction so
+        // incomplete rollback can be drained without losing that custody.
+        trace.step(11); // Original task deadline.
+        if launch.deadline <= now_ns() {
+            return Err(Error::Expired);
+        }
+        if local {
+            let reserved = reservation.as_ref().ok_or(Error::Conflict)?;
+            if reserved.key() != key || reserved.cpu() != launch.cpu
+                || reserved.core_generation() != self.layout.generation {
+                return Err(Error::Conflict);
+            }
+        } else if reservation.is_some() {
+            return Err(Error::Conflict);
+        }
+        trace.step(12); // Actual page-table/code-leaf construction.
         unsafe {
             for frame in slot * 3..slot * 3 + 3 {
                 core::ptr::write_bytes(frame_ptr(frame)?, 0, 4096);
@@ -67,15 +142,18 @@ impl Creator<'_> {
                 );
             }
         }
+        trace.step(13); // Register the exact memory owner generation.
         if r.recovery {
             self.memory.register_progress_owner(key, 4)?;
         } else {
             self.memory
                 .register_owner(key, if client || local { 16 } else { 64 })?;
         }
+        trace.step(14); // Commit real backing for LOCAL/recovery.
         if local || r.recovery {
             self.memory.commit_pages(key)?;
         }
+        trace.step(15); // Reserve the task's actual virtual regions.
         for (base, pages, write) in [
             (0x20000, 1, false),
             (0x21000, 1, false),
@@ -91,7 +169,9 @@ impl Creator<'_> {
             t.regions[t.region_count] = base;
             t.region_count += 1;
         }
+        trace.step(16); // Prepare/copy the original task input.
         prepare(self.memory, self.tasks, self.remote, key, 0x20000, 8, false)?;
+        trace.step(17);
         prepare(
             self.memory,
             self.tasks,
@@ -101,37 +181,36 @@ impl Creator<'_> {
             launch.len,
             false,
         )?;
+        trace.step(18);
         copy_to(
             self.memory,
             key,
             0x20000,
             &(launch.len as u64).to_le_bytes(),
         )?;
+        trace.step(19);
         copy_to(self.memory, key, 0x21000, &launch.input[..launch.len])?;
+        trace.step(20); // Actual TASK_QUERY capability grant.
         let cap = self.services.grant(key, key, TASK_SERVICE, 2)?;
         self.tasks[slot].own_query_cap = cap;
         if launch.recipe != 0 {
+            trace.step(21);
             self.tasks[slot].endpoint = self.ipc.open(key, true)?;
+            trace.step(22);
             self.background.set_commitment(r.group, 0, now_ns())?;
         }
-        self.scheduler.admit(
-            ThreadSpec {
-                key,
-                group: r.group,
-                cpu: launch.cpu,
-                allowed_mask: 12,
-                minimum_ns: if local { 10_000_000 } else { 0 },
-                budget_ns: if matches!(r.group.id, 15 | 16) {
-                    20_000_000
-                } else if client || local {
-                    10_000_000
-                } else {
-                    1_000_000
-                },
-            },
-            self.layout,
-            now_ns(),
-        )?;
+        if !local {
+            let spec = thread_spec(r, launch, key);
+            // LOCAL already owns its exact reservation. Repeating admission
+            // here would race the physical window during page construction.
+            let admission_ns = now_ns();
+            if trace.enabled {
+                trace.stage = 23;
+                trace.entered_ns = admission_ns;
+            }
+            self.scheduler.admit(spec, self.layout, admission_ns)?;
+        }
+        trace.step(24); // Final EL0 context/capability initialization.
         unsafe {
             let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
                 .cast::<user::Context>()
@@ -151,6 +230,8 @@ impl Creator<'_> {
             }
         }
         synchronize();
+        trace.step(25); // Protected replay membership, when applicable.
+        replay::member_created(key, r.caller, r.request_id, launch.recipe, matches!(r.group.id, 15 | 16))?;
         Ok(())
     }
     fn rollback(&mut self, slot: usize, key: ObjectKey) -> Result<(), Error> {
@@ -199,6 +280,7 @@ impl Creator<'_> {
                 .add(slot) = user::Context::empty();
         }
         synchronize();
+        replay::member_retired(key);
         self.tasks[slot] = Task::EMPTY;
         Ok(())
     }
@@ -214,7 +296,9 @@ impl TaskBackend for Creator<'_> {
         if r.recovery && r.caller != KERNEL_CALLER {
             return Err(Error::Auth);
         }
-        if r.caller != KERNEL_CALLER && r.caller != CLUSTER_CALLER {
+        if r.caller.id == replay::CALLER_ID {
+            replay::authorize_request(r, &launch.input[..launch.len], launch.cpu, launch.deadline, launch.recipe)?;
+        } else if r.caller != KERNEL_CALLER && r.caller != CLUSTER_CALLER {
             let parent = &self.tasks[task_index(self.tasks, r.caller)?];
             if parent.closed || parent.group != r.group {
                 return Err(Error::Auth);
@@ -236,6 +320,11 @@ impl TaskBackend for Creator<'_> {
         Ok(())
     }
     fn create(&mut self, r: &SpawnRequest) -> CreateOutcome {
+        let recipe = self.launch(r).ok().map_or(0, |i| self.launches[i].recipe);
+        // Recovery construction is already inside its executor-action span;
+        // synchronous ordinary admission is inside the replay caller's span.
+        let source = if recipe == 0 && !replay::work_measured() { replay::work_source(r.caller, r.request_id, recipe) } else { None };
+        let mut body = || {
         let range = if r.recovery {
             ORDINARY_TASKS..TASKS
         } else {
@@ -245,20 +334,55 @@ impl TaskBackend for Creator<'_> {
             .into_iter()
             .find(|i| self.tasks[*i].life == Life::Free && self.tasks[*i].recipe == 0)
         else {
+            if r.caller == CLUSTER_CALLER {
+                // These slots remain owned by real live/closing tasks. A
+                // queued LOCAL request may wait for their actual cleanup.
+                return CreateOutcome::Deferred;
+            }
+            self.local_failure = self.failure_facts(r, ZERO, 3, now_ns(), Error::Capacity);
             return CreateOutcome::Rejected(Error::Capacity);
         };
         let Some(generation) = self.generation.checked_add(1) else {
+            self.local_failure = self.failure_facts(r, ZERO, 4, now_ns(), Error::Overflow);
             return CreateOutcome::Rejected(Error::Overflow);
         };
-        *self.generation = generation;
         let key = ObjectKey {
             id: 0x1000 + slot as u64,
             generation,
         };
-        match self.build(r, slot, key) {
+        let mut trace = BuildTrace::new(r.caller == CLUSTER_CALLER);
+        let reservation = if r.caller == CLUSTER_CALLER {
+            let launch = match self.launch(r) {
+                Ok(index) => &self.launches[index],
+                Err(error) => {
+                    self.local_failure = self.failure_facts(r, key, 10, now_ns(), error);
+                    return CreateOutcome::Rejected(error);
+                }
+            };
+            let spec = thread_spec(r, launch, key);
+            let admission_ns = now_ns();
+            trace.stage = 23;
+            trace.entered_ns = admission_ns;
+            match self.scheduler.prepare_admission(spec, self.layout, admission_ns) {
+                Ok(Some(reserved)) => Some(reserved),
+                // No task, pages, capability, or scheduler thread has been
+                // created. Preserve the existing queue identity and deadline.
+                Ok(None) => return CreateOutcome::Deferred,
+                Err(error) => {
+                    self.local_failure = self.failure_facts(r, key, 23, admission_ns, error);
+                    return CreateOutcome::Rejected(error);
+                }
+            }
+        } else { None };
+        // The task lock covers reservation, construction and rollback. No
+        // other CPU can dispatch this reserved key before construction ends.
+        *self.generation = generation;
+        match self.build(r, slot, key, reservation, &mut trace) {
             Ok(()) => CreateOutcome::Created(key),
             Err(error) => {
+                let failure = self.failure_facts(r, key, trace.stage, trace.entered_ns, error);
                 if self.rollback(slot, key).is_ok() {
+                    self.local_failure = failure;
                     CreateOutcome::Rejected(error)
                 } else {
                     self.tasks[slot].life = Life::Exiting;
@@ -267,6 +391,10 @@ impl TaskBackend for Creator<'_> {
                 }
             }
         }
+        };
+        if let Some(source) = source {
+            crate::learning_evidence::measure(source, cyxia_prototype::learning::reward::CpuClass::ExecutorWork, body)
+        } else { body() }
     }
 }
 fn effective_layout(s: &State) -> CpuLayout {
@@ -364,6 +492,7 @@ fn submit_package(
         layout,
         remote: s.remote,
         generation: &mut s.generation,
+        local_failure: None,
     };
     let result = s.admission.submit(request, now_ns(), &mut backend);
     if !matches!(result, Ok(SpawnState::Queued)) {
@@ -394,7 +523,8 @@ pub fn submit_local(id: u64, input: &[u8], deadline: u64) -> Result<SpawnState, 
         return Err(Error::Auth);
     }
     locked(|s| {
-        submit_locked(
+        let entered_ns = now_ns();
+        let result = submit_locked(
             s,
             CLUSTER_CALLER,
             id,
@@ -404,11 +534,51 @@ pub fn submit_local(id: u64, input: &[u8], deadline: u64) -> Result<SpawnState, 
             deadline,
             false,
             0,
-        )
+        );
+        if let Err(error) = result {
+            // Lock contention and the explicit no-custody retry errors are
+            // not terminal receipts and must not consume the first-failure ABI.
+            if !matches!(error, Error::Busy | Error::Again | Error::NotReady) {
+                local_evidence::retain(local_evidence::Failure::capture(local_evidence::Event {
+                    stage: 1, error, observed_ns: now_ns(), spawn_id: id, deadline_ns: deadline,
+                    task: ZERO, cpu: 3, group: group(5), layout: effective_layout(s), entered_ns,
+                }, &s.scheduler));
+            }
+        }
+        result
     })
 }
 pub fn query_local(id: u64) -> Result<SpawnState, Error> {
     locked(|s| s.admission.query(CLUSTER_CALLER, id))
+}
+/// A LOCAL placement is complete only after its real EL0 result and full
+/// task/resource cleanup have produced the retained exit receipt.
+pub fn local_result(id: u64) -> Result<Option<(u64, u64)>, Error> {
+    locked(|s| match s.admission.query(CLUSTER_CALLER, id)? {
+        SpawnState::Created(key) => match s.exits.iter().flatten().find(|v| v.key == key && v.parent == CLUSTER_CALLER) {
+            Some(v) if v.code == 0 => Ok(Some((v.value, v.finished_ns))),
+            Some(v) if v.code == 110 => Err(Error::Expired), Some(_) => Err(Error::Io), None => Ok(None),
+        },
+        SpawnState::Queued | SpawnState::Unknown => Ok(None),
+        SpawnState::Failed(e) => Err(e), SpawnState::Cancelled => Err(Error::Expired),
+    })
+}
+/// The network owner acknowledges only after retaining this exact completion.
+/// Dropping an exit is never used to decide that execution completed.
+pub fn acknowledge_local_result(id: u64) -> Result<(), Error> {
+    if cpu::slot() != 0 { return Err(Error::Auth); }
+    locked(|s| match s.admission.query(CLUSTER_CALLER, id)? {
+        SpawnState::Created(key) => {
+            if s.tasks.iter().any(|t| t.key == key && t.life != Life::Free)
+                || s.active.iter().flatten().any(|a| a.dispatch.thread == key) { return Err(Error::Busy); }
+            if let Some(at) = s.exits.iter().position(|v| v.is_some_and(|v| v.key == key && v.parent == CLUSTER_CALLER)) {
+                s.exits[at] = None;
+            }
+            Ok(())
+        },
+        SpawnState::Failed(_) | SpawnState::Cancelled => Ok(()),
+        SpawnState::Queued | SpawnState::Unknown => Err(Error::Busy),
+    })
 }
 
 pub(super) fn wake_task(s: &mut State, i: usize) {
@@ -435,6 +605,11 @@ pub(super) fn wake_task(s: &mut State, i: usize) {
     }
 }
 fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
+    if let Some(source) = replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe) {
+        crate::learning_evidence::measure(source, cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || cleanup_inner(s, i))
+    } else { cleanup_inner(s, i) }
+}
+fn cleanup_inner(s: &mut State, i: usize) -> Result<(), Error> {
     let key = s.tasks[i].key;
     if FILE_BUSY[i].load(Ordering::Acquire)
         || s.active.iter().flatten().any(|a| a.dispatch.thread == key)
@@ -492,11 +667,19 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
         Err(e) => return Err(e),
     }
     if let Some(error) = s.tasks[i].failure {
-        let _ = s.admission.reconcile(
+        let entered_ns = now_ns();
+        let reconciled = s.admission.reconcile(
             s.tasks[i].parent,
             s.tasks[i].spawn_id,
             CreateOutcome::Rejected(error),
         );
+        if s.tasks[i].parent == CLUSTER_CALLER && reconciled == Ok(SpawnState::Failed(error)) {
+            local_evidence::retain(local_evidence::Failure::capture(local_evidence::Event {
+                stage: 30, error, observed_ns: now_ns(), spawn_id: s.tasks[i].spawn_id,
+                deadline_ns: s.tasks[i].deadline, task: key, cpu: s.tasks[i].cpu,
+                group: s.tasks[i].group, layout: effective_layout(s), entered_ns,
+            }, &s.scheduler));
+        }
     } else {
         let _ = s.admission.exited(key);
     }
@@ -512,6 +695,7 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
             .add(i) = user::Context::empty();
     }
     synchronize();
+    replay::member_retired(key);
     RETURN_PENDING[i].store(false, Ordering::Release);
     FILE_PENDING[i].store(false, Ordering::Release);
     FILE_DONE[i].store(false, Ordering::Release);
@@ -524,6 +708,7 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
             parent: s.tasks[i].parent,
             code: s.tasks[i].exit_code,
             value: s.tasks[i].response,
+            finished_ns: now_ns(),
         });
     }
     s.generation = s.generation.checked_add(1).ok_or(Error::Overflow)?;
@@ -554,10 +739,19 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
             layout,
             remote: s.remote,
             generation: &mut s.generation,
+            local_failure: None,
         };
-        match s.admission.service_one(now_ns(), &mut backend)? {
+        let entered_ns = now_ns();
+        match s.admission.service_one(entered_ns, &mut backend)? {
             None => break,
-            Some((_, SpawnState::Failed(_))) => {
+            Some((request, SpawnState::Failed(error))) => {
+                // The original constructor snapshot becomes visible only
+                // after SpawnAdmission has actually retained Failed(error).
+                if let Some(failure) = backend.local_failure.take().or_else(|| {
+                    backend.failure_facts(&request, ZERO, 2, entered_ns, error)
+                }) {
+                    local_evidence::retain(failure);
+                }
                 s.facts.rejected = s.facts.rejected.saturating_add(1)
             }
             Some(_) => {}
@@ -580,6 +774,18 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
     Ok(())
 }
 fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
+    let warm = if s.tasks[i].recipe == 2 && crate::domain_services::replay::owns(2)
+        && !s.tasks[i].pending && s.ipc.stats(s.tasks[i].endpoint).is_ok_and(|v| v.depth != 0) {
+        service_witness_locked(s).ok().and_then(|paid| crate::learning_prewarm::attempt_paid_service(&paid))
+    } else { None };
+    let first = now_ns();
+    let result = if let Some(source) = replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe) {
+        crate::learning_evidence::measure(source, cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || recipe_turn_inner(s, i))
+    } else { recipe_turn_inner(s, i) };
+    if let Some(mut warm) = warm { let _ = crate::learning_prewarm::finish(&mut warm, first, now_ns()); }
+    result
+}
+fn recipe_turn_inner(s: &mut State, i: usize) -> Result<(), Error> {
     let task = s.tasks[i];
     if task.recipe == 0
         || task.life != Life::Ready
@@ -637,7 +843,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     let _ = service_segment(|| {
         let external = locked(|s| {
             let phase = s.service_phase;
-            s.service_phase = (phase + 1) % 9;
+            s.service_phase = (phase + 1) % 11;
             match phase {
                 0 => {
                     for slot in 0..64 {
@@ -679,7 +885,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
                 }
                 3 => ipc_piece(s),
                 4 => memory_piece(s),
-                5 | 7 | 8 => {}
+                5 | 7 | 8 | 9 | 10 => {}
                 _ => metrics_piece(s),
             }
             publish_evidence(s);
@@ -710,8 +916,18 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             // Its cursor and any incomplete window survive a Busy return.
             let _ = crate::service_windows::poll();
         }
+        if external == Ok(9) {
+            // The replay coordinator is a separate bounded, prepaid owner
+            // piece; its frozen arrivals never run on an unpaid timer path.
+            let _ = crate::learning_replay::service_step();
+        }
+        if external == Ok(10) {
+            let _ = crate::peer_replay::poll();
+        }
     });
     service_file(progress);
+    crate::learning_workload::service_io(progress);
+    crate::learning_replay::service_io(progress);
 }
 fn lifecycle_piece(s: &mut State, i: usize) {
     if RETURN_PENDING[i].load(Ordering::Acquire)
@@ -859,6 +1075,19 @@ fn metrics_piece(s: &mut State) {
 }
 
 fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
+    // The real C3 credit already includes its direct EL0 return handling.
+    // Only a deferred C0 lifecycle return needs a separate service segment.
+    if cpu::slot() != 0 { process_return_inner(s, i, c); return; }
+    let warm = if s.tasks[i].recipe == 2 && crate::domain_services::replay::owns(2) {
+        service_witness_locked(s).ok().and_then(|paid| crate::learning_prewarm::attempt_paid_service(&paid))
+    } else { None };
+    let first = now_ns();
+    if let Some(source) = replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe) {
+        crate::learning_evidence::measure(source, cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || process_return_inner(s, i, c));
+    } else { process_return_inner(s, i, c); }
+    if let Some(mut warm) = warm { let _ = crate::learning_prewarm::finish(&mut warm, first, now_ns()); }
+}
+fn process_return_inner(s: &mut State, i: usize, c: &mut user::Context) {
     let key = s.tasks[i].key;
     let mut state = RunState::Runnable;
     if s.tasks[i].life == Life::Exiting {
@@ -978,6 +1207,39 @@ pub fn dispatch(slot: usize) -> bool {
     });
     true
 }
+/// One blocking owner operation, divided into actual CPU0 reservations at
+/// every device-progress wait. The callback must retain the same operation's
+/// custody; neither an unanswered I/O nor its payload may be resubmitted here.
+/// Call outside another service_segment. `None` means no operation started.
+pub fn service_io_piece<R>(
+    source: Option<ObjectKey>,
+    progress: &mut dyn FnMut(),
+    body: impl FnOnce(&mut dyn FnMut()) -> R,
+) -> Option<R> {
+    begin_service_segment()?;
+    let mut first = now_ns();
+    let mut capture = source.and_then(|key| crate::learning_evidence::attempt(key,
+        cyxia_prototype::learning::reward::CpuClass::ExecutorWork).ok().flatten());
+    let mut resume = || {
+        let end = now_ns();
+        if let Some(mut attempt) = capture.take() { let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, end); }
+        let _ = complete_service(end.saturating_sub(first), end);
+        loop {
+            progress();
+            if begin_service_segment().is_some() {
+                first = now_ns();
+                capture = source.and_then(|key| crate::learning_evidence::attempt(key,
+                    cyxia_prototype::learning::reward::CpuClass::ExecutorWork).ok().flatten());
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    };
+    let result = body(&mut resume); let end = now_ns();
+    if let Some(mut attempt) = capture { let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, end); }
+    let _ = complete_service(end.saturating_sub(first), end); Some(result)
+}
+
 fn service_file(progress: &mut dyn FnMut()) {
     let Some(next) = service_segment(|| {
         locked(|s| {
@@ -1456,8 +1718,9 @@ pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(),
             layout,
             remote: s.remote,
             generation: &mut s.generation,
+            local_failure: None,
         };
-        let result = backend.build(&request, i, expected);
+        let result = backend.build(&request, i, expected, None, &mut BuildTrace::new(false));
         if let Err(error) = result {
             if backend.rollback(i, expected).is_ok() {
                 backend.tasks[i] = prior;

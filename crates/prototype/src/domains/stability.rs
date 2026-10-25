@@ -111,7 +111,7 @@ impl Guard {
         if target.id == 0 || target.generation == 0 {
             return Err(Error::Stale);
         }
-        baseline.validate()?;
+        if baseline != Action::OfferCpu(0) { baseline.validate()?; }
         Ok(Self {
             target,
             current: baseline,
@@ -153,6 +153,19 @@ impl Guard {
     }
     pub const fn consecutive_breaches(&self) -> u8 {
         self.breaches
+    }
+    /// The quote owner may expire or explicitly stop new quotes without a
+    /// model action. Preserve version, freeze and reversal history, and start
+    /// a conservative new hold when that real stopped state is observed.
+    pub fn observe_stopped_offer(&mut self, now_ns: u64) -> Result<(), Error> {
+        self.time(now_ns)?;
+        if self.family() != (16, 1) { return Err(Error::Conflict); }
+        if self.current != Action::OfferCpu(0) {
+            self.current = Action::OfferCpu(0);
+            self.last_change_ns = now_ns;
+        }
+        self.last_now_ns = now_ns;
+        Ok(())
     }
     fn time(&self, now_ns: u64) -> Result<(), Error> {
         if now_ns < self.last_now_ns {
@@ -422,4 +435,18 @@ impl Guard {
         }
         Ok(Self::classify(registered.boundary, window))
     }
+}
+
+/// One adjacent step in the owner's sorted legal set. Stopped quotes are
+/// owner state, never a candidate: reopening admits only the first positive
+/// legal tier. Callers still enforce their hold, freeze, and authority gates.
+pub fn adjacent(current: Action, selected: Action, legal: &[Option<Action>]) -> Result<bool, Error> {
+    selected.validate()?;
+    let selected_index = legal.iter().position(|a| *a == Some(selected)).ok_or(Error::Conflict)?;
+    if current == Action::OfferCpu(0) {
+        return Ok(matches!(selected, Action::OfferCpu(_))
+            && legal.iter().position(Option::is_some) == Some(selected_index));
+    }
+    let previous = legal.iter().position(|a| *a == Some(current)).ok_or(Error::Stale)?;
+    Ok(selected_index.abs_diff(previous) <= 1)
 }

@@ -97,7 +97,7 @@ impl Header {
             sender_boot: u64::from_le_bytes(b[80..88].try_into().unwrap()),
             receiver_boot: u64::from_le_bytes(b[88..96].try_into().unwrap()),
         };
-        if !matches!(h.kind&0x7fff,1..=6|16..=22|32..=33)
+        if !matches!(h.kind&0x7fff,1..=6|16..=22|32..=33|48..=49|56)
             || h.body_len > 65536
             || h.sequence == 0
             || h.sender_boot == 0

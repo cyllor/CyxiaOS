@@ -9,6 +9,12 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+mod verified;
+pub use verified::{ReplayKind, VerifiedReplay, pair_verified, verify_replay};
+mod bounded;
+mod bounded_cost;
+pub use bounded::{IncrementalAuthority, ReplayPiece, ReplayVerification};
+
 pub const OBSERVATION_NS: u64 = 10_000_000_000;
 pub const MAX_REQUESTS: usize = 4096;
 pub const MAX_CPU_INTERVALS: usize = 8192;
@@ -118,6 +124,7 @@ impl RewardWorkspace {
             latencies: [0; MAX_REQUESTS],
         }
     }
+    pub(crate) fn latency_scratch(&mut self) -> &mut [u64] { &mut self.latencies }
 }
 const _: () = assert!(core::mem::size_of::<RewardWorkspace>() <= 1024 * 1024);
 
@@ -282,7 +289,17 @@ pub fn inspect_one_second(
     start: u64,
     work: &mut RewardWorkspace,
 ) -> Result<Option<Performance>, Error> {
-    inspect_window(requests, start, 1_000_000_000, work)
+    inspect_one_second_with_latencies(requests, start, &mut work.latencies)
+}
+/// A bounded service owner can use only the scratch its actual frozen request
+/// table needs. This shares the exact reward metric and nearest-rank rules;
+/// it does not need the CPU-union sweep workspace used by full replay trials.
+pub fn inspect_one_second_with_latencies(
+    requests: &[WorkRequest],
+    start: u64,
+    latencies: &mut [u64],
+) -> Result<Option<Performance>, Error> {
+    inspect_window_with_latencies(requests, start, 1_000_000_000, latencies)
 }
 fn performance_window(
     requests: &[WorkRequest],
@@ -302,7 +319,15 @@ fn inspect_window(
     duration: u64,
     work: &mut RewardWorkspace,
 ) -> Result<Option<Performance>, Error> {
-    if requests.len() > MAX_REQUESTS {
+    inspect_window_with_latencies(requests, start, duration, &mut work.latencies)
+}
+fn inspect_window_with_latencies(
+    requests: &[WorkRequest],
+    start: u64,
+    duration: u64,
+    latencies: &mut [u64],
+) -> Result<Option<Performance>, Error> {
+    if requests.len() > MAX_REQUESTS || requests.len() > latencies.len() {
         return Err(Error::Capacity);
     }
     let end = start.checked_add(duration).ok_or(Error::Numeric)?;
@@ -320,7 +345,7 @@ fn inspect_window(
             if finished_ns < r.arrived_ns || finished_ns > end {
                 return Err(Error::Evidence);
             }
-            work.latencies[completed] = finished_ns - r.arrived_ns;
+            latencies[completed] = finished_ns - r.arrived_ns;
             completed += 1;
             counts[0] += 1;
         } else {
@@ -334,17 +359,17 @@ fn inspect_window(
     if requests.is_empty() {
         return Ok(None);
     }
-    work.latencies[..completed].sort_unstable();
-    let actual = (completed != 0).then(|| work.latencies[(99 * completed).div_ceil(100) - 1]);
-    work.latencies[completed..requests.len()].fill(OBSERVATION_NS);
-    work.latencies[..requests.len()].sort_unstable();
+    latencies[..completed].sort_unstable();
+    let actual = (completed != 0).then(|| latencies[(99 * completed).div_ceil(100) - 1]);
+    latencies[completed..requests.len()].fill(OBSERVATION_NS);
+    latencies[..requests.len()].sort_unstable();
     Ok(Some(Performance {
         emitted: requests.len() as u64,
         completed: counts[0],
         rejected: counts[1],
         timed_out: counts[2],
         pending: counts[3],
-        penalty_p99_ns: work.latencies[(99 * requests.len()).div_ceil(100) - 1],
+        penalty_p99_ns: latencies[(99 * requests.len()).div_ceil(100) - 1],
         actual_completed_p99_ns: actual,
     }))
 }
@@ -500,7 +525,7 @@ fn verify_baseline(t: &Trial<'_>, hash: &mut Sha256) -> Result<(), Error> {
     let mut until = 0;
     for (index, b) in t.baseline.iter().enumerate() {
         terminal(b.executed)?;
-        b.actual.validate().map_err(|_| Error::Evidence)?;
+        super::baseline::validate(b.actual)?;
         if b.owner_boot == 0
             || b.receipt_sequence == 0
             || b.executor_generation == 0
@@ -551,9 +576,10 @@ fn verify_baseline(t: &Trial<'_>, hash: &mut Sha256) -> Result<(), Error> {
                 return Err(Error::Deadline);
             }
         } else {
+            let stopped_offer = b.actual == Action::OfferCpu(0) && b.installed_until_ns == 0;
             if b.target_request_id.is_some()
                 || b.approved_deadline_ns - b.accepted_ns > 50_000_000
-                || b.finished_ns > b.installed_until_ns
+                || (!stopped_offer && b.finished_ns > b.installed_until_ns)
                 || (index == 0
                     && (b.finished_ns > t.warmed_from_ns
                         || b.finished_ns - b.snapshot.taken_ns > 5_000_000_000))
@@ -561,7 +587,8 @@ fn verify_baseline(t: &Trial<'_>, hash: &mut Sha256) -> Result<(), Error> {
             {
                 return Err(Error::Evidence);
             }
-            until = until.max(b.installed_until_ns);
+            if stopped_offer && t.baseline.len() != 1 { return Err(Error::Evidence); }
+            until = until.max(if stopped_offer { t.observation_end_ns } else { b.installed_until_ns });
         }
         for value in [
             b.owner_boot,
@@ -583,7 +610,11 @@ fn verify_baseline(t: &Trial<'_>, hash: &mut Sha256) -> Result<(), Error> {
         ] {
             number(hash, value);
         }
-        action(hash, b.actual)?;
+        let mut payload = [0; 16];
+        let n = super::baseline::encode(b.actual, &mut payload)?;
+        hash.update(b.actual.domain().to_le_bytes());
+        hash.update(b.actual.kind().to_le_bytes());
+        hash.update(&payload[..n]);
     }
     if !first.actual.one_shot() && until < t.observation_end_ns {
         return Err(Error::Evidence);
@@ -1052,30 +1083,19 @@ pub fn pair(
     authority: &impl EvidenceAuthority,
     work: &mut RewardWorkspace,
 ) -> Result<AcceptedSample, Error> {
-    if candidate.group != baseline.group
-        || candidate.family != baseline.family
-        || candidate.frozen_other_domains != baseline.frozen_other_domains
-        || candidate.schemas != baseline.schemas
-        || candidate.local_node != baseline.local_node
-        || candidate.controlled_nodes != baseline.controlled_nodes
-        || candidate.requests.len() != baseline.requests.len()
-    {
-        return Err(Error::Evidence);
-    }
-    let (c_hash, input) = verify_trial(candidate, true, authority)?;
-    let (b_hash, _) = verify_trial(baseline, false, authority)?;
-    for (c, b) in candidate.requests.iter().zip(baseline.requests) {
-        if c.id != b.id
-            || c.arrived_ns.checked_sub(candidate.observation_ns)
-                != b.arrived_ns.checked_sub(baseline.observation_ns)
-        {
-            return Err(Error::Evidence);
-        }
-    }
-    let cp = performance(candidate.requests, candidate.observation_ns, work)?;
-    let bp = performance(baseline.requests, baseline.observation_ns, work)?;
-    let cc = union_cpu(candidate.family, candidate.cpu, candidate.coverage, work)?;
-    let bc = union_cpu(baseline.family, baseline.cpu, baseline.coverage, work)?;
+    let candidate = verify_replay(candidate, ReplayKind::Candidate, authority, work)?;
+    let baseline = verify_replay(baseline, ReplayKind::Baseline, authority, work)?;
+    pair_verified(&candidate, &baseline)
+}
+
+fn make_sample(
+    candidate: &VerifiedReplay,
+    baseline: &VerifiedReplay,
+) -> Result<AcceptedSample, Error> {
+    let cp = candidate.performance;
+    let bp = baseline.performance;
+    let cc = candidate.cpu;
+    let bc = baseline.cpu;
     let ten = F64::from_u64(10);
     let x = F64::from_u64(cp.completed).div(ten)?;
     let x0 = F64::from_u64(bp.completed).div(ten)?;
@@ -1100,13 +1120,13 @@ pub fn pair(
         .sub(fifth.mul(cost)?)?;
     let mut digest = Sha256::new();
     digest.update(b"CYXIA_PAIRED_LABEL_1.3\0");
-    digest.update(c_hash);
-    digest.update(b_hash);
+    digest.update(candidate.canonical_digest);
+    digest.update(baseline.canonical_digest);
     digest.update(reward.to_bits().to_le_bytes());
     Ok(AcceptedSample {
         family: candidate.family,
         group: candidate.group,
-        input,
+        input: candidate.input,
         reward: Reward {
             candidate: cp,
             baseline: bp,

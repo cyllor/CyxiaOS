@@ -109,7 +109,9 @@ impl CandidateSet {
             out.count += 1;
         }
         if let Some(current) = current {
-            if !out.iter().any(|c| c.action == current) {
+            let opening_offer = current == Action::OfferCpu(0) && out.count == 1
+                && matches!(first.action, Action::OfferCpu(_));
+            if !opening_offer && !out.iter().any(|c| c.action == current) {
                 return Err(Error::Conflict);
             }
         } else if !first.action.one_shot() || matches!(first.action, Action::ControlSet(_)) {
@@ -287,6 +289,11 @@ struct StoredPlan {
     targets: [ObjectKey; 16],
     model: Option<ModelBinding>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationPurpose {
+    Candidates,
+    Baseline,
+}
 #[derive(Clone, Copy)]
 pub struct RegisteredSet {
     pub snapshot: Snapshot,
@@ -296,6 +303,7 @@ pub struct RegisteredSet {
     actions: [Option<Action>; 32],
     count: usize,
     canary: Option<CanaryPermit>,
+    purpose: RegistrationPurpose,
 }
 impl RegisteredSet {
     pub fn action(&self, index: usize) -> Option<Action> {
@@ -307,6 +315,15 @@ impl RegisteredSet {
     }
     pub const fn canary_permit(&self) -> Option<CanaryPermit> {
         self.canary
+    }
+    /// A fixed baseline has no model features or scores. Only the protected
+    /// baseline executor may authorize this exact registered action.
+    pub fn baseline_action(&self) -> Option<Action> {
+        if self.purpose == RegistrationPurpose::Baseline {
+            self.actions[0]
+        } else {
+            None
+        }
     }
     fn validate_model_scope(&self, active: ModelBinding, now_ns: u64) -> Result<(), Error> {
         match self.canary {
@@ -351,6 +368,11 @@ impl RegisteredSet {
         gate: &CommitGate,
         now_ns: u64,
     ) -> Result<(), Error> {
+        // The Active/Canary gate cannot turn a deterministic baseline into an
+        // ordinary model proposal, even when its model binding is identical.
+        if self.purpose == RegistrationPurpose::Baseline {
+            return Err(Error::Auth);
+        }
         self.validate_model_scope(active, now_ns)?;
         if gate.active() != active {
             return Err(Error::Stale);
@@ -376,6 +398,18 @@ pub trait Clock {
 /// PREPARE must reserve all resources without starting physical effects. Failed
 /// publication is effect-free; cancel_prepared releases only those reservations.
 pub trait Executor {
+    /// Explicit authority for a fixed baseline, independent of model/Canary
+    /// authority. An override must verify the live protected reservation,
+    /// target and exact deterministic action. Every ordinary executor denies
+    /// it by default; normal hard constraints and publication bounds still run.
+    fn authorize_baseline(
+        &mut self,
+        _active: ModelBinding,
+        _set: &RegisteredSet,
+        _now_ns: u64,
+    ) -> Result<(), Error> {
+        Err(Error::Auth)
+    }
     /// A stopped optimizer may still owe an exact protected baseline restore.
     /// The default denies every new publication. An override must verify the
     /// current restoration request, target, baseline action and Active binding
@@ -517,6 +551,71 @@ impl Registry {
         }
         self.store_registered(Self::registered_set(set, set.digest, None))
     }
+    /// Register one deterministic action without claiming that absent domain
+    /// measurements were observed as zero or that a model selected it. This
+    /// grants no publication authority: submit still requires the executor's
+    /// explicit baseline reservation, current owners, generations and bounds.
+    pub fn register_baseline(
+        &mut self,
+        publisher: Publisher,
+        snapshot: Snapshot,
+        target: ObjectKey,
+        model: ModelBinding,
+        action: Action,
+    ) -> Result<[u8; 32], Error> {
+        self.authorize(publisher)?;
+        if model != self.model
+            || snapshot.sequence == 0
+            || snapshot.ledger_generation == 0
+            || snapshot.core_generation == 0
+            || target.id == 0
+            || target.generation == 0
+        {
+            return Err(Error::Stale);
+        }
+        // OfferCpu(0) remains the separate real stop-quote owner operation;
+        // it cannot be smuggled into the ordinary Action/Plan wire ABI.
+        action.validate()?;
+        let mut h = Sha256::new();
+        h.update(b"CYXIA_FIXED_BASELINE_V1.3\0");
+        for value in [
+            self.boot_epoch,
+            publisher.object.id,
+            publisher.object.generation,
+            publisher.controller_epoch,
+            snapshot.sequence,
+            snapshot.taken_ns,
+            snapshot.ledger_generation,
+            snapshot.core_generation,
+            target.id,
+            target.generation,
+            model.generation,
+        ] {
+            h.update(value.to_le_bytes());
+        }
+        h.update(model.model_hash);
+        h.update(model.schema_hash);
+        h.update(action.domain().to_le_bytes());
+        h.update(action.kind().to_le_bytes());
+        let mut payload = [0; 16];
+        let len = policy_wire::encode_payload(action, 0, &mut payload)?;
+        h.update((len as u16).to_le_bytes());
+        h.update(&payload[..len]);
+        let hash = h.finalize().into();
+        let mut actions = [None; 32];
+        actions[0] = Some(action);
+        self.store_registered(RegisteredSet {
+            snapshot,
+            target,
+            model,
+            hash,
+            actions,
+            count: 1,
+            canary: None,
+            purpose: RegistrationPurpose::Baseline,
+        })?;
+        Ok(hash)
+    }
     /// Bind a candidate set to a permit issued by the actual protected gate.
     /// Success changes only this set's hash/scope and the registration table,
     /// never the Active model or canary quota. Infer/encode only after success.
@@ -565,6 +664,7 @@ impl Registry {
             actions,
             count: set.len(),
             canary,
+            purpose: RegistrationPurpose::Candidates,
         }
     }
     fn store_registered(&mut self, registered: RegisteredSet) -> Result<(), Error> {
@@ -574,7 +674,10 @@ impl Registry {
             .flatten()
             .find(|old| old.hash == registered.hash)
         {
-            return if old.canary == registered.canary && old.model == registered.model {
+            return if old.canary == registered.canary
+                && old.model == registered.model
+                && old.purpose == registered.purpose
+            {
                 Ok(())
             } else {
                 Err(Error::Conflict)
@@ -722,7 +825,7 @@ impl Registry {
         for d in plan.iter() {
             let set = self.registered_decision(d)?;
             set.validate_model_scope(self.model, now)?;
-            if set.canary.is_some() && plan.len() != 1 {
+            if (set.canary.is_some() || set.baseline_action().is_some()) && plan.len() != 1 {
                 return Err(Error::Auth);
             }
             if binding.is_some_and(|old| old != set.model) {
@@ -740,7 +843,11 @@ impl Registry {
     ) -> Result<ModelBinding, Error> {
         let binding = self.model_scope(plan, now)?;
         for d in plan.iter() {
-            executor.authorize_model(self.model, self.registered_decision(d)?, now)?;
+            let set = self.registered_decision(d)?;
+            if set.baseline_action().is_some() {
+                executor.authorize_baseline(self.model, set, now)?;
+            }
+            executor.authorize_model(self.model, set, now)?;
         }
         Ok(binding)
     }

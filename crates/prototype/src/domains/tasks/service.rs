@@ -62,7 +62,9 @@ pub trait ServiceBackend {
     /// Perform one actual service IPC/batch, not one IPC for each item. Only the
     /// two read-only operations can reach this callback. Individual completion
     /// slots preserve successes even if another item times out or the batch
-    /// transport fails. Leaving a slot empty never means success.
+    /// transport fails. Busy/Again/NotReady retain an unfinished item for a
+    /// later bounded step; it is reauthorized and keeps its original deadline.
+    /// Leaving a slot empty never means success.
     fn call_batch(
         &mut self,
         service: ObjectKey,
@@ -368,6 +370,12 @@ impl ServiceBatch {
                 continue;
             }
             if let Err(e) = backend.validate_object(cap.object, item.op) {
+                // A contended owner observation is not an object failure.
+                // No read has completed; retry with fresh capability and
+                // generation checks on a later bounded service turn.
+                if matches!(e, Error::Busy | Error::Again | Error::NotReady) {
+                    continue;
+                }
                 self.finish(
                     vector,
                     i,
@@ -404,6 +412,10 @@ impl ServiceBatch {
                 let status = match result {
                     Ok(v) => ItemStatus::Value(v),
                     Err(Error::Expired) => ItemStatus::TimedOut,
+                    // These operations are read-only. An unavailable reader
+                    // or transport retains only its unfinished items; actual
+                    // neighbours already completed above are never replayed.
+                    Err(Error::Busy | Error::Again | Error::NotReady) => continue,
                     Err(e) => ItemStatus::Error(e),
                 };
                 self.finish(vector, indexes[i], status, now);

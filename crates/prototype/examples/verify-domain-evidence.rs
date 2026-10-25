@@ -116,13 +116,7 @@ fn main() -> Result<(), String> {
                 native::candidate(&input, index).map_err(|e| format!("candidate: {e:?}"))?;
             choices.push(Candidate { action, features });
         }
-        let mut prior = [0; 16];
-        prior[..8].copy_from_slice(&input[405].to_le_bytes());
-        prior[8..].copy_from_slice(&input[406].to_le_bytes());
-        let len = usize::try_from(input[404]).map_err(|e| e.to_string())?;
-        require(len <= prior.len(), "prior parameter length")?;
-        let (current, _) = policy_wire::decode_payload(r[2] as u16, r[3] as u16, &prior[..len])
-            .map_err(|e| format!("prior: {e:?}"))?;
+        let current = native::prior(&input).map_err(|e| format!("prior: {e:?}"))?;
         if let domains::Action::ControlSet(mask) = current {
             require(mask == input[400], "current control ownership binding")?;
         }

@@ -5,7 +5,7 @@ pub const STACK_TOP: u64 = 0x01ff_0000;
 pub const STACK_BYTES: usize = 128 * 1024;
 pub const SVC: u16 = 0x43;
 pub const MAGIC: u64 = 0x4359_5843_4c53_3031;
-pub const VERSION: u64 = 2;
+pub const VERSION: u64 = 3;
 pub const PAYLOAD: usize = 4096;
 pub const OK: u64 = 0;
 pub const AGAIN: u64 = 1;
@@ -56,6 +56,35 @@ pub struct PolicyWire {
     pub controller_epoch: u64,
     pub action_index: u64,
 }
+/// Protected replay operation, deliberately outside the model Action ABI.
+/// The replay owner keeps this identity until the real quote owner replies.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteStopWire {
+    pub boot_epoch: u64,
+    pub replay_id: u64,
+    pub owner_id: u64,
+    pub owner_generation: u64,
+    pub sequence: u64,
+    pub issued_ns: u64,
+}
+impl QuoteStopWire {
+    pub const EMPTY: Self = Self { boot_epoch: 0, replay_id: 0, owner_id: 0,
+        owner_generation: 0, sequence: 0, issued_ns: 0 };
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteStopReceiptWire {
+    pub command: QuoteStopWire,
+    pub offer_version: u64,
+    pub started_ns: u64,
+    pub finished_ns: u64,
+    pub outcome: u64,
+}
+impl QuoteStopReceiptWire {
+    pub const EMPTY: Self = Self { command: QuoteStopWire::EMPTY, offer_version: 0,
+        started_ns: 0, finished_ns: 0, outcome: DOMAIN_PENDING };
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DomainInput {
@@ -77,6 +106,7 @@ pub struct DomainInput {
     pub network_queued_bytes: u64,
     pub network_queue_depth: u64,
     pub network_active: u64,
+    pub quote_stop: QuoteStopWire,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -138,6 +168,8 @@ pub struct DomainFeedback {
     pub tx_last_ordinary: u64,
     pub tx_last_reserved: u64,
     pub waiting: [PendingPlacementWire; 32],
+    pub quote_stop: QuoteStopReceiptWire,
+    pub quotes_stopped: u64,
 }
 #[repr(C, align(4096))]
 pub struct Shared {

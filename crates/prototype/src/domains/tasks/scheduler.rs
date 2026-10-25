@@ -26,6 +26,34 @@ pub struct ThreadSpec {
     pub minimum_ns: u64,
     pub budget_ns: u64,
 }
+/// Proof that admission has inserted the exact thread and its budget promise.
+/// The owner keeps its scheduler/resource gate held while constructing the
+/// corresponding task, and removes this reservation if construction fails.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ThreadReservation {
+    key: ObjectKey,
+    cpu: u16,
+    core_generation: u64,
+    admitted_ns: u64,
+}
+impl ThreadReservation {
+    pub fn key(&self) -> ObjectKey {
+        self.key
+    }
+    pub fn cpu(&self) -> u16 {
+        self.cpu
+    }
+    pub fn core_generation(&self) -> u64 {
+        self.core_generation
+    }
+    pub fn admitted_ns(&self) -> u64 {
+        self.admitted_ns
+    }
+}
+enum Admission {
+    Reserved(ThreadReservation),
+    Deferred(Error),
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunState {
     Runnable,
@@ -237,7 +265,32 @@ impl Scheduler {
         g.weight = weight;
         Ok(())
     }
+    /// Reserve actual scheduling capacity before the owner acquires task,
+    /// memory, or capability custody. `None` leaves no thread reservation and
+    /// permits the same queued request to wait within its original deadline.
+    pub fn prepare_admission(
+        &mut self,
+        spec: ThreadSpec,
+        layout: CpuLayout,
+        now: u64,
+    ) -> Result<Option<ThreadReservation>, Error> {
+        match self.admit_inner(spec, layout, now)? {
+            Admission::Reserved(reservation) => Ok(Some(reservation)),
+            Admission::Deferred(_) => Ok(None),
+        }
+    }
     pub fn admit(&mut self, spec: ThreadSpec, layout: CpuLayout, now: u64) -> Result<(), Error> {
+        match self.admit_inner(spec, layout, now)? {
+            Admission::Reserved(_) => Ok(()),
+            Admission::Deferred(error) => Err(error),
+        }
+    }
+    fn admit_inner(
+        &mut self,
+        spec: ThreadSpec,
+        layout: CpuLayout,
+        now: u64,
+    ) -> Result<Admission, Error> {
         self.time(now)?;
         valid_key(spec.key)?;
         let group = self.group(spec.group)?;
@@ -245,13 +298,8 @@ impl Scheduler {
         if !layout.permits(cpu) || spec.allowed_mask & (1u64 << cpu) == 0 {
             return Err(Error::Auth);
         }
-        if self.cpus[cpu].quarantine_generation != 0 {
-            return Err(Error::NotReady);
-        }
-        if self.cpus[cpu].control.is_some() {
-            return Err(Error::Busy);
-        }
-        self.roll(cpu, now)?;
+        // Permanent request/identity failures cannot be hidden by temporary
+        // pressure on an otherwise usable CPU.
         if spec.budget_ns == 0 || spec.budget_ns > CPU_BUDGET_NS || spec.minimum_ns > spec.budget_ns
         {
             return Err(Error::Budget);
@@ -264,8 +312,22 @@ impl Scheduler {
         {
             return Err(Error::Exists);
         }
+        if self.cpus[cpu].quarantine_generation != 0 {
+            return Err(Error::NotReady);
+        }
+        if self.cpus[cpu].control.is_some() {
+            return Ok(Admission::Deferred(Error::Busy));
+        }
+        match self.roll(cpu, now) {
+            Ok(()) => {}
+            // An outstanding exact credit must be settled by its actual owner.
+            Err(Error::Busy) => return Ok(Admission::Deferred(Error::Busy)),
+            Err(error) => return Err(error),
+        }
         if self.committed_ns(cpu) > CPU_BUDGET_NS - spec.budget_ns {
-            return Err(Error::Capacity);
+            // Live thread promises are released only by real removal. Unlike
+            // the retained spawn receipt table, this occupancy can clear.
+            return Ok(Admission::Deferred(Error::Capacity));
         }
         let remaining: u64 = self
             .threads
@@ -280,7 +342,7 @@ impl Scheduler {
             .saturating_add(spec.budget_ns)
             > CPU_BUDGET_NS
         {
-            return Err(Error::Budget);
+            return Ok(Admission::Deferred(Error::Budget));
         }
         let minimum: u64 = self
             .threads
@@ -290,13 +352,11 @@ impl Scheduler {
             .map(|t| t.spec.minimum_ns.saturating_sub(t.spent))
             .sum();
         if minimum.saturating_add(spec.minimum_ns) > WINDOW_NS - now % WINDOW_NS {
-            return Err(Error::Budget);
+            return Ok(Admission::Deferred(Error::Budget));
         }
-        let slot = self
-            .threads
-            .iter_mut()
-            .find(|t| t.is_none())
-            .ok_or(Error::Capacity)?;
+        let Some(slot) = self.threads.iter_mut().find(|t| t.is_none()) else {
+            return Ok(Admission::Deferred(Error::Capacity));
+        };
         *slot = Some(Thread {
             spec,
             group,
@@ -306,7 +366,12 @@ impl Scheduler {
             actual: 0,
             last_dispatch: 0,
         });
-        Ok(())
+        Ok(Admission::Reserved(ThreadReservation {
+            key: spec.key,
+            cpu: spec.cpu,
+            core_generation: layout.generation,
+            admitted_ns: now,
+        }))
     }
     pub fn set_runnable(&mut self, key: ObjectKey, ready: bool, now: u64) -> Result<(), Error> {
         self.time(now)?;
@@ -838,6 +903,24 @@ impl Scheduler {
             .filter(|t| usize::from(t.spec.cpu) == cpu)
             .map(|t| t.spec.minimum_ns)
             .sum()
+    }
+    /// Actual outstanding thread promises in the current scheduler ledger.
+    /// Read-only diagnostics do not roll the window or retire active credit.
+    pub fn admission_observation(&self, cpu: usize) -> (u64, u64) {
+        self.threads
+            .iter()
+            .flatten()
+            .filter(|t| usize::from(t.spec.cpu) == cpu)
+            .fold((0u64, 0u64), |(budget, minimum), t| {
+                (
+                    budget.saturating_add(t.spec.budget_ns.saturating_sub(t.spent)),
+                    minimum.saturating_add(if t.state == RunState::Runnable {
+                        t.spec.minimum_ns.saturating_sub(t.spent)
+                    } else {
+                        0
+                    }),
+                )
+            })
     }
     pub fn thread_count(&self) -> usize {
         self.threads.iter().flatten().count()

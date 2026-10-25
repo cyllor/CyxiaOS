@@ -504,7 +504,9 @@ pub fn run(info: &BootInfo) -> ! {
             coordinator.poll();
             if !learning_installed {
                 match crate::domain_tasks::service_segment(|| {
-                    crate::smp::prototype_runtime::install_learning_capture(*LOCAL, boot.epoch)
+                    crate::smp::prototype_runtime::install_learning_capture(*LOCAL, boot.epoch)?;
+                    crate::peer_replay::init(boot.epoch)?;
+                    crate::learning_replay::init()
                 }) {
                     Some(Ok(())) => {
                         learning_installed = true;

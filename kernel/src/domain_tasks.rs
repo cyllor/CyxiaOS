@@ -15,16 +15,25 @@ mod execution;
 mod memory;
 #[path = "domain_tasks/service_authority.rs"]
 mod service_authority;
+#[path = "domain_tasks/publication.rs"]
+mod publication;
+pub(crate) use publication::{BaselinePublication, reserve_baseline_publication};
+#[path = "domain_tasks/local_evidence.rs"]
+mod local_evidence;
+#[path = "domain_tasks/replay.rs"]
+pub mod replay;
+pub use local_evidence::bind_local_failure_request;
 pub use abi::{
     close_network, fault, grant_endpoint, grant_file_cap, network_drain, network_key,
     network_pending, network_write, open_network, syscall,
 };
 pub use execution::{
     cancel_spawn, close_admission, dispatch, heartbeat_ns, init_recoverable, probe_status,
-    query_local, query_spawn, readonly_drained, recoverable_key, recoverable_result,
+    query_local, local_result, acknowledge_local_result, query_spawn, readonly_drained, recoverable_key, recoverable_result,
     recoverable_submit, remote_activate, remote_capacity, remote_fault, remote_release,
     remote_selected, remote_start, remote_stopped, remote_word, request_stop, running, service,
     start_generation, start_probe_client, stopped, submit_local, submit_spawn,
+    service_io_piece,
 };
 pub use memory::{
     cache_read, copyin, copyout, invalidate_file, probe_user, set_cache_loader, set_file_service,
@@ -269,6 +278,7 @@ struct ExitRecord {
     parent: ObjectKey,
     code: u64,
     value: u64,
+    finished_ns: u64,
 }
 #[derive(Clone, Copy)]
 struct Rate {
@@ -597,6 +607,7 @@ fn admit_service(s: &mut State, now: u64) -> Result<(), Error> {
         now,
     )?;
     s.service_admitted = true;
+    replay::service_admitted();
     Ok(())
 }
 pub fn publish_layout(
@@ -704,9 +715,16 @@ pub struct Credit {
     optional: bool,
 }
 struct Captures(core::cell::UnsafeCell<[Option<crate::learning_evidence::OwnerAttempt>; 64]>);
+// Include the complete existing per-CPU bank after its token gains retained
+// exit metadata; the learning workspace bound must not hide that growth.
+pub const CAPTURE_CREDIT_BYTES: usize = core::mem::size_of::<Captures>();
 // Slot i is accessed only by CPU i, and never by an interrupt handler.
 unsafe impl Sync for Captures {}
 static CAPTURES: Captures = Captures(core::cell::UnsafeCell::new([const { None }; 64]));
+struct WarmCaptures(core::cell::UnsafeCell<[Option<crate::learning_prewarm::Attempt>; 64]>);
+// The same per-CPU ownership as CAPTURES; IRQs never access these cells.
+unsafe impl Sync for WarmCaptures {}
+static WARM_CAPTURES: WarmCaptures = WarmCaptures(core::cell::UnsafeCell::new([const { None }; 64]));
 fn track_credit(
     slot: usize,
     result: Result<Option<Credit>, Error>,
@@ -724,11 +742,15 @@ fn track_credit(
                 .add(slot);
             let old = cell.replace(attempt);
             drop(old);
+            let warm = WARM_CAPTURES.0.get().cast::<Option<crate::learning_prewarm::Attempt>>().add(slot);
+            drop(warm.replace(crate::learning_prewarm::attempt_task(credit.thread)));
         }
     }
     result
 }
 fn finish_capture(slot: usize, first: u64, last: u64) {
+    let warm = unsafe { WARM_CAPTURES.0.get().cast::<Option<crate::learning_prewarm::Attempt>>().add(slot).replace(None) };
+    if let Some(mut warm) = warm { let _ = crate::learning_prewarm::finish(&mut warm, first, last); }
     let attempt = unsafe {
         CAPTURES
             .0
@@ -953,28 +975,23 @@ pub fn begin_service_segment() -> Option<Credit> {
 /// Authority for a bounded CPU0 mechanism piece, including exact baseline
 /// restoration after an optional numerical worker has failed. Merely running
 /// on CPU0, an EL0 TLS slice or an already submitted bill is insufficient.
+pub(crate) struct PaidServiceWitness { _private: () }
+fn service_witness_locked(s: &State) -> Result<PaidServiceWitness, Error> {
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) { return Err(Error::Auth); }
+    let active = s.active[0].as_ref().ok_or(Error::NotReady)?;
+    service_authority::authorize(service_authority::View {
+        cpu: cpu::slot(), held: active.dispatch, actual: s.scheduler.active(0), layout: s.layout,
+        draining: s.draining, quarantine: s.scheduler.stats().quarantine_mask,
+        kind: CREDIT_KIND[0].load(Ordering::Acquire), published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
+        settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
+    }, now_ns())?;
+    Ok(PaidServiceWitness { _private: () })
+}
 pub fn authorize_service_turn() -> Result<(), Error> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return Err(Error::Auth);
     }
-    locked(|s| {
-        let active = s.active[0].as_ref().ok_or(Error::NotReady)?;
-        let d = active.dispatch;
-        service_authority::authorize(
-            service_authority::View {
-                cpu: cpu::slot(),
-                held: d,
-                actual: s.scheduler.active(0),
-                layout: s.layout,
-                draining: s.draining,
-                quarantine: s.scheduler.stats().quarantine_mask,
-                kind: CREDIT_KIND[0].load(Ordering::Acquire),
-                published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
-                settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
-            },
-            now_ns(),
-        )
-    })
+    locked(|s| service_witness_locked(s).map(|_| ()))
 }
 /// Actual stopped file syscalls awaiting the CPU0 owner. This is demand, not
 /// permission to replay a request: completion custody and in-flight requests
@@ -1177,6 +1194,21 @@ pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCr
             .reserve_control(slot, s.layout, now_ns(), required_ns)
     })
 }
+/// Authenticate the exact still-live reservation on its original control CPU.
+/// Reconstructed or already-settled credits cannot authorize replay CPU work.
+pub(crate) fn verify_control_credit(credit: &ControlCredit) -> Result<(), Error> {
+    let slot = cpu::slot();
+    if !matches!(slot, 1 | 2) || usize::from(credit.cpu) != slot {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        if s.scheduler.control_active(slot) == Some(*credit) {
+            Ok(())
+        } else {
+            Err(Error::Stale)
+        }
+    })
+}
 pub fn complete_control(
     credit: ControlCredit,
     actual_ns: u64,
@@ -1329,26 +1361,26 @@ pub fn enumerate_target(domain: u16, ordinal: usize) -> Option<ObjectKey> {
     .flatten()
 }
 pub fn current_action(domain: u16, target: ObjectKey) -> Result<Action, Error> {
-    locked(|s| {
-        let now = now_ns();
-        match domain {
-            1 => Ok(Action::CpuWeight(s.scheduler.weight(target, now)?)),
-            2 => Ok(Action::SpawnTokens(s.admission.tokens(target, now)?)),
-            3 if target == MEMORY_KEY => {
-                let (pages, batch) = s.memory.cache_policy(now);
-                Ok(Action::Cache { pages, batch })
-            }
-            5 => {
-                let (budget, batch) = s.ipc.policy(target, now)?;
-                Ok(Action::Ipc { budget, batch })
-            }
-            8 if target == SERVICE_KEY => Ok(Action::ServiceBatch(s.services.policy(now))),
-            13 => Ok(Action::BackgroundBudget(
-                s.background.peek_status(target, now)?.budget_milli,
-            )),
-            _ => Err(Error::Stale),
+    locked(|s| current_locked(s, domain, target, now_ns()))
+}
+fn current_locked(s: &State, domain: u16, target: ObjectKey, now: u64) -> Result<Action, Error> {
+    match domain {
+        1 => Ok(Action::CpuWeight(s.scheduler.weight(target, now)?)),
+        2 => Ok(Action::SpawnTokens(s.admission.tokens(target, now)?)),
+        3 if target == MEMORY_KEY => {
+            let (pages, batch) = s.memory.cache_policy(now);
+            Ok(Action::Cache { pages, batch })
         }
-    })
+        5 => {
+            let (budget, batch) = s.ipc.policy(target, now)?;
+            Ok(Action::Ipc { budget, batch })
+        }
+        8 if target == SERVICE_KEY => Ok(Action::ServiceBatch(s.services.policy(now))),
+        13 => Ok(Action::BackgroundBudget(
+            s.background.peek_status(target, now)?.budget_milli,
+        )),
+        _ => Err(Error::Stale),
+    }
 }
 pub fn observation(domain: u16, target: ObjectKey) -> Result<[u64; 4], Error> {
     locked(|s| {
@@ -1526,11 +1558,15 @@ pub fn service_endpoints(target: ObjectKey) -> Result<[ObjectKey; 2], Error> {
     if target != SERVICE_KEY || !READY.load(Ordering::Acquire) {
         return Err(Error::Stale);
     }
-    locked(|s| {
-        s.ipc.stats(s.task_endpoint)?;
-        s.ipc.stats(s.file_endpoint)?;
-        Ok([s.task_endpoint, s.file_endpoint])
-    })
+    locked(|s| service_endpoints_locked(s, target))
+}
+fn service_endpoints_locked(s: &State, target: ObjectKey) -> Result<[ObjectKey; 2], Error> {
+    if target != SERVICE_KEY || !READY.load(Ordering::Acquire) {
+        return Err(Error::Stale);
+    }
+    s.ipc.stats(s.task_endpoint)?;
+    s.ipc.stats(s.file_endpoint)?;
+    Ok([s.task_endpoint, s.file_endpoint])
 }
 pub fn common_metrics() -> Result<[u64; 3], Error> {
     locked(|s| {
@@ -1678,14 +1714,21 @@ fn scheduling_dependencies(
     if !matches!(target.id, 15 | 16) {
         return Ok([None; 2]);
     }
-    locked(|s| {
-        group_index(s, target)?;
-        s.background.status(target)?;
-        Ok([
-            Some(crate::domain_control::Prerequisite { domain: 13, target }),
-            None,
-        ])
-    })
+    locked(|s| scheduling_dependencies_locked(s, target))
+}
+fn scheduling_dependencies_locked(
+    s: &State,
+    target: ObjectKey,
+) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error> {
+    if !matches!(target.id, 15 | 16) {
+        return Ok([None; 2]);
+    }
+    group_index(s, target)?;
+    s.background.status(target)?;
+    Ok([
+        Some(crate::domain_control::Prerequisite { domain: 13, target }),
+        None,
+    ])
 }
 fn vector_dependencies(
     target: ObjectKey,

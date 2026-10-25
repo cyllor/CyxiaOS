@@ -655,20 +655,22 @@ impl Drop for Guard {
         BORROWED.store(false, Ordering::Release);
     }
 }
-/// C copies only an already-published immutable view. It never takes BORROWED:
+/// C projects only needed fields from an already-published immutable view.
+/// The projection is bounded and calls no owner. It never takes BORROWED:
 /// legacy synchronous CPU0 owners cannot be made Busy by policy observation.
-fn control_view(now: u64) -> Result<ControlView, DomainError> {
+fn control_view<R>(now: u64, project: impl FnOnce(&ControlView) -> R) -> Result<R, DomainError> {
     if !DEVICE_READY.load(Ordering::Acquire) {
         return Err(DomainError::NotReady);
     }
-    let view = CONTROL_VIEW
-        .read()
+    CONTROL_VIEW
+        .inspect(|view| {
+            if now < view.at || now - view.at >= 50_000_000 || now >= view.until {
+                return Err(DomainError::Busy);
+            }
+            Ok(project(view))
+        })
         .map_err(|_| DomainError::Busy)?
-        .ok_or(DomainError::NotReady)?;
-    if now < view.at || now - view.at >= 50_000_000 || now >= view.until {
-        return Err(DomainError::Busy);
-    }
-    Ok(view)
+        .ok_or(DomainError::NotReady)?
 }
 pub fn try_with_journal<R>(
     f: impl FnOnce(&mut Journal, &mut NativeDisk, &mut [u8; 8192]) -> R,
@@ -745,7 +747,15 @@ pub fn facts() -> [u64; 38] {
 /// A coherent snapshot for canonical policy inputs; active I/O yields Busy.
 /// The owner can continue to publish independent atomic diagnostic facts.
 pub fn facts_read() -> Result<[u64; 38], DomainError> {
-    Ok(control_view(Board.now_ns())?.facts)
+    control_view(Board.now_ns(), |view| view.facts)
+}
+/// Per-candidate admission needs the current I/O uncertainty flag, not a copy
+/// of all 38 diagnostic counters. Freshness and owner deadline remain checked.
+pub fn validate_io_health() -> Result<(), DomainError> {
+    if control_view(Board.now_ns(), |view| view.facts[31])? != 0 {
+        return Err(DomainError::Io);
+    }
+    Ok(())
 }
 pub fn identity() -> Option<BootIdentity> {
     if !DEVICE_READY.load(Ordering::Acquire) {
@@ -813,10 +823,10 @@ pub fn cancel_background() -> Result<(), DomainError> {
     })?
 }
 pub fn current_io_action(now: u64) -> Result<Action, DomainError> {
-    Ok(control_view(now)?.io)
+    control_view(now, |view| view.io)
 }
 pub fn current_notify_batch(now: u64) -> Result<u8, DomainError> {
-    Ok(control_view(now)?.notify)
+    control_view(now, |view| view.notify)
 }
 /// CPU0 refreshes idle observations too. Metering is not a byte/credit grant.
 pub fn refresh_control_observation(now: u64) -> Result<(), DomainError> {

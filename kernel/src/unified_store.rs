@@ -66,16 +66,14 @@ pub fn request(
                 return (3, 0, 0);
             }
             let body = &(&*core::ptr::addr_of!(STAGE))[..stage.1];
-            // Only known recovery/closing event kinds may consume the closing reserve.
-            if key == 0
-                && !identity::initial_identity_allowed(
-                    key,
-                    (&*core::ptr::addr_of!(VOLUME)).as_ref().unwrap().used(),
-                    body,
-                )
-            {
+            if !identity::append_allowed(
+                key,
+                (&*core::ptr::addr_of!(VOLUME)).as_ref().unwrap().used(),
+                body,
+            ) {
                 return (3, 0, 0);
             }
+            // Only known recovery/closing event kinds may consume the closing reserve.
             let closing = body.len() >= 13
                 && &body[..4] == b"CXE1"
                 && (matches!(body[12], 5..=9 | 12 | 13)

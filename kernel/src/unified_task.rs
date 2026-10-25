@@ -29,6 +29,9 @@ static DEBITS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static MAX_SLICE: AtomicU64 = AtomicU64::new(0);
 static LEDGER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static RELEASE_STAGE: AtomicU64 = AtomicU64::new(0);
+pub fn replay_idle() -> bool { STATE.load(Ordering::Acquire) == 0 }
+pub fn package_digest() -> [u8; 32] { Sha256::digest(ELF).into() }
 fn phys(p: u64) -> u64 {
     p.checked_sub(crate::HIGH).unwrap()
 }
@@ -226,8 +229,14 @@ pub fn request(
     epoch: u64,
 ) -> (u64, usize, u64) {
     assert_eq!(cpu::slot(), 0);
+    if matches!(phase, 13 | 14 | 28) {
+        return crate::domain_network::application_request(phase, payload, len);
+    }
+    if matches!(phase, 21 | 22 | 23 | 25 | 26 | 29 | 30) {
+        return crate::peer_replay::broker(phase, token, payload, len, connected, epoch);
+    }
     let state = STATE.load(Ordering::Acquire);
-    if matches!(phase, 11 | 12) {
+    if matches!(phase, 11 | 12 | 27) {
         return crate::local_placement::request(phase, payload, len, Sha256::digest(ELF).into());
     }
     if phase == 10 {
@@ -280,7 +289,13 @@ pub fn request(
             return (3, 0, 0);
         };
         let leaf = unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Page>().add(2) } as u64;
+        if let Err(error) = crate::peer_replay::accept_remote(terms.contract, terms.input_hash, terms.package_hash, next) {
+            crate::peer_replay::abort_remote(next);
+            let _ = unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(next) };
+            return (if matches!(error, Error::Busy | Error::Again | Error::NotReady) { 1 } else { 3 }, 0, 0);
+        }
         if let Err(error) = crate::domain_tasks::remote_start(next, leaf) {
+            crate::peer_replay::abort_remote(next);
             let _ = unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(next) };
             return (
                 if matches!(
@@ -296,6 +311,7 @@ pub fn request(
             );
         }
         TOKEN.store(next, Ordering::Relaxed);
+        RELEASE_STAGE.store(0, Ordering::Release);
         EPOCH.store(epoch, Ordering::Relaxed);
         LENGTH.store(0, Ordering::Relaxed);
         CANCEL.store(false, Ordering::Relaxed);
@@ -402,29 +418,30 @@ pub fn request(
             }
         }
         4 => {
+            if state == 0 && RELEASE_STAGE.load(Ordering::Acquire) == 3 {
+                return (0, 0, token);
+            }
             if !matches!(state, 1 | 4 | 5) {
                 return (1, 0, token);
             }
-            if let Err(error) = crate::domain_tasks::remote_stopped(token)
-                .and_then(|()| crate::domain_tasks::remote_release(token))
-            {
-                return (
-                    if matches!(error, Error::Busy | Error::Again) {
-                        1
-                    } else {
-                        3
-                    },
-                    0,
-                    token,
-                );
+            if RELEASE_STAGE.load(Ordering::Acquire) == 0 {
+                if let Err(error) = crate::domain_tasks::remote_stopped(token)
+                    .and_then(|()| crate::domain_tasks::remote_release(token))
+                {
+                    return (if matches!(error, Error::Busy | Error::Again) { 1 } else { 3 }, 0, token);
+                }
+                RELEASE_STAGE.store(1, Ordering::Release);
             }
             unsafe {
                 core::ptr::write_bytes(core::ptr::addr_of_mut!(INPUT).cast::<u8>(), 0, 32768);
             }
-            if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(token) }.is_err() {
-                return (3, 0, 0);
+            if RELEASE_STAGE.load(Ordering::Acquire) == 1 {
+                if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(token) }.is_err() { return (3, 0, 0); }
+                RELEASE_STAGE.store(2, Ordering::Release);
             }
+            if crate::peer_replay::close_remote(token).is_err() { return (1, 0, token); }
             STATE.store(0, Ordering::Release);
+            RELEASE_STAGE.store(3, Ordering::Release);
             let _ = LEDGER_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 old.checked_add(1)
             });

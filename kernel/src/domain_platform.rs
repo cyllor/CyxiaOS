@@ -15,6 +15,10 @@ mod ipi;
 mod irq_metrics;
 #[path = "domain_platform/read_snapshot.rs"]
 pub(crate) mod read_snapshot;
+#[path = "domain_platform/replay.rs"]
+pub mod replay;
+#[path = "domain_platform/irq_replay.rs"]
+pub mod irq_replay;
 pub use ipi::{consume_ipi, ipi_enter, ipi_result, register_ipi_cpu, request_ipi};
 use irq_metrics::{Histogram, Snapshot};
 const IRQ_SLOTS: usize = 32;
@@ -384,6 +388,7 @@ pub fn irq_enter(gic: &Gic, irq: u32, cpu: usize, started: u64) -> bool {
     };
     INFLIGHT[i].fetch_add(1, Ordering::AcqRel);
     IRQ_STARTED[i].store(started, Ordering::Relaxed);
+    irq_replay::entered(irq, cpu, started);
     let _ = gic.mask(irq);
     MASKED[i].store(true, Ordering::Release);
     LAST_CPU[i].store(cpu as u64, Ordering::Relaxed);
@@ -397,6 +402,7 @@ pub fn irq_complete(irq: u32) {
             Some(v.saturating_add(ticks))
         });
         HISTOGRAMS[i].record(ticks, timer::frequency());
+        irq_replay::completed(irq, timer::ticks());
         INFLIGHT[i].fetch_sub(1, Ordering::Release);
     }
 }
@@ -574,9 +580,10 @@ pub fn poll(now: u64) -> Result<(), Error> {
             crate::learning_evidence::measure(key,
                 cyxia_prototype::learning::reward::CpuClass::ExecutorAction, || poll_route(i, now))?;
         }
-        unsafe {
-            (&mut *core::ptr::addr_of_mut!(TIMERS)).poll(now, TIMER_SLOTS, &mut TimerEvents)?;
-        }
+        crate::learning_evidence::measure(TIMER_SERVICE,
+            cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || unsafe {
+                (&mut *core::ptr::addr_of_mut!(TIMERS)).poll(now, TIMER_SLOTS, &mut TimerEvents)
+            })?;
         for i in 0..TIMER_SLOTS {
             let event = unsafe { (*core::ptr::addr_of_mut!(EVENTS))[i].take() };
             if let Some(key) = event

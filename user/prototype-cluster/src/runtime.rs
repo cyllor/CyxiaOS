@@ -293,6 +293,7 @@ pub fn run() -> ! {
                 }) {
                     Ok((ticket, ())) => {
                         authenticated = Some((identity, ticket));
+                        driver.replay_authenticated(epoch, broker::clock_ns());
                         broker::trace(3);
                     }
                     Err(_) => break,
@@ -311,6 +312,7 @@ pub fn run() -> ! {
                 if driver.tick(now).is_err() {
                     break;
                 }
+                if driver.replay_wants_reconnect(epoch) { break; }
             }
             if outgoing
                 .service_at(

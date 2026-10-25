@@ -19,6 +19,8 @@ use cyxia_prototype::{
     policy::ExecutionState,
 };
 static READY: AtomicBool = AtomicBool::new(false);
+#[path = "domain_storage/replay.rs"]
+pub mod replay;
 static BUSY: AtomicBool = AtomicBool::new(false);
 static mut FILES: FileSystem<4096> = FileSystem::new();
 static METRICS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
@@ -135,16 +137,17 @@ fn publish(files: &FileSystem<4096>) {
         fsync_p99: METRICS[15].load(Ordering::Acquire),
     });
 }
-fn file_view(now: u64) -> Result<FileView, Error> {
+fn file_view<R>(now: u64, project: impl FnOnce(&FileView) -> Result<R, Error>) -> Result<R, Error> {
     ready_read()?;
-    let view = FILE_VIEW
-        .read()
+    FILE_VIEW
+        .inspect(|view| {
+            if now < view.at || now - view.at >= 50_000_000 {
+                return Err(Error::Busy);
+            }
+            project(view)
+        })
         .map_err(|_| Error::Busy)?
-        .ok_or(Error::NotReady)?;
-    if now < view.at || now - view.at >= 50_000_000 {
-        return Err(Error::Busy);
-    }
-    Ok(view)
+        .ok_or(Error::NotReady)?
 }
 pub fn init() -> Result<(), Error> {
     owner()?;
@@ -199,21 +202,21 @@ pub fn cache_usage() -> [u64; 4] {
 }
 pub fn cache_partition_status() -> Result<[u64; 4], Error> {
     let now = Board.now_ns();
-    let view = file_view(now)?;
-    if view.cache_until.is_some_and(|until| now >= until) {
-        return Err(Error::Busy);
-    }
-    Ok(view.cache)
+    file_view(now, |view| {
+        if view.cache_until.is_some_and(|until| now >= until) {
+            return Err(Error::Busy);
+        }
+        Ok(view.cache)
+    })
 }
 pub fn cache_backing() -> Result<(u64, u32), Error> {
     ready_read()?;
     // The static physical span cannot change during this boot. Startup may
     // inspect it before periodic service refreshes mutable admission facts.
     FILE_VIEW
-        .read()
+        .inspect(|view| view.backing)
         .map_err(|_| Error::Busy)?
-        .ok_or(Error::NotReady)?
-        .backing
+        .flatten()
         .ok_or(Error::NotReady)
 }
 pub fn set_cache_partition(pages: u32, batch: u16) -> Result<(), Error> {
@@ -238,16 +241,12 @@ pub fn cache_reclaim_turn() -> Result<usize, Error> {
 }
 pub fn validate_file_object(key: ObjectKey) -> Result<(), Error> {
     ready_read()?;
-    if storage::facts_read()?[31] != 0 {
-        return Err(Error::Io);
-    }
+    storage::validate_io_health()?;
     read_files(|f| f.stat_object(key).map(|_| ()))
 }
 pub fn stat_file_object(key: ObjectKey) -> Result<u64, Error> {
     ready_read()?;
-    if storage::facts_read()?[31] != 0 {
-        return Err(Error::Io);
-    }
+    storage::validate_io_health()?;
     read_files(|f| f.stat_object(key).map(|v| v.size))
 }
 pub fn read_cache_page(key: ObjectKey, page: u64, out: &mut [u8; 4096]) -> Result<(), Error> {
@@ -566,9 +565,8 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
     let slot = target_slot(domain, key)?;
     let now = Board.now_ns();
     match domain {
-        4 => {
-            let view = file_view(now)?;
-            let m = view.metrics;
+        4 => file_view(now, |view| {
+            let m = &view.metrics;
             let total = m.read_bytes.saturating_add(m.write_bytes);
             Ok([
                 if total == 0 {
@@ -585,7 +583,7 @@ pub fn observation(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
                         .min(1000) as u64
                 },
             ])
-        }
+        }),
         9 => {
             let f = storage::facts_read()?;
             let total = f[10].saturating_add(f[11]);
@@ -634,8 +632,7 @@ pub fn current_action(domain: u16, key: ObjectKey) -> Result<Action, Error> {
     let slot = target_slot(domain, key)?;
     let now = Board.now_ns();
     match domain {
-        4 => {
-            let view = file_view(now)?;
+        4 => file_view(now, |view| {
             Ok(if now < view.action_until {
                 view.action
             } else {
@@ -644,7 +641,7 @@ pub fn current_action(domain: u16, key: ObjectKey) -> Result<Action, Error> {
                     flush: 4,
                 }
             })
-        }
+        }),
         9 => storage::current_io_action(now),
         11 if slot == 0 => Ok(Action::NotifyBatch(storage::current_notify_batch(now)?)),
         11 => Ok(Action::NotifyBatch(
@@ -663,9 +660,7 @@ pub fn validate_action(action: Action, key: ObjectKey, now: u64) -> Result<(), E
             if u64::from(readahead) > c[2] || u64::from(flush) > c[3] {
                 return Err(Error::Capacity);
             }
-            if storage::facts_read()?[31] != 0 {
-                return Err(Error::Io);
-            }
+            storage::validate_io_health()?;
         }
         Action::IoShare(_) => {
             let f = storage::facts_read()?;

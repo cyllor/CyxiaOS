@@ -339,6 +339,7 @@ pub fn discard(job_key: ObjectKey) -> Result<(), Error> {
 /// old execution pins and already published plans keep their exact identities.
 pub fn promote(governance: &mut Governance<'_, '_>) -> Result<ModelBinding, Error> {
     control(|state| {
+        if !super::replay::model_change_allowed() { return Err(Error::Unknown); }
         let active = state.registry.model();
         let gate = state.model_gate.as_mut().ok_or(Error::State)?;
         if gate.active() != active || state.models.active().map_err(native_error)? != active
@@ -362,6 +363,7 @@ pub fn promote(governance: &mut Governance<'_, '_>) -> Result<ModelBinding, Erro
 }
 pub fn rollback(governance: &mut Governance<'_, '_>) -> Result<ModelBinding, Error> {
     control(|state| {
+        if !super::replay::model_change_allowed() { return Err(Error::Unknown); }
         let active = state.registry.model();
         let gate = state.model_gate.as_mut().ok_or(Error::State)?;
         if gate.active() != active || state.models.active().map_err(native_error)? != active {

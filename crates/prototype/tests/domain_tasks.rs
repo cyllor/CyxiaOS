@@ -544,6 +544,35 @@ fn spawn_terminal_receipts_bound_memory_without_eviction_or_reexecution() {
     assert!(a.service_one(0, &mut b).unwrap().is_some());
 }
 
+#[test]
+fn replay_caller_retirement_preserves_live_unknown_and_other_generations() {
+    let mut admission = SpawnAdmission::new(); admission.register_group(key(1)).unwrap();
+    let mut creator = Creator::default();
+    admission.submit(request(1, false), 0, &mut creator).unwrap();
+    assert_eq!(admission.retire_closed_caller(key(1)), Err(Error::Busy));
+    admission.service_one(0, &mut creator).unwrap();
+    let SpawnState::Created(child) = admission.query(key(1), 1).unwrap() else { panic!("real child"); };
+    assert_eq!(admission.retire_closed_caller(key(1)), Err(Error::Busy));
+    admission.exited(child).unwrap();
+    let next = ObjectKey { generation: 2, ..key(1) };
+    let next_request = SpawnRequest { caller: next, ..request(2, false) };
+    admission.submit(next_request, WINDOW_NS, &mut creator).unwrap();
+    assert_eq!(admission.retire_closed_caller(key(1)), Ok(1));
+    assert_eq!(admission.query(key(1), 1), Err(Error::NotFound));
+    assert_eq!(admission.query(next, 2), Ok(SpawnState::Queued));
+    creator.uncertain = true; admission.service_one(WINDOW_NS, &mut creator).unwrap();
+    assert_eq!(admission.query(next, 2), Ok(SpawnState::Unknown));
+    assert_eq!(admission.retire_closed_caller(next), Err(Error::Busy));
+    assert_eq!(admission.query(next, 2), Ok(SpawnState::Unknown));
+    admission.reconcile(next, 2, CreateOutcome::Rejected(Error::Io)).unwrap();
+    assert_eq!(admission.retire_closed_caller(next), Ok(1));
+    // Revocation remains the real caller owner's obligation: an expired
+    // caller cannot create a replacement after releasing its terminal rows.
+    creator.deny = true;
+    assert_eq!(admission.submit(request(1, false), 2 * WINDOW_NS, &mut creator), Err(Error::Auth));
+    assert_eq!(creator.calls.len(), 2);
+}
+
 struct Backing {
     pages: Vec<[u8; 4096]>,
     maps: BTreeMap<(ObjectKey, u64), (usize, bool)>,

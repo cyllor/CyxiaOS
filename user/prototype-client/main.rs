@@ -54,7 +54,7 @@ fn handle(frame: &mut file::Frame, id: u64, generation: u64) {
 }
 
 #[inline(never)]
-fn mixed_vector(file_cap: u64, generation: u64, deadline: u64) -> u64 {
+fn mixed_vector(file_cap: u64, generation: u64, file_size: u64, deadline: u64) -> u64 {
     let own = call(16, 0, 0, 0, 0, 0);
     if own[0] != 0 {
         return 121;
@@ -94,7 +94,7 @@ fn mixed_vector(file_cap: u64, generation: u64, deadline: u64) -> u64 {
     for i in 0..16 {
         if get(0x53000 + i * 24) != 1000 + i
             || get(0x53008 + i * 24) != 1
-            || (i % 2 == 0 && get(0x53010 + i * 24) != 16)
+            || (i % 2 == 0 && get(0x53010 + i * 24) != file_size)
         {
             return 126;
         }
@@ -138,7 +138,17 @@ fn mixed_vector(file_cap: u64, generation: u64, deadline: u64) -> u64 {
 /// remain eligible for the background owner between calls; this client never
 /// fabricates a policy receipt or waits synchronously for an AI decision.
 #[inline(never)]
-fn file_workload(authority: file::Capability, deadline: u64) -> u64 {
+fn file_workload(
+    authority: file::Capability,
+    file_cap: u64,
+    object_generation: u64,
+    deadline: u64,
+) -> u64 {
+    const DATA: u64 = 0x60000;
+    const LENGTH: u64 = 8 * 4096;
+    if call(14, DATA, 8, 1, 0, 0)[0] != 0 {
+        return 139;
+    }
     let mut frame = file::Frame::new(file::OPEN, 18, authority);
     frame.set_path("/domain-probe/value");
     frame.set_u16(file::OFF_MODE, file::MODE_READ_WRITE);
@@ -150,23 +160,20 @@ fn file_workload(authority: file::Capability, deadline: u64) -> u64 {
         frame.u64(file::OFF_HANDLE_GENERATION),
     );
     let mut request = 19;
-    for turn in 0..8u64 {
-        let offset = (turn % 4) * 4096;
-        for word in 0..512u64 {
-            put(
-                0x50000 + word * 8,
-                0xc0ff_ee00_0000_0000 | (turn << 16) | word,
-            );
+    for turn in 0..12u64 {
+        let offset = (turn % 4) * LENGTH;
+        for word in 0..LENGTH / 8 {
+            put(DATA + word * 8, 0xc0ff_ee00_0000_0000 | (turn << 16) | word);
         }
         frame = file::Frame::new(file::WRITE, request, authority);
         request += 1;
         handle(&mut frame, id, generation);
         frame.set_u64(file::OFF_OFFSET, offset);
-        frame.set_u64(file::OFF_DATA, 0x50000);
-        frame.set_u32(file::OFF_DATA_LENGTH, 4096);
+        frame.set_u64(file::OFF_DATA, DATA);
+        frame.set_u32(file::OFF_DATA_LENGTH, LENGTH as u32);
         if !file_call(&mut frame, deadline)
             || frame.result() != 0
-            || frame.u64(file::OFF_COUNT) != 4096
+            || frame.u64(file::OFF_COUNT) != LENGTH
         {
             return 133;
         }
@@ -175,25 +182,37 @@ fn file_workload(authority: file::Capability, deadline: u64) -> u64 {
         if !waiting(deadline) {
             return 134;
         }
-        for word in 0..512u64 {
-            put(0x50000 + word * 8, 0);
+        for word in 0..LENGTH / 8 {
+            put(DATA + word * 8, 0);
         }
         frame = file::Frame::new(file::READ, request, authority);
         request += 1;
         handle(&mut frame, id, generation);
         frame.set_u64(file::OFF_OFFSET, offset);
-        frame.set_u64(file::OFF_DATA, 0x50000);
-        frame.set_u32(file::OFF_DATA_LENGTH, 4096);
+        frame.set_u64(file::OFF_DATA, DATA);
+        frame.set_u32(file::OFF_DATA_LENGTH, LENGTH as u32);
         if !file_call(&mut frame, deadline)
             || frame.result() != 0
-            || frame.u64(file::OFF_COUNT) != 4096
+            || frame.u64(file::OFF_COUNT) != LENGTH
         {
             return 135;
         }
-        for word in 0..512u64 {
-            if get(0x50000 + word * 8) != 0xc0ff_ee00_0000_0000 | (turn << 16) | word {
+        for word in 0..LENGTH / 8 {
+            if get(DATA + word * 8) != 0xc0ff_ee00_0000_0000 | (turn << 16) | word {
                 return 136;
             }
+        }
+        // Every turn queries real file/task owners. This keeps D08 demand
+        // alongside the read/write workload, with observable tagged results
+        // under whichever batch policy is actually installed at dispatch.
+        let result = mixed_vector(
+            file_cap,
+            object_generation,
+            (turn + 1).min(4) * LENGTH,
+            deadline,
+        );
+        if result != 0 {
+            return result;
         }
     }
     frame = file::Frame::new(file::FSYNC, request, authority);
@@ -209,6 +228,9 @@ fn file_workload(authority: file::Capability, deadline: u64) -> u64 {
     handle(&mut frame, id, generation);
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 138;
+    }
+    if call(15, DATA, 0, 0, 0, 0)[0] != 0 {
+        return 140;
     }
     0
 }
@@ -320,7 +342,8 @@ fn files(authority: file::Capability, deadline: u64) -> u64 {
     if !file_call(&mut frame, deadline) || frame.result() != 0 || frame.u64(file::OFF_COUNT) == 0 {
         return 131;
     }
-    let mixed = mixed_vector(frame.u64(file::OFF_COUNT), object_generation, deadline);
+    let file_cap = frame.u64(file::OFF_COUNT);
+    let mixed = mixed_vector(file_cap, object_generation, 16, deadline);
     if mixed != 0 {
         return mixed;
     }
@@ -360,7 +383,7 @@ fn files(authority: file::Capability, deadline: u64) -> u64 {
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 118;
     }
-    let workload = file_workload(authority, deadline);
+    let workload = file_workload(authority, file_cap, object_generation, deadline);
     if workload != 0 {
         return workload;
     }
@@ -373,6 +396,60 @@ fn files(authority: file::Capability, deadline: u64) -> u64 {
     frame.set_path("/domain-probe");
     if !file_call(&mut frame, deadline) || frame.result() != 0 {
         return 120;
+    }
+    0
+}
+
+/// Submit ordinary pure jobs after the file/vector work. Accepted identities
+/// are retained across every pending/unknown query; retries never mint a new
+/// logical job. The service, not this caller, owns the placement deadline.
+#[inline(never)]
+fn placement_workload() -> u64 {
+    // Caller observation starts with this stage. Four accepted requests may
+    // traverse the owner serially; each keeps its own unchanged four-second
+    // service contract. This bound is never sent as a replacement job deadline.
+    let deadline = clock().saturating_add(4 * 4_000_000_000 + 1_000_000_000);
+    let mut requests = [(0u64, 0u64); 4];
+    for (index, request) in requests.iter_mut().enumerate() {
+        for word in 0..4u64 {
+            put(0x50000 + word * 8, index as u64 * 4 + word + 1);
+        }
+        loop {
+            let result = call(19, index as u64 + 1, 0x50000, 32, 0, 0);
+            if result[0] == 0 {
+                if result[1] == 0 || result[2] == 0 {
+                    return 141;
+                }
+                *request = (result[1], result[2]);
+                break;
+            }
+            if result[0] as i64 != -11 || !waiting(deadline) {
+                return 142;
+            }
+        }
+    }
+    let mut complete = 0u8;
+    while complete != 0b1111 {
+        for (index, request) in requests.iter().enumerate() {
+            if complete & (1 << index) != 0 {
+                continue;
+            }
+            let result = call(20, request.0, request.1, 0, 0, 0);
+            if result[0] as i64 == -11 {
+                continue;
+            }
+            if result[0] != 0 {
+                return 143;
+            }
+            match result[1] {
+                0 | 1 | 5 => {}
+                2 | 3 if result[2] != 0 && result[3] != 0 => complete |= 1 << index,
+                _ => return 144,
+            }
+        }
+        if complete != 0b1111 && !waiting(deadline) {
+            return 145;
+        }
     }
     0
 }
@@ -483,7 +560,14 @@ fn run(authority: file::Capability) -> u64 {
     if result != 0 {
         return result;
     }
+    let result = placement_workload();
+    if result != 0 {
+        return result;
+    }
     stage(5);
+    // This independent ordinary child receives a deadline relative to its
+    // actual submission, after the file and placement requests have settled.
+    let deadline = clock().saturating_add(4_000_000_000);
     for (i, value) in [1u64, 2, 3, 4].into_iter().enumerate() {
         put(0x50000 + i as u64 * 8, value);
     }

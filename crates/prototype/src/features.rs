@@ -71,12 +71,18 @@ pub const DOMAIN_LIMITS: [[u64; 4]; 16] = [
 ];
 pub const TARGET_LIMITS: [u64; 4] = [4000, 1000, 100000, 1];
 
-/// Wide arithmetic makes saturation independent of caller-sized integers.
+/// Preserve the exact wide-arithmetic rounding rule. All schema limits fit
+/// the native u64 path; very large caller-supplied limits retain the u128 path.
 pub fn normalize(value: u64, upper: u64) -> Result<(i16, bool), Error> {
     if upper == 0 {
         return Err(Error::Schema);
     }
-    let v = u128::from(value.min(upper));
+    let value_in_range = value.min(upper);
+    if upper <= u64::MAX / 513 {
+        // value_in_range <= upper, so both numerator and denominator fit.
+        return Ok((((512 * value_in_range + upper) / (2 * upper)) as i16, value > upper));
+    }
+    let v = u128::from(value_in_range);
     let h = u128::from(upper);
     Ok((((512 * v + h) / (2 * h)) as i16, value > upper))
 }

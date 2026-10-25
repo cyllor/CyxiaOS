@@ -44,3 +44,16 @@ fn header_rejects_flags_unknown_type_and_oversize_before_body_allocation() {
     bad[12..16].copy_from_slice(&65537u32.to_le_bytes());
     assert!(Header::decode(&bad).is_err());
 }
+
+#[test]
+fn replay_status_and_opaque_kernel_billing_frames_keep_bounded_authenticated_header_rules() {
+    let h = Header { kind: 48, body_len: 2048, sequence: 1, request: [7; 16], cluster: [8; 32],
+        epoch: 2, sender_boot: 3, receiver_boot: 4 };
+    for kind in [48, 0x8030, 0x8031, 56] {
+        let value = Header { kind, ..h }; assert_eq!(Header::decode(&value.encode()), Ok(value));
+        assert!(Header::decode(&Header { receiver_boot: 0, ..value }.encode()).is_err());
+        assert!(Header::decode(&Header { sequence: 0, ..value }.encode()).is_err());
+        assert!(Header::decode(&Header { body_len: 65537, ..value }.encode()).is_err());
+    }
+    for kind in [47, 50, 55, 57] { assert!(Header::decode(&Header { kind, ..h }.encode()).is_err()); }
+}

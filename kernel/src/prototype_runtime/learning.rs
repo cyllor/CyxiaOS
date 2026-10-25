@@ -1958,12 +1958,10 @@ pub(super) fn step(worker: &mut Worker) {
         Ok(extra) => Some(extra),
         Err(_) => None,
     };
-    let mut capture = crate::learning_evidence::attempt(
-        OWNER,
-        cyxia_prototype::learning::reward::CpuClass::Policy,
-    )
-    .ok()
-    .flatten();
+    // This separately budgeted turn performs learning/session bookkeeping,
+    // trace export or numerical learning. It is not an adopted policy's P
+    // owner. Actual CACP generation/scoring/publication and controlled replay
+    // evaluation measure their own exact job target and physical CPU.
     if extra.is_some() {
         EXTRA_ACTIVE.store(true, Ordering::Release);
         if let Err(error) = turn(worker, credit, begin) {
@@ -1985,11 +1983,6 @@ pub(super) fn step(worker: &mut Worker) {
     EXTRA_ACTIVE.store(false, Ordering::Release);
     let end = timer::ticks();
     let actual = native::ns(end - begin);
-    if let Some(attempt) = capture.as_mut() {
-        let _ =
-            crate::learning_evidence::finish_attempt(attempt, native::ns(begin), native::ns(end));
-    }
-    drop(capture);
     worker.total_ns = worker.total_ns.saturating_add(actual);
     if worker.request.is_some() {
         worker.job_ns = worker.job_ns.saturating_add(actual);

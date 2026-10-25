@@ -52,7 +52,22 @@ def identity_metadata(directory):
     require(len(public)==len(peer)==len(local)==len(pin)==32,'identity public keys and pins must be 32 bytes')
     require(hashlib.sha256(public).digest()==local and hashlib.sha256(peer).digest()==pin and local!=pin,'identity public key/NodeID pin mismatch')
     require((directory/'key.der').is_file() and (directory/'key.der').stat().st_size>0,'own identity key is missing')
-    return dict(node_id=local.hex(),peer_node_id=pin.hex(),public_hex=public.hex(),public_sha256=hashlib.sha256(public).hexdigest(),certificate_sha256=sha(directory/'cert.der'))
+    billing=(directory/'billing.pub').read_bytes();peer_billing=(directory/'peer.billing.pub').read_bytes()
+    require(len(billing)==len(peer_billing)==len((directory/'billing.seed').read_bytes())==32,'provision separate 32-byte EL1 billing identities')
+    require(billing!=peer_billing and billing not in (public,peer) and peer_billing not in (public,peer),'billing and TLS identities must be independent')
+    derived=subprocess.run(['openssl','pkey','-inform','DER','-pubout','-outform','DER'],
+                           input=bytes.fromhex('302e020100300506032b657004220420')+(directory/'billing.seed').read_bytes(),
+                           capture_output=True,timeout=15)
+    require(derived.returncode==0 and derived.stdout==bytes.fromhex('302a300506032b6570032100')+billing,
+            'billing private identity does not match its provisioned public key')
+    return dict(node_id=local.hex(),peer_node_id=pin.hex(),public_hex=public.hex(),public_sha256=hashlib.sha256(public).hexdigest(),certificate_sha256=sha(directory/'cert.der'),billing_public_hex=billing.hex(),peer_billing_public_hex=peer_billing.hex())
+
+
+def audit_private_images(service,image,own_tls,peer_tls,own_billing,peer_billing):
+    for data in (service,image):
+        require(own_tls in data and peer_tls not in data,'image own-private-key-only audit failed')
+    require(own_billing not in service and peer_billing not in service,'EL0 service contains an EL1 billing private key')
+    require(own_billing in image and peer_billing not in image,'kernel billing key isolation audit failed')
 
 
 def parse_cargo_build_messages(text):
@@ -91,6 +106,7 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
     identities=[Path(identity_a).resolve(strict=True),Path(identity_b).resolve(strict=True)]
     require(all(not p.is_relative_to(ROOT) for p in identities),'private identities must be outside the source checkout')
     metadata=[identity_metadata(p) for p in identities]
+    require(all(metadata[i]['billing_public_hex']==metadata[1-i]['peer_billing_public_hex'] for i in range(2)),'billing public-key trust lists are not mutual')
     require(metadata[0]['node_id']!=metadata[1]['node_id'],'nodes must have distinct own private identities')
     output=Path(output).resolve()
     require(not output.exists() or (output.is_dir() and not any(output.iterdir())),'refuse to overwrite an existing build/evidence directory')
@@ -109,6 +125,7 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
         'installed_targets':['rustup','target','list','--installed']}.items()}
     require('aarch64-unknown-none\n' in versions['installed_targets']+'\n' and 'aarch64-unknown-none-softfloat' in versions['installed_targets'],'install both standard EL0 and softfloat EL1 Rust targets before building')
     keys=[(p/'key.der').read_bytes() for p in identities]
+    billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None
     for index,name in enumerate(('a','b')):
         per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0')
@@ -131,10 +148,10 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
         if task_hash is None:shutil.copyfile(package,output/'task.elf');(output/'task.elf').chmod(0o600)
         task_hash=found_hash
         public=output/f'node-{name}.pub';public.write_bytes((identities[index]/'own.pub').read_bytes());public.chmod(0o600)
-        for binary in (service,image):
-            data=binary.read_bytes()
-            require(keys[index] in data and keys[1-index] not in data,'image own-private-key-only audit failed')
+        audit_private_images(service.read_bytes(),image.read_bytes(),keys[index],keys[1-index],billing_seeds[index],billing_seeds[1-index])
+        billing_public=output/f'node-{name}.billing.pub';billing_public.write_bytes((identities[index]/'billing.pub').read_bytes());billing_public.chmod(0o600)
     require([identity_metadata(p) for p in identities]==metadata and all((p/'key.der').read_bytes()==keys[i] for i,p in enumerate(identities)),'external identity changed during the build')
+    require(all((p/'billing.seed').read_bytes()==billing_seeds[i] for i,p in enumerate(identities)),'billing identity changed during the build')
     require(code_source_map()==before,'code changed while building; preserve this failed build and rebuild from a source freeze')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)

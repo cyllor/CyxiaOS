@@ -49,9 +49,12 @@ fn transfer(a: &mut Session<'_>, b: &mut Session<'_>) {
     }
 }
 fn handshake(a: &mut Session<'_>, b: &mut Session<'_>) {
+    handshake_at(a, b, 0)
+}
+fn handshake_at(a: &mut Session<'_>, b: &mut Session<'_>, now: u64) {
     for _ in 0..20000 {
-        a.pump(0).unwrap();
-        b.pump(0).unwrap();
+        a.pump(now).unwrap();
+        b.pump(now).unwrap();
         transfer(a, b);
         transfer(b, a);
         if a.authenticated_peer().is_some()
@@ -63,6 +66,40 @@ fn handshake(a: &mut Session<'_>, b: &mut Session<'_>) {
         }
     }
     panic!("TLS handshake failed to complete");
+}
+#[test]
+fn delayed_real_handshake_adopts_exact_rate_and_recovery_does_not_adopt_a_new_policy() {
+    let mut ingress = TlsIngress::new(0).unwrap();
+    ingress.install(policy(8), 0).unwrap();
+    assert_eq!(ingress.receipt.outcome, DOMAIN_PENDING);
+    ingress.observe(2500).unwrap();
+    assert_eq!(ingress.receipt.outcome, DOMAIN_PENDING, "installation and elapsed time are not execution");
+    let (ticket, [client, server]) = ingress.begin([10, 0, 0, 1], 3000, || Ok(pairings())).unwrap();
+    let mut left = Buffers::new();
+    let mut right = Buffers::new();
+    let mut a = client.client(&mut left, 3000).unwrap();
+    let mut b = server.server(&mut right, 3000).unwrap();
+    handshake_at(&mut a, &mut b, 3000);
+    assert!(a.authenticated_peer().is_some() && b.authenticated_peer().is_some());
+    ingress.finish(ticket, true, 3000).unwrap();
+    let adopted = ingress.receipt;
+    assert_eq!(adopted.outcome, DOMAIN_APPLIED);
+    assert_eq!(adopted.actual, 8);
+    assert_eq!((adopted.version, adopted.plan_seq, adopted.controller_epoch, adopted.action_index), (1, 19, 7, 2));
+    let session = ObjectKey { id: 9, generation: 3 };
+    let (reserved, ()) = ingress.enter_authenticated_at(session, 3_000_000_000, || Ok(())).unwrap();
+    let mut next = policy(4);
+    next.version = 2;
+    next.plan_seq = 20;
+    next.snapshot_ns = 4_000_000_000;
+    next.installed_until_ns = 14_000_000_000;
+    ingress.install_at(next, 4_000_000_000).unwrap();
+    ingress.leave_authenticated_at(session, reserved, 4_000_000_001).unwrap();
+    assert_eq!(ingress.receipt.outcome, DOMAIN_PENDING, "authenticated recovery cannot stand in for an unauthenticated admission");
+    let (next_ticket, ()) = ingress.begin_at([10, 0, 0, 1], 4_000_000_002, || Ok(())).unwrap();
+    assert_eq!(ingress.receipt.outcome, DOMAIN_APPLIED);
+    assert_eq!((ingress.receipt.version, ingress.receipt.plan_seq, ingress.receipt.actual), (2, 20, 4));
+    ingress.finish_at(next_ticket, true, 4_000_000_003).unwrap();
 }
 fn policy(value: u64) -> PolicyWire {
     PolicyWire {

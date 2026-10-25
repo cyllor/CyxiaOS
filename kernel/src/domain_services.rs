@@ -14,6 +14,11 @@ use cyxia_prototype::{
 
 #[path = "domain_services/console_baseline.rs"]
 mod console_baseline;
+#[path = "domain_services/replay_sources.rs"]
+mod replay_sources;
+pub const SOURCE_IDENTITY_BYTES: usize = replay_sources::IDENTITY_BYTES;
+#[path = "domain_services/replay_serial.rs"]
+pub mod replay_serial;
 
 const CORE_ID: u64 = 0x434f5245;
 const BACKGROUND_TIMER_ID: u64 = 2;
@@ -165,6 +170,9 @@ fn with<R>(f: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
     }
 }
 fn publish_view(state: &State) {
+    replay_sources::publish(state.console_key, state.services.map(|item| {
+        item.map(|service| (service.key, service.recipe))
+    }));
     let now = now_ns();
     let calls = state.console.calls.saturating_sub(state.console_calls);
     let full = state.console.full.saturating_sub(state.console_full);
@@ -337,6 +345,12 @@ pub fn enqueue_frame(session: u64, sequence: u64, payload: &[u8]) -> Result<(), 
     if !console_ready() {
         return Err(Error::NotReady);
     }
+    if crate::learning_canary::owns_output() || replay_serial::reserved() {
+        // Optional frames receive ordinary backpressure while the registered
+        // measurement owner holds a fixed workload. Emergency audit output
+        // has its own path and is not admitted through this queue.
+        return Err(Error::Again);
+    }
     let mut frame = Frame {
         bytes: [0; 128],
         used: 0,
@@ -346,6 +360,25 @@ pub fn enqueue_frame(session: u64, sequence: u64, payload: &[u8]) -> Result<(), 
     // A frame is admitted in one bounded copy, so backpressure never publishes
     // a partial transport frame or reorders a retried frame.
     with(|s| s.console.enqueue(&frame.bytes[..frame.used], now_ns()))
+}
+
+/// Typed CPU0-only access for the protected ordinary serial replay owner.
+/// The returned watermark is a byte already accepted into the actual queue.
+pub(crate) fn replay_console_enqueue(bytes: &[u8]) -> Result<u64, Error> {
+    crate::domain_tasks::authorize_service_turn()?;
+    with(|s| {
+        s.console.enqueue(bytes, now_ns())?;
+        s.console.written.checked_add(s.console.queued() as u64).ok_or(Error::Overflow)
+    })
+}
+pub(crate) fn replay_console_state() -> Result<(ObjectKey, u64, usize, bool), Error> {
+    crate::domain_tasks::authorize_service_turn()?;
+    with(|s| Ok((s.console_key, s.console.written, s.console.queued(), s.console.poisoned())))
+}
+/// The executor's actual accepted installation, before any UART receipt.
+pub(crate) fn replay_console_installation() -> Result<Option<(PolicyStamp, ExecutionState)>, Error> {
+    crate::domain_tasks::authorize_service_turn()?;
+    with(|s| Ok(s.console_record.map(|r| (r.stamp, r.state))))
 }
 struct Uart {
     base: u64,
@@ -385,6 +418,8 @@ fn console_state(s: &mut State, now: u64) {
     }
 }
 fn pump_console(s: &mut State, now: u64) -> Result<(), Error> {
+    let unresolved = s.console_record.is_some_and(|r| !r.state.terminal());
+    let _ = crate::learning_canary::before_console(&mut s.console, s.console_key, now, unresolved);
     if s.console_window != now / 100_000_000 {
         s.console_window = now / 100_000_000;
         s.console_calls = s.console.calls;
@@ -393,12 +428,10 @@ fn pump_console(s: &mut State, now: u64) -> Result<(), Error> {
         s.console_wait = 0;
     }
     let before = s.console.written;
-    let receipt = s.console.pump(
-        now,
-        &mut Uart {
-            base: crate::UART.load(Ordering::Acquire),
-        },
-    );
+    let receipt = crate::learning_evidence::measure(s.console_key,
+        cyxia_prototype::learning::reward::CpuClass::ExecutorWork, || s.console.pump(
+            now, &mut Uart { base: crate::UART.load(Ordering::Acquire) },
+        ));
     crate::interrupts::TEST_PROGRESS
         .bytes
         .fetch_add(s.console.written.saturating_sub(before), Ordering::Relaxed);
@@ -409,6 +442,8 @@ fn pump_console(s: &mut State, now: u64) -> Result<(), Error> {
         }
     }
     console_state(s, now);
+    let unresolved = s.console_record.is_some_and(|r| !r.state.terminal());
+    let _ = crate::learning_canary::after_console(&s.console, s.console_key, now_ns(), unresolved);
     receipt.map(|_| ())
 }
 
@@ -574,7 +609,7 @@ fn poll_services(s: &mut State, now: u64) -> Result<(), Error> {
                     }
                 }
             }
-        } else if service.active.is_none() && now >= service.next_probe {
+        } else if service.active.is_none() && now >= service.next_probe && !replay::owns(service.recipe) {
             let id = service.request;
             let next = id.checked_add(1).ok_or(Error::Overflow)?;
             match crate::domain_tasks::recoverable_submit(service.recipe, id, id) {
@@ -593,6 +628,8 @@ fn poll_services(s: &mut State, now: u64) -> Result<(), Error> {
     }
     Ok(())
 }
+#[path = "domain_services/replay.rs"]
+pub mod replay;
 
 /// Called from the outer CPU0 loop, never recursively from a disk progress
 /// callback. The callback may progress the coordinator and TCP owner only.
@@ -757,6 +794,7 @@ fn legal_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Resul
             if recipe != service.recipe {
                 return Err(Error::Auth);
             }
+            if replay::preparing(service.recipe) { return Err(Error::Busy); }
             if service.active.is_some() || s.recovery.isolated(target)? {
                 return Err(Error::Busy);
             }
@@ -814,6 +852,7 @@ fn legal_view(s: &ReadView, action: Action, target: ObjectKey, now: u64) -> Resu
             if recipe != service.recipe {
                 return Err(Error::Auth);
             }
+            if replay::preparing(service.recipe) { return Err(Error::Busy); }
             if service.active || service.isolated? {
                 return Err(Error::Busy);
             }

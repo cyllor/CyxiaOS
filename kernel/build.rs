@@ -349,6 +349,15 @@ fn main() {
             );
             std::fs::write(out.join(format!("{name}32")), bytes).unwrap();
         }
+        // Billing identity is deliberately never copied into the EL0 service
+        // build. A signed CPU ledger can only be produced by this kernel.
+        for name in ["billing.seed", "billing.pub", "peer.billing.pub"] {
+            let source = identity.join(name);
+            println!("cargo:rerun-if-changed={}", source.display());
+            let bytes = std::fs::read(source).expect("provision separate EL1 billing identities");
+            assert_eq!(bytes.len(), 32, "billing seed/public key must be 32 bytes");
+            std::fs::write(out.join(name), bytes).unwrap();
+        }
         let unix = env::var("CYXIA_CLUSTER_UNIX_SECONDS")
             .or_else(|_| env::var("SOURCE_DATE_EPOCH"))
             .map(|v| v.parse::<u64>().expect("provisioned clock epoch"))

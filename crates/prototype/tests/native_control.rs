@@ -4,6 +4,9 @@ pub use cyxia_prototype::{domains, features, model, policy_wire};
 mod abi;
 #[path = "../../../user/prototype-runtime/native.rs"]
 mod native;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_control/reply.rs"]
+mod root_reply;
 use cyxia_prototype::policy::{Candidate, CandidateSet, ModelBinding, Snapshot};
 use domains::{Action, ObjectKey, POLICY_NS};
 use sha2::{Digest, Sha256};
@@ -75,6 +78,10 @@ fn input_for(choices: &[Candidate], current: Action) -> ([u64; 512], [u8; 2772],
         input[65 + i * 10] = u64::from_le_bytes(p[..8].try_into().unwrap());
         input[66 + i * 10] = u64::from_le_bytes(p[8..].try_into().unwrap());
     }
+    let mut prior = [0; 16];
+    input[404] = cyxia_prototype::learning::baseline::encode(current, &mut prior).unwrap() as u64;
+    input[405] = u64::from_le_bytes(prior[..8].try_into().unwrap());
+    input[406] = u64::from_le_bytes(prior[8..].try_into().unwrap());
     (input, bytes, set)
 }
 fn input() -> ([u64; 512], [u8; 2772]) {
@@ -97,6 +104,69 @@ fn actual_el0_module_builds_formal_plan_with_stable_integer_argmax() {
     let plan = policy_wire::decode_plan(&raw[..out[5] as usize]).unwrap();
     assert_eq!(plan.action(0).unwrap().action, Action::TxBatch(1));
     assert!(out[64..].iter().all(|v| *v == 0));
+}
+
+#[test]
+fn stopped_offer_owner_state_replays_without_becoming_an_ai_action() {
+    let candidate = Candidate {
+        action: Action::OfferCpu(100),
+        features: features::RawFeatures::default(),
+    };
+    let (input, bytes, set) = input_for(&[candidate], Action::OfferCpu(0));
+    assert_eq!(native::prior(&input), Ok(Action::OfferCpu(0)));
+    let model = model::Model::parse(&bytes).unwrap();
+    let mut output = [0; 512];
+    native::evaluate(&input, &model, &mut output).unwrap();
+    let encoded: Vec<_> = output[16..64]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let plan = policy_wire::decode_plan(&encoded[..output[5] as usize]).unwrap();
+    assert_eq!(plan.action(0).unwrap().action, Action::OfferCpu(100));
+    let replay = CandidateSet::new(
+        set.snapshot,
+        set.target,
+        set.model,
+        &[candidate],
+        Some(native::prior(&input).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(replay.hash(), set.hash());
+    assert!(
+        CandidateSet::new(
+            set.snapshot,
+            set.target,
+            set.model,
+            &[
+                candidate,
+                Candidate {
+                    action: Action::OfferCpu(250),
+                    ..candidate
+                }
+            ],
+            Some(Action::OfferCpu(0))
+        )
+        .is_err()
+    );
+    assert!(
+        CandidateSet::new(
+            set.snapshot,
+            set.target,
+            set.model,
+            &[Candidate {
+                action: Action::OfferCpu(0),
+                ..candidate
+            }],
+            Some(Action::OfferCpu(0))
+        )
+        .is_err()
+    );
+    let mut false_family = input;
+    false_family[8] = 12;
+    assert!(native::prior(&false_family).is_err());
+    let mut false_candidate = input;
+    false_candidate[65] = 0;
+    assert!(native::evaluate(&false_candidate, &model, &mut output).is_err());
 }
 #[test]
 fn el0_rejects_noncanonical_candidate_and_reserved_bits() {
@@ -204,4 +274,59 @@ fn native_decoder_rejects_invalid_presence_and_absent_required_metrics() {
     );
     input[32] = 1;
     assert_eq!(native::candidate(&input, 0), Err(domains::Error::Format));
+}
+
+#[test]
+fn actual_core_control_output_is_checked_against_protected_root_job() {
+    let choices = [2, 6].map(|mask| Candidate {
+        action: Action::ControlSet(mask),
+        features: features::RawFeatures {
+            control_capacity: Some(u64::from(mask.count_ones()) * 1000),
+            ..features::RawFeatures::default()
+        },
+    });
+    let (mut input, bytes, set) = input_for(&choices, Action::ControlSet(2));
+    for (i, candidate) in choices.iter().enumerate() {
+        input[64 + i * 10 + 8] = candidate.features.control_capacity.unwrap();
+    }
+    let model = model::Model::parse(&bytes).unwrap();
+    let mut output = [0; 512];
+    native::evaluate(&input, &model, &mut output).unwrap();
+    let expected = || root_reply::Expected {
+        set: &set,
+        sequence: 1,
+        controller: 1,
+        base_version: 0,
+        started_ns: 10,
+        boot_epoch: 1,
+        output_magic: abi::OUTPUT_MAGIC,
+    };
+    let reply = root_reply::verify(expected(), &output).unwrap();
+    assert_eq!(reply.action, Action::ControlSet(2));
+    assert_eq!(reply.selected, 0);
+    assert_eq!(reply.scores[0], reply.scores[1]);
+    let plan = policy_wire::decode_plan(&reply.bytes[..reply.len]).unwrap();
+    assert_eq!(plan.action(0).unwrap().envelope.target, set.target);
+    assert_eq!(plan.header.active_until_local_ns, 0);
+    // EL0 cannot change the owning root identity, selection, model, frozen
+    // snapshot, or canonical padding even when all scores look plausible.
+    for word in [2, 3, 4, 5, 6, 7, 16, 28, 40, 64, 511] {
+        let mut changed = output;
+        changed[word] ^= 1;
+        assert!(
+            root_reply::verify(expected(), &changed).is_err(),
+            "word {word}"
+        );
+    }
+    let mut wrong = expected();
+    wrong.base_version = 1;
+    assert!(root_reply::verify(wrong, &output).is_err());
+    let mut wrong = expected();
+    wrong.started_ns = 11;
+    assert!(root_reply::verify(wrong, &output).is_err());
+    let mut wrong_set = set;
+    wrong_set.target.generation += 1;
+    let mut wrong = expected();
+    wrong.set = &wrong_set;
+    assert!(root_reply::verify(wrong, &output).is_err());
 }

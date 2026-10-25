@@ -1,6 +1,7 @@
 //! Bounded model learning and validation mechanisms. Untrained fixtures and
 //! incomplete native measurements never become accepted training labels.
 pub mod capture;
+pub mod baseline;
 pub mod data;
 pub mod governance;
 pub mod manifest;

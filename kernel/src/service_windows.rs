@@ -80,6 +80,27 @@ fn evidence_error(error: evidence::Error) -> Error {
         evidence::Error::Stale => Error::Stale, evidence::Error::Capacity => Error::Capacity,
         evidence::Error::Owner => Error::Auth, _ => Error::Conflict }
 }
+fn registration_slot(state: &State) -> Result<usize, Error> {
+    if let Some(slot) = state.registrations.iter().position(Option::is_none) { return Ok(slot); }
+    // Even a sealed capture owns its immutable request table until retirement.
+    // Reclaiming a registration must not detach that table from its consumer.
+    if evidence::current_config().map_err(evidence_error)?.is_some() { return Err(Error::Busy); }
+    let mut blocked = None;
+    for (slot, registration) in state.registrations.iter().enumerate() {
+        if state.scope.is_some_and(|scope| scope.registration == slot && !scope.done()) {
+            blocked.get_or_insert(Error::Busy);
+            continue;
+        }
+        let registration = registration.ok_or(Error::Stale)?;
+        match crate::domain_control::service_target_retired(
+            registration.family.domain, registration.family.kind, registration.target) {
+            Ok(true) => return Ok(slot),
+            Ok(false) => {}
+            Err(error) => { blocked.get_or_insert(error); }
+        }
+    }
+    Err(blocked.unwrap_or(Error::Capacity))
+}
 /// The actual protected baseline owner supplies exact units, minimum sample
 /// count and limits. Renewal cannot alter any boundary on this generation.
 pub fn register(registration: Registration) -> Result<(), Error> {
@@ -90,20 +111,58 @@ pub fn register(registration: Registration) -> Result<(), Error> {
             old.target == registration.target && old.family == registration.family) {
             return if *old == registration { Ok(()) } else { Err(Error::Conflict) };
         }
-        let slot = state.registrations.iter().position(Option::is_none).ok_or(Error::Capacity)?;
+        let slot = registration_slot(state)?;
         crate::domain_control::register_service_boundary(registration.family.domain, registration.family.kind,
             registration.target, registration.boundary, registration.origin_ns)?;
+        // Commit replacement only after the new owner accepted the boundary.
+        // A consumed old scope must not alias the replacement slot.
+        if state.scope.is_some_and(|scope| scope.registration == slot) { state.scope = None; }
         state.registrations[slot] = Some(registration); CONFIGURED.store(true, Ordering::Release); Ok(())
     })
+}
+/// A replay chooses a future whole-second origin on its first real
+/// registration. Later trials reuse that exact immutable boundary and origin.
+/// Passing the boot's zero timestamp after boot would be a stale registration.
+pub fn register_replay(family: Family, target: ObjectKey, boundary: Boundary) -> Result<(), Error> {
+    let registration = with(|state| {
+        if let Some(old) = state.registrations.iter().flatten().find(|old|
+            old.target == target && old.family == family) {
+            if old.boundary != boundary { return Err(Error::Conflict); }
+            return Ok(*old);
+        }
+        let at = crate::domain_platform::now_ns();
+        let origin_ns = (at / SECOND).checked_add(1).and_then(|v| v.checked_mul(SECOND)).ok_or(Error::Overflow)?;
+        Ok(Registration { family, target, boundary, origin_ns })
+    })?;
+    register(registration)
 }
 /// Bind the predeclared replay scope before its first event. A later trial may
 /// use a new scope while the exact object's thresholds and window origin stay
 /// frozen. A still-unconsumed capture cannot be replaced.
 pub fn prepare(family: Family, target: ObjectKey, scope_hash: [u8; 32], first_ns: u64, observation_ns: u64) -> Result<(), Error> {
+    prepare_scope(family, target, scope_hash, first_ns, observation_ns, false)
+}
+/// The target and SLO were registered before root activation. C1's exact first
+/// snapshot may precede this CPU0 binding, but no complete observation second
+/// may have elapsed and the protected capture must already match every field.
+pub fn prepare_started(family: Family, target: ObjectKey, scope_hash: [u8; 32], first_ns: u64, observation_ns: u64) -> Result<(), Error> {
+    owner()?;
+    let config = evidence::current_config().map_err(evidence_error)?.ok_or(Error::NotReady)?;
+    if config.family != family || config.frozen_scope_hash != scope_hash
+        || config.first_ns != first_ns || config.observation_ns != observation_ns { return Err(Error::Stale); }
+    prepare_scope(family, target, scope_hash, first_ns, observation_ns, true)
+}
+fn prepare_scope(family: Family, target: ObjectKey, scope_hash: [u8; 32], first_ns: u64, observation_ns: u64, started: bool) -> Result<(), Error> {
     with(|state| {
         let at = crate::domain_platform::now_ns();
-        if scope_hash == [0; 32] || first_ns < at || observation_ns < first_ns { return Err(Error::Stale); }
-        if state.scope.is_some_and(|old| !old.done()) { return Err(Error::Busy); }
+        if scope_hash == [0; 32] || (!started && first_ns < at) || observation_ns < first_ns
+            || (started && observation_ns.checked_add(SECOND).is_none_or(|end| at >= end)) { return Err(Error::Stale); }
+        if let Some(old) = state.scope {
+            let registration = state.registrations[old.registration].ok_or(Error::Stale)?;
+            if old.hash == scope_hash && old.first == first_ns && old.observation == observation_ns
+                && registration.family == family && registration.target == target { return Ok(()); }
+            if !old.done() { return Err(Error::Busy); }
+        }
         let i = state.registrations.iter().position(|r| r.is_some_and(|r| r.family == family && r.target == target)).ok_or(Error::NotReady)?;
         let registration = state.registrations[i].ok_or(Error::Stale)?;
         let offset = observation_ns.saturating_sub(registration.origin_ns).div_ceil(SECOND);

@@ -507,7 +507,11 @@ fn manage(s: &mut State) -> Result<Turn, Error> {
             Ok(Turn::Progress)
         }
         Stage::Ready => {
-            s.permit = Some(root::begin_canary(governance_mut(s)?)?);
+            let target = crate::domain_services::canary_target().map_err(native_error)?;
+            if !crate::learning_canary::prepare_baseline(target.key)? { return Ok(Turn::Retry); }
+            let permit = root::begin_canary(governance_mut(s)?)?;
+            s.permit = Some(permit);
+            crate::learning_canary::begin(permit)?;
             Ok(Turn::Progress)
         }
         Stage::Canary => {
@@ -539,12 +543,13 @@ fn manage(s: &mut State) -> Result<Turn, Error> {
         },
         Stage::Restoring => Ok(Turn::Retry),
         Stage::Rejected => {
+            crate::learning_canary::request_release();
             s.phase = Phase::Release;
             Ok(Turn::Progress)
         }
         // The Active bank owns the model independently. Retain this session's
         // rollback capability while allowing another real dataset to compute.
-        Stage::Active => Ok(Turn::Idle),
+        Stage::Active => { crate::learning_canary::request_release(); Ok(Turn::Idle) },
     }
 }
 
@@ -953,6 +958,17 @@ pub fn observe_second(
     }
     root::observe_second(governance_mut(s)?, second, baseline, candidate, workspace)
 }
+pub fn observe_second_bounded(second: u16, baseline: &[WorkRequest], candidate: &[WorkRequest], latencies: &mut [u64]) -> Result<(), Error> {
+    runtime::authorize_learning_turn().map_err(native_error)?;
+    let _guard = guard().map_err(native_error)?;
+    let base = BASE.load(Ordering::Acquire);
+    if base == 0 || !READY.load(Ordering::Acquire) { return Err(Error::DataIncomplete); }
+    let s = unsafe { &mut *state_pointer(base) };
+    let permit = s.permit.ok_or(Error::State)?;
+    let closed = permit.start_ns.checked_add(u64::from(second).checked_add(1).ok_or(Error::Numeric)?.checked_mul(1_000_000_000).ok_or(Error::Numeric)?).ok_or(Error::Numeric)?;
+    if now() < closed || closed > permit.expires_ns { return Err(Error::Deadline); }
+    root::observe_second_bounded(governance_mut(s)?, second, baseline, candidate, latencies)
+}
 pub fn extend(windows: u16) -> Result<(), Error> {
     runtime::authorize_learning_turn().map_err(native_error)?;
     let _guard = guard().map_err(native_error)?;
@@ -971,6 +987,7 @@ pub fn extend(windows: u16) -> Result<(), Error> {
             .ok_or(Error::Numeric)?;
         permit.windows = windows;
         permit.quota = windows;
+        crate::learning_canary::changed_permit(*permit)?;
     }
     Ok(())
 }

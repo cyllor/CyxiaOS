@@ -1174,6 +1174,20 @@ impl<'a, 'model> Governance<'a, 'model> {
         work: &mut RewardWorkspace,
         authority: &impl GovernanceAuthority,
     ) -> Result<(), Error> {
+        self.observe_second_bounded(gate, second, baseline, candidate, work.latency_scratch(), authority)
+    }
+    /// A one-second comparison needs only one latency per request. The native
+    /// owner uses its real 100-entry scratch instead of allocating CPU-union
+    /// workspace while the independent numerical worker retains its banks.
+    pub fn observe_second_bounded(
+        &mut self,
+        gate: &mut CommitGate,
+        second: u16,
+        baseline: &[WorkRequest],
+        candidate: &[WorkRequest],
+        latencies: &mut [u64],
+        authority: &impl GovernanceAuthority,
+    ) -> Result<(), Error> {
         let permit = self.permit.ok_or(Error::State)?;
         if !matches!(self.stage, Stage::Canary | Stage::Frozen)
             || second != self.seconds_seen
@@ -1216,8 +1230,8 @@ impl<'a, 'model> Governance<'a, 'model> {
         let digest = hash.finalize().into();
         authority.verify_measurement(permit, second, baseline, candidate, digest)?;
         let (baseline, candidate) = match (
-            reward::inspect_one_second(baseline, start, work),
-            reward::inspect_one_second(candidate, start, work),
+            reward::inspect_one_second_with_latencies(baseline, start, latencies),
+            reward::inspect_one_second_with_latencies(candidate, start, latencies),
         ) {
             (Ok(b), Ok(c)) => (b, c),
             _ => {

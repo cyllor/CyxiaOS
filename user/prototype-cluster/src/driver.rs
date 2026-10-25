@@ -10,6 +10,10 @@ use cyxia_prototype::cluster::{
 use cyxia_prototype_cluster::abi::*;
 #[path = "driver/domain.rs"]
 mod domain;
+#[path = "driver/billing.rs"]
+mod billing;
+#[path = "driver/replay.rs"]
+mod replay;
 use domain::NativeDomains;
 struct RingCrypto {
     signer: IdentitySigner,
@@ -52,6 +56,7 @@ struct OutSnapshot {
     items: Vec<Status>,
     cursor: usize,
     owned: Vec<OwnedStatus>,
+    reply: Option<[u8; 16]>,
 }
 struct InSnapshot {
     id: u64,
@@ -101,6 +106,8 @@ pub struct Driver {
     native_mode: bool,
     outgoing_input: Vec<u8>,
     native_started: Vec<TaskKey>,
+    billing_incoming: Vec<Vec<u8>>,
+    replay: Option<replay::Active>,
 }
 impl Driver {
     pub fn new(
@@ -148,7 +155,9 @@ impl Driver {
         }
         let mut ordinal = 2;
         while let Some(record) = read_record(ordinal)? {
-            if record.starts_with(cyxia_prototype_cluster::domain_placement::MAGIC) {
+            if record.starts_with(cyxia_prototype_cluster::application_journal::MAGIC) {
+                native.as_mut().ok_or(())?.recover_application(&record, peer)?;
+            } else if record.starts_with(cyxia_prototype_cluster::domain_placement::MAGIC) {
                 native.as_mut().ok_or(())?.recover(&record)?;
             } else {
                 engine.recover_event(&record).map_err(|_| ())?;
@@ -157,6 +166,9 @@ impl Driver {
             if ordinal > 32768 {
                 return Err(());
             }
+        }
+        if let Some(native) = native.as_mut() {
+            native.finish_application_recovery()?;
         }
         while let Some(e) = engine.recovery_loss().map_err(|_| ())? {
             persist(&mut engine, e)?;
@@ -216,6 +228,8 @@ impl Driver {
             native_mode,
             outgoing_input: Vec::new(),
             native_started: Vec::new(),
+            billing_incoming: Vec::new(),
+            replay: None,
         })
     }
     pub fn connect(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
@@ -405,6 +419,12 @@ impl Driver {
         Ok(())
     }
     fn status(&mut self) -> Result<(), ()> {
+        self.status_reply(None)
+    }
+    fn status_reply(&mut self, reply: Option<[u8; 16]>) -> Result<(), ()> {
+        if reply.is_some() && self.out_snapshot.is_some() {
+            return self.send(0x8030, Vec::new(), reply);
+        }
         if self.out_snapshot.is_none() {
             let mut items = self.engine.statuses();
             if items.len() > 4096 {
@@ -430,6 +450,7 @@ impl Driver {
                 items,
                 cursor: 0,
                 owned,
+                reply,
             });
         }
         self.status_page()
@@ -481,7 +502,8 @@ impl Driver {
             b.extend_from_slice(&c.boot.to_le_bytes());
             b.extend_from_slice(&c.epoch.to_le_bytes());
         }
-        self.send(2, b, None)?;
+        let reply = snapshot.reply;
+        self.send(if reply.is_some() { 0x8031 } else { 2 }, b, reply)?;
         let snapshot = self.out_snapshot.as_mut().ok_or(())?;
         snapshot.cursor = end;
         if end == snapshot.items.len() {
@@ -585,6 +607,12 @@ impl Driver {
         }
         self.engine.accept_header(&h).map_err(|_| ())?;
         match (kind, response) {
+            (56, false) if self.native_mode => {
+                // No CPU fields are interpreted or synthesized in EL0. The
+                // independent EL1 key and exact replay owner verify this body.
+                if b.len() > 2048 || self.billing_incoming.len() >= 4 { return Err(()); }
+                self.billing_incoming.push(b.to_vec());
+            }
             (3, false) => {
                 let c = Config::decode(b).map_err(|_| ())?;
                 if self.engine.local < self.engine.peer
@@ -643,7 +671,15 @@ impl Driver {
                 }
                 self.status()?;
             }
-            (2, false) | (2, true) => {
+            (48, false) => {
+                if !b.is_empty() || !self.engine.ready() { return Err(()); }
+                return self.status_reply(Some(h.request));
+            }
+            (48, true) => {
+                if !b.is_empty() { return Err(()); }
+                self.replay_status_complete(h.request, false, broker::clock_ns());
+            }
+            (2, false) | (2, true) | (49, true) => {
                 let mut r = Reader::new(b);
                 let proof = match r.byte()? {
                     0 => None,
@@ -784,6 +820,7 @@ impl Driver {
                     self.ready_sent = true;
                     self.send(6, self.session.to_vec(), None)?;
                 }
+                if h.kind == 0x8031 { self.replay_status_complete(h.request, true, broker::clock_ns()); }
             }
             (6, false) => {
                 if b != self.session {
@@ -1236,6 +1273,8 @@ impl Driver {
             self.quoted = true;
         }
         if self.native.is_some() {
+            self.billing_tick()?;
+            self.replay_tick(broker::clock_ns())?;
             self.native_quote_request(now)?;
         }
         if option_env!("CYXIA_CLUSTER_LEAVE") == Some("1")

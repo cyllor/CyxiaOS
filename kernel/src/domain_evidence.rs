@@ -68,6 +68,19 @@ pub fn initialize(boot: u64, model: ModelBinding) {
 pub fn registered(index: usize) {
     DOMAIN_CONTROL_EVIDENCE.0[3].fetch_or(1u64 << index, Ordering::Release);
 }
+/// Called under the same control-owner gate as begin/finish/progress. An
+/// accepted action owns its original input until the executor settles it;
+/// UNKNOWN is a live obligation, not an eviction opportunity. A full capture
+/// table applies backpressure before another candidate is registered.
+pub fn available_slot(start: usize) -> Option<usize> {
+    (0..SLOTS).map(|offset| (start + offset) % SLOTS).find(|&slot| {
+        let at = base(slot);
+        get(at + SEQLOCK) & 1 == 0
+            && (get(at) == 0
+                || get(at + 30) != 0
+                    && (get(at + 13) == 0 || matches!(get(at + 14), 2 | 3)))
+    })
+}
 pub fn begin(slot: usize, input: &[u64; 512], input_hash: [u8; 32]) {
     let at = base(slot);
     begin_write(at);
@@ -216,5 +229,77 @@ pub fn stability_failed(domain: u16, version: u64, failure: Error) {
         put(29, u64::from(domain));
         put(30, version);
         DOMAIN_CONTROL_EVIDENCE.0[28].store(error(failure), Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn proposal(sequence: u64, domain: u64) -> ([u64; 512], [u8; 32]) {
+        let mut input = core::array::from_fn(|i| sequence * 1024 + i as u64);
+        input[2] = sequence;
+        input[8] = domain;
+        input[9] = 1;
+        let bytes: Vec<_> = input.iter().flat_map(|w| w.to_le_bytes()).collect();
+        (input, Sha256::digest(bytes).into())
+    }
+
+    #[test]
+    fn delayed_executor_retains_original_input_reply_and_hash_until_real_terminal() {
+        // Use the actual native record writer and allocator. D12 can wait for
+        // a later TLS admission while unrelated control jobs wrap the ring.
+        let (input, hash) = proposal(1, 12);
+        let reply = [0x55u64; 512];
+        assert_eq!(available_slot(0), Some(0));
+        begin(0, &input, hash);
+        finish(0, 1, 10, 20, 30, 40, 7, ExecutionState::Pending, 2, Some(&reply));
+        progress(0, 1, 7, ExecutionState::Unknown, 50_000_001);
+        for sequence in 2..=4 * SLOTS as u64 {
+            let start = (sequence as usize - 1) % SLOTS;
+            let slot = available_slot(start).unwrap();
+            assert_ne!(slot, 0, "pending TLS admission lost its original input");
+            let (other, digest) = proposal(sequence, 10);
+            begin(slot, &other, digest);
+            finish(slot, sequence, 1, 1, 1, 1, sequence + 7,
+                ExecutionState::Pending, 0, Some(&reply));
+            progress(slot, sequence, sequence + 7, ExecutionState::Applied, sequence);
+        }
+        let at = base(0);
+        assert_eq!(get(at), 1);
+        assert_eq!(get(at + 13), 7);
+        assert_eq!(get(at + 14), 4);
+        assert_eq!(core::array::from_fn::<_, 512, _>(|i| get(at + INPUT + i)), input);
+        assert_eq!(core::array::from_fn::<_, 64, _>(|i| get(at + OUTPUT + i)), reply[..64]);
+        let stored_hash: Vec<_> = (0..4).flat_map(|i| get(at + 608 + i).to_le_bytes()).collect();
+        assert_eq!(stored_hash, hash);
+        progress(0, 2, 7, ExecutionState::Applied, 3_000_000_000);
+        progress(0, 1, 8, ExecutionState::Applied, 3_000_000_000);
+        assert_eq!(get(at + 14), 4, "another sequence/version cannot settle this action");
+        progress(0, 1, 7, ExecutionState::Applied, 3_000_000_000);
+        assert_eq!(get(at + 14), 2);
+        assert_eq!(get(at + 28), 3_000_000_000);
+        assert_eq!(get(64 + 12), 1);
+        assert_eq!(available_slot(0), Some(0));
+
+        // Every live slot is retained, including unfinished inference and
+        // UNKNOWN. No new job may evict one just to keep making progress.
+        for slot in 0..SLOTS {
+            let sequence = 1000 + slot as u64;
+            let (pending, digest) = proposal(sequence, 12);
+            begin(slot, &pending, digest);
+            if slot != 0 {
+                finish(slot, sequence, 1, 1, 1, 1, sequence,
+                    ExecutionState::Pending, 0, Some(&reply));
+                progress(slot, sequence, sequence, ExecutionState::Unknown, sequence);
+            }
+        }
+        assert_eq!(available_slot(0), None);
+        finish(0, 1000, 1, 1, 1, 0, 0,
+            ExecutionState::Failed(Error::Expired), 0, None);
+        assert_eq!(available_slot(1), Some(0));
+        progress(7, 1007, 1007, ExecutionState::Failed(Error::Again), 4_000_000_000);
+        assert_eq!(available_slot(7), Some(7));
     }
 }
