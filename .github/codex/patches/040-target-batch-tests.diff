@@ -1,0 +1,183 @@
+diff --git a/crates/prototype/tests/native_target_batch.rs b/crates/prototype/tests/native_target_batch.rs
+index 50c8369..45c464a 100644
+--- a/crates/prototype/tests/native_target_batch.rs
++++ b/crates/prototype/tests/native_target_batch.rs
+@@ -1,131 +1,48 @@
+ #[path = "../../../kernel/src/domain_control/target_batch.rs"]
+ mod target_batch;
+ use cyxia_prototype::domains::{Error, ObjectKey};
+-use target_batch::{FAMILIES, Query, Released, Source, queued_wcet_us, resolve};
++use target_batch::{FAMILIES, Query, Source, queued_wcet_us, resolve};
+ 
+ fn key(id: u64, generation: u64) -> ObjectKey {
+     ObjectKey { id, generation }
+ }
+-fn released(index: usize, due_ns: u64) -> Released {
+-    Released {
+-        source: Source::ALL[index % 5],
+-        query: Query {
+-            domain: index as u16 + 1,
+-            kind: 1,
+-            ordinal: index % 3,
+-        },
+-        due_ns,
+-    }
+-}
+ 
+ #[test]
+-fn eighteen_released_families_count_once_and_read_each_owner_once() {
+-    let mut reads = [0; 5];
+-    let mut exposed = [0; FAMILIES];
+-    let wcet = queued_wcet_us(
+-        7,
+-        100,
+-        |index| Some(released(index, 100)),
+-        |source, queries, output| {
+-            reads[Source::ALL.iter().position(|v| *v == source).unwrap()] += 1;
+-            assert!(queries.len() <= FAMILIES);
+-            resolve(queries, output, |q| Some(key(q.domain as u64, 9)))
+-        },
+-        |index, target| {
+-            exposed[index] += 1;
+-            assert_eq!(target.generation, 9);
+-            true
+-        },
+-    );
++fn every_released_mandatory_slot_counts_without_owner_projection() {
++    let mut reads = [0u32; FAMILIES];
++    let wcet = queued_wcet_us(7, 100, |index| {
++        reads[index] += 1;
++        Some(100)
++    });
+     assert_eq!(wcet, Ok(45_000));
+-    assert_eq!(reads, [1; 5]);
+-    assert_eq!(exposed, core::array::from_fn(|i| u32::from(i != 7)));
++    assert_eq!(reads, core::array::from_fn(|index| u32::from(index != 7)));
+ }
+ 
+ #[test]
+-fn unavailable_owner_discards_partial_count_and_retry_reads_all_fresh() {
+-    for unavailable in [Error::Busy, Error::Again, Error::NotReady] {
+-        let first = queued_wcet_us(
+-            0,
+-            100,
+-            |i| Some(released(i, 100)),
+-            |source, queries, output| {
+-                if source == Source::Network {
+-                    return Err(unavailable);
+-                }
+-                resolve(queries, output, |q| Some(key(q.domain as u64, 1)))
+-            },
+-            |_, _| panic!("an incomplete owner batch must expose no queue estimate"),
+-        );
+-        assert_eq!(first, Err(unavailable));
+-        let mut generations = Vec::new();
+-        assert_eq!(
+-            queued_wcet_us(
+-                0,
+-                100,
+-                |i| Some(released(i, 100)),
+-                |_, queries, output| resolve(queries, output, |q| Some(key(q.domain as u64, 2))),
+-                |_, target| {
+-                    generations.push(target.generation);
+-                    true
+-                }
+-            ),
+-            Ok(45_000)
+-        );
+-        assert_eq!(generations, vec![2; 17]);
+-    }
++fn active_future_and_unregistered_slots_are_excluded_deterministically() {
++    let active = 3;
++    let wcet = queued_wcet_us(active, 100, |index| match index {
++        5 => None,
++        8 | 12 => Some(101),
++        _ => Some(100),
++    });
++    // Current evaluation + fourteen other registered and released slots.
++    assert_eq!(wcet, Ok(37_500));
++    assert_eq!(queued_wcet_us(FAMILIES, 100, |_| Some(0)), Err(Error::Range));
+ }
+ 
+ #[test]
+-fn grouping_matches_scalar_due_cursor_absence_and_eligibility_rules() {
+-    let families = core::array::from_fn::<_, FAMILIES, _>(|i| {
+-        (i != 12).then(|| released(i, if i % 4 == 0 { 101 } else { 100 }))
+-    });
+-    let target = |q: Query| {
+-        if q.domain == 6 || q.ordinal > 1 {
+-            None
+-        } else {
+-            Some(key(
+-                q.domain as u64 * 10 + q.ordinal as u64,
+-                q.domain as u64 + 3,
+-            ))
+-        }
+-    };
+-    // Represent existing independent replay/model/blocked-desired exclusions.
+-    let eligible = |index: usize, key: ObjectKey| index % 7 != 0 && key.generation != 12;
+-    let active = 3;
+-    let expected = 2_500
+-        * (1 + families
+-            .iter()
+-            .enumerate()
+-            .filter(|(i, _)| *i != active)
+-            .filter_map(|(i, family)| family.filter(|f| f.due_ns <= 100).map(|f| (i, f)))
+-            .filter_map(|(i, f)| {
+-                target(f.query)
+-                    .or_else(|| {
+-                        target(Query {
+-                            ordinal: 0,
+-                            ..f.query
+-                        })
+-                    })
+-                    .map(|key| (i, key))
+-            })
+-            .filter(|(i, key)| eligible(*i, *key))
+-            .count() as u64);
++fn empty_object_walk_remains_a_required_released_evaluation() {
++    // Object absence is discovered only when the family's own turn runs. Its
++    // released slot still belongs to the mandatory 18-family control schedule.
+     assert_eq!(
+-        queued_wcet_us(
+-            active,
+-            100,
+-            |i| families[i],
+-            |_, queries, output| resolve(queries, output, target),
+-            eligible
+-        ),
+-        Ok(expected)
++        queued_wcet_us(0, 100, |index| (index == 1).then_some(100)),
++        Ok(5_000)
+     );
+ }
+ 
+ #[test]
+-fn unused_owners_are_not_read_and_projection_preserves_holes_and_fallback() {
++fn projection_preserves_holes_and_fallback() {
+     let queries = [
+         Query {
+             domain: 14,
+@@ -144,22 +61,6 @@ fn unused_owners_are_not_read_and_projection_preserves_holes_and_fallback() {
+     })
+     .unwrap();
+     assert_eq!(out, [None, Some(key(8, 2))]);
+-    let mut reads = 0;
+-    assert_eq!(
+-        queued_wcet_us(
+-            0,
+-            100,
+-            |i| (i == 1).then(|| released(i, 100)),
+-            |source, queries, output| {
+-                reads += 1;
+-                assert_eq!(source, Source::Services);
+-                resolve(queries, output, |_| None)
+-            },
+-            |_, _| panic!("no object is eligible")
+-        ),
+-        Ok(2_500)
+-    );
+-    assert_eq!(reads, 1);
+ }
+ 
+ #[test]
