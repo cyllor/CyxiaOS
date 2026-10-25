@@ -85,6 +85,15 @@
          }
      };
      preparation_phase(2);
+@@ -1569,7 +1571,7 @@
+     s.sequence = s.sequence.max(sequence);
+     s.job = Some(Job {
+         cpu: cyxia_arch_aarch64::cpu::slot(),
+-        set,
++        set: *set,
+         sequence,
+         controller: controller_epoch,
+         base_version: s.registry.version(),
 --- a/kernel/src/domain_control/core_replay.rs
 +++ b/kernel/src/domain_control/core_replay.rs
 @@ -809,7 +809,7 @@
