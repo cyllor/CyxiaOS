@@ -6,6 +6,8 @@ use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDO
 const PREPAY_NS: u64 = 2_500_000;
 const WALL_NS: u64 = 50_000_000;
 const PRIVATE_CLEAR_PAGES: u8 = 9;
+const SERVICE_SLICE_NS: u64 = 100_000;
+const RETURN_ENVELOPE_NS: u64 = 2_000_000;
 static READY: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicU64 = AtomicU64::new(1);
 static JOB_CPU: AtomicU64 = AtomicU64::new(0);
@@ -472,8 +474,21 @@ fn run_turn(
                 } else if now.saturating_sub(worker.native.probe_started) >= WALL_NS {
                     fail_worker(worker);
                     return;
+                } else {
+                    // Retire this timer return in its own paid turn. Re-entering
+                    // EL0 below would charge two context-switch envelopes to one
+                    // 2.5 ms evaluation credit.
+                    worker.context.as_mut().expect("probe context").kind = 0;
+                    return;
                 }
-            } else if worker.native.in_job && context.kind != 9 {
+            } else if worker.native.in_job {
+                if context.kind == 9 {
+                    // The previous slice has already preserved all registers.
+                    // A later paid turn may arm the next slice, but this turn
+                    // performs only the deterministic return bookkeeping.
+                    worker.context.as_mut().expect("job context").kind = 0;
+                    return;
+                }
                 worker.native.publish_pending = context.kind == 8
                     && context.esr >> 26 == 0x15
                     && context.esr & 0xffff == abi::SUBMIT
@@ -593,7 +608,7 @@ fn run_turn(
     // Account encoding and private-page preparation before choosing a slice.
     // A turn with less than the full return envelope yields without entering EL0.
     let entered = timer::ticks();
-    if ns(entered.saturating_sub(begin)).saturating_add(1_000_000) > credit.reserved_ns {
+    if ns(entered.saturating_sub(begin)).saturating_add(RETURN_ENVELOPE_NS) > credit.reserved_ns {
         return;
     }
     let Some(context) = worker.context.as_mut() else {
@@ -608,7 +623,7 @@ fn run_turn(
         enter_service(
             context,
             phys(root),
-            entered.saturating_add(ticks(250_000).max(1)),
+            entered.saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
         );
     }
     let end = timer::ticks();
