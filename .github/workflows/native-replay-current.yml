@@ -1,0 +1,81 @@
+name: Native replay current
+
+on:
+  push:
+    branches:
+      - fix/first-level-subsystems-20261024
+    paths:
+      - '.github/workflows/native-replay-current.yml'
+      - 'kernel/**'
+      - 'crates/prototype/**'
+      - 'user/prototype-cluster/**'
+      - 'tools/verify_domains.py'
+      - 'tools/build_unified.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned native toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          cargo fetch --locked
+          mkdir -p "$RUNNER_TEMP/native-replay-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-replay-evidence/source-commit.txt"
+          rustc -vV > "$RUNNER_TEMP/native-replay-evidence/rust-version.txt"
+      - name: Restore verified QEMU 10.2.2
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '12518726246'
+          merge-multiple: true
+          run-id: '39991904741'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/qemu-restored
+      - name: Verify cached emulator
+        run: |
+          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
+          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-replay-evidence/qemu-version.txt"
+      - name: Build exact native pair and replay tools
+        run: |
+          set -o pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair" 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/provision.log"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk --example verify-domain-evidence 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/replay-tools-build.log"
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/pair/a" --identity-b "$RUNNER_TEMP/pair/b" --output "$RUNNER_TEMP/unified-build" --selftest 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/unified-build.log"
+      - name: Run first protected native replay pair
+        run: |
+          set -o pipefail
+          python3 tools/verify_domains.py \
+            --elf "$RUNNER_TEMP/unified-build/node-a.elf" \
+            --peer-elf "$RUNNER_TEMP/unified-build/node-b.elf" \
+            --build-manifest "$RUNNER_TEMP/unified-build/build-manifest.json" \
+            --source-root . \
+            --qemu "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" \
+            --output "$RUNNER_TEMP/native-replay-evidence/run" \
+            --timeout 600 --hold 1 --sample-ms 250 --clock-profile wallclock \
+            --replay-pairs 1 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/native-replay.log"
+      - name: Retain raw evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-replay-current-${{ github.sha }}
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
+          path: ${{ runner.temp }}/native-replay-evidence/
