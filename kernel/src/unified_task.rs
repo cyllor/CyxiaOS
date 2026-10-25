@@ -4,7 +4,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::PhysAddr;
-use cyxia_kernel_core::control_plane::task_admission::{Authority, Terms, expire_quiescent};
+use cyxia_kernel_core::control_plane::task_admission::{
+    Authority, StartRequest, Terms, expire_quiescent,
+};
 use cyxia_prototype::domains::Error;
 use sha2::{Digest, Sha256};
 static mut AUTHORITY: Authority = Authority::new();
@@ -374,13 +376,21 @@ pub fn request(
                 return (3, 0, 0);
             }
             let grant = u64::from_le_bytes(payload[24..32].try_into().unwrap());
-            let contract = payload[32..48].try_into().unwrap();
+            let contract: [u8; 16] = payload[32..48].try_into().unwrap();
             let digest = unsafe {
                 Sha256::digest(core::slice::from_raw_parts(
                     core::ptr::addr_of!(INPUT).cast::<u8>(),
                     input as usize,
                 ))
                 .into()
+            };
+            let start = StartRequest {
+                token,
+                contract,
+                grant,
+                deadline: end,
+                session: bound,
+                input_hash: digest,
             };
             if let Err(error) = crate::domain_tasks::remote_activate(token) {
                 return (
@@ -393,19 +403,7 @@ pub fn request(
                     token,
                 );
             }
-            if unsafe {
-                (&mut *core::ptr::addr_of_mut!(AUTHORITY)).start(
-                    token,
-                    contract,
-                    grant,
-                    end,
-                    bound,
-                    digest,
-                    timer::ticks() / (timer::frequency() / 1000),
-                )
-            }
-            .is_err()
-            {
+            if unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).start(start, now) }.is_err() {
                 let _ = crate::domain_tasks::remote_stopped(token);
                 return (3, 0, 0);
             }
