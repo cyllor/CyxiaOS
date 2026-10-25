@@ -26,7 +26,9 @@ jobs:
           ref: fix/first-level-subsystems-20261024
           fetch-depth: 0
       - name: Install pinned toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+          cargo fetch --locked
       - name: Patch host fixtures and self-remove
         env:
           BRANCH: fix/first-level-subsystems-20261024
