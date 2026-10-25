@@ -158,6 +158,26 @@ def parse_control(data, boot_epoch=None):
     }
 
 
+def active_control_records(data):
+    if len(data) != CONTROL_WORDS * 8:
+        return []
+    w = words(data, CONTROL_WORDS)
+    if w[0] != CONTROL_MAGIC or w[1] != 1:
+        return []
+    active = []
+    for slot in range(64):
+        r = w[512 + slot * 640:512 + (slot + 1) * 640]
+        if r[639] & 1 or r[0] == 0:
+            continue
+        active.append({
+            "slot": slot, "sequence": r[0], "domain": r[2], "kind": r[3],
+            "target_id": r[4], "target_generation": r[5],
+            "candidate_count": r[16], "approved_version": r[13],
+            "executor_state": r[14], "complete": bool(r[30]),
+        })
+    return active
+
+
 def parse_tasks(data):
     w = words(data, 32)
     if w[0] == 0:
@@ -469,8 +489,13 @@ def diagnostics(guest, bundle):
         if symbol_name in bundle:
             read(key, lambda: parser(bundle[symbol_name]))
             if key == "control_credit":
+                detail = {
+                    "failures": guest[key],
+                    "active_records": active_control_records(
+                        bundle.get("DOMAIN_CONTROL_EVIDENCE", b"")),
+                }
                 check(key, not guest[key],
-                      "native C credit failure: " + json.dumps(guest[key], separators=(",", ":")))
+                      "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
     # A synchronous file operation may retain its caller while waiting for a
     # new credit. Its periodic task snapshot can then be older than the actual
     # completion fault; the independent sticky record must still fail the run.
