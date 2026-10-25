@@ -1,0 +1,55 @@
+name: Apply stack-safe preparation patch
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.1-complete-prototype
+
+permissions:
+  contents: write
+
+concurrency:
+  group: complete-prototype-repair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repair:
+    if: ${{ startsWith(github.event.head_commit.message, 'apply stack safe preparation patch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONPATH: tools
+    steps:
+      - name: Check out writable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+      - name: Apply stack-safe patch and format workspace
+        run: |
+          set -euo pipefail
+          git apply --check .github/codex/patches/070-stack-safe-prepared.diff
+          git apply .github/codex/patches/070-stack-safe-prepared.diff
+          cargo fmt --all
+      - name: Run focused gates
+        run: |
+          python3 -B -m unittest -v test_check_v13_preparation_stack
+          cargo test --locked --offline -p cyxia-prototype \
+            --test native_target_batch \
+            --test native_preparation_debit \
+            --test domain_policy \
+            --test native_core_replay
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Commit validated formatted source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(control): preserve prepared stack proof'
+          git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
