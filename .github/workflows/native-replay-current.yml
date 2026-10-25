@@ -1,4 +1,4 @@
-# Probe generation 3: unified task StartRequest migration
+# Probe generation 4: bounded private-page clearing across paid turns
 name: Native replay current
 
 on:
