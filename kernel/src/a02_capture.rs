@@ -41,6 +41,7 @@ static A02_CAPTURE_LAYOUT: [u64; 8] = [
 static A02_BOOT_MODEL: [u8; 2772] = cyxia_prototype::learning::seed::UNTRAINED_SEED0_BYTES;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicBool = AtomicBool::new(false);
+static WAITERS: AtomicBool = AtomicBool::new(false);
 
 fn locked<R>(f: impl FnOnce(&mut state::Capture<EVENTS, TASKS>) -> R) -> R {
     while LOCK
@@ -52,17 +53,26 @@ fn locked<R>(f: impl FnOnce(&mut state::Capture<EVENTS, TASKS>) -> R) -> R {
         // paid vCPU from turning that wall delay into charged spin execution.
         // Strong CAS is required: a spurious weak-CAS failure with no owner
         // would otherwise sleep without a corresponding unlock event.
-        unsafe {
-            core::arch::asm!("wfe", options(nostack));
+        WAITERS.store(true, Ordering::Release);
+        // Recheck after publishing waiter state. If unlock raced before the
+        // publication, the next CAS can acquire immediately; if it raced
+        // after, its SEV remains in this CPU's event register for WFE.
+        if LOCK.load(Ordering::Acquire) {
+            unsafe {
+                core::arch::asm!("wfe", options(nostack));
+            }
         }
     }
     let result = f(unsafe { &mut *A02_CAPTURE.0.get() });
     LOCK.store(false, Ordering::Release);
-    // Publish the completed protected update before waking every possible
-    // contender. A waiter executes WFE without clearing its event register,
-    // so an unlock between failed CAS and WFE cannot be lost.
-    unsafe {
-        core::arch::asm!("dsb ishst", "sev", options(nostack));
+    // SEV is a relatively expensive QEMU synchronization helper. Broadcast it
+    // only when a contender published that it may sleep; the recheck above
+    // closes the unlock-before-WFE race. Multiple waiters are all woken, and
+    // losers publish WAITERS again before sleeping for the next owner.
+    if WAITERS.swap(false, Ordering::AcqRel) {
+        unsafe {
+            core::arch::asm!("dsb ishst", "sev", options(nostack));
+        }
     }
     result
 }

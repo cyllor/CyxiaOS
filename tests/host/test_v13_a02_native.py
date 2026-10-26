@@ -149,8 +149,11 @@ class A02NativeProducer(unittest.TestCase):
         lock = source[source.index('fn locked<R>'):source.index('/// CPU0, before')]
         self.assertIn('.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)', lock)
         self.assertNotIn('compare_exchange_weak', lock)
+        self.assertIn('WAITERS.store(true, Ordering::Release)', lock)
+        self.assertIn('if LOCK.load(Ordering::Acquire)', lock)
         self.assertIn('core::arch::asm!("wfe"', lock)
         self.assertIn('LOCK.store(false, Ordering::Release)', lock)
+        self.assertIn('if WAITERS.swap(false, Ordering::AcqRel)', lock)
         self.assertIn('core::arch::asm!("dsb ishst", "sev"', lock)
 
 

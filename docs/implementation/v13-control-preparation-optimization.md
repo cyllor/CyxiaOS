@@ -263,6 +263,21 @@ timer deadlines are unchanged. Configured AArch64 strict Clippy passes. Exact
 local build `/tmp/cyxia-prototype.8XqGmq` is `BUILT_NOT_RUN`; both selected
 stack paths remain 37,984/65,536 bytes. Linux timing remains required.
 
+Run `40380893390` confirms the probe-counter sharding removed that control
+failure and again passed beyond ordinary preparation, but the first CPU0/2/3
+task segments concurrently exceeded 2.5/10/10 ms. The A02 lock's first WFE
+correction broadcast `SEV` on every unlock, even with no sleeping contender.
+Under TCG that architectural broadcast is a synchronous helper inside the
+charged translated block. The lock now publishes a waiter flag after failed
+strong CAS, rechecks the lock before WFE, and performs `DSB ISHST; SEV` only
+when release atomically consumes a real waiter flag. This preserves the
+unlock-before-WFE event-register proof and wakes all multiple waiters, while
+uncontended capture does no broadcast. All thirteen A02 host tests (one
+historical-artifact skip), formatting and configured AArch64 strict Clippy
+pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
+selected stack paths remain 37,984/65,536 bytes. Native timing remains
+required.
+
 Run `40379550634` moved the next probe fault to the separate phase-8 return
 bookkeeping: CPU1 sequence 8 used 10.007/8 ms, with no active job or
 preparation markers. The only cross-core exclusive operation in that path was
