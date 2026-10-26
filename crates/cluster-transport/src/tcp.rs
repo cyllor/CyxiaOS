@@ -172,6 +172,21 @@ impl<'a, P: Port> Tcp<'a, P> {
     /// One ingress frame, bounded egress, no blocking network wait. The timer
     /// must be the same boot's monotonic clock, including reconnects.
     pub fn poll(&mut self, now_ms: u64) -> Result<State, Error> {
+        let mut checkpoint = || {};
+        self.poll_with_checkpoints(now_ms, &mut checkpoint)
+    }
+
+    /// The same protocol turn as [`Self::poll`], with explicit safe points
+    /// between independently bounded NIC, ingress and egress pieces. The
+    /// callback runs only while no smoltcp/device borrow or protocol update is
+    /// in flight, so a native scheduler may settle one CPU reservation and
+    /// obtain the next without keeping a device or socket lock across that
+    /// wait. A no-op callback preserves the ordinary host/test behaviour.
+    pub fn poll_with_checkpoints(
+        &mut self,
+        now_ms: u64,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<State, Error> {
         self.healthy()?;
         if now_ms < self.last_ms || now_ms > i64::MAX as u64 {
             self.abort();
@@ -187,6 +202,8 @@ impl<'a, P: Port> Tcp<'a, P> {
             self.abort();
             return Err(Error::Device);
         }
+        checkpoint();
+
         let now = Instant::from_millis(now_ms as i64);
         let before = self.sockets.get::<Socket>(self.socket);
         let queued = before.send_queue();
@@ -202,9 +219,12 @@ impl<'a, P: Port> Tcp<'a, P> {
                         && after.state() == State::Established),
             );
         }
+        checkpoint();
+
         // A hardware multichain port can accept multiple independent frames.
-        // Bound the producer pass by its real queue capacity, then ring once;
-        // an isolated frame is still flushed at the end of this same turn.
+        // Keep the logical burst, but expose a safe scheduler checkpoint after
+        // every complete descriptor-chain attempt. This prevents a batch from
+        // being billed as one non-preemptible native CPU segment.
         for _ in 0..self.device.port().burst_capacity().clamp(1, 8) {
             let egress = self
                 .interface
@@ -213,6 +233,7 @@ impl<'a, P: Port> Tcp<'a, P> {
                 self.abort();
                 return Err(Error::Device);
             }
+            checkpoint();
             // An idle socket or a retained backpressured frame cannot make
             // progress by repeating the same poll in this paid CPU turn.
             // The staged TX is serviced above and flushed below; retry on the

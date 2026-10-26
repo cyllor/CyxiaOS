@@ -797,6 +797,24 @@ impl<const B: usize> Ipc<B> {
         now: u64,
         backend: &mut impl IpcBackend<B>,
     ) -> Result<usize, Error> {
+        self.receive_batch_limited(receiver, key, now, usize::MAX, backend)
+    }
+
+    /// Receive no more than `limit` complete FIFO messages from one endpoint.
+    /// This is a scheduler boundary, not a different queue policy: the live
+    /// endpoint batch limit still applies, and a remaining head retains its
+    /// ownership and wake state for the next independently budgeted turn.
+    pub fn receive_batch_limited(
+        &mut self,
+        receiver: ObjectKey,
+        key: ObjectKey,
+        now: u64,
+        limit: usize,
+        backend: &mut impl IpcBackend<B>,
+    ) -> Result<usize, Error> {
+        if limit == 0 {
+            return Err(Error::Range);
+        }
         self.time(now)?;
         let i = self.index(key)?;
         let e = self.endpoints[i].as_mut().ok_or(Error::Stale)?;
@@ -804,7 +822,7 @@ impl<const B: usize> Ipc<B> {
             return Err(Error::Auth);
         }
         backend.authorize(receiver, key, IpcOperation::Receive)?;
-        let count = e.len.min(e.limits(now).1);
+        let count = e.len.min(e.limits(now).1).min(limit);
         let mut delivered = 0;
         for _ in 0..count {
             let cell = usize::from(e.order[e.head]);

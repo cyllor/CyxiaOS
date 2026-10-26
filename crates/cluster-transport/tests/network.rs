@@ -81,6 +81,36 @@ fn idle_multichain_poll_stops_when_egress_has_no_work() {
         link.borrow().receives[1]
     );
 }
+#[test]
+fn native_poll_exposes_bounded_scheduler_checkpoints() {
+    let link = Rc::new(RefCell::new(Link {
+        burst: 8,
+        ..Default::default()
+    }));
+    let (mut rx, mut tx) = ([0; BUFFER_SIZE], [0; BUFFER_SIZE]);
+    let mut storage = [Storage::EMPTY];
+    let mut tcp = Tcp::new(
+        TestPort { link, a: false },
+        config(false),
+        0,
+        &mut rx,
+        &mut tx,
+        &mut storage,
+    )
+    .unwrap();
+    tcp.listen().unwrap();
+    let mut checkpoints = 0;
+    let mut checkpoint = || checkpoints += 1;
+    tcp.poll_with_checkpoints(1, &mut checkpoint).unwrap();
+    drop(checkpoint);
+    // Device completion, one ingress attempt and the first bounded egress
+    // attempt are independently settleable even for an idle multichain port.
+    assert!(
+        checkpoints >= 3,
+        "only {checkpoints} safe points were exposed"
+    );
+}
+
 fn config(a: bool) -> Config {
     Config {
         mac: [2, 0, 0, 0, 0, if a { 1 } else { 2 }],

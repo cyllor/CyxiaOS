@@ -824,7 +824,9 @@ pub fn network_pending(epoch: u64) -> Result<usize, Error> {
     })
 }
 /// The callback must be nonblocking and accept the entire copied message or
-/// return an error without sending any prefix. Failed heads stay queued.
+/// return an error without sending any prefix. Exactly one FIFO head is handled
+/// per call so the native network owner can settle and reacquire CPU credit
+/// without holding the task/IPC lock. Failed heads stay queued.
 pub fn network_drain(
     epoch: u64,
     _now: u64,
@@ -838,10 +840,11 @@ pub fn network_drain(
             .network
             .filter(|network| network.epoch == epoch)
             .ok_or(Error::Stale)?;
-        s.ipc.receive_batch(
+        s.ipc.receive_batch_limited(
             network.owner(),
             network.endpoint,
             now_ns(),
+            1,
             &mut NetworkBackend {
                 network,
                 send: Some(send),
