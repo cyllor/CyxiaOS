@@ -85,7 +85,9 @@ static REQUEST_END: AtomicU64 = AtomicU64::new(0);
 static RESULT_KIND: AtomicU64 = AtomicU64::new(0);
 static RESULT_ESR: AtomicU64 = AtomicU64::new(0);
 static RESULT_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
-static PROTECTED: AtomicU64 = AtomicU64::new(0);
+// Each worker is the sole writer of its slot. Avoid a cross-core exclusive RMW
+// at the synchronous probe-return boundary; readers sum the four exact counts.
+static PROTECTED: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
 // Per-CPU one-credit mailboxes: idle / grant / executing / completion / expired.
 static DISPATCH: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
 static EXPIRES: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
@@ -98,6 +100,18 @@ static CONTROL_TICKS: AtomicU64 = AtomicU64::new(0);
 static CONTROL_TOTAL_DEBIT: AtomicU64 = AtomicU64::new(0);
 static CONTROL_OVERRUNS: AtomicU64 = AtomicU64::new(0);
 static MAX_SLICE: [AtomicU64; C] = [const { AtomicU64::new(0) }; C];
+fn record_protected() {
+    let counter = &PROTECTED[cpu::slot()];
+    counter.store(
+        counter.load(Ordering::Relaxed).saturating_add(1),
+        Ordering::Release,
+    );
+}
+fn protected_count() -> u64 {
+    PROTECTED.iter().fold(0u64, |total, counter| {
+        total.saturating_add(counter.load(Ordering::Acquire))
+    })
+}
 
 fn image_ptr() -> *mut Page {
     #[cfg(feature = "unified-runtime")]
@@ -438,7 +452,7 @@ pub(super) fn step(worker: &mut Worker) {
             {
                 fatal(182);
             }
-            PROTECTED.fetch_add(1, Ordering::Release);
+            record_protected();
         }
         worker.probed = true;
     }
@@ -1039,7 +1053,7 @@ impl Coordinator {
                 self.active_weights[0],
                 self.active_weights[1],
                 self.active_policy_sequence,
-                PROTECTED.load(Ordering::Acquire),
+                protected_count(),
                 FAULT_MODE,
                 self.origin,
                 self.successes + self.faults + self.stale,

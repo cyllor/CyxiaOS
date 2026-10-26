@@ -262,3 +262,13 @@ fields share one observed timestamp. Layout, ordering fields, credit sizes and
 timer deadlines are unchanged. Configured AArch64 strict Clippy passes. Exact
 local build `/tmp/cyxia-prototype.8XqGmq` is `BUILT_NOT_RUN`; both selected
 stack paths remain 37,984/65,536 bytes. Linux timing remains required.
+
+Run `40379550634` moved the next probe fault to the separate phase-8 return
+bookkeeping: CPU1 sequence 8 used 10.007/8 ms, with no active job or
+preparation markers. The only cross-core exclusive operation in that path was
+the shared protected-probe counter, updated by both C workers at synchronous
+returns. It is now four per-CPU single-writer atomics; evidence readers
+saturating-sum the same exact counts. The external total and release/acquire
+publication semantics are unchanged. Configured AArch64 strict Clippy passes.
+Exact local build `/tmp/cyxia-prototype.wu12S3` is `BUILT_NOT_RUN`; both selected
+stack paths remain 37,984/65,536 bytes. Linux timing remains required.

@@ -543,7 +543,7 @@ fn run_turn(
                         fail_worker(worker);
                         return;
                     }
-                    PROTECTED.fetch_add(1, Ordering::Release);
+                    record_protected();
                     worker.native.probe += 1;
                     worker.context = None;
                     worker.native.probing = false;
@@ -1194,7 +1194,7 @@ fn evidence(c: &mut Coordinator, tick: u64) {
     {
         put(i, v);
     }
-    put(28, PROTECTED.load(Ordering::Acquire));
+    put(28, protected_count());
     put(29, FAULT_MODE);
     put(30, c.origin);
     put(31, c.successes + c.faults + c.stale);
