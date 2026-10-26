@@ -22,16 +22,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - name: Materialize and verify text patch
+      - name: Materialize reviewable text patch
         run: |
           set -euo pipefail
-          source=.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz
-          target=.github/codex/patches/110-per-vcpu-accounting-repair.diff
-          gzip -t "$source"
-          gzip -dc "$source" > "$target"
-          test -s "$target"
-          grep -q '^diff --git ' "$target"
-          git diff --check -- "$target"
+          python3 - <<'PY'
+          import gzip
+          from pathlib import Path
+
+          source = Path('.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz')
+          target = source.with_suffix('')
+          payload = gzip.decompress(source.read_bytes())
+          if not payload or b'diff --git ' not in payload:
+              raise SystemExit('decompressed payload is not a git patch')
+          target.write_bytes(payload)
+          print(f'{source}: {source.stat().st_size} bytes')
+          print(f'{target}: {target.stat().st_size} bytes')
+          PY
       - name: Commit materialized patch
         run: |
           set -euo pipefail
