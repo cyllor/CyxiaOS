@@ -44,22 +44,16 @@ extern "C" fn _start(mode: u64) -> ! {
         _ => abort(),
     }
     if unsafe { ((INPUT_VA as *const u64).add(1)).read_volatile() } == native::ABI {
-        let input: [u64; native::INPUT_WORDS] =
-            core::array::from_fn(|i| unsafe { (INPUT_VA as *const u64).add(i).read_volatile() });
-        let mut output = [0u64; native::OUTPUT_WORDS];
-        // EL1 maps a pinned immutable bank at this fixed RO address for this
-        // invocation. Volatile loads prevent the compiler from substituting
-        // the link-time standalone fixture when Active changes.
-        let parameters: [u8; MODEL_BYTES] = core::array::from_fn(|i| unsafe {
-            (MODEL_VA as *const u8).add(i).read_volatile()
-        });
-        let model = model::Model::parse(&parameters).unwrap_or_else(|_| abort());
-        native::evaluate(&input, &model, &mut output).unwrap_or_else(|_| abort());
-        for (i, value) in output.into_iter().enumerate() {
-            unsafe {
-                (OUTPUT_VA as *mut u64).add(i).write_volatile(value);
-            }
-        }
+        // EL1 owns all three page mappings for the complete invocation: input
+        // and model are immutable, and output was cleared before it became
+        // writable here.  Borrow the protected pages in place so the bounded
+        // model does not spend its 2 ms execution budget on redundant 4 KiB
+        // volatile copies and a second output memset.
+        let input = unsafe { &*(INPUT_VA as *const [u64; native::INPUT_WORDS]) };
+        let parameters = unsafe { core::slice::from_raw_parts(MODEL_VA as *const u8, MODEL_BYTES) };
+        let output = unsafe { &mut *(OUTPUT_VA as *mut [u64; native::OUTPUT_WORDS]) };
+        let model = model::Model::parse(parameters).unwrap_or_else(|_| abort());
+        native::evaluate_precleared(input, &model, output).unwrap_or_else(|_| abort());
         unsafe {
             asm!("svc #0x541", in("x0") OUTPUT_VA,
                 in("x1") (native::OUTPUT_WORDS * 8) as u64, options(nostack));

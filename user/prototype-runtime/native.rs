@@ -109,6 +109,22 @@ pub fn evaluate(
     model: &model::Model<'_>,
     output: &mut [u64; OUTPUT_WORDS],
 ) -> Result<(), Error> {
+    output.fill(0);
+    evaluate_precleared(input, model, output)
+}
+
+/// Evaluate into the kernel-cleared EL0 output page.
+///
+/// The native runtime clears and revokes the complete private output mapping
+/// before every new job.  Keeping that single protected clear avoids a second
+/// 4 KiB byte-wise memset in the isolated guest while preserving the canonical
+/// zero padding checked by the root verifier.  Callers outside that boundary
+/// must use [`evaluate`].
+pub fn evaluate_precleared(
+    input: &[u64; INPUT_WORDS],
+    model: &model::Model<'_>,
+    output: &mut [u64; OUTPUT_WORDS],
+) -> Result<(), Error> {
     if input[0] != abi::INPUT_MAGIC
         || input[1] != ABI
         || [2, 3, 5, 6, 7, 10, 11, 13, 14, 36, 37, 38]
@@ -170,7 +186,6 @@ pub fn evaluate(
     };
     let mut bytes = [0u8; 384];
     let len = policy_wire::encode_plan(header, &[decision], &mut bytes)?;
-    output.fill(0);
     output[..8].copy_from_slice(&[
         abi::OUTPUT_MAGIC,
         ABI,

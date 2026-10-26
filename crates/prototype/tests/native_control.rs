@@ -107,6 +107,18 @@ fn actual_el0_module_builds_formal_plan_with_stable_integer_argmax() {
 }
 
 #[test]
+fn protected_precleared_output_matches_the_general_api() {
+    let (input, bytes) = input();
+    let model = model::Model::parse(&bytes).unwrap();
+    let mut general = [99; 512];
+    let mut protected = [0; 512];
+    native::evaluate(&input, &model, &mut general).unwrap();
+    native::evaluate_precleared(&input, &model, &mut protected).unwrap();
+    assert_eq!(protected, general);
+    assert!(protected[64..].iter().all(|word| *word == 0));
+}
+
+#[test]
 fn stopped_offer_owner_state_replays_without_becoming_an_ai_action() {
     let candidate = Candidate {
         action: Action::OfferCpu(100),
