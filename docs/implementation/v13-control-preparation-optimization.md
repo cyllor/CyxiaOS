@@ -293,6 +293,20 @@ formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-network-preflight` passes both selected
 stack paths at 33,904/65,536 bytes. Linux timing remains required.
 
+Run `40420213955` again reaches phase 2 and uses 8,559,843/8,000,000 ns at
+sequence 599. Inside the exact capture boundary, one-word entry/return payloads
+still used a dynamically sized loop, and every uncontended unlock executed a
+`WAITERS.swap` RMW. Capture append is now const-generic over payload length so
+the one/two/six-word cases compile as fixed work. Unlock first acquire-loads
+the waiter flag and performs the RMW/`SEV` only when published contention may
+exist; a waiter racing after a false load observes the released lock in its
+mandatory recheck and cannot sleep. Capture bytes and synchronization semantics
+are unchanged. The full 615 host tests (two environment skips), 141 v1.3 tests
+(one historical-evidence skip), formatting and configured strict AArch64
+Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-capture-fixed-payload` passes both selected
+stack paths at 33,904/65,536 bytes. Linux timing remains required.
+
 Run `40418568412` crosses the mapping-probe exception boundary; the next
 failure is phase 0 at sequence 601, where the separately paid task registration
 uses 9,784,972/8,000,000 ns. Registration constructs one capture event, but

@@ -69,7 +69,7 @@ fn locked<R>(f: impl FnOnce(&mut state::Capture<EVENTS, TASKS>) -> R) -> R {
     // only when a contender published that it may sleep; the recheck above
     // closes the unlock-before-WFE race. Multiple waiters are all woken, and
     // losers publish WAITERS again before sleeping for the next owner.
-    if WAITERS.swap(false, Ordering::AcqRel) {
+    if WAITERS.load(Ordering::Acquire) && WAITERS.swap(false, Ordering::AcqRel) {
         unsafe {
             core::arch::asm!("dsb ishst", "sev", options(nostack));
         }

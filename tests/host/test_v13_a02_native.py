@@ -153,7 +153,8 @@ class A02NativeProducer(unittest.TestCase):
         self.assertIn('if LOCK.load(Ordering::Acquire)', lock)
         self.assertIn('core::arch::asm!("wfe"', lock)
         self.assertIn('LOCK.store(false, Ordering::Release)', lock)
-        self.assertIn('if WAITERS.swap(false, Ordering::AcqRel)', lock)
+        self.assertIn('WAITERS.load(Ordering::Acquire)', lock)
+        self.assertIn('WAITERS.swap(false, Ordering::AcqRel)', lock)
         self.assertIn('core::arch::asm!("dsb ishst", "sev"', lock)
 
 

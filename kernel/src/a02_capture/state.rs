@@ -93,7 +93,14 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.counters[8] = self.counters[8].saturating_add(1);
         self.stopping = true;
     }
-    fn append(&mut self, tick: u64, kind: u64, cpu: usize, task: Task, payload: &[u64]) {
+    fn append<const P: usize>(
+        &mut self,
+        tick: u64,
+        kind: u64,
+        cpu: usize,
+        task: Task,
+        payload: [u64; P],
+    ) {
         let index = self.header[3] as usize;
         if index >= N {
             self.fail();
@@ -161,7 +168,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         } else if used < T && self.tasks[used].id == 0 {
             self.tasks[used] = task;
             self.counters[27] = (used + 1) as u64;
-            self.append(tick, 1, 4, task, &[task.role, task.affinity]);
+            self.append(tick, 1, 4, task, [task.role, task.affinity]);
             Some(used)
         } else {
             self.fail();
@@ -192,7 +199,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.returned_origin[task_index] = 0;
         self.started[cpu] = tick;
         self.counters[16 + cpu] += 1;
-        self.append(tick, 3, cpu, task, &[self.counters[16 + cpu]]);
+        self.append(tick, 3, cpu, task, [self.counters[16 + cpu]]);
         self.control_seen |= task.role == 2;
         self.business_seen |= task.role == 1;
         true
@@ -205,7 +212,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         let task = self.active[cpu];
         self.counters[20 + cpu] += 1;
         self.counters[40 + cpu] += tick.saturating_sub(self.started[cpu]);
-        self.append(tick, 4, cpu, task, &[self.counters[16 + cpu]]);
+        self.append(tick, 4, cpu, task, [self.counters[16 + cpu]]);
         self.active[cpu] = Task::EMPTY;
         let Ok((_, registered)) = self.find_registered(task.id, task.generation) else {
             return;
@@ -254,14 +261,14 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.returned_origin[index] = 0;
         self.counters[24] += 1;
         let request = self.counters[24];
-        self.append(tick, 5, cpu, task, &[request, mask]);
+        self.append(tick, 5, cpu, task, [request, mask]);
         if result == 1 {
             self.counters[25] += 1;
         } else if result == 0 {
             self.counters[26] += 1;
             self.tasks[index].affinity = mask;
         }
-        self.append(tick, 6, cpu, task, &[request, result]);
+        self.append(tick, 6, cpu, task, [request, result]);
         self.denial_seen |= task.role == 1 && mask & self.masks[0] != 0 && result == 1;
         self.stopping |=
             self.denial_seen && self.control_seen && self.business_seen && self.header[6] != 0;
@@ -273,7 +280,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         }
         self.core_generation = generation;
         self.masks = masks;
-        self.append(tick, 2, 4, Task::EMPTY, &masks);
+        self.append(tick, 2, 4, Task::EMPTY, masks);
     }
     fn seal(&mut self, tick: u64) {
         if !self.stopping || self.active.iter().any(|t| t.id != 0) || self.sealed() {
