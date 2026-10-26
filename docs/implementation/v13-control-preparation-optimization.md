@@ -249,3 +249,16 @@ artifact skip), formatting and configured AArch64 strict Clippy pass. Native
 build `/tmp/cyxia-prototype.sNuH59` is `BUILT_NOT_RUN`; both selected paths pass
 at 37,984/65,536 bytes with the 4,096-byte exception reserve. Native timing is
 still required.
+
+Run `40378384224` confirms the event-sleep lock removed both competing task
+overruns. The next failure is again the mapping probe, now 8.287/8 ms on CPU1
+sequence 42 after three timer preemptions; it has no job or preparation
+markers. The remaining hot entry path wrote the same slice-evidence magic and
+version from every CPU on every entry, used an exclusive atomic increment for
+a per-CPU single-writer row, and read the architectural timer twice with no
+intervening work. The immutable header is now initialized in the static bank,
+the row count uses single-writer atomic load/store, and the adjacent evidence
+fields share one observed timestamp. Layout, ordering fields, credit sizes and
+timer deadlines are unchanged. Configured AArch64 strict Clippy passes. Exact
+local build `/tmp/cyxia-prototype.8XqGmq` is `BUILT_NOT_RUN`; both selected
+stack paths remain 37,984/65,536 bytes. Linux timing remains required.

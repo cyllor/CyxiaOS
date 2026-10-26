@@ -95,11 +95,18 @@ struct SliceTiming {
     words: [AtomicU64; 128],
 }
 #[cfg(feature = "unified-runtime")]
+impl SliceTiming {
+    const fn new() -> Self {
+        let mut words = [const { AtomicU64::new(0) }; 128];
+        words[0] = AtomicU64::new(0x4359_534c_4943_4501);
+        words[1] = AtomicU64::new(1);
+        Self { words }
+    }
+}
+#[cfg(feature = "unified-runtime")]
 #[used]
 #[unsafe(no_mangle)]
-static TASK_SLICE_EVIDENCE: SliceTiming = SliceTiming {
-    words: [const { AtomicU64::new(0) }; 128],
-};
+static TASK_SLICE_EVIDENCE: SliceTiming = SliceTiming::new();
 unsafe extern "C" {
     static cyxia_secondary_start: u8;
     static smp_user_start: u8;
@@ -951,9 +958,10 @@ pub(crate) unsafe fn enter_service(
     let slot = cpu::slot();
     let row = 2 + slot * 30;
     if slot < 4 {
-        TASK_SLICE_EVIDENCE.words[0].store(0x4359_534c_4943_4501, Ordering::Relaxed);
-        TASK_SLICE_EVIDENCE.words[1].store(1, Ordering::Relaxed);
-        TASK_SLICE_EVIDENCE.words[row].fetch_add(1, Ordering::Relaxed);
+        // Header words are immutable static initialization. Each row has one
+        // CPU writer, so its entry count needs no cross-core exclusive RMW.
+        let entries = TASK_SLICE_EVIDENCE.words[row].load(Ordering::Relaxed);
+        TASK_SLICE_EVIDENCE.words[row].store(entries.saturating_add(1), Ordering::Relaxed);
         TASK_SLICE_EVIDENCE.words[row + 1].store(timer::ticks(), Ordering::Relaxed);
         TASK_SLICE_EVIDENCE.words[row + 14].store(0, Ordering::Relaxed);
         TASK_SLICE_EVIDENCE.words[row + 4].store(deadline, Ordering::Relaxed);
@@ -971,8 +979,9 @@ pub(crate) unsafe fn enter_service(
             core::arch::asm!("mrs {}, cntp_ctl_el0", "mrs {}, cntp_cval_el0",out(reg)ctl,out(reg)cval,options(nostack));
             TASK_SLICE_EVIDENCE.words[row + 15].store(ctl, Ordering::Relaxed);
             TASK_SLICE_EVIDENCE.words[row + 16].store(cval, Ordering::Relaxed);
-            TASK_SLICE_EVIDENCE.words[row + 5].store(timer::ticks(), Ordering::Relaxed);
-            TASK_SLICE_EVIDENCE.words[row + 6].store(timer::ticks(), Ordering::Relaxed);
+            let armed_at = timer::ticks();
+            TASK_SLICE_EVIDENCE.words[row + 5].store(armed_at, Ordering::Relaxed);
+            TASK_SLICE_EVIDENCE.words[row + 6].store(armed_at, Ordering::Relaxed);
         }
         crate::a02_capture::enter(task);
         user::enter(context, root);
