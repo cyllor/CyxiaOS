@@ -37,7 +37,10 @@ fn preparation_detail(phase: usize) {
             word.store(0, Ordering::Relaxed);
         }
     }
-    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(now(), Ordering::Release);
+    // The coarse preparation bank retains wall-clock ordering. This detailed
+    // bank uses the patched per-vCPU execution counter so MTTCG descheduling
+    // cannot hide which preparation substage consumed the prepaid CPU credit.
+    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(timer::cpu_ticks(), Ordering::Release);
 }
 fn preparation_phase(phase: usize) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
