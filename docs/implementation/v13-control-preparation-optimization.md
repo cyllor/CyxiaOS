@@ -418,3 +418,26 @@ change and now requires at least five. All 14 transport tests, 138 v1.3 host
 tests (one historical-evidence skip), configured AArch64 strict Clippy and
 exact two-node build `/tmp/cyxia-prototype.PCoLCe` pass; both selected
 preparation peaks remain 34,080/65,536 bytes. Native replay is pending.
+
+Run `40394645785` crossed preparation again, but the broader checkpoint alone
+still left two genuine task-credit faults. CPU0 service thread `0x101` used
+9.548/2.5 ms in unified network stage 4, and CPU2 builtin thread `2:1` used
+6.333/2.696 ms. The network device's apparently bounded TX/RX checks each
+synchronized an entire 4 KiB used-ring page merely to acquire `used.idx`, so
+one empty service call retained 8 KiB of cache maintenance inside a segment.
+The batch queue now synchronizes only the exact index, returned record,
+descriptor, availability, request and response byte ranges participating in
+each DMA ownership transition. Publication/acquisition barriers and a second
+post-index record synchronization remain intact. TX and RX device checks also
+have a scheduler-safe boundary with no live port call or DMA token. A recording
+platform regression rejects any steady-state synchronization larger than one
+cache line and verifies the actual 3/7/8-byte fields; the transport regression
+now requires at least seven safe points. The CPU2 receipt was a distinct
+window-tail grant: the translated-execution PMU can charge more than 2.696 ms
+before the architectural timer PPI returns, so builtin workers now require the
+existing complete 10 ms turn and defer an undersized tail to the next budget
+window. No budget or overrun threshold is enlarged. The full non-kernel Rust
+workspace, 613 host tests (two environment skips), 67 tool tests, 139 v1.3
+host tests (one historical-evidence skip), strict AArch64 Clippy and exact
+two-node build `/tmp/cyxia-prototype.fdQQtL` pass. Both independently recomputed
+selected stack peaks remain 34,080/65,536 bytes. Patched-QEMU replay is pending.

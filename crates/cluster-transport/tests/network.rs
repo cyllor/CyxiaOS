@@ -103,11 +103,11 @@ fn native_poll_exposes_bounded_scheduler_checkpoints() {
     let mut checkpoint = || checkpoints += 1;
     tcp.poll_with_checkpoints(1, &mut checkpoint).unwrap();
     drop(checkpoint);
-    // Device completion, its flush, one ingress attempt, the first bounded
-    // egress attempt and the final flush are independently settleable even for
-    // an idle multichain port.
+    // TX and RX completion, the device flush, one ingress attempt, the first
+    // bounded egress TX/RX attempt and the final flush are independently
+    // settleable even for an idle multichain port.
     assert!(
-        checkpoints >= 5,
+        checkpoints >= 7,
         "only {checkpoints} safe points were exposed"
     );
 }

@@ -223,7 +223,7 @@ impl BatchQueue {
     }
     pub fn set_completion_interrupts(&mut self, enabled: bool, p: &impl Platform) {
         self.memory.avail.put16(0, if enabled { 0 } else { 1 });
-        unsafe { p.sync(self.memory.avail.address(), 4096) };
+        unsafe { p.sync(self.memory.avail.address(), 2) };
         p.barrier();
     }
     pub fn poison(&mut self, t: &mut Transport, p: &impl Platform) {
@@ -241,16 +241,13 @@ impl BatchQueue {
             .ok_or(Error::Response)
     }
     fn validate_returned(&mut self, t: &mut Transport, p: &impl Platform) -> Result<(), Error> {
-        unsafe { p.sync(self.memory.used.address(), 4096) };
+        unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         let end = self.memory.used.get16(2);
         let delta = end.wrapping_sub(self.used);
         if delta == 0 {
             return Ok(());
         }
-        p.barrier();
-        unsafe { p.sync(self.memory.used.address(), 4096) };
-        p.barrier();
         let owned = self
             .slots
             .iter()
@@ -263,6 +260,11 @@ impl BatchQueue {
         }
         for n in 0..delta {
             let at = 4 + usize::from(self.used.wrapping_add(n) % self.size) * 8;
+            // used.idx is the device publication. Acquire each returned record
+            // after observing that index; the rest of the 4 KiB ring is neither
+            // data for this completion nor part of this ownership transition.
+            unsafe { p.sync(self.memory.used.address() + at, 8) };
+            p.barrier();
             let id = self.memory.used.get32(at);
             let len = self.memory.used.get32(at + 4);
             if !id.is_multiple_of(2) || id >= u32::from(self.size) {
@@ -319,6 +321,7 @@ impl BatchQueue {
         }
         let head = at * 2;
         let desc = head * 16;
+        let descriptors = u16::from(!request.is_empty()) + u16::from(writable != 0);
         if !request.is_empty() {
             m.desc.put64(desc, request_pa);
             m.desc.put32(desc + 8, request.len() as u32);
@@ -333,9 +336,13 @@ impl BatchQueue {
             m.desc.put16(d + 14, 0);
         }
         unsafe {
-            p.sync(m.request[at].address(), 4096);
-            p.sync(m.response[at].address(), 4096);
-            p.sync(m.desc.address(), 4096)
+            if !request.is_empty() {
+                p.sync(m.request[at].address(), request.len());
+            }
+            if writable != 0 {
+                p.sync(m.response[at].address(), writable);
+            }
+            p.sync(m.desc.address() + desc, usize::from(descriptors) * 16)
         };
         let now = p.now_ns();
         if self.count == 0 {
@@ -352,7 +359,7 @@ impl BatchQueue {
             state: State::Private,
             generation: token.generation,
             writable: writable as u32,
-            descriptors: u16::from(!request.is_empty()) + u16::from(writable != 0),
+            descriptors,
             version: self.frozen_version,
             started: now,
         };
@@ -401,12 +408,12 @@ impl BatchQueue {
             s.state = State::Published;
         }
         // Publish complete ring elements before the release of avail.idx.
-        unsafe { p.sync(self.memory.avail.address(), 4096) };
+        unsafe { p.sync(self.memory.avail.address() + 4, usize::from(self.size) * 2) };
         p.barrier();
         self.memory.avail.put16(2, self.available);
-        unsafe { p.sync(self.memory.avail.address(), 4096) };
+        unsafe { p.sync(self.memory.avail.address() + 2, 2) };
         p.barrier();
-        unsafe { p.sync(self.memory.used.address(), 4096) };
+        unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         if self.memory.used.get16(0) & 1 == 0 {
             t.write(0x50, self.index);
@@ -435,7 +442,7 @@ impl BatchQueue {
             return Err(Error::Device);
         }
         self.flush_due(t, p)?;
-        unsafe { p.sync(self.memory.used.address(), 4096) };
+        unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         let end = self.memory.used.get16(2);
         if end == self.used {
@@ -471,8 +478,10 @@ impl BatchQueue {
         if out.len() < len as usize {
             return Err(Error::Address);
         }
-        unsafe { p.sync(self.memory.response[index].address(), 4096) };
-        p.barrier();
+        if len != 0 {
+            unsafe { p.sync(self.memory.response[index].address(), len as usize) };
+            p.barrier();
+        }
         for (i, b) in out[..len as usize].iter_mut().enumerate() {
             *b = unsafe {
                 core::ptr::read_volatile((self.memory.response[index].address() + i) as *const u8)
@@ -512,7 +521,7 @@ impl BatchQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
     use std::boxed::Box;
     struct Host(Cell<u64>);
     unsafe impl Platform for Host {
@@ -547,6 +556,51 @@ mod tests {
         q.memory.used.put32(at, id);
         q.memory.used.put32(at + 4, len);
         q.memory.used.put16(2, index.wrapping_add(1));
+    }
+    struct RecordingHost {
+        clock: Cell<u64>,
+        syncs: RefCell<std::vec::Vec<(usize, usize)>>,
+    }
+    unsafe impl Platform for RecordingHost {
+        fn physical(&self, a: usize, _: usize) -> Result<u64, Error> {
+            Ok(a as u64)
+        }
+        unsafe fn sync(&self, address: usize, len: usize) {
+            self.syncs.borrow_mut().push((address, len));
+        }
+        fn barrier(&self) {}
+        fn now_ms(&self) -> u64 {
+            self.clock.get() / 1_000_000
+        }
+        fn now_ns(&self) -> u64 {
+            self.clock.get()
+        }
+    }
+    #[test]
+    fn steady_state_syncs_only_shared_dma_fields() {
+        let p = RecordingHost {
+            clock: Cell::new(0),
+            syncs: RefCell::new(std::vec::Vec::new()),
+        };
+        let m = Box::leak(Box::new(Page::zeroed()));
+        m.put32(0, 0x74726976);
+        m.put32(4, 2);
+        m.put32(8, 2);
+        m.put32(0x34, 16);
+        m.put32(0x70, 15);
+        let mut t = unsafe { Transport::attach(m.address(), 4096).unwrap() };
+        let mut q =
+            BatchQueue::configure(&mut t, Box::leak(Box::new(BatchMemory::zeroed())), 0, &p)
+                .unwrap();
+        p.syncs.borrow_mut().clear();
+        q.enqueue(&mut t, &[1, 2, 3], 7, false, true, &p).unwrap();
+        used(&mut q, 0, 7);
+        assert!(q.poll(&mut t, &mut [0; 7], &p).unwrap().is_some());
+        let syncs = p.syncs.borrow();
+        assert!(syncs.iter().all(|(_, len)| *len <= 64), "{syncs:?}");
+        assert!(syncs.iter().any(|(_, len)| *len == 3), "{syncs:?}");
+        assert!(syncs.iter().any(|(_, len)| *len == 7), "{syncs:?}");
+        assert!(syncs.iter().any(|(_, len)| *len == 8), "{syncs:?}");
     }
     #[test]
     fn four_chains_one_publish_and_out_of_order_custody() {

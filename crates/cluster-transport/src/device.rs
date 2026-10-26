@@ -156,17 +156,24 @@ impl<P: Port> Ethernet<P> {
     /// At most one TX and one RX operation; an idle or backpressured NIC does
     /// not spin. A fatal error poisons the adapter until externally reset.
     pub fn service(&mut self) -> Result<(), Error> {
+        self.service_with_checkpoint(&mut || {})
+    }
+
+    /// The same bounded device turn with a scheduler-safe boundary after the
+    /// TX completion check. At that point no port call or DMA token is live,
+    /// so the caller may settle the current CPU reservation before RX work.
+    pub fn service_with_checkpoint(&mut self, checkpoint: &mut dyn FnMut()) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Device);
         }
-        let result = self.service_inner();
+        let result = self.service_inner(checkpoint);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn service_inner(&mut self) -> Result<(), Error> {
+    fn service_inner(&mut self, checkpoint: &mut dyn FnMut()) -> Result<(), Error> {
         if self.tx.len != 0 {
             match self.port.send(&self.tx.bytes[..self.tx.len]) {
                 Ok(()) => self.tx.len = 0,
@@ -174,6 +181,7 @@ impl<P: Port> Ethernet<P> {
                 Err(e) => return Err(e),
             }
         }
+        checkpoint();
         if self.rx.len == 0
             && let Some(len) = self.port.receive(&mut self.rx.bytes)?
         {

@@ -194,7 +194,7 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
         self.last_ms = now_ms;
         self.device.port_mut().set_time(now_ms);
-        if self.device.service().is_err() {
+        if self.device.service_with_checkpoint(checkpoint).is_err() {
             self.abort();
             return Err(Error::Device);
         }
@@ -230,7 +230,7 @@ impl<'a, P: Port> Tcp<'a, P> {
             let egress = self
                 .interface
                 .poll_egress(now, &mut self.device, &mut self.sockets);
-            if self.device.service().is_err() {
+            if self.device.service_with_checkpoint(checkpoint).is_err() {
                 self.abort();
                 return Err(Error::Device);
             }

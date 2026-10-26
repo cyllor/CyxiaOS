@@ -473,6 +473,11 @@ static mut STATE: State = State::new();
 // still admits the ninth 10 ms turn at t=80 ms (the complete 90 ms business
 // capacity) while keeping the measured host pause out of the window tail.
 const BUILTIN_WINDOW_HEADROOM_NS: u64 = 20_000_000;
+// The native PMU charges translated execution rather than the architectural
+// timer interval. A tail grant smaller than one complete builtin turn can be
+// exhausted before QEMU delivers the timer PPI, so leave it undispatched for
+// the next budget window instead of creating an unavoidable overrun.
+const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -857,15 +862,19 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
             else {
                 return Ok(None);
             };
-            let safety = match task_index(&s.tasks, d.thread) {
-                Ok(i)
-                    if !s.tasks[i].optional
-                        && s.probe_key != Some(d.thread)
-                        && s.tasks[i].parent != CLUSTER_CALLER =>
-                {
-                    1_000_000
+            let safety = if d.thread == builtin(slot) {
+                BUILTIN_MIN_GRANT_NS
+            } else {
+                match task_index(&s.tasks, d.thread) {
+                    Ok(i)
+                        if !s.tasks[i].optional
+                            && s.probe_key != Some(d.thread)
+                            && s.tasks[i].parent != CLUSTER_CALLER =>
+                    {
+                        1_000_000
+                    }
+                    _ => 2_000_000,
                 }
-                _ => 2_000_000,
             };
             if d.reserved_ns < safety {
                 match s.scheduler.resize_dispatch(d, safety) {
