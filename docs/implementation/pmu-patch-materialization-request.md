@@ -1,5 +1,5 @@
-# PMU accounting patch materialization request
+# Native replay CPU-clock repair request
 
-This marker triggers the bounded workflow that reconstructs the checksum-pinned source repair, validates the full native and host test surface, and commits only runtime source, tests, and non-workflow staging cleanup. It does not change runtime behaviour by itself.
+This marker triggers the bounded workflow that replaces exactly three stale `Prefix.start` initializers with the real per-vCPU PMU clock, then builds both exact unified AArch64 node images before committing the source repair.
 
-Attempt: 7 — exclude repository workflows and this trigger marker from the historical patch while retaining byte-for-byte checksum verification of the runtime repair.
+Attempt: 1 — repair the compile-time field mismatch without falling back to the shared monotonic wall clock.
