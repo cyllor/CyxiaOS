@@ -131,3 +131,16 @@ stack paths pass at 37,968 of 65,536 bytes with the unchanged 4,096-byte
 exception reserve (down from 50,944 bytes on the diagnostic source).
 Patched-QEMU timing is still required on this source before the preparation
 budget can be accepted.
+
+Run `40362192077` shows the structural change is beneficial but insufficient:
+the scratch/feature segment fell from 424,359 ns to 265,438 ns and both native
+stack peaks remained 37,968 bytes, but the complete preparation still used
+3,242,836 ns. CandidateSet construction/hash measured 762,495 ns in this run
+and the segment after CoreReplay selection measured 1,252,579 ns; neither can
+be treated as fixed overhead from the earlier single sample. Validation,
+build and stack gates all passed, with only the known artifact-quota failures.
+The detailed CPU bank now uses its remaining five per-CPU slots to mark
+registration/prechecks, completed input encoding, completed input-page hash,
+completed WorkId/evidence binding, and completed history/final Job retention.
+This adds attribution only and changes no execution path, budget or acceptance
+condition.
