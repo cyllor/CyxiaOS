@@ -22,27 +22,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - name: Materialize reviewable text patch
+      - name: Encode staged bytes for deterministic inspection
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import gzip
-          from pathlib import Path
-
-          source = Path('.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz')
-          target = source.with_suffix('')
-          payload = gzip.decompress(source.read_bytes())
-          if not payload or b'diff --git ' not in payload:
-              raise SystemExit('decompressed payload is not a git patch')
-          target.write_bytes(payload)
-          print(f'{source}: {source.stat().st_size} bytes')
-          print(f'{target}: {target.stat().st_size} bytes')
-          PY
-      - name: Commit materialized patch
+          source=.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz
+          target=.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz.b64
+          test -s "$source"
+          base64 --wrap=76 "$source" > "$target"
+          test -s "$target"
+          sha256sum "$source" "$target" > .github/codex/patches/110-per-vcpu-accounting-repair.materialization.sha256
+      - name: Commit inspectable bytes
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .github/codex/patches/110-per-vcpu-accounting-repair.diff
-          git commit -m 'chore: materialize per-vCPU accounting patch'
+          git add \
+            .github/codex/patches/110-per-vcpu-accounting-repair.diff.gz.b64 \
+            .github/codex/patches/110-per-vcpu-accounting-repair.materialization.sha256
+          git commit -m 'chore: expose staged PMU patch bytes'
           git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
