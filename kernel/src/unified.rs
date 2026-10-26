@@ -666,6 +666,7 @@ pub fn run(info: &BootInfo) -> ! {
                         role: 1,
                         affinity: 1,
                     },
+                    true,
                 );
             }
             UNIFIED_EVIDENCE.words[2].fetch_add(1, Ordering::Relaxed);

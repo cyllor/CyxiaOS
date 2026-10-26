@@ -409,6 +409,7 @@ fn execute(ctx: &mut user::Context, i: usize) {
                 role: if i % 2 == 1 { 2 } else { 1 },
                 affinity: 1 << cpu::slot(),
             },
+            true,
         );
         #[cfg(not(feature = "unified-runtime"))]
         {
@@ -948,16 +949,19 @@ fn heartbeat(enabled: bool) {
 #[cfg(feature = "unified-runtime")]
 /// # Safety
 /// The context and address-space root must satisfy user::enter's contract.
+/// `record_slice_evidence` controls only the auxiliary timing bank; A02 always
+/// records the authoritative task boundary around the architectural entry.
 pub(crate) unsafe fn enter_service(
     context: &mut user::Context,
     root: u64,
     deadline: u64,
     task: crate::a02_capture::Task,
+    record_slice_evidence: bool,
 ) {
     let saved_daif: u64;
     let slot = cpu::slot();
     let row = 2 + slot * 30;
-    if slot < 4 {
+    if record_slice_evidence && slot < 4 {
         // Header words are immutable static initialization. Each row has one
         // CPU writer, so its entry count needs no cross-core exclusive RMW.
         let entries = TASK_SLICE_EVIDENCE.words[row].load(Ordering::Relaxed);
@@ -968,12 +972,12 @@ pub(crate) unsafe fn enter_service(
     }
     unsafe {
         core::arch::asm!("mrs {}, daif", "msr daifset, #2", "isb", out(reg) saved_daif, options(nostack, preserves_flags));
-        if slot < 4 {
+        if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 2].store(saved_daif, Ordering::Relaxed);
             TASK_SLICE_EVIDENCE.words[row + 3].store(timer::ticks(), Ordering::Relaxed);
         }
         timer::arm(deadline);
-        if slot < 4 {
+        if record_slice_evidence && slot < 4 {
             let ctl: u64;
             let cval: u64;
             core::arch::asm!("mrs {}, cntp_ctl_el0", "mrs {}, cntp_cval_el0",out(reg)ctl,out(reg)cval,options(nostack));
@@ -986,7 +990,7 @@ pub(crate) unsafe fn enter_service(
         crate::a02_capture::enter(task);
         user::enter(context, root);
         crate::a02_capture::returned();
-        if slot < 4 {
+        if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);
         }
         if HEARTBEAT[slot].load(Ordering::Acquire) {
@@ -994,12 +998,12 @@ pub(crate) unsafe fn enter_service(
         } else {
             cpu::disable_timer();
         }
-        if slot < 4 {
+        if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 13].store(timer::ticks(), Ordering::Relaxed);
         }
         core::arch::asm!("msr daif, {}", "isb", in(reg) saved_daif, options(nostack, preserves_flags));
     }
-    if slot < 4 {
+    if record_slice_evidence && slot < 4 {
         TASK_SLICE_EVIDENCE.words[row + 14].store(timer::ticks(), Ordering::Release);
     }
 }

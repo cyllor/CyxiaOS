@@ -737,6 +737,7 @@ fn run_turn(
                 role: 2,
                 affinity: 1 << slot,
             },
+            !worker.native.probing,
         );
     }
     let actual = timer::cpu_elapsed_ns(entered);

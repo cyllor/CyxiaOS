@@ -163,6 +163,7 @@ pub fn step(slot: usize) -> bool {
                 role: 1,
                 affinity: 1 << slot,
             },
+            true,
         );
         let spent = timer::ticks() - begin;
         TICKS.fetch_add(spent, Ordering::Relaxed);

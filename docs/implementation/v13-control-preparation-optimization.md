@@ -341,3 +341,15 @@ therefore still quarantines. Normal model slices remain 100 us and the probe's
 overall wall deadline remains one second. A source regression pins all three
 bounds. Exact two-node build `/tmp/cyxia-prototype.aiYaXT` passes with both
 selected stack peaks unchanged at 37,968/65,536 bytes; Linux timing is pending.
+
+Run `40387650339` confirms the separate wall deadline removed the repeated
+timer returns (`preemptions=0`), but the first direct mapping fault still used
+8.900 ms of its 8 ms CPU credit. The high-granularity
+`TASK_SLICE_EVIDENCE` row is an auxiliary timing diagnostic, not the A02
+authoritative schedule trace; its many timer/control reads and atomic stores
+were therefore perturbing the cold probe being measured. Mapping probes now
+skip only that auxiliary row. `a02_capture::enter/returned` remain unconditional
+around the actual architectural entry, while normal model, learning, service
+and business entries retain the slice bank. A regression pins both facts.
+Exact two-node build `/tmp/cyxia-prototype.n8RbyI` passes and both selected
+stack peaks remain 37,968/65,536 bytes. Patched-QEMU timing is required.

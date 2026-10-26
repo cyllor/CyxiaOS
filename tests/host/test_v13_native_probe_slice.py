@@ -18,6 +18,12 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("if worker.native.probing {\n            PROBE_SERVICE_SLICE_NS", source)
         self.assertIn("let reservation_ns = if worker.probed && !worker.native.probing", source)
         self.assertIn("PROBE_PREPAY_NS\n    };", source)
+        self.assertIn("!worker.native.probing", source)
+
+        entry = (ROOT / "kernel/src/smp.rs").read_text()
+        self.assertIn("a02_capture::enter(task);", entry)
+        self.assertIn("a02_capture::returned();", entry)
+        self.assertIn("if record_slice_evidence && slot < 4", entry)
 
 
 if __name__ == "__main__":
