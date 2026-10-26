@@ -39,6 +39,10 @@ jobs:
             git apply --check "$patch"
             git apply "$patch"
           done
+          # The default GITHUB_TOKEN cannot update an existing workflow file.
+          # Keep that already-validated diagnostic change for a separate
+          # connector commit, while pushing the formatted runtime sources here.
+          git restore -- .github/workflows/codex-source-snapshot.yml
           cargo fmt --all
           git diff --check
       - name: Run focused correctness gates
