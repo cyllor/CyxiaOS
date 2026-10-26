@@ -2,10 +2,10 @@
 //!
 //! `ticks()` is the shared monotonic time source used for deadlines, leases and
 //! timer programming. `cpu_ticks()` is intentionally separate: the locked QEMU
-//! platform exposes host-thread CPU time through PMCCNTR_EL0 and the unified
-//! runtime uses it only to debit actual execution. Mixing the clocks would
-//! charge time spent descheduled, or time spent running another vCPU, to the
-//! current task.
+//! platform exposes translated guest execution time through PMCCNTR_EL0 and the
+//! unified runtime uses it only to debit actual execution. Mixing the clocks
+//! would charge time spent descheduled, translating code, servicing the QEMU
+//! event loop, or running another vCPU to the current task.
 use core::arch::asm;
 
 /// Frequency of the generic physical timer used for monotonic time.
@@ -69,9 +69,10 @@ pub fn cpu_elapsed_ns(start: u64) -> u64 {
 ///
 /// # Safety
 /// The caller must run once during EL1 bring-up on the CPU being initialized.
-/// The locked prototype QEMU must provide the CyxiaOS per-vCPU PMU timing patch
-/// and run each guest vCPU on its own host thread. Stock QEMU's global virtual
-/// PMU clock is not a valid CPU-accounting source.
+/// The locked prototype QEMU must provide the CyxiaOS translated-TB execution
+/// accounting patch and run each guest vCPU on its own MTTCG thread. Stock
+/// QEMU's global virtual PMU clock, and whole host-thread CPU time that includes
+/// TCG translation, are not valid CPU-accounting sources.
 pub unsafe fn init_cpu_accounting() {
     const ALL_COUNTERS: u64 = u32::MAX as u64;
     const CYCLE_COUNTER: u64 = 1 << 31;

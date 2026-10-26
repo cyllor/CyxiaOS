@@ -1,20 +1,157 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: CyxiaOS Prototype <cyxiaos@example.invalid>
 Date: Mon, 26 Oct 2026 00:00:00 +0400
-Subject: [PATCH] arm: expose vCPU execution time through PMCCNTR
+Subject: [PATCH] arm: expose translated guest execution time through PMCCNTR
 
 CyxiaOS uses CNT[P]CT for shared monotonic deadlines and PMCCNTR for actual
 per-vCPU execution debit. Stock system-emulation PMCCNTR mirrors the global
-QEMU virtual clock, which charges time spent running other vCPUs to the current
-CPU. Under MTTCG each vCPU owns a host thread, so use that thread's CPU clock
-for the PMU cycle source. At the fixed 1 GHz PMU rate one nanosecond equals one
-cycle. User-mode and non-Linux hosts keep the upstream behaviour.
----
- target/arm/cpregs-pmu.c | 20 ++++++++++++++++++++
- 1 file changed, 20 insertions(+)
+QEMU virtual clock, while charging CLOCK_THREAD_CPUTIME_ID around the entire
+vCPU thread also includes TCG translation, JIT setup and event-loop work.
 
+Accumulate thread CPU time only while tcg_qemu_tb_exec() is running. This
+includes translated guest code and synchronous helpers, but excludes code
+translation and work performed after a TB exits. Account the active interval
+on guest PMU reads and in the longjmp cleanup path. At the fixed 1 GHz PMU
+rate one nanosecond equals one cycle. Non-TCG and unsupported hosts retain the
+upstream virtual-clock fallback.
+---
+ accel/tcg/cpu-exec.c     |  3 +++
+ cpu-common.c              | 67 +++++++++++++++++++++++++++++++++++++
+ include/hw/core/cpu.h     | 15 +++++++++
+ target/arm/cpregs-pmu.c   | 10 +++++++
+ 4 files changed, 95 insertions(+)
+
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -575,6 +575,16 @@ struct CPUState {
+     /* track IOMMUs whose translations we've cached in the TCG TLB */
+     GArray *iommu_notifiers;
+ 
++    /*
++     * CyxiaOS PMU accounting. These fields accumulate host-thread CPU time
++     * only while translated guest code is executing. They are deliberately
++     * outside architectural migration state: the locked prototype does not
++     * support live migration, and guest PMU deltas remain authoritative.
++     */
++    uint64_t cyxia_exec_ns;
++    uint64_t cyxia_exec_started_ns;
++    bool cyxia_exec_active;
++
+     /*
+      * MUST BE LAST in order to minimize the displacement to CPUArchState.
+      */
+@@ -618,6 +627,11 @@ extern CPUTailQ cpus_queue;
+ 
+ extern __thread CPUState *current_cpu;
+ 
++/* Locked CyxiaOS TCG execution accounting used by the Arm PMU source. */
++void cyxia_cpu_exec_start(CPUState *cpu);
++void cyxia_cpu_exec_stop(CPUState *cpu);
++bool cyxia_cpu_exec_time_ns(CPUState *cpu, uint64_t *value);
++
+ /**
+  * cpu_paging_enabled:
+  * @cpu: The CPU whose state is to be inspected.
+diff --git a/cpu-common.c b/cpu-common.c
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -112,6 +112,73 @@ CPUState *qemu_get_cpu(int index)
+ /* current CPU in the current thread. It is only valid inside cpu_exec() */
+ __thread CPUState *current_cpu;
+ 
++static bool cyxia_thread_cpu_time_ns(uint64_t *value)
++{
++#ifdef CLOCK_THREAD_CPUTIME_ID
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0 &&
++        ts.tv_sec >= 0 && ts.tv_nsec >= 0) {
++        *value = (uint64_t)ts.tv_sec * 1000000000ULL +
++                 (uint64_t)ts.tv_nsec;
++        return true;
++    }
++#endif
++    return false;
++}
++
++static uint64_t cyxia_saturating_add_ns(uint64_t total, uint64_t delta)
++{
++    return UINT64_MAX - total < delta ? UINT64_MAX : total + delta;
++}
++
++void cyxia_cpu_exec_start(CPUState *cpu)
++{
++    uint64_t now;
++
++    if (cpu->cyxia_exec_active || !cyxia_thread_cpu_time_ns(&now)) {
++        return;
++    }
++    cpu->cyxia_exec_started_ns = now;
++    cpu->cyxia_exec_active = true;
++}
++
++void cyxia_cpu_exec_stop(CPUState *cpu)
++{
++    uint64_t now;
++    uint64_t started;
++
++    if (!cpu->cyxia_exec_active) {
++        return;
++    }
++    started = cpu->cyxia_exec_started_ns;
++    cpu->cyxia_exec_active = false;
++    if (!cyxia_thread_cpu_time_ns(&now) || now < started) {
++        return;
++    }
++    cpu->cyxia_exec_ns = cyxia_saturating_add_ns(cpu->cyxia_exec_ns,
++                                                 now - started);
++}
++
++bool cyxia_cpu_exec_time_ns(CPUState *cpu, uint64_t *value)
++{
++    uint64_t total = cpu->cyxia_exec_ns;
++
++    if (cpu->cyxia_exec_active) {
++        uint64_t now;
++
++        /* Active intervals are owned by the current vCPU thread. */
++        if (current_cpu != cpu || !cyxia_thread_cpu_time_ns(&now) ||
++            now < cpu->cyxia_exec_started_ns) {
++            return false;
++        }
++        total = cyxia_saturating_add_ns(total,
++                                        now - cpu->cyxia_exec_started_ns);
++    }
++    *value = total;
++    return true;
++}
++
+ struct qemu_work_item {
+     QSIMPLEQ_ENTRY(qemu_work_item) node;
+     run_on_cpu_func func;
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -431,7 +431,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
+     }
+ 
+     qemu_thread_jit_execute();
++    cyxia_cpu_exec_start(cpu);
+     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
++    cyxia_cpu_exec_stop(cpu);
+     cpu->neg.can_do_io = true;
+     qemu_plugin_disable_mem_helpers(cpu);
+     /*
+@@ -505,6 +507,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
+ {
+     /* Non-buggy compilers preserve this; assert the correct value. */
+     g_assert(cpu == current_cpu);
++    cyxia_cpu_exec_stop(cpu);
+ 
+ #ifdef CONFIG_USER_ONLY
+     clear_helper_retaddr();
 diff --git a/target/arm/cpregs-pmu.c b/target/arm/cpregs-pmu.c
-index 31c01eddc8..1df61b8c04 100644
 --- a/target/arm/cpregs-pmu.c
 +++ b/target/arm/cpregs-pmu.c
 @@ -6,6 +6,7 @@
@@ -25,28 +162,18 @@ index 31c01eddc8..1df61b8c04 100644
  #include "hw/irq.h"
  #include "cpu.h"
  #include "cpu-features.h"
-@@ -72,8 +73,27 @@ static uint64_t cycles_get_count(CPUARMState *env)
+@@ -72,8 +73,17 @@ static uint64_t cycles_get_count(CPUARMState *env)
  {
  #ifndef CONFIG_USER_ONLY
-+#ifdef CLOCK_THREAD_CPUTIME_ID
-+    /*
-+     * Guest PMU reads execute in the owning vCPU thread. With MTTCG this
-+     * clock advances only while that vCPU thread consumes host CPU, unlike
-+     * QEMU_CLOCK_VIRTUAL which also advances while sibling vCPUs run. Keep
-+     * the upstream virtual-clock fallback for non-vCPU callers so ordinary
-+     * PMU maintenance remains available; CyxiaOS does not enable PMU
-+     * overflow interrupts for this accounting counter.
-+     */
 +    if (qemu_cpu_is_self(env_cpu(env))) {
-+        struct timespec ts;
++        uint64_t exec_ns;
 +
-+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
-+            return (uint64_t)ts.tv_sec * ARM_CPU_FREQ
-+                 + muldiv64(ts.tv_nsec, ARM_CPU_FREQ,
++        if (cyxia_cpu_exec_time_ns(env_cpu(env), &exec_ns)) {
++            return muldiv64(exec_ns, ARM_CPU_FREQ,
 +                            NANOSECONDS_PER_SECOND);
 +        }
 +    }
-+#endif
++
      return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                     ARM_CPU_FREQ, NANOSECONDS_PER_SECOND);
  #else
