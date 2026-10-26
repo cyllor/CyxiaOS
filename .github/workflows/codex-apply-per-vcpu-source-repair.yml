@@ -27,6 +27,7 @@ jobs:
       PATCH_GZ_SHA256: d7fa9fd63148147efe6bf3549ac6991c8df24ce957bc0497fe5bfc2634dcb390
       PATCH_SHA256: 53794f5f7da8db7d6fcd967963bdfb1220f7d066d10f710d6a8dd6dcc028403f
       HOST_FIX_SHA256: f5a907dde205895f58a2abe14747093a6d968abeab4bae61c61e1ffdd8aca403
+      NETWORK_FIX_SHA256: 66455ce47974bcf295ea00702fe03398914d223778702a703054f25ee970160a
     steps:
       - name: Check out writable staging commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -41,6 +42,7 @@ jobs:
           gzip_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff.gz"
           patch_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff"
           host_fix="$STAGING_DIR/host-clock-bridge.diff"
+          network_fix="$STAGING_DIR/network-checkpoint-contract.diff"
           {
             cat "$STAGING_DIR"/part-*
             printf '\n'
@@ -52,10 +54,13 @@ jobs:
           gzip -dc "$gzip_file" > "$patch_file"
           echo "$PATCH_SHA256  $patch_file" | sha256sum --check
           echo "$HOST_FIX_SHA256  $host_fix" | sha256sum --check
+          echo "$NETWORK_FIX_SHA256  $network_fix" | sha256sum --check
           git apply --check "$patch_file"
           git apply "$patch_file"
           git apply --check "$host_fix"
           git apply "$host_fix"
+          git apply --check "$network_fix"
+          git apply "$network_fix"
           git diff --check
 
       - name: Remove corrupt and one-shot staging inputs
