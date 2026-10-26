@@ -1533,3 +1533,38 @@ fn control_work_never_starts_with_only_partial_window_credit() {
             .is_some()
     );
 }
+
+#[test]
+fn control_window_headroom_defers_without_reserving_cpu_time() {
+    let mut s = Scheduler::new();
+    assert_eq!(
+        s.reserve_control_with_window_headroom(
+            1,
+            control_layout(1),
+            WINDOW_NS - 9_999_999,
+            8_000_000,
+            10_000_000,
+        ),
+        Ok(None)
+    );
+    assert_eq!(s.cpu_window_usage(1, WINDOW_NS - 9_999_999), Ok((0, 0)));
+    assert!(s.control_active(1).is_none());
+    let credit = s
+        .reserve_control_with_window_headroom(
+            1,
+            control_layout(1),
+            WINDOW_NS,
+            8_000_000,
+            10_000_000,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(credit.reserved_ns, 8_000_000);
+    assert_eq!(s.cpu_window_usage(1, WINDOW_NS), Ok((0, 8_000_000)));
+    s.complete_control(credit, 4_900_000, WINDOW_NS + 4_900_000)
+        .unwrap();
+    assert_eq!(
+        s.cpu_window_usage(1, WINDOW_NS + 4_900_000),
+        Ok((4_900_000, 0))
+    );
+}

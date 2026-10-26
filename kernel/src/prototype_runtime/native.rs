@@ -4,6 +4,10 @@ use super::*;
 use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDOW_NS};
 
 const PREPAY_NS: u64 = 2_500_000;
+// A fresh job turn includes bounded candidate preparation and protected input
+// encoding before any EL0 slice. It is distinct from the 2.5 ms evaluation
+// turns and must reserve enough CPU time for that measured native path.
+const PREPARATION_PREPAY_NS: u64 = 8_000_000;
 // The boot mapping self-test is recovery/setup work, not one model proposal.
 // It keeps exact actual accounting but reserves the design's 8 ms recovery slice.
 const PROBE_PREPAY_NS: u64 = 8_000_000;
@@ -808,10 +812,16 @@ pub(super) fn step(worker: &mut Worker) {
         learning::step(&mut worker.extra);
         return;
     }
-    let reservation_ns = if worker.probed && !worker.native.probing {
-        PREPAY_NS
-    } else {
+    let reservation_ns = if !worker.probed || worker.native.probing {
         PROBE_PREPAY_NS
+    } else if worker.context.is_none()
+        && !worker.native.in_job
+        && worker.native.completion.is_none()
+        && worker.native.model.is_none()
+    {
+        PREPARATION_PREPAY_NS
+    } else {
+        PREPAY_NS
     };
     if !learning::allow_mandatory(&worker.extra, reservation_ns, ns(timer::ticks())) {
         return;

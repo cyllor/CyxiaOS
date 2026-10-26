@@ -1043,6 +1043,20 @@ impl Scheduler {
         now: u64,
         required_ns: u64,
     ) -> Result<Option<ControlCredit>, Error> {
+        self.reserve_control_with_window_headroom(cpu, layout, now, required_ns, 0)
+    }
+    /// Prepay a complete control turn only when its aligned window also has
+    /// the caller's full wall-time execution envelope. The CPU-time debit is
+    /// still exactly `required_ns`; headroom is admission-only and creates no
+    /// additional credit.
+    pub fn reserve_control_with_window_headroom(
+        &mut self,
+        cpu: usize,
+        layout: CpuLayout,
+        now: u64,
+        required_ns: u64,
+        headroom_ns: u64,
+    ) -> Result<Option<ControlCredit>, Error> {
         if cpu >= 64
             || layout.generation == 0
             || layout.healthy_mask & (1u64 << cpu) == 0
@@ -1050,7 +1064,7 @@ impl Scheduler {
         {
             return Err(Error::Auth);
         }
-        if required_ns == 0 || required_ns > CONTROL_BUDGET_NS {
+        if required_ns == 0 || required_ns > CONTROL_BUDGET_NS || headroom_ns > WINDOW_NS {
             return Err(Error::Range);
         }
         self.time(now)?;
@@ -1061,6 +1075,9 @@ impl Scheduler {
             return Err(Error::NotReady);
         }
         self.roll(cpu, now)?;
+        if WINDOW_NS - now % WINDOW_NS < headroom_ns {
+            return Ok(None);
+        }
         let c = self.cpus[cpu];
         if required_ns > CPU_BUDGET_NS.saturating_sub(c.spent)
             || required_ns > CONTROL_BUDGET_NS.saturating_sub(c.control_spent)

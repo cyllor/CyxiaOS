@@ -93,6 +93,7 @@ const SERVICE_KEY: ObjectKey = ObjectKey {
     id: 0x535643,
     generation: 1,
 };
+const CONTROL_WINDOW_HEADROOM_NS: u64 = 10_000_000;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-task.elf"));
 const CLIENT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-client.elf"));
 const SELFTEST_ENABLED: bool = include!(concat!(env!("OUT_DIR"), "/domain-selftest.rs"));
@@ -1292,8 +1293,13 @@ pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCr
         if s.draining & (1u64 << slot) != 0 && !cleanup {
             return Err(Error::Busy);
         }
-        s.scheduler
-            .reserve_control(slot, s.layout, now_ns(), required_ns)
+        s.scheduler.reserve_control_with_window_headroom(
+            slot,
+            s.layout,
+            now_ns(),
+            required_ns,
+            CONTROL_WINDOW_HEADROOM_NS,
+        )
     })
 }
 /// Authenticate the exact still-live reservation on its original control CPU.
