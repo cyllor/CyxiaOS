@@ -278,6 +278,19 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40418568412` crosses the mapping-probe exception boundary; the next
+failure is phase 0 at sequence 601, where the separately paid task registration
+uses 9,784,972/8,000,000 ns. Registration constructs one capture event, but
+`append` used `copy_from_slice` for its seven-word fixed header and dynamic
+payload, retaining a generic copy path similar to the earlier clear failure.
+The event writer now emits seven explicit scalar header stores and a bounded
+payload loop. Event bytes, ordering, counters, capacity and failure behavior
+are unchanged. The full 615 host tests (two environment skips), 141 v1.3 tests
+(one historical-evidence skip), formatting and configured strict AArch64
+Clippy pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-capture-scalar`
+passes both selected stack paths at 33,904/65,536 bytes. Linux timing remains
+required.
+
 Run `40417713681` shows the atomic index handoff is counterproductive under
 TCG: phase 2 rises to 10,973,090/8,000,000 ns at sequence 625, so that change
 is removed. Inspection also finds that `record_slice_evidence=false` skipped

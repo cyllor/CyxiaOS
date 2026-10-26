@@ -100,16 +100,18 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             return;
         }
         let row = &mut self.events[index];
-        row[..7].copy_from_slice(&[
-            index as u64 + 1,
-            tick,
-            kind,
-            cpu as u64,
-            task.id,
-            task.generation,
-            self.core_generation,
-        ]);
-        row[7..7 + payload.len()].copy_from_slice(payload);
+        // Emit the fixed header as ordinary scalar stores. Small dynamic
+        // capture events must not enter a generic memcpy helper under TCG.
+        row[0] = index as u64 + 1;
+        row[1] = tick;
+        row[2] = kind;
+        row[3] = cpu as u64;
+        row[4] = task.id;
+        row[5] = task.generation;
+        row[6] = self.core_generation;
+        for (offset, value) in payload.iter().copied().enumerate() {
+            row[7 + offset] = value;
+        }
         self.header[3] += 1;
         self.counters[7] += 1;
     }
