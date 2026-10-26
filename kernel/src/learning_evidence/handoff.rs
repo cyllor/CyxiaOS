@@ -26,6 +26,11 @@ static SLOTS: [Slot; CAPACITY] = [const {
 }; CAPACITY];
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 static DRAINING: AtomicBool = AtomicBool::new(false);
+// Monotonic: before the first retained completion there is provably no slot to
+// scan. Once custody has ever crossed CPUs we retain the full conservative scan.
+static EVER_RETAINED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static DRAIN_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 #[repr(u64)]
@@ -54,7 +59,7 @@ pub struct Evidence([AtomicU64; 32]);
 pub static REPLAY_CAPTURE_EVIDENCE: Evidence = Evidence([const { AtomicU64::new(0) }; 32]);
 pub(super) const OWNED_BYTES: usize = size_of::<[Slot; CAPACITY]>()
     + size_of::<AtomicUsize>()
-    + size_of::<AtomicBool>()
+    + size_of::<AtomicBool>() * 2
     + size_of::<Evidence>();
 const _: () = assert!(size_of::<Evidence>() == 256);
 
@@ -104,6 +109,9 @@ pub(super) fn loss(reason: Loss, attempt: &OwnerAttempt) {
 /// intact so its real loss is accounted exactly once, without recursion.
 pub(super) fn retain(original: &mut OwnerAttempt) -> bool {
     debug_assert!(original.pending && original.validated && original.retry.is_some());
+    // Publish before claiming a slot. A false observation in drain therefore
+    // proves no retention attempt had begun before that observation.
+    EVER_RETAINED.store(true, Ordering::Release);
     for slot in &SLOTS {
         if slot
             .state
@@ -149,6 +157,9 @@ pub(super) fn pending() -> bool {
 /// Existing paid owner turns perform at most `limit` attempts. There is no
 /// spinning, heap allocation, timestamp refresh or recursive drain.
 pub(super) fn drain(limit: usize) -> bool {
+    if !EVER_RETAINED.load(Ordering::Acquire) {
+        return true;
+    }
     if DRAINING
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -165,6 +176,8 @@ pub(super) fn drain(limit: usize) -> bool {
     let start = CURSOR.fetch_add(1, Ordering::Relaxed) % CAPACITY;
     let mut attempted = 0;
     for offset in 0..CAPACITY {
+        #[cfg(test)]
+        DRAIN_SCANS.fetch_add(1, Ordering::Relaxed);
         if attempted == limit {
             break;
         }
@@ -198,4 +211,8 @@ pub(super) fn drain(limit: usize) -> bool {
 #[cfg(test)]
 pub(super) fn snapshot() -> [u64; 32] {
     core::array::from_fn(|i| REPLAY_CAPTURE_EVIDENCE.0[i].load(Ordering::Acquire))
+}
+#[cfg(test)]
+pub(super) fn scan_count() -> usize {
+    DRAIN_SCANS.load(Ordering::Acquire)
 }

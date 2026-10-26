@@ -1601,6 +1601,9 @@ pub(crate) mod test_support {
     pub fn handoff_status() -> [u64; 32] {
         handoff::snapshot()
     }
+    pub fn handoff_scans() -> usize {
+        handoff::scan_count()
+    }
     pub fn with_gate(f: impl FnOnce()) {
         let _guard = lock().expect("test owns collector gate");
         f();

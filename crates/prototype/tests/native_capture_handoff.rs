@@ -149,6 +149,7 @@ fn finished_native_segments_keep_original_custody_across_collector_contention() 
                 .unwrap();
             bridge::register_source_classifier(classify).unwrap();
             let run = begin(1);
+            assert_eq!(bridge::test_support::handoff_scans(), 0);
 
             // This is the actual fire-and-forget path used by synchronous native
             // owners: completion happens while another collector operation owns

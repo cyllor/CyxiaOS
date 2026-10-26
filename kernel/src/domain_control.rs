@@ -1157,28 +1157,20 @@ fn next_normal(
         });
         s.family_cursor = (index + 1) % 18;
         let ordinal = s.cursor[index];
-        let target = if s.preparation.is_some() {
-            // The legacy scalar callback conflates unavailable evidence and
-            // object absence. A retry must never drop its debit on contention.
-            let mut output = [None];
-            read_target_batch(
-                f.target_source,
-                &[target_batch::Query {
-                    domain: f.domain,
-                    kind: f.kind,
-                    ordinal,
-                }],
-                &mut output,
-            )?;
-            output[0]
-        } else {
-            (f.target)(f.domain, f.kind, ordinal).or_else(|| (f.target)(f.domain, f.kind, 0))
-        };
-        s.cursor[index] = if (f.target)(f.domain, f.kind, ordinal + 1).is_some() {
-            ordinal + 1
-        } else {
-            0
-        };
+        // Resolve current/fallback plus exact lookahead from one immutable
+        // owner view. A retry must never turn owner contention into absence,
+        // and the exact lookahead must not advance onto fallback ordinal zero.
+        let mut targets = [None; 2];
+        read_target_batch(
+            f.target_source,
+            &[
+                target_batch::Query::fallback(f.domain, f.kind, ordinal),
+                target_batch::Query::exact(f.domain, f.kind, ordinal + 1),
+            ],
+            &mut targets,
+        )?;
+        let target = targets[0];
+        s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {
             if s.preparation.is_some() {
                 return Err(Error::Stale);

@@ -35,6 +35,26 @@ pub struct Query {
     pub domain: u16,
     pub kind: u16,
     pub ordinal: usize,
+    pub fallback: bool,
+}
+impl Query {
+    pub const fn exact(domain: u16, kind: u16, ordinal: usize) -> Self {
+        Self {
+            domain,
+            kind,
+            ordinal,
+            fallback: false,
+        }
+    }
+
+    pub const fn fallback(domain: u16, kind: u16, ordinal: usize) -> Self {
+        Self {
+            domain,
+            kind,
+            ordinal,
+            fallback: true,
+        }
+    }
 }
 pub fn resolve(
     queries: &[Query],
@@ -46,7 +66,7 @@ pub fn resolve(
     }
     for (query, result) in queries.iter().copied().zip(output) {
         *result = target(query).or_else(|| {
-            (query.ordinal != 0)
+            (query.fallback && query.ordinal != 0)
                 .then(|| {
                     target(Query {
                         ordinal: 0,

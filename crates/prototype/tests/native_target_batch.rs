@@ -46,24 +46,24 @@ fn empty_object_walk_remains_a_required_released_evaluation() {
 
 #[test]
 fn projection_preserves_holes_and_fallback() {
-    let queries = [
-        Query {
-            domain: 14,
-            kind: 1,
-            ordinal: 2,
-        },
-        Query {
-            domain: 14,
-            kind: 1,
-            ordinal: 1,
-        },
-    ];
+    let queries = [Query::fallback(14, 1, 2), Query::fallback(14, 1, 1)];
     let mut out = [None; 2];
     resolve(&queries, &mut out, |q| {
         [None, Some(key(8, 2))].get(q.ordinal).copied().flatten()
     })
     .unwrap();
     assert_eq!(out, [None, Some(key(8, 2))]);
+}
+
+#[test]
+fn projection_distinguishes_current_fallback_from_exact_lookahead() {
+    let queries = [Query::fallback(1, 1, 7), Query::exact(1, 1, 8)];
+    let mut out = [None; 2];
+    resolve(&queries, &mut out, |q| {
+        (q.ordinal == 0).then_some(key(1, 1))
+    })
+    .unwrap();
+    assert_eq!(out, [Some(key(1, 1)), None]);
 }
 
 #[test]

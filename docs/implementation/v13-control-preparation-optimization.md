@@ -384,3 +384,22 @@ each page retains its final `DSB ISH`, actual CPU settlement and next-offset
 publication. The focused source regressions, configured AArch64 strict Clippy
 and exact two-node build `/tmp/cyxia-prototype.RwELJY` pass; both selected
 preparation peaks remain 33,872/65,536 bytes. Patched-QEMU timing is required.
+
+Run `40391681911` crossed the bounded private clears and localized the next
+ordinary family-0 preparation to two earlier intervals. CPU1 sequence 57 used
+23.140/2.5 ms for domain 1, kind 1, target 1:1: target discovery consumed about
+6.815 ms and the replay/measurement prefix another 11.364 ms. Target discovery
+previously acquired the task owner separately for current ordinal, fallback
+ordinal zero and exact lookahead. It now submits current/fallback plus exact
+lookahead as one batch against one immutable owner view; a direct regression
+proves lookahead cannot accidentally reuse fallback zero. Measurement setup
+also scanned all 16 completed-attempt handoff slots with exclusive CAS even
+before any attempt had ever been retained. A release/acquire monotonic flag now
+proves that virgin state and skips the scan; after the first retention attempt,
+the full conservative scan remains enabled permanently. The custody regression
+proves zero virgin scans and still exercises cross-CPU retained completion.
+Configured AArch64 strict Clippy, 138 v1.3 host tests (one historical-evidence
+skip), focused native-control tests and exact two-node build
+`/tmp/cyxia-prototype.NWCKfy` pass. Both selected preparation peaks are
+34,080/65,536 bytes with the unchanged exception reserve. Linux timing remains
+required.
