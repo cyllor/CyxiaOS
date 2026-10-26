@@ -93,7 +93,7 @@ fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started
         u64::from(descriptor.kind),
         source,
         ordinal as u64,
-        timer::cpu_ticks(),
+        0,
         0,
     ]
     .into_iter()
@@ -102,14 +102,6 @@ fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started
         DOMAIN_PREPARATION_CONTEXT.0[base + offset].store(value, Ordering::Relaxed);
     }
     DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(started, Ordering::Release);
-}
-fn preparation_lookup_finished() {
-    let cpu = cyxia_arch_aarch64::cpu::slot();
-    if !(1..=2).contains(&cpu) {
-        return;
-    }
-    let base = (cpu - 1) * 8;
-    DOMAIN_PREPARATION_CONTEXT.0[base + 6].store(timer::cpu_ticks(), Ordering::Release);
 }
 fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, started: u64) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
@@ -1210,7 +1202,6 @@ fn next_normal(
             ],
             &mut targets,
         );
-        preparation_lookup_finished();
         target_result?;
         let target = targets[0];
         s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };

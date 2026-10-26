@@ -4,10 +4,38 @@ use cyxia_peer_billing::{self as wire, Binding, TraceSeal};
 use cyxia_prototype::{
     domains::ObjectKey,
     learning::{
-        Error,
+        Error, Family,
         reward::{CpuClass, CpuCoverage, CpuInterval, OBSERVATION_NS},
     },
 };
+
+/// Immutable relevance that can be checked before borrowing the live ledger.
+/// Executor-work relevance also depends on its registered remote-token table
+/// and deliberately returns `None` for the owner to resolve under the gate.
+pub(crate) fn fixed_relevance(
+    family: Family,
+    target: ObjectKey,
+    owner: ObjectKey,
+    class: CpuClass,
+) -> Option<bool> {
+    match class {
+        CpuClass::Policy | CpuClass::ExecutorAction => Some(
+            owner == target
+                || family
+                    == (Family {
+                        domain: 16,
+                        kind: 2,
+                    })
+                    && owner
+                        == (ObjectKey {
+                            id: 16,
+                            generation: 1,
+                        }),
+        ),
+        CpuClass::Optional => Some(false),
+        CpuClass::ExecutorWork => None,
+    }
+}
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,24 +133,12 @@ impl Ledger {
         Ok(())
     }
     fn relevant(&self, owner: ObjectKey, class: CpuClass) -> bool {
-        match class {
-            CpuClass::Policy | CpuClass::ExecutorAction => {
-                owner == self.binding.target
-                    || self.binding.family
-                        == (cyxia_prototype::learning::Family {
-                            domain: 16,
-                            kind: 2,
-                        })
-                        && owner
-                            == (ObjectKey {
-                                id: 16,
-                                generation: 1,
-                            })
-            }
-            // Actual scheduler identities of the shared service and the
-            // single remote pure-task executor. Generations are never erased
-            // from a lease, even when the physical thread id is reused.
-            CpuClass::ExecutorWork => {
+        match fixed_relevance(self.binding.family, self.binding.target, owner, class) {
+            Some(relevant) => relevant,
+            None => {
+                // Actual scheduler identities of the shared service and the
+                // single remote pure-task executor. Generations are never erased
+                // from a lease, even when the physical thread id is reused.
                 owner
                     == (ObjectKey {
                         id: 0x101,
@@ -131,7 +147,6 @@ impl Ledger {
                     || owner.id == 0x100
                         && self.remote_tokens[..self.remote_count].contains(&owner.generation)
             }
-            CpuClass::Optional => false,
         }
     }
     pub fn begin(&mut self, owner: ObjectKey, class: CpuClass, core: u16) -> Option<Lease> {

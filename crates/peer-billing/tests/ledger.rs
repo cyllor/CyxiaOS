@@ -53,6 +53,42 @@ fn service() -> ObjectKey {
     }
 }
 #[test]
+fn immutable_relevance_rejects_unrelated_policy_before_live_ledger_borrow() {
+    let b = binding();
+    assert_eq!(
+        ledger::fixed_relevance(b.family, b.target, b.target, CpuClass::Policy),
+        Some(true)
+    );
+    assert_eq!(
+        ledger::fixed_relevance(
+            b.family,
+            b.target,
+            ObjectKey {
+                id: 1,
+                generation: 1,
+            },
+            CpuClass::Policy,
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        ledger::fixed_relevance(
+            b.family,
+            b.target,
+            ObjectKey {
+                id: 16,
+                generation: 1,
+            },
+            CpuClass::ExecutorAction,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        ledger::fixed_relevance(b.family, b.target, service(), CpuClass::ExecutorWork),
+        None
+    );
+}
+#[test]
 fn actual_open_credits_and_custody_block_closing_and_original_core_times_survive() {
     let b = binding();
     let observation = 2_000_000_000;

@@ -21,14 +21,11 @@ class NativeInputPage(unittest.TestCase):
         source = (ROOT / "kernel/src/domain_control.rs").read_text()
         lookup = source.index("preparation_lookup(index, f, ordinal, wall_started);")
         target = source.index("let target_result = read_target_batch", lookup)
-        finished = source.index("preparation_lookup_finished();", target)
-        checked = source.index("target_result?;", finished)
+        checked = source.index("target_result?;", target)
 
         self.assertLess(lookup, target)
-        self.assertLess(target, finished)
-        self.assertLess(finished, checked)
+        self.assertLess(target, checked)
         self.assertIn("descriptor.target_source", source)
-        self.assertIn("timer::cpu_ticks()", source[source.index("fn preparation_lookup"):target])
 
 
 if __name__ == "__main__":

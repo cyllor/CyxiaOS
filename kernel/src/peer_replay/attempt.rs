@@ -1,6 +1,6 @@
 //! Native partner CPU segment custody. The ledger and its backing remain owned
 //! by the parent; a token may be consumed only once after actual completion.
-use super::{DROPPED, DROPPED_OPEN, family, ledger, ledger_with, now, stored};
+use super::{DROPPED, DROPPED_OPEN, captures, ledger, ledger_with, now, stored};
 use core::sync::atomic::Ordering;
 use cyxia_prototype::{
     domains::ObjectKey,
@@ -22,7 +22,9 @@ impl Drop for Attempt {
     }
 }
 pub fn attempt(owner: ObjectKey, class: CpuClass, core: u16) -> Option<Attempt> {
-    family()?;
+    if !captures(owner, class) {
+        return None;
+    }
     match ledger_with(|l| Ok(l.begin(owner, class, core))) {
         Ok(Some(lease)) => Some(Attempt {
             lease: Some(lease),

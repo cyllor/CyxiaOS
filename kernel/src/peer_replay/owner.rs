@@ -162,6 +162,9 @@ unsafe impl Sync for LedgerCell {}
 static LEDGER: LedgerCell = LedgerCell(UnsafeCell::new(None));
 static LEDGER_GATE: AtomicBool = AtomicBool::new(false);
 static LEDGER_FAMILY: AtomicU64 = AtomicU64::new(0);
+static LEDGER_KIND: AtomicU64 = AtomicU64::new(0);
+static LEDGER_TARGET_ID: AtomicU64 = AtomicU64::new(0);
+static LEDGER_TARGET_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static DROPPED_OPEN: AtomicU64 = AtomicU64::new(0);
 // A successful root release cannot be undone by a contended owner lock. Keep
@@ -435,6 +438,25 @@ pub fn init(boot: u64) -> Result<(), DomainError> {
 pub fn family() -> Option<u16> {
     let f = LEDGER_FAMILY.load(Ordering::Acquire);
     (f != 0).then_some(f as u16)
+}
+pub(crate) fn captures(owner: ObjectKey, class: CpuClass) -> bool {
+    let domain = LEDGER_FAMILY.load(Ordering::Acquire);
+    if domain == 0 {
+        return false;
+    }
+    ledger::fixed_relevance(
+        cyxia_prototype::learning::Family {
+            domain: domain as u16,
+            kind: LEDGER_KIND.load(Ordering::Relaxed) as u16,
+        },
+        ObjectKey {
+            id: LEDGER_TARGET_ID.load(Ordering::Relaxed),
+            generation: LEDGER_TARGET_GENERATION.load(Ordering::Relaxed),
+        },
+        owner,
+        class,
+    )
+    .unwrap_or(true)
 }
 #[path = "attempt.rs"]
 mod attempts;
@@ -887,6 +909,9 @@ fn dispatch(s: &mut State, kind: u16, body: &[u8]) -> Result<(), DomainError> {
             }
             DROPPED.store(0, Ordering::Release);
             DROPPED_OPEN.store(0, Ordering::Release);
+            LEDGER_KIND.store(u64::from(b.family.kind), Ordering::Relaxed);
+            LEDGER_TARGET_ID.store(b.target.id, Ordering::Relaxed);
+            LEDGER_TARGET_GENERATION.store(b.target.generation, Ordering::Relaxed);
             LEDGER_FAMILY.store(u64::from(b.family.domain), Ordering::Release);
             p.identity = b;
             p.started = true;

@@ -546,3 +546,20 @@ environment skips), 141 v1.3 host tests (one historical-evidence skip),
 formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-compact-groups` is `BUILT_NOT_RUN`; both
 selected stack paths pass at 33,904/65,536 bytes with the fixed reserve.
+
+Run `40408468486` confirms compact target lookup succeeds and reaches detailed
+marker 2 for domain-1 group `1:1`, then the combined prefix/current path uses
+17,063,616 ns. During two-node replay, `Measurement::new` tried the remote
+ledger for every ordinary policy owner before the ledger itself rejected an
+unrelated identity. The immutable active ledger family, kind and target are now
+release-published beside its existing family gate. Policy/action attempts first
+apply the exact same relevance predicate without borrowing the live ledger;
+only relevant identities enter its lock and open-credit bookkeeping.
+Executor-work still resolves its mutable remote-token table under the ledger
+gate. The now-resolved target diagnostic keeps family/source attribution but
+drops its two per-turn counter reads. No capture, credit or authority is
+created by the projection. Local validation and Linux timing remain required.
+All seven peer-ledger tests, 141 v1.3 host tests (one historical-evidence skip),
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-peer-filter` is `BUILT_NOT_RUN`; both selected
+stack paths remain 33,904/65,536 bytes with the fixed reserve.
