@@ -829,6 +829,16 @@ fn control_legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
         _ => Err(Error::Unsupported),
     }
 }
+fn legal_options(
+    options: &[Option<Action>],
+    key: ObjectKey,
+    now: u64,
+    output: &mut [Option<Action>],
+) -> Result<usize, Error> {
+    cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+        control_legal(action, key, now)
+    })
+}
 fn irq_execution(
     progress: IrqProgress,
     apply: ApplyId,
@@ -921,6 +931,7 @@ pub fn register_control() -> Result<(), Error> {
             },
             current: control_current,
             legal: control_legal,
+            legal_options,
             target_features: |action, key| {
                 control_legal(action, key, now_ns())?;
                 Ok(TargetFeatures::default())

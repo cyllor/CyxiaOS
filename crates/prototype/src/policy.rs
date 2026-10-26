@@ -12,6 +12,38 @@ pub const MAX_REGISTERED: usize = 64;
 pub const MAX_PENDING: usize = 64;
 pub const TERMINAL_HISTORY: usize = 256;
 pub const PUBLICATION_BUDGET_NS: u64 = 500_000;
+
+/// Filter one immutable tier snapshot without changing the preparation
+/// semantics of the scalar legality callback. A transient owner result aborts
+/// the tier so callers retry the same candidate-set identity; hard rejection
+/// removes only that action while preserving order.
+pub fn collect_legal_actions(
+    options: &[Option<crate::domains::Action>],
+    output: &mut [Option<crate::domains::Action>],
+    mut legal: impl FnMut(crate::domains::Action) -> Result<(), Error>,
+) -> Result<usize, Error> {
+    if output.len() < options.len() {
+        return Err(Error::Capacity);
+    }
+    let mut count = 0;
+    for option in options.iter().flatten().copied() {
+        match legal(option) {
+            Ok(()) => {
+                output[count] = Some(option);
+                count += 1;
+            }
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Stale
+                | Error::NotFound),
+            ) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(count)
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Prerequisite {
     pub domain: u16,

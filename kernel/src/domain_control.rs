@@ -26,6 +26,12 @@ struct PreparationDetail([core::sync::atomic::AtomicU64; 32]);
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
     PreparationDetail([const { core::sync::atomic::AtomicU64::new(0) }; 32]);
+#[repr(C, align(64))]
+struct PreparationContext([core::sync::atomic::AtomicU64; 16]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_CONTEXT: PreparationContext =
+    PreparationContext([const { core::sync::atomic::AtomicU64::new(0) }; 16]);
 fn preparation_detail(phase: usize) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
@@ -54,6 +60,48 @@ fn preparation_phase(phase: usize) {
         }
     }
     DOMAIN_PREPARATION_EVIDENCE.0[base + phase].store(now(), Ordering::Release);
+}
+fn clear_preparation_context() {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let base = (cpu - 1) * 8;
+    for word in &DOMAIN_PREPARATION_CONTEXT.0[base..base + 8] {
+        word.store(0, Ordering::Relaxed);
+    }
+}
+fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, started: u64) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let base = (cpu - 1) * 8;
+    for (offset, value) in [
+        family as u64 + 1,
+        u64::from(descriptor.domain),
+        u64::from(descriptor.kind),
+        target.id,
+        target.generation,
+        0,
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        DOMAIN_PREPARATION_CONTEXT.0[base + offset].store(value, Ordering::Relaxed);
+    }
+    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(started, Ordering::Release);
+}
+fn preparation_current(current: Action) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let (_, _, a, b) = current.order();
+    let base = (cpu - 1) * 8;
+    DOMAIN_PREPARATION_CONTEXT.0[base + 5].store(a, Ordering::Relaxed);
+    DOMAIN_PREPARATION_CONTEXT.0[base + 6].store(b, Ordering::Release);
 }
 #[path = "domain_control/core_replay.rs"]
 pub mod core_replay;
@@ -102,6 +150,8 @@ pub struct Family {
     pub observe: fn(u16, ObjectKey) -> Result<DomainObservation, Error>,
     pub current: fn(u16, u16, ObjectKey) -> Result<Action, Error>,
     pub legal: fn(Action, ObjectKey, u64) -> Result<(), Error>,
+    pub legal_options:
+        fn(&[Option<Action>], ObjectKey, u64, &mut [Option<Action>]) -> Result<usize, Error>,
     pub target_features: fn(Action, ObjectKey) -> Result<TargetFeatures, Error>,
     pub apply: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
     pub reconcile: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
@@ -396,6 +446,7 @@ pub fn register(family: Family) -> Result<(), Error> {
                 && core::ptr::fn_addr_eq(old.observe, family.observe)
                 && core::ptr::fn_addr_eq(old.current, family.current)
                 && core::ptr::fn_addr_eq(old.legal, family.legal)
+                && core::ptr::fn_addr_eq(old.legal_options, family.legal_options)
                 && core::ptr::fn_addr_eq(old.target_features, family.target_features)
                 && core::ptr::fn_addr_eq(old.apply, family.apply)
                 && core::ptr::fn_addr_eq(old.reconcile, family.reconcile)
@@ -413,6 +464,7 @@ pub fn register(family: Family) -> Result<(), Error> {
         Ok(())
     })
 }
+
 pub fn register_dependencies(consumer: u16, resolver: DependencyResolver) -> Result<(), Error> {
     if !matches!(consumer, 1 | 4 | 8 | 10) {
         return Err(Error::Unsupported);
@@ -818,23 +870,7 @@ fn validate_selection(
     }
     let (options, n) = tiers(current);
     let mut legal = [None; 32];
-    let mut count = 0;
-    for option in options[..n].iter().flatten().copied() {
-        match (f.legal)(option, target, at) {
-            Ok(()) => {
-                legal[count] = Some(option);
-                count += 1;
-            }
-            Err(
-                error @ (Error::Busy
-                | Error::Again
-                | Error::NotReady
-                | Error::Stale
-                | Error::NotFound),
-            ) => return Err(error),
-            Err(_) => {}
-        }
-    }
+    let count = (f.legal_options)(&options[..n], target, at, &mut legal)?;
     legal[..count].sort_unstable_by_key(|a| a.map(Action::order));
     if !cyxia_prototype::domains::stability::adjacent(current, action, &legal[..count])? {
         return Err(Error::Conflict);
@@ -1037,6 +1073,7 @@ fn next_locked_inner(
 ) -> Result<bool, Error> {
     preparation_phase(0);
     preparation_detail(0);
+    clear_preparation_context();
     require_control(&s.owner)?;
     if s.boot == 0
         || s.job.is_some()
@@ -1148,6 +1185,7 @@ fn next_normal(
             }
             break 'families;
         };
+        preparation_context(index, f, target, wall_started);
         preparation_detail(1);
         if f.domain == 15 && crate::learning_canary::blocks_active() {
             break 'families;
@@ -1217,6 +1255,7 @@ fn next_normal(
             }
             Err(e) => return Err(e),
         };
+        preparation_current(current);
         preparation_detail(3);
         let observed = match (f.observe)(f.domain, target) {
             Ok(v) => v,
@@ -1242,19 +1281,13 @@ fn next_normal(
         preparation_detail(5);
         let (options, n) = tiers(current);
         let mut legal = [None; 32];
-        let mut legal_count = 0;
-        for option in options[..n].iter().flatten() {
-            match (f.legal)(*option, target, wall_started) {
-                Ok(()) => {
-                    legal[legal_count] = Some(*option);
-                    legal_count += 1;
-                }
-                Err(
-                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
-                ) => break 'families,
-                Err(_) => {}
+        let legal_count = match (f.legal_options)(&options[..n], target, wall_started, &mut legal) {
+            Ok(count) => count,
+            Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
+                break 'families;
             }
-        }
+            Err(error) => return Err(error),
+        };
         legal[..legal_count].sort_unstable_by_key(|a| a.map(Action::order));
         preparation_detail(6);
         if current != Action::OfferCpu(0)

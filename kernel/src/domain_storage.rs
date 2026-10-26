@@ -712,6 +712,16 @@ pub fn validate_action(action: Action, key: ObjectKey, now: u64) -> Result<(), E
     let _ = now;
     Ok(())
 }
+fn legal_options(
+    options: &[Option<Action>],
+    key: ObjectKey,
+    now: u64,
+    output: &mut [Option<Action>],
+) -> Result<usize, Error> {
+    cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+        validate_action(action, key, now)
+    })
+}
 fn control_current(domain: u16, _kind: u16, key: ObjectKey) -> Result<Action, Error> {
     current_action(domain, key)
 }
@@ -865,6 +875,7 @@ pub fn register_control() -> Result<(), Error> {
             },
             current: control_current,
             legal: validate_action,
+            legal_options,
             target_features,
             apply,
             reconcile,

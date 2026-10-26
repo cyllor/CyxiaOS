@@ -878,6 +878,18 @@ fn legal_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Resul
 fn legal(action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
     read(|s| legal_view(s, action, target, now))
 }
+fn legal_options(
+    options: &[Option<Action>],
+    target: ObjectKey,
+    now: u64,
+    output: &mut [Option<Action>],
+) -> Result<usize, Error> {
+    read(|view| {
+        cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+            legal_view(view, action, target, now)
+        })
+    })
+}
 fn legal_view(s: &ReadView, action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
     action.validate()?;
     match action {
@@ -1130,6 +1142,7 @@ pub fn register_control() -> Result<(), Error> {
             },
             current,
             legal,
+            legal_options,
             target_features,
             apply,
             reconcile,

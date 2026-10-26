@@ -382,6 +382,18 @@ fn current(domain: u16, kind: u16, key: ObjectKey) -> Result<Action, Error> {
 fn legal(action: Action, key: ObjectKey, _: u64) -> Result<(), Error> {
     inspect_view(|view| legal_in(view, action, key))
 }
+fn legal_options(
+    options: &[Option<Action>],
+    key: ObjectKey,
+    _at: u64,
+    output: &mut [Option<Action>],
+) -> Result<usize, Error> {
+    inspect_view(|view| {
+        cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+            legal_in(view, action, key)
+        })
+    })
+}
 fn legal_in(view: &ReadView, action: Action, key: ObjectKey) -> Result<(), Error> {
     action.validate()?;
     if !(0..32).any(|ordinal| target_in(view, action.domain(), action.kind(), ordinal) == Some(key))
@@ -494,6 +506,7 @@ pub fn register_control() -> Result<(), Error> {
             observe: measurements,
             current,
             legal,
+            legal_options,
             target_features,
             apply,
             reconcile,

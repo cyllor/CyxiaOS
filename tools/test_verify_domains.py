@@ -459,15 +459,18 @@ class EvidenceParserTests(unittest.TestCase):
         guest = {}
         preparation = list(range(16))
         detail = list(range(32))
+        context = [4, 3, 1, 0x1234, 7, 1024, 32, 900_010_000] + [0] * 8
         with self.assertRaisesRegex(ValueError, r'"preparation_evidence":\[0,1,2'):
             diagnostics(guest, {"UNIFIED_EVIDENCE": encode([0] * 512),
                                 "CONTROL_CREDIT_EVIDENCE": encode(receipt),
                                 "DOMAIN_TASK_EVIDENCE": encode([0] * 32),
                                 "DOMAIN_PREPARATION_EVIDENCE": encode(preparation),
-                                "DOMAIN_PREPARATION_DETAIL": encode(detail)})
+                                "DOMAIN_PREPARATION_DETAIL": encode(detail),
+                                "DOMAIN_PREPARATION_CONTEXT": encode(context)})
         self.assertEqual(guest["control_credit"], parsed)
         self.assertEqual(guest["preparation_evidence"], preparation)
         self.assertEqual(guest["preparation_detail"], detail)
+        self.assertEqual(guest["preparation_context"], context)
 
     def test_incomplete_c_credit_failure_is_not_a_successful_capture(self):
         receipt = [0] * 64

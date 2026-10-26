@@ -1415,6 +1415,66 @@ fn validate_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Re
 pub fn validate_action(action: Action, target: ObjectKey, _now: u64) -> Result<(), Error> {
     locked(|s| validate_locked(s, action, target, now_ns()))
 }
+fn legal_options(
+    options: &[Option<Action>],
+    target: ObjectKey,
+    _at: u64,
+    output: &mut [Option<Action>],
+) -> Result<usize, Error> {
+    // Candidate tiers share one immutable owner view. Reacquiring the task
+    // gate for every value adds cross-vCPU exclusive traffic without observing
+    // a newer state that could validly belong to the same candidate set.
+    locked(|s| {
+        let now = now_ns();
+        let first = options.iter().flatten().next().copied();
+        if matches!(first, Some(Action::Cache { .. })) {
+            // The partition identity and physical spans are common to every
+            // Cache tier. Read and validate them once, then vary only the
+            // candidate's page grant. A shared hard error still rejects each
+            // option exactly as the scalar callback did.
+            let cache = (|| {
+                if target != MEMORY_KEY {
+                    return Err(Error::Stale);
+                }
+                let usage = crate::domain_storage::cache_usage();
+                let (task_base, task_pages) = memory_backing()?;
+                let (file_base, file_pages) = crate::domain_storage::cache_backing()?;
+                let task_end = task_base
+                    .checked_add(u64::from(task_pages) * 4096)
+                    .ok_or(Error::Overflow)?;
+                let file_end = file_base
+                    .checked_add(u64::from(file_pages) * 4096)
+                    .ok_or(Error::Overflow)?;
+                if !file_base.is_multiple_of(4096)
+                    || file_pages == 0
+                    || u64::from(file_pages) != usage[3]
+                    || (task_base < file_end && file_base < task_end)
+                {
+                    return Err(Error::Conflict);
+                }
+                Ok(usage[3])
+            })();
+            return cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+                action.validate()?;
+                let available = cache?;
+                let Action::Cache { pages, .. } = action else {
+                    return Err(Error::Stale);
+                };
+                let grant = (pages / 4).min(256);
+                if grant as usize > PAGES - TABLE_PAGES - CODE_PAGES - 32
+                    || u64::from(pages - grant) > available
+                {
+                    Err(Error::Budget)
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+            validate_locked(s, action, target, now)
+        })
+    })
+}
 pub fn install(
     action: Action,
     target: ObjectKey,
@@ -1821,6 +1881,7 @@ pub fn register_control() -> Result<(), Error> {
             },
             current: control_current,
             legal: validate_action,
+            legal_options,
             target_features: control_features,
             apply: control_apply,
             reconcile: control_reconcile,

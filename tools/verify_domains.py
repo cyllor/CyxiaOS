@@ -72,7 +72,8 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
-            "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_REJECTIONS": 5184}
+            "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
+            "DOMAIN_PREPARATION_REJECTIONS": 5184}
 
 
 def require(condition, message):
@@ -515,6 +516,7 @@ def diagnostics(guest, bundle):
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
+                                    ("DOMAIN_PREPARATION_CONTEXT", "preparation_context", 16),
                                     ("DOMAIN_PREPARATION_REJECTIONS", "preparation_rejections", 648),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
                                     ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
@@ -591,6 +593,7 @@ def diagnostics(guest, bundle):
                         bundle.get("DOMAIN_CONTROL_EVIDENCE", b"")),
                     "preparation_evidence": guest.get("preparation_evidence"),
                     "preparation_detail": guest.get("preparation_detail"),
+                    "preparation_context": guest.get("preparation_context"),
                 }
                 check(key, not guest[key],
                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
@@ -992,7 +995,7 @@ def run(args):
         report["observations"] = [{key: guest.get(key) for key in
                                   ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "overrun_evidence", "panic_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
-                                   "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_rejections", "rejected_preparations",
+                                   "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",
                                    "replay_root_evidence", "replay_owner_evidence",
                                    "replay_config_evidence", "replay_capture_evidence",

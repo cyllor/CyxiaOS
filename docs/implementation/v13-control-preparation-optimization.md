@@ -303,3 +303,27 @@ saturating-sum the same exact counts. The external total and release/acquire
 publication semantics are unchanged. Configured AArch64 strict Clippy passes.
 Exact local build `/tmp/cyxia-prototype.wu12S3` is `BUILT_NOT_RUN`; both selected
 stack paths remain 37,984/65,536 bytes. Linux timing remains required.
+
+Run `40383183823` did not validate the dependency source. Its first attempt
+stopped in an early 8 ms mapping probe, while an exact rerun progressed to
+normal preparation and recorded a 23.516 ms CPU overrun between detailed
+markers 5 and 6. The preceding optimization was nevertheless visible:
+current-action lookup fell from approximately 4.840 ms to 2.595 ms and
+dependency preparation from 2.630 ms to 0.845 ms. The uncompleted interval is
+legal-tier enumeration. That path previously reacquired the same domain owner
+snapshot independently for every one of up to four tier values; the task Cache
+family also repeated identical physical partition and backing validation four
+times.
+
+Each registered family now supplies a bulk legality projection. Normal
+preparation and publication revalidation collect a tier from one immutable
+owner view, retaining the scalar callback for final apply checks. Hard action
+rejections still remove only that action, while Busy/Again/NotReady/Stale/
+NotFound abort the complete tier and retain the original preparation identity.
+The task Cache projection additionally reads its common partition identity and
+physical spans once, varying only the candidate page grant. Three direct
+behavior regressions pin order, transient short-circuiting and capacity failure.
+A new per-CPU diagnostic row records family, target and current action without
+changing an acceptance condition. The complete prototype suite, 47 domain-tool
+tests and exact two-node build `/tmp/cyxia-prototype.BxOJpS` pass locally; both
+selected stack peaks are 37,968/65,536 bytes. Patched-QEMU timing is required.
