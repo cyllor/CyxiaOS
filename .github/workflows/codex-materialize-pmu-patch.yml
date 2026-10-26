@@ -22,22 +22,28 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - name: Encode staged bytes for deterministic inspection
+      - name: Materialize payload and diagnostics
         run: |
-          set -euo pipefail
+          set -u
           source=.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz
-          target=.github/codex/patches/110-per-vcpu-accounting-repair.diff.gz.b64
-          test -s "$source"
-          base64 --wrap=76 "$source" > "$target"
+          target=.github/codex/patches/110-per-vcpu-accounting-repair.materialized
+          log=.github/codex/patches/110-per-vcpu-accounting-repair.materialization.log
+          : > "$log"
+          file "$source" >> "$log" 2>&1 || true
+          gzip -lv "$source" >> "$log" 2>&1 || true
+          gzip -dc "$source" > "$target" 2>> "$log"
+          status=$?
+          printf 'gzip_status=%s\n' "$status" >> "$log"
+          wc -c "$source" "$target" >> "$log" 2>&1 || true
+          sha256sum "$source" "$target" >> "$log" 2>&1 || true
           test -s "$target"
-          sha256sum "$source" "$target" > .github/codex/patches/110-per-vcpu-accounting-repair.materialization.sha256
-      - name: Commit inspectable bytes
+      - name: Commit inspectable payload
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add \
-            .github/codex/patches/110-per-vcpu-accounting-repair.diff.gz.b64 \
-            .github/codex/patches/110-per-vcpu-accounting-repair.materialization.sha256
-          git commit -m 'chore: expose staged PMU patch bytes'
+            .github/codex/patches/110-per-vcpu-accounting-repair.materialized \
+            .github/codex/patches/110-per-vcpu-accounting-repair.materialization.log
+          git commit -m 'chore: materialize staged PMU payload'
           git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype
