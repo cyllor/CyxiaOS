@@ -10,6 +10,7 @@ class NativePrivateClear(unittest.TestCase):
         source = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
 
         self.assertIn("const PRIVATE_CLEAR_SLICE_BYTES: usize = 64;", source)
+        self.assertIn("const PRIVATE_CLEAR_BARRIER: u32", source)
         self.assertNotIn("const PRIVATE_CLEAR_SLICE_NS", source)
         self.assertIn("let slice_end = offset", source)
         self.assertIn("while offset < slice_end", source)
@@ -17,6 +18,8 @@ class NativePrivateClear(unittest.TestCase):
         self.assertNotIn('core::arch::asm!("dc zva', source)
         self.assertIn("core::ptr::write_bytes(address, 0, block_bytes);", source)
         self.assertIn('core::arch::asm!("dsb ish", options(nostack));', source)
+        self.assertIn("if next == PRIVATE_CLEAR_BARRIER", source)
+        self.assertIn("PRIVATE_CLEAR_BARRIER\n", source)
 
 
 if __name__ == "__main__":

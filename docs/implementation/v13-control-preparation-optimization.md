@@ -587,3 +587,16 @@ The full 615 host tests (two environment skips), formatting and configured
 strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-clear-64` passes both selected stack paths
 at 33,904/65,536 bytes. Linux timing remains required.
+
+Run `40412622069` advances phase-1 clearing from sequence 3 to sequence 1101,
+then one 64-byte turn consumes 9,061,316 ns against the unchanged 8 ms credit.
+The continuation currently executes `DSB ISH` after every 64-byte range, even
+though no consumer can use the private pages before the complete clear. The
+same completion barrier is now retained as its own final continuation turn:
+all zero stores finish first, then the barrier, then (on another paid turn)
+EL0 entry. This preserves ordering while removing 575 redundant barriers per
+nine-page clear and prevents store and barrier costs from sharing one envelope.
+The full 615 host tests (two environment skips), formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-clear-barrier-turn` passes both selected
+stack paths at 33,904/65,536 bytes. Linux timing remains required.

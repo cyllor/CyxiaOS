@@ -13,6 +13,7 @@ const WALL_NS: u64 = 50_000_000;
 const PROBE_WALL_NS: u64 = 1_000_000_000;
 const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
+const PRIVATE_CLEAR_BARRIER: u32 = PRIVATE_CLEAR_BYTES as u32 + 1;
 // A fixed byte boundary remains observable even when a translated block does
 // not refresh the guest CPU counter until after the loop. DC ZVA amplified TCG
 // helpers, while even a 512-byte memset could retire 64 stores in one chain.
@@ -368,6 +369,21 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         .native
         .phase(if worker.native.probing { 1 } else { 4 });
     let started = timer::cpu_ticks();
+    if next == PRIVATE_CLEAR_BARRIER {
+        unsafe {
+            core::arch::asm!("dsb ish", options(nostack));
+        }
+        if worker.native.in_job {
+            worker.native.cpu_ns = worker
+                .native
+                .cpu_ns
+                .saturating_add(timer::cpu_elapsed_ns(started));
+        }
+        worker.native.clear_next = 0;
+        // Keep the completion barrier separate from both the last stores and
+        // EL0 entry, so each operation receives its own paid envelope.
+        return false;
+    }
     let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
     let slice_end = offset
         .saturating_add(PRIVATE_CLEAR_SLICE_BYTES)
@@ -378,9 +394,6 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         clear_private_block(slot, offset, bytes);
         offset += bytes;
     }
-    unsafe {
-        core::arch::asm!("dsb ish", options(nostack));
-    }
     if worker.native.in_job {
         worker.native.cpu_ns = worker
             .native
@@ -388,7 +401,7 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
             .saturating_add(timer::cpu_elapsed_ns(started));
     }
     worker.native.clear_next = if offset == PRIVATE_CLEAR_BYTES {
-        0
+        PRIVATE_CLEAR_BARRIER
     } else {
         u32::try_from(offset + 1).unwrap_or(0)
     };
