@@ -1896,6 +1896,7 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
                     },
                     None,
                     true,
+                    true,
                 );
             }
             let actual = timer::cpu_elapsed_ns(entered);

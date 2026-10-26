@@ -1338,6 +1338,7 @@ pub fn dispatch(slot: usize) -> bool {
             task,
             None,
             true,
+            true,
         );
     }
     RETURN_PENDING[i].store(true, Ordering::Release);

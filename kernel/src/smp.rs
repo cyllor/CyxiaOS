@@ -419,6 +419,7 @@ fn execute(ctx: &mut user::Context, i: usize) {
                 affinity: 1 << cpu::slot(),
             },
             None,
+            true,
             false,
         );
         #[cfg(not(feature = "unified-runtime"))]
@@ -975,6 +976,7 @@ pub(crate) unsafe fn enter_service(
     deadline: u64,
     task: crate::a02_capture::Task,
     capture_index: Option<usize>,
+    capture_boundary: bool,
     record_slice_evidence: bool,
 ) {
     let saved_daif: u64;
@@ -1006,18 +1008,22 @@ pub(crate) unsafe fn enter_service(
             TASK_SLICE_EVIDENCE.words[row + 5].store(armed_at, Ordering::Relaxed);
             TASK_SLICE_EVIDENCE.words[row + 6].store(armed_at, Ordering::Relaxed);
         }
-        if let Some(index) = capture_index {
-            crate::a02_capture::enter_prepared(task, index);
-        } else {
-            crate::a02_capture::enter(task);
+        if capture_boundary {
+            if let Some(index) = capture_index {
+                crate::a02_capture::enter_prepared(task, index);
+            } else {
+                crate::a02_capture::enter(task);
+            }
         }
         RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence, Ordering::Release);
         user::enter(context, root);
         RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
-        if let Some(index) = capture_index {
-            crate::a02_capture::returned_prepared(index);
-        } else {
-            crate::a02_capture::returned();
+        if capture_boundary {
+            if let Some(index) = capture_index {
+                crate::a02_capture::returned_prepared(index);
+            } else {
+                crate::a02_capture::returned();
+            }
         }
         if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);

@@ -745,6 +745,7 @@ fn run_turn(
             capture_task(slot),
             worker.native.capture_index,
             !worker.native.probing,
+            !worker.native.probing,
         );
     }
     let actual = timer::cpu_elapsed_ns(entered);

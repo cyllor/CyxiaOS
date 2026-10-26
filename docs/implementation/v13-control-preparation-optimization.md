@@ -278,6 +278,20 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40422409708` still spends 9,681,928/8,000,000 ns in phase 2 at sequence
+588, so removing lookup work is insufficient: the dominant remaining cost is
+the A02 task boundary itself. Mapping probes are boot protection/operator
+self-tests, not dispatched business/control tasks and never learning samples.
+They now skip only A02 workload-boundary events. Their real paid CPU debit,
+four exact page-fault expectations, one-second wall escape and fail-closed
+quarantine remain unchanged. Normal model, builtin, learning, remote and
+unified EL0 entries continue to capture A02 boundaries; the native normal-job
+path can reuse the separately verified registration index. Formatting,
+configured strict AArch64 Clippy, all 615 host tests (two environment skips)
+and 141 v1.3 tests (one historical-evidence skip) pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-no-a02` is `BUILT_NOT_RUN`; both
+selected stack paths remain 33,920/65,536 bytes. Linux timing remains required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

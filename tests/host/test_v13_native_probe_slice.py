@@ -21,8 +21,11 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("!worker.native.probing", source)
 
         entry = (ROOT / "kernel/src/smp.rs").read_text()
+        self.assertIn("if capture_boundary", entry)
         self.assertIn("a02_capture::enter(task);", entry)
         self.assertIn("a02_capture::returned();", entry)
+        native = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
+        self.assertEqual(native.count("!worker.native.probing,"), 2)
         self.assertIn("if record_slice_evidence && slot < 4", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire)", entry)

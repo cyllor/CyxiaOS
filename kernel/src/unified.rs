@@ -688,6 +688,7 @@ pub fn run(info: &BootInfo) -> ! {
                     },
                     None,
                     true,
+                    true,
                 );
             }
             UNIFIED_EVIDENCE.words[2].fetch_add(1, Ordering::Relaxed);

@@ -165,6 +165,7 @@ pub fn step(slot: usize) -> bool {
             },
             None,
             true,
+            true,
         );
         let spent = timer::ticks() - begin;
         TICKS.fetch_add(spent, Ordering::Relaxed);
