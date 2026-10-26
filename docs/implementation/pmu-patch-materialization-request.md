@@ -1,5 +1,5 @@
 # PMU accounting patch materialization request
 
-This marker triggers the bounded workflow that converts the staged gzip payload into inspectable repository text before it is allowed to modify the native prototype source. It does not change runtime behaviour.
+This marker triggers the bounded workflow that reconstructs the checksum-pinned source repair, validates the full native and host test surface, and commits only non-workflow source changes. It does not change runtime behaviour by itself.
 
-Attempt: 5 — preserve decompressed output and diagnostics even when gzip reports a non-zero trailer/status condition.
+Attempt: 6 — preserve all repository workflows byte-for-byte so the GitHub Actions token can publish the already verified per-vCPU accounting repair.
