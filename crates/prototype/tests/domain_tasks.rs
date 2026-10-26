@@ -341,6 +341,9 @@ fn scheduler_sixteen_groups_sixty_four_threads_and_exit_never_refills_credit() {
     for i in 1..=16 {
         s.register_group(key(i)).unwrap();
     }
+    assert_eq!(s.group_at(0), Some(key(1)));
+    assert_eq!(s.group_at(15), Some(key(16)));
+    assert_eq!(s.group_at(16), None);
     assert_eq!(s.register_group(key(17)), Err(Error::Capacity));
     for i in 0..64 {
         s.admit(spec(100 + i, i / 4 + 1, 0, 0, 1_000_000), layout(1), 0)

@@ -1,4 +1,4 @@
-use super::{MAX_GROUPS, MAX_THREADS, UNSET, valid_key};
+use super::{EMPTY_KEY, MAX_GROUPS, MAX_THREADS, UNSET, valid_key};
 use crate::domains::{Action, Error, ObjectKey, PolicyStamp, WINDOW_NS};
 
 pub const CPU_BUDGET_NS: u64 = WINDOW_NS * 9 / 10;
@@ -96,7 +96,6 @@ pub struct ControlCredit {
 }
 #[derive(Clone, Copy)]
 struct Group {
-    key: ObjectKey,
     weight: u16,
     stamp: PolicyStamp,
     applied_version: u64,
@@ -156,6 +155,11 @@ pub struct SchedulerStats {
 }
 pub struct Scheduler {
     groups: [Option<Group>; MAX_GROUPS],
+    // Groups are append-only. Keep their identities contiguous so control
+    // projection does not stride through the much larger policy records for
+    // current and exact-lookahead target queries.
+    group_keys: [ObjectKey; MAX_GROUPS],
+    group_count: u8,
     threads: [Option<Thread>; MAX_THREADS],
     cpus: [Cpu; 64],
     sequence: u64,
@@ -171,6 +175,8 @@ impl Scheduler {
     pub const fn new() -> Self {
         Self {
             groups: [None; MAX_GROUPS],
+            group_keys: [EMPTY_KEY; MAX_GROUPS],
+            group_count: 0,
             threads: [None; MAX_THREADS],
             cpus: [Cpu::EMPTY; 64],
             sequence: 0,
@@ -194,9 +200,9 @@ impl Scheduler {
         Ok(())
     }
     fn group(&self, key: ObjectKey) -> Result<usize, Error> {
-        self.groups
+        self.group_keys[..usize::from(self.group_count)]
             .iter()
-            .position(|g| g.is_some_and(|g| g.key == key))
+            .position(|candidate| *candidate == key)
             .ok_or(Error::Stale)
     }
     fn thread(&self, key: ObjectKey) -> Result<usize, Error> {
@@ -358,20 +364,23 @@ impl Scheduler {
     }
     pub fn register_group(&mut self, key: ObjectKey) -> Result<(), Error> {
         valid_key(key)?;
-        if self.groups.iter().flatten().any(|g| g.key.id == key.id) {
+        let count = usize::from(self.group_count);
+        if self.group_keys[..count]
+            .iter()
+            .any(|candidate| candidate.id == key.id)
+        {
             return Err(Error::Exists);
         }
-        let slot = self
-            .groups
-            .iter_mut()
-            .find(|g| g.is_none())
-            .ok_or(Error::Capacity)?;
-        *slot = Some(Group {
-            key,
+        if count == MAX_GROUPS {
+            return Err(Error::Capacity);
+        }
+        self.groups[count] = Some(Group {
             weight: 1,
             stamp: UNSET,
             applied_version: 0,
         });
+        self.group_keys[count] = key;
+        self.group_count = self.group_count.checked_add(1).ok_or(Error::Capacity)?;
         Ok(())
     }
     pub fn install_weight(
@@ -1087,7 +1096,10 @@ impl Scheduler {
         s
     }
     pub fn group_at(&self, ordinal: usize) -> Option<ObjectKey> {
-        self.groups.iter().flatten().nth(ordinal).map(|g| g.key)
+        self.group_keys
+            .get(..usize::from(self.group_count))?
+            .get(ordinal)
+            .copied()
     }
     pub fn weight(&self, key: ObjectKey, now: u64) -> Result<u16, Error> {
         let g = self.groups[self.group(key)?].ok_or(Error::Stale)?;

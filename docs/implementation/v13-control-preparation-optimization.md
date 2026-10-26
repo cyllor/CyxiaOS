@@ -530,3 +530,19 @@ The full 615 host tests pass with two environment skips, including 141 v1.3
 tests with one historical-evidence skip; formatting, configured strict AArch64
 Clippy and exact build `/tmp/cyxia-prototype.lcqCJ7/build-lookup` pass. Both
 selected stack paths remain 33,888/65,536 bytes with the fixed reserve.
+
+Run `40407063795` attributes the same pre-target failure precisely: family 0,
+domain 1, kind 1, Tasks source, ordinal 0. Its before/after per-vCPU counters
+show 291,108 ticks (approximately 4.66 ms) inside target lookup alone, while the
+whole turn uses 6,117,578 ns. Tasks resolved current and exact lookahead with
+two separate iterator walks over the scheduler's sparse `Group` policy array.
+Groups are append-only, so Scheduler now retains a contiguous identity index
+and count at registration. Exact group lookup and ordinal projection touch only
+that compact index, preserving duplicate-ID rejection, capacity, generations,
+policy records and all scheduling/accounting state. The existing sixteen-group
+test now also pins first, last and out-of-range ordinal results. Native Linux
+timing remains required. The full non-kernel workspace, 615 host tests (two
+environment skips), 141 v1.3 host tests (one historical-evidence skip),
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-compact-groups` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,904/65,536 bytes with the fixed reserve.
