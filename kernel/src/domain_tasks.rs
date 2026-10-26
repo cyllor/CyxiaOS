@@ -962,10 +962,10 @@ pub fn begin_service(now: u64) -> Option<Credit> {
 /// body. MTTCG may deschedule this vCPU after selection; if that consumed the
 /// protected wall envelope, refund the untouched CPU and optional-budget
 /// reservations so the task can be selected in a fresh window.
-pub fn revalidate_builtin(slot: usize) -> bool {
+fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
     if slot >= 64
         || cpu::slot() != slot
-        || CREDIT_KIND[slot].load(Ordering::Acquire) != 1
+        || CREDIT_KIND[slot].load(Ordering::Acquire) != kind
         || COMPLETE_READY[slot].load(Ordering::Acquire)
     {
         return false;
@@ -999,6 +999,12 @@ pub fn revalidate_builtin(slot: usize) -> bool {
         Err(_) => true,
     }
 }
+pub fn revalidate_builtin(slot: usize) -> bool {
+    revalidate_unstarted(slot, 1)
+}
+pub fn revalidate_service_segment() -> bool {
+    revalidate_unstarted(0, 5)
+}
 /// A non-preemptible mechanism piece needs the whole bounded envelope. A
 /// short remainder is returned without running the body or blocking its thread.
 pub fn begin_service_segment() -> Option<Credit> {
@@ -1016,7 +1022,14 @@ pub fn begin_service_segment() -> Option<Credit> {
             }
             let now = now_ns();
             admit_service(s, now)?;
-            let Some(mut d) = s.scheduler.dispatch(0, s.layout, now, 2_500_000)? else {
+            let Some(mut d) = s.scheduler.dispatch_with_window_headroom(
+                0,
+                s.layout,
+                now,
+                2_500_000,
+                BUILTIN_WINDOW_HEADROOM_NS,
+            )?
+            else {
                 return Ok(None);
             };
             if d.thread == group(0x101) && d.reserved_ns < 2_500_000 {
@@ -1119,6 +1132,9 @@ pub fn pending_file_requests() -> Result<[Option<(ObjectKey, u64)>; TASKS], Erro
 /// Blocking I/O must split at its progress callback and use a retained request.
 pub fn service_segment<R>(body: impl FnOnce() -> R) -> Option<R> {
     begin_service_segment()?;
+    if !revalidate_service_segment() {
+        return None;
+    }
     let started = timer::cpu_ticks();
     let result = body();
     let (_, finished_ns, actual_ns) = finish_cpu_interval(started);

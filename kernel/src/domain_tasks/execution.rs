@@ -1363,6 +1363,9 @@ pub fn service_io_piece<R>(
     body: impl FnOnce(&mut dyn FnMut()) -> R,
 ) -> Option<R> {
     begin_service_segment()?;
+    if !revalidate_service_segment() {
+        return None;
+    }
     let mut cpu_started = timer::cpu_ticks();
     let mut capture = source.and_then(|key| {
         crate::learning_evidence::attempt(
@@ -1380,7 +1383,7 @@ pub fn service_io_piece<R>(
         let _ = complete_service(actual_ns, finished_ns);
         loop {
             progress();
-            if begin_service_segment().is_some() {
+            if begin_service_segment().is_some() && revalidate_service_segment() {
                 cpu_started = timer::cpu_ticks();
                 capture = source.and_then(|key| {
                     crate::learning_evidence::attempt(

@@ -278,7 +278,9 @@ fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinat
 
 fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) -> u64 {
     loop {
-        if crate::domain_tasks::begin_service_segment().is_some() {
+        if crate::domain_tasks::begin_service_segment().is_some()
+            && crate::domain_tasks::revalidate_service_segment()
+        {
             return timer::cpu_ticks();
         }
         mechanism_progress(coordinator);
@@ -297,6 +299,9 @@ fn network_turn(
     let Some(_) = crate::domain_tasks::begin_service_segment() else {
         return link.state();
     };
+    if !crate::domain_tasks::revalidate_service_segment() {
+        return link.state();
+    }
     let mut started = timer::cpu_ticks();
     UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
     let mut checkpoint = || {
@@ -363,7 +368,9 @@ fn service_start(
     epoch: u64,
 ) -> u64 {
     loop {
-        if crate::domain_tasks::begin_service_segment().is_some() {
+        if crate::domain_tasks::begin_service_segment().is_some()
+            && crate::domain_tasks::revalidate_service_segment()
+        {
             return timer::cpu_ticks();
         }
         progress(coordinator, tcp, epoch);
@@ -641,6 +648,10 @@ pub fn run(info: &BootInfo) -> ! {
                     p.domains.network_queue_depth = depth.unwrap_or(0) as u64;
                     p.domains.network_active = observation.active;
                     refresh_input = false;
+                }
+                if !crate::domain_tasks::revalidate_builtin(0) {
+                    refresh_input = true;
+                    continue;
                 }
                 let slice = crate::domain_tasks::active_slice_ticks(0).unwrap_or_else(|| fail(36));
                 let hard =
