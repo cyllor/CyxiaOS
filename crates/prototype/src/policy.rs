@@ -41,16 +41,32 @@ pub struct Candidate {
     pub action: Action,
     pub features: RawFeatures,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateEntry {
+    action: Action,
+    target: crate::features::TargetFeatures,
+    control_capacity: Option<u64>,
+}
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateSet {
     pub snapshot: Snapshot,
     pub target: ObjectKey,
     pub model: ModelBinding,
-    entries: [Option<Candidate>; MAX_CANDIDATES],
+    // Candidate construction requires common/domain features to be identical.
+    // Store those bytes once rather than copying them through all 32 bounded
+    // slots; get/iter reconstruct the unchanged public Candidate value.
+    common: [u64; 8],
+    domain: [u64; 4],
+    domain_present: u8,
+    entries: [Option<CandidateEntry>; MAX_CANDIDATES],
     count: usize,
     digest: [u8; 32],
     canary: Option<CanaryPermit>,
 }
+// This value crosses the protected kernel/EL0 boundary and is copied into a
+// retained job. Keeping the complete 32-candidate representation within one
+// page is both a bounded-memory contract and a native preparation-cost gate.
+const _: () = assert!(core::mem::size_of::<CandidateSet>() <= 4096);
 impl CandidateSet {
     pub fn new(
         snapshot: Snapshot,
@@ -76,6 +92,9 @@ impl CandidateSet {
             snapshot,
             target,
             model,
+            common: first.features.common,
+            domain: first.features.domain,
+            domain_present: first.features.domain_present,
             entries: [None; MAX_CANDIDATES],
             count: 0,
             digest: [0; 32],
@@ -105,7 +124,11 @@ impl CandidateSet {
                 out.entries[at] = out.entries[at - 1];
                 at -= 1;
             }
-            out.entries[at] = Some(*candidate);
+            out.entries[at] = Some(CandidateEntry {
+                action: candidate.action,
+                target: candidate.features.target,
+                control_capacity: candidate.features.control_capacity,
+            });
             out.count += 1;
         }
         if let Some(current) = current {
@@ -163,10 +186,27 @@ impl CandidateSet {
         self.recompute_hash_scoped(Some(permit))
     }
     pub fn get(&self, index: usize) -> Option<Candidate> {
-        self.entries.get(index).copied().flatten()
+        if index >= self.count {
+            return None;
+        }
+        self.entries[index].map(|entry| self.expand(entry))
     }
     pub fn iter(&self) -> impl Iterator<Item = Candidate> + '_ {
-        self.entries[..self.count].iter().filter_map(|c| *c)
+        self.entries[..self.count]
+            .iter()
+            .filter_map(|entry| entry.map(|entry| self.expand(entry)))
+    }
+    fn expand(&self, entry: CandidateEntry) -> Candidate {
+        Candidate {
+            action: entry.action,
+            features: RawFeatures {
+                common: self.common,
+                domain: self.domain,
+                domain_present: self.domain_present,
+                target: entry.target,
+                control_capacity: entry.control_capacity,
+            },
+        }
     }
     fn recompute_hash(&self) -> Result<[u8; 32], Error> {
         self.recompute_hash_scoped(self.canary)

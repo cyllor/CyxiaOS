@@ -99,3 +99,35 @@ Scheduler settlement now separates a real CPU overrun from a wall-late receipt. 
 This is deliberately conservative: host descheduling is not reported as guest CPU execution, while no completion-window capacity is released by the delay. Guest wall deadlines, the 50 ms proposal deadline, the 20 ms start/revalidation envelope, per-thread limits, 70/90 ms ceilings and actual-over-reservation quarantine remain independent and unchanged. Three regressions cover ordinary, control and delegated-service late receipts, including concurrent old-window work on the caller's source CPU; they prove the next window loses the exact carried amount and that true CPU overruns still quarantine. The task-domain suite now has 52 passing tests. The complete prototype suite, 608 host tests (two environment-specific skips), 67 evidence-tool tests, the full non-kernel Rust workspace, formatting and configured AArch64 kernel Clippy pass locally. The exact-source two-node build at `/tmp/cyxia-prototype.f27Xvm` has status `BUILT_NOT_RUN`; both selected preparation paths peak at 50,944 of 65,536 bytes with the fixed 4,096-byte exception reserve. Patched-QEMU replay remains required.
 
 Run `40356644036` confirms that change: no crossed-window quarantine occurred. It instead reached a real CPU overrun on CPU1 sequence 118, where one domain-1/kind-1 candidate preparation used 3.738 ms of translated execution against the unchanged 2.5 ms credit. Phases 3 and 4 were active, the protected EL0 evaluation itself used only 0.013 ms, and no runtime preemption was recorded. All substantive validation, exact-build and stack gates passed; both artifact uploads failed only on the existing quota. Because the detailed preparation timestamps were still wall-clock values, MTTCG pauses make their deltas unsuitable for CPU attribution. `DOMAIN_PREPARATION_DETAIL` now records absolute patched per-vCPU execution ticks while the coarse bank retains wall-clock timestamps. The next failure snapshot can therefore partition actual CPU across target/current/observation, legality/features, candidate construction, registration, input encoding, page hashing and evidence publication without changing a guest budget or acceptance rule.
+
+## CPU-attributed candidate preparation
+
+CI run `40359127789` on source `9db754bcb1eb9ae3e0db5db19eecd5b23540ac3d`
+reproduced a genuine single-candidate overrun on CPU1: sequence 149 used
+2,985,985 ns against the unchanged 2,500,000 ns reservation, with no
+preemption. The absolute per-vCPU detail ticks partition the pre-encoding path
+as follows: target/replay prefix 155,011 ns, current/observation 358,151 ns,
+stability/dependencies 37,858 ns, legal candidates 254,394 ns, queued WCET
+239,982 ns, candidate feature assembly 424,359 ns, CandidateSet construction
+and canonical hash 459,907 ns, and CoreReplay selection 41,004 ns. The remaining
+1,015,319 ns covers registration, input encoding/page hash, evidence/history
+publication and the final retained-job copy. Protected EL0 evaluation was only
+41,576 ns. This run passed every substantive validation, exact-build and stack
+gate; both artifact uploads failed independently on the existing repository
+quota.
+
+The measured correction does not increase any budget. Invocation scratch now
+uses `MaybeUninit<Candidate>` and exposes only the prefix written before its
+count is advanced, eliminating unconditional initialization of 32 complete
+feature records when the family emits one. `CandidateSet` now stores the
+common/domain feature fields once and retains only action-specific target and
+capacity fields per bounded entry; `get` and `iter` reconstruct the same public
+`Candidate` values, so ordering, duplicate/conflict checks and canonical hashes
+are unchanged. A compile-time bound requires the complete 32-entry set to fit
+within one 4 KiB page, reducing construction and each later retained copy. The
+full prototype test suite and strict AArch64 Clippy pass locally. Exact-source
+build `/tmp/cyxia-prototype.dUwVeu` is `BUILT_NOT_RUN`; both selected native
+stack paths pass at 37,968 of 65,536 bytes with the unchanged 4,096-byte
+exception reserve (down from 50,944 bytes on the diagnostic source).
+Patched-QEMU timing is still required on this source before the preparation
+budget can be accepted.

@@ -1291,10 +1291,10 @@ fn next_normal(
             Err(error) => return Err(error),
         };
         preparation_detail(7);
-        let mut choices = [Candidate {
-            action: current,
-            features: RawFeatures::default(),
-        }; 32];
+        // A family usually emits one candidate. Do not initialize 32 complete
+        // feature records merely to obtain bounded scratch; only the prefix
+        // written below is ever exposed to CandidateSet::new.
+        let mut choices = [const { core::mem::MaybeUninit::<Candidate>::uninit() }; 32];
         let mut count = 0;
         for action in legal[..legal_count].iter().flatten().copied() {
             if !replay::allows_action(action, target) {
@@ -1329,7 +1329,7 @@ fn next_normal(
             let mut common = s.owner.context.common;
             common[2] = queued_wcet_us / 2_500;
             common[6] = 0;
-            choices[count] = Candidate {
+            choices[count].write(Candidate {
                 action,
                 features: RawFeatures {
                     common,
@@ -1342,7 +1342,7 @@ fn next_normal(
                         None
                     },
                 },
-            };
+            });
             count += 1;
         }
         if count == 0 {
@@ -1360,12 +1360,17 @@ fn next_normal(
         {
             return Err(Error::Stale);
         }
+        // SAFETY: count is incremented only after writing the corresponding
+        // slot, never exceeds the 32 legal-action bound, and the slice cannot
+        // outlive this scratch array.
+        let initialized_choices =
+            unsafe { core::slice::from_raw_parts(choices.as_ptr().cast::<Candidate>(), count) };
         let prepared = s.registry.prepare_candidates(
             publisher(controller_epoch),
             snapshot,
             target,
             s.registry.model(),
-            &choices[..count],
+            initialized_choices,
             Some(current),
         )?;
         preparation_detail(9);
