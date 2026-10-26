@@ -343,13 +343,12 @@ fn release_model(worker: &mut Worker) -> bool {
         }
     }
 }
-fn clear_private_block(slot: usize, offset: usize, block_bytes: usize) {
+fn clear_private_block(slot: usize, offset: usize) {
     debug_assert!(offset < PRIVATE_CLEAR_BYTES);
-    debug_assert!(block_bytes != 0 && block_bytes <= 4096);
     let page = offset / 4096;
     let within = offset % 4096;
     debug_assert!(page < PRIVATE_CLEAR_PAGES);
-    debug_assert!(within + block_bytes <= 4096);
+    debug_assert!(within + PRIVATE_CLEAR_SLICE_BYTES <= 4096);
     unsafe {
         let page = if page == 0 {
             output_ptr(slot)
@@ -357,7 +356,17 @@ fn clear_private_block(slot: usize, offset: usize, block_bytes: usize) {
             stack_ptr(slot).cast::<Page>().add(page - 1)
         };
         let address = page.cast::<u8>().add(within);
-        core::ptr::write_bytes(address, 0, block_bytes);
+        // Keep the fixed slice out of the generic memset loop. These are
+        // ordinary stores (not translated DC ZVA helpers), and the completion
+        // barrier below remains the point at which the whole clear is visible.
+        core::arch::asm!(
+            "stp xzr, xzr, [{address}, #0]",
+            "stp xzr, xzr, [{address}, #16]",
+            "stp xzr, xzr, [{address}, #32]",
+            "stp xzr, xzr, [{address}, #48]",
+            address = in(reg) address,
+            options(nostack, preserves_flags),
+        );
     }
 }
 fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
@@ -389,10 +398,8 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         .saturating_add(PRIVATE_CLEAR_SLICE_BYTES)
         .min(PRIVATE_CLEAR_BYTES);
     while offset < slice_end {
-        let within = offset % 4096;
-        let bytes = (4096 - within).min(slice_end - offset);
-        clear_private_block(slot, offset, bytes);
-        offset += bytes;
+        clear_private_block(slot, offset);
+        offset += PRIVATE_CLEAR_SLICE_BYTES;
     }
     if worker.native.in_job {
         worker.native.cpu_ns = worker

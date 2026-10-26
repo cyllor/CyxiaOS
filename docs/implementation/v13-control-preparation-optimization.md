@@ -600,3 +600,15 @@ The full 615 host tests (two environment skips), formatting and configured
 strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-clear-barrier-turn` passes both selected
 stack paths at 33,904/65,536 bytes. Linux timing remains required.
+
+Run `40413776197` fails on CPU1 sequence 2 before the independent barrier: the
+first 64-byte phase-1 turn consumes 8,635,911 ns against 8 ms. Although the
+range is fixed, `write_bytes` receives its length at runtime and retains the
+generic memset call/loop path. The 64-byte operation now emits four ordinary
+AArch64 `STP` instructions directly (eight 64-bit zero stores), with no DC ZVA
+helper and no generic loop. The separate final `DSB ISH`, exact nine-page
+range, accounting and credits remain unchanged. The full 615 host tests (two
+environment skips), 141 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-clear-stp` passes both
+selected stack paths at 33,904/65,536 bytes. Linux timing remains required.
