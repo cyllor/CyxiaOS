@@ -194,6 +194,9 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
         self.last_ms = now_ms;
         self.device.port_mut().set_time(now_ms);
+        // Preflight state is complete and no device/socket borrow is live.
+        // Give the first cold NIC service operation its own native credit.
+        checkpoint();
         if self.device.service_with_checkpoint(checkpoint).is_err() {
             self.abort();
             return Err(Error::Device);

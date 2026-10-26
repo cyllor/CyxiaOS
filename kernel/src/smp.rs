@@ -418,7 +418,7 @@ fn execute(ctx: &mut user::Context, i: usize) {
                 role: if i % 2 == 1 { 2 } else { 1 },
                 affinity: 1 << cpu::slot(),
             },
-            true,
+            false,
         );
         #[cfg(not(feature = "unified-runtime"))]
         {

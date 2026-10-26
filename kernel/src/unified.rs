@@ -303,11 +303,14 @@ fn network_turn(
         return link.state();
     }
     let mut started = timer::cpu_ticks();
-    UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
+    let mut network_stage = 40u64;
+    UNIFIED_EVIDENCE.words[30].store(network_stage, Ordering::Release);
     let mut checkpoint = || {
         finish_service(started);
         mechanism_progress(coordinator);
         started = resume_network_service(coordinator);
+        network_stage = network_stage.saturating_add(1);
+        UNIFIED_EVIDENCE.words[30].store(network_stage, Ordering::Release);
     };
     let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
     if matches!(state, Ok(TcpState::Established)) && epoch != 0 {

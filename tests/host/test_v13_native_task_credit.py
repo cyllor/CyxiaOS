@@ -24,6 +24,8 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("cmp x2, #4", assembly)
         self.assertIn("b.eq smp_bounded", assembly)
         self.assertIn("ctx.regs[2] = 4;", runtime)
+        self.assertIn("enter_service(\n            ctx", runtime)
+        self.assertIn("            false,\n        );", runtime)
         self.assertIn("fn fixture_yielded", runtime)
         self.assertIn("ctx.kind == 9", runtime[runtime.index("fn fixture_yielded"):])
         self.assertIn(

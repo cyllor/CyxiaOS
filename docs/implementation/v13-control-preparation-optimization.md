@@ -278,6 +278,21 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40419400094` crosses registration and all C-worker gates, then the global
+task bank reports CPU0 service `257:1` at 4,806,874/2,500,000 ns in network
+stage 4 and CPU2 builtin `2:1` at 10,957,969/10,000,000 ns. Halving the builtin
+loop did not materially change its cold boundary; the auxiliary slice row is
+therefore disabled for this fixed fixture while A02 authoritative boundaries
+and task-credit receipts remain unconditional. TCP polling now checkpoints
+after preflight and before the first NIC service, where no device/socket borrow
+is live. Network segments publish substage 40 and increment after every safe
+checkpoint so any remaining overrun is attributable to one bounded piece.
+No credit changes. The full 615 host tests (two environment skips), 141 v1.3
+tests (one historical-evidence skip), all 14 cluster-transport network tests,
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-network-preflight` passes both selected
+stack paths at 33,904/65,536 bytes. Linux timing remains required.
+
 Run `40418568412` crosses the mapping-probe exception boundary; the next
 failure is phase 0 at sequence 601, where the separately paid task registration
 uses 9,784,972/8,000,000 ns. Registration constructs one capture event, but
