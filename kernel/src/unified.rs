@@ -279,7 +279,7 @@ fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinat
 fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) -> u64 {
     loop {
         if crate::domain_tasks::begin_service_segment().is_some() {
-            return Board.now_ns();
+            return timer::cpu_ticks();
         }
         mechanism_progress(coordinator);
     }
@@ -297,7 +297,7 @@ fn network_turn(
     let Some(_) = crate::domain_tasks::begin_service_segment() else {
         return link.state();
     };
-    let mut started = Board.now_ns();
+    let mut started = timer::cpu_ticks();
     UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
     let mut checkpoint = || {
         finish_service(started);
@@ -328,8 +328,9 @@ fn progress(
 }
 
 fn finish_service(started: u64) {
-    let finished = Board.now_ns();
-    match crate::domain_tasks::complete_service(finished.saturating_sub(started), finished) {
+    let actual_ns = timer::cpu_elapsed_ns(started);
+    let finished_ns = Board.now_ns();
+    match crate::domain_tasks::complete_service(actual_ns, finished_ns) {
         Ok(()) | Err(Error::Budget) => {}
         Err(_) => fail(30),
     }
@@ -363,7 +364,7 @@ fn service_start(
 ) -> u64 {
     loop {
         if crate::domain_tasks::begin_service_segment().is_some() {
-            return Board.now_ns();
+            return timer::cpu_ticks();
         }
         progress(coordinator, tcp, epoch);
     }
@@ -605,7 +606,7 @@ pub fn run(info: &BootInfo) -> ! {
                 core::hint::spin_loop();
                 continue;
             };
-            let entered = Board.now_ns();
+            let entered = timer::cpu_ticks();
             UNIFIED_EVIDENCE.words[30].store(6, Ordering::Release);
             unsafe {
                 if refresh_input {

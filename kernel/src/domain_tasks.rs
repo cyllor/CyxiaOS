@@ -480,6 +480,19 @@ pub fn now_ns() -> u64 {
     ((u128::from(timer::ticks()) * 1_000_000_000) / u128::from(timer::frequency()))
         .min(u128::from(u64::MAX)) as u64
 }
+
+/// Close an actual per-vCPU interval at the current shared-monotonic point.
+/// The projected start keeps evidence on the common time axis without charging
+/// time spent descheduled or running another vCPU.
+pub(crate) fn finish_cpu_interval(started: u64) -> (u64, u64, u64) {
+    let finished_ns = now_ns();
+    let actual_ns = timer::cpu_elapsed_ns(started);
+    (
+        finished_ns.saturating_sub(actual_ns),
+        finished_ns,
+        actual_ns,
+    )
+}
 fn group(id: u64) -> ObjectKey {
     ObjectKey { id, generation: 1 }
 }
@@ -1037,10 +1050,10 @@ pub fn pending_file_requests() -> Result<[Option<(ObjectKey, u64)>; TASKS], Erro
 /// Blocking I/O must split at its progress callback and use a retained request.
 pub fn service_segment<R>(body: impl FnOnce() -> R) -> Option<R> {
     begin_service_segment()?;
-    let started = now_ns();
+    let started = timer::cpu_ticks();
     let result = body();
-    let finished = now_ns();
-    let _ = complete_service(finished.saturating_sub(started), finished);
+    let (_, finished_ns, actual_ns) = finish_cpu_interval(started);
+    let _ = complete_service(actual_ns, finished_ns);
     Some(result)
 }
 fn begin_file_credit(owner: ObjectKey) -> Result<Option<Credit>, Error> {

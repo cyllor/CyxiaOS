@@ -286,10 +286,10 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
         if !due {
             return Ok(());
         }
+        let cpu_started = cyxia_arch_aarch64::timer::cpu_ticks();
         let Some(mut attempt) = crate::learning_prewarm::attempt_service() else {
             return Err(Error::Busy);
         };
-        let first = now();
         if q.warm_queued && q.warm.phase == Phase::Done {
             q.warm_queued = false;
             q.warm_at = now().saturating_add(60_000_000);
@@ -300,7 +300,8 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
             q.warm_queued = true;
             q.warm_release = now();
         }
-        crate::learning_prewarm::finish(&mut attempt, first, now())
+        let (first, last, _) = crate::domain_tasks::finish_cpu_interval(cpu_started);
+        crate::learning_prewarm::finish(&mut attempt, first, last)
     })
 }
 pub fn freeze(first_ns: u64) -> Result<(), Error> {
@@ -645,8 +646,8 @@ pub(crate) fn retired(id: WorkId) -> Result<(), Error> {
     })
 }
 pub(crate) struct Measurement {
-    first: u64,
-    last: Option<u64>,
+    cpu_started: u64,
+    interval: Option<(u64, u64)>,
     captured: Option<evidence::OwnerAttempt>,
     warm: Option<crate::learning_prewarm::Attempt>,
 }
@@ -655,6 +656,7 @@ impl Measurement {
         if usize::from(witness.core()) != cyxia_arch_aarch64::cpu::slot() {
             return Err(Error::Auth);
         }
+        let cpu_started = cyxia_arch_aarch64::timer::cpu_ticks();
         let warm_work = source.work.is_some_and(|w| w.warm);
         let warm = if warm_work {
             Some(crate::learning_prewarm::attempt_control(witness).ok_or(Error::Busy)?)
@@ -667,16 +669,19 @@ impl Measurement {
             evidence::attempt(source.owner, source.class).map_err(|_| Error::Busy)?
         };
         Ok(Self {
-            first: now(),
-            last: None,
+            cpu_started,
+            interval: None,
             captured,
             warm,
         })
     }
     pub(crate) fn finish(&mut self) -> Result<(), Error> {
-        let last = *self.last.get_or_insert_with(now);
+        let (first, last) = *self.interval.get_or_insert_with(|| {
+            let (first, last, _) = crate::domain_tasks::finish_cpu_interval(self.cpu_started);
+            (first, last)
+        });
         if let Some(capture) = self.captured.as_mut() {
-            if evidence::finish_attempt(capture, self.first, last) == Err(evidence::Error::Busy) {
+            if evidence::finish_attempt(capture, first, last) == Err(evidence::Error::Busy) {
                 return Err(Error::Busy);
             }
             // A terminal collector error already retains a missing interval;
@@ -684,7 +689,7 @@ impl Measurement {
             self.captured = None;
         }
         if let Some(warm) = self.warm.as_mut() {
-            let result = crate::learning_prewarm::finish(warm, self.first, last);
+            let result = crate::learning_prewarm::finish(warm, first, last);
             if result == Err(Error::Busy) {
                 return result;
             }
@@ -706,7 +711,8 @@ pub(super) fn next(
     s: &mut State,
     controller: u64,
     witness: &PaidWorkWitness,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<bool, Error> {
     let Some(id) = selected()? else {
@@ -731,7 +737,7 @@ pub(super) fn next(
             Some(pending) => pending.identity.sequence,
             None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
         },
-        taken_ns: started,
+        taken_ns: wall_started,
         ledger_generation: s.owner.context.ledger_generation,
         core_generation: s.owner.context.core_generation,
     };
@@ -753,7 +759,7 @@ pub(super) fn next(
         features: RawFeatures::default(),
     }; 32];
     let mut n = 0;
-    let queued = match queued_control_wcet_us(s, 1, started) {
+    let queued = match queued_control_wcet_us(s, 1, wall_started) {
         Ok(value) => value,
         Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
             if s.preparation.is_none() {
@@ -771,7 +777,7 @@ pub(super) fn next(
         Err(error) => return Err(error),
     };
     for action in options[..count].iter().flatten().copied() {
-        match (f.legal)(action, target, started) {
+        match (f.legal)(action, target, wall_started) {
             Ok(()) => {}
             Err(Error::Busy | Error::Again | Error::NotReady) => return Ok(false),
             Err(_) => continue,
@@ -807,7 +813,8 @@ pub(super) fn next(
     encode_job(
         s,
         controller,
-        started,
+        wall_started,
+        cpu_started,
         snapshot,
         &set,
         current,

@@ -115,6 +115,8 @@ mod unified_store;
 #[cfg(feature = "unified-runtime")]
 mod unified_task;
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "unified-runtime")]
+use cyxia_arch_aarch64::timer;
 use cyxia_contracts::*;
 #[cfg(not(feature = "selftest"))]
 mod ai;
@@ -394,6 +396,10 @@ extern "C" fn boot_entry() -> ! {
     assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);
     log(b"HIGH_VA_OK BOOTSTRAP\n");
     clock::init(&info);
+    #[cfg(feature = "unified-runtime")]
+    unsafe {
+        timer::init_cpu_accounting();
+    }
     #[cfg(feature = "smp-selftest")]
     smp::run(&info);
     #[cfg(not(feature = "smp-selftest"))]

@@ -25,10 +25,10 @@ index 31c01eddc8..1df61b8c04 100644
  #include "hw/irq.h"
  #include "cpu.h"
  #include "cpu-features.h"
-@@ -72,6 +73,25 @@ static uint64_t cycles_get_count(CPUARMState *env)
+@@ -72,8 +73,27 @@ static uint64_t cycles_get_count(CPUARMState *env)
  {
  #ifndef CONFIG_USER_ONLY
-+#ifdef __linux__
++#ifdef CLOCK_THREAD_CPUTIME_ID
 +    /*
 +     * Guest PMU reads execute in the owning vCPU thread. With MTTCG this
 +     * clock advances only while that vCPU thread consumes host CPU, unlike
@@ -50,5 +50,8 @@ index 31c01eddc8..1df61b8c04 100644
      return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                     ARM_CPU_FREQ, NANOSECONDS_PER_SECOND);
  #else
+     return cpu_get_host_ticks();
+ #endif
+ }
 -- 
 2.43.0

@@ -1812,7 +1812,7 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
             // its compact input, one result page and guarded stack; the other
             // private pages stay inaccessible and need no per-score clearing.
             for _ in 0..16 {
-                if native::ns(timer::ticks().saturating_sub(begin)).saturating_add(1_000_000)
+                if timer::cpu_ns(timer::cpu_ticks().saturating_sub(begin)).saturating_add(1_000_000)
                     > credit.reserved_ns
                 {
                     break;
@@ -1860,8 +1860,8 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
             if exit_context(worker)? {
                 return Ok(());
             }
-            let entered = timer::ticks();
-            if native::ns(entered.saturating_sub(begin)).saturating_add(1_000_000)
+            let entered = timer::cpu_ticks();
+            if timer::cpu_ns(entered.saturating_sub(begin)).saturating_add(1_000_000)
                 > credit.reserved_ns
             {
                 return Ok(());
@@ -1881,7 +1881,7 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
                     } else {
                         resources()?.root
                     },
-                    entered.saturating_add(slice.max(1)),
+                    timer::ticks().saturating_add(slice.max(1)),
                     crate::a02_capture::Task {
                         id: role.id,
                         generation: role.generation,
@@ -1890,8 +1890,8 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
                     },
                 );
             }
-            let end = timer::ticks();
-            worker.max_slice = worker.max_slice.max(native::ns(end - entered));
+            let actual = timer::cpu_elapsed_ns(entered);
+            worker.max_slice = worker.max_slice.max(actual);
             if context.kind == 9 {
                 worker.preemptions += 1;
             }
@@ -1935,7 +1935,7 @@ pub(super) fn step(worker: &mut Worker) {
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(RESERVE_NS, false) else {
         return;
     };
-    let begin = timer::ticks();
+    let begin = timer::cpu_ticks();
     let role = worker.request.map_or_else(
         || {
             requests(|s| {
@@ -1990,19 +1990,19 @@ pub(super) fn step(worker: &mut Worker) {
         }
     }
     EXTRA_ACTIVE.store(false, Ordering::Release);
-    let end = timer::ticks();
-    let actual = native::ns(end - begin);
+    let actual = timer::cpu_elapsed_ns(begin);
+    let finished = native::ns(timer::ticks());
     worker.total_ns = worker.total_ns.saturating_add(actual);
     if worker.request.is_some() {
         worker.job_ns = worker.job_ns.saturating_add(actual);
         worker.last_sequence = credit.sequence;
     }
-    CONTROL_TICKS.fetch_add(end - begin, Ordering::Relaxed);
+    CONTROL_TICKS.fetch_add(native::ticks(actual), Ordering::Relaxed);
     worker.bill = Some(Bill {
         physical: credit,
         extra,
         actual,
-        finished: native::ns(end),
+        finished,
         physical_done: false,
     });
     let _ = settle(worker);

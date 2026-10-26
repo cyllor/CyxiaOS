@@ -1260,13 +1260,14 @@ pub fn release_spectator_prepared(token: Token) -> Result<bool, Error> {
 /// Runs at the first real candidate-generation entry, before encoding. The
 /// pre-registered owner may activate only its already-frozen manifest here.
 pub struct Prefix {
-    start: u64,
+    cpu_started: u64,
     attempt: Option<crate::learning_evidence::OwnerAttempt>,
 }
 impl Drop for Prefix {
     fn drop(&mut self) {
         if let Some(mut attempt) = self.attempt.take() {
-            let _ = crate::learning_evidence::finish_attempt(&mut attempt, self.start, now());
+            let (first, last, _) = crate::domain_tasks::finish_cpu_interval(self.cpu_started);
+            let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, last);
         }
     }
 }
@@ -1281,12 +1282,8 @@ fn activate(token: Token, q: Request, snapshot: Snapshot) -> Result<Prefix, Erro
         ACTIVATION_ATTEMPTS.store(0, Ordering::Relaxed);
     }
     ACTIVATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    let cpu_started = cyxia_arch_aarch64::timer::cpu_ticks();
     let first = root().first;
-    let measured_from = if first.is_none() {
-        snapshot.taken_ns
-    } else {
-        now()
-    };
     let snapshot = first.unwrap_or(snapshot);
     if first.is_none() {
         let before = root()
@@ -1309,7 +1306,7 @@ fn activate(token: Token, q: Request, snapshot: Snapshot) -> Result<Prefix, Erro
         .ok()
         .flatten();
     let prefix = Prefix {
-        start: measured_from,
+        cpu_started,
         attempt,
     };
     if let Err(e) = result {

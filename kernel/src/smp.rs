@@ -454,6 +454,10 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     if cpu::affinity() != AFFINITIES[slot].load(Ordering::Acquire) {
         fatal(2);
     }
+    #[cfg(feature = "unified-runtime")]
+    unsafe {
+        timer::init_cpu_accounting();
+    }
     let resource = unsafe { (*core::ptr::addr_of!(RESOURCE)).unwrap() };
     let controller = unsafe { Gic::attach_cpu(resource) }.unwrap();
     controller
@@ -539,7 +543,7 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         }
         #[cfg(feature = "unified-runtime")]
         {
-            let runtime_start = timer::ticks();
+            let runtime_start = timer::cpu_ticks();
             if super::unified_task::step(slot) {
                 prototype_runtime::business_complete(slot, runtime_start);
                 drop(permit);
@@ -548,7 +552,9 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             }
         }
         let ctx = &mut contexts[role];
-        #[cfg(feature = "prototype-runtime")]
+        #[cfg(all(feature = "prototype-runtime", feature = "unified-runtime"))]
+        let runtime_start = timer::cpu_ticks();
+        #[cfg(all(feature = "prototype-runtime", not(feature = "unified-runtime")))]
         let runtime_start = timer::ticks();
         execute(ctx, i);
         if ctx.kind != 9

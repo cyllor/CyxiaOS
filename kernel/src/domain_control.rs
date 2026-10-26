@@ -1,6 +1,7 @@
 //! Control CPUs own proposal publication. Isolated EL0 scores immutable candidates; executors
 //! report real completion independently, with no inference in business paths.
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use cyxia_arch_aarch64::timer;
 use cyxia_prototype::{
     domains::stability::{Boundary, Guard as StabilityGuard, ServiceWindow, WindowOutcome},
     domains::{Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS},
@@ -861,21 +862,39 @@ fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> Result<u6
     })
 }
 pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
-    let started = now();
+    let wall_started = now();
+    let cpu_started = timer::cpu_ticks();
     let mut input = [0; 512];
-    let ready = with(|s| next_locked(s, controller_epoch, None, started, &mut input))?;
+    let ready = with(|s| {
+        next_locked(
+            s,
+            controller_epoch,
+            None,
+            wall_started,
+            cpu_started,
+            &mut input,
+        )
+    })?;
     Ok(ready.then_some(input))
 }
 pub(crate) fn next_paid(
     controller_epoch: u64,
     witness: &core_replay::PaidWorkWitness,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<Option<JobSource>, Error> {
-    // The sole native caller starts the debit before initializing this private
+    // The sole native caller starts both clocks before initializing this
     // invocation-owned buffer and consumes its bytes only after Some(source).
     with(|s| {
-        if !next_locked(s, controller_epoch, Some(witness), started, input)? {
+        if !next_locked(
+            s,
+            controller_epoch,
+            Some(witness),
+            wall_started,
+            cpu_started,
+            input,
+        )? {
             return Ok(None);
         }
         Ok(Some(job_source(s.job.as_ref().ok_or(Error::Stale)?)))
@@ -885,18 +904,23 @@ fn next_locked(
     s: &mut State,
     controller_epoch: u64,
     witness: Option<&core_replay::PaidWorkWitness>,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<bool, Error> {
-    let result = next_locked_inner(s, controller_epoch, witness, started, input);
+    let result = next_locked_inner(
+        s,
+        controller_epoch,
+        witness,
+        wall_started,
+        cpu_started,
+        input,
+    );
     if let Some(pending) = s.preparation.as_mut() {
         // Every failed retry retains its actual CPU span. Reward/physical CPU
         // accounting remains with the original paid Measurement, exactly once.
         let at = now();
-        let debit = at
-            .checked_sub(started)
-            .ok_or(Error::Range)
-            .and_then(|elapsed| pending.charge(elapsed));
+        let debit = pending.charge(timer::cpu_elapsed_ns(cpu_started));
         let terminal = debit.err().or_else(|| match &result {
             Err(error) if !matches!(error, Error::Busy | Error::Again | Error::NotReady) => {
                 Some(*error)
@@ -1004,7 +1028,8 @@ fn next_locked_inner(
     s: &mut State,
     controller_epoch: u64,
     witness: Option<&core_replay::PaidWorkWitness>,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<bool, Error> {
     preparation_phase(0);
@@ -1031,16 +1056,31 @@ fn next_locked_inner(
             s,
             controller_epoch,
             witness.ok_or(Error::Auth)?,
-            started,
+            wall_started,
+            cpu_started,
             input,
         );
     }
-    match next_normal(s, controller_epoch, witness, started, input) {
+    match next_normal(
+        s,
+        controller_epoch,
+        witness,
+        wall_started,
+        cpu_started,
+        input,
+    ) {
         Ok(false) => (),
         result => return result,
     }
     if let Some(witness) = witness {
-        return core_replay::next(s, controller_epoch, witness, started, input);
+        return core_replay::next(
+            s,
+            controller_epoch,
+            witness,
+            wall_started,
+            cpu_started,
+            input,
+        );
     }
     Ok(false)
 }
@@ -1052,20 +1092,21 @@ fn next_normal(
     s: &mut State,
     controller_epoch: u64,
     witness: Option<&core_replay::PaidWorkWitness>,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<bool, Error> {
     let start_cursor = s.family_cursor;
     let turns = if s.preparation.is_some() { 1 } else { 18 };
     'families: for turn in 0..turns {
         let index = (start_cursor + turn) % 18;
-        if started < s.due[index] {
+        if wall_started < s.due[index] {
             continue;
         }
         let Some(f) = s.owner.families[index] else {
             continue;
         };
-        s.due[index] = started.saturating_add(if index == 1 || index == 16 {
+        s.due[index] = wall_started.saturating_add(if index == 1 || index == 16 {
             1_000_000_000
         } else {
             WINDOW_NS
@@ -1112,7 +1153,7 @@ fn next_normal(
                 Some(pending) => pending.identity.sequence,
                 None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
             },
-            taken_ns: started,
+            taken_ns: wall_started,
             ledger_generation: s.owner.context.ledger_generation,
             core_generation: s.owner.context.core_generation,
         };
@@ -1132,7 +1173,7 @@ fn next_normal(
                 Err(Error::Again | Error::Busy | Error::NotReady) => {
                     // Retry the same queued first generation within its real
                     // original deadline; no additional successful AI slot.
-                    s.due[index] = started;
+                    s.due[index] = wall_started;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1180,11 +1221,11 @@ fn next_normal(
         if old.is_some_and(execution_blocks_replacement) {
             continue;
         }
-        let stability_slot = ensure_stability(&mut s.owner, current, target, started)?;
+        let stability_slot = ensure_stability(&mut s.owner, current, target, wall_started)?;
         let stability = s.owner.stability[stability_slot]
             .as_ref()
             .ok_or(Error::Stale)?;
-        let dependencies = match bind_dependencies(&s.owner, current, target, started) {
+        let dependencies = match bind_dependencies(&s.owner, current, target, wall_started) {
             Ok(v) => v,
             Err(Error::Busy | Error::Again | Error::NotReady | Error::Conflict | Error::Stale) => {
                 continue;
@@ -1196,7 +1237,7 @@ fn next_normal(
         let mut legal = [None; 32];
         let mut legal_count = 0;
         for option in options[..n].iter().flatten() {
-            match (f.legal)(*option, target, started) {
+            match (f.legal)(*option, target, wall_started) {
                 Ok(()) => {
                     legal[legal_count] = Some(*option);
                     legal_count += 1;
@@ -1219,13 +1260,13 @@ fn next_normal(
         } else {
             WINDOW_NS
         };
-        let held = started.saturating_sub(stability.last_change_ns()) >= hold;
-        let queued_wcet_us = match queued_control_wcet_us(s, index, started) {
+        let held = wall_started.saturating_sub(stability.last_change_ns()) >= hold;
+        let queued_wcet_us = match queued_control_wcet_us(s, index, wall_started) {
             Ok(value) => value,
             Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
                 // Retry this same evaluation. replay::first retains its exact
                 // snapshot/deadline; the paid measurement still owns this span.
-                s.due[index] = started;
+                s.due[index] = wall_started;
                 s.cursor[index] = ordinal;
                 s.family_cursor = index;
                 if s.preparation.is_none() {
@@ -1326,7 +1367,8 @@ fn next_normal(
         return encode_prepared_job(
             s,
             controller_epoch,
-            started,
+            wall_started,
+            cpu_started,
             snapshot,
             prepared,
             current,
@@ -1357,7 +1399,8 @@ impl JobCandidates<'_> {
 fn encode_prepared_job(
     s: &mut State,
     controller_epoch: u64,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     snapshot: Snapshot,
     prepared: PreparedCandidateSet,
     current: Action,
@@ -1368,7 +1411,8 @@ fn encode_prepared_job(
     encode_job_inner(
         s,
         controller_epoch,
-        started,
+        wall_started,
+        cpu_started,
         snapshot,
         JobCandidates::Prepared(prepared),
         current,
@@ -1382,7 +1426,8 @@ fn encode_prepared_job(
 fn encode_job(
     s: &mut State,
     controller_epoch: u64,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     snapshot: Snapshot,
     set: &CandidateSet,
     current: Action,
@@ -1394,7 +1439,8 @@ fn encode_job(
     encode_job_inner(
         s,
         controller_epoch,
-        started,
+        wall_started,
+        cpu_started,
         snapshot,
         JobCandidates::CandidateSet(set),
         current,
@@ -1408,7 +1454,8 @@ fn encode_job(
 fn encode_job_inner(
     s: &mut State,
     controller_epoch: u64,
-    started: u64,
+    _wall_started: u64,
+    cpu_started: u64,
     snapshot: Snapshot,
     candidates: JobCandidates<'_>,
     current: Action,
@@ -1434,7 +1481,7 @@ fn encode_job_inner(
         pending.total(
             preparation_identity,
             now(),
-            now().checked_sub(started).ok_or(Error::Range)?,
+            timer::cpu_elapsed_ns(cpu_started),
         )?;
     }
     let evidence = if read_only {
@@ -1547,7 +1594,7 @@ fn encode_job_inner(
         pending.total(
             preparation_identity,
             now(),
-            now().checked_sub(started).ok_or(Error::Range)?,
+            timer::cpu_elapsed_ns(cpu_started),
         )?;
     }
     if let Some(work) = work {
@@ -1559,7 +1606,7 @@ fn encode_job_inner(
         let _ = crate::learning_history::record_proposal(sequence, &set, input_bytes, input_hash);
     }
     preparation_phase(6);
-    let elapsed = now().checked_sub(started).ok_or(Error::Range)?;
+    let elapsed = timer::cpu_elapsed_ns(cpu_started);
     let encode_ns = if let Some(pending) = s.preparation {
         // The admission check above precedes WorkId binding. Any final owner
         // bookkeeping is still included in the eventual accept-time bound.
@@ -1930,16 +1977,18 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         }
         require_control(&s.owner)?;
         let mut job = s.job.take().ok_or(Error::Stale)?;
-        let begin = now();
+        let wall_begin = now();
+        let decode_cpu_started = timer::cpu_ticks();
         const _: () = assert!(cfg!(target_endian = "little"));
         let bytes = unsafe { &*((output as *const [u64; 512]).cast::<[u8; 4096]>()) };
         let output_hash = cyxia_arch_aarch64::sha256::digest_page(bytes)
             .unwrap_or_else(|| Sha256::digest(bytes).into());
         let mut selected = u64::MAX;
         let mut decoded_ns = None;
+        let mut publication_cpu_started = None;
         let result = (|| {
-            if begin < job.started
-                || begin - job.started > 50_000_000
+            if wall_begin < job.started
+                || wall_begin - job.started > 50_000_000
                 || cpu_ns.checked_add(job.encode_ns).ok_or(Error::Overflow)? > 2_000_000
             {
                 return Err(Error::Expired);
@@ -1962,7 +2011,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 output,
             )?;
             selected = reply.selected as u64;
-            let decoding = now().checked_sub(begin).ok_or(Error::Range)?;
+            let decoding = timer::cpu_elapsed_ns(decode_cpu_started);
             decoded_ns = Some(decoding);
             if cpu_ns
                 .checked_add(job.encode_ns)
@@ -1972,6 +2021,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             {
                 return Err(Error::Budget);
             }
+            publication_cpu_started = Some(timer::cpu_ticks());
             if job.read_only {
                 // A read-only work ticket is root-owned. Even a byte-perfect
                 // Plan is only checked here; it never reaches publication.
@@ -1995,7 +2045,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 evidence: job.evidence,
                 job: job.sequence,
                 boot: s.boot,
-                publication_started: begin,
+                publication_started: wall_begin,
                 wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 dependencies: job.dependencies,
                 scores: reply.scores,
@@ -2004,7 +2054,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             let receipt = s.registry.submit_job(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],
-                begin,
+                wall_begin,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut NativeClock,
                 &mut executor,
@@ -2017,15 +2067,18 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             }
             Ok(receipt.version)
         })();
-        let elapsed = now().saturating_sub(begin);
-        if !job.read_only && elapsed > policy::PUBLICATION_BUDGET_NS {
+        let publication_ns = publication_cpu_started
+            .map(timer::cpu_elapsed_ns)
+            .unwrap_or(0);
+        if !job.read_only && publication_ns > policy::PUBLICATION_BUDGET_NS {
             s.registry.stop_optimization();
         }
+        let decoding = decoded_ns.unwrap_or_else(|| timer::cpu_elapsed_ns(decode_cpu_started));
         job.completion = Some(JobCompletion {
             result,
             selected,
-            decoded_ns: decoded_ns.unwrap_or(elapsed),
-            elapsed_ns: elapsed,
+            decoded_ns: decoding,
+            elapsed_ns: publication_ns,
             cpu_ns,
             output_hash,
             aborted: false,
@@ -2153,6 +2206,7 @@ pub fn poll(_at: u64) -> Result<(), Error> {
             let result = if let Err(error) = dependency_status {
                 Err(error)
             } else {
+                let cpu_started = timer::cpu_ticks();
                 let mut cost = crate::learning_evidence::attempt(
                     d.apply.target,
                     learning::reward::CpuClass::ExecutorAction,
@@ -2168,9 +2222,9 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.started = true;
                     (f.apply)(d.action, d.apply, d.stamp, entered)
                 };
-                let finished = now();
                 if let Some(cost) = cost.as_mut() {
-                    let _ = crate::learning_evidence::finish_attempt(cost, entered, finished);
+                    let (first, last, _) = crate::domain_tasks::finish_cpu_interval(cpu_started);
+                    let _ = crate::learning_evidence::finish_attempt(cost, first, last);
                 }
                 result
             };

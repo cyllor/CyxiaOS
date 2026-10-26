@@ -885,7 +885,7 @@ fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
     } else {
         None
     };
-    let first = now_ns();
+    let cpu_started = timer::cpu_ticks();
     let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
@@ -898,7 +898,8 @@ fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
         recipe_turn_inner(s, i)
     };
     if let Some(mut warm) = warm {
-        let _ = crate::learning_prewarm::finish(&mut warm, first, now_ns());
+        let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
+        let _ = crate::learning_prewarm::finish(&mut warm, first_ns, last_ns);
     }
     result
 }
@@ -1011,12 +1012,12 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
         if external == Ok(5) {
             // This owner call only evicts clean, unpinned pages. Dirty writeback
             // is progressed by the storage service with its own I/O callbacks.
-            let begin = now_ns();
+            let cpu_started = timer::cpu_ticks();
             let _ = crate::domain_storage::cache_reclaim_turn();
-            let elapsed = now_ns().saturating_sub(begin);
+            let (_, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
             let _ = locked(|s| {
-                s.facts.reclaim_ns.add(now_ns(), elapsed);
-                record_cache_receipt(s, now_ns());
+                s.facts.reclaim_ns.add(finished_ns, actual_ns);
+                record_cache_receipt(s, finished_ns);
                 Ok(())
             });
         }
@@ -1151,7 +1152,7 @@ fn ipc_piece(s: &mut State) {
     });
 }
 fn memory_piece(s: &mut State) {
-    let begin = now_ns();
+    let cpu_started = timer::cpu_ticks();
     memory::synchronize_cache(s);
     let _ = s.memory.reclaim_step(
         0,
@@ -1162,9 +1163,8 @@ fn memory_piece(s: &mut State) {
             load: None,
         },
     );
-    s.facts
-        .reclaim_ns
-        .add(now_ns(), now_ns().saturating_sub(begin));
+    let (_, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
+    s.facts.reclaim_ns.add(finished_ns, actual_ns);
     let faults = s.memory.stats().faults;
     s.facts
         .faults
@@ -1205,7 +1205,7 @@ fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
     } else {
         None
     };
-    let first = now_ns();
+    let cpu_started = timer::cpu_ticks();
     if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
@@ -1218,7 +1218,8 @@ fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
         process_return_inner(s, i, c);
     }
     if let Some(mut warm) = warm {
-        let _ = crate::learning_prewarm::finish(&mut warm, first, now_ns());
+        let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
+        let _ = crate::learning_prewarm::finish(&mut warm, first_ns, last_ns);
     }
 }
 fn process_return_inner(s: &mut State, i: usize, c: &mut user::Context) {
@@ -1362,7 +1363,7 @@ pub fn service_io_piece<R>(
     body: impl FnOnce(&mut dyn FnMut()) -> R,
 ) -> Option<R> {
     begin_service_segment()?;
-    let mut first = now_ns();
+    let mut cpu_started = timer::cpu_ticks();
     let mut capture = source.and_then(|key| {
         crate::learning_evidence::attempt(
             key,
@@ -1372,15 +1373,15 @@ pub fn service_io_piece<R>(
         .flatten()
     });
     let mut resume = || {
-        let end = now_ns();
+        let (first_ns, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
         if let Some(mut attempt) = capture.take() {
-            let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, end);
+            let _ = crate::learning_evidence::finish_attempt(&mut attempt, first_ns, finished_ns);
         }
-        let _ = complete_service(end.saturating_sub(first), end);
+        let _ = complete_service(actual_ns, finished_ns);
         loop {
             progress();
             if begin_service_segment().is_some() {
-                first = now_ns();
+                cpu_started = timer::cpu_ticks();
                 capture = source.and_then(|key| {
                     crate::learning_evidence::attempt(
                         key,
@@ -1395,11 +1396,11 @@ pub fn service_io_piece<R>(
         }
     };
     let result = body(&mut resume);
-    let end = now_ns();
+    let (first_ns, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
     if let Some(mut attempt) = capture {
-        let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, end);
+        let _ = crate::learning_evidence::finish_attempt(&mut attempt, first_ns, finished_ns);
     }
-    let _ = complete_service(end.saturating_sub(first), end);
+    let _ = complete_service(actual_ns, finished_ns);
     Some(result)
 }
 
@@ -1453,20 +1454,17 @@ fn service_file(progress: &mut dyn FnMut()) {
         FILE_BUSY[i].store(false, Ordering::Release);
         return;
     }
-    let mut segment_started = timer::ticks();
+    let mut segment_started = timer::cpu_ticks();
     let mut file_progress = || {
-        let finished = timer::ticks();
-        let actual = ((u128::from(finished.saturating_sub(segment_started)) * 1_000_000_000)
-            / u128::from(timer::frequency())) as u64;
-        let at = ((u128::from(finished) * 1_000_000_000) / u128::from(timer::frequency())) as u64;
-        let _ = complete_builtin(0, actual, at);
+        let (_, finished_ns, actual_ns) = finish_cpu_interval(segment_started);
+        let _ = complete_builtin(0, actual_ns, finished_ns);
         // The operation remains in custody across budget windows. Completion,
         // network and policy progress run outside both its credit and Task gate;
         // the same suspended operation resumes only after another real grant.
         loop {
             progress();
             if matches!(begin_file_credit(key), Ok(Some(_))) {
-                segment_started = timer::ticks();
+                segment_started = timer::cpu_ticks();
                 break;
             }
             core::hint::spin_loop();
@@ -1483,11 +1481,8 @@ fn service_file(progress: &mut dyn FnMut()) {
             FILE_PENDING[i].store(true, Ordering::Release);
         }
     }
-    let finished = timer::ticks();
-    let actual = ((u128::from(finished.saturating_sub(segment_started)) * 1_000_000_000)
-        / u128::from(timer::frequency())) as u64;
-    let at = ((u128::from(finished) * 1_000_000_000) / u128::from(timer::frequency())) as u64;
-    let _ = complete_builtin(0, actual, at);
+    let (_, finished_ns, actual_ns) = finish_cpu_interval(segment_started);
+    let _ = complete_builtin(0, actual_ns, finished_ns);
     FILE_DONE[i].store(true, Ordering::Release);
 }
 

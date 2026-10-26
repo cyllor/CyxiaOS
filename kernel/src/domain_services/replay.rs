@@ -122,10 +122,10 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
     if !due {
         return Ok(());
     }
+    let cpu_started = cyxia_arch_aarch64::timer::cpu_ticks();
     let Some(mut cpu) = crate::learning_prewarm::attempt_service() else {
         return Err(Error::Busy);
     };
-    let first = crate::domain_platform::now_ns();
     let result = with(|s| {
         let w = work();
         if w.run.is_some() || !crate::learning_prewarm::active() {
@@ -177,8 +177,8 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
             Ok(())
         }
     });
-    let measured =
-        crate::learning_prewarm::finish(&mut cpu, first, crate::domain_platform::now_ns());
+    let (first, last, _) = crate::domain_tasks::finish_cpu_interval(cpu_started);
+    let measured = crate::learning_prewarm::finish(&mut cpu, first, last);
     result.and(measured)
 }
 pub fn freeze_warm(first_ns: u64) -> Result<(), Error> {
@@ -346,12 +346,12 @@ pub fn abort_prepared() -> Result<bool, Error> {
         return Err(Error::Auth);
     }
     ABORTING.store(true, Ordering::Release);
+    let cpu_started = cyxia_arch_aarch64::timer::cpu_ticks();
     let mut measured = if crate::learning_prewarm::active() {
         Some(crate::learning_prewarm::attempt_service().ok_or(Error::Busy)?)
     } else {
         None
     };
-    let first = crate::domain_platform::now_ns();
     let result = with(|s| {
         let w = work();
         if w.run.is_some() {
@@ -407,7 +407,8 @@ pub fn abort_prepared() -> Result<bool, Error> {
         crate::domain_tasks::replay::echo_idle(service.key)
     });
     if let Some(cpu) = measured.as_mut() {
-        crate::learning_prewarm::finish(cpu, first, crate::domain_platform::now_ns())?;
+        let (first, last, _) = crate::domain_tasks::finish_cpu_interval(cpu_started);
+        crate::learning_prewarm::finish(cpu, first, last)?;
     }
     result
 }

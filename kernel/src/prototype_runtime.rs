@@ -546,26 +546,34 @@ pub(super) fn business_enter(slot: usize) -> bool {
     true
 }
 pub(super) fn business_complete(slot: usize, start: u64) {
-    let end = timer::ticks();
-    let elapsed = end - start;
     #[cfg(feature = "unified-runtime")]
     {
-        MAX_SLICE[slot].fetch_max(elapsed, Ordering::Relaxed);
-        TOTAL_TICKS[slot].fetch_add(elapsed, Ordering::Relaxed);
+        let actual_ns = timer::cpu_elapsed_ns(start);
+        let finished_ticks = timer::ticks();
+        let evidence_ticks = ((u128::from(actual_ns) * u128::from(timer::frequency()))
+            / 1_000_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        MAX_SLICE[slot].fetch_max(evidence_ticks, Ordering::Relaxed);
+        TOTAL_TICKS[slot].fetch_add(evidence_ticks, Ordering::Relaxed);
         // The selected credit belongs to exactly one dynamic, remote, or
         // builtin thread. Its deferred completion cannot grant a second slice.
-        let _ = crate::domain_tasks::complete_builtin(slot, native::ns(elapsed), native::ns(end));
+        let _ = crate::domain_tasks::complete_builtin(slot, actual_ns, native::ns(finished_ticks));
         return;
     }
-    ELAPSED[slot].store(elapsed, Ordering::Relaxed);
-    MAX_SLICE[slot].fetch_max(elapsed, Ordering::Relaxed);
-    TOTAL_TICKS[slot].fetch_add(elapsed, Ordering::Relaxed);
-    if elapsed > timer::frequency() / 100 || end > EXPIRES[slot].load(Ordering::Relaxed) {
-        OVERRUNS.fetch_add(1, Ordering::Release);
-        // Returning a permit is not enough to authorize another slice. CPU0
-        // observes this terminal fault and stops granting further execution.
+    #[cfg(not(feature = "unified-runtime"))]
+    {
+        let end = timer::ticks();
+        let elapsed = end - start;
+        ELAPSED[slot].store(elapsed, Ordering::Relaxed);
+        MAX_SLICE[slot].fetch_max(elapsed, Ordering::Relaxed);
+        TOTAL_TICKS[slot].fetch_add(elapsed, Ordering::Relaxed);
+        if elapsed > timer::frequency() / 100 || end > EXPIRES[slot].load(Ordering::Relaxed) {
+            OVERRUNS.fetch_add(1, Ordering::Release);
+            // Returning a permit is not enough to authorize another slice. CPU0
+            // observes this terminal fault and stops granting further execution.
+        }
+        DISPATCH[slot].store(3, Ordering::Release);
     }
-    DISPATCH[slot].store(3, Ordering::Release);
 }
 fn progress() -> [u64; 2] {
     [

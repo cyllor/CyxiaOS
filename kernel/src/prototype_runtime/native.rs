@@ -63,9 +63,32 @@ pub(super) fn ns(ticks: u64) -> u64 {
     ((u128::from(ticks) * 1_000_000_000) / u128::from(timer::frequency())).min(u128::from(u64::MAX))
         as u64
 }
-fn ticks(ns: u64) -> u64 {
+pub(super) fn ticks(ns: u64) -> u64 {
     ((u128::from(ns) * u128::from(timer::frequency())) / 1_000_000_000).min(u128::from(u64::MAX))
         as u64
+}
+fn cpu_ticks_for_ns(ns: u64) -> u64 {
+    ((u128::from(ns) * u128::from(timer::cpu_frequency())) / 1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64
+}
+#[derive(Clone, Copy)]
+struct ChargeStart {
+    cpu_ticks: u64,
+    wall_started_ns: u64,
+}
+impl ChargeStart {
+    fn begin() -> Self {
+        let wall_started_ns = ns(timer::ticks());
+        let cpu_ticks = timer::cpu_ticks();
+        Self {
+            cpu_ticks,
+            wall_started_ns,
+        }
+    }
+
+    fn actual_ns(self) -> u64 {
+        timer::cpu_elapsed_ns(self.cpu_ticks)
+    }
 }
 #[derive(Clone, Copy)]
 struct Bill {
@@ -357,8 +380,8 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
     worker
         .native
         .phase(if worker.native.probing { 1 } else { 4 });
-    let started = timer::ticks();
-    let slice_ticks = ticks(PRIVATE_CLEAR_SLICE_NS).max(1);
+    let started = timer::cpu_ticks();
+    let slice_ticks = cpu_ticks_for_ns(PRIVATE_CLEAR_SLICE_NS).max(1);
     let zero_block_bytes = private_zero_block_bytes();
     let block_bytes = zero_block_bytes.unwrap_or(FALLBACK_ZERO_BLOCK_BYTES);
     let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
@@ -369,7 +392,7 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
             .min(PRIVATE_CLEAR_BYTES - offset);
         clear_private_block(slot, offset, bytes, zero_block_bytes == Some(bytes));
         offset += bytes;
-        if timer::ticks().saturating_sub(started) >= slice_ticks {
+        if timer::cpu_ticks().saturating_sub(started) >= slice_ticks {
             break;
         }
     }
@@ -380,7 +403,7 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
-            .saturating_add(ns(timer::ticks() - started));
+            .saturating_add(timer::cpu_elapsed_ns(started));
     }
     worker.native.clear_next = if offset == PRIVATE_CLEAR_BYTES {
         0
@@ -468,16 +491,17 @@ fn root_return(
 fn next_input(
     controller: u64,
     witness: &crate::domain_control::core_replay::PaidWorkWitness,
-    started: u64,
+    wall_started: u64,
+    cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<Option<crate::domain_control::JobSource>, DomainError> {
-    crate::domain_control::next_paid(controller, witness, started, input)
+    crate::domain_control::next_paid(controller, witness, wall_started, cpu_started, input)
 }
 #[inline(never)]
 fn run_turn(
     worker: &mut Worker,
     credit: cyxia_prototype::domains::tasks::ControlCredit,
-    begin: u64,
+    begin: ChargeStart,
     witness: &crate::domain_control::core_replay::PaidWorkWitness,
 ) {
     let slot = cpu::slot();
@@ -587,11 +611,13 @@ fn run_turn(
         // Charge initialization too; no large value-return scratch is retained
         // while either preparation sibling constructs its candidate set.
         let preparation_started = ns(timer::ticks());
+        let preparation_cpu_started = timer::cpu_ticks();
         let mut input = [0; 512];
         let source = match next_input(
             CONTROLLER_EPOCH.load(Ordering::Acquire),
             witness,
             preparation_started,
+            preparation_cpu_started,
             &mut input,
         ) {
             Ok(Some(source)) => source,
@@ -614,7 +640,7 @@ fn run_turn(
             return;
         }
         worker.native.phase(4);
-        let copy_start = timer::ticks();
+        let copy_start = timer::cpu_ticks();
         unsafe {
             let page = if slot == 1 {
                 input_ptr(1)
@@ -628,7 +654,7 @@ fn run_turn(
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
-            .saturating_add(ns(timer::ticks() - copy_start));
+            .saturating_add(timer::cpu_elapsed_ns(copy_start));
         return;
     }
     if !continue_private_clear(worker, slot) {
@@ -638,7 +664,7 @@ fn run_turn(
         worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
     }
     if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
-        let preparation = timer::ticks();
+        let preparation = timer::cpu_ticks();
         let input = unsafe { &(*input_ptr(slot)).0 };
         if worker.native.model.is_none() {
             let result = crate::domain_control::pin_job_model(input[2], input[3]);
@@ -649,7 +675,7 @@ fn run_turn(
                 worker.native.cpu_ns = worker
                     .native
                     .cpu_ns
-                    .saturating_add(ns(timer::ticks() - preparation));
+                    .saturating_add(timer::cpu_elapsed_ns(preparation));
             }
             match result {
                 Ok(pin) => worker.native.model = Some(pin),
@@ -671,12 +697,14 @@ fn run_turn(
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
-            .saturating_add(ns(timer::ticks() - preparation));
+            .saturating_add(timer::cpu_elapsed_ns(preparation));
     }
     // Account encoding and private-page preparation before choosing a slice.
     // A turn with less than the full return envelope yields without entering EL0.
-    let entered = timer::ticks();
-    if ns(entered.saturating_sub(begin)).saturating_add(RETURN_ENVELOPE_NS) > credit.reserved_ns {
+    let entered = timer::cpu_ticks();
+    if timer::cpu_ns(entered.saturating_sub(begin.cpu_ticks)).saturating_add(RETURN_ENVELOPE_NS)
+        > credit.reserved_ns
+    {
         return;
     }
     let Some(context) = worker.context.as_mut() else {
@@ -691,7 +719,7 @@ fn run_turn(
         enter_service(
             context,
             phys(root),
-            entered.saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
+            timer::ticks().saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
             crate::a02_capture::Task {
                 id: capture_owner(slot).id,
                 generation: capture_owner(slot).generation,
@@ -700,9 +728,8 @@ fn run_turn(
             },
         );
     }
-    let end = timer::ticks();
-    let actual = ns(end - entered);
-    MAX_SLICE[slot].fetch_max(end - entered, Ordering::Relaxed);
+    let actual = timer::cpu_elapsed_ns(entered);
+    MAX_SLICE[slot].fetch_max(ticks(actual), Ordering::Relaxed);
     if worker.native.in_job {
         worker.native.cpu_ns = worker.native.cpu_ns.saturating_add(actual);
     }
@@ -713,23 +740,23 @@ fn run_turn(
 fn charge_turn(
     worker: &mut Worker,
     credit: cyxia_prototype::domains::tasks::ControlCredit,
-    begin: u64,
+    begin: ChargeStart,
 ) {
     finish_measurement(worker);
-    let end = timer::ticks();
-    let actual = ns(end - begin);
+    let actual = begin.actual_ns();
+    let finished = ns(timer::ticks());
     worker.window = credit.window;
     worker.charged = credit
         .control_total_ns
         .saturating_sub(credit.reserved_ns)
         .saturating_add(actual);
-    CONTROL_TICKS.fetch_add(end - begin, Ordering::Relaxed);
+    CONTROL_TICKS.fetch_add(ticks(actual), Ordering::Relaxed);
     learning::mandatory(&mut worker.extra, credit.started_ns, actual);
     worker.native.bill = Some(Bill {
         credit,
-        body_started: ns(begin),
+        body_started: begin.wall_started_ns,
         actual,
-        finished: ns(end),
+        finished,
         phase: worker.native.phase,
         phase_mask: worker.native.phase_mask,
     });
@@ -792,7 +819,7 @@ pub(super) fn step(worker: &mut Worker) {
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(reservation_ns, false) else {
         return;
     };
-    let begin = timer::ticks();
+    let begin = ChargeStart::begin();
     worker.native.phase = 0;
     worker.native.phase_mask = 0;
     CONTROL_MAX_DEBIT.fetch_max(credit.control_total_ns / 100_000, Ordering::Relaxed);
@@ -816,7 +843,7 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
         let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
             return false;
         };
-        let begin = timer::ticks();
+        let begin = ChargeStart::begin();
         worker.native.phase = 0;
         worker.native.phase_mask = 0;
         if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
@@ -837,7 +864,7 @@ pub(super) fn stop_ready(worker: &mut Worker) -> bool {
         let Ok(Some(credit)) = crate::domain_tasks::begin_control(PREPAY_NS, true) else {
             return false;
         };
-        let begin = timer::ticks();
+        let begin = ChargeStart::begin();
         worker.native.phase(8);
         if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
             if begin_measurement(worker, &witness) {

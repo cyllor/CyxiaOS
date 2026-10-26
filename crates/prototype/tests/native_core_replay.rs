@@ -28,6 +28,12 @@ pub mod cpu {
         CPU.store(v, Ordering::Release);
     }
 }
+pub mod timer {
+    use super::*;
+    pub fn cpu_ticks() -> u64 {
+        now()
+    }
+}
 static CLOCK: AtomicU64 = AtomicU64::new(1_000_000_000);
 fn now() -> u64 {
     CLOCK.load(Ordering::Acquire)
@@ -55,6 +61,11 @@ pub mod domain_tasks {
         } else {
             Err(Error::Stale)
         }
+    }
+    pub fn finish_cpu_interval(started: u64) -> (u64, u64, u64) {
+        let finished = now();
+        let actual = finished.saturating_sub(started);
+        (finished.saturating_sub(actual), finished, actual)
     }
     pub fn begin(sequence: u64) -> ControlCredit {
         let credit = ControlCredit {
@@ -321,7 +332,8 @@ fn preparation_snapshot(
 fn encode_job(
     s: &mut State,
     controller: u64,
-    started: u64,
+    _wall_started: u64,
+    cpu_started: u64,
     snapshot: Snapshot,
     set: &CandidateSet,
     _: Action,
@@ -336,9 +348,10 @@ fn encode_job(
     );
     CLOCK.fetch_add(ENCODING_CPU.swap(0, Ordering::AcqRel), Ordering::AcqRel);
     let identity = preparation_identity(s, controller, 1, 2, set.target, snapshot.sequence, work);
+    let elapsed = now().checked_sub(cpu_started).unwrap();
     s.encode_ns = match s.preparation {
-        Some(pending) => pending.total(identity, now(), now().checked_sub(started).unwrap())?,
-        None => now().checked_sub(started).unwrap(),
+        Some(pending) => pending.total(identity, now(), elapsed)?,
+        None => elapsed,
     };
     let id = work.unwrap();
     core_replay::bind(id, snapshot.sequence, cpu::slot(), set.hash())?;
@@ -397,7 +410,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
     cpu::set(1);
     let credit = domain_tasks::begin(1);
     let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-    assert!(core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
+    assert!(core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap());
     let warm = root.encoded.unwrap().work.unwrap();
     assert_eq!(core_replay::freeze(now()), Err(Error::Busy));
     cpu::set(0);
@@ -437,7 +450,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
         cpu::set(1 + id as usize % 2);
         let credit = domain_tasks::begin(10 + id);
         let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-        assert!(core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
+        assert!(core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap());
         let work = root.encoded.unwrap().work.unwrap();
         assert!(core_replay::result(id).unwrap().is_none());
         at(now() + 1_000);
@@ -493,7 +506,7 @@ fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {
     cpu::set(2);
     let credit = domain_tasks::begin(200);
     let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
-    assert!(!core_replay::next(&mut root, 1, &witness, now(), &mut input).unwrap());
+    assert!(!core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap());
     let choice = Candidate {
         action: Action::ControlSet(2),
         features: RawFeatures {
@@ -571,7 +584,14 @@ fn successful_readonly_retry_includes_owner_selection_and_measurement_prefix() {
         ENTRY_PREFIX.store(prior_ns, Ordering::Release);
         QUEUE_BUSY.store(true, Ordering::Release);
         assert_eq!(
-            core_replay::next(&mut root, 1, &witness, first_started, &mut input),
+            core_replay::next(
+                &mut root,
+                1,
+                &witness,
+                first_started,
+                first_started,
+                &mut input,
+            ),
             Err(Error::Busy)
         );
         root.preparation
@@ -583,7 +603,14 @@ fn successful_readonly_retry_includes_owner_selection_and_measurement_prefix() {
         let retry_started = now();
         ENTRY_PREFIX.store(100_000, Ordering::Release);
         ENCODING_CPU.store(800_000, Ordering::Release);
-        let result = core_replay::next(&mut root, 1, &witness, retry_started, &mut input);
+        let result = core_replay::next(
+            &mut root,
+            1,
+            &witness,
+            retry_started,
+            retry_started,
+            &mut input,
+        );
         assert_eq!(result.map(|_| root.encode_ns), expected);
         assert_eq!(now() - retry_started, 900_000);
         assert_eq!(

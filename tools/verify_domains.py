@@ -758,7 +758,7 @@ def run(args):
     minimum_pairs = getattr(args, "replay_pairs", 0)
     require(0 <= minimum_pairs <= 216, "--replay-pairs must be 0..216")
     require(not reconnect_requested or not args.single, "--reconnect requires --peer-elf")
-    tcg_threads = getattr(args, "tcg_threads", "single")
+    tcg_threads = getattr(args, "tcg_threads", "multi")
     require(tcg_threads in ("single", "multi"), "invalid TCG thread configuration")
     require(args.clock_profile != "icount" or tcg_threads == "single",
             "icount requires single-thread TCG")
@@ -1018,9 +1018,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=150)
     parser.add_argument("--hold", type=float, default=2, help="wall seconds after all functional conditions hold")
     parser.add_argument("--sample-ms", type=int, default=250)
-    parser.add_argument("--clock-profile", choices=("icount", "wallclock"), default="icount")
-    parser.add_argument("--tcg-threads", choices=("single", "multi"), default="single",
-                        help="TCG execution mode; multi requires wallclock and does not certify physical timing")
+    parser.add_argument("--clock-profile", choices=("icount", "wallclock"), default="wallclock")
+    parser.add_argument(
+        "--tcg-threads",
+        choices=("single", "multi"),
+        default="multi",
+        help="TCG execution mode; multi is required by the pinned per-vCPU PMU clock",
+    )
     parser.add_argument("--reconnect", action="store_true",
                         help="verify two-node link loss, guest-clock progress and fresh mutual authentication")
     parser.add_argument("--replay-pairs", type=int, default=0,
