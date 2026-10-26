@@ -144,3 +144,26 @@ registration/prechecks, completed input encoding, completed input-page hash,
 completed WorkId/evidence binding, and completed history/final Job retention.
 This adds attribution only and changes no execution path, budget or acceptance
 condition.
+
+Run `40364424158` on the instrumented source crossed the complete control
+preparation path without a C-credit fault and instead stopped later with native
+learning worker fault `1294` (`0x50e`). The code is `0x500 + Error::Budget`
+from `ExtraBudget::settle`: the physical control credit had already accepted an
+in-reservation guest-CPU span, but the learning ledger still rejected its
+host-delayed wall completion against `start + 2.5 ms`. This run therefore
+establishes that the candidate compaction closes the observed preparation
+failure, while exposing a separate learning-ledger clock mismatch.
+
+`ExtraBudget` settlement now matches the physical control ledger's clock
+semantics. A real `actual_ns > limit_ns`, impossible interval, 9 ms extra-role
+ceiling or 70 ms combined ceiling remains a sticky Budget fault. An in-credit
+turn whose wall receipt arrives in a later aligned window succeeds, remains
+charged in its grant window and carries the same actual CPU into the completion
+window before any new extra-role admission. The carry is window-tagged and
+checked against the unchanged 9 ms ceiling. A regression uses a 1 ms actual
+turn whose wall receipt arrives 15 ms after a 90 ms start, proves both ledgers
+settle, and proves only 8 ms of extra-role capacity remains in the next window;
+the existing 2.6 ms actual-overrun regression still faults both ledgers.
+The complete prototype suite and strict AArch64 Clippy pass. Exact-source build
+`/tmp/cyxia-prototype.b9yAHp` is `BUILT_NOT_RUN`; both selected stack paths pass
+at 37,984/65,536 bytes with the unchanged 4,096-byte exception reserve.

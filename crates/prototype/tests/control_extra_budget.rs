@@ -136,3 +136,68 @@ fn one_late_real_execution_is_retained_as_a_fault_by_both_ledgers() {
             .is_err()
     );
 }
+
+#[test]
+fn wall_late_in_credit_extra_work_carries_into_the_completion_window() {
+    let mut scheduler = Scheduler::new();
+    let mut extra = ExtraBudget::new();
+    let start = 90_000_000;
+    let physical = scheduler
+        .reserve_control(1, LAYOUT, start, 2_500_000)
+        .unwrap()
+        .unwrap();
+    let credit = extra
+        .reserve(
+            Role::Training,
+            1,
+            7,
+            1024 * 1024,
+            start,
+            2_500_000,
+            &Physical(physical),
+        )
+        .unwrap();
+
+    // Host descheduling moves wall completion into the next aligned window,
+    // while the patched per-vCPU counter reports only 1 ms of actual work.
+    let finished = 105_000_000;
+    scheduler
+        .complete_control(physical, 1_000_000, finished)
+        .unwrap();
+    let receipt = extra.settle(credit, 1_000_000, finished).unwrap();
+    assert_eq!(receipt.identity().actual_ns, 1_000_000);
+    assert!(!extra.faulted());
+
+    let next = scheduler
+        .reserve_control(1, LAYOUT, finished, 2_500_000)
+        .unwrap()
+        .unwrap();
+    // Rolling to the completion window applies the conservative 1 ms carry:
+    // only 8 ms of the 9 ms extra-role allowance remains.
+    assert!(matches!(
+        extra.reserve(
+            Role::Validation,
+            1,
+            7,
+            1024 * 1024,
+            finished,
+            8_000_001,
+            &Physical(next),
+        ),
+        Err(Error::Budget)
+    ));
+    assert_eq!(extra.spent_ns(), 1_000_000);
+    assert!(
+        extra
+            .reserve(
+                Role::Validation,
+                1,
+                7,
+                1024 * 1024,
+                finished,
+                2_500_000,
+                &Physical(next),
+            )
+            .is_ok()
+    );
+}

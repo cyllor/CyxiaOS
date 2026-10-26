@@ -55,7 +55,6 @@ pub struct ExtraCredit {
     role: Role,
     window: u64,
     start_ns: u64,
-    deadline_ns: u64,
     limit_ns: u64,
     cpu: u16,
     core_generation: u64,
@@ -99,6 +98,8 @@ impl WorkReceipt {
 pub struct ExtraBudget {
     ledger_id: u64,
     window: Option<u64>,
+    carry_window: Option<u64>,
+    carry_spent: u64,
     serial: u64,
     spent: u64,
     mandatory: u64,
@@ -118,6 +119,8 @@ impl ExtraBudget {
         Self {
             ledger_id,
             window: None,
+            carry_window: None,
+            carry_spent: 0,
             serial: 0,
             spent: 0,
             mandatory: 0,
@@ -138,8 +141,16 @@ impl ExtraBudget {
                 return Err(Error::Unknown);
             }
             self.window = Some(window);
-            self.spent = 0;
+            self.spent = if self.carry_window == Some(window) {
+                self.carry_spent
+            } else {
+                0
+            };
             self.mandatory = 0;
+            if self.carry_window.is_some_and(|carried| carried <= window) {
+                self.carry_window = None;
+                self.carry_spent = 0;
+            }
         }
         Ok(window)
     }
@@ -190,7 +201,6 @@ impl ExtraBudget {
             role,
             window,
             start_ns: now,
-            deadline_ns: now + limit_ns,
             limit_ns,
             cpu,
             core_generation,
@@ -215,12 +225,27 @@ impl ExtraBudget {
         if self.fault
             || actual_ns > credit.limit_ns
             || finished_ns < credit.start_ns
-            || finished_ns > credit.deadline_ns
+            || actual_ns > finished_ns.saturating_sub(credit.start_ns)
             || self.spent > EXTRA_NS
             || self.spent.saturating_add(self.mandatory) > CONTROL_NS
         {
             self.fault = true;
             return Err(Error::Budget);
+        }
+        let finished_window = finished_ns / WINDOW_NS;
+        if finished_window > credit.window {
+            if self.carry_window != Some(finished_window) {
+                self.carry_window = Some(finished_window);
+                self.carry_spent = 0;
+            }
+            self.carry_spent = self
+                .carry_spent
+                .checked_add(actual_ns)
+                .ok_or(Error::Numeric)?;
+            if self.carry_spent > EXTRA_NS {
+                self.fault = true;
+                return Err(Error::Budget);
+            }
         }
         Ok(WorkReceipt {
             ledger_id: credit.ledger_id,
