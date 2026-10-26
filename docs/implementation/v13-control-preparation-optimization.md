@@ -591,6 +591,20 @@ strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-capture-prepare` passes both selected stack
 paths at 33,904/65,536 bytes. Linux timing remains required.
 
+Run `40416748290` reaches phase 2 at sequence 580 but the first exact capture
+boundary still uses 8,683,689/8,000,000 ns. Registration is already separate;
+entry and return were each scanning the same protected task prefix to recover
+the index just validated by `prepare`. The protected state now returns that
+index to a per-CPU atomic handoff. Exact entry and return each recheck
+`tasks[index] == task` before updating the unchanged capture structure and
+event format, failing closed on any stale or mismatched handoff. This removes
+both repeated searches from the architectural boundary without weakening its
+identity checks. The full 615 host tests (two environment skips), 141 v1.3
+tests (one historical-evidence skip), formatting and configured strict AArch64
+Clippy pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-capture-index`
+passes both selected stack paths at 33,904/65,536 bytes. Linux timing remains
+required.
+
 Run `40415656116` crosses all native C-worker phase-1/phase-2 gates. The next
 failure is the global task-credit bank: CPU0 service thread `257:1` uses
 2,904,603/2,500,000 ns while diagnostic stage 1 installs learning storage, and

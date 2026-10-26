@@ -166,10 +166,10 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             None
         }
     }
-    pub fn prepare(&mut self, tick: u64, task: Task) -> bool {
-        self.register_task(tick, task).is_some()
+    pub fn prepare(&mut self, tick: u64, task: Task) -> Option<usize> {
+        self.register_task(tick, task)
     }
-    pub fn enter(&mut self, tick: u64, cpu: usize, task: Task) -> bool {
+    fn enter_registered(&mut self, tick: u64, cpu: usize, task: Task, task_index: usize) -> bool {
         if cpu >= 4
             || self.active[cpu].id != 0
             || self
@@ -180,9 +180,14 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             self.fail();
             return false;
         }
-        let Some(task_index) = self.register_task(tick, task) else {
+        if self.stopping || self.sealed() {
+            self.seal(tick);
             return false;
-        };
+        }
+        if self.tasks.get(task_index) != Some(&task) {
+            self.fail();
+            return false;
+        }
         self.active[cpu] = task;
         self.returned_origin[task_index] = 0;
         self.started[cpu] = tick;
@@ -191,6 +196,44 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.control_seen |= task.role == 2;
         self.business_seen |= task.role == 1;
         true
+    }
+    pub fn enter_prepared(&mut self, tick: u64, cpu: usize, task: Task, task_index: usize) -> bool {
+        self.enter_registered(tick, cpu, task, task_index)
+    }
+    pub fn enter(&mut self, tick: u64, cpu: usize, task: Task) -> bool {
+        if cpu >= 4
+            || self.active[cpu].id != 0
+            || self
+                .active
+                .iter()
+                .any(|active| active.id == task.id && active.generation == task.generation)
+        {
+            self.fail();
+            return false;
+        }
+        let Some(task_index) = self.register_task(tick, task) else {
+            return false;
+        };
+        self.enter_registered(tick, cpu, task, task_index)
+    }
+    fn exit_registered(&mut self, tick: u64, cpu: usize, task_index: usize) {
+        if cpu >= 4 || self.active[cpu].id == 0 {
+            self.fail();
+            return;
+        }
+        let task = self.active[cpu];
+        self.counters[20 + cpu] += 1;
+        self.counters[40 + cpu] += tick.saturating_sub(self.started[cpu]);
+        self.append(tick, 4, cpu, task, &[self.counters[16 + cpu]]);
+        self.active[cpu] = Task::EMPTY;
+        if self.tasks.get(task_index) != Some(&task) {
+            self.fail();
+            return;
+        }
+        self.returned_origin[task_index] = cpu as u64 + 1;
+    }
+    pub fn exit_prepared(&mut self, tick: u64, cpu: usize, task_index: usize) {
+        self.exit_registered(tick, cpu, task_index);
     }
     pub fn exit(&mut self, tick: u64, cpu: usize) {
         if cpu >= 4 || self.active[cpu].id == 0 {
@@ -364,12 +407,16 @@ mod tests {
     fn prepared_task_registration_is_a_separate_event_before_entry() {
         let mut c = capture::<16>();
         let task = task(20, 2, 2);
-        assert!(c.prepare(101, task));
+        let prepared = c.prepare(101, task);
+        assert_eq!(prepared, Some(0));
         assert_eq!(c.events[0][2], 1);
         assert_eq!(c.counters[27], 1);
-        assert!(c.enter(102, 1, task));
+        assert!(c.enter_prepared(102, 1, task, prepared.unwrap()));
         assert_eq!(c.events[1][2], 3);
         assert_eq!(c.counters[27], 1);
+        c.exit_prepared(103, 1, prepared.unwrap());
+        assert_eq!(c.events[2][2], 4);
+        assert_eq!(c.returned_origin[0], 2);
     }
     #[test]
     fn dense_task_prefix_exhaustion_fails_without_reusing_a_registration() {
