@@ -188,3 +188,25 @@ build `/tmp/cyxia-prototype.Z5Nrx0` is `BUILT_NOT_RUN`; both selected stack
 paths remain 37,984/65,536 bytes and `CandidateSet::new` remains a 4,032-byte
 frame. Linux patched-QEMU timing is required to establish whether the measured
 hash overhead is reduced enough.
+
+Run `40372166147` shows that batching generic digest updates did not close the
+native bound. CPU1 sequence 137 used 3.768 ms against its unchanged 2.5 ms
+credit. The per-vCPU detail bank attributes approximately 0.786 ms to legality,
+0.799 ms to CandidateSet construction/hash and 0.460 ms to registration; the
+remaining stages and unmarked edges account for the balance. This is a real CPU
+overrun, not a wall-clock carry or artifact-upload failure.
+
+The AArch64 kernel build now hashes the same single bounded canonical byte
+stream with the existing Armv8 SHA2 implementation used for protected page
+hashes. The maximum representation is fixed at 5,519 bytes (150-byte header,
+32 164-byte candidates and an optional 121-byte Canary scope). Other targets
+and AArch64 machines without SHA2 retain the `sha2` software fallback. The
+pre-change four-candidate golden digest remains
+`9e0f74e396ebe50cbb1047727cbc4cbc0cf11c5e891bfea495d8bfade103ccda`;
+the complete prototype suite and configured AArch64 strict Clippy pass. Exact
+local build `/tmp/cyxia-prototype.6Acj71` is `BUILT_NOT_RUN`; both independently
+checked node paths remain 37,984/65,536 bytes with the 4,096-byte exception
+reserve. Disassembly of the actual node image shows CandidateSet hashing calls
+`cyxia_sha256_compress_hw` and retains the software digest branch. Patched-QEMU
+timing is still required; no preparation or catalogue requirement is closed by
+the local build.

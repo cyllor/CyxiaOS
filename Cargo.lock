@@ -201,6 +201,7 @@ dependencies = [
 name = "cyxia-prototype"
 version = "0.1.0"
 dependencies = [
+ "cyxia-arch-aarch64",
  "sha2",
 ]
 
