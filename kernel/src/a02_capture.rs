@@ -95,6 +95,14 @@ pub fn init_boot(epoch: u64) {
         locked(|s| s.boot(epoch));
     }
 }
+/// Register immutable task identity in its own paid owner turn before the
+/// first architectural entry. The later `enter` still records the exact
+/// boundary and verifies that the prepared identity is unchanged.
+pub fn prepare(task: Task) {
+    if ENABLED.load(Ordering::Acquire) {
+        locked(|s| s.prepare(timer::ticks(), task));
+    }
+}
 /// Called immediately around the actual arch user::enter, after IRQ masking.
 /// Once complete, park all further EL0 entries; do not synthesize returns.
 pub fn enter(task: Task) {

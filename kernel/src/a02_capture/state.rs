@@ -137,15 +137,40 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             Ok((used, found))
         }
     }
-    pub fn enter(&mut self, tick: u64, cpu: usize, task: Task) -> bool {
+    fn register_task(&mut self, tick: u64, task: Task) -> Option<usize> {
         if self.stopping || self.sealed() {
             self.seal(tick);
-            return false;
+            return None;
         }
+        if task.id == 0 || task.generation == 0 || !(1..=2).contains(&task.role) {
+            self.fail();
+            return None;
+        }
+        let Ok((used, registered)) = self.find_registered(task.id, task.generation) else {
+            return None;
+        };
+        if let Some(index) = registered {
+            if self.tasks[index] != task {
+                self.fail();
+                None
+            } else {
+                Some(index)
+            }
+        } else if used < T && self.tasks[used].id == 0 {
+            self.tasks[used] = task;
+            self.counters[27] = (used + 1) as u64;
+            self.append(tick, 1, 4, task, &[task.role, task.affinity]);
+            Some(used)
+        } else {
+            self.fail();
+            None
+        }
+    }
+    pub fn prepare(&mut self, tick: u64, task: Task) -> bool {
+        self.register_task(tick, task).is_some()
+    }
+    pub fn enter(&mut self, tick: u64, cpu: usize, task: Task) -> bool {
         if cpu >= 4
-            || task.id == 0
-            || task.generation == 0
-            || !(1..=2).contains(&task.role)
             || self.active[cpu].id != 0
             || self
                 .active
@@ -155,22 +180,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             self.fail();
             return false;
         }
-        let Ok((used, registered)) = self.find_registered(task.id, task.generation) else {
-            return false;
-        };
-        let task_index = if let Some(index) = registered {
-            if self.tasks[index] != task {
-                self.fail();
-                return false;
-            }
-            index
-        } else if used < T && self.tasks[used].id == 0 {
-            self.tasks[used] = task;
-            self.counters[27] = (used + 1) as u64;
-            self.append(tick, 1, 4, task, &[task.role, task.affinity]);
-            used
-        } else {
-            self.fail();
+        let Some(task_index) = self.register_task(tick, task) else {
             return false;
         };
         self.active[cpu] = task;
@@ -349,6 +359,17 @@ mod tests {
         c.enter(103, 0, task(30, 1, 1));
         assert_eq!(c.events[3][2], 1);
         assert_eq!(c.counters[27], 2);
+    }
+    #[test]
+    fn prepared_task_registration_is_a_separate_event_before_entry() {
+        let mut c = capture::<16>();
+        let task = task(20, 2, 2);
+        assert!(c.prepare(101, task));
+        assert_eq!(c.events[0][2], 1);
+        assert_eq!(c.counters[27], 1);
+        assert!(c.enter(102, 1, task));
+        assert_eq!(c.events[1][2], 3);
+        assert_eq!(c.counters[27], 1);
     }
     #[test]
     fn dense_task_prefix_exhaustion_fails_without_reusing_a_registration() {

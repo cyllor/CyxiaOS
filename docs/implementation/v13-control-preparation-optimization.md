@@ -577,6 +577,20 @@ historical-evidence skip), formatting and configured strict AArch64 Clippy
 pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-clear-512` passes both
 selected stack paths at 33,904/65,536 bytes. Linux timing remains required.
 
+Run `40414762247` confirms the four fixed stores cross phase 1. The next
+failure is CPU1 sequence 594 in phase 2 at 8,683,018/8,000,000 ns, exactly
+after the 576 clear pieces and setup turns. The first protected capture entry
+was both registering immutable task identity (one 128-byte event) and recording
+the actual entry (another event) before the architectural transition. Task
+registration now occurs in the paid context-creation turn. The following turn
+retains the unconditional `a02_capture::enter`, `user::enter`, and
+`a02_capture::returned` boundary; the capture rechecks the prepared identity
+and fails closed on any mismatch. The full 615 host tests (two environment
+skips), 141 v1.3 tests (one historical-evidence skip), formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-capture-prepare` passes both selected stack
+paths at 33,904/65,536 bytes. Linux timing remains required.
+
 Run `40411712557` crosses the exact build and stack gates, then fails before
 preparation on CPU1 sequence 3: a 512-byte phase-1 clear consumes 10,302,577 ns
 against the unchanged 8 ms recovery credit. Its empty preparation context

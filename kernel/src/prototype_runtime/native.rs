@@ -71,6 +71,15 @@ pub(super) fn capture_owner(slot: usize) -> cyxia_prototype::domains::ObjectKey 
         generation: CONTROLLER_EPOCH.load(Ordering::Acquire),
     }
 }
+fn capture_task(slot: usize) -> crate::a02_capture::Task {
+    let owner = capture_owner(slot);
+    crate::a02_capture::Task {
+        id: owner.id,
+        generation: owner.generation,
+        role: 2,
+        affinity: 1 << slot,
+    }
+}
 pub(super) fn ns(ticks: u64) -> u64 {
     ((u128::from(ticks) * 1_000_000_000) / u128::from(timer::frequency())).min(u128::from(u64::MAX))
         as u64
@@ -662,6 +671,12 @@ fn run_turn(
     }
     if worker.native.probing && worker.context.is_none() {
         worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+        // The first capture entry would otherwise combine immutable task
+        // registration and two event publications with the architectural
+        // entry. Register in this paid setup turn; exact enter/return events
+        // still surround user::enter on the following turn.
+        crate::a02_capture::prepare(capture_task(slot));
+        return;
     }
     if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
         let preparation = timer::cpu_ticks();
@@ -725,12 +740,7 @@ fn run_turn(
             context,
             phys(root),
             timer::ticks().saturating_add(ticks(service_slice_ns).max(1)),
-            crate::a02_capture::Task {
-                id: capture_owner(slot).id,
-                generation: capture_owner(slot).generation,
-                role: 2,
-                affinity: 1 << slot,
-            },
+            capture_task(slot),
             !worker.native.probing,
         );
     }
