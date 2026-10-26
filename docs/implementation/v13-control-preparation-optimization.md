@@ -563,3 +563,16 @@ All seven peer-ledger tests, 141 v1.3 host tests (one historical-evidence skip),
 formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-peer-filter` is `BUILT_NOT_RUN`; both selected
 stack paths remain 33,904/65,536 bytes with the fixed reserve.
+
+Run `40410681654` fails before preparation and therefore does not evaluate the
+peer relevance correction: CPU1 sequence 2 spends 12,892,894 ns against the
+unchanged 8 ms recovery credit in the first phase-1 private clear. Removing
+`DC ZVA` eliminated helper amplification, but the complete-page `memset` still
+compiled to 512 ordinary 64-bit stores in one translated loop. The existing
+continuation now clears a fixed 512 bytes per paid turn instead of 4 KiB. All
+nine pages, final `DSB ISH`, exact actual accounting and credits are unchanged;
+the smaller ordinary loop also applies to the stricter 2.5 ms job-clear turns.
+The full 615 host tests (two environment skips), 141 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-clear-512` passes both
+selected stack paths at 33,904/65,536 bytes. Linux timing remains required.
