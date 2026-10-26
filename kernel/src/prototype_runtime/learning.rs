@@ -1894,6 +1894,7 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
                         role: 2,
                         affinity: 1 << cpu::slot(),
                     },
+                    None,
                     true,
                 );
             }

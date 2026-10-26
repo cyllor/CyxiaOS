@@ -1336,6 +1336,7 @@ pub fn dispatch(slot: usize) -> bool {
             root,
             timer::ticks().saturating_add(slice_ticks(slot)).min(end),
             task,
+            None,
             true,
         );
     }

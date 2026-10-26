@@ -686,6 +686,7 @@ pub fn run(info: &BootInfo) -> ! {
                         role: 1,
                         affinity: 1,
                     },
+                    None,
                     true,
                 );
             }

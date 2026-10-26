@@ -98,9 +98,20 @@ pub fn init_boot(epoch: u64) {
 /// Register immutable task identity in its own paid owner turn before the
 /// first architectural entry. The later `enter` still records the exact
 /// boundary and verifies that the prepared identity is unchanged.
-pub fn prepare(task: Task) {
+pub fn prepare(task: Task) -> Option<usize> {
     if ENABLED.load(Ordering::Acquire) {
-        locked(|s| s.prepare(timer::ticks(), task));
+        locked(|s| s.prepare(timer::ticks(), task))
+    } else {
+        None
+    }
+}
+pub fn enter_prepared(task: Task, task_index: usize) {
+    if ENABLED.load(Ordering::Acquire)
+        && !locked(|s| s.enter_prepared(timer::ticks(), cpu::slot(), task, task_index))
+    {
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 /// Called immediately around the actual arch user::enter, after IRQ masking.
@@ -118,6 +129,11 @@ pub fn enter(task: Task) {
 pub fn returned() {
     if ENABLED.load(Ordering::Acquire) {
         locked(|s| s.exit(timer::ticks(), cpu::slot()));
+    }
+}
+pub fn returned_prepared(task_index: usize) {
+    if ENABLED.load(Ordering::Acquire) {
+        locked(|s| s.exit_prepared(timer::ticks(), cpu::slot(), task_index));
     }
 }
 pub fn publish(generation: u64, masks: [u64; 6]) {

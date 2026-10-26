@@ -133,6 +133,7 @@ pub(super) struct WorkerState {
     measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
     probe_started: u64,
+    capture_index: Option<usize>,
     clear_next: u32,
     probing: bool,
     in_job: bool,
@@ -156,6 +157,7 @@ impl WorkerState {
             measurement: None,
             probe: 0,
             probe_started: 0,
+            capture_index: None,
             clear_next: 0,
             probing: false,
             in_job: false,
@@ -675,7 +677,7 @@ fn run_turn(
         // registration and two event publications with the architectural
         // entry. Register in this paid setup turn; exact enter/return events
         // still surround user::enter on the following turn.
-        crate::a02_capture::prepare(capture_task(slot));
+        worker.native.capture_index = crate::a02_capture::prepare(capture_task(slot));
         return;
     }
     if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
@@ -741,6 +743,7 @@ fn run_turn(
             phys(root),
             timer::ticks().saturating_add(ticks(service_slice_ns).max(1)),
             capture_task(slot),
+            worker.native.capture_index,
             !worker.native.probing,
         );
     }

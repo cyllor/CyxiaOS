@@ -278,6 +278,19 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40421014889` remains in phase 2 at sequence 583 with
+8,773,658/8,000,000 ns. The previously attempted index optimization paid for
+three additional atomic handoffs. The verified registration index is now kept
+in the CPU-private native `WorkerState` and passed as an ordinary argument
+through the same `enter_service` stack frame. Exact entry and return directly
+recheck `tasks[index] == task`; no atomic handoff or capture-layout field is
+added. Fixed builtin callers pass `None` and retain the original lookup path.
+The full 615 host tests (two environment skips), 141 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-capture-direct-index-2`
+passes both selected stack paths at 33,920/65,536 bytes. Linux timing remains
+required.
+
 Run `40419400094` crosses registration and all C-worker gates, then the global
 task bank reports CPU0 service `257:1` at 4,806,874/2,500,000 ns in network
 stage 4 and CPU2 builtin `2:1` at 10,957,969/10,000,000 ns. Halving the builtin
