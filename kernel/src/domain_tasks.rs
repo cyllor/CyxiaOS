@@ -464,6 +464,11 @@ impl State {
     }
 }
 static mut STATE: State = State::new();
+// A native builtin turn uses a bounded sub-millisecond timer slice, but the
+// shared monotonic clock can advance while an MTTCG vCPU is descheduled. Match
+// the standalone runtime contract: do not start a turn unless the current
+// aligned window retains its complete 10 ms wall-time execution envelope.
+const BUILTIN_WINDOW_HEADROOM_NS: u64 = 10_000_000;
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -822,7 +827,14 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
                 }
             }
             refresh_throttled(s, now);
-            let Some(mut d) = s.scheduler.dispatch(slot, s.layout, now, 10_000_000)? else {
+            let Some(mut d) = s.scheduler.dispatch_with_window_headroom(
+                slot,
+                s.layout,
+                now,
+                10_000_000,
+                BUILTIN_WINDOW_HEADROOM_NS,
+            )?
+            else {
                 return Ok(None);
             };
             let safety = match task_index(&s.tasks, d.thread) {

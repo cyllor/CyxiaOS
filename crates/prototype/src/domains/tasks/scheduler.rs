@@ -417,11 +417,25 @@ impl Scheduler {
         now: u64,
         maximum_ns: u64,
     ) -> Result<Option<Dispatch>, Error> {
+        self.dispatch_with_window_headroom(cpu, layout, now, maximum_ns, 0)
+    }
+    /// Dispatch only when the current aligned window still contains the
+    /// caller's complete wall-time execution envelope. Deferral leaves no
+    /// reservation behind; CPU-time credit is still bounded independently by
+    /// `maximum_ns` and the admitted thread budget.
+    pub fn dispatch_with_window_headroom(
+        &mut self,
+        cpu: usize,
+        layout: CpuLayout,
+        now: u64,
+        maximum_ns: u64,
+        headroom_ns: u64,
+    ) -> Result<Option<Dispatch>, Error> {
         self.time(now)?;
         if !layout.permits(cpu) {
             return Err(Error::Auth);
         }
-        if maximum_ns == 0 {
+        if maximum_ns == 0 || headroom_ns > WINDOW_NS {
             return Err(Error::Range);
         }
         if self.cpus[cpu].quarantine_generation != 0 {
@@ -431,6 +445,9 @@ impl Scheduler {
             return Err(Error::Busy);
         }
         self.roll(cpu, now)?;
+        if WINDOW_NS - now % WINDOW_NS < headroom_ns {
+            return Ok(None);
+        }
         if self.cpus[cpu].spent >= CPU_BUDGET_NS {
             return Ok(None);
         }

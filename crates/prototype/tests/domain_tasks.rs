@@ -386,6 +386,38 @@ fn scheduler_crossed_window_is_quarantined_until_the_tail_is_accounted() {
 }
 
 #[test]
+fn guarded_dispatch_defers_the_window_tail_without_reserving_credit() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 0, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    assert_eq!(
+        s.dispatch_with_window_headroom(
+            0,
+            layout(1),
+            WINDOW_NS - 10_000_000 + 1,
+            1_000_000,
+            10_000_000,
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        s.cpu_window_usage(0, WINDOW_NS - 1),
+        Ok((0, 0)),
+        "tail deferral must not consume or retain a credit"
+    );
+    let d = s
+        .dispatch_with_window_headroom(0, layout(1), WINDOW_NS, 1_000_000, 10_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.started_ns, WINDOW_NS);
+    assert_eq!(d.reserved_ns, 1_000_000);
+    s.complete(d, 250_000, RunState::Runnable, WINDOW_NS + 250_000)
+        .unwrap();
+    assert_eq!(s.stats().quarantine_mask, 0);
+}
+
+#[test]
 fn scheduler_native_margin_is_prepaid_and_stale_ticket_cannot_complete() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();
