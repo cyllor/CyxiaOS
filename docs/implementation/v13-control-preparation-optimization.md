@@ -210,3 +210,23 @@ reserve. Disassembly of the actual node image shows CandidateSet hashing calls
 `cyxia_sha256_compress_hw` and retains the software digest branch. Patched-QEMU
 timing is still required; no preparation or catalogue requirement is closed by
 the local build.
+
+Run `40375412966` no longer reached the former fresh-preparation failure. It
+instead failed during the earlier boot mapping probe: CPU1 sequence 6 spent
+9.024 ms against the separate 8 ms recovery/setup credit, with phase 2, one
+timer preemption, no active job and zero preparation markers. The first A02
+capture entry proved a new task identity by scanning all 512 protected task
+slots even though the table is append-only and never develops holes. That
+evidence work is inside the paid EL0 boundary and was therefore part of the
+real overrun.
+
+The A02 task count already retained in counter 27 now bounds lookup to the
+dense initialized prefix. New identities append at exactly that prefix; a
+count beyond capacity, a hole, a full table or a missing exit identity still
+fails closed. Exit and affinity binding use the same prefix, and binding reuses
+the resolved slot rather than scanning a second time. The standalone protected
+capture tests include exact two-slot exhaustion and pass, as do formatting and
+configured AArch64 strict Clippy. Exact local build
+`/tmp/cyxia-prototype.PbxIPh` is `BUILT_NOT_RUN`; both selected preparation
+paths pass at 37,984/65,536 bytes with the 4,096-byte exception reserve. Native
+timing remains required.

@@ -113,6 +113,30 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.header[3] += 1;
         self.counters[7] += 1;
     }
+    fn find_registered(&mut self, id: u64, generation: u64) -> Result<(usize, Option<usize>), ()> {
+        let Ok(used) = usize::try_from(self.counters[27]) else {
+            self.fail();
+            return Err(());
+        };
+        if used > T {
+            self.fail();
+            return Err(());
+        }
+        let mut found = None;
+        let mut hole = false;
+        for (index, task) in self.tasks[..used].iter().enumerate() {
+            hole |= task.id == 0;
+            if task.id == id && task.generation == generation {
+                found = Some(index);
+            }
+        }
+        if hole {
+            self.fail();
+            Err(())
+        } else {
+            Ok((used, found))
+        }
+    }
     pub fn enter(&mut self, tick: u64, cpu: usize, task: Task) -> bool {
         if self.stopping || self.sealed() {
             self.seal(tick);
@@ -131,21 +155,20 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             self.fail();
             return false;
         }
-        let task_index = if let Some(index) = self
-            .tasks
-            .iter()
-            .position(|t| t.id == task.id && t.generation == task.generation)
-        {
+        let Ok((used, registered)) = self.find_registered(task.id, task.generation) else {
+            return false;
+        };
+        let task_index = if let Some(index) = registered {
             if self.tasks[index] != task {
                 self.fail();
                 return false;
             }
             index
-        } else if let Some(index) = self.tasks.iter().position(|t| t.id == 0) {
-            self.tasks[index] = task;
-            self.counters[27] += 1;
+        } else if used < T && self.tasks[used].id == 0 {
+            self.tasks[used] = task;
+            self.counters[27] = (used + 1) as u64;
             self.append(tick, 1, 4, task, &[task.role, task.affinity]);
-            index
+            used
         } else {
             self.fail();
             return false;
@@ -169,12 +192,14 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.counters[40 + cpu] += tick.saturating_sub(self.started[cpu]);
         self.append(tick, 4, cpu, task, &[self.counters[16 + cpu]]);
         self.active[cpu] = Task::EMPTY;
-        if let Some(index) = self
-            .tasks
-            .iter()
-            .position(|t| t.id == task.id && t.generation == task.generation)
-        {
+        let Ok((_, registered)) = self.find_registered(task.id, task.generation) else {
+            return;
+        };
+        if let Some(index) = registered {
             self.returned_origin[index] = cpu as u64 + 1;
+        } else {
+            self.fail();
+            return;
         }
         self.stopping |=
             self.denial_seen && self.control_seen && self.business_seen && self.header[6] != 0;
@@ -193,11 +218,10 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         if self.sealed() {
             return;
         }
-        let Some(index) = self
-            .tasks
-            .iter()
-            .position(|t| t.id == id && t.generation == generation)
-        else {
+        let Ok((_, registered)) = self.find_registered(id, generation) else {
+            return;
+        };
+        let Some(index) = registered else {
             self.fail();
             return;
         };
@@ -220,13 +244,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             self.counters[25] += 1;
         } else if result == 0 {
             self.counters[26] += 1;
-            if let Some(t) = self
-                .tasks
-                .iter_mut()
-                .find(|t| t.id == id && t.generation == generation)
-            {
-                t.affinity = mask;
-            }
+            self.tasks[index].affinity = mask;
         }
         self.append(tick, 6, cpu, task, &[request, result]);
         self.denial_seen |= task.role == 1 && mask & self.masks[0] != 0 && result == 1;
@@ -331,6 +349,22 @@ mod tests {
         c.enter(103, 0, task(30, 1, 1));
         assert_eq!(c.events[3][2], 1);
         assert_eq!(c.counters[27], 2);
+    }
+    #[test]
+    fn dense_task_prefix_exhaustion_fails_without_reusing_a_registration() {
+        let mut c: Capture<32, 2> = Capture::new();
+        let mut config = [0; 64];
+        config[2] = 7;
+        c.begin(100, 1000, &config);
+        c.boot(4);
+        assert!(c.enter(101, 0, task(10, 1, 1)));
+        c.exit(102, 0);
+        assert!(c.enter(103, 1, task(20, 2, 2)));
+        c.exit(104, 1);
+        assert_eq!(c.counters[27], 2);
+        assert!(!c.enter(105, 3, task(30, 1, 8)));
+        assert_eq!(c.counters[27], 2);
+        assert!(c.header[4] > 0);
     }
     #[test]
     fn owner_flags_are_recorded_even_without_a_core_generation_change() {
