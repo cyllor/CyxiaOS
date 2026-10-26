@@ -278,6 +278,20 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40417713681` shows the atomic index handoff is counterproductive under
+TCG: phase 2 rises to 10,973,090/8,000,000 ns at sequence 625, so that change
+is removed. Inspection also finds that `record_slice_evidence=false` skipped
+the entry-side auxiliary row but the exception handler still unconditionally
+wrote five atomic `TASK_SLICE_EVIDENCE` fields. A per-CPU flag now enables those
+exception fields only for entries that requested auxiliary timing. Mapping
+probes therefore skip the complete auxiliary row as intended, while their A02
+authoritative enter/return capture and all normal task slice evidence remain
+unchanged. The full 615 host tests (two environment skips), 141 v1.3 tests
+(one historical-evidence skip), formatting and configured strict AArch64
+Clippy pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-no-aux`
+passes both selected stack paths at 33,904/65,536 bytes. Linux timing remains
+required.
+
 Run `40381922994` confirms conditional `SEV` removed the three task-credit
 faults and progressed to normal preparation. CPU1 sequence 73 then used
 13.057/2.5 ms before candidate construction: the current-action callback took

@@ -107,6 +107,8 @@ impl SliceTiming {
 #[used]
 #[unsafe(no_mangle)]
 static TASK_SLICE_EVIDENCE: SliceTiming = SliceTiming::new();
+#[cfg(feature = "unified-runtime")]
+static RECORD_SLICE_EXCEPTION: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
 unsafe extern "C" {
     static cyxia_secondary_start: u8;
     static smp_user_start: u8;
@@ -237,7 +239,7 @@ fn stop_failed(code: u64) -> ! {
 pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
     let slot = cpu::slot();
     #[cfg(feature = "unified-runtime")]
-    if slot < 4 && matches!(kind, 8 | 9) {
+    if slot < 4 && RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire) && matches!(kind, 8 | 9) {
         let row = 2 + slot * 30;
         TASK_SLICE_EVIDENCE.words[row + 7].store(timer::ticks(), Ordering::Relaxed);
         TASK_SLICE_EVIDENCE.words[row + 8].store(kind, Ordering::Relaxed);
@@ -1003,7 +1005,9 @@ pub(crate) unsafe fn enter_service(
             TASK_SLICE_EVIDENCE.words[row + 6].store(armed_at, Ordering::Relaxed);
         }
         crate::a02_capture::enter(task);
+        RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence, Ordering::Release);
         user::enter(context, root);
+        RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
         crate::a02_capture::returned();
         if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);

@@ -4,7 +4,7 @@
 //! 1 MiB of event storage is reserved in the kernel image's physical footprint,
 //! outside (and never borrowed from) the eight-MiB control allocation pool.
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_arch_aarch64::{cpu, timer};
 #[path = "a02_capture/state.rs"]
 mod state;
@@ -42,8 +42,6 @@ static A02_BOOT_MODEL: [u8; 2772] = cyxia_prototype::learning::seed::UNTRAINED_S
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicBool = AtomicBool::new(false);
 static WAITERS: AtomicBool = AtomicBool::new(false);
-static PREPARED_INDEX: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-static ACTIVE_INDEX: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn locked<R>(f: impl FnOnce(&mut state::Capture<EVENTS, TASKS>) -> R) -> R {
     while LOCK
@@ -102,14 +100,7 @@ pub fn init_boot(epoch: u64) {
 /// boundary and verifies that the prepared identity is unchanged.
 pub fn prepare(task: Task) {
     if ENABLED.load(Ordering::Acquire) {
-        let slot = cpu::slot();
-        if slot < 4 {
-            let prepared = locked(|s| s.prepare(timer::ticks(), task));
-            PREPARED_INDEX[slot].store(
-                prepared.map_or(0, |index| index as u64 + 1),
-                Ordering::Release,
-            );
-        }
+        locked(|s| s.prepare(timer::ticks(), task));
     }
 }
 /// Called immediately around the actual arch user::enter, after IRQ masking.
@@ -118,43 +109,15 @@ pub fn enter(task: Task) {
     if !ENABLED.load(Ordering::Acquire) {
         return;
     }
-    let slot = cpu::slot();
-    let prepared = if slot < 4 {
-        PREPARED_INDEX[slot].swap(0, Ordering::AcqRel)
-    } else {
-        0
-    };
-    let entered = locked(|s| {
-        if prepared == 0 {
-            s.enter(timer::ticks(), slot, task)
-        } else {
-            s.enter_prepared(timer::ticks(), slot, task, prepared as usize - 1)
-        }
-    });
-    if !entered {
+    if !locked(|s| s.enter(timer::ticks(), cpu::slot(), task)) {
         loop {
             core::hint::spin_loop();
         }
     }
-    if slot < 4 {
-        ACTIVE_INDEX[slot].store(prepared, Ordering::Release);
-    }
 }
 pub fn returned() {
     if ENABLED.load(Ordering::Acquire) {
-        let slot = cpu::slot();
-        let prepared = if slot < 4 {
-            ACTIVE_INDEX[slot].swap(0, Ordering::AcqRel)
-        } else {
-            0
-        };
-        locked(|s| {
-            if prepared == 0 {
-                s.exit(timer::ticks(), slot);
-            } else {
-                s.exit_prepared(timer::ticks(), slot, prepared as usize - 1);
-            }
-        });
+        locked(|s| s.exit(timer::ticks(), cpu::slot()));
     }
 }
 pub fn publish(generation: u64, masks: [u64; 6]) {

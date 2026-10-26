@@ -24,6 +24,8 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("a02_capture::enter(task);", entry)
         self.assertIn("a02_capture::returned();", entry)
         self.assertIn("if record_slice_evidence && slot < 4", entry)
+        self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence", entry)
+        self.assertIn("RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire)", entry)
 
 
 if __name__ == "__main__":
