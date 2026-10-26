@@ -108,6 +108,8 @@ struct Thread {
     state: RunState,
     ready_since: u64,
     spent: u64,
+    carry_window: u64,
+    carry_spent: u64,
     actual: u64,
     last_dispatch: u64,
 }
@@ -119,6 +121,10 @@ struct Cpu {
     active: Option<Dispatch>,
     control: Option<ControlCredit>,
     control_spent: u64,
+    carry_window: u64,
+    carry_spent: u64,
+    carry_control_spent: u64,
+    carry_groups: [u64; MAX_GROUPS],
     quarantine_generation: u64,
     recovery_after: u64,
 }
@@ -130,6 +136,10 @@ impl Cpu {
         active: None,
         control: None,
         control_spent: 0,
+        carry_window: u64::MAX,
+        carry_spent: 0,
+        carry_control_spent: 0,
+        carry_groups: [0; MAX_GROUPS],
         quarantine_generation: 0,
         recovery_after: 0,
     };
@@ -198,6 +208,28 @@ impl Scheduler {
     fn roll(&mut self, cpu: usize, now: u64) -> Result<(), Error> {
         let window = now / WINDOW_NS;
         if self.cpus[cpu].window == window {
+            let c = &mut self.cpus[cpu];
+            if c.carry_window == window {
+                c.spent = c.spent.saturating_add(c.carry_spent);
+                c.control_spent = c.control_spent.saturating_add(c.carry_control_spent);
+                for (spent, carry) in c.groups.iter_mut().zip(c.carry_groups) {
+                    *spent = spent.saturating_add(carry);
+                }
+                c.carry_window = u64::MAX;
+                c.carry_spent = 0;
+                c.carry_control_spent = 0;
+                c.carry_groups = [0; MAX_GROUPS];
+            }
+            for t in self
+                .threads
+                .iter_mut()
+                .flatten()
+                .filter(|t| usize::from(t.spec.cpu) == cpu && t.carry_window == window)
+            {
+                t.spent = t.spent.saturating_add(t.carry_spent);
+                t.carry_window = u64::MAX;
+                t.carry_spent = 0;
+            }
             return Ok(());
         }
         if self.cpus[cpu].active.is_some()
@@ -215,17 +247,113 @@ impl Scheduler {
         }
         let c = &mut self.cpus[cpu];
         c.window = window;
-        c.spent = 0;
-        c.control_spent = 0;
-        c.groups = [0; MAX_GROUPS];
+        if c.carry_window == window {
+            c.spent = c.carry_spent;
+            c.control_spent = c.carry_control_spent;
+            c.groups = c.carry_groups;
+        } else {
+            c.spent = 0;
+            c.control_spent = 0;
+            c.groups = [0; MAX_GROUPS];
+        }
+        if c.carry_window <= window {
+            c.carry_window = u64::MAX;
+            c.carry_spent = 0;
+            c.carry_control_spent = 0;
+            c.carry_groups = [0; MAX_GROUPS];
+        }
         for t in self
             .threads
             .iter_mut()
             .flatten()
             .filter(|t| usize::from(t.spec.cpu) == cpu)
         {
-            t.spent = 0;
+            t.spent = if t.carry_window == window {
+                t.carry_spent
+            } else {
+                0
+            };
+            if t.carry_window <= window {
+                t.carry_window = u64::MAX;
+                t.carry_spent = 0;
+            }
         }
+        Ok(())
+    }
+    /// Retain a late receipt in both ledgers. The grant window already paid
+    /// for the work; charging the completion window as well is deliberately
+    /// conservative and prevents host scheduling latency from releasing new
+    /// guest capacity.
+    fn carry_business_completion(
+        &mut self,
+        cpu: usize,
+        thread: usize,
+        actual_ns: u64,
+        finished_ns: u64,
+    ) -> Result<(), Error> {
+        let window = finished_ns / WINDOW_NS;
+        let (source, group, minimum_ns, budget_ns, old_thread_carry, new_thread_carry) = {
+            let t = self.threads[thread].as_mut().ok_or(Error::Stale)?;
+            if t.carry_window != window {
+                t.carry_window = window;
+                t.carry_spent = 0;
+            }
+            let old = t.carry_spent;
+            t.carry_spent = t.carry_spent.saturating_add(actual_ns);
+            (
+                usize::from(t.spec.cpu),
+                t.group,
+                t.spec.minimum_ns,
+                t.spec.budget_ns,
+                old,
+                t.carry_spent,
+            )
+        };
+        let extra = new_thread_carry
+            .saturating_sub(minimum_ns)
+            .saturating_sub(old_thread_carry.saturating_sub(minimum_ns));
+        let c = &mut self.cpus[cpu];
+        if c.carry_window != window {
+            c.carry_window = window;
+            c.carry_spent = 0;
+            c.carry_control_spent = 0;
+            c.carry_groups = [0; MAX_GROUPS];
+        }
+        c.carry_spent = c.carry_spent.saturating_add(actual_ns);
+        c.carry_groups[group] = c.carry_groups[group].saturating_add(extra);
+        if c.carry_spent > CPU_BUDGET_NS || new_thread_carry > budget_ns {
+            return Err(Error::Budget);
+        }
+        // Applying may be temporarily blocked by another old-window service
+        // receipt. In that case the tagged carry remains pending for the next
+        // admissible roll and read-only usage still exposes it.
+        let _ = self.roll(cpu, finished_ns);
+        if source != cpu {
+            let _ = self.roll(source, finished_ns);
+        }
+        Ok(())
+    }
+
+    fn carry_control_completion(
+        &mut self,
+        cpu: usize,
+        actual_ns: u64,
+        finished_ns: u64,
+    ) -> Result<(), Error> {
+        let window = finished_ns / WINDOW_NS;
+        let c = &mut self.cpus[cpu];
+        if c.carry_window != window {
+            c.carry_window = window;
+            c.carry_spent = 0;
+            c.carry_control_spent = 0;
+            c.carry_groups = [0; MAX_GROUPS];
+        }
+        c.carry_spent = c.carry_spent.saturating_add(actual_ns);
+        c.carry_control_spent = c.carry_control_spent.saturating_add(actual_ns);
+        if c.carry_spent > CPU_BUDGET_NS || c.carry_control_spent > CONTROL_BUDGET_NS {
+            return Err(Error::Budget);
+        }
+        let _ = self.roll(cpu, finished_ns);
         Ok(())
     }
     pub fn register_group(&mut self, key: ObjectKey) -> Result<(), Error> {
@@ -363,6 +491,8 @@ impl Scheduler {
             state: RunState::Runnable,
             ready_since: now,
             spent: 0,
+            carry_window: u64::MAX,
+            carry_spent: 0,
             actual: 0,
             last_dispatch: 0,
         });
@@ -800,7 +930,7 @@ impl Scheduler {
         t.ready_since = finished_ns;
         self.cpus[cpu].active = None;
         self.stats.actual_ns = self.stats.actual_ns.saturating_add(actual_ns);
-        if actual_ns > d.reserved_ns || finished_ns > end {
+        if actual_ns > d.reserved_ns {
             self.cpus[cpu].quarantine_generation = d.core_generation;
             self.cpus[cpu].recovery_after =
                 if finished_ns > end && !finished_ns.is_multiple_of(WINDOW_NS) {
@@ -815,6 +945,21 @@ impl Scheduler {
         if actual_ns != 0 {
             let g = self.groups[t.group].as_mut().ok_or(Error::Stale)?;
             g.applied_version = g.applied_version.max(d.policy_version);
+        }
+        if finished_ns > end
+            && self
+                .carry_business_completion(cpu, i, actual_ns, finished_ns)
+                .is_err()
+        {
+            self.cpus[cpu].quarantine_generation = d.core_generation;
+            self.cpus[cpu].recovery_after = if finished_ns.is_multiple_of(WINDOW_NS) {
+                finished_ns
+            } else {
+                finished_ns.saturating_add(WINDOW_NS - finished_ns % WINDOW_NS)
+            };
+            self.stats.overruns = self.stats.overruns.saturating_add(1);
+            self.stats.quarantine_mask |= 1u64 << cpu;
+            return Err(Error::Budget);
         }
         Ok(())
     }
@@ -1022,6 +1167,9 @@ impl Scheduler {
         if now / WINDOW_NS < c.window {
             return Err(Error::Stale);
         }
+        if now / WINDOW_NS > c.window && now / WINDOW_NS == c.carry_window {
+            return Ok((c.carry_spent, 0));
+        }
         if now / WINDOW_NS > c.window
             && c.active.is_none()
             && c.control.is_none()
@@ -1103,7 +1251,8 @@ impl Scheduler {
         Ok(Some(credit))
     }
     /// Settle exactly once, even if a later ownership context has been
-    /// published. Budget consumes the actual bill and quarantines this CPU;
+    /// published. A real CPU-time overrun quarantines this CPU. A wall-late
+    /// receipt is conservatively charged again in its completion window;
     /// malformed or stale receipts do not retire the real reservation.
     pub fn complete_control(
         &mut self,
@@ -1138,10 +1287,25 @@ impl Scheduler {
         c.control = None;
         self.last_now = self.last_now.max(finished_ns);
         if actual_ns > credit.reserved_ns
-            || finished_ns > end
             || c.spent > CPU_BUDGET_NS
             || c.control_spent > CONTROL_BUDGET_NS
         {
+            c.quarantine_generation = c.quarantine_generation.max(credit.core_generation);
+            c.recovery_after = if finished_ns.is_multiple_of(WINDOW_NS) {
+                finished_ns
+            } else {
+                finished_ns.saturating_add(WINDOW_NS - finished_ns % WINDOW_NS)
+            };
+            self.stats.quarantine_mask |= 1u64 << cpu;
+            self.stats.overruns = self.stats.overruns.saturating_add(1);
+            return Err(Error::Budget);
+        }
+        if finished_ns > end
+            && self
+                .carry_control_completion(cpu, actual_ns, finished_ns)
+                .is_err()
+        {
+            let c = &mut self.cpus[cpu];
             c.quarantine_generation = c.quarantine_generation.max(credit.core_generation);
             c.recovery_after = if finished_ns.is_multiple_of(WINDOW_NS) {
                 finished_ns

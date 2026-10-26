@@ -159,6 +159,37 @@ fn delegated_late_completion_cannot_be_erased_by_source_cpu_window_roll() {
 }
 
 #[test]
+fn delegated_wall_late_receipt_carries_broker_and_caller_without_double_charging_source() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 1, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    s.admit(spec(20, 1, 1, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    s.set_runnable(key(10), false, 0).unwrap();
+    let service = s
+        .dispatch_service(key(10), 0, layout(1), WINDOW_NS - 1_000_000, 1_000_000)
+        .unwrap()
+        .unwrap();
+    let source = s
+        .dispatch(1, layout(1), WINDOW_NS - 1_000_000, 1_000_000)
+        .unwrap()
+        .unwrap();
+    s.complete(service, 500_000, RunState::Blocked, WINDOW_NS + 1)
+        .unwrap();
+    s.complete(source, 500_000, RunState::Runnable, WINDOW_NS + 2)
+        .unwrap();
+    assert_eq!(s.cpu_window_usage(0, WINDOW_NS + 2), Ok((500_000, 0)));
+    assert_eq!(s.cpu_window_usage(1, WINDOW_NS + 2), Ok((500_000, 0)));
+    let next = s
+        .dispatch_service(key(10), 0, layout(1), WINDOW_NS + 2, 20_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.reserved_ns, 19_500_000);
+    assert_eq!(s.stats().quarantine_mask, 0);
+}
+
+#[test]
 fn scheduler_executes_minima_before_weighted_surplus() {
     let mut s = Scheduler::new();
     for (i, weight) in [1, 2, 4, 8].into_iter().enumerate() {
@@ -361,7 +392,7 @@ fn scheduler_independent_receipts_out_of_order_and_isolated_overrun() {
 }
 
 #[test]
-fn scheduler_crossed_window_is_quarantined_until_the_tail_is_accounted() {
+fn scheduler_wall_late_receipt_is_charged_in_both_windows_without_false_overrun() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();
     s.admit(spec(10, 1, 0, 0, 20_000_000), layout(1), 0)
@@ -370,14 +401,20 @@ fn scheduler_crossed_window_is_quarantined_until_the_tail_is_accounted() {
         .dispatch(0, layout(1), WINDOW_NS - 1_000_000, 1_000_000)
         .unwrap()
         .unwrap();
+    s.complete(d, 1_000_000, RunState::Runnable, WINDOW_NS + 1)
+        .unwrap();
+    assert_eq!(s.stats().quarantine_mask, 0);
+    assert_eq!(s.stats().overruns, 0);
+    assert_eq!(s.cpu_window_usage(0, WINDOW_NS + 1), Ok((1_000_000, 0)));
+    let carried = s
+        .dispatch(0, layout(1), WINDOW_NS + 1, 20_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(carried.reserved_ns, 19_000_000);
+    s.complete(carried, 0, RunState::Runnable, WINDOW_NS + 1)
+        .unwrap();
     assert_eq!(
-        s.complete(d, 1_000_000, RunState::Runnable, WINDOW_NS + 1),
-        Err(Error::Budget)
-    );
-    assert_eq!(s.recover_cpu(0, layout(2), WINDOW_NS + 1), Err(Error::Busy));
-    s.recover_cpu(0, layout(2), 2 * WINDOW_NS).unwrap();
-    assert_eq!(
-        s.dispatch(0, layout(2), 2 * WINDOW_NS, 1_000_000)
+        s.dispatch(0, layout(1), 2 * WINDOW_NS, 1_000_000)
             .unwrap()
             .unwrap()
             .reserved_ns,
@@ -1532,6 +1569,32 @@ fn pending_control_receipt_cannot_roll_away_or_release_a_crossed_window() {
     assert_eq!(s.cpu_window_usage(1, 102_000_000), Ok((3_000_000, 0)));
     assert_eq!(s.stats().quarantine_mask, 2);
     assert_eq!(s.stats().overruns, 1);
+}
+
+#[test]
+fn wall_late_control_receipt_is_carried_without_releasing_control_capacity() {
+    let mut s = Scheduler::new();
+    let c = s
+        .reserve_control(1, control_layout(1), 97_500_000, 2_500_000)
+        .unwrap()
+        .unwrap();
+    s.complete_control(c, 1_000_000, WINDOW_NS + 1_000_000)
+        .unwrap();
+    assert_eq!(s.stats().quarantine_mask, 0);
+    assert_eq!(s.stats().overruns, 0);
+    assert_eq!(
+        s.cpu_window_usage(1, WINDOW_NS + 1_000_000),
+        Ok((1_000_000, 0))
+    );
+    assert_eq!(
+        s.reserve_control(
+            1,
+            control_layout(1),
+            WINDOW_NS + 1_000_000,
+            CONTROL_BUDGET_NS,
+        ),
+        Ok(None)
+    );
 }
 
 #[test]
