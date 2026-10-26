@@ -15,10 +15,11 @@ const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
 // A fixed byte boundary remains observable even when a translated block does
 // not refresh the guest CPU counter until after the loop. DC ZVA amplified TCG
-// helpers, while a complete-page memset still retired 512 stores in one chain.
-// Eight 512-byte pieces retain the page's exact bytes and final barrier while
-// giving both 8 ms recovery and 2.5 ms ordinary turns a static instruction cap.
-const PRIVATE_CLEAR_SLICE_BYTES: usize = 512;
+// helpers, while even a 512-byte memset could retire 64 stores in one chain.
+// A 64-byte piece caps the translated loop at eight 64-bit stores. Repeated
+// pieces retain every page's exact bytes and final barrier while fitting both
+// the 8 ms recovery and 2.5 ms ordinary envelopes.
+const PRIVATE_CLEAR_SLICE_BYTES: usize = 64;
 const SERVICE_SLICE_NS: u64 = 100_000;
 // Mapping probes fault on their first EL0 memory instruction. Their timer is a
 // dead-context escape hatch, not inference time: leave enough wall headroom for

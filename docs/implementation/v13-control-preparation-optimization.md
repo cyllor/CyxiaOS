@@ -576,3 +576,14 @@ The full 615 host tests (two environment skips), 141 v1.3 tests (one
 historical-evidence skip), formatting and configured strict AArch64 Clippy
 pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-clear-512` passes both
 selected stack paths at 33,904/65,536 bytes. Linux timing remains required.
+
+Run `40411712557` crosses the exact build and stack gates, then fails before
+preparation on CPU1 sequence 3: a 512-byte phase-1 clear consumes 10,302,577 ns
+against the unchanged 8 ms recovery credit. Its empty preparation context
+confirms peer relevance is still not exercised. The fixed slice is therefore
+64 bytes, bounding the translated memset at eight 64-bit stores. The total
+nine-page clear, continuation, barrier, accounting and credits remain intact.
+The full 615 host tests (two environment skips), formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-clear-64` passes both selected stack paths
+at 33,904/65,536 bytes. Linux timing remains required.
