@@ -1920,7 +1920,7 @@ fn publish_baseline_traced(
         None
     } else {
         Some(Prefix {
-            start: at,
+            cpu_started: cyxia_arch_aarch64::timer::cpu_ticks(),
             attempt: crate::learning_evidence::attempt(
                 cost_owner,
                 learning::reward::CpuClass::Policy,

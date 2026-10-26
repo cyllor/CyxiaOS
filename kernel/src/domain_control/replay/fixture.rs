@@ -105,7 +105,7 @@ pub(super) fn poll(s: &mut State, token: Token) -> Result<(), Error> {
     }
     let value = root().fixture.issuing.ok_or(Error::Stale)?;
     let _cost = Prefix {
-        start: now(),
+        cpu_started: cyxia_arch_aarch64::timer::cpu_ticks(),
         attempt: crate::learning_evidence::attempt(
             fixed.target,
             learning::reward::CpuClass::Policy,
@@ -186,7 +186,7 @@ pub(super) fn stop(s: &mut State, token: Token) -> Result<bool, Error> {
         .ok_or(Error::Auth)?
         .stop_offer;
     let _cost = Prefix {
-        start: now(),
+        cpu_started: cyxia_arch_aarch64::timer::cpu_ticks(),
         attempt: crate::learning_evidence::attempt(
             fixed.target,
             learning::reward::CpuClass::Policy,
