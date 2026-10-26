@@ -221,21 +221,22 @@ fn publish_view(state: &State) {
     };
     let _ = READ_VIEW.publish(view);
 }
-/// C copies a small immutable snapshot and releases its separate short gate.
-/// It never holds the live service/UART/recovery gate while CPU0 is progressing.
+/// C projects a small result under the separate snapshot gate. It never copies
+/// the complete view or holds the live service/UART/recovery owner gate.
 fn read<R>(f: impl FnOnce(&ReadView) -> Result<R, Error>) -> Result<R, Error> {
     if !READY.load(Ordering::Acquire) {
         return Err(Error::NotReady);
     }
-    let view = READ_VIEW
-        .read()
+    READ_VIEW
+        .inspect(|view| {
+            let now = now_ns();
+            if now < view.at || now - view.at >= 50_000_000 {
+                return Err(Error::Busy);
+            }
+            f(view)
+        })
         .map_err(|_| Error::Busy)?
-        .ok_or(Error::NotReady)?;
-    let now = now_ns();
-    if now < view.at || now - view.at >= 50_000_000 {
-        return Err(Error::Busy);
-    }
-    f(&view)
+        .ok_or(Error::NotReady)?
 }
 fn now_ns() -> u64 {
     crate::domain_platform::now_ns()

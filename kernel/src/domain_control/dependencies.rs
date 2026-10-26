@@ -1,6 +1,6 @@
 //! Admission reads never acquire the coordinator or policy gate. The resource
 //! owner still validates its own initialized baseline, ownership and real use.
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cyxia_prototype::{
     domains::{Error, ObjectKey},
     policy::{ExecutionState, Prerequisite, dependency_allowed},
@@ -29,12 +29,16 @@ impl Entry {
 }
 pub struct AdmissionView {
     sequence: AtomicU64,
+    // Publication slots never move. Retain a monotonic high watermark so a
+    // one-entry dependency check does not scan 512 permanently empty rows.
+    used: AtomicUsize,
     entries: [Entry; CAPACITY],
 }
 impl AdmissionView {
     pub const fn new() -> Self {
         Self {
             sequence: AtomicU64::new(0),
+            used: AtomicUsize::new(0),
             entries: [const { Entry::empty() }; CAPACITY],
         }
     }
@@ -66,6 +70,7 @@ impl AdmissionView {
             },
             Ordering::Relaxed,
         );
+        self.used.fetch_max(slot + 1, Ordering::Relaxed);
         self.sequence.fetch_add(1, Ordering::Release);
     }
     /// Clear only after the real owner proves the terminal object is dead.
@@ -86,8 +91,12 @@ impl AdmissionView {
         if before & 1 != 0 {
             return Err(Error::Busy);
         }
+        let used = self.used.load(Ordering::Relaxed);
+        if used > CAPACITY {
+            return Err(Error::Conflict);
+        }
         let mut result = Ok(0);
-        for e in &self.entries {
+        for e in &self.entries[..used] {
             let state = e.state.load(Ordering::Relaxed);
             if state == 0
                 || e.domain.load(Ordering::Relaxed) != u64::from(prerequisite.domain)

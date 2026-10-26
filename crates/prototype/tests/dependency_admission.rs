@@ -39,3 +39,15 @@ fn references_bind_domain_object_and_generation_without_invented_edges() {
     table.retire(0);
     assert_eq!(table.admit(key(1, 1), 8, 1), Ok(0));
 }
+
+#[test]
+fn sparse_publication_high_watermark_keeps_every_exact_slot_visible() {
+    let table = AdmissionView::new();
+    table.publish(7, key(8, 1), 11, 200, ExecutionState::Applied);
+    table.publish(1, key(2, 3), 12, 300, ExecutionState::Applied);
+    assert_eq!(table.admit(key(8, 1), 8, 199), Ok(11));
+    assert_eq!(table.admit(key(2, 3), 10, 299), Ok(12));
+    table.retire(1);
+    assert_eq!(table.admit(key(2, 3), 8, 299), Ok(0));
+    assert_eq!(table.admit(key(8, 1), 10, 199), Ok(11));
+}

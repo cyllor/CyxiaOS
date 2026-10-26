@@ -278,6 +278,22 @@ pass. Exact local build `/tmp/cyxia-prototype.u002qv` is `BUILT_NOT_RUN`; both
 selected stack paths remain 37,984/65,536 bytes. Native timing remains
 required.
 
+Run `40381922994` confirms conditional `SEV` removed the three task-credit
+faults and progressed to normal preparation. CPU1 sequence 73 then used
+13.057/2.5 ms before candidate construction: the current-action callback took
+approximately 4.840 ms and dependency preparation approximately 2.630 ms.
+The dependency admission view scanned all 512 entries for every lookup even
+though publication slots are stable and almost all rows are unused. It now
+publishes a seqlock-covered monotonic high watermark and scans only that prefix;
+a sparse-slot regression proves later entries remain visible across retirement.
+The service current-action reader also projects under its immutable snapshot
+gate rather than copying the complete view. Error semantics, exact object and
+generation matching, seqlock recheck and dependency authorization are
+unchanged. Focused dependency/service tests and configured AArch64 strict
+Clippy pass. Exact local build `/tmp/cyxia-prototype.dMmVh7` is `BUILT_NOT_RUN`;
+both selected stack paths remain 37,984/65,536 bytes. Native timing remains
+required.
+
 Run `40379550634` moved the next probe fault to the separate phase-8 return
 bookkeeping: CPU1 sequence 8 used 10.007/8 ms, with no active job or
 preparation markers. The only cross-core exclusive operation in that path was
