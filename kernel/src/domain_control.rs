@@ -74,6 +74,43 @@ fn clear_preparation_context() {
         word.store(0, Ordering::Relaxed);
     }
 }
+fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started: u64) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let source = match descriptor.target_source {
+        TargetSource::Tasks => 1,
+        TargetSource::Services => 2,
+        TargetSource::Network => 3,
+        TargetSource::Storage => 4,
+        TargetSource::Platform => 5,
+    };
+    let base = (cpu - 1) * 8;
+    for (offset, value) in [
+        family as u64 + 1,
+        u64::from(descriptor.domain),
+        u64::from(descriptor.kind),
+        source,
+        ordinal as u64,
+        timer::cpu_ticks(),
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        DOMAIN_PREPARATION_CONTEXT.0[base + offset].store(value, Ordering::Relaxed);
+    }
+    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(started, Ordering::Release);
+}
+fn preparation_lookup_finished() {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let base = (cpu - 1) * 8;
+    DOMAIN_PREPARATION_CONTEXT.0[base + 6].store(timer::cpu_ticks(), Ordering::Release);
+}
 fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, started: u64) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
@@ -1164,14 +1201,17 @@ fn next_normal(
         // owner view. A retry must never turn owner contention into absence,
         // and the exact lookahead must not advance onto fallback ordinal zero.
         let mut targets = [None; 2];
-        read_target_batch(
+        preparation_lookup(index, f, ordinal, wall_started);
+        let target_result = read_target_batch(
             f.target_source,
             &[
                 target_batch::Query::fallback(f.domain, f.kind, ordinal),
                 target_batch::Query::exact(f.domain, f.kind, ordinal + 1),
             ],
             &mut targets,
-        )?;
+        );
+        preparation_lookup_finished();
+        target_result?;
         let target = targets[0];
         s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {

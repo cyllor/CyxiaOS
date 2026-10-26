@@ -516,3 +516,17 @@ AArch64 strict Clippy also pass. Exact local build
 `/tmp/cyxia-prototype.lcqCJ7/build-clear` is `BUILT_NOT_RUN`, contains no
 `DC ZVA`, and passes both selected stack paths at 33,888/65,536 bytes with the
 unchanged 4,096-byte reserve. Linux replay remains required.
+
+Run `40405800984` confirms the ordinary-store clear crosses all phase-1 work,
+then fails later at CPU1 sequence 137 in normal preparation: phase 3 consumes
+8,993,958 ns against 2.5 ms, reaches only coarse marker 0, and has no active
+record or target context. The existing context was published only after target
+resolution, leaving this precise lookup failure unattributed. The lookup now
+publishes its family, domain, kind, source, ordinal and before/after per-vCPU
+counter into the existing stopped-failure evidence bank; a successful lookup
+is still overwritten by the established target context. This is diagnostic
+only and does not change control work or authority. Linux replay is required.
+The full 615 host tests pass with two environment skips, including 141 v1.3
+tests with one historical-evidence skip; formatting, configured strict AArch64
+Clippy and exact build `/tmp/cyxia-prototype.lcqCJ7/build-lookup` pass. Both
+selected stack paths remain 33,888/65,536 bytes with the fixed reserve.

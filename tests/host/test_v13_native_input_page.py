@@ -17,6 +17,19 @@ class NativeInputPage(unittest.TestCase):
         encoder = (ROOT / "kernel/src/domain_control.rs").read_text()
         self.assertIn("input.fill(0);", encoder)
 
+    def test_failed_target_lookup_retains_attributable_context(self):
+        source = (ROOT / "kernel/src/domain_control.rs").read_text()
+        lookup = source.index("preparation_lookup(index, f, ordinal, wall_started);")
+        target = source.index("let target_result = read_target_batch", lookup)
+        finished = source.index("preparation_lookup_finished();", target)
+        checked = source.index("target_result?;", finished)
+
+        self.assertLess(lookup, target)
+        self.assertLess(target, finished)
+        self.assertLess(finished, checked)
+        self.assertIn("descriptor.target_source", source)
+        self.assertIn("timer::cpu_ticks()", source[source.index("fn preparation_lookup"):target])
+
 
 if __name__ == "__main__":
     unittest.main()
