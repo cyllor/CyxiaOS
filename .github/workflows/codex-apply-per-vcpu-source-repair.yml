@@ -56,7 +56,6 @@ jobs:
               raise SystemExit('expected exactly one stale baseline Prefix clock')
           replay.write_text(replay_text.replace(old_replay, new_replay))
           PY
-          cargo fmt --all
           git diff --check
           test "$(git diff --name-only | sort | tr '\n' ' ')" = \
             "kernel/src/domain_control/replay.rs kernel/src/domain_control/replay/fixture.rs "
@@ -81,7 +80,11 @@ jobs:
       - name: Run formatting and kernel compile gates
         run: |
           set -euo pipefail
+          cargo fmt --all
+          git diff --check
           cargo fmt --all -- --check
+          test "$(git diff --name-only | sort | tr '\n' ' ')" = \
+            "kernel/src/domain_control/replay.rs kernel/src/domain_control/replay/fixture.rs "
           cargo clippy --locked --offline \
             -p cyxia-kernel \
             --target aarch64-unknown-none-softfloat \
