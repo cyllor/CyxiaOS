@@ -44,13 +44,26 @@ static LOCK: AtomicBool = AtomicBool::new(false);
 
 fn locked<R>(f: impl FnOnce(&mut state::Capture<EVENTS, TASKS>) -> R) -> R {
     while LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        // A capture update is short but its owner can be descheduled by the
+        // host. Sleeping in the architectural event state prevents another
+        // paid vCPU from turning that wall delay into charged spin execution.
+        // Strong CAS is required: a spurious weak-CAS failure with no owner
+        // would otherwise sleep without a corresponding unlock event.
+        unsafe {
+            core::arch::asm!("wfe", options(nostack));
+        }
     }
     let result = f(unsafe { &mut *A02_CAPTURE.0.get() });
     LOCK.store(false, Ordering::Release);
+    // Publish the completed protected update before waking every possible
+    // contender. A waiter executes WFE without clearing its event register,
+    // so an unlock between failed CAS and WFE cannot be lost.
+    unsafe {
+        core::arch::asm!("dsb ishst", "sev", options(nostack));
+    }
     result
 }
 /// CPU0, before any gate can dispatch an EL0 context.

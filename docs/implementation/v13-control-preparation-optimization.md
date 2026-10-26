@@ -230,3 +230,22 @@ configured AArch64 strict Clippy. Exact local build
 `/tmp/cyxia-prototype.PbxIPh` is `BUILT_NOT_RUN`; both selected preparation
 paths pass at 37,984/65,536 bytes with the 4,096-byte exception reserve. Native
 timing remains required.
+
+Run `40376975641` confirms the dense-prefix change removed the boot-probe
+failure and the hardware-hashed ordinary preparation was no longer the first
+fault. It instead exposed simultaneous cold EL0 overruns on CPU0 and CPU3:
+3.903/2.5 ms and 12.718/10 ms. Both entries share the optional A02 capture
+lock. Its prior unbounded spin converted time spent waiting for a descheduled
+lock owner into paid translated execution on every contender.
+
+A02 capture contention now uses strong compare-exchange followed by AArch64
+`WFE`; release publishes the protected state with release ordering, `DSB
+ISHST`, then broadcasts `SEV`. Strong CAS prevents a spurious failure from
+sleeping when no owner exists, while the event-register rule prevents an
+unlock between failed CAS and WFE from being lost. Capture records remain
+serialized and none are skipped. A host structural regression pins the strong
+CAS/WFE/release/DSB/SEV protocol; all thirteen A02 host tests (one historical
+artifact skip), formatting and configured AArch64 strict Clippy pass. Native
+build `/tmp/cyxia-prototype.sNuH59` is `BUILT_NOT_RUN`; both selected paths pass
+at 37,984/65,536 bytes with the 4,096-byte exception reserve. Native timing is
+still required.
