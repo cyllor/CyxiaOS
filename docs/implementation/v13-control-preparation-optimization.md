@@ -371,3 +371,16 @@ exact two-node build `/tmp/cyxia-prototype.4ohiQN` pass locally. Removing the
 redundant stack page reduces both selected preparation peaks from 37,968 to
 33,872 bytes out of 65,536, with the unchanged 4,096-byte exception reserve.
 Patched-QEMU timing is still required.
+
+Run `40390634770` crossed the prior empty-preparation failure but stopped in a
+separate first private-clear turn: CPU1 sequence 2 used 13.273 ms against the
+unchanged 8 ms setup credit, phase 1 with no preparation or active job. The
+clear loop attempted to yield after 0.5 ms by sampling the patched guest CPU
+counter inside a translated loop. That is not a static work bound: a translated
+block may retire before the counter observation exposes the limit. Each paid
+clear turn is now capped at exactly one 4 KiB private page, independent of any
+in-loop clock refresh. The full nine-page clear still completes incrementally;
+each page retains its final `DSB ISH`, actual CPU settlement and next-offset
+publication. The focused source regressions, configured AArch64 strict Clippy
+and exact two-node build `/tmp/cyxia-prototype.RwELJY` pass; both selected
+preparation peaks remain 33,872/65,536 bytes. Patched-QEMU timing is required.

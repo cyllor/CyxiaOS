@@ -13,7 +13,10 @@ const WALL_NS: u64 = 50_000_000;
 const PROBE_WALL_NS: u64 = 1_000_000_000;
 const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
-const PRIVATE_CLEAR_SLICE_NS: u64 = 500_000;
+// A fixed page boundary remains observable even when a translated block does
+// not refresh the guest CPU counter until after the loop. One page is safely
+// bounded by the probe's unchanged 8 ms recovery credit.
+const PRIVATE_CLEAR_SLICE_BYTES: usize = 4096;
 const FALLBACK_ZERO_BLOCK_BYTES: usize = 64;
 const SERVICE_SLICE_NS: u64 = 100_000;
 // Mapping probes fault on their first EL0 memory instruction. Their timer is a
@@ -72,10 +75,6 @@ pub(super) fn ns(ticks: u64) -> u64 {
 pub(super) fn ticks(ns: u64) -> u64 {
     ((u128::from(ns) * u128::from(timer::frequency())) / 1_000_000_000).min(u128::from(u64::MAX))
         as u64
-}
-fn cpu_ticks_for_ns(ns: u64) -> u64 {
-    ((u128::from(ns) * u128::from(timer::cpu_frequency())) / 1_000_000_000)
-        .min(u128::from(u64::MAX)) as u64
 }
 #[derive(Clone, Copy)]
 struct ChargeStart {
@@ -387,20 +386,17 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         .native
         .phase(if worker.native.probing { 1 } else { 4 });
     let started = timer::cpu_ticks();
-    let slice_ticks = cpu_ticks_for_ns(PRIVATE_CLEAR_SLICE_NS).max(1);
     let zero_block_bytes = private_zero_block_bytes();
     let block_bytes = zero_block_bytes.unwrap_or(FALLBACK_ZERO_BLOCK_BYTES);
     let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
-    while offset < PRIVATE_CLEAR_BYTES {
+    let slice_end = offset
+        .saturating_add(PRIVATE_CLEAR_SLICE_BYTES)
+        .min(PRIVATE_CLEAR_BYTES);
+    while offset < slice_end {
         let within = offset % 4096;
-        let bytes = block_bytes
-            .min(4096 - within)
-            .min(PRIVATE_CLEAR_BYTES - offset);
+        let bytes = block_bytes.min(4096 - within).min(slice_end - offset);
         clear_private_block(slot, offset, bytes, zero_block_bytes == Some(bytes));
         offset += bytes;
-        if timer::cpu_ticks().saturating_sub(started) >= slice_ticks {
-            break;
-        }
     }
     unsafe {
         core::arch::asm!("dsb ish", options(nostack));
