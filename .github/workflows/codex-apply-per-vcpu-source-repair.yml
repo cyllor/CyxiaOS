@@ -1,0 +1,111 @@
+name: Apply per-vCPU source repair
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.1-complete-prototype
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: apply-per-vcpu-source-repair-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-validate:
+    if: "${{ startsWith(github.event.head_commit.message, 'diagnostic: stage direct per-vcpu source repair') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      TARGET_BRANCH: codex/cyxiaos-v0.1-complete-prototype
+      STAGING_DIR: .github/codex/staging/per-vcpu-repair
+      PATCH_B64_SHA256: 78ca6b355e99b139ae81a4c5f9da85e0fd0418b48aaf6aa8d2eb26091aa749a9
+      PATCH_GZ_SHA256: d7fa9fd63148147efe6bf3549ac6991c8df24ce957bc0497fe5bfc2634dcb390
+      PATCH_SHA256: 53794f5f7da8db7d6fcd967963bdfb1220f7d066d10f710d6a8dd6dcc028403f
+    steps:
+      - name: Check out writable staging commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct and verify exact source patch
+        run: |
+          set -euo pipefail
+          b64="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff.gz.b64"
+          gzip_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff.gz"
+          patch_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff"
+          cat "$STAGING_DIR"/part-* > "$b64"
+          test "$(wc -c < "$b64")" -eq 60320
+          echo "$PATCH_B64_SHA256  $b64" | sha256sum --check
+          base64 --decode "$b64" > "$gzip_file"
+          echo "$PATCH_GZ_SHA256  $gzip_file" | sha256sum --check
+          gzip -dc "$gzip_file" > "$patch_file"
+          echo "$PATCH_SHA256  $patch_file" | sha256sum --check
+          git apply --check "$patch_file"
+          git apply "$patch_file"
+          git diff --check
+
+      - name: Remove corrupt and one-shot staging inputs
+        run: |
+          set -euo pipefail
+          rm -f \
+            .github/codex/patches/110-per-vcpu-accounting-repair.materialization.log \
+            .github/codex/patches/110-per-vcpu-accounting-repair.materialized
+          rm -rf "$STAGING_DIR"
+          rm -f .github/workflows/codex-apply-per-vcpu-source-repair.yml
+          git diff --check
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --no-self-update \
+            --component rustfmt \
+            --component clippy \
+            --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+
+      - name: Format and run native compile gates
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git diff --check
+          cargo fmt --all -- --check
+          cargo clippy --locked --offline \
+            -p cyxia-kernel \
+            --target aarch64-unknown-none-softfloat \
+            --features smp-selftest \
+            -- -D warnings
+
+      - name: Run workspace and evidence tests
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --workspace --exclude cyxia-kernel
+          python3 -B tools/prepare_host_tests.py --fetch
+          python3 -B -m unittest discover -s tests/host -p 'test_*.py' -v
+          python3 -B -m unittest discover -s tools -p 'test_*.py' -v
+
+      - name: Commit verified repair atomically
+        run: |
+          set -euo pipefail
+          test -z "$(find .github/codex/staging -type f -print -quit 2>/dev/null || true)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix: account native execution per vCPU'
+          git push origin "HEAD:$TARGET_BRANCH"
+
+      - name: Dispatch authoritative validation and native replay
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh workflow run codex-source-snapshot.yml --ref "$TARGET_BRANCH"
