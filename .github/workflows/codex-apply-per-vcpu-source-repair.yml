@@ -63,14 +63,19 @@ jobs:
           git apply "$network_fix"
           git diff --check
 
-      - name: Remove corrupt and one-shot staging inputs
+      - name: Remove staging inputs and preserve repository workflows
         run: |
           set -euo pipefail
           rm -f \
             .github/codex/patches/110-per-vcpu-accounting-repair.materialization.log \
             .github/codex/patches/110-per-vcpu-accounting-repair.materialized
           rm -rf "$STAGING_DIR"
-          rm -f .github/workflows/codex-apply-per-vcpu-source-repair.yml
+          # The workflow token has contents:write but GitHub intentionally blocks
+          # workflow-file mutation without the separate workflows permission.
+          # Keep every workflow byte-identical to this triggering commit; only
+          # verified source, tests and non-workflow staging cleanup are committed.
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          test -z "$(git diff --name-only -- .github/workflows)"
           git diff --check
 
       - name: Install pinned Rust toolchain
@@ -108,9 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           test -z "$(find .github/codex/staging -type f -print -quit 2>/dev/null || true)"
+          test -z "$(git diff --name-only -- .github/workflows)"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
+          test -z "$(git diff --cached --name-only -- .github/workflows)"
           git diff --cached --check
           git commit -m 'fix: account native execution per vCPU'
           git push origin "HEAD:$TARGET_BRANCH"
