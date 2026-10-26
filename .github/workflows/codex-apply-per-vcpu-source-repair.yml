@@ -39,7 +39,10 @@ jobs:
           b64="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff.gz.b64"
           gzip_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff.gz"
           patch_file="$RUNNER_TEMP/cyxiaos-pmu-source-repair.diff"
-          cat "$STAGING_DIR"/part-* > "$b64"
+          {
+            cat "$STAGING_DIR"/part-*
+            printf '\n'
+          } > "$b64"
           test "$(wc -c < "$b64")" -eq 60320
           echo "$PATCH_B64_SHA256  $b64" | sha256sum --check
           base64 --decode "$b64" > "$gzip_file"
