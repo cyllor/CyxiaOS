@@ -252,11 +252,24 @@ impl CandidateSet {
         self.recompute_hash_scoped(self.canary)
     }
     fn recompute_hash_scoped(&self, canary: Option<CanaryPermit>) -> Result<[u8; 32], Error> {
-        // The maximum canonical representation is still bounded independently
-        // of the in-memory CandidateSet layout: a 150-byte header, 32 maximum
-        // 164-byte candidates and the optional 121-byte Canary scope.
-        const CANONICAL_CAPACITY: usize = 150 + MAX_CANDIDATES * 164 + 121;
-        let mut canonical = [0; CANONICAL_CAPACITY];
+        // Select the smallest fixed scratch tier that can hold the exact
+        // bounded stream. The common single-candidate case no longer clears a
+        // maximum-size 5.5 KiB buffer before hashing its ~314 useful bytes.
+        let required = 150 + self.count * 164 + usize::from(canary.is_some()) * 121;
+        match required {
+            0..=512 => self.recompute_hash_bounded::<512>(canary),
+            513..=1024 => self.recompute_hash_bounded::<1024>(canary),
+            1025..=2048 => self.recompute_hash_bounded::<2048>(canary),
+            2049..=4096 => self.recompute_hash_bounded::<4096>(canary),
+            _ => self.recompute_hash_bounded::<{ 150 + MAX_CANDIDATES * 164 + 121 }>(canary),
+        }
+    }
+    #[inline(never)]
+    fn recompute_hash_bounded<const N: usize>(
+        &self,
+        canary: Option<CanaryPermit>,
+    ) -> Result<[u8; 32], Error> {
+        let mut canonical = [0; N];
         let mut used = 0;
         append_canonical(&mut canonical, &mut used, b"CYXIA_CANDIDATES_V1.3\0")?;
         for v in [
@@ -400,13 +413,59 @@ enum RegistrationPurpose {
     Candidates,
     Baseline,
 }
+
+// Every validated Action fits in this private canonical word: five domain
+// bits, two kind bits, a 32-bit primary value and a 16-bit secondary value.
+// RegisteredSet needs only exact action recovery, not the enum's in-memory
+// discriminant. Keeping its bounded action array compact makes registration a
+// small copy and keeps the retained table out of the native preparation path's
+// cache working set.
+const fn pack_registered_action(action: Action) -> u64 {
+    let (domain, kind, a, b) = action.order();
+    (domain as u64) | ((kind as u64) << 5) | (a << 8) | (b << 40)
+}
+
+const fn unpack_registered_action(packed: u64) -> Option<Action> {
+    let domain = (packed & 0x1f) as u16;
+    let kind = ((packed >> 5) & 0x03) as u16;
+    let a = ((packed >> 8) & 0xffff_ffff) as u32;
+    let b = ((packed >> 40) & 0xffff) as u16;
+    match (domain, kind) {
+        (1, 1) => Some(Action::CpuWeight(a as u16)),
+        (1, 2) => Some(Action::ControlSet(a as u64)),
+        (2, 1) => Some(Action::SpawnTokens(a as u16)),
+        (3, 1) => Some(Action::Cache { pages: a, batch: b }),
+        (4, 1) => Some(Action::Filesystem {
+            readahead: a as u16,
+            flush: b,
+        }),
+        (5, 1) => Some(Action::Ipc {
+            budget: a as u16,
+            batch: b as u8,
+        }),
+        (6, 1) => Some(Action::IrqTarget(a as u16)),
+        (7, 1) => Some(Action::SoftCoalesce(a as u16)),
+        (8, 1) => Some(Action::ServiceBatch(a as u8)),
+        (9, 1) => Some(Action::IoShare(a as u16)),
+        (10, 1) => Some(Action::TxBatch(a as u8)),
+        (11, 1) => Some(Action::NotifyBatch(a as u8)),
+        (12, 1) => Some(Action::UnauthRate(a as u16)),
+        (13, 1) => Some(Action::BackgroundBudget(a as u16)),
+        (14, 1) => Some(Action::RecoveryRecipe(a as u16)),
+        (15, 1) => Some(Action::ConsoleBatch(a as u16)),
+        (16, 1) => Some(Action::OfferCpu(a as u16)),
+        (16, 2) => Some(Action::Placement(a as u16)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct RegisteredSet {
     pub snapshot: Snapshot,
     pub target: ObjectKey,
     pub model: ModelBinding,
     pub hash: [u8; 32],
-    actions: [Option<Action>; 32],
+    actions: [u64; MAX_CANDIDATES],
     count: usize,
     canary: Option<CanaryPermit>,
     purpose: RegistrationPurpose,
@@ -416,7 +475,7 @@ impl RegisteredSet {
         if index >= self.count {
             None
         } else {
-            self.actions[index]
+            unpack_registered_action(self.actions[index])
         }
     }
     pub const fn canary_permit(&self) -> Option<CanaryPermit> {
@@ -426,7 +485,7 @@ impl RegisteredSet {
     /// baseline executor may authorize this exact registered action.
     pub fn baseline_action(&self) -> Option<Action> {
         if self.purpose == RegistrationPurpose::Baseline {
-            self.actions[0]
+            self.action(0)
         } else {
             None
         }
@@ -455,9 +514,8 @@ impl RegisteredSet {
                     return Err(Error::Stale);
                 }
                 if self.count == 0
-                    || self.actions[..self.count]
-                        .iter()
-                        .any(|action| !matches!(action, Some(Action::ConsoleBatch(_))))
+                    || (0..self.count)
+                        .any(|index| !matches!(self.action(index), Some(Action::ConsoleBatch(_))))
                 {
                     return Err(Error::Auth);
                 }
@@ -561,6 +619,11 @@ pub struct Registry {
     plan_high: u64,
     decision_high: u64,
     registered: [Option<RegisteredSet>; MAX_REGISTERED],
+    // Registration hashes are scanned on every candidate commit and decision
+    // lookup. Keep them contiguous instead of touching one cache line from
+    // each much larger RegisteredSet.
+    registered_hashes: [[u8; 32]; MAX_REGISTERED],
+    registered_count: usize,
     registered_cursor: usize,
     active: [Option<StoredPlan>; MAX_PENDING],
     history: [Option<StoredPlan>; TERMINAL_HISTORY],
@@ -587,6 +650,8 @@ impl Registry {
             plan_high: 0,
             decision_high: 0,
             registered: [None; MAX_REGISTERED],
+            registered_hashes: [[0; 32]; MAX_REGISTERED],
+            registered_count: 0,
             registered_cursor: 0,
             active: [None; MAX_PENDING],
             history: [None; TERMINAL_HISTORY],
@@ -753,8 +818,8 @@ impl Registry {
         h.update((len as u16).to_le_bytes());
         h.update(&payload[..len]);
         let hash = h.finalize().into();
-        let mut actions = [None; 32];
-        actions[0] = Some(action);
+        let mut actions = [0; MAX_CANDIDATES];
+        actions[0] = pack_registered_action(action);
         self.store_registered(RegisteredSet {
             snapshot,
             target,
@@ -803,9 +868,9 @@ impl Registry {
         hash: [u8; 32],
         canary: Option<CanaryPermit>,
     ) -> RegisteredSet {
-        let mut actions = [None; 32];
+        let mut actions = [0; MAX_CANDIDATES];
         for (i, c) in set.iter().enumerate() {
-            actions[i] = Some(c.action);
+            actions[i] = pack_registered_action(c.action);
         }
         RegisteredSet {
             snapshot: set.snapshot,
@@ -819,12 +884,8 @@ impl Registry {
         }
     }
     fn store_registered(&mut self, registered: RegisteredSet) -> Result<(), Error> {
-        if let Some(old) = self
-            .registered
-            .iter()
-            .flatten()
-            .find(|old| old.hash == registered.hash)
-        {
+        if let Some(index) = self.registered_index(registered.hash) {
+            let old = self.registered[index].as_ref().ok_or(Error::Conflict)?;
             return if old.canary == registered.canary
                 && old.model == registered.model
                 && old.purpose == registered.purpose
@@ -834,17 +895,34 @@ impl Registry {
                 Err(Error::Conflict)
             };
         }
-        self.registered[self.registered_cursor] = Some(registered);
+        let slot = self.registered_cursor;
+        self.registered_hashes[slot] = registered.hash;
+        self.registered[slot] = Some(registered);
         self.registered_cursor = (self.registered_cursor + 1) % MAX_REGISTERED;
+        if self.registered_count < MAX_REGISTERED {
+            self.registered_count += 1;
+        }
         Ok(())
+    }
+    fn registered_index(&self, hash: [u8; 32]) -> Option<usize> {
+        self.registered_hashes[..self.registered_count]
+            .iter()
+            .position(|old| *old == hash)
+    }
+    fn registered_set_by_hash(&self, hash: [u8; 32]) -> Option<&RegisteredSet> {
+        self.registered_index(hash)
+            .and_then(|index| self.registered[index].as_ref())
+    }
+    fn clear_registrations(&mut self) {
+        self.registered.fill(None);
+        self.registered_hashes.fill([0; 32]);
+        self.registered_count = 0;
+        self.registered_cursor = 0;
     }
     /// Resolve only an exact retained candidate-set registration. This read
     /// does not authorize publication or bypass the final model/permit check.
     pub fn registered_action(&self, hash: [u8; 32], index: usize) -> Result<Action, Error> {
-        self.registered
-            .iter()
-            .flatten()
-            .find(|set| set.hash == hash)
+        self.registered_set_by_hash(hash)
             .ok_or(Error::Stale)?
             .action(index)
             .ok_or(Error::Range)
@@ -884,7 +962,7 @@ impl Registry {
         self.publisher = next;
         self.plan_high = 0;
         self.decision_high = 0;
-        self.registered.fill(None);
+        self.clear_registrations();
         Ok(())
     }
     fn records(&self) -> impl Iterator<Item = &StoredPlan> {
@@ -965,10 +1043,7 @@ impl Registry {
         Ok(receipt)
     }
     fn registered_decision(&self, decision: Decision) -> Result<&RegisteredSet, Error> {
-        self.registered
-            .iter()
-            .flatten()
-            .find(|set| set.hash == decision.envelope.candidate_set_hash)
+        self.registered_set_by_hash(decision.envelope.candidate_set_hash)
             .ok_or(Error::Stale)
     }
     fn model_scope(&self, plan: &Plan, now: u64) -> Result<ModelBinding, Error> {
@@ -1238,10 +1313,7 @@ impl Registry {
         published_ns: u64,
     ) -> Result<PolicyStamp, Error> {
         let set = self
-            .registered
-            .iter()
-            .flatten()
-            .find(|s| s.hash == decision.envelope.candidate_set_hash)
+            .registered_set_by_hash(decision.envelope.candidate_set_hash)
             .ok_or(Error::Stale)?;
         PolicyStamp::for_action(
             decision.action,
@@ -1264,7 +1336,7 @@ impl PreparedModelChange<'_> {
     }
     pub fn commit(self) -> ModelBinding {
         self.registry.model = self.next;
-        self.registry.registered.fill(None);
+        self.registry.clear_registrations();
         // Previously published plans retain their original model and receipts.
         // UNKNOWN obligations are unaffected by this admission-only switch.
         self.next
@@ -1286,4 +1358,49 @@ pub fn dependency_allowed(prerequisite: u16, consumer: u16) -> bool {
         (prerequisite, consumer),
         (3, 4) | (9, 4) | (5, 8) | (5, 10) | (13, 1)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack_registered_action, unpack_registered_action};
+    use crate::domains::Action;
+
+    #[test]
+    fn compact_registration_round_trips_every_action_shape() {
+        let actions = [
+            Action::CpuWeight(8),
+            Action::ControlSet(14),
+            Action::SpawnTokens(4),
+            Action::Cache {
+                pages: 4096,
+                batch: 64,
+            },
+            Action::Filesystem {
+                readahead: 16,
+                flush: 32,
+            },
+            Action::Ipc {
+                budget: 128,
+                batch: 16,
+            },
+            Action::IrqTarget(3),
+            Action::SoftCoalesce(1000),
+            Action::ServiceBatch(8),
+            Action::IoShare(750),
+            Action::TxBatch(16),
+            Action::NotifyBatch(8),
+            Action::UnauthRate(32),
+            Action::BackgroundBudget(400),
+            Action::RecoveryRecipe(2),
+            Action::ConsoleBatch(64),
+            Action::OfferCpu(1000),
+            Action::Placement(2),
+        ];
+        for action in actions {
+            assert_eq!(
+                unpack_registered_action(pack_registered_action(action)),
+                Some(action)
+            );
+        }
+    }
 }

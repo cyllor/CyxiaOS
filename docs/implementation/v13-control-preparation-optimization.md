@@ -441,3 +441,33 @@ workspace, 613 host tests (two environment skips), 67 tool tests, 139 v1.3
 host tests (one historical-evidence skip), strict AArch64 Clippy and exact
 two-node build `/tmp/cyxia-prototype.fdQQtL` pass. Both independently recomputed
 selected stack peaks remain 34,080/65,536 bytes. Patched-QEMU replay is pending.
+
+Run `40396666561` confirms both preceding task-credit corrections: neither the
+network service nor the builtin worker faulted, and the first failure returned
+to a single CPU1 CoreSet preparation. Sequence 114 used 3,692,619 ns of its
+unchanged 2,500,000 ns reservation with no preemption. Per-vCPU detail markers
+attribute about 0.629 ms to one-candidate construction/hash and 0.375 ms to
+registration; repeated service projection, held-tier alternate validation and
+diagnostic release stores also remained in the charged prefix. Every
+substantive static, exact-build and stack gate passed; artifact upload failed
+independently on the existing repository quota.
+
+The follow-up keeps all v1.3 budgets and candidate bytes unchanged. CoreSet
+current action and observation now come from one immutable service snapshot.
+A frozen or not-yet-held numerical tier validates only its current action,
+because the alternate is unconditionally discarded later in the same turn.
+Per-CPU detail markers use relaxed stores; their stopped failure snapshot and
+the credit record remain the publication boundary. Canonical hashing selects
+the smallest fixed scratch tier that contains the exact stream, so the common
+single candidate no longer clears 5.5 KiB to hash about 314 bytes. Retained
+actions use a private lossless 64-bit representation, and registration hashes
+have a contiguous bounded index instead of scanning one cache line from each
+large retained set. All eighteen action shapes round-trip exactly; a 65-entry
+regression proves the index follows the existing 64-slot eviction order and is
+cleared with model or publisher authority changes. The full non-kernel Rust
+workspace, 613 host tests (two environment skips), 67 tool tests, 139 v1.3
+host tests (one historical-evidence skip), formatting and strict AArch64
+Clippy pass. Exact local build `/tmp/cyxia-prototype.In9GVv` is
+`BUILT_NOT_RUN`; both independently checked selected stack paths peak at
+33,888/65,536 bytes with the unchanged 4,096-byte exception reserve. Patched
+Linux QEMU timing remains required.

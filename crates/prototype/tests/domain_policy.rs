@@ -185,6 +185,46 @@ fn registered_action_requires_retained_exact_hash_and_bounded_index() {
 }
 
 #[test]
+fn compact_registration_index_tracks_exact_ring_eviction() {
+    let mut registry = Registry::new(11, publisher(), binding()).unwrap();
+    let mut hashes = Vec::new();
+    for sequence in 1..=(MAX_REGISTERED as u64 + 1) {
+        let choices = [Candidate {
+            action: Action::CpuWeight(2),
+            features: RawFeatures::default(),
+        }];
+        let set = CandidateSet::new(
+            Snapshot {
+                sequence,
+                taken_ns: 10 + sequence,
+                ledger_generation: 3,
+                core_generation: 2,
+            },
+            ObjectKey {
+                id: 1,
+                generation: 1,
+            },
+            binding(),
+            &choices,
+            Some(Action::CpuWeight(2)),
+        )
+        .unwrap();
+        hashes.push(set.hash());
+        registry.register(publisher(), &set).unwrap();
+    }
+
+    assert_eq!(registry.registered_action(hashes[0], 0), Err(Error::Stale));
+    assert_eq!(
+        registry.registered_action(hashes[1], 0),
+        Ok(Action::CpuWeight(2))
+    );
+    assert_eq!(
+        registry.registered_action(*hashes.last().unwrap(), 0),
+        Ok(Action::CpuWeight(2))
+    );
+}
+
+#[test]
 fn prepared_candidate_set_is_invisible_until_exact_commit() {
     let source = candidates();
     let choices = source.iter().collect::<Vec<_>>();

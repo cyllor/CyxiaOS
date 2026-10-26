@@ -46,7 +46,10 @@ fn preparation_detail(phase: usize) {
     // The coarse preparation bank retains wall-clock ordering. This detailed
     // bank uses the patched per-vCPU execution counter so MTTCG descheduling
     // cannot hide which preparation substage consumed the prepaid CPU credit.
-    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(timer::cpu_ticks(), Ordering::Release);
+    // Each bank has one CPU writer and is consumed only from a stopped failure
+    // snapshot whose credit record is the publication boundary. A release
+    // store at every diagnostic marker perturbs the measured preparation path.
+    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(timer::cpu_ticks(), Ordering::Relaxed);
 }
 fn preparation_phase(phase: usize) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
@@ -1240,19 +1243,36 @@ fn next_normal(
         }) {
             break 'families;
         }
-        let current = match (f.current)(f.domain, f.kind, target) {
-            Ok(v) => v,
-            Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
-                break 'families;
+        let core_preparation = if (f.domain, f.kind) == (1, 2) {
+            match crate::domain_services::core_preparation(target) {
+                Ok(v) => Some(v),
+                Err(
+                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
+                ) => break 'families,
+                Err(error) => return Err(error),
             }
-            Err(e) => return Err(e),
+        } else {
+            None
+        };
+        let current = match core_preparation {
+            Some((current, _)) => current,
+            None => match (f.current)(f.domain, f.kind, target) {
+                Ok(v) => v,
+                Err(
+                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
+                ) => break 'families,
+                Err(e) => return Err(e),
+            },
         };
         preparation_current(current);
         preparation_detail(3);
-        let observed = match (f.observe)(f.domain, target) {
-            Ok(v) => v,
-            Err(Error::Busy | Error::Again | Error::NotReady) => break 'families,
-            Err(e) => return Err(e),
+        let observed = match core_preparation {
+            Some((_, observed)) => observed,
+            None => match (f.observe)(f.domain, target) {
+                Ok(v) => v,
+                Err(Error::Busy | Error::Again | Error::NotReady) => break 'families,
+                Err(e) => return Err(e),
+            },
         };
         preparation_detail(4);
         let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
@@ -1271,9 +1291,25 @@ fn next_normal(
             Err(e) => return Err(e),
         };
         preparation_detail(5);
+        let hold = if matches!(current, Action::ControlSet(_) | Action::UnauthRate(_)) {
+            1_000_000_000
+        } else {
+            WINDOW_NS
+        };
+        let held = wall_started.saturating_sub(stability.last_change_ns()) >= hold;
         let (options, n) = tiers(current);
+        let current_only = [Some(current)];
+        // An adjacent numerical action cannot enter this candidate set before
+        // the hold expires, and no alternate may enter a frozen tier. Do not
+        // borrow its owner merely to validate an action that this same turn
+        // must discard. The current action is still revalidated normally.
+        let eligible = if stability.frozen() || !categorical(current) && !held {
+            &current_only[..]
+        } else {
+            &options[..n]
+        };
         let mut legal = [None; 32];
-        let legal_count = match (f.legal_options)(&options[..n], target, wall_started, &mut legal) {
+        let legal_count = match (f.legal_options)(eligible, target, wall_started, &mut legal) {
             Ok(count) => count,
             Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
                 break 'families;
@@ -1287,12 +1323,6 @@ fn next_normal(
         {
             break 'families;
         }
-        let hold = if matches!(current, Action::ControlSet(_) | Action::UnauthRate(_)) {
-            1_000_000_000
-        } else {
-            WINDOW_NS
-        };
-        let held = wall_started.saturating_sub(stability.last_change_ns()) >= hold;
         let queued_wcet_us = match queued_control_wcet_us(s, index, wall_started) {
             Ok(value) => value,
             Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {

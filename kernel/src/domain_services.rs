@@ -8,7 +8,7 @@ use cyxia_prototype::{
         maintenance::{ConsoleHardware, ConsolePump, RecoveryBackend, RecoverySupervisor},
         platform::TimerClass,
     },
-    features::TargetFeatures,
+    features::{DomainObservation, TargetFeatures},
     policy::ExecutionState,
 };
 
@@ -794,6 +794,20 @@ fn observation(domain: u16, target: ObjectKey) -> Result<[u64; 4], Error> {
             ])
         }
         _ => Err(Error::Stale),
+    })
+}
+/// Project the CoreSet current action and its task-owner observation from one
+/// immutable service snapshot. The task metrics keep their own owner check;
+/// this merely avoids reacquiring the identical service publication twice.
+pub(crate) fn core_preparation(target: ObjectKey) -> Result<(Action, DomainObservation), Error> {
+    read(|s| {
+        if target != core_view_key(s) || s.cores.core_generation == 0 {
+            return Err(Error::Stale);
+        }
+        Ok((
+            Action::ControlSet(s.cores.control),
+            DomainObservation::complete(crate::domain_tasks::node_scheduler_observation()?),
+        ))
     })
 }
 fn current(domain: u16, kind: u16, target: ObjectKey) -> Result<Action, Error> {
