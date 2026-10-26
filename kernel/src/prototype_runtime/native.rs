@@ -14,10 +14,10 @@ const PROBE_WALL_NS: u64 = 1_000_000_000;
 const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
 // A fixed page boundary remains observable even when a translated block does
-// not refresh the guest CPU counter until after the loop. One page is safely
-// bounded by the probe's unchanged 8 ms recovery credit.
+// not refresh the guest CPU counter until after the loop. Use ordinary stores:
+// under TCG each DC ZVA enters a synchronous helper, so 64 helpers can consume
+// more than the unchanged 8 ms recovery credit even for one page.
 const PRIVATE_CLEAR_SLICE_BYTES: usize = 4096;
-const FALLBACK_ZERO_BLOCK_BYTES: usize = 64;
 const SERVICE_SLICE_NS: u64 = 100_000;
 // Mapping probes fault on their first EL0 memory instruction. Their timer is a
 // dead-context escape hatch, not inference time: leave enough wall headroom for
@@ -340,23 +340,7 @@ fn release_model(worker: &mut Worker) -> bool {
         }
     }
 }
-fn private_zero_block_bytes() -> Option<usize> {
-    let dczid: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {dczid}, dczid_el0",
-            dczid = out(reg) dczid,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    if dczid & (1 << 4) != 0 {
-        return None;
-    }
-    let bytes = 4usize.checked_shl((dczid & 0xf) as u32)?;
-    (bytes != 0 && bytes <= 4096 && bytes.is_power_of_two() && 4096usize.is_multiple_of(bytes))
-        .then_some(bytes)
-}
-fn clear_private_block(slot: usize, offset: usize, block_bytes: usize, use_zero_block: bool) {
+fn clear_private_block(slot: usize, offset: usize, block_bytes: usize) {
     debug_assert!(offset < PRIVATE_CLEAR_BYTES);
     debug_assert!(block_bytes != 0 && block_bytes <= 4096);
     let page = offset / 4096;
@@ -370,11 +354,7 @@ fn clear_private_block(slot: usize, offset: usize, block_bytes: usize, use_zero_
             stack_ptr(slot).cast::<Page>().add(page - 1)
         };
         let address = page.cast::<u8>().add(within);
-        if use_zero_block && (address as usize).is_multiple_of(block_bytes) {
-            core::arch::asm!("dc zva, {address}", address = in(reg) address, options(nostack));
-        } else {
-            core::ptr::write_bytes(address, 0, block_bytes);
-        }
+        core::ptr::write_bytes(address, 0, block_bytes);
     }
 }
 fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
@@ -386,16 +366,14 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
         .native
         .phase(if worker.native.probing { 1 } else { 4 });
     let started = timer::cpu_ticks();
-    let zero_block_bytes = private_zero_block_bytes();
-    let block_bytes = zero_block_bytes.unwrap_or(FALLBACK_ZERO_BLOCK_BYTES);
     let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
     let slice_end = offset
         .saturating_add(PRIVATE_CLEAR_SLICE_BYTES)
         .min(PRIVATE_CLEAR_BYTES);
     while offset < slice_end {
         let within = offset % 4096;
-        let bytes = block_bytes.min(4096 - within).min(slice_end - offset);
-        clear_private_block(slot, offset, bytes, zero_block_bytes == Some(bytes));
+        let bytes = (4096 - within).min(slice_end - offset);
+        clear_private_block(slot, offset, bytes);
         offset += bytes;
     }
     unsafe {

@@ -500,3 +500,19 @@ formatting and strict AArch64 Clippy pass. Exact local build
 `/tmp/cyxia-prototype.lcqCJ7` is `BUILT_NOT_RUN`; both selected stack paths pass
 at 33,904/65,536 bytes with the unchanged 4,096-byte exception reserve. A new
 patched-QEMU replay is required.
+
+Run `40404300372` validates the unified builtin mode far enough to start the
+native control worker, then exposes the remaining cold private-clear mechanism:
+CPU1 sequence 6 spent 9,722,780 ns against its unchanged 8 ms recovery credit,
+in phase 1 with no active job and no timer preemption. The fixed one-page slice
+still issued 64 `DC ZVA` instructions. Patched TCG handles each as a synchronous
+helper, so the helpers rather than the 4 KiB range defeated the static bound.
+The clear keeps one page per paid turn and the final `DSB ISH`, but now emits an
+ordinary fixed-size zero store sequence. This preserves the exact bytes, turn
+count and accounting while removing the per-cache-line helper. The full 614
+host tests pass with two environment skips, including all 140 v1.3 tests with
+one historical-evidence skip; formatting, the focused regressions and configured
+AArch64 strict Clippy also pass. Exact local build
+`/tmp/cyxia-prototype.lcqCJ7/build-clear` is `BUILT_NOT_RUN`, contains no
+`DC ZVA`, and passes both selected stack paths at 33,888/65,536 bytes with the
+unchanged 4,096-byte reserve. Linux replay remains required.

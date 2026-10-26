@@ -14,6 +14,8 @@ class NativePrivateClear(unittest.TestCase):
         self.assertIn("let slice_end = offset", source)
         self.assertIn("while offset < slice_end", source)
         self.assertNotIn("timer::cpu_ticks().saturating_sub(started) >= slice_ticks", source)
+        self.assertNotIn('core::arch::asm!("dc zva', source)
+        self.assertIn("core::ptr::write_bytes(address, 0, block_bytes);", source)
         self.assertIn('core::arch::asm!("dsb ish", options(nostack));', source)
 
 
