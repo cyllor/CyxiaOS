@@ -55,8 +55,12 @@ jobs:
           echo "$PATCH_SHA256  $patch_file" | sha256sum --check
           echo "$HOST_FIX_SHA256  $host_fix" | sha256sum --check
           echo "$NETWORK_FIX_SHA256  $network_fix" | sha256sum --check
-          git apply --check "$patch_file"
-          git apply "$patch_file"
+          apply_args=(
+            --exclude='.github/workflows/*'
+            --exclude='docs/implementation/pmu-patch-materialization-request.md'
+          )
+          git apply "${apply_args[@]}" --check "$patch_file"
+          git apply "${apply_args[@]}" "$patch_file"
           git apply --check "$host_fix"
           git apply "$host_fix"
           git apply --check "$network_fix"
