@@ -5,7 +5,7 @@ use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::PhysAddr;
 use cyxia_prototype::domains::maintenance::{BackgroundBudgets, CpuDebit};
 use cyxia_prototype::domains::tasks::*;
-use cyxia_prototype::domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp};
+use cyxia_prototype::domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp, WINDOW_NS};
 use sha2::{Digest, Sha256};
 #[path = "domain_tasks/abi.rs"]
 mod abi;
@@ -775,6 +775,22 @@ fn finish_capture(slot: usize, first: u64, last: u64) {
         let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, last);
     }
 }
+fn discard_capture(slot: usize) {
+    unsafe {
+        let capture = CAPTURES
+            .0
+            .get()
+            .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
+            .add(slot);
+        drop(capture.replace(None));
+        let warm = WARM_CAPTURES
+            .0
+            .get()
+            .cast::<Option<crate::learning_prewarm::Attempt>>()
+            .add(slot);
+        drop(warm.replace(None));
+    }
+}
 fn throttle(s: &mut State, key: ObjectKey, now: u64) {
     if let Some(slot) = s
         .throttled
@@ -941,6 +957,47 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
 }
 pub fn begin_service(now: u64) -> Option<Credit> {
     begin_builtin(0, now)
+}
+/// Recheck an unstarted builtin credit immediately before entering its task
+/// body. MTTCG may deschedule this vCPU after selection; if that consumed the
+/// protected wall envelope, refund the untouched CPU and optional-budget
+/// reservations so the task can be selected in a fresh window.
+pub fn revalidate_builtin(slot: usize) -> bool {
+    if slot >= 64
+        || cpu::slot() != slot
+        || CREDIT_KIND[slot].load(Ordering::Acquire) != 1
+        || COMPLETE_READY[slot].load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let result = locked(|s| {
+        let active = s.active[slot].ok_or(Error::Stale)?;
+        let now = now_ns();
+        if active.dispatch.window == now / WINDOW_NS
+            && WINDOW_NS - now % WINDOW_NS >= BUILTIN_WINDOW_HEADROOM_NS
+        {
+            return Ok(true);
+        }
+        s.scheduler.cancel_unstarted(active.dispatch, now)?;
+        if let Some(debit) = active.optional {
+            s.background.complete(debit, 0, now)?;
+        }
+        s.active[slot] = None;
+        CREDIT_NS[slot].store(0, Ordering::Relaxed);
+        CREDIT_KIND[slot].store(0, Ordering::Release);
+        Ok(false)
+    });
+    match result {
+        Ok(true) => true,
+        Ok(false) => {
+            discard_capture(slot);
+            false
+        }
+        // The task gate is deliberately nonblocking. Contention leaves the
+        // exact existing credit untouched, so preserve the prior execution
+        // path rather than stranding an active reservation.
+        Err(_) => true,
+    }
 }
 /// A non-preemptible mechanism piece needs the whole bounded envelope. A
 /// short remainder is returned without running the body or blocking its thread.

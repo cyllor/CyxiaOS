@@ -550,6 +550,14 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
                 prototype_runtime::idle_worker();
                 continue;
             }
+            // A builtin credit may have waited while this vCPU was
+            // descheduled after selection. It has executed no task body yet;
+            // refund an expired credit instead of carrying it across a window.
+            if !super::domain_tasks::revalidate_builtin(slot) {
+                drop(permit);
+                prototype_runtime::idle_worker();
+                continue;
+            }
         }
         let ctx = &mut contexts[role];
         #[cfg(all(feature = "prototype-runtime", feature = "unified-runtime"))]

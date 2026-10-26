@@ -418,6 +418,29 @@ fn guarded_dispatch_defers_the_window_tail_without_reserving_credit() {
 }
 
 #[test]
+fn unstarted_dispatch_can_be_refunded_after_its_window_expires() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 0, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    let d = s
+        .dispatch_with_window_headroom(0, layout(1), 40_000_000, 10_000_000, 10_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.cpu_window_usage(0, 40_000_000), Ok((0, 10_000_000)));
+    s.cancel_unstarted(d, WINDOW_NS + 1).unwrap();
+    assert_eq!(s.stats().quarantine_mask, 0);
+    assert_eq!(s.stats().overruns, 0);
+    assert_eq!(s.thread_cpu_ns(key(10)), Ok(0));
+    assert_eq!(s.cpu_window_usage(0, WINDOW_NS + 1), Ok((0, 0)));
+    assert!(
+        s.dispatch_with_window_headroom(0, layout(1), WINDOW_NS + 1, 1_000_000, 10_000_000)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn scheduler_native_margin_is_prepaid_and_stale_ticket_cannot_complete() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();

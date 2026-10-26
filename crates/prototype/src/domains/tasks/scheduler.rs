@@ -722,6 +722,37 @@ impl Scheduler {
         self.cpus[cpu].active = Some(next);
         Ok(next)
     }
+    /// Refund a dispatch that was selected but never entered execution. This
+    /// is distinct from completion: a vCPU may be descheduled after selection,
+    /// so an expired, wholly unused credit must not be reported as executed
+    /// across its aligned window. The caller must still own the exact active
+    /// dispatch and prove that no task body ran before using this operation.
+    pub fn cancel_unstarted(&mut self, d: Dispatch, now: u64) -> Result<(), Error> {
+        self.time(now)?;
+        let cpu = usize::from(d.cpu);
+        if cpu >= 64 || self.cpus[cpu].active != Some(d) {
+            return Err(Error::Stale);
+        }
+        if now < d.started_ns {
+            return Err(Error::Range);
+        }
+        let i = self.thread(d.thread)?;
+        let t = self.threads[i].as_mut().ok_or(Error::Stale)?;
+        let base = t.spent.checked_sub(d.reserved_ns).ok_or(Error::Conflict)?;
+        let cpu_base = self.cpus[cpu]
+            .spent
+            .checked_sub(d.reserved_ns)
+            .ok_or(Error::Conflict)?;
+        let extra = t
+            .spent
+            .saturating_sub(t.spec.minimum_ns)
+            .saturating_sub(base.saturating_sub(t.spec.minimum_ns));
+        t.spent = base;
+        self.cpus[cpu].spent = cpu_base;
+        self.cpus[cpu].groups[t.group] = self.cpus[cpu].groups[t.group].saturating_sub(extra);
+        self.cpus[cpu].active = None;
+        Ok(())
+    }
     pub fn complete(
         &mut self,
         d: Dispatch,
