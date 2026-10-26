@@ -418,6 +418,26 @@ fn guarded_dispatch_defers_the_window_tail_without_reserving_credit() {
 }
 
 #[test]
+fn twenty_ms_headroom_preserves_the_full_ninety_ms_business_capacity() {
+    let mut s = Scheduler::new();
+    s.register_group(key(1)).unwrap();
+    s.admit(spec(10, 1, 0, 0, 90_000_000), layout(1), 0)
+        .unwrap();
+    for turn in 0..9 {
+        let at = turn * 10_000_000;
+        let d = s
+            .dispatch_with_window_headroom(0, layout(1), at, 10_000_000, 20_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.reserved_ns, 10_000_000);
+        s.complete(d, 10_000_000, RunState::Runnable, at + 10_000_000)
+            .unwrap();
+    }
+    assert_eq!(s.cpu_window_usage(0, 90_000_000), Ok((90_000_000, 0)));
+    assert_eq!(s.stats().quarantine_mask, 0);
+}
+
+#[test]
 fn unstarted_dispatch_can_be_refunded_after_its_window_expires() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();

@@ -468,11 +468,11 @@ impl State {
     }
 }
 static mut STATE: State = State::new();
-// A native builtin turn uses a bounded sub-millisecond timer slice, but the
-// shared monotonic clock can advance while an MTTCG vCPU is descheduled. Match
-// the standalone runtime contract: do not start a turn unless the current
-// aligned window retains its complete 10 ms wall-time execution envelope.
-const BUILTIN_WINDOW_HEADROOM_NS: u64 = 10_000_000;
+// A native builtin turn reserves at most 10 ms, but the shared monotonic clock
+// can advance while an MTTCG vCPU is descheduled. Requiring 20 ms at entry
+// still admits the ninth 10 ms turn at t=80 ms (the complete 90 ms business
+// capacity) while keeping the measured host pause out of the window tail.
+const BUILTIN_WINDOW_HEADROOM_NS: u64 = 20_000_000;
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
