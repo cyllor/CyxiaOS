@@ -1,0 +1,70 @@
+diff --git a/crates/cluster-transport/tests/network.rs b/crates/cluster-transport/tests/network.rs
+--- a/crates/cluster-transport/tests/network.rs
++++ b/crates/cluster-transport/tests/network.rs
+@@ -104,12 +104,10 @@ fn native_poll_exposes_bounded_scheduler_checkpoints() {
+     let mut checkpoint = || checkpoints += 1;
+     tcp.poll_with_checkpoints(1, &mut checkpoint).unwrap();
+     drop(checkpoint);
+-    // Device completion, one ingress attempt and the first bounded egress
+-    // attempt are independently settleable even for an idle multichain port.
+-    assert!(
+-        checkpoints >= 3,
+-        "only {checkpoints} safe points were exposed"
+-    );
++    // TX completion, staged submit, single RX, flush, protocol ingress,
++    // protocol egress and its device follow-up are independently settleable
++    // even for an idle multichain port.
++    assert!(checkpoints >= 10, "only {checkpoints} safe points were exposed");
+ }
+ 
+ fn config(a: bool) -> Config {
+diff --git a/kernel/src/unified.rs b/kernel/src/unified.rs
+--- a/kernel/src/unified.rs
++++ b/kernel/src/unified.rs
+@@ -280,7 +280,7 @@ fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coord
+ ) -> u64 {
+     loop {
+         if crate::domain_tasks::begin_service_segment().is_some() {
+-            return Board.now_ns();
++            return timer::cpu_ticks();
+         }
+         mechanism_progress(coordinator);
+     }
+@@ -299,7 +299,7 @@ fn network_turn(
+     let Some(_) = crate::domain_tasks::begin_service_segment() else {
+         return link.state();
+     };
+-    let mut started = Board.now_ns();
++    let mut started = timer::cpu_ticks();
+     UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
+     let mut checkpoint = || {
+         finish_service(started);
+@@ -330,8 +330,9 @@ fn progress(
+ }
+ 
+ fn finish_service(started: u64) {
++    let actual = timer::cpu_ns(timer::cpu_ticks().saturating_sub(started));
+     let finished = Board.now_ns();
+-    match crate::domain_tasks::complete_service(finished.saturating_sub(started), finished) {
++    match crate::domain_tasks::complete_service(actual, finished) {
+         Ok(()) | Err(Error::Budget) => {}
+         Err(_) => fail(30),
+     }
+@@ -365,7 +366,7 @@ fn service_start(
+ ) -> u64 {
+     loop {
+         if crate::domain_tasks::begin_service_segment().is_some() {
+-            return Board.now_ns();
++            return timer::cpu_ticks();
+         }
+         progress(coordinator, tcp, epoch);
+     }
+@@ -608,7 +609,7 @@ pub fn run(info: &BootInfo) -> ! {
+                 core::hint::spin_loop();
+                 continue;
+             };
+-            let entered = Board.now_ns();
++            let entered = timer::cpu_ticks();
+             UNIFIED_EVIDENCE.words[30].store(6, Ordering::Release);
+             unsafe {
+                 if refresh_input {

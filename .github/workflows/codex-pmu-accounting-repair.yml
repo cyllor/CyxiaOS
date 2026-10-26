@@ -35,12 +35,19 @@ jobs:
       - name: Apply and format per-vCPU accounting repair
         run: |
           set -euo pipefail
-          for patch in .github/codex/patches/110*.diff.gz; do
-            expanded="$RUNNER_TEMP/$(basename "$patch" .gz)"
-            gzip -dc "$patch" > "$expanded"
-            git apply --check "$expanded"
-            git apply "$expanded"
-          done
+          main_patch="$RUNNER_TEMP/110-per-vcpu-accounting-repair.diff"
+          gzip -dc .github/codex/patches/110-per-vcpu-accounting-repair.diff.gz > "$main_patch"
+          # These two files were reformatted by the previous validated repair.
+          # Apply the semantic patch to every other file, then use a small patch
+          # rebased on the exact current branch head for these contexts.
+          excludes=(
+            --exclude=crates/cluster-transport/tests/network.rs
+            --exclude=kernel/src/unified.rs
+          )
+          git apply --check "${excludes[@]}" "$main_patch"
+          git apply "${excludes[@]}" "$main_patch"
+          git apply --check .github/codex/patches/111-rebased-conflicts.diff
+          git apply .github/codex/patches/111-rebased-conflicts.diff
           cargo fmt --all
           git diff --check
       - name: Run focused correctness gates

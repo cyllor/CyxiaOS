@@ -10,8 +10,8 @@ CPU. Under MTTCG each vCPU owns a host thread, so use that thread's CPU clock
 for the PMU cycle source. At the fixed 1 GHz PMU rate one nanosecond equals one
 cycle. User-mode and non-Linux hosts keep the upstream behaviour.
 ---
- target/arm/cpregs-pmu.c | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
+ target/arm/cpregs-pmu.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
 
 diff --git a/target/arm/cpregs-pmu.c b/target/arm/cpregs-pmu.c
 index 31c01eddc8..1df61b8c04 100644
@@ -25,7 +25,7 @@ index 31c01eddc8..1df61b8c04 100644
  #include "hw/irq.h"
  #include "cpu.h"
  #include "cpu-features.h"
-@@ -72,6 +73,23 @@ static uint64_t cycles_get_count(CPUARMState *env)
+@@ -72,6 +73,25 @@ static uint64_t cycles_get_count(CPUARMState *env)
  {
  #ifndef CONFIG_USER_ONLY
 +#ifdef __linux__
