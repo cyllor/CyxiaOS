@@ -353,3 +353,21 @@ around the actual architectural entry, while normal model, learning, service
 and business entries retain the slice bank. A regression pins both facts.
 Exact two-node build `/tmp/cyxia-prototype.n8RbyI` passes and both selected
 stack peaks remain 37,968/65,536 bytes. Patched-QEMU timing is required.
+
+Run `40388709995` passed the exact build and both stack gates, crossed the
+mapping probes, and then found a different empty preparation turn: CPU1
+sequence 22 used 2.964 ms against the unchanged 2.5 ms credit. Phase 3 was set,
+but only preparation marker 0 was present and the family context remained
+empty. Marker 0 arrived about 2.023 ms after the turn body began. The native
+caller was eagerly constructing a zeroed 4 KiB stack array before entering the
+domain owner; a successful encoder later zeroed the complete array again and
+copied it to the already isolated per-CPU input page. The stopped C worker now
+encodes directly into that private page. `encode_job` still clears every word
+before publishing a job, empty/retry turns never expose old contents to EL0,
+and `DSB ISH` still publishes all writes before a later entry. A structural
+regression pins those properties. The complete prototype suite, 137 v1.3 host
+tests (one historical-evidence skip), configured AArch64 strict Clippy and
+exact two-node build `/tmp/cyxia-prototype.4ohiQN` pass locally. Removing the
+redundant stack page reduces both selected preparation peaks from 37,968 to
+33,872 bytes out of 65,536, with the unchanged 4,096-byte exception reserve.
+Patched-QEMU timing is still required.

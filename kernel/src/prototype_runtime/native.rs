@@ -614,17 +614,20 @@ fn run_turn(
         worker.native.cpu_ns = 0;
         REQUEST_START.store(timer::ticks(), Ordering::Relaxed);
         worker.native.phase(3);
-        // Charge initialization too; no large value-return scratch is retained
-        // while either preparation sibling constructs its candidate set.
+        // The C worker is stopped and owns this private page exclusively.
+        // Encode there directly: encode_job clears the complete page before a
+        // successful publication, while an empty/retry turn never exposes it
+        // to EL0. This avoids eagerly zeroing a second 4 KiB stack value before
+        // we even know that a due family has a target.
         let preparation_started = ns(timer::ticks());
         let preparation_cpu_started = timer::cpu_ticks();
-        let mut input = [0; 512];
+        let input = unsafe { &mut (*input_ptr(slot)).0 };
         let source = match next_input(
             CONTROLLER_EPOCH.load(Ordering::Acquire),
             witness,
             preparation_started,
             preparation_cpu_started,
-            &mut input,
+            input,
         ) {
             Ok(Some(source)) => source,
             _ => {
@@ -637,8 +640,8 @@ fn run_turn(
         worker.native.job_started = input[4];
         STARTED_JOBS.fetch_add(1, Ordering::Release);
         // Encoding above opened its own exact source before constructing the
-        // immutable job. Subsequent private copy, inference and cleanup share
-        // this protected job source across all real paid turns.
+        // immutable job. Inference and cleanup share this protected job source
+        // across all real paid turns.
         worker.native.measurement =
             crate::domain_control::core_replay::Measurement::new(source, witness).ok();
         if worker.native.measurement.is_none() {
@@ -646,21 +649,16 @@ fn run_turn(
             return;
         }
         worker.native.phase(4);
-        let copy_start = timer::cpu_ticks();
+        let publish_start = timer::cpu_ticks();
         unsafe {
-            let page = if slot == 1 {
-                input_ptr(1)
-            } else {
-                input_ptr(2)
-            };
-            (*page).0.copy_from_slice(&input);
+            // Publish all direct input-page writes before a later EL0 entry.
             core::arch::asm!("dsb ish", options(nostack));
         }
         worker.native.clear_next = 1;
         worker.native.cpu_ns = worker
             .native
             .cpu_ns
-            .saturating_add(timer::cpu_elapsed_ns(copy_start));
+            .saturating_add(timer::cpu_elapsed_ns(publish_start));
         return;
     }
     if !continue_private_clear(worker, slot) {
