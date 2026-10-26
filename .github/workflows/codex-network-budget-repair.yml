@@ -1,0 +1,57 @@
+name: Apply bounded network service patch
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.1-complete-prototype
+
+permissions:
+  contents: write
+
+concurrency:
+  group: complete-prototype-network-repair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repair:
+    if: ${{ startsWith(github.event.head_commit.message, 'apply bounded network service patch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONPATH: tools
+    steps:
+      - name: Check out writable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update \
+            --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+      - name: Apply and format bounded network service patch
+        run: |
+          set -euo pipefail
+          for patch in .github/codex/patches/100*.diff; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+          cargo fmt --all
+          git diff --check
+      - name: Run focused correctness gates
+        run: |
+          python3 -B -m unittest -v test_verify_domains
+          cargo test --locked --offline -p cyxia-cluster-transport --test network
+          cargo test --locked --offline -p cyxia-prototype --test domain_tasks
+          cargo clippy --locked --offline -p cyxia-kernel \
+            --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Commit validated formatted source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(runtime): bound native network service credits'
+          git push origin HEAD:codex/cyxiaos-v0.1-complete-prototype

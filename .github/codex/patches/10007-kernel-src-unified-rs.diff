@@ -1,0 +1,116 @@
+diff --git a/kernel/src/unified.rs b/kernel/src/unified.rs
+index e199e7f..f4da4bc 100644
+--- a/kernel/src/unified.rs
++++ b/kernel/src/unified.rs
+@@ -257,7 +257,8 @@ fn drain_network(tcp: &mut NativeTcp<'_>, epoch: u64) {
+         return;
+     }
+     // The queue still owns each prefix until this exact, all-or-nothing TCP
+-    // enqueue succeeds. Dependency changes close only new admission.
++    // enqueue succeeds. One FIFO head is handled in this CPU reservation;
++    // further heads retain custody for later independently measured turns.
+     let _ = crate::domain_tasks::network_drain(epoch, Board.now_ns(), &mut |bytes| {
+         tcp.send_exact(bytes).map_err(|e| match e {
+             TcpError::WouldBlock => Error::Again,
+@@ -270,21 +271,52 @@ fn drain_network(tcp: &mut NativeTcp<'_>, epoch: u64) {
+     });
+ }
+ 
+-fn network_turn(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
+-    crate::domain_tasks::service_segment(|| network_turn_owned(tcp, epoch))
+-        .unwrap_or_else(|| tcp.as_ref().map_or(Ok(TcpState::Closed), Tcp::state))
++fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
++    coordinator.poll();
++    let _ = crate::domain_platform::poll(Board.now_ns());
+ }
+-fn network_turn_owned(tcp: &mut Option<NativeTcp<'_>>, epoch: u64) -> Result<TcpState, TcpError> {
++
++fn resume_network_service(
++    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
++) -> u64 {
++    loop {
++        if crate::domain_tasks::begin_service_segment().is_some() {
++            return Board.now_ns();
++        }
++        mechanism_progress(coordinator);
++    }
++}
++
++fn network_turn(
++    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
++    tcp: &mut Option<NativeTcp<'_>>,
++    epoch: u64,
++) -> Result<TcpState, TcpError> {
++    let Some(link) = tcp.as_mut() else {
++        crate::unified_task::transport(false);
++        return Ok(TcpState::Closed);
++    };
++    let Some(_) = crate::domain_tasks::begin_service_segment() else {
++        return link.state();
++    };
++    let mut started = Board.now_ns();
+     UNIFIED_EVIDENCE.words[30].store(4, Ordering::Release);
+-    let state = match tcp.as_mut() {
+-        Some(link) => link.poll(Board.now_ms()),
+-        None => Ok(TcpState::Closed),
++    let mut checkpoint = || {
++        finish_service(started);
++        mechanism_progress(coordinator);
++        started = resume_network_service(coordinator);
+     };
+-    let connected = matches!(state, Ok(TcpState::Established));
+-    crate::unified_task::transport(connected && epoch != 0);
+-    if connected && let Some(link) = tcp.as_mut() {
++    let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
++    if matches!(state, Ok(TcpState::Established)) && epoch != 0 {
++        // Socket polling and IPC dequeue are separate bounded owners. The
++        // callback runs with no socket/device or task lock held.
++        checkpoint();
+         drain_network(link, epoch);
+     }
++    drop(checkpoint);
++    finish_service(started);
++    let connected = matches!(state, Ok(TcpState::Established));
++    crate::unified_task::transport(connected && epoch != 0);
+     state
+ }
+ 
+@@ -293,9 +325,8 @@ fn progress(
+     tcp: &mut Option<NativeTcp<'_>>,
+     epoch: u64,
+ ) {
+-    coordinator.poll();
+-    let _ = crate::domain_platform::poll(Board.now_ns());
+-    let _ = network_turn(tcp, epoch);
++    mechanism_progress(coordinator);
++    let _ = network_turn(coordinator, tcp, epoch);
+ }
+ 
+ fn finish_service(started: u64) {
+@@ -531,7 +562,7 @@ pub fn run(info: &BootInfo) -> ! {
+                 }
+             }
+             let _ = crate::domain_platform::poll(Board.now_ns());
+-            let state = network_turn(&mut tcp, stream_epoch);
++            let state = network_turn(&mut coordinator, &mut tcp, stream_epoch);
+             let now = Board.now_ms();
+             let connected = matches!(state, Ok(TcpState::Established));
+             if connected && stream_epoch == 0 {
+@@ -681,7 +712,7 @@ pub fn run(info: &BootInfo) -> ! {
+                     p.len = 0;
+                     p.arg0 = u64::from(
+                         matches!(
+-                            network_turn(&mut tcp, stream_epoch),
++                            network_turn(&mut coordinator, &mut tcp, stream_epoch),
+                             Ok(TcpState::Established)
+                         ) && stream_epoch != 0,
+                     );
+@@ -775,7 +806,7 @@ pub fn run(info: &BootInfo) -> ! {
+                 }
+                 abi::OP_STORE_FLUSH => p.len = 0, // PUT already committed and FLUSHed.
+                 abi::OP_TASK => {
+-                    let _ = network_turn(&mut tcp, stream_epoch);
++                    let _ = network_turn(&mut coordinator, &mut tcp, stream_epoch);
+                     let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
+                     // Waiting for the full mechanism credit may advance a
+                     // socket or a contract deadline. Revalidate at admission,

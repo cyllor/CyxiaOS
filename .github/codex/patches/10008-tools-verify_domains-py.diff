@@ -1,0 +1,69 @@
+diff --git a/tools/verify_domains.py b/tools/verify_domains.py
+index 3e2c258..f5c58c2 100644
+--- a/tools/verify_domains.py
++++ b/tools/verify_domains.py
+@@ -534,6 +534,42 @@ def diagnostics(guest, bundle):
+         guest[key] = None
+         if symbol_name in bundle:
+             read(key, lambda: list(words(bundle[symbol_name], count)))
++    def credit_detail():
++        task_words = guest.get("task_evidence") or []
++        sticky_words = guest.get("overrun_evidence") or []
++        rows = []
++        for cpu, start in ((0, 2), (2, 12), (3, 22)):
++            row = sticky_words[start:start + 10]
++            if len(row) == 10 and any(row):
++                rows.append({
++                    "cpu": cpu, "sequence": row[0],
++                    "thread": [row[1], row[2]],
++                    "reserved_ns": row[3], "actual_ns": row[4],
++                    "started_ns": row[5], "finished_ns": row[6],
++                    "window": row[7], "core_generation": row[8],
++                    "optional": bool(row[9]),
++                })
++        return {
++            "mask": task_words[2] if len(task_words) > 2 else None,
++            "overruns": task_words[3] if len(task_words) > 3 else None,
++            "cpu_spent_ns": task_words[4:7] if len(task_words) >= 7 else None,
++            "service_stage": (guest.get("unified_words") or [None] * 31)[30],
++            "sticky_count": sticky_words[1] if len(sticky_words) > 1 else 0,
++            "receipts": rows,
++        }
++
++    def parse_task_snapshot(data):
++        try:
++            return parse_tasks(data)
++        except ValueError as error:
++            detail = credit_detail()
++            if detail["mask"] or detail["overruns"]:
++                raise ValueError(
++                    f"native task credit overrun/quarantine: mask={detail['mask']} "
++                    f"overruns={detail['overruns']} detail="
++                    + json.dumps(detail, separators=(",", ":"))) from error
++            raise
++
+     for symbol_name, key, parser in (("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
+                                      ("DOMAIN_PREPARATION_REJECTIONS", "rejected_preparations", parse_preparation_rejections),
+                                      ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
+@@ -544,7 +580,10 @@ def diagnostics(guest, bundle):
+                                      ("REPLAY_V13_EVIDENCE", "replay", parse_replay)):
+         guest[key] = None
+         if symbol_name in bundle:
+-            read(key, lambda: parser(bundle[symbol_name]))
++            if key == "tasks":
++                read(key, lambda: parse_task_snapshot(bundle[symbol_name]))
++            else:
++                read(key, lambda: parser(bundle[symbol_name]))
+             if key == "control_credit":
+                 detail = {
+                     "failures": guest[key],
+@@ -557,7 +596,8 @@ def diagnostics(guest, bundle):
+     # new credit. Its periodic task snapshot can then be older than the actual
+     # completion fault; the independent sticky record must still fail the run.
+     check("overrun_evidence", not (guest.get("overrun_evidence") or [0])[0],
+-          "native sticky CPU credit overrun evidence is present")
++          "native sticky CPU credit overrun evidence is present: "
++          + json.dumps(credit_detail(), separators=(",", ":")))
+     check("panic_evidence", not (guest.get("panic_evidence") or [0])[0], "kernel panic evidence is present")
+     check("smp_fault_evidence", not (guest.get("smp_fault_evidence") or [0])[0],
+           "native secondary fatal evidence is present")

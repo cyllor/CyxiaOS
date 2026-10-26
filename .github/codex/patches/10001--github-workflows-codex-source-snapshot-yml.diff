@@ -1,0 +1,19 @@
+diff --git a/.github/workflows/codex-source-snapshot.yml b/.github/workflows/codex-source-snapshot.yml
+index 0ce283e..29bfd94 100644
+--- a/.github/workflows/codex-source-snapshot.yml
++++ b/.github/workflows/codex-source-snapshot.yml
+@@ -132,7 +132,13 @@ jobs:
+             --output "$RUNNER_TEMP/native-replay-evidence/run" \
+             --timeout 600 --hold 1 --sample-ms 250 --clock-profile wallclock \
+             --replay-pairs 1 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/native-replay.log"
+-      - name: Retain raw native evidence
++      - name: Remove large mutable disk images
++        if: always()
++        run: |
++          find "$RUNNER_TEMP/native-replay-evidence" -type f \
++            \( -name 'disk.raw' -o -name '*.img' -o -size +32M \) -delete || true
++          du -ah "$RUNNER_TEMP/native-replay-evidence" | sort -h | tail -40
++      - name: Retain compact native evidence
+         if: always()
+         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+         with:
