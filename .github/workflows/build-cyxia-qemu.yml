@@ -1,0 +1,71 @@
+name: Build pinned Cyxia QEMU
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.1-complete-prototype
+    paths:
+      - tools/qemu/**
+      - .github/workflows/build-cyxia-qemu.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install QEMU build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git python3-venv ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev
+      - name: Fetch exact upstream source
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu"
+          git -C "$RUNNER_TEMP/qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+      - name: Apply Cyxia per-vCPU PMU patch
+        run: |
+          git -C "$RUNNER_TEMP/qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" diff --check
+      - name: Build AArch64 system emulator
+        run: |
+          cd "$RUNNER_TEMP/qemu"
+          ./configure \
+            --target-list=aarch64-softmmu \
+            --disable-docs \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-opengl \
+            --disable-werror
+          ninja -C build qemu-system-aarch64
+      - name: Package immutable tool
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/cyxia-qemu-tools"
+          mkdir -p "$out/bin"
+          install -m 0755 "$RUNNER_TEMP/qemu/build/qemu-system-aarch64" "$out/bin/qemu-system-aarch64"
+          "$out/bin/qemu-system-aarch64" --version | tee "$out/qemu-version.txt"
+          git -C "$RUNNER_TEMP/qemu" rev-parse HEAD > "$out/upstream-commit.txt"
+          sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > "$out/patch.sha256"
+          sha256sum "$out/bin/qemu-system-aarch64" > "$out/qemu-system-aarch64.sha256"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/cyxia-qemu-10.2.2-per-vcpu-pmu.tar.gz" cyxia-qemu-tools
+          sha256sum "$RUNNER_TEMP/cyxia-qemu-10.2.2-per-vcpu-pmu.tar.gz" > "$RUNNER_TEMP/cyxia-qemu-10.2.2-per-vcpu-pmu.tar.gz.sha256"
+      - name: Upload pinned QEMU artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cyxia-qemu-10.2.2-per-vcpu-pmu
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/cyxia-qemu-10.2.2-per-vcpu-pmu.tar.gz
+            ${{ runner.temp }}/cyxia-qemu-10.2.2-per-vcpu-pmu.tar.gz.sha256

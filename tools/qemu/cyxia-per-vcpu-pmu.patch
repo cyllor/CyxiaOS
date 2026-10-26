@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CyxiaOS Prototype <cyxiaos@example.invalid>
+Date: Mon, 26 Oct 2026 00:00:00 +0400
+Subject: [PATCH] arm: expose vCPU execution time through PMCCNTR
+
+CyxiaOS uses CNT[P]CT for shared monotonic deadlines and PMCCNTR for actual
+per-vCPU execution debit. Stock system-emulation PMCCNTR mirrors the global
+QEMU virtual clock, which charges time spent running other vCPUs to the current
+CPU. Under MTTCG each vCPU owns a host thread, so use that thread's CPU clock
+for the PMU cycle source. At the fixed 1 GHz PMU rate one nanosecond equals one
+cycle. User-mode and non-Linux hosts keep the upstream behaviour.
+---
+ target/arm/cpregs-pmu.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/target/arm/cpregs-pmu.c b/target/arm/cpregs-pmu.c
+index 31c01eddc8..1df61b8c04 100644
+--- a/target/arm/cpregs-pmu.c
++++ b/target/arm/cpregs-pmu.c
+@@ -6,6 +6,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/timer.h"
+ #include "exec/icount.h"
++#include "system/cpus.h"
+ #include "hw/irq.h"
+ #include "cpu.h"
+ #include "cpu-features.h"
+@@ -72,6 +73,23 @@ static uint64_t cycles_get_count(CPUARMState *env)
+ {
+ #ifndef CONFIG_USER_ONLY
++#ifdef __linux__
++    /*
++     * Guest PMU reads execute in the owning vCPU thread. With MTTCG this
++     * clock advances only while that vCPU thread consumes host CPU, unlike
++     * QEMU_CLOCK_VIRTUAL which also advances while sibling vCPUs run. Keep
++     * the upstream virtual-clock fallback for non-vCPU callers so ordinary
++     * PMU maintenance remains available; CyxiaOS does not enable PMU
++     * overflow interrupts for this accounting counter.
++     */
++    if (qemu_cpu_is_self(env_cpu(env))) {
++        struct timespec ts;
++
++        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
++            return (uint64_t)ts.tv_sec * ARM_CPU_FREQ
++                 + muldiv64(ts.tv_nsec, ARM_CPU_FREQ,
++                            NANOSECONDS_PER_SECOND);
++        }
++    }
++#endif
+     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                    ARM_CPU_FREQ, NANOSECONDS_PER_SECOND);
+ #else
+-- 
+2.43.0
