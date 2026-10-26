@@ -17,7 +17,7 @@ class NativeTaskCredit(unittest.TestCase):
         assembly = (ROOT / "kernel/src/smp_user.S").read_text()
         runtime = (ROOT / "kernel/src/smp.rs").read_text()
 
-        self.assertIn("mov x12, #256", assembly)
+        self.assertIn("mov x12, #128", assembly)
         self.assertIn("subs x12, x12, #1", assembly)
         self.assertIn("svc #4", assembly)
         self.assertIn("cbz x2, smp_busy", assembly)

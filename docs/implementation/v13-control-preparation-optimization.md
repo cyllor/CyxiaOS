@@ -591,6 +591,20 @@ strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-capture-prepare` passes both selected stack
 paths at 33,904/65,536 bytes. Linux timing remains required.
 
+Run `40415656116` crosses all native C-worker phase-1/phase-2 gates. The next
+failure is the global task-credit bank: CPU0 service thread `257:1` uses
+2,904,603/2,500,000 ns while diagnostic stage 1 installs learning storage, and
+CPU3 builtin `3:1` uses 10,912,938/10,000,000 ns. Learning startup had combined
+capture storage, history storage, peer replay and learning replay under one
+service segment. It is now a four-stage state machine, one exact 2.5 ms service
+credit per operation, retaining its stage on transient failure. The bounded
+EL0 builtin batch is 128 rather than 256 iterations under the same 10 ms credit
+and timer backstop. No budget or authority changes. The full 615 host tests
+(two environment skips), 141 v1.3 tests (one historical-evidence skip),
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-install-stages` passes both selected stack
+paths at 33,904/65,536 bytes. Linux timing remains required.
+
 Run `40411712557` crosses the exact build and stack gates, then fails before
 preparation on CPU1 sequence 3: a 512-byte phase-1 clear consumes 10,302,577 ns
 against the unchanged 8 ms recovery credit. Its empty preparation context

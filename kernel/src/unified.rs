@@ -491,7 +491,7 @@ pub fn run(info: &BootInfo) -> ! {
     let mut connection_epoch = 0u64;
     let mut entropy_failed = false;
     let mut refresh_input = true;
-    let mut learning_installed = false;
+    let mut learning_install_stage = 0u8;
     loop {
         // Only TCP state is reconstructed. The NIC and all DMA buffers retain
         // their original owner for the entire boot, including poisoned queues.
@@ -547,18 +547,35 @@ pub fn run(info: &BootInfo) -> ! {
         let mut terminal_since = None;
         loop {
             coordinator.poll();
-            if !learning_installed {
-                match crate::domain_tasks::service_segment(|| {
-                    UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
-                    crate::smp::prototype_runtime::install_learning_capture(*LOCAL, boot.epoch)?;
-                    UNIFIED_EVIDENCE.words[30].store(2, Ordering::Release);
-                    crate::peer_replay::init(boot.epoch)?;
-                    UNIFIED_EVIDENCE.words[30].store(3, Ordering::Release);
-                    crate::learning_replay::init()
+            if learning_install_stage < 4 {
+                match crate::domain_tasks::service_segment(|| match learning_install_stage {
+                    0 => {
+                        UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
+                        crate::smp::prototype_runtime::install_learning_capture_storage(
+                            *LOCAL, boot.epoch,
+                        )
+                    }
+                    1 => {
+                        UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
+                        crate::smp::prototype_runtime::install_learning_history_storage(
+                            *LOCAL, boot.epoch,
+                        )
+                    }
+                    2 => {
+                        UNIFIED_EVIDENCE.words[30].store(2, Ordering::Release);
+                        crate::peer_replay::init(boot.epoch)
+                    }
+                    3 => {
+                        UNIFIED_EVIDENCE.words[30].store(3, Ordering::Release);
+                        crate::learning_replay::init()
+                    }
+                    _ => Ok(()),
                 }) {
                     Some(Ok(())) => {
-                        learning_installed = true;
-                        UNIFIED_EVIDENCE.words[28].store(1, Ordering::Release);
+                        learning_install_stage += 1;
+                        if learning_install_stage == 4 {
+                            UNIFIED_EVIDENCE.words[28].store(1, Ordering::Release);
+                        }
                     }
                     None | Some(Err(Error::Busy | Error::Again | Error::NotReady)) => {}
                     Some(Err(error)) => {

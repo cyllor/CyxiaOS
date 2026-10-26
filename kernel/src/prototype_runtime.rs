@@ -358,6 +358,20 @@ pub fn install_learning_capture(
     learning::install_capture(node, boot)
 }
 #[cfg(feature = "unified-runtime")]
+pub fn install_learning_capture_storage(
+    node: [u8; 32],
+    boot: u64,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::install_capture_storage(node, boot)
+}
+#[cfg(feature = "unified-runtime")]
+pub fn install_learning_history_storage(
+    node: [u8; 32],
+    boot: u64,
+) -> Result<(), cyxia_prototype::domains::Error> {
+    learning::install_history_storage(node, boot)
+}
+#[cfg(feature = "unified-runtime")]
 pub fn verify_learning_completion(
     claim: &cyxia_prototype::learning::worker::CompletionClaim,
 ) -> Result<(), cyxia_prototype::learning::Error> {

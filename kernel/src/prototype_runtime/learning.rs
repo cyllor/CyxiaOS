@@ -611,8 +611,10 @@ fn history_check(
         }
     })
 }
-pub fn install_capture(node: [u8; 32], boot: u64) -> Result<(), DomainError> {
-    install_cpu_capture(node, boot)?;
+pub fn install_capture_storage(node: [u8; 32], boot: u64) -> Result<(), DomainError> {
+    install_cpu_capture(node, boot)
+}
+pub fn install_history_storage(node: [u8; 32], boot: u64) -> Result<(), DomainError> {
     if HISTORY_LOANED.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -635,6 +637,10 @@ pub fn install_capture(node: [u8; 32], boot: u64) -> Result<(), DomainError> {
             _ => DomainError::Conflict,
         }),
     }
+}
+pub fn install_capture(node: [u8; 32], boot: u64) -> Result<(), DomainError> {
+    install_capture_storage(node, boot)?;
+    install_history_storage(node, boot)
 }
 
 /// Kernel-only custody request. The frozen source allocation is pinned before
