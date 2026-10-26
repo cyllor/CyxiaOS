@@ -41,6 +41,14 @@ class PreparationStackTests(unittest.TestCase):
         self.assertEqual(result["exception_reserve_bytes"], 4096)
         self.assertEqual(result["stack_bytes"], 65536)
 
+    def test_compiler_closure_is_not_the_named_preparation_function(self):
+        closure = function("next_normal", 0x8000, 16).replace(
+            NAMES["next_normal"], NAMES["next_normal"] + "_$u7b$$u7b$closure$u7d$$u7d$::h1234"
+        )
+        result = inspect(chain(False) + "\n\n" + closure)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["functions"]["next_normal"]["address"], 0x4000)
+
     def test_llvm_probe_loop_reserves_every_page(self):
         text = """1000 <probe>:
 1000: stp x29, x30, [sp, #-0x60]!

@@ -93,7 +93,10 @@ const SERVICE_KEY: ObjectKey = ObjectKey {
     id: 0x535643,
     generation: 1,
 };
-const CONTROL_WINDOW_HEADROOM_NS: u64 = 10_000_000;
+// Preserve the full 70 ms control capacity while keeping a measured host
+// scheduling pause out of the aligned-window tail. This is admission-only;
+// every turn is still charged its exact requested and actual CPU time.
+const CONTROL_WINDOW_HEADROOM_NS: u64 = 20_000_000;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-task.elf"));
 const CLIENT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-client.elf"));
 const SELFTEST_ENABLED: bool = include!(concat!(env!("OUT_DIR"), "/domain-selftest.rs"));

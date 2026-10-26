@@ -589,6 +589,8 @@ def diagnostics(guest, bundle):
                     "failures": guest[key],
                     "active_records": active_control_records(
                         bundle.get("DOMAIN_CONTROL_EVIDENCE", b"")),
+                    "preparation_evidence": guest.get("preparation_evidence"),
+                    "preparation_detail": guest.get("preparation_detail"),
                 }
                 check(key, not guest[key],
                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))

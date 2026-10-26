@@ -1098,6 +1098,10 @@ fn next_normal(
 ) -> Result<bool, Error> {
     let start_cursor = s.family_cursor;
     let turns = if s.preparation.is_some() { 1 } else { 18 };
+    // One prepaid control turn evaluates at most one registered, due family.
+    // Skipping unavailable slots to find that family is bounded bookkeeping;
+    // continuing into another family's observation/candidate construction
+    // would silently combine multiple 2 ms evaluations in one 2.5 ms credit.
     'families: for turn in 0..turns {
         let index = (start_cursor + turn) % 18;
         if wall_started < s.due[index] {
@@ -1139,14 +1143,14 @@ fn next_normal(
             if s.preparation.is_some() {
                 return Err(Error::Stale);
             }
-            continue;
+            break 'families;
         };
         preparation_detail(1);
         if f.domain == 15 && crate::learning_canary::blocks_active() {
-            continue;
+            break 'families;
         }
         if !replay::allows(f.domain, f.kind, target) {
-            continue;
+            break 'families;
         }
         let fresh_snapshot = Snapshot {
             sequence: match s.preparation {
@@ -1174,7 +1178,7 @@ fn next_normal(
                     // Retry the same queued first generation within its real
                     // original deadline; no additional successful AI slot.
                     s.due[index] = wall_started;
-                    continue;
+                    break 'families;
                 }
                 Err(e) => return Err(e),
             };
@@ -1201,25 +1205,25 @@ fn next_normal(
             gate.check_active_publication(s.registry.model(), target)
                 .is_err()
         }) {
-            continue;
+            break 'families;
         }
         let current = match (f.current)(f.domain, f.kind, target) {
             Ok(v) => v,
             Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
-                continue;
+                break 'families;
             }
             Err(e) => return Err(e),
         };
         preparation_detail(3);
         let observed = match (f.observe)(f.domain, target) {
             Ok(v) => v,
-            Err(Error::Busy | Error::Again | Error::NotReady) => continue,
+            Err(Error::Busy | Error::Again | Error::NotReady) => break 'families,
             Err(e) => return Err(e),
         };
         preparation_detail(4);
         let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
         if old.is_some_and(execution_blocks_replacement) {
-            continue;
+            break 'families;
         }
         let stability_slot = ensure_stability(&mut s.owner, current, target, wall_started)?;
         let stability = s.owner.stability[stability_slot]
@@ -1228,7 +1232,7 @@ fn next_normal(
         let dependencies = match bind_dependencies(&s.owner, current, target, wall_started) {
             Ok(v) => v,
             Err(Error::Busy | Error::Again | Error::NotReady | Error::Conflict | Error::Stale) => {
-                continue;
+                break 'families;
             }
             Err(e) => return Err(e),
         };
@@ -1244,7 +1248,7 @@ fn next_normal(
                 }
                 Err(
                     Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
-                ) => continue 'families,
+                ) => break 'families,
                 Err(_) => {}
             }
         }
@@ -1253,7 +1257,7 @@ fn next_normal(
         if current != Action::OfferCpu(0)
             && !legal[..legal_count].iter().any(|a| *a == Some(current))
         {
-            continue;
+            break 'families;
         }
         let hold = if matches!(current, Action::ControlSet(_) | Action::UnauthRate(_)) {
             1_000_000_000
@@ -1309,7 +1313,7 @@ fn next_normal(
                 Ok(v) => v,
                 Err(
                     Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
-                ) => continue 'families,
+                ) => break 'families,
                 Err(e) => return Err(e),
             };
             if let Action::ControlSet(mask) = action {
@@ -1339,7 +1343,7 @@ fn next_normal(
             count += 1;
         }
         if count == 0 {
-            continue;
+            break 'families;
         }
         preparation_detail(8);
         let sequence = match s.preparation {

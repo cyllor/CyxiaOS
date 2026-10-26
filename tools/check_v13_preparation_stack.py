@@ -177,7 +177,10 @@ def inspect(disassembly):
     selected = {}
     for (address, name), code in functions.items():
         for key, prefix in NAMES.items():
-            if name == prefix or name.startswith(prefix):
+            # Select the function itself (optionally followed by Rust's hash),
+            # not compiler-emitted closures whose symbol begins with the same
+            # module/function path.
+            if name == prefix or re.fullmatch(re.escape(prefix) + r"h[0-9a-f]+", name):
                 if key in selected:
                     raise ValueError(f"ambiguous function {key}")
                 selected[key] = dict(address=address, frame_bytes=frame_size(code), code=code)
