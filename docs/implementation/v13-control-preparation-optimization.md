@@ -327,3 +327,17 @@ A new per-CPU diagnostic row records family, target and current action without
 changing an acceptance condition. The complete prototype suite, 47 domain-tool
 tests and exact two-node build `/tmp/cyxia-prototype.BxOJpS` pass locally; both
 selected stack peaks are 37,968/65,536 bytes. Patched-QEMU timing is required.
+
+Run `40386657172` did not reach legality preparation. CPU1 sequence 20 spent
+11.612 ms against the unchanged 8 ms mapping-probe credit, phase 2 after five
+earlier timer returns; all preparation rows were empty. Each mapping probe's
+first EL0 instruction is the deliberate fault under test, but it inherited the
+normal model's 100 us wall timer. Serialized protected capture before the
+architectural entry can consume that wall interval, so an already-expired timer
+repeatedly returned before the faulting instruction ran. Mapping probes now use
+a separate 20 ms wall escape deadline. This grants no CPU: their actual debit
+still settles against `PROBE_PREPAY_NS = 8 ms`, and a missing immediate fault
+therefore still quarantines. Normal model slices remain 100 us and the probe's
+overall wall deadline remains one second. A source regression pins all three
+bounds. Exact two-node build `/tmp/cyxia-prototype.aiYaXT` passes with both
+selected stack peaks unchanged at 37,968/65,536 bytes; Linux timing is pending.

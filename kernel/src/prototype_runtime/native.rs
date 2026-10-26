@@ -16,6 +16,12 @@ const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
 const PRIVATE_CLEAR_SLICE_NS: u64 = 500_000;
 const FALLBACK_ZERO_BLOCK_BYTES: usize = 64;
 const SERVICE_SLICE_NS: u64 = 100_000;
+// Mapping probes fault on their first EL0 memory instruction. Their timer is a
+// dead-context escape hatch, not inference time: leave enough wall headroom for
+// serialized protected capture before entry so that an already-expired 100 us
+// deadline cannot manufacture repeated timer returns. The unchanged 8 ms CPU
+// credit below still fails shut if the probe actually executes too much work.
+const PROBE_SERVICE_SLICE_NS: u64 = 20_000_000;
 const RETURN_ENVELOPE_NS: u64 = 2_000_000;
 static READY: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicU64 = AtomicU64::new(1);
@@ -716,10 +722,15 @@ fn run_turn(
         .phase(if worker.native.probing { 2 } else { 5 });
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot * 2 + 1) as u64 };
     unsafe {
+        let service_slice_ns = if worker.native.probing {
+            PROBE_SERVICE_SLICE_NS
+        } else {
+            SERVICE_SLICE_NS
+        };
         enter_service(
             context,
             phys(root),
-            timer::ticks().saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
+            timer::ticks().saturating_add(ticks(service_slice_ns).max(1)),
             crate::a02_capture::Task {
                 id: capture_owner(slot).id,
                 generation: capture_owner(slot).generation,
