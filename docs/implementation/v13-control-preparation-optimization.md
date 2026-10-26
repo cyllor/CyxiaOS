@@ -471,3 +471,32 @@ Clippy pass. Exact local build `/tmp/cyxia-prototype.In9GVv` is
 `BUILT_NOT_RUN`; both independently checked selected stack paths peak at
 33,888/65,536 bytes with the unchanged 4,096-byte exception reserve. Patched
 Linux QEMU timing remains required.
+
+Run `40400153990` validates the preparation correction over a substantially
+longer native interval: it passed exact build and stack gates and ran for
+466.6 seconds without another C-credit failure. It then exposed an independent
+CPU2 builtin-fixture overrun at sequence 149,797. A complete 10 ms credit used
+12,740,208 ns of translated CPU. This was not the earlier undersized tail: the
+credit was exactly 10 ms, thread identity was the fixed `2:1` worker, and the
+run had already completed roughly 150 thousand dispatches. Both validation and
+native artifact uploads again failed separately on the repository quota.
+
+The fixed builtin is a deliberately non-yielding EL0 loop whose private timer
+was its only return path. Although each entry armed a 250 us slice, patched
+MTTCG can retire a longer translated chain before delivering the PPI; reserving
+the full 10 ms turn therefore cannot make an asynchronous interrupt a static
+execution bound. The unified fixture now selects a dedicated worker mode that
+performs exactly 256 cookie-checked increments and voluntarily returns through
+SVC 4. EL1 accepts only that exact SVC or the existing timer return, then
+rechecks the unchanged cookie, TLS and SIMD state. The timer remains the hard
+backstop, while a finite instruction batch ends the ordinary path without
+increasing its 10 ms credit, 30 ms thread budget or 90 ms business ceiling. The
+non-unified SMP fixture retains its timer-only loop, preserving the independent
+requirement that every completed dispatch has timer-preemption evidence. A
+source regression pins the mode separation, batch and exact return
+classification. The full non-kernel workspace, 614 host tests (two environment
+skips), 67 tool tests, 140 v1.3 host tests (one historical-evidence skip),
+formatting and strict AArch64 Clippy pass. Exact local build
+`/tmp/cyxia-prototype.lcqCJ7` is `BUILT_NOT_RUN`; both selected stack paths pass
+at 33,904/65,536 bytes with the unchanged 4,096-byte exception reserve. A new
+patched-QEMU replay is required.

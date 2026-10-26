@@ -379,6 +379,13 @@ fn context(i: usize) -> user::Context {
     ctx.sp = STACK + 4096;
     ctx.regs[0] = cookie(i);
     ctx.regs[1] = DATA;
+    #[cfg(feature = "unified-runtime")]
+    {
+        // Only the production-style unified fixture may return voluntarily.
+        // The SMP self-test keeps mode zero so every completed turn still
+        // proves private-timer preemption; probe contexts overwrite this mode.
+        ctx.regs[2] = 4;
+    }
     ctx.tpidr_el0 = cookie(i);
     for r in 0..32 {
         ctx.simd[r] = [cookie(i), r as u64];
@@ -418,6 +425,14 @@ fn execute(ctx: &mut user::Context, i: usize) {
             cpu::disable_timer();
         }
     }
+}
+#[cfg(feature = "unified-runtime")]
+fn fixture_yielded(ctx: &user::Context) -> bool {
+    ctx.kind == 9 || ctx.kind == 8 && ctx.esr >> 26 == 0x15 && ctx.esr & 0xffff == 4
+}
+#[cfg(not(feature = "unified-runtime"))]
+fn fixture_yielded(ctx: &user::Context) -> bool {
+    ctx.kind == 9
 }
 fn probes(slot: usize, i: usize) {
     // Probe an EL1-only address, an unmapped private address, code write, NX data,
@@ -573,7 +588,7 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         #[cfg(all(feature = "prototype-runtime", not(feature = "unified-runtime")))]
         let runtime_start = timer::ticks();
         execute(ctx, i);
-        if ctx.kind != 9
+        if !fixture_yielded(ctx)
             || ctx.regs[0] != cookie(i)
             || ctx.tpidr_el0 != cookie(i)
             || ctx
