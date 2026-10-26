@@ -167,3 +167,24 @@ the existing 2.6 ms actual-overrun regression still faults both ledgers.
 The complete prototype suite and strict AArch64 Clippy pass. Exact-source build
 `/tmp/cyxia-prototype.b9yAHp` is `BUILT_NOT_RUN`; both selected stack paths pass
 at 37,984/65,536 bytes with the unchanged 4,096-byte exception reserve.
+
+Run `40369025168` confirms learning fault `0x50e` is gone, but another sample
+used 2,962,778 ns of actual preparation CPU. The complete detail timeline
+attributes 700,368 ns to CandidateSet construction/canonical hashing, 313,736
+ns to registration/prechecks, 69,171 ns to input encoding, 171,426 ns to the
+4 KiB input hash, 236,020 ns to WorkId/evidence binding, 129,286 ns to history
+and final Job retention, and about 154 µs after the last marker. This leaves a
+real 462,778 ns gap to the unchanged 2.5 ms credit; the learning carry is not a
+substitute for closing it.
+
+The canonical candidate hash still consumes the identical byte stream and
+keeps the `CYXIA_CANDIDATES_V1.3` format. Its fixed header, each candidate and
+optional Canary scope are now assembled into small bounded buffers and passed
+to SHA-256 once per component, instead of invoking the generic digest update
+for every two-byte, one-byte and eight-byte field. A golden regression records
+the pre-change four-candidate digest and all policy/Canary/native-control and
+bounded-replay tests pass unchanged. Strict AArch64 Clippy passes. Exact-source
+build `/tmp/cyxia-prototype.Z5Nrx0` is `BUILT_NOT_RUN`; both selected stack
+paths remain 37,984/65,536 bytes and `CandidateSet::new` remains a 4,032-byte
+frame. Linux patched-QEMU timing is required to establish whether the measured
+hash overhead is reduced enough.

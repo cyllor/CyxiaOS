@@ -67,6 +67,14 @@ pub struct CandidateSet {
 // retained job. Keeping the complete 32-candidate representation within one
 // page is both a bounded-memory contract and a native preparation-cost gate.
 const _: () = assert!(core::mem::size_of::<CandidateSet>() <= 4096);
+#[inline(always)]
+fn append_canonical(dst: &mut [u8], used: &mut usize, src: &[u8]) -> Result<(), Error> {
+    let end = used.checked_add(src.len()).ok_or(Error::Capacity)?;
+    let target = dst.get_mut(*used..end).ok_or(Error::Capacity)?;
+    target.copy_from_slice(src);
+    *used = end;
+    Ok(())
+}
 impl CandidateSet {
     pub fn new(
         snapshot: Snapshot,
@@ -213,7 +221,12 @@ impl CandidateSet {
     }
     fn recompute_hash_scoped(&self, canary: Option<CanaryPermit>) -> Result<[u8; 32], Error> {
         let mut h = Sha256::new();
-        h.update(b"CYXIA_CANDIDATES_V1.3\0");
+        // Preserve the exact canonical byte stream while batching tiny fields
+        // into one compression input. This avoids dozens of generic Digest
+        // update calls in the protected single-candidate hot path.
+        let mut header = [0; 150];
+        let mut used = 0;
+        append_canonical(&mut header, &mut used, b"CYXIA_CANDIDATES_V1.3\0")?;
         for v in [
             self.snapshot.sequence,
             self.snapshot.taken_ns,
@@ -224,21 +237,25 @@ impl CandidateSet {
             self.model.generation,
             self.count as u64,
         ] {
-            h.update(v.to_le_bytes());
+            append_canonical(&mut header, &mut used, &v.to_le_bytes())?;
         }
-        h.update(self.model.model_hash);
-        h.update(self.model.schema_hash);
+        append_canonical(&mut header, &mut used, &self.model.model_hash)?;
+        append_canonical(&mut header, &mut used, &self.model.schema_hash)?;
+        debug_assert_eq!(used, header.len());
+        h.update(header);
         for (index, c) in self.iter().enumerate() {
-            h.update(c.action.domain().to_le_bytes());
-            h.update(c.action.kind().to_le_bytes());
-            let mut bytes = [0; 16];
-            let n = policy_wire::encode_payload(c.action, index as u16, &mut bytes)?;
-            h.update((n as u16).to_le_bytes());
-            h.update(&bytes[..n]);
+            let mut canonical = [0; 164];
+            let mut used = 0;
+            append_canonical(&mut canonical, &mut used, &c.action.domain().to_le_bytes())?;
+            append_canonical(&mut canonical, &mut used, &c.action.kind().to_le_bytes())?;
+            let mut payload = [0; 16];
+            let n = policy_wire::encode_payload(c.action, index as u16, &mut payload)?;
+            append_canonical(&mut canonical, &mut used, &(n as u16).to_le_bytes())?;
+            append_canonical(&mut canonical, &mut used, &payload[..n])?;
             for v in c.features.common.into_iter().chain(c.features.domain) {
-                h.update(v.to_le_bytes());
+                append_canonical(&mut canonical, &mut used, &v.to_le_bytes())?;
             }
-            h.update([c.features.domain_present]);
+            append_canonical(&mut canonical, &mut used, &[c.features.domain_present])?;
             for v in c
                 .features
                 .target
@@ -246,16 +263,19 @@ impl CandidateSet {
                 .into_iter()
                 .chain([c.features.control_capacity])
             {
-                h.update([u8::from(v.is_some())]);
-                h.update(v.unwrap_or(0).to_le_bytes());
+                append_canonical(&mut canonical, &mut used, &[u8::from(v.is_some())])?;
+                append_canonical(&mut canonical, &mut used, &v.unwrap_or(0).to_le_bytes())?;
             }
+            h.update(&canonical[..used]);
         }
         // Both scopes bind raw measurements and their presence mask above.
         // Canary additionally binds this separator, eight u64 little-endian fields in
         // the order below, then the exact 32-byte candidate parameter hash.
         // Permit extensions/replacements therefore cannot revive an old set.
         if let Some(p) = canary {
-            h.update(b"\0CYXIA_CANARY_SCOPE_V1.3\0");
+            let mut canonical = [0; 121];
+            let mut used = 0;
+            append_canonical(&mut canonical, &mut used, b"\0CYXIA_CANARY_SCOPE_V1.3\0")?;
             for value in [
                 p.id,
                 p.active_generation,
@@ -266,9 +286,11 @@ impl CandidateSet {
                 u64::from(p.windows),
                 u64::from(p.quota),
             ] {
-                h.update(value.to_le_bytes());
+                append_canonical(&mut canonical, &mut used, &value.to_le_bytes())?;
             }
-            h.update(p.candidate_hash);
+            append_canonical(&mut canonical, &mut used, &p.candidate_hash)?;
+            debug_assert_eq!(used, canonical.len());
+            h.update(canonical);
         }
         Ok(h.finalize().into())
     }
