@@ -403,3 +403,18 @@ skip), focused native-control tests and exact two-node build
 `/tmp/cyxia-prototype.NWCKfy` pass. Both selected preparation peaks are
 34,080/65,536 bytes with the unchanged exception reserve. Linux timing remains
 required.
+
+Run `40392949565` attempt 1 stopped in the known cold mapping probe at
+8.348/8 ms. Its exact-source attempt 2 crossed all C-worker preparation without
+a C-credit failure, confirming the batched target and virgin-handoff paths,
+then exposed a CPU0 service segment at 5.003/2.5 ms (`0x101`, unified service
+stage 4). The initial native TCP segment combined device completion service and
+its port flush before the first scheduler callback. Those are separately
+bounded operations and no device/socket borrow or protocol update crosses the
+boundary. Native polling now checkpoints after completion service, after its
+flush, after one ingress attempt, after each egress attempt, and after the final
+flush. The transport regression observed only three checkpoints before the
+change and now requires at least five. All 14 transport tests, 138 v1.3 host
+tests (one historical-evidence skip), configured AArch64 strict Clippy and
+exact two-node build `/tmp/cyxia-prototype.PCoLCe` pass; both selected
+preparation peaks remain 34,080/65,536 bytes. Native replay is pending.

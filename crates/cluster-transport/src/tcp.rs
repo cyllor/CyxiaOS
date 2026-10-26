@@ -198,6 +198,7 @@ impl<'a, P: Port> Tcp<'a, P> {
             self.abort();
             return Err(Error::Device);
         }
+        checkpoint();
         if self.device.port_mut().flush().is_err() {
             self.abort();
             return Err(Error::Device);
@@ -246,6 +247,7 @@ impl<'a, P: Port> Tcp<'a, P> {
             self.abort();
             return Err(Error::Device);
         }
+        checkpoint();
         let socket = self.sockets.get::<Socket>(self.socket);
         if let Some(endpoint) = socket.remote_endpoint()
             && (endpoint.addr != IpAddress::Ipv4(Ipv4Address::from(self.config.peer))
