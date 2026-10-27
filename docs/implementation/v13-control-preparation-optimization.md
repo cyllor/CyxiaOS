@@ -1280,3 +1280,19 @@ tests, formatting and configured AArch64 strict Clippy pass. Exact build
 selected stack paths remain 32,960/65,536 bytes, and disassembly contains the
 fixed 32-register validation loop. Patched-QEMU replay is required; the
 69-case v1.3 catalogue remains open.
+
+Run `40456131372` stops before those task-boundary changes are exercised. CPU1
+sequence 597 uses 11,206,231/8,000,000 ns with phase 8 as its only phase bit.
+That phase had represented either fixed-heartbeat restoration or validation of
+an already returned mapping fault, so the stopped evidence could not identify
+which operation exceeded the recovery credit.
+
+Heartbeat restoration now records distinct phase 9, while returned-fault
+validation remains phase 8. The physical-counter read is also moved into only
+the timeout/setup branches that consume it; neither heartbeat restoration nor
+a valid synchronous fault now samples an unused clock. Probe addresses,
+deadline, timer backstop, validation, credits and failure behavior are
+unchanged. Focused probe tests, formatting and configured AArch64 strict Clippy
+pass. A new patched-QEMU replay is required both to classify this recovery
+fault and to reach the pending task-boundary changes; the 69-case catalogue
+remains open.

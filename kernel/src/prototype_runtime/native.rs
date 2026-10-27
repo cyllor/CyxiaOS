@@ -520,12 +520,10 @@ fn run_probe_turn(
     begin: ChargeStart,
 ) {
     let slot = cpu::slot();
-    // The probe timeout is a physical-counter deadline. Converting every
-    // clear turn through the generic u128 ticks-to-ns division would itself
-    // become charged recovery work under translated execution.
-    let now = timer::ticks();
     if worker.native.probe_heartbeat_pending {
-        worker.native.phase(8);
+        // Keep timer programming distinct from returned-fault validation in
+        // stopped credit evidence. Neither path needs a converted ns clock.
+        worker.native.phase(9);
         crate::smp::restore_service_heartbeat();
         worker.native.probe_heartbeat_pending = false;
         return;
@@ -556,7 +554,7 @@ fn run_probe_turn(
             worker.probed = worker.native.probe == 4;
             return;
         }
-        if now >= worker.native.probe_deadline {
+        if timer::ticks() >= worker.native.probe_deadline {
             fail_worker(worker);
             return;
         }
@@ -570,10 +568,13 @@ fn run_probe_turn(
         worker.native.clear_next = 1;
         worker.native.probing = true;
         worker.native.probe_deadline =
-            now.saturating_add(timer::frequency().saturating_mul(PROBE_WALL_SECONDS));
+            timer::ticks().saturating_add(timer::frequency().saturating_mul(PROBE_WALL_SECONDS));
         return;
     }
-    if worker.context.is_none() && now >= worker.native.probe_deadline {
+    // The probe timeout is a physical-counter deadline. Converting every
+    // clear turn through the generic u128 ticks-to-ns division would itself
+    // become charged recovery work under translated execution.
+    if worker.context.is_none() && timer::ticks() >= worker.native.probe_deadline {
         fail_worker(worker);
         return;
     }
