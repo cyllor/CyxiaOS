@@ -153,6 +153,49 @@ def decode(raw: bytes, binding: dict) -> dict:
                 records=records,A10_complete=False)
 
 
+def verify_consumption(raw: bytes, binding: dict, capture: dict) -> dict:
+    """Bind a selected FSYNC delivery to EL0's next authorized syscall entry."""
+    require(len(raw) == 256, 'wrong A10 consumption bank length')
+    mode = binding['mode']
+    if mode >= 3:
+        require(not any(raw), 'reader-only mode has an unexpected writer consumption boundary')
+        return dict(present=False, A10_complete=False)
+    values = struct.unpack_from('<21Q', raw)
+    (magic, owner_id, owner_generation, at, fsync_event, fsync_request,
+     next_request, operation, serial, progress_magic, version, progress_mode,
+     role, boot, stage, object_id, object_generation, consumed, observed,
+     verified, error) = values
+    expected = 2 if mode == 1 else 3
+    require(magic == 0x4359584131304350 and not any(raw[168:])
+            and (owner_id, owner_generation) == capture['writer']
+            and at > 0 and fsync_event > 0 and fsync_request > 0
+            and next_request == fsync_request + 1 and operation == 6
+            and serial > 0 and serial % 2 == 0
+            and progress_magic == 0x4359584131305553 and version == 1
+            and progress_mode == mode and role == 1 and boot == binding['boot_epoch']
+            and stage == (4 if mode == 1 else 7)
+            and object_id > 0 and object_generation > 0
+            and consumed == observed == expected and verified == error == 0,
+            'invalid A10 consumed-reply boundary')
+    matches = [row for row in capture['records'] if row['sequence'] == fsync_event]
+    require(len(matches) == 1, 'consumed-reply boundary names an unknown event')
+    receipt = matches[0]
+    require(receipt['owner'] == capture['writer'] and receipt['operation'] == 5
+            and receipt['result'] == 0 and receipt['request'] == fsync_request
+            and receipt['write_seq'] == receipt['durable_seq'] == expected
+            and receipt['object'] == (object_id, object_generation)
+            and at >= receipt['at_ns'],
+            'consumed-reply boundary disagrees with protected FSYNC delivery')
+    close = [row for row in capture['records'] if row['owner'] == capture['writer']
+             and row['request'] == next_request]
+    require(not close or (len(close) == 1 and close[0]['operation'] == 6),
+            'consumed-reply continuation changed before delivery')
+    return dict(present=True,owner=capture['writer'],fsync_event=fsync_event,
+                fsync_request=fsync_request,next_request=next_request,
+                durable_write_seq=expected,object=receipt['object'],at_ns=at,
+                close_delivered=bool(close),A10_complete=False)
+
+
 def verify_visibility(raw: bytes, binding: dict, path: str, sequence: int, payload: bytes) -> dict:
     capture = decode(raw,binding)
     require(sequence > 0 and len(payload) == 4096, 'invalid visibility expectation')
@@ -301,13 +344,15 @@ def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
                 scope='same-boot ordinary EL0 cache eviction; crash/replay matrix remains incomplete')
 
 
-def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict) -> dict:
+def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict,
+                      consumption: bytes) -> dict:
     """Check one clean native mode against independently decoded durable bytes.
 
     Fault prefixes must be checked separately: a clean terminal is never inferred
     from a cut or from an acknowledged backend FLUSH.
     """
     capture = decode(raw, binding)
+    consumed_boundary = verify_consumption(consumption, binding, capture)
     terminal = verify_terminal(progress, binding, capture)
     mode = binding['mode']
     path = '/a10/value'
@@ -325,7 +370,9 @@ def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict) 
             and all(item['object'] == obj for item in terminal.values()),
             'durable data/object disagrees with consumed native result')
     if mode == 4:
-        return verify_cache_eviction(capture, terminal, oracle)
+        result = verify_cache_eviction(capture, terminal, oracle)
+        result['consumption_boundary'] = consumed_boundary
+        return result
     expected_read = sequence if mode == 3 else 2
     require(terminal['reader']['observed_sequence'] == expected_read, 'recovery read chose a different durable version')
     expected_acks = [1,2] if mode == 1 else [3] if mode == 2 else []
@@ -395,4 +442,5 @@ def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict) 
     return dict(mode=mode,boot_epoch=binding['boot_epoch'],object=obj,durable_write_seq=sequence,
                 highest_commit_lsn=oracle['last_commit_lsn'],acknowledged_sequences=expected_acks,
                 reader_sequence=expected_read,reader_data_sha256=read['data_sha256'],terminal=terminal,
+                consumption_boundary=consumed_boundary,
                 A10_complete=False,scope='one clean ordinary EL0 mode; fault/replay/eviction matrix incomplete')

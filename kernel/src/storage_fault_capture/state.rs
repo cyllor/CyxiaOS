@@ -74,14 +74,14 @@ impl Capture {
         self.words[4].store(1, Ordering::Release);
     }
     /// Single CPU0 producer: complete the row before releasing its count.
-    pub fn record(&self, metadata: [u64; 10], hash: [u8; 32], frame: &[u8; 640]) {
+    pub fn record(&self, metadata: [u64; 10], hash: [u8; 32], frame: &[u8; 640]) -> Option<u64> {
         if !self.selected([metadata[2], metadata[3]]) {
-            return;
+            return None;
         }
         let count = self.words[3].load(Ordering::Acquire);
         if count >= 384 {
             self.fail();
-            return;
+            return None;
         }
         let at = 64 + count as usize * 96;
         self.put(at, &[0x4359584131304556, count + 1]);
@@ -89,5 +89,34 @@ impl Capture {
         self.bytes(at + 12, &hash);
         self.bytes(at + 16, frame);
         self.words[3].store(count + 1, Ordering::Release);
+        Some(count + 1)
+    }
+}
+
+#[repr(C, align(256))]
+pub struct Consumption {
+    pub words: [AtomicU64; 32],
+}
+impl Consumption {
+    pub const fn new() -> Self {
+        Self {
+            words: [const { AtomicU64::new(0) }; 32],
+        }
+    }
+    pub fn publish(&self, metadata: [u64; 7], progress: &[u8; 104]) -> bool {
+        if metadata.contains(&0) || self.words[0].load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        for (slot, value) in self.words[1..8].iter().zip(metadata) {
+            slot.store(value, Ordering::Relaxed);
+        }
+        for (slot, chunk) in self.words[8..21].iter().zip(progress.chunks_exact(8)) {
+            slot.store(
+                u64::from_le_bytes(chunk.try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+        }
+        self.words[0].store(0x4359584131304350, Ordering::Release);
+        true
     }
 }

@@ -73,15 +73,24 @@ identity and the exact returned write/durable sequence. User progress pages may
 show that the compiled client consumed a reply, but cannot replace the protected
 reply event or independent disk content.
 
-The current protected progress bank is published only on actual task exit.
-A cut before that point therefore has no protected consumed-progress snapshot;
-an NBD `after-ack` cut means the device reply was sent, and an ABI delivery event
-means copyout completed. Neither is labeled EL0 consumption. A future matrix
-must bind its sequence-2 starting disk to the earlier preparation run's verified
-ABI and actual-exit consumption receipt. To target sequence-3 consumption before
-exit, a later version can snapshot progress at the next ordinary file syscall
-entry and require a matching earlier protected FSYNC event. This remains
-unimplemented; the current single-mode runner does not certify that cut boundary.
+The protected progress bank is published only on actual task exit. A separate
+256-byte `A10_CONSUMPTION` bank now distinguishes pre-exit consumption for modes
+1 and 2. After the selected writer FSYNC reply has been copied out, the kernel
+retains its protected event and request identities. At the writer's next valid,
+authorized file call it requires the immediately following request to be CLOSE,
+copies the stopped task's complete 104-byte progress record, and publishes the
+owner, native timestamp, FSYNC event/request, continuation request/operation and
+progress bytes with a release-sealed magic. It accepts only stage 4/sequence 2 in
+preparation mode or stage 7/sequence 3 in overwrite mode. The independent
+verifier cross-links that bank to the exact successful protected FSYNC record,
+object generation and durable sequence; reader-only modes require an all-zero
+bank. Thus NBD `after-ack`, ABI delivery, EL0 consumption and eventual task exit
+remain four separate facts. The source/ELF-bound implementation and negative
+tests pass, but this boundary remains `BUILT_NOT_RUN` until native capture.
+
+A matrix must still bind its sequence-2 starting disk to the earlier preparation
+run's verified ABI, consumption and actual-exit receipts. No cut is promoted
+merely because the new bank is present.
 
 The immutable run input specifies mode, roles, expected payload versions and
 nonce. The producer and runner bind that input to the source/build/ELF identity,
@@ -148,7 +157,7 @@ there is no executed-matrix verdict until each actual cut/recovery is captured.
 ## Current host checks
 
 The dedicated client was compiled for `aarch64-unknown-none-softfloat` and fits
-the existing four RX pages. Seven host tests execute its actual control flow
+the existing four RX pages. Eight host tests execute its actual control flow
 against a deterministic ABI stand-in, including stale markers, wrong FSYNC
 sequences, corrupted bytes and generation changes. These are regressions only.
 The protected state rejects wrong boot/configuration identities, records only

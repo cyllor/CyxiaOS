@@ -531,6 +531,9 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     };
     let result = (|| {
         let grant = authorize(owner, &input)?;
+        if crate::storage_fault_capture::PROFILE {
+            crate::storage_fault_capture::entered(owner, &input.bytes);
+        }
         let result = run(owner, &input, &mut output, data, progress);
         if input.u16(OFF_OPERATION) == GET_STAT_CAP
             && result.as_ref().is_err_and(|e| retryable_before_run(*e))

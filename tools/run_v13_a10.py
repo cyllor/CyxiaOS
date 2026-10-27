@@ -33,7 +33,7 @@ from run_v13_a02 import inject_config
 from transport import FrameDecoder
 from v13_fault_disk import Backend, Server
 from verify_smp import require, sha
-from verify_v13_a10 import decode, payload, verify_boot, verify_filesystem
+from verify_v13_a10 import decode, payload, verify_boot, verify_consumption, verify_filesystem
 from verify_v13_model import loaded_bytes
 from verify_v13_storage_faults import copy_sparse
 
@@ -136,10 +136,11 @@ def result_scope(cut: bool) -> dict:
 def profile(image: bytes) -> dict:
     inspect_elf(image)
     require(boot_profile(image)['ram_mib'] == 1024, 'A10 requires 1 GiB unified image')
-    config, capture, progress, layout = (symbol(image, name) for name in
-        ('A10_CONFIG', 'A10_CAPTURE', 'A10_PROGRESS', 'A10_CAPTURE_LAYOUT'))
-    require(config['size'] == 512 and progress['size'] == 512 and layout['size'] == 64
-            and config['pa'] % 8 == progress['pa'] % 8 == 0,
+    config, capture, progress, consumption, layout = (symbol(image, name) for name in
+        ('A10_CONFIG', 'A10_CAPTURE', 'A10_PROGRESS', 'A10_CONSUMPTION', 'A10_CAPTURE_LAYOUT'))
+    require(config['size'] == 512 and progress['size'] == 512 and consumption['size'] == 256
+            and layout['size'] == 64
+            and config['pa'] % 8 == progress['pa'] % 8 == consumption['pa'] % 8 == 0,
             'invalid A10 protected symbols')
     require(struct.unpack('<8Q', loaded_bytes(image, layout['va'], 64)) == LAYOUT
             and capture['size'] == LAYOUT[5], 'unknown A10 capture layout')
@@ -153,8 +154,9 @@ def profile(image: bytes) -> dict:
         diagnostics[key] = location
     model = symbol(image, 'A02_BOOT_MODEL')
     require(model['size'] == 2772, 'unknown boot model artifact')
-    return dict(config=config, capture=capture, progress=progress, diagnostics=diagnostics,
-                model=model, instrumentation_bytes=capture['size'] + 1024)
+    return dict(config=config, capture=capture, progress=progress, consumption=consumption,
+                diagnostics=diagnostics, model=model,
+                instrumentation_bytes=capture['size'] + 1280)
 
 
 def _json(path: Path, document):
@@ -225,7 +227,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         clock='wallclock', client_deadline_ns=180_000_000_000, client_poll_ns=2_000_000_000,
         cut=cut, phase=phase, unflushed=unflushed, reverse_replies=reverse_replies,
         immutable_artifact_cache=str(artifact_cache) if artifact_cache is not None else None,
-        max_events=256, instrumentation_bytes=layout['instrumentation_bytes']))
+        max_events=LAYOUT[3], instrumentation_bytes=layout['instrumentation_bytes']))
     binding = {key: start[key] for key in ('mode', 'boot_epoch', 'uuid')}
     binding.update(nonce=nonce, image_sha256=sha(output / 'node-a.elf'),
         input_sha256=sha(output / 'input.json'), source_sha256=sha(output / 'source-manifest.json'))
@@ -245,7 +247,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     proc = sock = qmp = backend = server = None
     raw, serial = bytearray(), bytearray()
     decoder = FrameDecoder()
-    trace = progress = b''
+    trace = progress = consumption = b''
     started = time.monotonic()
     try:
         verify_unchanged(frozen_files)
@@ -320,6 +322,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                     qmp.execute('stop')
                     trace = save('trace.bin', layout['capture']['pa'], layout['capture']['size'])
                     progress = save('progress.bin', layout['progress']['pa'], 512)
+                    consumption = save('consumption.bin', layout['consumption']['pa'], 256)
                     capture_diagnostics()
                     report['capture_status'] = 'FAULT_CAPTURED'
                     break
@@ -331,6 +334,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                     # trace and progress are now immutable while VM keeps running.
                     trace = save('trace.bin', layout['capture']['pa'], layout['capture']['size'])
                     progress = save('progress.bin', layout['progress']['pa'], 512)
+                    consumption = save('consumption.bin', layout['consumption']['pa'], 256)
                     capture_diagnostics()
                     require(save('trace-confirm.bin', layout['capture']['pa'], layout['capture']['size']) == trace
                             and save('progress-confirm.bin', layout['progress']['pa'], 512) == progress,
@@ -379,10 +383,16 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
             report['status'] = 'NOT_RUN'
             try: report['partial_capture'] = decode(trace, binding)
             except ValueError as error: report['partial_capture_error'] = str(error)
+            if 'partial_capture' in report:
+                try:
+                    report['consumption_boundary'] = verify_consumption(
+                        consumption, binding, report['partial_capture'])
+                except ValueError as error:
+                    report['consumption_boundary_error'] = str(error)
         else:
             require(report['capture_status'] == 'TERMINAL_CAPTURED', 'missing actual native exits')
             report['storage_boot'] = verify_boot((output / 'storage-boot.bin').read_bytes(), before, bytes(serial))
-            verified = verify_filesystem(trace, binding, progress, oracle)
+            verified = verify_filesystem(trace, binding, progress, oracle, consumption)
             require(start['prior_object'] is None or tuple(verified['object']) == start['prior_object'],
                     'overwrite/recovery replaced the original file object')
             report.update(status='PASS', capture_status='VERIFIED', native_mode_verified=True,

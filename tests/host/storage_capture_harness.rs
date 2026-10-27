@@ -35,6 +35,18 @@ fn cache_eviction_mode_accepts_only_the_reader_owner() {
 }
 
 #[test]
+fn consumed_reply_boundary_is_single_publish_and_fail_closed() {
+    let s = state::Consumption::new();
+    let progress = [0x5a; 104];
+    assert!(s.publish([100, 3, 200, 7, 9, 10, 6], &progress));
+    assert_eq!(s.words[0].load(Ordering::Acquire), 0x4359584131304350);
+    assert_eq!(s.words[4].load(Ordering::Acquire), 7);
+    assert_eq!(s.words[8].load(Ordering::Acquire), 0x5a5a5a5a5a5a5a5a);
+    assert!(!s.publish([100, 3, 201, 7, 9, 10, 6], &progress));
+    assert!(!state::Consumption::new().publish([100, 3, 0, 7, 9, 10, 6], &progress));
+}
+
+#[test]
 fn only_registered_owner_is_published_and_overflow_fails_closed() {
     let s = Box::new(state::Capture::new());
     assert!(s.begin(
@@ -46,7 +58,7 @@ fn only_registered_owner_is_published_and_overflow_fails_closed() {
     assert!(s.owner(2, [101, 3]));
     assert!(!s.selected([100, 4]));
     for index in 0..384 {
-        s.record(
+        let _ = s.record(
             [index + 1, 9, 100, 3, 24, 80, 16, 4, 0, 0],
             [0xab; 32],
             &[0x5a; 640],
@@ -55,7 +67,7 @@ fn only_registered_owner_is_published_and_overflow_fails_closed() {
     }
     assert_eq!(s.words[64].load(Ordering::Acquire), 0x4359584131304556);
     assert_eq!(s.words[80].load(Ordering::Acquire), 0x5a5a5a5a5a5a5a5a);
-    s.record([385, 9, 100, 3, 24, 80, 16, 4, 0, 0], [0; 32], &[0; 640]);
+    let _ = s.record([385, 9, 100, 3, 24, 80, 16, 4, 0, 0], [0; 32], &[0; 640]);
     assert_eq!(s.words[3].load(Ordering::Acquire), 384);
     assert_ne!(s.words[4].load(Ordering::Acquire), 0);
 }

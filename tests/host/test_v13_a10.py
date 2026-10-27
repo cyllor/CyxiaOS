@@ -93,6 +93,21 @@ class ProtectedFileReplies(unittest.TestCase):
                 16,0x4359584131305553,1,1,role,1,8,5,2,consumed,observed,verified,0)
         return value
 
+    def consumption(self,raw,terminal,binding):
+        capture=self.verifier.decode(raw,binding)
+        expected=2 if binding['mode'] == 1 else 3
+        receipt=next(row for row in capture['records'] if row['owner'] == capture['writer']
+                     and row['operation'] == 5 and row['durable_seq'] == expected)
+        continuation=next(row for row in capture['records'] if row['owner'] == capture['writer']
+                          and row['request'] == receipt['request']+1)
+        progress=bytearray(terminal[40:144])
+        struct.pack_into('<Q',progress,6*8,4 if binding['mode'] == 1 else 7)
+        value=bytearray(256)
+        struct.pack_into('<8Q',value,0,0x4359584131304350,*capture['writer'],receipt['at_ns']+1,
+            receipt['sequence'],receipt['request'],continuation['request'],6)
+        value[64:168]=progress
+        return bytes(value)
+
     def test_terminal_consumption_requires_actual_exit_and_stable_role_binding(self):
         raw,_=self.capture();capture=self.verifier.decode(raw,self.binding)
         terminal=self.terminal()
@@ -133,16 +148,22 @@ class ProtectedFileReplies(unittest.TestCase):
 
     def test_clean_prepare_binds_consumed_ack_read_and_disk_oracle(self):
         raw,terminal,oracle=self.complete_prepare()
-        result=self.verifier.verify_filesystem(raw,self.binding,terminal,oracle)
+        consumption=self.consumption(raw,terminal,self.binding)
+        result=self.verifier.verify_filesystem(raw,self.binding,terminal,oracle,consumption)
         self.assertEqual(result['durable_write_seq'],2)
+        self.assertTrue(result['consumption_boundary']['present'])
         self.assertFalse(result['A10_complete'])
         import copy
         for key,value in (('durable_write_seq',1),('generation',3),('sha256','00'*32)):
             bad=copy.deepcopy(oracle);bad['files']['/a10/value'][key]=value
             with self.subTest(key=key),self.assertRaises(ValueError):
-                self.verifier.verify_filesystem(raw,self.binding,terminal,bad)
+                self.verifier.verify_filesystem(raw,self.binding,terminal,bad,consumption)
         bad=copy.deepcopy(oracle);bad['last_commit_lsn']=28
-        with self.assertRaises(ValueError):self.verifier.verify_filesystem(raw,self.binding,terminal,bad)
+        with self.assertRaises(ValueError):self.verifier.verify_filesystem(raw,self.binding,terminal,bad,consumption)
+        for offset in (32,40,48,64+6*8,64+9*8):
+            bad=bytearray(consumption);struct.pack_into('<Q',bad,offset,99)
+            with self.subTest(consumption_offset=offset),self.assertRaises(ValueError):
+                self.verifier.verify_filesystem(raw,self.binding,terminal,oracle,bytes(bad))
 
     def test_recovery_reader_requires_oracle_version_and_no_writer(self):
         import copy
@@ -156,10 +177,10 @@ class ProtectedFileReplies(unittest.TestCase):
         progress=bytearray(terminal);progress[:256]=bytes(256);struct.pack_into('<Q',progress,256+64,3)
         binding=dict(self.binding,mode=3)
         value=bytes(head+b''.join(rows))
-        result=self.verifier.verify_filesystem(value,binding,progress,oracle)
+        result=self.verifier.verify_filesystem(value,binding,progress,oracle,bytes(256))
         self.assertEqual(result['acknowledged_sequences'],[])
         bad=copy.deepcopy(oracle);bad['files']['/a10/value'].update(durable_write_seq=3,sha256=hashlib.sha256(self.verifier.payload(3)).hexdigest())
-        with self.assertRaises(ValueError):self.verifier.verify_filesystem(value,binding,progress,bad)
+        with self.assertRaises(ValueError):self.verifier.verify_filesystem(value,binding,progress,bad,bytes(256))
 
     def test_overwrite_requires_current_reader_marker_before_version_three(self):
         raw,terminal,oracle=self.complete_prepare();head=bytearray(raw[:512]);struct.pack_into('<Q',head,48,2)
@@ -184,13 +205,16 @@ class ProtectedFileReplies(unittest.TestCase):
         struct.pack_into('<2Q',progress,112,3,3)
         binding=dict(self.binding,mode=2)
         oracle['files']['/a10/value'].update(durable_write_seq=3,sha256=hashlib.sha256(value).hexdigest())
-        result=self.verifier.verify_filesystem(bytes(head+b''.join(rows)),binding,progress,oracle)
+        encoded=bytes(head+b''.join(rows))
+        consumption=self.consumption(encoded,progress,binding)
+        result=self.verifier.verify_filesystem(encoded,binding,progress,oracle,consumption)
         self.assertEqual(result['acknowledged_sequences'],[3])
         # A prior epoch marker cannot authorize this overwrite, even if its
         # inode happens to match the new reader marker.
         bad=bytearray(rows[reader_count+1]);frame=bytearray(bad[128:]);frame[128:128+len(marker)]=b'/a10/seen-0000000000000000';bad[128:]=frame
         changed=list(rows);changed[reader_count+1]=bad
-        with self.assertRaises(ValueError):self.verifier.verify_filesystem(bytes(head+b''.join(changed)),binding,progress,oracle)
+        with self.assertRaises(ValueError):self.verifier.verify_filesystem(
+            bytes(head+b''.join(changed)),binding,progress,oracle,consumption)
 
     def complete_cache_eviction(self):
         binding=dict(self.binding,mode=4)
@@ -255,7 +279,7 @@ class ProtectedFileReplies(unittest.TestCase):
 
     def test_same_boot_pressure_requires_a_real_cache_miss_and_backing_read(self):
         raw,terminal,oracle,binding=self.complete_cache_eviction()
-        result=self.verifier.verify_filesystem(raw,binding,terminal,oracle)
+        result=self.verifier.verify_filesystem(raw,binding,terminal,oracle,bytes(256))
         self.assertTrue(result['cache_eviction_verified'])
         self.assertEqual(result['pressure_pages'],4096)
         self.assertFalse(result['A10_complete'])
@@ -266,12 +290,12 @@ class ProtectedFileReplies(unittest.TestCase):
             struct.pack_into('<Q',changed,final_read+offset,
                 struct.unpack_from('<Q',raw,final_read+offset)[0]-1)
             with self.subTest(offset=offset),self.assertRaises(ValueError):
-                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle)
+                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle,bytes(256))
         for record,field,value in ((5,128+12,10), (6,128+96,999)):
             changed=bytearray(raw)
             struct.pack_into('<H' if field == 140 else '<Q',changed,512+record*768+field,value)
             with self.subTest(record=record,field=field),self.assertRaises(ValueError):
-                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle)
+                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle,bytes(256))
 
     def test_boot_recovery_counters_match_independent_prefix_including_first_boot(self):
         serial=b'STORAGE_V13_BOOT_DURABLE\nSMP_BOOT_OK a=4 b=15 c=0\n'+b''.join(f'SMP_CPU_ON a={cpu} b={cpu} c=0\n'.encode() for cpu in (1,2,3))
