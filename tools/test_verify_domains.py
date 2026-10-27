@@ -531,6 +531,18 @@ class EvidenceParserTests(unittest.TestCase):
             diagnostics({}, {"UNIFIED_EVIDENCE": encode([0] * 512),
                              "CONTROL_CREDIT_EVIDENCE": encode(receipt)})
 
+    def test_incomplete_concurrent_c_row_does_not_hide_complete_task_failure(self):
+        receipt = [0] * 64
+        receipt[24] = 1
+        task = [0] * 32
+        task[:4] = [0x43595441534B0001, 1, 4, 1]
+        with self.assertRaisesRegex(ValueError, "native task credit overrun/quarantine"):
+            diagnostics({}, {
+                "UNIFIED_EVIDENCE": encode([0] * 512),
+                "CONTROL_CREDIT_EVIDENCE": encode(receipt),
+                "DOMAIN_TASK_EVIDENCE": encode(task),
+            })
+
     def test_runtime_sticky_control_fault_survives_partial_snapshot(self):
         runtime = [0] * 1024
         runtime[:3] = [RUNTIME_MAGIC, 3, 5]

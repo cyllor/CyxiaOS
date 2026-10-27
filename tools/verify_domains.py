@@ -621,6 +621,22 @@ def diagnostics(guest, bundle):
     check("smp_fault_evidence", not (guest.get("smp_fault_evidence") or [0])[0],
           "native secondary fatal evidence is present")
     if errors:
+        # A second CPU can be stopped after claiming its failure row but before
+        # sealing it, while the CPU that triggered the stop has already
+        # release-published a complete task/sticky receipt. The incomplete C
+        # row must still fail acceptance, but it must not hide that complete
+        # primary diagnostic.
+        incomplete_control = guest.get("control_credit") and all(
+            not failure.get("complete", False) for failure in guest["control_credit"])
+        if incomplete_control:
+            for error in errors:
+                if str(error).startswith((
+                    "native task credit overrun/quarantine:",
+                    "native sticky CPU credit overrun evidence is present:",
+                    "kernel panic evidence is present",
+                    "native secondary fatal evidence is present",
+                )):
+                    raise error
         raise errors[0]
 
 

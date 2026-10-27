@@ -1296,3 +1296,15 @@ unchanged. Focused probe tests, formatting and configured AArch64 strict Clippy
 pass. A new patched-QEMU replay is required both to classify this recovery
 fault and to reach the pending task-boundary changes; the 69-case catalogue
 remains open.
+
+Run `40456663160` crosses the probe recovery state and reaches normal CPU1
+preparation, but its stopped snapshot catches CPU1's C-credit failure row in
+the claimed, unsealed state (`complete:false`) while another CPU has already
+caused the VM stop. The verifier previously raised that first incomplete row
+before reporting any later complete task/sticky receipt, hiding the primary
+diagnostic. Incomplete C evidence still fails acceptance, but diagnostics now
+prefer an independently release-published task, sticky-overrun, panic or
+secondary-fatal record when one is present. A focused regression preserves the
+standalone incomplete-C rejection and proves a complete task overrun wins this
+concurrent ordering. Another native replay is required to recover the primary
+failure; the pending task changes and 69-case catalogue remain open.
