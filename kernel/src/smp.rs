@@ -1061,7 +1061,9 @@ pub(crate) unsafe fn enter_service(
                 crate::a02_capture::enter(task);
             }
         }
-        RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence, Ordering::Release);
+        if record_slice_evidence {
+            RECORD_SLICE_EXCEPTION[slot].store(true, Ordering::Release);
+        }
         if capture_boundary {
             user::enter(context, root);
         } else {
@@ -1070,7 +1072,9 @@ pub(crate) unsafe fn enter_service(
             // its first memory access, so no vector state is touched.
             user::enter_integer_probe(context, root);
         }
-        RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
+        if record_slice_evidence {
+            RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
+        }
         if capture_boundary {
             if let Some(index) = capture_index {
                 crate::a02_capture::returned_prepared(index);

@@ -907,3 +907,28 @@ strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-task-stage-tail` is `BUILT_NOT_RUN`; both
 selected stack paths pass at 33,776/65,536 bytes. Patched-QEMU Linux replay is
 required before either observed fault can be considered closed.
+
+Run `40433458215` does not reproduce the partial dynamic-task dispatch before
+two earlier cold paths fail: CPU0 network stage 44 uses
+9,568,787/2,500,000 ns and CPU2 builtin sequence 5 uses
+13,640,199/10,000,000 ns. Stage 44 is the RX completion, copy, release and
+rearm segment. A released queue slot already zeroes every byte in its exact
+descriptor-owned request/response ranges, and all never-exposed bytes start
+zero. Rearm nevertheless rewrote the same writable response range to `0xff`.
+That redundant second pass is removed, while the required release clear now
+uses aligned volatile u64 stores plus an exact trailing-byte loop. The
+descriptor lengths, DMA synchronization, custody, generation checks and
+clearing before reuse are unchanged; the regression covers both wide and tail
+clears and proves the first byte outside each owned range is untouched.
+
+The fixed builtin had auxiliary slice recording disabled, but every entry
+still performed two Release atomic stores of `false` around the architectural
+transition. The exception flag is now published and cleared only when that
+auxiliary bank is actually requested. A02 authoritative enter/return capture,
+timer backstop, register validation and task-credit receipts remain
+unconditional. The full 619 host tests (two environment skips), 145 v1.3 tests
+(one historical-evidence skip), 69 evidence-tool tests, all 71 VirtIO driver
+tests, formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-rx-wide-clear-slice-flag` is
+`BUILT_NOT_RUN`; both selected stack paths pass at 33,776/65,536 bytes.
+Patched-QEMU timing is still required.

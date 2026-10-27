@@ -46,6 +46,15 @@ class NativeTaskCredit(unittest.TestCase):
             "            builtin_capture_index(cpu::slot()),\n            true,\n            false,\n        );",
             runtime,
         )
+        entry = runtime[runtime.index("pub(crate) unsafe fn enter_service"):]
+        self.assertNotIn(
+            "RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence",
+            entry,
+        )
+        self.assertIn(
+            "if record_slice_evidence {\n            RECORD_SLICE_EXCEPTION[slot].store(true",
+            entry,
+        )
         self.assertIn("fn fixture_yielded", runtime)
         self.assertIn("ctx.kind == 9", runtime[runtime.index("fn fixture_yielded"):])
         self.assertIn(

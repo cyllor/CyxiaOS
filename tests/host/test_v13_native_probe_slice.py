@@ -28,7 +28,8 @@ class NativeProbeSlice(unittest.TestCase):
         native = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
         self.assertEqual(native.count("!worker.native.probing,"), 2)
         self.assertIn("if record_slice_evidence && slot < 4", entry)
-        self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence", entry)
+        self.assertIn("if record_slice_evidence {\n            RECORD_SLICE_EXCEPTION[slot].store(true", entry)
+        self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(false", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire)", entry)
 
         arch = (ROOT / "crates/arch-aarch64/src/user.rs").read_text()

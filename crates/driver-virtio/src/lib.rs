@@ -55,8 +55,16 @@ impl Page {
         self.0.get() as usize
     }
     fn clear(&mut self) {
-        for index in 0..4096 {
-            self.put8(index, 0);
+        self.clear_prefix(4096);
+    }
+    fn clear_prefix(&self, bytes: usize) {
+        debug_assert!(bytes <= 4096);
+        let wide = bytes & !7;
+        for offset in (0..wide).step_by(8) {
+            self.put64(offset, 0);
+        }
+        for offset in wide..bytes {
+            self.put8(offset, 0);
         }
     }
     fn put8(&self, offset: usize, value: u8) {

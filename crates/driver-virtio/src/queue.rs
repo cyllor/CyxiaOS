@@ -318,9 +318,11 @@ impl BatchQueue {
         for (i, b) in request.iter().enumerate() {
             m.request[at].put8(i, *b);
         }
-        for i in 0..writable {
-            m.response[at].put8(i, 0xff);
-        }
+        // A Free slot is either zero-initialized or has passed through
+        // release(), which clears its complete prior descriptor-owned range.
+        // A later wider descriptor exposes only the still-zero initial tail,
+        // so rewriting the writable buffer here is redundant and would put a
+        // second full DMA-range clear in the RX completion segment.
         let head = at * 2;
         let desc = head * 16;
         let descriptors = u16::from(!request.is_empty()) + u16::from(writable != 0);
@@ -517,12 +519,8 @@ impl BatchQueue {
         // queue owner. Clear those exact ranges before reuse; rewriting both
         // complete pinned pages amplifies a maximum-MTU RX completion into
         // thousands of unrelated volatile stores inside one CPU credit.
-        for i in 0..slot.readable as usize {
-            self.memory.request[at].put8(i, 0);
-        }
-        for i in 0..slot.writable as usize {
-            self.memory.response[at].put8(i, 0);
-        }
+        self.memory.request[at].clear_prefix(slot.readable as usize);
+        self.memory.response[at].clear_prefix(slot.writable as usize);
         self.slots[at].state = State::Free;
         Ok(())
     }
@@ -644,14 +642,23 @@ mod tests {
     #[test]
     fn release_clears_only_the_descriptor_owned_ranges() {
         let (mut q, mut t, p) = fixture(16);
-        q.memory.request[0].put8(3, 0xa5);
-        q.memory.response[0].put8(7, 0x5a);
-        let token = q.enqueue(&mut t, &[1, 2, 3], 7, true, false, &p).unwrap();
-        used(&mut q, 0, 7);
-        let completion = q.poll(&mut t, &mut [0; 7], &p).unwrap().unwrap();
+        q.memory.request[0].put8(11, 0xa5);
+        q.memory.response[0].put8(15, 0x5a);
+        let token = q
+            .enqueue(
+                &mut t,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                15,
+                true,
+                false,
+                &p,
+            )
+            .unwrap();
+        used(&mut q, 0, 15);
+        let completion = q.poll(&mut t, &mut [0; 15], &p).unwrap().unwrap();
         assert_eq!(completion.token, token);
         q.release(token).unwrap();
-        for i in 0..3 {
+        for i in 0..11 {
             assert_eq!(
                 unsafe {
                     core::ptr::read_volatile((q.memory.request[0].address() + i) as *const u8)
@@ -659,7 +666,7 @@ mod tests {
                 0
             );
         }
-        for i in 0..7 {
+        for i in 0..15 {
             assert_eq!(
                 unsafe {
                     core::ptr::read_volatile((q.memory.response[0].address() + i) as *const u8)
@@ -668,11 +675,11 @@ mod tests {
             );
         }
         assert_eq!(
-            unsafe { core::ptr::read_volatile((q.memory.request[0].address() + 3) as *const u8) },
+            unsafe { core::ptr::read_volatile((q.memory.request[0].address() + 11) as *const u8) },
             0xa5
         );
         assert_eq!(
-            unsafe { core::ptr::read_volatile((q.memory.response[0].address() + 7) as *const u8) },
+            unsafe { core::ptr::read_volatile((q.memory.response[0].address() + 15) as *const u8) },
             0x5a
         );
     }
