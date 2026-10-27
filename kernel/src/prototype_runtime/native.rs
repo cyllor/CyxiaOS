@@ -17,10 +17,10 @@ const PRIVATE_CLEAR_BARRIER: u32 = PRIVATE_CLEAR_BYTES as u32 + 1;
 // A fixed byte boundary remains observable even when a translated block does
 // not refresh the guest CPU counter until after the loop. DC ZVA amplified TCG
 // helpers, while even a 512-byte memset could retire 64 stores in one chain.
-// A 64-byte piece caps the translated loop at eight 64-bit stores. Repeated
+// A 32-byte piece caps the translated loop at four 64-bit stores. Repeated
 // pieces retain every page's exact bytes and final barrier while fitting both
 // the 8 ms recovery and 2.5 ms ordinary envelopes.
-const PRIVATE_CLEAR_SLICE_BYTES: usize = 64;
+const PRIVATE_CLEAR_SLICE_BYTES: usize = 32;
 const SERVICE_SLICE_NS: u64 = 100_000;
 // Mapping probes fault on their first EL0 memory instruction. Their timer is a
 // dead-context escape hatch, not inference time: leave enough wall headroom for
@@ -376,8 +376,6 @@ fn clear_private_block(slot: usize, offset: usize) {
         core::arch::asm!(
             "stp xzr, xzr, [{address}, #0]",
             "stp xzr, xzr, [{address}, #16]",
-            "stp xzr, xzr, [{address}, #32]",
-            "stp xzr, xzr, [{address}, #48]",
             address = in(reg) address,
             options(nostack, preserves_flags),
         );

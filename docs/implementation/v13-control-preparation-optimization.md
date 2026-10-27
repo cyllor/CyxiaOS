@@ -1327,3 +1327,16 @@ tool tests, formatting and configured AArch64 strict Clippy pass. Exact build
 selected stack paths pass at 32,976/65,536 bytes with the unchanged 4,096-byte
 exception reserve. Patched-QEMU replay is required to identify the exact entry
 substage; the 69-case v1.3 catalogue remains open.
+
+Run `40457822975` stops before reaching the new entry bank: CPU1 mapping-probe
+sequence 994 uses 8,064,245/8,000,000 ns in one phase-1 private-clear turn,
+with no preemption or preparation context. This is a real but narrow overrun of
+the fixed 64-byte translated block, so each continuation is reduced to 32
+bytes emitted as two `STP` instructions. The complete nine-page range,
+independent final `DSB ISH`, raw one-second escape deadline, exact actual
+settlement and unchanged 8 ms recovery credit remain intact. A patched-QEMU
+replay is required before interpreting the pending entry diagnostic. All 627
+host tests (two environment skips), 153 v1.3 tests (one historical-evidence
+skip), formatting and configured AArch64 strict Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-clear-32-entry-detail` is `BUILT_NOT_RUN`;
+both selected stack paths remain 32,976/65,536 bytes.
