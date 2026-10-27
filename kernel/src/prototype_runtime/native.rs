@@ -134,6 +134,7 @@ pub(super) struct WorkerState {
     probe: u8,
     probe_started: u64,
     capture_index: Option<usize>,
+    probe_heartbeat_pending: bool,
     clear_next: u32,
     probing: bool,
     in_job: bool,
@@ -158,6 +159,7 @@ impl WorkerState {
             probe: 0,
             probe_started: 0,
             capture_index: None,
+            probe_heartbeat_pending: false,
             clear_next: 0,
             probing: false,
             in_job: false,
@@ -174,6 +176,7 @@ impl WorkerState {
         // The stop path proves there is no bill or root-owned job first.
         self.clear_next = 0;
         self.probing = false;
+        self.probe_heartbeat_pending = false;
     }
     fn phase(&mut self, phase: u64) {
         self.phase = phase;
@@ -519,6 +522,12 @@ fn run_turn(
 ) {
     let slot = cpu::slot();
     let now = ns(timer::ticks());
+    if worker.native.probe_heartbeat_pending {
+        worker.native.phase(8);
+        crate::smp::restore_service_heartbeat();
+        worker.native.probe_heartbeat_pending = false;
+        return;
+    }
     if worker.native.completion.is_some() && !worker.native.in_job {
         // step() settled the preceding context bill. This separate prepaid
         // owner piece releases only the already revoked immutable bank pin.
@@ -747,6 +756,9 @@ fn run_turn(
             !worker.native.probing,
             !worker.native.probing,
         );
+    }
+    if worker.native.probing {
+        worker.native.probe_heartbeat_pending = true;
     }
     let actual = timer::cpu_elapsed_ns(entered);
     MAX_SLICE[slot].fetch_max(ticks(actual), Ordering::Relaxed);

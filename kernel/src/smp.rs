@@ -1062,6 +1062,16 @@ fn heartbeat(enabled: bool) {
 }
 
 #[cfg(feature = "unified-runtime")]
+pub(crate) fn restore_service_heartbeat() {
+    let slot = cpu::slot();
+    if HEARTBEAT[slot].load(Ordering::Acquire) {
+        heartbeat(true);
+    } else {
+        unsafe { cpu::disable_timer() };
+    }
+}
+
+#[cfg(feature = "unified-runtime")]
 /// # Safety
 /// The context and address-space root must satisfy user::enter's contract.
 /// `record_slice_evidence` controls only the auxiliary timing bank; A02 always
@@ -1127,17 +1137,13 @@ unsafe fn enter_service_inner(
         // The only uncaptured caller is the audited mapping probe. Its
         // integer-only transition already masks/restores DAIF around ACTIVE
         // and TTBR0 installation, so wrapping it in a second DAIF transition
-        // adds no exclusion. Keep the independent timer backstop and restore
-        // the fixed heartbeat immediately after the synchronous return.
+        // adds no exclusion. Keep the independent timer backstop armed after
+        // the synchronous return; its caller restores the fixed heartbeat in
+        // a separate paid recovery turn.
         debug_assert!(!record_slice_evidence && !immutable_root);
         unsafe {
             timer::arm(deadline);
             user::enter_integer_probe(context, root);
-            if HEARTBEAT[slot].load(Ordering::Acquire) {
-                heartbeat(true);
-            } else {
-                cpu::disable_timer();
-            }
         }
         return;
     }

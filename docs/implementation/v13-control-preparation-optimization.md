@@ -1166,3 +1166,25 @@ Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-probe-single-daif` is `BUILT_NOT_RUN`; both
 selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay remains
 required, and the 69-case v1.3 catalogue stays open.
+
+Run `40450245587` shows that removing the redundant DAIF wrapper alone is not
+robust: CPU1 mapping-probe sequence 598 still uses
+10,098,920/8,000,000 ns in phase 2, again with no preemption, job, preparation
+context or adjacent phase. The synchronous boundary still programmed the
+physical timer twice inside one debit: it armed the 20 ms probe backstop before
+entry and immediately replaced it with the 250 µs heartbeat after return.
+
+The successfully returned probe can safely leave its longer backstop armed.
+`WorkerState` now records that heartbeat restoration is pending; the next
+separately paid recovery turn restores the fixed heartbeat and returns before
+fault validation. If scheduling delays that turn until the 20 ms timer fires,
+the unchanged IRQ path observes the existing heartbeat flag and restores it
+there. No interval lacks a timer, and probe code, four exact fault assertions,
+ASIDs, 8 ms actual debit, one-second wall escape and failure rules are
+unchanged. All 626 host tests (two environment skips), 152 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, 74 VirtIO tests, 14
+cluster-network tests, formatting, patch checks and configured AArch64 strict
+Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-heartbeat-turn` is `BUILT_NOT_RUN`;
+both selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
+required, and the 69-case v1.3 catalogue remains open.
