@@ -290,12 +290,12 @@ fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinat
     let _ = crate::domain_platform::poll(Board.now_ns());
 }
 
-fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) -> u64 {
+fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
     loop {
         if crate::domain_tasks::begin_service_segment().is_some()
             && crate::domain_tasks::revalidate_service_segment()
         {
-            return timer::cpu_ticks();
+            return;
         }
         mechanism_progress(coordinator);
     }
@@ -316,15 +316,18 @@ fn network_turn(
     if !crate::domain_tasks::revalidate_service_segment() {
         return link.state();
     }
-    let mut started = timer::cpu_ticks();
     let mut network_stage = 40u64;
     service_stage(network_stage);
+    // Stopped-snapshot instrumentation is not work owned by the following
+    // service reservation. Start actual accounting after publishing it.
+    let mut started = timer::cpu_ticks();
     let mut checkpoint = || {
         finish_service(started);
         mechanism_progress(coordinator);
-        started = resume_network_service(coordinator);
+        resume_network_service(coordinator);
         network_stage = network_stage.saturating_add(1);
         service_stage(network_stage);
+        started = timer::cpu_ticks();
     };
     let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
     if matches!(state, Ok(TcpState::Established)) && epoch != 0 {

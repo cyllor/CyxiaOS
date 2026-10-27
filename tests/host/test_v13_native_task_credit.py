@@ -45,6 +45,20 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("receive_frame_with_checkpoint", transport)
         self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
 
+    def test_network_stage_diagnostic_is_outside_next_service_debit(self):
+        runtime = (ROOT / "kernel/src/unified.rs").read_text()
+        turn = runtime[runtime.index("fn network_turn(") : runtime.index("fn progress(")]
+
+        self.assertLess(
+            turn.index("service_stage(network_stage);"),
+            turn.index("let mut started = timer::cpu_ticks();"),
+        )
+        resume = turn[turn.index("resume_network_service(coordinator);") :]
+        self.assertLess(
+            resume.index("service_stage(network_stage);"),
+            resume.index("started = timer::cpu_ticks();"),
+        )
+
     def test_builtin_boundary_has_single_writer_phase_detail(self):
         runtime = (ROOT / "kernel/src/smp.rs").read_text()
 

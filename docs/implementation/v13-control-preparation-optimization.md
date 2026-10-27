@@ -1119,6 +1119,26 @@ selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
 required before stage 50 can be considered closed, and the 69-case v1.3
 catalogue remains open.
 
+Run `40453655606` crosses every native C-worker probe after the probe recovery
+path stops acquiring the unrelated policy witness. Both builtin rows also
+reach the refined marker 7. The only failure moves to CPU0 network service
+sequence 690 at stage 41, where the actual debit is
+2,500,904/2,500,000 ns—904 ns over the unchanged bound.
+
+Each network segment previously read its PMU start before publishing the
+CPU-private stopped-snapshot stage for that segment. That diagnostic volatile
+store is not NIC, TCP or owner work and was therefore accidentally charged to
+the following service reservation. Initial and resumed segments now publish
+their stage first and read the PMU start afterward; completion measurement and
+all real work remain unchanged. A structural regression pins both orderings.
+The current source passes 627 host tests (two environment skips), 153 v1.3
+tests (one historical-evidence skip), 71 evidence-tool tests, 74 VirtIO tests,
+14 cluster-network tests, formatting, patch checks and configured AArch64
+strict Clippy. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-network-stage-accounting` is
+`BUILT_NOT_RUN`; both selected stack paths remain 32,960/65,536 bytes.
+Patched-QEMU replay is required, and the 69-case v1.3 catalogue remains open.
+
 Run `40441481598` reaches an empty RX poll, so the new completion-record
 boundaries are not exercised. CPU0 service sequence 60 instead uses
 4,278,593/2,500,000 ns at network stage 44 across device-status validation,
