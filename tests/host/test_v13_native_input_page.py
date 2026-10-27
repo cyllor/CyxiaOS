@@ -30,8 +30,11 @@ class NativeInputPage(unittest.TestCase):
     def test_preparation_diagnostics_use_zero_terminated_rows(self):
         source = (ROOT / "kernel/src/domain_control.rs").read_text()
 
-        self.assertIn("DOMAIN_PREPARATION_DETAIL.0[base + phase + 1].store(0", source)
-        self.assertIn("DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0", source)
+        self.assertIn("row.store(phase + 1, 0)", source)
+        self.assertIn("row.store(phase, timer::cpu_ticks())", source)
+        self.assertIn("row.store(phase, now())", source)
+        self.assertIn("size_of::<PreparationEvidence>() == 128", source)
+        self.assertIn("size_of::<PreparationDetail>() == 256", source)
         self.assertIn("struct PreparationContextRow", source)
         self.assertIn("published: AtomicU64", source)
         self.assertIn(".write_volatile(value)", source)

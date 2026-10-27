@@ -17,18 +17,37 @@ use cyxia_prototype::{
     policy_wire::{self, Decision, Envelope, Plan, PlanHeader},
 };
 use sha2::{Digest, Sha256};
+#[repr(transparent)]
+struct DiagnosticRow<const N: usize>(UnsafeCell<[u64; N]>);
+unsafe impl<const N: usize> Sync for DiagnosticRow<N> {}
+impl<const N: usize> DiagnosticRow<N> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; N]))
+    }
+    fn store(&self, offset: usize, value: u64) {
+        // Each row has one CPU writer and is consumed only from a stopped
+        // failure snapshot. Volatile preserves the external evidence writes
+        // without introducing a translated atomic helper into the measured
+        // preparation path.
+        unsafe {
+            self.0.get().cast::<u64>().add(offset).write_volatile(value);
+        }
+    }
+}
 #[repr(C, align(64))]
-struct PreparationEvidence([core::sync::atomic::AtomicU64; 16]);
+struct PreparationEvidence([DiagnosticRow<8>; 2]);
 #[used]
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_EVIDENCE: PreparationEvidence =
-    PreparationEvidence([const { core::sync::atomic::AtomicU64::new(0) }; 16]);
+    PreparationEvidence([const { DiagnosticRow::new() }; 2]);
 #[repr(C, align(64))]
-struct PreparationDetail([core::sync::atomic::AtomicU64; 32]);
+struct PreparationDetail([DiagnosticRow<16>; 2]);
 #[used]
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
-    PreparationDetail([const { core::sync::atomic::AtomicU64::new(0) }; 32]);
+    PreparationDetail([const { DiagnosticRow::new() }; 2]);
+const _: () = assert!(core::mem::size_of::<PreparationEvidence>() == 128);
+const _: () = assert!(core::mem::size_of::<PreparationDetail>() == 256);
 #[repr(C, align(64))]
 struct PreparationContextRow {
     payload: UnsafeCell<[u64; 7]>,
@@ -68,31 +87,30 @@ fn preparation_detail(phase: usize) {
     if !(1..=2).contains(&cpu) {
         return;
     }
-    let base = (cpu - 1) * 16;
+    let row = &DOMAIN_PREPARATION_DETAIL.0[cpu - 1];
     if phase + 1 < 16 {
         // A zero terminator distinguishes this invocation from stale tail
         // slots without rewriting the complete diagnostic row on every paid
         // preparation turn. Markers are emitted in strict phase order.
-        DOMAIN_PREPARATION_DETAIL.0[base + phase + 1].store(0, Ordering::Relaxed);
+        row.store(phase + 1, 0);
     }
     // The coarse preparation bank retains wall-clock ordering. This detailed
     // bank uses the patched per-vCPU execution counter so MTTCG descheduling
     // cannot hide which preparation substage consumed the prepaid CPU credit.
     // Each bank has one CPU writer and is consumed only from a stopped failure
-    // snapshot whose credit record is the publication boundary. A release
-    // store at every diagnostic marker perturbs the measured preparation path.
-    DOMAIN_PREPARATION_DETAIL.0[base + phase].store(timer::cpu_ticks(), Ordering::Relaxed);
+    // snapshot whose credit record is the publication boundary.
+    row.store(phase, timer::cpu_ticks());
 }
 fn preparation_phase(phase: usize) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
         return;
     }
-    let base = (cpu - 1) * 8;
+    let row = &DOMAIN_PREPARATION_EVIDENCE.0[cpu - 1];
     if phase + 1 < 8 {
-        DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0, Ordering::Relaxed);
+        row.store(phase + 1, 0);
     }
-    DOMAIN_PREPARATION_EVIDENCE.0[base + phase].store(now(), Ordering::Release);
+    row.store(phase, now());
 }
 fn clear_preparation_context() {
     let cpu = cyxia_arch_aarch64::cpu::slot();

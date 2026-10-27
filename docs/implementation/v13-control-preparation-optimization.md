@@ -874,3 +874,17 @@ host tests (two environment skips), 144 v1.3 tests (one historical-evidence
 skip), formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-single-writer-preparation-context` passes
 both selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
+
+Run `40431883221` confirms the context change cuts marker 0→1 from about
+8.640 ms to 4.023 ms and advances through marker 7. The complete phase still
+uses 21,146,527/2,500,000 ns because every coarse/detail marker retains two
+atomic helper stores (next zero terminator plus current timestamp). These banks
+also have one writer per CPU and no live Rust reader, so they now use volatile
+single-writer rows. Their stopped-snapshot ABI remains exactly 16 and 32 u64
+words (128 and 256 bytes), including the same zero-termination convention.
+Only the context start/validity word remains an AtomicU64 Release publication.
+The full 618 host tests (two environment skips), 144 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-single-writer-preparation-banks` passes both
+selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
