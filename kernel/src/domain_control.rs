@@ -52,9 +52,16 @@ struct PreparationPrefixDetail([DiagnosticRow<8>; 2]);
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_PREFIX_DETAIL: PreparationPrefixDetail =
     PreparationPrefixDetail([const { DiagnosticRow::new() }; 2]);
+#[repr(C, align(64))]
+struct PreparationEntryDetail([DiagnosticRow<8>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_ENTRY_DETAIL: PreparationEntryDetail =
+    PreparationEntryDetail([const { DiagnosticRow::new() }; 2]);
 const _: () = assert!(core::mem::size_of::<PreparationEvidence>() == 128);
 const _: () = assert!(core::mem::size_of::<PreparationDetail>() == 256);
 const _: () = assert!(core::mem::size_of::<PreparationPrefixDetail>() == 128);
+const _: () = assert!(core::mem::size_of::<PreparationEntryDetail>() == 128);
 #[repr(C, align(64))]
 struct PreparationContextRow {
     payload: UnsafeCell<[u64; 7]>,
@@ -114,6 +121,17 @@ fn preparation_prefix_detail(phase: usize) {
         return;
     }
     let row = &DOMAIN_PREPARATION_PREFIX_DETAIL.0[cpu - 1];
+    if phase + 1 < 8 {
+        row.store(phase + 1, 0);
+    }
+    row.store(phase, timer::cpu_ticks());
+}
+fn preparation_entry_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_ENTRY_DETAIL.0[cpu - 1];
     if phase + 1 < 8 {
         row.store(phase + 1, 0);
     }
@@ -1174,7 +1192,9 @@ fn next_locked_inner(
     preparation_phase(0);
     preparation_detail(0);
     clear_preparation_context();
+    preparation_entry_detail(0);
     require_control(&s.owner)?;
+    preparation_entry_detail(1);
     if s.boot == 0
         || s.job.is_some()
         || s.registry.optimization_stopped()
@@ -1182,10 +1202,12 @@ fn next_locked_inner(
     {
         return Ok(false);
     }
+    preparation_entry_detail(2);
     if s.registry.publisher() != publisher(controller_epoch) {
         s.registry
             .change_publisher(s.registry.publisher(), publisher(controller_epoch))?;
     }
+    preparation_entry_detail(3);
     if s.preparation
         .is_some_and(|p| p.identity.sequence != s.sequence)
     {
@@ -1201,6 +1223,7 @@ fn next_locked_inner(
             input,
         );
     }
+    preparation_entry_detail(4);
     match next_normal(
         s,
         controller_epoch,
@@ -1236,6 +1259,7 @@ fn next_normal(
     cpu_started: u64,
     input: &mut [u64; 512],
 ) -> Result<bool, Error> {
+    preparation_entry_detail(5);
     let start_cursor = s.family_cursor;
     let turns = if s.preparation.is_some() { 1 } else { 18 };
     // One prepaid control turn evaluates at most one registered, due family.
@@ -1261,6 +1285,7 @@ fn next_normal(
         // owner view. A retry must never turn owner contention into absence,
         // and the exact lookahead must not advance onto fallback ordinal zero.
         let mut targets = [None; 2];
+        preparation_entry_detail(6);
         let target_result = read_target_batch(
             f.target_source,
             &[
@@ -1269,6 +1294,7 @@ fn next_normal(
             ],
             &mut targets,
         );
+        preparation_entry_detail(7);
         if let Err(error) = target_result {
             preparation_lookup(index, f, ordinal, wall_started);
             return Err(error);

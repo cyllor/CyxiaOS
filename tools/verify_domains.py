@@ -75,7 +75,8 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
             "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256,
-            "DOMAIN_PREPARATION_PREFIX_DETAIL": 128}
+            "DOMAIN_PREPARATION_PREFIX_DETAIL": 128,
+            "DOMAIN_PREPARATION_ENTRY_DETAIL": 128}
 
 
 def require(condition, message):
@@ -523,6 +524,7 @@ def diagnostics(guest, bundle):
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
                                     ("DOMAIN_PREPARATION_PREFIX_DETAIL", "preparation_prefix_detail", 16),
+                                    ("DOMAIN_PREPARATION_ENTRY_DETAIL", "preparation_entry_detail", 16),
                                     ("DOMAIN_PREPARATION_CONTEXT", "preparation_context", 16),
                                     ("DOMAIN_SERVICE_DETAIL", "service_detail", 16),
                                     ("BUILTIN_TASK_DETAIL", "builtin_detail", 32),

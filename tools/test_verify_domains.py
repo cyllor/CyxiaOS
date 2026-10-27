@@ -460,6 +460,7 @@ class EvidenceParserTests(unittest.TestCase):
         preparation = list(range(16))
         detail = list(range(32))
         prefix_detail = list(range(16))
+        entry_detail = list(range(16))
         context = [4, 3, 1, 0x1234, 7, 1024, 32, 900_010_000] + [0] * 8
         with self.assertRaisesRegex(ValueError, r'"preparation_evidence":\[0,1,2'):
             diagnostics(guest, {"UNIFIED_EVIDENCE": encode([0] * 512),
@@ -468,11 +469,13 @@ class EvidenceParserTests(unittest.TestCase):
                                 "DOMAIN_PREPARATION_EVIDENCE": encode(preparation),
                                 "DOMAIN_PREPARATION_DETAIL": encode(detail),
                                 "DOMAIN_PREPARATION_PREFIX_DETAIL": encode(prefix_detail),
+                                "DOMAIN_PREPARATION_ENTRY_DETAIL": encode(entry_detail),
                                 "DOMAIN_PREPARATION_CONTEXT": encode(context)})
         self.assertEqual(guest["control_credit"], parsed)
         self.assertEqual(guest["preparation_evidence"], preparation)
         self.assertEqual(guest["preparation_detail"], detail)
         self.assertEqual(guest["preparation_prefix_detail"], prefix_detail)
+        self.assertEqual(guest["preparation_entry_detail"], entry_detail)
         self.assertEqual(guest["preparation_context"], context)
 
     def test_standalone_service_stage_overrides_legacy_unified_word(self):

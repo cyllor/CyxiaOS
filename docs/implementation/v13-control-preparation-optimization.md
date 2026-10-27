@@ -1308,3 +1308,22 @@ secondary-fatal record when one is present. A focused regression preserves the
 standalone incomplete-C rejection and proves a complete task overrun wins this
 concurrent ordering. Another native replay is required to recover the primary
 failure; the pending task changes and 69-case catalogue remain open.
+
+Run `40457158425` recovers that primary failure as a complete CPU1 control
+receipt. Ordinary preparation sequence 2505 uses 15,821,221/2,500,000 ns in
+phase 3 for family 0 (domain 1, kind 1, task 1:1). The existing detail bank
+reaches marker 2: marker 0 to 1 costs 6,716,897 ns, marker 1 to 2 costs
+1,154,761 ns, and the already refined replay prefix itself completes in about
+1.062 ms. Thus the remaining dominant interval precedes the candidate prefix,
+but still combines entry checks, governance reservation, family scheduling,
+task target resolution and context publication.
+
+`DOMAIN_PREPARATION_ENTRY_DETAIL` now records eight ordered patched per-vCPU
+counter values around those operations. It is a two-row, CPU-single-writer
+volatile diagnostic bank and adds no lock, authority, budget or acceptance
+rule. The verifier exports the complete stopped-snapshot rows. All 72 evidence
+tool tests, formatting and configured AArch64 strict Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-entry-detail` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 32,976/65,536 bytes with the unchanged 4,096-byte
+exception reserve. Patched-QEMU replay is required to identify the exact entry
+substage; the 69-case v1.3 catalogue remains open.
