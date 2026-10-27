@@ -6,7 +6,10 @@ from verify_smp import require
 
 HEADER = 512
 RECORD = 768
-MAX_EVENTS = 256
+MAX_EVENTS = 384
+PRESSURE_CHUNK_BYTES = 64 * 1024
+PRESSURE_FILE_BYTES = 8 * 1024 * 1024
+PRESSURE_CHUNKS = PRESSURE_FILE_BYTES // PRESSURE_CHUNK_BYTES
 TRACE_MAGIC = 0x4359584131305452
 EVENT_MAGIC = 0x4359584131304556
 EMPTY_HASH = hashlib.sha256(b'').digest()
@@ -15,6 +18,21 @@ EMPTY_HASH = hashlib.sha256(b'').digest()
 def payload(version: int) -> bytes:
     require(version in (1,2,3), 'unknown A10 payload version')
     return b''.join(struct.pack('<Q', 0xa100000000000000 | version << 32 | index) for index in range(512))
+
+
+def pressure_chunk(file_index: int, chunk: int) -> bytes:
+    require(file_index in (1, 2) and 0 <= chunk < PRESSURE_CHUNKS,
+            'invalid A10 cache-pressure chunk')
+    first = chunk * (PRESSURE_CHUNK_BYTES // 8)
+    return b''.join(struct.pack('<Q', 0xa400000000000000 | file_index << 48 | first + word)
+                    for word in range(PRESSURE_CHUNK_BYTES // 8))
+
+
+def pressure_sha256(file_index: int) -> str:
+    digest = hashlib.sha256()
+    for chunk in range(PRESSURE_CHUNKS):
+        digest.update(pressure_chunk(file_index, chunk))
+    return digest.hexdigest()
 
 
 def verify_boot(page: bytes, before: dict, serial: bytes) -> dict:
@@ -47,8 +65,8 @@ def verify_terminal(raw: bytes, binding: dict, capture: dict) -> dict:
     result = {}
     for role, name in ((1,'writer'), (2,'reader')):
         slot = raw[(role-1)*256:role*256]
-        if role == 1 and binding['mode'] == 3:
-            require(not any(slot), 'recovery has an unexpected writer exit')
+        if role == 1 and binding['mode'] >= 3:
+            require(not any(slot), 'reader-only mode has an unexpected writer exit')
             continue
         (tag, owner_id, owner_generation, code, at, serial, magic, version, mode,
          seen_role, boot, stage, object_id, object_generation, consumed, observed,
@@ -61,7 +79,8 @@ def verify_terminal(raw: bytes, binding: dict, capture: dict) -> dict:
                 and not any(slot[144:]), 'incomplete/mismatched A10 task exit')
         expected = 2 if mode == 1 else 3
         require((consumed == expected and verified == 0 and observed == expected) if role == 1
-                else (consumed == 0 and verified == 4096 and (observed in (2,3) if mode == 3 else observed == 2)),
+                else (consumed == 0 and verified == (8192 if mode == 4 else 4096)
+                      and (observed in (2,3) if mode >= 3 else observed == 2)),
                 'invalid A10 consumed/observed sequence')
         owned = [row for row in capture['records'] if row['owner'] == capture[name]]
         require(owned and at >= owned[-1]['at_ns'], 'A10 exit predates delivered replies')
@@ -71,18 +90,18 @@ def verify_terminal(raw: bytes, binding: dict, capture: dict) -> dict:
 
 
 def decode(raw: bytes, binding: dict) -> dict:
-    require(HEADER <= len(raw) <= 200704, 'incomplete/oversized A10 capture')
+    require(HEADER <= len(raw) <= 295424, 'incomplete/oversized A10 capture')
     magic, version, width, count, overflow, epoch, mode = struct.unpack_from('<7Q', raw)
     require((magic, version, width) == (TRACE_MAGIC, 1, RECORD) and 0 < count <= MAX_EVENTS
             and overflow == 0, 'invalid/overflowed A10 capture')
-    require(epoch == binding['boot_epoch'] > 0 and mode == binding['mode'] in (1, 2, 3), 'wrong A10 boot/mode')
+    require(epoch == binding['boot_epoch'] > 0 and mode == binding['mode'] in (1, 2, 3, 4), 'wrong A10 boot/mode')
     for at, width, key in ((56,16,'nonce'),(72,16,'uuid'),(120,32,'image_sha256'),
                            (152,32,'input_sha256'),(184,32,'source_sha256')):
         wanted = bytes.fromhex(binding[key])
         require(len(wanted) == width and any(wanted) and raw[at:at+width] == wanted, 'A10 run identity mismatch')
     writer = struct.unpack_from('<2Q', raw, 88)
     reader = struct.unpack_from('<2Q', raw, 104)
-    require(all(reader) and writer != reader and (all(writer) if mode != 3 else writer == (0,0)), 'invalid A10 task owners')
+    require(all(reader) and writer != reader and (all(writer) if mode <= 2 else writer == (0,0)), 'invalid A10 task owners')
     require(not any(raw[216:HEADER]), 'A10 header reserved bytes')
     end = HEADER+count*RECORD
     require(len(raw) >= end and not any(raw[end:]), 'truncated/unpublished A10 record suffix')
@@ -167,6 +186,121 @@ def verify_visibility(raw: bytes, binding: dict, path: str, sequence: int, paylo
                 scope='one protected fsync receipt and cross-endpoint read; no complete fault matrix')
 
 
+def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
+    """Prove the same-boot mode-4 cache-pressure and backing-read sequence."""
+    require(capture['mode'] == 4 and set(terminal) == {'reader'},
+            'cache eviction requires one completed reader role')
+    owner = capture['reader']
+    original = oracle['files'].get('/a10/value')
+    require(original is not None and original['durable_write_seq'] in (2, 3)
+            and original['size'] == 4096
+            and original['sha256'] == hashlib.sha256(payload(original['durable_write_seq'])).hexdigest(),
+            'cache eviction changed the acknowledged original object')
+    original_object = original['inode'], original['generation']
+    require(terminal['reader']['object'] == original_object
+            and terminal['reader']['observed_sequence'] == original['durable_write_seq']
+            and terminal['reader']['verified_bytes'] == 8192,
+            'cache eviction terminal does not cover both exact reads')
+
+    handles = {}
+    created = {}
+    writes = {path: [] for path in ('/a10/pressure-a', '/a10/pressure-b')}
+    fsyncs = {}
+    original_reads = []
+    records = capture['records']
+    expected = [(10, '/a10/value', 1), (2, '/a10/value', 1),
+                (3, '', 0), (6, '', 0), (10, '/a10/value', 1)]
+    for path in writes:
+        expected += [(1, path, 0), (2, path, 2)]
+        expected += [(4, '', 0)] * PRESSURE_CHUNKS
+        expected += [(5, '', 0), (6, '', 0)]
+    expected += [(10, '/a10/value', 1), (2, '/a10/value', 1),
+                 (3, '', 0), (6, '', 0), (10, '/a10/value', 1)]
+    require(len(records) == len(expected) == 274
+            and all((row['operation'], row['path'], row['open_mode']) == wanted
+                    for row, wanted in zip(records, expected)),
+            'cache eviction operation sequence changed')
+    for index, row in enumerate(records):
+        require(row['owner'] == owner, 'cache eviction includes another task owner')
+        operation = row['operation']
+        if row['result'] != 0:
+            raise ValueError('cache eviction contains a failed file operation')
+        key = row['owner'], row['handle']
+        if operation == 1:
+            require(row['path'] in writes and row['path'] not in created,
+                    'cache eviction created an unexpected or duplicate object')
+            created[row['path']] = row['object']
+        elif operation == 2:
+            require(all(row['handle']) and key not in handles
+                    and (row['object'] == original_object if row['path'] == '/a10/value'
+                         else created.get(row['path']) == row['object']),
+                    'cache eviction has an invalid open handle')
+            handles[key] = row['path'], row['object']
+        elif operation == 6:
+            require(key in handles, 'cache eviction closes an unknown handle')
+            del handles[key]
+        elif operation in (3, 4, 5):
+            require(key in handles and handles[key][1] == row['object'],
+                    'cache eviction data operation has wrong handle/object')
+            path = handles[key][0]
+            if operation == 3:
+                require(path == '/a10/value' and row['object'] == original_object
+                        and row['offset'] == 0 and row['data_length'] == 4096
+                        and row['data_sha256'] == original['sha256'],
+                        'cache eviction read does not match the original object')
+                original_reads.append((index, row))
+            elif operation == 4:
+                require(path in writes and row['data_length'] == PRESSURE_CHUNK_BYTES
+                        and row['count'] == PRESSURE_CHUNK_BYTES,
+                        'invalid cache-pressure write')
+                chunk = len(writes[path])
+                file_index = 1 if path.endswith('-a') else 2
+                require(chunk < PRESSURE_CHUNKS
+                        and row['offset'] == chunk * PRESSURE_CHUNK_BYTES
+                        and row['data_sha256'] == hashlib.sha256(
+                            pressure_chunk(file_index, chunk)).hexdigest(),
+                        'cache-pressure bytes or offset changed')
+                writes[path].append(row)
+            else:
+                require(path in writes and path not in fsyncs
+                        and len(writes[path]) == PRESSURE_CHUNKS
+                        and row['write_seq'] == row['durable_seq'] == PRESSURE_CHUNKS,
+                        'cache-pressure fsync does not cover the complete file')
+                fsyncs[path] = row
+        elif operation == 10:
+            require(row['path'] == '/a10/value' and row['object'] == original_object
+                    and row['count'] == 4096
+                    and row['write_seq'] == row['durable_seq'] == original['durable_write_seq'],
+                    'cache eviction STAT changed the original object')
+        else:
+            raise ValueError('cache eviction contains an unexpected operation')
+    require(not handles and set(created) == set(writes) == set(fsyncs)
+            and all(len(rows) == PRESSURE_CHUNKS for rows in writes.values())
+            and len(original_reads) == 2,
+            'incomplete cache-pressure operation sequence')
+    for file_index, path in enumerate(('/a10/pressure-a', '/a10/pressure-b'), 1):
+        durable = oracle['files'].get(path)
+        require(durable is not None and durable['size'] == PRESSURE_FILE_BYTES
+                and durable['durable_write_seq'] == PRESSURE_CHUNKS
+                and durable['sha256'] == pressure_sha256(file_index)
+                and (durable['inode'], durable['generation']) == created[path],
+                'durable cache-pressure file disagrees with protected writes')
+    final_index, final_read = original_reads[-1]
+    require(final_index > 0 and records[final_index - 1]['sequence'] + 1 == final_read['sequence']
+            and final_read['cache_misses'] > records[final_index - 1]['cache_misses']
+            and final_read['reads'] > records[final_index - 1]['reads'],
+            'final original read was not a measured cache miss/backing read')
+    return dict(mode=4, boot_epoch=capture['boot_epoch'], object=original_object,
+                durable_write_seq=original['durable_write_seq'], pressure_files=2,
+                pressure_pages=PRESSURE_FILE_BYTES * 2 // 4096,
+                first_read_event=original_reads[0][1]['sequence'],
+                eviction_read_event=final_read['sequence'],
+                cache_miss_delta=final_read['cache_misses'] - records[final_index - 1]['cache_misses'],
+                backing_read_delta=final_read['reads'] - records[final_index - 1]['reads'],
+                cache_eviction_verified=True, A10_complete=False,
+                scope='same-boot ordinary EL0 cache eviction; crash/replay matrix remains incomplete')
+
+
 def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict) -> dict:
     """Check one clean native mode against independently decoded durable bytes.
 
@@ -184,12 +318,14 @@ def verify_filesystem(raw: bytes, binding: dict, progress: bytes, oracle: dict) 
             and oracle['last_commit_lsn'] >= capture['records'][-1]['commit_lsn'],
             'durable image does not cover protected native prefix')
     sequence = durable['durable_write_seq']
-    require((sequence == 2 if mode == 1 else sequence == 3) if mode != 3 else sequence in (2,3),
+    require((sequence == 2 if mode == 1 else sequence == 3) if mode <= 2 else sequence in (2,3),
             'wrong final durable sequence')
     obj = durable['inode'], durable['generation']
     require(durable['size'] == 4096 and durable['sha256'] == hashlib.sha256(payload(sequence)).hexdigest()
             and all(item['object'] == obj for item in terminal.values()),
             'durable data/object disagrees with consumed native result')
+    if mode == 4:
+        return verify_cache_eviction(capture, terminal, oracle)
     expected_read = sequence if mode == 3 else 2
     require(terminal['reader']['observed_sequence'] == expected_read, 'recovery read chose a different durable version')
     expected_acks = [1,2] if mode == 1 else [3] if mode == 2 else []

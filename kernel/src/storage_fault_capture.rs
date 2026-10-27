@@ -14,7 +14,7 @@ static A10_CAPTURE: state::Capture = state::Capture::new();
 static mut A10_CONFIG: [u64; 64] = [u64::MAX; 64];
 #[used]
 #[unsafe(no_mangle)]
-static A10_CAPTURE_LAYOUT: [u64; 8] = [1, 512, 768, 256, 197120, 200704, 512, 512];
+static A10_CAPTURE_LAYOUT: [u64; 8] = [1, 512, 768, 384, 295424, 299008, 512, 512];
 #[used]
 #[unsafe(no_mangle)]
 static A10_PROGRESS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];

@@ -3,12 +3,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C, align(4096))]
 pub struct Capture {
-    pub words: [AtomicU64; 24640],
+    pub words: [AtomicU64; 36928],
 }
 impl Capture {
     pub const fn new() -> Self {
         Self {
-            words: [const { AtomicU64::new(0) }; 24640],
+            words: [const { AtomicU64::new(0) }; 36928],
         }
     }
     fn put(&self, at: usize, words: &[u64]) {
@@ -27,7 +27,7 @@ impl Capture {
     pub fn begin(&self, config: &[u64; 64], epoch: u64, uuid: [u8; 16]) -> bool {
         if config[0] != 0x4359584131304346
             || config[1] != 1
-            || !(1..=3).contains(&config[2])
+            || !(1..=4).contains(&config[2])
             || config[3] != epoch
             || epoch == 0
             || config[4..6] == [0; 2]
@@ -46,7 +46,7 @@ impl Capture {
     pub fn owner(&self, role: usize, owner: [u64; 2]) -> bool {
         if !(1..=2).contains(&role)
             || owner.contains(&0)
-            || (role == 1 && self.words[6].load(Ordering::Acquire) == 3)
+            || (role == 1 && self.words[6].load(Ordering::Acquire) >= 3)
         {
             return false;
         }
@@ -79,7 +79,7 @@ impl Capture {
             return;
         }
         let count = self.words[3].load(Ordering::Acquire);
-        if count >= 256 {
+        if count >= 384 {
             self.fail();
             return;
         }

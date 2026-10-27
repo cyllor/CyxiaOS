@@ -472,7 +472,7 @@ pub fn run(info: &BootInfo) -> ! {
         p.peer_node = *PEER;
     }
     if crate::storage_fault_capture::PROFILE {
-        if crate::storage_fault_capture::mode() != 3 {
+        if crate::storage_fault_capture::mode() <= 2 {
             startup(15, || crate::domain_tasks::start_storage_client(1));
         }
         startup(15, || crate::domain_tasks::start_storage_client(2));

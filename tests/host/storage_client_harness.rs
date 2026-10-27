@@ -130,14 +130,19 @@ fn file_call(frame: &mut file::Frame, _: u64) -> bool {
     let mut object = m.objects[&path].clone();
     match operation {
         file::WRITE => {
-            assert_eq!(frame.u64(file::OFF_OFFSET), 0);
-            assert_eq!(frame.u32(file::OFF_DATA_LENGTH), 4096);
+            let offset = frame.u64(file::OFF_OFFSET) as usize;
+            let length = frame.u32(file::OFF_DATA_LENGTH) as usize;
+            assert_eq!(offset % 8, 0);
+            assert!(matches!(length, 4096 | 65536));
             let address = frame.u64(file::OFF_DATA);
-            object.data = (0..512)
-                .map(|word| m.memory[&(address + word * 8)])
+            let words: Vec<_> = (0..length / 8)
+                .map(|word| m.memory[&(address + word as u64 * 8)])
                 .collect();
+            let first = offset / 8;
+            object.data.resize(object.data.len().max(first + words.len()), 0);
+            object.data[first..first + words.len()].copy_from_slice(&words);
             object.sequence += 1;
-            frame.set_u64(file::OFF_COUNT, 4096);
+            frame.set_u64(file::OFF_COUNT, length as u64);
             object_reply(frame, &object);
         }
         file::READ => {
@@ -200,6 +205,9 @@ fn marker(epoch: u64) -> bool {
         .unwrap()
         .objects
         .contains_key(&format!("/a10/seen-{epoch:016x}"))
+}
+fn named(path: &str) -> Object {
+    MACHINE.lock().unwrap().objects[path].clone()
 }
 fn prepare() {
     assert_eq!(launch(1, 1, 1, 101), 0);
@@ -280,4 +288,27 @@ fn invalid_launch_never_issues_file_requests() {
     assert_ne!(launch(3, 1, 1, 101), 0);
     assert_ne!(launch(1, 1, 0, 101), 0);
     assert!(MACHINE.lock().unwrap().requests.is_empty());
+}
+
+#[test]
+fn same_boot_cache_pressure_retains_and_rereads_the_original_value() {
+    reset();
+    prepare();
+    assert_eq!(launch(4, 2, 2, 402), 0);
+    assert_eq!(value().durable, 2);
+    assert_eq!(value().data[511], 0xa1000002000001ff);
+    for (index, path) in [(1u64, "/a10/pressure-a"), (2, "/a10/pressure-b")] {
+        let object = named(path);
+        assert_eq!(object.data.len(), 8 * 1024 * 1024 / 8);
+        assert_eq!(object.sequence, 128);
+        assert_eq!(object.durable, 128);
+        assert_eq!(object.data[0], 0xa400000000000000 | index << 48);
+        assert_eq!(
+            object.data[object.data.len() - 1],
+            0xa400000000000000 | index << 48 | (object.data.len() as u64 - 1)
+        );
+    }
+    assert_eq!(get(0x30000 + 6 * 8), 8);
+    assert_eq!(get(0x30000 + 11 * 8), 8192);
+    assert!(MACHINE.lock().unwrap().handles.is_empty());
 }

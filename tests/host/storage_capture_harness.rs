@@ -19,6 +19,21 @@ fn rejects_wrong_boot_uuid_or_reserved_configuration() {
     bad[20] = 1;
     assert!(!state::Capture::new().begin(&bad, 9, uuid));
 }
+
+#[test]
+fn cache_eviction_mode_accepts_only_the_reader_owner() {
+    let s = Box::new(state::Capture::new());
+    let mut c = config();
+    c[2] = 4;
+    assert!(s.begin(
+        &c,
+        9,
+        [7u64.to_le_bytes(); 2].concat().try_into().unwrap()
+    ));
+    assert!(!s.owner(1, [100, 3]));
+    assert!(s.owner(2, [101, 3]));
+}
+
 #[test]
 fn only_registered_owner_is_published_and_overflow_fails_closed() {
     let s = Box::new(state::Capture::new());
@@ -30,7 +45,7 @@ fn only_registered_owner_is_published_and_overflow_fails_closed() {
     assert!(s.owner(1, [100, 3]));
     assert!(s.owner(2, [101, 3]));
     assert!(!s.selected([100, 4]));
-    for index in 0..256 {
+    for index in 0..384 {
         s.record(
             [index + 1, 9, 100, 3, 24, 80, 16, 4, 0, 0],
             [0xab; 32],
@@ -40,7 +55,7 @@ fn only_registered_owner_is_published_and_overflow_fails_closed() {
     }
     assert_eq!(s.words[64].load(Ordering::Acquire), 0x4359584131304556);
     assert_eq!(s.words[80].load(Ordering::Acquire), 0x5a5a5a5a5a5a5a5a);
-    s.record([257, 9, 100, 3, 24, 80, 16, 4, 0, 0], [0; 32], &[0; 640]);
-    assert_eq!(s.words[3].load(Ordering::Acquire), 256);
+    s.record([385, 9, 100, 3, 24, 80, 16, 4, 0, 0], [0; 32], &[0; 640]);
+    assert_eq!(s.words[3].load(Ordering::Acquire), 384);
     assert_ne!(s.words[4].load(Ordering::Acquire), 0);
 }

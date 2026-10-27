@@ -1,8 +1,9 @@
 # Ordinary EL0 filesystem crash scenario for A10
 
 Status: independent volume decoder/image regression, dedicated EL0 producer,
-protected capture, shared kernel wiring and single-mode runner are implemented.
-No ordinary-file native run is yet certified.
+protected capture, shared kernel wiring and four-mode runner are implemented.
+Mode 4 now implements the same-boot cache-eviction workload and strict receipt
+verification described below. No ordinary-file native run is yet certified.
 The four successful boot/journal COMMIT-FLUSH cuts do not complete A10.
 
 ## Workload and source ownership
@@ -106,15 +107,23 @@ real cache eviction. Reboot creates a cold cache but will not be labeled as a
 same-boot eviction test. That additional phase must pressure or reclaim the real
 cache and prove a miss/backing read without changing mandatory policy budgets.
 
-A later dedicated mode can pressure the actual `FileSystem<4096>` cache with
-ordinary file ABI writes: warm-read `value`, then write and FSYNC two additional
-8 MiB files (4096 new pages), then reread `value` in the original boot. The final
-protected READ must show a positive per-call cache-miss delta and an actual
-NativeDisk read increase, alongside exact contents and stable object identity.
-This is only a proposed workload until those facts are observed. Its 256
-64-KiB WRITE calls plus metadata exceed the current 256-event reservation, so
-it needs a separately declared larger bounded capture and its own tested runtime
-budget. Modes 1–3 and their native receipts come first.
+Mode 4 pressures the actual `FileSystem<4096>` cache with ordinary file ABI
+writes: it warm-reads `value`, writes and FSYNCs two additional exact 8 MiB
+files (4096 new pages total), then rereads `value` in the same boot. Each
+pressure file is written in 128 ordered 64 KiB calls with independently known
+bytes. The protected capture capacity is explicitly 384 events; the loaded ELF
+publishes a 295,424-byte logical trace in a 299,008-byte page-aligned symbol.
+The independent verifier checks every chunk offset/hash, both durable file
+hashes and object identities, then requires positive per-call cache-miss and
+NativeDisk-read deltas on the final original-file READ. A host execution of the
+actual client and a 274-record tamper fixture cover the flow, but only a native
+mode-4 run can establish those facts. The mode therefore remains
+`BUILT_NOT_RUN` and A10 remains `NOT_RUN`.
+
+The runner's diagnostic layout check was also corrected to the current complete
+`DOMAIN_CONTROL_EVIDENCE` bank: 512 header words plus 64 records of 640 words,
+331,776 bytes. The previous 4 KiB expectation would have rejected every current
+A10 image before QEMU launch.
 
 Continue using sparse disk files. New raw NBD logs can use lossless gzip with
 both uncompressed and stored-byte digests; independently reconstructible disk

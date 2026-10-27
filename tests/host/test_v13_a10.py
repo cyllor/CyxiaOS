@@ -17,10 +17,12 @@ class ProtectedFileReplies(unittest.TestCase):
         self.binding=dict(nonce='08'*16,uuid='07'*16,image_sha256='04'*32,
                           input_sha256='05'*32,source_sha256='03'*32,boot_epoch=1,mode=1)
 
-    def frame(self,operation,request,*,handle=(0,0),obj=(5,2),seq=0,data=b'',path='',offset=0):
+    def frame(self,operation,request,*,handle=(0,0),obj=(5,2),seq=0,data=b'',path='',offset=0,
+              open_mode=None):
         frame=bytearray(640)
         struct.pack_into('<QHHHHQQQQQQQIHHqQQQQQ',frame,0,
-            0x435946494c453031,1,640,operation,3 if operation==2 else 0,
+            0x435946494c453031,1,640,operation,
+            (3 if operation==2 else 0) if open_mode is None else open_mode,
             request,11,9,*handle,offset,0x50000 if data else 0,len(data),len(path),0,
             0,len(data),*obj,seq,seq)
         frame[128:128+len(path)]=path.encode()
@@ -189,6 +191,87 @@ class ProtectedFileReplies(unittest.TestCase):
         bad=bytearray(rows[reader_count+1]);frame=bytearray(bad[128:]);frame[128:128+len(marker)]=b'/a10/seen-0000000000000000';bad[128:]=frame
         changed=list(rows);changed[reader_count+1]=bad
         with self.assertRaises(ValueError):self.verifier.verify_filesystem(bytes(head+b''.join(changed)),binding,progress,oracle)
+
+    def complete_cache_eviction(self):
+        binding=dict(self.binding,mode=4)
+        reader=(101,9)
+        head=bytearray(512)
+        struct.pack_into('<7Q',head,0,0x4359584131305452,1,768,0,0,1,4)
+        head[56:72]=bytes.fromhex(binding['nonce']);head[72:88]=bytes.fromhex(binding['uuid'])
+        struct.pack_into('<4Q',head,88,0,0,*reader)
+        for at,key in ((120,'image_sha256'),(152,'input_sha256'),(184,'source_sha256')):
+            head[at:at+32]=bytes.fromhex(binding[key])
+        rows=[]
+        counters=dict(reads=10,writes=20,flushes=4,misses=1)
+        def add(frame,data=b'',*,obj=(5,2),reads=None,misses=None):
+            row=bytearray(768);index=len(rows)+1
+            if reads is not None:counters['reads']=reads
+            if misses is not None:counters['misses']=misses
+            operation=struct.unpack_from('<H',frame,12)[0]
+            if operation == 4:counters['writes']+=8
+            if operation == 5:counters['flushes']+=1
+            struct.pack_into('<12Q',row,0,0x4359584131304556,index,index*10,1,*reader,29,
+                counters['reads'],counters['writes'],counters['flushes'],len(data),counters['misses'])
+            row[96:128]=hashlib.sha256(data).digest();row[128:]=frame;rows.append(row)
+        def stat(request):
+            frame=self.frame(10,request,seq=2,path='/a10/value')
+            struct.pack_into('<H',frame,14,1);struct.pack_into('<Q',frame,88,4096)
+            return frame
+        request=1
+        add(stat(request));request+=1
+        add(self.frame(2,request,handle=(1,200),path='/a10/value',open_mode=1));request+=1
+        original=self.verifier.payload(2)
+        add(self.frame(3,request,handle=(1,200),data=original),original,reads=11);request+=1
+        add(self.frame(6,request,handle=(1,200)));request+=1
+        add(stat(request));request+=1
+        for file_index,path,obj,handle_id in ((1,'/a10/pressure-a',(6,2),300),(2,'/a10/pressure-b',(7,2),400)):
+            add(self.frame(1,request,obj=obj,path=path),obj=obj);request+=1
+            add(self.frame(2,request,handle=(1,handle_id),obj=obj,path=path,open_mode=2),obj=obj);request+=1
+            for chunk in range(self.verifier.PRESSURE_CHUNKS):
+                data=self.verifier.pressure_chunk(file_index,chunk)
+                add(self.frame(4,request,handle=(1,handle_id),obj=obj,data=data,
+                    offset=chunk*self.verifier.PRESSURE_CHUNK_BYTES),data,obj=obj)
+                request+=1
+            add(self.frame(5,request,handle=(1,handle_id),obj=obj,seq=self.verifier.PRESSURE_CHUNKS),obj=obj)
+            request+=1
+            add(self.frame(6,request,handle=(1,handle_id),obj=obj),obj=obj);request+=1
+        add(stat(request));request+=1
+        add(self.frame(2,request,handle=(1,500),path='/a10/value',open_mode=1));request+=1
+        add(self.frame(3,request,handle=(1,500),data=original),original,reads=12,misses=2);request+=1
+        add(self.frame(6,request,handle=(1,500)));request+=1
+        add(stat(request))
+        struct.pack_into('<Q',head,24,len(rows))
+        terminal=bytearray(512)
+        struct.pack_into('<18Q',terminal,256,0x4359584131305052,*reader,0,5000,2,
+            0x4359584131305553,1,4,2,1,8,5,2,0,2,8192,0)
+        oracle=dict(uuid=binding['uuid'],boot_epoch=1,last_commit_lsn=29,files={
+            '/a10/value':dict(inode=5,generation=2,size=4096,durable_write_seq=2,
+                sha256=hashlib.sha256(original).hexdigest()),
+            '/a10/pressure-a':dict(inode=6,generation=2,size=self.verifier.PRESSURE_FILE_BYTES,
+                durable_write_seq=self.verifier.PRESSURE_CHUNKS,sha256=self.verifier.pressure_sha256(1)),
+            '/a10/pressure-b':dict(inode=7,generation=2,size=self.verifier.PRESSURE_FILE_BYTES,
+                durable_write_seq=self.verifier.PRESSURE_CHUNKS,sha256=self.verifier.pressure_sha256(2))})
+        return bytes(head+b''.join(rows)),bytes(terminal),oracle,binding
+
+    def test_same_boot_pressure_requires_a_real_cache_miss_and_backing_read(self):
+        raw,terminal,oracle,binding=self.complete_cache_eviction()
+        result=self.verifier.verify_filesystem(raw,binding,terminal,oracle)
+        self.assertTrue(result['cache_eviction_verified'])
+        self.assertEqual(result['pressure_pages'],4096)
+        self.assertFalse(result['A10_complete'])
+        final_read=next(row for row in reversed(range(512,len(raw),768))
+                        if struct.unpack_from('<H',raw,row+128+12)[0] == 3)
+        for offset in (56,88,96):
+            changed=bytearray(raw)
+            struct.pack_into('<Q',changed,final_read+offset,
+                struct.unpack_from('<Q',raw,final_read+offset)[0]-1)
+            with self.subTest(offset=offset),self.assertRaises(ValueError):
+                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle)
+        for record,field,value in ((5,128+12,10), (6,128+96,999)):
+            changed=bytearray(raw)
+            struct.pack_into('<H' if field == 140 else '<Q',changed,512+record*768+field,value)
+            with self.subTest(record=record,field=field),self.assertRaises(ValueError):
+                self.verifier.verify_filesystem(bytes(changed),binding,terminal,oracle)
 
     def test_boot_recovery_counters_match_independent_prefix_including_first_boot(self):
         serial=b'STORAGE_V13_BOOT_DURABLE\nSMP_BOOT_OK a=4 b=15 c=0\n'+b''.join(f'SMP_CPU_ON a={cpu} b={cpu} c=0\n'.encode() for cpu in (1,2,3))

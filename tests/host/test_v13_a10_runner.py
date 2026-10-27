@@ -32,7 +32,7 @@ class A10Runner(unittest.TestCase):
                                (112,32,'source_sha256'), (144,16,'uuid')):
             self.assertEqual(raw[at:at+width].hex(), binding[key])
         self.assertEqual(raw[160:], bytes(352))
-        for key, value in (('mode', 4), ('mode', True), ('boot_epoch', 0), ('nonce', '00'*16),
+        for key, value in (('mode', 5), ('mode', True), ('boot_epoch', 0), ('nonce', '00'*16),
                            ('uuid', '22'*15), ('image_sha256', '33'*31)):
             bad = dict(binding, **{key: value})
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
@@ -45,6 +45,7 @@ class A10Runner(unittest.TestCase):
         struct.pack_into('<Q', raw, 256, 0x4359584131305052)
         self.assertFalse(self.runner.terminal_ready(raw, 2))
         self.assertTrue(self.runner.terminal_ready(raw, 3))
+        self.assertTrue(self.runner.terminal_ready(raw, 4))
         struct.pack_into('<Q', raw, 0, 0x4359584131305052)
         # Failed exits are captured promptly; the independent verifier rejects
         # their exit codes rather than treating them as successful consumption.
@@ -74,6 +75,7 @@ class A10Runner(unittest.TestCase):
         self.assertEqual(self.runner.validate_start(fresh, 1)['boot_epoch'], 1)
         self.assertEqual(self.runner.validate_start(self.oracle(), 2)['prior_object'], (5, 2))
         self.assertEqual(self.runner.validate_start(self.oracle(3), 3)['boot_epoch'], 8)
+        self.assertEqual(self.runner.validate_start(self.oracle(3), 4)['boot_epoch'], 8)
         for oracle, mode in ((self.oracle(), 1), (fresh, 2), (self.oracle(3), 2)):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.runner.validate_start(oracle, mode)
@@ -89,6 +91,10 @@ class A10Runner(unittest.TestCase):
         self.runner.validate_build_profile(profile)
         profile['profiles']['fault'] = 'controller-panic'
         with self.assertRaises(ValueError): self.runner.validate_build_profile(profile)
+
+    def test_runner_uses_the_complete_current_control_evidence_bank(self):
+        self.assertEqual(self.runner.CONTROL_EVIDENCE_BYTES, (512 + 64 * 640) * 8)
+        self.assertEqual(self.runner.LAYOUT, (1, 512, 768, 384, 295424, 299008, 512, 512))
 
     def test_single_mode_or_cut_never_claims_complete_a10_acceptance(self):
         for cut in (False, True):

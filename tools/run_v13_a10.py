@@ -37,7 +37,8 @@ from verify_v13_a10 import decode, payload, verify_boot, verify_filesystem
 from verify_v13_model import loaded_bytes
 from verify_v13_storage_faults import copy_sparse
 
-LAYOUT = (1, 512, 768, 256, 197120, 200704, 512, 512)
+LAYOUT = (1, 512, 768, 384, 295424, 299008, 512, 512)
+CONTROL_EVIDENCE_BYTES = (512 + 64 * 640) * 8
 EXIT_MAGIC = 0x4359584131305052
 TOOL_NAMES = ('run_v13_a10.py', 'verify_v13_a10.py', 'run_v13_a02.py',
     'artifact_store.py', 'check_v13_preparation_stack.py',
@@ -49,7 +50,7 @@ TOOL_NAMES = ('run_v13_a10.py', 'verify_v13_a10.py', 'run_v13_a02.py',
 
 def config_bytes(binding: dict) -> bytes:
     mode, epoch = binding['mode'], binding['boot_epoch']
-    require(type(mode) is int and mode in (1, 2, 3)
+    require(type(mode) is int and mode in (1, 2, 3, 4)
             and type(epoch) is int and 0 < epoch < 2**64, 'invalid A10 mode/epoch')
     def identity(key, width):
         value = binding[key]
@@ -63,8 +64,8 @@ def config_bytes(binding: dict) -> bytes:
 
 
 def terminal_ready(raw: bytes, mode: int) -> bool:
-    require(len(raw) == 512 and mode in (1, 2, 3), 'invalid A10 exit probe')
-    roles = (1,) if mode == 3 else (0, 1)
+    require(len(raw) == 512 and mode in (1, 2, 3, 4), 'invalid A10 exit probe')
+    roles = (1,) if mode >= 3 else (0, 1)
     return all(struct.unpack_from('<Q', raw, role * 256)[0] == EXIT_MAGIC for role in roles)
 
 
@@ -87,7 +88,7 @@ def validate_build_profile(manifest: dict):
 
 
 def validate_start(oracle: dict, mode: int) -> dict:
-    require(type(mode) is int and mode in (1, 2, 3), 'invalid A10 mode')
+    require(type(mode) is int and mode in (1, 2, 3, 4), 'invalid A10 mode')
     epoch = oracle['boot_epoch']
     require(type(epoch) is int and 0 <= epoch < 2**64 - 1, 'invalid initial BootEpoch')
     value = oracle['files'].get('/a10/value')
@@ -144,7 +145,7 @@ def profile(image: bytes) -> dict:
             and capture['size'] == LAYOUT[5], 'unknown A10 capture layout')
     diagnostics = {}
     for name, key, size in (('STORAGE_V13_EVIDENCE', 'storage-boot', 4096),
-                           ('DOMAIN_CONTROL_EVIDENCE', 'control-header', 4096),
+                           ('DOMAIN_CONTROL_EVIDENCE', 'control-header', CONTROL_EVIDENCE_BYTES),
                            ('CONTROL_CREDIT_EVIDENCE', 'control-credit', 512),
                            ('TASK_OVERRUN_EVIDENCE', 'task-overrun', 256)):
         location = symbol(image, name)
@@ -407,7 +408,7 @@ def main():
     parser.add_argument('--initial-disk', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--source-root', type=Path, default=ROOT)
-    parser.add_argument('--mode', type=int, choices=(1, 2, 3), required=True)
+    parser.add_argument('--mode', type=int, choices=(1, 2, 3, 4), required=True)
     parser.add_argument('--timeout', type=float, default=210)
     parser.add_argument('--cut', type=int, default=0)
     parser.add_argument('--phase', choices=('before', 'after-ack'), default='before')

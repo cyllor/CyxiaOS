@@ -7,10 +7,15 @@ use core::sync::atomic::{Ordering, fence};
 const DATA: u64 = 0x50000;
 const PROGRESS: u64 = 0x30000;
 const BYTES: u64 = 4096;
+const DATA_PAGES: u64 = 16;
+const PRESSURE_CHUNK_BYTES: u64 = DATA_PAGES * 4096;
+const PRESSURE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const PRESSURE_CHUNKS: u64 = PRESSURE_FILE_BYTES / PRESSURE_CHUNK_BYTES;
 const VALUE: &str = "/a10/value";
+const PRESSURE: [&str; 2] = ["/a10/pressure-a", "/a10/pressure-b"];
 const DEADLINE_NS: u64 = 180_000_000_000;
 // At most 90 polling requests per role, leaving room for both endpoints and
-// the finite work in the protected 256-event capture. This changes no policy
+// the finite work in the protected capture. This changes no policy
 // budget and introduces no privileged I/O or acknowledgement shortcut.
 const POLL_NS: u64 = 2_000_000_000;
 
@@ -142,7 +147,7 @@ impl Client {
                 if frame.u16(file::OFF_MODE) != 1 || durable > written {
                     return Err(209);
                 }
-                let allowed = if self.mode == 3 {
+                let allowed = if self.mode >= 3 {
                     matches!(durable, 2 | 3)
                 } else {
                     durable == 2
@@ -150,7 +155,7 @@ impl Client {
                 if allowed && written == durable && frame.u64(file::OFF_COUNT) == BYTES {
                     return Ok(frame);
                 }
-                if self.mode == 3 || written > 2 || durable > 2 {
+                if self.mode >= 3 || written > 2 || durable > 2 {
                     return Err(209);
                 }
             } else if !matches!(frame.result(), -2 | -11 | -16 | -19) {
@@ -159,11 +164,11 @@ impl Client {
             self.wait_poll()?;
         }
     }
-    fn open(&mut self, mode: u16) -> Result<Identity> {
-        let mut frame = self.path_frame(file::OPEN, VALUE)?;
+    fn open_path(&mut self, path: &str, mode: u16, object: Identity) -> Result<Identity> {
+        let mut frame = self.path_frame(file::OPEN, path)?;
         frame.set_u16(file::OFF_MODE, mode);
         self.success(&mut frame)?;
-        self.object.matches(&frame)?;
+        object.matches(&frame)?;
         let key = Identity {
             id: frame.u64(file::OFF_HANDLE_ID),
             generation: frame.u64(file::OFF_HANDLE_GENERATION),
@@ -173,6 +178,9 @@ impl Client {
         }
         self.publish(2, 0);
         Ok(key)
+    }
+    fn open(&mut self, mode: u16) -> Result<Identity> {
+        self.open_path(VALUE, mode, self.object)
     }
     fn close(&mut self, key: Identity) -> Result<()> {
         let mut frame = self.frame(file::CLOSE)?;
@@ -249,10 +257,7 @@ impl Client {
         }
         self.close(key)
     }
-    fn reader(&mut self, marker: &str) -> Result<()> {
-        let before = self.await_value()?;
-        self.object = Identity::object(&before)?;
-        self.observed = before.u64(file::OFF_DURABLE_SEQ);
+    fn read_current(&mut self) -> Result<()> {
         let key = self.open(file::MODE_READ)?;
         for word in 0..BYTES / 8 {
             put(DATA + word * 8, 0);
@@ -282,8 +287,15 @@ impl Client {
         {
             return Err(209);
         }
-        self.verified = BYTES;
+        self.verified = self.verified.checked_add(BYTES).ok_or(213u64)?;
         self.publish(5, 0);
+        Ok(())
+    }
+    fn reader(&mut self, marker: &str) -> Result<()> {
+        let before = self.await_value()?;
+        self.object = Identity::object(&before)?;
+        self.observed = before.u64(file::OFF_DURABLE_SEQ);
+        self.read_current()?;
         if self.mode != 3 {
             let mut frame = self.path_frame(file::CREATE, marker)?;
             self.success(&mut frame)?;
@@ -292,9 +304,62 @@ impl Client {
         }
         Ok(())
     }
+    fn write_pressure_file(&mut self, path: &str, file_index: u64) -> Result<()> {
+        let mut frame = self.path_frame(file::CREATE, path)?;
+        self.success(&mut frame)?;
+        let object = Identity::object(&frame)?;
+        let key = self.open_path(path, file::MODE_WRITE, object)?;
+        for chunk in 0..PRESSURE_CHUNKS {
+            let first_word = chunk * (PRESSURE_CHUNK_BYTES / 8);
+            for word in 0..PRESSURE_CHUNK_BYTES / 8 {
+                put(DATA + word * 8, pressure_pattern(file_index, first_word + word));
+            }
+            let mut frame = self.frame(file::WRITE)?;
+            handle(&mut frame, key.id, key.generation);
+            frame.set_u64(file::OFF_OFFSET, chunk * PRESSURE_CHUNK_BYTES);
+            frame.set_u64(file::OFF_DATA, DATA);
+            frame.set_u32(file::OFF_DATA_LENGTH, PRESSURE_CHUNK_BYTES as u32);
+            self.success(&mut frame)?;
+            object.matches(&frame)?;
+            if frame.u64(file::OFF_COUNT) != PRESSURE_CHUNK_BYTES {
+                return Err(210);
+            }
+        }
+        let mut frame = self.frame(file::FSYNC)?;
+        handle(&mut frame, key.id, key.generation);
+        self.success(&mut frame)?;
+        object.matches(&frame)?;
+        if frame.u64(file::OFF_WRITE_SEQ) != PRESSURE_CHUNKS
+            || frame.u64(file::OFF_DURABLE_SEQ) != PRESSURE_CHUNKS
+        {
+            return Err(211);
+        }
+        self.close(key)
+    }
+    fn cache_pressure(&mut self) -> Result<()> {
+        let before = self.await_value()?;
+        self.object = Identity::object(&before)?;
+        self.observed = before.u64(file::OFF_DURABLE_SEQ);
+        self.read_current()?;
+        for (index, path) in PRESSURE.into_iter().enumerate() {
+            self.write_pressure_file(path, index as u64 + 1)?;
+        }
+        self.publish(7, 0);
+        let after = self.await_value()?;
+        self.object.matches(&after)?;
+        if after.u64(file::OFF_WRITE_SEQ) != self.observed
+            || after.u64(file::OFF_DURABLE_SEQ) != self.observed
+        {
+            return Err(209);
+        }
+        self.read_current()
+    }
 }
 fn pattern(version: u64, word: u64) -> u64 {
     0xa100_0000_0000_0000 | (version << 32) | word
+}
+fn pressure_pattern(file_index: u64, word: u64) -> u64 {
+    0xa400_0000_0000_0000 | (file_index << 48) | word
 }
 fn marker(boot: u64) -> [u8; 26] {
     let mut bytes = *b"/a10/seen-0000000000000000";
@@ -325,27 +390,30 @@ pub fn run(authority: file::Capability) -> u64 {
     let result = (|| {
         if get(0x20000) != 32
             || get(0x21000) != 1
-            || !matches!(client.mode, 1..=3)
+            || !matches!(client.mode, 1..=4)
             || !matches!(client.role, 1 | 2)
             || client.boot == 0
-            || (client.mode == 3 && client.role != 2)
+            || (client.mode >= 3 && client.role != 2)
         {
             return Err(201);
         }
         if authority.id == 0 || authority.generation == 0 {
             return Err(202);
         }
-        if call(14, DATA, 1, 1, 0, 0)[0] != 0 {
+        let pages = if client.mode == 4 { DATA_PAGES } else { 1 };
+        if call(14, DATA, pages, 1, 0, 0)[0] != 0 {
             return Err(203);
         }
         let bytes = marker(client.boot);
         let marker = core::str::from_utf8(&bytes).map_err(|_| 201u64)?;
-        let work = if client.role == 1 {
+        let work = if client.mode == 4 {
+            client.cache_pressure()
+        } else if client.role == 1 {
             client.writer(marker)
         } else {
             client.reader(marker)
         };
-        let unmapped = call(15, DATA, 0, 0, 0, 0)[0] == 0;
+        let unmapped = call(15, DATA, pages, 0, 0, 0)[0] == 0;
         work?;
         if !unmapped {
             return Err(204);
