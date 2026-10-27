@@ -6,6 +6,7 @@ on:
     branches:
       - fix/first-level-subsystems-20261024
       - CyxiaOS-V0.1
+      - CyxiaOS-V0.11
     paths:
       - '.github/workflows/native-replay-current.yml'
       - 'kernel/**'
@@ -16,6 +17,7 @@ on:
       - 'tools/verify_m1.py'
       - 'tools/build_unified.py'
       - 'tools/check_v13_preparation_stack.py'
+      - 'tools/qemu/**'
       - 'tools/test_check_v13_preparation_stack.py'
       - 'tests/host/test_preparation_stack_gate.py'
   workflow_dispatch:
@@ -45,20 +47,29 @@ jobs:
           mkdir -p "$RUNNER_TEMP/native-replay-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/native-replay-evidence/source-commit.txt"
           rustc -vV > "$RUNNER_TEMP/native-replay-evidence/rust-version.txt"
-      - name: Restore verified QEMU 10.2.2
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: '12518726246'
-          merge-multiple: true
-          run-id: '39991904741'
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/qemu-restored
-      - name: Verify cached emulator
+      - name: Build exact patched QEMU 10.2.2
         run: |
-          echo '93630eae12d04539e5a4f2169af8c49b430fe3fd9aaf1c7282a68c798a449937  '"$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz" | sha256sum --check
-          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/qemu-restored/cyxia-qemu-10.2.2.tar.gz"
-          echo "$RUNNER_TEMP/qemu-tools/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" --version | tee "$RUNNER_TEMP/native-replay-evidence/qemu-version.txt"
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu"
+          git -C "$RUNNER_TEMP/qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" diff --check
+          cd "$RUNNER_TEMP/qemu"
+          ./configure \
+            --target-list=aarch64-softmmu \
+            --disable-docs \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-opengl \
+            --disable-werror
+          ninja -C build qemu-system-aarch64
+          build/qemu-system-aarch64 --version | tee "$RUNNER_TEMP/native-replay-evidence/qemu-version.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-replay-evidence/qemu-source-commit.txt"
+          git diff --binary > "$RUNNER_TEMP/native-replay-evidence/qemu-source.patch"
+          sha256sum "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch" > "$RUNNER_TEMP/native-replay-evidence/qemu-patch.sha256"
+          sha256sum build/qemu-system-aarch64 > "$RUNNER_TEMP/native-replay-evidence/qemu-system-aarch64.sha256"
       - name: Build exact native pair and replay tools
         run: |
           set -o pipefail
@@ -90,7 +101,7 @@ jobs:
             --peer-elf "$RUNNER_TEMP/unified-build/node-b.elf" \
             --build-manifest "$RUNNER_TEMP/unified-build/build-manifest.json" \
             --source-root . \
-            --qemu "$RUNNER_TEMP/qemu-tools/bin/qemu-system-aarch64" \
+            --qemu "$RUNNER_TEMP/qemu/build/qemu-system-aarch64" \
             --output "$RUNNER_TEMP/native-replay-evidence/run" \
             --timeout 600 --hold 1 --sample-ms 250 --clock-profile wallclock \
             --replay-pairs 1 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/native-replay.log"
