@@ -29,7 +29,7 @@ permissions:
 jobs:
   native-replay:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       RUSTUP_TOOLCHAIN: '1.95.0'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -105,6 +105,56 @@ jobs:
             --output "$RUNNER_TEMP/native-replay-evidence/run" \
             --timeout 600 --hold 1 --sample-ms 250 --clock-profile wallclock \
             --replay-pairs 1 2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/native-replay.log"
+      - name: Run every same-boot service restart boundary
+        if: ${{ always() && !cancelled() }}
+        run: |
+          set -uo pipefail
+          status_file="$RUNNER_TEMP/native-replay-evidence/service-restart-status.tsv"
+          overall=0
+          while read -r profile expectation; do
+            build="$RUNNER_TEMP/service-restart-$profile-build"
+            evidence="$RUNNER_TEMP/native-replay-evidence/service-restart-$profile"
+            build_log="$RUNNER_TEMP/native-replay-evidence/service-restart-$profile-build.log"
+            set +e
+            python3 tools/build_unified.py \
+              --identity-a "$RUNNER_TEMP/pair/a" \
+              --identity-b "$RUNNER_TEMP/pair/b" \
+              --output "$build" --selftest --service-fault "$profile" \
+              2>&1 | tee "$build_log"
+            build_status=${PIPESTATUS[0]}
+            set -e
+            if [ "$build_status" -ne 0 ]; then
+              printf '%s\t%s\tBUILD_FAIL\t%s\n' "$profile" "$expectation" "$build_status" >> "$status_file"
+              overall=1
+              continue
+            fi
+            cp "$build/build-manifest.json" "$RUNNER_TEMP/native-replay-evidence/service-restart-$profile-build-manifest.json"
+            set +e
+            python3 tools/verify_unified.py \
+              --elf "$build/node-a.elf" \
+              --peer-elf "$build/node-b.elf" \
+              --public "$build/node-a.pub" \
+              --public "$build/node-b.pub" \
+              --package "$build/task.elf" \
+              --build-manifest "$build/build-manifest.json" \
+              --qemu "$RUNNER_TEMP/qemu/build/qemu-system-aarch64" \
+              --qemu-source "$RUNNER_TEMP/qemu" \
+              --output "$evidence" \
+              --expect "$expectation" \
+              --clock-profile wallclock --tcg-threads multi --timeout 180 \
+              2>&1 | tee "$RUNNER_TEMP/native-replay-evidence/service-restart-$profile.log"
+            run_status=${PIPESTATUS[0]}
+            set -e
+            printf '%s\t%s\tRUN\t%s\n' "$profile" "$expectation" "$run_status" >> "$status_file"
+            if [ "$run_status" -ne 0 ]; then overall=1; fi
+          done <<'EOF'
+          after-ready service-restart-ready
+          after-reserve service-restart-reserve
+          after-start service-restart-start
+          after-completion service-restart-completion
+          after-result-record service-restart-result
+          EOF
+          exit "$overall"
       - name: Retain raw evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -112,5 +162,5 @@ jobs:
           name: native-replay-current-${{ github.sha }}
           retention-days: 2
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 6
           path: ${{ runner.temp }}/native-replay-evidence/

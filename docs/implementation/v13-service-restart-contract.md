@@ -113,6 +113,14 @@ binary built by the attested tree. The per-vCPU PMU profile is accepted only
 with wallclock/multi-thread TCG; an ordinary unproven `-dirty` binary remains
 fail-closed.
 
+`.github/workflows/native-replay-current.yml` rebuilds that exact QEMU source
+instead of restoring a historical Actions artifact. After the control replay,
+it independently builds and runs `after-ready`, `after-reserve`, `after-start`,
+`after-completion` and `after-result-record`, preserving each manifest, log,
+raw verifier directory and exit status. A failure at one boundary does not
+erase the other boundary attempts; the job still fails unless every recorded
+status is zero.
+
 Relevant files are `kernel/src/unified.rs`, `unified_store.rs`,
 `unified_task.rs`, `domain_network.rs` and its `requests`/receipt adapters,
 `crates/kernel-core/src/control_plane/service_image.rs`, and the existing

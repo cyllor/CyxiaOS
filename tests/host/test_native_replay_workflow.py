@@ -19,6 +19,18 @@ class NativeReplayWorkflow(unittest.TestCase):
         self.assertIn("ninja -C build qemu-system-aarch64", text)
         self.assertIn('--qemu "$RUNNER_TEMP/qemu/build/qemu-system-aarch64"', text)
 
+    def test_runs_every_service_restart_boundary_with_source_attestation(self):
+        text = WORKFLOW.read_text()
+        for profile in ("after-ready", "after-reserve", "after-start",
+                        "after-completion", "after-result-record"):
+            self.assertIn(profile, text)
+        for expectation in ("service-restart-ready", "service-restart-reserve",
+                            "service-restart-start", "service-restart-completion",
+                            "service-restart-result"):
+            self.assertIn(expectation, text)
+        self.assertIn('--qemu-source "$RUNNER_TEMP/qemu"', text)
+        self.assertIn("service-restart-status.tsv", text)
+
 
 if __name__ == "__main__":
     unittest.main()
