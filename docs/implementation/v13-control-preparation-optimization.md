@@ -349,6 +349,21 @@ pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-minimal-capture` is
 `BUILT_NOT_RUN`; both selected stack paths are 33,968/65,536 bytes. Linux
 timing remains required.
 
+Run `40426881596` still fails the indivisible probe transition at
+14,368,906/8,000,000 ns (sequence 600). The platform TCR uses TTBR0 ASIDs
+(`A1=0`, `AS=0`), and the four probe roots are immutable from their initial
+global invalidation until all mapping faults complete. Each probe CPU now uses
+a reserved, boot-nonreused ASID `0x80..0x83`. Entry and return retain the EPD0
+low-walk gate and ordering barriers, while skipping only the two redundant
+global TLB invalidations; the first later ordinary task entry still performs
+the full global invalidation before any mutable mapping can be used or
+reclaimed. Local and Linux validation are required.
+All 615 host tests (two environment skips), 141 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-asid` is
+`BUILT_NOT_RUN`; both selected stack paths are 33,968/65,536 bytes. Linux
+timing remains required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

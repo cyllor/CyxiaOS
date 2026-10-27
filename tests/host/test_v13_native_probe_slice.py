@@ -34,15 +34,19 @@ class NativeProbeSlice(unittest.TestCase):
         arch = (ROOT / "crates/arch-aarch64/src/user.rs").read_text()
         assembly = (ROOT / "crates/arch-aarch64/src/user.S").read_text()
         self.assertIn("pub unsafe fn enter_integer_probe", arch)
-        self.assertIn("enter_inner(context, root, false)", arch)
+        self.assertIn("enter_inner(context, root | (asid << 48), false)", arch)
         self.assertIn("cbz x1, .Luser_integer_restore", assembly)
         self.assertIn("cbz x10, .Luser_integer_save", assembly)
         self.assertIn("cbz x1, .Luser_features_configured", assembly)
         self.assertIn("cbz x10, .Luser_features_restored", assembly)
         self.assertIn("cbz x10, .Luser_state_restored", assembly)
+        self.assertIn("cbz x10, .Luser_low_walks_revoked", assembly)
         self.assertIn("static INTEGER_ONLY", arch)
         self.assertIn("context.regs.copy_from_slice(regs)", arch)
         self.assertIn("if !INTEGER_ONLY[slot]", arch)
+        self.assertIn("let asid = 0x80u64 + super::cpu::slot() as u64", arch)
+        self.assertIn("root | (asid << 48)", arch)
+        self.assertIn("if restore_fp", arch)
 
 
 if __name__ == "__main__":

@@ -88,17 +88,21 @@ cyxia_enter_user:
 cyxia_user_return:
  // Exception dispatcher has selected EL1h with interrupts masked.
  msr daifset, #15
+ ldr x10, [sp, #128]
  // Revoke low-address translations before saving state or allowing reclamation.
  mrs x9, tcr_el1
  orr x9, x9, #0x80
  msr tcr_el1, x9
  isb
+ // Integer fault probes use a boot-unique ASID over one immutable root. The
+ // ordinary path still invalidates globally before any pages can be reclaimed.
+ cbz x10, .Luser_low_walks_revoked
  tlbi vmalle1is
  dsb ish
  isb
+.Luser_low_walks_revoked:
  // Its integer-only Rust/IRQ path has left the complete user FP/TLS bank intact.
  ldr x30, [sp, #104]
- ldr x10, [sp, #128]
  cbz x10, .Luser_integer_save
  add x9, x30, #304
  stp q0, q1, [x9, #0]

@@ -97,7 +97,14 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
     INTEGER_ONLY[slot].store(!restore_fp, Ordering::Relaxed);
     active.store(core::ptr::from_mut(context), Ordering::Relaxed);
     unsafe {
-        asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
+        if restore_fp {
+            asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
+        } else {
+            // The caller supplies a boot-unique ASID for an immutable probe
+            // root. EPD0 still gates low walks before and after this entry;
+            // no mapping can be reclaimed before the later ordinary TLBI.
+            asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb",root=in(reg)root,out("x9")_);
+        }
         cyxia_enter_user(core::ptr::from_mut(context), u64::from(restore_fp));
         // user.S has disabled low walks, completed TLBI, saved all enabled user
         // state, and restored the original EL1 CPACR/TLS before returning.
@@ -125,7 +132,12 @@ pub unsafe fn enter(context: &mut Context, root: u64) {
 /// In addition to [`enter`]'s contract, the entered code must be an audited
 /// integer-only fault probe whose executable range was checked for FP/SIMD.
 pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
-    unsafe { enter_inner(context, root, false) };
+    // TCR_EL1.A1=0 and AS=0 in this platform profile, so bits 55:48 carry an
+    // eight-bit TTBR0 ASID. 0x80..0x83 are reserved for the four immutable
+    // per-CPU mapping-probe roots and are never reused by ordinary contexts.
+    let asid = 0x80u64 + super::cpu::slot() as u64;
+    debug_assert!(asid <= 0xff && root >> 48 == 0);
+    unsafe { enter_inner(context, root | (asid << 48), false) };
 }
 /// # Safety
 /// Called only from a synchronous/IRQ AArch64 lower-EL vector, while enter() is
