@@ -77,6 +77,18 @@ class Acceptance(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'artifact differs'):check()
             with patch('verify_unified.code_source_map',return_value={'a.rs':'modified'}):
                 with self.assertRaisesRegex(ValueError,'different source'):check()
+    def test_build_binding_requires_the_exact_service_fault_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);names=('node-a.elf','node-b.elf','node-a.pub','node-b.pub','task.elf')
+            files=[root/n for n in names]
+            for i,f in enumerate(files):f.write_bytes(bytes([i+1])*32)
+            nodes={n:{'node_id':sha(files[i+2]),'peer_node_id':sha(files[3-i])} for i,n in enumerate(('a','b'))}
+            data=dict(schema_version=1,status='BUILT_NOT_RUN',code_source_map={'a.rs':'original'},code_source_sha256='code',builder_sha256=sha(ROOT/'tools/build_unified.py'),profiles={'fault':'normal','service_fault':'after-start','leave':False},own_private_key_only_verified=True,nodes=nodes,artifacts={n:{'sha256':sha(f),'bytes':32} for n,f in zip(names,files)})
+            manifest=root/'build.json';manifest.write_text(json.dumps(data))
+            with patch('verify_unified.code_source_map',return_value={'a.rs':'original'}):
+                self.assertEqual(bind_build(manifest,files[0],files[1],files[2:4],files[4],'service-restart-start')['profiles']['service_fault'],'after-start')
+                with self.assertRaisesRegex(ValueError,'service-fault profile'):
+                    bind_build(manifest,files[0],files[1],files[2:4],files[4],'service-restart-completion')
     def test_live_progress_retries_torn_publication_without_pausing_guest(self):
         commands=[]
         class Qmp:

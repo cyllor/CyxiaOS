@@ -88,6 +88,12 @@ reconciliation. A later node reboot is a separate scenario: a durable STARTED
 record without a complete terminal result becomes LOST at its authority and
 must not use the same-boot reattachment rule.
 
+The build profiles `after-reserve`, `after-start`, `after-completion` and
+`after-result-record` inject the synchronous generation-1 exception only after
+the corresponding successful broker return. `after-ready` is the baseline
+supervisor scenario. Each profile is independently bound into the build
+manifest and verifier expectation; substituting another boundary fails closed.
+
 Relevant files are `kernel/src/unified.rs`, `unified_store.rs`,
 `unified_task.rs`, `domain_network.rs` and its `requests`/receipt adapters,
 `crates/kernel-core/src/control_plane/service_image.rs`, and the existing

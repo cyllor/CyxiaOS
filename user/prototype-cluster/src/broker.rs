@@ -89,6 +89,12 @@ pub fn request(
         for (i, b) in output.iter_mut().take(n).enumerate() {
             *b = bytes.add(i).read_volatile();
         }
+        if service_fault_due(SERVICE_FAULT, service_generation(), op, args[0]) {
+            // BRK is a genuine synchronous EL0 exception. The successful
+            // broker boundary is already externally owned; this context must
+            // be retired and never return to its caller.
+            asm!("brk #0", options(noreturn, nostack));
+        }
         Ok((n, core::ptr::addr_of!((*p).arg0).read_volatile()))
     }
 }
@@ -120,11 +126,6 @@ pub fn poll() -> Result<(bool, u64), u64> {
 }
 pub fn trace(event: u64) {
     let _ = request(OP_TRACE, &[], &mut [], 0, [event, 0, 0]);
-    if service_fault_due(SERVICE_FAULT, service_generation(), event) {
-        // BRK is a genuine synchronous EL0 exception. The supervisor must
-        // retire this context and must never return to this instruction.
-        unsafe { asm!("brk #0", options(noreturn, nostack)) }
-    }
 }
 pub fn yield_now() {
     let _ = request(OP_YIELD, &[], &mut [], 0, [0; 3]);

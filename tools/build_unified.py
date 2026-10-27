@@ -127,7 +127,7 @@ def preparation_stack_gate(images, output, objdump, environment):
 def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',leave=False,unix_seconds=None,
           selftest=False,storage_fault=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
-    require(service_fault in ('none','after-ready'),'unknown cluster service fault')
+    require(service_fault in ('none','after-ready','after-reserve','after-start','after-completion','after-result-record'),'unknown cluster service fault')
     require(not storage_fault or (selftest and fault == 'normal' and not leave), 'storage fault profile requires selftest, normal runtime and no leave')
     if unix_seconds is None:
         unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
@@ -201,7 +201,7 @@ def main():
     parser.add_argument('--identity-b',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--fault',choices=('normal','hang-once','no-stop-ack'),default='normal')
-    parser.add_argument('--service-fault',choices=('none','after-ready'),default='none')
+    parser.add_argument('--service-fault',choices=('none','after-ready','after-reserve','after-start','after-completion','after-result-record'),default='none')
     parser.add_argument('--leave',action='store_true')
     parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
     parser.add_argument('--storage-fault',action='store_true',help='dedicated A10 ordinary-file workload (requires --selftest)')

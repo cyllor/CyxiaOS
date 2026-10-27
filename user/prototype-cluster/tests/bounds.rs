@@ -50,10 +50,14 @@ fn feedback_identity_requires_exact_boot_and_service_generation() {
 
 #[test]
 fn native_restart_fault_is_one_shot_and_bound_to_ready() {
-    assert!(service_fault_due(SERVICE_FAULT_AFTER_READY, 1, 0x212));
-    assert!(!service_fault_due(SERVICE_FAULT_AFTER_READY, 2, 0x212));
-    assert!(!service_fault_due(SERVICE_FAULT_AFTER_READY, 1, 0x211));
-    assert!(!service_fault_due(SERVICE_FAULT_NONE, 1, 0x212));
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_READY, 1, OP_TRACE, 0x212));
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_RESERVE, 1, OP_TASK, TASK_RESERVE_CUSTODY));
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_START, 1, OP_TASK, 2));
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_COMPLETION, 1, OP_TASK, 3));
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_RESULT_RECORD, 1, OP_TRACE, 0x216));
+    assert!(!service_fault_due(SERVICE_FAULT_AFTER_READY, 2, OP_TRACE, 0x212));
+    assert!(!service_fault_due(SERVICE_FAULT_AFTER_START, 1, OP_TASK, 3));
+    assert!(!service_fault_due(SERVICE_FAULT_NONE, 1, OP_TRACE, 0x212));
 }
 
 #[test]

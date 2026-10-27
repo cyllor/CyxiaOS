@@ -15,7 +15,11 @@ fn main() {
     let fault = match fault.as_str() {
         "none" => 0,
         "after-ready" => 1,
-        _ => panic!("CYXIA_CLUSTER_FAULT must be none or after-ready"),
+        "after-reserve" => 2,
+        "after-start" => 3,
+        "after-completion" => 4,
+        "after-result-record" => 5,
+        _ => panic!("invalid CYXIA_CLUSTER_FAULT"),
     };
     fs::write(output.join("service-fault.rs"), fault.to_string()).unwrap();
     for name in ["cert.der", "key.der", "peer.pub", "peer.pin"] {

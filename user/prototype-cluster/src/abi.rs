@@ -42,10 +42,22 @@ pub const OP_YIELD: u64 = 12;
 pub const TRACE_FATAL_BIT: u64 = 1 << 63;
 pub const SERVICE_FAULT_NONE: u64 = 0;
 pub const SERVICE_FAULT_AFTER_READY: u64 = 1;
+pub const SERVICE_FAULT_AFTER_RESERVE: u64 = 2;
+pub const SERVICE_FAULT_AFTER_START: u64 = 3;
+pub const SERVICE_FAULT_AFTER_COMPLETION: u64 = 4;
+pub const SERVICE_FAULT_AFTER_RESULT_RECORD: u64 = 5;
 /// Native restart evidence injects one real synchronous EL0 exception only
-/// after generation 1 has completed authenticated peer reconciliation.
-pub const fn service_fault_due(profile: u64, generation: u64, event: u64) -> bool {
-    profile == SERVICE_FAULT_AFTER_READY && generation == 1 && event == 0x212
+/// at an exact successful generation-1 broker receipt boundary.
+pub const fn service_fault_due(profile: u64, generation: u64, op: u64, arg0: u64) -> bool {
+    generation == 1
+        && matches!(
+            (profile, op, arg0),
+            (SERVICE_FAULT_AFTER_READY, OP_TRACE, 0x212)
+                | (SERVICE_FAULT_AFTER_RESERVE, OP_TASK, TASK_RESERVE_CUSTODY)
+                | (SERVICE_FAULT_AFTER_START, OP_TASK, 2)
+                | (SERVICE_FAULT_AFTER_COMPLETION, OP_TASK, 3)
+                | (SERVICE_FAULT_AFTER_RESULT_RECORD, OP_TRACE, 0x216)
+        )
 }
 /// POLL value: 0 disconnected, 1 connected. Epoch changes on every connection.
 /// STORE offset selects a record chunk; arg0 record key; arg1 total record
