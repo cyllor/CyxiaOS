@@ -472,6 +472,10 @@ impl State {
     }
 }
 static mut STATE: State = State::new();
+// These immutable target identities are published by READY. Ordinary policy
+// discovery must not borrow the large mutable task owner merely to read values
+// that never change after initialization.
+static IPC_TARGETS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 // A native builtin turn reserves at most 10 ms, but the shared monotonic clock
 // can advance while an MTTCG vCPU is descheduled. Requiring 20 ms at entry
 // still admits the ninth 10 ms turn at t=80 ms (the complete 90 ms business
@@ -592,6 +596,14 @@ pub fn init() -> Result<(), Error> {
         s.background.register(group(16), 100, 0, now)?;
         s.task_endpoint = s.ipc.open(TASK_SERVICE, false)?;
         s.file_endpoint = s.ipc.open(FILE_SERVICE, false)?;
+        for (word, value) in IPC_TARGETS.iter().zip([
+            s.task_endpoint.id,
+            s.task_endpoint.generation,
+            s.file_endpoint.id,
+            s.file_endpoint.generation,
+        ]) {
+            word.store(value, Ordering::Relaxed);
+        }
         memory::load_code(ELF, CODE_FRAME, 1)?;
         memory::load_code(CLIENT_ELF, CLIENT_CODE_FRAME, 4)?;
         Ok(())
@@ -1548,15 +1560,34 @@ fn target_locked(s: &State, domain: u16, ordinal: usize) -> Option<ObjectKey> {
         _ => None,
     }
 }
+fn projected_target(domain: u16, ordinal: usize) -> Option<ObjectKey> {
+    match domain {
+        1 | 2 => (ordinal < 16).then(|| group(ordinal as u64 + 1)),
+        3 => (ordinal == 0).then_some(MEMORY_KEY),
+        5 => {
+            let base = ordinal
+                .checked_mul(2)
+                .filter(|base| *base + 1 < IPC_TARGETS.len())?;
+            let target = ObjectKey {
+                id: IPC_TARGETS[base].load(Ordering::Relaxed),
+                generation: IPC_TARGETS[base + 1].load(Ordering::Relaxed),
+            };
+            (target.id != 0 && target.generation != 0).then_some(target)
+        }
+        8 => (ordinal == 0).then_some(SERVICE_KEY),
+        13 => [group(15), group(16)].get(ordinal).copied(),
+        _ => None,
+    }
+}
 pub(crate) fn queued_targets(
     queries: &[crate::domain_control::target_batch::Query],
     output: &mut [Option<ObjectKey>],
 ) -> Result<(), Error> {
-    // Pure scheduler/IPC projections from one borrowed owner generation.
-    locked(|s| {
-        crate::domain_control::target_batch::resolve(queries, output, |q| {
-            target_locked(s, q.domain, q.ordinal)
-        })
+    if !READY.load(Ordering::Acquire) {
+        return Err(Error::NotReady);
+    }
+    crate::domain_control::target_batch::resolve(queries, output, |q| {
+        projected_target(q.domain, q.ordinal)
     })
 }
 pub fn current_action(domain: u16, target: ObjectKey) -> Result<Action, Error> {

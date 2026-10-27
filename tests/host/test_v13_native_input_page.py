@@ -34,6 +34,31 @@ class NativeInputPage(unittest.TestCase):
         self.assertIn("DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0", source)
         self.assertIn("DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(0", source)
 
+    def test_task_target_projection_does_not_reborrow_mutable_owner(self):
+        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
+        start = source.index("pub(crate) fn queued_targets(")
+        end = source.index("pub fn current_action", start)
+        projection = source[start:end]
+
+        self.assertIn("if !READY.load(Ordering::Acquire)", projection)
+        self.assertIn("projected_target(q.domain, q.ordinal)", projection)
+        self.assertNotIn("locked(", projection)
+        self.assertLess(
+            source.index("word.store(value, Ordering::Relaxed)"),
+            source.index("READY.store(true, Ordering::Release)"),
+        )
+
+    def test_first_scope_hash_uses_verified_arch_acceleration_with_fallback(self):
+        source = (ROOT / "kernel/src/learning_replay/owner.rs").read_text()
+        start = source.index("fn scope_hash(")
+        end = source.index("fn on_first", start)
+        hashing = source[start:end]
+
+        self.assertIn("SCOPE_HASH_CAPACITY", source)
+        self.assertIn("cyxia_arch_aarch64::sha256::digest(input)", hashing)
+        self.assertIn("Sha256::digest(input)", hashing)
+        self.assertIn('append(b"CYXIA_NATIVE_WORKLOAD_SCOPE_1.3\\0")', hashing)
+
 
 if __name__ == "__main__":
     unittest.main()

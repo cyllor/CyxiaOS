@@ -284,6 +284,13 @@ static SETUP: Cell = Cell(UnsafeCell::new(Setup {
     allocation: None,
     pin: None,
 }));
+const SCOPE_HASH_CAPACITY: usize = 4096;
+struct ScopeHashBytes(UnsafeCell<[u8; SCOPE_HASH_CAPACITY]>);
+unsafe impl Sync for ScopeHashBytes {}
+// on_first reaches this storage only while holding this owner's non-reentrant
+// gate. The buffer is kernel-only and every byte in the hashed prefix is
+// overwritten before use.
+static SCOPE_HASH_BYTES: ScopeHashBytes = ScopeHashBytes(UnsafeCell::new([0; SCOPE_HASH_CAPACITY]));
 static ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static GATE: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -499,6 +506,63 @@ fn poll_root(token: root::Token) -> Result<root::Status, DomainError> {
     });
     Ok(status)
 }
+fn scope_hash(
+    token: root::Token,
+    trial_id: u64,
+    prepared: work::Prepared,
+    frozen: [u8; 32],
+    first_ns: u64,
+    observation_ns: u64,
+) -> Result<[u8; 32], DomainError> {
+    let bytes = unsafe { &mut *SCOPE_HASH_BYTES.0.get() };
+    let mut used = 0usize;
+    let mut append = |value: &[u8]| -> Result<(), DomainError> {
+        let end = used.checked_add(value.len()).ok_or(DomainError::Overflow)?;
+        let destination = bytes.get_mut(used..end).ok_or(DomainError::Capacity)?;
+        destination.copy_from_slice(value);
+        used = end;
+        Ok(())
+    };
+    append(b"CYXIA_NATIVE_WORKLOAD_SCOPE_1.3\0")?;
+    for value in [
+        token.boot_epoch,
+        trial_id,
+        prepared.family.domain as u64,
+        prepared.family.kind as u64,
+        prepared.target.id,
+        prepared.target.generation,
+        prepared.group.seed,
+        first_ns,
+        observation_ns,
+    ] {
+        append(&value.to_le_bytes())?;
+    }
+    append(&prepared.group.workload)?;
+    append(&prepared.group.initial_image)?;
+    append(&frozen)?;
+    for source in &prepared.sources[..prepared.source_count] {
+        for value in [
+            source.owner.id,
+            source.owner.generation,
+            source.class as u64,
+            source.allowed_cores,
+        ] {
+            append(&value.to_le_bytes())?;
+        }
+    }
+    for request in prepared.requests {
+        for value in [
+            request.id,
+            request.owner.id,
+            request.owner.generation,
+            request.offset_ns,
+        ] {
+            append(&value.to_le_bytes())?;
+        }
+    }
+    let input = &bytes[..used];
+    Ok(cyxia_arch_aarch64::sha256::digest(input).unwrap_or_else(|| Sha256::digest(input).into()))
+}
 fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
     if !root::activation(token) {
         return Err(DomainError::Auth);
@@ -525,36 +589,8 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
             },
             arrived_ns: 0,
         }; work::REQUESTS];
-        let mut h = Sha256::new();
-        h.update(b"CYXIA_NATIVE_WORKLOAD_SCOPE_1.3\0");
-        for v in [
-            token.boot_epoch,
-            s.trial_id,
-            p.family.domain as u64,
-            p.family.kind as u64,
-            p.target.id,
-            p.target.generation,
-            p.group.seed,
-            snapshot.taken_ns,
-            observation_ns,
-        ] {
-            h.update(v.to_le_bytes());
-        }
-        h.update(p.group.workload);
-        h.update(p.group.initial_image);
-        h.update(s.frozen);
         if p.source_count == 0 || p.source_count > p.sources.len() {
             return Err(DomainError::Capacity);
-        }
-        for source in &p.sources[..p.source_count] {
-            for v in [
-                source.owner.id,
-                source.owner.generation,
-                source.class as u64,
-                source.allowed_cores,
-            ] {
-                h.update(v.to_le_bytes());
-            }
         }
         for (i, r) in p.requests.iter().enumerate() {
             if r.offset_ns >= OBSERVATION_NS {
@@ -567,11 +603,15 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
                     .checked_add(r.offset_ns)
                     .ok_or(DomainError::Overflow)?,
             };
-            for v in [r.id, r.owner.id, r.owner.generation, r.offset_ns] {
-                h.update(v.to_le_bytes());
-            }
         }
-        let scope_hash = h.finalize().into();
+        let scope_hash = scope_hash(
+            token,
+            s.trial_id,
+            p,
+            s.frozen,
+            snapshot.taken_ns,
+            observation_ns,
+        )?;
         let permit = s.permit.as_ref().ok_or(DomainError::NotReady)?;
         let key = capture::start_authorized(
             permit,

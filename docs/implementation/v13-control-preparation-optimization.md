@@ -841,3 +841,21 @@ skip), all 71 driver tests, formatting and configured strict AArch64 Clippy
 pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-descriptor-range-clear`
 passes both selected stack paths at 33,968/65,536 bytes. The 10.153 ms CPU2
 boundary remains unchanged pending a fresh Linux replay.
+
+Run `40430213583` varies back to ordinary preparation: CPU1 sequence 2447 uses
+15,405,615/2,500,000 ns in phase 3. Detailed per-vCPU markers attribute about
+9.269 ms to task target discovery and 4.737 ms to the first replay prefix. The
+descriptor-range clear therefore remains valid but was not reached by this
+run. Task-family target identities are immutable after task-domain READY: the
+16 groups, memory/service constants and two IPC endpoints are now published
+through a release/acquire read projection. CPU1 no longer borrows the large
+mutable task owner merely to read those identities. The first replay scope
+retains its exact domain-separated byte sequence and software SHA-256 fallback,
+but uses the AArch64 SHA2 digest when available. Its boot self-test now covers
+both the 4 KiB full-block path and an arbitrary three-byte padded tail. No
+snapshot, candidate, target, replay identity, budget or threshold changes. The
+full 618 host tests (two environment skips), 144 v1.3 tests (one
+historical-evidence skip), all 71 driver tests, formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-target-projection-scope-sha-v2` passes both
+selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
