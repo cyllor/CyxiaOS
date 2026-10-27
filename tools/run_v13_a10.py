@@ -41,6 +41,7 @@ LAYOUT = (1, 512, 768, 384, 295424, 299008, 512, 512)
 CONTROL_EVIDENCE_BYTES = (512 + 64 * 640) * 8
 EXIT_MAGIC = 0x4359584131305052
 TOOL_NAMES = ('run_v13_a10.py', 'verify_v13_a10.py', 'run_v13_a02.py',
+    'run_v13_a10_matrix.py', 'verify_v13_a10_matrix.py', 'verify_v13_a10_faults.py',
     'artifact_store.py', 'check_v13_preparation_stack.py',
     'v13_fault_disk.py', 'check_v13_fault_disk.py', 'check_v13_filesystem.py',
     'check_v13_disk.py', 'verify_v13_storage_faults.py', 'verify_v13_storage.py',

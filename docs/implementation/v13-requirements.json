@@ -467,6 +467,6 @@
   "filesystem_fault_matrix": {
     "frozen": false,
     "evidence": null,
-    "reason": "Native redo format, independent image checker and enumerated write/FLUSH fault matrix are not implemented."
+    "reason": "The redo format, independent image checker and resumable all-observed-mutation overwrite/recovery-interruption/cache matrix gate are implemented, but the complete native matrix has not been executed or frozen as reviewed evidence."
   }
 }

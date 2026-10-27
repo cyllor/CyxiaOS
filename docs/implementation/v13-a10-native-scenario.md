@@ -154,6 +154,29 @@ The selector rejects merged/missing sectors, inconsistent counters or a window
 other than the declared two-REDO overwrite. It produces only planned points;
 there is no executed-matrix verdict until each actual cut/recovery is captured.
 
+`tools/run_v13_a10_matrix.py` now supplies that complete orchestration layer.
+Starting from one freshly formatted volume, it binds the verified preparation
+disk, clean overwrite probe and same-boot mode-4 cache run. It then cuts at
+**every observed overwrite mutation**, not merely the 50-point version-3
+subwindow, for both `before`/`after-ack` phases and both `drop`/`reverse-half`
+volatile-loss models. Every resulting damaged image gets an independent clean
+recovery probe; every mutation observed in that recovery is in turn cut across
+the same four combinations and followed by a third clean recovery boot.
+Diagnostic `flushes` or explicit-point selectors are supported, but the
+independent `verify_v13_a10_matrix.py` gate returns `NOT_RUN` for all such
+subsets. `PASS` additionally requires actual reordered replies and at least one
+cut capture that contains the protected EL0 FSYNC-consumption boundary.
+
+The matrix is resumable because the exhaustive native cross-product is large.
+`--resume` rehashes the frozen build, source, formatter output and complete tool
+set. Each completed child is independently revalidated down to its initial-disk
+hash and artifact inventory before it is skipped. A complete child written just
+before an interrupted progress update may be adopted after the same checks; an
+invalid partial attempt is moved under `_abandoned/` before a new attempt, so it
+is preserved rather than overwritten. The orchestrator and gate are currently
+host-tested but have not executed this native matrix. They therefore add no A10
+acceptance evidence, and the catalogue remains `NOT_RUN`.
+
 ## Current host checks
 
 The dedicated client was compiled for `aarch64-unknown-none-softfloat` and fits
