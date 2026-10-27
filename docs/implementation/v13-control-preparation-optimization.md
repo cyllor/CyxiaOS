@@ -1071,3 +1071,27 @@ formatting and patch checks. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-rx-wide-copy` is `BUILT_NOT_RUN`; both
 selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay remains
 required; the 69-case v1.3 catalogue is still open.
+
+Run `40439863605` confirms stage 44 is crossed after the wide volatile copy.
+Both fixed builtins also complete through marker 6 (about 5.040 ms on CPU2 and
+1.446 ms on CPU3, each below the unchanged 10 ms credit). The next CPU0
+service receipt, sequence 22, uses 5,648,084/2,500,000 ns while the global
+stage remains 5. The domain-service detail is older than that receipt and only
+shows its preceding platform poll (marker 0→1 is about 0.077 ms), demonstrating
+that stage 5 was stale while the outer task-service maintenance ran. Sequence
+22 aligns with the eleven-phase task-service rotation returning to phase 0.
+
+Phase 0 previously Acquire-loaded all 64 completion flags although the current
+native CPU layout owns only the bits in its healthy mask. CPU moves already
+close admission and wait for quiescence before changing that mask, and no
+completion can exist without an active reservation on an owned CPU. The scan
+now walks only set bits in the healthy layout mask and retains the exact
+per-slot Acquire check and `complete_locked` settlement. The unified stage bank
+now identifies task-service entry as 7 and publishes its internal phase as
+`10..20`, so a later stopped snapshot cannot confuse this owner with stale
+domain-service stage 5. The full 626 host tests (two environment skips), 152
+v1.3 tests (one historical-evidence skip), 71 evidence-tool tests, formatting
+and patch checks pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-owned-service-scan-v2` is `BUILT_NOT_RUN`;
+both selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
+pending and the 69-case v1.3 catalogue remains open.

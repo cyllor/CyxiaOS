@@ -55,7 +55,7 @@ unsafe impl Sync for ServiceStage {}
 #[used]
 #[unsafe(no_mangle)]
 static UNIFIED_SERVICE_STAGE: ServiceStage = ServiceStage(UnsafeCell::new(0));
-fn service_stage(stage: u64) {
+pub(crate) fn service_stage(stage: u64) {
     // CPU0 is the sole writer and no live Rust code reads this diagnostic.
     // The verifier consumes it only from a stopped guest snapshot, so a
     // volatile store preserves the evidence without an atomic TCG helper in a
@@ -634,6 +634,7 @@ pub fn run(info: &BootInfo) -> ! {
             // These pumps own their own bounded CPU segments. Their progress
             // callback advances mechanisms only, so no active file/owner is
             // recursively borrowed and no waiting wall time becomes CPU usage.
+            service_stage(7);
             crate::domain_tasks::service(Board.now_ns(), &mut || {
                 progress(&mut coordinator, &mut tcp, stream_epoch)
             });

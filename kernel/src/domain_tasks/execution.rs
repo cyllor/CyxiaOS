@@ -962,9 +962,18 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
         let external = locked(|s| {
             let phase = s.service_phase;
             s.service_phase = (phase + 1) % 11;
+            #[cfg(feature = "unified-runtime")]
+            crate::unified::service_stage(10 + phase as u64);
             match phase {
                 0 => {
-                    for slot in 0..64 {
+                    // A completion cannot exist outside the currently owned
+                    // CPU layout: moves close admission and wait for quiescence
+                    // before changing these masks. Avoid 64 translated atomic
+                    // loads when this prototype owns only four CPUs.
+                    let mut owned = s.layout.healthy_mask;
+                    while owned != 0 {
+                        let slot = owned.trailing_zeros() as usize;
+                        owned &= owned - 1;
                         if COMPLETE_READY[slot].load(Ordering::Acquire) {
                             let _ = complete_locked(s, slot);
                         }

@@ -110,6 +110,19 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("ldr x11, [sp, #136]", assembly)
         self.assertIn("cbz x11, .Luser_low_walks_revoked", assembly)
 
+    def test_cpu0_service_completion_scan_uses_owned_layout_only(self):
+        runtime = (ROOT / "kernel/src/unified.rs").read_text()
+        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        start = execution.index("pub fn service(_now:")
+        end = execution.index("fn lifecycle_piece", start)
+        service = execution[start:end]
+
+        self.assertIn("pub(crate) fn service_stage", runtime)
+        self.assertIn("crate::unified::service_stage(10 + phase as u64)", service)
+        self.assertIn("let mut owned = s.layout.healthy_mask", service)
+        self.assertIn("owned.trailing_zeros()", service)
+        self.assertNotIn("for slot in 0..64", service)
+
 
 if __name__ == "__main__":
     unittest.main()
