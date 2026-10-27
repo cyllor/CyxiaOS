@@ -67,6 +67,23 @@ impl Page {
             self.put8(offset, 0);
         }
     }
+    fn copy_prefix_to(&self, out: &mut [u8], bytes: usize) {
+        debug_assert!(bytes <= 4096 && bytes <= out.len());
+        let wide = bytes & !7;
+        for offset in (0..wide).step_by(8) {
+            // DMA ownership has already transferred to the CPU. Preserve
+            // volatile device-memory reads while avoiding one translated
+            // helper per byte for maximum-MTU responses. The destination may
+            // be unaligned, hence the explicit unaligned ordinary store.
+            let value = unsafe { read_volatile((self.address() + offset) as *const u64) };
+            unsafe {
+                core::ptr::write_unaligned(out.as_mut_ptr().add(offset).cast::<u64>(), value)
+            };
+        }
+        for (offset, byte) in out[wide..bytes].iter_mut().enumerate() {
+            *byte = unsafe { read_volatile((self.address() + wide + offset) as *const u8) };
+        }
+    }
     fn put8(&self, offset: usize, value: u8) {
         // SAFETY: every caller bounds offsets to this page; volatile accesses are
         // serialized by Queue's exclusive CPU owner and descriptor ownership.

@@ -78,6 +78,16 @@ class NativeInputPage(unittest.TestCase):
         self.assertNotIn("DROPPED.swap", ledger_with)
         self.assertNotIn("DROPPED_OPEN.swap", ledger_with)
 
+    def test_batched_completion_uses_wide_volatile_copy_with_exact_tail(self):
+        page = (ROOT / "crates/driver-virtio/src/lib.rs").read_text()
+        queue = (ROOT / "crates/driver-virtio/src/queue.rs").read_text()
+
+        self.assertIn("fn copy_prefix_to(&self, out: &mut [u8], bytes: usize)", page)
+        self.assertIn("read_volatile((self.address() + offset) as *const u64)", page)
+        self.assertIn("core::ptr::write_unaligned", page)
+        self.assertIn("out[wide..bytes]", page)
+        self.assertIn("copy_prefix_to(out, len as usize)", queue)
+
 
 if __name__ == "__main__":
     unittest.main()

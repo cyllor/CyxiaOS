@@ -487,11 +487,7 @@ impl BatchQueue {
             unsafe { p.sync(self.memory.response[index].address(), len as usize) };
             p.barrier();
         }
-        for (i, b) in out[..len as usize].iter_mut().enumerate() {
-            *b = unsafe {
-                core::ptr::read_volatile((self.memory.response[index].address() + i) as *const u8)
-            };
-        }
+        self.memory.response[index].copy_prefix_to(out, len as usize);
         self.slots[index].state = State::Complete;
         self.used = self.used.wrapping_add(1);
         self.stats.completed = self.stats.completed.saturating_add(1);
@@ -682,6 +678,22 @@ mod tests {
             unsafe { core::ptr::read_volatile((q.memory.response[0].address() + 15) as *const u8) },
             0x5a
         );
+    }
+    #[test]
+    fn completion_copy_uses_exact_wide_prefix_and_byte_tail() {
+        let (mut q, mut t, p) = fixture(16);
+        let token = q.enqueue(&mut t, &[], 15, true, false, &p).unwrap();
+        for i in 0..15 {
+            q.memory.response[0].put8(i, (i as u8).wrapping_add(1));
+        }
+        q.memory.response[0].put8(15, 0xee);
+        used(&mut q, 0, 15);
+        let mut out = [0xa5; 17];
+        let completion = q.poll(&mut t, &mut out, &p).unwrap().unwrap();
+        assert_eq!(completion.token, token);
+        assert_eq!(completion.len, 15);
+        assert_eq!(out[..15], core::array::from_fn::<_, 15, _>(|i| i as u8 + 1));
+        assert_eq!(&out[15..], &[0xa5, 0xa5]);
     }
     #[test]
     fn first_deadline_sync_and_isolated_never_wait_for_threshold() {

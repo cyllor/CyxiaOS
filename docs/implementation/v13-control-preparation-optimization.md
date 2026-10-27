@@ -1044,3 +1044,30 @@ pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-peer-zero-rmw` is
 `BUILT_NOT_RUN`; both selected stack paths pass at 33,760/65,536 bytes. Linux
 patched-QEMU replay must still cross this preparation boundary and later
 exercise the builtin ASID path. The 69-case v1.3 catalogue remains open.
+
+Run `40439008060` confirms the zero-counter RMW change crosses ordinary
+preparation and also supplies the first native validation of the fixed-root
+ASID path. CPU2's complete builtin row reaches marker 6, with the formerly
+12.090 ms marker-4→5 architectural boundary reduced to 41,789 ns. CPU3 was in
+another turn when the stopped snapshot was taken and is not counted as a
+completed observation. The first failure instead moves to CPU0 network stage
+44: service sequence 83 uses 6,243,137/2,500,000 ns. The checkpoint map makes
+stage 44 exactly the batched-RX completion acquisition: used-ring validation,
+response synchronization and copying the response into the driver's private
+packet, before the already separate packet-to-Ethernet copy and release/rearm
+segments.
+
+The remaining maximum-frame copy performed one volatile byte read per byte.
+After the DMA ownership synchronization, the response page is aligned and CPU
+owned, so it now copies its aligned prefix with volatile u64 reads and
+unaligned ordinary destination stores, followed by an exact volatile byte
+tail. This preserves volatile device-memory observation, the existing DMA
+barriers, completion token and response length, while never touching output
+or source bytes outside the descriptor-owned range. A 15-byte regression
+covers the wide word, seven-byte tail and two untouched destination sentinels.
+All 72 VirtIO driver tests pass, as do 625 host tests (two environment skips),
+151 v1.3 tests (one historical-evidence skip), 71 evidence-tool tests,
+formatting and patch checks. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-rx-wide-copy` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay remains
+required; the 69-case v1.3 catalogue is still open.
