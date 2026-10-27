@@ -19,7 +19,7 @@ smp_busy:
  str x11, [x1, #8]
  b smp_busy
 smp_bounded:
- mov x12, #128
+ mov x12, #16
 1:
  ldr x10, [x1]
  cmp x10, x0

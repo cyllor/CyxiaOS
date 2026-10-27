@@ -318,6 +318,23 @@ formatting and configured strict AArch64 Clippy pass. Exact build
 both selected stack paths remain 33,920/65,536 bytes. Linux timing remains
 required.
 
+Run `40425088374` crosses every native C-worker probe and reaches the global
+task bank. It exposes three cold combined segments: CPU0 network stage 40 at
+8,915,931/2,500,000 ns, CPU2 builtin sequence 1 at
+20,761,737/10,000,000 ns, and CPU3 optional task `4153:3` at
+15,246,632/10,000,000 ns. Network preflight now checkpoints after health and
+clock validation before device time setup. Dynamic tasks register their A02
+identity in a separately paid first dispatch and retain the verified index.
+The fixed builtin likewise prepares its already-probed identity only when its
+own credit is selected; its voluntary execution batch is reduced from 128 to
+16 iterations while still proving cookie access and SVC return. No reservation
+or budget is increased. All 615 host tests (two environment skips), 141 v1.3
+tests (one historical-evidence skip), 14 cluster-transport tests, formatting
+and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-task-cold-boundaries` is `BUILT_NOT_RUN`;
+both selected stack paths are 33,968/65,536 bytes. Linux timing remains
+required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

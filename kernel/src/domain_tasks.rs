@@ -169,6 +169,8 @@ struct Task {
     vector_output: u64,
     blocked: bool,
     heartbeat_ns: u64,
+    capture_ready: bool,
+    capture_index: Option<usize>,
 }
 impl Task {
     const EMPTY: Self = Self {
@@ -201,6 +203,8 @@ impl Task {
         vector_output: 0,
         blocked: false,
         heartbeat_ns: 0,
+        capture_ready: false,
+        capture_index: None,
     };
 }
 struct Launch {
@@ -970,6 +974,9 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
 }
 pub fn begin_service(now: u64) -> Option<Credit> {
     begin_builtin(0, now)
+}
+pub fn builtin_selected(slot: usize) -> bool {
+    slot < 64 && CREDIT_KIND[slot].load(Ordering::Acquire) == 1
 }
 /// Recheck an unstarted builtin credit immediately before entering its task
 /// body. MTTCG may deschedule this vCPU after selection; if that consumed the

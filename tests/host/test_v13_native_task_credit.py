@@ -12,20 +12,30 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;", source)
         self.assertIn("if d.thread == builtin(slot)", source)
         self.assertIn("BUILTIN_MIN_GRANT_NS", source[source.index("let safety ="):])
+        self.assertIn("pub fn builtin_selected", source)
 
     def test_builtin_fixture_yields_after_a_fixed_batch_with_timer_backstop(self):
         assembly = (ROOT / "kernel/src/smp_user.S").read_text()
         runtime = (ROOT / "kernel/src/smp.rs").read_text()
 
-        self.assertIn("mov x12, #128", assembly)
+        self.assertIn("mov x12, #16", assembly)
         self.assertIn("subs x12, x12, #1", assembly)
         self.assertIn("svc #4", assembly)
         self.assertIn("cbz x2, smp_busy", assembly)
         self.assertIn("cmp x2, #4", assembly)
         self.assertIn("b.eq smp_bounded", assembly)
         self.assertIn("ctx.regs[2] = 4;", runtime)
+        self.assertIn("prepare_builtin_capture(slot, i)", runtime)
+        self.assertIn("builtin_capture_index(cpu::slot())", runtime)
+        tasks = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        self.assertIn("if !s.tasks[i].capture_ready", tasks)
+        self.assertIn("crate::a02_capture::prepare(task)", tasks)
+        self.assertIn("s.tasks[i].capture_index = capture_index", tasks)
         self.assertIn("enter_service(\n            ctx", runtime)
-        self.assertIn("            None,\n            true,\n            false,\n        );", runtime)
+        self.assertIn(
+            "            builtin_capture_index(cpu::slot()),\n            true,\n            false,\n        );",
+            runtime,
+        )
         self.assertIn("fn fixture_yielded", runtime)
         self.assertIn("ctx.kind == 9", runtime[runtime.index("fn fixture_yielded"):])
         self.assertIn(

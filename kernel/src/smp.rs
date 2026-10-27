@@ -109,6 +109,10 @@ impl SliceTiming {
 static TASK_SLICE_EVIDENCE: SliceTiming = SliceTiming::new();
 #[cfg(feature = "unified-runtime")]
 static RECORD_SLICE_EXCEPTION: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
+#[cfg(feature = "unified-runtime")]
+static BUILTIN_CAPTURE_READY: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
+#[cfg(feature = "unified-runtime")]
+static BUILTIN_CAPTURE_INDEX: [AtomicU64; C] = [const { AtomicU64::new(u64::MAX) }; C];
 unsafe extern "C" {
     static cyxia_secondary_start: u8;
     static smp_user_start: u8;
@@ -394,6 +398,39 @@ fn context(i: usize) -> user::Context {
     }
     ctx
 }
+#[cfg(feature = "unified-runtime")]
+fn builtin_capture_task(slot: usize, i: usize) -> crate::a02_capture::Task {
+    crate::a02_capture::Task {
+        id: 0x534d_5000 + i as u64,
+        generation: 1,
+        role: 1,
+        affinity: 1 << slot,
+    }
+}
+#[cfg(feature = "unified-runtime")]
+fn prepare_builtin_capture(slot: usize, i: usize) -> bool {
+    if BUILTIN_CAPTURE_READY[slot].load(Ordering::Acquire) {
+        return true;
+    }
+    let encoded = crate::a02_capture::prepare(builtin_capture_task(slot, i))
+        .and_then(|index| u64::try_from(index).ok())
+        .unwrap_or(u64::MAX);
+    BUILTIN_CAPTURE_INDEX[slot].store(encoded, Ordering::Relaxed);
+    BUILTIN_CAPTURE_READY[slot].store(true, Ordering::Release);
+    false
+}
+#[cfg(feature = "unified-runtime")]
+fn builtin_capture_index(slot: usize) -> Option<usize> {
+    if !BUILTIN_CAPTURE_READY[slot].load(Ordering::Acquire) {
+        return None;
+    }
+    let encoded = BUILTIN_CAPTURE_INDEX[slot].load(Ordering::Relaxed);
+    if encoded == u64::MAX {
+        None
+    } else {
+        usize::try_from(encoded).ok()
+    }
+}
 fn execute(ctx: &mut user::Context, i: usize) {
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(i) as u64 };
     let quantum = (timer::frequency() / 1000).max(1);
@@ -413,12 +450,10 @@ fn execute(ctx: &mut user::Context, i: usize) {
             phys(root),
             timer::ticks().saturating_add(quantum),
             crate::a02_capture::Task {
-                id: 0x534d_5000 + i as u64,
-                generation: 1,
                 role: if i % 2 == 1 { 2 } else { 1 },
-                affinity: 1 << cpu::slot(),
+                ..builtin_capture_task(cpu::slot(), i)
             },
-            None,
+            builtin_capture_index(cpu::slot()),
             true,
             false,
         );
@@ -571,6 +606,12 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         #[cfg(feature = "unified-runtime")]
         {
             let runtime_start = timer::cpu_ticks();
+            if super::domain_tasks::builtin_selected(slot) && !prepare_builtin_capture(slot, i) {
+                prototype_runtime::business_complete(slot, runtime_start);
+                drop(permit);
+                prototype_runtime::idle_worker();
+                continue;
+            }
             if super::unified_task::step(slot) {
                 prototype_runtime::business_complete(slot, runtime_start);
                 drop(permit);

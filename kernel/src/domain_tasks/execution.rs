@@ -1305,6 +1305,15 @@ pub fn dispatch(slot: usize) -> bool {
         if RETURN_PENDING[i].load(Ordering::Acquire) || FILE_BUSY[i].load(Ordering::Acquire) {
             return Err(Error::Busy);
         }
+        let task = crate::a02_capture::Task {
+            id: s.tasks[i].key.id,
+            generation: s.tasks[i].key.generation,
+            role: 1,
+            affinity: s.scheduler.thread_affinity(s.tasks[i].key)?,
+        };
+        if !s.tasks[i].capture_ready {
+            return Ok(Some((i, 0, s.tasks[i].deadline, task, None, false)));
+        }
         s.tasks[i].life = Life::Running;
         s.tasks[i].entered = true;
         if let Some(a) = s.active[slot].as_mut() {
@@ -1314,17 +1323,26 @@ pub fn dispatch(slot: usize) -> bool {
             i,
             frame_phys(i * 3)?,
             s.tasks[i].deadline,
-            crate::a02_capture::Task {
-                id: s.tasks[i].key.id,
-                generation: s.tasks[i].key.generation,
-                role: 1,
-                affinity: s.scheduler.thread_affinity(s.tasks[i].key)?,
-            },
+            task,
+            s.tasks[i].capture_index,
+            true,
         )))
     });
-    let Ok(Some((i, root, deadline, task))) = selected else {
+    let Ok(Some((i, root, deadline, task, capture_index, capture_ready))) = selected else {
         return true;
     };
+    if !capture_ready {
+        let capture_index = crate::a02_capture::prepare(task);
+        let _ = locked(|s| {
+            if s.tasks[i].key.id != task.id || s.tasks[i].key.generation != task.generation {
+                return Err(Error::Stale);
+            }
+            s.tasks[i].capture_index = capture_index;
+            s.tasks[i].capture_ready = true;
+            Ok(())
+        });
+        return true;
+    }
     unsafe {
         let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
             .cast::<user::Context>()
@@ -1336,7 +1354,7 @@ pub fn dispatch(slot: usize) -> bool {
             root,
             timer::ticks().saturating_add(slice_ticks(slot)).min(end),
             task,
-            None,
+            capture_index,
             true,
             true,
         );

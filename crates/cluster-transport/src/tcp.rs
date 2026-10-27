@@ -188,11 +188,13 @@ impl<'a, P: Port> Tcp<'a, P> {
         checkpoint: &mut dyn FnMut(),
     ) -> Result<State, Error> {
         self.healthy()?;
+        checkpoint();
         if now_ms < self.last_ms || now_ms > i64::MAX as u64 {
             self.abort();
             return Err(Error::Clock);
         }
         self.last_ms = now_ms;
+        checkpoint();
         self.device.port_mut().set_time(now_ms);
         // Preflight state is complete and no device/socket borrow is live.
         // Give the first cold NIC service operation its own native credit.
