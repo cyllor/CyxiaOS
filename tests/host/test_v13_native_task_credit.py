@@ -34,6 +34,26 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("crate::domain_platform::poll(now)?;", service)
         self.assertIn("service_detail(6);\n    // with() has released", service)
 
+    def test_batched_rx_custody_transitions_are_independently_settleable(self):
+        driver = (ROOT / "crates/driver-virtio/src/net/batched.rs").read_text()
+        transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
+
+        receive = driver[driver.index("pub fn receive_with_checkpoint"):]
+        self.assertIn("self.poll_rx(p)?;\n        checkpoint();", receive)
+        self.assertIn("copy_from_slice", receive)
+        self.assertIn("checkpoint();\n        self.rx.release(token)?;", receive)
+        self.assertIn("receive_frame_with_checkpoint", transport)
+        self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
+
+    def test_builtin_boundary_has_single_writer_phase_detail(self):
+        runtime = (ROOT / "kernel/src/smp.rs").read_text()
+
+        self.assertIn("static BUILTIN_TASK_DETAIL: BuiltinDetail", runtime)
+        self.assertIn("size_of::<BuiltinDetail>() == 256", runtime)
+        fixture = runtime[runtime.index("let builtin_selected ="):]
+        for phase in range(7):
+            self.assertIn(f"builtin_detail(slot, {phase});", fixture)
+
     def test_builtin_fixture_yields_after_a_fixed_batch_with_timer_backstop(self):
         assembly = (ROOT / "kernel/src/smp_user.S").read_text()
         runtime = (ROOT / "kernel/src/smp.rs").read_text()

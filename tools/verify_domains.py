@@ -74,7 +74,7 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
-            "DOMAIN_SERVICE_DETAIL": 128}
+            "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256}
 
 
 def require(condition, message):
@@ -523,6 +523,7 @@ def diagnostics(guest, bundle):
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
                                     ("DOMAIN_PREPARATION_CONTEXT", "preparation_context", 16),
                                     ("DOMAIN_SERVICE_DETAIL", "service_detail", 16),
+                                    ("BUILTIN_TASK_DETAIL", "builtin_detail", 32),
                                     ("DOMAIN_PREPARATION_REJECTIONS", "preparation_rejections", 648),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
                                     ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
@@ -565,6 +566,7 @@ def diagnostics(guest, bundle):
             if guest.get("service_stage_word") is not None
             else (guest.get("unified_words") or [None] * 31)[30],
             "service_detail": guest.get("service_detail"),
+            "builtin_detail": guest.get("builtin_detail"),
             "sticky_count": sticky_words[1] if len(sticky_words) > 1 else 0,
             "receipts": rows,
         }

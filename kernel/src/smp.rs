@@ -6,6 +6,8 @@
 //! bring-up and does not run the core-transition proof fixture. No remote
 //! resources, RCU readers or production workers exist in this profile. The
 //! resulting proof provider MUST NOT be used by production.
+#[cfg(feature = "unified-runtime")]
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::{BootInfo, GicResource, PhysAddr};
@@ -113,6 +115,30 @@ static RECORD_SLICE_EXCEPTION: [AtomicBool; C] = [const { AtomicBool::new(false)
 static BUILTIN_CAPTURE_READY: [AtomicBool; C] = [const { AtomicBool::new(false) }; C];
 #[cfg(feature = "unified-runtime")]
 static BUILTIN_CAPTURE_INDEX: [AtomicU64; C] = [const { AtomicU64::new(u64::MAX) }; C];
+#[cfg(feature = "unified-runtime")]
+#[repr(C, align(64))]
+struct BuiltinDetail([UnsafeCell<[u64; 8]>; 4]);
+#[cfg(feature = "unified-runtime")]
+unsafe impl Sync for BuiltinDetail {}
+#[cfg(feature = "unified-runtime")]
+#[used]
+#[unsafe(no_mangle)]
+static BUILTIN_TASK_DETAIL: BuiltinDetail = BuiltinDetail([const { UnsafeCell::new([0; 8]) }; 4]);
+#[cfg(feature = "unified-runtime")]
+fn builtin_detail(slot: usize, phase: usize) {
+    if slot >= 4 || phase >= 8 {
+        return;
+    }
+    let row = BUILTIN_TASK_DETAIL.0[slot].get().cast::<u64>();
+    unsafe {
+        if phase + 1 < 8 {
+            row.add(phase + 1).write_volatile(0);
+        }
+        row.add(phase).write_volatile(timer::cpu_ticks());
+    }
+}
+#[cfg(feature = "unified-runtime")]
+const _: () = assert!(core::mem::size_of::<BuiltinDetail>() == 256);
 unsafe extern "C" {
     static cyxia_secondary_start: u8;
     static smp_user_start: u8;
@@ -611,17 +637,26 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         #[cfg(feature = "unified-runtime")]
         {
             let runtime_start = timer::cpu_ticks();
-            if super::domain_tasks::builtin_selected(slot) && !prepare_builtin_capture(slot, i) {
-                prototype_runtime::business_complete(slot, runtime_start);
-                drop(permit);
-                prototype_runtime::idle_worker();
-                continue;
+            let builtin_selected = super::domain_tasks::builtin_selected(slot);
+            if builtin_selected {
+                builtin_detail(slot, 0);
+                let capture_ready = prepare_builtin_capture(slot, i);
+                builtin_detail(slot, 1);
+                if !capture_ready {
+                    prototype_runtime::business_complete(slot, runtime_start);
+                    drop(permit);
+                    prototype_runtime::idle_worker();
+                    continue;
+                }
             }
             if super::unified_task::step(slot) {
                 prototype_runtime::business_complete(slot, runtime_start);
                 drop(permit);
                 prototype_runtime::idle_worker();
                 continue;
+            }
+            if builtin_selected {
+                builtin_detail(slot, 2);
             }
             // A builtin credit may have waited while this vCPU was
             // descheduled after selection. It has executed no task body yet;
@@ -631,13 +666,20 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
                 prototype_runtime::idle_worker();
                 continue;
             }
+            if builtin_selected {
+                builtin_detail(slot, 3);
+            }
         }
         let ctx = &mut contexts[role];
         #[cfg(all(feature = "prototype-runtime", feature = "unified-runtime"))]
         let runtime_start = timer::cpu_ticks();
         #[cfg(all(feature = "prototype-runtime", not(feature = "unified-runtime")))]
         let runtime_start = timer::ticks();
+        #[cfg(feature = "unified-runtime")]
+        builtin_detail(slot, 4);
         execute(ctx, i);
+        #[cfg(feature = "unified-runtime")]
+        builtin_detail(slot, 5);
         if !fixture_yielded(ctx)
             || ctx.regs[0] != cookie(i)
             || ctx.tpidr_el0 != cookie(i)
@@ -651,6 +693,8 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         }
         // All user writes completed before user::enter returned its TLB barrier.
         PROGRESS[i].fetch_add(1, Ordering::Release);
+        #[cfg(feature = "unified-runtime")]
+        builtin_detail(slot, 6);
         #[cfg(feature = "prototype-runtime")]
         prototype_runtime::business_complete(slot, runtime_start);
         drop(permit);

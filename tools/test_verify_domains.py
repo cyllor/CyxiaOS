@@ -498,6 +498,18 @@ class EvidenceParserTests(unittest.TestCase):
                 "DOMAIN_SERVICE_DETAIL": encode(detail),
             })
 
+    def test_builtin_detail_is_retained_in_credit_failure(self):
+        unified = [0] * 512
+        sticky = [0] * 32
+        sticky[0] = 1
+        detail = list(range(32))
+        with self.assertRaisesRegex(ValueError, r'"builtin_detail":\[0,1,2'):
+            diagnostics({}, {
+                "UNIFIED_EVIDENCE": encode(unified),
+                "TASK_OVERRUN_EVIDENCE": encode(sticky),
+                "BUILTIN_TASK_DETAIL": encode(detail),
+            })
+
     def test_legacy_service_stage_remains_available(self):
         unified = [0] * 512
         unified[30] = 43

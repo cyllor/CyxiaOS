@@ -21,6 +21,13 @@ pub enum Error {
 pub trait Port {
     fn send(&mut self, frame: &[u8]) -> Result<(), Error>;
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error>;
+    fn receive_with_checkpoint(
+        &mut self,
+        frame: &mut [u8; MTU],
+        _checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, Error> {
+        self.receive(frame)
+    }
     fn flush(&mut self) -> Result<(), Error> {
         Ok(())
     }
@@ -37,6 +44,14 @@ pub trait VirtioLink {
         out: &mut [u8],
         p: &impl Platform,
     ) -> Result<Option<usize>, DriverError>;
+    fn receive_frame_with_checkpoint(
+        &mut self,
+        out: &mut [u8],
+        p: &impl Platform,
+        _checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, DriverError> {
+        self.receive_frame(out, p)
+    }
     fn finish_turn(&mut self, p: &impl Platform) -> Result<(), DriverError>;
     fn burst_capacity(&self) -> usize;
 }
@@ -75,6 +90,14 @@ impl VirtioLink for BatchedNet {
     ) -> Result<Option<usize>, DriverError> {
         self.receive(o, p)
     }
+    fn receive_frame_with_checkpoint(
+        &mut self,
+        o: &mut [u8],
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, DriverError> {
+        self.receive_with_checkpoint(o, p, checkpoint)
+    }
     fn finish_turn(&mut self, p: &impl Platform) -> Result<(), DriverError> {
         self.flush_tx(p)
     }
@@ -103,6 +126,15 @@ impl<P: Platform, N: VirtioLink> Port for VirtioPort<'_, P, N> {
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error> {
         self.net
             .receive_frame(frame, self.platform)
+            .map_err(|_| Error::Device)
+    }
+    fn receive_with_checkpoint(
+        &mut self,
+        frame: &mut [u8; MTU],
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, Error> {
+        self.net
+            .receive_frame_with_checkpoint(frame, self.platform, checkpoint)
             .map_err(|_| Error::Device)
     }
     fn flush(&mut self) -> Result<(), Error> {
@@ -159,9 +191,10 @@ impl<P: Port> Ethernet<P> {
         self.service_with_checkpoint(&mut || {})
     }
 
-    /// The same bounded device turn with a scheduler-safe boundary after the
-    /// TX completion check. At that point no port call or DMA token is live,
-    /// so the caller may settle the current CPU reservation before RX work.
+    /// The same bounded device turn with scheduler-safe boundaries after the
+    /// TX completion check and, when supported by the port, between complete
+    /// RX custody transitions. At every boundary no borrowed frame escapes,
+    /// so the caller may settle the current CPU reservation before continuing.
     pub fn service_with_checkpoint(&mut self, checkpoint: &mut dyn FnMut()) -> Result<(), Error> {
         if self.failed {
             return Err(Error::Device);
@@ -183,7 +216,9 @@ impl<P: Port> Ethernet<P> {
         }
         checkpoint();
         if self.rx.len == 0
-            && let Some(len) = self.port.receive(&mut self.rx.bytes)?
+            && let Some(len) = self
+                .port
+                .receive_with_checkpoint(&mut self.rx.bytes, checkpoint)?
         {
             if !(14..=MTU).contains(&len) {
                 return Err(Error::Frame);

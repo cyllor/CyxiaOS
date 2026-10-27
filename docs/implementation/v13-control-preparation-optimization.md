@@ -953,3 +953,27 @@ strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-service-owner-segments` is `BUILT_NOT_RUN`;
 both selected stack paths pass at 33,776/65,536 bytes and both ELFs expose the
 detail bank at exactly 128 bytes. Patched-QEMU timing is still required.
+
+Run `40434814347` varies back to two previously observed cold boundaries:
+network stage 44 uses 6,136,894/2,500,000 ns and CPU2 builtin sequence 4 uses
+14,844,821/10,000,000 ns. The RX range-clear optimization remains effective
+relative to the prior 9.569 ms observation but does not make the combined
+completion/copy/rearm segment conforming. Batched receive now checkpoints
+after the queue completion has been acquired into its private packet and again
+after copying that packet into the Ethernet staging slot. The exact DMA token
+remains held across both checkpoints and is released/rearmed only in its own
+following segment; callbacks run with no borrowed DMA slice and advance
+mechanisms only. Ordinary ports retain the one-call fallback and all existing
+TCP semantics.
+
+The builtin credit may fail either in its separately paid first A02 identity
+preparation or in the later A02 enter/EL0/return/register-validation boundary.
+A four-row, eight-marker CPU-private volatile bank now distinguishes those
+phases without changing the authoritative A02 stream or auxiliary-slice
+settings. The stopped-snapshot symbol is exactly 256 bytes. The full 622 host
+tests (two environment skips), 148 v1.3 tests (one historical-evidence skip),
+71 evidence-tool tests, all 14 cluster-transport and 71 VirtIO driver tests,
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-rx-custody-builtin-detail-v2` is
+`BUILT_NOT_RUN`; both selected stack paths pass at 33,776/65,536 bytes.
+Patched-QEMU timing is still required.

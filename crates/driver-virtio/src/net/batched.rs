@@ -210,7 +210,19 @@ impl BatchedNet {
         Ok(true)
     }
     pub fn receive(&mut self, out: &mut [u8], p: &impl Platform) -> Result<Option<usize>, Error> {
+        self.receive_with_checkpoint(out, p, &mut || {})
+    }
+    /// Poll, copy and release/rearm are distinct custody transitions. The
+    /// callback is invoked only after a complete transition while no slice
+    /// into pinned DMA memory escapes this owner.
+    pub fn receive_with_checkpoint(
+        &mut self,
+        out: &mut [u8],
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, Error> {
         self.poll_rx(p)?;
+        checkpoint();
         let Some((token, len)) = self.received else {
             return Ok(None);
         };
@@ -218,6 +230,7 @@ impl BatchedNet {
             return Err(Error::Address);
         }
         out[..len].copy_from_slice(&self.packet[HEADER..HEADER + len]);
+        checkpoint();
         self.rx.release(token)?;
         self.received = None;
         self.rx
