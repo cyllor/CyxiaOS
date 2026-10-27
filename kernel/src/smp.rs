@@ -688,8 +688,6 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         #[cfg(feature = "unified-runtime")]
         builtin_detail(slot, 4);
         execute(ctx, i);
-        #[cfg(feature = "unified-runtime")]
-        builtin_detail(slot, 5);
         if !fixture_yielded(ctx)
             || ctx.regs[0] != cookie(i)
             || ctx.tpidr_el0 != cookie(i)
@@ -703,8 +701,6 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         }
         // All user writes completed before user::enter returned its TLB barrier.
         PROGRESS[i].fetch_add(1, Ordering::Release);
-        #[cfg(feature = "unified-runtime")]
-        builtin_detail(slot, 6);
         #[cfg(feature = "prototype-runtime")]
         prototype_runtime::business_complete(slot, runtime_start);
         drop(permit);
@@ -1162,6 +1158,9 @@ unsafe fn enter_service_inner(
                 crate::a02_capture::enter(task);
             }
         }
+        if immutable_root {
+            builtin_detail(slot, 5);
+        }
         if record_slice_evidence {
             RECORD_SLICE_EXCEPTION[slot].store(true, Ordering::Release);
         }
@@ -1175,6 +1174,9 @@ unsafe fn enter_service_inner(
             // its first memory access, so no vector state is touched.
             user::enter_integer_probe(context, root);
         }
+        if immutable_root {
+            builtin_detail(slot, 6);
+        }
         if record_slice_evidence {
             RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
         }
@@ -1184,6 +1186,9 @@ unsafe fn enter_service_inner(
             } else {
                 crate::a02_capture::returned();
             }
+        }
+        if immutable_root {
+            builtin_detail(slot, 7);
         }
         if record_slice_evidence && slot < 4 {
             TASK_SLICE_EVIDENCE.words[row + 12].store(timer::ticks(), Ordering::Relaxed);

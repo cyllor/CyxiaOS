@@ -51,8 +51,20 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("static BUILTIN_TASK_DETAIL: BuiltinDetail", runtime)
         self.assertIn("size_of::<BuiltinDetail>() == 256", runtime)
         fixture = runtime[runtime.index("let builtin_selected ="):]
-        for phase in range(7):
+        for phase in range(8):
             self.assertIn(f"builtin_detail(slot, {phase});", fixture)
+        self.assertLess(
+            runtime.index("builtin_detail(slot, 5);"),
+            runtime.index("user::enter_immutable(context, root, builtin_asid(root));"),
+        )
+        self.assertGreater(
+            runtime.index("builtin_detail(slot, 6);"),
+            runtime.index("user::enter_immutable(context, root, builtin_asid(root));"),
+        )
+        self.assertGreater(
+            runtime.index("builtin_detail(slot, 7);"),
+            runtime.index("crate::a02_capture::returned_prepared(index);"),
+        )
 
     def test_builtin_fixture_yields_after_a_fixed_batch_with_timer_backstop(self):
         assembly = (ROOT / "kernel/src/smp_user.S").read_text()

@@ -441,8 +441,8 @@ impl BatchQueue {
     ) -> Result<Option<Completion>, Error> {
         self.poll_with_checkpoint(t, out, p, &mut || {})
     }
-    /// Consume one validated used record with scheduler-safe boundaries after
-    /// acquiring its exact DMA record and after validating its slot/length.
+    /// Poll one used record with scheduler-safe boundaries after status,
+    /// publication and used-index acquisition, plus completion validation.
     /// The callback must not re-enter this queue; custody remains here until
     /// the response copy and final state transition complete.
     pub fn poll_with_checkpoint(
@@ -459,10 +459,13 @@ impl BatchQueue {
             self.poison(t, p);
             return Err(Error::Device);
         }
+        checkpoint();
         self.flush_due(t, p)?;
+        checkpoint();
         unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         let end = self.memory.used.get16(2);
+        checkpoint();
         if end == self.used {
             let irq = t.read(0x60);
             t.write(0x64, irq & 3);
@@ -711,7 +714,7 @@ mod tests {
         assert_eq!(&out[15..], &[0xa5, 0xa5]);
     }
     #[test]
-    fn completion_checkpoints_after_record_and_validation_before_copy() {
+    fn poll_checkpoints_status_publication_index_record_and_validation() {
         let (mut q, mut t, p) = fixture(16);
         q.enqueue(&mut t, &[], 15, true, false, &p).unwrap();
         used(&mut q, 0, 15);
@@ -721,7 +724,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completion.len, 15);
-        assert_eq!(checkpoints, 2);
+        assert_eq!(checkpoints, 5);
+    }
+    #[test]
+    fn empty_poll_checkpoints_status_publication_and_used_index() {
+        let (mut q, mut t, p) = fixture(16);
+        let mut checkpoints = 0;
+        assert!(
+            q.poll_with_checkpoint(&mut t, &mut [0; 15], &p, &mut || checkpoints += 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(checkpoints, 3);
     }
     #[test]
     fn first_deadline_sync_and_isolated_never_wait_for_threshold() {

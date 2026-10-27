@@ -1118,3 +1118,28 @@ configured AArch64 strict Clippy. Exact build
 selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
 required before stage 50 can be considered closed, and the 69-case v1.3
 catalogue remains open.
+
+Run `40441481598` reaches an empty RX poll, so the new completion-record
+boundaries are not exercised. CPU0 service sequence 60 instead uses
+4,278,593/2,500,000 ns at network stage 44 across device-status validation,
+due-batch handling, used-index acquisition and the empty acknowledgement. The
+same stopped snapshot records a separate CPU3 builtin receipt at
+10,068,534/10,000,000 ns. Its broad marker-4-to-5 interval is 10,064,446 ns,
+while CPU2's corresponding interval is only 30,236 ns.
+
+The queue now checkpoints after device-status validation, after any due batch
+publication and after used-index acquisition. Thus an empty poll has three
+separately credited safe pieces; a real completion additionally retains the
+record-acquisition and slot/length-validation boundaries. Queue custody remains
+held and the callback still may not re-enter the queue. The builtin's existing
+eight-word single-writer timeline is also refined without adding an evidence
+object: marker 4→5 now measures A02 entry, 5→6 the EL0 entry/return, and 6→7
+A02 return. This is diagnostic-only and changes neither capture authority nor
+task work. The empty-poll regression and all 74 VirtIO tests pass, as do all 14
+cluster-network tests, 626 host tests (two environment skips), 152 v1.3 tests
+(one historical-evidence skip), 71 evidence-tool tests, formatting, patch
+checks and configured AArch64 strict Clippy. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-rx-empty-segments` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
+required to attribute the builtin interval and validate the empty-poll split;
+the 69-case v1.3 catalogue remains open.
