@@ -17,6 +17,32 @@ class ProtectedFileReplies(unittest.TestCase):
         self.binding=dict(nonce='08'*16,uuid='07'*16,image_sha256='04'*32,
                           input_sha256='05'*32,source_sha256='03'*32,boot_epoch=1,mode=1)
 
+    def test_cache_batch_switch_waits_for_protected_pressure_create(self):
+        root=Path(__file__).resolve().parents[2]
+        budget=(root/'crates/prototype/src/a10_budget.rs').read_text()
+        storage=(root/'kernel/src/domain_storage.rs').read_text()
+        capture=(root/'kernel/src/storage_fault_capture.rs').read_text()
+        self.assertIn('pub const CACHE_WRITEBACK_PAGES: u16 = 32;',budget)
+        init=storage[storage.index('pub fn init()'):storage.index('fn ready()',
+                                                                  storage.index('pub fn init()'))]
+        self.assertNotIn('set_writeback_baseline',init)
+        delivered=capture[capture.index('pub fn delivered'):capture.index('pub fn entered')]
+        self.assertIn('run_mode == 4',delivered)
+        self.assertIn('operation == CREATE',delivered)
+        self.assertIn('result == 0',delivered)
+        self.assertIn('b"/a10/pressure-a"',delivered)
+        self.assertIn('domain_storage::set_writeback_baseline',delivered)
+        self.assertIn('a10_budget::CACHE_WRITEBACK_PAGES',delivered)
+
+    def test_storage_fault_profile_does_not_start_unrelated_learning_trial(self):
+        root=Path(__file__).resolve().parents[2]
+        owner=(root/'kernel/src/learning_replay/owner.rs').read_text()
+        prepare=owner[owner.index('Phase::Prepare =>'):owner.index('Phase::Reserve =>')]
+        self.assertIn('crate::storage_fault_capture::PROFILE',prepare)
+        self.assertIn('PAUSED.load(Ordering::Acquire)',prepare)
+        self.assertLess(prepare.index('crate::storage_fault_capture::PROFILE'),
+                        prepare.index('root::begin_preparation'))
+
     def frame(self,operation,request,*,handle=(0,0),obj=(5,2),seq=0,data=b'',path='',offset=0,
               open_mode=None):
         frame=bytearray(640)
@@ -72,6 +98,15 @@ class ProtectedFileReplies(unittest.TestCase):
         for at in (32,56,72,120,152,184,300):
             changed=bytearray(raw);changed[at]^=1
             with self.subTest(offset=at),self.assertRaises(ValueError):self.verifier.decode(changed,self.binding)
+
+    def test_page_aligned_symbol_padding_is_accepted_only_when_zero(self):
+        raw, _ = self.capture()
+        padded = raw + bytes(299008 - len(raw))
+        self.assertEqual(len(self.verifier.decode(padded, self.binding)['records']), 7)
+        changed = bytearray(padded)
+        changed[-1] = 1
+        with self.assertRaises(ValueError):
+            self.verifier.decode(changed, self.binding)
 
     def test_successful_fsync_with_lower_durable_sequence_is_rejected(self):
         raw,_=self.capture();changed=bytearray(raw)

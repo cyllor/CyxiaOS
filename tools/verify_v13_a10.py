@@ -5,6 +5,7 @@ import struct
 from verify_smp import require
 
 HEADER = 512
+CAPTURE_SYMBOL_BYTES = 299008
 RECORD = 768
 MAX_EVENTS = 384
 PRESSURE_CHUNK_BYTES = 64 * 1024
@@ -90,7 +91,7 @@ def verify_terminal(raw: bytes, binding: dict, capture: dict) -> dict:
 
 
 def decode(raw: bytes, binding: dict) -> dict:
-    require(HEADER <= len(raw) <= 295424, 'incomplete/oversized A10 capture')
+    require(HEADER <= len(raw) <= CAPTURE_SYMBOL_BYTES, 'incomplete/oversized A10 capture')
     magic, version, width, count, overflow, epoch, mode = struct.unpack_from('<7Q', raw)
     require((magic, version, width) == (TRACE_MAGIC, 1, RECORD) and 0 < count <= MAX_EVENTS
             and overflow == 0, 'invalid/overflowed A10 capture')

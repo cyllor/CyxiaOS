@@ -4,6 +4,12 @@ use crate::domains::{Action, Error, ObjectKey, PolicyStamp, WINDOW_NS};
 pub const CPU_BUDGET_NS: u64 = WINDOW_NS * 9 / 10;
 pub const CONTROL_BUDGET_NS: u64 = WINDOW_NS * 7 / 10;
 pub const FAIR_WAIT_NS: u64 = WINDOW_NS;
+// CPU execution and shared monotonic time are independent native clocks. Only
+// the wall-clock order is comparable here; the separately prepaid CPU
+// reservation below remains the hard execution limit for `actual_ns`.
+fn completion_time_valid(started_ns: u64, finished_ns: u64) -> bool {
+    finished_ns >= started_ns
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuLayout {
     pub business_mask: u64,
@@ -903,7 +909,7 @@ impl Scheduler {
         if cpu >= 64 || self.cpus[cpu].active != Some(d) {
             return Err(Error::Stale);
         }
-        if finished_ns < d.started_ns || actual_ns > finished_ns - d.started_ns {
+        if !completion_time_valid(d.started_ns, finished_ns) {
             return Err(Error::Range);
         }
         let i = self.thread(d.thread)?;
@@ -1277,9 +1283,7 @@ impl Scheduler {
         if c.control != Some(credit) {
             return Err(Error::Stale);
         }
-        if finished_ns < credit.started_ns
-            || actual_ns > finished_ns.saturating_sub(credit.started_ns)
-        {
+        if !completion_time_valid(credit.started_ns, finished_ns) {
             return Err(Error::Range);
         }
         let end = credit

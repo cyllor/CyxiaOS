@@ -32,21 +32,26 @@ from run_qemu import Qmp
 from run_v13_a02 import inject_config
 from transport import FrameDecoder
 from v13_fault_disk import Backend, Server
+from v13_a10_budget import scenario_budget
 from verify_smp import require, sha
 from verify_v13_a10 import decode, payload, verify_boot, verify_consumption, verify_filesystem
 from verify_v13_model import loaded_bytes
 from verify_v13_storage_faults import copy_sparse
+from verify_unified import attest_qemu
 
 LAYOUT = (1, 512, 768, 384, 295424, 299008, 512, 512)
 CONTROL_EVIDENCE_BYTES = (512 + 64 * 640) * 8
 EXIT_MAGIC = 0x4359584131305052
+PENDING_DIAGNOSTICS = ('domain-task', 'unified-runtime', 'unified-service-stage')
 TOOL_NAMES = ('run_v13_a10.py', 'verify_v13_a10.py', 'run_v13_a02.py',
     'run_v13_a10_matrix.py', 'verify_v13_a10_matrix.py', 'verify_v13_a10_faults.py',
     'artifact_store.py', 'check_v13_preparation_stack.py',
     'v13_fault_disk.py', 'check_v13_fault_disk.py', 'check_v13_filesystem.py',
     'check_v13_disk.py', 'verify_v13_storage_faults.py', 'verify_v13_storage.py',
     'build_unified.py', 'check_elf.py', 'verify_v13_model.py', 'run_qemu.py',
-    'transport.py', 'verify_smp.py', 'doctor.py', 'check_prototype_evidence.py')
+    'transport.py', 'verify_smp.py', 'doctor.py', 'check_prototype_evidence.py',
+    'v13_a10_budget.py',
+    'verify_unified.py')
 
 
 def config_bytes(binding: dict) -> bytes:
@@ -134,6 +139,35 @@ def result_scope(cut: bool) -> dict:
                'one ordinary EL0 clean mode; complete fault/replay/eviction matrix remains unrun'))
 
 
+def sample_interval(sample_ms: int) -> float:
+    require(type(sample_ms) is int and 100 <= sample_ms <= 30_000,
+            'A10 sample interval must be 100..30000 ms')
+    return sample_ms / 1000
+
+
+def request_merging(mode: int, cut: int) -> str:
+    return 'on' if cut == 0 and mode in (1, 4) else 'off'
+
+
+def diagnostic_specs() -> tuple[tuple[str, str, int], ...]:
+    return (('STORAGE_V13_EVIDENCE', 'storage-boot', 4096),
+            ('DOMAIN_CONTROL_EVIDENCE', 'control-header', CONTROL_EVIDENCE_BYTES),
+            ('CONTROL_CREDIT_EVIDENCE', 'control-credit', 512),
+            ('TASK_OVERRUN_EVIDENCE', 'task-overrun', 256),
+            ('DOMAIN_TASK_EVIDENCE', 'domain-task', 256),
+            ('RUNTIME_V13_EVIDENCE', 'runtime-v13', 8192),
+            ('DYNAMIC_V13_EVIDENCE', 'dynamic-v13', 4096),
+            ('UNIFIED_SERVICE_STAGE', 'unified-service-stage', 8),
+            ('UNIFIED_EVIDENCE', 'unified-runtime', 4096))
+
+
+def resolve_qemu(qemu: Path | None, qemu_source: Path | None) -> tuple[Path, dict]:
+    selected = qemu or shutil.which('qemu-system-aarch64', path=env()['PATH'])
+    require(selected is not None, 'QEMU missing')
+    binary = Path(selected).resolve(strict=True)
+    return binary, attest_qemu(binary, qemu_source)
+
+
 def profile(image: bytes) -> dict:
     inspect_elf(image)
     require(boot_profile(image)['ram_mib'] == 1024, 'A10 requires 1 GiB unified image')
@@ -146,10 +180,7 @@ def profile(image: bytes) -> dict:
     require(struct.unpack('<8Q', loaded_bytes(image, layout['va'], 64)) == LAYOUT
             and capture['size'] == LAYOUT[5], 'unknown A10 capture layout')
     diagnostics = {}
-    for name, key, size in (('STORAGE_V13_EVIDENCE', 'storage-boot', 4096),
-                           ('DOMAIN_CONTROL_EVIDENCE', 'control-header', CONTROL_EVIDENCE_BYTES),
-                           ('CONTROL_CREDIT_EVIDENCE', 'control-credit', 512),
-                           ('TASK_OVERRUN_EVIDENCE', 'task-overrun', 256)):
+    for name, key, size in diagnostic_specs():
         location = symbol(image, name)
         require(location['size'] == size, 'wrong diagnostic symbol: ' + name)
         diagnostics[key] = location
@@ -166,13 +197,22 @@ def _json(path: Path, document):
 
 
 def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
-        source_root: Path = ROOT, timeout: float = 210, cut: int = 0,
+        source_root: Path = ROOT, timeout: float | None = None, cut: int = 0,
         phase: str = 'before', unflushed: str = 'drop', reverse_replies: bool = False,
-        artifact_cache: Path | None = None) -> dict:
-    require(5 <= timeout <= 300 and type(cut) is int and cut >= 0, 'invalid bounded capture request')
+        artifact_cache: Path | None = None, sample_ms: int = 100,
+        qemu: Path | None = None, qemu_source: Path | None = None) -> dict:
+    source_root = source_root.resolve(strict=True)
+    budget = scenario_budget(source_root, mode)
+    if timeout is None:
+        timeout = budget['capture_timeout_seconds']
+    require(type(timeout) in (int, float) and not isinstance(timeout, bool)
+            and 5 <= timeout <= budget['capture_timeout_seconds']
+            and type(cut) is int and cut >= 0, 'invalid bounded capture request')
     require(phase in ('before', 'after-ack') and unflushed in ('drop', 'reverse-half'), 'invalid cut policy')
+    interval = sample_interval(sample_ms)
+    merging = request_merging(mode, cut)
     build_manifest, initial_disk = build_manifest.resolve(strict=True), initial_disk.resolve(strict=True)
-    source_root, output = source_root.resolve(strict=True), output.resolve()
+    output = output.resolve()
     if artifact_cache is not None: artifact_cache = artifact_cache.resolve()
     require(not output.exists(), 'refuse to reuse A10 evidence output')
     manifest = read_json(build_manifest)
@@ -188,11 +228,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     layout = profile(image)
     before = inspect_filesystem(initial_disk)
     start = validate_start(before, mode)
-    binary = shutil.which('qemu-system-aarch64', path=env()['PATH'])
-    require(binary is not None, 'QEMU missing')
-    version = subprocess.check_output([binary, '--version'], text=True, timeout=10)
-    require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
-            'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
+    binary, qemu_proof = resolve_qemu(qemu, qemu_source)
     output.mkdir(parents=True, mode=0o700)
     frozen_files = {build_manifest: manifest_hash, output / 'build-manifest.json': manifest_hash}
     for name in ('node-a.elf', 'service-a.elf', 'task.elf'):
@@ -225,7 +261,11 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         initial_disk_sha256=initial_hash, initial_object=start['prior_object'],
         scenario='ordinary EL0 same-home versions and independent reader',
         payload='LE u64 0xa100000000000000 | version<<32 | word_index, 512 words',
-        clock='wallclock', client_deadline_ns=180_000_000_000, client_poll_ns=2_000_000_000,
+        clock='wallclock', client_deadline_ns=budget['client_deadline_ns'],
+        capture_margin_ns=budget['capture_margin_ns'], capture_timeout_seconds=timeout,
+        client_poll_ns=budget['client_poll_ns'],
+        sample_ms=sample_ms,
+        qemu_request_merging=merging,
         cut=cut, phase=phase, unflushed=unflushed, reverse_replies=reverse_replies,
         immutable_artifact_cache=str(artifact_cache) if artifact_cache is not None else None,
         max_events=LAYOUT[3], instrumentation_bytes=layout['instrumentation_bytes']))
@@ -237,13 +277,14 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     (output / 'config.bin').write_bytes(config_bytes(binding))
     model = layout['model']
     (output / 'model.bin').write_bytes(loaded_bytes(image, model['va'], model['size']))
-    qemu_hash = sha(Path(binary))
-    frozen_files[Path(binary)] = qemu_hash
-    _json(output / 'tools.json', dict(qemu_version=version, qemu_sha256=qemu_hash,
+    frozen_files[binary] = qemu_proof['qemu_sha256']
+    _json(output / 'tools.json', dict(qemu_proof,
           build_tools=manifest['tools'], capture_tools=tool_hashes))
     report = dict(result_scope(bool(cut)), status='FAIL', capture_status='INCOMPLETE',
         verifier_version='a10-single-mode-v1', binding=binding, source_root=str(source_root),
-        clock_profile='wallclock', build_manifest_sha256=manifest_hash,
+        clock_profile='wallclock', scenario_budget=budget, sample_ms=sample_ms,
+        qemu_request_merging=merging,
+        build_manifest_sha256=manifest_hash,
         native_mode_verified=False, cut_observed=False)
     proc = sock = qmp = backend = server = None
     raw, serial = bytearray(), bytearray()
@@ -262,11 +303,11 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
             with socket.socket() as listener:
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]
-            argv = [binary, '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
+            argv = [str(binary), '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
                 '-cpu', 'cortex-a53', '-smp', '4', '-m', '1024M', '-accel', 'tcg,thread=multi',
                 '-S', '-display', 'none', '-monitor', 'none', '-global', 'virtio-mmio.force-legacy=false',
                 '-drive', f'if=none,id=disk0,file=nbd:unix:{server.path},format=raw,cache=writeback',
-                '-device', 'virtio-blk-device,drive=disk0,request-merging=off',
+                '-device', f'virtio-blk-device,drive=disk0,request-merging={merging}',
                 '-netdev', f'socket,id=net0,listen=127.0.0.1:{port}',
                 '-device', 'virtio-net-device,id=eth0,netdev=net0,mac=02:00:00:00:00:01',
                 '-object', 'rng-random,id=rng0,filename=/dev/urandom',
@@ -330,6 +371,9 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                 require(not any(word in serial for word in (b'PANIC', b'SMP_ERROR', b'FAIL')),
                         'native guest reported failure')
                 progress = save('pending-progress.bin', layout['progress']['pa'], 512)
+                for name in PENDING_DIAGNOSTICS:
+                    location = layout['diagnostics'][name]
+                    save('pending-' + name + '.bin', location['pa'], location['size'])
                 if terminal_ready(progress, mode):
                     # Both selected endpoints have actually exited. Their file
                     # trace and progress are now immutable while VM keeps running.
@@ -343,7 +387,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                     require(decoder.loss == decoder.corrupt == 0, 'serial transport loss/corruption')
                     report['capture_status'] = 'TERMINAL_CAPTURED'
                     break
-                time.sleep(.1)
+                time.sleep(interval)
             else:
                 # Preserve raw state without inferring a successful terminal.
                 trace = save('diagnostic-trace.bin', layout['capture']['pa'], layout['capture']['size'])
@@ -376,6 +420,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                 and tool_hashes == {name: sha(ROOT / 'tools' / name) for name in TOOL_NAMES},
                 'source/image/capture tools changed during execution')
         verify_unchanged(frozen_files)
+        require(attest_qemu(binary, qemu_source) == qemu_proof,
+                'QEMU source attestation changed during execution')
         report['nbd_trace'] = inspect_nbd(output / 'initial.raw', output / 'disk.raw', output / 'nbd')
         oracle = inspect_filesystem(output / 'disk.raw')
         _json(output / 'disk-after.json', oracle)
@@ -420,17 +466,23 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--mode', type=int, choices=(1, 2, 3, 4), required=True)
-    parser.add_argument('--timeout', type=float, default=210)
+    parser.add_argument('--timeout', type=float,
+                        help='diagnostic cap; default is the source-bound per-mode budget')
     parser.add_argument('--cut', type=int, default=0)
     parser.add_argument('--phase', choices=('before', 'after-ack'), default='before')
     parser.add_argument('--unflushed', choices=('drop', 'reverse-half'), default='drop')
     parser.add_argument('--reverse-replies', action='store_true')
+    parser.add_argument('--sample-ms', type=int, default=100)
+    parser.add_argument('--qemu', type=Path)
+    parser.add_argument('--qemu-source', type=Path)
     parser.add_argument('--artifact-cache', type=Path, help='optional private content-addressed store for immutable build bytes only')
     args = parser.parse_args()
     try:
         report = run(args.build_manifest, args.initial_disk, args.output, mode=args.mode,
             source_root=args.source_root, timeout=args.timeout, cut=args.cut, phase=args.phase,
-            unflushed=args.unflushed, reverse_replies=args.reverse_replies, artifact_cache=args.artifact_cache)
+            unflushed=args.unflushed, reverse_replies=args.reverse_replies,
+            artifact_cache=args.artifact_cache, sample_ms=args.sample_ms,
+            qemu=args.qemu, qemu_source=args.qemu_source)
         print(json.dumps(report, indent=2))
         return 0 if report['status'] in ('PASS', 'NOT_RUN') else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyError, struct.error) as error:

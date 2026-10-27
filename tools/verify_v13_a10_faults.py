@@ -8,6 +8,8 @@ import hashlib
 from verify_smp import require
 from verify_v13_a10 import payload
 
+MAX_REQUEST_COUNTER_SKEW = 9
+
 
 def overwrite_window(capture: dict, rows: list[dict]) -> dict:
     require(capture['mode'] == 2, 'fault selector requires clean overwrite mode')
@@ -29,22 +31,38 @@ def overwrite_window(capture: dict, rows: list[dict]) -> dict:
     first = write['writes'] * 8 + write['flushes']
     end = receipt['writes'] * 8 + receipt['flushes']
     require(0 <= first < end <= len(rows), 'native counters exceed captured mutation stream')
-    prefix = rows[:end]
-    require([row['mutation'] for row in prefix] == list(range(1,end+1))
+    require([row['mutation'] for row in rows] == list(range(1,len(rows)+1))
             and all((row['kind'] == 1 and row['length'] == 512 and row['offset'] % 512 == 0)
-                    or (row['kind'] == 3 and row['offset'] == row['length'] == 0) for row in prefix),
+                    or (row['kind'] == 3 and row['offset'] == row['length'] == 0) for row in rows),
             'merged/missing/invalid native sector boundaries')
     for boundary, event in ((first,write),(end,receipt)):
-        observed = prefix[:boundary]
+        observed = rows[:boundary]
         require(sum(row['kind'] == 1 for row in observed) == event['writes'] * 8
                 and sum(row['kind'] == 3 for row in observed) == event['flushes'],
                 'native reply I/O counters disagree with device prefix')
-    selected = prefix[first:]
-    require(selected[-1]['kind'] == 3, 'fsync receipt does not end at a device FLUSH')
+
+    # The protected counters advance only after a complete logical operation,
+    # while NBD records each request on receipt. With reversed replies the raw
+    # request stream may therefore be ahead by one bounded native batch. Select
+    # only the unique six-block journal shape: five records, durability barrier,
+    # COMMIT record, durability barrier. Never infer a boundary from the shift.
+    shape = [1] * 40 + [3] + [1] * 8 + [3]
+    candidates = []
+    for skew in range(MAX_REQUEST_COUNTER_SKEW + 1):
+        selected = rows[first + skew:end + skew]
+        if len(selected) != len(shape) or [row['kind'] for row in selected] != shape:
+            continue
+        writes_in_window = [row for row in selected if row['kind'] == 1]
+        if all(right['offset'] == left['offset'] + 512
+               for left,right in zip(writes_in_window,writes_in_window[1:])):
+            candidates.append((skew,selected))
+    require(len(candidates) == 1, 'missing/ambiguous native two-REDO journal request window')
+    skew,selected = candidates[0]
     return dict(points=[row['mutation'] for row in selected],
                 flush_points=[row['mutation'] for row in selected if row['kind'] == 3],
                 writer=writer,write_event=write['sequence'],fsync_event=receipt['sequence'],
                 before=dict(writes=write['writes'],flushes=write['flushes']),
                 after=dict(writes=receipt['writes'],flushes=receipt['flushes']),
+                request_counter_skew=skew,
                 boundary_semantics={'before':'request not executed','after-ack':'device reply sent'},
                 A10_complete=False,scope='planned cuts from one verified native overwrite; no executed matrix')

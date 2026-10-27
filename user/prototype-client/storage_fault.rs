@@ -3,6 +3,8 @@
 //! independent disk decoder, never this page, establish native acceptance.
 use super::{call, clock, file, file_call, get, handle, put, waiting};
 use core::sync::atomic::{Ordering, fence};
+#[path = "../../crates/prototype/src/a10_budget.rs"]
+mod a10_budget;
 
 const DATA: u64 = 0x50000;
 const PROGRESS: u64 = 0x30000;
@@ -13,11 +15,9 @@ const PRESSURE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const PRESSURE_CHUNKS: u64 = PRESSURE_FILE_BYTES / PRESSURE_CHUNK_BYTES;
 const VALUE: &str = "/a10/value";
 const PRESSURE: [&str; 2] = ["/a10/pressure-a", "/a10/pressure-b"];
-const DEADLINE_NS: u64 = 180_000_000_000;
-// At most 90 polling requests per role, leaving room for both endpoints and
-// the finite work in the protected capture. This changes no policy
+// At most MAX_POLL_REQUESTS polling requests per role, leaving room for both
+// endpoints and finite work in the protected capture. This changes no policy
 // budget and introduces no privileged I/O or acknowledgement shortcut.
-const POLL_NS: u64 = 2_000_000_000;
 
 // Public progress wire: stage 1 start, 2 opened, 3 fsync1 consumed, 4 fsync2
 // consumed, 5 complete read + stable STAT verified, 6 epoch marker created or
@@ -59,6 +59,7 @@ struct Client {
     role: u64,
     boot: u64,
     deadline: u64,
+    poll_ns: u64,
     request: u64,
     progress_sequence: u64,
     object: Identity,
@@ -124,7 +125,7 @@ impl Client {
         Ok(frame)
     }
     fn wait_poll(&self) -> Result<()> {
-        let next = clock().saturating_add(POLL_NS).min(self.deadline);
+        let next = clock().saturating_add(self.poll_ns).min(self.deadline);
         while clock() < next {
             if !waiting(self.deadline) {
                 return Err(205);
@@ -370,12 +371,15 @@ fn marker(boot: u64) -> [u8; 26] {
 }
 
 pub fn run(authority: file::Capability) -> u64 {
+    let mode = get(0x21008);
+    let deadline_ns = get(0x21020);
     let mut client = Client {
         authority,
-        mode: get(0x21008),
+        mode,
         role: get(0x21010),
         boot: get(0x21018),
-        deadline: clock().saturating_add(DEADLINE_NS),
+        deadline: clock().saturating_add(deadline_ns),
+        poll_ns: a10_budget::client_poll_ns(mode).unwrap_or(0),
         request: 0,
         progress_sequence: 0,
         object: Identity {
@@ -388,11 +392,13 @@ pub fn run(authority: file::Capability) -> u64 {
     };
     client.publish(1, 0);
     let result = (|| {
-        if get(0x20000) != 32
+        if get(0x20000) != 40
             || get(0x21000) != 1
             || !matches!(client.mode, 1..=4)
             || !matches!(client.role, 1 | 2)
             || client.boot == 0
+            || a10_budget::client_deadline_ns(client.mode) != Some(deadline_ns)
+            || client.poll_ns == 0
             || (client.mode >= 3 && client.role != 2)
         {
             return Err(201);

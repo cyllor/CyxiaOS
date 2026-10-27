@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import verify_v13_a10_matrix as matrix
@@ -75,22 +76,29 @@ class A10MatrixGate(unittest.TestCase):
             (root/'source-manifest.json').write_text('{}')
             (root/'formatted.raw').write_bytes(b'formatted')
             (root/'provision.log').write_text('provisioned')
+            qemu_binary=Path('/patched/qemu')
+            qemu_source=Path('/patched/source')
+            qemu_proof=dict(qemu_pmu_patch_attested=True,qemu_sha256='11'*32)
             request=dict(schema_version=1,test_id='A10',specification='1.3',
                 overwrite_points='all',recovery_points='all',phases=list(matrix.PHASES),
                 losses=list(matrix.LOSSES),reverse_replies=True,source_root=str(runner.ROOT),
                 build_manifest_sha256=matrix.sha(build),
                 source_manifest_sha256=matrix.sha(root/'source-manifest.json'),tools={},
                 formatted_disk_sha256=matrix.sha(root/'formatted.raw'),
-                provision_log_sha256=matrix.sha(root/'provision.log'),timeout=210.0,
+                provision_log_sha256=matrix.sha(root/'provision.log'),
+                scenario_budgets=runner.scenario_budgets(runner.ROOT),
+                sample_ms=30_000,qemu_binary=str(qemu_binary),
+                qemu_source=str(qemu_source),qemu_attestation=qemu_proof,
                 immutable_artifact_cache=None)
             (root/'matrix-input.json').write_text(json.dumps(request))
             (root/'progress.json').write_text(json.dumps(dict(
                 schema_version=1,status='RUNNING',completed=[],abandoned=[])))
-            loaded,_,timeout,cache=runner._resume_request(
+            loaded,_,budgets,cache=runner._resume_request(
                 root,build,{}, {},overwrite_points='all',recovery_points='all',
-                timeout=None,artifact_cache=None)
+                timeout=None,artifact_cache=None,qemu_binary=qemu_binary,
+                qemu_source=qemu_source,qemu_proof=qemu_proof,sample_ms=30_000)
             self.assertEqual(loaded,request)
-            self.assertEqual(timeout,210.0)
+            self.assertEqual(budgets,request['scenario_budgets'])
             self.assertIsNone(cache)
             attempts=[dict(overwrite_points='flushes',recovery_points='all',timeout=None,
                            artifact_cache=None),
@@ -100,11 +108,15 @@ class A10MatrixGate(unittest.TestCase):
                            artifact_cache=root/'cache')]
             for options in attempts:
                 with self.subTest(options=options),self.assertRaises(ValueError):
-                    runner._resume_request(root,build,{}, {},**options)
+                    runner._resume_request(root,build,{}, {},qemu_binary=qemu_binary,
+                                           qemu_source=qemu_source,qemu_proof=qemu_proof,
+                                           sample_ms=30_000,**options)
             build.write_text('{"changed":true}')
             with self.assertRaises(ValueError):
                 runner._resume_request(root,build,{}, {},overwrite_points='all',
-                                       recovery_points='all',timeout=None,artifact_cache=None)
+                                       recovery_points='all',timeout=None,artifact_cache=None,
+                                       qemu_binary=qemu_binary,qemu_source=qemu_source,
+                                       qemu_proof=qemu_proof,sample_ms=30_000)
 
     def test_matrix_names_keep_fault_semantics_unambiguous(self):
         names={matrix._case_name(7,phase,loss)
@@ -114,6 +126,23 @@ class A10MatrixGate(unittest.TestCase):
         self.assertEqual(len(names),4)
         self.assertEqual(len(recovery),4)
         self.assertTrue(names.isdisjoint(recovery))
+
+    def test_child_forwards_frozen_qemu_budget_and_low_observer_sampling(self):
+        import run_v13_a10_matrix as runner
+        budgets = runner.scenario_budgets(runner.ROOT)
+        expected = dict(status='PASS')
+        with patch.object(runner, 'run_mode', return_value=expected) as invoked:
+            result = runner._child(
+                Path('/build.json'), Path('/initial.raw'), Path('/evidence'), mode=1,
+                budgets=budgets, artifact_cache=None, qemu=Path('/patched/qemu'),
+                qemu_source=Path('/patched/source'), sample_ms=30_000)
+        self.assertIs(result, expected)
+        arguments = invoked.call_args.kwargs
+        self.assertEqual(arguments['timeout'], 1920.0)
+        self.assertEqual(arguments['sample_ms'], 30_000)
+        self.assertEqual(arguments['qemu'], Path('/patched/qemu'))
+        self.assertEqual(arguments['qemu_source'], Path('/patched/source'))
+        self.assertTrue(arguments['reverse_replies'])
 
 
 if __name__ == '__main__':

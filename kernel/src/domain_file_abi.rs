@@ -36,6 +36,7 @@ struct Delivery {
     data_len: usize,
     capture_len: usize,
     capture_misses: u64,
+    capture_io: Option<[u64; 4]>,
 }
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PENDING_ID: AtomicU64 = AtomicU64::new(0);
@@ -443,12 +444,17 @@ fn deliver(owner: ObjectKey, context: &mut Context) -> Result<(), Error> {
     context.regs[0] = pending.frame.u64(OFF_RESULT);
     if crate::storage_fault_capture::selected(owner) {
         let bytes = unsafe { &*core::ptr::addr_of!(DATA) };
-        crate::storage_fault_capture::delivered(
-            owner,
-            &pending.frame.bytes,
-            &bytes[..pending.capture_len],
-            pending.capture_misses,
-        );
+        if let Some(io) = pending.capture_io {
+            crate::storage_fault_capture::delivered(
+                owner,
+                &pending.frame.bytes,
+                &bytes[..pending.capture_len],
+                pending.capture_misses,
+                io,
+            );
+        } else {
+            crate::storage_fault_capture::snapshot_failed();
+        }
     }
     clear_pending();
     Ok(())
@@ -529,11 +535,18 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     } else {
         0
     };
+    if crate::storage_fault_capture::PROFILE
+        && authorize(owner, &input).is_ok()
+        && matches!(
+            crate::storage_fault_capture::entered(owner, &input.bytes),
+            Err(Error::Busy)
+        )
+    {
+        context.regs[0] = (-11i64) as u64;
+        return true;
+    }
     let result = (|| {
         let grant = authorize(owner, &input)?;
-        if crate::storage_fault_capture::PROFILE {
-            crate::storage_fault_capture::entered(owner, &input.bytes);
-        }
         let result = run(owner, &input, &mut output, data, progress);
         if input.u16(OFF_OPERATION) == GET_STAT_CAP
             && result.as_ref().is_err_and(|e| retryable_before_run(*e))
@@ -569,6 +582,11 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         } else {
             0
         };
+    let capture_io = if capture_selected {
+        crate::storage_fault_capture::snapshot()
+    } else {
+        None
+    };
     unsafe {
         *core::ptr::addr_of_mut!(PENDING) = Some(Delivery {
             owner,
@@ -584,6 +602,7 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             } else {
                 0
             },
+            capture_io,
         });
     }
     PENDING_GENERATION.store(owner.generation, Ordering::Relaxed);

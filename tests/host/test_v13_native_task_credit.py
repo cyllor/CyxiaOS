@@ -162,6 +162,75 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("owned.trailing_zeros()", service)
         self.assertNotIn("for slot in 0..64", service)
 
+    def test_cpu0_service_pumps_publish_stopped_snapshot_boundaries(self):
+        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        start = execution.index("pub fn service(_now:")
+        end = execution.index("fn lifecycle_piece", start)
+        service = execution[start:end]
+
+        for stage in range(70, 75):
+            self.assertIn(f"diagnostic_service_stage({stage});", service)
+        helper = execution[execution.index("fn diagnostic_service_stage") : start]
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[9].store(stage", helper)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[10]", helper)
+        self.assertIn("CREDIT_KIND[0].load", helper)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[11]", helper)
+        self.assertIn("COMPLETE_READY[0].load", helper)
+        self.assertLess(service.index("diagnostic_service_stage(70);"),
+                        service.index("let _ = service_segment"))
+        self.assertLess(service.index("diagnostic_service_stage(71);"),
+                        service.index("service_file(progress);"))
+        self.assertLess(service.index("diagnostic_service_stage(72);"),
+                        service.index("crate::learning_workload::service_io(progress);"))
+        self.assertLess(service.index("diagnostic_service_stage(73);"),
+                        service.index("crate::learning_replay::service_io(progress);"))
+
+    def test_storage_profile_records_unsettled_cpu0_credit_error(self):
+        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
+        start = source.index("fn complete_locked")
+        end = source.index("pub fn complete_builtin", start)
+        completion = source[start:end]
+
+        self.assertIn("storage_fault_capture::PROFILE", completion)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[12]", completion)
+        self.assertIn("error as u64 + 1", completion)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[13]", completion)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[14]", completion)
+        self.assertIn("DOMAIN_TASK_EVIDENCE.words[15]", completion)
+        self.assertIn("active.dispatch.started_ns", completion)
+
+    def test_a10_consumption_snapshot_retries_transient_task_lock_before_effect(self):
+        capture = (ROOT / "kernel/src/storage_fault_capture.rs").read_text()
+        file_abi = (ROOT / "kernel/src/domain_file_abi.rs").read_text()
+
+        self.assertIn("pub fn entered(owner: ObjectKey, frame: &[u8; 640]) -> Result<(), Error>",
+                      capture)
+        self.assertIn("Err(Error::Busy) => return Err(Error::Busy)", capture)
+        self.assertIn("authorize(owner, &input).is_ok()", file_abi)
+        self.assertIn("storage_fault_capture::entered(owner, &input.bytes)", file_abi)
+        self.assertIn("context.regs[0] = (-11i64) as u64", file_abi)
+        self.assertLess(file_abi.index("storage_fault_capture::entered(owner, &input.bytes)"),
+                        file_abi.index("let result = (||"))
+
+    def test_a10_delivery_retains_operation_completion_io_snapshot(self):
+        capture = (ROOT / "kernel/src/storage_fault_capture.rs").read_text()
+        file_abi = (ROOT / "kernel/src/domain_file_abi.rs").read_text()
+
+        self.assertIn("pub fn snapshot() -> Option<[u64; 4]>", capture)
+        self.assertIn("io: [u64; 4]", capture)
+        self.assertIn("capture_io: Option<[u64; 4]>", file_abi)
+        snapshot = "crate::storage_fault_capture::snapshot()"
+        self.assertIn(snapshot, file_abi)
+        self.assertLess(file_abi.index(snapshot),
+                        file_abi.index("*core::ptr::addr_of_mut!(PENDING) = Some(Delivery"))
+        self.assertIn("pending.capture_io", file_abi)
+
+    def test_a10_cache_client_uses_its_source_bound_private_page_quota(self):
+        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+
+        self.assertIn("a10_budget::client_memory_pages", execution)
+        self.assertNotIn("register_owner(key, if client || local { 16 }", execution)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -794,7 +794,13 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
         Phase::Prepare => {
             trace.site(Site::Prepare);
             let (existing, claimed) = with(|s| Ok((s.preparation, s.prepare_claimed)))?;
-            if PAUSED.load(Ordering::Acquire) && !claimed && work::quiescent() {
+            // The dedicated storage-fault image proves ordinary file/recovery
+            // behavior. Do not start an unrelated learning trial whose archive
+            // I/O would race the fault boundary and make it non-reproducible.
+            if (crate::storage_fault_capture::PROFILE || PAUSED.load(Ordering::Acquire))
+                && !claimed
+                && work::quiescent()
+            {
                 if let Some(p) = existing {
                     root::withdraw_preparation(p)?;
                     with(|s| {

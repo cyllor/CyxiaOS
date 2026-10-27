@@ -9,6 +9,8 @@ use cyxia_prototype::domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp, W
 use sha2::{Digest, Sha256};
 #[path = "domain_tasks/abi.rs"]
 mod abi;
+#[path = "domain_tasks/deadline.rs"]
+mod deadline;
 #[path = "domain_tasks/execution.rs"]
 mod execution;
 #[path = "domain_tasks/memory.rs"]
@@ -1235,6 +1237,15 @@ fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
         .scheduler
         .complete(active.dispatch, actual, active.state, finished);
     if s.scheduler.active(slot).is_some() {
+        if slot == 0
+            && crate::storage_fault_capture::PROFILE
+            && let Err(error) = result
+        {
+            DOMAIN_TASK_EVIDENCE.words[13].store(actual, Ordering::Relaxed);
+            DOMAIN_TASK_EVIDENCE.words[14].store(active.dispatch.started_ns, Ordering::Relaxed);
+            DOMAIN_TASK_EVIDENCE.words[15].store(finished, Ordering::Relaxed);
+            DOMAIN_TASK_EVIDENCE.words[12].store(error as u64 + 1, Ordering::Release);
+        }
         return result;
     }
     if result == Err(Error::Budget) {

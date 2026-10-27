@@ -223,6 +223,10 @@ pub fn set_cache_partition(pages: u32, batch: u16) -> Result<(), Error> {
     ready()?;
     with_files(|f| f.set_cache_partition(pages as usize, batch as usize))
 }
+pub(crate) fn set_writeback_baseline(pages: u16) -> Result<(), Error> {
+    ready()?;
+    with_files(|f| f.set_writeback_baseline(pages))
+}
 pub fn set_cache_partition_expiring(
     pages: u32,
     batch: u16,

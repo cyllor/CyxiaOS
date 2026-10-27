@@ -6,6 +6,8 @@
 mod file;
 #[path = "../../user/prototype-client/storage_fault.rs"]
 mod storage_fault;
+#[path = "../../crates/prototype/src/a10_budget.rs"]
+mod a10_budget;
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -176,12 +178,14 @@ fn file_call(frame: &mut file::Frame, _: u64) -> bool {
     true
 }
 fn launch(mode: u64, role: u64, epoch: u64, owner: u64) -> u64 {
+    let deadline_ns = a10_budget::client_deadline_ns(mode).unwrap();
     for (address, value) in [
-        (0x20000, 32),
+        (0x20000, 40),
         (0x21000, 1),
         (0x21008, mode),
         (0x21010, role),
         (0x21018, epoch),
+        (0x21020, deadline_ns),
     ] {
         put(address, value);
     }

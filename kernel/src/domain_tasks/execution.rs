@@ -159,11 +159,28 @@ impl Creator<'_> {
             }
         }
         trace.step(13); // Register the exact memory owner generation.
+        let client_pages = if client && crate::storage_fault_capture::PROFILE {
+            if launch.len != 40 {
+                return Err(Error::Format);
+            }
+            let mode = u64::from_le_bytes(launch.input[8..16].try_into().unwrap());
+            cyxia_prototype::a10_budget::client_memory_pages(mode).ok_or(Error::Format)?
+        } else {
+            16
+        };
         if r.recovery {
             self.memory.register_progress_owner(key, 4)?;
         } else {
-            self.memory
-                .register_owner(key, if client || local { 16 } else { 64 })?;
+            self.memory.register_owner(
+                key,
+                if client {
+                    client_pages
+                } else if local {
+                    16
+                } else {
+                    64
+                },
+            )?;
         }
         trace.step(14); // Commit real backing for LOCAL/recovery.
         if local || r.recovery {
@@ -255,7 +272,7 @@ impl Creator<'_> {
             matches!(r.group.id, 15 | 16),
         )?;
         if client && crate::storage_fault_capture::PROFILE {
-            if launch.len != 32 {
+            if launch.len != 40 {
                 return Err(Error::Format);
             }
             let role = u64::from_le_bytes(launch.input[16..24].try_into().unwrap());
@@ -514,7 +531,13 @@ fn submit_package(
         };
     }
     let now = now_ns();
-    if deadline <= now || (recipe == 0 && deadline.saturating_sub(now) > 60_000_000_000) {
+    let maximum_ns = if package == CLIENT_PACKAGE && crate::storage_fault_capture::PROFILE {
+        crate::storage_fault_capture::launch_deadline_ns(input)
+            .unwrap_or(super::deadline::ORDINARY_NS)
+    } else {
+        super::deadline::ORDINARY_NS
+    };
+    if !super::deadline::valid(now, deadline, recipe, maximum_ns) {
         return Err(Error::Range);
     }
     if cpu >= 64 || s.draining & (1u64 << cpu) != 0 {
@@ -952,12 +975,30 @@ fn recipe_turn_inner(s: &mut State, i: usize) -> Result<(), Error> {
     wake_task(s, i);
     Ok(())
 }
+#[inline]
+fn diagnostic_service_stage(stage: u64) {
+    #[cfg(feature = "unified-runtime")]
+    crate::unified::service_stage(stage);
+    if crate::storage_fault_capture::PROFILE {
+        DOMAIN_TASK_EVIDENCE.words[9].store(stage, Ordering::Relaxed);
+        DOMAIN_TASK_EVIDENCE.words[10]
+            .store(CREDIT_KIND[0].load(Ordering::Acquire), Ordering::Relaxed);
+        DOMAIN_TASK_EVIDENCE.words[11].store(
+            u64::from(COMPLETE_READY[0].load(Ordering::Acquire)),
+            Ordering::Release,
+        );
+    }
+    #[cfg(not(feature = "unified-runtime"))]
+    let _ = stage;
+}
+
 pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     if !READY.load(Ordering::Acquire) || cpu::slot() != 0 {
         return;
     }
     // One bounded owner piece per pass. A deferred piece retains its cursor;
     // file/DMA waits run in service_file's separately billed caller segments.
+    diagnostic_service_stage(70);
     let _ = service_segment(|| {
         let external = locked(|s| {
             let phase = s.service_phase;
@@ -1052,9 +1093,13 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             let _ = crate::peer_replay::poll();
         }
     });
+    diagnostic_service_stage(71);
     service_file(progress);
+    diagnostic_service_stage(72);
     crate::learning_workload::service_io(progress);
+    diagnostic_service_stage(73);
     crate::learning_replay::service_io(progress);
+    diagnostic_service_stage(74);
 }
 fn lifecycle_piece(s: &mut State, i: usize) {
     if RETURN_PENDING[i].load(Ordering::Acquire)
@@ -2011,9 +2056,10 @@ pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
             Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
             Ok(_) => {}
             Err(Error::NotFound) => {
-                let deadline = now_ns()
-                    .checked_add(180_000_000_000)
-                    .ok_or(Error::Overflow)?;
+                let launch = crate::storage_fault_capture::launch(role);
+                let deadline_ns = crate::storage_fault_capture::launch_deadline_ns(&launch)
+                    .ok_or(Error::Format)?;
+                let deadline = now_ns().checked_add(deadline_ns).ok_or(Error::Overflow)?;
                 s.facts.attempts = s.facts.attempts.saturating_add(1);
                 s.facts.spawn[3].add(now_ns(), 1);
                 if let SpawnState::Failed(e) = submit_package(
@@ -2022,7 +2068,7 @@ pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
                     KERNEL_CALLER,
                     id,
                     group(4),
-                    &crate::storage_fault_capture::launch(role),
+                    &launch,
                     3,
                     deadline,
                     false,

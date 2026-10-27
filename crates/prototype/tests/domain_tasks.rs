@@ -395,6 +395,41 @@ fn scheduler_independent_receipts_out_of_order_and_isolated_overrun() {
 }
 
 #[test]
+fn completion_accepts_independent_cpu_clock_but_rejects_wall_clock_reversal() {
+    let mut business = Scheduler::new();
+    business.register_group(key(1)).unwrap();
+    business
+        .admit(spec(10, 1, 0, 0, 1_000_000), layout(1), 0)
+        .unwrap();
+    let accepted = business
+        .dispatch(0, layout(1), 100, 1_000_000)
+        .unwrap()
+        .unwrap();
+    business
+        .complete(accepted, 500_000, RunState::Runnable, 4_100)
+        .unwrap();
+    assert_eq!(business.cpu_spent_ns(0), Ok(500_000));
+
+    let rejected = business
+        .dispatch(0, layout(1), 5_000, 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        business.complete(rejected, 1, RunState::Runnable, 4_999),
+        Err(Error::Range)
+    );
+    assert_eq!(business.active(0), Some(rejected));
+
+    let mut control = Scheduler::new();
+    let credit = control
+        .reserve_control(1, control_layout(1), 100, 1_000_000)
+        .unwrap()
+        .unwrap();
+    control.complete_control(credit, 500_000, 4_100).unwrap();
+    assert_eq!(control.cpu_spent_ns(1), Ok(500_000));
+}
+
+#[test]
 fn scheduler_wall_late_receipt_is_charged_in_both_windows_without_false_overrun() {
     let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();

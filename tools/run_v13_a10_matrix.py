@@ -11,12 +11,14 @@ import uuid
 from build_unified import code_source_map
 from check_prototype_evidence import read_json
 from doctor import ROOT, env
-from run_v13_a10 import TOOL_NAMES, run as run_mode, validate_build_profile
+from run_v13_a10 import (TOOL_NAMES, resolve_qemu, run as run_mode, sample_interval,
+                         validate_build_profile)
 from verify_smp import require, sha
 from verify_v13_a10 import decode
 from verify_v13_a10_faults import overwrite_window
 from verify_v13_a10_matrix import (LOSSES, PHASES, load_run, mutation_schedule, review,
                                    select_points)
+from v13_a10_budget import scenario_budgets
 
 MATRIX_TOOLS = TOOL_NAMES
 
@@ -61,7 +63,8 @@ def _archive_attempt(root: Path, directory: Path, name: str, progress: dict):
 
 def _resume_request(root: Path, build_manifest: Path, sources: dict, tools: dict, *,
                     overwrite_points: str, recovery_points: str, timeout: float | None,
-                    artifact_cache: Path | None) -> tuple[dict, dict, float, Path | None]:
+                    artifact_cache: Path | None, qemu_binary: Path, qemu_source: Path | None,
+                    qemu_proof: dict, sample_ms: int) -> tuple[dict, dict, dict, Path | None]:
     request = json.loads((root / 'matrix-input.json').read_text())
     progress = json.loads((root / 'progress.json').read_text())
     validate_progress(progress)
@@ -78,14 +81,17 @@ def _resume_request(root: Path, build_manifest: Path, sources: dict, tools: dict
             and request.get('source_manifest_sha256') == sha(root / 'source-manifest.json')
             and json.loads((root / 'source-manifest.json').read_text()) == sources
             and request.get('tools') == tools
+            and request.get('scenario_budgets') == scenario_budgets(ROOT)
+            and request.get('sample_ms') == sample_ms
+            and request.get('qemu_binary') == str(qemu_binary)
+            and request.get('qemu_source') == (str(qemu_source) if qemu_source else None)
+            and request.get('qemu_attestation') == qemu_proof
             and all(sha(root / 'tools' / name) == digest for name, digest in tools.items())
             and sha(root / 'formatted.raw') == request.get('formatted_disk_sha256')
             and sha(root / 'provision.log') == request.get('provision_log_sha256'),
             'A10 matrix resume request/evidence mismatch')
-    recorded_timeout = request.get('timeout')
-    require(type(recorded_timeout) in (int, float) and 5 <= recorded_timeout <= 300
-            and (timeout is None or timeout == recorded_timeout),
-            'A10 matrix resume timeout mismatch')
+    require(timeout is None, 'A10 matrix uses fixed source-bound per-mode budgets')
+    budgets = request['scenario_budgets']
     recorded_cache = request.get('immutable_artifact_cache')
     require(recorded_cache is None or type(recorded_cache) is str,
             'invalid recorded A10 artifact cache')
@@ -93,15 +99,18 @@ def _resume_request(root: Path, build_manifest: Path, sources: dict, tools: dict
         require(str(artifact_cache) == recorded_cache, 'A10 matrix resume artifact-cache mismatch')
     elif recorded_cache is not None:
         artifact_cache = Path(recorded_cache)
-    return request, progress, float(recorded_timeout), artifact_cache
+    return request, progress, budgets, artifact_cache
 
 
 def _child(build_manifest: Path, initial: Path, output: Path, *, mode: int,
-           timeout: float, artifact_cache: Path | None, cut: int = 0,
-           phase: str = 'before', loss: str = 'drop') -> dict:
+           budgets: dict, artifact_cache: Path | None, cut: int = 0,
+           phase: str = 'before', loss: str = 'drop', qemu: Path | None = None,
+           qemu_source: Path | None = None, sample_ms: int = 30_000) -> dict:
+    timeout = budgets[str(mode)]['capture_timeout_seconds']
     result = run_mode(build_manifest, initial, output, mode=mode, timeout=timeout,
                       cut=cut, phase=phase, unflushed=loss, reverse_replies=True,
-                      artifact_cache=artifact_cache)
+                      artifact_cache=artifact_cache, qemu=qemu, qemu_source=qemu_source,
+                      sample_ms=sample_ms)
     expected = 'NOT_RUN' if cut else 'PASS'
     require(result['status'] == expected, f'{output.name} returned {result["status"]}')
     print(f'{output}: {expected}', flush=True)
@@ -110,8 +119,12 @@ def _child(build_manifest: Path, initial: Path, output: Path, *, mode: int,
 
 def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
         recovery_points: str = 'all', timeout: float | None = None,
-        artifact_cache: Path | None = None, resume: bool = False) -> dict:
-    require(timeout is None or 5 <= timeout <= 300, 'invalid A10 matrix timeout')
+        artifact_cache: Path | None = None, resume: bool = False,
+        qemu: Path | None = None, qemu_source: Path | None = None,
+        sample_ms: int = 30_000) -> dict:
+    require(timeout is None, 'A10 matrix uses fixed source-bound per-mode budgets')
+    sample_interval(sample_ms)
+    require(sample_ms == 30_000, 'A10 matrix requires the frozen low-observer sample interval')
     build_manifest = build_manifest.resolve(strict=True)
     output = output.resolve()
     if artifact_cache is not None:
@@ -122,15 +135,28 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
     require(build['code_source_map'] == sources, 'matrix build/source mismatch')
     tools = {name: sha(ROOT / 'tools' / name) for name in MATRIX_TOOLS}
     if resume:
+        preview = json.loads((output / 'matrix-input.json').read_text())
+        if qemu is None:
+            qemu = Path(preview.get('qemu_binary', ''))
+        if qemu_source is None and preview.get('qemu_source'):
+            qemu_source = Path(preview['qemu_source'])
+    if qemu_source is not None:
+        qemu_source = qemu_source.resolve(strict=True)
+    qemu_binary, qemu_proof = resolve_qemu(qemu, qemu_source)
+    require(qemu_proof.get('qemu_pmu_patch_attested') is True,
+            'A10 matrix requires the source-attested QEMU PMU patch')
+    if resume:
         require(output.is_dir(), 'A10 matrix resume output does not exist')
-        request, progress, timeout, artifact_cache = _resume_request(
+        request, progress, budgets, artifact_cache = _resume_request(
             output, build_manifest, sources, tools, overwrite_points=overwrite_points,
-            recovery_points=recovery_points, timeout=timeout, artifact_cache=artifact_cache)
+            recovery_points=recovery_points, timeout=timeout, artifact_cache=artifact_cache,
+            qemu_binary=qemu_binary, qemu_source=qemu_source, qemu_proof=qemu_proof,
+            sample_ms=sample_ms)
         progress['status'] = 'RUNNING'
         _json(output / 'progress.json', progress)
     else:
         require(not output.exists(), 'refuse to reuse A10 matrix output without --resume')
-        timeout = float(210 if timeout is None else timeout)
+        budgets = scenario_budgets(ROOT)
         output.mkdir(parents=True, mode=0o700)
         shutil.copyfile(build_manifest, output / 'build-manifest.json')
         _json(output / 'source-manifest.json', sources)
@@ -152,7 +178,10 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
                        source_manifest_sha256=sha(output / 'source-manifest.json'),
                        filesystem_uuid=identity.hex(), overwrite_points=overwrite_points,
                        recovery_points=recovery_points, phases=list(PHASES), losses=list(LOSSES),
-                       reverse_replies=True, timeout=timeout, tools=tools,
+                       reverse_replies=True, scenario_budgets=budgets, tools=tools,
+                       sample_ms=sample_ms, qemu_binary=str(qemu_binary),
+                       qemu_source=str(qemu_source) if qemu_source else None,
+                       qemu_attestation=qemu_proof,
                        formatted_disk_sha256=sha(formatted),
                        provision_log_sha256=sha(output / 'provision.log'),
                        immutable_artifact_cache=(str(artifact_cache)
@@ -193,8 +222,9 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
                     _json(output / 'progress.json', progress)
                     print(f'{directory}: ADOPT {expected}', flush=True)
                     return directory, result
-            result = _child(build_manifest, initial, directory, mode=mode, timeout=timeout,
-                            artifact_cache=artifact_cache, cut=cut, phase=phase, loss=loss)
+            result = _child(build_manifest, initial, directory, mode=mode, budgets=budgets,
+                            artifact_cache=artifact_cache, cut=cut, phase=phase, loss=loss,
+                            qemu=qemu_binary, qemu_source=qemu_source, sample_ms=sample_ms)
             progress['completed'].append(name)
             completed.add(name)
             _json(output / 'progress.json', progress)
@@ -263,13 +293,18 @@ def main() -> int:
     parser.add_argument('--timeout', type=float,
                         help='per-run seconds; omitted on resume to reuse the recorded value')
     parser.add_argument('--artifact-cache', type=Path)
+    parser.add_argument('--qemu', type=Path)
+    parser.add_argument('--qemu-source', type=Path)
+    parser.add_argument('--sample-ms', type=int, default=30_000)
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args()
     try:
         result = run(args.build_manifest, args.output,
                      overwrite_points=args.overwrite_points,
                      recovery_points=args.recovery_points, timeout=args.timeout,
-                     artifact_cache=args.artifact_cache, resume=args.resume)
+                     artifact_cache=args.artifact_cache, resume=args.resume,
+                     qemu=args.qemu, qemu_source=args.qemu_source,
+                     sample_ms=args.sample_ms)
         print(json.dumps(result, indent=2))
         diagnostic = args.overwrite_points != 'all' or args.recovery_points != 'all'
         return 0 if result['status'] == 'PASS' or (diagnostic and result['status'] == 'NOT_RUN') else 1

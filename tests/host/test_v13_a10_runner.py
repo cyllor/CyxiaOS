@@ -96,6 +96,68 @@ class A10Runner(unittest.TestCase):
         self.assertEqual(self.runner.CONTROL_EVIDENCE_BYTES, (512 + 64 * 640) * 8)
         self.assertEqual(self.runner.LAYOUT, (1, 512, 768, 384, 295424, 299008, 512, 512))
 
+    def test_timeout_diagnostics_include_unified_startup_stage(self):
+        self.assertIn(('UNIFIED_EVIDENCE', 'unified-runtime', 4096),
+                      self.runner.diagnostic_specs())
+        self.assertIn(('DOMAIN_TASK_EVIDENCE', 'domain-task', 256),
+                      self.runner.diagnostic_specs())
+        self.assertIn(('RUNTIME_V13_EVIDENCE', 'runtime-v13', 8192),
+                      self.runner.diagnostic_specs())
+        self.assertIn(('DYNAMIC_V13_EVIDENCE', 'dynamic-v13', 4096),
+                      self.runner.diagnostic_specs())
+        self.assertIn(('UNIFIED_SERVICE_STAGE', 'unified-service-stage', 8),
+                      self.runner.diagnostic_specs())
+
+    def test_slow_run_samples_minimal_startup_diagnostics_without_control_bank(self):
+        self.assertEqual(self.runner.PENDING_DIAGNOSTICS,
+                         ('domain-task', 'unified-runtime', 'unified-service-stage'))
+        self.assertNotIn('control-header', self.runner.PENDING_DIAGNOSTICS)
+
+    def test_progress_sampling_is_bounded_and_converted_to_seconds(self):
+        self.assertEqual(self.runner.sample_interval(100), 0.1)
+        self.assertEqual(self.runner.sample_interval(2000), 2.0)
+        self.assertEqual(self.runner.sample_interval(30000), 30.0)
+        for value in (99, 30001, 100.0, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.runner.sample_interval(value)
+
+    def test_scenario_budget_is_mode_specific_and_source_bound(self):
+        expected = {
+            1: (1_800_000_000_000, 20_000_000_000, 1920.0),
+            2: (1_800_000_000_000, 20_000_000_000, 1920.0),
+            3: (1_800_000_000_000, 20_000_000_000, 1920.0),
+            4: (21_600_000_000_000, 240_000_000_000, 21_720.0),
+        }
+        for mode, (client_ns, poll_ns, capture_seconds) in expected.items():
+            with self.subTest(mode=mode):
+                budget = self.runner.scenario_budget(self.runner.ROOT, mode)
+                self.assertEqual(budget['client_deadline_ns'], client_ns)
+                self.assertEqual(budget['client_poll_ns'], poll_ns)
+                self.assertEqual(budget['capture_timeout_seconds'], capture_seconds)
+        for mode in (0, 5, True):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.runner.scenario_budget(self.runner.ROOT, mode)
+
+    def test_only_non_schedule_clean_modes_allow_qemu_request_merging(self):
+        self.assertEqual(self.runner.request_merging(1, 0), 'on')
+        self.assertEqual(self.runner.request_merging(4, 0), 'on')
+        for mode in (2, 3):
+            self.assertEqual(self.runner.request_merging(mode, 0), 'off')
+        for mode in range(1, 5):
+            self.assertEqual(self.runner.request_merging(mode, 1), 'off')
+            self.assertEqual(self.runner.request_merging(mode, 4096), 'off')
+
+    def test_explicit_qemu_path_is_attested_and_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'qemu-system-aarch64'
+            binary.write_text('#!/bin/sh\necho "QEMU emulator version 10.2.2"\n')
+            binary.chmod(0o700)
+            selected, proof = self.runner.resolve_qemu(binary, None)
+            self.assertEqual(selected, binary.resolve())
+            self.assertEqual(proof['qemu_version'].splitlines()[0],
+                             'QEMU emulator version 10.2.2')
+            self.assertFalse(proof['qemu_pmu_patch_attested'])
+
     def test_single_mode_or_cut_never_claims_complete_a10_acceptance(self):
         for cut in (False, True):
             result = self.runner.result_scope(cut)

@@ -155,6 +155,7 @@ pub struct FileSystem<const CACHE: usize = 64> {
     stamp: PolicyStamp,
     readahead: u16,
     flush_pages: u16,
+    flush_baseline: u16,
     metrics: Metrics,
 }
 impl<const C: usize> Default for FileSystem<C> {
@@ -197,6 +198,7 @@ impl<const C: usize> FileSystem<C> {
             },
             readahead: 0,
             flush_pages: 4,
+            flush_baseline: 4,
             metrics: Metrics {
                 read_bytes: 0,
                 write_bytes: 0,
@@ -284,7 +286,7 @@ impl<const C: usize> FileSystem<C> {
         } else {
             Action::Filesystem {
                 readahead: 0,
-                flush: 4,
+                flush: self.flush_baseline,
             }
         }
     }
@@ -363,6 +365,15 @@ impl<const C: usize> FileSystem<C> {
     pub fn set_cache_budget(&mut self, pages: usize) -> Result<(), Error> {
         self.set_cache_partition(pages, 64)?;
         while self.cache_usage()[0] > pages && self.reclaim_cache() != 0 {}
+        Ok(())
+    }
+    /// Configure the boot profile's writeback baseline without manufacturing a
+    /// policy version or completion receipt. A live policy still takes priority.
+    pub fn set_writeback_baseline(&mut self, pages: u16) -> Result<(), Error> {
+        if ![4, 8, 16, 32].contains(&pages) {
+            return Err(Error::Range);
+        }
+        self.flush_baseline = pages;
         Ok(())
     }
     pub fn reclaim_cache(&mut self) -> usize {
@@ -1413,7 +1424,7 @@ impl<const C: usize> FileSystem<C> {
         let (limit, version) = if self.stamp.live(now) {
             (self.flush_pages as usize, self.stamp.version)
         } else {
-            (4, 0)
+            (self.flush_baseline as usize, 0)
         };
         self.flush_inode(id, limit, version, j, d, s)
     }

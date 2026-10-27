@@ -1,10 +1,15 @@
 //! Dedicated A10 profile: observe real delivered file replies and task exits.
 //! EL0 cannot map these banks. The host supplies identities, never results.
 use crate::domain_file_abi::abi::{
-    CLOSE, FSYNC, OFF_DURABLE_SEQ, OFF_OPERATION, OFF_REQUEST, OFF_RESULT, OFF_WRITE_SEQ,
+    CLOSE, CREATE, FSYNC, OFF_DURABLE_SEQ, OFF_OPERATION, OFF_PATH, OFF_PATH_LENGTH, OFF_REQUEST,
+    OFF_RESULT, OFF_WRITE_SEQ,
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use cyxia_prototype::{boot::BootIdentity, domains::ObjectKey};
+use cyxia_prototype::{
+    a10_budget,
+    boot::BootIdentity,
+    domains::{Error, ObjectKey},
+};
 use sha2::{Digest, Sha256};
 mod state;
 
@@ -48,36 +53,56 @@ pub fn selected(owner: ObjectKey) -> bool {
 pub fn register(role: usize, owner: ObjectKey) -> bool {
     ENABLED.load(Ordering::Acquire) && A10_CAPTURE.owner(role, [owner.id, owner.generation])
 }
-pub fn launch(role: u64) -> [u8; 32] {
-    let mut bytes = [0; 32];
+pub fn launch(role: u64) -> [u8; 40] {
+    let run_mode = mode();
+    let deadline_ns = a10_budget::client_deadline_ns(run_mode)
+        .expect("invalid A10 mode after protected configuration");
+    let mut bytes = [0; 40];
     for (chunk, word) in bytes.chunks_exact_mut(8).zip([
         1,
-        mode(),
+        run_mode,
         role,
         A10_CAPTURE.words[5].load(Ordering::Acquire),
+        deadline_ns,
     ]) {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     bytes
 }
+pub fn launch_deadline_ns(input: &[u8]) -> Option<u64> {
+    if input.len() != 40 {
+        return None;
+    }
+    let word = |at| u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
+    let (version, run_mode, role, boot, deadline_ns) =
+        (word(0), word(8), word(16), word(24), word(32));
+    (version == 1
+        && matches!(run_mode, 1..=4)
+        && matches!(role, 1 | 2)
+        && boot > 0
+        && a10_budget::client_deadline_ns(run_mode) == Some(deadline_ns))
+    .then_some(deadline_ns)
+}
+pub fn snapshot() -> Option<[u64; 4]> {
+    crate::prototype_storage::try_with_journal(|journal, disk, _| {
+        [
+            journal.last_commit_lsn(),
+            disk.reads,
+            disk.writes,
+            disk.flushes,
+        ]
+    })
+    .ok()
+}
+pub fn snapshot_failed() {
+    A10_CAPTURE.fail();
+}
 /// Invoked after successful ABI copyout; retained retries publish exactly once.
-pub fn delivered(owner: ObjectKey, frame: &[u8; 640], data: &[u8], misses: u64) {
+pub fn delivered(owner: ObjectKey, frame: &[u8; 640], data: &[u8], misses: u64, io: [u64; 4]) {
     if !selected(owner) {
         return;
     }
-    let Ok((lsn, reads, writes, flushes)) =
-        crate::prototype_storage::try_with_journal(|journal, disk, _| {
-            (
-                journal.last_commit_lsn(),
-                disk.reads,
-                disk.writes,
-                disk.flushes,
-            )
-        })
-    else {
-        A10_CAPTURE.fail();
-        return;
-    };
+    let [lsn, reads, writes, flushes] = io;
     let ticks = cyxia_arch_aarch64::timer::ticks();
     let hz = cyxia_arch_aarch64::timer::frequency();
     let ns = (u128::from(ticks) * 1_000_000_000 / u128::from(hz)) as u64;
@@ -100,11 +125,26 @@ pub fn delivered(owner: ObjectKey, frame: &[u8; 640], data: &[u8], misses: u64) 
         return;
     };
     let run_mode = mode();
+    let operation = u16::from_le_bytes(frame[OFF_OPERATION..OFF_OPERATION + 2].try_into().unwrap());
+    let result = u64::from_le_bytes(frame[OFF_RESULT..OFF_RESULT + 8].try_into().unwrap());
+    let path_len = usize::from(u16::from_le_bytes(
+        frame[OFF_PATH_LENGTH..OFF_PATH_LENGTH + 2]
+            .try_into()
+            .unwrap(),
+    ));
+    if run_mode == 4
+        && operation == CREATE
+        && result == 0
+        && frame.get(OFF_PATH..OFF_PATH + path_len) == Some(b"/a10/pressure-a")
+        && crate::domain_storage::set_writeback_baseline(a10_budget::CACHE_WRITEBACK_PAGES).is_err()
+    {
+        A10_CAPTURE.fail();
+    }
     let expected = if run_mode == 1 { 2 } else { 3 };
     if run_mode <= 2
         && A10_CAPTURE.role([owner.id, owner.generation]) == Some(0)
-        && u16::from_le_bytes(frame[OFF_OPERATION..OFF_OPERATION + 2].try_into().unwrap()) == FSYNC
-        && u64::from_le_bytes(frame[OFF_RESULT..OFF_RESULT + 8].try_into().unwrap()) == 0
+        && operation == FSYNC
+        && result == 0
         && u64::from_le_bytes(frame[OFF_WRITE_SEQ..OFF_WRITE_SEQ + 8].try_into().unwrap())
             == expected
         && u64::from_le_bytes(
@@ -125,27 +165,32 @@ pub fn delivered(owner: ObjectKey, frame: &[u8; 640], data: &[u8], misses: u64) 
 /// At the first authorized syscall after the selected writer FSYNC, snapshot
 /// the stopped task's progress page. This distinguishes ABI delivery from EL0
 /// consumption without granting the task authority to publish the verdict.
-pub fn entered(owner: ObjectKey, frame: &[u8; 640]) {
+pub fn entered(owner: ObjectKey, frame: &[u8; 640]) -> Result<(), Error> {
     let run_mode = mode();
     if !selected(owner) || run_mode > 2 || A10_CAPTURE.role([owner.id, owner.generation]) != Some(0)
     {
-        return;
+        return Ok(());
     }
     let event = FSYNC_EVENT.load(Ordering::Acquire);
     if event == 0 {
-        return;
+        return Ok(());
     }
     let request = u64::from_le_bytes(frame[OFF_REQUEST..OFF_REQUEST + 8].try_into().unwrap());
     let operation = u16::from_le_bytes(frame[OFF_OPERATION..OFF_OPERATION + 2].try_into().unwrap());
     let fsync_request = FSYNC_REQUEST.load(Ordering::Acquire);
     let mut progress = [0; 104];
     let expected = if run_mode == 1 { 2 } else { 3 };
-    if operation != CLOSE
-        || fsync_request.checked_add(1) != Some(request)
-        || crate::domain_tasks::copyin(owner, 0x30000, &mut progress).is_err()
-    {
+    if operation != CLOSE || fsync_request.checked_add(1) != Some(request) {
         A10_CAPTURE.fail();
-        return;
+        return Ok(());
+    }
+    match crate::domain_tasks::copyin(owner, 0x30000, &mut progress) {
+        Ok(()) => {}
+        Err(Error::Busy) => return Err(Error::Busy),
+        Err(_) => {
+            A10_CAPTURE.fail();
+            return Ok(());
+        }
     }
     let mut words = [0; 13];
     for (word, chunk) in words.iter_mut().zip(progress.chunks_exact(8)) {
@@ -167,7 +212,7 @@ pub fn entered(owner: ObjectKey, frame: &[u8; 640]) {
         || words[12] != 0
     {
         A10_CAPTURE.fail();
-        return;
+        return Ok(());
     }
     let ticks = cyxia_arch_aarch64::timer::ticks();
     let hz = cyxia_arch_aarch64::timer::frequency();
@@ -186,6 +231,7 @@ pub fn entered(owner: ObjectKey, frame: &[u8; 640]) {
     ) {
         A10_CAPTURE.fail();
     }
+    Ok(())
 }
 /// Actual exit syscall, before ordinary memory teardown. This is supplemental
 /// consumed-reply evidence, distinct from protected delivered ABI receipts.

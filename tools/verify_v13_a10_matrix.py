@@ -6,9 +6,11 @@ from pathlib import Path
 import re
 
 from check_v13_fault_disk import read_events
+from doctor import ROOT
 from verify_smp import require, sha
 from verify_v13_a10 import decode
 from verify_v13_a10_faults import overwrite_window
+from v13_a10_budget import scenario_budgets
 
 PHASES = ('before', 'after-ack')
 LOSSES = ('drop', 'reverse-half')
@@ -58,6 +60,9 @@ def load_run(directory: Path, *, mode: int, cut: int, phase: str, loss: str,
     run_input = json.loads(input_path.read_text())
     binding = json.loads((directory / 'binding.json').read_text())
     tools = json.loads((directory / 'tools.json').read_text())
+    budget = matrix.get('scenario_budgets', {}).get(str(mode), {})
+    qemu = {key: value for key, value in tools.items()
+            if key not in ('build_tools', 'capture_tools')}
     require(summary.get('test_id') == 'A10' and summary.get('A10_complete') is False
             and summary.get('native_filesystem_fault_matrix_complete') is False
             and summary.get('status') == status and summary.get('binding') == binding
@@ -66,6 +71,14 @@ def load_run(directory: Path, *, mode: int, cut: int, phase: str, loss: str,
             and run_input.get('phase') == phase and run_input.get('unflushed') == loss
             and run_input.get('initial_disk_sha256') == initial_sha256
             and run_input.get('reverse_replies') is True
+            and run_input.get('client_deadline_ns') == budget.get('client_deadline_ns')
+            and run_input.get('capture_margin_ns') == budget.get('capture_margin_ns')
+            and run_input.get('client_poll_ns') == budget.get('client_poll_ns')
+            and run_input.get('capture_timeout_seconds')
+                == budget.get('capture_timeout_seconds')
+            and summary.get('scenario_budget') == budget
+            and run_input.get('sample_ms') == matrix.get('sample_ms')
+            and summary.get('sample_ms') == matrix.get('sample_ms')
             and run_input.get('immutable_artifact_cache')
                 == matrix.get('immutable_artifact_cache')
             and run_input.get('build_manifest_sha256') == matrix.get('build_manifest_sha256')
@@ -79,7 +92,8 @@ def load_run(directory: Path, *, mode: int, cut: int, phase: str, loss: str,
             and binding.get('uuid') == matrix.get('filesystem_uuid')
             and run_input.get('uuid') == matrix.get('filesystem_uuid')
             and sha(directory / 'source-manifest.json') == matrix.get('source_manifest_sha256')
-            and tools.get('capture_tools') == matrix.get('tools'),
+            and tools.get('capture_tools') == matrix.get('tools')
+            and qemu == matrix.get('qemu_attestation'),
             'A10 child run identity/status mismatch: ' + str(directory))
     if cut:
         require(summary.get('cut_observed') is True
@@ -136,8 +150,14 @@ def review(root: Path) -> dict:
             and request.get('phases') == list(PHASES)
             and request.get('losses') == list(LOSSES)
             and request.get('reverse_replies') is True
-            and type(request.get('timeout')) in (int, float)
-            and 5 <= request['timeout'] <= 300
+            and request.get('scenario_budgets') == scenario_budgets(ROOT)
+            and request.get('sample_ms') == 30_000
+            and type(request.get('qemu_binary')) is str
+            and request.get('qemu_binary')
+            and type(request.get('qemu_source')) is str
+            and request.get('qemu_source')
+            and type(request.get('qemu_attestation')) is dict
+            and request['qemu_attestation'].get('qemu_pmu_patch_attested') is True
             and (request.get('immutable_artifact_cache') is None
                  or type(request.get('immutable_artifact_cache')) is str)
             and re.fullmatch(r'[0-9a-f]{32}', request.get('filesystem_uuid', '')),

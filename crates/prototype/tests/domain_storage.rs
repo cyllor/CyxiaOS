@@ -596,6 +596,38 @@ fn selected_readahead_and_writeback_versions_execute_real_io() {
 }
 
 #[test]
+fn configured_writeback_baseline_batches_without_policy_credit() {
+    large(|| {
+        let (mut d, mut j) = fixture();
+        let mut s = [0; 8192];
+        let mut fs = FileSystem::<64>::new();
+        fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.create("/baseline", &mut j, &mut d, &mut s).unwrap();
+        let h = fs
+            .open("/baseline", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
+            .unwrap();
+        fs.write(h, 0, &[7; 65536], &mut j, &mut d, &mut s).unwrap();
+        fs.write(h, 65536, &[7; 65536], &mut j, &mut d, &mut s)
+            .unwrap();
+
+        fs.set_writeback_baseline(32).unwrap();
+        assert_eq!(
+            fs.current_action(0),
+            Action::Filesystem {
+                readahead: 0,
+                flush: 32,
+            }
+        );
+        let receipt = fs
+            .background_flush(0, &mut j, &mut d, &mut s)
+            .unwrap()
+            .unwrap();
+        assert_eq!((receipt.pages, receipt.policy_version), (32, 0));
+        assert_eq!(fs.metrics().dirty_pages, 0);
+    });
+}
+
+#[test]
 fn cache_shrink_is_bounded_and_never_discards_dirty_data() {
     large(|| {
         let (mut d, mut j) = fixture();

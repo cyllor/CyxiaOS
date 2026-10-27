@@ -46,6 +46,19 @@ class FaultPoints(unittest.TestCase):
         capture['records'][0]['writes']=2
         with self.assertRaises(ValueError):self.checker().overwrite_window(capture,rows)
 
+    def test_reverse_reply_request_ahead_selects_unique_journal_shape(self):
+        capture,rows=self.fixtures()
+        # The protected counters advance after a logical operation completes,
+        # while the NBD transcript records a mutation when its request arrives.
+        # One older FLUSH can therefore already be in the request stream at the
+        # WRITE receipt, with the selected transaction shifted by one mutation.
+        rows.insert(9,dict(mutation=10,kind=3,offset=0,length=0))
+        for index,row in enumerate(rows):row['mutation']=index+1
+        result=self.checker().overwrite_window(capture,rows)
+        self.assertEqual(result['points'],list(range(11,61)))
+        self.assertEqual(result['flush_points'],[51,60])
+        self.assertEqual(result['request_counter_skew'],1)
+
     def test_no_device_reply_is_labeled_el0_consumption(self):
         capture,rows=self.fixtures()
         result=self.checker().overwrite_window(capture,rows)
