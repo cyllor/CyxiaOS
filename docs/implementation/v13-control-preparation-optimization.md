@@ -1252,3 +1252,31 @@ pass. Exact build
 both selected stack paths pass at 32,960/65,536 bytes with the unchanged
 4,096-byte exception reserve. Patched-QEMU replay is required, and the 69-case
 v1.3 catalogue remains open.
+
+Run `40455226746` confirms raw-tick probe deadlines cross all C-worker probes.
+The first stopped snapshot instead contains three independent task-bank
+overruns: CPU0 service sequence 12 at network stage 47 uses
+3,882,359/2,500,000 ns; CPU2 builtin sequence 13 uses
+12,293,452/10,000,000 ns; and CPU3 optional dynamic thread `4153:3` uses
+11,550,626/10,000,000 ns. CPU2's refined markers place only 3,060,263 ns from
+the pre-A02 boundary through A02 return, leaving roughly 9.23 ms in the
+post-return validation and small surrounding work. Artifact upload again fails
+independently on the repository quota.
+
+Network stage 47 acquired the exact eight-byte used-ring record, but still
+combined cache synchronization with the record's two field reads. Those are
+now consecutive custody-safe checkpoints; the queue stays exclusively
+borrowed and no DMA slice escapes. The fixed builtin's generic Rust iterator is
+replaced by a fixed AArch64 loop that still compares both 64-bit halves of all
+32 saved SIMD registers. Finally, protected A02 task registration now keeps an
+open-addressed immutable identity index beside its append-only task table, so a
+new dynamic task no longer scans the full registered prefix. Every hit rechecks
+the exact stored id/generation/task, collisions probe deterministically, and
+entry/return continue using the validated task slot. The collision regression,
+all 74 VirtIO tests, complete non-kernel workspace, 627 host tests (two
+environment skips), 153 v1.3 tests (one historical-evidence skip), 71 tool
+tests, formatting and configured AArch64 strict Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-task-boundaries` is `BUILT_NOT_RUN`; both
+selected stack paths remain 32,960/65,536 bytes, and disassembly contains the
+fixed 32-register validation loop. Patched-QEMU replay is required; the
+69-case v1.3 catalogue remains open.

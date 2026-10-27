@@ -25,6 +25,9 @@ pub struct Capture<const N: usize, const T: usize> {
     pub events: [[u64; 16]; N],
     pub counters: [u64; 64],
     tasks: [Task; T],
+    // Open-addressed immutable identity index. Registrations are append-only;
+    // entry/return keep using the exact validated task slot.
+    task_index: [u16; T],
     active: [Task; 4],
     returned_origin: [u64; T],
     started: [u64; 4],
@@ -42,6 +45,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             events: [[0; 16]; N],
             counters: [0; 64],
             tasks: [Task::EMPTY; T],
+            task_index: [0; T],
             active: [Task::EMPTY; 4],
             returned_origin: [0; T],
             started: [0; 4],
@@ -122,28 +126,45 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.header[3] += 1;
         self.counters[7] += 1;
     }
-    fn find_registered(&mut self, id: u64, generation: u64) -> Result<(usize, Option<usize>), ()> {
+    fn task_hash(id: u64, generation: u64) -> usize {
+        let mixed = id ^ generation.rotate_left(23) ^ id.rotate_left(41);
+        mixed as usize
+    }
+    fn find_registered(
+        &mut self,
+        id: u64,
+        generation: u64,
+    ) -> Result<(usize, Option<usize>, usize), ()> {
         let Ok(used) = usize::try_from(self.counters[27]) else {
             self.fail();
             return Err(());
         };
-        if used > T {
+        if used > T || T == 0 {
             self.fail();
             return Err(());
         }
-        let mut found = None;
-        let mut hole = false;
-        for (index, task) in self.tasks[..used].iter().enumerate() {
-            hole |= task.id == 0;
+        let start = Self::task_hash(id, generation) % T;
+        for distance in 0..T {
+            let slot = (start + distance) % T;
+            let encoded = usize::from(self.task_index[slot]);
+            if encoded == 0 {
+                return Ok((used, None, slot));
+            }
+            let index = encoded - 1;
+            if index >= used || self.tasks[index].id == 0 {
+                self.fail();
+                return Err(());
+            }
+            let task = self.tasks[index];
             if task.id == id && task.generation == generation {
-                found = Some(index);
+                return Ok((used, Some(index), slot));
             }
         }
-        if hole {
+        if used == T {
+            Ok((used, None, 0))
+        } else {
             self.fail();
             Err(())
-        } else {
-            Ok((used, found))
         }
     }
     fn register_task(&mut self, tick: u64, task: Task) -> Option<usize> {
@@ -155,7 +176,8 @@ impl<const N: usize, const T: usize> Capture<N, T> {
             self.fail();
             return None;
         }
-        let Ok((used, registered)) = self.find_registered(task.id, task.generation) else {
+        let Ok((used, registered, index_slot)) = self.find_registered(task.id, task.generation)
+        else {
             return None;
         };
         if let Some(index) = registered {
@@ -166,7 +188,12 @@ impl<const N: usize, const T: usize> Capture<N, T> {
                 Some(index)
             }
         } else if used < T && self.tasks[used].id == 0 {
+            let Ok(encoded) = u16::try_from(used + 1) else {
+                self.fail();
+                return None;
+            };
             self.tasks[used] = task;
+            self.task_index[index_slot] = encoded;
             self.counters[27] = (used + 1) as u64;
             self.append(tick, 1, 4, task, [task.role, task.affinity]);
             Some(used)
@@ -239,7 +266,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         self.counters[40 + cpu] += tick.saturating_sub(self.started[cpu]);
         self.append(tick, 4, cpu, task, [self.counters[16 + cpu]]);
         self.active[cpu] = Task::EMPTY;
-        let Ok((_, registered)) = self.find_registered(task.id, task.generation) else {
+        let Ok((_, registered, _)) = self.find_registered(task.id, task.generation) else {
             return;
         };
         if let Some(index) = registered {
@@ -284,7 +311,7 @@ impl<const N: usize, const T: usize> Capture<N, T> {
         if self.sealed() {
             return;
         }
-        let Ok((_, registered)) = self.find_registered(id, generation) else {
+        let Ok((_, registered, _)) = self.find_registered(id, generation) else {
             return;
         };
         let Some(index) = registered else {
@@ -430,6 +457,27 @@ mod tests {
         c.exit_prepared(103, 1, prepared.unwrap());
         assert_eq!(c.events[2][2], 4);
         assert_eq!(c.returned_origin[0], 2);
+    }
+    #[test]
+    fn colliding_task_identities_use_the_exact_index_without_a_prefix_scan() {
+        let mut c: Capture<32, 4> = Capture::new();
+        let mut config = [0; 64];
+        config[2] = 7;
+        c.begin(100, 1000, &config);
+        c.boot(4);
+        let first = task(10, 1, 1);
+        let mut second = task(11, 1, 2);
+        while Capture::<32, 4>::task_hash(first.id, first.generation) % 4
+            != Capture::<32, 4>::task_hash(second.id, second.generation) % 4
+        {
+            second.id += 1;
+        }
+        assert_eq!(c.prepare(101, first), Some(0));
+        assert_eq!(c.prepare(102, second), Some(1));
+        assert_eq!(c.prepare(103, first), Some(0));
+        assert_eq!(c.prepare(104, second), Some(1));
+        assert_eq!(c.counters[27], 2);
+        assert_eq!(c.header[4], 0);
     }
     #[test]
     fn dense_task_prefix_exhaustion_fails_without_reusing_a_registration() {

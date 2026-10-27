@@ -510,6 +510,45 @@ fn execute(ctx: &mut user::Context, i: usize) {
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9 || ctx.kind == 8 && ctx.esr >> 26 == 0x15 && ctx.esr & 0xffff == 4
 }
+#[cfg(feature = "unified-runtime")]
+fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
+    if !fixture_yielded(ctx) || ctx.regs[0] != cookie(i) || ctx.tpidr_el0 != cookie(i) {
+        return false;
+    }
+    let expected = cookie(i);
+    let mut simd = ctx.simd.as_ptr();
+    let valid: u64;
+    // Validate every saved 128-bit Q register with a fixed AArch64 loop. The
+    // generic iterator path adds sizeable translated control flow after the
+    // architectural return even though the evidence shape is fixed at 32.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, #0",
+            "2:",
+            "ldp x10, x11, [{simd}], #16",
+            "cmp x10, {expected}",
+            "b.ne 3f",
+            "cmp x11, x9",
+            "b.ne 3f",
+            "add x9, x9, #1",
+            "cmp x9, #32",
+            "b.ne 2b",
+            "mov {valid}, #1",
+            "b 4f",
+            "3:",
+            "mov {valid}, #0",
+            "4:",
+            simd = inout(reg) simd => _,
+            expected = in(reg) expected,
+            valid = out(reg) valid,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            options(nostack, readonly),
+        );
+    }
+    valid != 0
+}
 #[cfg(not(feature = "unified-runtime"))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
@@ -688,15 +727,18 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         #[cfg(feature = "unified-runtime")]
         builtin_detail(slot, 4);
         execute(ctx, i);
-        if !fixture_yielded(ctx)
-            || ctx.regs[0] != cookie(i)
-            || ctx.tpidr_el0 != cookie(i)
-            || ctx
+        #[cfg(feature = "unified-runtime")]
+        let valid = fixture_context_valid(ctx, i);
+        #[cfg(not(feature = "unified-runtime"))]
+        let valid = fixture_yielded(ctx)
+            && ctx.regs[0] == cookie(i)
+            && ctx.tpidr_el0 == cookie(i)
+            && !ctx
                 .simd
                 .iter()
                 .enumerate()
-                .any(|(r, v)| *v != [cookie(i), r as u64])
-        {
+                .any(|(r, v)| *v != [cookie(i), r as u64]);
+        if !valid {
             fatal(4);
         }
         // All user writes completed before user::enter returned its TLB barrier.

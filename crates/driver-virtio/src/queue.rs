@@ -472,9 +472,11 @@ impl BatchQueue {
             p.barrier();
             return Ok(None);
         }
-        p.barrier();
         let at = 4 + usize::from(self.used % self.size) * 8;
         unsafe { p.sync(self.memory.used.address() + at, 8) };
+        // Cache acquisition and field decoding are independent bounded pieces.
+        // No DMA slice escapes and the queue remains exclusively borrowed.
+        checkpoint();
         p.barrier();
         let id = self.memory.used.get32(at);
         let len = self.memory.used.get32(at + 4);
@@ -724,7 +726,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completion.len, 15);
-        assert_eq!(checkpoints, 5);
+        assert_eq!(checkpoints, 6);
     }
     #[test]
     fn empty_poll_checkpoints_status_publication_and_used_index() {

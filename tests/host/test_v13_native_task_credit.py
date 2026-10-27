@@ -36,6 +36,7 @@ class NativeTaskCredit(unittest.TestCase):
 
     def test_batched_rx_custody_transitions_are_independently_settleable(self):
         driver = (ROOT / "crates/driver-virtio/src/net/batched.rs").read_text()
+        queue = (ROOT / "crates/driver-virtio/src/queue.rs").read_text()
         transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
 
         receive = driver[driver.index("pub fn receive_with_checkpoint"):]
@@ -44,6 +45,9 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("checkpoint();\n        self.rx.release(token)?;", receive)
         self.assertIn("receive_frame_with_checkpoint", transport)
         self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
+        record = queue[queue.index("let at = 4 + usize::from(self.used % self.size) * 8;") :]
+        self.assertLess(record.index("p.sync("), record.index("checkpoint();"))
+        self.assertLess(record.index("checkpoint();"), record.index("let id ="))
 
     def test_network_stage_diagnostic_is_outside_next_service_debit(self):
         runtime = (ROOT / "kernel/src/unified.rs").read_text()
@@ -118,6 +122,15 @@ class NativeTaskCredit(unittest.TestCase):
             runtime[runtime.index("fn fixture_yielded"):],
         )
         self.assertIn("ctx.esr & 0xffff == 4", runtime[runtime.index("fn fixture_yielded"):])
+        validator = runtime[
+            runtime.index("fn fixture_context_valid") : runtime.index(
+                '#[cfg(not(feature = "unified-runtime"))]\nfn fixture_yielded'
+            )
+        ]
+        self.assertIn('"ldp x10, x11, [{simd}], #16"', validator)
+        self.assertIn('"cmp x9, #32"', validator)
+        unified_loop = runtime[runtime.index("let ctx = &mut contexts[role]") :]
+        self.assertIn("fixture_context_valid(ctx, i)", unified_loop)
 
     def test_builtin_immutable_root_keeps_full_context_without_global_tlbi(self):
         runtime = (ROOT / "kernel/src/smp.rs").read_text()
