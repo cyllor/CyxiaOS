@@ -335,6 +335,20 @@ and configured strict AArch64 Clippy pass. Exact build
 both selected stack paths are 33,968/65,536 bytes. Linux timing remains
 required.
 
+Run `40425936832` returns to native C phase 2 with
+12,974,512/8,000,000 ns at sequence 594, demonstrating that the remaining
+generic integer/TLS capture work is not robust to the cold timing variance.
+The exception capture ABI now borrows the 31-register frame instead of passing
+it by value. Ordinary tasks still copy every integer register and SP. The
+audited mapping-probe path, whose result validation uses only PC, PSTATE, ESR,
+FAR and kind, skips that copy and all EL0/EL1 TLS moves. No validation field,
+credit or wall escape changes. Local and Linux validation are required.
+All 615 host tests (two environment skips), 141 v1.3 tests (one
+historical-evidence skip), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-minimal-capture` is
+`BUILT_NOT_RUN`; both selected stack paths are 33,968/65,536 bytes. Linux
+timing remains required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

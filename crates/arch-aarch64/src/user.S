@@ -31,11 +31,11 @@ cyxia_enter_user:
  msr cpacr_el1, x9
  isb
 .Luser_features_configured:
+ cbz x1, .Luser_integer_restore
  mrs x9, tpidr_el0
  str x9, [sp, #120]
  ldr x9, [x30, #296]
  msr tpidr_el0, x9
- cbz x1, .Luser_integer_restore
  ldr x9, [x30, #816]
  msr fpcr, x9
  ldr x9, [x30, #824]
@@ -122,6 +122,7 @@ cyxia_user_return:
  mrs x9, fpsr
  str x9, [x30, #824]
 .Luser_integer_save:
+ cbz x10, .Luser_state_restored
  mrs x9, tpidr_el0
  str x9, [x30, #296]
  // Restore the original EL1 TLS and feature controls before returning to Rust.
@@ -132,6 +133,7 @@ cyxia_user_return:
  msr cpacr_el1, x9
  isb
 .Luser_features_restored:
+.Luser_state_restored:
  ldp x19, x20, [sp, #0]
  ldp x21, x22, [sp, #16]
  ldp x23, x24, [sp, #32]

@@ -39,6 +39,10 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("cbz x10, .Luser_integer_save", assembly)
         self.assertIn("cbz x1, .Luser_features_configured", assembly)
         self.assertIn("cbz x10, .Luser_features_restored", assembly)
+        self.assertIn("cbz x10, .Luser_state_restored", assembly)
+        self.assertIn("static INTEGER_ONLY", arch)
+        self.assertIn("context.regs.copy_from_slice(regs)", arch)
+        self.assertIn("if !INTEGER_ONLY[slot]", arch)
 
 
 if __name__ == "__main__":

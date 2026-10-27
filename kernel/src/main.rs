@@ -291,7 +291,7 @@ fn exception_dispatch_primary(f: &mut ExceptionFrame, kind: u64) {
         }
         // Only AArch64 EL0 sync/IRQ vectors may return to the suspended caller.
         if let Some(pc) =
-            unsafe { cyxia_arch_aarch64::user::capture(f.regs, f.elr, f.spsr, f.esr, f.far, kind) }
+            unsafe { cyxia_arch_aarch64::user::capture(&f.regs, f.elr, f.spsr, f.esr, f.far, kind) }
         {
             f.elr = pc;
             f.spsr = 0x3c5;

@@ -69,6 +69,8 @@ const _: () = {
 };
 static ACTIVE: [AtomicPtr<Context>; super::cpu::MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; super::cpu::MAX_CPUS];
+static INTEGER_ONLY: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; super::cpu::MAX_CPUS];
 unsafe extern "C" {
     fn cyxia_enter_user(context: *mut Context, restore_fp: u64);
     fn cyxia_user_return();
@@ -88,9 +90,11 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
     unsafe {
         asm!("mrs {}, daif", "msr daifset, #15", out(reg) saved_daif, options(nostack));
     }
-    let active = &ACTIVE[super::cpu::slot()];
+    let slot = super::cpu::slot();
+    let active = &ACTIVE[slot];
     assert!(active.load(Ordering::Relaxed).is_null());
     context.status &= 0xf0000000; // NZCV only; always EL0t, IRQ enabled, no privileged PSTATE.
+    INTEGER_ONLY[slot].store(!restore_fp, Ordering::Relaxed);
     active.store(core::ptr::from_mut(context), Ordering::Relaxed);
     unsafe {
         asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
@@ -99,6 +103,7 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
         // state, and restored the original EL1 CPACR/TLS before returning.
     }
     active.store(core::ptr::null_mut(), Ordering::Relaxed);
+    INTEGER_ONLY[slot].store(false, Ordering::Relaxed);
     unsafe {
         asm!("msr daif, {}", in(reg) saved_daif, options(nostack, preserves_flags));
     }
@@ -129,25 +134,28 @@ pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
 /// TPIDR_EL0. Enabled live hardware values are saved by user.S after capture returns;
 /// integer-only probes do not execute FP/SIMD and leave their context bank untouched.
 pub unsafe fn capture(
-    regs: [u64; 31],
+    regs: &[u64; 31],
     pc: u64,
     status: u64,
     esr: u64,
     far: u64,
     kind: u64,
 ) -> Option<u64> {
-    let p = ACTIVE[super::cpu::slot()].load(Ordering::Relaxed);
+    let slot = super::cpu::slot();
+    let p = ACTIVE[slot].load(Ordering::Relaxed);
     if p.is_null() || status & 15 != 0 {
         return None;
     }
     let sp: u64;
     unsafe {
-        asm!("mrs {}, sp_el0",out(reg)sp);
         let context = &mut *p;
-        context.regs = regs;
+        if !INTEGER_ONLY[slot].load(Ordering::Relaxed) {
+            asm!("mrs {}, sp_el0",out(reg)sp);
+            context.regs.copy_from_slice(regs);
+            context.sp = sp;
+        }
         context.pc = pc;
         context.status = status;
-        context.sp = sp;
         context.esr = esr;
         context.far = far;
         context.kind = kind;

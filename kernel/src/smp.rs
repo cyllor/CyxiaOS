@@ -329,7 +329,12 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
     if (kind == 8 || kind == 9)
         && let Some(pc) = unsafe {
             user::capture(
-                frame.regs, frame.elr, frame.spsr, frame.esr, frame.far, kind,
+                &frame.regs,
+                frame.elr,
+                frame.spsr,
+                frame.esr,
+                frame.far,
+                kind,
             )
         }
     {
