@@ -1188,3 +1188,24 @@ Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-probe-heartbeat-turn` is `BUILT_NOT_RUN`;
 both selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
 required, and the 69-case v1.3 catalogue remains open.
+
+Run `40451075473` confirms the deferred heartbeat restoration crosses phase 2.
+The next failure moves to CPU1 sequence 1289 at
+15,229,641/8,000,000 ns with phase 1 as the only phase bit. That phase can
+only start the private probe clear or execute one fixed 64-byte clear piece;
+it has no job or preparation context and records no preemption.
+
+Every recovery turn nevertheless constructed `PaidWorkWitness`, whose live
+credit check acquires the global task owner. Probe clearing, heartbeat restore,
+synchronous fault entry and fault validation never read a policy or replay
+owner. They now execute in a separate `run_probe_turn` state machine before
+witness construction. Once all four fault probes pass, every normal
+preparation, measurement, model return and replay path continues to require the
+exact authenticated witness. The sibling functions also reduce the selected
+preparation stack peak from 33,760 to 32,960/65,536 bytes. All 626 host tests
+(two environment skips), 152 v1.3 tests (one historical-evidence skip), 71
+evidence-tool tests, 74 VirtIO tests, 14 cluster-network tests, formatting,
+patch checks and configured AArch64 strict Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-no-policy-witness` is
+`BUILT_NOT_RUN`. Patched-QEMU replay remains required, and the 69-case v1.3
+catalogue remains open.

@@ -514,11 +514,10 @@ fn next_input(
     crate::domain_control::next_paid(controller, witness, wall_started, cpu_started, input)
 }
 #[inline(never)]
-fn run_turn(
+fn run_probe_turn(
     worker: &mut Worker,
     credit: cyxia_prototype::domains::tasks::ControlCredit,
     begin: ChargeStart,
-    witness: &crate::domain_control::core_replay::PaidWorkWitness,
 ) {
     let slot = cpu::slot();
     let now = ns(timer::ticks());
@@ -528,6 +527,100 @@ fn run_turn(
         worker.native.probe_heartbeat_pending = false;
         return;
     }
+    if let Some(context) = worker.context.as_ref()
+        && context.kind != 0
+    {
+        worker.native.phase(8);
+        if context.kind != 9 {
+            let (address, fsc) = [
+                (abi::INPUT_VA, 0x4f),
+                (abi::MODEL_VA, 0x4f),
+                (0xb0000, 0x47),
+                (0x30000, 0x07),
+            ][worker.native.probe as usize];
+            if context.kind != 8
+                || context.esr >> 26 != 0x24
+                || context.esr & 0x7f != fsc
+                || context.far != address
+            {
+                fail_worker(worker);
+                return;
+            }
+            record_protected();
+            worker.native.probe += 1;
+            worker.context = None;
+            worker.native.probing = false;
+            worker.probed = worker.native.probe == 4;
+            return;
+        }
+        if now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS {
+            fail_worker(worker);
+            return;
+        }
+        // Retire this timer return in its own paid turn. Re-entering EL0 below
+        // would charge two context-switch envelopes to one recovery credit.
+        worker.context.as_mut().expect("probe context").kind = 0;
+        return;
+    }
+    if worker.context.is_none() && !worker.native.probing {
+        worker.native.phase(1);
+        worker.native.clear_next = 1;
+        worker.native.probing = true;
+        worker.native.probe_started = now;
+        return;
+    }
+    if worker.context.is_none() && now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS
+    {
+        fail_worker(worker);
+        return;
+    }
+    if !continue_private_clear(worker, slot) {
+        return;
+    }
+    if worker.context.is_none() {
+        worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+        // Register the later normal task identity outside its first captured
+        // boundary. Probe entries themselves remain uncaptured.
+        worker.native.capture_index = crate::a02_capture::prepare(capture_task(slot));
+        return;
+    }
+    let entered = timer::cpu_ticks();
+    if timer::cpu_ns(entered.saturating_sub(begin.cpu_ticks)).saturating_add(RETURN_ENVELOPE_NS)
+        > credit.reserved_ns
+    {
+        return;
+    }
+    let context = worker.context.as_mut().expect("probe context");
+    context.kind = 0;
+    worker.native.phase(2);
+    let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot * 2 + 1) as u64 };
+    unsafe {
+        enter_service(
+            context,
+            phys(root),
+            timer::ticks().saturating_add(ticks(PROBE_SERVICE_SLICE_NS).max(1)),
+            capture_task(slot),
+            worker.native.capture_index,
+            false,
+            false,
+        );
+    }
+    worker.native.probe_heartbeat_pending = true;
+    let actual = timer::cpu_elapsed_ns(entered);
+    MAX_SLICE[slot].fetch_max(ticks(actual), Ordering::Relaxed);
+    if context.kind == 9 {
+        worker.preemptions = worker.preemptions.saturating_add(1);
+    }
+}
+#[inline(never)]
+fn run_turn(
+    worker: &mut Worker,
+    credit: cyxia_prototype::domains::tasks::ControlCredit,
+    begin: ChargeStart,
+    witness: &crate::domain_control::core_replay::PaidWorkWitness,
+) {
+    let slot = cpu::slot();
+    let now = ns(timer::ticks());
     if worker.native.completion.is_some() && !worker.native.in_job {
         // step() settled the preceding context bill. This separate prepaid
         // owner piece releases only the already revoked immutable bank pin.
@@ -548,42 +641,7 @@ fn run_turn(
     }
     if let Some(context) = worker.context.as_ref() {
         if context.kind != 0 {
-            if worker.native.probing {
-                worker.native.phase(8);
-                if context.kind != 9 {
-                    let (address, fsc) = [
-                        (abi::INPUT_VA, 0x4f),
-                        (abi::MODEL_VA, 0x4f),
-                        (0xb0000, 0x47),
-                        (0x30000, 0x07),
-                    ][worker.native.probe as usize];
-                    if context.kind != 8
-                        || context.esr >> 26 != 0x24
-                        || context.esr & 0x7f != fsc
-                        || context.far != address
-                    {
-                        fail_worker(worker);
-                        return;
-                    }
-                    record_protected();
-                    worker.native.probe += 1;
-                    worker.context = None;
-                    worker.native.probing = false;
-                    worker.probed = worker.native.probe == 4;
-                    // The final probe completion is its own prepaid recovery turn.
-                    // A fresh 2.5 ms model turn must acquire and encode the first job.
-                    return;
-                } else if now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS {
-                    fail_worker(worker);
-                    return;
-                } else {
-                    // Retire this timer return in its own paid turn. Re-entering
-                    // EL0 below would charge two context-switch envelopes to one
-                    // 2.5 ms evaluation credit.
-                    worker.context.as_mut().expect("probe context").kind = 0;
-                    return;
-                }
-            } else if worker.native.in_job {
+            if worker.native.in_job {
                 if context.kind == 9 {
                     // The previous slice has already preserved all registers.
                     // A later paid turn may arm the next slice, but this turn
@@ -602,23 +660,7 @@ fn run_turn(
             }
         }
     }
-    if !worker.probed && worker.context.is_none() && !worker.native.probing {
-        worker.native.phase(1);
-        worker.native.clear_next = 1;
-        worker.native.probing = true;
-        worker.native.probe_started = now;
-        // Do not combine the ownership/state transition with the first private
-        // memory touch. The next independently prepaid turn performs the clear.
-        return;
-    }
-    if worker.native.probing
-        && worker.context.is_none()
-        && now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS
-    {
-        fail_worker(worker);
-        return;
-    }
-    if worker.probed && worker.context.is_none() && !worker.native.in_job {
+    if worker.context.is_none() && !worker.native.in_job {
         if TARGET.load(Ordering::Acquire) != slot as u64
             || REQUEST
                 .compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed)
@@ -680,15 +722,6 @@ fn run_turn(
     if !continue_private_clear(worker, slot) {
         return;
     }
-    if worker.native.probing && worker.context.is_none() {
-        worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
-        // The first capture entry would otherwise combine immutable task
-        // registration and two event publications with the architectural
-        // entry. Register in this paid setup turn; exact enter/return events
-        // still surround user::enter on the following turn.
-        worker.native.capture_index = crate::a02_capture::prepare(capture_task(slot));
-        return;
-    }
     if worker.native.in_job && worker.context.is_none() && !worker.native.abort_pending {
         let preparation = timer::cpu_ticks();
         let input = unsafe { &(*input_ptr(slot)).0 };
@@ -737,34 +770,22 @@ fn run_turn(
         return;
     };
     context.kind = 0;
-    worker
-        .native
-        .phase(if worker.native.probing { 2 } else { 5 });
+    worker.native.phase(5);
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot * 2 + 1) as u64 };
     unsafe {
-        let service_slice_ns = if worker.native.probing {
-            PROBE_SERVICE_SLICE_NS
-        } else {
-            SERVICE_SLICE_NS
-        };
         enter_service(
             context,
             phys(root),
-            timer::ticks().saturating_add(ticks(service_slice_ns).max(1)),
+            timer::ticks().saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
             capture_task(slot),
             worker.native.capture_index,
-            !worker.native.probing,
-            !worker.native.probing,
+            true,
+            true,
         );
-    }
-    if worker.native.probing {
-        worker.native.probe_heartbeat_pending = true;
     }
     let actual = timer::cpu_elapsed_ns(entered);
     MAX_SLICE[slot].fetch_max(ticks(actual), Ordering::Relaxed);
-    if worker.native.in_job {
-        worker.native.cpu_ns = worker.native.cpu_ns.saturating_add(actual);
-    }
+    worker.native.cpu_ns = worker.native.cpu_ns.saturating_add(actual);
     if context.kind == 9 {
         worker.preemptions = worker.preemptions.saturating_add(1);
     }
@@ -856,7 +877,12 @@ pub(super) fn step(worker: &mut Worker) {
     worker.native.phase_mask = 0;
     CONTROL_MAX_DEBIT.fetch_max(credit.control_total_ns / 100_000, Ordering::Relaxed);
     CONTROL_TOTAL_DEBIT.fetch_add(credit.reserved_ns / 100_000, Ordering::Relaxed);
-    if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
+    if !worker.probed {
+        // Mapping-probe setup never reads a protected policy owner. Avoid
+        // authenticating a replay witness (and borrowing the task owner) for
+        // its private clear, heartbeat and synchronous fault turns.
+        run_probe_turn(worker, credit, begin);
+    } else if let Ok(witness) = crate::domain_control::core_replay::PaidWorkWitness::new(credit) {
         if begin_measurement(worker, &witness) {
             run_turn(worker, credit, begin, &witness);
         }

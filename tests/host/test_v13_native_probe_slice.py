@@ -15,7 +15,12 @@ class NativeProbeSlice(unittest.TestCase):
         match = re.search(r"const PROBE_SERVICE_SLICE_NS: u64 = ([0-9_]+);", source)
         self.assertIsNotNone(match)
         self.assertGreater(int(match.group(1).replace("_", "")), 8_000_000)
-        self.assertIn("if worker.native.probing {\n            PROBE_SERVICE_SLICE_NS", source)
+        self.assertIn("ticks(PROBE_SERVICE_SLICE_NS)", source)
+        self.assertIn("fn run_probe_turn(", source)
+        self.assertIn("if !worker.probed {", source)
+        self.assertIn("run_probe_turn(worker, credit, begin);", source)
+        probe = source[source.index("fn run_probe_turn(") : source.index("fn run_turn(")]
+        self.assertNotIn("PaidWorkWitness", probe)
         self.assertIn("let reservation_ns = if worker.probed && !worker.native.probing", source)
         self.assertIn("PROBE_PREPAY_NS\n    };", source)
         self.assertIn("!worker.native.probing", source)
@@ -36,8 +41,10 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("a02_capture::enter(task);", entry)
         self.assertIn("a02_capture::returned();", entry)
         self.assertIn("user::enter_integer_probe(context, root);", entry)
-        native = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
-        self.assertEqual(native.count("!worker.native.probing,"), 2)
+        self.assertIn(
+            "worker.native.capture_index,\n            false,\n            false,",
+            probe,
+        )
         self.assertIn("if record_slice_evidence && slot < 4", entry)
         self.assertIn("if record_slice_evidence {\n            RECORD_SLICE_EXCEPTION[slot].store(true", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(false", entry)
