@@ -21,6 +21,10 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("run_probe_turn(worker, credit, begin);", source)
         probe = source[source.index("fn run_probe_turn(") : source.index("fn run_turn(")]
         self.assertNotIn("PaidWorkWitness", probe)
+        self.assertNotIn("ns(timer::ticks())", probe)
+        self.assertIn("let now = timer::ticks();", probe)
+        self.assertIn("now >= worker.native.probe_deadline", probe)
+        self.assertIn("timer::frequency().saturating_mul(PROBE_WALL_SECONDS)", probe)
         self.assertIn("let reservation_ns = if worker.probed && !worker.native.probing", source)
         self.assertIn("PROBE_PREPAY_NS\n    };", source)
         self.assertIn("!worker.native.probing", source)

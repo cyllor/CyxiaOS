@@ -1229,3 +1229,26 @@ patch checks and configured AArch64 strict Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-probe-no-policy-witness` is
 `BUILT_NOT_RUN`. Patched-QEMU replay remains required, and the 69-case v1.3
 catalogue remains open.
+
+Run `40454220555` confirms the network-stage accounting boundary crosses the
+previous 904 ns overrun, then stops earlier in the next node's mapping-probe
+clear: CPU1 sequence 370 uses 8,434,641/8,000,000 ns with phase 1 as its only
+phase bit. Its wall interval is 8,435,552 ns, closely matching the patched
+per-vCPU debit; there is no active job, preparation context or recorded
+preemption. Artifact upload failed independently on the existing repository
+quota.
+
+Every fixed 64-byte clear turn still converted the physical counter through
+the generic `u128` ticks-to-nanoseconds division solely to test the probe's
+one-second wall escape. That conversion ran after the paid turn began. The
+probe now records a raw physical-counter deadline once at setup and compares
+raw ticks on each continuation. The same one-second wall limit, 8 ms recovery
+credit, exact nanosecond settlement, four fault assertions, complete nine-page
+clear and final barrier remain unchanged. The complete non-kernel workspace,
+627 host tests (two environment skips), 153 v1.3 tests (one historical-evidence
+skip), 71 evidence-tool tests, formatting and configured AArch64 strict Clippy
+pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-raw-deadline` is `BUILT_NOT_RUN`;
+both selected stack paths pass at 32,960/65,536 bytes with the unchanged
+4,096-byte exception reserve. Patched-QEMU replay is required, and the 69-case
+v1.3 catalogue remains open.

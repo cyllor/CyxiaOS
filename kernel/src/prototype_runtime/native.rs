@@ -10,7 +10,7 @@ const PROBE_PREPAY_NS: u64 = 8_000_000;
 const WALL_NS: u64 = 50_000_000;
 // The mapping probe is a boot self-test that spans separately prepaid turns;
 // it is not a proposal whose single-turn wall deadline may be extended.
-const PROBE_WALL_NS: u64 = 1_000_000_000;
+const PROBE_WALL_SECONDS: u64 = 1;
 const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
 const PRIVATE_CLEAR_BARRIER: u32 = PRIVATE_CLEAR_BYTES as u32 + 1;
@@ -132,7 +132,7 @@ pub(super) struct WorkerState {
     source: Option<crate::domain_control::JobSource>,
     measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
-    probe_started: u64,
+    probe_deadline: u64,
     capture_index: Option<usize>,
     probe_heartbeat_pending: bool,
     clear_next: u32,
@@ -157,7 +157,7 @@ impl WorkerState {
             source: None,
             measurement: None,
             probe: 0,
-            probe_started: 0,
+            probe_deadline: 0,
             capture_index: None,
             probe_heartbeat_pending: false,
             clear_next: 0,
@@ -520,7 +520,10 @@ fn run_probe_turn(
     begin: ChargeStart,
 ) {
     let slot = cpu::slot();
-    let now = ns(timer::ticks());
+    // The probe timeout is a physical-counter deadline. Converting every
+    // clear turn through the generic u128 ticks-to-ns division would itself
+    // become charged recovery work under translated execution.
+    let now = timer::ticks();
     if worker.native.probe_heartbeat_pending {
         worker.native.phase(8);
         crate::smp::restore_service_heartbeat();
@@ -553,7 +556,7 @@ fn run_probe_turn(
             worker.probed = worker.native.probe == 4;
             return;
         }
-        if now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS {
+        if now >= worker.native.probe_deadline {
             fail_worker(worker);
             return;
         }
@@ -566,11 +569,11 @@ fn run_probe_turn(
         worker.native.phase(1);
         worker.native.clear_next = 1;
         worker.native.probing = true;
-        worker.native.probe_started = now;
+        worker.native.probe_deadline =
+            now.saturating_add(timer::frequency().saturating_mul(PROBE_WALL_SECONDS));
         return;
     }
-    if worker.context.is_none() && now.saturating_sub(worker.native.probe_started) >= PROBE_WALL_NS
-    {
+    if worker.context.is_none() && now >= worker.native.probe_deadline {
         fail_worker(worker);
         return;
     }
