@@ -1,6 +1,9 @@
 //! CPU0 service owners. Every receipt is tied to an actual owner transition,
 //! process generation or UART write; synchronous disk work runs outside this gate.
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use cyxia_contracts::{ConsoleOps, PlatformError};
 use cyxia_prototype::{
     domains::{
@@ -33,6 +36,33 @@ static LOCK: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static CONSOLE_READY: AtomicBool = AtomicBool::new(false);
 static BACKGROUND_DUE: AtomicBool = AtomicBool::new(false);
+#[repr(C, align(64))]
+struct ServiceDetail(UnsafeCell<[u64; 16]>);
+unsafe impl Sync for ServiceDetail {}
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_SERVICE_DETAIL: ServiceDetail = ServiceDetail(UnsafeCell::new([0; 16]));
+fn service_detail(phase: usize) {
+    if phase + 1 < 16 {
+        unsafe {
+            DOMAIN_SERVICE_DETAIL
+                .0
+                .get()
+                .cast::<u64>()
+                .add(phase + 1)
+                .write_volatile(0);
+        }
+    }
+    unsafe {
+        DOMAIN_SERVICE_DETAIL
+            .0
+            .get()
+            .cast::<u64>()
+            .add(phase)
+            .write_volatile(cyxia_arch_aarch64::timer::cpu_ticks());
+    }
+}
+const _: () = assert!(core::mem::size_of::<ServiceDetail>() == 128);
 
 #[derive(Clone, Copy, Default)]
 struct CoreFacts {
@@ -668,16 +698,32 @@ pub fn service(now: u64, progress: &mut dyn FnMut()) -> Result<(), Error> {
     if !READY.load(Ordering::Acquire) {
         return Err(Error::NotReady);
     }
+    service_detail(0);
     crate::domain_platform::poll(now)?;
+    service_detail(1);
+    // The platform poll owns no service state after return. Close its exact
+    // CPU segment before borrowing the service owner for recovery/console
+    // work, rather than charging two independently bounded owners together.
+    progress();
+    service_detail(2);
     with(|s| {
         for r in s.core_records.iter_mut().flatten() {
             if !r.state.terminal() && now.saturating_sub(r.started) >= 200_000_000 {
                 r.state = ExecutionState::Unknown;
             }
         }
+        service_detail(3);
         poll_services(s, now)?;
-        pump_console(s, now)
+        service_detail(4);
+        let result = pump_console(s, now);
+        service_detail(5);
+        result
     })?;
+    service_detail(6);
+    // with() has released the service lock and published its read projection.
+    // Background storage/reclaim therefore starts under a fresh exact credit.
+    progress();
+    service_detail(7);
     if BACKGROUND_DUE.swap(false, Ordering::AcqRel) {
         with(|s| {
             crate::domain_platform::arm_timer(
@@ -687,7 +733,9 @@ pub fn service(now: u64, progress: &mut dyn FnMut()) -> Result<(), Error> {
             )?;
             Ok(())
         })?;
+        service_detail(8);
         let result = crate::domain_storage::background_flush(now, progress);
+        service_detail(9);
         match result {
             Ok(_) => {}
             Err(Error::Busy | Error::Again | Error::Budget | Error::NotReady | Error::Conflict) => {
@@ -697,6 +745,7 @@ pub fn service(now: u64, progress: &mut dyn FnMut()) -> Result<(), Error> {
         }
     }
     // Reclaim remains bounded even when dependencies block new writeback.
+    service_detail(10);
     match crate::domain_storage::cache_reclaim_turn() {
         Ok(_) | Err(Error::Busy | Error::Again) => Ok(()),
         Err(error) => Err(error),

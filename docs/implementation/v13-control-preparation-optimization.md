@@ -932,3 +932,24 @@ tests, formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-rx-wide-clear-slice-flag` is
 `BUILT_NOT_RUN`; both selected stack paths pass at 33,776/65,536 bytes.
 Patched-QEMU timing is still required.
+
+Run `40434213506` confirms both immediately preceding cold paths are crossed:
+neither network stage 44 nor a builtin credit is quarantined. The run advances
+to CPU0 service sequence 395, where domain-services stage 5 uses
+8,878,935/2,500,000 ns. That call had combined the platform poll, the
+service/recovery/console owner, background storage and reclaim under one
+outer service segment even though each owner is released at explicit safe
+boundaries. The platform poll and service-owner call now close their exact
+credits before the next owner starts. A new 16-word, CPU0-only volatile detail
+bank records translated-execution timestamps around platform polling, the
+core-record scan, recovery services, console pumping, read-view publication,
+background flush and reclaim. It is consumed only from stopped snapshots and
+does not introduce atomic helpers into the measured path. No underlying
+service order, budget, deadline or failure rule changes.
+
+The full 620 host tests (two environment skips), 146 v1.3 tests (one
+historical-evidence skip), 70 evidence-tool tests, formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-service-owner-segments` is `BUILT_NOT_RUN`;
+both selected stack paths pass at 33,776/65,536 bytes and both ELFs expose the
+detail bank at exactly 128 bytes. Patched-QEMU timing is still required.

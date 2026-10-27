@@ -24,6 +24,16 @@ class NativeTaskCredit(unittest.TestCase):
         execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
         self.assertIn("minimum_ns: if local { 10_000_000 } else { 0 }", execution)
 
+    def test_cpu0_service_owners_have_separate_credits_and_single_writer_detail(self):
+        source = (ROOT / "kernel/src/domain_services.rs").read_text()
+
+        self.assertIn("static DOMAIN_SERVICE_DETAIL: ServiceDetail", source)
+        self.assertIn("size_of::<ServiceDetail>() == 128", source)
+        service = source[source.index("pub fn service(now:"):source.index("mod target_projection")]
+        self.assertGreaterEqual(service.count("progress();"), 2)
+        self.assertIn("crate::domain_platform::poll(now)?;", service)
+        self.assertIn("service_detail(6);\n    // with() has released", service)
+
     def test_builtin_fixture_yields_after_a_fixed_batch_with_timer_backstop(self):
         assembly = (ROOT / "kernel/src/smp_user.S").read_text()
         runtime = (ROOT / "kernel/src/smp.rs").read_text()

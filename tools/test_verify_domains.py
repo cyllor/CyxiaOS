@@ -486,6 +486,18 @@ class EvidenceParserTests(unittest.TestCase):
             })
         self.assertEqual(guest["service_stage_word"], 47)
 
+    def test_service_detail_is_retained_in_credit_failure(self):
+        unified = [0] * 512
+        sticky = [0] * 32
+        sticky[0] = 1
+        detail = list(range(16))
+        with self.assertRaisesRegex(ValueError, r'"service_detail":\[0,1,2'):
+            diagnostics({}, {
+                "UNIFIED_EVIDENCE": encode(unified),
+                "TASK_OVERRUN_EVIDENCE": encode(sticky),
+                "DOMAIN_SERVICE_DETAIL": encode(detail),
+            })
+
     def test_legacy_service_stage_remains_available(self):
         unified = [0] * 512
         unified[30] = 43
