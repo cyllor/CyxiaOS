@@ -93,6 +93,10 @@ The build profiles `after-reserve`, `after-start`, `after-completion` and
 the corresponding successful broker return. `after-ready` is the baseline
 supervisor scenario. Each profile is independently bound into the build
 manifest and verifier expectation; substituting another boundary fails closed.
+At the exception, EL1 freezes the last successful broker operation, original
+argument and service generation in protected evidence before resetting any
+service-owned memory. Native verification must match this receipt to the
+selected injection profile instead of trusting the build label alone.
 
 Relevant files are `kernel/src/unified.rs`, `unified_store.rs`,
 `unified_task.rs`, `domain_network.rs` and its `requests`/receipt adapters,

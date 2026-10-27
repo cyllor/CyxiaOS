@@ -555,6 +555,7 @@ pub fn run(info: &BootInfo) -> ! {
         boot.epoch, initiator as u8
     ));
     let mut sequence = 0u64;
+    let mut last_service_receipt = (0u64, 0u64);
     let mut connection_epoch = 0u64;
     let mut entropy_failed = false;
     let mut refresh_input = true;
@@ -777,9 +778,14 @@ pub fn run(info: &BootInfo) -> ! {
                 || context.esr >> 26 != 0x15
                 || context.esr & 0xffff != u64::from(abi::SVC)
             {
+                UNIFIED_EVIDENCE.words[13].store(last_service_receipt.0, Ordering::Relaxed);
+                UNIFIED_EVIDENCE.words[14].store(last_service_receipt.1, Ordering::Relaxed);
+                UNIFIED_EVIDENCE.words[22].store(service_lifecycle.generation(), Ordering::Release);
                 line(format_args!(
-                    "UNIFIED_EL0_FAULT generation={} kind={} esr={} far={} pc={}\n",
+                    "UNIFIED_EL0_FAULT generation={} last_op={} last_arg0={} kind={} esr={} far={} pc={}\n",
                     service_lifecycle.generation(),
+                    last_service_receipt.0,
+                    last_service_receipt.1,
                     context.kind,
                     context.esr,
                     context.far,
@@ -800,6 +806,7 @@ pub fn run(info: &BootInfo) -> ! {
             sequence = p.sequence;
             refresh_input = true;
             let len = p.len as usize;
+            let request_identity = (p.op, p.arg0);
             p.status = abi::OK;
             match p.op {
                 abi::OP_ENTROPY => {
@@ -982,6 +989,9 @@ pub fn run(info: &BootInfo) -> ! {
                     finish_service(started);
                 }
                 _ => p.status = abi::FAILED,
+            }
+            if p.status == abi::OK {
+                last_service_receipt = request_identity;
             }
         }
         crate::unified_task::transport(false);

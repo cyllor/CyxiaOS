@@ -76,9 +76,15 @@ def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
         require(not any(0xfe<=event<=0x108 or event>=0xf000 for event in events),'service reported failure')
         if expect=='leave':require(0x221 in events,'missing two-signature durable leave')
         if expect.startswith('service-restart'):
+            boundary={
+                'service-restart':(11,0x212),'service-restart-ready':(11,0x212),
+                'service-restart-reserve':(10,31),'service-restart-start':(10,2),
+                'service-restart-completion':(10,3),'service-restart-result':(11,0x216),
+            }[expect]
             restart=re.search(rb'UNIFIED_SERVICE_RESTART boot=(\d+) generation=2',text)
             require(u[30:32]==(2,1) and restart is not None and int(restart.group(1))==u[1],'same-boot service restart evidence missing')
-            require(re.search(rb'UNIFIED_EL0_FAULT generation=1 ',text) is not None,'real generation-1 EL0 fault missing')
+            fault=(f'UNIFIED_EL0_FAULT generation=1 last_op={boundary[0]} last_arg0={boundary[1]} ').encode()
+            require(u[13:15]==boundary and u[22]==1 and fault in text,'real generation-1 EL0 fault boundary missing')
             require(all(events.count(event)>=2 for event in (1,2,3,0x212)),'new service generation did not reconcile to READY')
         else:require(u[30:32]==(1,0),'unexpected service restart in this scenario')
         observations.append(dict(boot_epoch=u[1],service_generation=u[30],service_restarts=u[31],task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))

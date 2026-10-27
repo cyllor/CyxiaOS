@@ -38,12 +38,15 @@ class Acceptance(unittest.TestCase):
         for item in restarted:
             words=list(struct.unpack('<512Q',item['UNIFIED_EVIDENCE']))
             events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
-            words[6]=len(events);words[30:32]=[2,1];words[32:]=[0]*480
+            words[6]=len(events);words[13:15]=[11,0x212];words[22]=1
+            words[30:32]=[2,1];words[32:]=[0]*480
             for i,event in enumerate(events):words[32+i*2]=event
             item['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
-        serial=[b'UNIFIED_EL0_FAULT generation=1 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n']*2
+        serial=[b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n']*2
         self.assertEqual(len(validate(serial,restarted,[4,4],expect='service-restart')),2)
         changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',31,0)
+        with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
+        changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',14,2)
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
     def test_no_ack_cannot_be_mislabelled_successful_handoff(self):
         with self.assertRaises(ValueError):validate([b'DYNAMIC_V13_RECONCILE']*2,[bundle(),bundle(True)],[4,4],expect='no-stop-ack')
