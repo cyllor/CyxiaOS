@@ -72,7 +72,7 @@ static ACTIVE: [AtomicPtr<Context>; super::cpu::MAX_CPUS] =
 static INTEGER_ONLY: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; super::cpu::MAX_CPUS];
 unsafe extern "C" {
-    fn cyxia_enter_user(context: *mut Context, restore_fp: u64);
+    fn cyxia_enter_user(context: *mut Context, restore_fp: u64, invalidate: u64);
     fn cyxia_user_return();
 }
 /// # Safety
@@ -84,7 +84,7 @@ unsafe extern "C" {
 /// runs because their additional register state is not saved. A context must be
 /// initialized or reset before reuse by a different process so its full
 /// integer, FP/SIMD and TLS state belongs exclusively to the entered process.
-unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
+unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool, invalidate: bool) {
     let saved_daif: u64;
     // Do not expose a half-installed ACTIVE/TTBR0 pair to an IRQ.
     unsafe {
@@ -97,15 +97,19 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
     INTEGER_ONLY[slot].store(!restore_fp, Ordering::Relaxed);
     active.store(core::ptr::from_mut(context), Ordering::Relaxed);
     unsafe {
-        if restore_fp {
+        if invalidate {
             asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
         } else {
-            // The caller supplies a boot-unique ASID for an immutable probe
-            // root. EPD0 still gates low walks before and after this entry;
-            // no mapping can be reclaimed before the later ordinary TLBI.
+            // The caller supplies a boot-unique ASID for an immutable root.
+            // EPD0 still gates low walks before and after this entry; no
+            // mapping can be reclaimed before the later ordinary TLBI.
             asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb",root=in(reg)root,out("x9")_);
         }
-        cyxia_enter_user(core::ptr::from_mut(context), u64::from(restore_fp));
+        cyxia_enter_user(
+            core::ptr::from_mut(context),
+            u64::from(restore_fp),
+            u64::from(invalidate),
+        );
         // user.S has disabled low walks, completed TLBI, saved all enabled user
         // state, and restored the original EL1 CPACR/TLS before returning.
     }
@@ -121,7 +125,20 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
 /// The caller must provide a pinned private context and validated address-space
 /// root, on a registered CPU with no nested entry.
 pub unsafe fn enter(context: &mut Context, root: u64) {
-    unsafe { enter_inner(context, root, true) };
+    unsafe { enter_inner(context, root, true, true) };
+}
+/// Enter a complete user context whose page-table descriptors remain unchanged
+/// and whose mapped frames remain pinned for the boot lifetime. A private ASID
+/// avoids redundant global invalidation while retaining the full integer,
+/// FP/SIMD and TLS bank. Mapped writable data may still change normally.
+///
+/// # Safety
+/// In addition to [`enter`]'s contract, every page-table descriptor reachable
+/// from `root` must remain unchanged, mapped frames must not be reclaimed, and
+/// `asid` must be boot-unique for this root.
+pub unsafe fn enter_immutable(context: &mut Context, root: u64, asid: u8) {
+    debug_assert!(root >> 48 == 0);
+    unsafe { enter_inner(context, root | (u64::from(asid) << 48), true, false) };
 }
 /// Enter a protection probe that must fault before executing any FP/SIMD
 /// instruction. Its verified immutable code contains no such opcode. The
@@ -137,7 +154,7 @@ pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
     // per-CPU mapping-probe roots and are never reused by ordinary contexts.
     let asid = 0x80u64 + super::cpu::slot() as u64;
     debug_assert!(asid <= 0xff && root >> 48 == 0);
-    unsafe { enter_inner(context, root | (asid << 48), false) };
+    unsafe { enter_inner(context, root | (asid << 48), false, false) };
 }
 /// # Safety
 /// Called only from a synchronous/IRQ AArch64 lower-EL vector, while enter() is

@@ -994,3 +994,29 @@ strict AArch64 Clippy pass. Exact build
 `BUILT_NOT_RUN`; both selected stack paths pass at 33,760/65,536 bytes and the
 new symbol is exactly 128 bytes in both ELFs. Patched-QEMU timing is required
 before changing the identified substage.
+
+Run `40436726794` crosses that preparation prefix and reaches the global task
+bank. CPU0 network stage 41 is narrowly over at 2,794,196/2,500,000 ns, while
+the fixed builtins on CPU2 and CPU3 use approximately 12.094/10 ms and
+12.092/10 ms. Their stopped-snapshot rows isolate the excess to marker 4→5:
+12,089,781 ns on CPU2 and 12,076,607 ns on CPU3. That interval is the complete
+A02 enter, EL0 execution, return and validation boundary; preparation,
+admission and post-validation markers are only microseconds. The fixed fixture
+has eight page-table roots whose descriptors are written before `BOOT_READY`
+and never changed, and whose mapped frames remain pinned for the boot. Each
+root now receives its own reserved, boot-nonreused ASID `0x90..0x97`. Its
+complete integer, FP/SIMD and TLS context is still restored and saved, EPD0
+still gates low-address walks before and after entry, and ordinary mutable
+address spaces still perform both global invalidations. Only the two redundant
+global TLB invalidations are skipped for this fixed-root path; writable mapped
+data remains writable and is not part of the immutability premise.
+
+The structural regressions pin the distinct per-root ASIDs, full-context path,
+third assembly control flag and unchanged ordinary/probe invalidation modes.
+The full 623 host tests (two environment skips), 149 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, three architecture tests,
+formatting and patch checks pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-builtin-root-asid-v2` is `BUILT_NOT_RUN`;
+both selected stack paths pass at 33,760/65,536 bytes with the fixed 4,096-byte
+exception reserve. Patched-QEMU replay is required before the builtin fault can
+be considered closed; CPU0 stage 41 and the 69-case v1.3 catalogue remain open.

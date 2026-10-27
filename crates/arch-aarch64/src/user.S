@@ -6,7 +6,8 @@
 cyxia_enter_user:
  // Preserve the soft-float caller's state. EL0 cannot address this kernel stack.
  // Frame: x19-x30 [0,96), DAIF 96, Context* 104, CPACR 112, TPIDR_EL0 120,
- // restore-FP flag 128. x1 is zero only for an integer-only fault probe.
+ // restore-FP flag 128, invalidate flag 136. x1 is zero only for an
+ // integer-only fault probe; x2 is zero only for a boot-immutable ASID root.
  sub sp, sp, #144
  stp x19, x20, [sp, #0]
  stp x21, x22, [sp, #16]
@@ -20,6 +21,7 @@ cyxia_enter_user:
  mov x30, x0
  str x30, [sp, #104]
  str x1, [sp, #128]
+ str x2, [sp, #136]
  cbz x1, .Luser_features_configured
  mrs x9, cpacr_el1
  str x9, [sp, #112]
@@ -89,14 +91,16 @@ cyxia_user_return:
  // Exception dispatcher has selected EL1h with interrupts masked.
  msr daifset, #15
  ldr x10, [sp, #128]
+ ldr x11, [sp, #136]
  // Revoke low-address translations before saving state or allowing reclamation.
  mrs x9, tcr_el1
  orr x9, x9, #0x80
  msr tcr_el1, x9
  isb
- // Integer fault probes use a boot-unique ASID over one immutable root. The
- // ordinary path still invalidates globally before any pages can be reclaimed.
- cbz x10, .Luser_low_walks_revoked
+ // Immutable full-context fixtures and integer fault probes use boot-unique
+ // ASIDs. The ordinary path still invalidates globally before pages can be
+ // reclaimed or page-table mappings changed.
+ cbz x11, .Luser_low_walks_revoked
  tlbi vmalle1is
  dsb ish
  isb

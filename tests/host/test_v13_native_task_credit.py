@@ -71,7 +71,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("if !s.tasks[i].capture_ready", tasks)
         self.assertIn("crate::a02_capture::prepare(task)", tasks)
         self.assertIn("s.tasks[i].capture_index = capture_index", tasks)
-        self.assertIn("enter_service(\n            ctx", runtime)
+        self.assertIn("enter_builtin_service(\n            ctx", runtime)
         self.assertIn(
             "            builtin_capture_index(cpu::slot()),\n            true,\n            false,\n        );",
             runtime,
@@ -92,6 +92,23 @@ class NativeTaskCredit(unittest.TestCase):
             runtime[runtime.index("fn fixture_yielded"):],
         )
         self.assertIn("ctx.esr & 0xffff == 4", runtime[runtime.index("fn fixture_yielded"):])
+
+    def test_builtin_immutable_root_keeps_full_context_without_global_tlbi(self):
+        runtime = (ROOT / "kernel/src/smp.rs").read_text()
+        arch = (ROOT / "crates/arch-aarch64/src/user.rs").read_text()
+        assembly = (ROOT / "crates/arch-aarch64/src/user.S").read_text()
+
+        self.assertIn("unsafe fn enter_builtin_service", runtime)
+        self.assertIn("fn builtin_asid(root: u64) -> u8", runtime)
+        self.assertIn("index < (C * 2) as u64", runtime)
+        self.assertIn("0x90 + u8::try_from(index)", runtime)
+        self.assertIn("user::enter_immutable(context, root, builtin_asid(root));", runtime)
+        self.assertIn("pub unsafe fn enter_immutable", arch)
+        self.assertIn("u64::from(asid) << 48", arch)
+        self.assertIn("true, false", arch)
+        self.assertIn("str x2, [sp, #136]", assembly)
+        self.assertIn("ldr x11, [sp, #136]", assembly)
+        self.assertIn("cbz x11, .Luser_low_walks_revoked", assembly)
 
 
 if __name__ == "__main__":

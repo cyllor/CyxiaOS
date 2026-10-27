@@ -153,6 +153,16 @@ fn phys(address: u64) -> u64 {
         .checked_sub(super::HIGH)
         .expect("high kernel pointer")
 }
+#[cfg(feature = "unified-runtime")]
+fn builtin_asid(root: u64) -> u8 {
+    let first = phys(core::ptr::addr_of!(ROOTS) as u64);
+    let stride = core::mem::size_of::<Page>() as u64;
+    let offset = root.checked_sub(first).expect("builtin root below fixture");
+    assert!(offset % stride == 0);
+    let index = offset / stride;
+    assert!(index < (C * 2) as u64);
+    0x90 + u8::try_from(index).expect("builtin root index")
+}
 fn cookie(i: usize) -> u64 {
     0x43595800 + i as u64
 }
@@ -476,7 +486,7 @@ fn execute(ctx: &mut user::Context, i: usize) {
     // A non-yielding user program must be forcibly returned by the private PPI.
     unsafe {
         #[cfg(feature = "unified-runtime")]
-        enter_service(
+        enter_builtin_service(
             ctx,
             phys(root),
             timer::ticks().saturating_add(quantum),
@@ -1069,6 +1079,53 @@ pub(crate) unsafe fn enter_service(
     capture_boundary: bool,
     record_slice_evidence: bool,
 ) {
+    unsafe {
+        enter_service_inner(
+            context,
+            root,
+            deadline,
+            task,
+            capture_index,
+            capture_boundary,
+            record_slice_evidence,
+            false,
+        )
+    }
+}
+#[cfg(feature = "unified-runtime")]
+unsafe fn enter_builtin_service(
+    context: &mut user::Context,
+    root: u64,
+    deadline: u64,
+    task: crate::a02_capture::Task,
+    capture_index: Option<usize>,
+    capture_boundary: bool,
+    record_slice_evidence: bool,
+) {
+    unsafe {
+        enter_service_inner(
+            context,
+            root,
+            deadline,
+            task,
+            capture_index,
+            capture_boundary,
+            record_slice_evidence,
+            true,
+        )
+    }
+}
+#[cfg(feature = "unified-runtime")]
+unsafe fn enter_service_inner(
+    context: &mut user::Context,
+    root: u64,
+    deadline: u64,
+    task: crate::a02_capture::Task,
+    capture_index: Option<usize>,
+    capture_boundary: bool,
+    record_slice_evidence: bool,
+    immutable_root: bool,
+) {
     let saved_daif: u64;
     let slot = cpu::slot();
     let row = 2 + slot * 30;
@@ -1108,7 +1165,9 @@ pub(crate) unsafe fn enter_service(
         if record_slice_evidence {
             RECORD_SLICE_EXCEPTION[slot].store(true, Ordering::Release);
         }
-        if capture_boundary {
+        if capture_boundary && immutable_root {
+            user::enter_immutable(context, root, builtin_asid(root));
+        } else if capture_boundary {
             user::enter(context, root);
         } else {
             // The only non-captured entries are audited mapping probes. Their
