@@ -21,6 +21,12 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("!worker.native.probing", source)
 
         entry = (ROOT / "kernel/src/smp.rs").read_text()
+        probe_path = entry[entry.index("if !capture_boundary {") : entry.index("let saved_daif")]
+        self.assertIn("timer::arm(deadline);", probe_path)
+        self.assertIn("user::enter_integer_probe(context, root);", probe_path)
+        self.assertIn("heartbeat(true);", probe_path)
+        self.assertIn("return;", probe_path)
+        self.assertNotIn("msr daifset", probe_path)
         self.assertIn("if capture_boundary", entry)
         self.assertIn("a02_capture::enter(task);", entry)
         self.assertIn("a02_capture::returned();", entry)

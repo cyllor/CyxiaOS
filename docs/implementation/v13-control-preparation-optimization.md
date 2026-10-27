@@ -1143,3 +1143,26 @@ checks and configured AArch64 strict Clippy. Exact build
 selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
 required to attribute the builtin interval and validate the empty-poll split;
 the 69-case v1.3 catalogue remains open.
+
+Run `40449051003` stops before the pending RX and builtin diagnostics. CPU1
+mapping-probe sequence 580—the first phase-2 architectural transition after
+576 fixed 64-byte private clears—uses 8,258,978/8,000,000 ns. It has no timer
+preemption, active job or preparation context. A phase mask containing only
+bit 2 confirms that neither another clear nor probe-return bookkeeping shared
+the turn.
+
+The uncaptured integer probe already masks and restores DAIF inside
+`enter_integer_probe` while atomically installing `ACTIVE` and TTBR0. Its
+generic service wrapper redundantly repeated the same DAIF save/mask/restore
+around a synchronous entry. The uncaptured path now arms the same 20 ms timer
+backstop, calls the existing integer-only transition directly, then restores
+the fixed heartbeat. Captured task entries retain the generic wrapper and all
+A02 boundaries. The four addresses and exact fault checks, probe ASIDs,
+one-second wall escape, 8 ms actual debit and fail-closed behavior do not
+change. All 626 host tests (two environment skips), 152 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, 74 VirtIO tests, 14
+cluster-network tests, formatting, patch checks and configured AArch64 strict
+Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-single-daif` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay remains
+required, and the 69-case v1.3 catalogue stays open.

@@ -1122,8 +1122,26 @@ unsafe fn enter_service_inner(
     record_slice_evidence: bool,
     immutable_root: bool,
 ) {
-    let saved_daif: u64;
     let slot = cpu::slot();
+    if !capture_boundary {
+        // The only uncaptured caller is the audited mapping probe. Its
+        // integer-only transition already masks/restores DAIF around ACTIVE
+        // and TTBR0 installation, so wrapping it in a second DAIF transition
+        // adds no exclusion. Keep the independent timer backstop and restore
+        // the fixed heartbeat immediately after the synchronous return.
+        debug_assert!(!record_slice_evidence && !immutable_root);
+        unsafe {
+            timer::arm(deadline);
+            user::enter_integer_probe(context, root);
+            if HEARTBEAT[slot].load(Ordering::Acquire) {
+                heartbeat(true);
+            } else {
+                cpu::disable_timer();
+            }
+        }
+        return;
+    }
+    let saved_daif: u64;
     let row = 2 + slot * 30;
     if record_slice_evidence && slot < 4 {
         // Header words are immutable static initialization. Each row has one
@@ -1164,15 +1182,10 @@ unsafe fn enter_service_inner(
         if record_slice_evidence {
             RECORD_SLICE_EXCEPTION[slot].store(true, Ordering::Release);
         }
-        if capture_boundary && immutable_root {
+        if immutable_root {
             user::enter_immutable(context, root, builtin_asid(root));
-        } else if capture_boundary {
-            user::enter(context, root);
         } else {
-            // The only non-captured entries are audited mapping probes. Their
-            // immutable executable range has no FP/SIMD opcode and faults on
-            // its first memory access, so no vector state is touched.
-            user::enter_integer_probe(context, root);
+            user::enter(context, root);
         }
         if immutable_root {
             builtin_detail(slot, 6);
