@@ -825,3 +825,19 @@ environment skips), 141 v1.3 tests (one
 historical-evidence skip), formatting and configured strict AArch64 Clippy
 pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-clear-stp` passes both
 selected stack paths at 33,904/65,536 bytes. Linux timing remains required.
+
+Run `40428926802` proves that bounded diagnostic publication crosses ordinary
+preparation and reaches the global task bank. The remaining failures are CPU0
+network stage 44 at 2,992,929/2,500,000 ns and CPU2 builtin sequence 3 at
+10,153,491/10,000,000 ns. Stage 44 is the RX completion/rearm path: generic
+queue release rewrote both complete 4 KiB pinned pages even though the chain's
+descriptors named only the actual request and response ranges. Queue slots now
+retain those exact readable/writable lengths and clear only those bytes before
+reuse. DMA custody, generation checks, descriptor bounds and clearing of every
+device-visible byte remain unchanged. A regression proves bytes inside both
+owned ranges are cleared while unrelated page tails are not touched. The full
+616 host tests (two environment skips), 142 v1.3 tests (one historical-evidence
+skip), all 71 driver tests, formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-descriptor-range-clear`
+passes both selected stack paths at 33,968/65,536 bytes. The 10.153 ms CPU2
+boundary remains unchanged pending a fresh Linux replay.

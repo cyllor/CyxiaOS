@@ -39,6 +39,7 @@ enum State {
 struct Slot {
     state: State,
     generation: u64,
+    readable: u32,
     writable: u32,
     descriptors: u16,
     version: u64,
@@ -47,6 +48,7 @@ struct Slot {
 const EMPTY: Slot = Slot {
     state: State::Free,
     generation: 0,
+    readable: 0,
     writable: 0,
     descriptors: 0,
     version: 0,
@@ -358,6 +360,7 @@ impl BatchQueue {
         self.slots[at] = Slot {
             state: State::Private,
             generation: token.generation,
+            readable: request.len() as u32,
             writable: writable as u32,
             descriptors,
             version: self.frozen_version,
@@ -509,8 +512,15 @@ impl BatchQueue {
             return Err(Error::Busy);
         }
         let at = usize::from(token.slot);
-        for i in 0..4096 {
+        let slot = self.slots[at];
+        // Only bytes named by this chain's descriptors ever left the private
+        // queue owner. Clear those exact ranges before reuse; rewriting both
+        // complete pinned pages amplifies a maximum-MTU RX completion into
+        // thousands of unrelated volatile stores inside one CPU credit.
+        for i in 0..slot.readable as usize {
             self.memory.request[at].put8(i, 0);
+        }
+        for i in 0..slot.writable as usize {
             self.memory.response[at].put8(i, 0);
         }
         self.slots[at].state = State::Free;
@@ -629,6 +639,41 @@ mod tests {
         assert_eq!(
             q.poll(&mut t, &mut [0; 1], &p).unwrap().unwrap().token,
             tokens[0]
+        );
+    }
+    #[test]
+    fn release_clears_only_the_descriptor_owned_ranges() {
+        let (mut q, mut t, p) = fixture(16);
+        q.memory.request[0].put8(3, 0xa5);
+        q.memory.response[0].put8(7, 0x5a);
+        let token = q.enqueue(&mut t, &[1, 2, 3], 7, true, false, &p).unwrap();
+        used(&mut q, 0, 7);
+        let completion = q.poll(&mut t, &mut [0; 7], &p).unwrap().unwrap();
+        assert_eq!(completion.token, token);
+        q.release(token).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                unsafe {
+                    core::ptr::read_volatile((q.memory.request[0].address() + i) as *const u8)
+                },
+                0
+            );
+        }
+        for i in 0..7 {
+            assert_eq!(
+                unsafe {
+                    core::ptr::read_volatile((q.memory.response[0].address() + i) as *const u8)
+                },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { core::ptr::read_volatile((q.memory.request[0].address() + 3) as *const u8) },
+            0xa5
+        );
+        assert_eq!(
+            unsafe { core::ptr::read_volatile((q.memory.response[0].address() + 7) as *const u8) },
+            0x5a
         );
     }
     #[test]
