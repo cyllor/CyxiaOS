@@ -74,7 +74,8 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
-            "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256}
+            "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256,
+            "DOMAIN_PREPARATION_PREFIX_DETAIL": 128}
 
 
 def require(condition, message):
@@ -521,6 +522,7 @@ def diagnostics(guest, bundle):
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
+                                    ("DOMAIN_PREPARATION_PREFIX_DETAIL", "preparation_prefix_detail", 16),
                                     ("DOMAIN_PREPARATION_CONTEXT", "preparation_context", 16),
                                     ("DOMAIN_SERVICE_DETAIL", "service_detail", 16),
                                     ("BUILTIN_TASK_DETAIL", "builtin_detail", 32),
@@ -604,6 +606,7 @@ def diagnostics(guest, bundle):
                         bundle.get("DOMAIN_CONTROL_EVIDENCE", b"")),
                     "preparation_evidence": guest.get("preparation_evidence"),
                     "preparation_detail": guest.get("preparation_detail"),
+                    "preparation_prefix_detail": guest.get("preparation_prefix_detail"),
                     "preparation_context": guest.get("preparation_context"),
                 }
                 check(key, not guest[key],

@@ -977,3 +977,20 @@ formatting and configured strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-rx-custody-builtin-detail-v2` is
 `BUILT_NOT_RUN`; both selected stack paths pass at 33,776/65,536 bytes.
 Patched-QEMU timing is still required.
+
+Run `40435650460` stops earlier in ordinary CPU1 preparation sequence 2415 at
+14,277,833/2,500,000 ns, so it does not re-evaluate the new RX checkpoints or
+builtin detail. The existing per-vCPU timeline reaches marker 2: target/context
+resolution consumes about 5.104 ms and the interval from resolved target to
+the post-replay marker consumes about 8.152 ms. A separate 8-marker-per-control
+CPU volatile bank now partitions that latter interval across Canary blocking,
+replay eligibility, snapshot/identity construction, retained-preparation
+validation, `replay::first` and optional measurement creation. It preserves
+the existing preparation ABI and adds no synchronization or decision input.
+The full 622 host tests (two environment skips), 148 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-preparation-prefix-detail` is
+`BUILT_NOT_RUN`; both selected stack paths pass at 33,760/65,536 bytes and the
+new symbol is exactly 128 bytes in both ELFs. Patched-QEMU timing is required
+before changing the identified substage.

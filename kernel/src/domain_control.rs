@@ -46,8 +46,15 @@ struct PreparationDetail([DiagnosticRow<16>; 2]);
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
     PreparationDetail([const { DiagnosticRow::new() }; 2]);
+#[repr(C, align(64))]
+struct PreparationPrefixDetail([DiagnosticRow<8>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_PREFIX_DETAIL: PreparationPrefixDetail =
+    PreparationPrefixDetail([const { DiagnosticRow::new() }; 2]);
 const _: () = assert!(core::mem::size_of::<PreparationEvidence>() == 128);
 const _: () = assert!(core::mem::size_of::<PreparationDetail>() == 256);
+const _: () = assert!(core::mem::size_of::<PreparationPrefixDetail>() == 128);
 #[repr(C, align(64))]
 struct PreparationContextRow {
     payload: UnsafeCell<[u64; 7]>,
@@ -99,6 +106,17 @@ fn preparation_detail(phase: usize) {
     // cannot hide which preparation substage consumed the prepaid CPU credit.
     // Each bank has one CPU writer and is consumed only from a stopped failure
     // snapshot whose credit record is the publication boundary.
+    row.store(phase, timer::cpu_ticks());
+}
+fn preparation_prefix_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_PREFIX_DETAIL.0[cpu - 1];
+    if phase + 1 < 8 {
+        row.store(phase + 1, 0);
+    }
     row.store(phase, timer::cpu_ticks());
 }
 fn preparation_phase(phase: usize) {
@@ -1266,12 +1284,15 @@ fn next_normal(
         };
         preparation_context(index, f, target, wall_started);
         preparation_detail(1);
+        preparation_prefix_detail(0);
         if f.domain == 15 && crate::learning_canary::blocks_active() {
             break 'families;
         }
+        preparation_prefix_detail(1);
         if !replay::allows(f.domain, f.kind, target) {
             break 'families;
         }
+        preparation_prefix_detail(2);
         let fresh_snapshot = Snapshot {
             sequence: match s.preparation {
                 Some(pending) => pending.identity.sequence,
@@ -1290,7 +1311,9 @@ fn next_normal(
             fresh_snapshot.sequence,
             None,
         );
+        preparation_prefix_detail(3);
         let replay_snapshot = preparation_snapshot(s, preparation_identity, fresh_snapshot)?;
+        preparation_prefix_detail(4);
         let (replay_snapshot, _replay_prefix) =
             match replay::first(replay_snapshot, f.domain, f.kind, target) {
                 Ok(v) => v,
@@ -1302,6 +1325,7 @@ fn next_normal(
                 }
                 Err(e) => return Err(e),
             };
+        preparation_prefix_detail(5);
         let _encoding_measure = if _replay_prefix.is_none() {
             witness
                 .map(|w| {
@@ -1318,6 +1342,7 @@ fn next_normal(
         } else {
             None
         };
+        preparation_prefix_detail(6);
         preparation_detail(2);
         // An exclusive Canary or restoration reservation suppresses new
         // Active proposals before encoding and inference spend their CPU.

@@ -35,6 +35,8 @@ class NativeInputPage(unittest.TestCase):
         self.assertIn("row.store(phase, now())", source)
         self.assertIn("size_of::<PreparationEvidence>() == 128", source)
         self.assertIn("size_of::<PreparationDetail>() == 256", source)
+        self.assertIn("size_of::<PreparationPrefixDetail>() == 128", source)
+        self.assertIn("preparation_prefix_detail(6)", source)
         self.assertIn("struct PreparationContextRow", source)
         self.assertIn("published: AtomicU64", source)
         self.assertIn(".write_volatile(value)", source)
