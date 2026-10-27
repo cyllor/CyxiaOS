@@ -40,6 +40,9 @@ fn now() -> u64 {
 fn family() -> Option<u16> {
     Some(16)
 }
+fn captures(owner: ObjectKey, class: CpuClass) -> bool {
+    ledger::fixed_relevance(binding().family, binding().target, owner, class).unwrap_or(true)
+}
 fn stored(index: usize) -> *mut CpuInterval {
     (BANK.load(Ordering::Acquire) as *mut CpuInterval).wrapping_add(index)
 }

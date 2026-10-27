@@ -197,8 +197,19 @@ fn ledger_with<T>(
     let l = unsafe { &mut *LEDGER.0.get() }
         .as_mut()
         .ok_or(learning::Error::Stale)?;
-    let lost = DROPPED.swap(0, Ordering::AcqRel);
-    let open = DROPPED_OPEN.swap(0, Ordering::AcqRel);
+    // Most segments have no abandoned lease. Under translated execution an
+    // unconditional RMW is a synchronous helper even when the counter is zero.
+    // A concurrent increment after the zero load remains published for the
+    // next ledger borrower; a nonzero observation still drains atomically.
+    let take_pending = |counter: &AtomicU64| {
+        if counter.load(Ordering::Acquire) == 0 {
+            0
+        } else {
+            counter.swap(0, Ordering::AcqRel)
+        }
+    };
+    let lost = take_pending(&DROPPED);
+    let open = take_pending(&DROPPED_OPEN);
     l.missing = l.missing.saturating_add(lost);
     l.open = l.open.saturating_sub(open as usize);
     f(l)

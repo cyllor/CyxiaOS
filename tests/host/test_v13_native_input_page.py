@@ -67,6 +67,17 @@ class NativeInputPage(unittest.TestCase):
         self.assertIn("Sha256::digest(input)", hashing)
         self.assertIn('append(b"CYXIA_NATIVE_WORKLOAD_SCOPE_1.3\\0")', hashing)
 
+    def test_peer_ledger_avoids_zero_value_rmw_on_every_measurement(self):
+        source = (ROOT / "kernel/src/peer_replay/owner.rs").read_text()
+        start = source.index("fn ledger_with<T>(")
+        end = source.index("fn now()", start)
+        ledger_with = source[start:end]
+
+        self.assertIn("counter.load(Ordering::Acquire) == 0", ledger_with)
+        self.assertIn("counter.swap(0, Ordering::AcqRel)", ledger_with)
+        self.assertNotIn("DROPPED.swap", ledger_with)
+        self.assertNotIn("DROPPED_OPEN.swap", ledger_with)
+
 
 if __name__ == "__main__":
     unittest.main()

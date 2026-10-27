@@ -1020,3 +1020,27 @@ formatting and patch checks pass. Exact build
 both selected stack paths pass at 33,760/65,536 bytes with the fixed 4,096-byte
 exception reserve. Patched-QEMU replay is required before the builtin fault can
 be considered closed; CPU0 stage 41 and the 69-case v1.3 catalogue remain open.
+
+Run `40438084173` does not reach the fixed builtin and therefore does not yet
+validate the per-root ASID change. It stops first in CPU1 ordinary preparation
+sequence 2631 at 6,681,559/2,500,000 ns. The new prefix bank isolates
+4,403,045 ns of that turn to marker 5→6, the optional policy measurement
+construction; Canary, replay eligibility, identity, snapshot and
+`replay::first` each consume only about 0.02–0.11 ms. The peer ledger wrapper
+performed two cross-core atomic swaps on every measurement entry merely to
+collect abandoned-lease counters, even when both counters were zero. It now
+uses an Acquire zero check and performs the AcqRel swap only after observing a
+nonzero counter. An increment racing after a zero observation remains
+published for the next ledger borrower, while every observed nonzero value is
+still drained atomically; missing/open accounting and the ledger gate are
+unchanged.
+
+The complete peer-billing package suite (24 tests) also exposed an older host
+fixture missing the production attempt path's immutable relevance predicate;
+the fixture now supplies the same `fixed_relevance` decision and all tests
+pass. The full 624 host tests (two environment skips), 150 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, formatting and patch checks
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-peer-zero-rmw` is
+`BUILT_NOT_RUN`; both selected stack paths pass at 33,760/65,536 bytes. Linux
+patched-QEMU replay must still cross this preparation boundary and later
+exercise the builtin ASID path. The 69-case v1.3 catalogue remains open.
