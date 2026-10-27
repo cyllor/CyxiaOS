@@ -19,13 +19,20 @@ class NativeInputPage(unittest.TestCase):
 
     def test_failed_target_lookup_retains_attributable_context(self):
         source = (ROOT / "kernel/src/domain_control.rs").read_text()
-        lookup = source.index("preparation_lookup(index, f, ordinal, wall_started);")
-        target = source.index("let target_result = read_target_batch", lookup)
-        checked = source.index("target_result?;", target)
+        target = source.index("let target_result = read_target_batch")
+        checked = source.index("if let Err(error) = target_result", target)
+        lookup = source.index("preparation_lookup(index, f, ordinal, wall_started);", checked)
 
-        self.assertLess(lookup, target)
         self.assertLess(target, checked)
+        self.assertLess(checked, lookup)
         self.assertIn("descriptor.target_source", source)
+
+    def test_preparation_diagnostics_use_zero_terminated_rows(self):
+        source = (ROOT / "kernel/src/domain_control.rs").read_text()
+
+        self.assertIn("DOMAIN_PREPARATION_DETAIL.0[base + phase + 1].store(0", source)
+        self.assertIn("DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0", source)
+        self.assertIn("DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(0", source)
 
 
 if __name__ == "__main__":

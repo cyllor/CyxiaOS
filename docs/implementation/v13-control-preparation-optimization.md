@@ -231,6 +231,22 @@ configured AArch64 strict Clippy. Exact local build
 paths pass at 37,984/65,536 bytes with the 4,096-byte exception reserve. Native
 timing remains required.
 
+Run `40427765646` proves the ASID path crosses all mapping probes and advances
+to ordinary preparation sequence 2365. Domain 1/kind 1/target 1 then consumes
+15,817,065/2,500,000 ns in phase 3. Per-vCPU detail reaches target and replay
+markers, while the coarse bank only publishes phase 0. Every invocation was
+clearing 16 detail, eight coarse and eight context atomics before useful work,
+then publishing both lookup and resolved-target eight-word contexts on success.
+Diagnostic rows now use a next-slot zero terminator, context validity clears
+only its release-published start word, and a successful lookup publishes only
+the resolved target. Failed/empty lookup still publishes its exact source and
+ordinal. Decision inputs, failure attribution and the 2.5 ms bound are
+unchanged. The full 616 host tests (two environment skips), 142 v1.3 tests
+(one historical-evidence skip), formatting and configured strict AArch64
+Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-preparation-diagnostic-terminator` passes
+both selected stack paths at 33,968/65,536 bytes. Linux replay is pending.
+
 Run `40376975641` confirms the dense-prefix change removed the boot-probe
 failure and the hardware-hashed ordinary preparation was no longer the first
 fault. It instead exposed simultaneous cold EL0 overruns on CPU0 and CPU3:

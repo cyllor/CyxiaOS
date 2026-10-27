@@ -38,10 +38,11 @@ fn preparation_detail(phase: usize) {
         return;
     }
     let base = (cpu - 1) * 16;
-    if phase == 0 {
-        for word in &DOMAIN_PREPARATION_DETAIL.0[base..base + 16] {
-            word.store(0, Ordering::Relaxed);
-        }
+    if phase + 1 < 16 {
+        // A zero terminator distinguishes this invocation from stale tail
+        // slots without rewriting the complete diagnostic row on every paid
+        // preparation turn. Markers are emitted in strict phase order.
+        DOMAIN_PREPARATION_DETAIL.0[base + phase + 1].store(0, Ordering::Relaxed);
     }
     // The coarse preparation bank retains wall-clock ordering. This detailed
     // bank uses the patched per-vCPU execution counter so MTTCG descheduling
@@ -57,10 +58,8 @@ fn preparation_phase(phase: usize) {
         return;
     }
     let base = (cpu - 1) * 8;
-    if phase == 0 {
-        for word in &DOMAIN_PREPARATION_EVIDENCE.0[base..base + 8] {
-            word.store(0, Ordering::Relaxed);
-        }
+    if phase + 1 < 8 {
+        DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0, Ordering::Relaxed);
     }
     DOMAIN_PREPARATION_EVIDENCE.0[base + phase].store(now(), Ordering::Release);
 }
@@ -70,9 +69,10 @@ fn clear_preparation_context() {
         return;
     }
     let base = (cpu - 1) * 8;
-    for word in &DOMAIN_PREPARATION_CONTEXT.0[base..base + 8] {
-        word.store(0, Ordering::Relaxed);
-    }
+    // Word 7 is the release-published validity/start field. Clearing it makes
+    // the older payload in words 0..6 explicitly invalid until the next
+    // preparation_lookup/preparation_context publication completes.
+    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(0, Ordering::Release);
 }
 fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started: u64) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
@@ -1193,7 +1193,6 @@ fn next_normal(
         // owner view. A retry must never turn owner contention into absence,
         // and the exact lookahead must not advance onto fallback ordinal zero.
         let mut targets = [None; 2];
-        preparation_lookup(index, f, ordinal, wall_started);
         let target_result = read_target_batch(
             f.target_source,
             &[
@@ -1202,10 +1201,14 @@ fn next_normal(
             ],
             &mut targets,
         );
-        target_result?;
+        if let Err(error) = target_result {
+            preparation_lookup(index, f, ordinal, wall_started);
+            return Err(error);
+        }
         let target = targets[0];
         s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {
+            preparation_lookup(index, f, ordinal, wall_started);
             if s.preparation.is_some() {
                 return Err(Error::Stale);
             }
