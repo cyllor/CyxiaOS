@@ -1,5 +1,6 @@
 use core::arch::asm;
 use cyxia_prototype_cluster::abi::*;
+const SERVICE_FAULT: u64 = include!(concat!(env!("OUT_DIR"), "/service-fault.rs"));
 fn page() -> *mut Shared {
     SHARED_VA as *mut Shared
 }
@@ -41,6 +42,9 @@ pub fn boot() -> (u64, [u8; 16], [u8; 32], [u8; 32]) {
             core::ptr::addr_of!((*p).peer_node).read_volatile(),
         )
     }
+}
+pub fn service_generation() -> u64 {
+    unsafe { core::ptr::addr_of!((*page()).service_generation).read_volatile() }
 }
 pub fn request(
     op: u64,
@@ -116,6 +120,11 @@ pub fn poll() -> Result<(bool, u64), u64> {
 }
 pub fn trace(event: u64) {
     let _ = request(OP_TRACE, &[], &mut [], 0, [event, 0, 0]);
+    if service_fault_due(SERVICE_FAULT, service_generation(), event) {
+        // BRK is a genuine synchronous EL0 exception. The supervisor must
+        // retire this context and must never return to this instruction.
+        unsafe { asm!("brk #0", options(noreturn, nostack)) }
+    }
 }
 pub fn yield_now() {
     let _ = request(OP_YIELD, &[], &mut [], 0, [0; 3]);

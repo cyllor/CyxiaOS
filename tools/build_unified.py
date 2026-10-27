@@ -124,9 +124,10 @@ def preparation_stack_gate(images, output, objdump, environment):
                 scope='selected direct preparation calls; not a complete stack proof')
 
 
-def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds=None,
+def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',leave=False,unix_seconds=None,
           selftest=False,storage_fault=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
+    require(service_fault in ('none','after-ready'),'unknown cluster service fault')
     require(not storage_fault or (selftest and fault == 'normal' and not leave), 'storage fault profile requires selftest, normal runtime and no leave')
     if unix_seconds is None:
         unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
@@ -159,7 +160,7 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
     billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None
     for index,name in enumerate(('a','b')):
-        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0')
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault,CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
         commands.append(dict(node=name,stage='service',argv=service_command))
         print(f'Building node {name} EL0 service',flush=True)
@@ -189,7 +190,7 @@ def build(identity_a,identity_b,output,*,fault='normal',leave=False,unix_seconds
     require(sha(Path(__file__)) == builder_digest, 'native builder changed during build')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
@@ -200,6 +201,7 @@ def main():
     parser.add_argument('--identity-b',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--fault',choices=('normal','hang-once','no-stop-ack'),default='normal')
+    parser.add_argument('--service-fault',choices=('none','after-ready'),default='none')
     parser.add_argument('--leave',action='store_true')
     parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
     parser.add_argument('--storage-fault',action='store_true',help='dedicated A10 ordinary-file workload (requires --selftest)')
@@ -208,7 +210,7 @@ def main():
     parser.add_argument('--target-dir',type=Path,help='build cache directory (also accepts CARGO_TARGET_DIR)')
     parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
     args=parser.parse_args()
-    build(args.identity_a,args.identity_b,args.output,fault=args.fault,leave=args.leave,unix_seconds=args.unix_seconds,
+    build(args.identity_a,args.identity_b,args.output,fault=args.fault,service_fault=args.service_fault,leave=args.leave,unix_seconds=args.unix_seconds,
           selftest=args.selftest,storage_fault=args.storage_fault,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
     print(args.output/'build-manifest.json')
 

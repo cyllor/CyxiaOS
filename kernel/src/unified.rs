@@ -16,6 +16,7 @@ use cyxia_driver_virtio::{
     Platform, Transport, net::BatchedNet as Net, queue::BatchMemory as QueueMemory,
 };
 use cyxia_kernel_core::control_plane::service_image::{BASE, Image, LIMIT};
+use cyxia_kernel_core::control_plane::service_restart::{Lifecycle, RestartDecision};
 use cyxia_prototype::domains::Error;
 #[path = "../../user/prototype-cluster/src/abi.rs"]
 pub(crate) mod abi;
@@ -170,10 +171,62 @@ unsafe fn load() -> user::Context {
         }
         core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
     }
-    let mut ctx = user::Context::empty();
-    ctx.pc = image.entry;
-    ctx.sp = abi::STACK_TOP;
-    ctx
+    service_context(image.entry)
+}
+fn service_context(entry: u64) -> user::Context {
+    let mut context = user::Context::empty();
+    context.pc = entry;
+    context.sp = abi::STACK_TOP;
+    context
+}
+fn initialize_shared(boot_epoch: u64, filesystem: [u8; 16], service_generation: u64) {
+    unsafe {
+        let p = &mut *shared();
+        p.magic = abi::MAGIC;
+        p.version = abi::VERSION;
+        p.boot_epoch = boot_epoch;
+        p.service_generation = service_generation;
+        p.uuid = filesystem;
+        p.local_node = *LOCAL;
+        p.peer_node = *PEER;
+    }
+}
+fn reset_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) -> user::Context {
+    let image = Image::parse(ELF).expect("validated cluster ELF");
+    let mut offline = None;
+    for page in 0..image.writable_pages() {
+        let started = service_start(coordinator, &mut offline, 0);
+        unsafe {
+            let bytes = core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(PRIVATE).cast::<u8>(),
+                (LIMIT - BASE) as usize,
+            );
+            image
+                .reset_writable_page(bytes, page)
+                .expect("validated private service backing");
+        }
+        finish_service(started);
+    }
+    for (address, bytes) in [
+        (
+            core::ptr::addr_of_mut!(STACK).cast::<u8>(),
+            abi::STACK_BYTES,
+        ),
+        (
+            core::ptr::addr_of_mut!(SHARED).cast::<u8>(),
+            abi::SHARED_BYTES,
+        ),
+    ] {
+        for page in (0..bytes).step_by(4096) {
+            let started = service_start(coordinator, &mut offline, 0);
+            unsafe { core::ptr::write_bytes(address.add(page), 0, 4096) };
+            finish_service(started);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+    service_context(image.entry)
 }
 unsafe fn map(va: u64, address: u64, writable: bool, executable: bool) {
     let slot = match va >> 21 {
@@ -461,16 +514,9 @@ pub fn run(info: &BootInfo) -> ! {
     startup(14, crate::domain_services::register_control);
     let mut coordinator = crate::smp::prototype_runtime::Coordinator::new(boot);
     crate::smp::prototype_runtime::register_broker_devices();
+    let mut service_lifecycle = Lifecycle::new(boot.epoch, 1).expect("valid service identity");
     let mut context = unsafe { load() };
-    unsafe {
-        let p = &mut *shared();
-        p.magic = abi::MAGIC;
-        p.version = abi::VERSION;
-        p.boot_epoch = boot.epoch;
-        p.uuid = boot.filesystem;
-        p.local_node = *LOCAL;
-        p.peer_node = *PEER;
-    }
+    initialize_shared(boot.epoch, boot.filesystem, service_lifecycle.generation());
     if crate::storage_fault_capture::PROFILE {
         if crate::storage_fault_capture::mode() <= 2 {
             startup(15, || crate::domain_tasks::start_storage_client(1));
@@ -487,6 +533,7 @@ pub fn run(info: &BootInfo) -> ! {
     }
     crate::smp::enable_service_timer();
     UNIFIED_EVIDENCE.words[1].store(boot.epoch, Ordering::Relaxed);
+    UNIFIED_EVIDENCE.words[30].store(service_lifecycle.generation(), Ordering::Relaxed);
     UNIFIED_EVIDENCE.words[24].store(16, Ordering::Relaxed);
     UNIFIED_EVIDENCE.words[0].store(0x435958554e493031, Ordering::Release);
     let node = net.mac()[5];
@@ -565,6 +612,7 @@ pub fn run(info: &BootInfo) -> ! {
         }
         let mut stream_epoch = 0;
         let mut terminal_since = None;
+        let mut service_fault = false;
         loop {
             coordinator.poll();
             if learning_install_stage < 4 {
@@ -664,6 +712,7 @@ pub fn run(info: &BootInfo) -> ! {
                     p.unix_seconds = UNIX.checked_add(now / 1000).unwrap_or_else(|| fail(14));
                     p.connection_epoch = connection_epoch;
                     p.boot_epoch = boot.epoch;
+                    p.service_generation = service_lifecycle.generation();
                     p.uuid = boot.filesystem;
                     p.local_node = *LOCAL;
                     p.peer_node = *PEER;
@@ -700,7 +749,7 @@ pub fn run(info: &BootInfo) -> ! {
                     crate::domain_platform::next_deadline_ticks(hard),
                     crate::a02_capture::Task {
                         id: 0xffff_ffff_ffff_fef1,
-                        generation: 1,
+                        generation: service_lifecycle.generation(),
                         role: 1,
                         affinity: 1,
                     },
@@ -713,7 +762,11 @@ pub fn run(info: &BootInfo) -> ! {
             // Feedback is accepted only at a completed, unchanged even
             // publication sequence; an IRQ may interrupt the EL0 writer.
             unsafe {
-                crate::domain_network::observe(&*shared());
+                crate::domain_network::observe(
+                    &*shared(),
+                    boot.epoch,
+                    service_lifecycle.generation(),
+                );
             }
             finish_service(entered);
             if context.kind == 9 {
@@ -725,17 +778,19 @@ pub fn run(info: &BootInfo) -> ! {
                 || context.esr & 0xffff != u64::from(abi::SVC)
             {
                 line(format_args!(
-                    "UNIFIED_EL0_FAULT kind={} esr={} far={} pc={}\n",
-                    context.kind, context.esr, context.far, context.pc
+                    "UNIFIED_EL0_FAULT generation={} kind={} esr={} far={} pc={}\n",
+                    service_lifecycle.generation(),
+                    context.kind,
+                    context.esr,
+                    context.far,
+                    context.pc
                 ));
-                drop(tcp);
-                close_network(stream_epoch, &mut coordinator);
-                isolate(&mut coordinator, 11)
+                service_fault = true;
+                break;
             }
             let now = Board.now_ms();
             let p = unsafe { &mut *shared() };
-            if p.magic != abi::MAGIC
-                || p.version != abi::VERSION
+            if !abi::valid_service_identity(p, boot.epoch, service_lifecycle.generation())
                 || p.sequence != sequence.checked_add(1).unwrap_or_else(|| fail(12))
                 || !abi::valid_request(p.op, p.len, p.offset)
                 || (p.op == abi::OP_WRITE && p.arg0 > 1)
@@ -918,6 +973,11 @@ pub fn run(info: &BootInfo) -> ! {
                         "UNIFIED_SERVICE event={} arg1={} arg2={} ms={}\n",
                         p.arg0, p.arg1, p.arg2, now
                     ));
+                    if p.arg0 == 0x212 && !service_lifecycle.ready() {
+                        service_lifecycle
+                            .peer_ready(boot.epoch, p.service_generation)
+                            .unwrap_or_else(|_| fail(38));
+                    }
                     p.len = 0;
                     finish_service(started);
                 }
@@ -929,5 +989,26 @@ pub fn run(info: &BootInfo) -> ! {
         // otherwise a new connection could receive an old stream's bytes.
         drop(tcp);
         close_network(stream_epoch, &mut coordinator);
+        if service_fault {
+            crate::domain_network::service_stopped();
+            match service_lifecycle.fault(boot.epoch, service_lifecycle.generation()) {
+                Ok(RestartDecision::Restart { generation }) => {
+                    context = reset_service(&mut coordinator);
+                    initialize_shared(boot.epoch, boot.filesystem, generation);
+                    service_lifecycle
+                        .reset_complete(boot.epoch, generation)
+                        .unwrap_or_else(|_| fail(39));
+                    sequence = 0;
+                    refresh_input = true;
+                    UNIFIED_EVIDENCE.words[30].store(generation, Ordering::Relaxed);
+                    UNIFIED_EVIDENCE.words[31].fetch_add(1, Ordering::Release);
+                    line(format_args!(
+                        "UNIFIED_SERVICE_RESTART boot={} generation={}\n",
+                        boot.epoch, generation
+                    ));
+                }
+                Ok(RestartDecision::Isolate) | Err(_) => isolate(&mut coordinator, 11),
+            }
+        }
     }
 }

@@ -136,7 +136,8 @@ fn feedback(
 #[cfg(not(test))]
 pub fn run() -> ! {
     let (boot, uuid, local, peer) = broker::boot();
-    if boot == 0 {
+    let service_generation = broker::service_generation();
+    if boot == 0 || service_generation == 0 {
         broker::fatal(0x101);
     }
     let peer_file = include_bytes!(concat!(env!("OUT_DIR"), "/peer.pin"));

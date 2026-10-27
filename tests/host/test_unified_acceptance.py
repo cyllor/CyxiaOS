@@ -12,6 +12,7 @@ from verify_unified import ROOT, bind_build, capture, sha, validate, validate_re
 def bundle(owner=False):
     u=[0]*512;d=[0]*512;r=[0]*1024
     u[:6]=[0x435958554e493031,1,100,1,1000,1000]
+    u[30]=1
     events=[1,2,3,0x211,0x212,0x219];u[6]=len(events)
     for i,e in enumerate(events):u[32+2*i]=e
     u[8]=u[9]=int(owner);u[10]=100*int(owner);u[11]=100*int(owner);u[12]=100*int(owner)
@@ -29,9 +30,21 @@ class Acceptance(unittest.TestCase):
     def test_joint_checks_cannot_accept_partial_evidence(self):
         original=[bundle(),bundle(True)]
         self.assertEqual(len(validate([b'',b''],original,[4,4])),2)
-        for name,index,value in [('DYNAMIC_V13_EVIDENCE',1,1),('DYNAMIC_V13_EVIDENCE',25,31),('UNIFIED_EVIDENCE',36,0),('RUNTIME_V13_EVIDENCE',38,1),('RUNTIME_V13_EVIDENCE',32,2),('UNIFIED_EVIDENCE',6,201),('UNIFIED_EVIDENCE',12,625001),('UNIFIED_EVIDENCE',8,0)]:
+        for name,index,value in [('DYNAMIC_V13_EVIDENCE',1,1),('DYNAMIC_V13_EVIDENCE',25,31),('UNIFIED_EVIDENCE',36,0),('RUNTIME_V13_EVIDENCE',38,1),('RUNTIME_V13_EVIDENCE',32,2),('UNIFIED_EVIDENCE',6,201),('UNIFIED_EVIDENCE',12,625001),('UNIFIED_EVIDENCE',8,0),('UNIFIED_EVIDENCE',30,0),('UNIFIED_EVIDENCE',31,1)]:
             b=copy.deepcopy(original);change(b[1],name,index,value)
             with self.subTest(name=name,index=index),self.assertRaises(ValueError):validate([b'',b''],b,[4,4])
+    def test_service_restart_requires_real_fault_exact_generation_and_second_ready(self):
+        restarted=[bundle(),bundle(True)]
+        for item in restarted:
+            words=list(struct.unpack('<512Q',item['UNIFIED_EVIDENCE']))
+            events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
+            words[6]=len(events);words[30:32]=[2,1];words[32:]=[0]*480
+            for i,event in enumerate(events):words[32+i*2]=event
+            item['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
+        serial=[b'UNIFIED_EL0_FAULT generation=1 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n']*2
+        self.assertEqual(len(validate(serial,restarted,[4,4],expect='service-restart')),2)
+        changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',31,0)
+        with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
     def test_no_ack_cannot_be_mislabelled_successful_handoff(self):
         with self.assertRaises(ValueError):validate([b'DYNAMIC_V13_RECONCILE']*2,[bundle(),bundle(True)],[4,4],expect='no-stop-ack')
     def test_negative_cannot_hide_admitted_authority(self):

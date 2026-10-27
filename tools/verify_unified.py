@@ -23,6 +23,8 @@ def bind_build(path,elf,peer_elf,publics,package,expect):
     require(build['builder_sha256']==sha(ROOT/'tools/build_unified.py'),'builder changed after image build')
     expected_fault=expect if expect in ('hang-once','no-stop-ack') else 'normal'
     require(build['profiles']['fault']==expected_fault and build['profiles']['leave']==(expect=='leave'),'build fault/profile differs from acceptance')
+    expected_service_fault='after-ready' if expect=='service-restart' else 'none'
+    require(build['profiles'].get('service_fault','none')==expected_service_fault,'build service-fault profile differs from acceptance')
     require(build.get('own_private_key_only_verified') is True,'per-node key audit missing')
     require(publics is not None and len(publics)==2 and package is not None,'two public keys and task package required')
     for name,file in zip(('node-a.elf','node-b.elf','node-a.pub','node-b.pub','task.elf'),(elf,peer_elf,*publics,package)):
@@ -44,6 +46,7 @@ def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
     for text,bundle in zip(serial,pages):
         u=struct.unpack('<512Q',bundle['UNIFIED_EVIDENCE']);d=struct.unpack('<512Q',bundle['DYNAMIC_V13_EVIDENCE']);r=struct.unpack('<1024Q',bundle['RUNTIME_V13_EVIDENCE'])
         require(u[0]==0x435958554e493031 and u[1]>0 and u[15]==0 and 0<u[6]<=200,'invalid or truncated unified evidence')
+        require(u[30]>0 and u[30]==u[31]+1,'invalid service generation/restart evidence')
         require(r[0]==0x43595852554e3133 and r[2]>0 and r[2]%2==0 and r[32]==u[1],'incomplete runtime publication or boot mismatch')
         require(u[2]>0 and u[4]>0 and u[5]>0,'EL0 and encrypted transport must execute')
         require(expect=='no-stop-ack' or (d[0]==0x43595844594e3133 and 2<=d[1]<=16),'missing dynamic 1→2→1')
@@ -59,14 +62,20 @@ def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
         require(r[28]>=4 and (r[19]>0 or expect=='no-stop-ack') and r[20]>0 and r[14]>0,'AI/business/isolation did not execute')
         require(r[17]==r[18]==r[38]==0,'runtime rejection or budget violation')
         require(r[4]>=1000 and all(v<=r[4]//100 for v in r[39:42]) and r[35]<=700 and all(v<=900 and v%100==0 for v in r[23:25]),'raw runtime cost exceeds prepaid capacity')
-        require(r[29]=={'normal':0,'leave':0,'hang-once':1,'no-stop-ack':2}[expect],'wrong runtime fault image')
+        require(r[29]=={'normal':0,'leave':0,'service-restart':0,'hang-once':1,'no-stop-ack':2}[expect],'wrong runtime fault image')
         require(r[15]==int(expect=='hang-once'),'model fault was not contained exactly once')
         require(u[10]%100==0 and u[11]<=u[10]*r[4]//10000 and u[12]<=r[4]//100,'remote CPU execution exceeds predebit')
         events=[u[32+2*i] for i in range(min(u[6],200))]
         require(all(event in events for event in ((1,2,3,0x212) if recover else (1,2,3,0x211,0x212,0x219))),'missing TLS/BOUND/READY/close')
         require(not any(0xfe<=event<=0x108 or event>=0xf000 for event in events),'service reported failure')
         if expect=='leave':require(0x221 in events,'missing two-signature durable leave')
-        observations.append(dict(boot_epoch=u[1],task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))
+        if expect=='service-restart':
+            restart=re.search(rb'UNIFIED_SERVICE_RESTART boot=(\d+) generation=2',text)
+            require(u[30:32]==(2,1) and restart is not None and int(restart.group(1))==u[1],'same-boot service restart evidence missing')
+            require(re.search(rb'UNIFIED_EL0_FAULT generation=1 ',text) is not None,'real generation-1 EL0 fault missing')
+            require(all(events.count(event)>=2 for event in (1,2,3,0x212)),'new service generation did not reconcile to READY')
+        else:require(u[30:32]==(1,0),'unexpected service restart in this scenario')
+        observations.append(dict(boot_epoch=u[1],service_generation=u[30],service_restarts=u[31],task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))
     require(sorted(o['task_starts'] for o in observations)==([0,0] if recover else [0,1]) and sorted(o['task_finishes'] for o in observations)==([0,0] if recover else [0,1]),'pure task not uniquely executed')
     return observations
 
@@ -363,7 +372,7 @@ def main():
     for name in ('elf','peer-elf','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--public',type=Path,action='append',required=True);p.add_argument('--package',type=Path,required=True)
     p.add_argument('--disk',type=Path,action='append');p.add_argument('--reconnect',action='store_true')
-    p.add_argument('--expect',choices=('normal','leave','hang-once','no-stop-ack','wrong-pin','no-entropy'),default='normal')
+    p.add_argument('--expect',choices=('normal','leave','service-restart','hang-once','no-stop-ack','wrong-pin','no-entropy'),default='normal')
     p.add_argument('--clock-profile',choices=('icount','wallclock'),default='wallclock',help='icount is an experimental guest clock; neither profile certifies physical realtime')
     p.add_argument('--icount-shift',choices=(0,4),type=int,default=0)
     p.add_argument('--tcg-threads',choices=('single','multi'),default='multi')

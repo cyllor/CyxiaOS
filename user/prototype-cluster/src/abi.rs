@@ -5,7 +5,7 @@ pub const STACK_TOP: u64 = 0x01ff_0000;
 pub const STACK_BYTES: usize = 128 * 1024;
 pub const SVC: u16 = 0x43;
 pub const MAGIC: u64 = 0x4359_5843_4c53_3031;
-pub const VERSION: u64 = 3;
+pub const VERSION: u64 = 4;
 pub const PAYLOAD: usize = 4096;
 pub const OK: u64 = 0;
 pub const AGAIN: u64 = 1;
@@ -40,6 +40,13 @@ pub const OP_YIELD: u64 = 12;
 /// OP_TRACE arg0 distinguishes a terminal service failure from an ordinary event.
 /// This is a value convention; the shared page layout and ABI version are unchanged.
 pub const TRACE_FATAL_BIT: u64 = 1 << 63;
+pub const SERVICE_FAULT_NONE: u64 = 0;
+pub const SERVICE_FAULT_AFTER_READY: u64 = 1;
+/// Native restart evidence injects one real synchronous EL0 exception only
+/// after generation 1 has completed authenticated peer reconciliation.
+pub const fn service_fault_due(profile: u64, generation: u64, event: u64) -> bool {
+    profile == SERVICE_FAULT_AFTER_READY && generation == 1 && event == 0x212
+}
 /// POLL value: 0 disconnected, 1 connected. Epoch changes on every connection.
 /// STORE offset selects a record chunk; arg0 record key; arg1 total record
 /// bytes. PUT arg2 transaction phase: 0 stage,1 commit after complete staging.
@@ -208,6 +215,8 @@ pub struct Shared {
     pub monotonic_ms: u64,
     pub unix_seconds: u64,
     pub boot_epoch: u64,
+    /// Same-BootEpoch supervisor generation; increases on every service reset.
+    pub service_generation: u64,
     pub connection_epoch: u64,
     pub uuid: [u8; 16],
     pub local_node: [u8; 32],
@@ -230,5 +239,13 @@ pub fn valid_request(op: u64, len: u64, offset: u64) -> bool {
         OP_TIME | OP_POLL | OP_CLOSE | OP_STORE_FLUSH | OP_YIELD => len == 0 && offset == 0,
         _ => false,
     }
+}
+pub fn valid_service_identity(shared: &Shared, boot_epoch: u64, generation: u64) -> bool {
+    boot_epoch != 0
+        && generation != 0
+        && shared.magic == MAGIC
+        && shared.version == VERSION
+        && shared.boot_epoch == boot_epoch
+        && shared.service_generation == generation
 }
 const _: () = assert!(core::mem::size_of::<Shared>() <= SHARED_BYTES);

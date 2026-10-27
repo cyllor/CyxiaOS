@@ -61,3 +61,56 @@ fn rejects_dynamic_interpreter_truncation_overflow_and_bad_alignment() {
     b[112..120].copy_from_slice(&65536u64.to_le_bytes());
     assert!(Image::parse(&b).is_err());
 }
+
+#[test]
+fn same_boot_reset_restores_only_writable_segments_and_zeroes_their_bss() {
+    let mut b = elf();
+    for (index, value) in (0u8..16).enumerate() {
+        b[12288 + index] = value.wrapping_mul(7).wrapping_add(3);
+    }
+    let image = Image::parse(&b).unwrap();
+    let mut private = vec![0xa5; (LIMIT - BASE) as usize];
+    image.reset_writable(&mut private).unwrap();
+
+    assert_eq!(&private[..8192], &[0xa5; 8192]);
+    assert_eq!(&private[8192..8208], &b[12288..12304]);
+    assert!(private[8208..16384].iter().all(|byte| *byte == 0));
+    assert_eq!(private[16384], 0xa5);
+}
+
+#[test]
+fn same_boot_reset_rejects_a_backing_window_that_cannot_hold_the_image() {
+    let b = elf();
+    let image = Image::parse(&b).unwrap();
+    let mut short = vec![0; 12287];
+    assert!(image.reset_writable(&mut short).is_err());
+}
+
+#[test]
+fn same_boot_reset_clears_the_mapped_tail_past_memsz() {
+    let mut b = elf();
+    let rw = 64 + 2 * 56;
+    b[rw + 40..rw + 48].copy_from_slice(&5000u64.to_le_bytes());
+    let image = Image::parse(&b).unwrap();
+    let mut private = vec![0xa5; (LIMIT - BASE) as usize];
+    image.reset_writable(&mut private).unwrap();
+
+    assert!(private[8208..16384].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn restart_can_reset_one_writable_page_per_paid_turn() {
+    let b = elf();
+    let image = Image::parse(&b).unwrap();
+    let mut private = vec![0xa5; (LIMIT - BASE) as usize];
+    assert_eq!(image.writable_pages(), 2);
+
+    image.reset_writable_page(&mut private, 0).unwrap();
+    assert_eq!(&private[8192..8208], &b[12288..12304]);
+    assert!(private[8208..12288].iter().all(|byte| *byte == 0));
+    assert!(private[12288..16384].iter().all(|byte| *byte == 0xa5));
+
+    image.reset_writable_page(&mut private, 1).unwrap();
+    assert!(private[12288..16384].iter().all(|byte| *byte == 0));
+    assert!(image.reset_writable_page(&mut private, 2).is_err());
+}

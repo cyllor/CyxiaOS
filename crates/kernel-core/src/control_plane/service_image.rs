@@ -114,4 +114,76 @@ impl<'a> Image<'a> {
         }
         Ok(result)
     }
+
+    /// Restore only service-private writable segments for a same-boot restart.
+    /// Executable/read-only mappings and bytes outside mapped RW memory remain
+    /// untouched; file-backed initialization precedes zeroed BSS exactly as at
+    /// the first load.
+    pub fn reset_writable(&self, private: &mut [u8]) -> Result<(), Error> {
+        self.validate_writable_backing(private)?;
+        for page in 0..self.writable_pages() {
+            self.reset_writable_page(private, page)?;
+        }
+        Ok(())
+    }
+
+    pub fn writable_pages(&self) -> usize {
+        self.segments[..self.count]
+            .iter()
+            .filter(|segment| segment.writable)
+            .map(|segment| segment.memory_size.div_ceil(4096))
+            .sum()
+    }
+
+    /// Reset one mapped RW page. Callers use this as a bounded paid restart
+    /// turn; the final page is cleared beyond `p_memsz` because that tail is
+    /// still writable through the page-table mapping.
+    pub fn reset_writable_page(&self, private: &mut [u8], mut ordinal: usize) -> Result<(), Error> {
+        self.validate_writable_backing(private)?;
+        for segment in self.segments[..self.count]
+            .iter()
+            .filter(|segment| segment.writable)
+        {
+            let pages = segment.memory_size.div_ceil(4096);
+            if ordinal >= pages {
+                ordinal -= pages;
+                continue;
+            }
+            let segment_start =
+                usize::try_from(segment.address - BASE).map_err(|_| Error::Invalid)?;
+            let page_offset = ordinal.checked_mul(4096).ok_or(Error::Invalid)?;
+            let start = segment_start
+                .checked_add(page_offset)
+                .ok_or(Error::Invalid)?;
+            let end = start.checked_add(4096).ok_or(Error::Invalid)?;
+            private[start..end].fill(0);
+            if page_offset < segment.file_size {
+                let bytes = (segment.file_size - page_offset).min(4096);
+                private[start..start + bytes].copy_from_slice(
+                    &self.bytes[segment.offset + page_offset..segment.offset + page_offset + bytes],
+                );
+            }
+            return Ok(());
+        }
+        Err(Error::Invalid)
+    }
+
+    fn validate_writable_backing(&self, private: &[u8]) -> Result<(), Error> {
+        for segment in self.segments[..self.count]
+            .iter()
+            .filter(|segment| segment.writable)
+        {
+            let start = usize::try_from(segment.address - BASE).map_err(|_| Error::Invalid)?;
+            let mapped = segment
+                .memory_size
+                .div_ceil(4096)
+                .checked_mul(4096)
+                .ok_or(Error::Invalid)?;
+            let end = start.checked_add(mapped).ok_or(Error::Invalid)?;
+            if private.get(start..end).is_none() {
+                return Err(Error::Invalid);
+            }
+        }
+        Ok(())
+    }
 }

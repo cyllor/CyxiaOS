@@ -249,9 +249,9 @@ pub fn prepare(shared: &mut Shared) {
     READY.store(true, Ordering::Release);
     publish_view();
 }
-pub fn observe(shared: &Shared) {
+pub fn observe(shared: &Shared, boot_epoch: u64, service_generation: u64) {
     owner();
-    if shared.version == abi::VERSION && shared.magic == abi::MAGIC {
+    if abi::valid_service_identity(shared, boot_epoch, service_generation) {
         let before = unsafe { core::ptr::addr_of!(shared.feedback_sequence).read_volatile() };
         if before == 0 || before & 1 != 0 {
             return;
@@ -280,6 +280,19 @@ pub fn observe(shared: &Shared) {
         }
         publish_view();
     }
+}
+/// The synchronous EL0 fault already proves that the old service context is
+/// stopped. Withdraw only its volatile observation/feedback publication;
+/// protected desired actions, effective policy, one-shot requests and replay
+/// custody stay in their kernel owners for exact reconciliation by the next
+/// generation.
+pub fn service_stopped() {
+    owner();
+    READY.store(false, Ordering::Release);
+    unsafe {
+        *core::ptr::addr_of_mut!(FEEDBACK) = DomainFeedback::default();
+    }
+    publish_view();
 }
 fn matching_receipt(desired: Desired, receipt: PolicyReceiptWire) -> bool {
     receipt.version == desired.stamp.version

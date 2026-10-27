@@ -70,5 +70,6 @@ pub mod image;
 pub mod service;
 
 pub mod service_image;
+pub mod service_restart;
 
 pub mod task_admission;

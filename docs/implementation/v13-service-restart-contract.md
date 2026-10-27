@@ -1,10 +1,21 @@
 # Same-boot EL0 service recovery contract
 
-This records the next integration boundary for the v1.3 recovery work. It is
-not a claim that the unified native service currently restarts. The current
-`unified.rs` fault branch closes its TCP endpoint and enters `isolate()`;
-same-BootEpoch custody lookup/reconciliation exists, but is not reached by a
-fresh native service after that fault.
+This records the v1.3 recovery boundary and the current implementation status.
+The unified runtime now supervises a same-BootEpoch service generation, closes
+the old stream after a synchronous EL0 fault, resets private RW pages, stack,
+shared ABI and register context in paid page-sized turns, then starts the next
+generation. Kernel task, storage, policy, request, NIC and DMA custody are not
+reinitialized. A second fault before authenticated peer reconciliation isolates
+the service deterministically.
+
+This is not yet a native acceptance claim. Host lifecycle/image/custody tests
+pass and an `after-ready` build profile injects a real generation-1 `BRK`, but
+the local QEMU 10.2.2 wallclock and icount attempts on 2026-10-27 reached only
+the pre-TLS service events before their 180-second runner deadline. Their
+source-bound `FAIL` evidence is retained under
+`artifacts/v13-service-restart-native-20261027*`. No restart row may be marked
+PASS until a native run reaches the injected fault and independently verifies
+BootEpoch stability, generation 1→2, one restart and second-generation READY.
 
 ## Existing ownership that must survive
 
@@ -61,11 +72,13 @@ service or permits old receipt generations to settle new actions.
 
 ## Required regressions and native evidence
 
-Host regressions must cover incomplete PUT staging, poisoning persistence,
-service-generation overflow, context reset, partial reset/retry, old feedback,
-one-shot placement, returned-but-unconsumed results, and duplicate START/CLOSE.
-The actual supervisor state machine must be tested, in addition to the custody
-codec and driver reconciliation tests already present.
+Host regressions cover the supervisor state machine, generation overflow,
+private-image/context reset, mapped-tail clearing, stale feedback identity,
+same-boot custody lookup and duplicate execution prevention. Incomplete PUT
+staging and poisoning have independent storage coverage. Partial reset/retry,
+explicit one-shot placement retention and returned-but-unconsumed result
+coverage must remain visible in the final cross-subsystem gate; existing driver
+custody tests do not substitute for the native fault scenarios below.
 
 Native fault injection must stop the real service at START_PENDING, after task
 enqueue, after completion before service consumption, and around durable result

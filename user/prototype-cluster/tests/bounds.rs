@@ -35,6 +35,28 @@ fn repeated_disconnect_allocation_cycles_restore_entire_quota() {
 }
 
 #[test]
+fn feedback_identity_requires_exact_boot_and_service_generation() {
+    let mut shared: Shared = unsafe { core::mem::zeroed() };
+    shared.magic = MAGIC;
+    shared.version = VERSION;
+    shared.boot_epoch = 17;
+    shared.service_generation = 4;
+    assert!(valid_service_identity(&shared, 17, 4));
+    assert!(!valid_service_identity(&shared, 16, 4));
+    assert!(!valid_service_identity(&shared, 17, 3));
+    shared.version -= 1;
+    assert!(!valid_service_identity(&shared, 17, 4));
+}
+
+#[test]
+fn native_restart_fault_is_one_shot_and_bound_to_ready() {
+    assert!(service_fault_due(SERVICE_FAULT_AFTER_READY, 1, 0x212));
+    assert!(!service_fault_due(SERVICE_FAULT_AFTER_READY, 2, 0x212));
+    assert!(!service_fault_due(SERVICE_FAULT_AFTER_READY, 1, 0x211));
+    assert!(!service_fault_due(SERVICE_FAULT_NONE, 1, 0x212));
+}
+
+#[test]
 fn advertised_result_and_tombstone_capacity_fits_bounded_eight_mib_quota() {
     let mut arena = Arena::new(0x4000000, 8 * 1024 * 1024);
     let placements = arena
