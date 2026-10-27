@@ -888,3 +888,22 @@ historical-evidence skip), formatting and configured strict AArch64 Clippy
 pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-single-writer-preparation-banks` passes both
 selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
+
+Run `40432550309` confirms the single-writer preparation banks cross ordinary
+preparation and reach the global task bank. It reports CPU0 service thread
+`257:1` at network stage 47 using 6,556,934/2,500,000 ns and CPU3 dynamic EL0
+thread `4096:4` using 8,398,618 ns after receiving only a 4,019,971 ns tail
+grant. The service stage was still written through a shared atomic inside each
+measured segment; it is now a dedicated CPU0-only volatile diagnostic symbol
+read only from a stopped snapshot. Historical images remain decodable through
+the former unified-evidence word. Local dynamic tasks already declare a 10 ms
+minimum execution envelope, but the native admission wrapper let them enter on
+smaller window-tail grants. Such grants are now resized to the unchanged 10 ms
+envelope or completed unused and deferred through the existing scheduler path.
+No CPU budget, task budget, deadline, authority or overrun threshold changes.
+The full 619 host tests (two environment skips), 145 v1.3 tests (one
+historical-evidence skip), 69 evidence-tool tests, formatting and configured
+strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-task-stage-tail` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,776/65,536 bytes. Patched-QEMU Linux replay is
+required before either observed fault can be considered closed.

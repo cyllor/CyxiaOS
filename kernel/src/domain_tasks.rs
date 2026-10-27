@@ -486,6 +486,11 @@ const BUILTIN_WINDOW_HEADROOM_NS: u64 = 20_000_000;
 // exhausted before QEMU delivers the timer PPI, so leave it undispatched for
 // the next budget window instead of creating an unavoidable overrun.
 const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;
+// A dynamic EL0 task declares the same 10 ms minimum execution envelope when
+// admitted. Do not enter it on a smaller window-tail grant: the exception
+// entry/exit and input setup are indivisible fixed costs, and the existing
+// scheduler completion path will make the task runnable in the next window.
+const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 10_000_000;
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -880,6 +885,8 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
             };
             let safety = if d.thread == builtin(slot) {
                 BUILTIN_MIN_GRANT_NS
+            } else if d.thread.id >= 0x1000 {
+                DYNAMIC_EL0_MIN_GRANT_NS
             } else {
                 match task_index(&s.tasks, d.thread) {
                     Ok(i)

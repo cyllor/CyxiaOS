@@ -73,7 +73,7 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
-            "DOMAIN_PREPARATION_REJECTIONS": 5184}
+            "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8}
 
 
 def require(condition, message):
@@ -513,6 +513,10 @@ def diagnostics(guest, bundle):
             guest["diagnostic_errors"].append({"field": key, "error": str(error)})
 
     read("unified_words", lambda: list(words(bundle.get("UNIFIED_EVIDENCE", b""), 512)[:32]))
+    if "UNIFIED_SERVICE_STAGE" in bundle:
+        read("service_stage_word", lambda: words(bundle["UNIFIED_SERVICE_STAGE"], 1)[0])
+    else:
+        guest["service_stage_word"] = None
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
@@ -555,7 +559,9 @@ def diagnostics(guest, bundle):
             "mask": task_words[2] if len(task_words) > 2 else None,
             "overruns": task_words[3] if len(task_words) > 3 else None,
             "cpu_spent_ns": task_words[4:7] if len(task_words) >= 7 else None,
-            "service_stage": (guest.get("unified_words") or [None] * 31)[30],
+            "service_stage": guest.get("service_stage_word")
+            if guest.get("service_stage_word") is not None
+            else (guest.get("unified_words") or [None] * 31)[30],
             "sticky_count": sticky_words[1] if len(sticky_words) > 1 else 0,
             "receipts": rows,
         }

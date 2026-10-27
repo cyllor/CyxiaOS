@@ -472,6 +472,31 @@ class EvidenceParserTests(unittest.TestCase):
         self.assertEqual(guest["preparation_detail"], detail)
         self.assertEqual(guest["preparation_context"], context)
 
+    def test_standalone_service_stage_overrides_legacy_unified_word(self):
+        unified = [0] * 512
+        unified[30] = 41
+        sticky = [0] * 32
+        sticky[0] = 1
+        guest = {}
+        with self.assertRaisesRegex(ValueError, r'"service_stage":47'):
+            diagnostics(guest, {
+                "UNIFIED_EVIDENCE": encode(unified),
+                "UNIFIED_SERVICE_STAGE": encode([47]),
+                "TASK_OVERRUN_EVIDENCE": encode(sticky),
+            })
+        self.assertEqual(guest["service_stage_word"], 47)
+
+    def test_legacy_service_stage_remains_available(self):
+        unified = [0] * 512
+        unified[30] = 43
+        sticky = [0] * 32
+        sticky[0] = 1
+        with self.assertRaisesRegex(ValueError, r'"service_stage":43'):
+            diagnostics({}, {
+                "UNIFIED_EVIDENCE": encode(unified),
+                "TASK_OVERRUN_EVIDENCE": encode(sticky),
+            })
+
     def test_incomplete_c_credit_failure_is_not_a_successful_capture(self):
         receipt = [0] * 64
         receipt[24] = 1

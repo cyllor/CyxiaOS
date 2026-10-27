@@ -2,6 +2,7 @@
 //! concurrent local-model control and independently scheduled business cores.
 use crate::virtio_platform::Board;
 use core::{
+    cell::UnsafeCell,
     fmt::Write,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -48,6 +49,19 @@ pub struct Evidence {
 pub static UNIFIED_EVIDENCE: Evidence = Evidence {
     words: [const { AtomicU64::new(0) }; 512],
 };
+#[repr(transparent)]
+struct ServiceStage(UnsafeCell<u64>);
+unsafe impl Sync for ServiceStage {}
+#[used]
+#[unsafe(no_mangle)]
+static UNIFIED_SERVICE_STAGE: ServiceStage = ServiceStage(UnsafeCell::new(0));
+fn service_stage(stage: u64) {
+    // CPU0 is the sole writer and no live Rust code reads this diagnostic.
+    // The verifier consumes it only from a stopped guest snapshot, so a
+    // volatile store preserves the evidence without an atomic TCG helper in a
+    // measured service segment.
+    unsafe { UNIFIED_SERVICE_STAGE.0.get().write_volatile(stage) }
+}
 fn line(args: core::fmt::Arguments<'_>) {
     struct Text {
         bytes: [u8; 256],
@@ -304,13 +318,13 @@ fn network_turn(
     }
     let mut started = timer::cpu_ticks();
     let mut network_stage = 40u64;
-    UNIFIED_EVIDENCE.words[30].store(network_stage, Ordering::Release);
+    service_stage(network_stage);
     let mut checkpoint = || {
         finish_service(started);
         mechanism_progress(coordinator);
         started = resume_network_service(coordinator);
         network_stage = network_stage.saturating_add(1);
-        UNIFIED_EVIDENCE.words[30].store(network_stage, Ordering::Release);
+        service_stage(network_stage);
     };
     let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
     if matches!(state, Ok(TcpState::Established)) && epoch != 0 {
@@ -553,23 +567,23 @@ pub fn run(info: &BootInfo) -> ! {
             if learning_install_stage < 4 {
                 match crate::domain_tasks::service_segment(|| match learning_install_stage {
                     0 => {
-                        UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
+                        service_stage(1);
                         crate::smp::prototype_runtime::install_learning_capture_storage(
                             *LOCAL, boot.epoch,
                         )
                     }
                     1 => {
-                        UNIFIED_EVIDENCE.words[30].store(1, Ordering::Release);
+                        service_stage(1);
                         crate::smp::prototype_runtime::install_learning_history_storage(
                             *LOCAL, boot.epoch,
                         )
                     }
                     2 => {
-                        UNIFIED_EVIDENCE.words[30].store(2, Ordering::Release);
+                        service_stage(2);
                         crate::peer_replay::init(boot.epoch)
                     }
                     3 => {
-                        UNIFIED_EVIDENCE.words[30].store(3, Ordering::Release);
+                        service_stage(3);
                         crate::learning_replay::init()
                     }
                     _ => Ok(()),
@@ -624,7 +638,7 @@ pub fn run(info: &BootInfo) -> ! {
                 progress(&mut coordinator, &mut tcp, stream_epoch)
             });
             let _ = service_work(&mut coordinator, &mut tcp, stream_epoch, |advance| {
-                UNIFIED_EVIDENCE.words[30].store(5, Ordering::Release);
+                service_stage(5);
                 crate::domain_services::service(Board.now_ns(), advance)
             });
             update_probe();
@@ -634,7 +648,7 @@ pub fn run(info: &BootInfo) -> ! {
                 continue;
             };
             let entered = timer::cpu_ticks();
-            UNIFIED_EVIDENCE.words[30].store(6, Ordering::Release);
+            service_stage(6);
             unsafe {
                 if refresh_input {
                     // An IRQ can interrupt an EL0 structure copy. Keep input
