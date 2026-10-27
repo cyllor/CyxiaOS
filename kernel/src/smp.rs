@@ -1019,8 +1019,9 @@ pub(crate) unsafe fn enter_service(
         if capture_boundary {
             user::enter(context, root);
         } else {
-            // The only non-captured entries are audited mapping probes. They
-            // fault before FP/SIMD use, which remains trapped architecturally.
+            // The only non-captured entries are audited mapping probes. Their
+            // immutable executable range has no FP/SIMD opcode and faults on
+            // its first memory access, so no vector state is touched.
             user::enter_integer_probe(context, root);
         }
         RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);

@@ -1,12 +1,12 @@
 //! Per-CPU EL0 transitions. All memory management and policy belongs to the caller.
 //!
 //! Ordinary EL0 contexts own the complete Advanced SIMD/FP register bank while
-//! entered. Audited integer-only fault probes instead keep FP/SIMD trapped and
-//! never touch that bank. Kernel Rust, exception handlers and every routine they
-//! call must use the soft-float ABI and must not access FP/SIMD registers. Only
-//! `user.S` may touch them. This permits the lower-EL dispatcher to capture integer
-//! registers before the return assembly conditionally saves FP/SIMD, without
-//! corrupting the interrupted process's values.
+//! entered. Audited integer-only fault probes instead execute immutable code with
+//! no FP/SIMD opcodes and never touch that bank or its feature controls. Kernel
+//! Rust, exception handlers and every routine they call must use the soft-float
+//! ABI and must not access FP/SIMD registers. Only `user.S` may touch them. This
+//! permits the lower-EL dispatcher to capture integer registers before the return
+//! assembly conditionally saves FP/SIMD, without corrupting process values.
 //!
 //! Reference: Arm Cortex-A53 TRM, CPACR_EL1 and AArch64 thread registers:
 //! <https://documentation-service.arm.com/static/6040c321ee937942ba301626>.
@@ -112,12 +112,13 @@ pub unsafe fn enter(context: &mut Context, root: u64) {
     unsafe { enter_inner(context, root, true) };
 }
 /// Enter a protection probe that must fault before executing any FP/SIMD
-/// instruction. CPACR traps such instructions and the context's initialized
-/// FP/SIMD bank remains untouched, so no state crosses the probe boundary.
+/// instruction. Its verified immutable code contains no such opcode. The
+/// transition leaves both feature controls and the initialized FP/SIMD bank
+/// untouched, avoiding architectural access to another context's state.
 ///
 /// # Safety
 /// In addition to [`enter`]'s contract, the entered code must be an audited
-/// integer-only fault probe; any FP/SIMD trap must be treated as probe failure.
+/// integer-only fault probe whose executable range was checked for FP/SIMD.
 pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
     unsafe { enter_inner(context, root, false) };
 }
@@ -126,7 +127,7 @@ pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
 /// suspended. No Rust reference into the context is live in the user program.
 /// Neither this function nor the exception/IRQ path may use FP/SIMD or modify
 /// TPIDR_EL0. Enabled live hardware values are saved by user.S after capture returns;
-/// integer-only probes keep FP/SIMD trapped and leave their context bank untouched.
+/// integer-only probes do not execute FP/SIMD and leave their context bank untouched.
 pub unsafe fn capture(
     regs: [u64; 31],
     pc: u64,

@@ -20,18 +20,17 @@ cyxia_enter_user:
  mov x30, x0
  str x30, [sp, #104]
  str x1, [sp, #128]
+ cbz x1, .Luser_features_configured
  mrs x9, cpacr_el1
  str x9, [sp, #112]
- // Enable FP at EL0 and EL1 only for full restoration. Integer probes keep it
- // trapped. All kernel and IRQ code is soft-float; SVE and SME always stay trapped.
+ // Enable FP at EL0 and EL1 only for full restoration. The immutable integer
+ // probe has no FP/SIMD opcodes and leaves feature controls completely untouched.
  bic x9, x9, #0x30000
  bic x9, x9, #0x3000000
- bic x9, x9, #0x300000
- cbz x1, .Luser_fp_configured
  orr x9, x9, #0x300000
-.Luser_fp_configured:
  msr cpacr_el1, x9
  isb
+.Luser_features_configured:
  mrs x9, tpidr_el0
  str x9, [sp, #120]
  ldr x9, [x30, #296]
@@ -128,9 +127,11 @@ cyxia_user_return:
  // Restore the original EL1 TLS and feature controls before returning to Rust.
  ldr x9, [sp, #120]
  msr tpidr_el0, x9
+ cbz x10, .Luser_features_restored
  ldr x9, [sp, #112]
  msr cpacr_el1, x9
  isb
+.Luser_features_restored:
  ldp x19, x20, [sp, #0]
  ldp x21, x22, [sp, #16]
  ldp x23, x24, [sp, #32]

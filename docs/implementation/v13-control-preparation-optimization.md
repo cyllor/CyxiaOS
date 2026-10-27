@@ -305,6 +305,19 @@ pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-integer-state` is
 `BUILT_NOT_RUN`; both selected stack paths remain 33,920/65,536 bytes. Linux
 timing remains required.
 
+Run `40424353449` shows that changing CPACR for every integer probe is
+counterproductive under the pinned QEMU: sequence 584 phase 2 rises to
+34,467,340/8,000,000 ns. The dedicated path now leaves CPACR unchanged as well
+as skipping SIMD/FP loads and stores. This remains isolated because the probe's
+fixed entry executes immutable `smp_user` code, its first selected memory access
+must fault, and the binary instruction gate rejects FP/SIMD outside the explicit
+transition routines. Ordinary task state ownership is unchanged. Local and
+Linux validation are required. All 615 host tests (two environment skips),
+formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-probe-no-feature-churn` is `BUILT_NOT_RUN`;
+both selected stack paths remain 33,920/65,536 bytes. Linux timing remains
+required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

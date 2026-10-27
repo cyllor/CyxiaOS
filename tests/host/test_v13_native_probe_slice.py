@@ -37,7 +37,8 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("enter_inner(context, root, false)", arch)
         self.assertIn("cbz x1, .Luser_integer_restore", assembly)
         self.assertIn("cbz x10, .Luser_integer_save", assembly)
-        self.assertIn("bic x9, x9, #0x300000", assembly)
+        self.assertIn("cbz x1, .Luser_features_configured", assembly)
+        self.assertIn("cbz x10, .Luser_features_restored", assembly)
 
 
 if __name__ == "__main__":
