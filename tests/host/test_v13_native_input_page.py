@@ -32,7 +32,10 @@ class NativeInputPage(unittest.TestCase):
 
         self.assertIn("DOMAIN_PREPARATION_DETAIL.0[base + phase + 1].store(0", source)
         self.assertIn("DOMAIN_PREPARATION_EVIDENCE.0[base + phase + 1].store(0", source)
-        self.assertIn("DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(0", source)
+        self.assertIn("struct PreparationContextRow", source)
+        self.assertIn("published: AtomicU64", source)
+        self.assertIn(".write_volatile(value)", source)
+        self.assertIn(".published\n        .store(0, Ordering::Release)", source)
 
     def test_task_target_projection_does_not_reborrow_mutable_owner(self):
         source = (ROOT / "kernel/src/domain_tasks.rs").read_text()

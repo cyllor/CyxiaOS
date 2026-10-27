@@ -1,6 +1,9 @@
 //! Control CPUs own proposal publication. Isolated EL0 scores immutable candidates; executors
 //! report real completion independently, with no inference in business paths.
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use cyxia_arch_aarch64::timer;
 use cyxia_prototype::{
     domains::stability::{Boundary, Guard as StabilityGuard, ServiceWindow, WindowOutcome},
@@ -27,11 +30,39 @@ struct PreparationDetail([core::sync::atomic::AtomicU64; 32]);
 static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
     PreparationDetail([const { core::sync::atomic::AtomicU64::new(0) }; 32]);
 #[repr(C, align(64))]
-struct PreparationContext([core::sync::atomic::AtomicU64; 16]);
+struct PreparationContextRow {
+    payload: UnsafeCell<[u64; 7]>,
+    published: AtomicU64,
+}
+unsafe impl Sync for PreparationContextRow {}
+impl PreparationContextRow {
+    const fn new() -> Self {
+        Self {
+            payload: UnsafeCell::new([0; 7]),
+            published: AtomicU64::new(0),
+        }
+    }
+    fn store(&self, offset: usize, value: u64) {
+        // This row has exactly one CPU writer and no live Rust reader. The
+        // independent verifier reads it only from a stopped guest snapshot;
+        // published is the release validity word for partial live updates.
+        unsafe {
+            self.payload
+                .get()
+                .cast::<u64>()
+                .add(offset)
+                .write_volatile(value);
+        }
+    }
+}
+#[repr(C, align(64))]
+struct PreparationContext([PreparationContextRow; 2]);
 #[used]
 #[unsafe(no_mangle)]
 static DOMAIN_PREPARATION_CONTEXT: PreparationContext =
-    PreparationContext([const { core::sync::atomic::AtomicU64::new(0) }; 16]);
+    PreparationContext([const { PreparationContextRow::new() }; 2]);
+const _: () = assert!(core::mem::size_of::<PreparationContextRow>() == 64);
+const _: () = assert!(core::mem::size_of::<PreparationContext>() == 128);
 fn preparation_detail(phase: usize) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
@@ -68,11 +99,12 @@ fn clear_preparation_context() {
     if !(1..=2).contains(&cpu) {
         return;
     }
-    let base = (cpu - 1) * 8;
     // Word 7 is the release-published validity/start field. Clearing it makes
     // the older payload in words 0..6 explicitly invalid until the next
     // preparation_lookup/preparation_context publication completes.
-    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(0, Ordering::Release);
+    DOMAIN_PREPARATION_CONTEXT.0[cpu - 1]
+        .published
+        .store(0, Ordering::Release);
 }
 fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started: u64) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
@@ -86,7 +118,7 @@ fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started
         TargetSource::Storage => 4,
         TargetSource::Platform => 5,
     };
-    let base = (cpu - 1) * 8;
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
     for (offset, value) in [
         family as u64 + 1,
         u64::from(descriptor.domain),
@@ -99,16 +131,16 @@ fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started
     .into_iter()
     .enumerate()
     {
-        DOMAIN_PREPARATION_CONTEXT.0[base + offset].store(value, Ordering::Relaxed);
+        row.store(offset, value);
     }
-    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(started, Ordering::Release);
+    row.published.store(started, Ordering::Release);
 }
 fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, started: u64) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
         return;
     }
-    let base = (cpu - 1) * 8;
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
     for (offset, value) in [
         family as u64 + 1,
         u64::from(descriptor.domain),
@@ -121,9 +153,9 @@ fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, sta
     .into_iter()
     .enumerate()
     {
-        DOMAIN_PREPARATION_CONTEXT.0[base + offset].store(value, Ordering::Relaxed);
+        row.store(offset, value);
     }
-    DOMAIN_PREPARATION_CONTEXT.0[base + 7].store(started, Ordering::Release);
+    row.published.store(started, Ordering::Release);
 }
 fn preparation_current(current: Action) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
@@ -131,9 +163,9 @@ fn preparation_current(current: Action) {
         return;
     }
     let (_, _, a, b) = current.order();
-    let base = (cpu - 1) * 8;
-    DOMAIN_PREPARATION_CONTEXT.0[base + 5].store(a, Ordering::Relaxed);
-    DOMAIN_PREPARATION_CONTEXT.0[base + 6].store(b, Ordering::Release);
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
+    row.store(5, a);
+    row.store(6, b);
 }
 #[path = "domain_control/core_replay.rs"]
 pub mod core_replay;

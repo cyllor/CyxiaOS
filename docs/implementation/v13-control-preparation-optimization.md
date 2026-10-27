@@ -859,3 +859,18 @@ historical-evidence skip), all 71 driver tests, formatting and configured
 strict AArch64 Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-target-projection-scope-sha-v2` passes both
 selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
+
+Run `40431320483` confirms the accelerated replay prefix falls from about
+4.737 ms to 0.606 ms, while phase 3 still consumes 10,108,325/2,500,000 ns.
+The remaining marker-0-to-marker-1 interval is about 8.640 ms even after the
+task target lookup became a lock-free immutable projection. That interval also
+published seven Relaxed atomic diagnostic payload words, each translated as an
+expensive TCG atomic helper. Preparation context rows now have seven
+single-writer volatile payload words followed by the same AtomicU64 Release
+start/validity word. The stopped-snapshot ABI remains exactly 16 u64 words
+(128 bytes), and no live Rust reader observes the payload without its release
+publication. Decision work and synchronization are unchanged. The full 618
+host tests (two environment skips), 144 v1.3 tests (one historical-evidence
+skip), formatting and configured strict AArch64 Clippy pass. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-single-writer-preparation-context` passes
+both selected stack paths at 33,776/65,536 bytes. Linux replay is pending.
