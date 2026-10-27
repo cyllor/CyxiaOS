@@ -1016,7 +1016,13 @@ pub(crate) unsafe fn enter_service(
             }
         }
         RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence, Ordering::Release);
-        user::enter(context, root);
+        if capture_boundary {
+            user::enter(context, root);
+        } else {
+            // The only non-captured entries are audited mapping probes. They
+            // fault before FP/SIMD use, which remains trapped architecturally.
+            user::enter_integer_probe(context, root);
+        }
         RECORD_SLICE_EXCEPTION[slot].store(false, Ordering::Release);
         if capture_boundary {
             if let Some(index) = capture_index {

@@ -292,6 +292,19 @@ and 141 v1.3 tests (one historical-evidence skip) pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-probe-no-a02` is `BUILT_NOT_RUN`; both
 selected stack paths remain 33,920/65,536 bytes. Linux timing remains required.
 
+Run `40423377023` reduces phase 2 to 8,460,697/8,000,000 ns at sequence
+583, confirming that capture exclusion removed real work but that the generic
+EL0 transition remains too large for the probe envelope. That transition
+eagerly restores and saves all 32 SIMD/FP registers even though each audited
+mapping probe must fault on its first integer memory access. A dedicated
+integer-only probe entry now clears CPACR FPEN, so unexpected FP/SIMD execution
+traps and fails validation, and skips only the unused SIMD/FP loads and stores.
+Ordinary EL0 entries still restore and save the complete bank. All 615 host
+tests (two environment skips), formatting and configured strict AArch64 Clippy
+pass. Exact build `/tmp/cyxia-prototype.lcqCJ7/build-probe-integer-state` is
+`BUILT_NOT_RUN`; both selected stack paths remain 33,920/65,536 bytes. Linux
+timing remains required.
+
 Run `40421014889` remains in phase 2 at sequence 583 with
 8,773,658/8,000,000 ns. The previously attempted index optimization paid for
 three additional atomic handoffs. The verified registration index is now kept

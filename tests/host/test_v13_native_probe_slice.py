@@ -24,11 +24,20 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("if capture_boundary", entry)
         self.assertIn("a02_capture::enter(task);", entry)
         self.assertIn("a02_capture::returned();", entry)
+        self.assertIn("user::enter_integer_probe(context, root);", entry)
         native = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
         self.assertEqual(native.count("!worker.native.probing,"), 2)
         self.assertIn("if record_slice_evidence && slot < 4", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(record_slice_evidence", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire)", entry)
+
+        arch = (ROOT / "crates/arch-aarch64/src/user.rs").read_text()
+        assembly = (ROOT / "crates/arch-aarch64/src/user.S").read_text()
+        self.assertIn("pub unsafe fn enter_integer_probe", arch)
+        self.assertIn("enter_inner(context, root, false)", arch)
+        self.assertIn("cbz x1, .Luser_integer_restore", assembly)
+        self.assertIn("cbz x10, .Luser_integer_save", assembly)
+        self.assertIn("bic x9, x9, #0x300000", assembly)
 
 
 if __name__ == "__main__":

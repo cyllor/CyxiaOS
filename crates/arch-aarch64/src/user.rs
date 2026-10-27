@@ -1,10 +1,12 @@
 //! Per-CPU EL0 transitions. All memory management and policy belongs to the caller.
 //!
-//! EL0 owns the complete Advanced SIMD/FP register bank while entered. Kernel Rust,
-//! exception handlers and every routine they call must use the soft-float ABI and
-//! must not access FP/SIMD registers. Only `user.S` may touch them. This permits the
-//! lower-EL dispatcher to capture integer registers before the return assembly
-//! saves FP/SIMD, without corrupting the interrupted process's values.
+//! Ordinary EL0 contexts own the complete Advanced SIMD/FP register bank while
+//! entered. Audited integer-only fault probes instead keep FP/SIMD trapped and
+//! never touch that bank. Kernel Rust, exception handlers and every routine they
+//! call must use the soft-float ABI and must not access FP/SIMD registers. Only
+//! `user.S` may touch them. This permits the lower-EL dispatcher to capture integer
+//! registers before the return assembly conditionally saves FP/SIMD, without
+//! corrupting the interrupted process's values.
 //!
 //! Reference: Arm Cortex-A53 TRM, CPACR_EL1 and AArch64 thread registers:
 //! <https://documentation-service.arm.com/static/6040c321ee937942ba301626>.
@@ -68,7 +70,7 @@ const _: () = {
 static ACTIVE: [AtomicPtr<Context>; super::cpu::MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; super::cpu::MAX_CPUS];
 unsafe extern "C" {
-    fn cyxia_enter_user(context: *mut Context);
+    fn cyxia_enter_user(context: *mut Context, restore_fp: u64);
     fn cyxia_user_return();
 }
 /// # Safety
@@ -80,7 +82,7 @@ unsafe extern "C" {
 /// runs because their additional register state is not saved. A context must be
 /// initialized or reset before reuse by a different process so its full
 /// integer, FP/SIMD and TLS state belongs exclusively to the entered process.
-pub unsafe fn enter(context: &mut Context, root: u64) {
+unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool) {
     let saved_daif: u64;
     // Do not expose a half-installed ACTIVE/TTBR0 pair to an IRQ.
     unsafe {
@@ -92,20 +94,39 @@ pub unsafe fn enter(context: &mut Context, root: u64) {
     active.store(core::ptr::from_mut(context), Ordering::Relaxed);
     unsafe {
         asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
-        cyxia_enter_user(core::ptr::from_mut(context));
-        // user.S has disabled low walks, completed TLBI, saved all user state,
-        // and restored the original EL1 CPACR/TLS before returning to Rust.
+        cyxia_enter_user(core::ptr::from_mut(context), u64::from(restore_fp));
+        // user.S has disabled low walks, completed TLBI, saved all enabled user
+        // state, and restored the original EL1 CPACR/TLS before returning.
     }
     active.store(core::ptr::null_mut(), Ordering::Relaxed);
     unsafe {
         asm!("msr daif, {}", in(reg) saved_daif, options(nostack, preserves_flags));
     }
 }
+/// Enter a complete user context, including its private Advanced SIMD/FP bank.
+///
+/// # Safety
+/// The caller must provide a pinned private context and validated address-space
+/// root, on a registered CPU with no nested entry.
+pub unsafe fn enter(context: &mut Context, root: u64) {
+    unsafe { enter_inner(context, root, true) };
+}
+/// Enter a protection probe that must fault before executing any FP/SIMD
+/// instruction. CPACR traps such instructions and the context's initialized
+/// FP/SIMD bank remains untouched, so no state crosses the probe boundary.
+///
+/// # Safety
+/// In addition to [`enter`]'s contract, the entered code must be an audited
+/// integer-only fault probe; any FP/SIMD trap must be treated as probe failure.
+pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
+    unsafe { enter_inner(context, root, false) };
+}
 /// # Safety
 /// Called only from a synchronous/IRQ AArch64 lower-EL vector, while enter() is
 /// suspended. No Rust reference into the context is live in the user program.
 /// Neither this function nor the exception/IRQ path may use FP/SIMD or modify
-/// TPIDR_EL0. Their live hardware values are saved by user.S after capture returns.
+/// TPIDR_EL0. Enabled live hardware values are saved by user.S after capture returns;
+/// integer-only probes keep FP/SIMD trapped and leave their context bank untouched.
 pub unsafe fn capture(
     regs: [u64; 31],
     pc: u64,

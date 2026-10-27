@@ -5,8 +5,9 @@
 .type cyxia_enter_user, %function
 cyxia_enter_user:
  // Preserve the soft-float caller's state. EL0 cannot address this kernel stack.
- // Frame: x19-x30 [0,96), DAIF 96, Context* 104, CPACR 112, TPIDR_EL0 120.
- sub sp, sp, #128
+ // Frame: x19-x30 [0,96), DAIF 96, Context* 104, CPACR 112, TPIDR_EL0 120,
+ // restore-FP flag 128. x1 is zero only for an integer-only fault probe.
+ sub sp, sp, #144
  stp x19, x20, [sp, #0]
  stp x21, x22, [sp, #16]
  stp x23, x24, [sp, #32]
@@ -18,19 +19,24 @@ cyxia_enter_user:
  msr daifset, #15
  mov x30, x0
  str x30, [sp, #104]
+ str x1, [sp, #128]
  mrs x9, cpacr_el1
  str x9, [sp, #112]
- // Enable FP at EL0 and EL1 for restoration. All kernel and IRQ code is soft-float.
- // Trap SVE and SME: this context owns only the base Advanced SIMD/FP bank.
+ // Enable FP at EL0 and EL1 only for full restoration. Integer probes keep it
+ // trapped. All kernel and IRQ code is soft-float; SVE and SME always stay trapped.
  bic x9, x9, #0x30000
  bic x9, x9, #0x3000000
+ bic x9, x9, #0x300000
+ cbz x1, .Luser_fp_configured
  orr x9, x9, #0x300000
+.Luser_fp_configured:
  msr cpacr_el1, x9
  isb
  mrs x9, tpidr_el0
  str x9, [sp, #120]
  ldr x9, [x30, #296]
  msr tpidr_el0, x9
+ cbz x1, .Luser_integer_restore
  ldr x9, [x30, #816]
  msr fpcr, x9
  ldr x9, [x30, #824]
@@ -53,6 +59,7 @@ cyxia_enter_user:
  ldp q26, q27, [x9, #416]
  ldp q28, q29, [x9, #448]
  ldp q30, q31, [x9, #480]
+.Luser_integer_restore:
  ldr x9, [x30, #248]
  msr elr_el1, x9
  ldr x9, [x30, #256]
@@ -92,6 +99,8 @@ cyxia_user_return:
  isb
  // Its integer-only Rust/IRQ path has left the complete user FP/TLS bank intact.
  ldr x30, [sp, #104]
+ ldr x10, [sp, #128]
+ cbz x10, .Luser_integer_save
  add x9, x30, #304
  stp q0, q1, [x9, #0]
  stp q2, q3, [x9, #32]
@@ -113,6 +122,7 @@ cyxia_user_return:
  str x9, [x30, #816]
  mrs x9, fpsr
  str x9, [x30, #824]
+.Luser_integer_save:
  mrs x9, tpidr_el0
  str x9, [x30, #296]
  // Restore the original EL1 TLS and feature controls before returning to Rust.
@@ -128,7 +138,7 @@ cyxia_user_return:
  ldp x27, x28, [sp, #64]
  ldp x29, x30, [sp, #80]
  ldr x9, [sp, #96]
- add sp, sp, #128
+ add sp, sp, #144
  msr daif, x9
  ret
 .size cyxia_user_return, .-cyxia_user_return
