@@ -15,6 +15,47 @@ from verify_unified_disk import verify_pair
 import hashlib
 from build_unified import code_source_map
 
+PINNED_QEMU_COMMIT='f8ed81651e61d9c2166df6121ce2af0f44f06b3e'
+PINNED_QEMU_PATCH_SHA256='b92d2ce14bca13cae43338729de3226c1ad9f469dc9947e1bd5c465d753876fd'
+PATCHED_QEMU_SOURCE_SHA256={
+    'include/hw/core/cpu.h':'4696335a01617de2504f2ab09dd10dc8c86ec854fecf244aa24e31469d60ced1',
+    'cpu-common.c':'5a309695dd5c559b93ce7cf13171b3bdfc4b526092b42e49bbbcabeee22fdf13',
+    'accel/tcg/cpu-exec.c':'d49ac54fba75a2ee3fe58792e8bbcd0e4ca8ada5775d5facbccdfcb9bc990b2b',
+    'target/arm/cpregs-pmu.c':'f09a95b22f4b67e0d22bffa2523b3055cabe8d2bf943cfb313e5d4fc16364556',
+}
+
+def attest_qemu(binary,source=None):
+    binary=Path(binary).resolve(strict=True)
+    require(binary.is_file(),'qemu-system-aarch64 is missing')
+    version=subprocess.check_output([str(binary),'--version'],timeout=10,text=True)
+    first=version.splitlines()[0] if version.splitlines() else ''
+    clean=('QEMU emulator version 10.2.2','QEMU emulator version 10.2.2 (v10.2.2)')
+    if first in clean:
+        return {'qemu_version':version,'qemu_sha256':sha(binary),'qemu_pmu_patch_attested':False}
+    require(first=='QEMU emulator version 10.2.2 (v10.2.2-dirty)' and source is not None,
+            'unverified QEMU version; patched builds require exact source attestation')
+    source=Path(source).resolve(strict=True)
+    built=(source/'build/qemu-system-aarch64').resolve(strict=True)
+    require(sha(binary)==sha(built),'patched QEMU binary is not the attested source build')
+    commit=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],timeout=10,text=True).strip()
+    require(commit==PINNED_QEMU_COMMIT,'patched QEMU source commit differs')
+    status=subprocess.run(['git','-C',str(source),'status','--short','--untracked-files=no'],
+                          check=True,capture_output=True,text=True,timeout=10).stdout
+    changed={line[3:] for line in status.splitlines() if len(line)>=4 and line[:2]==' M'}
+    require(changed==set(PATCHED_QEMU_SOURCE_SHA256) and len(status.splitlines())==len(changed),
+            'patched QEMU tracked changes differ')
+    subprocess.run(['git','-C',str(source),'diff','--check'],check=True,capture_output=True,timeout=10)
+    subprocess.run(['git','-C',str(source),'apply','--reverse','--check',
+                    str(ROOT/'tools/qemu/cyxia-per-vcpu-pmu.patch')],
+                   check=True,capture_output=True,timeout=10)
+    require(sha(ROOT/'tools/qemu/cyxia-per-vcpu-pmu.patch')==PINNED_QEMU_PATCH_SHA256,
+            'pinned QEMU patch differs')
+    require(all(sha(source/name)==digest for name,digest in PATCHED_QEMU_SOURCE_SHA256.items()),
+            'patched QEMU source differs')
+    return {'qemu_version':version,'qemu_sha256':sha(binary),'qemu_pmu_patch_attested':True,
+            'qemu_source_commit':commit,'qemu_patch_sha256':PINNED_QEMU_PATCH_SHA256,
+            'qemu_source_sha256':PATCHED_QEMU_SOURCE_SHA256}
+
 def bind_build(path,elf,peer_elf,publics,package,expect):
     require(path is not None,'final acceptance requires --build-manifest')
     build=json.loads(path.read_text())
@@ -164,7 +205,7 @@ def validate_offline_custody(before,after,publics,package_hash):
     require(proof['pure_task_done_verified'],'offline custody lost completed task result')
     return proof
 
-def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, entropy: bool = True, formatter: Path | None = None, peer_elf: Path, development: bool = False, existing_disks=None, reconnect=False, publics=None, package=None,expect='normal',clock_profile='wallclock',build_manifest=None,icount_shift=0,tcg_threads='multi') -> dict:
+def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, entropy: bool = True, formatter: Path | None = None, peer_elf: Path, development: bool = False, existing_disks=None, reconnect=False, publics=None, package=None,expect='normal',clock_profile='wallclock',build_manifest=None,icount_shift=0,tcg_threads='multi',qemu=None,qemu_source=None) -> dict:
     require(1 <= timeout <= 180, 'invalid execution deadline')
     elf = elf.resolve(strict=True)
     peer_elf = peer_elf.resolve(strict=True)
@@ -190,12 +231,14 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
             locations = [profile(p.read_bytes()) for p in (elf,peer_elf)]
             formatter = (formatter or ROOT / 'target/debug/examples/prototype-disk').resolve(strict=True)
             report['formatter_sha256'] = sha(formatter)
-            binary = shutil.which('qemu-system-aarch64')
+            binary = qemu or shutil.which('qemu-system-aarch64')
             require(binary is not None, 'qemu-system-aarch64 is missing')
-            version = subprocess.check_output([binary, '--version'], timeout=10, text=True)
-            require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
-                    'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
-            report.update(qemu_version=version, qemu_sha256=sha(Path(binary)))
+            qemu_proof=attest_qemu(binary,qemu_source)
+            if qemu_proof['qemu_pmu_patch_attested']:
+                require(clock_profile=='wallclock' and tcg_threads=='multi',
+                        'patched per-vCPU PMU requires wallclock multi-thread TCG')
+            report.update(qemu_proof)
+            binary=str(Path(binary).resolve(strict=True))
             # Reserving then releasing the loopback port can race with another
             # process. QEMU startup failure is fatal; it cannot yield PASS.
             with socket.socket() as listener:
@@ -388,9 +431,11 @@ def main():
     p.add_argument('--clock-profile',choices=('icount','wallclock'),default='wallclock',help='icount is an experimental guest clock; neither profile certifies physical realtime')
     p.add_argument('--icount-shift',choices=(0,4),type=int,default=0)
     p.add_argument('--tcg-threads',choices=('single','multi'),default='multi')
+    p.add_argument('--qemu',type=Path,help='explicit qemu-system-aarch64 binary')
+    p.add_argument('--qemu-source',type=Path,help='exact pinned source tree for a patched QEMU build')
     p.add_argument('--build-manifest',type=Path)
     p.add_argument('--timeout',type=float,default=90);p.add_argument('--development',action='store_true');p.add_argument('--disconnected',action='store_true');p.add_argument('--without-entropy',action='store_true');p.add_argument('--formatter',type=Path)
     a=p.parse_args();require(len(a.public)==2 and (a.disk is None or len(a.disk)==2),'two keys/disks required')
-    r=run(a.elf,a.output,a.timeout,peer_elf=a.peer_elf,development=a.development,linked=not a.disconnected,entropy=not a.without_entropy,formatter=a.formatter,existing_disks=a.disk,reconnect=a.reconnect,publics=a.public,package=a.package,expect=a.expect,clock_profile=a.clock_profile,build_manifest=a.build_manifest,icount_shift=a.icount_shift,tcg_threads=a.tcg_threads)
+    r=run(a.elf,a.output,a.timeout,peer_elf=a.peer_elf,development=a.development,linked=not a.disconnected,entropy=not a.without_entropy,formatter=a.formatter,existing_disks=a.disk,reconnect=a.reconnect,publics=a.public,package=a.package,expect=a.expect,clock_profile=a.clock_profile,build_manifest=a.build_manifest,icount_shift=a.icount_shift,tcg_threads=a.tcg_threads,qemu=a.qemu,qemu_source=a.qemu_source)
     print(json.dumps(r,indent=2));return 0 if r['status'] in ('PASS','OBSERVED') else 1
 if __name__=='__main__':raise SystemExit(main())

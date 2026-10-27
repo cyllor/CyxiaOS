@@ -7,7 +7,7 @@ import struct
 import tempfile
 import unittest
 from unittest.mock import patch
-from verify_unified import ROOT, bind_build, capture, sha, validate, validate_rejection
+from verify_unified import ROOT, attest_qemu, bind_build, capture, sha, validate, validate_rejection
 
 def bundle(owner=False):
     u=[0]*512;d=[0]*512;r=[0]*1024
@@ -27,6 +27,30 @@ def change(b,name,index,value):
     data=bytearray(b[name]);struct.pack_into('<Q',data,index*8,value);b[name]=bytes(data)
 
 class Acceptance(unittest.TestCase):
+    def test_patched_qemu_requires_exact_source_attestation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source=Path(temp)/'qemu';binary=source/'build/qemu-system-aarch64'
+            binary.parent.mkdir(parents=True);binary.write_bytes(b'qemu')
+            files=('include/hw/core/cpu.h','cpu-common.c','accel/tcg/cpu-exec.c','target/arm/cpregs-pmu.c')
+            for name in files:
+                path=source/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
+            hashes={name:sha(source/name) for name in files}
+            def output(command,**_):
+                if command[-1]=='--version':return 'QEMU emulator version 10.2.2 (v10.2.2-dirty)\n'
+                return 'f8ed81651e61d9c2166df6121ce2af0f44f06b3e\n'
+            status=''.join(f' M {name}\n' for name in files)
+            with patch('verify_unified.PATCHED_QEMU_SOURCE_SHA256',hashes), \
+                 patch('verify_unified.subprocess.check_output',side_effect=output), \
+                 patch('verify_unified.subprocess.run') as run:
+                run.return_value.stdout=status;run.return_value.returncode=0
+                proof=attest_qemu(binary,source)
+                self.assertEqual(proof['qemu_source_commit'],'f8ed81651e61d9c2166df6121ce2af0f44f06b3e')
+                (source/files[0]).write_text('substituted')
+                with self.assertRaisesRegex(ValueError,'patched QEMU source differs'):
+                    attest_qemu(binary,source)
+            with patch('verify_unified.subprocess.check_output',return_value='QEMU emulator version 10.2.2 (v10.2.2-dirty)\n'):
+                with self.assertRaisesRegex(ValueError,'source attestation'):
+                    attest_qemu(binary,None)
     def test_joint_checks_cannot_accept_partial_evidence(self):
         original=[bundle(),bundle(True)]
         self.assertEqual(len(validate([b'',b''],original,[4,4])),2)

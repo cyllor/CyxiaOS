@@ -11,11 +11,16 @@ the service deterministically.
 This is not yet a native acceptance claim. Host lifecycle/image/custody tests
 pass and an `after-ready` build profile injects a real generation-1 `BRK`, but
 the local QEMU 10.2.2 wallclock and icount attempts on 2026-10-27 reached only
-the pre-TLS service events before their 180-second runner deadline. Their
-source-bound `FAIL` evidence is retained under
-`artifacts/v13-service-restart-native-20261027*`. No restart row may be marked
-PASS until a native run reaches the injected fault and independently verifies
-BootEpoch stability, generation 1→2, one restart and second-generation READY.
+the pre-TLS service events before their 180-second runner deadline. A later
+wallclock/multi run used the pinned per-vCPU PMU patch and independently
+attested the QEMU commit, patch, four changed source files and built binary; it
+still timed out with events 1/2, generation 1 and zero TCP/TLS bytes before the
+fault point. The source-bound `FAIL` evidence is retained under
+`artifacts/v13-service-restart-native-20261027*` and
+`artifacts/v13-service-restart-native-patched-ready-v2-20261027`. No restart
+row may be marked PASS until a native run reaches the injected fault and
+independently verifies BootEpoch stability, generation 1→2, one restart and
+second-generation READY.
 
 ## Existing ownership that must survive
 
@@ -97,6 +102,16 @@ At the exception, EL1 freezes the last successful broker operation, original
 argument and service generation in protected evidence before resetting any
 service-owned memory. Native verification must match this receipt to the
 selected injection profile instead of trusting the build label alone.
+
+Patched QEMU builds report `v10.2.2-dirty`, so accepting the version string by
+itself would admit arbitrary emulator changes. `tools/verify_unified.py`
+therefore requires both `--qemu` and `--qemu-source` for such a build. It
+checks upstream commit `f8ed81651e61d9c2166df6121ce2af0f44f06b3e`, the
+repository patch hash, the exact four patched source hashes, a clean
+`git diff --check`, reverse applicability of that patch, and equality with the
+binary built by the attested tree. The per-vCPU PMU profile is accepted only
+with wallclock/multi-thread TCG; an ordinary unproven `-dirty` binary remains
+fail-closed.
 
 Relevant files are `kernel/src/unified.rs`, `unified_store.rs`,
 `unified_task.rs`, `domain_network.rs` and its `requests`/receipt adapters,
