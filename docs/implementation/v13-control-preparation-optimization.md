@@ -1340,3 +1340,10 @@ host tests (two environment skips), 153 v1.3 tests (one historical-evidence
 skip), formatting and configured AArch64 strict Clippy pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-clear-32-entry-detail` is `BUILT_NOT_RUN`;
 both selected stack paths remain 32,976/65,536 bytes.
+
+Workflow run `40458383632` did not start any job step and produced no log. Its
+exact-source retry `40458417189` was rejected before checkout with GitHub's
+explicit `Actions budget is preventing further use` annotation. Neither run is
+native product evidence. The 32-byte change therefore remains
+`BUILT_NOT_RUN`; authoritative patched-Linux replay resumes only after the
+repository Actions budget is available.
