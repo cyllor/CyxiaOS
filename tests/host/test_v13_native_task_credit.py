@@ -39,7 +39,7 @@ class NativeTaskCredit(unittest.TestCase):
         transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
 
         receive = driver[driver.index("pub fn receive_with_checkpoint"):]
-        self.assertIn("self.poll_rx(p)?;\n        checkpoint();", receive)
+        self.assertIn("self.poll_rx_with_checkpoint(p, checkpoint)?;\n        checkpoint();", receive)
         self.assertIn("copy_from_slice", receive)
         self.assertIn("checkpoint();\n        self.rx.release(token)?;", receive)
         self.assertIn("receive_frame_with_checkpoint", transport)

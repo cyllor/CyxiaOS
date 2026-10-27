@@ -87,6 +87,11 @@ class NativeInputPage(unittest.TestCase):
         self.assertIn("core::ptr::write_unaligned", page)
         self.assertIn("out[wide..bytes]", page)
         self.assertIn("copy_prefix_to(out, len as usize)", queue)
+        self.assertIn("pub fn poll_with_checkpoint(", queue)
+        self.assertGreaterEqual(queue.count("checkpoint();"), 2)
+        net = (ROOT / "crates/driver-virtio/src/net/batched.rs").read_text()
+        self.assertIn(".poll_with_checkpoint(&mut self.transport", net)
+        self.assertIn("self.poll_rx_with_checkpoint(p, checkpoint)?", net)
 
 
 if __name__ == "__main__":

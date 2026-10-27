@@ -182,21 +182,32 @@ impl BatchedNet {
         }
     }
     pub fn poll_rx(&mut self, p: &impl Platform) -> Result<bool, Error> {
+        self.poll_rx_with_checkpoint(p, &mut || {})
+    }
+    fn poll_rx_with_checkpoint(
+        &mut self,
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<bool, Error> {
         self.healthy(p)?;
         if self.received.is_some() {
             return Ok(true);
         }
-        let c = match self.rx.poll(&mut self.transport, &mut self.packet, p) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                self.report(p, true);
-                return Ok(false);
-            }
-            Err(e) => {
-                self.fail(p);
-                return Err(e);
-            }
-        };
+        let c =
+            match self
+                .rx
+                .poll_with_checkpoint(&mut self.transport, &mut self.packet, p, checkpoint)
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    self.report(p, true);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    self.fail(p);
+                    return Err(e);
+                }
+            };
         let flags = self.packet[0];
         let gso = self.packet[1];
         let buffers = u16::from_le_bytes([self.packet[10], self.packet[11]]);
@@ -221,7 +232,7 @@ impl BatchedNet {
         p: &impl Platform,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<Option<usize>, Error> {
-        self.poll_rx(p)?;
+        self.poll_rx_with_checkpoint(p, checkpoint)?;
         checkpoint();
         let Some((token, len)) = self.received else {
             return Ok(None);

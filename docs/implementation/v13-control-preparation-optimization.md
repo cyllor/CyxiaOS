@@ -1095,3 +1095,26 @@ and patch checks pass. Exact build
 `/tmp/cyxia-prototype.lcqCJ7/build-owned-service-scan-v2` is `BUILT_NOT_RUN`;
 both selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
 pending and the 69-case v1.3 catalogue remains open.
+
+Run `40440599479` confirms the healthy-mask completion scan does not recur.
+The next failure is CPU0 network stage 50: service sequence 705 uses
+7,098,272/2,500,000 ns in the egress loop's batched-RX poll. Completion
+polling still combined exact used-record acquisition, slot/length validation,
+response synchronization and the response-to-private-packet copy before the
+next scheduler callback.
+
+`BatchQueue::poll_with_checkpoint` now exposes safe boundaries after acquiring
+the exact used record and after validating its slot and length. The callback
+must not re-enter the queue; descriptor and response custody remain held, no
+DMA slice escapes, and the subsequent synchronization, copy, completed-state
+transition and release/rearm retain their original ordering. `BatchedNet`
+threads those callbacks through the existing receive path without changing the
+public non-checkpoint polling behavior. A queue regression observes exactly
+both new boundaries. All 73 VirtIO driver tests and 14 cluster-network tests
+pass, as do 626 host tests (two environment skips), 152 v1.3 tests (one
+historical-evidence skip), 71 evidence-tool tests, formatting, patch checks and
+configured AArch64 strict Clippy. Exact build
+`/tmp/cyxia-prototype.lcqCJ7/build-rx-poll-segments` is `BUILT_NOT_RUN`; both
+selected stack paths pass at 33,760/65,536 bytes. Patched-QEMU replay is
+required before stage 50 can be considered closed, and the 69-case v1.3
+catalogue remains open.
