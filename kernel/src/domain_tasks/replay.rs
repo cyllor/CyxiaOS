@@ -364,7 +364,7 @@ pub fn source_for(
 pub fn spawn(id: u64, deadline: u64) -> Result<(), Error> {
     owner()?;
     locked(|s| {
-        let (actor, target, bytes) = {
+        let (actor, target, bytes, run) = {
             let r = state();
             let i = index(id)?;
             if r.closed || r.run.is_none() {
@@ -380,8 +380,12 @@ pub fn spawn(id: u64, deadline: u64) -> Result<(), Error> {
                 r.actor,
                 crate::learning_workload::background::FOREGROUND,
                 bytes,
+                r.run.ok_or(Error::Auth)?,
             )
         };
+        #[cfg(not(test))]
+        crate::learning_evidence::execution_trace::probe_caller(run, id, actor, now_ns());
+        let _ = run;
         execution::submit_locked(s, actor, id, target, &bytes, 3, deadline, false, 0)?;
         Ok(())
     })
@@ -640,32 +644,108 @@ pub fn ipc_result(id: u64) -> Result<Option<Result<u64, Error>>, Error> {
         Ok(r.delivered[i])
     })
 }
+fn drain_block(r: &Replay, reason: u64, detail: [u64; 6]) -> bool {
+    #[cfg(not(test))]
+    if let Some(run) = r.run {
+        crate::learning_evidence::execution_trace::task_block(run, reason, detail, now_ns());
+    }
+    let _ = (r, reason, detail);
+    false
+}
 fn drained_locked(s: &State, r: &Replay) -> Result<bool, Error> {
-    if s.tasks
+    if let Some(t) = s
+        .tasks
         .iter()
-        .any(|t| t.life != Life::Free && t.parent == r.actor)
-        || s.launches
-            .iter()
-            .any(|l| l.request.is_some_and(|v| v.caller == r.actor))
-        || s.exits.iter().flatten().any(|v| v.parent == r.actor)
-        || r.vector.is_some()
-        || r.local_spawn != 0
-            && (s.tasks.iter().any(|t| {
-                t.life != Life::Free && t.parent == CLUSTER_CALLER && t.spawn_id == r.local_spawn
-            }) || s.launches.iter().any(|l| {
-                l.request
-                    .is_some_and(|v| v.caller == CLUSTER_CALLER && v.request_id == r.local_spawn)
-            }))
+        .find(|t| t.life != Life::Free && t.parent == r.actor)
     {
-        return Ok(false);
+        return Ok(drain_block(
+            r,
+            1,
+            [
+                t.key.id,
+                t.key.generation,
+                u64::from(t.cpu),
+                t.life as u64,
+                t.spawn_id,
+                t.parent.id,
+            ],
+        ));
+    }
+    if let Some(q) = s
+        .launches
+        .iter()
+        .filter_map(|l| l.request)
+        .find(|v| v.caller == r.actor)
+    {
+        return Ok(drain_block(
+            r,
+            2,
+            [
+                q.request_id,
+                q.caller.id,
+                q.caller.generation,
+                q.package.id,
+                q.package.generation,
+                q.group.id,
+            ],
+        ));
+    }
+    if let Some(v) = s.exits.iter().flatten().find(|v| v.parent == r.actor) {
+        return Ok(drain_block(
+            r,
+            3,
+            [
+                v.key.id,
+                v.key.generation,
+                v.parent.id,
+                v.parent.generation,
+                v.finished_ns,
+                v.code,
+            ],
+        ));
+    }
+    if r.vector.is_some() {
+        return Ok(drain_block(r, 4, [r.vector_id, 0, 0, 0, 0, 0]));
+    }
+    if r.local_spawn != 0
+        && (s.tasks.iter().any(|t| {
+            t.life != Life::Free && t.parent == CLUSTER_CALLER && t.spawn_id == r.local_spawn
+        }) || s.launches.iter().any(|l| {
+            l.request
+                .is_some_and(|v| v.caller == CLUSTER_CALLER && v.request_id == r.local_spawn)
+        }))
+    {
+        return Ok(drain_block(r, 5, [r.local_spawn, 0, 0, 0, 0, 0]));
     }
     if r.endpoint != ZERO {
         let stats = s.ipc.stats(r.endpoint)?;
         if stats.depth != 0 || stats.reserved != 0 {
-            return Ok(false);
+            return Ok(drain_block(
+                r,
+                6,
+                [
+                    r.endpoint.id,
+                    r.endpoint.generation,
+                    stats.depth as u64,
+                    stats.reserved as u64,
+                    0,
+                    0,
+                ],
+            ));
         }
     }
-    Ok(r.lease.grants.iter().all(Option::is_none))
+    if r.lease.grants.iter().any(Option::is_some) {
+        return Ok(drain_block(
+            r,
+            7,
+            [u64::from(r.lease.needed), r.lease.deadline, 0, 0, 0, 0],
+        ));
+    }
+    #[cfg(not(test))]
+    if let Some(run) = r.run {
+        crate::learning_evidence::execution_trace::task_block(run, 0, [0; 6], now_ns());
+    }
+    Ok(true)
 }
 pub fn drain(run: RunKey) -> Result<bool, Error> {
     owner()?;

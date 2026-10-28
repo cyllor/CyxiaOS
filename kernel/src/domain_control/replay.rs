@@ -2369,6 +2369,18 @@ pub fn restore(token: Token) -> Result<(), Error> {
         root_mut().phase = Phase::Restoring;
         let value = publish_baseline(s, token, true)?;
         root_mut().closing = Some(value);
+        #[cfg(not(test))]
+        if let Some(first) = root().first {
+            crate::learning_evidence::execution_trace::closing(
+                value.apply.target,
+                first.taken_ns,
+                value.apply,
+                value.stamp,
+                value.accepted_ns,
+                value.approved_deadline_ns,
+                now(),
+            );
+        }
         Ok(())
     })
 }

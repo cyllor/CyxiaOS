@@ -88,6 +88,25 @@ mod task {
         FINISHED.store(100_030_000,Ordering::Release);
         CPU.store(0,Ordering::Release);
     }
+    pub fn execute_closing() {
+        WALL.store(210_000_000,Ordering::Release);
+        let stamp=PolicyStamp{version:42,snapshot_ns:210_000_000,installed_until_ns:10_210_000_000};
+        trace::closing(key(12),100_000_000,ApplyId{plan_seq:52,..ID},stamp,now(),260_000_000,now());
+        locked(|s| {s.scheduler.install_weight(key(12),1,stamp,now())?;
+            trace::installed(key(12),stamp,now());Ok(())}).unwrap();
+        CPU.store(3,Ordering::Release);WALL.store(210_010_000,Ordering::Release);
+        let d=locked(|s| {
+            let d=s.scheduler.dispatch_with_window_headroom(3,CpuLayout{business_mask:9,healthy_mask:15,generation:1},now(),2_000_000,20_000_000)?.unwrap();
+            s.active[3]=Some(Active{dispatch:d,state:RunState::Runnable,optional:None});trace::selected(d);Ok(d)
+        }).unwrap();
+        assert_eq!(d.policy_version,42);
+        COMPLETE_AT[3].store(210_030_000,Ordering::Relaxed);
+        COMPLETE_ACTUAL[3].store(20_000,Ordering::Relaxed);
+        COMPLETE_READY[3].store(true,Ordering::Release);
+        WALL.store(210_500_000,Ordering::Release);
+        locked(|s|complete_locked(s,3)).unwrap();
+        assert_eq!(version(),Ok(42));CPU.store(0,Ordering::Release);
+    }
 }
 mod control {
     use super::*;
@@ -173,5 +192,9 @@ fn main(){
     assert_eq!((t[37],t[43]),(100_030_000,100_500_000),"actual settlement hook lost physical or observed time");
     assert_eq!((c[27],c[28],c[31],c[32]),(1,1,200_002_000,78));
     assert_eq!((w[20],w[30]),(200_005_000,100_030_000),"actual warm outcome hook lost completion/observation distinction");
+    task::execute_closing();
+    let (_,t,_)=trace::snapshots();
+    assert_eq!((t[109],t[111]),(210_030_000,210_500_000),"production closing settlement hook was gated out");
+    assert_eq!(t[10],1,"closing settlement polluted first-policy counters");
     println!("production execution hooks passed");
 }

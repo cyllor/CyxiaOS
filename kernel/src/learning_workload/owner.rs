@@ -133,6 +133,39 @@ fn transient(e: Error) -> bool {
 fn native(_: evidence::Error) -> Error {
     Error::NotReady
 }
+fn poll_native(run: RunKey, stage: u64, error: evidence::Error) -> Error {
+    #[cfg(not(test))]
+    {
+        let code = match error {
+            evidence::Error::NotReady => 1,
+            evidence::Error::Busy => 2,
+            evidence::Error::Owner => 3,
+            evidence::Error::Stale => 4,
+            evidence::Error::Capacity => 5,
+            evidence::Error::Capture(e) => 0x100 + e as u64 + 1,
+        };
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::PollOrigin { stage, code },
+            now(),
+        );
+    }
+    let _ = (run, stage);
+    native(error)
+}
+fn poll_domain(run: RunKey, stage: u64, error: Error) -> Error {
+    #[cfg(not(test))]
+    evidence::execution_trace::closing_work(
+        run,
+        evidence::execution_trace::ClosingWork::PollOrigin {
+            stage,
+            code: 0x1_0000 + error as u64 + 1,
+        },
+        now(),
+    );
+    let _ = (run, stage);
+    error
+}
 fn learn(e: Error) -> learning::Error {
     if matches!(e, Error::Busy | Error::Again | Error::NotReady) {
         learning::Error::Unknown
@@ -682,8 +715,8 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
         }))
     })?;
     for i in todo.into_iter().flatten() {
-        let request = evidence::request(OWNER, i as u64 + 1).map_err(native)?;
-        evidence::arm_scheduled(request).map_err(native)?;
+        let request = evidence::request(OWNER, i as u64 + 1).map_err(|e| poll_native(run, 1, e))?;
+        evidence::arm_scheduled(request).map_err(|e| poll_native(run, 2, e))?;
         with(|s| {
             if s.run != Some(run) {
                 return Err(Error::Stale);
@@ -801,10 +834,10 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
             break;
         };
         evidence::result(
-            evidence::request(OWNER, i as u64 + 1).map_err(native)?,
+            evidence::request(OWNER, i as u64 + 1).map_err(|e| poll_native(run, 3, e))?,
             outcome,
         )
-        .map_err(native)?;
+        .map_err(|e| poll_native(run, 4, e))?;
         with(|s| {
             s.requests[i].reported = true;
             Ok(())
@@ -820,10 +853,23 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
 }
 pub fn drain(run: RunKey) -> Result<bool, Error> {
     owner()?;
+    #[cfg(not(test))]
+    evidence::execution_trace::closing_work(
+        run,
+        evidence::execution_trace::ClosingWork::DrainStart,
+        now(),
+    );
     // Closing execution may need its original probe while measurement requests
     // are still settling. Poll them first, but do not wait-all before providing
     // that demand. The retained result remains a barrier to every owner drain.
-    let poll_done = poll(run)?;
+    let polled = poll(run);
+    #[cfg(not(test))]
+    evidence::execution_trace::closing_work(
+        run,
+        evidence::execution_trace::ClosingWork::PollReturned { result: polled },
+        now(),
+    );
+    let poll_done = polled?;
     let (token, f) = with(|s| {
         Ok((
             s.token.ok_or(Error::NotReady)?,
@@ -831,8 +877,17 @@ pub fn drain(run: RunKey) -> Result<bool, Error> {
         ))
     })?;
     if f.domain != 14 {
-        let status = root::poll(token)?;
+        let status = root::poll(token).map_err(|e| poll_domain(run, 5, e))?;
         let closing = status.closing.ok_or(Error::NotReady)?;
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::ClosingObserved {
+                version: closing.stamp.version,
+                state: closing.state,
+            },
+            now(),
+        );
         if closing.state != cyxia_prototype::policy::ExecutionState::Applied {
             if closing.state.terminal() {
                 return Err(Error::Conflict);
@@ -860,14 +915,47 @@ pub fn drain(run: RunKey) -> Result<bool, Error> {
                                     .ok_or(Error::Overflow)?,
                                 active: false,
                             });
+                            #[cfg(not(test))]
+                            evidence::execution_trace::closing_work(
+                                run,
+                                evidence::execution_trace::ClosingWork::ProbeCreated {
+                                    version: closing.stamp.version,
+                                    id,
+                                    deadline: s.close_probe.unwrap().deadline,
+                                },
+                                now(),
+                            );
                         }
                         if let Some(mut work) = s.close_probe {
                             if !work.active {
-                                submit(f, s.seed, work.id, now(), work.deadline)?;
+                                let entered_ns = now();
+                                let reply = submit(f, s.seed, work.id, entered_ns, work.deadline);
+                                #[cfg(not(test))]
+                                evidence::execution_trace::closing_work(
+                                    run,
+                                    evidence::execution_trace::ClosingWork::ProbeSubmit {
+                                        id: work.id,
+                                        entered_ns,
+                                        result: reply,
+                                    },
+                                    now(),
+                                );
+                                reply?;
                                 work.active = true;
                                 s.close_probe = Some(work);
                             }
-                            if let Some(result) = outcome(f, work.id)? {
+                            if let Some(result) =
+                                outcome(f, work.id).map_err(|e| poll_domain(run, 6, e))?
+                            {
+                                #[cfg(not(test))]
+                                evidence::execution_trace::closing_work(
+                                    run,
+                                    evidence::execution_trace::ClosingWork::ProbeOutcome {
+                                        id: work.id,
+                                        result,
+                                    },
+                                    now(),
+                                );
                                 result?;
                                 s.close_probe = None;
                             }
@@ -886,7 +974,18 @@ pub fn drain(run: RunKey) -> Result<bool, Error> {
             if let Some(work) = s.close_probe {
                 if !work.active {
                     s.close_probe = None;
-                } else if let Some(result) = outcome(f, work.id)? {
+                } else if let Some(result) =
+                    outcome(f, work.id).map_err(|e| poll_domain(run, 7, e))?
+                {
+                    #[cfg(not(test))]
+                    evidence::execution_trace::closing_work(
+                        run,
+                        evidence::execution_trace::ClosingWork::ProbeOutcome {
+                            id: work.id,
+                            result,
+                        },
+                        now(),
+                    );
                     result?;
                     s.close_probe = None;
                 } else {
@@ -896,33 +995,86 @@ pub fn drain(run: RunKey) -> Result<bool, Error> {
             Ok(true)
         })
     })?;
-    if !poll_done
-        || !done
-        || if control_work(f) {
-            !core_work::drain()?
-        } else {
-            !crate::domain_tasks::replay::drain(run)?
-        }
-    {
+    if !poll_done || !done {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block {
+                reason: if !poll_done { 1 } else { 2 },
+            },
+            now(),
+        );
+        return Ok(false);
+    }
+    let owner_done = if control_work(f) {
+        core_work::drain()?
+    } else {
+        crate::domain_tasks::replay::drain(run).map_err(|e| poll_domain(run, 8, e))?
+    };
+    if !owner_done {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block {
+                reason: if control_work(f) { 3 } else { 4 },
+            },
+            now(),
+        );
         return Ok(false);
     }
     if uses_file(f) && !crate::domain_storage::replay::drain()? {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block { reason: 5 },
+            now(),
+        );
         return Ok(false);
     }
     if uses_file(f) && !crate::domain_platform::irq_replay::drain(run)? {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block { reason: 6 },
+            now(),
+        );
         return Ok(false);
     }
     if uses_echo(f) && !crate::domain_services::replay::drain(run)? {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block { reason: 7 },
+            now(),
+        );
         return Ok(false);
     }
     if one_shot(f) && !crate::learning_prewarm::drain(run)? {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block { reason: 8 },
+            now(),
+        );
         return Ok(false);
     }
     if f.domain == 7 && !crate::domain_platform::replay::drain(run)? {
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Block { reason: 9 },
+            now(),
+        );
         return Ok(false);
     }
     with(|s| {
         s.drained_at.get_or_insert(now());
+        #[cfg(not(test))]
+        evidence::execution_trace::closing_work(
+            run,
+            evidence::execution_trace::ClosingWork::Drained,
+            now(),
+        );
         Ok(true)
     })
 }

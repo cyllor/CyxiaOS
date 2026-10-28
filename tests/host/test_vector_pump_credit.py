@@ -36,6 +36,11 @@ class VectorPumpCredit(unittest.TestCase):
         active = re.search(r'^static BASELINE_RETRY_ACTIVE:.*;$', execution, re.M)
         if active:
             activation += '\n' + active[0]
+        # Only this diagnostic reads the fixture's simplified active Dispatch.
+        # Paid admission and interval serialization have their own full-State
+        # harnesses; preserve the actual pump/helper sequencing here.
+        activation = activation.replace('s.active[0].map_or(0, |v| v.dispatch.sequence)',
+                                        's.active.map_or(0, |v| v.sequence)')
         template = (ROOT / 'tests/host/vector_pump_credit_harness.rs').read_text()
         template = template.replace('// OWNER_GATE_PATH',
             str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))

@@ -10,6 +10,7 @@ const LAYOUT: CpuLayout = CpuLayout { business_mask: 13, healthy_mask: 15, gener
 static READY: AtomicBool = AtomicBool::new(true);
 static DENY: AtomicBool = AtomicBool::new(false);
 static NOW: AtomicU64 = AtomicU64::new(0);
+fn now_ns()->u64 {NOW.load(Ordering::Acquire)}
 static CPU_NS: AtomicU64 = AtomicU64::new(0);
 static BASELINE_PENDING: AtomicBool = AtomicBool::new(false);
 static BASELINE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +54,12 @@ mod crate_stubs {
 }
 use crate_stubs as learning_workload;
 use crate_stubs as learning_replay;
+// Closing diagnostics are outside this independent vector-pump fixture.
+mod learning_evidence { pub mod execution_trace {
+    pub fn admission_opportunity(_:bool,_:bool,_:u64) {}
+    pub fn admission_body(_:u64,_:u64) {}
+    pub fn admission_result(_:bool,_:u64) {}
+} }
 #[derive(Clone, Copy)]
 enum Life { Free, Ready, Exiting }
 struct Task { life: Life, recipe: u64, pending: bool }

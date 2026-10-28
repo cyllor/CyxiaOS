@@ -94,12 +94,80 @@ fn first_scope_preserves_each_stage_and_later_trials_cannot_replace_it() {
     assert_eq!(full[8], 8);
     assert_eq!(full[9], 1, "diagnostic overflow silently replaced a retained identity");
     assert_eq!(full[18], 51);
+    // The closing policy has a different snapshot/version from the first
+    // baseline. Its own demand, bill and observation chain must stay distinct.
+    let closing_stamp=PolicyStamp {version:42,snapshot_ns:103_000_000,installed_until_ns:10_103_000_000};
+    let closing_apply=ApplyId {plan_seq:60,..event(51,false,Ok(ExecutionState::Pending),103_000_000,1).apply};
+    trace::closing(key(12),99_000_000,closing_apply,closing_stamp,103_001_000,153_001_000,103_002_000);
+    trace::closing(key(12),100_000_000,ApplyId {target:key(13),..closing_apply},closing_stamp,103_001_000,153_001_000,103_002_000);
+    assert_eq!(trace::snapshots().2[37],0,"mismatched closing identity armed the task chain");
+    trace::closing(key(12),100_000_000,closing_apply,closing_stamp,103_001_000,153_001_000,103_002_000);
+    assert_eq!(trace::snapshots().2[37],42,"closing policy identity was not armed");
+    trace::closing(key(12),100_000_000,ApplyId{plan_seq:61,..closing_apply},closing_stamp,103_001_000,153_001_000,103_002_000);
+    assert_eq!(trace::admission_snapshot()[58],1,"conflicting closing identity was silently ignored");
+    trace::closing_work(RUN,trace::ClosingWork::DrainStart,103_003_000);
+    trace::closing_work(RUN,trace::ClosingWork::PollReturned{result:Err(Error::Busy)},103_004_000);
+    trace::closing_work(RUN,trace::ClosingWork::PollOrigin{stage:2,code:0x1007},103_004_000);
+    trace::closing_work(RUN,trace::ClosingWork::ProbeCreated{version:42,id:251,deadline:5_103_005_000},103_005_000);
+    trace::closing_work(RUN,trace::ClosingWork::ProbeSubmit{id:251,entered_ns:103_006_000,result:Err(Error::Busy)},103_007_000);
+    trace::closing_work(RUN,trace::ClosingWork::ProbeSubmit{id:251,entered_ns:103_008_000,result:Ok(())},103_009_000);
+    trace::admission_opportunity(true,true,103_010_000);
+    trace::admission_body(901,103_011_000);
+    let request=cyxia_prototype::domains::tasks::SpawnRequest {caller:key(0x5245504c4341),request_id:251,
+        package:key(7),group:key(12),payload_hash:[7;32],recovery:false};
+    trace::probe_caller(RUN,251,request.caller,103_010_000);
+    let foreign=cyxia_prototype::domains::tasks::SpawnRequest {caller:key(88),..request};
+    trace::admitted(&foreign,cyxia_prototype::domains::tasks::SpawnState::Queued,103_011_000,900);
+    trace::created(trace::Child{group:key(12),child:key(100),parent:foreign.caller,request_id:251,at:103_011_000});
+    assert_eq!(trace::snapshots().1[72],0,"foreign caller occupied closing probe child record");
+    trace::admitted(&request,cyxia_prototype::domains::tasks::SpawnState::Queued,103_012_000,901);
+    trace::created(trace::Child{group:key(12),child:key(101),parent:request.caller,request_id:251,at:103_012_500});
+    assert_eq!(trace::snapshots().1[72],101,"exact closing probe child was not retained");
+    trace::admission_result(true,103_013_000);
+    cpu::at(3);
+    trace::installed(key(12),PolicyStamp {snapshot_ns:99_000_000,..closing_stamp},103_014_000);
+    assert_eq!(trace::snapshots().1[88],0,"closing task accepted a mismatched snapshot");
+    trace::installed(key(12),closing_stamp,103_014_000);
+    scheduler.install_weight(key(12),1,closing_stamp,103_014_000).unwrap();
+    let close_dispatch=scheduler.dispatch(3,layout,103_015_000,20_000).unwrap().unwrap();
+    trace::selected(close_dispatch);
+    scheduler.complete(close_dispatch,10_000,RunState::Runnable,103_025_000).unwrap();
+    trace::settled(trace::Settlement {dispatch:close_dispatch,actual_ns:10_000,physical_finished_ns:103_025_000,
+        settled_ns:104_000_000,before_version:Ok(41),after_version:Ok(42),still_active:false,result:Ok(())});
+    cpu::at(0);
+    trace::reconciled(trace::Reconciliation {target:key(12),stamp:closing_stamp,version:42,in_flight:false,
+        state:ExecutionState::Applied,at:104_001_000});
+    trace::closing_work(RUN,trace::ClosingWork::ClosingObserved{version:42,state:ExecutionState::Applied},104_002_000);
+    trace::closing_work(RUN,trace::ClosingWork::ProbeOutcome{id:251,result:Ok(103_025_000)},104_003_000);
+    trace::closing_work(RUN,trace::ClosingWork::Block{reason:1},104_004_000);
+    trace::task_block(RUN,2,[251,7,1,12,1,0],104_005_000);
+    trace::closing_work(RUN,trace::ClosingWork::Drained,104_006_000);
+    let (_,closed_task,closed_work)=trace::snapshots();
+    assert_eq!(&closed_work[34..39],&[1,Error::Busy as u64+1,103_004_000,42,60]);
+    assert_eq!(&closed_work[40..47],&[251,5_103_005_000,103_005_000,103_006_000,103_007_000,
+        5|((Error::Busy as u64+1)<<8),103_009_000]);
+    assert_eq!(&closed_work[47..50],&[104_003_000,103_025_000,2]);
+    assert_eq!(closed_task[88],42);assert_eq!(closed_task[96],close_dispatch.sequence);
+    assert_eq!(closed_task[109],103_025_000,"closing physical time was replaced by settlement");
+    assert_eq!(closed_task[111],104_000_000);assert_eq!(closed_task[120],104_001_000);
+    let admission=trace::admission_snapshot();
+    assert_eq!(&admission[8..15],&[closing_apply.boot_epoch,closing_apply.controller_epoch,60,0,12,1,42]);
+    assert_eq!(&admission[25..30],&[251,foreign.caller.id,1,1,103_011_000]);
+    assert_eq!(&admission[30..35],&[251,request.caller.id,1,1,103_012_000]);
+    assert_eq!(admission[59],900);assert_eq!(admission[60],901);
+    assert_eq!(&closed_work[59..63],&[1,1,103_012_000,901]);
+    assert_eq!(&admission[40..48],&[104_005_000,2,251,7,1,12,1,0]);
+    assert_eq!(&admission[52..56],&[2,0x1007,103_004_000,1]);
     trace::close(RUN, 110_000_000);
+    let admission_frozen=trace::admission_snapshot();
     let frozen = trace::snapshots();
     trace::begin(RunKey { trial_id: 10, generation: 4, ..RUN }, Family { domain: 1, kind: 1 }, key(12), 200_000_000);
     trace::control(event(90, false, Ok(ExecutionState::Pending), 200_000_000, 1));
     trace::work(RunKey { trial_id: 10, ..RUN }, trace::WorkEvent::Poll, 200_001_000);
     trace::installed(key(12), PolicyStamp { version: 42, ..STAMP }, 200_001_000);
+    trace::admission_body(999,200_002_000);
+    trace::task_block(RUN,9,[9;6],200_002_000);
+    assert_eq!(trace::admission_snapshot(),admission_frozen,"later trial replaced closing diagnostics");
     assert_eq!(trace::snapshots(), frozen, "later trial replaced first-publication diagnostics");
     assert_eq!(frozen.0[223] & 1, 0); assert_eq!(frozen.1[127] & 1, 0); assert_eq!(frozen.2[63] & 1, 0);
 }

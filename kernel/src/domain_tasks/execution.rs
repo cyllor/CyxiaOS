@@ -918,7 +918,17 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
             local_failure: None,
         };
         let entered_ns = now_ns();
-        match s.admission.service_one(entered_ns, &mut backend)? {
+        let selected = s.admission.service_one(entered_ns, &mut backend)?;
+        #[cfg(not(test))]
+        if let Some((request, value)) = &selected {
+            crate::learning_evidence::execution_trace::admitted(
+                request,
+                *value,
+                now_ns(),
+                s.active[0].map_or(0, |v| v.dispatch.sequence),
+            );
+        }
+        match selected {
             None => break,
             Some((request, SpawnState::Failed(error))) => {
                 // The original constructor snapshot becomes visible only
@@ -1265,10 +1275,31 @@ fn service_baseline_activation_at(site: u64) {
         // construction a separate reservation. An unsettled prior bill or
         // insufficient fresh credit prevents this body from running. Keep the
         // shared retry guard held across both pieces, including nested progress.
-        if outcome.is_some_and(|result| result.is_ok())
-            && crate::learning_replay::baseline_activation_pending()
-        {
-            let _ = service_segment(|| locked(|s| advance_admission_bounded(s, 1, 0)));
+        let root_ok = outcome.is_some_and(|result| result.is_ok());
+        let pending = crate::learning_replay::baseline_activation_pending();
+        #[cfg(not(test))]
+        crate::learning_evidence::execution_trace::admission_opportunity(
+            root_ok,
+            pending,
+            now_ns(),
+        );
+        if root_ok && pending {
+            let admitted = service_segment(|| {
+                locked(|s| {
+                    #[cfg(not(test))]
+                    crate::learning_evidence::execution_trace::admission_body(
+                        s.active[0].map_or(0, |v| v.dispatch.sequence),
+                        now_ns(),
+                    );
+                    advance_admission_bounded(s, 1, 0)
+                })
+            });
+            #[cfg(not(test))]
+            crate::learning_evidence::execution_trace::admission_result(
+                admitted.is_some(),
+                now_ns(),
+            );
+            let _ = admitted;
         }
     }
 }

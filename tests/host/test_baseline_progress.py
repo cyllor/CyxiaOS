@@ -87,9 +87,9 @@ class BaselineProgress(unittest.TestCase):
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('recursive progress replaced the outer diagnostic ticket',
                           negative.stdout + negative.stderr)
-            admission = '            let _ = service_segment(|| locked(|s| advance_admission_bounded(s, 1, 0)));'
+            admission = 'advance_admission_bounded(s, 1, 0)'
             self.assertEqual(template.count(admission), 1)
-            rust.write_text(template.replace(admission, ''))
+            rust.write_text(template.replace(admission, 'Ok(())'))
             negative = subprocess.run(command + ['--exact',
                 'pending_execution_constructs_one_original_queued_child_under_separate_credit'],
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)

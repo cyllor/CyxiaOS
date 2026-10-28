@@ -1,14 +1,15 @@
 # First-trial execution milestones
 
-These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 3,328 bytes are included in the existing learning workspace bound.
+These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 3,840 bytes are included in the existing learning workspace bound.
 
-The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp. A seal closes collection. Later trials cannot replace the first scope. The three banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened.
+The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp. A seal closes collection. Later trials cannot replace the first scope. The four banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened. The closing extension is available only in images containing `TRACE_CLOSING_EVIDENCE`; historical images leave the newly used reserved words uninterpreted.
 
 | Bank | Bytes / publication word | Writer |
 | --- | --- | --- |
 | `TRACE_CONTROL_EVIDENCE` | 1,792 / 223 | CPU0, under control-owner exclusion |
 | `TRACE_TASK_EVIDENCE` | 1,024 / 127 | Existing task-owner gate, including CPU3 settlement |
 | `TRACE_WORK_EVIDENCE` | 512 / 63 | CPU0 workload owner |
+| `TRACE_CLOSING_EVIDENCE` | 512 / 63 | CPU0 root, helper and task-owner boundaries |
 
 All words are little-endian u64. Raw banks survive in the node directory and final functional report, including failed observations.
 
@@ -45,3 +46,56 @@ The work bank retains exact scope in words 2–7. Words 8–9 record activation 
 The host regression executes the actual task gate and `complete_locked`, control polling and warm-work functions against a real Scheduler. Hardware, transport, history and stability callbacks are controlled boundaries. Independent removal of each reporting hook fails its named assertion; storage tests distinguish physical completion, settlement and observation, identity overflow, conflicting actions and later-trial replacement. Native timing and causality still require the instrumented run.
 
 The separate `BASELINE_SERVICE_EVIDENCE` bank now follows the protected scheduling hint through real Pending/Unknown baseline, renewal and closing receipts, including faulted restoration. One helper opportunity can contain two separately billed pieces: replay service, then at most one bounded queued admission if replay returned successfully and the hint remains set. Its diagnostic ticket, body timings and final credit fields describe the replay piece only; that ticket closes before the admission piece begins. Actual Scheduler billing and replay capture account for both pieces. A stale hint supplies no execution authority, and Candidate initial execution is not covered by the baseline receipt cache.
+
+The closing extension keeps the first published closing identity. Root publishes its full ApplyId, version, snapshot and approved deadline before asynchronous executor work. A Release store of the version arms task-side matching; task writers retain their existing task gate. A different closing identity increments an explicit conflict count rather than replacing the first. Repeated closing attempts and other families therefore cannot be inferred from one retained chain.
+
+Additional task-bank words are:
+
+| Words | Meaning |
+| --- | --- |
+| 72–79 | Closing probe child: same eight fields as the original child row, matched by group, request ID and full caller key |
+| 88–90 / 91 | Closing installation version/snapshot/time; count of mismatching installation snapshots |
+| 92–95 | Closing cancellations, selections, settlements and reconciliation counts |
+| 96–103 | First closing selection, same format as word 16 |
+| 104–111 | First nonzero closing physical completion and settlement, same format as word 32 |
+| 112–119 | First closing receipt advance, same format as word 40 |
+| 120–125 / 126 | First Applied closing reconciliation, same format as word 56; failed settlement receipt-query count |
+
+The production `complete_locked` qualification includes first and closing versions. Each lane's writer uses its own predicate, so closing observations do not inflate first-policy counters. The actual-function regression passes through the real task gate and Scheduler; restoring the old first-only qualification fails its closing assertion. A physical completion row describes one dispatch segment, not the entire child's exit.
+
+Additional work-bank words are:
+
+| Words | Meaning |
+| --- | --- |
+| 31–33 | Drain calls and first/latest entry |
+| 34–36 | Poll error count, first original domain error+1 and observation |
+| 37–39 | First closing version, plan sequence and mismatching probe-version count |
+| 40–42 | First probe ID, original deadline and creation observation |
+| 43–46 | First submit entry/return/result, then first successful return |
+| 47–49 | First actual outcome observation, returned physical finish on success, result |
+| 50–55 | First blocker/time, latest blocker/time, first workload observation of closing Applied, first completed drain |
+| 56–58 | Probe submit count, latest return and result |
+| 59–62 | Probe queue-selection count, latest SpawnState tag/time and actual service dispatch sequence |
+
+Work blocker tags are measurement wait-all=1, probe wait=2, core=3, tasks=4, storage=5, IRQ=6, echo=7, prewarm=8 and timer=9. Submit/outcome result tags use the existing result encoder. Busy retries keep the original ID and deadline. Poll errors propagate unchanged; diagnostics do not turn NotReady, Capacity or Budget into permission to continue.
+
+The closing bank has this layout:
+
+| Words | Meaning |
+| --- | --- |
+| 0–7 | Magic/version, boot/trial/generation, first timestamp and target key |
+| 8–18 | Full ApplyId, policy version, snapshot, publication, approved deadline and arm observation |
+| 19–24 | Helper opportunities, eligible second pieces, second pieces without an entered service body, task-gated admission entries, first actual body sequence/time |
+| 25–29 / 30–34 | First selected request / first selected probe: ID, caller key, SpawnState tag and observation |
+| 35–39 | All selected attempts, Queued/Deferred results, Created results, other results, latest helper opportunity |
+| 40–47 | First task-drain blocker time/reason and six raw detail fields |
+| 48–51 | Latest task-drain blocker/time, blocker count and first clear observation |
+| 52–55 | First original poll failure stage/code/time and total tagged failure count |
+| 56–60 | Latest root-success/pending bits, latest second-piece return, identity conflicts, first-selected sequence and first-probe-selected sequence |
+| 61–62 | Exact probe caller ObjectKey, bound in actual replay `spawn` before queue submission |
+
+SpawnState tags are Queued=1, Created=2, Failed=`3 | ((error+1)<<8)`, Unknown=4, Cancelled=5. The normal selector and targeted helper both emit actual selections. Aggregate selection counts cover the armed scope through seal; they are not all necessarily targeted-helper selections or pre-Applied work. Compare the recorded service sequences before attributing a queue choice to a helper body. No service body and no task-gated admission entry are distinct observations.
+
+Task-drain blocker reasons are child task=1, queued launch=2, retained exit=3, vector=4, local spawn=5, endpoint queue/reservation=6 and send lease=7. Details identify the corresponding task/request/exit or endpoint. The first and latest blocker can differ. Clear means this task owner returned no blocker, not that every other owner or capture source has drained.
+
+Original evidence failure stages 1–4 are request lookup for arming, arm, request lookup for result, and result publication. Codes 1–5 name evidence NotReady/Busy/Owner/Stale/Capacity; `0x100 + learning_error + 1` preserves the inner Capture error. Domain stages 5–8 name root poll, pending-closing probe query, post-Applied probe query, and task drain, with code `0x10000 + domain_error + 1`. Not every earlier return has a stage tag: absent PollOrigin does not prove success. The work poll return remains separately recorded before propagation.

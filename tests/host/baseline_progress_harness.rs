@@ -146,7 +146,15 @@ pub mod domain_tasks {
         authorize_service_turn, service_baseline_progress};
 }
 mod learning_evidence {
-    pub mod execution_trace { pub fn cancelled(_: super::super::Dispatch, _: u64) {} }
+    pub mod execution_trace {
+        // Diagnostics have separate actual-bank/actual-hook regressions. This
+        // fixture asserts scheduling and bills, not diagnostic serialization.
+        pub fn cancelled(_: super::super::Dispatch, _: u64) {}
+        pub fn admitted(_: &super::super::SpawnRequest,_:super::super::SpawnState,_:u64,_:u64) {}
+        pub fn admission_opportunity(_:bool,_:bool,_:u64) {}
+        pub fn admission_body(_:u64,_:u64) {}
+        pub fn admission_result(_:bool,_:u64) {}
+    }
     pub fn attempt(_: super::ObjectKey, _: cyxia_prototype::learning::reward::CpuClass)
         -> Result<Option<()>, super::Error> { Ok(None) }
     pub fn finish_attempt(_: &mut (), _: u64, _: u64) -> Result<(), super::Error> { Ok(()) }

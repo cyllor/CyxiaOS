@@ -5,6 +5,7 @@ does not claim native execution or completion of a synthetic request.
 """
 from pathlib import Path
 import subprocess
+import re
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,11 @@ class ClosingProgress(unittest.TestCase):
         source = (ROOT / 'kernel/src/learning_workload/owner.rs').read_text()
         body = function(source, 'pub fn drain(')
         template = (ROOT / 'tests/host/workload_closing_progress_harness.rs').read_text()
+        # Enable diagnostic hooks in this actual-body fixture. Production still
+        # excludes them from ordinary cfg(test) kernel builds.
+        body=body.replace('#[cfg(not(test))]', '')
+        template=template.replace('// POLL_NATIVE','\n'.join(function(source,s).replace(
+            '#[cfg(not(test))]', '') for s in ['fn native(', 'fn poll_native(', 'fn poll_domain(']))
         with tempfile.TemporaryDirectory() as temporary:
             rust = Path(temporary) / 'harness.rs'
             binary = Path(temporary) / 'test'
@@ -35,18 +41,24 @@ class ClosingProgress(unittest.TestCase):
 
             result = run(body)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('6 passed; 0 failed', result.stdout)
-            early = '    let poll_done = poll(run)?;'
+            self.assertIn('8 passed; 0 failed', result.stdout)
+            early = '    let poll_done = polled?;'
             self.assertEqual(body.count(early), 1)
             negative = run(body.replace(early, early + '\n    if !poll_done { return Ok(false); }'),
                            'closing_probe_can_progress_before_measurement_wait_all')
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('closing demand blocked behind measurement wait-all', negative.stdout)
-            barrier = '    if !poll_done\n        || !done'
+            barrier = '    if !poll_done || !done'
             self.assertEqual(body.count(barrier), 1)
             negative = run(body.replace(barrier, '    if !done'),
                            'applied_receipt_does_not_retire_unfinished_probe_or_measurement')
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            submit_hook=r'evidence::execution_trace::closing_work\(\s*run,\s*evidence::execution_trace::ClosingWork::ProbeSubmit\s*\{.*?\},\s*now\(\),?\s*\);'
+            mutant,count=re.subn(submit_hook,'',body,flags=re.S)
+            self.assertEqual(count,1)
+            negative=run(mutant,'closing_probe_can_progress_before_measurement_wait_all')
+            self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertIn('actual probe submit hook was absent',negative.stdout+negative.stderr)
 
 
 if __name__ == '__main__':

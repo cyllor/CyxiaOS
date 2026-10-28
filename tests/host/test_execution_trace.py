@@ -59,6 +59,14 @@ pub fn snapshots() -> ([u64;224],[u64;128],[u64;64]) {
                 negative = subprocess.run(command, cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
                 self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
                 self.assertIn(failure, negative.stdout + negative.stderr)
+            rust.write_text(program)
+            trace_original=trace.read_text()
+            qualification=function(trace_original,'pub fn tracks_dispatch(')
+            trace.write_text(trace_original.replace(qualification,
+                'pub fn tracks_dispatch(d: Dispatch) -> bool { first_dispatch(d) }'))
+            negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+            self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertIn('production closing settlement hook was gated out',negative.stdout+negative.stderr)
 
     def test_first_trial_keeps_execution_settlement_and_observation_distinct(self):
         source = ROOT / 'kernel/src/learning_evidence/execution_trace.rs'
@@ -67,7 +75,15 @@ pub fn snapshots() -> ([u64;224],[u64;128],[u64;64]) {
             directory = Path(temporary)
             module = directory / 'trace.rs'
             if source.exists():
-                module.write_text(source.read_text() + '''
+                closing = (ROOT / 'tests/host/closing_trace_missing.rs').read_text() if (
+                    'pub fn closing(' not in source.read_text()) else '''
+pub fn admission_snapshot() -> [u64;64] {
+    core::array::from_fn(|i|TRACE_CLOSING_EVIDENCE.words[i].load(Ordering::Acquire))
+}
+'''
+                if 'pub fn probe_caller(' not in source.read_text():
+                    closing += 'pub fn probe_caller(_:RunKey,_:u64,_:ObjectKey,_:u64) {}\n'
+                module.write_text(source.read_text() + closing + '''
 pub fn snapshots() -> ([u64; 224], [u64; 128], [u64; 64]) {
     (core::array::from_fn(|i| TRACE_CONTROL_EVIDENCE.words[i].load(Ordering::Acquire)),
      core::array::from_fn(|i| TRACE_TASK_EVIDENCE.words[i].load(Ordering::Acquire)),
@@ -99,6 +115,13 @@ pub fn snapshots() -> ([u64; 224], [u64; 128], [u64; 64]) {
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('physical completion was replaced by settlement time',
                           negative.stdout + negative.stderr)
+            matching=function(original,'fn probe_matches(')
+            module.write_text(original.replace(matching,'''fn probe_matches(group:ObjectKey,_caller:ObjectKey,id:u64)->bool {
+    closing_active() && TRACE_WORK_EVIDENCE.get(40)==id && target_matches(group)
+}'''))
+            negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+            self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertIn('foreign caller occupied closing probe child record',negative.stdout+negative.stderr)
 
 
 if __name__ == '__main__':
