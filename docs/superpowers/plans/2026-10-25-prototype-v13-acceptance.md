@@ -81,6 +81,18 @@
 
 ## Execution Ledger
 
+### V0.12 delivery entrypoints (2026-10-28 continuation)
+
+While native builds/replay run, implement the independently testable §15 delivery interface in `tools/prototype.py`. Reuse the actual native builder and verifiers: `build` forwards to `build_unified.py`, `run-single` to `verify_domains.py --single`, and `run-pair` to `verify_unified.py`. `test` executes pinned fixture preparation, formatting, Rust workspace/TLS tests, Python suites and native Clippy, retaining each command's output and exit status. `report` runs the fixed 1.3 evidence validator and returns nonzero for incomplete acceptance. No wrapper may infer acceptance from a build, host test, diagnostic PASS or historical run.
+
+- [x] Add behavior tests for retained failure logs, continued independent checks, interrupted checks, existing-output protection, native command help/argument forwarding, and an incomplete catalogue report returning nonzero.
+- [x] Observe failing tests, implement the thin entrypoints, and run targeted then complete host/tool checks.
+- [x] Document real commands and explicit scope; independently review the final change before committing.
+
+Ruling: §15 delivery work can proceed independently while Tasks 1/2/4 await runtime evidence. It does not close any A/T/E or action-family result. Cost if wrong: revise the CLI integration when those runtime interfaces change.
+
+Continuation checkpoint: [V0.12 implementation and evidence](../../implementation/v012-continuation.md). The delivery interface is implemented; Tasks 1–5 and complete prototype acceptance remain open.
+
 - 2026-10-25: User explicitly authorized the full acceptance goal. Existing branch and prior uncommitted work retained; no fresh checkout that would strand fixes.
 - Ruling: Start with known defects and independently useful verifier work while auditing architecture. The approved design supplies requirements; remaining implementation decisions are recorded here as evidence becomes available.
 - Pre-flight: Tasks 1/2 share the final native build and evidence run; root owns those runs to avoid contention. Task 3 does not edit `verify_domains.py`. Architecture audit initially read-only.
