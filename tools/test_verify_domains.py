@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, CONTROL_POOL_MAGIC, LEARNING_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_control_pool, parse_learning, parse_ipi, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
+from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, CONTROL_POOL_MAGIC, GOVERNANCE_MAGIC, LEARNING_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_control_pool, parse_governance, parse_learning, parse_ipi, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
 from verify_domains import RECONNECT_OUTAGE_NS, ReconnectProbe, run
 from verify_domains import REPLAY_MAGIC, capture, parse_replay, refresh_snapshot, replay_ready
 
@@ -609,6 +609,24 @@ class EvidenceParserTests(unittest.TestCase):
         values[3] = 2049
         with self.assertRaisesRegex(ValueError, "allocation/pin bounds"):
             parse_control_pool(encode(values))
+
+    def test_governance_identity_binds_separate_image_and_mapping_without_execution_claim(self):
+        values = [0] * 16
+        values[:11] = [GOVERNANCE_MAGIC, 1, 0x80000, 0x44002000,
+                       17, 1, 1, 4, 3, 0x474f56434f4f0001, 1]
+        values[11:15] = [1, 2, 3, 4]
+        values[15] = 1
+        result = parse_governance(encode(values))
+        self.assertEqual(result['role_context'], [0x474f56434f4f0001, 1])
+        self.assertEqual(result['code_pages'], 17)
+        self.assertTrue(result['mapped_not_scheduled'])
+        values[7] = 3
+        with self.assertRaisesRegex(ValueError, 'private mapping bounds'):
+            parse_governance(encode(values))
+        values[7] = 4
+        values[11:15] = [0, 0, 0, 0]
+        with self.assertRaisesRegex(ValueError, 'image hash'):
+            parse_governance(encode(values))
 
     def test_independent_operator_selftest_is_never_training(self):
         values = self.learning()

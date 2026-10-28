@@ -72,6 +72,15 @@ class UnifiedBuilder(unittest.TestCase):
             self.assertNotIn('PRIVATE-KEY',json.dumps(result));self.assertNotIn('key.der',json.dumps(result))
             (p/'peer.pin').write_bytes(bytes(32))
             with self.assertRaises(ValueError):build.identity_metadata(p)
+    def test_embedded_role_audit_requires_the_exact_nonempty_image(self):
+        build.audit_embedded_role(b'kernel-prefix' + b'governance-image' + b'-suffix',
+                                  b'governance-image', 'governance')
+        with self.assertRaisesRegex(ValueError, 'exact embedded governance'):
+            build.audit_embedded_role(b'kernel-without-role', b'governance-image',
+                                      'governance')
+        with self.assertRaisesRegex(ValueError, 'exact embedded governance'):
+            build.audit_embedded_role(b'kernel', b'', 'governance')
+
     def test_json_messages_select_exact_kernel_artifact_and_actual_task_directory(self):
         messages=[{'reason':'build-script-executed','package_id':'path+file:///repo/kernel#cyxia-kernel@0.1.0','out_dir':'/build/out'}, {'reason':'compiler-artifact','target':{'name':'unrelated'},'executable':'/bad'}, {'reason':'compiler-artifact','target':{'name':'cyxia-kernel'},'executable':'/build/cyxia-kernel'}]
         self.assertEqual(build.parse_cargo_build_messages('\n'.join(map(json.dumps,messages))), (Path('/build/cyxia-kernel'),Path('/build/out')))

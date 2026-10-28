@@ -263,6 +263,49 @@ fn main() {
             learning_out.join("prototype-learning.elf"),
         )
         .expect("copy independent learning image");
+        // The governance coordinator is a distinct EL0 image and role. Build it
+        // into the same exact kernel OUT_DIR, but keep a separate target tree so
+        // nested Cargo never aliases the numerical worker's artifacts or lock.
+        let governance_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../user/prototype-governance");
+        let governance_target = learning_out.join("governance-target");
+        println!("cargo:rerun-if-changed={}", governance_root.display());
+        println!("cargo:rerun-if-changed=../crates/prototype/src/learning/coordinator_wire");
+        checked(
+            Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .args([
+                    "rustc",
+                    "--release",
+                    "--locked",
+                    "--offline",
+                    "--target",
+                    "aarch64-unknown-none-softfloat",
+                    "--manifest-path",
+                ])
+                .arg(governance_root.join("Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &governance_target)
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTFLAGS")
+                .arg("--")
+                .args([
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "link-arg=--build-id=none",
+                    "-C",
+                    "link-arg=-zmax-page-size=4096",
+                ])
+                .arg("-C")
+                .arg(format!(
+                    "link-arg=-T{}",
+                    governance_root.join("linker.ld").display()
+                )),
+        );
+        std::fs::copy(
+            governance_target.join("aarch64-unknown-none-softfloat/release/prototype-governance"),
+            learning_out.join("prototype-governance.elf"),
+        )
+        .expect("copy independent governance image");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_SERVICE_ELF");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");

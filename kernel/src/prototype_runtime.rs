@@ -9,6 +9,9 @@ use super::*;
 mod abi;
 #[path = "../../user/prototype-runtime/dynamic.rs"]
 mod dynamic;
+#[cfg(feature = "unified-runtime")]
+#[path = "prototype_runtime/governance.rs"]
+mod governance;
 #[path = "../../user/prototype-runtime/idle.rs"]
 mod idle;
 #[cfg(feature = "unified-runtime")]
@@ -261,6 +264,7 @@ pub(super) unsafe fn init() {
             }
         }
         learning::init().expect("learning control pool");
+        governance::init().expect("governance control mapping");
     }
 }
 fn fresh(mode: u64) -> user::Context {
@@ -297,11 +301,18 @@ impl Worker {
     }
 }
 #[cfg(feature = "unified-runtime")]
+pub use governance::Registration as GovernanceRegistration;
+#[cfg(feature = "unified-runtime")]
 pub use learning::InputLoan as LearningInputLoan;
 #[cfg(feature = "unified-runtime")]
 pub use learning::Registration as LearningRegistration;
 #[cfg(feature = "unified-runtime")]
 pub use learning::{Request as LearningRequest, Status as LearningStatus};
+#[cfg(feature = "unified-runtime")]
+pub fn governance_registration() -> Result<GovernanceRegistration, cyxia_prototype::domains::Error>
+{
+    governance::registration()
+}
 #[cfg(feature = "unified-runtime")]
 pub fn learning_driver_workspace()
 -> Result<crate::control_pool::Allocation, cyxia_prototype::domains::Error> {

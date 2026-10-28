@@ -1,10 +1,11 @@
 # Proposed EL0 learning-governance contract
 
-**Status: bounded coordinator wire v1 implemented and host-gated; the
-independent EL0 role/runtime is not yet integrated or native-accepted.** This
-increment does not claim A16 completion or move the remaining learning
-coordination choices out of EL1. The governing requirements are v1.3 §2.1, §5
-control budgets, §6.3, and A16.
+**Status: bounded coordinator wire v1 and the independent EL0 image are
+implemented. The unified kernel now builds, embeds, hashes and installs a
+separate bounded governance address space, but it is not yet dispatched or
+native-accepted.** This increment does not claim A16 completion or move the
+remaining learning coordination choices out of EL1. The governing requirements
+are v1.3 §2.1, §5 control budgets, §6.3, and A16.
 
 ## 2026-10-28 implementation checkpoint
 
@@ -18,13 +19,22 @@ Malformed encodings, stale generations, skipped or wrapped sequences, expired
 snapshots, handle substitution, receipt tampering, and excess credit are covered
 by negative tests in `crates/prototype/tests/learning_coordinator_wire.rs`.
 
-The exact source passed Rust 1.95 formatting, configured AArch64 kernel Clippy
-with `-D warnings`, the complete non-kernel Rust workspace, 630 host tests (two
-environment skips), and 77 evidence-tool tests in public Actions run
-`40625220174`. This proves the bounded transport and host validators only. The
-independently linked/scheduled EL0 coordinator image, mappings, dispatch-derived
-authority, shared-surplus accounting, command application refactor, migration
-ownership handoff, and native A16 execution evidence remain open.
+The exact transport source passed Rust 1.95 formatting, configured AArch64
+kernel Clippy with `-D warnings`, the complete non-kernel Rust workspace, 630
+host tests (two environment skips), and 77 evidence-tool tests in public Actions
+run `40625220174`.
+
+The next integration slice builds `prototype-governance.elf` inside the exact
+unified kernel build, retains the exact embedded bytes as a separately hashed
+build artifact, validates an RX/RO-only AArch64 ELF plan, copies it into the real
+8 MiB control pool, and installs distinct read-only observation, writable
+command, private stack and sealed page-table mappings. The stopped-snapshot
+`GOVERNANCE_V13_EVIDENCE` bank binds the image hash, role context, entry, root
+and page counts and explicitly reports a mapped-not-scheduled state. This does
+not grant command authority or create another 9 ms budget. Actual prepaid EL0
+dispatch, trap-derived authority, shared-surplus accounting, command application
+refactor, migration ownership handoff, and native A16 execution evidence remain
+open.
 
 ## Observed deployment gap
 

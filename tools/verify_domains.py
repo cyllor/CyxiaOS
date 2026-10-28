@@ -43,6 +43,7 @@ IPI_MAGIC = 0x4359495049000001
 CONTROL_CREDIT_MAGIC = 0x4359434352454401
 CONTROL_POOL_MAGIC = 0x435943504F4F4C01
 LEARNING_MAGIC = 0x43594C4541524E01
+GOVERNANCE_MAGIC = 0x4359474F56455201
 REPLAY_MAGIC = 0x435952504C593133
 RUNTIME_MAGIC = 0x43595852554E3133
 # The actual cluster Driver closes after 1.5 guest seconds without an RPC.
@@ -68,7 +69,8 @@ REQUIRED = {
 }
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
-            "LEARNING_V13_EVIDENCE": 1024, "REPLAY_V13_EVIDENCE": 512,
+            "LEARNING_V13_EVIDENCE": 1024, "GOVERNANCE_V13_EVIDENCE": 128,
+            "REPLAY_V13_EVIDENCE": 512,
             "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
@@ -381,6 +383,29 @@ def parse_control_pool(data):
             "allocations": w[4], "live_pins": w[5]}
 
 
+def parse_governance(data):
+    w = words(data, 16)
+    if w[0] == 0 or w[15] == 0:
+        return None
+    require(w[0] == GOVERNANCE_MAGIC and w[1] == 1,
+            "invalid governance image identity header")
+    require(0x80000 <= w[2] < 0x100000 and w[2] % 4 == 0,
+            "invalid governance entry point")
+    require(w[3] > 0 and w[3] % 4096 == 0 and 0 < w[4] <= 128,
+            "invalid governance mapping root or code pages")
+    require(w[5:9] == (1, 1, 4, 3),
+            "invalid governance private mapping bounds")
+    require(w[9] != 0 and w[10] != 0 and any(w[11:15]),
+            "invalid governance role or image hash")
+    return {"entry": w[2], "root": w[3], "code_pages": w[4],
+            "input_pages": w[5], "output_pages": w[6],
+            "stack_pages": w[7], "table_pages": w[8],
+            "role_context": [w[9], w[10]],
+            "image_hash": b"".join(value.to_bytes(8, "little")
+                                   for value in w[11:15]).hex(),
+            "mapped_not_scheduled": True}
+
+
 def parse_learning(data):
     w = words(data, 128)
     # The failure is sticky and cannot be hidden by an interrupted snapshot.
@@ -537,6 +562,7 @@ def diagnostics(guest, bundle):
                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
                                     ("CONTROL_POOL_EVIDENCE", "control_pool_evidence", 16),
                                     ("LEARNING_V13_EVIDENCE", "learning_evidence", 128),
+                                    ("GOVERNANCE_V13_EVIDENCE", "governance_evidence", 16),
                                     ("REPLAY_V13_EVIDENCE", "replay_evidence", 64),
                                     ("REPLAY_ROOT_EVIDENCE", "replay_root_evidence", 32),
                                     ("REPLAY_OWNER_EVIDENCE", "replay_owner_evidence", 32),
@@ -594,6 +620,7 @@ def diagnostics(guest, bundle):
                                      ("IPI_EVIDENCE", "ipi", parse_ipi),
                                      ("CONTROL_POOL_EVIDENCE", "control_pool", parse_control_pool),
                                      ("LEARNING_V13_EVIDENCE", "learning", parse_learning),
+                                     ("GOVERNANCE_V13_EVIDENCE", "governance", parse_governance),
                                      ("REPLAY_V13_EVIDENCE", "replay", parse_replay)):
         guest[key] = None
         if symbol_name in bundle:

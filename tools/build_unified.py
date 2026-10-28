@@ -71,6 +71,11 @@ def audit_private_images(service,image,own_tls,peer_tls,own_billing,peer_billing
     require(own_billing in image and peer_billing not in image,'kernel billing key isolation audit failed')
 
 
+def audit_embedded_role(image, role, name):
+    require(role and role in image,
+            f'kernel does not retain the exact embedded {name} EL0 image')
+
+
 def parse_cargo_build_messages(text):
     executable,out_dir=None,None
     for line in text.splitlines():
@@ -158,7 +163,7 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     require('aarch64-unknown-none\n' in versions['installed_targets']+'\n' and 'aarch64-unknown-none-softfloat' in versions['installed_targets'],'install both standard EL0 and softfloat EL1 Rust targets before building')
     keys=[(p/'key.der').read_bytes() for p in identities]
     billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
-    artifacts={};commands=[];task_hash=None
+    artifacts={};commands=[];task_hash=None;governance_hash=None
     for index,name in enumerate(('a','b')):
         per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault,CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
@@ -179,6 +184,18 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
         require(task_hash is None or found_hash==task_hash,'nodes contain different pure-task packages')
         if task_hash is None:shutil.copyfile(package,output/'task.elf');(output/'task.elf').chmod(0o600)
         task_hash=found_hash
+        governance=actual_out/'prototype-governance.elf'
+        require(governance.is_file() and governance.stat().st_size>0,
+                'kernel build did not emit the independent governance image')
+        governance_bytes=governance.read_bytes()
+        audit_embedded_role(image.read_bytes(),governance_bytes,'governance')
+        found_governance_hash=hashlib.sha256(governance_bytes).hexdigest()
+        require(governance_hash is None or found_governance_hash==governance_hash,
+                'nodes contain different governance images')
+        if governance_hash is None:
+            shutil.copyfile(governance,output/'governance.elf')
+            (output/'governance.elf').chmod(0o600)
+        governance_hash=found_governance_hash
         public=output/f'node-{name}.pub';public.write_bytes((identities[index]/'own.pub').read_bytes());public.chmod(0o600)
         audit_private_images(service.read_bytes(),image.read_bytes(),keys[index],keys[1-index],billing_seeds[index],billing_seeds[1-index])
         billing_public=output/f'node-{name}.billing.pub';billing_public.write_bytes((identities[index]/'billing.pub').read_bytes());billing_public.chmod(0o600)
@@ -190,7 +207,7 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     require(sha(Path(__file__)) == builder_digest, 'native builder changed during build')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,embedded_roles=dict(governance=dict(sha256=governance_hash,bytes=(output/'governance.elf').stat().st_size)),own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
