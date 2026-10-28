@@ -2,7 +2,7 @@
 
 The complete prototype remains **incomplete**. The fixed configuration-1.3 catalogue reports 69 `NOT_RUN` entries, an incomplete filesystem fault matrix, and `functional_acceptance_complete: false`. Passing host checks and individual native startup observations do not close those requirements.
 
-Latest implementation commit: `f61b494`. Its first native baseline reaches Applied in 20.564 ms from the original snapshot. The full 600-second replay gate still **FAILs**: closing execution and resource draining exceed their separate deadlines, and the third capture loses 60 completed intervals to a full handoff bank. No replay label is accepted.
+Latest implementation commits: `15102e3` and `0a9a65f`. The first baseline in their native run reaches Applied in 22.363008 ms. The full replay gate still **FAILs**: closing waits before actual execution, launch records obstruct draining, and 210 Full losses are recorded, with the first on CPU0's executor-action path. Two completed records have zero missing events; the third scope is unsealed. No replay label is accepted.
 
 ## Implemented checkpoint
 
@@ -184,3 +184,48 @@ First-scope Control CPU is 79,381 ns for the initial policy plus 38,596,793 ns f
 Next, retain the closing version/probe identity across poll, submission, actual queue selection, dispatch, physical completion and settlement, plus the first post-Applied drain blocker. The present bank only tracks the initial task policy. Source inspection confirms that a `poll(run)?` error skips the closing probe and the extra admission, but current native evidence does not prove that caused the closing delay. Do not swallow `transient()` wholesale: it includes Budget/Capacity and evidence failures map to NotReady. Full losses require separate bounded completion custody/backpressure, preserving the existing 16-cell capacity. Do not repeat the unchanged 600-second profile before this evidence-backed work.
 
 Candidate initial execution, native renewal, complete bounded draining and every later acceptance gate still need their own evidence. Paired replay, native training/validation data, model transitions, all mandatory scenario verifiers and the filesystem fault matrix remain open. The v32 catalogue report still has all 69 cases NOT_RUN and an incomplete filesystem matrix; no newer local commit has been pushed to the validation branch.
+
+## Completed capture and closing-path checkpoint
+
+Commit `15102e3` preserves a completed CPU2/3 physical capture in its original producer cell when collector/peer delivery is Busy. Old Scheduler billing proceeds independently before capture retirement; Busy blocks replacement and new grants. Completed, Active and Cancelled custody stay distinct. Warm is consumed once, the original times and binding cannot be rewritten, and CPU2's disabled stop path must retire its own capture before acknowledgement. CPU0 retains the existing shared handoff to avoid suspended-collector I/O self-wait. The handoff remains 16 cells. [Custody design and test limits](completed-capture-custody.md) describe the actual-source/real-Scheduler tests and controlled hardware boundaries. This does not establish loss-free synchronous measurement or complete native role transitions.
+
+Commit `0a9a65f` adds the closing-version, probe, actual queue selection and drain-blocker chain. All four diagnostic banks total 3,840 bytes inside the original workspace bound. Probe matching uses the full caller ObjectKey, request ID and group. An independent review caught and closed an Important production qualification omission: actual `complete_locked` now emits closing settlement facts while old first-policy counters retain their separate predicate. Actual-function regression and negative controls verify the production qualification and reject a foreign caller with the same request ID. [The wire layout](execution-milestones.md) includes error provenance and interpretation limits.
+
+Final v34 checks all pass: 688 host tests (two skips), 84 tooling tests, workspace/TLS checks, formatting and both configured Clippy checks. Both unified native images and selected preparation stack gates pass at 33,088/65,536 bytes in `build-completed-capture-closing-trace/`. Code source SHA-256 is `888d9627001db49cda462ffac260f5e3d945623b2fb93e68a007e557e8861d28`. Source remained frozen through the run.
+
+`native-single-completed-capture-closing-trace/` terminates **FAIL** after 601.913564 s. Ordinary client exit is 0; control reports 409 jobs, 382 publications, 341 Applied, 21 rejected, 41 failed and 95 unknown outcomes. There is no task overrun or quarantine. Two sides are excluded and durably archived, with zero verified sides/labels; trial 3 remains in Drain. The failed verifier does not assert source/build or release acceptance.
+
+Independent committed-redo CRC, inode-extents and file-SHA checks validate `/lr-0000000000000001-0000` at 872,512 bytes, SHA-256 `0ed9604e1f0e15fb4599025a9aab1916f3a89670706e8a8205f545bbbbd69db2`. Exact length-derived boundaries, without magic scanning, identify:
+
+| Trial / offset / bytes | Intervals / missing | Capture / verification error | Seal minus observation end |
+| --- | --- | --- | --- |
+| 1 / 0 / 478,528 | 7,149 / 0 | Deadline / Deadline | 23.898281008 s |
+| 2 / 478,528 / 393,984 | 5,828 / 0 | Deadline / Deadline | 23.920317008 s |
+
+These are complete byte ranges and diagnostic headers, not semantic replay acceptance. Trial 3 has no completed record. Final handoff diagnostics record 210 Full losses; the first identifies generation 3, owner `[12,1]`, executor action on CPU0 at 457.654742 s. All recorded loss reasons are Full, but later losses have no per-CPU or ApplyId identity. Retained=drained=133,800 and pending=0 refers to the shared handoff; it neither erases earlier loss nor proves all private producer cells have retired.
+
+The stopped four-bank inspector verifies stable even publications, exact agreement with final JSON, first-scope identity, the complete closing ApplyId/version, the approved deadline and exact probe caller. It finds no identity overflow/conflict or closing receipt-query error. First baseline reaches Applied in **22.363008 ms**. Closing ApplyId `[1,1,358,0,12,1]`, policy 342, has this chain:
+
+| Event | Native time |
+| --- | --- |
+| Publication / approved deadline | 72.816968 / 72.866968 s |
+| Probe 251 created / original deadline | 72.820172992 / 77.820138 s |
+| First submit entry / return | 72.820234992 / 72.820292 s; `Again` |
+| First successful submit | 76.924232 s |
+| Exact child `[4096,132]` created | 76.960894992 s |
+| First closing dispatch selected | 76.964058 s |
+| Physical completion / actual CPU | 76.964178992 s / 6,376 ns |
+| Scheduler settlement | 76.964210 s |
+| Control Applied | 76.965276 s |
+| Exact probe finished / workload observed result | 77.147996992 / 77.407606 s |
+| Work drain complete / capture seal | 94.605654 / 96.223400 s |
+
+Closing publication-to-Applied is **4.148308 s**, exceeding its approved deadline by **4.098308 s**. The probe is created within 3.204992 ms, but first submit to first success takes **4.103997008 s**. There are 4,180 submit attempts; only the first error and latest result are retained, so they cannot all be labelled Again. Construction after success takes 36.662992 ms; physical completion-to-settlement is 31.008 µs and settlement-to-Control Applied is 1.066 ms. This observation places the principal wait before execution, without retiming any receipt.
+
+Work poll has zero errors in this first scope. The first separately tagged failure is Root poll Busy; its total tagged-error counter cannot be interpreted as a count of that one stage. There are 56 eligible targeted admission bodies, with the first at 76.924512 s, after successful submit. Actual `service_one` selections also total 56, but include a general-path selection of request 46 as Failed(Expired) at 73.029122 s, sequence 514672. That precedes the first targeted body; equal aggregate counts do not mean those selections belong to the targeted helper. Actual sequence 536870 constructs the exact probe.
+
+Applied-to-WorkDrained is **17.640378 s**; another **1.617746 s** passes before seal. The first task-owner blocker is a launch for request 21 with the exact replay caller; the last blocker is also a launch, with no last-request identity retained. The data does not prove that the same request blocked the whole period. Control callback CPU is 70,787 + 38,830,503 = **38,901,290 ns**, exactly matching archive raw EA. Its intervals are Policy 3, EA 6,924, EW/CPU0 117 and EW/CPU3 105, with no adjacent/overlapping same-class/core intervals.
+
+Source inspection identifies two actionable dependencies. A Root Again return suppresses the extra admission piece under the current Some(Ok) condition. Again can mean no normal launch slot or a full SpawnAdmission queue; the diagnostic cannot distinguish all attempts. Also, the actual general phase 1 advances only one admission and one launch cleanup per rotation. A 72-slot scan at that cadence is consistent with the long tail, without proving every millisecond is scan time. Current cleanup also releases on query errors, so it cannot be described as terminal-only.
+
+The next reviewed TDD repair is to permit a separately paid piece on Some(Err(Again)), retain all other error exclusions, perform at most one construction plus one 4 KiB terminal-proven cleanup, and project a separate owned-Drain hint until CloseSources. Query errors, Queued and Unknown must retain their launch. Run observation must not receive this fast path. Retain the original trial snapshot and IDs/deadlines, CAS exclusion, actual bills, capacity and policy selector. This direction is approved for implementation and verification; it does not establish WCET or a native pass. CPU0 synchronous completion custody remains an independent open issue. The v34 catalogue still reports all 69 cases NOT_RUN and an incomplete filesystem matrix.
