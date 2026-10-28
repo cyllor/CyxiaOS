@@ -1,0 +1,60 @@
+--- a/user/prototype-client/main.rs
++++ b/user/prototype-client/main.rs
+@@ -39,17 +39,24 @@
+ fn get(address: u64) -> u64 {
+     unsafe { (address as *const u64).read_volatile() }
+ }
+-fn file_call(frame: &mut file::Frame, deadline: u64) -> bool {
++fn file_call_status(frame: &mut file::Frame, deadline: u64) -> Result<(), i64> {
+     loop {
+         let result = call(file::DISPATCH, 0, frame.bytes.as_mut_ptr() as u64, 0, 0, 0);
+-        if result[0] as i64 == frame.result() {
+-            return true;
++        let status = result[0] as i64;
++        if status == frame.result() {
++            return Ok(());
++        }
++        if status != -11 {
++            return Err(status);
+         }
+-        if result[0] as i64 != -11 || !waiting(deadline) {
+-            return false;
++        if !waiting(deadline) {
++            return Err(-110);
+         }
+     }
+ }
++fn file_call(frame: &mut file::Frame, deadline: u64) -> bool {
++    file_call_status(frame, deadline).is_ok()
++}
+ fn handle(frame: &mut file::Frame, id: u64, generation: u64) {
+     frame.set_u64(file::OFF_HANDLE_ID, id);
+     frame.set_u64(file::OFF_HANDLE_GENERATION, generation);
+@@ -331,13 +338,20 @@
+     handle(&mut frame, read_id, read_generation);
+     frame.set_u64(file::OFF_DATA, 0x50000);
+     frame.set_u32(file::OFF_DATA_LENGTH, 16);
+-    if !file_call(&mut frame, deadline)
+-        || frame.result() != 0
+-        || frame.u64(file::OFF_COUNT) != 16
+-        || get(0x50000) != 0x1122334455667788
+-        || get(0x50008) != 0xaabbccdd55667788
+-    {
+-        return 113;
++    if let Err(status) = file_call_status(&mut frame, deadline) {
++        return 113_000 + status.unsigned_abs().min(999);
++    }
++    if frame.result() != 0 {
++        return 114_000 + frame.result().unsigned_abs().min(999);
++    }
++    if frame.u64(file::OFF_COUNT) != 16 {
++        return 115_000 + frame.u64(file::OFF_COUNT).min(999);
++    }
++    if get(0x50000) != 0x1122334455667788 {
++        return 116_001;
++    }
++    if get(0x50008) != 0xaabbccdd55667788 {
++        return 116_002;
+     }
+     frame = file::Frame::new(file::GET_STAT_CAP, 11, authority);
+     handle(&mut frame, read_id, read_generation);
