@@ -21,6 +21,8 @@ mod owner_gate;
 mod publication;
 #[path = "domain_tasks/service_authority.rs"]
 mod service_authority;
+#[path = "domain_tasks/vector_diagnostics.rs"]
+mod vector_diagnostics;
 pub(crate) use publication::{BaselinePublication, reserve_baseline_publication};
 #[path = "domain_tasks/local_evidence.rs"]
 mod local_evidence;

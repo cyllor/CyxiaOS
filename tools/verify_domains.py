@@ -70,6 +70,7 @@ REQUIRED = {
 }
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
             "FILE_SERVICE_EVIDENCE": 512,
+            "TASK_VECTOR_EVIDENCE": 512,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
             "LEARNING_V13_EVIDENCE": 1024, "GOVERNANCE_V13_EVIDENCE": 128,
             "GOVERNANCE_RUNTIME_V13_EVIDENCE": 512,
@@ -607,6 +608,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
         guest["service_stage_word"] = None
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
                                     ("FILE_SERVICE_EVIDENCE", "file_service_evidence", 64),
+                                    ("TASK_VECTOR_EVIDENCE", "task_vector_evidence", 64),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
                                     ("DOMAIN_PREPARATION_PREFIX_DETAIL", "preparation_prefix_detail", 16),

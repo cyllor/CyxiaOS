@@ -1003,6 +1003,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
         let external = locked(|s| {
             let phase = s.service_phase;
             s.service_phase = (phase + 1) % 11;
+            vector_diagnostics::phase(phase);
             #[cfg(feature = "unified-runtime")]
             crate::unified::service_stage(10 + phase as u64);
             match phase {
@@ -1142,11 +1143,15 @@ fn vector_piece(s: &mut State, i: usize) {
         return;
     }
     let _ = recipe_turn(s, i);
-    let can_step = s.vectors[i].as_ref().is_some_and(|v| !v.complete())
-        && abi::prepare_vector_leases(s, i).unwrap_or(false);
+    let leases = if s.vectors[i].as_ref().is_some_and(|v| !v.complete()) {
+        abi::prepare_vector_leases(s, i)
+    } else {
+        Ok(false)
+    };
+    let mut step_error = 0;
     if let Some(vector) = s.vectors[i].as_mut()
         && !vector.complete()
-        && can_step
+        && leases.unwrap_or(false)
     {
         let mut transport = abi::Transport {
             tasks: &s.tasks,
@@ -1158,7 +1163,36 @@ fn vector_piece(s: &mut State, i: usize) {
             sequence: &mut s.service_sequence,
             lease: &mut s.vector_leases[i],
         };
-        let _ = s.services.step(vector, now_ns(), &mut transport);
+        if let Err(error) = s.services.step(vector, now_ns(), &mut transport) {
+            step_error = error as u64 + 1;
+        }
+    }
+    if let Some(vector) = s.vectors[i].as_ref() {
+        let now = now_ns();
+        let stats = s.services.stats();
+        vector_diagnostics::vector([
+            now,
+            s.tasks[i].key.id,
+            s.tasks[i].key.generation,
+            s.vector_ids[i],
+            s.facts.vector_started[i],
+            s.vector_leases[i].deadline,
+            u64::from(s.vector_leases[i].needed),
+            u64::from(s.vector_leases[i].ready),
+            leases.err().map_or(0, |error| error as u64 + 1),
+            step_error,
+            vector.results().len() as u64,
+            vector
+                .results()
+                .iter()
+                .filter(|result| result.status == ItemStatus::Pending)
+                .count() as u64,
+            stats.items,
+            stats.ipc_calls,
+            stats.completed,
+            stats.errors,
+            u64::from(s.services.policy(now)),
+        ]);
     }
     if !s.facts.vector_measured[i] && s.vectors[i].as_ref().is_some_and(SubmitVector::complete) {
         s.facts
