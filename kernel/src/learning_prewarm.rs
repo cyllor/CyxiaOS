@@ -229,6 +229,8 @@ pub struct Attempt {
     bank: usize,
     earliest_ns: u64,
     pending: bool,
+    task: Option<ObjectKey>,
+    finish_attempted: bool,
 }
 impl Drop for Attempt {
     fn drop(&mut self) {
@@ -255,6 +257,8 @@ fn attempt(bank: usize) -> Option<Attempt> {
         bank,
         earliest_ns: 0,
         pending: true,
+        task: None,
+        finish_attempted: false,
     })
 }
 pub fn attempt_task(member: ObjectKey) -> Option<Attempt> {
@@ -265,7 +269,9 @@ pub fn attempt_task(member: ObjectKey) -> Option<Attempt> {
     {
         return None;
     }
-    attempt(3)
+    let mut token = attempt(3)?;
+    token.task = Some(member);
+    Some(token)
 }
 /// Only a real still-live C1/C2 reservation can open an ordinary evaluation
 /// interval. Its actual original CPU remains in the protected raw ring.
@@ -298,7 +304,25 @@ pub fn attempt_paid_service(_: &crate::domain_tasks::PaidServiceWitness) -> Opti
     }
     attempt(0)
 }
+pub(crate) fn cancel_unstarted(
+    attempt: &mut Attempt,
+    proof: &crate::domain_tasks::Cancellation,
+) -> Result<(), Error> {
+    if !attempt.pending
+        || attempt.session != SESSION.load(Ordering::Acquire)
+        || attempt.finish_attempted
+        || attempt
+            .task
+            .is_none_or(|owner| !proof.matches(owner, attempt.bank as u16))
+    {
+        return Err(Error::Auth);
+    }
+    attempt.pending = false;
+    OPEN.fetch_sub(1, Ordering::SeqCst);
+    Ok(())
+}
 pub fn finish(attempt: &mut Attempt, first_ns: u64, last_ns: u64) -> Result<(), Error> {
+    attempt.finish_attempted = true;
     let core = cyxia_arch_aarch64::cpu::slot();
     if !attempt.pending
         || attempt.session != SESSION.load(Ordering::Acquire)

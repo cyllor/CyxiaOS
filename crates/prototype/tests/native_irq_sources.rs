@@ -1,6 +1,12 @@
 //! Production platform classification through the actual native collector.
 //! Host clocks and the IRQ registry are fixtures, not native replay evidence.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cyxia_prototype::{

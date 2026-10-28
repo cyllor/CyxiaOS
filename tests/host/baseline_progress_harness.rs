@@ -54,6 +54,11 @@ static mut STATE: State = State { scheduler: Scheduler::new(), active: [None],
 mod replay { pub fn service_admitted() {} }
 fn track_credit(_: usize, value: Result<Option<Credit>, Error>) -> Result<Option<Credit>, Error> { value }
 fn discard_capture(_: usize) {}
+mod capture_credit {
+    pub fn retire(_: usize) -> bool { true }
+    pub fn available(_: usize) -> bool { true }
+    pub fn cancelled(_: usize, _: super::Dispatch, _: Option<super::CpuDebit>) {}
+}
 fn finish_capture(_: usize, _: u64, _: u64) {}
 fn finish_cpu_interval(start: u64) -> (u64, u64, u64) {
     let at = now_ns(); let actual = timer::cpu_elapsed_ns(start); (at - actual, at, actual)

@@ -878,6 +878,39 @@ fn attempt_class(
         peer,
     }))
 }
+/// Release an untouched producer only with its scheduler cancellation proof.
+/// A busy peer ledger keeps both the proof and local producer in the CPU slot.
+pub(crate) fn cancel_unstarted(
+    attempt: &mut OwnerAttempt,
+    proof: &crate::domain_tasks::Cancellation,
+) -> Result<(), Error> {
+    if !attempt.pending {
+        return Err(Error::Stale);
+    }
+    if !proof.matches(attempt.owner, attempt.core)
+        || attempt.measured.is_some()
+        || attempt.validated
+        || attempt.invalid
+        || attempt.retry.is_some()
+        || !matches!(attempt.mode, AttemptMode::Record | AttemptMode::PeerOnly)
+    {
+        return Err(Error::Owner);
+    }
+    #[cfg(not(test))]
+    if let Some(peer) = attempt.peer.as_mut() {
+        crate::peer_replay::cancel_unstarted(peer, proof).map_err(|error| {
+            if error == learning::Error::Unknown {
+                Error::Busy
+            } else {
+                Error::Capture(error)
+            }
+        })?;
+        attempt.peer = None;
+    }
+    attempt.pending = false;
+    attempt.lease.take();
+    Ok(())
+}
 pub fn finish_attempt(
     attempt: &mut OwnerAttempt,
     first_ns: u64,

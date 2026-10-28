@@ -171,6 +171,13 @@ impl Ledger {
         }
         self.missing = self.missing.saturating_add(1);
     }
+    pub fn cancel_unstarted(&mut self, lease: Lease) -> Result<(), Error> {
+        if lease.generation != self.binding.run.generation || self.open == 0 {
+            return Err(Error::Stale);
+        }
+        self.open -= 1;
+        Ok(())
+    }
     /// Returns the actually charged clipped interval. Warmup and later work
     /// retain their real duration but cannot masquerade as observation CPU.
     pub fn finish(

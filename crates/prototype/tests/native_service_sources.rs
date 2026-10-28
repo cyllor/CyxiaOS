@@ -1,6 +1,12 @@
 //! Real source-classification and collector code under the production
 //! ReadSnapshot gate. CPU/time and actual service registration are host fixtures.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cyxia_prototype::{
     domains::{Error, ObjectKey},

@@ -1,6 +1,13 @@
 //! Production peer Attempt and Ledger with a real contended host mutex as the
 //! platform ledger gate. CPU/clock providers do not claim native execution.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+include!("../../prototype/tests/support/unstarted.rs");
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cyxia_peer_billing::{Binding, Endpoint};
 use cyxia_prototype::{
@@ -37,6 +44,7 @@ pub mod cpu {
 fn now() -> u64 {
     CLOCK.load(Ordering::Acquire)
 }
+#[allow(dead_code)]
 fn family() -> Option<u16> {
     Some(16)
 }
@@ -238,6 +246,90 @@ fn foreign_first_finish_cannot_create_a_completion_proof_and_dropping_unknown_st
         assert!(l.hash_piece(0, &[])?);
         assert!(l.sealed.is_none());
         assert_eq!(l.excluded.unwrap().trace.missing_events, 1);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn cancellation_releases_only_an_untouched_exact_owner_on_its_original_cpu() {
+    let _serial = SERIAL.lock().unwrap();
+    reset();
+    cpu::set(3);
+    let mut pending = owner_attempt::attempt(remote(), CpuClass::ExecutorWork, 3).unwrap();
+    let proof = unused_proof(remote(), 3);
+    let wrong = unused_proof(
+        ObjectKey {
+            generation: 43,
+            ..remote()
+        },
+        3,
+    );
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut pending, &wrong),
+        Err(learning::Error::Evidence)
+    );
+    cpu::set(0);
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut pending, &proof),
+        Err(learning::Error::Evidence)
+    );
+    cpu::set(3);
+    {
+        let gate = LEDGER.lock().unwrap();
+        assert_eq!(
+            owner_attempt::cancel_unstarted(&mut pending, &proof),
+            Err(learning::Error::Unknown)
+        );
+        assert_eq!(gate.as_ref().unwrap().open, 1);
+    }
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut pending, &proof),
+        Ok(())
+    );
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut pending, &proof),
+        Err(learning::Error::Stale)
+    );
+    drop(pending);
+    ledger_with(|l| {
+        assert_eq!((l.open, l.count, l.missing), (0, 0, 0));
+        Ok(())
+    })
+    .unwrap();
+
+    let mut invalid = owner_attempt::attempt(remote(), CpuClass::ExecutorWork, 3).unwrap();
+    assert_eq!(
+        owner_attempt::finish(&mut invalid, now() + 1, now() + 2),
+        Err(learning::Error::Evidence)
+    );
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut invalid, &proof),
+        Err(learning::Error::Evidence),
+        "failed first finish was laundered into unused cancellation"
+    );
+    drop(invalid);
+    ledger_with(|l| {
+        assert_eq!((l.open, l.count, l.missing), (0, 0, 1));
+        Ok(())
+    })
+    .unwrap();
+    let mut measured = owner_attempt::attempt(remote(), CpuClass::ExecutorWork, 3).unwrap();
+    {
+        let _gate = LEDGER.lock().unwrap();
+        assert_eq!(
+            owner_attempt::finish(&mut measured, OBS + 37, OBS + 74),
+            Err(learning::Error::Unknown)
+        );
+    }
+    assert_eq!(
+        owner_attempt::cancel_unstarted(&mut measured, &proof),
+        Err(learning::Error::Evidence)
+    );
+    owner_attempt::finish(&mut measured, OBS + 37, OBS + 74).unwrap();
+    drop(measured);
+    ledger_with(|l| {
+        assert_eq!((l.open, l.count, l.missing), (0, 1, 1));
         Ok(())
     })
     .unwrap();

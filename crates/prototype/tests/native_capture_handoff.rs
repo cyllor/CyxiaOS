@@ -1,6 +1,13 @@
 //! Actual native collector ingress with host clocks. These are contention
 //! counterexamples, not native samples or accepted learning evidence.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+include!("support/unstarted.rs");
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cyxia_prototype::{
@@ -383,6 +390,60 @@ fn finished_native_segments_keep_original_custody_across_collector_contention() 
             assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 37, 0]);
             assert_eq!(bridge::test_support::handoff_status()[28], 0);
             bridge::retire_exported(seal).unwrap();
+
+            begin(9);
+            let proof = unused_proof(key(13), 0);
+            let wrong = unused_proof(
+                ObjectKey {
+                    generation: 2,
+                    ..key(13)
+                },
+                0,
+            );
+            let mut unused = bridge::attempt_work(key(13), false).unwrap().unwrap();
+            assert_eq!(
+                bridge::cancel_unstarted(&mut unused, &wrong),
+                Err(bridge::Error::Owner)
+            );
+            cpu::at(3);
+            assert_eq!(
+                bridge::cancel_unstarted(&mut unused, &proof),
+                Err(bridge::Error::Owner)
+            );
+            cpu::at(0);
+            assert_eq!(bridge::cancel_unstarted(&mut unused, &proof), Ok(()));
+            assert_eq!(
+                bridge::cancel_unstarted(&mut unused, &proof),
+                Err(bridge::Error::Stale)
+            );
+            drop(unused);
+            assert_eq!(bridge::status().unwrap().0.missing_events, 0);
+            let mut invalid = bridge::attempt_work(key(13), false).unwrap().unwrap();
+            assert_eq!(
+                bridge::finish_attempt(&mut invalid, END + 1, END + 2),
+                Err(bridge::Error::Owner)
+            );
+            assert_eq!(
+                bridge::cancel_unstarted(&mut invalid, &proof),
+                Err(bridge::Error::Owner)
+            );
+            drop(invalid);
+            assert_eq!(bridge::status().unwrap().0.missing_events, 1);
+            domain_platform::at(OBS + 200_000_000);
+            let mut measured = bridge::attempt_work(key(13), false).unwrap().unwrap();
+            bridge::test_support::with_gate(|| {
+                assert_eq!(
+                    bridge::finish_attempt(&mut measured, OBS + 37, OBS + 74),
+                    Err(bridge::Error::Busy)
+                );
+            });
+            assert_eq!(
+                bridge::cancel_unstarted(&mut measured, &proof),
+                Err(bridge::Error::Owner)
+            );
+            bridge::finish_attempt(&mut measured, OBS + 37, OBS + 74).unwrap();
+            drop(measured);
+            assert_eq!(bridge::status().unwrap().0.missing_events, 1);
         })
         .unwrap()
         .join()

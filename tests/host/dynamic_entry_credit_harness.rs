@@ -50,6 +50,10 @@ fn group_index(_: &State, _: ObjectKey) -> Result<usize, Error> { Err(Error::Not
 fn complete_locked(_: &mut State, _: usize) -> Result<(), Error> { unreachable!("no retained completion in this fixture") }
 fn admit_service(_: &mut State, _: u64) -> Result<(), Error> { unreachable!("CPU3 admission only") }
 fn track_credit(_: usize, result: Result<Option<Credit>, Error>) -> Result<Option<Credit>, Error> { result }
+mod capture_credit {
+    pub fn retire(_: usize) -> bool { true }
+    pub fn available(_: usize) -> bool { true }
+}
 // NATIVE_ADMISSION
 fn reset(budget: u64, ordinary: bool) {
     reset_spec(budget, ordinary, 0);

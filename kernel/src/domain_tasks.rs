@@ -791,86 +791,20 @@ pub struct Credit {
     pub reserved_ns: u64,
     optional: bool,
 }
-struct Captures(core::cell::UnsafeCell<[Option<crate::learning_evidence::OwnerAttempt>; 64]>);
-// Include the complete existing per-CPU bank after its token gains retained
-// exit metadata; the learning workspace bound must not hide that growth.
-pub const CAPTURE_CREDIT_BYTES: usize = core::mem::size_of::<Captures>();
-// Slot i is accessed only by CPU i, and never by an interrupt handler.
-unsafe impl Sync for Captures {}
-static CAPTURES: Captures = Captures(core::cell::UnsafeCell::new([const { None }; 64]));
-struct WarmCaptures(core::cell::UnsafeCell<[Option<crate::learning_prewarm::Attempt>; 64]>);
-// The same per-CPU ownership as CAPTURES; IRQs never access these cells.
-unsafe impl Sync for WarmCaptures {}
-static WARM_CAPTURES: WarmCaptures =
-    WarmCaptures(core::cell::UnsafeCell::new([const { None }; 64]));
+#[path = "domain_tasks/cancellation.rs"]
+mod cancellation;
+#[path = "domain_tasks/capture_credit.rs"]
+mod capture_credit;
+pub(crate) use cancellation::Cancellation;
+pub const CAPTURE_CREDIT_BYTES: usize = capture_credit::OWNED_BYTES;
 fn track_credit(
     slot: usize,
     result: Result<Option<Credit>, Error>,
 ) -> Result<Option<Credit>, Error> {
-    if let Ok(Some(credit)) = &result {
-        debug_assert_eq!(cpu::slot(), slot);
-        let attempt = crate::learning_evidence::attempt_work(credit.thread, credit.optional)
-            .ok()
-            .flatten();
-        unsafe {
-            let cell = CAPTURES
-                .0
-                .get()
-                .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
-                .add(slot);
-            let old = cell.replace(attempt);
-            drop(old);
-            let warm = WARM_CAPTURES
-                .0
-                .get()
-                .cast::<Option<crate::learning_prewarm::Attempt>>()
-                .add(slot);
-            drop(warm.replace(crate::learning_prewarm::attempt_task(credit.thread)));
-        }
-    }
-    result
+    capture_credit::track(slot, result)
 }
 fn finish_capture(slot: usize, first: u64, last: u64) {
-    let warm = unsafe {
-        WARM_CAPTURES
-            .0
-            .get()
-            .cast::<Option<crate::learning_prewarm::Attempt>>()
-            .add(slot)
-            .replace(None)
-    };
-    if let Some(mut warm) = warm {
-        let _ = crate::learning_prewarm::finish(&mut warm, first, last);
-    }
-    let attempt = unsafe {
-        CAPTURES
-            .0
-            .get()
-            .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
-            .add(slot)
-            .replace(None)
-    };
-    if let Some(mut attempt) = attempt {
-        // A busy exit is explicitly excluded by OwnerAttempt::drop, including
-        // the exact measured duration; it can never become missing-free data.
-        let _ = crate::learning_evidence::finish_attempt(&mut attempt, first, last);
-    }
-}
-fn discard_capture(slot: usize) {
-    unsafe {
-        let capture = CAPTURES
-            .0
-            .get()
-            .cast::<Option<crate::learning_evidence::OwnerAttempt>>()
-            .add(slot);
-        drop(capture.replace(None));
-        let warm = WARM_CAPTURES
-            .0
-            .get()
-            .cast::<Option<crate::learning_prewarm::Attempt>>()
-            .add(slot);
-        drop(warm.replace(None));
-    }
+    capture_credit::finish(slot, first, last);
 }
 fn throttle(s: &mut State, key: ObjectKey, now: u64) {
     if let Some(slot) = s
@@ -906,13 +840,19 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
     if !READY.load(Ordering::Acquire) || slot >= 64 || cpu::slot() != slot {
         return None;
     }
+    if !capture_credit::retire(slot) {
+        return None;
+    }
     track_credit(
         slot,
         locked(|s| {
             if COMPLETE_READY[slot].load(Ordering::Acquire) {
                 let _ = complete_locked(s, slot);
             }
-            if s.draining & (1u64 << slot) != 0 || s.active[slot].is_some() {
+            if s.draining & (1u64 << slot) != 0
+                || s.active[slot].is_some()
+                || !capture_credit::available(slot)
+            {
                 return Ok(None);
             }
             let now = now_ns();
@@ -1075,9 +1015,9 @@ fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
             return Ok(true);
         }
         s.scheduler.cancel_unstarted(active.dispatch, now)?;
-        if let Some(debit) = active.optional {
-            s.background.complete(debit, 0, now)?;
-        }
+        // Cancellation is irreversible. Clear all execution authority even if
+        // the optional refund or an evidence custodian must be retried later.
+        capture_credit::cancelled(slot, active.dispatch, active.optional);
         s.active[slot] = None;
         CREDIT_NS[slot].store(0, Ordering::Relaxed);
         CREDIT_KIND[slot].store(0, Ordering::Release);
@@ -1089,7 +1029,7 @@ fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
             if slot == 0 {
                 baseline_diagnostics::failure(4, 2);
             }
-            discard_capture(slot);
+            let _ = capture_credit::retire(slot);
             false
         }
         // The task gate is deliberately nonblocking. Contention leaves the
@@ -1118,6 +1058,9 @@ pub fn begin_service_segment() -> Option<Credit> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return None;
     }
+    if !capture_credit::retire(0) {
+        return None;
+    }
     let mut entered = false;
     let result = locked_with_guard(|s, guard| {
         entered = true;
@@ -1133,7 +1076,7 @@ pub fn begin_service_segment() -> Option<Credit> {
                 );
             }
         }
-        if s.active[0].is_some() || s.draining & 1 != 0 {
+        if s.active[0].is_some() || s.draining & 1 != 0 || !capture_credit::available(0) {
             baseline_diagnostics::failure(3, if s.active[0].is_some() { 1 } else { 2 });
             return Ok(None);
         }
@@ -1306,13 +1249,16 @@ fn begin_file_credit(owner: ObjectKey) -> Result<Option<Credit>, Error> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return Err(Error::Auth);
     }
+    if !capture_credit::retire(0) {
+        return Ok(None);
+    }
     track_credit(
         0,
         locked(|s| {
             if COMPLETE_READY[0].load(Ordering::Acquire) {
                 let _ = complete_locked(s, 0);
             }
-            if s.active[0].is_some() || s.draining & 1 != 0 {
+            if s.active[0].is_some() || s.draining & 1 != 0 || !capture_credit::available(0) {
                 return Ok(None);
             }
             let i = task_index(&s.tasks, owner)?;

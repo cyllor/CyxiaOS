@@ -1,5 +1,11 @@
 //! Independent collector counterexamples using synthetic owner events only.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 
 // The bridge itself is compiled unchanged. Only platform CPU/time providers
 // are replaced for host contract tests; this does not claim native execution.

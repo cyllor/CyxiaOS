@@ -33,6 +33,13 @@ mod replay { pub fn service_admitted() {} }
 mod baseline_diagnostics { pub fn failure(_: usize, _: u64) {} }
 fn track_credit(_: usize, value: Result<Option<Credit>, Error>) -> Result<Option<Credit>, Error> { value }
 fn discard_capture(_: usize) {}
+// Capture custody is outside this paid-task-gate fixture; its dedicated
+// integration harness uses all three production evidence custodians.
+mod capture_credit {
+    pub fn retire(_: usize) -> bool { true }
+    pub fn available(_: usize) -> bool { true }
+    pub fn cancelled(_: usize, _: super::Dispatch, _: Option<super::CpuDebit>) {}
+}
 fn complete_locked(s: &mut State, _: usize) -> Result<(), Error> {
     let active = s.active[0].unwrap();
     s.scheduler.complete(active.dispatch, 100_000, RunState::Runnable, now_ns())?;

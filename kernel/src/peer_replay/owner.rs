@@ -471,6 +471,7 @@ pub(crate) fn captures(owner: ObjectKey, class: CpuClass) -> bool {
 }
 #[path = "attempt.rs"]
 mod attempts;
+pub(crate) use attempts::cancel_unstarted;
 pub use attempts::{Attempt, attempt, finish};
 pub fn transport(epoch: Option<u64>) {
     let _ = with(|s| {

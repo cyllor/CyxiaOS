@@ -3,6 +3,12 @@
 //! root callback boundary are supplied by this harness. These deterministic
 //! request events are fault-injection tests, never native replay samples.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
+}
 pub const HIGH: u64 = 0;
 pub mod cpu {
     use core::sync::atomic::{AtomicUsize, Ordering};

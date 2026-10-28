@@ -13,6 +13,7 @@ use cyxia_prototype::{
 mod ledger;
 #[path = "peer_replay/owner.rs"]
 mod owner;
+pub(crate) use owner::cancel_unstarted;
 #[path = "../../user/prototype-cluster/src/replay_work.rs"]
 pub(crate) mod work_wire;
 pub use owner::{

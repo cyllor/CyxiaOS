@@ -2,6 +2,11 @@
 //! CPU, clock, pool and task completion are explicit host fixtures, never
 //! accepted learning labels or evidence of a native workload run.
 extern crate self as cyxia_arch_aarch64;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+mod cancellation;
+include!("support/unstarted.rs");
+
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cyxia_prototype::{
     domains::{Error, ObjectKey},
@@ -34,6 +39,7 @@ pub mod domain_platform {
     }
 }
 pub mod domain_tasks {
+    pub(crate) use super::cancellation::Cancellation;
     use super::*;
     use cyxia_prototype::domains::tasks::ControlCredit;
     static CONTROL: Mutex<Option<ControlCredit>> = Mutex::new(None);
@@ -303,6 +309,31 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
         .is_none()
     );
     assert_eq!(prewarm::completed(), Err(Error::Auth));
+    let proof = unused_proof(member, 3);
+    let wrong = unused_proof(
+        ObjectKey {
+            generation: 5,
+            ..member
+        },
+        3,
+    );
+    let mut unused = prewarm::attempt_task(member).unwrap();
+    assert_eq!(
+        prewarm::cancel_unstarted(&mut unused, &wrong),
+        Err(Error::Auth)
+    );
+    cpu::set(0);
+    assert_eq!(
+        prewarm::cancel_unstarted(&mut unused, &proof),
+        Err(Error::Auth)
+    );
+    cpu::set(3);
+    assert_eq!(prewarm::cancel_unstarted(&mut unused, &proof), Ok(()));
+    assert_eq!(
+        prewarm::cancel_unstarted(&mut unused, &proof),
+        Err(Error::Auth)
+    );
+    drop(unused);
     cpu::set(0);
     for i in 0..13 {
         let at = 10_040_000_000 + i * 80_000_000;
@@ -334,6 +365,11 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
     );
     cpu::set(3);
     domain_platform::at(11_023_000_000);
+    assert_eq!(
+        prewarm::cancel_unstarted(&mut inflight, &proof),
+        Err(Error::Auth),
+        "failed first finish was laundered into unused prewarm cancellation"
+    );
     prewarm::finish(&mut inflight, 11_010_000_000, 11_023_000_000).unwrap();
     assert!(prewarm::attempt_task(member).is_none());
     cpu::set(0);
