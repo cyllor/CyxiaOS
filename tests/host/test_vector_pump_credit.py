@@ -5,6 +5,7 @@ actual service(), service_vectors() and service_segment() bodies are executed.
 This is a progress/accounting regression, not native timing evidence.
 """
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +29,13 @@ class VectorPumpCredit(unittest.TestCase):
         driver = driver.replace(general, 'let _ = service_segment(|| { general_turn(); }')
         activation = function(execution, 'fn service_baseline_activation(') if (
             'fn service_baseline_activation(' in execution) else 'fn service_baseline_activation() {}'
+        for signature in ['struct BaselineRetryGuard', 'impl Drop for BaselineRetryGuard',
+                          'fn enter_baseline_retry(', 'fn service_baseline_activation_at(']:
+            if signature in execution:
+                activation += '\n' + function(execution, signature)
+        active = re.search(r'^static BASELINE_RETRY_ACTIVE:.*;$', execution, re.M)
+        if active:
+            activation += '\n' + active[0]
         template = (ROOT / 'tests/host/vector_pump_credit_harness.rs').read_text()
         template = template.replace('// OWNER_GATE_PATH',
             str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))

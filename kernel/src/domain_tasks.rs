@@ -41,8 +41,8 @@ pub use execution::{
     init_recoverable, local_result, probe_status, query_local, query_spawn, readonly_drained,
     recoverable_key, recoverable_result, recoverable_submit, remote_activate, remote_capacity,
     remote_fault, remote_release, remote_selected, remote_start, remote_stopped, remote_word,
-    request_stop, running, service, service_io_piece, start_generation, start_probe_client,
-    start_storage_client, stopped, submit_local, submit_spawn,
+    request_stop, running, service, service_baseline_progress, service_io_piece, start_generation,
+    start_probe_client, start_storage_client, stopped, submit_local, submit_spawn,
 };
 pub use local_evidence::bind_local_failure_request;
 pub(crate) use memory::with_user_memory;

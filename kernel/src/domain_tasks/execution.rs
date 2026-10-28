@@ -1182,11 +1182,46 @@ fn lifecycle_piece(s: &mut State, i: usize) {
         let _ = cleanup(s, i);
     }
 }
+static BASELINE_RETRY_ACTIVE: AtomicBool = AtomicBool::new(false);
+struct BaselineRetryGuard {
+    _local: core::marker::PhantomData<*mut ()>,
+}
+impl Drop for BaselineRetryGuard {
+    fn drop(&mut self) {
+        BASELINE_RETRY_ACTIVE.store(false, Ordering::Release);
+    }
+}
+fn enter_baseline_retry() -> Option<BaselineRetryGuard> {
+    if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    BASELINE_RETRY_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| BaselineRetryGuard {
+            _local: core::marker::PhantomData,
+        })
+}
 fn service_baseline_activation() {
+    service_baseline_activation_at(1);
+}
+/// One targeted opportunity after suspended I/O has submitted its old bill.
+/// No task/file/storage/TCP pump is entered, and no old reservation is reused.
+pub fn service_baseline_progress() {
+    if crate::learning_replay::baseline_activation_pending() {
+        service_baseline_activation_at(2);
+    }
+}
+fn service_baseline_activation_at(site: u64) {
+    // Main-loop and progress paths share this gate. A nested I/O callback must
+    // not overwrite the outer diagnostic ticket or enter another helper body.
+    let Some(_entry) = enter_baseline_retry() else {
+        return;
+    };
     let hint = crate::learning_replay::baseline_activation_pending();
     let ticket = baseline_diagnostics::opportunity(
         hint,
-        1,
+        site,
         CREDIT_KIND[0].load(Ordering::Acquire),
         COMPLETE_READY[0].load(Ordering::Acquire),
     );

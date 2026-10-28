@@ -341,6 +341,7 @@ fn drain_network(tcp: &mut NativeTcp<'_>, epoch: u64) {
 fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
     coordinator.poll();
     let _ = crate::domain_platform::poll(Board.now_ns());
+    crate::domain_tasks::service_baseline_progress();
 }
 
 fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
@@ -684,8 +685,10 @@ pub fn run(info: &BootInfo) -> ! {
             }
 
             // These pumps own their own bounded CPU segments. Their progress
-            // callback advances mechanisms only, so no active file/owner is
-            // recursively borrowed and no waiting wall time becomes CPU usage.
+            // callback advances mechanisms and one independently paid baseline
+            // retry. Nonblocking owner checks reject held owners; no active
+            // file/storage/TCP pump is reentered. Resumption gets fresh credit
+            // and a new execution interval, excluding waiting wall time.
             service_stage(7);
             crate::domain_tasks::service(Board.now_ns(), &mut || {
                 progress(&mut coordinator, &mut tcp, stream_epoch)
