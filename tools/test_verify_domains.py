@@ -232,6 +232,23 @@ class EvidenceParserTests(unittest.TestCase):
         self.assertEqual(guest["replay"]["phase"], 4)
         self.assertEqual([e["field"] for e in guest["diagnostic_errors"]], ["unified"])
 
+    def test_file_probe_failure_keeps_current_service_fields_and_clears_stale_diagnostics(self):
+        guest = {"file_service_evidence": [999] * 64}
+        latest = self.snapshot()
+        unified = list(struct.unpack('<512Q', latest['UNIFIED_EVIDENCE']))
+        unified[19:21] = [1, 110]
+        latest['UNIFIED_EVIDENCE'] = encode(unified)
+        diagnostic = [0] * 64
+        diagnostic[:3] = [0x435946494c454431, 1, 7]
+        diagnostic[8:16] = [7, 100, 0, 1, 4096, 4, 7, 10]
+        latest['FILE_SERVICE_EVIDENCE'] = encode(diagnostic)
+        with self.assertRaisesRegex(ValueError, 'file probe exit code 110'):
+            refresh_snapshot(guest, latest)
+        self.assertEqual(guest['file_service_evidence'], diagnostic)
+        self.assertIsNone(guest['unified'])
+        refresh_snapshot(guest, self.snapshot())
+        self.assertIsNone(guest['file_service_evidence'])
+
     def test_root_failure_diagnostic_survives_other_fault_and_is_never_an_acceptance_gate(self):
         guest = {"replay_root_evidence": [999] * 32, "replay_owner_evidence": [999] * 32,
                  "replay_config_evidence": [999] * 32, "replay_capture_evidence": [999] * 32,

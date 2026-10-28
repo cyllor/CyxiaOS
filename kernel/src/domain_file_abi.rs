@@ -2,6 +2,8 @@
 //! A copyout retry re-delivers a retained result; it never replays a disk effect.
 #[path = "../../user/prototype-task/files_abi.rs"]
 pub mod abi;
+#[path = "domain_file_abi/diagnostics.rs"]
+mod diagnostics;
 use crate::{domain_storage as storage, domain_tasks};
 use abi::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,6 +48,61 @@ static mut HANDLES: [Option<Open>; 64] = [None; 64];
 static mut GENERATION: u64 = 0;
 static mut DATA: [u8; MAX_IO] = [0; MAX_IO];
 static mut PENDING: Option<Delivery> = None;
+// Only the actual CPU0 file owner writes this bank, under the same BUSY guard
+// as dispatch. EL0 never maps it; it retains no user file/path payload.
+#[used]
+#[unsafe(no_mangle)]
+static mut FILE_SERVICE_EVIDENCE: diagnostics::Capture = diagnostics::Capture::new();
+
+fn diagnostic_fields(owner: ObjectKey, frame: &Frame) -> [u64; 12] {
+    [
+        owner.id,
+        owner.generation,
+        frame.u64(OFF_REQUEST),
+        u64::from(frame.u16(OFF_OPERATION)),
+        frame.u64(OFF_RESULT),
+        frame.u64(OFF_COUNT),
+        frame.u64(OFF_OBJECT_ID),
+        frame.u64(OFF_OBJECT_GENERATION),
+        frame.u64(OFF_WRITE_SEQ),
+        frame.u64(OFF_DURABLE_SEQ),
+        frame.u64(OFF_HANDLE_ID),
+        frame.u64(OFF_HANDLE_GENERATION),
+    ]
+}
+fn diagnostic_finish(sequence: Option<u64>, owner: ObjectKey, output: &Frame) {
+    if let Some(sequence) = sequence {
+        unsafe {
+            (&mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE)).finish(
+                sequence,
+                cyxia_arch_aarch64::timer::ticks(),
+                &diagnostic_fields(owner, output),
+            );
+        }
+    }
+}
+pub(crate) fn record_credit_attempt(owner: ObjectKey, result: Result<bool, Error>) {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return;
+    }
+    let (status, error) = match result {
+        Ok(false) => (1, 0),
+        Err(error) => (2, error as u64 + 1),
+        Ok(true) => (3, 0),
+    };
+    // CPU0 is the sole writer. No Capture reference is held across a file
+    // operation or its progress callbacks; this pre-ABI admission observation
+    // cannot acquire a credit, touch a user frame, or authorize an effect.
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE)).credit_attempt(
+            cyxia_arch_aarch64::timer::ticks(),
+            owner.id,
+            owner.generation,
+            status,
+            error,
+        );
+    }
+}
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -489,6 +546,18 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         bytes: [0; FRAME_BYTES],
     };
     if let Err(e) = domain_tasks::copyin(owner, address, &mut input.bytes) {
+        let mut fields = diagnostic_fields(owner, &input);
+        fields[4] = if retryable_before_run(e) {
+            (-11i64) as u64
+        } else {
+            errno(e) as u64
+        };
+        unsafe {
+            let capture = &mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE);
+            if let Some(sequence) = capture.begin(cyxia_arch_aarch64::timer::ticks(), &fields) {
+                capture.finish(sequence, cyxia_arch_aarch64::timer::ticks(), &fields);
+            }
+        }
         context.regs[0] = if retryable_before_run(e) {
             (-11i64) as u64
         } else {
@@ -503,7 +572,22 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     output.set_u64(OFF_OBJECT_GENERATION, 0);
     output.set_u64(OFF_WRITE_SEQ, 0);
     output.set_u64(OFF_DURABLE_SEQ, 0);
+    let diagnostic_sequence = unsafe {
+        (&mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE)).begin(
+            cyxia_arch_aarch64::timer::ticks(),
+            &diagnostic_fields(owner, &input),
+        )
+    };
     if let Err(e) = validate(owner, address, &input) {
+        output.set_u64(
+            OFF_RESULT,
+            if retryable_before_run(e) {
+                (-11i64) as u64
+            } else {
+                errno(e) as u64
+            },
+        );
+        diagnostic_finish(diagnostic_sequence, owner, &output);
         if retryable_before_run(e) {
             context.regs[0] = (-11i64) as u64;
             return true;
@@ -519,6 +603,15 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     if input.u16(OFF_OPERATION) == WRITE {
         let len = input.u32(OFF_DATA_LENGTH) as usize;
         if let Err(e) = domain_tasks::copyin(owner, input.u64(OFF_DATA), &mut data[..len]) {
+            output.set_u64(
+                OFF_RESULT,
+                if retryable_before_run(e) {
+                    (-11i64) as u64
+                } else {
+                    errno(e) as u64
+                },
+            );
+            diagnostic_finish(diagnostic_sequence, owner, &output);
             if retryable_before_run(e) {
                 context.regs[0] = (-11i64) as u64;
                 return true;
@@ -542,6 +635,8 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             Err(Error::Busy)
         )
     {
+        output.set_u64(OFF_RESULT, (-11i64) as u64);
+        diagnostic_finish(diagnostic_sequence, owner, &output);
         context.regs[0] = (-11i64) as u64;
         return true;
     }
@@ -566,6 +661,8 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     if input.u16(OFF_OPERATION) == GET_STAT_CAP
         && result.as_ref().is_err_and(|e| retryable_before_run(*e))
     {
+        output.set_u64(OFF_RESULT, (-11i64) as u64);
+        diagnostic_finish(diagnostic_sequence, owner, &output);
         context.regs[0] = (-11i64) as u64;
         return true;
     }
@@ -576,6 +673,7 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             0
         }
     };
+    diagnostic_finish(diagnostic_sequence, owner, &output);
     let capture_len =
         if output.u64(OFF_RESULT) == 0 && matches!(input.u16(OFF_OPERATION), READ | WRITE) {
             output.u64(OFF_COUNT) as usize

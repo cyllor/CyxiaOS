@@ -1513,6 +1513,13 @@ fn service_file(progress: &mut dyn FnMut()) {
         return;
     };
     let credit = begin_file_credit(key);
+    crate::domain_file_abi::record_credit_attempt(
+        key,
+        credit
+            .as_ref()
+            .map(|credit| credit.is_some())
+            .map_err(|error| *error),
+    );
     if let Err(error @ (Error::Budget | Error::Auth | Error::Conflict | Error::Stale)) = credit {
         // A caller whose configured hard budget cannot ever cover a segment
         // is rejected before the file ABI executes any effect.
