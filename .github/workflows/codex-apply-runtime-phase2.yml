@@ -1,0 +1,80 @@
+name: Apply runtime phase 2
+
+on:
+  push:
+    branches:
+      - codex/v011-runtime-phase2
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runtime-phase2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    if: ${{ startsWith(github.event.head_commit.message, 'stage runtime phase2 applicator') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out writable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update \
+            --component rustfmt --component clippy --component llvm-tools-preview \
+            --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config python3-venv
+          cargo fetch --locked
+      - name: Apply exact runtime patch
+        run: |
+          set -euo pipefail
+          patch=.github/codex/patches/150-runtime-phase2.diff
+          echo '458bd6ff6b95c0cae18a0feb8262a5872d193fa56977639536bee378c542c36d  '"$patch" | sha256sum -c -
+          git apply --check "$patch"
+          git apply "$patch"
+          cargo fmt --all
+          git diff --check
+      - name: Verify evidence phase gates
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tools -p 'test_verify_domains.py' -v
+          python3 -B -m unittest discover -s tests/host -p 'test_v13_native_task_credit.py' -v
+      - name: Verify native transport
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p cyxia-cluster-transport --features tls
+          cargo clippy --locked --offline -p cyxia-cluster-transport \
+            --all-targets --features tls -- -D warnings
+      - name: Build exact unified pair
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/pair"
+          python3 tools/build_unified.py \
+            --identity-a "$RUNNER_TEMP/pair/a" \
+            --identity-b "$RUNNER_TEMP/pair/b" \
+            --output "$RUNNER_TEMP/unified-build" --selftest
+          test -s "$RUNNER_TEMP/unified-build/node-a.elf"
+          test -s "$RUNNER_TEMP/unified-build/node-b.elf"
+          test -s "$RUNNER_TEMP/unified-build/governance.elf"
+      - name: Commit validated source only
+        run: |
+          set -euo pipefail
+          git rm \
+            .github/codex/patches/150-runtime-phase2.diff \
+            .github/workflows/codex-apply-runtime-phase2.yml
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(runtime): phase governance evidence and transport credits'
+          git push origin HEAD:codex/v011-runtime-phase2
