@@ -5,7 +5,7 @@ on:
     branches:
       - codex/v011-tls-exit-diagnostics
     paths:
-      - '.github/codex/patches/tls-exit-diagnostics.patch.gz.b64'
+      - '.github/codex/patches/tls-exit-diagnostics.part-*'
       - '.github/workflows/codex-apply-tls-exit-diagnostics.yml'
   workflow_dispatch:
 
@@ -29,18 +29,24 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-      - name: Apply staged patch
+      - name: Reassemble and apply staged patch
         id: patch
         shell: bash
         run: |
           set -euo pipefail
-          payload=.github/codex/patches/tls-exit-diagnostics.patch.gz.b64
+          payload="$RUNNER_TEMP/tls-exit-diagnostics.patch.gz.b64"
           patch="$RUNNER_TEMP/tls-exit-diagnostics.patch"
-          if [ ! -f "$payload" ]; then
-            echo 'apply=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          parts=(.github/codex/patches/tls-exit-diagnostics.part-{00..08})
+          for part in "${parts[@]}"; do test -s "$part"; done
+          cat "${parts[@]}" > "$payload"
+          test "$(wc -c < "$payload")" = 2912
+          printf '%s  %s\n' \
+            ab105948ebc775ea371d011a22fa1c7774b3b21b10e5ad760d7fc4b8e8a7872b \
+            "$payload" | sha256sum --check --strict -
           base64 --decode "$payload" | gzip --decompress > "$patch"
+          printf '%s  %s\n' \
+            49c3a3d6bd39cd3a2a76cabcc775ff3b496f13cf8f385a771b27b0d1bc8b9496 \
+            "$patch" | sha256sum --check --strict -
           git apply --check "$patch"
           git apply "$patch"
           echo 'apply=true' >> "$GITHUB_OUTPUT"
@@ -85,6 +91,7 @@ jobs:
           set -euo pipefail
           git rm -f \
             .github/codex/patches/tls-exit-diagnostics.patch.gz.b64 \
+            .github/codex/patches/tls-exit-diagnostics.part-* \
             .github/workflows/codex-apply-tls-exit-diagnostics.yml
           git config user.name 'cyllor'
           git config user.email '45630989+cyllor@users.noreply.github.com'
