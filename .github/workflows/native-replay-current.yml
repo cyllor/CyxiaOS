@@ -7,6 +7,7 @@ on:
       - fix/first-level-subsystems-20261024
       - CyxiaOS-V0.1
       - CyxiaOS-V0.11
+      - codex/cyxiaos-v0.11-complete-prototype
     paths:
       - '.github/workflows/native-replay-current.yml'
       - 'kernel/**'
