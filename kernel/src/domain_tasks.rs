@@ -9,6 +9,8 @@ use cyxia_prototype::domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp, W
 use sha2::{Digest, Sha256};
 #[path = "domain_tasks/abi.rs"]
 mod abi;
+#[path = "domain_tasks/baseline_diagnostics.rs"]
+mod baseline_diagnostics;
 #[path = "domain_tasks/deadline.rs"]
 mod deadline;
 #[path = "domain_tasks/execution.rs"]

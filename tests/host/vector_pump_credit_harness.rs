@@ -15,7 +15,19 @@ static BASELINE_PENDING: AtomicBool = AtomicBool::new(false);
 static BASELINE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BASELINE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 mod cpu { pub fn slot() -> usize { 0 } }
-mod timer { pub fn cpu_ticks() -> u64 { super::CPU_NS.load(super::Ordering::Acquire) } }
+mod timer {
+    pub fn cpu_ticks() -> u64 { super::CPU_NS.load(super::Ordering::Acquire) }
+    pub fn cpu_elapsed_ns(start: u64) -> u64 { cpu_ticks() - start }
+}
+static CREDIT_KIND: [AtomicU64; 1] = [AtomicU64::new(0)];
+static CREDIT_NS: [AtomicU64; 1] = [AtomicU64::new(0)];
+static COMPLETE_READY: [AtomicBool; 1] = [AtomicBool::new(false)];
+mod baseline_diagnostics {
+    pub fn opportunity(_: bool, _: u64, _: u64, _: bool) -> Option<u64> { None }
+    pub fn body_start(_: Option<u64>, _: u64, _: u64) {}
+    pub fn body_finish(_: Option<u64>, _: &Result<bool, super::Error>, _: u64) {}
+    pub fn finish(_: Option<u64>, _: bool, _: u64, _: bool) {}
+}
 mod crate_stubs {
     pub fn service_io(_: &mut dyn FnMut()) {}
     pub fn baseline_activation_pending() -> bool { super::BASELINE_PENDING.load(super::Ordering::Acquire) }

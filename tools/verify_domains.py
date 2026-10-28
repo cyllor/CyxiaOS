@@ -72,6 +72,7 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "FILE_SERVICE_EVIDENCE": 512,
             "TASK_VECTOR_EVIDENCE": 512,
             "TASK_SPAWN_EVIDENCE": 256,
+            "BASELINE_SERVICE_EVIDENCE": 1024,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
             "LEARNING_V13_EVIDENCE": 1024, "GOVERNANCE_V13_EVIDENCE": 128,
             "GOVERNANCE_RUNTIME_V13_EVIDENCE": 512,
@@ -611,6 +612,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                                     ("FILE_SERVICE_EVIDENCE", "file_service_evidence", 64),
                                     ("TASK_VECTOR_EVIDENCE", "task_vector_evidence", 64),
                                     ("TASK_SPAWN_EVIDENCE", "task_spawn_evidence", 32),
+                                    ("BASELINE_SERVICE_EVIDENCE", "baseline_service_evidence", 128),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
                                     ("DOMAIN_PREPARATION_PREFIX_DETAIL", "preparation_prefix_detail", 16),
@@ -1143,7 +1145,7 @@ def run(args):
         if reconnect is not None:
             report["reconnect_evidence"] = reconnect.evidence()
         report["observations"] = [{key: guest.get(key) for key in
-                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "overrun_evidence", "panic_evidence",
+                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "baseline_service_evidence", "overrun_evidence", "panic_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
                                    "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",

@@ -1131,12 +1131,35 @@ fn lifecycle_piece(s: &mut State, i: usize) {
     }
 }
 fn service_baseline_activation() {
-    if crate::learning_replay::baseline_activation_pending() {
+    let hint = crate::learning_replay::baseline_activation_pending();
+    let ticket = baseline_diagnostics::opportunity(
+        hint,
+        1,
+        CREDIT_KIND[0].load(Ordering::Acquire),
+        COMPLETE_READY[0].load(Ordering::Acquire),
+    );
+    if hint {
         // Only an already-owned first baseline snapshot gets this retry
         // opportunity. Its exact original 50 ms deadline remains authoritative.
         // Each attempt needs fresh physical credit and settles before vectors
         // or file work. General replay phases keep their normal rotation.
-        let _ = service_segment(crate::learning_replay::service_step);
+        let outcome = service_segment(|| {
+            baseline_diagnostics::body_start(
+                ticket,
+                CREDIT_NS[0].load(Ordering::Acquire),
+                CREDIT_KIND[0].load(Ordering::Acquire),
+            );
+            let started = timer::cpu_ticks();
+            let result = crate::learning_replay::service_step();
+            baseline_diagnostics::body_finish(ticket, &result, timer::cpu_elapsed_ns(started));
+            result
+        });
+        baseline_diagnostics::finish(
+            ticket,
+            outcome.is_some(),
+            CREDIT_KIND[0].load(Ordering::Acquire),
+            COMPLETE_READY[0].load(Ordering::Acquire),
+        );
     }
 }
 fn service_vectors() {
