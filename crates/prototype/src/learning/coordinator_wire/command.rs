@@ -91,9 +91,7 @@ impl CommandAction {
             Self::Wait | Self::Release => Ok(()),
             Self::Score { family, .. } => family.index().map(|_| ()),
             Self::CloseShadowWindow { window } if window != 0 => Ok(()),
-            Self::PrepareBaseline { target } | Self::BeginCanary { target } => {
-                valid_object(target)
-            }
+            Self::PrepareBaseline { target } | Self::BeginCanary { target } => valid_object(target),
             Self::PublishCanary { score } if score.handle != 0 && score.digest != [0; 32] => Ok(()),
             Self::Freeze { permit_id } if permit_id != 0 => Ok(()),
             Self::Promote { registration_hash } if registration_hash != [0; 32] => Ok(()),
@@ -158,8 +156,7 @@ impl Command {
                 put16(output, 252, mode as u16);
             }
             CommandAction::CloseShadowWindow { window } => put64(output, 184, window),
-            CommandAction::PrepareBaseline { target }
-            | CommandAction::BeginCanary { target } => {
+            CommandAction::PrepareBaseline { target } | CommandAction::BeginCanary { target } => {
                 put64(output, 184, target.id);
                 put64(output, 192, target.generation);
             }
@@ -303,9 +300,7 @@ impl Command {
             };
         }
         match self.action {
-            CommandAction::PublishCanary { score }
-                if snapshot.verified_score != Some(score) =>
-            {
+            CommandAction::PublishCanary { score } if snapshot.verified_score != Some(score) => {
                 Err(Error::Stale)
             }
             CommandAction::Freeze { permit_id } => match snapshot.permit {
