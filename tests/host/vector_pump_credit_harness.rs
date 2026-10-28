@@ -56,7 +56,7 @@ use crate_stubs as learning_workload;
 use crate_stubs as learning_replay;
 // Closing diagnostics are outside this independent vector-pump fixture.
 mod learning_evidence { pub mod execution_trace {
-    pub fn admission_opportunity(_:bool,_:bool,_:u64) {}
+    pub fn admission_opportunity(_:bool,_:bool,_:bool,_:u64) {}
     pub fn admission_body(_:u64,_:u64) {}
     pub fn admission_result(_:bool,_:u64) {}
 } }

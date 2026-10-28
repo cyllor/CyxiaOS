@@ -950,9 +950,9 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
         s.launch_cursor = (index + 1) % LAUNCHES;
         let launch = &mut s.launches[index];
         if let Some(request) = launch.request
-            && !matches!(
+            && matches!(
                 s.admission.query(request.caller, request.request_id),
-                Ok(SpawnState::Queued | SpawnState::Unknown)
+                Ok(SpawnState::Created(_) | SpawnState::Failed(_) | SpawnState::Cancelled)
             )
         {
             launch.input.fill(0);
@@ -1276,14 +1276,19 @@ fn service_baseline_activation_at(site: u64) {
         // insufficient fresh credit prevents this body from running. Keep the
         // shared retry guard held across both pieces, including nested progress.
         let root_ok = outcome.is_some_and(|result| result.is_ok());
+        // Again can report a full launch cache or admission queue. Those
+        // already-owned requests need independently paid progress even though
+        // the probe itself could not enter. Other errors retain their rules.
+        let root_again = matches!(outcome, Some(Err(Error::Again)));
         let pending = crate::learning_replay::baseline_activation_pending();
         #[cfg(not(test))]
         crate::learning_evidence::execution_trace::admission_opportunity(
             root_ok,
+            root_again,
             pending,
             now_ns(),
         );
-        if root_ok && pending {
+        if (root_ok || root_again) && pending {
             let admitted = service_segment(|| {
                 locked(|s| {
                     #[cfg(not(test))]
@@ -1291,7 +1296,9 @@ fn service_baseline_activation_at(site: u64) {
                         s.active[0].map_or(0, |v| v.dispatch.sequence),
                         now_ns(),
                     );
-                    advance_admission_bounded(s, 1, 0)
+                    // One queued construction and one 4 KiB terminal-proven
+                    // launch cleanup, both inside this same fresh reservation.
+                    advance_admission_bounded(s, 1, 1)
                 })
             });
             #[cfg(not(test))]

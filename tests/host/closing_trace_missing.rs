@@ -11,7 +11,7 @@ pub enum ClosingWork {
 }
 pub fn closing(_:ObjectKey,_:u64,_:ApplyId,_:PolicyStamp,_:u64,_:u64,_:u64) {}
 pub fn closing_work(_:RunKey,_:ClosingWork,_:u64) {}
-pub fn admission_opportunity(_:bool,_:bool,_:u64) {}
+pub fn admission_opportunity(_:bool,_:bool,_:bool,_:u64) {}
 pub fn admission_body(_:u64,_:u64) {}
 pub fn admission_result(_:bool,_:u64) {}
 pub fn admitted(_: &cyxia_prototype::domains::tasks::SpawnRequest,_:cyxia_prototype::domains::tasks::SpawnState,_:u64,_:u64) {}

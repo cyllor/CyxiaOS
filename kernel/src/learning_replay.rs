@@ -15,7 +15,11 @@ pub(crate) mod late_archive;
 mod owner;
 #[path = "learning_replay/preparation_archive.rs"]
 pub(crate) mod preparation_archive;
-pub use crate::domain_control::replay::baseline_activation_pending;
+/// Scheduling only: published execution and already-owned draining each retain
+/// progress until their own gate clears the reason. Service revalidates rights.
+pub fn baseline_activation_pending() -> bool {
+    crate::domain_control::replay::baseline_activation_pending() || owner::drain_pending()
+}
 pub use owner::{control_step, init, pause_for_peer, quiescent, service_io, service_step, status};
 pub(crate) const WORKSPACE_PEAK_BYTES: usize = owner::WORKSPACE_PEAK_BYTES;
 

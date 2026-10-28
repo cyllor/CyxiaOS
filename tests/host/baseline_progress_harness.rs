@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cyxia_prototype::domains::{Error, ObjectKey, WINDOW_NS};
 use cyxia_prototype::domains::tasks::*;
 use cyxia_prototype::domains::maintenance::{BackgroundBudgets, CpuDebit};
+use sha2::{Digest,Sha256};
 static CPU: AtomicUsize = AtomicUsize::new(0);
 static NOW: AtomicU64 = AtomicU64::new(100_000_000);
 static WORK: AtomicU64 = AtomicU64::new(0);
@@ -14,6 +15,8 @@ static STEP_CALLS: AtomicU64 = AtomicU64::new(0);
 static BODY_EFFECTS: AtomicU64 = AtomicU64::new(0);
 static KEEP_HINT: AtomicBool = AtomicBool::new(false);
 static QUEUE_ON_STEP: AtomicBool = AtomicBool::new(false);
+static PROBE_MODE: AtomicUsize = AtomicUsize::new(0);
+static STEP_ERROR: AtomicUsize = AtomicUsize::new(0);
 static DENY_SETTLE: AtomicBool = AtomicBool::new(false);
 static CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 static RECURSED: AtomicBool = AtomicBool::new(false);
@@ -51,23 +54,40 @@ struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit>,
 struct State {
     scheduler: Scheduler, active: [Option<Active>; 1], layout: CpuLayout, draining: u64,
     service_admitted: bool, background: BackgroundBudgets, bills: Vec<(u64, u64, u64)>,
-    admission: SpawnAdmission, tasks: (), launches: [Launch; 1], memory: (), services: (), ipc: (),
+    admission: SpawnAdmission, tasks: (), launches: [Launch; LAUNCHES], memory: (), services: (), ipc: (),
     remote: (), generation: u64, facts: Facts, launch_cursor: usize,
 }
-const LAUNCHES: usize = 1;
+const LAUNCHES: usize = 72;
 const ZERO: ObjectKey = ObjectKey { id: 0, generation: 0 };
-struct Launch { request: Option<SpawnRequest>, input: [u8; 1] }
+const PACKAGE:ObjectKey=ObjectKey{id:7,generation:1};
+const CLIENT_PACKAGE:ObjectKey=ObjectKey{id:8,generation:1};
+const PROBE_DEADLINE:u64=5_100_000_000;
+struct Input([u8;4096]);
+impl Input {
+    fn fill(&mut self,value:u8){
+        if value==0 {
+            assert_eq!(CREDIT_KIND[0].load(Ordering::Acquire),5,"cleanup escaped a paid service piece");
+            assert!(!COMPLETE_READY[0].load(Ordering::Acquire));
+            work(20_000); // Controlled PMU cost, not native WCET.
+        }
+        self.0.fill(value);
+    }
+}
+impl core::ops::Deref for Input {type Target=[u8;4096];fn deref(&self)->&Self::Target{&self.0}}
+impl core::ops::DerefMut for Input {fn deref_mut(&mut self)->&mut Self::Target{&mut self.0}}
+struct Launch { request: Option<SpawnRequest>, input: Input, cpu:u16,deadline:u64,len:usize,recipe:u16 }
+impl Launch {const EMPTY:Self=Self{request:None,input:Input([0;4096]),cpu:3,deadline:0,len:0,recipe:0};}
 struct Facts { rejected: u64 }
 static mut STATE: State = State { scheduler: Scheduler::new(), active: [None],
     layout: CpuLayout { business_mask: 13, healthy_mask: 15, generation: 1 }, draining: 0,
     service_admitted: false, background: BackgroundBudgets::new(), bills: Vec::new(),
-    admission: SpawnAdmission::new(), tasks: (), launches: [Launch { request: None, input: [0] }],
+    admission: SpawnAdmission::new(), tasks: (), launches: [const {Launch::EMPTY};LAUNCHES],
     memory: (), services: (), ipc: (), remote: (), generation: 1, facts: Facts { rejected: 0 }, launch_cursor: 0 };
 fn effective_layout(s: &State) -> CpuLayout { s.layout }
 // Construction is the hardware boundary; the queue, selection, task gate and
 // Scheduler reservation are real. Each authorization checks fresh service credit.
 struct Creator<'a> {
-    tasks: &'a mut (), launches: &'a [Launch; 1], memory: &'a mut (),
+    tasks: &'a mut (), launches: &'a [Launch; LAUNCHES], memory: &'a mut (),
     scheduler: &'a mut Scheduler, services: &'a mut (), ipc: &'a mut (),
     background: &'a mut BackgroundBudgets, layout: CpuLayout, remote: (),
     generation: &'a mut u64, local_failure: Option<()>,
@@ -90,6 +110,21 @@ impl TaskBackend for Creator<'_> {
 mod local_evidence { pub fn retain(_: ()) {} }
 fn request() -> SpawnRequest { SpawnRequest { caller: group(0x5245504c4341), request_id: 101,
     package: group(7), group: group(12), payload_hash: [7; 32], recovery: false } }
+struct SubmitOnly;
+impl TaskBackend for SubmitOnly {
+    fn authorize(&mut self,_:&SpawnRequest)->Result<(),Error>{Ok(())}
+    fn create(&mut self,_:&SpawnRequest)->CreateOutcome{panic!("submission executed construction")}
+}
+fn probe_request()->SpawnRequest {SpawnRequest{request_id:251,..request()}}
+fn probe_attempt(mode:usize)->Result<SpawnState,Error>{
+    locked(|s|{
+        service_witness_locked(s)?;
+        if mode==1 {submit_package(s,PACKAGE,request().caller,251,group(12),&1u64.to_le_bytes(),3,PROBE_DEADLINE,false,0)}
+        else{s.admission.submit(probe_request(),now_ns(),&mut SubmitOnly)}
+    })
+}
+mod storage_fault_capture {pub const PROFILE:bool=false;pub fn launch_deadline_ns(_: &[u8])->Option<u64>{None}}
+mod domain_control {pub mod replay {pub fn baseline_activation_pending()->bool{super::super::HINT.load(super::super::Ordering::Acquire)}}}
 fn queue_warm() {
     locked(|s| {
         service_witness_locked(s)?;
@@ -151,7 +186,7 @@ mod learning_evidence {
         // fixture asserts scheduling and bills, not diagnostic serialization.
         pub fn cancelled(_: super::super::Dispatch, _: u64) {}
         pub fn admitted(_: &super::super::SpawnRequest,_:super::super::SpawnState,_:u64,_:u64) {}
-        pub fn admission_opportunity(_:bool,_:bool,_:u64) {}
+        pub fn admission_opportunity(_:bool,_:bool,_:bool,_:u64) {}
         pub fn admission_body(_:u64,_:u64) {}
         pub fn admission_result(_:bool,_:u64) {}
     }
@@ -183,17 +218,22 @@ fn network_turn(_: &mut smp::prototype_runtime::Coordinator, _: &mut Option<Nati
 fn fail(code: u64) -> ! { panic!("unexpected service failure {code}") }
 mod learning_replay {
     use super::*;
+    use super::learning_replay as owner;
     type DomainError = Error;
     static GATE: AtomicBool = AtomicBool::new(false);
     static ADDRESS: AtomicUsize = AtomicUsize::new(0);
-    struct State { archive: u64, snapshot: u64 }
-    static mut ARCHIVE: State = State { archive: 0, snapshot: 100_000_000 };
+    #[derive(Clone,Copy,PartialEq,Eq)] enum Phase {Run,Drain,CloseSources}
+    struct Activation {owned:bool}
+    impl Activation {fn entered(&self)->bool{self.owned}}
+    struct State { archive: u64, snapshot: u64, phase:Phase,scope:Option<u64>,token:Option<u64>,work_activation:Activation }
+    static mut ARCHIVE: State = State { archive: 0, snapshot: 100_000_000,phase:Phase::Run,scope:None,token:None,work_activation:Activation{owned:false} };
     pub fn reset() {
         GATE.store(false, Ordering::Release);
-        unsafe { ARCHIVE = State { archive: 0, snapshot: 100_000_000 }; }
+        unsafe { ARCHIVE = State { archive: 0, snapshot: 100_000_000,phase:Phase::Run,scope:None,token:None,work_activation:Activation{owned:false} }; }
+        DRAIN_PENDING.store(false,Ordering::Release);
         ADDRESS.store(core::ptr::addr_of_mut!(ARCHIVE) as usize, Ordering::Release);
     }
-    pub fn baseline_activation_pending() -> bool { HINT.load(Ordering::Acquire) }
+    // REPLAY_HINT_READER
     mod diagnostic {
         pub struct Attempt;
         impl Attempt { pub fn new(_: u64) -> Self { Self } }
@@ -207,12 +247,24 @@ mod learning_replay {
                 super::mechanism_progress(&mut smp::prototype_runtime::Coordinator);
                 RECURSED.store(true, Ordering::Release);
             }
-            if now_ns() > s.snapshot + 50_000_000 {
+            if s.phase!=Phase::Drain && now_ns() > s.snapshot + 50_000_000 {
                 HINT.store(false, Ordering::Release); return Err(Error::Expired);
             }
             BODY_EFFECTS.fetch_add(1, Ordering::AcqRel);
             s.archive += 1;
             if QUEUE_ON_STEP.swap(false, Ordering::AcqRel) { queue_warm(); }
+            if s.phase==Phase::Drain && locked(|t|Ok(t.launches.iter().all(|l|l.request.is_none())))? {
+                s.phase=Phase::CloseSources;
+            }
+            let mode=PROBE_MODE.load(Ordering::Acquire);
+            if mode!=0 {
+                let result=probe_attempt(mode);
+                HINT.store(true,Ordering::Release);
+                result?;
+            }
+            match STEP_ERROR.load(Ordering::Acquire){1=>return Err(Error::Again),2=>return Err(Error::Busy),
+                3=>return Err(Error::NotReady),4=>return Err(Error::Budget),5=>return Err(Error::Capacity),
+                6=>return Err(Error::Conflict),_=>()}
             HINT.store(KEEP_HINT.load(Ordering::Acquire), Ordering::Release); Ok(true)
         })
     }
@@ -222,6 +274,26 @@ mod learning_replay {
     pub fn with_archive(body: impl FnOnce(&mut u64)) { with(|s| { body(&mut s.archive); Ok(()) }).unwrap(); }
     pub fn snapshot() -> u64 { with(|s| Ok(s.snapshot)).unwrap() }
     pub fn first_at(at: u64) { with(|s| { s.snapshot = at; Ok(()) }).unwrap(); }
+    pub fn own_drain(result:Result<(),Error>)->Result<(),Error>{with(|s|{
+        s.phase=Phase::Drain;s.scope=Some(9);s.token=Some(9);s.work_activation.owned=true;result
+    })}
+    pub fn change_phase(phase:u8){with(|s|{s.phase=if phase==0{Phase::Run}else{Phase::CloseSources};Ok(())}).unwrap();}
+    pub fn check_projection_boundaries(){
+        for (scope,token,owned) in [(None,Some(9),true),(Some(9),None,true),(Some(9),Some(9),false)] {
+            with(|s|{s.phase=Phase::Drain;s.scope=scope;s.token=token;s.work_activation.owned=owned;Ok(())}).unwrap();
+            assert!(!drain_pending(),"unowned state requested drain progress");
+        }
+        own_drain(Ok(())).unwrap();
+        with(|s|{
+            s.phase=Phase::CloseSources;
+            assert_eq!(with(|_|Ok(())),Err(Error::Busy));
+            assert!(drain_pending(),"contended entry read or cleared borrowed owner state");Ok(())
+        }).unwrap();
+        assert!(!drain_pending());
+        own_drain(Ok(())).unwrap();assert!(drain_pending());
+        ADDRESS.store(0,Ordering::Release);
+        assert_eq!(with(|_|Ok(())),Err(Error::NotReady));assert!(!drain_pending());
+    }
 }
 // PRODUCTION_BODIES
 fn reset() {
@@ -232,6 +304,7 @@ fn reset() {
     STEP_CALLS.store(0, Ordering::Release); BODY_EFFECTS.store(0, Ordering::Release);
     KEEP_HINT.store(false, Ordering::Release); QUEUE_ON_STEP.store(false, Ordering::Release);
     DENY_SETTLE.store(false, Ordering::Release); CONSTRUCTIONS.store(0, Ordering::Release);
+    PROBE_MODE.store(0,Ordering::Release);STEP_ERROR.store(0,Ordering::Release);
     TICKETS.store(0, Ordering::Release); CURRENT_TICKET.store(0, Ordering::Release);
     COMPLETE_READY[0].store(false, Ordering::Release); CREDIT_KIND[0].store(0, Ordering::Release);
     POLLING.store(false, Ordering::Release); learning_replay::reset();
@@ -239,6 +312,7 @@ fn reset() {
         let s = &mut *core::ptr::addr_of_mut!(STATE);
         s.scheduler = Scheduler::new(); s.active = [None]; s.service_admitted = false; s.bills.clear();
         s.admission = SpawnAdmission::new(); s.facts.rejected = 0;
+        s.launches=[const {Launch::EMPTY};LAUNCHES];s.launch_cursor=0;
         s.admission.register_group(group(12)).unwrap();
         s.scheduler.register_group(group(12)).unwrap(); s.scheduler.register_group(group(14)).unwrap(); }
 }
@@ -358,19 +432,24 @@ fn pending_execution_constructs_one_original_queued_child_under_separate_credit(
 }
 #[test]
 fn second_piece_cannot_spend_an_exhausted_real_service_budget() {
+    for error in [0,1] {
     reset(); HINT.store(false, Ordering::Release);
     for _ in 0..23 { assert!(service_segment(|| work(2_500_000)).is_some()); }
     learning_replay::first_at(now_ns()); HINT.store(true, Ordering::Release);
     KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    STEP_ERROR.store(error,Ordering::Release);
     mechanism_progress(&mut smp::prototype_runtime::Coordinator);
     assert_eq!(STEP_CALLS.load(Ordering::Acquire), 1);
     assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 0);
     assert_eq!(locked(|s| s.admission.query(request().caller, 101)), Ok(SpawnState::Queued));
     assert_eq!(bills().len(), 24);
+    }
 }
 #[test]
 fn retained_first_bill_prevents_any_second_piece() {
+    for error in [0,1] {
     reset(); KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    STEP_ERROR.store(error,Ordering::Release);
     DENY_SETTLE.store(true, Ordering::Release);
     mechanism_progress(&mut smp::prototype_runtime::Coordinator);
     assert!(COMPLETE_READY[0].load(Ordering::Acquire));
@@ -378,6 +457,7 @@ fn retained_first_bill_prevents_any_second_piece() {
     assert_eq!(COMPLETE_ACTUAL[0].load(Ordering::Acquire), 100_000);
     DENY_SETTLE.store(false, Ordering::Release);
     assert_eq!(bills().len(), 0);
+    }
 }
 #[test]
 fn nested_pending_execution_still_has_only_one_ticket_and_one_admission() {
@@ -387,4 +467,140 @@ fn nested_pending_execution_still_has_only_one_ticket_and_one_admission() {
     assert_eq!(TICKETS.load(Ordering::Acquire), 1);
     assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 1, "pending execution never advanced its queued admission");
     assert_eq!(bills().len(), 2);
+}
+fn paid<R>(f:impl FnOnce(&mut State)->Result<R,Error>)->R {
+    service_segment(||locked(|s|{service_witness_locked(s)?;f(s)})).unwrap().unwrap()
+}
+fn kernel_submit(s:&mut State,id:u64)->Result<SpawnState,Error>{
+    submit_package(s,PACKAGE,request().caller,id,group(12),&1u64.to_le_bytes(),3,PROBE_DEADLINE,false,0)
+}
+fn fill_terminal_launches(){
+    paid(|s|{
+        for id in 101..165 {
+            assert_eq!(kernel_submit(s,id)?,SpawnState::Queued);
+            if id!=102 {s.admission.cancel(request().caller,id)?;}
+        }
+        Ok(())
+    });
+}
+#[test]
+fn launch_full_again_gets_one_fresh_construction_and_one_terminal_cleanup(){
+    reset();fill_terminal_launches();let before=bills().len();
+    PROBE_MODE.store(1,Ordering::Release);KEEP_HINT.store(true,Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire),1,"Again suppressed independent queue progress");
+    locked(|s|{
+        assert!(s.launches[0].request.is_none(),"Again did not retire one terminal launch slot");
+        assert!(s.launches[0].input.iter().all(|b|*b==0));
+        assert_eq!(s.launch_cursor,1);
+        assert!(s.launches[1].request.is_some(),"one piece cleared more than its cursor slot");
+        assert_eq!(s.admission.query(request().caller,251),Err(Error::NotFound));Ok(())
+    }).unwrap();
+    let b=bills();assert_eq!(b[before..].iter().map(|b|b.1).collect::<Vec<_>>(),[100_000,100_000]);
+    assert_ne!(b[before].0,b[before+1].0);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    locked(|s|{
+        let probe=s.admission.request(request().caller,251)?;
+        assert_eq!(probe.request_id,251);assert_eq!(probe.caller,request().caller);
+        assert_eq!(s.launches[0].deadline,PROBE_DEADLINE);assert_eq!(s.launch_cursor,2);Ok(())
+    }).unwrap();
+    assert_eq!(learning_replay::snapshot(),100_000_000);
+}
+#[test]
+fn real_admission_queue_full_again_can_advance_without_new_request_identity(){
+    reset();paid(|s|{
+        for id in 101..165 {s.admission.submit(SpawnRequest{request_id:id,..request()},now_ns(),&mut SubmitOnly)?;}
+        assert_eq!(s.admission.submit(probe_request(),now_ns(),&mut SubmitOnly),Err(Error::Again));
+        Ok(())
+    });
+    PROBE_MODE.store(2,Ordering::Release);KEEP_HINT.store(true,Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire),1,"queued-limit Again suppressed existing request admission");
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(locked(|s|s.admission.request(request().caller,251)),Ok(probe_request()));
+    assert_eq!(learning_replay::snapshot(),100_000_000);
+}
+#[test]
+fn cleanup_preserves_queued_unknown_and_query_error_custody(){
+    reset();paid(|s|{
+        struct Unknown;
+        impl TaskBackend for Unknown {
+            fn authorize(&mut self,_:&SpawnRequest)->Result<(),Error>{Ok(())}
+            fn create(&mut self,_:&SpawnRequest)->CreateOutcome{CreateOutcome::Uncertain}
+        }
+        let unknown=SpawnRequest{request_id:102,..request()};
+        s.admission.submit(unknown,now_ns(),&mut SubmitOnly)?;
+        assert_eq!(s.admission.service_one(now_ns(),&mut Unknown)?.unwrap().1,SpawnState::Unknown);
+        s.admission.submit(request(),now_ns(),&mut SubmitOnly)?;
+        for (i,id) in [(0,101),(1,102),(2,103)] {
+            s.launches[i].request=Some(SpawnRequest{request_id:id,..request()});s.launches[i].input.fill(0xaa);
+        }
+        Ok(())
+    });
+    for i in 0..3 {
+        paid(|s|advance_admission_bounded(s,0,1));
+        locked(|s|{
+            assert_eq!(s.launch_cursor,i+1);
+            assert!(s.launches[i].request.is_some(),"query error or unresolved receipt released launch custody");
+            assert!(s.launches[i].input.iter().all(|b|*b==0xaa));Ok(())
+        }).unwrap();
+    }
+}
+#[test]
+fn cleanup_releases_only_one_positive_terminal_receipt_per_paid_piece(){
+    reset();paid(|s|{
+        assert_eq!(kernel_submit(s,101)?,SpawnState::Queued);
+        advance_admission_bounded(s,1,0)?;
+        assert!(matches!(s.admission.query(request().caller,101)?,SpawnState::Created(_)));
+        assert_eq!(kernel_submit(s,102)?,SpawnState::Queued);
+        struct Expired;
+        impl TaskBackend for Expired {
+            fn authorize(&mut self,_:&SpawnRequest)->Result<(),Error>{Err(Error::Expired)}
+            fn create(&mut self,_:&SpawnRequest)->CreateOutcome{panic!("rejected request constructed")}
+        }
+        assert_eq!(s.admission.service_one(now_ns(),&mut Expired)?.unwrap().1,SpawnState::Failed(Error::Expired));
+        kernel_submit(s,103)?;s.admission.cancel(request().caller,103)?;
+        for launch in &mut s.launches[..3] {launch.input.fill(0xaa);}Ok(())
+    });
+    for i in 0..3 {
+        paid(|s|advance_admission_bounded(s,0,1));
+        locked(|s|{
+            assert_eq!(s.launch_cursor,i+1);assert!(s.launches[i].request.is_none());
+            assert!(s.launches[i].input.iter().all(|b|*b==0));
+            for launch in &s.launches[i+1..3] {assert!(launch.request.is_some());assert_eq!(launch.input[0],0xaa);}
+            Ok(())
+        }).unwrap();assert_eq!(bills().last().unwrap().1,20_000);
+    }
+}
+#[test]
+fn other_root_errors_do_not_receive_the_again_admission_exception(){
+    for error in 2..=6 {
+        reset();STEP_ERROR.store(error,Ordering::Release);QUEUE_ON_STEP.store(true,Ordering::Release);
+        mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+        assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire),0);
+        assert_eq!(bills().len(),1);
+    }
+}
+#[test]
+fn actual_owner_guard_projects_only_owned_drain_on_success_and_error(){
+    reset();HINT.store(false,Ordering::Release);
+    assert_eq!(learning_replay::own_drain(Err(Error::Again)),Err(Error::Again));
+    assert!(learning_replay::baseline_activation_pending(),"owned drain lost priority when Root was complete");
+    learning_replay::change_phase(1);assert!(!learning_replay::baseline_activation_pending());
+    learning_replay::own_drain(Ok(())).unwrap();learning_replay::change_phase(0);
+    assert!(!learning_replay::baseline_activation_pending(),"Run observation entered the drain fast path");
+    learning_replay::check_projection_boundaries();
+}
+#[test]
+fn actual_driver_finishes_owned_drain_after_root_hint_clears(){
+    reset();paid(|s|{
+        for id in 101..103 {kernel_submit(s,id)?;s.admission.cancel(request().caller,id)?;}Ok(())
+    });
+    let before=bills().len();HINT.store(false,Ordering::Release);
+    learning_replay::own_drain(Ok(())).unwrap();NOW.store(160_000_000,Ordering::Release);
+    for _ in 0..3 {mechanism_progress(&mut smp::prototype_runtime::Coordinator);}
+    assert_eq!(STEP_CALLS.load(Ordering::Acquire),3,"actual driver did not advance the owned drain debt");
+    assert!(!learning_replay::baseline_activation_pending());
+    assert_eq!(learning_replay::snapshot(),100_000_000);
+    assert_eq!(bills()[before..].iter().map(|b|b.1).collect::<Vec<_>>(),[100_000,20_000,100_000,20_000,100_000]);
 }

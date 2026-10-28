@@ -785,18 +785,21 @@ fn probe_matches(group: ObjectKey, caller: ObjectKey, id: u64) -> bool {
         && TRACE_WORK_EVIDENCE.get(40) == id
         && target_matches(group)
 }
-pub fn admission_opportunity(root_ok: bool, pending: bool, at: u64) {
+pub fn admission_opportunity(root_ok: bool, root_again: bool, pending: bool, at: u64) {
     debug_assert_eq!(cpu::slot(), 0);
     if !closing_active() {
         return;
     }
     TRACE_CLOSING_EVIDENCE.write(|b| {
         b.add(19, 1);
-        if root_ok && pending {
+        if (root_ok || root_again) && pending {
             b.add(20, 1);
         }
         b.put(39, at);
-        b.put(56, u64::from(root_ok) | u64::from(pending) << 1);
+        b.put(
+            56,
+            u64::from(root_ok) | u64::from(pending) << 1 | u64::from(root_again) << 2,
+        );
     });
 }
 pub fn admission_body(sequence: u64, at: u64) {

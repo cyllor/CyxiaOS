@@ -111,7 +111,7 @@ fn first_scope_preserves_each_stage_and_later_trials_cannot_replace_it() {
     trace::closing_work(RUN,trace::ClosingWork::ProbeCreated{version:42,id:251,deadline:5_103_005_000},103_005_000);
     trace::closing_work(RUN,trace::ClosingWork::ProbeSubmit{id:251,entered_ns:103_006_000,result:Err(Error::Busy)},103_007_000);
     trace::closing_work(RUN,trace::ClosingWork::ProbeSubmit{id:251,entered_ns:103_008_000,result:Ok(())},103_009_000);
-    trace::admission_opportunity(true,true,103_010_000);
+    trace::admission_opportunity(true,false,true,103_010_000);
     trace::admission_body(901,103_011_000);
     let request=cyxia_prototype::domains::tasks::SpawnRequest {caller:key(0x5245504c4341),request_id:251,
         package:key(7),group:key(12),payload_hash:[7;32],recovery:false};
