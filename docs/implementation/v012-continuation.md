@@ -65,7 +65,7 @@ The scoped memory-borrow design also received independent source review. Its fin
 
 Deferred minor: extend file retry coverage to deferred completion settlement and cleanup barriers. The current harness exercises immediate settlement; reviewed production barriers are not a substitute for executing that case in the final fault matrix.
 
-An additional independent source review covered the bounded owner turns, dynamic-entry minimum and private-clear batching, with no Critical, Important or Minor finding. It explicitly declined comparative native performance, universal timing adequacy and full acceptance; the client-125 failure remains open.
+An additional independent source review covered the bounded owner turns, dynamic-entry minimum and private-clear batching, with no Critical, Important or Minor finding. It explicitly declined comparative native performance, universal timing adequacy and full acceptance. The client-125 failure was still open at that review; the subsequent dedicated-pump run records its first complete client pass.
 
 The subsequent vector-pump review found no Critical or Important issue. Its report-retention Minor was fixed: `task_vector_evidence` now survives in final `result.json` as well as the raw bank; 57 targeted verifier tests pass. A source-body regression executes the real outer pump and paid service wrapper over the production Scheduler and ServiceBatch. It preserves the original selector and independently exercises batch sizes 1 and 8, denied-credit nonexecution, exact per-piece settlement, and a failing mutation that removes the new pump call. Other general mechanisms and hardware timing are substituted; native fairness and universal timing remain unproven.
 
