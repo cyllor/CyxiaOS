@@ -281,14 +281,16 @@ fn frame_with(set: &CandidateSet, sequence: u64, base: u64, decisions: &[Decisio
 }
 struct FixedClock(u64);
 impl Clock for FixedClock {
-    fn now_ns(&mut self) -> u64 {
-        self.0
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0 };
+        publication_time(wall_ns)
     }
 }
 struct ScriptClock(VecDeque<u64>);
 impl Clock for ScriptClock {
-    fn now_ns(&mut self) -> u64 {
-        self.0.pop_front().expect("unexpected clock read")
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0.pop_front().expect("unexpected clock read") };
+        publication_time(wall_ns)
     }
 }
 #[derive(Default)]
@@ -1229,4 +1231,15 @@ fn score_proof_cannot_authorize_another_legal_choice_or_extended_scope() {
         );
         assert_eq!(governance.submissions().count(), 0);
     });
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }

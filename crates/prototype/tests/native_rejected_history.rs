@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 struct FixedClock(u64);
 impl Clock for FixedClock {
-    fn now_ns(&mut self) -> u64 {
-        self.0
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0 };
+        publication_time(wall_ns)
     }
 }
 #[derive(Default)]
@@ -110,7 +111,14 @@ fn rejected(sequence: u64) -> (rejection::Facts, Vec<u8>) {
     let mut clock = FixedClock(snapshot.taken_ns + 1_000);
     let mut owner = BusyOwner::default();
     let receipt = registry
-        .submit_job(publisher, &wire, received, deadline, &mut clock, &mut owner)
+        .submit_job(
+            publisher,
+            &wire,
+            publication_time(received),
+            deadline,
+            &mut clock,
+            &mut owner,
+        )
         .unwrap();
     assert_eq!(receipt.version, 0);
     assert_eq!(receipt.state(), ExecutionState::Failed(Error::Busy));
@@ -119,7 +127,14 @@ fn rejected(sequence: u64) -> (rejection::Facts, Vec<u8>) {
     // Registry itself retains this terminal rejection. A retry does not ask
     // the owner to execute it again or turn Busy into a later publication.
     assert_eq!(
-        registry.submit_job(publisher, &wire, received, deadline, &mut clock, &mut owner),
+        registry.submit_job(
+            publisher,
+            &wire,
+            publication_time(received),
+            deadline,
+            &mut clock,
+            &mut owner
+        ),
         Ok(receipt)
     );
     assert_eq!((owner.checks, owner.publications), (1, 0));
@@ -299,4 +314,15 @@ fn terminal_rejection_uses_reserved_last_slot_without_rewriting_ordinary_rows() 
         Err(Error::Capacity)
     );
     assert_eq!((used, &rows), (64, &saved));
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }

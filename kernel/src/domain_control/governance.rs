@@ -664,7 +664,7 @@ impl GovernanceAuthority for Authority<'_> {
         if let Some(publication) = self.publication {
             // No callback or clock reset follows this final permit/window
             // check before the protected Governance publication mutation.
-            publication.check(at, now())?;
+            publication.check(at, policy::Clock::read(&mut NativeClock))?;
         }
         Ok(())
     }
@@ -733,7 +733,7 @@ struct CanaryScope<'a, 'b, 'm> {
     governance: &'a mut Governance<'b, 'm>,
     scored: &'a mut Option<Scored>,
     cost: &'a mut Option<WorkReceipt>,
-    started: u64,
+    started: policy::PublicationTime,
     deadline: u64,
 }
 fn domain_error(error: Error) -> DomainError {
@@ -789,7 +789,7 @@ impl PublicationScope for CanaryScope<'_, '_, '_> {
             checks: None,
             restoration: None,
             publication: Some(PublicationClock {
-                started_ns: self.started,
+                started: self.started,
                 deadline_ns: self.deadline,
                 permit: self.gate.permit().ok_or(DomainError::Auth)?,
             }),
@@ -836,7 +836,8 @@ pub fn publish_canary(
 ) -> Result<CanaryPublication, Error> {
     // The same publication clock includes native identity/model validation
     // and admission; it is never restarted after those fallible checks.
-    let started = now();
+    let publication_started = policy::Clock::read(&mut NativeClock);
+    let started = publication_started.wall_ns;
     control(|state| {
         let job = state.governance_jobs.score.ok_or(Error::State)?;
         current(state, governance, job)?;
@@ -914,7 +915,7 @@ pub fn publish_canary(
             governance,
             scored,
             cost,
-            started,
+            started: publication_started,
             deadline,
         };
         let mut executor = Executor {
@@ -924,7 +925,7 @@ pub fn publish_canary(
             evidence: None,
             job: job.sequence,
             boot: state.boot,
-            publication_started: started,
+            publication_started,
             wall_deadline: deadline,
             dependencies: job.dependencies,
             scores,
@@ -933,7 +934,7 @@ pub fn publish_canary(
         let receipt = match state.registry.submit_job(
             publisher(job.binding.controller_epoch),
             &wire[..used],
-            started,
+            publication_started,
             deadline,
             &mut NativeClock,
             &mut executor,
@@ -1239,7 +1240,8 @@ pub fn restore(governance: &mut Governance<'_, '_>) -> Result<ExecutionState, Er
                 return Ok(actual.state);
             }
         }
-        let started = now();
+        let publication_started = policy::Clock::read(&mut NativeClock);
+        let started = publication_started.wall_ns;
         let target = request.target.key;
         let baseline = request.target.baseline;
         let f = state.owner.families[family_index(15, 1).map_err(native_error)?]
@@ -1327,7 +1329,7 @@ pub fn restore(governance: &mut Governance<'_, '_>) -> Result<ExecutionState, Er
             evidence: None,
             job: sequence,
             boot: state.boot,
-            publication_started: started,
+            publication_started,
             wall_deadline: started.checked_add(50_000_000).ok_or(Error::Numeric)?,
             dependencies,
             scores: [0; 32],
@@ -1338,7 +1340,7 @@ pub fn restore(governance: &mut Governance<'_, '_>) -> Result<ExecutionState, Er
             .submit_job(
                 publisher(controller),
                 &wire[..used],
-                started,
+                publication_started,
                 executor.wall_deadline,
                 &mut NativeClock,
                 &mut executor,

@@ -25,7 +25,7 @@ fn permit() -> CanaryPermit {
 }
 fn clock(started_ns: u64) -> PublicationClock {
     PublicationClock {
-        started_ns,
+        started: paired(started_ns, started_ns),
         deadline_ns: started_ns + 50_000_000,
         permit: permit(),
     }
@@ -36,12 +36,18 @@ fn last_legal_callback_cannot_publish_after_exact_permit_expiry() {
     let expiry = permit().expires_ns;
     let commit = expiry - 100_000;
     let final_clock = clock(commit - 10_000);
-    assert_eq!(final_clock.check(commit, expiry - 1), Ok(()));
-    assert_eq!(final_clock.check(commit, expiry), Err(Error::Deadline));
+    assert_eq!(
+        final_clock.check(commit, paired(expiry - 1, expiry - 1)),
+        Ok(())
+    );
+    assert_eq!(
+        final_clock.check(commit, paired(expiry, expiry)),
+        Err(Error::Deadline)
+    );
     // The old commit clock is legal and neither 500us nor the job deadline
     // is exceeded, but the actual final callback has crossed the permit end.
     assert_eq!(
-        final_clock.check(commit, expiry + 10_000),
+        final_clock.check(commit, paired(expiry + 10_000, expiry + 10_000)),
         Err(Error::Deadline)
     );
 }
@@ -51,10 +57,16 @@ fn last_callback_cannot_charge_publication_to_the_previous_100ms_window() {
     let boundary = permit().start_ns + 3 * WINDOW_NS;
     let commit = boundary - 100_000;
     let final_clock = clock(commit - 10_000);
-    assert_eq!(final_clock.check(commit, boundary - 1), Ok(()));
-    assert_eq!(final_clock.check(commit, boundary), Err(Error::Deadline));
     assert_eq!(
-        final_clock.check(commit, boundary + 10_000),
+        final_clock.check(commit, paired(boundary - 1, boundary - 1)),
+        Ok(())
+    );
+    assert_eq!(
+        final_clock.check(commit, paired(boundary, boundary)),
+        Err(Error::Deadline)
+    );
+    assert_eq!(
+        final_clock.check(commit, paired(boundary + 10_000, boundary + 10_000)),
         Err(Error::Deadline)
     );
 }
@@ -62,24 +74,36 @@ fn last_callback_cannot_charge_publication_to_the_previous_100ms_window() {
 #[test]
 fn start_deadline_and_cpu_budget_bounds_are_not_renewed_by_the_callback() {
     let start = permit().start_ns;
-    assert_eq!(clock(start).check(start, start), Ok(()));
+    assert_eq!(clock(start).check(start, paired(start, start)), Ok(()));
     assert_eq!(
-        clock(start - 1).check(start - 1, start),
+        clock(start - 1).check(start - 1, paired(start, start)),
         Err(Error::Deadline)
     );
     let mut final_clock = clock(start);
     final_clock.deadline_ns = start + 250_000;
-    assert_eq!(final_clock.check(start, start + 250_000), Ok(()));
     assert_eq!(
-        final_clock.check(start, start + 250_001),
-        Err(Error::Deadline)
-    );
-    assert_eq!(
-        clock(start).check(start, start + PUBLICATION_BUDGET_NS),
+        final_clock.check(start, paired(start + 250_000, start + 250_000)),
         Ok(())
     );
     assert_eq!(
-        clock(start).check(start, start + PUBLICATION_BUDGET_NS + 1),
+        final_clock.check(start, paired(start + 250_001, start + 250_001)),
+        Err(Error::Deadline)
+    );
+    assert_eq!(
+        clock(start).check(
+            start,
+            paired(start + PUBLICATION_BUDGET_NS, start + PUBLICATION_BUDGET_NS)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        clock(start).check(
+            start,
+            paired(
+                start + PUBLICATION_BUDGET_NS + 1,
+                start + PUBLICATION_BUDGET_NS + 1
+            )
+        ),
         Err(Error::Budget)
     );
 }
@@ -87,9 +111,47 @@ fn start_deadline_and_cpu_budget_bounds_are_not_renewed_by_the_callback() {
 #[test]
 fn backwards_clocks_cannot_hide_cost_or_move_the_commit_before_issuance() {
     let start = permit().start_ns + 1_000_000;
-    assert_eq!(clock(start).check(start - 1, start), Err(Error::Deadline));
     assert_eq!(
-        clock(start).check(start + 100, start + 99),
+        clock(start).check(start - 1, paired(start, start)),
         Err(Error::Deadline)
+    );
+    assert_eq!(
+        clock(start).check(start + 100, paired(start + 99, start + 99)),
+        Err(Error::Deadline)
+    );
+}
+
+fn paired(wall_ns: u64, cpu_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime { cpu: 0, ns: cpu_ns },
+    }
+}
+
+#[test]
+fn canary_final_callback_charges_cpu_not_wall_pause_and_keeps_its_original_deadline() {
+    let start = permit().start_ns;
+    let mut c = clock(start);
+    c.started = paired(start, 1_000);
+    assert_eq!(
+        c.check(start, paired(start + 2_000_000, 1_100)),
+        Ok(()),
+        "Canary wall pause was counted as CPU"
+    );
+    assert_eq!(c.check(start, paired(start + 10, 501_000)), Ok(()));
+    assert_eq!(
+        c.check(start, paired(start + 11, 501_001)),
+        Err(Error::Budget)
+    );
+    assert_eq!(
+        c.check(start, paired(start + 50_000_001, 1_101)),
+        Err(Error::Deadline)
+    );
+    let mut migrated = paired(start + 12, 1_102);
+    migrated.cpu.cpu = 1;
+    assert_eq!(c.check(start, migrated), Err(Error::Evidence));
+    assert_eq!(
+        c.check(start, paired(start + 13, 999)),
+        Err(Error::Evidence)
     );
 }

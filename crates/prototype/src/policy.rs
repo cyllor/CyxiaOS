@@ -556,8 +556,35 @@ impl RegisteredSet {
     }
 }
 
+/// Execution counters are local to one CPU; they cannot be compared after a
+/// migration even when the numerical counter values happen to be ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuTime {
+    pub cpu: usize,
+    pub ns: u64,
+}
+/// Protected publication input boundary, or a later observation of it. Wall
+/// time governs leases/deadlines; the separate CPU counter governs execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationTime {
+    pub wall_ns: u64,
+    pub cpu: CpuTime,
+}
+impl PublicationTime {
+    pub fn cpu_elapsed(self, observed: Self) -> Result<u64, Error> {
+        if observed.cpu.cpu != self.cpu.cpu {
+            return Err(Error::Auth);
+        }
+        if observed.wall_ns < self.wall_ns {
+            return Err(Error::Range);
+        }
+        observed.cpu.ns.checked_sub(self.cpu.ns).ok_or(Error::Range)
+    }
+}
 pub trait Clock {
-    fn now_ns(&mut self) -> u64;
+    /// Both domains are explicit. A production clock must read actual local
+    /// execution time, rather than deriving it from the wall timestamp.
+    fn read(&mut self) -> PublicationTime;
 }
 /// PREPARE must reserve all resources without starting physical effects. Failed
 /// publication is effect-free; cancel_prepared releases only those reservations.
@@ -1132,16 +1159,16 @@ impl Registry {
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
-        let started_ns = clock.now_ns();
+        let started_ns = clock.read();
         self.submit_bounded(publisher, bytes, started_ns, clock, executor)
     }
-    /// `started_ns` comes from the protected caller before IPC decoding and
+    /// `started_ns` contains both protected origins before IPC decoding and
     /// validation, so those costs cannot be hidden outside the publication cap.
     pub fn submit_bounded<E: Executor, C: Clock>(
         &mut self,
         publisher: Publisher,
         bytes: &[u8],
-        started_ns: u64,
+        started_ns: PublicationTime,
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
@@ -1153,7 +1180,7 @@ impl Registry {
         &mut self,
         publisher: Publisher,
         bytes: &[u8],
-        started_ns: u64,
+        started_ns: PublicationTime,
         wall_deadline_ns: u64,
         clock: &mut C,
         executor: &mut E,
@@ -1177,7 +1204,7 @@ impl Registry {
             };
         }
         if self.optimization_stopped {
-            executor.authorize_recovery(self.model, &plan, started_ns)?;
+            executor.authorize_recovery(self.model, &plan, started_ns.wall_ns)?;
         }
         for d in plan.iter() {
             if self.records().any(|r| {
@@ -1225,32 +1252,37 @@ impl Registry {
         self.decision_high = record.decisions[plan.len() - 1];
         // Identity is protected before the first reservation or executor effect.
         self.active[slot] = Some(record);
-        let first = clock.now_ns();
+        let first = clock.read();
+        let mut last_sample = first;
         let mut prepared = false;
         let result = (|| {
-            if first > wall_deadline_ns {
+            if first.wall_ns > wall_deadline_ns {
                 return Err(Error::Expired);
             }
-            self.validate(&plan, first, executor)?;
+            self.validate(&plan, first.wall_ns, executor)?;
             publication_budget(started_ns, first)?;
             prepared = true;
             executor.prepare(&plan, next_version)?;
-            let now = clock.now_ns();
-            if now < first {
+            let now = clock.read();
+            last_sample = now;
+            if now.wall_ns < first.wall_ns {
                 return Err(Error::Range);
             }
-            self.validate(&plan, now, executor)?;
-            executor.revalidate(&plan, now)?;
+            first.cpu_elapsed(now)?;
+            self.validate(&plan, now.wall_ns, executor)?;
+            executor.revalidate(&plan, now.wall_ns)?;
             // Revalidation may itself take time or wait for an owner. Take a
             // fresh protected timestamp after all callbacks, before PUBLISH.
-            let publish_ns = clock.now_ns();
-            if publish_ns < now {
+            let publish_ns = clock.read();
+            last_sample = publish_ns;
+            if publish_ns.wall_ns < now.wall_ns {
                 return Err(Error::Range);
             }
-            if publish_ns > wall_deadline_ns
+            now.cpu_elapsed(publish_ns)?;
+            if publish_ns.wall_ns > wall_deadline_ns
                 || plan
                     .iter()
-                    .any(|d| publish_ns > d.envelope.expires_local_ns)
+                    .any(|d| publish_ns.wall_ns > d.envelope.expires_local_ns)
             {
                 return Err(Error::Expired);
             }
@@ -1258,25 +1290,29 @@ impl Registry {
             // Recheck the actual protected model/lease after all hard-constraint
             // callbacks. This is read-only: no canary quota or pending slot is
             // consumed until the executor performs the real atomic publish.
-            let binding = self.authorize_models(&plan, publish_ns, executor)?;
-            let commit_ns = clock.now_ns();
-            if commit_ns < publish_ns {
+            let binding = self.authorize_models(&plan, publish_ns.wall_ns, executor)?;
+            let commit_ns = clock.read();
+            last_sample = commit_ns;
+            if commit_ns.wall_ns < publish_ns.wall_ns {
                 return Err(Error::Range);
             }
-            if commit_ns > wall_deadline_ns
-                || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
+            publish_ns.cpu_elapsed(commit_ns)?;
+            if commit_ns.wall_ns > wall_deadline_ns
+                || plan
+                    .iter()
+                    .any(|d| commit_ns.wall_ns > d.envelope.expires_local_ns)
             {
                 return Err(Error::Expired);
             }
             publication_budget(started_ns, commit_ns)?;
             // The gate remains locked. Time may have passed during its check,
             // so recheck the immutable permit's bounds at this final timestamp.
-            if self.model_scope(&plan, commit_ns)? != binding {
+            if self.model_scope(&plan, commit_ns.wall_ns)? != binding {
                 return Err(Error::Stale);
             }
             // Publication is one atomic root change under the owner's resource gate.
-            executor.publish(&plan, next_version, commit_ns)?;
-            Ok((commit_ns, binding))
+            executor.publish(&plan, next_version, commit_ns.wall_ns)?;
+            Ok((commit_ns.wall_ns, binding))
         })();
         match result {
             Ok((now, binding)) => {
@@ -1297,9 +1333,10 @@ impl Registry {
         // Once PUBLISH succeeded it cannot be represented as a rejected plan,
         // even if its callback exceeded the cap. Retain the real receipt and
         // stop further optimization while existing APPLY/RECONCILE continues.
-        let finished_ns = clock.now_ns();
+        let finished_ns = clock.read();
         if publication_budget(started_ns, finished_ns).is_err()
-            || record.receipt.version != 0 && finished_ns > wall_deadline_ns
+            || last_sample.cpu_elapsed(finished_ns).is_err()
+            || record.receipt.version != 0 && finished_ns.wall_ns > wall_deadline_ns
             || matches!(result, Err(Error::Budget | Error::Range))
         {
             self.optimization_stopped = true;
@@ -1343,8 +1380,11 @@ impl PreparedModelChange<'_> {
     }
 }
 
-fn publication_budget(started_ns: u64, now_ns: u64) -> Result<(), Error> {
-    let elapsed = now_ns.checked_sub(started_ns).ok_or(Error::Range)?;
+pub fn publication_budget(
+    started: PublicationTime,
+    observed: PublicationTime,
+) -> Result<(), Error> {
+    let elapsed = started.cpu_elapsed(observed)?;
     if elapsed > PUBLICATION_BUDGET_NS {
         Err(Error::Budget)
     } else {

@@ -1876,8 +1876,14 @@ fn encode_job_inner(
 
 struct NativeClock;
 impl policy::Clock for NativeClock {
-    fn now_ns(&mut self) -> u64 {
-        now()
+    fn read(&mut self) -> policy::PublicationTime {
+        policy::PublicationTime {
+            wall_ns: now(),
+            cpu: policy::CpuTime {
+                cpu: cyxia_arch_aarch64::cpu::slot(),
+                ns: timer::cpu_ns(timer::cpu_ticks()),
+            },
+        }
     }
 }
 trait PublicationScope {
@@ -1978,7 +1984,7 @@ struct Executor<'a, S: PublicationScope> {
     evidence: Option<usize>,
     job: u64,
     boot: u64,
-    publication_started: u64,
+    publication_started: policy::PublicationTime,
     wall_deadline: u64,
     dependencies: [Option<BoundDependency>; 2],
     scores: [i16; 32],
@@ -2107,7 +2113,8 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             self.scope
                 .selection(self.owner, f, d.action, d.envelope.target, at)?;
         }
-        let commit_ns = now();
+        let commit = policy::Clock::read(&mut NativeClock);
+        let commit_ns = commit.wall_ns;
         if commit_ns < at {
             return Err(Error::Range);
         }
@@ -2116,9 +2123,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         {
             return Err(Error::Expired);
         }
-        if commit_ns.saturating_sub(self.publication_started) > policy::PUBLICATION_BUDGET_NS {
-            return Err(Error::Budget);
-        }
+        policy::publication_budget(self.publication_started, commit)?;
         for d in plan.iter() {
             if d.envelope.model_hash != self.model.model_hash
                 || plan.header.active_model_generation != self.model.generation
@@ -2191,7 +2196,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                 model: self.model,
                 selected: d.candidate_index,
                 scores: &self.scores[..self.score_count],
-                received_ns: self.publication_started,
+                received_ns: self.publication_started.wall_ns,
                 published_ns: commit_ns,
                 expires_local_ns: d.envelope.expires_local_ns,
                 active_until_local_ns: plan.header.active_until_local_ns,
@@ -2217,7 +2222,11 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         }
         require_control(&s.owner)?;
         let mut job = s.job.take().ok_or(Error::Stale)?;
-        let wall_begin = now();
+        // Includes reply IPC/identity/canonical-wire verification in the CPU
+        // cap. Its numerical decode is also checked against the 2 ms work cap;
+        // disjoint evidence intervals below still charge actual execution once.
+        let publication_started = policy::Clock::read(&mut NativeClock);
+        let wall_begin = publication_started.wall_ns;
         let decode_cpu_started = timer::cpu_ticks();
         const _: () = assert!(cfg!(target_endian = "little"));
         let bytes = unsafe { &*((output as *const [u64; 512]).cast::<[u8; 4096]>()) };
@@ -2285,7 +2294,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 evidence: job.evidence,
                 job: job.sequence,
                 boot: s.boot,
-                publication_started: wall_begin,
+                publication_started,
                 wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 dependencies: job.dependencies,
                 scores: reply.scores,
@@ -2294,7 +2303,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             let receipt = s.registry.submit_job(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],
-                wall_begin,
+                publication_started,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut NativeClock,
                 &mut executor,

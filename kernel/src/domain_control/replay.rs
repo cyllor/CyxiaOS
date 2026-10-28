@@ -1956,6 +1956,11 @@ fn publish_baseline_traced(
         })
     };
     trace.stage = 3;
+    let mut publication_started = if activating {
+        None
+    } else {
+        Some(policy::Clock::read(&mut NativeClock))
+    };
     // A renewal does not acquire a new Snapshot/Plan identity until its live
     // task owner is reserved. A first activation retains root.first instead;
     // its callback must finish outside the task gate before we can reserve it.
@@ -1980,6 +1985,7 @@ fn publish_baseline_traced(
         trace.stage = 2;
         _prefix = Some(activate(token, q, snapshot)?);
         trace.stage = 3;
+        publication_started = Some(policy::Clock::read(&mut NativeClock));
         task_publication = crate::domain_tasks::reserve_baseline_publication(action, q.target)?;
     }
     if !closing && root().baseline_count == 0 {
@@ -2028,7 +2034,10 @@ fn publish_baseline_traced(
         action,
         snapshot,
         trace,
-        task_publication,
+        BaselineAdmission {
+            task: task_publication,
+            started: publication_started.ok_or(Error::NotReady)?,
+        },
     )
 }
 fn publish_value(
@@ -2042,14 +2051,30 @@ fn publish_value(
         used: snapshot,
         ..PublicationTrace::default()
     };
+    let publication_started = policy::Clock::read(&mut NativeClock);
     let result =
         crate::domain_tasks::reserve_baseline_publication(action, target).and_then(|task| {
-            publish_value_traced(s, token, target, action, snapshot, &mut trace, task)
+            publish_value_traced(
+                s,
+                token,
+                target,
+                action,
+                snapshot,
+                &mut trace,
+                BaselineAdmission {
+                    task,
+                    started: publication_started,
+                },
+            )
         });
     if let Err(error) = result {
         publication_failure(s, token, false, &trace, error);
     }
     result
+}
+struct BaselineAdmission {
+    task: Option<crate::domain_tasks::BaselinePublication>,
+    started: policy::PublicationTime,
 }
 fn publish_value_traced(
     s: &mut State,
@@ -2058,8 +2083,12 @@ fn publish_value_traced(
     action: Action,
     snapshot: Snapshot,
     trace: &mut PublicationTrace,
-    task_publication: Option<crate::domain_tasks::BaselinePublication>,
+    admission: BaselineAdmission,
 ) -> Result<Receipt, Error> {
+    let BaselineAdmission {
+        task: task_publication,
+        started: publication_started,
+    } = admission;
     trace.used = snapshot;
     trace.stage = 16;
     let at = snapshot.taken_ns;
@@ -2139,7 +2168,6 @@ fn publish_value_traced(
     // Candidate/manifest work is already charged by Prefix. The publication
     // cap starts at the actual input-to-root boundary, while its wall deadline
     // and immutable snapshot still come from the original generation.
-    let publication_started = now();
     let mut executor = Executor {
         owner: &mut s.owner,
         scope: BaselineScope {
@@ -2183,7 +2211,7 @@ fn publish_value_traced(
                 header,
                 decision,
                 model,
-                received_ns: publication_started,
+                received_ns: publication_started.wall_ns,
                 observed_ns: now(),
                 wall_deadline_ns: executor.wall_deadline,
                 plan_hash: Sha256::digest(&bytes[..n]).into(),

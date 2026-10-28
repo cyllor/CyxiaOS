@@ -96,13 +96,16 @@ struct Times {
     calls: usize,
 }
 impl Clock for Times {
-    fn now_ns(&mut self) -> u64 {
-        self.calls += 1;
-        if self.calls <= 2 {
-            self.first
-        } else {
-            self.second
-        }
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = {
+            self.calls += 1;
+            if self.calls <= 2 {
+                self.first
+            } else {
+                self.second
+            }
+        };
+        publication_time(wall_ns)
     }
 }
 #[derive(Default)]
@@ -311,7 +314,7 @@ fn job_deadline_is_rechecked_after_validation_before_publish() {
         .submit_job(
             publisher(),
             &bytes,
-            49_900_000,
+            publication_time(49_900_000),
             50_000_000,
             &mut Times {
                 first: 49_900_000,
@@ -333,7 +336,7 @@ fn job_deadline_is_rechecked_after_validation_before_publish() {
             .submit_job(
                 publisher(),
                 &bytes,
-                60_000_000,
+                publication_time(60_000_000),
                 50_000_000,
                 &mut clock(),
                 &mut owner
@@ -634,8 +637,9 @@ fn arbitrary_dependency_edges_are_rejected() {
 
 struct ScriptClock(std::collections::VecDeque<u64>);
 impl Clock for ScriptClock {
-    fn now_ns(&mut self) -> u64 {
-        self.0.pop_front().expect("unexpected clock read")
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0.pop_front().expect("unexpected clock read") };
+        publication_time(wall_ns)
     }
 }
 
@@ -695,7 +699,13 @@ fn protected_predecode_cost_is_inside_publication_budget() {
     let (mut registry, set, mut owner) = ready();
     let mut time = ScriptClock([500_012, 500_013].into());
     let receipt = registry
-        .submit_bounded(publisher(), &frame(&set, 1, 0), 11, &mut time, &mut owner)
+        .submit_bounded(
+            publisher(),
+            &frame(&set, 1, 0),
+            publication_time(11),
+            &mut time,
+            &mut owner,
+        )
         .unwrap();
     assert_eq!(receipt.state(), ExecutionState::Failed(Error::Budget));
     assert_eq!(owner.prepares, 0);
@@ -860,4 +870,261 @@ fn authorized_restore_still_obeys_the_fresh_publication_cpu_limit() {
         (1, 1, 0, 1)
     );
     assert!(registry.optimization_stopped());
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
+}
+
+struct DualClock(std::collections::VecDeque<PublicationTime>);
+impl Clock for DualClock {
+    fn read(&mut self) -> PublicationTime {
+        self.0.pop_front().expect("unexpected paired clock read")
+    }
+}
+fn paired(wall_ns: u64, cpu_ns: u64) -> PublicationTime {
+    PublicationTime {
+        wall_ns,
+        cpu: CpuTime { cpu: 0, ns: cpu_ns },
+    }
+}
+
+#[test]
+fn descheduling_is_not_publication_cpu_and_receipts_keep_real_wall_time() {
+    let (mut registry, set, mut owner) = ready();
+    let mut clock = DualClock(
+        [
+            paired(11, 1_010),
+            paired(12, 1_020),
+            paired(600_010, 1_030),
+            paired(1_500_010, 1_040),
+            paired(2_000_010, 1_050),
+        ]
+        .into(),
+    );
+    let receipt = registry
+        .submit_job(
+            publisher(),
+            &frame(&set, 1, 0),
+            paired(10, 1_000),
+            50_000_010,
+            &mut clock,
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(
+        receipt.version, 1,
+        "wall descheduling was charged as publication CPU"
+    );
+    assert_eq!(receipt.published_ns, 1_500_010);
+    assert_eq!((owner.prepares, owner.publishes, owner.cancels), (1, 1, 0));
+    assert!(!registry.optimization_stopped());
+}
+
+#[test]
+fn publication_cpu_limit_is_exact_even_when_wall_has_barely_advanced() {
+    for cost in [500_000, 500_001] {
+        let (mut registry, set, mut owner) = ready();
+        let mut clock = DualClock(
+            [
+                paired(11, 1_000),
+                paired(12, 1_000),
+                paired(13, 1_000 + cost),
+                paired(14, 1_000 + cost),
+                paired(15, 1_000 + cost),
+            ]
+            .into(),
+        );
+        let receipt = registry
+            .submit_job(
+                publisher(),
+                &frame(&set, 1, 0),
+                paired(10, 1_000),
+                50_000_010,
+                &mut clock,
+                &mut owner,
+            )
+            .unwrap();
+        if cost == 500_000 {
+            assert_eq!(receipt.version, 1);
+            assert_eq!(owner.publishes, 1);
+        } else {
+            assert_eq!(
+                receipt.state(),
+                ExecutionState::Failed(Error::Budget),
+                "execution exceeding 500 us was admitted because wall time was short"
+            );
+            assert_eq!((receipt.version, owner.publishes), (0, 0));
+            assert_eq!(owner.cancels, 1);
+            assert!(registry.optimization_stopped());
+        }
+    }
+}
+
+#[test]
+fn original_wall_deadline_expires_with_almost_no_publication_cpu() {
+    let (mut registry, set, mut owner) = ready();
+    let mut clock = DualClock(
+        [
+            paired(11, 1_001),
+            paired(12, 1_002),
+            paired(50_000_011, 1_003),
+            paired(50_000_012, 1_004),
+        ]
+        .into(),
+    );
+    let receipt = registry
+        .submit_job(
+            publisher(),
+            &frame(&set, 1, 0),
+            paired(10, 1_000),
+            50_000_010,
+            &mut clock,
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(receipt.state(), ExecutionState::Failed(Error::Expired));
+    assert_eq!((receipt.version, owner.publishes), (0, 0));
+}
+
+#[test]
+fn cpu_identity_and_counter_regression_are_not_publication_credit() {
+    for error in [Error::Auth, Error::Range] {
+        let (mut registry, set, mut owner) = ready();
+        let mut sample = paired(11, 1_001);
+        if error == Error::Auth {
+            sample.cpu.cpu = 2;
+        } else {
+            sample.cpu.ns = 999;
+        }
+        let mut clock = DualClock([sample; 5].into());
+        let receipt = registry
+            .submit_job(
+                publisher(),
+                &frame(&set, 1, 0),
+                paired(10, 1_000),
+                50_000_010,
+                &mut clock,
+                &mut owner,
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.state(),
+            ExecutionState::Failed(error),
+            "invalid CPU domain became authority"
+        );
+        assert_eq!((receipt.version, owner.publishes), (0, 0));
+    }
+    let (mut registry, set, mut owner) = ready();
+    let mut clock = DualClock(
+        [
+            paired(11, 1_010),
+            paired(12, 1_009),
+            paired(13, 1_020),
+            paired(14, 1_030),
+            paired(15, 1_040),
+        ]
+        .into(),
+    );
+    let receipt = registry
+        .submit_job(
+            publisher(),
+            &frame(&set, 1, 0),
+            paired(10, 1_000),
+            50_000_010,
+            &mut clock,
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(
+        receipt.state(),
+        ExecutionState::Failed(Error::Range),
+        "intermediate CPU regression went unnoticed"
+    );
+    assert_eq!(owner.publishes, 0);
+}
+
+#[test]
+fn postpublish_cpu_overrun_retains_the_published_receipt() {
+    let (mut registry, set, mut owner) = ready();
+    let mut clock = DualClock(
+        [
+            paired(11, 1_001),
+            paired(12, 1_002),
+            paired(13, 1_003),
+            paired(14, 1_004),
+            paired(15, 501_001),
+        ]
+        .into(),
+    );
+    let receipt = registry
+        .submit_job(
+            publisher(),
+            &frame(&set, 1, 0),
+            paired(10, 1_000),
+            50_000_010,
+            &mut clock,
+            &mut owner,
+        )
+        .unwrap();
+    assert_eq!(
+        (receipt.version, receipt.published_ns, owner.publishes),
+        (1, 14, 1)
+    );
+    assert!(
+        registry.optimization_stopped(),
+        "late CPU overrun did not stop optimization"
+    );
+    assert_eq!(owner.cancels, 0);
+}
+
+#[test]
+fn postpublish_cpu_migration_or_regression_keeps_the_real_receipt() {
+    for migrated in [false, true] {
+        let (mut registry, set, mut owner) = ready();
+        // Regression stays above the origin, so only the successive-sample
+        // check can detect it. The root has already actually published.
+        let mut final_sample = paired(15, 1_003);
+        if migrated {
+            final_sample.cpu.cpu = 2;
+            final_sample.cpu.ns = 1_005;
+        }
+        let mut clock = DualClock(
+            [
+                paired(11, 1_001),
+                paired(12, 1_002),
+                paired(13, 1_003),
+                paired(14, 1_004),
+                final_sample,
+            ]
+            .into(),
+        );
+        let receipt = registry
+            .submit_job(
+                publisher(),
+                &frame(&set, 1, 0),
+                paired(10, 1_000),
+                50_000_010,
+                &mut clock,
+                &mut owner,
+            )
+            .unwrap();
+        assert_eq!(
+            (receipt.version, receipt.published_ns, owner.publishes),
+            (1, 14, 1)
+        );
+        assert!(
+            registry.optimization_stopped(),
+            "postpublish clock fault was ignored"
+        );
+        assert_eq!(owner.cancels, 0);
+        assert_eq!(registry.version(), 1);
+    }
 }

@@ -3,18 +3,19 @@
 use cyxia_prototype::{
     domains::WINDOW_NS,
     learning::{Error, governance::CanaryPermit},
-    policy::PUBLICATION_BUDGET_NS,
+    policy::{self, PublicationTime},
 };
 
 #[derive(Clone, Copy)]
 pub(super) struct PublicationClock {
-    pub started_ns: u64,
+    pub started: PublicationTime,
     pub deadline_ns: u64,
     pub permit: CanaryPermit,
 }
 impl PublicationClock {
-    pub fn check(self, commit_ns: u64, checked_ns: u64) -> Result<(), Error> {
-        if commit_ns < self.started_ns || checked_ns < commit_ns {
+    pub fn check(self, commit_ns: u64, checked: PublicationTime) -> Result<(), Error> {
+        let checked_ns = checked.wall_ns;
+        if commit_ns < self.started.wall_ns || checked_ns < commit_ns {
             return Err(Error::Deadline);
         }
         if checked_ns > self.deadline_ns
@@ -25,9 +26,10 @@ impl PublicationClock {
         {
             return Err(Error::Deadline);
         }
-        if checked_ns - self.started_ns > PUBLICATION_BUDGET_NS {
-            return Err(Error::Budget);
-        }
+        policy::publication_budget(self.started, checked).map_err(|error| match error {
+            cyxia_prototype::domains::Error::Budget => Error::Budget,
+            _ => Error::Evidence,
+        })?;
         Ok(())
     }
 }

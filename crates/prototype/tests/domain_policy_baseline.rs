@@ -103,20 +103,22 @@ fn registry() -> Registry {
 
 struct Time(u64);
 impl Clock for Time {
-    fn now_ns(&mut self) -> u64 {
-        self.0
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0 };
+        publication_time(wall_ns)
     }
 }
 struct NoClock;
 impl Clock for NoClock {
-    fn now_ns(&mut self) -> u64 {
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
         panic!("a retained identity must not re-enter execution")
     }
 }
 struct ScriptClock(std::collections::VecDeque<u64>);
 impl Clock for ScriptClock {
-    fn now_ns(&mut self) -> u64 {
-        self.0.pop_front().expect("unexpected clock read")
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0.pop_front().expect("unexpected clock read") };
+        publication_time(wall_ns)
     }
 }
 
@@ -296,7 +298,7 @@ fn fixed_baseline_has_no_fabricated_features_and_cannot_be_published_by_model_au
         .submit_job(
             publisher(),
             &fixed.frame(2, 0),
-            11,
+            publication_time(11),
             50_000_010,
             &mut Time(11),
             &mut ordinary,
@@ -315,7 +317,7 @@ fn fixed_baseline_has_no_fabricated_features_and_cannot_be_published_by_model_au
         .submit_job(
             publisher(),
             &fixed.frame(3, 0),
-            12,
+            publication_time(12),
             50_000_010,
             &mut Time(12),
             &mut owner,
@@ -504,7 +506,7 @@ fn failed_baseline_identity_is_terminal_and_new_attempt_keeps_original_snapshot_
         .submit_job(
             publisher(),
             &bytes,
-            11,
+            publication_time(11),
             50_000_010,
             &mut Time(11),
             &mut owner,
@@ -519,7 +521,7 @@ fn failed_baseline_identity_is_terminal_and_new_attempt_keeps_original_snapshot_
         registry.submit_job(
             publisher(),
             &bytes,
-            u64::MAX,
+            publication_time(u64::MAX),
             u64::MAX,
             &mut NoClock,
             &mut owner
@@ -546,7 +548,7 @@ fn failed_baseline_identity_is_terminal_and_new_attempt_keeps_original_snapshot_
         registry.submit_job(
             publisher(),
             &changed.frame(2, 0),
-            12,
+            publication_time(12),
             50_000_010,
             &mut NoClock,
             &mut owner
@@ -557,7 +559,7 @@ fn failed_baseline_identity_is_terminal_and_new_attempt_keeps_original_snapshot_
         .submit_job(
             publisher(),
             &fixed.frame(3, 0),
-            12,
+            publication_time(12),
             50_000_010,
             &mut Time(12),
             &mut owner,
@@ -568,7 +570,7 @@ fn failed_baseline_identity_is_terminal_and_new_attempt_keeps_original_snapshot_
         .submit_job(
             publisher(),
             &fixed.frame(4, 1),
-            50_000_011,
+            publication_time(50_000_011),
             50_000_010,
             &mut Time(50_000_011),
             &mut owner,
@@ -597,7 +599,7 @@ fn fixed_publication_rechecks_live_owner_generation_and_baseline_authority_befor
             .submit_job(
                 publisher(),
                 &fixed.frame(2, 0),
-                11,
+                publication_time(11),
                 50_000_010,
                 &mut Time(11),
                 &mut owner,
@@ -643,7 +645,7 @@ fn fixed_publication_preserves_wall_deadline_and_cpu_publication_cap() {
             .submit_job(
                 publisher(),
                 &fixed.frame(2, 0),
-                11,
+                publication_time(11),
                 50_000_010,
                 &mut ScriptClock(times.into()),
                 &mut owner,
@@ -682,7 +684,7 @@ fn a_fixed_registration_never_authorizes_a_mixed_plan_or_changed_action() {
         .submit_job(
             publisher(),
             &mixed,
-            11,
+            publication_time(11),
             50_000_010,
             &mut Time(11),
             &mut owner,
@@ -706,7 +708,7 @@ fn a_fixed_registration_never_authorizes_a_mixed_plan_or_changed_action() {
         .submit_job(
             publisher(),
             &fixed.frame_actions(4, 0, &[changed]),
-            12,
+            publication_time(12),
             50_000_010,
             &mut Time(12),
             &mut owner,
@@ -717,4 +719,15 @@ fn a_fixed_registration_never_authorizes_a_mixed_plan_or_changed_action() {
         (0, ExecutionState::Failed(Error::Conflict))
     );
     assert_eq!((owner.effects.prepares, owner.effects.publishes), (0, 0));
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }

@@ -287,22 +287,28 @@ impl Executor for Scope {
 }
 struct FixedClock(u64);
 impl Clock for FixedClock {
-    fn now_ns(&mut self) -> u64 {
-        NOW.store(self.0, Ordering::Release);
-        self.0
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = {
+            NOW.store(self.0, Ordering::Release);
+            self.0
+        };
+        publication_time(wall_ns)
     }
 }
 struct ScriptClock(std::collections::VecDeque<u64>);
 impl Clock for ScriptClock {
-    fn now_ns(&mut self) -> u64 {
-        let at = self.0.pop_front().expect("unexpected Registry clock read");
-        NOW.store(at, Ordering::Release);
-        at
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = {
+            let at = self.0.pop_front().expect("unexpected Registry clock read");
+            NOW.store(at, Ordering::Release);
+            at
+        };
+        publication_time(wall_ns)
     }
 }
 struct NoClock;
 impl Clock for NoClock {
-    fn now_ns(&mut self) -> u64 {
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
         panic!("a retained Failed identity must not execute again")
     }
 }
@@ -357,12 +363,15 @@ struct RacingClock {
     contender: Option<Contender>,
 }
 impl Clock for RacingClock {
-    fn now_ns(&mut self) -> u64 {
-        if self.contender.is_none() {
-            self.contender = Some(Contender::start(self.at));
-        }
-        NOW.store(self.at, Ordering::Release);
-        self.at
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = {
+            if self.contender.is_none() {
+                self.contender = Some(Contender::start(self.at));
+            }
+            NOW.store(self.at, Ordering::Release);
+            self.at
+        };
+        publication_time(wall_ns)
     }
 }
 
@@ -389,7 +398,7 @@ fn the_old_reacquisition_race_is_a_real_immutable_failed_busy() {
         .submit_job(
             publisher(),
             &bytes,
-            original.taken_ns,
+            publication_time(original.taken_ns),
             original.taken_ns + 50_000_000,
             &mut clock,
             &mut scope,
@@ -406,7 +415,7 @@ fn the_old_reacquisition_race_is_a_real_immutable_failed_busy() {
         registry.submit_job(
             publisher(),
             &bytes,
-            original.taken_ns,
+            publication_time(original.taken_ns),
             original.taken_ns + 50_000_000,
             &mut NoClock,
             &mut scope
@@ -440,7 +449,7 @@ fn reserved_task_owner_prevents_the_after_registration_cacp_race() {
         .submit_job(
             publisher(),
             &bytes,
-            original.taken_ns,
+            publication_time(original.taken_ns),
             original.taken_ns + 50_000_000,
             &mut clock,
             &mut scope,
@@ -501,7 +510,7 @@ fn a_busy_prepublication_gate_allocates_no_plan_and_preserves_the_snapshot() {
         .submit_job(
             publisher(),
             &bytes,
-            original.taken_ns + 100,
+            publication_time(original.taken_ns + 100),
             original.taken_ns + 50_000_000,
             &mut FixedClock(original.taken_ns + 100),
             &mut scope,
@@ -551,7 +560,7 @@ fn reservation_preserves_live_credit_target_and_publication_deadlines() {
             .submit_job(
                 publisher(),
                 &bytes,
-                original.taken_ns,
+                publication_time(original.taken_ns),
                 original.taken_ns + 50_000_000,
                 &mut clock,
                 &mut scope,
@@ -572,7 +581,7 @@ fn reservation_preserves_live_credit_target_and_publication_deadlines() {
             registry.submit_job(
                 publisher(),
                 &bytes,
-                original.taken_ns,
+                publication_time(original.taken_ns),
                 original.taken_ns + 50_000_000,
                 &mut NoClock,
                 &mut scope
@@ -609,7 +618,7 @@ fn a_new_service_turn_cannot_refresh_the_original_snapshot_wall_deadline() {
         .submit_job(
             publisher(),
             &bytes,
-            actual_start,
+            publication_time(actual_start),
             original.taken_ns + 50_000_000,
             &mut FixedClock(actual_start),
             &mut scope,
@@ -620,4 +629,15 @@ fn a_new_service_turn_cannot_refresh_the_original_snapshot_wall_deadline() {
     assert_eq!(scope.checks, 0);
     assert_eq!(scope.published, 0);
     assert_eq!(scope.snapshot, original);
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }

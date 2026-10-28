@@ -79,8 +79,9 @@ fn frame(set: &CandidateSet, sequence: u64, base: u64) -> Vec<u8> {
 }
 struct Time(u64);
 impl Clock for Time {
-    fn now_ns(&mut self) -> u64 {
-        self.0
+    fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+        let wall_ns = { self.0 };
+        publication_time(wall_ns)
     }
 }
 #[derive(Default)]
@@ -246,4 +247,15 @@ fn legacy_change_model_preserves_authorization_and_strictly_increasing_generatio
         prepared.prepare_model_change(publisher(), next).err(),
         Some(Error::Stale)
     );
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }

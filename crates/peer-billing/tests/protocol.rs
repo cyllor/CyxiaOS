@@ -661,8 +661,9 @@ fn actual_terminal_busy() -> (Failure, cyxia_prototype::policy::PlanReceipt) {
     };
     struct ClockAt;
     impl Clock for ClockAt {
-        fn now_ns(&mut self) -> u64 {
-            101
+        fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
+            let wall_ns = { 101 };
+            publication_time(wall_ns)
         }
     }
     struct ActualOwner;
@@ -748,7 +749,7 @@ fn actual_terminal_busy() -> (Failure, cyxia_prototype::policy::PlanReceipt) {
         .submit_job(
             publisher,
             &bytes[..count],
-            101,
+            publication_time(101),
             50_000_100,
             &mut ClockAt,
             &mut ActualOwner,
@@ -1036,4 +1037,15 @@ fn root_failure_reauthentication_keeps_original_failure_and_legacy_cancel_remain
     // The optional extension is canonical: nonzero bytes cannot hide under an absent tag.
     raw[PREPARATION_SEAL_BYTES - 1] = 1;
     assert!(PreparationSeal::decode(&raw).is_err());
+}
+
+// Legacy fixtures deliberately advance execution and wall time together.
+fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+    cyxia_prototype::policy::PublicationTime {
+        wall_ns,
+        cpu: cyxia_prototype::policy::CpuTime {
+            cpu: 0,
+            ns: wall_ns,
+        },
+    }
 }
