@@ -1,0 +1,43 @@
+name: Export v0.11 prototype source
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.11-complete-prototype
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: v011-source-export-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Archive exact source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-export"
+          git rev-parse HEAD > "$RUNNER_TEMP/source-export/source-commit.txt"
+          git status --short > "$RUNNER_TEMP/source-export/git-status.txt"
+          git archive --format=tar.gz \
+            --output="$RUNNER_TEMP/source-export/CyxiaOS-source.tar.gz" HEAD
+          sha256sum "$RUNNER_TEMP/source-export/CyxiaOS-source.tar.gz" \
+            > "$RUNNER_TEMP/source-export/CyxiaOS-source.tar.gz.sha256"
+      - name: Upload exact source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v011-source-${{ github.sha }}
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+          path: ${{ runner.temp }}/source-export/
