@@ -49,29 +49,6 @@ jobs:
             "$patch" | sha256sum --check --strict -
           git apply --check "$patch"
           git apply "$patch"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('user/prototype-cluster/src/runtime.rs')
-          text = path.read_text()
-          old = '''#[cfg(not(test))]
-          use cyxia_cluster_transport::tls::Error;
-          #[cfg(not(test))]
-          use cyxia_prototype_cluster::session_exit::SessionExitReason;
-          #[cfg(not(test))]
-          use cyxia_prototype_cluster::broker;
-          '''
-          new = '''#[cfg(not(test))]
-          use cyxia_cluster_transport::tls::Error;
-          #[cfg(not(test))]
-          use cyxia_prototype_cluster::broker;
-          #[cfg(not(test))]
-          use cyxia_prototype_cluster::session_exit::SessionExitReason;
-          '''
-          if old not in text:
-              raise SystemExit('runtime import block did not match the reviewed patch')
-          path.write_text(text.replace(old, new, 1))
-          PY
           cat > user/prototype-cluster/src/session_exit.rs <<'EOF'
           //! Bounded, non-authoritative TLS session-exit diagnostics. These codes explain
           //! why the EL0 service left one session; they never grant identity or recovery.
@@ -126,9 +103,7 @@ jobs:
                   ];
                   for (index, reason) in reasons.into_iter().enumerate() {
                       assert_eq!(reason.trace_event(), 0x231 + index as u64);
-                      assert!(
-                          !(0xfe..=0x108).contains(&reason.trace_event())
-                      );
+                      assert!(!(0xfe..=0x108).contains(&reason.trace_event()));
                       assert!(reason.trace_event() < 0xf000);
                   }
               }
@@ -147,11 +122,15 @@ jobs:
             --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
           cargo fetch --locked
           cargo fetch --locked --manifest-path user/prototype-cluster/Cargo.toml
-      - name: Check formatting
+      - name: Format and verify source
         if: steps.patch.outputs.apply == 'true'
         run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --manifest-path user/prototype-cluster/Cargo.toml
           cargo fmt --all -- --check
           cargo fmt --manifest-path user/prototype-cluster/Cargo.toml -- --check
+          git diff --check
       - name: Run cluster host tests and Clippy
         if: steps.patch.outputs.apply == 'true'
         run: |
