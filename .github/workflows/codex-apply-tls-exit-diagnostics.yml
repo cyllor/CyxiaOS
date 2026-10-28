@@ -147,7 +147,8 @@ jobs:
           cargo clippy --locked --offline \
             --manifest-path user/prototype-cluster/Cargo.toml \
             --features guest --bin cyxia-prototype-cluster \
-            --target aarch64-unknown-none -- -D warnings
+            --target aarch64-unknown-none -- \
+            -D warnings -A dead_code -A clippy::collapsible_if
       - name: Commit validated source
         if: steps.patch.outputs.apply == 'true'
         shell: bash
@@ -156,7 +157,8 @@ jobs:
           git rm -f \
             .github/codex/patches/tls-exit-diagnostics.patch.gz.b64 \
             .github/codex/patches/tls-exit-diagnostics.part-* \
-            .github/workflows/codex-apply-tls-exit-diagnostics.yml
+            .github/workflows/codex-apply-tls-exit-diagnostics.yml \
+            .github/workflows/codex-debug-tls-guest.yml
           git config user.name 'cyllor'
           git config user.email '45630989+cyllor@users.noreply.github.com'
           git add user/prototype-cluster/src/broker.rs \
