@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           patch=.github/codex/patches/140-learning-selftest-slices.diff.gz
-          echo '467c1be00e79a5b9ba02375b18344b65818c793233c68abe049c89c0983c760e  '"$patch" | sha256sum -c -
+          echo '1516b16c2737222b68d37b1a769c702e56359c40494de319923f6176bd7e6d57  '"$patch" | sha256sum -c -
           gzip -dc "$patch" > "$RUNNER_TEMP/learning-selftest-slices.diff"
           git apply --check "$RUNNER_TEMP/learning-selftest-slices.diff"
           git apply "$RUNNER_TEMP/learning-selftest-slices.diff"
