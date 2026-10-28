@@ -2,6 +2,7 @@
 //! incomplete native measurements never become accepted training labels.
 pub mod baseline;
 pub mod capture;
+pub mod coordinator_wire;
 pub mod data;
 pub mod governance;
 pub mod manifest;
