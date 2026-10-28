@@ -1141,7 +1141,7 @@ def run(args):
         if reconnect is not None:
             report["reconnect_evidence"] = reconnect.evidence()
         report["observations"] = [{key: guest.get(key) for key in
-                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "overrun_evidence", "panic_evidence",
+                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "overrun_evidence", "panic_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
                                    "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",

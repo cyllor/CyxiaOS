@@ -1039,19 +1039,9 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
                 1 => {
                     let _ = advance_admission_bounded(s, 1, 1);
                 }
-                2 => {
-                    let next = (0..TASKS)
-                        .map(|n| (s.vector_cursor + n) % TASKS)
-                        .find(|&i| {
-                            !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
-                                && (s.vectors[i].as_ref().is_some_and(|v| !v.complete())
-                                    || s.wake & (1u64 << i) != 0
-                                    || s.tasks[i].recipe != 0 && !s.tasks[i].pending)
-                        });
-                    let i = next.unwrap_or(s.vector_cursor);
-                    s.vector_cursor = (i + 1) % TASKS;
-                    vector_piece(s, i);
-                }
+                // Vector dispatch has its own prepaid opportunity below, like
+                // the file pump, rather than waiting for this phase rotation.
+                2 => {}
                 3 => ipc_piece(s),
                 4 => memory_piece(s),
                 5 | 7 | 8 | 9 | 10 => {}
@@ -1094,6 +1084,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             let _ = crate::peer_replay::poll();
         }
     });
+    service_vectors();
     diagnostic_service_stage(71);
     service_file(progress);
     diagnostic_service_stage(72);
@@ -1137,6 +1128,28 @@ fn lifecycle_piece(s: &mut State, i: usize) {
     if s.tasks[i].life == Life::Exiting {
         let _ = cleanup(s, i);
     }
+}
+fn service_vectors() {
+    // Like file requests, queued read-only vectors get an independently paid
+    // opportunity each pump pass. One opportunity still calls exactly one
+    // policy-bounded batch; it cannot enlarge that policy or borrow file credit.
+    let _ = service_segment(|| {
+        locked(|s| {
+            let next = (0..TASKS)
+                .map(|n| (s.vector_cursor + n) % TASKS)
+                .find(|&i| {
+                    !matches!(s.tasks[i].life, Life::Free | Life::Exiting)
+                        && (s.vectors[i].as_ref().is_some_and(|v| !v.complete())
+                            || s.wake & (1u64 << i) != 0
+                            || s.tasks[i].recipe != 0 && !s.tasks[i].pending)
+                });
+            let i = next.unwrap_or(s.vector_cursor);
+            s.vector_cursor = (i + 1) % TASKS;
+            vector_piece(s, i);
+            publish_evidence(s);
+            Ok(())
+        })
+    });
 }
 fn vector_piece(s: &mut State, i: usize) {
     if matches!(s.tasks[i].life, Life::Free | Life::Exiting) {
