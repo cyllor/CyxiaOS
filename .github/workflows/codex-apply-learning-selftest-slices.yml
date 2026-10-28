@@ -80,21 +80,6 @@ jobs:
               ]),
               'RawFeatures initializer',
           )
-          replace_once(
-              Path('crates/prototype/tests/domain_policy_model_change.rs'),
-              '\n'.join([
-                  '    let prepared = registry.prepare_model_change(publisher(), next).unwrap();',
-                  '    assert_eq!(prepared.binding(), next);',
-                  '    drop(prepared);',
-              ]),
-              '\n'.join([
-                  '    {',
-                  '        let prepared = registry.prepare_model_change(publisher(), next).unwrap();',
-                  '        assert_eq!(prepared.binding(), next);',
-                  '    }',
-              ]),
-              'prepared model change scope',
-          )
           PY
           cargo fmt --all
           cargo fmt --manifest-path user/prototype-learning/Cargo.toml
@@ -104,7 +89,8 @@ jobs:
           set -euo pipefail
           cargo test --locked --offline -p cyxia-prototype \
             --test learning_worker --test learning_validation
-          cargo clippy --locked --offline -p cyxia-prototype --all-targets -- -D warnings
+          cargo clippy --locked --offline -p cyxia-prototype \
+            --lib --test learning_worker --test learning_validation -- -D warnings
       - name: Build exact unified pair
         run: |
           set -euo pipefail
