@@ -29,6 +29,20 @@ File diagnostic timestamps are generic timer ticks, not nanoseconds. This run re
 
 The native verifier retains failure status even when useful diagnostics are present. In the latest failed run it does not assert source/build attestation or release acceptance.
 
+## Native filesystem progress
+
+The same source was rebuilt with the existing `--selftest --storage-fault` profile in `build-a10-retained-retry/`. Both image and preparation stack checks pass. Three standalone ordinary EL0 modes now have independently verified native results:
+
+| Evidence directory | Actual verified behavior |
+| --- | --- |
+| `a10-preparation-retained-retry/` | Mode 1 PASS in 120.830 s: writer consumes fsync sequences 1 and 2; the other endpoint reads and checks all 4,096 bytes of version 2. Protected exits, receipt consumption and independent disk oracle agree. |
+| `a10-overwrite-retained-retry/` | Mode 2 PASS in 90.783 s: the device trace confirms actual reordered replies; the original object `[5, 2]` remains and fsync sequence 3 becomes durable. The concurrent reader observes the valid prior version before the writer commits. |
+| `a10-recovery-retained-retry/` | Mode 3 PASS in 60.880 s: a fresh boot replays four blocks from three committed transactions; the new reader verifies all 4,096 bytes of version 3 and the original object identity. |
+
+Each uses the source-attested patched QEMU, wall clock, multiple TCG threads, and the frozen 30 s observation interval. These standalone runs use a shorter 180 s diagnostic capture cap; they cannot automatically satisfy the full matrix's exact input contract. Their reports correctly retain `native_acceptance_status: NOT_RUN` and `A10_complete: false`. Cache-pressure mode, every required power-cut boundary, recovery interruption, and full matrix review remain open.
+
+Mode 1 also retains a performance concern: its first cache-only WRITE and reader READ follow their preceding successful OPEN by 15.190 s and 24.259 s respectively, with no intervening device reads/writes in the protected counters. This requires further attribution of caller, owner and memory-copy scheduling; it does not justify increasing deadlines.
+
 ## Independent review
 
 Fresh-context source reviews found no Critical or Important defect in this checkpoint. The production-body scheduling harness covers retained credit settlement, startup priority, and already-owned job priority with independent failing mutations. The file harness covers no-effect retry custody, executed-EAGAIN non-replay and retained receipts using the production Scheduler.
