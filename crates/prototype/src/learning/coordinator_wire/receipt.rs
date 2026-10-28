@@ -1,8 +1,4 @@
-use super::{
-    ABI, RECEIPT_BYTES, RECEIPT_MAGIC,
-    codec::valid_object,
-    command::Command,
-};
+use super::{ABI, RECEIPT_BYTES, RECEIPT_MAGIC, codec::valid_object, command::Command};
 use crate::{
     domains::ObjectKey,
     learning::{
