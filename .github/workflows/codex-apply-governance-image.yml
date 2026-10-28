@@ -1,0 +1,54 @@
+name: Apply governance image integration
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.11-complete-prototype
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-governance-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: ${{ startsWith(github.event.head_commit.message, 'apply governance image integration') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Install pinned formatter
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --target aarch64-unknown-none-softfloat
+      - name: Apply and verify governance integration
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/governance-image-integration.diff"
+          cat .github/codex/patches/120-governance-image-integration.part* > "$patch"
+          echo 'bdf7b39f1d5e51c5dd11697b0da071d49de0a9d7172b7a9b0276a845ce15b572  '"$patch" | sha256sum -c -
+          git apply --check "$patch"
+          git apply "$patch"
+          cargo fmt --all
+          cargo fmt --manifest-path user/prototype-governance/Cargo.toml
+          git diff --check
+          python3 -B -m py_compile tools/build_unified.py tools/verify_domains.py tools/test_verify_domains.py tests/host/test_build_unified.py
+          python3 -B -m unittest tests.host.test_build_unified tools.test_verify_domains -v
+      - name: Commit integrated source
+        run: |
+          set -euo pipefail
+          rm -f .github/codex/patches/120-governance-image-integration.part*
+          rm -f .github/workflows/codex-apply-governance-image.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(governance): install bounded EL0 image identity'
+          git push origin "HEAD:${GITHUB_REF_NAME}"

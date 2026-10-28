@@ -1,0 +1,42 @@
++                'nodes contain different governance images')
++        if governance_hash is None:
++            shutil.copyfile(governance,output/'governance.elf')
++            (output/'governance.elf').chmod(0o600)
++        governance_hash=found_governance_hash
+         public=output/f'node-{name}.pub';public.write_bytes((identities[index]/'own.pub').read_bytes());public.chmod(0o600)
+         audit_private_images(service.read_bytes(),image.read_bytes(),keys[index],keys[1-index],billing_seeds[index],billing_seeds[1-index])
+         billing_public=output/f'node-{name}.billing.pub';billing_public.write_bytes((identities[index]/'billing.pub').read_bytes());billing_public.chmod(0o600)
+@@ -190,7 +207,7 @@
+     require(sha(Path(__file__)) == builder_digest, 'native builder changed during build')
+     for path in sorted(output.iterdir()):
+         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
+-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
++    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,embedded_roles=dict(governance=dict(sha256=governance_hash,bytes=(output/'governance.elf').stat().st_size)),own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
+     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
+     return report
+ 
+--- a/tests/host/test_build_unified.py	2026-10-28 04:41:41.000000000 +0000
++++ b/tests/host/test_build_unified.py	2026-10-28 04:49:59.694802004 +0000
+@@ -72,6 +72,15 @@
+             self.assertNotIn('PRIVATE-KEY',json.dumps(result));self.assertNotIn('key.der',json.dumps(result))
+             (p/'peer.pin').write_bytes(bytes(32))
+             with self.assertRaises(ValueError):build.identity_metadata(p)
++    def test_embedded_role_audit_requires_the_exact_nonempty_image(self):
++        build.audit_embedded_role(b'kernel-prefix' + b'governance-image' + b'-suffix',
++                                  b'governance-image', 'governance')
++        with self.assertRaisesRegex(ValueError, 'exact embedded governance'):
++            build.audit_embedded_role(b'kernel-without-role', b'governance-image',
++                                      'governance')
++        with self.assertRaisesRegex(ValueError, 'exact embedded governance'):
++            build.audit_embedded_role(b'kernel', b'', 'governance')
++
+     def test_json_messages_select_exact_kernel_artifact_and_actual_task_directory(self):
+         messages=[{'reason':'build-script-executed','package_id':'path+file:///repo/kernel#cyxia-kernel@0.1.0','out_dir':'/build/out'}, {'reason':'compiler-artifact','target':{'name':'unrelated'},'executable':'/bad'}, {'reason':'compiler-artifact','target':{'name':'cyxia-kernel'},'executable':'/build/cyxia-kernel'}]
+         self.assertEqual(build.parse_cargo_build_messages('\n'.join(map(json.dumps,messages))), (Path('/build/cyxia-kernel'),Path('/build/out')))
+--- a/tools/verify_domains.py	2026-10-28 04:41:41.000000000 +0000
++++ b/tools/verify_domains.py	2026-10-28 04:50:22.822502975 +0000
+@@ -43,6 +43,7 @@
+ CONTROL_CREDIT_MAGIC = 0x4359434352454401
+ CONTROL_POOL_MAGIC = 0x435943504F4F4C01
+ LEARNING_MAGIC = 0x43594C4541524E01
++GOVERNANCE_MAGIC = 0x4359474F56455201
