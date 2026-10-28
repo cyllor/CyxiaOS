@@ -105,6 +105,8 @@ class UnstartedCapture(unittest.TestCase):
         facade = re.sub(r'fn discard_capture\([^\n]+\n', '', facade)
         if 'mod capture_credit {' in facade:
             facade = facade.replace(function(facade, 'mod capture_credit {'), '')
+        if 'mod learning_evidence {' in facade:
+            facade = facade.replace(function(facade, 'mod learning_evidence {'), '')
         facade = facade.replace('use core::sync::atomic::',
             'extern crate self as cyxia_arch_aarch64;\nuse core::sync::atomic::', 1)
         if 'struct Captures(' in source:

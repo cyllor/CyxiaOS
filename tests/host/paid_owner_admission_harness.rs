@@ -31,6 +31,10 @@ static mut STATE: State = State { scheduler: Scheduler::new(), active: [None],
     draining: 0, service_admitted: false, background: BackgroundBudgets::new() };
 mod replay { pub fn service_admitted() {} }
 mod baseline_diagnostics { pub fn failure(_: usize, _: u64) {} }
+// Timing capture is outside this task-gate preference fixture.
+mod learning_evidence { pub mod execution_trace {
+    pub fn cancelled(_: super::super::Dispatch, _: u64) {}
+} }
 fn track_credit(_: usize, value: Result<Option<Credit>, Error>) -> Result<Option<Credit>, Error> { value }
 fn discard_capture(_: usize) {}
 // Capture custody is outside this paid-task-gate fixture; its dedicated

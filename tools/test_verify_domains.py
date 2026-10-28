@@ -83,6 +83,26 @@ def control():
 
 
 class EvidenceParserTests(unittest.TestCase):
+    def test_latest_execution_milestones_survive_a_fatal_snapshot_without_becoming_acceptance(self):
+        guest = {}
+        snapshot = self.snapshot(overrun=True)
+        banks = {}
+        for name, field, count in [
+            ('TRACE_CONTROL_EVIDENCE', 'trace_control_evidence', 224),
+            ('TRACE_TASK_EVIDENCE', 'trace_task_evidence', 128),
+            ('TRACE_WORK_EVIDENCE', 'trace_work_evidence', 64),
+        ]:
+            values = list(range(count))
+            snapshot[name] = encode(values)
+            banks[field] = values
+        with self.assertRaisesRegex(ValueError, 'overrun/quarantine'):
+            refresh_snapshot(guest, snapshot)
+        for field, values in banks.items():
+            self.assertEqual(guest[field], values)
+        refresh_snapshot(guest, self.snapshot())
+        for field in banks:
+            self.assertIsNone(guest[field], 'missing bank retained an earlier diagnostic snapshot')
+
     def test_secondary_fault_retains_original_exception_before_cpu0_panic(self):
         guest = {}
         snapshot = self.snapshot()

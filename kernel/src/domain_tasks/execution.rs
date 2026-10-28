@@ -484,7 +484,19 @@ impl TaskBackend for Creator<'_> {
             // other CPU can dispatch this reserved key before construction ends.
             *self.generation = generation;
             match self.build(r, slot, key, reservation, &mut trace) {
-                Ok(()) => CreateOutcome::Created(key),
+                Ok(()) => {
+                    #[cfg(not(test))]
+                    crate::learning_evidence::execution_trace::created(
+                        crate::learning_evidence::execution_trace::Child {
+                            group: r.group,
+                            child: key,
+                            parent: r.caller,
+                            request_id: r.request_id,
+                            at: now_ns(),
+                        },
+                    );
+                    CreateOutcome::Created(key)
+                }
                 Err(error) => {
                     let failure = self.failure_facts(r, key, trace.stage, trace.entered_ns, error);
                     if self.rollback(slot, key).is_ok() {

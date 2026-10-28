@@ -638,6 +638,8 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
             observation_ns,
         };
         s.scope = Some(scope);
+        #[cfg(not(test))]
+        capture::execution_trace::begin(key, p.family, p.target, snapshot.taken_ns);
         let bound = (|| {
             work::bind_scope(&scope)?;
             history::begin_authorized(scope, p.checks, permit)

@@ -38,6 +38,11 @@ mod replay {
     pub fn work_source(_: ObjectKey, _: u64, _: u64) -> Option<()> { None }
 }
 mod learning_evidence {
+    pub mod execution_trace {
+        pub struct Child { pub group: super::super::ObjectKey, pub child: super::super::ObjectKey,
+            pub parent: super::super::ObjectKey, pub request_id: u64, pub at: u64 }
+        pub fn created(_: Child) {}
+    }
     pub fn measure<T>(_: (), _: cyxia_prototype::learning::reward::CpuClass, body: impl FnOnce() -> T) -> T { body() }
 }
 // THREAD_SPEC

@@ -521,6 +521,12 @@ pub fn activate(run: RunKey, observation_ns: u64) -> Result<(), Error> {
     }
     with(|s| {
         s.activated = true;
+        #[cfg(not(test))]
+        evidence::execution_trace::work(
+            run,
+            evidence::execution_trace::WorkEvent::Activated,
+            now(),
+        );
         Ok(())
     })
 }
@@ -582,7 +588,20 @@ impl super::background::Echo for OptionalEcho {
 fn warm(s: &mut State, f: Family, observation: u64, at: u64) -> Result<(), Error> {
     if let Some(mut w) = s.warm {
         if !w.active {
-            match submit(f, s.seed, w.id, at, w.deadline) {
+            let reply = submit(f, s.seed, w.id, at, w.deadline);
+            #[cfg(not(test))]
+            if let Some(scope) = s.scope {
+                evidence::execution_trace::work(
+                    scope.key,
+                    evidence::execution_trace::WorkEvent::WarmSubmit {
+                        id: w.id,
+                        entered_ns: at,
+                        result: reply,
+                    },
+                    now(),
+                );
+            }
+            match reply {
                 Ok(()) => {
                     w.active = true;
                     s.warm = Some(w);
@@ -591,7 +610,16 @@ fn warm(s: &mut State, f: Family, observation: u64, at: u64) -> Result<(), Error
                 Err(e) => return Err(e),
             }
         }
-        match outcome(f, w.id) {
+        let reply = outcome(f, w.id);
+        #[cfg(not(test))]
+        if let (Some(scope), Ok(Some(result))) = (s.scope, reply) {
+            evidence::execution_trace::work(
+                scope.key,
+                evidence::execution_trace::WorkEvent::WarmOutcome { id: w.id, result },
+                now(),
+            );
+        }
+        match reply {
             Ok(Some(Ok(_))) => {
                 s.warm = None;
                 s.warm_at = at.saturating_add(100_000_000);
@@ -608,16 +636,27 @@ fn warm(s: &mut State, f: Family, observation: u64, at: u64) -> Result<(), Error
     } else if at < observation.saturating_sub(50_000_000) && at >= s.warm_at && s.next_warm < 240 {
         let id = s.next_warm;
         s.next_warm += 1;
+        let deadline = at.checked_add(REQUEST_DEADLINE_NS).ok_or(Error::Overflow)?;
         s.warm = Some(Warm {
             id,
-            deadline: at.checked_add(REQUEST_DEADLINE_NS).ok_or(Error::Overflow)?,
+            deadline,
             active: false,
         });
+        #[cfg(not(test))]
+        if let Some(scope) = s.scope {
+            evidence::execution_trace::work(
+                scope.key,
+                evidence::execution_trace::WorkEvent::WarmCreated { id, deadline },
+                at,
+            );
+        }
     }
     Ok(())
 }
 pub fn poll(run: RunKey) -> Result<bool, Error> {
     owner()?;
+    #[cfg(not(test))]
+    evidence::execution_trace::work(run, evidence::execution_trace::WorkEvent::Poll, now());
     let family = with(|s| s.family.ok_or(Error::NotReady))?;
     if one_shot(family) {
         let _ = crate::learning_prewarm::poll(run)?;

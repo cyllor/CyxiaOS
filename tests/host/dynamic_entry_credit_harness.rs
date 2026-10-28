@@ -15,6 +15,8 @@ static COMPLETE_READY: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64]
 static CREDIT_NS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 static CREDIT_KIND: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 mod cpu { pub fn slot() -> usize { 3 } }
+// Capture timing is covered by the dedicated production-hook harness.
+mod learning_evidence { pub mod execution_trace { pub fn selected(_: super::super::Dispatch) {} } }
 mod domain_control {
     pub struct Prerequisite { pub domain: u16, pub target: super::ObjectKey }
     pub fn admit_dependency(_: Prerequisite, _: u64, _: u64) -> Result<(), super::Error> { Ok(()) }

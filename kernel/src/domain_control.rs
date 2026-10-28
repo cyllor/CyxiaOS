@@ -2452,6 +2452,7 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 })
             };
             let mut actual_entry = None;
+            let mut executor_trace = None;
             let result = if let Err(error) = dependency_status {
                 Err(error)
             } else {
@@ -2471,8 +2472,10 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.started = true;
                     (f.apply)(d.action, d.apply, d.stamp, entered)
                 };
+                let (first, last, actual_ns) =
+                    crate::domain_tasks::finish_cpu_interval(cpu_started);
+                executor_trace = Some((entered, actual_ns));
                 if let Some(cost) = cost.as_mut() {
-                    let (first, last, _) = crate::domain_tasks::finish_cpu_interval(cpu_started);
                     let _ = crate::learning_evidence::finish_attempt(cost, first, last);
                 }
                 result
@@ -2498,6 +2501,21 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     // refusal. Do not invent an in-flight operation to reconcile.
                     d.state = ExecutionState::Failed(Error::Again);
                 }
+            }
+            if let Some((entered_ns, cpu_ns)) = executor_trace {
+                crate::learning_evidence::execution_trace::control(
+                    crate::learning_evidence::execution_trace::ControlEvent {
+                        action: d.action,
+                        apply: d.apply,
+                        stamp: d.stamp,
+                        was_started,
+                        entered_ns,
+                        finished_ns: observed,
+                        cpu_ns,
+                        published_ns: d.published,
+                        result,
+                    },
+                );
             }
             let _ = crate::learning_history::record_execution(crate::learning_history::Execution {
                 apply: d.apply,

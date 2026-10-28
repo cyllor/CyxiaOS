@@ -25,10 +25,14 @@ pub const EXPORT_CHUNK: usize = 16;
 // Larger replay tables need a separately budgeted, incremental preparer. This
 // synchronous native entry accepts enough real requests for one training trial.
 pub const START_REQUESTS: usize = 128;
+#[path = "learning_evidence/execution_trace.rs"]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod execution_trace;
 #[path = "learning_evidence/handoff.rs"]
 mod handoff;
 /// Exact fixed storage for completed exits and first-loss diagnostics.
-pub const HANDOFF_BYTES: usize = handoff::OWNED_BYTES + 2 * core::mem::size_of::<AtomicU64>();
+pub const HANDOFF_BYTES: usize =
+    handoff::OWNED_BYTES + 2 * core::mem::size_of::<AtomicU64>() + execution_trace::OWNED_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     NotReady,
@@ -1407,6 +1411,9 @@ pub fn seal(incomplete: bool) -> Result<Seal, Error> {
             // This does not re-open admission for new work or new spans.
             INGRESS.store(CLOSING, Ordering::Release);
         };
+        if let Ok(seal) = &result {
+            execution_trace::close(seal.key, at);
+        }
         result
     })
 }

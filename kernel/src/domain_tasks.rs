@@ -957,6 +957,8 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
                 optional: debit,
                 cpu_started: None,
             });
+            #[cfg(not(test))]
+            crate::learning_evidence::execution_trace::selected(d);
             if let Ok(i) = group_index(s, d.group) {
                 s.facts.wait[i].add(d.waited_ns);
                 s.facts.node_wait.add(d.waited_ns);
@@ -1015,6 +1017,8 @@ fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
             return Ok(true);
         }
         s.scheduler.cancel_unstarted(active.dispatch, now)?;
+        #[cfg(not(test))]
+        crate::learning_evidence::execution_trace::cancelled(active.dispatch, now);
         // Cancellation is irreversible. Clear all execution authority even if
         // the optional refund or an evidence custodian must be retried later.
         capture_credit::cancelled(slot, active.dispatch, active.optional);
@@ -1300,9 +1304,28 @@ fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
     let active = s.active[slot].ok_or(Error::Stale)?;
     let actual = COMPLETE_ACTUAL[slot].load(Ordering::Relaxed);
     let finished = COMPLETE_AT[slot].load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let before_version =
+        crate::learning_evidence::execution_trace::tracks_dispatch(active.dispatch)
+            .then(|| s.scheduler.policy_receipt(active.dispatch.group));
     let result = s
         .scheduler
         .complete(active.dispatch, actual, active.state, finished);
+    #[cfg(not(test))]
+    if let Some(before_version) = before_version {
+        crate::learning_evidence::execution_trace::settled(
+            crate::learning_evidence::execution_trace::Settlement {
+                dispatch: active.dispatch,
+                actual_ns: actual,
+                physical_finished_ns: finished,
+                settled_ns: now_ns(),
+                before_version,
+                after_version: s.scheduler.policy_receipt(active.dispatch.group),
+                still_active: s.scheduler.active(slot).is_some(),
+                result,
+            },
+        );
+    }
     if s.scheduler.active(slot).is_some() {
         if slot == 0
             && crate::storage_fault_capture::PROFILE
@@ -1598,7 +1621,12 @@ pub fn install(
         let now = now_ns();
         validate_locked(s, action, target, now)?;
         match action {
-            Action::CpuWeight(weight) => s.scheduler.install_weight(target, weight, stamp, now),
+            Action::CpuWeight(weight) => {
+                s.scheduler.install_weight(target, weight, stamp, now)?;
+                #[cfg(not(test))]
+                crate::learning_evidence::execution_trace::installed(target, stamp, now_ns());
+                Ok(())
+            }
             Action::SpawnTokens(tokens) => {
                 let i = group_index(s, target)?;
                 s.admission.install_tokens(target, tokens, stamp, now)?;
@@ -2012,7 +2040,21 @@ fn completion(
                 .iter()
                 .flatten()
                 .any(|a| a.dispatch.group == target && a.dispatch.policy_version == stamp.version);
-        Ok(receipts::reconcile(version, stamp, now, in_flight))
+        let state = receipts::reconcile(version, stamp, now, in_flight);
+        #[cfg(not(test))]
+        if matches!(action, Action::CpuWeight(_)) {
+            crate::learning_evidence::execution_trace::reconciled(
+                crate::learning_evidence::execution_trace::Reconciliation {
+                    target,
+                    stamp,
+                    version,
+                    in_flight,
+                    state,
+                    at: now,
+                },
+            );
+        }
+        Ok(state)
     })
 }
 fn control_target(domain: u16, _kind: u16, ordinal: usize) -> Option<ObjectKey> {
