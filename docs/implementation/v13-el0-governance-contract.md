@@ -1,10 +1,30 @@
 # Proposed EL0 learning-governance contract
 
-**Status: design review only; not implemented or native-accepted.** This is a
-separate implementation task after the current debit-liveness/A02 measurement
-version. It does not claim A16 completion or propose moving all learning
-mathematics. The governing requirements are v1.3 §2.1, §5 control budgets,
-§6.3, and A16.
+**Status: bounded coordinator wire v1 implemented and host-gated; the
+independent EL0 role/runtime is not yet integrated or native-accepted.** This
+increment does not claim A16 completion or move the remaining learning
+coordination choices out of EL1. The governing requirements are v1.3 §2.1, §5
+control budgets, §6.3, and A16.
+
+## 2026-10-28 implementation checkpoint
+
+`crates/prototype/src/learning/coordinator_wire.rs` and its `snapshot`,
+`command`, `receipt`, and `codec` modules now implement the contract's fixed
+512-byte observation, 256-byte command, and 256-byte receipt formats. Canonical
+zero-filled encoding binds the actual registered role context, session and
+model/core/ledger generations, snapshot digest, command sequence, protected
+score/permit/registration handles, effect handle, and paid credit evidence.
+Malformed encodings, stale generations, skipped or wrapped sequences, expired
+snapshots, handle substitution, receipt tampering, and excess credit are covered
+by negative tests in `crates/prototype/tests/learning_coordinator_wire.rs`.
+
+The exact source passed Rust 1.95 formatting, configured AArch64 kernel Clippy
+with `-D warnings`, the complete non-kernel Rust workspace, 630 host tests (two
+environment skips), and 77 evidence-tool tests in public Actions run
+`40625220174`. This proves the bounded transport and host validators only. The
+independently linked/scheduled EL0 coordinator image, mappings, dispatch-derived
+authority, shared-surplus accounting, command application refactor, migration
+ownership handoff, and native A16 execution evidence remain open.
 
 ## Observed deployment gap
 
