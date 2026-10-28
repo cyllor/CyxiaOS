@@ -26,9 +26,11 @@ class VectorPumpCredit(unittest.TestCase):
         # own tests. The old phase-2 vector opportunity is retained in RED.
         old_vector_phase = 'vector_piece(s, i);' in general
         driver = driver.replace(general, 'let _ = service_segment(|| { general_turn(); }')
+        activation = function(execution, 'fn service_baseline_activation(') if (
+            'fn service_baseline_activation(' in execution) else 'fn service_baseline_activation() {}'
         template = (ROOT / 'tests/host/vector_pump_credit_harness.rs').read_text()
         template = template.replace('// PUMP_BODIES', '\n'.join([
-            driver, function(execution, 'fn service_vectors('),
+            driver, activation, function(execution, 'fn service_vectors('),
             function((ROOT / 'kernel/src/domain_tasks.rs').read_text(), 'pub fn service_segment<R>')]))
         template = template.replace('// OLD_VECTOR_PHASE', str(old_vector_phase).lower())
         with tempfile.TemporaryDirectory() as temporary:
@@ -44,7 +46,7 @@ class VectorPumpCredit(unittest.TestCase):
             result = subprocess.run(command,
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('3 passed; 0 failed', result.stdout)
+            self.assertIn('4 passed; 0 failed', result.stdout)
             self.assertEqual(template.count('    service_vectors();'), 1)
             (directory / 'harness.rs').write_text(template.replace('    service_vectors();', ''))
             negative = subprocess.run(command + ['--exact',
@@ -52,6 +54,14 @@ class VectorPumpCredit(unittest.TestCase):
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('queued query still waits behind general service rotation',
+                          negative.stdout + negative.stderr)
+            self.assertEqual(template.count('    service_baseline_activation();'), 1)
+            (directory / 'harness.rs').write_text(template.replace('    service_baseline_activation();', ''))
+            negative = subprocess.run(command + ['--exact',
+                'owned_baseline_retries_on_the_next_paid_pass_with_unchanged_snapshot'],
+                cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('owned baseline missed the next prepaid service opportunity',
                           negative.stdout + negative.stderr)
 
 

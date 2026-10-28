@@ -336,6 +336,32 @@ impl Root {
 struct Cell(UnsafeCell<Root>);
 unsafe impl Sync for Cell {}
 static ROOT: Cell = Cell(UnsafeCell::new(Root::new()));
+static BASELINE_ACTIVATION_PENDING: AtomicBool = AtomicBool::new(false);
+/// Called only by the root gate's guard, before releasing exclusion. A first
+/// snapshot already exists even if on_first cannot yet acquire its owner gate
+/// or bind capture/history. Neither that Busy nor a read-only borrow may lose
+/// its retry opportunity. Successful publication and terminal closure clear it.
+pub(super) fn publish_baseline_activation_hint() {
+    debug_assert!(super::CLAIMED.load(Ordering::Relaxed));
+    let r = root();
+    let pending = r.token.is_some()
+        && r.request.is_some_and(|q| q.kind == TrialKind::Baseline)
+        && r.first.is_some()
+        && r.phase == Phase::Frozen
+        && r.initial.is_none()
+        && r.baseline_count == 0
+        && r.fault.is_none()
+        && r.unpublished.is_none()
+        && r.lifecycle.closing().is_none();
+    if pending != BASELINE_ACTIVATION_PENDING.load(Ordering::Relaxed) {
+        BASELINE_ACTIVATION_PENDING.store(pending, Ordering::Release);
+    }
+}
+/// Scheduling hint only: service_step still needs real paid service authority
+/// and revalidates the original token, snapshot, model and deadline.
+pub fn baseline_activation_pending() -> bool {
+    BASELINE_ACTIVATION_PENDING.load(Ordering::Acquire)
+}
 static ACTIVATING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ACTIVATION_TOKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);

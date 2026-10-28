@@ -1084,6 +1084,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             let _ = crate::peer_replay::poll();
         }
     });
+    service_baseline_activation();
     service_vectors();
     diagnostic_service_stage(71);
     service_file(progress);
@@ -1127,6 +1128,15 @@ fn lifecycle_piece(s: &mut State, i: usize) {
     }
     if s.tasks[i].life == Life::Exiting {
         let _ = cleanup(s, i);
+    }
+}
+fn service_baseline_activation() {
+    if crate::learning_replay::baseline_activation_pending() {
+        // Only an already-owned first baseline snapshot gets this retry
+        // opportunity. Its exact original 50 ms deadline remains authoritative.
+        // Each attempt needs fresh physical credit and settles before vectors
+        // or file work. General replay phases keep their normal rotation.
+        let _ = service_segment(crate::learning_replay::service_step);
     }
 }
 fn service_vectors() {

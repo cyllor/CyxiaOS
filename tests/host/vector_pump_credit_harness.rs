@@ -11,10 +11,23 @@ static READY: AtomicBool = AtomicBool::new(true);
 static DENY: AtomicBool = AtomicBool::new(false);
 static NOW: AtomicU64 = AtomicU64::new(0);
 static CPU_NS: AtomicU64 = AtomicU64::new(0);
+static BASELINE_PENDING: AtomicBool = AtomicBool::new(false);
+static BASELINE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BASELINE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 mod cpu { pub fn slot() -> usize { 0 } }
 mod timer { pub fn cpu_ticks() -> u64 { super::CPU_NS.load(super::Ordering::Acquire) } }
 mod crate_stubs {
     pub fn service_io(_: &mut dyn FnMut()) {}
+    pub fn baseline_activation_pending() -> bool { super::BASELINE_PENDING.load(super::Ordering::Acquire) }
+    pub fn service_step() -> Result<bool, super::Error> {
+        super::locked(|s| { assert!(s.active.is_some()); Ok(()) }).unwrap();
+        super::physical_work();
+        assert!(super::NOW.load(super::Ordering::Acquire) - super::BASELINE_SNAPSHOT.load(super::Ordering::Acquire) < 50_000_000);
+        let calls = super::BASELINE_CALLS.fetch_add(1, super::Ordering::AcqRel);
+        if calls == 0 { return Err(super::Error::Busy); }
+        super::BASELINE_PENDING.store(false, super::Ordering::Release);
+        Ok(true)
+    }
 }
 use crate_stubs as learning_workload;
 use crate_stubs as learning_replay;
@@ -91,6 +104,8 @@ fn diagnostic_service_stage(_: u64) {}
 // PUMP_BODIES
 fn reset(batch: u8) {
     DENY.store(false, Ordering::Release); NOW.store(100_000_000, Ordering::Release); CPU_NS.store(0, Ordering::Release);
+    BASELINE_PENDING.store(false, Ordering::Release); BASELINE_CALLS.store(0, Ordering::Release);
+    BASELINE_SNAPSHOT.store(100_000_000, Ordering::Release);
     let mut scheduler = Scheduler::new(); scheduler.register_group(GROUP).unwrap();
     scheduler.admit(ThreadSpec { key: KEY, group: GROUP, cpu: 0, allowed_mask: 1,
         minimum_ns: 20_000_000, budget_ns: 60_000_000 }, LAYOUT, 100_000_000).unwrap();
@@ -137,8 +152,26 @@ fn policy_batch_eight_is_still_applied_by_real_service_batch() {
 #[test]
 fn unavailable_credit_cannot_dispatch_or_consume_queued_items() {
     reset(1); DENY.store(true, Ordering::Release);
+    BASELINE_PENDING.store(true, Ordering::Release);
     service(0, &mut || {});
+    assert_eq!(BASELINE_CALLS.load(Ordering::Acquire), 0);
+    assert!(BASELINE_PENDING.load(Ordering::Acquire));
     locked(|s| { assert_eq!(s.services.stats().ipc_calls, 0); assert_eq!(s.bodies, 0);
         assert!(s.vectors[0].as_ref().unwrap().results().iter().all(|r| r.status == ItemStatus::Pending));
         assert_eq!(s.scheduler.thread_cpu_ns(KEY), Ok(0)); Ok(()) }).unwrap();
+}
+#[test]
+fn owned_baseline_retries_on_the_next_paid_pass_with_unchanged_snapshot() {
+    reset(1); BASELINE_PENDING.store(true, Ordering::Release);
+    for turn in 0..2 {
+        NOW.store(100_000_000 + turn * 1_000_000, Ordering::Release);
+        service(0, &mut || {});
+    }
+    assert_eq!(BASELINE_CALLS.load(Ordering::Acquire), 2,
+        "owned baseline missed the next prepaid service opportunity");
+    assert_eq!(BASELINE_SNAPSHOT.load(Ordering::Acquire), 100_000_000);
+    assert!(!BASELINE_PENDING.load(Ordering::Acquire));
+    locked(|s| { assert_eq!((s.general, s.files, s.bodies), (2, 2, 8));
+        assert_eq!(s.scheduler.thread_cpu_ns(KEY), Ok(800_000));
+        assert!(s.active.is_none()); Ok(()) }).unwrap();
 }

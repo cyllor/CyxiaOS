@@ -425,6 +425,7 @@ static mut STATE: State = State {
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
+        replay::publish_baseline_activation_hint();
         CLAIMED.store(false, Ordering::Release);
     }
 }
