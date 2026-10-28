@@ -14,13 +14,13 @@ const PROBE_WALL_SECONDS: u64 = 1;
 const PRIVATE_CLEAR_PAGES: usize = 9;
 const PRIVATE_CLEAR_BYTES: usize = PRIVATE_CLEAR_PAGES * 4096;
 const PRIVATE_CLEAR_BARRIER: u32 = PRIVATE_CLEAR_BYTES as u32 + 1;
-// A fixed byte boundary remains observable even when a translated block does
-// not refresh the guest CPU counter until after the loop. DC ZVA amplified TCG
-// helpers, while even a 512-byte memset could retire 64 stores in one chain.
-// A 32-byte piece caps the translated loop at four 64-bit stores. Repeated
-// pieces retain every page's exact bytes and final barrier while fitting both
-// the 8 ms recovery and 2.5 ms ordinary envelopes.
+// Fixed 32-byte blocks use four ordinary stores, avoiding DC ZVA and generic
+// memset helpers. One paid turn clears at most one page; requiring a separate
+// scheduler return for every block made normal jobs expire before EL0 entry.
+// No loop depends on an in-TB CPU clock advancing. Whole-turn actual execution
+// remains charged against the unchanged recovery/ordinary credit envelopes.
 const PRIVATE_CLEAR_SLICE_BYTES: usize = 32;
+const PRIVATE_CLEAR_TURN_BYTES: usize = 4096;
 const SERVICE_SLICE_NS: u64 = 100_000;
 // Mapping probes fault on their first EL0 memory instruction. Their timer is a
 // dead-context escape hatch, not inference time: leave enough wall headroom for
@@ -407,7 +407,7 @@ fn continue_private_clear(worker: &mut Worker, slot: usize) -> bool {
     }
     let mut offset = usize::try_from(next - 1).unwrap_or(PRIVATE_CLEAR_BYTES);
     let slice_end = offset
-        .saturating_add(PRIVATE_CLEAR_SLICE_BYTES)
+        .saturating_add(PRIVATE_CLEAR_TURN_BYTES)
         .min(PRIVATE_CLEAR_BYTES);
     while offset < slice_end {
         clear_private_block(slot, offset);

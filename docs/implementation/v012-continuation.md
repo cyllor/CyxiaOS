@@ -11,6 +11,10 @@ The complete prototype remains **incomplete**. The fixed configuration-1.3 catal
 | `d61faa3` | Retain a fixed 512-byte native file admission/ABI diagnostic bank, including failed grants, current request and previous completed request. |
 | `7c0e6e1` | Keep known no-effect file retries in the kernel owner queue with the original stopped syscall; distinguish executed EAGAIN and retained result delivery. |
 | `043286a` | Copy and validate file input under one bounded memory-owner borrow; deliver retained data and result frame under another. Preserve memory authority, original error stages and exact credit/deadline limits. |
+| `6e3dc35` | Give queued task-owner callers bounded 1 ms CPU turns, preserving nonblocking exclusion and allowing admission, body and settlement borrows within a turn. |
+| `bc885f7` | Permit dynamic EL0 entries with 1 ms remaining credit; retain the builtin 10 ms floor and all thread/window budgets. |
+
+Private output/stack clearing now groups exact 32-byte stores into one bounded 4 KiB paid turn, followed by its separate paid completion barrier. This replaces 1,152 separate store dispatches for a 36 KiB private region. It changes neither physical credit nor the 2 ms job-work and 50 ms wall limits.
 
 The normal governance entry quantum is 2 ms. Its work/credit limits, deliberate timer probe, 50 ms snapshot deadline and all acceptance thresholds remain unchanged. File retries receive and settle actual CPU0/caller credit on each turn.
 
@@ -28,6 +32,8 @@ Paths below are relative to `artifacts/v012-continuation/`, which is ignored and
 | `delivery-checks-v8/summary.json` | Latest memory-borrow source: all nine validation commands pass, including 672 host tests (two environment skips), 83 tooling tests and the unchanged Rust/TLS/format/configured Clippy checks. |
 | `build-complete-file-preflight/build-manifest.json` | Both native images and selected stack checks pass. Code source SHA-256: `0ce5dace11aebabc5ed5b66db665f74ed0127260eba2864fad55a9d2962a6a12`. |
 | `native-single-complete-file-preflight/result.json` | Overall **FAIL** after 52.065 host seconds, client stage 125. Actual request 20 completes the first 32 KiB workload READ after WRITE; content checking then advances into the next mixed-vector query, which reaches the unchanged deadline. No budget overrun/quarantine; the full workload remains incomplete. |
+| `delivery-checks-v13/summary.json` | All nine validation commands pass, including 674 host tests (two environment skips) and 83 tool tests. Both native images and selected stack gates pass in `build-private-clear-turn/`. |
+| `native-single-private-clear-turn/result.json` | Overall **FAIL**, client stage 125 after 50.105 host seconds. The first control job receives an EL0 reply in 14.580 ms, with 0.596 ms combined encoding/evaluation/decoding work; publication rejects `Busy`. Its completion retires normally. File requests 19–24 complete three 32 KiB WRITE/READ rounds before a subsequent mixed-vector wait expires. No task overrun/quarantine occurs. These are partial observations, not native acceptance. |
 
 File diagnostic timestamps are generic timer ticks, not nanoseconds. This run reports a 62,500,000 Hz timer; convert ticks using that recorded frequency. Admission diagnostics are explanatory data, not acceptance receipts.
 
@@ -56,6 +62,8 @@ Fresh-context source reviews found no Critical or Important defect in this check
 The scoped memory-borrow design also received independent source review. Its final header-copy integration passes nine production-body scenarios against the real Memory model; three independent mutations reproduce split-preflight, split-delivery and copied-error-stage failures. Hardware PTE/TLB behavior is substituted in that host harness. Fresh whole-branch review and full native acceptance remain required.
 
 Deferred minor: extend file retry coverage to deferred completion settlement and cleanup barriers. The current harness exercises immediate settlement; reviewed production barriers are not a substitute for executing that case in the final fault matrix.
+
+An additional independent source review covered the bounded owner turns, dynamic-entry minimum and private-clear batching, with no Critical, Important or Minor finding. It explicitly declined comparative native performance, universal timing adequacy and full acceptance; the client-125 failure remains open.
 
 ## Next native gate
 
