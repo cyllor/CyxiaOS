@@ -20,10 +20,15 @@ fn published_owner_snapshot_is_consistent_across_actual_concurrent_readers() {
         readers.push(std::thread::spawn(move || {
             start.wait();
             let mut seen = 0;
-            while !finished.load(Ordering::Acquire) {
+            loop {
                 if let Ok(Some(words)) = view.read() {
                     assert!(words.iter().all(|v| *v == words[0]));
                     seen += 1;
+                    if finished.load(Ordering::Acquire) {
+                        break;
+                    }
+                } else {
+                    std::thread::yield_now();
                 }
             }
             seen
@@ -36,11 +41,9 @@ fn published_owner_snapshot_is_consistent_across_actual_concurrent_readers() {
         }
     }
     finished.store(true, Ordering::Release);
-    let seen: usize = readers
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
-        .sum();
-    assert!(seen > 0);
+    for reader in readers {
+        assert!(reader.join().unwrap() > 0);
+    }
     assert_eq!(view.read().unwrap(), Some([4999; 256]));
 }
 
