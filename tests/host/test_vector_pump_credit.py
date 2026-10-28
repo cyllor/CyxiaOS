@@ -29,6 +29,8 @@ class VectorPumpCredit(unittest.TestCase):
         activation = function(execution, 'fn service_baseline_activation(') if (
             'fn service_baseline_activation(' in execution) else 'fn service_baseline_activation() {}'
         template = (ROOT / 'tests/host/vector_pump_credit_harness.rs').read_text()
+        template = template.replace('// OWNER_GATE_PATH',
+            str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))
         template = template.replace('// PUMP_BODIES', '\n'.join([
             driver, activation, function(execution, 'fn service_vectors('),
             function((ROOT / 'kernel/src/domain_tasks.rs').read_text(), 'pub fn service_segment<R>')]))
@@ -46,7 +48,7 @@ class VectorPumpCredit(unittest.TestCase):
             result = subprocess.run(command,
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('4 passed; 0 failed', result.stdout)
+            self.assertIn('6 passed; 0 failed', result.stdout)
             self.assertEqual(template.count('    service_vectors();'), 1)
             (directory / 'harness.rs').write_text(template.replace('    service_vectors();', ''))
             negative = subprocess.run(command + ['--exact',
@@ -55,7 +57,7 @@ class VectorPumpCredit(unittest.TestCase):
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('queued query still waits behind general service rotation',
                           negative.stdout + negative.stderr)
-            self.assertEqual(template.count('    service_baseline_activation();'), 1)
+            self.assertIn(template.count('    service_baseline_activation();'), (1, 2))
             (directory / 'harness.rs').write_text(template.replace('    service_baseline_activation();', ''))
             negative = subprocess.run(command + ['--exact',
                 'owned_baseline_retries_on_the_next_paid_pass_with_unchanged_snapshot'],
@@ -63,6 +65,16 @@ class VectorPumpCredit(unittest.TestCase):
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('owned baseline missed the next prepaid service opportunity',
                           negative.stdout + negative.stderr)
+            if 'let baseline_was_pending =' in driver:
+                old_order = template.replace('if baseline_was_pending {', 'if false {').replace(
+                    'if !baseline_was_pending {', 'if true {')
+                (directory / 'harness.rs').write_text(old_order)
+                negative = subprocess.run(command + ['--exact',
+                    'owned_baseline_gets_the_live_owner_turn_before_general_work'],
+                    cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+                self.assertIn("general work consumed the owned baseline's live task-owner turn",
+                              negative.stdout + negative.stderr)
 
 
 if __name__ == '__main__':

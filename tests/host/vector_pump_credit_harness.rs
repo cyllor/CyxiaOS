@@ -14,6 +14,16 @@ static CPU_NS: AtomicU64 = AtomicU64::new(0);
 static BASELINE_PENDING: AtomicBool = AtomicBool::new(false);
 static BASELINE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BASELINE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+static GATE_MODE: AtomicBool = AtomicBool::new(false);
+static CREATE_BASELINE: AtomicBool = AtomicBool::new(false);
+static BILL_CPU: AtomicU64 = AtomicU64::new(0);
+static BILL_AT: AtomicU64 = AtomicU64::new(0);
+#[path = "// OWNER_GATE_PATH"]
+mod owner_gate;
+static mut OWNER_GATE: owner_gate::Gate = owner_gate::Gate::new();
+fn owner_gate() -> &'static owner_gate::Gate {
+    unsafe { &*core::ptr::addr_of!(OWNER_GATE) }
+}
 mod cpu { pub fn slot() -> usize { 0 } }
 mod timer {
     pub fn cpu_ticks() -> u64 { super::CPU_NS.load(super::Ordering::Acquire) }
@@ -53,12 +63,24 @@ struct State {
 }
 static mut STATE: Option<State> = None;
 fn locked<R>(body: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
-    // Single CPU harness. Native gate's contention/custody is tested separately.
-    body(unsafe { (&mut *core::ptr::addr_of_mut!(STATE)).as_mut().unwrap() })
+    let permit = if GATE_MODE.load(Ordering::Acquire) {
+        Some(owner_gate().try_acquire(0, NOW.load(Ordering::Acquire), 1_000_000)
+            .ok_or(Error::Busy)?)
+    } else { None };
+    let result = body(unsafe { (&mut *core::ptr::addr_of_mut!(STATE)).as_mut().unwrap() });
+    if let Some(permit) = permit { permit.release(NOW.load(Ordering::Acquire)); }
+    result
+}
+fn settle(s: &mut State) -> Result<(), Error> {
+    s.scheduler.complete(s.active.take().unwrap(), BILL_CPU.load(Ordering::Acquire),
+        RunState::Runnable, BILL_AT.load(Ordering::Acquire))?;
+    COMPLETE_READY[0].store(false, Ordering::Release);
+    Ok(())
 }
 fn begin_service_segment() -> Option<()> {
     if DENY.load(Ordering::Acquire) { return None; }
     locked(|s| {
+        if COMPLETE_READY[0].load(Ordering::Acquire) { settle(s)?; }
         assert!(s.active.is_none(), "combined or abandoned physical reservation");
         let mut d = s.scheduler.dispatch_with_window_headroom(0, LAYOUT,
             NOW.load(Ordering::Acquire), 2_500_000, 20_000_000)?.ok_or(Error::Budget)?;
@@ -73,7 +95,9 @@ fn finish_cpu_interval(started: u64) -> (u64, u64, u64) {
     (NOW.load(Ordering::Acquire), NOW.load(Ordering::Acquire), timer::cpu_ticks() - started)
 }
 fn complete_service(actual: u64, at: u64) -> Result<(), Error> {
-    locked(|s| { s.bodies += 1; s.scheduler.complete(s.active.take().unwrap(), actual, RunState::Runnable, at) })
+    BILL_CPU.store(actual, Ordering::Relaxed); BILL_AT.store(at, Ordering::Relaxed);
+    COMPLETE_READY[0].store(true, Ordering::Release);
+    locked(|s| { s.bodies += 1; settle(s) })
 }
 fn physical_work() {
     CPU_NS.fetch_add(100_000, Ordering::AcqRel);
@@ -108,6 +132,16 @@ fn general_turn() {
         s.phase = (s.phase + 1) % 11; Ok(())
     }).unwrap();
     physical_work();
+    if CREATE_BASELINE.swap(false, Ordering::AcqRel) {
+        BASELINE_SNAPSHOT.store(NOW.load(Ordering::Acquire), Ordering::Release);
+        BASELINE_PENDING.store(true, Ordering::Release);
+    }
+    if GATE_MODE.load(Ordering::Acquire) {
+        // General work outlasts the remaining CPU0 metadata turn. The real
+        // gate must hand off to the queued peer at its next acquisition.
+        CPU_NS.fetch_add(1_000_000, Ordering::AcqRel);
+        NOW.fetch_add(1_000_000, Ordering::AcqRel);
+    }
 }
 fn service_file(_: &mut dyn FnMut()) {
     service_segment(|| { locked(|s| { s.files += 1; Ok(()) }).unwrap(); physical_work(); });
@@ -115,6 +149,9 @@ fn service_file(_: &mut dyn FnMut()) {
 fn diagnostic_service_stage(_: u64) {}
 // PUMP_BODIES
 fn reset(batch: u8) {
+    GATE_MODE.store(false, Ordering::Release); CREATE_BASELINE.store(false, Ordering::Release);
+    COMPLETE_READY[0].store(false, Ordering::Release);
+    unsafe { OWNER_GATE = owner_gate::Gate::new(); }
     DENY.store(false, Ordering::Release); NOW.store(100_000_000, Ordering::Release); CPU_NS.store(0, Ordering::Release);
     BASELINE_PENDING.store(false, Ordering::Release); BASELINE_CALLS.store(0, Ordering::Release);
     BASELINE_SNAPSHOT.store(100_000_000, Ordering::Release);
@@ -133,6 +170,36 @@ fn reset(batch: u8) {
                 Task { life: Life::Ready, recipe: 1, pending: false },
                 Task { life: Life::Ready, recipe: 2, pending: false }], vector_cursor: 0, wake: 0,
         services, general: 0, files: 0, opportunities: 0, phase: 0, bodies: 0 }); }
+}
+#[test]
+fn owned_baseline_gets_the_live_owner_turn_before_general_work() {
+    reset(1); BASELINE_PENDING.store(true, Ordering::Release);
+    let permit = owner_gate().try_acquire(0, 100_000_000, 1_000_000).unwrap();
+    assert!(owner_gate().try_acquire(1, 100_000_000, 1_000_000).is_none());
+    permit.release(100_000_000);
+    GATE_MODE.store(true, Ordering::Release);
+    service(0, &mut || {});
+    assert_eq!(BASELINE_CALLS.load(Ordering::Acquire), 1,
+        "general work consumed the owned baseline's live task-owner turn");
+    assert_eq!(BASELINE_SNAPSHOT.load(Ordering::Acquire), 100_000_000);
+    assert!(BASELINE_PENDING.load(Ordering::Acquire)); // first body Busy, retain identity
+    assert!(COMPLETE_READY[0].load(Ordering::Acquire));
+    let state = unsafe { (&*core::ptr::addr_of!(STATE)).as_ref().unwrap() };
+    assert_eq!(state.general, 1);
+    assert_eq!(state.active.unwrap().reserved_ns, 2_500_000);
+    assert_eq!(BILL_CPU.load(Ordering::Acquire), 1_100_000);
+    // Only the baseline was settled; general's exact bill survives gate denial.
+    assert_eq!(state.scheduler.thread_cpu_ns(KEY), Ok(100_000));
+}
+#[test]
+fn newly_owned_baseline_keeps_its_same_pass_opportunity() {
+    reset(1); CREATE_BASELINE.store(true, Ordering::Release);
+    service(0, &mut || {});
+    assert_eq!(BASELINE_CALLS.load(Ordering::Acquire), 1,
+        "new first snapshot lost its same-pass paid retry");
+    assert_eq!(BASELINE_SNAPSHOT.load(Ordering::Acquire), 100_100_000);
+    locked(|s| { assert_eq!((s.general, s.files, s.opportunities, s.bodies), (1, 1, 1, 4));
+        assert_eq!(s.scheduler.thread_cpu_ns(KEY), Ok(400_000)); Ok(()) }).unwrap();
 }
 #[test]
 fn queued_query_does_not_wait_for_eleven_unrelated_phases() {

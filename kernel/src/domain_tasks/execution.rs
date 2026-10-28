@@ -1039,6 +1039,13 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     if !READY.load(Ordering::Acquire) || cpu::slot() != 0 {
         return;
     }
+    // Use the current metadata turn for an already-owned 50 ms snapshot
+    // before general work can consume it. If general replay creates the first
+    // snapshot on this pass, retain its existing after-general opportunity.
+    let baseline_was_pending = crate::learning_replay::baseline_activation_pending();
+    if baseline_was_pending {
+        service_baseline_activation();
+    }
     // One bounded owner piece per pass. A deferred piece retains its cursor;
     // file/DMA waits run in service_file's separately billed caller segments.
     diagnostic_service_stage(70);
@@ -1127,7 +1134,9 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             let _ = crate::peer_replay::poll();
         }
     });
-    service_baseline_activation();
+    if !baseline_was_pending {
+        service_baseline_activation();
+    }
     service_vectors();
     diagnostic_service_stage(71);
     service_file(progress);
