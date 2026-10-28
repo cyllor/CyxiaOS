@@ -1032,9 +1032,14 @@ fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
         || CREDIT_KIND[slot].load(Ordering::Acquire) != kind
         || COMPLETE_READY[slot].load(Ordering::Acquire)
     {
+        if slot == 0 {
+            baseline_diagnostics::failure(4, 1);
+        }
         return false;
     }
+    let mut entered = false;
     let result = locked(|s| {
+        entered = true;
         let active = s.active[slot].ok_or(Error::Stale)?;
         let now = now_ns();
         if active.dispatch.window == now / WINDOW_NS
@@ -1054,13 +1059,24 @@ fn revalidate_unstarted(slot: usize, kind: u64) -> bool {
     match result {
         Ok(true) => true,
         Ok(false) => {
+            if slot == 0 {
+                baseline_diagnostics::failure(4, 2);
+            }
             discard_capture(slot);
             false
         }
         // The task gate is deliberately nonblocking. Contention leaves the
         // exact existing credit untouched, so preserve the prior execution
         // path rather than stranding an active reservation.
-        Err(_) => true,
+        Err(error) => {
+            if slot == 0 {
+                baseline_diagnostics::failure(
+                    4,
+                    (if entered { 4 } else { 3 }) | ((error as u64 + 1) << 8),
+                );
+            }
+            true
+        }
     }
 }
 pub fn revalidate_builtin(slot: usize) -> bool {
@@ -1075,53 +1091,82 @@ pub fn begin_service_segment() -> Option<Credit> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return None;
     }
-    track_credit(
-        0,
-        locked(|s| {
-            if COMPLETE_READY[0].load(Ordering::Acquire) {
-                let _ = complete_locked(s, 0);
+    let mut entered = false;
+    let result = locked(|s| {
+        entered = true;
+        if COMPLETE_READY[0].load(Ordering::Acquire) {
+            let settlement = complete_locked(s, 0);
+            if settlement.is_err() || s.active[0].is_some() {
+                baseline_diagnostics::failure(
+                    2,
+                    settlement.err().map_or(0, |error| error as u64 + 1)
+                        | (u64::from(s.active[0].is_some()) << 8)
+                        | (u64::from(COMPLETE_READY[0].load(Ordering::Acquire)) << 9)
+                        | (CREDIT_KIND[0].load(Ordering::Acquire) << 16),
+                );
             }
-            if s.active[0].is_some() || s.draining & 1 != 0 {
-                return Ok(None);
+        }
+        if s.active[0].is_some() || s.draining & 1 != 0 {
+            baseline_diagnostics::failure(3, if s.active[0].is_some() { 1 } else { 2 });
+            return Ok(None);
+        }
+        let now = now_ns();
+        if let Err(error) = admit_service(s, now) {
+            baseline_diagnostics::failure(3, 3 | ((error as u64 + 1) << 8));
+            return Err(error);
+        }
+        let dispatch = s.scheduler.dispatch_with_window_headroom(
+            0,
+            s.layout,
+            now,
+            2_500_000,
+            BUILTIN_WINDOW_HEADROOM_NS,
+        );
+        if let Err(error) = dispatch.as_ref() {
+            baseline_diagnostics::failure(3, 4 | ((*error as u64 + 1) << 8));
+        }
+        let Some(mut d) = dispatch? else {
+            baseline_diagnostics::failure(3, 5 | ((WINDOW_NS - now % WINDOW_NS) << 16));
+            return Ok(None);
+        };
+        if d.thread == group(0x101) && d.reserved_ns < 2_500_000 {
+            match s.scheduler.resize_dispatch(d, 2_500_000) {
+                Ok(full) => d = full,
+                Err(error) => baseline_diagnostics::failure(3, 8 | ((error as u64 + 1) << 8)),
             }
-            let now = now_ns();
-            admit_service(s, now)?;
-            let Some(mut d) = s.scheduler.dispatch_with_window_headroom(
-                0,
-                s.layout,
-                now,
-                2_500_000,
-                BUILTIN_WINDOW_HEADROOM_NS,
-            )?
-            else {
-                return Ok(None);
-            };
-            if d.thread == group(0x101) && d.reserved_ns < 2_500_000 {
-                if let Ok(full) = s.scheduler.resize_dispatch(d, 2_500_000) {
-                    d = full;
-                }
-            }
-            if d.thread != group(0x101) || d.reserved_ns != 2_500_000 {
-                s.scheduler.complete(d, 0, RunState::Runnable, now)?;
-                return Ok(None);
-            }
-            s.active[0] = Some(Active {
-                dispatch: d,
-                state: RunState::Runnable,
-                optional: None,
-            });
-            CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
-            CREDIT_KIND[0].store(5, Ordering::Release);
-            Ok(Some(Credit {
-                sequence: d.sequence,
-                thread: d.thread,
-                reserved_ns: d.reserved_ns,
-                optional: false,
-            }))
-        }),
-    )
-    .ok()
-    .flatten()
+        }
+        if d.thread != group(0x101) || d.reserved_ns != 2_500_000 {
+            baseline_diagnostics::failure(
+                3,
+                (if d.thread != group(0x101) { 6 } else { 7 }) | (d.reserved_ns << 16),
+            );
+            s.scheduler.complete(d, 0, RunState::Runnable, now)?;
+            return Ok(None);
+        }
+        s.active[0] = Some(Active {
+            dispatch: d,
+            state: RunState::Runnable,
+            optional: None,
+        });
+        CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
+        CREDIT_KIND[0].store(5, Ordering::Release);
+        Ok(Some(Credit {
+            sequence: d.sequence,
+            thread: d.thread,
+            reserved_ns: d.reserved_ns,
+            optional: false,
+        }))
+    });
+    if !entered && let Err(error) = &result {
+        // No State access is allowed when the nonblocking task gate failed.
+        baseline_diagnostics::failure(
+            1,
+            (*error as u64 + 1)
+                | (CREDIT_KIND[0].load(Ordering::Acquire) << 8)
+                | (u64::from(COMPLETE_READY[0].load(Ordering::Acquire)) << 16),
+        );
+    }
+    track_credit(0, result).ok().flatten()
 }
 /// Authority for a bounded CPU0 mechanism piece, including exact baseline
 /// restoration after an optional numerical worker has failed. Merely running
@@ -1154,7 +1199,16 @@ pub fn authorize_service_turn() -> Result<(), Error> {
     if cpu::slot() != 0 || !READY.load(Ordering::Acquire) {
         return Err(Error::Auth);
     }
-    locked(|s| service_witness_locked(s).map(|_| ()))
+    let result = locked(|s| service_witness_locked(s).map(|_| ()));
+    if let Err(error) = &result {
+        baseline_diagnostics::failure(
+            5,
+            (*error as u64 + 1)
+                | (CREDIT_KIND[0].load(Ordering::Acquire) << 8)
+                | (u64::from(COMPLETE_READY[0].load(Ordering::Acquire)) << 16),
+        );
+    }
+    result
 }
 /// Actual stopped file syscalls awaiting the CPU0 owner. This is demand, not
 /// permission to replay a request: completion custody and in-flight requests

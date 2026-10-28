@@ -6,7 +6,12 @@
 //! First attempt is words16..32; words32..112 retain the last five attempts.
 //! Row: sequence, callsite, opportunity/start/end/return ns, result(0 pending,
 //! 1 no body,2 Ok(false),3 Ok(true),4 Err), error+1, prior credit kind/pending,
-//! body reservation/kind, final credit kind/pending, body CPU ns, reserved.
+//! body reservation/kind, final credit kind/pending, body CPU ns, failure mask.
+//! Version2: words112..127 retain first failures in five categories as triples
+//! (ns, attempt, detail): gate, settlement, admission, revalidation, authority.
+//! Gate/authority detail: error+1, prior credit kind<<8, pending<<16.
+//! Settlement: error+1, retained active<<8, pending<<9, credit kind<<16.
+//! Admission/revalidation: reason, error+1<<8, copied scalar context<<16.
 //! Word127 is the publication seqlock. It freezes after the first cycle closes.
 use super::Error;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -23,11 +28,15 @@ static mut BASELINE_SERVICE_EVIDENCE: Capture = Capture {
     words: {
         let mut words = [0; 127];
         words[0] = 0x4359_4241_5345_5331;
-        words[1] = 1;
+        words[1] = 2;
         words
     },
     publication: AtomicU64::new(0),
 };
+// Diagnostic scope only; CPU0 is the sole writer. No mutable bank borrow is
+// retained across service_step or another owner call. Current call sites do
+// not recursively enter the helper. Other CPUs never mutate this bank.
+static CURRENT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
 impl Capture {
     fn row(&self, sequence: u64) -> usize {
@@ -56,6 +65,7 @@ pub(super) fn opportunity(hint: bool, site: u64, kind: u64, pending: bool) -> Op
     let now = super::now_ns();
     capture.publication.fetch_add(1, Ordering::AcqRel);
     if !hint {
+        CURRENT_ATTEMPT.store(0, Ordering::Release);
         capture.words[2] = 2;
         capture.words[11] = now;
         capture.publication.fetch_add(1, Ordering::Release);
@@ -78,7 +88,37 @@ pub(super) fn opportunity(hint: bool, site: u64, kind: u64, pending: bool) -> Op
     capture.words[offset + 8] = kind;
     capture.words[offset + 9] = u64::from(pending);
     capture.publication.fetch_add(1, Ordering::Release);
+    CURRENT_ATTEMPT.store(sequence, Ordering::Release);
     Some(sequence)
+}
+pub(super) fn failure(category: usize, detail: u64) {
+    if super::cpu::slot() != 0 || !(1..=5).contains(&category) {
+        return;
+    }
+    let sequence = CURRENT_ATTEMPT.load(Ordering::Acquire);
+    if sequence == 0 {
+        return;
+    }
+    let now = super::now_ns();
+    let capture = unsafe { &mut *core::ptr::addr_of_mut!(BASELINE_SERVICE_EVIDENCE) };
+    if capture.words[2] != 1 {
+        return;
+    }
+    capture.publication.fetch_add(1, Ordering::AcqRel);
+    let offset = capture.row(sequence);
+    if capture.words[offset] == sequence {
+        capture.words[offset + 15] |= 1 << (category - 1);
+        if sequence == 1 {
+            capture.words.copy_within(offset..offset + 16, 16);
+        }
+    } else {
+        capture.words[15] = capture.words[15].saturating_add(1);
+    }
+    let first = 112 + (category - 1) * 3;
+    if capture.words[first] == 0 {
+        capture.words[first..first + 3].copy_from_slice(&[now, sequence, detail]);
+    }
+    capture.publication.fetch_add(1, Ordering::Release);
 }
 pub(super) fn body_start(ticket: Option<u64>, reserved: u64, kind: u64) {
     if let Some(sequence) = ticket {
@@ -142,5 +182,6 @@ pub(super) fn finish(ticket: Option<u64>, entered: bool, kind: u64, pending: boo
             }
         }
         capture.publication.fetch_add(1, Ordering::Release);
+        CURRENT_ATTEMPT.store(0, Ordering::Release);
     }
 }
