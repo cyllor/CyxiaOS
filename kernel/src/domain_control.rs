@@ -253,6 +253,10 @@ static DOMAIN_PREPARATION_REJECTIONS: PreparationRejections =
     PreparationRejections([const { core::sync::atomic::AtomicU64::new(0) }; 648]);
 pub use cyxia_prototype::policy::{BoundDependency, Prerequisite};
 type DependencyResolver = fn(ObjectKey) -> Result<[Option<Prerequisite>; 2], Error>;
+/// Optional control-preparation projection. It must perform the same owner,
+/// current-action, legality and admission checks as the generic path while
+/// collapsing repeated immutable owner reads into one bounded snapshot.
+type DependencyBinder = fn(ObjectKey, u64) -> Result<[Option<BoundDependency>; 2], Error>;
 type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
 static ADMISSION: dependencies::AdmissionView = dependencies::AdmissionView::new();
 static DEPENDENCY_RESOLVERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
@@ -313,6 +317,7 @@ struct Owner {
     prepared_count: usize,
     poll_cursor: usize,
     dependencies: [Option<DependencyResolver>; 16],
+    dependency_binders: [Option<DependencyBinder>; 16],
     execution_observers: [Option<ExecutionObserver>; 16],
 }
 #[derive(Clone, Copy)]
@@ -405,6 +410,7 @@ static mut STATE: State = State {
         prepared_count: 0,
         poll_cursor: 0,
         dependencies: [None; 16],
+        dependency_binders: [None; 16],
         execution_observers: [None; 16],
     },
     boot: 0,
@@ -601,6 +607,26 @@ pub fn register_dependencies(consumer: u16, resolver: DependencyResolver) -> Res
         Ok(())
     })
 }
+/// Register a control-only collapsed dependency projection. The ordinary
+/// executor resolver remains authoritative for hot-path admission and is not
+/// replaced by this optimization.
+pub fn register_dependency_binder(consumer: u16, binder: DependencyBinder) -> Result<(), Error> {
+    if !matches!(consumer, 1 | 4 | 8 | 10) {
+        return Err(Error::Unsupported);
+    }
+    with(|s| {
+        let slot = &mut s.owner.dependency_binders[usize::from(consumer - 1)];
+        if let Some(old) = *slot {
+            return if core::ptr::fn_addr_eq(old, binder) {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        *slot = Some(binder);
+        Ok(())
+    })
+}
 /// Confirm the exact APPLIED version to the owner of real resource grants.
 /// The callback must be idempotent and nonblocking. Busy/Again/NotReady retain
 /// the receipt for retry; another policy for this object cannot replace it.
@@ -686,7 +712,11 @@ fn bind_dependencies(
     if !matches!(action.domain(), 1 | 4 | 8 | 10) || matches!(action, Action::ControlSet(_)) {
         return Ok([None; 2]);
     }
-    let resolver = owner.dependencies[usize::from(action.domain() - 1)].ok_or(Error::NotReady)?;
+    let dependency_slot = usize::from(action.domain() - 1);
+    if let Some(binder) = owner.dependency_binders[dependency_slot] {
+        return binder(target, at);
+    }
+    let resolver = owner.dependencies[dependency_slot].ok_or(Error::NotReady)?;
     bind_dependency_list(
         owner,
         action,

@@ -1778,6 +1778,54 @@ pub fn memory_backing() -> Result<(u64, u32), Error> {
 }
 /// Identity of the initialized physical cache partition owner, including its
 /// baseline policy before the controller publishes any desired version.
+/// Validate the current D03 owner and its file-cache partition from one task
+/// gate acquisition and one coherent file-owner projection. This is used only
+/// while binding a control proposal; executor admission still calls the normal
+/// dependency resolver and revalidates the actual owners.
+pub(crate) fn control_cache_dependency(
+    at: u64,
+) -> Result<crate::domain_control::Prerequisite, Error> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(Error::NotReady);
+    }
+    locked(|s| {
+        let (pages, batch) = s.memory.cache_policy(at);
+        let action = Action::Cache { pages, batch };
+        action.validate()?;
+        let authorized = s.memory.cache_authorized_pages(at);
+        let grant = (pages / 4).min(256);
+        let (cache, (file_base, file_pages)) = crate::domain_storage::cache_dependency_view(at)?;
+        let (task_base, task_pages) = memory_backing()?;
+        let task_end = task_base
+            .checked_add(u64::from(task_pages) * 4096)
+            .ok_or(Error::Overflow)?;
+        let file_end = file_base
+            .checked_add(u64::from(file_pages) * 4096)
+            .ok_or(Error::Overflow)?;
+        if authorized > pages as usize
+            || cache[2] != u64::from(pages).saturating_sub(authorized as u64)
+            || cache[0] > cache[3]
+            || cache[2] > cache[3]
+            || authorized > PAGES - TABLE_PAGES - CODE_PAGES - 32
+            || !file_base.is_multiple_of(4096)
+            || file_pages == 0
+            || u64::from(file_pages) != cache[3]
+            || (task_base < file_end && file_base < task_end)
+        {
+            return Err(Error::NotReady);
+        }
+        if grant as usize > PAGES - TABLE_PAGES - CODE_PAGES - 32
+            || u64::from(pages - grant) > cache[3]
+        {
+            return Err(Error::Budget);
+        }
+        Ok(crate::domain_control::Prerequisite {
+            domain: 3,
+            target: MEMORY_KEY,
+        })
+    })
+}
+
 pub fn memory_key() -> Result<ObjectKey, Error> {
     let (base, pages) = memory_backing()?;
     if base & 4095 != 0 || pages == 0 {
