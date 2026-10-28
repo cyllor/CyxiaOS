@@ -292,7 +292,13 @@ pub(super) fn syscall_locked(
             )?;
             spawn_result(context, state);
         }
-        3 => spawn_result(context, s.admission.query(task.key, args[0])?),
+        3 => {
+            let result = s.admission.query(task.key, args[0]);
+            if task.package == CLIENT_PACKAGE {
+                spawn_diagnostics::query(task.key, args[0], &result, now_ns());
+            }
+            spawn_result(context, result?);
+        }
         4 => spawn_result(context, s.admission.cancel(task.key, args[0])?),
         5 => {
             let endpoint = if task.endpoint == ZERO {
