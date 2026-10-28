@@ -72,6 +72,14 @@ class UnifiedBuilder(unittest.TestCase):
             self.assertNotIn('PRIVATE-KEY',json.dumps(result));self.assertNotIn('key.der',json.dumps(result))
             (p/'peer.pin').write_bytes(bytes(32))
             with self.assertRaises(ValueError):build.identity_metadata(p)
+    def test_service_restart_fault_scope_keeps_peer_healthy(self):
+        self.assertEqual(build.service_fault_scope('after-start'),
+                         {'a': 'after-start', 'b': 'none'})
+        self.assertEqual(build.service_fault_scope('none'),
+                         {'a': 'none', 'b': 'none'})
+        with self.assertRaisesRegex(ValueError, 'unknown cluster service fault'):
+            build.service_fault_scope('both')
+
     def test_embedded_role_audit_requires_the_exact_nonempty_image(self):
         build.audit_embedded_role(b'kernel-prefix' + b'governance-image' + b'-suffix',
                                   b'governance-image', 'governance')

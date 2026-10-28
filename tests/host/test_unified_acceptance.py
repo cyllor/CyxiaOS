@@ -57,20 +57,24 @@ class Acceptance(unittest.TestCase):
         for name,index,value in [('DYNAMIC_V13_EVIDENCE',1,1),('DYNAMIC_V13_EVIDENCE',25,31),('UNIFIED_EVIDENCE',36,0),('RUNTIME_V13_EVIDENCE',38,1),('RUNTIME_V13_EVIDENCE',32,2),('UNIFIED_EVIDENCE',6,201),('UNIFIED_EVIDENCE',12,625001),('UNIFIED_EVIDENCE',8,0),('UNIFIED_EVIDENCE',30,0),('UNIFIED_EVIDENCE',31,1)]:
             b=copy.deepcopy(original);change(b[1],name,index,value)
             with self.subTest(name=name,index=index),self.assertRaises(ValueError):validate([b'',b''],b,[4,4])
-    def test_service_restart_requires_real_fault_exact_generation_and_second_ready(self):
+    def test_service_restart_requires_one_real_fault_and_a_healthy_peer(self):
         restarted=[bundle(),bundle(True)]
+        events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
         for item in restarted:
             words=list(struct.unpack('<512Q',item['UNIFIED_EVIDENCE']))
-            events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
-            words[6]=len(events);words[13:15]=[11,0x212];words[22]=1
-            words[30:32]=[2,1];words[32:]=[0]*480
+            words[6]=len(events);words[32:]=[0]*480
             for i,event in enumerate(events):words[32+i*2]=event
             item['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
-        serial=[b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n']*2
+        words=list(struct.unpack('<512Q',restarted[0]['UNIFIED_EVIDENCE']))
+        words[13:15]=[11,0x212];words[22]=1;words[30:32]=[2,1]
+        restarted[0]['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
+        serial=[b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n',b'']
         self.assertEqual(len(validate(serial,restarted,[4,4],expect='service-restart')),2)
         changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',31,0)
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
         changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',14,2)
+        with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
+        changed=copy.deepcopy(restarted);change(changed[1],'UNIFIED_EVIDENCE',30,2);change(changed[1],'UNIFIED_EVIDENCE',31,1)
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
     def test_no_ack_cannot_be_mislabelled_successful_handoff(self):
         with self.assertRaises(ValueError):validate([b'DYNAMIC_V13_RECONCILE']*2,[bundle(),bundle(True)],[4,4],expect='no-stop-ack')
@@ -95,7 +99,7 @@ class Acceptance(unittest.TestCase):
             files=[root/n for n in names]
             for i,f in enumerate(files):f.write_bytes(bytes([i+1])*32)
             nodes={n:{'node_id':sha(files[i+2]),'peer_node_id':sha(files[3-i])} for i,n in enumerate(('a','b'))}
-            data=dict(schema_version=1,status='BUILT_NOT_RUN',code_source_map={'a.rs':'original'},code_source_sha256='code',builder_sha256=sha(ROOT/'tools/build_unified.py'),profiles={'fault':'normal','leave':False},own_private_key_only_verified=True,nodes=nodes,artifacts={n:{'sha256':sha(f),'bytes':32} for n,f in zip(names,files)})
+            data=dict(schema_version=1,status='BUILT_NOT_RUN',code_source_map={'a.rs':'original'},code_source_sha256='code',builder_sha256=sha(ROOT/'tools/build_unified.py'),profiles={'fault':'normal','service_fault':'none','service_fault_nodes':{'a':'none','b':'none'},'leave':False},own_private_key_only_verified=True,nodes=nodes,artifacts={n:{'sha256':sha(f),'bytes':32} for n,f in zip(names,files)})
             manifest=root/'build.json';manifest.write_text(json.dumps(data))
             def check():return bind_build(manifest,files[0],files[1],files[2:4],files[4],'normal')
             with patch('verify_unified.code_source_map',return_value={'a.rs':'original'}):
@@ -110,12 +114,16 @@ class Acceptance(unittest.TestCase):
             files=[root/n for n in names]
             for i,f in enumerate(files):f.write_bytes(bytes([i+1])*32)
             nodes={n:{'node_id':sha(files[i+2]),'peer_node_id':sha(files[3-i])} for i,n in enumerate(('a','b'))}
-            data=dict(schema_version=1,status='BUILT_NOT_RUN',code_source_map={'a.rs':'original'},code_source_sha256='code',builder_sha256=sha(ROOT/'tools/build_unified.py'),profiles={'fault':'normal','service_fault':'after-start','leave':False},own_private_key_only_verified=True,nodes=nodes,artifacts={n:{'sha256':sha(f),'bytes':32} for n,f in zip(names,files)})
+            data=dict(schema_version=1,status='BUILT_NOT_RUN',code_source_map={'a.rs':'original'},code_source_sha256='code',builder_sha256=sha(ROOT/'tools/build_unified.py'),profiles={'fault':'normal','service_fault':'after-start','service_fault_nodes':{'a':'after-start','b':'none'},'leave':False},own_private_key_only_verified=True,nodes=nodes,artifacts={n:{'sha256':sha(f),'bytes':32} for n,f in zip(names,files)})
             manifest=root/'build.json';manifest.write_text(json.dumps(data))
             with patch('verify_unified.code_source_map',return_value={'a.rs':'original'}):
                 self.assertEqual(bind_build(manifest,files[0],files[1],files[2:4],files[4],'service-restart-start')['profiles']['service_fault'],'after-start')
                 with self.assertRaisesRegex(ValueError,'service-fault profile'):
                     bind_build(manifest,files[0],files[1],files[2:4],files[4],'service-restart-completion')
+                data['profiles']['service_fault_nodes']={'a':'after-start','b':'after-start'}
+                manifest.write_text(json.dumps(data))
+                with self.assertRaisesRegex(ValueError,'node scope'):
+                    bind_build(manifest,files[0],files[1],files[2:4],files[4],'service-restart-start')
     def test_live_progress_retries_torn_publication_without_pausing_guest(self):
         commands=[]
         class Qmp:

@@ -442,9 +442,9 @@ impl BatchQueue {
         self.poll_with_checkpoint(t, out, p, &mut || {})
     }
     /// Poll one used record with scheduler-safe boundaries after status,
-    /// publication and used-index acquisition, plus completion validation.
-    /// The callback must not re-enter this queue; custody remains here until
-    /// the response copy and final state transition complete.
+    /// publication, used-index acquisition, DMA response synchronization and
+    /// completion publication. The callback must not re-enter this queue;
+    /// custody remains here until the caller explicitly releases the token.
     pub fn poll_with_checkpoint(
         &mut self,
         t: &mut Transport,
@@ -507,11 +507,16 @@ impl BatchQueue {
             unsafe { p.sync(self.memory.response[index].address(), len as usize) };
             p.barrier();
         }
+        // DMA cache acquisition can be the cold part of a native QEMU turn.
+        // Settle it before copying, while the completed chain is still owned.
+        checkpoint();
         self.memory.response[index].copy_prefix_to(out, len as usize);
         self.slots[index].state = State::Complete;
         self.used = self.used.wrapping_add(1);
         self.stats.completed = self.stats.completed.saturating_add(1);
         self.stats.last_completed_version = self.stats.last_completed_version.max(s.version);
+        // Publish a complete, queryable token before paying for MMIO IRQ ACK.
+        checkpoint();
         let irq = t.read(0x60);
         t.write(0x64, irq & 3);
         p.barrier();
@@ -726,7 +731,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completion.len, 15);
-        assert_eq!(checkpoints, 6);
+        assert_eq!(checkpoints, 8);
     }
     #[test]
     fn empty_poll_checkpoints_status_publication_and_used_index() {

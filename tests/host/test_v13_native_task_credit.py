@@ -48,6 +48,16 @@ class NativeTaskCredit(unittest.TestCase):
         record = queue[queue.index("let at = 4 + usize::from(self.used % self.size) * 8;") :]
         self.assertLess(record.index("p.sync("), record.index("checkpoint();"))
         self.assertLess(record.index("checkpoint();"), record.index("let id ="))
+        response = record[record.index("if len != 0 {") :]
+        self.assertIn("p.barrier();\n        }\n        // DMA cache acquisition", response)
+        self.assertLess(response.index("// DMA cache acquisition"),
+                        response.index("checkpoint();"))
+        self.assertLess(response.index("checkpoint();"),
+                        response.index("copy_prefix_to"))
+        published = response[response.index("copy_prefix_to") :]
+        self.assertLess(published.index("last_completed_version"),
+                        published.index("checkpoint();"))
+        self.assertLess(published.index("checkpoint();"), published.index("let irq"))
 
     def test_network_stage_diagnostic_is_outside_next_service_debit(self):
         runtime = (ROOT / "kernel/src/unified.rs").read_text()

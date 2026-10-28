@@ -71,6 +71,12 @@ def bind_build(path,elf,peer_elf,publics,package,expect):
         'service-restart-result':'after-result-record',
     }.get(expect,'none')
     require(build['profiles'].get('service_fault','none')==expected_service_fault,'build service-fault profile differs from acceptance')
+    expected_service_fault_nodes = (
+        {'a': expected_service_fault, 'b': 'none'}
+        if expected_service_fault != 'none' else {'a': 'none', 'b': 'none'}
+    )
+    require(build['profiles'].get('service_fault_nodes')==expected_service_fault_nodes,
+            'build service-fault node scope differs from acceptance')
     require(build.get('own_private_key_only_verified') is True,'per-node key audit missing')
     require(publics is not None and len(publics)==2 and package is not None,'two public keys and task package required')
     for name,file in zip(('node-a.elf','node-b.elf','node-a.pub','node-b.pub','task.elf'),(elf,peer_elf,*publics,package)):
@@ -88,6 +94,12 @@ def profile(data):
 
 def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
     require(cpu_counts==[4,4],'four native cores per node required')
+    service_restart = expect.startswith('service-restart')
+    restart_boundary = {
+        'service-restart':(11,0x212),'service-restart-ready':(11,0x212),
+        'service-restart-reserve':(10,31),'service-restart-start':(10,2),
+        'service-restart-completion':(10,3),'service-restart-result':(11,0x216),
+    }.get(expect)
     observations=[]
     for text,bundle in zip(serial,pages):
         u=struct.unpack('<512Q',bundle['UNIFIED_EVIDENCE']);d=struct.unpack('<512Q',bundle['DYNAMIC_V13_EVIDENCE']);r=struct.unpack('<1024Q',bundle['RUNTIME_V13_EVIDENCE'])
@@ -116,19 +128,26 @@ def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
         require(all(event in events for event in ((1,2,3,0x212) if recover else (1,2,3,0x211,0x212,0x219))),'missing TLS/BOUND/READY/close')
         require(not any(0xfe<=event<=0x108 or event>=0xf000 for event in events),'service reported failure')
         if expect=='leave':require(0x221 in events,'missing two-signature durable leave')
-        if expect.startswith('service-restart'):
-            boundary={
-                'service-restart':(11,0x212),'service-restart-ready':(11,0x212),
-                'service-restart-reserve':(10,31),'service-restart-start':(10,2),
-                'service-restart-completion':(10,3),'service-restart-result':(11,0x216),
-            }[expect]
+        restarted = u[30:32] == (2,1)
+        if service_restart:
             restart=re.search(rb'UNIFIED_SERVICE_RESTART boot=(\d+) generation=2',text)
-            require(u[30:32]==(2,1) and restart is not None and int(restart.group(1))==u[1],'same-boot service restart evidence missing')
-            fault=(f'UNIFIED_EL0_FAULT generation=1 last_op={boundary[0]} last_arg0={boundary[1]} ').encode()
-            require(u[13:15]==boundary and u[22]==1 and fault in text,'real generation-1 EL0 fault boundary missing')
-            require(all(events.count(event)>=2 for event in (1,2,3,0x212)),'new service generation did not reconcile to READY')
+            fault=(f'UNIFIED_EL0_FAULT generation=1 last_op={restart_boundary[0]} last_arg0={restart_boundary[1]} ').encode()
+            if restarted:
+                require(restart is not None and int(restart.group(1))==u[1],
+                        'same-boot service restart evidence missing')
+                require(u[13:15]==restart_boundary and u[22]==1 and fault in text,
+                        'real generation-1 EL0 fault boundary missing')
+            else:
+                require(u[30:32]==(1,0) and restart is None and u[13:15]==(0,0) and u[22]==0
+                        and b'UNIFIED_EL0_FAULT generation=' not in text,
+                        'healthy peer unexpectedly faulted or restarted')
+            require(all(events.count(event)>=2 for event in (1,2,3,0x212)),
+                    'service restart pair did not reconcile to READY')
         else:require(u[30:32]==(1,0),'unexpected service restart in this scenario')
-        observations.append(dict(boot_epoch=u[1],service_generation=u[30],service_restarts=u[31],task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))
+        observations.append(dict(boot_epoch=u[1],service_generation=u[30],service_restarts=u[31],service_restarted=restarted,task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))
+    if service_restart:
+        require([o['service_restarted'] for o in observations]==[True,False],
+                'service restart must fault node a exactly once while node b remains healthy')
     require(sorted(o['task_starts'] for o in observations)==([0,0] if recover else [0,1]) and sorted(o['task_finishes'] for o in observations)==([0,0] if recover else [0,1]),'pure task not uniquely executed')
     return observations
 
