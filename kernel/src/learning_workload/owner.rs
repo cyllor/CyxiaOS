@@ -820,9 +820,10 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
 }
 pub fn drain(run: RunKey) -> Result<bool, Error> {
     owner()?;
-    if !poll(run)? {
-        return Ok(false);
-    }
+    // Closing execution may need its original probe while measurement requests
+    // are still settling. Poll them first, but do not wait-all before providing
+    // that demand. The retained result remains a barrier to every owner drain.
+    let poll_done = poll(run)?;
     let (token, f) = with(|s| {
         Ok((
             s.token.ok_or(Error::NotReady)?,
@@ -895,7 +896,8 @@ pub fn drain(run: RunKey) -> Result<bool, Error> {
             Ok(true)
         })
     })?;
-    if !done
+    if !poll_done
+        || !done
         || if control_work(f) {
             !core_work::drain()?
         } else {

@@ -49,7 +49,7 @@ class BaselineActivationPriority(unittest.TestCase):
             result = subprocess.run([str(binary), '--test-threads=1'], capture_output=True,
                 text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('4 passed; 0 failed', result.stdout)
+            self.assertIn('8 passed; 0 failed', result.stdout)
             hook = '        replay::publish_baseline_activation_hint();'
             self.assertEqual(template.count(hook), 1)
             rust.write_text(template.replace(hook, ''))

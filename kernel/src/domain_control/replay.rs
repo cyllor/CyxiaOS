@@ -340,19 +340,38 @@ static BASELINE_ACTIVATION_PENDING: AtomicBool = AtomicBool::new(false);
 /// Called only by the root gate's guard, before releasing exclusion. A first
 /// snapshot already exists even if on_first cannot yet acquire its owner gate
 /// or bind capture/history. Neither that Busy nor a read-only borrow may lose
-/// its retry opportunity. Successful publication and terminal closure clear it.
+/// its retry opportunity. Published nonterminal executions and restorations
+/// retain that opportunity until their cached, real receipt becomes terminal.
 pub(super) fn publish_baseline_activation_hint() {
     debug_assert!(super::CLAIMED.load(Ordering::Relaxed));
     let r = root();
-    let pending = r.token.is_some()
-        && r.request.is_some_and(|q| q.kind == TrialKind::Baseline)
-        && r.first.is_some()
+    let baseline = r.request.is_some_and(|q| q.kind == TrialKind::Baseline);
+    let activating = baseline
         && r.phase == Phase::Frozen
         && r.initial.is_none()
         && r.baseline_count == 0
-        && r.fault.is_none()
+        && r.fault.is_none();
+    let executing = |receipt: &Receipt| {
+        receipt.stamp.version != 0
+            && matches!(
+                receipt.state,
+                ExecutionState::Pending | ExecutionState::Unknown
+            )
+    };
+    let pending = r.token.is_some()
+        && r.request.is_some()
+        && r.first.is_some()
+        && r.phase != Phase::Complete
         && r.unpublished.is_none()
-        && r.lifecycle.closing().is_none();
+        && r.lifecycle.closing().is_none()
+        && (activating
+            || baseline
+                && r.baseline
+                    .iter()
+                    .take(r.baseline_count)
+                    .flatten()
+                    .any(executing)
+            || r.closing.as_ref().is_some_and(executing));
     if pending != BASELINE_ACTIVATION_PENDING.load(Ordering::Relaxed) {
         BASELINE_ACTIVATION_PENDING.store(pending, Ordering::Release);
     }

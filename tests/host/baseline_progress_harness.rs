@@ -12,6 +12,10 @@ static HINT: AtomicBool = AtomicBool::new(false);
 static REENTER: AtomicBool = AtomicBool::new(false);
 static STEP_CALLS: AtomicU64 = AtomicU64::new(0);
 static BODY_EFFECTS: AtomicU64 = AtomicU64::new(0);
+static KEEP_HINT: AtomicBool = AtomicBool::new(false);
+static QUEUE_ON_STEP: AtomicBool = AtomicBool::new(false);
+static DENY_SETTLE: AtomicBool = AtomicBool::new(false);
+static CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 static RECURSED: AtomicBool = AtomicBool::new(false);
 static TICKETS: AtomicU64 = AtomicU64::new(0);
 static CURRENT_TICKET: AtomicU64 = AtomicU64::new(0);
@@ -47,10 +51,59 @@ struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit>,
 struct State {
     scheduler: Scheduler, active: [Option<Active>; 1], layout: CpuLayout, draining: u64,
     service_admitted: bool, background: BackgroundBudgets, bills: Vec<(u64, u64, u64)>,
+    admission: SpawnAdmission, tasks: (), launches: [Launch; 1], memory: (), services: (), ipc: (),
+    remote: (), generation: u64, facts: Facts, launch_cursor: usize,
 }
+const LAUNCHES: usize = 1;
+const ZERO: ObjectKey = ObjectKey { id: 0, generation: 0 };
+struct Launch { request: Option<SpawnRequest>, input: [u8; 1] }
+struct Facts { rejected: u64 }
 static mut STATE: State = State { scheduler: Scheduler::new(), active: [None],
     layout: CpuLayout { business_mask: 13, healthy_mask: 15, generation: 1 }, draining: 0,
-    service_admitted: false, background: BackgroundBudgets::new(), bills: Vec::new() };
+    service_admitted: false, background: BackgroundBudgets::new(), bills: Vec::new(),
+    admission: SpawnAdmission::new(), tasks: (), launches: [Launch { request: None, input: [0] }],
+    memory: (), services: (), ipc: (), remote: (), generation: 1, facts: Facts { rejected: 0 }, launch_cursor: 0 };
+fn effective_layout(s: &State) -> CpuLayout { s.layout }
+// Construction is the hardware boundary; the queue, selection, task gate and
+// Scheduler reservation are real. Each authorization checks fresh service credit.
+struct Creator<'a> {
+    tasks: &'a mut (), launches: &'a [Launch; 1], memory: &'a mut (),
+    scheduler: &'a mut Scheduler, services: &'a mut (), ipc: &'a mut (),
+    background: &'a mut BackgroundBudgets, layout: CpuLayout, remote: (),
+    generation: &'a mut u64, local_failure: Option<()>,
+}
+impl Creator<'_> { fn failure_facts(&self, _: &SpawnRequest, _: ObjectKey, _: u64, _: u64, _: Error) -> Option<()> { None } }
+impl TaskBackend for Creator<'_> {
+    fn authorize(&mut self, _: &SpawnRequest) -> Result<(), Error> {
+        assert_eq!(CREDIT_KIND[0].load(Ordering::Acquire), 5);
+        assert!(!COMPLETE_READY[0].load(Ordering::Acquire));
+        Ok(())
+    }
+    fn create(&mut self, request: &SpawnRequest) -> CreateOutcome {
+        let key = group(4096 + request.request_id - 101);
+        self.scheduler.admit(ThreadSpec { key, group: request.group, cpu: 3,
+            allowed_mask: 8, minimum_ns: 0, budget_ns: 1_000_000 }, self.layout, now_ns()).unwrap();
+        CONSTRUCTIONS.fetch_add(1, Ordering::AcqRel); work(80_000);
+        CreateOutcome::Created(key)
+    }
+}
+mod local_evidence { pub fn retain(_: ()) {} }
+fn request() -> SpawnRequest { SpawnRequest { caller: group(0x5245504c4341), request_id: 101,
+    package: group(7), group: group(12), payload_hash: [7; 32], recovery: false } }
+fn queue_warm() {
+    locked(|s| {
+        service_witness_locked(s)?;
+        struct Submit;
+        impl TaskBackend for Submit {
+            fn authorize(&mut self, _: &SpawnRequest) -> Result<(), Error> { Ok(()) }
+            fn create(&mut self, _: &SpawnRequest) -> CreateOutcome { panic!("submit constructed before reservation") }
+        }
+        assert_eq!(s.admission.submit(request(), now_ns(), &mut Submit)?, SpawnState::Queued);
+        let mut second = request(); second.request_id = 102;
+        assert_eq!(s.admission.submit(second, now_ns(), &mut Submit)?, SpawnState::Queued);
+        Ok(())
+    }).unwrap();
+}
 mod replay { pub fn service_admitted() {} }
 fn track_credit(_: usize, value: Result<Option<Credit>, Error>) -> Result<Option<Credit>, Error> { value }
 fn discard_capture(_: usize) {}
@@ -64,6 +117,7 @@ fn finish_cpu_interval(start: u64) -> (u64, u64, u64) {
     let at = now_ns(); let actual = timer::cpu_elapsed_ns(start); (at - actual, at, actual)
 }
 fn complete_locked(s: &mut State, _: usize) -> Result<(), Error> {
+    if DENY_SETTLE.load(Ordering::Acquire) { return Err(Error::Busy); }
     let a = s.active[0].ok_or(Error::Stale)?;
     let cpu = COMPLETE_ACTUAL[0].load(Ordering::Acquire);
     let at = COMPLETE_AT[0].load(Ordering::Acquire);
@@ -149,7 +203,9 @@ mod learning_replay {
                 HINT.store(false, Ordering::Release); return Err(Error::Expired);
             }
             BODY_EFFECTS.fetch_add(1, Ordering::AcqRel);
-            s.archive += 1; HINT.store(false, Ordering::Release); Ok(true)
+            s.archive += 1;
+            if QUEUE_ON_STEP.swap(false, Ordering::AcqRel) { queue_warm(); }
+            HINT.store(KEEP_HINT.load(Ordering::Acquire), Ordering::Release); Ok(true)
         })
     }
     fn retain_error(_: Error, _: Option<&mut diagnostic::Attempt>) { let _ = with(|_| Ok(())); }
@@ -166,13 +222,17 @@ fn reset() {
     READY.store(true, Ordering::Release); HINT.store(true, Ordering::Release);
     REENTER.store(false, Ordering::Release); RECURSED.store(false, Ordering::Release);
     STEP_CALLS.store(0, Ordering::Release); BODY_EFFECTS.store(0, Ordering::Release);
+    KEEP_HINT.store(false, Ordering::Release); QUEUE_ON_STEP.store(false, Ordering::Release);
+    DENY_SETTLE.store(false, Ordering::Release); CONSTRUCTIONS.store(0, Ordering::Release);
     TICKETS.store(0, Ordering::Release); CURRENT_TICKET.store(0, Ordering::Release);
     COMPLETE_READY[0].store(false, Ordering::Release); CREDIT_KIND[0].store(0, Ordering::Release);
     POLLING.store(false, Ordering::Release); learning_replay::reset();
     unsafe { (&mut *core::ptr::addr_of_mut!(ORDER)).clear();
         let s = &mut *core::ptr::addr_of_mut!(STATE);
         s.scheduler = Scheduler::new(); s.active = [None]; s.service_admitted = false; s.bills.clear();
-        s.scheduler.register_group(group(14)).unwrap(); }
+        s.admission = SpawnAdmission::new(); s.facts.rejected = 0;
+        s.admission.register_group(group(12)).unwrap();
+        s.scheduler.register_group(group(12)).unwrap(); s.scheduler.register_group(group(14)).unwrap(); }
 }
 fn bills() -> Vec<(u64, u64, u64)> { locked(|s| Ok(s.bills.clone())).unwrap() }
 #[test]
@@ -274,4 +334,49 @@ fn progress_cannot_refresh_an_expired_original_snapshot() {
     assert_eq!(STEP_CALLS.load(Ordering::Acquire), 1);
     assert_eq!(BODY_EFFECTS.load(Ordering::Acquire), 0);
     assert_eq!(learning_replay::snapshot(), 100_000_000);
+}
+#[test]
+fn pending_execution_constructs_one_original_queued_child_under_separate_credit() {
+    reset(); KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 1, "helper must construct exactly one queued child");
+    let b = bills();
+    assert_eq!(b.iter().map(|v| v.1).collect::<Vec<_>>(), [100_000, 80_000]);
+    assert_ne!(b[0].0, b[1].0, "admission reused replay credit");
+    assert_eq!(locked(|s| s.admission.request(request().caller, 101)), Ok(request()));
+    assert_eq!(locked(|s| s.admission.query(request().caller, 101)), Ok(SpawnState::Created(group(4096))));
+    assert_eq!(locked(|s| s.admission.query(request().caller, 102)), Ok(SpawnState::Queued));
+    assert_eq!(learning_replay::snapshot(), 100_000_000);
+}
+#[test]
+fn second_piece_cannot_spend_an_exhausted_real_service_budget() {
+    reset(); HINT.store(false, Ordering::Release);
+    for _ in 0..23 { assert!(service_segment(|| work(2_500_000)).is_some()); }
+    learning_replay::first_at(now_ns()); HINT.store(true, Ordering::Release);
+    KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(STEP_CALLS.load(Ordering::Acquire), 1);
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 0);
+    assert_eq!(locked(|s| s.admission.query(request().caller, 101)), Ok(SpawnState::Queued));
+    assert_eq!(bills().len(), 24);
+}
+#[test]
+fn retained_first_bill_prevents_any_second_piece() {
+    reset(); KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    DENY_SETTLE.store(true, Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert!(COMPLETE_READY[0].load(Ordering::Acquire));
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 0);
+    assert_eq!(COMPLETE_ACTUAL[0].load(Ordering::Acquire), 100_000);
+    DENY_SETTLE.store(false, Ordering::Release);
+    assert_eq!(bills().len(), 0);
+}
+#[test]
+fn nested_pending_execution_still_has_only_one_ticket_and_one_admission() {
+    reset(); KEEP_HINT.store(true, Ordering::Release); QUEUE_ON_STEP.store(true, Ordering::Release);
+    REENTER.store(true, Ordering::Release);
+    mechanism_progress(&mut smp::prototype_runtime::Coordinator);
+    assert_eq!(TICKETS.load(Ordering::Acquire), 1);
+    assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire), 1, "pending execution never advanced its queued admission");
+    assert_eq!(bills().len(), 2);
 }

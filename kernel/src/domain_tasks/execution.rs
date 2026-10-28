@@ -1217,8 +1217,9 @@ fn enter_baseline_retry() -> Option<BaselineRetryGuard> {
 fn service_baseline_activation() {
     service_baseline_activation_at(1);
 }
-/// One targeted opportunity after suspended I/O has submitted its old bill.
-/// No task/file/storage/TCP pump is entered, and no old reservation is reused.
+/// Targeted opportunities after suspended I/O has submitted its old bill.
+/// No general task/file/storage/TCP pump is entered; one bounded admission may
+/// follow under separate fresh credit. No old reservation is reused.
 pub fn service_baseline_progress() {
     if crate::learning_replay::baseline_activation_pending() {
         service_baseline_activation_at(2);
@@ -1238,8 +1239,8 @@ fn service_baseline_activation_at(site: u64) {
         COMPLETE_READY[0].load(Ordering::Acquire),
     );
     if hint {
-        // Only an already-owned first baseline snapshot gets this retry
-        // opportunity. Its exact original 50 ms deadline remains authoritative.
+        // Only already-owned activation/execution custody gets this retry
+        // opportunity. Its original snapshot and deadlines remain authoritative.
         // Each attempt needs fresh physical credit and settles before vectors
         // or file work. General replay phases keep their normal rotation.
         let outcome = service_segment(|| {
@@ -1259,6 +1260,16 @@ fn service_baseline_activation_at(site: u64) {
             CREDIT_KIND[0].load(Ordering::Acquire),
             COMPLETE_READY[0].load(Ordering::Acquire),
         );
+        // Publication alone is not execution. After the replay piece has
+        // submitted its bill and released all owner borrows, offer one queued
+        // construction a separate reservation. An unsettled prior bill or
+        // insufficient fresh credit prevents this body from running. Keep the
+        // shared retry guard held across both pieces, including nested progress.
+        if outcome.is_some_and(|result| result.is_ok())
+            && crate::learning_replay::baseline_activation_pending()
+        {
+            let _ = service_segment(|| locked(|s| advance_admission_bounded(s, 1, 0)));
+        }
     }
 }
 fn service_vectors() {

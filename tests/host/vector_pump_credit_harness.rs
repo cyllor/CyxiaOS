@@ -62,6 +62,12 @@ struct State {
     general: usize, files: usize, opportunities: usize, phase: usize, bodies: usize,
 }
 static mut STATE: Option<State> = None;
+// Queue admission has its own actual-source/real-SpawnAdmission harness. This
+// vector fixture's replay callback clears its hint on success, so that branch
+// must never run here rather than silently granting synthetic admission.
+fn advance_admission_bounded(_: &mut State, _: usize, _: usize) -> Result<(), Error> {
+    panic!("queue admission is outside the vector fixture")
+}
 fn locked<R>(body: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
     let permit = if GATE_MODE.load(Ordering::Acquire) {
         Some(owner_gate().try_acquire(0, NOW.load(Ordering::Acquire), 1_000_000)

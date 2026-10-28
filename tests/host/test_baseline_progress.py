@@ -31,7 +31,8 @@ class BaselineProgress(unittest.TestCase):
                           'fn service_witness_locked(', 'pub fn authorize_service_turn()',
                           'pub fn complete_builtin(', 'pub fn complete_service(', 'pub fn service_segment<R>']:
             pieces.append(function(task, signature))
-        for signature in ['pub fn service_io_piece<R>', 'fn service_baseline_activation(']:
+        for signature in ['pub fn service_io_piece<R>', 'fn service_baseline_activation(',
+                          'fn advance_admission_bounded(']:
             pieces.append(function(execution, signature))
         if 'fn service_baseline_progress(' in execution:
             pieces.append(function(execution, 'pub fn service_baseline_progress('))
@@ -69,7 +70,7 @@ class BaselineProgress(unittest.TestCase):
             result = subprocess.run(command, cwd=ROOT, env=env(), capture_output=True,
                                     text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('8 passed; 0 failed', result.stdout)
+            self.assertIn('12 passed; 0 failed', result.stdout)
             hook = '    crate::domain_tasks::service_baseline_progress();'
             self.assertEqual(template.count(hook), 1)
             rust.write_text(template.replace(hook, ''))
@@ -85,6 +86,22 @@ class BaselineProgress(unittest.TestCase):
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
             self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
             self.assertIn('recursive progress replaced the outer diagnostic ticket',
+                          negative.stdout + negative.stderr)
+            admission = '            let _ = service_segment(|| locked(|s| advance_admission_bounded(s, 1, 0)));'
+            self.assertEqual(template.count(admission), 1)
+            rust.write_text(template.replace(admission, ''))
+            negative = subprocess.run(command + ['--exact',
+                'pending_execution_constructs_one_original_queued_child_under_separate_credit'],
+                cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('helper must construct exactly one queued child',
+                          negative.stdout + negative.stderr)
+            rust.write_text(template.replace(admission, admission.replace('(s, 1, 0)', '(s, 2, 0)')))
+            negative = subprocess.run(command + ['--exact',
+                'pending_execution_constructs_one_original_queued_child_under_separate_credit'],
+                cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('helper must construct exactly one queued child',
                           negative.stdout + negative.stderr)
 
 
