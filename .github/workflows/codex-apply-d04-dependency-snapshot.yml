@@ -5,7 +5,7 @@ on:
     branches:
       - codex/v011-d04-dependency-snapshot
     paths:
-      - '.github/codex/patches/d04-dependency-snapshot.patch'
+      - '.github/codex/patches/d04-dependency-snapshot.patch.gz.b64'
       - '.github/workflows/codex-apply-d04-dependency-snapshot.yml'
   workflow_dispatch:
 
@@ -34,11 +34,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          patch=.github/codex/patches/d04-dependency-snapshot.patch
-          if [ ! -f "$patch" ]; then
+          payload=.github/codex/patches/d04-dependency-snapshot.patch.gz.b64
+          patch="$RUNNER_TEMP/d04-dependency-snapshot.patch"
+          if [ ! -f "$payload" ]; then
             echo 'apply=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          base64 --decode "$payload" | gzip --decompress > "$patch"
           git apply --check "$patch"
           git apply "$patch"
           echo 'apply=true' >> "$GITHUB_OUTPUT"
@@ -79,7 +81,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/codex/patches/d04-dependency-snapshot.patch
+          git rm -f \
+            .github/codex/patches/d04-dependency-snapshot.patch \
+            .github/codex/patches/d04-dependency-snapshot.patch.gz.b64
           git config user.name 'cyllor'
           git config user.email '45630989+cyllor@users.noreply.github.com'
           git add kernel/src/domain_control.rs kernel/src/domain_storage.rs \
