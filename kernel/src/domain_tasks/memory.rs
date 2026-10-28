@@ -246,58 +246,73 @@ pub(super) fn copy_to(
     }
     Ok(())
 }
-pub fn probe_user(owner: ObjectKey, address: u64, len: usize, writable: bool) -> Result<(), Error> {
-    locked(|s| {
-        let i = task_index(&s.tasks, owner)?;
-        if s.tasks[i].life == Life::Exiting {
-            return Err(Error::Stale);
-        }
+/// A bounded memory-only borrow. It cannot escape the task gate or be held
+/// across device/file work, progress callbacks, or user execution.
+pub(crate) struct UserMemoryAccess<'a> {
+    memory: &'a mut Memory<PAGES, 512>,
+    tasks: &'a [Task; TASKS],
+    remote: Option<Remote>,
+    owner: ObjectKey,
+}
+impl UserMemoryAccess<'_> {
+    pub(crate) fn probe(&mut self, address: u64, len: usize, writable: bool) -> Result<(), Error> {
         prepare(
-            &mut s.memory,
-            &s.tasks,
-            s.remote,
-            owner,
+            self.memory,
+            self.tasks,
+            self.remote,
+            self.owner,
             address,
             len,
             writable,
         )
-    })
-}
-pub fn copyin(owner: ObjectKey, address: u64, out: &mut [u8]) -> Result<(), Error> {
-    locked(|s| {
-        let i = task_index(&s.tasks, owner)?;
-        if s.tasks[i].life == Life::Exiting {
-            return Err(Error::Stale);
-        }
+    }
+    pub(crate) fn copyin(&mut self, address: u64, out: &mut [u8]) -> Result<(), Error> {
         prepare(
-            &mut s.memory,
-            &s.tasks,
-            s.remote,
-            owner,
+            self.memory,
+            self.tasks,
+            self.remote,
+            self.owner,
             address,
             out.len(),
             false,
         )?;
-        copy_from(&s.memory, &s.tasks, owner, address, out)
-    })
+        copy_from(self.memory, self.tasks, self.owner, address, out)
+    }
+    pub(crate) fn copyout(&mut self, address: u64, input: &[u8]) -> Result<(), Error> {
+        prepare(
+            self.memory,
+            self.tasks,
+            self.remote,
+            self.owner,
+            address,
+            input.len(),
+            true,
+        )?;
+        copy_to(self.memory, self.owner, address, input)
+    }
 }
-pub fn copyout(owner: ObjectKey, address: u64, input: &[u8]) -> Result<(), Error> {
+pub(crate) fn with_user_memory<R>(
+    owner: ObjectKey,
+    body: impl FnOnce(&mut UserMemoryAccess<'_>) -> Result<R, Error>,
+) -> Result<R, Error> {
     locked(|s| {
         let i = task_index(&s.tasks, owner)?;
         if s.tasks[i].life == Life::Exiting {
             return Err(Error::Stale);
         }
-        prepare(
-            &mut s.memory,
-            &s.tasks,
-            s.remote,
+        body(&mut UserMemoryAccess {
+            memory: &mut s.memory,
+            tasks: &s.tasks,
+            remote: s.remote,
             owner,
-            address,
-            input.len(),
-            true,
-        )?;
-        copy_to(&s.memory, owner, address, input)
+        })
     })
+}
+pub fn copyin(owner: ObjectKey, address: u64, out: &mut [u8]) -> Result<(), Error> {
+    with_user_memory(owner, |memory| memory.copyin(address, out))
+}
+pub fn copyout(owner: ObjectKey, address: u64, input: &[u8]) -> Result<(), Error> {
+    with_user_memory(owner, |memory| memory.copyout(address, input))
 }
 pub fn set_file_service(validate: ValidateFile, stat: StatFile) -> Result<(), Error> {
     if cpu::slot() != 0 {

@@ -313,15 +313,31 @@ fn validate_shape(address: u64, f: &Frame) -> Result<(), Error> {
     }
     Ok(())
 }
-fn validate(owner: ObjectKey, address: u64, f: &Frame) -> Result<(), Error> {
-    validate_shape(address, f)?;
-    domain_tasks::probe_user(owner, address, FRAME_BYTES, true)?;
-    let op = f.u16(OFF_OPERATION);
-    let len = f.u32(OFF_DATA_LENGTH) as usize;
-    if matches!(op, READ | WRITE | READDIR) && len != 0 {
-        domain_tasks::probe_user(owner, f.u64(OFF_DATA), len, op != WRITE)?;
-    }
-    Ok(())
+fn prepare_input(
+    owner: ObjectKey,
+    address: u64,
+    f: &mut Frame,
+    data: &mut [u8; MAX_IO],
+    copied: &mut bool,
+) -> Result<(), Error> {
+    // A stopped caller's frame, output ranges and WRITE payload form
+    // one bounded memory preflight. Do not relinquish/reacquire the shared
+    // task owner between these checks; no filesystem effect occurs here.
+    domain_tasks::with_user_memory(owner, |memory| {
+        memory.copyin(address, &mut f.bytes)?;
+        *copied = true;
+        validate_shape(address, f)?;
+        memory.probe(address, FRAME_BYTES, true)?;
+        let op = f.u16(OFF_OPERATION);
+        let len = f.u32(OFF_DATA_LENGTH) as usize;
+        if matches!(op, READ | WRITE | READDIR) && len != 0 {
+            memory.probe(f.u64(OFF_DATA), len, op != WRITE)?;
+        }
+        if op == WRITE {
+            memory.copyin(f.u64(OFF_DATA), &mut data[..len])?;
+        }
+        Ok(())
+    })
 }
 /// Only stopped, pending file requests can compete with background disk work.
 /// Inspect immutable copied frames and loaded inode/cache metadata; this does
@@ -493,11 +509,13 @@ fn deliver(owner: ObjectKey, context: &mut Context) -> Result<(), Error> {
     if pending.owner != owner || context.regs[1] != pending.address {
         return Err(Error::Busy);
     }
-    if pending.data_len != 0 {
-        let bytes = unsafe { &*core::ptr::addr_of!(DATA) };
-        domain_tasks::copyout(owner, pending.data_address, &bytes[..pending.data_len])?;
-    }
-    domain_tasks::copyout(owner, pending.address, &pending.frame.bytes)?;
+    domain_tasks::with_user_memory(owner, |memory| {
+        if pending.data_len != 0 {
+            let bytes = unsafe { &*core::ptr::addr_of!(DATA) };
+            memory.copyout(pending.data_address, &bytes[..pending.data_len])?;
+        }
+        memory.copyout(pending.address, &pending.frame.bytes)
+    })?;
     context.regs[0] = pending.frame.u64(OFF_RESULT);
     if crate::storage_fault_capture::selected(owner) {
         let bytes = unsafe { &*core::ptr::addr_of!(DATA) };
@@ -562,7 +580,11 @@ pub(crate) fn dispatch(
     let mut input = Frame {
         bytes: [0; FRAME_BYTES],
     };
-    if let Err(e) = domain_tasks::copyin(owner, address, &mut input.bytes) {
+    let data = unsafe { &mut *core::ptr::addr_of_mut!(DATA) };
+    let mut copied = false;
+    let dispatch_started = cyxia_arch_aarch64::timer::ticks();
+    let prepared = prepare_input(owner, address, &mut input, data, &mut copied);
+    if !copied && let Err(e) = prepared {
         let mut fields = diagnostic_fields(owner, &input);
         fields[4] = if retryable_before_run(e) {
             (-11i64) as u64
@@ -571,7 +593,7 @@ pub(crate) fn dispatch(
         };
         unsafe {
             let capture = &mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE);
-            if let Some(sequence) = capture.begin(cyxia_arch_aarch64::timer::ticks(), &fields) {
+            if let Some(sequence) = capture.begin(dispatch_started, &fields) {
                 capture.finish(sequence, cyxia_arch_aarch64::timer::ticks(), &fields);
             }
         }
@@ -590,12 +612,10 @@ pub(crate) fn dispatch(
     output.set_u64(OFF_WRITE_SEQ, 0);
     output.set_u64(OFF_DURABLE_SEQ, 0);
     let diagnostic_sequence = unsafe {
-        (&mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE)).begin(
-            cyxia_arch_aarch64::timer::ticks(),
-            &diagnostic_fields(owner, &input),
-        )
+        (&mut *core::ptr::addr_of_mut!(FILE_SERVICE_EVIDENCE))
+            .begin(dispatch_started, &diagnostic_fields(owner, &input))
     };
-    if let Err(e) = validate(owner, address, &input) {
+    if let Err(e) = prepared {
         output.set_u64(
             OFF_RESULT,
             if retryable_before_run(e) {
@@ -613,31 +633,6 @@ pub(crate) fn dispatch(
         output.set_u64(OFF_RESULT, errno(e) as u64);
         let _ = domain_tasks::copyout(owner, address, &output.bytes);
         return DispatchResult::Returned;
-    }
-    let data = unsafe { &mut *core::ptr::addr_of_mut!(DATA) };
-    // All user input is copied before the first filesystem effect. A lock
-    // collision here is an explicit no-effect retry and leaves the frame intact.
-    if input.u16(OFF_OPERATION) == WRITE {
-        let len = input.u32(OFF_DATA_LENGTH) as usize;
-        if let Err(e) = domain_tasks::copyin(owner, input.u64(OFF_DATA), &mut data[..len]) {
-            output.set_u64(
-                OFF_RESULT,
-                if retryable_before_run(e) {
-                    (-11i64) as u64
-                } else {
-                    errno(e) as u64
-                },
-            );
-            diagnostic_finish(diagnostic_sequence, owner, &output);
-            if retryable_before_run(e) {
-                context.regs[0] = (-11i64) as u64;
-                return DispatchResult::RetryBeforeEffect;
-            }
-            context.regs[0] = errno(e) as u64;
-            output.set_u64(OFF_RESULT, errno(e) as u64);
-            let _ = domain_tasks::copyout(owner, address, &output.bytes);
-            return DispatchResult::Returned;
-        }
     }
     let capture_selected = crate::storage_fault_capture::selected(owner);
     let capture_misses_before = if capture_selected {

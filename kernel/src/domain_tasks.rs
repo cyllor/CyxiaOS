@@ -37,8 +37,9 @@ pub use execution::{
     start_storage_client, stopped, submit_local, submit_spawn,
 };
 pub use local_evidence::bind_local_failure_request;
+pub(crate) use memory::with_user_memory;
 pub use memory::{
-    cache_read, copyin, copyout, invalidate_file, probe_user, set_cache_loader, set_file_service,
+    cache_read, copyin, copyout, invalidate_file, set_cache_loader, set_file_service,
 };
 
 const TASKS: usize = 60;
