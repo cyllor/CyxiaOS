@@ -1,6 +1,9 @@
 use core::arch::asm;
 use cyxia_prototype_cluster::abi::*;
 const SERVICE_FAULT: u64 = include!(concat!(env!("OUT_DIR"), "/service-fault.rs"));
+pub fn service_fault_enabled() -> bool {
+    SERVICE_FAULT != 0
+}
 fn page() -> *mut Shared {
     SHARED_VA as *mut Shared
 }
