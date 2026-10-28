@@ -1,1 +1,0 @@
-Validation trigger for the borrowed-candidate stack fix commit 8613a4a4b655c3c539a6748a3714bebf0f5ffa99.

@@ -1,2 +1,0 @@
-Validate native replay credit settlement and single-node service restart scope.
-Source commit: 5201968e931c8948f4f277700c771b1e89143acd
