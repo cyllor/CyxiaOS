@@ -1168,6 +1168,9 @@ pub(super) fn stop_turn(worker: &mut Worker) {
         if !native::stop_ready(worker) {
             return;
         }
+        if !crate::domain_tasks::retire_cpu_capture(2) {
+            return;
+        }
         // Control-job cleanup already owns its P credit/capture. The local
         // task/IRQ/PTE stop and its acknowledgement are separate E_action CPU.
         native::measure_stop_tail(operation, || stop_action_tail(worker, operation));

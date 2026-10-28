@@ -2,10 +2,19 @@
 //! unstarted cancellation. No new dispatch may replace a retained custodian.
 use super::cancellation::Binding;
 use super::*;
+enum Phase {
+    Active,
+    Completed {
+        binding: Binding,
+        first: u64,
+        last: u64,
+    },
+    Cancelled(Cancellation),
+}
 struct Captured {
     binding: Binding,
     poisoned: bool,
-    cancellation: Option<Cancellation>,
+    phase: Phase,
     refund: Option<CpuDebit>,
     owner: Option<crate::learning_evidence::OwnerAttempt>,
     warm: Option<crate::learning_prewarm::Attempt>,
@@ -40,7 +49,7 @@ pub(super) fn track(
                 thread: credit.thread,
                 cpu: slot,
             },
-            cancellation: None,
+            phase: Phase::Active,
             refund: None,
             owner: crate::learning_evidence::attempt_work(credit.thread, credit.optional)
                 .ok()
@@ -52,26 +61,61 @@ pub(super) fn track(
 }
 pub(super) fn finish(slot: usize, first: u64, last: u64) {
     let cell = cell(slot);
-    if cell.as_ref().is_some_and(|c| c.cancellation.is_some()) {
-        // A cancelled physical reservation can never supply a body interval.
+    let Some(capture) = cell.as_mut() else {
+        return;
+    };
+    // A second finish cannot rewrite completed times, repeat warm billing or
+    // manufacture work from an unstarted cancellation. Keep the cell occupied
+    // throughout callbacks; these paths never invoke progress or wait.
+    if !matches!(capture.phase, Phase::Active) {
         return;
     }
-    if let Some(mut capture) = cell.take() {
-        if let Some(mut warm) = capture.warm.take() {
-            let _ = crate::learning_prewarm::finish(&mut warm, first, last);
-        }
-        if let Some(mut owner) = capture.owner.take() {
-            let _ = crate::learning_evidence::finish_attempt(&mut owner, first, last);
-        }
+    capture.phase = Phase::Completed {
+        binding: capture.binding,
+        first,
+        last,
+    };
+    if let Some(mut warm) = capture.warm.take() {
+        let _ = crate::learning_prewarm::finish(&mut warm, first, last);
     }
+    if finish_completed(capture, matches!(slot, 2 | 3)) {
+        *cell = None;
+    }
+}
+fn finish_completed(capture: &mut Captured, retain: bool) -> bool {
+    let Phase::Completed {
+        binding,
+        first,
+        last,
+    } = &capture.phase
+    else {
+        return false;
+    };
+    if capture.poisoned || *binding != capture.binding || binding.cpu != cpu::slot() {
+        return false;
+    }
+    if let Some(owner) = capture.owner.as_mut() {
+        let result = crate::learning_evidence::finish_attempt(owner, *first, *last);
+        if retain
+            && result == Err(crate::learning_evidence::Error::Busy)
+            && owner.retryable_completion()
+        {
+            return false;
+        }
+        // Terminal failures retain their ordinary loss rules. CPU0 continues
+        // using the shared handoff so a suspended collector's I/O progress does
+        // not wait for itself. Business CPU2/3 keep Busy in this original cell.
+        capture.owner = None;
+    }
+    true
 }
 /// Caller has just successfully cancelled this exact physical dispatch while
 /// holding the task gate. Refund remains owned here until it succeeds.
 pub(super) fn cancelled(slot: usize, dispatch: Dispatch, refund: Option<CpuDebit>) {
     let proof = Cancellation::new(dispatch);
     if let Some(capture) = cell(slot).as_mut() {
-        if capture.cancellation.is_none() {
-            capture.cancellation = Some(proof);
+        if matches!(capture.phase, Phase::Active) {
+            capture.phase = Phase::Cancelled(proof);
             capture.refund = refund;
         }
     } else {
@@ -80,7 +124,7 @@ pub(super) fn cancelled(slot: usize, dispatch: Dispatch, refund: Option<CpuDebit
         *cell(slot) = Some(Captured {
             poisoned: true,
             binding: proof.binding,
-            cancellation: Some(proof),
+            phase: Phase::Cancelled(proof),
             refund,
             owner: None,
             warm: None,
@@ -93,7 +137,14 @@ pub(super) fn retire(slot: usize) -> bool {
     let Some(capture) = cell(slot).as_mut() else {
         return true;
     };
-    let Some(proof) = capture.cancellation.as_ref() else {
+    if matches!(capture.phase, Phase::Completed { .. }) {
+        if !finish_completed(capture, true) {
+            return false;
+        }
+        *cell(slot) = None;
+        return true;
+    }
+    let Phase::Cancelled(proof) = &capture.phase else {
         return false;
     };
     if capture.poisoned || proof.binding != capture.binding {

@@ -29,11 +29,14 @@ class UnstartedCapture(unittest.TestCase):
                           'fn throttle(', 'fn refresh_throttled(', 'pub fn begin_builtin(',
                           'fn revalidate_unstarted(', 'pub fn revalidate_service_segment()',
                           'pub(crate) struct PaidServiceWitness', 'fn service_witness_locked(',
-                          'pub fn authorize_service_turn()']:
+                          'pub fn authorize_service_turn()', 'pub fn complete_builtin(']:
             body = function(source, signature)
             if signature == 'pub struct Credit':
                 body = '#[derive(Clone, Copy)]\n' + body
             pieces.append(body)
+        for signature in ['pub fn close_cpu(', 'pub fn quiescent(']:
+            if signature in source:
+                pieces.append(function(source, signature))
         capture_start = min(source.index('#[path = "domain_tasks/capture_credit.rs"]'),
                             source.index('#[path = "domain_tasks/cancellation.rs"]'))
         capture = source[capture_start:source.index('fn throttle(')]
@@ -63,8 +66,47 @@ class UnstartedCapture(unittest.TestCase):
         program = template.replace('// PRODUCTION_BODIES', '\n'.join(pieces)).replace(
             '// WARM_PLATFORM_FIXTURES', platform).replace('// EVIDENCE_MODULES', modules).replace(
             '// PEER_FIXTURE', 'mod peer_replay {\n' + peer + '\n}')
+        runtime = (ROOT / 'kernel/src/prototype_runtime.rs').read_text()
+        tail = function(runtime, 'fn stop_action_tail(')
+        tail = tail[:tail.index('    worker.context = None;')] + '''
+    // Hardware timer/GIC/TLB tail is outside this host fixture. Retain the
+    // actual task/retirement prefix and stop_turn that decides entry to it.
+    worker.context = None;
+    STOP_TASK_ACK.store(operation, Ordering::Release);
+    STOP_ACK.store(operation, Ordering::Release);
+}
+'''
+        disabled = function((ROOT / 'kernel/src/smp.rs').read_text(), 'if !view.enabled {')
+        program = program.replace('// STOP_BODIES', function(runtime, 'pub(super) fn stop_turn(') + '\n' + tail)
+        program = program.replace('// DISABLED_BRANCH', disabled)
+        program = program.replace('// LOCAL_RETIRE_EXPORT',
+            'pub(crate) use super::retire_cpu_capture;' if 'fn retire_cpu_capture(' in source else '')
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
+            evidence_path = directory / 'learning_evidence.rs'
+            evidence_path.write_text((ROOT / 'kernel/src/learning_evidence.rs').read_text().replace(
+                '"learning_evidence/', '"' + str(ROOT / 'kernel/src/learning_evidence') + '/') + '''
+pub fn host_with_collector(f: impl FnOnce()) { let _guard = lock().unwrap(); f(); }
+pub fn host_completion(attempt: &OwnerAttempt) -> Option<(u64,u64)> { attempt.measured }
+pub fn host_handoff() -> [u64;32] { handoff::host_snapshot() }
+pub fn host_drain() { for _ in 0..16 { handoff::drain(1); } }
+''')
+            handoff_path = directory / 'handoff.rs'
+            handoff_path.write_text((ROOT / 'kernel/src/learning_evidence/handoff.rs').read_text() + '''
+pub(super) fn host_snapshot() -> [u64;32] {
+    core::array::from_fn(|i| REPLAY_CAPTURE_EVIDENCE.0[i].load(Ordering::Acquire))
+}
+''')
+            evidence_path.write_text(evidence_path.read_text().replace(
+                str(ROOT / 'kernel/src/learning_evidence/handoff.rs'), str(handoff_path)))
+            warm_path = directory / 'learning_prewarm.rs'
+            warm_path.write_text((ROOT / 'kernel/src/learning_prewarm.rs').read_text() + '''
+pub fn host_counts() -> (usize,usize,bool) {
+    (OPEN.load(Ordering::Acquire), HEAD[3].load(Ordering::Acquire), LOST.load(Ordering::Acquire))
+}
+''')
+            program = program.replace(str(ROOT / 'kernel/src/learning_evidence.rs'), str(evidence_path))
+            program = program.replace(str(ROOT / 'kernel/src/learning_prewarm.rs'), str(warm_path))
             original_capture = ROOT / 'kernel/src/domain_tasks/capture_credit.rs'
             capture_path = directory / 'capture_credit.rs'
             capture_path.write_text(original_capture.read_text() + '\n' +
@@ -75,7 +117,9 @@ class UnstartedCapture(unittest.TestCase):
                 '[package]\nname="unstarted-custody"\nversion="0.1.0"\nedition="2024"\n'
                 '[[bin]]\nname="custody"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='
                 + json.dumps(str(ROOT / 'crates/prototype')) + '}\ncyxia-peer-billing={path='
-                + json.dumps(str(ROOT / 'crates/peer-billing')) + '}\nsha2="=0.10.9"\n[workspace]\n')
+                + json.dumps(str(ROOT / 'crates/peer-billing')) + '}\ncyxia-kernel-core={path='
+                + json.dumps(str(ROOT / 'crates/kernel-core')) + '}\nsha2="=0.10.9"\n'
+                '[features]\ndefault=["unified-runtime","prototype-runtime"]\nunified-runtime=[]\nprototype-runtime=[]\n[workspace]\n')
             command = [str(RUST_BIN / 'cargo'), 'run', '--offline',
                 '--manifest-path', str(directory / 'Cargo.toml'), '--target-dir',
                 str(ROOT / 'target/host-unstarted-custody'), '--bin', 'custody']
@@ -83,6 +127,58 @@ class UnstartedCapture(unittest.TestCase):
                 cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('all cancellation custodians passed', result.stdout)
+            completed_env = env()
+            completed_env['CYXIA_COMPLETED_TEST'] = '1'
+            completed = subprocess.run(command, cwd=ROOT, env=completed_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn('completed dispatch custody passed', completed.stdout)
+            stop_env = env()
+            stop_env['CYXIA_COMPLETED_TEST'] = 'stop'
+            stopped = subprocess.run(command, cwd=ROOT, env=stop_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertIn('disabled CPU2 completion custody passed', stopped.stdout)
+            stop_guard = '''        if !crate::domain_tasks::retire_cpu_capture(2) {
+            return;
+        }
+'''
+            self.assertEqual(program.count(stop_guard), 1)
+            (directory / 'harness.rs').write_text(program.replace(stop_guard, ''))
+            negative = subprocess.run(command, cwd=ROOT, env=stop_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('disabled CPU2 acknowledged stop', negative.stdout + negative.stderr)
+            (directory / 'harness.rs').write_text(program)
+            capture_text = capture_path.read_text()
+            retirement = function(capture_text, 'pub(super) fn retire(')
+            guard = 'if !finish_completed(capture, true)'
+            self.assertEqual(retirement.count(guard), 1)
+            capture_path.write_text(capture_text.replace(retirement, retirement.replace(guard, 'if false')))
+            negative = subprocess.run(command, cwd=ROOT, env=completed_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('completed token allowed a new grant', negative.stdout + negative.stderr)
+            capture_path.write_text(capture_text)
+            original_builtin = function(program, 'pub fn begin_builtin(')
+            first_settlement = '''    if COMPLETE_READY[slot].load(Ordering::Acquire) {
+        let _ = locked(|s| complete_locked(s, slot));
+    }
+'''
+            self.assertEqual(original_builtin.count(first_settlement), 1)
+            (directory / 'harness.rs').write_text(program.replace(original_builtin,
+                original_builtin.replace(first_settlement, '')))
+            negative = subprocess.run(command, cwd=ROOT, env=completed_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('capture Busy prevented original Scheduler settlement', negative.stdout + negative.stderr)
+            (directory / 'harness.rs').write_text(program)
+            capture_path.write_text(capture_text.replace('*binding != capture.binding', 'false'))
+            negative = subprocess.run(command, cwd=ROOT, env=completed_env,
+                capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
+            self.assertIn('mismatched retained identity', negative.stdout + negative.stderr)
+            capture_path.write_text(capture_text)
             for signature, failure in [
                 ('pub fn begin_service_segment()', 'service did not retire cancelled custody'),
                 ('pub fn begin_builtin(', 'builtin did not retire cancelled custody'),

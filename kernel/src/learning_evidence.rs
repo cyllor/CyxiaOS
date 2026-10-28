@@ -757,7 +757,7 @@ impl OwnerAttempt {
 }
 impl Drop for OwnerAttempt {
     fn drop(&mut self) {
-        if self.pending && self.validated && !self.invalid && self.retry.is_some() {
+        if self.retryable_completion() {
             if handoff::retain(self) {
                 return;
             }
@@ -767,6 +767,13 @@ impl Drop for OwnerAttempt {
         } else {
             self.lose();
         }
+    }
+}
+impl OwnerAttempt {
+    /// A real validated completion whose exact token and times remain owned.
+    /// This predicate supplies custody information, never execution authority.
+    pub(crate) fn retryable_completion(&self) -> bool {
+        self.pending && self.validated && !self.invalid && self.retry.is_some()
     }
 }
 pub fn attempt(owner: ObjectKey, class: CpuClass) -> Result<Option<OwnerAttempt>, Error> {

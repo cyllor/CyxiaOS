@@ -806,6 +806,19 @@ fn track_credit(
 fn finish_capture(slot: usize, first: u64, last: u64) {
     capture_credit::finish(slot, first, last);
 }
+/// The actual stopping CPU must retire its own capture before acknowledging
+/// a role change. A remote quiescence query cannot access this private cell.
+/// Physical settlement is independent; collector/peer retries run only after
+/// releasing the task gate and never wait or invoke progress.
+pub(crate) fn retire_cpu_capture(slot: usize) -> bool {
+    if slot >= 64 || cpu::slot() != slot {
+        return false;
+    }
+    if COMPLETE_READY[slot].load(Ordering::Acquire) {
+        let _ = locked(|s| complete_locked(s, slot));
+    }
+    capture_credit::retire(slot)
+}
 fn throttle(s: &mut State, key: ObjectKey, now: u64) {
     if let Some(slot) = s
         .throttled
@@ -840,6 +853,13 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
     if !READY.load(Ordering::Acquire) || slot >= 64 || cpu::slot() != slot {
         return None;
     }
+    // Captured completion may remain blocked on an independent collector.
+    // Settle the original physical bill first, outside capture retirement;
+    // neither custody may overwrite the other or repeat its work. Release the
+    // task gate before touching collector/peer owners.
+    if COMPLETE_READY[slot].load(Ordering::Acquire) {
+        let _ = locked(|s| complete_locked(s, slot));
+    }
     if !capture_credit::retire(slot) {
         return None;
     }
@@ -851,6 +871,7 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
             }
             if s.draining & (1u64 << slot) != 0
                 || s.active[slot].is_some()
+                || COMPLETE_READY[slot].load(Ordering::Acquire)
                 || !capture_credit::available(slot)
             {
                 return Ok(None);
