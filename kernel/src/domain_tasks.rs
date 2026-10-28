@@ -15,6 +15,8 @@ mod deadline;
 mod execution;
 #[path = "domain_tasks/memory.rs"]
 mod memory;
+#[path = "domain_tasks/owner_gate.rs"]
+mod owner_gate;
 #[path = "domain_tasks/publication.rs"]
 mod publication;
 #[path = "domain_tasks/service_authority.rs"]
@@ -107,7 +109,7 @@ const SELFTEST_ENABLED: bool = include!(concat!(env!("OUT_DIR"), "/domain-selfte
 struct Page([u8; 4096]);
 static mut POOL: [Page; PAGES] = [const { Page([0; 4096]) }; PAGES];
 static mut CONTEXTS: [user::Context; TASKS] = [const { user::Context::empty() }; TASKS];
-static LOCK: AtomicBool = AtomicBool::new(false);
+static LOCK: owner_gate::Gate = owner_gate::Gate::new();
 static READY: AtomicBool = AtomicBool::new(false);
 static CACHE_EPOCH: AtomicU64 = AtomicU64::new(1);
 static CREDIT_KIND: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
@@ -494,16 +496,30 @@ const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;
 // entry/exit and input setup are indivisible fixed costs, and the existing
 // scheduler completion path will make the task runnable in the next window.
 const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 10_000_000;
-struct Guard;
+struct Guard {
+    permit: Option<owner_gate::Permit<'static>>,
+}
 impl Drop for Guard {
     fn drop(&mut self) {
-        LOCK.store(false, Ordering::Release);
+        // Four fixed 250 us heartbeat opportunities, not a runtime budget. An
+        // offline/descheduled waiter cannot reserve shared ownership forever.
+        self.permit.take().unwrap().release(timer::ticks());
     }
 }
+fn acquire_guard() -> Result<Guard, Error> {
+    let permit = LOCK
+        .try_acquire(
+            cpu::slot(),
+            timer::ticks(),
+            (timer::frequency() / 1000).max(1),
+        )
+        .ok_or(Error::Busy)?;
+    Ok(Guard {
+        permit: Some(permit),
+    })
+}
 fn locked<R>(f: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
-    LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .map_err(|_| Error::Busy)?;
-    let _guard = Guard;
+    let _guard = acquire_guard()?;
     unsafe { f(&mut *core::ptr::addr_of_mut!(STATE)) }
 }
 pub fn now_ns() -> u64 {

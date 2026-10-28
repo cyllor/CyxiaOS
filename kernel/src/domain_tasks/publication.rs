@@ -32,9 +32,7 @@ pub(crate) fn reserve_baseline_publication(
     if cpu::slot() != 0 || !owns(action) {
         return Ok(None);
     }
-    LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .map_err(|_| Error::Busy)?;
-    let guard = Guard;
+    let guard = acquire_guard()?;
     let state = unsafe { &*core::ptr::addr_of!(STATE) };
     service_witness_locked(state)?;
     Ok(Some(BaselinePublication {

@@ -69,6 +69,12 @@ fn lock() -> Result<Guard, Error> {
         .map_err(|_| Error::Busy)?;
     Ok(Guard)
 }
+// This facade controls the Registry race with bare exclusion; the actual
+// native handoff/guard and publication acquisition execute in the separate
+// task_owner_handoff host harness.
+fn acquire_guard() -> Result<Guard, Error> {
+    lock()
+}
 fn reset(service_started: u64) {
     assert!(!LOCK.load(Ordering::Acquire));
     cpu::set(0);
