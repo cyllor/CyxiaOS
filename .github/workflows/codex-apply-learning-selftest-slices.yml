@@ -55,37 +55,44 @@ jobs:
           replace_once(
               Path('crates/prototype/src/learning/train.rs'),
               'const VECTORS: [(i16, i8, i32, i64, i64, i64, i64, i8, i32, i64); 4] = [',
-              '''type OperatorVector = (i16, i8, i32, i64, u64, i64, u64, i8, i32, i64);
-              const VECTORS: [OperatorVector; 4] = [''',
+              'type OperatorVector = (i16, i8, i32, i64, u64, i64, u64, i8, i32, i64);\n    const VECTORS: [OperatorVector; 4] = [',
               'learning vector type declaration',
           )
           replace_once(
               Path('crates/prototype/tests/support/learning.rs'),
-              '''            let mut raw = RawFeatures::default();
-              raw.control_capacity = Some(if let Action::ControlSet(mask) = action {
-                  u64::from(mask.count_ones()) * 1000
-              } else {
-                  1000
-              });''',
-              '''            let raw = RawFeatures {
-                  control_capacity: Some(if let Action::ControlSet(mask) = action {
-                      u64::from(mask.count_ones()) * 1000
-                  } else {
-                      1000
-                  }),
-                  ..RawFeatures::default()
-              };''',
+              '\n'.join([
+                  '            let mut raw = RawFeatures::default();',
+                  '            raw.control_capacity = Some(if let Action::ControlSet(mask) = action {',
+                  '                u64::from(mask.count_ones()) * 1000',
+                  '            } else {',
+                  '                1000',
+                  '            });',
+              ]),
+              '\n'.join([
+                  '            let raw = RawFeatures {',
+                  '                control_capacity: Some(if let Action::ControlSet(mask) = action {',
+                  '                    u64::from(mask.count_ones()) * 1000',
+                  '                } else {',
+                  '                    1000',
+                  '                }),',
+                  '                ..RawFeatures::default()',
+                  '            };',
+              ]),
               'RawFeatures initializer',
           )
           replace_once(
               Path('crates/prototype/tests/domain_policy_model_change.rs'),
-              '''    let prepared = registry.prepare_model_change(publisher(), next).unwrap();
-              assert_eq!(prepared.binding(), next);
-              drop(prepared);''',
-              '''    {
-                  let prepared = registry.prepare_model_change(publisher(), next).unwrap();
-                  assert_eq!(prepared.binding(), next);
-              }''',
+              '\n'.join([
+                  '    let prepared = registry.prepare_model_change(publisher(), next).unwrap();',
+                  '    assert_eq!(prepared.binding(), next);',
+                  '    drop(prepared);',
+              ]),
+              '\n'.join([
+                  '    {',
+                  '        let prepared = registry.prepare_model_change(publisher(), next).unwrap();',
+                  '        assert_eq!(prepared.binding(), next);',
+                  '    }',
+              ]),
               'prepared model change scope',
           )
           PY
