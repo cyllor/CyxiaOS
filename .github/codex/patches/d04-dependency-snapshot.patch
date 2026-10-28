@@ -1,0 +1,256 @@
+--- a/kernel/src/domain_control.rs
++++ b/kernel/src/domain_control.rs
+@@ -253,6 +253,11 @@
+     PreparationRejections([const { core::sync::atomic::AtomicU64::new(0) }; 648]);
+ pub use cyxia_prototype::policy::{BoundDependency, Prerequisite};
+ type DependencyResolver = fn(ObjectKey) -> Result<[Option<Prerequisite>; 2], Error>;
++/// Optional control-preparation projection. It must perform the same owner,
++/// current-action, legality and admission checks as the generic path while
++/// collapsing repeated immutable owner reads into one bounded snapshot.
++type DependencyBinder =
++    fn(ObjectKey, u64) -> Result<[Option<BoundDependency>; 2], Error>;
+ type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
+ static ADMISSION: dependencies::AdmissionView = dependencies::AdmissionView::new();
+ static DEPENDENCY_RESOLVERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+@@ -313,6 +318,7 @@
+     prepared_count: usize,
+     poll_cursor: usize,
+     dependencies: [Option<DependencyResolver>; 16],
++    dependency_binders: [Option<DependencyBinder>; 16],
+     execution_observers: [Option<ExecutionObserver>; 16],
+ }
+ #[derive(Clone, Copy)]
+@@ -405,6 +411,7 @@
+         prepared_count: 0,
+         poll_cursor: 0,
+         dependencies: [None; 16],
++        dependency_binders: [None; 16],
+         execution_observers: [None; 16],
+     },
+     boot: 0,
+@@ -601,6 +608,26 @@
+         Ok(())
+     })
+ }
++/// Register a control-only collapsed dependency projection. The ordinary
++/// executor resolver remains authoritative for hot-path admission and is not
++/// replaced by this optimization.
++pub fn register_dependency_binder(consumer: u16, binder: DependencyBinder) -> Result<(), Error> {
++    if !matches!(consumer, 1 | 4 | 8 | 10) {
++        return Err(Error::Unsupported);
++    }
++    with(|s| {
++        let slot = &mut s.owner.dependency_binders[usize::from(consumer - 1)];
++        if let Some(old) = *slot {
++            return if core::ptr::fn_addr_eq(old, binder) {
++                Ok(())
++            } else {
++                Err(Error::Conflict)
++            };
++        }
++        *slot = Some(binder);
++        Ok(())
++    })
++}
+ /// Confirm the exact APPLIED version to the owner of real resource grants.
+ /// The callback must be idempotent and nonblocking. Busy/Again/NotReady retain
+ /// the receipt for retry; another policy for this object cannot replace it.
+@@ -686,7 +713,11 @@
+     if !matches!(action.domain(), 1 | 4 | 8 | 10) || matches!(action, Action::ControlSet(_)) {
+         return Ok([None; 2]);
+     }
+-    let resolver = owner.dependencies[usize::from(action.domain() - 1)].ok_or(Error::NotReady)?;
++    let dependency_slot = usize::from(action.domain() - 1);
++    if let Some(binder) = owner.dependency_binders[dependency_slot] {
++        return binder(target, at);
++    }
++    let resolver = owner.dependencies[dependency_slot].ok_or(Error::NotReady)?;
+     bind_dependency_list(
+         owner,
+         action,
+--- a/kernel/src/domain_storage.rs
++++ b/kernel/src/domain_storage.rs
+@@ -209,6 +209,17 @@
+         Ok(view.cache)
+     })
+ }
++/// One coherent control-plane projection for D03 dependency validation. It
++/// carries the exact cache partition and immutable physical backing from the
++/// same published file-owner view.
++pub(crate) fn cache_dependency_view(now: u64) -> Result<([u64; 4], (u64, u32)), Error> {
++    file_view(now, |view| {
++        if view.cache_until.is_some_and(|until| now >= until) {
++            return Err(Error::Busy);
++        }
++        Ok((view.cache, view.backing.ok_or(Error::NotReady)?))
++    })
++}
+ pub fn cache_backing() -> Result<(u64, u32), Error> {
+     ready_read()?;
+     // The static physical span cannot change during this boot. Startup may
+@@ -867,6 +878,7 @@
+ }
+ pub fn register_control() -> Result<(), Error> {
+     crate::domain_control::register_dependencies(4, dependencies)?;
++    crate::domain_control::register_dependency_binder(4, control_dependencies)?;
+     for domain in [4, 9, 11] {
+         crate::domain_control::register(crate::domain_control::Family {
+             domain,
+@@ -888,6 +900,50 @@
+     Ok(())
+ }
+ 
++fn control_dependencies(
++    key: ObjectKey,
++    at: u64,
++) -> Result<[Option<crate::domain_control::BoundDependency>; 2], Error> {
++    ready_read()?;
++    if enumerate_target(4, 0) != Some(key) {
++        return Err(Error::Stale);
++    }
++    let memory = crate::domain_tasks::control_cache_dependency(at)?;
++    let disk = control_io_dependency(at)?;
++    let memory_version = crate::domain_control::admit_dependency(memory, 4, at)?;
++    let disk_version = crate::domain_control::admit_dependency(disk, 4, at)?;
++    Ok([
++        Some(crate::domain_control::BoundDependency {
++            prerequisite: memory,
++            version: memory_version,
++        }),
++        Some(crate::domain_control::BoundDependency {
++            prerequisite: disk,
++            version: disk_version,
++        }),
++    ])
++}
++
++fn control_io_dependency(at: u64) -> Result<crate::domain_control::Prerequisite, Error> {
++    ready_read()?;
++    let disk = enumerate_target(9, 0).ok_or(Error::NotReady)?;
++    let (action, capacity, failed) = storage::io_dependency_view(at)?;
++    action.validate()?;
++    if !matches!(action, Action::IoShare(_)) {
++        return Err(Error::Conflict);
++    }
++    if capacity < 2 {
++        return Err(Error::Capacity);
++    }
++    if failed != 0 {
++        return Err(Error::Io);
++    }
++    Ok(crate::domain_control::Prerequisite {
++        domain: 9,
++        target: disk,
++    })
++}
++
+ fn dependencies(key: ObjectKey) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error> {
+     ready_read()?;
+     if enumerate_target(4, 0) != Some(key) {
+--- a/kernel/src/domain_tasks.rs
++++ b/kernel/src/domain_tasks.rs
+@@ -1778,6 +1778,55 @@
+ }
+ /// Identity of the initialized physical cache partition owner, including its
+ /// baseline policy before the controller publishes any desired version.
++/// Validate the current D03 owner and its file-cache partition from one task
++/// gate acquisition and one coherent file-owner projection. This is used only
++/// while binding a control proposal; executor admission still calls the normal
++/// dependency resolver and revalidates the actual owners.
++pub(crate) fn control_cache_dependency(
++    at: u64,
++) -> Result<crate::domain_control::Prerequisite, Error> {
++    if !READY.load(Ordering::Acquire) {
++        return Err(Error::NotReady);
++    }
++    locked(|s| {
++        let (pages, batch) = s.memory.cache_policy(at);
++        let action = Action::Cache { pages, batch };
++        action.validate()?;
++        let authorized = s.memory.cache_authorized_pages(at);
++        let grant = (pages / 4).min(256);
++        let (cache, (file_base, file_pages)) =
++            crate::domain_storage::cache_dependency_view(at)?;
++        let (task_base, task_pages) = memory_backing()?;
++        let task_end = task_base
++            .checked_add(u64::from(task_pages) * 4096)
++            .ok_or(Error::Overflow)?;
++        let file_end = file_base
++            .checked_add(u64::from(file_pages) * 4096)
++            .ok_or(Error::Overflow)?;
++        if authorized > pages as usize
++            || cache[2] != u64::from(pages).saturating_sub(authorized as u64)
++            || cache[0] > cache[3]
++            || cache[2] > cache[3]
++            || authorized > PAGES - TABLE_PAGES - CODE_PAGES - 32
++            || !file_base.is_multiple_of(4096)
++            || file_pages == 0
++            || u64::from(file_pages) != cache[3]
++            || (task_base < file_end && file_base < task_end)
++        {
++            return Err(Error::NotReady);
++        }
++        if grant as usize > PAGES - TABLE_PAGES - CODE_PAGES - 32
++            || u64::from(pages - grant) > cache[3]
++        {
++            return Err(Error::Budget);
++        }
++        Ok(crate::domain_control::Prerequisite {
++            domain: 3,
++            target: MEMORY_KEY,
++        })
++    })
++}
++
+ pub fn memory_key() -> Result<ObjectKey, Error> {
+     let (base, pages) = memory_backing()?;
+     if base & 4095 != 0 || pages == 0 {
+--- a/kernel/src/prototype_storage.rs
++++ b/kernel/src/prototype_storage.rs
+@@ -825,6 +825,11 @@
+ pub fn current_io_action(now: u64) -> Result<Action, DomainError> {
+     control_view(now, |view| view.io)
+ }
++/// Return the current D09 action, negotiated capacity and failure flag from a
++/// single immutable control snapshot for dependency binding.
++pub fn io_dependency_view(now: u64) -> Result<(Action, u64, u64), DomainError> {
++    control_view(now, |view| (view.io, view.facts[2], view.facts[31]))
++}
+ pub fn current_notify_batch(now: u64) -> Result<u8, DomainError> {
+     control_view(now, |view| view.notify)
+ }
+--- /dev/null
++++ b/tests/host/test_v13_dependency_projection.py
+@@ -0,0 +1,32 @@
++import pathlib
++import unittest
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++
++
++class DependencyProjectionTests(unittest.TestCase):
++    def test_d04_control_projection_does_not_replace_executor_resolver(self):
++        control = (ROOT / "kernel/src/domain_control.rs").read_text()
++        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
++        self.assertIn("register_dependencies(4, dependencies)", storage)
++        self.assertIn("register_dependency_binder(4, control_dependencies)", storage)
++        self.assertIn("owner.dependency_binders[dependency_slot]", control)
++        self.assertIn("DEPENDENCY_RESOLVERS", control)
++        self.assertIn("admit_dependencies(consumer: u16", control)
++
++    def test_collapsed_projection_revalidates_both_real_owners(self):
++        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
++        tasks = (ROOT / "kernel/src/domain_tasks.rs").read_text()
++        device = (ROOT / "kernel/src/prototype_storage.rs").read_text()
++        self.assertIn("control_cache_dependency(at)", storage)
++        self.assertIn("control_io_dependency(at)", storage)
++        self.assertEqual(storage.count("admit_dependency(memory, 4, at)"), 1)
++        self.assertEqual(storage.count("admit_dependency(disk, 4, at)"), 1)
++        self.assertIn("cache_dependency_view(at)", tasks)
++        self.assertIn("cache_authorized_pages(at)", tasks)
++        self.assertIn("io_dependency_view(at)", storage)
++        self.assertIn("view.io, view.facts[2], view.facts[31]", device)
++
++
++if __name__ == "__main__":
++    unittest.main()
