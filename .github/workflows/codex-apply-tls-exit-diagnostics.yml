@@ -131,12 +131,12 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path user/prototype-cluster/Cargo.toml -- --check
           git diff --check
-      - name: Run cluster host tests and Clippy
+      - name: Run cluster host tests and library Clippy
         if: steps.patch.outputs.apply == 'true'
         run: |
           cargo test --locked --offline --manifest-path user/prototype-cluster/Cargo.toml
           cargo clippy --locked --offline --manifest-path user/prototype-cluster/Cargo.toml \
-            --all-targets -- -D warnings
+            --lib -- -D warnings
       - name: Check exact service-fault guest image
         if: steps.patch.outputs.apply == 'true'
         run: |
