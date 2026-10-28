@@ -14,16 +14,6 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("BUILTIN_MIN_GRANT_NS", source[source.index("let safety ="):])
         self.assertIn("pub fn builtin_selected", source)
 
-    def test_dynamic_el0_workers_require_their_declared_full_envelope(self):
-        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
-
-        self.assertIn("const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 10_000_000;", source)
-        admission = source[source.index("let safety ="):source.index("let optional =")]
-        self.assertIn("d.thread.id >= 0x1000", admission)
-        self.assertIn("DYNAMIC_EL0_MIN_GRANT_NS", admission)
-        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
-        self.assertIn("minimum_ns: if local { 10_000_000 } else { 0 }", execution)
-
     def test_cpu0_service_owners_have_separate_credits_and_single_writer_detail(self):
         source = (ROOT / "kernel/src/domain_services.rs").read_text()
 

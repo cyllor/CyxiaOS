@@ -491,11 +491,11 @@ const BUILTIN_WINDOW_HEADROOM_NS: u64 = 20_000_000;
 // exhausted before QEMU delivers the timer PPI, so leave it undispatched for
 // the next budget window instead of creating an unavoidable overrun.
 const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;
-// A dynamic EL0 task declares the same 10 ms minimum execution envelope when
-// admitted. Do not enter it on a smaller window-tail grant: the exception
-// entry/exit and input setup are indivisible fixed costs, and the existing
-// scheduler completion path will make the task runnable in the next window.
-const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 10_000_000;
+// One EL0 entry must fit even the admitted 1 ms ordinary-task profile. A
+// thread's 10 ms window entitlement/guarantee is not an indivisible entry:
+// short syscall returns may resume against its remaining exact credit.
+// Smaller tails still defer, and actual overruns retain strict quarantine.
+const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 1_000_000;
 struct Guard {
     permit: Option<owner_gate::Permit<'static>>,
 }
