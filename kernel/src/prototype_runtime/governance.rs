@@ -21,6 +21,8 @@ use cyxia_prototype::{
     },
 };
 use sha2::{Digest, Sha256};
+#[path = "governance/outcome.rs"]
+mod outcome;
 
 const CODE_BASE: u64 = 0x80000;
 const CODE_LIMIT: u64 = 0x100000;
@@ -383,8 +385,6 @@ pub fn registration() -> Result<Registration, Error> {
 const RUNTIME_MAGIC: u64 = 0x4359_4752_554e_0001;
 const RUNTIME_VERSION: u64 = 1;
 const RUNTIME_PREPAY_NS: u64 = 2_500_000;
-const RUNTIME_SLICE_NS: u64 = 100_000;
-const RUNTIME_PROBE_SLICE_NS: u64 = 20_000_000;
 const COMMAND_DEADLINE_NS: u64 = 50_000_000;
 const PHASE_INPUT_PROBE: u64 = 1;
 const PHASE_CODE_PROBE: u64 = 2;
@@ -769,14 +769,7 @@ fn run_runtime_context(runtime: &mut Runtime, resources: &Resources) -> Result<(
     if !acquire_runtime_pins(runtime, resources)? {
         return Ok(());
     }
-    let slice = if matches!(
-        runtime.phase,
-        PHASE_INPUT_PROBE | PHASE_CODE_PROBE | PHASE_UNMAPPED_PROBE
-    ) {
-        RUNTIME_PROBE_SLICE_NS
-    } else {
-        RUNTIME_SLICE_NS
-    };
+    let slice = outcome::entry_slice_ns(mode)?;
     let context = runtime.context.as_mut().ok_or(Error::Conflict)?;
     context.kind = 0;
     unsafe {
@@ -937,6 +930,17 @@ fn settle_runtime_bill(runtime: &mut Runtime) -> bool {
         }
     }
 }
+
+/// A completed coordinator turn still owns its physical credit until exact
+/// settlement succeeds. Mandatory input becoming ready must not bypass that
+/// old bill: it would otherwise keep the same control CPU permanently busy.
+pub(super) fn settle() -> bool {
+    if cpu::slot() != 1 || !INITIALIZED.load(Ordering::Acquire) {
+        return true;
+    }
+    settle_runtime_bill(runtime_state())
+}
+
 fn perform_runtime_turn(
     runtime: &mut Runtime,
     resources: &Resources,
@@ -1014,8 +1018,8 @@ pub(super) fn step(extra: &mut super::learning::Worker) -> bool {
         actual_ns,
         finished_ns,
     });
-    if let Err(error) = result {
-        fail_runtime(runtime, 0x700 + error as u64);
+    if let Some(code) = outcome::failure_code(result) {
+        fail_runtime(runtime, code);
     }
     let _ = settle_runtime_bill(runtime);
     publish_runtime(runtime);

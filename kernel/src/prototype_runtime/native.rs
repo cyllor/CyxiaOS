@@ -846,6 +846,7 @@ pub(super) fn step(worker: &mut Worker) {
         || !finish_measurement(worker)
         || !settle(worker)
         || !learning::settle(&mut worker.extra)
+        || !super::governance::settle()
     {
         return;
     }
@@ -858,13 +859,19 @@ pub(super) fn step(worker: &mut Worker) {
         && !worker.native.in_job
         && worker.native.completion.is_none()
         && worker.native.model.is_none()
-        && (REQUEST.load(Ordering::Acquire) != 1 || TARGET.load(Ordering::Acquire) != slot as u64)
     {
+        // Complete the bounded boot coordinator self-test before starting a
+        // new ordinary model job. Its immutable command snapshot already has
+        // a 50 ms deadline; a newly ready REQUEST must not repeatedly displace
+        // its returned context/validation between prepaid turns. Already owned
+        // ordinary jobs still finish above this idle-context boundary.
         if super::governance::step(&mut worker.extra) {
             return;
         }
-        learning::step(&mut worker.extra);
-        return;
+        if REQUEST.load(Ordering::Acquire) != 1 || TARGET.load(Ordering::Acquire) != slot as u64 {
+            learning::step(&mut worker.extra);
+            return;
+        }
     }
     let reservation_ns = if worker.probed && !worker.native.probing {
         PREPAY_NS
