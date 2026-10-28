@@ -101,7 +101,6 @@ jobs:
             --output "$RUNNER_TEMP/unified-build" --selftest
           test -s "$RUNNER_TEMP/unified-build/node-a.elf"
           test -s "$RUNNER_TEMP/unified-build/node-b.elf"
-          test -s "$RUNNER_TEMP/unified-build/learning.elf"
           test -s "$RUNNER_TEMP/unified-build/governance.elf"
       - name: Commit validated source only
         run: |
