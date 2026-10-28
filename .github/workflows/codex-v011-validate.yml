@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/cyxiaos-v0.11-complete-prototype
+      - 'codex/v011-*'
   workflow_dispatch:
 
 permissions:
@@ -34,12 +35,29 @@ jobs:
             --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
           cargo fetch --locked
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path user/prototype-governance/Cargo.toml -- --check
       - name: Run configured native Clippy gate
         run: |
           cargo clippy --locked --offline -p cyxia-kernel \
             --target aarch64-unknown-none-softfloat \
             --features smp-selftest -- -D warnings
+      - name: Check and link independent governance image
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/governance-target"
+          cargo clippy --locked --offline \
+            --target aarch64-unknown-none-softfloat \
+            --manifest-path user/prototype-governance/Cargo.toml -- -D warnings
+          cargo rustc --release --locked --offline \
+            --target aarch64-unknown-none-softfloat \
+            --manifest-path user/prototype-governance/Cargo.toml -- \
+            -C relocation-model=static \
+            -C link-arg=--build-id=none \
+            -C link-arg=-zmax-page-size=4096 \
+            -C link-arg=-T"$GITHUB_WORKSPACE/user/prototype-governance/linker.ld"
+          test -s "$CARGO_TARGET_DIR/aarch64-unknown-none-softfloat/release/prototype-governance"
       - name: Run non-kernel Rust workspace tests
         run: cargo test --locked --offline --workspace --exclude cyxia-kernel
       - name: Prepare pinned host fixtures
