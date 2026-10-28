@@ -151,16 +151,21 @@ pub fn quantize_bias(value: F64) -> Result<i32, Error> {
     Ok(encoded as i32)
 }
 
-/// Fixed learning/packing boundary checks are also run by independent
-/// registration, not merely by the host test harness.
-pub fn operator_selftest() -> Result<(), Error> {
-    let vectors = [
+/// The ten fixed learning/packing boundary cases are addressable one at a
+/// time so the independent EL0 role can surrender its exact 2.5 ms physical
+/// credit after every case. `operator_selftest` retains the same monolithic
+/// host/registration contract by running the complete ordered sequence.
+pub const OPERATOR_SELFTEST_CASES: usize = 10;
+
+pub fn operator_selftest_case(index: usize) -> Result<(), Error> {
+    type OperatorVector = (i16, i8, i32, i64, u64, i64, u64, i8, i32, i64);
+    const VECTORS: [OperatorVector; 4] = [
         (256, 127, -768, 127, 64, -767, 256, 127, -767, -259),
         (256, -128, 1024, -2, 1, 1023, 256, -128, 1023, 511),
         (16640, -128, 32767, -511, 256, 32767, 256, -128, 32767, -513),
         (16640, 127, -32768, 507, 256, -128, 1, 127, -32768, 252),
     ];
-    for (h0, w0, b0, wn, wd, bn, bd, wq, bq, output) in vectors {
+    if let Some(&(h0, w0, b0, wn, wd, bn, bd, wq, bq, output)) = VECTORS.get(index) {
         let mut weights = [0i8; 16];
         weights[0] = w0;
         let mut hidden = [0i16; 16];
@@ -169,25 +174,50 @@ pub fn operator_selftest() -> Result<(), Error> {
         let (quantized, bias) = step.next.quantized()?;
         let accumulated = i64::from(quantized[0]) * i64::from(h0) + 64 * i64::from(bias);
         let integer = accumulated.signum() * ((accumulated.abs() + 32) / 64);
-        if step.next.weights[0] != ratio(wn, wd)?
-            || step.next.bias != ratio(bn, bd)?
-            || (quantized[0], bias) != (wq, bq)
-            || integer != output
+        return if step.next.weights[0] == ratio(wn, wd)?
+            && step.next.bias == ratio(bn, bd)?
+            && (quantized[0], bias) == (wq, bq)
+            && integer == output
         {
-            return Err(Error::Validation);
-        }
+            Ok(())
+        } else {
+            Err(Error::Validation)
+        };
     }
-    for sign in [-1, 1] {
-        if quantize_weight(ratio(sign, 128)?)? != sign as i8
-            || quantize_bias(ratio(sign, 512)?)? != sign as i32
-        {
-            return Err(Error::Validation);
+    match index {
+        4 | 5 => {
+            let sign: i64 = if index == 4 { -1 } else { 1 };
+            if quantize_weight(ratio(sign, 128)?)? == sign as i8 {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
         }
+        6 | 7 => {
+            let sign: i64 = if index == 6 { -1 } else { 1 };
+            if quantize_bias(ratio(sign, 512)?)? == sign as i32 {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
+        }
+        8 | 9 => {
+            let bias = if index == 8 { 32768 } else { -32769 };
+            if Parameters::from_quantized([0; 16], bias).is_err() {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
+        }
+        _ => Err(Error::Order),
     }
-    for bias in [32768, -32769] {
-        if Parameters::from_quantized([0; 16], bias).is_ok() {
-            return Err(Error::Validation);
-        }
+}
+
+/// Fixed learning/packing boundary checks are also run by independent
+/// registration, not merely by the host test harness.
+pub fn operator_selftest() -> Result<(), Error> {
+    for index in 0..OPERATOR_SELFTEST_CASES {
+        operator_selftest_case(index)?;
     }
     Ok(())
 }

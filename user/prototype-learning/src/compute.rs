@@ -32,10 +32,20 @@ pub fn selftest(output: &mut [u8], yield_fn: fn(u64)) -> Result<usize, Error> {
     if output.len() < wire::SELFTEST_BYTES {
         return Err(Error::Capacity);
     }
-    train::operator_selftest()?;
-    yield_fn(10);
-    validate::operator_selftest()?;
-    yield_fn(wire::SELFTEST_CASES);
+    let mut completed = 0u64;
+    for index in 0..train::OPERATOR_SELFTEST_CASES {
+        train::operator_selftest_case(index)?;
+        completed += 1;
+        yield_fn(completed);
+    }
+    for index in 0..validate::OPERATOR_SELFTEST_CASES {
+        validate::operator_selftest_case(index)?;
+        completed += 1;
+        yield_fn(completed);
+    }
+    if completed != wire::SELFTEST_CASES {
+        return Err(Error::Validation);
+    }
     for (i, value) in [
         wire::SELFTEST_MAGIC,
         u64::from(wire::ABI),

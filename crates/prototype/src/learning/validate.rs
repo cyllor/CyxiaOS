@@ -162,8 +162,11 @@ pub fn verify_reference(
     operator_selftest()
 }
 
-/// Fixed operator goldens are independent of a package's output goldens.
-pub fn operator_selftest() -> Result<(), Error> {
+/// The four fixed full-MLP operator cases are individually addressable so a
+/// native EL0 verifier never has to combine them under one physical credit.
+pub const OPERATOR_SELFTEST_CASES: usize = 4;
+
+pub fn operator_selftest_case(index: usize) -> Result<(), Error> {
     let mut bytes = [0u8; MODEL_BYTES];
     bytes[0] = 32;
     bytes[64] = (-32i8) as u8;
@@ -173,41 +176,56 @@ pub fn operator_selftest() -> Result<(), Error> {
     bytes[2560] = 64;
     let mut input = [0i16; 64];
     input[0] = 1;
-    let plus = Model::parse(&bytes)
-        .map_err(|_| Error::Model)?
-        .trace(&input);
-    if plus.hidden1[..4] != [1, 0, 32767, 0]
-        || plus.hidden2[0] != 1
-        || plus.output != 1
-        || plus != integer_reference(&bytes, &input)
-    {
-        return Err(Error::Validation);
+    match index {
+        0 => {
+            let plus = Model::parse(&bytes)
+                .map_err(|_| Error::Model)?
+                .trace(&input);
+            if plus.hidden1[..4] == [1, 0, 32767, 0]
+                && plus.hidden2[0] == 1
+                && plus.output == 1
+                && plus == integer_reference(&bytes, &input)
+            {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
+        }
+        1 => {
+            bytes[2560] = (-32i8) as u8;
+            if Model::parse(&bytes)
+                .map_err(|_| Error::Model)?
+                .score(&input)
+                == -1
+            {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
+        }
+        2 | 3 => {
+            let expected: i16 = if index == 2 { -32768 } else { 32767 };
+            bytes[2768..]
+                .copy_from_slice(&(if index == 2 { i32::MIN } else { i32::MAX }).to_le_bytes());
+            if integer_reference(&bytes, &input).output == expected
+                && Model::parse(&bytes)
+                    .map_err(|_| Error::Model)?
+                    .score(&input)
+                    == expected
+            {
+                Ok(())
+            } else {
+                Err(Error::Validation)
+            }
+        }
+        _ => Err(Error::Order),
     }
-    bytes[2560] = (-32i8) as u8;
-    if Model::parse(&bytes)
-        .map_err(|_| Error::Model)?
-        .score(&input)
-        != -1
-    {
-        return Err(Error::Validation);
-    }
-    bytes[2768..].copy_from_slice(&i32::MIN.to_le_bytes());
-    if integer_reference(&bytes, &input).output != -32768
-        || Model::parse(&bytes)
-            .map_err(|_| Error::Model)?
-            .score(&input)
-            != -32768
-    {
-        return Err(Error::Validation);
-    }
-    bytes[2768..].copy_from_slice(&i32::MAX.to_le_bytes());
-    if integer_reference(&bytes, &input).output != 32767
-        || Model::parse(&bytes)
-            .map_err(|_| Error::Model)?
-            .score(&input)
-            != 32767
-    {
-        return Err(Error::Validation);
+}
+
+/// Fixed operator goldens are independent of a package's output goldens.
+pub fn operator_selftest() -> Result<(), Error> {
+    for index in 0..OPERATOR_SELFTEST_CASES {
+        operator_selftest_case(index)?;
     }
     Ok(())
 }

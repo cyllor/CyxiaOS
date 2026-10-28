@@ -449,9 +449,11 @@ fn no_labels_remains_data_incomplete_and_lengths_never_truncate_silently() {
 fn guest_entry_executes_same_steps_and_operator_receipt_is_never_a_candidate() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
+    static YIELDS: AtomicU64 = AtomicU64::new(0);
     fn yielded(n: u64) {
         let old = LAST.swap(n, Ordering::SeqCst);
-        assert!(n > old);
+        assert_eq!(n, old + 1);
+        YIELDS.fetch_add(1, Ordering::SeqCst);
     }
     let mut receipt = [0u8; wire::SELFTEST_BYTES];
     assert_eq!(
@@ -463,8 +465,11 @@ fn guest_entry_executes_same_steps_and_operator_receipt_is_never_a_candidate() {
         wire::SELFTEST_MAGIC
     );
     assert_eq!(u64::from_le_bytes(receipt[16..24].try_into().unwrap()), 14);
+    assert_eq!(LAST.load(Ordering::SeqCst), wire::SELFTEST_CASES);
+    assert_eq!(YIELDS.load(Ordering::SeqCst), wire::SELFTEST_CASES);
     assert_eq!(Report::decode(&receipt).err(), Some(Error::Capacity));
     LAST.store(0, Ordering::SeqCst);
+    YIELDS.store(0, Ordering::SeqCst);
     let (t, v) = support::dataset();
     let data = FrozenData::freeze(&t, &v, 7, support::schemas()).unwrap();
     let seed = UntrainedSeed::new(0);

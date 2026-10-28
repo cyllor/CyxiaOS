@@ -140,12 +140,14 @@ pub fn set_schemas(
     let entries: Vec<_> = actions
         .iter()
         .map(|action| {
-            let mut raw = RawFeatures::default();
-            raw.control_capacity = Some(if let Action::ControlSet(mask) = action {
-                u64::from(mask.count_ones()) * 1000
-            } else {
-                1000
-            });
+            let raw = RawFeatures {
+                control_capacity: Some(if let Action::ControlSet(mask) = action {
+                    u64::from(mask.count_ones()) * 1000
+                } else {
+                    1000
+                }),
+                ..RawFeatures::default()
+            };
             Candidate {
                 action: *action,
                 features: raw,
