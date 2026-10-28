@@ -1,8 +1,9 @@
-name: Validate v0.11 prototype branch
+name: Validate prototype branches
 
 on:
   push:
     branches:
+      - CyxiaOS-V0.12
       - codex/cyxiaos-v0.11-complete-prototype
       - 'codex/v011-*'
   workflow_dispatch:
@@ -12,7 +13,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: v011-validation-${{ github.ref }}
+  group: prototype-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -69,16 +70,16 @@ jobs:
       - name: Record source identity
         if: always()
         run: |
-          mkdir -p "$RUNNER_TEMP/v011-validation"
-          git rev-parse HEAD > "$RUNNER_TEMP/v011-validation/source-commit.txt"
-          git status --short > "$RUNNER_TEMP/v011-validation/git-status.txt"
-          rustc -vV > "$RUNNER_TEMP/v011-validation/rust-version.txt" || true
+          mkdir -p "$RUNNER_TEMP/prototype-validation"
+          git rev-parse HEAD > "$RUNNER_TEMP/prototype-validation/source-commit.txt"
+          git status --short > "$RUNNER_TEMP/prototype-validation/git-status.txt"
+          rustc -vV > "$RUNNER_TEMP/prototype-validation/rust-version.txt" || true
       - name: Retain validation metadata
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: v011-validation-${{ github.sha }}
+          name: prototype-validation-${{ github.sha }}
           retention-days: 3
           compression-level: 0
           if-no-files-found: error
-          path: ${{ runner.temp }}/v011-validation/
+          path: ${{ runner.temp }}/prototype-validation/
