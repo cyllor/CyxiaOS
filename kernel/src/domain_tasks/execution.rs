@@ -63,10 +63,43 @@ impl Creator<'_> {
         entered_ns: u64,
         error: Error,
     ) -> Option<local_evidence::Failure> {
+        let launch = self.launch(request).ok().map(|i| &self.launches[i]);
+        if self.tasks.iter().any(|parent| {
+            parent.key == request.caller
+                && parent.package == CLIENT_PACKAGE
+                && parent.life != Life::Free
+        }) {
+            let memory = self.memory.stats();
+            let target_cpu = launch.map_or(3, |l| l.cpu);
+            spawn_diagnostics::construction_failure([
+                now_ns(),
+                stage,
+                error as u64 + 1,
+                request.request_id,
+                request.caller.id,
+                request.caller.generation,
+                task.id,
+                task.generation,
+                launch.map_or(0, |l| l.deadline),
+                entered_ns,
+                u64::from(target_cpu),
+                self.scheduler.committed_ns(usize::from(target_cpu)),
+                self.scheduler.thread_count() as u64,
+                self.tasks[..ORDINARY_TASKS]
+                    .iter()
+                    .filter(|t| t.life == Life::Free && t.recipe == 0)
+                    .count() as u64,
+                memory.free_pages as u64,
+                memory.progress_free_pages as u64,
+                self.scheduler.committed_ns(2),
+                self.scheduler.committed_ns(3),
+                self.layout.business_mask,
+                self.layout.healthy_mask,
+            ]);
+        }
         if request.caller != CLUSTER_CALLER {
             return None;
         }
-        let launch = self.launch(request).ok().map(|i| &self.launches[i]);
         Some(local_evidence::Failure::capture(
             local_evidence::Event {
                 stage,
@@ -408,7 +441,14 @@ impl TaskBackend for Creator<'_> {
                 id: 0x1000 + slot as u64,
                 generation,
             };
-            let mut trace = BuildTrace::new(r.caller == CLUSTER_CALLER);
+            let mut trace = BuildTrace::new(
+                r.caller == CLUSTER_CALLER
+                    || self.tasks.iter().any(|parent| {
+                        parent.key == r.caller
+                            && parent.package == CLIENT_PACKAGE
+                            && parent.life != Life::Free
+                    }),
+            );
             let reservation = if r.caller == CLUSTER_CALLER {
                 let launch = match self.launch(r) {
                     Ok(index) => &self.launches[index],
