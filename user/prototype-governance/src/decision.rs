@@ -102,9 +102,7 @@ pub fn decide(snapshot: CoordinatorSnapshot) -> Result<Command, Error> {
         .ok_or(Error::Numeric)?;
     let action = match snapshot.stage {
         Stage::Shadow => {
-            if snapshot.closed_windows >= 10
-                && snapshot.shadow_coverage == COMPLETE_FAMILY_MASK
-            {
+            if snapshot.closed_windows >= 10 && snapshot.shadow_coverage == COMPLETE_FAMILY_MASK {
                 CommandAction::CloseShadowWindow {
                     window: u64::from(snapshot.closed_windows) + 1,
                 }

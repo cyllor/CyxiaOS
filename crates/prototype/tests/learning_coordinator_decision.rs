@@ -84,14 +84,38 @@ fn shadow_cycles_all_eighteen_families_then_closes_one_window() {
         Family { domain: 7, kind: 1 },
         Family { domain: 8, kind: 1 },
         Family { domain: 9, kind: 1 },
-        Family { domain: 10, kind: 1 },
-        Family { domain: 11, kind: 1 },
-        Family { domain: 12, kind: 1 },
-        Family { domain: 13, kind: 1 },
-        Family { domain: 14, kind: 1 },
-        Family { domain: 15, kind: 1 },
-        Family { domain: 16, kind: 1 },
-        Family { domain: 16, kind: 2 },
+        Family {
+            domain: 10,
+            kind: 1,
+        },
+        Family {
+            domain: 11,
+            kind: 1,
+        },
+        Family {
+            domain: 12,
+            kind: 1,
+        },
+        Family {
+            domain: 13,
+            kind: 1,
+        },
+        Family {
+            domain: 14,
+            kind: 1,
+        },
+        Family {
+            domain: 15,
+            kind: 1,
+        },
+        Family {
+            domain: 16,
+            kind: 1,
+        },
+        Family {
+            domain: 16,
+            kind: 2,
+        },
     ];
     for (sequence, family) in expected.into_iter().enumerate() {
         let mut observation = snapshot(Stage::Shadow);
