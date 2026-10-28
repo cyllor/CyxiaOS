@@ -5,6 +5,7 @@ use cyxia_prototype::domains::tasks::*;
 use cyxia_prototype::domains::maintenance::{BackgroundBudgets, CpuDebit};
 static CPU: AtomicUsize = AtomicUsize::new(0);
 static NOW: AtomicU64 = AtomicU64::new(0);
+static CPU_WORK: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicBool = AtomicBool::new(true);
 static CREDIT_KIND: [AtomicU64; 1] = [AtomicU64::new(0)];
 static CREDIT_NS: [AtomicU64; 1] = [AtomicU64::new(0)];
@@ -14,11 +15,13 @@ mod cpu { pub fn slot() -> usize { super::CPU.load(super::Ordering::Acquire) } }
 mod timer {
     pub fn ticks() -> u64 { super::NOW.load(super::Ordering::Acquire) }
     pub fn frequency() -> u64 { 1_000_000_000 }
+    pub fn cpu_ticks() -> u64 { super::CPU_WORK.load(super::Ordering::Acquire) }
+    pub fn cpu_ns(ticks: u64) -> u64 { ticks }
 }
 fn now_ns() -> u64 { timer::ticks() }
 fn group(id: u64) -> ObjectKey { ObjectKey { id, generation: 1 } }
 #[derive(Clone, Copy)]
-struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit> }
+struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit>, cpu_started: Option<u64> }
 struct State {
     scheduler: Scheduler, active: [Option<Active>; 1], layout: CpuLayout,
     draining: u64, service_admitted: bool, background: BackgroundBudgets,
@@ -94,7 +97,7 @@ fn late_peer_cannot_turn_a_new_credit_into_authority_after_its_original_expiry()
     NOW.store(203_400_000, Ordering::Release);
     assert!(matches!(acquire_guard(), Err(Error::Busy)));
     CPU.store(2, Ordering::Release); drop(acquire_guard().unwrap());
-    CPU.store(0, Ordering::Release); NOW.store(205_000_000, Ordering::Release);
+    CPU.store(0, Ordering::Release); NOW.store(300_000_000, Ordering::Release);
     assert_eq!(authorize_service_turn(), Err(Error::Expired));
     // Retain exactly the same dispatch; preference never settles or refreshes it.
     let active = locked(|s| Ok(s.active[0].unwrap().dispatch)).unwrap();

@@ -15,6 +15,7 @@ pub(super) struct View {
     pub kind: u64,
     pub published_credit_ns: u64,
     pub settlement_pending: bool,
+    pub execution_ns: Option<u64>,
 }
 pub(super) fn authorize(view: View, now: u64) -> Result<(), Error> {
     let d = view.held;
@@ -33,20 +34,20 @@ pub(super) fn authorize(view: View, now: u64) -> Result<(), Error> {
     {
         return Err(Error::Auth);
     }
+    let execution_ns = view.execution_ns.ok_or(Error::Auth)?;
     if d.core_generation != view.layout.generation
         || view.layout.business_mask & view.layout.healthy_mask & 1 == 0
         || (view.draining | view.quarantine) & 1 != 0
     {
         return Err(Error::Stale);
     }
-    if now < d.started_ns
-        || now / WINDOW_NS != d.window
-        || now
-            >= d.started_ns
-                .checked_add(d.reserved_ns)
-                .ok_or(Error::Overflow)?
-    {
+    if now < d.started_ns || now / WINDOW_NS != d.window {
         return Err(Error::Expired);
+    }
+    // reserved_ns is execution credit, settled by the Scheduler against the
+    // local PMU. Host descheduling does not turn it into a wall-clock lease.
+    if execution_ns >= d.reserved_ns {
+        return Err(Error::Budget);
     }
     Ok(())
 }

@@ -41,6 +41,7 @@ fn view(s: &Scheduler, d: Dispatch, kind: u64) -> authority::View {
         kind,
         published_credit_ns: d.reserved_ns,
         settlement_pending: false,
+        execution_ns: Some(100),
     }
 }
 #[test]
@@ -63,7 +64,7 @@ fn baseline_safety_requires_the_live_paid_service_not_a_completed_dispatch() {
     assert_eq!(s.cpu_window_usage(0, 1_100_000), Ok((100_000, 0)));
 }
 #[test]
-fn safety_rejects_tls_slice_expired_credit_and_changed_owner() {
+fn safety_rejects_tls_slice_exhausted_cpu_and_changed_owner() {
     let mut s = scheduler();
     let tls = s
         .dispatch(0, LAYOUT, 1_000_000, 1_000_000)
@@ -85,6 +86,23 @@ fn safety_rejects_tls_slice_expired_credit_and_changed_owner() {
         .unwrap();
     assert_eq!(
         authority::authorize(view(&s, service, 5), 3_700_000),
+        Ok(())
+    );
+    let mut consumed = view(&s, service, 5);
+    consumed.execution_ns = Some(2_500_000);
+    assert_eq!(
+        authority::authorize(consumed, 1_200_100),
+        Err(Error::Budget)
+    );
+    let mut missing = view(&s, service, 5);
+    missing.execution_ns = None;
+    assert_eq!(authority::authorize(missing, 1_200_100), Err(Error::Auth));
+    assert_eq!(
+        authority::authorize(view(&s, service, 5), 100_000_000),
+        Err(Error::Expired)
+    );
+    assert_eq!(
+        authority::authorize(view(&s, service, 5), 1_199_999),
         Err(Error::Expired)
     );
     let mut changed = view(&s, service, 5);

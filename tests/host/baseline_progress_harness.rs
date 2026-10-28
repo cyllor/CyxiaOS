@@ -35,6 +35,7 @@ mod timer {
     pub fn frequency() -> u64 { 1_000_000_000 }
     pub fn cpu_ticks() -> u64 { super::WORK.load(super::Ordering::Acquire) }
     pub fn cpu_elapsed_ns(start: u64) -> u64 { cpu_ticks() - start }
+    pub fn cpu_ns(ticks: u64) -> u64 { ticks }
 }
 fn now_ns() -> u64 { timer::ticks() }
 fn work(ns: u64) { WORK.fetch_add(ns, Ordering::AcqRel); NOW.fetch_add(ns, Ordering::AcqRel); }
@@ -42,7 +43,7 @@ fn group(id: u64) -> ObjectKey { ObjectKey { id, generation: 1 } }
 struct Board;
 impl Board { fn now_ns(&self) -> u64 { now_ns() } }
 #[derive(Clone, Copy)]
-struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit> }
+struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit>, cpu_started: Option<u64> }
 struct State {
     scheduler: Scheduler, active: [Option<Active>; 1], layout: CpuLayout, draining: u64,
     service_admitted: bool, background: BackgroundBudgets, bills: Vec<(u64, u64, u64)>,

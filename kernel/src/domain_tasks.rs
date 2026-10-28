@@ -290,6 +290,9 @@ struct Active {
     dispatch: Dispatch,
     state: RunState,
     optional: Option<CpuDebit>,
+    // Only the exact kind-5 CPU0 dispatch owns this local execution origin.
+    // Reborrows/revalidation never renew it; dropping Active retires it.
+    cpu_started: Option<u64>,
 }
 #[derive(Clone, Copy)]
 struct ExitRecord {
@@ -1012,6 +1015,7 @@ pub fn begin_builtin(slot: usize, _now: u64) -> Option<Credit> {
                 dispatch: d,
                 state: RunState::Runnable,
                 optional: debit,
+                cpu_started: None,
             });
             if let Ok(i) = group_index(s, d.group) {
                 s.facts.wait[i].add(d.waited_ns);
@@ -1166,10 +1170,12 @@ pub fn begin_service_segment() -> Option<Credit> {
             s.scheduler.complete(d, 0, RunState::Runnable, now)?;
             return Ok(None);
         }
+        let cpu_started = timer::cpu_ticks();
         s.active[0] = Some(Active {
             dispatch: d,
             state: RunState::Runnable,
             optional: None,
+            cpu_started: Some(cpu_started),
         });
         CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
         CREDIT_KIND[0].store(5, Ordering::Release);
@@ -1206,6 +1212,15 @@ fn service_witness_locked(s: &State) -> Result<PaidServiceWitness, Error> {
         return Err(Error::Auth);
     }
     let active = s.active[0].as_ref().ok_or(Error::NotReady)?;
+    let execution_ns = active
+        .cpu_started
+        .map(|started| -> Result<u64, Error> {
+            let elapsed = timer::cpu_ticks()
+                .checked_sub(started)
+                .ok_or(Error::Range)?;
+            Ok(timer::cpu_ns(elapsed))
+        })
+        .transpose()?;
     service_authority::authorize(
         service_authority::View {
             cpu: cpu::slot(),
@@ -1217,6 +1232,7 @@ fn service_witness_locked(s: &State) -> Result<PaidServiceWitness, Error> {
             kind: CREDIT_KIND[0].load(Ordering::Acquire),
             published_credit_ns: CREDIT_NS[0].load(Ordering::Acquire),
             settlement_pending: COMPLETE_READY[0].load(Ordering::Acquire),
+            execution_ns,
         },
         now_ns(),
     )?;
@@ -1318,6 +1334,7 @@ fn begin_file_credit(owner: ObjectKey) -> Result<Option<Credit>, Error> {
                 dispatch: d,
                 state: RunState::Blocked,
                 optional: None,
+                cpu_started: None,
             });
             CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
             CREDIT_KIND[0].store(4, Ordering::Release);

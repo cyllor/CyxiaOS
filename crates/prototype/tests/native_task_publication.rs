@@ -47,6 +47,7 @@ const SERVICE: ObjectKey = ObjectKey {
 static SERIAL: Mutex<()> = Mutex::new(());
 static LOCK: AtomicBool = AtomicBool::new(false);
 static NOW: AtomicU64 = AtomicU64::new(0);
+static SERVICE_CPU_USED: AtomicU64 = AtomicU64::new(100);
 struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -76,6 +77,7 @@ fn acquire_guard() -> Result<Guard, Error> {
     lock()
 }
 fn reset(service_started: u64) {
+    SERVICE_CPU_USED.store(100, Ordering::Release);
     assert!(!LOCK.load(Ordering::Acquire));
     cpu::set(0);
     let _guard = lock().unwrap();
@@ -127,6 +129,7 @@ fn service_witness_locked(s: &State) -> Result<(), Error> {
             kind: 5,
             published_credit_ns: s.service.unwrap().reserved_ns,
             settlement_pending: false,
+            execution_ns: Some(SERVICE_CPU_USED.load(Ordering::Acquire)),
         },
         now_ns(),
     )
@@ -295,11 +298,13 @@ impl Clock for FixedClock {
         publication_time(wall_ns)
     }
 }
-struct ScriptClock(std::collections::VecDeque<u64>);
+struct ScriptClock(std::collections::VecDeque<(u64, u64)>);
 impl Clock for ScriptClock {
     fn read(&mut self) -> cyxia_prototype::policy::PublicationTime {
         let wall_ns = {
-            let at = self.0.pop_front().expect("unexpected Registry clock read");
+            let (at, service_cpu_used) =
+                self.0.pop_front().expect("unexpected Registry clock read");
+            SERVICE_CPU_USED.store(service_cpu_used, Ordering::Release);
             NOW.store(at, Ordering::Release);
             at
         };
@@ -525,10 +530,12 @@ fn a_busy_prepublication_gate_allocates_no_plan_and_preserves_the_snapshot() {
 #[test]
 fn reservation_preserves_live_credit_target_and_publication_deadlines() {
     let _serial = SERIAL.lock().unwrap();
-    for case in 0..3 {
+    for case in 0..4 {
         reset(1_000_000);
         if case == 0 {
             NOW.store(3_400_000, Ordering::Release);
+        } else if case == 3 {
+            NOW.store(99_900_000, Ordering::Release);
         }
         let original = snapshot();
         let target = if case == 1 {
@@ -551,11 +558,28 @@ fn reservation_preserves_live_credit_target_and_publication_deadlines() {
         };
         let late = if case == 0 {
             3_500_001
+        } else if case == 3 {
+            100_000_001
         } else {
             original.taken_ns + 500_001
         };
         let times = [original.taken_ns, original.taken_ns, late, late, late, late];
-        let mut clock = ScriptClock(times.into());
+        let mut clock = ScriptClock(
+            times
+                .map(|at| {
+                    // Service execution is an independent controlled observation;
+                    // only case 0 explicitly exhausts it before publication.
+                    (
+                        at,
+                        if case == 0 && at == late {
+                            2_500_000
+                        } else {
+                            100
+                        },
+                    )
+                })
+                .into(),
+        );
         let receipt = registry
             .submit_job(
                 publisher(),
@@ -570,9 +594,10 @@ fn reservation_preserves_live_credit_target_and_publication_deadlines() {
         assert_eq!(
             receipt.state(),
             ExecutionState::Failed(match case {
-                0 => Error::Expired,
+                0 => Error::Budget,
                 1 => Error::Stale,
-                _ => Error::Budget,
+                2 => Error::Budget,
+                _ => Error::Expired,
             })
         );
         assert_eq!(scope.published, 0);

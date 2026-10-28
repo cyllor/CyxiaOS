@@ -25,7 +25,7 @@ enum Life { Ready }
 struct Task { key: ObjectKey, optional: bool, pending: bool, parent: ObjectKey, life: Life, blocked: bool }
 const TASK: Task = Task { key: OWNER, optional: false, pending: false, parent: OWNER, life: Life::Ready, blocked: false };
 #[derive(Clone, Copy)]
-struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit> }
+struct Active { dispatch: Dispatch, state: RunState, optional: Option<CpuDebit>, cpu_started: Option<u64> }
 struct Counter;
 impl Counter { fn add(&mut self, _: u64) {} }
 struct Facts { wait: [Counter; 16], node_wait: Counter }
