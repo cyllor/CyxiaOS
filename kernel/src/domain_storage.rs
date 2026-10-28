@@ -209,6 +209,17 @@ pub fn cache_partition_status() -> Result<[u64; 4], Error> {
         Ok(view.cache)
     })
 }
+/// One coherent control-plane projection for D03 dependency validation. It
+/// carries the exact cache partition and immutable physical backing from the
+/// same published file-owner view.
+pub(crate) fn cache_dependency_view(now: u64) -> Result<([u64; 4], (u64, u32)), Error> {
+    file_view(now, |view| {
+        if view.cache_until.is_some_and(|until| now >= until) {
+            return Err(Error::Busy);
+        }
+        Ok((view.cache, view.backing.ok_or(Error::NotReady)?))
+    })
+}
 pub fn cache_backing() -> Result<(u64, u32), Error> {
     ready_read()?;
     // The static physical span cannot change during this boot. Startup may
@@ -867,6 +878,7 @@ pub fn apply(
 }
 pub fn register_control() -> Result<(), Error> {
     crate::domain_control::register_dependencies(4, dependencies)?;
+    crate::domain_control::register_dependency_binder(4, control_dependencies)?;
     for domain in [4, 9, 11] {
         crate::domain_control::register(crate::domain_control::Family {
             domain,
@@ -886,6 +898,50 @@ pub fn register_control() -> Result<(), Error> {
         })?;
     }
     Ok(())
+}
+
+fn control_dependencies(
+    key: ObjectKey,
+    at: u64,
+) -> Result<[Option<crate::domain_control::BoundDependency>; 2], Error> {
+    ready_read()?;
+    if enumerate_target(4, 0) != Some(key) {
+        return Err(Error::Stale);
+    }
+    let memory = crate::domain_tasks::control_cache_dependency(at)?;
+    let disk = control_io_dependency(at)?;
+    let memory_version = crate::domain_control::admit_dependency(memory, 4, at)?;
+    let disk_version = crate::domain_control::admit_dependency(disk, 4, at)?;
+    Ok([
+        Some(crate::domain_control::BoundDependency {
+            prerequisite: memory,
+            version: memory_version,
+        }),
+        Some(crate::domain_control::BoundDependency {
+            prerequisite: disk,
+            version: disk_version,
+        }),
+    ])
+}
+
+fn control_io_dependency(at: u64) -> Result<crate::domain_control::Prerequisite, Error> {
+    ready_read()?;
+    let disk = enumerate_target(9, 0).ok_or(Error::NotReady)?;
+    let (action, capacity, failed) = storage::io_dependency_view(at)?;
+    action.validate()?;
+    if !matches!(action, Action::IoShare(_)) {
+        return Err(Error::Conflict);
+    }
+    if capacity < 2 {
+        return Err(Error::Capacity);
+    }
+    if failed != 0 {
+        return Err(Error::Io);
+    }
+    Ok(crate::domain_control::Prerequisite {
+        domain: 9,
+        target: disk,
+    })
 }
 
 fn dependencies(key: ObjectKey) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error> {

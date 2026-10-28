@@ -825,6 +825,11 @@ pub fn cancel_background() -> Result<(), DomainError> {
 pub fn current_io_action(now: u64) -> Result<Action, DomainError> {
     control_view(now, |view| view.io)
 }
+/// Return the current D09 action, negotiated capacity and failure flag from a
+/// single immutable control snapshot for dependency binding.
+pub fn io_dependency_view(now: u64) -> Result<(Action, u64, u64), DomainError> {
+    control_view(now, |view| (view.io, view.facts[2], view.facts[31]))
+}
 pub fn current_notify_batch(now: u64) -> Result<u8, DomainError> {
     control_view(now, |view| view.notify)
 }
