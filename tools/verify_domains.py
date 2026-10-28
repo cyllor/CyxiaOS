@@ -579,7 +579,7 @@ def parse_preparation_rejections(data):
     return {"total": total, "overwritten": w[2], "retained": retained}
 
 
-def diagnostics(guest, bundle):
+def diagnostics(guest, bundle, *, require_governance_runtime=False):
     # Every field belongs to this stopped snapshot. One failed parser must
     # neither hide another fresh diagnostic nor retain an older healthy value.
     errors = []
@@ -703,8 +703,13 @@ def diagnostics(guest, bundle):
                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
     mapping = guest.get("governance")
     governance_runtime = guest.get("governance_runtime")
-    check("governance_runtime", mapping is None or governance_runtime is not None,
-          "governance mapping exists without completed native EL0 execution evidence")
+    # The mapping is installed before the independent EL0 role finishes its
+    # bounded multi-turn self-test. Live samples may therefore observe an
+    # authenticated mapping with a runtime bank that is still deliberately
+    # incomplete. Final/stopped acceptance remains strict.
+    if require_governance_runtime:
+        check("governance_runtime", mapping is None or governance_runtime is not None,
+              "governance mapping exists without completed native EL0 execution evidence")
     if mapping is not None and governance_runtime is not None:
         check("governance_runtime",
               mapping["role_context"] == governance_runtime["role_context"]
@@ -742,12 +747,12 @@ def diagnostics(guest, bundle):
         raise errors[0]
 
 
-def refresh_snapshot(guest, bundle):
+def refresh_snapshot(guest, bundle, *, require_governance_runtime=False):
     """Refresh ordinary and final diagnostics before raising the first fault."""
     guest["unified"] = guest["control"] = None
     errors = []
     try:
-        diagnostics(guest, bundle)
+        diagnostics(guest, bundle, require_governance_runtime=require_governance_runtime)
     except ValueError as error:
         errors.append(error)
     # Both parsers still run after a task/credit/panic fault. A failed unified
@@ -1028,6 +1033,10 @@ def run(args):
                                         and guest.get("learning") is not None
                                         and guest["learning"]["mechanism_ready"]
                                         and guest["unified_words"][28] == 1)
+                        if "GOVERNANCE_V13_EVIDENCE" in bundle:
+                            observed = (observed and guest.get("governance") is not None
+                                        and guest.get("governance_runtime") is not None
+                                        and guest["governance_runtime"]["completed"])
                         if minimum_pairs:
                             observed = observed and replay_ready(guest.get("replay"), minimum_pairs)
                         ready = ready and observed
@@ -1062,7 +1071,7 @@ def run(args):
                         final = capture(guests, resume=False)
                         for guest, bundle in zip(guests, final):
                             try:
-                                refresh_snapshot(guest, bundle)
+                                refresh_snapshot(guest, bundle, require_governance_runtime=True)
                                 archive(guest, bundle["DOMAIN_CONTROL_EVIDENCE"], guest["control"], force=True)
                             except ValueError as error:
                                 guest["final_parse_error"] = str(error)

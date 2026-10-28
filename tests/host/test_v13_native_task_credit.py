@@ -59,6 +59,19 @@ class NativeTaskCredit(unittest.TestCase):
                         published.index("checkpoint();"))
         self.assertLess(published.index("checkpoint();"), published.index("let irq"))
 
+    def test_native_tcp_ingress_and_handshake_have_separate_bounded_credits(self):
+        tcp = (ROOT / "crates/cluster-transport/src/tcp.rs").read_text()
+        tls = (ROOT / "crates/cluster-transport/src/tls.rs").read_text()
+
+        self.assertIn("pub const IDLE_TIMEOUT_SECS: u64 = 60;", tcp)
+        ingress = tcp[tcp.index("let queued = before.send_queue();"):
+                      tcp.index("// A hardware multichain port")]
+        self.assertIn("checkpoint();\n        let ingress = self", ingress)
+        self.assertIn("poll_ingress_single(now, &mut self.device, &mut self.sockets);\n        checkpoint();", ingress)
+        self.assertIn("pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;", tls)
+        self.assertIn("HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000", tls)
+        self.assertIn("checked_add(HANDSHAKE_TIMEOUT_MS)", tls)
+
     def test_network_stage_diagnostic_is_outside_next_service_debit(self):
         runtime = (ROOT / "kernel/src/unified.rs").read_text()
         turn = runtime[runtime.index("fn network_turn(") : runtime.index("fn progress(")]

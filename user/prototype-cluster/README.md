@@ -45,7 +45,7 @@ assembly and NEON assertions remain upstream. macOS ar/ranlib can warn that
 its ELF archive table is empty; rust-lld resolves the actual ELF members.
 
 The TLS policy is TLS1.3/X25519/AES128GCM/Ed25519 with mutually pinned NodeIDs,
-no resumption/tickets/0RTT, a five-second handshake deadline and bounded record
+no resumption/tickets/0RTT, a thirty-second handshake deadline and bounded record
 buffers. `TimeProvider` receives broker monotonic time plus a provisioned UTC
 offset; dates are not a Web-PKI authority in this pinned model. Each reconnect
 creates fresh X25519 state and must repeat HELLO/reconciliation before READY.

@@ -37,7 +37,7 @@ closed pairing model; an explicit TimeProvider is still mandatory and None
 rejects construction/continued use.
 
 Per session, caller storage is 96 KiB (two 32 KiB ciphertext buffers and two
-16 KiB plaintext buffers), in addition to rustls allocations. A five-second
+16 KiB plaintext buffers), in addition to rustls allocations. A thirty-second
 handshake deadline and monotonic clock checks apply even under output
 backpressure. A full input buffer with no possible progress poisons the session.
 Every TCP EOF, reset, timeout and fatal NIC error **must call Session::abort**;

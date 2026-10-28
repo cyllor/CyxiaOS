@@ -14,6 +14,10 @@ use smoltcp::{
 pub use smoltcp::iface::SocketStorage as Storage;
 pub use smoltcp::socket::tcp::State;
 pub const BUFFER_SIZE: usize = 32768;
+/// The application heartbeat detects a failed member much earlier; this bound
+/// only prevents an otherwise healthy native TLS/control session from being
+/// recycled while TCG is servicing other exact-credit roles.
+pub const IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -119,7 +123,7 @@ impl<'a, P: Port> Tcp<'a, P> {
             SocketBuffer::new(&mut rx[..]),
             SocketBuffer::new(&mut tx[..]),
         );
-        socket.set_timeout(Some(Duration::from_secs(10)));
+        socket.set_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS)));
         socket.set_ack_delay(None);
         socket.set_nagle_enabled(false);
         let handle = sockets.add(socket);
@@ -214,9 +218,14 @@ impl<'a, P: Port> Tcp<'a, P> {
         let before = self.sockets.get::<Socket>(self.socket);
         let queued = before.send_queue();
         let state = before.state();
+        // Parsing one received frame can include ARP/IP/TCP state transitions.
+        // It receives its own exact physical-credit segment and completes all
+        // borrows before the following safe point.
+        checkpoint();
         let ingress = self
             .interface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+        checkpoint();
         let after = self.sockets.get::<Socket>(self.socket);
         if ingress != smoltcp::iface::PollIngressSingleResult::None {
             self.device.port_mut().ingress_processed(

@@ -1,5 +1,7 @@
 #![cfg(feature = "tls")]
-use cyxia_cluster_transport::tls::{Buffers, Error, Pairing, Session, node_id};
+use cyxia_cluster_transport::tls::{
+    Buffers, Error, HANDSHAKE_TIMEOUT_MS, Pairing, Session, node_id,
+};
 use rustls::{
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, UnixTime},
     time_provider::TimeProvider,
@@ -325,7 +327,11 @@ fn handshake_deadline_and_clock_regression_close_the_session() {
     let mut a = small.client(&mut ab, 100).unwrap();
     a.pump(100).unwrap();
     // Applies even while the caller has not drained a pending ClientHello.
-    assert!(matches!(a.pump(5100), Err(Error::Timeout)));
+    a.pump(100 + HANDSHAKE_TIMEOUT_MS - 1).unwrap();
+    assert!(matches!(
+        a.pump(100 + HANDSHAKE_TIMEOUT_MS),
+        Err(Error::Timeout)
+    ));
     assert!(a.pending_tls().is_empty());
     let mut b = small.client(&mut bb, 100).unwrap();
     assert!(matches!(b.pump(99), Err(Error::Clock)));

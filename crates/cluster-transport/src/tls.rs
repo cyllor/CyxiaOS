@@ -3,6 +3,7 @@
 //! user/prototype-cluster service supplies these with a narrow EL1 broker.
 extern crate alloc;
 
+use crate::tcp::IDLE_TIMEOUT_SECS;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use ring::digest;
 use rustls::{
@@ -25,6 +26,9 @@ use rustls::{
 pub const RECORD_BUFFER: usize = 32768;
 pub const PLAINTEXT_BUFFER: usize = 16384;
 pub const MAX_CERTIFICATE: usize = 4096;
+/// Absolute guest-monotonic bound for a fresh mutually authenticated session.
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
+const _: () = assert!(HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000);
 const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 5, 6, 3, 0x2b, 0x65, 0x70, 3, 0x21, 0];
 
 #[derive(Debug)]
@@ -371,7 +375,9 @@ impl<'a> Session<'a> {
         time: Arc<dyn TimeProvider>,
         now_ms: u64,
     ) -> Result<Self, Error> {
-        let handshake_deadline = now_ms.checked_add(5000).ok_or(Error::Clock)?;
+        let handshake_deadline = now_ms
+            .checked_add(HANDSHAKE_TIMEOUT_MS)
+            .ok_or(Error::Clock)?;
         buffers.input.fill(0);
         buffers.output.fill(0);
         buffers.received.fill(0);

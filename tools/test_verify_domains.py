@@ -646,6 +646,39 @@ class EvidenceParserTests(unittest.TestCase):
         values[63] = 2
         return values
 
+    def governance_mapping(self):
+        values = [0] * 16
+        values[:11] = [GOVERNANCE_MAGIC, 1, 0x80000, 0x44002000,
+                       17, 1, 1, 4, 3, 0x474f56434f4f0001, 1]
+        values[11:15] = [9, 10, 11, 12]
+        values[15] = 1
+        return values
+
+    def test_live_governance_mapping_can_precede_completed_runtime(self):
+        guest = {}
+        snapshot = self.snapshot()
+        snapshot["GOVERNANCE_V13_EVIDENCE"] = encode(self.governance_mapping())
+        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode([0] * 64)
+        refresh_snapshot(guest, snapshot)
+        self.assertTrue(guest["governance"]["mapping_installed"])
+        self.assertIsNone(guest["governance_runtime"])
+        with self.assertRaisesRegex(
+                ValueError, "mapping exists without completed native EL0 execution"):
+            refresh_snapshot({}, snapshot, require_governance_runtime=True)
+
+    def test_final_governance_runtime_must_match_installed_mapping(self):
+        snapshot = self.snapshot()
+        snapshot["GOVERNANCE_V13_EVIDENCE"] = encode(self.governance_mapping())
+        runtime = self.governance_runtime()
+        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode(runtime)
+        guest = {}
+        refresh_snapshot(guest, snapshot, require_governance_runtime=True)
+        self.assertTrue(guest["governance_runtime"]["completed"])
+        runtime[50] += 4
+        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode(runtime)
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            refresh_snapshot({}, snapshot, require_governance_runtime=True)
+
     def test_governance_runtime_proves_native_entry_faults_preemption_and_wait_command(self):
         values = self.governance_runtime()
         result = parse_governance_runtime(encode(values))

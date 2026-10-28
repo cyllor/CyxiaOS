@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "version": "0.12",
+  "branch": "CyxiaOS-V0.12",
+  "created_date": "2026-10-28",
+  "status": "PROTOTYPE_DEVELOPMENT",
+  "specification": {
+    "name": "CyxiaOS Minimal Prototype Design",
+    "configuration": "1.3"
+  },
+  "source": {
+    "parent_commit": "6c0839cb15fddada0c2305b16b6d4a5107374adf",
+    "validated_materialization_commit": "7225d4e093f22d32ba1a157d573347ba697c5d4e",
+    "temporary_patch_artifacts_included": false
+  },
+  "validated_changes": [
+    "governance_live_and_final_evidence_phasing",
+    "native_tcp_ingress_credit_checkpoints",
+    "tcp_idle_timeout_60_seconds",
+    "tls_handshake_timeout_30_seconds",
+    "bounded_transport_and_governance_regressions"
+  ],
+  "validation": {
+    "github_actions_run": 40663908636,
+    "evidence_tool_tests": {
+      "passed": 56,
+      "failed": 0
+    },
+    "native_credit_host_tests": {
+      "passed": 15,
+      "failed": 0
+    },
+    "cluster_transport_tests": "PASS",
+    "cluster_transport_clippy_deny_warnings": "PASS",
+    "unified_pair_build": "PASS",
+    "node_a_elf": "BUILT",
+    "node_b_elf": "BUILT",
+    "governance_elf": "BUILT",
+    "source_push": "BLOCKED_BY_WORKFLOW_PERMISSION_ONLY"
+  },
+  "acceptance": {
+    "complete_prototype_verified": false,
+    "release_acceptance_verified": false,
+    "required_matrices": [
+      "A01-A16",
+      "T01-T20",
+      "E01-E15",
+      "18_action_families",
+      "filesystem_fault_matrix"
+    ],
+    "policy": "Any mandatory FAIL or NOT_RUN prevents a complete-prototype claim."
+  },
+  "required_delivery_entrypoints": [
+    "build",
+    "run-single",
+    "run-pair",
+    "test",
+    "report"
+  ]
+}

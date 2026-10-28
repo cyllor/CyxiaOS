@@ -1,6 +1,6 @@
 use cyxia_cluster_transport::{
     device::{Error as PortError, MTU, Port},
-    tcp::{BUFFER_SIZE, Config, Error, Storage, Tcp},
+    tcp::{BUFFER_SIZE, Config, Error, IDLE_TIMEOUT_SECS, Storage, Tcp},
     wire::{self, Decoder, Header, Kind, ReplayGate},
 };
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
@@ -107,9 +107,10 @@ fn native_poll_exposes_bounded_scheduler_checkpoints() {
     // bounded egress TX/RX attempt and the final flush are independently
     // settleable even for an idle multichain port.
     assert!(
-        checkpoints >= 7,
+        checkpoints >= 9,
         "only {checkpoints} safe points were exposed"
     );
+    assert_eq!(IDLE_TIMEOUT_SECS, 60);
 }
 
 fn config(a: bool) -> Config {
