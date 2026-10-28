@@ -505,10 +505,28 @@ const DYNAMIC_EL0_MIN_GRANT_NS: u64 = 1_000_000;
 struct Guard {
     permit: Option<owner_gate::Permit<'static>>,
 }
+impl Guard {
+    fn protect_service_dispatch(&self, dispatch: Dispatch) {
+        if cpu::slot() != 0 || dispatch.thread != group(0x101) || dispatch.reserved_ns != 2_500_000
+        {
+            return;
+        }
+        let Some(end_ns) = dispatch.started_ns.checked_add(dispatch.reserved_ns) else {
+            return;
+        };
+        let end_ticks = ((u128::from(end_ns) * u128::from(timer::frequency())) / 1_000_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        self.permit
+            .as_ref()
+            .unwrap()
+            .protect_service_until(end_ticks, timer::ticks());
+    }
+}
 impl Drop for Guard {
     fn drop(&mut self) {
-        // Four fixed 250 us heartbeat opportunities, not a runtime budget. An
-        // offline/descheduled waiter cannot reserve shared ownership forever.
+        // Normally four fixed 250 us heartbeat opportunities. An exact paid
+        // service grant may protect this same epoch for at most 2.5 ms, with
+        // no credit/budget extension. Absent owners and waiters still expire.
         self.permit.take().unwrap().release(timer::ticks());
     }
 }
@@ -525,8 +543,13 @@ fn acquire_guard() -> Result<Guard, Error> {
     })
 }
 fn locked<R>(f: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
-    let _guard = acquire_guard()?;
-    unsafe { f(&mut *core::ptr::addr_of_mut!(STATE)) }
+    locked_with_guard(|state, _| f(state))
+}
+fn locked_with_guard<R>(
+    f: impl FnOnce(&mut State, &Guard) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let guard = acquire_guard()?;
+    unsafe { f(&mut *core::ptr::addr_of_mut!(STATE), &guard) }
 }
 pub fn now_ns() -> u64 {
     ((u128::from(timer::ticks()) * 1_000_000_000) / u128::from(timer::frequency()))
@@ -1092,7 +1115,7 @@ pub fn begin_service_segment() -> Option<Credit> {
         return None;
     }
     let mut entered = false;
-    let result = locked(|s| {
+    let result = locked_with_guard(|s, guard| {
         entered = true;
         if COMPLETE_READY[0].load(Ordering::Acquire) {
             let settlement = complete_locked(s, 0);
@@ -1150,6 +1173,10 @@ pub fn begin_service_segment() -> Option<Credit> {
         });
         CREDIT_NS[0].store(d.reserved_ns, Ordering::Relaxed);
         CREDIT_KIND[0].store(5, Ordering::Release);
+        // Scheduling preference is bounded by the original dispatch and the
+        // immutable owner epoch. It grants no authority and holds no gate
+        // across the service body or its Root callbacks.
+        guard.protect_service_dispatch(d);
         Ok(Some(Credit {
             sequence: d.sequence,
             thread: d.thread,

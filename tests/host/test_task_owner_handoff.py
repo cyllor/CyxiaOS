@@ -25,6 +25,8 @@ class TaskOwnerHandoff(unittest.TestCase):
         if 'fn acquire_guard()' in source:
             pieces.append(function(source, 'fn acquire_guard()'))
         pieces.append(function(source, 'fn locked<R>'))
+        if 'fn locked_with_guard<R>' in source:
+            pieces.append(function(source, 'fn locked_with_guard<R>'))
         pieces.append(function(source, 'pub fn service_segment<R>'))
         body = '\n'.join(pieces)
         template = template.replace('// OWNER_GATE_MODULE', module).replace('// OWNER_GATE_BODY', body)

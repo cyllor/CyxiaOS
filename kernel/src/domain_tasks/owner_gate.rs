@@ -1,6 +1,8 @@
 //! Nonblocking task-owner exclusion with bounded per-CPU handoff. A failed
 //! caller returns immediately. A bounded CPU turn permits admission/use/settle
 //! sequences, then hands off to another waiter. An absent waiter expires.
+//! An exact CPU0 service grant may protect its current epoch up to 2.5 spans,
+//! capped by that grant's original wall end; later grants cannot renew it.
 use core::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -17,6 +19,8 @@ pub(super) struct Gate {
     until: AtomicU64,
     owner: AtomicUsize,
     turn_until: AtomicU64,
+    epoch_start: AtomicU64,
+    protected_until: AtomicU64,
 }
 
 /// Linear, gate-bound permission. It cannot be cloned or moved to another CPU.
@@ -36,6 +40,8 @@ impl Gate {
             until: AtomicU64::new(0),
             owner: AtomicUsize::new(NONE),
             turn_until: AtomicU64::new(0),
+            epoch_start: AtomicU64::new(0),
+            protected_until: AtomicU64::new(0),
         }
     }
 
@@ -86,6 +92,8 @@ impl Gate {
         }
         if owner == NONE || handoff && now < until {
             self.owner.store(cpu, Ordering::Relaxed);
+            self.epoch_start.store(now, Ordering::Relaxed);
+            self.protected_until.store(0, Ordering::Relaxed);
             self.turn_until
                 .store(now.saturating_add(span), Ordering::Relaxed);
         } else if now >= self.turn_until.load(Ordering::Relaxed) {
@@ -101,6 +109,8 @@ impl Gate {
                 return None;
             }
             self.owner.store(cpu, Ordering::Relaxed);
+            self.epoch_start.store(now, Ordering::Relaxed);
+            self.protected_until.store(0, Ordering::Relaxed);
             self.turn_until
                 .store(now.saturating_add(span), Ordering::Relaxed);
         } else if owner != cpu {
@@ -120,7 +130,39 @@ impl Gate {
 }
 
 impl Permit<'_> {
+    /// Preference only, under the matching CPU0 permit after a real service
+    /// dispatch. No exclusion survives release, and authority is still checked
+    /// against the live dispatch. The original epoch cannot be renewed by
+    /// another credit: at most 2.5 normal metadata spans belong to this turn.
+    pub(super) fn protect_service_until(&self, deadline: u64, now: u64) -> bool {
+        if self.cpu != 0 {
+            return false;
+        }
+        let maximum = ((u128::from(self.span) * 5) / 2).min(u128::from(u64::MAX)) as u64;
+        let cap = self
+            .gate
+            .epoch_start
+            .load(Ordering::Relaxed)
+            .saturating_add(maximum);
+        let end = deadline.min(cap);
+        if end <= now {
+            return false;
+        }
+        self.gate.protected_until.store(end, Ordering::Relaxed);
+        self.gate.turn_until.store(end, Ordering::Relaxed);
+        true
+    }
+
     pub(super) fn release(self, now: u64) {
+        let protected = self.gate.protected_until.load(Ordering::Relaxed);
+        if now < protected {
+            // A peer arriving after this release must see the same bounded
+            // preference, even if nobody was queued while admission ran.
+            self.gate.preferred.store(self.cpu, Ordering::Relaxed);
+            self.gate.until.store(protected, Ordering::Relaxed);
+            self.gate.held.store(false, Ordering::Release);
+            return;
+        }
         let waiting = self.gate.waiting.load(Ordering::Acquire);
         let end = self.gate.turn_until.load(Ordering::Relaxed);
         let next = if waiting == 0 {
