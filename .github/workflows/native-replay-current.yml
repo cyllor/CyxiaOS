@@ -1,4 +1,4 @@
-# Probe generation 9: report exact active domain on strict credit failure
+# Probe generation 10: validate bounded task credit settlement and single-node restart scope
 name: Native replay current
 
 on:
