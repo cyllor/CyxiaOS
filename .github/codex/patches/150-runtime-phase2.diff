@@ -1,0 +1,279 @@
+--- a/tools/verify_domains.py
++++ b/tools/verify_domains.py
+@@ -579,7 +579,7 @@
+     return {"total": total, "overwritten": w[2], "retained": retained}
+ 
+ 
+-def diagnostics(guest, bundle):
++def diagnostics(guest, bundle, *, require_governance_runtime=False):
+     # Every field belongs to this stopped snapshot. One failed parser must
+     # neither hide another fresh diagnostic nor retain an older healthy value.
+     errors = []
+@@ -703,8 +703,13 @@
+                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
+     mapping = guest.get("governance")
+     governance_runtime = guest.get("governance_runtime")
+-    check("governance_runtime", mapping is None or governance_runtime is not None,
+-          "governance mapping exists without completed native EL0 execution evidence")
++    # The mapping is installed before the independent EL0 role finishes its
++    # bounded multi-turn self-test. Live samples may therefore observe an
++    # authenticated mapping with a runtime bank that is still deliberately
++    # incomplete. Final/stopped acceptance remains strict.
++    if require_governance_runtime:
++        check("governance_runtime", mapping is None or governance_runtime is not None,
++              "governance mapping exists without completed native EL0 execution evidence")
+     if mapping is not None and governance_runtime is not None:
+         check("governance_runtime",
+               mapping["role_context"] == governance_runtime["role_context"]
+@@ -742,12 +747,12 @@
+         raise errors[0]
+ 
+ 
+-def refresh_snapshot(guest, bundle):
++def refresh_snapshot(guest, bundle, *, require_governance_runtime=False):
+     """Refresh ordinary and final diagnostics before raising the first fault."""
+     guest["unified"] = guest["control"] = None
+     errors = []
+     try:
+-        diagnostics(guest, bundle)
++        diagnostics(guest, bundle, require_governance_runtime=require_governance_runtime)
+     except ValueError as error:
+         errors.append(error)
+     # Both parsers still run after a task/credit/panic fault. A failed unified
+@@ -1028,6 +1033,10 @@
+                                         and guest.get("learning") is not None
+                                         and guest["learning"]["mechanism_ready"]
+                                         and guest["unified_words"][28] == 1)
++                        if "GOVERNANCE_V13_EVIDENCE" in bundle:
++                            observed = (observed and guest.get("governance") is not None
++                                        and guest.get("governance_runtime") is not None
++                                        and guest["governance_runtime"]["completed"])
+                         if minimum_pairs:
+                             observed = observed and replay_ready(guest.get("replay"), minimum_pairs)
+                         ready = ready and observed
+@@ -1062,7 +1071,7 @@
+                         final = capture(guests, resume=False)
+                         for guest, bundle in zip(guests, final):
+                             try:
+-                                refresh_snapshot(guest, bundle)
++                                refresh_snapshot(guest, bundle, require_governance_runtime=True)
+                                 archive(guest, bundle["DOMAIN_CONTROL_EVIDENCE"], guest["control"], force=True)
+                             except ValueError as error:
+                                 guest["final_parse_error"] = str(error)
+--- a/tools/test_verify_domains.py
++++ b/tools/test_verify_domains.py
+@@ -646,6 +646,39 @@
+         values[63] = 2
+         return values
+ 
++    def governance_mapping(self):
++        values = [0] * 16
++        values[:11] = [GOVERNANCE_MAGIC, 1, 0x80000, 0x44002000,
++                       17, 1, 1, 4, 3, 0x474f56434f4f0001, 1]
++        values[11:15] = [9, 10, 11, 12]
++        values[15] = 1
++        return values
++
++    def test_live_governance_mapping_can_precede_completed_runtime(self):
++        guest = {}
++        snapshot = self.snapshot()
++        snapshot["GOVERNANCE_V13_EVIDENCE"] = encode(self.governance_mapping())
++        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode([0] * 64)
++        refresh_snapshot(guest, snapshot)
++        self.assertTrue(guest["governance"]["mapping_installed"])
++        self.assertIsNone(guest["governance_runtime"])
++        with self.assertRaisesRegex(
++                ValueError, "mapping exists without completed native EL0 execution"):
++            refresh_snapshot({}, snapshot, require_governance_runtime=True)
++
++    def test_final_governance_runtime_must_match_installed_mapping(self):
++        snapshot = self.snapshot()
++        snapshot["GOVERNANCE_V13_EVIDENCE"] = encode(self.governance_mapping())
++        runtime = self.governance_runtime()
++        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode(runtime)
++        guest = {}
++        refresh_snapshot(guest, snapshot, require_governance_runtime=True)
++        self.assertTrue(guest["governance_runtime"]["completed"])
++        runtime[50] += 4
++        snapshot["GOVERNANCE_RUNTIME_V13_EVIDENCE"] = encode(runtime)
++        with self.assertRaisesRegex(ValueError, "identity differs"):
++            refresh_snapshot({}, snapshot, require_governance_runtime=True)
++
+     def test_governance_runtime_proves_native_entry_faults_preemption_and_wait_command(self):
+         values = self.governance_runtime()
+         result = parse_governance_runtime(encode(values))
+--- a/crates/cluster-transport/src/tcp.rs
++++ b/crates/cluster-transport/src/tcp.rs
+@@ -14,6 +14,10 @@
+ pub use smoltcp::iface::SocketStorage as Storage;
+ pub use smoltcp::socket::tcp::State;
+ pub const BUFFER_SIZE: usize = 32768;
++/// The application heartbeat detects a failed member much earlier; this bound
++/// only prevents an otherwise healthy native TLS/control session from being
++/// recycled while TCG is servicing other exact-credit roles.
++pub const IDLE_TIMEOUT_SECS: u64 = 60;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Error {
+@@ -119,7 +123,7 @@
+             SocketBuffer::new(&mut rx[..]),
+             SocketBuffer::new(&mut tx[..]),
+         );
+-        socket.set_timeout(Some(Duration::from_secs(10)));
++        socket.set_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS)));
+         socket.set_ack_delay(None);
+         socket.set_nagle_enabled(false);
+         let handle = sockets.add(socket);
+@@ -214,9 +218,14 @@
+         let before = self.sockets.get::<Socket>(self.socket);
+         let queued = before.send_queue();
+         let state = before.state();
++        // Parsing one received frame can include ARP/IP/TCP state transitions.
++        // It receives its own exact physical-credit segment and completes all
++        // borrows before the following safe point.
++        checkpoint();
+         let ingress = self
+             .interface
+             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
++        checkpoint();
+         let after = self.sockets.get::<Socket>(self.socket);
+         if ingress != smoltcp::iface::PollIngressSingleResult::None {
+             self.device.port_mut().ingress_processed(
+--- a/crates/cluster-transport/src/tls.rs
++++ b/crates/cluster-transport/src/tls.rs
+@@ -4,6 +4,7 @@
+ extern crate alloc;
+ 
+ use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
++use crate::tcp::IDLE_TIMEOUT_SECS;
+ use ring::digest;
+ use rustls::{
+     CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError,
+@@ -25,6 +26,9 @@
+ pub const RECORD_BUFFER: usize = 32768;
+ pub const PLAINTEXT_BUFFER: usize = 16384;
+ pub const MAX_CERTIFICATE: usize = 4096;
++/// Absolute guest-monotonic bound for a fresh mutually authenticated session.
++pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
++const _: () = assert!(HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000);
+ const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 5, 6, 3, 0x2b, 0x65, 0x70, 3, 0x21, 0];
+ 
+ #[derive(Debug)]
+@@ -371,7 +375,7 @@
+         time: Arc<dyn TimeProvider>,
+         now_ms: u64,
+     ) -> Result<Self, Error> {
+-        let handshake_deadline = now_ms.checked_add(5000).ok_or(Error::Clock)?;
++        let handshake_deadline = now_ms.checked_add(HANDSHAKE_TIMEOUT_MS).ok_or(Error::Clock)?;
+         buffers.input.fill(0);
+         buffers.output.fill(0);
+         buffers.received.fill(0);
+--- a/crates/cluster-transport/tests/network.rs
++++ b/crates/cluster-transport/tests/network.rs
+@@ -1,6 +1,6 @@
+ use cyxia_cluster_transport::{
+     device::{Error as PortError, MTU, Port},
+-    tcp::{BUFFER_SIZE, Config, Error, Storage, Tcp},
++    tcp::{BUFFER_SIZE, Config, Error, IDLE_TIMEOUT_SECS, Storage, Tcp},
+     wire::{self, Decoder, Header, Kind, ReplayGate},
+ };
+ use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+@@ -107,9 +107,10 @@
+     // bounded egress TX/RX attempt and the final flush are independently
+     // settleable even for an idle multichain port.
+     assert!(
+-        checkpoints >= 7,
++        checkpoints >= 9,
+         "only {checkpoints} safe points were exposed"
+     );
++    assert_eq!(IDLE_TIMEOUT_SECS, 60);
+ }
+ 
+ fn config(a: bool) -> Config {
+--- a/crates/cluster-transport/tests/tls.rs
++++ b/crates/cluster-transport/tests/tls.rs
+@@ -1,5 +1,5 @@
+ #![cfg(feature = "tls")]
+-use cyxia_cluster_transport::tls::{Buffers, Error, Pairing, Session, node_id};
++use cyxia_cluster_transport::tls::{Buffers, Error, HANDSHAKE_TIMEOUT_MS, Pairing, Session, node_id};
+ use rustls::{
+     pki_types::{CertificateDer, PrivatePkcs8KeyDer, UnixTime},
+     time_provider::TimeProvider,
+@@ -325,7 +325,11 @@
+     let mut a = small.client(&mut ab, 100).unwrap();
+     a.pump(100).unwrap();
+     // Applies even while the caller has not drained a pending ClientHello.
+-    assert!(matches!(a.pump(5100), Err(Error::Timeout)));
++    a.pump(100 + HANDSHAKE_TIMEOUT_MS - 1).unwrap();
++    assert!(matches!(
++        a.pump(100 + HANDSHAKE_TIMEOUT_MS),
++        Err(Error::Timeout)
++    ));
+     assert!(a.pending_tls().is_empty());
+     let mut b = small.client(&mut bb, 100).unwrap();
+     assert!(matches!(b.pump(99), Err(Error::Clock)));
+--- a/crates/cluster-transport/README.md
++++ b/crates/cluster-transport/README.md
+@@ -37,7 +37,7 @@
+ rejects construction/continued use.
+ 
+ Per session, caller storage is 96 KiB (two 32 KiB ciphertext buffers and two
+-16 KiB plaintext buffers), in addition to rustls allocations. A five-second
++16 KiB plaintext buffers), in addition to rustls allocations. A thirty-second
+ handshake deadline and monotonic clock checks apply even under output
+ backpressure. A full input buffer with no possible progress poisons the session.
+ Every TCP EOF, reset, timeout and fatal NIC error **must call Session::abort**;
+--- a/user/prototype-cluster/README.md
++++ b/user/prototype-cluster/README.md
+@@ -45,7 +45,7 @@
+ its ELF archive table is empty; rust-lld resolves the actual ELF members.
+ 
+ The TLS policy is TLS1.3/X25519/AES128GCM/Ed25519 with mutually pinned NodeIDs,
+-no resumption/tickets/0RTT, a five-second handshake deadline and bounded record
++no resumption/tickets/0RTT, a thirty-second handshake deadline and bounded record
+ buffers. `TimeProvider` receives broker monotonic time plus a provisioned UTC
+ offset; dates are not a Web-PKI authority in this pinned model. Each reconnect
+ creates fresh X25519 state and must repeat HELLO/reconciliation before READY.
+--- a/tests/host/test_v13_native_task_credit.py
++++ b/tests/host/test_v13_native_task_credit.py
+@@ -59,6 +59,19 @@
+                         published.index("checkpoint();"))
+         self.assertLess(published.index("checkpoint();"), published.index("let irq"))
+ 
++    def test_native_tcp_ingress_and_handshake_have_separate_bounded_credits(self):
++        tcp = (ROOT / "crates/cluster-transport/src/tcp.rs").read_text()
++        tls = (ROOT / "crates/cluster-transport/src/tls.rs").read_text()
++
++        self.assertIn("pub const IDLE_TIMEOUT_SECS: u64 = 60;", tcp)
++        ingress = tcp[tcp.index("let queued = before.send_queue();"):
++                      tcp.index("// A hardware multichain port")]
++        self.assertIn("checkpoint();\n        let ingress = self", ingress)
++        self.assertIn("poll_ingress_single(now, &mut self.device, &mut self.sockets);\n        checkpoint();", ingress)
++        self.assertIn("pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;", tls)
++        self.assertIn("HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000", tls)
++        self.assertIn("checked_add(HANDSHAKE_TIMEOUT_MS)", tls)
++
+     def test_network_stage_diagnostic_is_outside_next_service_debit(self):
+         runtime = (ROOT / "kernel/src/unified.rs").read_text()
+         turn = runtime[runtime.index("fn network_turn(") : runtime.index("fn progress(")]
+--- a/.github/workflows/native-replay-current.yml
++++ b/.github/workflows/native-replay-current.yml
+@@ -13,14 +13,18 @@
+       - 'kernel/**'
+       - 'crates/arch-aarch64/**'
+       - 'crates/prototype/**'
++      - 'crates/cluster-transport/**'
++      - 'crates/driver-virtio/**'
+       - 'user/prototype-cluster/**'
+       - 'tools/verify_domains.py'
++      - 'tools/test_verify_domains.py'
+       - 'tools/verify_m1.py'
+       - 'tools/build_unified.py'
+       - 'tools/check_v13_preparation_stack.py'
+       - 'tools/qemu/**'
+       - 'tools/test_check_v13_preparation_stack.py'
+       - 'tests/host/test_preparation_stack_gate.py'
++      - 'tests/host/test_v13_native_task_credit.py'
+   workflow_dispatch:
+ 
+ permissions:
