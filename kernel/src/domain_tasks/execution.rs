@@ -150,22 +150,22 @@ impl Creator<'_> {
             ..Task::EMPTY
         };
         self.tasks[slot].caps[0] = inherited;
-        // A reserved LOCAL thread already has scheduler custody. Keep its
+        // A reserved normal thread already has scheduler custody. Keep its
         // actual parent/request identity before any fallible construction so
         // incomplete rollback can be drained without losing that custody.
         trace.step(11); // Original task deadline.
         if launch.deadline <= now_ns() {
             return Err(Error::Expired);
         }
-        if local {
-            let reserved = reservation.as_ref().ok_or(Error::Conflict)?;
-            if reserved.key() != key
+        if let Some(reserved) = reservation.as_ref() {
+            if r.recovery
+                || reserved.key() != key
                 || reserved.cpu() != launch.cpu
                 || reserved.core_generation() != self.layout.generation
             {
                 return Err(Error::Conflict);
             }
-        } else if reservation.is_some() {
+        } else if !r.recovery {
             return Err(Error::Conflict);
         }
         trace.step(12); // Actual page-table/code-leaf construction.
@@ -265,10 +265,11 @@ impl Creator<'_> {
             trace.step(22);
             self.background.set_commitment(r.group, 0, now_ns())?;
         }
-        if !local {
+        if reservation.is_none() {
             let spec = thread_spec(r, launch, key);
-            // LOCAL already owns its exact reservation. Repeating admission
-            // here would race the physical window during page construction.
+            // Normal creation already owns its exact reservation. Repeating
+            // admission here would race the physical window during page
+            // construction. Recovery keeps its existing separate path.
             let admission_ns = now_ns();
             if trace.enabled {
                 trace.stage = 23;
@@ -449,7 +450,7 @@ impl TaskBackend for Creator<'_> {
                             && parent.life != Life::Free
                     }),
             );
-            let reservation = if r.caller == CLUSTER_CALLER {
+            let reservation = if !r.recovery {
                 let launch = match self.launch(r) {
                     Ok(index) => &self.launches[index],
                     Err(error) => {
@@ -467,7 +468,9 @@ impl TaskBackend for Creator<'_> {
                 {
                     Ok(Some(reserved)) => Some(reserved),
                     // No task, pages, capability, or scheduler thread has been
-                    // created. Preserve the existing queue identity and deadline.
+                    // created. This includes ordinary client children whose
+                    // target CPU still owns a live promise awaiting removal.
+                    // Preserve the existing queue identity and deadline.
                     Ok(None) => return CreateOutcome::Deferred,
                     Err(error) => {
                         self.local_failure = self.failure_facts(r, key, 23, admission_ns, error);
