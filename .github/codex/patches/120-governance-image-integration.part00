@@ -42,19 +42,20 @@
 +and page counts and explicitly reports a mapped-not-scheduled state. This does
 +not grant command authority or create another 9 ms budget. Actual prepaid EL0
 +dispatch, trap-derived authority, shared-surplus accounting, command application
-+refaactor, migration ownership handoff, and native A16 execution evidence remain
-open.
-
++refactor, migration ownership handoff, and native A16 execution evidence remain
++open.
+ 
  ## Observed deployment gap
-
+ 
 --- a/kernel/build.rs	2026-10-28 04:41:41.000000000 +0000
 +++ b/kernel/build.rs	2026-10-28 04:49:30.817224746 +0000
 @@ -263,6 +263,49 @@
              learning_out.join("prototype-learning.elf"),
          )
-        .expect("copy independent learning image");
+         .expect("copy independent learning image");
 +        // The governance coordinator is a distinct EL0 image and role. Build it
-+        // into the same exact kernel OUT_DIR, but keep a separate target tree so:+        // nested Cargo never aliases the numerical worker's artifacts or lock.
++        // into the same exact kernel OUT_DIR, but keep a separate target tree so
++        // nested Cargo never aliases the numerical worker's artifacts or lock.
 +        let governance_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
 +            .join("../user/prototype-governance");
 +        let governance_target = learning_out.join("governance-target");
