@@ -516,9 +516,26 @@ fn deliver(owner: ObjectKey, context: &mut Context) -> Result<(), Error> {
     clear_pending();
     Ok(())
 }
-pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMut()) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DispatchResult {
+    NotHandled,
+    RetryBeforeEffect,
+    Returned,
+}
+fn rejected_before_effect(error: Error) -> DispatchResult {
+    if retryable_before_run(error) {
+        DispatchResult::RetryBeforeEffect
+    } else {
+        DispatchResult::Returned
+    }
+}
+pub(crate) fn dispatch(
+    owner: ObjectKey,
+    context: &mut Context,
+    progress: &mut dyn FnMut(),
+) -> DispatchResult {
     if context.regs[8] != DISPATCH {
-        return false;
+        return DispatchResult::NotHandled;
     }
     let _guard = match acquire() {
         Ok(g) => g,
@@ -528,18 +545,18 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             } else {
                 errno(e) as u64
             };
-            return true;
+            return rejected_before_effect(e);
         }
     };
     if PENDING_ID.load(Ordering::Acquire) != 0 {
         if !pending_delivery(owner) {
             context.regs[0] = (-11i64) as u64;
-            return true;
+            return DispatchResult::RetryBeforeEffect;
         }
         if let Err(e) = deliver(owner, context) {
             context.regs[0] = errno(e) as u64;
         }
-        return true;
+        return DispatchResult::Returned;
     }
     let address = context.regs[1];
     let mut input = Frame {
@@ -563,7 +580,7 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         } else {
             errno(e) as u64
         };
-        return true;
+        return rejected_before_effect(e);
     }
     let mut output = input;
     output.set_u64(OFF_RESULT, 0);
@@ -590,12 +607,12 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         diagnostic_finish(diagnostic_sequence, owner, &output);
         if retryable_before_run(e) {
             context.regs[0] = (-11i64) as u64;
-            return true;
+            return DispatchResult::RetryBeforeEffect;
         }
         context.regs[0] = errno(e) as u64;
         output.set_u64(OFF_RESULT, errno(e) as u64);
         let _ = domain_tasks::copyout(owner, address, &output.bytes);
-        return true;
+        return DispatchResult::Returned;
     }
     let data = unsafe { &mut *core::ptr::addr_of_mut!(DATA) };
     // All user input is copied before the first filesystem effect. A lock
@@ -614,12 +631,12 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
             diagnostic_finish(diagnostic_sequence, owner, &output);
             if retryable_before_run(e) {
                 context.regs[0] = (-11i64) as u64;
-                return true;
+                return DispatchResult::RetryBeforeEffect;
             }
             context.regs[0] = errno(e) as u64;
             output.set_u64(OFF_RESULT, errno(e) as u64);
             let _ = domain_tasks::copyout(owner, address, &output.bytes);
-            return true;
+            return DispatchResult::Returned;
         }
     }
     let capture_selected = crate::storage_fault_capture::selected(owner);
@@ -638,7 +655,7 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         output.set_u64(OFF_RESULT, (-11i64) as u64);
         diagnostic_finish(diagnostic_sequence, owner, &output);
         context.regs[0] = (-11i64) as u64;
-        return true;
+        return DispatchResult::RetryBeforeEffect;
     }
     let result = (|| {
         let grant = authorize(owner, &input)?;
@@ -664,7 +681,7 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
         output.set_u64(OFF_RESULT, (-11i64) as u64);
         diagnostic_finish(diagnostic_sequence, owner, &output);
         context.regs[0] = (-11i64) as u64;
-        return true;
+        return DispatchResult::RetryBeforeEffect;
     }
     let len = match result {
         Ok(n) => n,
@@ -708,5 +725,5 @@ pub fn dispatch(owner: ObjectKey, context: &mut Context, progress: &mut dyn FnMu
     if let Err(e) = deliver(owner, context) {
         context.regs[0] = errno(e) as u64;
     }
-    true
+    DispatchResult::Returned
 }

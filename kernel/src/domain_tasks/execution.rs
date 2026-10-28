@@ -1555,20 +1555,31 @@ fn service_file(progress: &mut dyn FnMut()) {
             core::hint::spin_loop();
         }
     };
-    unsafe {
+    let retry_before_effect = unsafe {
         let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
             .cast::<user::Context>()
             .add(i);
-        if !crate::domain_file_abi::dispatch(key, context, &mut file_progress) {
+        let disposition = crate::domain_file_abi::dispatch(key, context, &mut file_progress);
+        if disposition == crate::domain_file_abi::DispatchResult::NotHandled {
             context.regs[0] = error_word(Error::Unsupported);
         }
-        if crate::domain_file_abi::pending_delivery(key) {
+        let retry = disposition == crate::domain_file_abi::DispatchResult::RetryBeforeEffect;
+        if retry || crate::domain_file_abi::pending_delivery(key) {
             FILE_PENDING[i].store(true, Ordering::Release);
         }
-    }
+        retry
+    };
     let (_, finished_ns, actual_ns) = finish_cpu_interval(segment_started);
     let _ = complete_builtin(0, actual_ns, finished_ns);
-    FILE_DONE[i].store(true, Ordering::Release);
+    if retry_before_effect {
+        // No operation or receipt was consumed. Keep the original stopped SVC
+        // in CPU0 custody, so another bounded owner turn can retry without an
+        // EL0 round trip. A delivered EAGAIN is Returned, never this branch.
+        FILE_DONE[i].store(false, Ordering::Release);
+        FILE_BUSY[i].store(false, Ordering::Release);
+    } else {
+        FILE_DONE[i].store(true, Ordering::Release);
+    }
 }
 
 pub fn remote_capacity() -> [u64; 4] {
