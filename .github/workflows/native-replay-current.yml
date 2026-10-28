@@ -1,4 +1,4 @@
-# Probe generation 10: validate bounded task credit settlement and single-node restart scope
+# Probe generation 11: execute and authenticate independent EL0 governance coordinator
 name: Native replay current
 
 on:
