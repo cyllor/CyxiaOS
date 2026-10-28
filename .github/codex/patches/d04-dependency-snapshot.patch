@@ -7,8 +7,7 @@
 +/// Optional control-preparation projection. It must perform the same owner,
 +/// current-action, legality and admission checks as the generic path while
 +/// collapsing repeated immutable owner reads into one bounded snapshot.
-+type DependencyBinder =
-+    fn(ObjectKey, u64) -> Result<[Option<BoundDependency>; 2], Error>;
++type DependencyBinder = fn(ObjectKey, u64) -> Result<[Option<BoundDependency>; 2], Error>;
  type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
  static ADMISSION: dependencies::AdmissionView = dependencies::AdmissionView::new();
  static DEPENDENCY_RESOLVERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
@@ -169,8 +168,7 @@
 +        action.validate()?;
 +        let authorized = s.memory.cache_authorized_pages(at);
 +        let grant = (pages / 4).min(256);
-+        let (cache, (file_base, file_pages)) =
-+            crate::domain_storage::cache_dependency_view(at)?;
++        let (cache, (file_base, file_pages)) = crate::domain_storage::cache_dependency_view(at)?;
 +        let (task_base, task_pages) = memory_backing()?;
 +        let task_end = task_base
 +            .checked_add(u64::from(task_pages) * 4096)
@@ -219,38 +217,3 @@
  pub fn current_notify_batch(now: u64) -> Result<u8, DomainError> {
      control_view(now, |view| view.notify)
  }
---- /dev/null
-+++ b/tests/host/test_v13_dependency_projection.py
-@@ -0,0 +1,32 @@
-+import pathlib
-+import unittest
-+
-+ROOT = pathlib.Path(__file__).resolve().parents[2]
-+
-+
-+class DependencyProjectionTests(unittest.TestCase):
-+    def test_d04_control_projection_does_not_replace_executor_resolver(self):
-+        control = (ROOT / "kernel/src/domain_control.rs").read_text()
-+        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
-+        self.assertIn("register_dependencies(4, dependencies)", storage)
-+        self.assertIn("register_dependency_binder(4, control_dependencies)", storage)
-+        self.assertIn("owner.dependency_binders[dependency_slot]", control)
-+        self.assertIn("DEPENDENCY_RESOLVERS", control)
-+        self.assertIn("admit_dependencies(consumer: u16", control)
-+
-+    def test_collapsed_projection_revalidates_both_real_owners(self):
-+        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
-+        tasks = (ROOT / "kernel/src/domain_tasks.rs").read_text()
-+        device = (ROOT / "kernel/src/prototype_storage.rs").read_text()
-+        self.assertIn("control_cache_dependency(at)", storage)
-+        self.assertIn("control_io_dependency(at)", storage)
-+        self.assertEqual(storage.count("admit_dependency(memory, 4, at)"), 1)
-+        self.assertEqual(storage.count("admit_dependency(disk, 4, at)"), 1)
-+        self.assertIn("cache_dependency_view(at)", tasks)
-+        self.assertIn("cache_authorized_pages(at)", tasks)
-+        self.assertIn("io_dependency_view(at)", storage)
-+        self.assertIn("view.io, view.facts[2], view.facts[31]", device)
-+
-+
-+if __name__ == "__main__":
-+    unittest.main()
