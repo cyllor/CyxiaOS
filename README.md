@@ -83,6 +83,18 @@ posix run preempt
 
 ## 构建与验证
 
+V0.12 配置 1.3 提供五个统一入口。原生构建与测试使用已有固定工具链；节点身份须先用 `user/prototype-cluster/tools/provision.py` 在仓库外的私有目录中生成。以下 `PAIR`、`QEMU`、`QEMU_SOURCE` 分别指身份目录、已核验的补丁版 QEMU 可执行文件及对应源码目录：
+
+```sh
+python3 tools/prototype.py build --identity-a "$PAIR/a" --identity-b "$PAIR/b" --output artifacts/prototype-build --selftest
+python3 tools/prototype.py run-single --elf artifacts/prototype-build/node-a.elf --build-manifest artifacts/prototype-build/build-manifest.json --source-root . --qemu "$QEMU" --output artifacts/prototype-single --clock-profile wallclock --tcg-threads multi --sample-ms 2000 --timeout 180
+python3 tools/prototype.py run-pair --elf artifacts/prototype-build/node-a.elf --peer-elf artifacts/prototype-build/node-b.elf --public artifacts/prototype-build/node-a.pub --public artifacts/prototype-build/node-b.pub --package artifacts/prototype-build/task.elf --build-manifest artifacts/prototype-build/build-manifest.json --qemu "$QEMU" --qemu-source "$QEMU_SOURCE" --output artifacts/prototype-pair --clock-profile wallclock --tcg-threads multi --timeout 180
+python3 tools/prototype.py test --fetch --output artifacts/prototype-checks
+python3 tools/prototype.py report --output artifacts/prototype-report.json
+```
+
+`run-single` 执行四核单节点域功能探针，`run-pair` 执行双节点联合验证；二者会在观察结束后退出，并保留原生记录。它们的局部通过不代表完整 1.3 验收。`test` 保留每项检查的输出、退出码及 `summary.json`，独立检查会在某项失败后继续；默认离线复查固定输入，首次准备输入才需要 `--fetch`。输出目录/报告文件必须是新路径。`report` 调用固定的独立证据检查器，存在未完成强制项时返回状态码 2；当前目录仍有 69 项 `NOT_RUN`，文件故障矩阵尚未关闭。补丁版 QEMU 的来源和计时边界见 [固定 QEMU 说明](tools/qemu/README.md)。
+
 新 checkout 运行主机测试前，先执行 `python3 tools/prepare_host_tests.py --fetch` 准备固定上游测试输入；后续可省略 `--fetch` 离线复查。当前分支的验证修复与尚未关闭的原生预算问题见 [V0.1 验证跟进](docs/implementation/v01-validation-followup.md)。
 
 在项目目录执行，Python 仅需标准库：
