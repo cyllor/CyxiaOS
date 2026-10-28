@@ -860,6 +860,9 @@ pub(super) fn step(worker: &mut Worker) {
         && worker.native.model.is_none()
         && (REQUEST.load(Ordering::Acquire) != 1 || TARGET.load(Ordering::Acquire) != slot as u64)
     {
+        if super::governance::step(&mut worker.extra) {
+            return;
+        }
         learning::step(&mut worker.extra);
         return;
     }
@@ -895,7 +898,11 @@ pub(super) fn step(worker: &mut Worker) {
 /// A closed gate never substitutes for settlement or cancellation of the
 /// original root job. Only its actual C owner can issue this abort.
 pub(super) fn stop_ready(worker: &mut Worker) -> bool {
-    if !finish_measurement(worker) || !settle(worker) || !learning::quiescent(&mut worker.extra) {
+    if !finish_measurement(worker)
+        || !settle(worker)
+        || !super::governance::quiescent()
+        || !learning::quiescent(&mut worker.extra)
+    {
         return false;
     }
     publish_completion(worker);

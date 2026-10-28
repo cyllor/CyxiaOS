@@ -44,6 +44,7 @@ CONTROL_CREDIT_MAGIC = 0x4359434352454401
 CONTROL_POOL_MAGIC = 0x435943504F4F4C01
 LEARNING_MAGIC = 0x43594C4541524E01
 GOVERNANCE_MAGIC = 0x4359474F56455201
+GOVERNANCE_RUNTIME_MAGIC = 0x43594752554E0001
 REPLAY_MAGIC = 0x435952504C593133
 RUNTIME_MAGIC = 0x43595852554E3133
 # The actual cluster Driver closes after 1.5 guest seconds without an RPC.
@@ -70,6 +71,7 @@ REQUIRED = {
 OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
             "LEARNING_V13_EVIDENCE": 1024, "GOVERNANCE_V13_EVIDENCE": 128,
+            "GOVERNANCE_RUNTIME_V13_EVIDENCE": 512,
             "REPLAY_V13_EVIDENCE": 512,
             "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
@@ -403,7 +405,64 @@ def parse_governance(data):
             "role_context": [w[9], w[10]],
             "image_hash": b"".join(value.to_bytes(8, "little")
                                    for value in w[11:15]).hex(),
-            "mapped_not_scheduled": True}
+            "mapping_installed": True}
+
+
+def parse_governance_runtime(data):
+    w = words(data, 64)
+    require(w[48] == 0, f"native governance runtime fault {w[48]}")
+    if w[0] == 0 or w[63] & 1 or w[27] == 0:
+        return None
+    require(w[0] == GOVERNANCE_RUNTIME_MAGIC and w[1] == 1 and w[2] == 8,
+            "invalid governance runtime completion header")
+    require(w[6] == 1 and w[7] >= 6 and w[60] >= 4 and w[61] >= 1,
+            "governance role did not execute on the registered C owner")
+    require(w[3] > 0 and w[4] > 0 and w[5] > 0
+            and w[56:59] == (w[3], w[4], w[3]),
+            "governance owner/credit generations were not independently revalidated")
+    require(w[9] <= 2_500_000 and w[42] == 2_500_000
+            and 0 < w[43] <= w[42] and w[47] == 1,
+            "governance turn exceeded or failed to settle its physical credit")
+    require(w[41] >= w[40] and w[44] >= w[42] and w[45] >= w[42],
+            "invalid governance credit accounting evidence")
+    probes = ((20, 21, 0x100000, 0x4f),
+              (22, 23, 0x80000, 0x4f),
+              (24, 25, 0x30000, 0x07))
+    for esr, far, address, fsc in probes:
+        require(w[esr] >> 26 == 0x24 and w[esr] & 0x7f == fsc
+                and w[far] == address,
+                "governance EL0 mapping probe did not fault at the protected boundary")
+    require(w[26] == 9 and w[10] >= 1,
+            "governance EL0 timer preemption was not observed")
+    require(w[59] == 8 and w[11] >> 26 == 0x15 and w[11] & 0xffff == 0x562
+            and w[12] == 0x101000 and w[13] == 256,
+            "governance command did not return through the exact EL0 SVC ABI")
+    require(w[14:17] == (1, 1, 1),
+            "governance self-test did not return the canonical sequence-one Wait command")
+    require(w[18] != 0 and w[19] != 0 and all(w[49:54]),
+            "governance runtime identity or address space is missing")
+    require(any(w[28:32]) and any(w[32:36]) and any(w[36:40]),
+            "governance command, snapshot or image digest is missing")
+    require(w[55] < w[17] < w[54],
+            "governance command was validated outside its canonical snapshot deadline")
+    return {
+        "phase": w[2], "cpu": w[6], "turns": w[7],
+        "total_actual_ns": w[8], "max_actual_ns": w[9],
+        "preemptions": w[10], "core_generation": w[3],
+        "ledger_generation": w[4], "credit_sequence": w[5],
+        "svc_esr": w[11], "svc_pointer": w[12], "svc_length": w[13],
+        "command_kind": w[14], "command_sequence": w[15],
+        "snapshot_revision": w[16], "validation_ns": w[17],
+        "role_context": [w[18], w[19]],
+        "command_digest": b"".join(value.to_bytes(8, "little")
+                                    for value in w[28:32]).hex(),
+        "snapshot_digest": b"".join(value.to_bytes(8, "little")
+                                     for value in w[32:36]).hex(),
+        "image_hash": b"".join(value.to_bytes(8, "little")
+                                  for value in w[36:40]).hex(),
+        "root": w[49], "entry": w[50],
+        "mapping_keys": list(w[51:54]), "completed": True,
+    }
 
 
 def parse_learning(data):
@@ -563,6 +622,7 @@ def diagnostics(guest, bundle):
                                     ("CONTROL_POOL_EVIDENCE", "control_pool_evidence", 16),
                                     ("LEARNING_V13_EVIDENCE", "learning_evidence", 128),
                                     ("GOVERNANCE_V13_EVIDENCE", "governance_evidence", 16),
+                                    ("GOVERNANCE_RUNTIME_V13_EVIDENCE", "governance_runtime_evidence", 64),
                                     ("REPLAY_V13_EVIDENCE", "replay_evidence", 64),
                                     ("REPLAY_ROOT_EVIDENCE", "replay_root_evidence", 32),
                                     ("REPLAY_OWNER_EVIDENCE", "replay_owner_evidence", 32),
@@ -621,6 +681,7 @@ def diagnostics(guest, bundle):
                                      ("CONTROL_POOL_EVIDENCE", "control_pool", parse_control_pool),
                                      ("LEARNING_V13_EVIDENCE", "learning", parse_learning),
                                      ("GOVERNANCE_V13_EVIDENCE", "governance", parse_governance),
+                                     ("GOVERNANCE_RUNTIME_V13_EVIDENCE", "governance_runtime", parse_governance_runtime),
                                      ("REPLAY_V13_EVIDENCE", "replay", parse_replay)):
         guest[key] = None
         if symbol_name in bundle:
@@ -640,6 +701,18 @@ def diagnostics(guest, bundle):
                 }
                 check(key, not guest[key],
                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
+    mapping = guest.get("governance")
+    governance_runtime = guest.get("governance_runtime")
+    check("governance_runtime", mapping is None or governance_runtime is not None,
+          "governance mapping exists without completed native EL0 execution evidence")
+    if mapping is not None and governance_runtime is not None:
+        check("governance_runtime",
+              mapping["role_context"] == governance_runtime["role_context"]
+              and mapping["image_hash"] == governance_runtime["image_hash"]
+              and mapping["root"] == governance_runtime["root"]
+              and mapping["entry"] == governance_runtime["entry"],
+              "governance runtime identity differs from its installed image mapping")
+
     # A synchronous file operation may retain its caller while waiting for a
     # new credit. Its periodic task snapshot can then be older than the actual
     # completion fault; the independent sticky record must still fail the run.
@@ -711,6 +784,9 @@ def profile(path):
             locations[name] = location
     require(("CONTROL_POOL_EVIDENCE" in locations) == ("LEARNING_V13_EVIDENCE" in locations),
             "incomplete native learning/control pool evidence symbols")
+    require(("GOVERNANCE_V13_EVIDENCE" in locations)
+            == ("GOVERNANCE_RUNTIME_V13_EVIDENCE" in locations),
+            "incomplete governance mapping/runtime evidence symbols")
     return data, locations
 
 
