@@ -1,0 +1,64 @@
+name: Validate v0.11 prototype branch
+
+on:
+  push:
+    branches:
+      - codex/cyxiaos-v0.11-complete-prototype
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: v011-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update \
+            --component rustfmt --component clippy --component llvm-tools-preview \
+            --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run configured native Clippy gate
+        run: cargo clippy --locked --offline -p cyxia-kernel \
+          --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+      - name: Run non-kernel Rust workspace tests
+        run: cargo test --locked --offline --workspace --exclude cyxia-kernel
+      - name: Prepare pinned host fixtures
+        run: python3 -B tools/prepare_host_tests.py --fetch
+      - name: Run host Python tests
+        run: python3 -B -m unittest discover -s tests/host -p 'test_*.py' -v
+      - name: Run native evidence tool tests
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Record source identity
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/v011-validation"
+          git rev-parse HEAD > "$RUNNER_TEMP/v011-validation/source-commit.txt"
+          git status --short > "$RUNNER_TEMP/v011-validation/git-status.txt"
+          rustc -vV > "$RUNNER_TEMP/v011-validation/rust-version.txt" || true
+      - name: Retain validation metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v011-validation-${{ github.sha }}
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+          path: ${{ runner.temp }}/v011-validation/
