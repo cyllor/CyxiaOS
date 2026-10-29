@@ -152,6 +152,9 @@ mod control {
         Ok(if task::version()?==41 {ExecutionState::Applied}else{ExecutionState::Pending})
     }
     // CONTROL_BODIES
+    // This older timing fixture has no replay trial. Candidate custody uses
+    // the actual Root hook in test_candidate_initial_progress instead.
+    mod replay {pub fn initial_execution(_:super::ApplyId,_:super::PolicyStamp,_:super::ExecutionState){}}
     pub fn observe(){poll(now()).unwrap();}
 }
 mod warm {

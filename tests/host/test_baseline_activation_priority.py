@@ -34,6 +34,7 @@ class BaselineActivationPriority(unittest.TestCase):
         bodies = '\n'.join(['struct Guard;', function(control, 'impl Drop for Guard'),
             function(control, 'fn with<T>')])
         template = (ROOT / 'tests/host/baseline_activation_priority_harness.rs').read_text()
+        template = template.replace('r.initial = Some(2)', 'r.initial = Some(INITIAL)').replace('r.initial=Some(2)', 'r.initial=Some(INITIAL)')
         template = template.replace('// CONTROL_GATE_BODIES', bodies)
         template = template.replace('// ROOT_HINT_BODIES', '\n'.join([
             hint, reader, projection, function(replay, 'fn activate(')]))

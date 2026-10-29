@@ -2139,7 +2139,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             self.boot,
             commit_ns,
         )?;
-        replay::published(plan, self.boot)?;
+        replay::published(plan, self.boot, stamps[..plan.len()].first().copied())?;
         for (index, d) in plan.iter().enumerate() {
             let slot = self.owner.prepared[index];
             let stamp = stamps[index];
@@ -2526,6 +2526,7 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.state = ExecutionState::Failed(Error::Again);
                 }
             }
+            replay::initial_execution(d.apply, d.stamp, d.state);
             if let Some((entered_ns, cpu_ns)) = executor_trace {
                 crate::learning_evidence::execution_trace::control(
                     crate::learning_evidence::execution_trace::ControlEvent {

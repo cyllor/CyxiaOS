@@ -1,0 +1,106 @@
+// Root's bounded projection is real; Registry commit, resource authorization,
+// capture/history binding and hardware remain explicit host boundaries.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+// CANDIDATE_GUARD
+pub mod replay {
+    use super::*;
+    use cyxia_prototype::{policy::Snapshot, policy_wire::{self, Plan, PlanHeader, Envelope, Decision}};
+    type LearningFamily = Family;
+    #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum TrialKind {Baseline,Candidate}
+    #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum Phase {Frozen,Running,Restoring,Faulted,Complete}
+    // CANDIDATE_TOKEN
+    #[derive(Clone,Copy)] struct Request {owner:ObjectKey,target:ObjectKey,family:Family,kind:TrialKind}
+    #[derive(Clone,Copy)] struct Receipt {stamp:PolicyStamp,state:ExecutionState}
+    struct Lifecycle {closed:bool}
+    impl Lifecycle {fn closing(&self)->Option<()>{self.closed.then_some(())}}
+    // CANDIDATE_INITIAL_TYPE
+    struct Root {token:Option<Token>,request:Option<Request>,first:Option<Snapshot>,first_ready:bool,
+        phase:Phase,initial:Option<ApplyId>,candidate_initial:Option<CandidateInitial>,selected:Option<Action>,
+        renew_after:u64,baseline:[Option<Receipt>;32],baseline_count:usize,closing:Option<Receipt>,
+        unpublished:Option<()>,fault:Option<Error>,lifecycle:Lifecycle}
+    static mut ROOT:Root=Root{token:None,request:None,first:None,first_ready:false,phase:Phase::Complete,
+        initial:None,candidate_initial:None,selected:None,renew_after:0,baseline:[None;32],baseline_count:0,
+        closing:None,unpublished:None,fault:None,lifecycle:Lifecycle{closed:false}};
+    fn root()->&'static Root{unsafe{&*core::ptr::addr_of!(ROOT)}}
+    fn root_mut()->&'static mut Root{unsafe{&mut *core::ptr::addr_of_mut!(ROOT)}}
+    // CANDIDATE_ROOT_BODIES
+    pub const TOKEN:Token=Token{id:9,boot_epoch:7,owner:key(7)};
+    pub fn reset(){let r=root_mut();r.token=Some(TOKEN);r.request=Some(Request{owner:key(7),target:key(12),
+        family:Family{domain:Action::CpuWeight(2).domain(),kind:Action::CpuWeight(2).kind()},kind:TrialKind::Candidate});
+        r.first=Some(Snapshot{sequence:ID.plan_seq,taken_ns:STAMP.snapshot_ns,ledger_generation:1,core_generation:1});
+        r.first_ready=true;r.phase=Phase::Running;r.initial=None;r.candidate_initial=None;r.selected=None;
+        r.unpublished=None;r.fault=None;r.lifecycle.closed=false;r.closing=None;r.baseline_count=0;
+        BASELINE_ACTIVATION_PENDING.store(false,Ordering::Release);}
+    pub fn commit(stamp:Option<PolicyStamp>,id:ApplyId)->Result<(),Error>{
+        let mut bytes=[0u8;1024];let n=policy_wire::encode_plan(PlanHeader{plan_seq:id.plan_seq,
+            controller_epoch:id.controller_epoch,snapshot_seq:ID.plan_seq,active_model_generation:1,active_until_local_ns:STAMP.installed_until_ns,
+            ..PlanHeader::default()},&[Decision{envelope:Envelope{target:id.target,controller_epoch:id.controller_epoch,
+                snapshot_seq:ID.plan_seq,decision_seq:1,ledger_generation:1,core_generation:1,..Envelope::default()},
+                action:Action::CpuWeight(2),candidate_index:0}],&mut bytes)?;
+        let plan=policy_wire::decode_plan(&bytes[..n])?;
+        // CANDIDATE_PUBLISHED_CALL
+        Ok(())
+    }
+    pub fn state(id:ApplyId,stamp:PolicyStamp,state:ExecutionState){initial_execution(id,stamp,state);}
+    pub fn publication_started(_:Token)->Result<bool,Error>{
+        if root().fault==Some(Error::Busy){return Err(Error::Busy)}
+        Ok(root().initial.is_some())
+    }
+    pub fn baseline_apply(_:Token)->Result<(),Error>{panic!("candidate took baseline publication")}
+    pub fn scenario(){
+        reset();with(|_|Ok(())).unwrap();assert!(!baseline_activation_pending());
+        with(|_|commit(Some(STAMP),ID)).unwrap();
+        assert!(baseline_activation_pending(),"submitted candidate initial lost its progress opportunity");
+        for state in [ExecutionState::Pending,ExecutionState::Unknown] {
+            with(|_|{initial_execution(ID,STAMP,state);Ok(())}).unwrap();assert!(baseline_activation_pending());
+        }
+        for id in [ApplyId{plan_seq:52,..ID},ApplyId{boot_epoch:8,..ID},ApplyId{target:key(13),..ID},ApplyId{action_index:1,..ID}] {
+            with(|_|{initial_execution(id,STAMP,ExecutionState::Applied);Ok(())}).unwrap();
+            assert!(baseline_activation_pending(),"foreign execution consumed the initial obligation");
+        }
+        with(|_|{initial_execution(ID,PolicyStamp{version:42,..STAMP},ExecutionState::Applied);Ok(())}).unwrap();
+        assert!(baseline_activation_pending());
+        for state in [ExecutionState::Applied,ExecutionState::Failed(Error::Stale)]{
+            reset();with(|_|commit(Some(STAMP),ID)).unwrap();
+            with(|_|{initial_execution(ID,STAMP,state);Err::<(),_>(Error::Busy)}).unwrap_err();
+            assert!(!baseline_activation_pending(),"terminal initial retained priority after a fallible caller");
+            with(|_|{initial_execution(ID,STAMP,ExecutionState::Unknown);Ok(())}).unwrap();
+            assert!(!baseline_activation_pending(),"terminal initial was resurrected by a delayed update");
+            with(|_|commit(Some(PolicyStamp{version:42,..STAMP}),ApplyId{plan_seq:52,..ID})).unwrap();
+            assert!(!baseline_activation_pending(),"later publication stole initial priority");
+        }
+        for wrong in 0..12 {
+            reset();with(|_|commit(if wrong==0{None}else{Some(if wrong==1{PolicyStamp{version:0,..STAMP}}else{STAMP})},ID)).unwrap();
+            with(|_|{let r=root_mut();match wrong {
+                2=>r.first.as_mut().unwrap().sequence+=1,3=>r.first.as_mut().unwrap().taken_ns+=1,
+                4=>r.token.as_mut().unwrap().id+=1,5=>r.token.as_mut().unwrap().owner=key(8),
+                6=>r.token.as_mut().unwrap().boot_epoch+=1,7=>r.first_ready=false,8=>r.phase=Phase::Complete,
+                9=>r.fault=Some(Error::Stale),10=>r.lifecycle.closed=true,11=>r.unpublished=Some(()),_=>()};Ok(())}).unwrap();
+            assert!(!baseline_activation_pending(),"unbound candidate identity requested service: {wrong}");
+        }
+        reset();with(|_|commit(Some(STAMP),ID)).unwrap();
+        // A real new trial reset cannot accept the old initial's delayed state.
+        reset();root_mut().token.as_mut().unwrap().id+=1;
+        with(|_|{initial_execution(ID,STAMP,ExecutionState::Unknown);Ok(())}).unwrap();assert!(!baseline_activation_pending());
+        println!("candidate initial custody passed");
+    }
+}
+pub fn candidate_poll_scenario(){
+    replay::reset();with(|_|replay::commit(Some(STAMP),ID)).unwrap();
+    assert!(replay::baseline_activation_pending(),"submitted candidate initial lost its progress opportunity");
+    let mode=std::env::args().nth(1).unwrap_or_default();
+    if mode=="stale"{with(|s|{s.owner.context.ledger_generation+=1;Ok(())}).unwrap();}
+    if mode=="deadline"{WALL.store(200_000_000,Ordering::Release);}
+    if mode=="failed"||mode=="registry"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::Conflict);Ok(())}).unwrap();}
+    if mode=="registry"{REGISTRY_FAIL.store(true,Ordering::Release);}
+    if mode=="busy"||mode=="deadline"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::Busy);Ok(())}).unwrap();}
+    if mode=="unknown"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::NotReady);Ok(())}).unwrap();}
+    let _=poll(now());
+    let terminal=matches!(mode.as_str(),"stale"|"failed"|"deadline"|"registry");
+    assert_eq!(replay::baseline_activation_pending(),!terminal,"real final Control state did not update the initial hint");
+    if mode=="applied" {
+        task::execute_and_settle();WALL.store(100_040_000,Ordering::Release);poll(now()).unwrap();
+        assert!(!replay::baseline_activation_pending(),"real Scheduler receipt did not retire initial priority");
+    }
+    println!("candidate actual poll passed");
+}

@@ -50,6 +50,7 @@ pub(super) const WORKSPACE_PEAK_BYTES: usize = 1024 * 1024
     + META_PAGES * 4096
     + crate::learning_prewarm::OWNED_BYTES
     + crate::domain_control::core_replay::OWNED_BYTES
+    + root::CANDIDATE_INITIAL_BYTES
     + crate::learning_evidence::HANDOFF_BYTES
     + crate::domain_tasks::CAPTURE_CREDIT_BYTES
     + crate::domain_services::SOURCE_IDENTITY_BYTES
@@ -1027,11 +1028,15 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             }
             // The first callback only bound capture/history. A transient
             // pre-publication failure must not start business work (and mutate
-            // its ledger) before retrying the original fixed baseline.
+            // its ledger) before the original publication has committed.
             trace.site(Site::ActivatePublished);
-            if kind == TrialKind::Baseline && !root::publication_started(token)? {
-                trace.site(Site::ActivateBaseline);
-                let _ = root::baseline_apply(token)?;
+            if !root::publication_started(token)? {
+                if kind == TrialKind::Baseline {
+                    trace.site(Site::ActivateBaseline);
+                    let _ = root::baseline_apply(token)?;
+                } else {
+                    return Ok(false);
+                }
             }
             trace.site(Site::ActivateWork);
             activate_work()?;

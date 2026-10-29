@@ -265,6 +265,18 @@ struct Spectator {
     trial_id: u64,
     fixture: Option<fixture::Fixed>,
 }
+/// Scheduling custody for the first actually committed candidate only. The
+/// control gate owns both this projection and Desired's authoritative state.
+#[derive(Clone, Copy)]
+struct CandidateInitial {
+    token: Token,
+    apply: ApplyId,
+    stamp: PolicyStamp,
+    family: LearningFamily,
+    state: ExecutionState,
+}
+pub(crate) const CANDIDATE_INITIAL_BYTES: usize = core::mem::size_of::<Option<CandidateInitial>>();
+const _: () = assert!(CANDIDATE_INITIAL_BYTES <= 128);
 struct Root {
     registered: [Option<OwnerChecks>; 4],
     serial: u64,
@@ -289,6 +301,7 @@ struct Root {
     cursor: usize,
     selected: Option<Action>,
     initial: Option<ApplyId>,
+    candidate_initial: Option<CandidateInitial>,
     renew_after: u64,
     baseline: [Option<Receipt>; 32],
     baseline_count: usize,
@@ -323,6 +336,7 @@ impl Root {
             cursor: 0,
             selected: None,
             initial: None,
+            candidate_initial: None,
             renew_after: 0,
             baseline: [None; 32],
             baseline_count: 0,
@@ -358,6 +372,29 @@ pub(super) fn publish_baseline_activation_hint() {
                 ExecutionState::Pending | ExecutionState::Unknown
             )
     };
+    let candidate = r.candidate_initial.is_some_and(|initial| {
+        r.phase == Phase::Running
+            && r.fault.is_none()
+            && r.first_ready
+            && r.token == Some(initial.token)
+            && r.initial == Some(initial.apply)
+            && initial.apply.boot_epoch == initial.token.boot_epoch
+            && initial.stamp.version != 0
+            && matches!(
+                initial.state,
+                ExecutionState::Pending | ExecutionState::Unknown
+            )
+            && r.first.is_some_and(|first| {
+                first.sequence == initial.apply.plan_seq
+                    && first.taken_ns == initial.stamp.snapshot_ns
+            })
+            && r.request.is_some_and(|q| {
+                q.kind == TrialKind::Candidate
+                    && q.owner == initial.token.owner
+                    && q.family == initial.family
+                    && q.target == initial.apply.target
+            })
+    });
     let pending = r.token.is_some()
         && r.request.is_some()
         && r.first.is_some()
@@ -365,6 +402,7 @@ pub(super) fn publish_baseline_activation_hint() {
         && r.unpublished.is_none()
         && r.lifecycle.closing().is_none()
         && (activating
+            || candidate
             || baseline
                 && r.baseline
                     .iter()
@@ -1015,6 +1053,7 @@ pub fn reserve(request: Request) -> Result<Token, Error> {
         r.cursor = 0;
         r.selected = None;
         r.initial = None;
+        r.candidate_initial = None;
         r.renew_after = 0;
         r.baseline_count = 0;
         r.closing = None;
@@ -1085,6 +1124,7 @@ pub fn advance(old: Token, request: Request) -> Result<Token, Error> {
         r.rejected = None;
         r.selected = None;
         r.initial = None;
+        r.candidate_initial = None;
         r.renew_after = 0;
         r.cursor = 0;
         r.baseline_count = 0;
@@ -1236,6 +1276,7 @@ fn reserve_spectator_inner(
         r.cursor = 0;
         r.selected = None;
         r.initial = None;
+        r.candidate_initial = None;
         r.renew_after = 0;
         r.baseline_count = 0;
         r.closing = None;
@@ -1483,7 +1524,11 @@ pub(super) fn reject_preparation(
         fail(r, error);
     }
 }
-pub(super) fn published(plan: &Plan, boot: u64) -> Result<(), Error> {
+pub(super) fn published(
+    plan: &Plan,
+    boot: u64,
+    first_stamp: Option<PolicyStamp>,
+) -> Result<(), Error> {
     let r = root_mut();
     let Some(q) = r.request else {
         return Ok(());
@@ -1515,16 +1560,43 @@ pub(super) fn published(plan: &Plan, boot: u64) -> Result<(), Error> {
         // latch is set under the same root gate immediately before Desired,
         // even if the caller later fails to retrieve the receipt.
         if r.initial.is_none() {
-            r.initial = Some(ApplyId {
+            let apply = ApplyId {
                 boot_epoch: boot,
                 controller_epoch: plan.header.controller_epoch,
                 plan_seq: plan.header.plan_seq,
                 action_index: 0,
                 target: q.target,
-            });
+            };
+            r.initial = Some(apply);
+            if q.kind == TrialKind::Candidate {
+                r.candidate_initial =
+                    r.token
+                        .zip(first_stamp)
+                        .map(|(token, stamp)| CandidateInitial {
+                            token,
+                            apply,
+                            stamp,
+                            family: q.family,
+                            state: ExecutionState::Pending,
+                        });
+            }
         }
     }
     Ok(())
+}
+/// Called after Control has finalized the real execution state, including
+/// pre-executor refusal and deadline conversion. No Registry query or retry.
+pub(super) fn initial_execution(apply: ApplyId, stamp: PolicyStamp, state: ExecutionState) {
+    let r = root_mut();
+    if let Some(initial) = r.candidate_initial.as_mut()
+        && r.token == Some(initial.token)
+        && r.initial == Some(apply)
+        && initial.apply == apply
+        && initial.stamp == stamp
+        && !initial.state.terminal()
+    {
+        initial.state = state;
+    }
 }
 fn hash_config(h: &mut Sha256, c: Configuration) -> Result<(), Error> {
     let mut b = [0u8; 32];

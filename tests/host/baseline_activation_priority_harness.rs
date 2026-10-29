@@ -4,6 +4,9 @@ use std::sync::{Mutex, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)] struct Snapshot { sequence: u64, taken_ns: u64 }
 #[derive(Clone, Copy, Eq, PartialEq)] enum TrialKind { Baseline, Candidate }
 #[derive(Clone, Copy, Eq, PartialEq)] enum ExecutionState { Pending, Applied, Unknown, Failed(Error) }
+type LearningFamily = u64;
+#[derive(Clone,Copy,Eq,PartialEq)] struct ApplyId {boot_epoch:u64,plan_seq:u64,target:u64}
+const INITIAL:ApplyId=ApplyId{boot_epoch:1,plan_seq:2,target:12};
 struct State;
 static mut STATE: State = State;
 static CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -23,10 +26,14 @@ mod replay {
     use super::*;
     #[derive(Clone, Copy, Eq, PartialEq)] pub enum Phase { Frozen, Running, Restoring, Faulted, Complete }
     #[derive(Clone, Copy)] pub struct Stamp { pub version: u64 }
+    // Candidate custody is exercised by test_candidate_initial_progress; this
+    // older fixture only supplies its absent cache while testing baselines.
+    #[derive(Clone,Copy)]struct CandidateStamp {version:u64,snapshot_ns:u64}
+    #[derive(Clone,Copy)]struct CandidateInitial {token:Token,apply:ApplyId,stamp:CandidateStamp,family:LearningFamily,state:ExecutionState}
     #[derive(Clone, Copy)] pub struct Receipt { pub state: ExecutionState, pub stamp: Stamp }
-    #[derive(Clone, Copy)] pub struct Token { pub id: u64 }
+    #[derive(Clone, Copy,Eq,PartialEq)] pub struct Token { pub id: u64,pub boot_epoch:u64,pub owner:u64 }
     #[derive(Clone, Copy)] pub struct Request {
-        pub owner: u64, pub target: u64, pub kind: TrialKind,
+        pub owner: u64, pub target: u64, pub kind: TrialKind,pub family:LearningFamily,
         pub on_first: fn(Token, Snapshot) -> Result<(), Error>,
     }
     pub struct Checks { pub owner: u64, pub before_first: fn(Token, Snapshot) -> Result<(), Error> }
@@ -34,12 +41,12 @@ mod replay {
     impl Lifecycle { pub fn closing(&self) -> Option<()> { self.close.then_some(()) } }
     pub struct Root {
         pub registered: [Option<Checks>; 1], pub token: Option<Token>, pub request: Option<Request>,
-        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<u64>,
+        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<ApplyId>,candidate_initial:Option<CandidateInitial>,
         pub baseline_count: usize, pub fault: Option<Error>, pub unpublished: Option<()>, pub lifecycle: Lifecycle,
         pub baseline: [Option<Receipt>;32], pub closing: Option<Receipt>,
     }
     static mut ROOT: Root = Root { registered: [None], token: None, request: None,
-        first: None, first_ready: false, phase: Phase::Complete, initial: None,
+        first: None, first_ready: false, phase: Phase::Complete, initial: None,candidate_initial:None,
         baseline_count: 0, fault: None, unpublished: None, lifecycle: Lifecycle { close: false }, baseline:[None;32],closing:None };
     fn root() -> &'static Root { unsafe { &*core::ptr::addr_of!(ROOT) } }
     pub fn root_mut() -> &'static mut Root { unsafe { &mut *core::ptr::addr_of_mut!(ROOT) } }
@@ -55,7 +62,7 @@ mod replay {
     pub fn reset() {
         let r = root_mut();
         r.registered = [Some(Checks { owner: 7, before_first: |_, _| Ok(()) })];
-        r.token = Some(Token { id: 9 }); r.request = Some(Request { owner: 7, target: 12,
+        r.token = Some(Token { id: 9,boot_epoch:1,owner:7 }); r.request = Some(Request { owner: 7, target: 12,family:1,
             kind: TrialKind::Baseline, on_first: callback });
         r.first = None; r.first_ready = false; r.phase = Phase::Frozen; r.initial = None;
         r.baseline_count = 0; r.fault = None; r.unpublished = None; r.lifecycle.close = false;
