@@ -56,6 +56,12 @@ class RecoveryObservation(unittest.TestCase):
                 negative=subprocess.run(command[:-1]+['--exact','recovery_predicates_retain_real_pending_vector_active_and_partial_cleanup'],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
                 self.assertIn(failure,negative.stdout+negative.stderr)
+            error='s.ipc.stats(t.endpoint)?.depth'
+            self.assertIn(error,original)
+            source.write_text(original.replace(error,'s.ipc.stats(t.endpoint).map_or(0, |stats| stats.depth)'))
+            negative=subprocess.run(command[:-1]+['--exact','recovery_predicates_do_not_advance_on_gate_busy_or_denied_or_retained_credit'],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+            self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertIn('IPC query error was collapsed into drain progress',negative.stdout+negative.stderr)
 
     def test_actual_supervisor_and_kernel_backend_keep_phase_result_and_single_issue(self):
         service=(ROOT/'kernel/src/domain_services.rs').read_text()

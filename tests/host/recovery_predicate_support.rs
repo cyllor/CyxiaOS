@@ -70,6 +70,10 @@ fn construct_recovery_generation(old:ObjectKey,generation:u64,apply:ApplyId)->Re
  assert_eq!(recovery_poll(&mut r,apply).state,ExecutionState::Applied);
  assert_eq!(domain_evidence::header()[384],0,"recipe2 overwrote recipe1 predicate lane");
  assert_eq!(domain_evidence::header()[511]%2,0);
+ let next=ObjectKey{id:key.id,generation:2};let next_apply=ApplyId{plan_seq:444,target:next,..apply};
+ close_admission(next,next_apply).unwrap();assert_eq!(readonly_drained(next),Ok(true));
+ let h=domain_evidence::header();assert_eq!((h[460],h[461],h[453]),(next.id,2,0),"new Task ApplyId inherited first blocker");
+ assert!(h[504..510].iter().all(|v|*v==0));
 }
 #[test]fn recovery_predicates_do_not_advance_on_gate_busy_or_denied_or_retained_credit(){
  let(mut r,_key,apply)=recovery_fixture();recovery_poll(&mut r,apply);
@@ -82,4 +86,9 @@ fn construct_recovery_generation(old:ObjectKey,generation:u64,apply:ApplyId)->Re
  let before=domain_evidence::header();assert!(service_segment(||r.poll(apply,now_ns(),&mut Recovery{apply})).is_none());
  assert_eq!(domain_evidence::header(),before);assert_eq!(COMPLETE_ACTUAL[0].load(Ordering::Acquire),60_000);
  DENY_SETTLE.store(false,Ordering::Release);recovery_poll(&mut r,apply);assert!(bills().iter().any(|v|v.1==60_000));
+ let(mut r,key,apply)=recovery_fixture();recovery_poll(&mut r,apply);
+ locked(|s|{s.tasks[2].pending=false;s.tasks[2].endpoint=ObjectKey{id:999,generation:1};Ok(())}).unwrap();
+ assert_eq!(service_segment(||readonly_drained(key)),Some(Err(Error::Stale)),"IPC query error was collapsed into drain progress");
+ let a=recovery_task_latest();assert_eq!((a[9],a[10],a[11],a[18]),(8,3,Error::Stale as u64+1,7));
+ assert_eq!(a[24],0,"failed IPC query scanned or invented an active dispatch");
 }

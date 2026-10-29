@@ -1,5 +1,11 @@
 # V0.12 continuation — 2026-10-29
 
+## Recovery phase/predicate checkpoint
+
+The next diagnostic now binds the real supervisor phase/issued transition and original backend result to each full Recovery ApplyId, alongside the original TaskGuard drain/stopped/running predicate, queried mask and full active Dispatch. It reuses existing header words under separate Services/Task publications, preserving original resource operations, clocks, short circuit, deadlines and single-issue behavior. [The ABI, TDD boundaries and attribution limits](recovery-observation-evidence.md) distinguish receipt queries from actual progress. It does not add a recovery scheduling opportunity or mark Unknown complete.
+
+Two actual-source groups and nine negative controls pass, including real paid Scheduler/Memory/IPC/cleanup and IPC-error propagation, with construction/EL0/hardware boundaries explicit. All nine v46 checks pass (701 host tests, two environment skips; 84 tooling tests). Both images and selected 33,104/65,536-byte preparation stacks pass; frozen compiled source is `d5e08548cab4163dfd2e064f942a81c520554bd2a8be64c4c99c44aba1b48559`. Fresh native diagnosis follows. All formal acceptance cases and the complete prototype goal remain open.
+
 ## Preparation admission native checkpoint
 
 The frozen admission-diagnostic run ends **FAIL after 601.666108 s**. All nine v45 engineering checks and both per-node builds passed first (699 host tests, two environment skips; 84 tooling tests; selected stack 33,104/65,536 bytes). The post-run code map remains `1a301087380efa1ffb837ce33b2dd8a60658363694454d932279009a90812be3`. Candidate 4's actual initial 424 reaches Applied **12.264 ms** after its snapshot, but later 427 takes **91.157008 ms** and remains invalid. Candidate entry diagnostics record 2,143 open visits and no accept-stop transition; the prior no-first-scope stall is not reproduced. Four CRC-validated archives retain one verified baseline, three exclusions, zero missing events and zero pair labels. Network/hand-off counters have no retained losses or physical overruns in this run; older failures remain independently open.
