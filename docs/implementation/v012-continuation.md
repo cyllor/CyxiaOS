@@ -268,3 +268,38 @@ The reviewed diagnostic adds two fixed banks: Work 512 bytes and Task 1,024 byte
 Four actual-source regressions first compiled and failed on absent Work facts, Task query facts, lifecycle facts and watched identity. They now pass, as do four independent reporting-hook removal negative controls. The tests execute actual Work poll, TaskGuard/SpawnAdmission query, lifecycle and cleanup wrapper; a real Scheduler dispatch checks the active-child flag. Hardware cleanup, return processing and Work outcomes remain controlled boundaries. They verify original result consumption, cached/query-error behavior, odd-publication rejection and unchanged Work completion behavior, not native WCET or the cause of the remaining tail. Independent review finds no production Critical or Important issue. Its fixture-reset Minor is corrected by resetting all six banks and asserting a fresh closing identity in each case, then rerunning the focused fixture successfully.
 
 An initial v36 check fails because a running test imported the older Python helper while reading the updated Rust fixture. The stable-source v37 rerun passes all nine checks: 689 host tests (two skips), 84 tooling tests, workspace/TLS tests, both format checks and both configured Clippy checks. `build-drain-custody-trace/` builds both images and selected preparation stacks at 33,088/65,536 bytes; code source SHA-256 is `f5c4c3d35cbb1ac06af0afd7f70d80f94db13d826e82f2f5de3e43d5504f4d6f`. Fresh native diagnosis follows.
+
+Commit `0aea8b3` remains frozen through `native-single-drain-custody-trace/`, which terminates **FAIL** after 601.132854 s. The post-run source map exactly matches the build. Ordinary client exit is 0; control reports 528 jobs, 457 publications, 380 Applied, 53 rejected, 77 failed and 128 unknown outcomes. Six sides are excluded and durably archived, with zero verified sides/labels and zero training/validation rows; trial 7 is preparing. Task overrun/quarantine, panic and diagnostic-error counts remain zero. Failed source/build and release acceptance stay unattested. Final shared capture loss is zero, retained=drained=119,818, pending=0, temporary collector replies=172,245; this does not establish universal loss freedom.
+
+Committed-redo CRC, inode-extents and whole-file SHA checks validate the stopped archive `/lr-0000000000000001-0000`, 239,296 bytes, SHA-256 `0b525fe33f86be9073e9bc301d12cc5bfcf2ba838eb2527cdeab6c6e75426664`. Length-derived boundaries and the existing truncated-append negative control identify:
+
+| Trial / offset / bytes | Intervals / missing | Capture / verification error | Seal minus observation end |
+| --- | --- | --- | --- |
+| 1 / 0 / 47,872 | 324 / 0 | Deadline / Deadline | 15.716390992 s |
+| 2 / 47,872 / 38,080 | 267 / 0 | Deadline / Deadline | 16.194588992 s |
+| 3 / 85,952 / 34,304 | 208 / 0 | Deadline / Deadline | 16.984890 s |
+| 4 / 120,256 / 35,392 | 225 / 0 | Deadline / Deadline | 15.605494 s |
+| 5 / 155,648 / 47,872 | 324 / 0 | Deadline / Deadline | 16.704984 s |
+| 6 / 203,520 / 35,776 | 231 / 0 | Deadline / Deadline | 16.133746 s |
+
+These complete byte ranges remain diagnostic evidence, not accepted replay. The stopped inspectors validate exact first-scope identity, stable even banks, raw/final-report agreement, and agreement with the final frozen banks retained by the light host observer. Its 16 saved snapshots contain eight Task observations, without extra QMP or guest work.
+
+The first scope starts at 58.503042 s, observation ends at 74.503042 s and seal occurs at 90.219432992 s. Initial policy 334 reaches Applied in 21.782992 ms from first snapshot. Renewal 335 reaches Applied 6.834992 ms after publication. Closing ApplyId `[1,1,364,0,12,1]`, version 336, publishes at 74.662050992 s with deadline 74.712050992 s, but Applied is observed at 74.741960992 s: **79.910 ms** after publication. The earlier run's 30.736 ms result is therefore not a stable execution bound. Probe 251 again has no successful submission or matching created child; only its first/latest Again and total 23 attempts are retained. Control CPU 68,041 + 51,209 + 581,666 = **700,916 ns**, exactly matching archive raw EA; 324 intervals comprise Policy 3, EA/CPU0 103, EW/CPU0 117 and EW/CPU3 101, with no adjacent/overlapping same-class/core intervals.
+
+Work records 18,213 blocked final predicates. Its first snapshot at 74.662620 s has Queued=37, Active=21, unreported=0, first unmet request 43 Active and no warm request. That request's later real query reports Failed(Expired). The last blocked snapshot at 88.469082992 s has only request 92 Active, with no warm request. Task retains the exact replay caller `[90457653396289,1]`. Sampled queries show request 61 / child `[4096,132]` Exiting, flags=0 and no ExitRecord at 76.256924, 78.261354992 and 80.269144 s; its unchanged deadline is 75.503042 s. Later sampled requests 64, 67 and 82 show the same type of obstruction. These samples are observations, not proof of uninterrupted states between them or attribution of every wait.
+
+The final request has a complete matching chain:
+
+| Request 92 / child `[4110,163]` | Native time |
+| --- | --- |
+| Original deadline | 78.503043 s |
+| Created query, Exiting, no return/file/active flag and no exit | 88.306550992 s |
+| Actual lifecycle entry / return | 88.469176992 / 88.469454 s |
+| Actual cleanup entry / successful return, post-Life Free | 88.469180992 / 88.469450992 s |
+| Original ExitRecord finish / actual query sees that exit | 88.469368992 / 88.469868 s |
+| Work predicate first clear / completed Work drain | 88.469936 / 88.470360 s |
+| Capture seal | 90.219432992 s |
+
+The query, lifecycle and cleanup rows all match the same final watch timestamp and original caller/request/child. Work does not report completion before real cleanup publishes the ExitRecord. Closing Applied-to-WorkDrained is **13.728399008 s**, followed by **1.749072992 s** until seal. The 15 matched lifecycle/cleanup observations cover watched IDs, not every lifecycle call. This establishes a concrete cleanup-progress dependency; it does not assign the entire tail to one child or prove that faster cleanup alone will satisfy both deadlines.
+
+Independent review approves entering TDD for at most one additional **independently paid** lifecycle opportunity while the replay owner still projects owned Drain. Keep the existing replay and admission pieces, same nonreentrancy guard, original Ok/Again eligibility, fresh-credit denial and retained old bills. Reuse the actual general phase-0 order: settle published completions, select one item with the existing selector, advance the existing cursor, then run `lifecycle_piece`. Do not select by diagnostic watch, insert a loop, fold cleanup into admission credit, publish exits early or change their timestamps. Required actual-source/real-Scheduler regressions include active/file/unmap Busy custody and retry, cursor fairness, one-item limits, three exact separate bills, disallowed/root-only hints, exhausted credit and negative removal of the new opportunity. Hardware cleanup and native WCET still require their own evidence. No such scheduling repair is included in this diagnostic commit; the full goal, all 69 catalogue cases and filesystem matrix remain open.
