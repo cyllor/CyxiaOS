@@ -95,6 +95,8 @@ class EvidenceParserTests(unittest.TestCase):
             ('TRACE_DRAIN_TASK_EVIDENCE', 'trace_drain_task_evidence', 128),
             ('TRACE_PREPARATION_ROOT_EVIDENCE', 'trace_preparation_root_evidence', 64),
             ('TRACE_PREPARATION_OWNER_EVIDENCE', 'trace_preparation_owner_evidence', 64),
+            ('NETWORK_PIECE_EVIDENCE', 'network_piece_evidence', 64),
+            ('NETWORK_SETTLEMENT_EVIDENCE', 'network_settlement_evidence', 64),
         ]:
             values = list(range(count))
             snapshot[name] = encode(values)

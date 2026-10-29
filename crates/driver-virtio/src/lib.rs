@@ -14,6 +14,40 @@ pub mod queue;
 pub mod rng;
 pub mod snapshot;
 
+/// Read-only operation labels. A marker is never a scheduler checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum DiagnosticStage {
+    TcpHealth = 1,
+    TcpClock,
+    TcpTime,
+    EthernetTx,
+    EthernetRx,
+    NetRxPoll,
+    NetRxHeader,
+    NetRxDelivery,
+    NetRxCopy,
+    NetRxRearm,
+    QueueStatus,
+    QueueFlush,
+    QueueUsedSync,
+    QueueIdleAck,
+    QueueElementSync,
+    QueueDecode,
+    QueueValidate,
+    QueuePayloadSync,
+    QueueCopyPublish,
+    QueueCompletionAck,
+    TcpFlush,
+    TcpSocketSnapshot,
+    TcpIngress,
+    TcpIngressResult,
+    TcpEgress,
+    TcpRemoteState,
+    IpcDrain,
+    TcpAbort,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Address,
@@ -32,6 +66,9 @@ pub enum Error {
 /// DMA addresses must identify the supplied pinned memory for its complete lifetime;
 /// cache maintenance and barriers must cover CPU/device ownership transitions.
 pub unsafe trait Platform {
+    /// Copy a scalar diagnostic only; implementations must not schedule,
+    /// borrow a device/owner, read clocks or alter DMA custody here.
+    fn diagnostic_stage(&self, _stage: u64) {}
     fn physical(&self, address: usize, len: usize) -> Result<u64, Error>;
     /// Synchronize an exclusively owned DMA region before CPU access or after writes.
     /// # Safety

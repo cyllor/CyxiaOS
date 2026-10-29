@@ -91,6 +91,8 @@ mod model_bank;
 #[cfg(feature = "net-selftest")]
 mod net_selftest;
 #[cfg(feature = "unified-runtime")]
+mod network_diagnostics;
+#[cfg(feature = "unified-runtime")]
 mod peer_replay;
 #[cfg(feature = "unified-runtime")]
 mod service_windows;

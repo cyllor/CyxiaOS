@@ -32,7 +32,11 @@ class NativeTaskCredit(unittest.TestCase):
         receive = driver[driver.index("pub fn receive_with_checkpoint"):]
         self.assertIn("self.poll_rx_with_checkpoint(p, checkpoint)?;\n        checkpoint();", receive)
         self.assertIn("copy_from_slice", receive)
-        self.assertIn("checkpoint();\n        self.rx.release(token)?;", receive)
+        copied=receive.index("copy_from_slice")
+        boundary=receive.index("checkpoint();",copied)
+        rearm=receive.index("Stage::NetRxRearm",boundary)
+        self.assertLess(boundary,rearm)
+        self.assertLess(rearm,receive.index("self.rx.release(token)?;"))
         self.assertIn("receive_frame_with_checkpoint", transport)
         self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
         record = queue[queue.index("let at = 4 + usize::from(self.used % self.size) * 8;") :]
@@ -56,7 +60,8 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("pub const IDLE_TIMEOUT_SECS: u64 = 60;", tcp)
         ingress = tcp[tcp.index("let queued = before.send_queue();"):
                       tcp.index("// A hardware multichain port")]
-        self.assertIn("checkpoint();\n        let ingress = self", ingress)
+        self.assertLess(ingress.index("checkpoint();"),ingress.index("Stage::TcpIngress"))
+        self.assertLess(ingress.index("Stage::TcpIngress"),ingress.index("let ingress = self"))
         self.assertIn("poll_ingress_single(now, &mut self.device, &mut self.sockets);\n        checkpoint();", ingress)
         self.assertIn("pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;", tls)
         self.assertIn("HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000", tls)

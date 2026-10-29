@@ -198,6 +198,9 @@ impl<P: Port> ObservedPort<P> {
     }
 }
 impl<P: Port> Port for ObservedPort<P> {
+    fn diagnostic_stage(&self, stage: u64) {
+        self.inner.diagnostic_stage(stage);
+    }
     fn flush(&mut self) -> Result<(), Error> {
         self.inner.flush()
     }

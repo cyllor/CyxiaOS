@@ -1,6 +1,6 @@
 //! Independent pinned split-ring chains, with one publication per bounded batch.
 //! Prepared chains are private; published/unknown chains are never cancelled.
-use crate::{Error, Page, Platform, Transport};
+use crate::{DiagnosticStage as Stage, Error, Page, Platform, Transport};
 
 pub const MAX_CHAINS: usize = 8;
 pub const MAX_DELAY_NS: u64 = 50_000;
@@ -452,6 +452,7 @@ impl BatchQueue {
         p: &impl Platform,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<Option<Completion>, Error> {
+        p.diagnostic_stage(Stage::QueueStatus as u64);
         if self.poisoned {
             return Err(Error::Device);
         }
@@ -460,27 +461,33 @@ impl BatchQueue {
             return Err(Error::Device);
         }
         checkpoint();
+        p.diagnostic_stage(Stage::QueueFlush as u64);
         self.flush_due(t, p)?;
         checkpoint();
+        p.diagnostic_stage(Stage::QueueUsedSync as u64);
         unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         let end = self.memory.used.get16(2);
         checkpoint();
         if end == self.used {
+            p.diagnostic_stage(Stage::QueueIdleAck as u64);
             let irq = t.read(0x60);
             t.write(0x64, irq & 3);
             p.barrier();
             return Ok(None);
         }
         let at = 4 + usize::from(self.used % self.size) * 8;
+        p.diagnostic_stage(Stage::QueueElementSync as u64);
         unsafe { p.sync(self.memory.used.address() + at, 8) };
         // Cache acquisition and field decoding are independent bounded pieces.
         // No DMA slice escapes and the queue remains exclusively borrowed.
         checkpoint();
+        p.diagnostic_stage(Stage::QueueDecode as u64);
         p.barrier();
         let id = self.memory.used.get32(at);
         let len = self.memory.used.get32(at + 4);
         checkpoint();
+        p.diagnostic_stage(Stage::QueueValidate as u64);
         let owned = self
             .slots
             .iter()
@@ -504,12 +511,14 @@ impl BatchQueue {
         }
         checkpoint();
         if len != 0 {
+            p.diagnostic_stage(Stage::QueuePayloadSync as u64);
             unsafe { p.sync(self.memory.response[index].address(), len as usize) };
             p.barrier();
         }
         // DMA cache acquisition can be the cold part of a native QEMU turn.
         // Settle it before copying, while the completed chain is still owned.
         checkpoint();
+        p.diagnostic_stage(Stage::QueueCopyPublish as u64);
         self.memory.response[index].copy_prefix_to(out, len as usize);
         self.slots[index].state = State::Complete;
         self.used = self.used.wrapping_add(1);
@@ -517,6 +526,7 @@ impl BatchQueue {
         self.stats.last_completed_version = self.stats.last_completed_version.max(s.version);
         // Publish a complete, queryable token before paying for MMIO IRQ ACK.
         checkpoint();
+        p.diagnostic_stage(Stage::QueueCompletionAck as u64);
         let irq = t.read(0x60);
         t.write(0x64, irq & 3);
         p.barrier();

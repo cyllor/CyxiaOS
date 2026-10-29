@@ -344,12 +344,14 @@ fn mechanism_progress(coordinator: &mut crate::smp::prototype_runtime::Coordinat
     crate::domain_tasks::service_baseline_progress();
 }
 
-fn resume_network_service(coordinator: &mut crate::smp::prototype_runtime::Coordinator) {
+fn resume_network_service(
+    coordinator: &mut crate::smp::prototype_runtime::Coordinator,
+) -> crate::domain_tasks::Credit {
     loop {
-        if crate::domain_tasks::begin_service_segment().is_some()
+        if let Some(credit) = crate::domain_tasks::begin_service_segment()
             && crate::domain_tasks::revalidate_service_segment()
         {
-            return;
+            return credit;
         }
         mechanism_progress(coordinator);
     }
@@ -364,7 +366,7 @@ fn network_turn(
         crate::unified_task::transport(false);
         return Ok(TcpState::Closed);
     };
-    let Some(_) = crate::domain_tasks::begin_service_segment() else {
+    let Some(credit) = crate::domain_tasks::begin_service_segment() else {
         return link.state();
     };
     if !crate::domain_tasks::revalidate_service_segment() {
@@ -372,15 +374,32 @@ fn network_turn(
     }
     let mut network_stage = 40u64;
     service_stage(network_stage);
+    let turn = crate::network_diagnostics::new_turn();
+    let mut ordinal = 0;
+    let mut ticket = crate::network_diagnostics::begin(
+        credit.sequence,
+        credit.thread,
+        credit.reserved_ns,
+        turn,
+        ordinal,
+    );
     // Stopped-snapshot instrumentation is not work owned by the following
     // service reservation. Start actual accounting after publishing it.
     let mut started = timer::cpu_ticks();
     let mut checkpoint = || {
-        finish_service(started);
+        finish_network_service(started, ticket);
         mechanism_progress(coordinator);
-        resume_network_service(coordinator);
+        let credit = resume_network_service(coordinator);
         network_stage = network_stage.saturating_add(1);
         service_stage(network_stage);
+        ordinal += 1;
+        ticket = crate::network_diagnostics::begin(
+            credit.sequence,
+            credit.thread,
+            credit.reserved_ns,
+            turn,
+            ordinal,
+        );
         started = timer::cpu_ticks();
     };
     let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
@@ -388,10 +407,11 @@ fn network_turn(
         // Socket polling and IPC dequeue are separate bounded owners. The
         // callback runs with no socket/device or task lock held.
         checkpoint();
+        crate::network_diagnostics::stage(cyxia_driver_virtio::DiagnosticStage::IpcDrain as u64);
         drain_network(link, epoch);
     }
     drop(checkpoint);
-    finish_service(started);
+    finish_network_service(started, ticket);
     let connected = matches!(state, Ok(TcpState::Established));
     crate::unified_task::transport(connected && epoch != 0);
     state
@@ -409,6 +429,16 @@ fn progress(
 fn finish_service(started: u64) {
     let actual_ns = timer::cpu_elapsed_ns(started);
     let finished_ns = Board.now_ns();
+    match crate::domain_tasks::complete_service(actual_ns, finished_ns) {
+        Ok(()) | Err(Error::Budget) => {}
+        Err(_) => fail(30),
+    }
+}
+
+fn finish_network_service(started: u64, ticket: Option<crate::network_diagnostics::Ticket>) {
+    let actual_ns = timer::cpu_elapsed_ns(started);
+    let finished_ns = Board.now_ns();
+    crate::network_diagnostics::finish(ticket, actual_ns, finished_ns);
     match crate::domain_tasks::complete_service(actual_ns, finished_ns) {
         Ok(()) | Err(Error::Budget) => {}
         Err(_) => fail(30),

@@ -1,7 +1,7 @@
 //! Eight independently owned RX and TX buffers, with private TX publication.
 use super::{BUFFER, HEADER, MAX_FRAME, Net};
 use crate::{
-    Error, Platform, Transport,
+    DiagnosticStage as Stage, Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, NotifyFeedback, NotifyRequest, NotifyStats, Token},
 };
 pub struct BatchedNet {
@@ -189,6 +189,7 @@ impl BatchedNet {
         p: &impl Platform,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<bool, Error> {
+        p.diagnostic_stage(Stage::NetRxPoll as u64);
         self.healthy(p)?;
         if self.received.is_some() {
             return Ok(true);
@@ -208,6 +209,7 @@ impl BatchedNet {
                     return Err(e);
                 }
             };
+        p.diagnostic_stage(Stage::NetRxHeader as u64);
         let flags = self.packet[0];
         let gso = self.packet[1];
         let buffers = u16::from_le_bytes([self.packet[10], self.packet[11]]);
@@ -234,14 +236,17 @@ impl BatchedNet {
     ) -> Result<Option<usize>, Error> {
         self.poll_rx_with_checkpoint(p, checkpoint)?;
         checkpoint();
+        p.diagnostic_stage(Stage::NetRxDelivery as u64);
         let Some((token, len)) = self.received else {
             return Ok(None);
         };
         if out.len() < len {
             return Err(Error::Address);
         }
+        p.diagnostic_stage(Stage::NetRxCopy as u64);
         out[..len].copy_from_slice(&self.packet[HEADER..HEADER + len]);
         checkpoint();
+        p.diagnostic_stage(Stage::NetRxRearm as u64);
         self.rx.release(token)?;
         self.received = None;
         self.rx

@@ -1,7 +1,7 @@
 //! Bounded bridge between a polling NIC and smoltcp. One pending frame each
 //! way; backpressure never overwrites DMA or a staged TCP packet.
 use cyxia_driver_virtio::{
-    Error as DriverError, Platform,
+    DiagnosticStage as Stage, Error as DriverError, Platform,
     net::{BatchedNet, Net},
 };
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -19,6 +19,8 @@ pub enum Error {
 /// Serialized owner of an Ethernet device. Success from send means queued,
 /// never that the peer received it. No host socket or protocol proxy is used.
 pub trait Port {
+    /// Read-only scalar forwarding, with no scheduler or device effect.
+    fn diagnostic_stage(&self, _stage: u64) {}
     fn send(&mut self, frame: &[u8]) -> Result<(), Error>;
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error>;
     fn receive_with_checkpoint(
@@ -111,6 +113,9 @@ pub struct VirtioPort<'a, P, N = Net> {
 }
 
 impl<P: Platform, N: VirtioLink> Port for VirtioPort<'_, P, N> {
+    fn diagnostic_stage(&self, stage: u64) {
+        self.platform.diagnostic_stage(stage);
+    }
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.net
             .poll_transmit(self.platform)
@@ -207,6 +212,7 @@ impl<P: Port> Ethernet<P> {
     }
 
     fn service_inner(&mut self, checkpoint: &mut dyn FnMut()) -> Result<(), Error> {
+        self.port.diagnostic_stage(Stage::EthernetTx as u64);
         if self.tx.len != 0 {
             match self.port.send(&self.tx.bytes[..self.tx.len]) {
                 Ok(()) => self.tx.len = 0,
@@ -215,6 +221,7 @@ impl<P: Port> Ethernet<P> {
             }
         }
         checkpoint();
+        self.port.diagnostic_stage(Stage::EthernetRx as u64);
         if self.rx.len == 0
             && let Some(len) = self
                 .port

@@ -1,6 +1,7 @@
 //! A single statically provisioned TCP stream over native Ethernet/ARP/IPv4.
 //! Its plaintext bytes must be consumed only by the TLS engine.
 use crate::device::{Ethernet, Port};
+use cyxia_driver_virtio::DiagnosticStage as Stage;
 mod observe;
 pub use observe::Observation;
 use observe::ObservedPort;
@@ -191,29 +192,39 @@ impl<'a, P: Port> Tcp<'a, P> {
         now_ms: u64,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<State, Error> {
+        self.device.port().diagnostic_stage(Stage::TcpHealth as u64);
         self.healthy()?;
         checkpoint();
+        self.device.port().diagnostic_stage(Stage::TcpClock as u64);
         if now_ms < self.last_ms || now_ms > i64::MAX as u64 {
+            self.device.port().diagnostic_stage(Stage::TcpAbort as u64);
             self.abort();
             return Err(Error::Clock);
         }
         self.last_ms = now_ms;
         checkpoint();
+        self.device.port().diagnostic_stage(Stage::TcpTime as u64);
         self.device.port_mut().set_time(now_ms);
         // Preflight state is complete and no device/socket borrow is live.
         // Give the first cold NIC service operation its own native credit.
         checkpoint();
         if self.device.service_with_checkpoint(checkpoint).is_err() {
+            self.device.port().diagnostic_stage(Stage::TcpAbort as u64);
             self.abort();
             return Err(Error::Device);
         }
         checkpoint();
+        self.device.port().diagnostic_stage(Stage::TcpFlush as u64);
         if self.device.port_mut().flush().is_err() {
+            self.device.port().diagnostic_stage(Stage::TcpAbort as u64);
             self.abort();
             return Err(Error::Device);
         }
         checkpoint();
 
+        self.device
+            .port()
+            .diagnostic_stage(Stage::TcpSocketSnapshot as u64);
         let now = Instant::from_millis(now_ms as i64);
         let before = self.sockets.get::<Socket>(self.socket);
         let queued = before.send_queue();
@@ -222,10 +233,16 @@ impl<'a, P: Port> Tcp<'a, P> {
         // It receives its own exact physical-credit segment and completes all
         // borrows before the following safe point.
         checkpoint();
+        self.device
+            .port()
+            .diagnostic_stage(Stage::TcpIngress as u64);
         let ingress = self
             .interface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
         checkpoint();
+        self.device
+            .port()
+            .diagnostic_stage(Stage::TcpIngressResult as u64);
         let after = self.sockets.get::<Socket>(self.socket);
         if ingress != smoltcp::iface::PollIngressSingleResult::None {
             self.device.port_mut().ingress_processed(
@@ -241,10 +258,12 @@ impl<'a, P: Port> Tcp<'a, P> {
         // every complete descriptor-chain attempt. This prevents a batch from
         // being billed as one non-preemptible native CPU segment.
         for _ in 0..self.device.port().burst_capacity().clamp(1, 8) {
+            self.device.port().diagnostic_stage(Stage::TcpEgress as u64);
             let egress = self
                 .interface
                 .poll_egress(now, &mut self.device, &mut self.sockets);
             if self.device.service_with_checkpoint(checkpoint).is_err() {
+                self.device.port().diagnostic_stage(Stage::TcpAbort as u64);
                 self.abort();
                 return Err(Error::Device);
             }
@@ -257,11 +276,16 @@ impl<'a, P: Port> Tcp<'a, P> {
                 break;
             }
         }
+        self.device.port().diagnostic_stage(Stage::TcpFlush as u64);
         if self.device.port_mut().flush().is_err() {
+            self.device.port().diagnostic_stage(Stage::TcpAbort as u64);
             self.abort();
             return Err(Error::Device);
         }
         checkpoint();
+        self.device
+            .port()
+            .diagnostic_stage(Stage::TcpRemoteState as u64);
         let socket = self.sockets.get::<Socket>(self.socket);
         if let Some(endpoint) = socket.remote_endpoint()
             && (endpoint.addr != IpAddress::Ipv4(Ipv4Address::from(self.config.peer))

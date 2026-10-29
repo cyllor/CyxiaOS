@@ -4,6 +4,12 @@ pub struct Board;
 // SAFETY: CPU0 owns statically pinned kernel DMA pools at HIGH+PA. This board
 // maps the complete kernel load budget; IRQ handlers never access these queues.
 unsafe impl Platform for Board {
+    fn diagnostic_stage(&self, stage: u64) {
+        #[cfg(feature = "unified-runtime")]
+        crate::network_diagnostics::stage(stage);
+        #[cfg(not(feature = "unified-runtime"))]
+        let _ = stage;
+    }
     fn physical(&self, address: usize, len: usize) -> Result<u64, Error> {
         let pa = (address as u64)
             .checked_sub(super::HIGH)

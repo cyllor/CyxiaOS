@@ -1138,6 +1138,8 @@ pub fn begin_service_segment() -> Option<Credit> {
             s.scheduler.complete(d, 0, RunState::Runnable, now)?;
             return Ok(None);
         }
+        #[cfg(feature = "unified-runtime")]
+        crate::network_diagnostics::admitted(d);
         let cpu_started = timer::cpu_ticks();
         s.active[0] = Some(Active {
             dispatch: d,
@@ -1332,6 +1334,17 @@ fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
     let result = s
         .scheduler
         .complete(active.dispatch, actual, active.state, finished);
+    let still_active = s.scheduler.active(slot).is_some();
+    #[cfg(feature = "unified-runtime")]
+    if slot == 0 {
+        crate::network_diagnostics::settled(
+            active.dispatch,
+            actual,
+            finished,
+            result,
+            still_active,
+        );
+    }
     #[cfg(not(test))]
     if let Some(before_version) = before_version {
         crate::learning_evidence::execution_trace::settled(
@@ -1342,12 +1355,12 @@ fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
                 settled_ns: now_ns(),
                 before_version,
                 after_version: s.scheduler.policy_receipt(active.dispatch.group),
-                still_active: s.scheduler.active(slot).is_some(),
+                still_active,
                 result,
             },
         );
     }
-    if s.scheduler.active(slot).is_some() {
+    if still_active {
         if slot == 0
             && crate::storage_fault_capture::PROFILE
             && let Err(error) = result

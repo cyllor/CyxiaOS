@@ -30,6 +30,9 @@ pub mod timer {
     pub fn cpu_elapsed_ns(start: u64) -> u64 { cpu_ticks() - start }
 }
 mod domain_platform { pub fn now_ns() -> u64 { super::now_ns() } }
+// This fixture covers cancellation/capture custody. Network provenance has
+// its separate actual-network/real-Scheduler regression.
+mod network_diagnostics { pub fn admitted(_: super::Dispatch) {} }
 fn now_ns() -> u64 { timer::ticks() }
 fn group(id: u64) -> ObjectKey { ObjectKey { id, generation: 1 } }
 fn builtin(slot: usize) -> ObjectKey { group(slot as u64) }
