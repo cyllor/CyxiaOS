@@ -8,7 +8,9 @@ use cyxia_contracts::{ConsoleOps, PlatformError};
 use cyxia_prototype::{
     domains::{
         Action, ApplyId, Error, ObjectKey, PolicyStamp,
-        maintenance::{ConsoleHardware, ConsolePump, RecoveryBackend, RecoverySupervisor},
+        maintenance::{
+            ConsoleHardware, ConsolePump, RecoveryBackend, RecoveryObservation, RecoverySupervisor,
+        },
         platform::TimerClass,
     },
     features::{DomainObservation, TargetFeatures},
@@ -590,6 +592,12 @@ struct Recovery {
     apply: ApplyId,
 }
 impl RecoveryBackend for Recovery {
+    fn observed(&mut self, observation: &RecoveryObservation) {
+        crate::domain_evidence::recovery_observation(
+            observation,
+            cyxia_arch_aarch64::cpu::slot() as u64,
+        );
+    }
     fn close_admission(&mut self, target: ObjectKey) -> Result<(), Error> {
         crate::domain_tasks::close_admission(target, self.apply)
     }

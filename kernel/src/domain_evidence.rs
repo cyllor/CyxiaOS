@@ -110,6 +110,137 @@ pub fn optimization_stop(context: [u64; 20]) {
     }
     DOMAIN_CONTROL_EVIDENCE.0[191].fetch_add(1, Ordering::Release);
 }
+/// Services-owner writer, independent of Control/Task header publications.
+/// Per recipe 1/2:256/320, latest +8..+33, first Unknown +36..+61,
+/// +2 total, +3 current-identity polls, +4 identity changes, +5 first present,
+/// +63 seqlock. First Unknown belongs only to the latest full ApplyId.
+pub fn recovery_observation(
+    observation: &cyxia_prototype::domains::maintenance::RecoveryObservation,
+    cpu: u64,
+) {
+    let r = observation.receipt;
+    if !(1..=2).contains(&r.recipe) {
+        return;
+    }
+    let at = 256 + (usize::from(r.recipe) - 1) * 64;
+    let apply = r.apply;
+    let identity = [
+        apply.boot_epoch,
+        apply.controller_epoch,
+        apply.plan_seq,
+        u64::from(apply.action_index),
+        apply.target.id,
+        apply.target.generation,
+    ];
+    DOMAIN_CONTROL_EVIDENCE.0[at + 63].fetch_add(1, Ordering::AcqRel);
+    if identity
+        .iter()
+        .enumerate()
+        .any(|(i, value)| get(at + 8 + i) != *value)
+    {
+        put(at + 3, 0);
+        put(at + 5, 0);
+        add(at + 4);
+        for i in 36..62 {
+            put(at + i, 0);
+        }
+    }
+    let before = state(observation.state_before);
+    let after = state(r.state);
+    let (result, error) = match observation.result {
+        Ok(true) => (1, 0),
+        Ok(false) => (2, 0),
+        Err(e) => (3, e as u64 + 1),
+    };
+    let policy = observation.policy.unwrap_or_default();
+    let row = [
+        identity[0],
+        identity[1],
+        identity[2],
+        identity[3],
+        identity[4],
+        identity[5],
+        u64::from(r.recipe),
+        policy.version,
+        r.generation,
+        r.started_ns,
+        observation.at_ns,
+        u64::from(observation.phase_before),
+        u64::from(observation.issued_before),
+        u64::from(observation.phase_after),
+        u64::from(observation.issued_after),
+        u64::from(observation.method),
+        result,
+        error,
+        before.0,
+        before.1,
+        after.0,
+        after.1,
+        r.finished_ns,
+        policy.snapshot_ns,
+        policy.installed_until_ns,
+        cpu,
+    ];
+    put(at, 0x4359_5253_5643_0001);
+    put(at + 1, 1);
+    add(at + 2);
+    add(at + 3);
+    for (i, value) in row.iter().copied().enumerate() {
+        put(at + 8 + i, value);
+    }
+    if r.state == ExecutionState::Unknown && get(at + 5) == 0 {
+        for (i, value) in row.into_iter().enumerate() {
+            put(at + 36 + i, value);
+        }
+        put(at + 5, 1);
+    }
+    DOMAIN_CONTROL_EVIDENCE.0[at + 63].fetch_add(1, Ordering::Release);
+}
+/// TaskGuard writer. Per recipe 1/2:384/448, latest +8..+55, first blocked
+/// summary +56..+61, +5 presence, +63 independent seqlock. No clock/query.
+pub fn recovery_predicate(recipe: u16, context: [u64; 48]) {
+    if !(1..=2).contains(&recipe) {
+        return;
+    }
+    let at = 384 + (usize::from(recipe) - 1) * 64;
+    DOMAIN_CONTROL_EVIDENCE.0[at + 63].fetch_add(1, Ordering::AcqRel);
+    if context[..6]
+        .iter()
+        .enumerate()
+        .any(|(i, value)| get(at + 8 + i) != *value)
+    {
+        put(at + 3, 0);
+        put(at + 5, 0);
+        add(at + 4);
+        for i in 56..62 {
+            put(at + i, 0);
+        }
+    }
+    put(at, 0x4359_5254_534b_0001);
+    put(at + 1, 1);
+    add(at + 2);
+    add(at + 3);
+    if (context[9] != 0 || context[10] == 3) && get(at + 5) == 0 {
+        for (i, value) in [
+            context[9],
+            context[8],
+            context[6],
+            context[7],
+            get(at + 2),
+            context[10],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(at + 56 + i, value);
+        }
+        put(at + 5, 1);
+    }
+    for (i, value) in context.into_iter().enumerate() {
+        put(at + 8 + i, value);
+    }
+    DOMAIN_CONTROL_EVIDENCE.0[at + 63].fetch_add(1, Ordering::Release);
+}
 /// Called under the same control-owner gate as begin/finish/progress. An
 /// accepted action owns its original input until the executor settles it;
 /// UNKNOWN is a live obligation, not an eviction opportunity. A full capture

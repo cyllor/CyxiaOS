@@ -2129,16 +2129,150 @@ pub fn close_admission(key: ObjectKey, apply: ApplyId) -> Result<(), Error> {
         Ok(())
     })
 }
+struct RecoveryPredicate {
+    method: u64,
+    reason: u64,
+    known: u64,
+    detail: [u64; 5],
+    active: Option<Dispatch>,
+}
+impl RecoveryPredicate {
+    fn new(method: u64) -> Self {
+        Self {
+            method,
+            reason: 0,
+            known: 0,
+            detail: [0; 5],
+            active: None,
+        }
+    }
+    fn emit(self, s: &State, i: usize, result: Result<bool, Error>) {
+        let t = &s.tasks[i];
+        let Some(apply) = (if self.method == 3 {
+            t.start_apply
+        } else {
+            t.stop_apply
+        }) else {
+            return;
+        };
+        let mut row = [0; 48];
+        let (result_tag, error) = match result {
+            Ok(true) => (1, 0),
+            Ok(false) => (2, 0),
+            Err(e) => (3, e as u64 + 1),
+        };
+        row[..25].copy_from_slice(&[
+            apply.boot_epoch,
+            apply.controller_epoch,
+            apply.plan_seq,
+            u64::from(apply.action_index),
+            apply.target.id,
+            apply.target.generation,
+            t.key.id,
+            t.key.generation,
+            self.method,
+            if result.is_err() && self.reason == 0 {
+                8
+            } else {
+                self.reason
+            },
+            result_tag,
+            error,
+            t.life as u64 + 1,
+            u64::from(t.pending),
+            u64::from(t.closed),
+            t.heartbeat_ns,
+            t.endpoint.id,
+            t.endpoint.generation,
+            self.known,
+            self.detail[0],
+            self.detail[1],
+            self.detail[2],
+            self.detail[3],
+            self.detail[4],
+            u64::from(self.active.is_some()),
+        ]);
+        if let Some(d) = self.active {
+            row[25..38].copy_from_slice(&[
+                d.sequence,
+                d.thread.id,
+                d.thread.generation,
+                d.group.id,
+                d.group.generation,
+                u64::from(d.cpu),
+                d.core_generation,
+                d.window,
+                d.started_ns,
+                d.reserved_ns,
+                d.reason as u64,
+                d.waited_ns,
+                d.policy_version,
+            ]);
+        }
+        row[38..45].copy_from_slice(&[
+            t.deadline,
+            u64::from(t.cpu),
+            t.group.id,
+            t.group.generation,
+            u64::from(t.start_apply == Some(apply)),
+            u64::from(t.stop_apply == Some(apply)),
+            u64::from(t.recipe),
+        ]);
+        crate::domain_evidence::recovery_predicate(t.recipe, row);
+    }
+}
 pub fn readonly_drained(key: ObjectKey) -> Result<bool, Error> {
     locked(|s| {
         let i = recovery_index(s, key)?;
         let t = &s.tasks[i];
-        Ok(t.closed
-            && !t.pending
-            && !FILE_BUSY[i].load(Ordering::Acquire)
-            && s.vectors[i].as_ref().is_none_or(SubmitVector::complete)
-            && (t.endpoint == ZERO || s.ipc.stats(t.endpoint)?.depth == 0)
-            && !s.active.iter().flatten().any(|a| a.dispatch.thread == key))
+        let mut trace = RecoveryPredicate::new(1);
+        let result = (|| {
+            if !t.closed {
+                trace.reason = 1;
+                return Ok(false);
+            }
+            if t.pending {
+                trace.reason = 2;
+                return Ok(false);
+            }
+            trace.known |= 1;
+            let busy = FILE_BUSY[i].load(Ordering::Acquire);
+            trace.detail[0] = u64::from(busy);
+            if busy {
+                trace.reason = 3;
+                return Ok(false);
+            }
+            trace.known |= 2;
+            let complete = s.vectors[i].as_ref().is_none_or(SubmitVector::complete);
+            trace.detail[1] = u64::from(complete);
+            if !complete {
+                trace.reason = 4;
+                return Ok(false);
+            }
+            if t.endpoint != ZERO {
+                trace.known |= 4;
+                let depth = s.ipc.stats(t.endpoint)?.depth;
+                trace.detail[2] = depth as u64;
+                if depth != 0 {
+                    trace.reason = 5;
+                    return Ok(false);
+                }
+            }
+            trace.known |= 16;
+            trace.active = s
+                .active
+                .iter()
+                .flatten()
+                .find(|a| a.dispatch.thread == key)
+                .map(|a| a.dispatch);
+            if trace.active.is_some() {
+                trace.reason = 6;
+                return Ok(false);
+            }
+            Ok(true)
+        })();
+        trace.emit(s, i, result);
+        result
     })
 }
 pub fn request_stop(key: ObjectKey, apply: ApplyId) -> Result<(), Error> {
@@ -2157,10 +2291,42 @@ pub fn request_stop(key: ObjectKey, apply: ApplyId) -> Result<(), Error> {
 pub fn stopped(key: ObjectKey) -> Result<bool, Error> {
     locked(|s| {
         let i = recovery_index(s, key)?;
-        Ok(s.tasks[i].life == Life::Free
-            && s.tasks[i].endpoint == ZERO
-            && s.memory.owner_pages(key) == Err(Error::Stale)
-            && !s.active.iter().flatten().any(|a| a.dispatch.thread == key))
+        let mut trace = RecoveryPredicate::new(2);
+        let result = (|| {
+            if s.tasks[i].life != Life::Free {
+                trace.reason = 1;
+                return Ok(false);
+            }
+            if s.tasks[i].endpoint != ZERO {
+                trace.reason = 2;
+                return Ok(false);
+            }
+            trace.known |= 8;
+            let pages = s.memory.owner_pages(key);
+            trace.detail[3] = if pages.is_ok() { 1 } else { 2 };
+            trace.detail[4] = match pages {
+                Ok(n) => n as u64,
+                Err(e) => e as u64 + 1,
+            };
+            if pages != Err(Error::Stale) {
+                trace.reason = 3;
+                return Ok(false);
+            }
+            trace.known |= 16;
+            trace.active = s
+                .active
+                .iter()
+                .flatten()
+                .find(|a| a.dispatch.thread == key)
+                .map(|a| a.dispatch);
+            if trace.active.is_some() {
+                trace.reason = 4;
+                return Ok(false);
+            }
+            Ok(true)
+        })();
+        trace.emit(s, i, result);
+        result
     })
 }
 pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(), Error> {
@@ -2257,11 +2423,37 @@ pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(),
 }
 pub fn running(key: ObjectKey) -> Result<bool, Error> {
     locked(|s| {
-        let t = &s.tasks[recovery_index(s, key)?];
-        Ok(matches!(t.life, Life::Ready | Life::Running)
-            && t.heartbeat_ns != 0
-            && t.endpoint != ZERO
-            && s.memory.owner_pages(key).is_ok())
+        let i = recovery_index(s, key)?;
+        let t = &s.tasks[i];
+        let mut trace = RecoveryPredicate::new(3);
+        let result = (|| {
+            if !matches!(t.life, Life::Ready | Life::Running) {
+                trace.reason = 1;
+                return Ok(false);
+            }
+            if t.heartbeat_ns == 0 {
+                trace.reason = 2;
+                return Ok(false);
+            }
+            if t.endpoint == ZERO {
+                trace.reason = 3;
+                return Ok(false);
+            }
+            trace.known |= 8;
+            let pages = s.memory.owner_pages(key);
+            trace.detail[3] = if pages.is_ok() { 1 } else { 2 };
+            trace.detail[4] = match pages {
+                Ok(n) => n as u64,
+                Err(e) => e as u64 + 1,
+            };
+            if pages.is_err() {
+                trace.reason = 4;
+                return Ok(false);
+            }
+            Ok(true)
+        })();
+        trace.emit(s, i, result);
+        result
     })
 }
 pub fn heartbeat_ns(key: ObjectKey) -> Result<u64, Error> {

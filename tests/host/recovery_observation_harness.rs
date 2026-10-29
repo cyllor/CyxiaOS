@@ -40,14 +40,18 @@ fn advance_to_start(r:&mut RecoverySupervisor){
  let before=h;for _ in 0..100{assert_eq!(r.query(ID).unwrap().state,ExecutionState::Pending);}
  assert_eq!(domain_evidence::header(),before,"receipt queries fabricated supervisor progress");
  poll(&mut r,1_100_000_000);let a=latest();assert_eq!((a[11],a[13],a[15],a[16],a[20]),(1,1,2,2,4));
- poll(&mut r,1_200_000_000);assert_eq!(latest()[10],1_200_000_000);assert_eq!(latest()[9],100_000_000);
+ poll(&mut r,1_200_000_000);assert_eq!(latest()[10],1_200_000_000,"Unknown stopped actual supervisor observation");assert_eq!(latest()[9],100_000_000);
  let h=domain_evidence::header();assert_eq!(h[325],1);assert_eq!(h[356+10],1_100_000_000,"later Unknown overwrote first Unknown for this apply");
+ let new=RecoveryObservation{receipt:RecoveryReceipt{apply:ApplyId{boot_epoch:2,..ID},recipe:2,state:ExecutionState::Unknown,generation:15,started_ns:2_000_000_000,finished_ns:0},
+  policy:Some(STAMP),at_ns:3_000_000_000,state_before:ExecutionState::Pending,phase_before:1,issued_before:false,phase_after:1,issued_after:false,method:2,result:Ok(false)};
+ domain_evidence::recovery_observation(&new,0);
+ let h=domain_evidence::header();assert_eq!((h[324],h[323],h[328],h[356],h[366]),(2,1,2,2,3_000_000_000),"new full ApplyId inherited old Unknown identity");
 }
 #[test]fn recovery_observation_retains_ambiguous_start_without_reissuing_it(){
  for error in [Error::Io,Error::NotReady]{
  let mut r=reset();advance_to_start(&mut r);HARDWARE.lock().unwrap().start_error=Some(error);
  assert_eq!(poll(&mut r,100_000_005).state,ExecutionState::Unknown);let a=latest();
- assert_eq!((a[11],a[12],a[13],a[14],a[15],a[16],a[17]),(3,0,3,1,5,3,error as u64+1));
+ assert_eq!((a[11],a[12],a[13],a[14],a[15],a[16],a[17]),(3,0,3,1,5,3,error as u64+1),"ambiguous callback lost original issued fact");
  for n in 0..3{poll(&mut r,1_100_000_000+n);}
  assert_eq!(HARDWARE.lock().unwrap().start_calls,1,"ambiguous start was issued twice");
  assert_eq!((latest()[15],latest()[16],latest()[20]),(6,2,4));

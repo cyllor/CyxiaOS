@@ -305,6 +305,9 @@ pub trait RecoveryBackend {
     fn stopped(&mut self, target: ObjectKey) -> Result<bool, Error>;
     fn start_generation(&mut self, target: ObjectKey, next_generation: u64) -> Result<(), Error>;
     fn running(&mut self, target: ObjectKey, generation: u64) -> Result<bool, Error>;
+    /// Passive observation after the original step and record update. The
+    /// default performs no work and cannot affect the recovery outcome.
+    fn observed(&mut self, _: &RecoveryObservation) {}
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryReceipt {
@@ -314,6 +317,20 @@ pub struct RecoveryReceipt {
     pub generation: u64,
     pub started_ns: u64,
     pub finished_ns: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryObservation {
+    pub receipt: RecoveryReceipt,
+    pub policy: Option<PolicyStamp>,
+    pub at_ns: u64,
+    pub state_before: ExecutionState,
+    pub phase_before: u8,
+    pub issued_before: bool,
+    pub phase_after: u8,
+    pub issued_after: bool,
+    /// 1 close,2 readonly drain,3 request stop,4 stopped,5 start,6 running.
+    pub method: u8,
+    pub result: Result<bool, Error>,
 }
 #[derive(Clone, Copy)]
 struct Service {
@@ -548,6 +565,18 @@ impl RecoverySupervisor {
         if now < r.receipt.started_ns {
             return Err(Error::Range);
         }
+        let phase_before = r.phase;
+        let issued_before = r.issued;
+        let state_before = r.receipt.state;
+        let method = match (r.phase, r.issued) {
+            (0, _) => 1,
+            (1, _) => 2,
+            (2, false) => 3,
+            (2, true) => 4,
+            (3, false) => 5,
+            (3, true) => 6,
+            _ => 0,
+        };
         if now - r.receipt.started_ns >= 1_000_000_000 {
             r.receipt.state = ExecutionState::Unknown;
         }
@@ -603,6 +632,18 @@ impl RecoverySupervisor {
             }
         }
         self.records[slot] = Some(r);
+        backend.observed(&RecoveryObservation {
+            receipt: r.receipt,
+            policy: r.policy,
+            at_ns: now,
+            state_before,
+            phase_before,
+            issued_before,
+            phase_after: r.phase,
+            issued_after: r.issued,
+            method,
+            result: step,
+        });
         Ok(r.receipt)
     }
     pub fn recover_stopped(&mut self, target: ObjectKey) -> Result<(), Error> {
