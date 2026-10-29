@@ -25,7 +25,17 @@ def program():
 class ActiveSchedulerPublication(unittest.TestCase):
  def test_actual_task_guard_borrow_preserves_owner_rules(self):
   with tempfile.TemporaryDirectory() as tmp:
-   d=Path(tmp);(d/'harness.rs').write_text(program());(d/'Cargo.toml').write_text('[package]\nname="active-scheduler-publication"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
+   d=Path(tmp);code=program();(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="active-scheduler-publication"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-active-scheduler-publication'),'--','--test-threads=1']
    r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('4 passed; 0 failed',r.stdout)
+   mutants=[
+    ('validate_locked(self.state, action, target, now_ns())','locked(|state| validate_locked(state, action, target, now_ns()))','legal query reentered'),
+    ('current_locked(self.state, domain, target, now_ns())','locked(|state| current_locked(state, domain, target, now_ns()))','current query reentered'),
+    ('allowed & (1u64 << cpu) == 0','false','invalid Active task publication role'),
+    ('cpu::slot() != self.cpu','false','borrow changed its control CPU identity'),
+   ]
+   for old,new,message in mutants:
+    self.assertTrue(old in code,'missing mutation anchor: '+old);(d/'harness.rs').write_text(code.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+
 if __name__=='__main__':unittest.main()

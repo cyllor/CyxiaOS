@@ -27,7 +27,10 @@ mod service_authority;
 mod spawn_diagnostics;
 #[path = "domain_tasks/vector_diagnostics.rs"]
 mod vector_diagnostics;
-pub(crate) use publication::{BaselinePublication, reserve_baseline_publication};
+pub(crate) use publication::{
+    BaselinePublication, SchedulerPublication, reserve_baseline_publication,
+    reserve_scheduler_publication,
+};
 #[path = "domain_tasks/local_evidence.rs"]
 mod local_evidence;
 #[path = "domain_tasks/replay.rs"]
