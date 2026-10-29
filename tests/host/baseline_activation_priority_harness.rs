@@ -5,8 +5,8 @@ use std::sync::{Mutex, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 #[derive(Clone, Copy, Eq, PartialEq)] enum TrialKind { Baseline, Candidate }
 #[derive(Clone, Copy, Eq, PartialEq)] enum ExecutionState { Pending, Applied, Unknown, Failed(Error) }
 type LearningFamily = u64;
-#[derive(Clone,Copy,Eq,PartialEq)] struct ApplyId {boot_epoch:u64,plan_seq:u64,target:u64}
-const INITIAL:ApplyId=ApplyId{boot_epoch:1,plan_seq:2,target:12};
+#[derive(Clone,Copy,Eq,PartialEq)] struct ApplyId {boot_epoch:u64,controller_epoch:u64,plan_seq:u64,action_index:u16,target:u64}
+const INITIAL:ApplyId=ApplyId{boot_epoch:1,controller_epoch:1,plan_seq:2,action_index:0,target:12};
 struct State;
 static mut STATE: State = State;
 static CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -39,14 +39,16 @@ mod replay {
     pub struct Checks { pub owner: u64, pub before_first: fn(Token, Snapshot) -> Result<(), Error> }
     pub struct Lifecycle { pub close: bool }
     impl Lifecycle { pub fn closing(&self) -> Option<()> { self.close.then_some(()) } }
+    #[derive(Clone,Copy)]struct CandidateAction;
+    impl CandidateAction{fn one_shot(self)->bool{panic!("candidate action outside baseline-only fixture")}}
     pub struct Root {
         pub registered: [Option<Checks>; 1], pub token: Option<Token>, pub request: Option<Request>,
-        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<ApplyId>,candidate_publication:Option<CandidatePublication>,
+        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<ApplyId>,candidate_publication:Option<CandidatePublication>,selected:Option<CandidateAction>,
         pub baseline_count: usize, pub fault: Option<Error>, pub unpublished: Option<()>, pub lifecycle: Lifecycle,
         pub baseline: [Option<Receipt>;32], pub closing: Option<Receipt>,
     }
     static mut ROOT: Root = Root { registered: [None], token: None, request: None,
-        first: None, first_ready: false, phase: Phase::Complete, initial: None,candidate_publication:None,
+        first: None, first_ready: false, phase: Phase::Complete, initial: None,candidate_publication:None,selected:None,
         baseline_count: 0, fault: None, unpublished: None, lifecycle: Lifecycle { close: false }, baseline:[None;32],closing:None };
     fn root() -> &'static Root { unsafe { &*core::ptr::addr_of!(ROOT) } }
     pub fn root_mut() -> &'static mut Root { unsafe { &mut *core::ptr::addr_of_mut!(ROOT) } }
