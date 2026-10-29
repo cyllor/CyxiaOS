@@ -13,9 +13,9 @@
 //! Settlement: error+1, retained active<<8, pending<<9, credit kind<<16.
 //! Admission/revalidation: reason, error+1<<8, copied scalar context<<16.
 //! Word127 is the publication seqlock. It freezes after the first cycle closes.
-//! An opportunity may offer two separately billed pieces: the replay body and
-//! one bounded queued admission. This ticket, body timings and final credit
-//! fields describe only the replay piece and close before admission begins.
+//! An opportunity may offer three separately billed pieces: replay, bounded
+//! queued admission and owned-Drain lifecycle. This ticket, body timings and
+//! final credit fields describe only replay and close before admission begins.
 use super::Error;
 use core::sync::atomic::{AtomicU64, Ordering};
 

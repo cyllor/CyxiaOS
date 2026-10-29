@@ -2436,20 +2436,26 @@ pub fn poll(_at: u64) -> Result<(), Error> {
             let family_slot = family_index(d.action.domain(), d.action.kind())?;
             let f = s.owner.families[family_slot].ok_or(Error::Unsupported)?;
             let was_started = d.started;
+            let mut denial_flags = 0;
             let dependency_status = if d.started {
                 Ok(())
             } else if d.core_generation != s.owner.context.core_generation
                 || d.ledger_generation != s.owner.context.ledger_generation
             {
+                denial_flags = 1;
                 Err(Error::Stale)
             } else {
-                bind_dependencies(&s.owner, d.action, d.apply.target, at).and_then(|actual| {
-                    if actual == d.dependencies {
-                        Ok(())
-                    } else {
+                match bind_dependencies(&s.owner, d.action, d.apply.target, at) {
+                    Err(error) => {
+                        denial_flags = 2;
+                        Err(error)
+                    }
+                    Ok(actual) if actual == d.dependencies => Ok(()),
+                    Ok(_) => {
+                        denial_flags = 4;
                         Err(Error::Stale)
                     }
-                })
+                }
             };
             let mut actual_entry = None;
             let mut executor_trace = None;
@@ -2490,6 +2496,24 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 Err(error) => ExecutionState::Failed(error),
             };
             let observed = now();
+            if denial_flags != 0
+                && let Err(error) = dependency_status
+            {
+                crate::learning_evidence::execution_trace::control_denied(
+                    crate::learning_evidence::execution_trace::ControlDenial {
+                        action: d.action,
+                        apply: d.apply,
+                        stamp: d.stamp,
+                        observed_ns: observed,
+                        expected_core: d.core_generation,
+                        current_core: s.owner.context.core_generation,
+                        expected_ledger: d.ledger_generation,
+                        current_ledger: s.owner.context.ledger_generation,
+                        flags: denial_flags,
+                        error,
+                    },
+                );
+            }
             d.observed_ns = observed;
             if !d.state.terminal()
                 && observed.saturating_sub(d.published) >= execution_limit(d.action)

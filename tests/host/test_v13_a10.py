@@ -4,6 +4,7 @@ import struct
 import sys
 from pathlib import Path
 import unittest
+from test_governance_billing_priority import function
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
 
@@ -37,7 +38,9 @@ class ProtectedFileReplies(unittest.TestCase):
     def test_storage_fault_profile_does_not_start_unrelated_learning_trial(self):
         root=Path(__file__).resolve().parents[2]
         owner=(root/'kernel/src/learning_replay/owner.rs').read_text()
-        prepare=owner[owner.index('Phase::Prepare =>'):owner.index('Phase::Reserve =>')]
+        dispatch=function(function(owner,'fn service('),'Phase::Prepare =>')
+        self.assertIn('return prepare_step(trace);',dispatch)
+        prepare=function(owner,'fn prepare_step(')
         self.assertIn('crate::storage_fault_capture::PROFILE',prepare)
         self.assertIn('PAUSED.load(Ordering::Acquire)',prepare)
         self.assertLess(prepare.index('crate::storage_fault_capture::PROFILE'),

@@ -1,8 +1,8 @@
 # First-trial execution milestones
 
-These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 5,376 bytes are included in the existing learning workspace bound. Earlier images contain only the original four banks, totaling 3,840 bytes.
+These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 6,400 bytes are included in the existing learning workspace bound. Earlier images contain four banks totaling 3,840 bytes, or six totaling 5,376 bytes.
 
-The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp. A seal closes collection. Later trials cannot replace the first scope. The banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened. Extensions are available only in images containing their symbols; historical images leave newly used reserved words uninterpreted.
+The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp for the original six banks. A seal closes their collection. Later trials cannot replace that first scope. The two preparation banks instead retain their latest entered call across trials. The banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened. Extensions are available only in images containing their symbols; historical images leave newly used reserved words uninterpreted.
 
 | Bank | Bytes / publication word | Writer |
 | --- | --- | --- |
@@ -12,6 +12,8 @@ The first successful capture start binds the exact boot/trial/capture generation
 | `TRACE_CLOSING_EVIDENCE` | 512 / 63 | CPU0 root, helper and task-owner boundaries |
 | `TRACE_DRAIN_WORK_EVIDENCE` | 512 / 63 | CPU0, final predicate under Work exclusion |
 | `TRACE_DRAIN_TASK_EVIDENCE` | 1,024 / 127 | Existing TaskGuard, query/lifecycle/cleanup |
+| `TRACE_PREPARATION_ROOT_EVIDENCE` | 512 / 63 | Existing control-owner gate, including control CPUs |
+| `TRACE_PREPARATION_OWNER_EVIDENCE` | 512 / 63 | CPU0 outer replay owner |
 
 All words are little-endian u64. Raw banks survive in the node directory and final functional report, including failed observations.
 
@@ -28,6 +30,16 @@ Control header words 2–7 contain boot, trial, capture generation, first timest
 | 22 | Busy/Again callback count |
 
 Result tags are Pending=1, Applied=2, Unknown=3, Failed=4, callback Err=5. Failed/Err also carry `(error enum + 1) << 8`. Canonical action bytes include the zero candidate index used by the wire encoder. Conflicting action bytes cannot contribute to the original identity's counters. CPU totals describe the measured callback segment; diagnostic reporting overhead is outside that segment.
+
+Control words 208–222 retain pre-executor denials for the exact first-scope target, family and boot. Word 208 counts all qualifying denials; words 209–215 hold the first denied ApplyId and version, 216–217 its original snapshot and existing observation time, 218–221 expected/current core and ledger generations, and 222 the branch flag plus `(raw error+1)<<8`. Flags are generation mismatch=1, original dependency bind returned error=2, and successful binding unequal to retained dependencies=4. First detail is immutable, so it cannot explain every later counted denial. These are original pre-executor results, with no second binding, clock read, callback row, callback count or manufactured callback CPU. Started reconciliation keeps its original admission bypass.
+
+Preparation banks share words 0–15: magic/version, completed entered-call count, caller's existing service-entry time, then trial, preparation ID, boot, owner key, family domain/kind, seed, trial kind (candidate=1/baseline=2), original preparation start, stage and result. Result tags are false=1, true=2, error=`3 | ((error+1)<<8)`. Service entry is not the time of each inner predicate. Root publishes only inside its existing control gate. If gate acquisition returns Busy, Root retains its previous record while Owner can publish the new call; correlate both full identities and service-entry times before comparing stages.
+
+Root words 16–20 retain job-present, prepared count, cursor before, scan end and cursor after. Stages are authorization=1, identity/failure=2, model=3, already ready=4, job/prepared wait=5, Desired blocker=6, scan progress=7 and ready=8. Words 21–36 are cleared for every publication and optionally retain slot+1, blocker reason, full ApplyId, version, snapshot, installed-until, execution state, started, execution-observed, original predicate time and predicate-time-present. Blocker reasons are nonterminal=1, Applied without execution observation=2 and live non-one-shot lease=4. The first short-circuit blocker comes from the original at-most-eight-slot scan. Only the live-lease branch reads the original clock; other blockers have no predicate time. Zero detail means no retained blocker in that call, not a complete owner drain.
+
+Owner stages are pause/withdraw=1, schema=2, begin preparation/family=3, Root poll=4, claim=5, Work bind=6, Work preparation returned None=7, register=8, permit/commit=9 and success=10. Empty preparation identity preserves the outer trial/family before allocation. These latest records do not latch Busy as a permanent outcome. No extra owner query or scan is introduced by reporting.
+
+Actual-source regressions separately fail before denial, Root and Owner diagnostics exist, then pass with four hook/dispatch removal negative controls. They preserve binding, model and predicate clock call counts, actual bounded scan progression, first denial immutability, seal freeze, later-trial blocker clearing and recovery after Root gate Busy. The Owner fixture executes the exact real Prepare dispatch arm and helper, with other service branches outside scope. Controlled authorization, owner state and hardware boundaries do not prove native multi-CPU exclusion or WCET.
 
 The task bank binds only the first exact CPU-weight installation whose target and snapshot match this scope. Header words 3–7 retain target, policy version, snapshot and installation observation. Words 8–15 count selections, unused cancellations, settlement attempts, receipt advances, reconciliation queries, settlement errors, group-matching child creations and receipt-query errors. Fixed records retain:
 

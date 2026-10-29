@@ -58,10 +58,16 @@ static TRACE_DRAIN_WORK_EVIDENCE: Evidence<64> = Evidence::new();
 #[used]
 #[unsafe(no_mangle)]
 static TRACE_DRAIN_TASK_EVIDENCE: Evidence<128> = Evidence::new();
+#[used]
+#[unsafe(no_mangle)]
+static TRACE_PREPARATION_ROOT_EVIDENCE: Evidence<64> = Evidence::new();
+#[used]
+#[unsafe(no_mangle)]
+static TRACE_PREPARATION_OWNER_EVIDENCE: Evidence<64> = Evidence::new();
 pub const OWNED_BYTES: usize = core::mem::size_of::<Evidence<224>>()
     + 2 * core::mem::size_of::<Evidence<128>>()
-    + 3 * core::mem::size_of::<Evidence<64>>();
-const _: () = assert!(OWNED_BYTES == 5376);
+    + 5 * core::mem::size_of::<Evidence<64>>();
+const _: () = assert!(OWNED_BYTES == 6400);
 fn active() -> bool {
     TRACE_CONTROL_EVIDENCE.get(10) == 1
 }
@@ -129,6 +135,211 @@ pub struct ControlEvent {
     pub cpu_ns: u64,
     pub published_ns: u64,
     pub result: Result<ExecutionState, Error>,
+}
+pub struct ControlDenial {
+    pub action: Action,
+    pub apply: ApplyId,
+    pub stamp: PolicyStamp,
+    pub observed_ns: u64,
+    pub expected_core: u64,
+    pub current_core: u64,
+    pub expected_ledger: u64,
+    pub current_ledger: u64,
+    pub flags: u64,
+    pub error: Error,
+}
+/// The real pre-executor decision, not an apply/reconcile invocation or cost.
+pub fn control_denied(e: ControlDenial) {
+    debug_assert_eq!(cpu::slot(), 0);
+    let b = &TRACE_CONTROL_EVIDENCE;
+    if !target_matches(e.apply.target)
+        || e.action.domain() as u64 != b.get(12)
+        || e.action.kind() as u64 != b.get(13)
+    {
+        return;
+    }
+    b.write(|b| {
+        if e.apply.boot_epoch != b.get(2)
+            || e.observed_ns < b.get(5)
+            || !matches!(e.flags, 1 | 2 | 4)
+        {
+            b.add(14, 1);
+            return;
+        }
+        b.add(208, 1);
+        if b.get(209) == 0 {
+            b.row(
+                209,
+                &[
+                    e.apply.boot_epoch,
+                    e.apply.controller_epoch,
+                    e.apply.plan_seq,
+                    u64::from(e.apply.action_index),
+                    e.apply.target.id,
+                    e.apply.target.generation,
+                    e.stamp.version,
+                    e.stamp.snapshot_ns,
+                    e.observed_ns,
+                    e.expected_core,
+                    e.current_core,
+                    e.expected_ledger,
+                    e.current_ledger,
+                    e.flags | ((e.error as u64 + 1) << 8),
+                ],
+            );
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+pub struct PreparationIdentity {
+    pub id: u64,
+    pub boot_epoch: u64,
+    pub owner: ObjectKey,
+    pub trial: u64,
+    pub family: Family,
+    pub seed: u64,
+    pub kind: u64,
+    pub started_ns: u64,
+}
+impl PreparationIdentity {
+    pub fn empty(trial: u64, family: Family, kind: u64) -> Self {
+        Self {
+            id: 0,
+            boot_epoch: 0,
+            owner: ObjectKey {
+                id: 0,
+                generation: 0,
+            },
+            trial,
+            family,
+            seed: 0,
+            kind,
+            started_ns: 0,
+        }
+    }
+    fn words(self) -> [u64; 10] {
+        [
+            self.trial,
+            self.id,
+            self.boot_epoch,
+            self.owner.id,
+            self.owner.generation,
+            self.family.domain as u64,
+            self.family.kind as u64,
+            self.seed,
+            self.kind,
+            self.started_ns,
+        ]
+    }
+}
+#[derive(Clone, Copy)]
+pub struct PreparationBlocker {
+    pub slot: usize,
+    pub apply: ApplyId,
+    pub stamp: PolicyStamp,
+    pub state: ExecutionState,
+    pub started: bool,
+    pub execution_observed: bool,
+    pub reason: u64,
+    pub predicate_at: Option<u64>,
+}
+pub struct RootPreparationTrace {
+    pub identity: PreparationIdentity,
+    pub service_entry_ns: u64,
+    pub stage: u64,
+    pub job: bool,
+    pub prepared_count: usize,
+    pub cursor_before: usize,
+    pub scan_end: usize,
+    pub cursor_after: usize,
+    pub blocker: Option<PreparationBlocker>,
+}
+impl RootPreparationTrace {
+    pub fn new(identity: PreparationIdentity, service_entry_ns: u64) -> Self {
+        Self {
+            identity,
+            service_entry_ns,
+            stage: 1,
+            job: false,
+            prepared_count: 0,
+            cursor_before: 0,
+            scan_end: 0,
+            cursor_after: 0,
+            blocker: None,
+        }
+    }
+}
+fn preparation_result(reply: Result<bool, Error>) -> u64 {
+    match reply {
+        Ok(false) => 1,
+        Ok(true) => 2,
+        Err(e) => 3 | ((e as u64 + 1) << 8),
+    }
+}
+/// Root writers retain the existing control gate, including control CPUs.
+/// The supplied time is the caller's already-observed service entry, not a
+/// new clock read or a reconstructed predicate timestamp.
+pub fn preparation_root(e: RootPreparationTrace, reply: Result<bool, Error>) {
+    TRACE_PREPARATION_ROOT_EVIDENCE.write(|b| {
+        b.row(0, &[0x4359_5052_5254_0001, 1]);
+        b.add(2, 1);
+        b.put(3, e.service_entry_ns);
+        b.row(4, &e.identity.words());
+        b.row(
+            14,
+            &[
+                e.stage,
+                preparation_result(reply),
+                u64::from(e.job),
+                e.prepared_count as u64,
+                e.cursor_before as u64,
+                e.scan_end as u64,
+                e.cursor_after as u64,
+            ],
+        );
+        b.row(21, &[0; 16]);
+        if let Some(d) = e.blocker {
+            b.row(
+                21,
+                &[
+                    d.slot as u64 + 1,
+                    d.reason,
+                    d.apply.boot_epoch,
+                    d.apply.controller_epoch,
+                    d.apply.plan_seq,
+                    d.apply.action_index as u64,
+                    d.apply.target.id,
+                    d.apply.target.generation,
+                    d.stamp.version,
+                    d.stamp.snapshot_ns,
+                    d.stamp.installed_until_ns,
+                    state(d.state),
+                    u64::from(d.started),
+                    u64::from(d.execution_observed),
+                    d.predicate_at.unwrap_or(0),
+                    u64::from(d.predicate_at.is_some()),
+                ],
+            );
+        }
+    });
+}
+pub struct OwnerPreparationTrace {
+    pub identity: PreparationIdentity,
+    pub service_entry_ns: u64,
+    pub stage: u64,
+}
+/// CPU0-only outer coordinator. It never shares a mutable publication with
+/// the independently gated Root writer, and remains live across trials.
+pub fn preparation_owner(e: OwnerPreparationTrace, reply: Result<bool, Error>) {
+    debug_assert_eq!(cpu::slot(), 0);
+    TRACE_PREPARATION_OWNER_EVIDENCE.write(|b| {
+        b.row(0, &[0x4359_5052_4f57_0001, 1]);
+        b.add(2, 1);
+        b.put(3, e.service_entry_ns);
+        b.row(4, &e.identity.words());
+        b.row(14, &[e.stage, preparation_result(reply)]);
+    });
 }
 pub fn control(e: ControlEvent) {
     debug_assert_eq!(cpu::slot(), 0);

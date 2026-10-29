@@ -645,37 +645,108 @@ pub fn verify_preparation(preparation: Preparation) -> Result<(), Error> {
         }
     })
 }
-pub fn poll_preparation(preparation: Preparation) -> Result<bool, Error> {
+fn trace_preparation(
+    p: Preparation,
+) -> crate::learning_evidence::execution_trace::PreparationIdentity {
+    crate::learning_evidence::execution_trace::PreparationIdentity {
+        id: p.id,
+        boot_epoch: p.boot_epoch,
+        owner: p.owner,
+        trial: p.trial_id,
+        family: p.family,
+        seed: p.seed,
+        kind: if p.kind == TrialKind::Baseline { 2 } else { 1 },
+        started_ns: p.started_ns,
+    }
+}
+pub fn poll_preparation(preparation: Preparation, service_entry_ns: u64) -> Result<bool, Error> {
     with(|s| {
-        authorized(s)?;
-        let p = root_mut().preparing.as_mut().ok_or(Error::Stale)?;
-        if p.identity != preparation || p.failure.is_some() {
-            return Err(Error::Stale);
-        }
-        if p.model != s.registry.model() {
-            return Err(Error::Stale);
-        }
-        if p.ready {
-            return Ok(true);
-        }
-        if s.job.is_some() || s.owner.prepared_count != 0 {
-            p.cursor = 0;
-            return Ok(false);
-        }
-        let end = (p.cursor + 8).min(s.owner.desired.len());
-        if s.owner.desired[p.cursor..end]
-            .iter()
-            .flatten()
-            .any(|d| execution_blocks_replacement(d) || !d.action.one_shot() && d.stamp.live(now()))
-        {
-            p.cursor = 0;
-            return Ok(false);
-        }
-        p.cursor = end;
-        if end == s.owner.desired.len() {
-            p.ready = true;
-        }
-        Ok(p.ready)
+        let mut trace = crate::learning_evidence::execution_trace::RootPreparationTrace::new(
+            trace_preparation(preparation),
+            service_entry_ns,
+        );
+        let result = (|| {
+            authorized(s)?;
+            trace.stage = 2;
+            let p = root_mut().preparing.as_mut().ok_or(Error::Stale)?;
+            if p.identity != preparation || p.failure.is_some() {
+                return Err(Error::Stale);
+            }
+            trace.stage = 3;
+            if p.model != s.registry.model() {
+                return Err(Error::Stale);
+            }
+            trace.cursor_before = p.cursor;
+            trace.cursor_after = p.cursor;
+            trace.stage = 4;
+            if p.ready {
+                return Ok(true);
+            }
+            trace.stage = 5;
+            if s.job.is_some() || s.owner.prepared_count != 0 {
+                trace.job = s.job.is_some();
+                trace.prepared_count = s.owner.prepared_count;
+                p.cursor = 0;
+                trace.cursor_after = p.cursor;
+                return Ok(false);
+            }
+            let end = (p.cursor + 8).min(s.owner.desired.len());
+            trace.stage = 6;
+            trace.scan_end = end;
+            if s.owner.desired[p.cursor..end]
+                .iter()
+                .enumerate()
+                .any(|(offset, value)| {
+                    let Some(d) = value else {
+                        return false;
+                    };
+                    let blocks = execution_blocks_replacement(d);
+                    let (live, predicate_at) = if blocks || d.action.one_shot() {
+                        (false, None)
+                    } else {
+                        let at = now();
+                        (d.stamp.live(at), Some(at))
+                    };
+                    if blocks || live {
+                        trace.blocker = Some(
+                            crate::learning_evidence::execution_trace::PreparationBlocker {
+                                slot: p.cursor + offset,
+                                apply: d.apply,
+                                stamp: d.stamp,
+                                state: d.state,
+                                started: d.started,
+                                execution_observed: d.execution_observed,
+                                reason: if !blocks {
+                                    4
+                                } else if !d.state.terminal() {
+                                    1
+                                } else {
+                                    2
+                                },
+                                predicate_at,
+                            },
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                })
+            {
+                p.cursor = 0;
+                trace.cursor_after = p.cursor;
+                return Ok(false);
+            }
+            p.cursor = end;
+            trace.cursor_after = p.cursor;
+            trace.stage = 7;
+            if end == s.owner.desired.len() {
+                p.ready = true;
+                trace.stage = 8;
+            }
+            Ok(p.ready)
+        })();
+        crate::learning_evidence::execution_trace::preparation_root(trace, result);
+        result
     })
 }
 pub fn claim_preparation(preparation: Preparation) -> Result<(), Error> {

@@ -779,6 +779,128 @@ pub fn service_step() -> Result<bool, DomainError> {
     publish_evidence();
     result
 }
+fn trace_preparation(p: root::Preparation) -> capture::execution_trace::PreparationIdentity {
+    capture::execution_trace::PreparationIdentity {
+        id: p.id,
+        boot_epoch: p.boot_epoch,
+        owner: p.owner,
+        trial: p.trial_id,
+        family: p.family,
+        seed: p.seed,
+        kind: if p.kind == TrialKind::Baseline { 2 } else { 1 },
+        started_ns: p.started_ns,
+    }
+}
+fn prepare_step(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
+    let mut preparation_trace = capture::execution_trace::OwnerPreparationTrace {
+        identity: capture::execution_trace::PreparationIdentity::empty(
+            trace.words[10],
+            Family {
+                domain: trace.words[14] as u16,
+                kind: trace.words[15] as u16,
+            },
+            trace.words[16],
+        ),
+        service_entry_ns: trace.words[31],
+        stage: 1,
+    };
+    let result = (|| {
+        trace.site(Site::Prepare);
+        let (existing, claimed) = with(|s| Ok((s.preparation, s.prepare_claimed)))?;
+        if let Some(p) = existing {
+            preparation_trace.identity = trace_preparation(p);
+        }
+        // The dedicated storage-fault image proves ordinary file/recovery
+        // behavior. Do not start an unrelated learning trial whose archive
+        // I/O would race the fault boundary and make it non-reproducible.
+        if (crate::storage_fault_capture::PROFILE || PAUSED.load(Ordering::Acquire))
+            && !claimed
+            && work::quiescent()
+        {
+            if let Some(p) = existing {
+                root::withdraw_preparation(p)?;
+                with(|s| {
+                    s.preparation = None;
+                    Ok(())
+                })?;
+            }
+            return Ok(false);
+        }
+        // This runs under the existing CPU0 service credit, before any
+        // trial first timestamp. Immutable source hashing must not turn
+        // the synchronous first-publication callback into an overrun.
+        preparation_trace.stage = 2;
+        let schemas_ready = with(|s| {
+            if s.schemas.ready().is_some() {
+                return Ok(true);
+            }
+            s.schemas.step();
+            Ok(false)
+        })?;
+        if !schemas_ready {
+            return Ok(false);
+        }
+        preparation_trace.stage = 3;
+        let (family, seed, kind) =
+            with(|s| Ok((FAMILIES[s.family], u64::from(s.group) + 1, s.kind)))?;
+        let preparation = if let Some(p) = existing {
+            p
+        } else {
+            let trial = with(|s| Ok(s.trial_id))?;
+            let p = root::begin_preparation(work::OWNER, trial, family, seed, kind)?;
+            with(|s| {
+                s.preparation = Some(p);
+                Ok(())
+            })?;
+            p
+        };
+        preparation_trace.identity = trace_preparation(preparation);
+        preparation_trace.stage = 4;
+        if !root::poll_preparation(preparation, trace.words[31])? {
+            return Ok(false);
+        }
+        preparation_trace.stage = 5;
+        with(|s| {
+            root::claim_preparation(preparation)?;
+            s.prepare_claimed = true;
+            Ok(())
+        })?;
+        preparation_trace.stage = 6;
+        work::bind_preparation(preparation)?;
+        preparation_trace.stage = 7;
+        let Some(prepared) = work::prepare(family, seed, kind)? else {
+            return Ok(false);
+        };
+        preparation_trace.stage = 8;
+        with(|s| {
+            s.prepared = Some(prepared);
+            Ok(())
+        })?;
+        crate::service_windows::register_replay(family, prepared.target, prepared.boundary)?;
+        preparation_trace.stage = 9;
+        with(|s| {
+            if s.permit.is_none() {
+                s.permit = Some(
+                    capture::prepare_start(work::OWNER, s.trial_id, family)
+                        .map_err(|e| domain_error(evidence_error(e)))?,
+                );
+            }
+            s.not_before = if prepared.baseline.one_shot() {
+                crate::domain_platform::now_ns().saturating_add(SECOND)
+            } else {
+                0
+            };
+            s.phase = Phase::Reserve;
+            Ok(())
+        })?;
+
+        preparation_trace.stage = 10;
+        Ok(true)
+    })();
+    capture::execution_trace::preparation_owner(preparation_trace, result);
+    result
+}
+
 fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
     let phase = with(|s| {
         trace.words[3] = s.phase as u64 + 1;
@@ -817,82 +939,7 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
     }
     match phase {
         Phase::Prepare => {
-            trace.site(Site::Prepare);
-            let (existing, claimed) = with(|s| Ok((s.preparation, s.prepare_claimed)))?;
-            // The dedicated storage-fault image proves ordinary file/recovery
-            // behavior. Do not start an unrelated learning trial whose archive
-            // I/O would race the fault boundary and make it non-reproducible.
-            if (crate::storage_fault_capture::PROFILE || PAUSED.load(Ordering::Acquire))
-                && !claimed
-                && work::quiescent()
-            {
-                if let Some(p) = existing {
-                    root::withdraw_preparation(p)?;
-                    with(|s| {
-                        s.preparation = None;
-                        Ok(())
-                    })?;
-                }
-                return Ok(false);
-            }
-            // This runs under the existing CPU0 service credit, before any
-            // trial first timestamp. Immutable source hashing must not turn
-            // the synchronous first-publication callback into an overrun.
-            let schemas_ready = with(|s| {
-                if s.schemas.ready().is_some() {
-                    return Ok(true);
-                }
-                s.schemas.step();
-                Ok(false)
-            })?;
-            if !schemas_ready {
-                return Ok(false);
-            }
-            let (family, seed, kind) =
-                with(|s| Ok((FAMILIES[s.family], u64::from(s.group) + 1, s.kind)))?;
-            let preparation = if let Some(p) = existing {
-                p
-            } else {
-                let trial = with(|s| Ok(s.trial_id))?;
-                let p = root::begin_preparation(work::OWNER, trial, family, seed, kind)?;
-                with(|s| {
-                    s.preparation = Some(p);
-                    Ok(())
-                })?;
-                p
-            };
-            if !root::poll_preparation(preparation)? {
-                return Ok(false);
-            }
-            with(|s| {
-                root::claim_preparation(preparation)?;
-                s.prepare_claimed = true;
-                Ok(())
-            })?;
-            work::bind_preparation(preparation)?;
-            let Some(prepared) = work::prepare(family, seed, kind)? else {
-                return Ok(false);
-            };
-            with(|s| {
-                s.prepared = Some(prepared);
-                Ok(())
-            })?;
-            crate::service_windows::register_replay(family, prepared.target, prepared.boundary)?;
-            with(|s| {
-                if s.permit.is_none() {
-                    s.permit = Some(
-                        capture::prepare_start(work::OWNER, s.trial_id, family)
-                            .map_err(|e| domain_error(evidence_error(e)))?,
-                    );
-                }
-                s.not_before = if prepared.baseline.one_shot() {
-                    crate::domain_platform::now_ns().saturating_add(SECOND)
-                } else {
-                    0
-                };
-                s.phase = Phase::Reserve;
-                Ok(())
-            })?;
+            return prepare_step(trace);
         }
         Phase::Reserve => {
             trace.site(Site::Reserve);
