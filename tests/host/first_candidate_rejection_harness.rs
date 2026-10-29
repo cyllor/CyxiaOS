@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use cyxia_prototype::{domains::{Action,Error,ObjectKey,PolicyStamp,ApplyId},
+use cyxia_prototype::{domains::{Action,Error,ObjectKey,ApplyId},
     policy::{ExecutionState,Candidate,CandidateSet,Snapshot,ModelBinding,BoundDependency},features::RawFeatures,
     learning::Family as LearningFamily};
 use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
@@ -23,6 +23,11 @@ static ABORTS:AtomicUsize=AtomicUsize::new(0);
 // ACTUAL_JOB
 // ACTUAL_COMPLETION
 struct State{job:Option<Job>,boot:u64}
+extern crate self as cyxia_arch_aarch64;
+pub mod cpu{pub fn slot()->usize{1}}
+static CONTROL:std::sync::Mutex<State>=std::sync::Mutex::new(State{job:None,boot:1});
+fn with<T>(f:impl FnOnce(&mut State)->Result<T,Error>)->Result<T,Error>{f(&mut CONTROL.lock().unwrap())}
+// ACTUAL_ABORT
 // ACTUAL_FINISH_JOB
 mod replay {
     use super::*;
@@ -46,6 +51,8 @@ mod replay {
         r.request=Some(Request{family:LearningFamily{domain:1,kind:1},target:key(12),kind:TrialKind::Candidate,baseline:Action::CpuWeight(1),not_before_ns:0});
         r.token=Some(Token{id:12,boot_epoch:1,owner:key(7)});r.lifecycle.closed=false;}
     pub fn fault()->Option<Error>{root().fault}
+    pub fn current_token()->Token{root().token.unwrap()}
+    pub fn retained(token:Token)->Result<Option<Error>,Error>{if root().token==Some(token){Ok(root().fault)}else{Err(Error::Stale)}}
     pub fn original()->Option<Snapshot>{root().first}
     pub fn fresh()->Result<Snapshot,Error>{first(Snapshot{sequence:410,taken_ns:now(),..SNAP},1,1,key(12)).map(|x|x.0)}
     pub fn scenario(change:u8){let r=root_mut();match change{
@@ -103,4 +110,66 @@ fn fixture()->(State,Job){
     assert_eq!(retained.sequence,job.sequence);assert_eq!(retained.completion.unwrap().result,Err(Error::Busy));
     assert_eq!(finish_job(&mut s,retained,None),Err(Error::Busy));
     assert!(s.job.is_none());assert_eq!(EVIDENCE.load(Ordering::Acquire),1);assert_eq!(replay::fault(),None);
+}
+
+mod candidate_owner {
+    use super::Error as DomainError;
+    use super::*;
+    #[derive(Clone,Copy,PartialEq,Eq,Debug)]enum Phase{Start,Activate,Run,Drain,PreparationArchive,PreparationReleaseWork,
+        PreparationReleaseRoot,PreparationReleasePermit,PreparationAbort,Failed}
+    struct OwnerState{token:Option<replay::Token>,scope:Option<()>,phase:Phase,last_error:Option<Error>,preparation:Option<()>,prepare_error:Option<(DomainError,u64)>}
+    static mut OWNER:OwnerState=OwnerState{token:None,scope:None,phase:Phase::Failed,last_error:None,preparation:None,prepare_error:None};
+    fn with<T>(f:impl FnOnce(&mut OwnerState)->Result<T,DomainError>)->Result<T,DomainError>{f(unsafe{&mut *core::ptr::addr_of_mut!(OWNER)})}
+    fn native_error(e:DomainError)->Error{e}
+    mod diagnostic {pub struct Attempt;impl Attempt{pub fn retain(&mut self,_:super::Error,_:Option<super::Error>,_:u64){panic!("no diagnostic attempt in fixture")}}}
+    mod root {
+        pub fn retained_fault(t:super::replay::Token)->Result<Option<super::Error>,super::Error>{super::replay::retained(t)}
+        pub fn abort_preparation(_:(),_:super::Error,_:u64)->Result<(),super::Error>{panic!("preparation custody is outside already-captured owner fixture")}
+    }
+    // ACTUAL_OWNER_RETAIN_ERROR
+    pub fn reset(){with(|s|{s.token=Some(replay::current_token());s.scope=Some(());s.phase=Phase::Activate;s.last_error=None;Ok(())}).unwrap();}
+    pub fn observe(e:DomainError){retain_error(e,None)}
+    pub fn drained()->bool{with(|s|Ok(s.phase==Phase::Drain)).unwrap()}
+    pub fn error()->Option<Error>{with(|s|Ok(s.last_error)).unwrap()}
+}
+mod domain_platform{pub fn now_ns()->u64{super::now()}}
+#[test]fn first_candidate_owner_preserves_terminal_busy_and_drains_original_scope(){
+    let(mut s,job)=fixture();candidate_owner::reset();
+    candidate_owner::observe(Error::Busy);assert!(!candidate_owner::drained());assert_eq!(candidate_owner::error(),None);
+    assert_eq!(finish_job(&mut s,job,None),Err(Error::Busy));
+    candidate_owner::observe(Error::Busy);
+    assert!(candidate_owner::drained(),"retained Root Busy was mistaken for transient owner contention");
+    assert_eq!(candidate_owner::error(),Some(Error::Busy));assert_eq!(replay::original(),Some(SNAP));
+    let(mut s,mut job)=fixture();candidate_owner::reset();job.completion.as_mut().unwrap().result=Err(Error::Auth);
+    assert_eq!(finish_job(&mut s,job,None),Err(Error::Auth));candidate_owner::observe(Error::Busy);
+    assert!(candidate_owner::drained());assert_eq!(candidate_owner::error(),Some(Error::Auth));
+}
+// ACTUAL_LIFECYCLE_MODULE
+#[test]fn first_candidate_unactivated_gate_cannot_close_published_or_entered_custody(){
+    use cyxia_prototype::learning::capture::RunKey;
+    let run=RunKey{boot_epoch:1,trial_id:3,generation:1};
+    let(mut s,job)=fixture();assert_eq!(finish_job(&mut s,job,None),Err(Error::Busy));
+    let mut gate=close_lifecycle::CloseGate::new();
+    assert_eq!(gate.begin(run,false,true),Err(Error::Busy));assert_eq!(gate.closing(),None);
+    assert_eq!(gate.begin(run,true,false),Ok(false));assert_eq!(gate.closing(),None);
+    assert_eq!(gate.begin(run,false,false),Ok(true));assert_eq!(gate.closing(),Some(run));
+    assert_eq!(gate.finish_activation(run),Err(Error::Auth));
+    let mut entered=close_lifecycle::CloseGate::new();entered.finish_activation(run).unwrap();
+    assert_eq!(entered.begin(run,false,false),Err(Error::Conflict));
+    // Actual CloseGate only: protected no-publication/owner/Memory/capture proof
+    // and abort/export/release are separate boundaries, never synthesized here.
+}
+
+#[test]fn first_candidate_abort_keeps_existing_completion_and_publication_custody(){
+    for mode in 0..4 {
+        let(_,mut job)=fixture();
+        if mode==0{job.completion=None;}
+        if mode==1{job.completion.as_mut().unwrap().result=Ok(384);replay::scenario(2);}
+        if mode==3{job.completion=None;job.cpu=2;}
+        with(|s|{s.job=Some(job);Ok(())}).unwrap();
+        assert_eq!(abort(100),if mode==3{Err(Error::Auth)}else{Ok(())});
+        assert_eq!(replay::fault(),match mode{0=>Some(Error::Expired),2=>Some(Error::Busy),_=>None});
+        assert_eq!(ABORTS.load(Ordering::Acquire),usize::from(mode==0));
+        assert_eq!(with(|s|Ok(s.job.is_some())).unwrap(),mode==3);
+    }
 }

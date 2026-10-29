@@ -2387,6 +2387,12 @@ fn finish_job(s: &mut State, job: Job, output: Option<&[u64; 512]>) -> Result<u6
             return Err(error);
         }
     }
+    if !job.read_only
+        && job.work.is_none()
+        && let Err(error) = completion.result
+    {
+        replay::reject_first_job(s.boot, job.sequence, &job.set, error);
+    }
     if let Some(evidence) = job.evidence {
         let (version, state) = match completion.result {
             Ok(version) => (version, ExecutionState::Pending),

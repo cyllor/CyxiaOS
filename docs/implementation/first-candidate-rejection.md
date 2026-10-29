@@ -1,0 +1,13 @@
+# Retired first-candidate rejection
+
+A captured candidate trial owns its original first snapshot. Previously, a first numerical job could complete with a definite unpublished error, retire, and leave Root Running with `initial=None`. The next sequence then used a fresh snapshot inside that same already-open scope. Native jobs 409–418 followed this path before publication 419 arrived after the original observation window.
+
+`finish_job` now forwards the **original completion error** to Root after any retained core-replay delivery succeeds. Only ordinary, non-read-only, non-core jobs qualify. Root requires the current token's boot, Running Candidate phase, exact original snapshot and sequence, matching family and full target, and no committed initial publication. It retains the original fault and prevents successor admission. No new clock read, receipt, snapshot, job, policy or deadline is created.
+
+A transient failure to deliver a completion retains the original Job without rejecting its scope. A successful receipt, an actual published initial latch, other trials, other targets and later snapshots cannot take the unpublished rejection path. Abort preserves an existing completion and only synthesizes the existing Expired result when none exists. The existing owner error handler recognizes retained Busy as a trial fault and advances the original scope to Drain.
+
+The existing unactivated close path remains responsible for proving no publication, unresolved work or actual owner custody before excluded export/release. The change does not directly publish a closing baseline, synthesize those proofs or release owners.
+
+`tests/host/test_first_candidate_rejection.py` executes the actual `finish_job`, abort, Root admission/first/rejection, owner error handler and CloseGate bodies. Six Rust scenarios cover exact rejection, foreign/success/published cases, retained delivery, owner Drain, publication/activation barriers and abort behavior. Seven independent mutations must fail. Initial behavioral RED fails because the retired Busy leaves its original scope open; positive and negative tests pass after the fix.
+
+Reply authentication, actual Registry commit, capture and resource-owner proofs remain explicit host boundaries. The owner fixture supplies a protected fault lookup and the CloseGate fixture supplies custody facts; neither is an end-to-end unactivated export/release test. These tests establish no native deadline, pair label or complete-prototype acceptance. Full engineering checks and fresh native evidence are recorded separately.

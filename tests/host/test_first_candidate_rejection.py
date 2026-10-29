@@ -25,10 +25,13 @@ def program():
     for marker,signature in [('JOB','struct Job {'),('COMPLETION','struct JobCompletion {')]:
         source=source.replace('// ACTUAL_'+marker,'#[derive(Clone,Copy)]\n'+function(control,signature))
     source=source.replace('// ACTUAL_FINISH_JOB',function(control,'fn finish_job('))
+    source=source.replace('// ACTUAL_ABORT',function(control,'pub fn abort('))
     source=source.replace('// ACTUAL_TOKEN','#[derive(Clone,Copy,Debug,PartialEq,Eq)]\n'+function(replay,'pub struct Token'))
     bodies='\n'.join(function(replay,s) for s in ['fn fail(','pub(super) fn allows(','pub(super) fn first('])
     hook='pub(super) fn reject_first_job(_:u64,_:u64,_:&CandidateSet,_:Error) {}'
     if 'fn reject_first_job(' in replay:hook=function(replay,'pub(super) fn reject_first_job(')
+    source=source.replace('// ACTUAL_OWNER_RETAIN_ERROR',function((ROOT/'kernel/src/learning_replay/owner.rs').read_text(),'fn retain_error('))
+    source=source.replace('// ACTUAL_LIFECYCLE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/replay/lifecycle.rs'))+'] mod close_lifecycle;')
     return source.replace('// ACTUAL_ROOT_FUNCTIONS',bodies+'\n'+hook)
 
 
@@ -41,20 +44,20 @@ class FirstCandidateRejection(unittest.TestCase):
             command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-first-candidate-rejection'),'--','--test-threads=1']
             r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)
-            self.assertIn('3 passed; 0 failed',r.stdout)
+            self.assertIn('6 passed; 0 failed',r.stdout)
             hook='        replay::reject_first_job(s.boot, job.sequence, &job.set, error);'
             mutants=[(hook,'','retired first candidate left its captured scope open'),
                 ('&& r.initial.is_none()','', 'unrelated or published obligation was failed: 2'),
-                ('&& q.kind == TrialKind::Candidate','', 'unrelated or published obligation was failed: 1'),
+                ('q.kind == TrialKind::Candidate','true', 'unrelated or published obligation was failed: 1'),
                 ('&& sequence == set.snapshot.sequence','', 'unrelated or published obligation was failed: 10'),
                 ('&& r.token.is_some_and(|token| token.boot_epoch == boot)','', 'unrelated or published obligation was failed: 4'),
-                ('!job.read_only && job.work.is_none()','!job.read_only', 'unrelated or published obligation was failed: 9'),
-                ('!job.read_only && job.work.is_none()','job.work.is_none()', 'unrelated or published obligation was failed: 8')]
+                ('!job.read_only\n        && job.work.is_none()','!job.read_only', 'unrelated or published obligation was failed: 9'),
+                ('!job.read_only\n        && job.work.is_none()','job.work.is_none()', 'unrelated or published obligation was failed: 8')]
             for old,new,message in mutants:
                 self.assertIn(old,original)
                 source.write_text(original.replace(old,new))
                 r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
-                self.assertNotEqual(r.returncode,0,r.stdout+r.stderr)
+                self.assertNotEqual(r.returncode,0,old+"\n"+r.stdout+r.stderr)
                 self.assertIn(message,r.stdout+r.stderr)
 
 

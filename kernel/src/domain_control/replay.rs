@@ -1563,6 +1563,26 @@ pub(super) fn reject_preparation(
         fail(r, error);
     }
 }
+/// A completed, unpublished first job has exhausted its original attempt.
+/// Its captured scope cannot acquire a new first sequence or deadline.
+pub(super) fn reject_first_job(boot: u64, sequence: u64, set: &CandidateSet, error: Error) {
+    let r = root_mut();
+    if r.phase == Phase::Running
+        && r.token.is_some_and(|token| token.boot_epoch == boot)
+        && sequence == set.snapshot.sequence
+        && r.first == Some(set.snapshot)
+        && r.initial.is_none()
+        && r.request.is_some_and(|q| {
+            q.kind == TrialKind::Candidate
+                && q.target == set.target
+                && set.get(0).is_some_and(|first| {
+                    q.family.domain == first.action.domain() && q.family.kind == first.action.kind()
+                })
+        })
+    {
+        fail(r, error);
+    }
+}
 pub(super) fn published(
     plan: &Plan,
     boot: u64,

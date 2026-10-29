@@ -1,5 +1,9 @@
 # V0.12 continuation — 2026-10-29
 
+## Original first-candidate rejection
+
+The [first-candidate retirement fix](first-candidate-rejection.md) now excludes a captured scope when its exact original first job has completed with a definite unpublished error. Root retains the original snapshot and error; a new sequence cannot refresh the trial. Actual publication, retained completion delivery and unrelated/read-only/core jobs retain their original paths. Six actual-source Rust scenarios and seven mutations cover the mechanism; native validation remains pending.
+
 ## Recovery phase/predicate checkpoint
 
 The next diagnostic now binds the real supervisor phase/issued transition and original backend result to each full Recovery ApplyId, alongside the original TaskGuard drain/stopped/running predicate, queried mask and full active Dispatch. It reuses existing header words under separate Services/Task publications, preserving original resource operations, clocks, short circuit, deadlines and single-issue behavior. [The ABI, TDD boundaries and attribution limits](recovery-observation-evidence.md) distinguish receipt queries from actual progress. It does not add a recovery scheduling opportunity or mark Unknown complete.
