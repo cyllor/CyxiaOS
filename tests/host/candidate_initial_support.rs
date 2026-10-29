@@ -9,7 +9,7 @@ pub mod replay {
     #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum TrialKind {Baseline,Candidate}
     #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum Phase {Frozen,Running,Restoring,Faulted,Complete}
     // CANDIDATE_TOKEN
-    #[derive(Clone,Copy)] struct Request {owner:ObjectKey,target:ObjectKey,family:Family,kind:TrialKind}
+    #[derive(Clone,Copy)] struct Request {trial_id:u64,owner:ObjectKey,target:ObjectKey,family:Family,kind:TrialKind}
     #[derive(Clone,Copy)] struct Receipt {stamp:PolicyStamp,state:ExecutionState}
     struct Lifecycle {closed:bool}
     impl Lifecycle {fn closing(&self)->Option<()>{self.closed.then_some(())}}
@@ -24,8 +24,9 @@ pub mod replay {
     fn root()->&'static Root{unsafe{&*core::ptr::addr_of!(ROOT)}}
     fn root_mut()->&'static mut Root{unsafe{&mut *core::ptr::addr_of_mut!(ROOT)}}
     // CANDIDATE_ROOT_BODIES
+    // CANDIDATE_STALE_HOOK
     pub const TOKEN:Token=Token{id:9,boot_epoch:7,owner:key(7)};
-    pub fn reset(){let r=root_mut();r.token=Some(TOKEN);r.request=Some(Request{owner:key(7),target:key(12),
+    pub fn reset(){let r=root_mut();r.token=Some(TOKEN);r.request=Some(Request{trial_id:3,owner:key(7),target:key(12),
         family:Family{domain:Action::CpuWeight(2).domain(),kind:Action::CpuWeight(2).kind()},kind:TrialKind::Candidate});
         r.first=Some(Snapshot{sequence:ID.plan_seq,taken_ns:STAMP.snapshot_ns,ledger_generation:1,core_generation:1});
         r.first_ready=true;r.phase=Phase::Running;r.initial=None;r.candidate_publication=None;r.selected=None;
@@ -143,14 +144,34 @@ pub fn candidate_poll_scenario(){
     }
 
     if mode=="stale"{with(|s|{s.owner.context.ledger_generation+=1;Ok(())}).unwrap();}
+    if mode=="denial_ledger"{with(|s|{s.owner.context.ledger_generation+=1;Ok(())}).unwrap();}
+    if mode=="denial_core"{with(|s|{s.owner.context.core_generation+=1;Ok(())}).unwrap();}
+    if mode=="denial_binder"{BIND_MODE.store(2,Ordering::Release);}
+    if mode=="denial_binding"{BIND_MODE.store(4,Ordering::Release);}
+    if mode=="denial_executor"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::Stale);Ok(())}).unwrap();}
+
     if mode=="deadline"{WALL.store(200_000_000,Ordering::Release);}
     if mode=="failed"||mode=="registry"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::Conflict);Ok(())}).unwrap();}
     if mode=="registry"{REGISTRY_FAIL.store(true,Ordering::Release);}
     if mode=="busy"||mode=="deadline"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::Busy);Ok(())}).unwrap();}
     if mode=="unknown"{with(|s|{s.owner.families[0].as_mut().unwrap().apply=|_,_,_,_|Err(Error::NotReady);Ok(())}).unwrap();}
     let _=poll(now());
-    let terminal=matches!(mode.as_str(),"stale"|"failed"|"deadline"|"registry"|"renewal_stale");
+    let terminal=matches!(mode.as_str(),"stale"|"failed"|"deadline"|"registry"|"renewal_stale"|"denial_core"|"denial_ledger"|"denial_binder"|"denial_binding"|"denial_executor");
     assert_eq!(replay::baseline_activation_pending(),!terminal,"real final Control state did not update the initial hint");
+    if mode.starts_with("denial_") {
+        let h=crate::domain_evidence::candidate_stale_header();
+        if mode=="denial_executor" {assert_eq!(h[2],0,"actual executor error was falsely recorded as pre-executor denial");}
+        else {
+            assert_eq!(h[3],1,"actual candidate pre-executor Stale lost its original denial facts");
+            assert_eq!(h[2],1);assert_eq!(&h[4..9],&[9,7,7,1,3]);
+            assert_eq!(&h[9..13],&[51,100_000_000,1,1]);
+            assert_eq!(&h[13..19],&[7,2,51,0,12,1]);
+            assert_eq!(&h[19..22],&[41,100_000_000,10_100_000_000]);
+            assert_eq!(&h[23..27],match mode.as_str(){"denial_core"=>&[1,2,1,1],"denial_ledger"=>&[1,1,1,2],_=>&[1,1,1,1]});
+            assert_eq!(h[27],match mode.as_str(){"denial_binder"=>2,"denial_binding"=>4,_=>1});assert_eq!(h[28],Error::Stale as u64+1);
+            assert_eq!(&h[29..31],&[1,1]);assert_eq!(h[35]%2,0);
+        }
+    }
     if mode=="applied" {
         task::execute_and_settle();WALL.store(100_040_000,Ordering::Release);poll(now()).unwrap();
         assert!(!replay::baseline_activation_pending(),"real Scheduler receipt did not retire initial priority");

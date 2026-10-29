@@ -16,7 +16,7 @@ from doctor import RUST_BIN,env
 from test_governance_billing_priority import function
 
 
-def root_support():
+def root_support(observe_stale=False):
     replay=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
     control=(ROOT/'kernel/src/domain_control.rs').read_text()
     support=(ROOT/'tests/host/candidate_initial_support.rs').read_text()
@@ -32,6 +32,9 @@ def root_support():
         re.search(r'^static BASELINE_ACTIVATION_PENDING:.*;$',replay,re.M)[0],
         function(replay,'pub(super) fn publish_baseline_activation_hint('),
         function(replay,'pub fn baseline_activation_pending('),function(replay,'pub(super) fn published('),hook]))
+    stale='pub(super) fn candidate_stale<T>(_: &T) {}'
+    if observe_stale and 'fn candidate_stale(' in replay:stale=function(replay,'pub(super) fn candidate_stale(')
+    support=support.replace('// CANDIDATE_STALE_HOOK',stale)
     extra=', stamp' if 'first_stamp: Option<PolicyStamp>' in replay else ''
     return support.replace('// CANDIDATE_PUBLISHED_CALL',f'published(&plan,id.boot_epoch{extra})?;')
 
@@ -84,7 +87,10 @@ class CandidatePublicationProgress(unittest.TestCase):
         support=support.replace('action_index:0,target:group(12)','action_index:0,target:key(12)')
         program+='\n#[path='+json.dumps(str(ROOT/'kernel/src/learning_evidence/execution_trace.rs'))+'] pub(crate) mod candidate_trace;\n'+support
         with tempfile.TemporaryDirectory() as tmp:
-            d=Path(tmp);source=d/'harness.rs';source.write_text(program)
+            d=Path(tmp);evidence=d/'evidence.rs'
+            evidence.write_text((ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
+            program=program.replace('// ACTUAL_DOMAIN_EVIDENCE','#[path='+json.dumps(str(evidence))+'] mod domain_evidence;')
+            source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-paid-progress"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\nsha2="=0.10.9"\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-paid-progress'),'--','--test-threads=1','candidate_']
             r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
@@ -123,7 +129,7 @@ class CandidatePublicationProgress(unittest.TestCase):
         program=program.replace('fn reconcile(&mut self,_:ApplyId,_:u64,_:ExecutionState)->Result<(),Error>{Ok(())}',
             'fn reconcile(&mut self,_:ApplyId,_:u64,_:ExecutionState)->Result<(),Error>{if REGISTRY_FAIL.load(Ordering::Acquire){Err(Error::Stale)}else{Ok(())}}')
         program=program.replace('// CONTROL_BODIES','\n'.join(function(control,s) for s in [
-            'fn execution_blocks_replacement(','fn execution_limit(','pub fn poll('])+root_support())
+            'fn execution_blocks_replacement(','fn execution_limit(','pub fn poll('])+root_support(True))
         # Execute native precommit through the actual post-commit Root hook.
         # Desired writes after that hook remain the original Control fixture's
         # explicit publication boundary; commit itself is a counted facade.
@@ -150,6 +156,10 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
 '''
         program=program.replace('    pub fn observe(){poll(now()).unwrap();}',
             '    pub fn observe(){poll(now()).unwrap();}\n pub mod publication{'+publication+'}\n')
+        program=program.replace(function(program,'mod domain_evidence {'),'// ACTUAL_DOMAIN_EVIDENCE')
+        program+='\nmod domain_platform {pub fn now_ns()->u64{super::now()}}\n'
+        program=program.replace('fn bind_dependencies(_: &Owner,_:Action,_:ObjectKey,_:u64)->Result<[Option<u8>;2],Error>{Ok([None;2])}',
+            'static BIND_MODE:AtomicU64=AtomicU64::new(0);\nfn bind_dependencies(_: &Owner,_:Action,_:ObjectKey,_:u64)->Result<[Option<u8>;2],Error>{match BIND_MODE.load(Ordering::Acquire){2=>Err(Error::Stale),4=>Ok([Some(1),None]),_=>Ok([None;2])}}')
         old='fn with<T>(f:impl FnOnce(&mut State)->Result<T,Error>)->Result<T,Error>{let mut guard=STATE.try_lock().map_err(|_|Error::Busy)?;f(&mut guard)}'
         program=program.replace(old,'''pub fn with<T>(f:impl FnOnce(&mut State)->Result<T,Error>)->Result<T,Error>{
             let mut guard=STATE.try_lock().map_err(|_|Error::Busy)?;
@@ -158,11 +168,14 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
         program+=(ROOT/'tests/host/candidate_activate_support.rs').read_text().replace('// CANDIDATE_ACTIVATE_ARM',arm)
         program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"root"=>control::replay::scenario(),"renewal"=>control::replay::renewal_scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
         with tempfile.TemporaryDirectory() as tmp:
-            d=Path(tmp);source=d/'harness.rs';source.write_text(program)
+            d=Path(tmp);evidence=d/'evidence.rs'
+            evidence.write_text((ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
+            program=program.replace('// ACTUAL_DOMAIN_EVIDENCE','#[path='+json.dumps(str(evidence))+'] mod domain_evidence;')
+            source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'run','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-initial')]
             failures=[]
-            for case in ['root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
+            for case in ['denial_core','denial_ledger','denial_binder','denial_binding','denial_executor','root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
                 r=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 if r.returncode: failures.append(case+'\n'+r.stdout+r.stderr)
             self.assertFalse(failures,'\n'.join(failures))
