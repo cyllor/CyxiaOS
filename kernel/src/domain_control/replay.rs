@@ -2505,6 +2505,7 @@ fn publish_value_traced(
         dependencies,
         scores: [0; 32],
         score_count: 0,
+        provenance: submission::Facts::disabled(),
     };
     trace.stage = 12;
     let published = s.registry.submit_job(

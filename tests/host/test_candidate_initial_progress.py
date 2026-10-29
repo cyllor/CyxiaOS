@@ -136,8 +136,11 @@ class CandidatePublicationProgress(unittest.TestCase):
         publication=publication.replace('use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};',
             'use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};\nuse super::replay;')
         publication=publication.replace('// NATIVE_CLOCK',function(control,'impl policy::Clock for NativeClock'))
+        publication=publication.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
         publish=function(control,'fn publish(&mut self, plan: &Plan, version: u64, at: u64)')
-        publish=publish[:publish.index('        for (index, d) in plan.iter().enumerate() {',publish.index('self.scope.commit('))]+'''\nself.published+=1;Ok(())}'''
+        cutoff=publish.index('        for (index, d) in plan.iter().enumerate() {',publish.index('self.scope.commit('));cutoff=publish.rfind('\n',0,cutoff)+1
+        suffix=publish[publish.rfind('\n        })();'):] if 'let result = (|| {' in publish else '\n}'
+        publish=publish[:cutoff]+'self.published+=1;Ok(())'+suffix
         publication=publication.replace('// NATIVE_PRECOMMIT',publish)
         publication=publication.replace('wall_deadline: u64, published: usize,','wall_deadline: u64, published: usize,boot:u64,')
         publication=publication.replace('wall_deadline: 150_000_000, published: 0','wall_deadline: 150_000_000, published: 0,boot:7')

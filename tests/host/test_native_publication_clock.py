@@ -22,12 +22,14 @@ class NativePublicationClock(unittest.TestCase):
         body = function(source, 'fn publish(&mut self, plan: &Plan, version: u64, at: u64)')
         # Execute the full native precommit body. Mutating root/device/history
         # effects below this boundary are substituted with one counted commit.
-        body = body[:body.index('        self.scope.commit(')] + '''
-        self.published += 1;
-        Ok(())
-    }'''
+        cutoff=body.index('self.scope.commit(');cutoff=body.rfind('\n',0,cutoff)+1
+        marker=body.rfind('self.provenance.at(',0,cutoff)
+        if marker>=0 and 'ScopeCommit' in body[marker:cutoff]:cutoff=body.rfind('\n',0,marker)+1
+        suffix=body[body.rfind('\n        })();'):] if 'let result = (|| {' in body else '\n    }'
+        body=body[:cutoff]+'self.published += 1; Ok(())'+suffix
         template = (ROOT / 'tests/host/native_publication_clock_harness.rs').read_text()
         template = template.replace('// NATIVE_CLOCK', function(source, 'impl policy::Clock for NativeClock'))
+        template=template.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
         template = template.replace('// NATIVE_PRECOMMIT', body)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

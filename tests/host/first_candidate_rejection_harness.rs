@@ -14,6 +14,8 @@ mod core_replay {
         if super::DELIVERY_BUSY.load(super::Ordering::Acquire){Err(super::Error::Busy)}else{Ok(())}}
 }
 mod domain_evidence {
+    // Submission provenance is covered by its own real record/accept fixture.
+    pub fn submission(_:usize,_:u64,_:[u64;27]){}
     pub fn finish(_:usize,_:u64,_:u64,_:u64,_:u64,_:u64,_:u64,_:super::ExecutionState,_:u64,_:Option<&[u64;512]>){super::EVIDENCE.fetch_add(1,super::Ordering::Relaxed);}
     pub fn aborted(){super::ABORTS.fetch_add(1,super::Ordering::Relaxed);}
 }

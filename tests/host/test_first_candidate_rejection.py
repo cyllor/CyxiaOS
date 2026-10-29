@@ -26,6 +26,7 @@ def program():
         source=source.replace('// ACTUAL_'+marker,'#[derive(Clone,Copy)]\n'+function(control,signature))
     source=source.replace('// ACTUAL_FINISH_JOB',function(control,'fn finish_job('))
     source=source.replace('// ACTUAL_ABORT',function(control,'pub fn abort('))
+    source+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;\n'
     source=source.replace('// ACTUAL_TOKEN','#[derive(Clone,Copy,Debug,PartialEq,Eq)]\n'+function(replay,'pub struct Token'))
     bodies='\n'.join(function(replay,s) for s in ['fn fail(','pub(super) fn allows(','pub(super) fn first('])
     hook='pub(super) fn reject_first_job(_:u64,_:u64,_:&CandidateSet,_:Error) {}'

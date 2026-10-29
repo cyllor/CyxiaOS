@@ -60,5 +60,5 @@ fn run(mode:u64)->(policy::PlanReceipt,[u64;27],u64,bool){let(mut registry,wire,
 }
 #[test]fn native_submission_does_not_blame_successful_callback_for_registry_cpu_failure(){
  let(r,w,reads,stopped)=run(8);assert_eq!(r.state(),ExecutionState::Failed(Error::Budget));assert!(stopped);assert_eq!(reads,4);
- assert_eq!(w[0],0x43595355424d0001,"native completion lost original submission provenance");assert_eq!((w[7],w[9],w[14],w[15],w[16],w[17]),(9,Error::Budget as u64+1,6,9,2,0));assert_eq!(w[19],1);assert_eq!(EFFECTS.load(Ordering::Acquire),0);
+ assert_eq!(w[0],0x43595355424d0001,"native completion lost original submission provenance");assert_eq!((w[7],w[9],w[14],w[15],w[16],w[17]),(9,Error::Budget as u64+1,6,7,2,0));assert_eq!(w[19],1);assert_eq!(EFFECTS.load(Ordering::Acquire),0);
 }

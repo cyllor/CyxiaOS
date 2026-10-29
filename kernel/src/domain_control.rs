@@ -235,6 +235,8 @@ pub mod learning_driver;
 pub mod replay;
 #[path = "domain_control/reply.rs"]
 mod reply;
+#[path = "domain_control/submission.rs"]
+mod submission;
 #[path = "domain_control/target_batch.rs"]
 pub(crate) mod target_batch;
 pub use target_batch::Source as TargetSource;
@@ -1997,6 +1999,7 @@ struct Executor<'a, S: PublicationScope> {
     dependencies: [Option<BoundDependency>; 2],
     scores: [i16; 32],
     score_count: usize,
+    provenance: submission::Facts,
 }
 impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
     fn authorize_baseline(
@@ -2005,10 +2008,18 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         set: &policy::RegisteredSet,
         at: u64,
     ) -> Result<(), Error> {
-        if set.model != self.model {
-            return Err(Error::Stale);
-        }
-        self.scope.authorize_baseline(active, set, at)
+        self.provenance
+            .enter(submission::Callback::AuthorizeBaseline);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ModelBinding);
+            if set.model != self.model {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_baseline(active, set, at)
+        })();
+        self.provenance.returned(result);
+        result
     }
     fn authorize_recovery(
         &mut self,
@@ -2016,7 +2027,14 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         plan: &Plan,
         at: u64,
     ) -> Result<(), Error> {
-        self.scope.authorize_recovery(active, plan, at)
+        self.provenance
+            .enter(submission::Callback::AuthorizeRecovery);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_recovery(active, plan, at)
+        })();
+        self.provenance.returned(result);
+        result
     }
     fn authorize_model(
         &mut self,
@@ -2024,65 +2042,34 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         set: &policy::RegisteredSet,
         at: u64,
     ) -> Result<(), Error> {
-        if set.model != self.model {
-            return Err(Error::Stale);
-        }
-        self.scope.authorize(active, set, at)
+        self.provenance.enter(submission::Callback::AuthorizeModel);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ModelBinding);
+            if set.model != self.model {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize(active, set, at)
+        })();
+        self.provenance.returned(result);
+        result
     }
     fn check(&mut self, d: Decision, _: &policy::RegisteredSet, now: u64) -> Result<(), Error> {
-        let c = self.owner.context;
-        if d.envelope.core_generation != c.core_generation
-            || d.envelope.ledger_generation != c.ledger_generation
-        {
-            return Err(Error::Stale);
-        }
-        let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
-            .ok_or(Error::Unsupported)?;
-        self.scope.legal(f, d.action, d.envelope.target, now)?;
-        if self
-            .scope
-            .dependencies(self.owner, d.action, d.envelope.target, now)?
-            != self.dependencies
-        {
-            return Err(Error::Stale);
-        }
-        if let Some(i) = locate(self.owner, d.action, d.envelope.target) {
-            if self.owner.desired[i]
-                .as_ref()
-                .is_some_and(execution_blocks_replacement)
-            {
-                return Err(Error::Busy);
-            }
-        }
-        self.scope
-            .selection(self.owner, f, d.action, d.envelope.target, now)?;
-        Ok(())
-    }
-    fn prepare(&mut self, plan: &Plan, _: u64) -> Result<(), Error> {
-        self.owner.prepared_count = 0;
-        for d in plan.iter() {
-            let i = locate(self.owner, d.action, d.envelope.target).ok_or(Error::Stale)?;
-            if self.owner.prepared[..self.owner.prepared_count].contains(&i) {
-                return Err(Error::Conflict);
-            }
-            self.owner.prepared[self.owner.prepared_count] = i;
-            self.owner.prepared_count += 1;
-        }
-        Ok(())
-    }
-    fn revalidate(&mut self, plan: &Plan, now: u64) -> Result<(), Error> {
-        for d in plan.iter() {
+        self.provenance.enter(submission::Callback::Check);
+        let result = (|| {
+            self.provenance.at(submission::Stage::Context);
             let c = self.owner.context;
             if d.envelope.core_generation != c.core_generation
                 || d.envelope.ledger_generation != c.ledger_generation
             {
                 return Err(Error::Stale);
             }
+            self.provenance.at(submission::Stage::Family);
             let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                 .ok_or(Error::Unsupported)?;
+            self.provenance.at(submission::Stage::Legal);
             self.scope.legal(f, d.action, d.envelope.target, now)?;
-            self.scope
-                .selection(self.owner, f, d.action, d.envelope.target, now)?;
+            self.provenance.at(submission::Stage::Dependencies);
             if self
                 .scope
                 .dependencies(self.owner, d.action, d.envelope.target, now)?
@@ -2090,133 +2077,219 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             {
                 return Err(Error::Stale);
             }
-        }
-        Ok(())
+            self.provenance.at(submission::Stage::OldDesired);
+            if let Some(i) = locate(self.owner, d.action, d.envelope.target) {
+                if self.owner.desired[i]
+                    .as_ref()
+                    .is_some_and(execution_blocks_replacement)
+                {
+                    return Err(Error::Busy);
+                }
+            }
+            self.provenance.at(submission::Stage::Selection);
+            self.scope
+                .selection(self.owner, f, d.action, d.envelope.target, now)?;
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn prepare(&mut self, plan: &Plan, _: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Prepare);
+        let result = (|| {
+            self.provenance.at(submission::Stage::PrepareIndex);
+            self.owner.prepared_count = 0;
+            for d in plan.iter() {
+                let i = locate(self.owner, d.action, d.envelope.target).ok_or(Error::Stale)?;
+                if self.owner.prepared[..self.owner.prepared_count].contains(&i) {
+                    return Err(Error::Conflict);
+                }
+                self.owner.prepared[self.owner.prepared_count] = i;
+                self.owner.prepared_count += 1;
+            }
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn revalidate(&mut self, plan: &Plan, now: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Revalidate);
+        let result = (|| {
+            for d in plan.iter() {
+                self.provenance.at(submission::Stage::Context);
+                let c = self.owner.context;
+                if d.envelope.core_generation != c.core_generation
+                    || d.envelope.ledger_generation != c.ledger_generation
+                {
+                    return Err(Error::Stale);
+                }
+                self.provenance.at(submission::Stage::Family);
+                let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
+                    .ok_or(Error::Unsupported)?;
+                self.provenance.at(submission::Stage::Legal);
+                self.scope.legal(f, d.action, d.envelope.target, now)?;
+                self.provenance.at(submission::Stage::Selection);
+                self.scope
+                    .selection(self.owner, f, d.action, d.envelope.target, now)?;
+                self.provenance.at(submission::Stage::Dependencies);
+                if self
+                    .scope
+                    .dependencies(self.owner, d.action, d.envelope.target, now)?
+                    != self.dependencies
+                {
+                    return Err(Error::Stale);
+                }
+            }
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
     }
     fn publish(&mut self, plan: &Plan, version: u64, at: u64) -> Result<(), Error> {
-        self.scope.authorize_executor(self.owner)?;
-        if self.owner.prepared_count != plan.len() {
-            return Err(Error::Conflict);
-        }
-        let mut stamps = [PolicyStamp::default(); 16];
-        for (index, d) in plan.iter().enumerate() {
-            stamps[index] = PolicyStamp::for_action(
-                d.action,
-                version,
-                if d.action.one_shot() {
-                    d.envelope
-                        .expires_local_ns
-                        .checked_sub(WINDOW_NS)
-                        .ok_or(Error::Format)?
-                } else {
-                    plan.header
-                        .active_until_local_ns
-                        .checked_sub(POLICY_NS)
-                        .ok_or(Error::Format)?
-                },
-                at,
-            )?;
-            let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
-                .ok_or(Error::Unsupported)?;
-            self.scope
-                .selection(self.owner, f, d.action, d.envelope.target, at)?;
-        }
-        let commit = policy::Clock::read(&mut NativeClock);
-        let commit_ns = commit.wall_ns;
-        if commit_ns < at {
-            return Err(Error::Range);
-        }
-        if commit_ns > self.wall_deadline
-            || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
-        {
-            return Err(Error::Expired);
-        }
-        policy::publication_budget(self.publication_started, commit)?;
-        for d in plan.iter() {
-            if d.envelope.model_hash != self.model.model_hash
-                || plan.header.active_model_generation != self.model.generation
-            {
-                return Err(Error::Stale);
+        self.provenance.enter(submission::Callback::Publish);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_executor(self.owner)?;
+            self.provenance.at(submission::Stage::PreparedCount);
+            if self.owner.prepared_count != plan.len() {
+                return Err(Error::Conflict);
             }
-        }
-        self.scope.commit(
-            self.owner,
-            self.model,
-            plan,
-            &stamps[..plan.len()],
-            self.boot,
-            commit_ns,
-        )?;
-        replay::published(plan, self.boot, stamps[..plan.len()].first().copied())?;
-        for (index, d) in plan.iter().enumerate() {
-            let slot = self.owner.prepared[index];
-            let stamp = stamps[index];
-            self.owner.desired[slot] = Some(Desired {
-                action: d.action,
-                apply: ApplyId {
+            let mut stamps = [PolicyStamp::default(); 16];
+            for (index, d) in plan.iter().enumerate() {
+                self.provenance.at(submission::Stage::Stamp);
+                stamps[index] = PolicyStamp::for_action(
+                    d.action,
+                    version,
+                    if d.action.one_shot() {
+                        d.envelope
+                            .expires_local_ns
+                            .checked_sub(WINDOW_NS)
+                            .ok_or(Error::Format)?
+                    } else {
+                        plan.header
+                            .active_until_local_ns
+                            .checked_sub(POLICY_NS)
+                            .ok_or(Error::Format)?
+                    },
+                    at,
+                )?;
+                self.provenance.at(submission::Stage::Family);
+                let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
+                    .ok_or(Error::Unsupported)?;
+                self.provenance.at(submission::Stage::Selection);
+                self.scope
+                    .selection(self.owner, f, d.action, d.envelope.target, at)?;
+            }
+            self.provenance.at(submission::Stage::CommitTime);
+            let commit = policy::Clock::read(&mut NativeClock);
+            let commit_ns = commit.wall_ns;
+            if commit_ns < at {
+                return Err(Error::Range);
+            }
+            self.provenance.at(submission::Stage::CommitDeadline);
+            if commit_ns > self.wall_deadline
+                || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
+            {
+                return Err(Error::Expired);
+            }
+            self.provenance.at(submission::Stage::CommitCpu);
+            policy::publication_budget(self.publication_started, commit)?;
+            self.provenance.at(submission::Stage::ModelHash);
+            for d in plan.iter() {
+                if d.envelope.model_hash != self.model.model_hash
+                    || plan.header.active_model_generation != self.model.generation
+                {
+                    return Err(Error::Stale);
+                }
+            }
+            self.provenance.at(submission::Stage::ScopeCommit);
+            self.scope.commit(
+                self.owner,
+                self.model,
+                plan,
+                &stamps[..plan.len()],
+                self.boot,
+                commit_ns,
+            )?;
+            self.provenance.at(submission::Stage::RootPublish);
+            replay::published(plan, self.boot, stamps[..plan.len()].first().copied())?;
+            self.provenance.at(submission::Stage::DesiredWrites);
+            for (index, d) in plan.iter().enumerate() {
+                let slot = self.owner.prepared[index];
+                let stamp = stamps[index];
+                self.owner.desired[slot] = Some(Desired {
+                    action: d.action,
+                    apply: ApplyId {
+                        boot_epoch: self.boot,
+                        controller_epoch: plan.header.controller_epoch,
+                        plan_seq: plan.header.plan_seq,
+                        action_index: index as u16,
+                        target: d.envelope.target,
+                    },
+                    stamp,
+                    state: ExecutionState::Pending,
+                    execution_observed: false,
+                    started: false,
+                    first_entry_ns: None,
+                    observed_ns: commit_ns,
+                    published: commit_ns,
+                    evidence: self.evidence,
+                    job: self.job,
+                    model: self.model,
+                    dependencies: self.dependencies,
+                    core_generation: d.envelope.core_generation,
+                    ledger_generation: d.envelope.ledger_generation,
+                });
+                ADMISSION.publish(
+                    slot,
+                    Prerequisite {
+                        domain: d.action.domain(),
+                        target: d.envelope.target,
+                    },
+                    version,
+                    stamp.installed_until_ns,
+                    ExecutionState::Pending,
+                );
+            }
+            let mut concurrent = [ApplyId::default(); 16];
+            for (index, d) in plan.iter().enumerate() {
+                concurrent[index] = ApplyId {
                     boot_epoch: self.boot,
                     controller_epoch: plan.header.controller_epoch,
                     plan_seq: plan.header.plan_seq,
                     action_index: index as u16,
                     target: d.envelope.target,
-                },
-                stamp,
-                state: ExecutionState::Pending,
-                execution_observed: false,
-                started: false,
-                first_entry_ns: None,
-                observed_ns: commit_ns,
-                published: commit_ns,
-                evidence: self.evidence,
-                job: self.job,
-                model: self.model,
-                dependencies: self.dependencies,
-                core_generation: d.envelope.core_generation,
-                ledger_generation: d.envelope.ledger_generation,
-            });
-            ADMISSION.publish(
-                slot,
-                Prerequisite {
-                    domain: d.action.domain(),
-                    target: d.envelope.target,
-                },
-                version,
-                stamp.installed_until_ns,
-                ExecutionState::Pending,
-            );
-        }
-        let mut concurrent = [ApplyId::default(); 16];
-        for (index, d) in plan.iter().enumerate() {
-            concurrent[index] = ApplyId {
-                boot_epoch: self.boot,
-                controller_epoch: plan.header.controller_epoch,
-                plan_seq: plan.header.plan_seq,
-                action_index: index as u16,
-                target: d.envelope.target,
-            };
-        }
-        for (index, d) in plan.iter().enumerate() {
-            let _ = crate::learning_history::record_publish(crate::learning_history::Publish {
-                decision_seq: d.envelope.decision_seq,
-                apply: concurrent[index],
-                plan_version: version,
-                stamp: stamps[index],
-                model: self.model,
-                selected: d.candidate_index,
-                scores: &self.scores[..self.score_count],
-                received_ns: self.publication_started.wall_ns,
-                published_ns: commit_ns,
-                expires_local_ns: d.envelope.expires_local_ns,
-                active_until_local_ns: plan.header.active_until_local_ns,
-                approved_deadline_ns: commit_ns.saturating_add(execution_limit(d.action)),
-                concurrent: &concurrent[..plan.len()],
-            });
-        }
-        self.owner.prepared_count = 0;
-        Ok(())
+                };
+            }
+            for (index, d) in plan.iter().enumerate() {
+                let _ = crate::learning_history::record_publish(crate::learning_history::Publish {
+                    decision_seq: d.envelope.decision_seq,
+                    apply: concurrent[index],
+                    plan_version: version,
+                    stamp: stamps[index],
+                    model: self.model,
+                    selected: d.candidate_index,
+                    scores: &self.scores[..self.score_count],
+                    received_ns: self.publication_started.wall_ns,
+                    published_ns: commit_ns,
+                    expires_local_ns: d.envelope.expires_local_ns,
+                    active_until_local_ns: plan.header.active_until_local_ns,
+                    approved_deadline_ns: commit_ns.saturating_add(execution_limit(d.action)),
+                    concurrent: &concurrent[..plan.len()],
+                });
+            }
+            self.owner.prepared_count = 0;
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
     }
     fn cancel_prepared(&mut self, _: &Plan) {
+        self.provenance.cancelled();
         self.owner.prepared_count = 0;
+    }
+    fn observed_submission(&mut self, observation: &policy::SubmissionObservation) {
+        self.provenance.observed(observation);
     }
 }
 pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
@@ -2244,6 +2317,17 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         let mut selected = u64::MAX;
         let mut decoded_ns = None;
         let mut publication_cpu_started = None;
+        let mut provenance = submission::Facts::new(
+            job.sequence,
+            job.read_only,
+            [
+                job.set.snapshot.core_generation,
+                s.owner.context.core_generation,
+                job.set.snapshot.ledger_generation,
+                s.owner.context.ledger_generation,
+            ],
+            job.evidence.is_some(),
+        );
         let result = (|| {
             if wall_begin < job.started
                 || wall_begin - job.started > 50_000_000
@@ -2251,11 +2335,13 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             {
                 return Err(Error::Expired);
             }
+            provenance.accept(submission::AcceptStage::Context);
             if job.set.snapshot.core_generation != s.owner.context.core_generation
                 || job.set.snapshot.ledger_generation != s.owner.context.ledger_generation
             {
                 return Err(Error::Stale);
             }
+            provenance.accept(submission::AcceptStage::Verify);
             let reply = reply::verify(
                 reply::Expected {
                     set: &job.set,
@@ -2271,6 +2357,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             selected = reply.selected as u64;
             let decoding = timer::cpu_elapsed_ns(decode_cpu_started);
             decoded_ns = Some(decoding);
+            provenance.accept(submission::AcceptStage::DecodeBudget);
             if cpu_ns
                 .checked_add(job.encode_ns)
                 .and_then(|v| v.checked_add(decoding))
@@ -2283,6 +2370,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             if job.read_only {
                 // A read-only work ticket is root-owned. Even a byte-perfect
                 // Plan is only checked here; it never reaches publication.
+                provenance.accept(submission::AcceptStage::ReadOnlyModel);
                 if job.work.is_none() || s.registry.model() != job.set.model {
                     return Err(Error::Stale);
                 }
@@ -2291,11 +2379,14 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                     .ok_or(Error::NotReady)?
                     .check_active_publication(job.set.model, job.set.target)
                     .map_err(|_| Error::Stale)?;
+                provenance.accept(submission::AcceptStage::ReadOnlyLegal);
                 let f = s.owner.families[family_index(reply.action.domain(), reply.action.kind())?]
                     .ok_or(Error::NotReady)?;
                 (f.legal)(reply.action, job.set.target, now())?;
+                provenance.accept(submission::AcceptStage::ReadOnlyComplete);
                 return Ok(0);
             }
+            provenance.accept(submission::AcceptStage::Executor);
             let mut executor = Executor {
                 owner: &mut s.owner,
                 scope: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
@@ -2308,15 +2399,20 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 dependencies: job.dependencies,
                 scores: reply.scores,
                 score_count: job.set.len(),
+                provenance,
             };
-            let receipt = s.registry.submit_job(
+            executor.provenance.accept(submission::AcceptStage::Submit);
+            let submitted = s.registry.submit_job(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],
                 publication_started,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut NativeClock,
                 &mut executor,
-            )?;
+            );
+            provenance = executor.provenance;
+            let receipt = submitted?;
+            provenance.accept(submission::AcceptStage::Receipt);
             if receipt.version == 0 {
                 return Err(match receipt.state() {
                     ExecutionState::Failed(e) => e,
@@ -2369,6 +2465,13 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             output_hash,
             aborted: false,
         });
+        if let Some(evidence) = job.evidence {
+            crate::domain_evidence::submission(
+                evidence,
+                job.sequence,
+                provenance.words(result, false),
+            );
+        }
         finish_job(s, job, Some(output))
     })
 }
@@ -2438,6 +2541,16 @@ pub fn abort(cpu_ns: u64) -> Result<(), Error> {
                     output_hash: [0; 32],
                     aborted: true,
                 });
+                if let Some(evidence) = job.evidence {
+                    let mut provenance =
+                        submission::Facts::new(job.sequence, job.read_only, [0; 4], true);
+                    provenance.accept(submission::AcceptStage::Aborted);
+                    crate::domain_evidence::submission(
+                        evidence,
+                        job.sequence,
+                        provenance.words(Err(Error::Expired), true),
+                    );
+                }
             }
             let result = finish_job(s, job, None);
             // A failed actual evaluation is still a known retired root job.

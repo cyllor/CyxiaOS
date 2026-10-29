@@ -126,6 +126,22 @@ pub fn candidate_stale(context: [u64; 31]) {
     }
     DOMAIN_CONTROL_EVIDENCE.0[255].fetch_add(1, Ordering::Release);
 }
+/// Original job completion provenance. Delivery retries never replace it.
+pub fn submission(slot: usize, sequence: u64, words: [u64; 27]) {
+    if slot >= SLOTS || words[0] != 0x4359_5355_424d_0001 || words[1] != 1 || words[20] != sequence
+    {
+        return;
+    }
+    let at = base(slot);
+    if get(at) != sequence || get(at + 612) != 0 || get(at + SEQLOCK) & 1 != 0 {
+        return;
+    }
+    begin_write(at);
+    for (i, value) in words.into_iter().enumerate() {
+        put(at + 612 + i, value);
+    }
+    end_write(at);
+}
 /// Services-owner writer, independent of Control/Task header publications.
 /// Per recipe 1/2:256/320, latest +8..+33, first Unknown +36..+61,
 /// +2 total, +3 current-identity polls, +4 identity changes, +5 first present,
