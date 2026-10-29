@@ -91,6 +91,8 @@ class EvidenceParserTests(unittest.TestCase):
             ('TRACE_CONTROL_EVIDENCE', 'trace_control_evidence', 224),
             ('TRACE_TASK_EVIDENCE', 'trace_task_evidence', 128),
             ('TRACE_WORK_EVIDENCE', 'trace_work_evidence', 64),
+            ('TRACE_DRAIN_WORK_EVIDENCE', 'trace_drain_work_evidence', 64),
+            ('TRACE_DRAIN_TASK_EVIDENCE', 'trace_drain_task_evidence', 128),
         ]:
             values = list(range(count))
             snapshot[name] = encode(values)

@@ -763,7 +763,9 @@ pub(super) fn wake_task(s: &mut State, i: usize) {
     }
 }
 fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
-    if let Some(source) =
+    #[cfg(not(test))]
+    let traced = replay::drain_task_facts(s, i).map(|facts| (facts, now_ns()));
+    let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
         crate::learning_evidence::measure(
@@ -773,7 +775,18 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
         )
     } else {
         cleanup_inner(s, i)
+    };
+    #[cfg(not(test))]
+    if let Some((facts, entered)) = traced {
+        crate::learning_evidence::execution_trace::drain_cleanup(
+            facts,
+            result,
+            entered,
+            now_ns(),
+            s.tasks[i].life as u64 + 1,
+        );
     }
+    result
 }
 fn cleanup_inner(s: &mut State, i: usize) -> Result<(), Error> {
     let key = s.tasks[i].key;
@@ -1169,6 +1182,8 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     diagnostic_service_stage(74);
 }
 fn lifecycle_piece(s: &mut State, i: usize) {
+    #[cfg(not(test))]
+    let traced = replay::drain_task_facts(s, i).map(|facts| (facts, now_ns()));
     if RETURN_PENDING[i].load(Ordering::Acquire)
         && !s
             .active
@@ -1202,6 +1217,15 @@ fn lifecycle_piece(s: &mut State, i: usize) {
     }
     if s.tasks[i].life == Life::Exiting {
         let _ = cleanup(s, i);
+    }
+    #[cfg(not(test))]
+    if let Some((facts, entered)) = traced {
+        crate::learning_evidence::execution_trace::drain_lifecycle(
+            facts,
+            entered,
+            now_ns(),
+            s.tasks[i].life as u64 + 1,
+        );
     }
 }
 static BASELINE_RETRY_ACTIVE: AtomicBool = AtomicBool::new(false);

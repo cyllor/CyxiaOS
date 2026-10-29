@@ -844,11 +844,55 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
         })?;
     }
     with(|s| {
-        Ok(s.requests
+        let done = s
+            .requests
             .iter()
             .all(|r| r.phase == Phase::Settled && r.reported)
             && s.warm.is_none()
-            && (family.domain != 13 || s.background.settled()))
+            && (family.domain != 13 || s.background.settled());
+        #[cfg(not(test))]
+        if evidence::execution_trace::drain_tracking(run) {
+            let mut counts = [0; 3];
+            let mut request = [0; 5];
+            for (i, r) in s.requests.iter().enumerate() {
+                match r.phase {
+                    Phase::Queued => counts[0] += 1,
+                    Phase::Active => counts[1] += 1,
+                    Phase::Settled if !r.reported => counts[2] += 1,
+                    _ => (),
+                }
+                if request[0] == 0 && (r.phase != Phase::Settled || !r.reported) {
+                    let (outcome, finished) = match r.outcome {
+                        RequestResult::Completed { finished_ns } => (1, finished_ns),
+                        RequestResult::Rejected => (2, 0),
+                        RequestResult::TimedOut => (3, 0),
+                        RequestResult::Pending => (4, 0),
+                    };
+                    request = [
+                        i as u64 + 1,
+                        r.phase as u64 + 1,
+                        u64::from(r.armed) | u64::from(r.reported) << 1,
+                        outcome,
+                        finished,
+                    ];
+                }
+            }
+            let warm = s
+                .warm
+                .map_or([0; 3], |w| [w.id, w.deadline, u64::from(w.active)]);
+            evidence::execution_trace::drain_work(
+                run,
+                evidence::execution_trace::WorkWait {
+                    counts,
+                    request,
+                    warm,
+                    background_done: family.domain != 13 || s.background.settled(),
+                },
+                done,
+                now(),
+            );
+        }
+        Ok(done)
     })
 }
 pub fn drain(run: RunKey) -> Result<bool, Error> {

@@ -52,10 +52,16 @@ static TRACE_WORK_EVIDENCE: Evidence<64> = Evidence::new();
 #[used]
 #[unsafe(no_mangle)]
 static TRACE_CLOSING_EVIDENCE: Evidence<64> = Evidence::new();
+#[used]
+#[unsafe(no_mangle)]
+static TRACE_DRAIN_WORK_EVIDENCE: Evidence<64> = Evidence::new();
+#[used]
+#[unsafe(no_mangle)]
+static TRACE_DRAIN_TASK_EVIDENCE: Evidence<128> = Evidence::new();
 pub const OWNED_BYTES: usize = core::mem::size_of::<Evidence<224>>()
-    + core::mem::size_of::<Evidence<128>>()
-    + 2 * core::mem::size_of::<Evidence<64>>();
-const _: () = assert!(OWNED_BYTES == 3840);
+    + 2 * core::mem::size_of::<Evidence<128>>()
+    + 3 * core::mem::size_of::<Evidence<64>>();
+const _: () = assert!(OWNED_BYTES == 5376);
 fn active() -> bool {
     TRACE_CONTROL_EVIDENCE.get(10) == 1
 }
@@ -993,4 +999,249 @@ pub fn work(run: RunKey, event: WorkEvent, at: u64) {
             }
         }
     });
+}
+
+/// Fixed facts from Work's own final predicate. No owner call belongs here.
+pub struct WorkWait {
+    pub counts: [u64; 3],
+    pub request: [u64; 5],
+    pub warm: [u64; 3],
+    pub background_done: bool,
+}
+pub fn drain_tracking(run: RunKey) -> bool {
+    run_matches(run) && closing_active()
+}
+pub fn drain_work(run: RunKey, value: WorkWait, done: bool, at: u64) {
+    debug_assert_eq!(cpu::slot(), 0);
+    if !drain_tracking(run) {
+        return;
+    }
+    TRACE_DRAIN_WORK_EVIDENCE.write(|b| {
+        if b.get(0) == 0 {
+            b.row(
+                0,
+                &[
+                    0x4359_4452_574b_0001,
+                    1,
+                    run.boot_epoch,
+                    run.trial_id,
+                    run.generation,
+                    TRACE_CONTROL_EVIDENCE.get(5),
+                ],
+            );
+        }
+        if done {
+            if b.get(7) == 0 {
+                b.put(7, at);
+            }
+            return;
+        }
+        b.add(6, 1);
+        let watched = if value.request[0] != 0 {
+            value.request[0]
+        } else {
+            value.warm[0]
+        };
+        let row = [
+            at,
+            value.counts[0],
+            value.counts[1],
+            value.counts[2],
+            value.request[0],
+            value.request[1],
+            value.request[2],
+            value.request[3],
+            value.request[4],
+            value.warm[0],
+            value.warm[1],
+            value.warm[2],
+            u64::from(value.background_done),
+            watched,
+        ];
+        if b.get(8) == 0 {
+            b.row(8, &row);
+        }
+        b.row(32, &row);
+    });
+}
+#[derive(Clone, Copy)]
+pub struct DrainWatch {
+    pub first_at: u64,
+    pub latest_at: u64,
+}
+/// A single bounded atomic snapshot, never a borrow or lock of Work state.
+/// A concurrent publication may omit a diagnostic; it cannot permit work.
+pub fn drain_watch(run: RunKey, id: u64) -> Option<DrainWatch> {
+    if id == 0 || !drain_tracking(run) {
+        return None;
+    }
+    let b = &TRACE_DRAIN_WORK_EVIDENCE;
+    let before = b.get(63);
+    if before & 1 != 0 {
+        return None;
+    }
+    let first_at = if b.get(21) == id { b.get(8) } else { 0 };
+    let latest_at = if b.get(45) == id { b.get(32) } else { 0 };
+    core::sync::atomic::fence(Ordering::Acquire);
+    if b.get(63) != before || first_at == 0 && latest_at == 0 {
+        return None;
+    }
+    Some(DrainWatch {
+        first_at,
+        latest_at,
+    })
+}
+#[derive(Clone, Copy)]
+pub struct DrainTask {
+    pub run: RunKey,
+    pub caller: ObjectKey,
+    pub id: u64,
+    pub child: ObjectKey,
+    pub life: u64,
+    pub flags: u64,
+    pub deadline: u64,
+    pub exit_code: u64,
+    pub exit_finished: u64,
+    pub watch: DrainWatch,
+}
+// All Task publications below retain the actual TaskGuard. The two watch
+// lanes keep their own snapshot time, so changing latest identity is explicit.
+fn drain_task(value: DrainTask, count: usize, first: usize, latest: usize, row: [u64; 16]) {
+    if !drain_tracking(value.run) {
+        return;
+    }
+    TRACE_DRAIN_TASK_EVIDENCE.write(|b| {
+        if b.get(0) == 0 {
+            b.row(
+                0,
+                &[
+                    0x4359_4452_544b_0001,
+                    1,
+                    value.run.boot_epoch,
+                    value.run.trial_id,
+                    value.run.generation,
+                    TRACE_CONTROL_EVIDENCE.get(5),
+                    value.caller.id,
+                    value.caller.generation,
+                ],
+            );
+        }
+        if (b.get(6), b.get(7)) != (value.caller.id, value.caller.generation) {
+            b.add(12, 1);
+            return;
+        }
+        b.add(count, 1);
+        if value.watch.first_at != 0 {
+            let mut row = row;
+            row[14] = value.watch.first_at;
+            b.row(first, &row);
+        }
+        if value.watch.latest_at != 0 {
+            let mut row = row;
+            row[14] = value.watch.latest_at;
+            b.row(latest, &row);
+        }
+    });
+}
+pub fn drain_query(
+    value: DrainTask,
+    query: Result<cyxia_prototype::domains::tasks::SpawnState, Error>,
+    cached: Option<Result<u64, Error>>,
+    at: u64,
+) {
+    use cyxia_prototype::domains::tasks::SpawnState;
+    let tag = if cached.is_some() {
+        6
+    } else {
+        match query {
+            Ok(SpawnState::Queued) => 1,
+            Ok(SpawnState::Created(_)) => 2,
+            Ok(SpawnState::Failed(e)) => 3 | ((e as u64 + 1) << 8),
+            Ok(SpawnState::Unknown) => 4,
+            Ok(SpawnState::Cancelled) => 5,
+            Err(e) => 7 | ((e as u64 + 1) << 8),
+        }
+    };
+    drain_task(
+        value,
+        8,
+        16,
+        32,
+        [
+            at,
+            value.id,
+            value.caller.id,
+            value.caller.generation,
+            tag,
+            value.child.id,
+            value.child.generation,
+            value.life,
+            value.flags,
+            value.deadline,
+            value.exit_code,
+            value.exit_finished,
+            cached.map_or(0, |r| result(r.map(|_| ExecutionState::Applied))),
+            cached.and_then(Result::ok).unwrap_or(0),
+            0,
+            0,
+        ],
+    );
+}
+pub fn drain_lifecycle(value: DrainTask, entered: u64, finished: u64, post_life: u64) {
+    drain_task(
+        value,
+        9,
+        48,
+        64,
+        [
+            entered,
+            finished,
+            value.id,
+            value.child.id,
+            value.child.generation,
+            value.caller.id,
+            value.caller.generation,
+            value.life,
+            value.flags,
+            value.deadline,
+            0,
+            0,
+            post_life,
+            0,
+            0,
+            0,
+        ],
+    );
+}
+pub fn drain_cleanup(
+    value: DrainTask,
+    reply: Result<(), Error>,
+    entered: u64,
+    finished: u64,
+    post_life: u64,
+) {
+    drain_task(
+        value,
+        10,
+        80,
+        96,
+        [
+            entered,
+            finished,
+            value.id,
+            value.child.id,
+            value.child.generation,
+            value.caller.id,
+            value.caller.generation,
+            value.life,
+            value.flags,
+            value.deadline,
+            0,
+            result(reply.map(|_| ExecutionState::Applied)),
+            post_life,
+            0,
+            0,
+            0,
+        ],
+    );
 }

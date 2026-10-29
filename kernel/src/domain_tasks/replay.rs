@@ -395,19 +395,75 @@ pub fn spawn_result(id: u64) -> Result<Option<Result<u64, Error>>, Error> {
     locked(|s| {
         let r = state();
         let i = index(id)?;
-        if let Some(result) = r.delivered[i] {
+        let cached = r.delivered[i];
+        // A cached delivery performs no new receipt query. A real query's
+        // exit position is found once and reused by diagnostics and consumption.
+        let queried = if cached.is_some() {
+            Ok(SpawnState::Unknown)
+        } else {
+            s.admission.query(r.actor, id)
+        };
+        let exit_at = if let Ok(SpawnState::Created(key)) = queried {
+            s.exits
+                .iter()
+                .position(|v| v.is_some_and(|v| v.key == key && v.parent == r.actor))
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        if let Some(run) = r.run
+            && let Some(watch) = crate::learning_evidence::execution_trace::drain_watch(run, id)
+        {
+            let child = if let Ok(SpawnState::Created(key)) = queried {
+                key
+            } else {
+                ZERO
+            };
+            let task_at = child
+                .id
+                .checked_sub(0x1000)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| {
+                    *n < TASKS && s.tasks[*n].key == child && s.tasks[*n].life != Life::Free
+                });
+            let exit = exit_at.and_then(|n| s.exits[n]);
+            let flags = task_at.map_or(0, |n| {
+                u64::from(RETURN_PENDING[n].load(Ordering::Acquire))
+                    | u64::from(FILE_BUSY[n].load(Ordering::Acquire)) << 1
+            }) | u64::from(
+                s.active
+                    .iter()
+                    .flatten()
+                    .any(|a| a.dispatch.thread == child),
+            ) << 2
+                | u64::from(exit.is_some()) << 3;
+            crate::learning_evidence::execution_trace::drain_query(
+                crate::learning_evidence::execution_trace::DrainTask {
+                    run,
+                    caller: r.actor,
+                    id,
+                    child,
+                    life: task_at.map_or(0, |n| s.tasks[n].life as u64 + 1),
+                    flags,
+                    deadline: r.deadlines[i],
+                    exit_code: exit.map_or(0, |v| v.code as u64),
+                    exit_finished: exit.map_or(0, |v| v.finished_ns),
+                    watch,
+                },
+                queried,
+                cached,
+                now_ns(),
+            );
+        }
+        if let Some(result) = cached {
             return Ok(Some(result));
         }
-        let result = match s.admission.query(r.actor, id)? {
+        let result = match queried? {
             SpawnState::Queued | SpawnState::Unknown => None,
             SpawnState::Cancelled => Some(Err(Error::Expired)),
             SpawnState::Failed(e) => Some(Err(e)),
-            SpawnState::Created(key) => {
-                if let Some(at) = s
-                    .exits
-                    .iter()
-                    .position(|v| v.is_some_and(|v| v.key == key && v.parent == r.actor))
-                {
+            SpawnState::Created(_) => {
+                if let Some(at) = exit_at {
                     let exit = s.exits[at].ok_or(Error::Stale)?;
                     if exit.code != 0 && exit.code != 110
                         || exit.code == 0 && exit.value != r.expected[i]
@@ -429,6 +485,39 @@ pub fn spawn_result(id: u64) -> Result<Option<Result<u64, Error>>, Error> {
             r.delivered[i] = result;
         }
         Ok(result)
+    })
+}
+/// Only TaskGuard callers may inspect this task and replay identity.
+#[cfg(not(test))]
+pub(super) fn drain_task_facts(
+    s: &State,
+    i: usize,
+) -> Option<crate::learning_evidence::execution_trace::DrainTask> {
+    let t = &s.tasks[i];
+    let r = state();
+    let run = r.run?;
+    if t.life == Life::Free || t.parent != r.actor {
+        return None;
+    }
+    let watch = crate::learning_evidence::execution_trace::drain_watch(run, t.spawn_id)?;
+    Some(crate::learning_evidence::execution_trace::DrainTask {
+        run,
+        caller: t.parent,
+        id: t.spawn_id,
+        child: t.key,
+        life: t.life as u64 + 1,
+        flags: u64::from(RETURN_PENDING[i].load(Ordering::Acquire))
+            | u64::from(FILE_BUSY[i].load(Ordering::Acquire)) << 1
+            | u64::from(
+                s.active
+                    .iter()
+                    .flatten()
+                    .any(|a| a.dispatch.thread == t.key),
+            ) << 2,
+        deadline: t.deadline,
+        exit_code: t.exit_code as u64,
+        exit_finished: 0,
+        watch,
     })
 }
 pub fn vector(id: u64, deadline: u64) -> Result<(), Error> {

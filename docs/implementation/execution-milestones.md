@@ -1,8 +1,8 @@
 # First-trial execution milestones
 
-These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 3,840 bytes are included in the existing learning workspace bound.
+These read-only diagnostics distinguish demand, scheduling, settlement and control observation. They grant no authority, change no receipt timestamp and supply no accepted replay label. Their 5,376 bytes are included in the existing learning workspace bound. Earlier images contain only the original four banks, totaling 3,840 bytes.
 
-The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp. A seal closes collection. Later trials cannot replace the first scope. The four banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened. The closing extension is available only in images containing `TRACE_CLOSING_EVIDENCE`; historical images leave the newly used reserved words uninterpreted.
+The first successful capture start binds the exact boot/trial/capture generation, family, target and original first timestamp. A seal closes collection. Later trials cannot replace the first scope. The banks have independent seqlocks; they are not one simultaneous cross-owner snapshot. Only interpret an even, stable publication word. An empty field alone is not proof that the corresponding operation never happened. Extensions are available only in images containing their symbols; historical images leave newly used reserved words uninterpreted.
 
 | Bank | Bytes / publication word | Writer |
 | --- | --- | --- |
@@ -10,6 +10,8 @@ The first successful capture start binds the exact boot/trial/capture generation
 | `TRACE_TASK_EVIDENCE` | 1,024 / 127 | Existing task-owner gate, including CPU3 settlement |
 | `TRACE_WORK_EVIDENCE` | 512 / 63 | CPU0 workload owner |
 | `TRACE_CLOSING_EVIDENCE` | 512 / 63 | CPU0 root, helper and task-owner boundaries |
+| `TRACE_DRAIN_WORK_EVIDENCE` | 512 / 63 | CPU0, final predicate under Work exclusion |
+| `TRACE_DRAIN_TASK_EVIDENCE` | 1,024 / 127 | Existing TaskGuard, query/lifecycle/cleanup |
 
 All words are little-endian u64. Raw banks survive in the node directory and final functional report, including failed observations.
 
@@ -101,3 +103,22 @@ SpawnState tags are Queued=1, Created=2, Failed=`3 | ((error+1)<<8)`, Unknown=4,
 Task-drain blocker reasons are child task=1, queued launch=2, retained exit=3, vector=4, local spawn=5, endpoint queue/reservation=6 and send lease=7. Details identify the corresponding task/request/exit or endpoint. The first and latest blocker can differ. Clear means this task owner returned no blocker, not that every other owner or capture source has drained.
 
 Original evidence failure stages 1–4 are request lookup for arming, arm, request lookup for result, and result publication. Codes 1–5 name evidence NotReady/Busy/Owner/Stale/Capacity; `0x100 + learning_error + 1` preserves the inner Capture error. Domain stages 5–8 name root poll, pending-closing probe query, post-Applied probe query, and task drain, with code `0x10000 + domain_error + 1`. Not every earlier return has a stage tag: absent PollOrigin does not prove success. The work poll return remains separately recorded before propagation.
+
+The two Drain custody banks are armed only for the same first scope after closing publication. The original Work completion predicate is unchanged. A diagnostic scan of its fixed 100 requests records Queued, Active and Settled-but-unreported counts. It calls no other owner. Work words 0–7 hold magic/version, boot/trial/generation, original first timestamp, blocked count and first clear observation. First and latest blocked snapshots start at 8 and 32; each contains:
+
+| Relative words | Meaning |
+| --- | --- |
+| 0–3 | Observation, Queued count, Active count, Settled-but-unreported count |
+| 4–8 | First unmet original request ID, phase (Queued=1/Active=2/Settled=3), armed/reported bits (1/2), outcome, physical finish if Completed |
+| 9–11 | Warm original ID, original deadline and active flag; zero ID means absent |
+| 12–13 | Background settled flag, watched ID (first unmet request, else warm) |
+
+Outcome tags are Completed=1, Rejected=2, TimedOut=3, Pending=4. First/last records are blocked snapshots, not a ledger of all changing blockers. Once clear is recorded the most recent blocked snapshot remains available. Later trials cannot replace it.
+
+Task uses one bounded atomic read of Work's publication and both watch identities, with an acquire fence before checking that publication is unchanged and even. It acquires no Work lock. A query or lifecycle event may therefore be omitted under concurrent publication; no authority depends on a diagnostic. Each retained event includes the watch snapshot time it matched. The first-watch lane stores the **latest event for the first watched ID**, not that ID's first event. The latest-watch lane can lag Work's changing latest watch. Compare times and identities before attributing a wait.
+
+Task header words 0–7 hold magic/version, exact scope and caller key; 8–10 count matched queries, lifecycle calls and cleanup calls, while 12 counts rejected caller conflicts. Query lanes start at 16 and 32. Their relative words 0–15 are observation, original request ID, caller key, query tag, full child key, Life, flags, original request deadline, exit code, exit finish, cached-result tag, cached physical finish, matching watch time and reserved zero. Life is absent=0, Free=1, Ready=2, Running=3, Waiting=4, Exiting=5. Flag bits are pending return=1, file busy=2, active dispatch=4, actual ExitRecord present=8. Query tags retain SpawnState's existing 1–5 encoding, cached delivery=6 and query error=`7 | ((error+1)<<8)`. Cached delivery performs no new admission query. The actual query's single exit-position lookup is reused for diagnostics and original consumption.
+
+Lifecycle lanes start at 48/64 and cleanup lanes at 80/96. Each stores entry/return observations, original request ID, original child key, caller key, entry Life/flags, original task deadline, reserved zero, cleanup result (or zero for lifecycle), post-Life, reserved zero, matching watch time and reserved zero. Cleanup result uses the existing result encoder (Ok=2, error=`5 | ((error+1)<<8)`). Original identity is copied before the operation, so successful cleanup cannot replace it with the cleared task. These hooks neither schedule extra work nor reconstruct completion times.
+
+Actual-source host regressions execute Work poll, TaskGuard/SpawnAdmission query, lifecycle and cleanup wrapper. Hardware cleanup, return processing and Work request outcomes are controlled boundaries; real Scheduler dispatch exercises the active-child flag. Cached and error queries retain their original behavior. Separate removal of each of the four reporting hooks fails its named assertion. Native timing, hardware cleanup and which blocker controls the remaining tail require native evidence.
