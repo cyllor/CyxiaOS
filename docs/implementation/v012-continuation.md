@@ -2,7 +2,7 @@
 
 ## Candidate renewal progress
 
-The [renewal progress extension](candidate-renewal-progress.md) now covers actual continuous candidate renewal custody using the existing bounded cache and two separately paid pieces. First identity stays unchanged; unresolved obligations cannot be replaced, and empty queues produce neither new work nor synthetic Applied. Targeted tests, all nine v49 checks and both images/selected stack gates pass; fresh native verification follows. The complete prototype remains unfinished.
+The [renewal progress extension](candidate-renewal-progress.md) now covers actual continuous candidate renewal custody using the existing bounded cache and two separately paid pieces. First identity stays unchanged; unresolved obligations cannot be replaced, and empty queues produce neither new work nor synthetic Applied. Targeted tests, all nine v49 checks and both images/selected stack gates pass; the native run fails after 601.367683 s with four verified sides, five excluded and zero labels. Two actual renewals fail Stale before executor entry; exact denial provenance is the next diagnosis. The complete prototype remains unfinished.
 
 ## Original first-candidate rejection
 
