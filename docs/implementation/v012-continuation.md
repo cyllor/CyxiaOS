@@ -2,7 +2,7 @@
 
 ## Original first-candidate rejection
 
-The [first-candidate retirement fix](first-candidate-rejection.md) now excludes a captured scope when its exact original first job has completed with a definite unpublished error. Root retains the original snapshot and error; a new sequence cannot refresh the trial. Actual publication, retained completion delivery and unrelated/read-only/core jobs retain their original paths. Six actual-source Rust scenarios and seven mutations cover the mechanism. All nine v47 engineering checks pass (702 host tests, two environment skips; 84 tooling tests); native validation remains pending.
+The [first-candidate retirement fix](first-candidate-rejection.md) now excludes a captured scope when its exact original first job has completed with a definite unpublished error. Root retains the original snapshot and error; a new sequence cannot refresh the trial. Actual publication, retained completion delivery and unrelated/read-only/core jobs retain their original paths. Six actual-source Rust scenarios and seven mutations cover the mechanism. All nine v47 engineering checks pass (702 host tests, two environment skips; 84 tooling tests); the fresh native run still fails after 600.720324 s. It confirms the exact unpublished Stale first-job scope is excluded without a replacement first, but later renewals still exceed their deadlines. Four baseline sides pass; no pair label is accepted.
 
 ## Recovery phase/predicate checkpoint
 
