@@ -1,5 +1,6 @@
 """Carry real pre-submission CPU without changing protected clock samples."""
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -24,4 +25,18 @@ class CarriedPublicationBudget(unittest.TestCase):
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-carried-publication-budget'),'--','--test-threads=1','carried_publication_']
    run_env=env();run_env['RUST_MIN_STACK']='16777216'
    r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('6 passed; 0 failed',r.stdout)
+   clone=d/'prototype';shutil.copytree(ROOT/'crates/prototype',clone,ignore=shutil.ignore_patterns('target','tests','__pycache__'))
+   manifest=(clone/'Cargo.toml').read_text().replace('version.workspace = true','version = "0.1.0"').replace('edition.workspace = true','edition = "2024"').replace('path = "../arch-aarch64"','path = '+json.dumps(str(ROOT/'crates/arch-aarch64')))
+   (clone/'Cargo.toml').write_text(manifest);(d/'Cargo.toml').write_text((d/'Cargo.toml').read_text().replace(json.dumps(str(ROOT/'crates/prototype')),json.dumps(str(clone))))
+   mutants=[
+    ('.checked_add(self.carried.ns)','.checked_add(0)','carried publication CPU was ignored'),
+    ('self.carried.cpu != self.started.cpu.cpu','false','invalid carried publication cost authorized'),
+    ('budget.check(finished_ns)','publication_budget(started_ns, finished_ns)','postcommit check discarded carried publication CPU'),
+    ('budget.check(commit_ns)?','publication_budget(started_ns, commit_ns)?','later check lost carried publication CPU'),
+    ('budget.check(publish_ns)?','publication_budget(started_ns, publish_ns)?','assertion'),
+   ]
+   for old,new,message in mutants:
+    self.assertTrue(old in policy,"missing mutation anchor: "+old);(clone/'src/policy.rs').write_text(policy.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+
 if __name__=='__main__':unittest.main()

@@ -8,7 +8,7 @@ fn submit_debited(r:&mut Registry,wire:&[u8],c:&mut Script,o:&mut Owner,debit:Cp
  assert_eq!(receipt.state(),ExecutionState::Failed(Error::Budget),"carried publication CPU was ignored");assert_eq!((c.reads,o.checks,o.prepares,o.effects),(2,1,0,0));assert_eq!(observed(&o).stage,3);assert!(r.optimization_stopped());
 }
 #[test]fn carried_publication_revalidation_and_final_model_checks_share_the_same_bound(){
- for (debit,samples,stage,reads) in [(499_998,vec![1,2,3,4],9,4),(499_997,vec![1,2,2,4,5],12,5)]{
+ for (debit,samples,stage,reads) in [(499_998,vec![1,2,3,4,5],9,4),(499_997,vec![1,2,2,4,5],12,5)]{
   let(mut r,wire,mut o,_)=setup(0);let mut c=Script{samples:samples.into_iter().enumerate().map(|(i,n)|moment(11+i as u64,n)).collect(),reads:0};
   let receipt=submit_debited(&mut r,&wire,&mut c,&mut o,CpuTime{cpu:1,ns:debit}).unwrap();assert_eq!(receipt.state(),ExecutionState::Failed(Error::Budget),"later check lost carried publication CPU");assert_eq!((c.reads,o.effects,o.cancels),(reads,0,1));assert_eq!(observed(&o).stage,stage);assert!(r.optimization_stopped());
  }

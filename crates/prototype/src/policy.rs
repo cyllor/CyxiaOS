@@ -581,6 +581,38 @@ impl PublicationTime {
         observed.cpu.ns.checked_sub(self.cpu.ns).ok_or(Error::Range)
     }
 }
+/// Actual local CPU spent by earlier pre-submission attempts. Clock samples
+/// retain their real values; only this decision's budget adds the carried cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationBudget {
+    pub started: PublicationTime,
+    pub carried: CpuTime,
+}
+impl PublicationBudget {
+    pub const fn fresh(started: PublicationTime) -> Self {
+        Self {
+            started,
+            carried: CpuTime {
+                cpu: started.cpu.cpu,
+                ns: 0,
+            },
+        }
+    }
+    pub fn check(self, observed: PublicationTime) -> Result<(), Error> {
+        if self.carried.cpu != self.started.cpu.cpu {
+            return Err(Error::Auth);
+        }
+        let elapsed = self.started.cpu_elapsed(observed)?;
+        let total = elapsed
+            .checked_add(self.carried.ns)
+            .ok_or(Error::Overflow)?;
+        if total > PUBLICATION_BUDGET_NS {
+            Err(Error::Budget)
+        } else {
+            Ok(())
+        }
+    }
+}
 pub trait Clock {
     /// Both domains are explicit. A production clock must read actual local
     /// execution time, rather than deriving it from the wall timestamp.
@@ -1218,6 +1250,27 @@ impl Registry {
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
+        self.submit_job_debited(
+            publisher,
+            bytes,
+            PublicationBudget::fresh(started_ns),
+            wall_deadline_ns,
+            clock,
+            executor,
+        )
+    }
+    /// Preserve the original clock and wall bounds while charging prior actual
+    /// pre-submission CPU from this same protected job and CPU identity.
+    pub fn submit_job_debited<E: Executor, C: Clock>(
+        &mut self,
+        publisher: Publisher,
+        bytes: &[u8],
+        budget: PublicationBudget,
+        wall_deadline_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
+        let started_ns = budget.started;
         let plan = policy_wire::decode_plan(bytes)?;
         self.authorize(publisher)?;
         if plan.header.controller_epoch != publisher.controller_epoch {
@@ -1296,7 +1349,7 @@ impl Registry {
             stage = SubmissionStage::FirstValidation;
             self.validate(&plan, first.wall_ns, executor)?;
             stage = SubmissionStage::InitialBudget;
-            publication_budget(started_ns, first)?;
+            budget.check(first)?;
             prepared = true;
             stage = SubmissionStage::Prepare;
             executor.prepare(&plan, next_version)?;
@@ -1328,7 +1381,7 @@ impl Registry {
                 return Err(Error::Expired);
             }
             stage = SubmissionStage::PreModelBudget;
-            publication_budget(started_ns, publish_ns)?;
+            budget.check(publish_ns)?;
             // Recheck the actual protected model/lease after all hard-constraint
             // callbacks. This is read-only: no canary quota or pending slot is
             // consumed until the executor performs the real atomic publish.
@@ -1349,7 +1402,7 @@ impl Registry {
                 return Err(Error::Expired);
             }
             stage = SubmissionStage::FinalBudget;
-            publication_budget(started_ns, commit_ns)?;
+            budget.check(commit_ns)?;
             // The gate remains locked. Time may have passed during its check,
             // so recheck the immutable permit's bounds at this final timestamp.
             stage = SubmissionStage::FinalModel;
@@ -1383,7 +1436,7 @@ impl Registry {
         // even if its callback exceeded the cap. Retain the real receipt and
         // stop further optimization while existing APPLY/RECONCILE continues.
         let finished_ns = clock.read();
-        if publication_budget(started_ns, finished_ns).is_err()
+        if budget.check(finished_ns).is_err()
             || last_sample.cpu_elapsed(finished_ns).is_err()
             || record.receipt.version != 0 && finished_ns.wall_ns > wall_deadline_ns
             || matches!(result, Err(Error::Budget | Error::Range))
@@ -1441,12 +1494,7 @@ pub fn publication_budget(
     started: PublicationTime,
     observed: PublicationTime,
 ) -> Result<(), Error> {
-    let elapsed = started.cpu_elapsed(observed)?;
-    if elapsed > PUBLICATION_BUDGET_NS {
-        Err(Error::Budget)
-    } else {
-        Ok(())
-    }
+    PublicationBudget::fresh(started).check(observed)
 }
 
 /// Only the fixed prerequisite edges from the 1.3 contract are representable.
