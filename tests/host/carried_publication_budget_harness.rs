@@ -1,6 +1,9 @@
 // Reuse actual Registry/wire fixtures and controlled Executor from submission
 // observation. Every clock sample remains the original physical CPU value.
 fn submit_debited(r:&mut Registry,wire:&[u8],c:&mut Script,o:&mut Owner,debit:CpuTime)->Result<PlanReceipt,Error>{
+ submit_debited_at(r,wire,c,o,debit,moment(10,0))
+}
+fn submit_debited_at(r:&mut Registry,wire:&[u8],c:&mut Script,o:&mut Owner,debit:CpuTime,started:PublicationTime)->Result<PlanReceipt,Error>{
  // DEBITED_SUBMIT
 }
 #[test]fn carried_publication_initial_cost_cannot_be_hidden_before_registry(){
@@ -25,4 +28,8 @@ fn submit_debited(r:&mut Registry,wire:&[u8],c:&mut Script,o:&mut Owner,debit:Cp
 }
 #[test]fn carried_publication_wall_and_cpu_rollback_are_still_rejected(){
  for physical in [PublicationTime{wall_ns:9,cpu:CpuTime{cpu:1,ns:1}},PublicationTime{wall_ns:11,cpu:CpuTime{cpu:2,ns:1}}]{let(mut r,wire,mut o,_)=setup(0);let mut c=Script{samples:vec![physical,physical],reads:0};let receipt=submit_debited(&mut r,&wire,&mut c,&mut o,CpuTime{cpu:1,ns:1}).unwrap();assert_eq!(receipt.version,0);assert_eq!(o.effects,0);assert!(r.optimization_stopped());}
+}
+
+#[test]fn carried_publication_counter_rollback_cannot_be_offset_by_prior_cost(){
+ let(mut r,wire,mut o,_)=setup(0);let mut c=Script{samples:vec![moment(11,9),moment(12,9)],reads:0};let receipt=submit_debited_at(&mut r,&wire,&mut c,&mut o,CpuTime{cpu:1,ns:100},moment(10,10)).unwrap();assert_eq!(receipt.state(),ExecutionState::Failed(Error::Range),"prior cost hid a CPU counter rollback");assert_eq!((c.reads,o.effects,o.prepares),(2,0,0));assert!(r.optimization_stopped());assert_eq!(observed(&o).stage,3);
 }

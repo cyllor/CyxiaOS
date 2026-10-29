@@ -17,14 +17,14 @@ class CarriedPublicationBudget(unittest.TestCase):
   code=(ROOT/'tests/host/submission_observation_harness.rs').read_text().replace('// ACTUAL_WIRE_FIXTURES','\n'.join(function(fixtures,s) for s in ['fn publisher()','fn binding()','fn candidates()','fn frame(']))
   code=code.replace('// ACTUAL_OBSERVER_OVERRIDE','fn observed_submission(&mut self,o:&policy::SubmissionObservation){self.seen.push(Seen{stage:o.stage as u8,result:o.result,id:o.id,version:o.version,published:o.published_ns,prepared:o.preparation_started});}')
   extra=(ROOT/'tests/host/carried_publication_budget_harness.rs').read_text()
-  call='r.submit_job(publisher(),wire,moment(10,0),50_000_010,c,o)'
-  if 'pub fn submit_job_debited' in policy:call='r.submit_job_debited(publisher(),wire,PublicationBudget{started:moment(10,0),carried:debit},50_000_010,c,o)'
+  call='r.submit_job(publisher(),wire,started,50_000_010,c,o)'
+  if 'pub fn submit_job_debited' in policy:call='r.submit_job_debited(publisher(),wire,PublicationBudget{started,carried:debit},50_000_010,c,o)'
   code+='\n'+extra.replace('// DEBITED_SUBMIT',call)
   with tempfile.TemporaryDirectory() as tmp:
    d=Path(tmp);(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="carried-publication-budget"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-carried-publication-budget'),'--','--test-threads=1','carried_publication_']
    run_env=env();run_env['RUST_MIN_STACK']='16777216'
-   r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('6 passed; 0 failed',r.stdout)
+   r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('7 passed; 0 failed',r.stdout)
    clone=d/'prototype';shutil.copytree(ROOT/'crates/prototype',clone,ignore=shutil.ignore_patterns('target','tests','__pycache__'))
    manifest=(clone/'Cargo.toml').read_text().replace('version.workspace = true','version = "0.1.0"').replace('edition.workspace = true','edition = "2024"').replace('path = "../arch-aarch64"','path = '+json.dumps(str(ROOT/'crates/arch-aarch64')))
    (clone/'Cargo.toml').write_text(manifest);(d/'Cargo.toml').write_text((d/'Cargo.toml').read_text().replace(json.dumps(str(ROOT/'crates/prototype')),json.dumps(str(clone))))
