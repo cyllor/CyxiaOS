@@ -154,7 +154,7 @@ mod control {
     // CONTROL_BODIES
     // This older timing fixture has no replay trial. Candidate custody uses
     // the actual Root hook in test_candidate_initial_progress instead.
-    mod replay {pub fn candidate_execution(_:super::ApplyId,_:super::PolicyStamp,_:super::ExecutionState){}}
+    mod replay {pub fn candidate_stale<T>(_:&T){} pub fn candidate_execution(_:super::ApplyId,_:super::PolicyStamp,_:super::ExecutionState){}}
     pub fn observe(){poll(now()).unwrap();}
 }
 mod warm {

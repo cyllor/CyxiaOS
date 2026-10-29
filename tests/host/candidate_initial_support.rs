@@ -25,6 +25,7 @@ pub mod replay {
     fn root_mut()->&'static mut Root{unsafe{&mut *core::ptr::addr_of_mut!(ROOT)}}
     // CANDIDATE_ROOT_BODIES
     // CANDIDATE_STALE_HOOK
+    // CANDIDATE_STALE_CASE
     pub const TOKEN:Token=Token{id:9,boot_epoch:7,owner:key(7)};
     pub fn reset(){let r=root_mut();r.token=Some(TOKEN);r.request=Some(Request{trial_id:3,owner:key(7),target:key(12),
         family:Family{domain:Action::CpuWeight(2).domain(),kind:Action::CpuWeight(2).kind()},kind:TrialKind::Candidate});

@@ -1,5 +1,9 @@
 # V0.12 continuation — 2026-10-29
 
+## Candidate Stale provenance
+
+The [new passive denial lane](candidate-stale-evidence.md) preserves the original candidate pre-executor Stale, including its full identity and expected/current generations, independently of the sealed first-baseline trace. It changes no generation check or progress path. Targeted RED→GREEN and negative controls pass; full checks/build/native validation follow.
+
 ## Candidate renewal progress
 
 The [renewal progress extension](candidate-renewal-progress.md) now covers actual continuous candidate renewal custody using the existing bounded cache and two separately paid pieces. First identity stays unchanged; unresolved obligations cannot be replaced, and empty queues produce neither new work nor synthetic Applied. Targeted tests, all nine v49 checks and both images/selected stack gates pass; the native run fails after 601.367683 s with four verified sides, five excluded and zero labels. Two actual renewals fail Stale before executor entry; exact denial provenance is the next diagnosis. The complete prototype remains unfinished.

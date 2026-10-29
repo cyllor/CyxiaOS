@@ -35,6 +35,7 @@ def root_support(observe_stale=False):
     stale='pub(super) fn candidate_stale<T>(_: &T) {}'
     if observe_stale and 'fn candidate_stale(' in replay:stale=function(replay,'pub(super) fn candidate_stale(')
     support=support.replace('// CANDIDATE_STALE_HOOK',stale)
+    support=support.replace('// CANDIDATE_STALE_CASE',(ROOT/'tests/host/candidate_stale_support.rs').read_text() if observe_stale else '')
     extra=', stamp' if 'first_stamp: Option<PolicyStamp>' in replay else ''
     return support.replace('// CANDIDATE_PUBLISHED_CALL',f'published(&plan,id.boot_epoch{extra})?;')
 
@@ -87,10 +88,7 @@ class CandidatePublicationProgress(unittest.TestCase):
         support=support.replace('action_index:0,target:group(12)','action_index:0,target:key(12)')
         program+='\n#[path='+json.dumps(str(ROOT/'kernel/src/learning_evidence/execution_trace.rs'))+'] pub(crate) mod candidate_trace;\n'+support
         with tempfile.TemporaryDirectory() as tmp:
-            d=Path(tmp);evidence=d/'evidence.rs'
-            evidence.write_text((ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
-            program=program.replace('// ACTUAL_DOMAIN_EVIDENCE','#[path='+json.dumps(str(evidence))+'] mod domain_evidence;')
-            source=d/'harness.rs';source.write_text(program)
+            d=Path(tmp);source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-paid-progress"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\nsha2="=0.10.9"\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-paid-progress'),'--','--test-threads=1','candidate_']
             r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
@@ -166,7 +164,7 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
             CLAIMED.store(true,Ordering::Release);let _root_guard=Guard;f(&mut guard)}''')
         arm=function(owner,'Phase::Activate =>')
         program+=(ROOT/'tests/host/candidate_activate_support.rs').read_text().replace('// CANDIDATE_ACTIVATE_ARM',arm)
-        program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"root"=>control::replay::scenario(),"renewal"=>control::replay::renewal_scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
+        program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"denial_scope"=>control::replay::stale_scope_scenario(),"root"=>control::replay::scenario(),"renewal"=>control::replay::renewal_scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);evidence=d/'evidence.rs'
             evidence.write_text((ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
@@ -175,7 +173,7 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'run','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-initial')]
             failures=[]
-            for case in ['denial_core','denial_ledger','denial_binder','denial_binding','denial_executor','root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
+            for case in ['denial_scope','denial_core','denial_ledger','denial_binder','denial_binding','denial_executor','root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
                 r=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 if r.returncode: failures.append(case+'\n'+r.stdout+r.stderr)
             self.assertFalse(failures,'\n'.join(failures))
@@ -187,6 +185,10 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
                     'replay::published(plan, self.boot, None)?'),
                  'publish','native publication did not bind its actual initial stamp'),
                 (program.replace(hook,''),'stale','real final Control state did not update the initial hint'),
+                (program.replace('                replay::candidate_stale(&denial);',''),'denial_ledger','actual candidate pre-executor Stale lost its original denial facts'),
+                (program.replace(function(program,'pub(super) fn candidate_stale('),'pub(super) fn candidate_stale<T>(_:&T){}'),'denial_core','actual candidate pre-executor Stale lost its original denial facts'),
+                (program.replace('e.current_ledger,','e.expected_ledger,'),'denial_ledger','assertion `left == right` failed'),
+
                 (program.replace(hook,'if d.apply.plan_seq==51{'+hook+'}'),'renewal_stale','real final Control state did not update the initial hint'),
                 (program.replace('old.state.terminal()','true'),'renewal','new publication replaced an unresolved renewal'),
                 (program.replace('first.plan_seq <= apply.plan_seq','first.plan_seq == apply.plan_seq'),'renewal','terminal actual renewal retained priority'),
@@ -206,6 +208,12 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
                 negative=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
                 self.assertIn(failure,negative.stdout+negative.stderr)
+            original_evidence=evidence.read_text();self.assertIn('if get(223) == 0 {',original_evidence)
+            evidence.write_text(original_evidence.replace('if get(223) == 0 {','if true {'))
+            source.write_text(program)
+            negative=subprocess.run(command+['--','denial_scope'],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+            self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertIn('first candidate stale facts were overwritten',negative.stdout+negative.stderr)
 
 
 if __name__=='__main__':unittest.main()

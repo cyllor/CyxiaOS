@@ -2542,20 +2542,20 @@ pub fn poll(_at: u64) -> Result<(), Error> {
             if denial_flags != 0
                 && let Err(error) = dependency_status
             {
-                crate::learning_evidence::execution_trace::control_denied(
-                    crate::learning_evidence::execution_trace::ControlDenial {
-                        action: d.action,
-                        apply: d.apply,
-                        stamp: d.stamp,
-                        observed_ns: observed,
-                        expected_core: d.core_generation,
-                        current_core: s.owner.context.core_generation,
-                        expected_ledger: d.ledger_generation,
-                        current_ledger: s.owner.context.ledger_generation,
-                        flags: denial_flags,
-                        error,
-                    },
-                );
+                let denial = crate::learning_evidence::execution_trace::ControlDenial {
+                    action: d.action,
+                    apply: d.apply,
+                    stamp: d.stamp,
+                    observed_ns: observed,
+                    expected_core: d.core_generation,
+                    current_core: s.owner.context.core_generation,
+                    expected_ledger: d.ledger_generation,
+                    current_ledger: s.owner.context.ledger_generation,
+                    flags: denial_flags,
+                    error,
+                };
+                replay::candidate_stale(&denial);
+                crate::learning_evidence::execution_trace::control_denied(denial);
             }
             d.observed_ns = observed;
             if !d.state.terminal()

@@ -1691,6 +1691,69 @@ pub(super) fn candidate_execution(apply: ApplyId, stamp: PolicyStamp, state: Exe
         initial.state = state;
     }
 }
+/// Copies the original pre-executor refusal under the already-held root gate.
+/// An executor-returned Stale does not enter this diagnostic path.
+pub(super) fn candidate_stale(e: &crate::learning_evidence::execution_trace::ControlDenial) {
+    let r = root();
+    let (Some(q), Some(token), Some(first), Some(initial)) =
+        (r.request, r.token, r.first, r.initial)
+    else {
+        return;
+    };
+    if q.kind != TrialKind::Candidate
+        || r.phase != Phase::Running
+        || e.error != Error::Stale
+        || !matches!(e.flags, 1 | 2 | 4)
+        || token.owner != q.owner
+        || token.boot_epoch != e.apply.boot_epoch
+        || initial.boot_epoch != e.apply.boot_epoch
+        || initial.controller_epoch != e.apply.controller_epoch
+        || initial.action_index != e.apply.action_index
+        || initial.target != e.apply.target
+        || first.sequence != initial.plan_seq
+        || e.apply.plan_seq < initial.plan_seq
+        || e.stamp.version == 0
+        || e.stamp.snapshot_ns < first.taken_ns
+        || q.target != e.apply.target
+        || q.family.domain != e.action.domain()
+        || q.family.kind != e.action.kind()
+    {
+        return;
+    }
+    crate::domain_evidence::candidate_stale([
+        token.id,
+        token.boot_epoch,
+        token.owner.id,
+        token.owner.generation,
+        q.trial_id,
+        first.sequence,
+        first.taken_ns,
+        first.ledger_generation,
+        first.core_generation,
+        e.apply.boot_epoch,
+        e.apply.controller_epoch,
+        e.apply.plan_seq,
+        u64::from(e.apply.action_index),
+        e.apply.target.id,
+        e.apply.target.generation,
+        e.stamp.version,
+        e.stamp.snapshot_ns,
+        e.stamp.installed_until_ns,
+        e.observed_ns,
+        e.expected_core,
+        e.current_core,
+        e.expected_ledger,
+        e.current_ledger,
+        e.flags,
+        e.error as u64 + 1,
+        u64::from(q.family.domain),
+        u64::from(q.family.kind),
+        initial.plan_seq,
+        r.phase as u64 + 1,
+        u64::from(r.first_ready),
+        u64::from(initial.action_index),
+    ]);
+}
 fn hash_config(h: &mut Sha256, c: Configuration) -> Result<(), Error> {
     let mut b = [0u8; 32];
     let n = learning::baseline::encode(c.action, &mut b).map_err(|_| Error::Schema)?;

@@ -110,6 +110,22 @@ pub fn optimization_stop(context: [u64; 20]) {
     }
     DOMAIN_CONTROL_EVIDENCE.0[191].fetch_add(1, Ordering::Release);
 }
+/// Original candidate pre-executor Stale, independent of the first scope trace.
+/// Header220..255: magic/schema/count/first-present,31 facts,255 seqlock.
+/// The Control gate owns this lane; only its first matching payload is retained.
+pub fn candidate_stale(context: [u64; 31]) {
+    DOMAIN_CONTROL_EVIDENCE.0[255].fetch_add(1, Ordering::AcqRel);
+    put(220, 0x4359_5354_414c_0001);
+    put(221, 1);
+    put(222, get(222).saturating_add(1));
+    if get(223) == 0 {
+        for (i, value) in context.into_iter().enumerate() {
+            put(224 + i, value);
+        }
+        put(223, 1);
+    }
+    DOMAIN_CONTROL_EVIDENCE.0[255].fetch_add(1, Ordering::Release);
+}
 /// Services-owner writer, independent of Control/Task header publications.
 /// Per recipe 1/2:256/320, latest +8..+33, first Unknown +36..+61,
 /// +2 total, +3 current-identity polls, +4 identity changes, +5 first present,
