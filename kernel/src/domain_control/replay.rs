@@ -2339,9 +2339,29 @@ pub fn baseline_apply(token: Token) -> Result<Receipt, Error> {
             if !old.state.terminal() {
                 return Ok(old);
             }
-            if old.action.one_shot()
-                || old.action == Action::OfferCpu(0)
-                || old.stamp.installed_until_ns > now().saturating_add(1_000_000_000)
+            if old.action.one_shot() || old.action == Action::OfferCpu(0) {
+                return Ok(old);
+            }
+            let at = now();
+            // A proposal rejected before executor entry installed no lease.
+            // While a prior real installation still covers this instant, a
+            // later renewal may make one independent decision. Keep the failed
+            // receipt in its original slot; never refresh or revive its stamp.
+            let unstarted_failed_renewal = matches!(old.state, ExecutionState::Failed(_))
+                && old.started_ns.is_none()
+                && r.baseline[..r.baseline_count - 1]
+                    .iter()
+                    .flatten()
+                    .any(|prior| {
+                        prior.state == ExecutionState::Applied
+                            && prior.started_ns.is_some()
+                            && prior.action == old.action
+                            && prior.apply.target == old.apply.target
+                            && prior.apply.boot_epoch == old.apply.boot_epoch
+                            && prior.stamp.live(at)
+                    });
+            if !unstarted_failed_renewal
+                && old.stamp.installed_until_ns > at.saturating_add(1_000_000_000)
             {
                 return Ok(old);
             }
