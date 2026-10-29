@@ -51,7 +51,7 @@ mod candidate_warm {
 }
 fn candidate_setup(){reset();candidate::prepare();candidate_warm::reset();HINT.store(false,Ordering::Release);}
 #[test]
-fn actual_candidate_initial_flows_through_fresh_helper_warm_admission_and_policy_receipt(){
+fn actual_candidate_publication_flows_through_fresh_helper_warm_admission_and_policy_receipt(){
     candidate_setup();let mut c=smp::prototype_runtime::Coordinator;
     mechanism_progress(&mut c);assert_eq!(STEP_CALLS.load(Ordering::Acquire),0,"unsubmitted initial ran helper");
     candidate::commit();assert!(candidate::pending(),"submitted candidate initial lost its progress opportunity");
@@ -89,7 +89,7 @@ fn candidate_old_bill_credit_denial_and_recursive_entry_preserve_original_custod
     assert!(candidate::pending());CANDIDATE_MODE.store(false,Ordering::Release);
 }
 
-fn candidate_initial_waiting(){
+fn candidate_publication_waiting(){
     candidate_setup();candidate::commit();candidate::install();let mut c=smp::prototype_runtime::Coordinator;
     mechanism_progress(&mut c);mechanism_progress(&mut c);
     let d=locked(|s|s.scheduler.dispatch_with_window_headroom(3,s.layout,now_ns(),1_000_000,20_000_000)).unwrap().unwrap();
@@ -97,7 +97,7 @@ fn candidate_initial_waiting(){
     candidate::settle();assert!(!candidate::pending());
 }
 #[test]fn candidate_renewal_progress_admits_only_existing_frozen_arrival_with_separate_credit(){
-    candidate_initial_waiting();let deadline=now_ns()+1_000_000_000;
+    candidate_publication_waiting();let deadline=now_ns()+1_000_000_000;
     candidate_warm::frozen_arrival(102,deadline);let queued=locked(|s|s.admission.request(request().caller,102)).unwrap();
     assert_eq!(CONSTRUCTIONS.load(Ordering::Acquire),1);
     let(id,stamp)=candidate::renewal();assert!(candidate::pending(),"actual candidate renewal lost its paid progress opportunity");
@@ -111,7 +111,7 @@ fn candidate_initial_waiting(){
     assert!(!candidate::pending());CANDIDATE_MODE.store(false,Ordering::Release);
 }
 #[test]fn candidate_renewal_without_runnable_or_queued_work_does_not_invent_demand_or_completion(){
-    candidate_initial_waiting();let(_id,_stamp)=candidate::renewal();
+    candidate_publication_waiting();let(_id,_stamp)=candidate::renewal();
     assert!(candidate::pending(),"actual candidate renewal lost its paid progress opportunity");
     let before=CONSTRUCTIONS.load(Ordering::Acquire);let mut c=smp::prototype_runtime::Coordinator;
     for _ in 0..4{mechanism_progress(&mut c);}

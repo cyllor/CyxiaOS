@@ -1,0 +1,11 @@
+# Candidate renewal progress
+
+Native initial actions 378, 443 and 478 reach Applied about 11 ms after their original snapshots, while later candidate renewals still miss their execution deadlines. The first-only scheduling cache does not cover those real renewal obligations. This change extends that existing cache to the current actually committed candidate publication.
+
+`Root.first` and `Root.initial` remain the original captured identity. Actual continuous, same-action renewal publication can replace the bounded cache only after the old cached execution is terminal, under the same token/boot/controller/target and increasing plan/version/snapshot. Pending/Unknown custody cannot be overwritten. One-shot actions do not acquire renewal priority. The final Control state hook updates only the exact cached ApplyId and stamp; old or terminal callbacks cannot revive it.
+
+The hint offers the existing replay service piece and separate admission piece under the existing CAS and fresh-credit/settlement gates. It changes no callback frequency outside that hint, admission rule, arrival, request deadline, observation window or execution receipt. The single cache remains compile-bounded to 128 bytes and conservatively counted against the unchanged 1 MiB workspace.
+
+Behavioral RED reproduces missing renewal custody in the Root and two paid scenarios. GREEN executes 12 identity/Control/publication/Activate scenarios, four paid scenarios and 16 negative controls. The paid renewal case admits an already queued original request 102 with its existing deadline using independent credit. In the empty-queue case, repeated helpers create no task, retain the old real execution receipt and leave the renewal Pending. The actual Control pre-executor Stale path also retires the current renewal hint.
+
+Registry commit, capture/owner facade and manual forwarding of a separately verified actual Scheduler receipt remain explicit fixture boundaries. Existing nonzero execution receipt semantics are retained. A hint can accelerate already available work; it cannot guarantee a late-window renewal has demand, and it does not add work after the frozen last arrival. Full engineering checks, builds and native evidence remain pending. No acceptance case or pair label is promoted by these tests.

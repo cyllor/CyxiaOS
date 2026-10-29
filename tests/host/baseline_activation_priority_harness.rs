@@ -29,7 +29,7 @@ mod replay {
     // Candidate custody is exercised by test_candidate_initial_progress; this
     // older fixture only supplies its absent cache while testing baselines.
     #[derive(Clone,Copy)]struct CandidateStamp {version:u64,snapshot_ns:u64}
-    #[derive(Clone,Copy)]struct CandidateInitial {token:Token,apply:ApplyId,stamp:CandidateStamp,family:LearningFamily,state:ExecutionState}
+    #[derive(Clone,Copy)]struct CandidatePublication {token:Token,apply:ApplyId,stamp:CandidateStamp,family:LearningFamily,state:ExecutionState}
     #[derive(Clone, Copy)] pub struct Receipt { pub state: ExecutionState, pub stamp: Stamp }
     #[derive(Clone, Copy,Eq,PartialEq)] pub struct Token { pub id: u64,pub boot_epoch:u64,pub owner:u64 }
     #[derive(Clone, Copy)] pub struct Request {
@@ -41,12 +41,12 @@ mod replay {
     impl Lifecycle { pub fn closing(&self) -> Option<()> { self.close.then_some(()) } }
     pub struct Root {
         pub registered: [Option<Checks>; 1], pub token: Option<Token>, pub request: Option<Request>,
-        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<ApplyId>,candidate_initial:Option<CandidateInitial>,
+        pub first: Option<Snapshot>, pub first_ready: bool, pub phase: Phase, pub initial: Option<ApplyId>,candidate_publication:Option<CandidatePublication>,
         pub baseline_count: usize, pub fault: Option<Error>, pub unpublished: Option<()>, pub lifecycle: Lifecycle,
         pub baseline: [Option<Receipt>;32], pub closing: Option<Receipt>,
     }
     static mut ROOT: Root = Root { registered: [None], token: None, request: None,
-        first: None, first_ready: false, phase: Phase::Complete, initial: None,candidate_initial:None,
+        first: None, first_ready: false, phase: Phase::Complete, initial: None,candidate_publication:None,
         baseline_count: 0, fault: None, unpublished: None, lifecycle: Lifecycle { close: false }, baseline:[None;32],closing:None };
     fn root() -> &'static Root { unsafe { &*core::ptr::addr_of!(ROOT) } }
     pub fn root_mut() -> &'static mut Root { unsafe { &mut *core::ptr::addr_of_mut!(ROOT) } }

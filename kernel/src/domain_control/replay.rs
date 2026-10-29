@@ -265,18 +265,19 @@ struct Spectator {
     trial_id: u64,
     fixture: Option<fixture::Fixed>,
 }
-/// Scheduling custody for the first actually committed candidate only. The
-/// control gate owns both this projection and Desired's authoritative state.
+/// Scheduling custody for the current actually committed candidate. First
+/// identity stays in Root; a renewal cannot replace unresolved custody here.
 #[derive(Clone, Copy)]
-struct CandidateInitial {
+struct CandidatePublication {
     token: Token,
     apply: ApplyId,
     stamp: PolicyStamp,
     family: LearningFamily,
     state: ExecutionState,
 }
-pub(crate) const CANDIDATE_INITIAL_BYTES: usize = core::mem::size_of::<Option<CandidateInitial>>();
-const _: () = assert!(CANDIDATE_INITIAL_BYTES <= 128);
+pub(crate) const CANDIDATE_PUBLICATION_BYTES: usize =
+    core::mem::size_of::<Option<CandidatePublication>>();
+const _: () = assert!(CANDIDATE_PUBLICATION_BYTES <= 128);
 struct Root {
     registered: [Option<OwnerChecks>; 4],
     serial: u64,
@@ -301,7 +302,7 @@ struct Root {
     cursor: usize,
     selected: Option<Action>,
     initial: Option<ApplyId>,
-    candidate_initial: Option<CandidateInitial>,
+    candidate_publication: Option<CandidatePublication>,
     renew_after: u64,
     baseline: [Option<Receipt>; 32],
     baseline_count: usize,
@@ -336,7 +337,7 @@ impl Root {
             cursor: 0,
             selected: None,
             initial: None,
-            candidate_initial: None,
+            candidate_publication: None,
             renew_after: 0,
             baseline: [None; 32],
             baseline_count: 0,
@@ -372,12 +373,18 @@ pub(super) fn publish_baseline_activation_hint() {
                 ExecutionState::Pending | ExecutionState::Unknown
             )
     };
-    let candidate = r.candidate_initial.is_some_and(|initial| {
+    let candidate = r.candidate_publication.is_some_and(|initial| {
+        let Some(first_apply) = r.initial else {
+            return false;
+        };
         r.phase == Phase::Running
             && r.fault.is_none()
             && r.first_ready
             && r.token == Some(initial.token)
-            && r.initial == Some(initial.apply)
+            && first_apply.boot_epoch == initial.apply.boot_epoch
+            && first_apply.controller_epoch == initial.apply.controller_epoch
+            && first_apply.action_index == initial.apply.action_index
+            && first_apply.target == initial.apply.target
             && initial.apply.boot_epoch == initial.token.boot_epoch
             && initial.stamp.version != 0
             && matches!(
@@ -385,8 +392,11 @@ pub(super) fn publish_baseline_activation_hint() {
                 ExecutionState::Pending | ExecutionState::Unknown
             )
             && r.first.is_some_and(|first| {
-                first.sequence == initial.apply.plan_seq
-                    && first.taken_ns == initial.stamp.snapshot_ns
+                first.sequence == first_apply.plan_seq
+                    && (initial.apply == first_apply && first.taken_ns == initial.stamp.snapshot_ns
+                        || initial.apply.plan_seq > first_apply.plan_seq
+                            && initial.stamp.snapshot_ns > first.taken_ns
+                            && r.selected.is_some_and(|action| !action.one_shot()))
             })
             && r.request.is_some_and(|q| {
                 q.kind == TrialKind::Candidate
@@ -1092,7 +1102,7 @@ pub fn reserve(request: Request) -> Result<Token, Error> {
         r.cursor = 0;
         r.selected = None;
         r.initial = None;
-        r.candidate_initial = None;
+        r.candidate_publication = None;
         r.renew_after = 0;
         r.baseline_count = 0;
         r.closing = None;
@@ -1163,7 +1173,7 @@ pub fn advance(old: Token, request: Request) -> Result<Token, Error> {
         r.rejected = None;
         r.selected = None;
         r.initial = None;
-        r.candidate_initial = None;
+        r.candidate_publication = None;
         r.renew_after = 0;
         r.cursor = 0;
         r.baseline_count = 0;
@@ -1315,7 +1325,7 @@ fn reserve_spectator_inner(
         r.cursor = 0;
         r.selected = None;
         r.initial = None;
-        r.candidate_initial = None;
+        r.candidate_publication = None;
         r.renew_after = 0;
         r.baseline_count = 0;
         r.closing = None;
@@ -1618,38 +1628,62 @@ pub(super) fn published(
         // A baseline PUBLISH is just as irrevocable as a model proposal. This
         // latch is set under the same root gate immediately before Desired,
         // even if the caller later fails to retrieve the receipt.
-        if r.initial.is_none() {
-            let apply = ApplyId {
-                boot_epoch: boot,
-                controller_epoch: plan.header.controller_epoch,
-                plan_seq: plan.header.plan_seq,
-                action_index: 0,
-                target: q.target,
-            };
+        let apply = ApplyId {
+            boot_epoch: boot,
+            controller_epoch: plan.header.controller_epoch,
+            plan_seq: plan.header.plan_seq,
+            action_index: 0,
+            target: q.target,
+        };
+        let first = r.initial.is_none();
+        if first {
             r.initial = Some(apply);
-            if q.kind == TrialKind::Candidate {
-                r.candidate_initial =
-                    r.token
-                        .zip(first_stamp)
-                        .map(|(token, stamp)| CandidateInitial {
-                            token,
-                            apply,
-                            stamp,
-                            family: q.family,
-                            state: ExecutionState::Pending,
-                        });
-            }
+        }
+        if q.kind == TrialKind::Candidate
+            && (first
+                || r.phase == Phase::Running
+                    && !d.action.one_shot()
+                    && r.candidate_publication.is_some_and(|old| {
+                        old.state.terminal()
+                            && r.token == Some(old.token)
+                            && old.stamp.version != 0
+                            && old.apply.boot_epoch == apply.boot_epoch
+                            && old.apply.controller_epoch == apply.controller_epoch
+                            && old.apply.target == apply.target
+                            && apply.plan_seq > old.apply.plan_seq
+                            && first_stamp.is_some_and(|stamp| {
+                                stamp.version > old.stamp.version
+                                    && stamp.snapshot_ns > old.stamp.snapshot_ns
+                            })
+                    }))
+        {
+            r.candidate_publication =
+                r.token
+                    .zip(first_stamp)
+                    .map(|(token, stamp)| CandidatePublication {
+                        token,
+                        apply,
+                        stamp,
+                        family: q.family,
+                        state: ExecutionState::Pending,
+                    });
         }
     }
     Ok(())
 }
 /// Called after Control has finalized the real execution state, including
 /// pre-executor refusal and deadline conversion. No Registry query or retry.
-pub(super) fn initial_execution(apply: ApplyId, stamp: PolicyStamp, state: ExecutionState) {
+pub(super) fn candidate_execution(apply: ApplyId, stamp: PolicyStamp, state: ExecutionState) {
     let r = root_mut();
-    if let Some(initial) = r.candidate_initial.as_mut()
+    if let Some(initial) = r.candidate_publication.as_mut()
         && r.token == Some(initial.token)
-        && r.initial == Some(apply)
+        && r.initial.is_some_and(|first| {
+            first.boot_epoch == apply.boot_epoch
+                && first.controller_epoch == apply.controller_epoch
+                && first.action_index == apply.action_index
+                && first.target == apply.target
+                && first.plan_seq <= apply.plan_seq
+        })
         && initial.apply == apply
         && initial.stamp == stamp
         && !initial.state.terminal()

@@ -2569,7 +2569,7 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.state = ExecutionState::Failed(Error::Again);
                 }
             }
-            replay::initial_execution(d.apply, d.stamp, d.state);
+            replay::candidate_execution(d.apply, d.stamp, d.state);
             if let Some((entered_ns, cpu_ns)) = executor_trace {
                 crate::learning_evidence::execution_trace::control(
                     crate::learning_evidence::execution_trace::ControlEvent {

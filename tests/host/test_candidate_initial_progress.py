@@ -20,11 +20,11 @@ def root_support():
     replay=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
     control=(ROOT/'kernel/src/domain_control.rs').read_text()
     support=(ROOT/'tests/host/candidate_initial_support.rs').read_text()
-    initial='#[derive(Clone,Copy)] struct CandidateInitial;'
-    if 'struct CandidateInitial' in replay:
-        initial='#[derive(Clone,Copy)]\n'+function(replay,'struct CandidateInitial')
-    hook='pub(super) fn initial_execution(_:ApplyId,_:PolicyStamp,_:ExecutionState) {}'
-    if 'fn initial_execution(' in replay: hook=function(replay,'pub(super) fn initial_execution(')
+    initial='#[derive(Clone,Copy)] struct CandidatePublication;'
+    if 'struct CandidatePublication' in replay:
+        initial='#[derive(Clone,Copy)]\n'+function(replay,'struct CandidatePublication')
+    hook='pub(super) fn candidate_execution(_:ApplyId,_:PolicyStamp,_:ExecutionState) {}'
+    if 'fn candidate_execution(' in replay: hook=function(replay,'pub(super) fn candidate_execution(')
     support=support.replace('// CANDIDATE_GUARD',function(control,'impl Drop for Guard').replace('impl Drop for Guard','struct Guard;\nimpl Drop for Guard'))
     support=support.replace('// CANDIDATE_TOKEN','#[derive(Clone,Copy,Debug,PartialEq,Eq)]\n'+function(replay,'pub struct Token'))
     support=support.replace('// CANDIDATE_INITIAL_TYPE',initial)
@@ -36,7 +36,7 @@ def root_support():
     return support.replace('// CANDIDATE_PUBLISHED_CALL',f'published(&plan,id.boot_epoch{extra})?;')
 
 
-class CandidateInitialProgress(unittest.TestCase):
+class CandidatePublicationProgress(unittest.TestCase):
     def test_actual_candidate_custody_uses_existing_paid_progress_pieces(self):
         task=(ROOT/'kernel/src/domain_tasks.rs').read_text()
         execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
@@ -92,9 +92,9 @@ class CandidateInitialProgress(unittest.TestCase):
             self.assertIn('4 passed; 0 failed',r.stdout)
             for old,new,case,failure in [
                 ('    crate::domain_tasks::service_baseline_progress();','',
-                 'actual_candidate_initial_flows_through_fresh_helper_warm_admission_and_policy_receipt','candidate warm never reached real admission'),
+                 'actual_candidate_publication_flows_through_fresh_helper_warm_admission_and_policy_receipt','candidate warm never reached real admission'),
                 ('advance_admission_bounded(s, 1, 1)','advance_admission_bounded(s, 0, 1)',
-                 'actual_candidate_initial_flows_through_fresh_helper_warm_admission_and_policy_receipt','candidate warm never reached real admission'),
+                 'actual_candidate_publication_flows_through_fresh_helper_warm_admission_and_policy_receipt','candidate warm never reached real admission'),
                 ('        return;\n    };\n    let hint = crate::learning_replay::baseline_activation_pending();',
                  '        return;\n    };\n    drop(_entry);\n    let hint = crate::learning_replay::baseline_activation_pending();',
                  'candidate_old_bill_credit_denial_and_recursive_entry_preserve_original_custody','recursive progress replaced the outer diagnostic ticket'),
@@ -162,11 +162,11 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'run','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-initial')]
             failures=[]
-            for case in ['root','renewal','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
+            for case in ['root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
                 r=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 if r.returncode: failures.append(case+'\n'+r.stdout+r.stderr)
             self.assertFalse(failures,'\n'.join(failures))
-            hook='            replay::initial_execution(d.apply, d.stamp, d.state);'
+            hook='            replay::candidate_execution(d.apply, d.stamp, d.state);'
             mutants=[
                 (program.replace('        replay::published(plan, self.boot, stamps[..plan.len()].first().copied())?;',''),
                  'publish','native publication did not bind its actual initial stamp'),
@@ -174,6 +174,12 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
                     'replay::published(plan, self.boot, None)?'),
                  'publish','native publication did not bind its actual initial stamp'),
                 (program.replace(hook,''),'stale','real final Control state did not update the initial hint'),
+                (program.replace(hook,'if d.apply.plan_seq==51{'+hook+'}'),'renewal_stale','real final Control state did not update the initial hint'),
+                (program.replace('old.state.terminal()','true'),'renewal','new publication replaced an unresolved renewal'),
+                (program.replace('first.plan_seq <= apply.plan_seq','first.plan_seq == apply.plan_seq'),'renewal','terminal actual renewal retained priority'),
+                (program.replace('initial.apply.plan_seq > first_apply.plan_seq','false'),'renewal','actual candidate renewal lost its paid progress opportunity'),
+                (program.replace('        if first {','        if true {'),'renewal','renewal replaced the original captured first identity'),
+
                 (program.replace(hook,'if executor_trace.is_some(){'+hook+'}'),'stale','real final Control state did not update the initial hint'),
                 (program.replace(hook,'').replace('            d.observed_ns = observed;',hook+'\n            d.observed_ns = observed;'),
                  'deadline','real final Control state did not update the initial hint'),

@@ -50,7 +50,7 @@ pub(super) const WORKSPACE_PEAK_BYTES: usize = 1024 * 1024
     + META_PAGES * 4096
     + crate::learning_prewarm::OWNED_BYTES
     + crate::domain_control::core_replay::OWNED_BYTES
-    + root::CANDIDATE_INITIAL_BYTES
+    + root::CANDIDATE_PUBLICATION_BYTES
     + crate::learning_evidence::HANDOFF_BYTES
     + crate::domain_tasks::CAPTURE_CREDIT_BYTES
     + crate::domain_services::SOURCE_IDENTITY_BYTES
