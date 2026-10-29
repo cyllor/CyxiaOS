@@ -68,6 +68,48 @@ pub fn initialize(boot: u64, model: ModelBinding) {
 pub fn registered(index: usize) {
     DOMAIN_CONTROL_EVIDENCE.0[3].fetch_or(1u64 << index, Ordering::Release);
 }
+/// Reserved header words, all writers under the original control-owner gate.
+/// 128 magic,129 schema,130 visits,131 denials,132..136 reason counts;
+/// 136..158 latest exact context,159 seqlock;192..214 first denied candidate.
+/// Reason: 0 open,1 no boot,2 live job,3 optimizer stopped,4 governance lease.
+pub fn preparation_admission(context: [u64; 22]) {
+    DOMAIN_CONTROL_EVIDENCE.0[159].fetch_add(1, Ordering::AcqRel);
+    put(128, 0x4359_4144_4d49_0001);
+    put(129, 1);
+    add(130);
+    let reason = context[2];
+    if reason != 0 {
+        add(131);
+        if reason <= 4 {
+            add(131 + reason as usize);
+        }
+        if get(218) == 0 {
+            for (i, value) in context.iter().copied().enumerate() {
+                put(192 + i, value);
+            }
+            put(218, 1);
+        }
+    }
+    for (i, value) in context.into_iter().enumerate() {
+        put(136 + i, value);
+    }
+    DOMAIN_CONTROL_EVIDENCE.0[159].fetch_add(1, Ordering::Release);
+}
+/// Independent header seqlock:160 magic,161 schema,162 transitions,164..184
+/// immutable first transition context,191 publication. Partial CPU sum is a
+/// lower bound, not a newly measured total or a fabricated rejection cause.
+pub fn optimization_stop(context: [u64; 20]) {
+    DOMAIN_CONTROL_EVIDENCE.0[191].fetch_add(1, Ordering::AcqRel);
+    put(160, 0x4359_4f50_5354_0001);
+    put(161, 1);
+    add(162);
+    if get(164) == 0 {
+        for (i, value) in context.into_iter().enumerate() {
+            put(164 + i, value);
+        }
+    }
+    DOMAIN_CONTROL_EVIDENCE.0[191].fetch_add(1, Ordering::Release);
+}
 /// Called under the same control-owner gate as begin/finish/progress. An
 /// accepted action owns its original input until the executor settles it;
 /// UNKNOWN is a live obligation, not an eviction opportunity. A full capture

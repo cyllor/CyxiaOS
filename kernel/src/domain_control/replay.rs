@@ -419,6 +419,45 @@ pub(super) fn publish_baseline_activation_hint() {
 pub fn baseline_activation_pending() -> bool {
     BASELINE_ACTIVATION_PENDING.load(Ordering::Acquire)
 }
+/// Existing control-gate entry only. The diagnostic never queries an owner,
+/// reads a new clock or changes an admission result.
+pub(super) fn preparation_admission(s: &State, reason: u64, at: u64) {
+    let r = root();
+    let Some(q) = r.request else {
+        return;
+    };
+    if q.kind != TrialKind::Candidate || r.phase != Phase::Running {
+        return;
+    }
+    let Some(token) = r.token else {
+        return;
+    };
+    let first = r.first.unwrap_or_default();
+    crate::domain_evidence::preparation_admission([
+        cyxia_arch_aarch64::cpu::slot() as u64,
+        at,
+        reason,
+        s.boot,
+        s.sequence,
+        s.job.as_ref().map_or(0, |job| job.sequence),
+        s.owner.prepared_count as u64,
+        token.id,
+        q.trial_id,
+        r.phase as u64 + 1,
+        u64::from(q.family.domain),
+        u64::from(q.family.kind),
+        q.target.id,
+        q.target.generation,
+        first.sequence,
+        first.taken_ns,
+        u64::from(r.first_ready),
+        r.initial.map_or(0, |apply| apply.plan_seq),
+        token.boot_epoch,
+        token.owner.id,
+        token.owner.generation,
+        1,
+    ]);
+}
 static ACTIVATING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ACTIVATION_TOKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);

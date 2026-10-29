@@ -1226,11 +1226,19 @@ fn next_locked_inner(
     preparation_entry_detail(0);
     require_control(&s.owner)?;
     preparation_entry_detail(1);
-    if s.boot == 0
-        || s.job.is_some()
-        || s.registry.optimization_stopped()
-        || s.governance_jobs.reserves_publication(now())
-    {
+    let blocked = if s.boot == 0 {
+        1
+    } else if s.job.is_some() {
+        2
+    } else if s.registry.optimization_stopped() {
+        3
+    } else if s.governance_jobs.reserves_publication(now()) {
+        4
+    } else {
+        0
+    };
+    replay::preparation_admission(s, blocked, wall_started);
+    if blocked != 0 {
         return Ok(false);
     }
     preparation_entry_detail(2);
@@ -2222,6 +2230,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         }
         require_control(&s.owner)?;
         let mut job = s.job.take().ok_or(Error::Stale)?;
+        let optimization_was_stopped = s.registry.optimization_stopped();
         // Includes reply IPC/identity/canonical-wire verification in the CPU
         // cap. Its numerical decode is also checked against the 2 ms work cap;
         // disjoint evidence intervals below still charge actual execution once.
@@ -2319,10 +2328,38 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         let publication_ns = publication_cpu_started
             .map(timer::cpu_elapsed_ns)
             .unwrap_or(0);
+        let registry_stopped = s.registry.optimization_stopped();
         if !job.read_only && publication_ns > policy::PUBLICATION_BUDGET_NS {
             s.registry.stop_optimization();
         }
         let decoding = decoded_ns.unwrap_or_else(|| timer::cpu_elapsed_ns(decode_cpu_started));
+        if !optimization_was_stopped && s.registry.optimization_stopped() {
+            let sum = decoding.checked_add(publication_ns);
+            crate::domain_evidence::optimization_stop([
+                u64::from(registry_stopped)
+                    | (u64::from(!job.read_only && publication_ns > policy::PUBLICATION_BUDGET_NS)
+                        << 1),
+                wall_begin,
+                s.boot,
+                job.controller,
+                job.sequence,
+                job.set.target.id,
+                job.set.target.generation,
+                result.unwrap_or(0),
+                result.err().map_or(0, |e| e as u64 + 1),
+                u64::from(job.read_only),
+                decoding,
+                publication_ns,
+                sum.unwrap_or(u64::MAX),
+                u64::from(sum.is_none()),
+                u64::from(optimization_was_stopped),
+                1,
+                job.set.model.generation,
+                s.sequence,
+                job.cpu as u64,
+                publication_started.cpu.ns,
+            ]);
+        }
         job.completion = Some(JobCompletion {
             result,
             selected,
