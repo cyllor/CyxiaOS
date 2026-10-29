@@ -6,7 +6,7 @@ use super::{
     Family, ModelBinding, NativeClock, ObjectKey, Owner, POLICY_NS, Plan, PlanHeader, PolicyStamp,
     PublicationScope, RawFeatures, Snapshot, State, WINDOW_NS, bind_dependencies, categorical,
     ensure_stability, execution_blocks_replacement, family_index, locate, now, policy, policy_wire,
-    publisher, queued_control_wcet_us, tiers, with,
+    publisher, queued_control_wcet_us, submission, tiers, with,
 };
 use crate::{control_pool::Allocation, smp::prototype_runtime as runtime};
 use core::mem::MaybeUninit;
