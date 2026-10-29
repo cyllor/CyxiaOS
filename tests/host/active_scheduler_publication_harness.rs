@@ -1,6 +1,7 @@
 //! Actual task Gate/Guard, Scheduler/BackgroundBudgets and relevant production
 //! locked branches. Other task families are explicit unsupported boundaries.
 #![allow(dead_code,unused_imports)]
+extern crate self as cyxia_arch_aarch64;
 use std::sync::atomic::{AtomicBool,AtomicU64,AtomicUsize,Ordering};
 use cyxia_prototype::{domains::{Action,Error,ObjectKey},domains::tasks::{Scheduler,CpuLayout},domains::maintenance::BackgroundBudgets,policy};
 static CPU:AtomicUsize=AtomicUsize::new(1);static NOW:AtomicU64=AtomicU64::new(0);
@@ -35,3 +36,6 @@ fn fixture(){NOW.fetch_add(2_000_000_000,Ordering::AcqRel);CPU.store(1,Ordering:
 #[test]fn active_scheduler_borrow_preserves_generations_ranges_and_actual_cpu_identity(){
  fixture();let guard=reserve_scheduler_publication(Action::CpuWeight(2)).unwrap().expect("Active CPU weight publication has no protected task borrow");let foreign=ObjectKey{id:12,generation:2};assert_eq!(guard.validate(Action::CpuWeight(2),foreign,now_ns()),Err(Error::Stale));assert_eq!(guard.current(1,foreign),Err(Error::Stale));assert!(guard.validate(Action::CpuWeight(0),key(12),now_ns()).is_err());CPU.store(2,Ordering::Release);assert_eq!(guard.current(1,key(12)),Err(Error::Auth),"borrow changed its control CPU identity");CPU.store(1,Ordering::Release);drop(guard);
 }
+
+mod learning_canary{pub fn blocks_active()->bool{false}}
+mod domain_tasks{pub(crate) use super::SchedulerPublication;}

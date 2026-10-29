@@ -28,7 +28,19 @@ def program():
   selection+='\n'+function(control,'fn validate_selection_with(')
   call='validate_selection_with(owner,action,target,at,||{CURRENT_CALLS.fetch_add(1,Ordering::AcqRel);view.current(action.domain(),target)},|options,out|view.legal_options(options,target,at,out))'
  extra=extra.replace('// ACTUAL_SELECTION_BODIES',selection).replace('// BORROWED_SELECTION',call)
- return code+'\n'+extra
+ code+='\n'+extra
+ scope=(ROOT/'tests/host/active_scope_harness.rs').read_text().replace('// ACTUAL_ADMISSION_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/dependencies.rs'))+'] mod admission_view;')
+ support='\n'.join(function(control,x) for x in ['fn require_control(','fn family_index(','pub fn admit_dependency(','fn bind_dependencies(','fn bind_dependency_list(','fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection(','fn validate_selection_with('])
+ scope=scope.replace('// ACTUAL_SCOPE_SUPPORT',support)
+ active='\n'.join(function(control,x) for x in ['trait PublicationScope','impl PublicationScope for ActiveScope'])
+ active="struct ActiveScope<'a>(&'a CommitGate);\n"+active
+ scope=scope.replace('// ACTUAL_ACTIVE_SCOPE',active)
+ publication='';constructor='ActiveScope(&gate)'
+ if 'struct ActivePublication' in control:
+  publication='\n'.join(function(control,x) for x in ["struct ActivePublication<'",'impl PublicationScope for ActivePublication'])
+  constructor='ActivePublication{active:ActiveScope(&gate),task_publication:Some(view)}'
+ scope=scope.replace('// ACTUAL_ACTIVE_PUBLICATION',publication).replace('// ACTIVE_PUBLICATION_CONSTRUCTOR',constructor)
+ return code+'\n'+scope
 
 class ActiveSchedulerPublication(unittest.TestCase):
  def test_actual_task_guard_borrow_preserves_owner_rules(self):
@@ -60,4 +72,9 @@ class ActiveSchedulerPublication(unittest.TestCase):
    for old,new,message in mutants:
     self.assertTrue(old in code,'missing mutation anchor: '+old);(d/'harness.rs').write_text(code.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+ def test_actual_active_scope_keeps_dependency_admission_under_one_borrow(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   d=Path(tmp);(d/'harness.rs').write_text(program());(d/'Cargo.toml').write_text('[package]\nname="active-publication-scope"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
+   command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-active-publication-scope'),'--','--test-threads=1','active_scope_']
+   r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('3 passed; 0 failed',r.stdout)
 if __name__=='__main__':unittest.main()
