@@ -586,9 +586,42 @@ pub trait Clock {
     /// execution time, rather than deriving it from the wall timestamp.
     fn read(&mut self) -> PublicationTime;
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubmissionStage {
+    InitialWall = 1,
+    FirstValidation = 2,
+    InitialBudget = 3,
+    Prepare = 4,
+    AfterPrepareTime = 5,
+    SecondValidation = 6,
+    Revalidate = 7,
+    AfterRevalidateTime = 8,
+    PreModelBudget = 9,
+    ModelAuthorization = 10,
+    CommitTime = 11,
+    FinalBudget = 12,
+    FinalModel = 13,
+    Publish = 14,
+    Complete = 15,
+}
+/// Original protected submit outcome, copied after its receipt is retained.
+/// A successful publication remains successful even if the final cap stops
+/// further optimization. This observer supplies no new execution authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmissionObservation {
+    pub id: PlanId,
+    pub version: u64,
+    pub published_ns: u64,
+    pub stage: SubmissionStage,
+    pub preparation_started: bool,
+    pub result: Result<(), Error>,
+}
 /// PREPARE must reserve all resources without starting physical effects. Failed
 /// publication is effect-free; cancel_prepared releases only those reservations.
 pub trait Executor {
+    /// Passive only: no recursive publication, clock or resource operations.
+    fn observed_submission(&mut self, _: &SubmissionObservation) {}
     /// Explicit authority for a fixed baseline, independent of model/Canary
     /// authority. An override must verify the live protected reservation,
     /// target and exact deterministic action. Every ordinary executor denies
@@ -1255,24 +1288,32 @@ impl Registry {
         let first = clock.read();
         let mut last_sample = first;
         let mut prepared = false;
+        let mut stage = SubmissionStage::InitialWall;
         let result = (|| {
             if first.wall_ns > wall_deadline_ns {
                 return Err(Error::Expired);
             }
+            stage = SubmissionStage::FirstValidation;
             self.validate(&plan, first.wall_ns, executor)?;
+            stage = SubmissionStage::InitialBudget;
             publication_budget(started_ns, first)?;
             prepared = true;
+            stage = SubmissionStage::Prepare;
             executor.prepare(&plan, next_version)?;
+            stage = SubmissionStage::AfterPrepareTime;
             let now = clock.read();
             last_sample = now;
             if now.wall_ns < first.wall_ns {
                 return Err(Error::Range);
             }
             first.cpu_elapsed(now)?;
+            stage = SubmissionStage::SecondValidation;
             self.validate(&plan, now.wall_ns, executor)?;
+            stage = SubmissionStage::Revalidate;
             executor.revalidate(&plan, now.wall_ns)?;
             // Revalidation may itself take time or wait for an owner. Take a
             // fresh protected timestamp after all callbacks, before PUBLISH.
+            stage = SubmissionStage::AfterRevalidateTime;
             let publish_ns = clock.read();
             last_sample = publish_ns;
             if publish_ns.wall_ns < now.wall_ns {
@@ -1286,11 +1327,14 @@ impl Registry {
             {
                 return Err(Error::Expired);
             }
+            stage = SubmissionStage::PreModelBudget;
             publication_budget(started_ns, publish_ns)?;
             // Recheck the actual protected model/lease after all hard-constraint
             // callbacks. This is read-only: no canary quota or pending slot is
             // consumed until the executor performs the real atomic publish.
+            stage = SubmissionStage::ModelAuthorization;
             let binding = self.authorize_models(&plan, publish_ns.wall_ns, executor)?;
+            stage = SubmissionStage::CommitTime;
             let commit_ns = clock.read();
             last_sample = commit_ns;
             if commit_ns.wall_ns < publish_ns.wall_ns {
@@ -1304,16 +1348,21 @@ impl Registry {
             {
                 return Err(Error::Expired);
             }
+            stage = SubmissionStage::FinalBudget;
             publication_budget(started_ns, commit_ns)?;
             // The gate remains locked. Time may have passed during its check,
             // so recheck the immutable permit's bounds at this final timestamp.
+            stage = SubmissionStage::FinalModel;
             if self.model_scope(&plan, commit_ns.wall_ns)? != binding {
                 return Err(Error::Stale);
             }
             // Publication is one atomic root change under the owner's resource gate.
+            stage = SubmissionStage::Publish;
             executor.publish(&plan, next_version, commit_ns.wall_ns)?;
+            stage = SubmissionStage::Complete;
             Ok((commit_ns.wall_ns, binding))
         })();
+        let observed_stage = stage;
         match result {
             Ok((now, binding)) => {
                 self.version = next_version;
@@ -1341,6 +1390,14 @@ impl Registry {
         {
             self.optimization_stopped = true;
         }
+        executor.observed_submission(&SubmissionObservation {
+            id: record.receipt.id,
+            version: record.receipt.version,
+            published_ns: record.receipt.published_ns,
+            stage: observed_stage,
+            preparation_started: prepared,
+            result: result.map(|_| ()),
+        });
         Ok(record.receipt)
     }
     pub fn stamp(
