@@ -999,9 +999,26 @@ fn validate_selection(
     target: ObjectKey,
     at: u64,
 ) -> Result<(), Error> {
+    validate_selection_with(
+        owner,
+        action,
+        target,
+        at,
+        || (f.current)(action.domain(), action.kind(), target),
+        |options, output| (f.legal_options)(options, target, at, output),
+    )
+}
+fn validate_selection_with(
+    owner: &Owner,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    current: impl FnOnce() -> Result<Action, Error>,
+    legal_options: impl FnOnce(&[Option<Action>], &mut [Option<Action>]) -> Result<usize, Error>,
+) -> Result<(), Error> {
     let slot = locate(owner, action, target).ok_or(Error::Stale)?;
     let guard = owner.stability[slot].as_ref().ok_or(Error::Stale)?;
-    let current = (f.current)(action.domain(), action.kind(), target)?;
+    let current = current()?;
     if action == current {
         return Ok(());
     }
@@ -1021,7 +1038,7 @@ fn validate_selection(
     }
     let (options, n) = tiers(current);
     let mut legal = [None; 32];
-    let count = (f.legal_options)(&options[..n], target, at, &mut legal)?;
+    let count = legal_options(&options[..n], &mut legal)?;
     legal[..count].sort_unstable_by_key(|a| a.map(Action::order));
     if !cyxia_prototype::domains::stability::adjacent(current, action, &legal[..count])? {
         return Err(Error::Conflict);

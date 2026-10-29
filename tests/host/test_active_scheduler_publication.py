@@ -26,7 +26,7 @@ def program():
  call='validate_selection(owner,family(),action,target,at)'
  if 'fn validate_selection_with(' in control:
   selection+='\n'+function(control,'fn validate_selection_with(')
-  call='validate_selection_with(owner,action,target,at,||view.current(action.domain(),target),|options,out|view.legal_options(options,target,at,out))'
+  call='validate_selection_with(owner,action,target,at,||{CURRENT_CALLS.fetch_add(1,Ordering::AcqRel);view.current(action.domain(),target)},|options,out|view.legal_options(options,target,at,out))'
  extra=extra.replace('// ACTUAL_SELECTION_BODIES',selection).replace('// BORROWED_SELECTION',call)
  return code+'\n'+extra
 
@@ -48,7 +48,16 @@ class ActiveSchedulerPublication(unittest.TestCase):
 
  def test_borrowed_owner_keeps_the_complete_ordinary_selection_algorithm(self):
   with tempfile.TemporaryDirectory() as tmp:
-   d=Path(tmp);(d/'harness.rs').write_text(program());(d/'Cargo.toml').write_text('[package]\nname="active-scheduler-selection"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
+   d=Path(tmp);code=program();(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="active-scheduler-selection"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-active-scheduler-selection'),'--','--test-threads=1','active_selection_']
    r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('4 passed; 0 failed',r.stdout)
+   mutants=[
+    ('if guard.frozen() {','if false {','publication bypassed sticky freeze'),
+    ('at.saturating_sub(guard.last_change_ns()) < hold','false','publication bypassed minhold'),
+    ('if !cyxia_prototype::domains::stability::adjacent(current, action, &legal[..count])? {','if false {','publication bypassed ordinary adjacency'),
+    ('let current = current()?;','let current = Action::CpuWeight(1);','selection trusted a cached action over the real current owner'),
+   ]
+   for old,new,message in mutants:
+    self.assertTrue(old in code,'missing mutation anchor: '+old);(d/'harness.rs').write_text(code.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
 if __name__=='__main__':unittest.main()
