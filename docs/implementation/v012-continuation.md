@@ -2,7 +2,7 @@
 
 ## Candidate Stale provenance
 
-The [new passive denial lane](candidate-stale-evidence.md) preserves the original candidate pre-executor Stale, including its full identity and expected/current generations, independently of the sealed first-baseline trace. It changes no generation check or progress path. Targeted RED→GREEN, negative controls, all nine v50 checks and both image/selected stack gates pass; fresh native diagnosis follows.
+The [new passive denial lane](candidate-stale-evidence.md) preserves the original candidate pre-executor Stale, including its full identity and expected/current generations, independently of the sealed first-baseline trace. It changes no generation check or progress path. Targeted RED→GREEN, negative controls, all nine v50 checks and both image/selected stack gates pass; the native run fails after 601.227957 s with two verified sides, six excluded and zero labels. The target pre-executor Stale is not reproduced; unpublished rejection and lease-coverage gaps are retained as the next diagnosis.
 
 ## Candidate renewal progress
 
