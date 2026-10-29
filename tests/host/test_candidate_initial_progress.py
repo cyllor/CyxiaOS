@@ -89,7 +89,7 @@ class CandidateInitialProgress(unittest.TestCase):
             command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-paid-progress'),'--','--test-threads=1','candidate_']
             r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)
-            self.assertIn('2 passed; 0 failed',r.stdout)
+            self.assertIn('4 passed; 0 failed',r.stdout)
             for old,new,case,failure in [
                 ('    crate::domain_tasks::service_baseline_progress();','',
                  'actual_candidate_initial_flows_through_fresh_helper_warm_admission_and_policy_receipt','candidate warm never reached real admission'),
@@ -156,13 +156,13 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
             CLAIMED.store(true,Ordering::Release);let _root_guard=Guard;f(&mut guard)}''')
         arm=function(owner,'Phase::Activate =>')
         program+=(ROOT/'tests/host/candidate_activate_support.rs').read_text().replace('// CANDIDATE_ACTIVATE_ARM',arm)
-        program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"root"=>control::replay::scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
+        program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"root"=>control::replay::scenario(),"renewal"=>control::replay::renewal_scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'run','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-initial')]
             failures=[]
-            for case in ['root','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
+            for case in ['root','renewal','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
                 r=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 if r.returncode: failures.append(case+'\n'+r.stdout+r.stderr)
             self.assertFalse(failures,'\n'.join(failures))

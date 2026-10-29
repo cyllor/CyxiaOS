@@ -42,6 +42,51 @@ pub mod replay {
         Ok(())
     }
     pub fn state(id:ApplyId,stamp:PolicyStamp,state:ExecutionState){initial_execution(id,stamp,state);}
+    pub fn commit_at(stamp:PolicyStamp,id:ApplyId,action:Action)->Result<(),Error>{
+        let mut bytes=[0u8;1024];let n=policy_wire::encode_plan(PlanHeader{plan_seq:id.plan_seq,
+            controller_epoch:id.controller_epoch,snapshot_seq:id.plan_seq,active_model_generation:1,active_until_local_ns:stamp.installed_until_ns,
+            ..PlanHeader::default()},&[Decision{envelope:Envelope{target:id.target,controller_epoch:id.controller_epoch,
+                snapshot_seq:id.plan_seq,decision_seq:id.plan_seq,ledger_generation:1,core_generation:1,..Envelope::default()},
+                action,candidate_index:0}],&mut bytes)?;
+        let plan=policy_wire::decode_plan(&bytes[..n])?;
+        let stamp=Some(stamp);
+        // CANDIDATE_PUBLISHED_CALL
+        Ok(())
+    }
+    pub fn first_identity()->(Snapshot,ApplyId){(root().first.unwrap(),root().initial.unwrap())}
+    pub fn renewal_scenario(){
+        const NEXT:ApplyId=ApplyId{plan_seq:52,..ID};
+        const RENEW:PolicyStamp=PolicyStamp{version:42,snapshot_ns:120_000_000,installed_until_ns:10_120_000_000};
+        reset();with(|_|commit(Some(STAMP),ID)).unwrap();
+        with(|_|{state(ID,STAMP,ExecutionState::Applied);Ok(())}).unwrap();let original=first_identity();
+        with(|_|commit_at(RENEW,NEXT,Action::CpuWeight(2))).unwrap();
+        assert!(baseline_activation_pending(),"actual candidate renewal lost its paid progress opportunity");
+        assert_eq!(first_identity(),original,"renewal replaced the original captured first identity");
+        with(|_|{state(ID,STAMP,ExecutionState::Unknown);Ok(())}).unwrap();
+        assert!(baseline_activation_pending(),"old terminal receipt retired the actual renewal");
+        with(|_|{state(NEXT,PolicyStamp{version:43,..RENEW},ExecutionState::Applied);Ok(())}).unwrap();
+        assert!(baseline_activation_pending(),"wrong stamp retired the renewal");
+        with(|_|{state(NEXT,RENEW,ExecutionState::Unknown);Ok(())}).unwrap();
+        let later=ApplyId{plan_seq:53,..ID};let late=PolicyStamp{version:43,snapshot_ns:140_000_000,installed_until_ns:10_140_000_000};
+        with(|_|commit_at(late,later,Action::CpuWeight(2))).unwrap();
+        with(|_|{state(later,late,ExecutionState::Applied);Ok(())}).unwrap();
+        assert!(baseline_activation_pending(),"new publication replaced an unresolved renewal");
+        with(|_|{state(NEXT,RENEW,ExecutionState::Applied);Ok(())}).unwrap();
+        assert!(!baseline_activation_pending(),"terminal actual renewal retained priority");
+        with(|_|{state(NEXT,RENEW,ExecutionState::Unknown);Ok(())}).unwrap();assert!(!baseline_activation_pending());
+        with(|_|commit_at(late,later,Action::CpuWeight(2))).unwrap();assert!(baseline_activation_pending());
+        with(|_|{root_mut().token.as_mut().unwrap().id+=1;state(later,late,ExecutionState::Applied);Ok(())}).unwrap();
+        assert!(!baseline_activation_pending(),"new token inherited old renewal custody");
+        // An actual one-shot cannot acquire a second execution hint, even if a
+        // direct fixture call bypasses the separately tested publication gate.
+        reset();root_mut().request.as_mut().unwrap().family=Family{domain:14,kind:1};
+        with(|_|commit_at(STAMP,ID,Action::RecoveryRecipe(1))).unwrap();
+        with(|_|{state(ID,STAMP,ExecutionState::Applied);Ok(())}).unwrap();
+        with(|_|commit_at(RENEW,NEXT,Action::RecoveryRecipe(1))).unwrap();
+        assert!(!baseline_activation_pending(),"one-shot candidate acquired renewal progress");
+        println!("candidate renewal custody passed");
+    }
+
     pub fn publication_started(_:Token)->Result<bool,Error>{
         if root().fault==Some(Error::Busy){return Err(Error::Busy)}
         Ok(root().initial.is_some())
