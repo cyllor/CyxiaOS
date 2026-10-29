@@ -20,6 +20,10 @@ pub(crate) mod preparation_archive;
 pub fn baseline_activation_pending() -> bool {
     crate::domain_control::replay::baseline_activation_pending() || owner::drain_pending()
 }
+/// Scheduling reason for already-entered Drain only; this grants no authority.
+pub fn owned_drain_pending() -> bool {
+    owner::drain_pending()
+}
 pub use owner::{control_step, init, pause_for_peer, quiescent, service_io, service_step, status};
 pub(crate) const WORKSPACE_PEAK_BYTES: usize = owner::WORKSPACE_PEAK_BYTES;
 

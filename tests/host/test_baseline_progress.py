@@ -37,6 +37,9 @@ class BaselineProgress(unittest.TestCase):
             # root; only its namespace changes, not its deadline implementation.
             pieces.append(function(execution, signature).replace('super::deadline::','deadline::'))
         pieces.append('#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/deadline.rs'))+'] mod deadline;')
+        # The complete lifecycle path has its own real cleanup/Memory/Scheduler
+        # fixture. This older fixture covers replay and admission custody.
+        pieces.append('fn lifecycle_turn(_: &mut State) { panic!("lifecycle outside replay/admission fixture") }')
         if 'fn service_baseline_progress(' in execution:
             pieces.append(function(execution, 'pub fn service_baseline_progress('))
         else:
@@ -64,6 +67,7 @@ class BaselineProgress(unittest.TestCase):
         replay+='\n'+(flag[0] if flag else 'static DRAIN_PENDING:AtomicBool=AtomicBool::new(false);')+'\n'+projection+'\n'+pending
         facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
         reader=function(facade,'pub fn baseline_activation_pending(') if 'pub fn baseline_activation_pending(' in facade else 'pub fn baseline_activation_pending()->bool {HINT.load(Ordering::Acquire)}'
+        reader+='\npub fn owned_drain_pending()->bool {false}\n'
         template=template.replace('// REPLAY_HINT_READER',reader)
         template = template.replace('// REPLAY_BODIES', replay)
         with tempfile.TemporaryDirectory() as temporary:

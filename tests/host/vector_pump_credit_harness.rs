@@ -42,6 +42,7 @@ mod baseline_diagnostics {
 mod crate_stubs {
     pub fn service_io(_: &mut dyn FnMut()) {}
     pub fn baseline_activation_pending() -> bool { super::BASELINE_PENDING.load(super::Ordering::Acquire) }
+    pub fn owned_drain_pending() -> bool { false }
     pub fn service_step() -> Result<bool, super::Error> {
         super::locked(|s| { assert!(s.active.is_some()); Ok(()) }).unwrap();
         super::physical_work();
@@ -75,6 +76,7 @@ static mut STATE: Option<State> = None;
 fn advance_admission_bounded(_: &mut State, _: usize, _: usize) -> Result<(), Error> {
     panic!("queue admission is outside the vector fixture")
 }
+fn lifecycle_turn(_: &mut State) { panic!("lifecycle outside vector fixture") }
 fn locked<R>(body: impl FnOnce(&mut State) -> Result<R, Error>) -> Result<R, Error> {
     let permit = if GATE_MODE.load(Ordering::Acquire) {
         Some(owner_gate().try_acquire(0, NOW.load(Ordering::Acquire), 1_000_000)

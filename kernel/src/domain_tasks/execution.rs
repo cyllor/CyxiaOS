@@ -1093,33 +1093,7 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
             crate::unified::service_stage(10 + phase as u64);
             match phase {
                 0 => {
-                    // A completion cannot exist outside the currently owned
-                    // CPU layout: moves close admission and wait for quiescence
-                    // before changing these masks. Avoid 64 translated atomic
-                    // loads when this prototype owns only four CPUs.
-                    let mut owned = s.layout.healthy_mask;
-                    while owned != 0 {
-                        let slot = owned.trailing_zeros() as usize;
-                        owned &= owned - 1;
-                        if COMPLETE_READY[slot].load(Ordering::Acquire) {
-                            let _ = complete_locked(s, slot);
-                        }
-                    }
-                    // Expired blocked callers share the same bounded rotation
-                    // as real returns/receipts. Continuous activity from other
-                    // tasks cannot keep their deadline cleanup off the queue.
-                    let i = lifecycle::select::<TASKS>(s.lifecycle_cursor, now_ns(), |i| {
-                        lifecycle::View {
-                            occupied: !matches!(s.tasks[i].life, Life::Free | Life::Exiting),
-                            exiting: s.tasks[i].life == Life::Exiting,
-                            deadline_ns: s.tasks[i].deadline,
-                            return_pending: RETURN_PENDING[i].load(Ordering::Acquire),
-                            file_done: FILE_DONE[i].load(Ordering::Acquire),
-                            file_busy: FILE_BUSY[i].load(Ordering::Acquire),
-                        }
-                    });
-                    s.lifecycle_cursor = (i + 1) % TASKS;
-                    lifecycle_piece(s, i);
+                    lifecycle_turn(s);
                 }
                 1 => {
                     let _ = advance_admission_bounded(s, 1, 1);
@@ -1180,6 +1154,32 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     diagnostic_service_stage(73);
     crate::learning_replay::service_io(progress);
     diagnostic_service_stage(74);
+}
+/// Preserve the general owner's settlement order and fair single-item turn.
+/// Callers must already hold TaskGuard inside a live paid service piece.
+fn lifecycle_turn(s: &mut State) {
+    // A completion cannot exist outside the currently owned CPU layout: moves
+    // close admission and wait for quiescence before changing these masks.
+    let mut owned = s.layout.healthy_mask;
+    while owned != 0 {
+        let slot = owned.trailing_zeros() as usize;
+        owned &= owned - 1;
+        if COMPLETE_READY[slot].load(Ordering::Acquire) {
+            let _ = complete_locked(s, slot);
+        }
+    }
+    // The original rotating selector includes expired blocked callers and
+    // advances even when a particular cleanup must retain its resources.
+    let i = lifecycle::select::<TASKS>(s.lifecycle_cursor, now_ns(), |i| lifecycle::View {
+        occupied: !matches!(s.tasks[i].life, Life::Free | Life::Exiting),
+        exiting: s.tasks[i].life == Life::Exiting,
+        deadline_ns: s.tasks[i].deadline,
+        return_pending: RETURN_PENDING[i].load(Ordering::Acquire),
+        file_done: FILE_DONE[i].load(Ordering::Acquire),
+        file_busy: FILE_BUSY[i].load(Ordering::Acquire),
+    });
+    s.lifecycle_cursor = (i + 1) % TASKS;
+    lifecycle_piece(s, i);
 }
 fn lifecycle_piece(s: &mut State, i: usize) {
     #[cfg(not(test))]
@@ -1252,8 +1252,8 @@ fn service_baseline_activation() {
     service_baseline_activation_at(1);
 }
 /// Targeted opportunities after suspended I/O has submitted its old bill.
-/// No general task/file/storage/TCP pump is entered; one bounded admission may
-/// follow under separate fresh credit. No old reservation is reused.
+/// Bounded admission and owned-Drain lifecycle may each follow under separate
+/// fresh credit. No old reservation is reused or general I/O pump entered.
 pub fn service_baseline_progress() {
     if crate::learning_replay::baseline_activation_pending() {
         service_baseline_activation_at(2);
@@ -1298,7 +1298,7 @@ fn service_baseline_activation_at(site: u64) {
         // submitted its bill and released all owner borrows, offer one queued
         // construction a separate reservation. An unsettled prior bill or
         // insufficient fresh credit prevents this body from running. Keep the
-        // shared retry guard held across both pieces, including nested progress.
+        // shared retry guard held across all pieces, including nested progress.
         let root_ok = outcome.is_some_and(|result| result.is_ok());
         // Again can report a full launch cache or admission queue. Those
         // already-owned requests need independently paid progress even though
@@ -1331,6 +1331,18 @@ fn service_baseline_activation_at(site: u64) {
                 now_ns(),
             );
             let _ = admitted;
+        }
+        // Measurement delivery can require real task cleanup after Root has
+        // completed. Recheck that independent owned-Drain reason, then request
+        // another fresh reservation after both earlier pieces have returned.
+        // A retained old bill or denied credit prevents this body from running.
+        if (root_ok || root_again) && crate::learning_replay::owned_drain_pending() {
+            let _ = service_segment(|| {
+                locked(|s| {
+                    lifecycle_turn(s);
+                    Ok(())
+                })
+            });
         }
     }
 }
