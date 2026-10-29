@@ -2025,6 +2025,88 @@ impl PublicationScope for ActiveScope<'_> {
         Ok(())
     }
 }
+/// Resource queries for an ordinary Active publication may share one live
+/// task-owner borrow. Model/Root authority stays with the original scope.
+struct ActivePublication<'a> {
+    active: ActiveScope<'a>,
+    task_publication: Option<crate::domain_tasks::SchedulerPublication>,
+}
+impl PublicationScope for ActivePublication<'_> {
+    fn authorize(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.active.authorize(active, set, at)
+    }
+    fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => {
+                task.validate(action, target, at)
+            }
+            Some(_) => Err(Error::Unsupported),
+            None => self.active.legal(f, action, target, at),
+        }
+    }
+    fn dependencies(
+        &self,
+        owner: &Owner,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<[Option<BoundDependency>; 2], Error> {
+        let Some(task) = self.task_publication.as_ref() else {
+            return self.active.dependencies(owner, action, target, at);
+        };
+        if !matches!(action, Action::CpuWeight(_)) || owner.dependency_binders[0].is_some() {
+            return Err(Error::Unsupported);
+        }
+        // This borrow implements the registered native D13 -> D01 contract.
+        // A custom binder must use its original unborrowed path instead.
+        owner.dependencies[0].ok_or(Error::NotReady)?;
+        bind_dependency_list(
+            owner,
+            action,
+            at,
+            task.prerequisites(action, target)?,
+            |f, key| task.current(f.domain, key),
+            |_, value, key| task.validate(value, key, at),
+        )
+    }
+    fn selection(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<(), Error> {
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with(
+                owner,
+                action,
+                target,
+                at,
+                || task.current(action.domain(), target),
+                |options, output| task.legal_options(options, target, at, output),
+            ),
+            Some(_) => Err(Error::Unsupported),
+            None => self.active.selection(owner, f, action, target, at),
+        }
+    }
+    fn commit(
+        &mut self,
+        owner: &Owner,
+        model: ModelBinding,
+        plan: &Plan,
+        stamps: &[PolicyStamp],
+        boot: u64,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.active.commit(owner, model, plan, stamps, boot, at)
+    }
+}
 struct Executor<'a, S: PublicationScope> {
     owner: &'a mut Owner,
     scope: S,

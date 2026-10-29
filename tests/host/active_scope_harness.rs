@@ -3,7 +3,8 @@
 mod active_scope_fixture {
  use super::*;
  use policy::{BoundDependency,Prerequisite,ModelBinding,RegisteredSet};
- use cyxia_prototype::domains::PolicyStamp;
+ use cyxia_prototype::domains::{PolicyStamp,POLICY_NS};
+ use cyxia_prototype::policy_wire::{Envelope,encode_plan,decode_plan,MAX_PLAN_BYTES};
  use cyxia_prototype::{policy_wire::{Plan,Decision,PlanHeader},learning::governance::CommitGate};
  #[derive(Clone,Copy)]struct Family{domain:u16,kind:u16,current:fn(u16,u16,ObjectKey)->Result<Action,Error>,legal:fn(Action,ObjectKey,u64)->Result<(),Error>,legal_options:fn(&[Option<Action>],ObjectKey,u64,&mut[Option<Action>])->Result<usize,Error>}
  struct Context{control_mask:u64,healthy_mask:u64,draining_mask:u64}
@@ -21,6 +22,12 @@ mod active_scope_fixture {
  // ACTUAL_ACTIVE_PUBLICATION
  fn binding()->ModelBinding{ModelBinding{generation:1,model_hash:[1;32],schema_hash:[2;32]}}
  fn gate()->CommitGate{CommitGate::new(1,binding()).unwrap()}
+ fn plan(target:ObjectKey)->Plan{let set=policy::CandidateSet::new(policy::Snapshot{sequence:1,taken_ns:now_ns(),core_generation:4,ledger_generation:3},target,binding(),&[policy::Candidate{action:Action::CpuWeight(1),features:cyxia_prototype::features::RawFeatures::default()},policy::Candidate{action:Action::CpuWeight(2),features:cyxia_prototype::features::RawFeatures::default()}],Some(Action::CpuWeight(1))).unwrap();let header=PlanHeader{plan_seq:1,base_plan_version:0,active_model_generation:1,controller_epoch:1,snapshot_seq:1,active_until_local_ns:now_ns()+POLICY_NS};let decision=Decision{action:Action::CpuWeight(2),candidate_index:1,envelope:Envelope{controller_epoch:1,decision_seq:1,snapshot_seq:1,target,ledger_generation:3,core_generation:4,expires_local_ns:now_ns()+WINDOW_NS,model_hash:binding().model_hash,candidate_set_hash:set.hash()}};let mut wire=[0;MAX_PLAN_BYTES];let n=encode_plan(header,&[decision],&mut wire).unwrap();decode_plan(&wire[..n]).unwrap()}
+ #[test]fn active_scope_commit_keeps_original_root_and_model_gates(){
+  fixture();ALLOW_ROOT.store(true,Ordering::Release);let owner=owner(key(15));let gate=gate();let view=reserve_scheduler_publication(Action::CpuWeight(2)).unwrap().unwrap();let mut scope=// ACTIVE_PUBLICATION_CONSTRUCTOR
+  ;let plan=plan(key(15));assert_eq!(scope.commit(&owner,binding(),&plan,&[],1,now_ns()),Ok(()));let wrong=ModelBinding{generation:2,..binding()};assert_eq!(scope.commit(&owner,wrong,&plan,&[],1,now_ns()),Err(Error::Busy),"Active borrow bypassed actual model gate");ALLOW_ROOT.store(false,Ordering::Release);assert_eq!(scope.commit(&owner,binding(),&plan,&[],1,now_ns()),Err(Error::Busy),"Active borrow bypassed original Root allowance");ALLOW_ROOT.store(true,Ordering::Release);assert_eq!(scope.authorize_recovery(binding(),&plan,now_ns()),Err(Error::Budget));drop(scope);
+ }
+
  #[test]fn active_scope_borrow_retains_legality_selection_and_real_dependency_version(){
   fixture();ALLOW_ROOT.store(true,Ordering::Release);let owner=owner(key(15));let gate=gate();let view=reserve_scheduler_publication(Action::CpuWeight(2)).unwrap().unwrap();let scope=// ACTIVE_PUBLICATION_CONSTRUCTOR
   ;
@@ -38,6 +45,7 @@ mod active_scope_fixture {
  }
  #[test]fn active_scope_requires_registered_dependency_contract_and_control_role(){
   fixture();let mut owner=owner(key(15));let gate=gate();let view=reserve_scheduler_publication(Action::CpuWeight(2)).unwrap().unwrap();let scope=// ACTIVE_PUBLICATION_CONSTRUCTOR
-  ;owner.dependencies[0]=None;assert_eq!(scope.dependencies(&owner,Action::CpuWeight(2),key(15),now_ns()),Err(Error::NotReady),"Active scope silently replaced missing registered dependency");owner.context.control_mask=0;assert_eq!(scope.authorize_executor(&owner),Err(Error::Auth));drop(scope);
+  ;owner.dependencies[0]=None;assert_eq!(scope.dependencies(&owner,Action::CpuWeight(2),key(15),now_ns()),Err(Error::NotReady),"Active scope silently replaced missing registered dependency");owner.dependencies[0]=Some(|target|locked(|s|scheduling_dependencies_locked(s,target)));owner.dependency_binders[0]=Some(|_,_|Ok([None;2]));assert_eq!(scope.dependencies(&owner,Action::CpuWeight(2),key(15),now_ns()),Err(Error::Unsupported),"borrow silently bypassed a custom binder");owner.context.control_mask=0;assert_eq!(scope.authorize_executor(&owner),Err(Error::Auth));drop(scope);let unborrowed=// ACTIVE_PUBLICATION_NONE_CONSTRUCTOR
+ ;assert_eq!(unborrowed.dependencies(&owner,Action::CpuWeight(2),key(15),now_ns()),Ok([None;2]));
  }
 }

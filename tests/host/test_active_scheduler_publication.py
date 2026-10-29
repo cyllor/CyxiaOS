@@ -35,11 +35,12 @@ def program():
  active='\n'.join(function(control,x) for x in ['trait PublicationScope','impl PublicationScope for ActiveScope'])
  active="struct ActiveScope<'a>(&'a CommitGate);\n"+active
  scope=scope.replace('// ACTUAL_ACTIVE_SCOPE',active)
- publication='';constructor='ActiveScope(&gate)'
+ publication='';constructor='ActiveScope(&gate)';none_constructor='ActiveScope(&gate)'
  if 'struct ActivePublication' in control:
   publication='\n'.join(function(control,x) for x in ["struct ActivePublication<'",'impl PublicationScope for ActivePublication'])
   constructor='ActivePublication{active:ActiveScope(&gate),task_publication:Some(view)}'
- scope=scope.replace('// ACTUAL_ACTIVE_PUBLICATION',publication).replace('// ACTIVE_PUBLICATION_CONSTRUCTOR',constructor)
+  none_constructor='ActivePublication{active:ActiveScope(&gate),task_publication:None}'
+ scope=scope.replace('// ACTUAL_ACTIVE_PUBLICATION',publication).replace('// ACTIVE_PUBLICATION_CONSTRUCTOR',constructor).replace('// ACTIVE_PUBLICATION_NONE_CONSTRUCTOR',none_constructor)
  return code+'\n'+scope
 
 class ActiveSchedulerPublication(unittest.TestCase):
@@ -74,7 +75,18 @@ class ActiveSchedulerPublication(unittest.TestCase):
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_active_scope_keeps_dependency_admission_under_one_borrow(self):
   with tempfile.TemporaryDirectory() as tmp:
-   d=Path(tmp);(d/'harness.rs').write_text(program());(d/'Cargo.toml').write_text('[package]\nname="active-publication-scope"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
+   d=Path(tmp);code=program();(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="active-publication-scope"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-active-publication-scope'),'--','--test-threads=1','active_scope_']
-   r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('3 passed; 0 failed',r.stdout)
+   r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('4 passed; 0 failed',r.stdout)
+   mutants=[
+    ('task.validate(action, target, at)','self.active.legal(f, action, target, at)','Active scope legal did not use'),
+    ('|| task.current(action.domain(), target)','|| (f.current)(action.domain(),action.kind(),target)','Active scope selection reentered'),
+    ('task.prerequisites(action, target)?','[None;2]','Active scope dropped or reacquired registered dependency'),
+    ('owner.dependencies[0].ok_or(Error::NotReady)?;','','Active scope silently replaced missing registered dependency'),
+    ('let version = admit_dependency(prerequisite, action.domain(), at)?;','let version=0;','Active scope dropped or reacquired registered dependency'),
+    ('self.active.commit(owner, model, plan, stamps, boot, at)','Ok(())','Active borrow bypassed actual model gate'),
+   ]
+   for old,new,message in mutants:
+    self.assertTrue(old in code,'missing mutation anchor: '+old);(d/'harness.rs').write_text(code.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
 if __name__=='__main__':unittest.main()
