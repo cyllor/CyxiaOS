@@ -29,7 +29,7 @@ mod spawn_diagnostics;
 mod vector_diagnostics;
 pub(crate) use publication::{
     BaselinePublication, SchedulerPublication, reserve_baseline_publication,
-    reserve_scheduler_publication,
+    reserve_scheduler_publication, scheduler_publication_matches,
 };
 #[path = "domain_tasks/local_evidence.rs"]
 mod local_evidence;

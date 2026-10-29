@@ -926,6 +926,10 @@ pub fn publish_canary(
             job: job.sequence,
             boot: state.boot,
             publication_started,
+            publication_debit: policy::CpuTime {
+                cpu: publication_started.cpu.cpu,
+                ns: 0,
+            },
             wall_deadline: deadline,
             dependencies: job.dependencies,
             scores,
@@ -1331,6 +1335,10 @@ pub fn restore(governance: &mut Governance<'_, '_>) -> Result<ExecutionState, Er
             job: sequence,
             boot: state.boot,
             publication_started,
+            publication_debit: policy::CpuTime {
+                cpu: publication_started.cpu.cpu,
+                ns: 0,
+            },
             wall_deadline: started.checked_add(50_000_000).ok_or(Error::Numeric)?,
             dependencies,
             scores: [0; 32],

@@ -331,6 +331,7 @@ struct Job {
     base_version: u64,
     started: u64,
     encode_ns: u64,
+    publication_debit: policy::CpuTime,
     evidence: Option<usize>,
     dependencies: [Option<BoundDependency>; 2],
     work: Option<core_replay::WorkId>,
@@ -1910,6 +1911,10 @@ fn encode_job_inner(
         base_version: s.registry.version(),
         started: snapshot.taken_ns,
         encode_ns,
+        publication_debit: policy::CpuTime {
+            cpu: cyxia_arch_aarch64::cpu::slot(),
+            ns: 0,
+        },
         evidence,
         dependencies,
         work,
@@ -2115,6 +2120,7 @@ struct Executor<'a, S: PublicationScope> {
     job: u64,
     boot: u64,
     publication_started: policy::PublicationTime,
+    publication_debit: policy::CpuTime,
     wall_deadline: u64,
     dependencies: [Option<BoundDependency>; 2],
     scores: [i16; 32],
@@ -2313,7 +2319,11 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                 return Err(Error::Expired);
             }
             self.provenance.at(submission::Stage::CommitCpu);
-            policy::publication_budget(self.publication_started, commit)?;
+            policy::PublicationBudget {
+                started: self.publication_started,
+                carried: self.publication_debit,
+            }
+            .check(commit)?;
             self.provenance.at(submission::Stage::ModelHash);
             for d in plan.iter() {
                 if d.envelope.model_hash != self.model.model_hash
@@ -2429,14 +2439,19 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         // disjoint evidence intervals below still charge actual execution once.
         let publication_started = policy::Clock::read(&mut NativeClock);
         let wall_begin = publication_started.wall_ns;
-        let decode_cpu_started = timer::cpu_ticks();
+        let budget = policy::PublicationBudget {
+            started: publication_started,
+            carried: job.publication_debit,
+        };
+        let mut decode_cpu_started = None;
+        let mut task_publication = None;
+        let mut acquisition_busy = false;
+        let mut registry_completed = false;
         const _: () = assert!(cfg!(target_endian = "little"));
         let bytes = unsafe { &*((output as *const [u64; 512]).cast::<[u8; 4096]>()) };
-        let output_hash = cyxia_arch_aarch64::sha256::digest_page(bytes)
-            .unwrap_or_else(|| Sha256::digest(bytes).into());
+        let mut output_hash = None;
         let mut selected = u64::MAX;
         let mut decoded_ns = None;
-        let mut publication_cpu_started = None;
         let mut provenance = submission::Facts::new(
             job.sequence,
             job.read_only,
@@ -2448,7 +2463,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             ],
             job.evidence.is_some(),
         );
-        let result = (|| {
+        let mut result = (|| {
             if wall_begin < job.started
                 || wall_begin - job.started > 50_000_000
                 || cpu_ns.checked_add(job.encode_ns).ok_or(Error::Overflow)? > 2_000_000
@@ -2461,6 +2476,41 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             {
                 return Err(Error::Stale);
             }
+            if !job.read_only {
+                budget.check(publication_started)?;
+                // Eligibility is the exact native registration contract, not
+                // the mere presence of a dependency resolver.
+                if (0..job.set.len()).all(|i| {
+                    job.set
+                        .get(i)
+                        .is_some_and(|candidate| matches!(candidate.action, Action::CpuWeight(_)))
+                }) {
+                    let consumer = s.owner.families[family_index(1, 1)?].ok_or(Error::NotReady)?;
+                    let prerequisite = s.owner.families[family_index(13, 1)?].as_ref();
+                    if crate::domain_tasks::scheduler_publication_matches(
+                        &consumer,
+                        prerequisite,
+                        s.owner.dependencies[0],
+                        s.owner.dependency_binders[0].is_some(),
+                    ) {
+                        match crate::domain_tasks::reserve_scheduler_publication(
+                            job.set.get(0).ok_or(Error::NotReady)?.action,
+                        ) {
+                            Ok(view) => task_publication = view,
+                            Err(Error::Busy) => {
+                                acquisition_busy = true;
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+            decode_cpu_started = Some(timer::cpu_ticks());
+            output_hash = Some(
+                cyxia_arch_aarch64::sha256::digest_page(bytes)
+                    .unwrap_or_else(|| Sha256::digest(bytes).into()),
+            );
             provenance.accept(submission::AcceptStage::Verify);
             let reply = reply::verify(
                 reply::Expected {
@@ -2475,7 +2525,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 output,
             )?;
             selected = reply.selected as u64;
-            let decoding = timer::cpu_elapsed_ns(decode_cpu_started);
+            let decoding = timer::cpu_elapsed_ns(decode_cpu_started.ok_or(Error::NotReady)?);
             decoded_ns = Some(decoding);
             provenance.accept(submission::AcceptStage::DecodeBudget);
             if cpu_ns
@@ -2486,7 +2536,6 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             {
                 return Err(Error::Budget);
             }
-            publication_cpu_started = Some(timer::cpu_ticks());
             if job.read_only {
                 // A read-only work ticket is root-owned. Even a byte-perfect
                 // Plan is only checked here; it never reaches publication.
@@ -2509,12 +2558,16 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             provenance.accept(submission::AcceptStage::Executor);
             let mut executor = Executor {
                 owner: &mut s.owner,
-                scope: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
+                scope: ActivePublication {
+                    active: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
+                    task_publication: task_publication.take(),
+                },
                 model: job.set.model,
                 evidence: job.evidence,
                 job: job.sequence,
                 boot: s.boot,
                 publication_started,
+                publication_debit: job.publication_debit,
                 wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 dependencies: job.dependencies,
                 scores: reply.scores,
@@ -2522,16 +2575,18 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 provenance,
             };
             executor.provenance.accept(submission::AcceptStage::Submit);
-            let submitted = s.registry.submit_job(
+            let submitted = s.registry.submit_job_debited(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],
-                publication_started,
+                budget,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut NativeClock,
                 &mut executor,
             );
             provenance = executor.provenance;
+            drop(executor);
             let receipt = submitted?;
+            registry_completed = true;
             provenance.accept(submission::AcceptStage::Receipt);
             if receipt.version == 0 {
                 return Err(match receipt.state() {
@@ -2541,20 +2596,76 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             }
             Ok(receipt.version)
         })();
-        let publication_ns = publication_cpu_started
-            .map(timer::cpu_elapsed_ns)
-            .unwrap_or(0);
-        let registry_stopped = s.registry.optimization_stopped();
-        if !job.read_only && publication_ns > policy::PUBLICATION_BUDGET_NS {
-            s.registry.stop_optimization();
+        // No task-owner borrow may survive into Root/work delivery. The
+        // functional final sample includes the actual release CPU as well.
+        drop(task_publication);
+        if acquisition_busy {
+            let observed = policy::Clock::read(&mut NativeClock);
+            let retry = budget.check(observed).and_then(|()| {
+                if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                    Err(Error::Expired)
+                } else {
+                    Ok(())
+                }
+            });
+            match retry {
+                Ok(()) => {
+                    job.publication_debit.ns = budget
+                        .carried
+                        .ns
+                        .checked_add(publication_started.cpu_elapsed(observed)?)
+                        .ok_or(Error::Overflow)?;
+                    s.job = Some(job);
+                    return Err(Error::Busy);
+                }
+                Err(error) => result = Err(error),
+            }
         }
-        let decoding = decoded_ns.unwrap_or_else(|| timer::cpu_elapsed_ns(decode_cpu_started));
+        // Terminal preflight errors still retain the stopped output hash.
+        let output_hash = output_hash.unwrap_or_else(|| {
+            decode_cpu_started = Some(timer::cpu_ticks());
+            cyxia_arch_aarch64::sha256::digest_page(bytes)
+                .unwrap_or_else(|| Sha256::digest(bytes).into())
+        });
+        let decoding = decoded_ns
+            .unwrap_or_else(|| decode_cpu_started.map(timer::cpu_elapsed_ns).unwrap_or(0));
+        let observed = policy::Clock::read(&mut NativeClock);
+        let elapsed = publication_started
+            .cpu_elapsed(observed)
+            .and_then(|elapsed| {
+                elapsed
+                    .checked_add(job.publication_debit.ns)
+                    .ok_or(Error::Overflow)
+            });
+        // Decode and publication evidence are disjoint; the functional 500 us
+        // cap intentionally includes both plus every earlier failed preflight.
+        let publication_ns = elapsed
+            .and_then(|elapsed| elapsed.checked_sub(decoding).ok_or(Error::Range))
+            .unwrap_or(u64::MAX);
+        let registry_stopped = s.registry.optimization_stopped();
+        let cap = budget.check(observed).and_then(|()| {
+            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                Err(Error::Expired)
+            } else {
+                Ok(())
+            }
+        });
+        let local_stop = !job.read_only
+            && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
+                || cap.is_err());
+        if local_stop {
+            s.registry.stop_optimization();
+            // Completed Registry receipts retain their original outcome,
+            // including version-zero refusals. Pre-submission cap failures
+            // still terminate this Job without creating a Registry identity.
+            if !registry_completed && let Err(error) = cap {
+                result = Err(error);
+            }
+        }
         if !optimization_was_stopped && s.registry.optimization_stopped() {
             let sum = decoding.checked_add(publication_ns);
             crate::domain_evidence::optimization_stop([
-                u64::from(registry_stopped)
-                    | (u64::from(!job.read_only && publication_ns > policy::PUBLICATION_BUDGET_NS)
-                        << 1),
+                u64::from(registry_stopped) | (u64::from(local_stop) << 1),
                 wall_begin,
                 s.boot,
                 job.controller,
@@ -2656,7 +2767,7 @@ pub fn abort(cpu_ns: u64) -> Result<(), Error> {
                     result: Err(Error::Expired),
                     selected: u64::MAX,
                     decoded_ns: 0,
-                    elapsed_ns: 0,
+                    elapsed_ns: job.publication_debit.ns,
                     cpu_ns,
                     output_hash: [0; 32],
                     aborted: true,

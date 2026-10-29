@@ -2524,6 +2524,10 @@ fn publish_value_traced(
         job: sequence,
         boot: s.boot,
         publication_started,
+        publication_debit: policy::CpuTime {
+            cpu: publication_started.cpu.cpu,
+            ns: 0,
+        },
         wall_deadline: at.checked_add(50_000_000).ok_or(Error::Overflow)?,
         dependencies,
         scores: [0; 32],

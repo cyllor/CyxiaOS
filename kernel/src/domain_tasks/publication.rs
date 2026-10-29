@@ -88,11 +88,57 @@ impl BaselinePublication {
 /// Ordinary C publication pins one immutable task-owner view. This supplies
 /// no baseline, recovery or model authority; the Active executor keeps those
 /// original checks and its complete ordinary selection algorithm.
+///
+/// Eligibility is checked separately before acquiring the task-owner gate.
 pub(crate) struct SchedulerPublication {
     state: &'static State,
     cpu: usize,
     _guard: Guard,
     _local: core::marker::PhantomData<*mut ()>,
+}
+
+/// Recognize the boot-fixed native registration before replacing its queries
+/// with a task-owner borrow. Like register/register_dependencies, this compares
+/// function identity, never inferred callback behavior. It reads no task state,
+/// takes no gate and calls neither callbacks nor Clock.
+pub(crate) fn scheduler_publication_matches(
+    consumer: &crate::domain_control::Family,
+    prerequisite: Option<&crate::domain_control::Family>,
+    resolver: Option<
+        fn(ObjectKey) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error>,
+    >,
+    has_custom_binder: bool,
+) -> bool {
+    if has_custom_binder {
+        return false;
+    }
+    native_scheduler_family_matches(consumer, 1)
+        && match prerequisite {
+            Some(prerequisite) => native_scheduler_family_matches(prerequisite, 13),
+            None => false,
+        }
+        && match resolver {
+            Some(resolver) => {
+                core::ptr::fn_addr_eq(resolver, scheduling_dependencies as fn(_) -> _)
+            }
+            None => false,
+        }
+}
+
+fn native_scheduler_family_matches(family: &crate::domain_control::Family, domain: u16) -> bool {
+    // These are all named entries from register_control, including every query
+    // replaced by SchedulerPublication. The anonymous observe adapter is not
+    // replaced; it remains on the original observation path.
+    family.domain == domain
+        && family.kind == 1
+        && family.target_source == crate::domain_control::TargetSource::Tasks
+        && core::ptr::fn_addr_eq(family.target, control_target as fn(_, _, _) -> _)
+        && core::ptr::fn_addr_eq(family.current, control_current as fn(_, _, _) -> _)
+        && core::ptr::fn_addr_eq(family.legal, validate_action as fn(_, _, _) -> _)
+        && core::ptr::fn_addr_eq(family.legal_options, legal_options as fn(_, _, _, _) -> _)
+        && core::ptr::fn_addr_eq(family.target_features, control_features as fn(_, _) -> _)
+        && core::ptr::fn_addr_eq(family.apply, control_apply as fn(_, _, _, _) -> _)
+        && core::ptr::fn_addr_eq(family.reconcile, control_reconcile as fn(_, _, _, _) -> _)
 }
 
 pub(crate) fn reserve_scheduler_publication(
