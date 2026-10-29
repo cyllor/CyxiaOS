@@ -16,7 +16,7 @@ fn key(id:u64)->ObjectKey{ObjectKey{id,generation:1}}
 #[derive(Clone,Copy)]struct Family{domain:u16,kind:u16,target_source:()}
 struct Context{core_generation:u64,ledger_generation:u64}
 struct Owner{context:Context,families:[Option<Family>;18]}
-struct Registry;impl Registry{fn model(&self)->ModelBinding{ModelBinding::default()}}
+struct Registry{model:ModelBinding}impl Registry{fn model(&self)->ModelBinding{self.model}}
 struct Gate;impl Gate{fn check_active_publication(&self,_:ModelBinding,_:ObjectKey)->Result<(),Error>{if MODE.load(Ordering::Acquire)==1{Err(Error::Busy)}else{Ok(())}}}
 struct State{boot:u64,sequence:u64,preparation:Option<preparation::Pending>,owner:Owner,registry:Registry,model_gate:Option<Gate>,family_cursor:usize,due:[u64;18],cursor:[usize;18],job:bool}
 mod target_batch{pub struct Query;impl Query{pub fn fallback(_:u16,_:u16,_:usize)->Self{Self}pub fn exact(_:u16,_:u16,_:usize)->Self{Self}}}
@@ -54,9 +54,9 @@ mod replay{
  // ACTUAL_ROOT_FUNCTIONS
  pub fn reset(){let r=root_mut();r.token=Some(Token{id:1,boot_epoch:1,owner:key(7)});r.request=Some(Request{family:LearningFamily{domain:1,kind:1},target:key(12),kind:TrialKind::Candidate,baseline:Action::CpuWeight(1),not_before_ns:0,owner:key(7),on_first:|_,_|if MODE.load(Ordering::Acquire)==2{Err(Error::Busy)}else{Ok(())}});r.phase=Phase::Running;r.first=None;r.first_ready=false;r.initial=None;r.fault=None;r.registered=[Some(Checks{owner:key(7),before_first:|_,_|if MODE.load(Ordering::Acquire)==3{Err(Error::Busy)}else{Ok(())}})];}
  pub fn first_snapshot()->Option<Snapshot>{root().first}pub fn error()->Option<Error>{root().fault}
- pub fn change(mode:u64){let r=root_mut();match mode{1=>r.request.as_mut().unwrap().kind=TrialKind::Baseline,2=>r.initial=Some(ApplyId::default()),3=>r.token.as_mut().unwrap().boot_epoch=2,4=>r.request.as_mut().unwrap().target.generation=2,5=>r.request.as_mut().unwrap().not_before_ns=now()+1_000_000_000,6=>r.phase=Phase::Faulted,_=>()}}
+ pub fn change(mode:u64){let r=root_mut();match mode{1=>r.request.as_mut().unwrap().kind=TrialKind::Baseline,2=>r.initial=Some(ApplyId::default()),3=>r.token.as_mut().unwrap().boot_epoch=2,4=>r.request.as_mut().unwrap().target.generation=2,5=>r.request.as_mut().unwrap().not_before_ns=now()+1_000_000_000,6=>r.phase=Phase::Faulted,7=>r.first=Some(Snapshot{sequence:41,taken_ns:99_000_000,core_generation:2,ledger_generation:3}),_=>()}}
 }
-fn fixture(mode:u64)->State{NOW.store(100_000_000,Ordering::Release);ELAPSED.store(11,Ordering::Release);MODE.store(mode,Ordering::Release);BLOCKED.store(0,Ordering::Release);replay::reset();unsafe{PREPARATION_REJECTIONS=preparation::Rejections::new()};State{boot:1,sequence:40,preparation:None,owner:Owner{context:Context{core_generation:2,ledger_generation:3},families:core::array::from_fn(|i|(i==0).then_some(Family{domain:1,kind:1,target_source:()}))},registry:Registry,model_gate:Some(Gate),family_cursor:0,due:[0;18],cursor:[0;18],job:false}}
+fn fixture(mode:u64)->State{NOW.store(100_000_000,Ordering::Release);ELAPSED.store(11,Ordering::Release);MODE.store(mode,Ordering::Release);BLOCKED.store(0,Ordering::Release);replay::reset();unsafe{PREPARATION_REJECTIONS=preparation::Rejections::new()};State{boot:1,sequence:40,preparation:None,owner:Owner{context:Context{core_generation:2,ledger_generation:3},families:core::array::from_fn(|i|(i==0).then_some(Family{domain:1,kind:1,target_source:()}))},registry:Registry{model:ModelBinding::default()},model_gate:Some(Gate),family_cursor:0,due:[0;18],cursor:[0;18],job:false}}
 fn step(s:&mut State)->Result<bool,Error>{next_locked(s,1,None,now(),0,&mut[0;512])}
 #[test]fn first_preparation_custody_precedes_capture_callback_and_model_refusal(){
  for mode in [1,2,3,4]{let mut s=fixture(mode);let _=step(&mut s);let pending=s.preparation.expect("first preparation escaped without custody");assert_eq!(s.sequence,41);assert_eq!(pending.snapshot.sequence,41);assert_eq!(pending.snapshot.taken_ns,100_000_000);assert!(!s.job);assert_eq!(replay::first_snapshot().is_some(),mode!=3);
@@ -67,8 +67,19 @@ fn step(s:&mut State)->Result<bool,Error>{next_locked(s,1,None,now(),0,&mut[0;51
  for cpu_overrun in [false,true]{let mut s=fixture(4);let _=step(&mut s);let p=s.preparation.expect("first preparation escaped without custody");s.owner.context.ledger_generation+=1;NOW.store(150_000_001,Ordering::Release);if cpu_overrun{ELAPSED.store(2_000_001,Ordering::Release)}let error=if cpu_overrun{Error::Budget}else{Error::Stale};assert_eq!(step(&mut s),Err(error));assert_eq!(replay::error(),Some(error));assert_eq!(replay::first_snapshot(),Some(p.snapshot));assert!(!s.job);assert!(s.preparation.is_none());}
 }
 #[test]fn first_preparation_custody_scope_excludes_baseline_published_foreign_and_not_before(){
- for change in 1..=6{let mut s=fixture(4);replay::change(change);let _=step(&mut s);assert!(s.preparation.is_none(),"foreign first acquired custody: {change}");assert_eq!(s.sequence,40);}
+ for change in 1..=7{let mut s=fixture(4);replay::change(change);assert!(!replay::first_preparation(1,Snapshot{sequence:41,taken_ns:now(),core_generation:2,ledger_generation:3},1,1,key(12)),"foreign first predicate accepted: {change}");let _=step(&mut s);assert!(s.preparation.is_none(),"foreign first acquired custody: {change}");assert_eq!(s.sequence,40);}
 }
 #[test]fn first_preparation_custody_success_carries_once_and_clears_before_outer_debit(){
  let mut s=fixture(4);let _=step(&mut s);let original=s.preparation.expect("first preparation escaped without custody");MODE.store(0,Ordering::Release);NOW.fetch_add(1,Ordering::AcqRel);assert_eq!(step(&mut s),Ok(true));assert!(s.job);assert!(s.preparation.is_none());assert_eq!(s.sequence,41);assert_eq!(replay::first_snapshot(),Some(original.snapshot));assert_eq!(replay::error(),None);
+}
+
+#[test]fn first_preparation_custody_before_capture_expiration_is_not_a_fabricated_root_first(){
+ let mut s=fixture(3);let _=step(&mut s);let pending=s.preparation.unwrap();assert_eq!(replay::first_snapshot(),None);
+ NOW.store(150_000_001,Ordering::Release);BLOCKED.store(1,Ordering::Release);assert_eq!(step(&mut s),Err(Error::Expired));assert_eq!(replay::first_snapshot(),None);assert_eq!(replay::error(),None);assert!(s.preparation.is_none());
+ let journal=unsafe{&*core::ptr::addr_of!(PREPARATION_REJECTIONS)};assert_eq!(journal.total,1);let rejected=journal.rows[0].unwrap();assert_eq!(rejected.pending.snapshot,pending.snapshot);assert_eq!(rejected.reason,Error::Expired);assert!(rejected.pending.is_first_candidate());
+}
+#[test]fn first_preparation_custody_leaves_ordinary_and_readonly_blocked_pending_behavior_unchanged(){
+ for readonly in [false,true]{let mut s=fixture(4);let identity=preparation::Identity{boot:1,controller:1,sequence:41,domain:1,kind:1,target:key(12),model:s.registry.model(),core_generation:2,ledger_generation:3,work:readonly.then_some([1;4])};
+  s.preparation=Some(preparation::Pending::new(identity,Snapshot{sequence:41,taken_ns:100_000_000,core_generation:2,ledger_generation:3},0,0));s.sequence=41;BLOCKED.store(1,Ordering::Release);NOW.store(150_000_001,Ordering::Release);assert_eq!(step(&mut s),Ok(false));assert!(!s.preparation.unwrap().is_first_candidate());assert_eq!(replay::error(),None);}
+ let mut s=fixture(4);let _=step(&mut s);s.registry.model.generation+=1;NOW.fetch_add(1,Ordering::AcqRel);assert_eq!(step(&mut s),Err(Error::Stale));assert_eq!(replay::error(),Some(Error::Stale));assert!(!s.job);
 }

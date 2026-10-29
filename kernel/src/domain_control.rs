@@ -1111,12 +1111,21 @@ fn next_locked(
         // accounting remains with the original paid Measurement, exactly once.
         let at = now();
         let debit = pending.charge(timer::cpu_elapsed_ns(cpu_started));
-        let terminal = debit.err().or_else(|| match &result {
-            Err(error) if !matches!(error, Error::Busy | Error::Again | Error::NotReady) => {
-                Some(*error)
-            }
-            _ => None,
-        });
+        let terminal = debit
+            .err()
+            .or_else(|| match &result {
+                Err(error) if !matches!(error, Error::Busy | Error::Again | Error::NotReady) => {
+                    Some(*error)
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                if pending.is_first_candidate() {
+                    pending.check(pending.identity, at).err()
+                } else {
+                    None
+                }
+            });
         if let Some(error) = terminal {
             retire_preparation(s, error, at)?;
             return Err(error);
@@ -1381,6 +1390,18 @@ fn next_normal(
         preparation_prefix_detail(3);
         let replay_snapshot = preparation_snapshot(s, preparation_identity, fresh_snapshot)?;
         preparation_prefix_detail(4);
+        if s.preparation.is_none()
+            && replay::first_preparation(s.boot, replay_snapshot, f.domain, f.kind, target)
+        {
+            preparation::next_sequence(s.sequence, preparation_identity)?;
+            s.sequence = preparation_identity.sequence;
+            s.preparation = Some(preparation::Pending::first_candidate(
+                preparation_identity,
+                replay_snapshot,
+                index,
+                ordinal,
+            ));
+        }
         let (replay_snapshot, _replay_prefix) =
             match replay::first(replay_snapshot, f.domain, f.kind, target) {
                 Ok(v) => v,

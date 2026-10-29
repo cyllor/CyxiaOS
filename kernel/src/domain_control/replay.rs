@@ -1528,6 +1528,29 @@ fn activate(token: Token, q: Request, snapshot: Snapshot) -> Result<Prefix, Erro
     // preparation until CPU0 has actually completed all owner activations.
     Ok(prefix)
 }
+/// Only this candidate's first unpublished attempt owns a fixed preparation
+/// before capture callbacks can freeze its snapshot or return a retry.
+/// Legitimate one-shot prewarming waits have not started that attempt yet.
+pub(super) fn first_preparation(
+    boot: u64,
+    snapshot: Snapshot,
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+) -> bool {
+    let r = root();
+    r.phase == Phase::Running
+        && r.fault.is_none()
+        && r.initial.is_none()
+        && r.token.is_some_and(|token| token.boot_epoch == boot)
+        && r.first.is_none_or(|first| first == snapshot)
+        && r.request.is_some_and(|q| {
+            q.kind == TrialKind::Candidate
+                && q.family == (LearningFamily { domain, kind })
+                && q.target == target
+                && snapshot.taken_ns >= q.not_before_ns
+        })
+}
 pub(super) fn first(
     snapshot: Snapshot,
     domain: u16,

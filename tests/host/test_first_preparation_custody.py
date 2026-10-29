@@ -43,5 +43,20 @@ class FirstPreparationCustody(unittest.TestCase):
    d=Path(tmp);(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="first-preparation-custody"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-first-preparation-custody'),'--','--test-threads=1']
    result=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
-   self.assertEqual(result.returncode,0,result.stdout+result.stderr);self.assertIn('4 passed; 0 failed',result.stdout)
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr);self.assertIn('6 passed; 0 failed',result.stdout)
+   creation=function(code,'if s.preparation.is_none()\n            && replay::first_preparation(')
+   mutants=[
+    (creation,'','first preparation escaped without custody'),
+    ('preparation::Pending::first_candidate(','preparation::Pending::new(','blocked candidate first ignored'),
+    ('if pending.is_first_candidate() {','if false {','blocked candidate first ignored'),
+    ('&& r.first.is_none_or(|first| first == snapshot)','', 'foreign first predicate accepted: 7'),
+    ('&& snapshot.taken_ns >= q.not_before_ns','', 'foreign first predicate accepted: 5'),
+    ('pending.charge(timer::cpu_elapsed_ns(cpu_started))','Ok::<(),Error>(())','assertion'),
+    ('replay::reject_preparation(pending.identity, pending.snapshot, reason);','', 'assertion'),
+    ('Some(*error)','None','assertion'),
+   ]
+   for old,new,message in mutants:
+    self.assertIn(old,code);(d/'harness.rs').write_text(code.replace(old,new));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+
 if __name__=='__main__':unittest.main()

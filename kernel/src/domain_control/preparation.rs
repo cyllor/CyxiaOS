@@ -26,7 +26,10 @@ pub struct Pending {
     pub ordinal: usize,
     spent_ns: u64,
     overflowed: bool,
+    first_candidate: bool,
 }
+// The candidate marker uses existing padding; retain the original footprint.
+const _: () = assert!(core::mem::size_of::<Pending>() <= 240);
 impl Pending {
     pub fn new(identity: Identity, snapshot: Snapshot, family: usize, ordinal: usize) -> Self {
         Self {
@@ -36,7 +39,21 @@ impl Pending {
             ordinal,
             spent_ns: 0,
             overflowed: false,
+            first_candidate: false,
         }
+    }
+    pub fn first_candidate(
+        identity: Identity,
+        snapshot: Snapshot,
+        family: usize,
+        ordinal: usize,
+    ) -> Self {
+        let mut pending = Self::new(identity, snapshot, family, ordinal);
+        pending.first_candidate = true;
+        pending
+    }
+    pub fn is_first_candidate(&self) -> bool {
+        self.first_candidate
     }
     pub fn check(&self, identity: Identity, at: u64) -> Result<(), Error> {
         if identity != self.identity {
