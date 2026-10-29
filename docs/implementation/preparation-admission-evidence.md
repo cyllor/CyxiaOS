@@ -124,3 +124,78 @@ Independent review finds no Critical/Important issue. Its two documentation
 Minors are resolved here by explicit inclusive header ranges and the
 accept-only provenance scope. Fresh native diagnosis follows, with complete
 prototype acceptance still open.
+
+## Frozen native result
+
+The new run ends **FAIL after 601.666108 seconds**, with source map unchanged.
+The ordinary client exits 0; control retains 446 jobs, 393 publications,
+334 Applied, 37 rejected, 58 failed and 100 unknown outcomes. Kernel replay
+retains one verified side, three excluded sides and four durable archives.
+Candidate-pair labels and all training/validation counts remain zero. No task
+overrun/quarantine, diagnostic error or final parse error is present.
+
+Admission raw header, final report counters and the independent observer's
+final header agree. All **2,143** Candidate/Running entry visits are open:
+zero denied visits and zero reason counts. The latest context binds token 8,
+trial 4, boot 1, family 1/1, target 12/1, first/initial sequence 424 and first
+261.818384992 s. No accept-stop transition is recorded. The previous missing
+first-scope/early-stop hypothesis is **not reproduced or causally resolved**;
+the empty accept-stop row is not a global health proof.
+
+Stopped CRC/extents/SHA/length/truncated-append checks validate
+232,576 bytes, SHA-256
+`c325c9add04c632f6da5fe91e2a03809e01e2a92daa7473bb580d481bc55890f`.
+
+| Trial / offset / bytes | History / intervals | Capture / verification | Drain tail |
+| --- | --- | --- | --- |
+| 1 / 0 / 62,784 | 2 / 557 | none / Evidence | 3.955688 s |
+| 2 / 62,784 / 54,400 | 2 / 426 | none / Evidence | 4.231268992 s |
+| 3 / 117,184 / 43,264 | 2 / 252 | none / none | 3.818057008 s |
+| 4 / 160,448 / 72,128 | 4 / 511 | none / Evidence | 3.888623008 s |
+
+All four retain 100 requests and zero missing events. Candidate 4 initial
+ApplyId `[1,1,424,0,12,1]` uses snapshot 261.818384992 s, publication
+261.824830992 s and Applied 261.830648992 s: **12.264 ms from snapshot /
+5.818 ms from publication**, within its original limit. This is one real timely
+initial example after the repair, not stable timing or complete acceptance.
+
+Later candidate 427 uses snapshot 274.460454992 s, publication
+274.465162992 s and Applied 274.551612 s: **91.157008 / 86.449008 ms**,
+36.449008 ms beyond its approved deadline. Its initial-only scheduling reason
+has already terminated; later execution remains an independent open problem.
+Rows 425/426 retain input-only flags and no adoption receipt; their cause is
+separately unassigned. Closing 428 is Applied 34.118 ms after publication.
+The later violation alone is a sufficient exclusion condition; the first
+verifier rejection branch is not reconstructed.
+
+Network raw/report/final-observer comparisons also pass their narrower gate:
+1,490,125 pieces match settlements, all binding/context/snapshot/identity
+errors are zero and no physical overrun is retained. Final handoff
+retained=drained=41,441, pending=loss=0. None of these diagnostics establish a
+candidate label.
+
+## Next dominant blocker
+
+Trial 5 preparation 9 begins at 296.134330992 s and remains incomplete at
+591.748446992 s. Root/Owner/raw/report/final-observer identity and service-entry
+comparisons agree. Root's actual blocker is Desired slot 34, full ApplyId
+`[1,1,443,0,4153,14]`, version 406, RecoveryRecipe family 14/1, one-shot,
+started and Unknown. The retained ordinary row 58 independently matches job
+443, target 4153/14, publication 296.008298992 s, decode 34,834 ns and subsequent
+publication 92,085 ns. Its Unknown transition is observed at 297.012490 s.
+
+Repeated same-state Control queries do not refresh the evidence timestamp;
+that timestamp does not prove polling stopped. Control reconcile only queries
+the recovery receipt. Actual progression belongs to the Services supervisor
+and its TaskGuard backend. Source review confirms that a new generation begins
+pending and can execute its initial EL0 work before another heartbeat probe;
+there is no established heartbeat circular wait.
+
+Independent read-only review therefore recommends the next actual-source TDD
+around the exact recovery phase/issued state and original backend result,
+followed by the matching TaskGuard blocking predicate. Distinguish no paid
+supervisor opportunity, pending/IPC drain, active dispatch, cleanup, ambiguous
+start/stop and new-generation heartbeat. Keep original Unknown custody and
+single-issue semantics. Do not add a lifecycle shortcut, clear a recovery record
+or manufacture completion before this boundary is known. Later candidate
+progress is separate. All acceptance tasks remain open.
