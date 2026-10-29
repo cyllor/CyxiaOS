@@ -39,5 +39,10 @@ fn main(){
     s.registry.stopped=false;post(&mut s,&job,false,Err(Error::Budget),Some(0));
     assert!(s.registry.stopped,"diagnostic removed the original native budget stop");
     assert_eq!(domain_evidence::header()[162],2);
+    assert_eq!(&domain_evidence::header()[164..184],&w[164..184],"later stop replaced first original publication");
+    domain_evidence::reset_stop();s.boot=2;s.registry.stopped=false;
+    post(&mut s,&job,false,Err(Error::Budget),Some(0));
+    let w=domain_evidence::header();assert_eq!(w[164],2,"native-only stop was attributed to Registry");
+    assert_eq!((w[166],w[171],w[172],w[175]),(2,0,Error::Budget as u64+1,500_001));
     println!("actual publication stop provenance passed");
 }
