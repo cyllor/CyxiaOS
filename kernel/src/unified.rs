@@ -20,6 +20,8 @@ use cyxia_kernel_core::control_plane::service_restart::{Lifecycle, RestartDecisi
 use cyxia_prototype::domains::Error;
 #[path = "../../user/prototype-cluster/src/abi.rs"]
 pub(crate) mod abi;
+#[path = "unified_session_exit.rs"]
+mod session_exit;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cluster-service.elf"));
 const LOCAL: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/local.pin32"));
 const PEER: &[u8; 32] = include_bytes!(concat!(env!("OUT_DIR"), "/peer.pin32"));
@@ -995,28 +997,65 @@ pub fn run(info: &BootInfo) -> ! {
                 }
                 abi::OP_TRACE => {
                     let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
-                    if p.arg0 & abi::TRACE_FATAL_BIT != 0 {
-                        let code = (p.arg0 & !abi::TRACE_FATAL_BIT).max(1);
-                        let _ = UNIFIED_EVIDENCE.words[15].compare_exchange(
-                            0,
-                            code,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        );
-                    }
-                    let n = UNIFIED_EVIDENCE.words[6].fetch_add(1, Ordering::Relaxed) as usize;
-                    if n < 200 {
-                        UNIFIED_EVIDENCE.words[32 + n * 2].store(p.arg0, Ordering::Relaxed);
-                        UNIFIED_EVIDENCE.words[33 + n * 2].store(now, Ordering::Release);
-                    }
-                    line(format_args!(
-                        "UNIFIED_SERVICE event={} arg1={} arg2={} ms={}\n",
-                        p.arg0, p.arg1, p.arg2, now
-                    ));
-                    if p.arg0 == 0x212 && !service_lifecycle.ready() {
-                        service_lifecycle
-                            .peer_ready(boot.epoch, p.service_generation)
-                            .unwrap_or_else(|_| fail(38));
+                    if p.arg0 == abi::TRACE_SESSION_EXIT {
+                        let mut record = [0; session_exit::RECORD_WORDS];
+                        if len == record.len() * 8 && p.arg1 == 0 && p.arg2 == 0 {
+                            for (word, bytes) in
+                                record.iter_mut().zip(p.payload[..len].chunks_exact(8))
+                            {
+                                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+                            }
+                            let mut bank = [0; session_exit::WORDS];
+                            for (word, saved) in
+                                bank.iter_mut().zip(&UNIFIED_EVIDENCE.words[432..512])
+                            {
+                                *word = saved.load(Ordering::Acquire);
+                            }
+                            if session_exit::retain(
+                                &mut bank,
+                                &record,
+                                boot.epoch,
+                                p.service_generation,
+                                connection_epoch,
+                            ) {
+                                UNIFIED_EVIDENCE.words[432].store(bank[0] - 1, Ordering::Release);
+                                core::sync::atomic::fence(Ordering::Release);
+                                for (saved, word) in
+                                    UNIFIED_EVIDENCE.words[433..512].iter().zip(&bank[1..])
+                                {
+                                    saved.store(*word, Ordering::Relaxed);
+                                }
+                                UNIFIED_EVIDENCE.words[432].store(bank[0], Ordering::Release);
+                            } else {
+                                p.status = abi::FAILED;
+                            }
+                        } else {
+                            p.status = abi::FAILED;
+                        }
+                    } else {
+                        if p.arg0 & abi::TRACE_FATAL_BIT != 0 {
+                            let code = (p.arg0 & !abi::TRACE_FATAL_BIT).max(1);
+                            let _ = UNIFIED_EVIDENCE.words[15].compare_exchange(
+                                0,
+                                code,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        let n = UNIFIED_EVIDENCE.words[6].fetch_add(1, Ordering::Relaxed) as usize;
+                        if n < 200 {
+                            UNIFIED_EVIDENCE.words[32 + n * 2].store(p.arg0, Ordering::Relaxed);
+                            UNIFIED_EVIDENCE.words[33 + n * 2].store(now, Ordering::Release);
+                        }
+                        line(format_args!(
+                            "UNIFIED_SERVICE event={} arg1={} arg2={} ms={}\n",
+                            p.arg0, p.arg1, p.arg2, now
+                        ));
+                        if p.arg0 == 0x212 && !service_lifecycle.ready() {
+                            service_lifecycle
+                                .peer_ready(boot.epoch, p.service_generation)
+                                .unwrap_or_else(|_| fail(38));
+                        }
                     }
                     p.len = 0;
                     finish_service(started);

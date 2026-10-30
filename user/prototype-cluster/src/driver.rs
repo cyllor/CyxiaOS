@@ -111,8 +111,53 @@ pub struct Driver {
     native_started: Vec<TaskKey>,
     billing_incoming: Vec<Vec<u8>>,
     replay: Option<replay::Active>,
+    last_header: Option<Header>,
+    last_tx_kind: u16,
+    exit_origin: u64,
+    exit_result: u64,
+    reported_exit: bool,
+    diagnostic_epoch: u64,
 }
 impl Driver {
+    /// Capture before teardown. Only public protocol metadata and a one-way
+    /// session fingerprint cross this diagnostic boundary; no RPC bodies.
+    pub(crate) fn report_exit(&mut self, reason: u64, result: u64, origin: u64, now: u64, authenticated: bool) {
+        let h = self.last_header;
+        let mut words = [0u64; SESSION_EXIT_WORDS];
+        words[..12].copy_from_slice(&[
+            1, self.engine.boot, broker::service_generation(), self.diagnostic_epoch,
+            now, reason, result, origin, self.engine.member as u64,
+            u64::from(authenticated) | (u64::from(self.active) << 1)
+                | (u64::from(self.ready_sent) << 2) | (u64::from(self.engine.ready()) << 3),
+            self.last_rx, self.peer_boot,
+        ]);
+        if let Some(h) = h {
+            words[12..17].copy_from_slice(&[h.kind as u64, h.sequence, h.sender_boot, h.receiver_boot, h.body_len as u64]);
+        }
+        words[17] = self.last_tx_kind as u64;
+        words[18] = self.sequence;
+        if self.peer_boot != 0 {
+            for (word, bytes) in words[19..23].iter_mut().zip(self.session.chunks_exact(8)) {
+                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+        }
+        let mut bytes = [0; SESSION_EXIT_WORDS * 8];
+        for (out, word) in bytes.chunks_exact_mut(8).zip(words) {
+            out.copy_from_slice(&word.to_le_bytes());
+        }
+        // A failed diagnostic grants nothing and cannot change the exit.
+        let _ = broker::request(OP_TRACE, &bytes, &mut [], 0, [TRACE_SESSION_EXIT, 0, 0]);
+        self.reported_exit = true;
+    }
+    pub(crate) fn take_exit_reported(&mut self) -> bool {
+        core::mem::take(&mut self.reported_exit)
+    }
+    pub(crate) fn begin_session_diagnostics(&mut self, epoch: u64) {
+        self.diagnostic_epoch = epoch;
+        self.last_header = None;
+        self.last_tx_kind = 0;
+        self.reported_exit = false;
+    }
     pub fn new(
         boot: u64,
         uuid: [u8; 16],
@@ -234,11 +279,29 @@ impl Driver {
             native_started: Vec::new(),
             billing_incoming: Vec::new(),
             replay: None,
+            last_header: None,
+            last_tx_kind: 0,
+            exit_origin: 0,
+            exit_result: 0,
+            reported_exit: false,
+            diagnostic_epoch: 0,
         };
         driver.recover_kernel_custody()?;
         Ok(driver)
     }
     pub fn connect(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
+        self.reported_exit = false;
+        self.last_header = None;
+        self.last_tx_kind = 0;
+        self.exit_origin = 1;
+        self.exit_result = 0x4000;
+        let result = self.connect_inner(challenge, now);
+        if result.is_err() {
+            self.report_exit(9, self.exit_result, self.exit_origin, now, true);
+        }
+        result
+    }
+    fn connect_inner(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
         self.disconnect();
         if challenge == [0; 32] {
             return Err(());
@@ -254,6 +317,7 @@ impl Driver {
         self.last_rx = now;
         self.last_status = now;
         self.kernel_epoch = broker::poll().map_err(|_| ())?.1;
+        self.diagnostic_epoch = self.kernel_epoch;
         broker::request(OP_TASK, &[], &mut [], 0, [9, 1, self.kernel_epoch]).map_err(|_| ())?;
         self.sent_results.clear();
         if self.engine.member == Member::Standalone {
@@ -350,6 +414,15 @@ impl Driver {
         }
     }
     pub fn ingest(&mut self, bytes: &[u8], now: u64) -> Result<usize, ()> {
+        self.exit_origin = 2;
+        self.exit_result = 0x4000;
+        let result = self.ingest_inner(bytes, now);
+        if result.is_err() {
+            self.report_exit(10, self.exit_result, self.exit_origin, now, true);
+        }
+        result
+    }
+    fn ingest_inner(&mut self, bytes: &[u8], now: u64) -> Result<usize, ()> {
         if !self.active || self.input.len() + bytes.len() > 96 + 65536 {
             return Err(());
         }
@@ -358,12 +431,16 @@ impl Driver {
             if self.input.len() < 96 {
                 break;
             }
-            let h = Header::decode(&self.input[..96]).map_err(|_| ())?;
+            let h = Header::decode(&self.input[..96]).map_err(|_| {
+                self.exit_result = 0x4101;
+            })?;
             let n = 96 + h.body_len as usize;
             if self.input.len() < n {
                 break;
             }
             let body = self.input[96..n].to_vec();
+            self.last_header = Some(h);
+            self.exit_origin = 3;
             self.input.drain(..n);
             self.handle(h, &body, now)?;
             self.last_rx = now;
@@ -422,6 +499,7 @@ impl Driver {
         }
         self.output.extend_from_slice(&h.encode());
         self.output.extend_from_slice(&body);
+        self.last_tx_kind = kind;
         Ok(())
     }
     fn status(&mut self) -> Result<(), ()> {
@@ -611,7 +689,9 @@ impl Driver {
             }
             return Ok(());
         }
-        self.engine.accept_header(&h).map_err(|_| ())?;
+        self.engine.accept_header(&h).map_err(|e| {
+            self.exit_result = 0x5001 + e as u64;
+        })?;
         match (kind, response) {
             (56, false) if self.native_mode => {
                 // No CPU fields are interpreted or synthesized in EL0. The
@@ -830,6 +910,8 @@ impl Driver {
             }
             (6, false) => {
                 if b != self.session {
+                    self.exit_origin = 4;
+                    self.exit_result = 0x4002;
                     return Err(());
                 }
                 self.engine
@@ -1255,6 +1337,15 @@ impl Driver {
         Ok(())
     }
     pub fn tick(&mut self, now: u64) -> Result<(), ()> {
+        self.exit_origin = 6;
+        self.exit_result = 0x4000;
+        let result = self.tick_inner(now);
+        if result.is_err() && self.exit_origin != 5 {
+            self.report_exit(12, self.exit_result, self.exit_origin, now, true);
+        }
+        result
+    }
+    fn tick_inner(&mut self, now: u64) -> Result<(), ()> {
         if self.finished_leave {
             return Ok(());
         }
@@ -1263,6 +1354,8 @@ impl Driver {
         }
         self.status_page()?;
         if now.saturating_sub(self.last_rx) >= 1500 {
+            self.exit_origin = 5;
+            self.report_exit(12, 0x4001, 5, now, true);
             self.disconnect();
             return Err(());
         }

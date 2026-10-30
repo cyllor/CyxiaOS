@@ -39,7 +39,9 @@ use cyxia_cluster_transport::tls::{Buffers, IdentitySigner, Pairing, node_id, pu
 #[cfg(not(test))]
 use cyxia_prototype_cluster::abi::*;
 #[cfg(not(test))]
-use cyxia_prototype_cluster::session_exit::SessionExitReason;
+use cyxia_prototype_cluster::session_exit::{
+    SessionExitReason, connection_result, domain_result, tls_result,
+};
 #[cfg(not(test))]
 use rustls::{
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, UnixTime},
@@ -203,7 +205,9 @@ pub fn run() -> ! {
                 continue;
             }
         };
+        driver.begin_session_diagnostics(epoch);
         let source = (broker::domains().peer_ipv4 as u32).to_be_bytes();
+        let mut pairing_error = None;
         let created = ingress.begin_at(source, broker::clock_ns(), || {
             Pairing::new(
                 certificate.clone(),
@@ -213,6 +217,7 @@ pub fn run() -> ! {
                 Arc::new(Clock),
             )
             .map_err(|e| {
+                pairing_error = Some(tls_result(&e));
                 if matches!(e, Error::Entropy) {
                     DomainError::Again
                 } else {
@@ -222,7 +227,14 @@ pub fn run() -> ! {
         });
         let (ticket, pairing) = match created {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                driver.report_exit(
+                    15,
+                    pairing_error.unwrap_or_else(|| domain_result(e)),
+                    8,
+                    now,
+                    false,
+                );
                 broker::close();
                 broker::yield_now();
                 continue;
@@ -236,7 +248,8 @@ pub fn run() -> ! {
         };
         let mut session = match created {
             Ok(session) => session,
-            Err(_) => {
+            Err(e) => {
+                driver.report_exit(16, tls_result(&e), 8, now, false);
                 let _ = ingress.finish_at(ticket, false, broker::clock_ns());
                 broker::close();
                 broker::yield_now();
@@ -253,38 +266,42 @@ pub fn run() -> ! {
         let outgoing = egress.as_mut().unwrap();
         let mut handshake = Some(ticket);
         let mut authenticated = None;
-        let exit_reason = loop {
-            if !matches!(broker::poll(),Ok((true,e)) if e==epoch) {
-                break SessionExitReason::ConnectionLost;
+        let (exit_reason, exit_result) = loop {
+            if let Some(result) = connection_result(broker::poll(), epoch) {
+                break (SessionExitReason::ConnectionLost, result);
             }
             let Some((now, _)) = broker::time() else {
-                break SessionExitReason::ClockUnavailable;
+                break (SessionExitReason::ClockUnavailable, 0);
             };
             let now_ns = broker::clock_ns();
             let policies = broker::domains();
             let _ = ingress.install_at(policies.unauth, now_ns);
             let _ = outgoing.install_at(policies.tx, now_ns);
             if driver.domain_tick(now_ns).is_err() {
-                break SessionExitReason::DomainTick;
+                break (SessionExitReason::DomainTick, 0x4000);
             }
             match broker::request(OP_READ, &[], &mut input, 0, [0; 3]) {
                 Ok((n, _)) => {
-                    if n > 0 && session.receive_tls(&input[..n]).ok() != Some(n) {
-                        break SessionExitReason::TlsReceive;
+                    if n > 0 {
+                        match session.receive_tls(&input[..n]) {
+                            Ok(accepted) if accepted == n => (),
+                            Ok(_) => break (SessionExitReason::TlsReceive, 0x4003),
+                            Err(e) => break (SessionExitReason::TlsReceive, tls_result(&e)),
+                        }
                     }
                 }
                 Err(AGAIN) => {}
-                Err(_) => break SessionExitReason::TcpRead,
+                Err(e) => break (SessionExitReason::TcpRead, 0x3000 + e),
             }
-            if session.pump(now).is_err() {
-                break SessionExitReason::TlsPump;
+            if let Err(e) = session.pump(now) {
+                break (SessionExitReason::TlsPump, tls_result(&e));
             }
             if session.authenticated_peer().is_some() && authenticated.is_none() {
                 let Some(ticket) = handshake.take() else {
-                    break SessionExitReason::HandshakeTicket;
+                    break (SessionExitReason::HandshakeTicket, 0);
                 };
-                if ingress.finish_at(ticket, true, broker::clock_ns()).is_err() {
-                    break SessionExitReason::HandshakeFinish;
+                if let Err(e) = ingress.finish_at(ticket, true, broker::clock_ns()) {
+                    break (SessionExitReason::HandshakeFinish, domain_result(e));
                 }
                 let identity = ObjectKey {
                     id: 1,
@@ -300,36 +317,33 @@ pub fn run() -> ! {
                         driver.replay_authenticated(epoch, broker::clock_ns());
                         broker::trace(3);
                     }
-                    Err(_) => break SessionExitReason::EnterAuthenticated,
+                    Err(e) => break (SessionExitReason::EnterAuthenticated, domain_result(e)),
                 }
             }
             if authenticated.is_some() {
                 if !session.plaintext().is_empty() {
                     let accepted = match driver.ingest(session.plaintext(), now) {
                         Ok(n) => n,
-                        Err(_) => break SessionExitReason::PlaintextIngest,
+                        Err(_) => break (SessionExitReason::PlaintextIngest, 0x4000),
                     };
-                    if session.consume_plaintext(accepted).is_err() {
-                        break SessionExitReason::PlaintextConsume;
+                    if let Err(e) = session.consume_plaintext(accepted) {
+                        break (SessionExitReason::PlaintextConsume, tls_result(&e));
                     }
                 }
                 if driver.tick(now).is_err() {
-                    break SessionExitReason::DriverTick;
+                    break (SessionExitReason::DriverTick, 0x4000);
                 }
                 if driver.replay_wants_reconnect(epoch) {
-                    break SessionExitReason::ReplayReconnect;
+                    break (SessionExitReason::ReplayReconnect, 0);
                 }
             }
-            if outgoing
-                .service_at(
-                    &mut session,
-                    &mut driver,
-                    broker::clock_ns(),
-                    &mut BrokerTcp,
-                )
-                .is_err()
-            {
-                break SessionExitReason::TlsEgress;
+            if let Err(e) = outgoing.service_at(
+                &mut session,
+                &mut driver,
+                broker::clock_ns(),
+                &mut BrokerTcp,
+            ) {
+                break (SessionExitReason::TlsEgress, domain_result(e));
             }
             feedback(
                 &driver,
@@ -341,6 +355,15 @@ pub fn run() -> ! {
             broker::yield_now();
         };
         let unauthenticated_exit = authenticated.is_none();
+        if !driver.take_exit_reported() {
+            driver.report_exit(
+                exit_reason as u64,
+                exit_result,
+                8,
+                broker::clock_ns() / 1_000_000,
+                !unauthenticated_exit || session.authenticated_peer().is_some(),
+            );
+        }
         driver.disconnect();
         session.abort();
         drop(session);

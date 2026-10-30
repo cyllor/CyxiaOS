@@ -13,6 +13,7 @@ struct Node {
     records: Vec<Vec<u8>>,
     staging: Vec<u8>,
     traces: Vec<u64>,
+    exit_records: Vec<Vec<u64>>,
     input: Vec<u8>,
     starts: usize,
     reserved: bool,
@@ -74,6 +75,11 @@ mod broker {
             let i = cx.node;
             let n = &mut cx.nodes[i];
             match op {
+                OP_TRACE if args[0] == 0x24f && input.len() == 192 => {
+                    n.exit_records.push(input.chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect());
+                    Ok((0, 0))
+                }
                 OP_STORE_GET => {
                     let b = n.records.get(args[0] as usize - 1).ok_or(NOT_FOUND)?;
                     let off = offset as usize;
@@ -319,6 +325,7 @@ mod broker {
     pub fn poll() -> Result<(bool, u64), u64> {
         Ok((true, CTX.with(|c| { let c = c.borrow(); c.nodes[c.node].transport_epoch.max(1) })))
     }
+    pub fn service_generation() -> u64 { 7 }
     pub fn time() -> Option<(u64, u64)> {
         Some(CTX.with(|c| {
             let c = c.borrow();
@@ -1277,6 +1284,112 @@ fn pump(a: &mut driver::Driver, b: &mut driver::Driver, base: u64, until: impl F
 }
 fn closed_both() -> bool {
     CTX.with(|c| c.borrow().nodes.iter().all(|n| n.traces.contains(&0x219)))
+}
+#[test]
+fn session_exit_idle_timeout_retains_original_identity_before_disconnect() {
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    pump(&mut a, &mut b, 0, closed_both);
+    select(0, 10_000);
+    assert_eq!(a.tick(10_000), Err(()));
+    assert!(a.take_exit_reported(), "runtime must suppress duplicate reporting");
+    assert!(!a.take_exit_reported());
+    assert!(a.outgoing().is_empty(), "timeout still tears down authority");
+    CTX.with(|c| {
+        let c = c.borrow();
+        let records = &c.nodes[0].exit_records;
+        assert_eq!(records.len(), 1, "real idle timeout must retain its original branch");
+        let r = &records[0];
+        assert_eq!(&r[..8], &[1, 1, 7, 1, 10_000, 12, 0x4001, 5]);
+        assert_eq!(r[8], 2, "bound membership before isolate");
+        assert_eq!(r[9], 15, "TLS authenticated, active, sent READY, ready");
+        assert_eq!(r[11], 1, "peer boot before disconnect clears it");
+        assert!(r[19..23].iter().any(|&v| v != 0));
+    });
+}
+
+#[test]
+fn session_exit_failed_ready_retains_message_context_without_body() {
+    use cyxia_prototype::cluster::wire::Header;
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    // Exchange HELLO and formation until a genuine READY is queued, then
+    // corrupt only its session binding. All headers/signatures remain real.
+    for now in 0..1000 {
+        for from in 0..2 {
+            let (src, dst) = if from == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+            let bytes = src.outgoing().to_vec();
+            if bytes.is_empty() { continue; }
+            src.consume_outgoing(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                let h = Header::decode(&bytes[at..at + 96]).unwrap();
+                let end = at + 96 + h.body_len as usize;
+                let mut frame = bytes[at..end].to_vec();
+                select(1 - from, now);
+                if h.kind == 6 {
+                    frame[96] ^= 1;
+                    assert_eq!(dst.ingest(&frame, now), Err(()));
+                    CTX.with(|c| {
+                        let c = c.borrow();
+                        let records = &c.nodes[1 - from].exit_records;
+                        assert_eq!(records.len(), 1, "failed READY must retain original validation branch");
+                        let r = &records[0];
+                        assert_eq!(&r[5..8], &[10, 0x4002, 4]);
+                        assert_eq!(&r[12..17], &[6, h.sequence, 1, 1, 32]);
+                        assert!(!c.nodes[1 - from].traces.contains(&0x212));
+                        assert_eq!(r[23], 0);
+                    });
+                    return;
+                }
+                assert_eq!(dst.ingest(&frame, now), Ok(frame.len()));
+                at = end;
+            }
+        }
+    }
+    panic!("real drivers never produced READY");
+}
+
+#[test]
+fn session_exit_replayed_real_header_keeps_original_engine_result() {
+    use cyxia_prototype::cluster::wire::Header;
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    for now in 0..1000 {
+        for from in 0..2 {
+            let (src, dst) = if from == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+            let bytes = src.outgoing().to_vec();
+            if bytes.is_empty() { continue; }
+            src.consume_outgoing(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                let h = Header::decode(&bytes[at..at + 96]).unwrap();
+                let end = at + 96 + h.body_len as usize;
+                let frame = &bytes[at..end];
+                select(1 - from, now);
+                assert_eq!(dst.ingest(frame, now), Ok(frame.len()));
+                if h.kind != 1 {
+                    assert_eq!(dst.ingest(frame, now), Err(()));
+                    CTX.with(|c| {
+                        let c = c.borrow();
+                        let r = &c.nodes[1 - from].exit_records[0];
+                        assert_eq!(&r[5..8], &[10, 0x5009, 3]);
+                        assert_eq!(&r[12..17], &[h.kind as u64, h.sequence, 1, 1, h.body_len as u64]);
+                        assert_eq!(c.nodes.iter().map(|n| n.starts).sum::<usize>(), 0);
+                    });
+                    return;
+                }
+                at = end;
+            }
+        }
+    }
+    panic!("real drivers never produced a formation frame");
 }
 #[test]
 fn reconnect_at_each_custody_boundary_never_reexecutes() {
