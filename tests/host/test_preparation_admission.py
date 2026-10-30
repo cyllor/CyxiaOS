@@ -29,10 +29,13 @@ class PreparationAdmission(unittest.TestCase):
         evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
         submit=function(control,'pub fn accept(')
         body=submit[submit.index('        let publication_ns ='):submit.index('        job.completion =')]
+        # Evaluate the actual checkpoint inputs at the fixture's controlled
+        # sample after its Registry-return facade, before the real final cap.
+        checkpoint=submit[submit.index('        let checkpoint_cap ='):submit.index('        let checkpoint_local_stop =')]
         origin='let optimization_was_stopped=false;'
         if 'let optimization_was_stopped =' in submit:
             origin=next(line.strip() for line in submit.splitlines() if 'let optimization_was_stopped =' in line)
-        code=(ROOT/'tests/host/preparation_stop_harness.rs').read_text().replace('// ACTUAL_POST_SUBMISSION',body).replace('// ACTUAL_STOP_ORIGIN',origin)
+        code=(ROOT/'tests/host/preparation_stop_harness.rs').read_text().replace('// ACTUAL_POST_SUBMISSION',body).replace('// ACTUAL_STOP_ORIGIN',origin).replace('// ACTUAL_CHECKPOINT_INPUTS',checkpoint)
         r=execute(code,evidence,'stop')
         self.assertEqual(r.returncode,0,r.stdout+r.stderr)
         self.assertIn('actual publication stop provenance passed',r.stdout)
@@ -51,6 +54,7 @@ class PreparationAdmission(unittest.TestCase):
             self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
             self.assertNotIn('error[E',negative.stdout+negative.stderr)
             self.assertNotIn('could not compile',negative.stdout+negative.stderr)
+            self.assertIn('Running `',negative.stderr)
             self.assertIn(failure,negative.stdout+negative.stderr)
 
     def test_actual_early_gate_reports_reason_without_new_queries(self):
@@ -79,6 +83,9 @@ class PreparationAdmission(unittest.TestCase):
             self.assertNotEqual((mutated_code,mutated_evidence),(code,evidence))
             negative=execute(mutated_code,mutated_evidence,'admission')
             self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertNotIn('error[E',negative.stdout+negative.stderr)
+            self.assertNotIn('could not compile',negative.stdout+negative.stderr)
+            self.assertIn('Running `',negative.stderr)
             self.assertIn(failure,negative.stdout+negative.stderr)
 
 
