@@ -10,7 +10,7 @@ BASE = '3af89206879ea990c5bce0b5e1ce17c7f381b473'
 PATCH_SHA = 'bd3ffdd02e03b798d27d5221556326caf22d7f15560154aa1323475e23af0a53'
 FIXUP_SHA = 'b8d666aa2d1ad1de0c8940c51b6c62738c272ef1f005f14e06c15e16a4592de4'
 STAGING = '.github/v13-boot-candidate/'
-WORKFLOW = '.github/workflows/v13-boot-candidate.yml'
+WORKFLOWS = {'.github/workflows/v13-boot-candidate.yml', '.github/workflows/v13-development-tools.yml'}
 ALLOWED = '''crates/prototype/src/lib.rs
 crates/prototype/src/boot_model.rs
 crates/prototype/tests/boot_model.rs
@@ -39,7 +39,7 @@ if git('status', '--porcelain'):
     raise SystemExit('Refuse a dirty candidate checkout')
 subprocess.run(['git', 'merge-base', '--is-ancestor', BASE, 'HEAD'], check=True)
 changed = git('diff', '--name-only', BASE, 'HEAD').splitlines()
-if any(not (p.startswith(STAGING) or p == WORKFLOW) for p in changed):
+if any(not (p.startswith(STAGING) or p in WORKFLOWS) for p in changed):
     raise SystemExit('Source moved beyond the reviewed candidate base')
 encoded = b''.join((Path(STAGING)/f'{i:02}.part').read_bytes() for i in range(13))
 patch = zlib.decompress(encoded)

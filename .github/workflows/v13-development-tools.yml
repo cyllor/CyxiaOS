@@ -1,0 +1,57 @@
+name: V0.13 fixed development tools
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths: ['.github/workflows/v13-development-tools.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Freeze compiler, public dependencies and emulator source
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1
+          pack="$RUNNER_TEMP/fixed-tools"
+          mkdir -p "$pack/rustup/toolchains" "$pack/cargo/bin" "$pack/lib"
+          cp -a "$HOME/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu" "$pack/rustup/toolchains/"
+          cp -a "$HOME/.cargo/registry" "$pack/cargo/"
+          cp -a "$HOME/.cargo/bin/rustup" "$pack/cargo/bin/"
+          for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+            ln -s rustup "$pack/cargo/bin/$tool"
+          done
+          cp -L /usr/lib/x86_64-linux-gnu/libfdt.so.1 "$pack/lib/libfdt.so.1"
+          git init "$pack/qemu"
+          git -C "$pack/qemu" remote add origin https://github.com/qemu/qemu.git
+          git -C "$pack/qemu" fetch --depth=1 origin f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$pack/qemu" checkout --detach FETCH_HEAD
+          test "$(git -C "$pack/qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$pack/qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          rustc -vV > "$pack/rust-version.txt"
+          cargo -vV > "$pack/cargo-version.txt"
+          git rev-parse HEAD > "$pack/source-commit.txt"
+          cp Cargo.lock "$pack/Cargo.lock"
+          cd "$pack"
+          find . -type f ! -path './qemu/.git/*' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/tool-files.sha256"
+          mv "$RUNNER_TEMP/tool-files.sha256" .
+          tar -czf "$RUNNER_TEMP/fixed-tools.tar.gz" .
+          sha256sum "$RUNNER_TEMP/fixed-tools.tar.gz" > "$RUNNER_TEMP/fixed-tools.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-fixed-tools-${{ github.sha }}
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/fixed-tools.tar.gz
+            ${{ runner.temp }}/fixed-tools.sha256
