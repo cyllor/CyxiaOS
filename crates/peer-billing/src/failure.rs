@@ -37,12 +37,7 @@ impl Failure {
     pub fn rejected(
         root_token: u64,
         receipt: PlanReceipt,
-        snapshot: Snapshot,
-        target: ObjectKey,
-        plan_hash: [u8; 32],
-        received_ns: u64,
-        observed_ns: u64,
-        wall_deadline_ns: u64,
+        publication: FailedPublication,
     ) -> Result<Self, Error> {
         if receipt.version != 0 || receipt.published_ns != 0 || receipt.action_count != 1 {
             return Err(Error::Incomplete);
@@ -50,19 +45,15 @@ impl Failure {
         let ExecutionState::Failed(error) = receipt.state() else {
             return Err(Error::Incomplete);
         };
+        // The typed context cannot rebind a terminal receipt to another plan.
+        if publication.id != receipt.id {
+            return Err(Error::Identity);
+        }
         let value = Self {
             root_token,
             error: error as u64 + 1,
-            observed_ns,
-            publication: Some(FailedPublication {
-                id: receipt.id,
-                snapshot,
-                target,
-                plan_hash,
-                received_ns,
-                observed_ns,
-                wall_deadline_ns,
-            }),
+            observed_ns: publication.observed_ns,
+            publication: Some(publication),
         };
         value.validate()?;
         Ok(value)
@@ -75,8 +66,8 @@ impl Failure {
         {
             return Err(Error::Identity);
         }
-        if let Some(p) = self.publication {
-            if p.id.boot_epoch == 0
+        if let Some(p) = self.publication
+            && (p.id.boot_epoch == 0
                 || p.id.controller_epoch == 0
                 || p.id.plan_seq == 0
                 || p.snapshot.sequence == 0
@@ -88,10 +79,9 @@ impl Failure {
                 || p.received_ns < p.snapshot.taken_ns
                 || p.observed_ns < p.received_ns
                 || p.observed_ns > self.observed_ns
-                || p.wall_deadline_ns < p.snapshot.taken_ns
-            {
-                return Err(Error::Identity);
-            }
+                || p.wall_deadline_ns < p.snapshot.taken_ns)
+        {
+            return Err(Error::Identity);
         }
         Ok(())
     }

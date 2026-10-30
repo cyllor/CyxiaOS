@@ -215,7 +215,17 @@ impl<P: Port> Port for ObservedPort<P> {
         Ok(())
     }
     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error> {
-        let received = self.inner.receive(frame)?;
+        self.receive_with_checkpoint(frame, &mut || {})
+    }
+    fn receive_with_checkpoint(
+        &mut self,
+        frame: &mut [u8; MTU],
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, Error> {
+        // Preserve the inner port's custody-safe scheduling boundaries. Falling
+        // back to Port::receive would silently collapse all DMA/MMIO pieces
+        // into one CPU reservation even though the NIC exposes safe points.
+        let received = self.inner.receive_with_checkpoint(frame, checkpoint)?;
         if let Some(length) = received {
             self.received_ack = frame
                 .get(..length)

@@ -2453,12 +2453,15 @@ fn propagate_root_failure(
             wire::Failure::rejected(
                 token.id,
                 value.receipt(),
-                value.snapshot(),
-                value.target(),
-                value.plan_hash(),
-                value.received_ns(),
-                value.observed_ns(),
-                value.wall_deadline_ns(),
+                wire::FailedPublication {
+                    id: value.receipt().id,
+                    snapshot: value.snapshot(),
+                    target: value.target(),
+                    plan_hash: value.plan_hash(),
+                    received_ns: value.received_ns(),
+                    observed_ns: value.observed_ns(),
+                    wall_deadline_ns: value.wall_deadline_ns(),
+                },
             )
             .map_err(domain)?
         } else {

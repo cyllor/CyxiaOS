@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -18,11 +20,37 @@ from check_prototype_evidence import read_json
 from check_v13_evidence import DEFAULT, validate
 from doctor import ROOT, RUST_BIN, TARGET, env
 
+# Each engineering gate has one lane; native execution remains separate.
+TEST_LANES = {
+    'static': ('format', 'governance-format', 'clippy', 'governance-clippy'),
+    'rust': ('rust', 'tls'),
+    'host': ('fixtures', 'host'),
+    'tools': ('tools',),
+}
+
 NATIVE_COMMANDS = {
     'build': ('build_unified.py', []),
     'run-single': ('verify_domains.py', ['--single']),
     'run-pair': ('verify_unified.py', []),
 }
+
+
+def stop_step(process: subprocess.Popen) -> None:
+    """Terminate only this runner's new process group, then reap its leader."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    # The group may outlive its leader (for example a nested compiler).
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=5)
 
 
 def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
@@ -49,8 +77,13 @@ def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
         print(f'{name}: running ({logfile})', flush=True)
         with logfile.open('x') as log:
             try:
-                row['returncode'] = subprocess.run(argv, cwd=ROOT, env=env(),
-                    stdout=log, stderr=subprocess.STDOUT, check=False).returncode
+                with subprocess.Popen(argv, cwd=ROOT, env=env(), stdout=log,
+                        stderr=subprocess.STDOUT, start_new_session=True) as process:
+                    try:
+                        row['returncode'] = process.wait()
+                    except BaseException:
+                        stop_step(process)
+                        raise
             except OSError as error:
                 row['returncode'] = 127
                 log.write(f'{type(error).__name__}: {error}\n')
@@ -69,10 +102,10 @@ def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
     return 130 if interrupted else int(report['status'] != 'PASS')
 
 
-def test_steps(fetch: bool) -> list[tuple[str, list[str]]]:
+def test_steps(fetch: bool, lane: str = "all") -> list[tuple[str, list[str]]]:
     cargo = str(RUST_BIN / 'cargo')
     python = [sys.executable, '-B']
-    return [
+    steps = [
         ('fixtures', python + [str(ROOT / 'tools/prepare_host_tests.py')]
          + (['--fetch'] if fetch else [])),
         ('format', [cargo, 'fmt', '--all', '--', '--check']),
@@ -90,6 +123,12 @@ def test_steps(fetch: bool) -> list[tuple[str, list[str]]]:
                                '--target-dir', str(ROOT / 'target/prototype-governance'),
                                '--target', TARGET, '--', '-D', 'warnings']),
     ]
+    if lane == 'all':
+        return steps
+    if lane not in TEST_LANES:
+        raise ValueError('unknown validation lane: ' + lane)
+    selected = set(TEST_LANES[lane])
+    return [(name, argv) for name, argv in steps if name in selected]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -108,13 +147,15 @@ def main(argv: list[str] | None = None) -> int:
     test = sub.add_parser('test', help='run host validation; keep per-step logs')
     test.add_argument('--output', type=Path, required=True, help='new evidence directory')
     test.add_argument('--fetch', action='store_true', help='fetch exact pinned host fixtures')
+    test.add_argument('--lane', choices=['all', *TEST_LANES], default='all',
+                      help='independent CI lane; default runs all host validation gates')
     report = sub.add_parser('report', help='independently validate the 1.3 catalogue')
     report.add_argument('--manifest', type=Path, default=DEFAULT)
     report.add_argument('--output', type=Path, help='optional new JSON file; otherwise stdout')
     args = parser.parse_args(argv)
     try:
         if args.command == 'test':
-            return run_steps(test_steps(args.fetch), args.output)
+            return run_steps(test_steps(args.fetch, args.lane), args.output)
         result = validate(read_json(args.manifest), ROOT)
         text = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
         if args.output is not None:

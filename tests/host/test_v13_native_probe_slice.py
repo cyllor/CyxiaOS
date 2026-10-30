@@ -52,9 +52,10 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("a02_capture::returned();", entry)
         self.assertIn("user::enter_integer_probe(context, root);", entry)
         self.assertIn(
-            "worker.native.capture_index,\n            false,\n            false,",
+            "None,\n            false,\n            false,",
             probe,
         )
+        self.assertNotIn(".capture.index(", probe, "uncaptured probes must not consume an old trace slot")
         self.assertIn("if record_slice_evidence && slot < 4", entry)
         self.assertIn("if record_slice_evidence {\n            RECORD_SLICE_EXCEPTION[slot].store(true", entry)
         self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(false", entry)

@@ -133,7 +133,7 @@ pub(super) struct WorkerState {
     measurement: Option<crate::domain_control::core_replay::Measurement>,
     probe: u8,
     probe_deadline: u64,
-    capture_index: Option<usize>,
+    capture: crate::a02_capture::PreparedTask,
     probe_heartbeat_pending: bool,
     clear_next: u32,
     probing: bool,
@@ -158,7 +158,7 @@ impl WorkerState {
             measurement: None,
             probe: 0,
             probe_deadline: 0,
-            capture_index: None,
+            capture: crate::a02_capture::PreparedTask::new(),
             probe_heartbeat_pending: false,
             clear_next: 0,
             probing: false,
@@ -583,7 +583,10 @@ fn run_probe_turn(
         worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
         // Register the later normal task identity outside its first captured
         // boundary. Probe entries themselves remain uncaptured.
-        worker.native.capture_index = crate::a02_capture::prepare(capture_task(slot));
+        worker
+            .native
+            .capture
+            .prepare(capture_task(slot), crate::a02_capture::prepare);
         return;
     }
     let entered = timer::cpu_ticks();
@@ -602,7 +605,7 @@ fn run_probe_turn(
             phys(root),
             timer::ticks().saturating_add(ticks(PROBE_SERVICE_SLICE_NS).max(1)),
             capture_task(slot),
-            worker.native.capture_index,
+            None,
             false,
             false,
         );
@@ -760,6 +763,23 @@ fn run_turn(
             .cpu_ns
             .saturating_add(timer::cpu_elapsed_ns(preparation));
     }
+    // Controller epoch can advance without rerunning the completed mapping
+    // probes. Never attach that new incarnation to an old prepared trace slot.
+    // Register it in this already-paid turn, count preparation against the job,
+    // then yield; the next turn must match the entire identity before EL0 entry.
+    let task = capture_task(slot);
+    let capture_started = timer::cpu_ticks();
+    let capture_ready = worker
+        .native
+        .capture
+        .prepare(task, crate::a02_capture::prepare);
+    worker.native.cpu_ns = worker
+        .native
+        .cpu_ns
+        .saturating_add(timer::cpu_elapsed_ns(capture_started));
+    if !capture_ready {
+        return;
+    }
     // Account encoding and private-page preparation before choosing a slice.
     // A turn with less than the full return envelope yields without entering EL0.
     let entered = timer::cpu_ticks();
@@ -779,8 +799,12 @@ fn run_turn(
             context,
             phys(root),
             timer::ticks().saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
-            capture_task(slot),
-            worker.native.capture_index,
+            task,
+            worker
+                .native
+                .capture
+                .index(task)
+                .expect("exact prepared capture identity"),
             true,
             true,
         );

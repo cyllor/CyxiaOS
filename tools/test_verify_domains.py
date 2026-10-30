@@ -741,6 +741,29 @@ class EvidenceParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'runtime fault 7'):
             parse_governance_runtime(encode(values))
 
+    def test_governance_contiguous_command_uses_five_physical_turns(self):
+        values = self.governance_runtime()
+        # Four separate isolation/timer probes, then one prepaid command turn
+        # covering preparation, one EL0 entry and canonical validation.
+        values[7], values[60], values[61] = 5, 4, 1
+        self.assertTrue(parse_governance_runtime(encode(values))["completed"])
+
+    def test_governance_entries_cannot_exceed_paid_turns(self):
+        values = self.governance_runtime()
+        values[7], values[60], values[61] = 7, 4, 4
+        with self.assertRaisesRegex(ValueError, "registered C owner"):
+            parse_governance_runtime(encode(values))
+
+    def test_governance_contiguous_turn_keeps_deadline_and_cost_gates(self):
+        for index, bad in ((9, 2_500_001), (42, 2_500_001), (43, 2_500_001),
+                           (47, 0), (17, 60_000_000), (10, 0), (60, 3), (61, 0)):
+            with self.subTest(index=index):
+                values = self.governance_runtime()
+                values[7] = 5
+                values[index] = bad
+                with self.assertRaises(ValueError):
+                    parse_governance_runtime(encode(values))
+
     def test_independent_operator_selftest_is_never_training(self):
         values = self.learning()
         result = parse_learning(encode(values))

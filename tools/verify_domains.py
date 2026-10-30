@@ -41,6 +41,7 @@ CONTROL_MAGIC = 0x435958444F4D3031
 UNIFIED_MAGIC = 0x435958554E493031
 IPI_MAGIC = 0x4359495049000001
 CONTROL_CREDIT_MAGIC = 0x4359434352454401
+CONTROL_SETTLEMENT_MAGIC = 0x4359435345540001
 CONTROL_POOL_MAGIC = 0x435943504F4F4C01
 LEARNING_MAGIC = 0x43594C4541524E01
 GOVERNANCE_MAGIC = 0x4359474F56455201
@@ -68,7 +69,7 @@ REQUIRED = {
     "CONTROL_CREDIT_EVIDENCE": 512,
     "IPI_EVIDENCE": 4096,
 }
-OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
+OPTIONAL = {"CONTROL_SETTLEMENT_EVIDENCE": 512, "DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
             "FILE_SERVICE_EVIDENCE": 512,
             "TASK_VECTOR_EVIDENCE": 512,
             "TASK_SPAWN_EVIDENCE": 256,
@@ -237,6 +238,54 @@ def parse_ipi(data):
         "observed_receipts": w[9], "stale_receipts": w[10],
         "wake_verified": bool(w[2] & (1 << 3) and w[4] > 0 and w[9] > 0),
     }
+
+
+
+def parse_control_settlements(data):
+    """Diagnostic receipt, never an authorization or a complete runtime proof."""
+    w = words(data, 64)
+    if not any(w):
+        return []
+    require(w[0] == CONTROL_SETTLEMENT_MAGIC and w[1] > 0,
+            "unsealed or invalid physical control settlement header")
+    require(not any(w[50:]), "physical control settlement reserved words")
+    names = ("cpu", "sequence", "core_generation", "window", "started_ns",
+             "finished_ns", "reserved_ns", "actual_ns", "control_prepaid_ns",
+             "control_actual_ns", "physical_prepaid_ns", "physical_actual_ns",
+             "flags", "error")
+    rows = []
+    maximum = (1 << 64) - 1
+    for cpu, offset in ((1, 2), (2, 26)):
+        row = w[offset:offset+24]
+        require(row[0] in (0, 1, 2), "invalid physical control settlement state")
+        if row[0] == 0:
+            require(not any(row), "payload without physical control settlement")
+            continue
+        if row[0] == 1:
+            rows.append({"cpu": cpu, "complete": False})
+            continue
+        require(row[1] == cpu and row[2] > 0 and row[3] > 0
+                and row[4] == row[5] // 100_000_000 and row[6] >= row[5]
+                and 0 < row[7] <= row[9] <= 70_000_000
+                and row[9] <= row[11] <= 90_000_000
+                and row[14] == 6 and not any(row[15:]),
+                "invalid physical control settlement identity/credit")
+        control = min(maximum, row[9] - row[7] + row[8])
+        physical = min(maximum, row[11] - row[7] + row[8])
+        end = min(maximum, (row[4] + 1) * 100_000_000)
+        flags = (int(row[8] > row[7]) | (int(row[6] > end) << 1)
+                 | (int(control > 70_000_000) << 2)
+                 | (int(physical > 90_000_000) << 3))
+        require(row[10] == control and row[12] == physical and row[13] == flags,
+                "physical control settlement arithmetic mismatch")
+        # Cross-window carry may exhaust capacity even when this single slice
+        # stayed within its credit. The authoritative Budget result is kept;
+        # a diagnostic flag must not replace the scheduler's decision.
+        require(flags != 0, "physical control settlement has no budget/carry cause")
+        rows.append(dict(zip(names, row[1:15]), complete=True))
+    require(rows and w[1] >= sum(row["complete"] for row in rows),
+            "physical control settlement count mismatch")
+    return rows
 
 
 def parse_control_credit(data):
@@ -429,7 +478,10 @@ def parse_governance_runtime(data):
         return None
     require(w[0] == GOVERNANCE_RUNTIME_MAGIC and w[1] == 1 and w[2] == 8,
             "invalid governance runtime completion header")
-    require(w[6] == 1 and w[7] >= 6 and w[60] >= 4 and w[61] >= 1,
+    # Four probe entries remain separate. Preparation, one command entry and
+    # validation may share a prepaid turn; no turn may hide a second EL0 entry.
+    require(w[6] == 1 and w[60] >= 4 and w[61] >= 1
+            and w[7] >= w[60] + w[61],
             "governance role did not execute on the registered C owner")
     require(w[3] > 0 and w[4] > 0 and w[5] > 0
             and w[56:59] == (w[3], w[4], w[3]),
@@ -646,6 +698,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
                                     ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
+                                    ("CONTROL_SETTLEMENT_EVIDENCE", "control_settlement_evidence", 64),
                                     ("RUNTIME_V13_EVIDENCE", "runtime_evidence", 1024),
                                     ("TASK_SLICE_EVIDENCE", "slice_evidence", 128),
                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
@@ -689,6 +742,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
             "builtin_detail": guest.get("builtin_detail"),
             "sticky_count": sticky_words[1] if len(sticky_words) > 1 else 0,
             "receipts": rows,
+            "control_settlement_words": guest.get("control_settlement_evidence"),
         }
 
     def parse_task_snapshot(data):
@@ -703,7 +757,8 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                     + json.dumps(detail, separators=(",", ":"))) from error
             raise
 
-    for symbol_name, key, parser in (("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
+    for symbol_name, key, parser in (("CONTROL_SETTLEMENT_EVIDENCE", "control_settlements", parse_control_settlements),
+                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
                                      ("DOMAIN_PREPARATION_REJECTIONS", "rejected_preparations", parse_preparation_rejections),
                                      ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
                                      ("DOMAIN_TASK_EVIDENCE", "tasks", parse_tasks),
@@ -731,6 +786,9 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                 }
                 check(key, not guest[key],
                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
+    check("control_settlements", not guest.get("control_settlements"),
+          "native physical control settlement failure: "
+          + json.dumps(guest.get("control_settlements"), separators=(",", ":")))
     mapping = guest.get("governance")
     governance_runtime = guest.get("governance_runtime")
     # The mapping is installed before the independent EL0 role finishes its
@@ -1313,15 +1371,22 @@ def run(args):
         report["wall_seconds"] = time.monotonic() - started
         if reconnect is not None:
             report["reconnect_evidence"] = reconnect.evidence()
-        report["observations"] = [{key: guest.get(key) for key in
-                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "baseline_service_evidence", "overrun_evidence", "panic_evidence",
+        report["observations"] = [retained_observation(guest) for guest in guests]
+        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        os.umask(previous_umask)
+    return report
+
+
+def retained_observation(guest):
+    """Only current stopped-snapshot fields; preserve raw banks on parser failure."""
+    return {key: guest.get(key) for key in ("argv", "service_stage_word", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "baseline_service_evidence", "overrun_evidence", "panic_evidence",
                                    "trace_control_evidence", "trace_task_evidence", "trace_work_evidence", "trace_closing_evidence",
                                    "trace_drain_work_evidence", "trace_drain_task_evidence",
                                    "trace_preparation_root_evidence", "trace_preparation_owner_evidence",
                                    "network_piece_evidence", "network_settlement_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
-                                   "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
-                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",
+                                   "control_credit", "control_credit_evidence", "control_settlement_evidence", "control_settlements", "preparation_evidence", "preparation_detail", "preparation_prefix_detail", "preparation_entry_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
+                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence", "governance", "governance_evidence", "governance_runtime", "governance_runtime_evidence", "replay", "replay_evidence",
                                    "replay_root_evidence", "replay_owner_evidence",
                                    "replay_config_evidence", "replay_capture_evidence",
                                    "local_placement_evidence",
@@ -1329,10 +1394,6 @@ def run(args):
                                    "capture_source_evidence", "capture_source", "capture_source_history",
                                    "session_exit_evidence", "session_exits", "progress_diagnostic_status",
                                    "registers", "stack_pa", "diagnostic_errors", "final_parse_error")}
-                                 for guest in guests]
-        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
-        os.umask(previous_umask)
-    return report
 
 
 def main():

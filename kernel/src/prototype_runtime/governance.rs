@@ -951,14 +951,29 @@ fn perform_runtime_turn(
         return Err(Error::Stale);
     }
     runtime.last_credit_core = credit.core_generation;
+    // Ready command stages share this one physically prepaid turn. Returning
+    // to the scheduler after PREPARE or a completed SVC added avoidable wall
+    // delay to the immutable 50 ms snapshot. This is not a retry loop: perform
+    // at most one preparation, one EL0 entry and one validation. A preempted
+    // context or retained pin keeps PHASE_RUN and ends the turn unchanged.
+    // step() charges the entire chain against the original 2.5 ms credit;
+    // budget failure, stale ownership and deadline rejection remain fatal.
     match runtime.phase {
-        PHASE_INPUT_PROBE | PHASE_CODE_PROBE | PHASE_UNMAPPED_PROBE | PHASE_TIMER_PROBE
-        | PHASE_RUN => run_runtime_context(runtime, resources),
-        PHASE_PREPARE => prepare_runtime_snapshot(runtime, resources, credit),
-        PHASE_VALIDATE => validate_runtime_command(runtime, resources),
-        PHASE_COMPLETE => Ok(()),
-        _ => Err(Error::Conflict),
+        PHASE_INPUT_PROBE | PHASE_CODE_PROBE | PHASE_UNMAPPED_PROBE | PHASE_TIMER_PROBE => {
+            return run_runtime_context(runtime, resources);
+        }
+        PHASE_PREPARE => prepare_runtime_snapshot(runtime, resources, credit)?,
+        PHASE_RUN | PHASE_VALIDATE => {}
+        PHASE_COMPLETE => return Ok(()),
+        _ => return Err(Error::Conflict),
     }
+    if runtime.phase == PHASE_RUN {
+        run_runtime_context(runtime, resources)?;
+    }
+    if runtime.phase == PHASE_VALIDATE {
+        validate_runtime_command(runtime, resources)?;
+    }
+    Ok(())
 }
 
 /// Run at most one physically prepaid coordinator turn. Returning true means

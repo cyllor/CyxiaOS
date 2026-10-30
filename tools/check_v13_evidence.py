@@ -36,7 +36,7 @@ FAMILIES = frozenset(['D01_WEIGHT', 'D01_CORESET'] + [f'D{i:02}' for i in range(
 STATUSES = frozenset({'PASS', 'FAIL', 'NOT_RUN'})
 
 
-def check_rows(rows, expected, label, root, *, descriptions):
+def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None):
     require(type(rows) is list and len(rows) == len(expected), f'Incomplete {label}')
     ids = [r.get('id') if type(r) is dict else None for r in rows]
     require(all(type(i) is str for i in ids) and len(set(ids)) == len(ids)
@@ -69,7 +69,10 @@ def check_rows(rows, expected, label, root, *, descriptions):
             require(receipt.name == 'summary.json', 'A02 receipt must name summary.json')
             # Fixed reviewed code only. Neither the manifest nor the receipt
             # can select a checker, source checkout or executable archive.
-            observed = verify_native_receipt(receipt.parent, source_root=root)
+            options = {'source_root': root}
+            if qemu_source is not None:
+                options['qemu_source'] = qemu_source
+            observed = verify_native_receipt(receipt.parent, **options)
             require(observed.get('test_id') == 'A02'
                     and observed.get('native_acceptance_status') == row['status']
                     and observed.get('native_execution_verified') is True
@@ -79,7 +82,7 @@ def check_rows(rows, expected, label, root, *, descriptions):
     return counts
 
 
-def validate(document, root=ROOT):
+def validate(document, root=ROOT, *, qemu_source=None):
     root = Path(root).resolve()
     exact_keys(document, {'schema_version', 'spec', 'deviations', 'cases',
                           'action_families', 'filesystem_fault_matrix'})
@@ -97,7 +100,8 @@ def validate(document, root=ROOT):
     exact_keys(d, {'id', 'clause', 'authorized', 'decision'})
     require(d['id'] == 'LANG-RUST' and d['clause'] == '1.2' and d['authorized'] is True
             and type(d['decision']) is str and bool(d['decision'].strip()), 'Invalid Rust deviation')
-    cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True)
+    cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True,
+                       qemu_source=qemu_source)
     definitions = [{key: row[key] for key in ('id', 'scenario', 'required_outcome')}
                    for row in document['cases']]
     encoded = json.dumps(sorted(definitions, key=lambda row: row['id']), ensure_ascii=False,
@@ -135,10 +139,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, default=DEFAULT)
     parser.add_argument('--root', type=Path, default=ROOT)
+    parser.add_argument('--qemu-source', type=Path,
+                        help='explicit trusted patched-QEMU checkout for A02 replay')
     parser.add_argument('--release', action='store_true')
     args = parser.parse_args(argv)
     try:
-        result = validate(read_json(args.manifest), args.root)
+        result = validate(read_json(args.manifest), args.root, qemu_source=args.qemu_source)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2 if args.release and not result['functional_acceptance_complete'] else 0
     except (OSError, ValueError, TypeError) as error:

@@ -116,6 +116,43 @@ def verify_stopped_status(statuses: list[dict]):
             and status.get('singlestep', False) is False, 'invalid stopped VM status')
 
 
+def verify_native_qemu(tools: dict, binary: Path, *, qemu_source: Path | None = None) -> None:
+    """Recheck the local binary; a dirty version string alone is never trusted.
+
+    Legacy stock captures retain their original hash/version contract. Patched
+    captures must match the repository's fixed commit, complete tracked diff,
+    source digests, patch and binary again during independent receipt replay.
+    """
+    from verify_unified import attest_qemu
+    version = tools.get('qemu_version', '')
+    require(isinstance(version, str) and version.splitlines(), 'missing QEMU version')
+    require(isinstance(tools.get('qemu_sha256'), str)
+            and re.fullmatch('[0-9a-f]{64}', tools['qemu_sha256'])
+            and sha256(Path(binary)) == tools['qemu_sha256'], 'QEMU binary identity changed')
+    clean = ('QEMU emulator version 10.2.2', 'QEMU emulator version 10.2.2 (v10.2.2)')
+    if version.splitlines()[0] in clean:
+        require(tools.get('qemu_pmu_patch_attested', False) is False,
+                'stock QEMU cannot claim the PMU patch')
+        return
+    source = tools.get('qemu_source_directory')
+    require(tools.get('qemu_pmu_patch_attested') is True and isinstance(source, str)
+            and Path(source).is_absolute(), 'patched QEMU source attestation missing')
+    # Never run git in an archive-selected directory. The replay caller must
+    # explicitly select the trusted emulator checkout, just like the runner.
+    require(qemu_source is not None and qemu_source.resolve(strict=True)
+            == Path(source).resolve(strict=True), 'explicit trusted QEMU source required')
+    trusted = qemu_source.resolve(strict=True)
+    built = trusted / 'build/qemu-system-aarch64'
+    require(built.is_file() and sha256(built) == sha256(binary),
+            'receipt binary differs from explicit trusted source build')
+    # The receipt chooses no executable either: run --version only on the
+    # caller-selected source build, after binding the archived binary digest.
+    actual = attest_qemu(built.resolve(strict=True), trusted)
+    require(actual.get('qemu_pmu_patch_attested') is True
+            and all(tools.get(key) == value for key, value in actual.items()),
+            'patched QEMU attestation changed')
+
+
 def verify_capture_revision(runner_sha256: str, verifier_sha256: str):
     project = Path(__file__).resolve().parents[1]
     current = tuple(sha256(project / 'tools' / name)
@@ -310,7 +347,8 @@ def verify(trace: bytes, counters: bytes, *, image_sha256: str,
                 scope='Raw capture contract only; use the native runner and its provenance for execution evidence.')
 
 
-def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -> dict:
+def verify_native_receipt(directory: Path, *, source_root: Path | None = None,
+                          qemu_source: Path | None = None) -> dict:
     """Replay known native evidence, ignoring the producer's PASS boolean.
 
     This is process/launch/capture provenance, not a hardware attestation or a
@@ -352,9 +390,7 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -
     verify_capture_revision(sha256(path('run_v13_a02.py')), sha256(path('verify_v13_a02.py')))
     require({'cargo', 'rustc', 'clang'} <= build['tools'].keys(), 'missing build tools')
     tools = document('tools.json')
-    require(tools['build_tools'] == build['tools'] and tools['qemu_version'].splitlines()[0]
-            in ('QEMU emulator version 10.2.2', 'QEMU emulator version 10.2.2 (v10.2.2)')
-            and re.fullmatch('[0-9a-f]{64}', tools['qemu_sha256']), 'unverified native QEMU/toolchain')
+    require(tools['build_tools'] == build['tools'], 'unverified native toolchain')
     image = path('node-a.elf').read_bytes()
     inspect_elf(image)
     require(boot_profile(image)['ram_mib'] == 1024, 'wrong native image RAM profile')
@@ -430,7 +466,7 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -
             'unexpected native loader/device')
     require(options['-drive'] == [f'if=none,id=disk0,format=raw,file={path("disk.raw")},cache=writeback'],
             'wrong native disk attachment')
-    require(sha256(Path(launch[0])) == tools['qemu_sha256'], 'QEMU binary identity changed')
+    verify_native_qemu(tools, Path(launch[0]), qemu_source=qemu_source)
     transcript = read_native_qmp(root)
     requests, responses = [], {}
     for item in transcript:

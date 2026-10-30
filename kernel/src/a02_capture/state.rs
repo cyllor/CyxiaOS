@@ -19,6 +19,39 @@ impl Task {
     };
 }
 
+/// A prepared capture slot is valid only for the exact immutable identity.
+/// A controller restart may change generation without repeating mapping probes.
+/// Registration stays in a separate paid turn; a hit performs no new lookup.
+pub struct PreparedTask {
+    identity: Option<Task>,
+    index: Option<usize>,
+}
+impl PreparedTask {
+    pub const fn new() -> Self {
+        Self {
+            identity: None,
+            index: None,
+        }
+    }
+    /// False means this turn registered a new identity; do not enter EL0 yet.
+    /// None is a valid prepared result when optional capture is disabled.
+    pub fn prepare(&mut self, task: Task, register: impl FnOnce(Task) -> Option<usize>) -> bool {
+        if self.identity == Some(task) {
+            return true;
+        }
+        self.index = register(task);
+        self.identity = Some(task);
+        false
+    }
+    pub fn index(&self, task: Task) -> Result<Option<usize>, ()> {
+        if self.identity == Some(task) {
+            Ok(self.index)
+        } else {
+            Err(())
+        }
+    }
+}
+
 #[repr(C)]
 pub struct Capture<const N: usize, const T: usize> {
     pub header: [u64; 64],
@@ -387,6 +420,59 @@ mod tests {
         c.begin(100, 1000, &config);
         c.boot(4);
         c
+    }
+    #[test]
+    fn prepared_cache_rebinds_a_new_controller_generation_before_entry() {
+        let mut c = capture::<32>();
+        let mut cache = PreparedTask::new();
+        let first = task(20, 2, 2);
+        assert!(!cache.prepare(first, |t| c.prepare(101, t)));
+        assert!(cache.prepare(first, |_| panic!("same identity must not register twice")));
+        assert!(c.enter_prepared(102, 1, first, cache.index(first).unwrap().unwrap()));
+        c.exit_prepared(103, 1, cache.index(first).unwrap().unwrap());
+        let next = Task {
+            generation: 2,
+            ..first
+        };
+        assert_eq!(cache.index(next), Err(()));
+        assert!(!cache.prepare(next, |t| c.prepare(104, t)));
+        assert_eq!(cache.index(first), Err(()));
+        assert_eq!(cache.index(next), Ok(Some(1)));
+        assert!(cache.prepare(next, |_| panic!("registration owns its own turn")));
+        assert!(c.enter_prepared(105, 1, next, cache.index(next).unwrap().unwrap()));
+        c.exit_prepared(106, 1, cache.index(next).unwrap().unwrap());
+        assert_eq!(c.header[4], 0);
+        assert_eq!(c.counters[27], 2);
+        assert_eq!(c.events[3][2], 1);
+        assert_eq!(c.events[3][5], 2);
+    }
+    #[test]
+    fn prepared_cache_checks_the_whole_identity_and_disabled_capture() {
+        let first = task(20, 2, 2);
+        for changed in [
+            Task { id: 21, ..first },
+            Task {
+                generation: 2,
+                ..first
+            },
+            Task { role: 1, ..first },
+            Task {
+                affinity: 4,
+                ..first
+            },
+        ] {
+            let mut cache = PreparedTask::new();
+            assert_eq!(cache.index(first), Err(()));
+            assert!(!cache.prepare(first, |_| None));
+            assert!(cache.prepare(first, |_| panic!("disabled capture also caches")));
+            assert_eq!(cache.index(first), Ok(None));
+            assert_eq!(cache.index(changed), Err(()));
+            assert!(!cache.prepare(changed, |t| {
+                assert_eq!(t, changed);
+                None
+            }));
+            assert_eq!(cache.index(first), Err(()));
+        }
     }
     #[test]
     fn counters_follow_boundaries_and_raw_denial_after_return() {

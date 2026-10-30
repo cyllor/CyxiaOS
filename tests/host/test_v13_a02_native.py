@@ -144,6 +144,15 @@ class A02NativeProducer(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('0 failed', result.stdout)
 
+    def test_control_capture_preparation_is_bound_to_current_identity(self):
+        source = (ROOT / 'kernel/src/prototype_runtime/native.rs').read_text()
+        run = source[source.index('fn run_turn('):source.index('fn charge_turn(')]
+        self.assertIn('let task = capture_task(slot);', run)
+        compact = ''.join(run.split())
+        self.assertIn('.capture.prepare(task,crate::a02_capture::prepare)', compact)
+        self.assertIn('worker.native.capture.index(task)', compact)
+        self.assertNotIn('worker.native.capture_index', source)
+
     def test_capture_contention_sleeps_until_a_published_unlock_event(self):
         source = (ROOT / 'kernel/src/a02_capture.rs').read_text()
         lock = source[source.index('fn locked<R>'):source.index('/// CPU0, before')]

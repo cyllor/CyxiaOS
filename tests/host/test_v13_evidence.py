@@ -53,6 +53,34 @@ class EvidenceCatalogue(unittest.TestCase):
     def check_native_row(self, row, root):
         return self.check.check_rows([row], {row['id']}, 'case set', root, descriptions=True)
 
+    def test_a02_patched_emulator_source_comes_only_from_explicit_caller(self):
+        # Mock tests adapter routing only, never execution or native acceptance.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root)
+            source = root / 'trusted-emulator'
+            with patch.object(self.check, 'verify_native_receipt', return_value={
+                    'test_id': 'A02', 'native_acceptance_status': 'PASS',
+                    'native_execution_verified': True, 'runtime_truth_attested': False}) as replay:
+                self.check.check_rows([row], {'A02'}, 'case set', root,
+                                      descriptions=True, qemu_source=source)
+                replay.assert_called_once_with(root, source_root=root, qemu_source=source)
+            row['evidence']['qemu_source'] = str(source)
+            with patch.object(self.check, 'verify_native_receipt') as replay:
+                with self.assertRaises(ValueError):
+                    self.check_native_row(row, root)
+                replay.assert_not_called()
+
+    def test_a02_legacy_adapter_does_not_infer_an_emulator_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root)
+            with patch.object(self.check, 'verify_native_receipt', return_value={
+                    'test_id': 'A02', 'native_acceptance_status': 'PASS',
+                    'native_execution_verified': True, 'runtime_truth_attested': False}) as replay:
+                self.check_native_row(row, root)
+                replay.assert_called_once_with(root, source_root=root)
+
     def test_raw_contract_or_producer_pass_boolean_cannot_close_a02(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

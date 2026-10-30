@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 mod abi;
 #[path = "domain_tasks/baseline_diagnostics.rs"]
 mod baseline_diagnostics;
+#[path = "domain_tasks/control_diagnostics.rs"]
+mod control_diagnostics;
 #[path = "domain_tasks/deadline.rs"]
 mod deadline;
 #[path = "domain_tasks/execution.rs"]
@@ -1504,6 +1506,15 @@ pub fn complete_control(
     }
     locked(|s| {
         let result = s.scheduler.complete_control(credit, actual_ns, finished_ns);
+        control_diagnostics::CONTROL_SETTLEMENT_EVIDENCE.settled(
+            credit,
+            actual_ns,
+            finished_ns,
+            result,
+            s.scheduler
+                .control_active(usize::from(credit.cpu))
+                .is_some(),
+        );
         if result == Err(Error::Budget) {
             publish_evidence(s);
         }

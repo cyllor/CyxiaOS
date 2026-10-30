@@ -22,6 +22,7 @@ import tempfile
 import time
 
 from build_unified import code_source_map
+from verify_unified import attest_qemu
 from check_elf import boot_profile, inspect_elf, symbol
 from run_qemu import Qmp
 from transport import FrameDecoder
@@ -92,7 +93,8 @@ def _json(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
-def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict:
+def run(build: Path, output: Path, formatter: Path, timeout: float = 90, *,
+        qemu: Path | None = None, qemu_source: Path | None = None) -> dict:
     require(5 <= timeout <= 300, 'invalid bounded runtime')
     build = build.resolve(strict=True)
     output = output.resolve()
@@ -152,12 +154,12 @@ def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict
         # A newly formatted volume has no allocated BootEpoch yet. The durable
         # decoder deliberately rejects epoch zero; decode after the real boot.
         _json(output / 'disk-before.json', dict(sha256=sha(disk), boot_epoch=0, uuid=filesystem_id))
-        binary = shutil.which('qemu-system-aarch64')
+        binary = str(qemu.resolve(strict=True)) if qemu is not None else shutil.which('qemu-system-aarch64')
         require(binary is not None, 'QEMU is missing')
-        version = subprocess.check_output([binary, '--version'], text=True, timeout=10)
-        require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
-                'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
-        _json(output / 'tools.json', dict(qemu_version=version, qemu_sha256=sha(Path(binary)),
+        qemu_identity = attest_qemu(binary, qemu_source)
+        if qemu_identity['qemu_pmu_patch_attested']:
+            qemu_identity['qemu_source_directory'] = str(qemu_source.resolve(strict=True))
+        _json(output / 'tools.json', dict(**qemu_identity,
               formatter_sha256=sha(formatter), build_tools=manifest['tools']))
         with tempfile.TemporaryDirectory(prefix='cyx-a02-') as temporary, \
                 (output / 'qemu-stderr.log').open('wb') as errors:
@@ -281,7 +283,7 @@ def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict
     _json(output / 'summary.json', report)
     if report['status'] == 'PASS':
         try:
-            report['independent_receipt'] = verify_native_receipt(output)
+            report['independent_receipt'] = verify_native_receipt(output, qemu_source=qemu_source)
             report.update(execution_flags(True))
         except (OSError, ValueError, KeyError, struct.error) as error:
             report.update(status='FAIL', native_acceptance_status='NOT_RUN', **execution_flags(False),
@@ -296,9 +298,12 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--formatter', required=True, type=Path)
     parser.add_argument('--timeout', type=float, default=90)
+    parser.add_argument('--qemu', type=Path, help='explicit pinned QEMU binary')
+    parser.add_argument('--qemu-source', type=Path, help='exact source for the pinned PMU-patched build')
     args = parser.parse_args()
     try:
-        result = run(args.build, args.output, args.formatter, args.timeout)
+        result = run(args.build, args.output, args.formatter, args.timeout,
+                     qemu=args.qemu, qemu_source=args.qemu_source)
         print(json.dumps(result, indent=2))
         return 0 if result['status'] == 'PASS' else 1
     except (OSError, ValueError, KeyError) as error:

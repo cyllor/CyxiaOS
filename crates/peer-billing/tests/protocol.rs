@@ -770,12 +770,15 @@ fn actual_terminal_busy() -> (Failure, cyxia_prototype::policy::PlanReceipt) {
     let failure = Failure::rejected(
         17,
         receipt,
-        snapshot,
-        target,
-        Sha256::digest(&bytes[..count]).into(),
-        101,
-        102,
-        50_000_100,
+        cyxia_peer_billing::FailedPublication {
+            id: receipt.id,
+            snapshot,
+            target,
+            plan_hash: Sha256::digest(&bytes[..count]).into(),
+            received_ns: 101,
+            observed_ns: 102,
+            wall_deadline_ns: 50_000_100,
+        },
     )
     .unwrap();
     (failure, receipt)
@@ -880,19 +883,7 @@ fn failure_cannot_rebind_boot_trial_plan_or_be_forged_from_pending_and_unknown()
     ] {
         let mut unresolved = receipt;
         unresolved.actions[0] = state;
-        assert_eq!(
-            Failure::rejected(
-                17,
-                unresolved,
-                p.snapshot,
-                p.target,
-                p.plan_hash,
-                p.received_ns,
-                p.observed_ns,
-                p.wall_deadline_ns
-            ),
-            Err(Error::Incomplete)
-        );
+        assert_eq!(Failure::rejected(17, unresolved, p), Err(Error::Incomplete));
     }
     for published in [
         cyxia_prototype::policy::PlanReceipt {
@@ -904,19 +895,7 @@ fn failure_cannot_rebind_boot_trial_plan_or_be_forged_from_pending_and_unknown()
             ..receipt
         },
     ] {
-        assert_eq!(
-            Failure::rejected(
-                17,
-                published,
-                p.snapshot,
-                p.target,
-                p.plan_hash,
-                p.received_ns,
-                p.observed_ns,
-                p.wall_deadline_ns
-            ),
-            Err(Error::Incomplete)
-        );
+        assert_eq!(Failure::rejected(17, published, p), Err(Error::Incomplete));
     }
     let notice = RootFailure {
         binding: b,
@@ -1048,4 +1027,34 @@ fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
             ns: wall_ns,
         },
     }
+}
+
+#[test]
+fn rejected_publication_context_cannot_rebind_the_terminal_plan() {
+    let (failure, receipt) = actual_terminal_busy();
+    let original = failure.publication.unwrap();
+    for id in [
+        cyxia_prototype::policy::PlanId {
+            boot_epoch: original.id.boot_epoch + 1,
+            ..original.id
+        },
+        cyxia_prototype::policy::PlanId {
+            controller_epoch: original.id.controller_epoch + 1,
+            ..original.id
+        },
+        cyxia_prototype::policy::PlanId {
+            plan_seq: original.id.plan_seq + 1,
+            ..original.id
+        },
+    ] {
+        assert_eq!(
+            Failure::rejected(
+                17,
+                receipt,
+                cyxia_peer_billing::FailedPublication { id, ..original }
+            ),
+            Err(Error::Identity)
+        );
+    }
+    assert_eq!(Failure::rejected(17, receipt, original), Ok(failure));
 }

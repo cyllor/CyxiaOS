@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_arch_aarch64::{cpu, timer};
 #[path = "a02_capture/state.rs"]
 mod state;
-pub use state::Task;
+pub use state::{PreparedTask, Task};
 
 pub const EVENTS: usize = 8192;
 const TASKS: usize = 512;
