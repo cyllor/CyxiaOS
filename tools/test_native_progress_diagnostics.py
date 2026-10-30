@@ -33,8 +33,8 @@ class ProgressDiagnostics(unittest.TestCase):
         # CPU2 is physically stopped before its row is release-published.
         p[64:70] = [0x4359505542430002, 0, 2, 7, 9, 12]
         c = [0] * 128
-        c[:14] = [0x4359535243450001, 1, 2, 7, 1, 2, 1, 1, 0, 0, 0, 1, 0, 1]
-        c[16:40] = [99, 8, 13, 2, 2, 0, 1, 37, 100, 137, 100, 137,
+        c[:14] = [0x4359535243450001, 2, 2, 7, 1, 2, 1, 1, 0, 1, 0, 1, 0, 0]
+        c[16:40] = [13, 2, 13, 2, 2, 0, 5, 1, 100, 100, 1, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         snapshot['DOMAIN_PUBLICATION_COST'] = fixtures.encode(p)
         snapshot['TRACE_SOURCE_EVIDENCE'] = fixtures.encode(c)
@@ -119,8 +119,13 @@ class ProgressDiagnostics(unittest.TestCase):
         self.assertEqual(guest['progress_diagnostic_status']['publication_cost']['in_progress_cpus'], [2])
         source = guest['capture_source']
         self.assertEqual(source['run'], [7, 1, 2])
-        self.assertEqual(source['sources'][0]['original_owner'], [99, 8])
-        self.assertEqual(source['sources'][0]['resolved_source'], [13, 2])
+        observation = source['sources'][0]
+        self.assertEqual(observation['offered_owner'], [13, 2])
+        self.assertEqual(observation['direct_source'], [13, 2])
+        self.assertEqual(observation['latest_start_cpu_ticks'], 100)
+        self.assertNotIn('sample_interval_ns', observation)
+        self.assertFalse(source['admission_known'])
+        self.assertFalse(source['completion_known'])
         self.assertFalse(source['attribution_complete'])
         self.assertIsNone(source['current_run_match'])
 
