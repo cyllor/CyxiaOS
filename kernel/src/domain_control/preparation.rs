@@ -5,14 +5,13 @@ use cyxia_prototype::{
     policy::{ModelBinding, Snapshot},
 };
 
-// Candidate registration, canonical input construction and hashing are a
-// fixed non-preemptible tail inside the enclosing 2.5 ms native control
-// credit. Stop before that tail when the measured preparation prefix has
-// already consumed this conservative share. The independent 2 ms decision
-// bound remains unchanged and is still checked by Pending and accept().
-pub const PRE_REGISTRATION_CPU_LIMIT_NS: u64 = 1_750_000;
-pub fn check_pre_registration(elapsed_ns: u64) -> Result<(), Error> {
-    if elapsed_ns > PRE_REGISTRATION_CPU_LIMIT_NS {
+// The candidate input page is hashed in a fixed non-preemptible tail.
+// Enforce the existing 2 ms decision bound immediately before that tail,
+// leaving the enclosing 2.5 ms native control credit for rejection and
+// settlement without weakening either normative limit.
+pub const DECISION_CPU_LIMIT_NS: u64 = 2_000_000;
+pub fn check_decision_cpu(elapsed_ns: u64) -> Result<(), Error> {
+    if elapsed_ns > DECISION_CPU_LIMIT_NS {
         Err(Error::Budget)
     } else {
         Ok(())
@@ -251,13 +250,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pre_registration_gate_retains_tail_credit() {
-        assert_eq!(
-            check_pre_registration(PRE_REGISTRATION_CPU_LIMIT_NS),
-            Ok(())
-        );
+    fn decision_gate_preserves_two_millisecond_limit() {
+        assert_eq!(check_decision_cpu(DECISION_CPU_LIMIT_NS), Ok(()));
         assert!(matches!(
-            check_pre_registration(PRE_REGISTRATION_CPU_LIMIT_NS + 1),
+            check_decision_cpu(DECISION_CPU_LIMIT_NS + 1),
             Err(Error::Budget)
         ));
     }
