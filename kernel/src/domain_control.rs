@@ -2036,6 +2036,7 @@ impl PublicationScope for ActiveScope<'_> {
 struct ActivePublication<'a> {
     active: ActiveScope<'a>,
     task_publication: Option<crate::domain_tasks::SchedulerPublication>,
+    spawn_publication: Option<crate::domain_tasks::SpawnPublication>,
 }
 impl PublicationScope for ActivePublication<'_> {
     fn authorize(
@@ -2047,6 +2048,9 @@ impl PublicationScope for ActivePublication<'_> {
         self.active.authorize(active, set, at)
     }
     fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return spawn.validate(action, target, at);
+        }
         match self.task_publication.as_ref() {
             Some(task) if matches!(action, Action::CpuWeight(_)) => {
                 task.validate(action, target, at)
@@ -2088,6 +2092,16 @@ impl PublicationScope for ActivePublication<'_> {
         target: ObjectKey,
         at: u64,
     ) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return validate_selection_with(
+                owner,
+                action,
+                target,
+                at,
+                || spawn.current(action.domain(), target),
+                |options, output| spawn.legal_options(options, target, at, output),
+            );
+        }
         match self.task_publication.as_ref() {
             Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with(
                 owner,
@@ -2466,6 +2480,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         };
         let mut decode_cpu_started = None;
         let mut task_publication = None;
+        let mut spawn_publication = None;
         let mut acquisition_busy = false;
         let mut registry_completed = false;
         const _: () = assert!(cfg!(target_endian = "little"));
@@ -2518,6 +2533,29 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                             job.set.get(0).ok_or(Error::NotReady)?.action,
                         ) {
                             Ok(view) => task_publication = view,
+                            Err(Error::Busy) => {
+                                acquisition_busy = true;
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                if (0..job.set.len()).all(|i| {
+                    job.set
+                        .get(i)
+                        .is_some_and(|candidate| matches!(candidate.action, Action::SpawnTokens(_)))
+                }) {
+                    let consumer = s.owner.families[family_index(2, 1)?].ok_or(Error::NotReady)?;
+                    if crate::domain_tasks::spawn_publication_matches(
+                        &consumer,
+                        s.owner.dependencies[1],
+                        s.owner.dependency_binders[1].is_some(),
+                    ) {
+                        match crate::domain_tasks::reserve_spawn_publication(
+                            job.set.get(0).ok_or(Error::NotReady)?.action,
+                        ) {
+                            Ok(view) => spawn_publication = view,
                             Err(Error::Busy) => {
                                 acquisition_busy = true;
                                 return Err(Error::Busy);
@@ -2582,6 +2620,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 scope: ActivePublication {
                     active: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
                     task_publication: task_publication.take(),
+                    spawn_publication: spawn_publication.take(),
                 },
                 model: job.set.model,
                 evidence: job.evidence,
@@ -2628,6 +2667,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         // No task-owner borrow may survive into Root/work delivery. The
         // functional final sample includes the actual release CPU as well.
         drop(task_publication);
+        drop(spawn_publication);
         if acquisition_busy {
             let observed = policy::Clock::read(&mut NativeClock);
             let retry = budget.check(observed).and_then(|()| {

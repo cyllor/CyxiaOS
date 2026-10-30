@@ -19,6 +19,9 @@ static TASK_GATE:owner_gate::Gate=owner_gate::Gate::new();
 mod domain_tasks{
  use super::*;
  pub struct SchedulerPublication{permit:Option<owner_gate::Permit<'static>>}
+ pub struct SpawnPublication;
+ pub fn spawn_publication_matches(_:&Family,_:Option<fn(ObjectKey)->Result<[Option<Prerequisite>;2],Error>>,_:bool)->bool{false}
+ pub fn reserve_spawn_publication(_:Action)->Result<Option<SpawnPublication>,Error>{panic!("D01 fixture must not reserve D02")}
  impl Drop for SchedulerPublication{fn drop(&mut self){self.permit.take().unwrap().release(WALL.load(Ordering::Acquire));BORROWS.fetch_sub(1,Ordering::AcqRel);WALL.fetch_add(RELEASE_WALL.load(Ordering::Acquire),Ordering::AcqRel);pay(RELEASE_CPU.load(Ordering::Acquire));}}
  pub fn scheduler_publication_matches(_:&Family,_:Option<&Family>,_:Option<fn(ObjectKey)->Result<[Option<Prerequisite>;2],Error>>,custom:bool)->bool{ELIGIBLE.load(Ordering::Acquire)&&!custom}
  pub fn reserve_scheduler_publication(action:Action)->Result<Option<SchedulerPublication>,Error>{assert!(matches!(action,Action::CpuWeight(_)));ACQUIRES.fetch_add(1,Ordering::AcqRel);pay(ACQUIRE_CPU.load(Ordering::Acquire));WALL.fetch_add(ACQUIRE_WALL.load(Ordering::Acquire),Ordering::AcqRel);match FAULT.load(Ordering::Acquire){1=>CPU.store(0,Ordering::Release),2=>CPU.store(u64::MAX-100,Ordering::Release),_=>()};let permit=TASK_GATE.try_acquire(1,WALL.load(Ordering::Acquire),1).ok_or(Error::Busy)?;BORROWS.fetch_add(1,Ordering::AcqRel);Ok(Some(SchedulerPublication{permit:Some(permit)}))}
@@ -26,7 +29,7 @@ mod domain_tasks{
 // Explicit resource/model/Root scope boundary: real composition tested separately.
 struct Gate;impl Gate{fn check_active_publication(&self,_:ModelBinding,_:ObjectKey)->Result<(),Error>{Ok(())}}
 struct ActiveScope<'a>(&'a Gate);
-struct ActivePublication<'a>{active:ActiveScope<'a>,task_publication:Option<domain_tasks::SchedulerPublication>}
+struct ActivePublication<'a>{active:ActiveScope<'a>,task_publication:Option<domain_tasks::SchedulerPublication>,spawn_publication:Option<domain_tasks::SpawnPublication>}
 macro_rules! scope_facade{($name:ident)=>{impl PublicationScope for $name<'_>{fn authorize(&mut self,m:ModelBinding,s:&RegisteredSet,t:u64)->Result<(),Error>{Scope.authorize(m,s,t)}fn legal(&self,f:Family,a:Action,k:ObjectKey,t:u64)->Result<(),Error>{Scope.legal(f,a,k,t)}fn dependencies(&self,o:&Owner,a:Action,k:ObjectKey,t:u64)->Result<[Option<BoundDependency>;2],Error>{Scope.dependencies(o,a,k,t)}fn selection(&self,o:&Owner,f:Family,a:Action,k:ObjectKey,t:u64)->Result<(),Error>{Scope.selection(o,f,a,k,t)}fn commit(&mut self,o:&Owner,m:ModelBinding,p:&Plan,s:&[PolicyStamp],b:u64,t:u64)->Result<(),Error>{Scope.commit(o,m,p,s,b,t)}}}}
 scope_facade!(ActiveScope);scope_facade!(ActivePublication);
 pub mod core_replay{#[derive(Clone,Copy)]pub struct WorkId;pub struct PaidWorkWitness;pub fn evaluated(_:WorkId,_:u64,_:Result<u64,super::Error>,_:[u8;32])->Result<(),super::Error>{if super::DELIVERY_BUSY.load(super::Ordering::Acquire){Err(super::Error::Busy)}else{Ok(())}}}
