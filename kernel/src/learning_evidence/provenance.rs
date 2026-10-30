@@ -10,7 +10,7 @@ use cyxia_prototype::{
 pub const OWNED_BYTES: usize = 1024;
 #[derive(Clone, Copy)]
 pub struct TaskIdentity {
-    /// 2 cleanup, 3 recipe, 4 deferred return; site5 is service I/O.
+    /// 2 cleanup, 3 recipe, 4 deferred return; sites5/6 have no task identity.
     pub site: u64,
     pub caller: ObjectKey,
     pub request: u64,
@@ -61,6 +61,11 @@ pub(super) struct Observation {
 /// Last successfully observed run survives seal/retire. A subsequent observed
 /// run replaces it explicitly; a run with no observation does not gain evidence.
 pub(super) fn observed(e: Observation) {
+    // Site1 remains unproved. Ordinary poll supplies no caller/child identity;
+    // reject malformed scope before touching the retained observed-run bank.
+    if !matches!(e.site, 2..=6) || (e.site == 6 && e.identity.is_some()) {
+        return;
+    }
     let b = &TRACE_SOURCE_EVIDENCE;
     b.0[2].fetch_add(1, Ordering::AcqRel);
     let run = [e.run.boot_epoch, e.run.trial_id, e.run.generation];

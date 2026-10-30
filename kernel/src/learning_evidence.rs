@@ -823,10 +823,15 @@ impl PaidEntry<'_> {
             (identity.site, Some(identity))
         });
     }
+    /// Ordinary owner poll has no task identity. Its caller proves the
+    /// enclosing service_segment ledger sample independently.
+    pub fn observe_workload_poll(self) {
+        observe_paid_entry(self.attempt, self.started, || (6, None));
+    }
 }
-/// Only TaskGuard service_segment bodies use this opt-in. Identity construction
-/// occurs lazily inside the original capture sample and its enclosing service
-/// ledger sample, never during credit setup or completion.
+/// Only bodies enclosed by TaskGuard service_segment use this opt-in. Identity
+/// construction occurs lazily inside the original capture sample and its
+/// enclosing service ledger sample, never during credit setup or completion.
 #[inline(never)]
 pub(crate) fn measure_paid_task<R>(
     owner: ObjectKey,

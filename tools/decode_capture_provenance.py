@@ -32,8 +32,9 @@ def decode(data: bytes, expected_run: tuple[int, int, int] | None = None) -> dic
             raise ValueError('invalid direct roster source; aliases stay unresolved')
         return list(direct) if present else None
 
-    def identity(values, present):
-        if present not in (0, 1) or not present and any(values) or values[5] > 0xffff:
+    def identity(values, present, site):
+        if (present not in (0, 1) or not present and any(values) or values[5] > 0xffff
+                or present and (site == 6 or not all(values[:5]))):
             raise ValueError('invalid task identity presence')
         return {'caller': list(values[:2]), 'request': values[2],
                 'child': list(values[3:5]), 'recipe': values[5]} if present else None
@@ -42,7 +43,7 @@ def decode(data: bytes, expected_run: tuple[int, int, int] | None = None) -> dic
     keys = set()
     for i in range(w[11]):
         r = w[16+i*24:40+i*24]
-        if r[4] > 3 or r[5] != 0 or r[6] not in (2, 3, 4, 5) or not r[7] or r[8] > r[9] or any(r[18:]):
+        if r[4] > 3 or r[5] != 0 or r[6] not in (2, 3, 4, 5, 6) or not r[7] or r[8] > r[9] or any(r[18:]):
             raise ValueError('invalid paid CPU0 observation')
         if r[:7] in keys:
             raise ValueError('duplicate producer bucket')
@@ -50,22 +51,24 @@ def decode(data: bytes, expected_run: tuple[int, int, int] | None = None) -> dic
         rows.append({'offered_owner': list(r[:2]), 'direct_source': source(r[:2], r[2:4], r[10]),
                      'class': r[4], 'core': r[5], 'site': r[6], 'observations': r[7],
                      'first_start_cpu_ticks': r[8], 'latest_start_cpu_ticks': r[9],
-                     'task_identity': identity(r[12:18], r[11])})
+                     'task_identity': identity(r[12:18], r[11], r[6])})
     if sum(r['observations'] for r in rows) + w[10] != w[6]:
         raise ValueError('observation bucket overflow accounting mismatch')
     overflow = None
     if w[14]:
         r = w[112:128]
-        if not w[10] or r[4] > 3 or r[5] != 0 or r[6] not in (2, 3, 4, 5):
+        if not w[10] or r[4] > 3 or r[5] != 0 or r[6] not in (2, 3, 4, 5, 6):
             raise ValueError('invalid overflow observation')
         if r[:7] in keys:
             raise ValueError('overflow source already has a producer bucket')
         overflow = {'offered_owner': list(r[:2]), 'direct_source': source(r[:2], r[2:4], r[8]),
                     'class': r[4], 'core': r[5], 'site': r[6], 'start_cpu_ticks': r[7],
-                    'task_identity': identity(r[10:16], r[9])}
+                    'task_identity': identity(r[10:16], r[9], r[6])}
     known_min = sum(r['observations'] for r in rows if r['direct_source'] is not None)
     unresolved_min = sum(r['observations'] for r in rows if r['direct_source'] is None)
-    unknown_task_min = sum(r['task_identity'] is None for r in rows)
+    # Every site6 invocation lacks task identity, including earlier invocations
+    # in an aggregate bucket. Other sites retain only their latest sample.
+    unknown_task_min = sum(r['observations'] if r['site'] == 6 else r['task_identity'] is None for r in rows)
     known_task_min = sum(r['task_identity'] is not None for r in rows)
     if overflow:
         known_min += overflow['direct_source'] is not None
@@ -75,7 +78,7 @@ def decode(data: bytes, expected_run: tuple[int, int, int] | None = None) -> dic
     if w[7] < known_min or w[8] < unresolved_min or not unknown_task_min <= w[9] <= w[6]-known_task_min:
         raise ValueError('header totals cannot describe observed producer samples')
     return {'present': True, 'schema': 2, 'run': list(run), 'attribution_complete': False,
-            'scope': 'paid CPU0 cleanup/recipe/deferred-return/serviceIO invocation observations; last successfully observed run; contended probes omitted',
+            'scope': 'paid CPU0 cleanup/recipe/deferred-return/serviceIO/ordinary-poll invocation observations; last successfully observed run; contended probes omitted',
             'admission_known': False, 'completion_known': False,
             'observations': w[6], 'direct_known_observations': w[7],
             'unresolved_observations': w[8], 'task_identity_unknown_observations': w[9],

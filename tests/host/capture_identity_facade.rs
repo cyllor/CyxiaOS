@@ -19,6 +19,7 @@ pub fn measure_task<R>(
 pub struct PaidEntry;
 impl PaidEntry {
     pub fn observe(self, identity: impl FnOnce()->TaskIdentity) { let _=identity(); }
+    pub fn observe_workload_poll(self) {}
 }
 pub fn measure_paid_task<R>(
     _:cyxia_prototype::domains::ObjectKey,
