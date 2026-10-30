@@ -2446,7 +2446,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             [s.boot, job.controller, job.sequence, job.set.target.id,
                 job.set.target.generation, job.set.model.generation,
                 u64::from(domain), u64::from(kind)],
-            job.publication_debit, publication_started,
+            job.publication_debit, publication_started, optimization_was_stopped,
         );
         let budget = policy::PublicationBudget {
             started: publication_started,
@@ -2642,6 +2642,28 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             .unwrap_or_else(|| decode_cpu_started.map(timer::cpu_elapsed_ns).unwrap_or(0));
         let publication_cost = publication_cost::prepare(job.sequence, decoding);
         let observed = policy::Clock::read(&mut NativeClock);
+        // Keep the original terminal sample physically in the diagnostic
+        // checkpoint. Finish every diagnostic operation before the enclosing
+        // sample that charges its serialization as actual publication CPU.
+        let checkpoint_elapsed = publication_started.cpu_elapsed(observed).and_then(|elapsed| {
+            elapsed.checked_add(job.publication_debit.ns).ok_or(Error::Overflow)
+        });
+        let checkpoint_cap = budget.check(observed).and_then(|()| {
+            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                Err(Error::Expired)
+            } else { Ok(()) }
+        });
+        let registry_stopped = s.registry.optimization_stopped();
+        let checkpoint_local_stop = !job.read_only
+            && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
+                || checkpoint_cap.is_err());
+        let checkpoint_result = if checkpoint_local_stop && !registry_completed {
+            checkpoint_cap.and(result)
+        } else { result };
+        publication_cost.finish(observed, checkpoint_elapsed, checkpoint_result,
+            checkpoint_cap, registry_stopped, checkpoint_local_stop);
+        // No diagnostic access or mutation may follow this charged boundary.
+        let observed = policy::Clock::read(&mut NativeClock);
         let elapsed = publication_started
             .cpu_elapsed(observed)
             .and_then(|elapsed| {
@@ -2654,8 +2676,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         let publication_ns = elapsed
             .and_then(|elapsed| elapsed.checked_sub(decoding).ok_or(Error::Range))
             .unwrap_or(u64::MAX);
-        let registry_stopped = s.registry.optimization_stopped();
-        let cap = budget.check(observed).and_then(|()| {
+        let cap = checkpoint_cap.and_then(|()| budget.check(observed)).and_then(|()| {
             if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
                 Err(Error::Expired)
             } else {
@@ -2699,7 +2720,6 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 publication_started.cpu.ns,
             ]);
         }
-        publication_cost.finish(observed, elapsed, result, cap, registry_stopped, local_stop);
         job.completion = Some(JobCompletion {
             result,
             selected,

@@ -9,14 +9,15 @@ use cyxia_prototype::{
     policy::{self, PlanReceipt, PublicationTime},
 };
 
-const SCHEMA: u64 = 0x4359505542430001;
+const SCHEMA: u64 = 0x4359505542430002;
 // Row ABI (all u64, little endian): 0 schema, 1 flags (stop/conflict/
 // overflow/chronology = 1/2/4/8), 2 CPU, 3..10 identity, 11 carried debit,
 // 12..13 start wall/CPU, 14 decode CPU, 15 Registry read count, 16..17 native
 // precommit, 18..19 Registry return, 20 return kind (none/Err/refused/version),
-// 21 version, 22 receipt error+1, 23..24 release, 25..26 original final sample,
-// 27 cumulative CPU, 28 final cap error+1, 29..30 result version/error+1,
-// 31..32 Registry/local stop, 33..42 original Registry wall/CPU samples,
+// 21 version, 22 receipt error+1, 23..24 release, 25..26 original terminal
+// sample (now the pre-serialization checkpoint), 27 checkpoint cumulative
+// CPU, 28 checkpoint cap error+1, 29..30 checkpoint result version/error+1,
+// 31..32 checkpoint Registry/local stop, 33..42 original Registry samples,
 // 43..45 returned PlanId, 46 precommit-present, 47..62 reserved, 63 validity.
 // The five Registry samples are first validation, after prepare, after
 // revalidation, after model authorization, and after retaining the receipt.
@@ -77,13 +78,22 @@ fn current(job: u64) -> Option<&'static Row> {
 
 /// identity: boot, controller, original Job sequence, target id/generation,
 /// model generation, domain and kind. A stopped row is never overwritten.
-pub fn begin(identity: [u64; 8], debit: policy::CpuTime, at: PublicationTime) {
+pub fn begin(identity: [u64; 8], debit: policy::CpuTime, at: PublicationTime, preserve: bool) {
     let cpu = cyxia_arch_aarch64::cpu::slot();
     if !(1..=2).contains(&cpu) {
         return;
     }
     let row = &DOMAIN_PUBLICATION_COST.0[cpu - 1];
     if row.get(1) & 1 != 0 {
+        return;
+    }
+    // A serializer-only overrun is discovered after this row is complete.
+    // The next attempt's already-started CPU budget pays this retention flag;
+    // no diagnostic write is added after the previous enclosing sample.
+    if preserve {
+        if row.get(0) == SCHEMA {
+            row.flag(1);
+        }
         return;
     }
     row.published.store(0, Ordering::Release);
@@ -222,8 +232,10 @@ pub fn prepare(job: u64, decoded: u64) -> Prepared {
     }
 }
 impl Prepared {
-    /// Only serialize original terminal values after their protected check.
-    /// All prefix preparation and validation ran before that actual sample.
+    /// Serialize the original terminal checkpoint before the additional
+    /// enclosing charged sample. These are checkpoint values, not final cap
+    /// authority. Original stop/completion evidence independently binds the
+    /// final charged outcome; diagnostics never run after that boundary.
     pub fn finish(
         self,
         at: PublicationTime,

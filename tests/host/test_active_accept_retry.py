@@ -46,17 +46,20 @@ class ActiveAcceptRetry(unittest.TestCase):
     ('                budget,\n                job.started.checked_add','                policy::PublicationBudget::fresh(publication_started),\n                job.started.checked_add','active_accept_registry_budget','Registry initial cap ignored carried CPU'),
     ('carried: self.publication_debit,','carried: policy::CpuTime{cpu:self.publication_started.cpu.cpu,ns:0},','active_accept_native_precommit','Native precommit forgot same Job debit'),
     ('elapsed_ns: job.publication_debit.ns,','elapsed_ns: 0,','active_accept_abort_keeps','abort dropped prior actual publication CPU'),
-    ('let cap = budget.check(observed)','let cap = policy::PublicationBudget::fresh(publication_started).check(observed)','active_accept_release_cap_includes','release cap forgot earlier actual CPU'),
+    ('budget.check(observed)','policy::PublicationBudget::fresh(publication_started).check(observed)','active_accept_release_cap_includes','release cap forgot earlier actual CPU'),
     ('if local_stop {','if false {','active_accept_release_overrun','release CPU escaped final publication cap'),
     ('if acquisition_busy {','if acquisition_busy || result == Err(Error::Busy) {','active_accept_only_acquisition','completed resource/model/Root/selection Busy was retried'),
     ('drop(task_publication);','core::mem::forget(task_publication);','active_accept_guard_releases','delivery retained Task guard'),
-    ('        let cap = budget.check(observed).and_then(|()| {\n            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {','        let cap = budget.check(observed).and_then(|()| {\n            if false {','active_accept_release_wall_overrun','release escaped original wall deadline'),
+    ('if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {','if false {','active_accept_release_wall_overrun','release escaped original wall deadline'),
     ('if !registry_completed','if true','active_accept_release_overrun','left: Err(Budget)'),
     ('if crate::domain_tasks::scheduler_publication_matches(','if true || crate::domain_tasks::scheduler_publication_matches(','active_accept_contract_fallback','unmatched registration acquired Task guard'),
     ('is_some_and(|job| job.completion.is_some())','is_some_and(|_| false)','active_accept_delivery_busy','delivery retried completed publication'),
    ]
    for old,new,name,message in mutants:
-    self.assertEqual(original.count(old),1,'mutation anchor: '+old)
+    # The original checkpoint and enclosing charged cap must both lose the
+    # same guard for these controls; the retry shares that original guard.
+    count=3 if old in ('budget.check(observed)','if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {') else 1
+    self.assertEqual(original.count(old),count,'mutation anchor: '+old)
     source.write_text(original.replace(old,new))
     negative=subprocess.run(command[:-1]+[name],cwd=ROOT,env=e,capture_output=True,text=True,timeout=60)
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
