@@ -6,7 +6,7 @@ use cyxia_contracts::BootInfo;
 use cyxia_driver_gicv2::Gic;
 use cyxia_prototype::{
     domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp, platform::*},
-    features::TargetFeatures,
+    features::{DomainObservation, TargetFeatures},
     policy::ExecutionState,
 };
 #[path = "domain_platform/ipi.rs"]
@@ -787,6 +787,67 @@ fn control_observe(domain: u16, key: ObjectKey) -> Result<[u64; 4], Error> {
         view.irq[i].ok_or(Error::NotReady)
     })
 }
+#[derive(Clone, Copy)]
+pub(crate) struct TimerPreparation {
+    current: Action,
+    observation: DomainObservation,
+}
+impl TimerPreparation {
+    pub(crate) const fn current(&self) -> Action {
+        self.current
+    }
+    pub(crate) const fn observation(&self) -> DomainObservation {
+        self.observation
+    }
+    pub(crate) fn legal_options(
+        &self,
+        options: &[Option<Action>],
+        output: &mut [Option<Action>],
+    ) -> Result<usize, Error> {
+        let current = self.current;
+        cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+            action.validate()?;
+            match (current, action) {
+                (Action::SoftCoalesce(_), Action::SoftCoalesce(_)) => Ok(()),
+                _ => Err(Error::Unsupported),
+            }
+        })
+    }
+    pub(crate) fn target_features(&self, action: Action) -> Result<TargetFeatures, Error> {
+        action.validate()?;
+        match (self.current, action) {
+            (Action::SoftCoalesce(_), Action::SoftCoalesce(_)) => Ok(TargetFeatures::default()),
+            _ => Err(Error::Unsupported),
+        }
+    }
+}
+/// Project D07's current action, observation and candidate-readiness from one
+/// immutable platform owner view. The token authorizes only candidate
+/// construction; CHECK and REVALIDATE still call the live family legality
+/// path before PUBLISH can expose a policy root or executor state.
+pub(crate) fn timer_preparation(key: ObjectKey, at: u64) -> Result<TimerPreparation, Error> {
+    if key != TIMER_SERVICE {
+        return Err(Error::Stale);
+    }
+    inspect_view(|view| {
+        if view.soft_timers == 0
+            || view.measurement_core != CORE_GENERATION.load(Ordering::Acquire)
+        {
+            return Err(Error::NotReady);
+        }
+        let observation = DomainObservation::complete(view.timer.ok_or(Error::NotReady)?);
+        let current = Action::SoftCoalesce(
+            view.timer_policy
+                .filter(|(_, stamp, _)| stamp.live(at))
+                .map_or(0, |(_, _, value)| value),
+        );
+        Ok(TimerPreparation {
+            current,
+            observation,
+        })
+    })
+}
+
 fn control_current(domain: u16, _: u16, key: ObjectKey) -> Result<Action, Error> {
     if domain == 7 {
         if key != TIMER_SERVICE {

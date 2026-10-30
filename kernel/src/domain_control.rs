@@ -1470,9 +1470,21 @@ fn next_normal(
         } else {
             None
         };
-        let current = match core_preparation {
-            Some((current, _)) => current,
-            None => match (f.current)(f.domain, f.kind, target) {
+        let timer_preparation = if (f.domain, f.kind) == (7, 1) {
+            match crate::domain_platform::timer_preparation(target, wall_started) {
+                Ok(v) => Some(v),
+                Err(
+                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
+                ) => break 'families,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let current = match (core_preparation, timer_preparation.as_ref()) {
+            (Some((current, _)), _) => current,
+            (None, Some(preparation)) => preparation.current(),
+            (None, None) => match (f.current)(f.domain, f.kind, target) {
                 Ok(v) => v,
                 Err(
                     Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
@@ -1482,9 +1494,10 @@ fn next_normal(
         };
         preparation_current(current);
         preparation_detail(3);
-        let observed = match core_preparation {
-            Some((_, observed)) => observed,
-            None => match (f.observe)(f.domain, target) {
+        let observed = match (core_preparation, timer_preparation.as_ref()) {
+            (Some((_, observed)), _) => observed,
+            (None, Some(preparation)) => preparation.observation(),
+            (None, None) => match (f.observe)(f.domain, target) {
                 Ok(v) => v,
                 Err(Error::Busy | Error::Again | Error::NotReady) => break 'families,
                 Err(e) => return Err(e),
@@ -1525,7 +1538,11 @@ fn next_normal(
             &options[..n]
         };
         let mut legal = [None; 32];
-        let legal_count = match (f.legal_options)(eligible, target, wall_started, &mut legal) {
+        let legal_result = match timer_preparation.as_ref() {
+            Some(preparation) => preparation.legal_options(eligible, &mut legal),
+            None => (f.legal_options)(eligible, target, wall_started, &mut legal),
+        };
+        let legal_count = match legal_result {
             Ok(count) => count,
             Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
                 break 'families;
@@ -1583,7 +1600,11 @@ fn next_normal(
             {
                 continue;
             }
-            let mut target_features = match (f.target_features)(action, target) {
+            let target_features_result = match timer_preparation.as_ref() {
+                Some(preparation) => preparation.target_features(action),
+                None => (f.target_features)(action, target),
+            };
+            let mut target_features = match target_features_result {
                 Ok(v) => v,
                 Err(
                     Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
