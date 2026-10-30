@@ -1,0 +1,836 @@
+diff --git a/crates/cluster-transport/src/tcp/observe.rs b/crates/cluster-transport/src/tcp/observe.rs
+index cdb3de43977a6af95c23e19c1d4c4048e55f7b77..e2054d30b3585d72a9c00945adf82628d3e8afb0 100644
+--- a/crates/cluster-transport/src/tcp/observe.rs
++++ b/crates/cluster-transport/src/tcp/observe.rs
+@@ -215,7 +215,17 @@ impl<P: Port> Port for ObservedPort<P> {
+         Ok(())
+     }
+     fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error> {
+-        let received = self.inner.receive(frame)?;
++        self.receive_with_checkpoint(frame, &mut || {})
++    }
++    fn receive_with_checkpoint(
++        &mut self,
++        frame: &mut [u8; MTU],
++        checkpoint: &mut dyn FnMut(),
++    ) -> Result<Option<usize>, Error> {
++        // Preserve the inner port's custody-safe scheduling boundaries. Falling
++        // back to Port::receive would silently collapse all DMA/MMIO pieces
++        // into one CPU reservation even though the NIC exposes safe points.
++        let received = self.inner.receive_with_checkpoint(frame, checkpoint)?;
+         if let Some(length) = received {
+             self.received_ack = frame
+                 .get(..length)
+diff --git a/crates/cluster-transport/tests/checkpoints.rs b/crates/cluster-transport/tests/checkpoints.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..760b5188a3be99747efcffbd455a742eeb59fae1
+--- /dev/null
++++ b/crates/cluster-transport/tests/checkpoints.rs
+@@ -0,0 +1,123 @@
++//! Exercise the complete Tcp -> observation -> Ethernet -> Port path.
++//! Component-only NIC tests cannot detect a wrapper swallowing safe points.
++use cyxia_cluster_transport::{
++    device::{Error as PortError, MTU, Port},
++    tcp::{BUFFER_SIZE, Config, Error, Storage, Tcp},
++};
++use std::{cell::RefCell, rc::Rc};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Event {
++    LegacyReceive,
++    ReceiveBegin,
++    Checkpoint,
++    ReceiveEnd,
++}
++struct CheckpointPort {
++    events: Rc<RefCell<Vec<Event>>>,
++    fail: bool,
++}
++impl Port for CheckpointPort {
++    fn send(&mut self, _: &[u8]) -> Result<(), PortError> {
++        Ok(())
++    }
++    fn receive(&mut self, _: &mut [u8; MTU]) -> Result<Option<usize>, PortError> {
++        self.events.borrow_mut().push(Event::LegacyReceive);
++        if self.fail {
++            Err(PortError::Device)
++        } else {
++            Ok(None)
++        }
++    }
++    fn receive_with_checkpoint(
++        &mut self,
++        _: &mut [u8; MTU],
++        checkpoint: &mut dyn FnMut(),
++    ) -> Result<Option<usize>, PortError> {
++        self.events.borrow_mut().push(Event::ReceiveBegin);
++        checkpoint();
++        self.events.borrow_mut().push(Event::ReceiveEnd);
++        if self.fail {
++            Err(PortError::Device)
++        } else {
++            Ok(None)
++        }
++    }
++    fn burst_capacity(&self) -> usize {
++        8
++    }
++}
++fn run(
++    fail: bool,
++) -> (
++    Result<cyxia_cluster_transport::tcp::State, Error>,
++    Vec<Event>,
++) {
++    let events = Rc::new(RefCell::new(Vec::new()));
++    let (mut rx, mut tx) = ([0; BUFFER_SIZE], [0; BUFFER_SIZE]);
++    let mut storage = [Storage::EMPTY];
++    let config = Config {
++        mac: [2, 0, 0, 0, 0, 2],
++        local: [10, 0, 0, 2],
++        peer: [10, 0, 0, 1],
++        prefix_len: 24,
++        local_port: 8443,
++        peer_port: 40001,
++        random_seed: 0xf00dcafe,
++    };
++    let mut tcp = Tcp::new(
++        CheckpointPort {
++            events: events.clone(),
++            fail,
++        },
++        config,
++        0,
++        &mut rx,
++        &mut tx,
++        &mut storage,
++    )
++    .unwrap();
++    tcp.listen().unwrap();
++    let result = tcp.poll_with_checkpoints(1, &mut || events.borrow_mut().push(Event::Checkpoint));
++    if fail {
++        assert_eq!(
++            tcp.poll_with_checkpoints(2, &mut || panic!("failed stream resumed")),
++            Err(Error::Closed)
++        );
++    }
++    let events = events.borrow().clone();
++    (result, events)
++}
++fn assert_forwarded(events: &[Event]) {
++    assert!(
++        !events.contains(&Event::LegacyReceive),
++        "observation wrapper swallowed RX checkpoints: {events:?}"
++    );
++    let mut receives = 0;
++    for (i, event) in events.iter().enumerate() {
++        if *event == Event::ReceiveBegin {
++            assert_eq!(
++                events.get(i + 1..i + 3),
++                Some(&[Event::Checkpoint, Event::ReceiveEnd][..])
++            );
++            receives += 1;
++        }
++    }
++    assert!(receives > 0, "no real receive boundary exercised");
++}
++#[test]
++fn tcp_observation_preserves_each_inner_receive_checkpoint() {
++    let (result, events) = run(false);
++    assert!(result.is_ok());
++    assert_forwarded(&events);
++}
++#[test]
++fn receive_error_preserves_checkpoints_and_poisoning_without_retry() {
++    let (result, events) = run(true);
++    assert_eq!(result, Err(Error::Device));
++    assert_forwarded(&events);
++    assert_eq!(
++        events.iter().filter(|v| **v == Event::ReceiveBegin).count(),
++        1
++    );
++}
+diff --git a/crates/peer-billing/src/failure.rs b/crates/peer-billing/src/failure.rs
+index 0001ece3abb5fbf267281cf1f30a5a75dc6a90fe..06804c04909863539721c16e24edbca5ad2a7cd4 100644
+--- a/crates/peer-billing/src/failure.rs
++++ b/crates/peer-billing/src/failure.rs
+@@ -37,12 +37,7 @@ impl Failure {
+     pub fn rejected(
+         root_token: u64,
+         receipt: PlanReceipt,
+-        snapshot: Snapshot,
+-        target: ObjectKey,
+-        plan_hash: [u8; 32],
+-        received_ns: u64,
+-        observed_ns: u64,
+-        wall_deadline_ns: u64,
++        publication: FailedPublication,
+     ) -> Result<Self, Error> {
+         if receipt.version != 0 || receipt.published_ns != 0 || receipt.action_count != 1 {
+             return Err(Error::Incomplete);
+@@ -50,19 +45,15 @@ impl Failure {
+         let ExecutionState::Failed(error) = receipt.state() else {
+             return Err(Error::Incomplete);
+         };
++        // The typed context cannot rebind a terminal receipt to another plan.
++        if publication.id != receipt.id {
++            return Err(Error::Identity);
++        }
+         let value = Self {
+             root_token,
+             error: error as u64 + 1,
+-            observed_ns,
+-            publication: Some(FailedPublication {
+-                id: receipt.id,
+-                snapshot,
+-                target,
+-                plan_hash,
+-                received_ns,
+-                observed_ns,
+-                wall_deadline_ns,
+-            }),
++            observed_ns: publication.observed_ns,
++            publication: Some(publication),
+         };
+         value.validate()?;
+         Ok(value)
+@@ -75,8 +66,8 @@ impl Failure {
+         {
+             return Err(Error::Identity);
+         }
+-        if let Some(p) = self.publication {
+-            if p.id.boot_epoch == 0
++        if let Some(p) = self.publication
++            && (p.id.boot_epoch == 0
+                 || p.id.controller_epoch == 0
+                 || p.id.plan_seq == 0
+                 || p.snapshot.sequence == 0
+@@ -88,10 +79,9 @@ impl Failure {
+                 || p.received_ns < p.snapshot.taken_ns
+                 || p.observed_ns < p.received_ns
+                 || p.observed_ns > self.observed_ns
+-                || p.wall_deadline_ns < p.snapshot.taken_ns
+-            {
+-                return Err(Error::Identity);
+-            }
++                || p.wall_deadline_ns < p.snapshot.taken_ns)
++        {
++            return Err(Error::Identity);
+         }
+         Ok(())
+     }
+diff --git a/crates/peer-billing/tests/protocol.rs b/crates/peer-billing/tests/protocol.rs
+index 83349579329a8688308c067cdeee6564ad72bbce..edd7783e9bd25ba4a78d7de61e444c6b2b52224c 100644
+--- a/crates/peer-billing/tests/protocol.rs
++++ b/crates/peer-billing/tests/protocol.rs
+@@ -770,12 +770,15 @@ fn actual_terminal_busy() -> (Failure, cyxia_prototype::policy::PlanReceipt) {
+     let failure = Failure::rejected(
+         17,
+         receipt,
+-        snapshot,
+-        target,
+-        Sha256::digest(&bytes[..count]).into(),
+-        101,
+-        102,
+-        50_000_100,
++        cyxia_peer_billing::FailedPublication {
++            id: receipt.id,
++            snapshot,
++            target,
++            plan_hash: Sha256::digest(&bytes[..count]).into(),
++            received_ns: 101,
++            observed_ns: 102,
++            wall_deadline_ns: 50_000_100,
++        },
+     )
+     .unwrap();
+     (failure, receipt)
+@@ -880,19 +883,7 @@ fn failure_cannot_rebind_boot_trial_plan_or_be_forged_from_pending_and_unknown()
+     ] {
+         let mut unresolved = receipt;
+         unresolved.actions[0] = state;
+-        assert_eq!(
+-            Failure::rejected(
+-                17,
+-                unresolved,
+-                p.snapshot,
+-                p.target,
+-                p.plan_hash,
+-                p.received_ns,
+-                p.observed_ns,
+-                p.wall_deadline_ns
+-            ),
+-            Err(Error::Incomplete)
+-        );
++        assert_eq!(Failure::rejected(17, unresolved, p), Err(Error::Incomplete));
+     }
+     for published in [
+         cyxia_prototype::policy::PlanReceipt {
+@@ -904,19 +895,7 @@ fn failure_cannot_rebind_boot_trial_plan_or_be_forged_from_pending_and_unknown()
+             ..receipt
+         },
+     ] {
+-        assert_eq!(
+-            Failure::rejected(
+-                17,
+-                published,
+-                p.snapshot,
+-                p.target,
+-                p.plan_hash,
+-                p.received_ns,
+-                p.observed_ns,
+-                p.wall_deadline_ns
+-            ),
+-            Err(Error::Incomplete)
+-        );
++        assert_eq!(Failure::rejected(17, published, p), Err(Error::Incomplete));
+     }
+     let notice = RootFailure {
+         binding: b,
+@@ -1049,3 +1028,33 @@ fn publication_time(wall_ns: u64) -> cyxia_prototype::policy::PublicationTime {
+         },
+     }
+ }
++
++#[test]
++fn rejected_publication_context_cannot_rebind_the_terminal_plan() {
++    let (failure, receipt) = actual_terminal_busy();
++    let original = failure.publication.unwrap();
++    for id in [
++        cyxia_prototype::policy::PlanId {
++            boot_epoch: original.id.boot_epoch + 1,
++            ..original.id
++        },
++        cyxia_prototype::policy::PlanId {
++            controller_epoch: original.id.controller_epoch + 1,
++            ..original.id
++        },
++        cyxia_prototype::policy::PlanId {
++            plan_seq: original.id.plan_seq + 1,
++            ..original.id
++        },
++    ] {
++        assert_eq!(
++            Failure::rejected(
++                17,
++                receipt,
++                cyxia_peer_billing::FailedPublication { id, ..original }
++            ),
++            Err(Error::Identity)
++        );
++    }
++    assert_eq!(Failure::rejected(17, receipt, original), Ok(failure));
++}
+diff --git a/crates/prototype/tests/native_control_settlement.rs b/crates/prototype/tests/native_control_settlement.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e347713b6081b9ef15086060d61c0fdc84c01817
+--- /dev/null
++++ b/crates/prototype/tests/native_control_settlement.rs
+@@ -0,0 +1,118 @@
++//! Exercise the same bounded diagnostic writer used after physical settlement.
++#[allow(dead_code)]
++#[path = "../../../kernel/src/domain_tasks/control_diagnostics.rs"]
++mod control_diagnostics;
++use control_diagnostics::Evidence;
++use cyxia_prototype::domains::Error;
++use cyxia_prototype::domains::tasks::{CpuLayout, Scheduler};
++
++fn layout() -> CpuLayout {
++    CpuLayout {
++        business_mask: 9,
++        healthy_mask: 15,
++        generation: 7,
++    }
++}
++
++#[test]
++fn every_control_cpu_retains_the_exact_consumed_budget_failure() {
++    let log = Evidence::new();
++    let mut scheduler = Scheduler::new();
++    for (cpu, offset) in [(1, 2), (2, 26)] {
++        let credit = scheduler
++            .reserve_control(cpu, layout(), 10_000_000 * cpu as u64, 2_500_000)
++            .unwrap()
++            .unwrap();
++        let actual = 2_500_001;
++        let finish = credit.started_ns + actual;
++        let result = scheduler.complete_control(credit, actual, finish);
++        assert_eq!(result, Err(Error::Budget));
++        log.settled(
++            credit,
++            actual,
++            finish,
++            result,
++            scheduler.control_active(cpu).is_some(),
++        );
++        let words = log.snapshot();
++        assert_eq!(words[0], control_diagnostics::MAGIC);
++        assert_eq!(
++            &words[offset..offset + 15],
++            &[
++                2,
++                cpu as u64,
++                credit.sequence,
++                7,
++                0,
++                credit.started_ns,
++                finish,
++                credit.reserved_ns,
++                actual,
++                credit.control_total_ns,
++                actual,
++                credit.physical_total_ns,
++                actual,
++                1,
++                Error::Budget as u64 + 1,
++            ]
++        );
++        assert_eq!(scheduler.cpu_spent_ns(cpu), Ok(actual));
++        assert!(scheduler.control_active(cpu).is_none());
++        assert_ne!(scheduler.stats().quarantine_mask & (1 << cpu), 0);
++        // A duplicate/stale settlement cannot create another fault record.
++        let duplicate = scheduler.complete_control(credit, actual, finish);
++        log.settled(credit, actual, finish, duplicate, false);
++        assert_eq!(log.snapshot(), words);
++    }
++    assert_eq!(log.snapshot()[1], 2);
++    assert_eq!(core::mem::size_of::<Evidence>(), 512);
++}
++
++#[test]
++fn malformed_unconsumed_and_successful_bills_never_become_fault_evidence() {
++    let log = Evidence::new();
++    let mut scheduler = Scheduler::new();
++    let credit = scheduler
++        .reserve_control(1, layout(), 10_000_000, 2_500_000)
++        .unwrap()
++        .unwrap();
++    let mut forged = credit;
++    forged.sequence += 1;
++    let result = scheduler.complete_control(forged, 3_000_000, 13_000_000);
++    assert_eq!(result, Err(Error::Stale));
++    log.settled(forged, 3_000_000, 13_000_000, result, true);
++    let result = scheduler.complete_control(credit, 3_000_000, 9_000_000);
++    assert_eq!(result, Err(Error::Range));
++    log.settled(credit, 3_000_000, 9_000_000, result, true);
++    // Even an incorrectly forwarded Budget result must not record an active bill.
++    log.settled(credit, 3_000_000, 13_000_000, Err(Error::Budget), true);
++    assert_eq!(log.snapshot(), [0; 64]);
++    let result = scheduler.complete_control(credit, 1000, 10_001_000);
++    assert_eq!(result, Ok(()));
++    log.settled(credit, 1000, 10_001_000, result, false);
++    assert_eq!(log.snapshot(), [0; 64]);
++}
++
++#[test]
++fn first_failure_is_not_overwritten_by_a_later_generation() {
++    let log = Evidence::new();
++    for generation in [7, 8] {
++        let mut scheduler = Scheduler::new();
++        let context = CpuLayout {
++            generation,
++            ..layout()
++        };
++        let credit = scheduler
++            .reserve_control(1, context, 10_000_000, 2_500_000)
++            .unwrap()
++            .unwrap();
++        let actual = 2_500_000 + generation;
++        let result = scheduler.complete_control(credit, actual, 10_000_000 + actual);
++        log.settled(credit, actual, 10_000_000 + actual, result, false);
++    }
++    let words = log.snapshot();
++    assert_eq!(words[1], 2);
++    assert_eq!(words[5], 7);
++    assert_eq!(words[10], 2_500_007);
++    assert!(words[17..].iter().all(|word| *word == 0));
++}
+diff --git a/kernel/src/a02_capture.rs b/kernel/src/a02_capture.rs
+index dfe4835f444b43c009cfe47bae20916fcaae9719..4946f78523bb9673ec0318d4af5b7627ed313614 100644
+--- a/kernel/src/a02_capture.rs
++++ b/kernel/src/a02_capture.rs
+@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
+ use cyxia_arch_aarch64::{cpu, timer};
+ #[path = "a02_capture/state.rs"]
+ mod state;
+-pub use state::Task;
++pub use state::{PreparedTask, Task};
+ 
+ pub const EVENTS: usize = 8192;
+ const TASKS: usize = 512;
+diff --git a/kernel/src/a02_capture/state.rs b/kernel/src/a02_capture/state.rs
+index 526b55c493c1ec767d9d996a759b993bf7081044..4b91d2ded62c51b0f86c8bba79968eb80f16f890 100644
+--- a/kernel/src/a02_capture/state.rs
++++ b/kernel/src/a02_capture/state.rs
+@@ -19,6 +19,39 @@ impl Task {
+     };
+ }
+ 
++/// A prepared capture slot is valid only for the exact immutable identity.
++/// A controller restart may change generation without repeating mapping probes.
++/// Registration stays in a separate paid turn; a hit performs no new lookup.
++pub struct PreparedTask {
++    identity: Option<Task>,
++    index: Option<usize>,
++}
++impl PreparedTask {
++    pub const fn new() -> Self {
++        Self {
++            identity: None,
++            index: None,
++        }
++    }
++    /// False means this turn registered a new identity; do not enter EL0 yet.
++    /// None is a valid prepared result when optional capture is disabled.
++    pub fn prepare(&mut self, task: Task, register: impl FnOnce(Task) -> Option<usize>) -> bool {
++        if self.identity == Some(task) {
++            return true;
++        }
++        self.index = register(task);
++        self.identity = Some(task);
++        false
++    }
++    pub fn index(&self, task: Task) -> Result<Option<usize>, ()> {
++        if self.identity == Some(task) {
++            Ok(self.index)
++        } else {
++            Err(())
++        }
++    }
++}
++
+ #[repr(C)]
+ pub struct Capture<const N: usize, const T: usize> {
+     pub header: [u64; 64],
+@@ -389,6 +422,59 @@ mod tests {
+         c
+     }
+     #[test]
++    fn prepared_cache_rebinds_a_new_controller_generation_before_entry() {
++        let mut c = capture::<32>();
++        let mut cache = PreparedTask::new();
++        let first = task(20, 2, 2);
++        assert!(!cache.prepare(first, |t| c.prepare(101, t)));
++        assert!(cache.prepare(first, |_| panic!("same identity must not register twice")));
++        assert!(c.enter_prepared(102, 1, first, cache.index(first).unwrap().unwrap()));
++        c.exit_prepared(103, 1, cache.index(first).unwrap().unwrap());
++        let next = Task {
++            generation: 2,
++            ..first
++        };
++        assert_eq!(cache.index(next), Err(()));
++        assert!(!cache.prepare(next, |t| c.prepare(104, t)));
++        assert_eq!(cache.index(first), Err(()));
++        assert_eq!(cache.index(next), Ok(Some(1)));
++        assert!(cache.prepare(next, |_| panic!("registration owns its own turn")));
++        assert!(c.enter_prepared(105, 1, next, cache.index(next).unwrap().unwrap()));
++        c.exit_prepared(106, 1, cache.index(next).unwrap().unwrap());
++        assert_eq!(c.header[4], 0);
++        assert_eq!(c.counters[27], 2);
++        assert_eq!(c.events[3][2], 1);
++        assert_eq!(c.events[3][5], 2);
++    }
++    #[test]
++    fn prepared_cache_checks_the_whole_identity_and_disabled_capture() {
++        let first = task(20, 2, 2);
++        for changed in [
++            Task { id: 21, ..first },
++            Task {
++                generation: 2,
++                ..first
++            },
++            Task { role: 1, ..first },
++            Task {
++                affinity: 4,
++                ..first
++            },
++        ] {
++            let mut cache = PreparedTask::new();
++            assert_eq!(cache.index(first), Err(()));
++            assert!(!cache.prepare(first, |_| None));
++            assert!(cache.prepare(first, |_| panic!("disabled capture also caches")));
++            assert_eq!(cache.index(first), Ok(None));
++            assert_eq!(cache.index(changed), Err(()));
++            assert!(!cache.prepare(changed, |t| {
++                assert_eq!(t, changed);
++                None
++            }));
++            assert_eq!(cache.index(first), Err(()));
++        }
++    }
++    #[test]
+     fn counters_follow_boundaries_and_raw_denial_after_return() {
+         let mut c = capture::<32>();
+         assert!(c.enter(101, 1, task(20, 2, 2)));
+diff --git a/kernel/src/domain_tasks.rs b/kernel/src/domain_tasks.rs
+index 894fca15382f68c2ec2bd1307e7a590e909ab0f9..9bf5ff29dc23bb6be5bdf6afd782b94eb3ba26d7 100644
+--- a/kernel/src/domain_tasks.rs
++++ b/kernel/src/domain_tasks.rs
+@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
+ mod abi;
+ #[path = "domain_tasks/baseline_diagnostics.rs"]
+ mod baseline_diagnostics;
++#[path = "domain_tasks/control_diagnostics.rs"]
++mod control_diagnostics;
+ #[path = "domain_tasks/deadline.rs"]
+ mod deadline;
+ #[path = "domain_tasks/execution.rs"]
+@@ -1504,6 +1506,15 @@ pub fn complete_control(
+     }
+     locked(|s| {
+         let result = s.scheduler.complete_control(credit, actual_ns, finished_ns);
++        control_diagnostics::CONTROL_SETTLEMENT_EVIDENCE.settled(
++            credit,
++            actual_ns,
++            finished_ns,
++            result,
++            s.scheduler
++                .control_active(usize::from(credit.cpu))
++                .is_some(),
++        );
+         if result == Err(Error::Budget) {
+             publish_evidence(s);
+         }
+diff --git a/kernel/src/domain_tasks/control_diagnostics.rs b/kernel/src/domain_tasks/control_diagnostics.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0bb728775c2621012aba520c0131e5dac88cd2dc
+--- /dev/null
++++ b/kernel/src/domain_tasks/control_diagnostics.rs
+@@ -0,0 +1,89 @@
++//! First *consumed* physical-control budget failure, independent of the role.
++//! Call only under the task-owner gate, after the scheduler's authoritative
++//! settlement and before publishing its quarantine summary. Diagnostic data
++//! cannot authorize execution, alter credit, or acknowledge an obligation.
++use core::sync::atomic::{AtomicU64, Ordering};
++use cyxia_prototype::domains::{
++    Error, WINDOW_NS,
++    tasks::{CONTROL_BUDGET_NS, CPU_BUDGET_NS, ControlCredit},
++};
++
++pub(super) const MAGIC: u64 = 0x4359_4353_4554_0001;
++#[repr(C, align(64))]
++pub(super) struct Evidence([AtomicU64; 64]);
++#[used]
++#[unsafe(no_mangle)]
++pub(super) static CONTROL_SETTLEMENT_EVIDENCE: Evidence = Evidence::new();
++const _: () = assert!(core::mem::size_of::<Evidence>() == 512);
++
++impl Evidence {
++    pub(super) const fn new() -> Self {
++        Self([const { AtomicU64::new(0) }; 64])
++    }
++    pub(super) fn settled(
++        &self,
++        credit: ControlCredit,
++        actual_ns: u64,
++        finished_ns: u64,
++        result: Result<(), Error>,
++        still_active: bool,
++    ) {
++        if result != Err(Error::Budget) || still_active {
++            return;
++        }
++        let offset = match credit.cpu {
++            1 => 2,
++            2 => 26,
++            _ => return, // begin_control admits only C workers on CPUs 1/2.
++        };
++        if self.0[offset].load(Ordering::Relaxed) == 0 {
++            // A stopped reader may see state=1. It must not call that a
++            // complete receipt; failure remains visible and cannot pass.
++            self.0[offset].store(1, Ordering::Release);
++            let control = credit
++                .control_total_ns
++                .saturating_sub(credit.reserved_ns)
++                .saturating_add(actual_ns);
++            let physical = credit
++                .physical_total_ns
++                .saturating_sub(credit.reserved_ns)
++                .saturating_add(actual_ns);
++            let end = credit.window.saturating_add(1).saturating_mul(WINDOW_NS);
++            let flags = u64::from(actual_ns > credit.reserved_ns)
++                | (u64::from(finished_ns > end) << 1)
++                | (u64::from(control > CONTROL_BUDGET_NS) << 2)
++                | (u64::from(physical > CPU_BUDGET_NS) << 3);
++            for (i, value) in [
++                u64::from(credit.cpu),
++                credit.sequence,
++                credit.core_generation,
++                credit.window,
++                credit.started_ns,
++                finished_ns,
++                credit.reserved_ns,
++                actual_ns,
++                credit.control_total_ns,
++                control,
++                credit.physical_total_ns,
++                physical,
++                flags,
++                Error::Budget as u64 + 1,
++            ]
++            .into_iter()
++            .enumerate()
++            {
++                self.0[offset + 1 + i].store(value, Ordering::Relaxed);
++            }
++            self.0[offset].store(2, Ordering::Release);
++        }
++        // The external task gate serializes all writers; no RMW retry or
++        // allocation is needed. Subsequent failures never overwrite the first.
++        let count = self.0[1].load(Ordering::Relaxed).saturating_add(1);
++        self.0[1].store(count, Ordering::Relaxed);
++        self.0[0].store(MAGIC, Ordering::Release);
++    }
++    #[cfg(test)]
++    pub(super) fn snapshot(&self) -> [u64; 64] {
++        core::array::from_fn(|i| self.0[i].load(Ordering::Acquire))
++    }
++}
+diff --git a/kernel/src/peer_replay/owner.rs b/kernel/src/peer_replay/owner.rs
+index e7cd15d0a04f0e224f9eba84d976d12c31971ad5..22e11066288b0c9bf3a49338233b6f8a3abf667e 100644
+--- a/kernel/src/peer_replay/owner.rs
++++ b/kernel/src/peer_replay/owner.rs
+@@ -2453,12 +2453,15 @@ fn propagate_root_failure(
+             wire::Failure::rejected(
+                 token.id,
+                 value.receipt(),
+-                value.snapshot(),
+-                value.target(),
+-                value.plan_hash(),
+-                value.received_ns(),
+-                value.observed_ns(),
+-                value.wall_deadline_ns(),
++                wire::FailedPublication {
++                    id: value.receipt().id,
++                    snapshot: value.snapshot(),
++                    target: value.target(),
++                    plan_hash: value.plan_hash(),
++                    received_ns: value.received_ns(),
++                    observed_ns: value.observed_ns(),
++                    wall_deadline_ns: value.wall_deadline_ns(),
++                },
+             )
+             .map_err(domain)?
+         } else {
+diff --git a/kernel/src/prototype_runtime/governance.rs b/kernel/src/prototype_runtime/governance.rs
+index 5d3d338a3a335f57a3288606faecd5855a3c5b44..81cdb9ca04b1a2f8759bd15112f6eba709d23f66 100644
+--- a/kernel/src/prototype_runtime/governance.rs
++++ b/kernel/src/prototype_runtime/governance.rs
+@@ -951,14 +951,29 @@ fn perform_runtime_turn(
+         return Err(Error::Stale);
+     }
+     runtime.last_credit_core = credit.core_generation;
++    // Ready command stages share this one physically prepaid turn. Returning
++    // to the scheduler after PREPARE or a completed SVC added avoidable wall
++    // delay to the immutable 50 ms snapshot. This is not a retry loop: perform
++    // at most one preparation, one EL0 entry and one validation. A preempted
++    // context or retained pin keeps PHASE_RUN and ends the turn unchanged.
++    // step() charges the entire chain against the original 2.5 ms credit;
++    // budget failure, stale ownership and deadline rejection remain fatal.
+     match runtime.phase {
+-        PHASE_INPUT_PROBE | PHASE_CODE_PROBE | PHASE_UNMAPPED_PROBE | PHASE_TIMER_PROBE
+-        | PHASE_RUN => run_runtime_context(runtime, resources),
+-        PHASE_PREPARE => prepare_runtime_snapshot(runtime, resources, credit),
+-        PHASE_VALIDATE => validate_runtime_command(runtime, resources),
+-        PHASE_COMPLETE => Ok(()),
+-        _ => Err(Error::Conflict),
++        PHASE_INPUT_PROBE | PHASE_CODE_PROBE | PHASE_UNMAPPED_PROBE | PHASE_TIMER_PROBE => {
++            return run_runtime_context(runtime, resources);
++        }
++        PHASE_PREPARE => prepare_runtime_snapshot(runtime, resources, credit)?,
++        PHASE_RUN | PHASE_VALIDATE => {}
++        PHASE_COMPLETE => return Ok(()),
++        _ => return Err(Error::Conflict),
++    }
++    if runtime.phase == PHASE_RUN {
++        run_runtime_context(runtime, resources)?;
+     }
++    if runtime.phase == PHASE_VALIDATE {
++        validate_runtime_command(runtime, resources)?;
++    }
++    Ok(())
+ }
+ 
+ /// Run at most one physically prepaid coordinator turn. Returning true means
+diff --git a/kernel/src/prototype_runtime/native.rs b/kernel/src/prototype_runtime/native.rs
+index 453fb4356adf63c4dc5063654cf92c9e4cb82e0b..7b42a0e845b4b9340cb60839c610c2e095414ddf 100644
+--- a/kernel/src/prototype_runtime/native.rs
++++ b/kernel/src/prototype_runtime/native.rs
+@@ -133,7 +133,7 @@ pub(super) struct WorkerState {
+     measurement: Option<crate::domain_control::core_replay::Measurement>,
+     probe: u8,
+     probe_deadline: u64,
+-    capture_index: Option<usize>,
++    capture: crate::a02_capture::PreparedTask,
+     probe_heartbeat_pending: bool,
+     clear_next: u32,
+     probing: bool,
+@@ -158,7 +158,7 @@ impl WorkerState {
+             measurement: None,
+             probe: 0,
+             probe_deadline: 0,
+-            capture_index: None,
++            capture: crate::a02_capture::PreparedTask::new(),
+             probe_heartbeat_pending: false,
+             clear_next: 0,
+             probing: false,
+@@ -583,7 +583,10 @@ fn run_probe_turn(
+         worker.context = Some(fresh(u64::from(worker.native.probe) + 1));
+         // Register the later normal task identity outside its first captured
+         // boundary. Probe entries themselves remain uncaptured.
+-        worker.native.capture_index = crate::a02_capture::prepare(capture_task(slot));
++        worker
++            .native
++            .capture
++            .prepare(capture_task(slot), crate::a02_capture::prepare);
+         return;
+     }
+     let entered = timer::cpu_ticks();
+@@ -602,7 +605,7 @@ fn run_probe_turn(
+             phys(root),
+             timer::ticks().saturating_add(ticks(PROBE_SERVICE_SLICE_NS).max(1)),
+             capture_task(slot),
+-            worker.native.capture_index,
++            None,
+             false,
+             false,
+         );
+@@ -760,6 +763,23 @@ fn run_turn(
+             .cpu_ns
+             .saturating_add(timer::cpu_elapsed_ns(preparation));
+     }
++    // Controller epoch can advance without rerunning the completed mapping
++    // probes. Never attach that new incarnation to an old prepared trace slot.
++    // Register it in this already-paid turn, count preparation against the job,
++    // then yield; the next turn must match the entire identity before EL0 entry.
++    let task = capture_task(slot);
++    let capture_started = timer::cpu_ticks();
++    let capture_ready = worker
++        .native
++        .capture
++        .prepare(task, crate::a02_capture::prepare);
++    worker.native.cpu_ns = worker
++        .native
++        .cpu_ns
++        .saturating_add(timer::cpu_elapsed_ns(capture_started));
++    if !capture_ready {
++        return;
++    }
+     // Account encoding and private-page preparation before choosing a slice.
+     // A turn with less than the full return envelope yields without entering EL0.
+     let entered = timer::cpu_ticks();
+@@ -779,8 +799,12 @@ fn run_turn(
+             context,
+             phys(root),
+             timer::ticks().saturating_add(ticks(SERVICE_SLICE_NS).max(1)),
+-            capture_task(slot),
+-            worker.native.capture_index,
++            task,
++            worker
++                .native
++                .capture
++                .index(task)
++                .expect("exact prepared capture identity"),
+             true,
+             true,
+         );
