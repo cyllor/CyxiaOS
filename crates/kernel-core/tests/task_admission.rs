@@ -82,6 +82,65 @@ fn start(token: u64, deadline: u64, session: u64, input_hash: [u8; 32]) -> Start
         input_hash,
     }
 }
+
+#[test]
+fn live_activity_preserves_custody_generation_and_level_without_granting_ready() {
+    let mut a = Authority::new();
+    a.session(7, 1, 0).unwrap();
+    for now in [1000, 2000, 3000] {
+        a.activity(7, now).unwrap();
+        assert!(a.reserve(terms(), [3; 32], now).is_err());
+    }
+    a.session(7, 2, 3000).unwrap();
+    let token = a
+        .reserve_with_custody(terms(), [3; 32], custody_key(), 3000)
+        .unwrap();
+    a.grant(token, [1; 16], 1, 3050, 3000).unwrap();
+    for now in [3001, 3002, 3003] {
+        a.activity(7, now).unwrap();
+    }
+    assert_eq!(a.custody(custody_key()).unwrap().token, token);
+    a.start(start(token, 3050, 7, [2; 32]), 3004).unwrap();
+    assert!(a.custody(custody_key()).unwrap().started);
+}
+
+#[test]
+fn invalid_activity_never_revives_or_rebinds_old_reservation() {
+    for (epoch, now) in [(0, 101), (8, 101), (7, 99), (7, 1600), (7, 1601)] {
+        let mut a = Authority::new();
+        a.session(7, 1, 100).unwrap();
+        a.session(7, 2, 100).unwrap();
+        let token = a
+            .reserve_with_custody(terms(), [3; 32], custody_key(), 100)
+            .unwrap();
+        a.grant(token, [1; 16], 1, 150, 100).unwrap();
+        assert!(a.activity(epoch, now).is_err());
+        assert!(a.activity(7, 101).is_err(), "invalid activity must isolate");
+        assert!(a.session(7, 2, 101).is_err());
+        assert_eq!(a.custody(custody_key()).unwrap().token, token);
+        a.session(7, 1, 101).unwrap();
+        a.session(7, 2, 101).unwrap();
+        assert!(
+            a.start(start(token, 150, 7, [2; 32]), 102).is_err(),
+            "reconnect reused old generation"
+        );
+    }
+}
+
+#[test]
+fn activity_at_exact_deadline_is_stale_and_does_not_change_last_rx() {
+    let mut a = Authority::new();
+    assert!(a.activity(7, 0).is_err());
+    a.session(7, 1, 10).unwrap();
+    a.activity(7, 1509).unwrap();
+    assert!(a.activity(7, 3009).is_err());
+    // Explicit establishment at the previous accepted time still succeeds:
+    // failed activity did not advance the monotonic last_rx watermark.
+    a.session(7, 1, 1509).unwrap();
+    a.disconnect();
+    assert!(a.activity(7, 1510).is_err());
+    assert!(a.session(7, 2, 1510).is_err());
+}
 #[test]
 fn freezes_contract_lease_and_content_before_unique_start() {
     let mut a = Authority::new();

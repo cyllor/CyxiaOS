@@ -449,11 +449,24 @@ impl Driver {
             self.last_header = Some(h);
             self.exit_origin = 3;
             self.input.drain(..n);
+            let was_ready = self.engine.ready();
             self.handle(h, &body, now)?;
+            // Completed leave deliberately closes kernel authority. Its trailing
+            // closure traffic must not reestablish a session or renew liveness.
+            if self.finished_leave {
+                continue;
+            }
+            // Only a completely accepted RPC renews the existing live session.
+            // EL1 samples its own fresh clock after any broker admission wait.
+            broker::request(OP_TASK, &[], &mut [], 0, [9, 3, self.kernel_epoch])
+                .map_err(|_| ())?;
             self.last_rx = now;
             if self.engine.ready() {
                 broker::request(OP_TASK, &[], &mut [], 0, [9, 2, self.kernel_epoch])
                     .map_err(|_| ())?;
+                if !was_ready {
+                    broker::trace(0x212);
+                }
             }
         }
         Ok(bytes.len())
@@ -938,11 +951,6 @@ impl Driver {
                 self.engine
                     .peer_ready(self.peer_boot, self.session, self.engine.cluster())
                     .map_err(|_| ())?;
-                if self.engine.ready() {
-                    broker::request(OP_TASK, &[], &mut [], 0, [9, 2, self.kernel_epoch])
-                        .map_err(|_| ())?;
-                    broker::trace(0x212);
-                }
             }
             (16, false) => {
                 if !b.is_empty() || !self.engine.ready() {

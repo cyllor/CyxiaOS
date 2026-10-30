@@ -121,6 +121,23 @@ impl Authority {
         self.last_rx = now;
         Ok(())
     }
+    /// Renew accepted authenticated traffic only while this exact session is
+    /// already live. This grants no READY or resource rights and cannot revive
+    /// an isolated session. Custody survives failed activity for reconciliation.
+    pub fn activity(&mut self, epoch: u64, now: u64) -> Result<(), Error> {
+        if epoch == 0
+            || epoch != self.epoch
+            || self.level == 0
+            || self.generation == u64::MAX
+            || now < self.last_rx
+            || now - self.last_rx >= 1500
+        {
+            self.disconnect();
+            return Err(Error::NotReady);
+        }
+        self.last_rx = now;
+        Ok(())
+    }
     fn ready(&self, now: u64) -> Result<(), Error> {
         if self.level != 2 || now < self.last_rx || now - self.last_rx >= 1500 {
             return Err(Error::NotReady);
@@ -258,5 +275,20 @@ impl Authority {
         }
         self.reservation = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn generation_exhaustion_is_fail_closed_without_refresh() {
+        let mut a = Authority::new();
+        a.session(7, 1, 10).unwrap();
+        a.generation = u64::MAX;
+        assert_eq!(a.activity(7, 11), Err(Error::NotReady));
+        assert_eq!((a.generation, a.level, a.last_rx), (u64::MAX, 0, 10));
+        assert!(a.session(7, 1, 11).is_err());
     }
 }
