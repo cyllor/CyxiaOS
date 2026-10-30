@@ -1,0 +1,137 @@
+name: V0.13 A acceptance
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths:
+      - '.github/workflows/v13-a-acceptance.yml'
+      - 'tools/**'
+      - 'tests/host/**'
+      - 'kernel/**'
+      - 'crates/**'
+      - 'user/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Preserve immutable tracked source, never provisioned private keys
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/a-source/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/a-source/source-tree.txt"
+          git archive --format=tar HEAD | gzip -n > "$RUNNER_TEMP/a-source/source.tar.gz"
+          (cd "$RUNNER_TEMP/a-source" && sha256sum source.tar.gz > source.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-a-source-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/a-source/
+
+  verifier-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+      - name: Run independent verifier regression lane
+        run: python3 -B tools/prototype.py test --lane tools --output "$RUNNER_TEMP/a-verifiers"
+      - name: Preserve verifier results separately from native acceptance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-a-verifiers-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/a-verifiers/
+
+  a02-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin native toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a02-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/a02-evidence/source-commit.txt"
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          cargo fetch --locked
+      - name: Build exact patched QEMU
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu"
+          git -C "$RUNNER_TEMP/qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" diff --check
+          cd "$RUNNER_TEMP/qemu"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror
+          ninja -C build qemu-system-aarch64
+      - name: Build selftest image and native formatter
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/a02-private-pair"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/a02-private-pair/a" --identity-b "$RUNNER_TEMP/a02-private-pair/b" --output "$RUNNER_TEMP/a02-build" --selftest 2>&1 | tee "$RUNNER_TEMP/a02-evidence/build.log"
+      - name: Run A02 independently of all-domain replay
+        id: native
+        run: |
+          set -euo pipefail
+          python3 tools/run_v13_a02.py --build "$RUNNER_TEMP/a02-build" --output "$RUNNER_TEMP/a02-evidence/run" --formatter "$GITHUB_WORKSPACE/target/debug/examples/prototype-disk" --qemu "$RUNNER_TEMP/qemu/build/qemu-system-aarch64" --qemu-source "$RUNNER_TEMP/qemu" --timeout 90 2>&1 | tee "$RUNNER_TEMP/a02-evidence/native.log"
+      - name: Independently replay the native receipt
+        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > "$RUNNER_TEMP/a02-evidence/independent-replay.json"
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from verify_v13_a02 import verify_native_receipt
+          root = Path(os.environ['RUNNER_TEMP'])
+          result = verify_native_receipt(root / 'a02-evidence/run', source_root=Path.cwd(), qemu_source=root / 'qemu')
+          if result.get('native_acceptance_status') != 'PASS' or result.get('native_execution_verified') is not True:
+              raise SystemExit('A02 receipt did not independently establish PASS')
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Preserve every A02 attempt without changing the catalogue
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-a02-native-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 6
+          path: ${{ runner.temp }}/a02-evidence/
