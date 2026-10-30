@@ -47,7 +47,11 @@ impl BlockDevice for Disk {
         TOTAL_BLOCKS
     }
     fn read_block(&mut self, block: u32, bytes: &mut [u8; BLOCK_SIZE]) -> Result<(), ()> {
-        if let Some(stored) = self.pending.get(&block).or_else(|| self.durable.get(&block)) {
+        if let Some(stored) = self
+            .pending
+            .get(&block)
+            .or_else(|| self.durable.get(&block))
+        {
             bytes.copy_from_slice(stored.as_ref());
         } else {
             bytes.fill(0);
@@ -117,10 +121,17 @@ fn exercise(previous_epoch: u64) {
         Ok(previous_epoch + 1)
     );
     let operations = healthy.operations;
-    assert!(operations.iter().any(|op| matches!(op, Operation::Write(_))));
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Operation::Write(_)))
+    );
     assert_eq!(operations.len(), if previous_epoch == 0 { 12 } else { 8 });
     assert_eq!(
-        operations.iter().filter(|op| **op == Operation::Flush).count(),
+        operations
+            .iter()
+            .filter(|op| **op == Operation::Flush)
+            .count(),
         2
     );
     assert_eq!(operations.last(), Some(&Operation::Flush));
@@ -145,7 +156,11 @@ fn exercise(previous_epoch: u64) {
                 allocate(&mut owner, &mut journal, &mut disk),
                 Err(BootError::AlreadyAttempted)
             );
-            assert_eq!(disk.operations.len(), attempts, "same-boot retry issued I/O");
+            assert_eq!(
+                disk.operations.len(),
+                attempts,
+                "same-boot retry issued I/O"
+            );
             assert_eq!(disk.durable, durable);
             assert_eq!(disk.pending, pending);
             // Lost final FLUSH completion means the epoch committed even though
