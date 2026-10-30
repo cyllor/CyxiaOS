@@ -28,6 +28,52 @@ def raw(w):
 
 
 class PublicationCostDecoder(unittest.TestCase):
+    def test_checkpoint_stop_requires_frozen_but_paid_later_freeze_is_allowed(self):
+        w=fixture();w[1]=0
+        with self.assertRaisesRegex(ValueError,'frozen'):
+            decode(raw(w))
+        # A later attempt may freeze a serializer-only stop's earlier
+        # checkpoint, whose own Registry/local stop facts were both false.
+        w=fixture();w[28]=0;w[31]=w[32]=0
+        row=decode(raw(w))[0]
+        self.assertTrue(row['frozen'])
+        context=[2,100,11,9,402,7,3,309,0,0,90,610,700,0,0,1,1,402,1,1000]
+        self.assertTrue(decoder.bind_publication_stop(row,context)['charged_stop_bound'])
+
+    def test_bound_registry_stop_bit_must_match_checkpoint_in_both_directions(self):
+        context=[1,100,11,9,402,7,3,309,0,0,90,610,700,0,0,1,1,402,1,1000]
+        with self.assertRaisesRegex(ValueError,'Registry.stop'):
+            decoder.bind_publication_stop(decode(raw(fixture()))[0],context)
+        w=fixture();w[31]=1;context[0]=2
+        with self.assertRaisesRegex(ValueError,'Registry.stop'):
+            decoder.bind_publication_stop(decode(raw(w))[0],context)
+
+    def test_bound_local_stop_cannot_be_readonly(self):
+        context=[2,100,11,9,402,7,3,309,0,1,90,610,700,0,0,1,1,402,1,1000]
+        with self.assertRaisesRegex(ValueError,'readonly'):
+            decoder.bind_publication_stop(decode(raw(fixture()))[0],context)
+
+    def test_bound_checkpoint_local_stop_cannot_disappear(self):
+        w=fixture();w[31]=1
+        context=[1,100,11,9,402,7,3,309,0,0,90,610,700,0,0,1,1,402,1,1000]
+        with self.assertRaisesRegex(ValueError,'checkpoint.local.stop'):
+            decoder.bind_publication_stop(decode(raw(w))[0],context)
+
+    def test_readonly_cannot_have_entered_registry_even_without_local_stop(self):
+        w=fixture();w[31]=1;w[32]=0
+        context=[1,100,11,9,402,7,3,309,0,1,90,610,700,0,0,1,1,402,1,1000]
+        with self.assertRaisesRegex(ValueError,'readonly'):
+            decoder.bind_publication_stop(decode(raw(w))[0],context)
+
+    def test_readonly_cannot_create_original_registry_only_stop_without_a_receipt(self):
+        w=fixture();w[15]=0;w[16:23]=[0]*7;w[33:47]=[0]*14
+        w[28]=0;w[29:33]=[0,8,1,0]
+        context=[1,100,11,9,402,7,3,0,8,1,90,610,700,0,0,1,1,402,1,1000]
+        # Even this matching Registry-only/no-receipt counterfactual cannot
+        # be an original readonly stop transition under the held control gate.
+        with self.assertRaisesRegex(ValueError,'readonly'):
+            decoder.bind_publication_stop(decode(raw(w))[0],context)
+
     def test_successful_new_publication_requires_precommit_but_cached_receipt_does_not(self):
         w=fixture();w[16]=w[17]=w[46]=0
         with self.assertRaisesRegex(ValueError,'precommit'):

@@ -158,6 +158,14 @@ def source():
  assert_eq!(&retained[2..],&w[2..],"later readonly attempt replaced first serializer-stop checkpoint");
  assert_eq!(retained[1],1,"prior stopped checkpoint was not retained");
  assert!(FINISHED.lock().unwrap().unwrap().1>=500_000,"next readonly completion omitted actual retention-flag CPU");
+ println!("RETAINED_COST={:?}",retained);
+}
+#[test]fn publication_cost_registry_and_local_stop_preserve_original_budget_refusal(){
+ let out=setup(8);assert_eq!(accept(&out,10),Err(Error::Budget));
+ let w=publication_cost::snapshot(1);let context=STOP_CONTEXT.lock().unwrap().unwrap();
+ assert_eq!((w[20],w[21],w[22],w[31],w[32]),(2,0,Error::Budget as u64+1,1,1));
+ assert_eq!((context[0],context[7],context[8]),(3,0,Error::Budget as u64+1));
+ println!("REGISTRY_PAIR=[{:?},{:?}]",w,context);
 }
 '''
     return p
@@ -200,6 +208,29 @@ class PublicationCost(unittest.TestCase):
             self.assertEqual(joined['charged_cumulative_ns'],600_060)
             self.assertEqual(joined['final_result_version'],1)
             self.assertNotIn('final',joined)
+            local_stop_words=json.loads(lines[0]);local_stop_words[1]=0
+            with self.subTest(contradiction='actual checkpoint stop without frozen'):
+                with self.assertRaisesRegex(ValueError,'frozen'):
+                    decode_publication_cost(struct.pack('<128Q',*(local_stop_words+[0]*64)))
+            for index,value,label in [(0,1,'actual serializer stop misattributed to Registry'),(9,1,'actual serializer local stop marked readonly')]:
+                bad_context=context.copy();bad_context[index]=value
+                with self.subTest(contradiction=label):
+                    with self.assertRaises(ValueError,msg=label):bind_publication_stop(checkpoint,bad_context)
+            retained=[json.loads(line.split('RETAINED_COST=',1)[1]) for line in r.stdout.splitlines() if 'RETAINED_COST=' in line]
+            self.assertEqual(len(retained),1)
+            later=decode_publication_cost(struct.pack('<128Q',*(retained[0]+[0]*64)))[0]
+            self.assertTrue(later['frozen'])
+            self.assertFalse(later['checkpoint_registry_stopped'])
+            self.assertFalse(later['checkpoint_local_stop'])
+            self.assertTrue(bind_publication_stop(later,context)['charged_stop_bound'])
+            both=[json.loads(line.split('REGISTRY_PAIR=',1)[1]) for line in r.stdout.splitlines() if 'REGISTRY_PAIR=' in line]
+            self.assertEqual(len(both),1)
+            both_words,both_context=both[0]
+            both_row=decode_publication_cost(struct.pack('<128Q',*(both_words+[0]*64)))[0]
+            self.assertTrue(bind_publication_stop(both_row,both_context)['charged_stop_bound'])
+            both_context[0]=1
+            with self.assertRaisesRegex(ValueError,'checkpoint.local.stop'):
+                bind_publication_stop(both_row,both_context)
             original=source()
             mutants=[
                 ('publication_cost::precommit(self.job, commit);','', 'publication_cost_successful', 'precommit/Registry-return samples missing'),

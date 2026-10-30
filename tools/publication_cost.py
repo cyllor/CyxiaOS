@@ -41,6 +41,10 @@ def decode_publication_cost(raw, expected=None):
             raise ValueError('publication cost malformed/reserved/capacity')
         if w[20] not in (0,1,2,3) or w[31] not in (0,1) or w[32] not in (0,1):
             raise ValueError('publication cost malformed outcome')
+        # A later paid begin may freeze a checkpoint without stop facts, but
+        # finish always freezes any checkpoint already reporting a stop.
+        if (w[31] or w[32]) and not w[1]:
+            raise ValueError('publication cost checkpoint stop missing frozen retention')
         n=w[15]
         # A protected new attempt always reads first+finished (at least two).
         # A cached receipt and an outer Registry error return before any read.
@@ -106,6 +110,15 @@ def bind_publication_stop(row, context):
     c=context
     if c[0] not in (1,2,3) or c[9] not in (0,1) or c[13] or c[14] or c[15]!=1 or c[8]>20:
         raise ValueError('publication stop incomplete/overflow/outcome')
+    # accept holds the control gate throughout. A readonly path enters
+    # neither Registry nor local_stop, so it cannot produce the original
+    # !wasStopped -> stopped transition. Readonly checkpoints stay unbound.
+    if c[9]:
+        raise ValueError('publication stop readonly cannot cause original stop transition')
+    if bool(c[0]&1)!=row['checkpoint_registry_stopped']:
+        raise ValueError('publication stop Registry-stop disagrees with checkpoint')
+    if row['checkpoint_local_stop'] and not c[0]&2:
+        raise ValueError('publication stop checkpoint local stop disappeared')
     bindings={'cpu':18,'boot':2,'controller':3,'job':4,'target':5,'generation':6,'model':16}
     if any(row[k]!=c[i] for k,i in bindings.items()) or row['start']['wall_ns']!=c[1] or row['start']['cpu_ns']!=c[19]:
         raise ValueError('publication stop identity mismatch')
