@@ -107,6 +107,9 @@ class CandidatePublicationProgress(unittest.TestCase):
                 source.write_text(program.replace(old,new))
                 negative=subprocess.run(command[:-1]+['--exact',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+                self.assertNotIn('error[E',negative.stdout+negative.stderr)
+                self.assertNotIn('could not compile',negative.stdout+negative.stderr)
+                self.assertIn('Running ',negative.stderr)
                 self.assertIn(failure,negative.stdout+negative.stderr)
 
     def test_submitted_identity_terminal_updates_and_prepublication_activate(self):
@@ -137,13 +140,16 @@ class CandidatePublicationProgress(unittest.TestCase):
             'use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};\nuse super::replay;')
         publication=publication.replace('// NATIVE_CLOCK',function(control,'impl policy::Clock for NativeClock'))
         publication=publication.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
+        # Keep the real diagnostic call and its Job input. This Root bridge
+        # does not begin a diagnostic row or prove publication-cost accounting.
+        publication+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
         publish=function(control,'fn publish(&mut self, plan: &Plan, version: u64, at: u64)')
         cutoff=publish.index('        for (index, d) in plan.iter().enumerate() {',publish.index('self.scope.commit('));cutoff=publish.rfind('\n',0,cutoff)+1
         suffix=publish[publish.rfind('\n        })();'):] if 'let result = (|| {' in publish else '\n}'
         publish=publish[:cutoff]+'self.published+=1;Ok(())'+suffix
         publication=publication.replace('// NATIVE_PRECOMMIT',publish)
-        publication=publication.replace('wall_deadline: u64, published: usize,','wall_deadline: u64, published: usize,boot:u64,')
-        publication=publication.replace('wall_deadline: 150_000_000, published: 0','wall_deadline: 150_000_000, published: 0,boot:7')
+        publication=publication.replace('wall_deadline: u64, published: usize,','wall_deadline: u64, published: usize,boot:u64,job:u64,')
+        publication=publication.replace('wall_deadline: 150_000_000, published: 0','wall_deadline: 150_000_000, published: 0,boot:7,job:51')
         publication=publication.replace('id: 1, generation: 1','id: 12, generation: 1').replace('plan_seq: 1,','plan_seq: 51,')
         publication=publication.replace('controller_epoch: 1,','controller_epoch: 2,').replace('snapshot_seq: 1,','snapshot_seq: 51,')
         publication+='''
@@ -210,12 +216,18 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
                 source.write_text(mutant)
                 negative=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+                self.assertNotIn('error[E',negative.stdout+negative.stderr)
+                self.assertNotIn('could not compile',negative.stdout+negative.stderr)
+                self.assertIn('Running `',negative.stderr)
                 self.assertIn(failure,negative.stdout+negative.stderr)
             original_evidence=evidence.read_text();self.assertIn('if get(223) == 0 {',original_evidence)
             evidence.write_text(original_evidence.replace('if get(223) == 0 {','if true {'))
             source.write_text(program)
             negative=subprocess.run(command+['--','denial_scope'],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
             self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertNotIn('error[E',negative.stdout+negative.stderr)
+            self.assertNotIn('could not compile',negative.stdout+negative.stderr)
+            self.assertIn('Running `',negative.stderr)
             self.assertIn('first candidate stale facts were overwritten',negative.stdout+negative.stderr)
 
 

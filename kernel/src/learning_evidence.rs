@@ -30,9 +30,14 @@ pub const START_REQUESTS: usize = 128;
 pub(crate) mod execution_trace;
 #[path = "learning_evidence/handoff.rs"]
 mod handoff;
+#[path = "learning_evidence/provenance.rs"]
+mod provenance;
+pub use provenance::TaskIdentity;
 /// Exact fixed storage for completed exits and first-loss diagnostics.
-pub const HANDOFF_BYTES: usize =
-    handoff::OWNED_BYTES + 2 * core::mem::size_of::<AtomicU64>() + execution_trace::OWNED_BYTES;
+pub const HANDOFF_BYTES: usize = handoff::OWNED_BYTES
+    + 2 * core::mem::size_of::<AtomicU64>()
+    + execution_trace::OWNED_BYTES
+    + provenance::OWNED_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     NotReady,
@@ -792,6 +797,116 @@ pub fn measure<R>(owner: ObjectKey, class: CpuClass, body: impl FnOnce() -> R) -
     let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
     let _ = finish_attempt(&mut attempt, first_ns, last_ns);
     result
+}
+/// Compatibility wrapper. A generic call has no proved enclosing ledger
+/// sample and therefore supplies no invocation observation.
+#[allow(dead_code)] // Preserve the existing public diagnostic wrapper signature.
+#[inline(never)]
+pub fn measure_task<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    _identity: TaskIdentity,
+    body: impl FnOnce() -> R,
+) -> R {
+    measure(owner, class, body)
+}
+/// Diagnostic context borrowed only during an original measured body. Its
+/// caller must prove the enclosing physical ledger sample independently.
+pub(crate) struct PaidEntry<'a> {
+    attempt: &'a OwnerAttempt,
+    started: u64,
+}
+impl PaidEntry<'_> {
+    pub fn observe(self, identity: impl FnOnce() -> TaskIdentity) {
+        observe_paid_entry(self.attempt, self.started, || {
+            let identity = identity();
+            (identity.site, Some(identity))
+        });
+    }
+    /// Ordinary owner poll has no task identity. Its caller proves the
+    /// enclosing service_segment ledger sample independently.
+    pub fn observe_workload_poll(self) {
+        observe_paid_entry(self.attempt, self.started, || (6, None));
+    }
+}
+/// Only bodies enclosed by TaskGuard service_segment use this opt-in. Identity
+/// construction occurs lazily inside the original capture sample and its
+/// enclosing service ledger sample, never during credit setup or completion.
+#[inline(never)]
+pub(crate) fn measure_paid_task<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    body: impl FnOnce(Option<PaidEntry<'_>>) -> R,
+) -> R {
+    let Some(mut attempt) = attempt(owner, class).ok().flatten() else {
+        return body(None);
+    };
+    let cpu_started = cpu_ticks();
+    let entry = if attempt.core == 0
+        && matches!(attempt.mode, AttemptMode::Record)
+        && attempt.lease.is_some()
+    {
+        Some(PaidEntry {
+            attempt: &attempt,
+            started: cpu_started,
+        })
+    } else {
+        None
+    };
+    let result = body(entry);
+    let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
+    let _ = finish_attempt(&mut attempt, first_ns, last_ns);
+    result
+}
+/// service_io_piece starts its original capture and ledger PMCC timer before
+/// acquiring the attempt and calling this probe. No caller identity is inferred.
+pub(crate) fn observe_service_io(attempt: &OwnerAttempt, started: u64) {
+    observe_paid_entry(attempt, started, || (5, None));
+}
+fn observe_paid_entry(
+    attempt: &OwnerAttempt,
+    started: u64,
+    identity: impl FnOnce() -> (u64, Option<TaskIdentity>),
+) {
+    if attempt.core != 0
+        || cpu::slot() != 0
+        || !matches!(attempt.mode, AttemptMode::Record)
+        || attempt.lease.is_none()
+        || !attempt.pending
+        || attempt.measured.is_some()
+    {
+        return;
+    }
+    // One existing nonblocking gate acquisition. Do not use with(): merging
+    // losses would mutate capture state merely to collect a diagnostic.
+    let Ok(_guard) = lock() else {
+        return;
+    };
+    let owner = unsafe { &*OWNER.0.get() };
+    if owner.storage.is_null() {
+        return;
+    }
+    let capture = unsafe { &*owner.storage };
+    let Some(config) = capture.config() else {
+        return;
+    };
+    if config.key.generation != attempt.generation {
+        return;
+    }
+    // A direct immutable roster match is known; alias/classifier resolution
+    // is deliberately not attempted and can never grant execution authority.
+    let direct = capture.source(attempt.owner, attempt.class).is_ok();
+    let (site, identity) = identity();
+    provenance::observed(provenance::Observation {
+        run: config.key,
+        offered: attempt.owner,
+        direct: direct.then_some(attempt.owner),
+        class: attempt.class,
+        core: attempt.core,
+        started,
+        site,
+        identity,
+    });
 }
 pub fn attempt_work(owner: ObjectKey, optional: bool) -> Result<Option<OwnerAttempt>, Error> {
     attempt_class(owner, |family| {
@@ -1638,6 +1753,9 @@ const _: () = assert!(STORAGE_BYTES <= 1024 * 1024);
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    pub fn source_snapshot() -> [u64; 128] {
+        provenance::snapshot()
+    }
     static PEER_BUSY: AtomicBool = AtomicBool::new(false);
     pub fn set_peer_busy(value: bool) {
         PEER_BUSY.store(value, Ordering::Release);

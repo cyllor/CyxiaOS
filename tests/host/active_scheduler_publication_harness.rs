@@ -38,4 +38,4 @@ fn fixture(){NOW.fetch_add(2_000_000_000,Ordering::AcqRel);CPU.store(1,Ordering:
 }
 
 mod learning_canary{pub fn blocks_active()->bool{false}}
-mod domain_tasks{pub(crate) use super::SchedulerPublication;}
+mod domain_tasks{pub(crate) use super::{SchedulerPublication,SpawnPublication};}

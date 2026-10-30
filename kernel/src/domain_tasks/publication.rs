@@ -227,3 +227,96 @@ impl SchedulerPublication {
         scheduling_dependencies_locked(self.state, target)
     }
 }
+
+/// Exact-native D02 queries share one live owner view. This is separate from
+/// the D01/D13 scheduler capability and grants no publication authority.
+pub(crate) struct SpawnPublication {
+    state: &'static State,
+    cpu: usize,
+    _guard: Guard,
+    _local: core::marker::PhantomData<*mut ()>,
+}
+
+pub(crate) fn spawn_publication_matches(
+    consumer: &crate::domain_control::Family,
+    resolver: Option<
+        fn(ObjectKey) -> Result<[Option<crate::domain_control::Prerequisite>; 2], Error>,
+    >,
+    has_custom_binder: bool,
+) -> bool {
+    !has_custom_binder && resolver.is_none() && native_scheduler_family_matches(consumer, 2)
+}
+
+pub(crate) fn reserve_spawn_publication(action: Action) -> Result<Option<SpawnPublication>, Error> {
+    if !matches!(action, Action::SpawnTokens(_)) {
+        return Ok(None);
+    }
+    let cpu = cpu::slot();
+    if cpu >= 64 {
+        return Err(Error::Auth);
+    }
+    let guard = acquire_guard()?;
+    let state = unsafe { &*core::ptr::addr_of!(STATE) };
+    let allowed = state.layout.healthy_mask
+        & !state.layout.business_mask
+        & !state.draining
+        & !state.scheduler.stats().quarantine_mask;
+    if allowed & (1u64 << cpu) == 0 {
+        return Err(Error::Auth);
+    }
+    Ok(Some(SpawnPublication {
+        state,
+        cpu,
+        _guard: guard,
+        _local: core::marker::PhantomData,
+    }))
+}
+
+impl SpawnPublication {
+    fn check_cpu(&self) -> Result<(), Error> {
+        if cpu::slot() != self.cpu {
+            Err(Error::Auth)
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn validate(
+        &self,
+        action: Action,
+        target: ObjectKey,
+        _at: u64,
+    ) -> Result<(), Error> {
+        self.check_cpu()?;
+        if !matches!(action, Action::SpawnTokens(_)) {
+            return Err(Error::Unsupported);
+        }
+        validate_locked(self.state, action, target, now_ns())
+    }
+    pub(crate) fn current(&self, domain: u16, target: ObjectKey) -> Result<Action, Error> {
+        self.check_cpu()?;
+        if domain != 2 {
+            return Err(Error::Unsupported);
+        }
+        current_locked(self.state, domain, target, now_ns())
+    }
+    pub(crate) fn legal_options(
+        &self,
+        options: &[Option<Action>],
+        target: ObjectKey,
+        _at: u64,
+        output: &mut [Option<Action>],
+    ) -> Result<usize, Error> {
+        self.check_cpu()?;
+        if options
+            .iter()
+            .flatten()
+            .any(|action| !matches!(action, Action::SpawnTokens(_)))
+        {
+            return Err(Error::Unsupported);
+        }
+        let at = now_ns();
+        cyxia_prototype::policy::collect_legal_actions(options, output, |action| {
+            validate_locked(self.state, action, target, at)
+        })
+    }
+}

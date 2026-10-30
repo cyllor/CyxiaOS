@@ -36,6 +36,16 @@ pub const TASK_LOOKUP_CUSTODY: u64 = 32;
 pub const TASK_CUSTODY_INVENTORY: u64 = 33;
 pub const TASK_CUSTODY_KEY_BYTES: usize = 120;
 pub const OP_TRACE: u64 = 11;
+/// Error-path diagnostics only. Exactly 24 little-endian u64 words; retained
+/// separately from ordinary service events, never interpreted as authority.
+/// Words: schema, boot, service generation, original connection epoch, ms,
+/// exit reason, original result class, origin, Member discriminant, state flags,
+/// last RX ms, peer boot, last complete RX kind/sequence/sender/receiver/body_len,
+/// last TX kind/sequence, four words of session fingerprint, reserved zero.
+/// State flags: TLS authenticated (1), driver active (2), sent READY (4), ready (8).
+/// No key, challenge, request body or plaintext bytes are included.
+pub const TRACE_SESSION_EXIT: u64 = 0x24f;
+pub const SESSION_EXIT_WORDS: usize = 24;
 pub const OP_YIELD: u64 = 12;
 /// OP_TRACE arg0 distinguishes a terminal service failure from an ordinary event.
 /// This is a value convention; the shared page layout and ABI version are unchanged.

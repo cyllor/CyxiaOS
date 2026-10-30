@@ -19,6 +19,7 @@ fn arm(){
 }
 fn wait(id:u64){trace::drain_work(RUN,trace::WorkWait{counts:[0,1,0],request:[id,2,1,4,0],warm:[0;3],background_done:true},false,now());}
 mod evidence {
+ pub use super::learning_evidence::{measure_paid_task, PaidEntry};
  pub(crate) use super::trace as execution_trace;
  pub fn measure<R>(_:super::ObjectKey,_:super::CpuClass,f:impl FnOnce()->R)->R{f()}
  pub fn request(_:super::ObjectKey,id:u64)->Result<u64,super::Error>{Ok(id)}

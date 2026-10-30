@@ -1,5 +1,9 @@
 //! Actual post-submit accounting boundary. Registry transition is an explicit
 //! facade; the real Registry's retained-stop contract has its own Rust tests.
+//! Decode/elapsed/observed samples are controlled inputs, shared by the actual
+//! checkpoint and final cap here. Diagnostic serialization and the enclosing
+//! native sample are not executed; full accept/charged-boundary tests own that
+//! proof. This fixture checks retained stop cost/identity, not measured CPU.
 #![allow(dead_code)]
 use core::sync::atomic::{AtomicU64,Ordering};
 use cyxia_prototype::{domains::{Error,ObjectKey},policy::{self,CpuTime,PublicationTime,ModelBinding}};
@@ -27,6 +31,7 @@ fn post(s:&mut State,job:&Job,transition:bool,mut result:Result<u64,Error>,decod
     // This boundary models the actual Registry callback's return. It cannot
     // clear an already retained stop or alter a published receipt.
     if transition{s.registry.stopped=true;}
+    // ACTUAL_CHECKPOINT_INPUTS
     // ACTUAL_POST_SUBMISSION
 }
 fn main(){

@@ -231,6 +231,7 @@ pub mod governance;
 pub mod learning_coordinator;
 #[path = "domain_control/learning_driver.rs"]
 pub mod learning_driver;
+mod publication_cost;
 #[path = "domain_control/replay.rs"]
 pub mod replay;
 #[path = "domain_control/reply.rs"]
@@ -2035,6 +2036,7 @@ impl PublicationScope for ActiveScope<'_> {
 struct ActivePublication<'a> {
     active: ActiveScope<'a>,
     task_publication: Option<crate::domain_tasks::SchedulerPublication>,
+    spawn_publication: Option<crate::domain_tasks::SpawnPublication>,
 }
 impl PublicationScope for ActivePublication<'_> {
     fn authorize(
@@ -2046,6 +2048,9 @@ impl PublicationScope for ActivePublication<'_> {
         self.active.authorize(active, set, at)
     }
     fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return spawn.validate(action, target, at);
+        }
         match self.task_publication.as_ref() {
             Some(task) if matches!(action, Action::CpuWeight(_)) => {
                 task.validate(action, target, at)
@@ -2087,6 +2092,16 @@ impl PublicationScope for ActivePublication<'_> {
         target: ObjectKey,
         at: u64,
     ) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return validate_selection_with(
+                owner,
+                action,
+                target,
+                at,
+                || spawn.current(action.domain(), target),
+                |options, output| spawn.legal_options(options, target, at, output),
+            );
+        }
         match self.task_publication.as_ref() {
             Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with(
                 owner,
@@ -2308,6 +2323,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             }
             self.provenance.at(submission::Stage::CommitTime);
             let commit = policy::Clock::read(&mut NativeClock);
+            publication_cost::precommit(self.job, commit);
             let commit_ns = commit.wall_ns;
             if commit_ns < at {
                 return Err(Error::Range);
@@ -2439,12 +2455,32 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         // disjoint evidence intervals below still charge actual execution once.
         let publication_started = policy::Clock::read(&mut NativeClock);
         let wall_begin = publication_started.wall_ns;
+        let (domain, kind) = job
+            .set
+            .get(0)
+            .map_or((0, 0), |c| (c.action.domain(), c.action.kind()));
+        publication_cost::begin(
+            [
+                s.boot,
+                job.controller,
+                job.sequence,
+                job.set.target.id,
+                job.set.target.generation,
+                job.set.model.generation,
+                u64::from(domain),
+                u64::from(kind),
+            ],
+            job.publication_debit,
+            publication_started,
+            optimization_was_stopped,
+        );
         let budget = policy::PublicationBudget {
             started: publication_started,
             carried: job.publication_debit,
         };
         let mut decode_cpu_started = None;
         let mut task_publication = None;
+        let mut spawn_publication = None;
         let mut acquisition_busy = false;
         let mut registry_completed = false;
         const _: () = assert!(cfg!(target_endian = "little"));
@@ -2497,6 +2533,29 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                             job.set.get(0).ok_or(Error::NotReady)?.action,
                         ) {
                             Ok(view) => task_publication = view,
+                            Err(Error::Busy) => {
+                                acquisition_busy = true;
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                if (0..job.set.len()).all(|i| {
+                    job.set
+                        .get(i)
+                        .is_some_and(|candidate| matches!(candidate.action, Action::SpawnTokens(_)))
+                }) {
+                    let consumer = s.owner.families[family_index(2, 1)?].ok_or(Error::NotReady)?;
+                    if crate::domain_tasks::spawn_publication_matches(
+                        &consumer,
+                        s.owner.dependencies[1],
+                        s.owner.dependency_binders[1].is_some(),
+                    ) {
+                        match crate::domain_tasks::reserve_spawn_publication(
+                            job.set.get(0).ok_or(Error::NotReady)?.action,
+                        ) {
+                            Ok(view) => spawn_publication = view,
                             Err(Error::Busy) => {
                                 acquisition_busy = true;
                                 return Err(Error::Busy);
@@ -2561,6 +2620,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 scope: ActivePublication {
                     active: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
                     task_publication: task_publication.take(),
+                    spawn_publication: spawn_publication.take(),
                 },
                 model: job.set.model,
                 evidence: job.evidence,
@@ -2575,13 +2635,22 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 provenance,
             };
             executor.provenance.accept(submission::AcceptStage::Submit);
+            publication_cost::submit_entry(job.sequence, policy::Clock::read(&mut NativeClock));
             let submitted = s.registry.submit_job_debited(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],
                 budget,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
-                &mut NativeClock,
+                &mut publication_cost::Clock {
+                    inner: &mut NativeClock,
+                    job: job.sequence,
+                },
                 &mut executor,
+            );
+            publication_cost::returned(
+                job.sequence,
+                policy::Clock::read(&mut NativeClock),
+                submitted.as_ref().map_err(|e| *e),
             );
             provenance = executor.provenance;
             drop(executor);
@@ -2599,6 +2668,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         // No task-owner borrow may survive into Root/work delivery. The
         // functional final sample includes the actual release CPU as well.
         drop(task_publication);
+        drop(spawn_publication);
         if acquisition_busy {
             let observed = policy::Clock::read(&mut NativeClock);
             let retry = budget.check(observed).and_then(|()| {
@@ -2621,6 +2691,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 Err(error) => result = Err(error),
             }
         }
+        publication_cost::released(job.sequence, policy::Clock::read(&mut NativeClock));
         // Terminal preflight errors still retain the stopped output hash.
         let output_hash = output_hash.unwrap_or_else(|| {
             decode_cpu_started = Some(timer::cpu_ticks());
@@ -2629,6 +2700,43 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         });
         let decoding = decoded_ns
             .unwrap_or_else(|| decode_cpu_started.map(timer::cpu_elapsed_ns).unwrap_or(0));
+        let publication_cost = publication_cost::prepare(job.sequence, decoding);
+        let observed = policy::Clock::read(&mut NativeClock);
+        // Keep the original terminal sample physically in the diagnostic
+        // checkpoint. Finish every diagnostic operation before the enclosing
+        // sample that charges its serialization as actual publication CPU.
+        let checkpoint_elapsed = publication_started
+            .cpu_elapsed(observed)
+            .and_then(|elapsed| {
+                elapsed
+                    .checked_add(job.publication_debit.ns)
+                    .ok_or(Error::Overflow)
+            });
+        let checkpoint_cap = budget.check(observed).and_then(|()| {
+            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                Err(Error::Expired)
+            } else {
+                Ok(())
+            }
+        });
+        let registry_stopped = s.registry.optimization_stopped();
+        let checkpoint_local_stop = !job.read_only
+            && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
+                || checkpoint_cap.is_err());
+        let checkpoint_result = if checkpoint_local_stop && !registry_completed {
+            checkpoint_cap.and(result)
+        } else {
+            result
+        };
+        publication_cost.finish(
+            observed,
+            checkpoint_elapsed,
+            checkpoint_result,
+            checkpoint_cap,
+            registry_stopped,
+            checkpoint_local_stop,
+        );
+        // No diagnostic access or mutation may follow this charged boundary.
         let observed = policy::Clock::read(&mut NativeClock);
         let elapsed = publication_started
             .cpu_elapsed(observed)
@@ -2642,14 +2750,15 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         let publication_ns = elapsed
             .and_then(|elapsed| elapsed.checked_sub(decoding).ok_or(Error::Range))
             .unwrap_or(u64::MAX);
-        let registry_stopped = s.registry.optimization_stopped();
-        let cap = budget.check(observed).and_then(|()| {
-            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
-                Err(Error::Expired)
-            } else {
-                Ok(())
-            }
-        });
+        let cap = checkpoint_cap
+            .and_then(|()| budget.check(observed))
+            .and_then(|()| {
+                if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                    Err(Error::Expired)
+                } else {
+                    Ok(())
+                }
+            });
         let local_stop = !job.read_only
             && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
                 || cap.is_err());

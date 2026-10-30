@@ -142,8 +142,9 @@ def result_scope(request: dict, overwrite_points: list[int], observed_points: li
                        if complete else 'diagnostic subset; mandatory A10 matrix remains incomplete'))
 
 
-def review(root: Path) -> dict:
+def review(root: Path, *, child_loader=None) -> dict:
     root = root.resolve(strict=True)
+    load_child = load_run if child_loader is None else child_loader
     request = json.loads((root / 'matrix-input.json').read_text())
     require(request.get('schema_version') == 1 and request.get('test_id') == 'A10'
             and request.get('specification') == '1.3'
@@ -180,7 +181,7 @@ def review(root: Path) -> dict:
 
     formatted = root / 'formatted.raw'
     formatted_sha = sha(formatted)
-    prepare, _ = load_run(root / 'prepare', mode=1, cut=0, phase='before', loss='drop',
+    prepare, _ = load_child(root / 'prepare', mode=1, cut=0, phase='before', loss='drop',
                           initial_sha256=formatted_sha, status='PASS', matrix=request)
     require(prepare['observation']['consumption_boundary']['present'] is True,
             'preparation lacks protected sequence-2 consumption')
@@ -188,7 +189,7 @@ def review(root: Path) -> dict:
     prepared_sha = sha(prepared_disk)
 
     probe_dir = root / 'overwrite-probe'
-    probe, _ = load_run(probe_dir, mode=2, cut=0, phase='before', loss='drop',
+    probe, _ = load_child(probe_dir, mode=2, cut=0, phase='before', loss='drop',
                         initial_sha256=prepared_sha, status='PASS', matrix=request)
     require(probe['observation']['consumption_boundary']['present'] is True,
             'overwrite probe lacks reordered transport or protected consumption')
@@ -198,7 +199,7 @@ def review(root: Path) -> dict:
     overwrite_points = select_points(request['overwrite_points'], overwrite_rows)
 
     cache_dir = root / 'cache-eviction'
-    cache, _ = load_run(cache_dir, mode=4, cut=0, phase='before', loss='drop',
+    cache, _ = load_child(cache_dir, mode=4, cut=0, phase='before', loss='drop',
                         initial_sha256=sha(probe_dir / 'disk.raw'), status='PASS', matrix=request)
     require(cache['observation'].get('cache_eviction_verified') is True
             and cache['observation'].get('pressure_pages') == 4096,
@@ -213,7 +214,7 @@ def review(root: Path) -> dict:
             for loss in LOSSES:
                 case = root / 'overwrite' / _case_name(point, phase, loss)
                 cut_dir = case / 'cut'
-                cut, _ = load_run(cut_dir, mode=2, cut=point, phase=phase, loss=loss,
+                cut, _ = load_child(cut_dir, mode=2, cut=point, phase=phase, loss=loss,
                                   initial_sha256=prepared_sha, status='NOT_RUN', matrix=request)
                 consumed_cut |= cut.get('consumption_boundary', {}).get('present') is True
                 reordered |= bool(cut.get('nbd_trace', {}).get('reordered_replies'))
@@ -221,7 +222,7 @@ def review(root: Path) -> dict:
 
                 damaged = cut_dir / 'disk.raw'
                 recovery_probe_dir = case / 'recovery-probe'
-                recovery, _ = load_run(
+                recovery, _ = load_child(
                     recovery_probe_dir, mode=3, cut=0, phase='before', loss='drop',
                     initial_sha256=sha(damaged), status='PASS', matrix=request)
                 require(recovery['observation']['consumption_boundary']['present'] is False,
@@ -236,13 +237,13 @@ def review(root: Path) -> dict:
                             interrupted = case / 'recovery' / _recovery_name(
                                 recovery_point, recovery_phase, recovery_loss)
                             recovery_cut_dir = interrupted / 'cut'
-                            recovery_cut, _ = load_run(
+                            recovery_cut, _ = load_child(
                                 recovery_cut_dir, mode=3, cut=recovery_point,
                                 phase=recovery_phase, loss=recovery_loss,
                                 initial_sha256=sha(damaged), status='NOT_RUN', matrix=request)
                             reordered |= bool(recovery_cut.get('nbd_trace', {}).get('reordered_replies'))
                             final_dir = interrupted / 'final'
-                            final, _ = load_run(
+                            final, _ = load_child(
                                 final_dir, mode=3, cut=0, phase='before', loss='drop',
                                 initial_sha256=sha(recovery_cut_dir / 'disk.raw'), status='PASS',
                                 matrix=request)

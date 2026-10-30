@@ -352,6 +352,7 @@ pub struct Session<'a> {
     output: usize,
     received: usize,
     sending: usize,
+    needs_input: bool,
     peer: [u8; 32],
     authenticated: bool,
     failed: bool,
@@ -389,6 +390,7 @@ impl<'a> Session<'a> {
             output: 0,
             received: 0,
             sending: 0,
+            needs_input: false,
             peer,
             authenticated: false,
             failed: false,
@@ -414,7 +416,25 @@ impl<'a> Session<'a> {
         }
         self.buffers.input[self.input..self.input + count].copy_from_slice(&bytes[..count]);
         self.input += count;
+        if count != 0 {
+            self.needs_input = false;
+        }
         Ok(count)
+    }
+    /// Maximum next socket read. While TLS owns outgoing plaintext, finish
+    /// admitted records before admitting more traffic. A real stalled pump
+    /// permits another bounded read, including handshake messages fragmented
+    /// across records. Callers retain any unread suffix in their transport.
+    pub fn receive_capacity(&self) -> usize {
+        if self.failed || (self.sending != 0 && !self.needs_input) {
+            0
+        } else {
+            RECORD_BUFFER - self.input
+        }
+    }
+    /// Accepted plaintext still belongs to TLS, even before ciphertext exists.
+    pub fn has_pending_plaintext(&self) -> bool {
+        self.sending != 0
     }
     /// Pending ciphertext remains immutable until the TCP stream accepted it.
     pub fn pending_tls(&self) -> &[u8] {
@@ -491,12 +511,14 @@ impl<'a> Session<'a> {
                 &mut self.buffers.output[..],
                 &mut self.buffers.received[..],
                 &self.buffers.sending[..self.sending],
+                self.input,
             ),
             Connection::Server(c) => step(
                 c.process_tls_records(incoming),
                 &mut self.buffers.output[..],
                 &mut self.buffers.received[..],
                 &self.buffers.sending[..self.sending],
+                self.input,
             ),
         };
         let progress = match result {
@@ -525,6 +547,11 @@ impl<'a> Session<'a> {
             .copy_within(progress.discard..self.input, 0);
         self.buffers.input[self.input - progress.discard..self.input].fill(0);
         self.input -= progress.discard;
+        self.needs_input = self.input != 0
+            && progress.discard == 0
+            && progress.output == 0
+            && progress.received == 0
+            && !progress.sent;
         self.output = progress.output;
         self.received = progress.received;
         if progress.sent {
@@ -550,6 +577,7 @@ impl<'a> Session<'a> {
         self.output = 0;
         self.received = 0;
         self.sending = 0;
+        self.needs_input = false;
     }
 }
 impl Drop for Session<'_> {
@@ -563,6 +591,7 @@ fn step<T>(
     output: &mut [u8],
     received: &mut [u8],
     sending: &[u8],
+    input_len: usize,
 ) -> Result<Step, Error> {
     let mut result = Step {
         discard: status.discard,
@@ -579,7 +608,10 @@ fn step<T>(
         ConnectionState::BlockedHandshake => {}
         ConnectionState::WriteTraffic(mut state) => {
             result.authenticated = true;
-            if !sending.is_empty() {
+            // A WriteTraffic state can still retain an incomplete control
+            // message. Finish all admitted input before encrypting application
+            // bytes, rather than hiding that input to force a write state.
+            if !sending.is_empty() && result.discard == input_len {
                 result.output = state.encrypt(sending, output).map_err(|_| Error::Buffer)?;
                 result.sent = true;
             }
@@ -602,6 +634,10 @@ fn step<T>(
     }
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "tls_duplex_tests.rs"]
+mod duplex_tests;
 
 #[cfg(test)]
 mod tests {

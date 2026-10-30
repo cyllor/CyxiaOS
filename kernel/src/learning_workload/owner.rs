@@ -725,7 +725,10 @@ pub fn poll(run: RunKey) -> Result<bool, Error> {
             Ok(())
         })?;
     }
-    evidence::measure(OWNER, CpuClass::ExecutorWork, || {
+    evidence::measure_paid_task(OWNER, CpuClass::ExecutorWork, |entry| {
+        if let Some(entry) = entry {
+            entry.observe_workload_poll();
+        }
         crate::domain_tasks::replay::within_work(|| {
             with(|s| {
                 let scope = s.scope.ok_or(Error::NotReady)?;

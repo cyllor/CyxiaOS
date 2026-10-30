@@ -574,6 +574,13 @@ impl Driver {
         Ok(result)
     }
     pub fn domain_tick(&mut self, now_ns: u64) -> Result<(), ()> {
+        let result = self.domain_tick_inner(now_ns);
+        if result.is_err() {
+            self.report_exit(3, 0x4000, 7, now_ns / 1_000_000, self.active);
+        }
+        result
+    }
+    fn domain_tick_inner(&mut self, now_ns: u64) -> Result<(), ()> {
         if self.native.is_none() {
             return Ok(());
         }

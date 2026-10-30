@@ -23,7 +23,9 @@ class DrainCustodyTrace(unittest.TestCase):
         work_body = function(work, 'pub fn poll(').replace('#[cfg(not(test))]', '')
         query_body = function(replay, 'pub fn spawn_result(').replace('#[cfg(not(test))]', '')
         helper = function(replay, 'pub(super) fn drain_task_facts(').replace('#[cfg(not(test))]', '') if 'fn drain_task_facts(' in replay else 'pub(super) fn drain_task_facts(_: &State,_:usize)->Option<crate::trace::DrainTask>{None}'
-        bodies = '\n'.join(function(execution, s).replace('#[cfg(not(test))]', '') for s in ['fn cleanup(', 'fn lifecycle_piece('])
+        bodies = '\n'.join(function(execution, s).replace('#[cfg(not(test))]', '') for s in ['fn capture_task_identity(', 'fn cleanup(', 'fn lifecycle_piece('])
+        template = template.replace('mod learning_evidence {', 'mod learning_evidence {' +
+                                    (ROOT/'tests/host/capture_identity_facade.rs').read_text())
         task_bodies = '\n'.join(function(task, s) for s in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()', 'fn locked<R>','fn locked_with_guard<R>'])
         task_bodies = 'static LOCK: owner_gate::Gate = owner_gate::Gate::new();\n' + task_bodies
         template = template.replace('// OWNER_GATE', '#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/owner_gate.rs'))+'] mod owner_gate;')

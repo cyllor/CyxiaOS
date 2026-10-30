@@ -23,6 +23,7 @@ def native_program():
  end=body.index('self.owner.prepared_count = 0;',start);end=body.rfind('\n',0,end)+1
  body=body[:start]+'            EFFECTS.fetch_add(1,Ordering::AcqRel);\n'+body[end:]
  program=program.replace('// NATIVE_EXECUTOR',struct).replace('// NATIVE_IMPL',body)
+ program=program.replace('struct NativeClock;', '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\nstruct NativeClock;')
  module=ROOT/'kernel/src/domain_control/submission.rs'
  if module.exists():
   program=program.replace('// FACTS_MODULE','#[path='+json.dumps(str(module))+'] mod submission;')

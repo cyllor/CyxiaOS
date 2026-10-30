@@ -20,11 +20,11 @@ fn now_ns() -> u64 { NOW.load(Ordering::Acquire) }
 fn group(id: u64) -> ObjectKey { key(id) }
 #[derive(Clone, Copy, Eq, PartialEq)] enum Life { Free, Ready, Exiting }
 #[derive(Clone, Copy)] struct Task { key: ObjectKey, group: ObjectKey, package: ObjectKey,
-    life: Life, recipe: u64, closed: bool, cpu: u16, failure: Option<Error> }
+    life: Life, recipe: u16, closed: bool, cpu: u16, failure: Option<Error> }
 impl Task { const EMPTY: Self = Self { key: ZERO, group: ZERO, package: ZERO,
     life: Life::Free, recipe: 0, closed: false, cpu: 3, failure: None }; }
 #[derive(Clone, Copy)] struct Launch { request: SpawnRequest, cpu: u16, deadline: u64,
-    recipe: u64, len: usize, input: [u8; 32] }
+    recipe: u16, len: usize, input: [u8; 32] }
 struct BuildTrace { enabled: bool, stage: u64, entered_ns: u64 }
 impl BuildTrace {
     fn new(enabled: bool) -> Self { Self { enabled, stage: 0, entered_ns: 0 } }
@@ -33,9 +33,9 @@ impl BuildTrace {
 mod replay {
     use super::*;
     pub const CALLER_ID: u64 = u64::MAX - 10;
-    pub fn authorize_request(_: &SpawnRequest, _: &[u8], _: u16, _: u64, _: u64) -> Result<(), Error> { Err(Error::Auth) }
+    pub fn authorize_request(_: &SpawnRequest, _: &[u8], _: u16, _: u64, _: u16) -> Result<(), Error> { Err(Error::Auth) }
     pub fn work_measured() -> bool { false }
-    pub fn work_source(_: ObjectKey, _: u64, _: u64) -> Option<()> { None }
+    pub fn work_source(_: ObjectKey, _: u64, _: u16) -> Option<ObjectKey> { None }
 }
 mod learning_evidence {
     pub mod execution_trace {
@@ -43,7 +43,7 @@ mod learning_evidence {
             pub parent: super::super::ObjectKey, pub request_id: u64, pub at: u64 }
         pub fn created(_: Child) {}
     }
-    pub fn measure<T>(_: (), _: cyxia_prototype::learning::reward::CpuClass, body: impl FnOnce() -> T) -> T { body() }
+    pub fn measure<T>(_: super::ObjectKey, _: cyxia_prototype::learning::reward::CpuClass, body: impl FnOnce() -> T) -> T { body() }
 }
 // THREAD_SPEC
 struct Creator<'a> {

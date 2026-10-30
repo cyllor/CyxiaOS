@@ -768,10 +768,15 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
     let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_paid_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
-            || cleanup_inner(s, i),
+            |entry| {
+                if let Some(entry) = entry {
+                    entry.observe(|| capture_task_identity(&s.tasks[i], 2));
+                }
+                cleanup_inner(s, i)
+            },
         )
     } else {
         cleanup_inner(s, i)
@@ -974,6 +979,15 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
     }
     Ok(())
 }
+fn capture_task_identity(task: &Task, site: u64) -> crate::learning_evidence::TaskIdentity {
+    crate::learning_evidence::TaskIdentity {
+        site,
+        caller: task.parent,
+        request: task.spawn_id,
+        child: task.key,
+        recipe: task.recipe,
+    }
+}
 fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
     let warm = if s.tasks[i].recipe == 2
         && crate::domain_services::replay::owns(2)
@@ -990,10 +1004,15 @@ fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
     let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_paid_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
-            || recipe_turn_inner(s, i),
+            |entry| {
+                if let Some(entry) = entry {
+                    entry.observe(|| capture_task_identity(&s.tasks[i], 3));
+                }
+                recipe_turn_inner(s, i)
+            },
         )
     } else {
         recipe_turn_inner(s, i)
@@ -1527,10 +1546,15 @@ fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
     if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_paid_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
-            || process_return_inner(s, i, c),
+            |entry| {
+                if let Some(entry) = entry {
+                    entry.observe(|| capture_task_identity(&s.tasks[i], 4));
+                }
+                process_return_inner(s, i, c)
+            },
         );
     } else {
         process_return_inner(s, i, c);
@@ -1714,6 +1738,9 @@ pub fn service_io_piece<R>(
         .ok()
         .flatten()
     });
+    if let Some(attempt) = capture.as_ref() {
+        crate::learning_evidence::observe_service_io(attempt, cpu_started);
+    }
     let mut resume = || {
         let (first_ns, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
         if let Some(mut attempt) = capture.take() {
@@ -1732,6 +1759,9 @@ pub fn service_io_piece<R>(
                     .ok()
                     .flatten()
                 });
+                if let Some(attempt) = capture.as_ref() {
+                    crate::learning_evidence::observe_service_io(attempt, cpu_started);
+                }
                 break;
             }
             core::hint::spin_loop();

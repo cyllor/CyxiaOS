@@ -13,6 +13,7 @@ struct Node {
     records: Vec<Vec<u8>>,
     staging: Vec<u8>,
     traces: Vec<u64>,
+    exit_records: Vec<Vec<u64>>,
     input: Vec<u8>,
     starts: usize,
     reserved: bool,
@@ -42,6 +43,10 @@ struct Node {
     bind_busy: bool,
     bind_calls: usize,
     transport_epoch: u64,
+    authority: Option<cyxia_kernel_core::control_plane::task_admission::Authority>,
+    session_calls: Vec<(u64, u64, Result<(), cyxia_kernel_core::control_plane::Error>)>,
+    // Controlled native admission wait: phase9 token, fresh time, live, epoch.
+    session_wait: Option<(u64, u64, bool, u64)>,
 }
 #[derive(Default)]
 struct Context {
@@ -72,8 +77,14 @@ mod broker {
         CTX.with(|cx| {
             let mut cx = cx.borrow_mut();
             let i = cx.node;
+            let now = cx.now;
             let n = &mut cx.nodes[i];
             match op {
+                OP_TRACE if args[0] == 0x24f && input.len() == 192 => {
+                    n.exit_records.push(input.chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect());
+                    Ok((0, 0))
+                }
                 OP_STORE_GET => {
                     let b = n.records.get(args[0] as usize - 1).ok_or(NOT_FOUND)?;
                     let off = offset as usize;
@@ -292,6 +303,24 @@ mod broker {
                             Err(AGAIN)
                         }
                     }
+                    9 if n.authority.is_some() => {
+                        let (now, connected, epoch) = match n.session_wait {
+                            Some((token, now, live, epoch)) if token == args[1] => {
+                                n.session_wait = None;
+                                (now, live, epoch)
+                            }
+                            _ => (now, true, n.transport_epoch.max(1)),
+                        };
+                        let authority = n.authority.as_mut().unwrap();
+                        if args[1] != 0 && (!connected || args[2] != epoch) {
+                            authority.disconnect(); return Err(FAILED);
+                        }
+                        let result = if args[1] == 3 { authority.activity(epoch, now) }
+                            else { authority.session(epoch, args[1], now) };
+                        n.session_calls.push((args[1], now, result));
+                        if result.is_err() { eprintln!("real Authority session calls: {:?}", n.session_calls); }
+                        result.map(|()| (0, 0)).map_err(|_| FAILED)
+                    }
                     7 | 9 => Ok((0, 0)),
                     6 => {
                         out[..32].fill(42);
@@ -319,6 +348,7 @@ mod broker {
     pub fn poll() -> Result<(bool, u64), u64> {
         Ok((true, CTX.with(|c| { let c = c.borrow(); c.nodes[c.node].transport_epoch.max(1) })))
     }
+    pub fn service_generation() -> u64 { 7 }
     pub fn time() -> Option<(u64, u64)> {
         Some(CTX.with(|c| {
             let c = c.borrow();
@@ -1255,11 +1285,12 @@ fn pump(a: &mut driver::Driver, b: &mut driver::Driver, base: u64, until: impl F
                 assert_eq!(
                     dst.ingest(&bytes, now),
                     Ok(n),
-                    "base {base},step {step},from {from}, traces {:?}",
+                    "base {base},step {step},from {from}, traces {:?}, exits {:?}",
                     CTX.with(|c| [
                         c.borrow().nodes[0].traces.clone(),
                         c.borrow().nodes[1].traces.clone()
-                    ])
+                    ]),
+                    CTX.with(|c| [c.borrow().nodes[0].exit_records.clone(), c.borrow().nodes[1].exit_records.clone()])
                 );
             }
             if until() {
@@ -1277,6 +1308,758 @@ fn pump(a: &mut driver::Driver, b: &mut driver::Driver, base: u64, until: impl F
 }
 fn closed_both() -> bool {
     CTX.with(|c| c.borrow().nodes.iter().all(|n| n.traces.contains(&0x219)))
+}
+
+// These helpers transport genuine production frames. Only the transport's
+// delivery order/chunk size and broker storage/clock boundary are controlled.
+fn session_frames(d: &mut driver::Driver) -> Vec<Vec<u8>> {
+    use cyxia_prototype::cluster::wire::Header;
+    let bytes = d.outgoing().to_vec();
+    d.consume_outgoing(bytes.len());
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let h = Header::decode(&bytes[at..at + 96]).unwrap();
+        let end = at + 96 + h.body_len as usize;
+        frames.push(bytes[at..end].to_vec());
+        at = end;
+    }
+    frames
+}
+
+fn deliver_session_frames(
+    d: &mut driver::Driver,
+    node: usize,
+    frames: &[Vec<u8>],
+    now: u64,
+    chunk: usize,
+) {
+    use cyxia_prototype::cluster::wire::Header;
+    select(node, now);
+    for frame in frames {
+        let h = Header::decode(&frame[..96]).unwrap();
+        for bytes in frame.chunks(chunk) {
+            assert_eq!(
+                d.ingest(bytes, now),
+                Ok(bytes.len()),
+                "node {node} rejected genuine kind {} sequence {} at {now}ms",
+                h.kind,
+                h.sequence
+            );
+        }
+        if h.kind == 2 {
+            assert_eq!(
+                frame[96], 1,
+                "heartbeat must not perform proofless reconciliation"
+            );
+        }
+    }
+}
+
+fn durable_member_proof(node: usize) -> Option<Vec<u8>> {
+    CTX.with(|c| {
+        c.borrow().nodes[node]
+            .records
+            .iter()
+            .rev()
+            .find(|b| b.len() > 13 && b.starts_with(b"CXE1") && b[12] == 3)
+            .map(|b| b[13..].to_vec())
+    })
+}
+
+fn session_ready_both() -> bool {
+    CTX.with(|c| c.borrow().nodes.iter().all(|n| n.traces.contains(&0x212)))
+}
+
+fn real_authority_pair() -> (driver::Driver, driver::Driver) {
+    CTX.with(|c| {
+        *c.borrow_mut() = Context::default();
+        for n in &mut c.borrow_mut().nodes {
+            n.authority = Some(cyxia_kernel_core::control_plane::task_admission::Authority::new());
+        }
+    });
+    let (mut a, mut b) = native_setup(1);
+    connect_native(&mut a, &mut b);
+    (a, b)
+}
+
+#[test]
+fn invalid_or_incomplete_rpc_and_outbound_ticks_do_not_renew_authority() {
+    use cyxia_prototype::cluster::wire::Header;
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        for mutation in 0..15 {
+            let (mut a, mut b) = real_authority_pair();
+            let ha = session_frames(&mut a);
+            let hb = session_frames(&mut b);
+            deliver_session_frames(&mut b, 1, &ha, 400, 97);
+            deliver_session_frames(&mut a, 0, &hb, 400, 97);
+            let mut frame = ha[0].clone();
+            let mut h = Header::decode(&frame[..96]).unwrap();
+            h.sequence = 10;
+            h.receiver_boot = 1;
+            match mutation {
+                0 => frame[96] ^= 1,
+                1 => frame[128] ^= 1,
+                2 => frame[160] ^= 1,
+                3 => frame[168] ^= 1,
+                4 => frame[176] ^= 1,
+                5 => frame[208] = 1,
+                6 => h.receiver_boot = 0,
+                7 => h.sender_boot = 2,
+                8 => h.cluster = [9; 32],
+                9 => h.epoch = 1,
+                10 => h.kind = 0x8001,
+                11 => h.sequence = 1,
+                12 => h.kind = 2,
+                _ => {},
+            }
+            frame[..96].copy_from_slice(&h.encode());
+            select(1, 1000);
+            if mutation < 13 {
+                assert_eq!(b.ingest(&frame, 1000), Err(()));
+            } else if mutation == 13 {
+                assert_eq!(b.ingest(&frame[..frame.len() - 1], 1000), Ok(frame.len() - 1));
+            } else {
+                b.tick(1000).unwrap();
+                assert!(!b.outgoing().is_empty());
+                b.consume_outgoing(b.outgoing().len());
+                b.ingest(&[], 1000).unwrap();
+            }
+            CTX.with(|c| {
+                let mut c = c.borrow_mut();
+                assert!(c.nodes[1].authority.as_mut().unwrap().session(1, 2, 1900).is_err(),
+                    "invalid/partial/outbound activity renewed authority: {mutation}");
+                assert!(!c.nodes[1].traces.contains(&0x212));
+            });
+        }
+    }).unwrap().join().unwrap();
+}
+
+// Both Drivers construct READY only after real signatures, durable BOUND and
+// reconciliation. Hold it at the transport boundary, never mutate Engine state.
+fn queued_real_ready(a: &mut driver::Driver, b: &mut driver::Driver) -> [Vec<Vec<u8>>; 2] {
+    use cyxia_prototype::cluster::wire::Header;
+    let mut held: [Vec<Vec<u8>>; 2] = Default::default();
+    for _ in 0..12 {
+        let frames = [session_frames(a), session_frames(b)];
+        for (node, d) in [(0, &mut *a), (1, &mut *b)] {
+            for frame in &frames[1 - node] {
+                if !held[node].is_empty() || Header::decode(&frame[..96]).unwrap().kind == 6 {
+                    held[node].push(frame.clone());
+                } else { deliver_session_frames(d, node, &[frame.clone()], 0, 97); }
+            }
+        }
+        if held.iter().all(|frames| !frames.is_empty()) { return held; }
+    }
+    panic!("genuine READY was never queued");
+}
+
+#[test]
+fn stale_or_wrong_session_ready_and_changed_native_admission_never_publish_ready() {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        for case in 0..7 {
+            let (mut a, mut b) = real_authority_pair();
+            let mut held = queued_real_ready(&mut a, &mut b);
+            assert!(durable_member_proof(0).is_some());
+            assert!(!session_ready_both());
+            let now = if case == 0 { 1500 } else if case == 1 { 1501 } else { 1000 };
+            if case == 2 { held[0][0][96] ^= 1; }
+            CTX.with(|c| c.borrow_mut().nodes[0].session_wait = match case {
+                3 => Some((3, 1500, true, 1)),
+                4 => Some((3, 1000, false, 1)),
+                5 => Some((3, 1000, true, 2)),
+                6 => Some((2, 2500, true, 1)),
+                _ => None,
+            });
+            select(0, now);
+            assert_eq!(a.ingest(&held[0][0], now), Err(()), "case {case}");
+            CTX.with(|c| {
+                let mut c = c.borrow_mut();
+                let n = &mut c.nodes[0];
+                assert!(!n.traces.contains(&0x212), "failed promotion published READY");
+                assert!(n.authority.as_mut().unwrap().session(1, 2, 2500).is_err());
+            });
+        }
+    }).unwrap().join().unwrap();
+}
+
+// Missing accepted-RPC renewal expires real kernel authority despite each
+// authenticated inter-message gap being shorter than the 1500ms deadline.
+#[test]
+fn live_authenticated_formation_over_1500ms_reaches_real_authority_ready() {
+    use cyxia_kernel_core::control_plane::task_admission::Terms;
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        let (mut a, mut b) = real_authority_pair();
+        for now in (400..=8000).step_by(400) {
+            for (node, d) in [(0, &mut a), (1, &mut b)] {
+                select(node, now);
+                d.tick(now).unwrap();
+            }
+            let frames = [session_frames(&mut a), session_frames(&mut b)];
+            for (node, d) in [(0, &mut a), (1, &mut b)] {
+                CTX.with(|c| {
+                    let mut c = c.borrow_mut();
+                    let n = &mut c.nodes[node];
+                    if !n.traces.contains(&0x212) {
+                        assert!(n.authority.as_mut().unwrap().reserve(Terms {
+                            cpu_milli: 100, memory_pages: 16, runtime_ms: 50,
+                            contract: [1; 16], input_hash: [2; 32], package_hash: [3; 32],
+                        }, [3; 32], now).is_err(), "pre-READY resource admission");
+                    }
+                });
+                deliver_session_frames(d, node, &frames[1 - node], now, 97);
+            }
+            if session_ready_both() {
+                assert!(now > 1500);
+                let proof = durable_member_proof(0).expect("durable BOUND precedes READY");
+                assert_eq!(durable_member_proof(1), Some(proof));
+                CTX.with(|c| {
+                    for n in &mut c.borrow_mut().nodes {
+                        let authority = n.authority.as_mut().unwrap();
+                        let token = authority.reserve(Terms {
+                            cpu_milli: 100, memory_pages: 16, runtime_ms: 50,
+                            contract: [1; 16], input_hash: [2; 32], package_hash: [3; 32],
+                        }, [3; 32], now).expect("current-session READY grants real resource authority");
+                        authority.release(token).unwrap();
+                    }
+                });
+                let status_before = CTX.with(|c| core::array::from_fn::<_, 2, _>(|i|
+                    c.borrow().nodes[i].traces.iter().filter(|e| **e == 0x10002).count()));
+                for later in [now + 400, now + 800] {
+                    native_pair_turn(&mut a, &mut b, later);
+                }
+                CTX.with(|c| {
+                    for (i, n) in c.borrow().nodes.iter().enumerate() {
+                        assert!(n.traces.iter().filter(|e| **e == 0x10002).count() > status_before[i],
+                            "fixture did not deliver post-READY STATUS");
+                        assert_eq!(n.traces.iter().filter(|e| **e == 0x212).count(), 1,
+                            "ordinary accepted STATUS repeated native READY");
+                    }
+                });
+                return;
+            }
+        }
+        panic!("mutual READY never reached");
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn forming_hello_heartbeat_only_refreshes_liveness_and_checks_frozen_identity() {
+    use cyxia_prototype::cluster::wire::Header;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            // Each malformed frame gets a fresh real session; rejected headers may
+            // tear down the connection, so never rely on accepting one afterwards.
+            for mutation in 0..14 {
+                CTX.with(|c| *c.borrow_mut() = Context::default());
+                let (mut a, mut b) = native_setup(1);
+                connect_native(&mut a, &mut b);
+                let ha = session_frames(&mut a);
+                let hb = session_frames(&mut b);
+                deliver_session_frames(&mut b, 1, &ha, 0, 97);
+                deliver_session_frames(&mut a, 0, &hb, 0, 97);
+                let mut frame = ha[0].clone();
+                let mut h = Header::decode(&frame[..96]).unwrap();
+                h.sequence = 10;
+                h.receiver_boot = 1;
+                match mutation {
+                    1 => frame[96] ^= 1,  // NodeID
+                    2 => frame[128] ^= 1, // challenge
+                    3 => frame[160] ^= 1, // formation counter
+                    4 => frame[168] ^= 1, // frozen epoch
+                    5 => frame[176] ^= 1, // nonce
+                    6 => frame[208] = 1,  // member
+                    7 => h.receiver_boot = 0,
+                    8 => h.sender_boot = 2,
+                    9 => h.cluster = [9; 32],
+                    10 => h.epoch = 1,
+                    11 => h.kind = 0x8001,
+                    12 => h.sequence = 1,
+                    13 => h.kind = 2,
+                    _ => {}
+                }
+                frame[..96].copy_from_slice(&h.encode());
+                let before = CTX.with(|c| c.borrow().nodes[1].records.clone());
+                let queued = b.outgoing().to_vec();
+                select(1, 1000);
+                if mutation == 0 {
+                    assert_eq!(
+                        b.ingest(&frame, 1000),
+                        Ok(frame.len()),
+                        "immutable forming HELLO is a liveness-only heartbeat"
+                    );
+                    assert_eq!(
+                        b.outgoing(),
+                        queued,
+                        "heartbeat must not restart negotiation or send READY"
+                    );
+                    assert_eq!(CTX.with(|c| c.borrow().nodes[1].records.clone()), before);
+                    assert!(!session_ready_both());
+                    assert!(durable_member_proof(1).is_none());
+                    select(1, 2499);
+                    b.tick(2499).unwrap();
+                    select(1, 2500);
+                    assert_eq!(b.tick(2500), Err(()), "1500ms isolation is unchanged");
+                } else {
+                    assert_eq!(
+                        b.ingest(&frame, 1000),
+                        Err(()),
+                        "mutation {mutation} must fail"
+                    );
+                    assert_eq!(CTX.with(|c| c.borrow().nodes[1].records.clone()), before);
+                }
+                CTX.with(|c| {
+                    assert_eq!(c.borrow().nodes.iter().map(|n| n.starts).sum::<usize>(), 0)
+                });
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn delayed_formation_crosses_heartbeat_without_proofless_reconciliation() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for first in [0, 1] {
+                for hold_confirm in [false, true] {
+                    CTX.with(|c| *c.borrow_mut() = Context::default());
+                    let (mut a, mut b) = native_setup(1);
+                    CTX.with(|c| {
+                        c.borrow_mut().nodes[0]
+                            .replay_requests
+                            .push(replay_work(16, 1))
+                    });
+                    connect_native(&mut a, &mut b);
+                    let hello_a = session_frames(&mut a);
+                    let hello_b = session_frames(&mut b);
+                    deliver_session_frames(&mut b, 1, &hello_a, 0, 97);
+                    deliver_session_frames(&mut a, 0, &hello_b, 0, 97);
+                    // Hold the genuine NEGOTIATE and every following frame in FIFO.
+                    let mut held = [session_frames(&mut a), session_frames(&mut b)];
+                    if hold_confirm {
+                        let proposer = usize::from(held[0].is_empty());
+                        let d = if proposer == 0 { &mut b } else { &mut a };
+                        deliver_session_frames(d, 1 - proposer, &held[proposer], 0, 97);
+                        held[proposer].clear();
+                        held[1 - proposer].extend(session_frames(d));
+                    }
+                    for now in [499, 500, 999, 1000] {
+                        for (node, d) in [(0, &mut a), (1, &mut b)] {
+                            select(node, now);
+                            d.tick(now).unwrap();
+                            let frames = session_frames(d);
+                            if now == 500 || now == 1000 {
+                                assert!(
+                                    !frames.is_empty(),
+                                    "node {node} owes a 500ms forming heartbeat"
+                                );
+                            } else {
+                                assert!(frames.is_empty(), "heartbeat must respect 500ms cadence");
+                            }
+                            held[node].extend(frames);
+                        }
+                    }
+                    assert!(!session_ready_both());
+                    CTX.with(|c| {
+                        assert_eq!(c.borrow().nodes.iter().map(|n| n.starts).sum::<usize>(), 0)
+                    });
+                    for from in [first, 1 - first] {
+                        let d = if from == 0 { &mut b } else { &mut a };
+                        deliver_session_frames(d, 1 - from, &held[from], 1100, 97);
+                    }
+                    pump(&mut a, &mut b, 1101, session_ready_both);
+                    let proof =
+                        durable_member_proof(0).expect("BOUND proof persisted before READY");
+                    assert_eq!(durable_member_proof(1), Some(proof));
+                    CTX.with(|c| {
+                        assert!(c.borrow().nodes.iter().all(|n| n.exit_records.is_empty()))
+                    });
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn forming_heartbeat_does_not_repeat_before_peer_hello_or_accept_initial_bound_or_leaving() {
+    use cyxia_prototype::cluster::wire::Header;
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            CTX.with(|c| *c.borrow_mut() = Context::default());
+            let (mut a, mut b) = native_setup(1);
+            connect_native(&mut a, &mut b);
+            session_frames(&mut a);
+            for now in [500, 1000, 1499] {
+                select(0, now);
+                a.tick(now).unwrap();
+                assert!(
+                    a.outgoing().is_empty(),
+                    "receiver boot is unknown until peer HELLO"
+                );
+            }
+            select(0, 1500);
+            assert_eq!(a.tick(1500), Err(()));
+            for leaving in [false, true] {
+                CTX.with(|c| *c.borrow_mut() = Context::default());
+                let (mut a, mut b) = native_setup(1);
+                connect_native(&mut a, &mut b);
+                pump(&mut a, &mut b, 0, session_ready_both);
+                if leaving {
+                    select(0, 100);
+                    a.begin_leave([7; 16]).unwrap();
+                }
+                drop(a);
+                drop(b);
+                let (mut a, mut b) = native_setup(2);
+                connect_native(&mut a, &mut b);
+                let hello = session_frames(&mut a);
+                assert_eq!(hello[0][208], if leaving { 3 } else { 2 });
+                deliver_session_frames(&mut b, 1, &hello, 0, 97);
+                let mut repeat = hello[0].clone();
+                let mut h = Header::decode(&repeat[..96]).unwrap();
+                h.sequence = 2;
+                h.receiver_boot = 2;
+                h.cluster = [0; 32];
+                h.epoch = 0;
+                repeat[..96].copy_from_slice(&h.encode());
+                select(1, 500);
+                assert_eq!(
+                    b.ingest(&repeat, 500),
+                    Err(()),
+                    "initial BOUND/LEAVING cannot claim forming heartbeat"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn bound_confirmed_reconnect_sends_proof_before_status() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            for first in [0, 1] {
+                for chunk in [97, usize::MAX] {
+                    CTX.with(|c| *c.borrow_mut() = Context::default());
+                    let (mut a, mut b) = native_setup(1);
+                    connect_native(&mut a, &mut b);
+                    pump(&mut a, &mut b, 0, || has_trace(0x211));
+                    let bound = usize::from(durable_member_proof(0).is_none());
+                    let proof = durable_member_proof(bound).unwrap();
+                    assert!(durable_member_proof(1 - bound).is_none());
+                    CTX.with(|c| {
+                        assert!(
+                            c.borrow().nodes[1 - bound]
+                                .records
+                                .iter()
+                                .any(|b| b.starts_with(b"CXE1") && b[12] == 2),
+                            "peer is durably CONFIRMED"
+                        )
+                    });
+                    drop(a);
+                    drop(b);
+                    CTX.with(|c| {
+                        for n in &mut c.borrow_mut().nodes {
+                            n.traces.clear();
+                        }
+                    });
+                    // Recover the real engine from the original persistent journals.
+                    let (mut a, mut b) = native_setup(2);
+                    connect_native(&mut a, &mut b);
+                    let hello = [session_frames(&mut a), session_frames(&mut b)];
+                    for from in [first, 1 - first] {
+                        let d = if from == 0 { &mut b } else { &mut a };
+                        deliver_session_frames(d, 1 - from, &hello[from], 0, chunk);
+                    }
+                    let responses = [session_frames(&mut a), session_frames(&mut b)];
+                    for from in [first, 1 - first] {
+                        let d = if from == 0 { &mut b } else { &mut a };
+                        deliver_session_frames(d, 1 - from, &responses[from], 1, chunk);
+                    }
+                    let kinds: Vec<_> = responses[bound]
+                        .iter()
+                        .map(|f| {
+                            cyxia_prototype::cluster::wire::Header::decode(&f[..96])
+                                .unwrap()
+                                .kind
+                        })
+                        .collect();
+                    assert_eq!(
+                        kinds.first(),
+                        Some(&5),
+                        "durable PROOF must precede reconciliation STATUS"
+                    );
+                    assert_eq!(durable_member_proof(1 - bound), Some(proof.clone()));
+                    assert!(!session_ready_both(), "proof alone cannot establish READY");
+                    CTX.with(|c| {
+                        assert_eq!(c.borrow().nodes.iter().map(|n| n.starts).sum::<usize>(), 0)
+                    });
+                    pump(&mut a, &mut b, 2, session_ready_both);
+                    assert_eq!(durable_member_proof(bound), Some(proof.clone()));
+                    assert_eq!(durable_member_proof(1 - bound), Some(proof));
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn recovered_ack_response_closes_only_the_exact_persisted_terminal_result() {
+    use cyxia_prototype::cluster::wire::Header;
+    for mutation in 0..5 {
+        CTX.with(|c| *c.borrow_mut() = Context::default());
+        let (mut a, mut b) = setup(1);
+        select(0, 0);
+        a.connect([31; 32], 0).unwrap();
+        select(1, 0);
+        b.connect([32; 32], 0).unwrap();
+        pump(&mut a, &mut b, 0, closed_both);
+        drop(a);
+        drop(b);
+        let (mut a, mut b) = setup(2);
+        select(0, 0);
+        a.connect([41; 32], 0).unwrap();
+        select(1, 0);
+        b.connect([42; 32], 0).unwrap();
+        let mut checked = false;
+        'delivery: for now in 0..100 {
+            for from in 0..2 {
+                let (src, dst) = if from == 0 {
+                    (&mut a, &mut b)
+                } else {
+                    (&mut b, &mut a)
+                };
+                for mut frame in session_frames(src) {
+                    let mut h = Header::decode(&frame[..96]).unwrap();
+                    if h.kind != 0x8015 {
+                        deliver_session_frames(dst, 1 - from, &[frame], now, 97);
+                        continue;
+                    }
+                    let contract = frame[128..144].to_vec();
+                    match mutation {
+                        1 => frame[128] ^= 1, // another contract/key
+                        2 => frame[168] ^= 1, // terminal hash
+                        3 => {
+                            frame.pop();
+                            h.body_len -= 1;
+                        }
+                        4 => {
+                            frame.push(0);
+                            h.body_len += 1;
+                        }
+                        _ => {}
+                    }
+                    frame[..96].copy_from_slice(&h.encode());
+                    let queued = dst.outgoing().to_vec();
+                    let records = CTX.with(|c| c.borrow().nodes[1 - from].records.clone());
+                    select(1 - from, now);
+                    if mutation == 0 {
+                        assert_eq!(
+                            dst.ingest(&frame, now),
+                            Ok(frame.len()),
+                            "recovered ACK response uses durable result, not transient task_key"
+                        );
+                        let close = &dst.outgoing()[queued.len()..];
+                        assert_eq!(Header::decode(&close[..96]).unwrap().kind, 22);
+                        assert_eq!(&close[96..], contract);
+                    } else {
+                        assert_eq!(
+                            dst.ingest(&frame, now),
+                            Err(()),
+                            "invalid recovered ACK mutation {mutation}"
+                        );
+                        assert_eq!(
+                            dst.outgoing(),
+                            queued,
+                            "invalid ACK cannot emit unrelated CLOSE"
+                        );
+                    }
+                    assert_eq!(
+                        CTX.with(|c| c.borrow().nodes[1 - from].records.clone()),
+                        records,
+                        "ACK response alone must not release or forget durable custody"
+                    );
+                    CTX.with(|c| {
+                        assert_eq!(c.borrow().nodes.iter().map(|n| n.starts).sum::<usize>(), 1)
+                    });
+                    checked = true;
+                    break 'delivery;
+                }
+            }
+        }
+        assert!(checked, "real recovery never generated ACK_RESULT response");
+    }
+}
+
+#[test]
+fn bound_pair_reconnect_drains_recovery_after_ready_in_both_fifo_orders() {
+    for first in [0, 1] {
+        for chunk in [97, usize::MAX] {
+            CTX.with(|c| *c.borrow_mut() = Context::default());
+            let (mut a, mut b) = setup(1);
+            select(0, 0);
+            a.connect([31; 32], 0).unwrap();
+            select(1, 0);
+            b.connect([32; 32], 0).unwrap();
+            pump(&mut a, &mut b, 0, closed_both);
+            let proof = durable_member_proof(0).unwrap();
+            assert_eq!(durable_member_proof(1), Some(proof.clone()));
+            drop(a);
+            drop(b);
+            CTX.with(|c| {
+                for n in &mut c.borrow_mut().nodes {
+                    n.traces.clear();
+                }
+            });
+            let (mut a, mut b) = setup(2);
+            select(0, 0);
+            a.connect([41; 32], 0).unwrap();
+            select(1, 0);
+            b.connect([42; 32], 0).unwrap();
+            // Keep consuming after READY, including retransmitted ACK/CLOSE and
+            // the next periodic STATUS. READY alone must not hide queued errors.
+            for now in 0..600 {
+                select(0, now);
+                a.tick(now).unwrap();
+                select(1, now);
+                b.tick(now).unwrap();
+                for from in [first, 1 - first] {
+                    let (src, dst) = if from == 0 {
+                        (&mut a, &mut b)
+                    } else {
+                        (&mut b, &mut a)
+                    };
+                    deliver_session_frames(dst, 1 - from, &session_frames(src), now, chunk);
+                }
+            }
+            assert!(session_ready_both());
+            assert_eq!(durable_member_proof(0), Some(proof.clone()));
+            assert_eq!(durable_member_proof(1), Some(proof));
+            CTX.with(|c| {
+                let c = c.borrow();
+                assert_eq!(c.nodes.iter().map(|n| n.starts).sum::<usize>(), 1);
+                assert!(c.nodes.iter().all(|n| n.exit_records.is_empty()));
+            });
+        }
+    }
+}
+
+#[test]
+fn session_exit_idle_timeout_retains_original_identity_before_disconnect() {
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    pump(&mut a, &mut b, 0, closed_both);
+    select(0, 10_000);
+    assert_eq!(a.tick(10_000), Err(()));
+    assert!(a.take_exit_reported(), "runtime must suppress duplicate reporting");
+    assert!(!a.take_exit_reported());
+    assert!(a.outgoing().is_empty(), "timeout still tears down authority");
+    CTX.with(|c| {
+        let c = c.borrow();
+        let records = &c.nodes[0].exit_records;
+        assert_eq!(records.len(), 1, "real idle timeout must retain its original branch");
+        let r = &records[0];
+        assert_eq!(&r[..8], &[1, 1, 7, 1, 10_000, 12, 0x4001, 5]);
+        assert_eq!(r[8], 2, "bound membership before isolate");
+        assert_eq!(r[9], 15, "TLS authenticated, active, sent READY, ready");
+        assert_eq!(r[11], 1, "peer boot before disconnect clears it");
+        assert!(r[19..23].iter().any(|&v| v != 0));
+    });
+}
+
+#[test]
+fn session_exit_failed_ready_retains_message_context_without_body() {
+    use cyxia_prototype::cluster::wire::Header;
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    // Exchange HELLO and formation until a genuine READY is queued, then
+    // corrupt only its session binding. All headers/signatures remain real.
+    for now in 0..1000 {
+        for from in 0..2 {
+            let (src, dst) = if from == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+            let bytes = src.outgoing().to_vec();
+            if bytes.is_empty() { continue; }
+            src.consume_outgoing(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                let h = Header::decode(&bytes[at..at + 96]).unwrap();
+                let end = at + 96 + h.body_len as usize;
+                let mut frame = bytes[at..end].to_vec();
+                select(1 - from, now);
+                if h.kind == 6 {
+                    frame[96] ^= 1;
+                    assert_eq!(dst.ingest(&frame, now), Err(()));
+                    CTX.with(|c| {
+                        let c = c.borrow();
+                        let records = &c.nodes[1 - from].exit_records;
+                        assert_eq!(records.len(), 1, "failed READY must retain original validation branch");
+                        let r = &records[0];
+                        assert_eq!(&r[5..8], &[10, 0x4002, 4]);
+                        assert_eq!(&r[12..17], &[6, h.sequence, 1, 1, 32]);
+                        assert!(!c.nodes[1 - from].traces.contains(&0x212));
+                        assert_eq!(r[23], 0);
+                    });
+                    return;
+                }
+                assert_eq!(dst.ingest(&frame, now), Ok(frame.len()));
+                at = end;
+            }
+        }
+    }
+    panic!("real drivers never produced READY");
+}
+
+#[test]
+fn session_exit_replayed_real_header_keeps_original_engine_result() {
+    use cyxia_prototype::cluster::wire::Header;
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0); a.connect([31; 32], 0).unwrap();
+    select(1, 0); b.connect([32; 32], 0).unwrap();
+    for now in 0..1000 {
+        for from in 0..2 {
+            let (src, dst) = if from == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+            let bytes = src.outgoing().to_vec();
+            if bytes.is_empty() { continue; }
+            src.consume_outgoing(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                let h = Header::decode(&bytes[at..at + 96]).unwrap();
+                let end = at + 96 + h.body_len as usize;
+                let frame = &bytes[at..end];
+                select(1 - from, now);
+                assert_eq!(dst.ingest(frame, now), Ok(frame.len()));
+                if h.kind != 1 {
+                    assert_eq!(dst.ingest(frame, now), Err(()));
+                    CTX.with(|c| {
+                        let c = c.borrow();
+                        let r = &c.nodes[1 - from].exit_records[0];
+                        assert_eq!(&r[5..8], &[10, 0x5009, 3]);
+                        assert_eq!(&r[12..17], &[h.kind as u64, h.sequence, 1, 1, h.body_len as u64]);
+                        assert_eq!(c.nodes.iter().map(|n| n.starts).sum::<usize>(), 0);
+                    });
+                    return;
+                }
+                at = end;
+            }
+        }
+    }
+    panic!("real drivers never produced a formation frame");
 }
 #[test]
 fn reconnect_at_each_custody_boundary_never_reexecutes() {
@@ -1345,7 +2128,12 @@ fn closed_disk_reboot_reconciles_without_duplicate_execution() {
 }
 #[test]
 fn double_signed_leave_proof_is_persisted_before_unlock() {
-    CTX.with(|c| *c.borrow_mut() = Context::default());
+    CTX.with(|c| {
+        *c.borrow_mut() = Context::default();
+        for n in &mut c.borrow_mut().nodes {
+            n.authority = Some(cyxia_kernel_core::control_plane::task_admission::Authority::new());
+        }
+    });
     let (mut a, mut b) = setup(1);
     select(0, 0);
     a.connect([31; 32], 0).unwrap();
@@ -1366,6 +2154,12 @@ fn double_signed_leave_proof_is_persisted_before_unlock() {
     for records in records {
         assert!(records.iter().any(|b| b.len() == 325 && b[12] == 8));
     }
+    CTX.with(|c| {
+        for n in &mut c.borrow_mut().nodes {
+            assert_eq!(n.session_calls.last().unwrap().0, 0, "completed leave renewed authority");
+            assert!(n.authority.as_mut().unwrap().session(1, 2, 1000).is_err());
+        }
+    });
 }
 #[test]
 fn worker_failure_is_durable_and_acknowledged_without_fake_done_output() {

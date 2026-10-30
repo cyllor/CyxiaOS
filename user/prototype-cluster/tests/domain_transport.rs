@@ -263,6 +263,237 @@ fn frame(kind: u16, sequence: u64, bytes: usize) -> Vec<u8> {
     output.extend(vec![sequence as u8; bytes]);
     output
 }
+
+// Socket acceptance is controlled here; TLS authentication, encryption,
+// decryption, egress scheduling and byte custody are the production code.
+struct AcceptAll(Vec<u8>);
+impl TlsTransport for AcceptAll {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn write_reserved(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.write(bytes)
+    }
+}
+fn encrypted_record(sender: &mut Session<'_>, plaintext: &[u8], now: u64) -> Vec<u8> {
+    sender.send_plaintext(plaintext).unwrap();
+    sender.pump(now).unwrap();
+    let bytes = sender.pending_tls().to_vec();
+    assert!(
+        !bytes.is_empty(),
+        "fixture must produce a separate TLS record"
+    );
+    sender.consume_tls(bytes.len()).unwrap();
+    bytes
+}
+
+#[test]
+fn duplex_reserved_plaintext_makes_progress_while_ingress_continues() {
+    let [small, large] = pairings();
+    let mut ab = Buffers::new();
+    let mut bb = Buffers::new();
+    let mut a = small.client(&mut ab, 0).unwrap();
+    let mut b = large.server(&mut bb, 0).unwrap();
+    handshake(&mut a, &mut b);
+    // READY has exactly a 32-byte session-binding body. Delivery here proves
+    // bytes only; the controlled outbox makes no engine readiness claim.
+    let expected = frame(6, 1, 32);
+    let mut outbox = Outbox {
+        bytes: expected.clone(),
+        offset: 0,
+    };
+    let mut egress = TlsEgress::new(1).unwrap();
+    let mut transport = AcceptAll(Vec::new());
+    let mut inbound = Vec::new();
+    let mut delivered = Vec::new();
+    // Two distinct records precede the first runtime turn. Thereafter one
+    // arrives at each 500 ms boundary; no fixture pump is added at endpoint A.
+    let first = encrypted_record(&mut b, b"first;", 0);
+    let second = encrypted_record(&mut b, b"second;", 0);
+    a.receive_tls(&first).unwrap();
+    a.receive_tls(&second).unwrap();
+    let mut socket_input = Vec::new();
+    for (now, next) in [
+        (0, &b""[..]),
+        (500, &b"third;"[..]),
+        (1000, &b"fourth;"[..]),
+    ] {
+        if !next.is_empty() {
+            let record = encrypted_record(&mut b, next, now);
+            socket_input.extend(record);
+        }
+        let count = a.receive_capacity().min(socket_input.len());
+        if count != 0 {
+            assert_eq!(a.receive_tls(&socket_input[..count]).unwrap(), count);
+            socket_input.drain(..count);
+        }
+        a.pump(now).unwrap();
+        inbound.extend_from_slice(a.plaintext());
+        a.consume_plaintext(a.plaintext().len()).unwrap();
+        let round = egress
+            .service_at(&mut a, &mut outbox, now * 1_000_000, &mut transport)
+            .unwrap();
+        assert!(round.reserved <= 4 && round.ordinary <= 4);
+        assert_eq!(
+            outbox.offset,
+            expected.len(),
+            "accepted prefix leaves the driver exactly once"
+        );
+        if !transport.0.is_empty() {
+            assert_eq!(b.receive_tls(&transport.0).unwrap(), transport.0.len());
+            transport.0.clear();
+        }
+        b.pump(now).unwrap();
+        delivered.extend_from_slice(b.plaintext());
+        b.consume_plaintext(b.plaintext().len()).unwrap();
+    }
+    assert!(b"first;second;third;fourth;".starts_with(&inbound));
+    assert!(
+        inbound.starts_with(b"first;second;third;"),
+        "continuing ingress must progress in order"
+    );
+    assert_eq!(
+        delivered, expected,
+        "TLS-owned reserved plaintext must reach the peer before 1500 ms despite continuing ingress"
+    );
+}
+
+struct DuplexLink {
+    bytes: Vec<u8>,
+    blocked: bool,
+    limit: usize,
+    counts: (u64, u64),
+}
+impl DuplexLink {
+    fn send(&mut self, bytes: &[u8], reserved: bool) -> Result<usize, Error> {
+        if self.blocked {
+            return Err(Error::Again);
+        }
+        let count = bytes.len().min(self.limit);
+        self.bytes.extend_from_slice(&bytes[..count]);
+        if reserved {
+            self.counts.1 += 1;
+        } else {
+            self.counts.0 += 1;
+        }
+        Ok(count)
+    }
+}
+impl TlsTransport for DuplexLink {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.send(bytes, false)
+    }
+    fn write_reserved(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.send(bytes, true)
+    }
+}
+fn runtime_turn(
+    session: &mut Session<'_>,
+    outbox: &mut Outbox,
+    egress: &mut TlsEgress,
+    incoming: &mut Vec<u8>,
+    outgoing: &mut DuplexLink,
+    received: &mut Vec<u8>,
+    now: u64,
+) {
+    let count = session.receive_capacity().min(incoming.len()).min(503);
+    if count != 0 {
+        assert_eq!(session.receive_tls(&incoming[..count]).unwrap(), count);
+        incoming.drain(..count);
+    }
+    session.pump(now).unwrap();
+    received.extend_from_slice(session.plaintext());
+    session
+        .consume_plaintext(session.plaintext().len())
+        .unwrap();
+    let pending = session.pending_tls().to_vec();
+    let round = egress
+        .service_at(session, outbox, now * 1_000_000, outgoing)
+        .unwrap();
+    assert!(round.reserved <= 4 && round.ordinary <= 1);
+    if outgoing.blocked {
+        assert_eq!((round.reserved, round.ordinary), (0, 0));
+        if !pending.is_empty() {
+            assert_eq!(session.pending_tls(), pending);
+        }
+    }
+}
+#[test]
+fn continuous_duplex_preserves_fifo_and_credit_classes_with_partial_writes_and_again() {
+    let [small, large] = pairings();
+    let mut ab = Buffers::new();
+    let mut bb = Buffers::new();
+    let mut a = small.client(&mut ab, 0).unwrap();
+    let mut b = large.server(&mut bb, 0).unwrap();
+    handshake(&mut a, &mut b);
+    let mut ae = TlsEgress::new(1).unwrap();
+    let mut be = TlsEgress::new(1).unwrap();
+    ae.install(policy(1), 0).unwrap();
+    be.install(policy(1), 0).unwrap();
+    let mut ao = Outbox {
+        bytes: frame(16, 1, 10000),
+        offset: 0,
+    };
+    let mut bo = Outbox {
+        bytes: frame(16, 1, 9000),
+        offset: 0,
+    };
+    let mut aw = DuplexLink {
+        bytes: Vec::new(),
+        blocked: false,
+        limit: 337,
+        counts: (0, 0),
+    };
+    let mut bw = DuplexLink {
+        bytes: Vec::new(),
+        blocked: false,
+        limit: 173,
+        counts: (0, 0),
+    };
+    let mut ar = Vec::new();
+    let mut br = Vec::new();
+    for now in 0..1000 {
+        if now < 40 {
+            let kind = if now % 2 == 0 { 2 } else { 16 };
+            ao.bytes.extend(frame(kind, now + 2, 97));
+            bo.bytes.extend(frame(kind, now + 2, 103));
+        }
+        aw.blocked = now % 7 == 0;
+        bw.blocked = now % 11 == 0;
+        runtime_turn(
+            &mut a,
+            &mut ao,
+            &mut ae,
+            &mut bw.bytes,
+            &mut aw,
+            &mut ar,
+            now,
+        );
+        runtime_turn(
+            &mut b,
+            &mut bo,
+            &mut be,
+            &mut aw.bytes,
+            &mut bw,
+            &mut br,
+            now,
+        );
+        if now == 200 {
+            assert!(
+                ar.len() > 9000 && br.len() > 10000,
+                "both directions progress under competing traffic"
+            );
+        }
+    }
+    assert_eq!(ar, bo.bytes);
+    assert_eq!(br, ao.bytes);
+    assert_eq!(ao.offset, ao.bytes.len());
+    assert_eq!(bo.offset, bo.bytes.len());
+    assert_eq!(ae.counts(), aw.counts);
+    assert_eq!(be.counts(), bw.counts);
+    assert!(aw.counts.0 > 0 && aw.counts.1 > 0 && bw.counts.0 > 0 && bw.counts.1 > 0);
+}
 #[test]
 fn native_egress_preserves_tls_suffix_and_sequence_while_separating_control_credits() {
     let [small, large] = pairings();

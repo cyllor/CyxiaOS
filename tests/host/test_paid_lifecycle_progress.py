@@ -53,6 +53,8 @@ def program():
     }''')
     replace('mod replay { pub fn service_admitted() {} }','// TASK_REPLAY')
     replace('mod learning_evidence {','mod learning_evidence { pub fn measure<R>(_:super::ObjectKey,_:cyxia_prototype::learning::reward::CpuClass,body:impl FnOnce()->R)->R{body()}')
+    code=code.replace('mod learning_evidence {','mod learning_evidence {'+
+        (ROOT/'tests/host/capture_identity_facade.rs').read_text())
     replace('fn complete_locked(s: &mut State, _: usize) -> Result<(), Error> {', 'fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {')
     old=function(code,'fn complete_locked(')
     replace(old,'''fn complete_locked(s:&mut State,slot:usize)->Result<(),Error>{
@@ -74,7 +76,7 @@ def program():
     pieces=['static LOCK: ResettableGate = ResettableGate(core::cell::UnsafeCell::new(owner_gate::Gate::new()));']
     pieces += [function(task,s) for s in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()','fn locked<R>','fn locked_with_guard<R>','pub struct Credit','fn admit_service(','pub fn begin_service_segment()','fn revalidate_unstarted(','pub fn revalidate_service_segment()','pub(crate) struct PaidServiceWitness','fn service_witness_locked(','pub fn authorize_service_turn()','pub fn complete_builtin(','pub fn complete_service(','pub fn service_segment<R>']]
     pieces.append(function(task,'fn complete_locked(').replace('fn complete_locked(','fn complete_actual_locked(',1))
-    pieces += [function(execution,s).replace('super::deadline::','deadline::') for s in ['pub fn service_io_piece<R>','fn service_baseline_activation(','pub fn service_baseline_progress(','struct BaselineRetryGuard','impl Drop for BaselineRetryGuard','fn enter_baseline_retry(','fn service_baseline_activation_at(','fn advance_admission_bounded(','fn submit_package(','fn lifecycle_piece(','fn cleanup(','fn cleanup_inner(']]
+    pieces += [function(execution,s).replace('super::deadline::','deadline::') for s in ['pub fn service_io_piece<R>','fn service_baseline_activation(','pub fn service_baseline_progress(','struct BaselineRetryGuard','impl Drop for BaselineRetryGuard','fn enter_baseline_retry(','fn service_baseline_activation_at(','fn advance_admission_bounded(','fn submit_package(','fn lifecycle_piece(','fn capture_task_identity(','fn cleanup(','fn cleanup_inner(']]
     pieces.append(re.search(r'^static BASELINE_RETRY_ACTIVE:.*;$',execution,re.M)[0])
     if 'fn lifecycle_turn(' in execution:
         pieces.append(function(execution,'fn lifecycle_turn('))

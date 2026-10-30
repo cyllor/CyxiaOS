@@ -20,6 +20,8 @@ def program():
  if 'struct SchedulerPublication' in pub:
   body='\n'.join(function(pub,s) for s in ['pub(crate) struct SchedulerPublication','pub(crate) fn reserve_scheduler_publication(','impl SchedulerPublication'])
  else:body='''struct SchedulerPublication;fn reserve_scheduler_publication(_:Action)->Result<Option<SchedulerPublication>,Error>{Ok(None)}impl SchedulerPublication{fn validate(&self,_:Action,_:ObjectKey,_:u64)->Result<(),Error>{Err(Error::Unsupported)}fn current(&self,_:u16,_:ObjectKey)->Result<Action,Error>{Err(Error::Unsupported)}fn legal_options(&self,_:&[Option<Action>],_:ObjectKey,_:u64,_:&mut[Option<Action>])->Result<usize,Error>{Err(Error::Unsupported)}fn prerequisites(&self,_:Action,_:ObjectKey)->Result<[Option<domain_control::Prerequisite>;2],Error>{Err(Error::Unsupported)}}'''
+ if 'struct SpawnPublication' in pub:
+  body+='\n'+'\n'.join(function(pub,s) for s in ['pub(crate) struct SpawnPublication','pub(crate) fn reserve_spawn_publication(','impl SpawnPublication'])
  code=code.replace('// SCHEDULER_PUBLICATION_BODY',body)
  control=(ROOT/'kernel/src/domain_control.rs').read_text();extra=(ROOT/'tests/host/active_selection_harness.rs').read_text()
  selection='\n'.join(function(control,x) for x in ['fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection('])
@@ -38,8 +40,8 @@ def program():
  publication='';constructor='ActiveScope(&gate)';none_constructor='ActiveScope(&gate)'
  if 'struct ActivePublication' in control:
   publication='\n'.join(function(control,x) for x in ["struct ActivePublication<'",'impl PublicationScope for ActivePublication'])
-  constructor='ActivePublication{active:ActiveScope(&gate),task_publication:Some(view)}'
-  none_constructor='ActivePublication{active:ActiveScope(&gate),task_publication:None}'
+  constructor='ActivePublication{active:ActiveScope(&gate),task_publication:Some(view),spawn_publication:None}'
+  none_constructor='ActivePublication{active:ActiveScope(&gate),task_publication:None,spawn_publication:None}'
  scope=scope.replace('// ACTUAL_ACTIVE_PUBLICATION',publication).replace('// ACTIVE_PUBLICATION_CONSTRUCTOR',constructor).replace('// ACTIVE_PUBLICATION_NONE_CONSTRUCTOR',none_constructor)
  return code+'\n'+scope
 

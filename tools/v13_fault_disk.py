@@ -14,6 +14,7 @@ from pathlib import Path
 import select
 import socket
 import struct
+import sys
 import threading
 import uuid
 from verify_smp import require, sha
@@ -37,7 +38,7 @@ def receive(sock: socket.socket, size: int) -> bytes:
 class Backend:
     def __init__(self, path: Path, output: Path, *, cut: int = 0,
                  phase: str = 'before', unflushed: str = 'drop',
-                 reverse_replies: bool = False, compress: bool = False):
+                 reverse_replies: bool = False, compress: bool = False, witness=None):
         require(cut >= 0 and phase in ('before', 'after-ack'), 'invalid cut boundary')
         require(unflushed in ('drop', 'reverse-half'), 'invalid survivor rule')
         self.path, self.output = path, output
@@ -47,6 +48,7 @@ class Backend:
         self.cut, self.phase, self.unflushed = cut, phase, unflushed
         self.reverse_replies = reverse_replies
         self.compress = compress
+        self.witness = witness
         self.cut_event = threading.Event()
         self.pending: dict[int, bytes] = {}
         self.requests = self.mutations = self.acks = self.flushes = 0
@@ -160,6 +162,9 @@ class Backend:
                  discarded_sectors=len(offsets)-len(survivors), surviving_offsets=survivors,
                  acks=self.acks, flushes=self.flushes)
         self.pending.clear()
+        if self.witness is not None:
+            self.witness('backend-cut', run_id=self.meta['run_id'], id=request['id'],
+                         mutation=request['mutation'], phase=self.phase)
         self.cut_event.set()
 
     def serve(self, sock):
@@ -226,6 +231,20 @@ class Server:
     def run(self):
         try:
             self.connection, _ = self.listener.accept()
+            if self.backend.witness is not None:
+                # Darwin SDK sys/un.h defines SOL_LOCAL=0, LOCAL_PEERPID=2;
+                # Python does not expose these constants on all macOS builds.
+                if sys.platform == 'darwin':
+                    peer_pid = self.connection.getsockopt(0, 2)
+                elif sys.platform == 'linux':
+                    peer_pid = struct.unpack('3i', self.connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))[0]
+                else:
+                    peer_pid = None
+                self.backend.witness('endpoint-connected', endpoint=str(self.path),
+                    run_id=self.backend.meta['run_id'], peer_pid=peer_pid,
+                    peer_identity='kernel-pid' if peer_pid is not None
+                                  else 'private-directory-one-connection-unsupported')
             with self.connection:
                 self.backend.serve(self.connection)
         except (OSError, ValueError) as error:

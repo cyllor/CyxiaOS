@@ -290,10 +290,15 @@ pub fn request(
     }
     if phase == 9 {
         if token != 0 && (!connected || offset != epoch) {
+            unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).disconnect() };
             return (3, 0, 0);
         }
-        let result =
-            unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).session(epoch, token, now) };
+        let authority = unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) };
+        let result = if token == 3 {
+            authority.activity(epoch, now)
+        } else {
+            authority.session(epoch, token, now)
+        };
         return (if result.is_ok() { 0 } else { 3 }, 0, 0);
     }
     if phase == 0 || phase == TASK_RESERVE_CUSTODY {

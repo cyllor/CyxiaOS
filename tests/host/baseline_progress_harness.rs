@@ -193,6 +193,7 @@ mod learning_evidence {
     pub fn attempt(_: super::ObjectKey, _: cyxia_prototype::learning::reward::CpuClass)
         -> Result<Option<()>, super::Error> { Ok(None) }
     pub fn finish_attempt(_: &mut (), _: u64, _: u64) -> Result<(), super::Error> { Ok(()) }
+    pub fn observe_service_io<T>(_: &T, _: u64) {}
 }
 static mut ORDER: Vec<u8> = Vec::new();
 fn order(n: u8) { unsafe { (&mut *core::ptr::addr_of_mut!(ORDER)).push(n); } }
