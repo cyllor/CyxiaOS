@@ -12,6 +12,7 @@ import unittest
 
 from test_active_accept_retry import program, ROOT
 from doctor import RUST_BIN, env
+from test_governance_billing_priority import function
 
 
 def source():
@@ -20,11 +21,18 @@ def source():
     if module.exists():
         p=p.replace('#[path='+json.dumps(str(module))+'] mod publication_cost;', '')
         body = module.read_text()
+        # Explicit controlled CPU boundary: assign actual CPU to entry into
+        # the real recorder's preparation body. Its call position, original
+        # budget check and stored completion all remain production source.
+        entry='pub fn prepare(' if 'pub fn prepare(' in body else 'pub fn finish('
+        actual=function(body,entry)
+        body=body.replace(actual,actual.replace('{\n','{\n    super::pay(super::DIAGNOSTIC_CPU_COST.load(super::Ordering::Acquire));\n',1))
         body += '\npub fn snapshot(cpu:usize)->[u64;64]{let r=&DOMAIN_PUBLICATION_COST.0[cpu-1];core::array::from_fn(|i|if i<63{r.get(i)}else{r.published.load(Ordering::Acquire)})}\n'
         body += '\npub fn reset(){for r in &DOMAIN_PUBLICATION_COST.0{for i in 0..63{r.put(i,0);}r.published.store(0,Ordering::Release);}}\n'
-        p=p.replace('fn setup(mode:u64)->[u64;512]{','fn setup(mode:u64)->[u64;512]{publication_cost::reset();')
+        p=p.replace('fn setup(mode:u64)->[u64;512]{','fn setup(mode:u64)->[u64;512]{DIAGNOSTIC_CPU_COST.store(0,Ordering::Release);publication_cost::reset();')
         p=p.replace('pub fn slot()->usize{1}','pub fn slot()->usize{super::COST_CPU.load(super::Ordering::Acquire)}')
         p+='\nstatic COST_CPU:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(1);\n'
+        p+='\nstatic DIAGNOSTIC_CPU_COST:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);\n'
         p += '\nmod publication_cost {\n' + body + '\n}\n'
     else:
         # Test-only absent-feature facade allows the unmodified actual source
@@ -70,7 +78,7 @@ def source():
  publication_cost::begin([11,9,7,1,1,1,1,1],policy::CpuTime{cpu:1,ns:u64::MAX},at);
  publication_cost::precommit(8,at); // Foreign Job cannot supply a stage.
  let end=policy::PublicationTime{wall_ns:101,cpu:policy::CpuTime{cpu:1,ns:101}};
- publication_cost::released(7,end);publication_cost::finish(7,end,0,Ok(9),Err(Error::Overflow),false,true);
+ publication_cost::released(7,end);publication_cost::prepare(7,0).finish(end,Err(Error::Overflow),Ok(9),Err(Error::Overflow),false,true);
  let w=publication_cost::snapshot(1);assert_eq!(w[1]&7,7,"identity conflict or arithmetic overflow was hidden");
  assert_eq!((w[27],w[29],w[30]),(u64::MAX,9,0));assert_eq!(w[46],0);
 }
@@ -80,7 +88,7 @@ def source():
   let at=policy::PublicationTime{wall_ns:1,cpu:policy::CpuTime{cpu,ns:1}};
   publication_cost::begin([11,9,1,1,1,1,1,1],at.cpu,at);
   publication_cost::precommit(1,at);publication_cost::released(1,at);
-  publication_cost::finish(1,at,0,Ok(1),Ok(()),false,true);
+  publication_cost::prepare(1,0).finish(at,Ok(0),Ok(1),Ok(()),false,true);
   assert_eq!(publication_cost::snapshot(1),[0;64],"unsupported CPU acquired a foreign evidence row");
   assert_eq!(accept(&out,10),Err(Error::Auth));assert!(pending_job().unwrap());
   COST_CPU.store(1,Ordering::Release);
@@ -93,6 +101,36 @@ def source():
  for _ in 0..6{policy::Clock::read(&mut clock);}
  assert_eq!(publication_cost::snapshot(1)[15],6);
  assert_eq!(publication_cost::snapshot(1)[1]&4,4,"extra Registry sample overflow was hidden");
+}
+#[test]fn publication_cost_terminal_without_registry_remains_complete_and_decodable(){
+ let out=setup(0);WALL.fetch_add(50_000_001,Ordering::AcqRel);
+ assert_eq!(accept(&out,10),Err(Error::Expired));
+ let w=publication_cost::snapshot(1);
+ assert_eq!(w[1],1,"terminal-before-Registry row acquired false chronology failure");
+ assert_eq!((w[15],w[20],w[63]),(0,0,1));
+ println!("TERMINAL_COST={:?}",w);
+ let out=setup(0);ACQUIRE_CPU.store(99_999,Ordering::Release);
+ let held=TASK_GATE.try_acquire(0,WALL.load(Ordering::Acquire),1).unwrap();
+ for _ in 0..5{assert_eq!(accept(&out,10),Err(Error::Busy));}
+ ACQUIRE_CPU.store(0,Ordering::Release);assert_eq!(accept(&out,10),Err(Error::Budget));
+ held.release(WALL.load(Ordering::Acquire));let w=publication_cost::snapshot(1);
+ assert_eq!(w[1],1,"exhausted retry acquired false chronology failure");
+ assert_eq!((w[11],w[15],w[20]),(500_000,0,0));
+ with(|s|{assert_eq!(s.registry.query(publisher_fixture(),id()).err(),Some(Error::Stale));Ok(())}).unwrap();
+ println!("TERMINAL_COST={:?}",w);
+ let out=setup(0);with(|s|{let j=s.job.as_mut().unwrap();j.read_only=true;j.work=Some(core_replay::WorkId);Ok(())}).unwrap();
+ assert_eq!(accept(&out,10),Ok(0));let w=publication_cost::snapshot(1);
+ assert_eq!(w[1],0,"readonly row acquired false chronology failure");
+ assert_eq!((w[15],w[20],w[63]),(0,0,1));
+ println!("TERMINAL_COST={:?}",w);
+}
+#[test]fn publication_cost_preparation_is_charged_before_original_terminal_cap(){
+ let out=setup(0);DIAGNOSTIC_CPU_COST.store(500_000,Ordering::Release);
+ assert_eq!(accept(&out,10),Ok(1),"diagnostic cost replaced original successful Registry receipt");
+ with(|s|{assert!(s.registry.optimization_stopped(),"diagnostic preparation escaped original cap");assert_eq!(s.registry.query(publisher_fixture(),id())?.version,1);Ok(())}).unwrap();
+ let w=publication_cost::snapshot(1);
+ assert_eq!((w[27],w[28],w[29],w[30]),(600_059,Error::Budget as u64+1,1,0),"diagnostic preparation cost omitted from original cumulative sample");
+ assert_eq!(FINISHED.lock().unwrap().unwrap().1,600_009,"stored publication debit omitted diagnostic preparation CPU");
 }
 '''
     return p
@@ -120,6 +158,12 @@ class PublicationCost(unittest.TestCase):
             (artifacts/'actual-source-bank.bin').write_bytes(bank)
             rows=decode_publication_cost(bank,expected={1:{'job':1,'boot':11,'controller':9,'target':1,'generation':1,'version':1}})
             self.assertEqual(rows[0]['cumulative_ns'],600_059)
+            terminal=[json.loads(line.split('TERMINAL_COST=',1)[1]) for line in r.stdout.splitlines() if 'TERMINAL_COST=' in line]
+            self.assertEqual(len(terminal),3)
+            for words in terminal:
+                row=decode_publication_cost(struct.pack('<128Q',*(words+[0]*64)),expected={1:{'job':1,'version':0}})[0]
+                self.assertIsNone(row['registry_return'])
+                self.assertEqual(row['registry_samples'],[])
             original=source()
             mutants=[
                 ('publication_cost::precommit(self.job, commit);','', 'publication_cost_successful', 'precommit/Registry-return samples missing'),
@@ -127,8 +171,10 @@ class PublicationCost(unittest.TestCase):
                 ('publication_cost::released(job.sequence, policy::Clock::read(&mut NativeClock));','', 'publication_cost_successful', 'release sample omitted actual release CPU'),
                 ('row.put(28, cap.err().map_or(0, |e| e as u64 + 1));','row.put(28,0);','publication_cost_successful','final cap failure replaced Registry success'),
                 ('if row.get(5) != job {\n        row.flag(2);\n        return None;\n    }','if row.get(5) != job { return None; }','publication_cost_identity','identity conflict or arithmetic overflow was hidden'),
-                ('if total.is_none() {\n            row.flag(4);\n        }','','publication_cost_identity','identity conflict or arithmetic overflow was hidden'),
+                ('Err(_) => 4','Err(_) => 0','publication_cost_identity','identity conflict or arithmetic overflow was hidden'),
                 ('else {\n                row.flag(4);\n            }','else {}','publication_cost_excess','extra Registry sample overflow was hidden'),
+                ('if i == 18 && row.get(20) == 0 {','if false {','publication_cost_terminal','terminal-before-Registry row acquired false chronology failure'),
+                ('let publication_cost = publication_cost::prepare(job.sequence, decoding);\n        let observed = policy::Clock::read(&mut NativeClock);','let observed = policy::Clock::read(&mut NativeClock);\n        let publication_cost = publication_cost::prepare(job.sequence, decoding);','publication_cost_preparation','diagnostic preparation escaped original cap'),
             ]
             for i,(old,new,name,message) in enumerate(mutants):
                 self.assertEqual(original.count(old),1,old)

@@ -28,6 +28,22 @@ def raw(w):
 
 
 class PublicationCostDecoder(unittest.TestCase):
+    def test_successful_new_publication_requires_precommit_but_cached_receipt_does_not(self):
+        w=fixture();w[16]=w[17]=w[46]=0
+        with self.assertRaisesRegex(ValueError,'precommit'):
+            decode(raw(w))
+        # An exact cached receipt returns before Registry clock/callback work.
+        w[15]=0;w[33:43]=[0]*10
+        row=decode(raw(w))[0]
+        self.assertEqual(row['registry_version'],309)
+        self.assertEqual(row['registry_samples'],[])
+        self.assertIsNone(row['precommit'])
+        refused=w.copy();refused[20:23]=[2,0,10];refused[29:31]=[0,10]
+        self.assertEqual(decode(raw(refused))[0]['registry_error'],10)
+        for count in (1,2,3,4):
+            bad=w.copy();bad[15]=count;bad[33:33+count*2]=fixture()[33:33+count*2]
+            with self.assertRaises(ValueError):decode(raw(bad))
+
     def test_original_identity_and_cost_are_decoded(self):
         got=decode(raw(fixture()),expected={1:{'job':402,'target':7,'generation':3,'version':309}})
         self.assertIsNotNone(got,'raw stage evidence has no independent decoder')

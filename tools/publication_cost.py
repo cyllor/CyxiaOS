@@ -44,6 +44,14 @@ def decode_publication_cost(raw, expected=None):
         if bool(w[1])!=bool(w[31] or w[32]):
             raise ValueError('publication cost stop flags')
         n=w[15]
+        # A protected new attempt always reads first+finished (at least two).
+        # A cached receipt and an outer Registry error return before any read.
+        if n==1 or (w[20] in (0,1) and n):
+            raise ValueError('publication cost impossible Registry clock combination')
+        if w[20]==3 and n not in (0,5):
+            raise ValueError('publication cost impossible successful Registry stages')
+        if w[20]==3 and n==5 and not w[46]:
+            raise ValueError('publication cost missing successful native precommit')
         if any(w[33+n*2:43]):raise ValueError('publication cost stale Registry tail')
         samples=[(w[12],w[13])]+[(w[33+i*2],w[34+i*2]) for i in range(n)]
         if w[46]:

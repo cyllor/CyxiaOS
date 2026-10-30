@@ -2640,6 +2640,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         });
         let decoding = decoded_ns
             .unwrap_or_else(|| decode_cpu_started.map(timer::cpu_elapsed_ns).unwrap_or(0));
+        let publication_cost = publication_cost::prepare(job.sequence, decoding);
         let observed = policy::Clock::read(&mut NativeClock);
         let elapsed = publication_started
             .cpu_elapsed(observed)
@@ -2698,7 +2699,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 publication_started.cpu.ns,
             ]);
         }
-        publication_cost::finish(job.sequence, observed, decoding, result, cap, registry_stopped, local_stop);
+        publication_cost.finish(observed, elapsed, result, cap, registry_stopped, local_stop);
         job.completion = Some(JobCompletion {
             result,
             selected,

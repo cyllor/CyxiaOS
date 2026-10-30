@@ -167,32 +167,17 @@ pub fn released(job: u64, at: PublicationTime) {
         row.sample(23, at);
     }
 }
-pub fn finish(
+/// Prepared before the original terminal Clock read. The token retains the
+/// sole-writer row and validated prefix so terminal serialization needs no
+/// row lookup, chronology traversal or duplicate cumulative arithmetic.
+pub struct Prepared {
+    row: Option<&'static Row>,
     job: u64,
-    at: PublicationTime,
-    decoded: u64,
-    result: Result<u64, Error>,
-    cap: Result<(), Error>,
-    registry_stopped: bool,
-    local_stop: bool,
-) {
+    flags: u64,
+}
+pub fn prepare(job: u64, decoded: u64) -> Prepared {
     if let Some(row) = current(job) {
-        row.sample(25, at);
         row.put(14, decoded);
-        let total = at
-            .cpu
-            .ns
-            .checked_sub(row.get(13))
-            .and_then(|v| v.checked_add(row.get(11)));
-        row.put(27, total.unwrap_or(u64::MAX));
-        if total.is_none() {
-            row.flag(4);
-        }
-        row.put(28, cap.err().map_or(0, |e| e as u64 + 1));
-        row.put(29, result.unwrap_or(0));
-        row.put(30, result.err().map_or(0, |e| e as u64 + 1));
-        row.put(31, u64::from(registry_stopped));
-        row.put(32, u64::from(local_stop));
         // Check actual chronology, including the precommit sample interleaved
         // between Registry commit and finished reads. Invalid evidence stays
         // explicit; it never changes the protected result or cap.
@@ -214,16 +199,60 @@ pub fn finish(
         {
             row.flag(8);
         }
-        for i in [18, 23, 25] {
+        for i in [18, 23] {
+            if i == 18 && row.get(20) == 0 {
+                continue;
+            }
             let sample = (row.get(i), row.get(i + 1));
             if sample.0 < last.0 || sample.1 < last.1 {
                 row.flag(8);
             }
             last = sample;
         }
-        if registry_stopped || local_stop {
-            row.flag(1);
-        }
-        row.published.store(job, Ordering::Release);
+        return Prepared {
+            row: Some(row),
+            job,
+            flags: row.get(1),
+        };
+    }
+    Prepared {
+        row: None,
+        job,
+        flags: 0,
+    }
+}
+impl Prepared {
+    /// Only serialize original terminal values after their protected check.
+    /// All prefix preparation and validation ran before that actual sample.
+    pub fn finish(
+        self,
+        at: PublicationTime,
+        total: Result<u64, Error>,
+        result: Result<u64, Error>,
+        cap: Result<(), Error>,
+        registry_stopped: bool,
+        local_stop: bool,
+    ) {
+        let Some(row) = self.row else {
+            return;
+        };
+        let flags = self.flags
+            | match total {
+                Err(Error::Auth) => 2,
+                Err(Error::Range) => 8,
+                Err(_) => 4,
+                Ok(_) => 0,
+            }
+            | u64::from(registry_stopped || local_stop);
+        row.put(25, at.wall_ns);
+        row.put(26, at.cpu.ns);
+        row.put(27, total.unwrap_or(u64::MAX));
+        row.put(28, cap.err().map_or(0, |e| e as u64 + 1));
+        row.put(29, result.unwrap_or(0));
+        row.put(30, result.err().map_or(0, |e| e as u64 + 1));
+        row.put(31, u64::from(registry_stopped));
+        row.put(32, u64::from(local_stop));
+        row.put(1, flags);
+        row.published.store(self.job, Ordering::Release);
     }
 }
