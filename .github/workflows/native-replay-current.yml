@@ -1,4 +1,4 @@
-# Probe generation 11: execute and authenticate independent EL0 governance coordinator
+# Probe generation 12: validate the V0.13 pre-registration control-credit gate
 name: Native replay current
 
 on:
