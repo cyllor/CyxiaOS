@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -10,6 +11,63 @@ import verify_v13_a10_matrix as matrix
 
 
 class A10MatrixGate(unittest.TestCase):
+    def test_trusted_child_projection_preserves_damaged_disk_lineage_and_subset_scope(self):
+        # Synthetic coverage context only. Raw decoding and native provenance
+        # have their own tests; this executes the real matrix traversal/edges.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root/'formatted.raw').write_bytes(b'formatted')
+            (root/'provision.log').write_text('fresh fixture')
+            (root/'source-manifest.json').write_text('{}')
+            (root/'build-manifest.json').write_text('{"code_source_map":{}}')
+            (root/'tools').mkdir(); (root/'tools/fixture.py').write_text('fixture data only')
+            request = dict(schema_version=1, test_id='A10', specification='1.3',
+                phases=list(matrix.PHASES), losses=list(matrix.LOSSES), reverse_replies=True,
+                scenario_budgets=matrix.scenario_budgets(matrix.ROOT), sample_ms=30000,
+                qemu_binary='/trusted/synthetic', qemu_source='/trusted/source',
+                qemu_attestation=dict(qemu_pmu_patch_attested=True), filesystem_uuid='11'*16,
+                overwrite_points='1', recovery_points='1', immutable_artifact_cache=None,
+                build_manifest_sha256=matrix.sha(root/'build-manifest.json'),
+                source_manifest_sha256=matrix.sha(root/'source-manifest.json'),
+                formatted_disk_sha256=matrix.sha(root/'formatted.raw'),
+                provision_log_sha256=matrix.sha(root/'provision.log'),
+                tools={'fixture.py': matrix.sha(root/'tools/fixture.py')})
+            (root/'matrix-input.json').write_text(json.dumps(request))
+
+            def trusted_loader(path, **expected):
+                name = path.relative_to(root).as_posix()
+                if name == 'prepare': initial = 'formatted'
+                elif name == 'overwrite-probe': initial = 'prepare'
+                elif name == 'cache-eviction': initial = 'overwrite-probe'
+                elif '/recovery/' in name:
+                    initial = (name.rsplit('/',1)[0]+'/cut' if name.endswith('/final')
+                               else name.split('/recovery/')[0]+'/cut')
+                elif name.endswith('/recovery-probe'): initial = name.rsplit('/',1)[0]+'/cut'
+                else: initial = 'prepare'
+                self.assertEqual(expected['initial_sha256'], hashlib.sha256(initial.encode()).hexdigest(),
+                                 'recovery must start from damaged bytes, never repaired probe output')
+                path.mkdir(parents=True)
+                (path/'disk.raw').write_bytes(name.encode())
+                (path/'trace.bin').write_bytes(b'fixture')
+                (path/'nbd').mkdir()
+                (path/'nbd/start.json').write_text('{}')
+                (path/'nbd/events.jsonl').write_text(json.dumps(dict(event='request', mutation=1,
+                    kind=3, offset=0, length=0))+'\n')
+                result = dict(binding={}, nbd_trace=dict(reordered_replies=True),
+                    observation=dict(consumption_boundary=dict(present=expected['mode'] != 3),
+                                     cache_eviction_verified=True, pressure_pages=4096),
+                    consumption_boundary=dict(present=True))
+                return result, {}
+
+            with patch.object(matrix, 'decode', return_value={}), \
+                 patch.object(matrix, 'overwrite_window', return_value=dict(points=[1])):
+                result = matrix.review(root, child_loader=trusted_loader)
+            self.assertEqual(result['status'], 'NOT_RUN')
+            self.assertEqual(result['overwrite_cases'], 4)
+            self.assertEqual(result['interrupted_recovery_cases'], 16)
+            self.assertTrue(result['cache_eviction_verified'])
+            self.assertFalse(result['runtime_truth_attested'])
+
     def rows(self):
         return [dict(mutation=1,kind=1,offset=0,length=512),
                 dict(mutation=2,kind=3,offset=0,length=0),

@@ -18,6 +18,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -28,7 +29,6 @@ from check_prototype_evidence import read_json, safe_path
 from check_v13_fault_disk import inspect as inspect_nbd
 from check_v13_filesystem import inspect as inspect_filesystem
 from doctor import ROOT, env
-from run_qemu import Qmp
 from run_v13_a02 import inject_config
 from transport import FrameDecoder
 from v13_fault_disk import Backend, Server
@@ -201,6 +201,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         phase: str = 'before', unflushed: str = 'drop', reverse_replies: bool = False,
         artifact_cache: Path | None = None, sample_ms: int = 100,
         qemu: Path | None = None, qemu_source: Path | None = None) -> dict:
+    from v13_a10_native_capture import NativeQmp, Witness, close_capture
+    from verify_v13_a10_native_receipt import VERSION, capture_limits, qemu_identity, tool_closure
     source_root = source_root.resolve(strict=True)
     budget = scenario_budget(source_root, mode)
     if timeout is None:
@@ -213,6 +215,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     merging = request_merging(mode, cut)
     build_manifest, initial_disk = build_manifest.resolve(strict=True), initial_disk.resolve(strict=True)
     output = output.resolve()
+    require(len(json.dumps(str(output))) <= 1024, 'A10 capture-root length exceeds native transcript budget')
     if artifact_cache is not None: artifact_cache = artifact_cache.resolve()
     require(not output.exists(), 'refuse to reuse A10 evidence output')
     manifest = read_json(build_manifest)
@@ -229,6 +232,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     before = inspect_filesystem(initial_disk)
     start = validate_start(before, mode)
     binary, qemu_proof = resolve_qemu(qemu, qemu_source)
+    require(qemu_source is not None and qemu_proof.get('qemu_pmu_patch_attested') is True,
+            'A10 native capture requires caller-selected patched QEMU source')
     output.mkdir(parents=True, mode=0o700)
     frozen_files = {build_manifest: manifest_hash, output / 'build-manifest.json': manifest_hash}
     for name in ('node-a.elf', 'service-a.elf', 'task.elf'):
@@ -280,6 +285,30 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     frozen_files[binary] = qemu_proof['qemu_sha256']
     _json(output / 'tools.json', dict(qemu_proof,
           build_tools=manifest['tools'], capture_tools=tool_hashes))
+    native_tools = tool_closure()
+    _json(output / 'native-tools.json', native_tools)
+    for name in native_tools:
+        target = output / 'native-tools' / name
+        target.parent.mkdir(exist_ok=True)
+        shutil.copyfile(ROOT / 'tools' / name, target)
+        frozen_files[ROOT / 'tools' / name] = frozen_files[target] = native_tools[name]
+    qemu_source_identity = qemu_identity(binary, qemu_source)
+    _json(output / 'qemu-source.json', qemu_source_identity)
+    (output / 'qemu-version.txt').write_text(qemu_proof['qemu_version'])
+    identity = dict(source_sha256=binding['source_sha256'], build_sha256=manifest_hash,
+                    input_sha256=binding['input_sha256'], initial_sha256=initial_hash,
+                    image_sha256=binding['image_sha256'], qemu=qemu_source_identity, tools=native_tools)
+    _json(output / 'native-identity.json', identity)
+    for name in ('input.json', 'binding.json', 'config.bin', 'model.bin', 'source-manifest.json',
+                 'native-tools.json', 'qemu-source.json', 'qemu-version.txt', 'native-identity.json'):
+        frozen_files[output / name] = sha(output / name)
+    for path in (output / 'build-inputs').rglob('*'):
+        if path.is_file():
+            frozen_files[path] = sha(path)
+    limits = capture_limits(dict(sample_ms=sample_ms, capture_timeout_seconds=timeout))
+    witness = Witness(output / 'native-provenance.jsonl', byte_limit=limits['bytes'],
+                      row_limit=limits['witness_rows'])
+    witness.record('identity-before', identity=identity)
     report = dict(result_scope(bool(cut)), status='FAIL', capture_status='INCOMPLETE',
         verifier_version='a10-single-mode-v1', binding=binding, source_root=str(source_root),
         clock_profile='wallclock', scenario_budget=budget, sample_ms=sample_ms,
@@ -294,12 +323,17 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     try:
         verify_unchanged(frozen_files)
         backend = Backend(output / 'disk.raw', output / 'nbd', cut=cut, phase=phase,
-                          unflushed=unflushed, reverse_replies=reverse_replies, compress=True)
+                          unflushed=unflushed, reverse_replies=reverse_replies, compress=True,
+                          witness=witness.record)
+        witness.record('backend-open', path=str(output / 'disk.raw'),
+                       run_id=backend.meta['run_id'], sha256=backend.meta['disk_initial_sha256'],
+                       size=backend.size)
         with tempfile.TemporaryDirectory(prefix='cyx-a10-') as temporary, \
                 (output / 'qemu-stderr.log').open('wb') as errors:
             endpoint = str(Path(temporary) / 'q.sock')
             debugger = str(Path(temporary) / 'g.sock')
             server = Server(backend, Path(temporary) / 'disk.sock')
+            witness.record('endpoint-created', endpoint=str(server.path), run_id=backend.meta['run_id'])
             with socket.socket() as listener:
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]
@@ -320,15 +354,25 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                 termination='SIGKILL own QEMU; no clean QMP stop/quit/host flush'))
             deadline = time.monotonic() + timeout
             proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errors, env=env())
+            witness.record('spawn', pid=proc.pid)
+            _json(output / 'native-context.json', dict(version=VERSION, capture_root=str(output),
+                initial_source=str(initial_disk), binary=str(binary), binary_sha256=qemu_proof['qemu_sha256'],
+                private_dir=temporary, private_mode=Path(temporary).stat().st_mode & 0o777,
+                endpoints=dict(qmp=endpoint, gdb=debugger, nbd=str(server.path)),
+                backend_run_id=backend.meta['run_id'], backing_path=str(output / 'disk.raw'),
+                backing_sha256=backend.meta['disk_initial_sha256'], backing_size=backend.size,
+                network_port=port, pid=proc.pid, host_platform=sys.platform))
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             while True:
                 require(proc.poll() is None, 'QEMU exited before handshake')
                 if time.monotonic() >= deadline: raise TimeoutError('A10 QMP startup deadline')
                 try: sock.connect(endpoint); break
                 except (FileNotFoundError, ConnectionRefusedError): time.sleep(.01)
-            qmp = Qmp(sock)
+            qmp = NativeQmp(sock, witness, journal_path=output / 'qmp.jsonl',
+                            byte_limit=limits['bytes'], command_limit=limits['commands'])
             require('QMP' in qmp.receive(deadline), 'missing QMP greeting')
             qmp.execute('qmp_capabilities')
+            qmp.execute('query-status')
             cpus, memory = qmp.execute('query-cpus-fast'), qmp.execute('query-memory-size-summary')
             require(len(cpus) == 4 and memory['base-memory'] == 1024 ** 3, 'wrong native platform')
             _json(output / 'platform.json', dict(cpus=cpus, memory=memory))
@@ -337,6 +381,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                 qmp.execute('pmemsave', dict(val=address, size=size, filename=str(path)))
                 data = path.read_bytes()
                 require(len(data) == size, 'short native memory capture: ' + name)
+                witness.record('save', id=qmp.seq, name=name, size=size,
+                               sha256=hashlib.sha256(data).hexdigest())
                 return data
             def capture_diagnostics():
                 for name, location in layout['diagnostics'].items():
@@ -347,21 +393,27 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
             save('platform.dtb', 0x40000000, size)
             config = (output / 'config.bin').read_bytes()
             _json(output / 'config-injection.json', inject_config(debugger, config, layout['config']['pa']))
+            witness.record('injection')
             require(save('config-observed.bin', layout['config']['pa'], 512) == config,
                     'A10 preboot injection not observed')
             qmp.execute('cont')
-            while time.monotonic() < deadline:
-                require(proc.poll() is None, 'QEMU exited during A10')
+            qmp.execute('query-status')
+            def read_serial():
                 chunk = base64.b64decode(qmp.execute('ringbuf-read',
                     dict(device='cyxlog', size=1048576, format='base64')), validate=True)
                 raw.extend(chunk)
                 require(len(raw) <= 8 * 1024 * 1024, 'serial capture limit')
                 for body in decoder.feed(chunk): serial.extend(body + b'\n')
+                return chunk
+            while time.monotonic() < deadline:
+                require(proc.poll() is None, 'QEMU exited during A10')
+                read_serial()
                 if backend.cut_event.is_set():
                     report['cut_observed'] = True
                     # The volatile backend has already disconnected; this stop
                     # cannot turn pending guest sectors into durable bytes.
                     qmp.execute('stop')
+                    qmp.execute('query-status')
                     trace = save('trace.bin', layout['capture']['pa'], layout['capture']['size'])
                     progress = save('progress.bin', layout['progress']['pa'], 512)
                     consumption = save('consumption.bin', layout['consumption']['pa'], 256)
@@ -382,9 +434,19 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                     consumption = save('consumption.bin', layout['consumption']['pa'], 256)
                     capture_diagnostics()
                     require(save('trace-confirm.bin', layout['capture']['pa'], layout['capture']['size']) == trace
-                            and save('progress-confirm.bin', layout['progress']['pa'], 512) == progress,
+                            and save('progress-confirm.bin', layout['progress']['pa'], 512) == progress
+                            and save('consumption-confirm.bin', layout['consumption']['pa'], 256) == consumption,
                             'A10 terminal capture changed during live read')
-                    require(decoder.loss == decoder.corrupt == 0, 'serial transport loss/corruption')
+                    drained = False
+                    # Ring capacity/read size are 1 MiB, total serial is 8 MiB.
+                    # Eight attempts are a fail-closed cap, never proof of empty.
+                    for _ in range(8):
+                        if not read_serial() and not decoder.buffer:
+                            drained = True
+                            break
+                    qmp.execute('query-status')
+                    require(drained and decoder.loss == decoder.corrupt == 0 and not decoder.buffer,
+                            'serial transport loss/corruption/trailing frame')
                     report['capture_status'] = 'TERMINAL_CAPTURED'
                     break
                 time.sleep(interval)
@@ -398,23 +460,14 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
     finally:
         # QMP stop/quit and graceful termination can trigger host-originated
         # FLUSH. Kill only our process, then discard NBD's remaining volatility.
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        if sock: sock.close()
-        if server:
-            try: server.close()
-            except (OSError, ValueError) as error: report['error'] = 'NBD close: ' + str(error)
-            if server.error is not None: report['error'] = 'NBD worker: ' + str(server.error)
-        if qmp:
-            (output / 'qmp.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in qmp.transcript))
+        close_capture(proc, sock, server, qmp, backend, witness, report)
         (output / 'serial.bin').write_bytes(raw)
         (output / 'serial.txt').write_bytes(serial)
         report.update(qemu_exit=proc.returncode if proc else None,
                       elapsed_seconds=round(time.monotonic() - started, 3))
     try:
         require('error' not in report, report.get('error', 'native capture failed'))
-        validate_capture_commands(qmp.transcript, cut_observed=report['cut_observed'])
+        validate_capture_commands(qmp.capture_commands, cut_observed=report['cut_observed'])
         require(report['cut_observed'] == bool(cut), 'requested cut was not reached')
         require(code_source_map(source_root) == sources and sha(image_path) == binding['image_sha256']
                 and tool_hashes == {name: sha(ROOT / 'tools' / name) for name in TOOL_NAMES},
@@ -422,6 +475,11 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         verify_unchanged(frozen_files)
         require(attest_qemu(binary, qemu_source) == qemu_proof,
                 'QEMU source attestation changed during execution')
+        require(qemu_identity(binary, qemu_source) == qemu_source_identity
+                and tool_closure() == native_tools, 'native provenance changed during execution')
+        witness.record('final-disk', sha256=sha(output / 'disk.raw'),
+                       size=(output / 'disk.raw').stat().st_size)
+        witness.record('identity-after', identity=identity)
         report['nbd_trace'] = inspect_nbd(output / 'initial.raw', output / 'disk.raw', output / 'nbd')
         oracle = inspect_filesystem(output / 'disk.raw')
         _json(output / 'disk-after.json', oracle)

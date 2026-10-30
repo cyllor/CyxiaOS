@@ -121,7 +121,7 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
         recovery_points: str = 'all', timeout: float | None = None,
         artifact_cache: Path | None = None, resume: bool = False,
         qemu: Path | None = None, qemu_source: Path | None = None,
-        sample_ms: int = 30_000) -> dict:
+        sample_ms: int = 30_000, formatter_binary: Path | None = None) -> dict:
     require(timeout is None, 'A10 matrix uses fixed source-bound per-mode budgets')
     sample_interval(sample_ms)
     require(sample_ms == 30_000, 'A10 matrix requires the frozen low-observer sample interval')
@@ -135,11 +135,8 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
     require(build['code_source_map'] == sources, 'matrix build/source mismatch')
     tools = {name: sha(ROOT / 'tools' / name) for name in MATRIX_TOOLS}
     if resume:
-        preview = json.loads((output / 'matrix-input.json').read_text())
-        if qemu is None:
-            qemu = Path(preview.get('qemu_binary', ''))
-        if qemu_source is None and preview.get('qemu_source'):
-            qemu_source = Path(preview['qemu_source'])
+        require(qemu is not None and qemu_source is not None and formatter_binary is not None,
+                'native resume requires caller-selected QEMU binary/source and formatter')
     if qemu_source is not None:
         qemu_source = qemu_source.resolve(strict=True)
     qemu_binary, qemu_proof = resolve_qemu(qemu, qemu_source)
@@ -152,6 +149,9 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
             recovery_points=recovery_points, timeout=timeout, artifact_cache=artifact_cache,
             qemu_binary=qemu_binary, qemu_source=qemu_source, qemu_proof=qemu_proof,
             sample_ms=sample_ms)
+        from verify_v13_a10_native_receipt import verify_provision
+        verify_provision(output, request, source_root=ROOT, build_manifest=build_manifest,
+                         formatter_binary=formatter_binary)
         progress['status'] = 'RUNNING'
         _json(output / 'progress.json', progress)
     else:
@@ -166,13 +166,48 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
             shutil.copyfile(ROOT / 'tools' / name, target)
         identity = uuid.uuid4().bytes
         formatted = output / 'formatted.raw'
-        command = ['rustup', 'run', 'stable', 'cargo', 'run', '--locked', '--offline',
-                   '-p', 'cyxia-prototype', '--example', 'prototype-disk', '--',
-                   str(formatted), identity.hex()]
-        provision = subprocess.run(command, cwd=ROOT, env=env(), capture_output=True,
+        from v13_a10_native_capture import formatter_artifact, formatter_environment, formatter_identity
+        formatter_tools = formatter_identity()
+        build_command = [formatter_tools['rustup']['path'], 'run', 'stable', 'cargo', 'build',
+            '--locked', '--offline', '-p', 'cyxia-prototype', '--example', 'prototype-disk',
+            '--message-format=json-render-diagnostics', '--target', formatter_tools['rustc']['host']]
+        formatter_env = formatter_environment()
+        removed = ('RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
+                   'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+                   'CARGO_BUILD_TARGET', 'CARGO_BUILD_RUSTFLAGS')
+        for name in removed:
+            formatter_env.pop(name, None)
+        built = subprocess.run(build_command, cwd=ROOT, env=formatter_env, capture_output=True,
+                               text=True, timeout=120)
+        (output / 'provision-build.stdout').write_text(built.stdout)
+        (output / 'provision-build.stderr').write_text(built.stderr)
+        require(built.returncode == 0, 'A10 formatter build failed')
+        compiler_artifact = formatter_artifact(built.stdout)
+        formatter = Path(compiler_artifact).resolve(strict=True)
+        formatter_hash = sha(formatter)
+        shutil.copyfile(formatter, output / 'formatter.bin')
+        (output / 'formatter.bin').chmod(0o600)
+        require(sha(output / 'formatter.bin') == formatter_hash, 'formatter changed during copy')
+        command = [str(formatter), str(formatted), identity.hex()]
+        provision = subprocess.run(command, cwd=ROOT, env=formatter_env, capture_output=True,
                                    text=True, timeout=120)
+        (output / 'provision.stdout').write_text(provision.stdout)
+        (output / 'provision.stderr').write_text(provision.stderr)
         (output / 'provision.log').write_text(provision.stdout + provision.stderr)
         require(provision.returncode == 0, 'A10 matrix formatter failed')
+        require(formatter_identity() == formatter_tools and sha(formatter) == formatter_hash
+                and code_source_map(ROOT) == sources, 'formatter/toolchain/source changed during provisioning')
+        formatter_binary = formatter
+        _json(output / 'provision.json', dict(version='a10-native-v1', argv=command, cwd=str(ROOT),
+            capture_root=str(output), returncode=provision.returncode,
+            source_sha256=sha(output / 'source-manifest.json'), build_sha256=sha(build_manifest),
+            disk_sha256=sha(formatted), log_sha256=sha(output / 'provision.log'),
+            build_argv=build_command, build_returncode=built.returncode,
+            build_stdout_sha256=sha(output / 'provision-build.stdout'),
+            build_stderr_sha256=sha(output / 'provision-build.stderr'), compiler_artifact=compiler_artifact,
+            formatter_path=str(formatter), formatter_sha256=formatter_hash,
+            tools_before=formatter_tools, tools_after=formatter_tools,
+            environment=dict(removed=list(removed), values=formatter_env)))
         request = dict(schema_version=1, test_id='A10', specification='1.3',
                        build_manifest_sha256=sha(build_manifest), source_root=str(ROOT),
                        source_manifest_sha256=sha(output / 'source-manifest.json'),
@@ -205,12 +240,18 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
             require(name not in visited, 'duplicate A10 matrix child name')
             visited.add(name)
             if name in completed:
+                from verify_v13_a10_native_receipt import verify_native_child
+                verify_native_child(directory, source_root=ROOT, build_manifest=build_manifest,
+                                    qemu_binary=qemu_binary, qemu_source=qemu_source)
                 result, _ = load_run(directory, mode=mode, cut=cut, phase=phase, loss=loss,
                                      initial_sha256=initial_hash, status=expected, matrix=request)
                 print(f'{directory}: RESUME {expected}', flush=True)
                 return directory, result
             if directory.exists():
                 try:
+                    from verify_v13_a10_native_receipt import verify_native_child
+                    verify_native_child(directory, source_root=ROOT, build_manifest=build_manifest,
+                                        qemu_binary=qemu_binary, qemu_source=qemu_source)
                     result, _ = load_run(directory, mode=mode, cut=cut, phase=phase, loss=loss,
                                          initial_sha256=initial_hash, status=expected,
                                          matrix=request)
@@ -295,6 +336,8 @@ def main() -> int:
     parser.add_argument('--artifact-cache', type=Path)
     parser.add_argument('--qemu', type=Path)
     parser.add_argument('--qemu-source', type=Path)
+    parser.add_argument('--formatter-binary', type=Path,
+                        help='caller-trusted local formatter executable, required when resuming')
     parser.add_argument('--sample-ms', type=int, default=30_000)
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args()
@@ -304,7 +347,7 @@ def main() -> int:
                      recovery_points=args.recovery_points, timeout=args.timeout,
                      artifact_cache=args.artifact_cache, resume=args.resume,
                      qemu=args.qemu, qemu_source=args.qemu_source,
-                     sample_ms=args.sample_ms)
+                     sample_ms=args.sample_ms, formatter_binary=args.formatter_binary)
         print(json.dumps(result, indent=2))
         diagnostic = args.overwrite_points != 'all' or args.recovery_points != 'all'
         return 0 if result['status'] == 'PASS' or (diagnostic and result['status'] == 'NOT_RUN') else 1
