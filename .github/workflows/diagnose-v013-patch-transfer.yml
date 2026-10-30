@@ -1,0 +1,31 @@
+name: Diagnose V0.13 patch transport
+on:
+  push:
+    branches: [work/v013-repair-verification-20261030]
+    paths: ['.github/workflows/diagnose-v013-patch-transfer.yml']
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Diagnose transfer bytes and exact resulting tree without publication
+        run: |
+          set -euo pipefail
+          cat .github/codex/v013-pending-delivered.patch .github/codex/v013-pending-delivered.part-02.patch .github/codex/v013-pending-delivered.part-03.patch .github/codex/v013-pending-delivered.part-04.patch > "$RUNNER_TEMP/transport.patch"
+          wc -cl "$RUNNER_TEMP/transport.patch"
+          sha256sum "$RUNNER_TEMP/transport.patch"
+          git checkout --detach 396b8777a9d72a47aa9e24aa432e4e1fca265ac4
+          git apply --check "$RUNNER_TEMP/transport.patch"
+          git apply --index "$RUNNER_TEMP/transport.patch"
+          git diff --cached --check
+          git write-tree
+          git diff --cached --binary --full-index > "$RUNNER_TEMP/canonical.patch"
+          sha256sum "$RUNNER_TEMP/canonical.patch"
+          diff -u "$RUNNER_TEMP/transport.patch" "$RUNNER_TEMP/canonical.patch" || test "$?" = 1
+          test "$(git write-tree)" = 67550daeb119a2d5bee14f8ea5e7d490d0f62733
