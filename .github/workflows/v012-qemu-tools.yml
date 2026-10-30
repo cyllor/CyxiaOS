@@ -1,0 +1,56 @@
+name: V012 pinned native emulator
+on:
+  push:
+    branches: [codex/v012-tools-20261030]
+    paths: ['.github/workflows/v012-qemu-tools.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build original pinned emulator and PMU patch
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends git python3-venv ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev
+          git clone --depth 1 --branch v10.2.2 https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu"
+          test "$(git -C "$RUNNER_TEMP/qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu" diff --check
+          cd "$RUNNER_TEMP/qemu"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror
+          ninja -C build qemu-system-aarch64
+      - name: Package source-bound binary and shared dependencies
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/native-emulator"
+          mkdir -p "$out/lib"
+          binary="$RUNNER_TEMP/qemu/build/qemu-system-aarch64"
+          "$binary" --version > "$out/qemu-version.txt"
+          sha256sum "$binary" > "$out/binary.sha256"
+          git -C "$RUNNER_TEMP/qemu" rev-parse HEAD > "$out/source-commit.txt"
+          git -C "$RUNNER_TEMP/qemu" diff --binary > "$out/source.patch"
+          ldd "$binary" > "$out/ldd.txt"
+          awk '/=> \/.* \(/ {print $3}' "$out/ldd.txt" | while read -r lib; do
+            case "$(basename "$lib")" in libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*) continue;; esac
+            cp -L "$lib" "$out/lib/"
+          done
+          tar -C "$RUNNER_TEMP" --exclude=qemu/build -cf "$out/qemu-source.tar" qemu
+          tar -C "$RUNNER_TEMP" -rf "$out/qemu-source.tar" qemu/build/qemu-system-aarch64
+          gzip -1 "$out/qemu-source.tar"
+          cd "$out"
+          sha256sum qemu-source.tar.gz lib/* > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v012-pinned-emulator-${{ github.sha }}
+          path: ${{ runner.temp }}/native-emulator/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
