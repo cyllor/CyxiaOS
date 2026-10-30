@@ -59,6 +59,8 @@ class FirstCandidateRejection(unittest.TestCase):
                 source.write_text(original.replace(old,new))
                 r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 self.assertNotEqual(r.returncode,0,old+"\n"+r.stdout+r.stderr)
+                self.assertNotIn('error[E',r.stdout+r.stderr)
+                self.assertIn('test result: FAILED',r.stdout+r.stderr)
                 self.assertIn(message,r.stdout+r.stderr)
 
 

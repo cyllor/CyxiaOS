@@ -5,9 +5,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_prototype::{
     domains::{
-        Action, Error, ObjectKey, POLICY_NS, WINDOW_NS,
+        Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS,
         tasks::{ControlCredit, CpuLayout, Dispatch, Scheduler, ThreadSpec},
     },
+    features::{DomainObservation, TargetFeatures},
     policy::{
         self, Clock, ExecutionState, Executor, ModelBinding, PlanId, Publisher, Registry, Snapshot,
     },
@@ -16,12 +17,54 @@ use cyxia_prototype::{
 use std::sync::{Mutex, mpsc};
 
 #[path = "../../../kernel/src/domain_tasks/publication.rs"]
+#[allow(dead_code)]
 mod publication;
 #[path = "../../../kernel/src/domain_tasks/service_authority.rs"]
 mod service_authority;
+#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+#[allow(dead_code)]
+mod target_batch;
+#[allow(dead_code)]
 mod domain_control {
+    pub use super::target_batch::Source as TargetSource;
+    use super::*;
     pub use cyxia_prototype::policy::Prerequisite;
+
+    pub struct Family {
+        pub domain: u16,
+        pub kind: u16,
+        pub target_source: TargetSource,
+        pub target: fn(u16, u16, usize) -> Option<ObjectKey>,
+        pub observe: fn(u16, ObjectKey) -> Result<DomainObservation, Error>,
+        pub current: fn(u16, u16, ObjectKey) -> Result<Action, Error>,
+        pub legal: fn(Action, ObjectKey, u64) -> Result<(), Error>,
+        pub legal_options:
+            fn(&[Option<Action>], ObjectKey, u64, &mut [Option<Action>]) -> Result<usize, Error>,
+        pub target_features: fn(Action, ObjectKey) -> Result<TargetFeatures, Error>,
+        pub apply: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
+        pub reconcile: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
+    }
 }
+// This fixture executes the protected baseline path. The shared publication
+// module also type-checks Active registration identities; their callbacks are
+// explicit uncalled boundaries here, exercised by the separate Active host
+// harnesses. Invoking one cannot manufacture a legal action or execution.
+macro_rules! active_callback {
+    ($name:ident($($argument:ident: $ty:ty),*) -> $result:ty) => {
+        #[allow(dead_code, unused_variables)]
+        fn $name($($argument: $ty),*) -> $result {
+            panic!(concat!("Active callback outside baseline fixture: ", stringify!($name)))
+        }
+    };
+}
+active_callback!(control_target(domain:u16, kind:u16, ordinal:usize) -> Option<ObjectKey>);
+active_callback!(control_current(domain:u16, kind:u16, target:ObjectKey) -> Result<Action,Error>);
+active_callback!(validate_action(action:Action, target:ObjectKey, at:u64) -> Result<(),Error>);
+active_callback!(legal_options(options:&[Option<Action>], target:ObjectKey, at:u64, output:&mut [Option<Action>]) -> Result<usize,Error>);
+active_callback!(control_features(action:Action, target:ObjectKey) -> Result<TargetFeatures,Error>);
+active_callback!(control_apply(action:Action, id:ApplyId, stamp:PolicyStamp, at:u64) -> Result<ExecutionState,Error>);
+active_callback!(control_reconcile(action:Action, id:ApplyId, stamp:PolicyStamp, at:u64) -> Result<ExecutionState,Error>);
+active_callback!(scheduling_dependencies(target:ObjectKey) -> Result<[Option<domain_control::Prerequisite>;2],Error>);
 mod cpu {
     std::thread_local! { static SLOT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) }; }
     pub fn slot() -> usize {
@@ -57,10 +100,14 @@ impl Drop for Guard {
 struct State {
     scheduler: Scheduler,
     service: Option<Dispatch>,
+    layout: CpuLayout,
+    draining: u64,
 }
 static mut STATE: State = State {
     scheduler: Scheduler::new(),
     service: None,
+    layout: LAYOUT,
+    draining: 0,
 };
 fn now_ns() -> u64 {
     NOW.load(Ordering::Acquire)
@@ -85,6 +132,8 @@ fn reset(service_started: u64) {
     *s = State {
         scheduler: Scheduler::new(),
         service: None,
+        layout: LAYOUT,
+        draining: 0,
     };
     s.scheduler.register_group(TARGET).unwrap();
     s.scheduler

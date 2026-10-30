@@ -45,13 +45,20 @@ class NativePublicationClock(unittest.TestCase):
                                     text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('4 passed; 0 failed', result.stdout)
-            if 'policy::publication_budget(self.publication_started, commit)?;' in template:
-                (directory / 'harness.rs').write_text(template.replace(
-                    '        policy::publication_budget(self.publication_started, commit)?;', ''))
-                negative = subprocess.run(command + ['--exact', 'last_callback_cannot_hide_cpu_overrun'],
-                    cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
-                self.assertNotEqual(negative.returncode, 0, negative.stdout + negative.stderr)
-                self.assertIn('last callback CPU overrun reached commit', negative.stdout + negative.stderr)
+            check = ('policy::PublicationBudget {\n'
+                     '                started: self.publication_started,\n'
+                     '                carried: self.publication_debit,\n'
+                     '            }\n'
+                     '            .check(commit)?;')
+            self.assertEqual(template.count(check), 1, 'native publication CPU check changed')
+            (directory / 'harness.rs').write_text(template.replace(check, ''))
+            negative = subprocess.run(command + ['--exact', 'last_callback_cannot_hide_cpu_overrun'],
+                cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
+            output = negative.stdout + negative.stderr
+            self.assertNotEqual(negative.returncode, 0, output)
+            self.assertNotIn('error[E', output)
+            self.assertIn('test result: FAILED', output)
+            self.assertIn('last callback CPU overrun reached commit', output)
 
 
 if __name__ == '__main__':

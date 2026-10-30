@@ -130,18 +130,28 @@ def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
         if expect=='leave':require(0x221 in events,'missing two-signature durable leave')
         restarted = u[30:32] == (2,1)
         if service_restart:
-            restart=re.search(rb'UNIFIED_SERVICE_RESTART boot=(\d+) generation=2',text)
+            restart=re.search(rb'(?m)^UNIFIED_SERVICE_RESTART boot=(\d+) generation=2\r?$',text)
             fault=(f'UNIFIED_EL0_FAULT generation=1 last_op={restart_boundary[0]} last_arg0={restart_boundary[1]} ').encode()
             if restarted:
                 require(restart is not None and int(restart.group(1))==u[1],
                         'same-boot service restart evidence missing')
-                require(u[13:15]==restart_boundary and u[22]==1 and fault in text,
+                require(u[13:15]==restart_boundary and u[22]==1 and fault in text[:restart.start()],
                         'real generation-1 EL0 fault boundary missing')
+                # Counts span the complete boot, including earlier reconnects.
+                # Only events after this generation's restart can certify its
+                # new service entry, TLS authentication and peer READY.
+                pending=iter((1,2,3,0x212));next_event=next(pending)
+                for event in re.finditer(rb'(?m)^UNIFIED_SERVICE event=(\d+) arg1=\d+ arg2=\d+ ms=\d+\r?$',text[restart.end():]):
+                    if int(event.group(1))==next_event:
+                        next_event=next(pending,None)
+                        if next_event is None:break
+                require(next_event is None,'post-restart service did not authenticate and reconcile to READY')
             else:
                 require(u[30:32]==(1,0) and restart is None and u[13:15]==(0,0) and u[22]==0
                         and b'UNIFIED_EL0_FAULT generation=' not in text,
                         'healthy peer unexpectedly faulted or restarted')
-            require(all(events.count(event)>=2 for event in (1,2,3,0x212)),
+            require(all(events.count(event)>=(2 if restarted else 1) for event in (1,2))
+                    and all(events.count(event)>=2 for event in (3,0x212)),
                     'service restart pair did not reconcile to READY')
         else:require(u[30:32]==(1,0),'unexpected service restart in this scenario')
         observations.append(dict(boot_epoch=u[1],service_generation=u[30],service_restarts=u[31],service_restarted=restarted,task_starts=u[8],task_finishes=u[9],events=events,transitions=[list(t) for t in transitions],business=list(r[19:23]),inferences=r[14]))

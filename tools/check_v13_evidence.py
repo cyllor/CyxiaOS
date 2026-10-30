@@ -4,8 +4,10 @@
 A02 has a fixed native receipt adapter following a real native run and separate
 receipt replay. It validates raw events, execution provenance and the caller's
 source root; producer PASS booleans and host fixtures cannot establish a result.
-Other cases, native FAIL classification and the filesystem matrix remain
-unenrolled. Coverage registration does not change unrun catalogue entries.
+A10 additionally has fixed offline matrix reconstruction, but its native
+launch/capture admission remains closed. Other cases, native FAIL classification
+and filesystem catalogue completion remain unenrolled. Coverage registration
+does not change unrun catalogue entries.
 """
 from __future__ import annotations
 import argparse
@@ -16,6 +18,9 @@ import sys
 
 from check_prototype_evidence import artifact, exact_keys, read_json, require, safe_path, sha256
 from verify_v13_a02 import verify_native_receipt
+from verify_v13_a10_receipt import (NATIVE_ADMISSION_BLOCKERS as A10_BLOCKERS,
+                                   VERSION as A10_OFFLINE_VERSION,
+                                   verify_matrix_receipt as verify_a10_matrix_receipt)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = ROOT / 'docs/implementation/v13-requirements.json'
@@ -51,6 +56,13 @@ def check_rows(rows, expected, label, root, *, descriptions):
         else:
             require(type(row['evidence']) is dict, 'Native result requires a receipt')
             receipt = artifact(root, row['evidence'])
+            if row['id'] == 'A10' and descriptions:
+                require(row['status'] == 'PASS', 'A10 native FAIL classification is not registered')
+                require(receipt.name == 'summary.json', 'A10 receipt must name summary.json')
+                verify_a10_matrix_receipt(receipt.parent, source_root=root)
+                # Rebuilding file/durability bytes cannot replace independent
+                # native process, launch, injection and capture provenance.
+                raise ValueError('A10 native receipt admission remains closed: ' + '; '.join(A10_BLOCKERS))
             if row['id'] != 'A02' or not descriptions:
                 raise ValueError(f"No complete 1.3 native receipt verifier registered for {row['id']}")
             require(row['status'] == 'PASS', 'A02 native FAIL classification is not registered')
@@ -111,8 +123,12 @@ def validate(document, root=ROOT):
                 'raw_contracts': {
                     'A02': {'verifier': 'tools/verify_v13_a02.py', 'wire_version': 2,
                             'native_receipt_admitted': True,
-                            'native_verifier_version': 'a02-native-v4'}}},
-            'scope': 'Catalogue integrity and fixed A02 native verification; other cases and filesystem fault matrix remain required.'}
+                            'native_verifier_version': 'a02-native-v4'},
+                    'A10': {'verifier': 'tools/verify_v13_a10_receipt.py',
+                            'native_receipt_admitted': False,
+                            'offline_verifier_version': A10_OFFLINE_VERSION,
+                            'native_admission_blockers': list(A10_BLOCKERS)}}},
+            'scope': 'Catalogue integrity, fixed A02 native verification and A10 offline reconstruction; other native cases and filesystem acceptance remain required.'}
 
 
 def main(argv=None):

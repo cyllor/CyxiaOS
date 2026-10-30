@@ -50,7 +50,7 @@ class NativeSubmissionProvenance(unittest.TestCase):
    for mutated,changed,message in mutants:
     self.assertNotEqual((mutated,changed),(local,facts));(d/'harness.rs').write_text(mutated);(d/'facts.rs').write_text(changed)
     negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
-    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_record_tail_preserves_first_completion_and_slot_identity(self):
   evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
   if 'pub fn submission(' not in evidence:evidence+='\npub fn submission(_:usize,_:u64,_:[u64;27]){}\n'
@@ -86,7 +86,7 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
    for old,new,message in [('get(at) != sequence || ', '', 'foreign completion acquired'),('get(at + 612) != 0 || ', '', 'delivery retry replaced original')]:
     self.assertIn(old,evidence);(d/'evidence.rs').write_text(evidence.replace(old,new))
     negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
-    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_accept_completion_and_abort_preserve_facts_across_delivery_retry(self):
   control=(ROOT/'kernel/src/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_completion_harness.rs').read_text()
   extra=extra.replace('// COMPLETION_JOB_TYPES','#[derive(Clone,Copy)]'+function(control,'struct Job {')+'\n#[derive(Clone,Copy)]'+function(control,'struct JobCompletion {'))
@@ -105,11 +105,14 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
    for marker,message in [('provenance.words(result, false)','actual accept omitted'),('provenance.words(Err(Error::Expired), true)','actual abort omitted')]:
     matching=[line for line in lines if marker in line];self.assertEqual(len(matching),1,matching)
     (d/'harness.rs').write_text(program.replace(matching[0],matching[0].replace(marker,'[0;27]')));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
-    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
+    self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_accept_submit_and_readonly_blocks_preserve_original_outcomes(self):
   control=(ROOT/'kernel/src/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_accept_segment.rs').read_text();accept=function(control,'pub fn accept(')
   start=accept.index('            provenance.accept(submission::AcceptStage::Executor);');end=accept.index('            Ok(receipt.version)')+len('            Ok(receipt.version)')
-  segment=accept[start:end].replace('ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?)','Scope').replace('publisher(job.controller)','publisher()')
+  segment=accept[start:end]
+  # This segment starts after borrow acquisition. Its model/Root/task scope
+  # remains the counted facade; the complete borrow path has its own fixture.
+  segment=segment.replace(function(segment,'ActivePublication {'),'Scope').replace('publisher(job.controller)','publisher()')
   extra=extra.replace('// ACTUAL_ACCEPT_SUBMIT',segment).replace('// ACTUAL_READONLY_BLOCK',function(accept,'if job.read_only {'));program+='\n'+extra
   with tempfile.TemporaryDirectory() as tmp:
    d=Path(tmp);source=d/'harness.rs';source.write_text(program);(d/'Cargo.toml').write_text('[package]\nname="submission-accept-segment"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
@@ -117,6 +120,6 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
    run_env=env();run_env['RUST_MIN_STACK']='16777216'
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-submission-accept-segment'),'--','--test-threads=1','submission_accept_segment_']
    r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('2 passed; 0 failed',r.stdout)
-   for old,new,message in [('            provenance = executor.provenance;','','actual accept lost the executor'),('            provenance = executor.provenance;\n            let receipt = submitted?;','            let receipt = submitted?;\n            provenance = executor.provenance;','Registry early return lost callback facts')]:
-    self.assertIn(old,program);source.write_text(program.replace(old,new));r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertNotEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn(message,r.stdout+r.stderr)
+   for old,new,message in [('            provenance = executor.provenance;','','actual accept lost the executor'),('            provenance = executor.provenance;\n            drop(executor);\n            let receipt = submitted?;','            let receipt = submitted?;\n            provenance = executor.provenance;\n            drop(executor);','Registry early return lost callback facts')]:
+    self.assertIn(old,program);source.write_text(program.replace(old,new));r=subprocess.run(command,cwd=ROOT,env=run_env,capture_output=True,text=True,timeout=120);self.assertNotEqual(r.returncode,0,r.stdout+r.stderr);self.assertNotIn('error[E',r.stdout+r.stderr);self.assertIn('test result: FAILED',r.stdout+r.stderr);self.assertIn(message,r.stdout+r.stderr)
 if __name__=='__main__':unittest.main()
