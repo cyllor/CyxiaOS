@@ -50,6 +50,8 @@ mod prototype_storage;
 compile_error!("tcp-v13-selftest must run as a separate evidence profile");
 #[cfg(feature = "unified-runtime")]
 mod a02_capture;
+#[cfg(feature = "unified-runtime")]
+mod boot_recovery;
 #[cfg(feature = "tcp-v13-selftest")]
 mod cluster_transport;
 #[cfg(feature = "unified-runtime")]

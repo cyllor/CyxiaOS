@@ -512,12 +512,24 @@ pub fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
     // Register the DTB's physical sources before any driver enables a queue.
     startup(1, || crate::domain_platform::init(info));
+    // Install deterministic task/IPC backing before attempting persistence.
+    // Failed boot never creates a fake epoch, coordinator or network identity.
+    startup(3, crate::domain_tasks::init);
+    crate::boot_recovery::init();
     UNIFIED_EVIDENCE.words[24].store(2, Ordering::Release);
-    let boot = crate::prototype_storage::boot(info);
+    let boot = match crate::prototype_storage::try_boot(info) {
+        Ok(boot) => boot,
+        Err(error) => crate::boot_recovery::run(error as u64),
+    };
+    crate::boot_recovery::durable(boot.epoch);
     crate::storage_fault_capture::init(boot);
     crate::a02_capture::init_boot(boot.epoch);
+    startup(3, crate::smp::prototype_runtime::enable_boot_baseline);
+    if !crate::smp::prototype_runtime::boot_model_test() {
+        crate::boot_recovery::run(5);
+    }
+    crate::boot_recovery::model_passed();
     crate::entropy::init(info);
-    startup(3, crate::domain_tasks::init);
     startup(4, crate::domain_storage::init);
     startup(5, || {
         crate::domain_tasks::set_file_service(
@@ -531,6 +543,7 @@ pub fn run(info: &BootInfo) -> ! {
     crate::unified_store::init();
     crate::unified_task::init(boot.epoch, *PEER);
     startup(7, || crate::domain_control::init(boot.epoch));
+    crate::boot_recovery::active();
     startup(8, crate::domain_services::init);
     let mut net = attach(info);
     startup(9, crate::prototype_storage::enable_block_interrupts);

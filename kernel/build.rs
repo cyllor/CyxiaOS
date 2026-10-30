@@ -159,6 +159,8 @@ fn main() {
         let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
         for path in [
             "user/prototype-runtime",
+            "crates/prototype/src/boot_model.rs",
+            "crates/prototype/src/learning/seed.rs",
             "crates/prototype/src/model.rs",
             "crates/prototype/src/features.rs",
             "crates/prototype/src/policy_wire.rs",

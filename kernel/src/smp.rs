@@ -850,6 +850,16 @@ fn transition_request(ownership: &mut Ownership<C>, proposal: ScaleProposal) {
         snapshot.generation,
     );
 }
+#[cfg(feature = "unified-runtime")]
+pub(crate) fn boot_progress() -> [u64; 5] {
+    [
+        ONLINE.load(Ordering::Acquire),
+        PROGRESS[4].load(Ordering::Acquire),
+        PROGRESS[6].load(Ordering::Acquire),
+        IRQS[2].load(Ordering::Acquire),
+        IRQS[3].load(Ordering::Acquire),
+    ]
+}
 pub fn run(info: &BootInfo) -> ! {
     if info.cpu_count != REQUIRED {
         report(

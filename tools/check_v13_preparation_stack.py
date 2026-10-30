@@ -133,6 +133,20 @@ def frame_size(code):
             size += int(pushed[1], 0)
             allocations.add(address)
             continue
+        # LLVM can fold a fixed 16-byte decrement into a post-index STR.
+        # Its store address uses the old SP, but the following frame begins
+        # at SP-offset. Charge the writeback, never silently ignore it.
+        post_store = re.fullmatch(
+            r"(?:[xw](?:[0-9]|[12][0-9]|30)|[xw]zr), \[sp\], #-(0x[0-9a-f]+|[0-9]+)",
+            operands,
+        )
+        if opcode == "str" and post_store:
+            decrement = int(post_store[1], 0)
+            if decrement == 0 or decrement > 256 or decrement % 16:
+                raise ValueError("unrecognized post-index stack allocation")
+            size += decrement
+            allocations.add(address)
+            continue
         if opcode == "b.ne" and probe is not None:
             destination = int(operands.split()[0], 16)
             if destination >= address or probe < size:

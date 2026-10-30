@@ -9,6 +9,9 @@ mod features;
 #[path = "../../crates/prototype/src/model.rs"]
 mod model;
 mod native;
+#[path = "../../crates/prototype/src/boot_model.rs"]
+#[allow(dead_code)]
+mod boot_model;
 #[path = "../../crates/prototype/src/policy_wire.rs"]
 mod policy_wire;
 use abi::*;
@@ -40,6 +43,22 @@ extern "C" fn _start(mode: u64) -> ! {
         5 => loop {
             core::hint::spin_loop();
         },
+        6 | 7 => {
+            // This runs as an isolated EL0 control role before any new proposal
+            // or authenticated network service. Fault mode corrupts only this
+            // invocation's private candidate copy, never the active bank.
+            let mut bytes = core::hint::black_box(domain_model_bytes());
+            if mode == 7 {
+                bytes[MODEL_BYTES - 4] ^= 1;
+            }
+            let passed = boot_model::check(core::hint::black_box(&bytes));
+            unsafe {
+                asm!("svc #0x543", in("x0") boot_model::OUTPUT_MAGIC,
+                    in("x1") u64::from(passed), in("x2") boot_model::CASES as u64,
+                    options(nostack));
+            }
+            abort()
+        }
         0 => (),
         _ => abort(),
     }

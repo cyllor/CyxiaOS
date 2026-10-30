@@ -7,6 +7,9 @@
 use super::*;
 #[path = "../../user/prototype-runtime/abi.rs"]
 mod abi;
+#[cfg(feature = "unified-runtime")]
+#[path = "prototype_runtime/boot_model.rs"]
+mod boot_model;
 #[path = "../../user/prototype-runtime/dynamic.rs"]
 mod dynamic;
 #[cfg(feature = "unified-runtime")]
@@ -275,6 +278,8 @@ fn fresh(mode: u64) -> user::Context {
     context
 }
 pub(super) struct Worker {
+    #[cfg(feature = "unified-runtime")]
+    boot_check: boot_model::Check,
     context: Option<user::Context>,
     preemptions: u64,
     probed: bool,
@@ -288,6 +293,8 @@ pub(super) struct Worker {
 impl Worker {
     pub(super) const fn new() -> Self {
         Self {
+            #[cfg(feature = "unified-runtime")]
+            boot_check: boot_model::Check::new(),
             context: None,
             preemptions: 0,
             probed: false,
@@ -438,7 +445,9 @@ pub fn cancel_learning(
 pub(super) fn step(worker: &mut Worker) {
     #[cfg(feature = "unified-runtime")]
     {
-        native::step(worker);
+        if !worker.boot_check.step() {
+            native::step(worker);
+        }
         return;
     }
     if cpu::slot() == 2 {
@@ -560,11 +569,41 @@ pub(super) fn step(worker: &mut Worker) {
     worker.context = None;
     REQUEST.store(if valid { 3 } else { 4 }, Ordering::Release);
 }
+#[cfg(feature = "unified-runtime")]
+static BOOT_BASELINE_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "unified-runtime")]
+pub(crate) fn enable_boot_baseline() -> Result<(), cyxia_prototype::domains::Error> {
+    assert_eq!(cpu::slot(), 0);
+    if BOOT_BASELINE_READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    crate::domain_tasks::publish_layout(13, 15, 1, 0)?;
+    crate::domain_platform::publish_context(1, 1, 13, 0)?;
+    crate::a02_capture::publish(1, [2, 13, 0, 0, 0, 0]);
+    BOOT_BASELINE_READY.store(true, Ordering::Release);
+    wake_workers();
+    Ok(())
+}
+#[cfg(feature = "unified-runtime")]
+pub(crate) fn boot_model_test() -> bool {
+    boot_model::request();
+    let until = timer::ticks().saturating_add(timer::frequency());
+    loop {
+        if let Some(result) = boot_model::result() {
+            return result;
+        }
+        if timer::ticks() >= until {
+            boot_model::cancel();
+            return false;
+        }
+        unsafe { core::arch::asm!("wfe", options(nostack)) };
+    }
+}
 pub(super) fn business_enter(slot: usize) -> bool {
     assert!((2..4).contains(&slot));
     #[cfg(feature = "unified-runtime")]
     {
-        if !native::ready() {
+        if !native::ready() && !BOOT_BASELINE_READY.load(Ordering::Acquire) {
             return false;
         }
         return crate::domain_tasks::begin_builtin(slot, crate::domain_tasks::now_ns()).is_some();
@@ -628,6 +667,7 @@ fn write_record(records: &mut [[u64; RECORD_WORDS]; RECORDS], record: [u64; RECO
 }
 /// Never terminates after a target number of inferences. The verifier samples
 /// this running service, resumes it and proves forward progress in another sample.
+#[cfg(not(feature = "unified-runtime"))]
 pub(super) fn run(info: &BootInfo) -> ! {
     let boot = super::super::prototype_storage::boot(info);
     let mut coordinator = Coordinator::new(boot);

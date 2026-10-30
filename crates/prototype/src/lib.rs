@@ -4,6 +4,7 @@
 //! Component tests are not proof of native integration or complete acceptance.
 pub mod a10_budget;
 pub mod boot;
+pub mod boot_model;
 pub mod cores;
 pub mod journal;
 pub mod learning;

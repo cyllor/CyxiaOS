@@ -479,10 +479,16 @@ fn publisher(epoch: u64) -> Publisher {
     }
 }
 pub fn init(boot: u64) -> Result<(), Error> {
+    if !crate::boot_recovery::activation_allowed(boot) {
+        return Err(Error::Auth);
+    }
     if boot == 0 {
         return Err(Error::Auth);
     }
-    if !cyxia_arch_aarch64::sha256::selftest() {
+    if !cyxia_arch_aarch64::sha256::selftest()
+        || <[u8; 32]>::from(Sha256::digest(abi::domain_model_bytes()))
+            != cyxia_prototype::boot_model::PARAMETER_HASH
+    {
         return Err(Error::Schema);
     }
     // The actual driver remains idle without protected replay data. Do this

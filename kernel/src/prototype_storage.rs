@@ -493,9 +493,17 @@ impl BlockDevice for NativeDisk {
         self.read(b, o, &mut || {})
     }
     fn write_block(&mut self, b: u32, d: &[u8; BLOCK_SIZE]) -> Result<(), Error> {
+        #[cfg(feature = "unified-runtime")]
+        if crate::boot_recovery::inject(1, u64::from(b)) {
+            return Err(Error::Device);
+        }
         self.write(b, d, &mut || {})
     }
     fn flush(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "unified-runtime")]
+        if crate::boot_recovery::inject(2, 0) {
+            return Err(Error::Device);
+        }
         self.barrier(&mut || {})
     }
     fn recovery_enter(&mut self) {
@@ -511,12 +519,12 @@ impl BlockDevice for NativeDisk {
         self.end_transaction(s)
     }
 }
-fn attach(info: &BootInfo) -> NativeDisk {
+fn attach(info: &BootInfo) -> Result<NativeDisk, BootFailure> {
     let mut selected = None;
     for resource in info
         .virtio
         .get(..info.virtio_count)
-        .expect("DTB virtio count")
+        .ok_or(BootFailure::Device)?
     {
         if resource.base.0 < 0x0a000000
             || resource
@@ -536,23 +544,26 @@ fn attach(info: &BootInfo) -> NativeDisk {
             continue;
         };
         if t.device_id() == 2 {
-            assert!(selected.is_none(), "exactly one boot disk required");
+            if selected.is_some() {
+                return Err(BootFailure::Device);
+            }
             selected = Some((t, resource.base.0, resource.irq));
         }
     }
-    let (t, base, irq) = selected.expect("512 MiB boot disk required");
+    let (t, base, irq) = selected.ok_or(BootFailure::Device)?;
     let device = BatchedBlock::attach(t, unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) }, &Board)
-        .expect("native block FLUSH support");
-    assert_eq!(device.sectors(), u64::from(TOTAL_BLOCKS) * 8);
-    assert!(!device.read_only());
+        .map_err(|_| BootFailure::Device)?;
+    if device.sectors() != u64::from(TOTAL_BLOCKS) * 8 || device.read_only() {
+        return Err(BootFailure::Device);
+    }
     let scheduler = unsafe { &mut *core::ptr::addr_of_mut!(SCHEDULER) };
     scheduler
         .configure_capacity(device.capacity() as u32 * 2, device.capacity() as u32 * 2)
-        .expect("pinned device pool");
+        .map_err(|_| BootFailure::Device)?;
     scheduler
         .recovery_reserve(2, 2)
-        .expect("recovery descriptors");
-    NativeDisk {
+        .map_err(|_| BootFailure::Device)?;
+    Ok(NativeDisk {
         device,
         scheduler,
         object: ObjectKey {
@@ -578,16 +589,25 @@ fn attach(info: &BootInfo) -> NativeDisk {
         busy_at: None,
         doorbell_base: 0,
         latencies: [0; 64],
-    }
+    })
 }
-pub fn boot(info: &BootInfo) -> BootIdentity {
-    assert!(
-        !CLAIMED.swap(true, Ordering::AcqRel),
-        "boot epoch already attempted"
-    );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum BootFailure {
+    AlreadyAttempted = 1,
+    Device = 2,
+    Mount = 3,
+    Epoch = 4,
+}
+/// Only orchestration owns this attempt. An uncertain persistent allocation is
+/// never retried in the same boot, and never replaced with a guessed identity.
+pub fn try_boot(info: &BootInfo) -> Result<BootIdentity, BootFailure> {
+    if CLAIMED.swap(true, Ordering::AcqRel) {
+        return Err(BootFailure::AlreadyAttempted);
+    }
     crate::log(b"STORAGE_V13_MOUNT_BEGIN\n");
     let start = Board.now_ms();
-    let mut disk = attach(info);
+    let mut disk = attach(info)?;
     let (journal, scratch, work) = unsafe {
         (
             &mut *core::ptr::addr_of_mut!(JOURNAL),
@@ -595,12 +615,27 @@ pub fn boot(info: &BootInfo) -> BootIdentity {
             &mut *core::ptr::addr_of_mut!(WORK),
         )
     };
-    let recovery = journal
-        .mount(&mut disk, scratch)
-        .expect("journal recovery; no automatic formatting");
-    let identity = BootSession::new()
-        .allocate(journal, &mut disk, scratch, work)
-        .expect("durable BootEpoch required");
+    let recovery = match journal.mount(&mut disk, scratch) {
+        Ok(recovery) => recovery,
+        Err(_) => {
+            // An error is not a DMA stop proof. Keep the queue, scheduler and
+            // backing pinned; DEVICE_READY remains false for all new users.
+            unsafe { *core::ptr::addr_of_mut!(DISK) = Some(disk) };
+            return Err(BootFailure::Mount);
+        }
+    };
+    #[cfg(feature = "unified-runtime")]
+    crate::boot_recovery::allocating(true);
+    let result = BootSession::new().allocate(journal, &mut disk, scratch, work);
+    #[cfg(feature = "unified-runtime")]
+    crate::boot_recovery::allocating(false);
+    let identity = match result {
+        Ok(identity) => identity,
+        Err(_) => {
+            unsafe { *core::ptr::addr_of_mut!(DISK) = Some(disk) };
+            return Err(BootFailure::Epoch);
+        }
+    };
     disk.object.generation = identity.epoch;
     disk.publish(Board.now_ns());
     let words = [
@@ -629,7 +664,11 @@ pub fn boot(info: &BootInfo) -> BootIdentity {
     }
     DEVICE_READY.store(true, Ordering::Release);
     crate::log(b"STORAGE_V13_BOOT_DURABLE\n");
-    identity
+    Ok(identity)
+}
+#[cfg(not(feature = "unified-runtime"))]
+pub fn boot(info: &BootInfo) -> BootIdentity {
+    try_boot(info).expect("standalone storage probe requires a durable BootEpoch")
 }
 #[cfg(feature = "storage-v13-selftest")]
 pub fn run(info: &BootInfo) -> ! {
@@ -641,7 +680,7 @@ fn acquire() -> Result<(), DomainError> {
     if cyxia_arch_aarch64::cpu::slot() != 0 {
         return Err(DomainError::Auth);
     }
-    if !CLAIMED.load(Ordering::Acquire) {
+    if !DEVICE_READY.load(Ordering::Acquire) {
         return Err(DomainError::NotReady);
     }
     BORROWED

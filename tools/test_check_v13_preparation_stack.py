@@ -63,6 +63,26 @@ class PreparationStackTests(unittest.TestCase):
         code = next(iter(instructions(text).values()))
         self.assertEqual(frame_size(code), 30688)
 
+    def test_post_index_store_charges_exact_sp_writeback(self):
+        for reg, offset in [("xzr", "0x10"), ("x19", "32"), ("wzr", "0x100")]:
+            code = [(0x1000, "sub", "sp, sp, #16"),
+                    (0x1004, "str", f"{reg}, [sp], #-{offset}"),
+                    (0x1008, "bl", "0x2000"),
+                    (0x100c, "add", f"sp, sp, #{16 + int(offset, 0)}"),
+                    (0x1010, "ret", "")]
+            self.assertEqual(frame_size(code), 16 + int(offset, 0))
+
+    def test_post_index_store_cannot_hide_late_or_dynamic_growth(self):
+        with self.assertRaisesRegex(ValueError, "stack write"):
+            frame_size([(0x1000, "sub", "sp, sp, #16"),
+                        (0x1004, "bl", "0x2000"),
+                        (0x1008, "str", "xzr, [sp], #-0x10")])
+        for operand in ["xzr, [sp], #-8", "xzr, [sp], #-0x200",
+                        "xzr, [sp], #0x10", "xzr, [sp], #-0", "xzr, [sp], #x8"]:
+            with self.subTest(operand=operand), self.assertRaises(ValueError):
+                frame_size([(0x1000, "sub", "sp, sp, #16"),
+                            (0x1004, "str", operand), (0x1008, "bl", "0x2000")])
+
     def test_missing_edges_and_dynamic_prologues_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "missing direct preparation path"):
             inspect(chain(False).replace("bl 0x4000", "bl 0x8000")
