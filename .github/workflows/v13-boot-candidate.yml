@@ -1,0 +1,166 @@
+name: V0.13 boot candidate gate
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths:
+      - '.github/workflows/v13-boot-candidate.yml'
+      - '.github/v13-boot-candidate/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v13-boot-candidate-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [static, rust, host, tools]
+    outputs:
+      tree: ${{ steps.candidate.outputs.tree }}
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install exact compiler and prepare reviewed candidate
+        id: candidate
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          python3 .github/v13-boot-candidate/prepare.py
+          cargo fetch --locked
+      - name: Independent engineering lane
+        env:
+          LANE: ${{ matrix.lane }}
+        run: python3 -B tools/prototype.py test --lane "$LANE" --fetch --output "$RUNNER_TEMP/boot-checks"
+      - name: Preserve every lane result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: boot-candidate-${{ matrix.lane }}-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/boot-checks/
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      tree: ${{ steps.candidate.outputs.tree }}
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install exact compiler and prepare reviewed candidate
+        id: candidate
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/boot-evidence"
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          python3 .github/v13-boot-candidate/prepare.py
+          git write-tree > "$RUNNER_TEMP/boot-evidence/tested-tree.txt"
+          git diff HEAD --binary > "$RUNNER_TEMP/boot-evidence/tested.patch"
+          cargo fetch --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+      - name: Compile native pair and validate both preparation stacks
+        id: build
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/boot-pair"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk 2>&1 | tee "$RUNNER_TEMP/boot-evidence/formatter-build.log"
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/boot-pair/a" --identity-b "$RUNNER_TEMP/boot-pair/b" --output "$RUNNER_TEMP/boot-build" --selftest 2>&1 | tee "$RUNNER_TEMP/boot-evidence/native-build.log"
+          for node in a b; do
+            python3 tools/check_v13_preparation_stack.py "$RUNNER_TEMP/boot-build/node-$node.elf" > "$RUNNER_TEMP/boot-evidence/node-$node-stack.json"
+          done
+      - name: Build exact PMU-patched QEMU
+        id: qemu
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/boot-qemu"
+          git -C "$RUNNER_TEMP/boot-qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/boot-qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/boot-qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/boot-qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          cd "$RUNNER_TEMP/boot-qemu"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror
+          ninja -C build qemu-system-aarch64
+          build/qemu-system-aarch64 --version > "$RUNNER_TEMP/boot-evidence/qemu-version.txt"
+          sha256sum build/qemu-system-aarch64 > "$RUNNER_TEMP/boot-evidence/qemu.sha256"
+      - name: Execute all four native boot profiles
+        run: |
+          set -euo pipefail
+          python3 -B tools/run_v13_boot_recovery.py --build "$RUNNER_TEMP/boot-build" --output "$RUNNER_TEMP/boot-evidence/matrix" --formatter "$GITHUB_WORKSPACE/target/debug/examples/prototype-disk" --qemu "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" --qemu-source "$RUNNER_TEMP/boot-qemu" --timeout 60 2>&1 | tee "$RUNNER_TEMP/boot-evidence/matrix.log"
+      - name: Independently preserve A02 isolation regression
+        if: ${{ always() && !cancelled() && steps.build.outcome == 'success' && steps.qemu.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/run_v13_a02.py --build "$RUNNER_TEMP/boot-build" --output "$RUNNER_TEMP/boot-evidence/a02" --formatter "$GITHUB_WORKSPACE/target/debug/examples/prototype-disk" --qemu "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" --qemu-source "$RUNNER_TEMP/boot-qemu" --timeout 90 2>&1 | tee "$RUNNER_TEMP/boot-evidence/a02.log"
+      - name: Preserve raw failures, build logs and public inputs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/boot-evidence/build-logs"
+          if [ -d "$RUNNER_TEMP/boot-build" ]; then
+            find "$RUNNER_TEMP/boot-build" -maxdepth 1 -type f \( -name '*.log' -o -name '*stack.json' -o -name '*manifest.json' \) -exec cp {} "$RUNNER_TEMP/boot-evidence/build-logs/" \;
+          fi
+          if [ -f "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" ]; then
+            cp "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" "$RUNNER_TEMP/boot-evidence/qemu-system-aarch64"
+            git -C "$RUNNER_TEMP/boot-qemu" diff --binary > "$RUNNER_TEMP/boot-evidence/qemu.patch"
+          fi
+          git diff HEAD --binary > "$RUNNER_TEMP/boot-evidence/tested.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: boot-candidate-native-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: error
+          path: ${{ runner.temp }}/boot-evidence/
+  integrate:
+    needs: [checks, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Reproduce exactly tested tree and fast-forward only
+        env:
+          EXPECTED_TREE: ${{ needs.native.outputs.tree }}
+          CHECKS_TREE: ${{ needs.checks.outputs.tree }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+          rustup override set 1.95.0
+          python3 .github/v13-boot-candidate/prepare.py
+          test -n "$EXPECTED_TREE"
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          test "$CHECKS_TREE" = "$EXPECTED_TREE"
+          git fetch origin CyxiaOS-V0.13
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git rm -r .github/v13-boot-candidate .github/workflows/v13-boot-candidate.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(v0.13): preserve safe boot behind durable epoch and EL0 model self-test' -m "Validated candidate tree: $EXPECTED_TREE. All four engineering lanes, four native boot regression profiles and A02 isolation passed. Raw A01 regression does not enrol the full A01 catalogue case. CPU budgets and formal catalogue are unchanged."
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/CyxiaOS-V0.13
+          echo "Integrated $(git rev-parse HEAD); tested candidate $EXPECTED_TREE" >> "$GITHUB_STEP_SUMMARY"
