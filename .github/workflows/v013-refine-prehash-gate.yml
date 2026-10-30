@@ -1,0 +1,98 @@
+name: Refine V0.13 pre-hash budget gate
+
+on:
+  push:
+    branches:
+      - codex/v013-preparation-credit-tail
+    paths:
+      - '.github/workflows/v013-refine-prehash-gate.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Move the universal decision gate immediately before hashing
+        env:
+          BASE_COMMIT: 1b0b49ee6b3e2e33ad4631897f37cab0652b1248
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          base = os.environ["BASE_COMMIT"]
+          prep_path = Path("kernel/src/domain_control/preparation.rs")
+          prep = subprocess.check_output(
+              ["git", "show", f"{base}:{prep_path.as_posix()}"], text=True
+          )
+          import_anchor = """use cyxia_prototype::{
+              domains::{Error, ObjectKey},
+              policy::{ModelBinding, Snapshot},
+          };
+          """
+          helper = """
+          // The candidate input page is hashed in a fixed non-preemptible tail.
+          // Enforce the existing 2 ms decision bound immediately before that tail,
+          // leaving the enclosing 2.5 ms native control credit for rejection and
+          // settlement without weakening either normative limit.
+          pub const DECISION_CPU_LIMIT_NS: u64 = 2_000_000;
+          pub fn check_decision_cpu(elapsed_ns: u64) -> Result<(), Error> {
+              if elapsed_ns > DECISION_CPU_LIMIT_NS {
+                  Err(Error::Budget)
+              } else {
+                  Ok(())
+              }
+          }
+          """
+          if prep.count(import_anchor) != 1:
+              raise SystemExit("preparation import anchor changed")
+          prep = prep.replace(import_anchor, import_anchor + helper, 1)
+          prep += """
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn decision_gate_preserves_two_millisecond_limit() {
+                  assert_eq!(check_decision_cpu(DECISION_CPU_LIMIT_NS), Ok(()));
+                  assert!(matches!(
+                      check_decision_cpu(DECISION_CPU_LIMIT_NS + 1),
+                      Err(Error::Budget)
+                  ));
+              }
+          }
+          """
+          prep_path.write_text(prep)
+
+          control_path = Path("kernel/src/domain_control.rs")
+          control = control_path.read_text()
+          old = "    preparation::check_pre_registration(timer::cpu_elapsed_ns(cpu_started))?;\n"
+          if control.count(old) != 1:
+              raise SystemExit("old pre-registration gate changed")
+          control = control.replace(old, "", 1)
+          anchor = "    let input_bytes = unsafe { &*((input as *const [u64; 512]).cast::<[u8; 4096]>()) };\n"
+          gate = "    preparation::check_decision_cpu(timer::cpu_elapsed_ns(cpu_started))?;\n"
+          if control.count(anchor) != 1:
+              raise SystemExit("pre-hash anchor changed")
+          control_path.write_text(control.replace(anchor, gate + anchor, 1))
+          PY
+          git diff --check
+      - name: Commit source and remove applicator
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/v013-refine-prehash-gate.yml
+          git add kernel/src/domain_control.rs kernel/src/domain_control/preparation.rs
+          git config user.name cyllor
+          git config user.email 45630989+cyllor@users.noreply.github.com
+          git commit -m "fix(v0.13): enforce decision bound before input hash"
+          git push origin HEAD:codex/v013-preparation-credit-tail
