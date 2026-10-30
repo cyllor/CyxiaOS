@@ -73,8 +73,10 @@ def decode_session_exits(data, *, boot, service_generation):
     require(min(r['service_generation'] for r in present) == first_generation,
             'first retained generation does not match bank')
     if auth:
-        require(first_auth['service_generation'] <= latest_auth['service_generation']
-                and first_auth['ms'] <= latest_auth['ms'], 'authenticated slot order mismatch')
+        # Retention follows publication order. Guest time is diagnostic data
+        # and may regress in the very TLS Clock failure being retained.
+        require(first_auth['service_generation'] <= latest_auth['service_generation'],
+                'authenticated slot order mismatch')
         require(auth != 1 or first_auth == latest_auth, 'single authenticated exit differs between slots')
     return dict(scope='first_unauthenticated_first_authenticated_latest_authenticated_per_boot',
                 counts=dict(unauthenticated=unauth, authenticated=auth),
