@@ -41,7 +41,7 @@ fn setup(mode:u64)->(policy::Registry,Vec<u8>,Owner){MODE.store(mode,Ordering::R
   desired:[(mode==3).then_some(Desired{state:ExecutionState::Pending,execution_observed:false})]};(registry,frame(&set,1,0),owner)}
 fn run(mode:u64)->(policy::PlanReceipt,[u64;27],u64,bool){let(mut registry,wire,mut owner)=setup(mode);
  let start=policy::PublicationTime{wall_ns:10,cpu:policy::CpuTime{cpu:1,ns:0}};
- let mut executor=Executor{owner:&mut owner,scope:Scope,model:binding(),evidence:Some(0),job:1,boot:11,publication_started:start,wall_deadline:50_000_010,dependencies:[None;2],scores:[0;32],score_count:4,
+ let mut executor=Executor{owner:&mut owner,scope:Scope,model:binding(),evidence:Some(0),job:1,boot:11,publication_started:start,publication_debit:policy::CpuTime{cpu:1,ns:0},wall_deadline:50_000_010,dependencies:[None;2],scores:[0;32],score_count:4,
  // FACTS_INITIALIZER
  };
  let receipt=registry.submit_job(publisher(),&wire,start,50_000_010,&mut NativeClock,&mut executor).unwrap();let facts=get_facts(&executor);

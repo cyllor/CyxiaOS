@@ -26,6 +26,10 @@ def bundle(owner=False):
 def change(b,name,index,value):
     data=bytearray(b[name]);struct.pack_into('<Q',data,index*8,value);b[name]=bytes(data)
 
+def service_events(events):
+    return b''.join(f'UNIFIED_SERVICE event={event} arg1=0 arg2=0 ms={i}\n'.encode()
+                    for i,event in enumerate(events))
+
 class Acceptance(unittest.TestCase):
     def test_patched_qemu_requires_exact_source_attestation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -60,15 +64,18 @@ class Acceptance(unittest.TestCase):
     def test_service_restart_requires_one_real_fault_and_a_healthy_peer(self):
         restarted=[bundle(),bundle(True)]
         events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
-        for item in restarted:
+        # Node b keeps its existing service context. Reconnecting authenticates
+        # again, but does not re-enter _start or reconstruct the driver.
+        peer_events=[1,2,3,0x211,0x212,3,0x212,0x219]
+        for item,observed in zip(restarted,(events,peer_events)):
             words=list(struct.unpack('<512Q',item['UNIFIED_EVIDENCE']))
-            words[6]=len(events);words[32:]=[0]*480
-            for i,event in enumerate(events):words[32+i*2]=event
+            words[6]=len(observed);words[32:]=[0]*480
+            for i,event in enumerate(observed):words[32+i*2]=event
             item['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
         words=list(struct.unpack('<512Q',restarted[0]['UNIFIED_EVIDENCE']))
         words[13:15]=[11,0x212];words[22]=1;words[30:32]=[2,1]
         restarted[0]['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
-        serial=[b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n',b'']
+        serial=[service_events(events[:5])+b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\nUNIFIED_SERVICE_RESTART boot=1 generation=2\n'+service_events(events[5:]),b'']
         self.assertEqual(len(validate(serial,restarted,[4,4],expect='service-restart')),2)
         changed=copy.deepcopy(restarted);change(changed[0],'UNIFIED_EVIDENCE',31,0)
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
@@ -76,8 +83,36 @@ class Acceptance(unittest.TestCase):
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
         changed=copy.deepcopy(restarted);change(changed[1],'UNIFIED_EVIDENCE',30,2);change(changed[1],'UNIFIED_EVIDENCE',31,1)
         with self.assertRaises(ValueError):validate(serial,changed,[4,4],expect='service-restart')
+        for position in (5,6):
+            changed=copy.deepcopy(restarted);change(changed[1],'UNIFIED_EVIDENCE',32+2*position,0)
+            with self.subTest(missing_peer_event=peer_events[position]),self.assertRaisesRegex(ValueError,'reconcile to READY'):
+                validate(serial,changed,[4,4],expect='service-restart')
     def test_no_ack_cannot_be_mislabelled_successful_handoff(self):
         with self.assertRaises(ValueError):validate([b'DYNAMIC_V13_RECONCILE']*2,[bundle(),bundle(True)],[4,4],expect='no-stop-ack')
+    def test_old_ready_events_cannot_certify_a_restarted_service(self):
+        restarted=[bundle(),bundle(True)]
+        events=[1,2,3,0x211,0x212,1,2,3,0x212,0x219]
+        for item in restarted:
+            words=list(struct.unpack('<512Q',item['UNIFIED_EVIDENCE']))
+            words[6]=len(events);words[32:]=[0]*480
+            for i,event in enumerate(events):words[32+i*2]=event
+            item['UNIFIED_EVIDENCE']=struct.pack('<512Q',*words)
+        for index,value in ((13,11),(14,0x212),(22,1),(30,2),(31,1)):
+            change(restarted[0],'UNIFIED_EVIDENCE',index,value)
+        old=service_events(events)
+        fault=b'UNIFIED_EL0_FAULT generation=1 last_op=11 last_arg0=530 kind=7\n'
+        restart=b'UNIFIED_SERVICE_RESTART boot=1 generation=2\n'
+        # A previous connection supplied all aggregate counters. Generation 2
+        # has started, but has not yet authenticated or reconciled its peer.
+        for after in ([],[1,2,3],[0x212,1,2,3]):
+            with self.subTest(after=after),self.assertRaisesRegex(ValueError,'post-restart'):
+                validate([old+fault+restart+service_events(after),old],restarted,[4,4],expect='service-restart')
+        after=service_events([1,2,3,0x212])
+        self.assertEqual(len(validate([old+fault+restart+after,old],restarted,[4,4],expect='service-restart')),2)
+        with self.assertRaisesRegex(ValueError,'fault boundary'):
+            validate([old+restart+fault+after,old],restarted,[4,4],expect='service-restart')
+        with self.assertRaisesRegex(ValueError,'same-boot'):
+            validate([old+fault+restart.replace(b'generation=2',b'generation=20')+after,old],restarted,[4,4],expect='service-restart')
     def test_negative_cannot_hide_admitted_authority(self):
         with self.assertRaises(ValueError):validate_rejection([b'']*2,[bundle(),bundle(True)],[4,4],'wrong-pin')
     def test_rejection_requires_initialized_custody_and_complete_budget_evidence(self):

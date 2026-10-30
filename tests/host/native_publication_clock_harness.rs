@@ -30,7 +30,7 @@ impl Scope {
 // SUBMISSION_TRACE_MODULE
 struct Executor {
     owner: &'static mut Owner, scope: Scope, model: ModelBinding, publication_started: PublicationTime,
-    wall_deadline: u64, published: usize,provenance:submission::Facts,
+    publication_debit: CpuTime, wall_deadline: u64, published: usize,provenance:submission::Facts,
 }
 impl Executor {
     // NATIVE_PRECOMMIT
@@ -48,6 +48,7 @@ fn fixture(cpu_cost: u64, wall_cost: u64) -> (Executor, Vec<u8>) {
     let mut wire = vec![0; 384]; let used = policy_wire::encode_plan(header, &[d], &mut wire).unwrap(); wire.truncate(used);
     (Executor { owner: Box::leak(Box::new(Owner { prepared_count: 1, families: [Some(Family)] })), scope: Scope { cpu_cost, wall_cost },
         model, publication_started: PublicationTime { wall_ns: 100_000_000, cpu: CpuTime { cpu: 0, ns: 1_000 } },
+        publication_debit: CpuTime { cpu: 0, ns: 0 },
         wall_deadline: 150_000_000, published: 0,provenance:submission::Facts::disabled() }, wire)
 }
 #[test]

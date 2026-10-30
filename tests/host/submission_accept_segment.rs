@@ -2,11 +2,13 @@
 // explicit boundaries. Native callbacks and Registry execute real source.
 struct Gate;impl Gate{fn check_active_publication(&self,_:ModelBinding,_:ObjectKey)->Result<(),Error>{Ok(())}}
 struct SubmitState{owner:Owner,registry:policy::Registry,boot:u64,model_gate:Option<Gate>}
-struct Job{sequence:u64,controller:u64,set:policy::CandidateSet,evidence:Option<usize>,started:u64,dependencies:[Option<BoundDependency>;2],work:Option<()>,read_only:bool}
+struct Job{sequence:u64,controller:u64,set:policy::CandidateSet,evidence:Option<usize>,started:u64,dependencies:[Option<BoundDependency>;2],work:Option<()>,read_only:bool,publication_debit:policy::CpuTime}
 struct Reply{bytes:Vec<u8>,len:usize,scores:[i16;32],action:Action}
-fn submit_fixture(mode:u64)->(SubmitState,Job,Reply){let(registry,wire,owner)=setup(mode);let len=wire.len();(SubmitState{owner,registry,boot:11,model_gate:Some(Gate)},Job{sequence:1,controller:9,set:candidates(),evidence:Some(0),started:10,dependencies:[None;2],work:Some(()),read_only:false},Reply{bytes:wire,len,scores:[0;32],action:Action::CpuWeight(2)})}
+fn submit_fixture(mode:u64)->(SubmitState,Job,Reply){let(registry,wire,owner)=setup(mode);let len=wire.len();(SubmitState{owner,registry,boot:11,model_gate:Some(Gate)},Job{sequence:1,controller:9,set:candidates(),evidence:Some(0),started:10,dependencies:[None;2],work:Some(()),read_only:false,publication_debit:policy::CpuTime{cpu:1,ns:0}},Reply{bytes:wire,len,scores:[0;32],action:Action::CpuWeight(2)})}
 fn actual_submit(s:&mut SubmitState,job:Job,reply:Reply)->(Result<u64,Error>,[u64;27]){
  let publication_started=policy::PublicationTime{wall_ns:10,cpu:policy::CpuTime{cpu:1,ns:0}};
+ let budget=policy::PublicationBudget{started:publication_started,carried:job.publication_debit};
+ let mut registry_completed=false;
  let mut provenance=submission::Facts::new(job.sequence,job.read_only,[2,2,3,3],true);
  let result=(||{
  // ACTUAL_ACCEPT_SUBMIT

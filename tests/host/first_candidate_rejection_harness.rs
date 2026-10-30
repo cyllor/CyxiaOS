@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use cyxia_prototype::{domains::{Action,Error,ObjectKey,ApplyId},
-    policy::{ExecutionState,Candidate,CandidateSet,Snapshot,ModelBinding,BoundDependency},features::RawFeatures,
+    policy::{self,ExecutionState,Candidate,CandidateSet,Snapshot,ModelBinding,BoundDependency},features::RawFeatures,
     learning::Family as LearningFamily};
 use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
 fn key(id:u64)->ObjectKey{ObjectKey{id,generation:1}}
@@ -68,7 +68,7 @@ fn fixture()->(State,Job){
     let choices=[Candidate{action:Action::CpuWeight(1),features:RawFeatures::default()}];
     let set=CandidateSet::new(SNAP,key(12),ModelBinding{generation:1,..ModelBinding::default()},&choices,Some(Action::CpuWeight(1))).unwrap();
     let job=Job{cpu:1,set,sequence:409,controller:1,base_version:0,started:SNAP.taken_ns,encode_ns:598915,evidence:Some(24),
-        dependencies:[None;2],work:None,read_only:false,completion:Some(JobCompletion{result:Err(Error::Busy),selected:0,decoded_ns:57706,
+        dependencies:[None;2],work:None,read_only:false,publication_debit:cyxia_prototype::policy::CpuTime{cpu:1,ns:0},completion:Some(JobCompletion{result:Err(Error::Busy),selected:0,decoded_ns:57706,
         elapsed_ns:204331,cpu_ns:225128,output_hash:[9;32],aborted:false})};
     (State{job:None,boot:1},job)
 }

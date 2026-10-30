@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -41,7 +42,7 @@ class EvidenceCatalogue(unittest.TestCase):
     def native_row(self, root, *, case='A02', filename='summary.json', status='PASS'):
         receipt = root / filename
         receipt.parent.mkdir(parents=True, exist_ok=True)
-        receipt.write_text(json.dumps({'test_id': 'A02', 'status': 'PASS',
+        receipt.write_text(json.dumps({'test_id': case, 'status': 'PASS',
                                        'native_execution_verified': True,
                                        'raw_contract_valid': True}))
         row = copy.deepcopy(next(r for r in self.document['cases'] if r['id'] == case))
@@ -58,6 +59,44 @@ class EvidenceCatalogue(unittest.TestCase):
             row = self.native_row(root)
             with self.assertRaisesRegex(ValueError, 'incomplete native artifact inventory'):
                 self.check_native_row(row, root)
+
+    def test_a10_offline_adapter_is_reported_without_opening_native_admission(self):
+        result = self.check.validate(self.document, ROOT)
+        coverage = result['verifier_coverage']
+        self.assertEqual(coverage['native_receipt_cases'], ['A02'])
+        a10 = coverage['raw_contracts']['A10']
+        self.assertFalse(a10['native_receipt_admitted'])
+        self.assertEqual(a10['offline_verifier_version'], 'a10-offline-v1')
+        self.assertTrue(a10['native_admission_blockers'])
+        self.assertEqual(result['states']['NOT_RUN'], 69)
+
+    def test_a10_producer_pass_without_raw_matrix_inventory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, case='A10')
+            with self.assertRaisesRegex(ValueError, 'matrix-input'):
+                self.check_native_row(row, root)
+
+    def test_a10_complete_raw_contract_does_not_imply_native_receipt_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = self.native_row(root, case='A10')
+            with patch.object(self.check, 'verify_a10_matrix_receipt', return_value={
+                    'raw_matrix_verified': True, 'native_acceptance_status': 'PASS',
+                    'native_execution_verified': True}) as replay:
+                with self.assertRaisesRegex(ValueError, 'A10 native receipt admission remains closed'):
+                    self.check_native_row(row, root)
+                replay.assert_called_once_with(root, source_root=root)
+
+    def test_a10_wrong_summary_name_and_fail_classification_remain_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename, status, message in (
+                    ('other.json', 'PASS', 'A10 receipt must name summary.json'),
+                    ('summary.json', 'FAIL', 'A10 native FAIL classification is not registered')):
+                row = self.native_row(root, case='A10', filename=filename, status=status)
+                with self.subTest(filename=filename, status=status), self.assertRaisesRegex(ValueError, message):
+                    self.check_native_row(row, root)
 
     def test_a02_adapter_requires_canonical_summary_filename(self):
         with tempfile.TemporaryDirectory() as directory:

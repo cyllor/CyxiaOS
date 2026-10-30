@@ -49,6 +49,8 @@ class PreparationAdmission(unittest.TestCase):
             self.assertNotEqual((mutated_code,mutated_evidence),(code,evidence))
             negative=execute(mutated_code,mutated_evidence,'stop')
             self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr)
+            self.assertNotIn('error[E',negative.stdout+negative.stderr)
+            self.assertNotIn('could not compile',negative.stdout+negative.stderr)
             self.assertIn(failure,negative.stdout+negative.stderr)
 
     def test_actual_early_gate_reports_reason_without_new_queries(self):

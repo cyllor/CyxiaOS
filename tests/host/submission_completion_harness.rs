@@ -15,7 +15,7 @@ fn retry_accept(output:&[u64;512])->Result<u64,Error>{with(|s|{
 })}
 // REAL_COMPLETION_EVIDENCE
 fn init_record(){let mut input=[0;512];input[2]=1;input[8]=1;input[9]=1;input[10]=1;input[11]=1;domain_evidence::begin(0,&input,[1;32]);}
-fn job()->Job{let set=candidates();Job{cpu:1,set,sequence:1,controller:9,base_version:0,started:10,encode_ns:1,evidence:Some(0),dependencies:[None;2],work:Some(core_replay::WorkId),read_only:false,completion:None}}
+fn job()->Job{let set=candidates();Job{cpu:1,set,sequence:1,controller:9,base_version:0,started:10,encode_ns:1,evidence:Some(0),dependencies:[None;2],work:Some(core_replay::WorkId),read_only:false,completion:None,publication_debit:policy::CpuTime{cpu:1,ns:0}}}
 fn finalize(s:&mut State,mut job:Job,output:&[u64;512],provenance:submission::Facts,result:Result<u64,Error>)->Result<u64,Error>{
  let selected=u64::MAX;let decoding=25;let publication_ns=0;let cpu_ns=1;let output_hash=[1;32];
  // ACTUAL_FINAL_ACCEPT
