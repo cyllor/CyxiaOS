@@ -237,6 +237,7 @@ pub mod replay;
 mod reply;
 #[path = "domain_control/submission.rs"]
 mod submission;
+mod publication_cost;
 #[path = "domain_control/target_batch.rs"]
 pub(crate) mod target_batch;
 pub use target_batch::Source as TargetSource;
@@ -2308,6 +2309,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             }
             self.provenance.at(submission::Stage::CommitTime);
             let commit = policy::Clock::read(&mut NativeClock);
+            publication_cost::precommit(self.job, commit);
             let commit_ns = commit.wall_ns;
             if commit_ns < at {
                 return Err(Error::Range);
@@ -2439,6 +2441,13 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
         // disjoint evidence intervals below still charge actual execution once.
         let publication_started = policy::Clock::read(&mut NativeClock);
         let wall_begin = publication_started.wall_ns;
+        let (domain, kind) = job.set.get(0).map_or((0, 0), |c| (c.action.domain(), c.action.kind()));
+        publication_cost::begin(
+            [s.boot, job.controller, job.sequence, job.set.target.id,
+                job.set.target.generation, job.set.model.generation,
+                u64::from(domain), u64::from(kind)],
+            job.publication_debit, publication_started,
+        );
         let budget = policy::PublicationBudget {
             started: publication_started,
             carried: job.publication_debit,
@@ -2580,9 +2589,10 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 &reply.bytes[..reply.len],
                 budget,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
-                &mut NativeClock,
+                &mut publication_cost::Clock { inner: &mut NativeClock, job: job.sequence },
                 &mut executor,
             );
+            publication_cost::returned(job.sequence, policy::Clock::read(&mut NativeClock), submitted.as_ref().map_err(|e| *e));
             provenance = executor.provenance;
             drop(executor);
             let receipt = submitted?;
@@ -2621,6 +2631,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 Err(error) => result = Err(error),
             }
         }
+        publication_cost::released(job.sequence, policy::Clock::read(&mut NativeClock));
         // Terminal preflight errors still retain the stopped output hash.
         let output_hash = output_hash.unwrap_or_else(|| {
             decode_cpu_started = Some(timer::cpu_ticks());
@@ -2687,6 +2698,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 publication_started.cpu.ns,
             ]);
         }
+        publication_cost::finish(job.sequence, observed, decoding, result, cap, registry_stopped, local_stop);
         job.completion = Some(JobCompletion {
             result,
             selected,

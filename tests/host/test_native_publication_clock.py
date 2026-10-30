@@ -28,9 +28,11 @@ class NativePublicationClock(unittest.TestCase):
         suffix=body[body.rfind('\n        })();'):] if 'let result = (|| {' in body else '\n    }'
         body=body[:cutoff]+'self.published += 1; Ok(())'+suffix
         template = (ROOT / 'tests/host/native_publication_clock_harness.rs').read_text()
+        template=template.replace('wall_deadline: u64, published:', 'job: u64, wall_deadline: u64, published:').replace('wall_deadline: 150_000_000,', 'job: 1, wall_deadline: 150_000_000,')
         template = template.replace('// NATIVE_CLOCK', function(source, 'impl policy::Clock for NativeClock'))
         template=template.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
         template = template.replace('// NATIVE_PRECOMMIT', body)
+        template+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / 'harness.rs').write_text(template)
