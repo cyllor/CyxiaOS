@@ -777,6 +777,40 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
         raise errors[0]
 
 
+def retain_capture_source(guest, raw, decoded):
+    """Keep sampled raw runs, without claiming all runs or invocations exist.
+
+    The live bank is overwritten by the guest's next observed RunKey. Keep
+    at most64 latest sampled raw banks, one per retained RunKey, in the final
+    JSON. This uses only bytes already read by the stopped-snapshot capture.
+    """
+    if not decoded["present"]:
+        return
+    sequence = struct.unpack_from('<Q', raw, 16)[0]
+    if not sequence or sequence & 1:
+        return
+    history = guest.setdefault("capture_source_history", {
+        "scope": "latest sampled stable raw bank per retained RunKey; sampling and contended probes omit observations",
+        "complete": False, "run_limit": 64, "overflow": False,
+        "first_unretained_run": None, "entries": [],
+    })
+    run = decoded["run"]
+    entries = history["entries"]
+    index = next((i for i, entry in enumerate(entries) if entry["run"] == run), None)
+    if index is None and len(entries) == history["run_limit"]:
+        history["overflow"] = True
+        if history["first_unretained_run"] is None:
+            history["first_unretained_run"] = list(run)
+        return
+    entry = {"run": list(run), "sequence": sequence, "bytes": len(raw),
+             "sha256": hashlib.sha256(raw).hexdigest(),
+             "raw_base64": base64.b64encode(raw).decode('ascii')}
+    if index is None:
+        entries.append(entry)
+    else:
+        entries[index] = entry
+
+
 def progress_diagnostics(guest, bundle):
     """Decode optional bounded diagnostics without replacing functional faults.
 
@@ -866,6 +900,7 @@ def progress_diagnostics(guest, bundle):
                                if replay else None)
                     result["current_replay_run"] = current
                     result["current_run_match"] = result["run"] == current if current else None
+                retain_capture_source(guest, bundle["TRACE_SOURCE_EVIDENCE"], result)
                 return result
             read("capture_source", source)
 
@@ -1291,7 +1326,7 @@ def run(args):
                                    "replay_config_evidence", "replay_capture_evidence",
                                    "local_placement_evidence",
                                    "publication_cost_evidence", "publication_cost",
-                                   "capture_source_evidence", "capture_source",
+                                   "capture_source_evidence", "capture_source", "capture_source_history",
                                    "session_exit_evidence", "session_exits", "progress_diagnostic_status",
                                    "registers", "stack_pa", "diagnostic_errors", "final_parse_error")}
                                  for guest in guests]
