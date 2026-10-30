@@ -9,6 +9,7 @@ on:
       - 'codex/v011-*'
       - 'codex/v012-complete-*'
       - 'codex/v012-governance-*'
+      - 'codex/v013-*'
   workflow_dispatch:
 
 permissions:
