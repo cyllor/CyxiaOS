@@ -338,7 +338,6 @@ def verify_native_child(directory, *, source_root, build_manifest, qemu_binary, 
             and opened['seq'] < created['seq'] < spawned['seq']
             and created['seq'] < connected['seq'] < one('kill')['seq'],
             'native backend endpoint lifecycle mismatch')
-    require(context['host_platform'] == sys.platform, 'native host platform differs from trusted local context')
     if context['host_platform'] in ('darwin', 'linux'):
         require(type(connected['peer_pid']) is int and connected['peer_pid'] == context['pid']
                 and connected['peer_identity'] == 'kernel-pid', 'native NBD peer is not the spawned QEMU')
@@ -704,6 +703,8 @@ def status(value, expected):
 
 def validate_protocol(root, context, layout, inputs, rows, witness):
     """Validate a capture protocol; this alone never grants native admission."""
+    require(context['host_platform'] == sys.platform,
+            'native host platform differs from trusted local context')
     require(safe_path(root, 'serial.bin').stat().st_size <= SERIAL_LIMIT,
             'native encoded serial size bound')
     events = []
@@ -759,6 +760,8 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
     status(take('query-status')[1], 'prelaunch')
     cpus = take('query-cpus-fast')[1]
     memory = take('query-memory-size-summary')[1]
+    # Pinned QEMU qemu_get_thread_id() uses getpid() on Darwin. The PID is
+    # also bound below to spawn/kill/wait and by the caller to the NBD peer.
     require(type(cpus) is list and len(cpus) == 4
             and [cpu.get('cpu-index') for cpu in cpus] == list(range(4))
             and all(cpu.keys() == {'cpu-index', 'thread-id', 'qom-path', 'qom-type', 'props', 'target'}
@@ -769,7 +772,8 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
                     and type(cpu.get('thread-id')) is int and cpu['thread-id'] > 0
                     and cpu.get('qom-path') == f'/machine/unattached/device[{index}]'
                     for index, cpu in enumerate(cpus))
-            and len({cpu['thread-id'] for cpu in cpus}) == 4
+            and (all(cpu['thread-id'] == context['pid'] for cpu in cpus) if sys.platform == 'darwin'
+                 else len({cpu['thread-id'] for cpu in cpus}) == 4)
             and type(memory) is dict and all(type(value) is int for value in memory.values())
             and memory == {'base-memory': 1024**3, 'plugged-memory': 0}, 'wrong QMP platform')
     require(read_json(safe_path(root, 'platform.json')) == dict(cpus=cpus, memory=memory),

@@ -21,6 +21,24 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import verify_v13_a10_native_receipt as native
 
 
+# Actual query-cpus-fast shape from read-only a10nc-20261030-01/prepare,
+# QMP response id 3. Embedded as data in synthetic tests, not native evidence.
+DARWIN_PREPARE_CPUS = [
+    {'thread-id': 31836, 'qom-type': 'cortex-a53-arm-cpu',
+     'props': {'core-id': 0, 'thread-id': 0, 'socket-id': 0, 'cluster-id': 0},
+     'qom-path': '/machine/unattached/device[0]', 'cpu-index': 0, 'target': 'aarch64'},
+    {'thread-id': 31836, 'qom-type': 'cortex-a53-arm-cpu',
+     'props': {'core-id': 1, 'thread-id': 0, 'socket-id': 0, 'cluster-id': 0},
+     'qom-path': '/machine/unattached/device[1]', 'cpu-index': 1, 'target': 'aarch64'},
+    {'thread-id': 31836, 'qom-type': 'cortex-a53-arm-cpu',
+     'props': {'core-id': 2, 'thread-id': 0, 'socket-id': 0, 'cluster-id': 0},
+     'qom-path': '/machine/unattached/device[2]', 'cpu-index': 2, 'target': 'aarch64'},
+    {'thread-id': 31836, 'qom-type': 'cortex-a53-arm-cpu',
+     'props': {'core-id': 3, 'thread-id': 0, 'socket-id': 0, 'cluster-id': 0},
+     'qom-path': '/machine/unattached/device[3]', 'cpu-index': 3, 'target': 'aarch64'},
+]
+
+
 def dtb_fixture(memory_size=1024**3, cpu_count=4, controller=b'arm,cortex-a15-gic\0'):
     names, structure = bytearray(), bytearray()
     def word(value): structure.extend(struct.pack('>I', value))
@@ -62,7 +80,8 @@ def fixture(root, cut=False, layout=None, drains=None):
     from run_v13_a10 import diagnostic_specs
     for index, (_, name, size) in enumerate(diagnostic_specs()):
         layout['diagnostics'].setdefault(name, dict(pa=0x41000000 + index * 0x100000, size=size))
-    context = dict(capture_root=str(root), pid=123, backend_run_id='ab' * 16)
+    context = dict(capture_root=str(root), pid=123, backend_run_id='ab' * 16,
+                   host_platform=sys.platform)
     inputs = dict(mode=1, cut=int(cut), phase='before', sample_ms=30000,
                   capture_timeout_seconds=1920.0)
     rows = [dict(direction='receive', message={'QMP': {'version': {
@@ -93,7 +112,7 @@ def fixture(root, cut=False, layout=None, drains=None):
         event('save', id=ident, name=name, size=size, sha256=hashlib.sha256(data).hexdigest())
     command('qmp_capabilities', {})
     command('query-status', dict(status='prelaunch', running=False))
-    cpus = [dict(**{'cpu-index': i, 'thread-id': 100 + i,
+    cpus = [dict(**{'cpu-index': i, 'thread-id': context['pid'] if sys.platform == 'darwin' else 100 + i,
                    'qom-path': f'/machine/unattached/device[{i}]', 'target': 'aarch64',
                    'qom-type': 'cortex-a53-arm-cpu',
                    'props': {'socket-id': 0, 'cluster-id': 0, 'core-id': i, 'thread-id': 0}})
@@ -319,6 +338,104 @@ class SyntheticChild:
             return native.verify_native_child(self.root, source_root=ROOT,
                 build_manifest=self.build_root/'build-manifest.json', qemu_binary=self.root.parent/'trusted-qemu',
                 qemu_source=self.root.parent/'synthetic-qemu-source')
+
+
+class NativeCpuPlatform(unittest.TestCase):
+    """Controlled local-host contexts; external fixture mocks grant no native proof."""
+    def capture_cpus(self, fixture, cpus, *, host_platform):
+        root = fixture.root
+        context = fixture.read('native-context.json')
+        context.update(pid=31836, host_platform=host_platform)
+        fixture.write('native-context.json', context)
+        platform = fixture.read('platform.json')
+        platform['cpus'] = cpus
+        fixture.write('platform.json', platform)
+        rows = [json.loads(line) for line in (root/'qmp.jsonl').read_text().splitlines()]
+        ident = next(row['message']['id'] for row in rows
+                     if row['message'].get('execute') == 'query-cpus-fast')
+        next(row['message'] for row in rows if row['direction'] == 'receive'
+             and row['message'].get('id') == ident)['return'] = cpus
+        (root/'qmp.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        witness = [json.loads(line) for line in (root/'native-provenance.jsonl').read_text().splitlines()]
+        for row in witness:
+            if 'pid' in row: row['pid'] = 31836
+            if 'peer_pid' in row: row['peer_pid'] = 31836
+        (root/'native-provenance.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in witness))
+        fixture.rehash()
+
+    def test_actual_darwin_cpu_shape_matches_the_owned_process(self):
+        with patch.object(native.sys, 'platform', 'darwin'), tempfile.TemporaryDirectory() as directory:
+            fixture = SyntheticChild(Path(directory))
+            self.capture_cpus(fixture, copy.deepcopy(DARWIN_PREPARE_CPUS), host_platform='darwin')
+            try:
+                child = fixture.verify()
+            except ValueError as error:
+                self.fail('actual Darwin CPU shape rejected in synthetic lifecycle: '+str(error))
+            self.assertEqual(child.context['pid'], 31836)
+            self.assertEqual(child.summary['status'], 'PASS')
+            self.assertEqual(child.summary['native_acceptance_status'], 'NOT_RUN')
+            self.assertIs(child.summary['A10_complete'], False)
+
+    def test_rehashed_cpu_thread_ids_follow_local_platform_rules(self):
+        for host in ('darwin', 'linux'):
+            with patch.object(native.sys, 'platform', host), tempfile.TemporaryDirectory() as directory:
+                fixture = SyntheticChild(Path(directory))
+                valid = [31836]*4 if host == 'darwin' else [31837,31838,31839,31840]
+                cpus = copy.deepcopy(DARWIN_PREPARE_CPUS)
+                for cpu, tid in zip(cpus, valid): cpu['thread-id'] = tid
+                self.capture_cpus(fixture, cpus, host_platform=host)
+                self.assertEqual(fixture.verify().summary['status'], 'PASS')
+                invalid = ([31837]*4, [31836,31836,31836,31837], [31837,31838,31839,31840]) \
+                    if host == 'darwin' else ([31837]*4, [31837,31838,31839,31839])
+                invalid += tuple([bad]+valid[1:] for bad in (0, -1, True, 31836.0, '31836'))
+                for ids in invalid:
+                    with self.subTest(host=host, ids=ids):
+                        for cpu, tid in zip(cpus, ids): cpu['thread-id'] = tid
+                        self.capture_cpus(fixture, cpus, host_platform=host)
+                        with self.assertRaisesRegex(ValueError, 'QMP platform|thread'):
+                            fixture.verify()
+
+    def test_rehashed_host_claim_cannot_select_thread_id_semantics(self):
+        for host, ids in (('darwin', [31836]*4), ('linux', [31837,31838,31839,31840])):
+            with patch.object(native.sys, 'platform', host), tempfile.TemporaryDirectory() as directory:
+                fixture = SyntheticChild(Path(directory))
+                cpus = copy.deepcopy(DARWIN_PREPARE_CPUS)
+                for cpu, tid in zip(cpus, ids): cpu['thread-id'] = tid
+                for claimed in ('linux' if host == 'darwin' else 'darwin', 'unreviewed-host'):
+                    with self.subTest(local=host, claimed=claimed):
+                        self.capture_cpus(fixture, cpus, host_platform=claimed)
+                        with self.assertRaisesRegex(ValueError, 'host platform'):
+                            fixture.verify()
+
+    def test_rehashed_darwin_cpu_pid_cannot_replace_the_owned_process_witness(self):
+        with patch.object(native.sys, 'platform', 'darwin'), tempfile.TemporaryDirectory() as directory:
+            fixture = SyntheticChild(Path(directory))
+            cpus = copy.deepcopy(DARWIN_PREPARE_CPUS)
+            for cpu in cpus: cpu['thread-id'] = 31837
+            self.capture_cpus(fixture, cpus, host_platform='darwin')
+            context = fixture.read('native-context.json')
+            context['pid'] = 31837
+            fixture.write('native-context.json', context)
+            fixture.rehash()
+            with self.assertRaisesRegex(ValueError, 'own-process'):
+                fixture.verify()
+
+    def test_rehashed_darwin_pid_fallback_keeps_four_cpus_and_exact_launch(self):
+        with patch.object(native.sys, 'platform', 'darwin'), tempfile.TemporaryDirectory() as directory:
+            fixture = SyntheticChild(Path(directory))
+            self.capture_cpus(fixture, copy.deepcopy(DARWIN_PREPARE_CPUS[:3]), host_platform='darwin')
+            with self.assertRaisesRegex(ValueError, 'QMP platform'):
+                fixture.verify()
+            self.capture_cpus(fixture, copy.deepcopy(DARWIN_PREPARE_CPUS), host_platform='darwin')
+            original = fixture.read('launch.json')
+            for option, value in (('-smp','1'), ('-accel','tcg,thread=single'), ('-m','512M')):
+                with self.subTest(option=option):
+                    changed = copy.deepcopy(original)
+                    changed['argv'][changed['argv'].index(option)+1] = value
+                    fixture.write('launch.json', changed)
+                    fixture.rehash()
+                    with self.assertRaisesRegex(ValueError, 'native launch'):
+                        fixture.verify()
 
 
 class NativeChildScope(unittest.TestCase):
