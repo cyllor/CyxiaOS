@@ -67,7 +67,7 @@ index f1a1e398c15fd9471fc53e29ab363a3cfeb4876b..ee37c3157764349b08aa5b3682c0e8ec
 -            -C link-arg=-T"$GITHUB_WORKSPACE/user/prototype-governance/linker.ld"
 +            -C link-arg=-T"$GITHUB_WORKSPACE/user/prototype-governance/linker.ld" \
 +            2>&1 | tee "$RUNNER_TEMP/prototype-validation/governance-link.log"
-           test -s "$RUNNER_TEMP/governance-target/aarch64-unknown-none-softfloat/release/prototype-governance"
+           test -s "$CARGO_TARGET_DIR/aarch64-unknown-none-softfloat/release/prototype-governance"
 -      - name: Run non-kernel Rust workspace tests
 -        run: cargo test --locked --offline --workspace --exclude cyxia-kernel
 -      - name: Prepare pinned host fixtures
