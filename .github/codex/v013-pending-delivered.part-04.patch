@@ -1,0 +1,527 @@
+diff --git a/tools/prototype.py b/tools/prototype.py
+index ef28e3996336afc77c4bffe2860db978019a90d1..59eca664466e238d2638b1df654b49de62c0851a 100644
+--- a/tools/prototype.py
++++ b/tools/prototype.py
+@@ -9,7 +9,9 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import os
+ from pathlib import Path
++import signal
+ import subprocess
+ import sys
+ import time
+@@ -18,6 +20,14 @@ from check_prototype_evidence import read_json
+ from check_v13_evidence import DEFAULT, validate
+ from doctor import ROOT, RUST_BIN, TARGET, env
+ 
++# Each engineering gate has one lane; native execution remains separate.
++TEST_LANES = {
++    'static': ('format', 'governance-format', 'clippy', 'governance-clippy'),
++    'rust': ('rust', 'tls'),
++    'host': ('fixtures', 'host'),
++    'tools': ('tools',),
++}
++
+ NATIVE_COMMANDS = {
+     'build': ('build_unified.py', []),
+     'run-single': ('verify_domains.py', ['--single']),
+@@ -25,6 +35,24 @@ NATIVE_COMMANDS = {
+ }
+ 
+ 
++def stop_step(process: subprocess.Popen) -> None:
++    """Terminate only this runner's new process group, then reap its leader."""
++    try:
++        os.killpg(process.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        pass
++    try:
++        process.wait(timeout=2)
++    except subprocess.TimeoutExpired:
++        pass
++    # The group may outlive its leader (for example a nested compiler).
++    try:
++        os.killpg(process.pid, signal.SIGKILL)
++    except ProcessLookupError:
++        pass
++    process.wait(timeout=5)
++
++
+ def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
+     """Retain all independent check results, including launch/interruption errors."""
+     if not steps:
+@@ -49,8 +77,13 @@ def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
+         print(f'{name}: running ({logfile})', flush=True)
+         with logfile.open('x') as log:
+             try:
+-                row['returncode'] = subprocess.run(argv, cwd=ROOT, env=env(),
+-                    stdout=log, stderr=subprocess.STDOUT, check=False).returncode
++                with subprocess.Popen(argv, cwd=ROOT, env=env(), stdout=log,
++                        stderr=subprocess.STDOUT, start_new_session=True) as process:
++                    try:
++                        row['returncode'] = process.wait()
++                    except BaseException:
++                        stop_step(process)
++                        raise
+             except OSError as error:
+                 row['returncode'] = 127
+                 log.write(f'{type(error).__name__}: {error}\n')
+@@ -69,10 +102,10 @@ def run_steps(steps: list[tuple[str, list[str]]], output: Path) -> int:
+     return 130 if interrupted else int(report['status'] != 'PASS')
+ 
+ 
+-def test_steps(fetch: bool) -> list[tuple[str, list[str]]]:
++def test_steps(fetch: bool, lane: str = "all") -> list[tuple[str, list[str]]]:
+     cargo = str(RUST_BIN / 'cargo')
+     python = [sys.executable, '-B']
+-    return [
++    steps = [
+         ('fixtures', python + [str(ROOT / 'tools/prepare_host_tests.py')]
+          + (['--fetch'] if fetch else [])),
+         ('format', [cargo, 'fmt', '--all', '--', '--check']),
+@@ -90,6 +123,12 @@ def test_steps(fetch: bool) -> list[tuple[str, list[str]]]:
+                                '--target-dir', str(ROOT / 'target/prototype-governance'),
+                                '--target', TARGET, '--', '-D', 'warnings']),
+     ]
++    if lane == 'all':
++        return steps
++    if lane not in TEST_LANES:
++        raise ValueError('unknown validation lane: ' + lane)
++    selected = set(TEST_LANES[lane])
++    return [(name, argv) for name, argv in steps if name in selected]
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+@@ -108,13 +147,15 @@ def main(argv: list[str] | None = None) -> int:
+     test = sub.add_parser('test', help='run host validation; keep per-step logs')
+     test.add_argument('--output', type=Path, required=True, help='new evidence directory')
+     test.add_argument('--fetch', action='store_true', help='fetch exact pinned host fixtures')
++    test.add_argument('--lane', choices=['all', *TEST_LANES], default='all',
++                      help='independent CI lane; default runs all host validation gates')
+     report = sub.add_parser('report', help='independently validate the 1.3 catalogue')
+     report.add_argument('--manifest', type=Path, default=DEFAULT)
+     report.add_argument('--output', type=Path, help='optional new JSON file; otherwise stdout')
+     args = parser.parse_args(argv)
+     try:
+         if args.command == 'test':
+-            return run_steps(test_steps(args.fetch), args.output)
++            return run_steps(test_steps(args.fetch, args.lane), args.output)
+         result = validate(read_json(args.manifest), ROOT)
+         text = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
+         if args.output is not None:
+diff --git a/tools/run_v13_a02.py b/tools/run_v13_a02.py
+index f6b2a85f14d1d64fdf5765bb4359e6c7901b246b..36601dc4a94a22f8926a583f64533a846567e6d9 100644
+--- a/tools/run_v13_a02.py
++++ b/tools/run_v13_a02.py
+@@ -22,6 +22,7 @@ import tempfile
+ import time
+ 
+ from build_unified import code_source_map
++from verify_unified import attest_qemu
+ from check_elf import boot_profile, inspect_elf, symbol
+ from run_qemu import Qmp
+ from transport import FrameDecoder
+@@ -92,7 +93,8 @@ def _json(path: Path, value) -> None:
+     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+ 
+ 
+-def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict:
++def run(build: Path, output: Path, formatter: Path, timeout: float = 90, *,
++        qemu: Path | None = None, qemu_source: Path | None = None) -> dict:
+     require(5 <= timeout <= 300, 'invalid bounded runtime')
+     build = build.resolve(strict=True)
+     output = output.resolve()
+@@ -152,12 +154,12 @@ def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict
+         # A newly formatted volume has no allocated BootEpoch yet. The durable
+         # decoder deliberately rejects epoch zero; decode after the real boot.
+         _json(output / 'disk-before.json', dict(sha256=sha(disk), boot_epoch=0, uuid=filesystem_id))
+-        binary = shutil.which('qemu-system-aarch64')
++        binary = str(qemu.resolve(strict=True)) if qemu is not None else shutil.which('qemu-system-aarch64')
+         require(binary is not None, 'QEMU is missing')
+-        version = subprocess.check_output([binary, '--version'], text=True, timeout=10)
+-        require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
+-                'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
+-        _json(output / 'tools.json', dict(qemu_version=version, qemu_sha256=sha(Path(binary)),
++        qemu_identity = attest_qemu(binary, qemu_source)
++        if qemu_identity['qemu_pmu_patch_attested']:
++            qemu_identity['qemu_source_directory'] = str(qemu_source.resolve(strict=True))
++        _json(output / 'tools.json', dict(**qemu_identity,
+               formatter_sha256=sha(formatter), build_tools=manifest['tools']))
+         with tempfile.TemporaryDirectory(prefix='cyx-a02-') as temporary, \
+                 (output / 'qemu-stderr.log').open('wb') as errors:
+@@ -281,7 +283,7 @@ def run(build: Path, output: Path, formatter: Path, timeout: float = 90) -> dict
+     _json(output / 'summary.json', report)
+     if report['status'] == 'PASS':
+         try:
+-            report['independent_receipt'] = verify_native_receipt(output)
++            report['independent_receipt'] = verify_native_receipt(output, qemu_source=qemu_source)
+             report.update(execution_flags(True))
+         except (OSError, ValueError, KeyError, struct.error) as error:
+             report.update(status='FAIL', native_acceptance_status='NOT_RUN', **execution_flags(False),
+@@ -296,9 +298,12 @@ def main():
+     parser.add_argument('--output', required=True, type=Path)
+     parser.add_argument('--formatter', required=True, type=Path)
+     parser.add_argument('--timeout', type=float, default=90)
++    parser.add_argument('--qemu', type=Path, help='explicit pinned QEMU binary')
++    parser.add_argument('--qemu-source', type=Path, help='exact source for the pinned PMU-patched build')
+     args = parser.parse_args()
+     try:
+-        result = run(args.build, args.output, args.formatter, args.timeout)
++        result = run(args.build, args.output, args.formatter, args.timeout,
++                     qemu=args.qemu, qemu_source=args.qemu_source)
+         print(json.dumps(result, indent=2))
+         return 0 if result['status'] == 'PASS' else 1
+     except (OSError, ValueError, KeyError) as error:
+diff --git a/tools/test_control_settlement_evidence.py b/tools/test_control_settlement_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..04a833c091e52776c44487c100b55f4c1ddd76f1
+--- /dev/null
++++ b/tools/test_control_settlement_evidence.py
+@@ -0,0 +1,71 @@
++import struct
++import unittest
++import verify_domains as verifier
++import test_verify_domains as fixtures
++from test_verify_domains import encode
++
++
++class ControlSettlementEvidenceTests(unittest.TestCase):
++    def bank(self):
++        w = [0] * 64
++        w[:2] = [0x4359435345540001, 1]
++        w[2:17] = [2,1,42,7,0,10_000_000,13_000_000,2_500_000,3_000_000,
++                   2_500_000,3_000_000,2_500_000,3_000_000,1,6]
++        return w
++
++    def test_control_failure_survives_task_quarantine_and_final_export(self):
++        guest = {}
++        snapshot = fixtures.EvidenceParserTests().snapshot(overrun=True)
++        snapshot['CONTROL_SETTLEMENT_EVIDENCE'] = encode(self.bank())
++        snapshot['GOVERNANCE_V13_EVIDENCE'] = encode([0]*16)
++        snapshot['GOVERNANCE_RUNTIME_V13_EVIDENCE'] = encode([0]*64)
++        with self.assertRaisesRegex(ValueError, 'overrun/quarantine'):
++            verifier.refresh_snapshot(guest,snapshot)
++        self.assertEqual(guest.get('control_settlement_evidence'),self.bank())
++        self.assertEqual(guest['control_settlements'][0]['actual_ns'],3_000_000)
++        retained = verifier.retained_observation(guest)
++        self.assertEqual(retained['control_settlement_evidence'],self.bank())
++        self.assertEqual(retained['governance_runtime_evidence'],[0]*64)
++        self.assertEqual(retained['governance_evidence'],[0]*16)
++        verifier.refresh_snapshot(guest,fixtures.EvidenceParserTests().snapshot())
++        self.assertIsNone(guest['control_settlement_evidence'])
++        self.assertIsNone(guest['control_settlements'])
++
++    def test_sticky_failure_rejects_an_older_healthy_task_snapshot(self):
++        snapshot = fixtures.EvidenceParserTests().snapshot()
++        snapshot['CONTROL_SETTLEMENT_EVIDENCE'] = encode(self.bank())
++        with self.assertRaisesRegex(ValueError,'physical control settlement'):
++            verifier.refresh_snapshot({},snapshot)
++
++    def test_empty_is_not_a_failure_and_partial_is_not_a_complete_receipt(self):
++        self.assertEqual(verifier.parse_control_settlements(encode([0]*64)),[])
++        w=self.bank();w[2]=1
++        rows=verifier.parse_control_settlements(encode(w))
++        self.assertEqual(rows,[{'cpu':1,'complete':False}])
++        w[0]=0
++        with self.assertRaises(ValueError):
++            verifier.parse_control_settlements(encode(w))
++
++    def test_completed_row_is_bound_to_its_slot_credit_and_arithmetic(self):
++        parsed=verifier.parse_control_settlements(encode(self.bank()))[0]
++        self.assertEqual((parsed['cpu'],parsed['sequence'],parsed['reserved_ns']),(1,42,2_500_000))
++        self.assertTrue(parsed['complete'])
++        for index,value in [(0,1),(1,0),(3,2),(4,0),(5,0),(6,1),(8,1),
++                            (9,0),(11,1),(12,1),(13,1),(14,1),(15,0),(16,5),(63,1)]:
++            with self.subTest(index=index):
++                w=self.bank();w[index]=value
++                with self.assertRaises(ValueError):
++                    verifier.parse_control_settlements(encode(w))
++
++    def test_governance_failure_keeps_raw_snapshot_deadline_and_bill(self):
++        snapshot=fixtures.EvidenceParserTests().snapshot()
++        w=[0]*64;w[48]=0x701;w[54:56]=[60_000_000,10_000_000]
++        snapshot['GOVERNANCE_RUNTIME_V13_EVIDENCE']=encode(w)
++        guest={}
++        with self.assertRaisesRegex(ValueError,'governance runtime fault'):
++            verifier.refresh_snapshot(guest,snapshot)
++        kept=verifier.retained_observation(guest)
++        self.assertIsNone(kept['governance_runtime'])
++        self.assertEqual(kept['governance_runtime_evidence'],w)
++
++if __name__=='__main__':unittest.main()
+diff --git a/tools/test_verify_domains.py b/tools/test_verify_domains.py
+index 914c235b06b97e4b94ef20f4d6430da7aeea183f..0175a580e8ab4d744e766cb51011d0d112094888 100644
+--- a/tools/test_verify_domains.py
++++ b/tools/test_verify_domains.py
+@@ -741,6 +741,29 @@ class EvidenceParserTests(unittest.TestCase):
+         with self.assertRaisesRegex(ValueError, 'runtime fault 7'):
+             parse_governance_runtime(encode(values))
+ 
++    def test_governance_contiguous_command_uses_five_physical_turns(self):
++        values = self.governance_runtime()
++        # Four separate isolation/timer probes, then one prepaid command turn
++        # covering preparation, one EL0 entry and canonical validation.
++        values[7], values[60], values[61] = 5, 4, 1
++        self.assertTrue(parse_governance_runtime(encode(values))["completed"])
++
++    def test_governance_entries_cannot_exceed_paid_turns(self):
++        values = self.governance_runtime()
++        values[7], values[60], values[61] = 7, 4, 4
++        with self.assertRaisesRegex(ValueError, "registered C owner"):
++            parse_governance_runtime(encode(values))
++
++    def test_governance_contiguous_turn_keeps_deadline_and_cost_gates(self):
++        for index, bad in ((9, 2_500_001), (42, 2_500_001), (43, 2_500_001),
++                           (47, 0), (17, 60_000_000), (10, 0), (60, 3), (61, 0)):
++            with self.subTest(index=index):
++                values = self.governance_runtime()
++                values[7] = 5
++                values[index] = bad
++                with self.assertRaises(ValueError):
++                    parse_governance_runtime(encode(values))
++
+     def test_independent_operator_selftest_is_never_training(self):
+         values = self.learning()
+         result = parse_learning(encode(values))
+diff --git a/tools/verify_domains.py b/tools/verify_domains.py
+index 8a83716db339048fa5480489b42de8b1a595da62..3ed4d3327cf4b4c531eda5203204e219521ebc30 100644
+--- a/tools/verify_domains.py
++++ b/tools/verify_domains.py
+@@ -41,6 +41,7 @@ CONTROL_MAGIC = 0x435958444F4D3031
+ UNIFIED_MAGIC = 0x435958554E493031
+ IPI_MAGIC = 0x4359495049000001
+ CONTROL_CREDIT_MAGIC = 0x4359434352454401
++CONTROL_SETTLEMENT_MAGIC = 0x4359435345540001
+ CONTROL_POOL_MAGIC = 0x435943504F4F4C01
+ LEARNING_MAGIC = 0x43594C4541524E01
+ GOVERNANCE_MAGIC = 0x4359474F56455201
+@@ -68,7 +69,7 @@ REQUIRED = {
+     "CONTROL_CREDIT_EVIDENCE": 512,
+     "IPI_EVIDENCE": 4096,
+ }
+-OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
++OPTIONAL = {"CONTROL_SETTLEMENT_EVIDENCE": 512, "DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDENCE": 576,
+             "FILE_SERVICE_EVIDENCE": 512,
+             "TASK_VECTOR_EVIDENCE": 512,
+             "TASK_SPAWN_EVIDENCE": 256,
+@@ -239,6 +240,54 @@ def parse_ipi(data):
+     }
+ 
+ 
++
++def parse_control_settlements(data):
++    """Diagnostic receipt, never an authorization or a complete runtime proof."""
++    w = words(data, 64)
++    if not any(w):
++        return []
++    require(w[0] == CONTROL_SETTLEMENT_MAGIC and w[1] > 0,
++            "unsealed or invalid physical control settlement header")
++    require(not any(w[50:]), "physical control settlement reserved words")
++    names = ("cpu", "sequence", "core_generation", "window", "started_ns",
++             "finished_ns", "reserved_ns", "actual_ns", "control_prepaid_ns",
++             "control_actual_ns", "physical_prepaid_ns", "physical_actual_ns",
++             "flags", "error")
++    rows = []
++    maximum = (1 << 64) - 1
++    for cpu, offset in ((1, 2), (2, 26)):
++        row = w[offset:offset+24]
++        require(row[0] in (0, 1, 2), "invalid physical control settlement state")
++        if row[0] == 0:
++            require(not any(row), "payload without physical control settlement")
++            continue
++        if row[0] == 1:
++            rows.append({"cpu": cpu, "complete": False})
++            continue
++        require(row[1] == cpu and row[2] > 0 and row[3] > 0
++                and row[4] == row[5] // 100_000_000 and row[6] >= row[5]
++                and 0 < row[7] <= row[9] <= 70_000_000
++                and row[9] <= row[11] <= 90_000_000
++                and row[14] == 6 and not any(row[15:]),
++                "invalid physical control settlement identity/credit")
++        control = min(maximum, row[9] - row[7] + row[8])
++        physical = min(maximum, row[11] - row[7] + row[8])
++        end = min(maximum, (row[4] + 1) * 100_000_000)
++        flags = (int(row[8] > row[7]) | (int(row[6] > end) << 1)
++                 | (int(control > 70_000_000) << 2)
++                 | (int(physical > 90_000_000) << 3))
++        require(row[10] == control and row[12] == physical and row[13] == flags,
++                "physical control settlement arithmetic mismatch")
++        # Cross-window carry may exhaust capacity even when this single slice
++        # stayed within its credit. The authoritative Budget result is kept;
++        # a diagnostic flag must not replace the scheduler's decision.
++        require(flags != 0, "physical control settlement has no budget/carry cause")
++        rows.append(dict(zip(names, row[1:15]), complete=True))
++    require(rows and w[1] >= sum(row["complete"] for row in rows),
++            "physical control settlement count mismatch")
++    return rows
++
++
+ def parse_control_credit(data):
+     w = words(data, 64)
+     require(w[0] in (0, CONTROL_CREDIT_MAGIC), "invalid control credit evidence header")
+@@ -429,7 +478,10 @@ def parse_governance_runtime(data):
+         return None
+     require(w[0] == GOVERNANCE_RUNTIME_MAGIC and w[1] == 1 and w[2] == 8,
+             "invalid governance runtime completion header")
+-    require(w[6] == 1 and w[7] >= 6 and w[60] >= 4 and w[61] >= 1,
++    # Four probe entries remain separate. Preparation, one command entry and
++    # validation may share a prepaid turn; no turn may hide a second EL0 entry.
++    require(w[6] == 1 and w[60] >= 4 and w[61] >= 1
++            and w[7] >= w[60] + w[61],
+             "governance role did not execute on the registered C owner")
+     require(w[3] > 0 and w[4] > 0 and w[5] > 0
+             and w[56:59] == (w[3], w[4], w[3]),
+@@ -646,6 +698,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
+                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
+                                     ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
+                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
++                                    ("CONTROL_SETTLEMENT_EVIDENCE", "control_settlement_evidence", 64),
+                                     ("RUNTIME_V13_EVIDENCE", "runtime_evidence", 1024),
+                                     ("TASK_SLICE_EVIDENCE", "slice_evidence", 128),
+                                     ("IPI_EVIDENCE", "ipi_evidence", 512),
+@@ -689,6 +742,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
+             "builtin_detail": guest.get("builtin_detail"),
+             "sticky_count": sticky_words[1] if len(sticky_words) > 1 else 0,
+             "receipts": rows,
++            "control_settlement_words": guest.get("control_settlement_evidence"),
+         }
+ 
+     def parse_task_snapshot(data):
+@@ -703,7 +757,8 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
+                     + json.dumps(detail, separators=(",", ":"))) from error
+             raise
+ 
+-    for symbol_name, key, parser in (("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
++    for symbol_name, key, parser in (("CONTROL_SETTLEMENT_EVIDENCE", "control_settlements", parse_control_settlements),
++                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
+                                      ("DOMAIN_PREPARATION_REJECTIONS", "rejected_preparations", parse_preparation_rejections),
+                                      ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
+                                      ("DOMAIN_TASK_EVIDENCE", "tasks", parse_tasks),
+@@ -731,6 +786,9 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
+                 }
+                 check(key, not guest[key],
+                       "native C credit failure: " + json.dumps(detail, separators=(",", ":")))
++    check("control_settlements", not guest.get("control_settlements"),
++          "native physical control settlement failure: "
++          + json.dumps(guest.get("control_settlements"), separators=(",", ":")))
+     mapping = guest.get("governance")
+     governance_runtime = guest.get("governance_runtime")
+     # The mapping is installed before the independent EL0 role finishes its
+@@ -1313,15 +1371,22 @@ def run(args):
+         report["wall_seconds"] = time.monotonic() - started
+         if reconnect is not None:
+             report["reconnect_evidence"] = reconnect.evidence()
+-        report["observations"] = [{key: guest.get(key) for key in
+-                                  ("argv", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "baseline_service_evidence", "overrun_evidence", "panic_evidence",
++        report["observations"] = [retained_observation(guest) for guest in guests]
++        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
++        os.umask(previous_umask)
++    return report
++
++
++def retained_observation(guest):
++    """Only current stopped-snapshot fields; preserve raw banks on parser failure."""
++    return {key: guest.get(key) for key in ("argv", "service_stage_word", "unified", "unified_words", "control", "tasks", "ipi", "task_evidence", "file_service_evidence", "task_vector_evidence", "task_spawn_evidence", "baseline_service_evidence", "overrun_evidence", "panic_evidence",
+                                    "trace_control_evidence", "trace_task_evidence", "trace_work_evidence", "trace_closing_evidence",
+                                    "trace_drain_work_evidence", "trace_drain_task_evidence",
+                                    "trace_preparation_root_evidence", "trace_preparation_owner_evidence",
+                                    "network_piece_evidence", "network_settlement_evidence",
+                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
+-                                   "control_credit", "control_credit_evidence", "preparation_evidence", "preparation_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
+-                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence", "replay", "replay_evidence",
++                                   "control_credit", "control_credit_evidence", "control_settlement_evidence", "control_settlements", "preparation_evidence", "preparation_detail", "preparation_prefix_detail", "preparation_entry_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
++                                   "control_pool", "control_pool_evidence", "learning", "learning_evidence", "governance", "governance_evidence", "governance_runtime", "governance_runtime_evidence", "replay", "replay_evidence",
+                                    "replay_root_evidence", "replay_owner_evidence",
+                                    "replay_config_evidence", "replay_capture_evidence",
+                                    "local_placement_evidence",
+@@ -1329,10 +1394,6 @@ def run(args):
+                                    "capture_source_evidence", "capture_source", "capture_source_history",
+                                    "session_exit_evidence", "session_exits", "progress_diagnostic_status",
+                                    "registers", "stack_pa", "diagnostic_errors", "final_parse_error")}
+-                                 for guest in guests]
+-        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+-        os.umask(previous_umask)
+-    return report
+ 
+ 
+ def main():
+diff --git a/tools/verify_v13_a02.py b/tools/verify_v13_a02.py
+index 215e3e902132ac82f38049a70ea809dd430a7273..cd28b048ce9756b9bffda0b9b62ae8619341b13e 100644
+--- a/tools/verify_v13_a02.py
++++ b/tools/verify_v13_a02.py
+@@ -116,6 +116,43 @@ def verify_stopped_status(statuses: list[dict]):
+             and status.get('singlestep', False) is False, 'invalid stopped VM status')
+ 
+ 
++def verify_native_qemu(tools: dict, binary: Path, *, qemu_source: Path | None = None) -> None:
++    """Recheck the local binary; a dirty version string alone is never trusted.
++
++    Legacy stock captures retain their original hash/version contract. Patched
++    captures must match the repository's fixed commit, complete tracked diff,
++    source digests, patch and binary again during independent receipt replay.
++    """
++    from verify_unified import attest_qemu
++    version = tools.get('qemu_version', '')
++    require(isinstance(version, str) and version.splitlines(), 'missing QEMU version')
++    require(isinstance(tools.get('qemu_sha256'), str)
++            and re.fullmatch('[0-9a-f]{64}', tools['qemu_sha256'])
++            and sha256(Path(binary)) == tools['qemu_sha256'], 'QEMU binary identity changed')
++    clean = ('QEMU emulator version 10.2.2', 'QEMU emulator version 10.2.2 (v10.2.2)')
++    if version.splitlines()[0] in clean:
++        require(tools.get('qemu_pmu_patch_attested', False) is False,
++                'stock QEMU cannot claim the PMU patch')
++        return
++    source = tools.get('qemu_source_directory')
++    require(tools.get('qemu_pmu_patch_attested') is True and isinstance(source, str)
++            and Path(source).is_absolute(), 'patched QEMU source attestation missing')
++    # Never run git in an archive-selected directory. The replay caller must
++    # explicitly select the trusted emulator checkout, just like the runner.
++    require(qemu_source is not None and qemu_source.resolve(strict=True)
++            == Path(source).resolve(strict=True), 'explicit trusted QEMU source required')
++    trusted = qemu_source.resolve(strict=True)
++    built = trusted / 'build/qemu-system-aarch64'
++    require(built.is_file() and sha256(built) == sha256(binary),
++            'receipt binary differs from explicit trusted source build')
++    # The receipt chooses no executable either: run --version only on the
++    # caller-selected source build, after binding the archived binary digest.
++    actual = attest_qemu(built.resolve(strict=True), trusted)
++    require(actual.get('qemu_pmu_patch_attested') is True
++            and all(tools.get(key) == value for key, value in actual.items()),
++            'patched QEMU attestation changed')
++
++
+ def verify_capture_revision(runner_sha256: str, verifier_sha256: str):
+     project = Path(__file__).resolve().parents[1]
+     current = tuple(sha256(project / 'tools' / name)
+@@ -310,7 +347,8 @@ def verify(trace: bytes, counters: bytes, *, image_sha256: str,
+                 scope='Raw capture contract only; use the native runner and its provenance for execution evidence.')
+ 
+ 
+-def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -> dict:
++def verify_native_receipt(directory: Path, *, source_root: Path | None = None,
++                          qemu_source: Path | None = None) -> dict:
+     """Replay known native evidence, ignoring the producer's PASS boolean.
+ 
+     This is process/launch/capture provenance, not a hardware attestation or a
+@@ -352,9 +390,7 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -
+     verify_capture_revision(sha256(path('run_v13_a02.py')), sha256(path('verify_v13_a02.py')))
+     require({'cargo', 'rustc', 'clang'} <= build['tools'].keys(), 'missing build tools')
+     tools = document('tools.json')
+-    require(tools['build_tools'] == build['tools'] and tools['qemu_version'].splitlines()[0]
+-            in ('QEMU emulator version 10.2.2', 'QEMU emulator version 10.2.2 (v10.2.2)')
+-            and re.fullmatch('[0-9a-f]{64}', tools['qemu_sha256']), 'unverified native QEMU/toolchain')
++    require(tools['build_tools'] == build['tools'], 'unverified native toolchain')
+     image = path('node-a.elf').read_bytes()
+     inspect_elf(image)
+     require(boot_profile(image)['ram_mib'] == 1024, 'wrong native image RAM profile')
+@@ -430,7 +466,7 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None) -
+             'unexpected native loader/device')
+     require(options['-drive'] == [f'if=none,id=disk0,format=raw,file={path("disk.raw")},cache=writeback'],
+             'wrong native disk attachment')
+-    require(sha256(Path(launch[0])) == tools['qemu_sha256'], 'QEMU binary identity changed')
++    verify_native_qemu(tools, Path(launch[0]), qemu_source=qemu_source)
+     transcript = read_native_qmp(root)
+     requests, responses = [], {}
+     for item in transcript:
