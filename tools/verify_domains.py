@@ -91,6 +91,7 @@ OPTIONAL = {"DYNAMIC_V13_EVIDENCE": 4096, "PANIC_EVIDENCE": 64, "SMP_FAULT_EVIDE
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
+            "DOMAIN_PUBLICATION_COST": 1024, "TRACE_SOURCE_EVIDENCE": 1024,
             "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256,
             "DOMAIN_PREPARATION_PREFIX_DETAIL": 128,
             "DOMAIN_PREPARATION_ENTRY_DETAIL": 128}
@@ -618,6 +619,8 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
     else:
         guest["service_stage_word"] = None
     for symbol_name, key, count in (("DOMAIN_TASK_EVIDENCE", "task_evidence", 32),
+                                    ("DOMAIN_PUBLICATION_COST", "publication_cost_evidence", 128),
+                                    ("TRACE_SOURCE_EVIDENCE", "capture_source_evidence", 128),
                                     ("FILE_SERVICE_EVIDENCE", "file_service_evidence", 64),
                                     ("TASK_VECTOR_EVIDENCE", "task_vector_evidence", 64),
                                     ("TASK_SPAWN_EVIDENCE", "task_spawn_evidence", 32),
@@ -774,6 +777,115 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
         raise errors[0]
 
 
+def progress_diagnostics(guest, bundle):
+    """Decode optional bounded diagnostics without replacing functional faults.
+
+    Raw banks belong to this snapshot even when ordinary parsing has failed.
+    Interrupted publications remain raw evidence, never completed records.
+    """
+    guest["publication_cost"] = guest["capture_source"] = None
+    guest["session_exit_evidence"] = guest["session_exits"] = None
+    guest["progress_diagnostic_status"] = {}
+    errors = []
+
+    def read(key, parser):
+        try:
+            guest[key] = parser()
+        except ValueError as error:
+            errors.append(error)
+            guest["diagnostic_errors"].append({"field": key, "error": str(error)})
+
+    raw = bundle.get("UNIFIED_EVIDENCE", b"")
+    u = words(raw, 512) if len(raw) == 4096 else None
+
+    def snapshot_boot():
+        require(u is not None and u[0] == UNIFIED_MAGIC and u[1] > 0,
+                "progress diagnostics require the captured BootEpoch")
+        return u[1]
+
+    p = guest.get("publication_cost_evidence")
+    if p is not None:
+        def publication():
+            try:
+                from .publication_cost import decode_publication_cost, bind_publication_stop
+            except ImportError:
+                from publication_cost import decode_publication_cost, bind_publication_stop
+            complete = list(p)
+            expected = {}
+            pending = []
+            for cpu in (1, 2):
+                start = (cpu - 1) * 64
+                row = p[start:start + 64]
+                if any(row) and row[63] == 0:
+                    pending.append(cpu)
+                    complete[start:start + 64] = [0] * 64
+                elif any(row):
+                    expected[cpu] = {"boot": snapshot_boot()}
+            guest["progress_diagnostic_status"]["publication_cost"] = {"in_progress_cpus": pending}
+            rows = decode_publication_cost(struct.pack('<128Q', *complete), expected)
+            context = None
+            control = bundle.get("DOMAIN_CONTROL_EVIDENCE", b"")
+            if len(control) == CONTROL_WORDS * 8:
+                ctl = words(control, CONTROL_WORDS)
+                if ctl[160] == 0x43594f5053540001:
+                    if not ctl[191] or ctl[191] & 1:
+                        guest["progress_diagnostic_status"]["publication_cost"]["stop_receipt"] = "in_progress"
+                    else:
+                        require(ctl[0] == CONTROL_MAGIC and ctl[1] == 1
+                                and ctl[2] == snapshot_boot() and ctl[161] == 1 and ctl[162] > 0,
+                                "invalid original publication stop header")
+                        context = ctl[164:184]
+            for row in rows:
+                row["charged_stop"] = None
+                if context is not None and (row["boot"], row["controller"], row["job"], row["cpu"]) == (
+                        context[2], context[3], context[4], context[18]):
+                    bound = bind_publication_stop(row, context)
+                    row["charged_stop"] = {key: bound[key] for key in (
+                        "charged_cumulative_ns", "charged_publication_ns", "final_result_version",
+                        "final_result_error", "final_stop_flags")}
+                    row["charged_stop_bound"] = True
+            return rows
+        read("publication_cost", publication)
+
+    c = guest.get("capture_source_evidence")
+    if c is not None:
+        if c[2] & 1:
+            guest["progress_diagnostic_status"]["capture_source"] = "in_progress"
+        else:
+            def source():
+                try:
+                    from .decode_capture_provenance import decode
+                except ImportError:
+                    from decode_capture_provenance import decode
+                result = decode(bundle["TRACE_SOURCE_EVIDENCE"])
+                if result["present"]:
+                    require(result["run"][0] == snapshot_boot(),
+                            "capture source snapshot BootEpoch mismatch")
+                    replay = guest.get("replay")
+                    current = ([replay["boot_epoch"], replay["trial"], replay["capture_generation"]]
+                               if replay else None)
+                    result["current_replay_run"] = current
+                    result["current_run_match"] = result["run"] == current if current else None
+                return result
+            read("capture_source", source)
+
+    if len(raw) == 4096:
+        if u[433] == 0x4359584558495431:
+            guest["session_exit_evidence"] = list(u[432:])
+            if u[432] & 1:
+                guest["progress_diagnostic_status"]["session_exits"] = "in_progress"
+            else:
+                def sessions():
+                    try:
+                        from .decode_session_exits import decode_session_exits
+                    except ImportError:
+                        from decode_session_exits import decode_session_exits
+                    return decode_session_exits(
+                        raw, boot=u[1], service_generation=u[30])
+                read("session_exits", sessions)
+    return errors
+
+
 def refresh_snapshot(guest, bundle, *, require_governance_runtime=False):
     """Refresh ordinary and final diagnostics before raising the first fault."""
     guest["unified"] = guest["control"] = None
@@ -793,6 +905,9 @@ def refresh_snapshot(guest, bundle, *, require_governance_runtime=False):
             error = error if isinstance(error, ValueError) else ValueError("missing snapshot evidence: " + str(error))
             errors.append(error)
             guest["diagnostic_errors"].append({"field": key, "error": str(error)})
+    # Supplemental diagnostics cannot hide the original credit, event overflow,
+    # or functional parser error. They also do not establish acceptance.
+    errors.extend(progress_diagnostics(guest, bundle))
     if errors:
         raise errors[0]
 
@@ -1175,6 +1290,9 @@ def run(args):
                                    "replay_root_evidence", "replay_owner_evidence",
                                    "replay_config_evidence", "replay_capture_evidence",
                                    "local_placement_evidence",
+                                   "publication_cost_evidence", "publication_cost",
+                                   "capture_source_evidence", "capture_source",
+                                   "session_exit_evidence", "session_exits", "progress_diagnostic_status",
                                    "registers", "stack_pa", "diagnostic_errors", "final_parse_error")}
                                  for guest in guests]
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
