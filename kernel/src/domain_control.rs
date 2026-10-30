@@ -2635,6 +2635,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 provenance,
             };
             executor.provenance.accept(submission::AcceptStage::Submit);
+            publication_cost::submit_entry(job.sequence, policy::Clock::read(&mut NativeClock));
             let submitted = s.registry.submit_job_debited(
                 publisher(job.controller),
                 &reply.bytes[..reply.len],

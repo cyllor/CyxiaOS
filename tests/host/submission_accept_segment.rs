@@ -26,7 +26,7 @@ fn actual_readonly(s:&mut SubmitState,job:Job,reply:Reply)->(Result<u64,Error>,[
  assert_eq!((w[2],w[6],w[7],w[14],w[15],w[16]),(9,1,2,4,6,3),"actual accept lost the executor's original submission facts");
  let(mut s,job,reply)=submit_fixture(0);s.registry.stop_optimization();let(r,w)=actual_submit(&mut s,job,reply);assert_eq!(r,Err(Error::Budget));
  assert_eq!((w[2],w[6],w[14],w[15],w[16],w[17]),(8,0,3,3,3,Error::Budget as u64+1),"Registry early return lost callback facts before question propagation");
- assert_eq!(READS.load(Ordering::Acquire),1); // Actual charged Registry-return sample.
+ assert_eq!(READS.load(Ordering::Acquire),2); // Paid entry and original Registry-return samples.
 }
 #[test]fn submission_accept_segment_readonly_busy_is_not_a_registry_publication_failure(){
  let(mut s,mut job,reply)=submit_fixture(0);job.read_only=true;s.owner.families[0].as_mut().unwrap().legal=|_,_,_|Err(Error::Busy);

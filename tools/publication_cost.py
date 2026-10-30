@@ -1,13 +1,14 @@
 """Decode DOMAIN_PUBLICATION_COST from a stopped guest, without guest decisions.
 
-ABI v2: two 512-byte rows indexed by control CPU 1/2. Word 63 is
+ABI v3 (strict legacy v2 accepted): two 512-byte rows indexed by control CPU 1/2. Word 63 is
 release-published original Job sequence. Flags: 1 frozen retention, 2 identity
 conflict, 4 capacity/arithmetic overflow, 8 sample chronology failure.
 Incomplete, conflicted or overflowed records are never accepted as evidence.
 """
 import struct
 
-SCHEMA=0x4359505542430002
+LEGACY_SCHEMA=0x4359505542430002
+SCHEMA=0x4359505542430003
 BANK_BYTES=1024
 
 
@@ -28,7 +29,7 @@ def decode_publication_cost(raw, expected=None):
         if not any(w):
             if cpu in expected:raise ValueError('missing expected publication cost row')
             continue
-        if w[0]!=SCHEMA or w[1] not in (0,1) or w[2]!=cpu:
+        if w[0] not in (LEGACY_SCHEMA,SCHEMA) or w[1] not in (0,1) or w[2]!=cpu:
             raise ValueError('publication cost schema/flags/CPU conflict')
         if not w[5] or w[63]!=w[5] or not all(w[i] for i in (3,4,7,8,9,10)):
             raise ValueError('publication cost incomplete/identity')
@@ -37,8 +38,12 @@ def decode_publication_cost(raw, expected=None):
         # domains::Error ABI uses discriminants 0..19, recorded as code+1.
         if any(w[i]>20 for i in (22,28,30)):
             raise ValueError('publication cost malformed error code')
-        if any(w[47:63]) or w[46] not in (0,1) or w[15]>5:
+        if any(w[50:63]) or w[46] not in (0,1) or w[15]>5:
             raise ValueError('publication cost malformed/reserved/capacity')
+        if w[0]==LEGACY_SCHEMA:
+            if any(w[47:50]):raise ValueError('publication cost legacy reserved submit entry')
+        elif w[49] not in (0,1) or bool(w[49])!=bool(w[20]) or (not w[49] and any(w[47:49])):
+            raise ValueError('publication cost malformed/missing submit entry')
         if w[20] not in (0,1,2,3) or w[31] not in (0,1) or w[32] not in (0,1):
             raise ValueError('publication cost malformed outcome')
         # A later paid begin may freeze a checkpoint without stop facts, but
@@ -55,11 +60,14 @@ def decode_publication_cost(raw, expected=None):
         if w[20]==3 and n==5 and not w[46]:
             raise ValueError('publication cost missing successful native precommit')
         if any(w[33+n*2:43]):raise ValueError('publication cost stale Registry tail')
-        samples=[(w[12],w[13])]+[(w[33+i*2],w[34+i*2]) for i in range(n)]
+        samples=[(w[12],w[13])]
+        if w[49]:samples.append((w[47],w[48]))
+        registry_samples=[(w[33+i*2],w[34+i*2]) for i in range(n)]
         if w[46]:
-            if n!=5 or not (samples[4][0]<=w[16]<=samples[5][0] and samples[4][1]<=w[17]<=samples[5][1]):
+            if n!=5 or not (registry_samples[3][0]<=w[16]<=registry_samples[4][0] and registry_samples[3][1]<=w[17]<=registry_samples[4][1]):
                 raise ValueError('publication cost precommit ordering')
         elif w[16] or w[17]:raise ValueError('publication cost malformed precommit')
+        samples.extend(registry_samples)
         if w[20]:samples.append((w[18],w[19]))
         elif any(w[18:23]) or n or w[46]:raise ValueError('publication cost missing Registry return')
         samples.extend(((w[23],w[24]),(w[25],w[26])))
@@ -86,6 +94,7 @@ def decode_publication_cost(raw, expected=None):
         def at(i):return {'wall_ns':w[i],'cpu_ns':w[i+1]}
         result.append({**identity,'flags':w[1],'debit_ns':w[11],
             'start':at(12),'decode_ns':w[14],
+            'native_submit_entry':at(47) if w[49] else None,
             'registry_samples':[at(33+i*2) for i in range(n)],
             'precommit':at(16) if w[46] else None,
             'registry_return':at(18) if w[20] else None,

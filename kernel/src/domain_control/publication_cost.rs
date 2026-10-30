@@ -9,7 +9,7 @@ use cyxia_prototype::{
     policy::{self, PlanReceipt, PublicationTime},
 };
 
-const SCHEMA: u64 = 0x4359505542430002;
+const SCHEMA: u64 = 0x4359505542430003;
 // Row ABI (all u64, little endian): 0 schema, 1 flags (stop/conflict/
 // overflow/chronology = 1/2/4/8), 2 CPU, 3..10 identity, 11 carried debit,
 // 12..13 start wall/CPU, 14 decode CPU, 15 Registry read count, 16..17 native
@@ -18,7 +18,8 @@ const SCHEMA: u64 = 0x4359505542430002;
 // sample (now the pre-serialization checkpoint), 27 checkpoint cumulative
 // CPU, 28 checkpoint cap error+1, 29..30 checkpoint result version/error+1,
 // 31..32 checkpoint Registry/local stop, 33..42 original Registry samples,
-// 43..45 returned PlanId, 46 precommit-present, 47..62 reserved, 63 validity.
+// 43..45 returned PlanId, 46 precommit-present, 47..48 native submit-entry
+// wall/CPU, 49 submit-entry-present, 50..62 reserved, 63 validity.
 // The five Registry samples are first validation, after prepare, after
 // revalidation, after model authorization, and after retaining the receipt.
 #[repr(C, align(64))]
@@ -133,6 +134,17 @@ impl<C: policy::Clock> policy::Clock for Clock<'_, C> {
         at
     }
 }
+/// The caller pays one additional native read immediately before Registry.
+/// This boundary splits attribution only; it is never a final charged sample.
+pub fn submit_entry(job: u64, at: PublicationTime) {
+    if let Some(row) = current(job) {
+        if row.get(49) != 0 {
+            row.flag(2);
+        }
+        row.put(49, 1);
+        row.sample(47, at);
+    }
+}
 pub fn precommit(job: u64, at: PublicationTime) {
     if let Some(row) = current(job) {
         if row.get(46) != 0 {
@@ -192,6 +204,13 @@ pub fn prepare(job: u64, decoded: u64) -> Prepared {
         // between Registry commit and finished reads. Invalid evidence stays
         // explicit; it never changes the protected result or cap.
         let mut last = (row.get(12), row.get(13));
+        if row.get(49) != 0 {
+            let sample = (row.get(47), row.get(48));
+            if sample.0 < last.0 || sample.1 < last.1 {
+                row.flag(8);
+            }
+            last = sample;
+        }
         let n = row.get(15).min(5) as usize;
         for i in 0..n {
             let sample = (row.get(33 + i * 2), row.get(34 + i * 2));

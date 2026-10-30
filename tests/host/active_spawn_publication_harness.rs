@@ -470,7 +470,7 @@ fn spawn_busy_precedes_registry_identity_retains_debit_and_original_deadline() {
     assert_eq!(accept(&out, 10), Ok(1));
     assert_eq!(
         FINISHED.lock().unwrap().unwrap().1,
-        300_012,
+        300_013,
         "same Job lost charged acquisition retry debit"
     );
     let out = setup_spawn(4);

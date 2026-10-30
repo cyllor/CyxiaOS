@@ -27,7 +27,48 @@ def raw(w):
     return struct.pack('<128Q',*(w+[0]*64))
 
 
+def entry_fixture():
+    w=fixture();w[0]=0x4359505542430003;w[47:50]=[105,1025,1]
+    return w
+
+
 class PublicationCostDecoder(unittest.TestCase):
+    def test_submit_entry_splits_original_interval_and_legacy_stays_absent(self):
+        row=decode(raw(entry_fixture()))[0]
+        self.assertEqual(row['native_submit_entry'],{'wall_ns':105,'cpu_ns':1025})
+        self.assertIsNone(decode(raw(fixture()))[0]['native_submit_entry'])
+        context=[2,100,11,9,402,7,3,309,0,0,90,610,700,0,0,1,1,402,1,1000]
+        self.assertEqual(decoder.bind_publication_stop(row,context)['charged_cumulative_ns'],700)
+        for index in (47,48,49,50,62):
+            bad=fixture();bad[index]=1
+            with self.subTest(legacy_reserved=index):
+                with self.assertRaises(ValueError):decode(raw(bad))
+
+    def test_submit_entry_required_for_cached_and_early_registry_error_without_r1(self):
+        w=entry_fixture();w[15]=0;w[16:18]=[0,0];w[33:43]=[0]*10;w[46]=0
+        self.assertEqual(decode(raw(w))[0]['registry_samples'],[])
+        w[20:23]=[1,0,10];w[29:31]=[0,10];w[43:46]=[0]*3
+        self.assertEqual(decode(raw(w))[0]['native_submit_entry']['cpu_ns'],1025)
+        for status in (1,2,3):
+            bad=w.copy();bad[20]=status;bad[47:50]=[0]*3
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(ValueError,'submit.entry'):decode(raw(bad))
+
+    def test_submit_entry_absent_on_non_submit_and_malformed_identity_chronology_rejected(self):
+        w=entry_fixture();w[15]=0;w[16:23]=[0]*7;w[33:50]=[0]*17;w[29:31]=[0,8]
+        self.assertIsNone(decode(raw(w))[0]['native_submit_entry'])
+        w[47:50]=[105,1025,1]
+        with self.assertRaisesRegex(ValueError,'submit.entry'):decode(raw(w))
+        for index,value in [(47,99),(48,999),(47,111),(48,1051),(49,0),(49,2),(50,1),(62,1),(43,12),(45,403)]:
+            bad=entry_fixture();bad[index]=value
+            with self.subTest(word=index,value=value):
+                with self.assertRaises(ValueError):decode(raw(bad))
+        bad=entry_fixture();bad[15]=0;bad[16:18]=[0,0];bad[33:43]=[0]*10;bad[46]=0;bad[47:49]=[161,1301]
+        with self.assertRaisesRegex(ValueError,'chronology'):decode(raw(bad))
+        for key,value in [('cpu',2),('boot',12),('controller',10),('job',403),('model',2),('target',8)]:
+            with self.subTest(foreign=key):
+                with self.assertRaisesRegex(ValueError,'identity'):decode(raw(entry_fixture()),expected={1:{key:value}})
+
     def test_checkpoint_stop_requires_frozen_but_paid_later_freeze_is_allowed(self):
         w=fixture();w[1]=0
         with self.assertRaisesRegex(ValueError,'frozen'):
