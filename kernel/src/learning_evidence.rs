@@ -30,9 +30,14 @@ pub const START_REQUESTS: usize = 128;
 pub(crate) mod execution_trace;
 #[path = "learning_evidence/handoff.rs"]
 mod handoff;
+#[path = "learning_evidence/provenance.rs"]
+mod provenance;
+pub use provenance::TaskIdentity;
 /// Exact fixed storage for completed exits and first-loss diagnostics.
-pub const HANDOFF_BYTES: usize =
-    handoff::OWNED_BYTES + 2 * core::mem::size_of::<AtomicU64>() + execution_trace::OWNED_BYTES;
+pub const HANDOFF_BYTES: usize = handoff::OWNED_BYTES
+    + 2 * core::mem::size_of::<AtomicU64>()
+    + execution_trace::OWNED_BYTES
+    + provenance::OWNED_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     NotReady,
@@ -784,13 +789,32 @@ pub fn attempt(owner: ObjectKey, class: CpuClass) -> Result<Option<OwnerAttempt>
 /// asynchronous waiting never becomes part of this actual CPU interval.
 #[inline(never)]
 pub fn measure<R>(owner: ObjectKey, class: CpuClass, body: impl FnOnce() -> R) -> R {
+    measure_identity(owner, class, None, body)
+}
+/// Copy identity already held by the task owner; never resolve another owner.
+#[inline(never)]
+pub fn measure_task<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    identity: TaskIdentity,
+    body: impl FnOnce() -> R,
+) -> R {
+    measure_identity(owner, class, Some(identity), body)
+}
+#[inline(never)]
+fn measure_identity<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    identity: Option<TaskIdentity>,
+    body: impl FnOnce() -> R,
+) -> R {
     let Some(mut attempt) = attempt(owner, class).ok().flatten() else {
         return body();
     };
     let cpu_started = cpu_ticks();
     let result = body();
     let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
-    let _ = finish_attempt(&mut attempt, first_ns, last_ns);
+    let _ = finish_attempt_identity(&mut attempt, first_ns, last_ns, identity);
     result
 }
 pub fn attempt_work(owner: ObjectKey, optional: bool) -> Result<Option<OwnerAttempt>, Error> {
@@ -927,6 +951,14 @@ pub fn finish_attempt(
     first_ns: u64,
     last_ns: u64,
 ) -> Result<(), Error> {
+    finish_attempt_identity(attempt, first_ns, last_ns, None)
+}
+fn finish_attempt_identity(
+    attempt: &mut OwnerAttempt,
+    first_ns: u64,
+    last_ns: u64,
+    identity: Option<TaskIdentity>,
+) -> Result<(), Error> {
     if !attempt.pending {
         return Err(Error::Stale);
     }
@@ -1029,9 +1061,25 @@ pub fn finish_attempt(
     let result = with(|capture, _| {
         entered = true;
         match capture.source(measured_owner, attempt.class) {
-            Ok(token) => capture
-                .record(token, attempt.core, first_ns, last_ns)
-                .map_err(Error::from),
+            Ok(token) => {
+                let result = capture
+                    .record(token, attempt.core, first_ns, last_ns)
+                    .map_err(Error::from);
+                if let Some(config) = capture.config() {
+                    provenance::completed(provenance::Completion {
+                        run: config.key,
+                        owner: attempt.owner,
+                        source: measured_owner,
+                        class: attempt.class,
+                        core: attempt.core,
+                        first: first_ns,
+                        last: last_ns,
+                        result,
+                        identity,
+                    });
+                }
+                result
+            }
             Err(error) => {
                 capture.missing_events(attempt.class, 1, last_ns - first_ns)?;
                 handoff::loss(handoff::Loss::UnknownSource, attempt);
@@ -1638,6 +1686,9 @@ const _: () = assert!(STORAGE_BYTES <= 1024 * 1024);
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    pub fn source_snapshot() -> [u64; 128] {
+        provenance::snapshot()
+    }
     static PEER_BUSY: AtomicBool = AtomicBool::new(false);
     pub fn set_peer_busy(value: bool) {
         PEER_BUSY.store(value, Ordering::Release);

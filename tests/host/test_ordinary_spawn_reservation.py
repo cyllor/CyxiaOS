@@ -24,6 +24,8 @@ class OrdinarySpawnReservation(unittest.TestCase):
         signature = 'if reservation.is_none() {' if 'if reservation.is_none() {' in build else 'if !local {'
         late_admission = function(build, signature)
         template = (ROOT / 'tests/host/ordinary_spawn_reservation_harness.rs').read_text()
+        template = template.replace('mod learning_evidence {', 'mod learning_evidence {' +
+                                    (ROOT / 'tests/host/capture_identity_facade.rs').read_text())
         template = template.replace('// BUILD_CHECKS', checks).replace('// LATE_ADMISSION', late_admission)
         template = template.replace('// THREAD_SPEC', function(source, 'fn thread_spec('))
         template = template.replace('// ACTUAL_CREATOR', '\n'.join([

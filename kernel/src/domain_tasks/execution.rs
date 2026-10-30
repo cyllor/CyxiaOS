@@ -416,6 +416,14 @@ impl TaskBackend for Creator<'_> {
         } else {
             None
         };
+        let identity = crate::learning_evidence::TaskIdentity {
+            site: 1,
+            caller: r.caller,
+            request: r.request_id,
+            // Construction has not allocated a child at this entry boundary.
+            child: ZERO,
+            recipe,
+        };
         let mut body = || {
             let range = if r.recovery {
                 ORDINARY_TASKS..TASKS
@@ -511,9 +519,10 @@ impl TaskBackend for Creator<'_> {
             }
         };
         if let Some(source) = source {
-            crate::learning_evidence::measure(
+            crate::learning_evidence::measure_task(
                 source,
                 cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+                identity,
                 body,
             )
         } else {
@@ -768,9 +777,10 @@ fn cleanup(s: &mut State, i: usize) -> Result<(), Error> {
     let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+            capture_task_identity(&s.tasks[i], 2),
             || cleanup_inner(s, i),
         )
     } else {
@@ -974,6 +984,15 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
     }
     Ok(())
 }
+fn capture_task_identity(task: &Task, site: u64) -> crate::learning_evidence::TaskIdentity {
+    crate::learning_evidence::TaskIdentity {
+        site,
+        caller: task.parent,
+        request: task.spawn_id,
+        child: task.key,
+        recipe: task.recipe,
+    }
+}
 fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
     let warm = if s.tasks[i].recipe == 2
         && crate::domain_services::replay::owns(2)
@@ -990,9 +1009,10 @@ fn recipe_turn(s: &mut State, i: usize) -> Result<(), Error> {
     let result = if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+            capture_task_identity(&s.tasks[i], 3),
             || recipe_turn_inner(s, i),
         )
     } else {
@@ -1527,9 +1547,10 @@ fn process_return(s: &mut State, i: usize, c: &mut user::Context) {
     if let Some(source) =
         replay::work_source(s.tasks[i].parent, s.tasks[i].spawn_id, s.tasks[i].recipe)
     {
-        crate::learning_evidence::measure(
+        crate::learning_evidence::measure_task(
             source,
             cyxia_prototype::learning::reward::CpuClass::ExecutorWork,
+            capture_task_identity(&s.tasks[i], 4),
             || process_return_inner(s, i, c),
         );
     } else {
