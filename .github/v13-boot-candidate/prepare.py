@@ -8,6 +8,7 @@ import zlib
 
 BASE = '3af89206879ea990c5bce0b5e1ce17c7f381b473'
 PATCH_SHA = 'bd3ffdd02e03b798d27d5221556326caf22d7f15560154aa1323475e23af0a53'
+FIXUP_SHA = 'b8d666aa2d1ad1de0c8940c51b6c62738c272ef1f005f14e06c15e16a4592de4'
 STAGING = '.github/v13-boot-candidate/'
 WORKFLOW = '.github/workflows/v13-boot-candidate.yml'
 ALLOWED = '''crates/prototype/src/lib.rs
@@ -25,7 +26,9 @@ kernel/src/unified.rs
 user/prototype-runtime/main.rs
 tools/run_v13_boot_recovery.py
 tools/verify_v13_boot_recovery.py
-tools/test_verify_v13_boot_recovery.py'''.splitlines()
+tools/test_verify_v13_boot_recovery.py
+tools/check_v13_preparation_stack.py
+tools/test_check_v13_preparation_stack.py'''.splitlines()
 
 
 def git(*args):
@@ -42,11 +45,15 @@ encoded = b''.join((Path(STAGING)/f'{i:02}.part').read_bytes() for i in range(13
 patch = zlib.decompress(encoded)
 if len(patch) != 48135 or hashlib.sha256(patch).hexdigest() != PATCH_SHA:
     raise SystemExit('Candidate transport identity mismatch')
-with tempfile.NamedTemporaryFile(suffix='.patch') as f:
-    f.write(patch)
-    f.flush()
-    subprocess.run(['git', 'apply', '--check', '--index', f.name], check=True)
-    subprocess.run(['git', 'apply', '--index', f.name], check=True)
+fixup = (Path(STAGING)/'fixup.patch').read_bytes()
+if hashlib.sha256(fixup).hexdigest() != FIXUP_SHA:
+    raise SystemExit('Reviewed stack-inspector fixup identity mismatch')
+for delta in (patch, fixup):
+    with tempfile.NamedTemporaryFile(suffix='.patch') as f:
+        f.write(delta)
+        f.flush()
+        subprocess.run(['git', 'apply', '--check', '--index', f.name], check=True)
+        subprocess.run(['git', 'apply', '--index', f.name], check=True)
 subprocess.run(['cargo', 'fmt', '--all'], check=True)
 changed = set(git('diff', 'HEAD', '--name-only').splitlines())
 if changed != set(ALLOWED):
