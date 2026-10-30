@@ -1,0 +1,723 @@
+diff --git a/tests/host/governance_turn_harness.rs b/tests/host/governance_turn_harness.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c0272fcf07a622b617ae062631b4dcdb1c41bb4b
+--- /dev/null
++++ b/tests/host/governance_turn_harness.rs
+@@ -0,0 +1,270 @@
++//! Executes the production bounded dispatcher with controlled phase boundaries.
++//! This is a host state-machine regression, not an EL0/runtime timing claim.
++#![allow(dead_code)]
++use cyxia_prototype::domains::{
++    Error,
++    tasks::{ControlCredit, CpuLayout, Scheduler},
++};
++use std::sync::atomic::{AtomicU64, Ordering};
++const PHASE_INPUT_PROBE: u64 = 1;
++const PHASE_CODE_PROBE: u64 = 2;
++const PHASE_UNMAPPED_PROBE: u64 = 3;
++const PHASE_TIMER_PROBE: u64 = 4;
++const PHASE_PREPARE: u64 = 5;
++const PHASE_RUN: u64 = 6;
++const PHASE_VALIDATE: u64 = 7;
++const PHASE_COMPLETE: u64 = 8;
++const PREPAY: u64 = 2_500_000;
++const DEADLINE: u64 = 50_000_000;
++static OWNER: AtomicU64 = AtomicU64::new(1);
++mod domain_tasks {
++    pub fn control_owner_context(_: usize) -> Result<(u64, u64), super::Error> {
++        let generation = super::OWNER.load(super::Ordering::Acquire);
++        if generation == 0 {
++            return Err(super::Error::Busy);
++        }
++        Ok((generation, 1))
++    }
++}
++struct Resources;
++struct Runtime {
++    phase: u64,
++    last_credit_core: u64,
++    now: u64,
++    deadline: u64,
++    cpu_ns: u64,
++    calls: Vec<&'static str>,
++    preempt: bool,
++    pins_busy: bool,
++    prepare_error: Option<Error>,
++    run_error: Option<Error>,
++    validate_error: Option<Error>,
++    run_ns: u64,
++    snapshot_count: u64,
++}
++impl Runtime {
++    fn new(phase: u64) -> Self {
++        Self {
++            phase,
++            last_credit_core: 0,
++            now: 1_000_000,
++            deadline: 51_000_000,
++            cpu_ns: 0,
++            calls: Vec::new(),
++            preempt: false,
++            pins_busy: false,
++            prepare_error: None,
++            run_error: None,
++            validate_error: None,
++            run_ns: 600_000,
++            snapshot_count: 0,
++        }
++    }
++}
++fn prepare_runtime_snapshot(r: &mut Runtime, _: &Resources, _: ControlCredit) -> Result<(), Error> {
++    r.calls.push("prepare");
++    r.cpu_ns += 100_000;
++    if let Some(e) = r.prepare_error {
++        return Err(e);
++    }
++    r.deadline = r.now + DEADLINE;
++    r.snapshot_count += 1;
++    r.phase = PHASE_RUN;
++    Ok(())
++}
++fn run_runtime_context(r: &mut Runtime, _: &Resources) -> Result<(), Error> {
++    r.calls.push("run");
++    r.cpu_ns += r.run_ns;
++    r.now += 1_000_000;
++    if let Some(e) = r.run_error {
++        return Err(e);
++    }
++    if r.phase <= PHASE_TIMER_PROBE {
++        r.phase += 1;
++    } else if !r.preempt && !r.pins_busy {
++        r.phase = PHASE_VALIDATE;
++    }
++    Ok(())
++}
++fn validate_runtime_command(r: &mut Runtime, _: &Resources) -> Result<(), Error> {
++    r.calls.push("validate");
++    r.cpu_ns += 200_000;
++    if let Some(e) = r.validate_error {
++        return Err(e);
++    }
++    if r.now >= r.deadline {
++        return Err(Error::Expired);
++    }
++    r.phase = PHASE_COMPLETE;
++    Ok(())
++}
++// PRODUCTION_TURN
++fn credit() -> (Scheduler, ControlCredit) {
++    OWNER.store(1, Ordering::Release);
++    let mut scheduler = Scheduler::new();
++    let c = scheduler
++        .reserve_control(
++            1,
++            CpuLayout {
++                business_mask: 13,
++                healthy_mask: 15,
++                generation: 1,
++            },
++            1_000_000,
++            PREPAY,
++        )
++        .unwrap()
++        .unwrap();
++    (scheduler, c)
++}
++#[test]
++fn ready_chain_uses_one_credit_without_two_artificial_scheduler_delays() {
++    let (mut scheduler, c) = credit();
++    let mut r = Runtime::new(PHASE_PREPARE);
++    assert_eq!(perform_runtime_turn(&mut r, &Resources, c), Ok(()));
++    assert_eq!(
++        r.calls,
++        ["prepare", "run", "validate"],
++        "ready chain was split across scheduler turns"
++    );
++    assert_eq!(r.phase, PHASE_COMPLETE);
++    assert_eq!(r.snapshot_count, 1);
++    assert_eq!(scheduler.control_active(1), Some(c));
++    scheduler.complete_control(c, r.cpu_ns, r.now).unwrap();
++    assert_eq!(scheduler.control_active(1), None);
++    assert_eq!(scheduler.cpu_window_usage(1, r.now).unwrap(), (900_000, 0));
++}
++#[test]
++fn returned_command_is_validated_before_an_avoidable_yield() {
++    let (_, c) = credit();
++    let mut r = Runtime::new(PHASE_RUN);
++    r.now = r.deadline - 2_000_000;
++    perform_runtime_turn(&mut r, &Resources, c).unwrap();
++    assert_eq!(
++        r.calls,
++        ["run", "validate"],
++        "returned command unnecessarily yielded"
++    );
++    assert_eq!(r.phase, PHASE_COMPLETE);
++    assert_eq!(r.snapshot_count, 0);
++}
++#[test]
++fn timer_preemption_and_unreleased_pins_each_end_the_bounded_turn() {
++    for pins_busy in [false, true] {
++        let (_, c) = credit();
++        let mut r = Runtime::new(PHASE_PREPARE);
++        r.preempt = !pins_busy;
++        r.pins_busy = pins_busy;
++        perform_runtime_turn(&mut r, &Resources, c).unwrap();
++        assert_eq!(r.calls, ["prepare", "run"]);
++        assert_eq!(r.phase, PHASE_RUN);
++        let deadline = r.deadline;
++        r.preempt = false;
++        r.pins_busy = false;
++        r.calls.clear();
++        perform_runtime_turn(&mut r, &Resources, c).unwrap();
++        assert_eq!(r.calls, ["run", "validate"]);
++        assert_eq!(r.snapshot_count, 1);
++        assert_eq!(r.deadline, deadline);
++    }
++}
++#[test]
++fn probes_never_fall_through_into_snapshot_or_command_work() {
++    for phase in PHASE_INPUT_PROBE..=PHASE_TIMER_PROBE {
++        let (_, c) = credit();
++        let mut r = Runtime::new(phase);
++        perform_runtime_turn(&mut r, &Resources, c).unwrap();
++        assert_eq!(r.calls, ["run"]);
++        assert_eq!(r.phase, phase + 1);
++    }
++}
++#[test]
++fn failures_are_not_converted_to_ready_transitions() {
++    for error in [
++        Error::Busy,
++        Error::NotReady,
++        Error::Auth,
++        Error::Budget,
++        Error::Stale,
++    ] {
++        let (_, c) = credit();
++        let mut r = Runtime::new(PHASE_PREPARE);
++        r.prepare_error = Some(error);
++        assert_eq!(perform_runtime_turn(&mut r, &Resources, c), Err(error));
++        assert_eq!(r.calls, ["prepare"]);
++        r.prepare_error = None;
++        r.run_error = Some(error);
++        r.calls.clear();
++        assert_eq!(perform_runtime_turn(&mut r, &Resources, c), Err(error));
++        assert_eq!(r.calls, ["prepare", "run"]);
++        r.phase = PHASE_VALIDATE;
++        r.validate_error = Some(error);
++        r.calls.clear();
++        assert_eq!(perform_runtime_turn(&mut r, &Resources, c), Err(error));
++        assert_eq!(r.calls, ["validate"]);
++    }
++}
++#[test]
++fn expired_original_snapshot_is_not_retimed_or_accepted() {
++    let (_, c) = credit();
++    let mut r = Runtime::new(PHASE_RUN);
++    r.now = r.deadline;
++    let deadline = r.deadline;
++    assert_eq!(
++        perform_runtime_turn(&mut r, &Resources, c),
++        Err(Error::Expired)
++    );
++    assert_eq!(r.deadline, deadline);
++    assert_eq!(r.snapshot_count, 0);
++    assert_ne!(r.phase, PHASE_COMPLETE);
++}
++#[test]
++fn owner_and_generation_must_still_authorize_the_whole_turn() {
++    let (_, c) = credit();
++    let mut r = Runtime::new(PHASE_PREPARE);
++    OWNER.store(2, Ordering::Release);
++    assert_eq!(
++        perform_runtime_turn(&mut r, &Resources, c),
++        Err(Error::Stale)
++    );
++    assert!(r.calls.is_empty());
++    OWNER.store(0, Ordering::Release);
++    assert_eq!(
++        perform_runtime_turn(&mut r, &Resources, c),
++        Err(Error::Busy)
++    );
++    assert!(r.calls.is_empty());
++    OWNER.store(1, Ordering::Release);
++    let mut wrong_cpu = c;
++    wrong_cpu.cpu = 2;
++    assert_eq!(
++        perform_runtime_turn(&mut r, &Resources, wrong_cpu),
++        Err(Error::Stale)
++    );
++    assert!(r.calls.is_empty());
++}
++#[test]
++fn combined_actual_cost_still_fails_the_original_physical_credit() {
++    let (mut scheduler, c) = credit();
++    let mut r = Runtime::new(PHASE_PREPARE);
++    r.run_ns = 2_300_001;
++    perform_runtime_turn(&mut r, &Resources, c).unwrap();
++    assert_eq!(r.calls, ["prepare", "run", "validate"]);
++    assert_eq!(
++        scheduler.complete_control(c, r.cpu_ns, r.now),
++        Err(Error::Budget)
++    );
++}
++#[test]
++fn completed_or_unknown_phase_cannot_repeat_the_command() {
++    let (_, c) = credit();
++    let mut r = Runtime::new(PHASE_COMPLETE);
++    perform_runtime_turn(&mut r, &Resources, c).unwrap();
++    assert!(r.calls.is_empty());
++    r.phase = 99;
++    assert_eq!(
++        perform_runtime_turn(&mut r, &Resources, c),
++        Err(Error::Conflict)
++    );
++    assert!(r.calls.is_empty());
++}
+diff --git a/tests/host/test_governance_turn.py b/tests/host/test_governance_turn.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4adfb9a4d892e355a2930b90c7cc7a294f8b80ff
+--- /dev/null
++++ b/tests/host/test_governance_turn.py
+@@ -0,0 +1,71 @@
++"""Compile the actual coordinator dispatcher; never treat this as native proof."""
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT / 'tools'))
++from doctor import RUST_BIN, env
++
++
++def function(source, signature):
++    start = source.index(signature)
++    opening = source.index('{', start)
++    depth = 1
++    for at in range(opening + 1, len(source)):
++        depth += (source[at] == '{') - (source[at] == '}')
++        if depth == 0:
++            return source[start:at + 1]
++    raise ValueError('unterminated production function')
++
++
++class GovernanceTurn(unittest.TestCase):
++    def test_actual_bounded_dispatch_preserves_deadlines_ownership_and_physical_credit(self):
++        source = (ROOT / 'kernel/src/prototype_runtime/governance.rs').read_text()
++        body = function(source, 'fn perform_runtime_turn(')
++        template = (ROOT / 'tests/host/governance_turn_harness.rs').read_text()
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            (root / 'Cargo.toml').write_text(
++                '[package]\nname="governance-turn-regression"\nversion="0.1.0"\nedition="2024"\n'
++                '[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='
++                + json.dumps(str(ROOT / 'crates/prototype')) + '}\n[workspace]\n')
++            command = [str(RUST_BIN / 'cargo'), 'test', '--offline',
++                '--manifest-path', str(root / 'Cargo.toml'), '--target-dir',
++                str(ROOT / 'target/host-governance-turn'), '--', '--test-threads=1']
++            mutations = [
++                ('prepare_runtime_snapshot(runtime, resources, credit)?,',
++                 'return prepare_runtime_snapshot(runtime, resources, credit),'),
++                ('        run_runtime_context(runtime, resources)?;',
++                 '        return run_runtime_context(runtime, resources);'),
++                ('credit.cpu != 1 || credit.core_generation != current.0', 'false'),
++                ('validate_runtime_command(runtime, resources)?;',
++                 'let _ = validate_runtime_command(runtime, resources);'),
++                ('PHASE_RUN | PHASE_VALIDATE => {}',
++                 'PHASE_RUN | PHASE_VALIDATE => { prepare_runtime_snapshot(runtime, resources, credit)?; }'),
++            ]
++            for old, replacement in mutations:
++                with self.subTest(mutation=old):
++                    self.assertEqual(body.count(old), 1, 'mutation must match exactly once')
++                    mutant = body.replace(old, replacement)
++                    (root / 'harness.rs').write_text(template.replace('// PRODUCTION_TURN', mutant))
++                    # A nonzero compiler exit is not an executed negative control.
++                    compiled = subprocess.run(command[:-2] + ['--no-run'], cwd=ROOT,
++                        env=env(), capture_output=True, text=True, timeout=180)
++                    self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
++                    result = subprocess.run(command, cwd=ROOT, env=env(),
++                        capture_output=True, text=True, timeout=180)
++                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
++                    self.assertIn('test result: FAILED', result.stdout)
++            (root / 'harness.rs').write_text(template.replace('// PRODUCTION_TURN', body))
++            result = subprocess.run(command, cwd=ROOT, env=env(),
++                capture_output=True, text=True, timeout=180)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            self.assertIn('9 passed; 0 failed', result.stdout)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/host/test_prototype_process_cleanup.py b/tests/host/test_prototype_process_cleanup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..253bf12306bdaac49e8ca891cab1208772d72c66
+--- /dev/null
++++ b/tests/host/test_prototype_process_cleanup.py
+@@ -0,0 +1,81 @@
++"""An interrupted validation lane owns and cleans up its entire process group."""
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++class ProcessCleanup(unittest.TestCase):
++    def run_interrupted(self, source, expected_children):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            output = root / 'checks'
++            ready = root / 'ready'
++            child = root / 'child.py'
++            child.write_text(source)
++            steps = [('owned', [sys.executable, str(child), str(ready)]),
++                     ('must-not-run', [sys.executable, '-c', 'pass'])]
++            script = ('import sys; from pathlib import Path; '
++                      f'sys.path.insert(0, {str(ROOT / "tools")!r}); '
++                      'from prototype import run_steps; '
++                      f'raise SystemExit(run_steps({steps!r}, Path({str(output)!r})))')
++            parent = subprocess.Popen([sys.executable, '-c', script],
++                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++            children = []
++            try:
++                deadline = time.monotonic() + 10
++                while not ready.exists() and parent.poll() is None and time.monotonic() < deadline:
++                    time.sleep(.01)
++                self.assertTrue(ready.exists(), 'owned child never became ready')
++                children = json.loads(ready.read_text())
++                self.assertEqual(len(children), expected_children)
++                parent.send_signal(signal.SIGINT)
++                out, err = parent.communicate(timeout=8)
++                self.assertEqual(parent.returncode, 130, out + err)
++                summary = json.loads((output / 'summary.json').read_text())
++                self.assertEqual(summary['status'], 'FAIL')
++                self.assertEqual([r['name'] for r in summary['steps']], ['owned'])
++                self.assertEqual(summary['steps'][0]['returncode'], 130)
++                for pid in children:
++                    with self.assertRaises(ProcessLookupError):
++                        os.kill(pid, 0)
++            finally:
++                if parent.poll() is None:
++                    parent.kill()
++                    parent.communicate(timeout=5)
++                for pid in children:
++                    try:
++                        os.kill(pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++
++    def test_term_ignoring_child_is_killed_and_reaped(self):
++        self.run_interrupted('''import json, os, signal, sys, time
++from pathlib import Path
++signal.signal(signal.SIGTERM, signal.SIG_IGN)
++Path(sys.argv[1]).write_text(json.dumps([os.getpid()]))
++time.sleep(60)
++''', 1)
++
++    def test_nested_child_receives_the_owned_group_signal(self):
++        self.run_interrupted('''import json, os, signal, subprocess, sys, time
++from pathlib import Path
++child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
++def stop(*_):
++    child.wait(timeout=2)
++    raise SystemExit(0)
++signal.signal(signal.SIGTERM, stop)
++Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]))
++time.sleep(60)
++''', 2)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/host/test_prototype_validation_lanes.py b/tests/host/test_prototype_validation_lanes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfde39d4957a774ed49dfa68030372392301a817
+--- /dev/null
++++ b/tests/host/test_prototype_validation_lanes.py
+@@ -0,0 +1,55 @@
++"""Engineering sharding must preserve every original gate and native boundaries."""
++from pathlib import Path
++import sys
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT / 'tools'))
++from prototype import TEST_LANES, test_steps
++
++
++class ValidationLanes(unittest.TestCase):
++    def test_disjoint_lanes_cover_all_nine_original_engineering_gates(self):
++        all_steps = test_steps(False)
++        combined = [step for lane in TEST_LANES for step in test_steps(False, lane)]
++        self.assertEqual(len(combined), 9)
++        self.assertEqual(len({name for name, _ in combined}), len(combined))
++        self.assertEqual(sorted(combined), sorted(all_steps))
++
++    def test_lane_selection_does_not_rewrite_commands_or_promote_host_to_native(self):
++        full = dict(test_steps(True))
++        for lane, expected in TEST_LANES.items():
++            steps = test_steps(True, lane)
++            self.assertEqual(set(dict(steps)), set(expected))
++            for name, command in steps:
++                self.assertEqual(command, full[name])
++                self.assertNotIn('verify_domains.py', ' '.join(command))
++                self.assertNotIn('verify_unified.py', ' '.join(command))
++
++    def test_pinned_fixture_preparation_precedes_host_checks_only(self):
++        host = test_steps(True, 'host')
++        self.assertEqual([name for name, _ in host], ['fixtures', 'host'])
++        self.assertIn('--fetch', host[0][1])
++        self.assertNotIn('--fetch', test_steps(False, 'host')[0][1])
++        for lane in ('static', 'rust', 'tools'):
++            self.assertNotIn('fixtures', dict(test_steps(True, lane)))
++
++    def test_typo_cannot_silently_produce_an_empty_successful_lane(self):
++        with self.assertRaisesRegex(ValueError, 'unknown validation lane'):
++            test_steps(False, 'ruts')
++
++    def test_workflow_preserves_failure_collection_link_gate_and_aggregate_gate(self):
++        source = (ROOT / '.github/workflows/validate-prototype.yml').read_text()
++        self.assertIn('lane: [static, rust, host, tools]', source)
++        self.assertIn('fail-fast: false', source)
++        self.assertIn('prototype.py test --lane "$LANE"', source)
++        self.assertIn('cargo rustc --release --locked --offline', source)
++        self.assertIn('rustup override set 1.95.0', source)
++        self.assertIn('needs: validate', source)
++        self.assertIn('run: test "$VALIDATION_RESULT" = success', source)
++        self.assertIn('prototype-validation-${{ matrix.lane }}-${{ github.sha }}', source)
++        self.assertNotIn('continue-on-error:', source)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/host/test_v13_a02_native.py b/tests/host/test_v13_a02_native.py
+index 5f4f6dc82c0e08bbfca7e3f292f23c6224dd7ce7..60b4d649e40263ba83562de704b8a60149eedee0 100644
+--- a/tests/host/test_v13_a02_native.py
++++ b/tests/host/test_v13_a02_native.py
+@@ -144,6 +144,15 @@ class A02NativeProducer(unittest.TestCase):
+             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+             self.assertIn('0 failed', result.stdout)
+ 
++    def test_control_capture_preparation_is_bound_to_current_identity(self):
++        source = (ROOT / 'kernel/src/prototype_runtime/native.rs').read_text()
++        run = source[source.index('fn run_turn('):source.index('fn charge_turn(')]
++        self.assertIn('let task = capture_task(slot);', run)
++        compact = ''.join(run.split())
++        self.assertIn('.capture.prepare(task,crate::a02_capture::prepare)', compact)
++        self.assertIn('worker.native.capture.index(task)', compact)
++        self.assertNotIn('worker.native.capture_index', source)
++
+     def test_capture_contention_sleeps_until_a_published_unlock_event(self):
+         source = (ROOT / 'kernel/src/a02_capture.rs').read_text()
+         lock = source[source.index('fn locked<R>'):source.index('/// CPU0, before')
+diff --git a/tests/host/test_v13_a02_qemu.py b/tests/host/test_v13_a02_qemu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e29e299c0a0c1f47acb778fe0273851c38f75f4
+--- /dev/null
++++ b/tests/host/test_v13_a02_qemu.py
+@@ -0,0 +1,83 @@
++"""Patched A02 captures must use the same fixed-source gate as pair runs."""
++import hashlib
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++from unittest.mock import patch
++sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
++from verify_v13_a02 import verify_native_qemu
++
++
++class NativeQemuTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.binary = self.root / 'qemu'
++        self.binary.write_bytes(b'unit-test binary, not native evidence')
++        self.built = self.root / 'build/qemu-system-aarch64'
++        self.built.parent.mkdir()
++        self.built.write_bytes(self.binary.read_bytes())
++        self.identity = dict(qemu_version='QEMU emulator version 10.2.2 (v10.2.2-dirty)\n',
++                             qemu_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),
++                             qemu_pmu_patch_attested=True, qemu_source_commit='fixed-commit',
++                             qemu_patch_sha256='fixed-patch', qemu_source_sha256={'cpu.c': 'fixed-source'})
++        self.tools = dict(self.identity, qemu_source_directory=str(self.root))
++
++    def test_patched_capture_is_rechecked_not_trusted_from_recorded_boolean(self):
++        with patch('verify_unified.attest_qemu', return_value=self.identity) as check:
++            verify_native_qemu(self.tools, self.binary, qemu_source=self.root)
++        check.assert_called_once_with(self.built, self.root)
++
++    def test_missing_flag_source_or_absolute_path_is_rejected(self):
++        for field, value in [('qemu_pmu_patch_attested', False),
++                             ('qemu_source_directory', None), ('qemu_source_directory', 'relative')]:
++            with self.subTest(field=field, value=value), patch('verify_unified.attest_qemu') as check:
++                with self.assertRaisesRegex(ValueError, 'attestation missing'):
++                    verify_native_qemu(dict(self.tools, **{field: value}), self.binary, qemu_source=self.root)
++                check.assert_not_called()
++
++    def test_changed_binary_is_rejected_before_source_validation(self):
++        self.binary.write_bytes(b'changed')
++        with self.assertRaisesRegex(ValueError, 'binary identity changed'):
++            verify_native_qemu(self.tools, self.binary, qemu_source=self.root)
++
++    def test_all_recorded_source_and_patch_fields_must_match(self):
++        for field in ('qemu_version', 'qemu_source_commit', 'qemu_patch_sha256', 'qemu_source_sha256'):
++            with self.subTest(field=field), patch('verify_unified.attest_qemu',
++                    return_value=dict(self.identity, **{field: 'changed'})):
++                with self.assertRaisesRegex(ValueError, 'attestation changed'):
++                    verify_native_qemu(self.tools, self.binary, qemu_source=self.root)
++
++    def test_attester_rejection_is_not_downgraded_to_stock(self):
++        with patch('verify_unified.attest_qemu', side_effect=ValueError('wrong tracked diff')):
++            with self.assertRaisesRegex(ValueError, 'wrong tracked diff'):
++                verify_native_qemu(self.tools, self.binary, qemu_source=self.root)
++
++    def test_archive_cannot_select_a_directory_for_git_execution(self):
++        with patch('verify_unified.attest_qemu') as check:
++            with self.assertRaisesRegex(ValueError, 'explicit trusted'):
++                verify_native_qemu(self.tools, self.binary)
++            check.assert_not_called()
++
++    def test_receipt_selected_executable_is_not_run_before_trusted_build_binding(self):
++        self.binary.write_bytes(b'untrusted executable bytes')
++        changed = dict(self.tools, qemu_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest())
++        with patch('verify_unified.attest_qemu') as check:
++            with self.assertRaisesRegex(ValueError, 'differs from explicit trusted source build'):
++                verify_native_qemu(changed, self.binary, qemu_source=self.root)
++            check.assert_not_called()
++
++    def test_stock_legacy_receipt_is_compatible_but_cannot_claim_pmu(self):
++        stock = dict(qemu_version='QEMU emulator version 10.2.2\n',
++                     qemu_sha256=self.identity['qemu_sha256'])
++        with patch('verify_unified.attest_qemu') as check:
++            verify_native_qemu(stock, self.binary)
++            check.assert_not_called()
++        with self.assertRaisesRegex(ValueError, 'cannot claim'):
++            verify_native_qemu(dict(stock, qemu_pmu_patch_attested=True), self.binary)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/host/test_v13_evidence.py b/tests/host/test_v13_evidence.py
+index 96c1d20a6cc45c84c9df68bf4c383493a26750ed..36506e34080fd7731e941df69fd3db6f53c38004 100644
+--- a/tests/host/test_v13_evidence.py
++++ b/tests/host/test_v13_evidence.py
+@@ -53,6 +53,34 @@ class EvidenceCatalogue(unittest.TestCase):
+     def check_native_row(self, row, root):
+         return self.check.check_rows([row], {row['id']}, 'case set', root, descriptions=True)
+ 
++    def test_a02_patched_emulator_source_comes_only_from_explicit_caller(self):
++        # Mock tests adapter routing only, never execution or native acceptance.
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            row = self.native_row(root)
++            source = root / 'trusted-emulator'
++            with patch.object(self.check, 'verify_native_receipt', return_value={
++                    'test_id': 'A02', 'native_acceptance_status': 'PASS',
++                    'native_execution_verified': True, 'runtime_truth_attested': False}) as replay:
++                self.check.check_rows([row], {'A02'}, 'case set', root,
++                                      descriptions=True, qemu_source=source)
++                replay.assert_called_once_with(root, source_root=root, qemu_source=source)
++            row['evidence']['qemu_source'] = str(source)
++            with patch.object(self.check, 'verify_native_receipt') as replay:
++                with self.assertRaises(ValueError):
++                    self.check_native_row(row, root)
++                replay.assert_not_called()
++
++    def test_a02_legacy_adapter_does_not_infer_an_emulator_source(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            row = self.native_row(root)
++            with patch.object(self.check, 'verify_native_receipt', return_value={
++                    'test_id': 'A02', 'native_acceptance_status': 'PASS',
++                    'native_execution_verified': True, 'runtime_truth_attested': False}) as replay:
++                self.check_native_row(row, root)
++                replay.assert_called_once_with(root, source_root=root)
++
+     def test_raw_contract_or_producer_pass_boolean_cannot_close_a02(self):
+         with tempfile.TemporaryDirectory() as directory:
+             root = Path(directory)
+diff --git a/tests/host/test_v13_native_probe_slice.py b/tests/host/test_v13_native_probe_slice.py
+index 173926ce25689f3f849128be8d5e215a01675770..b25a151048c28949cc7b02060e4056f8d39888e8 100644
+--- a/tests/host/test_v13_native_probe_slice.py
++++ b/tests/host/test_v13_native_probe_slice.py
+@@ -52,9 +52,10 @@ class NativeProbeSlice(unittest.TestCase):
+         self.assertIn("a02_capture::returned();", entry)
+         self.assertIn("user::enter_integer_probe(context, root);", entry)
+         self.assertIn(
+-            "worker.native.capture_index,\n            false,\n            false,",
++            "None,\n            false,\n            false,",
+             probe,
+         )
++        self.assertNotIn(".capture.index(", probe, "uncaptured probes must not consume an old trace slot")
+         self.assertIn("if record_slice_evidence && slot < 4", entry)
+         self.assertIn("if record_slice_evidence {\n            RECORD_SLICE_EXCEPTION[slot].store(true", entry)
+         self.assertIn("RECORD_SLICE_EXCEPTION[slot].store(false", entry)
+diff --git a/tools/check_v13_evidence.py b/tools/check_v13_evidence.py
+index 9079100e3b62c759ad2a3f413f7a3d88a9ac1129..6e12b0cbd5e2b9253f50b6c4eae10f6856fb1aa7 100644
+--- a/tools/check_v13_evidence.py
++++ b/tools/check_v13_evidence.py
+@@ -36,7 +36,7 @@ FAMILIES = frozenset(['D01_WEIGHT', 'D01_CORESET'] + [f'D{i:02}' for i in range(
+ STATUSES = frozenset({'PASS', 'FAIL', 'NOT_RUN'})
+ 
+ 
+-def check_rows(rows, expected, label, root, *, descriptions):
++def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None):
+     require(type(rows) is list and len(rows) == len(expected), f'Incomplete {label}')
+     ids = [r.get('id') if type(r) is dict else None for r in rows]
+     require(all(type(i) is str for i in ids) and len(set(ids)) == len(ids)
+@@ -69,7 +69,10 @@ def check_rows(rows, expected, label, root, *, descriptions):
+             require(receipt.name == 'summary.json', 'A02 receipt must name summary.json')
+             # Fixed reviewed code only. Neither the manifest nor the receipt
+             # can select a checker, source checkout or executable archive.
+-            observed = verify_native_receipt(receipt.parent, source_root=root)
++            options = {'source_root': root}
++            if qemu_source is not None:
++                options['qemu_source'] = qemu_source
++            observed = verify_native_receipt(receipt.parent, **options)
+             require(observed.get('test_id') == 'A02'
+                     and observed.get('native_acceptance_status') == row['status']
+                     and observed.get('native_execution_verified') is True
+@@ -79,7 +82,7 @@ def check_rows(rows, expected, label, root, *, descriptions):
+     return counts
+ 
+ 
+-def validate(document, root=ROOT):
++def validate(document, root=ROOT, *, qemu_source=None):
+     root = Path(root).resolve()
+     exact_keys(document, {'schema_version', 'spec', 'deviations', 'cases',
+                           'action_families', 'filesystem_fault_matrix'})
+@@ -97,7 +100,8 @@ def validate(document, root=ROOT):
+     exact_keys(d, {'id', 'clause', 'authorized', 'decision'})
+     require(d['id'] == 'LANG-RUST' and d['clause'] == '1.2' and d['authorized'] is True
+             and type(d['decision']) is str and bool(d['decision'].strip()), 'Invalid Rust deviation')
+-    cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True)
++    cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True,
++                       qemu_source=qemu_source)
+     definitions = [{key: row[key] for key in ('id', 'scenario', 'required_outcome')}
+                    for row in document['cases']]
+     encoded = json.dumps(sorted(definitions, key=lambda row: row['id']), ensure_ascii=False,
+@@ -135,10 +139,12 @@ def main(argv=None):
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument('--manifest', type=Path, default=DEFAULT)
+     parser.add_argument('--root', type=Path, default=ROOT)
++    parser.add_argument('--qemu-source', type=Path,
++                        help='explicit trusted patched-QEMU checkout for A02 replay')
+     parser.add_argument('--release', action='store_true')
+     args = parser.parse_args(argv)
+     try:
+-        result = validate(read_json(args.manifest), args.root)
++        result = validate(read_json(args.manifest), args.root, qemu_source=args.qemu_source)
+         print(json.dumps(result, ensure_ascii=False, indent=2))
+         return 2 if args.release and not result['functional_acceptance_complete'] else 0
+     except (OSError, ValueError, TypeError) as error:
