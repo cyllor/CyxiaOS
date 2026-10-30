@@ -50,7 +50,7 @@ TOOL_NAMES = ('run_v13_a10.py', 'verify_v13_a10.py', 'run_v13_a02.py',
     'check_v13_disk.py', 'verify_v13_storage_faults.py', 'verify_v13_storage.py',
     'build_unified.py', 'check_elf.py', 'verify_v13_model.py', 'run_qemu.py',
     'transport.py', 'verify_smp.py', 'doctor.py', 'check_prototype_evidence.py',
-    'v13_a10_budget.py',
+    'v13_a10_budget.py', 'v13_a10_fault_scope.py',
     'verify_unified.py')
 
 
@@ -324,7 +324,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         verify_unchanged(frozen_files)
         backend = Backend(output / 'disk.raw', output / 'nbd', cut=cut, phase=phase,
                           unflushed=unflushed, reverse_replies=reverse_replies, compress=True,
-                          witness=witness.record)
+                          witness=witness.record, event_clock='host-monotonic-ns-v1')
         witness.record('backend-open', path=str(output / 'disk.raw'),
                        run_id=backend.meta['run_id'], sha256=backend.meta['disk_initial_sha256'],
                        size=backend.size)
@@ -481,6 +481,9 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
                        size=(output / 'disk.raw').stat().st_size)
         witness.record('identity-after', identity=identity)
         report['nbd_trace'] = inspect_nbd(output / 'initial.raw', output / 'disk.raw', output / 'nbd')
+        from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
+        report['mutation_scope'] = (require_post_resume_cut(output, cut) if cut
+                                    else mutation_scope(output))
         oracle = inspect_filesystem(output / 'disk.raw')
         _json(output / 'disk-after.json', oracle)
         if report['cut_observed']:

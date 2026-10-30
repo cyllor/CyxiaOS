@@ -214,6 +214,22 @@ class VolatileNbd(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'merged or incomplete native sector schedule'):
             runner.validate_schedule(merged,dict(writes=1,flushes=1))
 
+    def test_source_bound_event_clock_is_monotonic_and_tamper_evident(self):
+        self.start(event_clock='host-monotonic-ns-v1')
+        self.request(1, 1, data=b'A'*512); self.reply(1)
+        self.request(3, 2); self.reply(2)
+        self.finish()
+        self.assertEqual(self.inspect()['acknowledged_flushes'], 1)
+        events = self.backend.output / 'events.jsonl'
+        rows = [json.loads(line) for line in events.read_text().splitlines()]
+        stamps = [row.get('monotonic_ns') for row in rows]
+        self.assertTrue(all(type(value) is int for value in stamps))
+        self.assertEqual(stamps, sorted(stamps))
+        rows[-1]['monotonic_ns'] = stamps[0] - 1
+        events.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        with self.assertRaisesRegex(ValueError, 'missing/unordered fault event clock'):
+            self.inspect()
+
     def test_compressed_capture_retains_exact_raw_bytes_and_tamper_rejection(self):
         self.start(compress=True,cut=2,phase='after-ack')
         self.request(1,1,data=b'A'*512);self.reply(1)

@@ -313,6 +313,7 @@ def verify_native_child(directory, *, source_root, build_manifest, qemu_binary, 
                 == inputs['initial_disk_sha256'] == sha256(safe_path(root, 'initial.raw'))
             and context['backing_size'] == nbd['size'] == 512 * 1024**2
             and nbd['max_pending_sectors'] == 32768
+            and nbd.get('event_clock') == 'host-monotonic-ns-v1'
             and nbd['reverse_replies'] is inputs['reverse_replies'], 'native endpoint/backing lineage mismatch')
     protocol = validate_protocol(root, context, layout, inputs,
         read_rows(safe_path(root, 'qmp.jsonl'), inputs),
@@ -373,6 +374,11 @@ def verify_native_child(directory, *, source_root, build_manifest, qemu_binary, 
     matrix = dict(build_manifest_sha256=sha256(build_manifest), source_manifest_sha256=binding['source_sha256'],
                   filesystem_uuid=binding['uuid'])
     replayed = replay_child(root, matrix)
+    from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
+    scope = (require_post_resume_cut(root, inputs['cut']) if inputs['cut']
+             else mutation_scope(root))
+    require(replayed.get('mutation_scope') == scope,
+            'native producer mutation scope differs from lifecycle evidence')
     replay_serial(root, complete=not protocol['cut_observed'])
     if protocol['cut_observed']:
         actual = replayed['nbd_trace']['cut']

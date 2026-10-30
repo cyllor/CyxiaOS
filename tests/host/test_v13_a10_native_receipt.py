@@ -201,6 +201,7 @@ class SyntheticChild:
         from run_v13_a02 import config_write_packet
         directory = directory.resolve()
         self.root, self.build_root = directory / 'receipt', directory / 'build'
+        self._artifact_cache = {}
         root = self.root
         root.mkdir()
         self.build_root.mkdir()
@@ -290,11 +291,41 @@ class SyntheticChild:
             qemu_source_commit=native.PINNED_QEMU_COMMIT, qemu_patch_sha256=native.PINNED_QEMU_PATCH_SHA256,
             qemu_source_sha256=native.PATCHED_QEMU_SOURCE_SHA256, qemu_pmu_patch_attested=True))
         (root / 'nbd').mkdir()
-        self.write('nbd/start.json', dict(run_id=context['backend_run_id'], disk_initial_sha256=initial_hash,
-            size=512*1024**2, max_pending_sectors=32768, reverse_replies=True))
-        for name in ('events.jsonl', 'requests.bin'):
-            with gzip.open(root / 'nbd' / (name + '.gz'), 'wb'): pass
-        self.write('nbd/capture.json', {})
+        nbd_start = dict(version=1, run_id=context['backend_run_id'],
+            disk_initial_sha256=initial_hash, size=512*1024**2, cut=int(cut),
+            phase='before', unflushed='drop', reverse_replies=True,
+            trace_encoding='gzip', max_pending_sectors=32768,
+            event_clock='host-monotonic-ns-v1')
+        self.write('nbd/start.json', nbd_start)
+        # One source-bound post-resume FLUSH is enough to exercise the native
+        # lifecycle partition without pretending that this synthetic fixture is
+        # a filesystem acceptance run.  Its raw mutation id is retained.
+        raw_request = struct.pack('>IHHQQI', 0x25609513, 0, 3, 1, 0, 0)
+        nbd_rows = [dict(event='request', id=1, kind=3, handle=1, offset=0,
+                         length=0, mutation=1, wire_offset=0,
+                         data_sha256=hashlib.sha256(b'').hexdigest(),
+                         monotonic_ns=1_000_000)]
+        if cut:
+            nbd_rows.append(dict(event='cut', id=1, mutation=1, phase='before',
+                surviving_offsets=[], discarded_sectors=0, acks=0, flushes=0,
+                monotonic_ns=1_000_001))
+        else:
+            nbd_rows.extend((
+                dict(event='complete', id=1, pending_sectors=0, flushes=1,
+                     monotonic_ns=1_000_001),
+                dict(event='ack', id=1,
+                     reply=struct.pack('>IIQ', 0x67446698, 0, 1).hex(),
+                     data_sha256=hashlib.sha256(b'').hexdigest(),
+                     monotonic_ns=1_000_002)))
+        event_bytes = ''.join(json.dumps(row, separators=(',', ':'))+'\n'
+                              for row in nbd_rows).encode()
+        with gzip.open(root / 'nbd/events.jsonl.gz', 'wb') as stream:
+            stream.write(event_bytes)
+        with gzip.open(root / 'nbd/requests.bin.gz', 'wb') as stream:
+            stream.write(raw_request)
+        self.write('nbd/capture.json', dict(version=1,
+            events_raw_sha256=hashlib.sha256(event_bytes).hexdigest(),
+            requests_raw_sha256=hashlib.sha256(raw_request).hexdigest()))
         for name in ('disk-before.json', 'disk-after.json'): self.write(name, {})
         for name in ('serial.txt', 'qemu-stderr.log'): (root/name).write_bytes(b'')
         identity = dict(source_sha256=self.binding['source_sha256'], build_sha256=native.sha256(root/'build-manifest.json'),
@@ -311,12 +342,14 @@ class SyntheticChild:
         for index, row in enumerate(witness): row.update(seq=index+1, monotonic_ns=index+1)
         for name, data in (('qmp.jsonl', rows), ('native-provenance.jsonl', witness)):
             (root/name).write_text(''.join(json.dumps(row)+'\n' for row in data))
+        from v13_a10_fault_scope import mutation_scope
         self.summary = dict(test_id='A10', native_acceptance_status='NOT_RUN', A10_complete=False,
                             native_filesystem_fault_matrix_complete=False, runtime_truth_attested=False,
                             scope=('one injected native prefix; no clean task completion inferred' if cut else
                                    'one ordinary EL0 clean mode; complete fault/replay/eviction matrix remains unrun'),
                             status='NOT_RUN' if cut else 'PASS', cut_observed=cut, native_mode_verified=not cut,
-                            capture_status='FAULT_CAPTURED' if cut else 'VERIFIED', binding=self.binding)
+                            capture_status='FAULT_CAPTURED' if cut else 'VERIFIED', binding=self.binding,
+                            mutation_scope=mutation_scope(root))
         if cut:
             self.summary['nbd_trace'] = dict(cut=dict(id=1,mutation=1,phase='before'))
         self.rehash()
@@ -328,8 +361,19 @@ class SyntheticChild:
         return json.loads((self.root/name).read_text())
 
     def rehash(self):
-        self.summary['artifacts'] = {path.relative_to(self.root).as_posix(): native.sha256(path)
-            for path in self.root.rglob('*') if path.is_file() and path.name != 'summary.json'}
+        artifacts = {}
+        for path in self.root.rglob('*'):
+            if not path.is_file() or path.name == 'summary.json':
+                continue
+            stat = path.stat()
+            identity = (stat.st_dev, stat.st_ino, stat.st_size,
+                        stat.st_mtime_ns, stat.st_ctime_ns)
+            cached = self._artifact_cache.get(path)
+            if cached is None or cached[0] != identity:
+                cached = (identity, native.sha256(path))
+                self._artifact_cache[path] = cached
+            artifacts[path.relative_to(self.root).as_posix()] = cached[1]
+        self.summary['artifacts'] = artifacts
         self.write('summary.json', self.summary)
 
     def verify(self):
@@ -469,12 +513,12 @@ class NativeChildScope(unittest.TestCase):
                     with self.subTest(cut=cut, field=name, value=value):
                         original = fixture.summary[name]
                         fixture.summary[name] = value
-                        fixture.rehash()
+                        fixture.write('summary.json', fixture.summary)
                         with self.assertRaisesRegex(ValueError, 'classification|scope'):
                             fixture.verify()
                         fixture.summary[name] = original
                 del fixture.summary['native_acceptance_status']
-                fixture.rehash()
+                fixture.write('summary.json', fixture.summary)
                 with self.subTest(cut=cut, field='missing native acceptance'):
                     with self.assertRaisesRegex(ValueError, 'classification|scope'):
                         fixture.verify()

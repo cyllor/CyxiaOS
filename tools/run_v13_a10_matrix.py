@@ -19,6 +19,7 @@ from verify_v13_a10_faults import overwrite_window
 from verify_v13_a10_matrix import (LOSSES, PHASES, load_run, mutation_schedule, review,
                                    select_points)
 from v13_a10_budget import scenario_budgets
+from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
 
 MATRIX_TOOLS = TOOL_NAMES
 
@@ -113,6 +114,8 @@ def _child(build_manifest: Path, initial: Path, output: Path, *, mode: int,
                       sample_ms=sample_ms)
     expected = 'NOT_RUN' if cut else 'PASS'
     require(result['status'] == expected, f'{output.name} returned {result["status"]}')
+    scope = require_post_resume_cut(output, cut) if cut else mutation_scope(output)
+    require(result.get('mutation_scope') == scope, 'A10 producer mutation scope mismatch')
     print(f'{output}: {expected}', flush=True)
     return result
 
@@ -276,8 +279,12 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
         probe_dir, probe = child('overwrite-probe', prepared, mode=2)
         probe_capture = decode((probe_dir / 'trace.bin').read_bytes(), probe['binding'])
         overwrite_rows = mutation_schedule(probe_dir)
-        overwrite_window(probe_capture, overwrite_rows)
-        selected_overwrite = select_points(overwrite_points, overwrite_rows)
+        overwrite = overwrite_window(probe_capture, overwrite_rows)
+        overwrite_scope = mutation_scope(probe_dir)
+        require(set(overwrite['points']) <= set(overwrite_scope['post_resume_points']),
+                'protected overwrite window predates guest resume')
+        selected_overwrite = select_points(
+            overwrite_points, overwrite_rows, overwrite_scope['post_resume_points'])
         child('cache-eviction', probe_dir / 'disk.raw', mode=4)
 
         for point in selected_overwrite:
@@ -289,7 +296,9 @@ def run(build_manifest: Path, output: Path, *, overwrite_points: str = 'all',
                     damaged = cut_dir / 'disk.raw'
                     recovery_probe, _ = child(case_name + '/recovery-probe', damaged, mode=3)
                     recovery_rows = mutation_schedule(recovery_probe)
-                    selected_recovery = select_points(recovery_points, recovery_rows)
+                    recovery_scope = mutation_scope(recovery_probe)
+                    selected_recovery = select_points(
+                        recovery_points, recovery_rows, recovery_scope['post_resume_points'])
                     for recovery_point in selected_recovery:
                         for recovery_phase in PHASES:
                             for recovery_loss in LOSSES:

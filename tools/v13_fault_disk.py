@@ -16,6 +16,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import uuid
 from verify_smp import require, sha
 
@@ -38,9 +39,11 @@ def receive(sock: socket.socket, size: int) -> bytes:
 class Backend:
     def __init__(self, path: Path, output: Path, *, cut: int = 0,
                  phase: str = 'before', unflushed: str = 'drop',
-                 reverse_replies: bool = False, compress: bool = False, witness=None):
+                 reverse_replies: bool = False, compress: bool = False, witness=None,
+                 event_clock: str | None = None):
         require(cut >= 0 and phase in ('before', 'after-ack'), 'invalid cut boundary')
         require(unflushed in ('drop', 'reverse-half'), 'invalid survivor rule')
+        require(event_clock in (None, 'host-monotonic-ns-v1'), 'invalid NBD event clock')
         self.path, self.output = path, output
         self.size = path.stat().st_size
         require(self.size > 0 and self.size % 512 == 0, 'unaligned export size')
@@ -49,6 +52,7 @@ class Backend:
         self.reverse_replies = reverse_replies
         self.compress = compress
         self.witness = witness
+        self.event_clock = event_clock
         self.cut_event = threading.Event()
         self.pending: dict[int, bytes] = {}
         self.requests = self.mutations = self.acks = self.flushes = 0
@@ -60,10 +64,15 @@ class Backend:
                          reverse_replies=reverse_replies,
                          trace_encoding='gzip' if compress else 'raw',
                          max_pending_sectors=MAX_PENDING)
+        if event_clock is not None:
+            self.meta['event_clock'] = event_clock
         (output/'start.json').write_text(json.dumps(self.meta, indent=2)+'\n')
 
     def log(self, event, **fields):
-        line = json.dumps(dict(event=event, **fields), separators=(',', ':'))+'\n'
+        record = dict(event=event, **fields)
+        if self.event_clock is not None:
+            record['monotonic_ns'] = time.monotonic_ns()
+        line = json.dumps(record, separators=(',', ':'))+'\n'
         self.events_hash.update(line.encode('utf-8'))
         self.events.write(line)
         self.events.flush()

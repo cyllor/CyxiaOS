@@ -36,6 +36,8 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
     require(start['phase'] in ('before', 'after-ack') and start['unflushed'] in ('drop', 'reverse-half')
             and type(start['cut']) is int and start['cut'] >= 0 and start['max_pending_sectors'] == 32768,
             'invalid fault configuration')
+    event_clock = start.get('event_clock')
+    require(event_clock in (None, 'host-monotonic-ns-v1'), 'invalid fault event clock')
     compressed = trace_encoding(directory) == 'gzip'
     raw_path = directory/('requests.bin.gz' if compressed else 'requests.bin')
     require(raw_path.stat().st_size <= 128*1024*1024, 'fault trace budget')
@@ -58,8 +60,13 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                     result[relative:relative+512] = image
             return bytes(result)
 
+        previous_ns = -1
         for position, row in enumerate(rows):
             require(cut is None, 'event after power cut')
+            if event_clock is not None:
+                require(type(row.get('monotonic_ns')) is int and row['monotonic_ns'] >= previous_ns,
+                        'missing/unordered fault event clock')
+                previous_ns = row['monotonic_ns']
             event = row['event']
             if event == 'option':
                 require(not requests, 'NBD option after transmission')

@@ -11,6 +11,7 @@ from verify_smp import require, sha
 from verify_v13_a10 import decode
 from verify_v13_a10_faults import overwrite_window
 from v13_a10_budget import scenario_budgets
+from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
 
 PHASES = ('before', 'after-ack')
 LOSSES = ('drop', 'reverse-half')
@@ -95,6 +96,8 @@ def load_run(directory: Path, *, mode: int, cut: int, phase: str, loss: str,
             and tools.get('capture_tools') == matrix.get('tools')
             and qemu == matrix.get('qemu_attestation'),
             'A10 child run identity/status mismatch: ' + str(directory))
+    scope = require_post_resume_cut(directory, cut) if cut else mutation_scope(directory)
+    require(summary.get('mutation_scope') == scope, 'matrix mutation scope differs from raw evidence')
     if cut:
         require(summary.get('cut_observed') is True
                 and summary.get('capture_status') == 'FAULT_CAPTURED'
@@ -121,11 +124,11 @@ def _recovery_name(point: int, phase: str, loss: str) -> str:
     return f'r{point:04}-{phase}-{loss}'
 
 
-def result_scope(request: dict, overwrite_points: list[int], observed_points: list[int],
+def result_scope(request: dict, overwrite_points: list[int], eligible_points: list[int],
                  primary_cases: int, recovery_mutations: int, secondary_cases: int,
                  consumed_cut: bool, reordered: bool) -> dict:
     complete = (request.get('overwrite_points') == request.get('recovery_points') == 'all'
-                and overwrite_points == observed_points
+                and overwrite_points == eligible_points
                 and primary_cases == len(overwrite_points) * len(PHASES) * len(LOSSES)
                 and recovery_mutations >= primary_cases
                 and secondary_cases == recovery_mutations * len(PHASES) * len(LOSSES)
@@ -196,7 +199,11 @@ def review(root: Path, *, child_loader=None) -> dict:
     capture = decode((probe_dir / 'trace.bin').read_bytes(), probe['binding'])
     overwrite_rows = mutation_schedule(probe_dir)
     window = overwrite_window(capture, overwrite_rows)
-    overwrite_points = select_points(request['overwrite_points'], overwrite_rows)
+    overwrite_scope = mutation_scope(probe_dir)
+    require(set(window['points']) <= set(overwrite_scope['post_resume_points']),
+            'protected overwrite window predates guest resume')
+    overwrite_points = select_points(request['overwrite_points'], overwrite_rows,
+                                     overwrite_scope['post_resume_points'])
 
     cache_dir = root / 'cache-eviction'
     cache, _ = load_child(cache_dir, mode=4, cut=0, phase='before', loss='drop',
@@ -229,7 +236,9 @@ def review(root: Path, *, child_loader=None) -> dict:
                         'recovery probe has wrong role/transport evidence')
                 reordered |= bool(recovery.get('nbd_trace', {}).get('reordered_replies'))
                 recovery_rows = mutation_schedule(recovery_probe_dir)
-                recovery_points = select_points(request['recovery_points'], recovery_rows)
+                recovery_scope = mutation_scope(recovery_probe_dir)
+                recovery_points = select_points(request['recovery_points'], recovery_rows,
+                                                recovery_scope['post_resume_points'])
                 recovery_mutations += len(recovery_points)
                 for recovery_point in recovery_points:
                     for recovery_phase in PHASES:
@@ -254,9 +263,12 @@ def review(root: Path, *, child_loader=None) -> dict:
 
     require(set(window['points']) <= set(overwrite_points) if request['overwrite_points'] == 'all' else True,
             'full matrix omitted the protected overwrite transaction')
-    return result_scope(request, overwrite_points,
-                        [row['mutation'] for row in overwrite_rows], primary_cases,
+    result = result_scope(request, overwrite_points,
+                        overwrite_scope['post_resume_points'], primary_cases,
                         recovery_mutations, secondary_cases, consumed_cut, reordered)
+    result.update(pre_resume_mutations_excluded=len(overwrite_scope['pre_resume_points']),
+                  eligible_overwrite_mutations=len(overwrite_scope['post_resume_points']))
+    return result
 
 
 def main() -> int:

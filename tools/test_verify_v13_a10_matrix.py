@@ -59,8 +59,10 @@ class A10MatrixGate(unittest.TestCase):
                     consumption_boundary=dict(present=True))
                 return result, {}
 
+            scoped = dict(post_resume_points=[1], pre_resume_points=[], raw_mutations=[1])
             with patch.object(matrix, 'decode', return_value={}), \
-                 patch.object(matrix, 'overwrite_window', return_value=dict(points=[1])):
+                 patch.object(matrix, 'overwrite_window', return_value=dict(points=[1])), \
+                 patch.object(matrix, 'mutation_scope', return_value=scoped):
                 result = matrix.review(root, child_loader=trusted_loader)
             self.assertEqual(result['status'], 'NOT_RUN')
             self.assertEqual(result['overwrite_cases'], 4)
@@ -188,8 +190,10 @@ class A10MatrixGate(unittest.TestCase):
     def test_child_forwards_frozen_qemu_budget_and_low_observer_sampling(self):
         import run_v13_a10_matrix as runner
         budgets = runner.scenario_budgets(runner.ROOT)
-        expected = dict(status='PASS')
-        with patch.object(runner, 'run_mode', return_value=expected) as invoked:
+        scope = dict(version=1, post_resume_points=[1], pre_resume_points=[], raw_mutations=[1])
+        expected = dict(status='PASS', mutation_scope=scope)
+        with patch.object(runner, 'run_mode', return_value=expected) as invoked, \
+                patch.object(runner, 'mutation_scope', return_value=scope):
             result = runner._child(
                 Path('/build.json'), Path('/initial.raw'), Path('/evidence'), mode=1,
                 budgets=budgets, artifact_cache=None, qemu=Path('/patched/qemu'),
@@ -202,6 +206,72 @@ class A10MatrixGate(unittest.TestCase):
         self.assertEqual(arguments['qemu_source'], Path('/patched/source'))
         self.assertTrue(arguments['reverse_replies'])
 
+
+class A10ResumeScopedMutations(unittest.TestCase):
+    def fixture(self):
+        from v13_a10_fault_scope import EVENT_CLOCK
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / 'nbd').mkdir()
+        (root / 'nbd' / 'start.json').write_text(json.dumps(dict(
+            version=1, trace_encoding='raw', event_clock=EVENT_CLOCK)))
+        qmp = [
+            dict(direction='send', message=dict(execute='qmp_capabilities', id=1)),
+            dict(direction='receive', message={'return': {}, 'id': 1}),
+            dict(direction='send', message=dict(execute='cont', id=2)),
+            dict(direction='receive', message={'return': {}, 'id': 2}),
+        ]
+        (root / 'qmp.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in qmp))
+        witness = [
+            dict(seq=1, monotonic_ns=10, event='qmp-request', id=1),
+            dict(seq=2, monotonic_ns=20, event='qmp-response', id=1),
+            dict(seq=3, monotonic_ns=100, event='qmp-request', id=2),
+            dict(seq=4, monotonic_ns=110, event='qmp-response', id=2),
+        ]
+        (root / 'native-provenance.jsonl').write_text(
+            ''.join(json.dumps(row) + '\n' for row in witness))
+        events = [
+            dict(event='request', id=1, kind=3, handle=1, offset=0, length=0,
+                 mutation=1, monotonic_ns=90),
+            dict(event='complete', id=1, pending_sectors=0, flushes=1, monotonic_ns=91),
+            dict(event='ack', id=1, reply='00', data_sha256='00', monotonic_ns=92),
+            dict(event='request', id=2, kind=1, handle=2, offset=0, length=512,
+                 mutation=2, monotonic_ns=120),
+            dict(event='request', id=3, kind=3, handle=3, offset=0, length=0,
+                 mutation=3, monotonic_ns=130),
+        ]
+        (root / 'nbd' / 'events.jsonl').write_text(
+            ''.join(json.dumps(row) + '\n' for row in events))
+        return root
+
+    def test_startup_mutation_is_retained_but_not_selectable(self):
+        from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
+        root = self.fixture()
+        scope = mutation_scope(root)
+        self.assertEqual(scope['raw_mutations'], [1, 2, 3])
+        self.assertEqual(scope['pre_resume_points'], [1])
+        self.assertEqual(scope['post_resume_points'], [2, 3])
+        self.assertEqual(require_post_resume_cut(root, 2), scope)
+        with self.assertRaisesRegex(ValueError, 'device startup'):
+            require_post_resume_cut(root, 1)
+
+    def test_missing_clock_and_unordered_rows_fail_closed(self):
+        from v13_a10_fault_scope import mutation_scope
+        root = self.fixture()
+        start = json.loads((root / 'nbd' / 'start.json').read_text())
+        del start['event_clock']
+        (root / 'nbd' / 'start.json').write_text(json.dumps(start))
+        with self.assertRaisesRegex(ValueError, 'resume clock'):
+            mutation_scope(root)
+        start['event_clock'] = 'host-monotonic-ns-v1'
+        (root / 'nbd' / 'start.json').write_text(json.dumps(start))
+        rows = [json.loads(line) for line in (root / 'nbd' / 'events.jsonl').read_text().splitlines()]
+        rows[-1]['monotonic_ns'] = 80
+        (root / 'nbd' / 'events.jsonl').write_text(
+            ''.join(json.dumps(row) + '\n' for row in rows))
+        with self.assertRaisesRegex(ValueError, 'unordered'):
+            mutation_scope(root)
 
 if __name__ == '__main__':
     unittest.main()
