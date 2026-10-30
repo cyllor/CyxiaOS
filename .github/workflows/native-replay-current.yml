@@ -1,4 +1,4 @@
-# Probe generation 12: validate the V0.13 pre-registration control-credit gate
+# Probe generation 13: validate the V0.13 pre-hash decision gate
 name: Native replay current
 
 on:
