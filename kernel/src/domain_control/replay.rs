@@ -1820,6 +1820,15 @@ fn receipt(
             .ok_or(Error::Overflow)?,
     })
 }
+fn refresh_baselines(s: &State, r: &mut Root) -> Result<(), Error> {
+    for i in 0..r.baseline_count {
+        let old = r.baseline[i].ok_or(Error::Conflict)?;
+        if !old.state.terminal() && old.action != Action::OfferCpu(0) {
+            r.baseline[i] = Some(receipt(s, old.apply, old.stamp, old.snapshot, old.action)?);
+        }
+    }
+    Ok(())
+}
 fn latest(s: &State, r: &Root) -> Result<Option<Receipt>, Error> {
     let Some(q) = r.request else {
         return Ok(None);
@@ -2017,13 +2026,7 @@ pub fn poll(token: Token) -> Result<Status, Error> {
                 if r.phase != Phase::Restoring || r.fault.is_none() {
                     check_configs(s, r)?;
                 }
-                for i in 0..r.baseline_count {
-                    let old = r.baseline[i].ok_or(Error::Conflict)?;
-                    if !old.state.terminal() && old.action != Action::OfferCpu(0) {
-                        r.baseline[i] =
-                            Some(receipt(s, old.apply, old.stamp, old.snapshot, old.action)?);
-                    }
-                }
+                refresh_baselines(s, r)?;
                 if let Some(old) = r.closing {
                     if !old.state.terminal() && old.action != Action::OfferCpu(0) {
                         r.closing =
@@ -2302,6 +2305,12 @@ fn publish_baseline_traced(
     } else {
         Some(policy::Clock::read(&mut NativeClock))
     };
+    if !activating {
+        // Control may have settled the current Desired before Root copied its
+        // terminal receipt. Preserve that exact outcome before replacement
+        // removes its lookup, within the original physical and CPU samples.
+        refresh_baselines(s, root_mut())?;
+    }
     // A renewal does not acquire a new Snapshot/Plan identity until its live
     // task owner is reserved. A first activation retains root.first instead;
     // its callback must finish outside the task gate before we can reserve it.

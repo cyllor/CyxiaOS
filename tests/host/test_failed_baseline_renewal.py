@@ -1,7 +1,7 @@
-"""Actual Control poll, Root receipt refresh arm and baseline_apply.
+"""Actual Control poll, Root refresh/restore and paid baseline publication prefix.
 
-Registry publication, authorization, configuration scanning and hardware are
-explicit counted boundaries. This fixture does not establish their native WCET.
+Owner reservation, Registry/storage publication, authorization, configuration
+scanning and hardware are controlled boundaries, not native WCET evidence.
 """
 import json
 from pathlib import Path
@@ -48,8 +48,22 @@ class FailedBaselineRenewal(unittest.TestCase):
         arm = function(function(replay, 'pub fn poll(token:'),
             'Phase::Frozen | Phase::Running | Phase::Restoring =>')
         body = body.replace('// ROOT_RUNNING_ARM', arm)
+        # Run the production replacement guard and paid prefix. The downstream
+        # owner reservation and Registry/Plan storage remain controlled.
+        publication = function(replay, 'fn publish_baseline_traced(')
+        publication = publication[:publication.index('    // A renewal does not acquire')]
+        publication += '    publication_boundary(s, token, closing, publication_started.unwrap())\n}'
+        body = body.replace('// PUBLICATION_PREFIX', publication + '\n'
+            + function(replay, 'pub struct Prefix {') + '\n'
+            + function(replay, 'impl Drop for Prefix {') + '\n'
+            + 'struct NativeClock;\n' + function(control, 'impl policy::Clock for NativeClock {'))
         body = body.replace('// ROOT_BODIES', '\n'.join(function(replay, sig) for sig in [
-            'fn receipt(\n', 'fn latest(', 'impl Receipt {', 'pub fn baseline_apply(', 'pub fn restore(']))
+            'fn receipt(\n', 'fn refresh_baselines(', 'fn latest(', 'impl Receipt {', 'pub fn baseline_apply(', 'pub fn restore(']))
+        prefix = prefix.replace('mod learning_evidence {', 'mod learning_evidence {\n pub type OwnerAttempt = ();')
+        prefix = prefix.replace('mod timer {', 'mod timer {\n pub fn cpu_ns(t:u64)->u64 {t}')
+        prefix = prefix.replace('Ok(None) }', 'Ok(Some(())) }', 1)
+        prefix = prefix.replace('let actual = super::timer::cpu_ticks() - start;',
+            'let actual = super::timer::cpu_ticks() - start; super::control::PAID_PREFIX_CPU.store(actual,super::Ordering::Relaxed);')
         trace = ROOT / 'kernel/src/learning_evidence/execution_trace.rs'
         prefix = prefix.replace('// TRACE_MODULE', '#[path=' + json.dumps(str(trace)) + '] mod trace;')
         code = prefix + body + '\nfn main(){control::renewal::scenarios();}\n'
@@ -61,12 +75,20 @@ class FailedBaselineRenewal(unittest.TestCase):
             command = [str(RUST_BIN / 'cargo'), 'run', '--offline', '--manifest-path',
                 str(directory / 'Cargo.toml'), '--target-dir', str(ROOT / 'target/host-failed-baseline-renewal')]
             results = [subprocess.run(command + ['--', case], cwd=ROOT, env=env(),
-                capture_output=True, text=True, timeout=120) for case in ['renewal', 'guards', 'capacity']]
+                capture_output=True, text=True, timeout=120) for case in ['renewal', 'guards', 'capacity', 'missed-sync', 'replacement-guards', 'closing-reuse', 'paid-limit']]
             self.assertTrue(all(result.returncode == 0 for result in results),
                 '\n'.join(result.stdout + result.stderr for result in results))
             for result in results:
                 self.assertIn('failed renewal custody scenarios passed', result.stdout)
             mutants = [
+                (code.replace('refresh_baselines(s, root_mut())?;', ''),
+                    'missed-sync', 'missed Root sync stranded the old receipt after replacement'),
+                (code.replace('.is_some_and(execution_blocks_replacement)', '.is_some_and(|_| false)'),
+                    'replacement-guards', 'unresolved Desired was replaced'),
+                (code.replace('        refresh_baselines(s, root_mut())?;', '')
+                    .replace('    let mut _prefix = if activating {',
+                        '    if !activating { refresh_baselines(s, root_mut())?; }\n    let mut _prefix = if activating {'),
+                    'missed-sync', 'receipt refresh escaped original publication CPU sample'),
                 (re.sub(r'let unstarted_failed_renewal =.*?;',
                     'let unstarted_failed_renewal = false;', code, count=1, flags=re.S),
                     'renewal', 'failed renewal future stamp blocked an independent successor'),
@@ -91,6 +113,7 @@ class FailedBaselineRenewal(unittest.TestCase):
                 negative = subprocess.run(command + ['--', case], cwd=ROOT, env=env(),
                     capture_output=True, text=True, timeout=120)
                 self.assertNotEqual(negative.returncode, 0, failure)
+                self.assertNotIn('error[E', negative.stderr, negative.stderr)
                 self.assertIn(failure, negative.stdout + negative.stderr)
 
 
