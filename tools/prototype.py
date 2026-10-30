@@ -151,19 +151,27 @@ def main(argv: list[str] | None = None) -> int:
                       help='independent CI lane; default runs all host validation gates')
     report = sub.add_parser('report', help='independently validate the 1.3 catalogue')
     report.add_argument('--manifest', type=Path, default=DEFAULT)
+    report.add_argument('--scope', choices=['all', 'A'], default='all',
+                        help='completion target only; all catalogue rows remain validated')
+    report.add_argument('--qemu-source', type=Path,
+                        help='trusted patched-QEMU source for independent A02 receipt replay')
     report.add_argument('--output', type=Path, help='optional new JSON file; otherwise stdout')
     args = parser.parse_args(argv)
     try:
         if args.command == 'test':
             return run_steps(test_steps(args.fetch, args.lane), args.output)
-        result = validate(read_json(args.manifest), ROOT)
+        options = {} if args.qemu_source is None else {'qemu_source': args.qemu_source}
+        result = validate(read_json(args.manifest), ROOT, **options)
+        result['selected_scope'] = args.scope
+        result['selected_scope_complete'] = result[
+            'a_acceptance_complete' if args.scope == 'A' else 'functional_acceptance_complete']
         text = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
         if args.output is not None:
             with args.output.open('x') as destination:
                 destination.write(text)
         else:
             sys.stdout.write(text)
-        return 0 if result['functional_acceptance_complete'] else 2
+        return 0 if result['selected_scope_complete'] else 2
     except (OSError, ValueError, TypeError) as error:
         print(f'prototype: {error}', file=sys.stderr)
         return 1

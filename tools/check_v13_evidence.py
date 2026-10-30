@@ -116,9 +116,18 @@ def validate(document, root=ROOT, *, qemu_source=None):
             'Invalid filesystem matrix status')
     require(fs['frozen'] is False and fs['evidence'] is None,
             'No reviewed native filesystem fault matrix verifier is registered')
+    # Only count after every row, definition and receipt has passed validation.
+    # The legacy states field includes 18 action families; it is not an A/T/E
+    # denominator. A-only completion never changes global release acceptance.
+    groups = {group: {status: 0 for status in ('PASS', 'FAIL', 'NOT_RUN')}
+              for group in ('A', 'T', 'E')}
+    for row in document['cases']:
+        groups[row['id'][0]][row['status']] += 1
     return {'schema_version': 1, 'spec_version': '1.3', 'catalogue_valid': True,
             'mandatory_cases': len(CASE_IDS), 'action_families': len(FAMILIES),
             'states': {s: cases[s] + actions[s] for s in cases},
+            'case_states': cases, 'action_states': actions, 'case_groups': groups,
+            'a_acceptance_complete': groups['A']['PASS'] == 16,
             'filesystem_fault_matrix_complete': False,
             'functional_acceptance_complete': False, 'strict_spec_conformance': False,
             'approved_deviations': deviations, 'runtime_truth_attested': False,

@@ -830,8 +830,7 @@ pub(crate) fn timer_preparation(key: ObjectKey, at: u64) -> Result<TimerPreparat
         return Err(Error::Stale);
     }
     inspect_view(|view| {
-        if view.soft_timers == 0
-            || view.measurement_core != CORE_GENERATION.load(Ordering::Acquire)
+        if view.soft_timers == 0 || view.measurement_core != CORE_GENERATION.load(Ordering::Acquire)
         {
             return Err(Error::NotReady);
         }
