@@ -1,0 +1,39 @@
+name: V012 verified test fixtures
+on:
+  push:
+    branches: [codex/v012-tools-20261030]
+    paths: ['.github/workflows/v012-test-fixtures.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Prepare exact test dependencies
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview
+          python3 -B tools/prepare_host_tests.py --fetch
+          out="$RUNNER_TEMP/test-fixtures"
+          mkdir -p "$out"
+          python3 -B tools/prepare_host_tests.py > "$out/fixture-verification.json"
+          tar -czf "$out/host-fixtures.tar.gz" artifacts/cosmic-sources artifacts/smithay-research artifacts/smithay-wayland-research
+          tar -C "$(rustc --print sysroot)" -czf "$out/llvm-tools.tar.gz" lib/rustlib/x86_64-unknown-linux-gnu/bin lib/rustlib/x86_64-unknown-linux-gnu/lib
+          rustc -vV > "$out/rust-version.txt"
+          git rev-parse HEAD > "$out/export-commit.txt"
+          cd "$out"
+          sha256sum *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v012-test-fixtures-${{ github.sha }}
+          path: ${{ runner.temp }}/test-fixtures/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
