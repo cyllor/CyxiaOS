@@ -1,0 +1,131 @@
+name: Verify exact V0.13 delivered repairs
+
+on:
+  push:
+    branches: [work/v013-repair-verification-20261030]
+    paths: ['.github/codex/v013-pending-delivered.patch']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v013-delivered-repair-verification
+  cancel-in-progress: false
+
+env:
+  BASE_COMMIT: '396b8777a9d72a47aa9e24aa432e4e1fca265ac4'
+  EXPECTED_TREE: '67550daeb119a2d5bee14f8ea5e7d490d0f62733'
+  PATCH_SHA256: 'f741458ac033bd7dda0b02bb020da1702bca126c5afc09a410961f5ac61af536'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  validate:
+    name: repair-${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [static, rust, host, tools]
+    steps:
+      - name: Check out verification source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Reconstruct exact product source without helper files
+        run: |
+          set -euo pipefail
+          cp .github/codex/v013-pending-delivered.patch "$RUNNER_TEMP/repairs.patch"
+          echo "$PATCH_SHA256  $RUNNER_TEMP/repairs.patch" | sha256sum --check -
+          git checkout --detach "$BASE_COMMIT"
+          git apply --check "$RUNNER_TEMP/repairs.patch"
+          git apply --index "$RUNNER_TEMP/repairs.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          mkdir -p "$RUNNER_TEMP/repair-evidence"
+          git diff --cached --stat > "$RUNNER_TEMP/repair-evidence/source-diff.txt"
+          git write-tree > "$RUNNER_TEMP/repair-evidence/source-tree.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/repair-evidence/base-commit.txt"
+      - name: Install pinned compiler and dependencies
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          rustc -vV > "$RUNNER_TEMP/repair-evidence/rust-version.txt"
+      - name: Run static, Rust or evidence-tool lane
+        if: matrix.lane != 'host'
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/prototype.py test --lane "$LANE" --output "$RUNNER_TEMP/repair-evidence/checks"
+      - name: Run all affected host regression suites
+        if: matrix.lane == 'host'
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY' 2>&1 | tee "$RUNNER_TEMP/repair-evidence/host.log"
+          import sys
+          import unittest
+          patterns = ['test_governance_turn.py', 'test_prototype_process_cleanup.py', 'test_prototype_validation_lanes.py', 'test_v13_a02_native.py', 'test_v13_a02_qemu.py', 'test_v13_evidence.py', 'test_v13_native_probe_slice.py']
+          loader = unittest.TestLoader()
+          suite = unittest.TestSuite()
+          for pattern in patterns:
+              suite.addTests(loader.discover('tests/host', pattern=pattern))
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(not result.wasSuccessful())
+          PY
+      - name: Confirm tracked source was not rewritten by tests
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+      - name: Retain actual verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v013-repair-${{ matrix.lane }}-${{ github.sha }}
+          path: ${{ runner.temp }}/repair-evidence/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish-candidate:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Publish only the verified candidate branch, not V0.13
+        run: |
+          set -euo pipefail
+          cp .github/codex/v013-pending-delivered.patch "$RUNNER_TEMP/repairs.patch"
+          echo "$PATCH_SHA256  $RUNNER_TEMP/repairs.patch" | sha256sum --check -
+          git checkout --detach "$BASE_COMMIT"
+          git apply --check "$RUNNER_TEMP/repairs.patch"
+          git apply --index "$RUNNER_TEMP/repairs.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git config user.name 'CyxiaOS Integration Assistant'
+          git config user.email 'integration-assistant@users.noreply.github.com'
+          git commit -m 'fix(v0.13): integrate verified pending prototype repairs' -m 'Integrate the exact 28-file delivered source tree after independent static, Rust, affected-host and evidence-tool checks. Preserve the original budget, deadline, permissions and branch audit. This is source integration, not native runtime or full-prototype acceptance. Helper workflows and patch transport files are excluded.'
+          test "$(git rev-parse HEAD^)" = "$BASE_COMMIT"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          target="refs/heads/codex/v013-reviewed-repairs-${GITHUB_RUN_ID}"
+          test -z "$(git ls-remote --heads origin "$target")"
+          git push origin "HEAD:$target"
+          commit="$(git rev-parse HEAD)"
+          test "$(git ls-remote origin "$target" | cut -f1)" = "$commit"
+          printf 'candidate_ref=%s\ncandidate_commit=%s\nsource_tree=%s\n' "$target" "$commit" "$EXPECTED_TREE" | tee "$RUNNER_TEMP/candidate.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v013-verified-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate.txt
+          retention-days: 7
+          if-no-files-found: error
