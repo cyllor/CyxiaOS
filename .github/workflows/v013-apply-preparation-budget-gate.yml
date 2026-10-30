@@ -80,27 +80,14 @@ jobs:
 
           control_path = Path("kernel/src/domain_control.rs")
           control = control_path.read_text()
-          anchor = """    if let Some(pending) = s.preparation {
-              pending.total(
-                  preparation_identity,
-                  now(),
-                  timer::cpu_elapsed_ns(cpu_started),
-              )?;
-          }
-          let evidence = if read_only {
-          """
-          replacement = """    if let Some(pending) = s.preparation {
-              pending.total(
-                  preparation_identity,
-                  now(),
-                  timer::cpu_elapsed_ns(cpu_started),
-              )?;
-          }
-          preparation::check_pre_registration(timer::cpu_elapsed_ns(cpu_started))?;
-          let evidence = if read_only {
-          """
+          anchor = "    let evidence = if read_only {\n"
+          replacement = (
+              "    preparation::check_pre_registration("
+              "timer::cpu_elapsed_ns(cpu_started))?;\n"
+              + anchor
+          )
           if control.count(anchor) != 1:
-              raise SystemExit("encode_job_inner budget anchor changed")
+              raise SystemExit("encode_job_inner evidence anchor changed")
           control_path.write_text(control.replace(anchor, replacement, 1))
           PY
           git diff --check
