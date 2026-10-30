@@ -19,13 +19,13 @@ jobs:
       - name: Prepare exact test dependencies
         run: |
           set -euo pipefail
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --component clippy --component rustfmt --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
           python3 -B tools/prepare_host_tests.py --fetch
           out="$RUNNER_TEMP/test-fixtures"
           mkdir -p "$out"
           python3 -B tools/prepare_host_tests.py > "$out/fixture-verification.json"
           tar -czf "$out/host-fixtures.tar.gz" artifacts/cosmic-sources artifacts/smithay-research artifacts/smithay-wayland-research
-          tar -C "$(rustc --print sysroot)" -czf "$out/llvm-tools.tar.gz" lib/rustlib/x86_64-unknown-linux-gnu/bin lib/rustlib/x86_64-unknown-linux-gnu/lib
+          tar -C "$(rustc --print sysroot)" -czf "$out/llvm-tools.tar.gz" lib/rustlib/x86_64-unknown-linux-gnu/bin lib/rustlib/x86_64-unknown-linux-gnu/lib lib/rustlib/aarch64-unknown-none lib/rustlib/multirust-config.toml lib/rustlib/components lib/rustlib/manifest-rust-std-aarch64-unknown-none lib/rustlib/manifest-llvm-tools-preview-x86_64-unknown-linux-gnu
           rustc -vV > "$out/rust-version.txt"
           git rev-parse HEAD > "$out/export-commit.txt"
           cd "$out"
