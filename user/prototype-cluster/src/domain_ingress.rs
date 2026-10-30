@@ -259,6 +259,7 @@ pub struct TlsEgress {
     frame_remaining: usize,
     frame_reserved: bool,
     encrypted_reserved: bool,
+    owned_reserved: Option<bool>,
     last_round: TxRound,
 }
 impl TlsEgress {
@@ -277,6 +278,7 @@ impl TlsEgress {
             frame_remaining: 0,
             frame_reserved: true,
             encrypted_reserved: true,
+            owned_reserved: None,
             last_round: TxRound::default(),
         })
     }
@@ -335,7 +337,10 @@ impl TlsEgress {
         now: u64,
         transport: &mut T,
     ) -> Result<TxRound, Error> {
-        if !outbox.outgoing().is_empty() || !session.pending_tls().is_empty() {
+        if !outbox.outgoing().is_empty()
+            || !session.pending_tls().is_empty()
+            || session.has_pending_plaintext()
+        {
             self.scheduler.mark_ready(self.connection)?;
         }
         let mut turn = SendTurn {
@@ -346,6 +351,7 @@ impl TlsEgress {
             frame_remaining: &mut self.frame_remaining,
             frame_reserved: &mut self.frame_reserved,
             encrypted_reserved: &mut self.encrypted_reserved,
+            owned_reserved: &mut self.owned_reserved,
         };
         let round = self.scheduler.service(now, &mut turn)?;
         self.last_round = round;
@@ -394,6 +400,7 @@ impl TlsEgress {
         self.frame_remaining = 0;
         self.frame_reserved = true;
         self.encrypted_reserved = true;
+        self.owned_reserved = None;
     }
     /// The caller has closed and dropped the previous TLS/TCP generation.
     pub fn begin_session(&mut self, epoch: u64) -> Result<(), Error> {
@@ -418,6 +425,7 @@ struct SendTurn<'s, 'b, O, T> {
     frame_remaining: &'s mut usize,
     frame_reserved: &'s mut bool,
     encrypted_reserved: &'s mut bool,
+    owned_reserved: &'s mut Option<bool>,
 }
 impl<O: RpcOutbox, T: TlsTransport> SendTurn<'_, '_, O, T> {
     fn head(&mut self) -> Result<Option<bool>, Error> {
@@ -437,42 +445,53 @@ impl<O: RpcOutbox, T: TlsTransport> SendTurn<'_, '_, O, T> {
     }
     fn send(&mut self, reserved: bool) -> Result<TxStep, Error> {
         if self.session.pending_tls().is_empty() && self.session.authenticated_peer().is_some() {
-            if self.head()? != Some(reserved) {
-                return Ok(TxStep {
-                    sent: false,
-                    still_ready: !self.outbox.outgoing().is_empty(),
-                });
-            }
-            let count = self
-                .outbox
-                .outgoing()
-                .len()
-                .min(*self.frame_remaining)
-                .min(PLAINTEXT_BUFFER);
-            match self
-                .session
-                .send_plaintext(&self.outbox.outgoing()[..count])
-            {
-                Ok(()) => {
-                    self.outbox.consume(count);
-                    *self.frame_remaining -= count;
-                    *self.encrypted_reserved = reserved;
-                }
-                Err(TlsError::WouldBlock) => {
+            if !self.session.has_pending_plaintext() {
+                if self.head()? != Some(reserved) {
                     return Ok(TxStep {
                         sent: false,
-                        still_ready: true,
+                        still_ready: !self.outbox.outgoing().is_empty(),
                     });
                 }
-                Err(_) => return Err(Error::Io),
+                let count = self
+                    .outbox
+                    .outgoing()
+                    .len()
+                    .min(*self.frame_remaining)
+                    .min(PLAINTEXT_BUFFER);
+                match self
+                    .session
+                    .send_plaintext(&self.outbox.outgoing()[..count])
+                {
+                    Ok(()) => {
+                        self.outbox.consume(count);
+                        *self.frame_remaining -= count;
+                        *self.owned_reserved = Some(reserved);
+                    }
+                    Err(TlsError::WouldBlock) => {
+                        return Ok(TxStep {
+                            sent: false,
+                            still_ready: true,
+                        });
+                    }
+                    Err(_) => return Err(Error::Io),
+                }
             }
             self.session.pump(self.now_ms).map_err(|_| Error::Io)?;
+        }
+        if !self.session.pending_tls().is_empty() {
+            if self.session.has_pending_plaintext() {
+                // Protocol output precedes the accepted application prefix.
+                *self.encrypted_reserved = true;
+            } else if let Some(class) = self.owned_reserved.take() {
+                *self.encrypted_reserved = class;
+            }
         }
         if self.session.pending_tls().is_empty() || *self.encrypted_reserved != reserved {
             return Ok(TxStep {
                 sent: false,
                 still_ready: !self.outbox.outgoing().is_empty()
-                    || !self.session.pending_tls().is_empty(),
+                    || !self.session.pending_tls().is_empty()
+                    || self.session.has_pending_plaintext(),
             });
         }
         let count = self.session.pending_tls().len().min(PAYLOAD);
@@ -495,7 +514,8 @@ impl<O: RpcOutbox, T: TlsTransport> SendTurn<'_, '_, O, T> {
         Ok(TxStep {
             sent: sent != 0,
             still_ready: !self.session.pending_tls().is_empty()
-                || !self.outbox.outgoing().is_empty(),
+                || !self.outbox.outgoing().is_empty()
+                || self.session.has_pending_plaintext(),
         })
     }
 }

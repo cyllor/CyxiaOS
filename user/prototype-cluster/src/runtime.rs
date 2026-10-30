@@ -280,18 +280,21 @@ pub fn run() -> ! {
             if driver.domain_tick(now_ns).is_err() {
                 break (SessionExitReason::DomainTick, 0x4000);
             }
-            match broker::request(OP_READ, &[], &mut input, 0, [0; 3]) {
-                Ok((n, _)) => {
-                    if n > 0 {
-                        match session.receive_tls(&input[..n]) {
-                            Ok(accepted) if accepted == n => (),
-                            Ok(_) => break (SessionExitReason::TlsReceive, 0x4003),
-                            Err(e) => break (SessionExitReason::TlsReceive, tls_result(&e)),
+            let read_capacity = session.receive_capacity().min(input.len());
+            if read_capacity != 0 {
+                match broker::request(OP_READ, &[], &mut input[..read_capacity], 0, [0; 3]) {
+                    Ok((n, _)) => {
+                        if n > 0 {
+                            match session.receive_tls(&input[..n]) {
+                                Ok(accepted) if accepted == n => (),
+                                Ok(_) => break (SessionExitReason::TlsReceive, 0x4003),
+                                Err(e) => break (SessionExitReason::TlsReceive, tls_result(&e)),
+                            }
                         }
                     }
+                    Err(AGAIN) => {}
+                    Err(e) => break (SessionExitReason::TcpRead, 0x3000 + e),
                 }
-                Err(AGAIN) => {}
-                Err(e) => break (SessionExitReason::TcpRead, 0x3000 + e),
             }
             if let Err(e) = session.pump(now) {
                 break (SessionExitReason::TlsPump, tls_result(&e));

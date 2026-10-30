@@ -357,3 +357,36 @@ fn replayed_authenticated_record_revokes_the_session() {
     assert_eq!(b.authenticated_peer(), None);
     assert!(b.plaintext().is_empty());
 }
+
+#[test]
+fn clock_failure_and_eof_revoke_owned_plaintext_during_duplex_backpressure() {
+    for failure in 0..3 {
+        let clock = Arc::new(Time(AtomicBool::new(true)));
+        let [small, large] = pairings(clock.clone());
+        let mut ab = Buffers::new();
+        let mut bb = Buffers::new();
+        let mut a = small.client(&mut ab, 0).unwrap();
+        let mut b = large.server(&mut bb, 0).unwrap();
+        handshake(&mut a, &mut b).unwrap();
+        a.send_plaintext(b"fragmented ingress").unwrap();
+        a.pump(100).unwrap();
+        b.receive_tls(&a.pending_tls()[..3]).unwrap();
+        b.send_plaintext(b"owned outbound").unwrap();
+        b.pump(100).unwrap();
+        assert!(b.has_pending_plaintext() && b.pending_tls().is_empty());
+        assert!(b.receive_capacity() > 0);
+        match failure {
+            0 => assert!(matches!(b.pump(99), Err(Error::Clock))),
+            1 => {
+                clock.0.store(false, Ordering::Relaxed);
+                assert!(matches!(b.pump(100), Err(Error::Time)));
+            }
+            _ => b.abort(),
+        }
+        assert!(!b.has_pending_plaintext());
+        assert_eq!(b.receive_capacity(), 0);
+        assert!(b.pending_tls().is_empty() && b.plaintext().is_empty());
+        assert_eq!(b.authenticated_peer(), None);
+        assert!(matches!(b.pump(100), Err(Error::Closed)));
+    }
+}
