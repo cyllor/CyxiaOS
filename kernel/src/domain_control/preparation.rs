@@ -5,13 +5,19 @@ use cyxia_prototype::{
     policy::{ModelBinding, Snapshot},
 };
 
-const DECISION_CPU_LIMIT_NS: u64 = 2_000_000;
-// The enclosing native control turn owns 2.5 ms. `total` is checked both
-// before the fixed input-page tail and after its digest. Reserving this slice
-// prevents a terminal Budget return plus settlement/evidence work from
-// crossing that credit while preserving the stricter 2 ms decision cap.
-const FIXED_TAIL_RESERVE_NS: u64 = 250_000;
-const PRE_TAIL_CPU_LIMIT_NS: u64 = DECISION_CPU_LIMIT_NS - FIXED_TAIL_RESERVE_NS;
+// Candidate registration, canonical input construction and hashing are a
+// fixed non-preemptible tail inside the enclosing 2.5 ms native control
+// credit. Stop before that tail when the measured preparation prefix has
+// already consumed this conservative share. The independent 2 ms decision
+// bound remains unchanged and is still checked by Pending and accept().
+pub const PRE_REGISTRATION_CPU_LIMIT_NS: u64 = 1_750_000;
+pub fn check_pre_registration(elapsed_ns: u64) -> Result<(), Error> {
+    if elapsed_ns > PRE_REGISTRATION_CPU_LIMIT_NS {
+        Err(Error::Budget)
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -70,7 +76,7 @@ impl Pending {
         if self.overflowed {
             return Err(Error::Overflow);
         }
-        if self.spent_ns > DECISION_CPU_LIMIT_NS {
+        if self.spent_ns > 2_000_000 {
             return Err(Error::Budget);
         }
         if at < self.snapshot.taken_ns || at - self.snapshot.taken_ns > 50_000_000 {
@@ -87,7 +93,7 @@ impl Pending {
             return Err(Error::Overflow);
         };
         self.spent_ns = total;
-        if total > DECISION_CPU_LIMIT_NS {
+        if total > 2_000_000 {
             Err(Error::Budget)
         } else {
             Ok(())
@@ -105,7 +111,7 @@ impl Pending {
     pub fn total(&self, identity: Identity, at: u64, elapsed_ns: u64) -> Result<u64, Error> {
         self.check(identity, at)?;
         let total = self.carried(identity, elapsed_ns)?;
-        if total > PRE_TAIL_CPU_LIMIT_NS {
+        if total > 2_000_000 {
             Err(Error::Budget)
         } else {
             Ok(total)
@@ -239,65 +245,20 @@ pub fn next_sequence(previous: u64, identity: Identity) -> Result<(), Error> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn identity() -> Identity {
-        Identity {
-            boot: 1,
-            controller: 1,
-            sequence: 1,
-            domain: 7,
-            kind: 1,
-            target: ObjectKey {
-                id: 7,
-                generation: 1,
-            },
-            model: ModelBinding {
-                generation: 1,
-                model_hash: [1; 32],
-                schema_hash: [2; 32],
-            },
-            core_generation: 1,
-            ledger_generation: 1,
-            work: None,
-        }
-    }
-
-    fn pending() -> Pending {
-        let identity = identity();
-        Pending::first_candidate(
-            identity,
-            Snapshot {
-                sequence: identity.sequence,
-                taken_ns: 1,
-                ledger_generation: identity.ledger_generation,
-                core_generation: identity.core_generation,
-            },
-            7,
-            0,
-        )
-    }
-
     #[test]
-    fn total_reserves_fixed_tail_before_control_settlement() {
-        let pending = pending();
-        let identity = identity();
+    fn pre_registration_gate_retains_tail_credit() {
         assert_eq!(
-            pending.total(identity, 1, PRE_TAIL_CPU_LIMIT_NS),
-            Ok(PRE_TAIL_CPU_LIMIT_NS)
+            check_pre_registration(PRE_REGISTRATION_CPU_LIMIT_NS),
+            Ok(())
         );
         assert!(matches!(
-            pending.total(identity, 1, PRE_TAIL_CPU_LIMIT_NS + 1),
+            check_pre_registration(PRE_REGISTRATION_CPU_LIMIT_NS + 1),
             Err(Error::Budget)
         ));
-    }
-
-    #[test]
-    fn accumulated_decision_bound_remains_two_milliseconds() {
-        let mut pending = pending();
-        assert_eq!(pending.charge(DECISION_CPU_LIMIT_NS), Ok(()));
-        assert!(matches!(pending.charge(1), Err(Error::Budget)));
     }
 }

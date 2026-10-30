@@ -1767,6 +1767,7 @@ fn encode_job_inner(
             timer::cpu_elapsed_ns(cpu_started),
         )?;
     }
+    preparation::check_pre_registration(timer::cpu_elapsed_ns(cpu_started))?;
     let evidence = if read_only {
         None
     } else {
