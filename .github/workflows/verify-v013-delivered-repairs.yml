@@ -3,7 +3,9 @@ name: Verify exact V0.13 delivered repairs
 on:
   push:
     branches: [work/v013-repair-verification-20261030]
-    paths: ['.github/codex/v013-pending-delivered.patch']
+    paths:
+      - '.github/codex/v013-pending-delivered*.patch'
+      - '.github/workflows/verify-v013-delivered-repairs.yml'
   workflow_dispatch:
 
 permissions:
@@ -38,14 +40,19 @@ jobs:
       - name: Reconstruct exact product source without helper files
         run: |
           set -euo pipefail
-          cp .github/codex/v013-pending-delivered.patch "$RUNNER_TEMP/repairs.patch"
+          mkdir -p "$RUNNER_TEMP/repair-evidence"
+          cat .github/codex/v013-pending-delivered.patch \
+              .github/codex/v013-pending-delivered.part-02.patch \
+              .github/codex/v013-pending-delivered.part-03.patch \
+              .github/codex/v013-pending-delivered.part-04.patch \
+              > "$RUNNER_TEMP/repairs.patch"
+          sha256sum "$RUNNER_TEMP/repairs.patch" | tee "$RUNNER_TEMP/repair-evidence/patch.sha256"
           echo "$PATCH_SHA256  $RUNNER_TEMP/repairs.patch" | sha256sum --check -
           git checkout --detach "$BASE_COMMIT"
           git apply --check "$RUNNER_TEMP/repairs.patch"
           git apply --index "$RUNNER_TEMP/repairs.patch"
           git diff --cached --check
           test "$(git write-tree)" = "$EXPECTED_TREE"
-          mkdir -p "$RUNNER_TEMP/repair-evidence"
           git diff --cached --stat > "$RUNNER_TEMP/repair-evidence/source-diff.txt"
           git write-tree > "$RUNNER_TEMP/repair-evidence/source-tree.txt"
           git rev-parse HEAD > "$RUNNER_TEMP/repair-evidence/base-commit.txt"
@@ -63,6 +70,19 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/prototype.py test --lane "$LANE" --output "$RUNNER_TEMP/repair-evidence/checks"
+      - name: Link independent governance image
+        if: matrix.lane == 'static'
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/governance-target"
+          cargo rustc --release --locked --offline \
+            --target aarch64-unknown-none-softfloat \
+            --manifest-path user/prototype-governance/Cargo.toml -- \
+            -C relocation-model=static -C link-arg=--build-id=none \
+            -C link-arg=-zmax-page-size=4096 \
+            -C link-arg=-T"$GITHUB_WORKSPACE/user/prototype-governance/linker.ld" \
+            2>&1 | tee "$RUNNER_TEMP/repair-evidence/governance-link.log"
+          test -s "$CARGO_TARGET_DIR/aarch64-unknown-none-softfloat/release/prototype-governance"
       - name: Run all affected host regression suites
         if: matrix.lane == 'host'
         run: |
@@ -105,7 +125,11 @@ jobs:
       - name: Publish only the verified candidate branch, not V0.13
         run: |
           set -euo pipefail
-          cp .github/codex/v013-pending-delivered.patch "$RUNNER_TEMP/repairs.patch"
+          cat .github/codex/v013-pending-delivered.patch \
+              .github/codex/v013-pending-delivered.part-02.patch \
+              .github/codex/v013-pending-delivered.part-03.patch \
+              .github/codex/v013-pending-delivered.part-04.patch \
+              > "$RUNNER_TEMP/repairs.patch"
           echo "$PATCH_SHA256  $RUNNER_TEMP/repairs.patch" | sha256sum --check -
           git checkout --detach "$BASE_COMMIT"
           git apply --check "$RUNNER_TEMP/repairs.patch"
