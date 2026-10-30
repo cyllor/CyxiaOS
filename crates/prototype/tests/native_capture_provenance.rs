@@ -91,7 +91,11 @@ fn sources() -> [Source; 3] {
     .map(|class| Source {
         owner: key(11 + class as u64),
         class,
-        allowed_cores: 1,
+        allowed_cores: if class == CpuClass::ExecutorWork {
+            9
+        } else {
+            1
+        },
     })
 }
 fn begin(trial: u64) -> RunKey {
@@ -149,46 +153,16 @@ fn close_and_export(incomplete: bool) -> cyxia_prototype::learning::capture::Sea
 }
 
 #[test]
-fn actual_completed_sources_are_attributed_without_changing_capture() {
+fn paid_entries_do_not_claim_completion_or_rewrite_capture() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let storage = Box::leak(Box::new(bridge::Storage::empty()));
             ALLOCATION.store(storage as *mut bridge::Storage as usize, Ordering::Release);
             bridge::install(storage, [1; 32], 7, key(44), pool_check)
-                .map_err(|(error, _)| error)
+                .map_err(|(e, _)| e)
                 .unwrap();
             bridge::register_source_classifier(classify).unwrap();
-            let run = begin(1);
-            domain_platform::at(OBS + 200_000_100);
-            let mut attempt = bridge::attempt_work(key(99), false).unwrap().unwrap();
-            bridge::finish_attempt(&mut attempt, OBS + 200_000_000, OBS + 200_000_037).unwrap();
-            drop(attempt);
-            let words = bridge::test_support::source_snapshot();
-            assert_eq!(
-                &words[3..6],
-                &[7, 1, 1],
-                "source provenance lost the original full RunKey"
-            );
-            assert_eq!(&words[6..10], &[1, 1, 0, 0]);
-            assert_eq!(
-                &words[16..24],
-                &[99, 1, 13, 1, 2, 0, 1, 37],
-                "original child and resolved source must stay distinct"
-            );
-            assert_eq!(
-                &words[24..28],
-                &[
-                    OBS + 200_000_000,
-                    OBS + 200_000_037,
-                    OBS + 200_000_000,
-                    OBS + 200_000_037
-                ]
-            );
-            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 37, 0]);
-            let seal = close_and_export(false);
-            assert_eq!(seal.key, run);
-            assert_eq!(seal.exclusion, None);
             let mut rows = [CpuInterval {
                 node: [0; 32],
                 core: 0,
@@ -196,129 +170,204 @@ fn actual_completed_sources_are_attributed_without_changing_capture() {
                 end_ns: 0,
                 class: CpuClass::Policy,
             }; 2];
+            // Generic measurement/completion has no proved enclosing ledger sample.
+            // Its original capture works, but it adds no diagnostic observation.
+            begin(1);
+            domain_platform::at(OBS + 200_000_000);
+            bridge::measure_task(key(99), CpuClass::ExecutorWork, identity(2, 70), || {
+                domain_platform::at(OBS + 200_000_037)
+            });
+            assert_eq!(bridge::test_support::source_snapshot(), [0; 128]);
+            let seal = close_and_export(false);
+            assert_eq!(seal.intervals, 1);
+            assert_eq!(seal.exclusion, None);
+            bridge::retire_exported(seal).unwrap();
+
+            let mut copied_without_attempt = false;
+            bridge::measure_paid_task(key(13), CpuClass::ExecutorWork, |entry| {
+                if let Some(entry) = entry {
+                    entry.observe(|| {
+                        copied_without_attempt = true;
+                        identity(2, 70)
+                    });
+                }
+            });
+            assert!(
+                !copied_without_attempt,
+                "no-attempt path copied TaskIdentity"
+            );
+            assert_eq!(bridge::test_support::source_snapshot(), [0; 128]);
+
+            // Unit fixture supplies the paid boundary; the dedicated source-cost
+            // harness checks real TaskGuard cleanup/service-I/O and Scheduler debit.
+            let run = begin(2);
+            domain_platform::at(OBS + 200_000_000);
+            let reads = domain_platform::reads();
+            bridge::measure_paid_task(key(13), CpuClass::ExecutorWork, |entry| {
+                entry.unwrap().observe(|| identity(2, 70));
+                domain_platform::at(OBS + 200_000_037)
+            });
+            assert_eq!(
+                domain_platform::reads() - reads,
+                4,
+                "diagnostic probe added a clock read"
+            );
+            let words = bridge::test_support::source_snapshot();
+            assert_eq!(
+                &words[0..2],
+                &[0x4359535243450001, 2],
+                "source provenance missing paid observation header"
+            );
+            assert_eq!(
+                &words[3..6],
+                &[7, 2, 2],
+                "source provenance lost full RunKey"
+            );
+            assert_eq!(&words[6..12], &[1, 1, 0, 0, 0, 1]);
+            assert_eq!(&words[16..24], &[13, 1, 13, 1, 2, 0, 2, 1]);
+            assert_eq!(
+                &words[24..34],
+                &[
+                    OBS + 200_000_000,
+                    OBS + 200_000_000,
+                    1,
+                    1,
+                    70,
+                    8,
+                    9,
+                    4097,
+                    6,
+                    2
+                ],
+                "TaskGuard caller/request/child identity was not copied"
+            );
+            let counters = bridge::status().unwrap();
+            let reads = domain_platform::reads();
+            assert_eq!(bridge::test_support::source_snapshot(), words);
+            assert_eq!(domain_platform::reads(), reads);
+            assert_eq!(
+                bridge::status().unwrap(),
+                counters,
+                "diagnostic snapshot mutated capture counters"
+            );
+            let seal = close_and_export(false);
+            assert_eq!(seal.key, run);
+            assert_eq!(seal.exclusion, None);
             assert_eq!(bridge::copy_intervals(seal, 0, &mut rows).unwrap(), 1);
             assert_eq!(
                 (rows[0].start_ns, rows[0].end_ns),
                 (OBS + 200_000_000, OBS + 200_000_037)
             );
             bridge::retire_exported(seal).unwrap();
-            // Full caller generation and request identity are copied, even when
-            // two callers reuse request9. Source aggregation grants no identity.
-            begin(2);
-            domain_platform::at(OBS + 200_000_000);
-            let reads = domain_platform::reads();
-            bridge::measure_task(
-                key(13),
-                CpuClass::ExecutorWork,
-                bridge::TaskIdentity {
-                    site: 2,
-                    caller: ObjectKey {
-                        id: 70,
-                        generation: 8,
-                    },
-                    request: 9,
-                    child: ObjectKey {
-                        id: 4097,
-                        generation: 6,
-                    },
-                    recipe: 2,
-                },
-                || domain_platform::at(OBS + 200_000_037),
-            );
-            assert_eq!(
-                domain_platform::reads() - reads,
-                4,
-                "diagnostics added a clock read"
-            );
-            let words = bridge::test_support::source_snapshot();
-            assert_eq!(&words[3..6], &[7, 2, 2]);
-            assert_eq!(words[12], 1);
-            assert_eq!(
-                &words[29..37],
-                &[1, 2, 70, 8, 9, 4097, 6, 2],
-                "TaskGuard caller/request/child identity was not copied"
-            );
-            let before = bridge::status().unwrap();
-            let reads = domain_platform::reads();
             assert_eq!(bridge::test_support::source_snapshot(), words);
-            assert_eq!(domain_platform::reads(), reads);
-            assert_eq!(
-                bridge::status().unwrap(),
-                before,
-                "diagnostic read changed capture counters"
-            );
+
+            // Busy probe skips only diagnostics and does not invoke the lazy
+            // identity copier, mutate capture, or publish when handoff imports.
+            begin(3);
+            domain_platform::at(OBS + 200_000_000);
+            let mut copied = false;
+            bridge::test_support::with_gate(|| {
+                bridge::measure_paid_task(key(99), CpuClass::ExecutorWork, |entry| {
+                    entry.unwrap().observe(|| {
+                        copied = true;
+                        identity(2, 70)
+                    });
+                    domain_platform::at(OBS + 200_000_037)
+                });
+            });
+            assert!(!copied);
+            assert_eq!(bridge::test_support::handoff_status()[28], 1);
             let seal = close_and_export(false);
-            bridge::retire_exported(seal).unwrap();
+            assert_eq!(seal.intervals, 1);
+            assert_eq!(seal.exclusion, None);
+            assert_eq!(bridge::test_support::handoff_status()[28], 0);
             assert_eq!(
                 bridge::test_support::source_snapshot(),
                 words,
-                "seal/retire erased provenance"
+                "completion/import published a diagnostic"
             );
+            bridge::retire_exported(seal).unwrap();
 
-            // Four source/site buckets are a diagnostic bound only. The fifth
-            // distinct source stays in the original interval collection, with an
-            // explicit omitted-attribution counter and no overwritten bucket.
-            begin(3);
-            domain_platform::at(OBS + 200_000_100);
-            for site in 1..=5 {
-                domain_platform::at(OBS + 200_000_000 + site * 100);
-                bridge::measure_task(
-                    key(13),
+            // A child alias is offered, not resolved by the diagnostic probe. The
+            // actual later classifier may be Busy and retain original custody.
+            begin(4);
+            CLASSIFIER_BUSY.store(true, Ordering::Release);
+            domain_platform::at(OBS + 200_000_000);
+            bridge::measure_paid_task(key(99), CpuClass::ExecutorWork, |entry| {
+                entry.unwrap().observe(|| identity(2, 70));
+                domain_platform::at(OBS + 200_000_037)
+            });
+            let words = bridge::test_support::source_snapshot();
+            assert_eq!(&words[6..12], &[1, 0, 1, 0, 0, 1]);
+            assert_eq!(
+                &words[16..24],
+                &[99, 1, 0, 0, 2, 0, 2, 1],
+                "offered alias was fabricated as resolved source"
+            );
+            assert_eq!(words[26], 0);
+            CLASSIFIER_BUSY.store(false, Ordering::Release);
+            cpu::at(1);
+            let seal = close_and_export(false);
+            assert_eq!(seal.exclusion, None);
+            assert_eq!(bridge::copy_intervals(seal, 0, &mut rows).unwrap(), 1);
+            assert_eq!(rows[0].core, 0);
+            assert_eq!(bridge::test_support::source_snapshot(), words);
+            bridge::retire_exported(seal).unwrap();
+
+            // Four bounded buckets plus a first overflow sample remain explicitly
+            // incomplete. All five original physical intervals remain collected.
+            begin(5);
+            for i in 0..5 {
+                domain_platform::at(OBS + 200_000_000 + i * 100);
+                bridge::measure_paid_task(
+                    if i < 3 { key(13) } else { key(99) },
                     CpuClass::ExecutorWork,
-                    bridge::TaskIdentity {
-                        site,
-                        caller: key(70 + site),
-                        request: 9,
-                        child: key(4096 + site),
-                        recipe: 0,
+                    |entry| {
+                        entry
+                            .unwrap()
+                            .observe(|| identity(if i < 3 { i + 2 } else { i - 1 }, 71 + i));
+                        domain_platform::at(OBS + 200_000_037 + i * 100)
                     },
-                    || domain_platform::at(OBS + 200_000_037 + site * 100),
                 );
             }
             let words = bridge::test_support::source_snapshot();
-            assert_eq!(&words[6..12], &[5, 5, 0, 0, 1, 4]);
-            assert_eq!(
-                words[14], 1,
-                "overflow attribution lost the producing source"
-            );
+            assert_eq!(&words[6..12], &[5, 3, 2, 0, 1, 4]);
+            assert_eq!(words[14], 1);
             assert_eq!(
                 &words[112..128],
                 &[
-                    13,
+                    99,
                     1,
-                    13,
-                    1,
+                    0,
+                    0,
                     2,
-                    OBS + 200_000_500,
-                    OBS + 200_000_537,
+                    0,
+                    3,
+                    OBS + 200_000_400,
+                    0,
                     1,
-                    1,
-                    5,
                     75,
-                    1,
+                    8,
                     9,
-                    4101,
-                    1,
-                    0
+                    4097,
+                    6,
+                    2
                 ]
             );
-            assert_eq!(words[31], 71);
-            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 185, 0]);
             let seal = close_and_export(false);
             assert_eq!(seal.intervals, 5);
+            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 185, 0]);
             bridge::retire_exported(seal).unwrap();
 
-            // The hard interval limit remains8192. Every37ns interval has a63ns
-            // physical gap. The8193rd real cost is retained raw and excluded as
-            // Capacity, never merged into a neighboring accepted interval.
-            begin(4);
+            // Capacity and Deadline stay actual exclusions. No completion path
+            // publishes a capacity/admission/result claim in the entry bank.
+            begin(6);
             for i in 0..8193 {
                 let first = OBS + 200_000_000 + i * 100;
                 domain_platform::at(first + 37);
-                let mut attempt = bridge::attempt_work(key(13), false).unwrap().unwrap();
-                let result = bridge::finish_attempt(&mut attempt, first, first + 37);
+                let mut a = bridge::attempt_work(key(13), false).unwrap().unwrap();
                 assert_eq!(
-                    result,
+                    bridge::finish_attempt(&mut a, first, first + 37),
                     if i < 8192 {
                         Ok(())
                     } else {
@@ -326,22 +375,18 @@ fn actual_completed_sources_are_attributed_without_changing_capture() {
                     }
                 );
             }
-            let words = bridge::test_support::source_snapshot();
-            assert_eq!(&words[6..10], &[8193, 8192, 1, 0]);
-            assert_eq!(&words[37..40], &[OBS + 200_819_200, OBS + 200_819_237, 1]);
-            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 303141, 0]);
+            assert_eq!(bridge::test_support::source_snapshot(), words);
             let seal = close_and_export(true);
             assert_eq!(seal.intervals, 8192);
             assert_eq!(seal.exclusion, Some(learning::Error::Capacity));
+            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 303141, 0]);
             assert_eq!(bridge::copy_intervals(seal, 8191, &mut rows).unwrap(), 1);
             assert_eq!(
                 (rows[0].start_ns, rows[0].end_ns),
                 (OBS + 200_819_100, OBS + 200_819_137)
             );
             bridge::retire_exported(seal).unwrap();
-
-            // Original cleanup bound remains five seconds after observation end.
-            begin(5);
+            begin(7);
             domain_platform::at(END + 5_000_000_001);
             for source in sources() {
                 bridge::close_source(bridge::source(source.owner, source.class).unwrap()).unwrap();
@@ -350,99 +395,49 @@ fn actual_completed_sources_are_attributed_without_changing_capture() {
                 bridge::seal(false),
                 Err(bridge::Error::Capture(learning::Error::Deadline))
             );
-            let seal = bridge::seal(true).unwrap();
-            assert_eq!(seal.exclusion, Some(learning::Error::Deadline));
-            assert_eq!(seal.intervals, 0);
             assert_eq!(
-                bridge::test_support::source_snapshot(),
-                words,
-                "a run without records must not claim attribution"
+                bridge::seal(true).unwrap().exclusion,
+                Some(learning::Error::Deadline)
             );
-            bridge::retire_exported(seal).unwrap();
-
-            // A retained original completion can import on another CPU. Its
-            // source/core/times remain exact, while unavailable task identity
-            // stays absent rather than being joined to a later caller.
-            begin(6);
+            assert_eq!(bridge::test_support::source_snapshot(), words);
+            bridge::retire_exported(bridge::seal(true).unwrap()).unwrap();
+            begin(8);
+            cpu::at(3);
             domain_platform::at(OBS + 200_000_000);
-            bridge::test_support::with_gate(|| {
-                bridge::measure_task(
-                    key(99),
-                    CpuClass::ExecutorWork,
-                    bridge::TaskIdentity {
-                        site: 2,
-                        caller: key(77),
-                        request: 9,
-                        child: key(99),
-                        recipe: 0,
-                    },
-                    || domain_platform::at(OBS + 200_000_037),
-                );
+            let mut copied_on_cpu3 = false;
+            bridge::measure_paid_task(key(13), CpuClass::ExecutorWork, |entry| {
+                if let Some(entry) = entry {
+                    entry.observe(|| {
+                        copied_on_cpu3 = true;
+                        identity(2, 70)
+                    });
+                }
+                domain_platform::at(OBS + 200_000_037);
             });
-            assert_eq!(bridge::test_support::handoff_status()[28], 1);
-            cpu::at(1);
+            assert!(!copied_on_cpu3, "non-CPU0 path copied TaskIdentity");
+            assert_eq!(bridge::test_support::source_snapshot(), words);
             let seal = close_and_export(false);
-            let words = bridge::test_support::source_snapshot();
-            assert_eq!(&words[3..6], &[7, 6, 6]);
-            assert_eq!(&words[16..24], &[99, 1, 13, 1, 2, 0, 1, 37]);
-            assert_eq!(words[13], 1);
-            assert_eq!(words[29], 0, "delayed completion invented task identity");
-            assert_eq!(bridge::test_support::handoff_status()[28], 0);
-            assert_eq!(seal.intervals, 1);
             assert_eq!(seal.exclusion, None);
-            bridge::retire_exported(seal).unwrap();
-
-            // Even an unbucketed producer retains its first Capacity sample,
-            // with the original complete identity. A later error cannot move
-            // that physical interval or substitute another caller.
-            begin(7);
-            for i in 0..8194 {
-                let first = OBS + 200_000_000 + i * 100;
-                domain_platform::at(first);
-                bridge::measure_task(
-                    key(13),
-                    CpuClass::ExecutorWork,
-                    bridge::TaskIdentity {
-                        site: if i < 4 { i + 1 } else { 5 },
-                        caller: key(70 + i),
-                        request: 9,
-                        child: key(4096 + i),
-                        recipe: 2,
-                    },
-                    || domain_platform::at(first + 37),
-                );
-            }
-            let words = bridge::test_support::source_snapshot();
-            assert_eq!(&words[6..12], &[8194, 8192, 2, 0, 8190, 4]);
-            assert_eq!(words[14], 2);
-            assert_eq!(
-                &words[112..128],
-                &[
-                    13,
-                    1,
-                    13,
-                    1,
-                    2,
-                    OBS + 200_819_200,
-                    OBS + 200_819_237,
-                    0x10a,
-                    1,
-                    5,
-                    8262,
-                    1,
-                    9,
-                    12288,
-                    1,
-                    2
-                ]
-            );
-            let seal = close_and_export(true);
-            assert_eq!(seal.intervals, 8192);
-            assert_eq!(seal.exclusion, Some(learning::Error::Capacity));
-            assert_eq!(bridge::status().unwrap().0.raw_tagged_ns, [0, 0, 303178, 0]);
+            assert_eq!(bridge::copy_intervals(seal, 0, &mut rows).unwrap(), 1);
+            assert_eq!(rows[0].core, 3);
             bridge::retire_exported(seal).unwrap();
         })
         .unwrap()
         .join()
         .unwrap();
+}
+fn identity(site: u64, caller: u64) -> bridge::TaskIdentity {
+    bridge::TaskIdentity {
+        site,
+        caller: ObjectKey {
+            id: caller,
+            generation: 8,
+        },
+        request: 9,
+        child: ObjectKey {
+            id: 4097,
+            generation: 6,
+        },
+        recipe: 2,
+    }
 }

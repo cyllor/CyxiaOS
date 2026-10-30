@@ -789,33 +789,119 @@ pub fn attempt(owner: ObjectKey, class: CpuClass) -> Result<Option<OwnerAttempt>
 /// asynchronous waiting never becomes part of this actual CPU interval.
 #[inline(never)]
 pub fn measure<R>(owner: ObjectKey, class: CpuClass, body: impl FnOnce() -> R) -> R {
-    measure_identity(owner, class, None, body)
-}
-/// Copy identity already held by the task owner; never resolve another owner.
-#[inline(never)]
-pub fn measure_task<R>(
-    owner: ObjectKey,
-    class: CpuClass,
-    identity: TaskIdentity,
-    body: impl FnOnce() -> R,
-) -> R {
-    measure_identity(owner, class, Some(identity), body)
-}
-#[inline(never)]
-fn measure_identity<R>(
-    owner: ObjectKey,
-    class: CpuClass,
-    identity: Option<TaskIdentity>,
-    body: impl FnOnce() -> R,
-) -> R {
     let Some(mut attempt) = attempt(owner, class).ok().flatten() else {
         return body();
     };
     let cpu_started = cpu_ticks();
     let result = body();
     let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
-    let _ = finish_attempt_identity(&mut attempt, first_ns, last_ns, identity);
+    let _ = finish_attempt(&mut attempt, first_ns, last_ns);
     result
+}
+/// Compatibility wrapper. A generic call has no proved enclosing ledger
+/// sample and therefore supplies no invocation observation.
+#[allow(dead_code)] // Preserve the existing public diagnostic wrapper signature.
+#[inline(never)]
+pub fn measure_task<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    _identity: TaskIdentity,
+    body: impl FnOnce() -> R,
+) -> R {
+    measure(owner, class, body)
+}
+/// Diagnostic context borrowed only during an original measured body. Its
+/// caller must prove the enclosing physical ledger sample independently.
+pub(crate) struct PaidEntry<'a> {
+    attempt: &'a OwnerAttempt,
+    started: u64,
+}
+impl PaidEntry<'_> {
+    pub fn observe(self, identity: impl FnOnce() -> TaskIdentity) {
+        observe_paid_entry(self.attempt, self.started, || {
+            let identity = identity();
+            (identity.site, Some(identity))
+        });
+    }
+}
+/// Only TaskGuard service_segment bodies use this opt-in. Identity construction
+/// occurs lazily inside the original capture sample and its enclosing service
+/// ledger sample, never during credit setup or completion.
+#[inline(never)]
+pub(crate) fn measure_paid_task<R>(
+    owner: ObjectKey,
+    class: CpuClass,
+    body: impl FnOnce(Option<PaidEntry<'_>>) -> R,
+) -> R {
+    let Some(mut attempt) = attempt(owner, class).ok().flatten() else {
+        return body(None);
+    };
+    let cpu_started = cpu_ticks();
+    let entry = if attempt.core == 0
+        && matches!(attempt.mode, AttemptMode::Record)
+        && attempt.lease.is_some()
+    {
+        Some(PaidEntry {
+            attempt: &attempt,
+            started: cpu_started,
+        })
+    } else {
+        None
+    };
+    let result = body(entry);
+    let (first_ns, last_ns, _) = finish_cpu_interval(cpu_started);
+    let _ = finish_attempt(&mut attempt, first_ns, last_ns);
+    result
+}
+/// service_io_piece starts its original capture and ledger PMCC timer before
+/// acquiring the attempt and calling this probe. No caller identity is inferred.
+pub(crate) fn observe_service_io(attempt: &OwnerAttempt, started: u64) {
+    observe_paid_entry(attempt, started, || (5, None));
+}
+fn observe_paid_entry(
+    attempt: &OwnerAttempt,
+    started: u64,
+    identity: impl FnOnce() -> (u64, Option<TaskIdentity>),
+) {
+    if attempt.core != 0
+        || cpu::slot() != 0
+        || !matches!(attempt.mode, AttemptMode::Record)
+        || attempt.lease.is_none()
+        || !attempt.pending
+        || attempt.measured.is_some()
+    {
+        return;
+    }
+    // One existing nonblocking gate acquisition. Do not use with(): merging
+    // losses would mutate capture state merely to collect a diagnostic.
+    let Ok(_guard) = lock() else {
+        return;
+    };
+    let owner = unsafe { &*OWNER.0.get() };
+    if owner.storage.is_null() {
+        return;
+    }
+    let capture = unsafe { &*owner.storage };
+    let Some(config) = capture.config() else {
+        return;
+    };
+    if config.key.generation != attempt.generation {
+        return;
+    }
+    // A direct immutable roster match is known; alias/classifier resolution
+    // is deliberately not attempted and can never grant execution authority.
+    let direct = capture.source(attempt.owner, attempt.class).is_ok();
+    let (site, identity) = identity();
+    provenance::observed(provenance::Observation {
+        run: config.key,
+        offered: attempt.owner,
+        direct: direct.then_some(attempt.owner),
+        class: attempt.class,
+        core: attempt.core,
+        started,
+        site,
+        identity,
+    });
 }
 pub fn attempt_work(owner: ObjectKey, optional: bool) -> Result<Option<OwnerAttempt>, Error> {
     attempt_class(owner, |family| {
@@ -951,14 +1037,6 @@ pub fn finish_attempt(
     first_ns: u64,
     last_ns: u64,
 ) -> Result<(), Error> {
-    finish_attempt_identity(attempt, first_ns, last_ns, None)
-}
-fn finish_attempt_identity(
-    attempt: &mut OwnerAttempt,
-    first_ns: u64,
-    last_ns: u64,
-    identity: Option<TaskIdentity>,
-) -> Result<(), Error> {
     if !attempt.pending {
         return Err(Error::Stale);
     }
@@ -1061,25 +1139,9 @@ fn finish_attempt_identity(
     let result = with(|capture, _| {
         entered = true;
         match capture.source(measured_owner, attempt.class) {
-            Ok(token) => {
-                let result = capture
-                    .record(token, attempt.core, first_ns, last_ns)
-                    .map_err(Error::from);
-                if let Some(config) = capture.config() {
-                    provenance::completed(provenance::Completion {
-                        run: config.key,
-                        owner: attempt.owner,
-                        source: measured_owner,
-                        class: attempt.class,
-                        core: attempt.core,
-                        first: first_ns,
-                        last: last_ns,
-                        result,
-                        identity,
-                    });
-                }
-                result
-            }
+            Ok(token) => capture
+                .record(token, attempt.core, first_ns, last_ns)
+                .map_err(Error::from),
             Err(error) => {
                 capture.missing_events(attempt.class, 1, last_ns - first_ns)?;
                 handoff::loss(handoff::Loss::UnknownSource, attempt);

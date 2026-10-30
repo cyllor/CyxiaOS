@@ -43,7 +43,7 @@ mod learning_evidence {
             pub parent: super::super::ObjectKey, pub request_id: u64, pub at: u64 }
         pub fn created(_: Child) {}
     }
-    pub fn measure<T>(_: (), _: cyxia_prototype::learning::reward::CpuClass, body: impl FnOnce() -> T) -> T { body() }
+    pub fn measure<T>(_: super::ObjectKey, _: cyxia_prototype::learning::reward::CpuClass, body: impl FnOnce() -> T) -> T { body() }
 }
 // THREAD_SPEC
 struct Creator<'a> {

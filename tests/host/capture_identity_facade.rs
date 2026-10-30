@@ -16,3 +16,12 @@ pub fn measure_task<R>(
 ) -> R {
     body()
 }
+pub struct PaidEntry;
+impl PaidEntry {
+    pub fn observe(self, identity: impl FnOnce()->TaskIdentity) { let _=identity(); }
+}
+pub fn measure_paid_task<R>(
+    _:cyxia_prototype::domains::ObjectKey,
+    _:cyxia_prototype::learning::reward::CpuClass,
+    body:impl FnOnce(Option<PaidEntry>)->R,
+)->R {body(Some(PaidEntry))}
