@@ -346,6 +346,105 @@ fn session_headers_reject_replay_boot_mismatch_and_active_clone() {
     assert_eq!(a.hello(2, [9; 32]), Err(Error::Conflict));
     assert!(!a.ready());
 }
+
+#[test]
+fn formation_heartbeat_preserves_sequence_boot_configuration_and_authority_guards() {
+    use cyxia_prototype::cluster::wire::Header;
+    let (mut bound, _, history) = pair();
+    let h = Header {
+        kind: 1,
+        body_len: 113,
+        sequence: 2,
+        request: [2; 16],
+        cluster: [0; 32],
+        epoch: 0,
+        sender_boot: 1,
+        receiver_boot: 1,
+    };
+    let original_proof = bound.proof;
+    // Queued pre-proof heartbeats remain legal after binding and cannot reset READY.
+    assert!(bound.ready());
+    bound.accept_formation_heartbeat(&h).unwrap();
+    assert!(bound.ready());
+    assert_eq!(bound.proof, original_proof);
+    assert_eq!(bound.accept_formation_heartbeat(&h), Err(Error::Replay));
+    let mut old = h;
+    old.sequence = 1;
+    assert_eq!(bound.accept_formation_heartbeat(&old), Err(Error::Replay));
+    // The same accepted sequence also fences ordinary RPCs.
+    let mut ordinary = h;
+    ordinary.kind = 16;
+    ordinary.cluster = bound.cluster();
+    ordinary.epoch = 1;
+    assert_eq!(bound.accept_header(&ordinary), Err(Error::Replay));
+    ordinary.sequence = 3;
+    bound.accept_header(&ordinary).unwrap();
+    let mut zero_status = h;
+    zero_status.kind = 2;
+    zero_status.sequence = 4;
+    assert_eq!(bound.accept_header(&zero_status), Err(Error::Replay));
+    for mutation in 0..7 {
+        let mut invalid = h;
+        invalid.sequence = 4;
+        match mutation {
+            0 => invalid.sender_boot = 2,
+            1 => invalid.receiver_boot = 0,
+            2 => invalid.cluster = bound.cluster(),
+            3 => invalid.epoch = 1,
+            4 => invalid.kind = 2,
+            5 => invalid.kind = 0x8001,
+            _ => invalid.body_len = 112,
+        }
+        assert_eq!(
+            bound.accept_formation_heartbeat(&invalid),
+            Err(Error::Replay)
+        );
+        assert!(bound.ready());
+    }
+    let mut next = h;
+    next.sequence = 4;
+    bound.accept_formation_heartbeat(&next).unwrap();
+    bound.isolate();
+    next.sequence = 5;
+    assert_eq!(bound.accept_formation_heartbeat(&next), Err(Error::Replay));
+    assert!(!bound.ready());
+
+    for count in [1, 2] {
+        let mut forming = Engine::new([1; 32], [2; 32], 1, TestCrypto([1; 32])).unwrap();
+        for event in &history[..count] {
+            forming.recover_event(event).unwrap();
+        }
+        forming.hello(1, [8; 32]).unwrap();
+        let before = (
+            forming.member,
+            forming.config,
+            forming.signature(),
+            forming.formation_lock(),
+        );
+        forming.accept_formation_heartbeat(&h).unwrap();
+        assert_eq!(
+            (
+                forming.member,
+                forming.config,
+                forming.signature(),
+                forming.formation_lock()
+            ),
+            before
+        );
+        assert!(forming.proof.is_none());
+        assert!(!forming.ready());
+        assert!(forming.send_ready().is_err());
+        assert!(
+            forming
+                .prepare(terms(&forming), [0; 32], [11; 16], 0, 2000)
+                .is_err()
+        );
+    }
+    let (mut leaving, _, _) = pair();
+    let effect = leaving.leave_with_id([9; 16]).unwrap();
+    commit(&mut leaving, effect);
+    assert_eq!(leaving.accept_formation_heartbeat(&h), Err(Error::Replay));
+}
 #[test]
 fn recipient_rejects_unknown_contract_wrong_input_and_unexpected_task() {
     let (mut owner, mut recipient, _) = pair();

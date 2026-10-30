@@ -322,6 +322,29 @@ impl<C: Crypto> Engine<C> {
         self.seq = h.sequence;
         Ok(())
     }
+    /// Accept only the header of an immutable, post-HELLO forming heartbeat.
+    /// The driver must first match its body against the authenticated peer's
+    /// original STANDALONE/CONFIRMED HELLO. This never changes session authority.
+    pub fn accept_formation_heartbeat(&mut self, h: &Header) -> Result<(), Error> {
+        if self.isolated
+            || !matches!(
+                self.member,
+                Member::Standalone | Member::Confirmed | Member::Bound
+            )
+            || h.kind != 1
+            || h.body_len != 113
+            || h.cluster != [0; 32]
+            || h.epoch != 0
+            || h.sender_boot != self.peer_boot
+            || h.receiver_boot != self.boot
+            || h.sequence <= 1
+            || h.sequence <= self.seq
+        {
+            return Err(Error::Replay);
+        }
+        self.seq = h.sequence;
+        Ok(())
+    }
     pub fn statuses(&self) -> Vec<Status> {
         let mut out: Vec<Status> = self
             .contracts

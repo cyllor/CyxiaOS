@@ -74,6 +74,8 @@ pub struct Driver {
     request: u64,
     session: [u8; 32],
     challenge: [u8; 32],
+    local_hello: Option<[u8; 113]>,
+    peer_hello: Option<[u8; 113]>,
     local_nonce: [u8; 32],
     peer_nonce: [u8; 32],
     peer_counter: u64,
@@ -242,6 +244,8 @@ impl Driver {
             request: 0,
             session: [0; 32],
             challenge: [0; 32],
+            local_hello: None,
+            peer_hello: None,
             local_nonce: [0; 32],
             peer_nonce: [0; 32],
             peer_counter: 0,
@@ -349,6 +353,7 @@ impl Driver {
         );
         body.extend_from_slice(&self.local_nonce);
         body.push(self.engine.member as u8);
+        self.local_hello = Some(body.as_slice().try_into().map_err(|_| ())?);
         self.send(1, body, None)?;
         Ok(())
     }
@@ -393,6 +398,8 @@ impl Driver {
         self.sent = 0;
         self.sequence = 0;
         self.peer_boot = 0;
+        self.local_hello = None;
+        self.peer_hello = None;
         self.formation_sent = false;
         self.ready_sent = false;
         self.quoted = false;
@@ -601,6 +608,17 @@ impl Driver {
         broker::trace(0x10000 + h.kind as u64);
         let response = h.kind & 0x8000 != 0;
         if kind == 1 {
+            if self.peer_boot != 0 {
+                let initial = self.peer_hello.as_ref().ok_or(())?;
+                if !matches!(initial[112], 0 | 1) || b != initial {
+                    return Err(());
+                }
+                // A queued forming heartbeat may arrive after this side binds.
+                // Never rerun hello(): that would reset sequence and READY state.
+                return self.engine.accept_formation_heartbeat(&h).map_err(|e| {
+                    self.exit_result = 0x5001 + e as u64;
+                });
+            }
             if self.peer_boot != 0
                 || h.sequence != 1
                 || b.len() != 113
@@ -627,6 +645,7 @@ impl Driver {
             self.engine
                 .hello(self.peer_boot, self.session)
                 .map_err(|_| ())?;
+            self.peer_hello = Some(b.try_into().map_err(|_| ())?);
             if self.engine.member == Member::Standalone
                 && b[112] == Member::Leaving as u8
                 && self
@@ -652,7 +671,9 @@ impl Driver {
                     self.send(32, out, None)?;
                 }
             } else if self.engine.member == Member::Bound {
-                self.status()?;
+                // The peer may still be CONFIRMED. Exchange the durable proof
+                // before PROOF/CONFIRM handling starts STATUS reconciliation.
+                self.send(5, self.engine.proof.ok_or(())?.encode().to_vec(), None)?;
             } else if self.engine.member == Member::Confirmed {
                 let c = self.engine.config.ok_or(())?;
                 let mut body = c.encode().to_vec();
@@ -1222,10 +1243,13 @@ impl Driver {
                 self.send(0x8015, b.to_vec(), Some(h.request))?;
             }
             (21, true) => {
-                if b.len() != 104 {
+                let mut r = Reader::new(b);
+                let key = read_key(&mut r)?;
+                let hash = r.arr()?;
+                r.end()?;
+                if self.engine.ack_ready(key).map_err(|_| ())? != hash {
                     return Err(());
                 }
-                let key = self.task_key.ok_or(())?;
                 self.send(22, key.contract.to_vec(), None)?;
             }
             (22, false) => {
@@ -1360,7 +1384,15 @@ impl Driver {
             return Err(());
         }
         if self.peer_boot != 0 && now.saturating_sub(self.last_status) >= 500 {
-            self.status()?;
+            if matches!(self.engine.member, Member::Standalone | Member::Confirmed)
+                && self.engine.proof.is_none()
+            {
+                // Fixed HELLO schema, frozen body, fresh sequence and exact boots.
+                // No STATUS snapshot exists until a durable proof is available.
+                self.send(1, self.local_hello.ok_or(())?.to_vec(), None)?;
+            } else {
+                self.status()?;
+            }
             self.last_status = now;
         }
         if self.engine.ready()
