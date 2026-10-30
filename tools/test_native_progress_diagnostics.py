@@ -186,6 +186,7 @@ class ProgressDiagnostics(unittest.TestCase):
         guest = {}
         refresh_snapshot(guest, snapshot)
         self.assertIsNone(guest['publication_cost'][0]['charged_stop'])
+
         self.assertEqual(guest['progress_diagnostic_status']['publication_cost']['stop_receipt'], 'in_progress')
         ctl[191] = 2
         ctl[164 + 5] = 100  # same Job/CPU but foreign target cannot bind
@@ -197,6 +198,30 @@ class ProgressDiagnostics(unittest.TestCase):
         guest = {}
         refresh_snapshot(guest, snapshot)
         self.assertIsNone(guest['publication_cost'][0]['charged_stop'])
+
+    def test_paid_submit_entry_survives_partial_cpu_and_original_stop_binding(self):
+        snapshot, p, _ = self.with_source_banks()
+        p[0] = 0x4359505542430003
+        p[47:50] = [108, 13, 1]
+        snapshot['DOMAIN_PUBLICATION_COST'] = fixtures.encode(p)
+        ctl = list(struct.unpack(f'<{fixtures.CONTROL_WORDS}Q', snapshot['DOMAIN_CONTROL_EVIDENCE']))
+        ctl[160:163] = [0x43594f5053540001, 1, 1]
+        ctl[164:184] = [2, 100, 7, 9, 11, 99, 2, 23, 0, 0,
+                        2, 500001, 500003, 0, 0, 1, 3, 11, 1, 10]
+        ctl[191] = 2
+        snapshot['DOMAIN_CONTROL_EVIDENCE'] = fixtures.encode(ctl)
+        guest = {}
+        refresh_snapshot(guest, snapshot)
+        self.assertEqual(guest['progress_diagnostic_status']['publication_cost']['in_progress_cpus'], [2])
+        self.assertEqual(len(guest['publication_cost']), 1)
+        row = guest['publication_cost'][0]
+        self.assertEqual(row['native_submit_entry'], {'wall_ns': 108, 'cpu_ns': 13})
+        self.assertEqual(row['charged_stop']['charged_cumulative_ns'], 500003)
+        self.assertEqual(row['checkpoint_cumulative_ns'], 10)
+        self.assertNotIn('final_wall_ns', row)
+        legacy, _, _ = self.with_source_banks()
+        refresh_snapshot(guest, legacy)
+        self.assertIsNone(guest['publication_cost'][0]['native_submit_entry'])
 
 
 if __name__ == '__main__':
