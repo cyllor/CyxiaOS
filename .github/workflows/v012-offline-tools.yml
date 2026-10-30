@@ -1,0 +1,41 @@
+name: V012 offline tools
+on:
+  push:
+    branches: [codex/v012-tools-20261030]
+    paths: ['.github/workflows/v012-offline-tools.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Prepare exact compiler and dependencies
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+          mkdir -p "$RUNNER_TEMP/offline-tools"
+          sysroot="$(rustc --print sysroot)"
+          rustc -vV > "$RUNNER_TEMP/offline-tools/rust-version.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/offline-tools/export-commit.txt"
+          git archive 6fc0441d60d78bd6f5f758fe9d49a6edf37adb0a | gzip -1 > "$RUNNER_TEMP/offline-tools/source-6fc0441.tar.gz"
+          tar -C "$sysroot" --exclude=share/doc -czf "$RUNNER_TEMP/offline-tools/rust-1.95.0.tar.gz" .
+          tar -C "$HOME/.cargo" -czf "$RUNNER_TEMP/offline-tools/cargo-registry.tar.gz" registry
+          cp -L "$HOME/.cargo/bin/rustup" "$RUNNER_TEMP/offline-tools/rustup"
+          cd "$RUNNER_TEMP/offline-tools"
+          sha256sum *.tar.gz rustup > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v012-offline-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/offline-tools/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
