@@ -76,6 +76,15 @@ pub fn active() {
     assert!(activation_allowed(
         A01_BOOT_EVIDENCE.0[6].load(Ordering::Acquire)
     ));
+    // Capture actual registered guest CPUs before sealing the normal terminal
+    // state, just as SAFE_EXEC captures them below. A QEMU -smp argument alone
+    // does not prove secondary startup. These are observations, never grants.
+    for (word, value) in A01_BOOT_EVIDENCE.0[9..14]
+        .iter()
+        .zip(crate::smp::boot_progress())
+    {
+        word.store(value, Ordering::Relaxed);
+    }
     A01_BOOT_EVIDENCE.0[15].store(timer::ticks(), Ordering::Relaxed);
     A01_BOOT_EVIDENCE.0[3].store(3, Ordering::Release);
 }

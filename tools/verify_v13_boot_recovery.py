@@ -43,6 +43,7 @@ def verify_samples(first: bytes, last: bytes, control: bytes, runtime: bytes,
                 'nonzero reserved boot record')
         if mode == 0:
             require(h[3] == 3 and h[4] == 0, 'boot activation failed')
+            require(h[9] == 15, 'normal boot lacks four registered guest CPUs')
             require(h[6] > 0 and 0 < h[7] <= h[14] <= h[15],
                     'AI activation preceded durable epoch or completed self-test')
             _model_sample(h, True)
@@ -74,7 +75,7 @@ def verify_samples(first: bytes, last: bytes, control: bytes, runtime: bytes,
         u = struct.unpack('<512Q', unified)
         require(u[0] == u[1] == 0 and not any(u[2:24]),
                 'cluster service/authorization initialized after failed boot')
-    return dict(mode=mode, boot_recovery_contract_valid=True,
+    return dict(mode=mode, boot_recovery_contract_valid=True, online_mask=b[9],
                 business_progress=[b[10]-a[10], b[11]-a[11]],
                 timer_progress=[b[12]-a[12], b[13]-a[13]],
                 model_cpu_ns=b[20], native_acceptance_status='NOT_RUN',
