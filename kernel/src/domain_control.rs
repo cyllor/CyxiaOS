@@ -1898,6 +1898,7 @@ fn encode_job_inner(
     const _: () = assert!(cfg!(target_endian = "little"));
     preparation_detail(12);
     preparation_phase(3);
+    preparation::check_decision_cpu(timer::cpu_elapsed_ns(cpu_started))?;
     let input_bytes = unsafe { &*((input as *const [u64; 512]).cast::<[u8; 4096]>()) };
     let input_hash = cyxia_arch_aarch64::sha256::digest_page(input_bytes)
         .unwrap_or_else(|| Sha256::digest(input_bytes).into());
