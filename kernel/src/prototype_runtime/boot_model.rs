@@ -34,7 +34,10 @@ fn debug_put(index: usize, value: u64) {
 fn debug_count(index: usize) {
     let word = &A01_BOOT_MODEL_DEBUG.0[index];
     // Each counter has one CPU writer; no exclusive retry loop is necessary.
-    word.store(word.load(Ordering::Relaxed).saturating_add(1), Ordering::Release);
+    word.store(
+        word.load(Ordering::Relaxed).saturating_add(1),
+        Ordering::Release,
+    );
 }
 fn debug_terminal(cause: u64) {
     if A01_BOOT_MODEL_DEBUG.0[23].load(Ordering::Relaxed) == 0 {
@@ -98,12 +101,8 @@ impl Check {
                         _ => 3,
                     };
                     FINAL_CPU.store(self.spent, Ordering::Relaxed);
-                    let published = STATUS.compare_exchange(
-                        1,
-                        status,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                    let published =
+                        STATUS.compare_exchange(1, status, Ordering::AcqRel, Ordering::Relaxed);
                     debug_terminal(if published.is_err() {
                         6
                     } else if late {

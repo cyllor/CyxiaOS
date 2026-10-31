@@ -97,7 +97,10 @@ mod domain_tasks {
             _ => {}
         }
         let mut state = MOCK.lock().unwrap();
-        assert!(state.active.is_none(), "second execution while original credit is pending");
+        assert!(
+            state.active.is_none(),
+            "second execution while original credit is pending"
+        );
         state.sequence += 1;
         let credit = ControlCredit {
             sequence: state.sequence,
@@ -140,7 +143,10 @@ mod boot_recovery {
     pub fn model_settled(spent: u64, passed: bool) {
         assert_eq!(cpu::slot(), 0);
         let mut state = MOCK.lock().unwrap();
-        assert!(state.active.is_none(), "model verdict published before physical settlement");
+        assert!(
+            state.active.is_none(),
+            "model verdict published before physical settlement"
+        );
         state.evidence = Some((spent, passed));
     }
 }
@@ -179,7 +185,11 @@ fn result() -> Option<bool> {
     worker::result()
 }
 fn no_model_receipt() {
-    assert_eq!(MOCK.lock().unwrap().evidence, None, "non-model failure/pending bill certified a model result");
+    assert_eq!(
+        MOCK.lock().unwrap().evidence,
+        None,
+        "non-model failure/pending bill certified a model result"
+    );
 }
 fn main() {
     let scenario = std::env::args().nth(1).expect("scenario");
@@ -206,7 +216,12 @@ fn main() {
             let state = MOCK.lock().unwrap();
             assert_eq!(state.entries.len(), 1);
             assert_eq!(state.receipts.len(), 3);
-            assert!(state.receipts.iter().all(|receipt| *receipt == state.receipts[0]));
+            assert!(
+                state
+                    .receipts
+                    .iter()
+                    .all(|receipt| *receipt == state.receipts[0])
+            );
             assert_eq!(state.evidence, Some((300, true)));
         }
         "cancelled-return" | "late-settlement" => {
@@ -269,7 +284,10 @@ fn main() {
             }
             let state = MOCK.lock().unwrap();
             assert_eq!(state.entries, vec![0x10000, 0x10004]);
-            assert_eq!(state.fresh, 1, "preemption restarted instead of resuming the saved context");
+            assert_eq!(
+                state.fresh, 1,
+                "preemption restarted instead of resuming the saved context"
+            );
         }
         "no-credit-deadline" => {
             RESERVE.store(1, Ordering::Relaxed);
