@@ -1,0 +1,336 @@
+name: V0.13 A01 focused debug
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths: ['.github/workflows/v13-a01-debug.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.publish.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Prepare narrowly anchored diagnostics candidate
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          expected = {
+              'kernel/src/prototype_storage.rs': '0dc87965a28d4040359e5f72ba41568c654dee6f',
+              'tools/run_v13_boot_recovery.py': '3a070d5b67da53e4b307000fe3ee105e7bba6516',
+              'tools/run_v13_boot_evidence.py': '0971b2dbda778edf850f778b8e2672d5a8482c79',
+          }
+          for name, oid in expected.items():
+              data = Path(name).read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if actual != oid:
+                  raise SystemExit('source anchor changed: ' + name)
+          def replace(name, old, new):
+              p = Path(name)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit('nonunique patch anchor: ' + name)
+              p.write_text(text.replace(old, new))
+          replace('kernel/src/prototype_storage.rs',
+              'static CLAIMED: AtomicBool = AtomicBool::new(false);',
+              '#[path = "prototype_storage/boot_diagnostics.rs"]\nmod boot_diagnostics;\nstatic CLAIMED: AtomicBool = AtomicBool::new(false);')
+          replace('kernel/src/prototype_storage.rs',
+              '        Err(_) => {\n            // An error is not a DMA stop proof.',
+              '        Err(error) => {\n            boot_diagnostics::mount_failure(&error, disk.reads, disk.writes, disk.flushes);\n            // An error is not a DMA stop proof.')
+          p = Path('kernel/src/prototype_storage/boot_diagnostics.rs')
+          if p.exists():
+              raise SystemExit('diagnostic module already exists')
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text('''//! Diagnostic output after a failed mount; never grants authority or retries I/O.
+          use core::fmt::Write;
+
+          pub(super) fn mount_failure<E: core::fmt::Debug>(
+              error: &E,
+              reads: u64,
+              writes: u64,
+              flushes: u64,
+          ) {
+              struct Text {
+                  bytes: [u8; 256],
+                  len: usize,
+              }
+              impl Write for Text {
+                  fn write_str(&mut self, value: &str) -> core::fmt::Result {
+                      let end = self.len.checked_add(value.len()).ok_or(core::fmt::Error)?;
+                      self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?.copy_from_slice(value.as_bytes());
+                      self.len = end;
+                      Ok(())
+                  }
+              }
+              let mut text = Text { bytes: [0; 256], len: 0 };
+              if writeln!(&mut text, "STORAGE_V13_MOUNT_ERROR {error:?} reads={reads} writes={writes} flushes={flushes}").is_ok() {
+                  crate::log(&text.bytes[..text.len]);
+              } else {
+                  crate::log(b"STORAGE_V13_MOUNT_ERROR diagnostic_truncated\\n");
+              }
+          }
+          ''')
+          replace('tools/run_v13_boot_recovery.py',
+              '\ndef run_case(build, output, formatter, qemu, qemu_source, mode, timeout):',
+              '''
+          def stopped_boot_state(sample, config):
+              """Decode a stopped diagnostic only; never returns an acceptance verdict."""
+              require(len(sample) == len(config) == 512, 'invalid stopped boot record size')
+              words, identity = (struct.unpack('<64Q', value) for value in (sample, config))
+              require(identity[:2] == (CONFIG_MAGIC, 1) and identity[2] in MODES.values(),
+                      'invalid diagnostic config')
+              require(words[:2] == (MAGIC, 1) and words[2] % 2 == 0,
+                      'unsealed stopped boot diagnostic')
+              require(words[5] == identity[2] and words[32:46] == identity[4:18],
+                      'mixed diagnostic boot/source/input/image')
+              fields = {2: 'sequence', 3: 'state', 4: 'reason', 5: 'mode', 6: 'epoch',
+                        7: 'epoch_durable_ticks', 9: 'online_mask', 14: 'model_passed_ticks',
+                        15: 'active_ticks', 20: 'model_checkpoint_cpu_ns', 21: 'model_exit_kind',
+                        22: 'model_cpu', 23: 'model_turns', 24: 'model_checkpoint_result'}
+              result = {name: words[index] for index, name in fields.items()}
+              result['reason_name'] = {0: 'none', 1: 'already-attempted', 2: 'device',
+                                       3: 'mount', 4: 'epoch', 5: 'model-selftest'}.get(words[4], 'unknown')
+              result['scope'] = 'stopped diagnostic, not native acceptance'
+              return result
+
+
+          def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):''')
+          replace('tools/run_v13_boot_recovery.py',
+              "                if words[0]==MAGIC and words[3]==target and words[2]%2==0 and progressed:",
+              "                if (words[0]==MAGIC and words[3] in (2, 3) and words[2]%2==0\n                        and (words[3]!=target or progressed)):")
+          replace('tools/run_v13_boot_recovery.py',
+              '                        if first is None:\n                            first=sample;',
+              '''                        diagnostic = stopped_boot_state(sample, config)
+                                  if diagnostic['state'] != target:
+                                      result['diagnostics'] = diagnostic
+                                      raise RuntimeError('unexpected boot terminal: '
+                                          f"state={diagnostic['state']} expected={target} "
+                                          f"reason={diagnostic['reason_name']}({diagnostic['reason']})")
+                                  if first is None:
+                                      first=sample;''')
+          replace('tools/run_v13_boot_recovery.py',
+              "    finally:\n        if qmp:\n            try: qmp.execute('quit')",
+              '''    finally:
+                  if qmp and result['status'] != 'PASS' and proc is not None and proc.poll() is None:
+                      try:
+                          qmp.execute('stop')
+                          require(qmp.execute('query-status')['status'] == 'paused', 'failure capture not stopped')
+                          sample = save('failure-boot.bin', symbols['boot']['pa'], 512)
+                          result['failure_capture'] = stopped_boot_state(sample, config)
+                          for key, size in (('control', 4096), ('runtime', 8192), ('unified', 4096)):
+                              save('failure-' + key + '.bin', symbols[key]['pa'], size)
+                          chunk = base64.b64decode(qmp.execute('ringbuf-read', dict(device='cyxlog', size=1048576, format='base64')), validate=True)
+                          require(len(raw) + len(chunk) <= 8*1024*1024, 'failure serial capture overflow')
+                          raw.extend(chunk)
+                          for payload in decoder.feed(chunk):
+                              text.extend(payload + b'\\n')
+                      except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+                          result['failure_capture_error'] = str(error)
+                  if qmp:
+                      try: qmp.execute('quit')''')
+          replace('tools/run_v13_boot_evidence.py',
+              'def preserve_and_verify(output, project, trusted_qemu, original_tool_hashes):',
+              'def preserve_evidence(output, project, trusted_qemu, original_tool_hashes):')
+          replace('tools/run_v13_boot_evidence.py',
+              '    replay = verify_receipt(output, source_root=project, qemu_source=trusted_qemu)',
+              '''    return receipt
+
+
+          def preserve_and_verify(output, project, trusted_qemu, original_tool_hashes):
+              receipt = preserve_evidence(output, project, trusted_qemu, original_tool_hashes)
+              require(receipt.get('status') == 'PASS', receipt.get('error', 'native boot regression failed'))
+              producer = output / 'summary.json'
+              replay = verify_receipt(output, source_root=project, qemu_source=trusted_qemu)''')
+          replace('tools/run_v13_boot_evidence.py',
+              "            require(raw.get('status') == 'PASS', raw.get('error', 'native boot regression failed'))\n", '')
+          replace('tools/run_v13_boot_evidence.py',
+              "    print(json.dumps({name: case['status'] for name, case in report['cases'].items()}, indent=2))",
+              "    print(json.dumps({name: {key: case.get(key) for key in ('status', 'error')}\n                      for name, case in report['cases'].items()}, indent=2))")
+          # Dedent inserted blocks: indentation is literal and intentionally checked by py_compile.
+          import ast
+          for name in ('tools/run_v13_boot_recovery.py', 'tools/run_v13_boot_evidence.py'):
+              ast.parse(Path(name).read_text(), filename=name)
+          PY
+      - name: Pin formatter and inspect exact candidate diff
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+          cargo +1.95.0 fmt --all
+          git diff --check
+          git diff --stat
+          git diff -- kernel/src/prototype_storage.rs tools/run_v13_boot_recovery.py tools/run_v13_boot_evidence.py
+      - name: Exercise diagnostics and fail-closed preservation
+        run: |
+          python3 -B - <<'PY'
+          import sys
+          from pathlib import Path
+          from unittest.mock import patch
+          sys.path.insert(0, 'tools')
+          from test_verify_v13_boot_recovery import fixture, packed
+          from run_v13_boot_recovery import stopped_boot_state
+          from run_v13_boot_evidence import preserve_and_verify
+          a, b, c = fixture(0)
+          a[3], a[4], a[6], a[7] = 2, 3, 0, 0
+          a[14:25] = [0] * 11
+          result = stopped_boot_state(packed(a), packed(c))
+          assert result['reason_name'] == 'mount' and result['epoch'] == 0
+          for index, value in ((2, 1), (0, 0), (1, 2), (5, 3), (32, a[32] ^ 1)):
+              broken = a.copy(); broken[index] = value
+              try: stopped_boot_state(packed(broken), packed(c))
+              except ValueError: pass
+              else: raise AssertionError(('accepted invalid diagnostic', index))
+          with patch('run_v13_boot_evidence.preserve_evidence', return_value={'status':'FAIL', 'error':'mount'}) as preserve, patch('run_v13_boot_evidence.verify_receipt') as verify:
+              try: preserve_and_verify(Path('/unused'), Path('/unused'), Path('/unused'), {})
+              except ValueError as error: assert str(error) == 'mount'
+              else: raise AssertionError('failed run was promoted')
+              preserve.assert_called_once(); verify.assert_not_called()
+          print('A01 focused diagnostic checks: PASS (host-only)')
+          PY
+          python3 -B -m unittest discover -s tools -p 'test_verify_v13_boot*.py' -v
+      - name: Publish candidate objects only; do not move a branch
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, subprocess, urllib.request
+          from pathlib import Path
+          paths = ['kernel/src/prototype_storage.rs', 'kernel/src/prototype_storage/boot_diagnostics.rs',
+                   'tools/run_v13_boot_recovery.py', 'tools/run_v13_boot_evidence.py']
+          changed = subprocess.check_output(['git','diff','--name-only'], text=True).splitlines()
+          if set(changed) != set(paths) - {'kernel/src/prototype_storage/boot_diagnostics.rs'}:
+              raise SystemExit('unexpected formatted changes: ' + repr(changed))
+          api = 'https://api.github.com/repos/cyllor/CyxiaOS'
+          def call(path, data=None):
+              request = urllib.request.Request(api + path, data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          parent = os.environ['GITHUB_SHA']
+          tree = call('/git/commits/' + parent)['tree']['sha']
+          entries = []
+          for name in paths:
+              blob = call('/git/blobs', {'content':base64.b64encode(Path(name).read_bytes()).decode(), 'encoding':'base64'})
+              entries.append({'path':name, 'mode':'100644', 'type':'blob', 'sha':blob['sha']})
+          tree = call('/git/trees', {'base_tree':tree, 'tree':entries})['sha']
+          commit = call('/git/commits', {'message':'fix(v0.13): retain A01 mount errors and stopped failure evidence', 'tree':tree, 'parents':[parent]})['sha']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('sha=' + commit + '\n')
+          print(json.dumps({'candidate':commit, 'tree':tree, 'parent':parent, 'files':entries, 'branch_updated':False}, indent=2))
+          PY
+
+  engineering:
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [static, rust, tools, host]
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+          persist-credentials: false
+      - run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component clippy
+          cargo fetch --locked
+          python3 -B tools/prototype.py test --lane '${{ matrix.lane }}' --output "$RUNNER_TEMP/a01-${{ matrix.lane }}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: a01-debug-${{ matrix.lane }}-${{ github.run_id }}
+          retention-days: 30
+          path: ${{ runner.temp }}/a01-${{ matrix.lane }}/
+
+  native:
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.candidate.outputs.sha }}
+          persist-credentials: false
+      - name: Prepare pinned native build
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a01-debug"
+          git rev-parse HEAD > "$RUNNER_TEMP/a01-debug/source-commit.txt"
+          git archive --format=tar HEAD | gzip -n > "$RUNNER_TEMP/a01-debug/source.tar.gz"
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          cargo fetch --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/a01-qemu"
+          git -C "$RUNNER_TEMP/a01-qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/a01-qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/a01-qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          (cd "$RUNNER_TEMP/a01-qemu"; ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror; ninja -C build qemu-system-aarch64)
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/a01-private-pair"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/a01-private-pair/a" --identity-b "$RUNNER_TEMP/a01-private-pair/b" --output "$RUNNER_TEMP/a01-build" --selftest
+      - name: Repeat all four boot profiles without hiding any failure
+        run: |
+          python3 -B - <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          bad = False
+          for index in range(3):
+              output = temp / 'a01-debug' / ('matrix-' + str(index))
+              result = subprocess.run([sys.executable, '-B', 'tools/run_v13_boot_evidence.py',
+                  '--build', str(temp/'a01-build'), '--output', str(output),
+                  '--formatter', str(Path.cwd()/'target/debug/examples/prototype-disk'),
+                  '--qemu', str(temp/'a01-qemu/build/qemu-system-aarch64'),
+                  '--qemu-source', str(temp/'a01-qemu'), '--timeout', '60'])
+              bad |= result.returncode != 0
+              for case in ('normal','epoch-write','epoch-flush','model-corrupt'):
+                  path = output / case / 'summary.json'
+                  if path.is_file():
+                      r = json.loads(path.read_text())
+                      print('A01_CASE', index, case, json.dumps({k:r[k] for k in ('status','error','diagnostics','failure_capture','failure_capture_error') if k in r}), flush=True)
+                  serial = output / case / 'serial.txt'
+                  if serial.is_file():
+                      for line in serial.read_text(errors='replace').splitlines():
+                          if 'STORAGE_V13_MOUNT_ERROR' in line:
+                              print('A01_MOUNT', index, case, line, flush=True)
+              if result.returncode == 0:
+                  replay = subprocess.run([sys.executable, '-B', 'tools/verify_v13_boot_receipt.py', '--matrix', str(output), '--source-root', str(Path.cwd()), '--qemu-source', str(temp/'a01-qemu')], stdout=(output/'separate-replay.json').open('w'))
+                  bad |= replay.returncode != 0
+          raise SystemExit(int(bad))
+          PY
+      - name: Retain exact emulator
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/a01-debug/emulator"
+          if [ -f "$RUNNER_TEMP/a01-qemu/build/qemu-system-aarch64" ]; then
+            cp "$RUNNER_TEMP/a01-qemu/build/qemu-system-aarch64" "$RUNNER_TEMP/a01-debug/emulator/"
+            git -C "$RUNNER_TEMP/a01-qemu" rev-parse HEAD > "$RUNNER_TEMP/a01-debug/emulator/source-commit.txt"
+            git -C "$RUNNER_TEMP/a01-qemu" diff --binary > "$RUNNER_TEMP/a01-debug/emulator/source.patch"
+          fi
+      - name: Retain every success and failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: a01-debug-native-${{ github.run_id }}
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: error
+          path: ${{ runner.temp }}/a01-debug/
