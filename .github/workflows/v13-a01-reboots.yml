@@ -7,6 +7,9 @@ on:
       - '.github/workflows/v13-a01-reboots.yml'
       - 'kernel/src/prototype_runtime/boot_model.rs'
       - 'kernel/src/boot_recovery.rs'
+      - 'crates/driver-virtio/**'
+      - 'kernel/src/prototype_storage.rs'
+      - 'crates/prototype/src/journal.rs'
       - 'tools/run_v13_boot_recovery.py'
       - 'tools/boot_reboot_contract.py'
       - 'tools/run_v13_boot_reboots.py'
@@ -97,6 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/a01-private-pair"
+          cargo test --locked --offline -p cyxia-driver-virtio 2>&1 | tee "$RUNNER_TEMP/a01-reboots/driver-tests.log"
           cargo build --locked --offline -p cyxia-prototype --example prototype-disk
           python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/a01-private-pair/a" --identity-b "$RUNNER_TEMP/a01-private-pair/b" --output "$RUNNER_TEMP/a01-build" --selftest 2>&1 | tee "$RUNNER_TEMP/a01-reboots/build.log"
           git diff --exit-code

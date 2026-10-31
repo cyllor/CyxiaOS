@@ -178,6 +178,12 @@ impl BatchedBlock {
         if self.failed {
             return Err(Error::Device);
         }
+        // Sample the deadline before acquiring the used ring. An empty
+        // observation made before the deadline cannot justify timing out after
+        // a slow IRQ ACK/deschedule: the device may have completed meanwhile.
+        // A later poll still uses the original start and 250 ms deadline, and
+        // its fresh completion observation always precedes any timeout verdict.
+        let observed_ms = p.now_ms();
         let mut bytes = [0; 513];
         let completion = match self.queue.poll(&mut self.transport, &mut bytes, p) {
             Ok(c) => c,
@@ -216,7 +222,7 @@ impl BatchedBlock {
             .pending
             .iter()
             .flatten()
-            .any(|(_, _, start)| p.now_ms().wrapping_sub(*start) >= 250)
+            .any(|(_, _, start)| observed_ms.wrapping_sub(*start) >= 250)
         {
             self.fail(p);
             return Err(Error::Timeout);
@@ -239,8 +245,22 @@ mod tests {
     use std::boxed::Box;
     struct Host {
         clock: Cell<u64>,
+        idle_completion: Cell<Option<(usize, u8, bool)>>,
+        idle_clock: Cell<Option<u64>>,
     }
     unsafe impl Platform for Host {
+        fn diagnostic_stage(&self, stage: u64) {
+            if stage == crate::DiagnosticStage::QueueIdleAck as u64 {
+                // The device completes after the poll sampled an empty used
+                // ring. Model descheduling across the deadline during IRQ ACK.
+                if let Some((base, slot, read)) = self.idle_completion.take() {
+                    unsafe { complete(base, slot, read, 0) };
+                }
+                if let Some(now) = self.idle_clock.take() {
+                    self.clock.set(now);
+                }
+            }
+        }
         fn physical(&self, a: usize, _: usize) -> Result<u64, Error> {
             Ok(a as u64)
         }
@@ -256,6 +276,8 @@ mod tests {
     fn fixture() -> (BatchedBlock, Host, usize) {
         let p = Host {
             clock: Cell::new(0),
+            idle_completion: Cell::new(None),
+            idle_clock: Cell::new(None),
         };
         let mmio = Box::leak(Box::new(Page::zeroed()));
         mmio.put32(0, 0x74726976);
@@ -328,6 +350,64 @@ mod tests {
         assert_eq!(c.notify_version, 9);
         b.acknowledge(c.token).unwrap();
         assert_eq!(b.free(), 5);
+    }
+    #[test]
+    fn predeadline_empty_poll_cannot_timeout_after_completion_during_ack() {
+        let (mut b, p, m) = fixture();
+        let token = b
+            .begin(Operation::Read(0), &[0; 512], true, true, &p)
+            .unwrap();
+        p.idle_completion.set(Some((m, token.slot, true)));
+        p.idle_clock.set(Some(250_000_000));
+        let mut out = [0; 512];
+        assert_eq!(b.poll(&mut out, &p), Ok(None));
+        assert_eq!(p.clock.get(), 250_000_000);
+        let completion = b.poll(&mut out, &p).unwrap().unwrap();
+        assert_eq!(completion.token, token);
+        assert_eq!(out, [0x5a; 512]);
+        assert_eq!(b.notify_stats().errors, 0);
+        b.acknowledge(token).unwrap();
+        assert_eq!(b.free(), b.capacity());
+    }
+    #[test]
+    fn empty_queue_observed_after_original_deadline_still_times_out() {
+        let (mut b, p, _) = fixture();
+        let token = b
+            .begin(Operation::Read(0), &[0; 512], true, true, &p)
+            .unwrap();
+        p.clock.set(249_000_000);
+        assert_eq!(b.poll(&mut [0; 512], &p), Ok(None));
+        p.clock.set(250_000_000);
+        assert_eq!(b.poll(&mut [0; 512], &p), Err(Error::Timeout));
+        assert_eq!(b.free(), b.capacity() - 1);
+        assert!(b.acknowledge(token).is_err());
+        assert_eq!(
+            b.begin(Operation::Read(1), &[0; 512], true, true, &p),
+            Err(Error::Device)
+        );
+    }
+    #[test]
+    fn stalled_empty_poll_does_not_restart_or_extend_original_deadline() {
+        let (mut b, p, _) = fixture();
+        b.begin(Operation::Read(0), &[0; 512], true, true, &p)
+            .unwrap();
+        p.idle_clock.set(Some(250_000_000));
+        assert_eq!(b.poll(&mut [0; 512], &p), Ok(None));
+        assert_eq!(b.poll(&mut [0; 512], &p), Err(Error::Timeout));
+        assert_eq!(b.notify_stats().published, 1);
+        assert_eq!(b.notify_stats().completed, 0);
+    }
+    #[test]
+    fn already_completed_flush_wins_over_elapsed_timeout() {
+        let (mut b, p, m) = fixture();
+        let token = b
+            .begin(Operation::Flush, &[0; 512], true, true, &p)
+            .unwrap();
+        unsafe { complete(m, token.slot, false, 0) };
+        p.clock.set(250_000_000);
+        let completion = b.poll(&mut [0; 512], &p).unwrap().unwrap();
+        assert_eq!(completion.operation, Operation::Flush);
+        b.acknowledge(token).unwrap();
     }
     #[test]
     fn invalid_device_status_never_releases_or_acknowledges_policy() {
