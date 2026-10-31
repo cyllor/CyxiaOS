@@ -29,6 +29,16 @@ from verify_unified import attest_qemu
 from verify_v13_boot_recovery import CONFIG_MAGIC, MAGIC, MODES, require, verify_samples
 
 ROOT = Path(__file__).resolve().parents[1]
+DEBUG_SYMBOLS = {'model-debug': 'A01_BOOT_MODEL_DEBUG',
+                 'control-settlement': 'CONTROL_SETTLEMENT_EVIDENCE',
+                 'smp-fault': 'SMP_FAULT_EVIDENCE'}
+MODEL_DEBUG_FIELDS = {8: 'steps', 9: 'admissions', 10: 'no_credit', 11: 'admission_error',
+    12: 'settlement_busy', 13: 'settlement_error', 14: 'credit_sequence', 15: 'reserved_ns',
+    16: 'actual_ns', 17: 'total_cpu_ns', 18: 'finished_ns', 19: 'exit_kind',
+    20: 'entry_pc', 21: 'exit_pc', 22: 'model_result', 23: 'terminal_cause',
+    24: 'last_admission_ns', 25: 'stage', 26: 'credit_window', 27: 'settlement',
+    28: 'bill_pending', 29: 'entry_ns', 30: 'return_ns', 31: 'cpu_before', 32: 'cpu_after',
+    48: 'requested_ns', 49: 'cancelled_ns', 50: 'cancel_won'}
 
 
 def sha(path):
@@ -78,11 +88,22 @@ def capture_failure(qmp, save, symbols, config, decoder, raw, text):
         require(qmp.execute('query-status')['status'] == 'paused', 'failure capture not stopped')
     except caught as error:
         return {'failure_capture_errors': {'stop': str(error)}}
-    for key, size in (('boot', 512), ('control', 4096), ('runtime', 8192), ('unified', 4096)):
+    captures = [('boot', 512), ('control', 4096), ('runtime', 8192), ('unified', 4096)]
+    captures += [(key, symbols[key].get('size')) for key in DEBUG_SYMBOLS if key in symbols]
+    for key, size in captures:
         try:
+            require(type(size) is int and 0 < size <= 8192 and size % 8 == 0,
+                    'invalid diagnostic buffer size')
             sample = save('failure-' + key + '.bin', symbols[key]['pa'], size)
             if key == 'boot':
                 report['failure_capture'] = stopped_boot_state(sample, config)
+            elif key in DEBUG_SYMBOLS:
+                require(len(sample) == size, 'short diagnostic buffer')
+                words = struct.unpack('<' + str(size // 8) + 'Q', sample)
+                details = {'words': list(words), 'scope': 'stopped diagnostic, not acceptance'}
+                if key == 'model-debug' and len(words) == 64:
+                    details['fields'] = {name: words[index] for index, name in MODEL_DEBUG_FIELDS.items()}
+                report.setdefault('failure_diagnostics', {})[key] = details
         except caught as error:
             errors[key] = str(error)
     try:
@@ -224,7 +245,13 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
         result['error']=str(error)
     finally:
         if qmp and result['status'] != 'PASS' and proc is not None and proc.poll() is None:
-            result.update(capture_failure(qmp, save, symbols, config, decoder, raw, text))
+            diagnostic_symbols = dict(symbols)
+            for key, name in DEBUG_SYMBOLS.items():
+                try:
+                    diagnostic_symbols[key] = symbol(data, name)
+                except (KeyError, ValueError) as error:
+                    result.setdefault('failure_symbol_errors', {})[key] = str(error)
+            result.update(capture_failure(qmp, save, diagnostic_symbols, config, decoder, raw, text))
         if qmp:
             try: qmp.execute('quit')
             except Exception: pass
