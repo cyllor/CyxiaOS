@@ -1,6 +1,7 @@
 """Host-only mutation tests; these do not establish native reboot acceptance."""
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -62,8 +63,18 @@ class RebootCustody(unittest.TestCase):
             files = {p.name: dict(bytes=p.stat().st_size, sha256=sha256(p))
                      for p in previous.iterdir()}
             (previous/'summary.json').write_text(json.dumps({'files': files}))
-            def identity(path): return dict(bytes=path.stat().st_size, sha256=sha256(path))
+            synchronized = []
+            def sync(fd):
+                self.assertEqual(os.fstat(fd).st_size, len(b'previous-volume'),
+                                 'buffered copy must be flushed before fsync')
+                synchronized.append(True)
+            def identity(path):
+                if path == output/'disk.raw':
+                    self.assertEqual(synchronized, [True],
+                                     'handoff digest published before setup copy was synchronized')
+                return dict(bytes=path.stat().st_size, sha256=sha256(path))
             with patch('boot_reboot_contract.disk_identity', side_effect=identity), \
+                 patch('boot_reboot_contract.os.fsync', side_effect=sync) as fsync, \
                  patch('boot_reboot_contract.subprocess.run') as formatter:
                 origin = prepare_disk(output, Path('/unused'), 'unused', previous)
                 self.assertEqual(origin['kind'], 'handoff')
@@ -71,10 +82,29 @@ class RebootCustody(unittest.TestCase):
                 self.assertEqual((previous/'disk.raw').read_bytes(), b'previous-volume')
                 self.assertEqual((output/'format.log').read_bytes(), HANDOFF_LOG)
                 formatter.assert_not_called()
+                fsync.assert_called_once()
                 (previous/'process-exit.json').write_text(json.dumps(dict(self.process(), forced=True)))
                 with self.assertRaises(ValueError): handoff_origin(previous)
 
-
+    def test_copy_sync_failure_is_terminal_not_a_reason_to_reformat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); previous = root/'previous'; previous.mkdir()
+            output = root/'next'; output.mkdir()
+            (previous/'disk.raw').write_bytes(b'previous-volume')
+            origin = dict(kind='handoff', disk_sha256='ab'*32)
+            with patch('boot_reboot_contract.handoff_origin', return_value=origin), \
+                 patch('boot_reboot_contract.os.fsync', side_effect=OSError('setup sync failed')), \
+                 patch('boot_reboot_contract.subprocess.run') as formatter:
+                with self.assertRaisesRegex(OSError, 'setup sync failed'):
+                    prepare_disk(output, Path('/unused'), 'unused', previous)
+                self.assertFalse((output/'format.log').exists())
+                self.assertEqual((previous/'disk.raw').read_bytes(), b'previous-volume')
+                formatter.assert_not_called()
+                # A failed setup copy is retained and cannot be overwritten by
+                # invoking setup again with a fresh-image request.
+                with self.assertRaisesRegex(ValueError, 'overwrite'):
+                    prepare_disk(output, Path('/unused'), 'unused')
+                formatter.assert_not_called()
 
 
 class RebootLinkMutations(unittest.TestCase):

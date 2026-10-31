@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -67,6 +68,12 @@ def prepare_disk(output: Path, formatter: Path, uuid: str, previous: Path | None
     # is ever attached to QEMU; the predecessor process has already exited.
     with source.open('rb') as src, disk.open('xb') as dst:
         shutil.copyfileobj(src, dst, 1024 * 1024)
+        # This is host fixture setup, before any guest starts. Do not make the
+        # first guest FLUSH pay for 512 MiB of dirty host copy buffers. The
+        # formatter similarly synchronizes its initial image. This does not
+        # acknowledge any failed guest FLUSH or model unflushed power loss.
+        dst.flush()
+        os.fsync(dst.fileno())
     require(disk_identity(disk)['sha256'] == origin['disk_sha256']
             and handoff_origin(previous) == origin, 'disk changed during stopped handoff')
     (output / 'format.log').write_bytes(HANDOFF_LOG)
