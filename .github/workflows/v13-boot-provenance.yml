@@ -5,11 +5,15 @@ on:
     branches: [CyxiaOS-V0.13]
     paths:
       - '.github/workflows/v13-boot-provenance.yml'
-      - 'tools/*v13_boot*'
-      - 'kernel/src/boot_recovery.rs'
-      - 'kernel/src/prototype_runtime/boot_model.rs'
-      - 'kernel/src/prototype_storage.rs'
-      - 'crates/prototype/src/boot*'
+      - 'tools/**'
+      - 'tests/host/**'
+      - 'kernel/**'
+      - 'crates/**'
+      - 'user/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
   workflow_dispatch:
 
 permissions:
@@ -25,15 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: a9add021a35c3f26746d510db612b9623e0c7632
           persist-credentials: false
-          fetch-depth: 2
       - name: Reproduce previously accepted invalid snapshots
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/boot-verifiers"
+          # This fixed historical comparator is reviewed repository code, not an archive-selected checker.
+          git fetch --no-tags --depth=1 origin 09b5f54baf795097d80b1b8a960b391bcdb6ea57
           python3 - <<'PY' | tee "$RUNNER_TEMP/boot-verifiers/red-green.log"
-          import struct, subprocess, sys
+          import subprocess, sys
           sys.path.insert(0, 'tools')
           from test_verify_v13_boot_recovery import fixture, packed
           from verify_v13_boot_recovery import verify_samples
@@ -81,7 +85,6 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: a9add021a35c3f26746d510db612b9623e0c7632
           persist-credentials: false
       - name: Preserve exact source and install pinned native compiler
         run: |
