@@ -1,0 +1,52 @@
+name: V0.13 A01 worker ordering
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths:
+      - '.github/workflows/v13-a01-worker.yml'
+      - 'kernel/src/prototype_runtime/boot_model.rs'
+      - 'kernel/src/boot_recovery.rs'
+      - 'tests/host/boot_model_harness.rs'
+      - 'tests/fixtures/a01-boot-worker-before-settlement.rs.txt'
+      - 'tools/test_a01_boot_worker.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-worker-interleavings:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned compiler
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+          rustup override set 1.95.0
+      - name: Exercise actual worker and reproduce historical failures
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a01-worker"
+          git rev-parse HEAD > "$RUNNER_TEMP/a01-worker/source-commit.txt"
+          rustc --version --verbose > "$RUNNER_TEMP/a01-worker/compiler.txt"
+          python3 -B -m unittest discover -s tools -p 'test_a01_boot_worker.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-worker/worker-tests.log"
+      - name: Check changed Rust source formatting
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --check kernel/src/prototype_runtime/boot_model.rs kernel/src/boot_recovery.rs tests/host/boot_model_harness.rs 2>&1 | tee "$RUNNER_TEMP/a01-worker/format.log"
+      - name: Preserve host-only results including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-a01-worker-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/a01-worker/

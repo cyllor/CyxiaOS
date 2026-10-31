@@ -54,6 +54,14 @@ pub fn model_turn(spent: u64, kind: u64, result: Option<bool>) {
         Ordering::Release,
     );
 }
+/// CPU0 publishes only the worker's validated, successfully settled response.
+/// The final total replaces the earlier checkpoint; faults, cancellation and
+/// failed/late settlement leave result=0 and cannot certify model rejection.
+pub fn model_settled(spent: u64, passed: bool) {
+    assert_eq!(cpu::slot(), 0);
+    A01_BOOT_EVIDENCE.0[20].store(spent, Ordering::Relaxed);
+    A01_BOOT_EVIDENCE.0[24].store(if passed { 1 } else { 2 }, Ordering::Release);
+}
 pub fn model_passed() {
     A01_BOOT_EVIDENCE.0[14].store(timer::ticks(), Ordering::Relaxed);
     MODEL_PASSED.store(true, Ordering::Release);
