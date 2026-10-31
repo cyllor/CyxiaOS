@@ -1,0 +1,161 @@
+name: V0.13 boot provenance
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths:
+      - '.github/workflows/v13-boot-provenance.yml'
+      - 'tools/*v13_boot*'
+      - 'kernel/src/boot_recovery.rs'
+      - 'kernel/src/prototype_runtime/boot_model.rs'
+      - 'kernel/src/prototype_storage.rs'
+      - 'crates/prototype/src/boot*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adversarial-verifiers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: a9add021a35c3f26746d510db612b9623e0c7632
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Reproduce previously accepted invalid snapshots
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/boot-verifiers"
+          python3 - <<'PY' | tee "$RUNNER_TEMP/boot-verifiers/red-green.log"
+          import struct, subprocess, sys
+          sys.path.insert(0, 'tools')
+          from test_verify_v13_boot_recovery import fixture, packed
+          from verify_v13_boot_recovery import verify_samples
+          code = subprocess.check_output(['git', 'show', '09b5f54baf795097d80b1b8a960b391bcdb6ea57:tools/verify_v13_boot_recovery.py'], text=True)
+          legacy = {}
+          exec(compile(code, 'reviewed-parent-decoder', 'exec'), legacy)
+          witnesses = [(0, 'first', 20, 0), (1, 'first', 14, 1), (1, 'last', 19, 1), (3, 'last', 20, 8000001)]
+          for mode, which, index, value in witnesses:
+              a, b, c = fixture(mode)
+              (a if which == 'first' else b)[index] = value
+              args = (packed(a), packed(b), bytes(4096), bytes(8192), bytes(4096), packed(c))
+              legacy['verify_samples'](*args)
+              try:
+                  verify_samples(*args)
+              except ValueError:
+                  print('OLD_ACCEPTED_NEW_REJECTED', mode, which, index, value)
+              else:
+                  raise SystemExit('New decoder still accepts the invalid witness')
+          PY
+      - name: Run boot adversarial fixtures
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tools -p 'test_verify_v13_boot*.py' -v 2>&1 | tee "$RUNNER_TEMP/boot-verifiers/boot-tests.log"
+      - name: Pin compiler for existing independent tool lane
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+      - name: Run complete tool regression lane
+        run: python3 -B tools/prototype.py test --lane tools --output "$RUNNER_TEMP/boot-verifiers/tools"
+      - name: Retain host-only results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-boot-verifiers-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/boot-verifiers/
+
+  native-boot-and-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: a9add021a35c3f26746d510db612b9623e0c7632
+          persist-credentials: false
+      - name: Preserve exact source and install pinned native compiler
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/boot-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/boot-evidence/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/boot-evidence/source-tree.txt"
+          git archive --format=tar HEAD | gzip -n > "$RUNNER_TEMP/boot-evidence/source.tar.gz"
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev ninja-build python3-venv
+      - name: Build exact PMU-patched emulator
+        id: qemu
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/boot-qemu"
+          git -C "$RUNNER_TEMP/boot-qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/boot-qemu" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/boot-qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/boot-qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/boot-qemu" diff --check
+          cd "$RUNNER_TEMP/boot-qemu"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror
+          ninja -C build qemu-system-aarch64
+      - name: Build exact native pair and formatter
+        id: build
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/boot-private-pair"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/boot-private-pair/a" --identity-b "$RUNNER_TEMP/boot-private-pair/b" --output "$RUNNER_TEMP/boot-build" --selftest 2>&1 | tee "$RUNNER_TEMP/boot-evidence/build.log"
+      - name: Run every boot profile without promoting A01
+        id: boot
+        run: |
+          set -euo pipefail
+          python3 -B tools/run_v13_boot_evidence.py --build "$RUNNER_TEMP/boot-build" --output "$RUNNER_TEMP/boot-evidence/matrix" --formatter "$GITHUB_WORKSPACE/target/debug/examples/prototype-disk" --qemu "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" --qemu-source "$RUNNER_TEMP/boot-qemu" --timeout 60 2>&1 | tee "$RUNNER_TEMP/boot-evidence/matrix.log"
+      - name: Replay complete matrix in an independent process
+        if: ${{ !cancelled() && steps.boot.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify_v13_boot_receipt.py --matrix "$RUNNER_TEMP/boot-evidence/matrix" --source-root "$GITHUB_WORKSPACE" --qemu-source "$RUNNER_TEMP/boot-qemu" | tee "$RUNNER_TEMP/boot-evidence/independent-matrix.json"
+      - name: Preserve A02 isolation independently of boot result
+        if: ${{ always() && !cancelled() && steps.build.outcome == 'success' && steps.qemu.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/run_v13_a02.py --build "$RUNNER_TEMP/boot-build" --output "$RUNNER_TEMP/boot-evidence/a02" --formatter "$GITHUB_WORKSPACE/target/debug/examples/prototype-disk" --qemu "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" --qemu-source "$RUNNER_TEMP/boot-qemu" --timeout 90 2>&1 | tee "$RUNNER_TEMP/boot-evidence/a02.log"
+      - name: Retain exact emulator and summarize failures
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/boot-evidence/emulator"
+          if [ -f "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" ]; then
+            cp "$RUNNER_TEMP/boot-qemu/build/qemu-system-aarch64" "$RUNNER_TEMP/boot-evidence/emulator/"
+            git -C "$RUNNER_TEMP/boot-qemu" rev-parse HEAD > "$RUNNER_TEMP/boot-evidence/emulator/source-commit.txt"
+            git -C "$RUNNER_TEMP/boot-qemu" diff --binary > "$RUNNER_TEMP/boot-evidence/emulator/source.patch"
+            sha256sum "$RUNNER_TEMP/boot-evidence/emulator/qemu-system-aarch64" > "$RUNNER_TEMP/boot-evidence/emulator/binary.sha256"
+          fi
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'boot-evidence/matrix/summary.json'
+          if p.is_file():
+              r = json.loads(p.read_text())
+              print(json.dumps({'status': r.get('status'), 'error': r.get('error'), 'cases': {k: {'status': v.get('status'), 'error': v.get('error')} for k, v in r.get('cases', {}).items()}}, indent=2))
+          PY
+      - name: Retain all native evidence including hidden build inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-boot-native-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6
+          path: ${{ runner.temp }}/boot-evidence/
