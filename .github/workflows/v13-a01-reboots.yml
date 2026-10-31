@@ -1,0 +1,157 @@
+name: V0.13 A01 persistent reboot chains
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths:
+      - '.github/workflows/v13-a01-reboots.yml'
+      - 'kernel/src/prototype_runtime/boot_model.rs'
+      - 'kernel/src/boot_recovery.rs'
+      - 'tools/run_v13_boot_recovery.py'
+      - 'tools/boot_reboot_contract.py'
+      - 'tools/run_v13_boot_reboots.py'
+      - 'tools/verify_v13_boot_reboots.py'
+      - 'tools/verify_v13_boot_receipt.py'
+      - 'tools/check_v13_disk.py'
+      - 'tools/test_boot_reboot_contract.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  persistent-reboot-chains:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Preserve source and verify diagnostic host tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a01-reboots"
+          git rev-parse HEAD > "$RUNNER_TEMP/a01-reboots/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/a01-reboots/source-tree.txt"
+          git archive --format=tar HEAD | gzip -n > "$RUNNER_TEMP/a01-reboots/source.tar.gz"
+          python3 -B -m unittest discover -s tools -p 'test_run_v13_boot*.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-reboots/diagnostics-tests.log"
+          python3 -B -m unittest discover -s tools -p 'test_verify_v13_boot*.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-reboots/verifier-tests.log"
+          python3 -B -m unittest discover -s tools -p 'test_boot_reboot*.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-reboots/custody-tests.log"
+      - name: Install pinned native compiler
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt --component llvm-tools-preview --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libglib2.0-0 libpixman-1-0 libfdt1
+      - name: Restore exact previously built emulator, never archive-selected code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/cyllor/CyxiaOS/actions/artifacts/13038781976/zip > "$RUNNER_TEMP/qemu-cache.zip"
+          echo '0505b2597c127246eab4a1b774efade2423c2560768c48c9061b5988edcdad07  '"$RUNNER_TEMP/qemu-cache.zip" | sha256sum --check
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/a01-qemu"
+          git -C "$RUNNER_TEMP/a01-qemu" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/a01-qemu" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/a01-qemu" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          with zipfile.ZipFile(root / 'qemu-cache.zip') as archive:
+              selected = ['emulator/qemu-system-aarch64', 'emulator/source-commit.txt', 'emulator/binary.sha256']
+              for name in selected:
+                  assert archive.namelist().count(name) == 1, 'missing or duplicate pinned cache entry'
+                  assert archive.getinfo(name).file_size <= 512 * 1024 * 1024, 'oversized cache entry'
+              binary = archive.read(selected[0])
+              commit = archive.read(selected[1]).decode().strip()
+              expected = archive.read(selected[2]).decode().split()[0]
+          assert commit == 'f8ed81651e61d9c2166df6121ce2af0f44f06b3e'
+          assert hashlib.sha256(binary).hexdigest() == expected
+          target = root / 'a01-qemu/build/qemu-system-aarch64'
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_bytes(binary)
+          target.chmod(0o755)
+          (root / 'a01-reboots/emulator-cache.json').write_text(json.dumps({
+              'source_run': 41189912033, 'source_artifact': 13038781976,
+              'archive_sha256': '0505b2597c127246eab4a1b774efade2423c2560768c48c9061b5988edcdad07',
+              'qemu_sha256': expected, 'qemu_source_commit': commit,
+              'scope': 'byte-identical reuse of the successful pinned native build; no archive code imported'
+          }, indent=2) + '\n')
+          PY
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from verify_unified import attest_qemu
+          source = Path(os.environ['RUNNER_TEMP']) / 'a01-qemu'
+          print(json.dumps(attest_qemu(source / 'build/qemu-system-aarch64', source), indent=2))
+          PY
+      - name: Build the pushed native source
+        run: |
+          set -euo pipefail
+          python3 user/prototype-cluster/tools/provision.py "$RUNNER_TEMP/a01-private-pair"
+          cargo build --locked --offline -p cyxia-prototype --example prototype-disk
+          python3 tools/build_unified.py --identity-a "$RUNNER_TEMP/a01-private-pair/a" --identity-b "$RUNNER_TEMP/a01-private-pair/b" --output "$RUNNER_TEMP/a01-build" --selftest 2>&1 | tee "$RUNNER_TEMP/a01-reboots/build.log"
+          git diff --exit-code
+      - name: Run three independent eight-boot chains and replay each
+        run: |
+          set -euo pipefail
+          python3 -u - <<'PYCODE' 2>&1 | tee "$RUNNER_TEMP/a01-reboots/chains.log"
+          import json, os, subprocess, sys
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          root = temp / 'a01-reboots'
+          report = {'scope': 'three independent eight-boot disk lineages; not formal A01',
+                    'native_acceptance_status': 'NOT_RUN', 'trials': []}
+          failed = False
+          for trial in range(3):
+              output = root / f'chain-{trial}'
+              command = [sys.executable, '-B', 'tools/run_v13_boot_reboots.py',
+                         '--build', str(temp / 'a01-build'), '--output', str(output),
+                         '--formatter', str(Path.cwd() / 'target/debug/examples/prototype-disk'),
+                         '--qemu', str(temp / 'a01-qemu/build/qemu-system-aarch64'),
+                         '--qemu-source', str(temp / 'a01-qemu'), '--timeout', '60']
+              completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (root / f'chain-{trial}.log').write_text(completed.stdout)
+              print('CHAIN', trial, 'exit', completed.returncode, completed.stdout, flush=True)
+              entry = {'trial': trial, 'returncode': completed.returncode, 'status': 'FAIL'}
+              if completed.returncode == 0:
+                  replay = subprocess.run([sys.executable, '-B', 'tools/verify_v13_boot_reboots.py',
+                      '--directory', str(output), '--source-root', str(Path.cwd()),
+                      '--qemu-source', str(temp / 'a01-qemu')],
+                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  (root / f'chain-{trial}-replay.json').write_text(replay.stdout)
+                  entry['replay_returncode'] = replay.returncode
+                  if replay.returncode == 0:
+                      entry['status'] = 'PASS'
+              if entry['status'] != 'PASS':
+                  failed = True
+                  for child in sorted(output.glob('*/summary.json')):
+                      value = json.loads(child.read_text())
+                      if value.get('status') != 'PASS':
+                          print('FAILURE', str(child), json.dumps({key: value.get(key) for key in
+                              ('error', 'failure_capture', 'failure_diagnostics', 'failure_capture_errors')},
+                              indent=2), flush=True)
+              report['trials'].append(entry)
+              report['status'] = 'FAIL' if failed else 'PASS'
+              (root / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
+              print('CHAIN_RESULT', json.dumps(entry), flush=True)
+          raise SystemExit(int(failed))
+          PYCODE
+      - name: Retain all lineages and exact source including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v13-a01-reboots-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 6
+          path: ${{ runner.temp }}/a01-reboots/

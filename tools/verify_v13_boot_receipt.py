@@ -17,17 +17,20 @@ import struct
 import sys
 
 from check_prototype_evidence import _pairs, read_json, safe_path, sha256
+from boot_reboot_contract import verify_origin, verify_process
 from verify_v13_boot_recovery import MODES, require, verify_samples
 from verify_v13_a02 import verify_native_qemu, verify_stopped_status
 from transport import FrameDecoder
 
-VERSION = 'a01-boot-provenance-v1'
+VERSION = 'a01-boot-provenance-v2'
 TOOL_FILES = (
     'run_v13_boot_recovery.py', 'run_v13_boot_evidence.py',
     'verify_v13_boot_recovery.py', 'verify_v13_boot_receipt.py',
     'run_qemu.py', 'run_v13_a02.py', 'verify_v13_a02.py',
     'verify_unified.py', 'build_unified.py', 'check_elf.py',
     'verify_v13_model.py', 'check_prototype_evidence.py', 'transport.py',
+    'boot_reboot_contract.py', 'check_v13_disk.py',
+    'run_v13_boot_reboots.py', 'verify_v13_boot_reboots.py',
 )
 BUILD_INPUTS = ('Cargo.toml', 'Cargo.lock', '.cargo/config.toml',
                 'crates/prototype/src/features.rs', 'crates/prototype/src/policy_wire.rs')
@@ -40,7 +43,7 @@ MANDATORY = {
     'dtb-header.bin', 'tools.json', 'launch.json', 'platform.json', 'disk.raw',
     'disk-before.json', 'format.log', 'first.bin', 'last.bin', 'control.bin',
     'runtime.bin', 'unified.bin', 'qmp-transcript.json', 'serial.bin', 'serial.txt',
-    'qemu-stderr.log', 'model.bin',
+    'qemu-stderr.log', 'model.bin', 'process-exit.json',
 } | {'tooling/' + name for name in TOOL_FILES} | {'build-inputs/' + name for name in BUILD_INPUTS}
 
 
@@ -291,13 +294,15 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
     require(config[48:144] == expected, 'wrong frozen artifact identities')
     inputs = document('input.json')
     require(type(inputs) is dict and inputs.keys() ==
-            {'scope', 'mode', 'nonce', 'timeout_seconds', 'sample_gap_seconds'}
+            {'scope', 'mode', 'nonce', 'timeout_seconds', 'sample_gap_seconds', 'disk_origin'}
             and inputs['scope'] == 'A01-boot-recovery-regression'
             and type(inputs['mode']) is int and inputs['mode'] in MODES.values()
             and inputs['mode'] == struct.unpack_from('<Q', config, 16)[0]
             and inputs['nonce'] == config[32:48].hex()
             and type(inputs['timeout_seconds']) in (int, float) and 5 <= inputs['timeout_seconds'] <= 120
             and inputs['sample_gap_seconds'] == .5, 'wrong frozen boot scenario')
+    verify_origin(inputs['disk_origin'], document('disk-before.json'), path('format.log').read_bytes())
+    verify_process(document('process-exit.json'))
     injection = document('config-injection.json')
     payload = f'M{symbols["config"]["pa"]:x},200:{config.hex()}'.encode('ascii')
     packet = b'$' + payload + f'#{sum(payload) % 256:02x}'.encode('ascii')
@@ -345,7 +350,8 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
             and text == path('serial.txt').read_bytes()
             and not any(marker in text for marker in (b'PANIC', b'SMP_ERROR', b'UNIFIED_FAIL')),
             'serial trace incomplete or failed')
-    return dict(verifier_version=VERSION, scope='A01 four-profile boot regression only',
+    return dict(verifier_version=VERSION, scope='A01 boot regression component; not reboot-chain admission',
+                reboot_chain_verified=False,
                 native_execution_verified=True, runtime_truth_attested=False,
                 native_acceptance_status='NOT_RUN', full_v13_acceptance=False,
                 mode=observed['mode'], run_nonce=inputs['nonce'], observations=observed,

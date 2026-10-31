@@ -21,6 +21,7 @@ import tempfile
 import time
 
 from build_unified import code_source_map
+from boot_reboot_contract import prepare_disk
 from check_elf import inspect_elf, symbol
 from run_qemu import Qmp
 from run_v13_a02 import inject_config
@@ -31,7 +32,10 @@ from verify_v13_boot_recovery import CONFIG_MAGIC, MAGIC, MODES, require, verify
 ROOT = Path(__file__).resolve().parents[1]
 DEBUG_SYMBOLS = {'model-debug': 'A01_BOOT_MODEL_DEBUG',
                  'control-settlement': 'CONTROL_SETTLEMENT_EVIDENCE',
-                 'smp-fault': 'SMP_FAULT_EVIDENCE'}
+                 'smp-fault': 'SMP_FAULT_EVIDENCE',
+                 'task-slices': 'TASK_SLICE_EVIDENCE', 'builtin-detail': 'BUILTIN_TASK_DETAIL',
+                 'baseline-service': 'BASELINE_SERVICE_EVIDENCE',
+                 'tasks': 'DOMAIN_TASK_EVIDENCE', 'task-overruns': 'TASK_OVERRUN_EVIDENCE'}
 MODEL_DEBUG_FIELDS = {8: 'steps', 9: 'admissions', 10: 'no_credit', 11: 'admission_error',
     12: 'settlement_busy', 13: 'settlement_error', 14: 'credit_sequence', 15: 'reserved_ns',
     16: 'actual_ns', 17: 'total_cpu_ns', 18: 'finished_ns', 19: 'exit_kind',
@@ -120,7 +124,7 @@ def capture_failure(qmp, save, symbols, config, decoder, raw, text):
     return report
 
 
-def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
+def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, previous=None):
     output.mkdir(parents=True, exist_ok=False)
     sources = code_source_map(ROOT)
     manifest = json.loads((build/'build-manifest.json').read_text())
@@ -140,22 +144,21 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
     shutil.copyfile(image, output/'node-a.elf')
     shutil.copyfile(build/'build-manifest.json', output/'build-manifest.json')
     write_json(output/'source-manifest.json', sources)
+    origin = prepare_disk(output, formatter, secrets.token_hex(16), previous)
+    disk = output/'disk.raw'
+    write_json(output/'disk-before.json', dict(sha256=sha(disk), bytes=disk.stat().st_size))
     nonce = secrets.token_bytes(16)
     write_json(output/'input.json', dict(scope='A01-boot-recovery-regression', mode=mode,
-               nonce=nonce.hex(), timeout_seconds=timeout, sample_gap_seconds=.5))
+               nonce=nonce.hex(), timeout_seconds=timeout, sample_gap_seconds=.5, disk_origin=origin))
     config = (struct.pack('<4Q', CONFIG_MAGIC, 1, mode, 0) + nonce
               + bytes.fromhex(sha(image)) + bytes.fromhex(sha(output/'input.json'))
               + bytes.fromhex(sha(output/'source-manifest.json')) + bytes(368))
     require(len(config) == 512, 'config size')
     (output/'config.bin').write_bytes(config)
     write_json(output/'tools.json', attest_qemu(str(qemu), qemu_source))
-    disk = output/'disk.raw'
-    formatted = subprocess.run([str(formatter), str(disk), secrets.token_hex(16)],
-                               capture_output=True, timeout=60, check=True)
-    (output/'format.log').write_bytes(formatted.stdout+formatted.stderr)
-    write_json(output/'disk-before.json', dict(sha256=sha(disk), bytes=disk.stat().st_size))
     decoder, raw, text = FrameDecoder(), bytearray(), bytearray()
     proc = sock = qmp = None
+    process_started = None
     result = dict(status='FAIL', mode=mode, native_acceptance_status='NOT_RUN')
 
     def save(name, address, size):
@@ -181,6 +184,7 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
                 '-qmp', f'unix:{qpath},server=on,wait=off', '-gdb', f'unix:{gpath},server=on,wait=off',
                 '-kernel', str(output/'node-a.elf'), '-no-reboot']
             write_json(output/'launch.json', dict(argv=argv, symbols=symbols))
+            process_started = time.monotonic_ns()
             proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errors)
             end = time.monotonic()+timeout
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -252,13 +256,30 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
                 except (KeyError, ValueError) as error:
                     result.setdefault('failure_symbol_errors', {})[key] = str(error)
             result.update(capture_failure(qmp, save, diagnostic_symbols, config, decoder, raw, text))
+            if 'stop' not in result.get('failure_capture_errors', {}):
+                try:
+                    registers = qmp.execute('human-monitor-command', {'command-line': 'info registers -a'})
+                    require(type(registers) is str and len(registers) <= 65536, 'unbounded register diagnostic')
+                    (output/'failure-registers.txt').write_text(registers)
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+                    result.setdefault('failure_capture_errors', {})['registers'] = str(error)
         if qmp:
             try: qmp.execute('quit')
             except Exception: pass
             write_json(output/'qmp-transcript.json', qmp.transcript)
         if proc:
-            try: proc.wait(timeout=5)
-            except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
+            forced = False
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                forced = True
+                proc.kill()
+                proc.wait(timeout=5)
+            write_json(output/'process-exit.json', dict(schema=1, started_ns=process_started,
+                exited_ns=time.monotonic_ns(), returncode=proc.returncode, forced=forced))
+            if forced or proc.returncode != 0:
+                result['status'] = 'FAIL'
+                result.setdefault('error', 'guest process did not exit normally')
         if sock: sock.close()
         (output/'serial.bin').write_bytes(raw); (output/'serial.txt').write_bytes(text)
         result['files']={p.name:dict(bytes=p.stat().st_size,sha256=sha(p)) for p in output.iterdir() if p.is_file()}
