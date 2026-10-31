@@ -3,91 +3,50 @@ name: V0.13 A01 focused debug
 on:
   push:
     branches: [CyxiaOS-V0.13]
-    paths: ['.github/workflows/v13-a01-debug.yml']
+    paths:
+      - '.github/workflows/v13-a01-debug.yml'
+      - 'kernel/src/boot_recovery.rs'
+      - 'kernel/src/prototype_runtime/boot_model.rs'
+      - 'kernel/src/prototype_storage.rs'
+      - 'kernel/src/prototype_storage/boot_diagnostics.rs'
+      - 'tools/run_v13_boot*.py'
+      - 'tools/verify_v13_boot*.py'
+      - 'tools/test_run_v13_boot*.py'
+      - 'tools/test_verify_v13_boot*.py'
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read
 
-# This reviewed candidate contains the mount diagnostic, stopped failure
-# capture and eight persistent host regression tests. No branch moves here.
-env:
-  CANDIDATE: 87eabfe7fa664104ce3627d995f300b13e614d9a
-  RUSTUP_TOOLCHAIN: '1.95.0'
-  PYTHONDONTWRITEBYTECODE: '1'
-
+# Current-source focused tests only. Engineering validation and the existing
+# v13-boot-provenance native workflow remain independent required evidence.
+# No old candidate checkout, branch mutation or catalogue promotion occurs.
 jobs:
-  engineering:
+  stopped-failure-regressions:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        lane: [static, rust, tools, host]
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 87eabfe7fa664104ce3627d995f300b13e614d9a
           persist-credentials: false
-      - name: Inspect the original Clippy failure without changing its result
-        if: matrix.lane == 'static'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Record exact source and exercise failure paths
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --location --max-time 60 --max-filesize 1048576 \
-            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            https://api.github.com/repos/cyllor/CyxiaOS/actions/artifacts/13037159449/zip \
-            -o "$RUNNER_TEMP/original-static.zip"
-          python3 - <<'PY'
-          import hashlib, os, zipfile
-          from pathlib import Path
-          p = Path(os.environ['RUNNER_TEMP']) / 'original-static.zip'
-          assert hashlib.sha256(p.read_bytes()).hexdigest() == 'b9bab85d6ee76ed44c463d923c8d07b78a02bef04bf32398d97a0ee4da6f7215'
-          with zipfile.ZipFile(p) as z:
-              for name in ('03-clippy.log', '04-governance-clippy.log'):
-                  assert z.getinfo(name).file_size <= 65536
-                  print('ORIGINAL_STATIC_FAILURE', name)
-                  print(z.read(name).decode())
-          PY
-      - name: Install all native targets and keep sanitized subprocesses pinned
-        run: |
-          set -euo pipefail
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update \
-            --component rustfmt --component clippy --component llvm-tools-preview \
-            --target aarch64-unknown-none --target aarch64-unknown-none-softfloat
-          rustup override set 1.95.0
-          cargo fetch --locked
-      - name: Validate exact candidate
-        env:
-          LANE: ${{ matrix.lane }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          mkdir -p "$RUNNER_TEMP/a01-focused"
+          git rev-parse HEAD > "$RUNNER_TEMP/a01-focused/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/a01-focused/source-tree.txt"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --check
-          python3 -B tools/prototype.py test --lane "$LANE" --fetch --output "$RUNNER_TEMP/a01-checks"
-      - name: Print failures and record source identity
+          python3 -B -m unittest discover -s tools -p 'test_run_v13_boot_diagnostics.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-focused/failure-paths.log"
+          python3 -B -m unittest discover -s tools -p 'test_verify_v13_boot*.py' -v 2>&1 | tee "$RUNNER_TEMP/a01-focused/boot-provenance.log"
+          printf '%s\n' 'Host-only diagnostics/provenance regression; not native A01 acceptance.' > "$RUNNER_TEMP/a01-focused/scope.txt"
+      - name: Retain successes and failures
         if: always()
-        run: |
-          mkdir -p "$RUNNER_TEMP/a01-checks"
-          git rev-parse HEAD > "$RUNNER_TEMP/a01-checks/source-commit.txt"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP']) / 'a01-checks'
-          path = root / 'summary.json'
-          if path.is_file():
-              result = json.loads(path.read_text())
-              print(json.dumps(result, indent=2))
-              for row in result['steps']:
-                  if row['status'] != 'PASS':
-                      print((root / row['log']).read_text(errors='replace')[-12000:])
-          PY
-      - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: a01-reviewed-${{ matrix.lane }}-${{ github.run_id }}
+          name: a01-focused-${{ github.sha }}-${{ github.run_attempt }}
           retention-days: 30
           if-no-files-found: error
-          path: ${{ runner.temp }}/a01-checks/
+          path: ${{ runner.temp }}/a01-focused/

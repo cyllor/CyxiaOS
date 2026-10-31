@@ -16,6 +16,8 @@ use cyxia_prototype::{
     journal::{BlockDevice, Journal},
     storage::{BLOCK_SIZE, TOTAL_BLOCKS},
 };
+#[path = "prototype_storage/boot_diagnostics.rs"]
+mod boot_diagnostics;
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 static BORROWED: AtomicBool = AtomicBool::new(false);
 static DEVICE_READY: AtomicBool = AtomicBool::new(false);
@@ -617,7 +619,8 @@ pub fn try_boot(info: &BootInfo) -> Result<BootIdentity, BootFailure> {
     };
     let recovery = match journal.mount(&mut disk, scratch) {
         Ok(recovery) => recovery,
-        Err(_) => {
+        Err(error) => {
+            boot_diagnostics::mount_failure(&error, disk.reads, disk.writes, disk.flushes);
             // An error is not a DMA stop proof. Keep the queue, scheduler and
             // backing pinned; DEVICE_READY remains false for all new users.
             unsafe { *core::ptr::addr_of_mut!(DISK) = Some(disk) };

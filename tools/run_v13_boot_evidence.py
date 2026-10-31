@@ -22,7 +22,7 @@ from verify_v13_boot_recovery import MODES, require
 from verify_v13_boot_receipt import BUILD_INPUTS, TOOL_FILES, verify_matrix, verify_receipt
 
 
-def preserve_and_verify(output, project, trusted_qemu, original_tool_hashes):
+def preserve_evidence(output, project, trusted_qemu, original_tool_hashes):
     producer = output / 'summary.json'
     original = producer.read_bytes()
     (output / 'producer-summary.json').write_bytes(original)
@@ -53,6 +53,13 @@ def preserve_and_verify(output, project, trusted_qemu, original_tool_hashes):
         for path in sorted(output.rglob('*')) if path.is_file() and path != producer
     }
     write_json(producer, receipt)
+    return receipt
+
+
+def preserve_and_verify(output, project, trusted_qemu, original_tool_hashes):
+    receipt = preserve_evidence(output, project, trusted_qemu, original_tool_hashes)
+    require(receipt.get('status') == 'PASS', receipt.get('error', 'native boot regression failed'))
+    producer = output / 'summary.json'
     replay = verify_receipt(output, source_root=project, qemu_source=trusted_qemu)
     receipt['independent_replay'] = replay
     receipt['native_execution_verified'] = True
@@ -86,7 +93,6 @@ def main(argv=None):
         directory = root / name
         try:
             raw = run_case(build, directory, formatter, qemu, trusted_qemu, mode, args.timeout)
-            require(raw.get('status') == 'PASS', raw.get('error', 'native boot regression failed'))
             replay = preserve_and_verify(directory, project, trusted_qemu, tool_hashes)
             report['cases'][name] = dict(status='PASS', independent_replay=replay,
                                          native_acceptance_status='NOT_RUN')
@@ -106,7 +112,8 @@ def main(argv=None):
             report['status'] = 'FAIL'
             report['error'] = str(error)
     write_json(root / 'summary.json', report)
-    print(json.dumps({name: case['status'] for name, case in report['cases'].items()}, indent=2))
+    print(json.dumps({name: {key: case.get(key) for key in ('status', 'error')}
+                      for name, case in report['cases'].items()}, indent=2))
     return int(report['status'] != 'PASS')
 
 

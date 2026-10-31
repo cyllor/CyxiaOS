@@ -43,6 +43,62 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
+def stopped_boot_state(sample, config):
+    """Decode a stopped diagnostic only; never returns an acceptance verdict."""
+    require(len(sample) == len(config) == 512, 'invalid stopped boot record size')
+    words, identity = (struct.unpack('<64Q', value) for value in (sample, config))
+    require(identity[:2] == (CONFIG_MAGIC, 1) and identity[2] in MODES.values(),
+            'invalid diagnostic config')
+    require(words[:2] == (MAGIC, 1) and words[2] % 2 == 0,
+            'unsealed stopped boot diagnostic')
+    require(words[5] == identity[2] and words[32:46] == identity[4:18],
+            'mixed diagnostic boot/source/input/image')
+    fields = {2: 'sequence', 3: 'state', 4: 'reason', 5: 'mode', 6: 'epoch',
+              7: 'epoch_durable_ticks', 9: 'online_mask', 14: 'model_passed_ticks',
+              15: 'active_ticks', 20: 'model_checkpoint_cpu_ns', 21: 'model_exit_kind',
+              22: 'model_cpu', 23: 'model_turns', 24: 'model_checkpoint_result'}
+    result = {name: words[index] for index, name in fields.items()}
+    result['reason_name'] = {0: 'none', 1: 'already-attempted', 2: 'device',
+                             3: 'mount', 4: 'epoch', 5: 'model-selftest'}.get(words[4], 'unknown')
+    result['scope'] = 'stopped diagnostic, not native acceptance'
+    return result
+
+
+def capture_failure(qmp, save, symbols, config, decoder, raw, text):
+    """Best-effort stopped evidence; never masks the original run failure.
+
+    A partially published boot record still has diagnostic bytes worth keeping.
+    Its decoder failure must not suppress the other authority buffers or serial.
+    This function never resumes the guest, rewrites memory or assigns PASS.
+    """
+    report, errors = {}, {}
+    caught = (OSError, ValueError, RuntimeError, KeyError, TypeError)
+    try:
+        qmp.execute('stop')
+        require(qmp.execute('query-status')['status'] == 'paused', 'failure capture not stopped')
+    except caught as error:
+        return {'failure_capture_errors': {'stop': str(error)}}
+    for key, size in (('boot', 512), ('control', 4096), ('runtime', 8192), ('unified', 4096)):
+        try:
+            sample = save('failure-' + key + '.bin', symbols[key]['pa'], size)
+            if key == 'boot':
+                report['failure_capture'] = stopped_boot_state(sample, config)
+        except caught as error:
+            errors[key] = str(error)
+    try:
+        chunk = base64.b64decode(qmp.execute('ringbuf-read',
+            dict(device='cyxlog', size=1048576, format='base64')), validate=True)
+        require(len(raw) + len(chunk) <= 8*1024*1024, 'failure serial capture overflow')
+        raw.extend(chunk)
+        for payload in decoder.feed(chunk):
+            text.extend(payload + b'\n')
+    except caught as error:
+        errors['serial'] = str(error)
+    if errors:
+        report['failure_capture_errors'] = errors
+    return report
+
+
 def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
     output.mkdir(parents=True, exist_ok=False)
     sources = code_source_map(ROOT)
@@ -80,6 +136,12 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
     decoder, raw, text = FrameDecoder(), bytearray(), bytearray()
     proc = sock = qmp = None
     result = dict(status='FAIL', mode=mode, native_acceptance_status='NOT_RUN')
+
+    def save(name, address, size):
+        dest = output/name
+        qmp.execute('pmemsave', dict(val=address, size=size, filename=str(dest)))
+        return dest.read_bytes()
+
     try:
         with tempfile.TemporaryDirectory(prefix='cyx-boot-') as temp, (output/'qemu-stderr.log').open('wb') as errors:
             qpath, gpath = str(Path(temp)/'q.sock'), str(Path(temp)/'g.sock')
@@ -110,10 +172,6 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
             cpus = qmp.execute('query-cpus-fast'); memory=qmp.execute('query-memory-size-summary')
             require(len(cpus)==4 and memory['base-memory']==1024**3, 'platform mismatch')
             write_json(output/'platform.json', dict(cpus=cpus, memory=memory))
-            def save(name, address, size):
-                dest = output/name
-                qmp.execute('pmemsave', dict(val=address, size=size, filename=str(dest)))
-                return dest.read_bytes()
             header = save('dtb-header.bin', 0x40000000, 40)
             magic, size = struct.unpack_from('>2I', header)
             require(magic==0xd00dfeed and 40<=size<=2*1024*1024, 'bad DTB')
@@ -133,7 +191,8 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
                 words=struct.unpack('<64Q',probe)
                 target=3 if mode==0 else 2
                 progressed=mode==0 or words[10]>0 and words[11]>0
-                if words[0]==MAGIC and words[3]==target and words[2]%2==0 and progressed:
+                if (words[0]==MAGIC and words[3] in (2, 3) and words[2]%2==0
+                        and (words[3]!=target or progressed)):
                     if first is None or time.monotonic()>=second_at:
                         qmp.execute('stop')
                         require(qmp.execute('query-status')['status']=='paused','capture not stopped')
@@ -141,6 +200,12 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
                         sample=save(name,symbols['boot']['pa'],512)
                         if struct.unpack('<64Q',sample)[2]%2:
                             qmp.execute('cont'); time.sleep(.005); continue
+                        diagnostic = stopped_boot_state(sample, config)
+                        if diagnostic['state'] != target:
+                            result['diagnostics'] = diagnostic
+                            raise RuntimeError('unexpected boot terminal: '
+                                f"state={diagnostic['state']} expected={target} "
+                                f"reason={diagnostic['reason_name']}({diagnostic['reason']})")
                         if first is None:
                             first=sample; second_at=time.monotonic()+.5
                             qmp.execute('cont')
@@ -158,6 +223,8 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout):
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
         result['error']=str(error)
     finally:
+        if qmp and result['status'] != 'PASS' and proc is not None and proc.poll() is None:
+            result.update(capture_failure(qmp, save, symbols, config, decoder, raw, text))
         if qmp:
             try: qmp.execute('quit')
             except Exception: pass
