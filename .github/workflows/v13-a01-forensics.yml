@@ -1,0 +1,96 @@
+name: V0.13 A01 pinned failure forensics
+
+on:
+  push:
+    branches: [CyxiaOS-V0.13]
+    paths: ['.github/workflows/v13-a01-forensics.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  decode-recorded-failure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download only the two pinned historical evidence archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a01-forensics"
+          cd "$RUNNER_TEMP/a01-forensics"
+          curl --fail --silent --show-error --location --max-time 120 --max-filesize 104857600 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/cyllor/CyxiaOS/actions/artifacts/13032017145/zip -o failure.zip
+          curl --fail --silent --show-error --location --max-time 120 --max-filesize 104857600 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/cyllor/CyxiaOS/actions/artifacts/13031229926/zip -o candidate.zip
+          printf '%s\n' \
+            '1febcc75dd047e282086fc4d2c2070b95eead43a7c9d130ebf2649d5214294db  failure.zip' \
+            '3dc68d9ce722be8012731247f1b3a57cd89f09cf968e4bcfddd7df321526c146  candidate.zip' | sha256sum --check
+      - name: Decode raw records without executing archive contents
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "$RUNNER_TEMP/a01-forensics/diagnostic.json"
+          import collections, json, os, struct, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'a01-forensics'
+          fields = {
+              0: 'magic', 1: 'version', 2: 'sequence', 3: 'state', 4: 'reason',
+              5: 'mode', 6: 'epoch', 7: 'epoch_durable_ticks', 8: 'progress_ticks',
+              9: 'online_mask', 10: 'business_a', 11: 'business_b',
+              12: 'timer_a', 13: 'timer_b', 14: 'model_passed_ticks',
+              15: 'active_ticks', 16: 'injected_operation', 17: 'injected_block',
+              18: 'injected_ticks', 20: 'model_checkpoint_cpu_ns', 21: 'model_exit_kind',
+              22: 'model_cpu', 23: 'model_turns', 24: 'model_checkpoint_result'
+          }
+          report = {'scope': 'Historical byte decoding only; not native execution or acceptance',
+                    'native_acceptance_status': 'NOT_RUN', 'archives': {}}
+          for archive in ('failure', 'candidate'):
+              out = {}
+              with zipfile.ZipFile(root / (archive + '.zip')) as z:
+                  names = z.namelist()
+                  if len(names) != len(set(names)):
+                      raise ValueError('duplicate ZIP entries')
+                  def read(name, limit=4*1024*1024):
+                      if z.getinfo(name).file_size > limit:
+                          raise ValueError('oversized diagnostic input')
+                      return z.read(name)
+                  for name in names:
+                      normalized = '/' + name
+                      if name.endswith('/summary.json') and '/matrix/' in normalized:
+                          r = json.loads(read(name))
+                          out[name] = {k: r[k] for k in ('mode', 'status', 'error', 'observations') if k in r}
+                      if '/matrix/' in normalized and name.rsplit('/', 1)[-1] in ('pending-boot.bin', 'first.bin', 'last.bin'):
+                          data = read(name, 512)
+                          if len(data) != 512:
+                              raise ValueError('wrong boot record size')
+                          words = struct.unpack('<64Q', data)
+                          out[name] = {label: words[index] for index, label in fields.items()}
+                          out[name]['is_stopped_terminal_capture'] = name.endswith(('/first.bin', '/last.bin'))
+                      if '/matrix/normal/' in normalized and name.endswith('/serial.txt'):
+                          lines = read(name, 8*1024*1024).decode('utf-8', errors='replace').splitlines()
+                          out[name] = [line[:400] for line in lines if any(t in line for t in ('BOOT_', 'MODEL', 'PANIC', 'SMP_ERROR', 'UNIFIED_FAIL'))][-40:]
+                      if '/matrix/normal/' in normalized and name.endswith('/qmp-transcript.json'):
+                          records = json.loads(read(name, 16*1024*1024))
+                          commands = [r['message'].get('execute') for r in records if r.get('direction') == 'send']
+                          out[name] = {'commands': dict(collections.Counter(commands)), 'last_commands': commands[-12:]}
+                  for name in ('source-commit.txt', 'source-tree.txt'):
+                      if name in names:
+                          out[name] = read(name, 256).decode().strip()
+              report['archives'][archive] = out
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
+      - name: Retain decoded diagnostic only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: a01-pinned-forensics-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/a01-forensics/diagnostic.json
