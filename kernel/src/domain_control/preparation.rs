@@ -5,6 +5,19 @@ use cyxia_prototype::{
     policy::{ModelBinding, Snapshot},
 };
 
+// The candidate input page is hashed in a fixed non-preemptible tail.
+// Enforce the existing 2 ms decision bound immediately before that tail,
+// leaving the enclosing 2.5 ms native control credit for rejection and
+// settlement without weakening either normative limit.
+pub const DECISION_CPU_LIMIT_NS: u64 = 2_000_000;
+pub fn check_decision_cpu(elapsed_ns: u64) -> Result<(), Error> {
+    if elapsed_ns > DECISION_CPU_LIMIT_NS {
+        Err(Error::Budget)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     pub boot: u64,
@@ -228,5 +241,20 @@ pub fn next_sequence(previous: u64, identity: Identity) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Stale)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_gate_preserves_two_millisecond_limit() {
+        assert_eq!(check_decision_cpu(DECISION_CPU_LIMIT_NS), Ok(()));
+        assert!(matches!(
+            check_decision_cpu(DECISION_CPU_LIMIT_NS + 1),
+            Err(Error::Budget)
+        ));
     }
 }

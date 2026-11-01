@@ -1,4 +1,4 @@
-# Probe generation 11: execute and authenticate independent EL0 governance coordinator
+# Probe generation 13: validate the V0.13 pre-hash decision gate
 name: Native replay current
 
 on:
@@ -10,6 +10,7 @@ on:
       - CyxiaOS-V0.12
       - CyxiaOS-V0.13
       - codex/cyxiaos-v0.11-complete-prototype
+      - 'codex/v013-*'
     paths:
       - '.github/workflows/native-replay-current.yml'
       - 'kernel/**'
