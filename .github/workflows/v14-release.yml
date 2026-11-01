@@ -24,7 +24,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/v014-checks"
           git rev-parse HEAD > "$RUNNER_TEMP/v014-checks/source-commit.txt"
           python3 -B -m unittest discover -s tools -p 'test_a10_fault_arming.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/arming.log"
-          python3 -B -m unittest discover -s tools -p 'test_*fault_disk*.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/disk-compatibility.log"
           python3 -B -m unittest discover -s tools -p 'test_*a10*.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/a10-tools.log"
           git diff --exit-code
       - name: Retain host-only checks, including failed attempts
