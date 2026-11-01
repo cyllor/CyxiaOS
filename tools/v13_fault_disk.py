@@ -4,6 +4,10 @@ Wire contract: https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.m
 Only 512-byte aligned READ/WRITE, FLUSH and DISC are advertised/accepted. A write
 reply acknowledges volatile visibility. A FLUSH reply follows backing-file fsync.
 The after-ack boundary means a reply was sent, not that the guest consumed it.
+
+Version 1 retains absolute mutation numbering for existing offline callers.
+Version 2 starts fault numbering only at an explicit, quiescent pre-resume arm.
+Every wire request and its absolute raw mutation number remain in the archive.
 """
 from __future__ import annotations
 import hashlib
@@ -11,6 +15,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import struct
@@ -24,6 +29,7 @@ OPTION_MAGIC = 0x49484156454f5054
 REPLY_MAGIC = 0x3e889045565a9
 MAX_PAYLOAD = 1024 * 1024
 MAX_PENDING = 32768  # 16 MiB: one journal's worth, in 512-byte sectors.
+ARM_SCOPE = 'post-arm-v1'
 
 
 def receive(sock: socket.socket, size: int) -> bytes:
@@ -40,10 +46,17 @@ class Backend:
     def __init__(self, path: Path, output: Path, *, cut: int = 0,
                  phase: str = 'before', unflushed: str = 'drop',
                  reverse_replies: bool = False, compress: bool = False, witness=None,
-                 event_clock: str | None = None):
-        require(cut >= 0 and phase in ('before', 'after-ack'), 'invalid cut boundary')
+                 event_clock: str | None = None, arm_input_sha256: str | None = None):
+        require(type(cut) is int and cut >= 0 and phase in ('before', 'after-ack'),
+                'invalid cut boundary')
         require(unflushed in ('drop', 'reverse-half'), 'invalid survivor rule')
         require(event_clock in (None, 'host-monotonic-ns-v1'), 'invalid NBD event clock')
+        if arm_input_sha256 is not None:
+            require(type(arm_input_sha256) is str
+                    and re.fullmatch('[0-9a-f]{64}', arm_input_sha256) is not None
+                    and arm_input_sha256 != '0' * 64
+                    and event_clock == 'host-monotonic-ns-v1',
+                    'explicit arming requires a frozen input hash and event clock')
         self.path, self.output = path, output
         self.size = path.stat().st_size
         require(self.size > 0 and self.size % 512 == 0, 'unaligned export size')
@@ -53,12 +66,20 @@ class Backend:
         self.compress = compress
         self.witness = witness
         self.event_clock = event_clock
+        self.arm_input_sha256 = arm_input_sha256
+        self.armed = arm_input_sha256 is None
+        self.fault_mutations = 0
+        self.gate = threading.RLock()
+        self.connection = None
+        self.ready = False
+        self.closed = False
         self.cut_event = threading.Event()
         self.pending: dict[int, bytes] = {}
         self.requests = self.mutations = self.acks = self.flushes = 0
         self.events = self.wire = self.disk = None
         self.events_hash, self.wire_hash = hashlib.sha256(), hashlib.sha256()
-        self.meta = dict(version=1, run_id=uuid.uuid4().hex,
+        self.meta = dict(version=2 if arm_input_sha256 is not None else 1,
+                         run_id=uuid.uuid4().hex,
                          disk_initial_sha256=sha(path), size=self.size,
                          cut=cut, phase=phase, unflushed=unflushed,
                          reverse_replies=reverse_replies,
@@ -66,6 +87,8 @@ class Backend:
                          max_pending_sectors=MAX_PENDING)
         if event_clock is not None:
             self.meta['event_clock'] = event_clock
+        if arm_input_sha256 is not None:
+            self.meta.update(mutation_scope=ARM_SCOPE, arm_input_sha256=arm_input_sha256)
         (output/'start.json').write_text(json.dumps(self.meta, indent=2)+'\n')
 
     def log(self, event, **fields):
@@ -76,6 +99,30 @@ class Backend:
         self.events_hash.update(line.encode('utf-8'))
         self.events.write(line)
         self.events.flush()
+
+    def arm(self):
+        """Called once after GDB/config readback, before the sole QMP cont.
+
+        The same lock covers complete request/response batches. Preparation
+        requests cannot be reclassified at completion. Queued input, pending
+        replies or writes make the boundary invalid instead of being discarded.
+        """
+        require(self.gate.acquire(timeout=5), 'NBD arming could not reach a request boundary')
+        try:
+            require(self.arm_input_sha256 is not None and not self.armed,
+                    'NBD arming is unavailable or already consumed')
+            require(self.ready and not self.closed and self.connection is not None
+                    and self.events is not None, 'NBD is not ready for arming')
+            require(self.requests == self.acks and not self.pending,
+                    'NBD preparation has outstanding replies or volatile writes')
+            require(not select.select([self.connection], [], [], 0)[0],
+                    'NBD preparation input has not drained')
+            self.log('arm', input_sha256=self.arm_input_sha256,
+                     requests=self.requests, raw_mutations=self.mutations,
+                     acks=self.acks, flushes=self.flushes, pending_sectors=0)
+            self.armed = True
+        finally:
+            self.gate.release()
 
     def negotiate(self, sock):
         sock.sendall(struct.pack('>QQH', 0x4e42444d41474943, OPTION_MAGIC, 3))
@@ -125,11 +172,21 @@ class Backend:
         self.wire_hash.update(header+body)
         self.wire.flush()
         self.requests += 1
-        if kind in (1, 3):
+        mutable = kind in (1, 3)
+        if mutable:
             self.mutations += 1
+        mutation = self.mutations if mutable else 0
+        extra = {}
+        if self.arm_input_sha256 is not None:
+            if mutable and self.armed:
+                self.fault_mutations += 1
+            extra = dict(raw_mutation=mutation, scope='armed' if self.armed else 'prepare')
+            mutation = self.fault_mutations if mutable and self.armed else 0
         request = dict(id=self.requests, kind=kind, handle=handle, offset=offset,
-                       length=length, mutation=self.mutations if kind in (1, 3) else 0)
+                       length=length, mutation=mutation, **extra)
         self.log('request', **request, wire_offset=at, data_sha256=hashlib.sha256(body).hexdigest())
+        require(self.arm_input_sha256 is None or self.armed or kind != 1,
+                'WRITE before fault arming contaminates the initial image')
         return request, body
 
     def apply(self, request, body):
@@ -167,9 +224,10 @@ class Backend:
         survivors = offsets[:(len(offsets)+1)//2] if self.unflushed == 'reverse-half' else []
         if survivors:
             self.persist(survivors)
+        extra = {'raw_mutation': request['raw_mutation']} if self.arm_input_sha256 is not None else {}
         self.log('cut', id=request['id'], mutation=request['mutation'], phase=self.phase,
                  discarded_sectors=len(offsets)-len(survivors), surviving_offsets=survivors,
-                 acks=self.acks, flushes=self.flushes)
+                 acks=self.acks, flushes=self.flushes, **extra)
         self.pending.clear()
         if self.witness is not None:
             self.witness('backend-cut', run_id=self.meta['run_id'], id=request['id'],
@@ -183,47 +241,57 @@ class Backend:
             try:
                 if not self.negotiate(sock):
                     return
+                with self.gate:
+                    self.connection = sock
+                    self.ready = True
+                    if self.arm_input_sha256 is not None:
+                        sock.settimeout(5)  # bound a partial pre-arm frame/response
                 while True:
-                    replies = []
-                    cut_before = None
-                    disconnect = False
-                    for index in range(16 if self.reverse_replies else 1):
-                        if index and not select.select([sock], [], [], .002)[0]:
-                            break
-                        request, body = self.request(sock)
-                        if request['kind'] == 2:
-                            disconnect = True
-                            break
-                        selected = self.cut != 0 and request['mutation'] == self.cut
-                        if selected and self.phase == 'before':
-                            cut_before = request
-                            break
-                        response = self.apply(request, body)
-                        replies.append((request, response, selected))
-                        # Never let a later WRITE ACK overtake a FLUSH whose
-                        # durable snapshot did not include that later write.
-                        if selected or request['kind'] == 3:
-                            break
-                    for request, response, selected in (reversed(replies) if self.reverse_replies else replies):
-                        reply = struct.pack('>IIQ', 0x67446698, 0, request['handle'])
-                        sock.sendall(reply+response)
-                        self.acks += 1
-                        self.log('ack', id=request['id'], reply=reply.hex(), data_sha256=hashlib.sha256(response).hexdigest())
-                        if selected:
-                            self.power_cut(request)
+                    # Never hold the arming lock while waiting for a new frame.
+                    if not select.select([sock], [], [], .1)[0]:
+                        continue
+                    with self.gate:
+                        replies = []
+                        cut_before = None
+                        disconnect = False
+                        for index in range(16 if self.reverse_replies else 1):
+                            if index and not select.select([sock], [], [], .002)[0]:
+                                break
+                            request, body = self.request(sock)
+                            if request['kind'] == 2:
+                                disconnect = True
+                                break
+                            selected = self.cut != 0 and request['mutation'] == self.cut
+                            if selected and self.phase == 'before':
+                                cut_before = request
+                                break
+                            response = self.apply(request, body)
+                            replies.append((request, response, selected))
+                            # Do not let a later WRITE ACK overtake a FLUSH.
+                            if selected or request['kind'] == 3:
+                                break
+                        for request, response, selected in (reversed(replies) if self.reverse_replies else replies):
+                            reply = struct.pack('>IIQ', 0x67446698, 0, request['handle'])
+                            sock.sendall(reply+response)
+                            self.acks += 1
+                            self.log('ack', id=request['id'], reply=reply.hex(), data_sha256=hashlib.sha256(response).hexdigest())
+                            if selected:
+                                self.power_cut(request)
+                                return
+                        if cut_before is not None:
+                            self.power_cut(cut_before)
                             return
-                    if cut_before is not None:
-                        self.power_cut(cut_before)
-                        return
-                    if disconnect:
-                        return
+                        if disconnect:
+                            return
             except EOFError:
                 self.log('disconnect', pending_sectors=len(self.pending))
             finally:
-                self.pending.clear()
-                (self.output/'capture.json').write_text(json.dumps(dict(version=1,
-                    events_raw_sha256=self.events_hash.hexdigest(),
-                    requests_raw_sha256=self.wire_hash.hexdigest()), indent=2)+'\n')
+                with self.gate:
+                    self.closed = True
+                    self.pending.clear()
+                    (self.output/'capture.json').write_text(json.dumps(dict(version=1,
+                        events_raw_sha256=self.events_hash.hexdigest(),
+                        requests_raw_sha256=self.wire_hash.hexdigest()), indent=2)+'\n')
 
 
 class Server:
@@ -267,5 +335,5 @@ class Server:
                 except OSError:
                     pass
                 sock.close()
-        self.thread.join(2)
+        self.thread.join(6 if self.backend.arm_input_sha256 is not None else 2)
         require(not self.thread.is_alive(), 'NBD worker did not terminate')

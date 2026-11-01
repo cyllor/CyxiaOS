@@ -5,6 +5,8 @@ This is not the full A10 fault/replay/eviction matrix. Clean completion requires
 protected task exits and file replies plus an independent disk oracle. Cuts
 retain diagnostic prefixes, never synthesized clean completion. The runner
 copies an existing disk; only the guest performs filesystem operations.
+Fault ordinals start at explicit pre-resume arming, after GDB/config readback.
+All earlier requests remain in the raw NBD trace with absolute identities.
 """
 from __future__ import annotations
 import argparse
@@ -271,7 +273,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         client_poll_ns=budget['client_poll_ns'],
         sample_ms=sample_ms,
         qemu_request_merging=merging,
-        cut=cut, phase=phase, unflushed=unflushed, reverse_replies=reverse_replies,
+        cut=cut, cut_scope='post-arm-v1', phase=phase, unflushed=unflushed,
+        reverse_replies=reverse_replies,
         immutable_artifact_cache=str(artifact_cache) if artifact_cache is not None else None,
         max_events=LAYOUT[3], instrumentation_bytes=layout['instrumentation_bytes']))
     binding = {key: start[key] for key in ('mode', 'boot_epoch', 'uuid')}
@@ -324,7 +327,8 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
         verify_unchanged(frozen_files)
         backend = Backend(output / 'disk.raw', output / 'nbd', cut=cut, phase=phase,
                           unflushed=unflushed, reverse_replies=reverse_replies, compress=True,
-                          witness=witness.record, event_clock='host-monotonic-ns-v1')
+                          witness=witness.record, event_clock='host-monotonic-ns-v1',
+                          arm_input_sha256=binding['input_sha256'])
         witness.record('backend-open', path=str(output / 'disk.raw'),
                        run_id=backend.meta['run_id'], sha256=backend.meta['disk_initial_sha256'],
                        size=backend.size)
@@ -396,6 +400,10 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
             witness.record('injection')
             require(save('config-observed.bin', layout['config']['pa'], 512) == config,
                     'A10 preboot injection not observed')
+            # GDB's vm_stop path can flush before the first guest instruction.
+            # Drain/ack that preparation, then arm without resetting raw ids.
+            # Mount and recovery writes remain in scope from the first cont.
+            backend.arm()
             qmp.execute('cont')
             qmp.execute('query-status')
             def read_serial():
@@ -529,7 +537,8 @@ def main():
     parser.add_argument('--mode', type=int, choices=(1, 2, 3, 4), required=True)
     parser.add_argument('--timeout', type=float,
                         help='diagnostic cap; default is the source-bound per-mode budget')
-    parser.add_argument('--cut', type=int, default=0)
+    parser.add_argument('--cut', type=int, default=0,
+                        help='1-based post-arm WRITE/FLUSH ordinal; 0 disables power cuts')
     parser.add_argument('--phase', choices=('before', 'after-ack'), default='before')
     parser.add_argument('--unflushed', choices=('drop', 'reverse-half'), default='drop')
     parser.add_argument('--reverse-replies', action='store_true')

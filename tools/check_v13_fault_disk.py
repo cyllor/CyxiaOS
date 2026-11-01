@@ -1,9 +1,16 @@
-"""Read-only replay of captured NBD bytes and durability events, not filesystem recovery."""
+"""Read-only replay of captured NBD bytes and durability events, not filesystem recovery.
+
+V1 uses absolute mutation ordinals. V2 preserves those as raw_mutation and
+independently reconstructs a second ordinal starting at an explicit arm event.
+Preparation FLUSH requests retain their real persistence semantics and bytes;
+they are not fault candidates. Preparation WRITE makes a v2 capture invalid.
+"""
 from __future__ import annotations
 import hashlib
 import gzip
 import json
 from pathlib import Path
+import re
 import struct
 from verify_smp import require, sha
 
@@ -30,7 +37,9 @@ def read_events(directory):
 
 def inspect(initial: Path, final: Path, directory: Path) -> dict:
     start = json.loads((directory/'start.json').read_text())
-    require(start['version'] == 1 and start['size'] == initial.stat().st_size == final.stat().st_size,
+    version = start['version']
+    require(type(version) is int and version in (1, 2)
+            and start['size'] == initial.stat().st_size == final.stat().st_size,
             'fault trace format/size mismatch')
     require(start['disk_initial_sha256'] == sha(initial), 'fault trace starting image mismatch')
     require(start['phase'] in ('before', 'after-ack') and start['unflushed'] in ('drop', 'reverse-half')
@@ -38,6 +47,17 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
             'invalid fault configuration')
     event_clock = start.get('event_clock')
     require(event_clock in (None, 'host-monotonic-ns-v1'), 'invalid fault event clock')
+    scoped = version == 2
+    if scoped:
+        require(start.get('mutation_scope') == 'post-arm-v1'
+                and event_clock == 'host-monotonic-ns-v1'
+                and type(start.get('arm_input_sha256')) is str
+                and re.fullmatch('[0-9a-f]{64}', start['arm_input_sha256']) is not None
+                and start['arm_input_sha256'] != '0' * 64, 'invalid explicit arming contract')
+    else:
+        require('mutation_scope' not in start and 'arm_input_sha256' not in start,
+                'v1 trace cannot contain a scoped arming contract')
+    armed = not scoped
     compressed = trace_encoding(directory) == 'gzip'
     raw_path = directory/('requests.bin.gz' if compressed else 'requests.bin')
     require(raw_path.stat().st_size <= 128*1024*1024, 'fault trace budget')
@@ -47,7 +67,7 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
     pending, stable, requests = {}, {}, {}
     pending_version, durable_version = {}, {}
     complete, acknowledged = set(), set()
-    mutations = flushes = acknowledged_flushes = wire_at = last_ack = 0
+    mutations = raw_mutations = flushes = acknowledged_flushes = wire_at = last_ack = 0
     cut = None
     reordered = False
     with initial.open('rb') as source, (gzip.open(raw_path, 'rb') if compressed else raw_path.open('rb')) as raw:
@@ -69,7 +89,21 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                 previous_ns = row['monotonic_ns']
             event = row['event']
             if event == 'option':
-                require(not requests, 'NBD option after transmission')
+                require(not requests and not (scoped and armed), 'NBD option after transmission/arm')
+                continue
+            if event == 'arm':
+                require(scoped and not armed, 'duplicate or undeclared fault arming')
+                require(row.keys() == {'event', 'monotonic_ns', 'input_sha256', 'requests',
+                                       'raw_mutations', 'acks', 'flushes', 'pending_sectors'}
+                        and row['input_sha256'] == start['arm_input_sha256']
+                        and type(row['requests']) is int and row['requests'] == len(requests)
+                        and type(row['raw_mutations']) is int and row['raw_mutations'] == raw_mutations
+                        and type(row['acks']) is int and row['acks'] == len(acknowledged)
+                        and type(row['flushes']) is int and row['flushes'] == flushes
+                        and type(row['pending_sectors']) is int and row['pending_sectors'] == 0
+                        and acknowledged == set(requests) and not pending,
+                        'fault arming did not follow a fully acknowledged empty preparation')
+                armed = True
                 continue
             if event == 'request':
                 header = raw.read(28)
@@ -83,13 +117,25 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                 require(len(body) == (length if kind == 1 else 0), 'truncated raw write')
                 wire_hash.update(header+body)
                 require(row['data_sha256'] == hashlib.sha256(body).hexdigest(), 'request payload digest mismatch')
-                if kind in (1, 3):
-                    mutations += 1
+                mutable = kind in (1, 3)
+                if mutable:
+                    raw_mutations += 1
+                    if armed:
+                        mutations += 1
+                require(not scoped or armed or kind in (0, 3),
+                        'preparation WRITE/DISC invalidates the fault window')
                 identity = len(requests)+1
                 expected = dict(id=identity, kind=kind, handle=handle, offset=offset,
-                                length=length, mutation=mutations if kind in (1, 3) else 0,
+                                length=length, mutation=mutations if mutable and armed else 0,
                                 wire_offset=wire_at)
-                require(all(row[key] == value for key, value in expected.items()), 'raw request/event mismatch')
+                if scoped:
+                    expected.update(raw_mutation=raw_mutations if mutable else 0,
+                                    scope='armed' if armed else 'prepare')
+                else:
+                    require('raw_mutation' not in row and 'scope' not in row,
+                            'scoped request mislabeled as v1')
+                require(all(type(row.get(key)) is type(value) and row[key] == value
+                            for key, value in expected.items()), 'raw request/event mismatch')
                 requests[identity] = dict(expected, body=body,
                     read_hash=hashlib.sha256(read_visible(offset, length)).hexdigest() if kind == 0 else hashlib.sha256(b'').hexdigest())
                 wire_at += 28+len(body)
@@ -104,7 +150,8 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
             kind, offset, length = (request[key] for key in ('kind', 'offset', 'length'))
             if event == 'complete':
                 require(identity not in complete and kind in (1, 3) and identity == len(requests), 'invalid completion order')
-                require(not (start['cut'] == request['mutation'] and start['phase'] == 'before'), 'completed before-cut request')
+                require(not (start['cut'] != 0 and start['cut'] == request['mutation']
+                             and start['phase'] == 'before'), 'completed before-cut request')
                 if kind == 1:
                     for relative in range(0, length, 512):
                         pending[offset+relative] = request['body'][relative:relative+512]
@@ -131,8 +178,11 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                 acknowledged.add(identity)
                 acknowledged_flushes += kind == 3
             elif event == 'cut':
-                require(start['cut'] == row['mutation'] == request['mutation'] != 0
+                require(armed and start['cut'] == row['mutation'] == request['mutation'] != 0
                         and start['phase'] == row['phase'] and identity == len(requests), 'wrong fault boundary')
+                if scoped:
+                    require(row.get('raw_mutation') == request['raw_mutation']
+                            and request['scope'] == 'armed', 'cut raw identity/scope mismatch')
                 if row['phase'] == 'before':
                     require(identity not in complete and identity not in acknowledged, 'before-cut request was completed')
                 else:
@@ -146,6 +196,7 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                 cut = row
             else:
                 raise ValueError('unknown fault event')
+        require(armed, 'explicit fault arming was not captured')
         require(not raw.read(1), 'uncaptured raw NBD suffix')
         capture = directory/'capture.json'
         require(not compressed or capture.is_file(), 'compressed capture has no raw byte binding')
@@ -169,6 +220,9 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
                     wanted[relative:relative+512] = stable[next_offset]
                     next_offset = next(offsets, None)
                 require(actual.read(len(wanted)) == wanted, f'durable disk differs at chunk {at}')
-    return dict(version=1, run_id=start['run_id'], requests=len(requests), mutations=mutations,
-                flushes=flushes, acknowledged_flushes=acknowledged_flushes,
-                reordered_replies=reordered, cut=cut, disk_final_sha256=sha(final))
+    result = dict(version=version, run_id=start['run_id'], requests=len(requests), mutations=mutations,
+                  flushes=flushes, acknowledged_flushes=acknowledged_flushes,
+                  reordered_replies=reordered, cut=cut, disk_final_sha256=sha(final))
+    if scoped:
+        result.update(raw_mutations=raw_mutations, mutation_scope='post-arm-v1')
+    return result

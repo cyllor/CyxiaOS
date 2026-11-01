@@ -1,0 +1,81 @@
+name: V0.14 source snapshot
+
+on:
+  push:
+    branches: [CyxiaOS-V0.14]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  a10-fault-arming:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Exercise actual NBD backend and independent arming replay
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v014-checks"
+          git rev-parse HEAD > "$RUNNER_TEMP/v014-checks/source-commit.txt"
+          python3 -B -m unittest discover -s tools -p 'test_a10_fault_arming.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/arming.log"
+          python3 -B -m unittest discover -s tools -p 'test_*fault_disk*.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/disk-compatibility.log"
+          python3 -B -m unittest discover -s tools -p 'test_*a10*.py' -v 2>&1 | tee "$RUNNER_TEMP/v014-checks/a10-tools.log"
+          git diff --exit-code
+      - name: Retain host-only checks, including failed attempts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CyxiaOS-V0.14-host-checks-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/v014-checks/
+
+  source-package:
+    needs: a10-fault-arming
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Package the exact committed development source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v014-source"
+          git archive --format=zip --prefix=CyxiaOS-V0.14/ HEAD > "$RUNNER_TEMP/v014-source/CyxiaOS-V0.14-source.zip"
+          git rev-parse HEAD > "$RUNNER_TEMP/v014-source/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/v014-source/source-tree.txt"
+          python3 - <<'PY'
+          import json, os, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'v014-source'
+          with zipfile.ZipFile(root / 'CyxiaOS-V0.14-source.zip') as archive:
+              assert archive.testzip() is None, 'damaged source archive'
+              assert archive.read('CyxiaOS-V0.14/VERSION').strip() == b'0.14.0-dev'
+          (root / 'validation-scope.json').write_text(json.dumps({
+              'software_version': '0.14.0-dev',
+              'source_commit': os.environ['GITHUB_SHA'],
+              'source_tree': (root / 'source-tree.txt').read_text().strip(),
+              'package_kind': 'development-source-only',
+              'a10_fault_arming_host_checks': 'PASS',
+              'native_A10_complete': False,
+              'full_prototype_acceptance': 'NOT_RUN',
+              'engineering_lanes': 'separate Validate prototype branches workflow',
+              'note': 'A source release and host checks do not promote any A/T/E item.'
+          }, indent=2) + '\n')
+          PY
+          (cd "$RUNNER_TEMP/v014-source" && sha256sum CyxiaOS-V0.14-source.zip > SHA256SUMS)
+      - name: Publish source snapshot and its identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CyxiaOS-V0.14-source-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+          path: ${{ runner.temp }}/v014-source/

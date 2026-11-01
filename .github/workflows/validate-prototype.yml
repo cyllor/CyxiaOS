@@ -5,6 +5,7 @@ on:
     branches:
       - CyxiaOS-V0.12
       - CyxiaOS-V0.13
+      - CyxiaOS-V0.14
       - codex/cyxiaos-v0.11-complete-prototype
       - 'codex/v011-*'
       - 'codex/v012-complete-*'

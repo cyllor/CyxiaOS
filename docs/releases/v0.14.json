@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "software_version": "0.14.0-dev",
+  "branch": "CyxiaOS-V0.14",
+  "release_kind": "development-source",
+  "specification": "1.3",
+  "base_branch": "CyxiaOS-V0.13",
+  "base_commit": "7fcc678d0055cb8b2a97a136cc109996411f1579",
+  "release_notes": "docs/releases/v0.14.md",
+  "acceptance_catalogue": "docs/implementation/v13-requirements.json",
+  "acceptance_catalogue_policy": "inherit unchanged; no manual promotion",
+  "complete_prototype_accepted": false,
+  "a10_cut_contract": {
+    "backend_capture_version": 2,
+    "scope": "post-arm-v1",
+    "cut_zero": "no injected power cut",
+    "cut_positive": "1-based WRITE/FLUSH ordinal after explicit pre-resume arming",
+    "absolute_wire_identity": "request id and raw_mutation remain preserved",
+    "legacy_backend_default": "version 1 absolute numbering",
+    "native_A10_pass_claimed": false
+  },
+  "validation": {
+    "engineering_workflow": ".github/workflows/validate-prototype.yml",
+    "source_workflow": ".github/workflows/v14-release.yml",
+    "results": "read exact-commit workflow runs; this manifest is not a test receipt"
+  }
+}
