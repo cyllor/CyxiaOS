@@ -18,7 +18,7 @@ def program():
  p=p.replace('#![allow(dead_code)]','#![allow(dead_code,unused_imports)]')
  p=p.replace('fn publisher() -> Publisher','fn publisher_fixture() -> Publisher')
  p=p.replace('pub fn cpu_ns(v:u64)->u64{v}', 'pub fn cpu_ns(v:u64)->u64{v}pub fn cpu_elapsed_ns(v:u64)->u64{cpu_ticks()-v}pub fn ticks()->u64{super::WALL.load(super::Ordering::Acquire)}pub fn frequency()->u64{1_000_000_000}')
- p=p.replace('CPU.fetch_add(1,Ordering::AcqRel);','pay(1);').replace('7 if n==4=>{CPU.fetch_add(500001','7 if n==4=>{CPU.fetch_add(250000')
+ p=p.replace('CPU.fetch_add(1,Ordering::AcqRel);','pay(1);').replace('7 if n==3=>{CPU.fetch_add(500001','7 if n==3=>{CPU.fetch_add(250000')
  p=p.replace('struct Owner{context:Context,', 'struct Owner{dependencies:[Option<fn(ObjectKey)->Result<[Option<Prerequisite>;2],Error>>;16],dependency_binders:[Option<fn(ObjectKey,u64)->Result<[Option<BoundDependency>;2],Error>>;16],context:Context,')
  h=(ROOT/'tests/host/active_accept_retry_harness.rs').read_text()
  for marker,signature in [('JOB','struct Job {'),('COMPLETION','struct JobCompletion {')]:h=h.replace('// ACTUAL_'+marker,'#[derive(Clone,Copy)]'+function(c,signature))

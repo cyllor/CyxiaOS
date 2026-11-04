@@ -6,6 +6,7 @@ fail without replacing the original Registry receipt or original CPU debit.
 """
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import struct
 import tempfile
@@ -118,7 +119,7 @@ def source():
  assert_eq!((w[28],w[29],w[30],w[31],w[32]),(Error::Budget as u64+1,1,0,0,1),"final cap failure replaced Registry success");
  assert_eq!(w[63],1);assert_eq!(w[1],1);
  println!("PUBLICATION_COST={:?}",w);
- assert_eq!(ACQUIRES.load(Ordering::Acquire),1);assert_eq!(SELECTIONS.load(Ordering::Acquire),4);
+ assert_eq!(ACQUIRES.load(Ordering::Acquire),1);assert_eq!(SELECTIONS.load(Ordering::Acquire),3,"native revalidate repeated the immediately preceding full Registry check");
  assert_eq!(READS.load(Ordering::Acquire),12,"diagnostic clock reads escaped the charged path");
  with(|s|{assert_eq!(s.registry.query(publisher_fixture(),id())?.version,1);Ok(())}).unwrap();
  // A stopped record remains tied to the original receipt even if unrelated
@@ -244,6 +245,118 @@ def source():
 
 
 class PublicationCost(unittest.TestCase):
+    def test_fresh_monotonic_submission_avoids_redundant_registry_scans(self):
+        """Count actual Registry scans without adding target timing noise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            prototype = d / 'crates/prototype'
+            shutil.copytree(ROOT / 'crates', d / 'crates')
+            policy = prototype / 'src/policy.rs'
+            original = policy.read_text()
+            marker = 'pub struct Registry {'
+            self.assertEqual(original.count(marker), 1)
+            instrumented = original.replace(
+                marker,
+                'static TEST_RECORD_VISITS: core::sync::atomic::AtomicU64 = '
+                'core::sync::atomic::AtomicU64::new(0);\n'
+                '#[doc(hidden)] pub fn test_record_visits_reset() {'
+                'TEST_RECORD_VISITS.store(0, core::sync::atomic::Ordering::Relaxed);}\n'
+                '#[doc(hidden)] pub fn test_record_visits() -> u64 {'
+                'TEST_RECORD_VISITS.load(core::sync::atomic::Ordering::Relaxed)}\n'
+                'static TEST_REGISTERED_LOOKUPS: core::sync::atomic::AtomicU64 = '
+                'core::sync::atomic::AtomicU64::new(0);\n'
+                '#[doc(hidden)] pub fn test_registered_lookups_reset() {'
+                'TEST_REGISTERED_LOOKUPS.store(0, core::sync::atomic::Ordering::Relaxed);}\n'
+                '#[doc(hidden)] pub fn test_registered_lookups() -> u64 {'
+                'TEST_REGISTERED_LOOKUPS.load(core::sync::atomic::Ordering::Relaxed)}\n'
+                + marker,
+            )
+            scan = '            .chain(self.history.iter())\n            .filter_map(|r| r.as_ref())'
+            self.assertEqual(instrumented.count(scan), 1)
+            instrumented = instrumented.replace(
+                scan,
+                '            .chain(self.history.iter())\n'
+                '            .inspect(|_| { TEST_RECORD_VISITS.fetch_add(1, '
+                'core::sync::atomic::Ordering::Relaxed); })\n'
+                '            .filter_map(|r| r.as_ref())',
+            )
+            lookup = '    fn registered_index(&self, hash: [u8; 32]) -> Option<usize> {\n'
+            self.assertEqual(instrumented.count(lookup), 1)
+            instrumented = instrumented.replace(
+                lookup,
+                lookup + '        TEST_REGISTERED_LOOKUPS.fetch_add(1, '
+                'core::sync::atomic::Ordering::Relaxed);\n',
+            )
+            self.assertNotEqual(instrumented, original)
+            policy.write_text(instrumented)
+
+            arch_sha = d / 'crates/arch-aarch64/src/sha256.rs'
+            arch_original = arch_sha.read_text()
+            arch_marker = '//! and restores CPACR_EL1 and DAIF before returning.\n'
+            self.assertEqual(arch_original.count(arch_marker), 1)
+            arch_original = arch_original.replace(
+                arch_marker,
+                arch_marker + '#[doc(hidden)] pub static TEST_DIGEST_CALLS: '
+                'core::sync::atomic::AtomicU64 = '
+                'core::sync::atomic::AtomicU64::new(0);\n',
+            )
+            host_digest = '''#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+pub fn digest(_: &[u8]) -> Option<[u8; 32]> {
+    None
+}'''
+            self.assertEqual(arch_original.count(host_digest), 1)
+            arch_sha.write_text(arch_original.replace(
+                host_digest,
+                '''#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+pub fn digest(_: &[u8]) -> Option<[u8; 32]> {
+    TEST_DIGEST_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some([0xa5; 32])
+}''',
+            ))
+
+            harness = source()
+            locate = 'fn locate(_:&Owner,_:Action,_:ObjectKey)->Option<usize>{Some(0)}'
+            self.assertEqual(harness.count(locate), 1)
+            harness = harness.replace(
+                locate,
+                'static TEST_LOCATE_CALLS:AtomicU64=AtomicU64::new(0);'
+                'fn locate(_:&Owner,_:Action,_:ObjectKey)->Option<usize>{'
+                'TEST_LOCATE_CALLS.fetch_add(1,Ordering::Relaxed);Some(0)}',
+            )
+            harness += r'''
+#[test]fn publication_cost_fresh_monotonic_submission_avoids_redundant_registry_scans(){
+ let out=setup(0);policy::test_record_visits_reset();policy::test_registered_lookups_reset();TEST_LOCATE_CALLS.store(0,Ordering::Relaxed);test_arch::sha256::TEST_DIGEST_CALLS.store(0,Ordering::Relaxed);
+ assert_eq!(accept(&out,10),Ok(1));
+ assert_eq!(policy::test_record_visits(),0,"fresh monotonic publication scanned prior records");
+ assert_eq!(policy::test_registered_lookups(),1,"one decision repeated its registered-set scan");
+ assert_eq!(TEST_LOCATE_CALLS.load(Ordering::Relaxed),1,"one decision repeated its stability-slot scan");
+ assert_eq!(test_arch::sha256::TEST_DIGEST_CALLS.load(Ordering::Relaxed),1,"plan receipt digest bypassed the enabled hardware SHA path");
+}
+'''
+            (d / 'harness.rs').write_text(harness)
+            (d / 'Cargo.toml').write_text(
+                '[package]\nname="publication-record-scan"\nversion="0.1.0"\nedition="2024"\n'
+                '[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='
+                + json.dumps(str(prototype)) + ',features=["hardware-sha256"]}\n'
+                'test-arch={package="cyxia-arch-aarch64",path=' + json.dumps(str(d / 'crates/arch-aarch64'))
+                + '}\nsha2="=0.10.9"\n'
+                '[workspace]\n[workspace.package]\nversion="0.1.0"\nedition="2024"\n'
+            )
+            command = [
+                str(RUST_BIN / 'cargo'), 'test', '--offline', '--manifest-path',
+                str(d / 'Cargo.toml'), '--target-dir',
+                str(ROOT / 'target/host-publication-record-scan'), '--',
+                '--test-threads=1',
+                'publication_cost_fresh_monotonic_submission_avoids_redundant_registry_scans',
+            ]
+            run_env = env()
+            run_env['RUST_MIN_STACK'] = '16777216'
+            result = subprocess.run(
+                command, cwd=ROOT, env=run_env, capture_output=True, text=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_actual_source_retains_cost_boundaries(self):
         artifacts = ROOT / 'artifacts/publication-cost'
         artifacts.mkdir(parents=True, exist_ok=True)

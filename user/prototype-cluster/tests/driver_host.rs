@@ -47,6 +47,8 @@ struct Node {
     session_calls: Vec<(u64, u64, Result<(), cyxia_kernel_core::control_plane::Error>)>,
     // Controlled native admission wait: phase9 token, fresh time, live, epoch.
     session_wait: Option<(u64, u64, bool, u64)>,
+    // Controlled TASK_RESERVE_CUSTODY completion time.
+    reserve_wait_ms: Option<u64>,
 }
 #[derive(Default)]
 struct Context {
@@ -248,6 +250,7 @@ mod broker {
                         if n.reserved {
                             return Err(AGAIN);
                         }
+                        let reserve_completed = n.reserve_wait_ms.take();
                         n.custody = if args[0] == TASK_RESERVE_CUSTODY {
                             assert_eq!(input.len(), 224);
                             Some(input[104..].try_into().unwrap())
@@ -255,6 +258,9 @@ mod broker {
                         n.custody_admitted = false;
                         n.reserved = true;
                         n.task_state = 1;
+                        if let Some(completed) = reserve_completed {
+                            cx.now = completed;
+                        }
                         Ok((0, 1))
                     }
                     1 => {
@@ -304,12 +310,12 @@ mod broker {
                         }
                     }
                     9 if n.authority.is_some() => {
-                        let (now, connected, epoch) = match n.session_wait {
+                        let (now, connected, epoch, waited) = match n.session_wait {
                             Some((token, now, live, epoch)) if token == args[1] => {
                                 n.session_wait = None;
-                                (now, live, epoch)
+                                (now, live, epoch, true)
                             }
-                            _ => (now, true, n.transport_epoch.max(1)),
+                            _ => (now, true, n.transport_epoch.max(1), false),
                         };
                         let authority = n.authority.as_mut().unwrap();
                         if args[1] != 0 && (!connected || args[2] != epoch) {
@@ -319,6 +325,7 @@ mod broker {
                             else { authority.session(epoch, args[1], now) };
                         n.session_calls.push((args[1], now, result));
                         if result.is_err() { eprintln!("real Authority session calls: {:?}", n.session_calls); }
+                        if waited { cx.now = now; }
                         result.map(|()| (0, 0)).map_err(|_| FAILED)
                     }
                     7 | 9 => Ok((0, 0)),
@@ -1247,6 +1254,100 @@ fn real_signed_two_driver_streams_form_and_persist_unique_result_custody() {
         assert!(c.nodes.iter().all(|n| n.records.len() >= 5));
     });
 }
+
+#[test]
+fn prepare_ttl_starts_after_kernel_custody_reservation_completes() {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        CTX.with(|c| *c.borrow_mut() = Context::default());
+        let (sa, pa, na) = identity(1);
+        let (sb, pb, nb) = identity(2);
+        select(0, 0);
+        let mut a = driver::Driver::new(1, [1; 16], na, nb, sa, pb).unwrap();
+        select(1, 0);
+        let mut b = driver::Driver::new(1, [2; 16], nb, na, sb, pa).unwrap();
+        select(0, 0);
+        a.connect([41; 32], 0).unwrap();
+        select(1, 0);
+        b.connect([42; 32], 0).unwrap();
+
+        // Complete formation without fragmenting frames. Contract negotiation
+        // starts only on a later tick after both Drivers publish READY.
+        for now in 0..100 {
+            select(0, now); a.tick(now).unwrap();
+            select(1, now); b.tick(now).unwrap();
+            for from in 0..2 {
+                let (source, target) = if from == 0 {
+                    (&mut a, &mut b)
+                } else {
+                    (&mut b, &mut a)
+                };
+                let bytes = source.outgoing().to_vec();
+                if !bytes.is_empty() {
+                    source.consume_outgoing(bytes.len());
+                    select(1 - from, now);
+                    assert_eq!(target.ingest(&bytes, now), Ok(bytes.len()));
+                }
+            }
+            if CTX.with(|c| c.borrow().nodes.iter().all(|n| n.traces.contains(&0x212))) {
+                break;
+            }
+        }
+        assert!(CTX.with(|c| c.borrow().nodes.iter().all(|n| n.traces.contains(&0x212))));
+        CTX.with(|c| {
+            for node in &mut c.borrow_mut().nodes {
+                node.reserve_wait_ms = Some(2_500);
+            }
+        });
+
+        // Deliver one direction at a time and stop immediately after kind 17
+        // completes its kernel custody reservation. The response remains
+        // queued, so every following protocol frame can use the fresh time.
+        let mut reserved_by = None;
+        for now in 100..500 {
+            select(0, now); a.tick(now).unwrap();
+            select(1, now); b.tick(now).unwrap();
+            for from in 0..2 {
+                let (source, target) = if from == 0 {
+                    (&mut a, &mut b)
+                } else {
+                    (&mut b, &mut a)
+                };
+                let bytes = source.outgoing().to_vec();
+                if bytes.is_empty() { continue; }
+                source.consume_outgoing(bytes.len());
+                select(1 - from, now);
+                assert_eq!(target.ingest(&bytes, now), Ok(bytes.len()));
+                let target_index = 1 - from;
+                if CTX.with(|c| c.borrow().nodes[target_index].reserve_wait_ms.is_none()) {
+                    reserved_by = Some(target_index);
+                    break;
+                }
+            }
+            if reserved_by.is_some() { break; }
+        }
+        let target_index = reserved_by.expect("contract never reached custody reservation");
+        let (source, target) = if target_index == 1 {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+
+        // Deliver the prepared response and commit at the actual completion
+        // time. A TTL started from the pre-reservation sample is already stale.
+        let response = target.outgoing().to_vec();
+        assert!(!response.is_empty());
+        target.consume_outgoing(response.len());
+        select(1 - target_index, 2_500);
+        assert_eq!(source.ingest(&response, 2_500), Ok(response.len()));
+        let commit = source.outgoing().to_vec();
+        assert!(!commit.is_empty());
+        source.consume_outgoing(commit.len());
+        select(target_index, 2_500);
+        assert_eq!(target.ingest(&commit, 2_500), Ok(commit.len()),
+            "prepare TTL was consumed by the successful custody reservation wait");
+        CTX.with(|c| assert!(c.borrow().nodes[target_index].reserved));
+    }).unwrap().join().unwrap();
+}
 fn setup(boot: u64) -> (driver::Driver, driver::Driver) {
     let (sa, _, na) = identity(1);
     let (sb, _, nb) = identity(2);
@@ -1432,6 +1533,22 @@ fn invalid_or_incomplete_rpc_and_outbound_ticks_do_not_renew_authority() {
                 assert!(!c.nodes[1].traces.contains(&0x212));
             });
         }
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn accepted_rpc_uses_fresh_completion_time_for_driver_liveness() {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        let (mut a, mut b) = real_authority_pair();
+        let hello = session_frames(&mut a).remove(0);
+        CTX.with(|c| {
+            c.borrow_mut().nodes[1].session_wait = Some((3, 1400, true, 1));
+        });
+        select(1, 1000);
+        assert_eq!(b.ingest(&hello, 1000), Ok(hello.len()));
+        select(1, 2500);
+        assert_eq!(b.tick(2500), Ok(()),
+            "the completed RPC was only 1100ms old; its pre-admission sample was stale");
     }).unwrap().join().unwrap();
 }
 
@@ -1978,6 +2095,22 @@ fn session_exit_idle_timeout_retains_original_identity_before_disconnect() {
         assert_eq!(r[11], 1, "peer boot before disconnect clears it");
         assert!(r[19..23].iter().any(|&v| v != 0));
     });
+}
+
+#[test]
+fn new_session_clears_prior_liveness_attempt_diagnostic() {
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = setup(1);
+    select(0, 0);
+    a.connect([31; 32], 0).unwrap();
+    select(1, 0);
+    b.connect([32; 32], 0).unwrap();
+    pump(&mut a, &mut b, 0, closed_both);
+    select(0, 600);
+    a.tick(600).unwrap();
+    assert_eq!(a.liveness_attempt_ns(), 600_000_000);
+    a.begin_session_diagnostics(2);
+    assert_eq!(a.liveness_attempt_ns(), 0);
 }
 
 #[test]

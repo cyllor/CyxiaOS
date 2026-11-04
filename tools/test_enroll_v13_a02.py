@@ -84,6 +84,17 @@ class A02Enrolment(unittest.TestCase):
                 enroll(self.manifest, receipt, self.output, source_root=ROOT)
         self.assertFalse(self.output.exists())
 
+    def test_source_root_alias_does_not_reject_its_own_receipt(self):
+        with tempfile.TemporaryDirectory() as external:
+            alias = Path(external) / 'source-root'
+            alias.symlink_to(ROOT, target_is_directory=True)
+            receipt = alias / self.receipt.relative_to(ROOT)
+            with self.verified() as adapter:
+                report = enroll(self.manifest, receipt, self.output, source_root=alias)
+            adapter.assert_called_once_with(self.folder, source_root=ROOT.resolve())
+            self.assertEqual(report['case_groups']['A'],
+                             {'PASS': 1, 'FAIL': 0, 'NOT_RUN': 15})
+
     def test_invalid_other_case_cannot_be_hidden_by_a02_enrolment(self):
         self.document['cases'][-1]['status'] = 'HOST_PASS'
         self.manifest.write_text(json.dumps(self.document))

@@ -14,7 +14,9 @@ def native_program():
  control=(ROOT/'kernel/src/domain_control.rs').read_text();fixture=(ROOT/'crates/prototype/tests/domain_policy.rs').read_text()
  program=(ROOT/'tests/host/native_submission_harness.rs').read_text().replace('// WIRE_FIXTURES','\n'.join(function(fixture,s) for s in ['fn publisher()','fn binding()','fn candidates()','fn frame(']))
  program=program.replace('// NATIVE_CLOCK',function(control,'impl policy::Clock for NativeClock')).replace('// REPLACEMENT_PREDICATE',function(control,'fn execution_blocks_replacement(')).replace('// SCOPE_TRAIT',function(control,'trait PublicationScope'))
- struct=function(control,'struct Executor<');body=function(control,"impl<S: PublicationScope> policy::Executor for Executor<'_, S>")
+ struct=function(control,'struct Executor<')
+ cache=function(control,"impl<S: PublicationScope> Executor<'_, S>")
+ body=function(control,"impl<S: PublicationScope> policy::Executor for Executor<'_, S>")
  # Real precommit and scope.commit. Root/Desired/history effects after it are
  # represented by a counted effect, not treated as actual resource custody.
  start=body.index('replay::published(');start=body.rfind('\n',0,start)+1
@@ -22,7 +24,7 @@ def native_program():
  if before>=0 and 'RootPublish' in body[before:start]:start=body.rfind('\n',0,before)+1
  end=body.index('self.owner.prepared_count = 0;',start);end=body.rfind('\n',0,end)+1
  body=body[:start]+'            EFFECTS.fetch_add(1,Ordering::AcqRel);\n'+body[end:]
- program=program.replace('// NATIVE_EXECUTOR',struct).replace('// NATIVE_IMPL',body)
+ program=program.replace('// NATIVE_EXECUTOR',struct+'\n'+cache).replace('// NATIVE_IMPL',body)
  program=program.replace('struct NativeClock;', '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\nstruct NativeClock;')
  module=ROOT/'kernel/src/domain_control/submission.rs'
  if module.exists():

@@ -12,6 +12,10 @@ from transport import FrameDecoder
 from verify_smp import manifest,require,sha
 from verify_unified_capture import validate_capture
 from verify_unified_disk import verify_pair
+from verify_domains import (CONTROL_MAGIC, CONTROL_WORDS, active_control_records,
+                            diagnostics as decode_domain_diagnostics, parse_control,
+                            progress_diagnostics as decode_progress_diagnostics,
+                            retained_observation)
 import hashlib
 from build_unified import code_source_map
 
@@ -23,6 +27,276 @@ PATCHED_QEMU_SOURCE_SHA256={
     'accel/tcg/cpu-exec.c':'d49ac54fba75a2ee3fe58792e8bbcd0e4ca8ada5775d5facbccdfcb9bc990b2b',
     'target/arm/cpregs-pmu.c':'f09a95b22f4b67e0d22bffa2523b3055cabe8d2bf943cfb313e5d4fc16364556',
 }
+
+CAPTURE_SYMBOLS = (
+    ('UNIFIED_EVIDENCE', 4096),
+    ('DYNAMIC_V13_EVIDENCE', 4096),
+    ('RUNTIME_V13_EVIDENCE', 8192),
+    ('UNIFIED_SERVICE_STAGE', 8),
+    ('DOMAIN_TASK_EVIDENCE', 256),
+    ('TASK_OVERRUN_EVIDENCE', 256),
+    ('NETWORK_PIECE_EVIDENCE', 512),
+    ('NETWORK_SETTLEMENT_EVIDENCE', 512),
+    ('FILE_SERVICE_EVIDENCE', 512),
+    ('TASK_VECTOR_EVIDENCE', 512),
+    ('RUNTIME_LOOP_EVIDENCE', 512),
+    ('DOMAIN_PUBLICATION_COST', 1024),
+    ('DOMAIN_CONTROL_EVIDENCE', CONTROL_WORDS * 8),
+    ('REPLAY_V13_EVIDENCE', 512),
+    ('DOMAIN_PREPARATION_CONTEXT', 128),
+    ('DOMAIN_PREPARATION_DETAIL', 256),
+    ('DOMAIN_PREPARATION_PREFIX_DETAIL', 128),
+    ('DOMAIN_PREPARATION_ENTRY_DETAIL', 128),
+    ('DOMAIN_PREPARATION_REJECTIONS', 5184),
+    ('DOMAIN_PREPARATION_SKIP_EVIDENCE', 2048),
+)
+
+FINAL_DIAGNOSTIC_FIELDS = (
+    'service_stage_word', 'task_evidence', 'tasks', 'overrun_evidence',
+    'network_piece_evidence', 'network_settlement_evidence',
+    'file_service_evidence', 'task_vector_evidence',
+    'runtime_loop', 'runtime_loop_evidence',
+    'publication_cost', 'publication_cost_evidence',
+    'control', 'replay', 'replay_evidence',
+    'preparation_context', 'preparation_detail',
+    'preparation_prefix_detail', 'preparation_entry_detail',
+    'preparation_rejections', 'rejected_preparations',
+    'preparation_skip_evidence', 'preparation_skips',
+    'diagnostic_errors', 'final_parse_error',
+)
+
+LIVE_CAPTURE_SYMBOLS = frozenset((
+    'UNIFIED_EVIDENCE', 'DYNAMIC_V13_EVIDENCE', 'RUNTIME_V13_EVIDENCE',
+))
+
+D8_DIAGNOSTIC_FILE = 'd8-service-batch-diagnostic.json'
+D8_CONTROL_RECORD_WORDS = 640
+D8_CONTROL_HEADER_WORDS = 512
+
+def d8_control_location(data):
+    """Resolve the optional diagnostic page without changing acceptance capture."""
+    location = symbol(data, 'DOMAIN_CONTROL_EVIDENCE')
+    require(location['size'] == CONTROL_WORDS * 8,
+            'DOMAIN_CONTROL_EVIDENCE size differs')
+    return location
+
+def _service_batch(input_words, selected):
+    """Decode the canonical D8 ABI3 payload selected by the native runtime."""
+    if input_words[8:10] != (8, 1) or not 0 <= selected < input_words[15] <= 32:
+        raise ValueError('invalid D8 native input identity')
+    at = 64 + selected * 10
+    length = input_words[at]
+    payload = (input_words[at + 1].to_bytes(8, 'little')
+               + input_words[at + 2].to_bytes(8, 'little'))
+    if length != 3 or any(payload[length:]) \
+            or int.from_bytes(payload[:2], 'little') != selected \
+            or payload[2] not in (1, 2, 4, 8):
+        raise ValueError('invalid D8 ServiceBatch candidate payload')
+    return payload[2]
+
+def stable_d8_records(first, second):
+    """Return only identical, independently stable D8 records from two live reads."""
+    expected = CONTROL_WORDS * 8
+    require(len(first) == len(second) == expected,
+            'live D8 control snapshot size differs')
+    a = struct.unpack(f'<{CONTROL_WORDS}Q', first)
+    b = struct.unpack(f'<{CONTROL_WORDS}Q', second)
+    require(a[0] == b[0] == CONTROL_MAGIC and a[1] == b[1] == 1
+            and a[2] == b[2] and a[2] > 0,
+            'live D8 control snapshot identity differs')
+    # Reuse the ordinary decoder's bounded slot filtering, then impose the
+    # stronger double-read/identity/completion requirements needed here.
+    active_a = {row['slot']: row for row in active_control_records(first)}
+    active_b = {row['slot']: row for row in active_control_records(second)}
+    rows = []
+    states = {1: 'pending', 2: 'applied', 3: 'failed', 4: 'unknown'}
+    for slot in sorted(active_a.keys() & active_b.keys()):
+        at = D8_CONTROL_HEADER_WORDS + slot * D8_CONTROL_RECORD_WORDS
+        ra = a[at:at + D8_CONTROL_RECORD_WORDS]
+        rb = b[at:at + D8_CONTROL_RECORD_WORDS]
+        if ra != rb or ra[639] & 1 or ra[0] == 0 or ra[0] != ra[1] \
+                or ra[2:4] != (8, 1) or ra[7] != a[2] or ra[30] != 1 \
+                or ra[14] not in states:
+            continue
+        if ra[14] == 2 and not (ra[13] > 0 and ra[19] == 1 and ra[15] == 0
+                                and ra[28] >= ra[9] >= ra[8]):
+            continue
+        selected = ra[17]
+        native_input = ra[32:544]
+        try:
+            batch = _service_batch(native_input, selected)
+        except (IndexError, OverflowError, ValueError):
+            continue
+        rows.append({
+            'slot': slot,
+            'sequence': ra[0],
+            'boot_epoch': ra[7],
+            'target': [ra[4], ra[5]],
+            'approved_version': ra[13],
+            'executor_state': states[ra[14]],
+            'executor_error': ra[15],
+            'selected_candidate': selected,
+            'service_batch': batch,
+            'completed_ns': ra[28],
+        })
+    return rows
+
+def _stable_d8_counters(first, second):
+    """Reuse the full control decoder when both live headers agree."""
+    try:
+        a = parse_control(first)
+        b = parse_control(second)
+    except ValueError:
+        return None
+    if a is None or b is None or a['boot_epoch'] != b['boot_epoch']:
+        return None
+    counters = {
+        'boot_epoch': a['boot_epoch'],
+        'jobs': a['family_jobs'][8],
+        'applied': a['family_applied'][8],
+        'family_jobs': a['family_jobs'],
+        'family_applied': a['family_applied'],
+    }
+    return counters if counters == {
+        'boot_epoch': b['boot_epoch'],
+        'jobs': b['family_jobs'][8],
+        'applied': b['family_applied'][8],
+        'family_jobs': b['family_jobs'],
+        'family_applied': b['family_applied'],
+    } else None
+
+class D8ControlDiagnostics:
+    """Best-effort development diagnostic with synchronous QMP perturbation."""
+    def __init__(self, output, *, interval_seconds):
+        require(0.1 <= interval_seconds <= 60,
+                'D8 diagnostic interval must be between 0.1 and 60 seconds')
+        self.output = Path(output)
+        self.interval_seconds = float(interval_seconds)
+        self.samples = 0
+        self.nodes = []
+        self.initialization_errors = []
+        self.enabled = True
+
+    def disable(self, error):
+        self.enabled = False
+        self.initialization_errors.append(type(error).__name__ + ': ' + str(error))
+
+    def next_sample_at(self, completed_monotonic):
+        return completed_monotonic + self.interval_seconds
+
+    def _node(self, index):
+        while len(self.nodes) <= index:
+            self.nodes.append({'node': len(self.nodes) + 1, 'records': {},
+                               'counters': [], 'errors': []})
+        return self.nodes[index]
+
+    def sample(self, guests, locations, *, elapsed_seconds):
+        require(len(guests) == len(locations), 'D8 diagnostic guest/location mismatch')
+        self.samples += 1
+        for index, (guest, location) in enumerate(zip(guests, locations)):
+            node = self._node(index)
+            paths = [guest['folder'] / f'.d8-control-{self.samples:04d}-{part}.bin'
+                     for part in ('a', 'b')]
+            try:
+                require(location['size'] == CONTROL_WORDS * 8,
+                        'DOMAIN_CONTROL_EVIDENCE size differs')
+                pages = []
+                for path in paths:
+                    guest['qmp'].execute('pmemsave', {
+                        'val': location['pa'], 'size': location['size'],
+                        'filename': str(path),
+                    })
+                    pages.append(path.read_bytes())
+                counters = _stable_d8_counters(*pages)
+                if counters is not None:
+                    node['counters'].append({
+                        'sample': self.samples,
+                        'elapsed_seconds': elapsed_seconds,
+                        **counters,
+                    })
+                for row in stable_d8_records(*pages):
+                    key = str(row['sequence'])
+                    old = node['records'].get(key)
+                    row['first_observed_seconds'] = (old or {}).get(
+                        'first_observed_seconds', elapsed_seconds)
+                    row['last_observed_seconds'] = elapsed_seconds
+                    row['stable_samples'] = (old or {}).get('stable_samples', 0) + 1
+                    node['records'][key] = row
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                node['errors'].append({
+                    'sample': self.samples,
+                    'elapsed_seconds': elapsed_seconds,
+                    'error': type(error).__name__ + ': ' + str(error),
+                })
+            finally:
+                for path in paths:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+    def document(self):
+        nodes = []
+        for node in self.nodes:
+            nodes.append({
+                'node': node['node'],
+                'records': [node['records'][key]
+                            for key in sorted(node['records'], key=int)],
+                'counters': node['counters'],
+                'errors': node['errors'],
+            })
+        return {
+            'schema_version': 1,
+            'kind': 'live-d8-service-batch-diagnostic',
+            'acceptance_evidence': False,
+            'development_only': True,
+            'warning': ('Development-only synchronous QMP memory reads perturb host timing. '
+                        'This file is not acceptance or physical-realtime evidence.'),
+            'initialization_errors': self.initialization_errors,
+            'sampling': {
+                'enabled': self.enabled,
+                'interval_seconds': self.interval_seconds,
+                'samples': self.samples,
+                'stops_vcpus': False,
+                'reads_per_node_per_sample': 2,
+            },
+            'nodes': nodes,
+        }
+
+    def write(self):
+        document = self.document()
+        try:
+            encoded = json.dumps(document, indent=2, allow_nan=False) + '\n'
+        except (TypeError, ValueError, OverflowError) as error:
+            document = {
+                'schema_version': 1,
+                'kind': 'live-d8-service-batch-diagnostic',
+                'acceptance_evidence': False,
+                'development_only': True,
+                'warning': ('Development-only synchronous QMP memory reads perturb host timing. '
+                            'This file is not acceptance or physical-realtime evidence.'),
+                'initialization_errors': list(self.initialization_errors),
+                'serialization_error': type(error).__name__ + ': ' + str(error),
+                'sampling': {
+                    'enabled': False,
+                    'interval_seconds': self.interval_seconds,
+                    'samples': self.samples,
+                    'stops_vcpus': False,
+                    'reads_per_node_per_sample': 2,
+                },
+                'nodes': [],
+            }
+            encoded = json.dumps(document, indent=2, allow_nan=False) + '\n'
+        (self.output / D8_DIAGNOSTIC_FILE).write_text(encoded)
+        return document
+
+def initialize_d8_locations(diagnostic, image_data):
+    """Best-effort opt-in setup; diagnostic symbol failures never fail the run."""
+    try:
+        return [d8_control_location(data) for data in image_data]
+    except (ValueError, KeyError, TypeError) as error:
+        diagnostic.disable(error)
+        return None
 
 def attest_qemu(binary,source=None):
     binary=Path(binary).resolve(strict=True)
@@ -90,7 +364,42 @@ def bind_build(path,elf,peer_elf,publics,package,expect):
 def profile(data):
     inspect_elf(data)
     require(boot_profile(data)['ram_mib']==1024,'unified image requires 1 GiB')
-    return {name:symbol(data,name) for name in ('UNIFIED_EVIDENCE','DYNAMIC_V13_EVIDENCE','RUNTIME_V13_EVIDENCE')}
+    locations={}
+    for name,size in CAPTURE_SYMBOLS:
+        location=symbol(data,name)
+        require(location['size']==size,f'{name} size differs')
+        locations[name]=location
+    return locations
+
+def decode_final_diagnostics(bundle):
+    """Decode a stopped snapshot without replacing its functional failure."""
+    snapshot={}
+    try:
+        decode_domain_diagnostics(snapshot,bundle)
+    except ValueError as error:
+        snapshot['final_parse_error']=str(error)
+    progress_errors=decode_progress_diagnostics(snapshot,bundle)
+    if progress_errors:
+        snapshot.setdefault('final_parse_error',str(progress_errors[0]))
+    snapshot['control'] = None
+    if 'DOMAIN_CONTROL_EVIDENCE' in bundle:
+        try:
+            unified = snapshot.get('unified_words') or []
+            boot_epoch = unified[1] if len(unified) > 1 else None
+            snapshot['control'] = parse_control(
+                bundle['DOMAIN_CONTROL_EVIDENCE'], boot_epoch)
+        except ValueError as error:
+            snapshot.setdefault('diagnostic_errors', []).append({
+                'field': 'control', 'error': str(error),
+            })
+            snapshot.setdefault('final_parse_error', str(error))
+    retained=retained_observation(snapshot)
+    return {key:retained.get(key) for key in FINAL_DIAGNOSTIC_FIELDS}
+
+def record_final_diagnostics(output,bundles):
+    decoded=[decode_final_diagnostics(bundle) for bundle in bundles]
+    (output/'final-diagnostics.json').write_text(json.dumps(decoded,indent=2)+'\n')
+    return decoded
 
 def validate(serial,pages,cpu_counts,*,recover=False,expect='normal'):
     require(cpu_counts==[4,4],'four native cores per node required')
@@ -198,7 +507,8 @@ def capture(guests,locations,label='',resume=False):
                 time.sleep(.001)
             else:raise ValueError('live runtime publication did not stabilize')
             for name,location in source.items():
-                if name!='RUNTIME_V13_EVIDENCE':bundle[name]=read(name,location['pa'],location['size'])
+                if name in LIVE_CAPTURE_SYMBOLS and name!='RUNTIME_V13_EVIDENCE':
+                    bundle[name]=read(name,location['pa'],location['size'])
             bundles.append(bundle)
         return bundles
     bundles=[]
@@ -234,13 +544,17 @@ def validate_offline_custody(before,after,publics,package_hash):
     require(proof['pure_task_done_verified'],'offline custody lost completed task result')
     return proof
 
-def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, entropy: bool = True, formatter: Path | None = None, peer_elf: Path, development: bool = False, existing_disks=None, reconnect=False, publics=None, package=None,expect='normal',clock_profile='wallclock',build_manifest=None,icount_shift=0,tcg_threads='multi',qemu=None,qemu_source=None) -> dict:
+def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, entropy: bool = True, formatter: Path | None = None, peer_elf: Path, development: bool = False, existing_disks=None, reconnect=False, publics=None, package=None,expect='normal',clock_profile='wallclock',build_manifest=None,icount_shift=0,tcg_threads='multi',qemu=None,qemu_source=None,d8_diagnostic_interval=None) -> dict:
     require(1 <= timeout <= 180, 'invalid execution deadline')
+    require(d8_diagnostic_interval is None or development,
+            'live D8 diagnostics require --development')
     elf = elf.resolve(strict=True)
     peer_elf = peer_elf.resolve(strict=True)
     output = output.resolve()
     require(not output.exists(), 'refuse to reuse evidence output')
     output.mkdir(parents=True)
+    d8_diagnostic = (D8ControlDiagnostics(output, interval_seconds=d8_diagnostic_interval)
+                     if d8_diagnostic_interval is not None else None)
     before = manifest()
     (output / 'source-manifest.json').write_text(json.dumps(before, indent=2) + '\n')
     rejection=expect in ('no-entropy','wrong-pin')
@@ -257,7 +571,10 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
             if not development or build_manifest is not None:
                 report['build_binding']=bind_build(build_manifest,elf,peer_elf,publics,package,expect)
                 shutil.copyfile(build_manifest,output/'build-manifest.json')
-            locations = [profile(p.read_bytes()) for p in (elf,peer_elf)]
+            image_data = [p.read_bytes() for p in (elf, peer_elf)]
+            locations = [profile(data) for data in image_data]
+            d8_locations = (initialize_d8_locations(d8_diagnostic, image_data)
+                            if d8_diagnostic is not None else None)
             formatter = (formatter or ROOT / 'target/debug/examples/prototype-disk').resolve(strict=True)
             report['formatter_sha256'] = sha(formatter)
             binary = qemu or shutil.which('qemu-system-aarch64')
@@ -331,6 +648,9 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
                 if not linked:
                     guest['qmp'].execute('set_link', {'name': 'eth0', 'up': False})
                 guest['qmp'].execute('cont')
+            next_d8_diagnostic = (d8_diagnostic.next_sample_at(time.monotonic())
+                                  if d8_diagnostic is not None
+                                  and d8_locations is not None else None)
             while time.monotonic() < end:
                 for guest in guests:
                     require(guest['proc'].poll() is None, 'QEMU exited before acceptance')
@@ -380,6 +700,14 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
                     require(development or before == manifest(), 'source changed during guest run')
                     report.update(status='OBSERVED' if development else 'PASS', native_tcp_verified=not rejection, observations=observations)
                     break
+                now = time.monotonic()
+                if d8_diagnostic is not None and d8_locations is not None \
+                        and now >= next_d8_diagnostic:
+                    d8_diagnostic.sample(
+                        guests, d8_locations,
+                        elapsed_seconds=round(now - started, 6),
+                    )
+                    next_d8_diagnostic = d8_diagnostic.next_sample_at(time.monotonic())
                 time.sleep(.01)
             else:
                 raise TimeoutError('two-guest TCP execution deadline')
@@ -387,8 +715,11 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
             report['error'] = type(error).__name__ + ': ' + str(error)
         finally:
             if len(guests)==2 and all(g.get('qmp') and g['proc'].poll() is None for g in guests):
-                try:capture(guests,locations,'final-')
-                except (OSError,ValueError,RuntimeError):pass
+                try:
+                    final_pages=capture(guests,locations,'final-')
+                    report['final_diagnostics']=record_final_diagnostics(output,final_pages)
+                except (OSError,ValueError,RuntimeError) as error:
+                    report['final_diagnostics_error']=type(error).__name__+': '+str(error)
             for guest in guests:
                 proc, qmp = guest['proc'], guest['qmp']
                 if proc is not None and proc.poll() is None:
@@ -418,6 +749,16 @@ def run(elf: Path, output: Path, timeout: float = 60, *, linked: bool = True, en
                     'cpus': guest.get('cpus'), 'memory': guest.get('memory'),
                     'exit': proc.returncode if proc is not None else None,
                     'transport': {'frames': decoder.frames, 'lost': decoder.loss, 'corrupt': decoder.corrupt}}, indent=2) + '\n')
+    if d8_diagnostic is not None:
+        try:
+            document = d8_diagnostic.write()
+            report['d8_service_batch_diagnostic'] = {
+                'file': D8_DIAGNOSTIC_FILE,
+                'acceptance_evidence': False,
+                'samples': document['sampling']['samples'],
+            }
+        except (OSError, TypeError, ValueError, OverflowError) as error:
+            report['d8_service_batch_diagnostic_error'] = type(error).__name__ + ': ' + str(error)
     if report['status'] in ('PASS','OBSERVED'):
         try:
             captures = [] if rejection else [validate_capture((guest['folder'] / 'ethernet.pcap').read_bytes()) for guest in guests]
@@ -463,8 +804,11 @@ def main():
     p.add_argument('--qemu',type=Path,help='explicit qemu-system-aarch64 binary')
     p.add_argument('--qemu-source',type=Path,help='exact pinned source tree for a patched QEMU build')
     p.add_argument('--build-manifest',type=Path)
+    p.add_argument('--d8-diagnostic-interval',type=float,metavar='SECONDS',
+                   help='development-only synchronous-QMP D8 diagnostic interval; '
+                        'recommended 2-3 seconds; perturbs host timing')
     p.add_argument('--timeout',type=float,default=90);p.add_argument('--development',action='store_true');p.add_argument('--disconnected',action='store_true');p.add_argument('--without-entropy',action='store_true');p.add_argument('--formatter',type=Path)
     a=p.parse_args();require(len(a.public)==2 and (a.disk is None or len(a.disk)==2),'two keys/disks required')
-    r=run(a.elf,a.output,a.timeout,peer_elf=a.peer_elf,development=a.development,linked=not a.disconnected,entropy=not a.without_entropy,formatter=a.formatter,existing_disks=a.disk,reconnect=a.reconnect,publics=a.public,package=a.package,expect=a.expect,clock_profile=a.clock_profile,build_manifest=a.build_manifest,icount_shift=a.icount_shift,tcg_threads=a.tcg_threads,qemu=a.qemu,qemu_source=a.qemu_source)
+    r=run(a.elf,a.output,a.timeout,peer_elf=a.peer_elf,development=a.development,linked=not a.disconnected,entropy=not a.without_entropy,formatter=a.formatter,existing_disks=a.disk,reconnect=a.reconnect,publics=a.public,package=a.package,expect=a.expect,clock_profile=a.clock_profile,build_manifest=a.build_manifest,icount_shift=a.icount_shift,tcg_threads=a.tcg_threads,qemu=a.qemu,qemu_source=a.qemu_source,d8_diagnostic_interval=a.d8_diagnostic_interval)
     print(json.dumps(r,indent=2));return 0 if r['status'] in ('PASS','OBSERVED') else 1
 if __name__=='__main__':raise SystemExit(main())

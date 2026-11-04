@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, CONTROL_POOL_MAGIC, GOVERNANCE_MAGIC, GOVERNANCE_RUNTIME_MAGIC, LEARNING_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_control_pool, parse_governance, parse_governance_runtime, parse_learning, parse_ipi, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
+from verify_domains import ALL_FAMILIES, CONTROL_MAGIC, CONTROL_WORDS, CONTROL_CREDIT_MAGIC, CONTROL_POOL_MAGIC, GOVERNANCE_MAGIC, GOVERNANCE_RUNTIME_MAGIC, LEARNING_MAGIC, IPI_MAGIC, RUNTIME_MAGIC, UNIFIED_MAGIC, code_source_map, diagnostics, parse_control, parse_control_credit, parse_control_pool, parse_governance, parse_governance_runtime, parse_learning, parse_ipi, parse_preparation_skips, parse_runtime, parse_tasks, parse_unified, sha, verify_source_build
 from verify_domains import RECONNECT_OUTAGE_NS, ReconnectProbe, run
 from verify_domains import REPLAY_MAGIC, capture, parse_replay, refresh_snapshot, replay_ready
 
@@ -69,6 +69,49 @@ class PreparationRejectionTests(unittest.TestCase):
                 words[offset] = value
                 with self.assertRaises(ValueError):
                     self.parse(words)
+
+
+class PreparationSkipTests(unittest.TestCase):
+    def bank(self):
+        values = [0] * 256
+        values[:8] = [0x435950534B495031, 1, 13, 18, 16, 16, 0, 0]
+        row = 8 + 8 * 13
+        values[row:row + 13] = [4, 8, 1, 2, 10, 7, 0x53525643, 1, 42,
+                                0, 1 << 48, 1 << 16, 0]
+        return values
+
+    def test_decodes_complete_d8_skip_counts_and_identity(self):
+        parsed = parse_preparation_skips(encode(self.bank()))
+        self.assertEqual(parsed['capacity'], 18)
+        self.assertEqual(parsed['rows'][0]['family_index'], 8)
+        self.assertEqual(parsed['rows'][0]['family'], [8, 1])
+        self.assertEqual(parsed['rows'][0]['total'], 2)
+        self.assertEqual(parsed['rows'][0]['last_reason'], 'DependencyUnavailable')
+        self.assertEqual(parsed['rows'][0]['last_error'], 'Conflict')
+        self.assertEqual(parsed['rows'][0]['target'], [0x53525643, 1])
+        self.assertEqual(parsed['rows'][0]['wall_started'], 42)
+        self.assertEqual(parsed['rows'][0]['reasons'], {
+            'ObservationUnavailable': 1,
+            'DependencyUnavailable': 1,
+        })
+
+    def test_rejects_wrong_size_layout_identity_and_family(self):
+        cases = []
+        cases.append(encode(self.bank()[:-1]))
+        for offset, value in ((0, 0), (2, 12), (4, 15), (5, 15), (8 + 8 * 13 + 1, 7)):
+            values = self.bank()
+            values[offset] = value
+            cases.append(encode(values))
+        for data in cases:
+            with self.subTest(size=len(data)), self.assertRaises(ValueError):
+                parse_preparation_skips(data)
+
+    def test_in_progress_row_is_reported_but_not_claimed_as_a_reason(self):
+        values = self.bank()
+        values[8 + 8 * 13] = 3
+        parsed = parse_preparation_skips(encode(values))
+        self.assertEqual(parsed['rows'], [])
+        self.assertEqual(parsed['in_progress'], [8])
 
 
 def encode(values):

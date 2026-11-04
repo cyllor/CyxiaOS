@@ -18,10 +18,11 @@ from check_v13_evidence import DEFAULT, ROOT, validate
 
 def enroll(manifest: Path, receipt: Path, output: Path, *, source_root: Path,
            qemu_source: Path | None = None) -> dict:
+    lexical_root = Path(source_root).absolute()
     root = Path(source_root).resolve(strict=True)
     # Keep the lexical path until safe_path checks every ancestor for symlinks.
     receipt = Path(receipt).absolute()
-    relative = receipt.relative_to(root).as_posix()
+    relative = receipt.relative_to(lexical_root).as_posix()
     receipt = safe_path(root, relative)
     require(receipt.name == 'summary.json', 'A02 receipt must name summary.json')
     document = read_json(manifest)

@@ -458,7 +458,9 @@ fn placement_workload() -> u64 {
 
 #[inline(never)]
 fn run(authority: file::Capability) -> u64 {
-    let deadline = clock().saturating_add(45_000_000_000);
+    // Give the probe a 55-second local wait window below the ordinary task's
+    // 60-second launch-to-expiry limit; startup consumes part of that headroom.
+    let deadline = clock().saturating_add(55_000_000_000);
     stage(1);
     if authority.id == 0 || authority.generation == 0 {
         return 1;

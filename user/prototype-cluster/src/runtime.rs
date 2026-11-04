@@ -1,4 +1,7 @@
 use crate::driver::Driver;
+#[cfg(not(test))]
+#[path = "runtime_timing.rs"]
+mod timing;
 #[derive(Debug)]
 pub(crate) enum AdvanceError {
     Custody,
@@ -266,7 +269,9 @@ pub fn run() -> ! {
         let outgoing = egress.as_mut().unwrap();
         let mut handshake = Some(ticket);
         let mut authenticated = None;
+        let mut loop_timing = timing::Tracker::new(broker::clock_ns());
         let (exit_reason, exit_result) = loop {
+            loop_timing.begin_loop(broker::clock_ns());
             if let Some(result) = connection_result(broker::poll(), epoch) {
                 break (SessionExitReason::ConnectionLost, result);
             }
@@ -280,6 +285,7 @@ pub fn run() -> ! {
             if driver.domain_tick(now_ns).is_err() {
                 break (SessionExitReason::DomainTick, 0x4000);
             }
+            let receive_started = broker::clock_ns();
             let read_capacity = session.receive_capacity().min(input.len());
             if read_capacity != 0 {
                 match broker::request(OP_READ, &[], &mut input[..read_capacity], 0, [0; 3]) {
@@ -296,6 +302,7 @@ pub fn run() -> ! {
                     Err(e) => break (SessionExitReason::TcpRead, 0x3000 + e),
                 }
             }
+            loop_timing.receive(receive_started, broker::clock_ns());
             if let Err(e) = session.pump(now) {
                 break (SessionExitReason::TlsPump, tls_result(&e));
             }
@@ -325,7 +332,15 @@ pub fn run() -> ! {
             }
             if authenticated.is_some() {
                 if !session.plaintext().is_empty() {
-                    let accepted = match driver.ingest(session.plaintext(), now) {
+                    let ingest_started = broker::clock_ns();
+                    let ingested = driver.ingest(session.plaintext(), now);
+                    let ingest_finished = broker::clock_ns();
+                    loop_timing.ingest(
+                        ingest_started,
+                        ingest_finished,
+                        driver.take_ingest_timing(),
+                    );
+                    let accepted = match ingested {
                         Ok(n) => n,
                         Err(_) => break (SessionExitReason::PlaintextIngest, 0x4000),
                     };
@@ -333,19 +348,25 @@ pub fn run() -> ! {
                         break (SessionExitReason::PlaintextConsume, tls_result(&e));
                     }
                 }
-                if driver.tick(now).is_err() {
+                let tick_started = broker::clock_ns();
+                let ticked = driver.tick(now);
+                loop_timing.tick(tick_started, broker::clock_ns());
+                if ticked.is_err() {
                     break (SessionExitReason::DriverTick, 0x4000);
                 }
                 if driver.replay_wants_reconnect(epoch) {
                     break (SessionExitReason::ReplayReconnect, 0);
                 }
             }
-            if let Err(e) = outgoing.service_at(
+            let egress_started = broker::clock_ns();
+            let egress_result = outgoing.service_at(
                 &mut session,
                 &mut driver,
                 broker::clock_ns(),
                 &mut BrokerTcp,
-            ) {
+            );
+            loop_timing.egress(egress_started, broker::clock_ns());
+            if let Err(e) = egress_result {
                 break (SessionExitReason::TlsEgress, domain_result(e));
             }
             feedback(
@@ -355,8 +376,11 @@ pub fn run() -> ! {
                 broker::clock_ns(),
                 !session.pending_tls().is_empty(),
             );
+            loop_timing.finish_loop(broker::clock_ns());
             broker::yield_now();
         };
+        let timing_exit_ns = broker::clock_ns();
+        loop_timing.finish_loop(timing_exit_ns);
         let unauthenticated_exit = authenticated.is_none();
         if !driver.take_exit_reported() {
             driver.report_exit(
@@ -384,6 +408,15 @@ pub fn run() -> ! {
             Some(outgoing),
             broker::clock_ns(),
             false,
+        );
+        // The diagnostic SVC runs only after Driver authority, TLS state,
+        // socket state and authenticated ingress ownership are torn down.
+        loop_timing.report(
+            epoch,
+            &driver,
+            timing_exit_ns,
+            exit_reason as u64,
+            exit_result,
         );
         if broker::service_fault_enabled() && unauthenticated_exit && !reported_unauthenticated_exit
         {

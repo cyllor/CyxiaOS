@@ -13,6 +13,14 @@ pub const MAX_PENDING: usize = 64;
 pub const TERMINAL_HISTORY: usize = 256;
 pub const PUBLICATION_BUDGET_NS: u64 = 500_000;
 
+fn plan_receipt_digest(bytes: &[u8]) -> [u8; 32] {
+    #[cfg(feature = "hardware-sha256")]
+    if let Some(hash) = cyxia_arch_aarch64::sha256::digest(bytes) {
+        return hash;
+    }
+    Sha256::digest(bytes).into()
+}
+
 /// Filter one immutable tier snapshot without changing the preparation
 /// semantics of the scalar legality callback. A transient owner result aborts
 /// the tier so callers retry the same candidate-set identity; hard rejection
@@ -1134,14 +1142,42 @@ impl Registry {
         self.finish(slot);
         Ok(receipt)
     }
-    fn registered_decision(&self, decision: Decision) -> Result<&RegisteredSet, Error> {
-        self.registered_set_by_hash(decision.envelope.candidate_set_hash)
-            .ok_or(Error::Stale)
+    fn registered_decision_cached<'a>(
+        &'a self,
+        decision: Decision,
+        cached: &mut Option<usize>,
+    ) -> Result<&'a RegisteredSet, Error> {
+        let hash = decision.envelope.candidate_set_hash;
+        let index = match *cached {
+            Some(index) => index,
+            None => {
+                let index = self.registered_index(hash).ok_or(Error::Stale)?;
+                *cached = Some(index);
+                index
+            }
+        };
+        if self.registered_hashes.get(index) != Some(&hash) {
+            return Err(Error::Stale);
+        }
+        let set = self
+            .registered
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::Stale)?;
+        if set.hash != hash {
+            return Err(Error::Stale);
+        }
+        Ok(set)
     }
-    fn model_scope(&self, plan: &Plan, now: u64) -> Result<ModelBinding, Error> {
+    fn model_scope(
+        &self,
+        plan: &Plan,
+        now: u64,
+        registered: &mut [Option<usize>; 16],
+    ) -> Result<ModelBinding, Error> {
         let mut binding = None;
-        for d in plan.iter() {
-            let set = self.registered_decision(d)?;
+        for (index, d) in plan.iter().enumerate() {
+            let set = self.registered_decision_cached(d, &mut registered[index])?;
             set.validate_model_scope(self.model, now)?;
             if (set.canary.is_some() || set.baseline_action().is_some()) && plan.len() != 1 {
                 return Err(Error::Auth);
@@ -1157,11 +1193,12 @@ impl Registry {
         &self,
         plan: &Plan,
         now: u64,
+        registered: &mut [Option<usize>; 16],
         executor: &mut E,
     ) -> Result<ModelBinding, Error> {
-        let binding = self.model_scope(plan, now)?;
-        for d in plan.iter() {
-            let set = self.registered_decision(d)?;
+        let binding = self.model_scope(plan, now, registered)?;
+        for (index, d) in plan.iter().enumerate() {
+            let set = self.registered_decision_cached(d, &mut registered[index])?;
             if set.baseline_action().is_some() {
                 executor.authorize_baseline(self.model, set, now)?;
             }
@@ -1169,16 +1206,22 @@ impl Registry {
         }
         Ok(binding)
     }
-    fn validate<E: Executor>(&self, plan: &Plan, now: u64, executor: &mut E) -> Result<(), Error> {
+    fn validate<E: Executor>(
+        &self,
+        plan: &Plan,
+        now: u64,
+        registered: &mut [Option<usize>; 16],
+        executor: &mut E,
+    ) -> Result<(), Error> {
         if plan.header.active_model_generation != self.model.generation
             || plan.header.base_plan_version != self.version
         {
             return Err(Error::Stale);
         }
-        self.authorize_models(plan, now, executor)?;
-        for d in plan.iter() {
+        self.authorize_models(plan, now, registered, executor)?;
+        for (index, d) in plan.iter().enumerate() {
             let e = d.envelope;
-            let set = self.registered_decision(d)?;
+            let set = self.registered_decision_cached(d, &mut registered[index])?;
             if e.model_hash != set.model.model_hash
                 || set.target != e.target
                 || set.snapshot.sequence != e.snapshot_seq
@@ -1281,31 +1324,35 @@ impl Registry {
             controller_epoch: publisher.controller_epoch,
             plan_seq: plan.header.plan_seq,
         };
-        let digest: [u8; 32] = Sha256::digest(bytes).into();
-        if let Some(old) = self.records().find(|r| r.receipt.id == id) {
-            return if old.digest == digest {
-                Ok(old.receipt)
-            } else {
-                Err(Error::Conflict)
-            };
+        let digest = plan_receipt_digest(bytes);
+        let old_plan = id.plan_seq <= self.plan_high;
+        let old_decision = plan
+            .iter()
+            .any(|d| d.envelope.decision_seq <= self.decision_high);
+        if old_plan || old_decision {
+            if let Some(old) = self.records().find(|r| r.receipt.id == id) {
+                return if old.digest == digest {
+                    Ok(old.receipt)
+                } else {
+                    Err(Error::Conflict)
+                };
+            }
         }
         if self.optimization_stopped {
             executor.authorize_recovery(self.model, &plan, started_ns.wall_ns)?;
         }
-        for d in plan.iter() {
-            if self.records().any(|r| {
-                r.receipt.id.controller_epoch == id.controller_epoch
-                    && r.decisions[..usize::from(r.receipt.action_count)]
-                        .contains(&d.envelope.decision_seq)
-            }) {
-                return Err(Error::Conflict);
+        if old_decision {
+            for d in plan.iter() {
+                if self.records().any(|r| {
+                    r.receipt.id.controller_epoch == id.controller_epoch
+                        && r.decisions[..usize::from(r.receipt.action_count)]
+                            .contains(&d.envelope.decision_seq)
+                }) {
+                    return Err(Error::Conflict);
+                }
             }
         }
-        if id.plan_seq <= self.plan_high
-            || plan
-                .iter()
-                .any(|d| d.envelope.decision_seq <= self.decision_high)
-        {
+        if old_plan || old_decision {
             return Err(Error::Stale);
         }
         let slot = self
@@ -1338,6 +1385,7 @@ impl Registry {
         self.decision_high = record.decisions[plan.len() - 1];
         // Identity is protected before the first reservation or executor effect.
         self.active[slot] = Some(record);
+        let mut registered = [None; 16];
         let first = clock.read();
         let mut last_sample = first;
         let mut prepared = false;
@@ -1347,7 +1395,7 @@ impl Registry {
                 return Err(Error::Expired);
             }
             stage = SubmissionStage::FirstValidation;
-            self.validate(&plan, first.wall_ns, executor)?;
+            self.validate(&plan, first.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::InitialBudget;
             budget.check(first)?;
             prepared = true;
@@ -1361,7 +1409,7 @@ impl Registry {
             }
             first.cpu_elapsed(now)?;
             stage = SubmissionStage::SecondValidation;
-            self.validate(&plan, now.wall_ns, executor)?;
+            self.validate(&plan, now.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::Revalidate;
             executor.revalidate(&plan, now.wall_ns)?;
             // Revalidation may itself take time or wait for an owner. Take a
@@ -1386,7 +1434,8 @@ impl Registry {
             // callbacks. This is read-only: no canary quota or pending slot is
             // consumed until the executor performs the real atomic publish.
             stage = SubmissionStage::ModelAuthorization;
-            let binding = self.authorize_models(&plan, publish_ns.wall_ns, executor)?;
+            let binding =
+                self.authorize_models(&plan, publish_ns.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::CommitTime;
             let commit_ns = clock.read();
             last_sample = commit_ns;
@@ -1406,7 +1455,7 @@ impl Registry {
             // The gate remains locked. Time may have passed during its check,
             // so recheck the immutable permit's bounds at this final timestamp.
             stage = SubmissionStage::FinalModel;
-            if self.model_scope(&plan, commit_ns.wall_ns)? != binding {
+            if self.model_scope(&plan, commit_ns.wall_ns, &mut registered)? != binding {
                 return Err(Error::Stale);
             }
             // Publication is one atomic root change under the owner's resource gate.

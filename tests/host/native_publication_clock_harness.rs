@@ -18,6 +18,8 @@ struct NativeClock;
 struct Family;
 struct Owner { prepared_count: usize, families: [Option<Family>; 1] }
 fn family_index(_: u16, _: u16) -> Result<usize, Error> { Ok(0) }
+fn locate(_: &Owner, _: Action, _: ObjectKey) -> Option<usize> { Some(0) }
+fn located_slot_matches(_: &Owner, slot: usize, _: Action, _: ObjectKey) -> bool { slot == 0 }
 struct Scope { cpu_cost: u64, wall_cost: u64 }
 impl Scope {
     fn authorize_executor(&self, _: &Owner) -> Result<(), Error> { Ok(()) }
@@ -26,12 +28,18 @@ impl Scope {
         WALL.fetch_add(self.wall_cost, Ordering::AcqRel);
         Ok(())
     }
+    fn selection_at(&self, owner: &Owner, family: Family, action: Action, target: ObjectKey,
+        at: u64, _: Option<usize>) -> Result<(), Error> {
+        self.selection(owner, family, action, target, at)
+    }
 }
 // SUBMISSION_TRACE_MODULE
 struct Executor {
     owner: &'static mut Owner, scope: Scope, model: ModelBinding, publication_started: PublicationTime,
-    publication_debit: CpuTime, wall_deadline: u64, published: usize,provenance:submission::Facts,
+    publication_debit: CpuTime, resolved_slots: [usize; 16], resolved_count: usize,
+    wall_deadline: u64, published: usize,provenance:submission::Facts,
 }
+// NATIVE_RESOLVED_SLOT
 impl Executor {
     // NATIVE_PRECOMMIT
 }
@@ -49,6 +57,7 @@ fn fixture(cpu_cost: u64, wall_cost: u64) -> (Executor, Vec<u8>) {
     (Executor { owner: Box::leak(Box::new(Owner { prepared_count: 1, families: [Some(Family)] })), scope: Scope { cpu_cost, wall_cost },
         model, publication_started: PublicationTime { wall_ns: 100_000_000, cpu: CpuTime { cpu: 0, ns: 1_000 } },
         publication_debit: CpuTime { cpu: 0, ns: 0 },
+        resolved_slots: [0; 16], resolved_count: 0,
         wall_deadline: 150_000_000, published: 0,provenance:submission::Facts::disabled() }, wire)
 }
 #[test]

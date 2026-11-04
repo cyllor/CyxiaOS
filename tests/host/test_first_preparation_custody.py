@@ -13,10 +13,14 @@ from test_governance_billing_priority import function
 def program():
  c=(ROOT/'kernel/src/domain_control.rs').read_text();r=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
  code=(ROOT/'tests/host/first_preparation_custody_harness.rs').read_text()
- code=code.replace('// PREPARATION_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/preparation.rs'))+'] mod preparation;')
+ code=code.replace(
+  '// PREPARATION_MODULE',
+  '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/preparation.rs'))+'] mod preparation;\n'
+  '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/preparation_skip.rs'))+'] mod preparation_skip;\n'
+  'use preparation_skip::Reason as Skip;')
  bank=c[c.index('struct PreparationRejections('):c.index(');',c.index('struct PreparationRejections('))+2]+'\nstatic DOMAIN_PREPARATION_REJECTIONS:PreparationRejections=PreparationRejections([const{AtomicU64::new(0)};648]);\nstatic mut PREPARATION_REJECTIONS:preparation::Rejections=preparation::Rejections::new();'
  code=code.replace('// ACTUAL_REJECTION_BANK',bank)
- code=code.replace('// ACTUAL_PREPARATION_FUNCTIONS','\n'.join(function(c,x) for x in ['fn next_locked(','fn retire_preparation(','fn preparation_identity(','fn preparation_snapshot(']))
+ code=code.replace('// ACTUAL_PREPARATION_FUNCTIONS','\n'.join(function(c,x) for x in ['fn skip(','fn next_locked(','fn retire_preparation(','fn preparation_identity(','fn preparation_snapshot(']))
  normal=function(c,'fn next_normal(');prefix=normal[:normal.index('        let core_preparation =')]
  # All real exits through model gate; later resource/encoding branches are an
  # explicit boundary. Successful encoding validates carried CPU, then clears
@@ -41,7 +45,7 @@ class FirstPreparationCustody(unittest.TestCase):
   code=program()
   with tempfile.TemporaryDirectory() as tmp:
    d=Path(tmp);(d/'harness.rs').write_text(code);(d/'Cargo.toml').write_text('[package]\nname="first-preparation-custody"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
-   command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-first-preparation-custody'),'--','--test-threads=1']
+   command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-first-preparation-custody'),'--','--test-threads=1','first_preparation_custody_']
    result=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
    self.assertEqual(result.returncode,0,result.stdout+result.stderr);self.assertIn('6 passed; 0 failed',result.stdout)
    creation=function(code,'if s.preparation.is_none()\n            && replay::first_preparation(')

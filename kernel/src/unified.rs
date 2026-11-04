@@ -20,6 +20,8 @@ use cyxia_kernel_core::control_plane::service_restart::{Lifecycle, RestartDecisi
 use cyxia_prototype::domains::Error;
 #[path = "../../user/prototype-cluster/src/abi.rs"]
 pub(crate) mod abi;
+#[path = "unified_runtime_loop.rs"]
+mod runtime_loop;
 #[path = "unified_session_exit.rs"]
 mod session_exit;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cluster-service.elf"));
@@ -1010,7 +1012,26 @@ pub fn run(info: &BootInfo) -> ! {
                 }
                 abi::OP_TRACE => {
                     let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
-                    if p.arg0 == abi::TRACE_SESSION_EXIT {
+                    if p.arg0 == abi::TRACE_RUNTIME_LOOP {
+                        let mut record = [0; runtime_loop::RECORD_WORDS];
+                        if len == record.len() * 8 && p.arg1 == 0 && p.arg2 == 0 {
+                            for (word, bytes) in
+                                record.iter_mut().zip(p.payload[..len].chunks_exact(8))
+                            {
+                                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+                            }
+                            if !runtime_loop::retain(
+                                &record,
+                                boot.epoch,
+                                p.service_generation,
+                                connection_epoch,
+                            ) {
+                                p.status = abi::FAILED;
+                            }
+                        } else {
+                            p.status = abi::FAILED;
+                        }
+                    } else if p.arg0 == abi::TRACE_SESSION_EXIT {
                         let mut record = [0; session_exit::RECORD_WORDS];
                         if len == record.len() * 8 && p.arg1 == 0 && p.arg2 == 0 {
                             for (word, bytes) in

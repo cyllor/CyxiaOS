@@ -243,6 +243,9 @@ pub(crate) mod target_batch;
 pub use target_batch::Source as TargetSource;
 #[path = "domain_control/preparation.rs"]
 mod preparation;
+#[path = "domain_control/preparation_skip.rs"]
+mod preparation_skip;
+use preparation_skip::Reason as Skip;
 // Serialized by the same protected control-owner gate as State. This is an
 // explicit negative preparation record, never a proposal or execution receipt.
 static mut PREPARATION_REJECTIONS: preparation::Rejections = preparation::Rejections::new();
@@ -280,6 +283,27 @@ pub struct Family {
     pub target_features: fn(Action, ObjectKey) -> Result<TargetFeatures, Error>,
     pub apply: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
     pub reconcile: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
+}
+fn skip(
+    family: usize,
+    descriptor: Family,
+    target: Option<ObjectKey>,
+    wall_started: u64,
+    reason: Skip,
+    error: Option<Error>,
+) {
+    if (descriptor.domain, descriptor.kind) != (8, 1) {
+        return;
+    }
+    preparation_skip::record(
+        family,
+        descriptor.domain,
+        descriptor.kind,
+        target,
+        wall_started,
+        reason,
+        error,
+    );
 }
 #[derive(Clone, Copy, Default)]
 pub struct Context {
@@ -793,6 +817,13 @@ fn locate_family(owner: &Owner, domain: u16, kind: u16, key: ObjectKey) -> Optio
                 .is_some_and(|guard| guard.family() == (domain, kind) && guard.target() == key)
         })
 }
+fn located_slot_matches(owner: &Owner, slot: usize, action: Action, target: ObjectKey) -> bool {
+    owner.stability.get(slot).is_some_and(|guard| {
+        guard.as_ref().is_some_and(|guard| {
+            guard.family() == (action.domain(), action.kind()) && guard.target() == target
+        })
+    })
+}
 fn ensure_stability(
     owner: &mut Owner,
     action: Action,
@@ -1007,11 +1038,23 @@ fn validate_selection(
     target: ObjectKey,
     at: u64,
 ) -> Result<(), Error> {
-    validate_selection_with(
+    let slot = locate(owner, action, target).ok_or(Error::Stale)?;
+    validate_selection_at(owner, f, action, target, at, slot)
+}
+fn validate_selection_at(
+    owner: &Owner,
+    f: Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    slot: usize,
+) -> Result<(), Error> {
+    validate_selection_with_at(
         owner,
         action,
         target,
         at,
+        slot,
         || (f.current)(action.domain(), action.kind(), target),
         |options, output| (f.legal_options)(options, target, at, output),
     )
@@ -1025,7 +1068,25 @@ fn validate_selection_with(
     legal_options: impl FnOnce(&[Option<Action>], &mut [Option<Action>]) -> Result<usize, Error>,
 ) -> Result<(), Error> {
     let slot = locate(owner, action, target).ok_or(Error::Stale)?;
-    let guard = owner.stability[slot].as_ref().ok_or(Error::Stale)?;
+    validate_selection_with_at(owner, action, target, at, slot, current, legal_options)
+}
+fn validate_selection_with_at(
+    owner: &Owner,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    slot: usize,
+    current: impl FnOnce() -> Result<Action, Error>,
+    legal_options: impl FnOnce(&[Option<Action>], &mut [Option<Action>]) -> Result<usize, Error>,
+) -> Result<(), Error> {
+    let guard = owner
+        .stability
+        .get(slot)
+        .and_then(Option::as_ref)
+        .ok_or(Error::Stale)?;
+    if guard.family() != (action.domain(), action.kind()) || guard.target() != target {
+        return Err(Error::Stale);
+    }
     let current = current()?;
     if action == current {
         return Ok(());
@@ -1378,6 +1439,7 @@ fn next_normal(
         s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {
             preparation_lookup(index, f, ordinal, wall_started);
+            skip(index, f, None, wall_started, Skip::TargetAbsent, None);
             if s.preparation.is_some() {
                 return Err(Error::Stale);
             }
@@ -1391,6 +1453,14 @@ fn next_normal(
         }
         preparation_prefix_detail(1);
         if !replay::allows(f.domain, f.kind, target) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ReplayBlocked,
+                None,
+            );
             break 'families;
         }
         preparation_prefix_detail(2);
@@ -1430,10 +1500,18 @@ fn next_normal(
         let (replay_snapshot, _replay_prefix) =
             match replay::first(replay_snapshot, f.domain, f.kind, target) {
                 Ok(v) => v,
-                Err(Error::Again | Error::Busy | Error::NotReady) => {
+                Err(error @ (Error::Again | Error::Busy | Error::NotReady)) => {
                     // Retry the same queued first generation within its real
                     // original deadline; no additional successful AI slot.
                     s.due[index] = wall_started;
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::ReplayFirstRetry,
+                        Some(error),
+                    );
                     break 'families;
                 }
                 Err(e) => return Err(e),
@@ -1463,6 +1541,14 @@ fn next_normal(
             gate.check_active_publication(s.registry.model(), target)
                 .is_err()
         }) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ModelGateBlocked,
+                None,
+            );
             break 'families;
         }
         let core_preparation = if (f.domain, f.kind) == (1, 2) {
@@ -1493,8 +1579,22 @@ fn next_normal(
             (None, None) => match (f.current)(f.domain, f.kind, target) {
                 Ok(v) => v,
                 Err(
-                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
-                ) => break 'families,
+                    error @ (Error::Busy
+                    | Error::Again
+                    | Error::NotReady
+                    | Error::Stale
+                    | Error::NotFound),
+                ) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::CurrentUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
                 Err(e) => return Err(e),
             },
         };
@@ -1505,13 +1605,31 @@ fn next_normal(
             (None, Some(preparation)) => preparation.observation(),
             (None, None) => match (f.observe)(f.domain, target) {
                 Ok(v) => v,
-                Err(Error::Busy | Error::Again | Error::NotReady) => break 'families,
+                Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::ObservationUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
                 Err(e) => return Err(e),
             },
         };
         preparation_detail(4);
         let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
         if old.is_some_and(execution_blocks_replacement) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ReplacementBlocked,
+                None,
+            );
             break 'families;
         }
         let stability_slot = ensure_stability(&mut s.owner, current, target, wall_started)?;
@@ -1520,7 +1638,21 @@ fn next_normal(
             .ok_or(Error::Stale)?;
         let dependencies = match bind_dependencies(&s.owner, current, target, wall_started) {
             Ok(v) => v,
-            Err(Error::Busy | Error::Again | Error::NotReady | Error::Conflict | Error::Stale) => {
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Conflict
+                | Error::Stale),
+            ) => {
+                skip(
+                    index,
+                    f,
+                    Some(target),
+                    wall_started,
+                    Skip::DependencyUnavailable,
+                    Some(error),
+                );
                 break 'families;
             }
             Err(e) => return Err(e),
@@ -1550,7 +1682,21 @@ fn next_normal(
         };
         let legal_count = match legal_result {
             Ok(count) => count,
-            Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Stale
+                | Error::NotFound),
+            ) => {
+                skip(
+                    index,
+                    f,
+                    Some(target),
+                    wall_started,
+                    Skip::LegalOptionsUnavailable,
+                    Some(error),
+                );
                 break 'families;
             }
             Err(error) => return Err(error),
@@ -1560,6 +1706,14 @@ fn next_normal(
         if current != Action::OfferCpu(0)
             && !legal[..legal_count].iter().any(|a| *a == Some(current))
         {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::CurrentIllegal,
+                None,
+            );
             break 'families;
         }
         let queued_wcet_us = match queued_control_wcet_us(s, index, wall_started) {
@@ -1590,8 +1744,11 @@ fn next_normal(
         // written below is ever exposed to CandidateSet::new.
         let mut choices = [const { core::mem::MaybeUninit::<Candidate>::uninit() }; 32];
         let mut count = 0;
+        let mut replay_filtered = false;
+        let mut stability_filtered = false;
         for action in legal[..legal_count].iter().flatten().copied() {
             if !replay::allows_action(action, target) {
+                replay_filtered = true;
                 continue;
             }
             if action != current
@@ -1604,6 +1761,7 @@ fn next_normal(
                                 &legal[..legal_count],
                             )?)))
             {
+                stability_filtered = true;
                 continue;
             }
             let target_features_result = match timer_preparation.as_ref() {
@@ -1613,8 +1771,22 @@ fn next_normal(
             let mut target_features = match target_features_result {
                 Ok(v) => v,
                 Err(
-                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
-                ) => break 'families,
+                    error @ (Error::Busy
+                    | Error::Again
+                    | Error::NotReady
+                    | Error::Stale
+                    | Error::NotFound),
+                ) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::TargetFeaturesUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
                 Err(e) => return Err(e),
             };
             if let Action::ControlSet(mask) = action {
@@ -1644,6 +1816,14 @@ fn next_normal(
             count += 1;
         }
         if count == 0 {
+            let reason = if replay_filtered {
+                Skip::ActionReplayFiltered
+            } else if stability_filtered {
+                Skip::ActionStabilityFiltered
+            } else {
+                Skip::NoCandidate
+            };
+            skip(index, f, Some(target), wall_started, reason, None);
             break 'families;
         }
         preparation_detail(8);
@@ -2010,6 +2190,17 @@ trait PublicationScope {
     ) -> Result<(), Error> {
         validate_selection(owner, f, action, target, at)
     }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        _: Option<usize>,
+    ) -> Result<(), Error> {
+        self.selection(owner, f, action, target, at)
+    }
     /// All fallible scope checks precede the common infallible desired-root
     /// writes. A Canary consumes its exact score receipt and quota here.
     fn commit(
@@ -2034,6 +2225,17 @@ impl PublicationScope for ActiveScope<'_> {
             return Err(Error::Auth);
         }
         set.authorize_with_gate(active, self.0, at)
+    }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        slot: Option<usize>,
+    ) -> Result<(), Error> {
+        validate_selection_at(owner, f, action, target, at, slot.ok_or(Error::Stale)?)
     }
     fn commit(
         &mut self,
@@ -2142,6 +2344,43 @@ impl PublicationScope for ActivePublication<'_> {
             None => self.active.selection(owner, f, action, target, at),
         }
     }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        slot: Option<usize>,
+    ) -> Result<(), Error> {
+        let slot = slot.ok_or(Error::Stale)?;
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return validate_selection_with_at(
+                owner,
+                action,
+                target,
+                at,
+                slot,
+                || spawn.current(action.domain(), target),
+                |options, output| spawn.legal_options(options, target, at, output),
+            );
+        }
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with_at(
+                owner,
+                action,
+                target,
+                at,
+                slot,
+                || task.current(action.domain(), target),
+                |options, output| task.legal_options(options, target, at, output),
+            ),
+            Some(_) => Err(Error::Unsupported),
+            None => self
+                .active
+                .selection_at(owner, f, action, target, at, Some(slot)),
+        }
+    }
     fn commit(
         &mut self,
         owner: &Owner,
@@ -2167,7 +2406,25 @@ struct Executor<'a, S: PublicationScope> {
     dependencies: [Option<BoundDependency>; 2],
     scores: [i16; 32],
     score_count: usize,
+    resolved_slots: [usize; 16],
+    resolved_count: usize,
     provenance: submission::Facts,
+}
+impl<S: PublicationScope> Executor<'_, S> {
+    fn resolved_slot(&mut self, action: Action, target: ObjectKey) -> Option<usize> {
+        for &slot in &self.resolved_slots[..self.resolved_count] {
+            if located_slot_matches(self.owner, slot, action, target) {
+                return Some(slot);
+            }
+        }
+        let slot = locate(self.owner, action, target)?;
+        if self.resolved_count == self.resolved_slots.len() {
+            return None;
+        }
+        self.resolved_slots[self.resolved_count] = slot;
+        self.resolved_count += 1;
+        Some(slot)
+    }
 }
 impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
     fn authorize_baseline(
@@ -2246,7 +2503,8 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                 return Err(Error::Stale);
             }
             self.provenance.at(submission::Stage::OldDesired);
-            if let Some(i) = locate(self.owner, d.action, d.envelope.target) {
+            let slot = self.resolved_slot(d.action, d.envelope.target);
+            if let Some(i) = slot {
                 if self.owner.desired[i]
                     .as_ref()
                     .is_some_and(execution_blocks_replacement)
@@ -2256,7 +2514,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             }
             self.provenance.at(submission::Stage::Selection);
             self.scope
-                .selection(self.owner, f, d.action, d.envelope.target, now)?;
+                .selection_at(self.owner, f, d.action, d.envelope.target, now, slot)?;
             Ok(())
         })();
         self.provenance.returned(result);
@@ -2268,7 +2526,9 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             self.provenance.at(submission::Stage::PrepareIndex);
             self.owner.prepared_count = 0;
             for d in plan.iter() {
-                let i = locate(self.owner, d.action, d.envelope.target).ok_or(Error::Stale)?;
+                let i = self
+                    .resolved_slot(d.action, d.envelope.target)
+                    .ok_or(Error::Stale)?;
                 if self.owner.prepared[..self.owner.prepared_count].contains(&i) {
                     return Err(Error::Conflict);
                 }
@@ -2280,36 +2540,16 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn revalidate(&mut self, plan: &Plan, now: u64) -> Result<(), Error> {
+    fn revalidate(&mut self, _: &Plan, _: u64) -> Result<(), Error> {
         self.provenance.enter(submission::Callback::Revalidate);
-        let result = (|| {
-            for d in plan.iter() {
-                self.provenance.at(submission::Stage::Context);
-                let c = self.owner.context;
-                if d.envelope.core_generation != c.core_generation
-                    || d.envelope.ledger_generation != c.ledger_generation
-                {
-                    return Err(Error::Stale);
-                }
-                self.provenance.at(submission::Stage::Family);
-                let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
-                    .ok_or(Error::Unsupported)?;
-                self.provenance.at(submission::Stage::Legal);
-                self.scope.legal(f, d.action, d.envelope.target, now)?;
-                self.provenance.at(submission::Stage::Selection);
-                self.scope
-                    .selection(self.owner, f, d.action, d.envelope.target, now)?;
-                self.provenance.at(submission::Stage::Dependencies);
-                if self
-                    .scope
-                    .dependencies(self.owner, d.action, d.envelope.target, now)?
-                    != self.dependencies
-                {
-                    return Err(Error::Stale);
-                }
-            }
-            Ok(())
-        })();
+        // Registry's immediately preceding second validation called `check`
+        // for every decision with this exact timestamp. Native `check` is a
+        // strict superset of the old body here: context, family, legality,
+        // dependencies and selection, plus the Desired replacement guard.
+        // Nothing runs between the two callbacks, so repeating those resource
+        // callbacks cannot observe a newer state. Keep the generic callback
+        // boundary while avoiding a third identical native validation pass.
+        let result = Ok(());
         self.provenance.returned(result);
         result
     }
@@ -2345,8 +2585,9 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                 let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
                     .ok_or(Error::Unsupported)?;
                 self.provenance.at(submission::Stage::Selection);
+                let slot = self.resolved_slot(d.action, d.envelope.target);
                 self.scope
-                    .selection(self.owner, f, d.action, d.envelope.target, at)?;
+                    .selection_at(self.owner, f, d.action, d.envelope.target, at, slot)?;
             }
             self.provenance.at(submission::Stage::CommitTime);
             let commit = policy::Clock::read(&mut NativeClock);
@@ -2659,6 +2900,8 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
                 dependencies: job.dependencies,
                 scores: reply.scores,
                 score_count: job.set.len(),
+                resolved_slots: [0; 16],
+                resolved_count: 0,
                 provenance,
             };
             executor.provenance.accept(submission::AcceptStage::Submit);

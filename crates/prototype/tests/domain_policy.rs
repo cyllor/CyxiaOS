@@ -90,6 +90,40 @@ fn frame(set: &CandidateSet, sequence: u64, base: u64) -> Vec<u8> {
     out.truncate(n);
     out
 }
+fn frame_with_decision(
+    set: &CandidateSet,
+    plan_sequence: u64,
+    decision_sequence: u64,
+    base: u64,
+) -> Vec<u8> {
+    let header = PlanHeader {
+        plan_seq: plan_sequence,
+        base_plan_version: base,
+        active_model_generation: set.model.generation,
+        controller_epoch: 9,
+        snapshot_seq: set.snapshot.sequence,
+        active_until_local_ns: set.snapshot.taken_ns + POLICY_NS,
+    };
+    let d = Decision {
+        action: set.get(1).unwrap().action,
+        candidate_index: 1,
+        envelope: Envelope {
+            controller_epoch: 9,
+            decision_seq: decision_sequence,
+            snapshot_seq: set.snapshot.sequence,
+            target: set.target,
+            ledger_generation: set.snapshot.ledger_generation,
+            core_generation: set.snapshot.core_generation,
+            expires_local_ns: set.snapshot.taken_ns + WINDOW_NS,
+            model_hash: set.model.model_hash,
+            candidate_set_hash: set.hash(),
+        },
+    };
+    let mut out = vec![0; MAX_PLAN_BYTES];
+    let n = encode_plan(header, &[d], &mut out).unwrap();
+    out.truncate(n);
+    out
+}
 struct Times {
     first: u64,
     second: u64,
@@ -574,6 +608,22 @@ fn duplicate_identity_cannot_change_payload_or_release_unknown() {
     );
 }
 #[test]
+fn fresh_plan_cannot_reuse_a_retained_decision_sequence() {
+    let (mut registry, set, mut owner) = ready();
+    registry
+        .submit(publisher(), &frame(&set, 1, 0), &mut clock(), &mut owner)
+        .unwrap();
+    assert_eq!(
+        registry.submit(
+            publisher(),
+            &frame_with_decision(&set, 2, 1, 1),
+            &mut clock(),
+            &mut owner,
+        ),
+        Err(Error::Conflict)
+    );
+}
+#[test]
 fn stamp_retry_does_not_renew_lease_and_old_versions_do_not_revive() {
     let old = PolicyStamp::new(2, 10, 20).unwrap();
     assert_eq!(old.installed_until_ns, 10 + POLICY_NS);
@@ -843,6 +893,19 @@ fn stopped_optimizer_requires_explicit_restore_authority_and_stays_stopped() {
             &frame(&set, 3, 2),
             &mut ScriptClock([700_000].into()),
             &mut Owner::default()
+        ),
+        Err(Error::Budget)
+    );
+}
+#[test]
+fn stopped_optimizer_checks_recovery_authority_before_duplicate_decision() {
+    let (mut registry, set, _) = stopped_console();
+    assert_eq!(
+        registry.submit(
+            publisher(),
+            &frame_with_decision(&set, 2, 1, 1),
+            &mut ScriptClock([600_000].into()),
+            &mut Owner::default(),
         ),
         Err(Error::Budget)
     );

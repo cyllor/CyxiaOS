@@ -934,6 +934,8 @@ pub fn publish_canary(
             dependencies: job.dependencies,
             scores,
             score_count: job.count,
+            resolved_slots: [0; 16],
+            resolved_count: 0,
             provenance: submission::Facts::disabled(),
         };
         let receipt = match state.registry.submit_job(
@@ -1343,6 +1345,8 @@ pub fn restore(governance: &mut Governance<'_, '_>) -> Result<ExecutionState, Er
             dependencies,
             scores: [0; 32],
             score_count: 0,
+            resolved_slots: [0; 16],
+            resolved_count: 0,
             provenance: submission::Facts::disabled(),
         };
         let receipt = state

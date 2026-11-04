@@ -65,6 +65,19 @@ struct InSnapshot {
     items: Vec<Status>,
     owned: Vec<OwnedStatus>,
 }
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IngestTiming {
+    pub handle: [u64; 3],
+    pub post_admission: [u64; 3],
+}
+impl IngestTiming {
+    fn observe(slot: &mut [u64; 3], started: u64, finished: u64) {
+        let duration = finished.saturating_sub(started);
+        if duration > slot[0] {
+            *slot = [duration, started, finished];
+        }
+    }
+}
 pub struct Driver {
     engine: Engine<RingCrypto>,
     input: Vec<u8>,
@@ -119,6 +132,8 @@ pub struct Driver {
     exit_result: u64,
     reported_exit: bool,
     diagnostic_epoch: u64,
+    diagnostic_ingest: IngestTiming,
+    diagnostic_liveness_attempt_ns: u64,
 }
 impl Driver {
     /// Capture before teardown. Only public protocol metadata and a one-way
@@ -159,6 +174,7 @@ impl Driver {
         self.last_header = None;
         self.last_tx_kind = 0;
         self.reported_exit = false;
+        self.diagnostic_liveness_attempt_ns = 0;
     }
     pub fn new(
         boot: u64,
@@ -289,6 +305,8 @@ impl Driver {
             exit_result: 0,
             reported_exit: false,
             diagnostic_epoch: 0,
+            diagnostic_ingest: IngestTiming::default(),
+            diagnostic_liveness_attempt_ns: 0,
         };
         driver.recover_kernel_custody()?;
         Ok(driver)
@@ -421,6 +439,7 @@ impl Driver {
         }
     }
     pub fn ingest(&mut self, bytes: &[u8], now: u64) -> Result<usize, ()> {
+        self.diagnostic_ingest = IngestTiming::default();
         self.exit_origin = 2;
         self.exit_result = 0x4000;
         let result = self.ingest_inner(bytes, now);
@@ -450,7 +469,15 @@ impl Driver {
             self.exit_origin = 3;
             self.input.drain(..n);
             let was_ready = self.engine.ready();
-            self.handle(h, &body, now)?;
+            let handle_started = broker::clock_ns();
+            let handled = self.handle(h, &body, now);
+            let handle_finished = broker::clock_ns();
+            IngestTiming::observe(
+                &mut self.diagnostic_ingest.handle,
+                handle_started,
+                handle_finished,
+            );
+            handled?;
             // Completed leave deliberately closes kernel authority. Its trailing
             // closure traffic must not reestablish a session or renew liveness.
             if self.finished_leave {
@@ -458,9 +485,16 @@ impl Driver {
             }
             // Only a completely accepted RPC renews the existing live session.
             // EL1 samples its own fresh clock after any broker admission wait.
-            broker::request(OP_TASK, &[], &mut [], 0, [9, 3, self.kernel_epoch])
-                .map_err(|_| ())?;
-            self.last_rx = now;
+            let admission_started = broker::clock_ns();
+            let admitted = broker::request(OP_TASK, &[], &mut [], 0, [9, 3, self.kernel_epoch]);
+            let admission_finished = broker::clock_ns();
+            IngestTiming::observe(
+                &mut self.diagnostic_ingest.post_admission,
+                admission_started,
+                admission_finished,
+            );
+            admitted.map_err(|_| ())?;
+            self.last_rx = broker::clock_ns() / 1_000_000;
             if self.engine.ready() {
                 broker::request(OP_TASK, &[], &mut [], 0, [9, 2, self.kernel_epoch])
                     .map_err(|_| ())?;
@@ -1032,11 +1066,12 @@ impl Driver {
                 let (_, token) =
                     broker::request(OP_TASK, &reserve, &mut [], 0, [TASK_RESERVE_CUSTODY, 0, 0])
                         .map_err(|_| ())?;
+                let prepare_now = broker::clock_ns() / 1_000_000;
                 self.kernel_token = Some(token);
                 self.kernel_contract = Some(t.id);
                 if self
                     .engine
-                    .prepare(t, hash, self.reservation, now, 2000)
+                    .prepare(t, hash, self.reservation, prepare_now, 2000)
                     .is_err()
                 {
                     let _ = broker::request(OP_TASK, &[], &mut [], 0, [4, token, 0]);
@@ -1392,6 +1427,9 @@ impl Driver {
             return Err(());
         }
         if self.peer_boot != 0 && now.saturating_sub(self.last_status) >= 500 {
+            // This is an attempt, not proof of enqueue: status paging may
+            // retain its cursor while the bounded outbox is full.
+            self.diagnostic_liveness_attempt_ns = broker::clock_ns();
             if matches!(self.engine.member, Member::Standalone | Member::Confirmed)
                 && self.engine.proof.is_none()
             {
@@ -1434,6 +1472,12 @@ impl Driver {
         }
 
         Ok(())
+    }
+    pub(crate) fn take_ingest_timing(&mut self) -> IngestTiming {
+        core::mem::take(&mut self.diagnostic_ingest)
+    }
+    pub(crate) fn liveness_attempt_ns(&self) -> u64 {
+        self.diagnostic_liveness_attempt_ns
     }
     fn resume_closure(&mut self) -> Result<(), ()> {
         let received: Vec<_> = self

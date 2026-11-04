@@ -16,6 +16,7 @@ class TimerPreparationProjection(unittest.TestCase):
     def test_single_snapshot_projection_and_live_revalidation(self):
         platform = (ROOT / "kernel/src/domain_platform.rs").read_text()
         control = (ROOT / "kernel/src/domain_control.rs").read_text()
+        policy = (ROOT / "crates/prototype/src/policy.rs").read_text()
 
         start = platform.index("#[derive(Clone, Copy)]\npub(crate) struct TimerPreparation")
         end = platform.index("fn control_current(", start)
@@ -58,11 +59,23 @@ class TimerPreparationProjection(unittest.TestCase):
         registration = function(platform, "pub fn register_control(")
         self.assertIn("legal: control_legal", registration)
         self.assertIn("control_legal(action, key, now_ns())?", registration)
-        self.assertGreaterEqual(
-            control.count("self.scope.legal(f, d.action, d.envelope.target, now)?;"),
+        executor = control[control.index("impl<S: PublicationScope> policy::Executor"):]
+        check = executor[executor.index("    fn check("):executor.index("    fn prepare(")]
+        revalidate = executor[
+            executor.index("    fn revalidate("):executor.index("    fn publish(")
+        ]
+        self.assertEqual(
+            policy.count("self.validate(&plan"),
             2,
-            "CHECK/REVALIDATE no longer performs the live family legality check",
+            "Registry no longer performs live validation before and after prepare",
         )
+        self.assertIn(
+            "self.scope.legal(f, d.action, d.envelope.target, now)?;",
+            check,
+            "native Registry check lost the live family legality callback",
+        )
+        self.assertNotIn("self.scope.legal(", revalidate)
+        self.assertIn("strict superset of the old body here", revalidate)
 
 
 if __name__ == "__main__":

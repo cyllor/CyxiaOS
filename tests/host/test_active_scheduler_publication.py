@@ -24,15 +24,16 @@ def program():
   body+='\n'+'\n'.join(function(pub,s) for s in ['pub(crate) struct SpawnPublication','pub(crate) fn reserve_spawn_publication(','impl SpawnPublication'])
  code=code.replace('// SCHEDULER_PUBLICATION_BODY',body)
  control=(ROOT/'kernel/src/domain_control.rs').read_text();extra=(ROOT/'tests/host/active_selection_harness.rs').read_text()
- selection='\n'.join(function(control,x) for x in ['fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection('])
+ selection='\n'.join(function(control,x) for x in ['fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection(','fn validate_selection_at('])
  call='validate_selection(owner,family(),action,target,at)'
  if 'fn validate_selection_with(' in control:
   selection+='\n'+function(control,'fn validate_selection_with(')
+  selection+='\n'+function(control,'fn validate_selection_with_at(')
   call='validate_selection_with(owner,action,target,at,||{CURRENT_CALLS.fetch_add(1,Ordering::AcqRel);view.current(action.domain(),target)},|options,out|view.legal_options(options,target,at,out))'
  extra=extra.replace('// ACTUAL_SELECTION_BODIES',selection).replace('// BORROWED_SELECTION',call)
  code+='\n'+extra
  scope=(ROOT/'tests/host/active_scope_harness.rs').read_text().replace('// ACTUAL_ADMISSION_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/dependencies.rs'))+'] mod admission_view;')
- support='\n'.join(function(control,x) for x in ['fn require_control(','fn family_index(','pub fn admit_dependency(','fn bind_dependencies(','fn bind_dependency_list(','fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection(','fn validate_selection_with('])
+ support='\n'.join(function(control,x) for x in ['fn require_control(','fn family_index(','pub fn admit_dependency(','fn bind_dependencies(','fn bind_dependency_list(','fn locate(','fn locate_family(','fn tiers(','fn categorical(','fn validate_selection(','fn validate_selection_at(','fn validate_selection_with(','fn validate_selection_with_at('])
  scope=scope.replace('// ACTUAL_SCOPE_SUPPORT',support)
  active='\n'.join(function(control,x) for x in ['trait PublicationScope','impl PublicationScope for ActiveScope'])
  active="struct ActiveScope<'a>(&'a CommitGate);\n"+active

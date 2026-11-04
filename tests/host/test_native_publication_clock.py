@@ -30,6 +30,9 @@ class NativePublicationClock(unittest.TestCase):
         template = (ROOT / 'tests/host/native_publication_clock_harness.rs').read_text()
         template=template.replace('wall_deadline: u64, published:', 'job: u64, wall_deadline: u64, published:').replace('wall_deadline: 150_000_000,', 'job: 1, wall_deadline: 150_000_000,')
         template = template.replace('// NATIVE_CLOCK', function(source, 'impl policy::Clock for NativeClock'))
+        resolved = function(source, "impl<S: PublicationScope> Executor<'_, S>")
+        resolved = resolved.replace("impl<S: PublicationScope> Executor<'_, S>", 'impl Executor')
+        template = template.replace('// NATIVE_RESOLVED_SLOT', resolved)
         template=template.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
         template = template.replace('// NATIVE_PRECOMMIT', body)
         template+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'

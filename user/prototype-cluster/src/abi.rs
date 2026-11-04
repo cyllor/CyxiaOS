@@ -46,6 +46,10 @@ pub const OP_TRACE: u64 = 11;
 /// No key, challenge, request body or plaintext bytes are included.
 pub const TRACE_SESSION_EXIT: u64 = 0x24f;
 pub const SESSION_EXIT_WORDS: usize = 24;
+/// One post-terminal timing summary; numeric clocks only, no RPC or TLS bytes.
+/// Publication is diagnostic and grants no authority.
+pub const TRACE_RUNTIME_LOOP: u64 = 0x250;
+pub const RUNTIME_LOOP_WORDS: usize = 32;
 pub const OP_YIELD: u64 = 12;
 /// OP_TRACE arg0 distinguishes a terminal service failure from an ordinary event.
 /// This is a value convention; the shared page layout and ABI version are unchanged.

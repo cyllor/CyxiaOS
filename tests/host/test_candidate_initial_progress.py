@@ -139,6 +139,9 @@ class CandidatePublicationProgress(unittest.TestCase):
         publication=publication.replace('use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};',
             'use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};\nuse super::replay;')
         publication=publication.replace('// NATIVE_CLOCK',function(control,'impl policy::Clock for NativeClock'))
+        resolved=function(control,"impl<S: PublicationScope> Executor<'_, S>")
+        resolved=resolved.replace("impl<S: PublicationScope> Executor<'_, S>",'impl Executor')
+        publication=publication.replace('// NATIVE_RESOLVED_SLOT',resolved)
         publication=publication.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
         # Keep the real diagnostic call and its Job input. This Root bridge
         # does not begin a diagnostic row or prove publication-cost accounting.

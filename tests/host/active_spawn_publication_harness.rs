@@ -286,7 +286,7 @@ fn spawn_exact_native_shares_one_physical_owner_acquisition_and_real_receipt() {
             VALIDATIONS.load(Ordering::Acquire),
             CURRENTS.load(Ordering::Acquire)
         ),
-        (19, 4),
+        (14, 3),
         "publication omitted validation, tier checks or final current selection"
     );
     assert_eq!(EFFECTS.load(Ordering::Acquire), 1);
@@ -414,7 +414,7 @@ fn spawn_ineligible_callbacks_resolver_and_binder_keep_original_path() {
         assert_eq!(accept(&out, 10), Ok(1));
         assert_eq!(
             ACQUIRES.load(Ordering::Acquire),
-            11,
+            8,
             "ineligible native registration used a borrowed owner"
         );
         if mode < 3 {

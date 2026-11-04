@@ -35,7 +35,7 @@ def program():
     code = code.replace(function(code, 'fn require_control('), function(control, 'fn require_control('))
     for name in ['fn family_index(', 'fn locate(', 'fn bind_dependencies(', 'fn validate_selection(']:
         code = code.replace(function(code, name), function(control, name))
-    code += '\n' + '\n'.join(function(control, name) for name in ['fn locate_family(', 'fn tiers(', 'fn categorical(', 'fn validate_selection_with(', 'fn bind_dependency_list(', 'pub fn admit_dependency('])
+    code += '\n' + '\n'.join(function(control, name) for name in ['fn locate_family(', 'fn tiers(', 'fn categorical(', 'fn validate_selection_at(', 'fn validate_selection_with(', 'fn validate_selection_with_at(', 'fn bind_dependency_list(', 'pub fn admit_dependency('])
     code = code.replace(function(code, 'mod domain_tasks{'), '// TASKS')
     start = code.index('struct Gate;')
     end = code.index('pub mod core_replay', start)

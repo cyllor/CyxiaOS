@@ -83,6 +83,7 @@ OPTIONAL = {"CONTROL_SETTLEMENT_EVIDENCE": 512, "DYNAMIC_V13_EVIDENCE": 4096, "P
             "TRACE_PREPARATION_OWNER_EVIDENCE": 512,
             "NETWORK_PIECE_EVIDENCE": 512,
             "NETWORK_SETTLEMENT_EVIDENCE": 512,
+            "RUNTIME_LOOP_EVIDENCE": 512,
             "TASK_SLICE_EVIDENCE": 1024, "CONTROL_POOL_EVIDENCE": 128,
             "LEARNING_V13_EVIDENCE": 1024, "GOVERNANCE_V13_EVIDENCE": 128,
             "GOVERNANCE_RUNTIME_V13_EVIDENCE": 512,
@@ -92,6 +93,7 @@ OPTIONAL = {"CONTROL_SETTLEMENT_EVIDENCE": 512, "DYNAMIC_V13_EVIDENCE": 4096, "P
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
+            "DOMAIN_PREPARATION_SKIP_EVIDENCE": 2048,
             "DOMAIN_PUBLICATION_COST": 1024, "TRACE_SOURCE_EVIDENCE": 1024,
             "DOMAIN_SERVICE_DETAIL": 128, "BUILTIN_TASK_DETAIL": 256,
             "DOMAIN_PREPARATION_PREFIX_DETAIL": 128,
@@ -645,6 +647,66 @@ def parse_preparation_rejections(data):
     return {"total": total, "overwritten": w[2], "retained": retained}
 
 
+def parse_preparation_skips(data):
+    """Decode cumulative early-exit reasons; rows never attest admission."""
+    w = words(data, 256)
+    require(w[:8] == (0x435950534B495031, 1, 13, 18, 16, 16, 0, 0),
+            "invalid preparation skip layout")
+    reason_names = (
+        "TargetAbsent", "CanaryBlocked", "ReplayBlocked", "ReplayFirstRetry",
+        "ModelGateBlocked", "SpecialPreparationUnavailable", "CurrentUnavailable",
+        "ObservationUnavailable", "ReplacementBlocked", "DependencyUnavailable",
+        "LegalOptionsUnavailable", "CurrentIllegal", "ActionReplayFiltered",
+        "ActionStabilityFiltered", "TargetFeaturesUnavailable", "NoCandidate",
+    )
+    error_names = (
+        "Format", "Auth", "Schema", "Stale", "Capacity", "Budget", "Conflict",
+        "Expired", "Unsupported", "Busy", "Again", "NotFound", "Exists",
+        "NotDirectory", "IsDirectory", "NotEmpty", "Range", "Io", "Overflow",
+        "NotReady",
+    )
+    rows = []
+    in_progress = []
+    for family_index in range(18):
+        row = w[8 + family_index * 13:8 + (family_index + 1) * 13]
+        publication = row[0]
+        if publication == 0:
+            require(not any(row[1:]), "unpublished preparation skip row is nonzero")
+            continue
+        if publication & 1:
+            in_progress.append(family_index)
+            continue
+        domain, kind, total, last_reason, last_error = row[1:6]
+        expected = ((1, 1) if family_index == 0 else
+                    (1, 2) if family_index == 1 else
+                    (16, 2) if family_index == 17 else
+                    (family_index, 1))
+        require((domain, kind) == expected, "invalid preparation skip family")
+        require(total > 0 and publication == 2 * total,
+                "invalid preparation skip publication")
+        require(1 <= last_reason <= len(reason_names)
+                and 0 <= last_error <= len(error_names),
+                "invalid preparation skip reason")
+        counters = []
+        for packed in row[9:13]:
+            counters.extend((packed >> shift) & 0xffff for shift in (0, 16, 32, 48))
+        require(sum(counters) <= total and counters[last_reason - 1] > 0,
+                "invalid preparation skip counters")
+        rows.append({
+            "family_index": family_index,
+            "family": [domain, kind],
+            "publication": publication,
+            "total": total,
+            "last_reason": reason_names[last_reason - 1],
+            "last_error": error_names[last_error - 1] if last_error else None,
+            "target": list(row[6:8]),
+            "wall_started": row[8],
+            "reasons": {name: count for name, count in zip(reason_names, counters) if count},
+        })
+    return {"capacity": 18, "reason_capacity": 16, "rows": rows,
+            "in_progress": in_progress}
+
+
 def diagnostics(guest, bundle, *, require_governance_runtime=False):
     # Every field belongs to this stopped snapshot. One failed parser must
     # neither hide another fresh diagnostic nor retain an older healthy value.
@@ -687,6 +749,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                                     ("TRACE_PREPARATION_OWNER_EVIDENCE", "trace_preparation_owner_evidence", 64),
                                     ("NETWORK_PIECE_EVIDENCE", "network_piece_evidence", 64),
                                     ("NETWORK_SETTLEMENT_EVIDENCE", "network_settlement_evidence", 64),
+                                    ("RUNTIME_LOOP_EVIDENCE", "runtime_loop_evidence", 64),
                                     ("DOMAIN_PREPARATION_EVIDENCE", "preparation_evidence", 16),
                                     ("DOMAIN_PREPARATION_DETAIL", "preparation_detail", 32),
                                     ("DOMAIN_PREPARATION_PREFIX_DETAIL", "preparation_prefix_detail", 16),
@@ -695,6 +758,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                                     ("DOMAIN_SERVICE_DETAIL", "service_detail", 16),
                                     ("BUILTIN_TASK_DETAIL", "builtin_detail", 32),
                                     ("DOMAIN_PREPARATION_REJECTIONS", "preparation_rejections", 648),
+                                    ("DOMAIN_PREPARATION_SKIP_EVIDENCE", "preparation_skip_evidence", 256),
                                     ("TASK_OVERRUN_EVIDENCE", "overrun_evidence", 32),
                                     ("SMP_FAULT_EVIDENCE", "smp_fault_evidence", 72),
                                     ("CONTROL_CREDIT_EVIDENCE", "control_credit_evidence", 64),
@@ -716,6 +780,16 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
         guest[key] = None
         if symbol_name in bundle:
             read(key, lambda: list(words(bundle[symbol_name], count)))
+    if "RUNTIME_LOOP_EVIDENCE" in bundle:
+        def runtime_loop():
+            try:
+                from .decode_runtime_loop import decode_runtime_loop
+            except ImportError:
+                from decode_runtime_loop import decode_runtime_loop
+            return decode_runtime_loop(bundle["RUNTIME_LOOP_EVIDENCE"])
+        read("runtime_loop", runtime_loop)
+    else:
+        guest["runtime_loop"] = None
     def credit_detail():
         task_words = guest.get("task_evidence") or []
         sticky_words = guest.get("overrun_evidence") or []
@@ -760,6 +834,7 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
     for symbol_name, key, parser in (("CONTROL_SETTLEMENT_EVIDENCE", "control_settlements", parse_control_settlements),
                                      ("CONTROL_CREDIT_EVIDENCE", "control_credit", parse_control_credit),
                                      ("DOMAIN_PREPARATION_REJECTIONS", "rejected_preparations", parse_preparation_rejections),
+                                     ("DOMAIN_PREPARATION_SKIP_EVIDENCE", "preparation_skips", parse_preparation_skips),
                                      ("RUNTIME_V13_EVIDENCE", "runtime", parse_runtime),
                                      ("DOMAIN_TASK_EVIDENCE", "tasks", parse_tasks),
                                      ("IPI_EVIDENCE", "ipi", parse_ipi),
@@ -1384,8 +1459,9 @@ def retained_observation(guest):
                                    "trace_drain_work_evidence", "trace_drain_task_evidence",
                                    "trace_preparation_root_evidence", "trace_preparation_owner_evidence",
                                    "network_piece_evidence", "network_settlement_evidence",
+                                   "runtime_loop", "runtime_loop_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
-                                   "control_credit", "control_credit_evidence", "control_settlement_evidence", "control_settlements", "preparation_evidence", "preparation_detail", "preparation_prefix_detail", "preparation_entry_detail", "preparation_context", "preparation_rejections", "rejected_preparations",
+                                   "control_credit", "control_credit_evidence", "control_settlement_evidence", "control_settlements", "preparation_evidence", "preparation_detail", "preparation_prefix_detail", "preparation_entry_detail", "preparation_context", "preparation_rejections", "rejected_preparations", "preparation_skip_evidence", "preparation_skips",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "governance", "governance_evidence", "governance_runtime", "governance_runtime_evidence", "replay", "replay_evidence",
                                    "replay_root_evidence", "replay_owner_evidence",
                                    "replay_config_evidence", "replay_capture_evidence",

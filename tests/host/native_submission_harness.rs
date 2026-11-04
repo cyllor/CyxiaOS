@@ -19,6 +19,7 @@ struct Owner{context:Context,families:[Option<Family>;1],prepared:[usize;16],pre
 fn require_control(_:&Owner)->Result<(),Error>{Ok(())} // Protected-role boundary.
 fn family_index(_:u16,_:u16)->Result<usize,Error>{Ok(0)}
 fn locate(_:&Owner,_:Action,_:ObjectKey)->Option<usize>{Some(0)}
+fn located_slot_matches(_:&Owner,slot:usize,_:Action,_:ObjectKey)->bool{slot==0}
 fn bind_dependencies(_:&Owner,_:Action,_:ObjectKey,_:u64)->Result<[Option<BoundDependency>;2],Error>{Ok([None;2])}
 fn validate_selection(_:&Owner,_:Family,_:Action,_:ObjectKey,_:u64)->Result<(),Error>{Ok(())}
 // REPLACEMENT_PREDICATE
@@ -29,7 +30,7 @@ impl PublicationScope for Scope{
  fn legal(&self,_:Family,_:Action,_:ObjectKey,_:u64)->Result<(),Error>{if MODE.load(Ordering::Acquire)==1{Err(Error::Busy)}else{Ok(())}}
  fn dependencies(&self,_:&Owner,_:Action,_:ObjectKey,_:u64)->Result<[Option<BoundDependency>;2],Error>{if MODE.load(Ordering::Acquire)==6{Err(Error::Busy)}else{Ok([None;2])}}
  fn selection(&self,_:&Owner,_:Family,_:Action,_:ObjectKey,_:u64)->Result<(),Error>{let n=SELECTIONS.fetch_add(1,Ordering::AcqRel)+1;
-  match MODE.load(Ordering::Acquire){2=>return Err(Error::Busy),7 if n==4=>{CPU.fetch_add(500001,Ordering::AcqRel);},8 if n==3=>{CPU.fetch_add(500001,Ordering::AcqRel);},_=>()};Ok(())}
+  match MODE.load(Ordering::Acquire){2=>return Err(Error::Busy),7 if n==3=>{CPU.fetch_add(500001,Ordering::AcqRel);},8 if n==2=>{CPU.fetch_add(500001,Ordering::AcqRel);},_=>()};Ok(())}
  fn commit(&mut self,_:&Owner,_:ModelBinding,_:&Plan,_:&[PolicyStamp],_:u64,_:u64)->Result<(),Error>{if MODE.load(Ordering::Acquire)==4{Err(Error::Busy)}else{Ok(())}}
 }
 // NATIVE_EXECUTOR
@@ -42,6 +43,7 @@ fn setup(mode:u64)->(policy::Registry,Vec<u8>,Owner){MODE.store(mode,Ordering::R
 fn run(mode:u64)->(policy::PlanReceipt,[u64;27],u64,bool){let(mut registry,wire,mut owner)=setup(mode);
  let start=policy::PublicationTime{wall_ns:10,cpu:policy::CpuTime{cpu:1,ns:0}};
  let mut executor=Executor{owner:&mut owner,scope:Scope,model:binding(),evidence:Some(0),job:1,boot:11,publication_started:start,publication_debit:policy::CpuTime{cpu:1,ns:0},wall_deadline:50_000_010,dependencies:[None;2],scores:[0;32],score_count:4,
+ resolved_slots:[0;16],resolved_count:0,
  // FACTS_INITIALIZER
  };
  let receipt=registry.submit_job(publisher(),&wire,start,50_000_010,&mut NativeClock,&mut executor).unwrap();let facts=get_facts(&executor);
@@ -60,5 +62,5 @@ fn run(mode:u64)->(policy::PlanReceipt,[u64;27],u64,bool){let(mut registry,wire,
 }
 #[test]fn native_submission_does_not_blame_successful_callback_for_registry_cpu_failure(){
  let(r,w,reads,stopped)=run(8);assert_eq!(r.state(),ExecutionState::Failed(Error::Budget));assert!(stopped);assert_eq!(reads,4);
- assert_eq!(w[0],0x43595355424d0001,"native completion lost original submission provenance");assert_eq!((w[7],w[9],w[14],w[15],w[16],w[17]),(9,Error::Budget as u64+1,6,7,2,0));assert_eq!(w[19],1);assert_eq!(EFFECTS.load(Ordering::Acquire),0);
+ assert_eq!(w[0],0x43595355424d0001,"native completion lost original submission provenance");assert_eq!((w[7],w[9],w[14],w[15],w[16],w[17]),(9,Error::Budget as u64+1,6,1,2,0));assert_eq!(w[19],1);assert_eq!(EFFECTS.load(Ordering::Acquire),0);
 }

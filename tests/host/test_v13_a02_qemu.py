@@ -28,7 +28,7 @@ class NativeQemuTests(unittest.TestCase):
     def test_patched_capture_is_rechecked_not_trusted_from_recorded_boolean(self):
         with patch('verify_unified.attest_qemu', return_value=self.identity) as check:
             verify_native_qemu(self.tools, self.binary, qemu_source=self.root)
-        check.assert_called_once_with(self.built, self.root)
+        check.assert_called_once_with(self.built.resolve(), self.root.resolve())
 
     def test_missing_flag_source_or_absolute_path_is_rejected(self):
         for field, value in [('qemu_pmu_patch_attested', False),
