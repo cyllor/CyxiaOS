@@ -58,6 +58,22 @@ class RuntimeLoopDecoder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'liveness attempt'):
             decode_runtime_loop(bytes(data))
 
+    def test_rejects_evidence_the_kernel_would_not_publish(self):
+        # The native producer rejects invalid exit reasons; its seqlock
+        # advances by two for each retained report and never writes tail words.
+        mutations = (
+            (3, 7, 'report sequence'),
+            (8 + 29, 0, 'exit reason'),
+            (8 + 29, 17, 'exit reason'),
+            (40, 1, 'reserved tail'),
+        )
+        for word_index, value, error in mutations:
+            with self.subTest(word_index=word_index, value=value):
+                data = bytearray(self.snapshot())
+                struct.pack_into('<Q', data, word_index * 8, value)
+                with self.assertRaisesRegex(ValueError, error):
+                    decode_runtime_loop(bytes(data))
+
     def test_terminal_publication_follows_authority_and_socket_teardown(self):
         source = (Path(__file__).parents[1] /
                   'user/prototype-cluster/src/runtime.rs').read_text()
