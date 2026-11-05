@@ -3,6 +3,9 @@ on:
   push:
     branches:
       - debug/v0.14-runtime-loop-verifier
+  pull_request:
+    branches:
+      - CyxiaOS-V0.14
   workflow_dispatch:
 
 permissions:
