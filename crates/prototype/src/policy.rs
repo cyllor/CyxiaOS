@@ -1329,14 +1329,14 @@ impl Registry {
         let old_decision = plan
             .iter()
             .any(|d| d.envelope.decision_seq <= self.decision_high);
-        if old_plan || old_decision {
-            if let Some(old) = self.records().find(|r| r.receipt.id == id) {
-                return if old.digest == digest {
-                    Ok(old.receipt)
-                } else {
-                    Err(Error::Conflict)
-                };
-            }
+        if (old_plan || old_decision)
+            && let Some(old) = self.records().find(|r| r.receipt.id == id)
+        {
+            return if old.digest == digest {
+                Ok(old.receipt)
+            } else {
+                Err(Error::Conflict)
+            };
         }
         if self.optimization_stopped {
             executor.authorize_recovery(self.model, &plan, started_ns.wall_ns)?;
