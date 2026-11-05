@@ -608,6 +608,53 @@ fn duplicate_identity_cannot_change_payload_or_release_unknown() {
     );
 }
 #[test]
+fn unknown_apply_cannot_be_downgraded_by_delayed_pending_report() {
+    let (mut registry, set, mut owner) = ready();
+    let bytes = frame(&set, 1, 0);
+    let published = registry
+        .submit(publisher(), &bytes, &mut clock(), &mut owner)
+        .unwrap();
+    let apply = ApplyId {
+        boot_epoch: published.id.boot_epoch,
+        controller_epoch: published.id.controller_epoch,
+        plan_seq: published.id.plan_seq,
+        action_index: 0,
+        target: set.target,
+    };
+    let unknown = registry
+        .reconcile(apply, published.version, ExecutionState::Unknown)
+        .unwrap();
+    assert_eq!(unknown.state(), ExecutionState::Unknown);
+
+    // A delayed initial callback must not erase an unresolved physical effect.
+    // The retained identity remains queryable and a retried plan never prepares
+    // or publishes a second operation while its original APPLY is UNKNOWN.
+    assert_eq!(
+        registry.reconcile(apply, published.version, ExecutionState::Pending),
+        Err(Error::Conflict)
+    );
+    assert_eq!(registry.query(publisher(), published.id), Ok(unknown));
+    assert_eq!(
+        registry.submit(publisher(), &bytes, &mut clock(), &mut owner),
+        Ok(unknown)
+    );
+    assert_eq!((owner.prepares, owner.publishes), (1, 1));
+    assert_eq!(
+        registry.reconcile(apply, published.version, ExecutionState::Unknown),
+        Ok(unknown)
+    );
+
+    let applied = registry
+        .reconcile(apply, published.version, ExecutionState::Applied)
+        .unwrap();
+    assert_eq!(applied.state(), ExecutionState::Applied);
+    assert_eq!(
+        registry.reconcile(apply, published.version, ExecutionState::Unknown),
+        Err(Error::Conflict)
+    );
+}
+
+#[test]
 fn fresh_plan_cannot_reuse_a_retained_decision_sequence() {
     let (mut registry, set, mut owner) = ready();
     registry
