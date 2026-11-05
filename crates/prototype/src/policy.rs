@@ -1134,7 +1134,13 @@ impl Registry {
         {
             return Err(Error::Stale);
         }
-        if r.receipt.actions[i].terminal() && r.receipt.actions[i] != state {
+        let recorded = r.receipt.actions[i];
+        // UNKNOWN records an unresolved side effect, not an empty queue slot.
+        // A late PENDING callback cannot erase that uncertainty and reopen
+        // admission or allow a replacement APPLY to run ahead of reconciliation.
+        if (recorded.terminal() && recorded != state)
+            || (recorded == ExecutionState::Unknown && state == ExecutionState::Pending)
+        {
             return Err(Error::Conflict);
         }
         r.receipt.actions[i] = state;
