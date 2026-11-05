@@ -19,8 +19,10 @@ def decode_runtime_loop(data):
     require(words[0] > 0 and words[0] % 2 == 0, 'runtime-loop publication is incomplete')
     require(words[1] == MAGIC and words[2] == 1 and words[3] > 0,
             'invalid runtime-loop header')
+    require(words[0] == 2 * words[3], 'invalid runtime-loop report sequence')
     require(words[4] > 0 and words[5] > 0 and words[6] > 0 and words[7] == 0,
             'invalid runtime-loop identity')
+    require(not any(words[40:]), 'nonzero runtime-loop reserved tail')
     r = words[8:40]
     require(r[0] == 1 and r[1] == words[6] and r[2] > 0 and r[31] == 0,
             'invalid runtime-loop record')
@@ -34,6 +36,7 @@ def decode_runtime_loop(data):
         return {'duration_ns': duration, 'started_ns': started, 'finished_ns': finished}
 
     require(0 < r[3] <= r[4] <= r[5] <= r[28], 'invalid runtime-loop bounds')
+    require(1 <= r[29] <= 16, 'invalid runtime-loop exit reason')
     loop_gap = interval('loop_gap', 6)
     segments = {
         name: interval(name, offset) for name, offset in (
