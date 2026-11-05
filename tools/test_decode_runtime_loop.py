@@ -58,6 +58,18 @@ class RuntimeLoopDecoder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'liveness attempt'):
             decode_runtime_loop(bytes(data))
 
+    def test_rejects_invalid_exit_reason_report_count_and_reserved_tail(self):
+        for word, value, message in (
+            (8 + 29, 17, 'exit reason'),
+            (0, 18, 'publication/report count'),
+            (40, 1, 'reserved tail'),
+        ):
+            with self.subTest(word=word):
+                data = bytearray(self.snapshot())
+                struct.pack_into('<Q', data, word * 8, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    decode_runtime_loop(bytes(data))
+
     def test_terminal_publication_follows_authority_and_socket_teardown(self):
         source = (Path(__file__).parents[1] /
                   'user/prototype-cluster/src/runtime.rs').read_text()
