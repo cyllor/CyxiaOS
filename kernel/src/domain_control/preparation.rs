@@ -5,6 +5,17 @@ use cyxia_prototype::{
     policy::{ModelBinding, Snapshot},
 };
 
+/// Normal evaluations and carried retries share the 2 ms decision CPU bound.
+pub const DECISION_CPU_LIMIT_NS: u64 = 2_000_000;
+
+pub fn check_decision_cpu(elapsed_ns: u64) -> Result<(), Error> {
+    if elapsed_ns > DECISION_CPU_LIMIT_NS {
+        Err(Error::Budget)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     pub boot: u64,
@@ -62,7 +73,7 @@ impl Pending {
         if self.overflowed {
             return Err(Error::Overflow);
         }
-        if self.spent_ns > 2_000_000 {
+        if self.spent_ns > DECISION_CPU_LIMIT_NS {
             return Err(Error::Budget);
         }
         if at < self.snapshot.taken_ns || at - self.snapshot.taken_ns > 50_000_000 {
@@ -79,7 +90,7 @@ impl Pending {
             return Err(Error::Overflow);
         };
         self.spent_ns = total;
-        if total > 2_000_000 {
+        if total > DECISION_CPU_LIMIT_NS {
             Err(Error::Budget)
         } else {
             Ok(())
@@ -97,7 +108,7 @@ impl Pending {
     pub fn total(&self, identity: Identity, at: u64, elapsed_ns: u64) -> Result<u64, Error> {
         self.check(identity, at)?;
         let total = self.carried(identity, elapsed_ns)?;
-        if total > 2_000_000 {
+        if total > DECISION_CPU_LIMIT_NS {
             Err(Error::Budget)
         } else {
             Ok(total)
@@ -228,5 +239,48 @@ pub fn next_sequence(previous: u64, identity: Identity) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Stale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_hash_decision_boundary_is_not_the_enclosing_control_credit() {
+        assert!(check_decision_cpu(DECISION_CPU_LIMIT_NS).is_ok());
+        assert!(matches!(
+            check_decision_cpu(DECISION_CPU_LIMIT_NS + 1),
+            Err(Error::Budget)
+        ));
+    }
+
+    #[test]
+    fn carried_retry_is_charged_before_the_hash_tail() {
+        let identity = Identity {
+            boot: 1,
+            controller: 1,
+            sequence: 1,
+            domain: 7,
+            kind: 1,
+            target: ObjectKey::default(),
+            model: ModelBinding::default(),
+            core_generation: 1,
+            ledger_generation: 1,
+            work: None,
+        };
+        let snapshot = Snapshot {
+            sequence: 1,
+            taken_ns: 1,
+            core_generation: 1,
+            ledger_generation: 1,
+        };
+        let mut pending = Pending::new(identity, snapshot, 7, 0);
+        pending.charge(1_000_000).unwrap();
+        assert!(pending.total(identity, 2, 1_000_000).is_ok());
+        assert!(matches!(
+            pending.total(identity, 2, 1_000_001),
+            Err(Error::Budget)
+        ));
     }
 }
