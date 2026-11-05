@@ -13,10 +13,11 @@ from pathlib import Path
 import re
 import struct
 from verify_smp import require, sha
+from check_prototype_evidence import _pairs, read_json
 
 
 def trace_encoding(directory):
-    encoding = json.loads((directory/'start.json').read_text()).get('trace_encoding', 'raw')
+    encoding = read_json(directory/'start.json').get('trace_encoding', 'raw')
     require(encoding in ('raw', 'gzip'), 'unknown raw trace encoding')
     return encoding
 
@@ -31,12 +32,23 @@ def event_bytes(directory):
     return data
 
 
+def decode_events(raw: bytes):
+    # Original bytes are separately hash-bound; strict parsing ensures that
+    # two verifiers cannot disagree on the same duplicate-key/nonfinite row.
+    require(raw and raw.endswith(b'\n'), 'invalid fault JSONL framing')
+    def reject_constant(value):
+        raise ValueError('nonfinite fault event number: ' + value)
+    return [json.loads(line, object_pairs_hook=_pairs,
+                       parse_constant=reject_constant)
+            for line in raw.splitlines()]
+
+
 def read_events(directory):
-    return [json.loads(line) for line in event_bytes(directory).splitlines()]
+    return decode_events(event_bytes(directory))
 
 
 def inspect(initial: Path, final: Path, directory: Path) -> dict:
-    start = json.loads((directory/'start.json').read_text())
+    start = read_json(directory/'start.json')
     version = start['version']
     require(type(version) is int and version in (1, 2)
             and start['size'] == initial.stat().st_size == final.stat().st_size,
@@ -62,7 +74,7 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
     raw_path = directory/('requests.bin.gz' if compressed else 'requests.bin')
     require(raw_path.stat().st_size <= 128*1024*1024, 'fault trace budget')
     events = event_bytes(directory)
-    rows = [json.loads(line) for line in events.splitlines()]
+    rows = decode_events(events)
     wire_hash = hashlib.sha256()
     pending, stable, requests = {}, {}, {}
     pending_version, durable_version = {}, {}
@@ -201,7 +213,7 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
         capture = directory/'capture.json'
         require(not compressed or capture.is_file(), 'compressed capture has no raw byte binding')
         if capture.is_file():
-            require(json.loads(capture.read_text()) == dict(version=1,
+            require(read_json(capture) == dict(version=1,
                 events_raw_sha256=hashlib.sha256(events).hexdigest(), requests_raw_sha256=wire_hash.hexdigest()),
                 'raw capture digest mismatch')
         require((cut is not None) == (start['cut'] != 0), 'requested power cut was not captured')
