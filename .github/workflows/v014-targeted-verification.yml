@@ -1,0 +1,29 @@
+name: V0.14 targeted debug verification
+on:
+  push:
+    branches:
+      - debug/v0.14-native-prehash-budget
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Run source-bound regression
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          python3 -B -m unittest discover -s tests/host -p 'test_prehash_decision_budget.py' -v
+          git diff --exit-code
+      - name: Record exact source identity
+        if: always()
+        run: git rev-parse HEAD
