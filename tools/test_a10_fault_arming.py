@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 
-from check_v13_fault_disk import inspect, read_events
+from check_v13_fault_disk import decode_events, inspect, read_events
 from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
 from v13_fault_disk import Backend, receive
 
@@ -274,6 +274,12 @@ class FaultArming(unittest.TestCase):
 
 
 class ArmingEvidence(unittest.TestCase):
+    def test_independent_replay_rejects_non_object_and_truncated_events(self):
+        for row in (b'null\n', b'[]\n', b'\"text\"\n', b'12\n', b'{}'):
+            with self.subTest(row=row), self.assertRaisesRegex(ValueError,
+                    'fault event row must be a JSON object|invalid fault JSONL framing'):
+                decode_events(row)
+
     def rewrite(self, case, rows):
         path = case.root / 'nbd' / 'events.jsonl'
         raw = ''.join(json.dumps(row, separators=(',', ':'))+'\n' for row in rows).encode()
