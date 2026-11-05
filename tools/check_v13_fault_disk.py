@@ -38,9 +38,16 @@ def decode_events(raw: bytes):
     require(raw and raw.endswith(b'\n'), 'invalid fault JSONL framing')
     def reject_constant(value):
         raise ValueError('nonfinite fault event number: ' + value)
-    return [json.loads(line, object_pairs_hook=_pairs,
-                       parse_constant=reject_constant)
-            for line in raw.splitlines()]
+    result = []
+    # Keep independent replay within the same bounded row budget as the scope
+    # verifier, even when an attacker supplies millions of tiny valid JSON rows.
+    for line in raw.splitlines():
+        require(len(result) < 1_000_000, 'fault event row budget exceeded')
+        row = json.loads(line, object_pairs_hook=_pairs,
+                         parse_constant=reject_constant)
+        require(type(row) is dict, 'fault event row must be a JSON object')
+        result.append(row)
+    return result
 
 
 def read_events(directory):
