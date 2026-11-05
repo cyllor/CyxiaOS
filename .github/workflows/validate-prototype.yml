@@ -1,8 +1,6 @@
 name: Validate prototype branches
 
 on:
-  pull_request:
-    branches: [CyxiaOS-V0.14]
   push:
     branches:
       - CyxiaOS-V0.12
@@ -12,6 +10,8 @@ on:
       - 'codex/v011-*'
       - 'codex/v012-complete-*'
       - 'codex/v012-governance-*'
+  pull_request:
+    branches: [CyxiaOS-V0.14]
   workflow_dispatch:
 
 permissions:
