@@ -44,7 +44,8 @@ LANES = {
                  'domain_stability', 'spawn_reservation', 'task_receipt_expiry'),
         'python': (('tools', 'test_v13_a_reporting.py'),
                    ('tools', 'test_v14_workstreams.py'),
-                   ('tools', 'test_v14_source_seal.py')),
+                   ('tools', 'test_v14_source_seal.py'),
+                   ('tests/host', 'test_prototype_validation_lanes.py')),
     },
     'W4': {
         'ids': ('A10',), 'issue': 14,
