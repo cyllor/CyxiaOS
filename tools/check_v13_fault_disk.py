@@ -38,14 +38,29 @@ def decode_events(raw: bytes):
     require(raw and raw.endswith(b'\n'), 'invalid fault JSONL framing')
     def reject_constant(value):
         raise ValueError('nonfinite fault event number: ' + value)
+    def reject_float(value):
+        raise ValueError('non-integer fault event number: ' + value)
+    integer_fields = frozenset(('monotonic_ns', 'option', 'id', 'kind', 'handle',
+        'offset', 'length', 'mutation', 'raw_mutation', 'wire_offset', 'requests',
+        'raw_mutations', 'acks', 'flushes', 'pending_sectors', 'discarded_sectors'))
     result = []
     # Keep independent replay within the same bounded row budget as the scope
     # verifier, even when an attacker supplies millions of tiny valid JSON rows.
     for line in raw.splitlines():
         require(len(result) < 1_000_000, 'fault event row budget exceeded')
         row = json.loads(line, object_pairs_hook=_pairs,
-                         parse_constant=reject_constant)
+                         parse_constant=reject_constant, parse_float=reject_float)
         require(type(row) is dict, 'fault event row must be a JSON object')
+        # Python equates True with 1 (and 1.0); neither is an integer wire ID.
+        # Validate before dictionary/set lookups can alias an existing request.
+        for field in integer_fields.intersection(row):
+            require(type(row[field]) is int and row[field] >= 0,
+                    'invalid fault integer field: ' + field)
+        if 'surviving_offsets' in row:
+            require(type(row['surviving_offsets']) is list
+                    and all(type(offset) is int and offset >= 0
+                            for offset in row['surviving_offsets']),
+                    'invalid fault surviving offsets')
         result.append(row)
     return result
 
@@ -58,11 +73,14 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
     start = read_json(directory/'start.json')
     version = start['version']
     require(type(version) is int and version in (1, 2)
+            and type(start['size']) is int
             and start['size'] == initial.stat().st_size == final.stat().st_size,
             'fault trace format/size mismatch')
     require(start['disk_initial_sha256'] == sha(initial), 'fault trace starting image mismatch')
     require(start['phase'] in ('before', 'after-ack') and start['unflushed'] in ('drop', 'reverse-half')
-            and type(start['cut']) is int and start['cut'] >= 0 and start['max_pending_sectors'] == 32768,
+            and type(start['cut']) is int and start['cut'] >= 0
+            and type(start['max_pending_sectors']) is int
+            and start['max_pending_sectors'] == 32768,
             'invalid fault configuration')
     event_clock = start.get('event_clock')
     require(event_clock in (None, 'host-monotonic-ns-v1'), 'invalid fault event clock')
@@ -220,7 +238,9 @@ def inspect(initial: Path, final: Path, directory: Path) -> dict:
         capture = directory/'capture.json'
         require(not compressed or capture.is_file(), 'compressed capture has no raw byte binding')
         if capture.is_file():
-            require(read_json(capture) == dict(version=1,
+            binding = read_json(capture)
+            require(type(binding) is dict and type(binding.get('version')) is int
+                    and binding == dict(version=1,
                 events_raw_sha256=hashlib.sha256(events).hexdigest(), requests_raw_sha256=wire_hash.hexdigest()),
                 'raw capture digest mismatch')
         require((cut is not None) == (start['cut'] != 0), 'requested power cut was not captured')

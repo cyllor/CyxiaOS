@@ -22,7 +22,8 @@ LANES = {
         'rust': ('boot', 'boot_fault_matrix', 'boot_model', 'cores',
                  'native_core_replay', 'native_irq_replay', 'native_irq_sources'),
         'python': (('tools', 'test_verify_v13_boot_cpus.py'),
-                   ('tools', 'test_verify_v13_boot_receipt.py')),
+                   ('tools', 'test_verify_v13_boot_receipt.py'),
+                   ('tools', 'test_v14_native_workflow.py')),
     },
     'W2': {
         'ids': ('A05', 'A08'), 'issue': 12,
@@ -42,14 +43,16 @@ LANES = {
                  'domain_maintenance', 'domain_ipc_grants', 'domain_tasks',
                  'domain_stability', 'spawn_reservation', 'task_receipt_expiry'),
         'python': (('tools', 'test_v13_a_reporting.py'),
-                   ('tools', 'test_v14_workstreams.py')),
+                   ('tools', 'test_v14_workstreams.py'),
+                   ('tools', 'test_v14_source_seal.py')),
     },
     'W4': {
         'ids': ('A10',), 'issue': 14,
         'rust': ('journal', 'storage', 'domain_storage', 'native_storage_replay',
                  'native_file_diagnostics'),
         'python': (('tools', 'test_a10_fault_arming.py'),
-                   ('tools', 'test_verify_v13_a10_matrix.py')),
+                   ('tools', 'test_verify_v13_a10_matrix.py'),
+                   ('tools', 'test_v14_fault_numbers.py')),
     },
     'W5': {
         'ids': ('A12', 'A13', 'A14'), 'issue': 15,
@@ -71,7 +74,7 @@ LANES = {
                  'learning_review_governance', 'learning_score_worker',
                  'native_canary_console_baseline', 'native_canary_measurements',
                  'native_canary_publication_clock', 'native_learning_receipt',
-                 'model_bank'),
+                 'model_bank', 'learning_governance_faults'),
         'python': (),
     },
 }
@@ -117,8 +120,8 @@ def source_identity(root: Path = ROOT) -> dict:
     def git(*args):
         return subprocess.check_output(['git', *args], cwd=root, text=True).strip()
     commit, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
-    if git('status', '--porcelain', '--untracked-files=no'):
-        raise ValueError('tracked source must be clean for exact-source evidence')
+    if git('status', '--porcelain', '--untracked-files=all'):
+        raise ValueError('source must be clean, including untracked files, for exact-source evidence')
     return {'commit': commit, 'tree': tree, 'tracked_dirty': False}
 
 
@@ -130,7 +133,8 @@ def run_lane(lane: str, output: Path) -> int:
     report = {'schema_version': 1, 'scope': 'component-workstream-validation',
               'lane': lane, 'issue': LANES[lane]['issue'],
               'requirements': list(LANES[lane]['ids']), 'source': source,
-              'status': 'RUNNING', 'native_execution_attempted': False,
+              'status': 'RUNNING', 'source_verified_after_checks': False,
+              'native_execution_attempted': False,
               'native_acceptance_status': 'NOT_RUN',
               'release_acceptance_verified': False, 'log_sha256': {}}
 
@@ -146,9 +150,14 @@ def run_lane(lane: str, output: Path) -> int:
                     all(row['name'] == name and row['argv'] == argv and
                         row['status'] == 'PASS' and row['returncode'] == 0
                         for row, (name, argv) in zip(rows, steps)))
-        report['status'] = 'PASS' if code == 0 and complete else 'FAIL'
         for path in sorted((output / 'checks').glob('*.log')):
             report['log_sha256'][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        after = source_identity()
+        report['source_after_checks'] = after
+        if after != source:
+            raise ValueError('source identity changed during component checks')
+        report['source_verified_after_checks'] = True
+        report['status'] = 'PASS' if code == 0 and complete else 'FAIL'
         save()
         return code if code else int(not complete)
     except BaseException as error:

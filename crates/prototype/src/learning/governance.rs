@@ -156,10 +156,13 @@ impl ExtraBudget {
     }
     pub fn record_mandatory(&mut self, now: u64, actual_ns: u64) -> Result<(), Error> {
         self.at(now)?;
-        self.mandatory = self
-            .mandatory
-            .checked_add(actual_ns)
-            .ok_or(Error::Numeric)?;
+        let Some(total) = self.mandatory.checked_add(actual_ns) else {
+            // An unrepresentable charge is lost accounting, not spare capacity.
+            // Keep the last representable debit and permanently stop new work.
+            self.fault = true;
+            return Err(Error::Numeric);
+        };
+        self.mandatory = total;
         if self.mandatory > MANDATORY_NS || self.mandatory.saturating_add(self.spent) > CONTROL_NS {
             self.fault = true;
             return Err(Error::Budget);
@@ -220,7 +223,12 @@ impl ExtraBudget {
         }
         // Record even invalid execution before closing the credit. A budget
         // violation does not disappear by reporting failure or advancing time.
-        self.spent = self.spent.checked_add(actual_ns).ok_or(Error::Numeric)?;
+        let Some(total) = self.spent.checked_add(actual_ns) else {
+            self.fault = true;
+            // The unsettled credit remains owned; overflow is not a refund.
+            return Err(Error::Numeric);
+        };
+        self.spent = total;
         self.pending = None;
         if self.fault
             || actual_ns > credit.limit_ns
@@ -1163,6 +1171,11 @@ impl<'a, 'model> Governance<'a, 'model> {
             } else {
                 Err(Error::Conflict)
             };
+        }
+        if submission.state == ExecutionState::Unknown && receipt.state == ExecutionState::Pending {
+            // A delayed initial report cannot erase an unresolved side effect.
+            // Only a verified terminal receipt can close this obligation.
+            return Err(Error::Conflict);
         }
         let late = receipt.state.terminal() && receipt.finished_ns > submission.apply_deadline_ns;
         if receipt.state == ExecutionState::Applied {
