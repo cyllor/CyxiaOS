@@ -38,7 +38,15 @@ jobs:
       - name: Check out exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify exact head before testing
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          test -z "$(git status --porcelain --untracked-files=all)"
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
@@ -73,16 +81,22 @@ jobs:
           test -s "$CARGO_TARGET_DIR/aarch64-unknown-none-softfloat/release/prototype-governance"
       - name: Record source identity
         if: always()
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/prototype-validation"
           git rev-parse HEAD > "$RUNNER_TEMP/prototype-validation/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/prototype-validation/source-tree.txt"
           git status --short > "$RUNNER_TEMP/prototype-validation/git-status.txt"
           rustc -vV > "$RUNNER_TEMP/prototype-validation/rust-version.txt" || true
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          test -z "$(git status --porcelain --untracked-files=all)"
       - name: Retain lane logs and results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: prototype-validation-${{ matrix.lane }}-${{ github.sha }}
+          name: prototype-validation-${{ matrix.lane }}-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
           retention-days: 3
           compression-level: 6
           if-no-files-found: error

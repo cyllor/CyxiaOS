@@ -4,11 +4,7 @@ mod support;
 use cyxia_prototype::{
     domains::{Action, ApplyId, ObjectKey, PolicyStamp},
     features::RawFeatures,
-    learning::{
-        Error, Family,
-        governance::*,
-        reward::WorkRequest,
-    },
+    learning::{Error, Family, governance::*, reward::WorkRequest},
     policy::{Candidate, CandidateSet, ExecutionState, ModelBinding, Snapshot},
 };
 
@@ -84,7 +80,10 @@ fn settlement_overflow_keeps_debt_and_stops_future_credits() {
     let second = budget
         .reserve(Role::Validation, 1, 1, 1024 * 1024, 1, 1, &Owners)
         .unwrap();
-    assert_eq!(budget.settle(second, u64::MAX, 2).err(), Some(Error::Numeric));
+    assert_eq!(
+        budget.settle(second, u64::MAX, 2).err(),
+        Some(Error::Numeric)
+    );
     assert!(budget.faulted());
     assert_eq!(budget.spent_ns(), 1); // last representable charge is not reset
     assert_eq!(

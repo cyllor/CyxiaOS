@@ -36,6 +36,14 @@ class NativeWorkflow(unittest.TestCase):
         self.assertNotIn('path: ${{ runner.temp }}/a02-private-pair', collection)
         self.assertIn('git status --porcelain --untracked-files=no', collection)
 
+    def test_full_engineering_lane_also_tests_exact_head_and_seals_source(self):
+        text = (ROOT / '.github/workflows/validate-prototype.yml').read_text()
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', text)
+        self.assertIn('Verify exact head before testing', text)
+        self.assertIn('source-tree.txt', text)
+        self.assertEqual(text.count('git status --porcelain --untracked-files=all'), 2)
+        self.assertIn('${{ github.run_attempt }}', text)
+
 
 if __name__ == '__main__':
     unittest.main()
