@@ -47,7 +47,13 @@ class ValidationLanes(unittest.TestCase):
         self.assertIn('rustup override set 1.95.0', source)
         self.assertIn('needs: validate', source)
         self.assertIn('run: test "$VALIDATION_RESULT" = success', source)
-        self.assertIn('prototype-validation-${{ matrix.lane }}-${{ github.sha }}', source)
+        head = '${{ github.event.pull_request.head.sha || github.sha }}'
+        self.assertIn('ref: ' + head, source)
+        self.assertIn('EXPECTED_SOURCE: ' + head, source)
+        self.assertIn('prototype-validation-${{ matrix.lane }}-' + head
+                      + '-${{ github.run_attempt }}', source)
+        self.assertIn('source-tree.txt', source)
+        self.assertEqual(source.count('git status --porcelain --untracked-files=all'), 2)
         self.assertNotIn('continue-on-error:', source)
 
 

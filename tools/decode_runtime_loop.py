@@ -21,6 +21,9 @@ def decode_runtime_loop(data):
             'invalid runtime-loop header')
     require(words[4] > 0 and words[5] > 0 and words[6] > 0 and words[7] == 0,
             'invalid runtime-loop identity')
+    require(words[0] == 2 * words[3],
+            'runtime-loop publication/report count mismatch')
+    require(not any(words[40:]), 'runtime-loop reserved tail is nonzero')
     r = words[8:40]
     require(r[0] == 1 and r[1] == words[6] and r[2] > 0 and r[31] == 0,
             'invalid runtime-loop record')
@@ -42,6 +45,7 @@ def decode_runtime_loop(data):
         )
     }
     require(r[27] == 0 or r[3] <= r[27] <= r[28], 'invalid liveness attempt time')
+    require(1 <= r[29] <= 16, 'invalid runtime-loop exit reason')
     return {
         'scope': ('latest terminal session maxima, never the current active session; '
                   'stopped snapshot; non-authoritative; '

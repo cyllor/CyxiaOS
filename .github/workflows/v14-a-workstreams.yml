@@ -1,0 +1,66 @@
+name: V0.14 A01-A16 component workstreams
+
+on:
+  pull_request:
+    branches: [CyxiaOS-V0.14]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workstream:
+    name: ${{ matrix.lane }} components (not native acceptance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [W1, W2, W3, W4, W5, W6]
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out the exact proposed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Record source before provisioning
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lane-source"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          git rev-parse HEAD > "$RUNNER_TEMP/lane-source/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/lane-source/source-tree.txt"
+      - name: Install the pinned host toolchain and locked dependencies
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Execute this workstream's component tests
+        run: python3 -B tools/v14_workstreams.py --lane ${{ matrix.lane }} --output "$RUNNER_TEMP/lane-evidence"
+      - name: Preserve each attempt separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v14-${{ matrix.lane }}-components-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/lane-source/
+            ${{ runner.temp }}/lane-evidence/
+
+  component-gate:
+    name: All six component lanes (not native acceptance)
+    needs: workstream
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every independent lane to succeed
+        env:
+          RESULT: ${{ needs.workstream.result }}
+        run: test "$RESULT" = success

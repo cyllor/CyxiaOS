@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -58,9 +59,15 @@ def _pairs(pairs):
     return out
 
 
+def _finite_float(value: str) -> float:
+    number = float(value)
+    require(math.isfinite(number), f"Invalid number {value}")
+    return number
+
+
 def read_json(path: Path):
     require(path.stat().st_size <= 4 * 1024 * 1024, "JSON exceeds bounded size")
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_pairs,
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_pairs, parse_float=_finite_float,
                       parse_constant=lambda value: (_ for _ in ()).throw(EvidenceError(f"Invalid number {value}")))
 
 

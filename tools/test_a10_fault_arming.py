@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 
-from check_v13_fault_disk import inspect, read_events
+from check_v13_fault_disk import decode_events, inspect, read_events
 from v13_a10_fault_scope import mutation_scope, require_post_resume_cut
 from v13_fault_disk import Backend, receive
 
@@ -274,6 +274,12 @@ class FaultArming(unittest.TestCase):
 
 
 class ArmingEvidence(unittest.TestCase):
+    def test_independent_replay_rejects_non_object_and_truncated_events(self):
+        for row in (b'null\n', b'[]\n', b'\"text\"\n', b'12\n', b'{}'):
+            with self.subTest(row=row), self.assertRaisesRegex(ValueError,
+                    'fault event row must be a JSON object|invalid fault JSONL framing'):
+                decode_events(row)
+
     def rewrite(self, case, rows):
         path = case.root / 'nbd' / 'events.jsonl'
         raw = ''.join(json.dumps(row, separators=(',', ':'))+'\n' for row in rows).encode()
@@ -282,6 +288,58 @@ class ArmingEvidence(unittest.TestCase):
         document = json.loads(capture.read_text())
         document['events_raw_sha256'] = hashlib.sha256(raw).hexdigest()
         capture.write_text(json.dumps(document))
+
+    def test_rehashed_duplicate_and_nonfinite_fault_records_are_rejected(self):
+        with session() as case:
+            case.setup_flush()
+            case.arm_and_record_resume()
+            case.send(1)
+            case.finish_cut()
+            root = case.root / 'nbd'
+            events = root / 'events.jsonl'
+            capture = root / 'capture.json'
+            original_events = events.read_bytes()
+            original_capture = capture.read_bytes()
+            first, remainder = original_events.split(b'\n', 1)
+            self.assertIn(b'"event":', first)
+            forged_rows = {
+                'duplicate-event': first.replace(b'"event":',
+                    b'"event":"arm","event":', 1) + b'\n' + remainder,
+                'nonfinite-value': first[:-1] + b',"poison":NaN}\n' + remainder,
+            }
+            for name, forged in forged_rows.items():
+                with self.subTest(name=name):
+                    events.write_bytes(forged)
+                    digest = hashlib.sha256(forged).hexdigest()
+                    recorded = json.loads(original_capture)
+                    recorded['events_raw_sha256'] = digest
+                    capture.write_text(json.dumps(recorded) + '\n')
+                    pattern = ('Duplicate JSON key' if name == 'duplicate-event'
+                               else 'nonfinite fault event number')
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        inspect(case.initial, case.disk, root)
+            events.write_bytes(original_events)
+            capture.write_bytes(original_capture)
+            self.assertEqual(case.finish_cut()['cut']['mutation'], 1)
+
+    def test_duplicate_start_and_capture_fields_cannot_select_an_ambiguous_record(self):
+        with session() as case:
+            case.setup_flush()
+            case.arm_and_record_resume()
+            case.send(1)
+            case.finish_cut()
+            root = case.root / 'nbd'
+            for filename, token in (('start.json', '"version"'),
+                                    ('capture.json', '"version"')):
+                with self.subTest(filename=filename):
+                    path = root / filename
+                    original = path.read_text()
+                    self.assertIn(token, original)
+                    path.write_text(original.replace(token, token + ': 2, ' + token, 1))
+                    with self.assertRaisesRegex(ValueError, 'Duplicate JSON key'):
+                        inspect(case.initial, case.disk, root)
+                    path.write_text(original)
+            self.assertEqual(case.finish_cut()['cut']['mutation'], 1)
 
     def test_rehashed_tampered_arming_and_raw_identity_are_rejected(self):
         with session() as case:
