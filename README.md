@@ -1,5 +1,19 @@
 # CyxiaOS
 
+## V0.15 代码汇总基线
+
+当前开发分支为 **`CyxiaOS-V0.15`**，软件版本 **`0.15.0-dev`**；最小原型设计配置仍为 **1.3**，不随软件分支改号。
+
+本分支从已验证的集成提交 `60435c3d002f5d24ab0590bcbd938eeecf073185` 建立，保留 V0.14 之后的 14 个集成提交，包括 PR #9/#10 已移植的修复、A07 未决回执保护、A10 证据校验、学习预算及 Canary 修复、六路组件 CI 和独立原生 A02 流程。V0.14 与现有 PR 不被合并、重置或关闭。
+
+完整来源、历史验证和剩余工作见 [V0.15 汇总说明](docs/implementation/v15-source-summary.md)；机器可读来源清单见 [V0.15 基线](docs/implementation/v15-source-baseline.json)。历史 A02 PASS 只属于原提交，**不能自动改称 V0.15 PASS**；新提交须重跑原生流程并独立登记。受版本管理的验收目录保持原样，完整原型发布门禁仍关闭。
+
+工程四路、组件六路和独立 A02 工作流已接入 V0.15 的 push/PR；`V0.15 source snapshot` 仅归档源码和身份，不发布已完成验收的发行版。`tools/prototype.py` 的 `build`、`run-single`、`run-pair`、`test`、`report` 入口保持不变。
+
+## 历史桌面、Shell 与独立配置说明
+
+以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，V0.15 状态以上述汇总和精确提交的运行证据为准。
+
 不基于 Linux 的实验性操作系统。目标是由本地 AI 决策资源分配，由内核执行安全约束和资源机制。
 
 当前代码包含 **M1 单核 ARM 内核、基础 Shell、AI 文件系统，AI 内存/任务/设备管理切片，以及 EL0/POSIX 文件接口子集**。可在真实 QEMU ARM 客体中管理目录和文件，本地整数模型负责写入准入与缓存排序，并支持候选训练、验证、显式发布及回退。**文件在 RAM 中运行；连接专用 VirtIO 磁盘并执行 `storage checkpoint` 后可重启恢复，未保存修改和学习状态会丢失。尚无全系统统一 AI 调度。** HTML 文件保留为早期设计原型。
@@ -61,7 +75,7 @@ posix run preempt
 
 真实 C 程序在 EL0 通过系统调用执行 `open/read/write/close/lseek/dup/dup2` 等接口，文件服务与 Shell 共用。AI 控制用户页准入及 1/4 ms 派发预算；内核提供权限检查、IRQ 抢占和故障回收。在原生 POSIX 子集之外，已增加独立的 Linux AArch64 syscall personality，运行本项目交叉构建的静态 musl ELF，支持匿名内存、Unix socket、eventfd、目录读取和部分信号语义。已有单核最多 8 个线程上下文的真实 musl pthread/clone/futex 子集验证。**尚不支持通用 fork/execve、完整 pthread、动态链接和完整 POSIX/Linux ABI；指定静态移植程序的成功不代表任意 Linux 二进制兼容。** production 构建需要已安装的 Clang，链接器复用 Rust LLD。[POSIX 第一阶段说明](docs/implementation/posix-compatibility.md)保留原生接口范围；当前桌面兼容层见 [X11 集成记录](docs/implementation/x11-desktop-integration.md)。
 
-已有 [桌面 D2 多进程与 IPC 基础](docs/implementation/desktop-process-foundation.md)：`posix spawn idle|spin|fault`、`posix pair`、`posix list`、`posix kill PID`。本地 AI 选择活动进程与时间预算，8 个槽最多同时准入 7 个独立进程，并保留 8 页启动余量；支持有界双向通信、等待/唤醒和故障回收。X.Org、窗口管理器和测试客户端使用这条真实调度路径并发运行；七进程并发与第八次拒绝、槽复用和高槽内存回收已经验证；第一版桌面常驻四进程，加一个终端及其 shell 为六进程，保存对话框短时为七进程；更多应用会受实际准入额度限制。
+已有 [桌面 D2 多进程与 IPC 基础](docs/implementation/desktop-process-foundation.md)：`posix spawn idle|spin|fault`、`posix pair`、`posix list`、`posix kill PID`。本地 AI 选择活动进程与时间预算，8 个槽最多同时准入 7 个独立进程，并保留 8 页启动余量；支持有界双向通信、等待/唤醒和故障回收。X.Org、窗口管理器和测试客户端使用这条真实调度路径并发运行；七进程并发与第八次拒绝、槽复用和高槽内存回收已经验证；第一版桌面常驻四进程，加一个终端及其 shell 为六进程；保存对话框短时为七进程；更多应用会受实际准入额度限制。
 
 进一步实现了 [匿名内存、FP/TLS 与用户态绘制](docs/implementation/desktop-memory-display.md)：默认每槽 8 MiB 匿名窗口，512 MiB 桌面配置为每槽 16 MiB，本地模型决定内存准入；静态 ELF 映像与 256 KiB 栈共享每槽 16 MiB 映像额度；保存完整浮点/向量与 TLS 寄存器，musl 可初始化静态 TLS。EL0 程序可向真实 GPU 提交矩形并等待异步 fence。可试 `posix spawn heap`、`posix spawn fpu`，或 `python3 tools/graphics.py --paint` 查看绘制验证。**1/4 ms 预算约束 EL0 派发，不是系统调用或交互响应的硬截止。** Linux personality 的 mmap/mprotect/munmap 只覆盖已验证子集；线程子集有独立真实 musl 客体验证，不代表完整 pthread。
 

@@ -6,12 +6,13 @@ on:
       - CyxiaOS-V0.12
       - CyxiaOS-V0.13
       - CyxiaOS-V0.14
+      - CyxiaOS-V0.15
       - codex/cyxiaos-v0.11-complete-prototype
       - 'codex/v011-*'
       - 'codex/v012-complete-*'
       - 'codex/v012-governance-*'
   pull_request:
-    branches: [CyxiaOS-V0.14]
+    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15]
   workflow_dispatch:
 
 permissions:

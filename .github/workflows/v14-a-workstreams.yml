@@ -1,8 +1,10 @@
-name: V0.14 A01-A16 component workstreams
+name: Prototype A01-A16 component workstreams
 
 on:
+  push:
+    branches: [CyxiaOS-V0.15]
   pull_request:
-    branches: [CyxiaOS-V0.14]
+    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15]
   workflow_dispatch:
 
 permissions:
@@ -47,7 +49,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: v14-${{ matrix.lane }}-components-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          name: prototype-${{ matrix.lane }}-components-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
           retention-days: 30
           if-no-files-found: error
           path: |

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "software_version": "0.15.0-dev",
+  "branch": "CyxiaOS-V0.15",
+  "package_kind": "development-source-only",
+  "specification_version": "1.3",
+  "source": {
+    "repository": "cyllor/CyxiaOS",
+    "parent_commit": "60435c3d002f5d24ab0590bcbd938eeecf073185",
+    "parent_tree": "a060f76522306b83650e20d7bd696a59c8088774",
+    "previous_version_branch": "CyxiaOS-V0.14",
+    "previous_version_commit": "c5fb398e21de3b56f7a89ca17c48b62205d671a4",
+    "integration_branch": "codex/v014-a01-a16-parallel-gates",
+    "integration_pull_request": 17,
+    "integrated_commit_count_since_v014": 14,
+    "integrated_changed_file_count_since_v014": 23,
+    "source_test_ports": [
+      {
+        "pull_request": 9,
+        "commit": "ed4df102eae6bd85d2ab810b4960defa50426669"
+      },
+      {
+        "pull_request": 10,
+        "commit": "a92eebf137abb48a74c95e8e9db767313d5d0c7e"
+      }
+    ],
+    "port_note": "Source/test changes are already integrated; original PRs are not merged again and their duplicate targeted workflows are excluded."
+  },
+  "historical_verification": {
+    "source_commit": "60435c3d002f5d24ab0590bcbd938eeecf073185",
+    "engineering_run_id": 42159535039,
+    "component_run_id": 42159534956,
+    "native_a02_run_id": 42159535274,
+    "native_a02_artifact_id": 13476516492,
+    "native_a02_artifact_sha256": "ec6bf91248cd940d439c09744ed4fca6743cb65fc3cea4e474549069c98db42f",
+    "native_a02_status": "PASS",
+    "run_catalogue_A": {
+      "PASS": 1,
+      "FAIL": 0,
+      "NOT_RUN": 15
+    },
+    "applies_to_new_commits": false
+  },
+  "acceptance_catalogue": {
+    "path": "docs/implementation/v13-requirements.json",
+    "sha256": "6133f32bdfb6c826583c35826037037a9369f8a7c55b14589e973e8f04123985",
+    "preserved_at_branch_creation": true,
+    "tracked_A": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 16
+    },
+    "tracked_T": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 20
+    },
+    "tracked_E": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 15
+    }
+  },
+  "acceptance_policy": {
+    "inherit_native_verdicts": false,
+    "source_snapshot_implies_acceptance": false,
+    "new_commit_requires_independent_runtime_verification": true,
+    "release_gate_opened_by_branch_creation": false
+  },
+  "workstreams": {
+    "W1": [
+      "A01",
+      "A02",
+      "A03",
+      "A04"
+    ],
+    "W2": [
+      "A05",
+      "A08"
+    ],
+    "W3": [
+      "A06",
+      "A07",
+      "A09",
+      "A11",
+      "A15"
+    ],
+    "W4": [
+      "A10"
+    ],
+    "W5": [
+      "A12",
+      "A13",
+      "A14"
+    ],
+    "W6": [
+      "A16"
+    ]
+  }
+}

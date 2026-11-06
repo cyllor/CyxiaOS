@@ -1,8 +1,10 @@
-name: V0.14 native A02 isolation
+name: Prototype native A02 isolation
 
 on:
+  push:
+    branches: [CyxiaOS-V0.15]
   pull_request:
-    branches: [CyxiaOS-V0.14]
+    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15]
     paths:
       - '.github/workflows/v14-native-a02.yml'
       - 'kernel/**'
@@ -122,7 +124,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: v14-a02-native-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          name: prototype-a02-native-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
           retention-days: 30
           if-no-files-found: error
           compression-level: 6

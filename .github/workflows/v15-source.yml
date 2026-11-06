@@ -1,0 +1,72 @@
+name: V0.15 source snapshot
+
+on:
+  push:
+    branches: [CyxiaOS-V0.15]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify version, provenance and branch gates
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v015-source"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git rev-parse HEAD > "$RUNNER_TEMP/v015-source/source-commit.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/v015-source/source-tree.txt"
+          python3 -B -m unittest discover -s tools -p 'test_v15_snapshot.py' -v 2>&1 | tee "$RUNNER_TEMP/v015-source/snapshot-checks.log"
+      - name: Archive the exact source without promoting native acceptance
+        run: |
+          set -euo pipefail
+          test "$(cat VERSION)" = 0.15.0-dev
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git archive --format=zip --prefix=CyxiaOS-V0.15/ HEAD > "$RUNNER_TEMP/v015-source/CyxiaOS-V0.15-source.zip"
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'v015-source'
+          source = root / 'CyxiaOS-V0.15-source.zip'
+          with zipfile.ZipFile(source) as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('damaged source archive')
+              if archive.read('CyxiaOS-V0.15/VERSION').strip() != b'0.15.0-dev':
+                  raise SystemExit('wrong source version')
+              count = sum(not member.is_dir() for member in archive.infolist())
+          record = {
+              'schema_version': 1,
+              'software_version': '0.15.0-dev',
+              'package_kind': 'development-source-only',
+              'source_commit': (root / 'source-commit.txt').read_text().strip(),
+              'source_tree': (root / 'source-tree.txt').read_text().strip(),
+              'source_file_count': count,
+              'source_zip_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+              'snapshot_checks': 'PASS',
+              'native_execution_attempted_by_this_workflow': False,
+              'release_acceptance_verified': False,
+              'note': 'Consult separate exact-commit engineering/component/native runs; historical verdicts are not inherited.'
+          }
+          (root / 'source-manifest.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          (cd "$RUNNER_TEMP/v015-source" && sha256sum CyxiaOS-V0.15-source.zip source-manifest.json > SHA256SUMS)
+      - name: Preserve source identity, archive and check failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CyxiaOS-V0.15-source-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+          path: ${{ runner.temp }}/v015-source/
