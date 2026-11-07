@@ -1992,7 +1992,16 @@ pub fn poll(token: Token) -> Result<Status, Error> {
                         r.ordinal = 0;
                         continue;
                     }
-                    let Some(target) = (f.target)(f.domain, f.kind, r.ordinal) else {
+                    let Some(target) = ({
+                        let source =
+                            TargetSource::for_family(f.domain, f.kind).ok_or(Error::Unsupported)?;
+                        let query = target_batch::Query::exact(f.domain, f.kind, r.ordinal);
+                        let mut output = [None];
+                        // Busy/NotReady is not exhaustion. Propagate it before
+                        // changing either cursor or the frozen configuration set.
+                        read_target_batch(source, &[query], &mut output)?;
+                        output[0]
+                    }) else {
                         r.family += 1;
                         r.ordinal = 0;
                         continue;

@@ -9,7 +9,12 @@ fn same_boot_service_restart_recovers_started_task_without_a_second_enqueue() {
     b.connect([32; 32], 0).unwrap();
     crate::pump(&mut a, &mut b, 0, || crate::has_trace(0x214));
     let owner = crate::CTX.with(|c| c.borrow().nodes.iter().position(|n| n.starts == 1).unwrap());
-    let key = if owner == 0 { a.task_key } else { b.task_key }.unwrap();
+    let key = if owner == 0 {
+        a.incoming_task_key
+    } else {
+        b.incoming_task_key
+    }
+    .unwrap();
     drop(a);
     drop(b);
     // The service alone is reconstructed. The kernel and BootEpoch survive.
@@ -78,7 +83,12 @@ fn started() -> (Driver, Driver, usize, TaskKey) {
     b.connect([32; 32], 0).unwrap();
     crate::pump(&mut a, &mut b, 0, || crate::has_trace(0x214));
     let owner = crate::CTX.with(|c| c.borrow().nodes.iter().position(|n| n.starts == 1).unwrap());
-    let key = if owner == 0 { a.task_key } else { b.task_key }.unwrap();
+    let key = if owner == 0 {
+        a.incoming_task_key
+    } else {
+        b.incoming_task_key
+    }
+    .unwrap();
     (a, b, owner, key)
 }
 

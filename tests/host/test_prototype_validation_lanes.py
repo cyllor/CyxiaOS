@@ -9,12 +9,24 @@ from prototype import TEST_LANES, test_steps
 
 
 class ValidationLanes(unittest.TestCase):
-    def test_disjoint_lanes_cover_all_nine_original_engineering_gates(self):
+    def test_disjoint_lanes_cover_original_gates_and_cluster_recovery_regressions(self):
         all_steps = test_steps(False)
         combined = [step for lane in TEST_LANES for step in test_steps(False, lane)]
-        self.assertEqual(len(combined), 9)
+        self.assertEqual({name for name, _ in combined}, {
+            'fixtures', 'format', 'governance-format', 'rust', 'cluster-engine',
+            'tls', 'host', 'tools', 'clippy', 'governance-clippy',
+        })
         self.assertEqual(len({name for name, _ in combined}), len(combined))
         self.assertEqual(sorted(combined), sorted(all_steps))
+
+    def test_rust_lane_executes_production_cluster_engine_tests_offline(self):
+        commands = dict(test_steps(False, 'rust'))
+        self.assertIn('cluster-engine', commands)
+        command = commands['cluster-engine']
+        self.assertEqual(command[1:], [
+            'test', '--locked', '--offline', '-p', 'cyxia-prototype',
+            '--features', 'cluster-engine',
+        ])
 
     def test_lane_selection_does_not_rewrite_commands_or_promote_host_to_native(self):
         full = dict(test_steps(True))

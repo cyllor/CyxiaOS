@@ -1410,12 +1410,6 @@ fn next_normal(
         let Some(f) = s.owner.families[index] else {
             continue;
         };
-        s.due[index] = wall_started.saturating_add(if index == 1 || index == 16 {
-            1_000_000_000
-        } else {
-            WINDOW_NS
-        });
-        s.family_cursor = (index + 1) % 18;
         let ordinal = s.cursor[index];
         // Resolve current/fallback plus exact lookahead from one immutable
         // owner view. A retry must never turn owner contention into absence,
@@ -1433,8 +1427,21 @@ fn next_normal(
         preparation_entry_detail(7);
         if let Err(error) = target_result {
             preparation_lookup(index, f, ordinal, wall_started);
+            // An initial lookup has no preparation retry budget. Preserve its
+            // due/object position, but let unrelated owners get the next turn.
+            // Carried preparation retains its existing identity and retry path.
+            if s.preparation.is_none() {
+                s.family_cursor = (index + 1) % 18;
+            }
             return Err(error);
         }
+        // Unavailable owner views consume no enumeration progress or due slot.
+        s.due[index] = wall_started.saturating_add(if index == 1 || index == 16 {
+            1_000_000_000
+        } else {
+            WINDOW_NS
+        });
+        s.family_cursor = (index + 1) % 18;
         let target = targets[0];
         s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {
@@ -3210,6 +3217,7 @@ pub fn poll(_at: u64) -> Result<(), Error> {
             let family_slot = family_index(d.action.domain(), d.action.kind())?;
             let f = s.owner.families[family_slot].ok_or(Error::Unsupported)?;
             let was_started = d.started;
+            let previous_state = d.state;
             let mut denial_flags = 0;
             let dependency_status = if d.started {
                 Ok(())
@@ -3269,6 +3277,11 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                 Err(Error::Io | Error::NotReady) => ExecutionState::Unknown,
                 Err(error) => ExecutionState::Failed(error),
             };
+            // A started Unknown operation remains an unresolved obligation.
+            // Late Pending/Busy/Again is not proof that its effects disappeared.
+            if previous_state == ExecutionState::Unknown && d.state == ExecutionState::Pending {
+                d.state = ExecutionState::Unknown;
+            }
             let observed = now();
             if denial_flags != 0
                 && let Err(error) = dependency_status
@@ -3300,6 +3313,9 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.state = ExecutionState::Failed(Error::Again);
                 }
             }
+            // Preserve factual executor custody and terminal candidate evidence
+            // even if the later Registry update rejects its identity. Unknown
+            // normalization above prevents the forbidden Pending regression.
             replay::candidate_execution(d.apply, d.stamp, d.state);
             if let Some((entered_ns, cpu_ns)) = executor_trace {
                 crate::learning_evidence::execution_trace::control(

@@ -412,8 +412,8 @@ impl PlacementBackend for Backend<'_> {
         if persist(&mut self.driver.engine, effect).is_err() {
             return PlacementAdmission::Unknown;
         }
-        self.driver.terms = Some(terms);
-        self.driver.contract_hash = hash;
+        self.driver.outgoing_terms = Some(terms);
+        self.driver.outgoing_hash = hash;
         self.driver.outgoing_input = input;
         let mut body = terms_bytes(terms);
         body.extend_from_slice(&hash);
@@ -887,7 +887,7 @@ impl Driver {
         let mut reader = Reader::new(b);
         let key = read_key(&mut reader)?;
         reader.end()?;
-        if Some(key) != self.task_key || !self.committed {
+        if Some(key) != self.outgoing_task_key || !self.committed {
             return Err(());
         }
         if !self.native_started.contains(&key) {

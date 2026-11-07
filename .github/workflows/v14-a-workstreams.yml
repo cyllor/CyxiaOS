@@ -2,9 +2,9 @@ name: Prototype A01-A16 component workstreams
 
 on:
   push:
-    branches: [CyxiaOS-V0.15]
+    branches: [CyxiaOS-V0.15, CyxiaOS-V0.16]
   pull_request:
-    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15]
+    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15, CyxiaOS-V0.16]
   workflow_dispatch:
 
 permissions:

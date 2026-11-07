@@ -49,6 +49,10 @@ struct Node {
     session_wait: Option<(u64, u64, bool, u64)>,
     // Controlled TASK_RESERVE_CUSTODY completion time.
     reserve_wait_ms: Option<u64>,
+    strict_authority: bool,
+    strict_reserves: usize,
+    strict_grants: usize,
+    strict_releases: usize,
 }
 #[derive(Default)]
 struct Context {
@@ -250,6 +254,38 @@ mod broker {
                         if n.reserved {
                             return Err(AGAIN);
                         }
+                        if n.strict_authority {
+                            use cyxia_kernel_core::control_plane::task_admission::{
+                                CustodyKey, Terms,
+                            };
+                            assert_eq!(args[0], TASK_RESERVE_CUSTODY);
+                            assert_eq!(input.len(), 224);
+                            let value =
+                                |at| u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
+                            let terms = Terms {
+                                cpu_milli: value(0),
+                                memory_pages: value(8),
+                                runtime_ms: value(16),
+                                contract: input[24..40].try_into().unwrap(),
+                                input_hash: input[40..72].try_into().unwrap(),
+                                package_hash: input[72..104].try_into().unwrap(),
+                            };
+                            let key = CustodyKey {
+                                owner_boot: value(104),
+                                cluster: input[112..144].try_into().unwrap(),
+                                requester: input[144..176].try_into().unwrap(),
+                                contract: input[176..192].try_into().unwrap(),
+                                request_hash: input[192..224].try_into().unwrap(),
+                            };
+                            let token = n
+                                .authority
+                                .as_mut()
+                                .unwrap()
+                                .reserve_with_custody(terms, [42; 32], key, now)
+                                .map_err(|_| FAILED)?;
+                            assert_eq!(token, 1, "only one incoming task in each scenario");
+                            n.strict_reserves += 1;
+                        }
                         let reserve_completed = n.reserve_wait_ms.take();
                         n.custody = if args[0] == TASK_RESERVE_CUSTODY {
                             assert_eq!(input.len(), 224);
@@ -271,6 +307,28 @@ mod broker {
                         Ok((0, 1))
                     }
                     2 => {
+                        if n.strict_authority {
+                            use cyxia_kernel_core::control_plane::task_admission::StartRequest;
+                            assert_eq!(input.len(), 48);
+                            let v = |at| u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
+                            assert_eq!(v(0), n.input.len() as u64);
+                            let start = StartRequest {
+                                token: args[1],
+                                deadline: v(8),
+                                session: v(16),
+                                grant: v(24),
+                                contract: input[32..48].try_into().unwrap(),
+                                input_hash: ring::digest::digest(&ring::digest::SHA256, &n.input)
+                                    .as_ref()
+                                    .try_into()
+                                    .unwrap(),
+                            };
+                            n.authority
+                                .as_mut()
+                                .unwrap()
+                                .start(start, now)
+                                .map_err(|_| FAILED)?;
+                        }
                         assert!(!n.custody_admitted, "task was admitted twice");
                         n.custody_admitted = true;
                         n.starts += 1;
@@ -293,7 +351,19 @@ mod broker {
                         Ok((8, 1))
                     }
                     4 => {
-                        if n.fail_release_once { n.fail_release_once = false; return Err(AGAIN); }
+                        if n.fail_release_once {
+                            n.fail_release_once = false;
+                            return Err(AGAIN);
+                        }
+                        if n.strict_authority {
+                            assert!(matches!(n.task_state, 1 | 4 | 5));
+                            n.authority
+                                .as_mut()
+                                .unwrap()
+                                .release(args[1])
+                                .map_err(|_| FAILED)?;
+                            n.strict_releases += 1;
+                        }
                         n.reserved = false;
                         n.custody = None;
                         Ok((0, 1))
@@ -327,6 +397,19 @@ mod broker {
                         if result.is_err() { eprintln!("real Authority session calls: {:?}", n.session_calls); }
                         if waited { cx.now = now; }
                         result.map(|()| (0, 0)).map_err(|_| FAILED)
+                    }
+                    7 if n.strict_authority => {
+                        assert_eq!(input.len(), 32);
+                        let deadline = u64::from_le_bytes(input[..8].try_into().unwrap());
+                        let grant = u64::from_le_bytes(input[8..16].try_into().unwrap());
+                        let contract = input[16..32].try_into().unwrap();
+                        n.authority
+                            .as_mut()
+                            .unwrap()
+                            .grant(args[1], contract, grant, deadline, now)
+                            .map_err(|_| FAILED)?;
+                        n.strict_grants += 1;
+                        Ok((0, 0))
                     }
                     7 | 9 => Ok((0, 0)),
                     6 => {
@@ -2531,3 +2614,211 @@ fn completed_history_recovers_without_entropy_and_remains_unchanged_offline() {
         }
     });
 }
+
+// Superpowers recheck: ordinary applications, real kernel Authority, and a
+// production-style per-node order (domain_tick -> inbound -> tick -> outbound).
+// No replay_work is supplied and no pair-global double-slot is created.
+#[derive(Debug)]
+struct DuplexOutcome {
+    failure: Option<(usize, u64, Vec<u16>)>,
+    selected: [bool; 2],
+    completions: [usize; 2],
+    reserves: [usize; 2],
+    grants: [usize; 2],
+    starts: [usize; 2],
+}
+fn recheck_ordinary_duplex(requesters: [bool; 2], reverse: bool, fragment: usize) -> DuplexOutcome {
+    use cyxia_prototype::cluster::wire::Header;
+    use cyxia_prototype_cluster::abi::*;
+    CTX.with(|c| *c.borrow_mut() = Context::default());
+    let (mut a, mut b) = native_setup(1);
+    // Both queues receive an ordinary caller so the built-in demo injection is
+    // irrelevant. Only the selected requester(s) receive a remote placement.
+    enqueue_application(0, 1, 0);
+    enqueue_application(1, 1, 0);
+    CTX.with(|c| {
+        for n in &mut c.borrow_mut().nodes {
+            n.strict_authority = true;
+            n.authority = Some(cyxia_kernel_core::control_plane::task_admission::Authority::new());
+            n.transport_epoch = 1;
+            n.domains.offer = PolicyWire {
+                version: 1,
+                snapshot_ns: 0,
+                installed_until_ns: 10_000_000_000,
+                value: 250,
+                plan_seq: 1,
+                controller_epoch: 1,
+                action_index: 0,
+            };
+        }
+    });
+    connect_native(&mut a, &mut b);
+    let mut wire: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut selected = [false; 2];
+    let mut failure = None;
+    let mut delivered = [Vec::<u8>::new(), Vec::<u8>::new()];
+    for at in 0..800u64 {
+        for i in if reverse { [1, 0] } else { [0, 1] } {
+            let d = if i == 0 { &mut a } else { &mut b };
+            select(i, at);
+            assert!(
+                d.domain_tick(at * 1_000_000).is_ok(),
+                "domain turn node={i} at={at}"
+            );
+            if !wire[i].is_empty() {
+                let bytes = std::mem::take(&mut wire[i]);
+                delivered[i].extend_from_slice(&bytes);
+                let accepted = d.ingest(&bytes, at);
+                if accepted != Ok(bytes.len()) {
+                    let mut cursor = 0;
+                    let mut kinds = Vec::new();
+                    while cursor + 96 <= delivered[i].len() {
+                        let h = Header::decode(&delivered[i][cursor..cursor + 96]).unwrap();
+                        let end = cursor + 96 + h.body_len as usize;
+                        if end > delivered[i].len() {
+                            break;
+                        }
+                        kinds.push(h.kind);
+                        cursor = end;
+                    }
+                    eprintln!(
+                        "duplex_failure requester_mask={requesters:?} reverse={reverse} fragment={fragment} node={i} at_ms={at} kinds={kinds:?} accepted={accepted:?}"
+                    );
+                    failure = Some((i, at, kinds));
+                    break;
+                }
+                // Keep only an incomplete frame, so an error identifies the
+                // failing frame even under byte fragmentation.
+                let mut cursor = 0;
+                while cursor + 96 <= delivered[i].len() {
+                    let h = Header::decode(&delivered[i][cursor..cursor + 96]).unwrap();
+                    let end = cursor + 96 + h.body_len as usize;
+                    if end > delivered[i].len() {
+                        break;
+                    }
+                    cursor = end;
+                }
+                delivered[i].drain(..cursor);
+            }
+            assert!(d.tick(at).is_ok(), "tick node={i} at={at}");
+            let size = d.outgoing().len().min(fragment);
+            if size > 0 {
+                wire[1 - i].extend_from_slice(&d.outgoing()[..size]);
+                d.consume_outgoing(size);
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        // Install legal, fresh, zero-lease peer policies only after both
+        // requesting nodes actually received a valid positive peer quote.
+        if !selected.iter().any(|v| *v) {
+            let feedback = [
+                a.domain_feedback(at * 1_000_000),
+                b.domain_feedback(at * 1_000_000),
+            ];
+            if (0..2).all(|i| !requesters[i] || feedback[i].waiting[0].peer_ready == 1) {
+                CTX.with(|c| {
+                    let mut c = c.borrow_mut();
+                    for i in 0..2 {
+                        if requesters[i] {
+                            let f = feedback[i];
+                            assert_eq!((f.peer_cpu_milli, f.peer_memory_pages), (100, 16));
+                            let d = &mut c.nodes[i].domains;
+                            d.placement = PolicyWire {
+                                version: 2,
+                                snapshot_ns: at * 1_000_000,
+                                installed_until_ns: 0,
+                                value: 1,
+                                plan_seq: 2,
+                                controller_epoch: 1,
+                                action_index: 0,
+                            };
+                            d.placement_request_id = f.waiting[0].request_id;
+                            d.placement_request_generation = f.waiting[0].request_generation;
+                            selected[i] = true;
+                        }
+                    }
+                });
+            }
+        }
+        if CTX.with(|c| {
+            let c = c.borrow();
+            (0..2).all(|i| !requesters[i] || c.nodes[i].application_completions.len() == 1)
+        }) {
+            break;
+        }
+    }
+    let outcome = CTX.with(|c| {
+        let c = c.borrow();
+        assert!(
+            c.nodes
+                .iter()
+                .all(|n| n.replay_requests.is_empty() && n.replay_results.is_empty())
+        );
+        for (i, n) in c.nodes.iter().enumerate() {
+            assert!(
+                n.strict_reserves <= 1,
+                "node {i} must never reserve two incoming slots"
+            );
+            for completion in &n.application_completions {
+                assert_eq!(
+                    (completion.outcome, completion.value, completion.closed),
+                    (1, 26, 1)
+                );
+            }
+        }
+        DuplexOutcome {
+            failure,
+            selected,
+            completions: core::array::from_fn(|i| c.nodes[i].application_completions.len()),
+            reserves: core::array::from_fn(|i| c.nodes[i].strict_reserves),
+            grants: core::array::from_fn(|i| c.nodes[i].strict_grants),
+            starts: core::array::from_fn(|i| c.nodes[i].starts),
+        }
+    });
+    eprintln!("ordinary_result reverse={reverse} fragment={fragment} {outcome:?}");
+    outcome
+}
+fn recheck_case(requesters: [bool; 2], reverse: bool, fragment: usize) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let o = recheck_ordinary_duplex(requesters, reverse, fragment);
+            assert_eq!(o.selected, requesters);
+            assert!(o.failure.is_none());
+            assert_eq!(o.completions, requesters.map(usize::from));
+            let owners = [usize::from(requesters[1]), usize::from(requesters[0])];
+            assert_eq!(o.starts, owners);
+            assert_eq!(o.grants, owners);
+            assert_eq!(o.reserves, owners);
+            CTX.with(|c| {
+                for (i, n) in c.borrow().nodes.iter().enumerate() {
+                    assert_eq!(n.strict_releases, owners[i]);
+                    assert!(!n.reserved);
+                }
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+#[test]
+fn recheck_ordinary_a_to_b_control() {
+    recheck_case([true, false], false, usize::MAX);
+}
+#[test]
+fn recheck_ordinary_b_to_a_fragmented_control() {
+    recheck_case([false, true], true, 251);
+}
+#[test]
+fn recheck_ordinary_duplex_a_first_coalesced() {
+    recheck_case([true, true], false, usize::MAX);
+}
+#[test]
+fn recheck_ordinary_duplex_b_first_fragmented() {
+    recheck_case([true, true], true, 251);
+}
+
+#[path = "support/reconnect_checks.rs"]
+mod reconnect_checks;

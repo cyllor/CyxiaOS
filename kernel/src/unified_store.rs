@@ -12,6 +12,9 @@ static mut STAGE: [u8; MAX_EFFECT] = [0; MAX_EFFECT];
 static mut READ: [u8; MAX_EFFECT] = [0; MAX_EFFECT];
 static mut STAGED: (u64, usize, usize) = (0, 0, 0);
 static mut CACHED: (u64, usize) = (0, 0);
+// Next ordinal and its byte position belong to this initialized volume. A
+// successful read advances them; EOF must not discard the append position.
+static mut POSITION: (u64, Cursor) = (1, Cursor::new());
 static mut FAILED: bool = false;
 pub fn init() {
     crate::prototype_storage::with_journal(|j, d, s| unsafe {
@@ -19,6 +22,11 @@ pub fn init() {
             Volume::open(j, d, s, &mut *core::ptr::addr_of_mut!(WORK))
                 .expect("reserved cluster volume"),
         );
+        *core::ptr::addr_of_mut!(POSITION) = (1, Cursor::new());
+        *core::ptr::addr_of_mut!(CACHED) = (0, 0);
+        *core::ptr::addr_of_mut!(STAGED) = (0, 0, 0);
+        (*core::ptr::addr_of_mut!(STAGE)).fill(0);
+        *core::ptr::addr_of_mut!(FAILED) = false;
     });
 }
 pub fn request(
@@ -104,9 +112,16 @@ pub fn request(
                 *cache = (0, 0);
                 let found = crate::prototype_storage::with_progress(progress, |j, d, s| {
                     let volume = (&*core::ptr::addr_of!(VOLUME)).as_ref().unwrap();
-                    let mut cursor = Cursor::new();
+                    let position = &mut *core::ptr::addr_of_mut!(POSITION);
+                    if key < position.0 {
+                        *position = (1, Cursor::new());
+                    }
                     let mut found = None;
-                    for _ in 0..key {
+                    while position.0 <= key {
+                        // Volume::next may walk past both files on EOF. Commit
+                        // only successful movement so a subsequent append at
+                        // the old tail remains visible without a prefix rescan.
+                        let mut cursor = position.1;
                         match volume.next(
                             j,
                             d,
@@ -115,7 +130,10 @@ pub fn request(
                             &mut cursor,
                             &mut *core::ptr::addr_of_mut!(READ),
                         ) {
-                            Ok(Some(n)) => found = Some(n),
+                            Ok(Some(n)) => {
+                                *position = (position.0 + 1, cursor);
+                                found = Some(n);
+                            }
                             Ok(None) => return Ok(None),
                             Err(e) => return Err(e),
                         }

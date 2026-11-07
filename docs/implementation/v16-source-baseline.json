@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "software_version": "0.16.0-dev",
+  "branch": "CyxiaOS-V0.16",
+  "package_kind": "development-source-only",
+  "specification_version": "1.3",
+  "source": {
+    "repository": "cyllor/CyxiaOS",
+    "parent_commit": "32057802e6e7d9239d04f1e7e3fed4f82f90db7e",
+    "parent_tree": "db337d179974761aae837e373b1d708d198aac2e",
+    "previous_version_branch": "CyxiaOS-V0.15",
+    "previous_version_commit": "32057802e6e7d9239d04f1e7e3fed4f82f90db7e"
+  },
+  "audit_basis": {
+    "source_commit": "32057802e6e7d9239d04f1e7e3fed4f82f90db7e",
+    "full_audit_report_sha256": "bfcd59719379d4a7d5d8bf2134568d7c3bbe592a796ac3e2481c83ba3b22b9ee",
+    "superpowers_recheck_report_sha256": "d92b96919327c38d0bcda869363c96ed5f3a5282e2693605c0d10f2e0c5ee881",
+    "confirmed_findings": 9,
+    "priority_counts": {
+      "P1": 1,
+      "P2": 8
+    }
+  },
+  "design": {
+    "path": "CyxiaOS_Minimal_Prototype_Design_Final.docx",
+    "sha256": "01f8c315018d8117c0b43671add6527fe76d0b83caabe865b5d714a99fa135a0",
+    "language": "Rust",
+    "architecture": "AArch64",
+    "equal_ai_domains": 16,
+    "action_families": 18,
+    "dedicated_control_cores": "dynamic",
+    "business_hot_path_model_wait": false,
+    "official_members": "native CyxiaOS"
+  },
+  "remediation": [
+    {
+      "id": "R01",
+      "priority": "P1",
+      "change": "Bounded resumable reconnect closure replay",
+      "regression": "user/prototype-cluster/tests/support/reconnect_checks.rs",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R02",
+      "priority": "P2",
+      "change": "Normalize late nonterminal feedback against Unknown before publishing views; retain actual execution custody on Registry rejection",
+      "regression": "tests/host/test_control_remediation.py",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R03",
+      "priority": "P2",
+      "change": "Separate incoming and outgoing contract execution context",
+      "regression": "user/prototype-cluster/tests/driver_host.rs",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R04",
+      "priority": "P2",
+      "change": "Owned process-group cessation before timeout cleanup returns",
+      "regression": "tests/host/test_v016_tools_bounds.py",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R05",
+      "priority": "P2",
+      "change": "Reject nonpositive PTY verification run counts",
+      "regression": "tests/host/test_v016_tools_bounds.py",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R06",
+      "priority": "P2",
+      "change": "Sequential volume cursor for linear journal recovery",
+      "regression": "crates/prototype/tests/native_unified_store.rs",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R07",
+      "priority": "P2",
+      "change": "Sample RNG deadline before completion polling",
+      "regression": "crates/driver-virtio/src/rng/batched.rs",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R08",
+      "priority": "P2",
+      "change": "Enumerate the live ordinary IPC endpoint roster",
+      "regression": "tests/host/test_control_remediation.py",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    },
+    {
+      "id": "R09",
+      "priority": "P2",
+      "change": "Preserve typed Busy and replay enumeration cursor",
+      "regression": "tests/host/test_control_remediation.py",
+      "status": "IMPLEMENTED_HOST_VERIFIED",
+      "native_acceptance": "NOT_RUN"
+    }
+  ],
+  "acceptance_catalogue": {
+    "path": "docs/implementation/v13-requirements.json",
+    "sha256": "6133f32bdfb6c826583c35826037037a9369f8a7c55b14589e973e8f04123985",
+    "preserved_at_branch_creation": true,
+    "tracked_A": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 16
+    },
+    "tracked_T": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 20
+    },
+    "tracked_E": {
+      "PASS": 0,
+      "FAIL": 0,
+      "NOT_RUN": 15
+    }
+  },
+  "acceptance_policy": {
+    "inherit_native_verdicts": false,
+    "source_snapshot_implies_acceptance": false,
+    "new_commit_requires_independent_runtime_verification": true,
+    "release_gate_opened_by_branch_creation": false
+  },
+  "verification_record": "docs/implementation/v16-verification.json",
+  "workstreams": {
+    "W1": [
+      "A01",
+      "A02",
+      "A03",
+      "A04"
+    ],
+    "W2": [
+      "A05",
+      "A08"
+    ],
+    "W3": [
+      "A06",
+      "A07",
+      "A09",
+      "A11",
+      "A15"
+    ],
+    "W4": [
+      "A10"
+    ],
+    "W5": [
+      "A12",
+      "A13",
+      "A14"
+    ],
+    "W6": [
+      "A16"
+    ]
+  },
+  "historical_verification": {
+    "manifest": "docs/implementation/v15-source-baseline.json",
+    "applies_to_new_commits": false
+  },
+  "source_identity_note": "This manifest records the immutable parent; archive CI records the actual triggering commit/tree and source ZIP digest without a circular self-commit field."
+}

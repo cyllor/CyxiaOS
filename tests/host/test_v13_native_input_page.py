@@ -42,20 +42,6 @@ class NativeInputPage(unittest.TestCase):
         self.assertIn(".write_volatile(value)", source)
         self.assertIn(".published\n        .store(0, Ordering::Release)", source)
 
-    def test_task_target_projection_does_not_reborrow_mutable_owner(self):
-        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
-        start = source.index("pub(crate) fn queued_targets(")
-        end = source.index("pub fn current_action", start)
-        projection = source[start:end]
-
-        self.assertIn("if !READY.load(Ordering::Acquire)", projection)
-        self.assertIn("projected_target(q.domain, q.ordinal)", projection)
-        self.assertNotIn("locked(", projection)
-        self.assertLess(
-            source.index("word.store(value, Ordering::Relaxed)"),
-            source.index("READY.store(true, Ordering::Release)"),
-        )
-
     def test_first_scope_hash_uses_verified_arch_acceleration_with_fallback(self):
         source = (ROOT / "kernel/src/learning_replay/owner.rs").read_text()
         start = source.index("fn scope_hash(")

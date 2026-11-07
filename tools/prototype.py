@@ -23,7 +23,7 @@ from doctor import ROOT, RUST_BIN, TARGET, env
 # Each engineering gate has one lane; native execution remains separate.
 TEST_LANES = {
     'static': ('format', 'governance-format', 'clippy', 'governance-clippy'),
-    'rust': ('rust', 'tls'),
+    'rust': ('rust', 'cluster-engine', 'tls'),
     'host': ('fixtures', 'host'),
     'tools': ('tools',),
 }
@@ -112,6 +112,8 @@ def test_steps(fetch: bool, lane: str = "all") -> list[tuple[str, list[str]]]:
         ('governance-format', [cargo, 'fmt', '--manifest-path',
                               str(ROOT / 'user/prototype-governance/Cargo.toml'), '--', '--check']),
         ('rust', [cargo, 'test', '--locked', '--offline', '--workspace', '--exclude', 'cyxia-kernel']),
+        ('cluster-engine', [cargo, 'test', '--locked', '--offline', '-p',
+                            'cyxia-prototype', '--features', 'cluster-engine']),
         ('tls', [cargo, 'test', '--locked', '--offline', '-p',
                  'cyxia-cluster-transport', '--features', 'tls']),
         ('host', python + ['-m', 'unittest', 'discover', '-s', 'tests/host', '-p', 'test_*.py']),

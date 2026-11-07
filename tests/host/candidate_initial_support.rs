@@ -144,6 +144,25 @@ pub fn candidate_poll_scenario(){
         assert!(replay::baseline_activation_pending(),"actual candidate renewal lost its paid progress opportunity");
     }
 
+    if mode=="registry_first_apply" {
+        static APPLIES:AtomicU64=AtomicU64::new(0);
+        with(|s|{s.owner.families[0].as_mut().unwrap().apply=|a,id,stamp,at|{
+            APPLIES.fetch_add(1,Ordering::AcqRel);apply(a,id,stamp,at)
+        };Ok(())}).unwrap();
+        let entered=now();REGISTRY_FAIL.store(true,Ordering::Release);
+        assert_eq!(poll(now()),Err(Error::Stale));
+        assert_eq!(APPLIES.load(Ordering::Acquire),1);
+        with(|s|{let d=s.owner.desired[0].unwrap();
+            assert!(d.started,"Registry error discarded actual APPLY custody");
+            assert_eq!(d.first_entry_ns,Some(entered));Ok(())}).unwrap();
+        assert!(replay::baseline_activation_pending());
+        REGISTRY_FAIL.store(false,Ordering::Release);
+        poll(now()).unwrap();
+        assert_eq!(APPLIES.load(Ordering::Acquire),1,"Registry error caused duplicate APPLY");
+        with(|s|{assert_eq!(s.owner.desired[0].unwrap().first_entry_ns,Some(entered));Ok(())}).unwrap();
+        println!("candidate first APPLY custody survives Registry error");return;
+    }
+
     if mode=="stale"{with(|s|{s.owner.context.ledger_generation+=1;Ok(())}).unwrap();}
     if mode=="denial_ledger"{with(|s|{s.owner.context.ledger_generation+=1;Ok(())}).unwrap();}
     if mode=="denial_core"{with(|s|{s.owner.context.core_generation+=1;Ok(())}).unwrap();}

@@ -52,7 +52,7 @@ impl Driver {
                     .iter()
                     .any(|r| r.key == *task && r.state == TaskState::Started && !r.received)
             }) {
-                self.task_key = Some(task);
+                self.incoming_task_key = Some(task);
                 if admitted {
                     self.engine
                         .reconcile_started(task, contract.owner_boot, contract.request_hash)

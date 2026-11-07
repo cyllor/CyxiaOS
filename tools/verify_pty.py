@@ -12,6 +12,8 @@ from verify_x11 import wait
 
 
 def verify(elf, output, runs=3):
+    if runs <= 0:
+        raise ValueError("runs must be positive")
     image = elf.read_bytes()
     profile = boot_profile(image)
     output.mkdir(parents=True, exist_ok=True)
@@ -54,6 +56,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts/pty")
     parser.add_argument("--runs", type=int, default=3)
     args = parser.parse_args()
+    if args.runs <= 0:
+        parser.error("--runs must be positive")
     result = verify(args.elf.resolve(), args.output.resolve(), args.runs)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result["status"] == "PASS" else 1)

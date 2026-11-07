@@ -185,7 +185,7 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             command=[str(RUST_BIN/'cargo'),'run','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-candidate-initial')]
             failures=[]
-            for case in ['denial_scope','denial_core','denial_ledger','denial_binder','denial_binding','denial_executor','root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry']:
+            for case in ['denial_scope','denial_core','denial_ledger','denial_binder','denial_binding','denial_executor','root','renewal','renewal_stale','publish','activate','stale','failed','busy','deadline','unknown','applied','registry','registry_first_apply']:
                 r=subprocess.run(command+['--',case],cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
                 if r.returncode: failures.append(case+'\n'+r.stdout+r.stderr)
             self.assertFalse(failures,'\n'.join(failures))

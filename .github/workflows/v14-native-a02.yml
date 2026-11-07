@@ -2,9 +2,9 @@ name: Prototype native A02 isolation
 
 on:
   push:
-    branches: [CyxiaOS-V0.15]
+    branches: [CyxiaOS-V0.15, CyxiaOS-V0.16]
   pull_request:
-    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15]
+    branches: [CyxiaOS-V0.14, CyxiaOS-V0.15, CyxiaOS-V0.16]
     paths:
       - '.github/workflows/v14-native-a02.yml'
       - 'kernel/**'

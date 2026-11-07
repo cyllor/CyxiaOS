@@ -116,6 +116,9 @@ impl BatchedRng {
         r
     }
     fn collect(&mut self, p: &impl Platform) -> Result<(), Error> {
+        // Pair deadline decisions with the upcoming completion observation.
+        // A device can complete during the empty poll's interrupt ACK.
+        let observed_ms = p.now_ms();
         for _ in 0..self.capacity() {
             let mut out = [0; 256];
             let c = match self.queue.poll(&mut self.transport, &mut out, p) {
@@ -145,7 +148,7 @@ impl BatchedRng {
             .pending
             .iter()
             .flatten()
-            .any(|(_, start)| p.now_ms().wrapping_sub(*start) >= 250)
+            .any(|(_, start)| observed_ms.wrapping_sub(*start) >= 250)
         {
             self.fail(p);
             return Err(Error::Timeout);
@@ -224,8 +227,16 @@ mod tests {
         ptr::{read_volatile, write_volatile},
     };
     use std::boxed::Box;
-    struct Host(Cell<u64>);
+    struct Host(Cell<u64>, Cell<Option<usize>>);
     unsafe impl Platform for Host {
+        fn diagnostic_stage(&self, stage: u64) {
+            if stage == crate::DiagnosticStage::QueueIdleAck as u64 {
+                if let Some(base) = self.1.take() {
+                    unsafe { all_complete(base) };
+                    self.0.set(250_000_000);
+                }
+            }
+        }
         fn physical(&self, a: usize, _: usize) -> Result<u64, Error> {
             Ok(a as u64)
         }
@@ -239,7 +250,7 @@ mod tests {
         }
     }
     fn fixture() -> (BatchedRng, Host, usize) {
-        let p = Host(Cell::new(0));
+        let p = Host(Cell::new(0), Cell::new(None));
         let m = Box::leak(Box::new(Page::zeroed()));
         m.put32(0, 0x74726976);
         m.put32(4, 2);
@@ -301,6 +312,25 @@ mod tests {
         assert_eq!(b[0], 64);
         assert_eq!(r.queue.free(), 1);
         assert_eq!(r.pool[0], [0; 256]);
+    }
+    #[test]
+    fn completion_during_idle_ack_does_not_time_out_or_release_dma() {
+        let (mut r, p, m) = fixture();
+        r.prefetch(&p).unwrap();
+        p.0.set(249_000_000);
+        p.1.set(Some(m));
+        let mut out = [0xaa; 32];
+        assert_eq!(r.try_fill(&mut out, &p), Ok(0));
+        assert_eq!(out, [0xaa; 32]);
+        assert_eq!(r.queue.free(), 0);
+        assert!(
+            r.pending
+                .iter()
+                .all(|entry| entry.is_some_and(|(_, start)| start == 0))
+        );
+        assert_eq!(r.try_fill(&mut out, &p), Ok(32));
+        assert_eq!(out[31], 31);
+        assert_eq!(r.queue.free(), 0);
     }
     #[test]
     fn silent_device_retains_all_dma_and_never_fills_output() {

@@ -1,0 +1,743 @@
+{
+  "schema_version": 1,
+  "software_version": "0.16.0-dev",
+  "source_parent": "32057802e6e7d9239d04f1e7e3fed4f82f90db7e",
+  "scope": "development-source remediation and host verification; not native acceptance",
+  "native_acceptance": "NOT_RUN",
+  "release_acceptance_verified": false,
+  "source_identity_policy": "Source hashes bind the reviewed production/test/CI files. Exact commit/tree and ZIP checksum are emitted by the source workflow to avoid a self-referential commit field.",
+  "verified_source_sha256": {
+    ".github/workflows/v14-a-workstreams.yml": "03d2d4ca4a6869b4601104fb3ab3e1bbfa64fdbba03ccabf2530c86494751748",
+    ".github/workflows/v14-native-a02.yml": "ccbe7da422129ec1fb7b100b868875ddb5f557d55bb709a9bc4671ef2df06172",
+    ".github/workflows/v16-source.yml": "4a2f5fdc48791666939ce6cfc9e29eff0e1bb9acc2cb037fb4ecc2a31804a828",
+    ".github/workflows/validate-prototype.yml": "c0552a0c025dda655ddb4f7c06a4ab45faf1c0126fbd947be563ae99c2cb6e88",
+    "VERSION": "b896b16fefa8b8e97f413d2d0c4e8a7d60ccea27044db9671a93a13c6e12af5d",
+    "crates/driver-virtio/src/rng/batched.rs": "5e269f451c777a11965f9c6fc9fa324e32f72113b501ff471bdd8d8f2f6349f6",
+    "crates/prototype/tests/native_unified_store.rs": "9a42df362d152ae18c55eb4e2c17a0b1277ef8e3836fe4e239b527b11e81cd1b",
+    "kernel/src/domain_control.rs": "a20ee10c67b1af5fd4903108180461670b9137f0f38298fb9c8b7cfe652ee4b4",
+    "kernel/src/domain_control/replay.rs": "8dfee0a800e866b801abefa2f1104ed04474fca7cc3fb2a3e946c075fdd48418",
+    "kernel/src/domain_tasks.rs": "2b3b8b27b3725f83b02be4006a0840c0629e1aba21624f6014de664e6c666d92",
+    "kernel/src/unified_store.rs": "f6721323d07f8be81e4144fb9c9151c1ee96196e45bbe1428406265b87a714bc",
+    "tests/host/candidate_initial_support.rs": "803b7c4e2ab31cb08d9868f987c98ca32c080f1d8b5b80729d60c95d2d6d93c7",
+    "tests/host/generate_control_feedback.py": "c83cf3b36a709a32894aaf73b8059ae53c9db6ac1c9124c56f76951a308e74d1",
+    "tests/host/generate_replay_target_cursor.py": "9189ad154deac6daed380fc74d41b4efc1b69b809e17e1ca70d54e625e36a700",
+    "tests/host/generate_task_target_regression.py": "86b6225153e3a9febc9dcc87ded569e749ce830dcd4edb154ba3636decbd6e6d",
+    "tests/host/test_candidate_initial_progress.py": "f7182c7dedb4d677639ed06888d0a39e17c97ac79187ef4a3626487c2c3cf547",
+    "tests/host/test_control_remediation.py": "dcc0b8c092bc6fee6a53c3a16ae7b284a88d86a1eea53abdabf3f15fb569169d",
+    "tests/host/test_prototype_validation_lanes.py": "fdef1608c2d7a1058729d8ac9b45187b6258ba73bf0cdda7b1efa0bab3cac05a",
+    "tests/host/test_v016_tools_bounds.py": "8b6f2c559547a8e4c3c73bc1e12adf7e40c18ad8b0fcce64b9fb2497c66afb8c",
+    "tests/host/test_v13_native_input_page.py": "4c5bde2afe66ee9aebcac46db39977025307bf4e5d6fb59c9170106a9a063e8e",
+    "tools/build_cosmic.py": "1b410337a135d52b68918ab68db76a92c1a649cffd00e800100e07c080600fe0",
+    "tools/prototype.py": "587511cebbf8f45340411cf62ad3dd463111721f9f8984bc4c63f22356205e18",
+    "tools/verify_pty.py": "81b4cba9e191de64bf5b8dcf4f9c9081c0ecf476acda97b467d38a5d298f12ab",
+    "user/prototype-cluster/src/driver.rs": "5c9c953d4e8a7d61b1ca9019d905e4f88bf6ec5a20db5e036a628d564fc0d2f0",
+    "user/prototype-cluster/src/driver/custody.rs": "c25a894c38b40e8ce96b095e4f432b0f61e0f7a043c779da7afe3b1644de0b69",
+    "user/prototype-cluster/src/driver/domain.rs": "89229e0258e087abbaf34cbbb7baa1e9274682b91e847d8cde5ad4ec99bbfe62",
+    "user/prototype-cluster/tests/driver_host.rs": "4853cc40331a81c32428938b1dd6e55b98d62831c011f3258d2f7c04264269b0",
+    "user/prototype-cluster/tests/support/reconnect_checks.rs": "ef7d0d1ace94d94f31fd1db02b62d53bc732c08dac7bda88e0f6381ca15ca184",
+    "user/prototype-cluster/tests/support/recovery_checks.rs": "570028b2087894a8cf937a2e71b6fd913cd7fbafb458d7c6f1aa0668dc06bb32",
+    "user/prototype-cluster/tests/support/resend_checks.rs": "8ee0844d17872d6a707c74ed1c996b7f24b0c5551d86b41d2ea2e33e8cca42eb"
+  },
+  "environment": {
+    "test_toolchain": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "host_target": "x86_64-unknown-linux-gnu",
+    "cargo_mode": "--locked --offline for project verification",
+    "formatter_used": "rustfmt 1.10.0-stable (58cf8f9c35 2026-10-13), installed stable toolchain",
+    "missing_pinned_components": [
+      "aarch64-unknown-none-softfloat",
+      "rustfmt",
+      "clippy"
+    ],
+    "unavailable_native_tools": [
+      "qemu-system-aarch64",
+      "clang"
+    ],
+    "native_guest_execution_attempted": false
+  },
+  "baseline_workspace": {
+    "log": "baseline-workspace.log",
+    "log_sha256": "ec602456686b84b8ecb6a6da6e69cba3a47d738c26944b1999d43c78e7cbe7d8",
+    "passed": 1202,
+    "failed": 0,
+    "ignored": 0,
+    "targets": 162,
+    "counts_overlap_other_suites": true
+  },
+  "engineering_runs": [
+    {
+      "schema_version": 1,
+      "scope": "host-validation",
+      "status": "FAIL",
+      "release_acceptance_verified": false,
+      "steps": [
+        {
+          "name": "fixtures",
+          "argv": [
+            "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+            "-B",
+            "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/tools/prepare_host_tests.py"
+          ],
+          "log": "01-fixtures.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 0.07,
+          "log_sha256": "984b0ea21c1db318dacd1fef17213d6de025e7572481e45b41f58ed384f6da9c"
+        },
+        {
+          "name": "format",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+          ],
+          "log": "02-format.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 0.101,
+          "log_sha256": "cc27b4ccc96a1ed9869eb7ebb1e256f3f637f5dc459f15d7d5681334e008eed4"
+        },
+        {
+          "name": "governance-format",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "fmt",
+            "--manifest-path",
+            "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
+            "--",
+            "--check"
+          ],
+          "log": "03-governance-format.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 0.098,
+          "log_sha256": "cc27b4ccc96a1ed9869eb7ebb1e256f3f637f5dc459f15d7d5681334e008eed4"
+        },
+        {
+          "name": "rust",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "test",
+            "--locked",
+            "--offline",
+            "--workspace",
+            "--exclude",
+            "cyxia-kernel"
+          ],
+          "log": "04-rust.log",
+          "returncode": 0,
+          "status": "PASS",
+          "elapsed_seconds": 37.405,
+          "log_sha256": "4f27ac643ade759638f415bf234e0daec687aa0a6c9503ae61b18b5fff8a0fc1"
+        },
+        {
+          "name": "cluster-engine",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "test",
+            "--locked",
+            "--offline",
+            "-p",
+            "cyxia-prototype",
+            "--features",
+            "cluster-engine"
+          ],
+          "log": "05-cluster-engine.log",
+          "returncode": 0,
+          "status": "PASS",
+          "elapsed_seconds": 29.292,
+          "log_sha256": "80aeb60a5fc8c309327c827efbc6900355de3cd156d3267de6302fc80e8c64fe"
+        },
+        {
+          "name": "tls",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "test",
+            "--locked",
+            "--offline",
+            "-p",
+            "cyxia-cluster-transport",
+            "--features",
+            "tls"
+          ],
+          "log": "06-tls.log",
+          "returncode": 0,
+          "status": "PASS",
+          "elapsed_seconds": 10.851,
+          "log_sha256": "b2f5827569a70b0ab51ccacbc85d8c77de331bac6a587adc9261a73d7526d1d7"
+        },
+        {
+          "name": "host",
+          "argv": [
+            "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+            "-B",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests/host",
+            "-p",
+            "test_*.py"
+          ],
+          "log": "07-host.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 428.74,
+          "log_sha256": "ef2539795e35ee3fd2910d19ef5f97fea08854b9c74ed9756999e656920ca1ec"
+        },
+        {
+          "name": "tools",
+          "argv": [
+            "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+            "-B",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tools",
+            "-p",
+            "test_*.py"
+          ],
+          "log": "08-tools.log",
+          "returncode": 0,
+          "status": "PASS",
+          "elapsed_seconds": 1.323,
+          "log_sha256": "5829f1374a2b7a31b61ef986262dcbcd30e9d8ac53f2dc5a62f381f37fea6187"
+        },
+        {
+          "name": "clippy",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "clippy",
+            "--locked",
+            "--offline",
+            "-p",
+            "cyxia-kernel",
+            "--target",
+            "aarch64-unknown-none-softfloat",
+            "--features",
+            "smp-selftest",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "09-clippy.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 0.096,
+          "log_sha256": "3ed140b34eda44b9b5d2a898de74b86e714424b11cb4c6122fa75bf08aa452a7"
+        },
+        {
+          "name": "governance-clippy",
+          "argv": [
+            "/home/agent/.cargo/bin/cargo",
+            "clippy",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+            "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
+            "--target-dir",
+            "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/target/prototype-governance",
+            "--target",
+            "aarch64-unknown-none-softfloat",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "10-governance-clippy.log",
+          "returncode": 1,
+          "status": "FAIL",
+          "elapsed_seconds": 0.105,
+          "log_sha256": "3ed140b34eda44b9b5d2a898de74b86e714424b11cb4c6122fa75bf08aa452a7"
+        }
+      ],
+      "stage": "before final control integration corrections",
+      "bound_to_final_source": false,
+      "host_counts": {
+        "run": 836,
+        "failures": 3,
+        "errors": 22,
+        "skipped": 2
+      },
+      "product_regressions_fixed_after_run": [
+        {
+          "test": "test_candidate_initial_progress.CandidatePublicationProgress.test_submitted_identity_terminal_updates_and_prepublication_activate",
+          "correction": "Retain actual executor custody and candidate terminal evidence on later Registry rejection; add exactly-once APPLY regression."
+        },
+        {
+          "test": "test_v13_native_input_page.NativeInputPage.test_task_target_projection_does_not_reborrow_mutable_owner",
+          "correction": "Remove obsolete fixed-projection source-string requirement; behavioral live-roster and fairness coverage replaces it."
+        }
+      ],
+      "host_failure_names": [
+        "ERROR: setUpClass (test_cosmic_nested_patch.NestedPatch)",
+        "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+        "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+        "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+        "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+        "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+        "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+        "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+        "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+        "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_multi_client.SmithayMultiClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+        "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_multi_client.SmithayMultiClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+        "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_multi_client.SmithayMultiClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+        "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_multi_client.SmithayMultiClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+        "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_resize_client.SmithayResizeClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+        "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_resize_client.SmithayResizeClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+        "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_resize_client.SmithayResizeClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+        "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_resize_client.SmithayResizeClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+        "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+        "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+        "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+        "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+        "ERROR: test_private_nbd_connection_records_the_kernel_peer_process_when_supported (test_v13_a10_native_receipt.NativeProtocol.test_private_nbd_connection_records_the_kernel_peer_process_when_supported)",
+        "FAIL: test_submitted_identity_terminal_updates_and_prepublication_activate (test_candidate_initial_progress.CandidatePublicationProgress.test_submitted_identity_terminal_updates_and_prepublication_activate)",
+        "FAIL: test_timeout_reaps_only_owned_qemu (test_runner.CleanupTests.test_timeout_reaps_only_owned_qemu)",
+        "FAIL: test_task_target_projection_does_not_reborrow_mutable_owner (test_v13_native_input_page.NativeInputPage.test_task_target_projection_does_not_reborrow_mutable_owner)"
+      ],
+      "environment_classification": {
+        "missing_wayland_protocols_0_32_13_crate": 20,
+        "missing_cosmic_comp_epoch_source": 1,
+        "unix_socket_permission_error": 1,
+        "runner_timeout_assertion_receives_socket_permission_error": 1,
+        "historical_native_capture_skips": 2
+      }
+    }
+  ],
+  "final_engineering_rerun": {
+    "schema_version": 1,
+    "scope": "host-validation",
+    "status": "FAIL",
+    "release_acceptance_verified": false,
+    "steps": [
+      {
+        "name": "fixtures",
+        "argv": [
+          "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+          "-B",
+          "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/tools/prepare_host_tests.py"
+        ],
+        "log": "01-fixtures.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 0.093,
+        "log_sha256": "984b0ea21c1db318dacd1fef17213d6de025e7572481e45b41f58ed384f6da9c"
+      },
+      {
+        "name": "format",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "log": "02-format.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 0.146,
+        "log_sha256": "cc27b4ccc96a1ed9869eb7ebb1e256f3f637f5dc459f15d7d5681334e008eed4"
+      },
+      {
+        "name": "governance-format",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "fmt",
+          "--manifest-path",
+          "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
+          "--",
+          "--check"
+        ],
+        "log": "03-governance-format.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 0.133,
+        "log_sha256": "cc27b4ccc96a1ed9869eb7ebb1e256f3f637f5dc459f15d7d5681334e008eed4"
+      },
+      {
+        "name": "rust",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--workspace",
+          "--exclude",
+          "cyxia-kernel"
+        ],
+        "log": "04-rust.log",
+        "returncode": 0,
+        "status": "PASS",
+        "elapsed_seconds": 10.063,
+        "log_sha256": "fc4fef519e7f4af11211f4408fdc593fadbbb6b3e49877fd67ada81bc69ce233",
+        "rust_counts": {
+          "passed": 1203,
+          "failed": 0,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "cluster-engine",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "-p",
+          "cyxia-prototype",
+          "--features",
+          "cluster-engine"
+        ],
+        "log": "05-cluster-engine.log",
+        "returncode": 0,
+        "status": "PASS",
+        "elapsed_seconds": 8.965,
+        "log_sha256": "e2b0172a5272ea60ad6c71cfdd1e1426c579745aefd3ff6a32bddd819a914c98",
+        "rust_counts": {
+          "passed": 612,
+          "failed": 0,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "tls",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "-p",
+          "cyxia-cluster-transport",
+          "--features",
+          "tls"
+        ],
+        "log": "06-tls.log",
+        "returncode": 0,
+        "status": "PASS",
+        "elapsed_seconds": 0.089,
+        "log_sha256": "74f79326adb7110642349b5a9d8039cc7defc4cf64afedb9791c8bf0ed3fbeb6",
+        "rust_counts": {
+          "passed": 34,
+          "failed": 0,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "host",
+        "argv": [
+          "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests/host",
+          "-p",
+          "test_*.py"
+        ],
+        "log": "07-host.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 244.901,
+        "log_sha256": "16467915bbeab776c54ba005cb75ca3a62d15e4a149be646c0f7d80c114a0909",
+        "counts": {
+          "run": 837,
+          "failures": 1,
+          "errors": 22,
+          "skipped": 2
+        },
+        "failure_names": [
+          "ERROR: setUpClass (test_cosmic_nested_patch.NestedPatch)",
+          "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+          "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+          "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+          "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_dynamic_client.SmithayDynamicClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+          "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+          "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+          "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+          "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_interactive_client.SmithayInteractiveClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+          "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_multi_client.SmithayMultiClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+          "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_multi_client.SmithayMultiClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+          "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_multi_client.SmithayMultiClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+          "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_multi_client.SmithayMultiClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+          "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_resize_client.SmithayResizeClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+          "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_resize_client.SmithayResizeClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+          "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_resize_client.SmithayResizeClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+          "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_resize_client.SmithayResizeClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+          "ERROR: test_archive_identity_does_not_replace_exact_xml_pin (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_archive_identity_does_not_replace_exact_xml_pin)",
+          "ERROR: test_modified_crate_is_rejected_before_generation (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_modified_crate_is_rejected_before_generation)",
+          "ERROR: test_stale_scanner_is_rejected_before_output (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_stale_scanner_is_rejected_before_output)",
+          "ERROR: test_xml_extracted_from_exact_archive_and_existing_evidence_preserved (test_smithay_xdg_client.SmithayXdgClientBuildTests.test_xml_extracted_from_exact_archive_and_existing_evidence_preserved)",
+          "ERROR: test_private_nbd_connection_records_the_kernel_peer_process_when_supported (test_v13_a10_native_receipt.NativeProtocol.test_private_nbd_connection_records_the_kernel_peer_process_when_supported)",
+          "FAIL: test_timeout_reaps_only_owned_qemu (test_runner.CleanupTests.test_timeout_reaps_only_owned_qemu)"
+        ],
+        "environment_classification": {
+          "missing_wayland_protocols_0_32_13_crate": 20,
+          "missing_cosmic_comp_epoch_source": 1,
+          "unix_socket_permission_error": 1,
+          "runner_timeout_assertion_receives_socket_permission_error": 1,
+          "historical_native_capture_skips": 2
+        }
+      },
+      {
+        "name": "tools",
+        "argv": [
+          "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools",
+          "-p",
+          "test_*.py"
+        ],
+        "log": "08-tools.log",
+        "returncode": 0,
+        "status": "PASS",
+        "elapsed_seconds": 1.297,
+        "log_sha256": "0ae174e84497b4e4bdbb5c8c139a9812f905b6d02328d1c3f2fd7d9a4ed228bf",
+        "counts": {
+          "run": 232,
+          "status": "PASS"
+        }
+      },
+      {
+        "name": "clippy",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "clippy",
+          "--locked",
+          "--offline",
+          "-p",
+          "cyxia-kernel",
+          "--target",
+          "aarch64-unknown-none-softfloat",
+          "--features",
+          "smp-selftest",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "09-clippy.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 0.096,
+        "log_sha256": "3ed140b34eda44b9b5d2a898de74b86e714424b11cb4c6122fa75bf08aa452a7"
+      },
+      {
+        "name": "governance-clippy",
+        "argv": [
+          "/home/agent/.cargo/bin/cargo",
+          "clippy",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
+          "--target-dir",
+          "/workspace/scratch/56306521ea0a/CyxiaOS-V0.16/target/prototype-governance",
+          "--target",
+          "aarch64-unknown-none-softfloat",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "10-governance-clippy.log",
+        "returncode": 1,
+        "status": "FAIL",
+        "elapsed_seconds": 0.104,
+        "log_sha256": "3ed140b34eda44b9b5d2a898de74b86e714424b11cb4c6122fa75bf08aa452a7"
+      }
+    ],
+    "evidence_directory": "engineering-confirmed",
+    "bound_to_final_source": true,
+    "scope_note": "Completed after all semantic production and test corrections. Two generator whitespace-only cleanups followed, with a fresh passing control regression run recorded in post_matrix_cosmetic_cleanup. FAIL is retained for missing inputs/components and socket limitations."
+  },
+  "targeted_results": {
+    "cluster_final": {
+      "log": "cluster-final.log",
+      "log_sha256": "855c8ac2c906df5bf4c7b3d5c8d32591e085eca2ac3133fc718d056a84c57d97",
+      "passed": 88,
+      "failed": 0,
+      "ignored": 0,
+      "targets": 12,
+      "counts_overlap_other_suites": true
+    },
+    "prototype_with_cluster_engine": {
+      "log": "prototype-engine-green.log",
+      "log_sha256": "0ee46d9d80f771a1d94486ae887638fe827d7b4d8ef78f40025066d338637fcc",
+      "passed": 612,
+      "failed": 0,
+      "ignored": 0,
+      "targets": 102,
+      "counts_overlap_other_suites": true
+    },
+    "store_broker": {
+      "log": "store-green.log",
+      "log_sha256": "634e36543aa48aa4bde71ddfe7090516cc5718745b90048fe565ce442d142630",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "targets": 1,
+      "counts_overlap_other_suites": true
+    },
+    "driver": {
+      "log": "tools-driver/round1-driver-green.txt",
+      "log_sha256": "b3f0d977db053a0172da35e8b82b5502a88ef300bb17e97bbf0e8c0eb34257c2",
+      "passed": 79,
+      "failed": 0,
+      "ignored": 0,
+      "targets": 2,
+      "counts_overlap_other_suites": true
+    },
+    "control_final": {
+      "log": "control-round2-remediation-green.log",
+      "log_sha256": "1e3867dde2043e24546c45bba6fe0249f3a0bebd2c20c05c044b1fce4824ceb4",
+      "summaries": [
+        "Ran 3 tests in 1.272s",
+        "OK"
+      ]
+    },
+    "candidate_custody_final": {
+      "log": "control-round2-candidate-green.log",
+      "log_sha256": "ebaf54bd7c6536f5fb7a7eb7aba18f8c53fc815e757912ba9cbef01728d1cbb0",
+      "summaries": [
+        "Ran 2 tests in 7.914s",
+        "OK"
+      ]
+    },
+    "native_input_page_remaining": {
+      "log": "control-round2-input-green.log",
+      "log_sha256": "c6b9b1f09add0403cc07e90bfdf272129b1ddfa2f8f7675ea8218862f2516371",
+      "summaries": [
+        "Ran 6 tests in 0.001s",
+        "OK"
+      ]
+    },
+    "tools_bounds_final": {
+      "log": "tools-driver/round3-green.txt",
+      "log_sha256": "4cae4b5447e83ce9121bc201c8ccfcd43f37a1db7168a932eacfea8ba824cacb",
+      "summaries": [
+        "Ran 6 tests in 7.621s",
+        "OK"
+      ]
+    },
+    "build_cosmic_final": {
+      "log": "tools-driver/round3-build-green.txt",
+      "log_sha256": "6be6cab2e70b48a0227b73edeff88bfb6c5227e25667b51142a60496449e43d3",
+      "summaries": [
+        "Ran 13 tests in 0.559s",
+        "OK (skipped=1)"
+      ]
+    },
+    "lane_command_coverage": {
+      "log": "lanes-green.log",
+      "log_sha256": "c6b9b1f09add0403cc07e90bfdf272129b1ddfa2f8f7675ea8218862f2516371",
+      "summaries": [
+        "Ran 6 tests in 0.001s",
+        "OK"
+      ]
+    }
+  },
+  "storage_read_cost": {
+    "unit": "4 KiB block-device read calls on a host memory device",
+    "pre_fix": [
+      {
+        "records": 36,
+        "broker_reads": 1415,
+        "reference_reads": 74
+      }
+    ],
+    "post_fix": [
+      {
+        "records": 36,
+        "broker_reads": 73,
+        "reference_reads": 74
+      },
+      {
+        "records": 68,
+        "broker_reads": 138,
+        "reference_reads": 139
+      },
+      {
+        "records": 132,
+        "broker_reads": 268,
+        "reference_reads": 269
+      }
+    ],
+    "physical_time_claim": false
+  },
+  "review": {
+    "groups": [
+      "cluster R01/R03",
+      "control R02/R08/R09",
+      "tools/driver R04/R05/R07",
+      "storage R06"
+    ],
+    "task_reviews": "All four groups and final scoped integration fixes approved.",
+    "whole_branch_review": "APPROVED",
+    "warnings": [
+      "Existing vendored ring lifetime warnings and test-harness unused/dead-code warnings remain.",
+      "Host and component suite counts overlap and must not be added as unique cases."
+    ],
+    "whole_branch_review_sha256": "c85d1c7f79db6af8ab0093024c6de2b811992d6ff86386352d99bd244cbb54b1",
+    "critical_findings": 0,
+    "important_findings": 0,
+    "optional_follow_up": [
+      "Direct nonmatching CLOSE_REPLY window regression",
+      "Explicit second-volume-file EOF/append regression"
+    ]
+  },
+  "supplemental_checks": [
+    {
+      "name": "pinned unified kernel check",
+      "status": "FAIL",
+      "reason": "Rust 1.95.0 AArch64 core target absent",
+      "log": "control-kernel-check.log"
+    },
+    {
+      "name": "stable 1.99.1 unified AArch64 check",
+      "status": "FAIL",
+      "reason": "Build script requires a previously built per-node EL0 cluster service; unified kernel compilation not reached",
+      "log": "supplemental-aarch64-check.log",
+      "log_sha256": "f4e90e7f216d654ef3b99d7e937bc8a7ee04ceac4ac75b05046c43762eca3ae2",
+      "qualifies_pinned_build": false
+    },
+    {
+      "name": "stable 1.10.0 workspace formatting check",
+      "status": "FAIL",
+      "reason": "Newer formatter proposes macro formatting in unchanged crates/prototype/tests/native_task_publication.rs; pinned formatter is unavailable",
+      "log": "supplemental-format.log",
+      "log_sha256": "1babe7073cca80b406a229a28596590c047843473bb6c082d1ad70aed1461161",
+      "qualifies_pinned_formatter": false
+    }
+  ],
+  "preserved_contracts": {
+    "persistent_record_format_changed": false,
+    "wire_format_changed": false,
+    "queue_limit_raised": false,
+    "dependencies_changed": false,
+    "native_catalogue_changed": false,
+    "specification_changed": false
+  },
+  "acceptance_limits": [
+    "No QEMU/native TCP/cold boot/power-loss acceptance.",
+    "R09 targeted typed enumeration proof is not a native full-freeze or cross-owner atomic roster proof.",
+    "R02 normalizes the confirmed illegal transition while preserving actual execution facts; no general transactionality across arbitrary Registry failures is claimed.",
+    "Linux cleanup and simulated portable-observer paths were tested; other operating systems were not executed."
+  ],
+  "post_matrix_cosmetic_cleanup": {
+    "files": [
+      "tests/host/generate_control_feedback.py",
+      "tests/host/generate_task_target_regression.py"
+    ],
+    "change": "Remove trailing whitespace in two generator lines; one is outside a Python literal, one is a blank leading line in generated Rust. Production source and Rust tokens are unchanged.",
+    "targeted_revalidation": "PASS",
+    "command": "python3 -B -m unittest discover -s tests/host -p test_control_remediation.py",
+    "tests_run": 3,
+    "log": "control-final-whitespace.log",
+    "log_sha256": "f19f5e05ffd6ad08e39443ceb4a8bd11906b07fc4b45c722e59f59456edc6bc6"
+  }
+}

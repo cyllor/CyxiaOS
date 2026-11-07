@@ -1,18 +1,18 @@
 # CyxiaOS
 
-## V0.15 代码汇总基线
+## V0.16 审核修复开发基线
 
-当前开发分支为 **`CyxiaOS-V0.15`**，软件版本 **`0.15.0-dev`**；最小原型设计配置仍为 **1.3**，不随软件分支改号。
+当前开发分支为 **`CyxiaOS-V0.16`**，软件版本 **`0.16.0-dev`**；最小原型设计配置仍为 **1.3**，不随软件分支改号。
 
-本分支从已验证的集成提交 `60435c3d002f5d24ab0590bcbd938eeecf073185` 建立，保留 V0.14 之后的 14 个集成提交，包括 PR #9/#10 已移植的修复、A07 未决回执保护、A10 证据校验、学习预算及 Canary 修复、六路组件 CI 和独立原生 A02 流程。V0.14 与现有 PR 不被合并、重置或关闭。
+本分支基于 V0.15 提交 `32057802e6e7d9239d04f1e7e3fed4f82f90db7e`，修复全量代码审核和 Superpowers 复核确认的九项问题：集群重连关闭记录分批恢复、双向契约状态隔离、Unknown 执行状态一致性、构建进程组清理、PTY 执行次数校验、日志恢复顺序游标、Virtio RNG 超时竞态、动态 IPC 目标枚举，以及回放扫描对暂不可读目标的重试。
 
-完整来源、历史验证和剩余工作见 [V0.15 汇总说明](docs/implementation/v15-source-summary.md)；机器可读来源清单见 [V0.15 基线](docs/implementation/v15-source-baseline.json)。历史 A02 PASS 只属于原提交，**不能自动改称 V0.15 PASS**；新提交须重跑原生流程并独立登记。受版本管理的验收目录保持原样，完整原型发布门禁仍关闭。
+修复范围、回归结果与剩余工作见 [V0.16 汇总说明](docs/implementation/v16-source-summary.md)；机器可读来源见 [V0.16 基线](docs/implementation/v16-source-baseline.json)，实际验证记录见 [V0.16 验证](docs/implementation/v16-verification.json)。[V0.15 历史来源](docs/implementation/v15-source-summary.md)保留不变。历史原生 PASS 只属于原提交；V0.16 的主机回归通过不能替代原生验收，完整原型发布门禁仍关闭。
 
-工程四路、组件六路和独立 A02 工作流已接入 V0.15 的 push/PR；`V0.15 source snapshot` 仅归档源码和身份，不发布已完成验收的发行版。`tools/prototype.py` 的 `build`、`run-single`、`run-pair`、`test`、`report` 入口保持不变。
+工程四路、组件六路和独立 A02 工作流已接入 V0.16 的 push/PR；Rust 工程路新增 `cluster-engine` 回归。`V0.16 source snapshot` 归档触发提交的源码、树身份和校验结果，不改变原生验收状态。`tools/prototype.py` 的 `build`、`run-single`、`run-pair`、`test`、`report` 入口保持不变。
 
 ## 历史桌面、Shell 与独立配置说明
 
-以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，V0.15 状态以上述汇总和精确提交的运行证据为准。
+以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，V0.16 状态以上述汇总和精确提交的运行证据为准。
 
 不基于 Linux 的实验性操作系统。目标是由本地 AI 决策资源分配，由内核执行安全约束和资源机制。
 

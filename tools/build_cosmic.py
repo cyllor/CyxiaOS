@@ -132,6 +132,35 @@ def resource_check(root, min_free, max_bytes):
         raise CosmicBuildError('build directory exceeded its byte budget')
 
 
+def process_group_live(pgid):
+    """Observe cessation without waiting forever for orphan zombies to reap.
+
+    Linux exposes group and lifecycle state together in procfs. Elsewhere,
+    group disappearance is the portable proof available; callers must report
+    inability to establish cessation rather than assume signal delivery did it.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    if not sys.platform.startswith('linux'):
+        return True
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # comm may contain spaces and parentheses; fields after its final
+            # closing parenthesis begin with state, ppid and pgrp.
+            fields = (entry / 'stat').read_text().rpartition(') ')[2].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if len(fields) < 3:
+            raise CosmicBuildError('cannot establish process-group cessation: malformed proc stat')
+        if int(fields[2]) == pgid and fields[0] not in ('Z', 'X'):
+            return True
+    return False
+
+
 def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_root=None,
                 stderr_log=None, scratch_roots=(), growth_roots=()):
     """Run a real subprocess; terminate the entire process group on limit breach."""
@@ -166,15 +195,64 @@ def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_
             if child.returncode:
                 raise CosmicBuildError(f'command exit {child.returncode}; see {log}')
         except BaseException:
+            group_exists = True
             try:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                group_exists = False
+            observation_error = None
+
+            def still_live():
+                nonlocal observation_error
+                # Reap a terminated leader as the portable existence probe
+                # otherwise continues seeing its zombie indefinitely.
+                child.poll()
+                try:
+                    return process_group_live(child.pid)
+                except Exception as error:
+                    if observation_error is None:
+                        observation_error = error
+                    # Unknown procfs state must not bypass escalation. ESRCH
+                    # remains an independent proof that ownership has ended.
+                    try:
+                        os.killpg(child.pid, 0)
+                    except ProcessLookupError:
+                        return False
+                    return True
+
+            # A failed observer does not cancel bounded termination/reaping.
+            # Retain its error even if the portable fallback later sees ESRCH.
+            grace = time.monotonic() + 2
+            while group_exists and still_live():
+                if time.monotonic() >= grace:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        group_exists = False
+                        break
+                    stopped = time.monotonic() + 2
+                    while still_live():
+                        if time.monotonic() >= stopped:
+                            break
+                        time.sleep(min(.01, max(0, stopped - time.monotonic())))
+                    else:
+                        group_exists = False
+                    break
+                time.sleep(min(.05, max(0, grace - time.monotonic())))
+            else:
+                group_exists = False
+            # No more signals or group lookups after cessation/ESRCH proof.
+            # Always attempt bounded leader reaping, including observer errors.
             try:
                 child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
+            except subprocess.TimeoutExpired as error:
+                raise CosmicBuildError('process-group cleanup failed: leader could not be reaped') from error
+            if observation_error is not None:
+                raise CosmicBuildError(
+                    f'process-group cleanup observation failed: {observation_error}') from observation_error
+            if group_exists:
+                raise CosmicBuildError(
+                    'process-group cleanup failed: live members remain or cessation cannot be established')
             raise
 
 

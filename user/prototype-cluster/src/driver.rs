@@ -104,15 +104,20 @@ pub struct Driver {
     committed: bool,
     activated: bool,
     done: bool,
-    terms: Option<Terms>,
-    reservation: [u8; 16],
-    contract_hash: [u8; 32],
+    // Requester state is independent of the peer-owned kernel custody below.
+    outgoing_terms: Option<Terms>,
+    outgoing_reservation: [u8; 16],
+    outgoing_hash: [u8; 32],
     kernel_token: Option<u64>,
     kernel_contract: Option<[u8; 16]>,
     kernel_epoch: u64,
     custody_recovering: bool,
-    task_key: Option<TaskKey>,
-    deadline: u64,
+    incoming_task_key: Option<TaskKey>,
+    outgoing_task_key: Option<TaskKey>,
+    closure_work: Vec<(TaskKey, [u8; 32])>,
+    closure_cursor: usize,
+    closure_waiting: Option<[u8; 16]>,
+    incoming_deadline: u64,
     sent_results: Vec<TaskKey>,
     recovering: bool,
     leave_id: Option<[u8; 16]>,
@@ -277,15 +282,19 @@ impl Driver {
             committed: false,
             activated: false,
             done,
-            terms: None,
-            reservation: [0; 16],
-            contract_hash: [0; 32],
+            outgoing_terms: None,
+            outgoing_reservation: [0; 16],
+            outgoing_hash: [0; 32],
             kernel_token: None,
             kernel_contract: None,
             kernel_epoch: 0,
             custody_recovering: true,
-            task_key: None,
-            deadline: 0,
+            incoming_task_key: None,
+            outgoing_task_key: None,
+            closure_work: Vec::new(),
+            closure_cursor: 0,
+            closure_waiting: None,
+            incoming_deadline: 0,
             sent_results: Vec::new(),
             recovering: false,
             leave_id,
@@ -411,6 +420,9 @@ impl Driver {
         let _ = broker::request(OP_TASK, &[], &mut [], 0, [9, 0, self.kernel_epoch]);
         self.active = false;
         self.engine.isolate();
+        self.closure_work.clear();
+        self.closure_cursor = 0;
+        self.closure_waiting = None;
         self.input.clear();
         self.output.clear();
         self.sent = 0;
@@ -1022,16 +1034,16 @@ impl Driver {
                     package_hash: b[12..44].try_into().unwrap(),
                     input_hash: self.engine.crypto.sha256(&task_input()),
                 };
-                self.contract_hash =
+                self.outgoing_hash =
                     self.engine
                         .request_hash_for(&t, self.engine.local, self.engine.peer);
-                self.terms = Some(t);
+                self.outgoing_terms = Some(t);
                 let mut body = terms_bytes(t);
-                body.extend_from_slice(&self.contract_hash);
+                body.extend_from_slice(&self.outgoing_hash);
                 body.extend_from_slice(&owner_boot.to_le_bytes());
                 let e = self
                     .engine
-                    .record_request(t, self.contract_hash)
+                    .record_request(t, self.outgoing_hash)
                     .map_err(|_| ())?;
                 persist(&mut self.engine, e)?;
                 self.done = true;
@@ -1062,7 +1074,8 @@ impl Driver {
                 reserve.extend_from_slice(&t.input_hash);
                 reserve.extend_from_slice(&t.package_hash);
                 reserve.extend_from_slice(&self.custody_key(t.id, hash));
-                broker::entropy(&mut self.reservation).map_err(|_| ())?;
+                let mut reservation = [0; 16];
+                broker::entropy(&mut reservation).map_err(|_| ())?;
                 let (_, token) =
                     broker::request(OP_TASK, &reserve, &mut [], 0, [TASK_RESERVE_CUSTODY, 0, 0])
                         .map_err(|_| ())?;
@@ -1071,7 +1084,7 @@ impl Driver {
                 self.kernel_contract = Some(t.id);
                 if self
                     .engine
-                    .prepare(t, hash, self.reservation, prepare_now, 2000)
+                    .prepare(t, hash, reservation, prepare_now, 2000)
                     .is_err()
                 {
                     let _ = broker::request(OP_TASK, &[], &mut [], 0, [4, token, 0]);
@@ -1079,21 +1092,19 @@ impl Driver {
                     self.kernel_contract = None;
                     return Err(());
                 }
-                self.terms = Some(t);
-                self.contract_hash = hash;
                 let mut out = t.id.to_vec();
-                out.extend_from_slice(&self.reservation);
+                out.extend_from_slice(&reservation);
                 out.extend_from_slice(&2000u32.to_le_bytes());
                 self.send(0x8011, out, Some(h.request))?;
                 broker::trace(0x220);
             }
             (17, true) => {
-                if b.len() != 36 || b[..16] != self.terms.ok_or(())?.id {
+                if b.len() != 36 || b[..16] != self.outgoing_terms.ok_or(())?.id {
                     return Err(());
                 }
-                self.reservation = b[16..32].try_into().unwrap();
+                self.outgoing_reservation = b[16..32].try_into().unwrap();
                 let mut out = b[..32].to_vec();
-                out.extend_from_slice(&self.contract_hash);
+                out.extend_from_slice(&self.outgoing_hash);
                 self.send(18, out, None)?;
                 self.prepared = true;
             }
@@ -1109,8 +1120,19 @@ impl Driver {
                     .commit(id, reservation, hash, now)
                     .map_err(|_| ())?;
                 persist(&mut self.engine, e)?;
-                self.deadline = now + self.terms.ok_or(())?.runtime_ms as u64;
-                let mut grant = self.deadline.to_le_bytes().to_vec();
+                let incoming = self
+                    .engine
+                    .contracts
+                    .iter()
+                    .find(|c| !c.remote && c.terms.id == id)
+                    .ok_or(())?;
+                if self.kernel_contract != Some(id) {
+                    return Err(());
+                }
+                self.incoming_deadline = now
+                    .checked_add(incoming.terms.runtime_ms as u64)
+                    .ok_or(())?;
+                let mut grant = self.incoming_deadline.to_le_bytes().to_vec();
                 grant.extend_from_slice(&1u64.to_le_bytes());
                 grant.extend_from_slice(&id);
                 broker::request(
@@ -1128,18 +1150,18 @@ impl Driver {
                 self.send(0x8012, out, Some(h.request))?;
             }
             (18, true) => {
-                if b.len() != 32 || b[..16] != self.terms.ok_or(())?.id {
+                if b.len() != 32 || b[..16] != self.outgoing_terms.ok_or(())?.id {
                     return Err(());
                 }
                 let owner_boot = u64::from_le_bytes(b[16..24].try_into().unwrap());
                 let grant_epoch = u64::from_le_bytes(b[24..32].try_into().unwrap());
-                let t = self.terms.ok_or(())?;
+                let t = self.outgoing_terms.ok_or(())?;
                 let e = self
                     .engine
                     .observe_grant(
                         t,
-                        self.contract_hash,
-                        self.reservation,
+                        self.outgoing_hash,
+                        self.outgoing_reservation,
                         owner_boot,
                         grant_epoch,
                     )
@@ -1156,9 +1178,9 @@ impl Driver {
                     .record_request_task(key, t.input_hash)
                     .map_err(|_| ())?;
                 persist(&mut self.engine, e)?;
-                self.task_key = Some(key);
+                self.outgoing_task_key = Some(key);
                 let mut out = key_bytes(key);
-                out.extend_from_slice(&self.contract_hash);
+                out.extend_from_slice(&self.outgoing_hash);
                 out.extend_from_slice(&owner_boot.to_le_bytes());
                 out.extend_from_slice(&grant_epoch.to_le_bytes());
                 let input = if self.native.is_some() {
@@ -1188,7 +1210,7 @@ impl Driver {
                     .activate(key, hash, input, owner_boot, grant_epoch, now)
                     .map_err(|_| ())?;
                 persist(&mut self.engine, e)?;
-                self.task_key = Some(key);
+                self.incoming_task_key = Some(key);
                 self.activated = true;
                 let token = self.kernel_token.ok_or(())?;
                 let dispatched = (|| -> Result<(), ()> {
@@ -1207,7 +1229,7 @@ impl Driver {
                         .enqueue(key, owner_boot, grant_epoch, current)
                         .map_err(|_| ())?;
                     let mut start = (input.len() as u64).to_le_bytes().to_vec();
-                    start.extend_from_slice(&self.deadline.to_le_bytes());
+                    start.extend_from_slice(&self.incoming_deadline.to_le_bytes());
                     start.extend_from_slice(&self.kernel_epoch.to_le_bytes());
                     start.extend_from_slice(&grant_epoch.to_le_bytes());
                     start.extend_from_slice(&key.contract);
@@ -1273,7 +1295,6 @@ impl Driver {
                 out.extend_from_slice(&hash);
                 self.send(21, out, None)?;
                 self.done = true;
-                self.task_key = Some(key);
             }
             (21, false) => {
                 let mut r = Reader::new(b);
@@ -1338,6 +1359,9 @@ impl Driver {
                 persist(&mut self.engine, e)?;
                 broker::trace(0x219);
                 self.recovering = false;
+                if self.closure_waiting.as_ref().is_some_and(|id| b == id) {
+                    self.closure_waiting = None;
+                }
             }
             (32, false) => {
                 if b.len() != 48 {
@@ -1468,6 +1492,7 @@ impl Driver {
         }
         self.offline_tick(now)?;
         if self.peer_boot != 0 {
+            self.service_closure()?;
             self.resend_results()?;
         }
 
@@ -1480,20 +1505,45 @@ impl Driver {
         self.diagnostic_liveness_attempt_ns
     }
     fn resume_closure(&mut self) -> Result<(), ()> {
-        let received: Vec<_> = self
+        self.closure_work = self
             .engine
             .results
             .iter()
             .filter(|r| r.received && r.state != TaskState::Started)
             .map(|r| (r.key, r.result_hash))
             .collect();
-        for (key, hash) in received {
-            let mut b = key_bytes(key);
-            b.extend_from_slice(&hash);
-            self.send(21, b, None)?;
-            self.send(22, key.contract.to_vec(), None)?;
+        self.closure_cursor = 0;
+        self.closure_waiting = None;
+        self.service_closure()
+    }
+    fn service_closure(&mut self) -> Result<(), ()> {
+        // Wait for the peer to drain this contract's replies before sending
+        // another pair; local TLS acceptance alone is not peer backpressure.
+        if self.closure_waiting.is_some() {
+            return Ok(());
         }
-        self.resend_results()?;
+        let Some(&(key, hash)) = self.closure_work.get(self.closure_cursor) else {
+            return Ok(());
+        };
+        // One pair per turn, with eight frames and 8 KiB left for proof,
+        // status and replies. Partial consumption retains the whole frame in
+        // capacity accounting. Advance only after both frames are enqueued.
+        let pair_bytes = 96 + 72 + 32 + 96 + 16;
+        let available = if self.native_mode {
+            let (bytes, frames) = self.queued_class(true)?;
+            frames + 2 <= 24 && bytes + pair_bytes <= 131264 - 8192
+        } else {
+            self.output.len() + pair_bytes <= 131264 - 8192
+        };
+        if !available {
+            return Ok(());
+        }
+        let mut body = key_bytes(key);
+        body.extend_from_slice(&hash);
+        self.send(21, body, None)?;
+        self.send(22, key.contract.to_vec(), None)?;
+        self.closure_cursor += 1;
+        self.closure_waiting = Some(key.contract);
         Ok(())
     }
     fn send_result(&mut self, key: TaskKey) -> Result<(), ()> {
@@ -1531,7 +1581,13 @@ impl Driver {
             .map(|r| (r.key, 96usize + 141 + r.body.len()));
         if let Some((key, frame_bytes)) = next {
             let (used, limit) = if self.native_mode {
-                (self.queued_class(true)?.0, 131264 - 8192)
+                {
+                    let (bytes, frames) = self.queued_class(true)?;
+                    if frames >= 24 {
+                        return Ok(());
+                    }
+                    (bytes, 131264 - 8192)
+                }
             } else {
                 (self.output.len(), 131264)
             };
@@ -1548,7 +1604,7 @@ impl Driver {
             let mut body = [0; 8];
             match broker::request(OP_TASK, &[], &mut body, 0, [3, token, 0]) {
                 Ok((8, _)) => {
-                    let key = self.task_key.ok_or(())?;
+                    let key = self.incoming_task_key.ok_or(())?;
                     let e = self
                         .engine
                         .finish(key, TaskState::Done, &body)
@@ -1562,7 +1618,7 @@ impl Driver {
                 }
                 Err(AGAIN) => {}
                 Err(FAILED) => {
-                    let key = self.task_key.ok_or(())?;
+                    let key = self.incoming_task_key.ok_or(())?;
                     let e = self
                         .engine
                         .finish(key, TaskState::Failed, &[])
