@@ -121,6 +121,7 @@ fn publish(files: &FileSystem<4096>) {
         METRICS[i].store(v, Ordering::Relaxed);
     }
     METRICS[18].store(now, Ordering::Release);
+    METRICS[19].store(files.cache_evictions(), Ordering::Release);
     let (base, len) = files.cache_backing();
     let backing = Board
         .physical(base, len)
@@ -196,6 +197,9 @@ pub fn metrics() -> Metrics {
         last_read_version: METRICS[11].load(Ordering::Acquire),
         last_flush_version: METRICS[12].load(Ordering::Acquire),
     }
+}
+pub fn cache_evictions() -> u64 {
+    METRICS[19].load(Ordering::Acquire)
 }
 pub fn cache_usage() -> [u64; 4] {
     core::array::from_fn(|i| METRICS[i].load(Ordering::Acquire))

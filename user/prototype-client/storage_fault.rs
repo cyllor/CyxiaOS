@@ -13,6 +13,7 @@ const DATA_PAGES: u64 = 16;
 const PRESSURE_CHUNK_BYTES: u64 = DATA_PAGES * 4096;
 const PRESSURE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const PRESSURE_CHUNKS: u64 = PRESSURE_FILE_BYTES / PRESSURE_CHUNK_BYTES;
+const WRITE_RETRY_WAIT_NS: u64 = 2_000_000_000;
 const VALUE: &str = "/a10/value";
 const PRESSURE: [&str; 2] = ["/a10/pressure-a", "/a10/pressure-b"];
 // At most MAX_POLL_REQUESTS polling requests per role, leaving room for both
@@ -24,7 +25,8 @@ const PRESSURE: [&str; 2] = ["/a10/pressure-a", "/a10/pressure-b"];
 // observed, 7 fsync3 consumed, 8 complete, 255 failed (word12 is the error).
 // Local error codes: 201 launch, 202 authority, 203 map, 204 unmap, 205 timeout,
 // 206 transport, 207 file reply, 208 object/handle identity, 209 metadata,
-// 210 data/length, 211 fsync sequence, 212 marker, 213 request overflow.
+// 210 data/length, 211 fsync sequence, 212 marker, 213 request overflow,
+// 214 completed pressure-WRITE retry limit.
 type Result<T> = core::result::Result<T, u64>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,7 @@ struct Client {
     deadline: u64,
     poll_ns: u64,
     request: u64,
+    write_retries: u64,
     progress_sequence: u64,
     object: Identity,
     consumed: u64,
@@ -305,6 +308,23 @@ impl Client {
         }
         Ok(())
     }
+    fn wait_write_retry(&mut self) -> Result<()> {
+        self.write_retries = self.write_retries.checked_add(1).ok_or(214u64)?;
+        if self.write_retries > a10_budget::MAX_POLL_REQUESTS {
+            return Err(214);
+        }
+        let next = clock().saturating_add(WRITE_RETRY_WAIT_NS).min(self.deadline);
+        while clock() < next {
+            if !waiting(self.deadline) {
+                return Err(205);
+            }
+        }
+        if clock() < self.deadline {
+            Ok(())
+        } else {
+            Err(205)
+        }
+    }
     fn write_pressure_file(&mut self, path: &str, file_index: u64) -> Result<()> {
         let mut frame = self.path_frame(file::CREATE, path)?;
         self.success(&mut frame)?;
@@ -315,15 +335,25 @@ impl Client {
             for word in 0..PRESSURE_CHUNK_BYTES / 8 {
                 put(DATA + word * 8, pressure_pattern(file_index, first_word + word));
             }
-            let mut frame = self.frame(file::WRITE)?;
-            handle(&mut frame, key.id, key.generation);
-            frame.set_u64(file::OFF_OFFSET, chunk * PRESSURE_CHUNK_BYTES);
-            frame.set_u64(file::OFF_DATA, DATA);
-            frame.set_u32(file::OFF_DATA_LENGTH, PRESSURE_CHUNK_BYTES as u32);
-            self.success(&mut frame)?;
-            object.matches(&frame)?;
-            if frame.u64(file::OFF_COUNT) != PRESSURE_CHUNK_BYTES {
-                return Err(210);
+            loop {
+                let mut frame = self.frame(file::WRITE)?;
+                handle(&mut frame, key.id, key.generation);
+                frame.set_u64(file::OFF_OFFSET, chunk * PRESSURE_CHUNK_BYTES);
+                frame.set_u64(file::OFF_DATA, DATA);
+                frame.set_u32(file::OFF_DATA_LENGTH, PRESSURE_CHUNK_BYTES as u32);
+                self.deliver(&mut frame)?;
+                if frame.result() == -11 {
+                    self.wait_write_retry()?;
+                    continue;
+                }
+                if frame.result() != 0 {
+                    return Err(207);
+                }
+                object.matches(&frame)?;
+                if frame.u64(file::OFF_COUNT) != PRESSURE_CHUNK_BYTES {
+                    return Err(210);
+                }
+                break;
             }
         }
         let mut frame = self.frame(file::FSYNC)?;
@@ -381,6 +411,7 @@ pub fn run(authority: file::Capability) -> u64 {
         deadline: clock().saturating_add(deadline_ns),
         poll_ns: a10_budget::client_poll_ns(mode).unwrap_or(0),
         request: 0,
+        write_retries: 0,
         progress_sequence: 0,
         object: Identity {
             id: 0,

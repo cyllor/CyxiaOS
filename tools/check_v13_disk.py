@@ -122,70 +122,74 @@ def committed_volume(path: Path):
 
 def inspect(path: Path) -> dict:
     with committed_volume(path) as (current, metadata):
-        table=b''.join(current(4102+i) for i in range(16))
-        root_size,root_sequence=struct.unpack_from('<QQ',table,16)
-        require(root_size in (128,256,384) and root_sequence==root_size//128,'invalid durable root size/sequence')
-        files=root_size//128-1
-        sizes=[]
-        for inode in range(256):
-            slot=table[inode*256:(inode+1)*256]; checksum(slot,252)
-            require(struct.unpack_from('<I',slot)[0]==0x4359494e,'invalid inode magic')
-            require(struct.unpack_from('<Q',slot,8)[0]==1,'reserved inode generation changed')
-            live=inode<2+files
-            expected=bytearray(256)
-            struct.pack_into('<IH',expected,0,0x4359494e,2 if inode==0 else 1 if live else 0)
-            struct.pack_into('<Q',expected,8,1)
-            if live:
-                seq=struct.unpack_from('<Q',slot,24)[0]
-                size=struct.unpack_from('<Q',slot,16)[0]
-                if inode==0:
-                    require(size==root_size and seq==root_sequence,'invalid root inode')
-                    start,blocks=4118,1
-                elif inode==1:
-                    require(size==64 and seq>0,'invalid boot inode')
-                    start,blocks=4119,1
-                else:
-                    require(0<size<=8*1024*1024 and seq>0,'invalid cluster inode size/sequence')
-                    start,blocks=4120+(inode-2)*2048,(size+BLOCK-1)//BLOCK
-                    sizes.append((size,blocks,seq))
-                struct.pack_into('<QQH',expected,16,size,seq,1)
-                struct.pack_into('<Q',expected,40,1)
-                struct.pack_into('<III',expected,48,0,start,blocks)
-            require(slot[:252]==expected[:252],'unexpected allocated inode/layout')
-        directory=current(4118)
-        names=[b'.cyxia-boot',b'.cyxia-cluster-a',b'.cyxia-cluster-b']
-        for index in range(files+1):
-            entry=directory[index*128:(index+1)*128];checksum(entry,124)
-            expected=bytearray(124);name=names[index]
-            struct.pack_into('<IH',expected,0,index+1,len(name));struct.pack_into('<Q',expected,8,1);expected[16:16+len(name)]=name
-            require(entry[:124]==expected,'invalid reserved directory entry')
-        require(not any(directory[root_size:]),'directory unused suffix not zero')
-        body=current(4119);epoch=struct.unpack_from('<Q',body,24)[0]
-        require(body[:8]==b'CYXBOOT1' and body[8:24].hex()==metadata['uuid'] and epoch>0 and not any(body[36:]),'invalid boot body')
-        require(struct.unpack_from('<I',body,32)[0]==crc32c(body[:32]),'boot CRC mismatch')
-        require(struct.unpack_from('<Q',table,256+24)[0]==epoch,'inode and boot epoch disagree')
-        bitmap=b''.join(current(4098+i) for i in range(4))
-        expected=bytearray(16384)
-        for block in range(4120):expected[block//8]|=1<<(block%8)
-        cluster_records=[]
-        for file in range(2):
-            start=4120+file*2048
-            stream=b''.join(current(start+i) for i in range(2048))
-            size,blocks,seq=sizes[file] if file<files else (0,0,0)
-            require(not any(stream[size:]),'cluster file unused suffix not zero')
-            for block in range(start,start+blocks):expected[block//8]|=1<<(block%8)
-            at,records=0,0
-            while at<size:
-                require(at+16<=size,'truncated cluster record header')
-                header=stream[at:at+16]
-                magic,length,body_crc,header_crc=struct.unpack('<4sIII',header)
-                require(magic==b'CXV1' and 0<length<=33200 and crc32c(header[:12])==header_crc,'invalid cluster record header/CRC')
-                at+=16
-                require(at+length<=size,'truncated cluster record body')
-                body=stream[at:at+length]
-                require(crc32c(body)==body_crc,'cluster record body CRC mismatch')
-                cluster_records.append(body.hex());at+=length;records+=1
-            require(records==seq,'cluster inode durable sequence differs from record count')
-        require(bitmap==bytes(expected),'boot/cluster volume allocation mismatch')
-        return dict(metadata,boot_epoch=epoch,
-                    cluster_files=files,cluster_file_sizes=[row[0] for row in sizes],cluster_records=cluster_records)
+        return inspect_reserved_committed(current, metadata)
+
+
+def inspect_reserved_committed(current, metadata) -> dict:
+    table=b''.join(current(4102+i) for i in range(16))
+    root_size,root_sequence=struct.unpack_from('<QQ',table,16)
+    require(root_size in (128,256,384) and root_sequence==root_size//128,'invalid durable root size/sequence')
+    files=root_size//128-1
+    sizes=[]
+    for inode in range(256):
+        slot=table[inode*256:(inode+1)*256]; checksum(slot,252)
+        require(struct.unpack_from('<I',slot)[0]==0x4359494e,'invalid inode magic')
+        require(struct.unpack_from('<Q',slot,8)[0]==1,'reserved inode generation changed')
+        live=inode<2+files
+        expected=bytearray(256)
+        struct.pack_into('<IH',expected,0,0x4359494e,2 if inode==0 else 1 if live else 0)
+        struct.pack_into('<Q',expected,8,1)
+        if live:
+            seq=struct.unpack_from('<Q',slot,24)[0]
+            size=struct.unpack_from('<Q',slot,16)[0]
+            if inode==0:
+                require(size==root_size and seq==root_sequence,'invalid root inode')
+                start,blocks=4118,1
+            elif inode==1:
+                require(size==64 and seq>0,'invalid boot inode')
+                start,blocks=4119,1
+            else:
+                require(0<size<=8*1024*1024 and seq>0,'invalid cluster inode size/sequence')
+                start,blocks=4120+(inode-2)*2048,(size+BLOCK-1)//BLOCK
+                sizes.append((size,blocks,seq))
+            struct.pack_into('<QQH',expected,16,size,seq,1)
+            struct.pack_into('<Q',expected,40,1)
+            struct.pack_into('<III',expected,48,0,start,blocks)
+        require(slot[:252]==expected[:252],'unexpected allocated inode/layout')
+    directory=current(4118)
+    names=[b'.cyxia-boot',b'.cyxia-cluster-a',b'.cyxia-cluster-b']
+    for index in range(files+1):
+        entry=directory[index*128:(index+1)*128];checksum(entry,124)
+        expected=bytearray(124);name=names[index]
+        struct.pack_into('<IH',expected,0,index+1,len(name));struct.pack_into('<Q',expected,8,1);expected[16:16+len(name)]=name
+        require(entry[:124]==expected,'invalid reserved directory entry')
+    require(not any(directory[root_size:]),'directory unused suffix not zero')
+    body=current(4119);epoch=struct.unpack_from('<Q',body,24)[0]
+    require(body[:8]==b'CYXBOOT1' and body[8:24].hex()==metadata['uuid'] and epoch>0 and not any(body[36:]),'invalid boot body')
+    require(struct.unpack_from('<I',body,32)[0]==crc32c(body[:32]),'boot CRC mismatch')
+    require(struct.unpack_from('<Q',table,256+24)[0]==epoch,'inode and boot epoch disagree')
+    bitmap=b''.join(current(4098+i) for i in range(4))
+    expected=bytearray(16384)
+    for block in range(4120):expected[block//8]|=1<<(block%8)
+    cluster_records=[]
+    for file in range(2):
+        start=4120+file*2048
+        stream=b''.join(current(start+i) for i in range(2048))
+        size,blocks,seq=sizes[file] if file<files else (0,0,0)
+        require(not any(stream[size:]),'cluster file unused suffix not zero')
+        for block in range(start,start+blocks):expected[block//8]|=1<<(block%8)
+        at,records=0,0
+        while at<size:
+            require(at+16<=size,'truncated cluster record header')
+            header=stream[at:at+16]
+            magic,length,body_crc,header_crc=struct.unpack('<4sIII',header)
+            require(magic==b'CXV1' and 0<length<=33200 and crc32c(header[:12])==header_crc,'invalid cluster record header/CRC')
+            at+=16
+            require(at+length<=size,'truncated cluster record body')
+            body=stream[at:at+length]
+            require(crc32c(body)==body_crc,'cluster record body CRC mismatch')
+            cluster_records.append(body.hex());at+=length;records+=1
+        require(records==seq,'cluster inode durable sequence differs from record count')
+    require(bitmap==bytes(expected),'boot/cluster volume allocation mismatch')
+    return dict(metadata,boot_epoch=epoch,
+                cluster_files=files,cluster_file_sizes=[row[0] for row in sizes],cluster_records=cluster_records)

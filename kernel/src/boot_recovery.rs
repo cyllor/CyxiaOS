@@ -2,6 +2,7 @@
 //! Test configuration is read once before storage; it cannot forge a receipt.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, timer};
+pub(crate) mod formal;
 
 const MAGIC: u64 = 0x4359_5842_4f4f_5431;
 const CONFIG_MAGIC: u64 = 0x4359_5841_3031_4346;
@@ -39,6 +40,7 @@ pub fn init() {
     A01_BOOT_EVIDENCE.0[1].store(1, Ordering::Relaxed);
     A01_BOOT_EVIDENCE.0[3].store(1, Ordering::Relaxed); // booting, not ACTIVE
     A01_BOOT_EVIDENCE.0[5].store(MODE.load(Ordering::Relaxed), Ordering::Relaxed);
+    formal::init(&c);
     A01_BOOT_EVIDENCE.0[0].store(MAGIC, Ordering::Release);
 }
 pub fn model_corruption() -> bool {
@@ -63,7 +65,9 @@ pub fn model_settled(spent: u64, passed: bool) {
     A01_BOOT_EVIDENCE.0[24].store(if passed { 1 } else { 2 }, Ordering::Release);
 }
 pub fn model_passed() {
-    A01_BOOT_EVIDENCE.0[14].store(timer::ticks(), Ordering::Relaxed);
+    let ticks = timer::ticks();
+    A01_BOOT_EVIDENCE.0[14].store(ticks, Ordering::Relaxed);
+    formal::model_passed(ticks);
     MODEL_PASSED.store(true, Ordering::Release);
 }
 pub fn activation_allowed(epoch: u64) -> bool {
@@ -85,7 +89,9 @@ pub fn active() {
     {
         word.store(value, Ordering::Relaxed);
     }
-    A01_BOOT_EVIDENCE.0[15].store(timer::ticks(), Ordering::Relaxed);
+    let ticks = timer::ticks();
+    A01_BOOT_EVIDENCE.0[15].store(ticks, Ordering::Relaxed);
+    formal::active(ticks);
     A01_BOOT_EVIDENCE.0[3].store(3, Ordering::Release);
 }
 pub fn allocating(value: bool) {
@@ -105,8 +111,10 @@ pub fn inject(operation: u64, block: u64) -> bool {
     true
 }
 pub fn durable(epoch: u64) {
+    let ticks = timer::ticks();
     A01_BOOT_EVIDENCE.0[6].store(epoch, Ordering::Relaxed);
-    A01_BOOT_EVIDENCE.0[7].store(timer::ticks(), Ordering::Release);
+    formal::durable(epoch, ticks);
+    A01_BOOT_EVIDENCE.0[7].store(ticks, Ordering::Release);
 }
 /// No mount retry, auto-format, epoch substitute, network service or CACP is
 /// reachable here. Failed DMA/journal custody stays pinned in the storage owner.

@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 
 from check_prototype_evidence import _pairs, read_json, require, safe_path, sha256
-from run_v13_a10 import PENDING_DIAGNOSTICS, terminal_ready
+from run_v13_a10 import A10_DISK_NODE_NAME, PENDING_DIAGNOSTICS, terminal_ready
 from doctor import ROOT
 from transport import FrameDecoder
 from verify_unified import (PINNED_QEMU_COMMIT, PINNED_QEMU_PATCH_SHA256,
@@ -214,7 +214,7 @@ def validate_launch(argv, context, inputs):
     expected = [context['binary'], '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
         '-cpu', 'cortex-a53', '-smp', '4', '-m', '1024M', '-accel', 'tcg,thread=multi',
         '-S', '-display', 'none', '-monitor', 'none', '-global', 'virtio-mmio.force-legacy=false',
-        '-drive', f'if=none,id=disk0,file=nbd:unix:{private}/disk.sock,format=raw,cache=writeback',
+        '-drive', f'if=none,id=disk0,node-name={A10_DISK_NODE_NAME},file=nbd:unix:{private}/disk.sock,format=raw,cache=writeback',
         '-device', f'virtio-blk-device,drive=disk0,request-merging={merging}',
         '-netdev', f'socket,id=net0,listen=127.0.0.1:{port}',
         '-device', 'virtio-net-device,id=eth0,netdev=net0,mac=02:00:00:00:00:01',
@@ -384,6 +384,10 @@ def verify_native_child(directory, *, source_root, build_manifest, qemu_binary, 
         actual = replayed['nbd_trace']['cut']
         require(all(one('backend-cut')[key] == actual[key] for key in ('id', 'mutation', 'phase')),
                 'native cut witness differs from actual NBD stream')
+    # Only now has replay_child independently rebuilt every NBD request,
+    # loss/survivor and final disk byte, plus the committed filesystem oracle.
+    # A collected QMP event is never sufficient before that closure completes.
+    verify_fault_io_events(root, context, inputs, protocol, replayed, scope)
     control = safe_path(root, 'control-header.bin').read_bytes()
     magic = struct.unpack_from('<Q', control)[0]
     # initialize() publishes this aligned atomic magic last, after both hashes.
@@ -598,7 +602,7 @@ def read_rows(path, inputs):
             yield value
 
 
-def transactions(rows, limit, events):
+def transactions(rows, limit, events, *, fault_events=None):
     iterator = iter(rows)
     first = next(iterator, {})
     require(first.keys() == {'direction', 'message'} and first['direction'] == 'receive'
@@ -612,7 +616,7 @@ def transactions(rows, limit, events):
             and hello['capabilities'] in ([], ['oob']), 'wrong QEMU greeting')
     pending = None
     count, last = 0, {}
-    for row in iterator:
+    for qmp_row, row in enumerate(iterator, 2):
         require(row.keys() == {'direction', 'message'} and type(row['message']) is dict,
                 'invalid QMP row')
         message = row['message']
@@ -623,6 +627,34 @@ def transactions(rows, limit, events):
                     and count < limit, 'unordered/duplicate QMP request')
             pending = message
         elif row['direction'] == 'receive' and 'event' in message:
+            if message.get('event') == 'BLOCK_IO_ERROR' and fault_events is not None:
+                # Collection alone grants no native verdict. The caller must
+                # later close the raw NBD cut/replay and monotonic witness proof.
+                require(type(fault_events) is list and not fault_events
+                        and events == ['RESUME'] and pending is not None
+                        and pending.get('execute') == 'ringbuf-read',
+                        'QMP block error outside bounded fault observation')
+                require(message.keys() == {'event', 'timestamp', 'data'}
+                        and type(message['timestamp']) is dict
+                        and message['timestamp'].keys() == {'seconds', 'microseconds'}
+                        and all(type(v) is int and v >= 0 for v in message['timestamp'].values())
+                        and message['timestamp']['microseconds'] < 1000000,
+                        'invalid QMP block error envelope')
+                data = message['data']
+                require(type(data) is dict and data.keys() == {'device', 'nospace', 'node-name',
+                            'qom-path', 'reason', 'operation', 'action'}
+                        and data['device'] == 'disk0' and data['operation'] == 'write'
+                        and data['action'] == 'report' and data['nospace'] is False
+                        and data['node-name'] == A10_DISK_NODE_NAME
+                        and data['qom-path'] == '/machine/peripheral-anon/device[0]'
+                        and type(data['reason']) is str and 0 < len(data['reason']) <= 256
+                        and all(32 <= ord(c) < 127 for c in data['reason']),
+                        'QMP block error is not the fixed bounded disk/write/report event')
+                digest = hashlib.sha256(json.dumps(message, sort_keys=True,
+                    separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+                fault_events.append(dict(qmp_row=qmp_row, sha256=digest,
+                                         command_id=pending['id']))
+                continue
             require(message.keys() == {'event', 'timestamp'}
                     and message['event'] in ('STOP', 'RESUME')
                     and type(message['timestamp']) is dict
@@ -644,6 +676,56 @@ def transactions(rows, limit, events):
             pending = None
             yield last, message['return']
     require(pending is None, 'unanswered QMP request')
+
+
+def verify_fault_io_events(root, context, inputs, protocol, replayed, scope):
+    """Close the one before-FLUSH case after full raw replay, never a verdict.
+
+    WRITE cuts, reordered replies and multiple outstanding I/O errors have no
+    reviewed attribution contract here. Old captures without a source-bound
+    receive witness remain rejected; QEMU wall timestamps are diagnostic only.
+    """
+    candidates = protocol['fault_io_events']
+    if not candidates:
+        return
+    from check_v13_fault_disk import read_events
+    require(len(candidates) == 1 and type(inputs['cut']) is int and inputs['cut'] > 0
+            and inputs['phase'] == 'before' and inputs['reverse_replies'] is False
+            and protocol['cut_observed'] is True, 'unsupported QMP block error fault context')
+    start = document(root, 'nbd/start.json')
+    trace = replayed['nbd_trace']
+    actual = trace.get('cut')
+    lifecycle = protocol['lifecycle']
+    stop = protocol['stop_request']
+    require(type(actual) is dict and 'backend-cut' in lifecycle and type(stop) is dict,
+            'QMP block error lacks actual cut/stop proof')
+    backend = lifecycle['backend-cut']
+    received = candidates[0]['witness']
+    require(start['run_id'] == trace['run_id'] == backend['run_id'] == context['backend_run_id']
+            and start['cut'] == actual['mutation'] == backend['mutation'] == inputs['cut']
+            and start['phase'] == actual['phase'] == backend['phase'] == 'before'
+            and actual['id'] == backend['id'] and start['reverse_replies'] is False,
+            'QMP block error actual NBD run/cut policy mismatch')
+    rows = read_events(safe_path(root, 'nbd/start.json').parent)
+    requests = [row for row in rows if row['event'] == 'request']
+    cuts = [row for row in rows if row['event'] == 'cut']
+    require(len(cuts) == 1 and cuts[0] == actual and rows[-1] == actual,
+            'QMP block error lacks final actual raw cut')
+    matching = [row for row in requests if row['id'] == actual['id']]
+    require(len(matching) == 1 and matching[0]['kind'] == 3
+            and matching[0]['mutation'] == inputs['cut'],
+            'QMP block error is not a before-FLUSH cut')
+    request = matching[0]
+    acknowledgments = {row['id'] for row in rows if row['event'] == 'ack'}
+    outstanding = [row['id'] for row in requests if row['kind'] != 2 and row['id'] not in acknowledgments]
+    require(outstanding == [actual['id']]
+            and not any(row['event'] == 'complete' and row['id'] == actual['id'] for row in rows),
+            'QMP block error has ambiguous outstanding or completed I/O')
+    require(inputs['cut'] in scope['post_resume_points']
+            and scope['resume_monotonic_ns'] <= request['monotonic_ns'] <= actual['monotonic_ns']
+            <= backend['monotonic_ns'] <= received['monotonic_ns'] <= stop['monotonic_ns']
+            and backend['seq'] < received['seq'] < stop['seq'],
+            'QMP block error is outside the source-bound post-cut/pre-stop interval')
 
 
 class Forward:
@@ -669,6 +751,7 @@ class Lifecycle:
         'endpoint-created': {'endpoint', 'run_id'},
         'endpoint-connected': {'endpoint', 'run_id', 'peer_pid', 'peer_identity'},
         'qmp-request': {'id'}, 'qmp-response': {'id'}, 'save': {'id', 'name', 'size', 'sha256'},
+        'qmp-block-error': {'qmp_row', 'sha256'},
     }
 
     def __init__(self, rows):
@@ -687,7 +770,7 @@ class Lifecycle:
             require(kind in self.FIELDS and row.keys() ==
                     {'seq', 'monotonic_ns', 'event'} | self.FIELDS[kind],
                     'unknown native lifecycle field')
-            if kind in ('qmp-request', 'qmp-response', 'save'):
+            if kind in ('qmp-request', 'qmp-response', 'save', 'qmp-block-error'):
                 require(kind == expected, 'native witness/QMP/save order mismatch')
                 return row
             require(kind in {'spawn', 'injection', 'kill', 'wait', 'backend-close', 'backend-cut', 'final-disk',
@@ -713,9 +796,11 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
             'native host platform differs from trusted local context')
     require(safe_path(root, 'serial.bin').stat().st_size <= SERIAL_LIMIT,
             'native encoded serial size bound')
-    events = []
-    commands = Forward(transactions(rows, poll_bound(inputs) * 5 + 64, events))
-    cut = bool(inputs['cut'])
+    events, fault_io_events = [], []
+    require(type(inputs['cut']) is int and inputs['cut'] >= 0, 'invalid native cut ordinal')
+    cut = inputs['cut'] > 0
+    commands = Forward(transactions(rows, poll_bound(inputs) * 5 + 64, events,
+                                   fault_events=fault_io_events if cut else None))
     require(type(context['capture_root']) is str and len(json.dumps(context['capture_root'])) <= 1024
             and Path(context['capture_root']).is_absolute(), 'invalid historic capture root')
     lifecycle = Lifecycle(witness)
@@ -723,8 +808,9 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
     latest = {}
     index = last_response = resume_request = 0
     injection_bounds = []
+    stop_request = None
     def take(name, args=None):
-        nonlocal index, last_response, resume_request
+        nonlocal index, last_response, resume_request, stop_request
         require(commands.current is not None, 'missing QMP command: ' + name)
         command, result = commands.pop()
         index += 1
@@ -732,11 +818,21 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
                 and (args is None or all(type(command['arguments'][key]) is type(value)
                                         for key, value in args.items())),
                 'unexpected QMP command/arguments: ' + name)
-        request, response = lifecycle.take('qmp-request'), lifecycle.take('qmp-response')
+        request = lifecycle.take('qmp-request')
+        for candidate in fault_io_events:
+            if candidate['command_id'] == index:
+                received = lifecycle.take('qmp-block-error')
+                require(type(received['qmp_row']) is int and received['qmp_row'] == candidate['qmp_row']
+                        and received['sha256'] == candidate['sha256']
+                        and request['seq'] < received['seq'],
+                        'QMP block error receive witness mismatch')
+                candidate['witness'] = received
+        response = lifecycle.take('qmp-response')
         require(request['id'] == response['id'] == index
                 and one('spawn')['seq'] < request['seq'] < response['seq']
                 and 'kill' not in lifecycle.events, 'QMP witness identity/order mismatch')
         if name == 'stop':
+            stop_request = request
             require('backend-cut' in lifecycle.events
                     and one('backend-cut')['seq'] < request['seq'], 'cut observation must precede stop')
         if name == 'cont':
@@ -878,8 +974,11 @@ def validate_protocol(root, context, layout, inputs, rows, witness):
                 'native save content mismatch: ' + name)
     require(bytes(serial) == safe_path(root, 'serial.bin').read_bytes(),
             'QMP serial reconstruction differs')
+    require(all('witness' in candidate for candidate in fault_io_events),
+            'missing QMP block error receive witness')
     return dict(cut_observed=cut, capture_names=set(latest), lifecycle=lifecycle.events,
-                witness_count=lifecycle.count)
+                witness_count=lifecycle.count, fault_io_events=fault_io_events,
+                stop_request=stop_request)
 
 
 if __name__ == '__main__':

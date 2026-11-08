@@ -423,6 +423,52 @@ pub fn progress(slot: usize, sequence: u64, version: u64, outcome: ExecutionStat
 pub fn aborted() {
     add(10);
 }
+/// Original hash already measured at the real stopped output boundary.
+pub(crate) fn output_digest(slot: usize, sequence: u64, hash: [u8; 32]) {
+    if slot >= SLOTS {
+        return;
+    }
+    let at = base(slot);
+    if get(at) != sequence {
+        return;
+    }
+    begin_write(at);
+    for (i, b) in hash.chunks_exact(8).enumerate() {
+        put(at + 21 + i, u64::from_le_bytes(b.try_into().unwrap()));
+    }
+    end_write(at);
+}
+/// Caller holds the existing control-owner serialization. Copy the actual
+/// settled record before freeing its ring slot; no callback waits or mutates it.
+pub(crate) fn ownership_snapshot(
+    slot: usize,
+    sequence: u64,
+    mut copy: impl FnMut(usize, u64),
+) -> Result<(), Error> {
+    if slot >= SLOTS {
+        return Err(Error::Range);
+    }
+    let at = base(slot);
+    let stamp = get(at + SEQLOCK);
+    if stamp & 1 != 0
+        || get(at) != sequence
+        || get(at + 30) != 1
+        || get(at + 14) != 2
+        || get(at + 13) == 0
+    {
+        return Err(Error::NotReady);
+    }
+    for i in 0..32 {
+        copy(i, get(i));
+    }
+    for i in 0..RECORD_WORDS {
+        copy(32 + i, get(at + i));
+    }
+    if get(at + SEQLOCK) != stamp || get(at) != sequence {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
 pub fn observer_failed(domain: u16, version: u64, failure: Error) {
     if get(25) == 0 {
         put(26, u64::from(domain));

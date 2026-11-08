@@ -13,6 +13,7 @@ bench = false
 selftest = []
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
+register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
 net-selftest = ["smp-selftest", "prototype-memory"]

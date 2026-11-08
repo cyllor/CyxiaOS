@@ -73,11 +73,13 @@ class RuntimeLoopDecoder(unittest.TestCase):
     def test_terminal_publication_follows_authority_and_socket_teardown(self):
         source = (Path(__file__).parents[1] /
                   'user/prototype-cluster/src/runtime.rs').read_text()
-        tail = source[source.index('let unauthenticated_exit = authenticated.is_none();'):]
-        self.assertLess(tail.index('driver.disconnect();'), tail.index('loop_timing.report('))
-        self.assertLess(tail.index('broker::close();'), tail.index('loop_timing.report('))
+        self.assertIn('let mut state = SessionState::new(epoch, ticket);', source)
+        self.assertIn('if let Err(exit) = session_turn(', source)
+        tail = source[source.index('let unauthenticated_exit = state.authenticated.is_none();'):]
+        self.assertLess(tail.index('driver.disconnect();'), tail.index('state.timing.report('))
+        self.assertLess(tail.index('broker::close();'), tail.index('state.timing.report('))
         self.assertLess(tail.index('ingress.leave_authenticated_at('),
-                        tail.index('loop_timing.report('))
+                        tail.index('state.timing.report('))
 
 
 if __name__ == '__main__':

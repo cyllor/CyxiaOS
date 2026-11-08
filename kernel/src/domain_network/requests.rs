@@ -6,6 +6,8 @@ use core::{
 };
 use cyxia_prototype::domains::{Error, ObjectKey};
 use sha2::{Digest, Sha256};
+#[path = "requests_diagnostic.rs"]
+pub(crate) mod diagnostic;
 #[path = "../../../user/prototype-cluster/src/application.rs"]
 pub(crate) mod wire;
 
@@ -40,6 +42,37 @@ pub(crate) struct Queue<const H: usize = HISTORY> {
     cursor: usize,
 }
 impl<const H: usize> Queue<H> {
+    // [DEBUG-v15-placement] Read only the exact receipt already owned here;
+    // do not scan payloads or change the admission/completion state machine.
+    fn trace(&self, index: usize, stage: diagnostic::Stage, now: u64) {
+        let Some(r) = self.records[index] else {
+            return;
+        };
+        let key = self.key(index);
+        diagnostic::APPLICATION_REQUEST_EVIDENCE.record(
+            index,
+            stage,
+            [
+                key.id,
+                key.generation,
+                r.actor.id,
+                r.actor.generation,
+                r.sequence,
+                r.submitted_ns,
+                now,
+                0,
+                0,
+                r.state,
+                r.target.id,
+                r.target.generation,
+                r.completion.map_or(0, |c| c.outcome),
+                r.completion.map_or(0, |c| c.finished_ns),
+                u64::from(r.available)
+                    | u64::from(r.cancelled_ns.is_some()) << 1
+                    | u64::from(r.completion.is_some()) << 2,
+            ],
+        );
+    }
     pub(crate) const fn new() -> Self {
         Self {
             boot: 0,
@@ -161,6 +194,15 @@ impl<const H: usize> Queue<H> {
         });
         self.used += 1;
         self.outstanding += 1;
+        self.trace(
+            i,
+            if available {
+                diagnostic::Stage::Submit
+            } else {
+                diagnostic::Stage::Reserve
+            },
+            now,
+        );
         Ok(self.key(i))
     }
     pub(crate) fn release(
@@ -193,6 +235,7 @@ impl<const H: usize> Queue<H> {
         }
         r.submitted_ns = at;
         r.available = true;
+        self.trace(i, diagnostic::Stage::Release, now);
         Ok(())
     }
     pub(crate) fn completion(
@@ -233,6 +276,7 @@ impl<const H: usize> Queue<H> {
                 *payload = None;
             }
         }
+        self.trace(i, diagnostic::Stage::Cancel, now);
         Ok(now)
     }
     pub(crate) fn finish(&mut self, value: wire::Completion, now: u64) -> Result<(), Error> {
@@ -257,17 +301,25 @@ impl<const H: usize> Queue<H> {
             return Err(Error::Conflict);
         }
         r.completion = Some(value);
+        self.trace(i, diagnostic::Stage::Finish, now);
         Ok(())
     }
     pub(crate) fn status(&self, actor: ObjectKey, key: ObjectKey) -> Result<[u64; 3], Error> {
-        let r = self.records[self.index(key)?].as_ref().unwrap();
+        let index = self.index(key)?;
+        let r = self.records[index].as_ref().unwrap();
         if r.actor != actor {
             return Err(Error::Auth);
         }
         if r.cancelled_ns.is_some() {
             return Err(Error::Stale);
         }
-        Ok([r.state, r.target.id, r.target.generation])
+        let result = [r.state, r.target.id, r.target.generation];
+        self.trace(
+            index,
+            diagnostic::Stage::Status,
+            crate::domain_platform::now_ns(),
+        );
+        Ok(result)
     }
     pub(crate) fn next(&mut self, output: &mut [u8]) -> Result<usize, Error> {
         for offset in 0..CAPACITY {
@@ -287,7 +339,13 @@ impl<const H: usize> Queue<H> {
                 input: &payload.bytes[..r.length],
             }
             .encode(output)?;
+            let index = payload.record;
             self.cursor = (slot + 1) % CAPACITY;
+            self.trace(
+                index,
+                diagnostic::Stage::Next,
+                crate::domain_platform::now_ns(),
+            );
             return Ok(size);
         }
         Err(Error::Again)
@@ -327,6 +385,11 @@ impl<const H: usize> Queue<H> {
                 *payload = None;
             }
         }
+        self.trace(
+            i,
+            diagnostic::Stage::Acknowledge,
+            crate::domain_platform::now_ns(),
+        );
         Ok(())
     }
 }

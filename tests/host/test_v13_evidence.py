@@ -34,7 +34,7 @@ class EvidenceCatalogue(unittest.TestCase):
         result = self.check.validate(self.document, ROOT)
         coverage = result.get('verifier_coverage', {})
         self.assertIn('raw_contracts', coverage, 'Raw verifier coverage is not reported')
-        self.assertEqual(coverage['native_receipt_cases'], ['A02'])
+        self.assertEqual(coverage['native_receipt_cases'], ['A01', 'A02', 'A03'])
         self.assertEqual(coverage['raw_contracts']['A02']['native_receipt_admitted'], True)
         self.assertEqual(coverage['raw_contracts']['A02']['native_verifier_version'], 'a02-native-v4')
         self.assertEqual(result['states']['NOT_RUN'], 69)
@@ -91,7 +91,7 @@ class EvidenceCatalogue(unittest.TestCase):
     def test_a10_offline_adapter_is_reported_without_opening_native_admission(self):
         result = self.check.validate(self.document, ROOT)
         coverage = result['verifier_coverage']
-        self.assertEqual(coverage['native_receipt_cases'], ['A02'])
+        self.assertEqual(coverage['native_receipt_cases'], ['A01', 'A02', 'A03'])
         a10 = coverage['raw_contracts']['A10']
         self.assertFalse(a10['native_receipt_admitted'])
         self.assertEqual(a10['offline_verifier_version'], 'a10-offline-v1')
@@ -143,7 +143,7 @@ class EvidenceCatalogue(unittest.TestCase):
     def test_a02_receipt_cannot_close_another_case_or_action_family(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            row = self.native_row(root, case='A03')
+            row = self.native_row(root, case='A04')
             with self.assertRaisesRegex(ValueError, 'No complete 1.3 native receipt verifier'):
                 self.check_native_row(row, root)
             row = {key: value for key, value in row.items() if key in ('id', 'status', 'evidence')}

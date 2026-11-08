@@ -24,6 +24,9 @@ class SessionActivityDispatch(unittest.TestCase):
         phase = function(task, 'if phase == 9')
         template = (ROOT / 'tests/host/session_activity_dispatch_harness.rs').read_text()
         code = template.replace('// PHASE9', phase).replace('// OP_TASK', arm)
+        code = code.replace('ACTIVITY_DIAGNOSTIC_PATH', json.dumps(str(
+            ROOT / 'kernel/src/session_activity_diagnostic.rs')))
+        code = code.replace('// BROKER_TIMING', function(task, 'pub fn observe_broker_timing('))
         code = code.replace('// SAMPLES', '\n'.join(function(native, name) for name in
             ['fn finish_service(', 'fn service_start(']))
         with tempfile.TemporaryDirectory() as tmp:

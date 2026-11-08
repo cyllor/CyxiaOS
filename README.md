@@ -1,12 +1,14 @@
 # CyxiaOS
 
-## V0.16 审核修复开发基线
+## V0.16 审核修复与实现恢复开发基线
 
 当前开发分支为 **`CyxiaOS-V0.16`**，软件版本 **`0.16.0-dev`**；最小原型设计配置仍为 **1.3**，不随软件分支改号。
 
 本分支基于 V0.15 提交 `32057802e6e7d9239d04f1e7e3fed4f82f90db7e`，修复全量代码审核和 Superpowers 复核确认的九项问题：集群重连关闭记录分批恢复、双向契约状态隔离、Unknown 执行状态一致性、构建进程组清理、PTY 执行次数校验、日志恢复顺序游标、Virtio RNG 超时竞态、动态 IPC 目标枚举，以及回放扫描对暂不可读目标的重试。
 
-修复范围、回归结果与剩余工作见 [V0.16 汇总说明](docs/implementation/v16-source-summary.md)；机器可读来源见 [V0.16 基线](docs/implementation/v16-source-baseline.json)，实际验证记录见 [V0.16 验证](docs/implementation/v16-verification.json)。[V0.15 历史来源](docs/implementation/v15-source-summary.md)保留不变。历史原生 PASS 只属于原提交；V0.16 的主机回归通过不能替代原生验收，完整原型发布门禁仍关闭。
+修复范围、回归结果与剩余工作见 [V0.16 汇总说明](docs/implementation/v16-source-summary.md)；机器可读来源见 [V0.16 基线](docs/implementation/v16-source-baseline.json)，实际验证记录见 [V0.16 验证](docs/implementation/v16-verification.json)。[V0.15 历史来源](docs/implementation/v15-source-summary.md)保留不变。历史原生 PASS 只归属原运行绑定的源码快照；V0.16 的主机回归通过不能替代原生验收，完整原型发布门禁仍关闭。
+
+后续整合恢复了与 V0.15 A09 r7 实测记录逐项一致的 957 文件源码快照中的实现及工具，同时保留 V0.16 九项审核修复。历史审核记录保持原字节；当前来源与实际验证见 [整合摘要](docs/implementation/v16-reintegration-summary.md) 和 [恢复验证记录](docs/implementation/v16-reintegration-verification.json)。2026-11-08 新源码下 A01、A02、A09 已重新采集并独立通过，运行目录为 **3 PASS / 13 NOT_RUN**；A06 寄存器子项通过，A10 两个乱序前置阶段通过、缓存压力阶段诊断中断，完整矩阵未完成。[A01–A16 进度](docs/implementation/v16-a01-a16-progress-20261108.md)列出每项边界。特性 Clippy 既有失败、未归因 I/O 超时及其余验收义务仍保留，全分支审核为 CHANGES_REQUIRED，完整发布验收未通过。
 
 工程四路、组件六路和独立 A02 工作流已接入 V0.16 的 push/PR；Rust 工程路新增 `cluster-engine` 回归。`V0.16 source snapshot` 归档触发提交的源码、树身份和校验结果，不改变原生验收状态。`tools/prototype.py` 的 `build`、`run-single`、`run-pair`、`test`、`report` 入口保持不变。
 

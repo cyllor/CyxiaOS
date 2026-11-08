@@ -147,7 +147,7 @@ impl Driver {
         let h = self.last_header;
         let mut words = [0u64; SESSION_EXIT_WORDS];
         words[..12].copy_from_slice(&[
-            1, self.engine.boot, broker::service_generation(), self.diagnostic_epoch,
+            if origin == 9 { 2 } else { 1 }, self.engine.boot, broker::service_generation(), self.diagnostic_epoch,
             now, reason, result, origin, self.engine.member as u64,
             u64::from(authenticated) | (u64::from(self.active) << 1)
                 | (u64::from(self.ready_sent) << 2) | (u64::from(self.engine.ready()) << 3),
@@ -332,7 +332,7 @@ impl Driver {
         }
         result
     }
-    fn connect_inner(&mut self, challenge: [u8; 32], now: u64) -> Result<(), ()> {
+    fn connect_inner(&mut self, challenge: [u8; 32], _now: u64) -> Result<(), ()> {
         self.disconnect();
         if challenge == [0; 32] {
             return Err(());
@@ -345,11 +345,8 @@ impl Driver {
         self.in_snapshot = None;
         self.challenge = challenge;
         self.active = true;
-        self.last_rx = now;
-        self.last_status = now;
         self.kernel_epoch = broker::poll().map_err(|_| ())?.1;
         self.diagnostic_epoch = self.kernel_epoch;
-        broker::request(OP_TASK, &[], &mut [], 0, [9, 1, self.kernel_epoch]).map_err(|_| ())?;
         self.sent_results.clear();
         if self.engine.member == Member::Standalone {
             if let Some((nonce, _)) = self.engine.formation_lock() {
@@ -382,6 +379,13 @@ impl Driver {
         body.push(self.engine.member as u8);
         self.local_hello = Some(body.as_slice().try_into().map_err(|_| ())?);
         self.send(1, body, None)?;
+        // Cold durable setup is not time spent awaiting peer traffic. Open
+        // level 1 only once HELLO is prepared; runtime cannot transmit it until
+        // this call returns. The broker samples fresh time and revalidates the
+        // exact transport epoch before granting this non-READY session.
+        broker::request(OP_TASK, &[], &mut [], 0, [9, 1, self.kernel_epoch]).map_err(|_| ())?;
+        self.last_rx = broker::clock_ns() / 1_000_000;
+        self.last_status = self.last_rx;
         Ok(())
     }
     pub fn begin_leave(&mut self, id: [u8; 16]) -> Result<(), ()> {
@@ -505,7 +509,12 @@ impl Driver {
                 admission_started,
                 admission_finished,
             );
-            admitted.map_err(|_| ())?;
+            admitted.map_err(|status| {
+                // Preserve the existing broker boundary's original result;
+                // recording adds no call or authority.
+                self.exit_result = 0x3000 + status;
+                self.exit_origin = 9;
+            })?;
             self.last_rx = broker::clock_ns() / 1_000_000;
             if self.engine.ready() {
                 broker::request(OP_TASK, &[], &mut [], 0, [9, 2, self.kernel_epoch])

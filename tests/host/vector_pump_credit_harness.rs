@@ -43,6 +43,7 @@ mod crate_stubs {
     pub fn service_io(_: &mut dyn FnMut()) {}
     pub fn baseline_activation_pending() -> bool { super::BASELINE_PENDING.load(super::Ordering::Acquire) }
     pub fn owned_drain_pending() -> bool { false }
+    pub fn admission_progress_pending() -> bool { baseline_activation_pending() }
     pub fn service_step() -> Result<bool, super::Error> {
         super::locked(|s| { assert!(s.active.is_some()); Ok(()) }).unwrap();
         super::physical_work();

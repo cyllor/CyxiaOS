@@ -87,26 +87,22 @@ impl Parameters {
         }
         gradients[16] = error.clamp(F64::ONE.neg(), F64::ONE)?;
         let mut next = *self;
+        // Bound the clipped update itself. Re-subtracting the rounded endpoints
+        // can exceed the rate by one rounding unit when the update crosses a
+        // binary64 binade boundary; that is not an oversized gradient. Preserve
+        // the canonical RNE subtraction and projection without a tolerance.
         for (j, gradient) in gradients[..16].iter().copied().enumerate() {
-            next.weights[j] = self.weights[j]
-                .sub(rate.mul(gradient)?)?
-                .clamp(weight_min, weight_max)?;
-            if next.weights[j]
-                .sub(self.weights[j])?
-                .abs()
-                .compare(rate)
-                .is_gt()
-            {
+            let delta = rate.mul(gradient)?;
+            if delta.abs().compare(rate).is_gt() {
                 return Err(Error::Numeric);
             }
+            next.weights[j] = self.weights[j].sub(delta)?.clamp(weight_min, weight_max)?;
         }
-        next.bias = self
-            .bias
-            .sub(rate.mul(gradients[16])?)?
-            .clamp(bias_min, bias_max)?;
-        if next.bias.sub(self.bias)?.abs().compare(rate).is_gt() {
+        let delta = rate.mul(gradients[16])?;
+        if delta.abs().compare(rate).is_gt() {
             return Err(Error::Numeric);
         }
+        next.bias = self.bias.sub(delta)?.clamp(bias_min, bias_max)?;
         Ok(Step {
             prediction,
             error,

@@ -91,6 +91,11 @@ OPTIONAL = {"CONTROL_SETTLEMENT_EVIDENCE": 512, "DYNAMIC_V13_EVIDENCE": 4096, "P
             "REPLAY_ROOT_EVIDENCE": 256, "REPLAY_OWNER_EVIDENCE": 256,
             "REPLAY_CONFIG_EVIDENCE": 256, "REPLAY_CAPTURE_EVIDENCE": 256,
             "LOCAL_PLACEMENT_EVIDENCE": 256, "DOMAIN_PREPARATION_EVIDENCE": 128,
+            "APPLICATION_REQUEST_EVIDENCE": 6208,
+            "LOCAL_REQUEST_EVIDENCE": 2112,
+            "SESSION_ACTIVITY_EVIDENCE": 832,
+            "DISCOVERY_EVIDENCE": 512,
+            "REPLAY_QUIESCING_EVIDENCE": 512,
             "DOMAIN_PREPARATION_DETAIL": 256, "DOMAIN_PREPARATION_CONTEXT": 128,
             "DOMAIN_PREPARATION_REJECTIONS": 5184, "UNIFIED_SERVICE_STAGE": 8,
             "DOMAIN_PREPARATION_SKIP_EVIDENCE": 2048,
@@ -776,12 +781,22 @@ def diagnostics(guest, bundle, *, require_governance_runtime=False):
                                     ("REPLAY_CONFIG_EVIDENCE", "replay_config_evidence", 32),
                                     ("REPLAY_CAPTURE_EVIDENCE", "replay_capture_evidence", 32),
                                     ("LOCAL_PLACEMENT_EVIDENCE", "local_placement_evidence", 32),
+                                    ("APPLICATION_REQUEST_EVIDENCE", "application_request_evidence", 776),
+                                    ("LOCAL_REQUEST_EVIDENCE", "local_request_evidence", 264),
+                                    ("SESSION_ACTIVITY_EVIDENCE", "session_activity_evidence", 104),
+                                    ("DISCOVERY_EVIDENCE", "discovery_evidence", 64),
+                                    ("REPLAY_QUIESCING_EVIDENCE", "replay_quiescing_evidence", 64),
                                     ("PANIC_EVIDENCE", "panic_evidence", 8)):
         guest[key] = None
         if symbol_name in bundle:
             read(key, lambda: list(words(bundle[symbol_name], count)))
     if "RUNTIME_LOOP_EVIDENCE" in bundle:
         def runtime_loop():
+            # This optional bank is published only when a session terminates.
+            # An exact zero bank before the first terminal report is not a
+            # malformed completed record and cannot prove runtime progress.
+            if bundle["RUNTIME_LOOP_EVIDENCE"] == bytes(512):
+                return None
             try:
                 from .decode_runtime_loop import decode_runtime_loop
             except ImportError:
@@ -953,7 +968,42 @@ def progress_diagnostics(guest, bundle):
     guest["publication_cost"] = guest["capture_source"] = None
     guest["session_exit_evidence"] = guest["session_exits"] = None
     guest["progress_diagnostic_status"] = {}
+    if bundle.get("RUNTIME_LOOP_EVIDENCE") == bytes(512):
+        guest["progress_diagnostic_status"]["runtime_loop"] = "not_published"
     errors = []
+
+    # [DEBUG-v15-placement] This bank observes existing queue receipts only.
+    # Neither its counters nor a missing publication grants execution rights.
+    guest["application_requests"] = None
+    application = guest.get("application_request_evidence")
+    if application is not None:
+        if application[0] & 1:
+            guest["progress_diagnostic_status"]["application_requests"] = "in_progress"
+        else:
+            try:
+                try:
+                    from .decode_application_requests import decode
+                except ImportError:
+                    from decode_application_requests import decode
+                guest["application_requests"] = decode(bundle["APPLICATION_REQUEST_EVIDENCE"])
+            except ValueError as error:
+                errors.append(error)
+                guest["diagnostic_errors"].append({"field": "application_requests", "error": str(error)})
+    guest["local_requests"] = None
+    local = guest.get("local_request_evidence")
+    if local is not None:
+        if local[0] & 1:
+            guest["progress_diagnostic_status"]["local_requests"] = "in_progress"
+        else:
+            try:
+                try:
+                    from .decode_local_requests import decode
+                except ImportError:
+                    from decode_local_requests import decode
+                guest["local_requests"] = decode(bundle["LOCAL_REQUEST_EVIDENCE"])
+            except ValueError as error:
+                errors.append(error)
+                guest["diagnostic_errors"].append({"field": "local_requests", "error": str(error)})
 
     def read(key, parser):
         try:
@@ -969,6 +1019,56 @@ def progress_diagnostics(guest, bundle):
         require(u is not None and u[0] == UNIFIED_MAGIC and u[1] > 0,
                 "progress diagnostics require the captured BootEpoch")
         return u[1]
+
+    guest["replay_quiescing"] = None
+    if guest.get("replay_quiescing_evidence") is not None:
+        def replay_quiescing():
+            try:
+                from .decode_replay_quiescing import decode
+            except ImportError:
+                from decode_replay_quiescing import decode
+            result = decode(bundle["REPLAY_QUIESCING_EVIDENCE"])
+            if result["status"] == "observed":
+                require(result["boot_epoch"] == snapshot_boot(),
+                        "Quiescing snapshot BootEpoch mismatch")
+            guest["progress_diagnostic_status"]["replay_quiescing"] = result["status"]
+            return result
+        read("replay_quiescing", replay_quiescing)
+
+    guest["discovery"] = None
+    if guest.get("discovery_evidence") is not None:
+        def discovery():
+            raw = bundle["DISCOVERY_EVIDENCE"]
+            if guest["discovery_evidence"][0] & 1:
+                guest["progress_diagnostic_status"]["discovery"] = "in_progress"
+                return None
+            try:
+                from .decode_discovery import decode
+            except ImportError:
+                from decode_discovery import decode
+            result = decode(raw)
+            if result["present"]:
+                require(result["boot"] == snapshot_boot(),
+                        "discovery snapshot BootEpoch mismatch")
+            guest["progress_diagnostic_status"]["discovery"] = (
+                "sampled" if result["present"] else "not_published")
+            return result
+        read("discovery", discovery)
+
+    guest["session_activity"] = None
+    if guest.get("session_activity_evidence") is not None:
+        def session_activity():
+            try:
+                from .decode_session_activity import decode
+            except ImportError:
+                from decode_session_activity import decode
+            result = decode(bundle["SESSION_ACTIVITY_EVIDENCE"])
+            for record in result.get("records", {}).values():
+                require(record["boot_epoch"] == snapshot_boot(),
+                        "session-activity snapshot BootEpoch mismatch")
+            guest["progress_diagnostic_status"]["session_activity"] = result["status"]
+            return result
+        read("session_activity", session_activity)
 
     p = guest.get("publication_cost_evidence")
     if p is not None:
@@ -1460,6 +1560,11 @@ def retained_observation(guest):
                                    "trace_preparation_root_evidence", "trace_preparation_owner_evidence",
                                    "network_piece_evidence", "network_settlement_evidence",
                                    "runtime_loop", "runtime_loop_evidence",
+                                   "application_requests", "application_request_evidence",
+                                   "local_requests", "local_request_evidence",
+                                   "session_activity", "session_activity_evidence",
+                                   "discovery", "discovery_evidence",
+                                   "replay_quiescing", "replay_quiescing_evidence",
                                    "ipi_evidence", "slice_evidence", "smp_fault_evidence", "runtime", "runtime_evidence",
                                    "control_credit", "control_credit_evidence", "control_settlement_evidence", "control_settlements", "preparation_evidence", "preparation_detail", "preparation_prefix_detail", "preparation_entry_detail", "preparation_context", "preparation_rejections", "rejected_preparations", "preparation_skip_evidence", "preparation_skips",
                                    "control_pool", "control_pool_evidence", "learning", "learning_evidence", "governance", "governance_evidence", "governance_runtime", "governance_runtime_evidence", "replay", "replay_evidence",

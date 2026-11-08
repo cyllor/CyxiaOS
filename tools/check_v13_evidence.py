@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Report the separate 1.3 catalogue without promoting legacy/host evidence.
 
-A02 has a fixed native receipt adapter following a real native run and separate
-receipt replay. It validates raw events, execution provenance and the caller's
-source root; producer PASS booleans and host fixtures cannot establish a result.
-A10 additionally has fixed offline matrix reconstruction, but its native
-launch/capture admission remains closed. Other cases, native FAIL classification
+A01/A02/A03 have fixed native receipt adapters validating protected raw events,
+execution provenance and the caller's source root. A01 additionally requires
+actual architecture/authority observations and same-disk boot continuity;
+producer PASS booleans and host fixtures cannot establish a result.
+A09 requires full stopped-memory/native custody replay with an explicit trusted
+build directory and QEMU source; raw page structure alone cannot establish PASS.
+A10 additionally has fixed offline matrix reconstruction and native custody
+replay requiring explicit caller-selected build, formatter and QEMU inputs.
+Other cases, native FAIL classification
 and filesystem catalogue completion remain unenrolled. Coverage registration
 does not change unrun catalogue entries.
 """
@@ -18,9 +22,16 @@ import sys
 
 from check_prototype_evidence import artifact, exact_keys, read_json, require, safe_path, sha256
 from verify_v13_a02 import verify_native_receipt
-from verify_v13_a10_receipt import (NATIVE_ADMISSION_BLOCKERS as A10_BLOCKERS,
-                                   VERSION as A10_OFFLINE_VERSION,
+from verify_v15_a01 import (VERSION as A01_NATIVE_VERSION,
+                            verify_acceptance as verify_a01_native_receipt)
+from verify_v15_ownership import verify_native as verify_a03_native_receipt
+from memory_v15_custody import verify_native as verify_a09_native_receipt
+from verify_v13_a10_receipt import (VERSION as A10_OFFLINE_VERSION,
                                    verify_matrix_receipt as verify_a10_matrix_receipt)
+from verify_v13_a10_native_receipt import (
+    VERSION as A10_NATIVE_VERSION,
+    verify_native_matrix_receipt as verify_a10_native_matrix_receipt,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = ROOT / 'docs/implementation/v13-requirements.json'
@@ -36,7 +47,8 @@ FAMILIES = frozenset(['D01_WEIGHT', 'D01_CORESET'] + [f'D{i:02}' for i in range(
 STATUSES = frozenset({'PASS', 'FAIL', 'NOT_RUN'})
 
 
-def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None):
+def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None,
+               a09_build=None, a10_build_manifest=None, a10_formatter=None):
     require(type(rows) is list and len(rows) == len(expected), f'Incomplete {label}')
     ids = [r.get('id') if type(r) is dict else None for r in rows]
     require(all(type(i) is str for i in ids) and len(set(ids)) == len(ids)
@@ -56,13 +68,81 @@ def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None):
         else:
             require(type(row['evidence']) is dict, 'Native result requires a receipt')
             receipt = artifact(root, row['evidence'])
+            if row['id'] == 'A01' and descriptions:
+                require(row['status'] == 'PASS', 'A01 native FAIL classification is not registered')
+                require(receipt.name == 'summary.json', 'A01 receipt must name summary.json')
+                require(qemu_source is not None, 'A01 requires explicit trusted QEMU source')
+                observed = verify_a01_native_receipt(receipt.parent, source_root=root,
+                                                     qemu_source=qemu_source)
+                require(observed.get('test_id') == 'A01'
+                        and observed.get('native_acceptance_status') == 'PASS'
+                        and observed.get('native_execution_verified') is True
+                        and observed.get('runtime_truth_attested') is False
+                        and observed.get('reboot_chain_verified') is True,
+                        'A01 native receipt does not establish complete A01')
+                counts[row['status']] += 1
+                continue
+            if row['id'] == 'A03' and descriptions:
+                require(row['status'] == 'PASS', 'A03 native FAIL classification is not registered')
+                require(receipt.name == 'summary.json', 'A03 receipt must name summary.json')
+                require(qemu_source is not None, 'A03 requires explicit trusted QEMU source')
+                observed = verify_a03_native_receipt(receipt.parent, source_root=root,
+                                                     qemu_source=qemu_source)
+                model = observed.get('model_replay')
+                require(observed.get('test_id') == 'A03'
+                        and observed.get('native_acceptance_status') == 'PASS'
+                        and observed.get('native_execution_verified') is True
+                        and observed.get('runtime_truth_attested') is False
+                        and observed.get('control_sets') == [2, 6, 2]
+                        and type(model) is list and len(model) == 2
+                        and all(type(item) is dict
+                                and item.get('status') == 'MODEL_REPLAY_VALID'
+                                and item.get('full_integer_mlp') is True for item in model),
+                        'A03 native receipt does not establish complete A03')
+                counts[row['status']] += 1
+                continue
+            if row['id'] == 'A09' and descriptions:
+                require(row['status'] == 'PASS', 'A09 native FAIL classification is not registered')
+                require(receipt.name == 'summary.json', 'A09 receipt must name summary.json')
+                require(a09_build is not None and qemu_source is not None,
+                        'A09 requires explicit trusted build directory and QEMU source')
+                # Only the caller supplies the trusted build/source context.
+                # Raw page checks and an archived producer verdict grant nothing.
+                observed = verify_a09_native_receipt(receipt.parent, build=a09_build,
+                    source_root=root, qemu_source=qemu_source)
+                require(type(observed) is dict
+                        and observed.get('status') == 'PASS'
+                        and observed.get('test_id') == 'A09'
+                        and observed.get('native_acceptance_status') == 'PASS'
+                        and observed.get('native_execution_verified') is True
+                        and observed.get('full_a09_verified') is True
+                        and observed.get('actual_cache_pressure_verified') is True
+                        and observed.get('runtime_truth_attested') is False,
+                        'A09 native receipt does not establish complete A09')
+                counts[row['status']] += 1
+                continue
             if row['id'] == 'A10' and descriptions:
                 require(row['status'] == 'PASS', 'A10 native FAIL classification is not registered')
                 require(receipt.name == 'summary.json', 'A10 receipt must name summary.json')
                 verify_a10_matrix_receipt(receipt.parent, source_root=root)
-                # Rebuilding file/durability bytes cannot replace independent
-                # native process, launch, injection and capture provenance.
-                raise ValueError('A10 native receipt admission remains closed: ' + '; '.join(A10_BLOCKERS))
+                # The receipt cannot choose a build, source, executable or
+                # verifier. Raw replay alone never opens native admission.
+                require(all(value is not None for value in
+                            (qemu_source, a10_build_manifest, a10_formatter)),
+                        'A10 native receipt admission remains closed without explicit '
+                        'caller-selected A10 build, formatter and QEMU inputs')
+                observed = verify_a10_native_matrix_receipt(receipt.parent, source_root=root,
+                    build_manifest=a10_build_manifest,
+                    qemu_binary=Path(qemu_source) / 'build/qemu-system-aarch64',
+                    qemu_source=qemu_source, formatter_binary=a10_formatter)
+                require(observed.get('test_id') == 'A10'
+                        and observed.get('native_acceptance_status') == 'PASS'
+                        and observed.get('native_execution_verified') is True
+                        and observed.get('raw_matrix_verified') is True
+                        and observed.get('native_filesystem_fault_matrix_complete') is True,
+                        'A10 native receipt does not establish the complete A10 matrix')
+                counts[row['status']] += 1
+                continue
             if row['id'] != 'A02' or not descriptions:
                 raise ValueError(f"No complete 1.3 native receipt verifier registered for {row['id']}")
             require(row['status'] == 'PASS', 'A02 native FAIL classification is not registered')
@@ -82,7 +162,8 @@ def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None):
     return counts
 
 
-def validate(document, root=ROOT, *, qemu_source=None):
+def validate(document, root=ROOT, *, qemu_source=None, a09_build=None, a10_build_manifest=None,
+             a10_formatter=None):
     root = Path(root).resolve()
     exact_keys(document, {'schema_version', 'spec', 'deviations', 'cases',
                           'action_families', 'filesystem_fault_matrix'})
@@ -101,7 +182,9 @@ def validate(document, root=ROOT, *, qemu_source=None):
     require(d['id'] == 'LANG-RUST' and d['clause'] == '1.2' and d['authorized'] is True
             and type(d['decision']) is str and bool(d['decision'].strip()), 'Invalid Rust deviation')
     cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True,
-                       qemu_source=qemu_source)
+                       qemu_source=qemu_source, a09_build=a09_build,
+                       a10_build_manifest=a10_build_manifest,
+                       a10_formatter=a10_formatter)
     definitions = [{key: row[key] for key in ('id', 'scenario', 'required_outcome')}
                    for row in document['cases']]
     encoded = json.dumps(sorted(definitions, key=lambda row: row['id']), ensure_ascii=False,
@@ -123,6 +206,14 @@ def validate(document, root=ROOT, *, qemu_source=None):
               for group in ('A', 'T', 'E')}
     for row in document['cases']:
         groups[row['id'][0]][row['status']] += 1
+    a09_context = a09_build is not None and qemu_source is not None
+    a10_context = all(value is not None for value in
+                      (qemu_source, a10_build_manifest, a10_formatter))
+    native_receipt_cases = ['A01', 'A02', 'A03']
+    if a09_context:
+        native_receipt_cases.append('A09')
+    if a10_context:
+        native_receipt_cases.append('A10')
     return {'schema_version': 1, 'spec_version': '1.3', 'catalogue_valid': True,
             'mandatory_cases': len(CASE_IDS), 'action_families': len(FAMILIES),
             'states': {s: cases[s] + actions[s] for s in cases},
@@ -132,16 +223,31 @@ def validate(document, root=ROOT, *, qemu_source=None):
             'functional_acceptance_complete': False, 'strict_spec_conformance': False,
             'approved_deviations': deviations, 'runtime_truth_attested': False,
             'verifier_coverage': {
-                'native_receipt_cases': ['A02'],
+                'native_receipt_cases': native_receipt_cases,
                 'raw_contracts': {
+                    'A01': {'verifier': 'tools/verify_v15_a01.py',
+                            'native_receipt_admitted': True,
+                            'native_verifier_version': A01_NATIVE_VERSION,
+                            'requires_explicit_qemu_source': True},
                     'A02': {'verifier': 'tools/verify_v13_a02.py', 'wire_version': 2,
                             'native_receipt_admitted': True,
                             'native_verifier_version': 'a02-native-v4'},
+                    'A03': {'verifier': 'tools/verify_v15_ownership.py',
+                            'native_receipt_admitted': True,
+                            'native_verifier_version': 'v15-model-owner-v1',
+                            'requires_explicit_qemu_source': True},
+                    'A09': {'verifier': 'tools/memory_v15_custody.py',
+                            'native_receipt_admitted': a09_context,
+                            'native_verifier_version': 'v15-a09-memory-v1',
+                            'requires_explicit_build': True,
+                            'requires_explicit_qemu_source': True},
                     'A10': {'verifier': 'tools/verify_v13_a10_receipt.py',
-                            'native_receipt_admitted': False,
+                            'native_receipt_admitted': a10_context,
                             'offline_verifier_version': A10_OFFLINE_VERSION,
-                            'native_admission_blockers': list(A10_BLOCKERS)}}},
-            'scope': 'Catalogue integrity, fixed A02 native verification and A10 offline reconstruction; other native cases and filesystem acceptance remain required.'}
+                            'native_verifier_version': A10_NATIVE_VERSION,
+                            'native_admission_blockers': [] if a10_context else [
+                                'explicit caller-selected A10 build, formatter and QEMU inputs required']}}},
+            'scope': 'Catalogue integrity, A01/A02/A03 native verification, explicit-context A09 native memory custody and A10 native matrix replay; other native cases and filesystem acceptance remain required.'}
 
 
 def main(argv=None):
@@ -149,11 +255,20 @@ def main(argv=None):
     parser.add_argument('--manifest', type=Path, default=DEFAULT)
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--qemu-source', type=Path,
-                        help='explicit trusted patched-QEMU checkout for A02 replay')
+                        help='explicit trusted patched-QEMU checkout for native receipt replay')
+    parser.add_argument('--a09-build', type=Path,
+                        help='explicit trusted A09 build directory for complete native memory replay')
+    parser.add_argument('--a10-build-manifest', type=Path,
+                        help='explicit trusted build record for complete A10 native replay')
+    parser.add_argument('--a10-formatter', type=Path,
+                        help='explicit trusted formatter binary for A10 native replay')
     parser.add_argument('--release', action='store_true')
     args = parser.parse_args(argv)
     try:
-        result = validate(read_json(args.manifest), args.root, qemu_source=args.qemu_source)
+        result = validate(read_json(args.manifest), args.root, qemu_source=args.qemu_source,
+                          a09_build=args.a09_build,
+                          a10_build_manifest=args.a10_build_manifest,
+                          a10_formatter=args.a10_formatter)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2 if args.release and not result['functional_acceptance_complete'] else 0
     except (OSError, ValueError, TypeError) as error:

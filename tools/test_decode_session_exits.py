@@ -20,11 +20,21 @@ use std::io::Write;
 fn main() {
  let mut bank = [0u64; 80];
  let regressed = std::env::args().any(|arg| arg == "clock-regression");
+ let activity = std::env::args().any(|arg| arg == "activity-admission");
  for (generation, connection, auth, now) in [(1,1,0,2000), (1,2,1,4000), (2,3,1,6000)] {
   let mut r = [0;24];
   r[..12].copy_from_slice(&[1,7,generation,connection,now,12,0x4001,5,2,auth,now-1500,4]);
   if regressed && connection == 3 {
    r[4]=3000; r[5]=6; r[6]=0x1004; r[7]=8; r[10]=4500;
+  }
+  if activity && connection == 3 {
+   r[0]=2; r[5]=10; r[6]=0x3003; r[7]=9;
+   let mut invalid = r; invalid[0]=1;
+   assert!(!evidence::valid_record(&invalid,7,generation,connection));
+   invalid=r; invalid[7]=10;
+   assert!(!evidence::valid_record(&invalid,7,generation,connection));
+   invalid=r; invalid[0]=3;
+   assert!(!evidence::valid_record(&invalid,7,generation,connection));
   }
   assert!(evidence::retain(&mut bank,&r,7,generation,connection));
  }
@@ -40,6 +50,8 @@ fn main() {
             subprocess.run([rustc, '--edition=2024', str(path / 'fixture.rs'), '-o', str(path / 'fixture')], check=True)
             cls.snapshot = subprocess.check_output([str(path / 'fixture')])
             cls.clock_regression_snapshot = subprocess.check_output([str(path / 'fixture'), 'clock-regression'])
+            cls.activity_fixture = subprocess.run([str(path / 'fixture'), 'activity-admission'],
+                                                  capture_output=True)
 
     def decode(self, data=None, **kwargs):
         return decode_session_exits(self.snapshot if data is None else data,
@@ -94,6 +106,22 @@ fn main() {
         words[432 + 56 + 6] = 0x4001
         with self.assertRaisesRegex(ValueError, 'malformed session-exit record'):
             self.decode(struct.pack('<512Q', *words))
+
+    def test_v2_activity_origin_preserves_v1_bounds_and_original_broker_error(self):
+        self.assertEqual(self.activity_fixture.returncode, 0,
+                         self.activity_fixture.stderr.decode())
+        result = self.decode(self.activity_fixture.stdout)
+        self.assertEqual(result['first_authenticated']['record_version'], 1)
+        record = result['latest_authenticated']
+        self.assertEqual(record['record_version'], 2)
+        self.assertEqual((record['reason'], record['result'], record['origin']),
+                         ('plaintext_ingest', 'broker_failed', 'activity_admission'))
+        for version, origin in ((1, 9), (2, 10), (3, 9)):
+            words = list(struct.unpack('<512Q', self.activity_fixture.stdout))
+            words[432 + 56] = version
+            words[432 + 56 + 7] = origin
+            with self.subTest(version=version, origin=origin), self.assertRaises(ValueError):
+                self.decode(struct.pack('<512Q', *words))
 
 
 if __name__ == '__main__':

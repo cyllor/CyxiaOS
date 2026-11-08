@@ -1,4 +1,4 @@
-use super::memory::{Pages, copy_from, copy_to, fault_page, prepare};
+use super::memory::{Pages, copy_from, copy_to, fault_page, frame_ptr, prepare};
 use super::*;
 
 pub(super) struct Mailbox<'a> {
@@ -252,13 +252,43 @@ pub(super) fn syscall_locked(
     if task.closed
         && !matches!(
             context.regs[8],
-            0 | 1 | 3 | 7 | 9 | 10 | 12 | 13 | 15 | 16 | 17 | 18 | 20
+            0 | 1 | 3 | 7 | 9 | 10 | 12 | 13 | 15 | 16 | 17 | 18 | 20 | 22
         )
     {
         return Err(Error::Auth);
     }
     match context.regs[8] {
-        0 => {}
+        0 => {
+            if crate::memory_fault_capture::selected(task.key) {
+                let mut progress = [0u8; 128];
+                read(s, task.key, 0x30000, &mut progress)?;
+                let stage = u64::from_le_bytes(progress[16..24].try_into().unwrap());
+                if crate::memory_fault_capture::needs_snapshot(task.key, stage)
+                    || progress[24..32] != [0; 8]
+                {
+                    let leaf = unsafe { &*frame_ptr(i * 3 + 2)?.cast::<[u64; 512]>() };
+                    let mut owned = [0; 7];
+                    for (n, va) in [
+                        0x60000, 0x61000, 0x62000, 0x63000, 0x72000, 0x80000, 0x30000,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        owned[n] = super::memory::frame_phys(s.memory.resident(task.key, va)?)?;
+                    }
+                    crate::memory_fault_capture::observe(
+                        task.key,
+                        now_ns(),
+                        s.memory.owner_pages(task.key)?,
+                        s.memory.owner_quota(task.key)?,
+                        owned,
+                        s.memory.stats(),
+                        leaf,
+                        &progress,
+                    );
+                }
+            }
+        }
         1 => {
             if crate::storage_fault_capture::selected(task.key) {
                 let mut progress = [0; 104];
@@ -351,7 +381,7 @@ pub(super) fn syscall_locked(
                     .id;
             }
         }
-        7 => {
+        7 | 22 => {
             let len = usize::try_from(args[1]).map_err(|_| Error::Range)?;
             if len > 8192 || len < 32 {
                 return Err(Error::Range);

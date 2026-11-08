@@ -7,7 +7,7 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
-from check_v13_disk import inspect
+from check_v13_boot_disk import inspect
 
 
 def require(value, message):
@@ -30,14 +30,15 @@ def signature(public, message, signed):
         require(result.returncode==0,'Ed25519 proof signature verification failed')
 
 
-def config(data):
+def config(data,*,schema_version=1):
     require(len(data)==252 and data[:4]==b'\x01\0\0\0','invalid canonical formation configuration')
     nodes=[data[36:68],data[68:100]]
     counters=struct.unpack_from('<QQ',data,100)
     nonces=[data[116:148],data[148:180]]
     epoch=struct.unpack_from('<Q',data,244)[0]
     require(nodes[0]<nodes[1] and min(counters)>0 and epoch>0 and all(any(n) for n in nonces),'invalid formation identities/counters/nonces')
-    require(data[4:36]==sha(b'CyxiaOS paired native v1') and data[180:212]==sha(b'CX-RPC-native-schema-1') and data[212:244]==sha(b'pure-vector-sum-only'),'unexpected native formation trust/schema/policy')
+    schemas={1:b'CX-RPC-native-schema-1',2:b'CX-RPC-native-schema-2'}
+    require(schema_version in schemas and data[4:36]==sha(b'CyxiaOS paired native v1') and data[180:212]==sha(schemas[schema_version]) and data[212:244]==sha(b'pure-vector-sum-only'),'unexpected native formation trust/schema/policy')
     return dict(bytes=data,nodes=nodes,counters=counters,nonces=nonces,epoch=epoch,formation=sha(b'CX-FORM-v1'+data),cluster=sha(b'CX-CLUSTER-v1'+sha(b'CX-FORM-v1'+data)))
 
 
@@ -45,7 +46,8 @@ def verify_records(disk, public_map, task_input, package_hash):
     records=[bytes.fromhex(r) for r in disk['cluster_records']]
     require(records and len(records)<=32768,'missing/beyond-quota durable identity/events')
     identity=records[0]
-    require(len(identity)==85 and identity[:5]==b'CXID1' and identity[5:21].hex()==disk['uuid'],'durable filesystem identity mismatch')
+    require(len(identity)==85 and identity[:5] in (b'CXID1',b'CXID2') and identity[5:21].hex()==disk['uuid'],'durable filesystem identity mismatch')
+    version=1 if identity[:5]==b'CXID1' else 2
     local,peer=identity[21:53],identity[53:85]
     require(local!=peer and local in public_map and peer in public_map,'durable NodeID differs from provisioned Ed25519 public keys')
     require(disk['boot_epoch']>0,'invalid current BootEpoch')
@@ -57,7 +59,15 @@ def verify_records(disk, public_map, task_input, package_hash):
     expected_tasks={}
     proof_history=[]
     formation_locks={}
+    from cluster_native_journal import NativeJournal
+    native=NativeJournal(peer,package_hash) if version==2 else None
+    engine_ordinal=0
     for ordinal,record in enumerate(records[1:],1):
+        if native is not None and record.startswith((b'CXDP2',b'CXAPP1')):
+            native.observe(record)
+            continue
+        engine_ordinal+=1
+        ordinal=engine_ordinal
         require(len(record)>=13 and len(record)<=33200 and record[:4]==b'CXE1' and struct.unpack_from('<Q',record,4)[0]==ordinal,'non-monotonic durable event serial')
         tag,body=record[12],record[13:]
         if tag==1:
@@ -67,7 +77,7 @@ def verify_records(disk, public_map, task_input, package_hash):
             locked=(counter,nonce,frozen)
         elif tag==2:
             require(len(body)==316 and member in ('standalone','confirmed') and locked,'CONFIRMED state/length')
-            new=config(body[:252]);i=new['nodes'].index(local) if local in new['nodes'] else -1
+            new=config(body[:252],schema_version=version);i=new['nodes'].index(local) if local in new['nodes'] else -1
             require(i>=0 and new['nodes'][1-i]==peer and new['counters'][i]==locked[0] and new['nonces'][i]==locked[1] and new['epoch']>locked[2] and new['counters'][1-i]>peer_counter,'CONFIRMED durable formation mismatch')
             if member=='confirmed':require(cfg['bytes']==new['bytes'] and own_signature==body[252:],'conflicting repeated CONFIRMED')
             signature(public_map[local],b'CX-CONFIRM-v1'+new['formation'],body[252:])
@@ -184,7 +194,8 @@ def verify_records(disk, public_map, task_input, package_hash):
             raise ValueError('unknown durable protocol event')
     require(proof_history,'missing durable BOUND proof')
     require(not contracts,'unclosed durable contract obligations')
-    return dict(local=local,peer=peer,proofs=proof_history,expected_tasks=expected_tasks,formation_locks=formation_locks,started=started,results=results,acks=acks,closed=closed,member=member,events=len(records)-1)
+    native_summary=native.finish(proof_history,local,expected_tasks,closed) if native is not None else None
+    return dict(local=local,peer=peer,proofs=proof_history,expected_tasks=expected_tasks,formation_locks=formation_locks,started=started,results=results,acks=acks,closed=closed,member=member,events=len(records)-1,profile_version=version,native_journal=native_summary)
 
 
 def verify_pair(disks, publics, *, task_input=None, package_hash=None):
@@ -194,10 +205,11 @@ def verify_pair(disks, publics, *, task_input=None, package_hash=None):
     require(len(public_map)==2,'cloned NodeIDs')
     if task_input is None:task_input=struct.pack('<4q',1,2,3,4)
     nodes=[verify_records(d,public_map,task_input,package_hash) for d in disks]
+    require(nodes[0]['profile_version']==nodes[1]['profile_version'],'mixed durable identity/schema versions')
     require(nodes[0]['local']==nodes[1]['peer'] and nodes[1]['local']==nodes[0]['peer'],'disk pair identity mismatch')
     require(set(nodes[0]['proofs'])==set(nodes[1]['proofs']),'nodes hold different durable BOUND proofs')
     for proof in nodes[0]['proofs']:
-        c=config(proof[:252])
+        c=config(proof[:252],schema_version=nodes[0]['profile_version'])
         frozen=[n['formation_locks'][c['formation']][2] for n in nodes]
         require(c['epoch']==max(frozen)+1,'formation epoch must equal max frozen epoch plus one')
     starts=[(key,i) for i,n in enumerate(nodes) for key in n['started']]

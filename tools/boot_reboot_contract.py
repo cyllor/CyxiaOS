@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
-import shutil
 import subprocess
 
 from check_prototype_evidence import read_json, safe_path, sha256
@@ -67,7 +66,14 @@ def prepare_disk(output: Path, formatter: Path, uuid: str, previous: Path | None
     # Keep the predecessor immutable for independent replay. Only the new copy
     # is ever attached to QEMU; the predecessor process has already exited.
     with source.open('rb') as src, disk.open('xb') as dst:
-        shutil.copyfileobj(src, dst, 1024 * 1024)
+        while block := src.read(1024 * 1024):
+            if block != bytes(len(block)):
+                dst.write(block)
+            else:
+                dst.seek(len(block), os.SEEK_CUR)
+        # Seeking over a trailing zero chunk does not extend the file. Preserve
+        # the exact logical EOF before publishing or synchronizing the copy.
+        dst.truncate()
         # This is host fixture setup, before any guest starts. Do not make the
         # first guest FLUSH pay for 512 MiB of dirty host copy buffers. The
         # formatter similarly synchronizes its initial image. This does not

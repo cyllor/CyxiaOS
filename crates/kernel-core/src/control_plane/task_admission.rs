@@ -99,6 +99,10 @@ impl Authority {
             self.level = 0;
         }
     }
+    /// Read-only diagnostic facts; never a substitute for fresh admission.
+    pub fn session_observation(&self) -> [u64; 4] {
+        [self.epoch, self.level, self.last_rx, self.generation]
+    }
     pub fn session(&mut self, epoch: u64, level: u64, now: u64) -> Result<(), Error> {
         if level == 0 {
             self.disconnect();

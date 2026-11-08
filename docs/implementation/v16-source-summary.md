@@ -1,5 +1,10 @@
 # CyxiaOS V0.16：审核修复开发基线
 
+本文记录初始审核提交 `abd8fa01d0dab42c43ecd4c1a4cf29e24ba9906f` 的九项修复及当时验证范围。
+后续实现恢复与新源码的独立验证见 [恢复说明](v16-reintegration-summary.md) 和
+[恢复验证记录](v16-reintegration-verification.json)；本文及原审核记录的 PASS/APPROVED 不转移到后续源码。
+2026-11-08 新源码的独立运行目录为 A01/A02/A09 三项 PASS，其余十三项 A 验收待完成；见 [逐项进度](v16-a01-a16-progress-20261108.md)。本轮功能测试通过，严格特性 Clippy 仍有既有失败；原生子项与完整验收分别记账。
+
 ## 版本与来源
 
 | 项目 | 值 |

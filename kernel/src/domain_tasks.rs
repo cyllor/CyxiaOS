@@ -42,6 +42,7 @@ pub use abi::{
     close_network, fault, grant_endpoint, grant_file_cap, network_drain, network_key,
     network_pending, network_write, open_network, syscall,
 };
+pub use execution::start_memory_client;
 pub use execution::{
     acknowledge_local_result, cancel_spawn, close_admission, dispatch, heartbeat_ns,
     init_recoverable, local_result, probe_status, query_local, query_spawn, readonly_drained,
@@ -63,7 +64,12 @@ const PAGES: usize = 1024;
 const TABLE_PAGES: usize = TASKS * 3;
 const CODE_FRAME: usize = TABLE_PAGES;
 const CLIENT_CODE_FRAME: usize = CODE_FRAME + 1;
-const CODE_PAGES: usize = 5;
+const MEMORY_CODE_FRAME: usize = CLIENT_CODE_FRAME + 4;
+const CODE_PAGES: usize = if crate::memory_fault_capture::PROFILE {
+    9
+} else {
+    5
+};
 const USER_LIMIT: u64 = 0x20_0000;
 const IPC_BYTES: usize = 256;
 const ZERO: ObjectKey = ObjectKey {
@@ -101,6 +107,10 @@ pub const CLIENT_PACKAGE: ObjectKey = ObjectKey {
     id: 2,
     generation: 1,
 };
+const MEMORY_PACKAGE: ObjectKey = ObjectKey {
+    id: 3,
+    generation: 1,
+};
 const REMOTE_ID: u64 = 0x100;
 const MEMORY_KEY: ObjectKey = ObjectKey {
     id: 0x4d454d,
@@ -116,6 +126,7 @@ const SERVICE_KEY: ObjectKey = ObjectKey {
 const CONTROL_WINDOW_HEADROOM_NS: u64 = 20_000_000;
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-task.elf"));
 const CLIENT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prototype-client.elf"));
+const MEMORY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/memory-client.elf"));
 const SELFTEST_ENABLED: bool = include!(concat!(env!("OUT_DIR"), "/domain-selftest.rs"));
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -656,6 +667,9 @@ pub fn init() -> Result<(), Error> {
         s.file_endpoint = s.ipc.open(FILE_SERVICE, false)?;
         memory::load_code(ELF, CODE_FRAME, 1)?;
         memory::load_code(CLIENT_ELF, CLIENT_CODE_FRAME, 4)?;
+        if crate::memory_fault_capture::PROFILE {
+            memory::load_code(MEMORY_ELF, MEMORY_CODE_FRAME, 4)?;
+        }
         Ok(())
     })?;
     READY.store(true, Ordering::Release);

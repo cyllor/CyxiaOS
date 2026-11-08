@@ -23,6 +23,7 @@ from verify_v13_a02 import verify_native_qemu, verify_stopped_status
 from transport import FrameDecoder
 
 VERSION = 'a01-boot-provenance-v2'
+MAX_STOPPED_PROBE_STOPS = 64
 TOOL_FILES = (
     'run_v13_boot_recovery.py', 'run_v13_boot_evidence.py',
     'verify_v13_boot_recovery.py', 'verify_v13_boot_receipt.py',
@@ -30,7 +31,10 @@ TOOL_FILES = (
     'verify_unified.py', 'build_unified.py', 'check_elf.py',
     'verify_v13_model.py', 'check_prototype_evidence.py', 'transport.py',
     'boot_reboot_contract.py', 'check_v13_disk.py',
+    'check_v13_boot_disk.py', 'check_v13_filesystem.py',
     'run_v13_boot_reboots.py', 'verify_v13_boot_reboots.py',
+    'verify_v15_a01.py', 'run_v15_a01.py',
+    'verify_v15_ownership.py', 'run_v15_a03.py',
 )
 BUILD_INPUTS = ('Cargo.toml', 'Cargo.lock', '.cargo/config.toml',
                 'crates/prototype/src/features.rs', 'crates/prototype/src/policy_wire.rs')
@@ -163,19 +167,31 @@ def _exchanges(rows: list[dict]) -> list[tuple[dict, object]]:
     return exchanges
 
 
-def verify_qmp(rows, capture_root, symbols, dtb_size, platform):
+def verify_qmp(rows, capture_root, symbols, dtb_size, platform, *, formal=False, ownership=False):
     """Validate capture ordering and addresses; never trust supplied save locations."""
     specs = {'dtb-header.bin': (0x40000000, 40), 'platform.dtb': (0x40000000, dtb_size),
              'config-observed.bin': (symbols['config']['pa'], 512),
              'pending-boot.bin': (symbols['boot']['pa'], 512),
+             'stopped-boot-probe.bin': (symbols['boot']['pa'], 512),
              'first.bin': (symbols['boot']['pa'], 512), 'last.bin': (symbols['boot']['pa'], 512),
              'control.bin': (symbols['control']['pa'], 4096),
              'runtime.bin': (symbols['runtime']['pa'], 8192),
              'unified.bin': (symbols['unified']['pa'], 4096)}
+    if formal:
+        specs.update({name: (symbols['formal']['pa'], 2048) for name in
+                      ('pending-formal.bin', 'stopped-formal-probe.bin', 'formal-first.bin', 'formal-last.bin')})
+    if ownership:
+        from verify_v15_ownership import WORDS
+        specs.update({name:(symbols['ownership']['pa'],WORDS*8) for name in
+            ('pending-ownership.bin','stopped-ownership-probe.bin','ownership-first.bin','ownership-last.bin')})
+    probe_group=['stopped-boot-probe.bin']+(['stopped-formal-probe.bin'] if formal else [])+(['stopped-ownership-probe.bin'] if ownership else [])
+    first_group=['first.bin']+(['formal-first.bin'] if formal else [])+(['ownership-first.bin'] if ownership else [])
+    final_group=['last.bin']+(['formal-last.bin'] if formal else [])+(['ownership-last.bin'] if ownership else [])+['control.bin','runtime.bin','unified.bin']
     preboot = {'dtb-header.bin', 'platform.dtb', 'config-observed.bin'}
     before = set()
     queries = set()
     groups = []
+    stopped_probes = []
     running = False
     started = False
     stopped_checked = False
@@ -198,7 +214,8 @@ def verify_qmp(rows, capture_root, symbols, dtb_size, platform):
             require(args is None and response == {} and not running and before == preboot
                     and len(queries) == 2, 'invalid resume/preboot capture')
             if started:
-                require(groups and stopped_checked and groups[-1] in (['first.bin'], ['last.bin']),
+                require(groups and stopped_checked and (groups[-1] == first_group
+                        or not groups[-1] and stopped_probes[-1]),
                         'resume after authority capture or unobserved stop')
             running = started = True
             stopped_checked = False
@@ -207,6 +224,8 @@ def verify_qmp(rows, capture_root, symbols, dtb_size, platform):
             running = False
             stopped_checked = False
             groups.append([])
+            stopped_probes.append([])
+            require(len(groups) <= MAX_STOPPED_PROBE_STOPS, 'too many stopped candidate probes')
         elif command == 'query-status':
             require(args is None and started and not running and not stopped_checked,
                     'invalid capture status ordering')
@@ -223,11 +242,20 @@ def verify_qmp(rows, capture_root, symbols, dtb_size, platform):
             if name in preboot:
                 require(not started and name not in before, 'late/duplicate preboot capture')
                 before.add(name)
-            elif name == 'pending-boot.bin':
+            elif name in ('pending-boot.bin', 'pending-formal.bin', 'pending-ownership.bin'):
                 require(running, 'live probe outside running interval')
+            elif name in probe_group:
+                require(started and not running and stopped_checked and not groups[-1],
+                        'stopped probe outside verified stop or after authority')
+                probes = stopped_probes[-1]
+                require(len(probes) < len(probe_group) and name == probe_group[len(probes)],
+                        'duplicate or unordered stopped candidate probe')
+                probes.append(name)
             else:
                 require(started and not running and stopped_checked and name not in groups[-1],
                         'memory sample was not taken after verified stop')
+                require(not stopped_probes[-1] or stopped_probes[-1] == probe_group,
+                        'authority before complete stopped candidate probes')
                 groups[-1].append(name)
         elif command == 'ringbuf-read':
             require(running and args == {'device': 'cyxlog', 'size': 1048576, 'format': 'base64'}
@@ -240,22 +268,23 @@ def verify_qmp(rows, capture_root, symbols, dtb_size, platform):
             ended = True
         else:
             raise ValueError('forbidden QMP command: ' + command)
-    require(ended and len(groups) >= 2
-            and groups[-1] == ['last.bin', 'control.bin', 'runtime.bin', 'unified.bin'],
+    groups = [group for group in groups if group]
+    require(ended and len(groups) >= 2 and groups[-1] == final_group,
             'missing final stopped authority captures')
-    first_groups = [i for i, group in enumerate(groups[:-1]) if group == ['first.bin']]
-    require(first_groups and all(group == ['last.bin'] for group in groups[first_groups[-1]+1:-1]),
+    first_groups = [i for i, group in enumerate(groups[:-1]) if group == first_group]
+    require(first_groups and not groups[first_groups[-1]+1:-1],
             'missing ordered first sample')
-    require(all(group in (['first.bin'], ['last.bin']) for group in groups[:-1]),
+    require(all(group == first_group for group in groups[:-1]),
             'extra nonfinal capture')
     return bytes(serial)
 
 
-def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> dict:
+def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path,
+                   formal=False, ownership=False) -> dict:
     from build_unified import code_source_map
     from check_elf import boot_profile, inspect_elf, symbol
     from verify_v13_model import loaded_bytes
-    from check_v13_disk import inspect as inspect_disk
+    from check_v13_boot_disk import inspect as inspect_disk
     root = Path(directory).resolve(strict=True)
     project = Path(source_root).resolve(strict=True)
     trusted_qemu = Path(qemu_source).resolve(strict=True)
@@ -281,7 +310,21 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
     image = path('node-a.elf').read_bytes()
     inspect_elf(image)
     require(boot_profile(image)['ram_mib'] == 1024, 'wrong image RAM profile')
-    symbols = {key: symbol(image, name) for key, name in SYMBOLS.items()}
+    names = dict(SYMBOLS)
+    if formal:
+        names['formal'] = 'A01_FORMAL_EVIDENCE'
+    if ownership:
+        names['ownership'] = 'OWNERSHIP_V15_EVIDENCE'
+    symbols = {key: symbol(image, name) for key, name in names.items()}
+    if formal:
+        require(symbols['formal']['size'] == 2048, 'wrong formal boot wire layout')
+        for name in ('pending-formal.bin', 'formal-first.bin', 'formal-last.bin'):
+            require(name in receipt['files'], 'formal capture omitted from inventory')
+    if ownership:
+        from verify_v15_ownership import WORDS
+        require(symbols['ownership']['size']==WORDS*8,'wrong actual ownership bank size')
+        for name in ('pending-ownership.bin','ownership-first.bin','ownership-last.bin'):
+            require(name in receipt['files'],'owner capture omitted from inventory')
     for key, needed in (('boot', 512), ('config', 512), ('control', 4096), ('runtime', 8192), ('unified', 4096)):
         item = symbols[key]
         require(item['size'] >= needed and 0x40000000 <= item['pa']
@@ -295,7 +338,7 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
     inputs = document('input.json')
     require(type(inputs) is dict and inputs.keys() ==
             {'scope', 'mode', 'nonce', 'timeout_seconds', 'sample_gap_seconds', 'disk_origin'}
-            and inputs['scope'] == 'A01-boot-recovery-regression'
+            and inputs['scope'] == ('A03-model-owner-transition' if ownership else 'A01-boot-recovery-regression')
             and type(inputs['mode']) is int and inputs['mode'] in MODES.values()
             and inputs['mode'] == struct.unpack_from('<Q', config, 16)[0]
             and inputs['nonce'] == config[32:48].hex()
@@ -312,6 +355,23 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
             'write outside the fixed preboot configuration')
     observed = verify_samples(*(path(name).read_bytes() for name in
                                ('first.bin', 'last.bin', 'control.bin', 'runtime.bin', 'unified.bin', 'config.bin')))
+    if formal:
+        from verify_v15_a01 import verify_formal_samples
+        first_formal, last_formal = (path(name).read_bytes() for name in
+                                    ('formal-first.bin', 'formal-last.bin'))
+        first_authority = verify_formal_samples(first_formal, path('first.bin').read_bytes())
+        last_authority = verify_formal_samples(last_formal, path('last.bin').read_bytes())
+        first_words, last_words = (struct.unpack('<256Q', raw) for raw in
+                                  (first_formal, last_formal))
+        require(first_words[:8] == last_words[:8]
+                and first_words[16:30] == last_words[16:30]
+                and first_words[128:185] == last_words[128:185]
+                and first_authority['key_count'] <= last_authority['key_count']
+                and first_authority['publication_count'] <= last_authority['publication_count'],
+                'first authority facts changed between stopped captures')
+        for cpu, row in first_authority['el0'].items():
+            require(last_authority['el0'].get(cpu) == row, 'first EL0 return changed between captures')
+        observed['formal_authority'] = last_authority
     platform = document('platform.json')
     cpus = platform['cpus']
     require(type(cpus) is list and len(cpus) == 4
@@ -342,7 +402,7 @@ def verify_receipt(directory: Path, *, source_root: Path, qemu_source: Path) -> 
     require(transcript.stat().st_size <= 16 * 1024 * 1024, 'QMP transcript exceeds bound')
     rows = json.loads(transcript.read_text(), object_pairs_hook=_pairs,
                       parse_constant=lambda value: (_ for _ in ()).throw(ValueError('invalid JSON number')))
-    raw = verify_qmp(rows, captured_root, symbols, len(dtb), platform)
+    raw = verify_qmp(rows, captured_root, symbols, len(dtb), platform, formal=formal, ownership=ownership)
     require(raw == path('serial.bin').read_bytes(), 'serial bytes differ from QMP capture')
     decoder = FrameDecoder()
     text = b''.join(payload + b'\n' for payload in decoder.feed(raw))

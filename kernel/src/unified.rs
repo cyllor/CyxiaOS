@@ -9,7 +9,11 @@ use core::{
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_cluster_transport::{
     device::VirtioPort,
-    tcp::{BUFFER_SIZE, Config, Error as TcpError, State as TcpState, Storage, Tcp, reconnect_due},
+    discovery::PacketMetadata,
+    tcp::{
+        BUFFER_SIZE, Config, DiscoveryBuffers, DiscoveryConfig, Error as TcpError,
+        State as TcpState, Storage, Tcp, reconnect_due,
+    },
 };
 use cyxia_contracts::{BootInfo, PhysAddr};
 use cyxia_driver_virtio::{
@@ -20,6 +24,8 @@ use cyxia_kernel_core::control_plane::service_restart::{Lifecycle, RestartDecisi
 use cyxia_prototype::domains::Error;
 #[path = "../../user/prototype-cluster/src/abi.rs"]
 pub(crate) mod abi;
+#[path = "unified_discovery.rs"]
+mod discovery_evidence;
 #[path = "unified_runtime_loop.rs"]
 mod runtime_loop;
 #[path = "unified_session_exit.rs"]
@@ -44,7 +50,11 @@ static mut RX: QueueMemory = QueueMemory::zeroed();
 static mut TX: QueueMemory = QueueMemory::zeroed();
 static mut TCP_RX: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
 static mut TCP_TX: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
-static mut SOCKET: [Storage<'static>; 1] = [Storage::EMPTY];
+static mut SOCKET: [Storage<'static>; 2] = [Storage::EMPTY, Storage::EMPTY];
+static mut DISCOVERY_RX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
+static mut DISCOVERY_TX_META: [PacketMetadata; 4] = [PacketMetadata::EMPTY; 4];
+static mut DISCOVERY_RX: [u8; 1024] = [0; 1024];
+static mut DISCOVERY_TX: [u8; 1024] = [0; 1024];
 #[repr(C, align(4096))]
 pub struct Evidence {
     words: [AtomicU64; 512],
@@ -406,7 +416,34 @@ fn network_turn(
         );
         started = timer::cpu_ticks();
     };
-    let state = link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint);
+    // Each due announcement obtains a new nonce from the actual guest CSPRNG.
+    // The RNG's bounded progress points settle the same paid network service
+    // segments; neither a clock-derived nonce nor an unbilled wait is used.
+    let discovery = (|| {
+        if link.discovery_due(Board.now_ms())? {
+            let mut nonce = [0; 16];
+            crate::entropy::fill_progress(&mut nonce, &mut checkpoint)
+                .map_err(|_| TcpError::Device)?;
+            link.prepare_discovery(Board.now_ms(), nonce)?;
+        }
+        Ok::<(), TcpError>(())
+    })();
+    let state = match discovery {
+        Ok(()) => link.poll_with_checkpoints(Board.now_ms(), &mut checkpoint),
+        Err(error) => {
+            link.abort();
+            Err(error)
+        }
+    };
+    if let Some(snapshot) = link.discovery_snapshot() {
+        discovery_evidence::publish(
+            UNIFIED_EVIDENCE.words[1].load(Ordering::Relaxed),
+            epoch,
+            Board.now_ms(),
+            state.ok(),
+            snapshot,
+        );
+    }
     if matches!(state, Ok(TcpState::Established)) && epoch != 0 {
         // Socket polling and IPC dequeue are separate bounded owners. The
         // callback runs with no socket/device or task lock held.
@@ -565,7 +602,11 @@ pub fn run(info: &BootInfo) -> ! {
     let mut service_lifecycle = Lifecycle::new(boot.epoch, 1).expect("valid service identity");
     let mut context = unsafe { load() };
     initialize_shared(boot.epoch, boot.filesystem, service_lifecycle.generation());
-    if crate::storage_fault_capture::PROFILE {
+    if crate::memory_fault_capture::PROFILE {
+        startup(15, || crate::memory_fault_capture::activate(boot.epoch));
+        startup(15, || crate::domain_tasks::start_memory_client(1));
+        startup(15, || crate::domain_tasks::start_memory_client(2));
+    } else if crate::storage_fault_capture::PROFILE {
         if crate::storage_fault_capture::mode() <= 2 {
             startup(15, || crate::domain_tasks::start_storage_client(1));
         }
@@ -592,10 +633,10 @@ pub fn run(info: &BootInfo) -> ! {
     let mut config = Config {
         mac: net.mac(),
         local: [10, 42, 0, node],
-        peer: [10, 42, 0, 3 - node],
+        peer: [0; 4], // Only an actually received discovery candidate selects TCP.
         prefix_len: 24,
         local_port: if initiator { 40001 } else { 8443 },
-        peer_port: if initiator { 8443 } else { 40001 },
+        peer_port: 0,
         random_seed: 1, // Always replaced by real fresh guest entropy below.
     };
     line(format_args!(
@@ -608,6 +649,7 @@ pub fn run(info: &BootInfo) -> ! {
     let mut entropy_failed = false;
     let mut refresh_input = true;
     let mut learning_install_stage = 0u8;
+    let mut discovery_schedule = None;
     loop {
         // Only TCP state is reconstructed. The NIC and all DMA buffers retain
         // their original owner for the entire boot, including poisoned queues.
@@ -629,14 +671,16 @@ pub fn run(info: &BootInfo) -> ! {
             continue;
         }
         unsafe {
-            (*core::ptr::addr_of_mut!(SOCKET))[0] = Storage::EMPTY;
+            *core::ptr::addr_of_mut!(SOCKET) = [Storage::EMPTY, Storage::EMPTY];
+            *core::ptr::addr_of_mut!(DISCOVERY_RX_META) = [PacketMetadata::EMPTY; 4];
+            *core::ptr::addr_of_mut!(DISCOVERY_TX_META) = [PacketMetadata::EMPTY; 4];
         }
         let mut tcp = if entropy_failed {
             None
         } else {
             Some(
                 unsafe {
-                    Tcp::new(
+                    Tcp::new_discovering(
                         VirtioPort {
                             net: &mut net,
                             platform: &Board,
@@ -646,12 +690,26 @@ pub fn run(info: &BootInfo) -> ! {
                         &mut *core::ptr::addr_of_mut!(TCP_RX),
                         &mut *core::ptr::addr_of_mut!(TCP_TX),
                         &mut *core::ptr::addr_of_mut!(SOCKET),
+                        DiscoveryConfig {
+                            local_node: *LOCAL,
+                            peer_node: *PEER,
+                        },
+                        DiscoveryBuffers {
+                            rx_meta: &mut *core::ptr::addr_of_mut!(DISCOVERY_RX_META),
+                            tx_meta: &mut *core::ptr::addr_of_mut!(DISCOVERY_TX_META),
+                            rx: &mut *core::ptr::addr_of_mut!(DISCOVERY_RX),
+                            tx: &mut *core::ptr::addr_of_mut!(DISCOVERY_TX),
+                        },
                     )
                 }
                 .unwrap_or_else(|_| fail(7)),
             )
         };
         if let Some(link) = tcp.as_mut() {
+            if let Some(schedule) = discovery_schedule {
+                link.resume_discovery_schedule(schedule, Board.now_ms())
+                    .unwrap_or_else(|_| fail(7));
+            }
             (if initiator {
                 link.connect()
             } else {
@@ -664,6 +722,7 @@ pub fn run(info: &BootInfo) -> ! {
         let mut service_fault = false;
         loop {
             coordinator.poll();
+            crate::memory_fault_capture::poll();
             if learning_install_stage < 4 {
                 match crate::domain_tasks::service_segment(|| match learning_install_stage {
                     0 => {
@@ -768,7 +827,11 @@ pub fn run(info: &BootInfo) -> ! {
                     p.local_node = *LOCAL;
                     p.peer_node = *PEER;
                     crate::domain_network::prepare(p);
-                    p.domains.peer_ipv4 = u64::from(u32::from_be_bytes(config.peer));
+                    p.domains.peer_ipv4 = tcp
+                        .as_ref()
+                        .and_then(|link| link.peer_ipv4())
+                        .map(|ip| u64::from(u32::from_be_bytes(ip)))
+                        .unwrap_or(0);
                     let observation = tcp
                         .as_ref()
                         .map(|link| link.observation())
@@ -969,8 +1032,15 @@ pub fn run(info: &BootInfo) -> ! {
                 }
                 abi::OP_STORE_FLUSH => p.len = 0, // PUT already committed and FLUSHed.
                 abi::OP_TASK => {
+                    let request_entry_ms = Board.now_ms();
                     let _ = network_turn(&mut coordinator, &mut tcp, stream_epoch);
+                    let network_finished_ms = Board.now_ms();
                     let started = service_start(&mut coordinator, &mut tcp, stream_epoch);
+                    crate::unified_task::observe_broker_timing([
+                        request_entry_ms,
+                        network_finished_ms,
+                        Board.now_ms(),
+                    ]);
                     // Waiting for the full mechanism credit may advance a
                     // socket or a contract deadline. Revalidate at admission,
                     // never using the earlier SVC capture time/connectivity.
@@ -1101,6 +1171,9 @@ pub fn run(info: &BootInfo) -> ! {
             }
         }
         crate::unified_task::transport(false);
+        if let Some(schedule) = tcp.as_ref().and_then(|link| link.discovery_schedule()) {
+            discovery_schedule = Some(schedule);
+        }
         // End the socket and NIC mutable borrow before discarding IPC prefixes;
         // otherwise a new connection could receive an old stream's bytes.
         drop(tcp);

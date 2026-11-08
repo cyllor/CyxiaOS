@@ -84,6 +84,7 @@ struct CoreRecord {
     state: ExecutionState,
     started: u64,
     order: u64,
+    context: [u64; 2],
 }
 #[derive(Clone, Copy)]
 struct ConsoleRecord {
@@ -546,6 +547,18 @@ pub fn core_request() -> Option<(ApplyId, PolicyStamp, u64)> {
             .flatten()
             .find(|r| !r.state.terminal())
             .map(|r| (r.apply, r.stamp, r.desired)))
+    })
+    .ok()
+    .flatten()
+}
+/// Context frozen at actual executor admission, not a later poll's view.
+pub(crate) fn core_request_trace() -> Option<(ApplyId, PolicyStamp, u64, [u64; 2])> {
+    with(|s| {
+        Ok(s.core_records
+            .iter()
+            .flatten()
+            .find(|r| !r.state.terminal())
+            .map(|r| (r.apply, r.stamp, r.desired, r.context)))
     })
     .ok()
     .flatten()
@@ -1085,6 +1098,7 @@ fn core_apply(
         state,
         started: now,
         order,
+        context: [s.cores.core_generation, s.cores.ledger_generation],
     });
     s.core_sequence = order;
     s.core_seen = (apply.controller_epoch, apply.plan_seq);

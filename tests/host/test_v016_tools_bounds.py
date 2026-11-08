@@ -70,19 +70,28 @@ while True: time.sleep(.01)
                         reaped = True
                 libc.prctl(36, previous.value, 0, 0, 0)
 
-    def run_term_ignoring_leader(self, observer_failure=False):
+    def run_term_ignoring_leader(self, observer_failure=False, probe_failure=False):
         owned = []
         original_popen = subprocess.Popen
+        original_killpg = os.killpg
+        probe_denials = 0
         def spawn(*args, **kwargs):
             process = original_popen(*args, **kwargs)
             owned.append(process)
             return process
+        def killpg(pgid, signum):
+            nonlocal probe_denials
+            if probe_failure and signum == 0 and probe_denials < 2:
+                probe_denials += 1
+                raise PermissionError('injected group probe denial')
+            return original_killpg(pgid, signum)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             program = ('import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
                        'signal.alarm(10); time.sleep(9)')
             try:
-                with patch.object(build_cosmic.subprocess, 'Popen', side_effect=spawn):
+                with patch.object(build_cosmic.subprocess, 'Popen', side_effect=spawn), \
+                     patch.object(build_cosmic.os, 'killpg', side_effect=killpg):
                     if observer_failure:
                         with patch.object(build_cosmic, 'process_group_live',
                                           side_effect=PermissionError('injected observer denial')):
@@ -90,6 +99,12 @@ while True: time.sleep(.01)
                                 build_cosmic.run_bounded([sys.executable, '-c', program],
                                     root, dict(os.environ), root / 'log', .5, 0, 10**8)
                         self.assertIn('injected observer denial', str(caught.exception))
+                    elif probe_failure:
+                        with self.assertRaisesRegex(build_cosmic.CosmicBuildError, 'deadline') as caught:
+                            build_cosmic.run_bounded([sys.executable, '-c', program],
+                                root, dict(os.environ), root / 'log', .5, 0, 10**8)
+                        self.assertIn('injected group probe denial', str(caught.exception))
+                        self.assertEqual(probe_denials, 2)
                     else:
                         # Force the portable existence observer without procfs.
                         with patch.object(build_cosmic.sys, 'platform', 'portable-test'):
@@ -108,6 +123,9 @@ while True: time.sleep(.01)
 
     def test_observer_failure_still_kills_and_reaps_owned_leader(self):
         self.run_term_ignoring_leader(observer_failure=True)
+
+    def test_group_probe_denial_still_kills_and_reaps_owned_leader(self):
+        self.run_term_ignoring_leader(probe_failure=True)
 
     def test_portable_observer_reaps_term_ignoring_leader_before_group_check(self):
         self.run_term_ignoring_leader()

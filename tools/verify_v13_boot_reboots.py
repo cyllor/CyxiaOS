@@ -14,7 +14,7 @@ import sys
 
 from boot_reboot_contract import SCENARIOS, verify_process, verify_transition
 from check_prototype_evidence import read_json, safe_path, sha256
-from check_v13_disk import inspect as inspect_disk
+from check_v13_boot_disk import inspect as inspect_disk
 from verify_v13_boot_recovery import require
 from verify_v13_boot_receipt import verify_receipt
 
@@ -42,7 +42,8 @@ def verify_link(previous: dict | None, current: dict) -> None:
                       current['mode'], current['issued_epoch'])
 
 
-def verify_chain(directory: Path, *, source_root: Path, qemu_source: Path) -> dict:
+def verify_chain(directory: Path, *, source_root: Path, qemu_source: Path,
+                 formal=False) -> dict:
     root = Path(directory).resolve(strict=True)
     previous, nonces, results = None, set(), {}
     expected_dirs = {name for name, _ in SCENARIOS}
@@ -51,7 +52,8 @@ def verify_chain(directory: Path, *, source_root: Path, qemu_source: Path) -> di
     for name, mode in SCENARIOS:
         child = root / name
         require(not child.is_symlink(), 'redirected reboot profile')
-        native = verify_receipt(child, source_root=source_root, qemu_source=qemu_source)
+        native = verify_receipt(child, source_root=source_root, qemu_source=qemu_source,
+                                formal=formal)
         require(native['mode'] == mode, 'wrong reboot fault order')
         get = lambda name: safe_path(child, name)
         inputs = read_json(get('input.json'))

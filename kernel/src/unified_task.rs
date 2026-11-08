@@ -10,8 +10,13 @@ use cyxia_kernel_core::control_plane::task_admission::{
 };
 use cyxia_prototype::domains::Error;
 use sha2::{Digest, Sha256};
+#[path = "session_activity_diagnostic.rs"]
+mod activity_diagnostic;
 #[path = "unified_task/custody.rs"]
 mod custody;
+pub fn observe_broker_timing(times: [u64; 3]) {
+    activity_diagnostic::broker_timing(times);
+}
 static mut AUTHORITY: Authority = Authority::new();
 static BOOT: AtomicU64 = AtomicU64::new(0);
 static mut REQUESTER: [u8; 32] = [0; 32];
@@ -289,16 +294,47 @@ pub fn request(
         return (0, 32, 0);
     }
     if phase == 9 {
+        let authority = unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) };
+        let before = authority.session_observation();
         if token != 0 && (!connected || offset != epoch) {
-            unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).disconnect() };
+            authority.disconnect();
+            activity_diagnostic::record(activity_diagnostic::Observation {
+                boot: BOOT.load(Ordering::Acquire),
+                token,
+                requested_epoch: offset,
+                live_epoch: epoch,
+                connected,
+                fresh_ms: now,
+                before,
+                after: authority.session_observation(),
+                status: 3,
+                reason: 1,
+            });
             return (3, 0, 0);
         }
-        let authority = unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) };
         let result = if token == 3 {
             authority.activity(epoch, now)
         } else {
             authority.session(epoch, token, now)
         };
+        let reason = match &result {
+            Ok(()) => 0,
+            Err(cyxia_kernel_core::control_plane::Error::Invalid) => 2,
+            Err(cyxia_kernel_core::control_plane::Error::NotReady) => 3,
+            Err(_) => 255,
+        };
+        activity_diagnostic::record(activity_diagnostic::Observation {
+            boot: BOOT.load(Ordering::Acquire),
+            token,
+            requested_epoch: offset,
+            live_epoch: epoch,
+            connected,
+            fresh_ms: now,
+            before,
+            after: authority.session_observation(),
+            status: if result.is_ok() { 0 } else { 3 },
+            reason,
+        });
         return (if result.is_ok() { 0 } else { 3 }, 0, 0);
     }
     if phase == 0 || phase == TASK_RESERVE_CUSTODY {

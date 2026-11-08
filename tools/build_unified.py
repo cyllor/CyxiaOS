@@ -46,6 +46,30 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def build_cache_context(cache_base, source_root, sources):
+    """Keep backdated source and other checkouts out of Cargo's mtime cache."""
+    base = Path(cache_base).expanduser().resolve()
+    root = Path(source_root).resolve(strict=True)
+    source_sha = hashlib.sha256(json.dumps(sources, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    identity = dict(version=1, source_root=str(root), compiled_source_sha256=source_sha)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    target = base / ('source-' + key)
+    require(not target.is_symlink() and target.resolve().parent == base,
+            'linked or escaping build cache namespace')
+    return dict(base=str(base), effective=str(target), namespace_key=key,
+                source_root=str(root), compiled_source_sha256=source_sha,
+                strategy='source-and-checkout-v1')
+
+
+def cache_artifact(path, target_dir):
+    actual = Path(path).resolve(strict=True)
+    require(actual.is_relative_to(Path(target_dir).resolve(strict=True)),
+            'Cargo artifact outside selected build cache namespace')
+    return actual
+
+
 def identity_metadata(directory):
     directory=Path(directory)
     public=(directory/'own.pub').read_bytes();peer=(directory/'peer.pub').read_bytes()
@@ -144,10 +168,11 @@ def service_fault_scope(profile):
 
 
 def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',leave=False,unix_seconds=None,
-          selftest=False,storage_fault=False,cargo=None,cc=None,target_dir=None):
+          selftest=False,storage_fault=False,memory_probe=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
     service_fault_nodes = service_fault_scope(service_fault)
     require(not storage_fault or (selftest and fault == 'normal' and not leave), 'storage fault profile requires selftest, normal runtime and no leave')
+    require(not memory_probe or (selftest and fault=='normal' and service_fault=='none' and not leave and not storage_fault), 'A09 requires independent normal ordinary-client profile')
     if unix_seconds is None:
         unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
     require(0<unix_seconds<(1<<63),'invalid provisioned UTC epoch')
@@ -163,7 +188,8 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     environment=env()
     cargo=cargo or environment.get('CARGO','cargo')
     cc=cc or environment.get('CC_aarch64_unknown_none',environment.get('CYXIA_CC',environment.get('CC','clang')))
-    target_dir=Path(target_dir or environment.get('CARGO_TARGET_DIR',ROOT/'target')).expanduser().resolve()
+    cache_context=build_cache_context(target_dir or environment.get('CARGO_TARGET_DIR',ROOT/'target'), ROOT, before)
+    target_dir=Path(cache_context['effective'])
     environment.update(CARGO=str(cargo),CC_aarch64_unknown_none=str(cc),CYXIA_CC=str(cc),CARGO_TARGET_DIR=str(target_dir))
     environment['CARGO_NET_OFFLINE']='true'
     environment.pop('RUSTFLAGS',None);environment.pop('CARGO_ENCODED_RUSTFLAGS',None)
@@ -179,7 +205,7 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None;governance_hash=None
     for index,name in enumerate(('a','b')):
-        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault_nodes[name],CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0')
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault_nodes[name],CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0',CYXIA_MEMORY_FAULT_PROBE='1' if memory_probe else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
         commands.append(dict(node=name,stage='service',argv=service_command,service_fault=service_fault_nodes[name]))
         print(f'Building node {name} EL0 service',flush=True)
@@ -192,7 +218,16 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
         print(f'Building node {name} EL1 kernel',flush=True)
         text=run_logged(kernel_command,per_node,output/f'kernel-{name}.log')
         kernel,actual_out=parse_cargo_build_messages(text)
+        kernel=cache_artifact(kernel,target_dir)
+        actual_out=cache_artifact(actual_out,target_dir)
         image=output/f'node-{name}.elf';shutil.copyfile(kernel,image);image.chmod(0o600)
+        if memory_probe:
+            memory=actual_out/'memory-client.elf'
+            audit_embedded_role(image.read_bytes(),memory.read_bytes(),'A09 ordinary memory client')
+            from memory_v15_client import current_code,user_code
+            require(user_code(memory.read_bytes())==current_code(ROOT),
+                    'A09 current source differs from actual OUT_DIR client; isolate the native Cargo target and preserve this failed build')
+            shutil.copyfile(memory,output/f'memory-client-{name}.elf');(output/f'memory-client-{name}.elf').chmod(0o600)
         package=actual_out/'prototype-task.elf'
         found_hash=sha(package)
         require(task_hash is None or found_hash==task_hash,'nodes contain different pure-task packages')
@@ -221,7 +256,7 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     require(sha(Path(__file__)) == builder_digest, 'native builder changed during build')
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
-    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,service_fault_nodes=service_fault_nodes,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,embedded_roles=dict(governance=dict(sha256=governance_hash,bytes=(output/'governance.elf').stat().st_size)),own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
+    report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,service_fault_nodes=service_fault_nodes,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault),memory_probe=bool(memory_probe)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,build_cache=cache_context,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,embedded_roles=dict(governance=dict(sha256=governance_hash,bytes=(output/'governance.elf').stat().st_size)),own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
@@ -236,13 +271,14 @@ def main():
     parser.add_argument('--leave',action='store_true')
     parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
     parser.add_argument('--storage-fault',action='store_true',help='dedicated A10 ordinary-file workload (requires --selftest)')
+    parser.add_argument('--memory-probe',action='store_true',help='dedicated A09 ordinary anonymous/file-pressure workload')
     parser.add_argument('--cargo',default=os.environ.get('CARGO'),help='Cargo executable (also accepts CARGO)')
     parser.add_argument('--cc',help='bare-metal C compiler (also accepts CC_aarch64_unknown_none or CC)')
-    parser.add_argument('--target-dir',type=Path,help='build cache directory (also accepts CARGO_TARGET_DIR)')
+    parser.add_argument('--target-dir',type=Path,help='cache base; source/checkout namespace is derived inside it (also accepts CARGO_TARGET_DIR)')
     parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
     args=parser.parse_args()
     build(args.identity_a,args.identity_b,args.output,fault=args.fault,service_fault=args.service_fault,leave=args.leave,unix_seconds=args.unix_seconds,
-          selftest=args.selftest,storage_fault=args.storage_fault,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
+          selftest=args.selftest,storage_fault=args.storage_fault,memory_probe=args.memory_probe,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
     print(args.output/'build-manifest.json')
 
 

@@ -167,5 +167,12 @@
     "manifest": "docs/implementation/v15-source-baseline.json",
     "applies_to_new_commits": false
   },
-  "source_identity_note": "This manifest records the immutable parent; archive CI records the actual triggering commit/tree and source ZIP digest without a circular self-commit field."
+  "source_identity_note": "This manifest records the immutable parent; archive CI records the actual triggering commit/tree and source ZIP digest without a circular self-commit field.",
+  "followup_verification": {
+    "record": "docs/implementation/v16-reintegration-verification.json",
+    "summary": "docs/implementation/v16-reintegration-summary.md",
+    "historical_audit_commit": "abd8fa01d0dab42c43ecd4c1a4cf29e24ba9906f",
+    "historical_record_preserved": true,
+    "scope": "source restoration follow-up; current checks and review recorded separately from the initial audit"
+  }
 }

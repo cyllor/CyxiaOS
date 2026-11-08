@@ -125,7 +125,7 @@ pub fn corrupt_pending(_:usize,_:u64){}
             template = template.replace('// DIAGNOSTIC_MODULE', '#[path=' + json.dumps(str(diagnostic)) + '] mod network_diagnostics;')
             source = directory / 'harness.rs'
             source.write_text(template)
-            (directory / 'Cargo.toml').write_text('[package]\nname="network-piece-trace"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[features]\ndefault=["unified-runtime"]\nunified-runtime=[]\n[dependencies]\ncyxia-prototype={path=' + json.dumps(str(ROOT / 'crates/prototype')) + '}\ncyxia-driver-virtio={path=' + json.dumps(str(ROOT / 'crates/driver-virtio')) + '}\n[workspace]\n')
+            (directory / 'Cargo.toml').write_text('[package]\nname="network-piece-trace"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[features]\ndefault=["unified-runtime"]\nunified-runtime=[]\n[dependencies]\ncyxia-prototype={path=' + json.dumps(str(ROOT / 'crates/prototype')) + '}\ncyxia-driver-virtio={path=' + json.dumps(str(ROOT / 'crates/driver-virtio')) + '}\ncyxia-cluster-transport={path=' + json.dumps(str(ROOT / 'crates/cluster-transport')) + '}\ncyxia-posix={path=' + json.dumps(str(ROOT / 'crates/posix')) + '}\n[workspace]\n')
             command = [str(RUST_BIN / 'cargo'), 'test', '--offline', '--manifest-path',
                 str(directory / 'Cargo.toml'), '--target-dir', str(ROOT / 'target/host-network-piece-trace'),
                 '--', '--test-threads=1']

@@ -1,6 +1,7 @@
 """A10-only ordered host observations. These are custody, not attestation."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -124,6 +125,7 @@ class TranscriptJournal:
         self.bytes = self.commands = 0
         self.lifecycle = []
         self.rows = 0
+        self.block_errors = 0
         self.witness = witness
         self.lock = witness.lock if witness is not None else threading.RLock()
 
@@ -136,7 +138,7 @@ class TranscriptJournal:
             message = row['message']
             lifecycle = sent and message['execute'] in ('cont', 'stop', 'quit')
             require(len(data) <= 4 * 1024**2 and self.bytes + len(data) <= self.byte_limit
-                    and self.rows < 2 * self.command_limit + 3
+                    and self.rows < 2 * self.command_limit + 4
                     and self.commands + int(sent) <= self.command_limit
                     and (not lifecycle or len(self.lifecycle) < 3),
                     'native QMP journal bound exceeded')
@@ -147,6 +149,15 @@ class TranscriptJournal:
             self.rows += 1
             if lifecycle:
                 self.lifecycle.append(row)
+            if not sent and message.get('event') == 'BLOCK_IO_ERROR':
+                self.block_errors += 1
+                require(self.block_errors == 1, 'native QMP block error bound exceeded')
+                if self.witness is not None:
+                    # Preserve the actual parse point under the same lock as
+                    # backend-cut. QEMU's wall timestamp grants no ordering.
+                    digest = hashlib.sha256(json.dumps(message, sort_keys=True,
+                        separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+                    self.witness.record('qmp-block-error', qmp_row=self.rows, sha256=digest)
             if self.witness is not None and (sent or 'id' in message):
                 self.witness.record('qmp-request' if sent else 'qmp-response', id=message['id'])
 

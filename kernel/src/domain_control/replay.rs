@@ -17,6 +17,8 @@ mod config_diagnostic;
 mod fixture;
 #[path = "replay/lifecycle.rs"]
 pub(crate) mod lifecycle;
+#[path = "replay/quiescing_diagnostic.rs"]
+mod quiescing_diagnostic;
 #[path = "replay/verification.rs"]
 mod verification;
 
@@ -1924,6 +1926,26 @@ pub fn poll(token: Token) -> Result<Status, Error> {
             return status(s, root());
         }
         if let Err(error) = fixture::poll(s, token) {
+            if root().phase == Phase::Quiescing {
+                // [DEBUG-v15-replay-gate] No predicate clock was reached.
+                let mut gate = quiescing_diagnostic::Event::new();
+                gate.0[..2].copy_from_slice(&[token.boot_epoch, token.id]);
+                if let Some(q) = root().request {
+                    gate.0[2..7].copy_from_slice(&[
+                        q.trial_id,
+                        q.family.domain as u64,
+                        q.family.kind as u64,
+                        q.target.id,
+                        q.target.generation,
+                    ]);
+                }
+                gate.0[7] = root().phase as u64;
+                gate.0[8] = 7;
+                gate.0[10] = root().cursor as u64;
+                gate.0[12] = root().cursor as u64;
+                gate.0[43] = error as u64 + 1;
+                gate.publish();
+            }
             if root().spectator.is_some() {
                 if root().fault.is_none()
                     && !matches!(error, Error::Busy | Error::Again | Error::NotReady)
@@ -1947,29 +1969,113 @@ pub fn poll(token: Token) -> Result<Status, Error> {
         }
         match r.phase {
             Phase::Quiescing => {
-                if s.job.is_some() {
+                // [DEBUG-v15-replay-gate] Copy the actual predicates under the
+                // existing gate. No additional clock reads or owner callbacks.
+                let mut gate = quiescing_diagnostic::Event::new();
+                gate.0[..2].copy_from_slice(&[token.boot_epoch, token.id]);
+                if let Some(q) = q {
+                    gate.0[2..7].copy_from_slice(&[
+                        q.trial_id,
+                        q.family.domain as u64,
+                        q.family.kind as u64,
+                        q.target.id,
+                        q.target.generation,
+                    ]);
+                }
+                gate.0[7] = r.phase as u64;
+                gate.0[9] = at;
+                gate.0[10] = r.cursor as u64;
+                if let Some(job) = s.job {
+                    gate.0[8] = 1;
+                    gate.0[12] = r.cursor as u64;
+                    gate.0[35..41].copy_from_slice(&[
+                        1,
+                        job.sequence,
+                        job.controller,
+                        job.cpu as u64,
+                        job.started,
+                        u64::from(job.completion.is_some()),
+                    ]);
+                    gate.publish();
                     return status(s, r);
                 }
                 let end = (r.cursor + 8).min(s.owner.desired.len());
-                for d in s.owner.desired[r.cursor..end].iter().flatten() {
-                    if execution_blocks_replacement(d)
-                        || (!fixture::skip_wait(r, d) && !d.action.one_shot() && d.stamp.live(at))
-                    {
+                gate.0[11] = end as u64;
+                for (offset, entry) in s.owner.desired[r.cursor..end].iter().enumerate() {
+                    let Some(d) = entry else {
+                        continue;
+                    };
+                    let blocks = execution_blocks_replacement(d);
+                    let live = !blocks
+                        && !fixture::skip_wait(r, d)
+                        && !d.action.one_shot()
+                        && d.stamp.live(at);
+                    if blocks || live {
+                        gate.0[8] = if blocks { 2 } else { 3 };
+                        gate.0[13] = (r.cursor + offset + 1) as u64;
+                        gate.0[14] = if !d.state.terminal() {
+                            1
+                        } else if blocks {
+                            2
+                        } else {
+                            4
+                        };
+                        gate.0[15..24].copy_from_slice(&[
+                            d.apply.boot_epoch,
+                            d.apply.controller_epoch,
+                            d.apply.plan_seq,
+                            d.apply.action_index as u64,
+                            d.apply.target.id,
+                            d.apply.target.generation,
+                            d.stamp.version,
+                            d.stamp.snapshot_ns,
+                            d.stamp.installed_until_ns,
+                        ]);
+                        let (state, error) = match d.state {
+                            ExecutionState::Pending => (0, 0),
+                            ExecutionState::Applied => (1, 0),
+                            ExecutionState::Failed(error) => (2, error as u64 + 1),
+                            ExecutionState::Unknown => (3, 0),
+                        };
+                        gate.0[24..35].copy_from_slice(&[
+                            state,
+                            error,
+                            u64::from(d.execution_observed),
+                            u64::from(d.started),
+                            u64::from(d.action.one_shot()),
+                            d.action.domain() as u64,
+                            d.action.kind() as u64,
+                            d.job,
+                            d.first_entry_ns.unwrap_or(0),
+                            d.observed_ns,
+                            d.published,
+                        ]);
                         r.cursor = 0;
+                        gate.publish();
                         return status(s, r);
                     }
                 }
                 r.cursor = end;
-                if end == s.owner.desired.len() && fixture::ready(r) {
-                    r.phase = Phase::Scanning;
-                    r.cursor = 0;
-                    let mut h = Sha256::new();
-                    h.update(b"CYXIA_NATIVE_FROZEN_CONFIGURATION_1.3\0");
-                    h.update(s.registry.model().model_hash);
-                    // Dynamic object identity and selected parameters are read
-                    // from actual owners below. Trial IDs are not reset proof.
-                    r.hashing = Some(h);
+                gate.0[12] = end as u64;
+                gate.0[8] = 4;
+                if end == s.owner.desired.len() {
+                    let ready = fixture::ready(r);
+                    gate.0[41] = 1;
+                    gate.0[42] = u64::from(ready);
+                    gate.0[8] = if ready { 6 } else { 5 };
+                    if ready {
+                        r.phase = Phase::Scanning;
+                        r.cursor = 0;
+                        gate.0[12] = 0;
+                        let mut h = Sha256::new();
+                        h.update(b"CYXIA_NATIVE_FROZEN_CONFIGURATION_1.3\0");
+                        h.update(s.registry.model().model_hash);
+                        // Dynamic object identity and selected parameters are read
+                        // from actual owners below. Trial IDs are not reset proof.
+                        r.hashing = Some(h);
+                    }
                 }
+                gate.publish();
             }
             Phase::Scanning => {
                 for _ in 0..4 {

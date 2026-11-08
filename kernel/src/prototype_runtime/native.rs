@@ -999,6 +999,9 @@ pub(super) struct CoordinatorState {
     control_ratio: u64,
     business_ratio: u64,
 }
+pub(super) fn active_core_apply(state: &CoordinatorState) -> Option<ApplyId> {
+    state.core.map(|action| action.apply)
+}
 pub(super) fn publish_stop_measure(operation: u64, state: &CoordinatorState) {
     STOP_MEASURE[0].store(0, Ordering::Release);
     if let Some(action) = state.core {
@@ -1175,7 +1178,16 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
 }
 fn core_turn(c: &mut Coordinator, tick: u64, now: u64) {
     if c.native.core.is_none() && REQUEST.load(Ordering::Acquire) == 0 && c.handoff.is_none() {
-        if let Some((apply, stamp, target)) = crate::domain_services::core_request() {
+        if let Some((apply, stamp, target, context)) = crate::domain_services::core_request_trace()
+        {
+            crate::ownership_evidence::accepted(
+                apply,
+                stamp,
+                target,
+                context,
+                &c.owner,
+                ns(timer::ticks()),
+            );
             c.native.core = Some(CoreAction {
                 apply,
                 stamp,
@@ -1215,6 +1227,12 @@ fn core_action_turn(c: &mut Coordinator, tick: u64, now: u64, mut action: CoreAc
             }
             c.propose(action.target, tick);
             if c.handoff.is_some() {
+                crate::ownership_evidence::draining(
+                    action.apply,
+                    c.handoff_sequence,
+                    &c.owner,
+                    ns(timer::ticks()),
+                );
                 action.started = true;
             } else {
                 // Re-open task admission only if the physical gate never closed.
@@ -1251,6 +1269,17 @@ fn core_action_turn(c: &mut Coordinator, tick: u64, now: u64, mut action: CoreAc
         if publish(c, now).is_ok()
             && crate::domain_services::core_complete(action.apply, result, now).is_ok()
         {
+            if result.is_ok() {
+                crate::ownership_evidence::completed(action.apply, &c.owner, ns(timer::ticks()));
+            } else {
+                crate::ownership_evidence::failed(
+                    action.apply,
+                    &c.owner,
+                    ns(timer::ticks()),
+                    c.handoff_sequence,
+                    STOP_ACK.load(Ordering::Acquire),
+                );
+            }
             c.native.core = None;
         }
     }

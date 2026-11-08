@@ -26,6 +26,9 @@ mod prototype_model;
 #[cfg(feature = "prototype-runtime")]
 #[path = "prototype_runtime.rs"]
 pub(crate) mod prototype_runtime;
+#[cfg(feature = "register-v15-selftest")]
+#[path = "register_evidence.rs"]
+mod register_evidence;
 const C: usize = cyxia_contracts::BOOT_CPUS;
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
@@ -620,7 +623,11 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             timer::enable_irqs();
         }
     }
+    #[cfg(feature = "unified-runtime")]
+    crate::boot_recovery::formal::el1();
     ONLINE.fetch_or(1 << slot, Ordering::Release);
+    #[cfg(feature = "register-v15-selftest")]
+    register_evidence::worker(slot);
     let mut contexts = [context(slot * 2), context(slot * 2 + 1)];
     let mut tested = [false; 2];
     #[cfg(feature = "prototype-runtime")]
@@ -861,6 +868,8 @@ pub(crate) fn boot_progress() -> [u64; 5] {
     ]
 }
 pub fn run(info: &BootInfo) -> ! {
+    #[cfg(feature = "unified-runtime")]
+    crate::boot_recovery::formal::el1();
     if info.cpu_count != REQUIRED {
         report(
             "SMP_REJECT_CPU_COUNT",
@@ -889,6 +898,8 @@ pub fn run(info: &BootInfo) -> ! {
         #[cfg(feature = "unified-runtime")]
         enable_service_timer();
         init_memory();
+        #[cfg(feature = "register-v15-selftest")]
+        register_evidence::init();
         #[cfg(feature = "ai-control-selftest")]
         controller::init();
         #[cfg(feature = "model-v13-selftest")]
@@ -925,6 +936,8 @@ pub fn run(info: &BootInfo) -> ! {
         ONLINE.load(Ordering::Acquire),
         0,
     );
+    #[cfg(feature = "register-v15-selftest")]
+    register_evidence::finish();
     for (slot, gate) in GATES.iter().enumerate().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,
@@ -1245,6 +1258,8 @@ unsafe fn enter_service_inner(
         } else {
             user::enter(context, root);
         }
+        #[cfg(target_os = "none")]
+        crate::boot_recovery::formal::el0_return(context, root, task.role);
         if immutable_root {
             builtin_detail(slot, 6);
         }

@@ -2,6 +2,8 @@
 from __future__ import annotations
 import hashlib
 import struct
+from pathlib import Path
+from v13_a10_budget import scenario_budget
 from verify_smp import require
 
 HEADER = 512
@@ -11,6 +13,7 @@ MAX_EVENTS = 384
 PRESSURE_CHUNK_BYTES = 64 * 1024
 PRESSURE_FILE_BYTES = 8 * 1024 * 1024
 PRESSURE_CHUNKS = PRESSURE_FILE_BYTES // PRESSURE_CHUNK_BYTES
+WRITE_RETRY_WAIT_NS = 2_000_000_000
 TRACE_MAGIC = 0x4359584131305452
 EVENT_MAGIC = 0x4359584131304556
 EMPTY_HASH = hashlib.sha256(b'').digest()
@@ -149,7 +152,8 @@ def decode(raw: bytes, binding: dict) -> dict:
             object=(object_id,object_generation),offset=offset,count=count_bytes,
             write_seq=write_seq,durable_seq=durable_seq,commit_lsn=lsn,
             reads=reads,writes=writes,flushes=flushes,cache_misses=misses,
-            data_length=transferred,data_sha256=row[96:128].hex()))
+            data_length=transferred,requested_data_length=data_length,data_address=address,
+            data_sha256=row[96:128].hex()))
     return dict(version=1,writer=writer,reader=reader,boot_epoch=epoch,mode=mode,
                 records=records,A10_complete=False)
 
@@ -251,7 +255,13 @@ def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
     writes = {path: [] for path in ('/a10/pressure-a', '/a10/pressure-b')}
     fsyncs = {}
     original_reads = []
-    records = capture['records']
+    raw_records = capture['records']
+    records = []
+    retry_count = 0
+    pending_retry = None
+    retry_limit = scenario_budget(Path(__file__).resolve().parents[1], 4)['max_poll_requests']
+    require(274 + retry_limit <= MAX_EVENTS and len(raw_records) <= MAX_EVENTS,
+            'cache eviction retry/capture bound changed')
     expected = [(10, '/a10/value', 1), (2, '/a10/value', 1),
                 (3, '', 0), (6, '', 0), (10, '/a10/value', 1)]
     for path in writes:
@@ -260,16 +270,44 @@ def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
         expected += [(5, '', 0), (6, '', 0)]
     expected += [(10, '/a10/value', 1), (2, '/a10/value', 1),
                  (3, '', 0), (6, '', 0), (10, '/a10/value', 1)]
-    require(len(records) == len(expected) == 274
-            and all((row['operation'], row['path'], row['open_mode']) == wanted
-                    for row, wanted in zip(records, expected)),
-            'cache eviction operation sequence changed')
-    for index, row in enumerate(records):
-        require(row['owner'] == owner, 'cache eviction includes another task owner')
+    require(len(expected) == 274, 'cache eviction success contract changed')
+    for original_index, row in enumerate(raw_records):
+        index = len(records)
+        require(row['owner'] == owner and row['sequence'] == original_index + 1,
+                'cache eviction owner or original record order changed')
+        require(index < len(expected), 'cache eviction contains extra operations')
         operation = row['operation']
-        if row['result'] != 0:
-            raise ValueError('cache eviction contains a failed file operation')
         key = row['owner'], row['handle']
+        wanted = expected[index]
+        shape = operation, row['path'], row['open_mode']
+        if row['result'] != 0:
+            require(row['result'] == -11 and shape == wanted == (4, '', 0)
+                    and key in handles and handles[key][0] in writes,
+                    'cache eviction has an unsupported failed operation')
+            path = handles[key][0]
+            require(retry_count < retry_limit and len(writes[path]) < PRESSURE_CHUNKS
+                    and row['offset'] == len(writes[path]) * PRESSURE_CHUNK_BYTES
+                    and row['requested_data_length'] == PRESSURE_CHUNK_BYTES
+                    and row['data_address'] > 0 and row['data_length'] == row['count'] == 0
+                    and row['object'] == (0, 0) and row['write_seq'] == row['durable_seq'] == 0
+                    and row['data_sha256'] == EMPTY_HASH.hex(),
+                    'cache eviction has an invalid completed WRITE retry')
+            signature = key, row['offset'], row['requested_data_length'], row['data_address']
+            if pending_retry is not None:
+                require(signature == pending_retry[0]
+                        and row['at_ns'] - pending_retry[1] >= WRITE_RETRY_WAIT_NS,
+                        'cache eviction retry changed its chunk or cadence')
+            pending_retry = signature, row['at_ns']
+            retry_count += 1
+            continue
+        require(shape == wanted, 'cache eviction operation sequence changed')
+        if pending_retry is not None:
+            signature = key, row['offset'], row['requested_data_length'], row['data_address']
+            require(operation == 4 and signature == pending_retry[0]
+                    and row['at_ns'] - pending_retry[1] >= WRITE_RETRY_WAIT_NS,
+                    'cache eviction completed retry changed its chunk or cadence')
+            pending_retry = None
+        records.append(row)
         if operation == 1:
             require(row['path'] in writes and row['path'] not in created,
                     'cache eviction created an unexpected or duplicate object')
@@ -318,7 +356,8 @@ def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
                     'cache eviction STAT changed the original object')
         else:
             raise ValueError('cache eviction contains an unexpected operation')
-    require(not handles and set(created) == set(writes) == set(fsyncs)
+    require(pending_retry is None and len(records) == 274
+            and not handles and set(created) == set(writes) == set(fsyncs)
             and all(len(rows) == PRESSURE_CHUNKS for rows in writes.values())
             and len(original_reads) == 2,
             'incomplete cache-pressure operation sequence')
@@ -341,7 +380,7 @@ def verify_cache_eviction(capture: dict, terminal: dict, oracle: dict) -> dict:
                 eviction_read_event=final_read['sequence'],
                 cache_miss_delta=final_read['cache_misses'] - records[final_index - 1]['cache_misses'],
                 backing_read_delta=final_read['reads'] - records[final_index - 1]['reads'],
-                cache_eviction_verified=True, A10_complete=False,
+                cache_eviction_verified=True, completed_write_retries=retry_count, A10_complete=False,
                 scope='same-boot ordinary EL0 cache eviction; crash/replay matrix remains incomplete')
 
 

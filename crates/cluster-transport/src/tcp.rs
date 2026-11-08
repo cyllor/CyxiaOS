@@ -2,7 +2,9 @@
 //! Its plaintext bytes must be consumed only by the TLS engine.
 use crate::device::{Ethernet, Port};
 use cyxia_driver_virtio::DiagnosticStage as Stage;
+mod discovery;
 mod observe;
+pub use discovery::{DiscoveryBuffers, DiscoveryConfig, DiscoverySnapshot};
 pub use observe::Observation;
 use observe::ObservedPort;
 use smoltcp::{
@@ -69,6 +71,7 @@ pub struct Tcp<'a, P> {
     config: Config,
     last_ms: u64,
     failed: bool,
+    discovery: Option<discovery::Socket>,
 }
 
 impl<'a, P: Port> Tcp<'a, P> {
@@ -80,6 +83,18 @@ impl<'a, P: Port> Tcp<'a, P> {
         tx: &'a mut [u8; BUFFER_SIZE],
         storage: &'a mut [SocketStorage<'a>; 1],
     ) -> Result<Self, Error> {
+        Self::new_inner(port, config, now_ms, rx, tx, storage, false)
+    }
+
+    fn new_inner(
+        port: P,
+        config: Config,
+        now_ms: u64,
+        rx: &'a mut [u8; BUFFER_SIZE],
+        tx: &'a mut [u8; BUFFER_SIZE],
+        storage: &'a mut [SocketStorage<'a>],
+        discovering: bool,
+    ) -> Result<Self, Error> {
         let mac = EthernetAddress(config.mac);
         let local = Ipv4Address::from(config.local);
         let peer = Ipv4Address::from(config.peer);
@@ -87,22 +102,25 @@ impl<'a, P: Port> Tcp<'a, P> {
         if !mac.is_unicast()
             || config.mac == [0; 6]
             || !unicast(config.local)
-            || !unicast(config.peer)
-            || local == peer
+            || (!discovering && (!unicast(config.peer) || local == peer))
+            || (discovering && (config.peer != [0; 4] || config.peer_port != 0))
             || !(1..=30).contains(&config.prefix_len)
             || config.local_port == 0
-            || config.peer_port == 0
+            || (!discovering && config.peer_port == 0)
             || config.random_seed == 0
             || now_ms > i64::MAX as u64
         {
             return Err(Error::Configuration);
         }
         let cidr = IpCidr::new(IpAddress::Ipv4(local), config.prefix_len);
-        if !cidr.contains_addr(&IpAddress::Ipv4(peer)) {
+        if !discovering && !cidr.contains_addr(&IpAddress::Ipv4(peer)) {
             return Err(Error::Configuration);
         }
         let host_mask = u32::MAX >> config.prefix_len;
-        for address in [config.local, config.peer] {
+        for address in [Some(config.local), (!discovering).then_some(config.peer)]
+            .into_iter()
+            .flatten()
+        {
             let host = u32::from_be_bytes(address) & host_mask;
             if host == 0 || host == host_mask {
                 return Err(Error::Configuration);
@@ -136,11 +154,22 @@ impl<'a, P: Port> Tcp<'a, P> {
             config,
             last_ms: now_ms,
             failed: false,
+            discovery: None,
         })
     }
 
     pub fn listen(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        if let Some(discovery) = self.discovery.as_mut() {
+            if discovery.initiator {
+                return Err(Error::Configuration);
+            }
+            discovery.armed = true;
+            return Ok(());
+        }
+        self.listen_raw()
+    }
+    fn listen_raw(&mut self) -> Result<(), Error> {
         self.sockets
             .get_mut::<Socket>(self.socket)
             .listen((Ipv4Address::from(self.config.local), self.config.local_port))
@@ -149,6 +178,16 @@ impl<'a, P: Port> Tcp<'a, P> {
 
     pub fn connect(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        if let Some(discovery) = self.discovery.as_mut() {
+            if !discovery.initiator {
+                return Err(Error::Configuration);
+            }
+            discovery.armed = true;
+            return Ok(());
+        }
+        self.connect_raw()
+    }
+    fn connect_raw(&mut self) -> Result<(), Error> {
         self.sockets
             .get_mut::<Socket>(self.socket)
             .connect(
@@ -171,6 +210,15 @@ impl<'a, P: Port> Tcp<'a, P> {
     /// device work. A scheduler turn with no CPU credit is not a disconnect.
     pub fn state(&self) -> Result<State, Error> {
         self.healthy()?;
+        // Waiting for an unauthenticated hint is a live listener lifecycle,
+        // never an established transport or a failed TCP generation.
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|d| d.armed && d.attempt.is_none())
+        {
+            return Ok(State::Listen);
+        }
         Ok(self.sockets.get::<Socket>(self.socket).state())
     }
 
@@ -253,6 +301,10 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
         checkpoint();
 
+        if self.discovery.is_some() {
+            self.discovery_turn(now_ms)?;
+            checkpoint();
+        }
         // A hardware multichain port can accept multiple independent frames.
         // Keep the logical burst, but expose a safe scheduler checkpoint after
         // every complete descriptor-chain attempt. This prevents a batch from

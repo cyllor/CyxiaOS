@@ -53,6 +53,18 @@ struct Node {
     strict_reserves: usize,
     strict_grants: usize,
     strict_releases: usize,
+    tcp_input: std::collections::VecDeque<u8>,
+    tcp_fragment: usize,
+    tcp_writes: usize,
+    tcp_again_every: usize,
+    io_delay_ms: u64,
+    io_delay_ops: Vec<u64>,
+    io_delay_task: Option<u64>,
+    io_calls: Vec<(u64, u64)>,
+    diagnostic_generation: Option<u64>,
+    reject_store_next: bool,
+    local_queued_initial: bool,
+    local_queued_queries: usize,
 }
 #[derive(Default)]
 struct Context {
@@ -73,6 +85,7 @@ mod broker {
             c.nodes[c.node].domains
         })
     }
+    pub fn domain_feedback(_: DomainFeedback) {}
     pub fn request(
         op: u64,
         input: &[u8],
@@ -83,8 +96,34 @@ mod broker {
         CTX.with(|cx| {
             let mut cx = cx.borrow_mut();
             let i = cx.node;
+            let n = &cx.nodes[i];
+            let delay = if (n.io_delay_ops.is_empty() || n.io_delay_ops.contains(&op))
+                && n.io_delay_task.is_none_or(|phase| op == OP_TASK && args[0] == phase)
+                { n.io_delay_ms } else { 0 };
+            cx.now += delay;
+            cx.nodes[i].io_calls.push((op, args[0]));
+            if op == OP_READ {
+                let n = &mut cx.nodes[i];
+                if n.tcp_input.is_empty() { return Err(AGAIN); }
+                let limit = if n.tcp_fragment == 0 { out.len() } else { n.tcp_fragment.min(out.len()) };
+                let count = limit.min(n.tcp_input.len());
+                for byte in &mut out[..count] { *byte = n.tcp_input.pop_front().unwrap(); }
+                return Ok((count, 0));
+            }
+            if op == OP_WRITE {
+                let n = &mut cx.nodes[i];
+                n.tcp_writes += 1;
+                if n.tcp_again_every != 0 && n.tcp_writes % n.tcp_again_every == 0 { return Err(AGAIN); }
+                let count = if n.tcp_fragment == 0 { input.len() } else { input.len().min(n.tcp_fragment) };
+                cx.nodes[1 - i].tcp_input.extend(&input[..count]);
+                return Ok((count, 0));
+            }
             let now = cx.now;
             let n = &mut cx.nodes[i];
+            if op == OP_STORE_PUT && n.reject_store_next {
+                n.reject_store_next = false;
+                return Err(REJECTED);
+            }
             match op {
                 OP_TRACE if args[0] == 0x24f && input.len() == 192 => {
                     n.exit_records.push(input.chunks_exact(8)
@@ -162,7 +201,8 @@ mod broker {
                             n.local_requests.push((key, hash));
                             n.local_submits += 1;
                         }
-                        for (i, value) in [1u64, 51, 1].into_iter().enumerate() {
+                        let reply = if n.local_queued_initial { [0u64; 3] } else { [1u64, 51, 1] };
+                        for (i, value) in reply.into_iter().enumerate() {
                             out[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
                         }
                         Ok((24, 0))
@@ -173,7 +213,10 @@ mod broker {
                         if !n.local_requests.contains(&(key, hash)) {
                             return Err(NOT_FOUND);
                         }
-                        for (i, value) in [1u64, 51, 1].into_iter().enumerate() {
+                        let reply = if n.local_queued_queries != 0 {
+                            n.local_queued_queries -= 1; [0u64; 3]
+                        } else { [1u64, 51, 1] };
+                        for (i, value) in reply.into_iter().enumerate() {
                             out[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
                         }
                         Ok((24, 0))
@@ -438,7 +481,9 @@ mod broker {
     pub fn poll() -> Result<(bool, u64), u64> {
         Ok((true, CTX.with(|c| { let c = c.borrow(); c.nodes[c.node].transport_epoch.max(1) })))
     }
-    pub fn service_generation() -> u64 { 7 }
+    pub fn service_generation() -> u64 {
+        CTX.with(|c| { let c = c.borrow(); c.nodes[c.node].diagnostic_generation.unwrap_or(7) })
+    }
     pub fn time() -> Option<(u64, u64)> {
         Some(CTX.with(|c| {
             let c = c.borrow();
@@ -462,6 +507,8 @@ mod broker {
         })
     }
 }
+#[path = "support/runtime_session_host.rs"]
+mod runtime_session_host;
 fn identity(seed: u8) -> (IdentitySigner, [u8; 32], [u8; 32]) {
     let seed = [seed; 32];
     let kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
@@ -965,6 +1012,38 @@ fn local_pre_admission_busy_retries_one_durable_intent_but_recovery_never_readmi
             assert_eq!((c.nodes[1].local_attempts, c.nodes[1].local_submits), (3, 0));
             assert_eq!(c.nodes[1].application_status[0].state, wire::UNKNOWN);
         });
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn queued_local_broker_reply_is_queried_until_created_without_another_admission() {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        use cyxia_prototype_cluster::application as wire;
+        CTX.with(|c| *c.borrow_mut() = Context::default());
+        let (mut a, mut b) = native_setup(1);
+        for node in 0..2 { enqueue_application(node, 1, 1_000_000_000); }
+        for (node, d) in [(0, &mut a), (1, &mut b)] {
+            select(node, 1000); d.domain_tick(1_000_000_000).unwrap();
+        }
+        CTX.with(|c| { for n in &mut c.borrow_mut().nodes {
+            n.local_queued_initial = true; n.local_queued_queries = 2;
+        }});
+        for at in 5000..5008 {
+            for (node, d) in [(0, &mut a), (1, &mut b)] {
+                select(node, at); d.domain_tick(at * 1_000_000).unwrap();
+            }
+            if at == 5000 {
+                CTX.with(|c| { for n in &c.borrow().nodes {
+                    assert_eq!(n.application_status[0].state, wire::UNKNOWN);
+                }});
+            }
+        }
+        CTX.with(|c| { for n in &c.borrow().nodes {
+            assert_eq!((n.local_attempts, n.local_submits), (1, 1));
+            assert_eq!(n.local_queued_queries, 0);
+            assert_eq!(n.application_status[0].state, wire::LOCAL);
+            assert!(n.io_calls.iter().filter(|call| **call == (10, 12)).count() >= 3);
+        }});
     }).unwrap().join().unwrap();
 }
 

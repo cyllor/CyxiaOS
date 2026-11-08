@@ -68,9 +68,11 @@ class CandidatePublicationProgress(unittest.TestCase):
         program=(ROOT/'tests/host/baseline_progress_harness.rs').read_text().replace('// PRODUCTION_BODIES',modules+'\n'+'\n'.join(pieces))
         replay='struct Guard;\n'+'\n'.join(function(owner,sig) for sig in ['impl Drop for Guard','fn lock()','fn with<T>','pub fn service_step()','fn publish_drain_hint(','pub(super) fn drain_pending('])
         replay+='\n'+re.search(r'^static DRAIN_PENDING:.*;$',owner,re.M)[0]
+        replay+='\n'+function(owner,'pub(super) fn service_pending(')
+        replay+='\n'+re.search(r'^static SERVICE_PENDING:.*;$',owner,re.M)[0]
         program=program.replace('// REPLAY_BODIES',replay)
         facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
-        program=program.replace('// REPLAY_HINT_READER',function(facade,'pub fn baseline_activation_pending(')+'\npub fn owned_drain_pending()->bool{false}')
+        program=program.replace('// REPLAY_HINT_READER',function(facade,'pub fn baseline_activation_pending(')+'\npub fn owned_drain_pending()->bool{false}\n'+function(facade,'pub fn admission_progress_pending('))
         reader=function(program,'mod domain_control {')
         program=program.replace(reader,'''mod domain_control {pub mod replay {pub fn baseline_activation_pending()->bool{
             if super::super::CANDIDATE_MODE.load(super::super::Ordering::Acquire){super::super::candidate::pending()}

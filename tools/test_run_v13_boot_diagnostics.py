@@ -8,6 +8,8 @@ from run_v13_boot_evidence import preserve_and_verify
 from run_v13_boot_recovery import capture_failure, stopped_boot_state
 from test_verify_v13_boot_recovery import fixture, packed
 
+FULL_CONTROL_BYTES = 331_776
+
 
 class BootFailureDiagnostics(unittest.TestCase):
     def setUp(self):
@@ -16,6 +18,7 @@ class BootFailureDiagnostics(unittest.TestCase):
         self.sample[14:25] = [0] * 11
         self.symbols = {key: {'pa': 0x40200000 + index * 0x4000}
                         for index, key in enumerate(('boot', 'control', 'runtime', 'unified'))}
+        self.symbols['control']['size'] = FULL_CONTROL_BYTES
 
     def test_mount_failure_is_distinct_from_selftest_and_no_epoch_is_invented(self):
         result = stopped_boot_state(packed(self.sample), packed(self.config))
@@ -54,8 +57,12 @@ class BootFailureDiagnostics(unittest.TestCase):
         def save(name, address, size):
             self.assertEqual(events[:2], ['stop', 'query-status'])
             key = name.removeprefix('failure-').removesuffix('.bin')
-            self.assertEqual(address, self.symbols[key]['pa'])
-            self.assertIn(size, (512, 4096, 8192))
+            symbol_key = 'control' if key == 'control-full' else key
+            self.assertEqual(address, self.symbols[symbol_key]['pa'])
+            if key == 'control-full':
+                self.assertEqual(size, FULL_CONTROL_BYTES)
+            else:
+                self.assertIn(size, (512, 4096, 8192))
             events.append(name)
             if key == fail_key:
                 raise OSError('simulated capture failure')
@@ -75,7 +82,9 @@ class BootFailureDiagnostics(unittest.TestCase):
         result, events, saved, raw, text, _ = self.capture()
         self.assertEqual(result['failure_capture']['reason_name'], 'mount')
         self.assertNotIn('failure_capture_errors', result)
-        self.assertEqual(len(saved), 4)
+        self.assertEqual(len(saved), 5)
+        self.assertEqual(result['failure_control_full_bytes'], FULL_CONTROL_BYTES)
+        self.assertEqual(len(saved['failure-control-full.bin']), FULL_CONTROL_BYTES)
         self.assertEqual(raw, b'raw-serial')
         self.assertEqual(text, b'decoded-serial\n')
         self.assertEqual(events[-1], 'ringbuf-read')
@@ -85,14 +94,31 @@ class BootFailureDiagnostics(unittest.TestCase):
         result, _, saved, raw, _, _ = self.capture(odd=True)
         self.assertNotIn('failure_capture', result)
         self.assertIn('boot', result['failure_capture_errors'])
-        self.assertEqual(len(saved), 4)
+        self.assertEqual(len(saved), 5)
+        self.assertIn('failure-control-full.bin', saved)
         self.assertEqual(raw, b'raw-serial')
 
     def test_one_capture_error_does_not_discard_independent_captures(self):
         result, _, saved, raw, _, _ = self.capture(fail_key='control')
         self.assertEqual(set(result['failure_capture_errors']), {'control'})
+        self.assertIn('failure-control-full.bin', saved)
         self.assertIn('failure-runtime.bin', saved)
         self.assertIn('failure-unified.bin', saved)
+        self.assertEqual(raw, b'raw-serial')
+
+    def test_full_control_error_does_not_discard_headers_or_serial(self):
+        result, _, saved, raw, _, _ = self.capture(fail_key='control-full')
+        self.assertEqual(set(result['failure_capture_errors']), {'control-full'})
+        self.assertEqual(set(saved), {'failure-boot.bin', 'failure-control.bin',
+                                     'failure-runtime.bin', 'failure-unified.bin'})
+        self.assertEqual(raw, b'raw-serial')
+
+    def test_missing_full_control_metadata_preserves_independent_captures(self):
+        del self.symbols['control']['size']
+        result, _, saved, raw, _, _ = self.capture()
+        self.assertEqual(set(result['failure_capture_errors']), {'control-full'})
+        self.assertEqual(set(saved), {'failure-boot.bin', 'failure-control.bin',
+                                     'failure-runtime.bin', 'failure-unified.bin'})
         self.assertEqual(raw, b'raw-serial')
 
     def test_no_memory_capture_without_stopped_confirmation(self):
@@ -104,7 +130,8 @@ class BootFailureDiagnostics(unittest.TestCase):
 
     def test_serial_limit_is_not_relaxed_during_failure_cleanup(self):
         result, _, saved, raw, text, decoder = self.capture(overflow=True)
-        self.assertEqual(len(saved), 4)
+        self.assertEqual(len(saved), 5)
+        self.assertIn('failure-control-full.bin', saved)
         self.assertEqual(len(raw), 8 * 1024 * 1024)
         self.assertEqual(text, b'')
         self.assertIn('serial', result['failure_capture_errors'])

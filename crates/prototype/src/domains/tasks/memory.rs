@@ -734,6 +734,9 @@ impl<const P: usize, const R: usize> Memory<P, R> {
     pub fn owner_pages(&self, key: ObjectKey) -> Result<usize, Error> {
         Ok(self.owners[self.owner(key)?].ok_or(Error::Stale)?.used)
     }
+    pub fn owner_quota(&self, key: ObjectKey) -> Result<usize, Error> {
+        Ok(self.owners[self.owner(key)?].ok_or(Error::Stale)?.quota)
+    }
     pub fn cache_policy(&self, now: u64) -> (u32, u16) {
         if self.stamp.live(now) {
             (self.cache_budget as u32, self.reclaim_batch as u16)

@@ -2004,6 +2004,23 @@ fn encode_job_inner(
             *set
         }
     };
+    #[cfg(target_os = "none")]
+    if !read_only {
+        crate::boot_recovery::formal::new_key(crate::boot_recovery::formal::Key {
+            boot: s.boot,
+            controller: controller_epoch,
+            sequence,
+            target,
+            model: set.model,
+            domain: current.domain(),
+            kind: current.kind(),
+            candidate_hash: set.hash(),
+            root_version: s.registry.version(),
+            core_generation: snapshot.core_generation,
+            ledger_generation: snapshot.ledger_generation,
+            control_mask: s.owner.context.control_mask,
+        });
+    }
     preparation_detail(11);
     preparation_phase(2);
     input.fill(0);
@@ -2708,6 +2725,18 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                 });
             }
             self.owner.prepared_count = 0;
+            // Observe the successful root/Desired boundary, after every
+            // fallible commit and actual desired write. Fixed baselines have
+            // no model scores and cannot substitute for AI publication.
+            #[cfg(target_os = "none")]
+            if self.score_count != 0 {
+                crate::boot_recovery::formal::published(
+                    self.boot,
+                    plan,
+                    version,
+                    self.owner.context.control_mask,
+                );
+            }
             Ok(())
         })();
         self.provenance.returned(result);
@@ -3138,6 +3167,8 @@ fn finish_job(s: &mut State, job: Job, output: Option<&[u64; 512]>) -> Result<u6
             completion.selected,
             if completion.aborted { None } else { output },
         );
+        #[cfg(target_os = "none")]
+        crate::domain_evidence::output_digest(evidence, job.sequence, completion.output_hash);
         if completion.aborted {
             crate::domain_evidence::aborted();
         }
@@ -3360,6 +3391,10 @@ pub fn poll(_at: u64) -> Result<(), Error> {
                     d.state,
                     observed,
                 );
+                #[cfg(target_os = "none")]
+                if matches!(d.action, Action::ControlSet(_)) && d.state == ExecutionState::Applied {
+                    let _ = crate::ownership_evidence::model_witness(d.apply, evidence, d.job);
+                }
             }
             let stability_result =
                 s.owner.stability[i]

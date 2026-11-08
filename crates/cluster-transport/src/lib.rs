@@ -4,6 +4,7 @@
 //! TCP connectivity is never a cluster admission proof.
 
 pub mod device;
+pub mod discovery;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;

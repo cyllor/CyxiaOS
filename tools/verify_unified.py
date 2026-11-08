@@ -6,7 +6,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from doctor import ROOT
 from check_elf import boot_profile,inspect_elf,symbol
-from check_v13_disk import inspect as inspect_disk
+from check_v13_boot_disk import inspect as inspect_disk
 from run_qemu import Qmp
 from transport import FrameDecoder
 from verify_smp import manifest,require,sha
@@ -51,11 +51,23 @@ CAPTURE_SYMBOLS = (
     ('DOMAIN_PREPARATION_SKIP_EVIDENCE', 2048),
 )
 
+# Optional diagnostics are retained as raw bytes, never an acceptance oracle.
+# Unpublished or interrupted pages remain useful for independent inspection.
+OPTIONAL_CAPTURE_SYMBOLS = {'APPLICATION_REQUEST_EVIDENCE': 6208,
+                            'LOCAL_REQUEST_EVIDENCE': 2112,
+                            'SESSION_ACTIVITY_EVIDENCE': 832,
+                            'DISCOVERY_EVIDENCE': 512,
+                            'REPLAY_QUIESCING_EVIDENCE': 512}
+
 FINAL_DIAGNOSTIC_FIELDS = (
     'service_stage_word', 'task_evidence', 'tasks', 'overrun_evidence',
     'network_piece_evidence', 'network_settlement_evidence',
     'file_service_evidence', 'task_vector_evidence',
     'runtime_loop', 'runtime_loop_evidence',
+    'application_requests', 'application_request_evidence',
+    'local_requests', 'local_request_evidence',
+    'session_activity', 'session_activity_evidence', 'progress_diagnostic_status',
+    'discovery', 'discovery_evidence', 'replay_quiescing', 'replay_quiescing_evidence',
     'publication_cost', 'publication_cost_evidence',
     'control', 'replay', 'replay_evidence',
     'preparation_context', 'preparation_detail',
@@ -369,6 +381,13 @@ def profile(data):
         location=symbol(data,name)
         require(location['size']==size,f'{name} size differs')
         locations[name]=location
+    for name,size in OPTIONAL_CAPTURE_SYMBOLS.items():
+        try:
+            location=symbol(data,name)
+        except ValueError:
+            continue
+        if location['size']==size:
+            locations[name]=location
     return locations
 
 def decode_final_diagnostics(bundle):
@@ -518,8 +537,17 @@ def capture(guests,locations,label='',resume=False):
             bundle={}
             for name,location in source.items():
                 path=guest['folder']/(label+name+'.bin')
-                guest['qmp'].execute('pmemsave',{'val':location['pa'],'size':location['size'],'filename':str(path)})
-                bundle[name]=path.read_bytes()
+                try:
+                    guest['qmp'].execute('pmemsave',{'val':location['pa'],'size':location['size'],'filename':str(path)})
+                    bundle[name]=path.read_bytes()
+                except Exception as error:
+                    if name not in OPTIONAL_CAPTURE_SYMBOLS:
+                        raise
+                    errors=guest.setdefault('optional_capture_errors',[])
+                    errors.append({'symbol':name,'label':label,
+                                   'error':type(error).__name__+': '+str(error)})
+                    (guest['folder']/'optional-capture-errors.json').write_text(
+                        json.dumps(errors,indent=2)+'\n')
             bundles.append(bundle)
     finally:
         if resume:

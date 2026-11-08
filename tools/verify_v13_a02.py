@@ -153,10 +153,10 @@ def verify_native_qemu(tools: dict, binary: Path, *, qemu_source: Path | None = 
             'patched QEMU attestation changed')
 
 
-def verify_capture_revision(runner_sha256: str, verifier_sha256: str):
-    project = Path(__file__).resolve().parents[1]
-    current = tuple(sha256(project / 'tools' / name)
-                    for name in ('run_v13_a02.py', 'verify_v13_a02.py'))
+def verify_capture_revision(runner_sha256: str, verifier_sha256: str, *, source_root=None):
+    local = Path(__file__).resolve().parent
+    names = ('run_v13_a02.py', 'verify_v13_a02.py')
+    current = tuple(sha256(local / name) for name in names)
     # Exact archived tools of the real 2026-10-26 v4 run, independently replayed
     # before enrolment. Preserve replay after verifier maintenance without ever
     # importing/executing archive code or trusting a manifest-selected checker.
@@ -164,6 +164,37 @@ def verify_capture_revision(runner_sha256: str, verifier_sha256: str):
                    'b59af78493b056a8ece7911584d7dc91cb55af3e17309aea81c3bb4b000631ef')
     require((runner_sha256, verifier_sha256) in (current, reviewed_v4),
             'unreviewed runner/verifier revision')
+    if (runner_sha256, verifier_sha256) == reviewed_v4:
+        return 'reviewed-v4'
+    if source_root is not None:
+        require(tuple(sha256(safe_path(Path(source_root), 'tools/' + name))
+                      for name in names) == current,
+                'explicit source has a different current runner/verifier revision')
+    return 'current'
+
+
+def disk_decoder(directory: Path, source_root: Path, artifacts: dict, revision: str):
+    """Select only reviewed local decoding code; archived files are hash data."""
+    if revision == 'reviewed-v4':
+        # The reviewed historical v4 capture keeps its original reserved-only
+        # contract; it cannot borrow current ordinary-volume decoding rules.
+        from check_v13_disk import inspect
+        return inspect
+    require(revision == 'current', 'unreviewed disk decoder revision')
+    import check_v13_boot_disk as boot_disk
+    import check_v13_filesystem as filesystem
+    import check_v13_disk as reserved_disk
+    modules = {'check_v13_boot_disk.py': boot_disk,
+               'check_v13_filesystem.py': filesystem, 'check_v13_disk.py': reserved_disk}
+    local = Path(__file__).resolve().parent
+    for name in boot_disk.TOOL_FILES:
+        expected = sha256(local / name)
+        require(sha256(Path(modules[name].__file__).resolve()) == expected
+                and sha256(safe_path(source_root, 'tools/' + name)) == expected
+                and artifacts.get(name) == expected
+                and sha256(safe_path(directory, name)) == expected,
+                'unreviewed boot disk decoder revision: ' + name)
+    return boot_disk.inspect
 
 
 def _ownership(masks):
@@ -358,7 +389,6 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None,
     """
     from check_elf import boot_profile, inspect_elf, symbol
     from verify_v13_model import loaded_bytes
-    from check_v13_disk import inspect as inspect_disk
     from build_unified import code_source_map
     root = Path(directory).resolve(strict=True)
     project = Path(source_root if source_root is not None else Path(__file__).resolve().parents[1]).resolve(strict=True)
@@ -387,7 +417,9 @@ def verify_native_receipt(directory: Path, *, source_root: Path | None = None,
         require(build['artifacts'][name]['sha256'] == sha256(path(name)), 'native build artifact mismatch')
     require(build['builder_sha256'] == sha256(safe_path(project, 'tools/build_unified.py')),
             'native builder revision changed')
-    verify_capture_revision(sha256(path('run_v13_a02.py')), sha256(path('verify_v13_a02.py')))
+    revision = verify_capture_revision(sha256(path('run_v13_a02.py')),
+                                       sha256(path('verify_v13_a02.py')), source_root=project)
+    inspect_disk = disk_decoder(root, project, artifacts, revision)
     require({'cargo', 'rustc', 'clang'} <= build['tools'].keys(), 'missing build tools')
     tools = document('tools.json')
     require(tools['build_tools'] == build['tools'], 'unverified native toolchain')

@@ -194,7 +194,7 @@ def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_
             check_resources()
             if child.returncode:
                 raise CosmicBuildError(f'command exit {child.returncode}; see {log}')
-        except BaseException:
+        except BaseException as failure:
             group_exists = True
             try:
                 os.killpg(child.pid, signal.SIGTERM)
@@ -218,6 +218,11 @@ def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_
                         os.killpg(child.pid, 0)
                     except ProcessLookupError:
                         return False
+                    except OSError:
+                        # A refused fallback is still unknown. Keep the
+                        # termination/reaping loop running instead of escaping
+                        # before the owned group receives SIGKILL.
+                        return True
                     return True
 
             # A failed observer does not cancel bounded termination/reaping.
@@ -249,7 +254,8 @@ def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_
                 raise CosmicBuildError('process-group cleanup failed: leader could not be reaped') from error
             if observation_error is not None:
                 raise CosmicBuildError(
-                    f'process-group cleanup observation failed: {observation_error}') from observation_error
+                    f'process-group cleanup observation failed after {failure}: '
+                    f'{observation_error}') from observation_error
             if group_exists:
                 raise CosmicBuildError(
                     'process-group cleanup failed: live members remain or cessation cannot be established')

@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify exact source, provenance and acceptance boundaries
         run: |
@@ -29,9 +30,15 @@ jobs:
           git rev-parse HEAD^{tree} > "$RUNNER_TEMP/v016-source/source-tree.txt"
           python3 -B -m unittest discover -s tools -p 'test_v15_snapshot.py' -v 2>&1 | tee "$RUNNER_TEMP/v016-source/historical-provenance-checks.log"
           python3 - <<'PY' 2>&1 | tee "$RUNNER_TEMP/v016-source/snapshot-checks.log"
-          import hashlib, json
-          from pathlib import Path
+          import hashlib, json, subprocess
+          from pathlib import Path, PurePosixPath
           root = Path('.')
+          audit_commit = 'abd8fa01d0dab42c43ecd4c1a4cf29e24ba9906f'
+          historical_path = 'docs/implementation/v16-verification.json'
+          followup_path = 'docs/implementation/v16-reintegration-verification.json'
+          def blob(filename):
+              return subprocess.check_output(['git', 'show', audit_commit + ':' + filename])
+          subprocess.run(['git', 'merge-base', '--is-ancestor', audit_commit, 'HEAD'], check=True)
           data = json.loads((root / 'docs/implementation/v16-source-baseline.json').read_text())
           assert (root / 'VERSION').read_text().strip() == data['software_version'] == '0.16.0-dev'
           assert data['branch'] == 'CyxiaOS-V0.16'
@@ -53,7 +60,12 @@ jobs:
               assert (root / item['regression']).is_file()
               assert item['status'] == 'IMPLEMENTED_HOST_VERIFIED'
               assert item['native_acceptance'] == 'NOT_RUN'
-          evidence = json.loads((root / data['verification_record']).read_text())
+          # The initial audit is immutable history. Its APPROVED verdict and
+          # file hashes apply to the fixed audit commit, not today's checkout.
+          assert data['verification_record'] == historical_path
+          historical_bytes = blob(historical_path)
+          assert (root / historical_path).read_bytes() == historical_bytes, 'initial audit record was rewritten'
+          evidence = json.loads(historical_bytes)
           assert evidence['native_acceptance'] == 'NOT_RUN'
           assert evidence['release_acceptance_verified'] is False
           assert evidence['source_parent'] == data['source']['parent_commit']
@@ -61,8 +73,55 @@ jobs:
           assert evidence['review']['whole_branch_review'] == 'APPROVED'
           assert evidence['verified_source_sha256']
           for filename, digest in evidence['verified_source_sha256'].items():
-              assert hashlib.sha256((root / filename).read_bytes()).hexdigest() == digest, filename
-          print('PASS: V0.16 provenance, reviewed source bindings and source-only acceptance boundary')
+              assert hashlib.sha256(blob(filename)).hexdigest() == digest, filename
+          assert data['followup_verification']['record'] == followup_path
+          followup = json.loads((root / followup_path).read_text())
+          assert followup['schema_version'] == 1
+          assert followup['software_version'] == data['software_version']
+          assert followup['source_parent'] == data['source']['parent_commit']
+          assert followup['historical_audit'] == {
+              'commit': audit_commit,
+              'record': historical_path,
+              'record_sha256': hashlib.sha256(historical_bytes).hexdigest(),
+              'applies_to_reintegrated_source': False,
+          }
+          assert followup['restoration_source']['compiled_file_count'] == 957
+          assert followup['restoration_source']['matched_file_count'] == 957
+          assert followup['restoration_source']['source_manifest_sha256'] == '6ac3481838941d1a44f69675d63c3c26726b268a7310d5650425ce787bfedb29'
+          assert followup['acceptance_policy'] == data['acceptance_policy']
+          assert followup['release_acceptance_verified'] is False
+          binding = followup['source_binding']
+          assert binding['status'] == 'SEALED', 'reintegration source binding is PENDING; freeze and bind the final source first'
+          assert binding['excluded_paths'] == [followup_path]
+          names = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z']).decode().split('\0')
+          expected = {name for name in names if name and name != followup_path}
+          assert expected == set(binding['files_sha256']), 'incomplete reintegration source binding'
+          assert binding['file_count'] == len(expected)
+          for filename, digest in binding['files_sha256'].items():
+              path = PurePosixPath(filename)
+              assert not path.is_absolute() and '..' not in path.parts and path.as_posix() == filename
+              source = root / filename
+              assert source.is_file() and not source.is_symlink(), filename
+              assert source.resolve().is_relative_to(root.resolve()), filename
+              assert not any(part.is_symlink() for part in source.parents), filename
+              assert hashlib.sha256(source.read_bytes()).hexdigest() == digest, filename
+          canonical = json.dumps(binding['files_sha256'], sort_keys=True, separators=(',', ':')).encode()
+          assert binding['sha256'] == hashlib.sha256(canonical).hexdigest()
+          verification = followup['current_verification']
+          assert verification['engineering_status'] in ('PENDING', 'PASS', 'FAIL')
+          for check in verification['checks'] + verification['native_runs']:
+              assert check['status'] in ('PENDING', 'NOT_RUN', 'SKIPPED', 'PASS', 'FAIL')
+              if check['status'] in ('PASS', 'FAIL'):
+                  assert check['source_binding_sha256'] == binding['sha256'], check['id']
+                  assert check['evidence'], check['id']
+          review = followup['review']
+          assert review['whole_branch_review'] in ('PENDING', 'APPROVED', 'CHANGES_REQUIRED')
+          if review['whole_branch_review'] == 'APPROVED':
+              assert review['approved_source_binding_sha256'] == binding['sha256']
+              assert review['evidence']
+          print('PASS: immutable initial-audit Git blobs and current reintegration source binding')
+          print('Current engineering:', verification['engineering_status'], 'review:', review['whole_branch_review'])
+          print('Source-only archive; native verdicts are not inherited or promoted by this workflow')
           PY
       - name: Archive the exact source and record identity
         run: |
@@ -90,10 +149,21 @@ jobs:
               'source_file_count': count,
               'source_zip_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
               'snapshot_checks': 'PASS',
+              'historical_audit_commit': 'abd8fa01d0dab42c43ecd4c1a4cf29e24ba9906f',
               'native_execution_attempted_by_this_workflow': False,
               'release_acceptance_verified': False,
               'note': 'Host remediation evidence and source identity do not replace exact-commit native acceptance.'
           }
+          followup_path = Path('docs/implementation/v16-reintegration-verification.json')
+          followup = json.loads(followup_path.read_text())
+          record.update(
+              followup_verification_record=str(followup_path),
+              followup_verification_sha256=hashlib.sha256(followup_path.read_bytes()).hexdigest(),
+              reintegration_source_binding_sha256=followup['source_binding']['sha256'],
+              reintegration_engineering_status=followup['current_verification']['engineering_status'],
+              reintegration_review_status=followup['review']['whole_branch_review'],
+              reintegration_native_runs=followup['current_verification']['native_runs'],
+          )
           (root / 'source-manifest.json').write_text(json.dumps(record, indent=2) + '\n')
           PY
           (cd "$RUNNER_TEMP/v016-source" && sha256sum CyxiaOS-V0.16-source.zip source-manifest.json > SHA256SUMS)

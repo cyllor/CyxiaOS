@@ -9,7 +9,7 @@ REASONS = ('connection_lost', 'clock_unavailable', 'domain_tick', 'tcp_read',
            'enter_authenticated', 'plaintext_ingest', 'plaintext_consume',
            'driver_tick', 'replay_reconnect', 'tls_egress', 'ingress_begin', 'tls_create')
 ORIGINS = ('connect', 'ingest_decode', 'handle', 'ready_binding', 'idle_timeout',
-           'tick', 'domain_tick', 'runtime')
+           'tick', 'domain_tick', 'runtime', 'activity_admission')
 RESULTS = {0: 'local_lifecycle', 0x4000: 'driver_unit_error',
            0x4001: 'driver_idle_timeout', 0x4002: 'ready_binding_mismatch',
            0x4003: 'partial_tls_receive', 0x4004: 'connection_epoch_changed',
@@ -51,14 +51,14 @@ def decode_session_exits(data, *, boot, service_generation):
             require(not any(record), 'nonempty absent session-exit slot')
             return None
         r = record
-        require(r[0] == 1 and r[1] == boot and first_generation <= r[2] <= last_generation
+        require(r[0] in (1, 2) and r[1] == boot and first_generation <= r[2] <= last_generation
                 and r[3] > 0, 'record boot/service/session identity mismatch')
-        require(1 <= r[5] <= 16 and r[6] in RESULTS and 1 <= r[7] <= 8
+        require(1 <= r[5] <= 16 and r[6] in RESULTS and 1 <= r[7] <= (9 if r[0] == 2 else 8)
                 and r[8] <= 3 and r[9] <= 15 and bool(r[9] & 1) == expected_auth
                 and (r[10] <= r[4] or r[6] == 0x1004) and r[12] <= 65535
                 and r[16] <= 65536 and r[17] <= 65535 and r[23] == 0,
                 'malformed session-exit record')
-        return dict(boot=r[1], service_generation=r[2], connection_epoch=r[3], ms=r[4],
+        return dict(record_version=r[0], boot=r[1], service_generation=r[2], connection_epoch=r[3], ms=r[4],
                     reason=REASONS[r[5] - 1], result=RESULTS[r[6]], original_result_code=r[6],
                     origin=ORIGINS[r[7] - 1], membership=r[8], state_flags=r[9], last_rx_ms=r[10],
                     peer_boot=r[11], last_message=dict(kind=r[12], sequence=r[13],

@@ -41,6 +41,7 @@ from verify_v13_model import loaded_bytes
 from verify_v13_storage_faults import copy_sparse
 from verify_unified import attest_qemu
 
+A10_DISK_NODE_NAME = 'cyxia-a10-disk'
 LAYOUT = (1, 512, 768, 384, 295424, 299008, 512, 512)
 CONTROL_EVIDENCE_BYTES = (512 + 64 * 640) * 8
 EXIT_MAGIC = 0x4359584131305052
@@ -344,7 +345,7 @@ def run(build_manifest: Path, initial_disk: Path, output: Path, *, mode: int,
             argv = [str(binary), '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
                 '-cpu', 'cortex-a53', '-smp', '4', '-m', '1024M', '-accel', 'tcg,thread=multi',
                 '-S', '-display', 'none', '-monitor', 'none', '-global', 'virtio-mmio.force-legacy=false',
-                '-drive', f'if=none,id=disk0,file=nbd:unix:{server.path},format=raw,cache=writeback',
+                '-drive', f'if=none,id=disk0,node-name={A10_DISK_NODE_NAME},file=nbd:unix:{server.path},format=raw,cache=writeback',
                 '-device', f'virtio-blk-device,drive=disk0,request-merging={merging}',
                 '-netdev', f'socket,id=net0,listen=127.0.0.1:{port}',
                 '-device', 'virtio-net-device,id=eth0,netdev=net0,mac=02:00:00:00:00:01',

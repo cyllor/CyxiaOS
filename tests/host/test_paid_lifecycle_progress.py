@@ -69,9 +69,11 @@ def program():
     replace(function(code,'if s.phase==Phase::Drain && locked('),'')
     reader=function(facade,'pub fn baseline_activation_pending(')
     owned=function(facade,'pub fn owned_drain_pending(') if 'pub fn owned_drain_pending(' in facade else 'pub fn owned_drain_pending()->bool{false}'
-    replace('// REPLAY_HINT_READER',reader+'\n'+owned)
+    replace('// REPLAY_HINT_READER',reader+'\n'+owned+'\n'+function(facade,'pub fn admission_progress_pending('))
     owner_bodies='struct Guard;\n'+'\n'.join(function(owner,s) for s in ['impl Drop for Guard','fn lock()','fn with<T>','pub fn service_step()','fn publish_drain_hint(','pub(super) fn drain_pending('])
     owner_bodies+='\n'+re.search(r'^static DRAIN_PENDING:.*;$',owner,re.M)[0]
+    owner_bodies+='\n'+function(owner,'pub(super) fn service_pending(')
+    owner_bodies+='\n'+re.search(r'^static SERVICE_PENDING:.*;$',owner,re.M)[0]
     replace('// REPLAY_BODIES',owner_bodies)
     pieces=['static LOCK: ResettableGate = ResettableGate(core::cell::UnsafeCell::new(owner_gate::Gate::new()));']
     pieces += [function(task,s) for s in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()','fn locked<R>','fn locked_with_guard<R>','pub struct Credit','fn admit_service(','pub fn begin_service_segment()','fn revalidate_unstarted(','pub fn revalidate_service_segment()','pub(crate) struct PaidServiceWitness','fn service_witness_locked(','pub fn authorize_service_turn()','pub fn complete_builtin(','pub fn complete_service(','pub fn service_segment<R>']]

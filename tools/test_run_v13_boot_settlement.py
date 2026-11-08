@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock
 
 from run_v13_boot_recovery import capture_failure
-from test_run_v13_boot_diagnostics import BootFailureDiagnostics
+from test_run_v13_boot_diagnostics import BootFailureDiagnostics, FULL_CONTROL_BYTES
 
 
 class BootSettlementCapture(unittest.TestCase):
@@ -18,7 +18,8 @@ class BootSettlementCapture(unittest.TestCase):
     def test_extra_buffers_are_independent_stopped_diagnostics(self):
         base = self.fixture()
         result, events, saved, raw, _, _ = base.capture()
-        self.assertEqual(len(saved), 6)
+        self.assertEqual(len(saved), 7)
+        self.assertEqual(len(saved['failure-control-full.bin']), FULL_CONTROL_BYTES)
         self.assertEqual(result['failure_diagnostics']['model-debug']['fields']['actual_ns'], 0)
         self.assertNotIn('status', result['failure_diagnostics']['model-debug'])
         self.assertNotIn('native_acceptance_status', result)
@@ -30,6 +31,7 @@ class BootSettlementCapture(unittest.TestCase):
         result, _, saved, _, _, _ = self.fixture().capture(fail_key='model-debug')
         self.assertEqual(set(result['failure_capture_errors']), {'model-debug'})
         self.assertIn('failure-control-settlement.bin', saved)
+        self.assertIn('failure-control-full.bin', saved)
         self.assertIn('failure-boot.bin', saved)
         self.assertIn('failure-runtime.bin', saved)
 
@@ -39,7 +41,8 @@ class BootSettlementCapture(unittest.TestCase):
         result, _, saved, _, _, _ = base.capture()
         self.assertIn('model-debug', result['failure_capture_errors'])
         self.assertNotIn('failure-model-debug.bin', saved)
-        self.assertEqual(len(saved), 5)
+        self.assertEqual(len(saved), 6)
+        self.assertIn('failure-control-full.bin', saved)
 
     def test_final_bill_fields_do_not_alias_checkpoint_or_model_verdict(self):
         base = self.fixture()
@@ -72,6 +75,8 @@ class BootSettlementCapture(unittest.TestCase):
         self.assertEqual(fields['terminal_cause'], 5)
         self.assertEqual(fields['cancel_won'], 1)
         self.assertEqual(result['failure_capture']['model_checkpoint_cpu_ns'], 0)
+        self.assertEqual(result['failure_control_full_bytes'], FULL_CONTROL_BYTES)
+        self.assertNotIn('failure_capture_errors', result)
 
 
 if __name__ == '__main__':

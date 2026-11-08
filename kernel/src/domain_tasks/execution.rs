@@ -47,7 +47,7 @@ fn thread_spec(request: &SpawnRequest, launch: &Launch, key: ObjectKey) -> Threa
         minimum_ns: if local { 10_000_000 } else { 0 },
         budget_ns: if matches!(request.group.id, 15 | 16) && launch.recipe != 0 {
             20_000_000
-        } else if request.package == CLIENT_PACKAGE || local {
+        } else if request.package == CLIENT_PACKAGE || request.package == MEMORY_PACKAGE || local {
             10_000_000
         } else {
             1_000_000
@@ -132,7 +132,8 @@ impl Creator<'_> {
     ) -> Result<(), Error> {
         trace.step(10); // Original immutable launch lookup.
         let launch = &self.launches[self.launch(r)?];
-        let client = r.package == CLIENT_PACKAGE;
+        let client = r.package == CLIENT_PACKAGE || r.package == MEMORY_PACKAGE;
+        let memory_client = r.package == MEMORY_PACKAGE;
         let local = r.caller == CLUSTER_CALLER;
         let inherited = task_index(self.tasks, r.caller).map_or(ZERO, |i| self.tasks[i].endpoint);
         self.tasks[slot] = Task {
@@ -179,7 +180,9 @@ impl Creator<'_> {
             frame_ptr(slot * 3 + 1)?
                 .cast::<u64>()
                 .write(frame_phys(slot * 3 + 2)? | 3);
-            let (first, count) = if client {
+            let (first, count) = if memory_client {
+                (MEMORY_CODE_FRAME, 4)
+            } else if client {
                 (CLIENT_CODE_FRAME, 4)
             } else {
                 (CODE_FRAME, 1)
@@ -192,7 +195,9 @@ impl Creator<'_> {
             }
         }
         trace.step(13); // Register the exact memory owner generation.
-        let client_pages = if client && crate::storage_fault_capture::PROFILE {
+        let client_pages = if memory_client {
+            32
+        } else if client && crate::storage_fault_capture::PROFILE {
             if launch.len != 40 {
                 return Err(Error::Format);
             }
@@ -314,6 +319,13 @@ impl Creator<'_> {
                 return Err(Error::Conflict);
             }
         }
+        if memory_client {
+            if launch.len != 40 {
+                return Err(Error::Format);
+            }
+            let role = u64::from_le_bytes(launch.input[8..16].try_into().unwrap());
+            crate::memory_fault_capture::register(role, key, frame_phys(slot * 3)?)?;
+        }
         Ok(())
     }
     fn rollback(&mut self, slot: usize, key: ObjectKey) -> Result<(), Error> {
@@ -371,6 +383,10 @@ impl TaskBackend for Creator<'_> {
     fn authorize(&mut self, r: &SpawnRequest) -> Result<(), Error> {
         if r.package != PACKAGE
             && !(r.package == CLIENT_PACKAGE && r.caller == KERNEL_CALLER && SELFTEST_ENABLED)
+            && !(r.package == MEMORY_PACKAGE
+                && r.caller == KERNEL_CALLER
+                && SELFTEST_ENABLED
+                && crate::memory_fault_capture::PROFILE)
         {
             return Err(Error::Auth);
         }
@@ -589,6 +605,11 @@ fn submit_package(
     let maximum_ns = if package == CLIENT_PACKAGE && crate::storage_fault_capture::PROFILE {
         crate::storage_fault_capture::launch_deadline_ns(input)
             .unwrap_or(super::deadline::ORDINARY_NS)
+    } else if package == MEMORY_PACKAGE
+        && caller == KERNEL_CALLER
+        && crate::memory_fault_capture::PROFILE
+    {
+        crate::memory_fault_capture::LIFETIME_NS
     } else {
         super::deadline::ORDINARY_NS
     };
@@ -1323,7 +1344,9 @@ fn service_baseline_activation_at(site: u64) {
         // already-owned requests need independently paid progress even though
         // the probe itself could not enter. Other errors retain their rules.
         let root_again = matches!(outcome, Some(Err(Error::Again)));
-        let pending = crate::learning_replay::baseline_activation_pending();
+        // Source closing/sealing owns service progress, not another queued
+        // admission. Preserve the published execution or owned-Drain reason.
+        let pending = crate::learning_replay::admission_progress_pending();
         #[cfg(not(test))]
         crate::learning_evidence::execution_trace::admission_opportunity(
             root_ok,
@@ -1600,13 +1623,22 @@ fn process_return_inner(s: &mut State, i: usize, c: &mut user::Context) {
             state = RunState::Blocked;
             FILE_PENDING[i].store(true, Ordering::Release);
         } else {
-            if let Err(error) = abi::syscall_locked(s, i, c) {
+            let result = abi::syscall_locked(s, i, c);
+            // The nonblocking receive ABI7 retains its original AGAIN return.
+            // ABI22 returns the same value after a wake; the ordinary client
+            // retries. Empty receive owns no queue/completion cell or buffer
+            // loan while the original CPU credit settles as Blocked.
+            let empty_receive = c.regs[8] == 22 && matches!(result, Err(Error::Again));
+            if let Err(error) = result {
                 c.regs[0] = error_word(error);
             }
             if s.tasks[i].life == Life::Exiting {
                 state = RunState::Exited;
             } else {
                 s.tasks[i].life = Life::Ready;
+                if empty_receive {
+                    state = RunState::Blocked;
+                }
             }
         }
     } else if abi::fault_locked(s, key, c).is_ok() {
@@ -2597,5 +2629,60 @@ pub fn probe_status() -> Result<Option<u64>, Error> {
             return Err(Error::NotFound);
         }
         Ok(s.probe_exit)
+    })
+}
+pub fn start_memory_client(role: u64) -> Result<ObjectKey, Error> {
+    if !SELFTEST_ENABLED
+        || !crate::memory_fault_capture::PROFILE
+        || !(1..=2).contains(&role)
+        || cpu::slot() != 0
+    {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        let id = 0xa0900000 + role;
+        match s.admission.query(KERNEL_CALLER, id) {
+            Ok(SpawnState::Created(key)) => {
+                if role == 1 {
+                    s.probe_key = Some(key);
+                }
+                return Ok(key);
+            }
+            Ok(SpawnState::Failed(e)) => return Err(e),
+            Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
+            Ok(_) => (),
+            Err(Error::NotFound) => {
+                let deadline = now_ns()
+                    .checked_add(crate::memory_fault_capture::LIFETIME_NS)
+                    .ok_or(Error::Overflow)?;
+                let launch = crate::memory_fault_capture::launch(role);
+                if let SpawnState::Failed(e) = submit_package(
+                    s,
+                    MEMORY_PACKAGE,
+                    KERNEL_CALLER,
+                    id,
+                    group(4),
+                    &launch,
+                    3,
+                    deadline,
+                    false,
+                    0,
+                )? {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        advance_admission(s)?;
+        match s.admission.query(KERNEL_CALLER, id)? {
+            SpawnState::Created(key) => {
+                if role == 1 {
+                    s.probe_key = Some(key);
+                }
+                Ok(key)
+            }
+            SpawnState::Failed(e) => Err(e),
+            _ => Err(Error::Again),
+        }
     })
 }

@@ -241,6 +241,11 @@ impl Cores {
     pub const fn snapshot(&self) -> Snapshot {
         self.state
     }
+    /// Actual retained accounting window; a failed advance does not relabel
+    /// old obligations with the current hardware clock's later window.
+    pub const fn budget_window(&self) -> u64 {
+        self.budget_window
+    }
     pub const fn permits(&self, cpu: usize, plane: Plane) -> bool {
         self.state.permits(cpu, plane)
     }

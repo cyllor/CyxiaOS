@@ -1452,6 +1452,23 @@ impl Coordinator {
                     self.admit_movable();
                 }
                 let generation = gate.view().token.unwrap().generation + 1;
+                #[cfg(feature = "unified-runtime")]
+                if let Some(apply) = native::active_core_apply(&self.native) {
+                    let proofs = u64::from(stop.dispatch)
+                        | (u64::from(stop.tasks) << 1)
+                        | (u64::from(stop.irq) << 2)
+                        | (u64::from(stop.dma) << 3)
+                        | (u64::from(stop.tlb) << 4)
+                        | (u64::from(stop.references) << 5);
+                    crate::ownership_evidence::published(
+                        apply,
+                        operation,
+                        &self.owner,
+                        native::ns(timer::ticks()),
+                        proofs,
+                        STOP_ACK.load(Ordering::Acquire),
+                    );
+                }
                 gate.open(Token {
                     generation,
                     plane: plane(self.handoff_target, 2),

@@ -3,6 +3,8 @@
 //! from a later boot cannot manufacture a fresh execution from an old intent.
 use cyxia_prototype::domains::{ObjectKey, tasks::SpawnState};
 use sha2::{Digest, Sha256};
+#[path = "local_request_diagnostic.rs"]
+pub(crate) mod diagnostic;
 
 const CAPACITY: usize = 256;
 #[derive(Clone, Copy)]
@@ -34,15 +36,21 @@ fn answer(payload: &mut [u8; 4096], state: SpawnState) -> (u64, usize, u64) {
     payload[16..24].copy_from_slice(&key.generation.to_le_bytes());
     (0, 24, 0)
 }
-fn query(entry: &mut Entry) {
+fn query(entry: &mut Entry, observation: &mut diagnostic::Observation) {
     if matches!(entry.state, SpawnState::Queued | SpawnState::Unknown) {
-        if let Ok(state) = crate::domain_tasks::query_local(entry.spawn_id) {
+        let result = crate::domain_tasks::query_local(entry.spawn_id);
+        observation.owner(12, &result);
+        if let Ok(state) = result {
             entry.state = state;
         }
     }
     crate::domain_tasks::bind_local_failure_request(entry.spawn_id, entry.key, entry.deadline_ns);
 }
-fn admit(entry: &mut Entry, input: &[u8]) -> Result<(), ()> {
+fn admit(
+    entry: &mut Entry,
+    input: &[u8],
+    observation: &mut diagnostic::Observation,
+) -> Result<(), ()> {
     // Only an explicit error before SpawnAdmission publishes its Queued
     // receipt permits another call. UNKNOWN is visible before callbacks;
     // a lost reply, accepted Failed, or uncertain construction never retries.
@@ -50,6 +58,7 @@ fn admit(entry: &mut Entry, input: &[u8]) -> Result<(), ()> {
     entry.state = SpawnState::Unknown;
     let result = crate::domain_network::replay::claim_local(entry.key, entry.spawn_id)
         .and_then(|()| crate::domain_tasks::submit_local(entry.spawn_id, input, entry.deadline_ns));
+    observation.owner(11, &result);
     let outcome = match result {
         Err(
             cyxia_prototype::domains::Error::Busy
@@ -80,6 +89,30 @@ pub fn request(
     package_hash: [u8; 32],
 ) -> (u64, usize, u64) {
     assert_eq!(cyxia_arch_aarch64::cpu::slot(), 0);
+    // [DEBUG-v15-placement] Observe the actual entry again only after the
+    // original operation has returned. No payload or new authority is stored.
+    let mut observation = diagnostic::Observation::new(phase, crate::domain_platform::now_ns());
+    let result = request_inner(phase, payload, len, package_hash, &mut observation);
+    if let Some(index) = observation.index {
+        let entry = unsafe {
+            core::ptr::addr_of!(ENTRIES)
+                .cast::<Option<Entry>>()
+                .add(index)
+                .read()
+        };
+        if let Some(entry) = entry {
+            observation.finish(entry, result, crate::domain_platform::now_ns());
+        }
+    }
+    result
+}
+fn request_inner(
+    phase: u64,
+    payload: &mut [u8; 4096],
+    len: usize,
+    package_hash: [u8; 32],
+    observation: &mut diagnostic::Observation,
+) -> (u64, usize, u64) {
     if len > payload.len() || !matches!(phase, 11 | 12 | 27) {
         return (3, 0, 0);
     }
@@ -96,9 +129,14 @@ pub fn request(
     // Exclusive CPU0 broker ownership; no callback or IRQ handler borrows it.
     let entries = unsafe { &mut *core::ptr::addr_of_mut!(ENTRIES) };
     if matches!(phase, 12 | 27) {
-        let Some(entry) = entries.iter_mut().flatten().find(|entry| entry.key == key) else {
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.is_some_and(|e| e.key == key))
+        else {
             return (4, 0, 0);
         };
+        observation.index = Some(index);
+        let entry = entries[index].as_mut().unwrap();
         if payload[16..48] != entry.input_hash {
             return (3, 0, 0);
         }
@@ -107,7 +145,7 @@ pub fn request(
             // into a new admission. Only an explicitly retried phase 11 can.
             return (1, 0, 0);
         }
-        query(entry);
+        query(entry, observation);
         if phase == 27 {
             if entry.completion.is_none() {
                 match crate::domain_tasks::local_result(entry.spawn_id) {
@@ -156,7 +194,12 @@ pub fn request(
     {
         return (3, 0, 0);
     }
-    if let Some(entry) = entries.iter_mut().flatten().find(|entry| entry.key == key) {
+    if let Some(index) = entries
+        .iter()
+        .position(|entry| entry.is_some_and(|e| e.key == key))
+    {
+        observation.index = Some(index);
+        let entry = entries[index].as_mut().unwrap();
         if entry.input_hash != input_hash
             || entry.package_hash != package_hash
             || entry.deadline_ns != deadline_ns
@@ -168,11 +211,11 @@ pub fn request(
             if entry.deadline_ns <= crate::domain_platform::now_ns() {
                 entry.retryable = false;
                 entry.state = SpawnState::Failed(cyxia_prototype::domains::Error::Expired);
-            } else if admit(entry, &payload[112..len]).is_err() {
+            } else if admit(entry, &payload[112..len], observation).is_err() {
                 return (1, 0, 0);
             }
         }
-        query(entry);
+        query(entry, observation);
         return answer(payload, entry.state);
     }
     let now = crate::domain_platform::now_ns();
@@ -198,7 +241,8 @@ pub fn request(
         acknowledged: false,
     });
     let entry = entries[index].as_mut().unwrap();
-    if admit(entry, &payload[112..len]).is_err() {
+    observation.index = Some(index);
+    if admit(entry, &payload[112..len], observation).is_err() {
         return (1, 0, 0);
     }
     answer(payload, entry.state)

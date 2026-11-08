@@ -4,7 +4,7 @@ pub const WORDS: usize = 80;
 pub const RECORD_WORDS: usize = 24;
 
 pub fn valid_record(r: &[u64; RECORD_WORDS], boot: u64, generation: u64, connection: u64) -> bool {
-    r[0] == 1
+    matches!(r[0], 1 | 2)
         && boot != 0
         && r[1] == boot
         && generation != 0
@@ -14,7 +14,7 @@ pub fn valid_record(r: &[u64; RECORD_WORDS], boot: u64, generation: u64, connect
         && (1..=16).contains(&r[5])
         && matches!(r[6], 0 | 0x1001..=0x100b | 0x2001..=0x2014 | 0x3000..=0x3005
             | 0x4000..=0x4005 | 0x4101 | 0x5001..=0x500b)
-        && (1..=8).contains(&r[7])
+        && (1..=if r[0] == 2 { 9 } else { 8 }).contains(&r[7])
         && r[8] <= 3
         && r[9] <= 15
         && (r[10] <= r[4] || r[6] == 0x1004)

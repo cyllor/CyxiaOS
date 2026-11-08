@@ -3,7 +3,7 @@
 use super::Config;
 use crate::device::{Error, MTU, Port};
 use smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, TcpPacket,
+    EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +40,14 @@ pub(super) struct ObservedPort<P> {
     sent: u64,
     retransmitted: u64,
     valid: bool,
+    pub(super) discovery_sent: u64,
+    pub(super) discovery_sent_ms: u64,
+    pub(super) discovery_nonce: [u8; 16],
+}
+impl<P> ObservedPort<P> {
+    pub(super) fn select_peer(&mut self, config: Config) {
+        self.config = config;
+    }
 }
 fn before(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
@@ -105,6 +113,9 @@ impl<P: Port> ObservedPort<P> {
             sent: 0,
             retransmitted: 0,
             valid: true,
+            discovery_sent: 0,
+            discovery_sent_ms: 0,
+            discovery_nonce: [0; 16],
         }
     }
     pub(super) fn set_time(&mut self, now: u64) {
@@ -209,6 +220,22 @@ impl<P: Port> Port for ObservedPort<P> {
     }
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.inner.send(frame)?;
+        // Count only packets actually accepted by the device, not socket
+        // preparation/queueing. PCAP remains the independent wire evidence.
+        if let Ok(ethernet) = EthernetFrame::new_checked(frame)
+            && ethernet.ethertype() == EthernetProtocol::Ipv4
+            && let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload())
+            && ip.next_header() == IpProtocol::Udp
+            && ip.src_addr().octets() == self.config.local
+            && let Ok(udp) = UdpPacket::new_checked(ip.payload())
+            && udp.src_port() == crate::discovery::PORT
+            && udp.dst_port() == crate::discovery::PORT
+            && let Ok(message) = crate::discovery::Message::decode(udp.payload())
+        {
+            self.discovery_sent = self.discovery_sent.saturating_add(1);
+            self.discovery_sent_ms = self.now;
+            self.discovery_nonce = message.nonce;
+        }
         if let Some(packet) = packet(frame, self.config, true) {
             self.sent_packet(packet);
         }

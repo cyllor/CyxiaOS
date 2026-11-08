@@ -54,7 +54,7 @@ pub(super) const WORKSPACE_PEAK_BYTES: usize = 1024 * 1024
     + crate::learning_evidence::HANDOFF_BYTES
     + crate::domain_tasks::CAPTURE_CREDIT_BYTES
     + crate::domain_services::SOURCE_IDENTITY_BYTES
-    + size_of::<AtomicBool>();
+    + 2 * size_of::<AtomicBool>();
 const RECORD_LIMIT: usize = 8;
 const SECOND: u64 = 1_000_000_000;
 const FAMILIES: [Family; 18] = [
@@ -296,6 +296,7 @@ static SCOPE_HASH_BYTES: ScopeHashBytes = ScopeHashBytes(UnsafeCell::new([0; SCO
 static ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static GATE: AtomicBool = AtomicBool::new(false);
 static DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
+static SERVICE_PENDING: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Stable native-reader ABI, all values observed from actual owners. Word 0
 /// is a seqlock; 1 magic; 2 phase; 3/4 family; 5 group; 6 candidate=1/baseline=2;
@@ -380,20 +381,25 @@ struct Guard;
 fn publish_drain_hint() {
     debug_assert!(GATE.load(Ordering::Relaxed));
     let base = ADDRESS.load(Ordering::Acquire);
-    let pending = if base == 0 {
-        false
+    let (drain, service) = if base == 0 {
+        (false, false)
     } else {
         // Guard owns exclusion. with() cannot return a borrow of its State.
         let s = unsafe { &*(base as *const State) };
-        s.phase == Phase::Drain
-            && s.scope.is_some()
-            && s.token.is_some()
-            && s.work_activation.entered()
+        let owned = s.scope.is_some() && s.token.is_some() && s.work_activation.entered();
+        (
+            owned && s.phase == Phase::Drain,
+            owned && matches!(s.phase, Phase::Drain | Phase::CloseSources | Phase::Seal),
+        )
     };
-    DRAIN_PENDING.store(pending, Ordering::Release);
+    DRAIN_PENDING.store(drain, Ordering::Release);
+    SERVICE_PENDING.store(service, Ordering::Release);
 }
 pub(super) fn drain_pending() -> bool {
     DRAIN_PENDING.load(Ordering::Acquire)
+}
+pub(super) fn service_pending() -> bool {
+    SERVICE_PENDING.load(Ordering::Acquire)
 }
 impl Drop for Guard {
     fn drop(&mut self) {

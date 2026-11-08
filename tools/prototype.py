@@ -157,12 +157,24 @@ def main(argv: list[str] | None = None) -> int:
                         help='completion target only; all catalogue rows remain validated')
     report.add_argument('--qemu-source', type=Path,
                         help='trusted patched-QEMU source for independent A02 receipt replay')
+    report.add_argument('--a09-build', type=Path,
+                        help='caller-selected trusted A09 build directory for native memory replay')
+    report.add_argument('--a10-build-manifest', type=Path,
+                        help='caller-selected trusted build for A10 native matrix replay')
+    report.add_argument('--a10-formatter', type=Path,
+                        help='caller-selected trusted formatter for A10 native matrix replay')
     report.add_argument('--output', type=Path, help='optional new JSON file; otherwise stdout')
     args = parser.parse_args(argv)
     try:
         if args.command == 'test':
             return run_steps(test_steps(args.fetch, args.lane), args.output)
         options = {} if args.qemu_source is None else {'qemu_source': args.qemu_source}
+        if args.a09_build is not None:
+            options['a09_build'] = args.a09_build
+        if args.a10_build_manifest is not None:
+            options['a10_build_manifest'] = args.a10_build_manifest
+        if args.a10_formatter is not None:
+            options['a10_formatter'] = args.a10_formatter
         result = validate(read_json(args.manifest), ROOT, **options)
         result['selected_scope'] = args.scope
         result['selected_scope_complete'] = result[

@@ -61,6 +61,8 @@ const LAUNCHES: usize = 72;
 const ZERO: ObjectKey = ObjectKey { id: 0, generation: 0 };
 const PACKAGE:ObjectKey=ObjectKey{id:7,generation:1};
 const CLIENT_PACKAGE:ObjectKey=ObjectKey{id:8,generation:1};
+const MEMORY_PACKAGE:ObjectKey=ObjectKey{id:3,generation:1};
+const KERNEL_CALLER:ObjectKey=ObjectKey{id:u64::MAX,generation:1};
 const PROBE_DEADLINE:u64=5_100_000_000;
 struct Input([u8;4096]);
 impl Input {
@@ -124,6 +126,9 @@ fn probe_attempt(mode:usize)->Result<SpawnState,Error>{
     })
 }
 mod storage_fault_capture {pub const PROFILE:bool=false;pub fn launch_deadline_ns(_: &[u8])->Option<u64>{None}}
+// This ordinary-task fixture keeps the A09 package profile disabled while
+// compiling the unchanged production admission/deadline branch.
+mod memory_fault_capture {pub const PROFILE:bool=false;pub const LIFETIME_NS:u64=600_000_000_000;}
 mod domain_control {pub mod replay {pub fn baseline_activation_pending()->bool{super::super::HINT.load(super::super::Ordering::Acquire)}}}
 fn queue_warm() {
     locked(|s| {
@@ -223,7 +228,7 @@ mod learning_replay {
     type DomainError = Error;
     static GATE: AtomicBool = AtomicBool::new(false);
     static ADDRESS: AtomicUsize = AtomicUsize::new(0);
-    #[derive(Clone,Copy,PartialEq,Eq)] enum Phase {Run,Drain,CloseSources}
+    #[derive(Clone,Copy,PartialEq,Eq)] enum Phase {Run,Drain,CloseSources,Seal}
     struct Activation {owned:bool}
     impl Activation {fn entered(&self)->bool{self.owned}}
     struct State { archive: u64, snapshot: u64, phase:Phase,scope:Option<u64>,token:Option<u64>,work_activation:Activation }
@@ -232,6 +237,7 @@ mod learning_replay {
         GATE.store(false, Ordering::Release);
         unsafe { ARCHIVE = State { archive: 0, snapshot: 100_000_000,phase:Phase::Run,scope:None,token:None,work_activation:Activation{owned:false} }; }
         DRAIN_PENDING.store(false,Ordering::Release);
+        SERVICE_PENDING.store(false,Ordering::Release);
         ADDRESS.store(core::ptr::addr_of_mut!(ARCHIVE) as usize, Ordering::Release);
     }
     // REPLAY_HINT_READER
@@ -587,7 +593,9 @@ fn actual_owner_guard_projects_only_owned_drain_on_success_and_error(){
     reset();HINT.store(false,Ordering::Release);
     assert_eq!(learning_replay::own_drain(Err(Error::Again)),Err(Error::Again));
     assert!(learning_replay::baseline_activation_pending(),"owned drain lost priority when Root was complete");
-    learning_replay::change_phase(1);assert!(!learning_replay::baseline_activation_pending());
+    learning_replay::change_phase(1);
+    assert!(!learning_replay::drain_pending(),"source closure retained lifecycle authority");
+    assert!(learning_replay::baseline_activation_pending(),"source closure lost its separate paid service reason");
     learning_replay::own_drain(Ok(())).unwrap();learning_replay::change_phase(0);
     assert!(!learning_replay::baseline_activation_pending(),"Run observation entered the drain fast path");
     learning_replay::check_projection_boundaries();
@@ -601,7 +609,8 @@ fn actual_driver_finishes_owned_drain_after_root_hint_clears(){
     learning_replay::own_drain(Ok(())).unwrap();NOW.store(160_000_000,Ordering::Release);
     for _ in 0..3 {mechanism_progress(&mut smp::prototype_runtime::Coordinator);}
     assert_eq!(STEP_CALLS.load(Ordering::Acquire),3,"actual driver did not advance the owned drain debt");
-    assert!(!learning_replay::baseline_activation_pending());
+    assert!(!learning_replay::drain_pending(),"completed Drain retained lifecycle authority");
+    assert!(learning_replay::baseline_activation_pending(),"remaining source closure lost service progress");
     assert_eq!(learning_replay::snapshot(),100_000_000);
     assert_eq!(bills()[before..].iter().map(|b|b.1).collect::<Vec<_>>(),[100_000,20_000,100_000,20_000,100_000]);
 }

@@ -7,11 +7,14 @@ const fn key(id: u64) -> ObjectKey { ObjectKey { id, generation: 1 } }
 const GROUP: ObjectKey = key(14);
 const PACKAGE: ObjectKey = key(1);
 const CLIENT_PACKAGE: ObjectKey = key(2);
+const MEMORY_PACKAGE: ObjectKey = key(3);
 const KERNEL_CALLER: ObjectKey = key(u64::MAX);
 const CLUSTER_CALLER: ObjectKey = key(u64::MAX - 3);
 const PARENT: ObjectKey = key(0x1000);
 const ZERO: ObjectKey = ObjectKey { id: 0, generation: 0 };
 const SELFTEST_ENABLED: bool = true;
+// Exercise ordinary admission with the restored A09 package profile disabled.
+mod memory_fault_capture { pub const PROFILE: bool = false; }
 const TASKS: usize = 6;
 const ORDINARY_TASKS: usize = 4;
 const LAYOUT: CpuLayout = CpuLayout { business_mask: 13, healthy_mask: 15, generation: 7 };

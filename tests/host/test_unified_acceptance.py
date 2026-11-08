@@ -154,7 +154,7 @@ class Acceptance(unittest.TestCase):
             self.assertFalse(any(folder.glob('.d8-control-*')))
 
     def test_profile_captures_task_and_network_diagnostics(self):
-        expected = (
+        required = (
             'UNIFIED_EVIDENCE', 'DYNAMIC_V13_EVIDENCE', 'RUNTIME_V13_EVIDENCE',
             'UNIFIED_SERVICE_STAGE', 'DOMAIN_TASK_EVIDENCE', 'TASK_OVERRUN_EVIDENCE',
             'NETWORK_PIECE_EVIDENCE', 'NETWORK_SETTLEMENT_EVIDENCE',
@@ -168,6 +168,14 @@ class Acceptance(unittest.TestCase):
             'DOMAIN_PREPARATION_REJECTIONS',
             'DOMAIN_PREPARATION_SKIP_EVIDENCE',
         )
+        optional = {
+            'APPLICATION_REQUEST_EVIDENCE': 6208,
+            'LOCAL_REQUEST_EVIDENCE': 2112,
+            'SESSION_ACTIVITY_EVIDENCE': 832,
+            'DISCOVERY_EVIDENCE': 512,
+            'REPLAY_QUIESCING_EVIDENCE': 512,
+        }
+        expected = required + tuple(optional)
         sizes = {
             'UNIFIED_EVIDENCE': 4096, 'DYNAMIC_V13_EVIDENCE': 4096,
             'RUNTIME_V13_EVIDENCE': 8192, 'UNIFIED_SERVICE_STAGE': 8,
@@ -184,6 +192,7 @@ class Acceptance(unittest.TestCase):
             'DOMAIN_PREPARATION_ENTRY_DETAIL': 128,
             'DOMAIN_PREPARATION_REJECTIONS': 5184,
             'DOMAIN_PREPARATION_SKIP_EVIDENCE': 2048,
+            **optional,
         }
 
         with patch('verify_unified.inspect_elf'), \
@@ -191,7 +200,7 @@ class Acceptance(unittest.TestCase):
              patch('verify_unified.symbol', side_effect=lambda _, name: {'pa': 0, 'size': sizes[name]}):
             self.assertEqual(tuple(profile(b'elf')), expected)
 
-        for malformed in expected[-7:]:
+        for malformed in required[-7:]:
             def located(_, name, malformed=malformed):
                 return {'pa': 0, 'size': sizes[name] + int(name == malformed)}
             with self.subTest(malformed=malformed), \
@@ -200,6 +209,28 @@ class Acceptance(unittest.TestCase):
                  patch('verify_unified.symbol', side_effect=located), \
                  self.assertRaisesRegex(ValueError, malformed + ' size differs'):
                 profile(b'elf')
+
+        # Optional diagnostics may be absent in older images or have an
+        # incompatible layout; neither condition can discard required banks.
+        for missing in optional:
+            def located(_, name, missing=missing):
+                if name == missing:
+                    raise ValueError('fixture image has no ' + name)
+                return {'pa': 0, 'size': sizes[name]}
+            with self.subTest(missing_optional=missing), \
+                 patch('verify_unified.inspect_elf'), \
+                 patch('verify_unified.boot_profile', return_value={'ram_mib': 1024}), \
+                 patch('verify_unified.symbol', side_effect=located):
+                self.assertEqual(tuple(profile(b'elf')), tuple(n for n in expected if n != missing))
+
+        for malformed in optional:
+            def located(_, name, malformed=malformed):
+                return {'pa': 0, 'size': sizes[name] + int(name == malformed)}
+            with self.subTest(malformed_optional=malformed), \
+                 patch('verify_unified.inspect_elf'), \
+                 patch('verify_unified.boot_profile', return_value={'ram_mib': 1024}), \
+                 patch('verify_unified.symbol', side_effect=located):
+                self.assertEqual(tuple(profile(b'elf')), tuple(n for n in expected if n != malformed))
 
     def test_final_diagnostics_reuse_domain_decoder(self):
         evidence = bundle()

@@ -274,7 +274,7 @@ class SyntheticChild:
         argv = [context['binary'], '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
             '-cpu','cortex-a53','-smp','4','-m','1024M','-accel','tcg,thread=multi','-S',
             '-display','none','-monitor','none','-global','virtio-mmio.force-legacy=false',
-            '-drive','if=none,id=disk0,file=nbd:unix:/tmp/synthetic/disk.sock,format=raw,cache=writeback',
+            '-drive','if=none,id=disk0,node-name=cyxia-a10-disk,file=nbd:unix:/tmp/synthetic/disk.sock,format=raw,cache=writeback',
             '-device','virtio-blk-device,drive=disk0,request-merging=on',
             '-netdev','socket,id=net0,listen=127.0.0.1:1234',
             '-device','virtio-net-device,id=eth0,netdev=net0,mac=02:00:00:00:00:01',
@@ -715,7 +715,7 @@ class NativeTrustedBoundary(unittest.TestCase):
                     launch = fixture.read('launch.json')
                     if kind == 'loader': launch['argv'] += ['-device', 'loader,file=/attacker']
                     if kind == 'endpoint':
-                        launch['argv'][launch['argv'].index('-drive')+1] = 'if=none,id=disk0,file=nbd:unix:/wrong,format=raw,cache=writeback'
+                        launch['argv'][launch['argv'].index('-drive')+1] = 'if=none,id=disk0,node-name=cyxia-a10-disk,file=nbd:unix:/wrong,format=raw,cache=writeback'
                     if kind == 'symbols': launch['symbols']['config']['pa'] += 8
                     fixture.write('launch.json', launch)
                 if kind == 'backing':

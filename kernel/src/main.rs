@@ -1,6 +1,18 @@
 #![no_std]
 #![no_main]
 #[cfg(all(
+    feature = "register-v15-selftest",
+    any(
+        feature = "prototype-runtime",
+        feature = "ai-control-selftest",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest"
+    )
+))]
+compile_error!("register-v15-selftest has an independent evidence scope");
+#[cfg(all(
     feature = "smp-selftest",
     any(feature = "ported", feature = "graphics", feature = "large-memory")
 ))]
@@ -89,11 +101,15 @@ mod learning_workload;
 #[cfg(feature = "unified-runtime")]
 mod local_placement;
 #[cfg(feature = "unified-runtime")]
+mod memory_fault_capture;
+#[cfg(feature = "unified-runtime")]
 mod model_bank;
 #[cfg(feature = "net-selftest")]
 mod net_selftest;
 #[cfg(feature = "unified-runtime")]
 mod network_diagnostics;
+#[cfg(feature = "unified-runtime")]
+mod ownership_evidence;
 #[cfg(feature = "unified-runtime")]
 mod peer_replay;
 #[cfg(feature = "unified-runtime")]

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 from verify_v13_tcp import checksum
+from discovery_capture import decode_discovery_datagram
 
 
 def require(value, message):
@@ -83,7 +84,7 @@ def validate_capture(data: bytes) -> dict:
     require(order is not None, 'unsupported PCAP encoding')
     major,minor,_,_,snaplen,network = struct.unpack_from(order+'HHIIII',data,4)
     require((major,minor,network)==(2,4,1) and snaplen>=1514,'invalid PCAP header')
-    at, sessions, current, packets = 24, [], None, 0
+    at, sessions, current, packets, discovery = 24, [], None, 0, []
     while at < len(data):
         require(at+16<=len(data),'truncated capture record')
         _,_,length,original = struct.unpack_from(order+'IIII',data,at)
@@ -100,6 +101,9 @@ def validate_capture(data: bytes) -> dict:
             require(len(frame)>=42 and frame[14:20]==b'\0\x01\x08\0\x06\x04','invalid ARP frame')
             continue
         require(frame[12:14]==b'\x08\0','unexpected Ethernet protocol')
+        if len(frame)>23 and frame[23]==17:
+            discovery.append(decode_discovery_datagram(frame,node))
+            continue
         ip = frame[14:]
         require(len(ip)>=40 and ip[0]==0x45 and ip[9]==6,'invalid IPv4/TCP header')
         size = int.from_bytes(ip[2:4],'big')
@@ -151,7 +155,7 @@ def validate_capture(data: bytes) -> dict:
             directions.append(tls_stream(bytes(stream),slot==0))
         proofs.append({'client_node':session['client'],'cipher':'TLS_AES_128_GCM_SHA256','key_exchange':'X25519','directions':directions})
     require(proofs,'no TLS sessions captured')
-    return {'frames':packets,'sessions':proofs,'tls_hello_policy_verified':True,
+    return {'frames':packets,'sessions':proofs,'discovery':discovery,'tls_hello_policy_verified':True,
             'tls_peer_authentication_verified':False,'membership_verified':False,
             'scope':'PCAP exposes hello policy and encrypted records; serial, native isolation, and durable proof evidence required for authentication and membership'}
 

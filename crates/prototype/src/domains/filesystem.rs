@@ -140,6 +140,7 @@ pub struct FileSystem<const CACHE: usize = 64> {
     handle_generation: u64,
     cache: [Cache; CACHE],
     resident: usize,
+    evictions: u64,
     pages: [CachePage; CACHE],
     cache_budget: usize,
     reclaim_batch: usize,
@@ -175,6 +176,7 @@ impl<const C: usize> FileSystem<C> {
             handle_generation: 0,
             cache: [Cache::EMPTY; C],
             resident: 0,
+            evictions: 0,
             pages: [CachePage([0; BLOCK_SIZE]); C],
             cache_budget: if C < 256 { C } else { 256 },
             reclaim_batch: 16,
@@ -318,6 +320,10 @@ impl<const C: usize> FileSystem<C> {
     pub fn cache_backing(&self) -> (usize, usize) {
         (self.pages.as_ptr() as usize, C * BLOCK_SIZE)
     }
+    /// Actual clean cells removed by replacement or cache reclaim.
+    pub const fn cache_evictions(&self) -> u64 {
+        self.evictions
+    }
     pub fn set_cache_partition(&mut self, pages: usize, batch: usize) -> Result<(), Error> {
         if pages == 0 || pages > C || batch == 0 || batch > 64 {
             return Err(Error::Capacity);
@@ -388,6 +394,7 @@ impl<const C: usize> FileSystem<C> {
             let page = &mut self.cache[at];
             if page.valid && !page.dirty && !page.pinned {
                 *page = Cache::EMPTY;
+                self.evictions = self.evictions.saturating_add(1);
                 self.resident -= 1;
                 resident -= 1;
                 freed += 1;
@@ -1045,6 +1052,7 @@ impl<const C: usize> FileSystem<C> {
         .ok_or(Error::Again)?;
         if self.cache[at].valid {
             self.resident -= 1;
+            self.evictions = self.evictions.saturating_add(1);
         }
         self.cache[at] = Cache::EMPTY;
         if !zero {

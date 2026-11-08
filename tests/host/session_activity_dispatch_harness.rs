@@ -123,6 +123,10 @@ mod unified_task {
     use super::*;
     use cyxia_kernel_core::control_plane::task_admission::Authority;
     static mut AUTHORITY: Authority = Authority::new();
+    static BOOT: AtomicU64 = AtomicU64::new(1);
+    #[path = ACTIVITY_DIAGNOSTIC_PATH]
+    mod activity_diagnostic;
+    // BROKER_TIMING
     pub fn reset() {
         let a = unsafe { &mut *core::ptr::addr_of_mut!(AUTHORITY) };
         *a = Authority::new();

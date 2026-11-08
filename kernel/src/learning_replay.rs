@@ -15,9 +15,14 @@ pub(crate) mod late_archive;
 mod owner;
 #[path = "learning_replay/preparation_archive.rs"]
 pub(crate) mod preparation_archive;
-/// Scheduling only: published execution and already-owned draining each retain
-/// progress until their own gate clears the reason. Service revalidates rights.
+/// Scheduling only: published execution and already-owned drain/source closure
+/// retain progress until their gate clears the reason. Service revalidates rights.
 pub fn baseline_activation_pending() -> bool {
+    crate::domain_control::replay::baseline_activation_pending() || owner::service_pending()
+}
+/// Queued admission keeps its original execution/Drain reason. Closing or
+/// sealing a capture requests service only, without another admission turn.
+pub fn admission_progress_pending() -> bool {
     crate::domain_control::replay::baseline_activation_pending() || owner::drain_pending()
 }
 /// Scheduling reason for already-entered Drain only; this grants no authority.

@@ -30,7 +30,7 @@ from verify_smp import ROOT, require, sha
 from verify_v13_a02 import verify, verify_native_receipt, execution_flags, MAX_EVENTS, TRACE_MAGIC
 from check_prototype_evidence import read_json
 from verify_v13_model import loaded_bytes
-from check_v13_disk import inspect as inspect_disk
+from check_v13_boot_disk import inspect as inspect_disk, TOOL_FILES as DISK_TOOL_FILES
 
 
 def config_bytes(image_hash: str, input_hash: str, source_hash: str, nonce: bytes) -> bytes:
@@ -130,7 +130,7 @@ def run(build: Path, output: Path, formatter: Path, timeout: float = 90, *,
             target = output / 'build-inputs' / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
-    for name in ('run_v13_a02.py', 'verify_v13_a02.py'):
+    for name in ('run_v13_a02.py', 'verify_v13_a02.py') + DISK_TOOL_FILES:
         shutil.copyfile(ROOT / 'tools' / name, output / name)
     model = layout['model']
     (output / 'model.bin').write_bytes(loaded_bytes(image.read_bytes(), model['va'], model['size']))

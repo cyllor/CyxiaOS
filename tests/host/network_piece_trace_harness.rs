@@ -3,6 +3,7 @@ extern crate self as cyxia_arch_aarch64;
 use core::sync::atomic::{AtomicBool,AtomicU64,AtomicUsize,Ordering};
 use std::sync::Mutex;
 use cyxia_prototype::domains::{Error,ObjectKey,WINDOW_NS,tasks::*,maintenance::{BackgroundBudgets,CpuDebit}};
+use cyxia_cluster_transport::tcp::{DiscoverySnapshot,Error as TcpError,State as TcpState};
 static CPU:AtomicUsize=AtomicUsize::new(0);
 static NOW:AtomicU64=AtomicU64::new(100_000_000);
 static WORK:AtomicU64=AtomicU64::new(0);
@@ -21,6 +22,8 @@ const BUILTIN_WINDOW_HEADROOM_NS:u64=20_000_000;
 static CREDIT_KIND:[AtomicU64;1]=[AtomicU64::new(0)];static CREDIT_NS:[AtomicU64;1]=[AtomicU64::new(0)];
 static COMPLETE_READY:[AtomicBool;1]=[AtomicBool::new(false)];static COMPLETE_AT:[AtomicU64;1]=[AtomicU64::new(0)];static COMPLETE_ACTUAL:[AtomicU64;1]=[AtomicU64::new(0)];
 struct Bank{words:[AtomicU64;32]}static DOMAIN_TASK_EVIDENCE:Bank=Bank{words:[const{AtomicU64::new(0)};32]};static TASK_OVERRUN_EVIDENCE:Bank=Bank{words:[const{AtomicU64::new(0)};32]};
+struct UnifiedEvidence{words:[AtomicU64;512]}
+static UNIFIED_EVIDENCE:UnifiedEvidence=UnifiedEvidence{words:[const{AtomicU64::new(0)};512]};
 #[derive(Clone,Copy)]struct Active{dispatch:Dispatch,state:RunState,optional:Option<CpuDebit>,cpu_started:Option<u64>}
 struct Counter;impl Counter{fn add(&mut self,_:u64,_:u64){}}
 struct Facts{cpu:[Counter;1]}
@@ -65,10 +68,18 @@ mod smp{pub mod prototype_runtime{#[derive(Default)]pub struct Coordinator;impl 
  }}super::super::work(11_000);
 }}}}
 mod domain_platform{pub fn poll(_:u64)->Result<(),super::Error>{super::work(13_000);Ok(())}}
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]enum TcpState{Closed,Established}
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]enum TcpError{Device}
+// This counted TCP boundary models discovery=None, as in an ordinary fixed
+// peer stream. Actual discovery/RNG/wire behavior has separate integration
+// tests; unexpectedly entering those paths must fail rather than add fake work.
+mod entropy{pub fn fill_progress(_: &mut[u8],_: &mut dyn FnMut())->Result<(),cyxia_posix::Errno>{panic!("disabled discovery requested entropy")}}
+mod discovery_evidence{pub fn publish(_:u64,_:u64,_:u64,_:Option<super::TcpState>,_:super::DiscoverySnapshot){panic!("disabled discovery published evidence")}}
 struct NativeTcp<'a>{mode:u8,_p:core::marker::PhantomData<&'a mut()>}
-impl NativeTcp<'_>{fn state(&self)->Result<TcpState,TcpError>{Ok(TcpState::Closed)}fn poll_with_checkpoints(&mut self,_:u64,cp:&mut dyn FnMut())->Result<TcpState,TcpError>{
+impl NativeTcp<'_>{
+fn discovery_due(&mut self,_:u64)->Result<bool,TcpError>{Ok(false)}
+fn prepare_discovery(&mut self,_:u64,_:[u8;16])->Result<(),TcpError>{panic!("disabled discovery prepared a packet")}
+fn discovery_snapshot(&self)->Option<DiscoverySnapshot>{None}
+fn abort(&mut self){panic!("disabled discovery entered abort path")}
+fn state(&self)->Result<TcpState,TcpError>{Ok(TcpState::Closed)}fn poll_with_checkpoints(&mut self,_:u64,cp:&mut dyn FnMut())->Result<TcpState,TcpError>{
  network_diagnostics::stage(1);CPU.store(1,Ordering::Relaxed);network_diagnostics::stage(63);CPU.store(0,Ordering::Relaxed);work(if self.mode==2{2_603_169}else{100_000});
  if self.mode==3{network_diagnostics::stage(2);network_diagnostics::stage(2);}
  if self.mode==2{return Err(TcpError::Device)}

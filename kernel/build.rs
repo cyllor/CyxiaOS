@@ -317,6 +317,61 @@ fn main() {
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
         let storage_probe = env::var("CYXIA_STORAGE_FAULT_PROBE").unwrap_or_else(|_| "0".into());
+        println!("cargo:rerun-if-env-changed=CYXIA_MEMORY_FAULT_PROBE");
+        let memory_probe = env::var("CYXIA_MEMORY_FAULT_PROBE").unwrap_or_else(|_| "0".into());
+        assert!(["0", "1"].contains(&memory_probe.as_str()));
+        assert!(
+            memory_probe != "1"
+                || (storage_probe == "0"
+                    && env::var("CYXIA_DOMAIN_SELFTEST").as_deref() == Ok("1")),
+            "A09 needs an independent ordinary-client profile"
+        );
+        std::fs::write(
+            out.join("memory-fault-probe.rs"),
+            if memory_probe == "1" { "true" } else { "false" },
+        )
+        .unwrap();
+        if memory_probe == "1" {
+            let source = root.join("user/prototype-memory-client");
+            // Include shared ABI definitions as well as the private package and
+            // linker script. These are actual standalone-rustc dependencies.
+            for path in [
+                source.join("main.rs"),
+                source.join("linker.ld"),
+                root.join("user/prototype-task/files_abi.rs"),
+            ] {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+            checked(
+                Command::new(env::var("RUSTC").unwrap())
+                    .arg(source.join("main.rs"))
+                    .args([
+                        "--edition=2024",
+                        "--target",
+                        "aarch64-unknown-none-softfloat",
+                        "--crate-name",
+                        "cyxia_memory_client",
+                        "-C",
+                        "opt-level=2",
+                        "-C",
+                        "panic=abort",
+                        "-C",
+                        "overflow-checks=yes",
+                        "-C",
+                        "relocation-model=static",
+                        "-C",
+                        "link-arg=--build-id=none",
+                        "-C",
+                        "link-arg=-zmax-page-size=4096",
+                    ])
+                    .arg("-C")
+                    .arg(format!("link-arg=-T{}", source.join("linker.ld").display()))
+                    .arg("-o")
+                    .arg(out.join("memory-client.elf")),
+            );
+        } else {
+            std::fs::write(out.join("memory-client.elf"), []).unwrap();
+        }
         assert!(
             ["0", "1"].contains(&storage_probe.as_str()),
             "CYXIA_STORAGE_FAULT_PROBE must be 0 or 1"

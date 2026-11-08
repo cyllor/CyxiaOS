@@ -31,6 +31,7 @@ from verify_v13_boot_recovery import CONFIG_MAGIC, MAGIC, MODES, require, verify
 
 ROOT = Path(__file__).resolve().parents[1]
 DEBUG_SYMBOLS = {'model-debug': 'A01_BOOT_MODEL_DEBUG',
+                 'formal': 'A01_FORMAL_EVIDENCE',
                  'control-settlement': 'CONTROL_SETTLEMENT_EVIDENCE',
                  'smp-fault': 'SMP_FAULT_EVIDENCE',
                  'task-slices': 'TASK_SLICE_EVIDENCE', 'builtin-detail': 'BUILTIN_TASK_DETAIL',
@@ -110,6 +111,18 @@ def capture_failure(qmp, save, symbols, config, decoder, raw, text):
                 report.setdefault('failure_diagnostics', {})[key] = details
         except caught as error:
             errors[key] = str(error)
+    # The existing 4096-byte control diagnostic contains only header counters.
+    # Preserve the already-produced bounded record ring separately, so a
+    # failed ownership run retains later no-change CoreSet input/score/legality.
+    # This does not alter the small-debug cap or confer an acceptance verdict.
+    try:
+        size = (512 + 64 * 640) * 8
+        require(symbols['control']['size'] == size, 'wrong full control evidence symbol')
+        sample = save('failure-control-full.bin', symbols['control']['pa'], size)
+        require(len(sample) == size, 'short full control failure capture')
+        report['failure_control_full_bytes'] = size
+    except caught as error:
+        errors['control-full'] = str(error)
     try:
         chunk = base64.b64decode(qmp.execute('ringbuf-read',
             dict(device='cyxlog', size=1048576, format='base64')), validate=True)
@@ -124,7 +137,9 @@ def capture_failure(qmp, save, symbols, config, decoder, raw, text):
     return report
 
 
-def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, previous=None):
+def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, previous=None,
+             formal=False, ownership=False):
+    from verify_v13_boot_receipt import MAX_STOPPED_PROBE_STOPS
     output.mkdir(parents=True, exist_ok=False)
     sources = code_source_map(ROOT)
     manifest = json.loads((build/'build-manifest.json').read_text())
@@ -139,6 +154,10 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
     names = {'boot': 'A01_BOOT_EVIDENCE', 'config': 'A01_BOOT_CONFIG',
              'control': 'DOMAIN_CONTROL_EVIDENCE', 'runtime': 'RUNTIME_V13_EVIDENCE',
              'unified': 'UNIFIED_EVIDENCE'}
+    if formal:
+        names['formal'] = 'A01_FORMAL_EVIDENCE'
+    if ownership:
+        names['ownership'] = 'OWNERSHIP_V15_EVIDENCE'
     symbols = {k: symbol(data, v) for k, v in names.items()}
     require(symbols['boot']['size'] == symbols['config']['size'] == 512, 'wrong capture layout')
     shutil.copyfile(image, output/'node-a.elf')
@@ -148,7 +167,7 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
     disk = output/'disk.raw'
     write_json(output/'disk-before.json', dict(sha256=sha(disk), bytes=disk.stat().st_size))
     nonce = secrets.token_bytes(16)
-    write_json(output/'input.json', dict(scope='A01-boot-recovery-regression', mode=mode,
+    write_json(output/'input.json', dict(scope='A03-model-owner-transition' if ownership else 'A01-boot-recovery-regression', mode=mode,
                nonce=nonce.hex(), timeout_seconds=timeout, sample_gap_seconds=.5, disk_origin=origin))
     config = (struct.pack('<4Q', CONFIG_MAGIC, 1, mode, 0) + nonce
               + bytes.fromhex(sha(image)) + bytes.fromhex(sha(output/'input.json'))
@@ -204,7 +223,7 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
             write_json(output/'config-injection.json', inject_config(gpath,config,symbols['config']['pa']))
             require(save('config-observed.bin', symbols['config']['pa'],512)==config, 'config not observed')
             qmp.execute('cont')
-            first = None; second_at = None
+            first = None; second_at = None; stopped_attempts = 0
             while time.monotonic()<end:
                 require(proc.poll() is None, 'guest exited')
                 chunk=base64.b64decode(qmp.execute('ringbuf-read',dict(device='cyxlog',size=1048576,format='base64')),validate=True)
@@ -216,13 +235,36 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
                 words=struct.unpack('<64Q',probe)
                 target=3 if mode==0 else 2
                 progressed=mode==0 or words[10]>0 and words[11]>0
+                if ownership and words[3] == target:
+                    from verify_v15_ownership import WORDS, validate_structure
+                    live_owner = save('pending-ownership.bin', symbols['ownership']['pa'], WORDS*8)
+                    try:
+                        validate_structure(live_owner)
+                    except ValueError:
+                        time.sleep(.01)
+                        continue
+                if formal and words[3] == target:
+                    from verify_v15_a01 import verify_formal_samples
+                    live_formal = save('pending-formal.bin', symbols['formal']['pa'], 2048)
+                    try:
+                        verify_formal_samples(live_formal, probe)
+                    except ValueError:
+                        # Live readiness probes are never evidence. The final
+                        # verdict requires both independently stopped banks.
+                        time.sleep(.01)
+                        continue
                 if (words[0]==MAGIC and words[3] in (2, 3) and words[2]%2==0
                         and (words[3]!=target or progressed)):
                     if first is None or time.monotonic()>=second_at:
                         qmp.execute('stop')
                         require(qmp.execute('query-status')['status']=='paused','capture not stopped')
-                        name='first.bin' if first is None else 'last.bin'
-                        sample=save(name,symbols['boot']['pa'],512)
+                        stopped_attempts += 1
+                        require(stopped_attempts <= MAX_STOPPED_PROBE_STOPS,
+                                'stopped candidate probe limit exceeded')
+                        # Stopping can interrupt a publication that began after
+                        # the live readiness read. Do not publish an authority
+                        # filename until every required stopped bank is ready.
+                        sample=save('stopped-boot-probe.bin',symbols['boot']['pa'],512)
                         if struct.unpack('<64Q',sample)[2]%2:
                             qmp.execute('cont'); time.sleep(.005); continue
                         diagnostic = stopped_boot_state(sample, config)
@@ -231,6 +273,33 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
                             raise RuntimeError('unexpected boot terminal: '
                                 f"state={diagnostic['state']} expected={target} "
                                 f"reason={diagnostic['reason_name']}({diagnostic['reason']})")
+                        if formal:
+                            stopped_formal=save('stopped-formal-probe.bin',symbols['formal']['pa'],2048)
+                            try:
+                                verify_formal_samples(stopped_formal,sample)
+                            except ValueError:
+                                qmp.execute('cont'); time.sleep(.005); continue
+                        if ownership:
+                            stopped_owner=save('stopped-ownership-probe.bin',symbols['ownership']['pa'],WORDS*8)
+                            try:
+                                validate_structure(stopped_owner)
+                                require(stopped_owner[16*8:30*8]==config[32:144],
+                                        'stopped ownership bank differs from frozen run')
+                            except ValueError:
+                                qmp.execute('cont'); time.sleep(.005); continue
+                        name='first.bin' if first is None else 'last.bin'
+                        require(save(name,symbols['boot']['pa'],512)==sample,
+                                'boot bank changed while stopped')
+                        if formal:
+                            formal_name = 'formal-first.bin' if first is None else 'formal-last.bin'
+                            authority = save(formal_name, symbols['formal']['pa'], 2048)
+                            require(authority==stopped_formal,'formal bank changed while stopped')
+                            verify_formal_samples(authority, sample)
+                        if ownership:
+                            owner_name='ownership-first.bin' if first is None else 'ownership-last.bin'
+                            owner_bank=save(owner_name,symbols['ownership']['pa'],WORDS*8)
+                            require(owner_bank==stopped_owner,'ownership bank changed while stopped')
+                            validate_structure(owner_bank)
                         if first is None:
                             first=sample; second_at=time.monotonic()+.5
                             qmp.execute('cont')
@@ -256,6 +325,12 @@ def run_case(build, output, formatter, qemu, qemu_source, mode, timeout, *, prev
                 except (KeyError, ValueError) as error:
                     result.setdefault('failure_symbol_errors', {})[key] = str(error)
             result.update(capture_failure(qmp, save, diagnostic_symbols, config, decoder, raw, text))
+            if ownership and 'stop' not in result.get('failure_capture_errors', {}):
+                try:
+                    from verify_v15_ownership import WORDS
+                    save('failure-ownership.bin',symbols['ownership']['pa'],WORDS*8)
+                except (OSError,ValueError,RuntimeError,KeyError,TypeError) as error:
+                    result.setdefault('failure_capture_errors',{})['ownership']=str(error)
             if 'stop' not in result.get('failure_capture_errors', {}):
                 try:
                     registers = qmp.execute('human-monitor-command', {'command-line': 'info registers -a'})
