@@ -866,3 +866,168 @@ fn closing_never_restarts_the_fifty_ms_action_or_finalization_deadline() {
         );
     });
 }
+
+// Synthetic accepted-reward/authority fixtures only; no native corpus or package export.
+use cyxia_prototype::learning::{
+    data::FrozenData,
+    manifest::{ModelManifest, SealedModel, UntrainedSeed},
+    reward::{self, CpuClass, CpuInterval, Trial},
+    train::Trainer,
+    validate::{
+        ReferenceCase, ReferenceSelection, ReferenceSuite, ValidatedCandidate, integer_reference,
+    },
+};
+use sha2::{Digest, Sha256};
+
+#[test]
+fn accepted_cpu_penalty_labels_complete_the_host_model_lifecycle_without_seed_changes() {
+    let mut training = Vec::new();
+    let mut validation = Vec::new();
+    let mut id = 1;
+    for family in support::FAMILIES {
+        for group in 0..12 {
+            let sample = support::with_trials(
+                family,
+                if group < 8 { 1 } else { 2 },
+                id,
+                Default::default(),
+                |candidate, baseline| {
+                    let mut cpu = candidate.cpu.to_vec();
+                    cpu.push(CpuInterval {
+                        node: candidate.local_node,
+                        core: 0,
+                        start_ns: candidate.observation_ns + 500_000_000,
+                        end_ns: candidate.observation_ns + 5_500_000_000,
+                        class: CpuClass::ExecutorWork,
+                    });
+                    let same_qos = Trial {
+                        cpu: &cpu,
+                        requests: baseline.requests,
+                        ..*candidate
+                    };
+                    let sample = reward::pair(
+                        &same_qos,
+                        baseline,
+                        &support::TestAuthority,
+                        &mut RewardWorkspace::new(),
+                    )?;
+                    assert!(f64::from_bits(sample.reward().value.to_bits()) < -0.1);
+                    Ok(sample)
+                },
+            )
+            .unwrap();
+            if group < 8 {
+                training.push(sample)
+            } else {
+                validation.push(sample)
+            };
+            id += 1;
+        }
+    }
+    let data = FrozenData::freeze(&training, &validation, 1, support::schemas()).unwrap();
+    let seed = UntrainedSeed::new(0);
+    let original_seed = *seed.bytes();
+    let mut trainer = Trainer::start(seed.bytes(), &data).unwrap();
+    while trainer.step_next().unwrap() {}
+    assert_eq!(trainer.completed_steps(), 144);
+    let trained = trainer.finish().unwrap();
+    let mut cases = Vec::new();
+    let mut selections = Vec::new();
+    for set in support::probes(trained.bytes()) {
+        let first = cases.len();
+        let mut selected = 0;
+        let mut score = i16::MIN;
+        for (i, c) in set.iter().enumerate() {
+            let input = cyxia_prototype::features::encode(c.action, c.features)
+                .unwrap()
+                .values;
+            let trace = integer_reference(trained.bytes(), &input);
+            if i == 0 || trace.output > score {
+                selected = i;
+                score = trace.output;
+            }
+            cases.push(ReferenceCase { input, trace });
+        }
+        selections.push(ReferenceSelection {
+            first: first as u16,
+            count: set.len() as u16,
+            selected: selected as u16,
+        });
+    }
+    let vectors = ReferenceSuite {
+        parameters_hash: Sha256::digest(trained.bytes()).into(),
+        cases: &cases,
+        selections: &selections,
+    };
+    let manifest =
+        ModelManifest::learned(&trained, support::schemas(), &vectors, 1024 * 1024).unwrap();
+    let sealed =
+        SealedModel::seal(trained.bytes(), manifest, support::schemas(), &vectors).unwrap();
+    let candidate = ValidatedCandidate::register(
+        seed.bytes(),
+        sealed,
+        &data,
+        &support::probes(trained.bytes()),
+    )
+    .unwrap();
+    assert_eq!(seed.bytes(), &original_seed);
+    let active = ModelBinding {
+        generation: 7,
+        model_hash: candidate.parent_hash(),
+        schema_hash: support::schemas().feature.hash,
+    };
+    let mut gate = CommitGate::new(1, active).unwrap();
+    let mut gov = Governance::new(&gate, &candidate, seed.bytes(), 0).unwrap();
+    let mut budget = ExtraBudget::new();
+    shadow(&mut gov, &gate, &mut budget);
+    let permit = gov
+        .begin_canary(
+            &mut gate,
+            TargetRegistration {
+                key: console(),
+                baseline: Action::ConsoleBatch(1),
+            },
+            10 * WINDOW_NS,
+            &Owners { extend: true },
+        )
+        .unwrap();
+    publish(&mut gov, &mut gate, &mut budget, permit.start_ns + 1, 1).unwrap();
+    let submission = gov.submissions().next().unwrap();
+    assert_eq!(
+        gov.promote(&mut gate, permit.expires_ns).err(),
+        Some(Error::State)
+    );
+    gov.reconcile(
+        &mut gate,
+        receipt(submission, ExecutionState::Applied),
+        &Owners { extend: true },
+    )
+    .unwrap();
+    let mut work = RewardWorkspace::new();
+    for second in 0..10 {
+        let start = permit.start_ns + second * 1_000_000_000;
+        let baseline = observations(start, 100, 1000, 0);
+        let candidate = observations(start, 100, 900, 0);
+        gov.observe_second(
+            &mut gate,
+            second as u16,
+            &baseline,
+            &candidate,
+            &mut work,
+            &Owners { extend: true },
+        )
+        .unwrap();
+    }
+    gov.freeze().unwrap();
+    let learned = gov.promote(&mut gate, permit.expires_ns).unwrap();
+    assert_eq!(learned.generation, 8);
+    assert_ne!(learned.model_hash, active.model_hash);
+    let rollback = gov.rollback(&mut gate).unwrap();
+    assert_eq!(rollback.generation, 9);
+    assert_eq!(rollback.model_hash, active.model_hash);
+    assert_eq!(
+        gate.check_active_publication(active, console()),
+        Err(Error::Stale)
+    );
+    assert_eq!(seed.bytes(), &original_seed);
+}

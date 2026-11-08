@@ -26,7 +26,8 @@
       "receipt_summary_sha256": "c32a67c3ae9e3763fdcac27fbeaee5319de122131b163d0b923a5a75fed1837f",
       "resealed_semantic_mutations_rejected": 14,
       "applies_to_reintegrated_source": false
-    }
+    },
+    "historical_scope_note": "957/957 describes the earlier restoration baseline, not byte equality of this repaired C4 source with V0.15."
   },
   "audit_repairs": {
     "required_ids": [
@@ -41,7 +42,7 @@
       "R09"
     ],
     "policy": "Preserve the nine V0.16 repairs while integrating restored source; verify the combined source again.",
-    "final_integration_verification": "SCOPED_FUNCTIONAL_CHECKS_PASS_STRICT_FEATURE_LINT_FAIL_NATIVE_RELEASE_INCOMPLETE"
+    "final_integration_verification": "SCOPED_FUNCTIONAL_AND_NATIVE_SLICES_PASS_SUPPLEMENTAL_ENGINEERING_FAILURES_AND_FULL_NATIVE_RELEASE_INCOMPLETE"
   },
   "acceptance_policy": {
     "inherit_native_verdicts": false,
@@ -49,20 +50,38 @@
     "new_commit_requires_independent_runtime_verification": true,
     "release_gate_opened_by_branch_creation": false
   },
-  "record_status": "VERIFIED_WITH_OPEN_ACCEPTANCE_AND_ENGINEERING_ITEMS",
-  "scope": "2026-11-08 parallel A01-A16 follow-up: real red/green fixes and fresh native verification; prior sealed reintegration retained separately.",
+  "record_status": "VERIFIED_SCOPED_PROGRESS_WITH_OPEN_ACCEPTANCE_AND_ENGINEERING_ITEMS",
+  "scope": "2026-11-08 R4: new strict A12-specific native verifier and actual C4 Local-admission PASS; original129 naturally reproduced, no runtime causal fix. Python tools434 pass; full release and broad engineering remain incomplete.",
   "prior_round": {
-    "path": "artifacts/v016-progress-20261108/prior-sealed-source/v16-reintegration-verification-20261107.json",
-    "sha256": "5a1cac594fef4bf86f07e6b71fda34a773b3437ed7934bbb503bb94493d85a31",
-    "source_binding_sha256": "fc44e8d90d9d0d06773c9828fdd9870ca480b0149f7bfe48a9f74c5a21f6ffae",
-    "compiled_input_map_sha256": "e3e09ea9309f375ef6f143004c4481062e8694d818929cca4aa57ae8826efa57",
-    "A": {
-      "PASS": 3,
-      "FAIL": 0,
-      "NOT_RUN": 13
+    "round": "R3",
+    "raw_record": {
+      "path": "artifacts/v016-progress-20261108-r4/prior-round-record.json",
+      "sha256": "fb3db160dec45556d8ef7b974c568772c1ee118cff61e770aa02878c7ab979b6"
     },
-    "inherit_native_verdicts": false,
-    "source_byte_archive": "/private/tmp/cyxia-v016-source-byte-archive-20261107"
+    "source_binding_sha256": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+    "compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+    "source_byte_archive": {
+      "status": "COMPLETE_FINAL_RECORD_SYNCED",
+      "path": "/private/tmp/cyxia-v016-source-byte-archive-20261108-r3",
+      "source_binding_sha256": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+      "manifest_locator": "artifacts/v016-progress-20261108-r3/source-byte-archive.json",
+      "manifest_hash_policy": "External manifest raw record hash updated after final metadata; locator here avoids hash cycle.",
+      "native_replay_from_archive_path_attested": false
+    },
+    "source_metadata_review": {
+      "status": "APPROVED",
+      "scope_id": "R3_SOURCE_AND_EVIDENCE_METADATA_ONLY",
+      "approved_source_binding_sha256": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+      "evidence": [
+        {
+          "path": "artifacts/v016-progress-20261108-r3/final-source-metadata-review.json",
+          "sha256": "368c2f5162f0a9b2645fc4c54ef48ee2ec0b17b2e23335d4dbedeea4427e3a2c"
+        }
+      ],
+      "whole_branch_or_native_release_approval": false
+    },
+    "evidence_preserved": true,
+    "prior_checks_and_attempt_history_retained_in_raw_record": true
   },
   "source_binding": {
     "status": "SEALED",
@@ -70,8 +89,8 @@
     "excluded_paths": [
       "docs/implementation/v16-reintegration-verification.json"
     ],
-    "file_count": 1792,
-    "sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
+    "file_count": 1806,
+    "sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
     "files_sha256": {
       ".cargo/config.toml": "2e78b9440604ab242a4928453e40798fcffb1ddf6c15a9184351d399cce9c5c4",
       ".github/workflows/ai-control-native.yml": "d493efdd78e7e4379efad16131c8022e1c27f72099104cf708971a09bc3b287c",
@@ -124,7 +143,7 @@
       "CyxiaOS-system-prototype.jpg": "65f9f284c555b25218b4624d376c079db822265d479dc7158054bbe5adf3aab5",
       "CyxiaOS.code-workspace": "4f888fe1084d2a9091583d5093693d81453c0b8d06dfd6192b096972bae551d4",
       "CyxiaOS_Minimal_Prototype_Design_Final.docx": "01f8c315018d8117c0b43671add6527fe76d0b83caabe865b5d714a99fa135a0",
-      "README.md": "dee20f32462e55464eafade5f62953ed980be880fab1e48270ff55b044dc0102",
+      "README.md": "7a553913fd26ed0fb233f73e559b29dc61360f7155252173189ca58a24d066b2",
       "Start-CyxiaOS-Desktop.command": "f8f9b47f658f2b0bb564a5925bffe115d5abc5b17d462f37fd58bbd960965f0f",
       "Start-CyxiaOS.command": "d6cf10ca0592165762d2824e4231d7440b5c48939908d6d44b0e6a782838d5b7",
       "VERSION": "b896b16fefa8b8e97f413d2d0c4e8a7d60ccea27044db9671a93a13c6e12af5d",
@@ -332,11 +351,11 @@
       "crates/prototype/examples/prototype-disk.rs": "59c3c40cc589b799060f505ec3bd4354d2521563742eb4466567694d6bdcfc30",
       "crates/prototype/examples/prototype-memory-disk.rs": "599cc794b39485d980ccecef0aa7c0d44849321458a3d8bb3ca889482cbb0848",
       "crates/prototype/examples/verify-domain-evidence.rs": "053b7da09b2c7017f8c398cd9b3ef1da9ef189e60c1e6d4809af0fd10875613d",
-      "crates/prototype/examples/verify-ownership-evidence.rs": "2dc67e0873974f7bfa3e6d5f9a9465cc2b45497bcfc697a167bc8c51232098cd",
+      "crates/prototype/examples/verify-ownership-evidence.rs": "73fe96568146749e15ad3ca859c0f2dbf27db437ad17ae1d483034e9e5d50658",
       "crates/prototype/src/a10_budget.rs": "02b8568196e121eb070e2dd66f430c2cb469e8401acda9a3f56f555a3d8c2d39",
       "crates/prototype/src/boot.rs": "eaf0f42420f9d83f193b32b00592f1947625dd29d842167548475c00b92b82b1",
       "crates/prototype/src/boot_model.rs": "3c6fb8b1a963c10976f68d0561c987c1a8e380f09dcd5b50e465e0e229cf5e51",
-      "crates/prototype/src/cluster/engine.rs": "e6313da4559e0379dfad129964377604ff348d57ff247c0ede40e550ab6973ee",
+      "crates/prototype/src/cluster/engine.rs": "d71052bfc961568943a62b8fd226a72d380dd41bc22ae2e12436ff7d87cc54f7",
       "crates/prototype/src/cluster/mod.rs": "b06c45b695cf435366ac75de082a4a911ca42bc9d4f39c8f19821efdf4dbced3",
       "crates/prototype/src/cluster/volume.rs": "266ca6c5d6210b8475c179d813e05c0d4889c89215c8923dab875ff20562b4dd",
       "crates/prototype/src/cluster/wire.rs": "d5afd0de36caeafbe745a1a3e09fa6b0a9bb767e2d5a4ec79585ca1083f16565",
@@ -433,13 +452,13 @@
       "crates/prototype/tests/learning_capture_init.rs": "503a4850806cb0e4f8a4cf9c58c4faaa724bb0ccc58bb6b54b21257595d93369",
       "crates/prototype/tests/learning_coordinator_decision.rs": "eeaf892e45c4e8e4c59dcbe41e3ab2dba08f14c1ceda373872798e524df42819",
       "crates/prototype/tests/learning_coordinator_wire.rs": "da172c2099f654266a92755d9fa2f5e75258ec2766e523488e933cd70dfdf080",
-      "crates/prototype/tests/learning_governance.rs": "71dc46cd49cc12e82d598091e9f93f99312018abd0fe5b02f43028c6312d721b",
+      "crates/prototype/tests/learning_governance.rs": "77f55dd95f46f3d763cb87a749db76b1ee40f23e01a5025714530a1868c7e58b",
       "crates/prototype/tests/learning_governance_faults.rs": "d1c26308aeab0b7dfa4034388b3b33b3fb0c264d03d4d77a818db194fb7fb334",
       "crates/prototype/tests/learning_governance_init.rs": "806b0fa099f3a255702e45db5fd52adbe7ce12d29cc18fbdde4bc6f6e03228f5",
       "crates/prototype/tests/learning_native_driver.rs": "aabbd6205ac4e5d9bba837838006230481610a39e76e0b6f3b0e2eb38ca8942a",
       "crates/prototype/tests/learning_native_history.rs": "abd5550dbc9d2530a2f85c8aad2d8bf1fd81f6c54397113bff6e5c07c6d43d32",
       "crates/prototype/tests/learning_native_producer.rs": "5c22ddc87d20e3cb4fc6c724cbc40de687de25cf867bac0679fd224b61a5bf5d",
-      "crates/prototype/tests/learning_native_session.rs": "d252ae1f45413ab1444022ca65dc8ef12b8746a2ad046c4ce139eb6eae2a4d7a",
+      "crates/prototype/tests/learning_native_session.rs": "ee3a9ae536c7704faf2776463c2969d2312cd66c7ad9b837902b5298a2ac34cc",
       "crates/prototype/tests/learning_replay_bounded.rs": "10514bb8f02914e456d5f73484b48690912ba286340c82c251684a8fdd625168",
       "crates/prototype/tests/learning_replay_schemas.rs": "7d8ccb08db479b17e79ec6337336443e2db40eb2e8ddba92f4c81acc3a648c6b",
       "crates/prototype/tests/learning_replay_target.rs": "175a9e411e6c4d6b163b4c1f35c6c92809837d751eb4ce7fe90ebf5c0112bf2b",
@@ -615,10 +634,13 @@
       "docs/implementation/v15-source-summary.md": "80ce6de733825a5884dd286c00664dbfdb7c8c506d503377d546bc97edaff026",
       "docs/implementation/v15-until-pass-tracker.md": "6e849e9de2ea21a2ed10d9650bed30e7b02850f395f13d4b5547060009d02f0a",
       "docs/implementation/v16-a01-a16-progress-20261107.md": "47e6c5b4a07002775a3e9bd66642133c3e4f63d1a19848fbfffd248b109eba79",
+      "docs/implementation/v16-a01-a16-progress-20261108-r2.md": "64297c087a5684df56e32308f978daa5fe6a60ce8a1f365f744259266850f22c",
+      "docs/implementation/v16-a01-a16-progress-20261108-r3.md": "eee3b3d8118dce58682990114b44106f247637701db7152ee4ad96b8d33ab393",
+      "docs/implementation/v16-a01-a16-progress-20261108-r4.md": "30f45477bb0a6a158bf577f4e3a2ada2110490d93398f718380f9984bad6f5bf",
       "docs/implementation/v16-a01-a16-progress-20261108.md": "b93b1e3458e7088061a6997e305c6e1e355337b2b825244f50dceedaf5df8fb5",
-      "docs/implementation/v16-reintegration-summary.md": "b720cf35fa1618a9d73ae33f490f9f1d0e8dbad458890fb4d9ef74cf0c7ed481",
+      "docs/implementation/v16-reintegration-summary.md": "b2250aaf540a073b575e5914f940c0182c90b4744c2623821de892db501d59d1",
       "docs/implementation/v16-source-baseline.json": "c83c728b6a68e27bd73ddaceea88f12149271a217b59f0a01dfa849f0371b80b",
-      "docs/implementation/v16-source-summary.md": "d22df57214888705424482b6e32af5693e5900b633e4208830e53ba5ce2492a2",
+      "docs/implementation/v16-source-summary.md": "513d361d2976fc7dbe26171e135e7d81f36a7cf2aa8eefed782bebd23786e348",
       "docs/implementation/v16-verification.json": "2c4c1212233bb1092b73b1cae558db94c5436e05c4b6be6e9cac9ce09e35c988",
       "docs/implementation/wayland-foundation.md": "05ceaf322df6adbdff94172582679d111ea71ad6c0387fae2d1b96f1cf5cb7f0",
       "docs/implementation/wayland-shm.md": "03fb3ee823a10a4dd9c2b40334c34af9e73e8f1d6a3ee000aa2f437298cced10",
@@ -686,7 +708,7 @@
       "kernel/src/domain_platform/replay.rs": "6c0ec6b0d108dd95b294e8235d3f6527ee1a69e572d142b2a0d37a45f6d0b2dd",
       "kernel/src/domain_platform/replay_irq_image.rs": "1e68f876dcb207bbf93c120f3afe4d2a595143db55f73987055ca81cf04eef5d",
       "kernel/src/domain_platform/replay_sources.rs": "cf5872fc10d07fc80975905538fb567d914a5bcab8e862176c07b65dc1a8604d",
-      "kernel/src/domain_services.rs": "2e0dfa783cef46bf7d662958be6afec241d63c9927e5e16289035bb93c08e816",
+      "kernel/src/domain_services.rs": "cb6752026f6f395b99903d4a71665908c5d3702c74d29e56f1c05d638ed81b31",
       "kernel/src/domain_services/console_baseline.rs": "b49a5e9c9059a4463bdd9c4fe8429c7b0fc3c019e522a273fcb6002ace61d80f",
       "kernel/src/domain_services/replay.rs": "af651cf06999cc8eb337f9f04a5328b40a5b02ab57bd7eea9d665a18fdfcd32c",
       "kernel/src/domain_services/replay_core_image.rs": "eae2219bde55d84e929745d2cb4b2cb5d2332a8df7973c791cbbe57e5cb26c67",
@@ -913,6 +935,7 @@
       "tests/host/active_scope_harness.rs": "fa7266a85a55adcb12084c167b70c0644e5e3bbf0afd1b8dfb329b4e3fc11cd5",
       "tests/host/active_selection_harness.rs": "8029cf9dea61c085e51aeff21f43e8625af7e218f51dc158871a3af4efd6f840",
       "tests/host/active_spawn_publication_harness.rs": "faa4e81a033c44a587864c898d3d2c257266bd2bac3160f850d04b63a16ccf2c",
+      "tests/host/background_maintenance_harness.rs": "ff4dff0b8cf324454c2a61f1014c7a7899206d662f564b2f88950b820e14301a",
       "tests/host/baseline_activation_priority_harness.rs": "feca094217f3725cb1f3b226eed6038128a01fa0c6918c2fc12629e63e3291ad",
       "tests/host/baseline_progress_harness.rs": "cf673ec1c33528110c2c1754f9e4f48d8fcb402c7474c9e6004be9a59e142e8a",
       "tests/host/boot_model_harness.rs": "c0c336c6356e180a4e1e32af29f677dab8c9701b843818e38e123cd95ea6a29b",
@@ -980,6 +1003,7 @@
       "tests/host/test_active_spawn_publication.py": "7d5a990377552ec2bf99b2b5ac73d7e65a33b2adcf5080d4c035e7af682126d7",
       "tests/host/test_ai_system.py": "1e68f651ff0cdeafa2c6b096b41ebac94d48bd6a1fd14ebfc518a48d89860a3f",
       "tests/host/test_artifact_store.py": "913a655f04c3776f9f5b03c2bacd9a279b15e3fa0b174c750b3c846ff223d2e2",
+      "tests/host/test_background_maintenance_progress.py": "0b6d37471b015d1a9b6cffdf94cfe39134b46bfbb861d4366a463355c87a45b2",
       "tests/host/test_baseline_activation_priority.py": "0d1933991630bfdfa2ccc4b079232fed97ee653f1ed95e3605fbd12ccde28c5f",
       "tests/host/test_baseline_progress.py": "815d6c072aea1e4beb6e6f9150715a4eac2e6f17ab288d3dffdf3f5f5b1fbd93",
       "tests/host/test_build_sysroot.py": "b42176e7f4bc0ff83d0e7034f3c32e57a95c014dd244d90bc5ddecfdcf6abb7e",
@@ -1158,7 +1182,7 @@
       "tools/check_prototype_evidence.py": "da6a9ffde9376ae8878f11d594c8ce2fb8049bd1af3f835589bf9022c59b3525",
       "tools/check_v13_boot_disk.py": "9d9ee49494abdba18829397bfb81c0f05acc5b4edc135f4d9b8ea9c1e5149c1c",
       "tools/check_v13_disk.py": "81d4de76b78958df82a1375de11d836552f71b49679c17d4f2f5147a920d4a01",
-      "tools/check_v13_evidence.py": "f7df549149ccdf6825c2444a9066b1e52226f6655fefaf4a9e465043867a84b3",
+      "tools/check_v13_evidence.py": "e5280a247d17bf3bb6fda0feb2ea09e0b42db6e096b9ac5845ca4471b5edefb3",
       "tools/check_v13_fault_disk.py": "e8568feaf4b35f186e036e25aa2628206de7b36cf4e09f631d27fd2c12f0c771",
       "tools/check_v13_filesystem.py": "ab65f1b16893fad6729a8b6f765c5826ae5a781770cc55f7b2100c6b999e32bf",
       "tools/check_v13_preparation_stack.py": "d655ab01ccb0ee79d25431351c506c0d0a65df9df9407afc4b655e24149a3c51",
@@ -1181,14 +1205,17 @@
       "tools/discovery_capture.py": "71f501ef19e95f3f80e79c11317f2ce11e96e00cb07debb8d765af93f708ddae",
       "tools/doctor.py": "73522fc7df9b99698f9c398d534304d6569cf2bd840e95dd378d6a0d78005c68",
       "tools/enroll_v13_a02.py": "54abdec5a975f0a2c1d4b1424167f11ae25cf102f5368fb39a20a46c73679d04",
-      "tools/enroll_v15_a.py": "016ea76939216f760af4efe7d8552aa13a581f562318d6c9457e96215b8781f7",
+      "tools/enroll_v15_a.py": "bf83966a607025d00581a3f3044ee17fbe69acd30b33d245fceaf32a8aa6ba9e",
+      "tools/fixtures/v16_a12/README.md": "ee561ab6fa9aeadef6411109bf4b21e32e32e75a7a36e9e71451ea3a535f4288",
+      "tools/fixtures/v16_a12/application.bin": "6b70e4ac6020060e6b14d02c314001656722e7855a007f8acd8b627ea161db01",
+      "tools/fixtures/v16_a12/local.bin": "97d011e3aa5f6713d0ea9c0a01d7465be4fcd0a3d1b6e40d450a63ea883d21bd",
       "tools/graphics.py": "6ff03149755ad4459ba1468ea67506e37062b1c8f7b65cfe17304b8bc778f966",
       "tools/host_prototype_library.py": "023b08ae7197136d24d5a80207b8d4f368619dff81b3e5221296fa4a946d92fe",
       "tools/memory_v15_client.py": "f4f00893e32646381a641ed167fe368234a7101f73a2816ec2ba69a67892f85f",
       "tools/memory_v15_custody.py": "cceed2f829865c99da88b5bb4f7802e7d74183308ff30dace0daf2a1149cf195",
       "tools/port_smithay_dynamic.py": "3d5380ea364ee47b2ead4af50af3709da2229d01c822f9806b132de9867c85dc",
       "tools/prepare_host_tests.py": "85a3c40fc0a3ba1d2ff8089d737c1832aa1d72f7cc89119b603551a5ae7d2526",
-      "tools/prototype.py": "47416c197869fcc673929c0293729b15dc052c3b12a37c16507bf334e22205b1",
+      "tools/prototype.py": "c0b8eae46c4c3938ddd176ef1072164147d37519ef416326836b10242a1e56b7",
       "tools/publication_cost.py": "e6a1a7502d1c149d2c86ef77d034005e0c2fe423dcd42408f0b8e2fa9482954d",
       "tools/qemu/README.md": "90de12560dee983693343b4ae52ad7e659c1e6efc3e3bea4c394ff9b2697d976",
       "tools/qemu/cyxia-per-vcpu-pmu.patch": "b92d2ce14bca13cae43338729de3226c1ad9f469dc9947e1bd5c465d753876fd",
@@ -1252,6 +1279,9 @@
       "tools/test_v14_workstreams.py": "c4221e998c7de160aecd2bc15e69569ecca0d3b092d400d51b0db59c4b51da0d",
       "tools/test_v15_register_recorder.py": "559d26f6d7a43c58e7fb66e0b8bad0ca9af227510484bfbe9cb712b5c82dd603",
       "tools/test_v15_snapshot.py": "d90ceb675f950d9983e7825ae1b5dac01057c7850fcbd3199729dab86f90d4a0",
+      "tools/test_v16_a12_dispatch.py": "5fc3969172e0c75023123e8ba7b8abd83b505b58870d331d6d203e073c2e8edc",
+      "tools/test_v16_a12_local.py": "8a4826c5bf245f202a5d5db09c772fa91d0d8aa41155ad79d9bc201580689db5",
+      "tools/test_v16_a12_outer.py": "e41b7bbf179d7a2507f1ff3a32191f662bbb8a190b3a5cb4f86106df2cdccd26",
       "tools/test_verify_domains.py": "139642f0b8595ede83746d5f5ab79ec2db87b83358c7ba5367ca4020d8a91669",
       "tools/test_verify_unified_capture.py": "ffe5e9b4c0aeb36536eea6f6d20557c229c11989aebc968f414a3655d5c21190",
       "tools/test_verify_v13_a10_matrix.py": "1922d7b6ef1642fdc2af5ca583d8f08497f42871e55107aed3873fb98747b31d",
@@ -1273,6 +1303,8 @@
       "tools/v13_a10_native_capture.py": "55882786f7b57d33671213059b57ca0bdc08fa112376a346017f43d248ff868f",
       "tools/v13_fault_disk.py": "b4401074edc97edaac941e3dc4b6d1683b2ac591b107d1c79238cdd679c5113f",
       "tools/v14_workstreams.py": "ebd67d9abe0adb1aa548274746584bbcee22873b4d371eaff238512023ea1c90",
+      "tools/v16_a12_local.py": "da3e8b8ccc76e59edaa9e32b4b5ee9c115fcb4796d391d9a3a8a0fc9b1118cd4",
+      "tools/v16_a12_pair.py": "cdb1428c996da6d90c15f1d479816523e30a8bb9aca089982f5c741db8f989a2",
       "tools/verify_ai_accounting.py": "4cb6bd6cd88395f50d41065af8bf20fa8eb7968336fcb098c4644efbc77ba718",
       "tools/verify_ai_control.py": "0a6b1a25cf22f95711aa73f6a33a964cab249de0a19c155f4fba28970eb02499",
       "tools/verify_ai_system.py": "f52f1e2970575f47b9f8c0a7469289f8b500d32bd233a88bedb7cea8da2e774e",
@@ -1337,6 +1369,7 @@
       "tools/verify_v15_memory.py": "e9ae6aa49bba6021201b0ce9ef032aba26e07e2ccf662a7b49ca5e9249423835",
       "tools/verify_v15_ownership.py": "1b08ca78fc7e5eed2bd41d05210e025d953cf5d4bc535d62cd2d52b76caf1794",
       "tools/verify_v15_registers.py": "6ddb91b2413797a417471e119993a0ca1f17c545c65531e0fdd2f5c72c642de1",
+      "tools/verify_v16_a12.py": "fcbcec047e1a948f63776aa139dfc56c4529e5e6e89cd856cde05f174461d5fe",
       "tools/verify_wayland.py": "3be74ea3e3ecd071783bb8ee5d8fec4c8be3ff2ed21ba89e0374c94ce08f5c3f",
       "tools/verify_wayland_shm.py": "1ede61dd84b267b63fdf59d24d8738ca165b4bb693baebaeb937efc1e6f5491b",
       "tools/verify_x11.py": "68eec017c4919dc9217006c9e63b79da6c68c202edc450471712051e9e451f17",
@@ -1440,7 +1473,7 @@
       "user/prototype-cluster/tests/support/reconnect_checks.rs": "ef7d0d1ace94d94f31fd1db02b62d53bc732c08dac7bda88e0f6381ca15ca184",
       "user/prototype-cluster/tests/support/recovery_checks.rs": "570028b2087894a8cf937a2e71b6fd913cd7fbafb458d7c6f1aa0668dc06bb32",
       "user/prototype-cluster/tests/support/resend_checks.rs": "8ee0844d17872d6a707c74ed1c996b7f24b0c5551d86b41d2ea2e33e8cca42eb",
-      "user/prototype-cluster/tests/support/runtime_session_host.rs": "dbf609775e862f04ddb94e67991f3a0a20b7bbd9750543148c5bfb2af34a3e2e",
+      "user/prototype-cluster/tests/support/runtime_session_host.rs": "2b0e1abd9a807676b1d16a7d2ef25fe23026f152fec3dc435c4e44f983dc8ad1",
       "user/prototype-cluster/tools/build.sh": "1274d71410099526e14c6f26cf08499ad5064ed5d7769d2f53ecf2ff4d40226f",
       "user/prototype-cluster/tools/provision.py": "1e531d1e5b3ba16033d6a241970ffc5870ed067897dbb4cfe85222ca795941db",
       "user/prototype-cluster/tools/provision_billing.py": "b674d9908e3a7eb0f19c44fad14b04a8d310cc7bc585b5c510b44322b86a0232",
@@ -1869,378 +1902,181 @@
   },
   "current_verification": {
     "engineering_status": "FAIL",
+    "engineering_reason": "434 Python tool tests pass. Earlier Rust/scoped checks retain their original identities; broad strict Clippy/full-cluster format failures and incomplete acceptance persist. No whole-branch PASS.",
     "checks": [
       {
-        "id": "prototype-default-main",
-        "kind": "functional_host",
+        "id": "r4-python-tools-434",
         "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-tests.json",
-          "sha256": "4fe0ef47536f7ebb63944cca92ed0ecdb9c312b867c2019fa8d4d0e22fb24b76"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "c84a3e8e1b8d01f7e7f09d2fc5de3a7ea9a88eef11947a82a5288e4a503fc5dd",
+        "execution_compiled_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
         "argv": [
-          "/Users/robin/.cargo/bin/cargo",
+          "python3",
+          "-B",
+          "tools/prototype.py",
           "test",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/Cargo.toml",
-          "-p",
-          "cyxia-prototype",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target",
-          "--target",
-          "aarch64-apple-darwin"
+          "--lane",
+          "tools",
+          "--output",
+          "artifacts/v016-progress-20261108-r4/tools-final"
         ],
         "returncode": 0,
-        "elapsed_seconds": 86.67176541601657,
+        "elapsed_seconds": 27.834843,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/tools-final-execution.json",
+            "sha256": "5d9ccafad248cbe74e4939b4717004056ec882b0eadef06d4509f7c20f37569d"
+          }
+        ],
+        "association_scope": "Final report executed on this exact source binding; earlier three runs differ only in four documentation paths, proven in final-source-tool-delta.json.",
+        "returncode_meaning": "successful independent command",
         "counts": {
-          "run": 599,
-          "passed": 599,
+          "run": 434,
+          "passed": 434,
           "failed": 0,
-          "ignored": 0
-        },
-        "log": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-tests.log",
-          "sha256": "4e5ea88c85a244d9664498a11634d9d1a5da4962c11def33f572b887a22c5acf"
-        },
-        "before_after_source_proof": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/source-after.json",
-          "sha256": "fbfed566d5daca717b09ee013c7be05868b83ab13fe3afa930b026ab47d95748"
-        },
-        "new_four_sgd_regressions_included": true,
-        "not_additive_with": [
-          "prototype-default-main",
-          "prototype-cluster-engine-main"
-        ],
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-tests.json",
-            "sha256": "4fe0ef47536f7ebb63944cca92ed0ecdb9c312b867c2019fa8d4d0e22fb24b76"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-tests.log",
-            "sha256": "4e5ea88c85a244d9664498a11634d9d1a5da4962c11def33f572b887a22c5acf"
-          }
-        ]
+          "skipped": 0
+        }
       },
       {
-        "id": "prototype-cluster-engine-main",
-        "kind": "functional_host",
+        "id": "r4-A12-fixed-native-raw-replay",
         "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-tests.json",
-          "sha256": "838285d2f2b6b4b97d29e5ce3c8bfcbfd97133e007a8dc0ced570f76fdfabcf2"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "c84a3e8e1b8d01f7e7f09d2fc5de3a7ea9a88eef11947a82a5288e4a503fc5dd",
+        "execution_compiled_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
         "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "test",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/Cargo.toml",
-          "-p",
-          "cyxia-prototype",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target",
-          "--target",
-          "aarch64-apple-darwin",
-          "--features",
-          "cluster-engine"
+          "python3",
+          "-B",
+          "tools/verify_v16_a12.py",
+          "--source-root",
+          "/Users/robin/CyxiaOS-V0.16",
+          "--build-manifest",
+          "artifacts/v016-progress-20261108-r2/builds/normal-c4/build-manifest.json",
+          "--formatter",
+          "target/source-58a44230007c9e89dd99b0d87a17a8c38d9cc875977747106ba3c1d4f1f09208/aarch64-apple-darwin/debug/examples/prototype-disk",
+          "--qemu-source",
+          "/private/tmp/cyxia-v015-qemu-exact-20261106",
+          "--capture",
+          "artifacts/v016-progress-20261108-r4/c4-fast-02",
+          "--output",
+          "artifacts/v016-progress-20261108-r4/a12-native-verified"
         ],
         "returncode": 0,
-        "elapsed_seconds": 124.82230900001014,
-        "counts": {
-          "run": 620,
-          "passed": 620,
-          "failed": 0,
-          "ignored": 0
-        },
-        "log": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-tests.log",
-          "sha256": "60b61bf6fa2cb6fc6e9860eff8f25a4a84435336d5b8e67488c814c068cb1458"
-        },
-        "before_after_source_proof": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/source-after.json",
-          "sha256": "fbfed566d5daca717b09ee013c7be05868b83ab13fe3afa930b026ab47d95748"
-        },
-        "new_four_sgd_regressions_included": true,
-        "not_additive_with": [
-          "prototype-default-main",
-          "prototype-cluster-engine-main"
-        ],
+        "elapsed_seconds": 4.454495,
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-tests.json",
-            "sha256": "838285d2f2b6b4b97d29e5ce3c8bfcbfd97133e007a8dc0ced570f76fdfabcf2"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-tests.log",
-            "sha256": "60b61bf6fa2cb6fc6e9860eff8f25a4a84435336d5b8e67488c814c068cb1458"
+            "path": "artifacts/v016-progress-20261108-r4/a12-verified-issue-execution.json",
+            "sha256": "c474ebdcb0d8ea059512e01a418601ba811fbdb336bb8e14cf828fa6dca700aa"
           }
-        ]
+        ],
+        "association_scope": "Final report executed on this exact source binding; earlier three runs differ only in four documentation paths, proven in final-source-tool-delta.json.",
+        "returncode_meaning": "successful independent command"
       },
       {
-        "id": "prototype-default-strict-clippy",
-        "kind": "strict_lint",
+        "id": "r4-native-catalogue-enrollment",
         "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-scoped-clippy.json",
-          "sha256": "1521a532633ff54f7034454331f4f5cc03dc953520f5c920e3eb3d98342dbb01"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "c84a3e8e1b8d01f7e7f09d2fc5de3a7ea9a88eef11947a82a5288e4a503fc5dd",
+        "execution_compiled_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
         "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "clippy",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/Cargo.toml",
-          "-p",
-          "cyxia-prototype",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target",
-          "--target",
-          "aarch64-apple-darwin",
-          "--lib",
-          "--test",
-          "learning_rounding",
-          "--",
-          "-D",
-          "warnings"
+          "python3",
+          "-B",
+          "tools/enroll_v15_a.py",
+          "--manifest",
+          "artifacts/v016-progress-20261108-r2/run-catalogue-c4-current-a01-a02-a09.json",
+          "--case",
+          "A12",
+          "--receipt",
+          "artifacts/v016-progress-20261108-r4/a12-native-verified/summary.json",
+          "--source-root",
+          "/Users/robin/CyxiaOS-V0.16",
+          "--qemu-source",
+          "/private/tmp/cyxia-v015-qemu-exact-20261106",
+          "--a09-build",
+          "artifacts/v016-progress-20261108-r2/builds/memory-c4",
+          "--a12-build-manifest",
+          "artifacts/v016-progress-20261108-r2/builds/normal-c4/build-manifest.json",
+          "--a12-formatter",
+          "target/source-58a44230007c9e89dd99b0d87a17a8c38d9cc875977747106ba3c1d4f1f09208/aarch64-apple-darwin/debug/examples/prototype-disk",
+          "--output",
+          "artifacts/v016-progress-20261108-r4/run-catalogue-c4-a01-a02-a09-a12.json"
         ],
         "returncode": 0,
-        "elapsed_seconds": 0.1297531249874737,
-        "scope": "--lib --test learning_rounding; -D warnings; default",
-        "log": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-scoped-clippy.log",
-          "sha256": "8223fddeaf318d66e971ac43a46a8132875ec62592f25b0bf4c61a183fdecf9e"
-        },
-        "lint_rules_relaxed": false,
+        "elapsed_seconds": 15.307384,
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-scoped-clippy.json",
-            "sha256": "1521a532633ff54f7034454331f4f5cc03dc953520f5c920e3eb3d98342dbb01"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-scoped-clippy.log",
-            "sha256": "8223fddeaf318d66e971ac43a46a8132875ec62592f25b0bf4c61a183fdecf9e"
+            "path": "artifacts/v016-progress-20261108-r4/a12-enroll-execution.json",
+            "sha256": "95a7914a4cb693ee7e57f4bfff57d7a0c722d9b7dfb3adf235d5b1b7495b16a9"
           }
-        ]
+        ],
+        "association_scope": "Final report executed on this exact source binding; earlier three runs differ only in four documentation paths, proven in final-source-tool-delta.json.",
+        "returncode_meaning": "successful independent command"
       },
       {
-        "id": "prototype-cluster-engine-strict-clippy",
-        "kind": "strict_lint",
-        "status": "FAIL",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-scoped-clippy.json",
-          "sha256": "a25fb6e94c3f18f4e6d493244b0db4d5dbfa64a1817377e042dbdadd6c602525"
-        },
-        "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "clippy",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/Cargo.toml",
-          "-p",
-          "cyxia-prototype",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target",
-          "--target",
-          "aarch64-apple-darwin",
-          "--lib",
-          "--test",
-          "learning_rounding",
-          "--features",
-          "cluster-engine",
-          "--",
-          "-D",
-          "warnings"
-        ],
-        "returncode": 101,
-        "elapsed_seconds": 1.9100472090067342,
-        "scope": "--lib --test learning_rounding; -D warnings; cluster-engine",
-        "log": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-scoped-clippy.log",
-          "sha256": "7d557302c1b93641eed8e1d50c552f38814cfaea974e4e82e14b66998df90e9a"
-        },
-        "lint_rules_relaxed": false,
-        "failure_classification": "PREEXISTING_UNCHANGED_FEATURE_LIBRARY_LINTS",
-        "observed_findings": [
-          {
-            "path": "crates/prototype/src/cluster/engine.rs",
-            "line": 887,
-            "lint": "collapsible_if"
-          },
-          {
-            "path": "crates/prototype/src/cluster/engine.rs",
-            "line": 1205,
-            "lint": "nonminimal_bool"
-          }
-        ],
-        "preexisting_source_identity_proof": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/preexisting-lint-source-identity.json",
-          "sha256": "6b9908e374d2849f0f156e8da0fcce82a44e8d82f22858c41107dcdc0b5ed362"
-        },
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-scoped-clippy.json",
-            "sha256": "a25fb6e94c3f18f4e6d493244b0db4d5dbfa64a1817377e042dbdadd6c602525"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/cluster-engine-scoped-clippy.log",
-            "sha256": "7d557302c1b93641eed8e1d50c552f38814cfaea974e4e82e14b66998df90e9a"
-          }
-        ]
-      },
-      {
-        "id": "prototype-all-targets-supplemental-attempt",
-        "kind": "supplemental_strict_lint",
-        "status": "FAIL",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-clippy.json",
-          "sha256": "f356c8a9e10bad28e1894f9d6ef9814e5884abfe7128336042c006d49bcd0c72"
-        },
-        "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "clippy",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/Cargo.toml",
-          "-p",
-          "cyxia-prototype",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target",
-          "--target",
-          "aarch64-apple-darwin",
-          "--all-targets",
-          "--",
-          "-D",
-          "warnings"
-        ],
-        "returncode": 101,
-        "elapsed_seconds": 0.39034562499728054,
-        "scope": "Extra --all-targets -D warnings attempt; retained separately from appropriate lib/newtest scope",
-        "log": {
-          "path": "artifacts/v016-progress-20261108/model-main-verification/default-clippy.log",
-          "sha256": "a9129077ac80a351d67104e175fa229e14cf7ad65996592030650ec9bdad8f60"
-        },
-        "failure_classification": "PREEXISTING_UNCHANGED_EXAMPLE_LINT",
-        "observed_findings": [
-          {
-            "path": "crates/prototype/examples/verify-ownership-evidence.rs",
-            "line": 165,
-            "lint": "manual_is_multiple_of"
-          }
-        ],
-        "findings_are_exhaustive": false,
-        "source_or_rule_changes": false,
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-clippy.json",
-            "sha256": "f356c8a9e10bad28e1894f9d6ef9814e5884abfe7128336042c006d49bcd0c72"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/model-main-verification/default-clippy.log",
-            "sha256": "a9129077ac80a351d67104e175fa229e14cf7ad65996592030650ec9bdad8f60"
-          }
-        ]
-      },
-      {
-        "id": "tools-cache-fixed-complete-main",
-        "kind": "tools",
+        "id": "r4-final-report-independent-replay",
         "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX2",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/cache-fixed-gates-summary.json",
-          "sha256": "3f12cca04fb4d9852d0626af08313f1618c79104d1afdc1c95e625bd8e3219fc"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_compiled_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
         "argv": [
-          "/opt/homebrew/opt/python@3.15/bin/python3.15",
+          "python3",
+          "-B",
+          "tools/prototype.py",
+          "report",
+          "--scope",
+          "A",
+          "--source-root",
+          "/Users/robin/CyxiaOS-V0.16",
+          "--manifest",
+          "artifacts/v016-progress-20261108-r4/run-catalogue-c4-a01-a02-a09-a12.json",
+          "--qemu-source",
+          "/private/tmp/cyxia-v015-qemu-exact-20261106",
+          "--a09-build",
+          "artifacts/v016-progress-20261108-r2/builds/memory-c4",
+          "--a12-build-manifest",
+          "artifacts/v016-progress-20261108-r2/builds/normal-c4/build-manifest.json",
+          "--a12-formatter",
+          "target/source-58a44230007c9e89dd99b0d87a17a8c38d9cc875977747106ba3c1d4f1f09208/aarch64-apple-darwin/debug/examples/prototype-disk",
+          "--output",
+          "artifacts/v016-progress-20261108-r4/report-final-c4-a.json"
+        ],
+        "returncode": 2,
+        "elapsed_seconds": 14.677107,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+            "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
+          }
+        ],
+        "association_scope": "Final report executed on this exact source binding; earlier three runs differ only in four documentation paths, proven in final-source-tool-delta.json.",
+        "returncode_meaning": "2 means valid catalogue with incomplete A/release; it is not a native PASS failure"
+      },
+      {
+        "id": "r4-final-source-workflow-inline",
+        "status": "PASS",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "argv": [
+          "python3",
+          "-B",
+          "/private/tmp/cyxia-v016-r4-workflow-inline-check.py"
+        ],
+        "returncode": 0,
+        "elapsed_seconds": 0.584317,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/workflow-final-execution.json",
+            "sha256": "e0acbd54f0c524e13ca0b36621d7db6b1e29bc253133d837c887dd925d2737a7"
+          }
+        ],
+        "scope": "Actual final worktree check; complete clean committed-tree CI job has not run."
+      },
+      {
+        "id": "r4-historical-provenance-tests",
+        "status": "PASS",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "argv": [
+          "python3",
           "-B",
           "-m",
           "unittest",
@@ -2248,911 +2084,432 @@
           "-s",
           "tools",
           "-p",
-          "test_*.py"
-        ],
-        "caller_argv": [
-          "python3",
-          "-B",
-          "/Users/robin/CyxiaOS-V0.16/tools/prototype.py",
-          "test",
-          "--lane",
-          "tools",
-          "--output",
-          "/private/tmp/cyxia-v016-20261108/control-storage/cache-fixed-gates-01/tools"
+          "test_v15_snapshot.py",
+          "-v"
         ],
         "returncode": 0,
-        "returncode_basis": "Complete prototype test step reports PASS and unittest run completed",
-        "counts": {
-          "run": 382,
-          "passed": 382,
-          "failed": 0,
-          "errors": 0,
-          "skipped": 0
-        },
-        "test_seconds": 25.976,
-        "step_elapsed_seconds": 26.273,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/tools/01-tools.log",
-          "sha256": "d23ab3d173db18f7bb8906658b24338a20ba95f24a8e5e3a77ec950188cbcf49"
-        },
-        "includes_real_cargo_cache_five_tests_once": true,
-        "before_after_source_proof": {
-          "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/execution-source-after.json",
-          "sha256": "a227c00d9fe74596a2ae9d8b07fdcdb55396bc0f32c47fd96699af9d4bb9bd1f"
-        },
+        "elapsed_seconds": 0.06613,
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/cache-fixed-gates-summary.json",
-            "sha256": "3f12cca04fb4d9852d0626af08313f1618c79104d1afdc1c95e625bd8e3219fc"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/tools/01-tools.log",
-            "sha256": "d23ab3d173db18f7bb8906658b24338a20ba95f24a8e5e3a77ec950188cbcf49"
+            "path": "artifacts/v016-progress-20261108-r4/historical-final-execution.json",
+            "sha256": "25c43a327584793a229587f28645fcee52b7551a9303b79e74dd2c679920c630"
           }
-        ]
-      },
-      {
-        "id": "builder-host-cache-fixed-main",
-        "kind": "host",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX2",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/build-host-result.json",
-          "sha256": "d9d962213e1782367672e4ab16401ca0870d6c6b9958c4406f832c83825785a5"
-        },
-        "argv": [
-          "/opt/homebrew/opt/python@3.15/bin/python3.15",
-          "-B",
-          "/private/tmp/cyxia-v016-20261108/control-storage/cache-fixed-gates-01/run_build_host.py"
         ],
-        "returncode": null,
-        "returncode_note": "Raw JSON stores unittest PASS/counts, not the child process exit field; no new execution is inferred",
-        "counts": {
-          "run": 8,
-          "passed": 8,
-          "failed": 0,
-          "errors": 0,
-          "skipped": 0
-        },
-        "elapsed_seconds": 0.232158708,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/build-host.log",
-          "sha256": "917b845b0154e85849504f39f88b4d46a6eb3359504918f2516dfcd2be323fe4"
-        },
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/build-host-result.json",
-            "sha256": "d9d962213e1782367672e4ab16401ca0870d6c6b9958c4406f832c83825785a5"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-cache-fixed-gates-01/build-host.log",
-            "sha256": "917b845b0154e85849504f39f88b4d46a6eb3359504918f2516dfcd2be323fe4"
-          }
-        ]
+        "scope": "Actual final worktree check; complete clean committed-tree CI job has not run."
       },
       {
-        "id": "static-format",
-        "kind": "static",
+        "id": "r4-final-diff-check",
         "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": null,
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-          "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "execution_source_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
         "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "fmt",
-          "--all",
-          "--",
+          "git",
+          "diff",
           "--check"
         ],
         "returncode": 0,
-        "elapsed_seconds": 1.713,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/main-static/01-format.log",
-          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        },
-        "execution_scope_note": "Actual main4-step static wrapper; controller frozen compiledC2 context. Wrapper does not itself carry a fullGit snapshot, so no fabricated SX1/SX2 capture-time full-map assertion. Subsequent cache changes affect only3 Python tool/test files, not compiledC2.",
-        "not_equivalent_to": "Feature-library or all-targets strict Clippy; their FAIL results remain separate",
+        "elapsed_seconds": 0.02811,
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-            "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/01-format.log",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "path": "artifacts/v016-progress-20261108-r4/diff-final-execution.json",
+            "sha256": "0a47c5071a89afdf91baff596aeda8b4e1d8a262a4e0bbbdb3b305ab37b2f26f"
           }
-        ]
-      },
-      {
-        "id": "static-governance-format",
-        "kind": "static",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": null,
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-          "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-        },
-        "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "fmt",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
-          "--",
-          "--check"
         ],
-        "returncode": 0,
-        "elapsed_seconds": 0.069,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/main-static/02-governance-format.log",
-          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        },
-        "execution_scope_note": "Actual main4-step static wrapper; controller frozen compiledC2 context. Wrapper does not itself carry a fullGit snapshot, so no fabricated SX1/SX2 capture-time full-map assertion. Subsequent cache changes affect only3 Python tool/test files, not compiledC2.",
-        "not_equivalent_to": "Feature-library or all-targets strict Clippy; their FAIL results remain separate",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-            "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/02-governance-format.log",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-          }
-        ]
-      },
-      {
-        "id": "static-clippy",
-        "kind": "static",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": null,
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-          "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-        },
-        "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "clippy",
-          "--locked",
-          "--offline",
-          "-p",
-          "cyxia-kernel",
-          "--target",
-          "aarch64-unknown-none-softfloat",
-          "--features",
-          "smp-selftest",
-          "--",
-          "-D",
-          "warnings"
-        ],
-        "returncode": 0,
-        "elapsed_seconds": 7.009,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/main-static/03-clippy.log",
-          "sha256": "353b25b10267ea9e489ecb22bf45fa595a2692f97bb892343d8b36dd4d645b66"
-        },
-        "execution_scope_note": "Actual main4-step static wrapper; controller frozen compiledC2 context. Wrapper does not itself carry a fullGit snapshot, so no fabricated SX1/SX2 capture-time full-map assertion. Subsequent cache changes affect only3 Python tool/test files, not compiledC2.",
-        "not_equivalent_to": "Feature-library or all-targets strict Clippy; their FAIL results remain separate",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-            "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/03-clippy.log",
-            "sha256": "353b25b10267ea9e489ecb22bf45fa595a2692f97bb892343d8b36dd4d645b66"
-          }
-        ]
-      },
-      {
-        "id": "static-governance-clippy",
-        "kind": "static",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": null,
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-          "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-        },
-        "argv": [
-          "/Users/robin/.cargo/bin/cargo",
-          "clippy",
-          "--locked",
-          "--offline",
-          "--manifest-path",
-          "/Users/robin/CyxiaOS-V0.16/user/prototype-governance/Cargo.toml",
-          "--target-dir",
-          "/Users/robin/CyxiaOS-V0.16/target/prototype-governance",
-          "--target",
-          "aarch64-unknown-none-softfloat",
-          "--",
-          "-D",
-          "warnings"
-        ],
-        "returncode": 0,
-        "elapsed_seconds": 2.312,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/main-static/04-governance-clippy.log",
-          "sha256": "2e74d5901fe36f7f2222f1308cdb0f443aed5485c5ef245c58e65a822dc1fd93"
-        },
-        "execution_scope_note": "Actual main4-step static wrapper; controller frozen compiledC2 context. Wrapper does not itself carry a fullGit snapshot, so no fabricated SX1/SX2 capture-time full-map assertion. Subsequent cache changes affect only3 Python tool/test files, not compiledC2.",
-        "not_equivalent_to": "Feature-library or all-targets strict Clippy; their FAIL results remain separate",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/summary.json",
-            "sha256": "a89daa6467f8a0dba2988b8a632d3961a22866e8618561c3cd2fb168980e78ee"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/main-static/04-governance-clippy.log",
-            "sha256": "2e74d5901fe36f7f2222f1308cdb0f443aed5485c5ef245c58e65a822dc1fd93"
-          }
-        ]
-      },
-      {
-        "id": "typed-cluster-journal-main-host25",
-        "kind": "host",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/retained-local/cluster-pair/actual-main-validation-01/main-validation.json",
-          "sha256": "2f6d1f4c9c93b478196af80fd5bbdb985db927e1b383a61a0dcc976cb5f4b4c4"
-        },
-        "argv": [
-          "python3",
-          "-B",
-          "-m",
-          "unittest",
-          "-v",
-          "test_native_cluster_journal",
-          "test_unified_proofs",
-          "test_unified_disk"
-        ],
-        "returncode": null,
-        "returncode_note": "Report and raw unittest log show PASS; process rc is not serialized in this report",
-        "counts": {
-          "run": 25,
-          "passed": 25,
-          "failed": 0,
-          "errors": 0,
-          "skipped": 0
-        },
-        "elapsed_seconds": 1.799,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/retained-local/cluster-pair/actual-main-validation-01/host25.log",
-          "sha256": "c7130b1323fba61ed7dd9591df95451947d0045f79eb1226ef8ddfbd1eb56883"
-        },
-        "source_before_after_unchanged": true,
-        "self_authored_report_is_independent_review": false,
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/retained-local/cluster-pair/actual-main-validation-01/main-validation.json",
-            "sha256": "2f6d1f4c9c93b478196af80fd5bbdb985db927e1b383a61a0dcc976cb5f4b4c4"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/retained-local/cluster-pair/actual-main-validation-01/host25.log",
-            "sha256": "c7130b1323fba61ed7dd9591df95451947d0045f79eb1226ef8ddfbd1eb56883"
-          }
-        ]
-      },
-      {
-        "id": "a10-relevant-host-original-121",
-        "kind": "host_attempt",
-        "status": "FAIL",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-result.json",
-          "sha256": "6358e6f6dd899cabc970e78410916c82ff1ae4fe2c758bedb8f1ad2e7edf0d0c"
-        },
-        "argv": [
-          "/opt/homebrew/opt/python@3.15/bin/python3.15",
-          "-B",
-          "/private/tmp/cyxia-v016-20261108/control-storage/main-gates-01/run_relevant_host.py"
-        ],
-        "returncode": 1,
-        "counts": {
-          "run": 121,
-          "passed": 120,
-          "failed": 0,
-          "errors": 1,
-          "skipped": 0
-        },
-        "elapsed_seconds": 95.77689875,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host.log",
-          "sha256": "99a432aa237beee7939e81821fc0d1f267ed34ece05f4ef8672f7825bafaaa53"
-        },
-        "failure_classification": "HARNESS_IMPORT_BEFORE_ONE_TEST_BODY",
-        "error_detail": "Custom /tmp runner omitted repository root from sys.path; tools.transport import failed before one test body.",
-        "original_verdict_preserved": true,
-        "followup_check": "a10-relevant-host-single-import-followup",
-        "source_or_assertions_changed": false,
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-result.json",
-            "sha256": "6358e6f6dd899cabc970e78410916c82ff1ae4fe2c758bedb8f1ad2e7edf0d0c"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host.log",
-            "sha256": "99a432aa237beee7939e81821fc0d1f267ed34ece05f4ef8672f7825bafaaa53"
-          }
-        ]
-      },
-      {
-        "id": "a10-relevant-host-single-import-followup",
-        "kind": "isolated_host_followup",
-        "status": "PASS",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "execution_snapshot_id": "SX1",
-        "compiled_source_scope": "C2",
-        "evidence_report": {
-          "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-import-followup.json",
-          "sha256": "536a967dbedfbb9f737f69b5ebe9c034aa5a3d3771cd4967042c20442c4ed847"
-        },
-        "argv": [
-          "/opt/homebrew/opt/python@3.15/bin/python3.15",
-          "-B",
-          "/private/tmp/cyxia-v016-20261108/control-storage/main-gates-01/run_import_followup.py"
-        ],
-        "returncode": 0,
-        "counts": {
-          "run": 1,
-          "passed": 1,
-          "failed": 0,
-          "errors": 0,
-          "skipped": 0
-        },
-        "elapsed_seconds": 0.095425167,
-        "log": {
-          "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-import-followup.log",
-          "sha256": "6504b112c7b178d0bcef539ee95617da500c0bf4aedd6ef773da12611b6c989a"
-        },
-        "follows": "a10-relevant-host-original-121",
-        "only_harness_sys_path_fixed": true,
-        "source_parser_assertions_changed": false,
-        "full_121_suite_rerun": false,
-        "original_suite_status_after_followup": "FAIL_PRESERVED",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-import-followup.json",
-            "sha256": "536a967dbedfbb9f737f69b5ebe9c034aa5a3d3771cd4967042c20442c4ed847"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/control-storage-main-gates-01/relevant-host-import-followup.log",
-            "sha256": "6504b112c7b178d0bcef539ee95617da500c0bf4aedd6ef773da12611b6c989a"
-          }
-        ]
+        "scope": "Actual final worktree check; complete clean committed-tree CI job has not run."
       }
     ],
     "native_runs": [
       {
         "id": "A01",
         "status": "PASS",
-        "scope": "native",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "binding_semantics": "Actual capture-time compiled/tool identity is retained. Independent receipt replay against the final sealed main source is complete and recorded separately; future metadata is not claimed as capture-time input.",
-        "capture_identity": {
-          "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c",
-          "source_root": "/Users/robin/CyxiaOS-V0.16",
-          "build_context": "artifacts/v016-progress-20261108/builds-current/normal"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "capture_compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "capture_execution_source_sha256": "1c711c430b5a401b99c0fc6d546224ad5b55fcae4707aa5ab0412326916788cd",
+        "original_capture_round": "R2 C4",
+        "new_native_capture_this_round": false,
+        "independent_status": "PASS",
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/a01-current-01/summary.json",
-            "sha256": "b500faeb941fe0d2087286b44c82c59d5a2d5c02af36d8f009010a73dbf90b9d"
+            "path": "artifacts/v016-progress-20261108-r2/a01-c4-02/summary.json",
+            "sha256": "d4471c1bc97214005b80ebc45e9117eb5af2a912e101e3a2c74db3d67f48bf96"
           },
           {
-            "path": "artifacts/v016-progress-20261108/a01-current-01-independent.json",
-            "sha256": "21a34545a93c0f56b5514c286f7f20802671b1f01aeacdd99b0c127343cbff87"
+            "path": "artifacts/v016-progress-20261108-r2/a01-c4-02-independent.json",
+            "sha256": "18d5d261e6b580ce4f4278f93bd27abb1b5d92eaf80d348e569c35231d52915c"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r2/formal-native-c4-execution-02.json",
+            "sha256": "44045de4d0748493af94243b1a94d458470e0d267796984cf3a2c3374a616230"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+            "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
           }
         ],
-        "native_execution_verified": true,
-        "runtime_truth_attested": false,
-        "final_source_replay": {
-          "status": "PASS",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-sealed-current-native-replay.json",
-              "sha256": "12e7e58e4e738ace8e683caea2030fb008266d0dafda2f4cd6c9c865fb6ddd09"
-            }
-          ],
-          "scope": "Actual fixed adapters replayed the current native receipt on sealed main source; A09 uses explicit caller-selected persistent memory build and all cases pinned QEMU source."
-        },
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        }
+        "association_scope": "R4 actual independent raw replay; current compiled inputs and original capture-bound tools unchanged. Historical execution identity is preserved, not relabelled a new capture."
       },
       {
         "id": "A02",
         "status": "PASS",
-        "scope": "native",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "binding_semantics": "Actual capture-time compiled/tool identity is retained. Independent receipt replay against the final sealed main source is complete and recorded separately; future metadata is not claimed as capture-time input.",
-        "capture_identity": {
-          "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c",
-          "source_root": "/Users/robin/CyxiaOS-V0.16",
-          "build_context": "artifacts/v016-progress-20261108/builds-current/normal"
-        },
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "capture_compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "capture_execution_source_sha256": "1c711c430b5a401b99c0fc6d546224ad5b55fcae4707aa5ab0412326916788cd",
+        "original_capture_round": "R2 C4",
+        "new_native_capture_this_round": false,
+        "independent_status": "PASS",
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/a02-current-01/summary.json",
-            "sha256": "db6f80194ef16eef30c896835a83b18d0be51f4269e1068ca8fb472fd20bf776"
+            "path": "artifacts/v016-progress-20261108-r2/a02-c4-02/summary.json",
+            "sha256": "e8ad59c0efbfde70ab2d9f5f1be805af6fd0b5f2aa0d3cf03f7ae72da1c24b1b"
           },
           {
-            "path": "artifacts/v016-progress-20261108/a02-current-01-independent.json",
-            "sha256": "e80c057c0d81e5c1ac087ef642fb4b972258631d7fffdf1a13f2da98de98da3c"
+            "path": "artifacts/v016-progress-20261108-r2/a02-c4-02-independent.json",
+            "sha256": "fa2f8ef6e1d5a2840550ee489cfea6b24264080d079616810e2ab96a0adf05d8"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r2/formal-native-c4-execution-02.json",
+            "sha256": "44045de4d0748493af94243b1a94d458470e0d267796984cf3a2c3374a616230"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+            "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
           }
         ],
-        "native_execution_verified": true,
-        "runtime_truth_attested": false,
-        "final_source_replay": {
-          "status": "PASS",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-sealed-current-native-replay.json",
-              "sha256": "12e7e58e4e738ace8e683caea2030fb008266d0dafda2f4cd6c9c865fb6ddd09"
-            }
-          ],
-          "scope": "Actual fixed adapters replayed the current native receipt on sealed main source; A09 uses explicit caller-selected persistent memory build and all cases pinned QEMU source."
-        },
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        }
+        "association_scope": "R4 actual independent raw replay; current compiled inputs and original capture-bound tools unchanged. Historical execution identity is preserved, not relabelled a new capture."
       },
       {
         "id": "A09",
         "status": "PASS",
-        "scope": "native",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "binding_semantics": "Actual capture-time compiled/tool identity is retained. Independent receipt replay against the final sealed main source is complete and recorded separately; future metadata is not claimed as capture-time input.",
-        "capture_identity": {
-          "source_root": "/Users/robin/CyxiaOS-V0.16",
-          "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c",
-          "source_manifest_file_sha256": "5f9e9d52c413d0f359870c8362a048f9a79b3dcd5b35101076e741b66b665259",
-          "image_sha256": "d87abd7c2ce051d0c7a95a2cc28538d64037b79fecd0c920f157aa2c8ed8f3f8",
-          "build_context": "artifacts/v016-progress-20261108/builds-current/memory",
-          "formatter_context": "artifacts/v016-progress-20261108/a09-memory-formatter-context.json",
-          "host_timeout_seconds": 300
-        },
-        "observations": {
-          "tasks": 2,
-          "anonymous_sentinel_pages": 8,
-          "verified_unique_file_pages": 4097,
-          "actual_cache_evictions": 3909,
-          "full_a09_verified": true,
-          "actual_cache_pressure_verified": true
-        },
-        "native_execution_verified": true,
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "capture_compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "capture_execution_source_sha256": "1c711c430b5a401b99c0fc6d546224ad5b55fcae4707aa5ab0412326916788cd",
+        "original_capture_round": "R2 C4",
+        "new_native_capture_this_round": false,
+        "independent_status": "PASS",
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r2/a09-c4-02/summary.json",
+            "sha256": "e2f303db1dc064c123c9ee018c7f2ce53e444c011d36fd118a9fa78689c758df"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r2/a09-c4-02-independent.json",
+            "sha256": "cbfeed4e11576a5467440cb2c95e5cedad779a6e8da4ac9fd78edec512dc7b87"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r2/formal-native-c4-execution-02.json",
+            "sha256": "44045de4d0748493af94243b1a94d458470e0d267796984cf3a2c3374a616230"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+            "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
+          }
+        ],
+        "association_scope": "R4 actual independent raw replay; current compiled inputs and original capture-bound tools unchanged. Historical execution identity is preserved, not relabelled a new capture."
+      },
+      {
+        "id": "A12",
+        "status": "PASS",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "capture_compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "capture_execution_source_sha256": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+        "original_capture_round": "R4 c4-fast-02",
+        "new_native_capture_this_round": true,
+        "verifier_execution_source_sha256": "c84a3e8e1b8d01f7e7f09d2fc5de3a7ea9a88eef11947a82a5288e4a503fc5dd",
+        "independent_status": "PASS",
+        "full_a12_verified": true,
+        "admission_scope": "legitimate-native-Local",
+        "original_integration_status": "FAIL",
+        "original_client_codes": [
+          0,
+          126
+        ],
+        "remote_lifecycle_verified": false,
+        "a13_a14_verified": false,
+        "other_runtime_failures_fixed": false,
         "runtime_truth_attested": false,
         "evidence": [
           {
-            "path": "artifacts/v016-progress-20261108/a09-current-02/summary.json",
-            "sha256": "3dc4ae2790ec8d1ad9d664b3fd5f7cd3c645c1ff0a759b9cb807f596432ce998"
+            "path": "artifacts/v016-progress-20261108-r4/a12-native-verified/summary.json",
+            "sha256": "5b8782a631661fba0a9995bd7b89bf6bb868addff226fecad03b8a0c08a973ed"
           },
           {
-            "path": "artifacts/v016-progress-20261108/a09-current-02-independent.json",
-            "sha256": "bc40e66bc928f3729eaadeebcf45b800e16f0d38ed9b1ab888be3d975387a9e7"
+            "path": "artifacts/v016-progress-20261108-r4/a12-verified-issue-execution.json",
+            "sha256": "c474ebdcb0d8ea059512e01a418601ba811fbdb336bb8e14cf828fa6dca700aa"
           },
           {
-            "path": "artifacts/v016-progress-20261108/formal-a09-current-correct-execution.json",
-            "sha256": "aa681bc547f479e1166b1c0a426c8c9b44235502bde5e7535589639e0d1b6814"
+            "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+            "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
           }
-        ],
-        "final_source_replay": {
-          "status": "PASS",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-sealed-current-native-replay.json",
-              "sha256": "12e7e58e4e738ace8e683caea2030fb008266d0dafda2f4cd6c9c865fb6ddd09"
-            }
-          ],
-          "scope": "Actual fixed adapters replayed the current native receipt on sealed main source; A09 uses explicit caller-selected persistent memory build and all cases pinned QEMU source."
-        },
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        }
+        ]
       }
     ],
     "component_native_runs": [
       {
-        "id": "A06-registers-six-context-subset",
-        "status": "PASS",
-        "scope": "native-register-subset-only",
-        "formal_native_acceptance_status": "NOT_RUN",
-        "full_A06_verified": false,
-        "native_execution_verified": true,
-        "runtime_truth_attested": false,
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c",
-        "trusted_build_context": "artifacts/v016-progress-20261108/builds-current/registers-02",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/a06-registers-02-execution.json",
-            "sha256": "a667ac84803981f18bfe2e8e8768e2001c727a021f0be2ef7b72eb0de6ad40b9"
-          }
-        ],
-        "limitations": "SixFP/SIMD/FPCR/FPSR contexts only; object revoke/TLB/oldAPPLY intersections unrun. Original runner did not retain PID; actual normalquit/wait0 and postexit unique kernel-path process count0 reported without invented PID.",
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        },
-        "final_source_replay": {
-          "status": "PASS",
-          "scope": "Register subset only; formal A06 NOT_RUN",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/a06-registers-final-source-replay.json",
-              "sha256": "f97501c10e4cd1391b944dcee9caa029eb2f58de0fa13a92737a17a29b2b1a06"
-            }
-          ]
-        }
-      },
-      {
-        "id": "A10-current-reverse-prepare-reference-cache",
-        "status": "PARTIAL_WITH_MODE4_INTERRUPTED",
-        "formal_native_acceptance_status": "NOT_RUN",
-        "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-        "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c",
-        "native_tool_closure_sha256": "7d40b01ae987b6e3761946ec2fdacf60e8e2dfd8ed500ca0b1ff44545db38c4e",
-        "trusted_build_context": "artifacts/v016-progress-20261108/builds-current/storage",
-        "scope": "Fresh provision and reverse prepare/reference independently pass; reverse mode4 externally interrupted and strict verifier actually rejects. Full matrix incomplete.",
-        "evidence": [
-          {
-            "path": "artifacts/v016-progress-20261108/a10-cache-current-chain-summary.json",
-            "sha256": "9f8a98427186eaf4f55d372b6c58790f11e93a63c260b1f7c8f3f712da3d31cb"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/a10-cache-current-custody-mirror.json",
-            "sha256": "c760bc6536c0bb58a5d757268f13609d61d01e446c24259828dd3c4c1aa67d12"
-          },
-          {
-            "path": "artifacts/v016-progress-20261108/a10-cache-current-final-metadata-note.json",
-            "sha256": "2bbff8b1cc31f7b9cf3bf44e7144052b7854197c452fb2221315a106d24ca203"
-          }
-        ],
-        "raw_capture_modified": false,
-        "producer_failure_upgraded": false,
-        "final_source_association": {
-          "status": "PASS_METADATA_ONLY_ASSOCIATION",
-          "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-          "evidence": [
-            {
-              "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-              "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-            }
-          ],
-          "semantics": "Final full-Git association only; actual execution source identities, earlier three-tool follow-up and native capture inputs retain their own recorded hashes."
-        }
-      }
-    ],
-    "counts_overlap": true,
-    "counting_policy": "Separate actually executed suites; overlapping counts must not be summed. Prior suites/captures are in the immutable prior_round record.",
-    "run_specific_acceptance": {
-      "A": {
-        "PASS": 3,
-        "FAIL": 0,
-        "NOT_RUN": 13
-      },
-      "policy": "Three independently revalidated fresh C2-source native captures only. Old-source and wrong-formatter attempts remain separate historical evidence.",
-      "run_catalogue": {
-        "path": "artifacts/v016-progress-20261108/run-catalogue-current-a01-a02-a09.json",
-        "sha256": "778bc7c8b279814e198f25d3de183467189fdfb8205432aa06d176f6d5e92c72"
-      },
-      "report": {
-        "path": "artifacts/v016-progress-20261108/report-current-a.json",
-        "sha256": "cccf6f0d09843b5e08d6f916aa2604d23e267e7b2440376c32aa7f7960e46d53"
-      },
-      "all_51_cases": {
-        "PASS": 3,
-        "FAIL": 0,
-        "NOT_RUN": 48
-      },
-      "action_families_NOT_RUN": 18,
-      "report_scope_A_returncode": 2,
-      "release_acceptance_verified": false
-    },
-    "attempt_history": [
-      {
-        "case": "A09",
-        "capture": "artifacts/v016-progress-20261108/a09-current-01",
+        "id": "R4-c4-fast-01",
+        "status": "FAIL",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
         "producer_status": "FAIL",
-        "formal_native_status": "NOT_RUN",
-        "cause": "Controller passed ordinary prototype-disk rather than dedicated prototype-memory-disk; real flag CREATE errno-2/ENOENT and client103. Source code unchanged.",
-        "original_budget_seconds": 300,
-        "retry_output_planned": "artifacts/v016-progress-20261108/a09-current-02",
-        "raw_result_rewritten": false
+        "actual_probe_exits": [
+          129,
+          134
+        ],
+        "elapsed_seconds": 62.465293,
+        "compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "derivative_guest": false,
+        "runtime_causal_fix": false,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/c4-fast-01-execution.json",
+            "sha256": "3399afbad45f730124186f87070614607d7e1f32c28c5de8c16209c1ab16368f"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/c4-fast-01/summary.json",
+            "sha256": "049b6d0d9345a13fcad96526ded0128bf9f0c541e1d63a7f636da7561f4bd2c5"
+          }
+        ],
+        "verdict_scope": "Original ordinary-client/integration failure retained; A12 conjunction independently replayed only from c4-fast-02."
+      },
+      {
+        "id": "R4-c4-fast-02",
+        "status": "FAIL",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "producer_status": "FAIL",
+        "actual_probe_exits": [
+          0,
+          126
+        ],
+        "elapsed_seconds": 64.627642,
+        "compiled_source_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+        "derivative_guest": false,
+        "runtime_causal_fix": false,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/c4-fast-02-execution.json",
+            "sha256": "e0025761976f065c2d3d750b0cd8f5a515091d3ae7b4a3aa7e7d06613756b64c"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/c4-fast-02/summary.json",
+            "sha256": "b6ef8e01b5cf8fa861076df48f58f3207e1123611365d782a5ea1f4856b798b6"
+          }
+        ],
+        "verdict_scope": "Original ordinary-client/integration failure retained; A12 conjunction independently replayed only from c4-fast-02."
+      },
+      {
+        "id": "R4-transition-fast-01",
+        "status": "FAIL",
+        "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+        "producer_status": "FAIL",
+        "actual_probe_exits": [
+          126,
+          134
+        ],
+        "elapsed_seconds": 62.74607,
+        "compiled_source_sha256": "da477fb03a1c3d723cb3981efdb191fa2638233c237a8c825ba8f84083dc4444",
+        "derivative_guest": true,
+        "runtime_causal_fix": false,
+        "evidence": [
+          {
+            "path": "artifacts/v016-progress-20261108-r4/transition-fast-01-execution.json",
+            "sha256": "8124262c60966ed68f8169bba0c3301750500afd9df77064948650ffc84e7f45"
+          },
+          {
+            "path": "artifacts/v016-progress-20261108-r4/transition-fast-01/summary.json",
+            "sha256": "27919724ba900d3c7f101ee62e79c104d18126cc0038c19fb80114c5788e567e"
+          }
+        ],
+        "verdict_scope": "Original ordinary-client/integration failure retained; A12 conjunction independently replayed only from c4-fast-02."
       }
     ],
-    "engineering_scope": "Actually executed scoped checks. Functional suites and appropriate default strict Clippy pass; existing feature/example lint failures and the original host harness import error are retained, with isolated correction identified. No complete clean engineering/CI pass is claimed.",
-    "engineering_evidence": {
-      "path": "artifacts/v016-progress-20261108/engineering-checks-20261108.json",
-      "sha256": "b0f24612c6911fc6f77dd7f42b843d98bb88a90b28491efee06c90ecd526b294",
-      "binding_semantics": "Immutable execution-stage report; pending metadata fields inside it refer to that earlier report stage. Final associations live in this record and the final metadata-delta proof."
-    }
+    "run_specific_acceptance": {
+      "catalogue_valid": true,
+      "case_groups": {
+        "A": {
+          "PASS": 4,
+          "FAIL": 0,
+          "NOT_RUN": 12
+        },
+        "T": {
+          "PASS": 0,
+          "FAIL": 0,
+          "NOT_RUN": 20
+        },
+        "E": {
+          "PASS": 0,
+          "FAIL": 0,
+          "NOT_RUN": 15
+        }
+      },
+      "all_A_T_E": {
+        "PASS": 4,
+        "FAIL": 0,
+        "NOT_RUN": 47
+      },
+      "action_families": {
+        "PASS": 0,
+        "FAIL": 0,
+        "NOT_RUN": 18
+      },
+      "evidence": [
+        {
+          "path": "artifacts/v016-progress-20261108-r4/run-catalogue-c4-a01-a02-a09-a12.json",
+          "sha256": "82cd044f2db7c99890ae8e5be8ac40c26148c835fad3eb87b99820d9d93ad1cd"
+        },
+        {
+          "path": "artifacts/v016-progress-20261108-r4/report-final-c4-a.json",
+          "sha256": "f108b0aed56e83281d60e860640b3f0769b00c91e72bab6806ef32de5fa0755c"
+        },
+        {
+          "path": "artifacts/v016-progress-20261108-r4/a12-enroll-execution.json",
+          "sha256": "95a7914a4cb693ee7e57f4bfff57d7a0c722d9b7dfb3adf235d5b1b7495b16a9"
+        },
+        {
+          "path": "artifacts/v016-progress-20261108-r4/report-final-execution.json",
+          "sha256": "5830b538612b1184828360ecfcee86d8816841887daac806fe3544d32ae4c4fd"
+        }
+      ],
+      "report_returncode": 2,
+      "returncode_meaning": "Valid catalogue; A4P/12NR, all51 4P/47NR, actions18NR; release incomplete."
+    },
+    "retained_prior_checks": {
+      "record": {
+        "path": "artifacts/v016-progress-20261108-r4/prior-round-record.json",
+        "sha256": "fb3db160dec45556d8ef7b974c568772c1ee118cff61e770aa02878c7ab979b6"
+      },
+      "rerun_this_round": false,
+      "scope": "All R2/R3 executions and component subsets remain with their original source identities and limitations. They are not inserted into new current check rows as R4 executions."
+    },
+    "counting_policy": "Only fixed independently replayed complete case receipts are enrolled. Full producer FAIL, diagnostic derivatives, fixtures, host checks and partial matrices do not create additional case PASS."
   },
   "review": {
     "whole_branch_review": "CHANGES_REQUIRED",
     "approved_source_binding_sha256": null,
     "evidence": [],
+    "scoped_implementation_reviews": [
+      {
+        "path": "artifacts/v016-progress-20261108-r4/independent-evidence/main-a12-review.json",
+        "sha256": "19d6e290590baa5747924cbf911abf846c37d25382d947b5e757f7de5a18ec35"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/independent-evidence/local-review.json",
+        "sha256": "7ffbfc00efb5955c28571f78ba459ab17ec46e9324fca2afe3695b0b874e02dd"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/independent-evidence/final-tool-bindings-review.json",
+        "sha256": "cf74c9261d1a1377512678897e4e3ea5477f1b51801f5bc219cbdad8397c2dec"
+      }
+    ],
+    "scope": "First review independently covers new outer and expanded five-bank custody only; original pair implementation is not self-approved. Second covers Local extraction/actor composition. No whole-branch or release approval.",
     "source_integration_metadata_review": {
       "status": "APPROVED",
-      "scope_id": "SOURCE_INTEGRATION_METADATA_ONLY",
-      "approved_source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
+      "scope_id": "R4_SOURCE_TOOL_AND_EVIDENCE_ASSOCIATION",
+      "approved_source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
       "evidence": [
         {
-          "path": "artifacts/v016-progress-20261108/final-source-metadata-review.json",
-          "sha256": "404d649ea8b160ee3673a77319538b59d14c0b5d5b9bc01282646a9a463633f1"
+          "path": "artifacts/v016-progress-20261108-r4/final-source-metadata-review.json",
+          "sha256": "ed0ea1faf320c5921035532b2227c80e946f7ee74c0f0787ab6948f15a466cf6"
         }
       ],
-      "does_not_approve_whole_branch_or_full_native_acceptance": true
+      "whole_branch_or_native_release_approval": false
     }
   },
   "release_acceptance_verified": false,
   "open_acceptance_blockers": [
-    {
-      "id": "A01-ORIGINAL-IO-TIMEOUT",
-      "status": "OPEN_UNATTRIBUTED",
-      "note": "32 first-terminal diagnostic boots did not reproduce. No production driver change or timeout-budget relaxation."
-    },
-    {
-      "id": "A03-MODEL-RESPONSE-AND-OLD-COST",
-      "status": "OPEN",
-      "note": "Cold model still lacks required expand/shrink response; old60s 515546ns>500000ns event remains separate."
-    },
-    {
-      "id": "SGD-STORED-DELTA-ROUNDING-SPEC",
-      "status": "OPEN_INTERPRETATION",
-      "note": "Canonical RNE subtraction can make exact stored endpoint difference exceed1/256 by rounding residue; fix preserves required arithmetic and clipped update bound. Frozen normative document unchanged."
-    },
-    {
-      "id": "A10-FULL-MATRIX",
-      "status": "OPEN",
-      "note": "Selected partial and new cache/reorder slices do not establish complete native fault/recovery/recut matrix."
-    },
-    {
-      "id": "A12-NATIVE-ADMISSION",
-      "status": "OPEN",
-      "note": "Pre-followup current-e3e native pair reached mutualREADY4times and same schema2 proof; no native task admission/STARTED.180s normal runner FAIL remains unchanged."
-    },
-    {
-      "id": "OTHER-NATIVE-SPEC-OBLIGATIONS",
-      "status": "OPEN",
-      "note": "Remaining A/T/E/action families and full native release remain incomplete."
-    },
-    {
-      "id": "A10-C2-MODE4-PROGRESS",
-      "status": "OPEN_UNATTRIBUTED",
-      "note": "Fresh reverse mode4 interrupted at actualstop298.046s/capture300.860s; lasttaskpublication122.016s/EL0returns4236/service-stage53. QMP responsive to270s. Existing banks lack full gates/credits/selectedTaskKey; no EAGAIN-only causal claim."
-    },
-    {
-      "id": "PREEXISTING-STRICT-CLIPPY",
-      "status": "OPEN",
-      "note": "Feature scopedClippy2 untouchedcluster/engine.rs lints and supplementalexample1 lint fail. Functional599/620, tools382, builder8, static4 pass; no all-gates pass claim."
-    }
+    "A01 original after-flush IoTimeout remains OPEN_UNATTRIBUTED; successful new chains are not a driver fix.",
+    "A03 cold model response/actual1→2→1 and old control-cost event remain open; no seed or budget rewrite.",
+    "SGD canonical RNE versus literal stored-endpoint difference interpretation remains open; normative document unchanged.",
+    "Full A10 fault/replay/re-cut/non-reordered matrix remains incomplete despite current reverse1/2/4 PASS.",
+    "Remaining A04-A08/A11/A15/A16 native obligations, T01-T20/E01-E15 and18 action-family evidence remain incomplete.",
+    "Supplemental strict all-targets Clippy and full cluster fmt failures remain, no lint suppression or unrelated mass reformat.",
+    "R3 diagnostic source did not reproduce original C4 client129. New125/122 observations lack first-completion/yield-resume/failed-submit/outer-return/callsite timing; no faithful fast native temporal red seam or causal fix.",
+    "R3 supported nonreordered A10 cut/recovery is not the official reordered full matrix or recovery-recut coverage.",
+    "R3 correct seed host feedback does not discharge native A03 load-response or A05/A15/A16 evidence; no coldseed exemption.",
+    "R4 C4 original129 naturally reproduced in62.465s and a second run has0/126; sparse derivative has126/134. No faithful short native causal seam or129 fix; original integration FAILs retained.",
+    "A12 now passes its own native Local-admission conjunction. Remote Authority/STARTED/result/reply-loss/ACK/CLOSE and A13/A14 remain incomplete; no READY observed in the A12 capture.",
+    "A12 v1 supports only the reviewed C4 normal capture profile and bounded positive Local witness, with trusted native source/ELF/QEMU/custody. It is not general hardware runtime attestation."
   ],
-  "finalization_progress": {
-    "source_fixes": "LANDED_13_REVIEWED_FILES_INCLUDING_CACHE_CORRECTION",
-    "engineering_scopes": "COMPLETE_WITH_RETAINED_STRICT_LINT_FAILURES_AND_DOCUMENTED_HARNESS_FOLLOWUP",
-    "native_source_builds": "THREE_SOURCE_CACHE_VERIFIED_PROFILES_PLUS_REGISTER_SUBSET_READY",
-    "current_A01_A02_A09_native": "PASS_CURRENT_CAPTURES_AND_FINAL_SEALED_SOURCE_INDEPENDENT_REPLAY",
-    "source_binding": "SEALED",
-    "independent_final_review": "COMPLETE_SCOPED_METADATA_APPROVED_WHOLE_BRANCH_CHANGES_REQUIRED",
-    "source_byte_archive": "COMPLETE_FINAL_SELF_EXCLUDED_RECORD_SYNCED",
-    "full_native_release": "INCOMPLETE",
-    "main_metadata_landed": "COMPLETE",
-    "metadata_delta": "PASS",
-    "final_source_receipt_replays": "PASS_THREE_FORMAL_CASES_AND_REGISTER_SUBSET_A10_PARTIAL_BOUNDARIES_RETAINED",
-    "final_validation": "PASS_SCOPED_METADATA_AND_ARCHIVE_ONLY",
-    "round_finalization": "COMPLETE_WITH_OPEN_ACCEPTANCE_AND_ENGINEERING_ITEMS"
+  "round_changes_manifest": {
+    "status": "TWELVE_HOST_TOOL_TEST_FIXTURE_PATHS_PLUS_FOUR_DOCUMENTATION_PATHS_AND_SELF_EXCLUDED_RECORD",
+    "production_inputs_changed": false,
+    "whole_round_documentation_only": false,
+    "code_and_tool_changes_present": true,
+    "metadata_delta": {
+      "path": "artifacts/v016-progress-20261108-r4/final-source-tool-delta.json",
+      "sha256": "ce67247107885b7e0e4260ad68639dfdc8753343005150b72c7a0d879b723eae"
+    }
   },
-  "evidence_location_policy": {
-    "root": "artifacts/v016-progress-20261108",
-    "private_builds_raw_images": "Ignored local evidence only; not in source archive.",
-    "source_root_for_A09_client_byte_replay": "/Users/robin/CyxiaOS-V0.16",
-    "source_path_move_binary_reproducibility_attested": false
+  "execution_stages": {
+    "R3_sealed_source": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+    "R4_native_C4_capture": "6579471742a2f291c29da42ce3de5f267a66f60cfaee167e3f98da2bebf0a64b",
+    "R4_tools_and_verifier_execution": "c84a3e8e1b8d01f7e7f09d2fc5de3a7ea9a88eef11947a82a5288e4a503fc5dd",
+    "R4_final_report": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
+    "C4_compiled_sha256": "60c336577974f21545bf29f6babccc0575376cb070abb8157ba2be83f6357f93",
+    "R4_temporary_derivative_compiled_sha256": "da477fb03a1c3d723cb3981efdb191fa2638233c237a8c825ba8f84083dc4444"
+  },
+  "cache_cleanup": {
+    "status": "COMPLETE",
+    "released_bytes": 1785282560,
+    "source_git_and_evidence_unchanged_at_cleanup": true,
+    "evidence": [
+      {
+        "path": "artifacts/cache-cleanup-20261108-1233/result.json",
+        "sha256": "28e28c9790d14f6ae8e0c5d885019aa0bb08c2e0883b30fa2e8ad09428c30eb1"
+      }
+    ]
+  },
+  "evidence_location_policy": "P4 holds unchanged actual C4/native diagnostic captures, final strict A12 receipt, full tools test/report outputs and copied small independent reviews. Temporary diagnostic source/build dependencies remain under /private/tmp/cyxia-v016-20261108-r4; old R2/R3 archives and raw records remain unchanged. No identity directory copied and no archive-path native replay attested.",
+  "source_byte_archive": {
+    "status": "NOT_CREATED_IN_R4",
+    "prior_R3_archive_retained": "/private/tmp/cyxia-v016-source-byte-archive-20261108-r3",
+    "native_replay_from_archive_path_attested": false
+  },
+  "finalization_progress": {
+    "source_binding": "SEALED",
+    "new_production_fix": "NONE",
+    "A12": "PASS_FIXED_NATIVE_REPLAY",
+    "formal_cases": "A4P_12NR",
+    "python_tools": "434_PASS",
+    "runtime129": "REPRODUCED_UNFIXED",
+    "final_report_replay": "PASS_VALID_INCOMPLETE_CATALOGUE",
+    "full_native_release": "INCOMPLETE",
+    "final_validation": "PASS_SOURCE_WORKFLOW_HISTORICAL5_AND_DIFF_CHECKS",
+    "round_finalization": "COMPLETE_WITH_OPEN_ACCEPTANCE_AND_ENGINEERING_ITEMS",
+    "independent_final_review": "COMPLETE_SCOPED_SOURCE_TOOL_EVIDENCE_METADATA_APPROVED"
   },
   "commit_created": false,
   "pushed": false,
-  "round_changes_manifest": {
-    "path": "artifacts/v016-progress-20261108/integration-file-map.json",
-    "sha256": "21d5a2eb9f488f1c695d153a8291f4a8bef7b7f4c9cf36bf1456dcf66dbdcfeb"
-  },
-  "execution_snapshot": {
-    "path": "artifacts/v016-progress-20261108/source-execution-snapshot-cache-fixed.json",
-    "sha256": "3f5825aab405c574f6ba95baf5dd44c3243be0c1568c2d3e86ace55e61d3ed4d",
-    "full_git_sha256": "57dcad00a307ec6b7e1e3f9413a2282a6e5dcc5554d0f976e32a1a5295f9b3b0",
-    "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c"
-  },
-  "pre_cache_fix_test_execution_snapshot": {
-    "path": "artifacts/v016-progress-20261108/source-execution-snapshot.json",
-    "sha256": "0e86660b0eee50b45334cfe92d2520de41662402ceb7c6aa3fc041d654d2802c",
-    "full_git_sha256": "455e32033902cbfe9659efa9d29a79cd2a933fcc7438aece2593fe8dfb21072b",
-    "compiled_input_sha256": "e01a6dca5a266b72daabeaf45d53bd0ebe83c2e49c7b4ef82ee24827cc98dd0c"
-  },
-  "build_provenance_failure": {
-    "status": "CLOSED_ISOLATED_REBUILD_AND_THREE_FORMAL_NATIVE_CASES_REVERIFIED_A10_MATRIX_OPEN",
-    "proof": "artifacts/v016-progress-20261108/build-cache-failure/invalidated-builds.json",
-    "real_cargo_red": "artifacts/v016-progress-20261108/build-cache-failure/actual-cargo-red.json",
-    "host_green": "artifacts/v016-progress-20261108/build-cache-failure/source-cache-green.json",
-    "independent_review": "artifacts/v016-progress-20261108/model-cache-independent-review/review.json",
-    "native_execution_of_invalid_images": false,
-    "new_builds": {
-      "path": "artifacts/v016-progress-20261108/builds-current/execution.json",
-      "sha256": "504619d365a6edfcca6e188f84bffc07b9bd2064f49a15cea8d32fc7b1f4985e"
-    }
-  },
-  "retained_evidence_mirror": {
-    "path": "artifacts/v016-progress-20261108/retained-local-mirror.json",
-    "sha256": "4038acb51b0378ced63e284a18196f5aa4a34f7883c4c642a75d0a9adb29c379"
-  },
-  "final_metadata_delta": {
-    "path": "artifacts/v016-progress-20261108/final-metadata-only-delta.json",
-    "sha256": "ac5bc707e92e5433c0bb7f8036fdfa9300831af08e7afb9c79cd0d9d8ab1c2af"
-  },
   "final_validation": {
-    "status": "PASS_SCOPED_SOURCE_METADATA_VALIDATION",
-    "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-    "evidence": [
-      {
-        "path": "artifacts/v016-progress-20261108/finalization-source-checks.json",
-        "sha256": "8a37ca315405ff219240a03d1a28cb363789513ab0d5170da0473b53a2953aab"
-      },
-      {
-        "path": "artifacts/v016-progress-20261108/finalization-workflow-check.log",
-        "sha256": "525801c22e4f266c54f21155e136e771b80b442f1e199003e2995d6f9cf097ad"
-      }
-    ],
+    "status": "PASS_SCOPED_SOURCE_TOOL_AND_EVIDENCE_CHECKS",
+    "source_binding_sha256": "e4f823b69d8afb2bfcccd5fa87f583a8dc52a63f1e2c2c09a9f16ae7c2545669",
     "full_clean_committed_tree_ci_job_run": false,
     "engineering_status": "FAIL",
     "whole_branch_review": "CHANGES_REQUIRED",
     "release_acceptance_verified": false,
-    "final_record_archive_verification_locator": "artifacts/v016-progress-20261108/finalization-archive-checks.json",
-    "final_record_archive_verification_hash_policy": "External final byte check records the raw record hash; locator only here prevents a hash cycle."
-  },
-  "source_byte_archive": {
-    "status": "COMPLETE",
-    "path": "/private/tmp/cyxia-v016-source-byte-archive-20261108",
-    "source_binding_sha256": "19eb8af339416c35de024b583a25dc240d4fa9bae66ef39b562ffbd7896520b5",
-    "manifest_locator": "artifacts/v016-progress-20261108/source-byte-archive.json",
-    "manifest_hash_policy": "External manifest includes the raw final record SHA; intentionally not hashed inside this record.",
-    "standalone_git_objects": true,
-    "new_commit_created": false,
-    "private_identity_keys_or_native_images_copied": false,
-    "native_replay_from_archive_path_attested": false
+    "evidence": [
+      {
+        "path": "artifacts/v016-progress-20261108-r4/workflow-final-execution.json",
+        "sha256": "e0acbd54f0c524e13ca0b36621d7db6b1e29bc253133d837c887dd925d2737a7"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/historical-final-execution.json",
+        "sha256": "25c43a327584793a229587f28645fcee52b7551a9303b79e74dd2c679920c630"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/diff-final-execution.json",
+        "sha256": "0a47c5071a89afdf91baff596aeda8b4e1d8a262a4e0bbbdb3b305ab37b2f26f"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/final-input-preservation.json",
+        "sha256": "160666b264ae73b349ab38d88b92aa112a4205e8a3d8758a33923a95c0cd4fa6"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/final-process-and-space.json",
+        "sha256": "81fdee3063e9cdde27375d7ef4c7794a602fd8364a78c7060329f8a479c2d96b"
+      },
+      {
+        "path": "artifacts/v016-progress-20261108-r4/final-source-metadata-review.json",
+        "sha256": "ed0ea1faf320c5921035532b2227c80e946f7ee74c0f0787ab6948f15a466cf6"
+      }
+    ],
+    "final_record_byte_check_locator": "artifacts/v016-progress-20261108-r4/final-record-byte-check.json"
   }
 }

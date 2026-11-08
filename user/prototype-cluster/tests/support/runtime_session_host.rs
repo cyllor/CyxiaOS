@@ -47,7 +47,14 @@ fn replay(
     delay_ops: &[u64],
     delay_task: Option<u64>,
 ) -> Result<(), (usize, SessionExitReason, u64)> {
-    replay_with_goal(io_delay_ms, fragment, again_every, delay_ops, delay_task, false)
+    replay_with_goal(
+        io_delay_ms,
+        fragment,
+        again_every,
+        delay_ops,
+        delay_task,
+        false,
+    )
 }
 
 fn replay_with_goal(
@@ -58,10 +65,42 @@ fn replay_with_goal(
     delay_task: Option<u64>,
     first_hello_only: bool,
 ) -> Result<(), (usize, SessionExitReason, u64)> {
+    replay_goal(
+        io_delay_ms,
+        fragment,
+        again_every,
+        delay_ops,
+        delay_task,
+        first_hello_only,
+        false,
+    )
+}
+
+fn replay_goal(
+    io_delay_ms: u64,
+    fragment: usize,
+    again_every: usize,
+    delay_ops: &[u64],
+    delay_task: Option<u64>,
+    first_hello_only: bool,
+    remote_ordinary: bool,
+) -> Result<(), (usize, SessionExitReason, u64)> {
     CTX.with(|c| {
         *c.borrow_mut() = Context::default();
         for n in &mut c.borrow_mut().nodes {
             n.authority = Some(Authority::new());
+            if remote_ordinary {
+                n.strict_authority = true;
+                n.domains.offer = cyxia_prototype_cluster::abi::PolicyWire {
+                    version: 1,
+                    snapshot_ns: 0,
+                    installed_until_ns: 10_000_000_000,
+                    value: 250,
+                    plan_seq: 1,
+                    controller_epoch: 1,
+                    action_index: 0,
+                };
+            }
             n.tcp_fragment = fragment;
             n.tcp_again_every = again_every;
             n.io_delay_ops = delay_ops.to_vec();
@@ -86,6 +125,11 @@ fn replay_with_goal(
     };
     let mut a = make(0);
     let mut b = make(1);
+    if remote_ordinary {
+        enqueue_application(0, 1, 0);
+        enqueue_application(1, 1, 0);
+    }
+    let mut selected = false;
     let pairings = [0, 1].map(|node| {
         Pairing::new(
             CertificateDer::from(f[node].0),
@@ -136,16 +180,84 @@ fn replay_with_goal(
                 return Err((node, reason, status));
             }
         }
-        if first_hello_only && CTX.with(|c| c.borrow().nodes.iter().all(|n|
-            n.session_calls.iter().any(|(token, _, result)| *token == 3 && result.is_ok()))) {
+        if remote_ordinary && session_ready_both() && !selected {
+            let now = CTX.with(|c| c.borrow().now);
+            let f = a.domain_feedback(now * 1_000_000);
+            if f.waiting[0].peer_ready == 1 {
+                CTX.with(|c| {
+                    let mut c = c.borrow_mut();
+                    let d = &mut c.nodes[0].domains;
+                    // A controlled legal D16 invocation exercises the real
+                    // execution chain; it is not evidence of model selection.
+                    d.placement = cyxia_prototype_cluster::abi::PolicyWire {
+                        version: 2,
+                        snapshot_ns: now * 1_000_000,
+                        installed_until_ns: 0,
+                        value: 1,
+                        plan_seq: 2,
+                        controller_epoch: 1,
+                        action_index: 0,
+                    };
+                    d.placement_request_id = f.waiting[0].request_id;
+                    d.placement_request_generation = f.waiting[0].request_generation;
+                });
+                selected = true;
+            }
+        }
+        if remote_ordinary
+            && CTX.with(|c| {
+                c.borrow().nodes[0]
+                    .application_status
+                    .iter()
+                    .any(|s| s.state == cyxia_prototype_cluster::application::REMOTE)
+            })
+        {
+            CTX.with(|c| {
+                let c = c.borrow();
+                assert!(selected);
+                assert!(durable_member_proof(0).is_some());
+                assert_eq!(durable_member_proof(0), durable_member_proof(1));
+                assert_eq!(c.nodes.each_ref().map(|n| n.starts), [0, 1]);
+                assert_eq!(c.nodes.each_ref().map(|n| n.local_submits), [0, 0]);
+                assert_eq!(
+                    (c.nodes[1].strict_reserves, c.nodes[1].strict_grants),
+                    (1, 1)
+                );
+                assert!(
+                    c.nodes[0]
+                        .records
+                        .iter()
+                        .filter_map(|r| cyxia_prototype_cluster::domain_placement::decode(r).ok())
+                        .any(|r| matches!(
+                            r,
+                            cyxia_prototype_cluster::domain_placement::Record::Receipt(
+                                _,
+                                cyxia_prototype::domains::platform::PlacementOutcome::Peer { .. }
+                            )
+                        ))
+                );
+            });
             return Ok(());
         }
-        if session_ready_both() {
+        if first_hello_only
+            && CTX.with(|c| {
+                c.borrow().nodes.iter().all(|n| {
+                    n.session_calls
+                        .iter()
+                        .any(|(token, _, result)| *token == 3 && result.is_ok())
+                })
+            })
+        {
+            return Ok(());
+        }
+        if !remote_ordinary && session_ready_both() {
             assert_eq!(durable_member_proof(0), durable_member_proof(1));
             return Ok(());
         }
     }
-    panic!("real TLS/runtime pair did not reach durable mutual READY");
+    panic!(
+        "real TLS/runtime pair did not reach requested READY or ordinary remote STARTED custody"
+    );
 }
 
 #[test]
@@ -420,6 +532,20 @@ fn failed_preparation_or_replaced_epoch_cannot_transmit_hello_or_open_authority(
                     assert!(n.authority.as_mut().unwrap().session(1, 2, 1800).is_err());
                 });
             }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+// Coverage enhancement: this path was GREEN before any production fix. The
+// legal peer policy is controlled; no native or current-model verdict follows.
+#[test]
+fn real_tls_runtime_ordinary_peer_choice_reaches_actual_started_custody() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            replay_goal(0, 71, 5, &[], None, false, true).unwrap();
         })
         .unwrap()
         .join()

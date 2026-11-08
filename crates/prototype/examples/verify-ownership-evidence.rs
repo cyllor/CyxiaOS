@@ -162,7 +162,7 @@ fn main() -> Result<(), String> {
     for i in 0..words[4] as usize {
         let row = &words[128 + i * ROW..128 + (i + 1) * ROW];
         require(
-            row[0] > 0 && row[0] % 2 == 0 && row[1] == 31,
+            row[0] > 0 && row[0].is_multiple_of(2) && row[1] == 31,
             "unsettled actual ownership chain",
         )?;
         pressure.push(replay(row, &package, schema)?);

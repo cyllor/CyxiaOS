@@ -1,4 +1,8 @@
-# V0.16 实现恢复与验证 — 2026-11-08
+# V0.16 实现恢复与验证 — 2026-11-08 首轮封存
+
+本页以下“本轮”指已提交 `3e4e954` 的封存轮次，保留其实际结果和当时限制。最新维护修复、C4 新原生采集与验证见 [R2 后续进度](v16-a01-a16-progress-20261108-r2.md)。当轮机器记录可用 `git show 3e4e954:docs/implementation/v16-reintegration-verification.json` 读取；当前同名路径是后续验证记录，不继承旧批准。
+
+最新 [R4进度](v16-a01-a16-progress-20261108-r4.md)记录A12真实两节点原生验证通过，运行目录4 PASS/12 NOT_RUN；434项工具测试通过，129未修复，完整发布未通过。下文保留各历史轮次原始边界。
 
 本轮新源码A01/A02/A09已重新采集并独立通过：A项3 PASS、13 NOT_RUN；全部51个A/T/E项为3 PASS、48 NOT_RUN，18动作族仍NOT_RUN。新A06寄存器子集通过但完整A06未通过；A10新prepare/reference局部通过，mode4中断且完整A10仍NOT_RUN。当前功能测试通过，额外严格特性/示例Clippy存在保留的既有FAIL，整体engineering_status=FAIL，不能概括为全部工程门禁PASS。旧最终源码B的三项A PASS已封存，没有继承给新源码；完整原型和release未通过。
 

@@ -746,14 +746,21 @@ pub fn service(now: u64, progress: &mut dyn FnMut()) -> Result<(), Error> {
     progress();
     service_detail(7);
     if BACKGROUND_DUE.swap(false, Ordering::AcqRel) {
-        with(|s| {
+        // Progress may have advanced the shared timer owner since entry.
+        // Use current wall time without changing the paid CPU reservation.
+        let now = now_ns();
+        let rearmed = with(|s| {
             crate::domain_platform::arm_timer(
                 timer_key(s),
                 now.checked_add(BACKGROUND_PERIOD).ok_or(Error::Overflow)?,
                 now,
             )?;
             Ok(())
-        })?;
+        });
+        if let Err(error) = rearmed {
+            BACKGROUND_DUE.store(true, Ordering::Release);
+            return Err(error);
+        }
         service_detail(8);
         let result = crate::domain_storage::background_flush(now, progress);
         service_detail(9);

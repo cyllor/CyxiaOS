@@ -884,14 +884,13 @@ impl<C: Crypto> Engine<C> {
         {
             return Err(Error::Invalid);
         }
-        if let Some(r) = self.results.iter().find(|r| r.key == key) {
-            if r.result_hash != hash
+        if let Some(r) = self.results.iter().find(|r| r.key == key)
+            && (r.result_hash != hash
                 || r.state != state
                 || r.input_hash != input_hash
-                || r.body != body
-            {
-                return Err(Error::Conflict);
-            }
+                || r.body != body)
+        {
+            return Err(Error::Conflict);
         }
         if self.results.len() >= 128 && !self.results.iter().any(|r| r.key == key) {
             return Err(Error::Capacity);
@@ -1202,8 +1201,8 @@ impl<C: Crypto> Engine<C> {
                     || c.owner_boot == 0
                     || c.grant_epoch == 0
                     || c.request_hash != expected
-                    || !matches!(c.state, ContractState::Granted | ContractState::Released)
-                        && !(b[12] == 11 && c.state == ContractState::Prepared)
+                    || !(matches!(c.state, ContractState::Granted | ContractState::Released)
+                        || b[12] == 11 && c.state == ContractState::Prepared)
                 {
                     return Err(Error::Invalid);
                 }

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-from check_prototype_evidence import read_json
+from check_prototype_evidence import read_json, require
 from check_v13_evidence import DEFAULT, validate
 from doctor import ROOT, RUST_BIN, TARGET, env
 
@@ -153,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
                       help='independent CI lane; default runs all host validation gates')
     report = sub.add_parser('report', help='independently validate the 1.3 catalogue')
     report.add_argument('--manifest', type=Path, default=DEFAULT)
+    report.add_argument('--source-root', '--root', type=Path,
+                        help='trusted source checkout; required explicitly for A12 replay')
     report.add_argument('--scope', choices=['all', 'A'], default='all',
                         help='completion target only; all catalogue rows remain validated')
     report.add_argument('--qemu-source', type=Path,
@@ -163,6 +165,10 @@ def main(argv: list[str] | None = None) -> int:
                         help='caller-selected trusted build for A10 native matrix replay')
     report.add_argument('--a10-formatter', type=Path,
                         help='caller-selected trusted formatter for A10 native matrix replay')
+    report.add_argument('--a12-build-manifest', type=Path,
+                        help='caller-selected trusted build record for A12 native replay')
+    report.add_argument('--a12-formatter', type=Path,
+                        help='caller-selected trusted formatter for A12 native replay')
     report.add_argument('--output', type=Path, help='optional new JSON file; otherwise stdout')
     args = parser.parse_args(argv)
     try:
@@ -175,7 +181,14 @@ def main(argv: list[str] | None = None) -> int:
             options['a10_build_manifest'] = args.a10_build_manifest
         if args.a10_formatter is not None:
             options['a10_formatter'] = args.a10_formatter
-        result = validate(read_json(args.manifest), ROOT, **options)
+        if args.a12_build_manifest is not None or args.a12_formatter is not None:
+            require(args.source_root is not None, 'A12 requires an explicit trusted source root')
+        if args.a12_build_manifest is not None:
+            options['a12_build_manifest'] = args.a12_build_manifest
+        if args.a12_formatter is not None:
+            options['a12_formatter'] = args.a12_formatter
+        result = validate(read_json(args.manifest),
+                          ROOT if args.source_root is None else args.source_root, **options)
         result['selected_scope'] = args.scope
         result['selected_scope_complete'] = result[
             'a_acceptance_complete' if args.scope == 'A' else 'functional_acceptance_complete']

@@ -9,6 +9,9 @@ A09 requires full stopped-memory/native custody replay with an explicit trusted
 build directory and QEMU source; raw page structure alone cannot establish PASS.
 A10 additionally has fixed offline matrix reconstruction and native custody
 replay requiring explicit caller-selected build, formatter and QEMU inputs.
+A12 verifies native boot/discovery/authentication/configuration and legal Local
+admission with explicit source, build, formatter and QEMU inputs; A13/A14 remain
+separate obligations.
 Other cases, native FAIL classification
 and filesystem catalogue completion remain unenrolled. Coverage registration
 does not change unrun catalogue entries.
@@ -32,6 +35,8 @@ from verify_v13_a10_native_receipt import (
     VERSION as A10_NATIVE_VERSION,
     verify_native_matrix_receipt as verify_a10_native_matrix_receipt,
 )
+from verify_v16_a12 import (VERSION as A12_NATIVE_VERSION,
+                            verify_native as verify_a12_native_receipt)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = ROOT / 'docs/implementation/v13-requirements.json'
@@ -48,7 +53,8 @@ STATUSES = frozenset({'PASS', 'FAIL', 'NOT_RUN'})
 
 
 def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None,
-               a09_build=None, a10_build_manifest=None, a10_formatter=None):
+               a09_build=None, a10_build_manifest=None, a10_formatter=None,
+               a12_build_manifest=None, a12_formatter=None):
     require(type(rows) is list and len(rows) == len(expected), f'Incomplete {label}')
     ids = [r.get('id') if type(r) is dict else None for r in rows]
     require(all(type(i) is str for i in ids) and len(set(ids)) == len(ids)
@@ -143,6 +149,24 @@ def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None,
                         'A10 native receipt does not establish the complete A10 matrix')
                 counts[row['status']] += 1
                 continue
+            if row['id'] == 'A12' and descriptions:
+                require(row['status'] == 'PASS', 'A12 native FAIL classification is not registered')
+                require(receipt.name == 'summary.json', 'A12 receipt must name summary.json')
+                require(all(value is not None for value in
+                            (qemu_source, a12_build_manifest, a12_formatter)),
+                        'A12 requires explicit trusted source, build, formatter and QEMU inputs')
+                observed = verify_a12_native_receipt(receipt.parent, source_root=root,
+                    build_manifest=a12_build_manifest, formatter=a12_formatter,
+                    qemu_source=qemu_source)
+                require(type(observed) is dict
+                        and observed.get('test_id') == 'A12'
+                        and observed.get('native_acceptance_status') == 'PASS'
+                        and observed.get('full_a12_verified') is True
+                        and observed.get('native_execution_verified') is True
+                        and observed.get('runtime_truth_attested') is False,
+                        'A12 native receipt does not establish complete A12')
+                counts[row['status']] += 1
+                continue
             if row['id'] != 'A02' or not descriptions:
                 raise ValueError(f"No complete 1.3 native receipt verifier registered for {row['id']}")
             require(row['status'] == 'PASS', 'A02 native FAIL classification is not registered')
@@ -162,9 +186,10 @@ def check_rows(rows, expected, label, root, *, descriptions, qemu_source=None,
     return counts
 
 
-def validate(document, root=ROOT, *, qemu_source=None, a09_build=None, a10_build_manifest=None,
-             a10_formatter=None):
-    root = Path(root).resolve()
+def validate(document, root=None, *, qemu_source=None, a09_build=None, a10_build_manifest=None,
+             a10_formatter=None, a12_build_manifest=None, a12_formatter=None):
+    explicit_source = root is not None
+    root = Path(ROOT if root is None else root).resolve()
     exact_keys(document, {'schema_version', 'spec', 'deviations', 'cases',
                           'action_families', 'filesystem_fault_matrix'})
     require(type(document['schema_version']) is int and document['schema_version'] == 1,
@@ -181,10 +206,15 @@ def validate(document, root=ROOT, *, qemu_source=None, a09_build=None, a10_build
     exact_keys(d, {'id', 'clause', 'authorized', 'decision'})
     require(d['id'] == 'LANG-RUST' and d['clause'] == '1.2' and d['authorized'] is True
             and type(d['decision']) is str and bool(d['decision'].strip()), 'Invalid Rust deviation')
+    if not explicit_source and type(document['cases']) is list:
+        require(not any(type(row) is dict and row.get('id') == 'A12'
+                        and row.get('status') == 'PASS' for row in document['cases']),
+                'A12 requires an explicit trusted source root')
     cases = check_rows(document['cases'], CASE_IDS, 'case set', root, descriptions=True,
                        qemu_source=qemu_source, a09_build=a09_build,
                        a10_build_manifest=a10_build_manifest,
-                       a10_formatter=a10_formatter)
+                       a10_formatter=a10_formatter, a12_build_manifest=a12_build_manifest,
+                       a12_formatter=a12_formatter)
     definitions = [{key: row[key] for key in ('id', 'scenario', 'required_outcome')}
                    for row in document['cases']]
     encoded = json.dumps(sorted(definitions, key=lambda row: row['id']), ensure_ascii=False,
@@ -209,11 +239,15 @@ def validate(document, root=ROOT, *, qemu_source=None, a09_build=None, a10_build
     a09_context = a09_build is not None and qemu_source is not None
     a10_context = all(value is not None for value in
                       (qemu_source, a10_build_manifest, a10_formatter))
+    a12_context = explicit_source and all(value is not None for value in
+                      (qemu_source, a12_build_manifest, a12_formatter))
     native_receipt_cases = ['A01', 'A02', 'A03']
     if a09_context:
         native_receipt_cases.append('A09')
     if a10_context:
         native_receipt_cases.append('A10')
+    if a12_context:
+        native_receipt_cases.append('A12')
     return {'schema_version': 1, 'spec_version': '1.3', 'catalogue_valid': True,
             'mandatory_cases': len(CASE_IDS), 'action_families': len(FAMILIES),
             'states': {s: cases[s] + actions[s] for s in cases},
@@ -246,14 +280,22 @@ def validate(document, root=ROOT, *, qemu_source=None, a09_build=None, a10_build
                             'offline_verifier_version': A10_OFFLINE_VERSION,
                             'native_verifier_version': A10_NATIVE_VERSION,
                             'native_admission_blockers': [] if a10_context else [
-                                'explicit caller-selected A10 build, formatter and QEMU inputs required']}}},
-            'scope': 'Catalogue integrity, A01/A02/A03 native verification, explicit-context A09 native memory custody and A10 native matrix replay; other native cases and filesystem acceptance remain required.'}
+                                'explicit caller-selected A10 build, formatter and QEMU inputs required']},
+                    'A12': {'verifier': 'tools/verify_v16_a12.py',
+                            'native_receipt_admitted': a12_context,
+                            'native_verifier_version': A12_NATIVE_VERSION,
+                            'requires_explicit_source_root': True,
+                            'requires_explicit_build_manifest': True,
+                            'requires_explicit_formatter': True,
+                            'requires_explicit_qemu_source': True}}},
+            'scope': 'Catalogue integrity, A01/A02/A03 native verification, explicit-context A09 native memory custody, A10 native matrix replay and A12 native boot/discovery/auth/config/Local admission; other native cases and filesystem acceptance remain required.'}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, default=DEFAULT)
-    parser.add_argument('--root', type=Path, default=ROOT)
+    parser.add_argument('--root', type=Path,
+                        help='trusted source root; explicit for A12, otherwise defaults to this checkout')
     parser.add_argument('--qemu-source', type=Path,
                         help='explicit trusted patched-QEMU checkout for native receipt replay')
     parser.add_argument('--a09-build', type=Path,
@@ -262,13 +304,19 @@ def main(argv=None):
                         help='explicit trusted build record for complete A10 native replay')
     parser.add_argument('--a10-formatter', type=Path,
                         help='explicit trusted formatter binary for A10 native replay')
+    parser.add_argument('--a12-build-manifest', type=Path,
+                        help='explicit trusted build record for A12 native replay')
+    parser.add_argument('--a12-formatter', type=Path,
+                        help='explicit trusted formatter binary for A12 native replay')
     parser.add_argument('--release', action='store_true')
     args = parser.parse_args(argv)
     try:
         result = validate(read_json(args.manifest), args.root, qemu_source=args.qemu_source,
                           a09_build=args.a09_build,
                           a10_build_manifest=args.a10_build_manifest,
-                          a10_formatter=args.a10_formatter)
+                          a10_formatter=args.a10_formatter,
+                          a12_build_manifest=args.a12_build_manifest,
+                          a12_formatter=args.a12_formatter)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2 if args.release and not result['functional_acceptance_complete'] else 0
     except (OSError, ValueError, TypeError) as error:

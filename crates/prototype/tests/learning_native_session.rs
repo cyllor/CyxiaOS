@@ -725,6 +725,86 @@ fn real_session_initializes_in_place_retries_exact_pins_and_keeps_unknown_score_
                 assert_eq!(control_pool::usage().2, 2);
                 assert_eq!(smp::prototype_runtime::ACKS.load(Ordering::Acquire), 1);
                 assert_eq!(smp::prototype_runtime::CANCELS.load(Ordering::Acquire), 1);
+
+                // A live Shadow which misses its first funded window must abort,
+                // not count an empty window or strand candidate/model pins.
+                let delivery = domain_control::learning_driver::ValidationDelivery::new(
+                    binding(52),
+                    candidate.rebind(frozen).unwrap(),
+                    domain_control::pin(new_a, next),
+                );
+                session::accept(delivery).map_err(|(e, _)| e).unwrap();
+                for _ in 0..500 {
+                    session::turn().unwrap();
+                    if session::status().unwrap().phase == session::Phase::Manage {
+                        break;
+                    }
+                }
+                assert_eq!(session::status().unwrap().phase, session::Phase::Manage);
+                assert_eq!(session::status().unwrap().stage, Some(Stage::Shadow));
+                let missed = (domain_platform::now_ns() / WINDOW_NS + 2) * WINDOW_NS;
+                domain_platform::set(missed);
+                for _ in 0..20 {
+                    session::turn().unwrap();
+                    if session::status().unwrap().phase == session::Phase::Idle {
+                        break;
+                    }
+                }
+                let rejected = session::status().unwrap();
+                assert_eq!(rejected.phase, session::Phase::Idle);
+                assert_eq!(rejected.stage, None);
+                assert_eq!(rejected.last_error, Some(Error::DataIncomplete));
+                assert_eq!(rejected.completed, 0);
+                assert_eq!(control_pool::usage().2, 2);
+                assert_eq!(smp::prototype_runtime::ACKS.load(Ordering::Acquire), 1);
+                assert_eq!(smp::prototype_runtime::CANCELS.load(Ordering::Acquire), 1);
+                assert!(ROOT_SCORE.lock().unwrap().is_none());
+                assert!(
+                    ROOT_GATE
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .permit()
+                        .is_none()
+                );
+                assert_eq!(ROOT_GATE.lock().unwrap().as_ref().unwrap().active(), active);
+
+                // A new protected delivery can start a fresh future window;
+                // this does not silently continue or promote the rejected one.
+                let delivery = domain_control::learning_driver::ValidationDelivery::new(
+                    binding(53),
+                    candidate.rebind(frozen).unwrap(),
+                    domain_control::pin(new_a, next),
+                );
+                session::accept(delivery).map_err(|(e, _)| e).unwrap();
+                for _ in 0..500 {
+                    session::turn().unwrap();
+                    if session::status().unwrap().phase == session::Phase::Manage {
+                        break;
+                    }
+                }
+                assert_eq!(session::status().unwrap().phase, session::Phase::Manage);
+                assert_eq!(session::status().unwrap().stage, Some(Stage::Shadow));
+                domain_platform::set(missed + WINDOW_NS + 1000);
+                assert_eq!(session::turn().unwrap(), session::Turn::Progress);
+                assert_eq!(
+                    session::status().unwrap().phase,
+                    session::Phase::BorrowInput
+                );
+                assert_eq!(session::status().unwrap().stage, Some(Stage::Shadow));
+                cpu::set(0);
+                session::request_abort(Error::Budget).unwrap();
+                cpu::set(1);
+                for _ in 0..20 {
+                    session::turn().unwrap();
+                    if session::status().unwrap().phase == session::Phase::Idle {
+                        break;
+                    }
+                }
+                assert_eq!(session::status().unwrap().phase, session::Phase::Idle);
+                assert_eq!(control_pool::usage().2, 2);
+                assert_eq!(ROOT_GATE.lock().unwrap().as_ref().unwrap().active(), active);
             })
         })
         .unwrap()
