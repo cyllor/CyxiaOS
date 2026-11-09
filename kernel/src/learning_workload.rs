@@ -424,3 +424,11 @@ pub fn outside_source(
     }
     Ok(false)
 }
+
+pub(crate) fn owns_core_prewarm(
+    p: crate::domain_control::replay::Preparation,
+    t: crate::domain_control::replay::Token,
+    target: ObjectKey,
+) -> bool {
+    owner::owns_core_prewarm(p, t, target)
+}

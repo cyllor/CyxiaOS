@@ -3,7 +3,10 @@
 //! gate. A stopped verifier rejects any incomplete release-published row.
 use super::*;
 use cyxia_arch_aarch64::user;
-use cyxia_prototype::{domains::ObjectKey, policy::ModelBinding, policy_wire::Plan};
+use cyxia_prototype::{
+    domains::ObjectKey,
+    policy::{ModelBinding, PlanView},
+};
 
 #[repr(C, align(64))]
 struct Formal([AtomicU64; 256]);
@@ -184,7 +187,7 @@ pub(crate) fn new_key(key: Key) {
     }
     A01_FORMAL_EVIDENCE.0[128].store(2, Ordering::Release);
 }
-pub(crate) fn published(boot: u64, plan: &Plan, version: u64, control_mask: u64) {
+pub(crate) fn published<P: PlanView>(boot: u64, plan: &P, version: u64, control_mask: u64) {
     authority_observed(boot);
     let count = get(9);
     put(9, count.saturating_add(1));
@@ -205,9 +208,9 @@ pub(crate) fn published(boot: u64, plan: &Plan, version: u64, control_mask: u64)
         e.target.id,
         e.target.generation,
         cpu::slot() as u64,
-        plan.header.plan_seq,
+        plan.header().plan_seq,
         version,
-        plan.header.active_model_generation,
+        plan.header().active_model_generation,
         u64::from(first.action.domain()),
         u64::from(first.action.kind()),
     ]

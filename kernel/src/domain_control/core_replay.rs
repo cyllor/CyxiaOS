@@ -109,6 +109,8 @@ struct Queue {
     warm_at: u64,
     warm_release: u64,
     fault: Option<Error>,
+    primary_preparation: Option<(preparation::Identity, Snapshot)>,
+    last_claim_retire: Option<Error>,
 }
 impl Queue {
     const fn new() -> Self {
@@ -132,6 +134,8 @@ impl Queue {
             warm_at: 0,
             warm_release: 0,
             fault: None,
+            primary_preparation: None,
+            last_claim_retire: None,
         }
     }
 }
@@ -278,7 +282,13 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
         if q.image.is_none() || q.seed != seed || q.scope.is_some() {
             return Err(Error::Stale);
         }
-        if q.stopped || q.first.is_some() || !crate::learning_prewarm::active() {
+        if q.stopped || q.first.is_some() || q.primary_preparation.is_some() {
+            return Ok(());
+        }
+        if !crate::learning_prewarm::active() {
+            let _ = crate::learning_prewarm::resume_unfrozen_control()?;
+        }
+        if !crate::learning_prewarm::active() {
             return Ok(());
         }
         let due =
@@ -317,6 +327,7 @@ pub fn freeze(first_ns: u64) -> Result<(), Error> {
         }
         crate::learning_prewarm::freeze(first_ns)?;
         q.first = Some(first_ns);
+        q.primary_preparation = None;
         q.warm_queued = false;
         Ok(())
     })
@@ -826,3 +837,124 @@ pub(super) fn next(
     .map(|()| true)
 }
 const _: () = assert!(core::mem::size_of::<Queue>() <= META_PAGES * 4096);
+
+/// Read-only queue facts. Neither a snapshot nor its serial authorizes work.
+#[derive(Clone, Copy)]
+pub(crate) struct PrewarmSnapshot {
+    pub serial: u64,
+    pub seed: u64,
+    pub target: ObjectKey,
+    pub model: ModelBinding,
+    pub scope: bool,
+    pub first: bool,
+    pub stopped: bool,
+    pub fault: Option<Error>,
+    pub warm_queued: bool,
+    pub warm_phase: u64,
+    pub warm_serial: u64,
+    pub warm_release: u64,
+    pub warm_at: u64,
+    pub warm_result: Option<Result<u64, Error>>,
+    pub warm_reported: bool,
+    pub warm_root: u64,
+    pub primary_phase: u64,
+    pub primary_result: Option<Result<u64, Error>>,
+    pub primary_reported: bool,
+    pub primary_root: u64,
+    pub claim: Option<(preparation::Identity, Snapshot)>,
+    pub claim_retire: Option<Error>,
+}
+pub(crate) fn prewarm_snapshot() -> Result<PrewarmSnapshot, Error> {
+    queue(|q| {
+        Ok(PrewarmSnapshot {
+            serial: q.serial,
+            seed: q.seed,
+            target: q.image.map_or(
+                ObjectKey {
+                    id: 0,
+                    generation: 0,
+                },
+                |i| i.target,
+            ),
+            model: q.model,
+            scope: q.scope.is_some(),
+            first: q.first.is_some(),
+            stopped: q.stopped,
+            fault: q.fault,
+            warm_queued: q.warm_queued,
+            warm_phase: q.warm.phase as u64,
+            warm_serial: q.warm_serial as u64,
+            warm_release: q.warm_release,
+            warm_at: q.warm_at,
+            warm_result: q.warm.result,
+            warm_reported: q.warm.completion_reported,
+            warm_root: q.warm.root_ns,
+            primary_phase: q.rows[0].phase as u64,
+            primary_result: q.rows[0].result,
+            primary_reported: q.rows[0].completion_reported,
+            primary_root: q.rows[0].root_ns,
+            claim: q.primary_preparation,
+            claim_retire: q.last_claim_retire,
+        })
+    })
+}
+/// Called under the real control gate before first-candidate Pending exists.
+/// Queue exclusion makes readiness+admission parking atomic against CPU0's
+/// requeue. This is not a freeze: FIRST/ACTIVE/Scope are unchanged.
+pub(super) fn claim_primary_preparation(
+    identity: preparation::Identity,
+    snapshot: Snapshot,
+) -> Result<bool, Error> {
+    queue(|q| {
+        if let Some(held) = q.primary_preparation {
+            return if held == (identity, snapshot) {
+                Ok(true)
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        if q.scope.is_some()
+            || q.first.is_some()
+            || q.stopped
+            || q.fault.is_some()
+            || q.image.is_none_or(|i| i.target != identity.target)
+            || q.model != identity.model
+            || (identity.domain, identity.kind) != (1, 2)
+            || identity.work.is_some()
+        {
+            return Ok(false);
+        }
+        if q.warm_queued && q.warm.phase != Phase::Done {
+            return Ok(false);
+        }
+        if !crate::learning_prewarm::ready_for_core_first(snapshot.taken_ns)? {
+            return Ok(false);
+        }
+        q.primary_preparation = Some((identity, snapshot));
+        Ok(true)
+    })
+}
+/// Only the exact pre-capture preparation retirement releases its parked
+/// admission. The original rejection journal/deadline remains authoritative.
+pub(super) fn retire_primary_preparation(
+    identity: preparation::Identity,
+    reason: Error,
+) -> Result<(), Error> {
+    if ADDRESS.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    queue(|q| {
+        let Some((held, _)) = q.primary_preparation else {
+            return Ok(());
+        };
+        if held != identity {
+            return Err(Error::Stale);
+        }
+        if q.first.is_some() || q.scope.is_some() {
+            return Err(Error::Busy);
+        }
+        q.primary_preparation = None;
+        q.last_claim_retire = Some(reason);
+        Ok(())
+    })
+}

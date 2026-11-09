@@ -30,6 +30,23 @@ fn assets(directory: &std::path::Path, paths: &mut Vec<PathBuf>) {
     }
 }
 fn main() {
+    println!("cargo:rerun-if-env-changed=CYXIA_LEARNING_COLLECTION");
+    let collection = env::var("CYXIA_LEARNING_COLLECTION").unwrap_or_else(|_| "full".into());
+    assert!(
+        ["full", "coreset-one-pair", "coreset-data-one-pair"].contains(&collection.as_str()),
+        "invalid collection profile"
+    );
+    std::fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("learning-collection.rs"),
+        if collection == "full" {
+            "CollectionProfile::Full"
+        } else if collection == "coreset-one-pair" {
+            "CollectionProfile::CoreSetOnePair"
+        } else {
+            "CollectionProfile::CoreSetDataOnePair"
+        },
+    )
+    .unwrap();
     println!("cargo:rerun-if-env-changed=CYXIA_RUST_EGL_PROBE_ELF");
     println!("cargo:rerun-if-env-changed=CYXIA_RUST_REACTOR_PROBE_ELF");
     println!("cargo:rerun-if-env-changed=CYXIA_SMITHAY_PROBE_ELF");

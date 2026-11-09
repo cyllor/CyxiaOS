@@ -165,6 +165,14 @@ pub mod learning_evidence {
 pub mod learning_prewarm {
     use super::*;
     static ACTIVE: AtomicBool = AtomicBool::new(false);
+    pub static READY: AtomicBool = AtomicBool::new(false);
+    pub fn ready_for_core_first(_: u64) -> Result<bool, Error> {
+        Ok(READY.load(Ordering::Acquire))
+    }
+    pub fn resume_unfrozen_control() -> Result<bool, Error> {
+        let was = ACTIVE.swap(true, Ordering::AcqRel);
+        Ok(!was)
+    }
     pub static COMPLETED: AtomicUsize = AtomicUsize::new(0);
     pub static SERVICE: AtomicUsize = AtomicUsize::new(0);
     pub struct Attempt {
@@ -638,4 +646,92 @@ fn successful_readonly_retry_includes_owner_selection_and_measurement_prefix() {
         assert_eq!(core_replay::drain(), Ok(true));
         core_replay::release(frozen.key).unwrap();
     }
+}
+
+#[test]
+fn cold_primary_allows_real_warm_fallback_and_claim_parks_only_until_original_retirement() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let service_before = learning_prewarm::SERVICE.load(Ordering::Acquire);
+    CLOCK.store(30_000_000_000, Ordering::Release);
+    cpu::set(0);
+    assert!(core_replay::abort_prepared().unwrap());
+    core_replay::release_prepared().unwrap();
+    core_replay::prepare(55).unwrap();
+    learning_prewarm::begin();
+    let snapshot = Snapshot {
+        sequence: 2000,
+        taken_ns: now(),
+        core_generation: 1,
+        ledger_generation: 1,
+    };
+    let identity = preparation::Identity {
+        boot: 1,
+        controller: 1,
+        sequence: 2000,
+        domain: 1,
+        kind: 2,
+        target: TARGET,
+        model: MODEL,
+        core_generation: 1,
+        ledger_generation: 1,
+        work: None,
+    };
+    learning_prewarm::READY.store(false, Ordering::Release);
+    assert!(!core_replay::claim_primary_preparation(identity, snapshot).unwrap());
+    assert!(core_replay::prewarm_snapshot().unwrap().claim.is_none());
+    core_replay::prewarm_step(55).unwrap();
+    let mut root = state();
+    let mut input = [0; 512];
+    cpu::set(1);
+    let credit = domain_tasks::begin(2000);
+    let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
+    assert!(
+        core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap(),
+        "cold primary must leave genuine warm fallback executable"
+    );
+    let warm = root.encoded.unwrap().work.unwrap();
+    core_replay::evaluated(warm, root.sequence, Err(Error::Expired), [0; 32]).unwrap();
+    core_replay::report_completed(warm, &witness).unwrap();
+    domain_tasks::settle(credit);
+    core_replay::retired(warm).unwrap();
+    cpu::set(0);
+    assert!(core_replay::abort_prepared().unwrap());
+    core_replay::release_prepared().unwrap();
+    core_replay::prepare(55).unwrap();
+    learning_prewarm::begin();
+    learning_prewarm::READY.store(true, Ordering::Release);
+    assert!(core_replay::claim_primary_preparation(identity, snapshot).unwrap());
+    learning_prewarm::freeze(now()).unwrap(); // explicit host unresolved freeze fixture
+    core_replay::prewarm_step(55).unwrap();
+    assert!(
+        !learning_prewarm::active(),
+        "pending claim must prevent resume as well as enqueue"
+    );
+    let parked = core_replay::prewarm_snapshot().unwrap();
+    assert!(
+        !parked.warm_queued && !parked.first && !parked.scope,
+        "claim parks admission without fake freeze/scope"
+    );
+    learning_prewarm::READY.store(false, Ordering::Release);
+    at(now() + 50_000_001);
+    let pending = preparation::Pending::first_candidate(identity, snapshot, 1, 0);
+    assert_eq!(pending.check(identity, now()), Err(Error::Expired));
+    assert_eq!(
+        core_replay::prewarm_snapshot().unwrap().claim.unwrap().1,
+        snapshot,
+        "readiness loss cannot refresh original deadline"
+    );
+    let mut stale = identity;
+    stale.sequence += 1;
+    assert_eq!(
+        core_replay::retire_primary_preparation(stale, Error::Expired),
+        Err(Error::Stale)
+    );
+    core_replay::retire_primary_preparation(identity, Error::Expired).unwrap();
+    core_replay::prewarm_step(55).unwrap();
+    assert!(core_replay::prewarm_snapshot().unwrap().warm_queued);
+    assert!(core_replay::abort_prepared().unwrap());
+    core_replay::release_prepared().unwrap();
+    learning_prewarm::READY.store(false, Ordering::Release);
+    learning_prewarm::SERVICE.store(service_before, Ordering::Release);
 }

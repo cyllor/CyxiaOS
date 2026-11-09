@@ -317,12 +317,12 @@ fn actual_core_control_output_is_checked_against_protected_root_job() {
     assert_eq!(reply.action, Action::ControlSet(2));
     assert_eq!(reply.selected, 0);
     assert_eq!(reply.scores[0], reply.scores[1]);
-    let plan = policy_wire::decode_plan(&reply.bytes[..reply.len]).unwrap();
+    let plan = policy_wire::decode_plan(reply.canonical.bytes()).unwrap();
     assert_eq!(plan.action(0).unwrap().envelope.target, set.target);
     assert_eq!(plan.header.active_until_local_ns, 0);
     // EL0 cannot change the owning root identity, selection, model, frozen
     // snapshot, or canonical padding even when all scores look plausible.
-    for word in [2, 3, 4, 5, 6, 7, 16, 28, 40, 64, 511] {
+    for word in [0, 1, 2, 3, 4, 5, 6, 7].into_iter().chain(16..512) {
         let mut changed = output;
         changed[word] ^= 1;
         assert!(

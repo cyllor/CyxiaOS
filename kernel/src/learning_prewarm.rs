@@ -10,6 +10,142 @@ use cyxia_prototype::{
     domains::{Error, ObjectKey},
     learning::{self, Family, capture::RunKey, reward::CpuClass},
 };
+#[path = "learning_prewarm/diagnostic.rs"]
+mod diagnostic;
+pub const DIAGNOSTIC_BYTES: usize = diagnostic::BYTES;
+#[cfg(test)]
+pub fn first_failure_snapshot() -> [u64; 32] {
+    diagnostic::LEARNING_PREWARM_FIRST_FAILURE.snapshot()
+}
+pub const PROGRESS_BYTES: usize = 4 * core::mem::size_of::<AtomicU64>();
+static READY_FIRST: AtomicU64 = AtomicU64::new(0);
+static READY_RECENT: AtomicU64 = AtomicU64::new(0);
+static READY_EARLIEST: AtomicU64 = AtomicU64::new(0);
+static READY_REASON: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy)]
+pub struct ProgressStatus {
+    pub session: u64,
+    pub active: bool,
+    pub open: u64,
+    pub lost: bool,
+    pub completed_before: u64,
+    pub completed_after: u64,
+    pub latest: u64,
+    pub started: u64,
+    pub first: u64,
+    pub times: [u64; 16],
+    pub heads: [u64; 4],
+    pub tails: [u64; 4],
+    pub ready_first: u64,
+    pub ready_recent: u64,
+    pub ready_earliest: u64,
+    pub ready_reason: u64,
+}
+pub fn admission_observation() -> (bool, u64, u64) {
+    (
+        ACTIVE.load(Ordering::Acquire),
+        OPEN.load(Ordering::Acquire) as u64,
+        SESSION.load(Ordering::Acquire),
+    )
+}
+/// Bounded diagnostic observation. Counts and slots can be in flight; no
+/// snapshot or equality flag authorizes an interval, first timestamp or label.
+pub fn progress_status() -> ProgressStatus {
+    let before = COMPLETED.load(Ordering::Acquire);
+    let times = core::array::from_fn(|i| COMPLETION_TIMES[i].load(Ordering::Acquire));
+    ProgressStatus {
+        session: SESSION.load(Ordering::Acquire),
+        active: ACTIVE.load(Ordering::Acquire),
+        open: OPEN.load(Ordering::Acquire) as u64,
+        lost: LOST.load(Ordering::Acquire),
+        completed_before: before,
+        completed_after: COMPLETED.load(Ordering::Acquire),
+        latest: LAST_COMPLETED.load(Ordering::Acquire),
+        started: STARTED.load(Ordering::Acquire),
+        first: FIRST.load(Ordering::Acquire),
+        times,
+        heads: core::array::from_fn(|i| HEAD[i].load(Ordering::Acquire) as u64),
+        tails: core::array::from_fn(|i| TAIL[i].load(Ordering::Acquire) as u64),
+        ready_first: READY_FIRST.load(Ordering::Acquire),
+        ready_recent: READY_RECENT.load(Ordering::Acquire),
+        ready_earliest: READY_EARLIEST.load(Ordering::Acquire),
+        ready_reason: READY_REASON.load(Ordering::Acquire),
+    }
+}
+/// Paid CPU0 continuation of an uncommitted CoreSet freeze. No FIRST or
+/// scope exists here; a real frozen session can never reopen through this API.
+pub(crate) fn resume_unfrozen_control() -> Result<bool, Error> {
+    cpu0()?;
+    let _guard = lock()?;
+    let setup = unsafe { &*SETUP.0.get() };
+    if setup
+        .preparation
+        .is_none_or(|p| (p.family.domain, p.family.kind) != (1, 2))
+        || setup.aborted_ns != 0
+        || !control_family()
+        || SESSION.load(Ordering::Acquire) == 0
+        || FIRST.load(Ordering::Acquire) != 0
+        || LOST.load(Ordering::Acquire)
+        || OPEN.load(Ordering::SeqCst) != 0
+        || ACTIVE.load(Ordering::SeqCst)
+    {
+        return Ok(false);
+    }
+    ACTIVE.store(true, Ordering::SeqCst);
+    Ok(true)
+}
+/// Nonfreezing observation under the same warm owner gate and exact existing
+/// readiness predicate. It cannot create FIRST, close ACTIVE or consume work.
+pub fn ready_for_core_first(first_ns: u64) -> Result<bool, Error> {
+    let _guard = lock()?;
+    if !control_family()
+        || SESSION.load(Ordering::Acquire) == 0
+        || first_ns < SECOND
+        || first_ns > now()
+    {
+        return Ok(false);
+    }
+    if LOST.load(Ordering::Acquire) {
+        return Err(Error::Capacity);
+    }
+    Ok(readiness_met(first_ns))
+}
+fn readiness_met(first_ns: u64) -> bool {
+    let completed = COMPLETED.load(Ordering::Acquire);
+    let latest = LAST_COMPLETED.load(Ordering::Acquire);
+    let (mut recent, mut earliest) = (0, u64::MAX);
+    for entry in &COMPLETION_TIMES {
+        let at = entry.load(Ordering::Acquire);
+        if at != 0 && at >= first_ns - SECOND && at <= first_ns {
+            recent += 1;
+            earliest = earliest.min(at);
+        }
+    }
+    let mut reason = 0;
+    if first_ns.saturating_sub(STARTED.load(Ordering::Acquire)) < SECOND {
+        reason |= 1;
+    }
+    if completed < 10 {
+        reason |= 2;
+    }
+    if latest > first_ns {
+        reason |= 4;
+    }
+    if first_ns.saturating_sub(latest) > 200_000_000 {
+        reason |= 8;
+    }
+    if recent < 10 {
+        reason |= 16;
+    }
+    if latest.saturating_sub(earliest) < 800_000_000 {
+        reason |= 32;
+    }
+    READY_FIRST.store(first_ns, Ordering::Relaxed);
+    READY_RECENT.store(recent, Ordering::Relaxed);
+    READY_EARLIEST.store(earliest, Ordering::Relaxed);
+    READY_REASON.store(reason, Ordering::Release);
+    reason == 0
+}
 const OWNER: ObjectKey = ObjectKey {
     id: 0x5052_4557_4152_4d,
     generation: 1,
@@ -232,10 +368,97 @@ pub struct Attempt {
     task: Option<ObjectKey>,
     finish_attempted: bool,
 }
+struct FailureOperands {
+    first: u64,
+    last: u64,
+    clock: u64,
+    current_session: u64,
+    ring: Option<(usize, usize, u64, u64)>,
+    flags: u64,
+    observed_cpu: Option<usize>,
+}
+impl FailureOperands {
+    fn empty() -> Self {
+        Self {
+            first: 0,
+            last: 0,
+            clock: 0,
+            current_session: 0,
+            ring: None,
+            flags: 0,
+            observed_cpu: None,
+        }
+    }
+}
+/// Read-only snapshot only on a failure path. Original predicate operands are
+/// passed through; no extra clock reads or predicate/LOST changes occur here.
+fn first_failure(
+    site: u64,
+    error: Option<Error>,
+    attempt: Option<&Attempt>,
+    facts: FailureOperands,
+) {
+    let bank = attempt.map_or(usize::MAX, |a| a.bank);
+    let (head, tail, old_last, cutoff) = facts.ring.unwrap_or_else(|| {
+        if bank < CORES {
+            (
+                HEAD[bank].load(Ordering::Acquire),
+                TAIL[bank].load(Ordering::Acquire),
+                0,
+                0,
+            )
+        } else {
+            (0, 0, 0, 0)
+        }
+    });
+    let mut words = [0; 32];
+    words[1] = diagnostic::MAGIC;
+    words[2] = 1;
+    words[3] = site;
+    words[4] = error.map_or(0, |e| e as u64 + 1);
+    words[5] = bank as u64;
+    words[6] = facts
+        .observed_cpu
+        .unwrap_or_else(cyxia_arch_aarch64::cpu::slot) as u64;
+    words[7] = attempt.map_or(0, |a| a.session);
+    words[8] = facts.current_session;
+    words[9] = facts.first;
+    words[10] = facts.last;
+    words[11] = attempt.map_or(0, |a| a.earliest_ns);
+    words[12] = facts.clock;
+    words[13] = head as u64;
+    words[14] = tail as u64;
+    words[15] = if bank < CORES { ROWS[bank] as u64 } else { 0 };
+    words[16] = old_last;
+    words[17] = cutoff;
+    words[18] = OPEN.load(Ordering::SeqCst) as u64;
+    words[19] = u64::from(ACTIVE.load(Ordering::SeqCst));
+    words[20] = u64::from(LOST.load(Ordering::Acquire));
+    words[21] = COMPLETED.load(Ordering::Acquire);
+    words[22] = LAST_COMPLETED.load(Ordering::Acquire);
+    words[23] = FIRST.load(Ordering::Acquire);
+    words[24] = STARTED.load(Ordering::Acquire);
+    words[25] = u64::from(attempt.is_some_and(|a| a.finish_attempted));
+    words[26] = facts.flags;
+    words[27] = BOOT.load(Ordering::Acquire);
+    words[28] = TRIAL.load(Ordering::Acquire);
+    words[29] = GENERATION.load(Ordering::Acquire);
+    diagnostic::LEARNING_PREWARM_FIRST_FAILURE.record(&words);
+}
 impl Drop for Attempt {
     fn drop(&mut self) {
         if self.pending {
             LOST.store(true, Ordering::Release);
+            first_failure(
+                1,
+                None,
+                Some(self),
+                FailureOperands {
+                    current_session: SESSION.load(Ordering::Acquire),
+                    flags: 8,
+                    ..FailureOperands::empty()
+                },
+            );
             OPEN.fetch_sub(1, Ordering::SeqCst);
             self.pending = false;
         }
@@ -324,13 +547,39 @@ pub(crate) fn cancel_unstarted(
 pub fn finish(attempt: &mut Attempt, first_ns: u64, last_ns: u64) -> Result<(), Error> {
     attempt.finish_attempted = true;
     let core = cyxia_arch_aarch64::cpu::slot();
+    let mut current_session = 0;
+    let mut session_observed = false;
+    let mut observed_clock = 0;
+    let mut clock_observed = false;
     if !attempt.pending
-        || attempt.session != SESSION.load(Ordering::Acquire)
+        || {
+            current_session = SESSION.load(Ordering::Acquire);
+            session_observed = true;
+            attempt.session != current_session
+        }
         || core != attempt.bank
         || first_ns < attempt.earliest_ns
         || first_ns > last_ns
-        || last_ns > now()
+        || {
+            observed_clock = now();
+            clock_observed = true;
+            last_ns > observed_clock
+        }
     {
+        first_failure(
+            2,
+            Some(Error::Auth),
+            Some(attempt),
+            FailureOperands {
+                first: first_ns,
+                last: last_ns,
+                clock: observed_clock,
+                current_session,
+                ring: None,
+                flags: u64::from(clock_observed) | (u64::from(session_observed) << 3),
+                observed_cpu: Some(core),
+            },
+        );
         return Err(Error::Auth);
     }
     let bank = attempt.bank;
@@ -340,6 +589,20 @@ pub fn finish(attempt: &mut Attempt, first_ns: u64, last_ns: u64) -> Result<(), 
         let old = unsafe { *row(bank, tail) };
         if old.last >= last_ns.saturating_sub(SECOND) {
             LOST.store(true, Ordering::Release);
+            first_failure(
+                3,
+                Some(Error::Capacity),
+                Some(attempt),
+                FailureOperands {
+                    first: first_ns,
+                    last: last_ns,
+                    clock: observed_clock,
+                    current_session,
+                    ring: Some((head, tail, old.last, last_ns.saturating_sub(SECOND))),
+                    flags: 15,
+                    observed_cpu: Some(core),
+                },
+            );
             return Err(Error::Capacity);
         }
         tail += 1;
@@ -396,7 +659,12 @@ fn completed_at() -> Result<(), Error> {
 /// The original in-flight credits must return; elapsed time cannot settle them.
 pub fn freeze(first_ns: u64) -> Result<(), Error> {
     let _guard = lock()?;
-    if SESSION.load(Ordering::Acquire) == 0 || first_ns > now() || first_ns < SECOND {
+    let current_session = SESSION.load(Ordering::Acquire);
+    if current_session == 0 {
+        return Err(Error::NotReady);
+    }
+    let observed_clock = now();
+    if first_ns > observed_clock || first_ns < SECOND {
         return Err(Error::NotReady);
     }
     let old = FIRST.load(Ordering::Acquire);
@@ -408,25 +676,21 @@ pub fn freeze(first_ns: u64) -> Result<(), Error> {
         };
     }
     if LOST.load(Ordering::Acquire) {
+        first_failure(
+            4,
+            Some(Error::Capacity),
+            None,
+            FailureOperands {
+                first: first_ns,
+                clock: observed_clock,
+                current_session,
+                flags: 9,
+                ..FailureOperands::empty()
+            },
+        );
         return Err(Error::Capacity);
     }
-    let completed = COMPLETED.load(Ordering::Acquire);
-    let latest = LAST_COMPLETED.load(Ordering::Acquire);
-    let (mut recent, mut earliest) = (0, u64::MAX);
-    for entry in &COMPLETION_TIMES {
-        let at = entry.load(Ordering::Acquire);
-        if at != 0 && at >= first_ns - SECOND && at <= first_ns {
-            recent += 1;
-            earliest = earliest.min(at);
-        }
-    }
-    if first_ns.saturating_sub(STARTED.load(Ordering::Acquire)) < SECOND
-        || completed < 10
-        || latest > first_ns
-        || first_ns.saturating_sub(latest) > 200_000_000
-        || recent < 10
-        || latest.saturating_sub(earliest) < 800_000_000
-    {
+    if !readiness_met(first_ns) {
         // A paid credit that took too long to return may leave the old warm
         // window stale. Reopen ordinary preparation only after that credit
         // really returned; no policy/capture has been issued at this point.
@@ -437,6 +701,7 @@ pub fn freeze(first_ns: u64) -> Result<(), Error> {
     }
     ACTIVE.store(false, Ordering::SeqCst);
     if OPEN.load(Ordering::SeqCst) != 0 {
+        READY_REASON.store(64, Ordering::Release);
         return Err(Error::Busy);
     }
     let mut present = 0u64;
@@ -461,6 +726,7 @@ pub fn freeze(first_ns: u64) -> Result<(), Error> {
             present & 8 != 0
         };
     if !ready {
+        READY_REASON.store(128, Ordering::Release);
         ACTIVE.store(true, Ordering::SeqCst);
         return Err(Error::NotReady);
     }

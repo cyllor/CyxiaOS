@@ -1124,65 +1124,70 @@ pub fn service(_now: u64, progress: &mut dyn FnMut()) {
     // One bounded owner piece per pass. A deferred piece retains its cursor;
     // file/DMA waits run in service_file's separately billed caller segments.
     diagnostic_service_stage(70);
-    let _ = service_segment(|| {
-        let external = locked(|s| {
-            let phase = s.service_phase;
-            s.service_phase = (phase + 1) % 11;
-            vector_diagnostics::phase(phase);
-            #[cfg(feature = "unified-runtime")]
-            crate::unified::service_stage(10 + phase as u64);
-            match phase {
-                0 => {
-                    lifecycle_turn(s);
+    let _ = crate::learning_replay::prewarm_progress::after_general(
+        || {
+            service_segment(|| {
+                let external = locked(|s| {
+                    let phase = s.service_phase;
+                    s.service_phase = (phase + 1) % 11;
+                    vector_diagnostics::phase(phase);
+                    #[cfg(feature = "unified-runtime")]
+                    crate::unified::service_stage(10 + phase as u64);
+                    match phase {
+                        0 => {
+                            lifecycle_turn(s);
+                        }
+                        1 => {
+                            let _ = advance_admission_bounded(s, 1, 1);
+                        }
+                        // Vector dispatch has its own prepaid opportunity below, like
+                        // the file pump, rather than waiting for this phase rotation.
+                        2 => {}
+                        3 => ipc_piece(s),
+                        4 => memory_piece(s),
+                        5 | 7 | 8 | 9 | 10 => {}
+                        _ => metrics_piece(s),
+                    }
+                    publish_evidence(s);
+                    Ok(phase)
+                });
+                if external == Ok(5) {
+                    // This owner call only evicts clean, unpinned pages. Dirty writeback
+                    // is progressed by the storage service with its own I/O callbacks.
+                    let cpu_started = timer::cpu_ticks();
+                    let _ = crate::domain_storage::cache_reclaim_turn();
+                    let (_, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
+                    let _ = locked(|s| {
+                        s.facts.reclaim_ns.add(finished_ns, actual_ns);
+                        record_cache_receipt(s, finished_ns);
+                        Ok(())
+                    });
                 }
-                1 => {
-                    let _ = advance_admission_bounded(s, 1, 1);
+                if external == Ok(7) {
+                    // Runs with this exact still-live kind-5 service reservation,
+                    // outside the task gate. Safety work can restore an exact baseline
+                    // even when the optional C1 worker's extra ledger is faulted.
+                    // It neither acknowledges unknown numerical work nor frees pins.
+                    let _ = crate::learning_session::safety_turn();
                 }
-                // Vector dispatch has its own prepaid opportunity below, like
-                // the file pump, rather than waiting for this phase rotation.
-                2 => {}
-                3 => ipc_piece(s),
-                4 => memory_piece(s),
-                5 | 7 | 8 | 9 | 10 => {}
-                _ => metrics_piece(s),
-            }
-            publish_evidence(s);
-            Ok(phase)
-        });
-        if external == Ok(5) {
-            // This owner call only evicts clean, unpinned pages. Dirty writeback
-            // is progressed by the storage service with its own I/O callbacks.
-            let cpu_started = timer::cpu_ticks();
-            let _ = crate::domain_storage::cache_reclaim_turn();
-            let (_, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
-            let _ = locked(|s| {
-                s.facts.reclaim_ns.add(finished_ns, actual_ns);
-                record_cache_receipt(s, finished_ns);
-                Ok(())
-            });
-        }
-        if external == Ok(7) {
-            // Runs with this exact still-live kind-5 service reservation,
-            // outside the task gate. Safety work can restore an exact baseline
-            // even when the optional C1 worker's extra ledger is faulted.
-            // It neither acknowledges unknown numerical work nor frees pins.
-            let _ = crate::learning_session::safety_turn();
-        }
-        if external == Ok(8) {
-            // The registered, immutable service boundary consumes actual
-            // capture rows under this independently prepaid owner turn.
-            // Its cursor and any incomplete window survive a Busy return.
-            let _ = crate::service_windows::poll();
-        }
-        if external == Ok(9) {
-            // The replay coordinator is a separate bounded, prepaid owner
-            // piece; its frozen arrivals never run on an unpaid timer path.
-            let _ = crate::learning_replay::service_step();
-        }
-        if external == Ok(10) {
-            let _ = crate::peer_replay::poll();
-        }
-    });
+                if external == Ok(8) {
+                    // The registered, immutable service boundary consumes actual
+                    // capture rows under this independently prepaid owner turn.
+                    // Its cursor and any incomplete window survive a Busy return.
+                    let _ = crate::service_windows::poll();
+                }
+                if external == Ok(9) {
+                    // The replay coordinator is a separate bounded, prepaid owner
+                    // piece; its frozen arrivals never run on an unpaid timer path.
+                    let _ = crate::learning_replay::service_step();
+                }
+                if external == Ok(10) {
+                    let _ = crate::peer_replay::poll();
+                }
+            })
+        },
+        service_core_prewarm,
+    );
     if !baseline_was_pending {
         service_baseline_activation();
     }
@@ -1298,6 +1303,16 @@ pub fn service_baseline_progress() {
     if crate::learning_replay::baseline_activation_pending() {
         service_baseline_activation_at(2);
     }
+    let _ = service_core_prewarm();
+}
+/// Service-only scheduling. The extra piece receives its own kind-5 physical
+/// reservation and settles before return; it grants no task admission/lifecycle.
+fn service_core_prewarm() -> Option<()> {
+    let _entry = enter_baseline_retry()?;
+    let hint = crate::learning_replay::prewarm_service_hint()?;
+    service_segment(|| {
+        let _ = crate::learning_replay::service_owned_prewarm(hint);
+    })
 }
 fn service_baseline_activation_at(site: u64) {
     // Main-loop and progress paths share this gate. A nested I/O callback must

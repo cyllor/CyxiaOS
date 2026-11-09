@@ -3,10 +3,10 @@
 use super::learning_coordinator::{control, native_error};
 use super::{
     Action, ApplyId, Candidate, CandidateSet, Error as DomainError, ExecutionState, Executor,
-    Family, ModelBinding, NativeClock, ObjectKey, Owner, POLICY_NS, Plan, PlanHeader, PolicyStamp,
-    PublicationScope, RawFeatures, Snapshot, State, WINDOW_NS, bind_dependencies, categorical,
-    ensure_stability, execution_blocks_replacement, family_index, locate, now, policy, policy_wire,
-    publisher, queued_control_wcet_us, submission, tiers, with,
+    Family, ModelBinding, NativeClock, ObjectKey, Owner, POLICY_NS, PlanHeader, PlanView,
+    PolicyStamp, PublicationScope, RawFeatures, Snapshot, State, WINDOW_NS, bind_dependencies,
+    categorical, ensure_stability, execution_blocks_replacement, family_index, locate, now, policy,
+    policy_wire, publisher, queued_control_wcet_us, submission, tiers, with,
 };
 use crate::{control_pool::Allocation, smp::prototype_runtime as runtime};
 use core::mem::MaybeUninit;
@@ -758,11 +758,11 @@ impl PublicationScope for CanaryScope<'_, '_, '_> {
         }
         set.authorize_with_gate(active, self.gate, at)
     }
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         owner: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         stamps: &[PolicyStamp],
         boot: u64,
         at: u64,
@@ -796,8 +796,8 @@ impl PublicationScope for CanaryScope<'_, '_, '_> {
         };
         let apply = ApplyId {
             boot_epoch: boot,
-            controller_epoch: plan.header.controller_epoch,
-            plan_seq: plan.header.plan_seq,
+            controller_epoch: plan.header().controller_epoch,
+            plan_seq: plan.header().plan_seq,
             action_index: 0,
             target: d.envelope.target,
         };
@@ -1092,7 +1092,7 @@ struct RestoreScope<'a> {
     request: RestorationRequest,
 }
 impl RestoreScope<'_> {
-    fn check(&self, model: ModelBinding, plan: &Plan) -> Result<(), DomainError> {
+    fn check<P: PlanView>(&self, model: ModelBinding, plan: &P) -> Result<(), DomainError> {
         if self.gate.active() != model
             || self.gate.restoration_request() != Some(self.request)
             || plan.len() != 1
@@ -1104,7 +1104,7 @@ impl RestoreScope<'_> {
             || d.action != self.request.target.baseline
             || !matches!(d.action, Action::ConsoleBatch(_))
             || d.envelope.model_hash != model.model_hash
-            || plan.header.active_model_generation != model.generation
+            || plan.header().active_model_generation != model.generation
         {
             return Err(DomainError::Auth);
         }
@@ -1138,10 +1138,10 @@ impl PublicationScope for RestoreScope<'_> {
         }
         Ok(())
     }
-    fn authorize_recovery(
+    fn authorize_recovery<P: PlanView>(
         &mut self,
         active: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         _: u64,
     ) -> Result<(), DomainError> {
         self.check(active, plan)
@@ -1165,11 +1165,11 @@ impl PublicationScope for RestoreScope<'_> {
             Err(DomainError::Auth)
         }
     }
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         _: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         _: &[PolicyStamp],
         boot: u64,
         _: u64,

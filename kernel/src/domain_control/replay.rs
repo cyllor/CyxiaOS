@@ -470,6 +470,29 @@ pub(super) fn preparation_admission(s: &State, reason: u64, at: u64) {
         1,
     ]);
 }
+#[path = "baseline_cause.rs"]
+mod baseline_cause;
+pub(crate) const BASELINE_CAUSE_BYTES: usize = baseline_cause::BYTES;
+pub(crate) fn baseline_read_failure(
+    reason: u64,
+    view_at: u64,
+    observed: u64,
+    requested: u64,
+    current: u64,
+    pending: bool,
+    flags: u64,
+) {
+    baseline_cause::observe(
+        reason,
+        view_at,
+        observed,
+        cyxia_arch_aarch64::cpu::slot(),
+        requested,
+        current,
+        pending,
+        flags,
+    );
+}
 static ACTIVATING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ACTIVATION_TOKEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -748,14 +771,25 @@ fn trace_preparation(
         started_ns: p.started_ns,
     }
 }
+#[path = "replay/preparation_progress.rs"]
+mod preparation_progress;
+pub(crate) const PREPARATION_PROGRESS_BYTES: usize =
+    preparation_progress::BYTES + preparation_progress::LOCAL_BYTES;
+
 pub fn poll_preparation(preparation: Preparation, service_entry_ns: u64) -> Result<bool, Error> {
     with(|s| {
         let mut trace = crate::learning_evidence::execution_trace::RootPreparationTrace::new(
             trace_preparation(preparation),
             service_entry_ns,
         );
+        let mut reason = preparation_progress::Reason::OtherError;
+        let mut job_facts = None;
         let result = (|| {
-            authorized(s)?;
+            let authorization = authorized(s);
+            if authorization.is_err() {
+                reason = preparation_progress::Reason::AuthError;
+            }
+            authorization?;
             trace.stage = 2;
             let p = root_mut().preparing.as_mut().ok_or(Error::Stale)?;
             if p.identity != preparation || p.failure.is_some() {
@@ -769,10 +803,22 @@ pub fn poll_preparation(preparation: Preparation, service_entry_ns: u64) -> Resu
             trace.cursor_after = p.cursor;
             trace.stage = 4;
             if p.ready {
+                reason = preparation_progress::Reason::AlreadyReady;
                 return Ok(true);
             }
             trace.stage = 5;
             if s.job.is_some() || s.owner.prepared_count != 0 {
+                reason = preparation_progress::Reason::JobReset;
+                job_facts = s.job.as_ref().map(|job| preparation_progress::Job {
+                    controller: job.controller,
+                    sequence: job.sequence,
+                    cpu: job.cpu as u64,
+                    read_only: job.read_only,
+                    family: job.set.get(0).map(|c| (c.action.domain(), c.action.kind())),
+                    target: [job.set.target.id, job.set.target.generation],
+                    started_ns: job.started,
+                    completion: job.completion.is_some(),
+                });
                 trace.job = s.job.is_some();
                 trace.prepared_count = s.owner.prepared_count;
                 p.cursor = 0;
@@ -821,20 +867,63 @@ pub fn poll_preparation(preparation: Preparation, service_entry_ns: u64) -> Resu
                     }
                 })
             {
+                reason = preparation_progress::Reason::DesiredReset;
                 p.cursor = 0;
                 trace.cursor_after = p.cursor;
                 return Ok(false);
             }
+            reason = preparation_progress::Reason::Advance;
             p.cursor = end;
             trace.cursor_after = p.cursor;
             trace.stage = 7;
             if end == s.owner.desired.len() {
+                reason = preparation_progress::Reason::ScanComplete;
                 p.ready = true;
                 trace.stage = 8;
             }
             Ok(p.ready)
         })();
+        let identity = preparation_progress::Identity([
+            preparation.boot_epoch,
+            preparation.id,
+            preparation.trial_id,
+            preparation.owner.id,
+            preparation.owner.generation,
+            u64::from(preparation.family.domain),
+            u64::from(preparation.family.kind),
+            preparation.seed,
+            if preparation.kind == TrialKind::Candidate {
+                1
+            } else {
+                2
+            },
+            preparation.started_ns,
+        ]);
+        let observation = preparation_progress::Observation {
+            reason,
+            stage: trace.stage,
+            result,
+            service_entry_ns: trace.service_entry_ns,
+            before: trace.cursor_before,
+            end: trace.scan_end,
+            after: trace.cursor_after,
+            job: job_facts,
+            prepared_count: trace.prepared_count,
+            blocker: trace.blocker.map(|b| preparation_progress::Blocker {
+                slot: b.slot,
+                reason: b.reason,
+                apply: b.apply,
+                stamp: b.stamp,
+                state: b.state,
+                started: b.started,
+                observed: b.execution_observed,
+                predicate_at: b.predicate_at,
+            }),
+        };
         crate::learning_evidence::execution_trace::preparation_root(trace, result);
+        // All writes retain this original Root gate. An outer with() refusal
+        // never enters this observer and is explicitly outside its coverage.
+        preparation_progress::REPLAY_PREPARATION_PROGRESS.observe(identity, observation);
         result
     })
 }
@@ -1618,8 +1707,8 @@ pub(super) fn reject_first_job(boot: u64, sequence: u64, set: &CandidateSet, err
         fail(r, error);
     }
 }
-pub(super) fn published(
-    plan: &Plan,
+pub(super) fn published<P: PlanView>(
+    plan: &P,
     boot: u64,
     first_stamp: Option<PolicyStamp>,
 ) -> Result<(), Error> {
@@ -1645,7 +1734,7 @@ pub(super) fn published(
             r.renew_after = if d.action.one_shot() {
                 u64::MAX
             } else {
-                plan.header
+                plan.header()
                     .active_until_local_ns
                     .saturating_sub(2_000_000_000)
             };
@@ -1655,8 +1744,8 @@ pub(super) fn published(
         // even if the caller later fails to retrieve the receipt.
         let apply = ApplyId {
             boot_epoch: boot,
-            controller_epoch: plan.header.controller_epoch,
-            plan_seq: plan.header.plan_seq,
+            controller_epoch: plan.header().controller_epoch,
+            plan_seq: plan.header().plan_seq,
             action_index: 0,
             target: q.target,
         };
@@ -2203,13 +2292,18 @@ struct BaselineScope {
     model: ModelBinding,
     snapshot: Snapshot,
     task_publication: Option<crate::domain_tasks::BaselinePublication>,
+    core_service: Option<crate::domain_tasks::CoreSetServiceAuthority>,
 }
 impl PublicationScope for BaselineScope {
     fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
-        match self.task_publication.as_ref() {
-            Some(task) => task.validate(action, target, at),
-            None => (f.legal)(action, target, at),
-        }
+        baseline_legal(
+            f,
+            action,
+            target,
+            at,
+            self.task_publication.as_ref(),
+            self.core_service.as_ref(),
+        )
     }
     fn dependencies(
         &self,
@@ -2231,6 +2325,8 @@ impl PublicationScope for BaselineScope {
     fn authorize_executor(&self, owner: &Owner) -> Result<(), Error> {
         if let Some(task) = self.task_publication.as_ref() {
             task.authorize_service_turn()
+        } else if let Some(service) = self.core_service.as_ref() {
+            service.authorize_service_turn()
         } else if cyxia_arch_aarch64::cpu::slot() == 0 {
             crate::domain_tasks::authorize_service_turn()
         } else {
@@ -2269,19 +2365,19 @@ impl PublicationScope for BaselineScope {
         }
         Ok(())
     }
-    fn authorize_recovery(
+    fn authorize_recovery<P: PlanView>(
         &mut self,
         active: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         _: u64,
     ) -> Result<(), Error> {
         self.check(active, plan)
     }
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         _: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         _: &[PolicyStamp],
         boot: u64,
         _: u64,
@@ -2290,6 +2386,36 @@ impl PublicationScope for BaselineScope {
             return Err(Error::Stale);
         }
         self.check(model, plan)
+    }
+}
+fn reserve_core_baseline_service(
+    s: &State,
+    action: Action,
+) -> Result<Option<crate::domain_tasks::CoreSetServiceAuthority>, Error> {
+    if !matches!(action, Action::ControlSet(_)) {
+        return Ok(None);
+    }
+    let family =
+        s.owner.families[family_index(action.domain(), action.kind())?].ok_or(Error::NotReady)?;
+    if !crate::domain_services::baseline_core_family_matches(&family) {
+        return Ok(None);
+    }
+    crate::domain_tasks::reserve_core_set_service_authority(action)
+}
+fn baseline_legal(
+    f: Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    task: Option<&crate::domain_tasks::BaselinePublication>,
+    core_service: Option<&crate::domain_tasks::CoreSetServiceAuthority>,
+) -> Result<(), Error> {
+    if let Some(task) = task {
+        task.validate(action, target, at)
+    } else if let Some(service) = core_service {
+        crate::domain_services::baseline_core_legal(&f, action, target, at, service)
+    } else {
+        (f.legal)(action, target, at)
     }
 }
 fn baseline_dependencies(
@@ -2345,11 +2471,11 @@ impl BaselineScope {
         }
         Err(Error::Auth)
     }
-    fn check(&self, model: ModelBinding, plan: &Plan) -> Result<(), Error> {
+    fn check<P: PlanView>(&self, model: ModelBinding, plan: &P) -> Result<(), Error> {
         self.bound()?;
         if model != self.model
             || plan.len() != 1
-            || plan.header.active_model_generation != model.generation
+            || plan.header().active_model_generation != model.generation
         {
             return Err(Error::Stale);
         }
@@ -2434,6 +2560,11 @@ fn publish_baseline_traced(
     } else {
         crate::domain_tasks::reserve_baseline_publication(action, q.target)?
     };
+    let mut core_service = if activating {
+        None
+    } else {
+        reserve_core_baseline_service(s, action)?
+    };
     let sequence = s.sequence.checked_add(1).ok_or(Error::Overflow)?;
     let mut snapshot = Snapshot {
         sequence,
@@ -2452,6 +2583,7 @@ fn publish_baseline_traced(
         trace.stage = 3;
         publication_started = Some(policy::Clock::read(&mut NativeClock));
         task_publication = crate::domain_tasks::reserve_baseline_publication(action, q.target)?;
+        core_service = reserve_core_baseline_service(s, action)?;
     }
     if !closing && root().baseline_count == 0 {
         snapshot = root().first.ok_or(Error::Stale)?;
@@ -2501,6 +2633,7 @@ fn publish_baseline_traced(
         trace,
         BaselineAdmission {
             task: task_publication,
+            core_service,
             started: publication_started.ok_or(Error::NotReady)?,
         },
     )
@@ -2519,6 +2652,7 @@ fn publish_value(
     let publication_started = policy::Clock::read(&mut NativeClock);
     let result =
         crate::domain_tasks::reserve_baseline_publication(action, target).and_then(|task| {
+            let core_service = reserve_core_baseline_service(s, action)?;
             publish_value_traced(
                 s,
                 token,
@@ -2528,6 +2662,7 @@ fn publish_value(
                 &mut trace,
                 BaselineAdmission {
                     task,
+                    core_service,
                     started: publication_started,
                 },
             )
@@ -2539,6 +2674,7 @@ fn publish_value(
 }
 struct BaselineAdmission {
     task: Option<crate::domain_tasks::BaselinePublication>,
+    core_service: Option<crate::domain_tasks::CoreSetServiceAuthority>,
     started: policy::PublicationTime,
 }
 fn publish_value_traced(
@@ -2552,6 +2688,7 @@ fn publish_value_traced(
 ) -> Result<Receipt, Error> {
     let BaselineAdmission {
         task: task_publication,
+        core_service,
         started: publication_started,
     } = admission;
     trace.used = snapshot;
@@ -2576,10 +2713,14 @@ fn publish_value_traced(
     let f =
         s.owner.families[family_index(action.domain(), action.kind())?].ok_or(Error::NotReady)?;
     trace.stage = 3;
-    match task_publication.as_ref() {
-        Some(task) => task.validate(action, target, at)?,
-        None => (f.legal)(action, target, at)?,
-    }
+    baseline_legal(
+        f,
+        action,
+        target,
+        at,
+        task_publication.as_ref(),
+        core_service.as_ref(),
+    )?;
     trace.stage = 4;
     let current = match task_publication.as_ref() {
         Some(task) => task.current(f.domain, target)?,
@@ -2633,6 +2774,12 @@ fn publish_value_traced(
     // Candidate/manifest work is already charged by Prefix. The publication
     // cap starts at the actual input-to-root boundary, while its wall deadline
     // and immutable snapshot still come from the original generation.
+    let diagnostic_generations = [
+        snapshot.core_generation,
+        s.owner.context.core_generation,
+        snapshot.ledger_generation,
+        s.owner.context.ledger_generation,
+    ];
     let mut executor = Executor {
         owner: &mut s.owner,
         scope: BaselineScope {
@@ -2642,6 +2789,7 @@ fn publish_value_traced(
             model,
             snapshot,
             task_publication,
+            core_service,
         },
         model,
         evidence: None,
@@ -2658,17 +2806,48 @@ fn publish_value_traced(
         score_count: 0,
         resolved_slots: [0; 16],
         resolved_count: 0,
-        provenance: submission::Facts::disabled(),
+        provenance: if crate::learning_replay::bounded_profile() {
+            submission::Facts::new(snapshot.sequence, false, diagnostic_generations, true)
+        } else {
+            submission::Facts::disabled()
+        },
     };
     trace.stage = 12;
-    let published = s.registry.submit_job(
+    let diagnostic = crate::learning_replay::bounded_profile();
+    if diagnostic {
+        executor.provenance.accept(submission::AcceptStage::Submit);
+        baseline_cause::begin(true);
+    }
+    let wall_deadline = executor.wall_deadline;
+    let submitted = s.registry.submit_job(
         publisher(controller),
         &bytes[..n],
         publication_started,
         executor.wall_deadline,
         &mut NativeClock,
         &mut executor,
-    )?;
+    );
+    let facts = executor.provenance;
+    drop(executor);
+    if diagnostic {
+        let actual_result = submitted
+            .as_ref()
+            .map_err(|e| *e)
+            .and_then(|r| match r.state() {
+                ExecutionState::Failed(e) => Err(e),
+                _ => Ok(r.version),
+            });
+        baseline_cause::finish(
+            root().request.map_or(0, |q| q.trial_id),
+            token.id,
+            s.boot,
+            snapshot,
+            submitted.as_ref().ok().copied(),
+            facts.words(actual_result, false),
+            Sha256::digest(&bytes[..n]).into(),
+        );
+    }
+    let published = submitted?;
     trace.receipt = Some(published);
     if published.version == 0 {
         let error = match published.state() {
@@ -2685,7 +2864,7 @@ fn publish_value_traced(
                 model,
                 received_ns: publication_started.wall_ns,
                 observed_ns: now(),
-                wall_deadline_ns: executor.wall_deadline,
+                wall_deadline_ns: wall_deadline,
                 plan_hash: Sha256::digest(&bytes[..n]).into(),
             };
             // In particular Failed(Busy) is a sealed Registry outcome. It
@@ -3478,4 +3657,53 @@ pub fn validation_probe(token: Token) -> Result<ValidationProbe, Error> {
             set,
         })
     })
+}
+
+/// CPU0 scheduling observation only. No caller receives a replay permit or
+/// publication right; the eventual service body still requires fresh credit.
+pub(crate) fn observes_core_prewarm(
+    p: Preparation,
+    t: Token,
+    target: ObjectKey,
+    model: ModelBinding,
+) -> bool {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return false;
+    }
+    with(|s| {
+        let r = root();
+        Ok(r.token == Some(t)
+            && r.preparing.is_some_and(|a| {
+                a.identity == p
+                    && a.ready
+                    && a.claimed
+                    && a.bound == Some(t)
+                    && a.failure.is_none()
+                    && a.close.is_none()
+            })
+            && r.request.is_some_and(|q| {
+                q.owner == p.owner
+                    && q.trial_id == p.trial_id
+                    && q.family == p.family
+                    && q.kind == p.kind
+                    && q.target == target
+            })
+            && (p.family.domain, p.family.kind) == (1, 2)
+            && t.boot_epoch == p.boot_epoch
+            && t.owner == p.owner
+            && r.first.is_none()
+            && !r.first_ready
+            && r.initial.is_none()
+            && r.fault.is_none()
+            && r.unpublished.is_none()
+            && r.closing.is_none()
+            && r.lifecycle.closing().is_none()
+            && r.model == Some(model)
+            && s.registry.model() == model
+            && match p.kind {
+                TrialKind::Baseline => r.phase == Phase::Frozen,
+                TrialKind::Candidate => matches!(r.phase, Phase::Frozen | Phase::Running),
+            })
+    })
+    .unwrap_or(false)
 }

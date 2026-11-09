@@ -1726,3 +1726,27 @@ pub fn service_io(progress: &mut dyn FnMut()) {
         result
     });
 }
+
+/// Advisory observation of this actual protected, claimed preparation only.
+/// It neither creates task admission nor treats a copied identity as authority.
+pub(super) fn owns_core_prewarm(p: root::Preparation, t: root::Token, target: ObjectKey) -> bool {
+    with(|s| {
+        Ok(s.preparation == Some(p)
+            && s.token == Some(t)
+            && s.family == Some(p.family)
+            && s.seed == p.seed
+            && s.kind == p.kind
+            && (p.family.domain, p.family.kind) == (1, 2)
+            && !s.aborting
+            && !s.activated
+            && !s.activation_started
+            && s.scope.is_none()
+            && s.run.is_none()
+            && s.fault.is_none()
+            && s.prepared.as_ref().is_some_and(|v| {
+                v.target == target && v.family == p.family && v.group.seed == p.seed
+            })
+            && s.initial_core.is_some_and(|i| i.target == target))
+    })
+    .unwrap_or(false)
+}

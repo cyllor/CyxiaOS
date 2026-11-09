@@ -19,6 +19,8 @@ use cyxia_prototype::{
 
 #[path = "domain_services/console_baseline.rs"]
 mod console_baseline;
+#[path = "domain_services/core_set_legality.rs"]
+mod core_set_legality;
 #[path = "domain_services/replay_sources.rs"]
 mod replay_sources;
 pub const SOURCE_IDENTITY_BYTES: usize = replay_sources::IDENTITY_BYTES;
@@ -258,18 +260,28 @@ fn publish_view(state: &State) {
 /// the complete view or holds the live service/UART/recovery owner gate.
 fn read<R>(f: impl FnOnce(&ReadView) -> Result<R, Error>) -> Result<R, Error> {
     if !READY.load(Ordering::Acquire) {
+        crate::domain_control::replay::baseline_read_failure(4, 0, 0, 0, 0, false, 0);
         return Err(Error::NotReady);
     }
     READ_VIEW
         .inspect(|view| {
             let now = now_ns();
             if now < view.at || now - view.at >= 50_000_000 {
+                crate::domain_control::replay::baseline_read_failure(
+                    2, view.at, now, 0, 0, false, 1,
+                );
                 return Err(Error::Busy);
             }
             f(view)
         })
-        .map_err(|_| Error::Busy)?
-        .ok_or(Error::NotReady)?
+        .map_err(|_| {
+            crate::domain_control::replay::baseline_read_failure(1, 0, 0, 0, 0, false, 0);
+            Error::Busy
+        })?
+        .ok_or_else(|| {
+            crate::domain_control::replay::baseline_read_failure(3, 0, 0, 0, 0, false, 0);
+            Error::NotReady
+        })?
 }
 fn now_ns() -> u64 {
     crate::domain_platform::now_ns()
@@ -969,6 +981,38 @@ fn legal_locked(s: &State, action: Action, target: ObjectKey, now: u64) -> Resul
 fn legal(action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
     read(|s| legal_view(s, action, target, now))
 }
+/// Only the boot-fixed native CoreSet callbacks may substitute a retained
+/// task-owner query. Custom registrations keep their complete original path.
+pub(crate) fn baseline_core_family_matches(f: &crate::domain_control::Family) -> bool {
+    core_set_legality::native_family_matches(
+        f,
+        core_set_legality::NativeCallbacks {
+            target,
+            current,
+            legal,
+            legal_options,
+            target_features,
+            apply,
+            reconcile,
+        },
+    )
+}
+pub(crate) fn baseline_core_legal(
+    f: &crate::domain_control::Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    authority: &crate::domain_tasks::CoreSetServiceAuthority,
+) -> Result<(), Error> {
+    if !baseline_core_family_matches(f) || !matches!(action, Action::ControlSet(_)) {
+        return Err(Error::Auth);
+    }
+    read(|s| {
+        legal_view_with_move(s, action, target, at, |slot| {
+            authority.can_control_move(slot)
+        })
+    })
+}
 fn legal_options(
     options: &[Option<Action>],
     target: ObjectKey,
@@ -982,30 +1026,48 @@ fn legal_options(
     })
 }
 fn legal_view(s: &ReadView, action: Action, target: ObjectKey, now: u64) -> Result<(), Error> {
+    legal_view_with_move(
+        s,
+        action,
+        target,
+        now,
+        crate::domain_tasks::can_control_move,
+    )
+}
+fn legal_view_with_move(
+    s: &ReadView,
+    action: Action,
+    target: ObjectKey,
+    now: u64,
+    can_move: impl FnOnce(usize) -> Result<(), Error>,
+) -> Result<(), Error> {
     action.validate()?;
     match action {
-        Action::ControlSet(mask) => {
-            if target != core_view_key(s) || s.cores.core_generation == 0 {
-                return Err(Error::Stale);
-            }
-            if ![2, 6].contains(&mask)
-                || mask & s.cores.healthy != mask
-                || mask & s.cores.draining != 0
-                || s.cores.business & s.cores.healthy & !s.cores.draining & !mask == 0
-            {
-                return Err(Error::Budget);
-            }
-            if mask != s.cores.control {
-                if (mask ^ s.cores.control) != 4 {
-                    return Err(Error::Range);
-                }
-                if s.core_pending {
-                    return Err(Error::Busy);
-                }
-                crate::domain_tasks::can_control_move(2)?;
-            }
-            Ok(())
-        }
+        Action::ControlSet(mask) => core_set_legality::check(
+            core_set_legality::View {
+                key: core_view_key(s),
+                generation: s.cores.core_generation,
+                control: s.cores.control,
+                healthy: s.cores.healthy,
+                draining: s.cores.draining,
+                business: s.cores.business,
+                pending: s.core_pending,
+            },
+            mask,
+            target,
+            can_move,
+            |reason| {
+                crate::domain_control::replay::baseline_read_failure(
+                    reason,
+                    s.at,
+                    now,
+                    mask,
+                    s.cores.control,
+                    s.core_pending,
+                    3,
+                )
+            },
+        ),
         Action::RecoveryRecipe(recipe) => {
             let service = s.services[service_view_index(s, target)?].ok_or(Error::Stale)?;
             if recipe == 0 {

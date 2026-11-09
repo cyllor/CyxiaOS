@@ -331,7 +331,7 @@ pub(super) fn accept(
         return Err((error, replay));
     }
     let mut retained = Some(replay);
-    let result = with(|s| accept_into(s, &mut retained, split, probe));
+    let result = with(|s| accept_into(s, &mut retained, split, probe, None));
     match result {
         Ok(()) => Ok(()),
         Err(error) => Err((error, retained.expect("unaccepted replay retained"))),
@@ -349,6 +349,15 @@ pub(super) fn accept_bounded(
     replay: VerifiedReplay,
     split: Split,
     probe: Option<&CandidateSet>,
+) -> Result<(), AcceptFailure> {
+    accept_bounded_outbound(replay, split, probe, None)
+}
+#[inline(never)]
+pub(super) fn accept_bounded_outbound(
+    replay: VerifiedReplay,
+    split: Split,
+    probe: Option<&CandidateSet>,
+    outbound: Option<&mut Option<super::sample_witness::Witness>>,
 ) -> Result<(), AcceptFailure> {
     if cyxia_arch_aarch64::cpu::slot() != 1 {
         return Err(AcceptFailure::Rejected(Error::State, replay));
@@ -373,6 +382,7 @@ pub(super) fn accept_bounded(
         &mut retained,
         split,
         probe,
+        outbound,
     );
     match result {
         Ok(()) => Ok(()),
@@ -388,7 +398,11 @@ fn accept_into(
     retained: &mut Option<VerifiedReplay>,
     split: Split,
     probe: Option<&CandidateSet>,
+    outbound: Option<&mut Option<super::sample_witness::Witness>>,
 ) -> Result<(), Error> {
+    if outbound.as_ref().is_some_and(|slot| slot.is_some()) {
+        return Err(Error::Capacity);
+    }
     if s.phase != Phase::Collecting || s.in_flight {
         return Err(Error::State);
     }
@@ -447,6 +461,14 @@ fn accept_into(
     }
     unsafe {
         core::ptr::write((s.bases[0] as *mut AcceptedSample).add(index), sample);
+    }
+    // Read back the initialized actual sample through getters. This bounded
+    // handoff performs no I/O and never consults a replay-owner lock.
+    if let Some(outbound) = outbound {
+        let stored = unsafe { &*(s.bases[0] as *const AcceptedSample).add(index) };
+        *outbound = Some(super::sample_witness::Witness::from_stored(
+            stored, replay, baseline, split, index,
+        ));
     }
     s.counts[split_index][family] += 1;
     s.baseline = None;

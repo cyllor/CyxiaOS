@@ -11,18 +11,25 @@ use sha2::{Digest, Sha256};
 mod abi;
 #[path = "domain_tasks/baseline_diagnostics.rs"]
 mod baseline_diagnostics;
+#[path = "domain_tasks/baseline_service_authority.rs"]
+mod baseline_service_authority;
 #[path = "domain_tasks/control_diagnostics.rs"]
 mod control_diagnostics;
 #[path = "domain_tasks/deadline.rs"]
 mod deadline;
 #[path = "domain_tasks/execution.rs"]
 mod execution;
+#[path = "domain_tasks/measured_interval.rs"]
+mod measured_interval;
 #[path = "domain_tasks/memory.rs"]
 mod memory;
 #[path = "domain_tasks/owner_gate.rs"]
 mod owner_gate;
 #[path = "domain_tasks/publication.rs"]
 mod publication;
+pub(crate) use baseline_service_authority::{
+    CoreSetServiceAuthority, reserve_core_set_service_authority,
+};
 #[path = "domain_tasks/service_authority.rs"]
 mod service_authority;
 #[path = "domain_tasks/spawn_diagnostics.rs"]
@@ -576,13 +583,7 @@ pub fn now_ns() -> u64 {
 /// The projected start keeps evidence on the common time axis without charging
 /// time spent descheduled or running another vCPU.
 pub(crate) fn finish_cpu_interval(started: u64) -> (u64, u64, u64) {
-    let finished_ns = now_ns();
-    let actual_ns = timer::cpu_elapsed_ns(started);
-    (
-        finished_ns.saturating_sub(actual_ns),
-        finished_ns,
-        actual_ns,
-    )
+    measured_interval::finish(|| timer::cpu_elapsed_ns(started), now_ns)
 }
 fn group(id: u64) -> ObjectKey {
     ObjectKey { id, generation: 1 }

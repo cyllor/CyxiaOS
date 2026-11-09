@@ -1,7 +1,7 @@
 //! CPU0 owns workloads and closure; prepaid C1 turns verify immutable evidence.
 use super::{
-    Error, Split, archive::Archive, data, domain_error, evidence_error, late_archive, native_error,
-    preparation_archive,
+    COLLECTION_PROFILE, CollectionProfile, Error, Split, archive::Archive, data, domain_error,
+    evidence_error, late_archive, native_error, preparation_archive, sample_export,
 };
 use crate::{
     control_pool as pool,
@@ -34,13 +34,15 @@ use sha2::{Digest, Sha256};
 #[path = "diagnostic.rs"]
 mod diagnostic;
 use diagnostic::Site;
+#[path = "close_sources.rs"]
+mod close_sources;
 #[path = "schemas.rs"]
 mod schemas;
 const OWNER: ObjectKey = ObjectKey {
     id: 0x4c45_524f_574e,
     generation: 1,
 };
-const META_PAGES: usize = 3;
+const META_PAGES: usize = 5;
 // Use the same reserved input, stack and metadata allowance as the real
 // driver gate, plus every producer-owned bank that remains live. This is a
 // conservative bound of actual reservations, not a fabricated measured peak.
@@ -49,12 +51,23 @@ pub(super) const WORKSPACE_PEAK_BYTES: usize = 1024 * 1024
     + data::OWNED_BYTES
     + META_PAGES * 4096
     + crate::learning_prewarm::OWNED_BYTES
+    + crate::learning_prewarm::DIAGNOSTIC_BYTES
+    + crate::learning_prewarm::PROGRESS_BYTES
+    + super::prewarm_status::BYTES
+    + size_of::<AtomicU64>()
     + crate::domain_control::core_replay::OWNED_BYTES
     + root::CANDIDATE_PUBLICATION_BYTES
     + crate::learning_evidence::HANDOFF_BYTES
     + crate::domain_tasks::CAPTURE_CREDIT_BYTES
     + crate::domain_services::SOURCE_IDENTITY_BYTES
-    + 2 * size_of::<AtomicBool>();
+    + 2 * size_of::<AtomicBool>()
+    + size_of::<NativeCollectionEvidence>()
+    + 2 * size_of::<AtomicU64>()
+    + size_of::<BoundedCell>()
+    + size_of::<BoundedEvidence>()
+    + root::BASELINE_CAUSE_BYTES
+    + root::PREPARATION_PROGRESS_BYTES
+    + size_of::<super::bounded_data::HardPending>();
 const RECORD_LIMIT: usize = 8;
 const SECOND: u64 = 1_000_000_000;
 const FAMILIES: [Family; 18] = [
@@ -128,6 +141,10 @@ pub enum Phase {
     PreparationReleaseWork,
     PreparationReleaseRoot,
     PreparationReleasePermit,
+    CollectionArchive,
+    CollectionComplete,
+    BoundedExhausted,
+    BoundedStopped,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -166,6 +183,65 @@ impl Journal {
     }
 }
 const _: () = assert!(size_of::<late_archive::Archive>() <= size_of::<Archive>());
+// This cell is accessed only under this owner's nonrecursive gate. It is
+// separate from the legacy five-page State, so Full/strict allocation stays fixed.
+struct BoundedState {
+    ledger: super::bounded_data::Ledger,
+    archive: Option<super::bounded_export::Archive>,
+}
+struct BoundedCell(UnsafeCell<BoundedState>);
+unsafe impl Sync for BoundedCell {}
+static BOUNDED: BoundedCell = BoundedCell(UnsafeCell::new(BoundedState {
+    ledger: super::bounded_data::Ledger::new(),
+    archive: None,
+}));
+static HARD_PENDING: super::bounded_data::HardPending = super::bounded_data::HardPending::new();
+fn bounded_sync(s: &mut State) -> Result<(), DomainError> {
+    if !COLLECTION_PROFILE.bounded() {
+        return Ok(());
+    }
+    if let Some((code, observed)) = HARD_PENDING.snapshot()? {
+        let phase = s.phase as u64;
+        let trial = bounded(s).ledger.last_trial();
+        if trial == 0 {
+            return Err(DomainError::Conflict);
+        }
+        bounded(s)
+            .ledger
+            .observe_hard_code(trial, code, observed, phase)?;
+    }
+    Ok(())
+}
+fn bounded(_s: &mut State) -> &mut BoundedState {
+    unsafe { &mut *BOUNDED.0.get() }
+}
+#[repr(C, align(64))]
+pub struct BoundedEvidence([AtomicU64; 1024]);
+#[used]
+#[unsafe(no_mangle)]
+pub static CORESET_BOUNDED_DATA_EVIDENCE: BoundedEvidence =
+    BoundedEvidence([const { AtomicU64::new(0) }; 1024]);
+fn bounded_release(
+    s: &mut State,
+    release: super::bounded_data::Release,
+) -> Result<(), DomainError> {
+    if COLLECTION_PROFILE.bounded() {
+        let trial = s.trial_id;
+        bounded(s).ledger.release(trial, release)?;
+    }
+    Ok(())
+}
+fn bounded_regular(export: super::archive::Export) -> super::bounded_data::Reference {
+    let k = export.key();
+    let o = export.object();
+    super::bounded_data::Reference {
+        key: [k.boot_epoch, k.trial_id, k.generation],
+        object: [o.id, o.generation],
+        offset: export.offset(),
+        bytes: export.bytes() as u64,
+        digest: export.digest(),
+    }
+}
 struct State {
     schemas: schemas::Preparation,
     phase: Phase,
@@ -214,6 +290,10 @@ struct State {
     prepare_segment: u16,
     pair_group: Option<cyxia_prototype::learning::ReplayGroup>,
     retry_group: Option<cyxia_prototype::learning::ReplayGroup>,
+    collection_exports: [Option<super::archive::Export>; 2],
+    sample_witness: Option<super::sample_witness::Witness>,
+    sample_archive: Option<sample_export::Archive>,
+    collection_release_ticket: u64,
 }
 const _: () = assert!(size_of::<State>() <= META_PAGES * 4096);
 impl State {
@@ -221,7 +301,7 @@ impl State {
         Self {
             schemas: schemas::Preparation::new(),
             phase: Phase::Prepare,
-            family: 0,
+            family: COLLECTION_PROFILE.first_family(),
             group: 0,
             kind: TrialKind::Baseline,
             trial_id: 1,
@@ -266,6 +346,10 @@ impl State {
             prepare_segment: 0,
             pair_group: None,
             retry_group: None,
+            collection_exports: [None, None],
+            sample_witness: None,
+            sample_archive: None,
+            collection_release_ticket: 0,
         }
     }
     fn split(&self) -> Split {
@@ -298,6 +382,7 @@ static GATE: AtomicBool = AtomicBool::new(false);
 static DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
 static SERVICE_PENDING: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static PREWARM_LAST_SERVICE_OUTCOME: AtomicU64 = AtomicU64::new(0);
 /// Stable native-reader ABI, all values observed from actual owners. Word 0
 /// is a seqlock; 1 magic; 2 phase; 3/4 family; 5 group; 6 candidate=1/baseline=2;
 /// 7 trial; 8 boot; 9 capture generation; 10 verified sides; 11 exclusions;
@@ -311,6 +396,93 @@ pub struct NativeEvidence([AtomicU64; 64]);
 #[used]
 #[unsafe(no_mangle)]
 pub static REPLAY_V13_EVIDENCE: NativeEvidence = NativeEvidence([const { AtomicU64::new(0) }; 64]);
+/// Separate typed collection ABI; does not reassign legacy Complete/training.
+/// 0 seqlock, 1 magic, 2 version, 3 profile, 4 phase, 5 complete,
+/// 6/7 family, 8 group, 9 verified, 10 archives, 11 paired, 12 baseline pending,
+/// 13 owner clear, 14 work quiescent, 15 witness durable, 16/17 witness object,
+/// 18 bytes, 19..23 witness archive SHA256, 23..47 two 12-word archive refs,
+/// 47 sampled time; 48 final C1 release ticket, 49 exact bills settled. All releases concern this collection, never Active/unrelated jobs.
+#[repr(C, align(64))]
+pub struct NativeCollectionEvidence([AtomicU64; 64]);
+#[used]
+#[unsafe(no_mangle)]
+pub static LEARNING_COLLECTION_V16_EVIDENCE: NativeCollectionEvidence =
+    NativeCollectionEvidence([const { AtomicU64::new(0) }; 64]);
+fn collection_owner_clear(s: &State) -> bool {
+    s.scope.is_none()
+        && s.token.is_none()
+        && s.preparation.is_none()
+        && s.permit.is_none()
+        && s.prepared.is_none()
+        && s.model.is_none()
+        && s.loan.is_none()
+        && s.initialized == 0
+        && s.sample_witness.is_none()
+}
+fn publish_collection(data: &data::Status) {
+    if COLLECTION_PROFILE.bounded() {
+        publish_bounded(data);
+    }
+    let work_quiescent = work::quiescent();
+    let Ok(words) = with(|s| {
+        let mut words = [0; 64];
+        words[1] = 0x43594c434f4c3136;
+        words[2] = 1;
+        words[3] = COLLECTION_PROFILE as u64;
+        words[4] = s.phase as u64;
+        words[5] = u64::from(s.phase == Phase::CollectionComplete);
+        words[6] = FAMILIES[s.family.min(17)].domain as u64;
+        words[7] = FAMILIES[s.family.min(17)].kind as u64;
+        words[8] = s.group as u64;
+        words[9] = s.verified;
+        words[10] = s.archived;
+        words[11] = data.paired as u64;
+        words[12] = u64::from(data.pending_baseline);
+        words[13] = u64::from(collection_owner_clear(s));
+        words[14] = u64::from(work_quiescent);
+        if let Some(archive) = &s.sample_archive {
+            words[15] = u64::from(archive.done());
+            if let Some(object) = archive.object() {
+                words[16] = object.id;
+                words[17] = object.generation;
+            }
+            words[18] = 2048;
+            for (i, chunk) in archive.digest().chunks_exact(8).enumerate() {
+                words[19 + i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+        }
+        for (index, export) in s.collection_exports.iter().enumerate() {
+            if let Some(export) = export {
+                let at = 23 + index * 12;
+                let key = export.key();
+                let object = export.object();
+                words[at..at + 7].copy_from_slice(&[
+                    key.boot_epoch,
+                    key.trial_id,
+                    key.generation,
+                    object.id,
+                    object.generation,
+                    export.offset(),
+                    export.bytes() as u64,
+                ]);
+                for (i, chunk) in export.digest().chunks_exact(8).enumerate() {
+                    words[at + 7 + i] = u64::from_le_bytes(chunk.try_into().unwrap());
+                }
+            }
+        }
+        words[47] = crate::domain_platform::now_ns();
+        words[48] = s.collection_release_ticket;
+        words[49] = u64::from(runtime::learning_turn_settled(s.collection_release_ticket));
+        Ok(words)
+    }) else {
+        return;
+    };
+    LEARNING_COLLECTION_V16_EVIDENCE.0[0].fetch_add(1, Ordering::AcqRel);
+    for (i, value) in words.into_iter().enumerate().skip(1) {
+        LEARNING_COLLECTION_V16_EVIDENCE.0[i].store(value, Ordering::Relaxed);
+    }
+    LEARNING_COLLECTION_V16_EVIDENCE.0[0].fetch_add(1, Ordering::Release);
+}
 fn publish_evidence() {
     if cyxia_arch_aarch64::cpu::slot() != 0 {
         return;
@@ -361,6 +533,7 @@ fn publish_evidence() {
     let Ok(data) = data::status() else {
         return;
     };
+    publish_collection(&data);
     words[18] = data.phase as u64 + 1;
     words[19] = data.paired as u64;
     words[20] = u64::from(data.pending_baseline);
@@ -482,8 +655,14 @@ pub fn pause_for_peer(paused: bool) -> Result<(), DomainError> {
 }
 pub fn quiescent() -> bool {
     with(|s| {
-        Ok(matches!(s.phase, Phase::Prepare | Phase::Complete)
-            && s.token.is_none()
+        Ok(matches!(
+            s.phase,
+            Phase::Prepare
+                | Phase::Complete
+                | Phase::CollectionComplete
+                | Phase::BoundedExhausted
+                | Phase::BoundedStopped
+        ) && s.token.is_none()
             && s.scope.is_none()
             && s.preparation
                 .is_none_or(|p| matches!(p.family.domain, 10 | 12 | 16)))
@@ -675,6 +854,9 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
             history::begin_authorized(scope, p.checks, permit)
                 .map_err(|e| domain_error(evidence_error(e)))
         })();
+        if COLLECTION_PROFILE.bounded() {
+            bounded(s).ledger.capture(key.trial_id, key.generation)?;
+        }
         if let Err(error) = bound {
             // Capture already owns this exact run. Keep its manifest and all
             // actual intervals even when a later owner/history binding fails.
@@ -695,10 +877,18 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
     })
 }
 fn retain_error(error: DomainError, trace: Option<&mut diagnostic::Attempt>) {
-    let retained = with(|s| Ok(s.token))
-        .ok()
-        .flatten()
-        .and_then(|token| root::retained_fault(token).ok().flatten());
+    // Capture the incoming hard fault before retained Busy replaces the effective
+    // trial error, and before any owner try-lock can reject this observation.
+    if COLLECTION_PROFILE.bounded() && super::bounded_data::is_hard(error) {
+        HARD_PENDING.record(error, crate::domain_platform::now_ns());
+    }
+    let retained = with(|s| {
+        bounded_sync(s)?;
+        Ok(s.token)
+    })
+    .ok()
+    .flatten()
+    .and_then(|token| root::retained_fault(token).ok().flatten());
     if retained.is_none()
         && matches!(
             error,
@@ -712,7 +902,15 @@ fn retain_error(error: DomainError, trace: Option<&mut diagnostic::Attempt>) {
     }
     let error = retained.unwrap_or(error);
     let preparation = with(|s| {
+        bounded_sync(s)?;
         s.last_error.get_or_insert(native_error(error));
+        if COLLECTION_PROFILE.bounded() {
+            let trial = s.trial_id;
+            let _ =
+                bounded(s)
+                    .ledger
+                    .error(trial, error as u64 + 1, crate::domain_platform::now_ns());
+        }
         if s.scope.is_some() && matches!(s.phase, Phase::Start | Phase::Activate | Phase::Run) {
             s.phase = Phase::Drain;
         } else if s.scope.is_none() && s.preparation.is_some() {
@@ -729,7 +927,9 @@ fn retain_error(error: DomainError, trace: Option<&mut diagnostic::Attempt>) {
                 s.phase = Phase::PreparationAbort;
             }
             return Ok(s.preparation.map(|p| (p, original)));
-        } else if s.scope.is_none() {
+        } else if s.scope.is_none()
+            && !(COLLECTION_PROFILE.bounded() && s.phase == Phase::CollectionArchive)
+        {
             s.phase = Phase::Failed;
         }
         Ok(None)
@@ -783,6 +983,11 @@ pub fn service_step() -> Result<bool, DomainError> {
     if let Err(error) = result {
         retain_error(error, Some(&mut trace));
     }
+    PREWARM_LAST_SERVICE_OUTCOME.store(
+        result.as_ref().err().map_or(0, |e| *e as u64 + 1),
+        Ordering::Release,
+    );
+    publish_prewarm_progress();
     publish_evidence();
     result
 }
@@ -854,8 +1059,29 @@ fn prepare_step(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             p
         } else {
             let trial = with(|s| Ok(s.trial_id))?;
+            if COLLECTION_PROFILE.bounded()
+                && !with(|s| {
+                    bounded_sync(s)?;
+                    Ok(bounded(s).ledger.can_admit())
+                })?
+            {
+                with(|s| {
+                    s.phase = Phase::CollectionArchive;
+                    Ok(())
+                })?;
+                return Ok(false);
+            }
             let p = root::begin_preparation(work::OWNER, trial, family, seed, kind)?;
             with(|s| {
+                if COLLECTION_PROFILE.bounded() {
+                    bounded(s).ledger.admit(
+                        p.trial_id,
+                        p.id,
+                        p.boot_epoch,
+                        if p.kind == TrialKind::Candidate { 1 } else { 2 },
+                        p.started_ns,
+                    )?;
+                }
                 s.preparation = Some(p);
                 Ok(())
             })?;
@@ -910,6 +1136,7 @@ fn prepare_step(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
 
 fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
     let phase = with(|s| {
+        bounded_sync(s)?;
         trace.words[3] = s.phase as u64 + 1;
         trace.words[10] = s.trial_id;
         trace.words[11] = s
@@ -938,8 +1165,9 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
         Ok(s.phase)
     })?;
     trace.site(Site::OtherPhase);
-    if matches!(phase, Phase::Reserve | Phase::Freeze | Phase::Start)
-        && with(|s| Ok(s.scope.is_none()))?
+    if (matches!(phase, Phase::Reserve | Phase::Freeze | Phase::Start)
+        && with(|s| Ok(s.scope.is_none()))?)
+        || phase == Phase::Run && observed_core_prewarm().is_some()
     {
         trace.site(Site::Prewarm);
         work::prewarm_step()?;
@@ -972,6 +1200,10 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             work::bind_root(token)?;
             with(|s| {
                 s.token = Some(token);
+                if COLLECTION_PROFILE.bounded() {
+                    let trial = s.trial_id;
+                    bounded(s).ledger.root(trial, token.id)?;
+                }
                 s.phase = Phase::Freeze;
                 Ok(())
             })?;
@@ -1251,7 +1483,20 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                 let source = p.sources[cursor];
                 let token = capture::source(source.owner, source.class)
                     .map_err(|e| domain_error(evidence_error(e)))?;
-                capture::close_source(token).map_err(|e| domain_error(evidence_error(e)))?;
+                let config = capture::current_config()
+                    .map_err(|e| domain_error(evidence_error(e)))?
+                    .ok_or(DomainError::NotReady)?;
+                if !close_sources::close_if_due(
+                    &config,
+                    scope.key,
+                    source.class,
+                    crate::domain_platform::now_ns(),
+                    || capture::close_source(token).map_err(evidence_error),
+                )
+                .map_err(domain_error)?
+                {
+                    return Ok(false);
+                }
                 with(|s| {
                     s.cursor += 1;
                     Ok(())
@@ -1303,6 +1548,7 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             with(|s| {
                 capture::retire_exported(s.seal.ok_or(DomainError::NotReady)?)
                     .map_err(|e| domain_error(evidence_error(e)))?;
+                bounded_release(s, super::bounded_data::Release::Capture)?;
                 s.phase = Phase::RetireHistory;
                 Ok(())
             })?;
@@ -1311,16 +1557,21 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             with(|s| {
                 history::replay::retire_exported(s.seal.ok_or(DomainError::NotReady)?)
                     .map_err(|e| domain_error(evidence_error(e)))?;
+                bounded_release(s, super::bounded_data::Release::History)?;
                 s.phase = Phase::ReleaseWork;
                 Ok(())
             })?;
         }
         Phase::Release => {
             with(|s| {
-                let keep =
-                    s.kind == TrialKind::Baseline && s.verification.is_some_and(|v| v.is_ok());
+                let keep = s.kind == TrialKind::Baseline
+                    && s.verification.is_some_and(|v| v.is_ok())
+                    && (!COLLECTION_PROFILE.bounded() || bounded(s).ledger.may_continue());
                 if !keep {
                     root::release(s.token.ok_or(DomainError::NotReady)?)?;
+                    if COLLECTION_PROFILE.bounded() {
+                        bounded(s).ledger.release_root_chain();
+                    }
                     s.token = None;
                 }
                 s.phase = Phase::ReleasePermit;
@@ -1349,6 +1600,7 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                     // packet until late_archived accepts a durable Export.
                     work::release(run)?;
                 }
+                bounded_release(s, super::bounded_data::Release::Work)?;
                 s.phase = Phase::Release;
                 Ok(())
             })?;
@@ -1357,13 +1609,20 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
             with(|s| {
                 capture::release_start(s.permit.as_ref().ok_or(DomainError::NotReady)?)
                     .map_err(|e| domain_error(evidence_error(e)))?;
+                bounded_release(s, super::bounded_data::Release::Permit)?;
                 let accepted = s.verification.is_some_and(|v| v.is_ok());
+                let focused_pair =
+                    accepted && s.kind == TrialKind::Candidate && COLLECTION_PROFILE.focused();
                 if accepted && s.kind == TrialKind::Baseline {
                     s.pair_group = s.prepared.map(|p| p.group);
                 } else if accepted {
                     s.pair_group = None;
                 }
-                if !accepted {
+                if !accepted
+                    || COLLECTION_PROFILE.bounded()
+                        && !bounded(s).ledger.can_admit()
+                        && !bounded(s).ledger.stored()
+                {
                     s.retry_group = s.pair_group.or(s.prepared.map(|p| p.group));
                 }
                 if accepted {
@@ -1375,7 +1634,7 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                     s.kind = TrialKind::Baseline;
                 } else if s.kind == TrialKind::Baseline {
                     s.kind = TrialKind::Candidate;
-                } else {
+                } else if !focused_pair {
                     s.kind = TrialKind::Baseline;
                     s.group += 1;
                     if s.group == 12 {
@@ -1383,7 +1642,9 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                         s.family += 1;
                     }
                 }
-                s.trial_id = s.trial_id.checked_add(1).ok_or(DomainError::Overflow)?;
+                if !COLLECTION_PROFILE.bounded() || bounded(s).ledger.can_admit() {
+                    s.trial_id = s.trial_id.checked_add(1).ok_or(DomainError::Overflow)?;
+                }
                 if accepted {
                     s.prepared = None;
                 }
@@ -1407,8 +1668,14 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                 }
                 s.preparation = None;
                 s.prepare_claimed = false;
-                s.phase = if !accepted {
+                s.phase = if COLLECTION_PROFILE.bounded() && bounded(s).ledger.stored() {
+                    Phase::CollectionArchive
+                } else if !accepted {
                     Phase::Restart
+                } else if COLLECTION_PROFILE.bounded() && !bounded(s).ledger.can_admit() {
+                    Phase::Restart
+                } else if focused_pair {
+                    Phase::CollectionArchive
                 } else if s.family == FAMILIES.len() {
                     Phase::Complete
                 } else {
@@ -1449,6 +1716,7 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                 if s.prepare_claimed {
                     work::release_prepared(preparation)?;
                 }
+                bounded_release(s, super::bounded_data::Release::Work)?;
                 s.phase = Phase::PreparationReleaseRoot;
                 Ok(())
             })?;
@@ -1456,6 +1724,9 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
         Phase::PreparationReleaseRoot => {
             with(|s| {
                 root::release_preparation(s.preparation.ok_or(DomainError::NotReady)?)?;
+                if COLLECTION_PROFILE.bounded() {
+                    bounded(s).ledger.release_root_chain();
+                }
                 s.token = None;
                 s.phase = Phase::PreparationReleasePermit;
                 Ok(())
@@ -1466,10 +1737,20 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                 if let Some(permit) = s.permit.as_ref() {
                     capture::release_start(permit).map_err(|e| domain_error(evidence_error(e)))?;
                 }
+                bounded_release(s, super::bounded_data::Release::Permit)?;
+                if COLLECTION_PROFILE.bounded() {
+                    let trial = s.trial_id;
+                    let error = s.prepare_error.ok_or(DomainError::NotReady)?.0;
+                    bounded(s)
+                        .ledger
+                        .excluded(trial, native_error(error) as u64 + 1)?;
+                }
                 s.retry_group = s.pair_group.or(s.prepared.map(|p| p.group));
                 s.excluded += 1;
                 s.kind = TrialKind::Baseline;
-                s.trial_id = s.trial_id.checked_add(1).ok_or(DomainError::Overflow)?;
+                if !COLLECTION_PROFILE.bounded() || bounded(s).ledger.can_admit() {
+                    s.trial_id = s.trial_id.checked_add(1).ok_or(DomainError::Overflow)?;
+                }
                 s.permit = None;
                 s.prepared = None;
                 s.preparation = None;
@@ -1489,6 +1770,10 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
                 s.unpublished = None;
                 s.phase = if s.retry_group.is_some() {
                     Phase::Restart
+                } else if COLLECTION_PROFILE.bounded()
+                    && (!bounded(s).ledger.can_admit() || !bounded(s).ledger.retryable())
+                {
+                    Phase::CollectionArchive
                 } else {
                     Phase::Prepare
                 };
@@ -1499,15 +1784,167 @@ fn service(trace: &mut diagnostic::Attempt) -> Result<bool, DomainError> {
     }
     Ok(true)
 }
+#[inline(never)]
+fn bounded_complete_step() -> Result<bool, DomainError> {
+    let data = data::status().map_err(domain_error)?;
+    let work_clear = work::quiescent();
+    with(|s| {
+        bounded_sync(s)?;
+        if s.phase != Phase::CollectionArchive {
+            return Ok(false);
+        }
+        let owner_clear = collection_owner_clear(s);
+        let settled = runtime::learning_turn_settled(s.collection_release_ticket);
+        let ledger = bounded(s);
+        if !owner_clear
+            || !work_clear
+            || data.pending_baseline
+            || !settled
+            || !ledger.ledger.references_closed()
+            || !ledger
+                .archive
+                .as_ref()
+                .is_some_and(super::bounded_export::Archive::done)
+        {
+            return Ok(false);
+        }
+        let archive = ledger.archive.as_ref().ok_or(DomainError::NotReady)?;
+        // A hard failure after final snapshot construction cannot rewrite that
+        // immutable bank. Its new fault record is still owed: remain incomplete.
+        if !ledger.ledger.snapshot_current(archive.bytes()) {
+            return Ok(false);
+        }
+        if data.paired != usize::from(ledger.ledger.stored())
+            || ledger.ledger.stored() && ledger.ledger.selected().is_err()
+        {
+            return Err(DomainError::Conflict);
+        }
+        if !ledger.ledger.retryable() {
+            s.phase = Phase::BoundedStopped;
+        } else if ledger.ledger.stored() {
+            s.phase = Phase::CollectionComplete;
+        } else if ledger.ledger.exhausted() {
+            s.phase = Phase::BoundedExhausted;
+        } else {
+            return Err(DomainError::Conflict);
+        }
+        Ok(true)
+    })
+}
+#[inline(never)]
+fn publish_bounded(data: &data::Status) {
+    let work_clear = work::quiescent();
+    let Ok(words) = with(|s| {
+        bounded_sync(s)?;
+        let mut words = [0u64; 1024];
+        words[1] = super::bounded_data::MAGIC;
+        words[2] = 2;
+        words[3] = 2;
+        words[4] = s.phase as u64;
+        words[10] = s.excluded;
+        words[11] = s.verified;
+        words[12] = s.archived;
+        words[13] = data.paired as u64;
+        words[14] = u64::from(data.pending_baseline);
+        words[15] = u64::from(collection_owner_clear(s));
+        words[16] = u64::from(work_clear);
+        words[25] = s.collection_release_ticket;
+        words[26] = u64::from(runtime::learning_turn_settled(s.collection_release_ticket));
+        let witness = s.sample_witness.as_ref().map(|w| w.0);
+        let b = bounded(s);
+        words[5] = b.ledger.count() as u64;
+        words[6] = super::bounded_data::MAX_ATTEMPTS as u64;
+        words[7] = u64::from(b.ledger.stored());
+        words[8] = u64::from(b.ledger.exhausted());
+        words[9] = u64::from(b.ledger.references_closed());
+        let selected = b.ledger.selected_trials();
+        words[27] = selected[0];
+        words[28] = selected[1];
+        words[29] = b.ledger.journals() as u64;
+        words[30] = b.ledger.closed() as u64;
+        b.ledger.rows_words(&mut words[32..368]);
+        words[524..528].copy_from_slice(&b.ledger.hard_stop());
+        if let Some(a) = b.archive.as_ref() {
+            words[17] = u64::from(a.done());
+            if let Some(o) = a.object() {
+                words[18] = o.id;
+                words[19] = o.generation;
+            }
+            words[20] = super::bounded_data::SUPPLEMENT_BYTES as u64;
+            for (i, c) in a.digest().chunks_exact(8).enumerate() {
+                words[21 + i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+            for (i, c) in a.bytes()[2816..3872].chunks_exact(8).enumerate() {
+                words[368 + i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+            for (i, c) in a.bytes()[3872..4064].chunks_exact(8).enumerate() {
+                words[500 + i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+        } else if let Some(w) = witness {
+            for (i, c) in w.chunks_exact(8).enumerate() {
+                words[368 + i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+            let hash: [u8; 32] = Sha256::digest(w).into();
+            for (i, c) in hash.chunks_exact(8).enumerate() {
+                words[496 + i] = u64::from_le_bytes(c.try_into().unwrap());
+            }
+        }
+        words[31] = crate::domain_platform::now_ns();
+        Ok(words)
+    }) else {
+        return;
+    };
+    CORESET_BOUNDED_DATA_EVIDENCE.0[0].fetch_add(1, Ordering::AcqRel);
+    for (i, w) in words.into_iter().enumerate().skip(1) {
+        CORESET_BOUNDED_DATA_EVIDENCE.0[i].store(w, Ordering::Relaxed);
+    }
+    CORESET_BOUNDED_DATA_EVIDENCE.0[0].fetch_add(1, Ordering::Release);
+}
+fn collection_complete_step() -> Result<bool, DomainError> {
+    if COLLECTION_PROFILE.bounded() {
+        return bounded_complete_step();
+    }
+    if COLLECTION_PROFILE != CollectionProfile::CoreSetOnePair {
+        return Ok(false);
+    }
+    let data = data::status().map_err(domain_error)?;
+    let work_quiescent = work::quiescent();
+    with(|s| {
+        if s.phase != Phase::CollectionArchive {
+            return Ok(false);
+        }
+        let facts = super::collection_profile::ReleaseFacts {
+            owner_clear: collection_owner_clear(s),
+            work_quiescent,
+            pending_baseline: data.pending_baseline,
+            witness_durable: s
+                .sample_archive
+                .as_ref()
+                .is_some_and(sample_export::Archive::done),
+            credit_settled: runtime::learning_turn_settled(s.collection_release_ticket),
+        };
+        if s.family == 1
+            && s.group == 0
+            && s.excluded == 0
+            && s.last_error.is_none()
+            && COLLECTION_PROFILE.pair_complete(s.verified, s.archived, data.paired)
+            && facts.complete()
+        {
+            s.phase = Phase::CollectionComplete;
+            return Ok(true);
+        }
+        Ok(false)
+    })
+}
 pub fn service_io(progress: &mut dyn FnMut()) {
     if cyxia_arch_aarch64::cpu::slot() != 0
         || with(|s| {
-            Ok(
-                !(matches!(s.phase, Phase::Archive | Phase::PreparationArchive)
-                    || s.phase == Phase::ReleaseWork
-                        && !s.partial_start
-                        && matches!(FAMILIES[s.family].domain, 10 | 12 | 16)),
-            )
+            Ok(!(matches!(
+                s.phase,
+                Phase::Archive | Phase::PreparationArchive | Phase::CollectionArchive
+            ) || s.phase == Phase::ReleaseWork
+                && !s.partial_start
+                && matches!(FAMILIES[s.family].domain, 10 | 12 | 16)))
         })
         .unwrap_or(true)
     {
@@ -1515,6 +1952,58 @@ pub fn service_io(progress: &mut dyn FnMut()) {
     }
     let result = crate::domain_tasks::service_io_piece(None, progress, |yield_io| {
         with(|s| {
+            bounded_sync(s)?;
+            if s.phase == Phase::CollectionArchive {
+                if COLLECTION_PROFILE.bounded() {
+                    if !runtime::learning_turn_settled(s.collection_release_ticket) {
+                        return Ok(false);
+                    }
+                    if bounded(s).archive.is_none() {
+                        let counters = [s.excluded, s.verified, s.archived];
+                        let ticket = s.collection_release_ticket;
+                        let mut witness = [0u8; 1024];
+                        let stored = bounded(s).ledger.stored();
+                        if stored {
+                            witness.copy_from_slice(
+                                &s.sample_witness.as_ref().ok_or(DomainError::NotReady)?.0,
+                            );
+                        }
+                        let bytes = bounded(s).ledger.supplement(
+                            if stored { Some(&witness) } else { None },
+                            counters,
+                            ticket,
+                            true,
+                        )?;
+                        let boot = bounded(s).ledger.row(0)[2];
+                        let archive = super::bounded_export::Archive::new(bytes, boot)?;
+                        bounded(s).archive = Some(archive);
+                        s.sample_witness = None;
+                    }
+                    return bounded(s)
+                        .archive
+                        .as_mut()
+                        .ok_or(DomainError::NotReady)?
+                        .step(yield_io);
+                }
+                if s.sample_archive.is_none() {
+                    let baseline = s.collection_exports[0].ok_or(DomainError::NotReady)?;
+                    let candidate = s.collection_exports[1].ok_or(DomainError::NotReady)?;
+                    // Validate durable identities before consuming the sole handoff.
+                    if baseline.key().boot_epoch != candidate.key().boot_epoch
+                        || baseline.key().trial_id == candidate.key().trial_id
+                    {
+                        return Err(DomainError::Conflict);
+                    }
+                    let witness = s.sample_witness.take().ok_or(DomainError::NotReady)?;
+                    s.sample_archive =
+                        Some(sample_export::Archive::new(witness, baseline, candidate)?);
+                }
+                return s
+                    .sample_archive
+                    .as_mut()
+                    .ok_or(DomainError::NotReady)?
+                    .step(yield_io);
+            }
             if s.phase == Phase::ReleaseWork {
                 let run = s.scope.ok_or(DomainError::NotReady)?.key;
                 let replace = match s.archive.as_ref() {
@@ -1544,8 +2033,25 @@ pub fn service_io(progress: &mut dyn FnMut()) {
                     // This capability is available only after the new raw
                     // signed packet was fsynced, read back and closed. Busy
                     // leaves the completed archive available for exact retry.
-                    crate::peer_replay::late_archived(archive.export()?)?;
-                    s.late_segment = archive.segment();
+                    let export = archive.export()?;
+                    let segment = archive.segment();
+                    crate::peer_replay::late_archived(export)?;
+                    if COLLECTION_PROFILE.bounded() {
+                        let k = export.receipt().key();
+                        let o = export.object();
+                        bounded(s).ledger.journal(
+                            k.trial_id,
+                            2,
+                            super::bounded_data::Reference {
+                                key: [k.boot_epoch, k.trial_id, k.generation],
+                                object: [o.id, o.generation],
+                                offset: export.offset(),
+                                bytes: export.bytes() as u64,
+                                digest: export.digest(),
+                            },
+                        )?;
+                    }
+                    s.late_segment = segment;
                     s.archived += 1;
                     s.archive = None;
                 }
@@ -1576,7 +2082,23 @@ pub fn service_io(progress: &mut dyn FnMut()) {
                 let archive = s.prepare_archive.as_mut().ok_or(DomainError::NotReady)?;
                 let progressed = archive.step(s.prepared.as_ref(), yield_io)?;
                 if archive.done() {
+                    let export = archive.export()?;
                     s.prepare_segment = archive.segment();
+                    if COLLECTION_PROFILE.bounded() {
+                        let p = export.close().preparation();
+                        let o = export.object();
+                        bounded(s).ledger.journal(
+                            p.trial_id,
+                            1,
+                            super::bounded_data::Reference {
+                                key: [p.boot_epoch, p.trial_id, 0],
+                                object: [o.id, o.generation],
+                                offset: export.offset(),
+                                bytes: export.bytes() as u64,
+                                digest: export.digest(),
+                            },
+                        )?;
+                    }
                     s.archived += 1;
                     s.phase = Phase::PreparationReleaseWork;
                 }
@@ -1609,13 +2131,32 @@ pub fn service_io(progress: &mut dyn FnMut()) {
             };
             let progressed = archive.step(yield_io)?;
             if archive.done() {
+                let export = archive.export()?;
+                let segment = archive.segment();
                 if s.partial_start {
-                    root::mark_unactivated_archived(
-                        s.token.ok_or(DomainError::NotReady)?,
-                        archive.export()?,
-                    )?;
+                    root::mark_unactivated_archived(s.token.ok_or(DomainError::NotReady)?, export)?;
                 }
-                s.segment = archive.segment();
+                if COLLECTION_PROFILE.bounded() {
+                    let trial = s.trial_id;
+                    let verification = s.verification.ok_or(DomainError::NotReady)?;
+                    match verification {
+                        Ok(hash) => bounded(s).ledger.verified(trial, hash)?,
+                        Err(error) => bounded(s).ledger.excluded(trial, error as u64 + 1)?,
+                    }
+                    bounded(s)
+                        .ledger
+                        .journal(trial, 0, bounded_regular(export))?;
+                }
+                if COLLECTION_PROFILE == CollectionProfile::CoreSetOnePair
+                    && s.verification.is_some_and(|v| v.is_ok())
+                {
+                    let index = usize::from(s.kind == TrialKind::Candidate);
+                    if s.collection_exports[index].is_some() {
+                        return Err(DomainError::Capacity);
+                    }
+                    s.collection_exports[index] = Some(export);
+                }
+                s.segment = segment;
                 s.archived += 1;
                 s.phase = Phase::RetireCapture;
             }
@@ -1625,6 +2166,7 @@ pub fn service_io(progress: &mut dyn FnMut()) {
     if let Some(Err(error)) = result {
         retain_error(error, None);
     }
+    let _ = collection_complete_step();
     publish_evidence();
 }
 // Keep mutually exclusive phase work off one shared native stack frame. In
@@ -1636,13 +2178,24 @@ pub fn control_step() -> Result<bool, DomainError> {
         return Err(DomainError::Auth);
     }
     runtime::authorize_learning_turn()?;
-    match with(|s| Ok(s.phase))? {
+    let result = match with(|s| {
+        bounded_sync(s)?;
+        Ok(s.phase)
+    })? {
         Phase::Run => control_probe_step(),
         Phase::Restart => control_restart_step(),
         Phase::Complete => control_complete_step(),
+        Phase::CollectionArchive => collection_release_input(),
         Phase::Verify => control_verify_step(),
         _ => Ok(false),
+    };
+    if COLLECTION_PROFILE.bounded()
+        && let Err(error) = result
+        && super::bounded_data::is_hard(error)
+    {
+        HARD_PENDING.record(error, crate::domain_platform::now_ns());
     }
+    result
 }
 
 #[inline(never)]
@@ -1677,6 +2230,9 @@ fn control_probe_step() -> Result<bool, DomainError> {
 
 #[inline(never)]
 fn control_restart_step() -> Result<bool, DomainError> {
+    if COLLECTION_PROFILE.bounded() && with(|s| Ok(bounded(s).ledger.stored()))? {
+        return Err(DomainError::Conflict);
+    }
     let (family, group) = with(|s| {
         Ok((
             FAMILIES[s.family],
@@ -1690,12 +2246,40 @@ fn control_restart_step() -> Result<bool, DomainError> {
         s.prepared = None;
         s.retry_group = None;
         s.pair_group = None;
-        s.phase = Phase::Prepare;
+        if COLLECTION_PROFILE.bounded() {
+            bounded(s).ledger.supersede()?;
+            s.phase = if bounded(s).ledger.can_admit() && bounded(s).ledger.retryable() {
+                Phase::Prepare
+            } else {
+                Phase::CollectionArchive
+            };
+        } else {
+            s.phase = Phase::Prepare;
+        }
         Ok(())
     })?;
     Ok(true)
 }
 
+#[inline(never)]
+fn collection_release_input() -> Result<bool, DomainError> {
+    with(|s| {
+        if let Some(loan) = s.loan.as_mut() {
+            let ticket = runtime::learning_turn_ticket()?;
+            runtime::abandon_learning_input(loan)?;
+            s.loan = None;
+            s.scratch = 0;
+            s.initialized = 0;
+            s.collection_release_ticket = ticket;
+            return Ok(true);
+        }
+        if COLLECTION_PROFILE.bounded() && s.collection_release_ticket == 0 {
+            s.collection_release_ticket = runtime::learning_turn_ticket()?;
+            return Ok(true);
+        }
+        Ok(false)
+    })
+}
 #[inline(never)]
 fn control_complete_step() -> Result<bool, DomainError> {
     let released = with(|s| {
@@ -1722,7 +2306,11 @@ fn control_verify_step() -> Result<bool, DomainError> {
             error,
             DomainError::Busy | DomainError::Again | DomainError::NotReady
         ) {
+            if COLLECTION_PROFILE.bounded() && super::bounded_data::is_hard(error) {
+                HARD_PENDING.record(error, crate::domain_platform::now_ns());
+            }
             with(|s| {
+                bounded_sync(s)?;
                 let error = native_error(error);
                 s.verification = Some(Err(error));
                 s.last_error = Some(error);
@@ -1902,14 +2490,19 @@ fn verify(s: &mut State) -> Result<Option<[u8; 32]>, Error> {
     if s.records == 0 || s.retained == 0 {
         return Err(Error::DataIncomplete);
     }
-    let scope = s.scope.as_ref().ok_or(Error::State)?;
+    let scope = s.scope.ok_or(Error::State)?;
     let seal = s.seal.ok_or(Error::State)?;
     let prepared = s.prepared.as_ref().ok_or(Error::State)?;
-    let model = s.model.as_ref().ok_or(Error::State)?;
-    let address = model
-        .physical_address()
-        .checked_add(crate::HIGH)
-        .ok_or(Error::Capacity)?;
+    let (address, model_binding) = {
+        let model = s.model.as_ref().ok_or(Error::State)?;
+        (
+            model
+                .physical_address()
+                .checked_add(crate::HIGH)
+                .ok_or(Error::Capacity)?,
+            model.binding(),
+        )
+    };
     let bytes = unsafe { &*(address as *const [u8; MODEL_BYTES]) };
     let scratch = s.scratch as *mut Scratch;
     let mut adoptions: [MaybeUninit<Adoption<'_>>; RECORD_LIMIT] =
@@ -1919,7 +2512,7 @@ fn verify(s: &mut State) -> Result<Option<[u8; 32]>, Error> {
             let record =
                 unsafe { (&*core::ptr::addr_of!((*scratch).records[i])).assume_init_ref() };
             let set = unsafe { (&*core::ptr::addr_of!((*scratch).sets[i])).assume_init_ref() };
-            if set.model != model.binding() {
+            if set.model != model_binding {
                 return Err(Error::Stale);
             }
             slot.write(
@@ -1951,11 +2544,47 @@ fn verify(s: &mut State) -> Result<Option<[u8; 32]>, Error> {
     };
     let delivery =
         unsafe { (&mut *core::ptr::addr_of_mut!((*scratch).delivery)).assume_init_mut() };
+    if COLLECTION_PROFILE.bounded() {
+        bounded_sync(s).map_err(native_error)?;
+        if bounded(s).ledger.hard_stop()[0] != 0 {
+            return Err(Error::Safety);
+        }
+    }
     if let Some(verified) = delivery.take() {
         let hash = verified.evidence_hash();
         let probe = adoption_slice.first().map(|a| a.candidates);
-        return match data::accept_bounded(verified, s.split(), probe) {
-            Ok(()) => Ok(Some(hash)),
+        let split = s.split();
+        let outbound = if COLLECTION_PROFILE.focused() {
+            Some(&mut s.sample_witness)
+        } else {
+            None
+        };
+        return match data::accept_bounded_outbound(verified, split, probe, outbound) {
+            Ok(()) => {
+                if COLLECTION_PROFILE.bounded() {
+                    if s.kind == TrialKind::Candidate {
+                        // A real AcceptedSample was already stored. Latch first;
+                        // even contradictory follow-up observations cannot restart.
+                        let mut witness = [0u8; 1024];
+                        if let Some(w) = s.sample_witness.as_ref() {
+                            witness.copy_from_slice(&w.0);
+                        }
+                        let trial = s.trial_id;
+                        // Set selection's candidate evidence from the actual delivery.
+                        let verification = bounded(s).ledger.verified(trial, hash);
+                        let latch = bounded(s).ledger.store(&witness);
+                        verification.map_err(native_error)?;
+                        latch.map_err(native_error)?;
+                    } else {
+                        let trial = s.trial_id;
+                        bounded(s)
+                            .ledger
+                            .verified(trial, hash)
+                            .map_err(native_error)?;
+                    }
+                }
+                Ok(Some(hash))
+            }
             Err(data::AcceptFailure::Busy(verified)) => {
                 *delivery = Some(verified);
                 Ok(None)
@@ -1966,6 +2595,7 @@ fn verify(s: &mut State) -> Result<Option<[u8; 32]>, Error> {
     let workspace = unsafe { (&mut *core::ptr::addr_of_mut!((*scratch).reward)).assume_init_mut() };
     let verification =
         unsafe { (&mut *core::ptr::addr_of_mut!((*scratch).verification)).assume_init_mut() };
+    let model = s.model.as_ref().ok_or(Error::State)?;
     let result = capture::with_sealed_trace(seal, |trace| {
         let mut coverage = [trace.coverage(); 2];
         let mut nodes = [coverage[0].node; 2];
@@ -1978,7 +2608,7 @@ fn verify(s: &mut State) -> Result<Option<[u8; 32]>, Error> {
             count = 2;
             coverage[1] = peer.seal.coverage;
             nodes[1] = coverage[1].node;
-            frozen = history::replay::partner_frozen(scope, peer)?;
+            frozen = history::replay::partner_frozen(&scope, peer)?;
             warmup = warmup
                 .checked_add(peer.seal.ordinary_warmup_ns)
                 .ok_or(Error::Numeric)?;
@@ -2038,3 +2668,240 @@ const _: () = assert!(
         <= crate::domain_control::learning_driver::MAX_SOURCE_BYTES
 );
 const _: () = assert!(WORKSPACE_PEAK_BYTES <= 1024 * 1024);
+
+#[derive(Clone, Copy)]
+pub(crate) struct PrewarmHint {
+    owner: super::prewarm_progress::Owner,
+    preparation: root::Preparation,
+    token: root::Token,
+    target: ObjectKey,
+    queue: crate::domain_control::core_replay::PrewarmSnapshot,
+    reason: super::prewarm_progress::Reason,
+}
+fn core_owner_observation() -> Option<(
+    super::prewarm_progress::Owner,
+    root::Preparation,
+    root::Token,
+    ObjectKey,
+)> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return None;
+    }
+    with(|s| {
+        let p = s.preparation.ok_or(DomainError::NotReady)?;
+        let t = s.token.ok_or(DomainError::NotReady)?;
+        let prepared = s.prepared.as_ref().ok_or(DomainError::NotReady)?;
+        let owner = super::prewarm_progress::Owner {
+            phase: s.phase as u64,
+            trial_kind: if s.kind == TrialKind::Candidate { 1 } else { 2 },
+            domain: FAMILIES[s.family.min(17)].domain,
+            kind: FAMILIES[s.family.min(17)].kind,
+            preparation: p.id,
+            boot: p.boot_epoch,
+            trial: s.trial_id,
+            token: t.id,
+            target: prepared.target.id,
+            seed: prepared.group.seed,
+            claimed: s.prepare_claimed,
+            prepared: p.trial_id == s.trial_id
+                && p.kind == s.kind
+                && p.family == prepared.family
+                && p.seed == prepared.group.seed
+                && t.boot_epoch == p.boot_epoch
+                && t.owner == p.owner
+                && p.owner == work::OWNER,
+            scope: s.scope.is_some(),
+            first: s.first_ready || s.partial_start,
+            activated: s.work_activation.entered(),
+            paused: PAUSED.load(Ordering::Acquire),
+            error: s.last_error.is_some() || s.prepare_error.is_some(),
+        };
+        Ok((owner, p, t, prepared.target))
+    })
+    .ok()
+}
+fn queue_progress(
+    q: crate::domain_control::core_replay::PrewarmSnapshot,
+) -> super::prewarm_progress::Queue {
+    super::prewarm_progress::Queue {
+        serial: q.serial,
+        seed: q.seed,
+        target: q.target.id,
+        has_scope: q.scope,
+        first: q.first,
+        stopped: q.stopped,
+        fault: q.fault.is_some(),
+        warm_queued: q.warm_queued,
+        warm_phase: q.warm_phase,
+        warm_at: q.warm_at,
+    }
+}
+fn observed_core_prewarm() -> Option<(
+    super::prewarm_progress::Owner,
+    root::Preparation,
+    root::Token,
+    ObjectKey,
+    crate::domain_control::core_replay::PrewarmSnapshot,
+)> {
+    let (o, p, t, target) = core_owner_observation()?;
+    let q = crate::domain_control::core_replay::prewarm_snapshot().ok()?;
+    let root_matches = root::observes_core_prewarm(p, t, target, q.model);
+    let work_matches = work::owns_core_prewarm(p, t, target);
+    (q.target == target
+        && super::prewarm_progress::owned(o, queue_progress(q), root_matches, work_matches))
+    .then_some((o, p, t, target, q))
+}
+pub(crate) fn prewarm_service_hint() -> Option<PrewarmHint> {
+    let (owner, preparation, token, target, q) = observed_core_prewarm()?;
+    if q.claim.is_some() {
+        return None;
+    }
+    let (active, open, session) = crate::learning_prewarm::admission_observation();
+    if session == 0 {
+        return None;
+    }
+    let reason = super::prewarm_progress::reason(
+        owner,
+        queue_progress(q),
+        true,
+        true,
+        crate::domain_platform::now_ns(),
+        active,
+        open,
+    )?;
+    Some(PrewarmHint {
+        owner,
+        preparation,
+        token,
+        target,
+        queue: q,
+        reason,
+    })
+}
+/// This body is reachable only inside a newly authorized kind-5 service turn.
+/// A stale hint is discarded, never converted to a permissive Busy outcome.
+pub(crate) fn service_owned_prewarm(hint: PrewarmHint) -> Result<bool, DomainError> {
+    crate::domain_tasks::authorize_service_turn()?;
+    let Some(fresh) = prewarm_service_hint() else {
+        return Ok(false);
+    };
+    if fresh.owner != hint.owner
+        || fresh.preparation != hint.preparation
+        || fresh.token != hint.token
+        || fresh.target != hint.target
+        || fresh.queue.serial != hint.queue.serial
+        || fresh.queue.model != hint.queue.model
+        || fresh.reason != hint.reason
+    {
+        return Ok(false);
+    }
+    service_step()
+}
+fn publish_prewarm_progress() {
+    let Ok(mut w) = with(|s| {
+        let mut w = [0; 128];
+        w[1] = super::prewarm_status::MAGIC;
+        w[2] = 1;
+        w[4] = s.phase as u64;
+        w[5] = FAMILIES[s.family.min(17)].domain as u64;
+        w[6] = FAMILIES[s.family.min(17)].kind as u64;
+        w[7] = s.group as u64;
+        w[8] = if s.kind == TrialKind::Candidate { 1 } else { 2 };
+        if let Some(p) = s.preparation {
+            w[9] = p.id;
+            w[10] = p.boot_epoch;
+            w[11] = p.trial_id;
+            w[12] = p.started_ns;
+            w[17] = p.seed;
+        }
+        if let Some(t) = s.token {
+            w[13] = t.id;
+            w[14] = t.boot_epoch;
+        }
+        if let Some(p) = &s.prepared {
+            w[15] = p.target.id;
+            w[16] = p.target.generation;
+        }
+        w[83] = u64::from(s.prepare_claimed)
+            | (u64::from(s.prepared.is_some()) << 1)
+            | (u64::from(s.token.is_some()) << 2)
+            | (u64::from(s.scope.is_some()) << 3)
+            | (u64::from(s.first_ready) << 4)
+            | (u64::from(s.work_activation.entered()) << 5)
+            | (u64::from(PAUSED.load(Ordering::Acquire)) << 6)
+            | (u64::from(s.last_error.is_some()) << 7);
+        w[84] = s.root_phase;
+        w[85] = PREWARM_LAST_SERVICE_OUTCOME.load(Ordering::Acquire);
+        Ok(w)
+    }) else {
+        return;
+    };
+    if let Ok(q) = crate::domain_control::core_replay::prewarm_snapshot() {
+        w[18] = q.serial;
+        w[19] = q.model.generation;
+        w[20] = q.seed;
+        w[21] = q.target.id;
+        w[22] = q.target.generation;
+        w[23] = u64::from(q.scope);
+        w[24] = u64::from(q.first);
+        w[25] = u64::from(q.stopped);
+        w[26] = q.fault.map_or(0, |e| e as u64 + 1);
+        w[27] = u64::from(q.warm_queued);
+        w[28] = q.warm_phase;
+        w[29] = q.warm_serial;
+        w[30] = q.warm_release;
+        w[31] = q.warm_at;
+        let outcome = |r: Option<Result<u64, DomainError>>| match r {
+            None => (0, 0, 0),
+            Some(Ok(t)) => (1, 0, t),
+            Some(Err(e)) => (2, e as u64 + 1, 0),
+        };
+        (w[32], w[33], w[36]) = outcome(q.warm_result);
+        w[34] = u64::from(q.warm_reported);
+        w[35] = q.warm_root;
+        w[37] = q.primary_phase;
+        (w[38], w[39], w[42]) = outcome(q.primary_result);
+        w[40] = u64::from(q.primary_reported);
+        w[41] = q.primary_root;
+        if let Some((id, snapshot)) = q.claim {
+            w[86] = 1;
+            w[87] = id.sequence;
+            w[88] = snapshot.taken_ns;
+            w[89] = snapshot
+                .taken_ns
+                .checked_add(50_000_000)
+                .unwrap_or(u64::MAX);
+        }
+        w[90] = q.claim_retire.map_or(0, |e| e as u64 + 1);
+    }
+    let p = crate::learning_prewarm::progress_status();
+    w[43] = p.session;
+    w[44] = u64::from(p.active);
+    w[45] = p.open;
+    w[46] = u64::from(p.lost);
+    w[47] = p.completed_before;
+    w[48] = p.completed_after;
+    w[49] = p.latest;
+    w[50] = p.started;
+    w[51] = p.first;
+    w[52..68].copy_from_slice(&p.times);
+    w[68..72].copy_from_slice(&p.heads);
+    w[72..76].copy_from_slice(&p.tails);
+    w[78] = p.ready_first;
+    w[79] = p.ready_recent;
+    w[80] = p.ready_earliest;
+    w[81] = p.ready_reason;
+    w[82] = u64::from(
+        p.completed_before == p.completed_after
+            && (p.completed_after == 0
+                || p.times[(p.completed_after as usize - 1) % 16] == p.latest),
+    );
+    if let Some(hint) = prewarm_service_hint() {
+        w[76] = hint.reason as u64;
+        w[77] = 1;
+    }
+    // The diagnostic time closes this observation: no later concurrent
+    // completion is misrepresented as occurring before an earlier sample.
+    w[3] = crate::domain_platform::now_ns();
+    super::prewarm_status::publish(&w);
+}

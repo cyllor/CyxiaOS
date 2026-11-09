@@ -75,6 +75,22 @@ static CAPTURE_BOOT: AtomicU64 = AtomicU64::new(0);
 static HISTORY_READY: AtomicBool = AtomicBool::new(false);
 static HISTORY_LOANED: AtomicBool = AtomicBool::new(false);
 static EXTRA_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Outbound exact-turn fence: a collection may release a loan inside the turn,
+// but CPU0 cannot claim its credit released until both actual bills settle.
+#[path = "learning_turn_fence.rs"]
+mod turn_fence;
+static DRIVER_FENCE: turn_fence::Fence = turn_fence::Fence::new();
+pub fn turn_ticket() -> Result<u64, DomainError> {
+    require_extra_caller()?;
+    let ticket = DRIVER_FENCE.ticket();
+    if ticket == 0 {
+        return Err(DomainError::NotReady);
+    }
+    Ok(ticket)
+}
+pub fn turn_settled(ticket: u64) -> bool {
+    DRIVER_FENCE.settled(ticket)
+}
 static INPUT_IDLE: AtomicBool = AtomicBool::new(false);
 static INPUT_TOKEN: AtomicU64 = AtomicU64::new(0);
 static INPUT_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -1355,6 +1371,9 @@ pub(super) fn settle(worker: &mut Worker) -> bool {
         worker.extra_ns = 0;
     }
     worker.extra_ns = worker.extra_ns.saturating_add(bill.actual);
+    if worker.failed == 0 {
+        DRIVER_FENCE.acknowledge(bill.physical.sequence);
+    }
     worker.last_bill = [
         bill.physical.sequence,
         bill.physical.started_ns,
@@ -1981,6 +2000,7 @@ pub(super) fn step(worker: &mut Worker) {
     // owner. Actual CACP generation/scoring/publication and controlled replay
     // evaluation measure their own exact job target and physical CPU.
     if extra.is_some() {
+        DRIVER_FENCE.begin(credit.sequence);
         EXTRA_ACTIVE.store(true, Ordering::Release);
         if let Err(error) = turn(worker, credit, begin) {
             if !matches!(

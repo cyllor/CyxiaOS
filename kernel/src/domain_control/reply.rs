@@ -2,7 +2,7 @@
 //! read-only CACP work. This module cannot publish or create executor custody.
 use cyxia_prototype::{
     domains::{Action, Error, POLICY_NS, WINDOW_NS},
-    policy::CandidateSet,
+    policy::{CandidateSet, CanonicalPlan},
     policy_wire::{self, Decision, Envelope, PlanHeader},
 };
 
@@ -19,8 +19,7 @@ pub(super) struct Verified {
     pub action: Action,
     pub selected: usize,
     pub scores: [i16; 32],
-    pub bytes: [u8; 384],
-    pub len: usize,
+    pub canonical: CanonicalPlan<384>,
 }
 pub(super) fn verify(expected: Expected<'_>, output: &[u64; 512]) -> Result<Verified, Error> {
     let set = expected.set;
@@ -87,20 +86,21 @@ pub(super) fn verify(expected: Expected<'_>, output: &[u64; 512]) -> Result<Veri
             candidate_set_hash: set.hash(),
         },
     };
-    let mut canonical = [0; 384];
-    let len = policy_wire::encode_plan(header, &[decision], &mut canonical)?;
+    let canonical = CanonicalPlan::encode(header, &[decision])?;
     let mut bytes = [0u8; 384];
     for (i, word) in output[16..64].iter().enumerate() {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
-    if output[5] != len as u64 || bytes != canonical || output[64..].iter().any(|v| *v != 0) {
+    if output[5] != canonical.bytes().len() as u64
+        || &bytes != canonical.storage()
+        || output[64..].iter().any(|v| *v != 0)
+    {
         return Err(Error::Conflict);
     }
     Ok(Verified {
         action: candidate.action,
         selected,
         scores,
-        bytes,
-        len,
+        canonical,
     })
 }

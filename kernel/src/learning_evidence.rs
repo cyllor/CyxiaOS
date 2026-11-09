@@ -19,6 +19,8 @@ use cyxia_prototype::{
     },
 };
 
+#[path = "domain_tasks/measured_interval.rs"]
+mod measured_interval;
 pub type Storage = Capture<8192, 4096>;
 pub const STORAGE_BYTES: usize = core::mem::size_of::<Storage>();
 pub const EXPORT_CHUNK: usize = 16;
@@ -258,13 +260,7 @@ fn cpu_elapsed_ns(started: u64) -> u64 {
 
 #[inline]
 fn finish_cpu_interval(started: u64) -> (u64, u64, u64) {
-    let finished_ns = now_ns();
-    let actual_ns = cpu_elapsed_ns(started);
-    (
-        finished_ns.saturating_sub(actual_ns),
-        finished_ns,
-        actual_ns,
-    )
+    measured_interval::finish(|| cpu_elapsed_ns(started), now_ns)
 }
 fn add(counter: &AtomicU64, value: u64) {
     let _ = counter.fetch_update(Ordering::Release, Ordering::Relaxed, |old| {

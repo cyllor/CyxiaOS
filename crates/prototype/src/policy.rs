@@ -13,6 +13,104 @@ pub const MAX_PENDING: usize = 64;
 pub const TERMINAL_HISTORY: usize = 256;
 pub const PUBLICATION_BUDGET_NS: u64 = 500_000;
 
+// Only the unchanged decoded wire Plan and our encoder-owned representation
+// implement this view. Header/decisions are copied values, never mutable views.
+mod plan_view_sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Plan {}
+    impl<const N: usize> Sealed for super::CanonicalPlan<N> {}
+}
+pub trait PlanView: plan_view_sealed::Sealed {
+    fn header(&self) -> policy_wire::PlanHeader;
+    fn len(&self) -> usize;
+    fn action(&self, index: usize) -> Option<Decision>;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn iter(&self) -> impl Iterator<Item = Decision> {
+        (0..self.len()).filter_map(|index| self.action(index))
+    }
+}
+impl PlanView for Plan {
+    fn header(&self) -> policy_wire::PlanHeader {
+        self.header
+    }
+    fn len(&self) -> usize {
+        Plan::len(self)
+    }
+    fn action(&self, index: usize) -> Option<Decision> {
+        Plan::action(self, index)
+    }
+}
+
+/// Owned structural proof from the unchanged full canonical encoder. This
+/// grants no reply-authentication, publisher, model or resource authority.
+/// Private bytes and private validated decisions cannot be replaced separately.
+/// Caller input mutation cannot change this owned value.
+///
+/// ```compile_fail
+/// use cyxia_prototype::policy::CanonicalPlan;
+/// let forged = CanonicalPlan::<384> { bytes: [0;384], len: 0, header: todo!(), actions: todo!(), count: 0 };
+/// ```
+pub struct CanonicalPlan<const N: usize> {
+    header: policy_wire::PlanHeader,
+    actions: [Option<Decision>; policy_wire::MAX_ACTIONS],
+    count: usize,
+    bytes: [u8; N],
+    len: usize,
+}
+impl<const N: usize> CanonicalPlan<N> {
+    pub fn encode(header: policy_wire::PlanHeader, actions: &[Decision]) -> Result<Self, Error> {
+        let mut bytes = [0; N];
+        let len = policy_wire::encode_plan(header, actions, &mut bytes)?;
+        let mut parsed = [None; policy_wire::MAX_ACTIONS];
+        for (destination, decision) in parsed.iter_mut().zip(actions) {
+            *destination = Some(*decision);
+        }
+        Ok(Self {
+            header,
+            actions: parsed,
+            count: actions.len(),
+            bytes,
+            len,
+        })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+    /// Immutable padded storage for native exact canonical reply comparison.
+    pub fn storage(&self) -> &[u8; N] {
+        &self.bytes
+    }
+}
+impl<const N: usize> PlanView for CanonicalPlan<N> {
+    fn header(&self) -> policy_wire::PlanHeader {
+        self.header
+    }
+    fn len(&self) -> usize {
+        self.count
+    }
+    fn action(&self, index: usize) -> Option<Decision> {
+        self.actions.get(index).copied().flatten()
+    }
+}
+
+#[cfg(test)]
+mod decode_probe {
+    extern crate std;
+    use core::cell::Cell;
+    std::thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+    }
+    pub(super) fn count() -> usize {
+        CALLS.with(Cell::get)
+    }
+    pub(super) fn called() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 fn plan_receipt_digest(bytes: &[u8]) -> [u8; 32] {
     #[cfg(feature = "hardware-sha256")]
     if let Some(hash) = cyxia_arch_aarch64::sha256::digest(bytes) {
@@ -659,7 +757,7 @@ pub struct SubmissionObservation {
 }
 /// PREPARE must reserve all resources without starting physical effects. Failed
 /// publication is effect-free; cancel_prepared releases only those reservations.
-pub trait Executor {
+pub trait Executor<P: PlanView = Plan> {
     /// Passive only: no recursive publication, clock or resource operations.
     fn observed_submission(&mut self, _: &SubmissionObservation) {}
     /// Explicit authority for a fixed baseline, independent of model/Canary
@@ -682,7 +780,7 @@ pub trait Executor {
     fn authorize_recovery(
         &mut self,
         _active: ModelBinding,
-        _plan: &Plan,
+        _plan: &P,
         _started_ns: u64,
     ) -> Result<(), Error> {
         Err(Error::Budget)
@@ -705,10 +803,10 @@ pub trait Executor {
         }
     }
     fn check(&mut self, decision: Decision, set: &RegisteredSet, now_ns: u64) -> Result<(), Error>;
-    fn prepare(&mut self, plan: &Plan, version: u64) -> Result<(), Error>;
-    fn revalidate(&mut self, plan: &Plan, now_ns: u64) -> Result<(), Error>;
-    fn publish(&mut self, plan: &Plan, version: u64, now_ns: u64) -> Result<(), Error>;
-    fn cancel_prepared(&mut self, plan: &Plan);
+    fn prepare(&mut self, plan: &P, version: u64) -> Result<(), Error>;
+    fn revalidate(&mut self, plan: &P, now_ns: u64) -> Result<(), Error>;
+    fn publish(&mut self, plan: &P, version: u64, now_ns: u64) -> Result<(), Error>;
+    fn cancel_prepared(&mut self, plan: &P);
 }
 
 pub struct Registry {
@@ -1175,9 +1273,9 @@ impl Registry {
         }
         Ok(set)
     }
-    fn model_scope(
+    fn model_scope<P: PlanView>(
         &self,
-        plan: &Plan,
+        plan: &P,
         now: u64,
         registered: &mut [Option<usize>; 16],
     ) -> Result<ModelBinding, Error> {
@@ -1195,9 +1293,9 @@ impl Registry {
         }
         binding.ok_or(Error::Format)
     }
-    fn authorize_models<E: Executor>(
+    fn authorize_models<P: PlanView, E: Executor<P>>(
         &self,
-        plan: &Plan,
+        plan: &P,
         now: u64,
         registered: &mut [Option<usize>; 16],
         executor: &mut E,
@@ -1212,15 +1310,15 @@ impl Registry {
         }
         Ok(binding)
     }
-    fn validate<E: Executor>(
+    fn validate<P: PlanView, E: Executor<P>>(
         &self,
-        plan: &Plan,
+        plan: &P,
         now: u64,
         registered: &mut [Option<usize>; 16],
         executor: &mut E,
     ) -> Result<(), Error> {
-        if plan.header.active_model_generation != self.model.generation
-            || plan.header.base_plan_version != self.version
+        if plan.header().active_model_generation != self.model.generation
+            || plan.header().base_plan_version != self.version
         {
             return Err(Error::Stale);
         }
@@ -1259,7 +1357,7 @@ impl Registry {
                     .checked_add(POLICY_NS)
                     .ok_or(Error::Overflow)?
             };
-            if plan.header.active_until_local_ns != until {
+            if plan.header().active_until_local_ns != until {
                 return Err(Error::Format);
             }
             executor.check(d, set, now)?;
@@ -1319,16 +1417,61 @@ impl Registry {
         clock: &mut C,
         executor: &mut E,
     ) -> Result<PlanReceipt, Error> {
-        let started_ns = budget.started;
+        #[cfg(test)]
+        decode_probe::called();
         let plan = policy_wire::decode_plan(bytes)?;
+        self.submit_decoded_job_debited(
+            publisher,
+            bytes,
+            &plan,
+            budget,
+            wall_deadline_ns,
+            clock,
+            executor,
+        )
+    }
+    /// Reuse only encoder-owned canonical structure. This supplies no reply,
+    /// publisher or execution authority; every mutable submission check below
+    /// is shared with untrusted byte ingress. The receipt hashes these exact
+    /// immutable bytes, never a separately supplied buffer or a new encoding.
+    pub fn submit_canonical_job_debited<E: Executor<CanonicalPlan<N>>, C: Clock, const N: usize>(
+        &mut self,
+        publisher: Publisher,
+        canonical: &CanonicalPlan<N>,
+        budget: PublicationBudget,
+        wall_deadline_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
+        self.submit_decoded_job_debited(
+            publisher,
+            canonical.bytes(),
+            canonical,
+            budget,
+            wall_deadline_ns,
+            clock,
+            executor,
+        )
+    }
+    fn submit_decoded_job_debited<P: PlanView, E: Executor<P>, C: Clock>(
+        &mut self,
+        publisher: Publisher,
+        bytes: &[u8],
+        plan: &P,
+        budget: PublicationBudget,
+        wall_deadline_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
+        let started_ns = budget.started;
         self.authorize(publisher)?;
-        if plan.header.controller_epoch != publisher.controller_epoch {
+        if plan.header().controller_epoch != publisher.controller_epoch {
             return Err(Error::Auth);
         }
         let id = PlanId {
             boot_epoch: self.boot_epoch,
             controller_epoch: publisher.controller_epoch,
-            plan_seq: plan.header.plan_seq,
+            plan_seq: plan.header().plan_seq,
         };
         let digest = plan_receipt_digest(bytes);
         let old_plan = id.plan_seq <= self.plan_high;
@@ -1345,7 +1488,7 @@ impl Registry {
             };
         }
         if self.optimization_stopped {
-            executor.authorize_recovery(self.model, &plan, started_ns.wall_ns)?;
+            executor.authorize_recovery(self.model, plan, started_ns.wall_ns)?;
         }
         if old_decision {
             for d in plan.iter() {
@@ -1401,12 +1544,12 @@ impl Registry {
                 return Err(Error::Expired);
             }
             stage = SubmissionStage::FirstValidation;
-            self.validate(&plan, first.wall_ns, &mut registered, executor)?;
+            self.validate(plan, first.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::InitialBudget;
             budget.check(first)?;
             prepared = true;
             stage = SubmissionStage::Prepare;
-            executor.prepare(&plan, next_version)?;
+            executor.prepare(plan, next_version)?;
             stage = SubmissionStage::AfterPrepareTime;
             let now = clock.read();
             last_sample = now;
@@ -1415,9 +1558,9 @@ impl Registry {
             }
             first.cpu_elapsed(now)?;
             stage = SubmissionStage::SecondValidation;
-            self.validate(&plan, now.wall_ns, &mut registered, executor)?;
+            self.validate(plan, now.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::Revalidate;
-            executor.revalidate(&plan, now.wall_ns)?;
+            executor.revalidate(plan, now.wall_ns)?;
             // Revalidation may itself take time or wait for an owner. Take a
             // fresh protected timestamp after all callbacks, before PUBLISH.
             stage = SubmissionStage::AfterRevalidateTime;
@@ -1441,7 +1584,7 @@ impl Registry {
             // consumed until the executor performs the real atomic publish.
             stage = SubmissionStage::ModelAuthorization;
             let binding =
-                self.authorize_models(&plan, publish_ns.wall_ns, &mut registered, executor)?;
+                self.authorize_models(plan, publish_ns.wall_ns, &mut registered, executor)?;
             stage = SubmissionStage::CommitTime;
             let commit_ns = clock.read();
             last_sample = commit_ns;
@@ -1461,12 +1604,12 @@ impl Registry {
             // The gate remains locked. Time may have passed during its check,
             // so recheck the immutable permit's bounds at this final timestamp.
             stage = SubmissionStage::FinalModel;
-            if self.model_scope(&plan, commit_ns.wall_ns, &mut registered)? != binding {
+            if self.model_scope(plan, commit_ns.wall_ns, &mut registered)? != binding {
                 return Err(Error::Stale);
             }
             // Publication is one atomic root change under the owner's resource gate.
             stage = SubmissionStage::Publish;
-            executor.publish(&plan, next_version, commit_ns.wall_ns)?;
+            executor.publish(plan, next_version, commit_ns.wall_ns)?;
             stage = SubmissionStage::Complete;
             Ok((commit_ns.wall_ns, binding))
         })();
@@ -1480,7 +1623,7 @@ impl Registry {
             }
             Err(error) => {
                 if prepared {
-                    executor.cancel_prepared(&plan);
+                    executor.cancel_prepared(plan);
                 }
                 record.receipt.actions[..plan.len()].fill(ExecutionState::Failed(error));
             }
@@ -1604,3 +1747,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "policy/canonical_plan_tests.rs"]
+mod canonical_plan_tests;

@@ -334,6 +334,11 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
         Err(Error::Auth)
     );
     drop(unused);
+    assert_eq!(
+        prewarm::first_failure_snapshot(),
+        [0; 32],
+        "a proven unused token is not a pending Drop failure"
+    );
     cpu::set(0);
     for i in 0..13 {
         let at = 10_040_000_000 + i * 80_000_000;
@@ -363,6 +368,14 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
         prewarm::finish(&mut inflight, 11_010_000_000, 11_020_000_000),
         Err(Error::Auth)
     );
+    let first_failure = prewarm::first_failure_snapshot();
+    assert_eq!(first_failure[0], 2);
+    assert_eq!(first_failure[3], 2); // original finish Auth, not inferred Capacity
+    assert_eq!(first_failure[4], Error::Auth as u64 + 1);
+    assert_eq!(first_failure[5], 3); // original token's bank
+    assert_eq!(first_failure[6], 0); // actual wrong observed CPU
+    assert_eq!(first_failure[9], 11_010_000_000);
+    assert_eq!(first_failure[10], 11_020_000_000);
     cpu::set(3);
     domain_platform::at(11_023_000_000);
     assert_eq!(
@@ -542,8 +555,28 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
     }
     cpu::set(0);
     domain_platform::at(13_024_000_000);
+    let mut unfinished = prewarm::attempt_service().unwrap();
+    domain_platform::at(domain_platform::now_ns() + 1);
     let first = domain_platform::now_ns();
+    assert!(prewarm::ready_for_core_first(first).unwrap());
+    assert!(
+        prewarm::active(),
+        "nonfreezing readiness must not close warm admission"
+    );
+    assert_eq!(prewarm::freeze(first), Err(Error::Busy));
+    assert!(!prewarm::active());
+    assert!(
+        !prewarm::resume_unfrozen_control().unwrap(),
+        "OPEN work cannot be resumed/cancelled away"
+    );
+    prewarm::finish(&mut unfinished, first - 1, first).unwrap();
+    assert!(prewarm::resume_unfrozen_control().unwrap());
+    assert!(prewarm::active());
     prewarm::freeze(first).unwrap();
+    assert!(
+        !prewarm::resume_unfrozen_control().unwrap(),
+        "actual frozen FIRST can never reopen"
+    );
     let key = RunKey { trial_id: 2, ..key };
     prewarm::activate(key, first).unwrap();
     let mut sources = sources.to_vec();
@@ -576,7 +609,7 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
     learning_evidence::IMPORTED.lock().unwrap().clear();
     while !prewarm::poll(key).unwrap() {}
     let imported = learning_evidence::IMPORTED.lock().unwrap();
-    assert_eq!(imported.len(), 426);
+    assert_eq!(imported.len(), 427);
     assert!(imported.windows(2).all(|r| r[0].event < r[1].event));
     assert!(
         imported
@@ -623,6 +656,11 @@ fn original_credits_survive_freeze_and_busy_import_and_lost_credit_cannot_close(
         Err(Error::Capacity)
     );
     assert!(prewarm::active());
+    assert_eq!(
+        prewarm::first_failure_snapshot(),
+        first_failure,
+        "later pending Drop and freeze Capacity must retain original Auth operands"
+    );
     // Losing a real credit cannot become zero CPU or a closable warmup.
     assert!(prewarm::freeze_abort(preparation).unwrap());
     let failure = prewarm::summary_prepared(preparation).unwrap().unwrap();

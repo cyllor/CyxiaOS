@@ -11,10 +11,10 @@ use cyxia_prototype::{
     features::{DomainObservation, RawFeatures, TargetFeatures},
     learning::{self, SchemaBinding, Schemas, governance::CommitGate},
     policy::{
-        self, Candidate, CandidateSet, ExecutionState, ModelBinding, PreparedCandidateSet,
-        Publisher, Registry, Snapshot,
+        self, Candidate, CandidateSet, ExecutionState, ModelBinding, PlanView,
+        PreparedCandidateSet, Publisher, Registry, Snapshot,
     },
-    policy_wire::{self, Decision, Envelope, Plan, PlanHeader},
+    policy_wire::{self, Decision, Envelope, PlanHeader},
 };
 use sha2::{Digest, Sha256};
 #[repr(transparent)]
@@ -1234,6 +1234,10 @@ fn retire_preparation(s: &mut State, reason: Error, at: u64) -> Result<(), Error
     } else {
         replay::reject_preparation(pending.identity, pending.snapshot, reason);
     }
+    if (pending.identity.domain, pending.identity.kind) == (1, 2) && pending.identity.work.is_none()
+    {
+        core_replay::retire_primary_preparation(pending.identity, reason)?;
+    }
     let (retired, total, overwritten) = unsafe {
         let journal = &mut *core::ptr::addr_of_mut!(PREPARATION_REJECTIONS);
         (
@@ -1495,7 +1499,20 @@ fn next_normal(
         if s.preparation.is_none()
             && replay::first_preparation(s.boot, replay_snapshot, f.domain, f.kind, target)
         {
-            preparation::next_sequence(s.sequence, preparation_identity)?;
+            if (f.domain, f.kind) == (1, 2)
+                && !core_replay::claim_primary_preparation(preparation_identity, replay_snapshot)?
+            {
+                // A cold warmup has no first-candidate Pending. Preserve the
+                // released due slot and allow existing real warm work below.
+                s.due[index] = wall_started;
+                break 'families;
+            }
+            if let Err(error) = preparation::next_sequence(s.sequence, preparation_identity) {
+                if (f.domain, f.kind) == (1, 2) {
+                    core_replay::retire_primary_preparation(preparation_identity, error)?;
+                }
+                return Err(error);
+            }
             s.sequence = preparation_identity.sequence;
             s.preparation = Some(preparation::Pending::first_candidate(
                 preparation_identity,
@@ -2183,7 +2200,12 @@ trait PublicationScope {
     fn authorize_executor(&self, owner: &Owner) -> Result<(), Error> {
         require_control(owner)
     }
-    fn authorize_recovery(&mut self, _: ModelBinding, _: &Plan, _: u64) -> Result<(), Error> {
+    fn authorize_recovery<P: PlanView>(
+        &mut self,
+        _: ModelBinding,
+        _: &P,
+        _: u64,
+    ) -> Result<(), Error> {
         Err(Error::Budget)
     }
     fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
@@ -2235,11 +2257,11 @@ trait PublicationScope {
     }
     /// All fallible scope checks precede the common infallible desired-root
     /// writes. A Canary consumes its exact score receipt and quota here.
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         owner: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         stamps: &[PolicyStamp],
         boot: u64,
         at: u64,
@@ -2269,11 +2291,11 @@ impl PublicationScope for ActiveScope<'_> {
     ) -> Result<(), Error> {
         validate_selection_at(owner, f, action, target, at, slot.ok_or(Error::Stale)?)
     }
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         _: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         _: &[PolicyStamp],
         _: u64,
         _: u64,
@@ -2413,11 +2435,11 @@ impl PublicationScope for ActivePublication<'_> {
                 .selection_at(owner, f, action, target, at, Some(slot)),
         }
     }
-    fn commit(
+    fn commit<P: PlanView>(
         &mut self,
         owner: &Owner,
         model: ModelBinding,
-        plan: &Plan,
+        plan: &P,
         stamps: &[PolicyStamp],
         boot: u64,
         at: u64,
@@ -2458,7 +2480,7 @@ impl<S: PublicationScope> Executor<'_, S> {
         Some(slot)
     }
 }
-impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
+impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
     fn authorize_baseline(
         &mut self,
         active: ModelBinding,
@@ -2478,12 +2500,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn authorize_recovery(
-        &mut self,
-        active: ModelBinding,
-        plan: &Plan,
-        at: u64,
-    ) -> Result<(), Error> {
+    fn authorize_recovery(&mut self, active: ModelBinding, plan: &P, at: u64) -> Result<(), Error> {
         self.provenance
             .enter(submission::Callback::AuthorizeRecovery);
         let result = (|| {
@@ -2552,7 +2569,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn prepare(&mut self, plan: &Plan, _: u64) -> Result<(), Error> {
+    fn prepare(&mut self, plan: &P, _: u64) -> Result<(), Error> {
         self.provenance.enter(submission::Callback::Prepare);
         let result = (|| {
             self.provenance.at(submission::Stage::PrepareIndex);
@@ -2572,7 +2589,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn revalidate(&mut self, _: &Plan, _: u64) -> Result<(), Error> {
+    fn revalidate(&mut self, _: &P, _: u64) -> Result<(), Error> {
         self.provenance.enter(submission::Callback::Revalidate);
         // Registry's immediately preceding second validation called `check`
         // for every decision with this exact timestamp. Native `check` is a
@@ -2585,7 +2602,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn publish(&mut self, plan: &Plan, version: u64, at: u64) -> Result<(), Error> {
+    fn publish(&mut self, plan: &P, version: u64, at: u64) -> Result<(), Error> {
         self.provenance.enter(submission::Callback::Publish);
         let result = (|| {
             self.provenance.at(submission::Stage::ScopeAuthority);
@@ -2606,7 +2623,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                             .checked_sub(WINDOW_NS)
                             .ok_or(Error::Format)?
                     } else {
-                        plan.header
+                        plan.header()
                             .active_until_local_ns
                             .checked_sub(POLICY_NS)
                             .ok_or(Error::Format)?
@@ -2643,7 +2660,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             self.provenance.at(submission::Stage::ModelHash);
             for d in plan.iter() {
                 if d.envelope.model_hash != self.model.model_hash
-                    || plan.header.active_model_generation != self.model.generation
+                    || plan.header().active_model_generation != self.model.generation
                 {
                     return Err(Error::Stale);
                 }
@@ -2667,8 +2684,8 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                     action: d.action,
                     apply: ApplyId {
                         boot_epoch: self.boot,
-                        controller_epoch: plan.header.controller_epoch,
-                        plan_seq: plan.header.plan_seq,
+                        controller_epoch: plan.header().controller_epoch,
+                        plan_seq: plan.header().plan_seq,
                         action_index: index as u16,
                         target: d.envelope.target,
                     },
@@ -2701,8 +2718,8 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
             for (index, d) in plan.iter().enumerate() {
                 concurrent[index] = ApplyId {
                     boot_epoch: self.boot,
-                    controller_epoch: plan.header.controller_epoch,
-                    plan_seq: plan.header.plan_seq,
+                    controller_epoch: plan.header().controller_epoch,
+                    plan_seq: plan.header().plan_seq,
                     action_index: index as u16,
                     target: d.envelope.target,
                 };
@@ -2719,7 +2736,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
                     received_ns: self.publication_started.wall_ns,
                     published_ns: commit_ns,
                     expires_local_ns: d.envelope.expires_local_ns,
-                    active_until_local_ns: plan.header.active_until_local_ns,
+                    active_until_local_ns: plan.header().active_until_local_ns,
                     approved_deadline_ns: commit_ns.saturating_add(execution_limit(d.action)),
                     concurrent: &concurrent[..plan.len()],
                 });
@@ -2742,7 +2759,7 @@ impl<S: PublicationScope> policy::Executor for Executor<'_, S> {
         self.provenance.returned(result);
         result
     }
-    fn cancel_prepared(&mut self, _: &Plan) {
+    fn cancel_prepared(&mut self, _: &P) {
         self.provenance.cancelled();
         self.owner.prepared_count = 0;
     }
@@ -2950,9 +2967,9 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             };
             executor.provenance.accept(submission::AcceptStage::Submit);
             publication_cost::submit_entry(job.sequence, policy::Clock::read(&mut NativeClock));
-            let submitted = s.registry.submit_job_debited(
+            let submitted = s.registry.submit_canonical_job_debited(
                 publisher(job.controller),
-                &reply.bytes[..reply.len],
+                &reply.canonical,
                 budget,
                 job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
                 &mut publication_cost::Clock {

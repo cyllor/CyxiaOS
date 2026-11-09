@@ -156,6 +156,9 @@ pub mod learning_session {
 #[allow(dead_code)]
 #[path = "../../../kernel/src/learning_replay/data.rs"]
 mod producer;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/learning_replay/sample_witness.rs"]
+mod sample_witness;
 fn schemas() -> Schemas {
     Schemas {
         feature: SchemaBinding {
@@ -314,8 +317,29 @@ fn real_checked_pairs_freeze_and_deliver_trained_and_validated_sources() {
                         &support::TestAuthority,
                         &mut workspace,
                     )?;
-                    producer::accept(checked, split, Some(candidate.adoptions[0].candidates))
-                        .map_err(|(e, _)| e)?;
+                    if family == support::FAMILIES[1] && group == 1 {
+                        // Exercise the production successful store→outbound handoff
+                        // using explicitly synthetic protected-owner host fixtures.
+                        let mut outbound = None;
+                        producer::accept_bounded_outbound(
+                            checked,
+                            split,
+                            Some(candidate.adoptions[0].candidates),
+                            Some(&mut outbound),
+                        )
+                        .map_err(|failure| match failure {
+                            producer::AcceptFailure::Busy(_) => Error::Unknown,
+                            producer::AcceptFailure::Rejected(error, _) => error,
+                        })?;
+                        let witness = outbound.expect("actual stored sample handoff");
+                        assert_eq!(&witness.0[112..120], &1u64.to_le_bytes());
+                        assert_eq!(&witness.0[120..128], &2u64.to_le_bytes());
+                        assert_eq!(&witness.0[368..376], &8u64.to_le_bytes());
+                        assert!(!producer::status()?.pending_baseline);
+                    } else {
+                        producer::accept(checked, split, Some(candidate.adoptions[0].candidates))
+                            .map_err(|(e, _)| e)?;
+                    }
                     Ok(())
                 },
             )

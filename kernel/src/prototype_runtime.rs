@@ -357,6 +357,14 @@ pub fn authorize_learning_turn() -> Result<(), cyxia_prototype::domains::Error> 
     learning::require_extra_caller()
 }
 #[cfg(feature = "unified-runtime")]
+pub fn learning_turn_ticket() -> Result<u64, cyxia_prototype::domains::Error> {
+    learning::turn_ticket()
+}
+#[cfg(feature = "unified-runtime")]
+pub fn learning_turn_settled(ticket: u64) -> bool {
+    learning::turn_settled(ticket)
+}
+#[cfg(feature = "unified-runtime")]
 pub fn register_learning_driver(
     turn: fn() -> Result<bool, cyxia_prototype::domains::Error>,
 ) -> Result<(), cyxia_prototype::domains::Error> {

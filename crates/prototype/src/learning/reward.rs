@@ -470,6 +470,15 @@ pub struct AcceptedSample {
     pub(super) action_schema: SchemaBinding,
 }
 impl AcceptedSample {
+    /// Outbound semantic bindings of this actual protected sample.
+    pub fn schemas(&self) -> Schemas {
+        Schemas {
+            feature: self.feature_schema,
+            action: self.action_schema,
+            reward: self.reward_schema,
+            learning: self.learning_config,
+        }
+    }
     pub fn family(&self) -> Family {
         self.family
     }
