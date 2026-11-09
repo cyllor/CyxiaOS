@@ -12,6 +12,18 @@ FULL_CONTROL_BYTES = 331_776
 
 
 class BootFailureDiagnostics(unittest.TestCase):
+    preparation_sizes = {
+        'preparation-entry': 128, 'preparation-context': 128,
+        'preparation-detail': 256, 'preparation-prefix': 128,
+        'preparation-root': 512, 'preparation-owner': 512,
+        'replay': 512, 'replay-quiescing': 512,
+        'publication-cost': 1024, 'control-credit': 512,
+    }
+
+    def add_preparation_symbols(self):
+        for index, (key, size) in enumerate(self.preparation_sizes.items()):
+            self.symbols[key] = {'pa': 0x41000000 + index * 0x10000, 'size': size}
+
     def setUp(self):
         self.sample, _, self.config = fixture(0)
         self.sample[3:8] = [2, 3, 0, 0, 0]
@@ -37,7 +49,7 @@ class BootFailureDiagnostics(unittest.TestCase):
         with self.assertRaises(ValueError):
             stopped_boot_state(packed(self.sample)[:-1], packed(self.config))
 
-    def capture(self, *, odd=False, fail_key=None, paused=True, overflow=False):
+    def capture(self, *, odd=False, fail_key=None, paused=True, overflow=False, payloads=None):
         events, saved = [], {}
         sample = self.sample.copy()
         if odd:
@@ -61,12 +73,14 @@ class BootFailureDiagnostics(unittest.TestCase):
             self.assertEqual(address, self.symbols[symbol_key]['pa'])
             if key == 'control-full':
                 self.assertEqual(size, FULL_CONTROL_BYTES)
+            elif key in self.preparation_sizes:
+                self.assertEqual(size, self.symbols[key]['size'])
             else:
                 self.assertIn(size, (512, 4096, 8192))
             events.append(name)
             if key == fail_key:
                 raise OSError('simulated capture failure')
-            data = packed(sample) if key == 'boot' else bytes(size)
+            data = (payloads or {}).get(key, packed(sample) if key == 'boot' else bytes(size))
             saved[name] = data
             return data
 
@@ -89,6 +103,52 @@ class BootFailureDiagnostics(unittest.TestCase):
         self.assertEqual(text, b'decoded-serial\n')
         self.assertEqual(events[-1], 'ringbuf-read')
         self.assertNotIn('cont', events)
+
+    def test_timeout_keeps_preparation_and_replay_bytes_without_assigning_a_verdict(self):
+        self.add_preparation_symbols()
+        payloads = {key: (index + 1).to_bytes(8, 'little') * (size // 8)
+                    for index, (key, size) in enumerate(self.preparation_sizes.items())}
+        # A stop may interrupt this bank's publication. Preserve the odd raw
+        # sequence for diagnosis rather than manufacturing a coherent result.
+        root = bytearray(payloads['preparation-root'])
+        root[-8:] = (1).to_bytes(8, 'little')
+        payloads['preparation-root'] = bytes(root)
+        result, events, saved, raw, _, _ = self.capture(payloads=payloads)
+        for key, data in payloads.items():
+            with self.subTest(bank=key):
+                self.assertIn('failure-' + key + '.bin', saved)
+                self.assertEqual(saved['failure-' + key + '.bin'], data)
+                details = result['failure_diagnostics'][key]
+                self.assertEqual(details['words'], [int.from_bytes(data[i:i+8], 'little')
+                                                     for i in range(0, len(data), 8)])
+                self.assertEqual(details['scope'], 'stopped diagnostic, not acceptance')
+                self.assertNotIn('status', details)
+        self.assertNotIn('status', result)
+        self.assertNotIn('native_acceptance_status', result)
+        self.assertNotIn('failure_capture_errors', result)
+        self.assertNotIn('cont', events)
+        self.assertEqual(raw, b'raw-serial')
+
+    def test_preparation_read_failure_keeps_other_banks_and_original_serial(self):
+        self.add_preparation_symbols()
+        result, _, saved, raw, _, _ = self.capture(fail_key='preparation-root')
+        self.assertEqual(set(result['failure_capture_errors']), {'preparation-root'})
+        self.assertNotIn('failure-preparation-root.bin', saved)
+        for key in self.preparation_sizes.keys() - {'preparation-root'}:
+            self.assertIn('failure-' + key + '.bin', saved)
+        self.assertIn('failure-control-full.bin', saved)
+        self.assertEqual(raw, b'raw-serial')
+
+    def test_invalid_preparation_size_cannot_expand_the_stopped_read_bound(self):
+        self.add_preparation_symbols()
+        self.symbols['preparation-root']['size'] = 8200
+        result, _, saved, raw, _, _ = self.capture()
+        self.assertEqual(result['failure_capture_errors'],
+                         {'preparation-root': 'invalid diagnostic buffer size'})
+        self.assertNotIn('failure-preparation-root.bin', saved)
+        self.assertIn('failure-preparation-owner.bin', saved)
+        self.assertIn('failure-control-full.bin', saved)
+        self.assertEqual(raw, b'raw-serial')
 
     def test_torn_snapshot_is_retained_without_suppressing_other_evidence(self):
         result, _, saved, raw, _, _ = self.capture(odd=True)

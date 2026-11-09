@@ -1,5 +1,133 @@
 use cyxia_prototype::{domains::*, features::*, policy::*, policy_wire::*};
 
+fn validation_wire(count: usize) -> Vec<u8> {
+    let header = PlanHeader {
+        plan_seq: 1,
+        base_plan_version: 0,
+        active_model_generation: 1,
+        controller_epoch: 9,
+        snapshot_seq: 1,
+        active_until_local_ns: POLICY_NS,
+    };
+    let actions: Vec<_> = (0..count)
+        .map(|i| Decision {
+            action: Action::CpuWeight(1),
+            candidate_index: i as u16,
+            envelope: Envelope {
+                controller_epoch: 9,
+                decision_seq: i as u64 + 1,
+                snapshot_seq: 1,
+                target: ObjectKey {
+                    id: i as u64 + 1,
+                    generation: 1,
+                },
+                ledger_generation: 3,
+                core_generation: 2,
+                expires_local_ns: WINDOW_NS,
+                model_hash: [3; 32],
+                candidate_set_hash: [5; 32],
+            },
+        })
+        .collect();
+    let mut bytes = vec![0; MAX_PLAN_BYTES];
+    let len = encode_plan(header, &actions, &mut bytes).unwrap();
+    bytes.truncate(len);
+    bytes
+}
+
+#[test]
+fn validation_preserves_actual_native_single_action_wire() {
+    // Original C4 pair/node2 job1 canonical Plan, SHA256 ab360a45...801a3d7.
+    // Public PolicyEnvelope bytes only; no capture directory or key is needed.
+    let hex = concat!(
+        "314c594301004000da0000000100000001000000000000000000000000000000",
+        "0100000000000000010000000000000001000000000000000000000000000000",
+        "3150594301009000010002000a00000001000000000000000100000000000000",
+        "010000000000000045524f430000000001000000000000000900000000000000",
+        "0100000000000000306e5d86000000009b9bf87a969d7b0c6be3a9ea0564714d",
+        "87cf12f1578037867d945c210c5f0ca344f406d3cac2a54b917876f0c8fcf92e",
+        "e90dca55fc99f2b664b672bc71bc65b600000200000000000000"
+    );
+    let bytes: Vec<_> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let plan = decode_plan(&bytes).unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan.action(0).unwrap().action, Action::ControlSet(2));
+    let mut encoded = vec![0; MAX_PLAN_BYTES];
+    let len = encode_plan(plan.header, &[plan.action(0).unwrap()], &mut encoded).unwrap();
+    assert_eq!(&encoded[..len], bytes);
+}
+
+#[test]
+fn validation_keeps_single_and_maximum_action_roundtrips() {
+    for count in [1, MAX_ACTIONS] {
+        let bytes = validation_wire(count);
+        let decoded = decode_plan(&bytes).unwrap();
+        assert_eq!(decoded.len(), count);
+        let actions: Vec<_> = decoded.iter().collect();
+        let mut output = vec![0; MAX_PLAN_BYTES];
+        let len = encode_plan(decoded.header, &actions, &mut output).unwrap();
+        assert_eq!(&output[..len], bytes);
+    }
+}
+
+#[test]
+fn validation_rejects_duplicate_target_identity_and_decision_reordering() {
+    let second = PLAN_HEADER_BYTES + ENVELOPE_BYTES + payload_len(Action::CpuWeight(1));
+    let mut duplicate = validation_wire(MAX_ACTIONS);
+    duplicate[second + 40..second + 48].copy_from_slice(&1u64.to_le_bytes());
+    // Generation changes do not make a duplicated family/object ID legal.
+    duplicate[second + 48..second + 56].copy_from_slice(&2u64.to_le_bytes());
+    assert!(matches!(decode_plan(&duplicate), Err(Error::Conflict)));
+    let mut reordered = validation_wire(MAX_ACTIONS);
+    reordered[second + 24..second + 32].copy_from_slice(&1u64.to_le_bytes());
+    assert!(matches!(decode_plan(&reordered), Err(Error::Stale)));
+}
+
+#[test]
+fn validation_keeps_candidate_index_bounds() {
+    let mut bytes = validation_wire(1);
+    let index = PLAN_HEADER_BYTES + ENVELOPE_BYTES;
+    bytes[index..index + 2].copy_from_slice(&31u16.to_le_bytes());
+    assert_eq!(
+        decode_plan(&bytes)
+            .unwrap()
+            .action(0)
+            .unwrap()
+            .candidate_index,
+        31
+    );
+    bytes[index..index + 2].copy_from_slice(&32u16.to_le_bytes());
+    assert!(matches!(decode_plan(&bytes), Err(Error::Range)));
+}
+
+#[test]
+fn validation_rejects_reserved_padding_and_partial_frames() {
+    for count in [1, MAX_ACTIONS] {
+        let bytes = validation_wire(count);
+        let mut reserved = bytes.clone();
+        reserved[14] = 1;
+        assert!(matches!(decode_plan(&reserved), Err(Error::Format)));
+        let mut padded = bytes.clone();
+        padded.push(0);
+        let size = padded.len() as u32;
+        padded[8..12].copy_from_slice(&size.to_le_bytes());
+        assert!(matches!(decode_plan(&padded), Err(Error::Format)));
+        for size in [0, PLAN_HEADER_BYTES - 1, PLAN_HEADER_BYTES, bytes.len() - 1] {
+            assert!(decode_plan(&bytes[..size]).is_err());
+        }
+        let mut empty = bytes.clone();
+        empty[12..14].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(decode_plan(&empty), Err(Error::Capacity)));
+        let mut overflow = bytes;
+        overflow[12..14].copy_from_slice(&(MAX_ACTIONS as u16 + 1).to_le_bytes());
+        assert!(matches!(decode_plan(&overflow), Err(Error::Capacity)));
+    }
+}
+
 fn publisher() -> Publisher {
     Publisher {
         object: ObjectKey {

@@ -36,7 +36,20 @@ DEBUG_SYMBOLS = {'model-debug': 'A01_BOOT_MODEL_DEBUG',
                  'smp-fault': 'SMP_FAULT_EVIDENCE',
                  'task-slices': 'TASK_SLICE_EVIDENCE', 'builtin-detail': 'BUILTIN_TASK_DETAIL',
                  'baseline-service': 'BASELINE_SERVICE_EVIDENCE',
-                 'tasks': 'DOMAIN_TASK_EVIDENCE', 'task-overruns': 'TASK_OVERRUN_EVIDENCE'}
+                 'tasks': 'DOMAIN_TASK_EVIDENCE', 'task-overruns': 'TASK_OVERRUN_EVIDENCE',
+                 # Existing public banks, read only after the failure stop. Their
+                 # raw words are diagnostics; torn or unpublished records never
+                 # grant acceptance or change the original producer verdict.
+                 'preparation-entry': 'DOMAIN_PREPARATION_ENTRY_DETAIL',
+                 'preparation-context': 'DOMAIN_PREPARATION_CONTEXT',
+                 'preparation-detail': 'DOMAIN_PREPARATION_DETAIL',
+                 'preparation-prefix': 'DOMAIN_PREPARATION_PREFIX_DETAIL',
+                 'preparation-root': 'TRACE_PREPARATION_ROOT_EVIDENCE',
+                 'preparation-owner': 'TRACE_PREPARATION_OWNER_EVIDENCE',
+                 'replay': 'REPLAY_V13_EVIDENCE',
+                 'replay-quiescing': 'REPLAY_QUIESCING_EVIDENCE',
+                 'publication-cost': 'DOMAIN_PUBLICATION_COST',
+                 'control-credit': 'CONTROL_CREDIT_EVIDENCE'}
 MODEL_DEBUG_FIELDS = {8: 'steps', 9: 'admissions', 10: 'no_credit', 11: 'admission_error',
     12: 'settlement_busy', 13: 'settlement_error', 14: 'credit_sequence', 15: 'reserved_ns',
     16: 'actual_ns', 17: 'total_cpu_ns', 18: 'finished_ns', 19: 'exit_kind',
