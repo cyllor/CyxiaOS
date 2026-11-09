@@ -219,11 +219,14 @@ class DispatchIdentity(unittest.TestCase):
             for old,new in replacements:
                 self.assertEqual(expected.count(old),1);expected=expected.replace(old,new)
             self.assertEqual(ast.dump(ast.parse(expected)),ast.dump(ast.parse(inspect.getsource(getattr(offline,name)))))
-        offline.require_native_contract(offline.TOOL_ROOT)
+        # This checker intentionally accepts only the historical native
+        # contract. Test against its pinned raw specimen, not today's tree.
+        frozen_source=CAPTURE/'source-inputs'
+        offline.require_native_contract(frozen_source)
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             for rel in offline.NATIVE_CONTRACT_SOURCES:
-                target=root/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes((offline.TOOL_ROOT/rel).read_bytes())
+                target=root/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes((frozen_source/rel).read_bytes())
             offline.require_native_contract(root)
             (root/'kernel/src/domain_control.rs').write_bytes(b'changed native capacity contract')
             with self.assertRaises(ValueError):offline.require_native_contract(root)

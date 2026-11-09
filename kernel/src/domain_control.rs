@@ -225,6 +225,8 @@ fn preparation_current(current: Action) {
 pub mod core_replay;
 #[path = "domain_control/dependencies.rs"]
 mod dependencies;
+#[path = "domain_control/dispatch.rs"]
+mod dispatch;
 #[path = "domain_control/governance.rs"]
 pub mod governance;
 #[path = "domain_control/learning.rs"]
@@ -1364,28 +1366,33 @@ fn next_locked_inner(
         );
     }
     preparation_entry_detail(4);
-    match next_normal(
+    dispatch::normal_then_optional(
         s,
-        controller_epoch,
-        witness,
-        wall_started,
-        cpu_started,
         input,
-    ) {
-        Ok(false) => (),
-        result => return result,
-    }
-    if let Some(witness) = witness {
-        return core_replay::next(
-            s,
-            controller_epoch,
-            witness,
-            wall_started,
-            cpu_started,
-            input,
-        );
-    }
-    Ok(false)
+        crate::a03_demand::PROFILE,
+        |s| (s.job.is_some(), s.preparation.is_some()),
+        |s, input| {
+            next_normal(
+                s,
+                controller_epoch,
+                witness,
+                wall_started,
+                cpu_started,
+                input,
+            )
+        },
+        |s, input| match witness {
+            Some(witness) => core_replay::next(
+                s,
+                controller_epoch,
+                witness,
+                wall_started,
+                cpu_started,
+                input,
+            ),
+            None => Ok(false),
+        },
+    )
 }
 // Normal and read-only preparation each own sizeable bounded candidate scratch.
 // Keep them in sibling calls: retaining the normal frame while entering replay
@@ -1440,14 +1447,16 @@ fn next_normal(
             return Err(error);
         }
         // Unavailable owner views consume no enumeration progress or due slot.
-        s.due[index] = wall_started.saturating_add(if index == 1 || index == 16 {
-            1_000_000_000
-        } else {
-            WINDOW_NS
-        });
-        s.family_cursor = (index + 1) % 18;
+        target_batch::complete_visit(
+            index,
+            wall_started,
+            ordinal,
+            targets[1].is_some(),
+            &mut s.due,
+            &mut s.family_cursor,
+            &mut s.cursor,
+        )?;
         let target = targets[0];
-        s.cursor[index] = if targets[1].is_some() { ordinal + 1 } else { 0 };
         let Some(target) = target else {
             preparation_lookup(index, f, ordinal, wall_started);
             skip(index, f, None, wall_started, Skip::TargetAbsent, None);
@@ -2967,7 +2976,7 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
             };
             executor.provenance.accept(submission::AcceptStage::Submit);
             publication_cost::submit_entry(job.sequence, policy::Clock::read(&mut NativeClock));
-            let submitted = s.registry.submit_canonical_job_debited(
+            let submitted = s.registry.submit_single_canonical_job_debited(
                 publisher(job.controller),
                 &reply.canonical,
                 budget,
@@ -3151,11 +3160,12 @@ pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
 fn finish_job(s: &mut State, job: Job, output: Option<&[u64; 512]>) -> Result<u64, Error> {
     let completion = job.completion.ok_or(Error::Stale)?;
     if let Some(work) = job.work {
-        if let Err(error) = core_replay::evaluated(
+        if let Err(error) = core_replay::evaluated_cost(
             work,
             job.sequence,
             completion.result,
             completion.output_hash,
+            completion.cpu_ns,
         ) {
             s.job = Some(job);
             return Err(error);
@@ -3188,6 +3198,22 @@ fn finish_job(s: &mut State, job: Job, output: Option<&[u64; 512]>) -> Result<u6
         crate::domain_evidence::output_digest(evidence, job.sequence, completion.output_hash);
         if completion.aborted {
             crate::domain_evidence::aborted();
+        }
+        if crate::a03_demand::PROFILE
+            && !job.read_only
+            && job
+                .set
+                .get(0)
+                .is_some_and(|c| matches!(c.action, Action::ControlSet(_)))
+            && let Ok(version) = completion.result
+        {
+            crate::a03_demand::ordinary_decision(
+                job.sequence,
+                version,
+                job.set.snapshot.taken_ns,
+                now(),
+                evidence,
+            );
         }
     }
     completion.result

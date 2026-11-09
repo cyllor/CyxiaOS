@@ -1,0 +1,15 @@
+{
+  "scope": "Public actual D02 lookup/reply regression fixture; original native budget failure, no training sample or PASS",
+  "source_sha256": "1593216045bc2afdaa15332c1dbf9dc3ae434991abbf3fcc431620c8baca8208",
+  "control_bank_sha256": "3b8d5c6b745ba1aa0db1917ad8b9613b27a0f99622c17f86a3349335634e734a",
+  "slot": 46,
+  "job": 111,
+  "domain": 2,
+  "kind": 1,
+  "input_sha256": "4e9643bf020c19c099a85b42adf2d81f543a1eb1785764b3c7ec196496dc3bae",
+  "output_sha256": "5ab88b0fc9fb7f64fd67dfd5bac25a6a4660a94830906dd2f25d574e91ffbb18",
+  "model_sha256": "9b9bf87a969d7b0c6be3a9ea0564714d87cf12f1578037867d945c210c5f0ca3",
+  "decode_ns": 128793,
+  "publication_ns": 390206,
+  "combined_ns": 518999
+}

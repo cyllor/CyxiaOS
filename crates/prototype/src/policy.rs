@@ -13,12 +13,13 @@ pub const MAX_PENDING: usize = 64;
 pub const TERMINAL_HISTORY: usize = 256;
 pub const PUBLICATION_BUDGET_NS: u64 = 500_000;
 
-// Only the unchanged decoded wire Plan and our encoder-owned representation
+// Only the unchanged decoded wire Plan and our encoder-owned representations
 // implement this view. Header/decisions are copied values, never mutable views.
 mod plan_view_sealed {
     pub trait Sealed {}
     impl Sealed for super::Plan {}
     impl<const N: usize> Sealed for super::CanonicalPlan<N> {}
+    impl<const N: usize> Sealed for super::SingleCanonicalPlan<N> {}
 }
 pub trait PlanView: plan_view_sealed::Sealed {
     fn header(&self) -> policy_wire::PlanHeader;
@@ -95,6 +96,51 @@ impl<const N: usize> PlanView for CanonicalPlan<N> {
     }
 }
 
+/// Encoder-owned structural proof for the native one-action reply. The exact
+/// same wire encoder performs all framing/action/header validation; storage
+/// retains only its one immutable decision rather than sixteen empty slots.
+/// This value confers no model, publisher, resource or execution authority.
+///
+/// ```compile_fail
+/// use cyxia_prototype::policy::SingleCanonicalPlan;
+/// let forged = SingleCanonicalPlan::<384> { header: todo!(), decision: todo!(), bytes: [0;384], len: 0 };
+/// ```
+pub struct SingleCanonicalPlan<const N: usize> {
+    header: policy_wire::PlanHeader,
+    decision: Decision,
+    bytes: [u8; N],
+    len: usize,
+}
+impl<const N: usize> SingleCanonicalPlan<N> {
+    pub fn encode(header: policy_wire::PlanHeader, decision: Decision) -> Result<Self, Error> {
+        let mut bytes = [0; N];
+        let len = policy_wire::encode_plan(header, core::slice::from_ref(&decision), &mut bytes)?;
+        Ok(Self {
+            header,
+            decision,
+            bytes,
+            len,
+        })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+    pub fn storage(&self) -> &[u8; N] {
+        &self.bytes
+    }
+}
+impl<const N: usize> PlanView for SingleCanonicalPlan<N> {
+    fn header(&self) -> policy_wire::PlanHeader {
+        self.header
+    }
+    fn len(&self) -> usize {
+        1
+    }
+    fn action(&self, index: usize) -> Option<Decision> {
+        (index == 0).then_some(self.decision)
+    }
+}
+
 #[cfg(test)]
 mod decode_probe {
     extern crate std;
@@ -108,6 +154,21 @@ mod decode_probe {
     }
     pub(super) fn called() {
         CALLS.with(|c| c.set(c.get() + 1));
+    }
+}
+#[cfg(test)]
+mod registration_lookup_probe {
+    extern crate std;
+    use core::cell::Cell;
+    std::thread_local! { static COMPARISONS: Cell<usize> = const { Cell::new(0) }; }
+    pub(super) fn reset() {
+        COMPARISONS.with(|c| c.set(0));
+    }
+    pub(super) fn count() -> usize {
+        COMPARISONS.with(Cell::get)
+    }
+    pub(super) fn compared() {
+        COMPARISONS.with(|c| c.set(c.get() + 1));
     }
 }
 
@@ -1105,7 +1166,31 @@ impl Registry {
     fn registered_index(&self, hash: [u8; 32]) -> Option<usize> {
         self.registered_hashes[..self.registered_count]
             .iter()
-            .position(|old| *old == hash)
+            .position(|old| {
+                #[cfg(test)]
+                registration_lookup_probe::compared();
+                *old == hash
+            })
+    }
+    /// The ordinary job normally names the set just registered before its
+    /// isolated evaluation. This is only a full-hash lookup hint: no cached
+    /// authority or state is introduced, and every model/resource check below
+    /// still runs. Interleaved/older jobs retain the original ordered search.
+    fn recent_registered_index(&self, hash: [u8; 32]) -> Option<usize> {
+        if self.registered_count == 0
+            || self.registered_count > MAX_REGISTERED
+            || self.registered_cursor >= MAX_REGISTERED
+        {
+            return None;
+        }
+        let recent = (self.registered_cursor + MAX_REGISTERED - 1) % MAX_REGISTERED;
+        if recent >= self.registered_count {
+            return None;
+        }
+        let old = self.registered_hashes.get(recent)?;
+        #[cfg(test)]
+        registration_lookup_probe::compared();
+        (*old == hash).then_some(recent)
     }
     fn registered_set_by_hash(&self, hash: [u8; 32]) -> Option<&RegisteredSet> {
         self.registered_index(hash)
@@ -1255,7 +1340,10 @@ impl Registry {
         let index = match *cached {
             Some(index) => index,
             None => {
-                let index = self.registered_index(hash).ok_or(Error::Stale)?;
+                let index = self
+                    .recent_registered_index(hash)
+                    .or_else(|| self.registered_index(hash))
+                    .ok_or(Error::Stale)?;
                 *cached = Some(index);
                 index
             }
@@ -1438,6 +1526,31 @@ impl Registry {
         &mut self,
         publisher: Publisher,
         canonical: &CanonicalPlan<N>,
+        budget: PublicationBudget,
+        wall_deadline_ns: u64,
+        clock: &mut C,
+        executor: &mut E,
+    ) -> Result<PlanReceipt, Error> {
+        self.submit_decoded_job_debited(
+            publisher,
+            canonical.bytes(),
+            canonical,
+            budget,
+            wall_deadline_ns,
+            clock,
+            executor,
+        )
+    }
+    /// Native single-action structural reuse. All mutable checks, timestamps,
+    /// receipt hashing and transactional publication share the exact old body.
+    pub fn submit_single_canonical_job_debited<
+        E: Executor<SingleCanonicalPlan<N>>,
+        C: Clock,
+        const N: usize,
+    >(
+        &mut self,
+        publisher: Publisher,
+        canonical: &SingleCanonicalPlan<N>,
         budget: PublicationBudget,
         wall_deadline_ns: u64,
         clock: &mut C,

@@ -2,8 +2,8 @@
 //! read-only CACP work. This module cannot publish or create executor custody.
 use cyxia_prototype::{
     domains::{Action, Error, POLICY_NS, WINDOW_NS},
-    policy::{CandidateSet, CanonicalPlan},
-    policy_wire::{self, Decision, Envelope, PlanHeader},
+    policy::{CandidateSet, SingleCanonicalPlan},
+    policy_wire::{Decision, Envelope, PlanHeader},
 };
 
 pub(super) struct Expected<'a> {
@@ -19,7 +19,7 @@ pub(super) struct Verified {
     pub action: Action,
     pub selected: usize,
     pub scores: [i16; 32],
-    pub canonical: CanonicalPlan<384>,
+    pub canonical: SingleCanonicalPlan<384>,
 }
 pub(super) fn verify(expected: Expected<'_>, output: &[u64; 512]) -> Result<Verified, Error> {
     let set = expected.set;
@@ -86,7 +86,7 @@ pub(super) fn verify(expected: Expected<'_>, output: &[u64; 512]) -> Result<Veri
             candidate_set_hash: set.hash(),
         },
     };
-    let canonical = CanonicalPlan::encode(header, &[decision])?;
+    let canonical = SingleCanonicalPlan::encode(header, decision)?;
     let mut bytes = [0u8; 384];
     for (i, word) in output[16..64].iter().enumerate() {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());

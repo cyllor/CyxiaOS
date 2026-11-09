@@ -1,5 +1,5 @@
 //! Invocation-local, bounded collection of released mandatory evaluations.
-use cyxia_prototype::domains::{Error, ObjectKey};
+use cyxia_prototype::domains::{Error, ObjectKey, WINDOW_NS};
 
 pub const FAMILIES: usize = 18;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +76,30 @@ pub fn resolve(
                 .flatten()
         });
     }
+    Ok(())
+}
+
+/// Advance exactly the one successfully visited mandatory family. An EMPTY
+/// result is still a visit; unrelated due families keep their own next turn.
+pub fn complete_visit(
+    index: usize,
+    at: u64,
+    ordinal: usize,
+    lookahead_present: bool,
+    due: &mut [u64; FAMILIES],
+    family_cursor: &mut usize,
+    cursor: &mut [usize; FAMILIES],
+) -> Result<(), Error> {
+    if index >= FAMILIES {
+        return Err(Error::Range);
+    }
+    due[index] = at.saturating_add(if index == 1 || index == 16 {
+        1_000_000_000
+    } else {
+        WINDOW_NS
+    });
+    *family_cursor = (index + 1) % FAMILIES;
+    cursor[index] = if lookahead_present { ordinal + 1 } else { 0 };
     Ok(())
 }
 

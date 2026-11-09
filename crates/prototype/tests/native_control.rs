@@ -10,6 +10,190 @@ mod root_reply;
 use cyxia_prototype::policy::{Candidate, CandidateSet, ModelBinding, Snapshot};
 use domains::{Action, ObjectKey, POLICY_NS};
 use sha2::{Digest, Sha256};
+#[test]
+fn actual_d03_job297_reply_replays_full_model_and_canonical_bytes() {
+    actual_reply_fixture(
+        include_bytes!("fixtures/a03-d03-job297-public/input.bin"),
+        include_bytes!("fixtures/a03-d03-job297-public/output.bin"),
+        include_bytes!("fixtures/a03-d03-job297-public/model.bin"),
+        (297, 3, 1),
+        [
+            "9f1bad2d941a5db650d7491c4372f7b1a7e2b207f85766d0cc3fbc1b6dea2d67",
+            "bf531ca88e8e4e0e50c66b5bb0e14b580ccada3363ba45207de3b56903fe43c6",
+            "9b9bf87a969d7b0c6be3a9ea0564714d87cf12f1578037867d945c210c5f0ca3",
+        ],
+        512457,
+    );
+}
+#[test]
+fn actual_d02_job111_reply_replays_full_model_and_canonical_bytes() {
+    actual_reply_fixture(
+        include_bytes!("fixtures/a03-d02-job111-public/input.bin"),
+        include_bytes!("fixtures/a03-d02-job111-public/output.bin"),
+        include_bytes!("fixtures/a03-d02-job111-public/model.bin"),
+        (111, 2, 1),
+        [
+            "4e9643bf020c19c099a85b42adf2d81f543a1eb1785764b3c7ec196496dc3bae",
+            "5ab88b0fc9fb7f64fd67dfd5bac25a6a4660a94830906dd2f25d574e91ffbb18",
+            "9b9bf87a969d7b0c6be3a9ea0564714d87cf12f1578037867d945c210c5f0ca3",
+        ],
+        518999,
+    );
+}
+fn actual_reply_fixture(
+    input_raw: &[u8; 4096],
+    output_raw: &[u8; 4096],
+    package: &[u8; 2772],
+    identity: (u64, u64, u64),
+    hashes: [&str; 3],
+    original_ns: u64,
+) {
+    // Public ABI bytes from a preserved failed VM. Host replay/elapsed time
+    // never substitutes for the original native cap or creates training data.
+    assert_eq!(format!("{:x}", Sha256::digest(input_raw)), hashes[0]);
+    assert_eq!(format!("{:x}", Sha256::digest(output_raw)), hashes[1]);
+    assert_eq!(format!("{:x}", Sha256::digest(package)), hashes[2]);
+    let input: [u64; 512] = core::array::from_fn(|i| {
+        u64::from_le_bytes(input_raw[i * 8..i * 8 + 8].try_into().unwrap())
+    });
+    let output: [u64; 512] = core::array::from_fn(|i| {
+        u64::from_le_bytes(output_raw[i * 8..i * 8 + 8].try_into().unwrap())
+    });
+    assert_eq!((input[2], input[8], input[9]), identity);
+    let parsed = model::Model::parse(package).unwrap();
+    let mut evaluated = [0; 512];
+    native::evaluate(&input, &parsed, &mut evaluated).unwrap();
+    assert_eq!(
+        evaluated, output,
+        "actual scores, selection and full Plan must replay exactly"
+    );
+    let choices: Vec<_> = (0..input[15] as usize)
+        .map(|i| {
+            let (action, features) = native::candidate(&input, i).unwrap();
+            Candidate { action, features }
+        })
+        .collect();
+    let binding = ModelBinding {
+        generation: input[13],
+        model_hash: Sha256::digest(package).into(),
+        schema_hash: Sha256::digest(include_bytes!("../src/features.rs")).into(),
+    };
+    let set = CandidateSet::new(
+        Snapshot {
+            sequence: input[38],
+            taken_ns: input[4],
+            ledger_generation: input[7],
+            core_generation: input[6],
+        },
+        ObjectKey {
+            id: input[10],
+            generation: input[11],
+        },
+        binding,
+        &choices,
+        Some(native::prior(&input).unwrap()),
+    )
+    .unwrap();
+    let expected = || root_reply::Expected {
+        set: &set,
+        sequence: input[2],
+        controller: input[3],
+        base_version: input[12],
+        started_ns: input[4],
+        boot_epoch: input[14],
+        output_magic: abi::OUTPUT_MAGIC,
+    };
+    let verified = root_reply::verify(expected(), &output).unwrap();
+    assert_eq!(verified.selected, output[4] as usize);
+    let decoded = policy_wire::decode_plan(verified.canonical.bytes()).unwrap();
+    let legacy = cyxia_prototype::policy::CanonicalPlan::<384>::encode(
+        decoded.header,
+        &[decoded.action(0).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(verified.canonical.bytes(), legacy.bytes());
+    assert_eq!(verified.canonical.storage(), legacy.storage());
+    assert_eq!(
+        Sha256::digest(verified.canonical.bytes()),
+        Sha256::digest(legacy.bytes())
+    );
+    let begin = std::time::Instant::now();
+    for _ in 0..10_000 {
+        std::hint::black_box(
+            root_reply::verify(expected(), std::hint::black_box(&output)).unwrap(),
+        );
+    }
+    println!(
+        "actual_reply_component job={} iterations=10000 verified_bytes={} elapsed_ns={} host_guidance_only=true original_native_combined_ns={}",
+        identity.0,
+        core::mem::size_of::<root_reply::Verified>(),
+        begin.elapsed().as_nanos(),
+        original_ns
+    );
+    for word in [0, 4, 5, 16, 33, 63, 64, 511] {
+        let mut changed = output;
+        changed[word] ^= 1;
+        assert!(
+            root_reply::verify(expected(), &changed).is_err(),
+            "actual job{} word{word}",
+            identity.0
+        );
+    }
+}
+#[test]
+fn d03_single_action_root_reply_keeps_only_the_one_validated_decision() {
+    let choices = [(64, 4), (256, 16)].map(|(pages, batch)| Candidate {
+        action: Action::Cache { pages, batch },
+        features: features::RawFeatures::default(),
+    });
+    let (input, package, set) = input_for(&choices, choices[0].action);
+    let parsed = model::Model::parse(&package).unwrap();
+    let mut output = [0; 512];
+    native::evaluate(&input, &parsed, &mut output).unwrap();
+    let began = std::time::Instant::now();
+    for _ in 0..10_000 {
+        let got = root_reply::verify(
+            root_reply::Expected {
+                set: std::hint::black_box(&set),
+                sequence: input[2],
+                controller: input[3],
+                base_version: input[12],
+                started_ns: input[4],
+                boot_epoch: input[14],
+                output_magic: abi::OUTPUT_MAGIC,
+            },
+            std::hint::black_box(&output),
+        )
+        .unwrap();
+        std::hint::black_box(got);
+    }
+    println!(
+        "d03_reply_component iterations=10000 verified_bytes={} elapsed_ns={}",
+        core::mem::size_of::<root_reply::Verified>(),
+        began.elapsed().as_nanos()
+    );
+    assert!(
+        core::mem::size_of::<root_reply::Verified>() <= 1024,
+        "the native one-action reply must not initialize/copy sixteen Decision slots"
+    );
+    let expected = || root_reply::Expected {
+        set: &set,
+        sequence: input[2],
+        controller: input[3],
+        base_version: input[12],
+        started_ns: input[4],
+        boot_epoch: input[14],
+        output_magic: abi::OUTPUT_MAGIC,
+    };
+    for word in (0..8).chain(16..512) {
+        let mut changed = output;
+        changed[word] ^= 1;
+        assert!(
+            root_reply::verify(expected(), &changed).is_err(),
+            "D03 word {word}"
+        );
+    }
+}
 fn input_for(choices: &[Candidate], current: Action) -> ([u64; 512], [u8; 2772], CandidateSet) {
     let bytes = abi::model_bytes();
     let binding = ModelBinding {

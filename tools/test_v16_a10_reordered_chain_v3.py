@@ -283,6 +283,9 @@ class DriverControlV3(unittest.TestCase):
         self.patches=[patch.object(driver,'code_source_map',return_value={'fixture':'host-only'}),
             patch.object(driver,'tool_closure',return_value={'fixture':'host-only'}),
             patch.object(driver,'qemu_identity',return_value={'fixture':'host-only'}),
+            # Native producers are mocked here; make their host admission
+            # input explicit too, independently of the developer's free disk.
+            patch.object(driver.shutil,'disk_usage',return_value=SimpleNamespace(free=16*1024**3)),
             patch.object(driver,'verify_native_child',side_effect=admitted),
             patch.object(driver,'verify_native_reordered_write_child',side_effect=admitted),
             patch.object(driver,'run_clean',side_effect=capture),patch.object(driver,'run_cut',side_effect=capture),
@@ -373,6 +376,14 @@ class DriverControlV3(unittest.TestCase):
         for change in (dict(same_host_monotonic_session=False),dict(resource_caps={}),
             dict(resource_caps=dict(max_children=6,max_runtime_seconds=9600,max_storage_bytes=8*1024**3))):
             with self.assertRaises(ValueError):self.run_driver(**change)
+        self.assertEqual(self.calls,[])
+    def test_insufficient_host_storage_fails_before_native_dispatch(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from v16_a10_reordered_chain_v3 import MIN_STORAGE
+        with patch.object(self.driver.shutil,'disk_usage',return_value=SimpleNamespace(free=MIN_STORAGE-1)):
+            with self.assertRaisesRegex(ValueError,'insufficient available campaign storage'):
+                self.run_driver()
         self.assertEqual(self.calls,[])
 
 class InventoryBoundsV3(unittest.TestCase):

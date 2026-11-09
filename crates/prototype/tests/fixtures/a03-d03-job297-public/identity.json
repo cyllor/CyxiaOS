@@ -1,0 +1,15 @@
+{
+  "scope": "Public actual D03 reply component regression fixture; no training sample or native PASS",
+  "source_sha256": "697f4538b30dfa88ff74cb4ace90efcf53df3ea75b4a5921bf1a6ff21fabed21",
+  "control_bank_sha256": "b0af75a55b6f294ee1426ed2771cbb124008525d91dd7c05551872ef2f9b57d3",
+  "slot": 40,
+  "job": 297,
+  "domain": 3,
+  "kind": 1,
+  "input_sha256": "9f1bad2d941a5db650d7491c4372f7b1a7e2b207f85766d0cc3fbc1b6dea2d67",
+  "output_sha256": "bf531ca88e8e4e0e50c66b5bb0e14b580ccada3363ba45207de3b56903fe43c6",
+  "model_sha256": "9b9bf87a969d7b0c6be3a9ea0564714d87cf12f1578037867d945c210c5f0ca3",
+  "decode_ns": 158541,
+  "publication_ns": 353916,
+  "combined_ns": 512457
+}

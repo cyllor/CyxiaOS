@@ -30,8 +30,22 @@ fn assets(directory: &std::path::Path, paths: &mut Vec<PathBuf>) {
     }
 }
 fn main() {
+    println!("cargo:rerun-if-env-changed=CYXIA_A03_DEMAND");
+    let demand = env::var("CYXIA_A03_DEMAND").unwrap_or_else(|_| "off".into());
+    assert!(
+        ["off", "ordinary-rise-fall"].contains(&demand.as_str()),
+        "invalid A03 demand profile"
+    );
+    println!("cargo:rustc-check-cfg=cfg(cyxia_a03_demand)");
+    if demand == "ordinary-rise-fall" {
+        println!("cargo:rustc-cfg=cyxia_a03_demand");
+    }
     println!("cargo:rerun-if-env-changed=CYXIA_LEARNING_COLLECTION");
     let collection = env::var("CYXIA_LEARNING_COLLECTION").unwrap_or_else(|_| "full".into());
+    assert!(
+        demand == "off" || collection == "full",
+        "A03 ordinary demand conflicts with learning collection"
+    );
     assert!(
         ["full", "coreset-one-pair", "coreset-data-one-pair"].contains(&collection.as_str()),
         "invalid collection profile"

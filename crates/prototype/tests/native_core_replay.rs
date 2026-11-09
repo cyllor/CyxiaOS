@@ -258,6 +258,9 @@ struct State {
     preparation: Option<preparation::Pending>,
     cursor: [usize; 18],
     encode_ns: u64,
+    due: [u64; 18],
+    family_cursor: usize,
+    mandatory_visits: usize,
 }
 #[derive(Clone, Copy)]
 struct JobSource {
@@ -284,6 +287,9 @@ fn state() -> State {
         preparation: None,
         cursor: [0; 18],
         encode_ns: 0,
+        due: [0; 18],
+        family_cursor: 0,
+        mandatory_visits: 0,
     }
 }
 fn with<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
@@ -375,7 +381,41 @@ fn encode_job(
 }
 #[allow(dead_code)]
 #[path = "../../../kernel/src/domain_control/core_replay.rs"]
-mod core_replay;
+pub(crate) mod core_replay;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_control/dispatch.rs"]
+mod dispatch;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+mod target_batch;
+pub mod domain_control {
+    pub(crate) use crate::core_replay;
+}
+pub mod domain_platform {
+    pub fn now_ns() -> u64 {
+        super::now()
+    }
+}
+pub mod domain_evidence {
+    pub fn visit_record(_: usize, sequence: u64, mut word: impl FnMut(usize, u64)) -> bool {
+        for i in 0..640 {
+            word(
+                i,
+                if i <= 1 {
+                    sequence
+                } else if i == 639 {
+                    2
+                } else {
+                    0
+                },
+            );
+        }
+        true
+    }
+}
+#[allow(unexpected_cfgs, dead_code)]
+#[path = "../../../kernel/src/a03_demand.rs"]
+mod a03_demand;
 fn scope(
     seed: u64,
     kind: learning_history::TrialKind,
@@ -401,6 +441,261 @@ fn scope(
 }
 fn relative(id: u64) -> u64 {
     ((id - 1) / 10) * 1_000_000_000 + ((id - 1) % 10) * 1000
+}
+fn normal_empty_visit(s: &mut State, _: &mut [u64; 512]) -> Result<bool, Error> {
+    let index = s.family_cursor;
+    let ordinal = s.cursor[index];
+    let mut targets = [None; 2];
+    // This fixture owner has no domain-2 object. Exercise the production
+    // target walk and successful mandatory-visit/rotation mechanics.
+    target_batch::resolve(
+        &[
+            target_batch::Query::fallback(2, 1, ordinal),
+            target_batch::Query::exact(2, 1, ordinal + 1),
+        ],
+        &mut targets,
+        |query| (query.domain == 1).then_some(TARGET),
+    )?;
+    target_batch::complete_visit(
+        index,
+        now(),
+        ordinal,
+        targets[1].is_some(),
+        &mut s.due,
+        &mut s.family_cursor,
+        &mut s.cursor,
+    )?;
+    s.mandatory_visits += 1;
+    CLOCK.fetch_add(20_000, Ordering::AcqRel);
+    assert!(targets[0].is_none());
+    Ok(false)
+}
+#[test]
+fn ordinary_dispatch_empty_mandatory_visit_uses_same_paid_turn_despite_other_due_slots() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    CLOCK.store(1_000_000_000, Ordering::Release);
+    ENCODING_CPU.store(0, Ordering::Release);
+    cpu::set(0);
+    assert_eq!(core_replay::abort_prepared(), Ok(true));
+    core_replay::release_prepared().unwrap();
+    core_replay::prepare_ordinary(now()).unwrap();
+    core_replay::ordinary_release(now()).unwrap();
+    let mut root = state();
+    root.owner.families[0] = Some(FAMILY);
+    cpu::set(1);
+    let credit = domain_tasks::begin(1400);
+    let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
+    let first = now();
+    let mut input = [0; 512];
+    let started = dispatch::normal_then_optional(
+        &mut root,
+        &mut input,
+        true,
+        |s| (s.encoded.is_some(), s.preparation.is_some()),
+        normal_empty_visit,
+        |s, input| core_replay::next(s, 1, &witness, first, first, input),
+    )
+    .unwrap();
+    assert_eq!(root.mandatory_visits, 1);
+    assert_eq!(root.family_cursor, 1);
+    assert!(root.due[0] > first && root.due[1] <= first);
+    assert!(
+        started,
+        "real mandatory EMPTY visit finished but an unrelated due slot starved real read-only work"
+    );
+    assert!(
+        root.encode_ns >= 20_000,
+        "the optional job must retain the original CPU start including the normal visit"
+    );
+    let work = root.encoded.unwrap().work.unwrap();
+    core_replay::evaluated_cost(work, root.sequence, Ok(0), [7; 32], 32_000).unwrap();
+    core_replay::report_completed(work, &witness).unwrap();
+    domain_tasks::settle(credit);
+    core_replay::retired(work).unwrap();
+    cpu::set(0);
+    assert!(core_replay::ordinary_withdraw().unwrap().drained());
+    core_replay::ordinary_finish().unwrap();
+}
+#[test]
+fn ordinary_dispatch_never_steals_a_started_job_error_or_unfinished_preparation() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut root = state();
+    let mut input = [0; 512];
+    let facts = |s: &State| (s.encoded.is_some(), s.preparation.is_some());
+    assert_eq!(
+        dispatch::normal_then_optional(
+            &mut root,
+            &mut input,
+            true,
+            facts,
+            |_, _| Err(Error::Busy),
+            |_, _| panic!("normal error cannot admit optional work")
+        ),
+        Err(Error::Busy)
+    );
+    assert_eq!(
+        dispatch::normal_then_optional(
+            &mut root,
+            &mut input,
+            true,
+            facts,
+            |_, _| Ok(true),
+            |_, _| panic!("normal model already owns this turn")
+        ),
+        Ok(true)
+    );
+    root.encoded = Some(JobSource {
+        owner: core_replay::CORE_OWNER,
+        class: CpuClass::ExecutorWork,
+        work: None,
+    });
+    assert_eq!(
+        dispatch::normal_then_optional(
+            &mut root,
+            &mut input,
+            true,
+            facts,
+            |_, _| panic!("live job cannot dispatch another normal visit"),
+            |_, _| panic!("live job cannot dispatch optional work")
+        ),
+        Ok(false)
+    );
+    root.encoded = None;
+    assert_eq!(
+        dispatch::normal_then_optional(
+            &mut root,
+            &mut input,
+            true,
+            facts,
+            |s, _| {
+                let snapshot = Snapshot {
+                    sequence: 1,
+                    taken_ns: now(),
+                    ledger_generation: 1,
+                    core_generation: 1,
+                };
+                let identity = preparation_identity(s, 1, 1, 2, TARGET, 1, None);
+                s.preparation = Some(preparation::Pending::new(identity, snapshot, 1, 0));
+                Ok(false)
+            },
+            |_, _| panic!("unfinished normal preparation retains its next opportunity")
+        ),
+        Ok(false)
+    );
+    root.preparation = None;
+    assert_eq!(
+        dispatch::normal_then_optional(
+            &mut root,
+            &mut input,
+            false,
+            facts,
+            |_, _| Ok(false),
+            |_, _| Ok(true)
+        ),
+        Ok(true),
+        "legacy fallback does not require every mandatory slot idle"
+    );
+}
+#[test]
+fn ordinary_demand_withdraw_keeps_admitted_work_until_real_retirement() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    CLOCK.store(1_000_000_000, Ordering::Release);
+    cpu::set(0);
+    assert_eq!(core_replay::abort_prepared(), Ok(true));
+    core_replay::release_prepared().unwrap();
+    let first = now();
+    core_replay::prepare_ordinary(first).unwrap();
+    assert_eq!(core_replay::ordinary_release(first).unwrap().released, 1);
+    cpu::set(1);
+    let credit = domain_tasks::begin(999);
+    let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
+    let mut root = state();
+    let mut input = [0; 512];
+    assert!(core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap());
+    let work = root.encoded.unwrap().work.unwrap();
+    cpu::set(0);
+    // Withdrawal stops future arrivals; it never clears queued/running work.
+    let withdrawn = core_replay::ordinary_withdraw().unwrap();
+    assert_eq!(
+        (withdrawn.released, withdrawn.running, withdrawn.retired),
+        (1, 1, 0)
+    );
+    at(first + 20_000_000_000);
+    assert_eq!(core_replay::ordinary_release(now()), Err(Error::Conflict));
+    assert!(!core_replay::ordinary_snapshot().unwrap().drained());
+    assert_eq!(core_replay::ordinary_finish(), Err(Error::Busy));
+    cpu::set(1);
+    core_replay::evaluated(work, root.sequence, Ok(0), [7; 32]).unwrap();
+    core_replay::report_completed(work, &witness).unwrap();
+    cpu::set(0);
+    assert!(!core_replay::ordinary_snapshot().unwrap().drained());
+    cpu::set(1);
+    domain_tasks::settle(credit);
+    core_replay::retired(work).unwrap();
+    cpu::set(0);
+    let drained = core_replay::ordinary_snapshot().unwrap();
+    assert!(drained.drained());
+    assert_eq!(
+        (drained.released, drained.retired, drained.completed),
+        (1, 1, 1)
+    );
+    assert_eq!(core_replay::ordinary_withdraw().unwrap(), drained);
+    core_replay::ordinary_finish().unwrap();
+}
+#[test]
+fn ordinary_demand_scene_needs_a_real_job_retirement_and_later_ordinary_decision() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    CLOCK.store(1_000_000_000, Ordering::Release);
+    cpu::set(0);
+    assert_eq!(core_replay::abort_prepared(), Ok(true));
+    core_replay::release_prepared().unwrap();
+    a03_demand::service_step().unwrap(); // Own the fixed ordinary queue.
+    a03_demand::service_step().unwrap(); // Release only the first due request.
+    let first = now();
+    cpu::set(1);
+    let credit = domain_tasks::begin(1000);
+    let witness = core_replay::PaidWorkWitness::new(credit).unwrap();
+    let mut root = state();
+    let mut input = [0; 512];
+    assert!(core_replay::next(&mut root, 1, &witness, now(), now(), &mut input).unwrap());
+    let work = root.encoded.unwrap().work.unwrap();
+    cpu::set(0);
+    at(first + a03_demand::HIGH_NS);
+    a03_demand::service_step().unwrap();
+    a03_demand::service_step().unwrap(); // Withdraw preserves the running job.
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 4);
+    assert!(!a03_demand::quiescent());
+    cpu::set(1);
+    core_replay::evaluated_cost(work, root.sequence, Ok(0), [7; 32], 32_000).unwrap();
+    core_replay::evaluated_cost(work, root.sequence, Ok(0), [7; 32], 32_000).unwrap();
+    core_replay::report_completed(work, &witness).unwrap();
+    domain_tasks::settle(credit);
+    core_replay::retired(work).unwrap();
+    cpu::set(0);
+    at(first + a03_demand::HIGH_NS + 5_000_000_000);
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 5);
+    let bank = a03_demand::observed();
+    assert_eq!(
+        (bank[17], bank[21], bank[22], bank[24]),
+        (100, 100, 1, 32_000)
+    );
+    // Elapsing the quiet horizon alone never substitutes for model work.
+    at(now() + a03_demand::QUIET_NS);
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 5);
+    a03_demand::ordinary_decision(99, 0, now(), now(), 0);
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 5);
+    // A completed reply whose original input predates drain is insufficient.
+    a03_demand::ordinary_decision(100, 10, first, now(), 0);
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 5);
+    a03_demand::ordinary_decision(100, 10, now(), now(), 0);
+    a03_demand::service_step().unwrap();
+    assert_eq!(a03_demand::observed()[5], 6);
+    assert!(a03_demand::quiescent());
 }
 #[test]
 fn real_queue_waits_for_runtime_retirement_and_never_expires_owned_work() {

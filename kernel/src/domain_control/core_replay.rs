@@ -111,6 +111,10 @@ struct Queue {
     fault: Option<Error>,
     primary_preparation: Option<(preparation::Identity, Snapshot)>,
     last_claim_retire: Option<Error>,
+    ordinary: bool,
+    ordinary_withdrawn: bool,
+    ordinary_released: usize,
+    ordinary_worker_ns: u64,
 }
 impl Queue {
     const fn new() -> Self {
@@ -136,6 +140,10 @@ impl Queue {
             fault: None,
             primary_preparation: None,
             last_claim_retire: None,
+            ordinary: false,
+            ordinary_withdrawn: false,
+            ordinary_released: 0,
+            ordinary_worker_ns: 0,
         }
     }
 }
@@ -248,9 +256,141 @@ pub fn prepare(seed: u64) -> Result<Image, Error> {
         Ok(image)
     })
 }
+/// A separate ordinary queue mode. It owns real read-only jobs but no replay
+/// scope, label authority, model substitution or permission to publish actions.
+pub(crate) fn prepare_ordinary(first_ns: u64) -> Result<Image, Error> {
+    cpu0()?;
+    if first_ns == 0 || first_ns > now() {
+        return Err(Error::Range);
+    }
+    let image = prepare(0)?;
+    queue(|q| {
+        if q.ordinary {
+            return if q.first == Some(first_ns) {
+                Ok(image)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if q.scope.is_some() || q.first.is_some() || q.warm_queued || q.stopped {
+            return Err(Error::Conflict);
+        }
+        q.ordinary = true;
+        q.first = Some(first_ns);
+        q.activated = true;
+        Ok(image)
+    })
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OrdinarySnapshot {
+    pub first_ns: u64,
+    pub withdrawn: bool,
+    pub released: u64,
+    pub queued: u64,
+    pub running: u64,
+    pub retirement_pending: u64,
+    pub retired: u64,
+    pub completed: u64,
+    pub rejected: u64,
+    pub worker_ns: u64,
+}
+impl OrdinarySnapshot {
+    pub fn drained(self) -> bool {
+        self.withdrawn
+            && self.queued == 0
+            && self.running == 0
+            && self.retirement_pending == 0
+            && self.retired == self.released
+    }
+}
+fn ordinary_facts(q: &Queue) -> Result<OrdinarySnapshot, Error> {
+    if !q.ordinary || q.scope.is_some() {
+        return Err(Error::NotReady);
+    }
+    let mut s = OrdinarySnapshot {
+        first_ns: q.first.ok_or(Error::NotReady)?,
+        withdrawn: q.ordinary_withdrawn,
+        released: q.ordinary_released as u64,
+        ..OrdinarySnapshot::default()
+    };
+    s.worker_ns = q.ordinary_worker_ns;
+    for row in &q.rows[..q.ordinary_released] {
+        match row.phase {
+            Phase::Queued => s.queued += 1,
+            Phase::Running => s.running += 1,
+            Phase::Evaluated => s.retirement_pending += 1,
+            Phase::Done => {
+                s.retired += 1;
+                if row.result.is_some_and(|v| v.is_ok()) {
+                    s.completed += 1;
+                } else {
+                    s.rejected += 1;
+                }
+            }
+        }
+    }
+    Ok(s)
+}
+/// Release only the pre-owned, fixed arrivals due by the caller's paid C0 turn.
+pub(crate) fn ordinary_release(at: u64) -> Result<OrdinarySnapshot, Error> {
+    cpu0()?;
+    if at > now() {
+        return Err(Error::Range);
+    }
+    queue(|q| {
+        if !q.ordinary {
+            return Err(Error::NotReady);
+        }
+        if q.ordinary_withdrawn {
+            return Err(Error::Conflict);
+        }
+        let first = q.first.ok_or(Error::NotReady)?;
+        while q.ordinary_released < REQUESTS
+            && first
+                .checked_add(relative(q.ordinary_released as u64 + 1)?)
+                .ok_or(Error::Overflow)?
+                <= at
+        {
+            q.ordinary_released += 1;
+        }
+        expire(q)?;
+        ordinary_facts(q)
+    })
+}
+pub(crate) fn ordinary_withdraw() -> Result<OrdinarySnapshot, Error> {
+    cpu0()?;
+    queue(|q| {
+        if !q.ordinary {
+            return Err(Error::NotReady);
+        }
+        q.ordinary_withdrawn = true;
+        expire(q)?;
+        ordinary_facts(q)
+    })
+}
+pub(crate) fn ordinary_snapshot() -> Result<OrdinarySnapshot, Error> {
+    cpu0()?;
+    queue(|q| {
+        expire(q)?;
+        ordinary_facts(q)
+    })
+}
+pub(crate) fn ordinary_finish() -> Result<(), Error> {
+    cpu0()?;
+    queue(|q| {
+        if !ordinary_facts(q)?.drained() {
+            return Err(Error::Busy);
+        }
+        let serial = q.serial;
+        *q = Queue::new();
+        q.serial = serial;
+        Ok(())
+    })
+}
 pub fn bind_scope(scope: &FrozenScope) -> Result<(), Error> {
     queue(|q| {
-        if q.image.is_none_or(|i| i.target != scope.target)
+        if q.ordinary
+            || q.image.is_none_or(|i| i.target != scope.target)
             || q.seed != scope.group.seed
             || scope.family != (learning::Family { domain: 1, kind: 2 })
             || q.first != Some(scope.first_ns)
@@ -316,6 +456,9 @@ pub fn prewarm_step(seed: u64) -> Result<(), Error> {
 }
 pub fn freeze(first_ns: u64) -> Result<(), Error> {
     queue(|q| {
+        if q.ordinary {
+            return Err(Error::Conflict);
+        }
         if q.first == Some(first_ns) {
             return Ok(());
         }
@@ -357,6 +500,21 @@ pub fn result(id: u64) -> Result<Option<Result<u64, Error>>, Error> {
     })
 }
 fn expire(q: &mut Queue) -> Result<(), Error> {
+    if q.ordinary {
+        let first = q.first.ok_or(Error::NotReady)?;
+        for (i, row) in q.rows[..q.ordinary_released].iter_mut().enumerate() {
+            if row.phase == Phase::Queued
+                && now()
+                    >= first
+                        .saturating_add(relative(i as u64 + 1)?)
+                        .saturating_add(DEADLINE)
+            {
+                row.phase = Phase::Done;
+                row.result = Some(Err(Error::Expired));
+            }
+        }
+        return Ok(());
+    }
     let Some(scope) = q.scope else {
         return Ok(());
     };
@@ -399,7 +557,7 @@ pub fn abort_prepared() -> Result<bool, Error> {
         return Ok(true);
     }
     queue(|q| {
-        if q.scope.is_some() {
+        if q.scope.is_some() || q.ordinary {
             return Err(Error::Conflict);
         }
         q.stopped = true;
@@ -416,7 +574,11 @@ pub fn release_prepared() -> Result<(), Error> {
         return Ok(());
     }
     queue(|q| {
-        if q.scope.is_some() || !q.stopped || q.warm_queued && q.warm.phase != Phase::Done {
+        if q.scope.is_some()
+            || q.ordinary
+            || !q.stopped
+            || q.warm_queued && q.warm.phase != Phase::Done
+        {
             return Err(Error::Busy);
         }
         let serial = q.serial;
@@ -477,6 +639,9 @@ fn row_mut(q: &mut Queue, id: WorkId) -> Result<&mut Row, Error> {
         }
         Ok(&mut q.warm)
     } else {
+        if q.ordinary && (id.primary || usize::from(id.slot) >= q.ordinary_released) {
+            return Err(Error::Stale);
+        }
         q.rows.get_mut(usize::from(id.slot)).ok_or(Error::Range)
     }
 }
@@ -516,6 +681,18 @@ fn selected() -> Result<Option<WorkId>, Error> {
     queue(|q| {
         if q.image.is_none() || q.stopped || q.fault.is_some() {
             return Ok(None);
+        }
+        if q.ordinary {
+            expire(q)?;
+            return Ok(q.rows[..q.ordinary_released]
+                .iter()
+                .position(|r| r.phase == Phase::Queued)
+                .map(|slot| WorkId {
+                    serial: q.serial,
+                    slot: slot as u16,
+                    warm: false,
+                    primary: false,
+                }));
         }
         if q.scope.is_none() {
             return Ok(
@@ -605,7 +782,25 @@ pub(super) fn evaluated(
     result: Result<u64, Error>,
     output_hash: [u8; 32],
 ) -> Result<(), Error> {
+    evaluated_cost(id, sequence, result, output_hash, 0)
+}
+pub(super) fn evaluated_cost(
+    id: WorkId,
+    sequence: u64,
+    result: Result<u64, Error>,
+    output_hash: [u8; 32],
+    worker_ns: u64,
+) -> Result<(), Error> {
     queue(|q| {
+        let total = if q.ordinary {
+            Some(
+                q.ordinary_worker_ns
+                    .checked_add(worker_ns)
+                    .ok_or(Error::Overflow)?,
+            )
+        } else {
+            None
+        };
         let row = row_mut(q, id)?;
         if row.sequence != sequence || row.cpu as usize != cyxia_arch_aarch64::cpu::slot() {
             return Err(Error::Auth);
@@ -626,6 +821,9 @@ pub(super) fn evaluated(
         row.output_hash = output_hash;
         row.result = Some(result.map(|_| row.root_ns));
         row.phase = Phase::Evaluated;
+        if let Some(total) = total {
+            q.ordinary_worker_ns = total;
+        }
         Ok(())
     })
 }

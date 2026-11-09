@@ -61,7 +61,42 @@ pub fn admission_progress_pending() -> bool {
 pub fn owned_drain_pending() -> bool {
     owner::drain_pending()
 }
-pub use owner::{control_step, init, pause_for_peer, quiescent, service_io, service_step, status};
+pub use owner::status;
+pub fn init() -> Result<(), DomainError> {
+    if crate::a03_demand::PROFILE {
+        return Ok(());
+    }
+    owner::init()
+}
+pub fn control_step() -> Result<bool, DomainError> {
+    if crate::a03_demand::PROFILE {
+        return Ok(false);
+    }
+    owner::control_step()
+}
+pub fn service_step() -> Result<bool, DomainError> {
+    if crate::a03_demand::PROFILE {
+        return crate::a03_demand::service_step();
+    }
+    owner::service_step()
+}
+pub fn service_io(progress: &mut dyn FnMut()) {
+    if !crate::a03_demand::PROFILE {
+        owner::service_io(progress);
+    }
+}
+pub fn pause_for_peer(paused: bool) -> Result<(), DomainError> {
+    if crate::a03_demand::PROFILE {
+        return Err(DomainError::NotReady);
+    }
+    owner::pause_for_peer(paused)
+}
+pub fn quiescent() -> bool {
+    if crate::a03_demand::PROFILE {
+        return crate::a03_demand::quiescent();
+    }
+    owner::quiescent()
+}
 pub(crate) use owner::{prewarm_service_hint, service_owned_prewarm};
 pub(crate) const WORKSPACE_PEAK_BYTES: usize = owner::WORKSPACE_PEAK_BYTES;
 

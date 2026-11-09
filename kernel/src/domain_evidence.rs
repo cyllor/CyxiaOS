@@ -37,6 +37,23 @@ fn begin_write(at: usize) {
 fn end_write(at: usize) {
     DOMAIN_CONTROL_EVIDENCE.0[at + SEQLOCK].fetch_add(1, Ordering::Release);
 }
+/// Read-only retention of one complete record by the dedicated A03 observer.
+/// A failed copy supplies no successful observation or publication authority.
+#[cfg(cyxia_a03_demand)]
+pub(crate) fn visit_record(slot: usize, sequence: u64, mut word: impl FnMut(usize, u64)) -> bool {
+    if slot >= SLOTS {
+        return false;
+    }
+    let at = base(slot);
+    let publication = get(at + SEQLOCK);
+    if publication == 0 || publication & 1 != 0 || get(at) != sequence || get(at + 1) != sequence {
+        return false;
+    }
+    for index in 0..RECORD_WORDS {
+        word(index, get(at + index));
+    }
+    get(at + SEQLOCK) == publication && get(at) == sequence && get(at + 1) == sequence
+}
 fn family(domain: u64, kind: u64) -> usize {
     match (domain, kind) {
         (1, 1) => 0,
