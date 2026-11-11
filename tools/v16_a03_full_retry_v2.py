@@ -14,7 +14,7 @@ from boot_reboot_contract import DISK_BYTES, verify_origin
 from build_unified import code_source_map
 from build_v16_learning_collection import elf_profile
 from check_elf import boot_profile, inspect_elf, symbol
-from check_prototype_evidence import read_json, _pairs
+from check_prototype_evidence import EvidenceError, read_json, _finite_float, _pairs
 from run_v13_a02 import config_write_packet
 from transport import FrameDecoder
 from verify_unified import attest_qemu
@@ -44,6 +44,16 @@ BANKS = {'boot':('A01_BOOT_EVIDENCE',512), 'config':('A01_BOOT_CONFIG',512),
     'root-diagnostic':('REPLAY_ROOT_EVIDENCE',256), 'publication-cost':('DOMAIN_PUBLICATION_COST',1024),
     'tasks':('DOMAIN_TASK_EVIDENCE',256), 'credit':('CONTROL_CREDIT_EVIDENCE',512),
     'settlement':('CONTROL_SETTLEMENT_EVIDENCE',512)}
+
+# Complete captures outgrow the generic 4 MiB JSON bound. Keep the same
+# dedicated transcript bound and strict JSON semantics as the v1 verifier.
+QMP_TRANSCRIPT_BYTES = 16*1024**2
+
+
+def read_transcript(path):
+    require(path.stat().st_size <= QMP_TRANSCRIPT_BYTES,'Full frontier QMP transcript exceeds bounded size')
+    return json.loads(path.read_text(encoding='utf-8'),object_pairs_hook=_pairs,parse_float=_finite_float,
+        parse_constant=lambda value: (_ for _ in ()).throw(EvidenceError(f'Invalid number {value}')))
 
 
 def require_full_profile(manifest):
@@ -115,8 +125,11 @@ def stopped_frontier(probe):
     if value is None: return None
     for key in ('boot','runtime'):
         if len(probe[key]) != BANKS[key][1]: return None
-        seq = word(probe[key],16)
-        if not seq or seq%2: return None
+    # Boot word2 advances only in the non-returning SAFE_EXEC loop; a clean
+    # successful boot reads zero here. Runtime still requires publication.
+    if word(probe['boot'],16)%2: return None
+    runtime_seq = word(probe['runtime'],16)
+    if not runtime_seq or runtime_seq%2: return None
     fatal_evidence(probe['replay'],probe['control'],probe['tasks'])
     return value
 
@@ -317,7 +330,7 @@ def verify_capture(directory, *, source_root, build_manifest, formatter, qemu_bi
     dtb = (root/'platform.dtb').read_bytes(); header = (root/'dtb-header.bin').read_bytes()
     require(header == dtb[:40] and len(header) == 40 and 40 <= len(dtb) <= 2*1024**2
         and struct.unpack_from('>2I',dtb) == (0xd00dfeed,len(dtb)),'Full frontier DTB mismatch')
-    rows = doc('qmp-transcript.json')
+    rows = read_transcript(root/'qmp-transcript.json')
     for direction,name in (('send','qmp-sent.bin'),('receive','qmp-received.bin')):
         raw = (root/name).read_bytes(); require(len(raw) <= 128*1024**2,'Full frontier raw QMP bound')
         require(raw_qmp_messages(raw) == [r['message'] for r in rows if r['direction'] == direction],'Full frontier raw QMP/transcript mismatch')

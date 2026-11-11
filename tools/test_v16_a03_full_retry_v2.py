@@ -1,6 +1,7 @@
 """Host protocol fixtures only; never a native dataset or AcceptedSample."""
 import importlib
 import copy
+import json
 import os
 import struct
 import tempfile
@@ -62,6 +63,110 @@ class Frontier(unittest.TestCase):
         for at, value in ((0, 3), (3, 1), (3, 2), (8, 1), (12, 1), (14, 0)):
             w = list(struct.unpack('<64Q', c)); w[at] = value
             self.assertIsNone(self.f.frontier_boundary(r, struct.pack('<64Q', *w)))
+
+    def test_stopped_frontier_accepts_clean_boot_zero_and_keeps_fatal_checks(self):
+        # Successful normal boot does not enter the non-returning SAFE_EXEC
+        # loop that advances boot word2; runtime is independently published.
+        def probe(boot_seq=0, runtime_seq=2):
+            value={key:bytes(size) for key,(_,size) in self.f.BANKS.items() if key!='config'}
+            value['replay'],value['collection']=banks()
+            boot=bytearray(value['boot']);runtime=bytearray(value['runtime'])
+            struct.pack_into('<4Q',boot,0,0x435958424f4f5431,1,boot_seq,3)
+            struct.pack_into('<Q',runtime,16,runtime_seq)
+            value.update(boot=bytes(boot),runtime=bytes(runtime))
+            return value
+        clean=self.f.stopped_frontier(probe())
+        self.assertIsNotNone(clean,'clean boot word2=0 was rejected')
+        self.assertEqual(clean['paired'],2)
+        self.assertEqual(self.f.stopped_frontier(probe(2,2))['paired'],2)
+        for boot_seq,runtime_seq in ((1,2),(3,2),(0,0),(0,3),(2,0)):
+            with self.subTest(boot_seq=boot_seq,runtime_seq=runtime_seq):
+                self.assertIsNone(self.f.stopped_frontier(probe(boot_seq,runtime_seq)))
+        for key in ('boot','runtime'):
+            value=probe();value[key]=value[key][:-8]
+            self.assertIsNone(self.f.stopped_frontier(value))
+        value=probe();tasks=bytearray(value['tasks']);struct.pack_into('<Q',tasks,16,1)
+        value['tasks']=bytes(tasks)
+        with self.assertRaisesRegex(ValueError,'quarantine'):
+            self.f.stopped_frontier(value)
+        value=probe();control=bytearray(value['control'])
+        for at,number in ((160,0x43594f5053540001),(161,1),(162,1),(191,2)):
+            struct.pack_into('<Q',control,at*8,number)
+        value['control']=bytes(control)
+        with self.assertRaisesRegex(ValueError,'optimization-stop'):
+            self.f.stopped_frontier(value)
+
+    def test_verify_capture_reads_large_transcript_and_rechecks_raw_streams(self):
+        # Isolate real transcript ingestion from native source/disk admission.
+        # The protocol-verifier sentinel prevents this fixture claiming success.
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve();digest='11'*32
+            context=dict(artifacts={'node-a.elf':digest},build_sha256=digest,
+                base_build_sha256=digest,model_sha256=digest,source_map={},tools={},
+                symbols={'config':{'pa':4096}},paths={'qemu_binary':'/qemu','formatter':'/formatter'})
+            inputs=dict(version=self.f.VERSION,mode=0,collection_profile='full',frontier_groups=2,
+                max_exclusions=self.f.MAX_EXCLUSIONS,max_archive_bytes=self.f.MAX_ARCHIVE_BYTES,
+                timeout_seconds=1200,poll_seconds=.1,serial_seconds=1,max_stopped_attempts=64,
+                nonce='22'*16,disk_uuid='33'*16,disk_origin={})
+            config=struct.pack('<4Q',self.f.CONFIG_MAGIC,1,0,0)+bytes.fromhex(inputs['nonce'])+bytes.fromhex(digest)*3+bytes(368)
+            (root/'config.bin').write_bytes(config);(root/'config-observed.bin').write_bytes(config)
+            (root/'format.log').write_bytes(b'');(root/'disk.raw').write_bytes(b'x')
+            dtb=struct.pack('>2I',0xd00dfeed,40)+bytes(32)
+            (root/'platform.dtb').write_bytes(dtb);(root/'dtb-header.bin').write_bytes(dtb)
+            launch=dict(port=1234,qmp='qmp.sock',gdb='gdb.sock',symbols=context['symbols'])
+            launch['argv']=self.f.launch_argv('/qemu',root,launch['qmp'],launch['gdb'],launch['port'])
+            docs={'native-context.json':context,'source-manifest.json':{},'input.json':inputs,
+                'config-injection.json':dict(request_hex=self.f.config_write_packet(config,4096).hex(),received_hex=b'$OK#9a'.hex(),ack_hex='2b'),
+                'process-exit.json':dict(schema=1,pid=1,peer_pid=1,returncode=0,forced=False,quit_ok=True,eof=True,errors=[],started_ns=1,exited_ns=2),
+                'launch.json':launch,'formatter-command.json':dict(argv=['/formatter',str(root/'disk.raw'),inputs['disk_uuid']]),
+                'disk-before.json':{},'disk-after.json':dict(bytes=1,sha256=digest),
+                'platform.json':dict(cpus=[{'cpu-index':i} for i in range(4)],memory={'base-memory':1024**3})}
+            rows=[{'direction':'receive','message':{'QMP':{}}}]
+            for identity in range(1,16001):
+                rows.extend([{'direction':'send','message':{'execute':'pmemsave','id':identity,
+                    'arguments':{'val':4096,'size':512,'filename':str(root/'pending-replay.bin')}}},
+                    {'direction':'receive','message':{'id':identity,'return':{}}}])
+            transcript=root/'qmp-transcript.json';transcript.write_text(json.dumps(rows,indent=2),encoding='utf-8')
+            self.assertGreater(transcript.stat().st_size,4*1024**2)
+            for direction,name in (('send','qmp-sent.bin'),('receive','qmp-received.bin')):
+                (root/name).write_text(''.join(json.dumps(r['message'])+'\n' for r in rows if r['direction']==direction),encoding='utf-8')
+            original_read_json=self.f.read_json
+            def document(path):
+                return original_read_json(path) if path.name=='qmp-transcript.json' else docs[path.name]
+            trusted=dict(source_root=root,build_manifest=root,formatter=root,qemu_binary=root,qemu_source=root)
+            with patch.object(self.f,'bounded_inventory',return_value={}),patch.object(self.f,'closure',return_value={}),\
+                    patch.object(self.f,'trusted_context',return_value=context),patch.object(self.f,'sha',return_value=digest),\
+                    patch.object(self.f,'read_json',side_effect=document),patch.object(self.f,'verify_origin'),\
+                    patch.object(self.f,'DISK_BYTES',1),patch.object(self.f,'verify_qmp',side_effect=RuntimeError('transcript ingested')) as verify:
+                with self.assertRaisesRegex(RuntimeError,'transcript ingested'):
+                    self.f.verify_capture(root,**trusted)
+                verify.assert_called_once_with(root,context,rows,docs['platform.json'],dtb)
+                (root/'qmp-sent.bin').write_bytes(b'')
+                with self.assertRaisesRegex(ValueError,'raw QMP/transcript mismatch'):
+                    self.f.verify_capture(root,**trusted)
+
+    def test_transcript_reader_rejects_duplicate_nonfinite_and_invalid_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'qmp-transcript.json'
+            for raw in (b'[{"message":{"id":1,"id":2}}]',b'[{"value":NaN}]',
+                        b'[{"value":Infinity}]',b'[{"value":-Infinity}]',
+                        b'[{"value":1e999}]',b'[{"id":1}',b'\xff'):
+                with self.subTest(raw=raw):
+                    path.write_bytes(raw)
+                    with self.assertRaises(ValueError):self.f.read_transcript(path)
+            path.write_bytes(b'[{"value":1.25}]')
+            self.assertEqual(self.f.read_transcript(path),[{'value':1.25}])
+
+    def test_transcript_reader_enforces_its_16_mib_byte_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'qmp-transcript.json'
+            limit=16*1024**2
+            self.assertEqual(self.f.QMP_TRANSCRIPT_BYTES,limit)
+            path.write_bytes(b'[]'+b' '*(limit-2))
+            self.assertEqual(self.f.read_transcript(path),[])
+            with path.open('ab') as stream:stream.write(b' ')
+            with self.assertRaisesRegex(ValueError,'transcript exceeds bounded size'):
+                self.f.read_transcript(path)
 
     def test_full_manifest_refuses_ordinary_and_focused(self):
         good = dict(schema_version=1, contract='v16-learning-collection-build-v1',
@@ -129,7 +234,7 @@ class Frontier(unittest.TestCase):
             for key,(_,size) in self.f.BANKS.items():
                 if key=='config':continue
                 value=banks()[0] if key=='replay' else banks()[1] if key=='collection' else bytes(size)
-                if key in ('boot','runtime'):
+                if key=='runtime':
                     value=bytearray(value);struct.pack_into('<Q',value,16,2);value=bytes(value)
                 save('probe-01-'+key+'.bin',key,value)
             for key in self.f.BANKS:
@@ -206,7 +311,7 @@ class Observer(unittest.TestCase):
             if key=='replay': return banks()[0]
             if key=='collection': return banks()[1]
             w=bytearray(size)
-            if key in ('boot','runtime'): struct.pack_into('<Q',w,16,2)
+            if key=='runtime': struct.pack_into('<Q',w,16,2)
             return bytes(w)
         with patch.object(producer.time,'sleep'), patch.object(f,'fatal_evidence'):
             result=producer.observe(q,save,symbols,Proc(),producer.time.monotonic()+5,
@@ -260,7 +365,7 @@ class Retry(unittest.TestCase):
             if key=='replay':return final
             if key=='collection':return collection
             value=bytearray(size)
-            if key in ('boot','runtime'):struct.pack_into('<Q',value,16,2)
+            if key=='runtime':struct.pack_into('<Q',value,16,2)
             return bytes(value)
         with patch.object(p.time,'sleep'):
             result=p.observe(q,save,symbols,Proc(),p.time.monotonic()+5,p.FrameDecoder(),bytearray(),bytearray())
