@@ -11,6 +11,8 @@ use cyxia_prototype::learning::{
     self, Family as LearningFamily,
     reward::{Adoption, BaselineAdoption},
 };
+#[path = "replay/candidate_window.rs"]
+mod candidate_window;
 #[path = "replay/config_diagnostic.rs"]
 mod config_diagnostic;
 #[path = "replay/fixture.rs"]
@@ -280,6 +282,8 @@ struct CandidatePublication {
 pub(crate) const CANDIDATE_PUBLICATION_BYTES: usize =
     core::mem::size_of::<Option<CandidatePublication>>();
 const _: () = assert!(CANDIDATE_PUBLICATION_BYTES <= 128);
+/// Separately live Root state, outside the driver's exact metadata-page loans.
+pub(crate) const CANDIDATE_WINDOW_BYTES: usize = core::mem::size_of::<candidate_window::Window>();
 struct Root {
     registered: [Option<OwnerChecks>; 4],
     serial: u64,
@@ -293,6 +297,7 @@ struct Root {
     model: Option<ModelBinding>,
     first: Option<Snapshot>,
     first_ready: bool,
+    candidate_window: candidate_window::Window,
     lifecycle: lifecycle::CloseGate,
     rejected: Option<RejectedPublication>,
     digest: [u8; 32],
@@ -328,6 +333,7 @@ impl Root {
             model: None,
             first: None,
             first_ready: false,
+            candidate_window: candidate_window::Window::new(),
             lifecycle: lifecycle::CloseGate::new(),
             rejected: None,
             digest: [0; 32],
@@ -1104,6 +1110,7 @@ pub fn release_preparation(preparation: Preparation) -> Result<(), Error> {
             r.fault = None;
             r.first = None;
             r.first_ready = false;
+            r.candidate_window = candidate_window::Window::new();
         }
         root_mut().preparing = None;
         Ok(())
@@ -1184,6 +1191,7 @@ pub fn reserve(request: Request) -> Result<Token, Error> {
         r.model = Some(s.registry.model());
         r.first = None;
         r.first_ready = false;
+        r.candidate_window = candidate_window::Window::new();
         r.lifecycle = lifecycle::CloseGate::new();
         r.rejected = None;
         r.digest = [0; 32];
@@ -1260,6 +1268,7 @@ pub fn advance(old: Token, request: Request) -> Result<Token, Error> {
         r.phase = Phase::Frozen;
         r.first = None;
         r.first_ready = false;
+        r.candidate_window = candidate_window::Window::new();
         r.lifecycle = lifecycle::CloseGate::new();
         r.rejected = None;
         r.selected = None;
@@ -1277,7 +1286,7 @@ pub fn advance(old: Token, request: Request) -> Result<Token, Error> {
         Ok(token)
     })
 }
-pub(super) fn allows(domain: u16, kind: u16, target: ObjectKey) -> bool {
+pub(super) fn allows_at(domain: u16, kind: u16, target: ObjectKey, at: u64) -> bool {
     let r = root();
     if r.lifecycle.closing().is_some()
         || r.spectator.is_some()
@@ -1294,9 +1303,10 @@ pub(super) fn allows(domain: u16, kind: u16, target: ObjectKey) -> bool {
         && q.family == (LearningFamily { domain, kind })
         && q.target == target
         && (!q.baseline.one_shot() || r.initial.is_none())
-        && (r.initial.is_none() || now() >= r.renew_after)
+        && (r.initial.is_none() || at >= r.renew_after)
+        && r.candidate_window.allows_new(r.initial.is_some(), at)
 }
-pub(super) fn allows_action(action: Action, target: ObjectKey) -> bool {
+pub(super) fn allows_action_at(action: Action, target: ObjectKey, at: u64) -> bool {
     let r = root();
     if r.lifecycle.closing().is_some()
         || r.spectator.is_some()
@@ -1308,7 +1318,8 @@ pub(super) fn allows_action(action: Action, target: ObjectKey) -> bool {
     if r.request.is_none() {
         return true;
     }
-    allows(action.domain(), action.kind(), target) && root().selected.is_none_or(|a| a == action)
+    allows_at(action.domain(), action.kind(), target, at)
+        && root().selected.is_none_or(|a| a == action)
 }
 pub fn active() -> bool {
     with(|_| {
@@ -1407,6 +1418,7 @@ fn reserve_spectator_inner(
         r.model = Some(s.registry.model());
         r.first = None;
         r.first_ready = false;
+        r.candidate_window = candidate_window::Window::new();
         r.lifecycle = lifecycle::CloseGate::new();
         r.rejected = None;
         r.digest = [0; 32];
@@ -1573,6 +1585,38 @@ pub fn activation(token: Token) -> bool {
     ACTIVATING.load(core::sync::atomic::Ordering::Acquire) == cyxia_arch_aarch64::cpu::slot() + 1
         && root().token == Some(token)
 }
+/// Bind the actual protected capture window while its registered on_first
+/// callback holds the existing synchronous Root activation authority.
+pub fn bind_observation_window(
+    token: Token,
+    scope: &crate::learning_history::FrozenScope,
+) -> Result<(), Error> {
+    if !activation(token) {
+        return Err(Error::Auth);
+    }
+    let r = root();
+    let q = exact(r, token)?;
+    if scope.key.boot_epoch != token.boot_epoch
+        || scope.key.trial_id != q.trial_id
+        || q.owner != token.owner
+        || scope.kind != q.kind
+        || scope.family != q.family
+        || scope.target != q.target
+        || scope.frozen_other_domains != r.digest
+        || r.first.is_none_or(|first| first.taken_ns != scope.first_ns)
+    {
+        return Err(Error::Conflict);
+    }
+    root_mut()
+        .candidate_window
+        .bind(candidate_window::Observation {
+            run: scope.key,
+            family: scope.family,
+            target: scope.target,
+            first_ns: scope.first_ns,
+            observation_ns: scope.observation_ns,
+        })
+}
 fn activate(token: Token, q: Request, snapshot: Snapshot) -> Result<Prefix, Error> {
     if ACTIVATION_TOKEN.load(Ordering::Relaxed) != token.id {
         ACTIVATION_TOKEN.store(token.id, Ordering::Relaxed);
@@ -1652,7 +1696,7 @@ pub(super) fn first(
     let Some(q) = r.request else {
         return Ok((snapshot, None));
     };
-    if !allows(domain, kind, target) {
+    if !allows_at(domain, kind, target, snapshot.taken_ns) {
         return Err(Error::Busy);
     }
     let r = root();

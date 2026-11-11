@@ -11,7 +11,7 @@ use cyxia_prototype::{
         Action, ApplyId, Error, ObjectKey, PolicyStamp,
         filesystem::{
             BACKGROUND_RESERVATION_BYTES, Entry, FileSystem, FlushReceipt, Handle, Metrics,
-            OpenMode, Stat, SyncReceipt,
+            OpenMode, Stat, SyncReceipt, cache_writeback_required,
         },
         io::Class,
     },
@@ -91,10 +91,10 @@ fn read_files<R>(f: impl FnOnce(&FileSystem<4096>) -> Result<R, Error>) -> Resul
 fn publish(files: &FileSystem<4096>) {
     let m = files.metrics();
     let c = files.cache_usage();
-    // Dirty debt above the cache partition is necessary Recovery writeback,
-    // not an ordinary background competitor. No clean/anonymous cache page
-    // or merely runnable service is advertised as pending disk work.
-    let _ = storage::set_background_demand(m.dirty_pages != 0 && c[0] <= c[2]);
+    // Required dirty writeback is not an ordinary background competitor. No
+    // clean/anonymous page or merely runnable service advertises disk work.
+    let required = cache_writeback_required(c[0] as u64, c[1] as u64, c[2] as u64);
+    let _ = storage::set_background_demand(m.dirty_pages != 0 && !required);
     let now = Board.now_ns();
     let (action_a, action_b) = match files.current_action(now) {
         Action::Filesystem { readahead, flush } => (readahead, flush),
@@ -408,10 +408,11 @@ pub fn background_flush(now: u64, p: &mut dyn FnMut()) -> Result<Option<FlushRec
         storage::cancel_background()?;
         return Ok(None);
     }
-    if usage[0] > usage[2] {
-        // These pages are already owned obligations of the shrinking cache.
-        // Necessary writeback cannot wait for the shrinking grant to become
-        // APPLIED, and neither optional policy gets a completion receipt here.
+    if cache_writeback_required(usage[0], usage[1], usage[2]) {
+        // These pages are already owned obligations: quota debt or a completely
+        // dirty full cache. Necessary writeback cannot wait for optional grants
+        // to become APPLIED; the filesystem rechecks under its actual owner.
+        // Neither optional policy gets a completion receipt here.
         storage::cancel_background()?;
         return with_files(|f| {
             storage::try_with_class(Class::Recovery, p, |j, d, s| f.reclaim_flush_one(j, d, s))?

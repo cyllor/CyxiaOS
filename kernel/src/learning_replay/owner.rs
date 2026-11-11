@@ -57,6 +57,7 @@ pub(super) const WORKSPACE_PEAK_BYTES: usize = 1024 * 1024
     + size_of::<AtomicU64>()
     + crate::domain_control::core_replay::OWNED_BYTES
     + root::CANDIDATE_PUBLICATION_BYTES
+    + root::CANDIDATE_WINDOW_BYTES
     + crate::learning_evidence::HANDOFF_BYTES
     + crate::domain_tasks::CAPTURE_CREDIT_BYTES
     + crate::domain_services::SOURCE_IDENTITY_BYTES
@@ -870,6 +871,7 @@ fn on_first(token: root::Token, snapshot: Snapshot) -> Result<(), DomainError> {
             }
             return Err(error);
         }
+        root::bind_observation_window(token, &scope)?;
         s.first_ready = true;
         s.cursor = 0;
         s.phase = Phase::Activate;

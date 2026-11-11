@@ -57,7 +57,10 @@ pub mod renewal {
   let apply=ApplyId{plan_seq:seq,..ID};let stamp=PolicyStamp::for_action(q.baseline,seq,at,at)?;
   s.owner.desired[0]=Some(Desired{action:q.baseline,apply,stamp,state:ExecutionState::Pending,
    started:false,first_entry_ns:None,observed_ns:at,published:at,evidence:None,job:seq,
-   dependencies:[None;2],core_generation:snapshot.core_generation,ledger_generation:snapshot.ledger_generation,execution_observed:false});
+   dependencies:[None;2],core_generation:snapshot.core_generation,ledger_generation:snapshot.ledger_generation,
+   // Ownership term is taken from the live context, never from the wire-encoded
+   // Snapshot/Envelope, so the plan wire format stays byte-identical.
+   owner_ledger_generation:s.owner.context.owner_ledger_generation,execution_observed:false});
   PUBLICATIONS.fetch_add(1,Ordering::Relaxed);let mut value=receipt(s,apply,stamp,snapshot,q.baseline)?;
   // Actual OfferCpu(0) publication uses its synchronous stop-owner receipt;
   // that owner is a boundary here, not the asynchronous Desired cache path.
@@ -70,12 +73,17 @@ pub mod renewal {
   // ROOT_RUNNING_ARM
   _=>(),
  }Ok(())})}
- fn context(ledger:u64){publish_context(Context{core_generation:1,ledger_generation:ledger,control_mask:6,business_mask:9}).unwrap();}
+ fn context(ledger:u64){publish_context(Context{core_generation:1,ledger_generation:ledger,owner_ledger_generation:ledger,control_mask:6,business_mask:9}).unwrap();}
+ // Production publishes a composite: prototype_runtime/native.rs adds the task
+ // resource generation to the CoreSet ledger generation. Model that fold so a
+ // task-only advance is visible to the real spliced poll gate, while the
+ // ownership-only term stays available for the gate that must ignore churn.
+ fn context_split(coreset:u64,task:u64){publish_context(Context{core_generation:1,ledger_generation:coreset+task,owner_ledger_generation:coreset,control_mask:6,business_mask:9}).unwrap();}
  fn setup(){
   AUTHORIZED.store(true,Ordering::Relaxed);PUBLICATIONS.store(0,Ordering::Relaxed);NEXT.store(51,Ordering::Relaxed);RESOURCE_LEDGER.store(1,Ordering::Relaxed);EVENTS.lock().unwrap().clear();
   APPLY_CALLS.store(0,Ordering::Relaxed);APPLY_MODE.store(0,Ordering::Relaxed);RECONCILE_CALLS.store(0,Ordering::Relaxed);WALL.store(100_000_000,Ordering::Release);
   RECEIPT_CPU.store(0,Ordering::Relaxed);PAID_PREFIX_CPU.store(0,Ordering::Relaxed);PUBLICATION_CPU.store(0,Ordering::Relaxed);WORK.store(0,Ordering::Relaxed);
-  with(|s|{s.owner.context=Context{core_generation:1,ledger_generation:1,control_mask:6,business_mask:9};s.owner.desired=[None];s.owner.family_epochs=[1];
+  with(|s|{s.owner.context=Context{core_generation:1,ledger_generation:1,owner_ledger_generation:1,control_mask:6,business_mask:9};s.owner.desired=[None];s.owner.family_epochs=[1];
    *root_mut()=Root{token:Some(TOKEN),request:Some(Request{kind:TrialKind::Baseline,baseline:Action::CpuWeight(2),target:key(12),owner:key(88),family:Family{domain:1,kind:1},not_before_ns:0}),phase:Phase::Frozen,baseline:[None;32],baseline_count:0,closing:None,fault:None,lifecycle:Lifecycle,registered:[Some(Checks{owner:key(88),settled:|_|Ok(())})],initial:None,first:None,unpublished:None,first_ready:true};Ok(())}).unwrap();
  }
  fn execute()->Receipt{super::poll(now()).unwrap();poll(TOKEN).unwrap();*root().baseline[root().baseline_count-1].as_ref().unwrap()}
@@ -233,8 +241,27 @@ pub mod renewal {
   assert_eq!(unknown.approved_deadline_ns,b.approved_deadline_ns);assert_eq!(unknown.snapshot,b.snapshot);
   assert_eq!(root().closing,None);assert_eq!(PUBLICATIONS.load(Ordering::Relaxed),1);
  }
+ // A renewal must survive task-resource churn that leaves core ownership
+ // untouched. Production publishes a composite (prototype_runtime/native.rs
+ // folds domain_tasks::resource_generation into ledger_generation), so under
+ // the Full profile that composite advances several times per 100 ms while
+ // ownership is idle. The pre-execution freshness gate must not reject on the
+ // churn term alone, or no candidate renewal can ever be applied under load.
+ fn task_churn_scenario(){
+  setup();let a=applied_initial();WALL.store(a.stamp.installed_until_ns-750_000_000,Ordering::Release);
+  let b=baseline_apply(TOKEN).unwrap();
+  context_split(1,1);
+  assert_eq!(with(|s|Ok(s.owner.context.ledger_generation)).unwrap(),2,"fixture did not model the production composite");
+  assert_eq!(with(|s|Ok(s.owner.context.owner_ledger_generation)).unwrap(),1,"fixture moved core ownership");
+  super::poll(now()).unwrap();poll(TOKEN).unwrap();
+  let renewed=root().baseline[1].unwrap();
+  assert_ne!(renewed.state,ExecutionState::Failed(Error::Stale),"unrelated task-resource churn rejected a fresh renewal");
+  assert_eq!(renewed.apply,b.apply,"task churn replaced the retained renewal identity");
+  assert_eq!(renewed.state,ExecutionState::Applied,"task churn blocked continuous coverage");
+  assert!(renewed.observed_ns<a.stamp.installed_until_ns,"coverage was not restored before the prior installation expired");
+ }
  pub fn scenarios(){
-  match std::env::args().nth(1).as_deref(){Some("renewal")=>renewal_scenarios(),Some("guards")=>guard_scenarios(),Some("capacity")=>capacity_scenarios(),Some("missed-sync")=>missed_sync_scenario(),Some("replacement-guards")=>replacement_guards(),Some("closing-reuse")=>closing_reuse(),Some("paid-limit")=>paid_refresh_limit(),_=>panic!("unknown scenario")}
+  match std::env::args().nth(1).as_deref(){Some("renewal")=>renewal_scenarios(),Some("guards")=>guard_scenarios(),Some("capacity")=>capacity_scenarios(),Some("missed-sync")=>missed_sync_scenario(),Some("replacement-guards")=>replacement_guards(),Some("closing-reuse")=>closing_reuse(),Some("paid-limit")=>paid_refresh_limit(),Some("task-churn")=>task_churn_scenario(),_=>panic!("unknown scenario")}
   println!("failed renewal custody scenarios passed");
  }
 }

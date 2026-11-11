@@ -17,6 +17,12 @@ pub const FIRST_ORDINARY_BLOCK: u32 =
 const MAP_BYTES: usize = TOTAL_BLOCKS as usize / 8;
 const TX_CAPACITY: usize = 40;
 pub const BACKGROUND_RESERVATION_BYTES: u64 = (2 + 2 * TX_CAPACITY as u64) * BLOCK_SIZE as u64;
+/// Already accepted dirty pages need bounded writeback when a shrinking quota
+/// owns debt, or when the exact quota contains no clean replacement page.
+/// This grants no new cache capacity and earns no optional policy receipt.
+pub const fn cache_writeback_required(resident: u64, dirty: u64, budget: u64) -> bool {
+    dirty != 0 && (resident > budget || (resident == budget && dirty == resident))
+}
 const EMPTY_INODE: Inode = Inode {
     kind: InodeKind::Free,
     generation: 1,
@@ -1438,6 +1444,8 @@ impl<const C: usize> FileSystem<C> {
     }
     /// Required cache reclamation uses the protected progress path. It cannot
     /// be stopped by an optional writeback policy or earn that policy a receipt.
+    /// Recheck actual owner state: a prior observation cannot authorize a flush
+    /// after debt has drained or a clean replacement page has become available.
     pub fn reclaim_flush_one<D: BlockDevice>(
         &mut self,
         j: &mut Journal,
@@ -1445,7 +1453,11 @@ impl<const C: usize> FileSystem<C> {
         s: &mut Scratch,
     ) -> Result<Option<FlushReceipt>, Error> {
         self.check_journal(j)?;
-        if self.resident <= self.cache_budget {
+        if !cache_writeback_required(
+            self.resident as u64,
+            u64::from(self.metrics.dirty_pages),
+            self.cache_budget as u64,
+        ) {
             return Ok(None);
         }
         let Some(id) = self

@@ -311,6 +311,10 @@ fn skip(
 pub struct Context {
     pub core_generation: u64,
     pub ledger_generation: u64,
+    /// CoreSet ledger generation alone, without the task-resource term folded
+    /// into `ledger_generation`. Pre-execution freshness compares this term so
+    /// ordinary task churn cannot strand an otherwise valid plan.
+    pub owner_ledger_generation: u64,
     pub control_mask: u64,
     pub business_mask: u64,
     pub healthy_mask: u64,
@@ -334,6 +338,8 @@ struct Desired {
     dependencies: [Option<BoundDependency>; 2],
     core_generation: u64,
     ledger_generation: u64,
+    /// Ownership term captured at publication. Not part of the plan wire.
+    owner_ledger_generation: u64,
 }
 struct Owner {
     families: [Option<Family>; 18],
@@ -430,6 +436,7 @@ static mut STATE: State = State {
         context: Context {
             core_generation: 0,
             ledger_generation: 0,
+            owner_ledger_generation: 0,
             control_mask: 0,
             business_mask: 0,
             healthy_mask: 0,
@@ -1472,7 +1479,7 @@ fn next_normal(
             break 'families;
         }
         preparation_prefix_detail(1);
-        if !replay::allows(f.domain, f.kind, target) {
+        if !replay::allows_at(f.domain, f.kind, target, wall_started) {
             skip(
                 index,
                 f,
@@ -1780,7 +1787,7 @@ fn next_normal(
         let mut replay_filtered = false;
         let mut stability_filtered = false;
         for action in legal[..legal_count].iter().flatten().copied() {
-            if !replay::allows_action(action, target) {
+            if !replay::allows_action_at(action, target, wall_started) {
                 replay_filtered = true;
                 continue;
             }
@@ -2298,6 +2305,9 @@ impl PublicationScope for ActiveScope<'_> {
         at: u64,
         slot: Option<usize>,
     ) -> Result<(), Error> {
+        if !replay::allows_action_at(action, target, at) {
+            return Err(Error::Busy);
+        }
         validate_selection_at(owner, f, action, target, at, slot.ok_or(Error::Stale)?)
     }
     fn commit<P: PlanView>(
@@ -2307,13 +2317,13 @@ impl PublicationScope for ActiveScope<'_> {
         plan: &P,
         _: &[PolicyStamp],
         _: u64,
-        _: u64,
+        at: u64,
     ) -> Result<(), Error> {
         for d in plan.iter() {
             if d.action.domain() == 15 && crate::learning_canary::blocks_active() {
                 return Err(Error::Busy);
             }
-            if !replay::allows_action(d.action, d.envelope.target) {
+            if !replay::allows_action_at(d.action, d.envelope.target, at) {
                 return Err(Error::Busy);
             }
             self.0
@@ -2711,6 +2721,7 @@ impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
                     dependencies: self.dependencies,
                     core_generation: d.envelope.core_generation,
                     ledger_generation: d.envelope.ledger_generation,
+                    owner_ledger_generation: self.owner.context.owner_ledger_generation,
                 });
                 ADMISSION.publish(
                     slot,
@@ -3296,8 +3307,13 @@ pub fn poll(_at: u64) -> Result<(), Error> {
             let dependency_status = if d.started {
                 Ok(())
             } else if d.core_generation != s.owner.context.core_generation
-                || d.ledger_generation != s.owner.context.ledger_generation
+                || d.owner_ledger_generation != s.owner.context.owner_ledger_generation
             {
+                // Freshness is ownership staleness only. The published composite
+                // also carries the task-resource generation, which ordinary
+                // background work advances continuously; comparing it here
+                // stranded every renewal under load. Task-state drift stays
+                // covered by the dependency binding checked below.
                 denial_flags = 1;
                 Err(Error::Stale)
             } else {

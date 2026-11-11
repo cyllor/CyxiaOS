@@ -30,10 +30,10 @@ class FailedBaselineRenewal(unittest.TestCase):
         body = body.replace(function(body, 'fn reconcile(_:Action'), '''fn reconcile(_:Action,_:ApplyId,_:PolicyStamp,_:u64)->Result<ExecutionState,Error>{
             RECONCILE_CALLS.fetch_add(1,Ordering::Relaxed); Ok(ExecutionState::Applied)
         }''')
-        body = body.replace('struct Context {core_generation:u64,ledger_generation:u64}',
-            '#[derive(Clone,Copy)] struct Context {core_generation:u64,ledger_generation:u64,control_mask:u64,business_mask:u64}')
-        body = body.replace('context:Context {core_generation:1,ledger_generation:1}',
-            'context:Context {core_generation:1,ledger_generation:1,control_mask:6,business_mask:9}')
+        body = body.replace('struct Context {core_generation:u64,ledger_generation:u64,owner_ledger_generation:u64}',
+            '#[derive(Clone,Copy)] struct Context {core_generation:u64,ledger_generation:u64,owner_ledger_generation:u64,control_mask:u64,business_mask:u64}')
+        body = body.replace('context:Context {core_generation:1,ledger_generation:1,owner_ledger_generation:1}',
+            'context:Context {core_generation:1,ledger_generation:1,owner_ledger_generation:1,control_mask:6,business_mask:9}')
         body = body.replace('struct State {owner:Owner,registry:Registry}',
             'struct State {owner:Owner,registry:Registry,job:Option<()>}')
         body = body.replace('poll_cursor:usize,context:Context }',
@@ -75,7 +75,7 @@ class FailedBaselineRenewal(unittest.TestCase):
             command = [str(RUST_BIN / 'cargo'), 'run', '--offline', '--manifest-path',
                 str(directory / 'Cargo.toml'), '--target-dir', str(ROOT / 'target/host-failed-baseline-renewal')]
             results = [subprocess.run(command + ['--', case], cwd=ROOT, env=env(),
-                capture_output=True, text=True, timeout=120) for case in ['renewal', 'guards', 'capacity', 'missed-sync', 'replacement-guards', 'closing-reuse', 'paid-limit']]
+                capture_output=True, text=True, timeout=120) for case in ['renewal', 'guards', 'capacity', 'missed-sync', 'replacement-guards', 'closing-reuse', 'paid-limit', 'task-churn']]
             self.assertTrue(all(result.returncode == 0 for result in results),
                 '\n'.join(result.stdout + result.stderr for result in results))
             for result in results:

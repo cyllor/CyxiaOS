@@ -112,7 +112,7 @@ mod control {
     use super::*;
     #[derive(Clone,Copy)] struct Desired { action:Action,apply:ApplyId,stamp:PolicyStamp,state:ExecutionState,
         started:bool,first_entry_ns:Option<u64>,observed_ns:u64,published:u64,evidence:Option<usize>,job:u64,
-        dependencies:[Option<u8>;2],core_generation:u64,ledger_generation:u64,execution_observed:bool }
+        dependencies:[Option<u8>;2],core_generation:u64,ledger_generation:u64,owner_ledger_generation:u64,execution_observed:bool }
     #[derive(Clone,Copy)] struct FamilyEntry {
         apply:fn(Action,ApplyId,PolicyStamp,u64)->Result<ExecutionState,Error>,
         reconcile:fn(Action,ApplyId,PolicyStamp,u64)->Result<ExecutionState,Error>,
@@ -123,7 +123,7 @@ mod control {
         fn observe_execution(&mut self,_:u64,_:Action,_:ExecutionState,_:u64)->Result<(),Error>{Ok(())}
         fn family(&self)->(u16,u16){(1,1)} fn target(&self)->ObjectKey{key(12)}
     }
-    struct Context {core_generation:u64,ledger_generation:u64}
+    struct Context {core_generation:u64,ledger_generation:u64,owner_ledger_generation:u64}
     struct Owner { desired:[Option<Desired>;1],stability:[Option<Stability>;1],families:[Option<FamilyEntry>;1],
         family_epochs:[u64;1],stability_high:usize,poll_cursor:usize,context:Context }
     struct Registry; impl Registry {
@@ -137,9 +137,9 @@ mod control {
     static STATE:Mutex<State>=Mutex::new(State {owner:Owner {
         desired:[Some(Desired {action:Action::CpuWeight(2),apply:ID,stamp:STAMP,state:ExecutionState::Pending,
             started:false,first_entry_ns:None,observed_ns:100_000_500,published:100_000_500,evidence:None,job:51,
-            dependencies:[None;2],core_generation:1,ledger_generation:1,execution_observed:false})],
+            dependencies:[None;2],core_generation:1,ledger_generation:1,owner_ledger_generation:1,execution_observed:false})],
         stability:[Some(Stability)],families:[Some(FamilyEntry {apply,reconcile,current:|_,_,_|Ok(Action::CpuWeight(2))})],
-        family_epochs:[1],stability_high:1,poll_cursor:0,context:Context {core_generation:1,ledger_generation:1}},registry:Registry});
+        family_epochs:[1],stability_high:1,poll_cursor:0,context:Context {core_generation:1,ledger_generation:1,owner_ledger_generation:1}},registry:Registry});
     fn with<T>(f:impl FnOnce(&mut State)->Result<T,Error>)->Result<T,Error>{let mut guard=STATE.try_lock().map_err(|_|Error::Busy)?;f(&mut guard)}
     fn family_index(_:u16,_:u16)->Result<usize,Error>{Ok(0)}
     fn bind_dependencies(_: &Owner,_:Action,_:ObjectKey,_:u64)->Result<[Option<u8>;2],Error>{Ok([None;2])}

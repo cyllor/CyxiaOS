@@ -1147,6 +1147,9 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
     crate::domain_control::publish_context(crate::domain_control::Context {
         core_generation: s.core_generation,
         ledger_generation,
+        // Unfolded CoreSet term: control-plane freshness must not trip on the
+        // task-resource generation folded into the composite above.
+        owner_ledger_generation: s.ledger_generation,
         control_mask: s.control.bits(),
         business_mask: s.business.bits(),
         healthy_mask: healthy,
