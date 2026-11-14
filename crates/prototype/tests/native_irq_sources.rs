@@ -2,7 +2,7 @@
 //! Host clocks and the IRQ registry are fixtures, not native replay evidence.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 mod domain_tasks {
     pub(crate) use super::cancellation::Cancellation;
@@ -47,9 +47,9 @@ fn registered_irq(index: usize) -> Option<(ObjectKey, u32, u64)> {
     (index == 0).then_some((IRQ, 2, 0x0a00_0000))
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_evidence.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_evidence.rs"]
 mod bridge;
-#[path = "../../../kernel/src/domain_platform/replay_sources.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/replay_sources.rs"]
 mod platform_sources;
 
 static ALLOCATION: AtomicUsize = AtomicUsize::new(0);

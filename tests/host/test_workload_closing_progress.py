@@ -18,7 +18,7 @@ from test_governance_billing_priority import function
 
 class ClosingProgress(unittest.TestCase):
     def test_actual_drain_preserves_closing_custody_before_releasing_owners(self):
-        source = (ROOT / 'kernel/src/learning_workload/owner.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/learning/learning_workload/owner.rs').read_text()
         body = function(source, 'pub fn drain(')
         template = (ROOT / 'tests/host/workload_closing_progress_harness.rs').read_text()
         # Enable diagnostic hooks in this actual-body fixture. Production still

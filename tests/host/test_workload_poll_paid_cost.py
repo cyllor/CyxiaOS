@@ -55,10 +55,10 @@ class WorkloadPollPaidCost(unittest.TestCase):
         with self.assertRaises(ValueError): decode(packed(bad))
 
     def test_actual_poll_cost_and_compile_valid_late_observer_counterexamples(self):
-        bridge = (ROOT / 'kernel/src/learning_evidence.rs').read_text()
-        provenance = (ROOT / 'kernel/src/learning_evidence/provenance.rs').read_text()
-        owner = (ROOT / 'kernel/src/learning_workload/owner.rs').read_text()
-        tasks = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        bridge = (ROOT / 'kernel/src/runtime/learning/learning_evidence.rs').read_text()
+        provenance = (ROOT / 'kernel/src/runtime/learning/learning_evidence/provenance.rs').read_text()
+        owner = (ROOT / 'kernel/src/runtime/learning/learning_workload/owner.rs').read_text()
+        tasks = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         # Reuse installation/roster/export clock fixture, never its old cleanup
         # body or its test. The dedicated source body below is actual poll().
         fixture = (ROOT / 'tests/host/capture_paid_cost_harness.rs').read_text().split('mod paid {', 1)[0]
@@ -88,13 +88,14 @@ class WorkloadPollPaidCost(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             bank, evidence, harness = [directory / n for n in ['provenance.rs', 'learning_evidence.rs', 'harness.rs']]
-            bridge = bridge.replace('"learning_evidence/', '"' + str(ROOT / 'kernel/src/learning_evidence') + '/')
-            bridge = bridge.replace(str(ROOT / 'kernel/src/learning_evidence/provenance.rs'), str(bank))
+            bridge = bridge.replace('"../tasks/domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/')
+            bridge = bridge.replace('"learning_evidence/', '"' + str(ROOT / 'kernel/src/runtime/learning/learning_evidence') + '/')
+            bridge = bridge.replace(str(ROOT / 'kernel/src/runtime/learning/learning_evidence/provenance.rs'), str(bank))
             signature = 'pub(super) fn observed(e: Observation) {'
             self.assertIn(signature, provenance)
             bank.write_text(provenance.replace(signature, signature + '\n    crate::recorder_cost();'))
-            program = program.replace('"../../../kernel/src/domain_tasks/cancellation.rs"', json.dumps(str(ROOT / 'kernel/src/domain_tasks/cancellation.rs')))
-            program = program.replace('"../../../kernel/src/learning_evidence.rs"', json.dumps(str(evidence)))
+            program = program.replace('"../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"', json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/cancellation.rs')))
+            program = program.replace('"../../../kernel/src/runtime/learning/learning_evidence.rs"', json.dumps(str(evidence)))
             (directory / 'Cargo.toml').write_text('[package]\nname="workload-poll-paid-cost"\nversion="0.1.0"\nedition="2024"\n[[test]]\nname="poll-paid-cost"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path=' + json.dumps(str(ROOT / 'crates/prototype')) + '}\n[workspace]\n')
             command = [str(RUST_BIN / 'cargo'), 'test', '--offline', '--manifest-path', str(directory / 'Cargo.toml'), '--target-dir', str(ROOT / 'target/host-workload-poll-paid-cost'), '--', '--nocapture']
             def run(case, source=bridge, code=program):

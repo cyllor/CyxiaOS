@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativePrehashBudget(unittest.TestCase):
     def test_production_gate_precedes_fixed_input_hash(self):
-        text = (ROOT / 'kernel/src/domain_control.rs').read_text()
+        text = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
         marker = '    preparation_phase(3);\n'
         self.assertEqual(text.count(marker), 1)
         start = text.index(marker)

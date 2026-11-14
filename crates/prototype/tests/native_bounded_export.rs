@@ -162,7 +162,7 @@ pub enum Split {
     Training,
     Validation,
 }
-#[path = "../../../kernel/src/learning_replay/sample_witness.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/sample_witness.rs"]
 mod sample_witness;
 #[path = "support/learning.rs"]
 mod support;
@@ -199,7 +199,7 @@ pub mod archive {
         }
     }
 }
-#[path = "../../../kernel/src/learning_replay/sample_export.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/sample_export.rs"]
 mod sample_export;
 fn reset() {
     BLOCK_SYNC.store(false, Ordering::Release);
@@ -302,9 +302,9 @@ fn with_witness(f: impl FnOnce(sample_witness::Witness, archive::Export, archive
     .unwrap();
 }
 
-#[path = "../../../kernel/src/learning_replay/bounded_data.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/bounded_data.rs"]
 mod bounded_data;
-#[path = "../../../kernel/src/learning_replay/bounded_export.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/bounded_export.rs"]
 mod bounded_export;
 #[test]
 fn bounded_sample_ledger_uses_real_durable_readback_and_retains_failed_close() {

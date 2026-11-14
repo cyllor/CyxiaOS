@@ -14,8 +14,8 @@ from test_baseline_progress import program as paid_program
 
 
 def program():
-    owner=(ROOT/'kernel/src/learning_replay/owner.rs').read_text()
-    facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
+    owner=(ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
+    facade=(ROOT/'kernel/src/runtime/learning/learning_replay.rs').read_text()
     code=paid_program().split('#[test]',1)[0]
     previous=function(code,'mod learning_replay {')
     fixture=(ROOT/'tests/host/replay_close_sources_harness.rs').read_text()

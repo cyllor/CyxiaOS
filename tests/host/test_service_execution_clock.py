@@ -15,7 +15,7 @@ from test_governance_billing_priority import function
 
 class ServiceExecutionClock(unittest.TestCase):
     def test_original_service_reservation_is_execution_credit_not_a_wall_lease(self):
-        source = (ROOT / 'kernel/src/domain_tasks/service_authority.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/service_authority.rs').read_text()
         # Keep the old authority body executable for behavioral RED before
         # its view gains an execution observation. No budget behavior is added.
         if 'pub execution_ns:' not in source:
@@ -51,7 +51,7 @@ class ServiceExecutionClock(unittest.TestCase):
                           negative.stdout + negative.stderr)
 
     def test_production_witness_keeps_one_counter_origin_and_settles_exact_cpu(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         facade = (ROOT / 'tests/host/paid_owner_admission_harness.rs').read_text().split('// PRODUCTION_BODIES')[0]
         if 'static CPU_WORK:' not in facade:
             facade = facade.replace('static NOW:', 'static CPU_WORK: AtomicU64 = AtomicU64::new(1_000);\nstatic NOW:')
@@ -74,9 +74,9 @@ class ServiceExecutionClock(unittest.TestCase):
                 body = body.replace('s.active[0] = Some(Active {',
                     's.active[0] = Some(Active { cpu_started: Some(timer::cpu_ticks()),')
             pieces.append(body)
-        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))
+        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))
                       + '] mod owner_gate;')
-        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/service_authority.rs'))
+        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/service_authority.rs'))
                       + '] mod service_authority;')
         template = (ROOT / 'tests/host/service_credit_binding_harness.rs').read_text().replace(
             '// OWNER_FACADE', facade).replace('// PRODUCTION_BODIES', '\n'.join(pieces))

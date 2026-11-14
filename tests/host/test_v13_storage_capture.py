@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class StorageCapture(unittest.TestCase):
     def test_actual_capture_rejects_bad_binding_and_preserves_bounded_publication(self):
-        source = ROOT / 'kernel/src/storage_fault_capture/state.rs'
+        source = ROOT / 'kernel/src/diagnostics/storage_fault_capture/state.rs'
         self.assertTrue(source.is_file(), 'protected capture state missing')
         rustc = shutil.which('rustc') or str(Path.home() / '.cargo/bin/rustc')
         with tempfile.TemporaryDirectory() as directory:

@@ -91,7 +91,7 @@ mod prototype_storage {
         with_journal(f)
     }
 }
-#[path = "../../../kernel/src/unified_store.rs"]
+#[path = "../../../kernel/src/runtime/cluster/unified_store.rs"]
 mod unified_store;
 
 fn initialize() {

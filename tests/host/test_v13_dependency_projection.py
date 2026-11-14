@@ -6,8 +6,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 class DependencyProjectionTests(unittest.TestCase):
     def test_d04_control_projection_does_not_replace_executor_resolver(self):
-        control = (ROOT / "kernel/src/domain_control.rs").read_text()
-        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
+        control = (ROOT / "kernel/src/runtime/control/domain_control.rs").read_text()
+        storage = (ROOT / "kernel/src/runtime/files/domain_storage.rs").read_text()
         self.assertIn("register_dependencies(4, dependencies)", storage)
         self.assertIn("register_dependency_binder(4, control_dependencies)", storage)
         self.assertIn("owner.dependency_binders[dependency_slot]", control)
@@ -15,9 +15,9 @@ class DependencyProjectionTests(unittest.TestCase):
         self.assertIn("admit_dependencies(consumer: u16", control)
 
     def test_collapsed_projection_revalidates_both_real_owners(self):
-        storage = (ROOT / "kernel/src/domain_storage.rs").read_text()
-        tasks = (ROOT / "kernel/src/domain_tasks.rs").read_text()
-        device = (ROOT / "kernel/src/prototype_storage.rs").read_text()
+        storage = (ROOT / "kernel/src/runtime/files/domain_storage.rs").read_text()
+        tasks = (ROOT / "kernel/src/runtime/tasks/domain_tasks.rs").read_text()
+        device = (ROOT / "kernel/src/platform/virt/prototype_storage.rs").read_text()
         self.assertIn("control_cache_dependency(at)", storage)
         self.assertIn("control_io_dependency(at)", storage)
         self.assertEqual(storage.count("admit_dependency(memory, 4, at)"), 1)

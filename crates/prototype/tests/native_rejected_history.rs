@@ -1,6 +1,6 @@
 //! Host fixtures exercise the actual Registry and negative-history encoder.
 //! Their clock/authority are synthetic and never supply native learning labels.
-#[path = "../../../kernel/src/learning_history/rejection.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_history/rejection.rs"]
 mod rejection;
 
 use cyxia_prototype::{

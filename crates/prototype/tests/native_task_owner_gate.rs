@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_tasks/owner_gate.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/owner_gate.rs"]
 mod owner_gate;
 use owner_gate::Gate;
 

@@ -21,14 +21,14 @@ def extract(rel, signature):
             return body
     raise ValueError(signature)
 
-network = ROOT / 'kernel/src/domain_network.rs'
+network = ROOT / 'kernel/src/runtime/network/domain_network.rs'
 nsrc = network.read_text()
 network_code = '''use super::*;
 use abi::{DomainFeedback,PolicyReceiptWire,PolicyWire,Shared};
 use core::sync::atomic::AtomicBool;
 #[derive(Clone,Copy)] struct ReadView {ready:bool,feedback:DomainFeedback}
 #[derive(Clone,Copy)]
-'''+extract('kernel/src/domain_network.rs','struct Desired {')+'''
+'''+extract('kernel/src/runtime/network/domain_network.rs','struct Desired {')+'''
 static READY:AtomicBool=AtomicBool::new(true);
 static mut DESIRED:[Option<Desired>;4]=[None;4];
 static mut EFFECTIVE:[Option<Desired>;3]=[None;3];
@@ -44,7 +44,7 @@ network_code += nsrc[nsrc.index('static mut FEEDBACK:'):nsrc.index('fn owner()')
 network_functions = ['fn owner()', 'fn index(', 'fn value(', 'fn wire(', 'fn matching_receipt(',
                      'fn applied_value(', 'fn target_in(', 'fn legal(', 'fn legal_in(',
                      'fn apply(', 'fn reconcile(', 'pub fn observe(']
-network_code += '\n'.join(extract('kernel/src/domain_network.rs', f) for f in network_functions)
+network_code += '\n'.join(extract('kernel/src/runtime/network/domain_network.rs', f) for f in network_functions)
 network_code += '''
 pub fn apply_entry(a:Action,id:ApplyId,s:PolicyStamp,at:u64)->Result<ExecutionState,Error>{
  APPLIES.fetch_add(1,Ordering::AcqRel); apply(a,id,s,at)
@@ -61,13 +61,13 @@ pub fn receive(receipt:PolicyReceiptWire, foreign_generation:bool){
 '''
 (OUT/'network.rs').write_text(network_code)
 
-hsrc=(ROOT/'kernel/src/learning_history.rs').read_text()
+hsrc=(ROOT/'kernel/src/runtime/learning/learning_history.rs').read_text()
 history_code=hsrc[:hsrc.index('#[path = "learning_history/rejection.rs"]')]
 history_code+=hsrc[hsrc.index('pub const RECORDS:'):hsrc.index('pub fn install(')]
-SOURCES['kernel/src/learning_history.rs::prelude_and_storage_helpers']=hashlib.sha256(history_code.encode()).hexdigest()
+SOURCES['kernel/src/runtime/learning/learning_history.rs::prelude_and_storage_helpers']=hashlib.sha256(history_code.encode()).hexdigest()
 for f in ['pub fn install(', 'pub fn begin_run(', 'fn begin_inner(', 'pub fn record_proposal(',
           'pub fn record_publish(', 'pub fn record_execution(', 'pub fn status(', 'pub fn copy_record(']:
-    history_code+='\n'+extract('kernel/src/learning_history.rs',f)
+    history_code+='\n'+extract('kernel/src/runtime/learning/learning_history.rs',f)
 history_code+='''
 pub fn init(set:&CandidateSet,id:ApplyId,stamp:PolicyStamp){
  let storage=Box::leak(Box::new(Storage{bytes:[0;STORAGE_BYTES]}));
@@ -138,9 +138,9 @@ mod learning_evidence{
 #[path="history.rs"]mod learning_history;
 #[path="network.rs"]mod network;
 '''
-admission_source=(ROOT/'kernel/src/domain_control/dependencies.rs').read_text()
+admission_source=(ROOT/'kernel/src/runtime/control/domain_control/dependencies.rs').read_text()
 (OUT/'admission.rs').write_text(admission_source+"\npub fn state_tag(view:&AdmissionView)->u64{view.entries[0].state.load(Ordering::Acquire)}\n")
-SOURCES['kernel/src/domain_control/dependencies.rs']=hashlib.sha256(admission_source.encode()).hexdigest()
+SOURCES['kernel/src/runtime/control/domain_control/dependencies.rs']=hashlib.sha256(admission_source.encode()).hexdigest()
 main+='#[path="admission.rs"]mod admission;\n'
 main+='''
 mod control{
@@ -163,7 +163,7 @@ mod control{
  mod replay{pub fn candidate_stale<T>(_:&T){}pub fn candidate_execution(_:super::ApplyId,_:super::PolicyStamp,_:super::ExecutionState){}}
 '''
 for f in ['fn execution_blocks_replacement(', 'fn execution_limit(', 'pub fn poll(']:
-    main+='\n'+extract('kernel/src/domain_control.rs',f)
+    main+='\n'+extract('kernel/src/runtime/control/domain_control.rs',f)
 main+='''
  fn views(publisher:policy::Publisher,id:ApplyId)->(ExecutionState,ExecutionState,bool){
   with(|s|{let d=s.owner.desired[0].unwrap();Ok((d.state,s.registry.query(publisher,policy::PlanId{boot_epoch:id.boot_epoch,controller_epoch:id.controller_epoch,plan_seq:id.plan_seq})?.state(),d.started))}).unwrap()

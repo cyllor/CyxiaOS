@@ -21,8 +21,8 @@ class ProtectedFileReplies(unittest.TestCase):
     def test_cache_batch_switch_waits_for_protected_pressure_create(self):
         root=Path(__file__).resolve().parents[2]
         budget=(root/'crates/prototype/src/a10_budget.rs').read_text()
-        storage=(root/'kernel/src/domain_storage.rs').read_text()
-        capture=(root/'kernel/src/storage_fault_capture.rs').read_text()
+        storage=(root/'kernel/src/runtime/files/domain_storage.rs').read_text()
+        capture=(root/'kernel/src/diagnostics/storage_fault_capture.rs').read_text()
         self.assertIn('pub const CACHE_WRITEBACK_PAGES: u16 = 32;',budget)
         init=storage[storage.index('pub fn init()'):storage.index('fn ready()',
                                                                   storage.index('pub fn init()'))]
@@ -37,7 +37,7 @@ class ProtectedFileReplies(unittest.TestCase):
 
     def test_storage_fault_profile_does_not_start_unrelated_learning_trial(self):
         root=Path(__file__).resolve().parents[2]
-        owner=(root/'kernel/src/learning_replay/owner.rs').read_text()
+        owner=(root/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
         dispatch=function(function(owner,'fn service('),'Phase::Prepare =>')
         self.assertIn('return prepare_step(trace);',dispatch)
         prepare=function(owner,'fn prepare_step(')

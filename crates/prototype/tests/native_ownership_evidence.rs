@@ -9,7 +9,7 @@ use cyxia_prototype::{
 #[path = "../../../user/prototype-runtime/dynamic.rs"]
 mod dynamic;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/ownership_evidence.rs"]
+#[path = "../../../kernel/src/diagnostics/ownership_evidence.rs"]
 mod evidence;
 mod domain_evidence {
     use super::*;

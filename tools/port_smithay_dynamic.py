@@ -112,7 +112,7 @@ def source_manifest(root: Path) -> dict[str, str]:
         cwd=root, capture_output=True, check=True, timeout=30)
     names = sorted(set(os.fsdecode(name) for name in result.stdout.split(b'\0') if name))
     mandatory = {'Cargo.toml', 'Cargo.lock', 'kernel/build.rs', 'kernel/Cargo.toml',
-                 'kernel/src/user/shared_memory.rs', 'crates/posix/src/epoll.rs'}
+                 'kernel/src/desktop/user/shared_memory.rs', 'crates/posix/src/epoll.rs'}
     require(mandatory <= set(names), 'Incomplete CyxiaOS checkout')
     manifest = {}
     for name in names:

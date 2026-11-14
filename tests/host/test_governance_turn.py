@@ -24,7 +24,7 @@ def function(source, signature):
 
 class GovernanceTurn(unittest.TestCase):
     def test_actual_bounded_dispatch_preserves_deadlines_ownership_and_physical_credit(self):
-        source = (ROOT / 'kernel/src/prototype_runtime/governance.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/control/prototype_runtime/governance.rs').read_text()
         body = function(source, 'fn perform_runtime_turn(')
         template = (ROOT / 'tests/host/governance_turn_harness.rs').read_text()
         with tempfile.TemporaryDirectory() as temporary:

@@ -3,21 +3,23 @@ import json
 from pathlib import Path
 import struct
 import sys
-LIMIT=2**64
+try:
+    from . import elf64
+except ImportError:
+    import elf64
 
 def inspect_elf(b):
     def need(ok,msg):
         if not ok: raise ValueError(msg)
     need(len(b)>=64,'truncated header')
     h=struct.unpack_from('<16sHHIQQQIHHHHHH',b)
-    ident,kind,machine,version,entry,phoff,shoff,flags,ehsize,phsize,phnum,shsize,shnum,shstr=h
+    ident,kind,machine,version,entry=h[:5]
     need(ident[:7]==b'\x7fELF\x02\x01\x01' and kind==2 and machine==183 and version==1,'not AArch64 executable')
-    need(ehsize==64 and phsize==56 and 0<phnum<=32 and phoff>=64 and phoff+phnum*56<=len(b),'invalid program headers')
+    decoded=elf64.decode(b)
     loads=[]
-    for i in range(phnum):
-        typ,fl,off,va,pa,fs,ms,al=struct.unpack_from('<IIQQQQQQ',b,phoff+i*56)
-        if typ!=1:continue
-        need(fs<=ms and off+fs<=len(b) and pa+ms<LIMIT and va+ms<LIMIT,'segment overflow')
+    for segment in decoded['segments']:
+        if segment['type']!=1:continue
+        fl,off,va,pa,fs,ms,al=(segment[key] for key in ('flags','offset','va','pa','size','mem','align'))
         if ms==0:continue
         need(0x40200000<=pa<pa+ms<=0x44000000,'load outside reserved kernel pool / DTB collision')
         need(not (fl&2 and fl&1),'writable executable segment')
@@ -32,26 +34,7 @@ def inspect_elf(b):
 
 def symbol(b,name):
     loads=inspect_elf(b)['loads']
-    h=struct.unpack_from('<16sHHIQQQIHHHHHH',b);off=h[6];size=h[11];count=h[12]
-    if size!=64 or count>1024 or off+count*size>len(b):raise ValueError('bad sections')
-    sections=[struct.unpack_from('<IIQQQQIIQQ',b,off+i*size) for i in range(count)]
-    for s in sections:
-        if s[1]!=2:continue
-        if s[6]>=count or s[9]!=24 or s[5]%24 or s[4]+s[5]>len(b):
-            raise ValueError('bad symbol table')
-        strings=sections[s[6]];table=b[strings[4]:strings[4]+strings[5]]
-        if strings[1]!=3 or strings[4]+strings[5]>len(b):
-            raise ValueError('bad symbol string table')
-        for p in range(s[4],s[4]+s[5],24):
-            n,info,other,idx,value,length=struct.unpack_from('<IBBHQQ',b,p)
-            if n>=len(table):raise ValueError('symbol name outside string table')
-            end=table.find(b'\0',n)
-            if end<0:raise ValueError('unterminated symbol name')
-            if table[n:end]==name.encode('utf8'):
-                for seg in loads:
-                    if seg['va']<=value and value+length<=seg['va']+seg['mem']:
-                        return dict(va=value,pa=value-seg['va']+seg['pa'],size=length)
-    raise ValueError('missing symbol '+name)
+    return elf64.symbol(b,name,loads)
 
 
 def boot_profile(b):

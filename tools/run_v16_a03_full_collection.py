@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from dataclasses import dataclass, field
-import fcntl
 import json
 import math
 import os
@@ -23,6 +22,7 @@ import time
 from boot_reboot_contract import prepare_disk
 from check_elf import symbol
 from doctor import env
+from native_session import DEFAULT_NATIVE_LOCK, native_lease, idle_native_host
 from run_qemu import Qmp
 from run_v13_a02 import inject_config
 from run_v16_a03_data import WireSocket, close_owned
@@ -36,7 +36,6 @@ from v16_a03_full_collection import (VERSION, BANKS, LIVE_BANKS, POLL_SECONDS,
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_NATIVE_LOCK = TOOL_ROOT/'artifacts/v016-focus-a03-a10-20261109-r9/native-session.lock'
 MAX_STOPPED_ATTEMPTS = 64
 NODES = ('a','b')
 
@@ -86,24 +85,6 @@ def atomic_json(path, value):
         json.dump(value,stream,sort_keys=True,indent=2,allow_nan=False)
         stream.write('\n');stream.flush();os.fsync(stream.fileno())
     temporary.replace(path)
-
-
-@contextmanager
-def native_lease(path):
-    path=Path(path)
-    require(path.parent.is_dir() and not path.is_symlink(),'Full collection native lock parent/target')
-    flags=os.O_RDWR|os.O_CREAT|os.O_APPEND|getattr(os,'O_NOFOLLOW',0)
-    with os.fdopen(os.open(path,flags,0o600),'a') as lease:
-        fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        yield
-
-
-def idle_native_host():
-    rows=subprocess.run(['ps','-axo','pid=,comm='],capture_output=True,text=True,check=True).stdout
-    busy=[row.strip() for row in rows.splitlines() if row.split()
-        and Path(row.strip().split(None,1)[-1]).name in
-            ('qemu-system-aarch64','cargo','rustc','clang')]
-    require(not busy,'Full collection native/build exclusion: '+repr(busy))
 
 
 def pause_all(guests):

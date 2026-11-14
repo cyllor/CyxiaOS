@@ -18,10 +18,10 @@ from test_governance_billing_priority import function
 
 class SchedulerPublicationContract(unittest.TestCase):
     def test_only_the_native_registration_can_use_the_borrow(self):
-        tasks = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
-        publication = (ROOT / 'kernel/src/domain_tasks/publication.rs').read_text()
-        control = (ROOT / 'kernel/src/domain_control.rs').read_text()
-        source = (ROOT / 'kernel/src/domain_control/target_batch.rs').read_text()
+        tasks = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        publication = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/publication.rs').read_text()
+        control = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/control/domain_control/target_batch.rs').read_text()
         try:
             matcher = function(publication, 'pub(crate) fn scheduler_publication_matches(')
         except ValueError:

@@ -18,7 +18,7 @@ from test_governance_billing_priority import function
 
 class OrdinarySpawnReservation(unittest.TestCase):
     def test_actual_creator_defers_before_effects_and_keeps_original_receipt(self):
-        source = (ROOT / 'kernel/src/domain_tasks/execution.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
         build = function(source, 'fn build(')
         checks = build[build.index('        trace.step(11)'):build.index('        trace.step(12)')]
         signature = 'if reservation.is_none() {' if 'if reservation.is_none() {' in build else 'if !local {'

@@ -18,8 +18,8 @@ from test_governance_billing_priority import function
 
 class BaselineActivationPriority(unittest.TestCase):
     def test_real_root_retains_partial_activation_and_projects_it_before_unlock(self):
-        control = (ROOT / 'kernel/src/domain_control.rs').read_text()
-        replay = (ROOT / 'kernel/src/domain_control/replay.rs').read_text()
+        control = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
+        replay = (ROOT / 'kernel/src/runtime/control/domain_control/replay.rs').read_text()
         hint = 'static BASELINE_ACTIVATION_PENDING: AtomicBool = AtomicBool::new(false);'
         match = re.search(r'^static BASELINE_ACTIVATION_PENDING:.*;$', replay, re.M)
         if match:

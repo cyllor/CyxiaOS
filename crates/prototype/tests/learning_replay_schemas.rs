@@ -1,6 +1,6 @@
 //! Exercise the exact native schema-preparation helper. These hashes bind
 //! immutable code semantics; they do not manufacture native CPU evidence.
-#[path = "../../../kernel/src/learning_replay/schemas.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/schemas.rs"]
 mod schemas;
 
 use cyxia_prototype::learning::{self, SchemaBinding, Schemas};

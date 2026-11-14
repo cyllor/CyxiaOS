@@ -1,4 +1,4 @@
-#[path = "../../kernel/src/domain_tasks/deadline.rs"]
+#[path = "../../kernel/src/runtime/tasks/domain_tasks/deadline.rs"]
 mod deadline;
 #[path = "../../crates/prototype/src/a10_budget.rs"]
 mod a10_budget;

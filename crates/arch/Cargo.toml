@@ -1,0 +1,7 @@
+[package]
+name = "cyxia-arch"
+version.workspace = true
+edition.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+cyxia-arch-aarch64 = { path = "../arch-aarch64" }

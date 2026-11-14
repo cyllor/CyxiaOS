@@ -132,7 +132,7 @@ class A02NativeProducer(unittest.TestCase):
                 run_v13_a02.config_bytes('11' * 32, '22' * 32, '33' * 32, nonce)
 
     def test_protected_capture_records_actual_boundaries_and_fails_closed(self):
-        source = ROOT / 'kernel/src/a02_capture/state.rs'
+        source = ROOT / 'kernel/src/diagnostics/a02_capture/state.rs'
         self.assertTrue(source.is_file(), 'native A02 capture state is missing')
         rustc = shutil.which('rustc') or str(Path.home() / '.cargo/bin/rustc')
         with tempfile.TemporaryDirectory() as directory:
@@ -145,7 +145,7 @@ class A02NativeProducer(unittest.TestCase):
             self.assertIn('0 failed', result.stdout)
 
     def test_control_capture_preparation_is_bound_to_current_identity(self):
-        source = (ROOT / 'kernel/src/prototype_runtime/native.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/control/prototype_runtime/native.rs').read_text()
         run = source[source.index('fn run_turn('):source.index('fn charge_turn(')]
         self.assertIn('let task = capture_task(slot);', run)
         compact = ''.join(run.split())
@@ -154,7 +154,7 @@ class A02NativeProducer(unittest.TestCase):
         self.assertNotIn('worker.native.capture_index', source)
 
     def test_capture_contention_sleeps_until_a_published_unlock_event(self):
-        source = (ROOT / 'kernel/src/a02_capture.rs').read_text()
+        source = (ROOT / 'kernel/src/diagnostics/a02_capture.rs').read_text()
         lock = source[source.index('fn locked<R>'):source.index('/// CPU0, before')]
         self.assertIn('.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)', lock)
         self.assertNotIn('compare_exchange_weak', lock)

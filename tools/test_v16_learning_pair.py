@@ -499,9 +499,22 @@ class FrozenProducerProvenance(unittest.TestCase):
                 retained = module.trusted_context(**args, producer_tools_root=frozen)
                 self.assertEqual(set(retained['paths']), set(args))
                 self.assertEqual(retained['paths'], current['paths'])
-                self.assertEqual(len(retained['tools']), 42)
+                self.assertEqual(len(retained['tools']), 44)
                 self.assertEqual(retained['tools']['tools/v16_learning_pair.py'], hashlib.sha256(producer.read_bytes()).hexdigest())
                 self.assertNotEqual(retained['tools'], current['tools'])
+                for name in ('tools/build_sources.py','tools/elf64.py'):
+                    shared=frozen/name;original=shared.read_bytes()
+                    with self.subTest(shared_dependency=name):
+                        self.assertIn(name,retained['tools'])
+                        self.assertEqual(retained['tools'][name],hashlib.sha256(original).hexdigest())
+                        shared.write_bytes(original+b'\nraise RuntimeError("MUST NOT EXECUTE SHARED FROZEN CODE")\n')
+                        changed=module.trusted_context(**args,producer_tools_root=frozen)
+                        self.assertEqual(set(changed['tools']),set(retained['tools']))
+                        self.assertEqual(changed['tools'][name],hashlib.sha256(shared.read_bytes()).hexdigest())
+                        self.assertEqual({key for key in retained['tools']
+                            if changed['tools'][key]!=retained['tools'][key]},{name})
+                        self.assertEqual(changed['paths'],retained['paths'])
+                    shared.write_bytes(original)
                 with self.assertRaises(FileNotFoundError):
                     module.trusted_context(**args, producer_tools_root=root / 'absent')
                 producer.unlink()

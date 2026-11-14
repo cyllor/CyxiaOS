@@ -14,11 +14,11 @@ from test_governance_billing_priority import function
 
 class DrainCustodyTrace(unittest.TestCase):
     def test_actual_custody_boundaries_publish_without_changing_results(self):
-        work = (ROOT/'kernel/src/learning_workload/owner.rs').read_text()
-        replay = (ROOT/'kernel/src/domain_tasks/replay.rs').read_text()
-        execution = (ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
-        task = (ROOT/'kernel/src/domain_tasks.rs').read_text()
-        trace = (ROOT/'kernel/src/learning_evidence/execution_trace.rs').read_text()
+        work = (ROOT/'kernel/src/runtime/learning/learning_workload/owner.rs').read_text()
+        replay = (ROOT/'kernel/src/runtime/tasks/domain_tasks/replay.rs').read_text()
+        execution = (ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+        task = (ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        trace = (ROOT/'kernel/src/runtime/learning/learning_evidence/execution_trace.rs').read_text()
         template = (ROOT/'tests/host/drain_custody_trace_harness.rs').read_text()
         work_body = function(work, 'pub fn poll(').replace('#[cfg(not(test))]', '')
         query_body = function(replay, 'pub fn spawn_result(').replace('#[cfg(not(test))]', '')
@@ -28,7 +28,7 @@ class DrainCustodyTrace(unittest.TestCase):
                                     (ROOT/'tests/host/capture_identity_facade.rs').read_text())
         task_bodies = '\n'.join(function(task, s) for s in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()', 'fn locked<R>','fn locked_with_guard<R>'])
         task_bodies = 'static LOCK: owner_gate::Gate = owner_gate::Gate::new();\n' + task_bodies
-        template = template.replace('// OWNER_GATE', '#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/owner_gate.rs'))+'] mod owner_gate;')
+        template = template.replace('// OWNER_GATE', '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))+'] mod owner_gate;')
         template = template.replace('// WORK_POLL', work_body).replace('// SPAWN_QUERY', query_body+'\n'+helper)
         template = template.replace('// TASK_BODIES', task_bodies+'\n'+bodies)
         with tempfile.TemporaryDirectory() as temporary:

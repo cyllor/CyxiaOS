@@ -18,12 +18,12 @@ from test_governance_billing_priority import function
 
 
 def program():
-    task=(ROOT/'kernel/src/domain_tasks.rs').read_text()
-    execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
-    owner=(ROOT/'kernel/src/learning_replay/owner.rs').read_text()
-    replay=(ROOT/'kernel/src/domain_tasks/replay.rs').read_text()
-    facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
-    unified=(ROOT/'kernel/src/unified.rs').read_text()
+    task=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+    execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+    owner=(ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
+    replay=(ROOT/'kernel/src/runtime/tasks/domain_tasks/replay.rs').read_text()
+    facade=(ROOT/'kernel/src/runtime/learning/learning_replay.rs').read_text()
+    unified=(ROOT/'kernel/src/runtime/cluster/unified.rs').read_text()
     code=(ROOT/'tests/host/baseline_progress_harness.rs').read_text().split('#[test]',1)[0]
     def replace(old,new,count=1):
         nonlocal code
@@ -90,7 +90,7 @@ def program():
     pieces += [function(unified,s) for s in ['fn mechanism_progress(','fn progress(','fn finish_service(','fn service_work<R>','fn service_start(']]
     pieces += ['#[derive(Clone,Copy,PartialEq,Eq)]'+function(task,'enum Life'), '#[derive(Clone,Copy)]'+function(task,'struct Task {'),function(task,'impl Task'),'#[derive(Clone,Copy)]'+function(task,'struct ExitRecord')]
     for name in ['owner_gate.rs','service_authority.rs','deadline.rs','lifecycle.rs']:
-        pieces.append('#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks'/name))+'] mod '+name[:-3]+';')
+        pieces.append('#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks'/name))+'] mod '+name[:-3]+';')
     replace('// PRODUCTION_BODIES','\n'.join(pieces))
     query=function(replay,'pub fn spawn_result(')
     # Namespace-only relocation into the fixture's task-replay module.

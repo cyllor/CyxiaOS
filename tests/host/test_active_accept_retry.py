@@ -13,7 +13,7 @@ from test_governance_billing_priority import function
 from test_native_submission_provenance import native_program
 
 def program():
- c=(ROOT/'kernel/src/domain_control.rs').read_text()
+ c=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
  p=native_program().split('fn setup(mode:')[0]
  p=p.replace('#![allow(dead_code)]','#![allow(dead_code,unused_imports)]')
  p=p.replace('fn publisher() -> Publisher','fn publisher_fixture() -> Publisher')
@@ -23,9 +23,9 @@ def program():
  h=(ROOT/'tests/host/active_accept_retry_harness.rs').read_text()
  for marker,signature in [('JOB','struct Job {'),('COMPLETION','struct JobCompletion {')]:h=h.replace('// ACTUAL_'+marker,'#[derive(Clone,Copy)]'+function(c,signature))
  for marker,signature in [('ACCEPT','pub fn accept('),('ABORT','pub fn abort('),('FINISH_JOB','fn finish_job('),('PENDING_JOB','pub fn pending_job(')]:h=h.replace('// ACTUAL_'+marker,function(c,signature))
- native=(ROOT/'kernel/src/prototype_runtime/native.rs').read_text();h=h.replace('// ACTUAL_ROOT_RETURN',function(native,'fn root_return('))
- h=h.replace('// REPLY_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/reply.rs'))+'] mod actual_reply;')
- h=h.replace('// OWNER_GATE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/owner_gate.rs'))+'] mod owner_gate;')
+ native=(ROOT/'kernel/src/runtime/control/prototype_runtime/native.rs').read_text();h=h.replace('// ACTUAL_ROOT_RETURN',function(native,'fn root_return('))
+ h=h.replace('// REPLY_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/reply.rs'))+'] mod actual_reply;')
+ h=h.replace('// OWNER_GATE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))+'] mod owner_gate;')
  h=h.replace('// JOB_DEBIT_INIT','publication_debit:policy::CpuTime{cpu:1,ns:0},' if 'publication_debit:' in function(c,'struct Job {') else '')
  h=h.replace('// FAULT_TESTS',r'''
 #[test]fn active_accept_counter_identity_rollback_and_overflow_fail_closed(){for fault in 0..3{let out=setup(0);if fault==0{with(|s|{s.job.as_mut().unwrap().publication_debit.cpu=2;Ok(())}).unwrap();}else{CPU.store(1000,Ordering::Release);FAULT.store(fault,Ordering::Release);if fault==2{with(|s|{s.job.as_mut().unwrap().publication_debit.ns=100_000;Ok(())}).unwrap();}}let held=TASK_GATE.try_acquire(0,WALL.load(Ordering::Acquire),1).unwrap();let r=accept(&out,10);held.release(WALL.load(Ordering::Acquire));assert_eq!(r,Err(match fault{0=>Error::Auth,1=>Error::Range,_=>Error::Overflow}));assert!(!pending_job().unwrap());assert!(with(|s|Ok(s.registry.optimization_stopped())).unwrap());assert_eq!(EFFECTS.load(Ordering::Acquire),0);}}

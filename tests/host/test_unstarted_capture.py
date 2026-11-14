@@ -15,13 +15,13 @@ from test_governance_billing_priority import function
 
 class UnstartedCapture(unittest.TestCase):
     def test_non_test_local_peer_and_prewarm_custody_survive_busy_and_refund_failure(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         template = (ROOT / 'tests/host/unstarted_custody_harness.rs').read_text()
         pieces = [re.search(r'^static LOCK:.*;$', source, re.M)[0]]
         pieces += [re.search(rf'^const {name}: u64 = .*;$', source, re.M)[0] for name in
                    ['BUILTIN_WINDOW_HEADROOM_NS', 'BUILTIN_MIN_GRANT_NS', 'DYNAMIC_EL0_MIN_GRANT_NS']]
         for name in ['owner_gate', 'service_authority']:
-            pieces.append('#[path=' + json.dumps(str(ROOT / f'kernel/src/domain_tasks/{name}.rs'))
+            pieces.append('#[path=' + json.dumps(str(ROOT / f'kernel/src/runtime/tasks/domain_tasks/{name}.rs'))
                           + f'] mod {name};')
         for signature in ['struct Guard', 'impl Guard', 'impl Drop for Guard', 'fn acquire_guard()',
                           'fn locked<R>', 'fn locked_with_guard<R>', 'pub struct Credit',
@@ -40,14 +40,14 @@ class UnstartedCapture(unittest.TestCase):
         capture_start = min(source.index('#[path = "domain_tasks/capture_credit.rs"]'),
                             source.index('#[path = "domain_tasks/cancellation.rs"]'))
         capture = source[capture_start:source.index('fn throttle(')]
-        pieces.append(capture.replace('"domain_tasks/', '"' + str(ROOT / 'kernel/src/domain_tasks') + '/'))
+        pieces.append(capture.replace('"domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/'))
         warm = (ROOT / 'crates/prototype/tests/native_prewarm.rs').read_text()
         platform = warm[warm.index('pub mod domain_control {'):warm.index('pub mod learning_evidence {')]
         platform = platform.replace('pub mod domain_control {', '''pub mod domain_control {
     pub struct Prerequisite { pub domain: u16, pub target: super::ObjectKey }
     pub fn admit_dependency(_: Prerequisite, _: u64, _: u64) -> Result<(), super::Error> { Ok(()) }
 ''')
-        modules = '\n'.join('#[path=' + json.dumps(str(ROOT / f'kernel/src/{name}.rs'))
+        modules = '\n'.join('#[path=' + json.dumps(str(ROOT / f'kernel/src/runtime/learning/{name}.rs'))
                             + f'] mod {name};' for name in ['learning_evidence', 'learning_prewarm'])
         peer = (ROOT / 'crates/peer-billing/tests/native_attempt.rs').read_text()
         # The same platform fixture executes unchanged production Attempt and
@@ -66,7 +66,7 @@ class UnstartedCapture(unittest.TestCase):
         program = template.replace('// PRODUCTION_BODIES', '\n'.join(pieces)).replace(
             '// WARM_PLATFORM_FIXTURES', platform).replace('// EVIDENCE_MODULES', modules).replace(
             '// PEER_FIXTURE', 'mod peer_replay {\n' + peer + '\n}')
-        runtime = (ROOT / 'kernel/src/prototype_runtime.rs').read_text()
+        runtime = (ROOT / 'kernel/src/runtime/control/prototype_runtime.rs').read_text()
         tail = function(runtime, 'fn stop_action_tail(')
         tail = tail[:tail.index('    worker.context = None;')] + '''
     // Hardware timer/GIC/TLB tail is outside this host fixture. Retain the
@@ -76,7 +76,7 @@ class UnstartedCapture(unittest.TestCase):
     STOP_ACK.store(operation, Ordering::Release);
 }
 '''
-        disabled = function((ROOT / 'kernel/src/smp.rs').read_text(), 'if !view.enabled {')
+        disabled = function((ROOT / 'kernel/src/arch/aarch64/smp.rs').read_text(), 'if !view.enabled {')
         program = program.replace('// STOP_BODIES', function(runtime, 'pub(super) fn stop_turn(') + '\n' + tail)
         program = program.replace('// DISABLED_BRANCH', disabled)
         program = program.replace('// LOCAL_RETIRE_EXPORT',
@@ -84,30 +84,32 @@ class UnstartedCapture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             evidence_path = directory / 'learning_evidence.rs'
-            evidence_path.write_text((ROOT / 'kernel/src/learning_evidence.rs').read_text().replace(
-                '"learning_evidence/', '"' + str(ROOT / 'kernel/src/learning_evidence') + '/') + '''
+            evidence_path.write_text((ROOT / 'kernel/src/runtime/learning/learning_evidence.rs').read_text().replace(
+                '"../tasks/domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/').replace(
+                '"learning_evidence/', '"' + str(ROOT / 'kernel/src/runtime/learning/learning_evidence') + '/') + '''
 pub fn host_with_collector(f: impl FnOnce()) { let _guard = lock().unwrap(); f(); }
 pub fn host_completion(attempt: &OwnerAttempt) -> Option<(u64,u64)> { attempt.measured }
 pub fn host_handoff() -> [u64;32] { handoff::host_snapshot() }
 pub fn host_drain() { for _ in 0..16 { handoff::drain(1); } }
 ''')
             handoff_path = directory / 'handoff.rs'
-            handoff_path.write_text((ROOT / 'kernel/src/learning_evidence/handoff.rs').read_text() + '''
+            handoff_path.write_text((ROOT / 'kernel/src/runtime/learning/learning_evidence/handoff.rs').read_text() + '''
 pub(super) fn host_snapshot() -> [u64;32] {
     core::array::from_fn(|i| REPLAY_CAPTURE_EVIDENCE.0[i].load(Ordering::Acquire))
 }
 ''')
             evidence_path.write_text(evidence_path.read_text().replace(
-                str(ROOT / 'kernel/src/learning_evidence/handoff.rs'), str(handoff_path)))
+                str(ROOT / 'kernel/src/runtime/learning/learning_evidence/handoff.rs'), str(handoff_path)))
             warm_path = directory / 'learning_prewarm.rs'
-            warm_path.write_text((ROOT / 'kernel/src/learning_prewarm.rs').read_text() + '''
+            warm_path.write_text((ROOT / 'kernel/src/runtime/learning/learning_prewarm.rs').read_text().replace(
+                '"learning_prewarm/', '"' + str(ROOT / 'kernel/src/runtime/learning/learning_prewarm') + '/') + '''
 pub fn host_counts() -> (usize,usize,bool) {
     (OPEN.load(Ordering::Acquire), HEAD[3].load(Ordering::Acquire), LOST.load(Ordering::Acquire))
 }
 ''')
-            program = program.replace(str(ROOT / 'kernel/src/learning_evidence.rs'), str(evidence_path))
-            program = program.replace(str(ROOT / 'kernel/src/learning_prewarm.rs'), str(warm_path))
-            original_capture = ROOT / 'kernel/src/domain_tasks/capture_credit.rs'
+            program = program.replace(str(ROOT / 'kernel/src/runtime/learning/learning_evidence.rs'), str(evidence_path))
+            program = program.replace(str(ROOT / 'kernel/src/runtime/learning/learning_prewarm.rs'), str(warm_path))
+            original_capture = ROOT / 'kernel/src/runtime/tasks/domain_tasks/capture_credit.rs'
             capture_path = directory / 'capture_credit.rs'
             capture_path.write_text(original_capture.read_text() + '\n' +
                 (ROOT / 'tests/host/unstarted_capture_test_support.rs').read_text())
@@ -195,7 +197,7 @@ pub fn host_counts() -> (usize,usize,bool) {
                 self.assertIn(failure, negative.stdout + negative.stderr)
 
     def test_cancelled_dispatch_has_no_executed_interval_to_lose(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         facade = (ROOT / 'tests/host/paid_owner_admission_harness.rs').read_text().split('// PRODUCTION_BODIES')[0]
         facade = re.sub(r'fn track_credit\([^\n]+\n', '', facade)
         facade = re.sub(r'fn discard_capture\([^\n]+\n', '', facade)
@@ -211,7 +213,7 @@ pub fn host_counts() -> (usize,usize,bool) {
             capture_start = min(source.index('#[path = "domain_tasks/capture_credit.rs"]'),
                                 source.index('#[path = "domain_tasks/cancellation.rs"]'))
             capture = source[capture_start:source.index('fn throttle(')]
-            capture = capture.replace('"domain_tasks/', '"' + str(ROOT / 'kernel/src/domain_tasks') + '/')
+            capture = capture.replace('"domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/')
         pieces_extra = ''
         if 'struct Captures(' not in source:
             pieces_extra = 'mod domain_tasks { pub(crate) use super::Cancellation; }'
@@ -221,11 +223,11 @@ pub fn host_counts() -> (usize,usize,bool) {
                           'fn admit_service(', 'pub fn begin_service_segment()',
                           'fn revalidate_unstarted(', 'pub fn revalidate_service_segment()']:
             pieces.append(function(source, signature))
-        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))
+        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))
                       + '] mod owner_gate;')
         template = (ROOT / 'tests/host/unstarted_capture_harness.rs').read_text()
         program = facade + '\n' + pieces_extra + '\n' + '\n'.join(pieces) + '\n' + template.replace(
-            '// EVIDENCE_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/learning_evidence.rs'))
+            '// EVIDENCE_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/learning/learning_evidence.rs'))
             + '] mod learning_evidence;')
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

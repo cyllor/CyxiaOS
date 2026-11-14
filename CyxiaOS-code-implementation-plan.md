@@ -1,14 +1,14 @@
 # CyxiaOS 全系统代码实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 当前采用本会话内顺序执行；ECC plan 默认不委派规划。本文为路线图，首批可执行任务见 M1 计划。
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 当前采用本会话内顺序执行；ECC plan 默认不委派规划。本文保留历史阶段路线；当前主平台与执行顺序以 [V0.17 平台设计](CyxiaOS-v0.17-platform-design.md) 为准，M1 计划仅作 ARM 兼容参考。
 
-**Goal:** 分阶段实现不基于 Linux、由客体本地 AI 大脑决策与学习的 CyxiaOS，先交付单核 ARM 可启动基础，再形成可验证的全系统资源决策闭环。
+**Goal:** 分阶段实现不基于 Linux、由客体本地 AI 大脑决策与学习的 CyxiaOS，V0.17 以 x86-64 为主平台，复用共享策略并逐项补齐多核、执行计量、设备与 A03 原生闭环。
 
 **Architecture:** 通用机制、平台契约、架构适配、设备驱动和本地模型分别实现。各资源域向 AI 提交请求和可信观测，执行经校验的动作/有效计划，结果进入审计和学习；硬约束和已承诺操作的正确性由内核维护。
 
-**Tech Stack:** 建议冻结 Rust 1.95.0 `no_std`、少量 AArch64 汇编、`aarch64-unknown-none-softfloat`、QEMU 10.2.2 `virt-10.2` / Cortex-A53 / TCG / 1 CPU / 256 MiB、Python 标准库测试驱动。模型首版为自研整数运行时，无云模型依赖。
+**Tech Stack:** Rust 1.95.0 `no_std`、x86-64 汇编、`x86_64-unknown-none`、QEMU PC；当前单 BSP / 256 MiB，Linux x86-64 显式 KVM，跨架构宿主 TCG、Python 标准库测试驱动。模型首版为自研整数运行时，无云模型依赖。
 
-**Spec:** [总体设计 v0.12](CyxiaOS-design.md)、[详细设计 v0.12](CyxiaOS-detailed-design.md)、[全系统 AI 决策契约](CyxiaOS-ai-decision-contract.md)、[学习设计](CyxiaOS-learning-prototype-design.md)。
+**Spec:** [总体设计 v0.17](CyxiaOS-design.md)、[详细设计 v0.17](CyxiaOS-detailed-design.md)、[全系统 AI 决策契约](CyxiaOS-ai-decision-contract.md)、[学习设计](CyxiaOS-learning-prototype-design.md)。
 
 POSIX 正式规格：[POSIX 兼容需求与架构](CyxiaOS-posix-design.md)，含 PX-R01—12、S1—S6 及 PX-T01—12。POSIX 专项以源码兼容为目标；新增 Linux 应用目标由独立兼容专项承接，认证另行决定。
 

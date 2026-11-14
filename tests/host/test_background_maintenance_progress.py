@@ -16,7 +16,7 @@ from doctor import RUST_BIN, env
 from host_prototype_library import build_host_prototype_library
 from test_a01_formal_recorder import function
 
-SERVICE_SOURCE = ROOT / 'kernel/src/domain_services.rs'
+SERVICE_SOURCE = ROOT / 'kernel/src/runtime/services/domain_services.rs'
 HARNESS_SOURCE = Path(__file__).with_name('background_maintenance_harness.rs')
 
 MINIMAL_HEADER = '''
@@ -93,10 +93,10 @@ class BackgroundMaintenance(unittest.TestCase):
         period = re.search(r'^const BACKGROUND_PERIOD:.*;$', source, re.M)[0]
         fixture = fixture.replace('// PRODUCTION_BACKGROUND_PERIOD', period)
         fixture = fixture.replace('// PRODUCTION_MECHANISM', function(
-            (ROOT / 'kernel/src/unified.rs').read_text(), 'fn mechanism_progress('))
+            (ROOT / 'kernel/src/runtime/cluster/unified.rs').read_text(), 'fn mechanism_progress('))
         minimal = MINIMAL_HEADER + fixture + MINIMAL_MAIN
         full = (ROOT / 'tests/host/a10_write_backpressure_harness.rs').read_text()
-        full = full.replace('__BROKER__', str(ROOT / 'kernel/src/domain_file_abi.rs'))
+        full = full.replace('__BROKER__', str(ROOT / 'kernel/src/runtime/files/domain_file_abi.rs'))
         full = full.replace('__CLIENT__', str(ROOT / 'user/prototype-client/storage_fault.rs'))
         full = full.replace('// ACTUAL_FILE_CALL', function(
             (ROOT / 'user/prototype-client/main.rs').read_text(), 'fn file_call('))

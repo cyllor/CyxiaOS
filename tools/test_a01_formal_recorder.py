@@ -25,7 +25,7 @@ def function(source, name):
 
 class ActualFirstReturnRecorder(unittest.TestCase):
     def test_expected_permission_probe_cannot_seal_or_block_normal_el0_return(self):
-        source = (ROOT / 'kernel/src/boot_recovery/formal.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/recovery/boot_recovery/formal.rs').read_text()
         recorder = function(source, 'pub(crate) fn el0_return(')
         start = recorder.index('    unsafe {\n        core::arch::asm!')
         end = recorder.index('\n    }', start) + len('\n    }')

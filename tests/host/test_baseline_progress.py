@@ -18,10 +18,10 @@ from test_governance_billing_priority import function
 
 
 def program():
-    task = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
-    execution = (ROOT / 'kernel/src/domain_tasks/execution.rs').read_text()
-    unified = (ROOT / 'kernel/src/unified.rs').read_text()
-    owner = (ROOT / 'kernel/src/learning_replay/owner.rs').read_text()
+    task = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+    execution = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+    unified = (ROOT / 'kernel/src/runtime/cluster/unified.rs').read_text()
+    owner = (ROOT / 'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
     pieces = ['static LOCK: ResettableGate = ResettableGate(core::cell::UnsafeCell::new(owner_gate::Gate::new()));']
     for signature in ['struct Guard', 'impl Guard', 'impl Drop for Guard', 'fn acquire_guard()',
                       'fn locked<R>', 'fn locked_with_guard<R>', 'pub struct Credit',
@@ -35,7 +35,7 @@ def program():
         # The function moves from execution's child module into this host
         # root; only its namespace changes, not its deadline implementation.
         pieces.append(function(execution, signature).replace('super::deadline::','deadline::'))
-    pieces.append('#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/deadline.rs'))+'] mod deadline;')
+    pieces.append('#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/deadline.rs'))+'] mod deadline;')
     # The complete lifecycle path has its own real cleanup/Memory/Scheduler
     # fixture. This older fixture covers replay and admission custody.
     pieces.append('fn lifecycle_turn(_: &mut State) { panic!("lifecycle outside replay/admission fixture") }')
@@ -53,7 +53,7 @@ def program():
     for signature in ['fn mechanism_progress(', 'fn progress(', 'fn finish_service(',
                       'fn service_work<R>', 'fn service_start(']:
         pieces.append(function(unified, signature))
-    modules = '\n'.join('#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks' / name))
+    modules = '\n'.join('#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks' / name))
         + '] mod ' + name.removesuffix('.rs') + ';'
         for name in ['owner_gate.rs', 'service_authority.rs'])
     template = (ROOT / 'tests/host/baseline_progress_harness.rs').read_text()
@@ -66,7 +66,7 @@ def program():
     replay+='\n'+(flag[0] if flag else 'static DRAIN_PENDING:AtomicBool=AtomicBool::new(false);')+'\n'+projection+'\n'+pending
     replay+='\n'+function(owner,'pub(super) fn service_pending(')
     replay+='\n'+re.search(r'^static SERVICE_PENDING:.*;$',owner,re.M)[0]
-    facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
+    facade=(ROOT/'kernel/src/runtime/learning/learning_replay.rs').read_text()
     reader=function(facade,'pub fn baseline_activation_pending(') if 'pub fn baseline_activation_pending(' in facade else 'pub fn baseline_activation_pending()->bool {HINT.load(Ordering::Acquire)}'
     reader+='\npub fn owned_drain_pending()->bool {false}\n'
     reader+='\n'+function(facade,'pub fn admission_progress_pending(')

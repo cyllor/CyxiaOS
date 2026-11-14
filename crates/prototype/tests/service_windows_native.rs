@@ -4,7 +4,7 @@
 //! request events are fault-injection tests, never native replay samples.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 mod domain_tasks {
     pub(crate) use super::cancellation::Cancellation;
@@ -35,13 +35,13 @@ pub mod domain_platform {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/control_pool.rs"]
+#[path = "../../../kernel/src/runtime/control/control_pool.rs"]
 pub mod control_pool;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_evidence.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_evidence.rs"]
 mod learning_evidence;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/service_windows.rs"]
+#[path = "../../../kernel/src/runtime/services/service_windows.rs"]
 mod service_windows;
 
 use core::sync::atomic::{AtomicBool, Ordering};

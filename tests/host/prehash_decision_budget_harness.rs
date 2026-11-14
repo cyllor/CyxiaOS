@@ -31,5 +31,5 @@ pub mod policy {
     }
 }
 
-#[path = "../../kernel/src/domain_control/preparation.rs"]
+#[path = "../../kernel/src/runtime/control/domain_control/preparation.rs"]
 mod preparation;

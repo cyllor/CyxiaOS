@@ -85,7 +85,7 @@ mod learning_evidence {
             .map_err(|_| Error::Evidence)
     }
 }
-#[path = "../../../kernel/src/domain_platform/irq_replay.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/irq_replay.rs"]
 mod irq_replay;
 
 #[test]

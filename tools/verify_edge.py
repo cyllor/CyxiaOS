@@ -100,7 +100,7 @@ def provenance(elf, probe):
         assert layout[name + "_sha256"] == digest(path), (name, path)
     manifest_path = elf.parent / "kernel-source-manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    assert manifest and "kernel/src/user/linux.rs" in manifest and "crates/posix/src/epoll.rs" in manifest
+    assert manifest and "kernel/src/desktop/user/linux.rs" in manifest and "crates/posix/src/epoll.rs" in manifest
     paths = [elf, probe, layout_path, source, libc, driver, manifest_path]
     for name, expected in manifest.items():
         path = (ROOT / name).resolve()

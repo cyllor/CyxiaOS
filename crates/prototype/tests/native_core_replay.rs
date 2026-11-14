@@ -16,7 +16,7 @@ static QUEUE_BUSY: AtomicBool = AtomicBool::new(false);
 static ENTRY_PREFIX: AtomicU64 = AtomicU64::new(0);
 static ENCODING_CPU: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/preparation.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/preparation.rs"]
 mod preparation;
 pub mod cpu {
     use super::*;
@@ -380,13 +380,13 @@ fn encode_job(
     Ok(())
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/core_replay.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/core_replay.rs"]
 pub(crate) mod core_replay;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/dispatch.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/dispatch.rs"]
 mod dispatch;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/target_batch.rs"]
 mod target_batch;
 pub mod domain_control {
     pub(crate) use crate::core_replay;
@@ -414,7 +414,7 @@ pub mod domain_evidence {
     }
 }
 #[allow(unexpected_cfgs, dead_code)]
-#[path = "../../../kernel/src/a03_demand.rs"]
+#[path = "../../../kernel/src/diagnostics/a03_demand.rs"]
 mod a03_demand;
 fn scope(
     seed: u64,

@@ -5,7 +5,7 @@ mod abi;
 #[path = "../../../user/prototype-runtime/native.rs"]
 mod native;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/reply.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/reply.rs"]
 mod root_reply;
 use cyxia_prototype::policy::{Candidate, CandidateSet, ModelBinding, Snapshot};
 use domains::{Action, ObjectKey, POLICY_NS};

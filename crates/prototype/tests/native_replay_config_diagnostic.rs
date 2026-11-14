@@ -1,6 +1,6 @@
 //! Actual diagnostic encoder/latch; synthetic host identities are never
 //! publication authority or native replay evidence.
-#[path = "../../../kernel/src/domain_control/replay/config_diagnostic.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/replay/config_diagnostic.rs"]
 #[allow(dead_code)]
 mod diagnostic;
 use cyxia_prototype::{

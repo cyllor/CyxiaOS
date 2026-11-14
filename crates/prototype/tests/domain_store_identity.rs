@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/unified_store/identity.rs"]
+#[path = "../../../kernel/src/runtime/cluster/unified_store/identity.rs"]
 mod identity;
 
 fn record(version: &[u8; 5]) -> [u8; 85] {

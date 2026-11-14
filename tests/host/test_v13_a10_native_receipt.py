@@ -691,7 +691,7 @@ class NativeTrustedBoundary(unittest.TestCase):
                 path = fixture.root/name
                 if kind == 'source':
                     sources = fixture.read(name)
-                    sources['kernel/src/smp.rs'] = '00'*32
+                    sources['kernel/src/arch/aarch64/smp.rs'] = '00'*32
                     fixture.write(name, sources)
                 else:
                     data = bytearray(path.read_bytes()); data[-1] ^= 1; path.write_bytes(data)

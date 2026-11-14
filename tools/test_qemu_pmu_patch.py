@@ -47,7 +47,7 @@ class QemuPmuPatchContract(unittest.TestCase):
             "reserved_ns",
             "native task credit overrun",
             "tools/verify_domains.py",
-            "kernel/src/domain_tasks",
+            "kernel/src/runtime/tasks/domain_tasks",
         )
         for marker in forbidden:
             self.assertNotIn(marker, self.text)

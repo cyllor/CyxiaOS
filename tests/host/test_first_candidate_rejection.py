@@ -17,22 +17,22 @@ from test_governance_billing_priority import function
 
 
 def program():
-    control=(ROOT/'kernel/src/domain_control.rs').read_text()
-    replay=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
-    preparation=(ROOT/'kernel/src/domain_control/preparation.rs').read_text()
+    control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
+    replay=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
+    preparation=(ROOT/'kernel/src/runtime/control/domain_control/preparation.rs').read_text()
     source=(ROOT/'tests/host/first_candidate_rejection_harness.rs').read_text()
     source=source.replace('// ACTUAL_IDENTITY','use super::*;\n#[derive(Clone,Copy)]\n'+function(preparation,'pub struct Identity'))
     for marker,signature in [('JOB','struct Job {'),('COMPLETION','struct JobCompletion {')]:
         source=source.replace('// ACTUAL_'+marker,'#[derive(Clone,Copy)]\n'+function(control,signature))
     source=source.replace('// ACTUAL_FINISH_JOB',function(control,'fn finish_job('))
     source=source.replace('// ACTUAL_ABORT',function(control,'pub fn abort('))
-    source+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;\n'
+    source+='\n#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/submission.rs'))+'] mod submission;\n'
     source=source.replace('// ACTUAL_TOKEN','#[derive(Clone,Copy,Debug,PartialEq,Eq)]\n'+function(replay,'pub struct Token'))
     bodies='\n'.join(function(replay,s) for s in ['fn fail(','pub(super) fn allows(','pub(super) fn first('])
     hook='pub(super) fn reject_first_job(_:u64,_:u64,_:&CandidateSet,_:Error) {}'
     if 'fn reject_first_job(' in replay:hook=function(replay,'pub(super) fn reject_first_job(')
-    source=source.replace('// ACTUAL_OWNER_RETAIN_ERROR',function((ROOT/'kernel/src/learning_replay/owner.rs').read_text(),'fn retain_error('))
-    source=source.replace('// ACTUAL_LIFECYCLE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/replay/lifecycle.rs'))+'] mod close_lifecycle;')
+    source=source.replace('// ACTUAL_OWNER_RETAIN_ERROR',function((ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text(),'fn retain_error('))
+    source=source.replace('// ACTUAL_LIFECYCLE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/replay/lifecycle.rs'))+'] mod close_lifecycle;')
     return source.replace('// ACTUAL_ROOT_FUNCTIONS',bodies+'\n'+hook)
 
 

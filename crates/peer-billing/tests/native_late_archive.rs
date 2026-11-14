@@ -17,9 +17,9 @@ use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Mutex};
 
-#[path = "../../../kernel/src/learning_replay/archive_packet.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/archive_packet.rs"]
 mod archive_packet;
-#[path = "../../../kernel/src/learning_replay/late_archive.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/late_archive.rs"]
 mod late_archive;
 
 static SERIAL: Mutex<()> = Mutex::new(());

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Host-only fixtures driving production bounded collection transitions.
 //! These do not construct AcceptedSample or grant replay authority.
-#[path = "../../../kernel/src/learning_replay/bounded_data.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/bounded_data.rs"]
 mod bounded;
 use bounded::{Ledger, MAX_ATTEMPTS, Reference, Release};
 fn reference(trial: u64, generation: u64) -> Reference {
@@ -208,7 +208,7 @@ fn only_expected_exclusion_codes_can_restart_and_supplement_requires_final_actua
     assert_eq!(bytes.len(), 4096);
     assert!(bytes[2816..].iter().all(|v| *v == 0));
 }
-#[path = "../../../kernel/src/domain_control/baseline_cause.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/baseline_cause.rs"]
 mod baseline_cause;
 
 #[test]

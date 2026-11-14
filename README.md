@@ -1,20 +1,34 @@
 # CyxiaOS
 
-## V0.16 审核修复与实现恢复开发基线
+## V0.17：x86-64 主开发平台
 
-当前开发分支为 **`CyxiaOS-V0.16`**，软件版本 **`0.16.0-dev`**；最小原型设计配置仍为 **1.3**，不随软件分支改号。
+当前分支为 **`CyxiaOS-V0.17`**，软件版本 **`0.17.0-dev`**。主目标改为 **x86-64**；
+主开发/加速验证宿主为 Linux x86-64，显式选择 KVM；macOS ARM 可继续交叉编译和运行 TCG 功能回归。
+ARM64 保留独立兼容适配与历史证据。最小原型配置 1.3、模型/协议版本和验收预算不随分支号改变。
 
-本分支基于 V0.15 提交 `32057802e6e7d9239d04f1e7e3fed4f82f90db7e`，修复全量代码审核和 Superpowers 复核确认的九项问题：集群重连关闭记录分批恢复、双向契约状态隔离、Unknown 执行状态一致性、构建进程组清理、PTY 执行次数校验、日志恢复顺序游标、Virtio RNG 超时竞态、动态 IPC 目标枚举，以及回放扫描对暂不可读目标的重试。
+当前 PC 支持单 BSP、256 MiB、分页保护、异常、定时器和用户态往返；尚未完成 x86 SMP、
+生产运行时、PCI/VirtIO 和 A03 原生学习链。64 核/128 GiB 是宿主资源，不代表客体已经支持。
+[V0.17 平台设计](CyxiaOS-v0.17-platform-design.md) 是本分支的平台基线；
+[开发路线与 A03 缺口](docs/implementation/v17-development.md) 区分实现、测试和验收状态。
 
-修复范围、回归结果与剩余工作见 [V0.16 汇总说明](docs/implementation/v16-source-summary.md)；机器可读来源见 [V0.16 基线](docs/implementation/v16-source-baseline.json)，实际验证记录见 [V0.16 验证](docs/implementation/v16-verification.json)。[V0.15 历史来源](docs/implementation/v15-source-summary.md)保留不变。历史原生 PASS 只归属原运行绑定的源码快照；V0.16 的主机回归通过不能替代原生验收，完整原型发布门禁仍关闭。
+```sh
+python3 -B tools/build.py --output artifacts/v017-x86-build
+python3 -B tools/x86_64.py run --build artifacts/v017-x86-build --output artifacts/v017-x86-run
+# Linux x86-64 上明确选择加速：上一条 run 命令增加 --accel kvm
+python3 -B tools/x86_64.py check --directory artifacts/v017-x86-run
+```
 
-后续整合恢复了与 V0.15 A09 r7 实测记录逐项一致的957文件源码快照中的实现及工具，同时保留 V0.16 九项审核修复。历史审核记录保持原字节；最新见 [R4 A01–A16进度](docs/implementation/v16-a01-a16-progress-20261108-r4.md) 和 [恢复验证记录](docs/implementation/v16-reintegration-verification.json)。R2修复后台维护的旧时间戳与待办丢失，生产编译输入保持C4。R4新增A12固定原生验证器，真实两节点启动、认证、同配置及Local任务准入通过；运行目录为 **4 PASS / 12 NOT_RUN**（A01、A02、A09、A12）。原综合运行FAIL、A13/A14未完成，129自然复现但尚无因果修复。新增完整工具测试434/434通过；R2的Rust600/621保留原执行身份。广范围既有失败保留，全分支审核CHANGES_REQUIRED，完整发布验收未通过。[R2](docs/implementation/v16-a01-a16-progress-20261108-r2.md)、[R3](docs/implementation/v16-a01-a16-progress-20261108-r3.md)与[整合摘要](docs/implementation/v16-reintegration-summary.md)保留历史边界。
+构建 CLI 默认 x86-64。ARM 回归必须传 `--arch aarch64`；原有 ARM 专项工具与 Python 构建 API
+保留其明确范围。平台自测不能替代 A03/A10；V0.17 的 A01–A16 均需重新取得与架构、源码、
+工具和实际运行绑定的证据，历史 PASS 不自动迁移。
 
-工程四路、组件六路和独立 A02 工作流已接入 V0.16 的 push/PR；Rust 工程路新增 `cluster-engine` 回归。`V0.16 source snapshot` 归档触发提交的源码、树身份和校验结果，不改变原生验收状态。`tools/prototype.py` 的 `build`、`run-single`、`run-pair`、`test`、`report` 入口保持不变。
+本分支承接 [V0.16 审核修复](docs/implementation/v16-source-summary.md)、
+[R15 x86 支持](docs/implementation/v16-x86-platform-20261114-r15.md) 与
+[R16 kernel 整理](docs/implementation/v16-kernel-layout-20261114-r16.md)。历史记录保持原版本含义。
 
 ## 历史桌面、Shell 与独立配置说明
 
-以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，V0.16 状态以上述汇总和精确提交的运行证据为准。
+以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，历史状态以相应版本记录为准，当前平台状态以上述 V0.17 基线为准。
 
 不基于 Linux 的实验性操作系统。目标是由本地 AI 决策资源分配，由内核执行安全约束和资源机制。
 
@@ -117,18 +131,24 @@ python3 tools/prototype.py report --output artifacts/prototype-report.json
 
 ```sh
 python3 tools/doctor.py --json
-python3 tools/build.py --profile dev
+python3 tools/build.py --arch aarch64 --profile dev
 python3 tools/run_qemu.py --elf target/aarch64-unknown-none-softfloat/debug/cyxia-kernel --case all
 python3 tools/verify_m1.py --output artifacts/m1-final
 python3 tools/coverage.py
 ```
+
+kernel 目录和模块接口已按职责整理，见 [kernel 架构说明](kernel/README.md)。
+
+新增 x86-64 PC 裸机平台入口：`python3 tools/build.py --arch x86_64 --output artifacts/x86-build`。
+平台职责、运行命令与当前支持边界见 [x86-64 平台说明](docs/implementation/x86-64-platform.md)；
+x86 平台自测不替代 A03/A10 验收。
 
 环境：Rust/Cargo 1.95.0、目标 aarch64-unknown-none-softfloat、rustfmt/clippy/llvm-tools-preview；QEMU 10.2.2。当前使用已安装 stable 并强制版本校验，避免重复安装；如果本机 stable 升级，须使用精确 1.95.0 工具链或重新验收，不能绕过 doctor。
 
 基础裸机配置：virt-10.2、Cortex-A53、TCG、1 CPU、256 MiB、GICv2，无磁盘和网络；桌面使用独立的 512 MiB 配置及 VirtIO 显示/输入/RNG/数据盘。完整测试包含开发/优化映像、日志停读压力和无 selftest 的启动。`--case pressure` 仅用于默认自检构建。
 
 ```sh
-python3 tools/build.py --profile release --production
+python3 tools/build.py --arch aarch64 --profile release --production
 python3 tools/run_qemu.py --elf target/aarch64-unknown-none-softfloat/release/cyxia-kernel --case boot-entry
 ```
 

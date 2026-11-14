@@ -14,7 +14,7 @@ from test_governance_billing_priority import function
 
 class NativePrivateClearProgress(unittest.TestCase):
     def test_private_clear_finishes_under_normal_wake_cadence_without_skipping_paid_work(self):
-        source = (ROOT / 'kernel/src/prototype_runtime/native.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/control/prototype_runtime/native.rs').read_text()
         constants = [re.search(rf'^const {name}:.*;$', source, re.M)[0] for name in
             ['PRIVATE_CLEAR_PAGES', 'PRIVATE_CLEAR_BYTES', 'PRIVATE_CLEAR_BARRIER', 'PRIVATE_CLEAR_SLICE_BYTES']]
         if 'const PRIVATE_CLEAR_TURN_BYTES:' in source:

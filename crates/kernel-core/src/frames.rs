@@ -47,7 +47,10 @@ impl FrameHandle {
 pub struct RevokeComplete(FrameHandle);
 impl RevokeComplete {
     /// # Safety
-    /// Caller must remove all CPU/DMA mappings to this exact handle and complete synchronization.
+    /// Caller must remove all CPU/DMA mappings granted to the former owner of
+    /// this exact handle and complete synchronization. Only an exclusively
+    /// controlled supervisor mapping used by the allocator to clear/reassign
+    /// the page may remain; no former owner or DMA agent may access it.
     pub unsafe fn after_unmap(handle: FrameHandle) -> Self {
         Self(handle)
     }
@@ -67,16 +70,42 @@ impl<'a> FramePool<'a> {
         if info.ram_count > 8 || info.reserved_count > 32 {
             return Err(FrameError::Invalid);
         }
+        Self::from_memory_parts(
+            &info.ram[..info.ram_count],
+            reserved,
+            &info.reserved[..info.reserved_count],
+            metadata,
+        )
+    }
+    /// Firmware-independent admission. Architecture adapters supply validated
+    /// RAM and reservations; no DTB, PSCI or interrupt-controller ABI is needed.
+    pub fn from_memory(
+        ram: &[MemoryRegion],
+        reserved: &[MemoryRegion],
+        metadata: &'a mut [FrameMeta],
+    ) -> Result<Self, FrameError> {
+        Self::from_memory_parts(ram, reserved, &[], metadata)
+    }
+    fn from_memory_parts(
+        ram: &[MemoryRegion],
+        reserved: &[MemoryRegion],
+        firmware_reserved: &[MemoryRegion],
+        metadata: &'a mut [FrameMeta],
+    ) -> Result<Self, FrameError> {
+        if ram.len() > 8 {
+            return Err(FrameError::Invalid);
+        }
         let mut total = 0usize;
-        for (i, r) in info.ram[..info.ram_count].iter().enumerate() {
-            if r.len == 0
+        for (i, r) in ram.iter().enumerate() {
+            if r.kind != RegionKind::Ram
+                || r.len == 0
                 || !r.start.0.is_multiple_of(4096)
                 || !r.len.is_multiple_of(4096)
                 || r.end().is_err()
             {
                 return Err(FrameError::Invalid);
             }
-            if info.ram[..i].iter().any(|x| x.overlaps(*r)) {
+            if ram[..i].iter().any(|x| x.overlaps(*r)) {
                 return Err(FrameError::Invalid);
             }
             total = total
@@ -86,16 +115,13 @@ impl<'a> FramePool<'a> {
         if total > 65536 || total > metadata.len() {
             return Err(FrameError::Capacity);
         }
-        for r in reserved
-            .iter()
-            .chain(info.reserved[..info.reserved_count].iter())
-        {
+        for r in reserved.iter().chain(firmware_reserved.iter()) {
             if r.end().is_err() {
                 return Err(FrameError::Invalid);
             }
         }
         let mut i = 0;
-        for r in &info.ram[..info.ram_count] {
+        for r in ram {
             for offset in (0..r.len).step_by(4096) {
                 let page = MemoryRegion {
                     start: PhysAddr(r.start.0 + offset),
@@ -104,7 +130,7 @@ impl<'a> FramePool<'a> {
                 };
                 let excluded = reserved
                     .iter()
-                    .chain(info.reserved[..info.reserved_count].iter())
+                    .chain(firmware_reserved.iter())
                     .any(|x| x.overlaps(page));
                 metadata[i] = FrameMeta {
                     address: page.start,

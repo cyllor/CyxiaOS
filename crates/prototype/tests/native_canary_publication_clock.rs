@@ -1,5 +1,5 @@
 //! Boundary tests invoke the production post-owner-callback clock check.
-#[path = "../../../kernel/src/domain_control/publication_clock.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/publication_clock.rs"]
 mod publication_clock;
 use cyxia_prototype::{
     domains::{ObjectKey, WINDOW_NS},

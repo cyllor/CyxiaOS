@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/prototype_runtime/learning_receipt.rs"]
+#[path = "../../../kernel/src/runtime/control/prototype_runtime/learning_receipt.rs"]
 mod receipt_match;
 use cyxia_prototype::{
     domains::tasks::{ControlCredit, CpuLayout, Scheduler},

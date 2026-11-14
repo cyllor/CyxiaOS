@@ -366,7 +366,7 @@ def provenance(elf, server, client):
                    for load in layout["loads"] if not load["flags"] & 2), program
     manifest_path = elf.parent / "kernel-source-manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    assert "kernel/src/user/shared_memory.rs" in manifest and "crates/posix/src/epoll.rs" in manifest
+    assert "kernel/src/desktop/user/shared_memory.rs" in manifest and "crates/posix/src/epoll.rs" in manifest
     inputs[manifest_path] = digest(manifest_path)
     bind_inputs(inputs, {ROOT / name: value for name, value in manifest.items()})
     for program, kind in ((server, "probe"), (client, "client")):

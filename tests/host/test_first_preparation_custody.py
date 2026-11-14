@@ -11,12 +11,12 @@ from doctor import RUST_BIN,env
 from test_governance_billing_priority import function
 
 def program():
- c=(ROOT/'kernel/src/domain_control.rs').read_text();r=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
+ c=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text();r=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
  code=(ROOT/'tests/host/first_preparation_custody_harness.rs').read_text()
  code=code.replace(
   '// PREPARATION_MODULE',
-  '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/preparation.rs'))+'] mod preparation;\n'
-  '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/preparation_skip.rs'))+'] mod preparation_skip;\n'
+  '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/preparation.rs'))+'] mod preparation;\n'
+  '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/preparation_skip.rs'))+'] mod preparation_skip;\n'
   'use preparation_skip::Reason as Skip;')
  bank=c[c.index('struct PreparationRejections('):c.index(');',c.index('struct PreparationRejections('))+2]+'\nstatic DOMAIN_PREPARATION_REJECTIONS:PreparationRejections=PreparationRejections([const{AtomicU64::new(0)};648]);\nstatic mut PREPARATION_REJECTIONS:preparation::Rejections=preparation::Rejections::new();'
  code=code.replace('// ACTUAL_REJECTION_BANK',bank)

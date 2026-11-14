@@ -174,7 +174,7 @@ fn execute(context: &mut user::Context, root: usize) {
     WALL.fetch_add(1_000_000, Ordering::Relaxed);
 }
 fn wake_workers() {}
-#[path = "../../kernel/src/prototype_runtime/boot_model.rs"]
+#[path = "../../kernel/src/runtime/control/prototype_runtime/boot_model.rs"]
 mod worker;
 fn step(check: &mut worker::Check) {
     CPU.store(1, Ordering::Relaxed);

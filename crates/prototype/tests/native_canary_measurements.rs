@@ -1,7 +1,7 @@
 //! Production measurement collector and ConsolePump; the UART is a controlled
 //! test fixture. No replay labels or native execution claims are constructed.
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_canary/collector.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_canary/collector.rs"]
 mod collector;
 use collector::*;
 use cyxia_prototype::{

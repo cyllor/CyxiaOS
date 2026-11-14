@@ -13,13 +13,13 @@ use cyxia_prototype::{
     policy_wire::{self, Decision, Envelope, Plan, PlanHeader},
 };
 use std::sync::Mutex;
-#[path = "../../../kernel/src/domain_tasks/baseline_service_authority.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/baseline_service_authority.rs"]
 mod authority;
-#[path = "../../../kernel/src/domain_services/core_set_legality.rs"]
+#[path = "../../../kernel/src/runtime/services/domain_services/core_set_legality.rs"]
 mod legality;
-#[path = "../../../kernel/src/domain_tasks/owner_gate.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/owner_gate.rs"]
 mod owner_gate;
-#[path = "../../../kernel/src/domain_tasks/service_authority.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/service_authority.rs"]
 mod service_authority;
 static SERIAL: Mutex<()> = Mutex::new(());
 static GATE: owner_gate::Gate = owner_gate::Gate::new();

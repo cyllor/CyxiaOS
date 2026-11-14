@@ -59,10 +59,10 @@ class CaptureProvenance(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'run identity mismatch'):decode(packed(w),(7,11,6))
 
     def test_actual_observer_counterexamples_compile_and_fail_behaviorally(self):
-        original=(ROOT/'kernel/src/learning_evidence/provenance.rs').read_text()
-        bridge=(ROOT/'kernel/src/learning_evidence.rs').read_text()
+        original=(ROOT/'kernel/src/runtime/learning/learning_evidence/provenance.rs').read_text()
+        bridge=(ROOT/'kernel/src/runtime/learning/learning_evidence.rs').read_text()
         harness=(ROOT/'crates/prototype/tests/native_capture_provenance.rs').read_text()
-        execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
+        execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
         # Explicit test-only paid-credit/physical-cleanup/membership boundary.
         # The companion cost test runs the original service sample and real
         # Scheduler debit; here collector/identity copy/interval storage stay real.
@@ -82,10 +82,11 @@ mod task_boundary {
         harness=harness.replace('crate::learning_evidence::','crate::bridge::')
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);bank=d/'provenance.rs';evidence=d/'learning_evidence.rs';h=d/'test.rs'
-            bridge=bridge.replace('"learning_evidence/','"'+str(ROOT/'kernel/src/learning_evidence')+'/')
-            bridge=bridge.replace(str(ROOT/'kernel/src/learning_evidence/provenance.rs'),str(bank));evidence.write_text(bridge)
-            harness=harness.replace('"../../../kernel/src/domain_tasks/cancellation.rs"',json.dumps(str(ROOT/'kernel/src/domain_tasks/cancellation.rs')))
-            harness=harness.replace('"../../../kernel/src/learning_evidence.rs"',json.dumps(str(evidence)));h.write_text(harness)
+            bridge = bridge.replace('"../tasks/domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/')
+            bridge=bridge.replace('"learning_evidence/','"'+str(ROOT/'kernel/src/runtime/learning/learning_evidence')+'/')
+            bridge=bridge.replace(str(ROOT/'kernel/src/runtime/learning/learning_evidence/provenance.rs'),str(bank));evidence.write_text(bridge)
+            harness=harness.replace('"../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"',json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/cancellation.rs')))
+            harness=harness.replace('"../../../kernel/src/runtime/learning/learning_evidence.rs"',json.dumps(str(evidence)));h.write_text(harness)
             (d/'Cargo.toml').write_text('[package]\nname="capture-provenance-counterexamples"\nversion="0.1.0"\nedition="2024"\n[[test]]\nname="provenance"\npath="test.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             cmd=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-capture-provenance'),'--','--nocapture']
             def run(source):

@@ -1,6 +1,6 @@
 //! The production root/coordinator lifecycle state, exercised with synthetic
 //! host identities. These tests create no replay samples or native receipts.
-#[path = "../../../kernel/src/domain_control/replay/lifecycle.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/replay/lifecycle.rs"]
 mod lifecycle;
 use cyxia_prototype::{domains::Error, learning::capture::RunKey, policy::ExecutionState};
 use lifecycle::{CloseGate, WorkActivation};

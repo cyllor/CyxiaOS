@@ -22,6 +22,7 @@ import time
 from check_elf import inspect_elf, symbol
 from run_qemu import Qmp
 from transport import FrameDecoder
+from build_sources import working_tree_names
 
 ROOT = Path(__file__).resolve().parents[1]
 MAGIC = 0x435958534D503031
@@ -44,10 +45,8 @@ def manifest() -> dict[str, str]:
     # Bind the entire checked-out tree (including new tracked/untracked source),
     # excluding only Git-ignored outputs. Never infer source identity from HEAD
     # while accepting edited files alongside it.
-    result = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-                            cwd=ROOT, capture_output=True, check=True, timeout=10)
-    names = sorted({os.fsdecode(n) for n in result.stdout.split(b'\0') if n})
-    require({'kernel/src/smp.rs', 'crates/arch-aarch64/src/user.rs', 'Cargo.lock'} <= set(names),
+    names = working_tree_names(ROOT)
+    require({'kernel/src/arch/aarch64/smp.rs', 'crates/arch-aarch64/src/user.rs', 'Cargo.lock'} <= set(names),
             'incomplete source checkout')
     files = [ROOT / name for name in names]
     require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(ROOT) for p in files),

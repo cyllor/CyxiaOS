@@ -1,5 +1,5 @@
 //! Exercise the dependency resolver used by D10 on both control and owner CPUs.
-#[path = "../../../kernel/src/domain_network/dependencies.rs"]
+#[path = "../../../kernel/src/runtime/network/domain_network/dependencies.rs"]
 mod dependencies;
 use cyxia_prototype::domains::{Error, ObjectKey};
 

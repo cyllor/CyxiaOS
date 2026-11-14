@@ -76,3 +76,39 @@ fn failed_zero_does_not_publish_page() {
     assert!(p.clean_one(&mut Bad).is_err());
     assert_eq!(p.alloc_clean(owner()), Err(FrameError::Again));
 }
+
+#[test]
+fn firmware_independent_map_preserves_reservation_and_revoke_contract() {
+    let info = info();
+    let reserved = [MemoryRegion {
+        start: PhysAddr(0x1000),
+        len: 4096,
+        kind: RegionKind::Reserved,
+    }];
+    let mut meta = [FrameMeta::EMPTY; 3];
+    let mut p = FramePool::from_memory(&info.ram[..1], &reserved, &mut meta).unwrap();
+    let mut z = Zero {
+        bytes: [0xa5; 12288],
+    };
+    p.clean_one(&mut z).unwrap();
+    let first = p.alloc_clean(owner()).unwrap();
+    assert_eq!(first.address(), PhysAddr(0x2000));
+    p.begin_revoke(first, owner()).unwrap();
+    p.finish_revoke(first, unsafe { RevokeComplete::after_unmap(first) })
+        .unwrap();
+    p.clean_one(&mut z).unwrap();
+    let second = p.alloc_clean(owner()).unwrap();
+    assert_eq!(second.address(), first.address());
+    assert_ne!(first, second);
+    assert!(p.begin_revoke(first, owner()).is_err());
+    assert!(z.bytes[4096..8192].iter().all(|&x| x == 0));
+}
+
+#[test]
+fn firmware_independent_map_rejects_device_memory_and_overlap() {
+    let mut regions = [info().ram[0]; 2];
+    let mut meta = [FrameMeta::EMPTY; 6];
+    assert!(FramePool::from_memory(&regions, &[], &mut meta).is_err());
+    regions[0].kind = RegionKind::Reserved;
+    assert!(FramePool::from_memory(&regions[..1], &[], &mut meta).is_err());
+}

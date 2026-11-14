@@ -14,13 +14,13 @@ from test_governance_billing_priority import function
 
 class ReplayQuiescingGate(unittest.TestCase):
     def test_actual_gate_blocks_preserve_identity_and_short_circuit(self):
-        root = (ROOT / 'kernel/src/domain_control/replay.rs').read_text()
+        root = (ROOT / 'kernel/src/runtime/control/domain_control/replay.rs').read_text()
         arm = function(function(root, 'pub fn poll(token:'), 'Phase::Quiescing =>')
-        predicate = function((ROOT / 'kernel/src/domain_control.rs').read_text(),
+        predicate = function((ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text(),
                              'fn execution_blocks_replacement(')
         template = (ROOT / 'tests/host/replay_quiescing_harness.rs').read_text()
         code = template.replace('// ACTUAL_ARM', arm).replace('// ACTUAL_PREDICATE', predicate)
-        code = code.replace('// BANK_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_control/replay/quiescing_diagnostic.rs')) + '] mod quiescing_diagnostic;')
+        code = code.replace('// BANK_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/control/domain_control/replay/quiescing_diagnostic.rs')) + '] mod quiescing_diagnostic;')
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             source, binary = directory / 'gate.rs', directory / 'gate'
@@ -47,8 +47,8 @@ class ReplayQuiescingGate(unittest.TestCase):
             self.assertIn('actual desired gate was not retained', negative.stdout + negative.stderr)
 
     def test_actual_rotation_needs_64_paid_replay_pieces_for_512_slots(self):
-        root = (ROOT / 'kernel/src/domain_control/replay.rs').read_text()
-        execution = (ROOT / 'kernel/src/domain_tasks/execution.rs').read_text()
+        root = (ROOT / 'kernel/src/runtime/control/domain_control/replay.rs').read_text()
+        execution = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
         arm = function(function(root, 'pub fn poll(token:'), 'Phase::Quiescing =>')
         service = function(execution, 'pub fn service(_now:')
         dispatch = function(service, 'if external == Ok(9)')
@@ -58,11 +58,11 @@ class ReplayQuiescingGate(unittest.TestCase):
         import re
         rotation = re.search(r'let phase = s.service_phase;\s+s.service_phase = \(phase \+ 1\) % 11;', service)
         self.assertIsNotNone(rotation)
-        predicate = function((ROOT / 'kernel/src/domain_control.rs').read_text(),
+        predicate = function((ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text(),
                              'fn execution_blocks_replacement(')
         code = (ROOT / 'tests/host/replay_quiescing_harness.rs').read_text()
         code = code.replace('// ACTUAL_ARM', arm).replace('// ACTUAL_PREDICATE', predicate)
-        code = code.replace('// BANK_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_control/replay/quiescing_diagnostic.rs')) + '] mod quiescing_diagnostic;')
+        code = code.replace('// BANK_MODULE', '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/control/domain_control/replay/quiescing_diagnostic.rs')) + '] mod quiescing_diagnostic;')
         code = code.replace('[Option<Desired>;16]', '[Option<Desired>;512]').replace('desired:[None;16]', 'desired:[None;512]')
         code = code.replace('struct State{job:', 'struct State{service_phase:usize,job:').replace('(State{job:', '(State{service_phase:0,job:')
         code += '\nfn real_rotation(s:&mut State,r:&mut Root,at:u64){' + rotation[0] + 'let external=Ok::<usize,Error>(phase);' + dispatch + '}\n'

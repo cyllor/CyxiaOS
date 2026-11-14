@@ -202,7 +202,7 @@ def verify_pair_components(capture: Path, source_root: Path, build: dict,
                     'user/prototype-cluster/src/main.rs', 'user/prototype-cluster/src/runtime.rs',
                     'user/prototype-cluster/src/runtime_turn.rs', 'user/prototype-cluster/src/broker.rs',
                     'user/prototype-cluster/src/driver.rs', 'user/prototype-cluster/src/session_exit.rs',
-                    'kernel/src/unified.rs')
+                    'kernel/src/runtime/cluster/unified.rs')
     source_hashes = {}
     for name in source_paths:
         digest = _sha(_read(source_root / name, 1024 * 1024))

@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/control_pool/ledger.rs"]
+#[path = "../../../kernel/src/runtime/control/control_pool/ledger.rs"]
 mod ledger;
 use cyxia_prototype::domains::{Error, ObjectKey};
 use ledger::Ledger;

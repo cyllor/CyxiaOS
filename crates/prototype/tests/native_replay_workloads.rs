@@ -2,11 +2,11 @@
 //! These checks create no native labels or substituted execution evidence.
 use cyxia_prototype::domains::{Action, Error, ObjectKey};
 use sha2::{Digest, Sha256};
-#[path = "../../../kernel/src/learning_workload/background.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_workload/background.rs"]
 mod background;
-#[path = "../../../kernel/src/domain_services/replay_core_image.rs"]
+#[path = "../../../kernel/src/runtime/services/domain_services/replay_core_image.rs"]
 mod core_image;
-#[path = "../../../kernel/src/domain_platform/replay_irq_image.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/replay_irq_image.rs"]
 mod irq_image;
 
 #[test]

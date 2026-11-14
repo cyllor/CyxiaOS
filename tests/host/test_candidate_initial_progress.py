@@ -17,8 +17,8 @@ from test_governance_billing_priority import function
 
 
 def root_support(observe_stale=False):
-    replay=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
-    control=(ROOT/'kernel/src/domain_control.rs').read_text()
+    replay=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
+    control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
     support=(ROOT/'tests/host/candidate_initial_support.rs').read_text()
     initial='#[derive(Clone,Copy)] struct CandidatePublication;'
     if 'struct CandidatePublication' in replay:
@@ -42,11 +42,11 @@ def root_support(observe_stale=False):
 
 class CandidatePublicationProgress(unittest.TestCase):
     def test_actual_candidate_custody_uses_existing_paid_progress_pieces(self):
-        task=(ROOT/'kernel/src/domain_tasks.rs').read_text()
-        execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
-        unified=(ROOT/'kernel/src/unified.rs').read_text()
-        owner=(ROOT/'kernel/src/learning_replay/owner.rs').read_text()
-        control=(ROOT/'kernel/src/domain_control.rs').read_text()
+        task=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+        unified=(ROOT/'kernel/src/runtime/cluster/unified.rs').read_text()
+        owner=(ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
+        control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
         pieces=['static LOCK: ResettableGate = ResettableGate(core::cell::UnsafeCell::new(owner_gate::Gate::new()));']
         for sig in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()',
             'fn locked<R>','fn locked_with_guard<R>','pub struct Credit','fn admit_service(',
@@ -60,18 +60,18 @@ class CandidatePublicationProgress(unittest.TestCase):
             'fn service_baseline_activation_at(']:
             pieces.append(function(execution,sig).replace('super::deadline::','deadline::'))
         pieces += [re.search(r'^static BASELINE_RETRY_ACTIVE:.*;$',execution,re.M)[0],
-            '#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/deadline.rs'))+'] mod deadline;',
+            '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/deadline.rs'))+'] mod deadline;',
             'fn lifecycle_turn(_: &mut State) {panic!("lifecycle outside candidate fixture")}']
         pieces += [function(unified,sig) for sig in ['fn mechanism_progress(','fn progress(',
             'fn finish_service(','fn service_work<R>','fn service_start(']]
-        modules='\n'.join('#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks'/name))+'] mod '+name[:-3]+';' for name in ['owner_gate.rs','service_authority.rs'])
+        modules='\n'.join('#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks'/name))+'] mod '+name[:-3]+';' for name in ['owner_gate.rs','service_authority.rs'])
         program=(ROOT/'tests/host/baseline_progress_harness.rs').read_text().replace('// PRODUCTION_BODIES',modules+'\n'+'\n'.join(pieces))
         replay='struct Guard;\n'+'\n'.join(function(owner,sig) for sig in ['impl Drop for Guard','fn lock()','fn with<T>','pub fn service_step()','fn publish_drain_hint(','pub(super) fn drain_pending('])
         replay+='\n'+re.search(r'^static DRAIN_PENDING:.*;$',owner,re.M)[0]
         replay+='\n'+function(owner,'pub(super) fn service_pending(')
         replay+='\n'+re.search(r'^static SERVICE_PENDING:.*;$',owner,re.M)[0]
         program=program.replace('// REPLAY_BODIES',replay)
-        facade=(ROOT/'kernel/src/learning_replay.rs').read_text()
+        facade=(ROOT/'kernel/src/runtime/learning/learning_replay.rs').read_text()
         program=program.replace('// REPLAY_HINT_READER',function(facade,'pub fn baseline_activation_pending(')+'\npub fn owned_drain_pending()->bool{false}\n'+function(facade,'pub fn admission_progress_pending('))
         reader=function(program,'mod domain_control {')
         program=program.replace(reader,'''mod domain_control {pub mod replay {pub fn baseline_activation_pending()->bool{
@@ -84,11 +84,11 @@ class CandidatePublicationProgress(unittest.TestCase):
         support=(ROOT/'tests/host/candidate_paid_support.rs').read_text()
         support=support.replace('// PAID_CONTROL_WITH',function(control,'fn with<T>'))
         support=support.replace('// PAID_ROOT_SUPPORT',root_support().split('pub fn candidate_poll_scenario()',1)[0])
-        warm=function((ROOT/'kernel/src/learning_workload/owner.rs').read_text(),'fn warm(')
+        warm=function((ROOT/'kernel/src/runtime/learning/learning_workload/owner.rs').read_text(),'fn warm(')
         support=support.replace('// PAID_REAL_WARM',warm)
         # Use a const key in the fixture's static ID, never alter real ApplyId.
         support=support.replace('action_index:0,target:group(12)','action_index:0,target:key(12)')
-        program+='\n#[path='+json.dumps(str(ROOT/'kernel/src/learning_evidence/execution_trace.rs'))+'] pub(crate) mod candidate_trace;\n'+support
+        program+='\n#[path='+json.dumps(str(ROOT/'kernel/src/runtime/learning/learning_evidence/execution_trace.rs'))+'] pub(crate) mod candidate_trace;\n'+support
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-paid-progress"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\nsha2="=0.10.9"\n[workspace]\n')
@@ -115,17 +115,17 @@ class CandidatePublicationProgress(unittest.TestCase):
                 self.assertIn(failure,negative.stdout+negative.stderr)
 
     def test_submitted_identity_terminal_updates_and_prepublication_activate(self):
-        task=(ROOT/'kernel/src/domain_tasks.rs').read_text()
-        control=(ROOT/'kernel/src/domain_control.rs').read_text()
-        owner=(ROOT/'kernel/src/learning_replay/owner.rs').read_text()
+        task=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
+        owner=(ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
         template=(ROOT/'tests/host/execution_trace_hooks_harness.rs').read_text()
         pieces=[re.search(r'^static LOCK:.*;$',task,re.M)[0],
-            '#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/owner_gate.rs'))+'] mod owner_gate;']
+            '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))+'] mod owner_gate;']
         pieces += [function(task,s) for s in ['struct Guard','impl Guard','impl Drop for Guard',
             'fn acquire_guard()','fn locked<R>','fn locked_with_guard<R>','fn complete_locked(']]
         program=template[:template.index('mod warm {')]
         program=program.replace(function(program,'mod replay {'),'')
-        program=program.replace('// TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/learning_evidence/execution_trace.rs'))+'] pub(crate) mod trace;')
+        program=program.replace('// TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/learning/learning_evidence/execution_trace.rs'))+'] pub(crate) mod trace;')
         program=program.replace('// TASK_BODIES','\n'.join(pieces))
         program=program.replace('struct State {owner:Owner,registry:Registry}', 'pub struct State {owner:Owner,registry:Registry}')
         program=program.replace('struct Registry; impl Registry {','static REGISTRY_FAIL:AtomicBool=AtomicBool::new(false);\nstruct Registry; impl Registry {')
@@ -144,10 +144,10 @@ class CandidatePublicationProgress(unittest.TestCase):
         resolved=function(control,"impl<S: PublicationScope> Executor<'_, S>")
         resolved=resolved.replace("impl<S: PublicationScope> Executor<'_, S>",'impl Executor')
         publication=publication.replace('// NATIVE_RESOLVED_SLOT',resolved)
-        publication=publication.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
+        publication=publication.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/submission.rs'))+'] mod submission;')
         # Keep the real diagnostic call and its Job input. This Root bridge
         # does not begin a diagnostic row or prove publication-cost accounting.
-        publication+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
+        publication+='\n#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
         publish=function(control,'fn publish(&mut self, plan: &Plan, version: u64, at: u64)')
         cutoff=publish.index('        for (index, d) in plan.iter().enumerate() {',publish.index('self.scope.commit('));cutoff=publish.rfind('\n',0,cutoff)+1
         suffix=publish[publish.rfind('\n        })();'):] if 'let result = (|| {' in publish else '\n}'
@@ -181,7 +181,7 @@ pub fn scenario(){replay::reset();let(mut executor,wire)=fixture(100,1);
         program+='\nfn main(){trace::begin(RUN,Family{domain:1,kind:1},key(12),STAMP.snapshot_ns);task::initialize();match std::env::args().nth(1).unwrap_or_default().as_str(){"denial_scope"=>control::replay::stale_scope_scenario(),"root"=>control::replay::scenario(),"renewal"=>control::replay::renewal_scenario(),"publish"=>control::publication::scenario(),"activate"=>candidate_owner::scenario(),_=>control::candidate_poll_scenario()}}\n'
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);evidence=d/'evidence.rs'
-            evidence.write_text((ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
+            evidence.write_text((ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()+'\npub fn candidate_stale_header()->[u64;36]{core::array::from_fn(|i|get(220+i))}\n')
             program=program.replace('// ACTUAL_DOMAIN_EVIDENCE','#[path='+json.dumps(str(evidence))+'] mod domain_evidence;')
             source=d/'harness.rs';source.write_text(program)
             (d/'Cargo.toml').write_text('[package]\nname="candidate-initial"\nversion="0.1.0"\nedition="2024"\n[[bin]]\nname="initial"\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')

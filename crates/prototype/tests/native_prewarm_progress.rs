@@ -1,6 +1,6 @@
 //! Production scheduling seams with explicit host ownership/credit fixtures.
 //! No replay receipt, label or adoption authority is created.
-#[path = "../../../kernel/src/learning_replay/prewarm_progress.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/prewarm_progress.rs"]
 mod progress;
 use progress::{Owner, Queue, Reason};
 fn owner() -> Owner {
@@ -147,7 +147,7 @@ fn optional_piece_follows_every_general_rotation_even_when_credit_denied() {
     );
 }
 
-#[path = "../../../kernel/src/domain_tasks/service_authority.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/service_authority.rs"]
 mod authority;
 #[test]
 fn additional_callback_uses_real_fresh_service_credit_and_settles_it_once() {

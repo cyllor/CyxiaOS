@@ -16,7 +16,7 @@ class UnifiedBuilder(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         subprocess.run(['git', 'init', '--quiet', str(root)], check=True)
-        sources = {'Cargo.lock': 'lock', 'kernel/src/smp.rs': 'smp',
+        sources = {'Cargo.lock': 'lock', 'kernel/src/arch/aarch64/smp.rs': 'smp',
                    'crates/arch-aarch64/src/user.rs': 'user', **entries}
         for name, content in sources.items():
             path = root / name
@@ -25,11 +25,11 @@ class UnifiedBuilder(unittest.TestCase):
         return root
 
     def test_code_manifest_retains_build_and_crypto_but_excludes_mutable_evidence(self):
-        entries={'Cargo.lock':'a','kernel/build.rs':'b','kernel/src/unified.rs':'c','user/prototype-cluster/vendor/ring/build.rs':'d','user/prototype-cluster/vendor/ring/pregenerated/a.S':'e','user/prototype-cluster/tools/build.sh':'f','user/prototype-cluster/vendor/ring/crypto/limbs/limbs.inl':'f1','user/prototype-cluster/vendor/ring/crypto/fipsmodule/ec/ecp_nistz384.inl':'f2','user/custom/model.weights':'f3','.cargo/config.toml':'f4','rust-toolchain.toml':'f5','docs/evidence.md':'g','tools/verify_unified.py':'h','tests/host/test_v13_disk.py':'i','crates/prototype/tests/foo.rs':'j'}
+        entries={'Cargo.lock':'a','kernel/build.rs':'b','kernel/src/runtime/cluster/unified.rs':'c','user/prototype-cluster/vendor/ring/build.rs':'d','user/prototype-cluster/vendor/ring/pregenerated/a.S':'e','user/prototype-cluster/tools/build.sh':'f','user/prototype-cluster/vendor/ring/crypto/limbs/limbs.inl':'f1','user/prototype-cluster/vendor/ring/crypto/fipsmodule/ec/ecp_nistz384.inl':'f2','user/custom/model.weights':'f3','.cargo/config.toml':'f4','rust-toolchain.toml':'f5','docs/evidence.md':'g','tools/verify_unified.py':'h','tests/host/test_v13_disk.py':'i','crates/prototype/tests/foo.rs':'j'}
         root = self.source_tree(entries)
         result = build.code_source_map(root)
         self.assertEqual(set(result), set(list(entries)[:11]) |
-                         {'kernel/src/smp.rs', 'crates/arch-aarch64/src/user.rs'})
+                         {'kernel/src/arch/aarch64/smp.rs', 'crates/arch-aarch64/src/user.rs'})
         for name, digest in result.items():
             self.assertEqual(digest, hashlib.sha256((root / name).read_bytes()).hexdigest())
 
@@ -59,6 +59,36 @@ class UnifiedBuilder(unittest.TestCase):
         link.parent.mkdir()
         link.symlink_to(root / 'Cargo.lock')
         with self.assertRaisesRegex(ValueError, 'missing, linked, or external'):
+            build.code_source_map(root)
+
+    def test_declared_unstaged_rename_binds_replacement_and_migration(self):
+        old, new = 'kernel/src/fixture.rs', 'kernel/src/runtime/fixture.rs'
+        root = self.source_tree({old: 'before'})
+        subprocess.run(['git', 'add', '.'], cwd=root, check=True)
+        (root / new).parent.mkdir(parents=True)
+        (root / old).rename(root / new)
+        manifest = root / 'kernel/layout-migration.json'
+        manifest.write_text(json.dumps(dict(version=1, moves={old: new})))
+        sources = build.code_source_map(root)
+        self.assertNotIn(old, sources)
+        self.assertIn(new, sources)
+        self.assertIn('kernel/layout-migration.json', sources)
+        (root / new).unlink()
+        with self.assertRaisesRegex(ValueError, 'missing kernel migration replacement'):
+            build.code_source_map(root)
+
+    def test_migration_cannot_hide_missing_non_kernel_sources_or_ambiguous_moves(self):
+        root = self.source_tree({'user/model.weights': 'model'})
+        subprocess.run(['git', 'add', '.'], cwd=root, check=True)
+        (root / 'user/model.weights').unlink()
+        manifest = root / 'kernel/layout-migration.json'
+        manifest.write_text(json.dumps(dict(version=1, moves={'user/model.weights': 'Cargo.lock'})))
+        with self.assertRaisesRegex(ValueError, 'escaping kernel migration path'):
+            build.code_source_map(root)
+        manifest.write_text(json.dumps(dict(version=1, moves={
+            'kernel/src/one.rs': 'kernel/src/runtime/new.rs',
+            'kernel/src/two.rs': 'kernel/src/runtime/new.rs'})))
+        with self.assertRaisesRegex(ValueError, 'ambiguous kernel migration destination'):
             build.code_source_map(root)
     def test_identity_metadata_checks_actual_public_pin_without_private_bytes(self):
         with tempfile.TemporaryDirectory() as temp:

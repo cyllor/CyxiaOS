@@ -91,8 +91,8 @@ class NetworkPieceTrace(unittest.TestCase):
             self.assertIn('1 passed; 0 failed', result.stdout)
 
     def test_actual_network_pieces_keep_original_bills_and_stages(self):
-        task = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
-        unified = (ROOT / 'kernel/src/unified.rs').read_text()
+        task = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        unified = (ROOT / 'kernel/src/runtime/cluster/unified.rs').read_text()
         pieces = ['static LOCK: ResettableGate = ResettableGate(core::cell::UnsafeCell::new(owner_gate::Gate::new()));']
         pieces += [function(task, sig) for sig in ['struct Guard', 'impl Guard',
             'impl Drop for Guard', 'fn acquire_guard()', 'fn locked<R>', 'fn locked_with_guard<R>',
@@ -104,10 +104,10 @@ class NetworkPieceTrace(unittest.TestCase):
             'fn resume_network_service(', 'fn network_turn(', 'fn finish_service(']]
         if 'fn finish_network_service(' in unified:
             pieces.append(function(unified, 'fn finish_network_service('))
-        pieces.append('#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
+        pieces.append('#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
         template = (ROOT / 'tests/host/network_piece_trace_harness.rs').read_text()
         template = template.replace('// PRODUCTION_BODIES', '\n'.join(pieces))
-        module = ROOT / 'kernel/src/network_diagnostics.rs'
+        module = ROOT / 'kernel/src/diagnostics/network_diagnostics.rs'
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             diagnostic = directory / 'network.rs'

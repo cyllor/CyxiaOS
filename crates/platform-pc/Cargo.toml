@@ -1,0 +1,10 @@
+[package]
+name = "cyxia-platform-pc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cyxia-contracts = { path = "../contracts" }
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+cyxia-arch-x86_64 = { path = "../arch-x86_64" }

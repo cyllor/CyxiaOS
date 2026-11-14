@@ -1,7 +1,7 @@
 //! Host regression of the production D15 registration, Governance and real
 //! ConsolePump executor. Clock, UART and protected callback ownership are
 //! explicit fixtures; this does not claim native A16 execution evidence.
-#[path = "../../../kernel/src/domain_services/console_baseline.rs"]
+#[path = "../../../kernel/src/runtime/services/domain_services/console_baseline.rs"]
 mod console_baseline;
 #[path = "support/learning.rs"]
 mod support;

@@ -1,6 +1,6 @@
 //! The same lookup-error classification used by the protected replay root.
 //! These checks create neither publication receipts nor replay samples.
-#[path = "../../../kernel/src/domain_control/replay/verification.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/replay/verification.rs"]
 mod verification;
 use cyxia_prototype::{domains::Error, learning};
 

@@ -14,7 +14,7 @@ pub mod cpu {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/control_pool.rs"]
+#[path = "../../../kernel/src/runtime/control/control_pool.rs"]
 mod actual_pool;
 pub mod control_pool {
     pub use super::actual_pool::{
@@ -38,10 +38,10 @@ pub mod control_pool {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/model_bank.rs"]
+#[path = "../../../kernel/src/runtime/learning/model_bank.rs"]
 mod model_bank;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/learning_driver.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/learning_driver.rs"]
 mod native_driver;
 #[path = "support/learning.rs"]
 mod support;

@@ -46,12 +46,19 @@ abi-trace = []
 large-memory = ["cyxia-posix/large-memory", "cyxia-platform-virt/large-memory"]
 
 [dependencies]
+cyxia-contracts = { path = "../crates/contracts" }
+cyxia-kernel-core = { path = "../crates/kernel-core" }
+cyxia-control-model = { path = "../crates/control-model" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+cyxia-arch-x86_64 = { path = "../crates/arch-x86_64" }
+cyxia-platform-pc = { path = "../crates/platform-pc" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
 cyxia-peer-billing = { path = "../crates/peer-billing", optional = true }
 sha2 = { version = "=0.10.9", default-features = false, optional = true }
 cyxia-cluster-transport = { path = "../crates/cluster-transport", optional = true }
 cyxia-prototype = { path = "../crates/prototype", features = ["hardware-sha256"] }
-cyxia-contracts = { path = "../crates/contracts" }
-cyxia-kernel-core = { path = "../crates/kernel-core" }
 cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }
 cyxia-platform-virt = { path = "../crates/platform-virt" }
 cyxia-driver-pl011 = { path = "../crates/driver-pl011" }
@@ -61,4 +68,3 @@ cyxia-ai-runtime = { path = "../crates/ai-runtime" }
 cyxia-posix = { path = "../crates/posix" }
 cyxia-ai-fs = { path = "../crates/ai-fs" }
 cyxia-driver-virtio = { path = "../crates/driver-virtio" }
-cyxia-control-model = { path = "../crates/control-model" }

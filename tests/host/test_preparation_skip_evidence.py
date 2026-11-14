@@ -19,7 +19,7 @@ class PreparationSkipEvidence(unittest.TestCase):
             harness = directory / "harness.rs"
             harness.write_text(
                 "#[path="
-                + json.dumps(str(ROOT / "kernel/src/domain_control/preparation_skip.rs"))
+                + json.dumps(str(ROOT / "kernel/src/runtime/control/domain_control/preparation_skip.rs"))
                 + "] mod preparation_skip;\n"
             )
             (directory / "Cargo.toml").write_text(

@@ -20,8 +20,8 @@ from test_governance_billing_priority import function
 class FailedBaselineRenewal(unittest.TestCase):
     def test_failed_unstarted_renewal_is_not_an_installed_lease(self):
         template = (ROOT / 'tests/host/execution_trace_hooks_harness.rs').read_text()
-        control = (ROOT / 'kernel/src/domain_control.rs').read_text()
-        replay = (ROOT / 'kernel/src/domain_control/replay.rs').read_text()
+        control = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
+        replay = (ROOT / 'kernel/src/runtime/control/domain_control/replay.rs').read_text()
         prefix = template[:template.index('mod task {')]
         body = function(template, 'mod control {')
         body = body.replace(function(body, 'fn apply('), '''fn apply(_:Action,_:ApplyId,_:PolicyStamp,_:u64)->Result<ExecutionState,Error>{
@@ -64,7 +64,7 @@ class FailedBaselineRenewal(unittest.TestCase):
         prefix = prefix.replace('Ok(None) }', 'Ok(Some(())) }', 1)
         prefix = prefix.replace('let actual = super::timer::cpu_ticks() - start;',
             'let actual = super::timer::cpu_ticks() - start; super::control::PAID_PREFIX_CPU.store(actual,super::Ordering::Relaxed);')
-        trace = ROOT / 'kernel/src/learning_evidence/execution_trace.rs'
+        trace = ROOT / 'kernel/src/runtime/learning/learning_evidence/execution_trace.rs'
         prefix = prefix.replace('// TRACE_MODULE', '#[path=' + json.dumps(str(trace)) + '] mod trace;')
         code = prefix + body + '\nfn main(){control::renewal::scenarios();}\n'
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,0 +1,66 @@
+name: V0.17 x86 development
+
+on:
+  push:
+    branches: [CyxiaOS-V0.17]
+  pull_request:
+    branches: [CyxiaOS-V0.17]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v17-x86-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install pinned toolchain and dependencies
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component clippy --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Verify layout and version
+        run: |
+          test "$(cat VERSION)" = 0.17.0-dev
+          python3 -B tools/check_kernel_layout.py
+          git diff --check
+      - name: Shared runtime and PC component tests
+        run: |
+          cargo test --locked --offline -p cyxia-kernel-core -p cyxia-prototype -p cyxia-peer-billing -p cyxia-arch-x86_64 -p cyxia-platform-pc -p cyxia-arch --features cyxia-prototype/hardware-sha256
+          python3 -B -m unittest discover -s tools -p test_x86_64.py -v
+      - name: Build PC images and enforce clippy
+        run: |
+          python3 -B tools/build.py --output artifacts/v017-ci-dev
+          python3 -B tools/build.py --profile release --output artifacts/v017-ci-release
+          cargo clippy --locked --offline -p cyxia-kernel --target x86_64-unknown-none --features selftest -- -D warnings
+      - name: Record exact source
+        if: always()
+        run: |
+          mkdir -p artifacts/v017-source
+          git rev-parse HEAD > artifacts/v017-source/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v017-source/tree.txt
+          git archive --format=tar.gz --prefix=CyxiaOS-V0.17/ --output=artifacts/v017-source/source.tar.gz HEAD
+          sha256sum artifacts/v017-source/source.tar.gz > artifacts/v017-source/source.sha256
+      - name: Retain build and source evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v017-x86-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          retention-days: 3
+          path: |
+            artifacts/v017-ci-dev/
+            artifacts/v017-ci-release/
+            artifacts/v017-source/
+      # QEMU/KVM execution is a separate source-bound native capture, not implied by CI build success.

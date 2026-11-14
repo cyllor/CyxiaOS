@@ -16,12 +16,12 @@ use cyxia_prototype::{
 };
 use std::sync::{Mutex, mpsc};
 
-#[path = "../../../kernel/src/domain_tasks/publication.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/publication.rs"]
 #[allow(dead_code)]
 mod publication;
-#[path = "../../../kernel/src/domain_tasks/service_authority.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/service_authority.rs"]
 mod service_authority;
-#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/target_batch.rs"]
 #[allow(dead_code)]
 mod target_batch;
 #[allow(dead_code)]

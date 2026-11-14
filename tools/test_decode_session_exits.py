@@ -42,7 +42,7 @@ fn main() {
  words[0]=0x435958554e493031; words[1]=7; words[6]=201; words[30]=2;
  words[432..].copy_from_slice(&bank);
  for word in words { std::io::stdout().write_all(&word.to_le_bytes()).unwrap(); }
-}'''.replace('HELPER', str(root / 'kernel/src/unified_session_exit.rs'))
+}'''.replace('HELPER', str(root / 'kernel/src/runtime/cluster/unified_session_exit.rs'))
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory)
             (path / 'fixture.rs').write_text(source)

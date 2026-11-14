@@ -5,5 +5,5 @@ mod domain_platform {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_evidence.rs"]
+#[path = "../../../kernel/src/diagnostics/domain_evidence.rs"]
 mod domain_evidence;

@@ -1,5 +1,5 @@
 //! Production transition seams with host fixtures; never creates training labels.
-#[path = "../../../kernel/src/learning_replay/collection_profile.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/collection_profile.rs"]
 mod collection_profile;
 use collection_profile::{CollectionProfile as P, ReleaseFacts};
 #[test]
@@ -63,7 +63,7 @@ fn every_trial_obligation_blocks_completion() {
     assert!(clean.complete()); // repeated final poll is idempotent
 }
 
-#[path = "../../../kernel/src/prototype_runtime/learning_turn_fence.rs"]
+#[path = "../../../kernel/src/runtime/control/prototype_runtime/learning_turn_fence.rs"]
 mod learning_turn_fence;
 #[test]
 fn released_input_does_not_acknowledge_unsettled_paid_turn() {

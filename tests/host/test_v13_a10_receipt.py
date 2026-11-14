@@ -245,7 +245,7 @@ class A10OfflineReceipt(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             request, build = self.identity_fixture(root)
-            build['code_source_map']['kernel/src/smp.rs'] = '0' * 64
+            build['code_source_map']['kernel/src/arch/aarch64/smp.rs'] = '0' * 64
             (root / 'source-manifest.json').write_text(json.dumps(build['code_source_map']))
             (root / 'build-manifest.json').write_text(json.dumps(build))
             for key, name in (('source_manifest_sha256', 'source-manifest.json'),

@@ -1,0 +1,3496 @@
+//! Control CPUs own proposal publication. Isolated EL0 scores immutable candidates; executors
+//! report real completion independently, with no inference in business paths.
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
+use cyxia_arch_aarch64::timer;
+use cyxia_prototype::{
+    domains::stability::{Boundary, Guard as StabilityGuard, ServiceWindow, WindowOutcome},
+    domains::{Action, ApplyId, Error, ObjectKey, POLICY_NS, PolicyStamp, WINDOW_NS},
+    features::{DomainObservation, RawFeatures, TargetFeatures},
+    learning::{self, SchemaBinding, Schemas, governance::CommitGate},
+    policy::{
+        self, Candidate, CandidateSet, ExecutionState, ModelBinding, PlanView,
+        PreparedCandidateSet, Publisher, Registry, Snapshot,
+    },
+    policy_wire::{self, Decision, Envelope, PlanHeader},
+};
+use sha2::{Digest, Sha256};
+#[repr(transparent)]
+struct DiagnosticRow<const N: usize>(UnsafeCell<[u64; N]>);
+unsafe impl<const N: usize> Sync for DiagnosticRow<N> {}
+impl<const N: usize> DiagnosticRow<N> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; N]))
+    }
+    fn store(&self, offset: usize, value: u64) {
+        // Each row has one CPU writer and is consumed only from a stopped
+        // failure snapshot. Volatile preserves the external evidence writes
+        // without introducing a translated atomic helper into the measured
+        // preparation path.
+        unsafe {
+            self.0.get().cast::<u64>().add(offset).write_volatile(value);
+        }
+    }
+}
+#[repr(C, align(64))]
+struct PreparationEvidence([DiagnosticRow<8>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_EVIDENCE: PreparationEvidence =
+    PreparationEvidence([const { DiagnosticRow::new() }; 2]);
+#[repr(C, align(64))]
+struct PreparationDetail([DiagnosticRow<16>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_DETAIL: PreparationDetail =
+    PreparationDetail([const { DiagnosticRow::new() }; 2]);
+#[repr(C, align(64))]
+struct PreparationPrefixDetail([DiagnosticRow<8>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_PREFIX_DETAIL: PreparationPrefixDetail =
+    PreparationPrefixDetail([const { DiagnosticRow::new() }; 2]);
+#[repr(C, align(64))]
+struct PreparationEntryDetail([DiagnosticRow<8>; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_ENTRY_DETAIL: PreparationEntryDetail =
+    PreparationEntryDetail([const { DiagnosticRow::new() }; 2]);
+const _: () = assert!(core::mem::size_of::<PreparationEvidence>() == 128);
+const _: () = assert!(core::mem::size_of::<PreparationDetail>() == 256);
+const _: () = assert!(core::mem::size_of::<PreparationPrefixDetail>() == 128);
+const _: () = assert!(core::mem::size_of::<PreparationEntryDetail>() == 128);
+#[repr(C, align(64))]
+struct PreparationContextRow {
+    payload: UnsafeCell<[u64; 7]>,
+    published: AtomicU64,
+}
+unsafe impl Sync for PreparationContextRow {}
+impl PreparationContextRow {
+    const fn new() -> Self {
+        Self {
+            payload: UnsafeCell::new([0; 7]),
+            published: AtomicU64::new(0),
+        }
+    }
+    fn store(&self, offset: usize, value: u64) {
+        // This row has exactly one CPU writer and no live Rust reader. The
+        // independent verifier reads it only from a stopped guest snapshot;
+        // published is the release validity word for partial live updates.
+        unsafe {
+            self.payload
+                .get()
+                .cast::<u64>()
+                .add(offset)
+                .write_volatile(value);
+        }
+    }
+}
+#[repr(C, align(64))]
+struct PreparationContext([PreparationContextRow; 2]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_CONTEXT: PreparationContext =
+    PreparationContext([const { PreparationContextRow::new() }; 2]);
+const _: () = assert!(core::mem::size_of::<PreparationContextRow>() == 64);
+const _: () = assert!(core::mem::size_of::<PreparationContext>() == 128);
+fn preparation_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_DETAIL.0[cpu - 1];
+    if phase + 1 < 16 {
+        // A zero terminator distinguishes this invocation from stale tail
+        // slots without rewriting the complete diagnostic row on every paid
+        // preparation turn. Markers are emitted in strict phase order.
+        row.store(phase + 1, 0);
+    }
+    // The coarse preparation bank retains wall-clock ordering. This detailed
+    // bank uses the patched per-vCPU execution counter so MTTCG descheduling
+    // cannot hide which preparation substage consumed the prepaid CPU credit.
+    // Each bank has one CPU writer and is consumed only from a stopped failure
+    // snapshot whose credit record is the publication boundary.
+    row.store(phase, timer::cpu_ticks());
+}
+fn preparation_prefix_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_PREFIX_DETAIL.0[cpu - 1];
+    if phase + 1 < 8 {
+        row.store(phase + 1, 0);
+    }
+    row.store(phase, timer::cpu_ticks());
+}
+fn preparation_entry_detail(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_ENTRY_DETAIL.0[cpu - 1];
+    if phase + 1 < 8 {
+        row.store(phase + 1, 0);
+    }
+    row.store(phase, timer::cpu_ticks());
+}
+fn preparation_phase(phase: usize) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_EVIDENCE.0[cpu - 1];
+    if phase + 1 < 8 {
+        row.store(phase + 1, 0);
+    }
+    row.store(phase, now());
+}
+fn clear_preparation_context() {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    // Word 7 is the release-published validity/start field. Clearing it makes
+    // the older payload in words 0..6 explicitly invalid until the next
+    // preparation_lookup/preparation_context publication completes.
+    DOMAIN_PREPARATION_CONTEXT.0[cpu - 1]
+        .published
+        .store(0, Ordering::Release);
+}
+fn preparation_lookup(family: usize, descriptor: Family, ordinal: usize, started: u64) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let source = match descriptor.target_source {
+        TargetSource::Tasks => 1,
+        TargetSource::Services => 2,
+        TargetSource::Network => 3,
+        TargetSource::Storage => 4,
+        TargetSource::Platform => 5,
+    };
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
+    for (offset, value) in [
+        family as u64 + 1,
+        u64::from(descriptor.domain),
+        u64::from(descriptor.kind),
+        source,
+        ordinal as u64,
+        0,
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        row.store(offset, value);
+    }
+    row.published.store(started, Ordering::Release);
+}
+fn preparation_context(family: usize, descriptor: Family, target: ObjectKey, started: u64) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
+    for (offset, value) in [
+        family as u64 + 1,
+        u64::from(descriptor.domain),
+        u64::from(descriptor.kind),
+        target.id,
+        target.generation,
+        0,
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        row.store(offset, value);
+    }
+    row.published.store(started, Ordering::Release);
+}
+fn preparation_current(current: Action) {
+    let cpu = cyxia_arch_aarch64::cpu::slot();
+    if !(1..=2).contains(&cpu) {
+        return;
+    }
+    let (_, _, a, b) = current.order();
+    let row = &DOMAIN_PREPARATION_CONTEXT.0[cpu - 1];
+    row.store(5, a);
+    row.store(6, b);
+}
+#[path = "domain_control/core_replay.rs"]
+pub mod core_replay;
+#[path = "domain_control/dependencies.rs"]
+mod dependencies;
+#[path = "domain_control/dispatch.rs"]
+mod dispatch;
+#[path = "domain_control/governance.rs"]
+pub mod governance;
+#[path = "domain_control/learning.rs"]
+pub mod learning_coordinator;
+#[path = "domain_control/learning_driver.rs"]
+pub mod learning_driver;
+#[path = "domain_control/publication_cost.rs"]
+mod publication_cost;
+#[path = "domain_control/replay.rs"]
+pub mod replay;
+#[path = "domain_control/reply.rs"]
+mod reply;
+#[path = "domain_control/submission.rs"]
+mod submission;
+#[path = "domain_control/target_batch.rs"]
+pub(crate) mod target_batch;
+pub use target_batch::Source as TargetSource;
+#[path = "domain_control/preparation.rs"]
+mod preparation;
+#[path = "domain_control/preparation_skip.rs"]
+mod preparation_skip;
+use preparation_skip::Reason as Skip;
+// Serialized by the same protected control-owner gate as State. This is an
+// explicit negative preparation record, never a proposal or execution receipt.
+static mut PREPARATION_REJECTIONS: preparation::Rejections = preparation::Rejections::new();
+/// Header: magic, count, overwritten, seqlock, version, row words, capacity, 0.
+/// Sixteen 40-word explicit rejected preparations follow; no proposal is implied.
+#[repr(C, align(64))]
+struct PreparationRejections([core::sync::atomic::AtomicU64; 648]);
+#[used]
+#[unsafe(no_mangle)]
+static DOMAIN_PREPARATION_REJECTIONS: PreparationRejections =
+    PreparationRejections([const { core::sync::atomic::AtomicU64::new(0) }; 648]);
+pub use cyxia_prototype::policy::{BoundDependency, Prerequisite};
+type DependencyResolver = fn(ObjectKey) -> Result<[Option<Prerequisite>; 2], Error>;
+/// Optional control-preparation projection. It must perform the same owner,
+/// current-action, legality and admission checks as the generic path while
+/// collapsing repeated immutable owner reads into one bounded snapshot.
+type DependencyBinder = fn(ObjectKey, u64) -> Result<[Option<BoundDependency>; 2], Error>;
+type ExecutionObserver = fn(ObjectKey, u64) -> Result<(), Error>;
+static ADMISSION: dependencies::AdmissionView = dependencies::AdmissionView::new();
+static DEPENDENCY_RESOLVERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+#[path = "../../../../user/prototype-runtime/abi.rs"]
+mod abi;
+
+#[derive(Clone, Copy)]
+pub struct Family {
+    pub domain: u16,
+    pub kind: u16,
+    pub target_source: TargetSource,
+    pub target: fn(u16, u16, usize) -> Option<ObjectKey>,
+    pub observe: fn(u16, ObjectKey) -> Result<DomainObservation, Error>,
+    pub current: fn(u16, u16, ObjectKey) -> Result<Action, Error>,
+    pub legal: fn(Action, ObjectKey, u64) -> Result<(), Error>,
+    pub legal_options:
+        fn(&[Option<Action>], ObjectKey, u64, &mut [Option<Action>]) -> Result<usize, Error>,
+    pub target_features: fn(Action, ObjectKey) -> Result<TargetFeatures, Error>,
+    pub apply: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
+    pub reconcile: fn(Action, ApplyId, PolicyStamp, u64) -> Result<ExecutionState, Error>,
+}
+fn skip(
+    family: usize,
+    descriptor: Family,
+    target: Option<ObjectKey>,
+    wall_started: u64,
+    reason: Skip,
+    error: Option<Error>,
+) {
+    if (descriptor.domain, descriptor.kind) != (8, 1) {
+        return;
+    }
+    preparation_skip::record(
+        family,
+        descriptor.domain,
+        descriptor.kind,
+        target,
+        wall_started,
+        reason,
+        error,
+    );
+}
+#[derive(Clone, Copy, Default)]
+pub struct Context {
+    pub core_generation: u64,
+    pub ledger_generation: u64,
+    /// CoreSet ledger generation alone, without the task-resource term folded
+    /// into `ledger_generation`. Pre-execution freshness compares this term so
+    /// ordinary task churn cannot strand an otherwise valid plan.
+    pub owner_ledger_generation: u64,
+    pub control_mask: u64,
+    pub business_mask: u64,
+    pub healthy_mask: u64,
+    pub draining_mask: u64,
+    pub common: [u64; 8],
+}
+#[derive(Clone, Copy)]
+struct Desired {
+    action: Action,
+    apply: ApplyId,
+    stamp: PolicyStamp,
+    state: ExecutionState,
+    execution_observed: bool,
+    started: bool,
+    first_entry_ns: Option<u64>,
+    observed_ns: u64,
+    published: u64,
+    evidence: Option<usize>,
+    job: u64,
+    model: ModelBinding,
+    dependencies: [Option<BoundDependency>; 2],
+    core_generation: u64,
+    ledger_generation: u64,
+    /// Ownership term captured at publication. Not part of the plan wire.
+    owner_ledger_generation: u64,
+}
+struct Owner {
+    families: [Option<Family>; 18],
+    family_epochs: [u64; 18],
+    desired: [Option<Desired>; 512],
+    stability: [Option<StabilityGuard>; 512],
+    stability_high: usize,
+    context: Context,
+    prepared: [usize; 16],
+    prepared_count: usize,
+    poll_cursor: usize,
+    dependencies: [Option<DependencyResolver>; 16],
+    dependency_binders: [Option<DependencyBinder>; 16],
+    execution_observers: [Option<ExecutionObserver>; 16],
+}
+#[derive(Clone, Copy)]
+struct Job {
+    cpu: usize,
+    set: CandidateSet,
+    sequence: u64,
+    controller: u64,
+    base_version: u64,
+    started: u64,
+    encode_ns: u64,
+    publication_debit: policy::CpuTime,
+    evidence: Option<usize>,
+    dependencies: [Option<BoundDependency>; 2],
+    work: Option<core_replay::WorkId>,
+    read_only: bool,
+    completion: Option<JobCompletion>,
+}
+#[derive(Clone, Copy)]
+struct JobCompletion {
+    result: Result<u64, Error>,
+    selected: u64,
+    decoded_ns: u64,
+    elapsed_ns: u64,
+    cpu_ns: u64,
+    output_hash: [u8; 32],
+    aborted: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct JobSource {
+    pub owner: ObjectKey,
+    pub class: learning::reward::CpuClass,
+    pub work: Option<core_replay::WorkId>,
+}
+fn job_source(job: &Job) -> JobSource {
+    JobSource {
+        owner: if job.read_only {
+            core_replay::CORE_OWNER
+        } else {
+            job.set.target
+        },
+        class: if job.read_only {
+            learning::reward::CpuClass::ExecutorWork
+        } else {
+            learning::reward::CpuClass::Policy
+        },
+        work: job.work,
+    }
+}
+struct State {
+    registry: Registry,
+    models: crate::model_bank::ModelBank<crate::model_bank::NativeMemory>,
+    model_gate: Option<CommitGate>,
+    learning_jobs: learning_coordinator::Jobs,
+    governance_jobs: governance::Jobs,
+    worker_sequence: u64,
+    owner: Owner,
+    boot: u64,
+    sequence: u64,
+    job: Option<Job>,
+    preparation: Option<preparation::Pending>,
+    due: [u64; 18],
+    cursor: [usize; 18],
+    family_cursor: usize,
+    started: u64,
+}
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+static mut STATE: State = State {
+    registry: Registry::empty(),
+    models: crate::model_bank::ModelBank::new(crate::model_bank::NativeMemory),
+    model_gate: None,
+    learning_jobs: learning_coordinator::Jobs::new(),
+    governance_jobs: governance::Jobs::new(),
+    worker_sequence: 0,
+    owner: Owner {
+        families: [None; 18],
+        family_epochs: [0; 18],
+        desired: [None; 512],
+        stability: [None; 512],
+        stability_high: 0,
+        context: Context {
+            core_generation: 0,
+            ledger_generation: 0,
+            owner_ledger_generation: 0,
+            control_mask: 0,
+            business_mask: 0,
+            healthy_mask: 0,
+            draining_mask: 0,
+            common: [0; 8],
+        },
+        prepared: [0; 16],
+        prepared_count: 0,
+        poll_cursor: 0,
+        dependencies: [None; 16],
+        dependency_binders: [None; 16],
+        execution_observers: [None; 16],
+    },
+    boot: 0,
+    sequence: 0,
+    job: None,
+    preparation: None,
+    due: [0; 18],
+    cursor: [0; 18],
+    family_cursor: 0,
+    started: 0,
+};
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {
+        replay::publish_baseline_activation_hint();
+        CLAIMED.store(false, Ordering::Release);
+    }
+}
+fn with<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
+    if cyxia_arch_aarch64::cpu::slot() >= 4 {
+        return Err(Error::Auth);
+    }
+    if CLAIMED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(Error::Busy);
+    }
+    let _guard = Guard;
+    f(unsafe { &mut *core::ptr::addr_of_mut!(STATE) })
+}
+fn now() -> u64 {
+    crate::domain_platform::now_ns()
+}
+fn require_control(owner: &Owner) -> Result<(), Error> {
+    let bit = 1u64 << cyxia_arch_aarch64::cpu::slot();
+    if owner.context.control_mask & owner.context.healthy_mask & !owner.context.draining_mask & bit
+        == 0
+    {
+        Err(Error::Auth)
+    } else {
+        Ok(())
+    }
+}
+fn family_index(domain: u16, kind: u16) -> Result<usize, Error> {
+    match (domain, kind) {
+        (1, 1) => Ok(0),
+        (1, 2) => Ok(1),
+        (2..=15, 1) => Ok(domain as usize),
+        (16, 1) => Ok(16),
+        (16, 2) => Ok(17),
+        _ => Err(Error::Unsupported),
+    }
+}
+fn publisher(epoch: u64) -> Publisher {
+    Publisher {
+        object: ObjectKey {
+            id: 0x43414350,
+            generation: epoch,
+        },
+        controller_epoch: epoch,
+    }
+}
+pub fn init(boot: u64) -> Result<(), Error> {
+    if !crate::boot_recovery::activation_allowed(boot) {
+        return Err(Error::Auth);
+    }
+    if boot == 0 {
+        return Err(Error::Auth);
+    }
+    if !cyxia_arch_aarch64::sha256::selftest()
+        || <[u8; 32]>::from(Sha256::digest(abi::domain_model_bytes()))
+            != cyxia_prototype::boot_model::PARAMETER_HASH
+    {
+        return Err(Error::Schema);
+    }
+    // The actual driver remains idle without protected replay data. Do this
+    // before publishing boot readiness so a Busy startup can retry its loan.
+    learning_driver::init()?;
+    crate::learning_canary::init()?;
+    crate::service_windows::init()?;
+    with(|s| {
+        if s.boot != 0 {
+            return if s.boot == boot {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        let model = ModelBinding {
+            generation: 1,
+            model_hash: Sha256::digest(abi::domain_model_bytes()).into(),
+            schema_hash: Sha256::digest(include_bytes!("../../../../crates/prototype/src/features.rs"))
+                .into(),
+        };
+        let schemas = Schemas {
+            feature: SchemaBinding {
+                version: 13,
+                hash: model.schema_hash,
+            },
+            action: SchemaBinding {
+                version: 13,
+                hash: Sha256::digest(include_bytes!("../../../../crates/prototype/src/policy_wire.rs"))
+                    .into(),
+            },
+            reward: learning::reward_schema(),
+            learning: learning::learning_config(),
+        };
+        // Provision the actual four-bank backing before exposing Registry. A
+        // Busy retry retains every already allocated page and exact identity.
+        s.models
+            .initialize(boot, model, schemas, &abi::domain_model_bytes())?;
+        let gate = CommitGate::new(boot, model).map_err(|_| Error::Schema)?;
+        s.registry.initialize(boot, publisher(1), model)?;
+        s.model_gate = Some(gate);
+        s.boot = boot;
+        s.started = now();
+        crate::domain_evidence::initialize(boot, model);
+        Ok(())
+    })
+}
+pub type NativeModelPin = crate::model_bank::ModelPin<crate::control_pool::Lease>;
+/// The immutable parameters are selected by the exact outstanding job, never
+/// by an EL0 pointer, echoed model hash, or the newest Active after a restart.
+pub fn pin_job_model(sequence: u64, controller: u64) -> Result<NativeModelPin, Error> {
+    with(|s| {
+        require_control(&s.owner)?;
+        let job = s.job.as_ref().ok_or(Error::NotReady)?;
+        if job.cpu != cyxia_arch_aarch64::cpu::slot()
+            || job.sequence != sequence
+            || job.controller != controller
+        {
+            return Err(Error::Auth);
+        }
+        let gate = s.model_gate.as_ref().ok_or(Error::NotReady)?;
+        if gate.active() != s.registry.model() || s.models.active()? != s.registry.model() {
+            return Err(Error::Stale);
+        }
+        gate.check_active_publication(job.set.model, job.set.target)
+            .map_err(|_| Error::Stale)?;
+        s.models.pin(job.set.model)
+    })
+}
+/// Runtime calls this after the exact context has stopped, its model mapping
+/// and TLB entry are revoked, and the final physical/control bill has settled.
+/// Busy leaves the caller's original, non-clonable pin live for retry.
+pub fn release_job_model(pin: &NativeModelPin) -> Result<(), Error> {
+    with(|s| s.models.release(pin))
+}
+pub fn register(family: Family) -> Result<(), Error> {
+    with(|s| {
+        if s.boot == 0 {
+            return Err(Error::NotReady);
+        }
+        let i = family_index(family.domain, family.kind)?;
+        if TargetSource::for_family(family.domain, family.kind) != Some(family.target_source) {
+            return Err(Error::Conflict);
+        }
+        if let Some(old) = s.owner.families[i] {
+            return if old.domain == family.domain
+                && old.kind == family.kind
+                && old.target_source == family.target_source
+                && core::ptr::fn_addr_eq(old.target, family.target)
+                && core::ptr::fn_addr_eq(old.observe, family.observe)
+                && core::ptr::fn_addr_eq(old.current, family.current)
+                && core::ptr::fn_addr_eq(old.legal, family.legal)
+                && core::ptr::fn_addr_eq(old.legal_options, family.legal_options)
+                && core::ptr::fn_addr_eq(old.target_features, family.target_features)
+                && core::ptr::fn_addr_eq(old.apply, family.apply)
+                && core::ptr::fn_addr_eq(old.reconcile, family.reconcile)
+            {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        s.owner.families[i] = Some(family);
+        // Registered callbacks are fixed for this boot. This is the executor's
+        // protected registration epoch, independent of each target's lifetime.
+        s.owner.family_epochs[i] = s.boot;
+        crate::domain_evidence::registered(i);
+        Ok(())
+    })
+}
+
+pub fn register_dependencies(consumer: u16, resolver: DependencyResolver) -> Result<(), Error> {
+    if !matches!(consumer, 1 | 4 | 8 | 10) {
+        return Err(Error::Unsupported);
+    }
+    with(|s| {
+        let slot = &mut s.owner.dependencies[usize::from(consumer - 1)];
+        if let Some(old) = *slot {
+            return if core::ptr::fn_addr_eq(old, resolver) {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        *slot = Some(resolver);
+        DEPENDENCY_RESOLVERS[usize::from(consumer - 1)].store(resolver as usize, Ordering::Release);
+        Ok(())
+    })
+}
+/// Register a control-only collapsed dependency projection. The ordinary
+/// executor resolver remains authoritative for hot-path admission and is not
+/// replaced by this optimization.
+pub fn register_dependency_binder(consumer: u16, binder: DependencyBinder) -> Result<(), Error> {
+    if !matches!(consumer, 1 | 4 | 8 | 10) {
+        return Err(Error::Unsupported);
+    }
+    with(|s| {
+        let slot = &mut s.owner.dependency_binders[usize::from(consumer - 1)];
+        if let Some(old) = *slot {
+            return if core::ptr::fn_addr_eq(old, binder) {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        *slot = Some(binder);
+        Ok(())
+    })
+}
+/// Confirm the exact APPLIED version to the owner of real resource grants.
+/// The callback must be idempotent and nonblocking. Busy/Again/NotReady retain
+/// the receipt for retry; another policy for this object cannot replace it.
+/// Existing grants keep their own confirmation across later policy versions.
+pub fn register_execution_observer(domain: u16, observer: ExecutionObserver) -> Result<(), Error> {
+    if !matches!(domain, 5 | 9) {
+        return Err(Error::Unsupported);
+    }
+    with(|s| {
+        let slot = &mut s.owner.execution_observers[usize::from(domain - 1)];
+        if let Some(old) = *slot {
+            return if core::ptr::fn_addr_eq(old, observer) {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if s.owner
+            .desired
+            .iter()
+            .flatten()
+            .any(|d| d.action.domain() == domain)
+        {
+            return Err(Error::Conflict);
+        }
+        *slot = Some(observer);
+        Ok(())
+    })
+}
+fn execution_blocks_replacement(d: &Desired) -> bool {
+    !d.state.terminal() || d.state == ExecutionState::Applied && !d.execution_observed
+}
+fn observe_execution(s: &mut State, d: &mut Desired) {
+    if d.state != ExecutionState::Applied || d.execution_observed {
+        return;
+    }
+    let result = s.owner.execution_observers[usize::from(d.action.domain() - 1)]
+        .map_or(Ok(()), |observer| observer(d.apply.target, d.stamp.version));
+    match result {
+        Ok(()) => d.execution_observed = true,
+        Err(Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound) => {}
+        Err(error) => {
+            // The resource already exists. Preserve its real APPLIED receipt
+            // and obligations while stopping further optimization on a broken
+            // owner-confirmation contract.
+            s.registry.stop_optimization();
+            crate::domain_evidence::observer_failed(d.action.domain(), d.stamp.version, error);
+        }
+    }
+}
+/// Call while holding the actual prerequisite owner's resource gate, after
+/// checking its initialized baseline, ownership, current capacity and usage.
+/// Existing in-flight completion/recovery must not pass through this new-work gate.
+pub fn admit_dependency(prerequisite: Prerequisite, consumer: u16, at: u64) -> Result<u64, Error> {
+    ADMISSION.admit(prerequisite, consumer, at)
+}
+/// Resolve before taking a consumer lock. Resolution validates initialized
+/// baseline owners; this method never takes the coordinator/policy gate.
+pub fn admit_dependencies(consumer: u16, target: ObjectKey) -> Result<(), Error> {
+    let address = DEPENDENCY_RESOLVERS
+        .get(usize::from(
+            consumer.checked_sub(1).ok_or(Error::Unsupported)?,
+        ))
+        .ok_or(Error::Unsupported)?
+        .load(Ordering::Acquire);
+    if address == 0 {
+        return Err(Error::NotReady);
+    }
+    // Only register_dependencies writes a statically typed function address;
+    // release/acquire publication prevents observing a partially installed resolver.
+    let resolver: DependencyResolver = unsafe { core::mem::transmute(address) };
+    for prerequisite in resolver(target)?.into_iter().flatten() {
+        admit_dependency(prerequisite, consumer, now())?;
+    }
+    Ok(())
+}
+fn bind_dependencies(
+    owner: &Owner,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+) -> Result<[Option<BoundDependency>; 2], Error> {
+    if !matches!(action.domain(), 1 | 4 | 8 | 10) || matches!(action, Action::ControlSet(_)) {
+        return Ok([None; 2]);
+    }
+    let dependency_slot = usize::from(action.domain() - 1);
+    if let Some(binder) = owner.dependency_binders[dependency_slot] {
+        return binder(target, at);
+    }
+    let resolver = owner.dependencies[dependency_slot].ok_or(Error::NotReady)?;
+    bind_dependency_list(
+        owner,
+        action,
+        at,
+        resolver(target)?,
+        |f, key| (f.current)(f.domain, f.kind, key),
+        |f, value, key| (f.legal)(value, key, at),
+    )
+}
+fn bind_dependency_list(
+    owner: &Owner,
+    action: Action,
+    at: u64,
+    prerequisites: [Option<Prerequisite>; 2],
+    mut current: impl FnMut(Family, ObjectKey) -> Result<Action, Error>,
+    mut legal: impl FnMut(Family, Action, ObjectKey) -> Result<(), Error>,
+) -> Result<[Option<BoundDependency>; 2], Error> {
+    let mut bound = [None; 2];
+    for (i, prerequisite) in prerequisites.into_iter().enumerate() {
+        let Some(prerequisite) = prerequisite else {
+            continue;
+        };
+        if !policy::dependency_allowed(prerequisite.domain, action.domain()) {
+            return Err(Error::Unsupported);
+        }
+        let f = owner.families[family_index(prerequisite.domain, 1)?].ok_or(Error::NotReady)?;
+        let value = current(f, prerequisite.target)?;
+        legal(f, value, prerequisite.target)?;
+        let version = admit_dependency(prerequisite, action.domain(), at)?;
+        bound[i] = Some(BoundDependency {
+            prerequisite,
+            version,
+        });
+    }
+    Ok(bound)
+}
+pub fn publish_context(context: Context) -> Result<(), Error> {
+    with(|s| {
+        if context.core_generation == 0
+            || context.ledger_generation == 0
+            || context.control_mask & context.business_mask != 0
+        {
+            return Err(Error::Conflict);
+        }
+        if context.core_generation < s.owner.context.core_generation
+            || context.ledger_generation < s.owner.context.ledger_generation
+        {
+            return Err(Error::Stale);
+        }
+        s.owner.context = context;
+        Ok(())
+    })
+}
+fn locate(owner: &Owner, action: Action, key: ObjectKey) -> Option<usize> {
+    locate_family(owner, action.domain(), action.kind(), key)
+}
+fn locate_family(owner: &Owner, domain: u16, kind: u16, key: ObjectKey) -> Option<usize> {
+    owner.stability[..owner.stability_high]
+        .iter()
+        .position(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(|guard| guard.family() == (domain, kind) && guard.target() == key)
+        })
+}
+fn located_slot_matches(owner: &Owner, slot: usize, action: Action, target: ObjectKey) -> bool {
+    owner.stability.get(slot).is_some_and(|guard| {
+        guard.as_ref().is_some_and(|guard| {
+            guard.family() == (action.domain(), action.kind()) && guard.target() == target
+        })
+    })
+}
+fn ensure_stability(
+    owner: &mut Owner,
+    action: Action,
+    key: ObjectKey,
+    at: u64,
+) -> Result<usize, Error> {
+    if let Some(slot) = locate(owner, action, key) {
+        if action == Action::OfferCpu(0) {
+            owner.stability[slot]
+                .as_mut()
+                .ok_or(Error::Stale)?
+                .observe_stopped_offer(at)?;
+        }
+        return Ok(slot);
+    }
+    let slot = owner.stability[..owner.stability_high]
+        .iter()
+        .enumerate()
+        .position(|(i, guard)| guard.is_none() && owner.desired[i].is_none())
+        .unwrap_or(owner.stability_high);
+    if slot == owner.stability.len() {
+        return Err(Error::Capacity);
+    }
+    owner.stability[slot] = Some(StabilityGuard::new(key, action, at)?);
+    owner.stability_high = owner.stability_high.max(slot + 1);
+    Ok(slot)
+}
+/// A protected service owner freezes its measurement bounds before the first
+/// window. There are no synthetic default throughput or latency observations.
+pub fn register_service_boundary(
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+    boundary: Boundary,
+    starts_at_ns: u64,
+) -> Result<(), Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    with(|s| {
+        let f = s.owner.families[family_index(domain, kind)?].ok_or(Error::NotReady)?;
+        let current = (f.current)(domain, kind, target)?;
+        let at = now();
+        let slot = ensure_stability(&mut s.owner, current, target, at)?;
+        s.owner.stability[slot]
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .register_boundary(boundary, starts_at_ns, at)
+    })
+}
+/// A window registration may be recycled only after its exact owner generation
+/// has disappeared. This is a read-only query: live generations retain their
+/// sticky Guard, and unresolved execution or inference still pins the target.
+pub fn service_target_retired(domain: u16, kind: u16, target: ObjectKey) -> Result<bool, Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    with(|s| {
+        let f = s.owner.families[family_index(domain, kind)?].ok_or(Error::NotReady)?;
+        if s.job.as_ref().is_some_and(|job| {
+            job.set.target == target
+                && job.set.get(0).is_some_and(|candidate| {
+                    candidate.action.domain() == domain && candidate.action.kind() == kind
+                })
+        }) {
+            return Err(Error::Busy);
+        }
+        if let Some(slot) = locate_family(&s.owner, domain, kind, target)
+            && (s.owner.prepared[..s.owner.prepared_count].contains(&slot)
+                || s.owner.desired[slot]
+                    .as_ref()
+                    .is_some_and(|desired| !desired.state.terminal()))
+        {
+            return Err(Error::Busy);
+        }
+        // The same exact-owner predicate used by the service-step Guard
+        // collector. Busy, unavailable ownership and UNKNOWN are not death.
+        match (f.current)(domain, kind, target) {
+            Err(Error::Stale | Error::NotFound) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(error),
+        }
+    })
+}
+/// Consume owner-measured complete windows; partial and missing evidence never
+/// becomes a successful service-boundary observation. Freeze preserves APPLY.
+pub fn observe_service_window(window: ServiceWindow) -> Result<WindowOutcome, Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    with(|s| {
+        let f =
+            s.owner.families[family_index(window.domain, window.kind)?].ok_or(Error::NotReady)?;
+        let current = (f.current)(window.domain, window.kind, window.target)?;
+        let slot = locate(&s.owner, current, window.target).ok_or(Error::NotReady)?;
+        s.owner.stability[slot]
+            .as_mut()
+            .ok_or(Error::Stale)?
+            .observe_service(window, now())
+    })
+}
+fn tiers(current: Action) -> ([Option<Action>; 32], usize) {
+    let mut out = [None; 32];
+    let mut n = 0;
+    let mut add = |a| {
+        out[n] = Some(a);
+        n += 1;
+    };
+    match current {
+        Action::CpuWeight(_) => {
+            for v in [1, 2, 4, 8] {
+                add(Action::CpuWeight(v));
+            }
+        }
+        Action::ControlSet(mask) => {
+            add(Action::ControlSet(mask));
+            add(Action::ControlSet(mask ^ 4));
+        }
+        Action::SpawnTokens(_) => {
+            for v in [1, 2, 4, 8] {
+                add(Action::SpawnTokens(v));
+            }
+        }
+        Action::Cache { .. } => {
+            for (pages, batch) in [(64, 4), (256, 16), (1024, 32), (4096, 64)] {
+                add(Action::Cache { pages, batch });
+            }
+        }
+        Action::Filesystem { .. } => {
+            for (readahead, flush) in [(0, 4), (2, 8), (8, 16), (16, 32)] {
+                add(Action::Filesystem { readahead, flush });
+            }
+        }
+        Action::Ipc { .. } => {
+            for (budget, batch) in [(8, 1), (32, 4), (64, 8), (128, 16)] {
+                add(Action::Ipc { budget, batch });
+            }
+        }
+        Action::IrqTarget(_) => {
+            for v in 0..4 {
+                add(Action::IrqTarget(v));
+            }
+        }
+        Action::SoftCoalesce(_) => {
+            for v in [0, 50, 200, 1000] {
+                add(Action::SoftCoalesce(v));
+            }
+        }
+        Action::ServiceBatch(_) => {
+            for v in [1, 2, 4, 8] {
+                add(Action::ServiceBatch(v));
+            }
+        }
+        Action::IoShare(_) => {
+            for v in [100, 250, 500, 750] {
+                add(Action::IoShare(v));
+            }
+        }
+        Action::TxBatch(_) => {
+            for v in [1, 4, 8, 16] {
+                add(Action::TxBatch(v));
+            }
+        }
+        Action::NotifyBatch(_) => {
+            for v in [1, 2, 4, 8] {
+                add(Action::NotifyBatch(v));
+            }
+        }
+        Action::UnauthRate(_) => {
+            for v in [4, 8, 16, 32] {
+                add(Action::UnauthRate(v));
+            }
+        }
+        Action::BackgroundBudget(_) => {
+            for v in [50, 100, 200, 400] {
+                add(Action::BackgroundBudget(v));
+            }
+        }
+        Action::RecoveryRecipe(_) => {
+            for v in 0..3 {
+                add(Action::RecoveryRecipe(v));
+            }
+        }
+        Action::ConsoleBatch(_) => {
+            for v in [1, 8, 32, 64] {
+                add(Action::ConsoleBatch(v));
+            }
+        }
+        Action::OfferCpu(_) => {
+            for v in [100, 250, 500, 1000] {
+                add(Action::OfferCpu(v));
+            }
+        }
+        Action::Placement(_) => {
+            for v in 0..3 {
+                add(Action::Placement(v));
+            }
+        }
+    }
+    (out, n)
+}
+fn categorical(action: Action) -> bool {
+    matches!(
+        action,
+        Action::IrqTarget(_) | Action::RecoveryRecipe(_) | Action::Placement(_)
+    )
+}
+fn validate_selection(
+    owner: &Owner,
+    f: Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+) -> Result<(), Error> {
+    let slot = locate(owner, action, target).ok_or(Error::Stale)?;
+    validate_selection_at(owner, f, action, target, at, slot)
+}
+fn validate_selection_at(
+    owner: &Owner,
+    f: Family,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    slot: usize,
+) -> Result<(), Error> {
+    validate_selection_with_at(
+        owner,
+        action,
+        target,
+        at,
+        slot,
+        || (f.current)(action.domain(), action.kind(), target),
+        |options, output| (f.legal_options)(options, target, at, output),
+    )
+}
+fn validate_selection_with(
+    owner: &Owner,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    current: impl FnOnce() -> Result<Action, Error>,
+    legal_options: impl FnOnce(&[Option<Action>], &mut [Option<Action>]) -> Result<usize, Error>,
+) -> Result<(), Error> {
+    let slot = locate(owner, action, target).ok_or(Error::Stale)?;
+    validate_selection_with_at(owner, action, target, at, slot, current, legal_options)
+}
+fn validate_selection_with_at(
+    owner: &Owner,
+    action: Action,
+    target: ObjectKey,
+    at: u64,
+    slot: usize,
+    current: impl FnOnce() -> Result<Action, Error>,
+    legal_options: impl FnOnce(&[Option<Action>], &mut [Option<Action>]) -> Result<usize, Error>,
+) -> Result<(), Error> {
+    let guard = owner
+        .stability
+        .get(slot)
+        .and_then(Option::as_ref)
+        .ok_or(Error::Stale)?;
+    if guard.family() != (action.domain(), action.kind()) || guard.target() != target {
+        return Err(Error::Stale);
+    }
+    let current = current()?;
+    if action == current {
+        return Ok(());
+    }
+    if guard.frozen() {
+        return Err(Error::Busy);
+    }
+    if categorical(action) {
+        return Ok(());
+    }
+    let hold = if matches!(action, Action::ControlSet(_) | Action::UnauthRate(_)) {
+        1_000_000_000
+    } else {
+        WINDOW_NS
+    };
+    if at.saturating_sub(guard.last_change_ns()) < hold {
+        return Err(Error::Busy);
+    }
+    let (options, n) = tiers(current);
+    let mut legal = [None; 32];
+    let count = legal_options(&options[..n], &mut legal)?;
+    legal[..count].sort_unstable_by_key(|a| a.map(Action::order));
+    if !cyxia_prototype::domains::stability::adjacent(current, action, &legal[..count])? {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+fn read_target_batch(
+    source: TargetSource,
+    queries: &[target_batch::Query],
+    output: &mut [Option<ObjectKey>],
+) -> Result<(), Error> {
+    match source {
+        TargetSource::Tasks => crate::domain_tasks::queued_targets(queries, output),
+        TargetSource::Services => crate::domain_services::queued_targets(queries, output),
+        TargetSource::Network => crate::domain_network::queued_targets(queries, output),
+        TargetSource::Storage => crate::domain_storage::queued_targets(queries, output),
+        TargetSource::Platform => crate::domain_platform::queued_targets(queries, output),
+    }
+}
+fn queued_control_wcet_us(s: &State, active_family: usize, at: u64) -> Result<u64, Error> {
+    // A released family slot remains required work even if its object walk later
+    // records EMPTY or its legal-candidate set is empty. Use the scheduler's own
+    // due table for this deterministic WCET feature instead of synchronously
+    // borrowing all five object owners. Actual targets, generations, replay/model
+    // gates and replacement blockers are checked when each family starts.
+    target_batch::queued_wcet_us(active_family, at, |index| {
+        s.owner.families[index].map(|_| s.due[index])
+    })
+}
+pub fn next(controller_epoch: u64) -> Result<Option<[u64; 512]>, Error> {
+    let wall_started = now();
+    let cpu_started = timer::cpu_ticks();
+    let mut input = [0; 512];
+    let ready = with(|s| {
+        next_locked(
+            s,
+            controller_epoch,
+            None,
+            wall_started,
+            cpu_started,
+            &mut input,
+        )
+    })?;
+    Ok(ready.then_some(input))
+}
+pub(crate) fn next_paid(
+    controller_epoch: u64,
+    witness: &core_replay::PaidWorkWitness,
+    wall_started: u64,
+    cpu_started: u64,
+    input: &mut [u64; 512],
+) -> Result<Option<JobSource>, Error> {
+    // The sole native caller starts both clocks before initializing this
+    // invocation-owned buffer and consumes its bytes only after Some(source).
+    with(|s| {
+        if !next_locked(
+            s,
+            controller_epoch,
+            Some(witness),
+            wall_started,
+            cpu_started,
+            input,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(job_source(s.job.as_ref().ok_or(Error::Stale)?)))
+    })
+}
+fn next_locked(
+    s: &mut State,
+    controller_epoch: u64,
+    witness: Option<&core_replay::PaidWorkWitness>,
+    wall_started: u64,
+    cpu_started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
+    let result = next_locked_inner(
+        s,
+        controller_epoch,
+        witness,
+        wall_started,
+        cpu_started,
+        input,
+    );
+    if let Some(pending) = s.preparation.as_mut() {
+        // Every failed retry retains its actual CPU span. Reward/physical CPU
+        // accounting remains with the original paid Measurement, exactly once.
+        let at = now();
+        let debit = pending.charge(timer::cpu_elapsed_ns(cpu_started));
+        let terminal = debit
+            .err()
+            .or_else(|| match &result {
+                Err(error) if !matches!(error, Error::Busy | Error::Again | Error::NotReady) => {
+                    Some(*error)
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                if pending.is_first_candidate() {
+                    pending.check(pending.identity, at).err()
+                } else {
+                    None
+                }
+            });
+        if let Some(error) = terminal {
+            retire_preparation(s, error, at)?;
+            return Err(error);
+        }
+        s.due[pending.family] = pending.snapshot.taken_ns;
+        s.cursor[pending.family] = pending.ordinal;
+        s.family_cursor = pending.family;
+    }
+    result
+}
+fn retire_preparation(s: &mut State, reason: Error, at: u64) -> Result<(), Error> {
+    let pending = s.preparation.ok_or(Error::Stale)?;
+    if let Some(work) = pending.identity.work {
+        // A changed WorkId is already outside this attempt's authority; the
+        // rejected old identity is still retained without touching its successor.
+        match core_replay::reject_preparation(work, pending.identity.sequence, reason, at) {
+            Ok(()) | Err(Error::Stale) => (),
+            Err(error) => return Err(error),
+        }
+    } else {
+        replay::reject_preparation(pending.identity, pending.snapshot, reason);
+    }
+    if (pending.identity.domain, pending.identity.kind) == (1, 2) && pending.identity.work.is_none()
+    {
+        core_replay::retire_primary_preparation(pending.identity, reason)?;
+    }
+    let (retired, total, overwritten) = unsafe {
+        let journal = &mut *core::ptr::addr_of_mut!(PREPARATION_REJECTIONS);
+        (
+            journal.retire(pending, reason, at, s.sequence)?,
+            journal.total,
+            journal.overwritten,
+        )
+    };
+    let bank = &DOMAIN_PREPARATION_REJECTIONS.0;
+    bank[3].fetch_add(1, Ordering::AcqRel);
+    let row = preparation::Rejected {
+        pending,
+        reason,
+        retired_ns: at,
+    }
+    .words(total);
+    let base = 8 + ((total - 1) as usize % 16) * 40;
+    for (destination, value) in bank[base..base + 40].iter().zip(row) {
+        destination.store(value, Ordering::Relaxed);
+    }
+    for (index, value) in [0x4359_5052_4550_3133, total, overwritten]
+        .into_iter()
+        .enumerate()
+    {
+        bank[index].store(value, Ordering::Relaxed);
+    }
+    for (index, value) in [1, 40, 16, 0].into_iter().enumerate() {
+        bank[4 + index].store(value, Ordering::Relaxed);
+    }
+    bank[3].fetch_add(1, Ordering::Release);
+    s.sequence = s.sequence.max(retired.sequence);
+    s.due[retired.family] = retired.due_ns;
+    s.cursor[retired.family] = retired.ordinal;
+    s.family_cursor = retired.next_family;
+    s.preparation = None;
+    Ok(())
+}
+fn preparation_identity(
+    s: &State,
+    controller: u64,
+    domain: u16,
+    kind: u16,
+    target: ObjectKey,
+    sequence: u64,
+    work: Option<core_replay::WorkId>,
+) -> preparation::Identity {
+    preparation::Identity {
+        boot: s.boot,
+        controller,
+        sequence,
+        domain,
+        kind,
+        target,
+        model: s.registry.model(),
+        core_generation: s.owner.context.core_generation,
+        ledger_generation: s.owner.context.ledger_generation,
+        work: work.map(core_replay::WorkId::identity),
+    }
+}
+fn preparation_snapshot(
+    s: &mut State,
+    identity: preparation::Identity,
+    fresh: Snapshot,
+) -> Result<Snapshot, Error> {
+    let Some(pending) = s.preparation else {
+        return Ok(fresh);
+    };
+    if pending.identity != identity {
+        // An actual owner/model/context change abandons the old attempt. Its
+        // paid CPU is retained globally; no old debit authorizes the new key.
+        return Err(Error::Stale);
+    }
+    pending.check(identity, now())?;
+    Ok(pending.snapshot)
+}
+fn next_locked_inner(
+    s: &mut State,
+    controller_epoch: u64,
+    witness: Option<&core_replay::PaidWorkWitness>,
+    wall_started: u64,
+    cpu_started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
+    preparation_phase(0);
+    preparation_detail(0);
+    clear_preparation_context();
+    preparation_entry_detail(0);
+    require_control(&s.owner)?;
+    preparation_entry_detail(1);
+    let blocked = if s.boot == 0 {
+        1
+    } else if s.job.is_some() {
+        2
+    } else if s.registry.optimization_stopped() {
+        3
+    } else if s.governance_jobs.reserves_publication(now()) {
+        4
+    } else {
+        0
+    };
+    replay::preparation_admission(s, blocked, wall_started);
+    if blocked != 0 {
+        return Ok(false);
+    }
+    preparation_entry_detail(2);
+    if s.registry.publisher() != publisher(controller_epoch) {
+        s.registry
+            .change_publisher(s.registry.publisher(), publisher(controller_epoch))?;
+    }
+    preparation_entry_detail(3);
+    if s.preparation
+        .is_some_and(|p| p.identity.sequence != s.sequence)
+    {
+        return Err(Error::Stale);
+    }
+    if s.preparation.is_some_and(|p| p.identity.work.is_some()) {
+        return core_replay::next(
+            s,
+            controller_epoch,
+            witness.ok_or(Error::Auth)?,
+            wall_started,
+            cpu_started,
+            input,
+        );
+    }
+    preparation_entry_detail(4);
+    dispatch::normal_then_optional(
+        s,
+        input,
+        crate::a03_demand::PROFILE,
+        |s| (s.job.is_some(), s.preparation.is_some()),
+        |s, input| {
+            next_normal(
+                s,
+                controller_epoch,
+                witness,
+                wall_started,
+                cpu_started,
+                input,
+            )
+        },
+        |s, input| match witness {
+            Some(witness) => core_replay::next(
+                s,
+                controller_epoch,
+                witness,
+                wall_started,
+                cpu_started,
+                input,
+            ),
+            None => Ok(false),
+        },
+    )
+}
+// Normal and read-only preparation each own sizeable bounded candidate scratch.
+// Keep them in sibling calls: retaining the normal frame while entering replay
+// exceeds the fixed control stack even before an exception adds its frame.
+#[inline(never)]
+fn next_normal(
+    s: &mut State,
+    controller_epoch: u64,
+    witness: Option<&core_replay::PaidWorkWitness>,
+    wall_started: u64,
+    cpu_started: u64,
+    input: &mut [u64; 512],
+) -> Result<bool, Error> {
+    preparation_entry_detail(5);
+    let start_cursor = s.family_cursor;
+    let turns = if s.preparation.is_some() { 1 } else { 18 };
+    // One prepaid control turn evaluates at most one registered, due family.
+    // Skipping unavailable slots to find that family is bounded bookkeeping;
+    // continuing into another family's observation/candidate construction
+    // would silently combine multiple 2 ms evaluations in one 2.5 ms credit.
+    'families: for turn in 0..turns {
+        let index = (start_cursor + turn) % 18;
+        if wall_started < s.due[index] {
+            continue;
+        }
+        let Some(f) = s.owner.families[index] else {
+            continue;
+        };
+        let ordinal = s.cursor[index];
+        // Resolve current/fallback plus exact lookahead from one immutable
+        // owner view. A retry must never turn owner contention into absence,
+        // and the exact lookahead must not advance onto fallback ordinal zero.
+        let mut targets = [None; 2];
+        preparation_entry_detail(6);
+        let target_result = read_target_batch(
+            f.target_source,
+            &[
+                target_batch::Query::fallback(f.domain, f.kind, ordinal),
+                target_batch::Query::exact(f.domain, f.kind, ordinal + 1),
+            ],
+            &mut targets,
+        );
+        preparation_entry_detail(7);
+        if let Err(error) = target_result {
+            preparation_lookup(index, f, ordinal, wall_started);
+            // An initial lookup has no preparation retry budget. Preserve its
+            // due/object position, but let unrelated owners get the next turn.
+            // Carried preparation retains its existing identity and retry path.
+            if s.preparation.is_none() {
+                s.family_cursor = (index + 1) % 18;
+            }
+            return Err(error);
+        }
+        // Unavailable owner views consume no enumeration progress or due slot.
+        target_batch::complete_visit(
+            index,
+            wall_started,
+            ordinal,
+            targets[1].is_some(),
+            &mut s.due,
+            &mut s.family_cursor,
+            &mut s.cursor,
+        )?;
+        let target = targets[0];
+        let Some(target) = target else {
+            preparation_lookup(index, f, ordinal, wall_started);
+            skip(index, f, None, wall_started, Skip::TargetAbsent, None);
+            if s.preparation.is_some() {
+                return Err(Error::Stale);
+            }
+            break 'families;
+        };
+        preparation_context(index, f, target, wall_started);
+        preparation_detail(1);
+        preparation_prefix_detail(0);
+        if f.domain == 15 && crate::learning_canary::blocks_active() {
+            break 'families;
+        }
+        preparation_prefix_detail(1);
+        if !replay::allows_at(f.domain, f.kind, target, wall_started) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ReplayBlocked,
+                None,
+            );
+            break 'families;
+        }
+        preparation_prefix_detail(2);
+        let fresh_snapshot = Snapshot {
+            sequence: match s.preparation {
+                Some(pending) => pending.identity.sequence,
+                None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+            },
+            taken_ns: wall_started,
+            ledger_generation: s.owner.context.ledger_generation,
+            core_generation: s.owner.context.core_generation,
+        };
+        let preparation_identity = preparation_identity(
+            s,
+            controller_epoch,
+            f.domain,
+            f.kind,
+            target,
+            fresh_snapshot.sequence,
+            None,
+        );
+        preparation_prefix_detail(3);
+        let replay_snapshot = preparation_snapshot(s, preparation_identity, fresh_snapshot)?;
+        preparation_prefix_detail(4);
+        if s.preparation.is_none()
+            && replay::first_preparation(s.boot, replay_snapshot, f.domain, f.kind, target)
+        {
+            if (f.domain, f.kind) == (1, 2)
+                && !core_replay::claim_primary_preparation(preparation_identity, replay_snapshot)?
+            {
+                // A cold warmup has no first-candidate Pending. Preserve the
+                // released due slot and allow existing real warm work below.
+                s.due[index] = wall_started;
+                break 'families;
+            }
+            if let Err(error) = preparation::next_sequence(s.sequence, preparation_identity) {
+                if (f.domain, f.kind) == (1, 2) {
+                    core_replay::retire_primary_preparation(preparation_identity, error)?;
+                }
+                return Err(error);
+            }
+            s.sequence = preparation_identity.sequence;
+            s.preparation = Some(preparation::Pending::first_candidate(
+                preparation_identity,
+                replay_snapshot,
+                index,
+                ordinal,
+            ));
+        }
+        let (replay_snapshot, _replay_prefix) =
+            match replay::first(replay_snapshot, f.domain, f.kind, target) {
+                Ok(v) => v,
+                Err(error @ (Error::Again | Error::Busy | Error::NotReady)) => {
+                    // Retry the same queued first generation within its real
+                    // original deadline; no additional successful AI slot.
+                    s.due[index] = wall_started;
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::ReplayFirstRetry,
+                        Some(error),
+                    );
+                    break 'families;
+                }
+                Err(e) => return Err(e),
+            };
+        preparation_prefix_detail(5);
+        let _encoding_measure = if _replay_prefix.is_none() {
+            witness
+                .map(|w| {
+                    core_replay::Measurement::new(
+                        JobSource {
+                            owner: target,
+                            class: learning::reward::CpuClass::Policy,
+                            work: None,
+                        },
+                        w,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        preparation_prefix_detail(6);
+        preparation_detail(2);
+        // An exclusive Canary or restoration reservation suppresses new
+        // Active proposals before encoding and inference spend their CPU.
+        if s.model_gate.as_ref().is_none_or(|gate| {
+            gate.check_active_publication(s.registry.model(), target)
+                .is_err()
+        }) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ModelGateBlocked,
+                None,
+            );
+            break 'families;
+        }
+        let core_preparation = if (f.domain, f.kind) == (1, 2) {
+            match crate::domain_services::core_preparation(target) {
+                Ok(v) => Some(v),
+                Err(
+                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
+                ) => break 'families,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let timer_preparation = if (f.domain, f.kind) == (7, 1) {
+            match crate::domain_platform::timer_preparation(target, wall_started) {
+                Ok(v) => Some(v),
+                Err(
+                    Error::Busy | Error::Again | Error::NotReady | Error::Stale | Error::NotFound,
+                ) => break 'families,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let current = match (core_preparation, timer_preparation.as_ref()) {
+            (Some((current, _)), _) => current,
+            (None, Some(preparation)) => preparation.current(),
+            (None, None) => match (f.current)(f.domain, f.kind, target) {
+                Ok(v) => v,
+                Err(
+                    error @ (Error::Busy
+                    | Error::Again
+                    | Error::NotReady
+                    | Error::Stale
+                    | Error::NotFound),
+                ) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::CurrentUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        preparation_current(current);
+        preparation_detail(3);
+        let observed = match (core_preparation, timer_preparation.as_ref()) {
+            (Some((_, observed)), _) => observed,
+            (None, Some(preparation)) => preparation.observation(),
+            (None, None) => match (f.observe)(f.domain, target) {
+                Ok(v) => v,
+                Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::ObservationUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        preparation_detail(4);
+        let old = locate(&s.owner, current, target).and_then(|i| s.owner.desired[i].as_ref());
+        if old.is_some_and(execution_blocks_replacement) {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::ReplacementBlocked,
+                None,
+            );
+            break 'families;
+        }
+        let stability_slot = ensure_stability(&mut s.owner, current, target, wall_started)?;
+        let stability = s.owner.stability[stability_slot]
+            .as_ref()
+            .ok_or(Error::Stale)?;
+        let dependencies = match bind_dependencies(&s.owner, current, target, wall_started) {
+            Ok(v) => v,
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Conflict
+                | Error::Stale),
+            ) => {
+                skip(
+                    index,
+                    f,
+                    Some(target),
+                    wall_started,
+                    Skip::DependencyUnavailable,
+                    Some(error),
+                );
+                break 'families;
+            }
+            Err(e) => return Err(e),
+        };
+        preparation_detail(5);
+        let hold = if matches!(current, Action::ControlSet(_) | Action::UnauthRate(_)) {
+            1_000_000_000
+        } else {
+            WINDOW_NS
+        };
+        let held = wall_started.saturating_sub(stability.last_change_ns()) >= hold;
+        let (options, n) = tiers(current);
+        let current_only = [Some(current)];
+        // An adjacent numerical action cannot enter this candidate set before
+        // the hold expires, and no alternate may enter a frozen tier. Do not
+        // borrow its owner merely to validate an action that this same turn
+        // must discard. The current action is still revalidated normally.
+        let eligible = if stability.frozen() || !categorical(current) && !held {
+            &current_only[..]
+        } else {
+            &options[..n]
+        };
+        let mut legal = [None; 32];
+        let legal_result = match timer_preparation.as_ref() {
+            Some(preparation) => preparation.legal_options(eligible, &mut legal),
+            None => (f.legal_options)(eligible, target, wall_started, &mut legal),
+        };
+        let legal_count = match legal_result {
+            Ok(count) => count,
+            Err(
+                error @ (Error::Busy
+                | Error::Again
+                | Error::NotReady
+                | Error::Stale
+                | Error::NotFound),
+            ) => {
+                skip(
+                    index,
+                    f,
+                    Some(target),
+                    wall_started,
+                    Skip::LegalOptionsUnavailable,
+                    Some(error),
+                );
+                break 'families;
+            }
+            Err(error) => return Err(error),
+        };
+        legal[..legal_count].sort_unstable_by_key(|a| a.map(Action::order));
+        preparation_detail(6);
+        if current != Action::OfferCpu(0)
+            && !legal[..legal_count].iter().any(|a| *a == Some(current))
+        {
+            skip(
+                index,
+                f,
+                Some(target),
+                wall_started,
+                Skip::CurrentIllegal,
+                None,
+            );
+            break 'families;
+        }
+        let queued_wcet_us = match queued_control_wcet_us(s, index, wall_started) {
+            Ok(value) => value,
+            Err(error @ (Error::Busy | Error::Again | Error::NotReady)) => {
+                // Retry this same evaluation. replay::first retains its exact
+                // snapshot/deadline; the paid measurement still owns this span.
+                s.due[index] = wall_started;
+                s.cursor[index] = ordinal;
+                s.family_cursor = index;
+                if s.preparation.is_none() {
+                    preparation::next_sequence(s.sequence, preparation_identity)?;
+                    s.sequence = preparation_identity.sequence;
+                    s.preparation = Some(preparation::Pending::new(
+                        preparation_identity,
+                        replay_snapshot,
+                        index,
+                        ordinal,
+                    ));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        preparation_detail(7);
+        // A family usually emits one candidate. Do not initialize 32 complete
+        // feature records merely to obtain bounded scratch; only the prefix
+        // written below is ever exposed to CandidateSet::new.
+        let mut choices = [const { core::mem::MaybeUninit::<Candidate>::uninit() }; 32];
+        let mut count = 0;
+        let mut replay_filtered = false;
+        let mut stability_filtered = false;
+        for action in legal[..legal_count].iter().flatten().copied() {
+            if !replay::allows_action_at(action, target, wall_started) {
+                replay_filtered = true;
+                continue;
+            }
+            if action != current
+                && (stability.frozen()
+                    || (!categorical(action)
+                        && (!held
+                            || !cyxia_prototype::domains::stability::adjacent(
+                                current,
+                                action,
+                                &legal[..legal_count],
+                            )?)))
+            {
+                stability_filtered = true;
+                continue;
+            }
+            let target_features_result = match timer_preparation.as_ref() {
+                Some(preparation) => preparation.target_features(action),
+                None => (f.target_features)(action, target),
+            };
+            let mut target_features = match target_features_result {
+                Ok(v) => v,
+                Err(
+                    error @ (Error::Busy
+                    | Error::Again
+                    | Error::NotReady
+                    | Error::Stale
+                    | Error::NotFound),
+                ) => {
+                    skip(
+                        index,
+                        f,
+                        Some(target),
+                        wall_started,
+                        Skip::TargetFeaturesUnavailable,
+                        Some(error),
+                    );
+                    break 'families;
+                }
+                Err(e) => return Err(e),
+            };
+            if let Action::ControlSet(mask) = action {
+                let cores = u64::from(mask.count_ones());
+                if cores == 0 {
+                    return Err(Error::Range);
+                }
+                target_features.values[2] = Some(queued_wcet_us.div_ceil(cores));
+            }
+            let mut common = s.owner.context.common;
+            common[2] = queued_wcet_us / 2_500;
+            common[6] = 0;
+            choices[count].write(Candidate {
+                action,
+                features: RawFeatures {
+                    common,
+                    domain: observed.values,
+                    domain_present: observed.present,
+                    target: target_features,
+                    control_capacity: if let Action::ControlSet(mask) = action {
+                        Some(u64::from(mask.count_ones()) * 1000)
+                    } else {
+                        None
+                    },
+                },
+            });
+            count += 1;
+        }
+        if count == 0 {
+            let reason = if replay_filtered {
+                Skip::ActionReplayFiltered
+            } else if stability_filtered {
+                Skip::ActionStabilityFiltered
+            } else {
+                Skip::NoCandidate
+            };
+            skip(index, f, Some(target), wall_started, reason, None);
+            break 'families;
+        }
+        preparation_detail(8);
+        let sequence = match s.preparation {
+            Some(pending) => pending.identity.sequence,
+            None => s.sequence.checked_add(1).ok_or(Error::Overflow)?,
+        };
+        let snapshot = replay_snapshot;
+        if snapshot.sequence != sequence
+            || snapshot.ledger_generation != s.owner.context.ledger_generation
+            || snapshot.core_generation != s.owner.context.core_generation
+        {
+            return Err(Error::Stale);
+        }
+        // SAFETY: count is incremented only after writing the corresponding
+        // slot, never exceeds the 32 legal-action bound, and the slice cannot
+        // outlive this scratch array.
+        let initialized_choices =
+            unsafe { core::slice::from_raw_parts(choices.as_ptr().cast::<Candidate>(), count) };
+        let prepared = s.registry.prepare_candidates(
+            publisher(controller_epoch),
+            snapshot,
+            target,
+            s.registry.model(),
+            initialized_choices,
+            Some(current),
+        )?;
+        preparation_detail(9);
+        let work = core_replay::primary(prepared.candidate_set())?;
+        preparation_detail(10);
+        return encode_prepared_job(
+            s,
+            controller_epoch,
+            wall_started,
+            cpu_started,
+            snapshot,
+            prepared,
+            current,
+            dependencies,
+            work,
+            input,
+        )
+        .map(|()| true);
+    }
+    if s.preparation.is_some() {
+        return Err(Error::NotReady);
+    }
+    Ok(false)
+}
+enum JobCandidates<'a> {
+    Prepared(PreparedCandidateSet),
+    CandidateSet(&'a CandidateSet),
+}
+impl JobCandidates<'_> {
+    fn candidate_set(&self) -> &CandidateSet {
+        match self {
+            Self::Prepared(prepared) => prepared.candidate_set(),
+            Self::CandidateSet(set) => set,
+        }
+    }
+}
+#[inline(never)]
+fn encode_prepared_job(
+    s: &mut State,
+    controller_epoch: u64,
+    wall_started: u64,
+    cpu_started: u64,
+    snapshot: Snapshot,
+    prepared: PreparedCandidateSet,
+    current: Action,
+    dependencies: [Option<BoundDependency>; 2],
+    work: Option<core_replay::WorkId>,
+    input: &mut [u64; 512],
+) -> Result<(), Error> {
+    encode_job_inner(
+        s,
+        controller_epoch,
+        wall_started,
+        cpu_started,
+        snapshot,
+        JobCandidates::Prepared(prepared),
+        current,
+        dependencies,
+        work,
+        false,
+        input,
+    )
+}
+#[inline(never)]
+fn encode_job(
+    s: &mut State,
+    controller_epoch: u64,
+    wall_started: u64,
+    cpu_started: u64,
+    snapshot: Snapshot,
+    set: &CandidateSet,
+    current: Action,
+    dependencies: [Option<BoundDependency>; 2],
+    work: Option<core_replay::WorkId>,
+    read_only: bool,
+    input: &mut [u64; 512],
+) -> Result<(), Error> {
+    encode_job_inner(
+        s,
+        controller_epoch,
+        wall_started,
+        cpu_started,
+        snapshot,
+        JobCandidates::CandidateSet(set),
+        current,
+        dependencies,
+        work,
+        read_only,
+        input,
+    )
+}
+#[inline(never)]
+fn encode_job_inner(
+    s: &mut State,
+    controller_epoch: u64,
+    _wall_started: u64,
+    cpu_started: u64,
+    snapshot: Snapshot,
+    candidates: JobCandidates<'_>,
+    current: Action,
+    dependencies: [Option<BoundDependency>; 2],
+    work: Option<core_replay::WorkId>,
+    read_only: bool,
+    input: &mut [u64; 512],
+) -> Result<(), Error> {
+    preparation_phase(1);
+    let pending_set = candidates.candidate_set();
+    let sequence = snapshot.sequence;
+    let target = pending_set.target;
+    let preparation_identity = preparation_identity(
+        s,
+        controller_epoch,
+        current.domain(),
+        current.kind(),
+        target,
+        sequence,
+        if read_only { work } else { None },
+    );
+    if let Some(pending) = s.preparation {
+        pending.total(
+            preparation_identity,
+            now(),
+            timer::cpu_elapsed_ns(cpu_started),
+        )?;
+    }
+    let evidence = if read_only {
+        None
+    } else {
+        Some(
+            crate::domain_evidence::available_slot(
+                (sequence as usize - 1) % crate::domain_evidence::SLOTS,
+            )
+            .ok_or(Error::Busy)?,
+        )
+    };
+    let set = match &candidates {
+        JobCandidates::Prepared(prepared) => {
+            s.registry
+                .commit_candidates(publisher(controller_epoch), prepared)?;
+            prepared.candidate_set()
+        }
+        JobCandidates::CandidateSet(set) => {
+            if !read_only {
+                s.registry.register(publisher(controller_epoch), set)?;
+            }
+            *set
+        }
+    };
+    #[cfg(target_os = "none")]
+    if !read_only {
+        crate::boot_recovery::formal::new_key(crate::boot_recovery::formal::Key {
+            boot: s.boot,
+            controller: controller_epoch,
+            sequence,
+            target,
+            model: set.model,
+            domain: current.domain(),
+            kind: current.kind(),
+            candidate_hash: set.hash(),
+            root_version: s.registry.version(),
+            core_generation: snapshot.core_generation,
+            ledger_generation: snapshot.ledger_generation,
+            control_mask: s.owner.context.control_mask,
+        });
+    }
+    preparation_detail(11);
+    preparation_phase(2);
+    input.fill(0);
+    input[..16].copy_from_slice(&[
+        abi::INPUT_MAGIC,
+        3,
+        sequence,
+        controller_epoch,
+        snapshot.taken_ns,
+        cyxia_arch_aarch64::timer::frequency(),
+        snapshot.core_generation,
+        snapshot.ledger_generation,
+        u64::from(current.domain()),
+        u64::from(current.kind()),
+        target.id,
+        target.generation,
+        s.registry.version(),
+        set.model.generation,
+        s.boot,
+        set.len() as u64,
+    ]);
+    for (at, hash) in [(16, set.model.model_hash), (20, set.hash())] {
+        for i in 0..4 {
+            input[at + i] = u64::from_le_bytes(hash[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+    }
+    let raw = set.get(0).ok_or(Error::NotReady)?.features;
+    input[24..32].copy_from_slice(&raw.common);
+    input[32..36].copy_from_slice(&raw.domain);
+    input[40] = u64::from(raw.domain_present);
+    input[36..40].copy_from_slice(&[
+        sequence,
+        sequence,
+        sequence,
+        if current.one_shot() {
+            0
+        } else {
+            snapshot
+                .taken_ns
+                .checked_add(POLICY_NS)
+                .ok_or(Error::Overflow)?
+        },
+    ]);
+    for (i, c) in set.iter().enumerate() {
+        let at = 64 + i * 10;
+        let mut p = [0; 16];
+        input[at] = policy_wire::encode_payload(c.action, i as u16, &mut p)? as u64;
+        input[at + 1] = u64::from_le_bytes(p[..8].try_into().unwrap());
+        input[at + 2] = u64::from_le_bytes(p[8..].try_into().unwrap());
+        for j in 0..4 {
+            if let Some(v) = c.features.target.values[j] {
+                input[at + 3 + j] = v;
+                input[at + 7] |= 1 << j;
+            }
+        }
+        input[at + 8] = c.features.control_capacity.unwrap_or(0);
+    }
+    input[400..404].copy_from_slice(&[
+        s.owner.context.control_mask,
+        s.owner.context.business_mask,
+        s.owner.context.healthy_mask,
+        s.owner.context.draining_mask,
+    ]);
+    let mut prior = [0; 16];
+    input[404] = cyxia_prototype::learning::baseline::encode(current, &mut prior)
+        .map_err(|_| Error::Schema)? as u64;
+    input[405] = u64::from_le_bytes(prior[..8].try_into().unwrap());
+    input[406] = u64::from_le_bytes(prior[8..].try_into().unwrap());
+    for (i, binding) in dependencies.into_iter().enumerate() {
+        if let Some(binding) = binding {
+            input[408 + i * 4..412 + i * 4].copy_from_slice(&[
+                u64::from(binding.prerequisite.domain),
+                binding.prerequisite.target.id,
+                binding.prerequisite.target.generation,
+                binding.version,
+            ]);
+        }
+    }
+    const _: () = assert!(cfg!(target_endian = "little"));
+    preparation_detail(12);
+    preparation_phase(3);
+    // The fixed 4 KiB digest and evidence tail cannot be interrupted.
+    // Recheck before entering it, including earlier paid retry turns.
+    let cpu_elapsed = timer::cpu_elapsed_ns(cpu_started);
+    if let Some(pending) = s.preparation {
+        pending.total(preparation_identity, now(), cpu_elapsed)?;
+    } else {
+        preparation::check_decision_cpu(cpu_elapsed)?;
+    }
+    let input_bytes = unsafe { &*((input as *const [u64; 512]).cast::<[u8; 4096]>()) };
+    let input_hash = cyxia_arch_aarch64::sha256::digest_page(input_bytes)
+        .unwrap_or_else(|| Sha256::digest(input_bytes).into());
+    preparation_detail(13);
+    preparation_phase(4);
+    if let Some(pending) = s.preparation {
+        pending.total(
+            preparation_identity,
+            now(),
+            timer::cpu_elapsed_ns(cpu_started),
+        )?;
+    }
+    if let Some(work) = work {
+        core_replay::bind(work, sequence, cyxia_arch_aarch64::cpu::slot(), input_hash)?;
+    }
+    if let Some(evidence) = evidence {
+        crate::domain_evidence::begin(evidence, input, input_hash);
+        preparation_detail(14);
+        preparation_phase(5);
+        let _ = crate::learning_history::record_proposal(sequence, &set, input_bytes, input_hash);
+    } else {
+        preparation_detail(14);
+    }
+    preparation_phase(6);
+    let elapsed = timer::cpu_elapsed_ns(cpu_started);
+    let encode_ns = if let Some(pending) = s.preparation {
+        // The admission check above precedes WorkId binding. Any final owner
+        // bookkeeping is still included in the eventual accept-time bound.
+        pending.carried(preparation_identity, elapsed)?
+    } else {
+        elapsed
+    };
+    s.sequence = s.sequence.max(sequence);
+    s.job = Some(Job {
+        cpu: cyxia_arch_aarch64::cpu::slot(),
+        set: *set,
+        sequence,
+        controller: controller_epoch,
+        base_version: s.registry.version(),
+        started: snapshot.taken_ns,
+        encode_ns,
+        publication_debit: policy::CpuTime {
+            cpu: cyxia_arch_aarch64::cpu::slot(),
+            ns: 0,
+        },
+        evidence,
+        dependencies,
+        work,
+        read_only,
+        completion: None,
+    });
+    s.preparation = None;
+    preparation_detail(15);
+    preparation_phase(7);
+    Ok(())
+}
+
+struct NativeClock;
+impl policy::Clock for NativeClock {
+    fn read(&mut self) -> policy::PublicationTime {
+        policy::PublicationTime {
+            wall_ns: now(),
+            cpu: policy::CpuTime {
+                cpu: cyxia_arch_aarch64::cpu::slot(),
+                ns: timer::cpu_ns(timer::cpu_ticks()),
+            },
+        }
+    }
+}
+trait PublicationScope {
+    fn authorize_executor(&self, owner: &Owner) -> Result<(), Error> {
+        require_control(owner)
+    }
+    fn authorize_recovery<P: PlanView>(
+        &mut self,
+        _: ModelBinding,
+        _: &P,
+        _: u64,
+    ) -> Result<(), Error> {
+        Err(Error::Budget)
+    }
+    fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
+        (f.legal)(action, target, at)
+    }
+    fn dependencies(
+        &self,
+        owner: &Owner,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<[Option<BoundDependency>; 2], Error> {
+        bind_dependencies(owner, action, target, at)
+    }
+    fn authorize_baseline(
+        &mut self,
+        _: ModelBinding,
+        _: &policy::RegisteredSet,
+        _: u64,
+    ) -> Result<(), Error> {
+        Err(Error::Auth)
+    }
+    fn authorize(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error>;
+    fn selection(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<(), Error> {
+        validate_selection(owner, f, action, target, at)
+    }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        _: Option<usize>,
+    ) -> Result<(), Error> {
+        self.selection(owner, f, action, target, at)
+    }
+    /// All fallible scope checks precede the common infallible desired-root
+    /// writes. A Canary consumes its exact score receipt and quota here.
+    fn commit<P: PlanView>(
+        &mut self,
+        owner: &Owner,
+        model: ModelBinding,
+        plan: &P,
+        stamps: &[PolicyStamp],
+        boot: u64,
+        at: u64,
+    ) -> Result<(), Error>;
+}
+struct ActiveScope<'a>(&'a CommitGate);
+impl PublicationScope for ActiveScope<'_> {
+    fn authorize(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error> {
+        if set.canary_permit().is_some() || set.baseline_action().is_some() {
+            return Err(Error::Auth);
+        }
+        set.authorize_with_gate(active, self.0, at)
+    }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        slot: Option<usize>,
+    ) -> Result<(), Error> {
+        if !replay::allows_action_at(action, target, at) {
+            return Err(Error::Busy);
+        }
+        validate_selection_at(owner, f, action, target, at, slot.ok_or(Error::Stale)?)
+    }
+    fn commit<P: PlanView>(
+        &mut self,
+        _: &Owner,
+        model: ModelBinding,
+        plan: &P,
+        _: &[PolicyStamp],
+        _: u64,
+        at: u64,
+    ) -> Result<(), Error> {
+        for d in plan.iter() {
+            if d.action.domain() == 15 && crate::learning_canary::blocks_active() {
+                return Err(Error::Busy);
+            }
+            if !replay::allows_action_at(d.action, d.envelope.target, at) {
+                return Err(Error::Busy);
+            }
+            self.0
+                .check_active_publication(model, d.envelope.target)
+                .map_err(|_| Error::Busy)?;
+        }
+        Ok(())
+    }
+}
+/// Resource queries for an ordinary Active publication may share one live
+/// task-owner borrow. Model/Root authority stays with the original scope.
+struct ActivePublication<'a> {
+    active: ActiveScope<'a>,
+    task_publication: Option<crate::domain_tasks::SchedulerPublication>,
+    spawn_publication: Option<crate::domain_tasks::SpawnPublication>,
+}
+impl PublicationScope for ActivePublication<'_> {
+    fn authorize(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.active.authorize(active, set, at)
+    }
+    fn legal(&self, f: Family, action: Action, target: ObjectKey, at: u64) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return spawn.validate(action, target, at);
+        }
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => {
+                task.validate(action, target, at)
+            }
+            Some(_) => Err(Error::Unsupported),
+            None => self.active.legal(f, action, target, at),
+        }
+    }
+    fn dependencies(
+        &self,
+        owner: &Owner,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<[Option<BoundDependency>; 2], Error> {
+        let Some(task) = self.task_publication.as_ref() else {
+            return self.active.dependencies(owner, action, target, at);
+        };
+        if !matches!(action, Action::CpuWeight(_)) || owner.dependency_binders[0].is_some() {
+            return Err(Error::Unsupported);
+        }
+        // This borrow implements the registered native D13 -> D01 contract.
+        // A custom binder must use its original unborrowed path instead.
+        owner.dependencies[0].ok_or(Error::NotReady)?;
+        bind_dependency_list(
+            owner,
+            action,
+            at,
+            task.prerequisites(action, target)?,
+            |f, key| task.current(f.domain, key),
+            |_, value, key| task.validate(value, key, at),
+        )
+    }
+    fn selection(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+    ) -> Result<(), Error> {
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return validate_selection_with(
+                owner,
+                action,
+                target,
+                at,
+                || spawn.current(action.domain(), target),
+                |options, output| spawn.legal_options(options, target, at, output),
+            );
+        }
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with(
+                owner,
+                action,
+                target,
+                at,
+                || task.current(action.domain(), target),
+                |options, output| task.legal_options(options, target, at, output),
+            ),
+            Some(_) => Err(Error::Unsupported),
+            None => self.active.selection(owner, f, action, target, at),
+        }
+    }
+    fn selection_at(
+        &self,
+        owner: &Owner,
+        f: Family,
+        action: Action,
+        target: ObjectKey,
+        at: u64,
+        slot: Option<usize>,
+    ) -> Result<(), Error> {
+        let slot = slot.ok_or(Error::Stale)?;
+        if let Some(spawn) = self.spawn_publication.as_ref() {
+            return validate_selection_with_at(
+                owner,
+                action,
+                target,
+                at,
+                slot,
+                || spawn.current(action.domain(), target),
+                |options, output| spawn.legal_options(options, target, at, output),
+            );
+        }
+        match self.task_publication.as_ref() {
+            Some(task) if matches!(action, Action::CpuWeight(_)) => validate_selection_with_at(
+                owner,
+                action,
+                target,
+                at,
+                slot,
+                || task.current(action.domain(), target),
+                |options, output| task.legal_options(options, target, at, output),
+            ),
+            Some(_) => Err(Error::Unsupported),
+            None => self
+                .active
+                .selection_at(owner, f, action, target, at, Some(slot)),
+        }
+    }
+    fn commit<P: PlanView>(
+        &mut self,
+        owner: &Owner,
+        model: ModelBinding,
+        plan: &P,
+        stamps: &[PolicyStamp],
+        boot: u64,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.active.commit(owner, model, plan, stamps, boot, at)
+    }
+}
+struct Executor<'a, S: PublicationScope> {
+    owner: &'a mut Owner,
+    scope: S,
+    model: ModelBinding,
+    evidence: Option<usize>,
+    job: u64,
+    boot: u64,
+    publication_started: policy::PublicationTime,
+    publication_debit: policy::CpuTime,
+    wall_deadline: u64,
+    dependencies: [Option<BoundDependency>; 2],
+    scores: [i16; 32],
+    score_count: usize,
+    resolved_slots: [usize; 16],
+    resolved_count: usize,
+    provenance: submission::Facts,
+}
+impl<S: PublicationScope> Executor<'_, S> {
+    fn resolved_slot(&mut self, action: Action, target: ObjectKey) -> Option<usize> {
+        for &slot in &self.resolved_slots[..self.resolved_count] {
+            if located_slot_matches(self.owner, slot, action, target) {
+                return Some(slot);
+            }
+        }
+        let slot = locate(self.owner, action, target)?;
+        if self.resolved_count == self.resolved_slots.len() {
+            return None;
+        }
+        self.resolved_slots[self.resolved_count] = slot;
+        self.resolved_count += 1;
+        Some(slot)
+    }
+}
+impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
+    fn authorize_baseline(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.provenance
+            .enter(submission::Callback::AuthorizeBaseline);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ModelBinding);
+            if set.model != self.model {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_baseline(active, set, at)
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn authorize_recovery(&mut self, active: ModelBinding, plan: &P, at: u64) -> Result<(), Error> {
+        self.provenance
+            .enter(submission::Callback::AuthorizeRecovery);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_recovery(active, plan, at)
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn authorize_model(
+        &mut self,
+        active: ModelBinding,
+        set: &policy::RegisteredSet,
+        at: u64,
+    ) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::AuthorizeModel);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ModelBinding);
+            if set.model != self.model {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize(active, set, at)
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn check(&mut self, d: Decision, _: &policy::RegisteredSet, now: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Check);
+        let result = (|| {
+            self.provenance.at(submission::Stage::Context);
+            let c = self.owner.context;
+            if d.envelope.core_generation != c.core_generation
+                || d.envelope.ledger_generation != c.ledger_generation
+            {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::Family);
+            let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
+                .ok_or(Error::Unsupported)?;
+            self.provenance.at(submission::Stage::Legal);
+            self.scope.legal(f, d.action, d.envelope.target, now)?;
+            self.provenance.at(submission::Stage::Dependencies);
+            if self
+                .scope
+                .dependencies(self.owner, d.action, d.envelope.target, now)?
+                != self.dependencies
+            {
+                return Err(Error::Stale);
+            }
+            self.provenance.at(submission::Stage::OldDesired);
+            let slot = self.resolved_slot(d.action, d.envelope.target);
+            if let Some(i) = slot {
+                if self.owner.desired[i]
+                    .as_ref()
+                    .is_some_and(execution_blocks_replacement)
+                {
+                    return Err(Error::Busy);
+                }
+            }
+            self.provenance.at(submission::Stage::Selection);
+            self.scope
+                .selection_at(self.owner, f, d.action, d.envelope.target, now, slot)?;
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn prepare(&mut self, plan: &P, _: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Prepare);
+        let result = (|| {
+            self.provenance.at(submission::Stage::PrepareIndex);
+            self.owner.prepared_count = 0;
+            for d in plan.iter() {
+                let i = self
+                    .resolved_slot(d.action, d.envelope.target)
+                    .ok_or(Error::Stale)?;
+                if self.owner.prepared[..self.owner.prepared_count].contains(&i) {
+                    return Err(Error::Conflict);
+                }
+                self.owner.prepared[self.owner.prepared_count] = i;
+                self.owner.prepared_count += 1;
+            }
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn revalidate(&mut self, _: &P, _: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Revalidate);
+        // Registry's immediately preceding second validation called `check`
+        // for every decision with this exact timestamp. Native `check` is a
+        // strict superset of the old body here: context, family, legality,
+        // dependencies and selection, plus the Desired replacement guard.
+        // Nothing runs between the two callbacks, so repeating those resource
+        // callbacks cannot observe a newer state. Keep the generic callback
+        // boundary while avoiding a third identical native validation pass.
+        let result = Ok(());
+        self.provenance.returned(result);
+        result
+    }
+    fn publish(&mut self, plan: &P, version: u64, at: u64) -> Result<(), Error> {
+        self.provenance.enter(submission::Callback::Publish);
+        let result = (|| {
+            self.provenance.at(submission::Stage::ScopeAuthority);
+            self.scope.authorize_executor(self.owner)?;
+            self.provenance.at(submission::Stage::PreparedCount);
+            if self.owner.prepared_count != plan.len() {
+                return Err(Error::Conflict);
+            }
+            let mut stamps = [PolicyStamp::default(); 16];
+            for (index, d) in plan.iter().enumerate() {
+                self.provenance.at(submission::Stage::Stamp);
+                stamps[index] = PolicyStamp::for_action(
+                    d.action,
+                    version,
+                    if d.action.one_shot() {
+                        d.envelope
+                            .expires_local_ns
+                            .checked_sub(WINDOW_NS)
+                            .ok_or(Error::Format)?
+                    } else {
+                        plan.header()
+                            .active_until_local_ns
+                            .checked_sub(POLICY_NS)
+                            .ok_or(Error::Format)?
+                    },
+                    at,
+                )?;
+                self.provenance.at(submission::Stage::Family);
+                let f = self.owner.families[family_index(d.action.domain(), d.action.kind())?]
+                    .ok_or(Error::Unsupported)?;
+                self.provenance.at(submission::Stage::Selection);
+                let slot = self.resolved_slot(d.action, d.envelope.target);
+                self.scope
+                    .selection_at(self.owner, f, d.action, d.envelope.target, at, slot)?;
+            }
+            self.provenance.at(submission::Stage::CommitTime);
+            let commit = policy::Clock::read(&mut NativeClock);
+            publication_cost::precommit(self.job, commit);
+            let commit_ns = commit.wall_ns;
+            if commit_ns < at {
+                return Err(Error::Range);
+            }
+            self.provenance.at(submission::Stage::CommitDeadline);
+            if commit_ns > self.wall_deadline
+                || plan.iter().any(|d| commit_ns > d.envelope.expires_local_ns)
+            {
+                return Err(Error::Expired);
+            }
+            self.provenance.at(submission::Stage::CommitCpu);
+            policy::PublicationBudget {
+                started: self.publication_started,
+                carried: self.publication_debit,
+            }
+            .check(commit)?;
+            self.provenance.at(submission::Stage::ModelHash);
+            for d in plan.iter() {
+                if d.envelope.model_hash != self.model.model_hash
+                    || plan.header().active_model_generation != self.model.generation
+                {
+                    return Err(Error::Stale);
+                }
+            }
+            self.provenance.at(submission::Stage::ScopeCommit);
+            self.scope.commit(
+                self.owner,
+                self.model,
+                plan,
+                &stamps[..plan.len()],
+                self.boot,
+                commit_ns,
+            )?;
+            self.provenance.at(submission::Stage::RootPublish);
+            replay::published(plan, self.boot, stamps[..plan.len()].first().copied())?;
+            self.provenance.at(submission::Stage::DesiredWrites);
+            for (index, d) in plan.iter().enumerate() {
+                let slot = self.owner.prepared[index];
+                let stamp = stamps[index];
+                self.owner.desired[slot] = Some(Desired {
+                    action: d.action,
+                    apply: ApplyId {
+                        boot_epoch: self.boot,
+                        controller_epoch: plan.header().controller_epoch,
+                        plan_seq: plan.header().plan_seq,
+                        action_index: index as u16,
+                        target: d.envelope.target,
+                    },
+                    stamp,
+                    state: ExecutionState::Pending,
+                    execution_observed: false,
+                    started: false,
+                    first_entry_ns: None,
+                    observed_ns: commit_ns,
+                    published: commit_ns,
+                    evidence: self.evidence,
+                    job: self.job,
+                    model: self.model,
+                    dependencies: self.dependencies,
+                    core_generation: d.envelope.core_generation,
+                    ledger_generation: d.envelope.ledger_generation,
+                    owner_ledger_generation: self.owner.context.owner_ledger_generation,
+                });
+                ADMISSION.publish(
+                    slot,
+                    Prerequisite {
+                        domain: d.action.domain(),
+                        target: d.envelope.target,
+                    },
+                    version,
+                    stamp.installed_until_ns,
+                    ExecutionState::Pending,
+                );
+            }
+            let mut concurrent = [ApplyId::default(); 16];
+            for (index, d) in plan.iter().enumerate() {
+                concurrent[index] = ApplyId {
+                    boot_epoch: self.boot,
+                    controller_epoch: plan.header().controller_epoch,
+                    plan_seq: plan.header().plan_seq,
+                    action_index: index as u16,
+                    target: d.envelope.target,
+                };
+            }
+            for (index, d) in plan.iter().enumerate() {
+                let _ = crate::learning_history::record_publish(crate::learning_history::Publish {
+                    decision_seq: d.envelope.decision_seq,
+                    apply: concurrent[index],
+                    plan_version: version,
+                    stamp: stamps[index],
+                    model: self.model,
+                    selected: d.candidate_index,
+                    scores: &self.scores[..self.score_count],
+                    received_ns: self.publication_started.wall_ns,
+                    published_ns: commit_ns,
+                    expires_local_ns: d.envelope.expires_local_ns,
+                    active_until_local_ns: plan.header().active_until_local_ns,
+                    approved_deadline_ns: commit_ns.saturating_add(execution_limit(d.action)),
+                    concurrent: &concurrent[..plan.len()],
+                });
+            }
+            self.owner.prepared_count = 0;
+            // Observe the successful root/Desired boundary, after every
+            // fallible commit and actual desired write. Fixed baselines have
+            // no model scores and cannot substitute for AI publication.
+            #[cfg(target_os = "none")]
+            if self.score_count != 0 {
+                crate::boot_recovery::formal::published(
+                    self.boot,
+                    plan,
+                    version,
+                    self.owner.context.control_mask,
+                );
+            }
+            Ok(())
+        })();
+        self.provenance.returned(result);
+        result
+    }
+    fn cancel_prepared(&mut self, _: &P) {
+        self.provenance.cancelled();
+        self.owner.prepared_count = 0;
+    }
+    fn observed_submission(&mut self, observation: &policy::SubmissionObservation) {
+        self.provenance.observed(observation);
+    }
+}
+pub fn accept(output: &[u64; 512], cpu_ns: u64) -> Result<u64, Error> {
+    with(|s| {
+        if s.job.as_ref().ok_or(Error::Stale)?.cpu != cyxia_arch_aarch64::cpu::slot() {
+            return Err(Error::Auth);
+        }
+        if s.job.as_ref().is_some_and(|job| job.completion.is_some()) {
+            let job = s.job.take().ok_or(Error::Stale)?;
+            return finish_job(s, job, Some(output));
+        }
+        require_control(&s.owner)?;
+        let mut job = s.job.take().ok_or(Error::Stale)?;
+        let optimization_was_stopped = s.registry.optimization_stopped();
+        // Includes reply IPC/identity/canonical-wire verification in the CPU
+        // cap. Its numerical decode is also checked against the 2 ms work cap;
+        // disjoint evidence intervals below still charge actual execution once.
+        let publication_started = policy::Clock::read(&mut NativeClock);
+        let wall_begin = publication_started.wall_ns;
+        let (domain, kind) = job
+            .set
+            .get(0)
+            .map_or((0, 0), |c| (c.action.domain(), c.action.kind()));
+        publication_cost::begin(
+            [
+                s.boot,
+                job.controller,
+                job.sequence,
+                job.set.target.id,
+                job.set.target.generation,
+                job.set.model.generation,
+                u64::from(domain),
+                u64::from(kind),
+            ],
+            job.publication_debit,
+            publication_started,
+            optimization_was_stopped,
+        );
+        let budget = policy::PublicationBudget {
+            started: publication_started,
+            carried: job.publication_debit,
+        };
+        let mut decode_cpu_started = None;
+        let mut task_publication = None;
+        let mut spawn_publication = None;
+        let mut acquisition_busy = false;
+        let mut registry_completed = false;
+        const _: () = assert!(cfg!(target_endian = "little"));
+        let bytes = unsafe { &*((output as *const [u64; 512]).cast::<[u8; 4096]>()) };
+        let mut output_hash = None;
+        let mut selected = u64::MAX;
+        let mut decoded_ns = None;
+        let mut provenance = submission::Facts::new(
+            job.sequence,
+            job.read_only,
+            [
+                job.set.snapshot.core_generation,
+                s.owner.context.core_generation,
+                job.set.snapshot.ledger_generation,
+                s.owner.context.ledger_generation,
+            ],
+            job.evidence.is_some(),
+        );
+        let mut result = (|| {
+            if wall_begin < job.started
+                || wall_begin - job.started > 50_000_000
+                || cpu_ns.checked_add(job.encode_ns).ok_or(Error::Overflow)? > 2_000_000
+            {
+                return Err(Error::Expired);
+            }
+            provenance.accept(submission::AcceptStage::Context);
+            if job.set.snapshot.core_generation != s.owner.context.core_generation
+                || job.set.snapshot.ledger_generation != s.owner.context.ledger_generation
+            {
+                return Err(Error::Stale);
+            }
+            if !job.read_only {
+                budget.check(publication_started)?;
+                // Eligibility is the exact native registration contract, not
+                // the mere presence of a dependency resolver.
+                if (0..job.set.len()).all(|i| {
+                    job.set
+                        .get(i)
+                        .is_some_and(|candidate| matches!(candidate.action, Action::CpuWeight(_)))
+                }) {
+                    let consumer = s.owner.families[family_index(1, 1)?].ok_or(Error::NotReady)?;
+                    let prerequisite = s.owner.families[family_index(13, 1)?].as_ref();
+                    if crate::domain_tasks::scheduler_publication_matches(
+                        &consumer,
+                        prerequisite,
+                        s.owner.dependencies[0],
+                        s.owner.dependency_binders[0].is_some(),
+                    ) {
+                        match crate::domain_tasks::reserve_scheduler_publication(
+                            job.set.get(0).ok_or(Error::NotReady)?.action,
+                        ) {
+                            Ok(view) => task_publication = view,
+                            Err(Error::Busy) => {
+                                acquisition_busy = true;
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                if (0..job.set.len()).all(|i| {
+                    job.set
+                        .get(i)
+                        .is_some_and(|candidate| matches!(candidate.action, Action::SpawnTokens(_)))
+                }) {
+                    let consumer = s.owner.families[family_index(2, 1)?].ok_or(Error::NotReady)?;
+                    if crate::domain_tasks::spawn_publication_matches(
+                        &consumer,
+                        s.owner.dependencies[1],
+                        s.owner.dependency_binders[1].is_some(),
+                    ) {
+                        match crate::domain_tasks::reserve_spawn_publication(
+                            job.set.get(0).ok_or(Error::NotReady)?.action,
+                        ) {
+                            Ok(view) => spawn_publication = view,
+                            Err(Error::Busy) => {
+                                acquisition_busy = true;
+                                return Err(Error::Busy);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+            decode_cpu_started = Some(timer::cpu_ticks());
+            output_hash = Some(
+                cyxia_arch_aarch64::sha256::digest_page(bytes)
+                    .unwrap_or_else(|| Sha256::digest(bytes).into()),
+            );
+            provenance.accept(submission::AcceptStage::Verify);
+            let reply = reply::verify(
+                reply::Expected {
+                    set: &job.set,
+                    sequence: job.sequence,
+                    controller: job.controller,
+                    base_version: job.base_version,
+                    started_ns: job.started,
+                    boot_epoch: s.boot,
+                    output_magic: abi::OUTPUT_MAGIC,
+                },
+                output,
+            )?;
+            selected = reply.selected as u64;
+            let decoding = timer::cpu_elapsed_ns(decode_cpu_started.ok_or(Error::NotReady)?);
+            decoded_ns = Some(decoding);
+            provenance.accept(submission::AcceptStage::DecodeBudget);
+            if cpu_ns
+                .checked_add(job.encode_ns)
+                .and_then(|v| v.checked_add(decoding))
+                .ok_or(Error::Overflow)?
+                > 2_000_000
+            {
+                return Err(Error::Budget);
+            }
+            if job.read_only {
+                // A read-only work ticket is root-owned. Even a byte-perfect
+                // Plan is only checked here; it never reaches publication.
+                provenance.accept(submission::AcceptStage::ReadOnlyModel);
+                if job.work.is_none() || s.registry.model() != job.set.model {
+                    return Err(Error::Stale);
+                }
+                s.model_gate
+                    .as_ref()
+                    .ok_or(Error::NotReady)?
+                    .check_active_publication(job.set.model, job.set.target)
+                    .map_err(|_| Error::Stale)?;
+                provenance.accept(submission::AcceptStage::ReadOnlyLegal);
+                let f = s.owner.families[family_index(reply.action.domain(), reply.action.kind())?]
+                    .ok_or(Error::NotReady)?;
+                (f.legal)(reply.action, job.set.target, now())?;
+                provenance.accept(submission::AcceptStage::ReadOnlyComplete);
+                return Ok(0);
+            }
+            provenance.accept(submission::AcceptStage::Executor);
+            let mut executor = Executor {
+                owner: &mut s.owner,
+                scope: ActivePublication {
+                    active: ActiveScope(s.model_gate.as_ref().ok_or(Error::NotReady)?),
+                    task_publication: task_publication.take(),
+                    spawn_publication: spawn_publication.take(),
+                },
+                model: job.set.model,
+                evidence: job.evidence,
+                job: job.sequence,
+                boot: s.boot,
+                publication_started,
+                publication_debit: job.publication_debit,
+                wall_deadline: job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
+                dependencies: job.dependencies,
+                scores: reply.scores,
+                score_count: job.set.len(),
+                resolved_slots: [0; 16],
+                resolved_count: 0,
+                provenance,
+            };
+            executor.provenance.accept(submission::AcceptStage::Submit);
+            publication_cost::submit_entry(job.sequence, policy::Clock::read(&mut NativeClock));
+            let submitted = s.registry.submit_single_canonical_job_debited(
+                publisher(job.controller),
+                &reply.canonical,
+                budget,
+                job.started.checked_add(50_000_000).ok_or(Error::Overflow)?,
+                &mut publication_cost::Clock {
+                    inner: &mut NativeClock,
+                    job: job.sequence,
+                },
+                &mut executor,
+            );
+            publication_cost::returned(
+                job.sequence,
+                policy::Clock::read(&mut NativeClock),
+                submitted.as_ref().map_err(|e| *e),
+            );
+            provenance = executor.provenance;
+            drop(executor);
+            let receipt = submitted?;
+            registry_completed = true;
+            provenance.accept(submission::AcceptStage::Receipt);
+            if receipt.version == 0 {
+                return Err(match receipt.state() {
+                    ExecutionState::Failed(e) => e,
+                    _ => Error::Conflict,
+                });
+            }
+            Ok(receipt.version)
+        })();
+        // No task-owner borrow may survive into Root/work delivery. The
+        // functional final sample includes the actual release CPU as well.
+        drop(task_publication);
+        drop(spawn_publication);
+        if acquisition_busy {
+            let observed = policy::Clock::read(&mut NativeClock);
+            let retry = budget.check(observed).and_then(|()| {
+                if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                    Err(Error::Expired)
+                } else {
+                    Ok(())
+                }
+            });
+            match retry {
+                Ok(()) => {
+                    job.publication_debit.ns = budget
+                        .carried
+                        .ns
+                        .checked_add(publication_started.cpu_elapsed(observed)?)
+                        .ok_or(Error::Overflow)?;
+                    s.job = Some(job);
+                    return Err(Error::Busy);
+                }
+                Err(error) => result = Err(error),
+            }
+        }
+        publication_cost::released(job.sequence, policy::Clock::read(&mut NativeClock));
+        // Terminal preflight errors still retain the stopped output hash.
+        let output_hash = output_hash.unwrap_or_else(|| {
+            decode_cpu_started = Some(timer::cpu_ticks());
+            cyxia_arch_aarch64::sha256::digest_page(bytes)
+                .unwrap_or_else(|| Sha256::digest(bytes).into())
+        });
+        let decoding = decoded_ns
+            .unwrap_or_else(|| decode_cpu_started.map(timer::cpu_elapsed_ns).unwrap_or(0));
+        let publication_cost = publication_cost::prepare(job.sequence, decoding);
+        let observed = policy::Clock::read(&mut NativeClock);
+        // Keep the original terminal sample physically in the diagnostic
+        // checkpoint. Finish every diagnostic operation before the enclosing
+        // sample that charges its serialization as actual publication CPU.
+        let checkpoint_elapsed = publication_started
+            .cpu_elapsed(observed)
+            .and_then(|elapsed| {
+                elapsed
+                    .checked_add(job.publication_debit.ns)
+                    .ok_or(Error::Overflow)
+            });
+        let checkpoint_cap = budget.check(observed).and_then(|()| {
+            if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                Err(Error::Expired)
+            } else {
+                Ok(())
+            }
+        });
+        let registry_stopped = s.registry.optimization_stopped();
+        let checkpoint_local_stop = !job.read_only
+            && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
+                || checkpoint_cap.is_err());
+        let checkpoint_result = if checkpoint_local_stop && !registry_completed {
+            checkpoint_cap.and(result)
+        } else {
+            result
+        };
+        publication_cost.finish(
+            observed,
+            checkpoint_elapsed,
+            checkpoint_result,
+            checkpoint_cap,
+            registry_stopped,
+            checkpoint_local_stop,
+        );
+        // No diagnostic access or mutation may follow this charged boundary.
+        let observed = policy::Clock::read(&mut NativeClock);
+        let elapsed = publication_started
+            .cpu_elapsed(observed)
+            .and_then(|elapsed| {
+                elapsed
+                    .checked_add(job.publication_debit.ns)
+                    .ok_or(Error::Overflow)
+            });
+        // Decode and publication evidence are disjoint; the functional 500 us
+        // cap intentionally includes both plus every earlier failed preflight.
+        let publication_ns = elapsed
+            .and_then(|elapsed| elapsed.checked_sub(decoding).ok_or(Error::Range))
+            .unwrap_or(u64::MAX);
+        let cap = checkpoint_cap
+            .and_then(|()| budget.check(observed))
+            .and_then(|()| {
+                if observed.wall_ns > job.started.checked_add(50_000_000).ok_or(Error::Overflow)? {
+                    Err(Error::Expired)
+                } else {
+                    Ok(())
+                }
+            });
+        let local_stop = !job.read_only
+            && (matches!(result, Err(Error::Budget | Error::Range | Error::Overflow))
+                || cap.is_err());
+        if local_stop {
+            s.registry.stop_optimization();
+            // Completed Registry receipts retain their original outcome,
+            // including version-zero refusals. Pre-submission cap failures
+            // still terminate this Job without creating a Registry identity.
+            if !registry_completed && let Err(error) = cap {
+                result = Err(error);
+            }
+        }
+        if !optimization_was_stopped && s.registry.optimization_stopped() {
+            let sum = decoding.checked_add(publication_ns);
+            crate::domain_evidence::optimization_stop([
+                u64::from(registry_stopped) | (u64::from(local_stop) << 1),
+                wall_begin,
+                s.boot,
+                job.controller,
+                job.sequence,
+                job.set.target.id,
+                job.set.target.generation,
+                result.unwrap_or(0),
+                result.err().map_or(0, |e| e as u64 + 1),
+                u64::from(job.read_only),
+                decoding,
+                publication_ns,
+                sum.unwrap_or(u64::MAX),
+                u64::from(sum.is_none()),
+                u64::from(optimization_was_stopped),
+                1,
+                job.set.model.generation,
+                s.sequence,
+                job.cpu as u64,
+                publication_started.cpu.ns,
+            ]);
+        }
+        job.completion = Some(JobCompletion {
+            result,
+            selected,
+            decoded_ns: decoding,
+            elapsed_ns: publication_ns,
+            cpu_ns,
+            output_hash,
+            aborted: false,
+        });
+        if let Some(evidence) = job.evidence {
+            crate::domain_evidence::submission(
+                evidence,
+                job.sequence,
+                provenance.words(result, false),
+            );
+        }
+        finish_job(s, job, Some(output))
+    })
+}
+/// The real verified result survives owner-gate contention. A retry can finish
+/// its exact queue receipt, but cannot resubmit a policy or replace its result.
+fn finish_job(s: &mut State, job: Job, output: Option<&[u64; 512]>) -> Result<u64, Error> {
+    let completion = job.completion.ok_or(Error::Stale)?;
+    if let Some(work) = job.work {
+        if let Err(error) = core_replay::evaluated_cost(
+            work,
+            job.sequence,
+            completion.result,
+            completion.output_hash,
+            completion.cpu_ns,
+        ) {
+            s.job = Some(job);
+            return Err(error);
+        }
+    }
+    if !job.read_only
+        && job.work.is_none()
+        && let Err(error) = completion.result
+    {
+        replay::reject_first_job(s.boot, job.sequence, &job.set, error);
+    }
+    if let Some(evidence) = job.evidence {
+        let (version, state) = match completion.result {
+            Ok(version) => (version, ExecutionState::Pending),
+            Err(error) => (0, ExecutionState::Failed(error)),
+        };
+        crate::domain_evidence::finish(
+            evidence,
+            job.sequence,
+            completion.cpu_ns,
+            job.encode_ns,
+            completion.decoded_ns,
+            completion.elapsed_ns,
+            version,
+            state,
+            completion.selected,
+            if completion.aborted { None } else { output },
+        );
+        #[cfg(target_os = "none")]
+        crate::domain_evidence::output_digest(evidence, job.sequence, completion.output_hash);
+        if completion.aborted {
+            crate::domain_evidence::aborted();
+        }
+        if crate::a03_demand::PROFILE
+            && !job.read_only
+            && job
+                .set
+                .get(0)
+                .is_some_and(|c| matches!(c.action, Action::ControlSet(_)))
+            && let Ok(version) = completion.result
+        {
+            crate::a03_demand::ordinary_decision(
+                job.sequence,
+                version,
+                job.set.snapshot.taken_ns,
+                now(),
+                evidence,
+            );
+        }
+    }
+    completion.result
+}
+pub fn pending_job() -> Result<bool, Error> {
+    with(|s| Ok(s.job.is_some()))
+}
+pub fn abort(cpu_ns: u64) -> Result<(), Error> {
+    with(|s| {
+        if s.job
+            .as_ref()
+            .is_some_and(|job| job.cpu != cyxia_arch_aarch64::cpu::slot())
+        {
+            return Err(Error::Auth);
+        }
+        if let Some(mut job) = s.job.take() {
+            if job.completion.is_none() {
+                job.completion = Some(JobCompletion {
+                    result: Err(Error::Expired),
+                    selected: u64::MAX,
+                    decoded_ns: 0,
+                    elapsed_ns: job.publication_debit.ns,
+                    cpu_ns,
+                    output_hash: [0; 32],
+                    aborted: true,
+                });
+                if let Some(evidence) = job.evidence {
+                    let mut provenance =
+                        submission::Facts::new(job.sequence, job.read_only, [0; 4], true);
+                    provenance.accept(submission::AcceptStage::Aborted);
+                    crate::domain_evidence::submission(
+                        evidence,
+                        job.sequence,
+                        provenance.words(Err(Error::Expired), true),
+                    );
+                }
+            }
+            let result = finish_job(s, job, None);
+            // A failed actual evaluation is still a known retired root job.
+            // Gate contention keeps the exact owned job for another paid turn.
+            if s.job.is_some() {
+                return result.map(|_| ());
+            }
+        }
+        Ok(())
+    })
+}
+fn execution_limit(action: Action) -> u64 {
+    match action {
+        Action::ControlSet(_) => 200_000_000,
+        Action::RecoveryRecipe(_) => 1_000_000_000,
+        Action::Placement(_) => 4_000_000_000,
+        _ => 50_000_000,
+    }
+}
+pub fn poll(_at: u64) -> Result<(), Error> {
+    with(|s| {
+        // A control CPU may have completed publication since CPU0 captured
+        // its outer-loop timestamp. APPLY and stability use a fresh clock.
+        let at = now();
+        for scanned in 0..s.owner.stability_high {
+            let i = (s.owner.poll_cursor + scanned) % s.owner.stability_high;
+            let Some(mut d) = s.owner.desired[i] else {
+                continue;
+            };
+            if d.state.terminal() && !execution_blocks_replacement(&d) {
+                continue;
+            }
+            s.owner.poll_cursor = (i + 1) % s.owner.stability_high;
+            if d.state == ExecutionState::Applied {
+                observe_execution(s, &mut d);
+                s.owner.desired[i] = Some(d);
+                break;
+            }
+            let family_slot = family_index(d.action.domain(), d.action.kind())?;
+            let f = s.owner.families[family_slot].ok_or(Error::Unsupported)?;
+            let was_started = d.started;
+            let previous_state = d.state;
+            let mut denial_flags = 0;
+            let dependency_status = if d.started {
+                Ok(())
+            } else if d.core_generation != s.owner.context.core_generation
+                || d.owner_ledger_generation != s.owner.context.owner_ledger_generation
+            {
+                // Freshness is ownership staleness only. The published composite
+                // also carries the task-resource generation, which ordinary
+                // background work advances continuously; comparing it here
+                // stranded every renewal under load. Task-state drift stays
+                // covered by the dependency binding checked below.
+                denial_flags = 1;
+                Err(Error::Stale)
+            } else {
+                match bind_dependencies(&s.owner, d.action, d.apply.target, at) {
+                    Err(error) => {
+                        denial_flags = 2;
+                        Err(error)
+                    }
+                    Ok(actual) if actual == d.dependencies => Ok(()),
+                    Ok(_) => {
+                        denial_flags = 4;
+                        Err(Error::Stale)
+                    }
+                }
+            };
+            let mut actual_entry = None;
+            let mut executor_trace = None;
+            let result = if let Err(error) = dependency_status {
+                Err(error)
+            } else {
+                let cpu_started = timer::cpu_ticks();
+                let mut cost = crate::learning_evidence::attempt(
+                    d.apply.target,
+                    learning::reward::CpuClass::ExecutorAction,
+                )
+                .ok()
+                .flatten();
+                let entered = now();
+                let result = if d.started {
+                    (f.reconcile)(d.action, d.apply, d.stamp, entered)
+                } else {
+                    actual_entry = Some(entered);
+                    d.first_entry_ns.get_or_insert(entered);
+                    d.started = true;
+                    (f.apply)(d.action, d.apply, d.stamp, entered)
+                };
+                let (first, last, actual_ns) =
+                    crate::domain_tasks::finish_cpu_interval(cpu_started);
+                executor_trace = Some((entered, actual_ns));
+                if let Some(cost) = cost.as_mut() {
+                    let _ = crate::learning_evidence::finish_attempt(cost, first, last);
+                }
+                result
+            };
+            d.state = match result {
+                Ok(state) => state,
+                Err(Error::Busy | Error::Again) => {
+                    d.started = was_started;
+                    ExecutionState::Pending
+                }
+                Err(Error::Io | Error::NotReady) => ExecutionState::Unknown,
+                Err(error) => ExecutionState::Failed(error),
+            };
+            // A started Unknown operation remains an unresolved obligation.
+            // Late Pending/Busy/Again is not proof that its effects disappeared.
+            if previous_state == ExecutionState::Unknown && d.state == ExecutionState::Pending {
+                d.state = ExecutionState::Unknown;
+            }
+            let observed = now();
+            if denial_flags != 0
+                && let Err(error) = dependency_status
+            {
+                let denial = crate::learning_evidence::execution_trace::ControlDenial {
+                    action: d.action,
+                    apply: d.apply,
+                    stamp: d.stamp,
+                    observed_ns: observed,
+                    expected_core: d.core_generation,
+                    current_core: s.owner.context.core_generation,
+                    expected_ledger: d.ledger_generation,
+                    current_ledger: s.owner.context.ledger_generation,
+                    flags: denial_flags,
+                    error,
+                };
+                replay::candidate_stale(&denial);
+                crate::learning_evidence::execution_trace::control_denied(denial);
+            }
+            d.observed_ns = observed;
+            if !d.state.terminal()
+                && observed.saturating_sub(d.published) >= execution_limit(d.action)
+            {
+                if d.started {
+                    d.state = ExecutionState::Unknown;
+                } else {
+                    // Busy/Again before admission is an authoritative no-effect
+                    // refusal. Do not invent an in-flight operation to reconcile.
+                    d.state = ExecutionState::Failed(Error::Again);
+                }
+            }
+            // Preserve factual executor custody and terminal candidate evidence
+            // even if the later Registry update rejects its identity. Unknown
+            // normalization above prevents the forbidden Pending regression.
+            replay::candidate_execution(d.apply, d.stamp, d.state);
+            if let Some((entered_ns, cpu_ns)) = executor_trace {
+                crate::learning_evidence::execution_trace::control(
+                    crate::learning_evidence::execution_trace::ControlEvent {
+                        action: d.action,
+                        apply: d.apply,
+                        stamp: d.stamp,
+                        was_started,
+                        entered_ns,
+                        finished_ns: observed,
+                        cpu_ns,
+                        published_ns: d.published,
+                        result,
+                    },
+                );
+            }
+            let _ = crate::learning_history::record_execution(crate::learning_history::Execution {
+                apply: d.apply,
+                stamp: d.stamp,
+                state: d.state,
+                observed_ns: observed,
+                started_ns: actual_entry,
+                executor_generation: actual_entry.map(|_| s.owner.family_epochs[family_slot]),
+            });
+            s.owner.desired[i] = Some(d);
+            ADMISSION.publish(
+                i,
+                Prerequisite {
+                    domain: d.action.domain(),
+                    target: d.apply.target,
+                },
+                d.stamp.version,
+                d.stamp.installed_until_ns,
+                d.state,
+            );
+            s.registry.reconcile(d.apply, d.stamp.version, d.state)?;
+            if let Some(evidence) = d.evidence {
+                crate::domain_evidence::progress(
+                    evidence,
+                    d.job,
+                    d.stamp.version,
+                    d.state,
+                    observed,
+                );
+                #[cfg(target_os = "none")]
+                if matches!(d.action, Action::ControlSet(_)) && d.state == ExecutionState::Applied {
+                    let _ = crate::ownership_evidence::model_witness(d.apply, evidence, d.job);
+                }
+            }
+            let stability_result =
+                s.owner.stability[i]
+                    .as_mut()
+                    .ok_or(Error::Stale)
+                    .and_then(|guard| {
+                        guard.observe_execution(d.stamp.version, d.action, d.state, observed)
+                    });
+            if let Err(error) = stability_result {
+                s.registry.stop_optimization();
+                crate::domain_evidence::stability_failed(d.action.domain(), d.stamp.version, error);
+            }
+            observe_execution(s, &mut d);
+            s.owner.desired[i] = Some(d);
+            break;
+        }
+        // Reclaim only an owner-proven dead, terminal object; unknown work is pinned.
+        for i in 0..s.owner.stability_high {
+            if let Some(guard) = s.owner.stability[i].as_ref()
+                && s.owner.desired[i]
+                    .as_ref()
+                    .is_none_or(|d| d.state.terminal())
+            {
+                let (domain, kind) = guard.family();
+                let f = s.owner.families[family_index(domain, kind)?].ok_or(Error::Unsupported)?;
+                if matches!(
+                    (f.current)(domain, kind, guard.target()),
+                    Err(Error::Stale | Error::NotFound)
+                ) {
+                    s.owner.desired[i] = None;
+                    s.owner.stability[i] = None;
+                    ADMISSION.retire(i);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })
+}

@@ -14,7 +14,7 @@ pub mod cpu {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/control_pool.rs"]
+#[path = "../../../kernel/src/runtime/control/control_pool.rs"]
 mod control_pool;
 #[path = "support/learning.rs"]
 mod support;
@@ -154,10 +154,10 @@ pub mod learning_session {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_replay/data.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/data.rs"]
 mod producer;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_replay/sample_witness.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/sample_witness.rs"]
 mod sample_witness;
 fn schemas() -> Schemas {
     Schemas {

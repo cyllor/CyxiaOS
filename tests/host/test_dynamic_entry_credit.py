@@ -15,7 +15,7 @@ from test_governance_billing_priority import function
 
 class DynamicEntryCredit(unittest.TestCase):
     def test_short_returns_resume_within_the_existing_thread_budget(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         template = (ROOT / 'tests/host/dynamic_entry_credit_harness.rs').read_text()
         definitions = [re.search(rf'^const {name}: u64 = .*;$', source, re.M)[0] for name in
             ['BUILTIN_WINDOW_HEADROOM_NS', 'BUILTIN_MIN_GRANT_NS', 'DYNAMIC_EL0_MIN_GRANT_NS']]

@@ -55,7 +55,7 @@ mod prototype_storage {
         });
     }
 }
-#[path = "../../../kernel/src/unified_store.rs"]
+#[path = "../../../kernel/src/runtime/cluster/unified_store.rs"]
 mod store;
 #[test]
 fn missing_ordinal_cannot_relabel_the_last_scanned_record() {

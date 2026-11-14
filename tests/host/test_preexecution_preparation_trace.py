@@ -15,14 +15,14 @@ from test_governance_billing_priority import function
 
 class PreexecutionPreparationTrace(unittest.TestCase):
     def test_actual_denials_and_prepare_waits_keep_original_work_and_identity(self):
-        control=(ROOT/'kernel/src/domain_control.rs').read_text()
-        root=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
-        owner=(ROOT/'kernel/src/learning_replay/owner.rs').read_text()
-        task=(ROOT/'kernel/src/domain_tasks.rs').read_text()
-        trace=(ROOT/'kernel/src/learning_evidence/execution_trace.rs').read_text()
+        control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
+        root=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
+        owner=(ROOT/'kernel/src/runtime/learning/learning_replay/owner.rs').read_text()
+        task=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        trace=(ROOT/'kernel/src/runtime/learning/learning_evidence/execution_trace.rs').read_text()
         code=(ROOT/'tests/host/execution_trace_hooks_harness.rs').read_text().split('fn main()',1)[0]
-        code=code.replace('// WARM_BODY',function((ROOT/'kernel/src/learning_workload/owner.rs').read_text(),'fn warm('))
-        pieces=[re.search(r'^static LOCK:.*;$',task,re.M)[0], '#[path='+json.dumps(str(ROOT/'kernel/src/domain_tasks/owner_gate.rs'))+'] mod owner_gate;']
+        code=code.replace('// WARM_BODY',function((ROOT/'kernel/src/runtime/learning/learning_workload/owner.rs').read_text(),'fn warm('))
+        pieces=[re.search(r'^static LOCK:.*;$',task,re.M)[0], '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))+'] mod owner_gate;']
         pieces += [function(task,s) for s in ['struct Guard','impl Guard','impl Drop for Guard','fn acquire_guard()','fn locked<R>','fn locked_with_guard<R>','fn complete_locked(']]
         code=code.replace('// TASK_BODIES','\n'.join(pieces))
         predicate=function(control,'fn execution_blocks_replacement(').replace('fn execution_blocks_replacement(','fn real_execution_blocks_replacement(',1)

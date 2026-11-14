@@ -1,6 +1,6 @@
 //! Synthetic request events exercise the same native aggregation function;
 //! these tests do not constitute actual SLO or replay measurements.
-#[path = "../../../kernel/src/service_windows/aggregate.rs"]
+#[path = "../../../kernel/src/runtime/services/service_windows/aggregate.rs"]
 mod aggregate;
 #[path = "support/learning.rs"]
 mod support;

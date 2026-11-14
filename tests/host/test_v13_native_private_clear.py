@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativePrivateClear(unittest.TestCase):
     def test_private_clear_is_bounded_by_fixed_subpage_work_not_an_in_tb_clock(self):
-        source = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
+        source = (ROOT / "kernel/src/runtime/control/prototype_runtime/native.rs").read_text()
 
         self.assertIn("const PRIVATE_CLEAR_SLICE_BYTES: usize = 32;", source)
         self.assertIn("const PRIVATE_CLEAR_BARRIER: u32", source)

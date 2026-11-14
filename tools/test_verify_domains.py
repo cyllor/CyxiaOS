@@ -413,7 +413,7 @@ class EvidenceParserTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         subprocess.run(["git", "init", "--quiet", str(root)], check=True)
-        for name in ("kernel/src/smp.rs", "crates/arch-aarch64/src/user.rs", "Cargo.lock", "tools/build_unified.py",
+        for name in ("kernel/src/arch/aarch64/smp.rs", "crates/arch-aarch64/src/user.rs", "Cargo.lock", "tools/build_unified.py",
                      "ports/control-service/core-head.bin", "ports/control-service/model-sha256.rs"):
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -658,7 +658,7 @@ class EvidenceParserTests(unittest.TestCase):
         self.assertEqual(proof["code_source_sha256"], data["code_source_sha256"])
         with self.assertRaisesRegex(ValueError, "image differs"):
             verify_source_build(path, root, ["a" * 64, "c" * 64])
-        (root / "kernel/src/smp.rs").write_text("changed after build\n")
+        (root / "kernel/src/arch/aarch64/smp.rs").write_text("changed after build\n")
         with self.assertRaisesRegex(ValueError, "source changed"):
             verify_source_build(path, root, ["a" * 64, "b" * 64])
 

@@ -16,7 +16,7 @@ class DiscoveryDecoderTests(unittest.TestCase):
         target=pathlib.Path(os.environ.get('CARGO_TARGET_DIR',target))
         subprocess.run([cargo,'build','--locked','--offline','-p','cyxia-cluster-transport'],cwd=root,check=True,capture_output=True)
         library=max((target/'debug/deps').glob('libcyxia_cluster_transport-*.rlib'),key=lambda p:p.stat().st_mtime_ns)
-        source='mod actual {\n'+(root/'kernel/src/unified_discovery.rs').read_text()+'''
+        source='mod actual {\n'+(root/'kernel/src/runtime/cluster/unified_discovery.rs').read_text()+'''
 pub fn run() {
  use cyxia_cluster_transport::{discovery::{Discovery,Message},tcp::DiscoverySnapshot};
  let mut state=Discovery::new([1;32],[2;32],[10,42,0,1],24,40001,0).unwrap();

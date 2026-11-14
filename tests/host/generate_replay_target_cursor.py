@@ -5,14 +5,14 @@ service target projection, and checks its two cursor fields on transient errors.
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2];OUT=Path(sys.argv[1]).resolve();OUT.mkdir(parents=True,exist_ok=True)
-src=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
+src=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
 start=src.index('                    let Some(target) =',src.index('Phase::Scanning =>'))
 end=src.index('                    let action =',start)
 lookup=src[start:end]
 code='''#![allow(dead_code)]
 use cyxia_prototype::domains::{Error,ObjectKey};
 '''
-for name,path in [('read_snapshot','domain_platform/read_snapshot.rs'),('target_projection','domain_services/target_projection.rs'),('target_batch','domain_control/target_batch.rs')]:
+for name,path in [('read_snapshot','platform/virt/domain_platform/read_snapshot.rs'),('target_projection','runtime/services/domain_services/target_projection.rs'),('target_batch','runtime/control/domain_control/target_batch.rs')]:
  code+=f'#[path="{ROOT}/kernel/src/{path}"] pub mod {name};\n'
 code+='''
 mod domain_platform{pub use crate::read_snapshot;}

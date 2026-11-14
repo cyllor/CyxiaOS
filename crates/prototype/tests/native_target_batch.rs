@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/target_batch.rs"]
 mod target_batch;
 use cyxia_prototype::domains::{Error, ObjectKey};
 use target_batch::{FAMILIES, Query, Source, queued_wcet_us, resolve};

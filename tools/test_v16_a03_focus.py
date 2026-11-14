@@ -450,11 +450,34 @@ class TreeLimits(unittest.TestCase):
 
 
 class BuilderClosureContracts(unittest.TestCase):
-    def test_actual_wrapper_closure_is_exact_transitive_eleven(self):
+    def test_actual_wrapper_closure_is_exact_transitive_thirteen(self):
         from build_v16_learning_collection import builder_closure
         actual=focus.builder_source_closure(Path(__file__).resolve().parents[1])
         self.assertEqual(actual,builder_closure())
-        self.assertEqual(len(actual),11)
+        self.assertEqual(set(actual),{
+            'tools/build_sources.py','tools/build_unified.py','tools/build_v16_learning_collection.py',
+            'tools/check_elf.py','tools/check_prototype_evidence.py','tools/check_v13_preparation_stack.py',
+            'tools/doctor.py','tools/elf64.py','tools/memory_v15_client.py','tools/run_qemu.py',
+            'tools/transport.py','tools/verify_smp.py','tools/verify_v13_model.py'})
+        self.assertEqual(len(actual),13)
+
+    def test_shared_builder_dependencies_are_individually_hash_bound(self):
+        source=Path(__file__).resolve().parents[1]
+        expected=focus.builder_source_closure(source)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);(root/'tools').mkdir()
+            for name in expected:(root/name).write_bytes((source/name).read_bytes())
+            self.assertEqual(focus.builder_source_closure(root),expected)
+            for name in ('tools/build_sources.py','tools/elf64.py'):
+                path=root/name;original=path.read_bytes()
+                path.write_bytes(original+b'\nraise RuntimeError("must never execute shared captured code")\n')
+                changed=focus.builder_source_closure(root)
+                with self.subTest(name=name):
+                    self.assertEqual(set(changed),set(expected))
+                    self.assertEqual(changed[name],hashlib.sha256(path.read_bytes()).hexdigest())
+                    self.assertNotEqual(changed[name],expected[name])
+                    self.assertEqual({key for key in expected if changed[key]!=expected[key]},{name})
+                path.write_bytes(original)
 
     def test_closure_reads_ast_only_and_binds_nested_function_imports(self):
         with tempfile.TemporaryDirectory() as temporary:

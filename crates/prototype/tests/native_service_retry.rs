@@ -10,9 +10,9 @@ use cyxia_prototype::domains::{
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_platform/read_snapshot.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/read_snapshot.rs"]
 mod read_snapshot;
-#[path = "../../../kernel/src/domain_tasks/vector_transport.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/vector_transport.rs"]
 mod vector_transport;
 
 const TASKS: usize = 2;

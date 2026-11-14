@@ -1,6 +1,6 @@
 //! Production caller/collector transition seams with explicit host clocks.
 //! These fixtures create no native capture, accepted label or release receipt.
-#[path = "../../../kernel/src/learning_replay/close_sources.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/close_sources.rs"]
 mod close_sources;
 use core::cell::Cell;
 use cyxia_prototype::{

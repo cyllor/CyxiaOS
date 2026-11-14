@@ -1,6 +1,6 @@
 //! Execute the native owner's production selector with stopped task facts.
 //! These counterexamples exercise fairness and custody, not guest timing.
-#[path = "../../../kernel/src/domain_tasks/lifecycle.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/lifecycle.rs"]
 mod lifecycle;
 use lifecycle::View;
 

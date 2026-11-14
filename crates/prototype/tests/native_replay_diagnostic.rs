@@ -1,6 +1,6 @@
 //! Exercise the production first-failure latch without supplying any replay
 //! authorization, learning samples, or native completion evidence.
-#[path = "../../../kernel/src/learning_replay/diagnostic.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/diagnostic.rs"]
 #[allow(dead_code)]
 mod diagnostic;
 use cyxia_prototype::{domains::Error, learning, policy::ExecutionState};

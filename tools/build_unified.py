@@ -15,59 +15,14 @@ import time
 from doctor import ROOT,env
 from verify_smp import require
 import check_v13_preparation_stack as preparation_stack
-
-
-CODE_ROOTS={'kernel','crates','user','ports','.cargo'}
-ROOT_BUILD_FILES={'Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchain'}
-EXCLUDED_COMPONENTS={'tests','docs','target','__pycache__','.git'}
+from build_sources import (CODE_ROOTS, ROOT_BUILD_FILES, EXCLUDED_COMPONENTS,
+    code_source_map as source_snapshot, build_cache_context, cache_artifact, sha)
 
 
 def code_source_map(source_root=None):
-    # Bind every potentially included source/asset, not an extension allowlist:
-    # ring includes .inl, and models/packages can have arbitrary suffixes.
-    # Filter the build scope before requiring each file. An intentionally sparse
-    # test fixture does not participate in these native images; missing compiled
-    # sources and symlinks still fail instead of silently disappearing.
-    source_root=Path(source_root or ROOT).resolve(strict=True)
-    result=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard'],
-                          cwd=source_root,capture_output=True,check=True,timeout=10)
-    names=sorted(set(name for name in result.stdout.decode('utf-8').split('\0') if name
-                     and (name in ROOT_BUILD_FILES or Path(name).parts[0] in CODE_ROOTS)
-                     and not any(part in EXCLUDED_COMPONENTS for part in Path(name).parts)))
-    require({'kernel/src/smp.rs','crates/arch-aarch64/src/user.rs','Cargo.lock'}<=set(names),
-            'incomplete native source checkout')
-    files=[source_root/name for name in names]
-    require(all(p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(source_root) for p in files),
-            'missing, linked, or external native build source')
-    return {name:sha(path) for name,path in zip(names,files)}
-
-
-def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def build_cache_context(cache_base, source_root, sources):
-    """Keep backdated source and other checkouts out of Cargo's mtime cache."""
-    base = Path(cache_base).expanduser().resolve()
-    root = Path(source_root).resolve(strict=True)
-    source_sha = hashlib.sha256(json.dumps(sources, sort_keys=True,
-        separators=(',', ':')).encode()).hexdigest()
-    identity = dict(version=1, source_root=str(root), compiled_source_sha256=source_sha)
-    key = hashlib.sha256(json.dumps(identity, sort_keys=True,
-        separators=(',', ':')).encode()).hexdigest()
-    target = base / ('source-' + key)
-    require(not target.is_symlink() and target.resolve().parent == base,
-            'linked or escaping build cache namespace')
-    return dict(base=str(base), effective=str(target), namespace_key=key,
-                source_root=str(root), compiled_source_sha256=source_sha,
-                strategy='source-and-checkout-v1')
-
-
-def cache_artifact(path, target_dir):
-    actual = Path(path).resolve(strict=True)
-    require(actual.is_relative_to(Path(target_dir).resolve(strict=True)),
-            'Cargo artifact outside selected build cache namespace')
-    return actual
+    # Preserve the unified AArch64 checkout contract at its platform boundary.
+    return source_snapshot(source_root or ROOT,
+        required_sources=('kernel/src/arch/aarch64/smp.rs','crates/arch-aarch64/src/user.rs','Cargo.lock'))
 
 
 def identity_metadata(directory):

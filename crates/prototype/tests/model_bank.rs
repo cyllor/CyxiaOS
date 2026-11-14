@@ -1,7 +1,7 @@
 //! Host fault injection for the native model-bank owner. Numerical candidates
 //! come from the real worker protocol with a synthetic completion authority;
 //! these are mechanism tests, not native measurements or replay samples.
-#[path = "../../../kernel/src/model_bank.rs"]
+#[path = "../../../kernel/src/runtime/learning/model_bank.rs"]
 mod model_bank;
 #[path = "support/learning.rs"]
 mod support;

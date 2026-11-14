@@ -174,7 +174,7 @@ mod registration_lookup_probe {
 
 fn plan_receipt_digest(bytes: &[u8]) -> [u8; 32] {
     #[cfg(feature = "hardware-sha256")]
-    if let Some(hash) = cyxia_arch_aarch64::sha256::digest(bytes) {
+    if let Some(hash) = cyxia_arch::sha256::digest(bytes) {
         return hash;
     }
     Sha256::digest(bytes).into()
@@ -497,7 +497,7 @@ impl CandidateSet {
             append_canonical(&mut canonical, &mut used, &p.candidate_hash)?;
         }
         #[cfg(feature = "hardware-sha256")]
-        if let Some(hash) = cyxia_arch_aarch64::sha256::digest(&canonical[..used]) {
+        if let Some(hash) = cyxia_arch::sha256::digest(&canonical[..used]) {
             return Ok(hash);
         }
         Ok(Sha256::digest(&canonical[..used]).into())

@@ -16,9 +16,9 @@ from test_governance_billing_priority import function
 class RecoveryObservation(unittest.TestCase):
     def test_actual_paid_task_predicates_and_cleanup_match_supervisor_custody(self):
         from test_paid_lifecycle_progress import program
-        execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
-        service=(ROOT/'kernel/src/domain_services.rs').read_text()
-        evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
+        execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+        service=(ROOT/'kernel/src/runtime/services/domain_services.rs').read_text()
+        evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()
         code=program().split('const TASKS:usize=4;',1)[0]
         # Keep the existing support boundaries/setup/helpers, omit old tests.
         support=(ROOT/'tests/host/paid_lifecycle_support.rs').read_text().split('#[test]',1)[0]
@@ -64,8 +64,8 @@ class RecoveryObservation(unittest.TestCase):
             self.assertIn('IPC query error was collapsed into drain progress',negative.stdout+negative.stderr)
 
     def test_actual_supervisor_and_kernel_backend_keep_phase_result_and_single_issue(self):
-        service=(ROOT/'kernel/src/domain_services.rs').read_text()
-        evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
+        service=(ROOT/'kernel/src/runtime/services/domain_services.rs').read_text()
+        evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()
         code=(ROOT/'tests/host/recovery_observation_harness.rs').read_text()
         code=code.replace('// KERNEL_RECOVERY_BACKEND',function(service,'struct Recovery {')+'\n'+function(service,'impl RecoveryBackend for Recovery'))
         with tempfile.TemporaryDirectory() as tmp:

@@ -15,11 +15,11 @@ from test_governance_billing_priority import function
 
 class ExecutionTrace(unittest.TestCase):
     def test_production_poll_warm_and_task_gate_settlement_emit_the_actual_times(self):
-        task = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
-        control = (ROOT / 'kernel/src/domain_control.rs').read_text()
-        work = (ROOT / 'kernel/src/learning_workload/owner.rs').read_text()
+        task = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        control = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
+        work = (ROOT / 'kernel/src/runtime/learning/learning_workload/owner.rs').read_text()
         pieces = [re.search(r'^static LOCK:.*;$', task, re.M)[0]]
-        pieces.append('#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
+        pieces.append('#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
         pieces += [function(task, s) for s in ['struct Guard', 'impl Guard', 'impl Drop for Guard',
             'fn acquire_guard()', 'fn locked<R>', 'fn locked_with_guard<R>', 'fn complete_locked(']]
         program = (ROOT / 'tests/host/execution_trace_hooks_harness.rs').read_text().replace(
@@ -29,7 +29,7 @@ class ExecutionTrace(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             trace = directory / 'trace.rs'
-            trace.write_text((ROOT / 'kernel/src/learning_evidence/execution_trace.rs').read_text() + '''
+            trace.write_text((ROOT / 'kernel/src/runtime/learning/learning_evidence/execution_trace.rs').read_text() + '''
 pub fn snapshots() -> ([u64;224],[u64;128],[u64;64]) {
     (core::array::from_fn(|i|TRACE_CONTROL_EVIDENCE.words[i].load(Ordering::Acquire)),
      core::array::from_fn(|i|TRACE_TASK_EVIDENCE.words[i].load(Ordering::Acquire)),
@@ -69,7 +69,7 @@ pub fn snapshots() -> ([u64;224],[u64;128],[u64;64]) {
             self.assertIn('production closing settlement hook was gated out',negative.stdout+negative.stderr)
 
     def test_first_trial_keeps_execution_settlement_and_observation_distinct(self):
-        source = ROOT / 'kernel/src/learning_evidence/execution_trace.rs'
+        source = ROOT / 'kernel/src/runtime/learning/learning_evidence/execution_trace.rs'
         template = (ROOT / 'tests/host/execution_trace_harness.rs').read_text()
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

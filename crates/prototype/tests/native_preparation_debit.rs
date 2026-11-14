@@ -1,6 +1,6 @@
-#[path = "../../../kernel/src/domain_control/preparation.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/preparation.rs"]
 mod preparation;
-#[path = "../../../kernel/src/domain_control/target_batch.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/target_batch.rs"]
 #[allow(dead_code)]
 mod target_batch;
 use cyxia_prototype::{

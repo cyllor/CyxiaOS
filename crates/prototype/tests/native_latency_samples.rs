@@ -1,5 +1,5 @@
 //! Execute the native scheduler's latency ring, without a synthetic clock.
-#[path = "../../../kernel/src/domain_tasks/samples.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/samples.rs"]
 mod samples;
 use cyxia_prototype::domains::Error;
 use samples::Samples;

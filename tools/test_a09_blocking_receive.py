@@ -14,9 +14,9 @@ from test_a01_formal_recorder import function
 
 class ActualBlockingReceive(unittest.TestCase):
     def test_empty_receive_settles_credit_then_only_authorized_message_wakes(self):
-        execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
-        abi=(ROOT/'kernel/src/domain_tasks/abi.rs').read_text()
-        parent=(ROOT/'kernel/src/domain_tasks.rs').read_text()
+        execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
+        abi=(ROOT/'kernel/src/runtime/tasks/domain_tasks/abi.rs').read_text()
+        parent=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         arm='7 | 22 => {' if '7 | 22 => {' in abi else '7 => {'
         receive=function(abi,arm)
         wake_tail=function(execution,'    if s.wake & (1u64 << i) != 0 {')

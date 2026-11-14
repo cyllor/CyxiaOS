@@ -108,7 +108,7 @@ fn run(){
 }
 fn main(){std::thread::Builder::new().stack_size(32*1024*1024).spawn(run).unwrap().join().unwrap();}
 '''
-        program=program.replace('BROKER_PATH',str(ROOT/'kernel/src/domain_file_abi.rs'))
+        program=program.replace('BROKER_PATH',str(ROOT/'kernel/src/runtime/files/domain_file_abi.rs'))
         for marker,name in [('ACTUAL_FRAME','fn frame('),('ACTUAL_RUN','fn run('),('ACTUAL_READ','fn read_batch(')]:
             program=program.replace('// '+marker,function(client,name))
         deps,library=build_host_prototype_library()

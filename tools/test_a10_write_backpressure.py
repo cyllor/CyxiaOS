@@ -15,7 +15,7 @@ class ActualWriteBackpressure(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary=tempfile.TemporaryDirectory(prefix='a10-real-write-')
         cls.directory=Path(cls.temporary.name)
-        source=HARNESS_SOURCE.read_text().replace('__BROKER__',str(ROOT/'kernel/src/domain_file_abi.rs')).replace('__CLIENT__',str(CLIENT_SOURCE))
+        source=HARNESS_SOURCE.read_text().replace('__BROKER__',str(ROOT/'kernel/src/runtime/files/domain_file_abi.rs')).replace('__CLIENT__',str(CLIENT_SOURCE))
         source=source.replace('// ACTUAL_FILE_CALL',function((ROOT/'user/prototype-client/main.rs').read_text(),'fn file_call('))
         path=cls.directory/'harness.rs';path.write_text(source)
         deps,library=build_host_prototype_library();cls.binary=cls.directory/'harness'

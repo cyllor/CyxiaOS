@@ -2,7 +2,7 @@
 //! Uses the real filesystem, redo journal, dependency table and I/O credits;
 //! this host seam creates no native acceptance or optional policy receipt.
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/dependencies.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/dependencies.rs"]
 mod dependencies;
 
 use cyxia_prototype::{

@@ -15,9 +15,9 @@ from test_governance_billing_priority import function
 
 class TaskOwnerHandoff(unittest.TestCase):
     def test_waiting_cpu_gets_bounded_owner_opportunity_without_spinning(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         template = (ROOT / 'tests/host/task_owner_handoff_harness.rs').read_text()
-        gate = ROOT / 'kernel/src/domain_tasks/owner_gate.rs'
+        gate = ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'
         module = '#[path=' + json.dumps(str(gate)) + '] mod owner_gate;' if gate.exists() else ''
         pieces = [re.search(r'^static LOCK:.*;$', source, re.M)[0],
                           re.search(r'struct Guard(?:\s*;|\s*\{[^}]*\})', source)[0],
@@ -30,7 +30,7 @@ class TaskOwnerHandoff(unittest.TestCase):
         pieces.append(function(source, 'pub fn service_segment<R>'))
         body = '\n'.join(pieces)
         template = template.replace('// OWNER_GATE_MODULE', module).replace('// OWNER_GATE_BODY', body)
-        publication = (ROOT / 'kernel/src/domain_tasks/publication.rs').read_text()
+        publication = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/publication.rs').read_text()
         template = template.replace('// PUBLICATION_BODIES', '\n'.join(function(publication, signature)
             for signature in ['pub(crate) struct BaselinePublication', 'fn owns(',
                               'pub(crate) fn reserve_baseline_publication(']))

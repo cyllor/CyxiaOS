@@ -100,7 +100,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyxia-arch"
+version = "0.1.0"
+dependencies = [
+ "cyxia-arch-aarch64",
+]
+
+[[package]]
 name = "cyxia-arch-aarch64"
+version = "0.1.0"
+dependencies = [
+ "cyxia-contracts",
+]
+
+[[package]]
+name = "cyxia-arch-x86_64"
 version = "0.1.0"
 dependencies = [
  "cyxia-contracts",
@@ -150,6 +164,7 @@ dependencies = [
  "cyxia-ai-fs",
  "cyxia-ai-runtime",
  "cyxia-arch-aarch64",
+ "cyxia-arch-x86_64",
  "cyxia-cluster-transport",
  "cyxia-contracts",
  "cyxia-control-model",
@@ -158,6 +173,7 @@ dependencies = [
  "cyxia-driver-virtio",
  "cyxia-kernel-core",
  "cyxia-peer-billing",
+ "cyxia-platform-pc",
  "cyxia-platform-virt",
  "cyxia-posix",
  "cyxia-prototype",
@@ -184,6 +200,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyxia-platform-pc"
+version = "0.1.0"
+dependencies = [
+ "cyxia-arch-x86_64",
+ "cyxia-contracts",
+]
+
+[[package]]
 name = "cyxia-platform-virt"
 version = "0.1.0"
 dependencies = [
@@ -201,7 +225,7 @@ dependencies = [
 name = "cyxia-prototype"
 version = "0.1.0"
 dependencies = [
- "cyxia-arch-aarch64",
+ "cyxia-arch",
  "sha2",
 ]
 

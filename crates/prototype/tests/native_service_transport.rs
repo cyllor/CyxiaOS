@@ -9,7 +9,7 @@ use cyxia_prototype::domains::{
     },
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-#[path = "../../../kernel/src/domain_tasks/vector_transport.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/vector_transport.rs"]
 mod vector_transport;
 const TASKS: usize = 2;
 const IPC_BYTES: usize = 256;

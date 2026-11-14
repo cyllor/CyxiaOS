@@ -2,7 +2,7 @@
 //! platform ledger gate. CPU/clock providers do not claim native execution.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 include!("../../prototype/tests/support/unstarted.rs");
 mod domain_tasks {
@@ -20,9 +20,9 @@ use cyxia_prototype::{
 };
 use std::sync::Mutex;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/peer_replay/ledger.rs"]
+#[path = "../../../kernel/src/runtime/cluster/peer_replay/ledger.rs"]
 mod ledger;
-#[path = "../../../kernel/src/peer_replay/attempt.rs"]
+#[path = "../../../kernel/src/runtime/cluster/peer_replay/attempt.rs"]
 mod owner_attempt;
 
 static SERIAL: Mutex<()> = Mutex::new(());

@@ -2,7 +2,7 @@
 //! counterexamples, not native samples or accepted learning evidence.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 mod domain_tasks {
     pub(crate) use super::cancellation::Cancellation;
@@ -44,7 +44,7 @@ pub mod domain_platform {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_evidence.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_evidence.rs"]
 mod bridge;
 
 static ALLOCATION: AtomicUsize = AtomicUsize::new(0);

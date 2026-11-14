@@ -3,7 +3,7 @@
 //! tests do not manufacture accepted replay labels or claim a native run.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 
 pub mod sha256 {
@@ -41,10 +41,10 @@ pub mod service_windows {
     pub const PENALIZED_P99_NS: u16 = 1;
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_evidence.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_evidence.rs"]
 mod learning_evidence;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_history.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_history.rs"]
 mod learning_history;
 #[path = "support/learning.rs"]
 mod support;
@@ -315,7 +315,7 @@ pub mod domain_services {
     pub use crate::adapter as replay_serial;
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_services/replay_serial.rs"]
+#[path = "../../../kernel/src/runtime/services/domain_services/replay_serial.rs"]
 pub mod adapter;
 // Production adapter uses its domain_services parent's typed queue functions.
 use domain_services::{replay_console_enqueue, replay_console_installation, replay_console_state};

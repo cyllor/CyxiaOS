@@ -20,7 +20,7 @@ from test_governance_billing_priority import function
 
 class VectorPumpCredit(unittest.TestCase):
     def test_actual_pump_uses_separate_bounded_credit_without_changing_batch_policy(self):
-        execution = (ROOT / 'kernel/src/domain_tasks/execution.rs').read_text()
+        execution = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
         driver = function(execution, 'pub fn service(')
         general = function(driver, 'let _ = service_segment(|| {')
         # Preserve actual outer sequencing; general owner internals have their
@@ -43,10 +43,10 @@ class VectorPumpCredit(unittest.TestCase):
                                         's.active.map_or(0, |v| v.sequence)')
         template = (ROOT / 'tests/host/vector_pump_credit_harness.rs').read_text()
         template = template.replace('// OWNER_GATE_PATH',
-            str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))
+            str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))
         template = template.replace('// PUMP_BODIES', '\n'.join([
             driver, activation, function(execution, 'fn service_vectors('),
-            function((ROOT / 'kernel/src/domain_tasks.rs').read_text(), 'pub fn service_segment<R>')]))
+            function((ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text(), 'pub fn service_segment<R>')]))
         template = template.replace('// OLD_VECTOR_PHASE', str(old_vector_phase).lower())
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

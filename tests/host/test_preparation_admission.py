@@ -25,8 +25,8 @@ def execute(code,evidence,target):
 
 class PreparationAdmission(unittest.TestCase):
     def test_actual_post_submission_retains_original_stop_cost_and_identity(self):
-        control=(ROOT/'kernel/src/domain_control.rs').read_text()
-        evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
+        control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
+        evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()
         submit=function(control,'pub fn accept(')
         body=submit[submit.index('        let publication_ns ='):submit.index('        job.completion =')]
         # Evaluate the actual checkpoint inputs at the fixture's controlled
@@ -58,9 +58,9 @@ class PreparationAdmission(unittest.TestCase):
             self.assertIn(failure,negative.stdout+negative.stderr)
 
     def test_actual_early_gate_reports_reason_without_new_queries(self):
-        control=(ROOT/'kernel/src/domain_control.rs').read_text()
-        replay=(ROOT/'kernel/src/domain_control/replay.rs').read_text()
-        evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
+        control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
+        replay=(ROOT/'kernel/src/runtime/control/domain_control/replay.rs').read_text()
+        evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()
         projection='pub(super) fn preparation_admission(_: &State,_:u64,_:u64){}'
         if 'fn preparation_admission(' in replay:projection=function(replay,'pub(super) fn preparation_admission(')
         code=(ROOT/'tests/host/preparation_admission_harness.rs').read_text()

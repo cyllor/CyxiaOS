@@ -1,5 +1,5 @@
 //! Protected diagnostic custody, not a filesystem acceptance verdict.
-#[path = "../../../kernel/src/domain_file_abi/diagnostics.rs"]
+#[path = "../../../kernel/src/runtime/files/domain_file_abi/diagnostics.rs"]
 mod diagnostics;
 
 #[test]

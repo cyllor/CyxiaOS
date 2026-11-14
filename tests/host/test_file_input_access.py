@@ -14,8 +14,8 @@ from test_governance_billing_priority import function
 
 class FileInputAccess(unittest.TestCase):
     def test_preflight_holds_one_owner_borrow_and_retains_memory_authority(self):
-        memory = (ROOT / 'kernel/src/domain_tasks/memory.rs').read_text()
-        files = (ROOT / 'kernel/src/domain_file_abi.rs').read_text()
+        memory = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/memory.rs').read_text()
+        files = (ROOT / 'kernel/src/runtime/files/domain_file_abi.rs').read_text()
         template = (ROOT / 'tests/host/file_input_access_harness.rs').read_text()
         signatures = ['pub(crate) struct UserMemoryAccess', "impl UserMemoryAccess<'_>",
                       'pub(crate) fn with_user_memory', 'pub(super) fn frame_ptr(',

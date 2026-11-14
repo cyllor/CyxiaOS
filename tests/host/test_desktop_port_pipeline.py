@@ -20,7 +20,7 @@ CARGO = Path('/not-installed/bin/cargo')
 def checkout(root):
     root.mkdir()
     for name in ('Cargo.toml', 'Cargo.lock', 'kernel/build.rs', 'kernel/Cargo.toml',
-                 'kernel/src/user/shared_memory.rs', 'crates/posix/src/epoll.rs'):
+                 'kernel/src/desktop/user/shared_memory.rs', 'crates/posix/src/epoll.rs'):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('unit-test fixture; not buildable kernel\n')

@@ -1,6 +1,6 @@
 //! Production interval sampling with deterministic clock fixtures from the
 //! actual stopped CoreSet failure. No native evidence or accepted labels.
-#[path = "../../../kernel/src/domain_tasks/measured_interval.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/measured_interval.rs"]
 mod measured_interval;
 use core::cell::{Cell, RefCell};
 const CREDIT_START: u64 = 67_624_394_000;

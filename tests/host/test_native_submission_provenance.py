@@ -11,7 +11,7 @@ from doctor import RUST_BIN,env
 from test_governance_billing_priority import function
 
 def native_program():
- control=(ROOT/'kernel/src/domain_control.rs').read_text();fixture=(ROOT/'crates/prototype/tests/domain_policy.rs').read_text()
+ control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text();fixture=(ROOT/'crates/prototype/tests/domain_policy.rs').read_text()
  program=(ROOT/'tests/host/native_submission_harness.rs').read_text().replace('// WIRE_FIXTURES','\n'.join(function(fixture,s) for s in ['fn publisher()','fn binding()','fn candidates()','fn frame(']))
  program=program.replace('// NATIVE_CLOCK',function(control,'impl policy::Clock for NativeClock')).replace('// REPLACEMENT_PREDICATE',function(control,'fn execution_blocks_replacement(')).replace('// SCOPE_TRAIT',function(control,'trait PublicationScope'))
  struct=function(control,'struct Executor<')
@@ -25,8 +25,8 @@ def native_program():
  end=body.index('self.owner.prepared_count = 0;',start);end=body.rfind('\n',0,end)+1
  body=body[:start]+'            EFFECTS.fetch_add(1,Ordering::AcqRel);\n'+body[end:]
  program=program.replace('// NATIVE_EXECUTOR',struct+'\n'+cache).replace('// NATIVE_IMPL',body)
- program=program.replace('struct NativeClock;', '#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\nstruct NativeClock;')
- module=ROOT/'kernel/src/domain_control/submission.rs'
+ program=program.replace('struct NativeClock;', '#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/publication_cost.rs'))+'] mod publication_cost;\nstruct NativeClock;')
+ module=ROOT/'kernel/src/runtime/control/domain_control/submission.rs'
  if module.exists():
   program=program.replace('// FACTS_MODULE','#[path='+json.dumps(str(module))+'] mod submission;')
  else:program=program.replace('// FACTS_MODULE','mod submission{#[derive(Clone,Copy)]pub struct Facts;impl Facts{pub fn words(self,_:Result<u64,super::Error>,_:bool)->[u64;27]{[0;27]}}}')
@@ -43,8 +43,8 @@ class NativeSubmissionProvenance(unittest.TestCase):
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-native-submission-provenance'),'--','--test-threads=1']
    r=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
    self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertIn('3 passed; 0 failed',r.stdout)
-   facts=(ROOT/'kernel/src/domain_control/submission.rs').read_text();(d/'facts.rs').write_text(facts)
-   local=program.replace(json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs')),json.dumps(str(d/'facts.rs')))
+   facts=(ROOT/'kernel/src/runtime/control/domain_control/submission.rs').read_text();(d/'facts.rs').write_text(facts)
+   local=program.replace(json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/submission.rs')),json.dumps(str(d/'facts.rs')))
    mutants=[
     (local.replace('self.provenance.observed(observation);',''),facts,'left: 0'),
     (local,facts.replace('self.cancellations = self.cancellations.saturating_add(1);','self.returned = 0; self.error = 0; self.cancellations = self.cancellations.saturating_add(1);'),'assertion'),
@@ -55,7 +55,7 @@ class NativeSubmissionProvenance(unittest.TestCase):
     negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_record_tail_preserves_first_completion_and_slot_identity(self):
-  evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()
+  evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()
   if 'pub fn submission(' not in evidence:evidence+='\npub fn submission(_:usize,_:u64,_:[u64;27]){}\n'
   evidence+='\npub fn tail(slot:usize)->[u64;27]{core::array::from_fn(|i|get(base(slot)+612+i))}\npub fn input_hash(slot:usize)->[u64;4]{core::array::from_fn(|i|get(base(slot)+608+i))}\n'
   body=r'''#![allow(dead_code)]
@@ -91,7 +91,7 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
     negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_accept_completion_and_abort_preserve_facts_across_delivery_retry(self):
-  control=(ROOT/'kernel/src/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_completion_harness.rs').read_text()
+  control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_completion_harness.rs').read_text()
   extra=extra.replace('// COMPLETION_JOB_TYPES','#[derive(Clone,Copy)]'+function(control,'struct Job {')+'\n#[derive(Clone,Copy)]'+function(control,'struct JobCompletion {'))
   extra=extra.replace('// ACTUAL_FINISH_JOB',function(control,'fn finish_job(')).replace('// ACTUAL_ABORT',function(control,'pub fn abort('))
   accept=function(control,'pub fn accept(');start=accept.index('        job.completion =');end=accept.index('        finish_job(s, job, Some(output))')+len('        finish_job(s, job, Some(output))')
@@ -99,7 +99,7 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
   extra=extra.replace('// ACTUAL_ACCEPT_RETRY_PREFIX',prefix)
   extra=extra.replace('// ACTUAL_FINAL_ACCEPT',accept[start:end]);program+='\n'+extra
   with tempfile.TemporaryDirectory() as tmp:
-   d=Path(tmp);evidence=(ROOT/'kernel/src/domain_evidence.rs').read_text()+'\npub fn submission_tail(slot:usize)->[u64;27]{core::array::from_fn(|i|get(base(slot)+612+i))}\n';(d/'evidence.rs').write_text(evidence)
+   d=Path(tmp);evidence=(ROOT/'kernel/src/diagnostics/domain_evidence.rs').read_text()+'\npub fn submission_tail(slot:usize)->[u64;27]{core::array::from_fn(|i|get(base(slot)+612+i))}\n';(d/'evidence.rs').write_text(evidence)
    program=program.replace('// REAL_COMPLETION_EVIDENCE','#[path='+json.dumps(str(d/'evidence.rs'))+'] mod domain_evidence;')
    (d/'harness.rs').write_text(program);(d/'Cargo.toml').write_text('[package]\nname="submission-completion"\nversion="0.1.0"\nedition="2024"\n[lib]\npath="harness.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\nsha2="=0.10.9"\n[workspace]\n')
    command=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-submission-completion'),'--','--test-threads=1','submission_completion_']
@@ -110,7 +110,7 @@ fn begin(slot:usize,sequence:u64){let mut input=[0;512];input[2]=sequence;input[
     (d/'harness.rs').write_text(program.replace(matching[0],matching[0].replace(marker,'[0;27]')));negative=subprocess.run(command,cwd=ROOT,env=env(),capture_output=True,text=True,timeout=120)
     self.assertNotEqual(negative.returncode,0,negative.stdout+negative.stderr);self.assertNotIn('error[E',negative.stdout+negative.stderr);self.assertIn('test result: FAILED',negative.stdout+negative.stderr);self.assertIn(message,negative.stdout+negative.stderr)
  def test_actual_accept_submit_and_readonly_blocks_preserve_original_outcomes(self):
-  control=(ROOT/'kernel/src/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_accept_segment.rs').read_text();accept=function(control,'pub fn accept(')
+  control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text();program=native_program();extra=(ROOT/'tests/host/submission_accept_segment.rs').read_text();accept=function(control,'pub fn accept(')
   start=accept.index('            provenance.accept(submission::AcceptStage::Executor);');end=accept.index('            Ok(receipt.version)')+len('            Ok(receipt.version)')
   segment=accept[start:end]
   # This segment starts after borrow acquisition. Its model/Root/task scope

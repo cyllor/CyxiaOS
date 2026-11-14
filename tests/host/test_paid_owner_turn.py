@@ -18,7 +18,7 @@ from test_governance_billing_priority import function
 
 class PaidOwnerTurn(unittest.TestCase):
     def test_real_gate_preserves_paid_turn_without_renewing_its_epoch(self):
-        gate = (ROOT / 'kernel/src/domain_tasks/owner_gate.rs').read_text()
+        gate = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs').read_text()
         # Before the API exists this no-op adapter permits a behavioral RED,
         # rather than making an absent method the test's failure condition.
         adapter = '' if 'fn protect_service_until(' in gate else '''
@@ -28,7 +28,7 @@ impl owner_gate::Permit<'_> {
 '''
         template = (ROOT / 'tests/host/paid_owner_turn_harness.rs').read_text()
         template = template.replace('// OWNER_GATE_MODULE', '#[path=' + json.dumps(str(
-            ROOT / 'kernel/src/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
+            ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs')) + '] mod owner_gate;')
         template = template.replace('// BEFORE_API_ADAPTER', adapter)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -58,7 +58,7 @@ impl owner_gate::Permit<'_> {
                 self.assertEqual(gate.count(old), 1)
                 mutant = directory / 'mutant.rs'
                 mutant.write_text(gate.replace(old, new))
-                rust.write_text(template.replace(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'),
+                rust.write_text(template.replace(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'),
                                                 str(mutant)))
                 compiled = subprocess.run(command, cwd=ROOT, env=env(), capture_output=True,
                                           text=True, timeout=60)
@@ -69,7 +69,7 @@ impl owner_gate::Permit<'_> {
                 self.assertIn(failure, negative.stdout + negative.stderr)
 
     def test_production_admission_and_authority_use_the_same_bounded_preference(self):
-        source = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
         pieces = [re.search(r'^static LOCK:.*;$', source, re.M)[0],
                   function(source, 'struct Guard'), function(source, 'impl Drop for Guard'),
                   function(source, 'fn acquire_guard()'), function(source, 'fn locked<R>'),
@@ -83,9 +83,9 @@ impl owner_gate::Permit<'_> {
         for signature in ['impl Guard', 'fn locked_with_guard<R>']:
             if signature in source:
                 pieces.append(function(source, signature))
-        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs'))
+        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs'))
                       + '] mod owner_gate;')
-        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/service_authority.rs'))
+        pieces.insert(0, '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/service_authority.rs'))
                       + '] mod service_authority;')
         template = (ROOT / 'tests/host/paid_owner_admission_harness.rs').read_text().replace(
             '// PRODUCTION_BODIES', '\n'.join(pieces))

@@ -1,9 +1,9 @@
-#[path = "../../../kernel/src/domain_platform/read_snapshot.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/read_snapshot.rs"]
 pub mod read_snapshot;
 mod domain_platform {
     pub use crate::read_snapshot;
 }
-#[path = "../../../kernel/src/domain_services/target_projection.rs"]
+#[path = "../../../kernel/src/runtime/services/domain_services/target_projection.rs"]
 mod target_projection;
 use cyxia_prototype::domains::ObjectKey;
 use read_snapshot::ReadSnapshot;

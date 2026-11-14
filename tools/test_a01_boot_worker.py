@@ -22,7 +22,7 @@ class BootWorkerOrdering(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         root = Path(cls.temp.name)
         template = (ROOT / 'tests/host/boot_model_harness.rs').read_text()
-        marker = '"../../kernel/src/prototype_runtime/boot_model.rs"'
+        marker = '"../../kernel/src/runtime/control/prototype_runtime/boot_model.rs"'
         if template.count(marker) != 1:
             raise AssertionError('worker harness must include exactly the actual kernel source')
 
@@ -37,7 +37,7 @@ class BootWorkerOrdering(unittest.TestCase):
                 raise AssertionError(result.stdout + result.stderr)
             return binary
 
-        cls.current = compile_worker(ROOT / 'kernel/src/prototype_runtime/boot_model.rs', 'current')
+        cls.current = compile_worker(ROOT / 'kernel/src/runtime/control/prototype_runtime/boot_model.rs', 'current')
         original = (ROOT / 'tests/fixtures/a01-boot-worker-before-settlement.rs.txt').read_bytes()
         # Exact reviewed Git blob from 9336226; a historical implementation,
         # not a second hand-written model of the behavior under test.

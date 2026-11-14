@@ -1,6 +1,6 @@
 //! Real replay-window gate and Registry commit callbacks with explicit host
 //! clocks. These fixtures create no native sample, model or executor receipt.
-#[path = "../../../kernel/src/domain_control/replay/candidate_window.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/replay/candidate_window.rs"]
 mod candidate_window;
 use candidate_window::{Observation, Window};
 use cyxia_prototype::{

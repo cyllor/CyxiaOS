@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_platform/read_snapshot.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/read_snapshot.rs"]
 mod read_snapshot;
 use read_snapshot::ReadSnapshot;
 use std::sync::{

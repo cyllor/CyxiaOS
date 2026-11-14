@@ -1,4 +1,4 @@
-#[path = "../../kernel/src/storage_fault_capture/state.rs"]
+#[path = "../../kernel/src/diagnostics/storage_fault_capture/state.rs"]
 mod state;
 use core::sync::atomic::Ordering;
 

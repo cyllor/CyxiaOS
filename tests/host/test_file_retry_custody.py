@@ -16,9 +16,9 @@ class FileRetryCustody(unittest.TestCase):
     def test_no_effect_retry_and_delivered_receipt_have_different_custody(self):
         template = (ROOT / 'tests/host/file_retry_harness.rs').read_text()
         template = template.replace('// DISPATCH_RESULT', function(
-            (ROOT / 'kernel/src/domain_file_abi.rs').read_text(), 'pub(crate) enum DispatchResult'))
+            (ROOT / 'kernel/src/runtime/files/domain_file_abi.rs').read_text(), 'pub(crate) enum DispatchResult'))
         template = template.replace('// FILE_SERVICE_FUNCTION', function(
-            (ROOT / 'kernel/src/domain_tasks/execution.rs').read_text(), 'fn service_file('))
+            (ROOT / 'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text(), 'fn service_file('))
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / 'Cargo.toml').write_text(

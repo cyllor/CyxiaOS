@@ -6,7 +6,7 @@ pub mod abi;
 mod unified {
     pub use crate::abi;
 }
-#[path = "../../../kernel/src/domain_network/placement_legal.rs"]
+#[path = "../../../kernel/src/runtime/network/domain_network/placement_legal.rs"]
 mod placement_legal;
 use cyxia_prototype::{
     domains::{Action, Error, ObjectKey},

@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/peer_replay/ledger.rs"]
+#[path = "../../../kernel/src/runtime/cluster/peer_replay/ledger.rs"]
 mod ledger;
 use cyxia_peer_billing::{Assembler, Binding, Endpoint, MAX_INTERVALS};
 use cyxia_prototype::{

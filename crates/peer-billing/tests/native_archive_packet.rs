@@ -12,7 +12,7 @@ use cyxia_prototype::{
 };
 use ed25519_dalek::SigningKey;
 
-#[path = "../../../kernel/src/learning_replay/archive_packet.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/archive_packet.rs"]
 mod archive_packet;
 
 fn pair() -> (Keys, Keys) {

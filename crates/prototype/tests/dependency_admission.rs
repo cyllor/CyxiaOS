@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_control/dependencies.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/dependencies.rs"]
 mod dependencies;
 use cyxia_prototype::{
     domains::{Error, ObjectKey},

@@ -153,7 +153,7 @@ pub enum Split {
     Training,
     Validation,
 }
-#[path = "../../../kernel/src/learning_replay/sample_witness.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/sample_witness.rs"]
 mod sample_witness;
 #[path = "support/learning.rs"]
 mod support;
@@ -190,7 +190,7 @@ pub mod archive {
         }
     }
 }
-#[path = "../../../kernel/src/learning_replay/sample_export.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_replay/sample_export.rs"]
 mod sample_export;
 fn reset() {
     BLOCK_SYNC.store(false, Ordering::Release);

@@ -22,19 +22,19 @@ def source():
     # Keep the complete production publish callback, including actual Desired
     # and ADMISSION writes. Only hardware/scope authority, Root, history
     # storage and final delivery cross explicit controlled kernel boundaries.
-    control = (ROOT/'kernel/src/domain_control.rs').read_text()
+    control = (ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
     p = p.replace('#[derive(Clone,Copy)]struct Desired{state:ExecutionState,execution_observed:bool}',
                   '#[derive(Clone,Copy)]'+function(control, 'struct Desired {'))
     p = p.replace(function(p, "impl<S: PublicationScope> policy::Executor for Executor<'_, S>"),
                   function(control, "impl<S: PublicationScope> policy::Executor for Executor<'_, S>"))
     p += '\n'+function(control, 'fn execution_limit(')
-    admission = (ROOT/'kernel/src/domain_control/dependencies.rs').read_text()
+    admission = (ROOT/'kernel/src/runtime/control/domain_control/dependencies.rs').read_text()
     admission += '\nimpl AdmissionView{pub fn snapshot(&self)->[u64;4]{let e=&self.entries[0];[e.domain.load(Ordering::Acquire),e.id.load(Ordering::Acquire),e.version.load(Ordering::Acquire),e.state.load(Ordering::Acquire)]}}'
     p += '\nmod admission_view{\n'+admission+'\n}\nstatic ADMISSION:admission_view::AdmissionView=admission_view::AdmissionView::new();\n'
-    history = (ROOT/'kernel/src/learning_history.rs').read_text()
+    history = (ROOT/'kernel/src/runtime/learning/learning_history.rs').read_text()
     p += '\nmod learning_history{use super::*;\n'+function(history,"pub struct Publish<'")+'\npub fn record_publish(p:Publish<\'_>)->Result<bool,Error>{assert_eq!(p.plan_version,1);assert_eq!(p.apply.plan_seq,1);Ok(true)}}\n'
     p = p.replace('mod replay{pub fn reject_first_job', 'mod replay{pub fn published(plan:&super::Plan,boot:u64,stamp:Option<super::PolicyStamp>)->Result<(),super::Error>{assert_eq!(boot,11);assert_eq!(plan.header.plan_seq,1);assert_eq!(stamp.unwrap().version,1);super::EFFECTS.fetch_add(1,super::Ordering::AcqRel);Ok(())} pub fn reject_first_job')
-    module = ROOT / 'kernel/src/domain_control/publication_cost.rs'
+    module = ROOT / 'kernel/src/runtime/control/domain_control/publication_cost.rs'
     if module.exists():
         p=p.replace('#[path='+json.dumps(str(module))+'] mod publication_cost;', '')
         body = module.read_text()

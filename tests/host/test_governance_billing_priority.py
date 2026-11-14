@@ -24,8 +24,8 @@ def function(source, signature):
 
 class GovernanceBillingPriority(unittest.TestCase):
     def test_actual_native_step_releases_original_bill_before_ready_request(self):
-        native = (ROOT / 'kernel/src/prototype_runtime/native.rs').read_text()
-        governance = (ROOT / 'kernel/src/prototype_runtime/governance.rs').read_text()
+        native = (ROOT / 'kernel/src/runtime/control/prototype_runtime/native.rs').read_text()
+        governance = (ROOT / 'kernel/src/runtime/control/prototype_runtime/governance.rs').read_text()
         step = function(native, 'pub(super) fn step(worker: &mut Worker)')
         template = (ROOT / 'tests/host/governance_priority_harness.rs').read_text()
         template = template.replace('// GOVERNANCE_BILL_FUNCTION',

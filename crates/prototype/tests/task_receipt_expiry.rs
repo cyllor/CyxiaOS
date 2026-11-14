@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_tasks/receipts.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/receipts.rs"]
 mod receipts;
 use cyxia_prototype::{
     domains::{

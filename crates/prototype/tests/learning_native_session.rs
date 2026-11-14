@@ -17,9 +17,9 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-#[path = "../../../kernel/src/control_pool/ledger.rs"]
+#[path = "../../../kernel/src/runtime/control/control_pool/ledger.rs"]
 mod ledger;
-#[path = "../../../kernel/src/learning_session.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_session.rs"]
 mod session;
 #[path = "support/learning.rs"]
 mod support;

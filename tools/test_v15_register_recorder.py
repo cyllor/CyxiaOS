@@ -9,7 +9,7 @@ from test_a01_formal_recorder import function
 
 class ActualRecorder(unittest.TestCase):
     def test_capture_copies_every_word_and_does_not_reconstruct_expected_patterns(self):
-        source=(ROOT/'kernel/src/register_evidence.rs').read_text()
+        source=(ROOT/'kernel/src/diagnostics/register_evidence.rs').read_text()
         context=(ROOT/'crates/arch-aarch64/src/user.rs').read_text()
         structure=function(context,'pub struct Context {')
         body='\n'.join(function(source,n) for n in ('fn put(','fn get(','fn capture('))

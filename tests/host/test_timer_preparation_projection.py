@@ -14,8 +14,8 @@ def function(source: str, signature: str) -> str:
 
 class TimerPreparationProjection(unittest.TestCase):
     def test_single_snapshot_projection_and_live_revalidation(self):
-        platform = (ROOT / "kernel/src/domain_platform.rs").read_text()
-        control = (ROOT / "kernel/src/domain_control.rs").read_text()
+        platform = (ROOT / "kernel/src/platform/virt/domain_platform.rs").read_text()
+        control = (ROOT / "kernel/src/runtime/control/domain_control.rs").read_text()
         policy = (ROOT / "crates/prototype/src/policy.rs").read_text()
 
         start = platform.index("#[derive(Clone, Copy)]\npub(crate) struct TimerPreparation")

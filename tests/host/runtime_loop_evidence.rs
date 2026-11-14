@@ -1,4 +1,4 @@
-#[path = "../../kernel/src/unified_runtime_loop.rs"]
+#[path = "../../kernel/src/runtime/cluster/unified_runtime_loop.rs"]
 mod evidence;
 
 #[test]

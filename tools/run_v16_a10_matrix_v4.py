@@ -18,6 +18,7 @@ import sys
 import time
 
 from doctor import ROOT
+from native_session import native_lease, idle_native_host
 from check_prototype_evidence import require, read_json, safe_path, sha256 as entry_digest
 from run_v13_a10 import run as run_clean
 from run_v16_a10_cut_v4 import run as run_cut
@@ -52,14 +53,6 @@ def retained_bytes(root):
     return total
 
 
-def idle_native_host():
-    rows = subprocess.run(['ps','-axo','pid=,comm='],capture_output=True,text=True,check=True).stdout
-    busy = [row.strip() for row in rows.splitlines() if row.split()
-            and Path(row.strip().split(None,1)[-1]).name in
-                ('qemu-system-aarch64','cargo','rustc','clang')]
-    require(not busy,'v4 matrix native/build exclusion: '+repr(busy))
-
-
 def run(*, output, seed, prepare, overwrite_probe, source_root, build_manifest,
         qemu_binary, qemu_source, native_lock, max_new_children, max_storage_bytes,
         resume=False, operator_diagnose_stalled_cache=False):
@@ -75,8 +68,7 @@ def run(*, output, seed, prepare, overwrite_probe, source_root, build_manifest,
         require(not output.exists(),'v4 matrix output exists; explicit resume required')
         output.mkdir(parents=True,mode=0o700)
     require(native_lock.parent.is_dir() and not native_lock.is_symlink(), 'v4 matrix native lock parent')
-    with native_lock.open('a') as native_lease, (output/'campaign.lock').open('a') as campaign_lease:
-        fcntl.flock(native_lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with native_lease(native_lock), (output/'campaign.lock').open('a') as campaign_lease:
         fcntl.flock(campaign_lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
         idle_native_host()
         if resume:

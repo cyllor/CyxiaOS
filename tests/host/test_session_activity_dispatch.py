@@ -18,14 +18,14 @@ from test_governance_billing_priority import function
 
 class SessionActivityDispatch(unittest.TestCase):
     def test_native_activity_guards_fresh_wait_and_paid_dispatch(self):
-        native = (ROOT / 'kernel/src/unified.rs').read_text()
-        task = (ROOT / 'kernel/src/unified_task.rs').read_text()
+        native = (ROOT / 'kernel/src/runtime/cluster/unified.rs').read_text()
+        task = (ROOT / 'kernel/src/runtime/cluster/unified_task.rs').read_text()
         arm = function(native, 'abi::OP_TASK =>')
         phase = function(task, 'if phase == 9')
         template = (ROOT / 'tests/host/session_activity_dispatch_harness.rs').read_text()
         code = template.replace('// PHASE9', phase).replace('// OP_TASK', arm)
         code = code.replace('ACTIVITY_DIAGNOSTIC_PATH', json.dumps(str(
-            ROOT / 'kernel/src/session_activity_diagnostic.rs')))
+            ROOT / 'kernel/src/diagnostics/session_activity_diagnostic.rs')))
         code = code.replace('// BROKER_TIMING', function(task, 'pub fn observe_broker_timing('))
         code = code.replace('// SAMPLES', '\n'.join(function(native, name) for name in
             ['fn finish_service(', 'fn service_start(']))

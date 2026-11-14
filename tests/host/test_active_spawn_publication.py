@@ -20,16 +20,16 @@ from test_active_accept_retry import program as accept_program
 
 
 def program():
-    control = (ROOT / 'kernel/src/domain_control.rs').read_text()
-    tasks = (ROOT / 'kernel/src/domain_tasks.rs').read_text()
-    publication = (ROOT / 'kernel/src/domain_tasks/publication.rs').read_text()
+    control = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
+    tasks = (ROOT / 'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+    publication = (ROOT / 'kernel/src/runtime/tasks/domain_tasks/publication.rs').read_text()
     code = accept_program().split('fn setup(mode:')[0].replace('#![allow(dead_code,unused_imports)]', '#![allow(dead_code,unused_imports,unused_variables)]')
     code = code.replace('pub mod cpu{pub fn slot()->usize{1}}', 'pub mod cpu{pub fn slot()->usize{super::SLOT.load(super::Ordering::Acquire)}}')
     code = code.replace('#[derive(Clone,Copy)]struct Family{legal:fn(Action,ObjectKey,u64)->Result<(),Error>}', '#[derive(Clone,Copy)]' + function(control, 'pub struct Family'))
     code = code.replace('#[derive(Clone,Copy)]struct Context{core_generation:u64,ledger_generation:u64}', '#[derive(Clone,Copy,Default)]' + function(control, 'pub struct Context'))
     code = code.replace('#[derive(Clone,Copy)]struct Desired{state:ExecutionState,execution_observed:bool}', '#[derive(Clone,Copy)]' + function(control, 'struct Desired {'))
     code = code.replace(function(code, "impl<S: PublicationScope> policy::Executor for Executor<'_, S>"), function(control, "impl<S: PublicationScope> policy::Executor for Executor<'_, S>"))
-    history = (ROOT / 'kernel/src/learning_history.rs').read_text()
+    history = (ROOT / 'kernel/src/runtime/learning/learning_history.rs').read_text()
     code += '\nmod learning_history{use super::*;\n' + function(history, "pub struct Publish<'") + '\npub fn record_publish(p:Publish<\'_>)->Result<bool,Error>{HISTORY.with(|h|*h.borrow_mut()=Some(History{apply:p.apply,version:p.plan_version,stamp:p.stamp,model:p.model,selected:p.selected,scores:p.scores.to_vec(),concurrent:p.concurrent.to_vec()}));Ok(true)}}\n' + function(control, 'fn execution_limit(')
     code = code.replace('families:[Option<Family>;1]', 'families:[Option<Family>;18],stability:[Option<StabilityGuard>;1],stability_high:usize')
     code = code.replace(function(code, 'fn require_control('), function(control, 'fn require_control('))
@@ -48,7 +48,7 @@ def program():
 pub fn register(f:Family)->Result<(),super::Error>{super::FAMILIES.with(|v|v.borrow_mut().push(f));Ok(())}
 pub fn register_dependencies(_:u16,_:fn(super::ObjectKey)->Result<[Option<Prerequisite>;2],super::Error>)->Result<(),super::Error>{Ok(())}
 pub fn register_execution_observer(_:u16,_:fn(super::ObjectKey,u64)->Result<(),super::Error>)->Result<(),super::Error>{Ok(())}}''')
-    target = (ROOT / 'kernel/src/domain_control/target_batch.rs').read_text()
+    target = (ROOT / 'kernel/src/runtime/control/domain_control/target_batch.rs').read_text()
     code += '\n#[derive(Clone,Copy,PartialEq,Eq)]' + function(target, 'pub enum Source').replace('enum Source', 'enum TargetSource')
     bodies = [re.search(r'^static LOCK:.*;$', tasks, re.M)[0], function(tasks, 'struct Guard {')]
     bodies += [function(tasks, name) for name in ['impl Drop for Guard', 'fn acquire_guard()', 'fn locked<R>', 'fn locked_with_guard<R>', 'fn group_index(', 'pub fn validate_action(', 'pub fn current_action(', 'fn control_current(', 'pub fn register_control()']]
@@ -69,9 +69,9 @@ pub fn register_execution_observer(_:u16,_:fn(super::ObjectKey,u64)->Result<(),s
         bodies += [function(publication, name) for name in ['pub(crate) struct SpawnPublication', 'pub(crate) fn reserve_spawn_publication(', 'impl SpawnPublication', 'pub(crate) fn spawn_publication_matches(']]
     bodies += ['fn scheduling_dependencies(_:ObjectKey)->Result<[Option<domain_control::Prerequisite>;2],Error>{panic!("unused D01 resolver")}', 'fn scheduling_dependencies_locked(_: &State,_:ObjectKey)->Result<[Option<domain_control::Prerequisite>;2],Error>{panic!("unused D01 owner")}', 'fn vector_dependencies(_:ObjectKey)->Result<[Option<domain_control::Prerequisite>;2],Error>{panic!("unused vector resolver")}', 'fn confirm_ipc_execution(_:ObjectKey,_:u64)->Result<(),Error>{panic!("unused IPC observer")}']
     task_fixture = (ROOT / 'tests/host/active_spawn_publication_harness.rs').read_text()
-    admission = (ROOT / 'kernel/src/domain_control/dependencies.rs').read_text()
+    admission = (ROOT / 'kernel/src/runtime/control/domain_control/dependencies.rs').read_text()
     admission += '\nimpl AdmissionView{pub fn snapshot(&self)->[u64;6]{let e=&self.entries[0];[e.domain.load(Ordering::Acquire),e.id.load(Ordering::Acquire),e.generation.load(Ordering::Acquire),e.version.load(Ordering::Acquire),e.until.load(Ordering::Acquire),e.state.load(Ordering::Acquire)]}}'
-    task_fixture = task_fixture.replace('// OWNER_GATE_PATH', '#[path=' + json.dumps(str(ROOT / 'kernel/src/domain_tasks/owner_gate.rs')) + '] mod owner_gate;').replace('// ADMISSION_PATH', 'mod admission_view{\n' + admission + '\n}')
+    task_fixture = task_fixture.replace('// OWNER_GATE_PATH', '#[path=' + json.dumps(str(ROOT / 'kernel/src/runtime/tasks/domain_tasks/owner_gate.rs')) + '] mod owner_gate;').replace('// ADMISSION_PATH', 'mod admission_view{\n' + admission + '\n}')
     code = code.replace('// TASKS', task_fixture.split('// TESTS')[0].replace('// TASK_BODIES', '\n'.join(bodies)))
     return code + '\n' + task_fixture.split('// TESTS')[1]
 

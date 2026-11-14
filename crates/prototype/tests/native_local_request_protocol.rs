@@ -62,7 +62,7 @@ mod domain_tasks {
         Ok(())
     }
 }
-#[path = "../../../kernel/src/local_placement.rs"]
+#[path = "../../../kernel/src/runtime/tasks/local_placement.rs"]
 mod local;
 
 use core::sync::atomic::Ordering;

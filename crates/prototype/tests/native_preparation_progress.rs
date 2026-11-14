@@ -1,6 +1,6 @@
 //! Production diagnostic transitions with literal host fixtures; no native authority.
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_control/replay/preparation_progress.rs"]
+#[path = "../../../kernel/src/runtime/control/domain_control/replay/preparation_progress.rs"]
 mod progress;
 use cyxia_prototype::{
     domains::{ApplyId, Error, ObjectKey, PolicyStamp},

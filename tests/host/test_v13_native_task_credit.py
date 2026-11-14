@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativeTaskCredit(unittest.TestCase):
     def test_builtin_workers_do_not_run_on_tail_credit_below_one_full_turn(self):
-        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
+        source = (ROOT / "kernel/src/runtime/tasks/domain_tasks.rs").read_text()
 
         self.assertIn("const BUILTIN_MIN_GRANT_NS: u64 = 10_000_000;", source)
         self.assertIn("if d.thread == builtin(slot)", source)
@@ -15,7 +15,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("pub fn builtin_selected", source)
 
     def test_cpu0_service_owners_have_separate_credits_and_single_writer_detail(self):
-        source = (ROOT / "kernel/src/domain_services.rs").read_text()
+        source = (ROOT / "kernel/src/runtime/services/domain_services.rs").read_text()
 
         self.assertIn("static DOMAIN_SERVICE_DETAIL: ServiceDetail", source)
         self.assertIn("size_of::<ServiceDetail>() == 128", source)
@@ -68,7 +68,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("checked_add(HANDSHAKE_TIMEOUT_MS)", tls)
 
     def test_network_stage_diagnostic_is_outside_next_service_debit(self):
-        runtime = (ROOT / "kernel/src/unified.rs").read_text()
+        runtime = (ROOT / "kernel/src/runtime/cluster/unified.rs").read_text()
         turn = runtime[runtime.index("fn network_turn(") : runtime.index("fn progress(")]
 
         self.assertLess(
@@ -82,7 +82,7 @@ class NativeTaskCredit(unittest.TestCase):
         )
 
     def test_builtin_boundary_has_single_writer_phase_detail(self):
-        runtime = (ROOT / "kernel/src/smp.rs").read_text()
+        runtime = (ROOT / "kernel/src/arch/aarch64/smp.rs").read_text()
 
         self.assertIn("static BUILTIN_TASK_DETAIL: BuiltinDetail", runtime)
         self.assertIn("size_of::<BuiltinDetail>() == 256", runtime)
@@ -103,8 +103,8 @@ class NativeTaskCredit(unittest.TestCase):
         )
 
     def test_builtin_fixture_yields_after_a_fixed_batch_with_timer_backstop(self):
-        assembly = (ROOT / "kernel/src/smp_user.S").read_text()
-        runtime = (ROOT / "kernel/src/smp.rs").read_text()
+        assembly = (ROOT / "kernel/src/arch/aarch64/smp_user.S").read_text()
+        runtime = (ROOT / "kernel/src/arch/aarch64/smp.rs").read_text()
 
         self.assertIn("mov x12, #16", assembly)
         self.assertIn("subs x12, x12, #1", assembly)
@@ -115,7 +115,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("ctx.regs[2] = 4;", runtime)
         self.assertIn("prepare_builtin_capture(slot, i)", runtime)
         self.assertIn("builtin_capture_index(cpu::slot())", runtime)
-        tasks = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        tasks = (ROOT / "kernel/src/runtime/tasks/domain_tasks/execution.rs").read_text()
         self.assertIn("if !s.tasks[i].capture_ready", tasks)
         self.assertIn("crate::a02_capture::prepare(task)", tasks)
         self.assertIn("s.tasks[i].capture_index = capture_index", tasks)
@@ -151,7 +151,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("fixture_context_valid(ctx, i)", unified_loop)
 
     def test_builtin_immutable_root_keeps_full_context_without_global_tlbi(self):
-        runtime = (ROOT / "kernel/src/smp.rs").read_text()
+        runtime = (ROOT / "kernel/src/arch/aarch64/smp.rs").read_text()
         arch = (ROOT / "crates/arch-aarch64/src/user.rs").read_text()
         assembly = (ROOT / "crates/arch-aarch64/src/user.S").read_text()
 
@@ -168,8 +168,8 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("cbz x11, .Luser_low_walks_revoked", assembly)
 
     def test_cpu0_service_completion_scan_uses_owned_layout_only(self):
-        runtime = (ROOT / "kernel/src/unified.rs").read_text()
-        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        runtime = (ROOT / "kernel/src/runtime/cluster/unified.rs").read_text()
+        execution = (ROOT / "kernel/src/runtime/tasks/domain_tasks/execution.rs").read_text()
         start = execution.index("pub fn service(_now:")
         end = execution.index("fn lifecycle_piece", start)
         service = execution[start:end]
@@ -181,7 +181,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertNotIn("for slot in 0..64", service)
 
     def test_cpu0_service_pumps_publish_stopped_snapshot_boundaries(self):
-        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        execution = (ROOT / "kernel/src/runtime/tasks/domain_tasks/execution.rs").read_text()
         start = execution.index("pub fn service(_now:")
         end = execution.index("fn lifecycle_piece", start)
         service = execution[start:end]
@@ -204,7 +204,7 @@ class NativeTaskCredit(unittest.TestCase):
                         service.index("crate::learning_replay::service_io(progress);"))
 
     def test_storage_profile_records_unsettled_cpu0_credit_error(self):
-        source = (ROOT / "kernel/src/domain_tasks.rs").read_text()
+        source = (ROOT / "kernel/src/runtime/tasks/domain_tasks.rs").read_text()
         start = source.index("fn complete_locked")
         end = source.index("pub fn complete_builtin", start)
         completion = source[start:end]
@@ -218,8 +218,8 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("active.dispatch.started_ns", completion)
 
     def test_a10_consumption_snapshot_retries_transient_task_lock_before_effect(self):
-        capture = (ROOT / "kernel/src/storage_fault_capture.rs").read_text()
-        file_abi = (ROOT / "kernel/src/domain_file_abi.rs").read_text()
+        capture = (ROOT / "kernel/src/diagnostics/storage_fault_capture.rs").read_text()
+        file_abi = (ROOT / "kernel/src/runtime/files/domain_file_abi.rs").read_text()
 
         self.assertIn("pub fn entered(owner: ObjectKey, frame: &[u8; 640]) -> Result<(), Error>",
                       capture)
@@ -231,8 +231,8 @@ class NativeTaskCredit(unittest.TestCase):
                         file_abi.index("let result = (||"))
 
     def test_a10_delivery_retains_operation_completion_io_snapshot(self):
-        capture = (ROOT / "kernel/src/storage_fault_capture.rs").read_text()
-        file_abi = (ROOT / "kernel/src/domain_file_abi.rs").read_text()
+        capture = (ROOT / "kernel/src/diagnostics/storage_fault_capture.rs").read_text()
+        file_abi = (ROOT / "kernel/src/runtime/files/domain_file_abi.rs").read_text()
 
         self.assertIn("pub fn snapshot() -> Option<[u64; 4]>", capture)
         self.assertIn("io: [u64; 4]", capture)
@@ -244,7 +244,7 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("pending.capture_io", file_abi)
 
     def test_a10_cache_client_uses_its_source_bound_private_page_quota(self):
-        execution = (ROOT / "kernel/src/domain_tasks/execution.rs").read_text()
+        execution = (ROOT / "kernel/src/runtime/tasks/domain_tasks/execution.rs").read_text()
 
         self.assertIn("a10_budget::client_memory_pages", execution)
         self.assertNotIn("register_owner(key, if client || local { 16 }", execution)

@@ -55,3 +55,26 @@ class BootProfileTests(unittest.TestCase):
     symbol(b,'CYXIA_BOOT_PROFILE')
   for length in range(64):
    with self.assertRaises(ValueError):symbol(bytes(length),'CYXIA_BOOT_PROFILE')
+
+ def boundary_image(self):
+  b=self.image(size=0)
+  struct.pack_into('<H',b,56,2)
+  struct.pack_into('<IIQQQQQQ',b,120,1,6,304,0x40201000,0x40201000,16,4096,1)
+  struct.pack_into('<Q',b,800+8,0x40201000)
+  b[900:919]=b'\0__stack_top\0'+bytes(6)
+  return b
+
+ def test_zero_size_linker_symbol_at_contiguous_load_boundary_resolves_once(self):
+  self.assertEqual(symbol(self.boundary_image(),'__stack_top'),
+                   dict(va=0x40201000,pa=0x40201000,size=0))
+
+ def test_boundary_symbol_with_distinct_physical_mappings_is_ambiguous(self):
+  b=self.boundary_image();struct.pack_into('<Q',b,120+24,0x40202000)
+  with self.assertRaisesRegex(ValueError,'ambiguous symbol'):symbol(b,'__stack_top')
+
+ def test_duplicate_symbol_table_entries_are_not_collapsed(self):
+  for second_value in (0x40201000,0x40201008):
+   b=self.boundary_image();struct.pack_into('<Q',b,576+32,48)
+   b[824:848]=b[800:824];struct.pack_into('<Q',b,824+8,second_value)
+   with self.subTest(second_value=second_value),self.assertRaisesRegex(ValueError,'ambiguous symbol'):
+    symbol(b,'__stack_top')

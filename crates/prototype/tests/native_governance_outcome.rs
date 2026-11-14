@@ -1,5 +1,5 @@
 //! Retry classification for actual paid EL0 coordinator turns, not native proof.
-#[path = "../../../kernel/src/prototype_runtime/governance/outcome.rs"]
+#[path = "../../../kernel/src/runtime/control/prototype_runtime/governance/outcome.rs"]
 mod outcome;
 
 use cyxia_prototype::domains::Error;

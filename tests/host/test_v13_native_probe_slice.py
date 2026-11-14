@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativeProbeSlice(unittest.TestCase):
     def test_mapping_probe_has_wall_escape_headroom_without_larger_cpu_credit(self):
-        source = (ROOT / "kernel/src/prototype_runtime/native.rs").read_text()
+        source = (ROOT / "kernel/src/runtime/control/prototype_runtime/native.rs").read_text()
 
         self.assertRegex(source, r"const PROBE_PREPAY_NS: u64 = 8_000_000;")
         self.assertRegex(source, r"const SERVICE_SLICE_NS: u64 = 100_000;")
@@ -35,7 +35,7 @@ class NativeProbeSlice(unittest.TestCase):
         self.assertIn("PROBE_PREPAY_NS\n    };", source)
         self.assertIn("!worker.native.probing", source)
 
-        entry = (ROOT / "kernel/src/smp.rs").read_text()
+        entry = (ROOT / "kernel/src/arch/aarch64/smp.rs").read_text()
         probe_path = entry[entry.index("if !capture_boundary {") : entry.index("let saved_daif")]
         self.assertIn("timer::arm(deadline);", probe_path)
         self.assertIn("user::enter_integer_probe(context, root);", probe_path)

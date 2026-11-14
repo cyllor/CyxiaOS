@@ -10,7 +10,7 @@ mod domain_platform {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_network/requests.rs"]
+#[path = "../../../kernel/src/runtime/network/domain_network/requests.rs"]
 mod requests;
 
 use cyxia_prototype::domains::ObjectKey;

@@ -14,26 +14,27 @@ from test_governance_billing_priority import function
 
 class PaidCaptureCost(unittest.TestCase):
     def test_recorder_cost_is_in_original_capture_and_submitted_debit(self):
-        bridge=(ROOT/'kernel/src/learning_evidence.rs').read_text()
-        provenance=(ROOT/'kernel/src/learning_evidence/provenance.rs').read_text()
-        tasks=(ROOT/'kernel/src/domain_tasks.rs').read_text()
-        execution=(ROOT/'kernel/src/domain_tasks/execution.rs').read_text()
+        bridge=(ROOT/'kernel/src/runtime/learning/learning_evidence.rs').read_text()
+        provenance=(ROOT/'kernel/src/runtime/learning/learning_evidence/provenance.rs').read_text()
+        tasks=(ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
+        execution=(ROOT/'kernel/src/runtime/tasks/domain_tasks/execution.rs').read_text()
         harness=(ROOT/'tests/host/capture_paid_cost_harness.rs').read_text()
         bodies='\n'.join(function(execution,s) for s in ['fn capture_task_identity(','fn cleanup(','pub fn service_io_piece<R>'])
         bodies+='\n'+function(tasks,'pub fn service_segment<R>')+'\n'+function(tasks,'pub(crate) fn finish_cpu_interval(')
         harness=harness.replace('// ACTUAL_PAID_BODIES',bodies).replace('crate::learning_evidence::','crate::bridge::')
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);b=d/'learning_evidence.rs';p=d/'provenance.rs';h=d/'test.rs'
-            bridge=bridge.replace('"learning_evidence/','"'+str(ROOT/'kernel/src/learning_evidence')+'/')
-            bridge=bridge.replace(str(ROOT/'kernel/src/learning_evidence/provenance.rs'),str(p));b.write_text(bridge)
+            bridge = bridge.replace('"../tasks/domain_tasks/', '"' + str(ROOT / 'kernel/src/runtime/tasks/domain_tasks') + '/')
+            bridge=bridge.replace('"learning_evidence/','"'+str(ROOT/'kernel/src/runtime/learning/learning_evidence')+'/')
+            bridge=bridge.replace(str(ROOT/'kernel/src/runtime/learning/learning_evidence/provenance.rs'),str(p));b.write_text(bridge)
             # This controlled PMCC cost models the real writer instructions;
             # source collector/samples/cleanup/service-I/O/Scheduler stay real.
             signature='pub(super) fn completed(e: Completion) {'
             if signature not in provenance: signature='pub(super) fn observed(e: Observation) {'
             self.assertIn(signature,provenance)
             p.write_text(provenance.replace(signature,signature+'\n    crate::recorder_cost();'))
-            harness=harness.replace('"../../../kernel/src/domain_tasks/cancellation.rs"',json.dumps(str(ROOT/'kernel/src/domain_tasks/cancellation.rs')))
-            harness=harness.replace('"../../../kernel/src/learning_evidence.rs"',json.dumps(str(b)));h.write_text(harness)
+            harness=harness.replace('"../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"',json.dumps(str(ROOT/'kernel/src/runtime/tasks/domain_tasks/cancellation.rs')))
+            harness=harness.replace('"../../../kernel/src/runtime/learning/learning_evidence.rs"',json.dumps(str(b)));h.write_text(harness)
             (d/'Cargo.toml').write_text('[package]\nname="capture-paid-cost"\nversion="0.1.0"\nedition="2024"\n[[test]]\nname="paid-cost"\npath="test.rs"\n[dependencies]\ncyxia-prototype={path='+json.dumps(str(ROOT/'crates/prototype'))+'}\n[workspace]\n')
             cmd=[str(RUST_BIN/'cargo'),'test','--offline','--manifest-path',str(d/'Cargo.toml'),'--target-dir',str(ROOT/'target/host-capture-paid-cost'),'--','--nocapture']
             def run(case,source=bridge,code=harness):

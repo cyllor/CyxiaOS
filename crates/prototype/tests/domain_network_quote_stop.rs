@@ -1,7 +1,7 @@
 #[path = "../../../user/prototype-cluster/src/abi.rs"]
 #[allow(dead_code)]
 mod abi;
-#[path = "../../../kernel/src/domain_network/quote_stop.rs"]
+#[path = "../../../kernel/src/runtime/network/domain_network/quote_stop.rs"]
 #[allow(dead_code)]
 mod quote_stop;
 use cyxia_prototype::{

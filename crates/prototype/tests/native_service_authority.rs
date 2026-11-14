@@ -1,4 +1,4 @@
-#[path = "../../../kernel/src/domain_tasks/service_authority.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/service_authority.rs"]
 mod authority;
 use cyxia_prototype::domains::{
     Error, ObjectKey,

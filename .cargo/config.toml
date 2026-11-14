@@ -1,2 +1,8 @@
 [target.aarch64-unknown-none-softfloat]
 rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
+
+[target.x86_64-unknown-none]
+# The low identity-linked PC image uses small; prebuilt core uses kernel.
+# Do not merge incompatible LLVM code-model flags through workspace release LTO.
+# Keep ARM release LTO unchanged; x86 still uses the release optimization level.
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=small", "-C", "no-redzone=yes", "-C", "lto=off"]

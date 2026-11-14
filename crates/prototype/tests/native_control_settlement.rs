@@ -1,6 +1,6 @@
 //! Exercise the same bounded diagnostic writer used after physical settlement.
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/control_diagnostics.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/control_diagnostics.rs"]
 mod control_diagnostics;
 use control_diagnostics::Evidence;
 use cyxia_prototype::domains::Error;

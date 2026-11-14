@@ -13,7 +13,7 @@ from doctor import env
 
 class SessionActivityObservation(unittest.TestCase):
     def test_actual_admission_records_kernel_clock_and_does_not_renew_expired_authority(self):
-        source = (ROOT / 'kernel/src/unified_task.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/cluster/unified_task.rs').read_text()
         arm = source[source.index('    if phase == 9 {'):source.index('    if phase == 0 ||')]
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -64,7 +64,7 @@ fn actual_fresh_admission_and_transport_boundaries() {
         assert!(row[21..].iter().all(|w|*w==0));
     }
 }
-'''.replace('DIAGNOSTIC_PATH', json.dumps(str(ROOT / 'kernel/src/session_activity_diagnostic.rs')))
+'''.replace('DIAGNOSTIC_PATH', json.dumps(str(ROOT / 'kernel/src/diagnostics/session_activity_diagnostic.rs')))
             harness = harness.replace('ACTUAL_ARM', arm)
             (directory / 'harness.rs').write_text(harness)
             result = subprocess.run([str(Path(env()['PATH'].split(':')[0]) / 'cargo'), 'test',

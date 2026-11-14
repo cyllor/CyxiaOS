@@ -135,7 +135,7 @@ fn fsync(handle: Handle, _: &mut dyn FnMut()) -> Result<SyncReceipt, Error> {
             .fsync(handle, &mut s.journal, &mut s.disk, &mut s.scratch)
     })
 }
-#[path = "../../../kernel/src/domain_storage/replay.rs"]
+#[path = "../../../kernel/src/runtime/files/domain_storage/replay.rs"]
 mod replay;
 
 #[test]

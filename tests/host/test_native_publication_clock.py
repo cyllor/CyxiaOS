@@ -18,7 +18,7 @@ from test_governance_billing_priority import function
 
 class NativePublicationClock(unittest.TestCase):
     def test_native_final_gate_uses_original_cpu_origin_after_the_last_callback(self):
-        source = (ROOT / 'kernel/src/domain_control.rs').read_text()
+        source = (ROOT / 'kernel/src/runtime/control/domain_control.rs').read_text()
         body = function(source, 'fn publish(&mut self, plan: &Plan, version: u64, at: u64)')
         # Execute the full native precommit body. Mutating root/device/history
         # effects below this boundary are substituted with one counted commit.
@@ -33,9 +33,9 @@ class NativePublicationClock(unittest.TestCase):
         resolved = function(source, "impl<S: PublicationScope> Executor<'_, S>")
         resolved = resolved.replace("impl<S: PublicationScope> Executor<'_, S>", 'impl Executor')
         template = template.replace('// NATIVE_RESOLVED_SLOT', resolved)
-        template=template.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/submission.rs'))+'] mod submission;')
+        template=template.replace('// SUBMISSION_TRACE_MODULE','#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/submission.rs'))+'] mod submission;')
         template = template.replace('// NATIVE_PRECOMMIT', body)
-        template+='\n#[path='+json.dumps(str(ROOT/'kernel/src/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
+        template+='\n#[path='+json.dumps(str(ROOT/'kernel/src/runtime/control/domain_control/publication_cost.rs'))+'] mod publication_cost;\n'
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / 'harness.rs').write_text(template)

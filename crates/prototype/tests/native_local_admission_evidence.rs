@@ -2,7 +2,7 @@
 //! changing admission. Original request identity is bound only after the
 //! kernel broker observes the same spawn/deadline result.
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/local_evidence.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/local_evidence.rs"]
 mod evidence;
 use cyxia_prototype::domains::{
     Error, ObjectKey, WINDOW_NS,

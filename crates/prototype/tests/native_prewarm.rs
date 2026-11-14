@@ -3,7 +3,7 @@
 //! accepted learning labels or evidence of a native workload run.
 extern crate self as cyxia_arch_aarch64;
 #[allow(dead_code)]
-#[path = "../../../kernel/src/domain_tasks/cancellation.rs"]
+#[path = "../../../kernel/src/runtime/tasks/domain_tasks/cancellation.rs"]
 mod cancellation;
 include!("support/unstarted.rs");
 
@@ -269,7 +269,7 @@ pub mod learning_evidence {
     }
 }
 #[allow(dead_code)]
-#[path = "../../../kernel/src/learning_prewarm.rs"]
+#[path = "../../../kernel/src/runtime/learning/learning_prewarm.rs"]
 mod prewarm;
 
 #[test]

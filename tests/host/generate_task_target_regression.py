@@ -4,7 +4,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 OUT = Path(sys.argv[1]).resolve()
 OUT.mkdir(parents=True, exist_ok=True)
-src = (ROOT/'kernel/src/domain_tasks.rs').read_text()
+src = (ROOT/'kernel/src/runtime/tasks/domain_tasks.rs').read_text()
 def extract(signature):
     start=src.index(signature); opening=src.index('{',start); depth=1
     for end in range(opening+1,len(src)):
@@ -27,14 +27,14 @@ fn group(id:u64)->ObjectKey{ObjectKey{id,generation:1}}
 const MEMORY_KEY:ObjectKey=ObjectKey{id:100,generation:1};
 const SERVICE_KEY:ObjectKey=ObjectKey{id:101,generation:1};
 '''
-code += f'#[path="{ROOT}/kernel/src/domain_control/target_batch.rs"] pub mod target_batch;\nmod domain_control {{pub use crate::target_batch;}}\n'
+code += f'#[path="{ROOT}/kernel/src/runtime/control/domain_control/target_batch.rs"] pub mod target_batch;\nmod domain_control {{pub use crate::target_batch;}}\n'
 for sig in ['fn target_locked(', 'pub(crate) fn queued_targets(']: code += extract(sig)+'\n'
 if 'fn projected_target(' in src: code+=extract('fn projected_target(')+'\n'
-control=(ROOT/'kernel/src/domain_control.rs').read_text()
+control=(ROOT/'kernel/src/runtime/control/domain_control.rs').read_text()
 start=control.index('    let start_cursor = s.family_cursor;',control.index('fn next_normal('))
 end=control.index('        let Some(target) = target else {',start)
 lookup=control[start:end]
-for name,path in [('read_snapshot','domain_platform/read_snapshot.rs'),('target_projection','domain_services/target_projection.rs')]:
+for name,path in [('read_snapshot','platform/virt/domain_platform/read_snapshot.rs'),('target_projection','runtime/services/domain_services/target_projection.rs')]:
  code+=f'#[path="{ROOT}/kernel/src/{path}"] pub mod {name};\n'
 code+='''
 mod domain_platform{pub use crate::read_snapshot;}

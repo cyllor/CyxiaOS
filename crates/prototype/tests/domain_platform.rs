@@ -140,7 +140,7 @@ fn ipi_concurrent_sender_and_receiver_keep_keys_and_completion_results_together(
     thread.join().unwrap();
     assert_eq!(received.load(Ordering::Acquire), 512);
 }
-#[path = "../../../kernel/src/domain_platform/irq_metrics.rs"]
+#[path = "../../../kernel/src/platform/virt/domain_platform/irq_metrics.rs"]
 mod irq_metrics;
 
 #[test]
