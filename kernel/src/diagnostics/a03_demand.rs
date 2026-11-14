@@ -80,8 +80,8 @@ mod native {
     unsafe impl Sync for Cell {}
     static STATE: Cell = Cell(UnsafeCell::new(State::new()));
     static GATE: AtomicBool = AtomicBool::new(false);
-    // The root gate serializes writers. A separate publication counter makes
-    // a C0 snapshot fail closed when interrupted by a new ordinary decision.
+    // The publication counter serializes both the root reply and C0 Applied
+    // retention writers. Readers fail closed while either writer owns it.
     static DECISION_SEQ: AtomicU64 = AtomicU64::new(0);
     static DECISION_JOB: AtomicU64 = AtomicU64::new(0);
     static DECISION_VERSION: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +92,24 @@ mod native {
     impl Drop for Guard {
         fn drop(&mut self) {
             GATE.store(false, Ordering::Release);
+        }
+    }
+    struct DecisionWriter;
+    impl DecisionWriter {
+        fn try_acquire() -> Option<Self> {
+            let seq = DECISION_SEQ.load(Ordering::Acquire);
+            if seq & 1 != 0 || seq.checked_add(2).is_none() {
+                return None;
+            }
+            DECISION_SEQ
+                .compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .ok()
+                .map(|_| Self)
+        }
+    }
+    impl Drop for DecisionWriter {
+        fn drop(&mut self) {
+            DECISION_SEQ.fetch_add(1, Ordering::Release);
         }
     }
     fn decision() -> Option<[u64; 4]> {
@@ -122,7 +140,13 @@ mod native {
         {
             return;
         }
-        DECISION_SEQ.fetch_add(1, Ordering::AcqRel);
+        let Some(_writer) = DecisionWriter::try_acquire() else {
+            return;
+        };
+        if RETAINED.load(Ordering::Acquire) {
+            return;
+        }
+        DECISION_JOB.store(0, Ordering::Relaxed);
         if crate::domain_evidence::visit_record(slot, job, |i, value| {
             A03_QUIET_MODEL_V16_EVIDENCE.0[i].store(value, Ordering::Relaxed);
         }) {
@@ -132,7 +156,31 @@ mod native {
             DECISION_INPUT_AT.store(input_at, Ordering::Relaxed);
             RETAINED.store(true, Ordering::Release);
         }
-        DECISION_SEQ.fetch_add(1, Ordering::Release);
+    }
+    fn retain_applied(s: &State) -> bool {
+        let Some(_writer) = DecisionWriter::try_acquire() else {
+            return false;
+        };
+        // A failed/torn copy must not leave an old identity over new row bytes.
+        DECISION_JOB.store(0, Ordering::Relaxed);
+        let completion = crate::ownership_evidence::visit_ordinary_roundtrip(
+            cyxia_prototype::a03::DemandWindow {
+                first_ns: s.first,
+                withdrawn_ns: s.withdrawn,
+                drained_ns: s.drained,
+            },
+            |i, value| {
+                A03_QUIET_MODEL_V16_EVIDENCE.0[i].store(value, Ordering::Relaxed);
+            },
+        );
+        if let Some(done) = completion {
+            DECISION_JOB.store(done.job, Ordering::Relaxed);
+            DECISION_VERSION.store(done.version, Ordering::Relaxed);
+            DECISION_AT.store(done.applied_ns, Ordering::Relaxed);
+            DECISION_INPUT_AT.store(done.input_ns, Ordering::Relaxed);
+            RETAINED.store(true, Ordering::Release);
+        }
+        completion.is_some()
     }
     fn publish(s: &State, at: u64) {
         let bank = &A03_DEMAND_V16_EVIDENCE.0;
@@ -240,8 +288,14 @@ mod native {
                         return Err(Error::Conflict);
                     }
                     if at >= s.drained.checked_add(QUIET_NS).ok_or(Error::Overflow)?
+                        && retain_applied(s)
                         && decision().is_some_and(|d| {
-                            d[0] > 0 && d[1] > 0 && d[2] > s.drained && d[3] > s.drained
+                            d[0] > 0
+                                && d[1] > 0
+                                && d[2] > s.drained
+                                && d[2] <= at
+                                && d[3] > s.drained
+                                && d[3] <= d[2]
                         })
                     {
                         queue::ordinary_finish()?;
@@ -271,6 +325,11 @@ mod native {
     #[cfg(test)]
     pub(super) fn observed() -> [u64; 128] {
         core::array::from_fn(|i| A03_DEMAND_V16_EVIDENCE.0[i].load(Ordering::Acquire))
+    }
+    #[cfg(test)]
+    pub(super) fn with_receipt_writer(f: impl FnOnce()) {
+        let _writer = DecisionWriter::try_acquire().expect("idle receipt writer");
+        f();
     }
     // Profile-only state and snapshot scratch; learning collection is disabled.
     const _: () = assert!(
@@ -312,4 +371,8 @@ pub fn quiescent() -> bool {
 #[cfg(test)]
 pub(crate) fn observed() -> [u64; 128] {
     native::observed()
+}
+#[cfg(test)]
+pub(crate) fn with_receipt_writer(f: impl FnOnce()) {
+    native::with_receipt_writer(f);
 }

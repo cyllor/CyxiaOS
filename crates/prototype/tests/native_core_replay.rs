@@ -413,6 +413,30 @@ pub mod domain_evidence {
         true
     }
 }
+// The scene test controls the observation adapter. The real structural gate is
+// exercised separately in a03_completion; these are never native owner facts.
+pub mod ownership_evidence {
+    use super::*;
+    pub static APPLIED: AtomicU64 = AtomicU64::new(0);
+    pub fn visit_ordinary_roundtrip(
+        window: cyxia_prototype::a03::DemandWindow,
+        mut copy: impl FnMut(usize, u64),
+    ) -> Option<cyxia_prototype::a03::Completion> {
+        let ready = APPLIED.load(Ordering::Acquire);
+        if ready == 0 {
+            return None;
+        }
+        domain_evidence::visit_record(0, 200, &mut copy);
+        Some(cyxia_prototype::a03::Completion {
+            row: 1024,
+            publication: 8,
+            job: 200,
+            version: 20,
+            input_ns: window.drained_ns + 1,
+            applied_ns: now() + u64::from(ready == 2),
+        })
+    }
+}
 #[allow(unexpected_cfgs, dead_code)]
 #[path = "../../../kernel/src/diagnostics/a03_demand.rs"]
 mod a03_demand;
@@ -643,7 +667,7 @@ fn ordinary_demand_withdraw_keeps_admitted_work_until_real_retirement() {
     core_replay::ordinary_finish().unwrap();
 }
 #[test]
-fn ordinary_demand_scene_needs_a_real_job_retirement_and_later_ordinary_decision() {
+fn ordinary_demand_scene_needs_retirement_and_serialized_applied_ownership() {
     let _serial = TEST_LOCK.lock().unwrap();
     CLOCK.store(1_000_000_000, Ordering::Release);
     cpu::set(0);
@@ -694,6 +718,32 @@ fn ordinary_demand_scene_needs_a_real_job_retirement_and_later_ordinary_decision
     assert_eq!(a03_demand::observed()[5], 5);
     a03_demand::ordinary_decision(100, 10, now(), now(), 0);
     a03_demand::service_step().unwrap();
+    assert_eq!(
+        a03_demand::observed()[5],
+        5,
+        "a model reply is not Applied ownership"
+    );
+    ownership_evidence::APPLIED.store(2, Ordering::Release);
+    a03_demand::service_step().unwrap();
+    assert_eq!(
+        a03_demand::observed()[5],
+        5,
+        "future completion cannot close this observation"
+    );
+    ownership_evidence::APPLIED.store(1, Ordering::Release);
+    a03_demand::with_receipt_writer(|| {
+        a03_demand::service_step().unwrap();
+        assert_eq!(a03_demand::observed()[5], 5);
+        assert_eq!(a03_demand::observed()[40], 0);
+        assert!(!a03_demand::quiescent());
+    });
+    a03_demand::service_step().unwrap();
+    assert_eq!(
+        a03_demand::observed()[40],
+        200,
+        "retained reply must match the actual contraction"
+    );
+    assert_eq!(a03_demand::observed()[41], 20);
     assert_eq!(a03_demand::observed()[5], 6);
     assert!(a03_demand::quiescent());
 }

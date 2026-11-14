@@ -180,3 +180,18 @@ pub(crate) fn model_witness(apply: ApplyId, slot: usize, sequence: u64) -> Resul
     end(at);
     result
 }
+
+/// Retain the actual contraction receipt only after both owner changes finish.
+/// CPU0 consumes this observer; it never changes core ownership or model choice.
+pub(crate) fn visit_ordinary_roundtrip(
+    window: cyxia_prototype::a03::DemandWindow,
+    mut copy: impl FnMut(usize, u64),
+) -> Option<cyxia_prototype::a03::Completion> {
+    let completion = cyxia_prototype::a03::completed_roundtrip(get, window)?;
+    for i in 0..640 {
+        copy(i, get(completion.row + 192 + i));
+    }
+    // The model copy must still belong to the same complete, last owner row.
+    (cyxia_prototype::a03::completed_roundtrip(get, window) == Some(completion))
+        .then_some(completion)
+}
