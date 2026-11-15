@@ -47,27 +47,36 @@ def list_names(console):
     return names
 
 
-def run_probe(console):
-    from os_smoke import object_snapshot, reclaimed_probe
+def idle_broker(console):
     from verify_ported import parse_processes
-    def idle_broker():
-        # A client's exit precedes the broker consuming the socket hangup.
-        # Observe its actual blocking state before comparing descriptor counts.
-        deadline = time.monotonic() + 10
-        while True:
-            at = console.command('posix list')
-            rows = [row for row in parse_processes(bytes(console.raw[at:])).values()
-                    if row['state'] in ('Running', 'Waiting')]
-            pc.require(rows, 'broker exited while draining connections')
-            if all(row['state'] == 'Waiting' for row in rows):
-                return rows
-            pc.require(time.monotonic() < deadline, 'broker did not return to its wait loop')
-            time.sleep(.02)
-    active = idle_broker()
-    before = object_snapshot(console)
-    pc.require(active and len({row['free_pages'] for row in active}) == 1,
-               'missing shared process-grant baseline')
-    free_pages = active[0]['free_pages']
+    deadline = time.monotonic() + 10
+    while True:
+        at = console.command('posix list')
+        rows = [row for row in parse_processes(bytes(console.raw[at:])).values()
+                if row['state'] in ('Running', 'Waiting')]
+        pc.require(rows, 'broker exited while draining connections')
+        if all(row['state'] == 'Waiting' for row in rows):
+            return rows
+        pc.require(time.monotonic() < deadline, 'broker did not return to its wait loop')
+        time.sleep(.02)
+
+
+def drain_connections(console, baseline):
+    from os_smoke import object_snapshot
+    # Waiting alone is not quiescence: the broker can park between consuming a
+    # hangup and closing its peer descriptor. Require the pre-client baseline.
+    deadline = time.monotonic() + 10
+    while True:
+        idle_broker(console)
+        if object_snapshot(console) == baseline:
+            return
+        pc.require(time.monotonic() < deadline, 'broker connections did not return to baseline')
+        time.sleep(.02)
+
+
+def run_probe(console, baseline, free_pages):
+    from os_smoke import reclaimed_probe
+    drain_connections(console, baseline)
     at = console.command('posix exec dbus-probe')
     pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
     for phase in ('WRONG_IDENTITY_REJECTED', 'OWNERSHIP_CONFLICT',
@@ -75,8 +84,8 @@ def run_probe(console):
         console.until(('DBUS_PROBE ' + phase + ' PASS').encode(), at)
     console.until(rb'DBUS_PROBE PASS', at)
     console.until(rb'pid=' + pid + rb' Exited code=0\b', at)
-    idle_broker()
-    result = reclaimed_probe(console, pid, before, free_pages=free_pages)
+    drain_connections(console, baseline)
+    result = reclaimed_probe(console, pid, baseline, free_pages=free_pages)
     rows = re.findall(rb'DBUS_PROBE IDENTITY PASS unique=([^ ]+) pid=(\d+) uid=(\d+) id=([0-9a-f]{32})',
                       bytes(console.raw[at:]))
     pc.require(len(rows) == 2 and rows[0][0] != rows[1][0] and
@@ -117,11 +126,15 @@ def checks(console, expected_machine_id=None):
     runs = []
     for _ in range(2):
         bus = start_bus(console)
+        active = idle_broker(console)
+        pc.require(len(active) == 1 and active[0]['pid'] == bus['pid'],
+                   'broker-only baseline requires exactly the real broker')
+        baseline = object_snapshot(console)
         names = list_names(console)
-        probe = run_probe(console)
+        probe = run_probe(console, baseline, active[0]['free_pages'])
         pc.require('org.cyxia.SessionBusProbe' not in list_names(console), 'disconnected name leaked')
         ended = stop_bus(console, bus, before)
-        runs.append(dict(bus=bus, names=names, probe=probe, ended=ended))
+        runs.append(dict(bus=bus, names=names, broker_baseline=baseline, probe=probe, ended=ended))
     pc.require(runs[0]['bus']['guid'] != runs[1]['bus']['guid'], 'broker restart reused bus GUID')
     return dict(machine_id=identity, runs=runs,
                 scope='real upstream session broker; complete COSMIC session remains unverified')

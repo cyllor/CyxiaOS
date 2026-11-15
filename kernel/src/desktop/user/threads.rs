@@ -524,13 +524,19 @@ mod linux_threads {
             signal: u64,
         ) -> Result<u64, Errno> {
             let (tid, signal) = if number == cyxia_posix::linux_abi::Call::Tgkill {
-                if target != self.status.pid as u64 {
-                    return Err(Errno::Srch);
-                }
                 (thread_target, signal)
             } else {
                 (target, thread_target)
             };
+            let signal = u32::try_from(signal).map_err(|_| Errno::Inval)?;
+            if signal as usize > cyxia_posix::signal::COUNT {
+                return Err(Errno::Inval);
+            }
+            if number == cyxia_posix::linux_abi::Call::Tgkill
+                && target != self.status.pid as u64
+            {
+                return Err(Errno::Srch);
+            }
             let info = Info {
                 code: if number == cyxia_posix::linux_abi::Call::Kill {
                     0
@@ -540,13 +546,14 @@ mod linux_threads {
                 sender_pid: self.status.pid,
                 address: 0,
             };
-            let signal = u32::try_from(signal).map_err(|_| Errno::Inval)?;
-            if signal > 64 {
-                return Err(Errno::Inval);
-            }
             if number == cyxia_posix::linux_abi::Call::Kill {
-                if tid != 0 && tid != self.status.pid as u64 {
-                    return Err(Errno::Srch);
+                // Process groups and broadcast delivery have no implementation.
+                // Do not reinterpret kill(0, sig) as a successful self signal.
+                if tid == 0 || (tid as i64) < 0 {
+                    return Err(Errno::Opnotsupp);
+                }
+                if tid != self.status.pid as u64 {
+                    return self.request_process_signal(tid, signal);
                 }
                 if signal != 0 {
                     self.threads.shared.pending.raise(

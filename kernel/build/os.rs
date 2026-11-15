@@ -74,7 +74,7 @@ fn catalog(root: &Path, out: &Path) {
     println!("cargo:rerun-if-env-changed=CYXIA_SYSROOT");
     let prefix = env::var_os("CYXIA_SYSROOT").map(PathBuf::from)
         .unwrap_or_else(|| root.join("artifacts/sysroot/x86_64-musl"));
-    let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "signal-probe", "desktop-api-probe",
+    let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "session-process-probe", "signal-probe", "desktop-api-probe",
         "pipe-probe", "file-probe", "clock-probe", "event-probe", "timerfd-probe", "edge-probe", "fd-share-probe", "scm-probe",
         "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "xkb-rules-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "thread-capacity-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe", "thread-exit-probe", "heap-capacity-probe", "heap-pool-probe"];
     let mut required = vec!["probe"];

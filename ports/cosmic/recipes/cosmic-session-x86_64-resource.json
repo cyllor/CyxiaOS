@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "session-static-x86_64-full-os-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Unmodified upstream cosmic-session without optional systemd/logind or autostart. The 512 MiB build bound is experimental, not a measured successful peak. Image backing and charged stack match full-os-v1/v2/v3 (64 MiB including 2 MiB stack). The unchanged builder still applies its legacy 16 MiB LOAD-address inspector before these bounds; larger linked output requires separate full-OS admission. Runtime requires a real session bus and real COSMIC child executables.",
+      "jobs_max": 1,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 536870912,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

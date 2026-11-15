@@ -192,7 +192,7 @@ impl Runner {
         });
         Ok(0)
     }
-    fn supervisor_result(&mut self, tid: u32, result: Result<u64, Errno>) {
+    pub(super) fn supervisor_result(&mut self, tid: u32, result: Result<u64, Errno>) {
         let value = result.unwrap_or_else(|e| (-(e as i64)) as u64);
         for thread in core::iter::once(&mut self.thread).chain(self.threads.parked.iter_mut()) {
             if thread.active && thread.tid == tid {

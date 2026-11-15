@@ -85,6 +85,8 @@ enum Wait {
     #[cfg(feature = "ported")]
     Spawn,
     #[cfg(feature = "ported")]
+    Signal,
+    #[cfg(feature = "ported")]
     Child {
         pid: i32,
         status: u64,
@@ -142,6 +144,8 @@ struct Runner {
     threads: threads::Group,
     #[cfg(feature = "ported")]
     pending_spawn: Option<spawn::Request>,
+    #[cfg(feature = "ported")]
+    pending_signal: Option<signals::Request>,
     #[cfg(target_arch = "aarch64")]
     l1: Table,
     #[cfg(target_arch = "aarch64")]
@@ -172,6 +176,8 @@ impl Runner {
             threads: threads::Group::new(),
             #[cfg(feature = "ported")]
             pending_spawn: None,
+            #[cfg(feature = "ported")]
+            pending_signal: None,
             #[cfg(target_arch = "aarch64")]
             l1: Table([0; 512]),
             #[cfg(target_arch = "aarch64")]
@@ -246,6 +252,7 @@ impl Runner {
         {
             self.linux = false;
             self.pending_spawn = None;
+            self.pending_signal = None;
             self.threads.reset();
         }
         self.thread.reset();
@@ -353,6 +360,7 @@ impl Runner {
         #[cfg(feature = "ported")]
         {
             self.pending_spawn = None;
+            self.pending_signal = None;
             self.clear_all_threads();
         }
         self.status.exit_signal = match state {
@@ -717,7 +725,7 @@ impl Runner {
             #[cfg(feature = "ported")]
             Some(Wait::Nanosleep { until, .. }) => time >= until,
             #[cfg(feature = "ported")]
-            Some(Wait::Spawn | Wait::Child { .. }) => false,
+            Some(Wait::Spawn | Wait::Signal | Wait::Child { .. }) => false,
             #[cfg(feature = "ported")]
             Some(Wait::Retry(until)) => time >= until,
             #[cfg(feature = "ported")]
@@ -1087,6 +1095,8 @@ impl Supervisor {
             "heap-pool-probe"
         } else if name == "thread-exit-bad-stack" {
             "thread-exit-probe"
+        } else if name == "cosmic-session-version" {
+            "cosmic-session"
         } else if name == "cosmic-version" {
             "cosmic-comp"
         } else if matches!(name, "cosmic-config-defaults" | "cosmic-config-init" | "cosmic-config-check" | "cosmic-config-verify" | "cosmic-config-raw" | "cosmic-config-values") {
@@ -1135,7 +1145,7 @@ impl Supervisor {
         fs.register_boot_file(cyxia_ai_fs::Path::resolve(
             cyxia_ai_fs::Path::ROOT, "/dev/null",
         )?)?;
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1159,6 +1169,12 @@ impl Supervisor {
             b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
         ];
         let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
+        let session_argv: &[&[u8]] = if name == "cosmic-session-version" {
+            &[path.as_bytes(), b"--version"]
+        } else {
+            &[path.as_bytes(), b"/bin/cosmic-comp", b"--no-xwayland"]
+        };
+        let session_probe_argv: &[&[u8]] = &[path.as_bytes(), path.as_bytes()];
         let config_argv: &[&[u8]] = &[path.as_bytes(), match name {
             "cosmic-config-defaults" => b"defaults", "cosmic-config-init" => b"init",
             "cosmic-config-check" => b"exercise", "cosmic-config-verify" => b"verify",
@@ -1246,6 +1262,10 @@ impl Supervisor {
                     dbus_uuid_argv
                 } else if image_name == "cosmic-comp" {
                     cosmic_argv
+                } else if image_name == "session-process-probe" {
+                    session_probe_argv
+                } else if image_name == "cosmic-session" {
+                    session_argv
                 } else if image_name == "cosmic-config" {
                     config_argv
                 } else if name == "xorg" {
@@ -1555,6 +1575,7 @@ impl Supervisor {
         {
             for index in 0..SLOTS {
                 self.service_spawn(index, shell.fs_mut());
+                self.service_signals(index);
             }
             self.collect_children();
         }

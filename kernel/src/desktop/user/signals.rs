@@ -1,11 +1,41 @@
 //! Foreground Linux signal policy with architecture-owned frame serialization.
 //! The parent wakes interrupted waits and owns process termination. All frame
 //! I/O goes through Runner usercopy; no pointer supplied by user code is dereferenced.
-use super::{Errno, Runner};
+use super::{Errno, Runner, Supervisor, Wait};
 use crate::process_arch::{self, SIGNAL_FRAME_BYTES as FRAME_BYTES};
 use cyxia_posix::signal::{self, Action, Actions, AltStack, Delivery, Info, SA_ONSTACK};
 
+#[derive(Clone, Copy)]
+pub(super) struct Request {
+    tid: u32,
+    target: u32,
+    signal: u32,
+}
+
 impl Runner {
+    /// Cross-process lookup belongs to the supervisor after all AP contexts
+    /// have returned. This request owns no target references or user pointers.
+    pub(super) fn request_process_signal(
+        &mut self,
+        target: u64,
+        signal: u32,
+    ) -> Result<u64, Errno> {
+        let target = u32::try_from(target)
+            .ok()
+            .filter(|pid| *pid != 0 && *pid <= i32::MAX as u32)
+            .ok_or(Errno::Srch)?;
+        if self.pending_signal.is_some() {
+            return Err(Errno::Again);
+        }
+        self.pending_signal = Some(Request {
+            tid: self.thread.tid,
+            target,
+            signal,
+        });
+        self.block(Wait::Signal);
+        Ok(0)
+    }
+
     pub(super) fn signal_stack(&mut self, new: u64, old: u64) -> Result<u64, Errno> {
         let previous = self.thread.alt_stack;
         let next = if new == 0 {
@@ -202,5 +232,59 @@ impl Runner {
         self.thread.alt_stack = stack;
         self.thread.context = context;
         Ok(self.thread.context.result())
+    }
+}
+
+impl Supervisor {
+    /// Called only by CPU0 after the parallel phase has drained every root and
+    /// restored every Runner. No user process runs between validation, enqueue,
+    /// and completion; a cancelled origin must not send a deferred signal.
+    pub(super) fn service_signals(&mut self, origin: usize) {
+        let Some(request) = self.runners[origin].pending_signal.take() else {
+            return;
+        };
+        let sender = &self.runners[origin];
+        if !sender.status.state.active()
+            || !sender.linux
+            || !core::iter::once(&sender.thread)
+                .chain(sender.threads.parked.iter())
+                .any(|thread| {
+                    thread.active
+                        && thread.tid == request.tid
+                        && matches!(thread.waiting, Some(Wait::Signal))
+                })
+        {
+            return;
+        }
+        let sender_pid = sender.status.pid;
+        let result = self
+            .runners
+            .iter_mut()
+            .find(|runner| runner.status.pid == request.target && runner.status.state.active())
+            .ok_or(Errno::Srch)
+            .and_then(|target| {
+                // Every supported POSIX process has real/effective/saved UID 0.
+                // Same-UID peers may signal; parenthood authorizes wait only.
+                // Native runners can be queried, but have no Linux delivery
+                // contract: never report successful undeliverable signals.
+                if request.signal == 0 {
+                    return Ok(0);
+                }
+                if !target.linux {
+                    return Err(Errno::Opnotsupp);
+                }
+                target.threads.shared.pending.raise(
+                    &target.threads.shared.actions,
+                    request.signal,
+                    Info {
+                        code: 0, // SI_USER
+                        sender_pid,
+                        address: 0,
+                    },
+                    false,
+                )?;
+                Ok(0)
+            });
+        self.runners[origin].supervisor_result(request.tid, result);
     }
 }

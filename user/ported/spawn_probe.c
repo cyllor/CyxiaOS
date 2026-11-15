@@ -2,12 +2,15 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -62,8 +65,156 @@ static int read_all(int fd, char *bytes, int cap) {
     }
     return total;
 }
+
+struct signal_packet { int signal, sender, code; };
+static int signal_socket = -1;
+static void target_signal(int number, siginfo_t *info, void *context) {
+    (void)context;
+    struct signal_packet packet = {number, info ? info->si_pid : -1,
+                                   info ? info->si_code : -1};
+    /* The ready byte is the only earlier traffic. This small, blocking write
+     * has room and uses only an async-signal-safe function. */
+    if (write(signal_socket, &packet, sizeof packet) != sizeof packet) _exit(90);
+    _exit(41);
+}
+static int signal_target(const char *mode) {
+    const char *socket_env = getenv("SIGNAL_SOCKET");
+    const char *plain_env = getenv("SIGNAL_PLAIN");
+    const char *closed_env = getenv("SIGNAL_CLOSED");
+    const char *parent_env = getenv("PARENT_PID");
+    if (!socket_env || !plain_env || !closed_env || !parent_env) return 81;
+    signal_socket = atoi(socket_env);
+    int plain = atoi(plain_env), closed = atoi(closed_env);
+    char byte;
+    if (getppid() != atoi(parent_env) || getuid() != 0 || geteuid() != 0 ||
+        fcntl(signal_socket, F_GETFD) != 0 ||
+        (fcntl(signal_socket, F_GETFL) & O_NONBLOCK) ||
+        fcntl(plain, F_GETFD) != 0 || read(plain, &byte, 1) != 0) return 82;
+    errno = 0;
+    if (fcntl(closed, F_GETFD) != -1 || errno != EBADF) return 83;
+    if (!strcmp(mode, "handler")) {
+        struct sigaction action = {.sa_sigaction=target_signal,.sa_flags=SA_SIGINFO};
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGTERM, &action, 0)) return 84;
+    } else if (!strcmp(mode, "ignore")) {
+        struct sigaction action = {.sa_handler=SIG_IGN};
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGTERM, &action, 0)) return 85;
+    } else if (strcmp(mode, "default")) return 86;
+    if (write(signal_socket, "R", 1) != 1) return 87;
+    /* Real readiness handshake precedes every parent signal. Poll bounds a
+     * failed RED run and peer EOF lets this child retire if its parent fails. */
+    for (int round = 0; round < 2; round++) {
+        struct pollfd p = {.fd=signal_socket,.events=POLLIN};
+        int result;
+        do result = poll(&p, 1, 5000); while (result < 0 && errno == EINTR);
+        if (result != 1 || read(signal_socket, &byte, 1) != 1) return 88;
+        if (strcmp(mode, "ignore") || byte != 'A' || write(signal_socket, "A", 1) != 1)
+            return 89;
+    }
+    return 91;
+}
+static int signal_sender(const char *pid_text) {
+    pid_t target = atoi(pid_text);
+    int status = 0x12345678;
+    errno = 0;
+    /* Same UID permits signaling a sibling; it does not transfer wait ownership. */
+    if (waitpid(target, &status, WNOHANG) != -1 || errno != ECHILD ||
+        status != 0x12345678 || kill(target, 0) || kill(target, SIGTERM)) return 92;
+    return 31;
+}
+static int signal_case(const char *mode, int sibling) {
+    int channel[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, channel))
+        return fail("signal-socketpair");
+    int plain = open("/dev/null", O_RDONLY), excluded = open("/dev/null", O_RDONLY);
+    if (plain < 0 || excluded < 0) return fail("signal-null-fds");
+    /* Exercise both launch-pad with_fds (CLOEXEC) and the compositor's ambient
+     * non-CLOEXEC source. Native spawn still requires an explicit same-FD map. */
+    int source_flags = !strcmp(mode, "default") ? 0 : FD_CLOEXEC;
+    if (fcntl(channel[1], F_SETFD, source_flags)) return fail("signal-fd-flags");
+    char socket_env[40], plain_env[40], closed_env[40], parent_env[40];
+    snprintf(socket_env, sizeof socket_env, "SIGNAL_SOCKET=%d", channel[1]);
+    snprintf(plain_env, sizeof plain_env, "SIGNAL_PLAIN=%d", plain);
+    snprintf(closed_env, sizeof closed_env, "SIGNAL_CLOSED=%d", excluded);
+    snprintf(parent_env, sizeof parent_env, "PARENT_PID=%d", getpid());
+    char *env[] = {socket_env, plain_env, closed_env, parent_env, NULL};
+    char *args[] = {"/bin/spawn-probe", "signal-target", (char *)mode, NULL};
+    struct mapping maps[] = {{0,0},{1,1},{2,2},{channel[1],channel[1]},{plain,plain}};
+    pid_t child = spawn(args, env, NULL, maps, 5, 0);
+    if (child < 0) return fail("signal-spawn");
+    if (fcntl(channel[1], F_GETFD) != source_flags || fcntl(plain, F_GETFD) != 0 ||
+        fcntl(excluded, F_GETFD) != 0 || close(channel[1]) || close(plain) || close(excluded))
+        return fail("signal-parent-fds");
+    char ready = 0;
+    if (read_all(channel[0], &ready, 1) != 1 || ready != 'R')
+        return fail("signal-child-ready");
+    printf("SPAWN_PROBE USER_SIGNAL READY parent=%d child=%d mode=%s sibling=%d\n",
+           getpid(), child, mode, sibling);
+    /* The current kernel fails here with ESRCH for a real live child PID. */
+    if (kill(child, 0)) return fail("signal-live-zero");
+    int status = 0x12345678;
+    if (waited(child, &status, WNOHANG) != 0 || status != 0x12345678)
+        return fail("signal-zero-no-effect");
+    errno = 0;
+    if (kill(child, 65) != -1 || errno != EINVAL) return fail("signal-invalid-number");
+    errno = 0;
+    if (kill(child, -1) != -1 || errno != EINVAL) return fail("signal-negative-number");
+    errno = 0;
+    if (kill(INT_MAX, 0) != -1 || errno != ESRCH) return fail("signal-unknown-zero");
+    errno = 0;
+    if (kill(INT_MAX, SIGTERM) != -1 || errno != ESRCH) return fail("signal-unknown-term");
+
+    pid_t sender = getpid();
+    if (sibling) {
+        char target[24]; snprintf(target, sizeof target, "%d", child);
+        char *sender_args[] = {"/bin/spawn-probe", "signal-sender", target, NULL};
+        char *empty_env[] = {NULL};
+        struct mapping sender_maps[] = {{0,0},{1,1},{2,2}};
+        sender = spawn(sender_args, empty_env, NULL, sender_maps, 3, 0);
+        if (sender < 0) return fail("signal-sibling-spawn");
+    } else if (kill(child, SIGTERM)) return fail("signal-user-term");
+
+    if (!strcmp(mode, "handler")) {
+        struct signal_packet packet = {0};
+        if (read_all(channel[0], (char *)&packet, sizeof packet) != sizeof packet ||
+            packet.signal != SIGTERM || packet.sender != sender || packet.code != SI_USER)
+            return fail("signal-handler-info");
+    } else if (!strcmp(mode, "ignore")) {
+        if (write(channel[0], "A", 1) != 1 || read_all(channel[0], &ready, 1) != 1 ||
+            ready != 'A' || kill(child, 0) || kill(child, SIGKILL))
+            return fail("signal-ignore-then-kill");
+    }
+    if (waited(child, &status, 0) != child) return fail("signal-parent-wait");
+    if (!strcmp(mode, "handler")) {
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 41) return fail("signal-handler-status");
+    } else if (!WIFSIGNALED(status) ||
+               WTERMSIG(status) != (!strcmp(mode, "ignore") ? SIGKILL : SIGTERM))
+        return fail("signal-default-status");
+    if (read_all(channel[0], &ready, 1) != 0 || close(channel[0]))
+        return fail("signal-final-socket-eof");
+    if (seen_pid != child || seen_status != (!strcmp(mode, "handler") ? 41 :
+            !strcmp(mode, "ignore") ? SIGKILL : SIGTERM) ||
+        seen_code != (!strcmp(mode, "handler") ? CLD_EXITED : CLD_KILLED)) {
+        /* A sibling can also exit and its coalesced SIGCHLD may arrive last. */
+        if (!sibling) return fail("signal-parent-sigchld");
+    }
+    errno = 0;
+    if (waitpid(child, &status, WNOHANG) != -1 || errno != ECHILD)
+        return fail("signal-double-reap");
+    errno = 0;
+    if (kill(child, 0) != -1 || errno != ESRCH) return fail("signal-dead-zero");
+    errno = 0;
+    if (kill(child, SIGTERM) != -1 || errno != ESRCH) return fail("signal-dead-term");
+    if (sibling && (waited(sender, &status, 0) != sender || !WIFEXITED(status) ||
+                    WEXITSTATUS(status) != 31)) return fail("signal-sibling-status");
+    printf("SPAWN_PROBE USER_SIGNAL %s%s PASS\n", mode, sibling ? "-sibling" : "");
+    return 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IONBF, 0);
+    if (argc == 3 && !strcmp(argv[1], "signal-target")) return signal_target(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "signal-sender")) return signal_sender(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "child")) {
         char cwd[96], input[16];
         const char *parent = getenv("PARENT_PID");
@@ -138,6 +289,31 @@ int main(int argc, char **argv) {
     child=spawn(signal_args,empty_env,0,ordinary,3,0);
     if(child<0||waited(child,&status,0)!=child||!WIFSIGNALED(status)||WTERMSIG(status)!=SIGTERM) return fail("wait-signal");
     puts("SPAWN_PROBE WAIT_SIGNAL PASS");
+
+    if (signal_case("handler", 0) || signal_case("default", 0) ||
+        signal_case("ignore", 0) || signal_case("handler", 1)) return 1;
+    puts("SPAWN_PROBE USER_SIGNALS PASS");
+
+    /* Process-group/broadcast signaling is unsupported; zero must not report
+     * a successful self-only substitute. Validate signals before target form. */
+    pid_t unsupported_targets[] = {0, -1, -getpid()};
+    for (unsigned i = 0; i < sizeof unsupported_targets / sizeof unsupported_targets[0]; i++) {
+        errno = 0;
+        if (kill(unsupported_targets[i], 65) != -1 || errno != EINVAL)
+            return fail("group-invalid-signal-first");
+        errno = 0;
+        if (kill(unsupported_targets[i], -1) != -1 || errno != EINVAL)
+            return fail("group-negative-signal-first");
+        errno = 0;
+        int result = kill(unsupported_targets[i], 0), error = errno;
+        printf("SPAWN_PROBE GROUP_TARGET target=%d result=%d errno=%d\n",
+               unsupported_targets[i], result, error);
+        if (result != -1 || error != EOPNOTSUPP) {
+            errno = error;
+            return fail("unsupported-group-target");
+        }
+    }
+    puts("SPAWN_PROBE GROUP_TARGETS_UNSUPPORTED PASS");
 
     struct spawn_request request={64,0,"/bin/missing",sleep_args,empty_env,0,ordinary,3,0,0};
     errno=0;
