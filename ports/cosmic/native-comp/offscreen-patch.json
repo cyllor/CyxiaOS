@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-comp",
+  "repository": "https://github.com/pop-os/cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "base_patch_sha256": "a336ef3133c04158cea798d3f90425caf7d7db014600c3338b9cf8a23b673f05",
+  "patch_sha256": "2e73093e7bdea209937bfc9fe49351bca0535ecf80a7fba5b5c7da49daca84b9",
+  "before": {
+    "src/backend/kms/mod.rs": "314b15a854005477b1dbf1870e36a0e51d33a14b0ee04e20a4e661f0a8118685",
+    "src/backend/kms/offscreen.rs": null,
+    "src/backend/kms/offscreen_policy.rs": null,
+    "src/backend/mod.rs": "edf8337a2cfd519236b012252cbb4b03fd129e3098d560eb5f5c56b2740a03ac",
+    "src/backend/offscreen.rs": null,
+    "src/state.rs": "91acb70592a584e61b7d73417177424427961ebe0ddb40ac9c9b022971d40d58",
+    "src/utils/screenshot.rs": "9f3e103831528e82f2fef6d82a6c893919a20cc982ee82214746b82d0d3e03d7",
+    "src/wayland/handlers/image_copy_capture/mod.rs": "a1396e205dac273dfe8fcc492fa9ac3d8b0ebb3073cd3e5903a8d90635106985",
+    "src/wayland/handlers/image_copy_capture/render.rs": "60bd4a750685c59986eb418f6bf9ab3a1d6194626386bc8f9a8d3a5e59f7dfa9"
+  },
+  "after": {
+    "src/backend/kms/mod.rs": "a02b3015a07ebf1fcd831d8d6fa8ef65346848eafe84eb711b1e2507e3734264",
+    "src/backend/kms/offscreen.rs": "bc7bf9a312ac9ad472f16e5358c36b7dbb96c76ba4ff193f3cda7eb72b6e8caa",
+    "src/backend/kms/offscreen_policy.rs": "aa1b618a6d2c087c893bf6af5d758410b253eafc431c59c464cf85e21b2339c8",
+    "src/backend/mod.rs": "5b5f2c7ff9c4e85a80162d420faa72d14a3659ffe246f26db345ccb7fd1a14ac",
+    "src/backend/offscreen.rs": "c91205629db38d70a26fdb4df40a1804f11695c474cd8e6329de639f4a29cc9c",
+    "src/state.rs": "513e91a7af73d874630bb55f1655bd1577a868f006f49001275af5e1cab93575",
+    "src/utils/screenshot.rs": "8a4dcd5e9ce44e779360b7b447c4625a67e2495ff602758440a660a6705df020",
+    "src/wayland/handlers/image_copy_capture/mod.rs": "6ae024c7e9467f7d21b92c4832583c48e49b74e4ec29bb62444eb930bd3ceea4",
+    "src/wayland/handlers/image_copy_capture/render.rs": "a0e6268263b0254677b4a22958b5d105effb60af04ce320896443554c29cf7de"
+  },
+  "status": "PATCHED_NOT_COMPOSITOR_BUILT"
+}

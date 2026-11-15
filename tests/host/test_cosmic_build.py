@@ -192,6 +192,66 @@ class CosmicBuildTests(unittest.TestCase):
                 build.verify_metadata(metadata, root / 'source', root / 'cache',
                                       {'package': 'fixture', 'binary': 'fixture'})
 
+    def test_missing_target_cpp_fails_if_a_build_script_requests_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'unwind.a').write_bytes(b'fixture')
+            tools = {key: root / key for key in ('target_cxx', 'target_cc', 'target_ar',
+                     'target_ranlib', 'pkg_config', 'rustc', 'host_cc')}
+            identities = {'target': 'x86_64-unknown-linux-musl', 'unwind': {'path': root / 'unwind.a'}}
+            output = root / 'out'
+            output.mkdir()
+            env = build.cargo_environment(tools, identities, root / 'sdk', output,
+                                          root / 'cache', root / 'control')
+            command = env['CXX_x86_64_unknown_linux_musl']
+            result = subprocess.run([command, '--version'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('target C++ SDK is unavailable', result.stderr)
+            self.assertEqual(result.stdout, '')
+
+    @unittest.skipUnless((build.ROOT / 'artifacts/sysroot/x86_64-musl/sysroot/usr/lib/libc.a').is_file(),
+                         'x86 target SDK unavailable')
+    def test_real_x86_typecheck_reports_no_link_and_rejects_invalid_program(self):
+        sysroot = build.ROOT / 'artifacts/sysroot/x86_64-musl'
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                source = self.local_source(root)
+                if not valid:
+                    (root / 'fixture/src/main.rs').write_text('fn main() { let _: u8 = "bad"; }\n')
+                    subprocess.run(['git', '-C', str(root / 'fixture'), 'add', '.'], check=True)
+                    subprocess.run(['git', '-C', str(root / 'fixture'), '-c', 'user.name=test', '-c',
+                                    'user.email=test@example.invalid', 'commit', '-qm', 'invalid'], check=True)
+                    source['commit'] = build.git(root / 'fixture', 'rev-parse', 'HEAD')
+                record = build.inspect_source(root, source)
+                (root / 'cache').mkdir()
+                recipe = {'target': 'x86_64-unknown-linux-musl', 'package': 'fixture', 'binary': 'fixture',
+                          'default_features': False, 'features': [], 'patches': [], 'native_inputs': [],
+                          'effective_lock_sha256': build.digest(root / 'fixture/Cargo.lock')}
+                for name in ('libc.a', 'libclang_rt.builtins-x86_64.a', 'crt1.o', 'crti.o', 'crtn.o'):
+                    relative = 'sysroot/usr/lib/' + name
+                    recipe['native_inputs'].append({'path': relative, 'sha256': build.digest(sysroot / relative)})
+                recipe_path = root / 'recipe.json'
+                recipe_path.write_text(json.dumps(recipe))
+                profile = {'min_free_bytes': 64 * 1024**2, 'max_build_bytes': 64 * 1024**2,
+                           'timeout_seconds': 60}
+                def run():
+                    return build.perform_build(source, record, recipe, recipe_path, root / 'out',
+                                               sysroot, root / 'cache', profile, 1, operation='typecheck')
+                if valid:
+                    report = run()
+                    self.assertEqual(report['status'], 'target-typechecked')
+                    self.assertFalse(report['target_linked'])
+                    self.assertFalse((root / 'out/fixture.elf').exists())
+                    self.assertEqual(report['guest_execution'], 'not performed')
+                else:
+                    with self.assertRaisesRegex(ValueError, 'exit 101'):
+                        run()
+                    report = json.loads((root / 'out/build-report.json').read_text())
+                    self.assertEqual(report['status'], 'failed')
+                    self.assertFalse(report['target_linked'])
+                    self.assertIn('mismatched types', (root / 'out/cargo.log').read_text())
+
     @unittest.skipUnless((build.DEFAULT_SYSROOT / 'sysroot/usr/lib/libc.a').is_file(),
                          'real pinned target sysroot is not installed')
     def test_real_single_binary_cargo_cross_build_uses_isolated_target(self):

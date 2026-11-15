@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Controlled single-binary COSMIC Cargo experiments; offline, never a guest gate.
 
-`check --component NAME` is read-only. `build` requires an explicit reviewed
+`check --component NAME` is read-only. `build` and `typecheck` require an explicit reviewed
 recipe, an existing clean pinned checkout, and a separately prepared private
 Cargo cache. No fetch, recursive checkout, shell command, or full-workspace build
 is performed. Cargo offline mode is not an OS sandbox for trusted build scripts.
@@ -27,10 +27,12 @@ if __package__:
     from . import cosmic_ports as ports
     from . import cosmic_dependencies as dependencies
     from .build_sysroot import inspect_elf
+    from .target_profile import profile_for
 else:
     import cosmic_ports as ports
     import cosmic_dependencies as dependencies
     from build_sysroot import inspect_elf
+    from target_profile import profile_for
 
 ROOT = ports.ROOT
 TARGET = 'aarch64-unknown-linux-musl'
@@ -262,8 +264,10 @@ def run_bounded(command, cwd, env, log, timeout, min_free, max_bytes, *, budget_
             raise
 
 
-def select_profile(document, name, jobs):
-    if document.get('schema_version') != 1 or document.get('target') != TARGET:
+def select_profile(document, name, jobs, target=None):
+    selected = ports.user_target(document.get("target"))
+    if (document.get("schema_version") != 1 or
+            (target is not None and selected != profile_for(target))):
         raise CosmicBuildError('unsupported resource profile')
     try:
         profile = document['build_profiles'][name]
@@ -315,8 +319,9 @@ def checked_name(name):
 
 def validate_recipe(recipe, source):
     if (recipe.get('schema_version') != 1 or recipe.get('component') != source['name']
-            or recipe.get('commit') != source['commit'] or recipe.get('target') != TARGET):
+            or recipe.get('commit') != source['commit']):
         raise CosmicBuildError('recipe does not identify the selected pinned component/target')
+    ports.user_target(recipe.get('target'))
     if recipe.get('purpose') != 'bounded-build-experiment':
         raise CosmicBuildError('recipe must explicitly describe a bounded build experiment')
     for key in ('package', 'binary', 'resource_profile'):
@@ -333,6 +338,11 @@ def validate_recipe(recipe, source):
             raise CosmicBuildError('recipe needs pinned source/effective Cargo.lock identities')
     if not isinstance(recipe.get('native_inputs'), list) or not isinstance(recipe.get('patches'), list):
         raise CosmicBuildError('explicit native input and patch lists required')
+    if 'source_series' in recipe:
+        series = recipe['source_series']
+        dependencies.relative_path(series['path'])
+        if recipe['patches'] or not re.fullmatch('[0-9a-f]{64}', series.get('sha256', '')):
+            raise CosmicBuildError('select one pinned source series or individual patches')
     return recipe
 
 
@@ -380,6 +390,7 @@ def validate_cache(path):
 
 
 def tools_and_sysroot(sysroot, recipe):
+    selected = ports.user_target(recipe.get("target", TARGET))
     env = clean_environment('/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin')
     proxy = Path.home() / '.cargo/bin/rustc'
     rust_root = Path(subprocess.check_output([str(proxy), '--print', 'sysroot'], env=env, text=True).strip())
@@ -387,24 +398,28 @@ def tools_and_sysroot(sysroot, recipe):
     version = subprocess.check_output([str(rustc), '-vV'], env=env, text=True)
     host = next(line.split(': ', 1)[1] for line in version.splitlines() if line.startswith('host: '))
     llvm = rust_root / 'lib/rustlib' / host / 'bin'
-    libdir = rust_root / 'lib/rustlib' / TARGET / 'lib'
+    libdir = rust_root / 'lib/rustlib' / selected.rust_target / 'lib'
     std = list(libdir.glob('libstd-*.rlib'))
     if len(std) != 1:
         raise CosmicBuildError('exactly one official target libstd archive is required')
-    ports.architecture(std[0], rust_archive=True)
-    cc = sysroot / 'bin/aarch64-linux-musl-cc'
+    ports.architecture(std[0], rust_archive=True, target=selected)
+    cc = selected.cc(sysroot)
     tools = {'rustc': rustc, 'cargo': cargo, 'target_cc': cc,
-             'target_cxx': sysroot / 'bin/aarch64-linux-musl-cxx',
-             'target_ar': sysroot / 'bin/aarch64-linux-musl-ar',
-             'target_ranlib': sysroot / 'bin/aarch64-linux-musl-ranlib',
+             'target_cxx': sysroot / 'bin' / (selected.c_target + '-cxx'),
+             'target_ar': sysroot / 'bin' / (selected.c_target + '-ar'),
+             'target_ranlib': sysroot / 'bin' / (selected.c_target + '-ranlib'),
              'host_cc': Path('/usr/bin/clang'), 'strip': llvm / 'llvm-strip',
              'pkg_config': Path(shutil.which('pkg-config', path=env['PATH']) or '/missing/pkg-config')}
     for name, path in tools.items():
+        if name == 'target_cxx' and not path.exists():
+            # A C/Rust-only graph does not need a C++ SDK. Keep the missing
+            # capability explicit; any build script requesting CXX fails below.
+            continue
         if not path.is_file() or not os.access(path, os.X_OK):
             raise CosmicBuildError('required tool missing: ' + name)
     native = []
     required = {'sysroot/usr/lib/' + name for name in
-                ('libc.a', 'libclang_rt.builtins-aarch64.a', 'crt1.o', 'crti.o', 'crtn.o')}
+                ('libc.a', selected.builtins_archive, 'crt1.o', 'crti.o', 'crtn.o')}
     declared = set()
     for item in recipe['native_inputs']:
         relative = str(dependencies.relative_path(item['path']))
@@ -415,17 +430,18 @@ def tools_and_sysroot(sysroot, recipe):
         if not path.resolve().is_relative_to(sysroot.resolve()) or digest(path) != item['sha256']:
             raise CosmicBuildError('native input identity mismatch: ' + relative)
         if path.suffix == '.a':
-            ports.architecture(path)
+            ports.architecture(path, target=selected)
         elif path.suffix == '.o':
-            ports.elf_header(path.read_bytes(), (1,))
+            ports.elf_header(path.read_bytes(), (1,), selected)
         native.append({'path': relative, 'sha256': item['sha256']})
     if not required.issubset(declared):
         raise CosmicBuildError('recipe lacks pinned target musl/CRT/compiler runtime inputs')
     unwind = libdir / 'self-contained/libunwind.a'
-    ports.architecture(unwind)
-    return tools, {'rustc_version': version, 'host': host, 'std': {'path': str(std[0]), 'sha256': digest(std[0])},
+    ports.architecture(unwind, target=selected)
+    return tools, {'target': selected.rust_target, 'architecture': selected.architecture, 'rustc_version': version, 'host': host, 'std': {'path': str(std[0]), 'sha256': digest(std[0])},
                    'unwind': {'path': str(unwind), 'sha256': digest(unwind)}, 'native_inputs': native,
-                   'tools': {name: {'path': str(path), 'sha256': digest(path)} for name, path in tools.items()}}
+                   'tools': {name: {'path': str(path), 'sha256': digest(path) if path.is_file() else None,
+                                    'available': path.is_file()} for name, path in tools.items()}}
 
 
 def wrapper(path, command, environment):
@@ -478,12 +494,19 @@ def target_pkg_wrapper(path, executable, environment, target_root):
 
 
 def cargo_environment(tools, identities, sysroot, output, cargo_cache, control):
+    selected = ports.user_target(identities.get("target", TARGET))
     env = clean_environment('/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin')
     native = output / 'native'
     native.mkdir()
     shutil.copyfile(identities['unwind']['path'], native / 'libunwind.a')
     binary = output / 'bin'
     binary.mkdir()
+    target_cxx = tools['target_cxx']
+    if not target_cxx.is_file():
+        target_cxx = binary / 'unavailable-target-cxx'
+        target_cxx.write_text('#!' + sys.executable + '\nimport sys\n'
+                              'sys.exit("target C++ SDK is unavailable; install a real cross compiler/runtime")\n')
+        target_cxx.chmod(0o755)
     target_root = sysroot / 'sysroot'
     pcdirs = os.pathsep.join(str(target_root / p) for p in ('usr/lib/pkgconfig', 'usr/share/pkgconfig'))
     target_pc = target_pkg_wrapper(binary / 'target-pkg-config', tools['pkg_config'],
@@ -502,10 +525,10 @@ def cargo_environment(tools, identities, sysroot, output, cargo_cache, control):
                PKG_CONFIG_SYSROOT_DIR='', TMPDIR=str(control),
                CARGO_ENCODED_RUSTFLAGS='\x1f'.join(['-C', 'link-self-contained=no', '-C', 'relocation-model=static',
                    '-C', 'target-feature=+crt-static', '-L', 'native=' + str(native)]))
-    env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER'] = str(tools['target_cc'])
-    for target in (TARGET, TARGET.replace('-', '_')):
+    env['CARGO_TARGET_' + selected.rust_target.replace('-', '_').upper() + '_LINKER'] = str(tools['target_cc'])
+    for target in (selected.rust_target, selected.rust_target.replace('-', '_')):
         env['CC_' + target] = str(tools['target_cc'])
-        env['CXX_' + target] = str(tools['target_cxx'])
+        env['CXX_' + target] = str(target_cxx)
         env['AR_' + target] = str(tools['target_ar'])
         env['RANLIB_' + target] = str(tools['target_ranlib'])
         env['PKG_CONFIG_' + target] = str(target_pc)
@@ -534,16 +557,21 @@ def verify_metadata(metadata, source, cache, recipe):
     return records
 
 
-def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_cache, profile, jobs):
+def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_cache, profile, jobs,
+                  *, operation='build'):
+    if operation not in ('build', 'typecheck'):
+        raise CosmicBuildError('unsupported compilation operation')
+    selected = ports.user_target(recipe["target"])
     # Shared target library mutation and another COSMIC build cannot overlap.
     with (sysroot / '.build.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         tools, identities = tools_and_sysroot(sysroot, recipe)
         report = {'status': 'building', 'component': source, 'recipe_sha256': digest(recipe_path),
-                  'recipe': recipe, 'resource_profile': profile, 'target': TARGET,
+                  'recipe': recipe, 'resource_profile': profile, 'target': selected.rust_target, 'architecture': selected.architecture,
                   'builder_sha256': digest(Path(__file__)),
                   'profile_sha256': hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
                   'guest_execution': 'not performed', 'cosmic_session_ready': False,
+                  'operation': operation, 'target_linked': False,
                   'cargo_offline': True, 'build_script_network_sandbox': False, 'toolchain': identities}
         output = new_output(output)
         report_path = output / 'build-report.json'
@@ -557,7 +585,22 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                         raise CosmicBuildError('Cargo control directory has inherited configuration')
                 stage = control / 'source'
                 export_source(Path(record['path']), stage)
-                report['patches'] = apply_patches(recipe, stage, recipe_path.parent)
+                if 'source_series' in recipe:
+                    if __package__:
+                        from . import prepare_cosmic_comp as comp
+                    else:
+                        import prepare_cosmic_comp as comp
+                    series_path = comp.bound_path(ROOT, recipe['source_series']['path'])
+                    if digest(series_path) != recipe['source_series']['sha256']:
+                        raise CosmicBuildError('source series identity mismatch')
+                    series = comp.load_series(series_path)
+                    if (series['component'] != source['name'] or series['commit'] != source['commit']
+                            or ports.repository_url(series['repository']) != ports.repository_url(source['repository'])):
+                        raise CosmicBuildError('source series differs from component')
+                    report['series_sha256'] = digest(series_path)
+                    report['patches'] = comp.apply_series(stage, series_path)
+                else:
+                    report['patches'] = apply_patches(recipe, stage, recipe_path.parent)
                 if digest(stage / 'Cargo.lock') != recipe['effective_lock_sha256']:
                     raise CosmicBuildError('effective Cargo.lock mismatch after patches')
                 before = tree_identity(stage)
@@ -570,7 +613,7 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                 if recipe['features']:
                     features += ['--features', ','.join(recipe['features'])]
                 metadata_command = [str(tools['cargo']), 'metadata', '--format-version', '1',
-                                    '--filter-platform', TARGET, *common, *features]
+                                    '--filter-platform', selected.rust_target, *common, *features]
                 bounds = (profile['timeout_seconds'], profile['min_free_bytes'], profile['max_build_bytes'])
                 report['metadata_command'] = metadata_command
                 cache_baseline = directory_bytes(cargo_cache)
@@ -583,7 +626,8 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                     raise CosmicBuildError('Cargo metadata did not produce one complete JSON document') from error
                 report['cargo_dependencies'] = verify_metadata(metadata, stage, cargo_cache, recipe)
                 report['sysroot_before'] = tree_identity(sysroot / 'sysroot')
-                command = [str(tools['cargo']), 'build', '--release', '--target', TARGET, '--jobs', str(jobs),
+                command = [str(tools['cargo']), 'check' if operation == 'typecheck' else 'build',
+                           '--release', '--target', selected.rust_target, '--jobs', str(jobs),
                            '--package', recipe['package'], '--bin', recipe['binary'], *common, *features]
                 report['command'] = command
                 run_bounded(command, control, env, output / 'cargo.log', *bounds, budget_root=output,
@@ -596,18 +640,22 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                     raise CosmicBuildError('builder changed during execution')
                 if verify_metadata(metadata, stage, cargo_cache, recipe) != report['cargo_dependencies']:
                     raise CosmicBuildError('build modified dependency source inputs')
-                result = output / 'target' / TARGET / 'release' / recipe['binary']
+                report['source_preserved'] = inspect_source(Path(record['path']).parent, source)['verified']
+                if operation == 'typecheck':
+                    report['status'] = 'target-typechecked'
+                    return report
+                result = output / 'target' / selected.rust_target / 'release' / recipe['binary']
                 if not result.is_file() or not result.resolve().is_relative_to(output.resolve()):
                     raise CosmicBuildError('expected binary missing or escaped output')
-                executable = inspect_elf(result)
+                executable = inspect_elf(result, selected)
                 pages = sum(((p['vaddr'] + p['memsz'] + 4095) // 4096 - p['vaddr'] // 4096)
                             for p in executable['program_headers'] if p['type'] == 1)
                 if executable['bytes'] > profile['max_elf_bytes'] or pages * 4096 + profile['stack_bytes'] > profile['image_bytes']:
                     raise CosmicBuildError('linked ELF exceeds admitted image profile')
                 final = output / (recipe['binary'] + '.elf')
                 shutil.copyfile(result, final)
-                report.update(status='cross-built', executable=inspect_elf(final), image_load_pages=pages,
-                              source_preserved=inspect_source(Path(record['path']).parent, source)['verified'])
+                report.update(status='cross-built', executable=inspect_elf(final, selected), image_load_pages=pages,
+                              target_linked=True)
                 if not report['source_preserved']:
                     raise CosmicBuildError('original source changed during build')
         except (OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
@@ -620,11 +668,12 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'build'), nargs='?', default='check')
+    parser.add_argument('action', choices=('check', 'typecheck', 'build'), nargs='?', default='check')
     parser.add_argument('--component', required=True)
     parser.add_argument('--recipe', type=Path)
     parser.add_argument('--cache', type=Path, default=ports.CACHE)
-    parser.add_argument('--sysroot', type=Path, default=DEFAULT_SYSROOT)
+    parser.add_argument('--sysroot', type=Path)
+    parser.add_argument('--arch', choices=('aarch64', 'x86_64'))
     parser.add_argument('--cargo-cache', type=Path, default=CARGO_CACHE)
     parser.add_argument('--resource-profile', type=Path, default=PROFILE)
     parser.add_argument('--output', type=Path)
@@ -633,8 +682,11 @@ def main(argv=None):
     try:
         manifest = ports.load_manifest()
         source, record, recipe = source_and_recipe(args.component, args.recipe, manifest, args.cache)
-        profile = select_profile(load_json(args.resource_profile), recipe['resource_profile'], args.jobs)
-        sysroot = no_symlink_path(args.sysroot)
+        selected = ports.user_target(recipe['target'])
+        if args.arch is not None and selected != profile_for(args.arch):
+            raise CosmicBuildError('recipe target disagrees with --arch')
+        profile = select_profile(load_json(args.resource_profile), recipe['resource_profile'], args.jobs, selected)
+        sysroot = no_symlink_path(args.sysroot or selected.default_output(ROOT))
         cache = validate_cache(args.cargo_cache)
         tools_and_sysroot(sysroot, recipe)
         resource_check(sysroot, profile['min_free_bytes'] + profile['max_build_bytes'], 2**63)
@@ -645,7 +697,7 @@ def main(argv=None):
         if args.output is None:
             raise CosmicBuildError('build requires a new explicit --output directory')
         report = perform_build(source, record, recipe, args.recipe.resolve(), args.output,
-                               sysroot, cache, profile, args.jobs)
+                               sysroot, cache, profile, args.jobs, operation=args.action)
         print(json.dumps({'status': report['status'], 'report': str(args.output / 'build-report.json')}, indent=2))
         return 0
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:

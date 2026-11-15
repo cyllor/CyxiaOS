@@ -1,4 +1,4 @@
-/* Native CyxiaOS Linux-AArch64-persona probe; links only target musl. */
+/* Native CyxiaOS Linux-personality probe; links only the selected target musl. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -70,16 +70,27 @@ int main(int argc, char **argv)
     double live = 1.25;
     const double increment = 0.5;
     long long elapsed = 0;
-    /* d0-equivalent stays live through an actual FP instruction loop, across
+    /* The target FP register stays live through actual instructions, across
      * timer interrupts; the outer bound prevents hangs if the clock stalls. */
     for (unsigned chunk = 0; chunk < 1024 && elapsed < 50000000; ++chunk) {
         unsigned remaining = 65536;
+#if defined(__aarch64__)
         __asm__ volatile (
             "1: fadd %d0, %d0, %d2\n"
             "fsub %d0, %d0, %d2\n"
             "subs %w1, %w1, #1\n"
             "b.ne 1b"
             : "+w"(live), "+r"(remaining) : "w"(increment) : "cc");
+#elif defined(__x86_64__)
+        __asm__ volatile (
+            "1: addsd %2, %0\n"
+            "subsd %2, %0\n"
+            "subl $1, %1\n"
+            "jnz 1b"
+            : "+x"(live), "+r"(remaining) : "x"(increment) : "cc");
+#else
+#error Unsupported CyxiaOS probe architecture
+#endif
         if (live != 1.25) return fail("fp-irq-state");
         if (clock_gettime(CLOCK_MONOTONIC, &now)) return fail("clock");
         elapsed = (long long)(now.tv_sec - start.tv_sec) * 1000000000LL

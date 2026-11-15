@@ -1,0 +1,536 @@
+--- a/src/backend/kms/mod.rs
++++ b/src/backend/kms/mod.rs
+@@ -61,6 +61,8 @@
+ 
+ mod device;
+ mod drm_helpers;
++mod offscreen;
++mod offscreen_policy;
+ pub mod render;
+ mod surface;
+ use device::*;
+--- /dev/null
++++ b/src/backend/kms/offscreen.rs
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use super::{
++    KmsState,
++    offscreen_policy::{DevicePreference, NodePair},
++};
++use crate::{
++    backend::{
++        offscreen::OffscreenTarget,
++        render::{GlMultiError, RendererRef},
++    },
++    state::advertised_node_for_surface,
++};
++use smithay::{
++    backend::{
++        allocator::{Buffer, Fourcc},
++        drm::DrmNode,
++        renderer::{BufferType, buffer_type, utils::with_renderer_surface_state},
++    },
++    reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
++    wayland::{
++        dmabuf::get_dmabuf,
++        shm::{shm_format_to_fourcc, with_buffer_contents},
++    },
++};
++
++fn buffer_node(buffer: &WlBuffer) -> Option<DrmNode> {
++    get_dmabuf(buffer).ok().and_then(|dmabuf| dmabuf.node())
++}
++
++fn surface_node(surface: &WlSurface) -> Option<DrmNode> {
++    with_renderer_surface_state(surface, |state| {
++        let buffer = state.buffer()?;
++        let dmabuf = get_dmabuf(buffer).ok()?;
++        dmabuf.node()
++    })
++    .flatten()
++}
++
++impl KmsState {
++    fn offscreen_nodes(&self, target: OffscreenTarget<'_>) -> Option<(NodePair<DrmNode>, Fourcc)> {
++        let primary = *self.primary_node.read().unwrap();
++        let preference = match target {
++            OffscreenTarget::Primary => DevicePreference::Primary,
++            OffscreenTarget::Output(output) => DevicePreference::Output {
++                output: self.target_node_for_output(output),
++                target: None,
++            },
++            OffscreenTarget::Surface(surface) => DevicePreference::Surface {
++                surface: surface_node(surface),
++                target: None,
++            },
++            OffscreenTarget::OutputBuffer { output, buffer } => DevicePreference::Output {
++                output: self.target_node_for_output(output),
++                target: buffer_node(buffer),
++            },
++            OffscreenTarget::SurfaceBuffer { surface, buffer } => {
++                let target = buffer_node(buffer);
++                DevicePreference::Surface {
++                    surface: if target.is_none() {
++                        surface.and_then(surface_node)
++                    } else {
++                        None
++                    },
++                    target,
++                }
++            }
++            OffscreenTarget::Screenshot { surface, display } => DevicePreference::Surface {
++                surface: advertised_node_for_surface(surface, display),
++                target: None,
++            },
++        };
++        let nodes = preference.select(primary)?;
++        // Only output/workspace capture can copy across devices. Preserve the
++        // destination buffer format, including the upstream ABGR fallback.
++        let copy_format = if let OffscreenTarget::OutputBuffer { buffer, .. } = target {
++            match buffer_type(buffer) {
++                Some(BufferType::Dma) => Some(get_dmabuf(buffer).unwrap().format().code),
++                Some(BufferType::Shm) => {
++                    with_buffer_contents(buffer, |_, _, data| shm_format_to_fourcc(data.format))
++                        .unwrap()
++                }
++                _ => None,
++            }
++        } else {
++            None
++        }
++        .unwrap_or(Fourcc::Abgr8888);
++        Some((nodes, copy_format))
++    }
++
++    pub fn offscreen_renderer(
++        &mut self,
++        target: OffscreenTarget<'_>,
++    ) -> Result<RendererRef<'_>, GlMultiError> {
++        if let Some((nodes, copy_format)) = self.offscreen_nodes(target) {
++            Ok(RendererRef::GlMulti(self.api.renderer(
++                &nodes.render,
++                &nodes.target,
++                copy_format,
++            )?))
++        } else {
++            Ok(RendererRef::Glow(
++                self.software_renderer
++                    .as_mut()
++                    .expect("No Software Rendering"),
++            ))
++        }
++    }
++}
+--- /dev/null
++++ b/src/backend/kms/offscreen_policy.rs
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++/// Device preference after resolving a capture's Wayland objects.
++///
++/// Kept independent of device handles so the KMS selection contract can be
++/// exercised without opening a display device. `None` means the caller must
++/// use its software renderer; it does not create or substitute a GPU device.
++pub enum DevicePreference<Node> {
++    Primary,
++    Output {
++        output: Option<Node>,
++        target: Option<Node>,
++    },
++    Surface {
++        surface: Option<Node>,
++        target: Option<Node>,
++    },
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct NodePair<Node> {
++    pub render: Node,
++    pub target: Node,
++}
++
++impl<Node: Copy> DevicePreference<Node> {
++    pub fn select(self, primary: Option<Node>) -> Option<NodePair<Node>> {
++        match self {
++            Self::Primary => primary.map(|node| NodePair {
++                render: node,
++                target: node,
++            }),
++            Self::Output { output, target } => {
++                let render = output.or(primary)?;
++                Some(NodePair {
++                    render,
++                    target: target.unwrap_or(render),
++                })
++            }
++            Self::Surface { surface, target } => {
++                let node = target.or(surface).or(primary)?;
++                Some(NodePair {
++                    render: node,
++                    target: node,
++                })
++            }
++        }
++    }
++}
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -9,6 +9,7 @@
+ use smithay::reexports::{calloop::EventLoop, wayland_server::DisplayHandle};
+ use tracing::{info, warn};
+ 
++pub mod offscreen;
+ pub mod render;
+ mod selection;
+ 
+--- /dev/null
++++ b/src/backend/offscreen.rs
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use smithay::{
++    output::Output,
++    reexports::wayland_server::{
++        DisplayHandle,
++        protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
++    },
++};
++
++/// A capture source and optional destination, independent of the output backend.
++///
++/// KMS resolves these objects to its render/copy devices. Single-renderer
++/// backends use their existing renderer. Callers never inspect KMS state.
++#[derive(Debug, Clone, Copy)]
++pub enum OffscreenTarget<'a> {
++    /// Cursor capture and other rendering without a particular output or surface.
++    Primary,
++    /// Query capture constraints for an output.
++    Output(&'a Output),
++    /// Query capture constraints for the surface's committed buffer.
++    Surface(&'a WlSurface),
++    /// Render an output/workspace to a client's capture buffer.
++    OutputBuffer {
++        output: &'a Output,
++        buffer: &'a WlBuffer,
++    },
++    /// Render a toplevel to a client's capture buffer.
++    SurfaceBuffer {
++        surface: Option<&'a WlSurface>,
++        buffer: &'a WlBuffer,
++    },
++    /// A screenshot uses the device advertised to the surface's client.
++    /// This intentionally differs from the committed-buffer capture constraint.
++    Screenshot {
++        surface: &'a WlSurface,
++        display: &'a DisplayHandle,
++    },
++}
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -7,7 +7,10 @@
+ #[cfg(feature = "backend-x11")]
+ use crate::backend::x11::X11State;
+ use crate::{
+-    backend::render::{GlMultiError, RendererRef},
++    backend::{
++        offscreen::OffscreenTarget,
++        render::{GlMultiError, RendererRef},
++    },
+     config::{CompOutputConfig, Config, ScreenFilter},
+     dbus::DBusState,
+     input::{PointerFocusState, gestures::GestureState},
+@@ -42,7 +45,7 @@
+ use rust_embed::RustEmbed;
+ use smithay::{
+     backend::{
+-        allocator::{Fourcc, dmabuf::Dmabuf},
++        allocator::dmabuf::Dmabuf,
+         drm::DrmNode,
+         renderer::{
+             ImportDma,
+@@ -439,32 +442,17 @@
+         Ok(None)
+     }
+ 
+-    /// Get an offscreen renderer for screen capture / screenshot rendering
++    /// Get an offscreen renderer for a capture source and destination.
+     ///
+-    /// `kms_node_cb` callback use used to determine nodes to render with when using kms backend.
+-    /// If this returns `None`, it will attempt to use llvmpipe, then panic if no renderer is
+-    /// found.
++    /// Device selection and software fallback belong to the selected backend.
++    /// The request is identical for KMS and single-renderer backends.
+     pub fn offscreen_renderer(
+         &mut self,
+-        #[cfg(feature = "backend-kms")] kms_node_cb: impl FnOnce(&mut KmsState) -> Option<KmsNodes>,
++        target: OffscreenTarget<'_>,
+     ) -> Result<RendererRef<'_>, GlMultiError> {
+         match self {
+             #[cfg(feature = "backend-kms")]
+-            BackendData::Kms(kms) => {
+-                if let Some(nodes) = kms_node_cb(kms) {
+-                    Ok(RendererRef::GlMulti(kms.api.renderer(
+-                        &nodes.render_node,
+-                        &nodes.target_node,
+-                        nodes.copy_format,
+-                    )?))
+-                } else {
+-                    Ok(RendererRef::Glow(
+-                        kms.software_renderer
+-                            .as_mut()
+-                            .expect("No Software Rendering"),
+-                    ))
+-                }
+-            }
++            BackendData::Kms(kms) => kms.offscreen_renderer(target),
+             #[cfg(feature = "backend-winit")]
+             BackendData::Winit(winit) => Ok(RendererRef::Glow(winit.backend.renderer())),
+             #[cfg(feature = "backend-x11")]
+@@ -657,23 +645,6 @@
+         });
+ 
+         Ok(())
+-    }
+-}
+-
+-pub struct KmsNodes {
+-    pub render_node: DrmNode,
+-    pub target_node: DrmNode,
+-    pub copy_format: Fourcc,
+-}
+-
+-impl From<DrmNode> for KmsNodes {
+-    fn from(node: DrmNode) -> Self {
+-        KmsNodes {
+-            render_node: node,
+-            target_node: node,
+-            // Ignored if render == target
+-            copy_format: Fourcc::Abgr8888,
+-        }
+     }
+ }
+ 
+--- a/src/utils/screenshot.rs
++++ b/src/utils/screenshot.rs
+@@ -14,9 +14,10 @@
+ use tracing::warn;
+ 
+ use crate::{
++    backend::offscreen::OffscreenTarget,
+     backend::render::{RendererRef, element::AsGlowRenderer},
+     shell::element::CosmicSurface,
+-    state::{State, advertised_node_for_surface},
++    state::State,
+ };
+ 
+ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
+@@ -99,14 +100,10 @@
+     if let Some(wl_surface) = surface.wl_surface() {
+         let res = state
+             .backend
+-            .offscreen_renderer(
+-                #[cfg(feature = "backend-kms")]
+-                |kms| {
+-                    advertised_node_for_surface(&wl_surface, &state.common.display_handle)
+-                        .or(*kms.primary_node.read().unwrap())
+-                        .map(Into::into)
+-                },
+-            )
++            .offscreen_renderer(OffscreenTarget::Screenshot {
++                surface: &wl_surface,
++                display: &state.common.display_handle,
++            })
+             .with_context(|| "Failed to get renderer for screenshot")
+             .and_then(|renderer| match renderer {
+                 RendererRef::Glow(renderer) => render_window(renderer, surface),
+--- a/src/wayland/handlers/image_copy_capture/mod.rs
++++ b/src/wayland/handlers/image_copy_capture/mod.rs
+@@ -12,7 +12,6 @@
+             damage::OutputDamageTracker,
+             gles::{Capability, GlesRenderer},
+             glow::GlowRenderer,
+-            utils::with_renderer_surface_state,
+         },
+     },
+     desktop::space::SpaceElement,
+@@ -21,7 +20,6 @@
+     reexports::wayland_server::protocol::{wl_pointer::WlPointer, wl_shm::Format as ShmFormat},
+     utils::{Buffer as BufferCoords, Point, Size, Transform},
+     wayland::{
+-        dmabuf::get_dmabuf,
+         image_capture_source::ImageCaptureSource,
+         image_copy_capture::{
+             BufferConstraints, CaptureFailureReason, CursorSession, CursorSessionRef,
+@@ -33,6 +31,7 @@
+ };
+ 
+ use crate::{
++    backend::offscreen::OffscreenTarget,
+     shell::{CosmicSurface, CursorGeometry, Shell},
+     state::{BackendData, State},
+     utils::prelude::{
+@@ -399,14 +398,7 @@
+     };
+ 
+     let mut renderer = backend
+-        .offscreen_renderer(
+-            #[cfg(feature = "backend-kms")]
+-            |kms| {
+-                kms.target_node_for_output(output)
+-                    .or(*kms.primary_node.read().unwrap())
+-                    .map(Into::into)
+-            },
+-        )
++        .offscreen_renderer(OffscreenTarget::Output(output))
+         .unwrap();
+     Some(constraints_for_renderer(mode, renderer.as_mut()))
+ }
+@@ -419,22 +411,7 @@
+     let wl_surface = surface.wl_surface()?;
+ 
+     let mut renderer = backend
+-        .offscreen_renderer(
+-            #[cfg(feature = "backend-kms")]
+-            |kms| {
+-                let dma_node = with_renderer_surface_state(&wl_surface, |state| {
+-                    let buffer = state.buffer()?;
+-                    let dmabuf = get_dmabuf(buffer).ok()?;
+-                    dmabuf.node()
+-                })
+-                .flatten();
+-
+-                dma_node
+-                    .or(*kms.primary_node.read().unwrap())
+-                    .map(Into::into)
+-                    .map(Into::into)
+-            },
+-        )
++        .offscreen_renderer(OffscreenTarget::Surface(&wl_surface))
+         .unwrap();
+ 
+     Some(constraints_for_renderer(size, renderer.as_mut()))
+--- a/src/wayland/handlers/image_copy_capture/render.rs
++++ b/src/wayland/handlers/image_copy_capture/render.rs
+@@ -3,7 +3,7 @@
+ use calloop::LoopHandle;
+ use smithay::{
+     backend::{
+-        allocator::{Buffer, Fourcc, format::get_transparent},
++        allocator::{Buffer, format::get_transparent},
+         renderer::{
+             BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
+             buffer_dimensions, buffer_type,
+@@ -14,7 +14,6 @@
+             },
+             gles::{GlesError, GlesRenderbuffer},
+             sync::SyncPoint,
+-            utils::with_renderer_surface_state,
+         },
+     },
+     desktop::space::SpaceElement,
+@@ -36,6 +35,7 @@
+ use tracing::warn;
+ 
+ use crate::{
++    backend::offscreen::OffscreenTarget,
+     backend::render::{
+         CursorMode, ElementFilter, RendererRef,
+         cursor::{self, CursorRenderElement},
+@@ -44,7 +44,7 @@
+         wayland::SurfaceRenderElement,
+     },
+     shell::{CosmicMappedRenderElement, CosmicSurface, WorkspaceRenderElement},
+-    state::{Common, KmsNodes, State},
++    state::{Common, State},
+     utils::prelude::{PointExt, PointGlobalExt, RectExt, RectLocalExt, SeatExt},
+     wayland::{
+         handlers::image_copy_capture::{
+@@ -433,33 +433,12 @@
+     let transform = output.current_transform();
+     let common = &mut state.common;
+ 
+-    let renderer = match state.backend.offscreen_renderer(
+-        #[cfg(feature = "backend-kms")]
+-        |kms| {
+-            let render_node = kms
+-                .target_node_for_output(&output)
+-                .or(*kms.primary_node.read().unwrap())?;
+-            let target_node = get_dmabuf(&buffer)
+-                .ok()
+-                .and_then(|dma| dma.node())
+-                .unwrap_or(render_node);
+-
+-            let buffer_format = match buffer_type(&buffer) {
+-                Some(BufferType::Dma) => Some(get_dmabuf(&buffer).unwrap().format().code),
+-                Some(BufferType::Shm) => {
+-                    with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+-                        .unwrap()
+-                }
+-                _ => None,
+-            };
+-
+-            Some(KmsNodes {
+-                render_node,
+-                target_node,
+-                copy_format: buffer_format.unwrap_or(Fourcc::Abgr8888),
+-            })
+-        },
+-    ) {
++    let renderer = match state
++        .backend
++        .offscreen_renderer(OffscreenTarget::OutputBuffer {
++            output: &output,
++            buffer: &buffer,
++        }) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+@@ -715,28 +694,13 @@
+     let common = &mut state.common;
+     let draw_cursor = session.draw_cursor();
+ 
+-    let renderer = match state.backend.offscreen_renderer(
+-        #[cfg(feature = "backend-kms")]
+-        |kms| {
+-            get_dmabuf(&buffer)
+-                .ok()
+-                .and_then(|dmabuf| dmabuf.node())
+-                .or_else(|| {
+-                    toplevel
+-                        .wl_surface()
+-                        .and_then(|wl_surface| {
+-                            with_renderer_surface_state(&wl_surface, |state| {
+-                                let buffer = state.buffer()?;
+-                                let dmabuf = get_dmabuf(buffer).ok()?;
+-                                dmabuf.node()
+-                            })
+-                        })
+-                        .flatten()
+-                })
+-                .or(*kms.primary_node.read().unwrap())
+-                .map(Into::into)
+-        },
+-    ) {
++    let wl_surface = toplevel.wl_surface();
++    let renderer = match state
++        .backend
++        .offscreen_renderer(OffscreenTarget::SurfaceBuffer {
++            surface: wl_surface.as_deref(),
++            buffer: &buffer,
++        }) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+@@ -900,10 +864,7 @@
+     }
+ 
+     let common = &mut state.common;
+-    let renderer = match state.backend.offscreen_renderer(
+-        #[cfg(feature = "backend-kms")]
+-        |kms| kms.primary_node.read().unwrap().map(Into::into),
+-    ) {
++    let renderer = match state.backend.offscreen_renderer(OffscreenTarget::Primary) {
+         Ok(renderer) => renderer,
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");

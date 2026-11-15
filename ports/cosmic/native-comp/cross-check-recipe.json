@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-comp",
+  "binary": "cosmic-comp",
+  "resource_profile": "comp-winit-cross-check",
+  "default_features": false,
+  "features": [
+    "backend-winit"
+  ],
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "effective_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "patches": [],
+  "source_series": {
+    "path": "ports/cosmic/native-comp/series.json",
+    "sha256": "616baeca2b658e86cd932c99a0a8327b0682160547f38483f9d85f54c722247a"
+  },
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "82a08301217c17ad6c4eaeb4c5af6abaceb6cab2ad485a7c5007ec8ca0abe3a4"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    }
+  ]
+}

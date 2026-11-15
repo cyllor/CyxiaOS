@@ -112,6 +112,42 @@ class CosmicPortSourceTests(unittest.TestCase):
                 self.assertIn('--offline', commands[1])
                 self.assertIn('--filter-platform', commands[1])
 
+    def test_explicit_x86_target_and_features_reach_real_metadata_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = {'name': 'fixture', 'commit': 'a' * 40}
+            cargo = root / 'cargo'
+            cargo.write_text('fixture tool')
+            commands = []
+
+            def export(_, destination):
+                destination.mkdir()
+                (destination / 'Cargo.toml').write_text('[package]\nname="fixture"\nversion="1.0.0"\n')
+                (destination / 'Cargo.lock').write_text('version = 4\n[[package]]\nname="fixture"\nversion="1.0.0"\n')
+
+            def run(command, cwd, env, log, *args, **kwargs):
+                commands.append(command)
+                if command[1] == 'metadata':
+                    Path(log).write_text(json.dumps({'version': 1, 'packages': [
+                        {'id': 'fixture', 'name': 'fixture', 'source': None,
+                         'manifest_path': str(cwd / 'Cargo.toml')}],
+                        'resolve': {'nodes': [{'id': 'fixture', 'dependencies': []}]}}))
+
+            with patch.object(prep.ports, 'load_manifest', return_value={'components': [source]}), \
+                 patch.object(prep.build, 'inspect_source', return_value={'path': str(root)}), \
+                 patch.object(prep.build, 'resource_check'), \
+                 patch.object(prep.build, 'export_source', side_effect=export), \
+                 patch.object(prep, 'acquisition_environment', return_value=(cargo, {})), \
+                 patch.object(prep.build, 'run_bounded', side_effect=run):
+                result = prep.prepare('fixture', root / 'out', cache=root / 'cache',
+                                      arch='x86_64', default_features=False, features=['backend-winit'])
+            self.assertEqual(result['target'], 'x86_64-unknown-linux-musl')
+            self.assertIn('x86_64-unknown-linux-musl', commands[1])
+            self.assertIn('--no-default-features', commands[1])
+            self.assertEqual(commands[1][-2:], ['--features', 'backend-winit'])
+            self.assertNotIn('--features', commands[0])  # cargo fetch has no feature selection
+            self.assertFalse(result['built'])
+
     @unittest.skipUnless((Path.home() / '.cargo/bin/rustc').exists(), 'Rust toolchain unavailable')
     def test_real_cargo_standalone_package_ignores_output_ancestor_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:

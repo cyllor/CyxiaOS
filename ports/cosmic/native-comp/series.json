@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-comp",
+  "repository": "https://github.com/pop-os/cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "patches": [
+    {
+      "manifest": "ports/cosmic/patches/cosmic-comp-41497b42-cyxia-nested.json",
+      "patch": "ports/cosmic/patches/cosmic-comp-41497b42-cyxia-nested.patch",
+      "manifest_sha256": "ed8fc0faeabdcbd8cd617f4829d36a3161918bfe0080d3b67a8dccba70000b44"
+    },
+    {
+      "manifest": "ports/cosmic/native-comp/offscreen-patch.json",
+      "patch": "ports/cosmic/patches/cosmic-comp-native-offscreen.patch",
+      "manifest_sha256": "d54918234136ad854203a53f51d239e33a1c9944d02a3df42a5400c13e7160a6"
+    }
+  ]
+}

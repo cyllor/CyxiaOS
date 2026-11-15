@@ -19,6 +19,11 @@ import tempfile
 import tomllib
 from urllib.parse import urlsplit
 
+if __package__:
+    from .target_profile import profile_for
+else:
+    from target_profile import profile_for
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'ports/cosmic/manifest.json'
 CACHE = ROOT / 'artifacts/cosmic-sources'
@@ -211,16 +216,26 @@ def inspect_locks(manifest, cache, sources):
     return checks
 
 
-def elf_header(data, allowed_types):
+def user_target(triple):
+    for architecture in ("aarch64", "x86_64"):
+        target = profile_for(architecture)
+        if triple == target.rust_target:
+            return target
+    raise PortError("unsupported Rust user-space target: " + str(triple))
+
+
+def elf_header(data, allowed_types, target="aarch64"):
+    target = profile_for(target)
     if len(data) < 64 or data[:7] != b'\x7fELF\x02\x01\x01':
         raise PortError('not ELF64 little-endian')
     kind, machine = struct.unpack_from('<HH', data, 16)
-    if machine != 183 or kind not in allowed_types:
-        raise PortError('not an AArch64 ELF object of the expected kind')
+    if machine != target.machine or kind not in allowed_types:
+        raise PortError('not a ' + target.architecture + ' ELF object of the expected kind')
 
 
-def architecture(path, *, rust_archive=False):
+def architecture(path, *, rust_archive=False, target="aarch64"):
     """Reject host objects, empty/thin/truncated archives and external symlinks."""
+    target = profile_for(target)
     path = Path(path)
     data = path.read_bytes()
     count = 0
@@ -243,26 +258,27 @@ def architecture(path, *, rust_archive=False):
                 # libraries do not get this exception, nor do arbitrary bytes.
                 metadata = rust_archive and name in (b'lib.rmeta/', b'lib.rmeta')
                 if not metadata:
-                    elf_header(body, (1,))
+                    elf_header(body, (1,), target)
                     count += 1
             offset = end + size % 2
         if offset != len(data) or count == 0:
             raise PortError('empty or truncated archive')
         kind = 'static-archive'
     else:
-        elf_header(data, (3,))
+        elf_header(data, (3,), target)
         count, kind = 1, 'shared-object'
-    return {'kind': kind, 'aarch64_objects': count, 'bytes': len(data),
+    return {'kind': kind, target.architecture + '_objects': count, 'machine': target.machine, 'architecture': target.architecture, 'bytes': len(data),
             'sha256': hashlib.sha256(data).hexdigest()}
 
 
-def inspect_libraries(manifest, sysroot):
+def inspect_libraries(manifest, sysroot, target="aarch64"):
+    target = profile_for(target)
     root = Path(sysroot).resolve()
     results = []
     # Never invoke host pkg-config or search /usr/lib on the build machine.
     for library in manifest['target_libraries']:
         files, candidates = [], set()
-        for relative in ('usr/lib', 'lib', 'usr/lib/aarch64-linux-musl'):
+        for relative in ('usr/lib', 'lib', 'usr/lib/' + target.c_target):
             for pattern in library['filenames']:
                 candidates.update((root / relative).glob(pattern))
         for path in sorted(candidates):
@@ -270,7 +286,7 @@ def inspect_libraries(manifest, sysroot):
             try:
                 if not path.resolve().is_relative_to(root):
                     raise PortError('library symlink escapes the target sysroot')
-                item.update(architecture(path), architecture_verified=True)
+                item.update(architecture(path, target=target), architecture_verified=True)
             except (PortError, OSError, ValueError) as error:
                 item['error'] = str(error)
             files.append(item)
@@ -281,6 +297,7 @@ def inspect_libraries(manifest, sysroot):
 
 
 def inspect_rust(target, minimum, rustc=None):
+    selected = user_target(target)
     compiler = rustc or shutil.which('rustc', path=str(Path.home() / '.cargo/bin') + os.pathsep + os.environ.get('PATH', ''))
     result = {'compiler': compiler, 'target': target, 'minimum_version': minimum,
               'minimum_version_met': False, 'std_target_present': False, 'guest_tested': False}
@@ -297,18 +314,19 @@ def inspect_rust(target, minimum, rustc=None):
         archives = sorted(directory.glob('libstd-*.rlib'))
         if not archives:
             raise PortError('target libstd rlib is not installed')
-        result['std_archives'] = [{'file': str(p), **architecture(p, rust_archive=True)} for p in archives]
+        result['std_archives'] = [{'file': str(p), **architecture(p, rust_archive=True, target=selected)} for p in archives]
         result['std_target_present'] = True
     except (PortError, OSError, subprocess.SubprocessError) as error:
         result['error'] = str(error)
     return result
 
 
-def inventory(manifest, cache=CACHE, sysroot=SYSROOT, rustc=None):
+def inventory(manifest, cache=CACHE, sysroot=SYSROOT, rustc=None, architecture="aarch64"):
+    selected = profile_for(architecture)
     sources = [inspect_source(cache, p) for p in [manifest['epoch'], *manifest['components']]]
     checks = inspect_locks(manifest, cache, sources)
-    libraries = inspect_libraries(manifest, sysroot)
-    rust = inspect_rust(manifest['target'], manifest['compositor']['rust_version'], rustc)
+    libraries = inspect_libraries(manifest, sysroot, selected)
+    rust = inspect_rust(selected.rust_target, manifest['compositor']['rust_version'], rustc)
     blockers = [{'id': p['id'], 'scope': p['scope'], 'status': 'requires-implementation-or-guest-evidence',
                  'detail': p['detail']} for p in manifest['required_work']]
     if not checks['epoch_components'] or not checks['compositor_cargo_lock']:
@@ -318,8 +336,8 @@ def inventory(manifest, cache=CACHE, sysroot=SYSROOT, rustc=None):
     for library in libraries:
         if not library['target_library_present'] and library['scope'] == 'winit-software-candidate':
             blockers.append({'id': 'target-library-' + library['name'], 'scope': 'build',
-                             'detail': 'No verified AArch64 candidate library in the selected target sysroot.'})
-    return {'target': manifest['target'], 'backend': manifest['backend'], 'sources': sources,
+                             'detail': 'No verified ' + selected.architecture + ' candidate library in the selected target sysroot.'})
+    return {'target': selected.rust_target, 'source_manifest_target': manifest['target'], 'architecture': selected.architecture, 'backend': manifest['backend'], 'sources': sources,
             'component_count': len(manifest['components']), 'lock_checks': checks,
             'compositor_lock': manifest['compositor'], 'initial_comp_audit': manifest['initial_comp_audit'],
             'epoch_unlinked_submodules': manifest.get('epoch_unlinked_submodules', []),
@@ -376,7 +394,8 @@ def main(argv=None):
     parser.add_argument('action', nargs='?', choices=('inventory', 'check', 'fetch'), default='inventory')
     parser.add_argument('--manifest', type=Path, default=MANIFEST)
     parser.add_argument('--cache', type=Path, default=CACHE)
-    parser.add_argument('--sysroot', type=Path, default=SYSROOT)
+    parser.add_argument('--sysroot', type=Path)
+    parser.add_argument('--arch', choices=('aarch64', 'x86_64'), default='aarch64')
     parser.add_argument('--rustc')
     parser.add_argument('--component', help='fetch exactly cosmic-epoch or one locked component')
     parser.add_argument('--output', type=Path, help='write the JSON report to this file as well')
@@ -393,7 +412,9 @@ def main(argv=None):
         else:
             if args.component:
                 raise PortError('--component is only valid for fetch')
-            report = inventory(manifest, args.cache, args.sysroot, args.rustc)
+            selected = profile_for(args.arch)
+            prefix = args.sysroot or selected.default_output(ROOT) / "sysroot"
+            report = inventory(manifest, args.cache, prefix, args.rustc, args.arch)
         report['manifest_sha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
         encoded = json.dumps(report, indent=2) + '\n'
         if args.output:

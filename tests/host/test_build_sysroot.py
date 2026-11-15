@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from tools import build_sysroot as build
+from tests.host.sdk_fixtures import object_archive
 
 
 def executable():
@@ -83,6 +84,54 @@ class ElfTests(unittest.TestCase):
 
 
 class SourceTests(unittest.TestCase):
+    def test_zlib_bootstrap_rejects_foreign_compiler_output(self):
+        for machine in (62, 183):
+            with self.subTest(machine=machine), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / 'source').mkdir()
+                (root / 'build-report.json').write_text(json.dumps({'target': 'x86_64-linux-musl'}))
+                lib = root / 'sysroot/usr/lib'
+                lib.mkdir(parents=True)
+                (lib / 'libc.a').write_bytes(object_archive([62]))
+                archive = root / 'source.archive'
+                with tarfile.open(archive, 'w') as bundle:
+                    notice = tarfile.TarInfo('zlib-fixture/LICENSE')
+                    notice.size = 3
+                    bundle.addfile(notice, io.BytesIO(b'MIT'))
+                package = dict(name='zlib', archive_root='zlib-fixture', license_file='LICENSE',
+                               expected_sha256=build.digest(archive))
+                builder = build.Builder(root, {'llvm-ar': 'unused', 'clang': 'unused', 'make': 'unused'}, 1, 'x86_64')
+                def compile_fixture(command, *args):
+                    if 'install' in command:
+                        (lib / 'libz.a').write_bytes(object_archive([machine]))
+                with patch.object(builder, 'run', side_effect=compile_fixture):
+                    if machine == 62:
+                        result = builder.build_zlib(package, {'directory': str(root)})
+                        self.assertEqual(result['archive']['machine'], 62)
+                    else:
+                        with self.assertRaises(ValueError):
+                            builder.build_zlib(package, {'directory': str(root)})
+
+    def test_xorg_bootstrap_validates_selected_isa_at_the_link_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'build-report.json').write_text(json.dumps({'target': 'x86_64-linux-musl'}))
+            lib = root / 'sysroot/usr/lib'
+            lib.mkdir(parents=True)
+            for name in ('libc.a', 'libXau.a', 'libxcb.a', 'libX11.a'):
+                (lib / name).write_bytes(object_archive([62]))
+            builder = build.Builder(root, {'llvm-ar': 'unused', 'clang': 'unused'}, 1, target='x86_64')
+            # Only the external compiler is substituted. The loader and target
+            # receipt validation exercise actual ELF and archive bytes.
+            def compile_fixture(command, *args):
+                data = executable()
+                struct.pack_into('<H', data, 18, 62)
+                Path(command[command.index('-o') + 1]).write_bytes(data)
+            with patch.object(builder, 'run', side_effect=compile_fixture):
+                report = builder.build_xorg({'packages': []}, [])
+            self.assertEqual(report['probe']['machine'], 62)
+            self.assertEqual(report['architecture'], 'x86_64')
+
     def test_manifest_requires_pins_and_simple_paths(self):
         baseline = build.load_manifest()
         for field, value in (("expected_sha256", ""), ("archive_root", "../musl"),

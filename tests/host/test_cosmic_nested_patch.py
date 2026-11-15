@@ -11,6 +11,23 @@ ROOT = Path(__file__).resolve().parents[2]
 ORIGINAL = ROOT / 'artifacts/cosmic-sources/cosmic-comp-epoch'
 PATCH = ROOT / 'ports/cosmic/patches/cosmic-comp-41497b42-cyxia-nested.patch'
 SMITHAY = ROOT / 'artifacts/smithay-research/smithay-e3d461a057ba244d213a8498ec372b0799cca103/Cargo.toml'
+SMITHAY_PIN = 'e3d461a057ba244d213a8498ec372b0799cca103'
+
+
+def smithay_manifest():
+    if SMITHAY.is_file():
+        return tomllib.loads(SMITHAY.read_text())
+    # Source acquisition now uses the isolated Cargo cache. Read the exact
+    # pinned Git blob, not an arbitrary same-named working-tree manifest.
+    checkouts = ROOT / 'artifacts/cosmic-cargo-cache/git/checkouts'
+    for source in sorted(checkouts.glob('smithay-*/*')):
+        if not source.is_dir() or source.is_symlink():
+            continue
+        result = subprocess.run(['git', '-C', str(source), 'show', SMITHAY_PIN + ':Cargo.toml'],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return tomllib.loads(result.stdout)
+    raise FileNotFoundError('pinned Smithay source unavailable: ' + SMITHAY_PIN)
 
 
 class NestedPatch(unittest.TestCase):
@@ -30,7 +47,7 @@ class NestedPatch(unittest.TestCase):
 
     def test_nested_feature_does_not_activate_native_device_dependencies(self):
         comp = tomllib.loads((self.stage / 'Cargo.toml').read_text())
-        smithay = tomllib.loads(SMITHAY.read_text())
+        smithay = smithay_manifest()
         config = tomllib.loads((self.stage / 'cosmic-comp-config/Cargo.toml').read_text())
         self.assertFalse(comp['dependencies']['cosmic-comp-config']['default-features'])
         self.assertTrue(config['dependencies']['input']['optional'])

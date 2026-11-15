@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "comp-winit-cross-check": {
+      "target_runtime_validated": false,
+      "purpose": "Compile the real patched compositor with the existing Winit branch to validate common backend separation. Not a Cyxia native backend, link, or runtime proof. Missing C++ SDK fails if requested. Build retains current guest image bounds.",
+      "jobs_max": 1,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 2147483648,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 16777216,
+      "image_bytes": 16777216,
+      "stack_bytes": 262144
+    }
+  }
+}

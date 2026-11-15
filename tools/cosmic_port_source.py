@@ -18,10 +18,14 @@ try:
     from . import build_cosmic as build
     from . import cosmic_dependencies as dependencies
     from . import cosmic_ports as ports
+    from . import prepare_cosmic_comp as comp
+    from .target_profile import profile_for
 except ImportError:
     import build_cosmic as build
     import cosmic_dependencies as dependencies
     import cosmic_ports as ports
+    import prepare_cosmic_comp as comp
+    from target_profile import profile_for
 
 
 def acquisition_environment(cache):
@@ -61,20 +65,35 @@ def summarize_metadata(path, source):
 
 
 def prepare(component, output, *, source_cache=ports.CACHE, cache=build.CARGO_CACHE,
-            timeout=900, min_free=1024**3, max_bytes=2 * 1024**3):
+            timeout=900, min_free=1024**3, max_bytes=2 * 1024**3, arch='aarch64',
+            series_path=None, default_features=True, features=(), offline=False):
     if any(type(value) is not int or value <= 0 for value in (timeout, min_free, max_bytes)):
         raise build.CosmicBuildError('resource bounds must be positive integers')
+    target = profile_for(arch).rust_target
+    if type(default_features) is not bool or type(offline) is not bool:
+        raise build.CosmicBuildError('feature/offline selection must be boolean')
+    for feature in features:
+        build.checked_name(feature)
+    if len(set(features)) != len(features):
+        raise build.CosmicBuildError('duplicate Cargo feature')
     manifest = ports.load_manifest()
     source = next((p for p in manifest['components'] if p['name'] == component), None)
     if source is None:
         raise build.CosmicBuildError('unknown pinned component')
+    if series_path is not None:
+        series = comp.load_series(series_path)
+        if (series['component'] != component or series['commit'] != source['commit']
+                or ports.repository_url(series['repository']) != ports.repository_url(source['repository'])):
+            raise build.CosmicBuildError('port series differs from selected source')
     record = build.inspect_source(source_cache, source)
     cache = build.no_symlink_path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     build.validate_cache(cache)
     output = build.new_output(output)
     report = {'schema_version': 1, 'status': 'INCOMPLETE', 'source': source,
-              'target': build.TARGET, 'cache': str(cache), 'built': False,
+              'target': target, 'cache': str(cache), 'built': False,
+              'default_features': default_features, 'features': list(features),
+              'network_acquisition': not offline,
               'guest_tested': False, 'native_dependency_closure_verified': False,
               'vendored': False, 'bounds': {'timeout_seconds': timeout,
               'min_free_bytes': min_free, 'max_growth_bytes': max_bytes},
@@ -94,6 +113,9 @@ def prepare(component, output, *, source_cache=ports.CACHE, cache=build.CARGO_CA
             baseline = build.directory_bytes(cache)
             build.resource_check(output, min_free + max_bytes, max_bytes)
             build.export_source(record['path'], stage)
+            if series_path is not None:
+                report['series_sha256'] = build.digest(series_path)
+                report['patches'] = comp.apply_series(stage, series_path)
             before = build.tree_identity(stage)
             report['source_tree_sha256'] = before['sha256']
             report['metadata_source_directory'] = str(stage)
@@ -103,13 +125,16 @@ def prepare(component, output, *, source_cache=ports.CACHE, cache=build.CARGO_CA
             if report['lock']['unfixed_sources']:
                 raise build.CosmicBuildError('Cargo.lock contains unfixed dependency sources')
             cargo, env = acquisition_environment(cache)
+            env['CARGO_NET_OFFLINE'] = 'true' if offline else 'false'
             env['CARGO_TARGET_DIR'] = str(output / 'target')
             report['cargo'] = {'path': str(cargo), 'sha256': build.digest(cargo)}
             # Cargo metadata resolves manifests for every lockfile platform even
             # with --filter-platform; a target-only fetch leaves those absent.
-            commands = [([str(cargo), 'fetch', '--locked'], 'fetch.log'),
+            commands = [([str(cargo), 'fetch', '--locked'] + (['--offline'] if offline else []), 'fetch.log'),
                         ([str(cargo), 'metadata', '--locked', '--offline', '--format-version', '1',
-                          '--filter-platform', build.TARGET], 'metadata.json')]
+                          '--filter-platform', target]
+                         + ([] if default_features else ['--no-default-features'])
+                         + (['--features', ','.join(features)] if features else []), 'metadata.json')]
             report['commands'] = [command for command, _ in commands]
             for command, name in commands:
                 remaining = timeout - (time.monotonic() - started)
@@ -142,9 +167,16 @@ def main(argv=None):
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--source-cache', type=Path, default=ports.CACHE)
     parser.add_argument('--cache', type=Path, default=build.CARGO_CACHE)
+    parser.add_argument('--arch', choices=('aarch64', 'x86_64'), default='aarch64')
+    parser.add_argument('--series', type=Path, help='ordered hash-bound compositor port series')
+    parser.add_argument('--no-default-features', action='store_true')
+    parser.add_argument('--features', nargs='*', default=[])
+    parser.add_argument('--offline', action='store_true', help='only use already acquired source inputs')
     args = parser.parse_args(argv)
     try:
-        result = prepare(args.component, args.output, source_cache=args.source_cache, cache=args.cache)
+        result = prepare(args.component, args.output, source_cache=args.source_cache, cache=args.cache,
+                         arch=args.arch, series_path=args.series,
+                         default_features=not args.no_default_features, features=args.features, offline=args.offline)
         print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError, subprocess.SubprocessError) as error:

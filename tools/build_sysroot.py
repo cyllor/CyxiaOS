@@ -27,8 +27,10 @@ import tempfile
 
 if __package__:
     from . import desktop_ports
+    from .target_profile import profile_for
 else:
     import desktop_ports
+    from target_profile import profile_for
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "ports/libc/manifest.json"
@@ -188,15 +190,16 @@ def unpack(package: dict, record: dict, source: Path) -> Path:
     return destination
 
 
-def inspect_elf(path: Path) -> dict:
+def inspect_elf(path: Path, target="aarch64") -> dict:
     """Check the bounded static ELF contract consumed by the CyxiaOS loader."""
+    target = profile_for(target)
     data = path.read_bytes()
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
         raise BuildError("Expected little-endian ELF64")
     h = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
     _, kind, machine, version, entry, phoff, shoff, _, ehsize, phsize, phnum, shsize, shnum, _ = h
-    if (kind, machine, version, ehsize, phsize) != (2, 183, 1, 64, 56):
-        raise BuildError("Expected AArch64 ET_EXEC with 56-byte program headers")
+    if (kind, machine, version, ehsize, phsize) != (2, target.machine, 1, 64, 56):
+        raise BuildError("Expected " + target.architecture + " ET_EXEC with 56-byte program headers")
     if not phnum or phnum > 32 or phoff + phnum * phsize > len(data):
         raise BuildError("Invalid program-header table")
     if shsize != 64 or shoff + shnum * shsize > len(data):
@@ -234,7 +237,7 @@ def inspect_elf(path: Path) -> dict:
             if any(start < previous[1] and previous[0] < end for previous in loads):
                 raise BuildError("Overlapping LOAD pages")
             loads.append((start, end))
-    if not any(p["type"] == 1 and p["flags"] & 1 and
+    if entry % target.entry_alignment or not any(p["type"] == 1 and p["flags"] & 1 and
                p["vaddr"] <= entry < p["vaddr"] + p["filesz"] for p in headers):
         raise BuildError("Entry point must be inside file-backed executable LOAD")
     phdr = next((p for p in headers if p["type"] == 6), None)
@@ -244,11 +247,13 @@ def inspect_elf(path: Path) -> dict:
                                for p in headers):
         raise BuildError("Program headers must be mapped for musl TLS startup")
     return {"file": str(path), "sha256": digest(path), "bytes": len(data),
+            "architecture": target.architecture, "machine": machine, "target": target.c_target,
             "entry": entry, "at_phdr": phdr["vaddr"], "at_phent": phsize,
             "at_phnum": phnum, "program_headers": headers}
 
 
-def compiler_runtime_sources(source: Path) -> list[str]:
+def compiler_runtime_sources(source: Path, target="aarch64") -> list[str]:
+    target = profile_for(target)
     text = (source / "lib/builtins/CMakeLists.txt").read_text()
     names = []
     for group in ("GENERIC_SOURCES", "GENERIC_TF_SOURCES"):
@@ -260,13 +265,28 @@ def compiler_runtime_sources(source: Path) -> list[str]:
             raise BuildError("Unexpected compiler-rt source group")
         names.extend(entries)
     names.remove("fp_mode.c")
-    names.append("aarch64/fp_mode.c")
+    if target.architecture == "aarch64":
+        names.append("aarch64/fp_mode.c")
+    else:
+        match = re.search(r"set\(x86_80_BIT_SOURCES\s+([^)]*)\)", text)
+        if match is None:
+            raise BuildError("Missing upstream x86 80-bit source group")
+        extended = match.group(1).split()
+        if any(not re.fullmatch(r"[a-zA-Z0-9_]+\.c", name) for name in extended):
+            raise BuildError("Unexpected x86 extended-precision source group")
+        names.extend(extended)
+        for generic in ("floatdidf.c", "floatdisf.c", "floatundidf.c", "floatundisf.c", "floatdixf.c", "floatundixf.c"):
+            if generic in names:
+                names.remove(generic)
+        names.extend(("i386/fp_mode.c", "cpu_model/x86.c", "x86_64/floatdidf.c", "x86_64/floatdisf.c",
+                      "x86_64/floatundidf.S", "x86_64/floatundisf.S", "x86_64/floatdixf.c", "x86_64/floatundixf.S"))
     names.append("clear_cache.c")
     return names
 
 
 class Builder:
-    def __init__(self, output: Path, tools: dict[str, str], jobs: int):
+    def __init__(self, output: Path, tools: dict[str, str], jobs: int, target="aarch64"):
+        self.target = profile_for(target)
         self.output, self.tools, self.jobs = output, tools, jobs
         self.env = clean_env()
         self.commands: list[list[str]] = []
@@ -287,6 +307,9 @@ class Builder:
 
     def build(self, manifest: dict, records: list[dict]) -> dict:
         out = self.output
+        producer_paths = [Path(__file__).resolve(), Path(__file__).with_name('target_profile.py').resolve(),
+                          MANIFEST, ROOT / 'user/ported/probe.c']
+        producers = {str(path): digest(path) for path in producer_paths}
         for directory in ("source", "logs", "bin", "licenses", "musl-build", "compiler-rt-build"):
             (out / directory).mkdir(parents=True, exist_ok=True)
         sources = [unpack(package, record, out / "source")
@@ -298,12 +321,11 @@ class Builder:
         for package, source in zip(manifest["packages"], sources):
             shutil.copyfile(source / package["license_file"], out / "licenses" / (package["name"] + ".txt"))
         linker = self.shell_wrapper("ld.lld", [self.tools["rust-lld"], "-flavor", "gnu"])
-        ranlib = self.shell_wrapper("aarch64-linux-musl-ranlib", [self.tools["llvm-ar"], "s"])
-        self.shell_wrapper("aarch64-linux-musl-ar", [self.tools["llvm-ar"]])
-        cc = [self.tools["clang"], "--target=aarch64-linux-musl", "-march=armv8-a",
-              "-mno-outline-atomics", "--ld-path=" + str(linker)]
+        ranlib = self.shell_wrapper(self.target.c_target + "-ranlib", [self.tools["llvm-ar"], "s"])
+        self.shell_wrapper(self.target.c_target + "-ar", [self.tools["llvm-ar"]])
+        cc = [self.tools["clang"], *self.target.clang_args, "--ld-path=" + str(linker)]
         # Prefix /usr is safe only with the mandatory project-local DESTDIR below.
-        self.run([str(sources[0] / "configure"), "--target=aarch64-linux-musl",
+        self.run([str(sources[0] / "configure"), "--target=" + self.target.c_target,
                   "--prefix=/usr", "--disable-shared", "--disable-wrapper",
                   "CC=" + shlex.join(cc), "AR=" + self.tools["llvm-ar"],
                   "RANLIB=" + str(ranlib), "LIBCC="], "configure.log", out / "musl-build")
@@ -312,9 +334,15 @@ class Builder:
                  "install.log", out / "musl-build")
         headers = out / "sysroot/usr/include"
         lib = out / "sysroot/usr/lib"
-        target_cc = [self.tools["clang"], "--target=aarch64-linux-musl", "-march=armv8-a",
-                     "-mno-outline-atomics", "-nostdinc", "-isystem", str(headers)]
-        names = compiler_runtime_sources(sources[1])
+        target_cc = [self.tools["clang"], *self.target.clang_args, "-nostdinc", "-isystem", str(headers)]
+        if self.target.architecture == 'x86_64':
+            resource = Path(subprocess.check_output([self.tools['clang'], '-print-resource-dir'], text=True).strip()) / 'include'
+            if not (resource / 'cpuid.h').is_file():
+                raise BuildError('Clang x86 intrinsic header cpuid.h is missing')
+            # Compiler intrinsics are target code; no host libc include path is added.
+            target_cc += ['-isystem', str(resource)]
+            producers[str(resource / 'cpuid.h')] = digest(resource / 'cpuid.h')
+        names = compiler_runtime_sources(sources[1], self.target)
 
         def compile_builtin(name: str) -> Path:
             obj = out / "compiler-rt-build" / (name.replace("/", "_") + ".o")
@@ -325,27 +353,34 @@ class Builder:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.jobs) as executor:
             objects = list(executor.map(compile_builtin, names))
-        builtins = lib / "libclang_rt.builtins-aarch64.a"
+        builtins = lib / self.target.builtins_archive
         builtins.unlink(missing_ok=True)
         self.run([self.tools["llvm-ar"], "rcs", str(builtins), *map(str, objects)], "builtins-ar.log")
         self.run(target_cc + ["-O2", "-ffp-contract=off", "-fno-stack-protector", "-fno-pie",
                               "-c", str(ROOT / "user/ported/probe.c"), "-o", str(out / "probe.o")], "probe-compile.log")
         temporary = out / "probe.elf.tmp"
-        self.run([str(linker), "-m", "aarch64elf", "--image-base=0x01000000", "-z",
+        self.run([str(linker), "-m", self.target.linker_emulation, "--image-base=0x01000000", "-z",
                   "max-page-size=4096", "-z", "separate-code", "-static", "--no-pie", "--build-id=sha1",
                   "-o", str(temporary), str(lib / "crt1.o"), str(lib / "crti.o"), str(out / "probe.o"),
                   "--start-group", str(lib / "libc.a"), str(builtins), "--end-group", str(lib / "crtn.o")], "probe-link.log")
-        elf = inspect_elf(temporary)
+        elf = inspect_elf(temporary, self.target)
         temporary.replace(out / "probe.elf")
         elf["file"] = str(out / "probe.elf")
         (out / "probe-layout.json").write_text(json.dumps(elf, indent=2) + "\n")
         self.run([self.tools["llvm-objdump"], "-d", str(out / "probe.elf")], "probe-disassembly.txt")
         self.write_cc_wrapper(target_cc, lib, linker)
-        report = {"target": manifest["target"], "sources": records,
+        if any(digest(Path(path)) != expected for path, expected in producers.items()):
+            raise BuildError('A sysroot producer input changed during compilation')
+        report = {"status": "cross-built", "target": self.target.c_target, "architecture": self.target.architecture,
+                  "source_manifest_target": manifest["target"], "target_profile": self.target.identity(), "sources": records,
                   "toolchain": self.tools, "commands": self.commands,
+                  "producer_inputs_sha256": producers,
+                  "driver_sha256": digest(self.target.cc(out)),
                   "compiler_rt_sources": names, "probe": elf,
                   "guest_execution": "not performed by this build tool",
                   "libc_sha256": digest(lib / "libc.a"), "builtins_sha256": digest(builtins),
+                  "archives": {"libc.a": self.target.inspect_archive(lib / "libc.a"),
+                               self.target.builtins_archive: self.target.inspect_archive(builtins)},
                   "probe_source_sha256": digest(ROOT / "user/ported/probe.c"),
                   "licenses": {str(p.relative_to(out / "licenses")): digest(p)
                                for p in (out / "licenses").rglob("*") if p.is_file()}}
@@ -354,12 +389,13 @@ class Builder:
 
     def write_cc_wrapper(self, cc: list[str], lib: Path, linker: Path) -> None:
         """A target-only compiler driver for static dependency configure/builds."""
-        path = self.output / "bin/aarch64-linux-musl-cc"
+        path = self.target.cc(self.output)
         script = '''#!/usr/bin/env python3
 import os, subprocess, sys
 CC = %r
 LIB = %r
 LD = %r
+BUILTINS = %r
 args = sys.argv[1:]
 env = dict(os.environ)
 for key in ('CPATH','C_INCLUDE_PATH','CPLUS_INCLUDE_PATH','LIBRARY_PATH','SDKROOT','MACOSX_DEPLOYMENT_TARGET','COMPILER_PATH','GCC_EXEC_PREFIX'):
@@ -372,9 +408,9 @@ else:
     if '-shared' in args or '-pie' in args:
         sys.exit('This bootstrap sysroot supports static ET_EXEC only')
     cmd += ['-nostdlib','-static','--ld-path='+LD,'-Wl,--image-base=0x01000000,-z,max-page-size=4096,-z,separate-code','-L'+LIB,LIB+'/crt1.o',LIB+'/crti.o']
-    cmd += args + ['-Wl,--start-group',LIB+'/libc.a',LIB+'/libclang_rt.builtins-aarch64.a','-Wl,--end-group',LIB+'/crtn.o']
+    cmd += args + ['-Wl,--start-group',LIB+'/libc.a',LIB+'/'+BUILTINS,'-Wl,--end-group',LIB+'/crtn.o']
 sys.exit(subprocess.call(cmd, env=env))
-''' % (cc, str(lib), str(linker))
+''' % (cc, str(lib), str(linker), self.target.builtins_archive)
         path.write_text(script)
         path.chmod(0o755)
 
@@ -382,12 +418,14 @@ sys.exit(subprocess.call(cmd, env=env))
         out = self.output
         if not (out / "build-report.json").is_file():
             raise BuildError("Build the libc sysroot successfully before xorg-bootstrap")
+        self.target.require_report(json.loads((out / 'build-report.json').read_text()))
+        self.target.inspect_archive(out / 'sysroot/usr/lib/libc.a')
         pkgconfig = shutil.which("pkg-config")
         if not pkgconfig:
             raise BuildError("Host pkg-config is required; no host target libraries will be used")
         sysroot = out / "sysroot"
-        self.env.update(CC=str(out / "bin/aarch64-linux-musl-cc"),
-                        AR=self.tools["llvm-ar"], RANLIB=str(out / "bin/aarch64-linux-musl-ranlib"),
+        self.env.update(CC=str(self.target.cc(out)),
+                        AR=self.tools["llvm-ar"], RANLIB=str(out / "bin" / (self.target.c_target + "-ranlib")),
                         PKG_CONFIG=pkgconfig, PKG_CONFIG_PATH="",
                         PKG_CONFIG_LIBDIR=os.pathsep.join(str(sysroot / x) for x in
                                                          ("usr/lib/pkgconfig", "usr/share/pkgconfig")),
@@ -408,7 +446,7 @@ sys.exit(subprocess.call(cmd, env=env))
             if not guess.is_file():
                 guess = out / "source/xorgproto-2024.1/config.guess"
             build_triplet = subprocess.check_output(["sh", str(guess)], text=True).strip()
-            command = [str(source / "configure"), "--prefix=/usr", "--host=aarch64-linux-musl",
+            command = [str(source / "configure"), "--prefix=/usr", "--host=" + self.target.c_target,
                        "--build=" + build_triplet]
             if package["name"] in ("xorgproto", "xtrans"):
                 command.append("--disable-specs")
@@ -429,10 +467,14 @@ sys.exit(subprocess.call(cmd, env=env))
         probe = out / "xau-probe.elf.tmp"
         self.run([self.env["CC"], "-O2", str(ROOT / "user/ported/xau_probe.c"),
                   "-lXau", "-o", str(probe)], "xau-probe-link.log")
-        elf = inspect_elf(probe)
+        elf = inspect_elf(probe, self.target)
         probe.replace(out / "xau-probe.elf")
         elf["file"] = str(out / "xau-probe.elf")
+        archives = {name: self.target.inspect_archive(sysroot / 'usr/lib' / name)
+                    for name in ('libXau.a', 'libxcb.a', 'libX11.a')}
         report = {"sources": records, "commands": self.commands,
+                  'architecture': self.target.architecture, 'target_triple': self.target.rust_target,
+                  'target_archives': archives,
                   "library": str(sysroot / "usr/lib/libXau.a"),
                   "library_sha256": digest(sysroot / "usr/lib/libXau.a"),
                   "probe": elf, "guest_execution": "not performed by this build tool",
@@ -443,23 +485,52 @@ sys.exit(subprocess.call(cmd, env=env))
     def target_environment(self) -> None:
         out = self.output
         sysroot = out / "sysroot"
+        report = json.loads((out / "build-report.json").read_text())
+        self.target.require_report(report)
+        self.target.inspect_archive(sysroot / "usr/lib/libc.a")
         pkgconfig = shutil.which("pkg-config")
         if not pkgconfig:
             raise BuildError("Host pkg-config is required")
-        self.env.update(CC=str(out / "bin/aarch64-linux-musl-cc"),
-                        AR=self.tools["llvm-ar"], RANLIB=str(out / "bin/aarch64-linux-musl-ranlib"),
+        self.env.update(CC=str(self.target.cc(out)),
+                        AR=self.tools["llvm-ar"], RANLIB=str(out / "bin" / (self.target.c_target + "-ranlib")),
                         PKG_CONFIG=pkgconfig, PKG_CONFIG_PATH="",
                         PKG_CONFIG_LIBDIR=os.pathsep.join(str(sysroot / x) for x in
                                                          ("usr/lib/pkgconfig", "usr/share/pkgconfig")),
                         PKG_CONFIG_SYSROOT_DIR=str(sysroot), PYTHON=sys.executable,
                         CC_FOR_BUILD=self.tools["clang"])
 
+    def build_zlib(self, package: dict, record: dict) -> dict:
+        """Build the existing pinned zlib dependency without an X server build."""
+        if package['name'] != 'zlib':
+            raise BuildError('zlib-bootstrap requires the pinned zlib package')
+        self.target_environment()
+        out = self.output
+        source = unpack(package, record, out / 'source')
+        directory = out / 'zlib-build'
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+        self.env['CHOST'] = self.target.c_target
+        try:
+            self.run([str(source / 'configure'), '--prefix=/usr', '--static'], 'zlib-configure.log', directory)
+            self.run([self.tools['make'], '-j' + str(self.jobs)], 'zlib-make.log', directory)
+            self.run([self.tools['make'], 'install', 'DESTDIR=' + str(out / 'sysroot')], 'zlib-install.log', directory)
+        finally:
+            self.env.pop('CHOST', None)
+        library = out / 'sysroot/usr/lib/libz.a'
+        report = dict(status='cross-built', architecture=self.target.architecture,
+                      target_triple=self.target.rust_target, source=record, commands=self.commands,
+                      archive=self.target.inspect_archive(library), guest_execution='not performed')
+        (out / 'zlib-build-report.json').write_text(json.dumps(report, indent=2) + '\n')
+        return report
+
     def build_probes(self, selected: list[str]) -> dict:
         """Rebuild only the named local probes; never fetch or run target code."""
         out = self.output
-        cc = out / "bin/aarch64-linux-musl-cc"
+        self.target.require_report(json.loads((out / "build-report.json").read_text()))
+        cc = self.target.cc(out)
         lib = out / "sysroot/usr/lib"
-        required = [cc, lib / "libc.a", lib / "libclang_rt.builtins-aarch64.a"]
+        required = [cc, lib / "libc.a", lib / self.target.builtins_archive]
         if any("-lXau" in PROBES[name][1] for name in selected):
             required.append(lib / "libXau.a")
         if any("-lX11" in PROBES[name][1] for name in selected):
@@ -469,7 +540,7 @@ sys.exit(subprocess.call(cmd, env=env))
                 raise BuildError(f"Build the prerequisite target sysroot first: missing {path}")
         report = {"probes": {}, "source_sha256": {}, "commands": self.commands,
                   "libc_sha256": digest(lib / "libc.a"),
-                  "builtins_sha256": digest(lib / "libclang_rt.builtins-aarch64.a"),
+                  "builtins_sha256": digest(lib / self.target.builtins_archive),
                   "driver_sha256": digest(cc), "guest_execution": "not performed by this build tool"}
         for name in selected:
             filename, libraries = PROBES[name]
@@ -482,7 +553,7 @@ sys.exit(subprocess.call(cmd, env=env))
             if "-lX11" in libraries:
                 shutil.copyfile(temporary, out / (name + ".symbols.elf"))
                 self.run([self.tools["llvm-strip"], "--strip-debug", str(temporary)], name + "-strip.log")
-            elf = inspect_elf(temporary)
+            elf = inspect_elf(temporary, self.target)
             target = out / (name + ".elf")
             temporary.replace(target)
             elf["file"] = str(target)
@@ -529,7 +600,7 @@ sys.exit(subprocess.call(cmd, env=env))
                                  "ar = " + repr(self.tools["llvm-ar"]) + "\n" +
                                  "strip = " + repr(self.tools["llvm-strip"]) + "\n" +
                                  "pkg-config = " + repr(self.env["PKG_CONFIG"]) + "\n" +
-                                 "[host_machine]\nsystem = 'linux'\ncpu_family = 'aarch64'\ncpu = 'cortex-a53'\nendian = 'little'\n" +
+                                 self.target.meson_machine() +
                                  "[properties]\nneeds_exe_wrapper = true\nsys_root = " + repr(str(sysroot)) + "\n" +
                                  "pkg_config_libdir = " + repr(self.env["PKG_CONFIG_LIBDIR"].split(os.pathsep)) + "\n")
                 self.run([str(meson), "setup", str(build_dir), str(source), "--cross-file", str(cross),
@@ -541,11 +612,11 @@ sys.exit(subprocess.call(cmd, env=env))
                 self.env.pop("DESTDIR")
                 continue
             build_dir.mkdir()
-            options = ["--prefix=/usr", "--host=aarch64-linux-musl", "--build=" + triplet,
+            options = ["--prefix=/usr", "--host=" + self.target.c_target, "--build=" + triplet,
                        "--disable-shared", "--enable-static"]
             if package["name"] == "zlib":
                 options = ["--prefix=/usr", "--static"]
-                self.env["CHOST"] = "aarch64-linux-musl"
+                self.env["CHOST"] = self.target.c_target
             if package["name"] == "freetype":
                 options += ["--with-zlib=yes", "--with-bzip2=no", "--with-png=no", "--with-harfbuzz=no", "--with-brotli=no"]
             if package["name"] == "libXfont2":
@@ -567,7 +638,8 @@ sys.exit(subprocess.call(cmd, env=env))
         triplet = subprocess.check_output(["sh", str(source / "config.guess")], text=True).strip()
         # The kernel implements poll, not epoll; select the real upstream fallback.
         self.env.update(ac_cv_func_epoll_create1="no", CPPFLAGS="-DCYXIA_OS=1")
-        self.run([str(source / "configure"), *XSERVER_OPTIONS, "--build=" + triplet], "xserver-configure.log", build_dir)
+        options = ["--host=" + self.target.c_target if item.startswith("--host=") else item for item in XSERVER_OPTIONS]
+        self.run([str(source / "configure"), *options, "--build=" + triplet], "xserver-configure.log", build_dir)
         self.run([self.tools["make"], f"-j{self.jobs}"], "xserver-make.log", build_dir)
         elf = self.link_xserver()
         report = {"sources": records, "commands": self.commands, "probe": elf,
@@ -584,7 +656,7 @@ sys.exit(subprocess.call(cmd, env=env))
         src = out / "source/xorg-server-21.1.25"
         include_dirs = [p for p in src.iterdir() if p.is_dir()]
         include_dirs += [src / x for x in ("hw/kdrive/src", "miext/shadow", "miext/damage", "miext/sync")]
-        cc = str(out / "bin/aarch64-linux-musl-cc")
+        cc = str(self.target.cc(out))
         self.run([cc, "-O2", "-D_GNU_SOURCE", "-DHAVE_DIX_CONFIG_H", "-DCYXIA_OS=1",
                   "-I" + str(out / "xserver-build/include"), "-I" + str(out / "sysroot/usr/include/pixman-1"),
                   *["-I" + str(p) for p in include_dirs], "-c", str(ROOT / "user/ported/xorg/cyxia_ddx.c"),
@@ -600,7 +672,7 @@ sys.exit(subprocess.call(cmd, env=env))
                   "-lXfont2", "-lfontenc", "-lfreetype", "-lxkbfile", "-lX11", "-lxcb", "-lXau",
                   "-lpixman-1", "-lmd", "-lz", "-lm", "-lpthread", "-Wl,--end-group", "-o", str(temporary)], "xcyxia-link.log")
         self.run([self.tools["llvm-strip"], "--strip-debug", str(temporary)], "xcyxia-strip.log")
-        elf = inspect_elf(temporary)
+        elf = inspect_elf(temporary, self.target)
         temporary.replace(out / "Xcyxia.elf")
         elf["file"] = str(out / "Xcyxia.elf")
         (out / "xcyxia-layout.json").write_text(json.dumps(elf, indent=2) + "\n")
@@ -609,33 +681,40 @@ sys.exit(subprocess.call(cmd, env=env))
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("inventory", "build", "inspect", "xorg-bootstrap", "server-bootstrap", "probes"), default="inventory")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("command", nargs="?", choices=("inventory", "build", "inspect", "xorg-bootstrap", "zlib-bootstrap", "server-bootstrap", "probes"), default="inventory")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
     parser.add_argument("--cache", type=Path, default=desktop_ports.DEFAULT_CACHE)
     parser.add_argument("--fetch", action="store_true", help="Allow retrieval of the two pinned source archives")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 6))
     parser.add_argument("--probe", choices=tuple(PROBES), action="append", help="For probes: select a named probe (repeatable); default all")
     args = parser.parse_args()
+    target = profile_for(args.arch)
+    args.output = args.output or target.default_output(ROOT)
     try:
         if args.jobs < 1 or args.jobs > 32:
             raise BuildError("jobs must be between 1 and 32")
-        if args.fetch and args.command not in ("build", "xorg-bootstrap", "server-bootstrap"):
+        if args.fetch and args.command not in ("build", "xorg-bootstrap", "zlib-bootstrap", "server-bootstrap"):
             raise BuildError("--fetch requires the explicit build command")
         if args.probe and args.command != "probes":
             raise BuildError("--probe requires the probes command")
         manifest = (server_manifest() if args.command == "server-bootstrap" else
+                    {'packages': [item for item in server_manifest()['packages'] if item['name'] == 'zlib']}
+                    if args.command == 'zlib-bootstrap' else
                     load_manifest(XORG_MANIFEST, xorg=True) if args.command == "xorg-bootstrap" else load_manifest())
         if args.command == "inventory":
             print(json.dumps({"manifest": manifest, "toolchain": toolchain(),
                               "output": str(args.output), "network": False}, indent=2))
             return 0
         if args.command == "inspect":
-            print(json.dumps(inspect_elf(args.output / "probe.elf"), indent=2))
+            print(json.dumps(inspect_elf(args.output / "probe.elf", target), indent=2))
             return 0
         output = args.output.resolve()
         if not output.is_relative_to(ROOT / "artifacts"):
             raise BuildError("Build output must remain inside this project's artifacts directory")
         output.mkdir(parents=True, exist_ok=True)
+        if (output / "build-report.json").exists():
+            target.require_report(json.loads((output / "build-report.json").read_text()))
         if shutil.disk_usage(output).free < RESERVE_BYTES:
             raise BuildError("At least 512 MiB free space required for build and reserve")
         with (output / ".build.lock").open("w") as lock:
@@ -644,6 +723,7 @@ def main() -> int:
             except BlockingIOError as error:
                 raise BuildError("Another sysroot build is active") from error
             report_name = ("probes-build-report.json" if args.command == "probes" else
+                           'zlib-build-report.json' if args.command == 'zlib-bootstrap' else
                            "xserver-build-report.json" if args.command == "server-bootstrap" else
                            "xorg-bootstrap-report.json" if args.command == "xorg-bootstrap" else "build-report.json")
             (output / report_name).unlink(missing_ok=True)
@@ -653,8 +733,9 @@ def main() -> int:
                     records.append(desktop_ports.fetch(package, args.cache, online=True, max_bytes=8 * 1024 * 1024))
                 else:
                     records.append(desktop_ports.verify(package, args.cache, max_bytes=8 * 1024 * 1024))
-            builder = Builder(output, toolchain(), args.jobs)
+            builder = Builder(output, toolchain(), args.jobs, target)
             report = (builder.build_probes(list(dict.fromkeys(args.probe or PROBES))) if args.command == "probes" else
+                      builder.build_zlib(manifest['packages'][0], records[0]) if args.command == 'zlib-bootstrap' else
                       builder.build_xserver(manifest, records) if args.command == "server-bootstrap" else
                       builder.build_xorg(manifest, records) if args.command == "xorg-bootstrap"
                       else builder.build(manifest, records))
