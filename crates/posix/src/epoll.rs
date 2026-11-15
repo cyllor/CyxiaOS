@@ -3,6 +3,7 @@
 //! lifetime-extending references. Edge candidates come from committed backend
 //! notifications and readiness transitions, not repeated scans of a ready FD.
 use super::{Description, Errno, O_CLOEXEC, O_RDWR, OPEN_MAX, Object, Process};
+mod nesting;
 
 pub const INSTANCES: usize = 2;
 pub const IN: u32 = 1;
@@ -28,13 +29,16 @@ struct Watch {
     observed: u32,
 }
 impl Watch {
-    fn observe(&mut self, readiness: u32, notifications: u32) {
+    fn observe(&mut self, readiness: u32, notifications: u32) -> bool {
         let interest = (self.events | ERR | HUP) & !(ONESHOT | EDGE);
         let current = readiness & interest;
-        if self.armed && ((notifications & interest != 0) || current & !self.observed != 0) {
+        let notified =
+            self.armed && ((notifications & interest != 0) || current & !self.observed != 0);
+        if notified {
             self.pending = true;
         }
         self.observed = current;
+        notified && self.deliverable()
     }
     fn deliverable(&self) -> bool {
         self.armed && self.observed != 0 && (self.events & EDGE == 0 || self.pending)
@@ -49,6 +53,9 @@ pub(crate) struct Instance {
     cursor: usize,
 }
 impl Instance {
+    fn readable(&self) -> bool {
+        self.watches.iter().flatten().any(Watch::deliverable)
+    }
     pub(crate) const EMPTY: Self = Self {
         used: false,
         owner: 0,
@@ -104,10 +111,15 @@ impl super::OpenDescriptions {
     /// not call another pool or reenter this OFD table. At most 256 watches.
     pub fn observe_backend(&self, mut sample: impl FnMut(Source) -> Option<(u32, u32)>) {
         let mut table = self.inner.borrow_mut();
+        let mut wakes = [false; super::open_description::EPOLLS];
         let super::open_description::Table {
             entries, epolls, ..
         } = &mut *table;
-        for instance in epolls.iter_mut().filter(|instance| instance.used) {
+        for (index, instance) in epolls
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, instance)| instance.used)
+        {
             for watch in instance
                 .watches
                 .iter_mut()
@@ -122,12 +134,15 @@ impl super::OpenDescriptions {
                     continue;
                 };
                 if let Ok(source) = source(description.object, entry.owner)
-                    && let Some((ready, wakes)) = sample(source)
+                    && let Some((ready, notifications)) = sample(source)
                 {
-                    watch.observe(ready, wakes);
+                    // A backend wake can add an event while this epoll is
+                    // already readable; its ancestors still need that edge.
+                    wakes[index] |= watch.observe(ready, notifications);
                 }
             }
         }
+        table.propagate_nested(wakes);
     }
     pub(crate) fn observe_local(
         &self,
@@ -136,13 +151,20 @@ impl super::OpenDescriptions {
         wakes: u32,
     ) {
         let mut table = self.inner.borrow_mut();
-        for instance in table.epolls.iter_mut().filter(|instance| instance.used) {
+        let mut notifications = [false; super::open_description::EPOLLS];
+        for (index, instance) in table
+            .epolls
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, instance)| instance.used)
+        {
             for watch in instance.watches.iter_mut().flatten() {
                 if watch.description == handle {
-                    watch.observe(readiness, wakes);
+                    notifications[index] |= watch.observe(readiness, wakes);
                 }
             }
         }
+        table.propagate_nested(notifications);
     }
 }
 
@@ -213,8 +235,10 @@ impl Process<'_> {
         if op != 2 && event.events & !SUPPORTED != 0 {
             return Err(Errno::Inval);
         }
-        match self.objects.get(description)?.object {
-            Object::Epoll(_) => return Err(Errno::Inval),
+        let target = self.objects.get(description)?.object;
+        match target {
+            Object::Epoll(child) if child == index => return Err(Errno::Inval),
+            Object::Epoll(_) => {}
             Object::Event { .. }
             | Object::Timer(_)
             | Object::Socket(_)
@@ -223,7 +247,7 @@ impl Process<'_> {
             _ => return Err(Errno::Perm),
         }
         let mut table = self.objects.inner.borrow_mut();
-        let instance = &mut table.epolls[index];
+        let instance = &table.epolls[index];
         let existing = instance
             .watches
             .iter()
@@ -238,7 +262,12 @@ impl Process<'_> {
             (_, None) => return Err(Errno::Noent),
             (_, Some(slot)) => slot,
         };
-        instance.watches[slot] = if op == 2 {
+        if op == 1
+            && let Object::Epoll(child) = target
+        {
+            table.epoll_topology(Some((index, child)))?;
+        }
+        table.epolls[index].watches[slot] = if op == 2 {
             None
         } else {
             Some(Watch {
@@ -251,10 +280,13 @@ impl Process<'_> {
                 observed: 0,
             })
         };
+        table.propagate_nested([false; super::open_description::EPOLLS]);
         Ok(())
     }
     /// Weak OFD identities resolve independently of this process's FD table.
     /// A child may retain a watched object after the registering FD was closed.
+    /// Nested watches have no external backend source; use epoll_sample to
+    /// refresh their descendants before collection.
     pub fn epoll_sources(&self, epfd: i32) -> Result<[Option<Source>; OPEN_MAX], Errno> {
         let index = self.epoll_index(epfd)?;
         let watches = self.objects.inner.borrow().epolls[index].watches;
@@ -265,9 +297,50 @@ impl Process<'_> {
             };
             let d = self.objects.get(watch.description)?;
             let owner = self.objects.owner(watch.description)?;
-            *out = Some(source(d.object, owner)?);
+            if !matches!(d.object, Object::Epoll(_)) {
+                *out = Some(source(d.object, owner)?);
+            }
         }
         Ok(sources)
+    }
+
+    /// Sample only the requested epoll's reachable children, without consuming
+    /// any events. Backend callbacks run outside the OFD borrow and may publish
+    /// readiness notifications, but must not mutate descriptors or watches.
+    pub fn epoll_sample(
+        &self,
+        epfd: i32,
+        mut sample: impl FnMut(Source) -> Result<u32, Errno>,
+    ) -> Result<[u32; OPEN_MAX], Errno> {
+        let root = self.epoll_index(epfd)?;
+        let topology = self.objects.inner.borrow().epoll_topology(None)?;
+        let reachable = topology.reachable(root);
+        let mut result = [0; OPEN_MAX];
+        let mut wakes = [false; super::open_description::EPOLLS];
+        for &index in &topology.order[..topology.count] {
+            if reachable & (1 << index) == 0 {
+                continue;
+            }
+            let watches = self.objects.inner.borrow().epolls[index].watches;
+            let mut readiness = [0; OPEN_MAX];
+            for (slot, watch) in watches.into_iter().enumerate() {
+                let Some(watch) = watch.filter(|w| w.armed) else {
+                    continue;
+                };
+                let description = self.objects.get(watch.description)?;
+                if !matches!(description.object, Object::Epoll(_)) {
+                    let owner = self.objects.owner(watch.description)?;
+                    readiness[slot] = sample(source(description.object, owner)?)?;
+                }
+            }
+            let mut table = self.objects.inner.borrow_mut();
+            wakes[index] |= table.observe_epoll(index, &mut readiness);
+            if index == root {
+                result = readiness;
+            }
+        }
+        self.objects.inner.borrow_mut().propagate_nested(wakes);
+        Ok(result)
     }
     pub fn epoll_collect(
         &mut self,
@@ -280,14 +353,12 @@ impl Process<'_> {
         }
         let index = self.epoll_index(epfd)?;
         let mut table = self.objects.inner.borrow_mut();
-        let instance = &mut table.epolls[index];
         // Observe every watch before applying maxevents, retaining candidates
         // beyond the returned prefix. No loss and no allocation under pressure.
-        for (watch, &ready) in instance.watches.iter_mut().zip(readiness) {
-            if let Some(watch) = watch {
-                watch.observe(ready, 0);
-            }
-        }
+        let mut wakes = [false; super::open_description::EPOLLS];
+        let mut readiness = *readiness;
+        wakes[index] = table.observe_epoll(index, &mut readiness);
+        let instance = &mut table.epolls[index];
         let start = instance.cursor;
         let mut count = 0;
         for offset in 0..OPEN_MAX {
@@ -316,12 +387,12 @@ impl Process<'_> {
                 break;
             }
         }
+        table.propagate_nested(wakes);
         Ok(count)
     }
 
     /// Refresh readiness without consuming an event, advancing the fairness
     /// cursor, or disarming ONESHOT. Used by poll(2) on an epoll descriptor.
-    /// Nested epoll registrations remain unsupported.
     pub fn epoll_readable(
         &mut self,
         epfd: i32,
@@ -329,17 +400,11 @@ impl Process<'_> {
     ) -> Result<bool, Errno> {
         let index = self.epoll_index(epfd)?;
         let mut table = self.objects.inner.borrow_mut();
-        let instance = &mut table.epolls[index];
-        let mut readable = false;
-        for (watch, &ready) in instance.watches.iter_mut().zip(readiness) {
-            if let Some(watch) = watch {
-                watch.observe(ready, 0);
-                if watch.observed == 0 {
-                    watch.pending = false;
-                }
-                readable |= watch.deliverable();
-            }
-        }
+        let mut wakes = [false; super::open_description::EPOLLS];
+        let mut readiness = *readiness;
+        wakes[index] = table.observe_epoll(index, &mut readiness);
+        let readable = table.epolls[index].readable();
+        table.propagate_nested(wakes);
         Ok(readable)
     }
 }
@@ -357,6 +422,357 @@ mod tests {
     }
 
     #[test]
+    fn nested_level_is_nonconsuming_and_rejects_self_and_cycles() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        let fd = p.eventfd(1, 0).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 11,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN,
+                data: 22,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                ready(&mut p, outer, 1)[0],
+                Event {
+                    events: IN,
+                    data: 22
+                }
+            );
+        }
+        assert_eq!(
+            ready(&mut p, inner, 1)[0],
+            Event {
+                events: IN,
+                data: 11
+            }
+        );
+        assert_eq!(
+            p.epoll_ctl(inner, 1, outer, Event::default())
+                .err()
+                .map(|e| e as i32),
+            Some(40)
+        );
+        let alias = p.dup(inner).unwrap();
+        assert_eq!(
+            p.epoll_ctl(inner, 1, alias, Event::default()),
+            Err(Errno::Inval)
+        );
+        p.read(&mut fs, fd, &mut [0; 8]).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.close_all(&mut fs).unwrap();
+        assert_eq!(objects.snapshot().live, 0);
+    }
+
+    #[test]
+    fn nested_depth_counts_ancestors_and_disarmed_watches_across_owners() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let mut ep = [-1; 6];
+        for i in 0..ep.len() {
+            if i != 0 && i % INSTANCES == 0 {
+                let maps: [crate::spawn::Mapping; 6] =
+                    core::array::from_fn(|j| crate::spawn::Mapping {
+                        source: ep[j],
+                        target: ep[j],
+                    });
+                let child = p
+                    .spawn_descriptors(&fs, None, &maps[..i], (i / INSTANCES + 1) as u32)
+                    .unwrap();
+                p.close_all(&mut fs).unwrap();
+                p = child;
+            }
+            ep[i] = p.epoll_create(0).unwrap();
+        }
+        for i in 0..4 {
+            p.epoll_ctl(
+                ep[i],
+                1,
+                ep[i + 1],
+                Event {
+                    events: IN | ONESHOT,
+                    data: i as u64,
+                },
+            )
+            .unwrap();
+        }
+        let event = p.eventfd(1, 0).unwrap();
+        p.epoll_ctl(
+            ep[4],
+            1,
+            event,
+            Event {
+                events: IN,
+                data: 99,
+            },
+        )
+        .unwrap();
+        assert_eq!(ready(&mut p, ep[0], 1)[0].events, IN);
+        // The first graph edge is now disarmed, but still participates in limits.
+        let before = objects.snapshot();
+        assert_eq!(
+            p.epoll_ctl(ep[4], 1, ep[5], Event::default()),
+            Err(Errno::Loop)
+        );
+        assert_eq!(
+            p.epoll_ctl(ep[5], 1, ep[0], Event::default()),
+            Err(Errno::Loop)
+        );
+        assert_eq!(objects.snapshot(), before);
+        p.epoll_ctl(ep[0], 2, ep[1], Event::default()).unwrap();
+        p.epoll_ctl(
+            ep[4],
+            1,
+            ep[5],
+            Event {
+                events: IN,
+                data: 55,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.epoll_ctl(ep[0], 1, ep[1], Event::default()),
+            Err(Errno::Loop)
+        );
+        p.close_all(&mut fs).unwrap();
+        assert_eq!(objects.snapshot().live, 0);
+    }
+
+    #[test]
+    fn nested_edges_follow_new_notifications_not_sampling_or_level_collection() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        let fd = p.eventfd(0, 0).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 1,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN | EDGE,
+                data: 2,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            p.write(&mut fs, &mut Sink, fd, &1u64.to_le_bytes())
+                .unwrap();
+            let sampled = sample(&p, outer);
+            assert_eq!(p.epoll_readable(outer, &sampled), Ok(true));
+            assert_eq!(ready(&mut p, outer, 1)[0].events, IN);
+            assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+            assert_eq!(ready(&mut p, inner, 1)[0].events, IN);
+            assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        }
+        p.epoll_ctl(
+            inner,
+            3,
+            fd,
+            Event {
+                events: IN | ONESHOT,
+                data: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, IN);
+        assert_eq!(ready(&mut p, inner, 1)[0].data, 3);
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.write(&mut fs, &mut Sink, fd, &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        // Even a disarmed edge is present for cycle detection.
+        assert_eq!(
+            p.epoll_ctl(inner, 1, outer, Event::default()),
+            Err(Errno::Loop)
+        );
+        p.epoll_ctl(
+            inner,
+            3,
+            fd,
+            Event {
+                events: IN,
+                data: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, IN);
+        p.epoll_ctl(inner, 2, fd, Event::default()).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.close_all(&mut fs).unwrap();
+    }
+
+    #[test]
+    fn nested_backend_sampling_allows_notifications_and_ignores_unrelated_owners() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut other = Process::new(&objects, 2).unwrap();
+        let mut fs = FileSystem::new();
+        let mut pipes = crate::pipe::Pipes::new();
+        let handles = pipes.pair(1).unwrap();
+        let [reader, writer] = p.install_pipe(handles, 0).unwrap();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            reader,
+            Event {
+                events: IN,
+                data: 1,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN | EDGE,
+                data: 2,
+            },
+        )
+        .unwrap();
+        let unrelated = other.epoll_create(0).unwrap();
+        let timer = other.timerfd_create(1, 0).unwrap();
+        other
+            .epoll_ctl(
+                unrelated,
+                1,
+                timer,
+                Event {
+                    events: IN,
+                    data: 3,
+                },
+            )
+            .unwrap();
+        for _ in 0..2 {
+            pipes.write(1, handles[1], b"x").unwrap();
+            let readiness = p
+                .epoll_sample(outer, |source| {
+                    let Source::Pipe { owner, handle } = source else {
+                        panic!("unrelated source sampled");
+                    };
+                    let ready = u32::from(pipes.poll(owner, handle)?);
+                    // This is the actual backend-wrapper callback pattern. It must
+                    // not encounter a held OFD borrow or lose its pending edge.
+                    objects.observe_backend(|source| match source {
+                        Source::Pipe { owner, handle } => Some((
+                            u32::from(pipes.poll(owner, handle).unwrap()),
+                            pipes.wake_mask(owner, handle).unwrap(),
+                        )),
+                        _ => None,
+                    });
+                    Ok(ready)
+                })
+                .unwrap();
+            pipes.clear_wakes();
+            let mut events = [Event::default(); 1];
+            assert_eq!(p.epoll_collect(outer, &readiness, &mut events), Ok(1));
+            assert_eq!(events[0].data, 2);
+            assert_eq!(p.epoll_collect(outer, &readiness, &mut events), Ok(0));
+        }
+        for fd in [reader, writer] {
+            let Some(crate::open_description::Released::Pipe { owner, handle }) =
+                p.close(&mut fs, fd).unwrap()
+            else {
+                panic!("pipe release");
+            };
+            pipes.close(owner, handle).unwrap();
+        }
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.close_all(&mut fs).unwrap();
+        other.close_all(&mut fs).unwrap();
+        assert_eq!(objects.snapshot().live, 0);
+    }
+
+    #[test]
+    fn nested_watches_follow_inherited_ofds_until_final_release_not_numeric_reuse() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        let fd = p.eventfd(1, 0).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 1,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN,
+                data: 2,
+            },
+        )
+        .unwrap();
+        let mapping = crate::spawn::Mapping {
+            source: inner,
+            target: 8,
+        };
+        let mut child = p.spawn_descriptors(&fs, None, &[mapping], 2).unwrap();
+        p.close(&mut fs, inner).unwrap();
+        assert_eq!(p.eventfd(0, 0).unwrap(), inner);
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 2);
+        assert_eq!(ready(&mut child, 8, 1)[0].data, 1);
+        child.close_all(&mut fs).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.close(&mut fs, inner).unwrap();
+        assert_eq!(p.epoll_create(0).unwrap(), inner);
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.close_all(&mut fs).unwrap();
+        assert_eq!(objects.snapshot().live, 0);
+    }
+
+    #[test]
     fn polling_priority_interest_does_not_turn_ordinary_reads_into_priority_events() {
         // polling 3.11 registers IN|HUP|ERR|PRI|ONESHOT on its eventfd.
         // Priority interest is valid even when this backend cannot produce it.
@@ -366,15 +782,67 @@ mod tests {
         let ep = p.epoll_create(O_CLOEXEC).unwrap();
         let fd = p.eventfd(1, 0).unwrap();
         let polling_interest = IN | HUP | ERR | PRIORITY | ONESHOT;
-        assert_eq!(p.epoll_ctl(ep, 1, fd, Event { events: polling_interest, data: 41 }), Ok(()));
+        assert_eq!(
+            p.epoll_ctl(
+                ep,
+                1,
+                fd,
+                Event {
+                    events: polling_interest,
+                    data: 41
+                }
+            ),
+            Ok(())
+        );
         let events = ready(&mut p, ep, 1);
-        assert_eq!(events[0], Event { events: IN, data: 41 });
+        assert_eq!(
+            events[0],
+            Event {
+                events: IN,
+                data: 41
+            }
+        );
         assert_eq!(ready(&mut p, ep, 1)[0].events, 0);
-        p.epoll_ctl(ep, 3, fd, Event { events: PRIORITY | ONESHOT, data: 42 }).unwrap();
+        p.epoll_ctl(
+            ep,
+            3,
+            fd,
+            Event {
+                events: PRIORITY | ONESHOT,
+                data: 42,
+            },
+        )
+        .unwrap();
         assert_eq!(ready(&mut p, ep, 1)[0].events, 0);
-        p.epoll_ctl(ep, 3, fd, Event { events: polling_interest, data: 43 }).unwrap();
-        assert_eq!(ready(&mut p, ep, 1)[0], Event { events: IN, data: 43 });
-        assert_eq!(p.epoll_ctl(ep, 3, fd, Event { events: 1 << 27, data: 44 }), Err(Errno::Inval));
+        p.epoll_ctl(
+            ep,
+            3,
+            fd,
+            Event {
+                events: polling_interest,
+                data: 43,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&mut p, ep, 1)[0],
+            Event {
+                events: IN,
+                data: 43
+            }
+        );
+        assert_eq!(
+            p.epoll_ctl(
+                ep,
+                3,
+                fd,
+                Event {
+                    events: 1 << 27,
+                    data: 44
+                }
+            ),
+            Err(Errno::Inval)
+        );
     }
 
     #[test]
@@ -617,12 +1085,14 @@ mod tests {
     }
 
     fn sample(process: &Process, epfd: i32) -> [u32; OPEN_MAX] {
-        let sources = process.epoll_sources(epfd).unwrap();
-        core::array::from_fn(|i| match sources[i] {
-            Some(Source::Local { read, write }) => u32::from(read) | (u32::from(write) << 2),
-            None => 0,
-            _ => panic!("unexpected backend source"),
-        })
+        process
+            .epoll_sample(epfd, |source| {
+                Ok(match source {
+                    Source::Local { read, write } => u32::from(read) | (u32::from(write) << 2),
+                    _ => panic!("unexpected backend source"),
+                })
+            })
+            .unwrap()
     }
     fn ready(process: &mut Process, epfd: i32, capacity: usize) -> [Event; OPEN_MAX] {
         let readiness = sample(process, epfd);

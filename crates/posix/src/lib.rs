@@ -56,6 +56,7 @@ pub enum Errno {
     Nametoolong = 36,
     Nosys = 38,
     Notempty = 39,
+    Loop = 40,
     Overflow = 75,
     Addrinuse = 98,
     Nobufs = 105,

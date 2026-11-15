@@ -113,14 +113,27 @@ def ported_checks(console):
             for fault in ('MAPERR', 'READONLY', 'PROT_NONE'):
                 console.until(('RUST_STD_PROBE PF_' + fault + ' PASS').encode(), at)
 
-def flock_checks(console):
+def object_snapshot(console):
     from verify_fd_share import objects
+    at = console.command('ai system')
+    console.until(rb'AI_SYSTEM_END\r?\n', at)
+    return objects(bytes(console.raw[at:]))
+
+def reclaimed_probe(console, pid, before_objects):
     from verify_ported import parse_processes
-    def snapshot():
-        at = console.command('ai system')
-        console.until(rb'AI_SYSTEM_END\r?\n', at)
-        return objects(bytes(console.raw[at:]))
-    before_objects = snapshot()
+    console.until(rb'pid=' + pid + rb' Exited code=0\b')
+    at = console.command('posix list')
+    process = parse_processes(bytes(console.raw[at:]))[int(pid)]
+    for name, expected in dict(state='Exited', code=0, free_pages=64, heap_pages=0,
+                               image_pages=0, thread_count=0, heap_free=4096,
+                               image_free=16384).items():
+        pc.require(process.get(name) == expected, 'probe did not reclaim ' + name)
+    after_objects = object_snapshot(console)
+    pc.require(after_objects == before_objects, 'probe open descriptions were not reclaimed')
+    return dict(pid=int(pid), process=process, objects_before=before_objects, objects_after=after_objects)
+
+def flock_checks(console):
+    before_objects = object_snapshot(console)
     pc.require(before_objects['live'] == before_objects['references'] == 0,
                'flock capture begins with live open descriptions')
     start = console.command('posix exec flock-probe')
@@ -150,35 +163,50 @@ def flock_checks(console):
         console.until(('FLOCK_PROBE ' + phase + ' PASS').encode(), start)
         phases.append(dict(phase=phase, waits_before=before, waits_after=after))
     console.until(rb'FLOCK_PROBE PASS', start)
-    console.until(rb'pid=' + pid + rb' Exited code=0\b', start)
-    at = console.command('posix list')
-    process = parse_processes(bytes(console.raw[at:]))[int(pid)]
-    for name, expected in dict(state='Exited', code=0, free_pages=64, heap_pages=0,
-                               image_pages=0, thread_count=0, heap_free=4096,
-                               image_free=16384).items():
-        pc.require(process.get(name) == expected, 'flock process did not reclaim ' + name)
-    after_objects = snapshot()
-    pc.require(after_objects == before_objects, 'flock open descriptions were not reclaimed')
-    return dict(pid=int(pid), phases=phases, process=process,
-                objects_before=before_objects, objects_after=after_objects)
+    return dict(reclaimed_probe(console, pid, before_objects), phases=phases)
 
-def flock_build_inputs(prefix):
-    from build_sysroot import inspect_elf
+def nested_epoll_checks(console):
+    before_objects = object_snapshot(console)
+    pc.require(before_objects['live'] == before_objects['references'] == 0,
+               'nested epoll capture begins with live open descriptions')
+    start = console.command('posix exec nested-epoll-probe')
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    for phase in ('LEVEL', 'INNER_ONESHOT', 'OUTER_EDGE', 'CYCLE_REJECTION', 'OFD_REUSE', 'SOCKET_TIMER'):
+        console.until(('NESTED_EPOLL_PROBE ' + phase + ' PASS').encode(), start)
+    console.until(rb'NESTED_EPOLL_PROBE PASS', start)
+    result = reclaimed_probe(console, pid, before_objects)
+    pc.require(result['process']['waits'] > 0, 'nested epoll timer did not enter the actual wait path')
+    return result
+
+def syscall_probe_inputs(prefix, name):
+    from build_sysroot import inspect_elf, PROBES
     prefix = Path(prefix)
-    receipt_path = prefix / 'flock-probe-layout.json'
+    receipt_path = prefix / (name + '-layout.json')
     receipt = pc.read_json(receipt_path)
-    image = prefix / 'flock-probe.elf'
+    image = prefix / (name + '.elf')
     actual = inspect_elf(image, 'x86_64')
     pc.require(all(receipt.get(key) == value for key, value in actual.items() if key != 'file'),
-               'flock probe layout differs from the actual target ELF')
-    source = pc.ROOT / 'user/ported/flock_probe.c'
+               name + ' layout differs from the actual target ELF')
+    source = pc.ROOT / 'user/ported' / PROBES[name][0]
     sdk = pc.ROOT / 'artifacts/sysroot/x86_64-musl'
     inputs = {'source_sha256': pc.sha(source),
               'libc_sha256': pc.sha(sdk / 'sysroot/usr/lib/libc.a'),
               'driver_sha256': pc.sha(sdk / 'bin/x86_64-linux-musl-cc')}
     pc.require(all(receipt.get(key) == value for key, value in inputs.items()),
-               'flock probe source or SDK inputs changed since compilation')
+               name + ' source or SDK inputs changed since compilation')
     return dict(inputs, receipt_sha256=pc.sha(receipt_path), image_sha256=actual['sha256'])
+
+def embedded_images(build, manifest, names):
+    kernel = (build / 'kernel.elf').read_bytes()
+    embedded = {}
+    for name in names:
+        program = (Path(manifest['sysroot']) / name).read_bytes()
+        pc.require(program and kernel.count(program) == 1 and
+                   any(program in kernel[load['offset']:load['offset'] + load['size']]
+                       for load in manifest['elf']['loads'] if not load['flags'] & 2),
+                   'exact ' + name + ' must be embedded once in a read-only load')
+        embedded[name] = pc.sha_bytes(program)
+    return embedded
 
 def flock_checkpoint_proof(raw, commands):
     expected = ['write /run/user/0/boot-expired stale-session',
@@ -331,6 +359,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'flock' or (any(f in manifest['features'] for f in ('full-os', 'cosmic-desktop')) and
                    'flock-probe.elf' in manifest['external_inputs']),
                    'flock smoke requires full-OS runtime and the actual syscall probe')
+        pc.require(scenario != 'nested-epoll' or ('full-os' in manifest['features'] and
+                   'nested-epoll-probe.elf' in manifest['external_inputs']),
+                   'nested epoll smoke requires full-OS runtime and the actual syscall probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -352,35 +383,17 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'smithay':
                     from os_smithay import validate_inputs
                     result['smithay_inputs'] = validate_inputs(Path(manifest['sysroot']))
-                    kernel = (build / 'kernel.elf').read_bytes()
-                    embedded = {}
-                    for name in ('smithay-dynamic-probe.elf', 'smithay-dynamic-client.elf'):
-                        program = (Path(manifest['sysroot']) / name).read_bytes()
-                        pc.require(program and kernel.count(program) == 1,
-                                   'exact Smithay target image missing or duplicated')
-                        pc.require(any(program in kernel[load['offset']:load['offset']+load['size']]
-                                       for load in manifest['elf']['loads'] if not load['flags'] & 2),
-                                   'Smithay image must be embedded in a read-only load')
-                        embedded[name] = pc.sha_bytes(program)
-                    result['smithay_embedded_sha256'] = embedded
+                    result['smithay_embedded_sha256'] = embedded_images(build, manifest,
+                        ('smithay-dynamic-probe.elf', 'smithay-dynamic-client.elf'))
                 if scenario == 'cosmic-version':
-                    program = (Path(manifest['sysroot']) / 'cosmic-comp.elf').read_bytes()
-                    kernel = (build / 'kernel.elf').read_bytes()
-                    pc.require(program and kernel.count(program) == 1 and
-                               any(program in kernel[load['offset']:load['offset']+load['size']]
-                                   for load in manifest['elf']['loads'] if not load['flags'] & 2),
-                               'exact COSMIC image must be embedded once in a read-only load')
-                    result['cosmic_embedded_sha256'] = pc.sha_bytes(program)
+                    result['cosmic_embedded_sha256'] = embedded_images(build, manifest, ('cosmic-comp.elf',))['cosmic-comp.elf']
                 if scenario == 'flock':
-                    result['flock_build_inputs'] = flock_build_inputs(manifest['sysroot'])
+                    result['flock_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'flock-probe')
                     if recover_disk: result['recovery_input'] = flock_recovery_input(disk, result)
-                    program = (Path(manifest['sysroot']) / 'flock-probe.elf').read_bytes()
-                    kernel = (build / 'kernel.elf').read_bytes()
-                    pc.require(program and kernel.count(program) == 1 and
-                               any(program in kernel[load['offset']:load['offset']+load['size']]
-                                   for load in manifest['elf']['loads'] if not load['flags'] & 2),
-                               'exact flock syscall probe must be embedded once in a read-only load')
-                    result['flock_embedded_sha256'] = pc.sha_bytes(program)
+                    result['flock_embedded_sha256'] = embedded_images(build, manifest, ('flock-probe.elf',))['flock-probe.elf']
+                if scenario == 'nested-epoll':
+                    result['nested_epoll_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'nested-epoll-probe')
+                    result['nested_epoll_embedded_sha256'] = embedded_images(build, manifest, ('nested-epoll-probe.elf',))['nested-epoll-probe.elf']
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err, env=pc.env())
                 console = Console(connect(path / 's.sock', process), process, output / 'serial.raw')
                 qmp = Qmp(connect(path / 'q.sock', process))
@@ -410,6 +423,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'nested-epoll': result['nested_epoll'] = [nested_epoll_checks(console), nested_epoll_checks(console)]
                 if scenario == 'flock':
                     console.until(rb'SESSION_RUNTIME_READY path=/run/user/0 mode=0700 uid=0')
                     at = console.command('ls /run/user/0')
@@ -477,8 +491,11 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                             pc.require(validate_inputs(Path(manifest['sysroot'])) == result['smithay_inputs'],
                                        'Smithay source/build receipt changed during VM')
                         if scenario == 'flock':
-                            pc.require(flock_build_inputs(manifest['sysroot']) == result['flock_build_inputs'],
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'flock-probe') == result['flock_build_inputs'],
                                        'flock source/build inputs changed during VM')
+                        if scenario == 'nested-epoll':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'nested-epoll-probe') == result['nested_epoll_build_inputs'],
+                                       'nested epoll source/build inputs changed during VM')
                         pc.require(result.get('returncode') == 0, 'QEMU did not exit normally')
                     except Exception as changed:
                         result.update(status='FAIL', error=repr(changed))
@@ -489,7 +506,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

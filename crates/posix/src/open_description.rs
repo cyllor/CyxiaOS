@@ -253,6 +253,7 @@ impl OpenDescriptions {
         table.entries[handle.slot].value = None;
         table.entries[handle.slot].references = 0;
         table.entries[handle.slot].flock = super::flock::Mode::Unlocked;
+        table.propagate_nested([false; EPOLLS]);
         let owner = entry.owner;
         Ok(match description.object {
             Object::Socket(handle) => Some(Released::Socket { owner, handle }),

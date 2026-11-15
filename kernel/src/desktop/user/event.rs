@@ -91,14 +91,7 @@ impl Runner {
     }
 
     fn epoll_readiness(&self, epfd: i32) -> Result<[u32; OPEN_MAX], Errno> {
-        let descriptors = self.process.epoll_sources(epfd)?;
-        let mut readiness = [0u32; OPEN_MAX];
-        for (i, descriptor) in descriptors.into_iter().enumerate() {
-            if let Some(descriptor) = descriptor {
-                readiness[i] = Self::source_readiness(descriptor)?;
-            }
-        }
-        Ok(readiness)
+        self.process.epoll_sample(epfd, Self::source_readiness)
     }
 
     pub(super) fn epoll_readable(&mut self, epfd: i32) -> Result<bool, Errno> {
