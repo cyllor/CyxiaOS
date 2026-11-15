@@ -125,8 +125,8 @@ def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0):
     at = console.command('posix list')
     process = parse_processes(bytes(console.raw[at:]))[int(pid)]
     for name, expected in dict(state=state, code=code, free_pages=64, heap_pages=0,
-                               image_pages=0, thread_count=0, heap_free=8192,
-                               heap_allocations=0, heap_largest_free=8192,
+                               image_pages=0, thread_count=0, heap_free=16384,
+                               heap_allocations=0, heap_largest_free=16384,
                                image_free=16384).items():
         pc.require(process.get(name) == expected, 'probe did not reclaim ' + name)
     after_objects = object_snapshot(console)
@@ -249,7 +249,7 @@ def heap_capacity_checks(console):
     console.until(rb'HEAP_CAPACITY_PROBE PASS', start)
     result = reclaimed_probe(console, pid, before)
     process = result['process']
-    pc.require(7168 <= process['heap_peak'] <= 8160 and process['heap_model'] == 8198,
+    pc.require(15360 <= process['heap_peak'] <= 16352 and process['heap_model'] == 8199,
                'missing admitted full-OS heap growth/reserve')
     pc.require(process['heap_peak_allocations'] == 1024, 'missing actual record-capacity exhaustion')
     return result
@@ -489,6 +489,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'xkb-rules' or ('full-os' in manifest['features'] and
                    'xkb-rules-probe.elf' in manifest['external_inputs']),
                    'XKB rules smoke requires full-OS and actual libxkbcommon probe')
+        pc.require(scenario != 'heap-pool' or ('full-os' in manifest['features'] and
+                   'heap-pool-probe.elf' in manifest['external_inputs']),
+                   'heap pool smoke requires full-OS and actual musl probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -528,6 +531,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     result['xkb_assets'] = xkb_data_inputs(manifest['sysroot'])
                     result['xkb_rules_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe')
                     result['xkb_rules_embedded_sha256'] = embedded_images(build, manifest, ('xkb-rules-probe.elf',))['xkb-rules-probe.elf']
+                if scenario == 'heap-pool':
+                    result['heap_pool_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'heap-pool-probe')
+                    result['heap_pool_embedded_sha256'] = embedded_images(build, manifest, ('heap-pool-probe.elf',))['heap-pool-probe.elf']
                 if scenario == 'heap-capacity':
                     result['heap_capacity_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe')
                     result['heap_capacity_embedded_sha256'] = embedded_images(build, manifest, ('heap-capacity-probe.elf',))['heap-capacity-probe.elf']
@@ -565,6 +571,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
                 if scenario == 'xkb-rules':
                     result['xkb_rules'] = [xkb_rules_checks(console), xkb_rules_checks(console)]
+                if scenario == 'heap-pool':
+                    from os_heap_pool import checks
+                    result['heap_pool'] = checks(console)
                 if scenario == 'heap-capacity':
                     result['heap_capacity'] = [heap_capacity_checks(console), heap_capacity_checks(console)]
                 if scenario == 'thread-exit':
@@ -651,6 +660,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                                        'XKB asset receipt changed during VM')
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe') == result['xkb_rules_build_inputs'],
                                        'XKB probe source/library changed during VM')
+                        if scenario == 'heap-pool':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'heap-pool-probe') == result['heap_pool_build_inputs'],
+                                       'heap pool probe inputs changed during VM')
                         if scenario == 'heap-capacity':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe') == result['heap_capacity_build_inputs'],
                                        'heap probe source/build inputs changed during VM')
@@ -667,7 +679,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules', 'heap-pool'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

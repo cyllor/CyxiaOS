@@ -1,8 +1,10 @@
 //! Bounded private user mappings, with no hardware or allocation-policy dependency.
 //!
-//! Each `Vm` describes one private physical pool and one bounded user virtual window
-//! (8 MiB normally, 16 MiB with `large-memory`, 32 MiB with `full-os`).
-//! Pool slots are indices, never physical addresses. Allocations default to RW/NX;
+//! Each `Vm` describes process-local backing slots and one bounded user virtual window
+//! (8 MiB normally, 16 MiB with `large-memory`, 64 MiB with `full-os`). The kernel
+//! resolves each live slot to exclusively owned physical backing; the virtual
+//! capacity does not reserve that much RAM. Slots are never physical addresses.
+//! Allocations default to RW/NX;
 //! per-page permissions may become NONE or R/NX. Immutable shared snapshots also
 //! retain a permanent write ceiling. The kernel must enforce the metadata in PTEs;
 //! permissions do not change physical ownership or grant accounting.
@@ -23,7 +25,7 @@ pub const BASE: u64 = 0x200000;
 #[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const BASE: u64 = 0x04000000;
 #[cfg(feature = "full-os")]
-pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV2.layout().heap_base;
+pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV3.layout().heap_base;
 pub const END: u64 = BASE + (PAGE_COUNT * PAGE_SIZE) as u64;
 pub const PAGE_SIZE: usize = 4096;
 #[cfg(not(feature = "large-memory"))]
@@ -31,7 +33,7 @@ pub const PAGE_COUNT: usize = 2048;
 #[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const PAGE_COUNT: usize = 4096;
 #[cfg(feature = "full-os")]
-pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV2.layout().heap_pages;
+pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV3.layout().heap_pages;
 const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT % 512 == 0);
 const UNMAPPED: u16 = u16::MAX;
 
@@ -85,7 +87,7 @@ pub struct PageBatch {
 
 impl PageBatch {
     /// Reusable caller-owned output. Kernel callers keep this in pinned metadata
-    /// rather than returning an 8 KiB snapshot through a small exception stack.
+    /// rather than returning up to 32 KiB of slot indices through an exception stack.
     pub const fn new() -> Self {
         Self {
             start: 0,
@@ -169,7 +171,7 @@ impl Iterator for Fragments<'_> {
 impl ExactSizeIterator for Fragments<'_> {}
 impl core::iter::FusedIterator for Fragments<'_> {}
 
-/// Metadata for one externally owned, exclusively backed process memory pool.
+/// Metadata for one process's externally owned, exclusively backed live slots.
 pub struct Vm {
     slots: [u16; PAGE_COUNT],
     protections: [u8; PAGE_COUNT],
@@ -530,6 +532,22 @@ mod tests {
 
     #[test]
     #[cfg(feature = "full-os")]
+    fn full_os_heap_crosses_32_mib_for_the_observed_515_page_request() {
+        let mut vm = Vm::new();
+        let mut batch = PageBatch::new();
+        vm.allocate_into(8192, &mut batch).unwrap();
+        vm.allocate_into(515, &mut batch).unwrap();
+        assert_eq!(batch.start(), BASE + 8192 * PAGE_SIZE as u64);
+        assert_eq!(vm.used(), 8192 + 515);
+        assert_eq!(vm.validate_access(batch.start(), 515 * PAGE_SIZE, true), Ok(()));
+        assert_eq!((BASE, END, PAGE_COUNT), (0x0c00_0000, 0x1000_0000, 16384));
+        vm.unmap_into(BASE, 8192 + 515, &mut batch).unwrap();
+        assert_eq!(vm.used(), 0);
+        assert_eq!(vm.largest_free_run(), PAGE_COUNT);
+    }
+
+    #[test]
+    #[cfg(feature = "full-os")]
     fn full_os_heap_crosses_old_capacity_and_reclaims_protected_tail() {
         let mut vm = Vm::new();
         let mut batch = PageBatch::new();
@@ -541,16 +559,16 @@ mod tests {
         assert_eq!(vm.validate_access(tail, 1, false), Err(Errno::Fault));
         assert_eq!(vm.validate_access(BASE, PAGE_SIZE, true), Ok(()));
         vm.unmap_into(tail, 1024, &mut batch).unwrap();
-        vm.allocate_into(4096, &mut batch).unwrap();
+        vm.allocate_into(PAGE_COUNT - 4096, &mut batch).unwrap();
         assert_eq!(batch.start(), tail);
         let last = batch.iter().last().unwrap();
         assert_eq!(vm.validate_access(last.address, PAGE_SIZE, true), Ok(()));
         assert_eq!(vm.validate_access(last.address + PAGE_SIZE as u64, 1, false), Err(Errno::Fault));
         assert_eq!(vm.allocate_into(1, &mut batch), Err(Errno::Nomem));
-        vm.unmap_into(BASE, 8192, &mut batch).unwrap();
+        vm.unmap_into(BASE, PAGE_COUNT, &mut batch).unwrap();
         assert_eq!(vm.used(), 0);
-        vm.allocate_into(8192, &mut batch).unwrap();
-        assert_eq!(vm.validate_access(tail, 4096 * PAGE_SIZE, true), Ok(()));
+        vm.allocate_into(PAGE_COUNT, &mut batch).unwrap();
+        assert_eq!(vm.validate_access(tail, (PAGE_COUNT - 4096) * PAGE_SIZE, true), Ok(()));
     }
 
     #[test]

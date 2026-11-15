@@ -1,4 +1,4 @@
-//! Pinned per-process anonymous RAM. CPU0 foreground owns all metadata and copies.
+//! Private anonymous mappings. CPU0 owns metadata after all AP roots retire.
 use super::user::ai::{self, Domain};
 use crate::address_space::PageTable as Table;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,8 +15,21 @@ use cyxia_posix::{
     vm::{self, PageBatch, Vm},
 };
 
+#[cfg(feature = "full-os")]
+#[path = "user_heap/pool.rs"]
+mod pool;
+#[path = "user_heap/transaction.rs"]
+mod transaction;
+#[cfg(feature = "full-os")]
+use cyxia_kernel_core::frames::FrameHandle;
+#[cfg(not(feature = "full-os"))]
 const BYTES: u64 = (vm::PAGE_COUNT * vm::PAGE_SIZE) as u64;
+#[cfg(not(feature = "full-os"))]
 pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
+#[cfg(feature = "full-os")]
+pub const RESERVED_BYTES: u64 = pool::BYTES;
+#[cfg(feature = "full-os")]
+pub use pool::status as pool_status;
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + RESERVED_BYTES <= cyxia_platform_virt::USER_RAM_END
@@ -29,7 +42,7 @@ const ALLOCATIONS: usize = 1024;
 const ALLOCATIONS: usize = 512;
 const TABLES: usize = vm::PAGE_COUNT / 512;
 #[cfg(feature = "full-os")]
-const MODEL_ID: u64 = cyxia_ai_runtime::FULL_OS_ANON_MODEL_ID;
+const MODEL_ID: u64 = cyxia_ai_runtime::FULL_OS_POOL_ANON_MODEL_ID;
 #[cfg(not(feature = "full-os"))]
 const MODEL_ID: u64 = 8194;
 static POOL_BASE: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +54,8 @@ static POOL_BASE: AtomicU64 = AtomicU64::new(0);
 pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
+    #[cfg(feature = "full-os")]
+    pool::init(range.start.0)?;
     POOL_BASE.store(range.start.0, Ordering::Relaxed);
     Ok(())
 }
@@ -56,6 +71,8 @@ pub struct Heap {
     // CPU0 owns each Heap while user execution is stopped. Reuse pinned output instead of
     // copying whole-pool page lists through the guarded kernel stack.
     batch: PageBatch,
+    #[cfg(feature = "full-os")]
+    frames: [Option<FrameHandle>; vm::PAGE_COUNT],
     tables: [Table; TABLES],
     allocations: [Option<Allocation>; ALLOCATIONS],
     ledger: BoundedGrantLedger<ALLOCATIONS>,
@@ -63,6 +80,55 @@ pub struct Heap {
     owner: Option<Owner>,
     pub model: u64,
     usage: Usage,
+}
+
+// Desired PTEs are private staging metadata. The caller has retired every AP
+// root; no user CPU or DMA can observe these pages until Heap::publish_space.
+struct HeapBacking<'a> {
+    tables: &'a mut [Table; TABLES],
+    #[cfg(feature = "full-os")]
+    frames: &'a mut [Option<FrameHandle>; vm::PAGE_COUNT],
+    #[cfg(feature = "full-os")]
+    owner: cyxia_contracts::TaskId,
+    #[cfg(not(feature = "full-os"))]
+    base: u64,
+}
+impl transaction::Backing for HeapBacking<'_> {
+    fn stage(&mut self, page: vm::Page) -> Result<(), Errno> {
+        #[cfg(feature = "full-os")]
+        let physical = {
+            let frame = pool::allocate(self.owner)?;
+            self.frames[page.slot] = Some(frame);
+            frame.address().0
+        };
+        #[cfg(not(feature = "full-os"))]
+        let physical = {
+            let physical = self.base + page.slot as u64 * vm::PAGE_SIZE as u64;
+            unsafe {
+                core::ptr::write_bytes((super::HIGH + physical) as *mut u8, 0, vm::PAGE_SIZE);
+            }
+            physical
+        };
+        let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
+        self.tables[index / 512].set(index % 512, physical, 3)
+    }
+    fn unstage(&mut self, page: vm::Page) {
+        let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
+        self.tables[index / 512].remove(index % 512);
+    }
+    fn release(&mut self, page: vm::Page) -> Result<(), Errno> {
+        #[cfg(feature = "full-os")]
+        if let Some(frame) = self.frames[page.slot] {
+            pool::release(frame, self.owner)?;
+            self.frames[page.slot] = None;
+        }
+        #[cfg(not(feature = "full-os"))]
+        unsafe {
+            let physical = self.base + page.slot as u64 * vm::PAGE_SIZE as u64;
+            core::ptr::write_bytes((super::HIGH + physical) as *mut u8, 0, vm::PAGE_SIZE);
+        }
+        Ok(())
+    }
 }
 
 /// Lifetime high-water marks survive teardown until the slot is rebound.
@@ -86,6 +152,8 @@ impl Heap {
         Self {
             vm: Vm::new(),
             batch: PageBatch::new(),
+            #[cfg(feature = "full-os")]
+            frames: [None; vm::PAGE_COUNT],
             tables: [const { Table::empty() }; TABLES],
             allocations: [None; ALLOCATIONS],
             ledger: BoundedGrantLedger::new(PageCount(vm::PAGE_COUNT as u32)),
@@ -98,11 +166,19 @@ impl Heap {
     pub fn bind(&mut self, slot: usize, owner: Owner) {
         assert!(slot < MAX_PROCESSES && self.vm.used() == 0);
         let pool = POOL_BASE.load(Ordering::Relaxed);
-        self.base = if pool == 0 {
-            0
-        } else {
-            pool + BYTES * slot as u64
-        };
+        #[cfg(feature = "full-os")]
+        {
+            assert!(self.frames.iter().all(Option::is_none));
+            self.base = pool;
+        }
+        #[cfg(not(feature = "full-os"))]
+        {
+            self.base = if pool == 0 {
+                0
+            } else {
+                pool + BYTES * slot as u64
+            };
+        }
         self.owner = Some(owner);
         self.model = 0;
         self.usage = Usage::EMPTY;
@@ -120,9 +196,19 @@ impl Heap {
     pub fn usage(&self) -> Usage {
         self.usage
     }
+    fn physical(&self, slot: usize) -> u64 {
+        #[cfg(feature = "full-os")]
+        {
+            self.frames[slot].expect("owned physical frame").address().0
+        }
+        #[cfg(not(feature = "full-os"))]
+        {
+            self.base + slot as u64 * vm::PAGE_SIZE as u64
+        }
+    }
     fn pointer(&self, slot: usize, offset: usize) -> *mut u8 {
         assert!(self.base != 0 && slot < vm::PAGE_COUNT && offset < vm::PAGE_SIZE);
-        (super::HIGH + self.base + (slot * vm::PAGE_SIZE + offset) as u64) as *mut u8
+        (super::HIGH + self.physical(slot) + offset as u64) as *mut u8
     }
     pub fn allocate(&mut self, pages: usize) -> Result<u64, Errno> {
         let mut attempt = Attempt::default();
@@ -152,10 +238,11 @@ impl Heap {
         #[cfg(not(feature = "full-os"))]
         let policy = cyxia_ai_runtime::anonymous_memory_policy;
         #[cfg(feature = "full-os")]
-        let policy = cyxia_ai_runtime::full_os_anonymous_memory_policy;
-        let (admitted, model) =
-            policy(self.free(), pages as u32)
-                .map_err(|_| Errno::Io)?;
+        let policy = cyxia_ai_runtime::full_os_pool_anonymous_memory_policy;
+        let effective_free = self.free();
+        #[cfg(feature = "full-os")]
+        let effective_free = effective_free.min(pool::snapshot()?.free as u32);
+        let (admitted, model) = policy(effective_free, pages as u32).map_err(|_| Errno::Io)?;
         attempt.decided(admitted, model);
         self.model = model;
         if !admitted {
@@ -166,35 +253,32 @@ impl Heap {
         let request =
             unsafe { AuthorizedGrantRequest::validated_ai(owner, PageCount(pages as u32), model) }
                 .map_err(|_| Errno::Io)?;
-        let redemption = self
-            .ledger
-            .commit_and_redeem(request)
-            .map_err(|_| Errno::Nomem)?;
-        ai::record(Domain::Anonymous, |c| c.grant(pages as u64));
-        if let Err(error) = self.vm.allocate_into(pages, &mut self.batch) {
-            // No PTE was published; no CPU or device ever saw these pages.
-            self.ledger
-                .release_completed(unsafe {
-                    ReleaseReceipt::after_revoke(redemption, owner, PageCount(pages as u32))
+        let redemption = transaction::allocate(
+            &mut self.vm,
+            &mut self.batch,
+            &mut self.ledger,
+            request,
+            owner,
+            pages,
+            &mut HeapBacking {
+                tables: &mut self.tables,
+                #[cfg(feature = "full-os")]
+                frames: &mut self.frames,
+                #[cfg(feature = "full-os")]
+                owner: owner.task,
+                #[cfg(not(feature = "full-os"))]
+                base: self.base,
+            },
+            |grant, pages| {
+                ai::record(Domain::Anonymous, |c| {
+                    if grant {
+                        c.grant(pages as u64);
+                    } else {
+                        c.release(pages as u64);
+                    }
                 })
-                .map_err(|_| Errno::Io)?;
-            ai::record(Domain::Anonymous, |c| c.release(pages as u64));
-            return Err(error);
-        }
-        for page in self.batch.iter() {
-            // Private boot-reserved RAM; not yet user mapped, no DMA aliases.
-            unsafe {
-                core::ptr::write_bytes(self.pointer(page.slot, 0), 0, vm::PAGE_SIZE);
-            }
-            let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
-            self.tables[index / 512]
-                .set(
-                    index % 512,
-                    self.base + (page.slot * vm::PAGE_SIZE) as u64,
-                    1 | if true { 2 } else { 0 } | if false { 4 } else { 0 },
-                )
-                .map_err(|_| Errno::Inval)?;
-        }
+            },
+        )?;
         self.allocations[slot] = Some(Allocation {
             start: self.batch.start(),
             pages,
@@ -215,6 +299,11 @@ impl Heap {
             .position(|a| a.is_some_and(|a| a.start == start && a.pages == pages))
             .ok_or(Errno::Inval)?;
         let allocation = self.allocations[slot].ok_or(Errno::Io)?;
+        let owner = self.owner.ok_or(Errno::Io)?;
+        #[cfg(feature = "full-os")]
+        for fragment in self.vm.fragments(start, pages * vm::PAGE_SIZE)? {
+            pool::check_owned(self.frames[fragment.slot].ok_or(Errno::Io)?, owner.task)?;
+        }
         self.vm.unmap_into(start, pages, &mut self.batch)?;
         for page in self.batch.iter() {
             let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
@@ -223,11 +312,17 @@ impl Heap {
         // The backend retired every user alias before this CPU0 syscall;
         // no other CPU/DMA retains these pages while they are cleared.
         for page in self.batch.iter() {
+            #[cfg(feature = "full-os")]
+            {
+                let frame = self.frames[page.slot].ok_or(Errno::Io)?;
+                pool::release(frame, owner.task)?;
+                self.frames[page.slot] = None;
+            }
+            #[cfg(not(feature = "full-os"))]
             unsafe {
                 core::ptr::write_bytes(self.pointer(page.slot, 0), 0, vm::PAGE_SIZE);
             }
         }
-        let owner = self.owner.ok_or(Errno::Io)?;
         self.ledger
             .release_completed(unsafe {
                 ReleaseReceipt::after_revoke(allocation.redemption, owner, PageCount(pages as u32))
@@ -278,11 +373,8 @@ impl Heap {
         let rounded = len.checked_add(4095).ok_or(Errno::Inval)? & !4095;
         for fragment in self.vm.fragments(address, rounded)? {
             let i = ((fragment.address - vm::BASE) / 4096) as usize;
-            self.tables[i / 512].set(
-                i % 512,
-                self.base + fragment.slot as u64 * 4096,
-                protection,
-            )?;
+            let physical = self.physical(fragment.slot);
+            self.tables[i / 512].set(i % 512, physical, protection)?;
         }
         // CPU0 owns the stopped process; the retired backend root has no stale
         // user alias. The next entry publishes these desired permissions.
@@ -334,6 +426,8 @@ pub fn init_pc() -> Result<(), Errno> {
         return Err(Errno::Busy);
     }
     let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    #[cfg(feature = "full-os")]
+    pool::init(base.0)?;
     POOL_BASE.store(base.0, Ordering::Release);
     Ok(())
 }

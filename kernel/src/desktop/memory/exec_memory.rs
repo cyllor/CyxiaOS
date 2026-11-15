@@ -14,7 +14,7 @@ use cyxia_posix::{
     usermem::MAX_PROCESSES,
 };
 #[cfg(feature = "full-os")]
-pub const PROFILE: ImageProfile = ImageProfile::FullOsV2;
+pub const PROFILE: ImageProfile = ImageProfile::FullOsV3;
 #[cfg(not(feature = "full-os"))]
 pub const PROFILE: ImageProfile = ImageProfile::Legacy;
 const LAYOUT: cyxia_contracts::user_layout::ImageLayout = PROFILE.layout();
@@ -132,11 +132,11 @@ impl ExecMemory {
         }
         attempt.proposed(match PROFILE {
             ImageProfile::Legacy => 8195,
-            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 => cyxia_ai_runtime::FULL_OS_EXEC_MODEL_ID,
+            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => cyxia_ai_runtime::FULL_OS_EXEC_MODEL_ID,
         });
         let (allowed, model) = match PROFILE {
             ImageProfile::Legacy => cyxia_ai_runtime::executable_memory_policy(PAGES as u32, count as u32),
-            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 => cyxia_ai_runtime::full_os_executable_memory_policy(PAGES as u32, count as u32),
+            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => cyxia_ai_runtime::full_os_executable_memory_policy(PAGES as u32, count as u32),
         }.map_err(|_| Errno::Io)?;
         attempt.decided(allowed, model);
         if !allowed {

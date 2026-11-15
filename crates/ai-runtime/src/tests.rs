@@ -538,6 +538,51 @@ fn full_os_anonymous_extension_preserves_historical_policy_contracts() {
 }
 
 #[test]
+fn full_os_pool_anonymous_policy_admits_the_observed_515_page_request() {
+    let observed_used = 8192 - 49;
+    assert_eq!(FULL_OS_POOL_ANON_MODEL_ID, 8199);
+    assert_eq!(full_os_anonymous_memory_policy(49, 515), Ok((false, 8198)));
+    assert_eq!(
+        full_os_pool_anonymous_memory_policy(16384 - observed_used, 515),
+        Ok((true, 8199))
+    );
+    assert_eq!(full_os_pool_anonymous_memory_policy(16384, 2048), Ok((true, 8199)));
+    // The kernel supplies the smaller virtual/physical free count: enlarging
+    // the virtual window must not admit a physically exhausted shared pool.
+    assert_eq!(
+        full_os_pool_anonymous_memory_policy((16384 - observed_used).min(49), 515),
+        Ok((false, 8199))
+    );
+}
+
+#[test]
+fn full_os_pool_anonymous_policy_rejects_invalid_inputs_and_keeps_reserve() {
+    for (free, requested, allowed) in [(0, 1, false), (47, 16, false), (48, 16, true), (2048, 2048, false)] {
+        assert_eq!(full_os_pool_anonymous_memory_policy(free, requested), Ok((allowed, 8199)));
+    }
+    for (free, requested) in [(16385, 1), (u32::MAX, 1), (16384, 0), (16384, 2049), (16384, u32::MAX)] {
+        assert_eq!(full_os_pool_anonymous_memory_policy(free, requested), Err(Error::Invalid));
+    }
+    for free_units in 0..=1024 {
+        let free_low = free_units * 16;
+        let free_high = (free_low + 15).min(16384);
+        for requested_units in 1..=128 {
+            let requested_low = (requested_units - 1) * 16 + 1;
+            let requested_high = requested_units * 16;
+            let reference = full_os_pool_anonymous_memory_policy(free_low, requested_high).unwrap();
+            assert_eq!(reference.1, 8199);
+            for free in [free_low, free_high] {
+                for requested in [requested_low, requested_high] {
+                    let decision = full_os_pool_anonymous_memory_policy(free, requested).unwrap();
+                    assert_eq!(decision, reference, "free={free} requested={requested}");
+                    assert!(!decision.0 || requested + 32 <= free, "free={free} requested={requested}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn executable_memory_policy_cannot_overcommit_image_arena() {
     assert_eq!(executable_memory_policy(4096, 20), Ok((true, 8195)));
     assert_eq!(executable_memory_policy(4096, 4096), Ok((false, 8195)));

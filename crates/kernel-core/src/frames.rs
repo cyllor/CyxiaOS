@@ -36,10 +36,15 @@ impl FrameMeta {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHandle {
+    index: usize,
     address: PhysAddr,
     generation: u64,
 }
 impl FrameHandle {
+    /// Index in this pool's metadata, including excluded reserved entries.
+    pub fn index(self) -> usize {
+        self.index
+    }
     pub fn address(self) -> PhysAddr {
         self.address
     }
@@ -58,8 +63,21 @@ impl RevokeComplete {
 pub trait PageZeroer {
     fn zero(&mut self, page: PhysAddr) -> Result<(), FrameError>;
 }
+/// Available capacity excludes reserved and permanently retired frames.
+/// Dirty pages are free capacity because `alloc_zeroed` clears them before use;
+/// revoking pages remain used until the matching completion is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSnapshot {
+    pub capacity: usize,
+    pub free: usize,
+    pub used: usize,
+}
+
 pub struct FramePool<'a> {
     meta: &'a mut [FrameMeta],
+    capacity: usize,
+    free: usize,
+    next_zeroed: usize,
 }
 impl<'a> FramePool<'a> {
     pub fn from_regions(
@@ -121,6 +139,7 @@ impl<'a> FramePool<'a> {
             }
         }
         let mut i = 0;
+        let mut free = 0;
         for r in ram {
             for offset in (0..r.len).step_by(4096) {
                 let page = MemoryRegion {
@@ -132,6 +151,9 @@ impl<'a> FramePool<'a> {
                     .iter()
                     .chain(firmware_reserved.iter())
                     .any(|x| x.overlaps(page));
+                if !excluded {
+                    free += 1;
+                }
                 metadata[i] = FrameMeta {
                     address: page.start,
                     state: if excluded {
@@ -146,19 +168,35 @@ impl<'a> FramePool<'a> {
         }
         Ok(Self {
             meta: &mut metadata[..total],
+            capacity: free,
+            free,
+            next_zeroed: 0,
         })
     }
+    pub fn snapshot(&self) -> FrameSnapshot {
+        FrameSnapshot {
+            capacity: self.capacity,
+            free: self.free,
+            used: self.capacity - self.free,
+        }
+    }
+
+    /// First-fit clean-page allocation retains the historical selection order.
     pub fn alloc_clean(&mut self, owner: TaskId) -> Result<FrameHandle, FrameError> {
-        for m in self.meta.iter_mut() {
+        for (index, m) in self.meta.iter_mut().enumerate() {
             if m.state == State::Clean {
                 let Some(g) = m.generation.checked_add(1) else {
                     m.state = State::Retired;
+                    self.capacity -= 1;
+                    self.free -= 1;
                     continue;
                 };
                 m.generation = g;
                 m.owner = Some(owner);
                 m.state = State::Owned;
+                self.free -= 1;
                 return Ok(FrameHandle {
+                    index,
                     address: m.address,
                     generation: g,
                 });
@@ -174,16 +212,70 @@ impl<'a> FramePool<'a> {
             Err(FrameError::Exhausted)
         }
     }
+    /// Allocate a free page, clearing dirty contents before issuing ownership.
+    /// Scanning starts after the previous successful allocation and examines at
+    /// most one full pool. A zero failure leaves its page dirty and unowned;
+    /// exhausted generations permanently retire capacity instead of wrapping.
+    pub fn alloc_zeroed(
+        &mut self,
+        owner: TaskId,
+        zeroer: &mut impl PageZeroer,
+    ) -> Result<FrameHandle, FrameError> {
+        let count = self.meta.len();
+        let mut revoking = false;
+        for offset in 0..count {
+            let index = (self.next_zeroed + offset) % count;
+            let m = &mut self.meta[index];
+            if m.state == State::Revoking {
+                revoking = true;
+            }
+            if !matches!(m.state, State::Dirty | State::Clean) {
+                continue;
+            }
+            let Some(generation) = m.generation.checked_add(1) else {
+                m.state = State::Retired;
+                self.capacity -= 1;
+                self.free -= 1;
+                continue;
+            };
+            if m.state == State::Dirty {
+                zeroer.zero(m.address)?;
+            }
+            m.generation = generation;
+            m.owner = Some(owner);
+            m.state = State::Owned;
+            self.free -= 1;
+            self.next_zeroed = (index + 1) % count;
+            return Ok(FrameHandle {
+                index,
+                address: m.address,
+                generation,
+            });
+        }
+        Err(if revoking { FrameError::Again } else { FrameError::Exhausted })
+    }
+
     fn find(&mut self, h: FrameHandle) -> Result<&mut FrameMeta, FrameError> {
-        let m = self
-            .meta
-            .iter_mut()
-            .find(|m| m.address == h.address)
-            .ok_or(FrameError::Stale)?;
-        if m.generation != h.generation {
+        let m = self.meta.get_mut(h.index).ok_or(FrameError::Stale)?;
+        if m.address != h.address || m.generation != h.generation {
             return Err(FrameError::Stale);
         }
         Ok(m)
+    }
+
+    /// Read-only preflight for a complete release batch before any VM mutation.
+    pub fn check_owned(&self, h: FrameHandle, owner: TaskId) -> Result<(), FrameError> {
+        let m = self.meta.get(h.index).ok_or(FrameError::Stale)?;
+        if m.address != h.address || m.generation != h.generation {
+            return Err(FrameError::Stale);
+        }
+        if m.owner != Some(owner) {
+            return Err(FrameError::Owner);
+        }
+        if m.state != State::Owned {
+            return Err(FrameError::Stale);
+        }
+        Ok(())
     }
     pub fn begin_revoke(&mut self, h: FrameHandle, owner: TaskId) -> Result<(), FrameError> {
         let m = self.find(h)?;
@@ -210,6 +302,7 @@ impl<'a> FramePool<'a> {
         }
         m.owner = None;
         m.state = State::Dirty;
+        self.free += 1;
         Ok(())
     }
     pub fn clean_one(&mut self, zeroer: &mut impl PageZeroer) -> Result<bool, FrameError> {
@@ -219,6 +312,75 @@ impl<'a> FramePool<'a> {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoZero;
+    impl PageZeroer for NoZero {
+        fn zero(&mut self, _: PhysAddr) -> Result<(), FrameError> {
+            panic!("retired or clean pages must not invoke the zeroer");
+        }
+    }
+
+    #[test]
+    fn exhausted_generations_retire_capacity_in_both_allocation_paths() {
+        for zeroed in [false, true] {
+            let mut metadata = [FrameMeta {
+                address: PhysAddr(0x1000),
+                generation: u64::MAX,
+                owner: None,
+                state: if zeroed { State::Dirty } else { State::Clean },
+            }];
+            let mut pool = FramePool {
+                meta: &mut metadata,
+                capacity: 1,
+                free: 1,
+                next_zeroed: 0,
+            };
+            let owner = TaskId::new(1).unwrap();
+            let result = if zeroed {
+                pool.alloc_zeroed(owner, &mut NoZero)
+            } else {
+                pool.alloc_clean(owner)
+            };
+            assert_eq!(result, Err(FrameError::Exhausted));
+            assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 0, free: 0, used: 0 });
+            assert_eq!(pool.meta[0].state, State::Retired);
+            assert_eq!(pool.alloc_zeroed(owner, &mut NoZero), Err(FrameError::Exhausted));
+            assert_eq!(pool.snapshot().free, 0);
+        }
+    }
+
+    #[test]
+    fn forged_index_does_not_authorize_another_frame() {
+        let owner = TaskId::new(1).unwrap();
+        let mut metadata = [FrameMeta {
+            address: PhysAddr(0x1000),
+            generation: 1,
+            owner: Some(owner),
+            state: State::Owned,
+        }, FrameMeta {
+            address: PhysAddr(0x2000),
+            generation: 1,
+            owner: Some(owner),
+            state: State::Owned,
+        }];
+        let mut pool = FramePool {
+            meta: &mut metadata,
+            capacity: 2,
+            free: 0,
+            next_zeroed: 0,
+        };
+        for index in [1, usize::MAX] {
+            let forged = FrameHandle { index, address: PhysAddr(0x1000), generation: 1 };
+            assert_eq!(pool.check_owned(forged, owner), Err(FrameError::Stale));
+            assert_eq!(pool.begin_revoke(forged, owner), Err(FrameError::Stale));
+            assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 2, free: 0, used: 2 });
         }
     }
 }

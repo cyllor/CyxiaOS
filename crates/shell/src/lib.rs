@@ -298,6 +298,8 @@ impl Shell {
                         "inotify-probe" => "inotify-probe",
                         "thread-exit-probe" => "thread-exit-probe",
                         "heap-capacity-probe" => "heap-capacity-probe",
+                        "heap-pool-probe" => "heap-pool-probe",
+                        "heap-pool-hold" => "heap-pool-hold",
                         "thread-exit-bad-stack" => "thread-exit-bad-stack",
                         "rust-egl-probe" => "rust-egl-probe",
                         "fd-share-probe" => "fd-share-probe",

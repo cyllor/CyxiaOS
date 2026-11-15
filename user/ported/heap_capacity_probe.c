@@ -170,7 +170,7 @@ int main(int argc, char **argv)
     }
     if (!exhausted)
         return fail("reserve-loop-bound", EOVERFLOW);
-    if (allocated_bytes < 28 * MIB || allocated_bytes > 32 * MIB - 32 * PAGE_BYTES)
+    if (allocated_bytes < 60 * MIB || allocated_bytes > 64 * MIB - 32 * PAGE_BYTES)
         return fail("reserve-capacity", EINVAL);
     if (check_payload("reserve-integrity"))
         return 1;

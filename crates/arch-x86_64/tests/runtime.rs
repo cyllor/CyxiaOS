@@ -89,9 +89,22 @@ fn private_roots_map_disjoint_frames_and_enforce_permissions() {
 }
 
 #[test]
-fn full_os_v2_complete_windows_fit_private_tables_and_preserve_stack_guard() {
-    use cyxia_contracts::user_layout::ImageProfile;
+fn full_os_v3_complete_windows_fit_private_tables_and_preserve_stack_guard() {
+    full_os_windows_fit_private_tables(
+        cyxia_contracts::user_layout::ImageProfile::FullOsV3,
+        64 * 1024 * 1024,
+    );
+}
 
+#[test]
+fn full_os_v2_complete_windows_fit_private_tables_and_preserve_stack_guard() {
+    full_os_windows_fit_private_tables(
+        cyxia_contracts::user_layout::ImageProfile::FullOsV2,
+        32 * 1024 * 1024,
+    );
+}
+
+fn full_os_windows_fit_private_tables(profile: cyxia_contracts::user_layout::ImageProfile, heap_bytes: u64) {
     #[derive(Clone)]
     #[repr(C, align(4096))]
     struct TableFrame([u8; 4096]);
@@ -111,10 +124,10 @@ fn full_os_v2_complete_windows_fit_private_tables_and_preserve_stack_guard() {
         )
     }
     .unwrap();
-    let layout = ImageProfile::FullOsV2.layout();
+    let layout = profile.layout();
     let stack_end = layout.stack_base + layout.stack_pages as u64 * PAGE_BYTES;
     let heap_end = layout.heap_base + layout.heap_pages as u64 * PAGE_BYTES;
-    assert_eq!(heap_end - layout.heap_base, 32 * 1024 * 1024);
+    assert_eq!(heap_end - layout.heap_base, heap_bytes);
     let windows = [
         (layout.image_base, layout.image_end, UserPermissions::RX),
         // The existing shared-memory ABI window is independent of image profiles.

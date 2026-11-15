@@ -155,6 +155,51 @@
       "minimum_admitted_spare_pages": 32,
       "quantized_inputs_checked": 65664,
       "unsafe_grants": 0
+    },
+    "USER_MEMORY_FULL_OS_POOL": {
+      "version": 1,
+      "weights": [
+        -452,
+        453,
+        -456,
+        0
+      ],
+      "train": 104960,
+      "heldout": 26240,
+      "correct": 26240,
+      "model_id": 8199,
+      "profile": "full-os-v3",
+      "epochs": 32,
+      "page_bytes": 4096,
+      "virtual_window_pages": 16384,
+      "shared_pool_pages": 65536,
+      "process_slots": 8,
+      "backing": "committed at mmap; no fault-lazy allocation",
+      "free_input": "min(process_virtual_free, shared_physical_free)",
+      "free_pages": [
+        0,
+        16384
+      ],
+      "requested_pages": [
+        1,
+        2048
+      ],
+      "feature_unit_pages": 16,
+      "free_units": [
+        0,
+        1024
+      ],
+      "requested_units": [
+        1,
+        128
+      ],
+      "free_rounding": "floor",
+      "requested_rounding": "ceil",
+      "teacher": "free_units - requested_units >= 2 (synthetic)",
+      "teacher_reserve_pages": 32,
+      "minimum_admitted_spare_pages": 32,
+      "quantized_inputs_checked": 131200,
+      "unsafe_grants": 0
     }
   },
   "limitation": "Synthetic policy distillation; not workload performance validation."

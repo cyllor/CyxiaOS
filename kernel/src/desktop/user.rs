@@ -1061,6 +1061,8 @@ impl Supervisor {
             "gtk-probe"
         } else if matches!(name, "pcmanfm-desktop" | "pcmanfm-home") {
             "pcmanfm"
+        } else if name == "heap-pool-hold" {
+            "heap-pool-probe"
         } else if name == "thread-exit-bad-stack" {
             "thread-exit-probe"
         } else if name == "cosmic-version" {
@@ -1177,6 +1179,7 @@ impl Supervisor {
             b"--config-file",
             b"/etc/xdg/openbox/rc.xml",
         ];
+        let heap_hold_argv: &[&[u8]] = &[path.as_bytes(), b"hold"];
         let bad_stack_argv: &[&[u8]] = &[path.as_bytes(), b"bad-stack"];
         let egl_x11_argv: &[&[u8]] = &[path.as_bytes(), b"x11"];
         let sp = match runner.executable.load(
@@ -1185,7 +1188,9 @@ impl Supervisor {
             &plan,
             super::exec_memory::StackInput {
                 random,
-                argv: if name == "thread-exit-bad-stack" {
+                argv: if name == "heap-pool-hold" {
+                    heap_hold_argv
+                } else if name == "thread-exit-bad-stack" {
                     bad_stack_argv
                 } else if image_name == "cosmic-comp" {
                     cosmic_argv
@@ -1536,6 +1541,8 @@ pub fn ai_status(out: &mut impl Write) {
     #[cfg(target_arch = "x86_64")]
     parallel::status(out);
     object_status(out);
+    #[cfg(feature = "full-os")]
+    crate::user_heap::pool_status(out);
     #[cfg(feature = "ported")]
     crate::shared_memory::status(out);
 }

@@ -6,6 +6,7 @@ pub enum ImageProfile {
     Legacy,
     FullOsV1,
     FullOsV2,
+    FullOsV3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,7 @@ impl ImageProfile {
             Self::Legacy => "legacy",
             Self::FullOsV1 => "full-os-v1",
             Self::FullOsV2 => "full-os-v2",
+            Self::FullOsV3 => "full-os-v3",
         }
     }
 
@@ -53,6 +55,10 @@ impl ImageProfile {
                 heap_pages: 8192,
                 ..Self::FullOsV1.layout()
             },
+            Self::FullOsV3 => ImageLayout {
+                heap_pages: 16384,
+                ..Self::FullOsV2.layout()
+            },
         }
     }
 }
@@ -69,7 +75,7 @@ mod tests {
 
     #[test]
     fn full_os_image_heap_stack_and_existing_shared_window_do_not_alias() {
-        for profile in [ImageProfile::FullOsV1, ImageProfile::FullOsV2] {
+        for profile in [ImageProfile::FullOsV1, ImageProfile::FullOsV2, ImageProfile::FullOsV3] {
             let layout = profile.layout();
             let regions = [
                 (layout.image_base, layout.image_end),
@@ -102,5 +108,17 @@ mod tests {
         assert_eq!((layout.image_base, layout.image_end), (0x01000000, 0x02000000));
         assert_eq!((layout.stack_base, layout.stack_pages), (0x03000000, 64));
         assert_eq!(layout.exec_pool_pages, 4096);
+    }
+
+    #[test]
+    fn full_os_v3_extends_only_the_anonymous_virtual_window() {
+        let previous = ImageProfile::FullOsV2.layout();
+        let layout = ImageProfile::FullOsV3.layout();
+        assert_eq!(ImageProfile::FullOsV3.name(), "full-os-v3");
+        assert_eq!(layout, ImageLayout { heap_pages: 16384, ..previous });
+        assert_eq!(layout.heap_base, 0x0c00_0000);
+        assert_eq!(layout.heap_base + layout.heap_pages as u64 * 4096, 0x1000_0000);
+        assert_eq!(ImageProfile::FullOsV1.layout().heap_pages, 4096);
+        assert_eq!(previous.heap_pages, 8192);
     }
 }

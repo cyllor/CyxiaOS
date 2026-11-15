@@ -58,6 +58,7 @@ PROBES = {
     "inotify-probe": ("inotify_probe.c", []),
     "thread-exit-probe": ("thread_exit_probe.c", []),
     "heap-capacity-probe": ("heap_capacity_probe.c", []),
+    "heap-pool-probe": ("heap_pool_probe.c", []),
     "xkb-rules-probe": ("xkb_rules_probe.c", ["-lxkbcommon"]),
     "scm-probe": ("scm_probe.c", []),
     "memfd-probe": ("memfd_probe.c", []),

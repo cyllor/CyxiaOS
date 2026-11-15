@@ -10,3 +10,6 @@ full-os = ["large-memory"]
 [dependencies]
 cyxia-ai-fs = { path = "../ai-fs" }
 cyxia-contracts = { path = "../contracts" }
+
+[dev-dependencies]
+cyxia-kernel-core = { path = "../kernel-core" }

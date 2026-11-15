@@ -775,6 +775,30 @@ pub fn full_os_anonymous_memory_policy(free: u32, requested: u32) -> Result<(boo
     Ok((score >= 0, FULL_OS_ANON_MODEL_ID))
 }
 
+/// Separate synthetic anonymous-admission model for the full-OS v3 profile.
+pub const FULL_OS_POOL_ANON_MODEL_ID: u64 = 0x2007;
+
+/// Anonymous-memory admission for the full-OS v3 64 MiB virtual window backed
+/// by a shared physical pool. The kernel supplies the smaller of this process's
+/// free virtual pages and the shared pool's free physical pages. Free pages round
+/// down and requested pages round up to 16-page features, within the separately
+/// trained 0..1024 free / 1..128 request domain. The synthetic policy retains a
+/// 32-page reserve and 2,048-page request bound; out-of-domain inputs are rejected.
+/// Admission confers no authority: the kernel must commit exclusive physical
+/// backing at mmap, zero it before publication, and enforce mapping permissions.
+pub fn full_os_pool_anonymous_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > 16384 || requested == 0 || requested > 2048 {
+        return Err(Error::Invalid);
+    }
+    let features = [1, (free / 16) as i32, requested.div_ceil(16) as i32, 0];
+    let score: i32 = weights::USER_MEMORY_FULL_OS_POOL
+        .into_iter()
+        .zip(features)
+        .map(|(w, x)| w * x)
+        .sum();
+    Ok((score >= 0, FULL_OS_POOL_ANON_MODEL_ID))
+}
+
 /// Executable-image admission, separately trained for a 16 MiB private arena.
 /// The kernel still enforces actual page capacity, permissions and ownership.
 pub fn executable_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
