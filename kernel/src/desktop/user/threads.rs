@@ -1,13 +1,14 @@
 //! Bounded CPU0 thread mechanism. One Runner owns the address space and FDs.
-//! Eight 4KiB context slots plus a shared signal page and a spare page occupy
-//! ten actual boot-reserved pages. Model 8193 admits one context credit while
-//! preserving its two-credit floor; neither stack nor heap bytes are fabricated.
+//! Eight legacy or sixteen full-OS 4KiB context slots, a shared signal page and
+//! a spare page occupy ten or eighteen actual boot-reserved pages. Model 8193
+//! admits one context credit while preserving its two-credit floor; user stacks
+//! and heap bytes are separately backed and admitted.
 #[cfg(any(feature = "ported", feature = "graphics"))]
 use super::Errno;
 use super::{Context, LocalIpc, Runner, UserState, Wait};
 
 #[cfg(feature = "ported")]
-pub(super) const MAX_THREADS: usize = 8;
+pub(super) const MAX_THREADS: usize = if cfg!(feature = "full-os") { 16 } else { 8 };
 #[repr(C, align(4096))]
 pub(super) struct Thread {
     pub context: Context,
@@ -96,8 +97,8 @@ pub(super) struct Group {
 }
 #[cfg(feature = "ported")]
 impl Group {
-    // Reset each bounded record in place; constructing the whole 36KiB Group
-    // as a temporary would exhaust the 64KiB kernel stack during ELF launch.
+    // Reset each bounded record in place; constructing the whole Group (36KiB
+    // legacy, 68KiB full OS) would exhaust the 64KiB kernel stack at ELF launch.
     #[inline(never)]
     pub fn reset(&mut self) {
         for thread in &mut self.parked {
@@ -120,9 +121,16 @@ impl Group {
     }
 }
 #[cfg(feature = "ported")]
+const RESERVED_CONTEXT_PAGES: usize =
+    (core::mem::size_of::<Thread>() + core::mem::size_of::<Group>()) / 4096;
+#[cfg(feature = "ported")]
 const _: () = {
     assert!(core::mem::size_of::<Shared>() == 4096);
-    assert!(core::mem::size_of::<Thread>() + core::mem::size_of::<Group>() == 10 * 4096);
+    assert!(
+        core::mem::size_of::<Thread>() + core::mem::size_of::<Group>()
+            == (MAX_THREADS + 2) * 4096
+    );
+    assert!(RESERVED_CONTEXT_PAGES <= 64); // Model 8193's existing input domain.
 };
 
 impl Runner {
@@ -165,7 +173,13 @@ impl Runner {
             if self.threads.shared.dispatch.take().is_some() {
                 super::ai::record(super::ai::Domain::CpuThread, |c| c.cancelled());
             }
-            if let Some(choice) = cyxia_ai_runtime::user_dispatch_policy(&candidates).unwrap() {
+            let choice = if cfg!(feature = "full-os") {
+                cyxia_ai_runtime::full_os_thread_dispatch_policy(&candidates)
+            } else {
+                cyxia_ai_runtime::user_dispatch_policy(&candidates)
+            }
+            .unwrap();
+            if let Some(choice) = choice {
                 super::ai::record(super::ai::Domain::CpuThread, |c| c.proposal(choice.model));
                 self.threads.shared.dispatch = Some((choice.model, choice.source));
                 if choice.index > 0 {
@@ -294,9 +308,11 @@ mod linux_threads {
                 return Err(Errno::Again);
             };
             attempt.proposed(8193);
-            let (allow, model) =
-                cyxia_ai_runtime::user_memory_policy((10 - self.live_threads()) as u32, 1)
-                    .map_err(|_| Errno::Io)?;
+            let (allow, model) = cyxia_ai_runtime::user_memory_policy(
+                (RESERVED_CONTEXT_PAGES - self.live_threads()) as u32,
+                1,
+            )
+            .map_err(|_| Errno::Io)?;
             attempt.decided(allow, model);
             self.status.thread_memory_model = model;
             if !allow {

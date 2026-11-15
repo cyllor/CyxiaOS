@@ -119,12 +119,12 @@ def object_snapshot(console):
     console.until(rb'AI_SYSTEM_END\r?\n', at)
     return objects(bytes(console.raw[at:]))
 
-def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0):
+def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0, free_pages=64):
     from verify_ported import parse_processes
     console.until(rb'pid=' + pid + b' ' + state.encode() + rb' code=' + str(code).encode() + rb'\b')
     at = console.command('posix list')
     process = parse_processes(bytes(console.raw[at:]))[int(pid)]
-    for name, expected in dict(state=state, code=code, free_pages=64, heap_pages=0,
+    for name, expected in dict(state=state, code=code, free_pages=free_pages, heap_pages=0,
                                image_pages=0, thread_count=0, heap_free=16384,
                                heap_allocations=0, heap_largest_free=16384,
                                image_free=16384).items():
@@ -492,6 +492,12 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'heap-pool' or ('full-os' in manifest['features'] and
                    'heap-pool-probe.elf' in manifest['external_inputs']),
                    'heap pool smoke requires full-OS and actual musl probe')
+        pc.require(scenario != 'socket-options' or 'socket-options-probe.elf' in manifest['external_inputs'],
+                   'socket options smoke requires actual musl probe')
+        pc.require(scenario != 'dbus' or ('full-os' in manifest['features'] and
+                   all(name + '.elf' in manifest['external_inputs'] for name in
+                       ('dbus-daemon', 'dbus-send', 'dbus-uuidgen', 'dbus-probe'))),
+                   'D-Bus smoke requires genuine broker and clients')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -531,6 +537,26 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     result['xkb_assets'] = xkb_data_inputs(manifest['sysroot'])
                     result['xkb_rules_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe')
                     result['xkb_rules_embedded_sha256'] = embedded_images(build, manifest, ('xkb-rules-probe.elf',))['xkb-rules-probe.elf']
+                if scenario == 'fsync-concurrent':
+                    result['fsync_concurrent_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'fsync-concurrent-probe')
+                    result['fsync_concurrent_embedded'] = embedded_images(build, manifest, ('fsync-concurrent-probe.elf',))
+                if scenario == 'thread-capacity':
+                    result['thread_capacity_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'thread-capacity-probe')
+                    result['thread_capacity_embedded'] = embedded_images(build, manifest, ('thread-capacity-probe.elf',))
+                if scenario == 'fd-share':
+                    result['fd_share_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'fd-share-probe')
+                    result['fd_share_embedded'] = embedded_images(build, manifest, ('fd-share-probe.elf',))
+                if scenario in ('dbus', 'fsync', 'fsync-concurrent'):
+                    result['fsync_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'fsync-probe')
+                    result['fsync_embedded'] = embedded_images(build, manifest, ('fsync-probe.elf',))
+                if scenario == 'dbus':
+                    from os_dbus import validate_inputs
+                    result['dbus_inputs'] = validate_inputs(manifest['sysroot'])
+                    result['dbus_embedded'] = embedded_images(build, manifest, tuple(
+                        name + '.elf' for name in ('dbus-daemon', 'dbus-send', 'dbus-uuidgen', 'dbus-probe')))
+                if scenario == 'socket-options':
+                    result['socket_options_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'socket-options-probe')
+                    result['socket_options_embedded_sha256'] = embedded_images(build, manifest, ('socket-options-probe.elf',))['socket-options-probe.elf']
                 if scenario == 'heap-pool':
                     result['heap_pool_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'heap-pool-probe')
                     result['heap_pool_embedded_sha256'] = embedded_images(build, manifest, ('heap-pool-probe.elf',))['heap-pool-probe.elf']
@@ -571,6 +597,86 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
                 if scenario == 'xkb-rules':
                     result['xkb_rules'] = [xkb_rules_checks(console), xkb_rules_checks(console)]
+                if scenario == 'dbus':
+                    from os_dbus import checks
+                    expected_id = None
+                    if recover_disk:
+                        prior = pc.read_json(disk.parent / 'summary.json')
+                        pc.require(prior.get('status') == 'OS_DBUS_PASS' and
+                                   prior['disk_after_sha256'] == result['disk_before_sha256'],
+                                   'D-Bus recovery requires the actual prior completed disk')
+                        expected_id = prior['dbus']['machine_id']
+                        result['recovery_summary_sha256'] = pc.sha(disk.parent / 'summary.json')
+                    result['dbus'] = checks(console, expected_id)
+                if scenario == 'thread-capacity':
+                    before = object_snapshot(console)
+                    at = console.program('posix exec thread-capacity-probe', b'THREAD_CAPACITY_PROBE PASS')
+                    pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+                    result['thread_capacity'] = reclaimed_probe(console, pid, before)
+                    row = result['thread_capacity']['process']
+                    pc.require(row['thread_peak'] == 16 and row['thread_denials'] == 2,
+                               'full OS thread capacity/rejection not observed twice')
+                if scenario == 'fd-share':
+                    from verify_fd_share import STAGES, RETRY_STAGES
+                    from verify_ported import parse_processes
+                    before = object_snapshot(console)
+                    at = console.command('posix exec fd-share-probe')
+                    pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+                    for stage in STAGES:
+                        console.until(('FD_SHARE_PROBE ' + stage + ' PASS').encode(), at)
+                    retries = []
+                    for stage in RETRY_STAGES:
+                        console.until(('FD_SHARE_PROBE ' + stage + ' WAIT').encode(), at)
+                        def process_row():
+                            listing = console.command('posix list')
+                            row = parse_processes(bytes(console.raw[listing:]))[int(pid)]
+                            pc.require(row['state'] in ('Running', 'Waiting'), 'fd-share ended before retry gate')
+                            return row
+                        previous = process_row()['waits']
+                        deadline = time.monotonic() + 10
+                        while True:
+                            current = process_row()['waits']
+                            if current > previous: break
+                            pc.require(time.monotonic() < deadline, 'fd-share worker did not block')
+                            time.sleep(.01)
+                        console.command('touch /ofd-' + stage)
+                        console.until(('FD_SHARE_PROBE ' + stage + ' PASS').encode(), at)
+                        retries.append(dict(stage=stage, waits_before=previous, waits_after=current))
+                    console.until(rb'FD_SHARE_PROBE PASS', at)
+                    result['fd_share'] = reclaimed_probe(console, pid, before)
+                    result['fd_share']['retry_witnesses'] = retries
+                if scenario == 'fsync-concurrent':
+                    if recover_disk:
+                        prior = pc.read_json(disk.parent / 'summary.json')
+                        pc.require(prior.get('status') == 'OS_FSYNC-CONCURRENT_PASS' and
+                                   prior['disk_after_sha256'] == result['disk_before_sha256'],
+                                   'fsync recovery requires actual prior completed disk')
+                        console.program('posix exec fsync-concurrent-verify', b'FSYNC_CONCURRENT_PROBE RECOVERED PASS')
+                        result['fsync_recovery_summary_sha256'] = pc.sha(disk.parent / 'summary.json')
+                    else:
+                        from os_fsync import checks
+                        result['fsync_concurrent'] = checks(console, qmp, output)
+                if scenario == 'fsync':
+                    before = object_snapshot(console)
+                    if recover_disk:
+                        prior = pc.read_json(disk.parent / 'summary.json')
+                        pc.require(prior.get('status') == 'OS_FSYNC_PASS' and
+                                   prior['disk_after_sha256'] == result['disk_before_sha256'],
+                                   'fsync recovery requires actual prior completed disk')
+                        at = console.program('posix exec fsync-verify', b'FSYNC_PROBE RECOVERED PASS')
+                        result['fsync_recovery_summary_sha256'] = pc.sha(disk.parent / 'summary.json')
+                    else:
+                        at = console.program('posix exec fsync-probe', b'FSYNC_PROBE PASS')
+                    pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+                    result['fsync'] = reclaimed_probe(console, pid, before)
+                if scenario == 'socket-options':
+                    result['socket_options'] = []
+                    for _ in range(2):
+                        before = object_snapshot(console)
+                        at = console.command('posix exec socket-options-probe')
+                        pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+                        console.until(rb'SOCKET_OPTIONS_PROBE PASS', at)
+                        result['socket_options'].append(reclaimed_probe(console, pid, before))
                 if scenario == 'heap-pool':
                     from os_heap_pool import checks
                     result['heap_pool'] = checks(console)
@@ -601,8 +707,11 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     console.program('posix exec probe', b'PORTED_PROBE PASS')
                     result['scope'] = 'real cosmic-comp --version and image reuse; not compositor startup or a COSMIC session'
                 if egl: console.program('posix exec egl-probe', b'EGL_PROBE RESULT PASS mode=offscreen failures=0')
-                if not recover_disk:
-                    console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=[2-9]'])
+                # These scenarios establish durability through the tested
+                # fsync calls. A later operator checkpoint would mask a stale
+                # syscall snapshot when the same disk is rebooted.
+                if not recover_disk and scenario not in ('dbus', 'fsync', 'fsync-concurrent'):
+                    console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=(?:[2-9]|[1-9][0-9]+)\b'])
                     if scenario == 'flock':
                         result['runtime_checkpoint'] = flock_checkpoint_proof(bytes(console.raw), console.commands)
                 qmp.execute('screendump', {'filename': str(output / 'display.ppm')})
@@ -660,6 +769,21 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                                        'XKB asset receipt changed during VM')
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe') == result['xkb_rules_build_inputs'],
                                        'XKB probe source/library changed during VM')
+                        if scenario == 'fsync-concurrent':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'fsync-concurrent-probe') == result['fsync_concurrent_inputs'], 'fsync contention inputs changed')
+                        if scenario == 'thread-capacity':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'thread-capacity-probe') == result['thread_capacity_inputs'], 'thread capacity inputs changed')
+                        if scenario == 'fd-share':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'fd-share-probe') == result['fd_share_inputs'], 'fd-share inputs changed')
+                        if scenario in ('dbus', 'fsync', 'fsync-concurrent'):
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'fsync-probe') == result['fsync_build_inputs'],
+                                       'fsync probe inputs changed during guest')
+                        if scenario == 'dbus':
+                            pc.require(validate_inputs(manifest['sysroot']) == result['dbus_inputs'],
+                                       'D-Bus build inputs changed during guest')
+                        if scenario == 'socket-options':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'socket-options-probe') == result['socket_options_build_inputs'],
+                                       'socket options probe inputs changed during VM')
                         if scenario == 'heap-pool':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'heap-pool-probe') == result['heap_pool_build_inputs'],
                                        'heap pool probe inputs changed during VM')
@@ -679,7 +803,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules', 'heap-pool'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules', 'heap-pool', 'socket-options', 'dbus', 'fsync', 'fsync-concurrent', 'fd-share', 'thread-capacity'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

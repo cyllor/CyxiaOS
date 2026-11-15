@@ -16,7 +16,7 @@
   "patches": [],
   "source_series": {
     "path": "ports/cosmic/native-comp/native-series.json",
-    "sha256": "1e3d54bc90c58b9fdb9f25e24006c890024a25e6104d427d965d7e2e058f9a47"
+    "sha256": "365242b0ed76c1c0e9e6df893d8f0db185d083989b411b3ec746f884ba74f8e6"
   },
   "native_inputs": [
     {

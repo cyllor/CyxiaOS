@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct PendingPresentation {
     info: DisplayInfo,
@@ -15,6 +17,7 @@ pub struct PendingPresentation {
     tile: Vec<u8>,
     ready: bool,
     failed: bool,
+    // Only an actually completed tile renews this no-progress watchdog.
     deadline: Instant,
 }
 
@@ -52,7 +55,7 @@ impl PendingPresentation {
             tile,
             ready: false,
             failed: false,
-            deadline: Instant::now() + Duration::from_secs(5),
+            deadline: Instant::now() + STALL_TIMEOUT,
         })
     }
 
@@ -92,7 +95,17 @@ impl PendingPresentation {
         &mut self,
         rgba: Option<&[u8]>,
         budget: usize,
+        submit: impl FnMut(Rectangle, &[u8]) -> io::Result<usize>,
+    ) -> io::Result<bool> {
+        self.advance_pixels_with_clock(rgba, budget, submit, Instant::now)
+    }
+
+    fn advance_pixels_with_clock(
+        &mut self,
+        rgba: Option<&[u8]>,
+        budget: usize,
         mut submit: impl FnMut(Rectangle, &[u8]) -> io::Result<usize>,
+        mut now: impl FnMut() -> Instant,
     ) -> io::Result<bool> {
         if self.failed {
             return Err(io::Error::other("native presentation already failed"));
@@ -108,11 +121,11 @@ impl PendingPresentation {
             if self.left == self.info.width {
                 return Ok(true);
             }
-            if Instant::now() >= self.deadline {
+            if now() >= self.deadline {
                 self.failed = true;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "native presentation deadline",
+                    "native presentation stalled",
                 ));
             }
             let columns = (self.info.width - self.left).min(self.tile.len() as u32 / 4);
@@ -157,6 +170,10 @@ impl PendingPresentation {
                         self.top = 0;
                         self.left += columns;
                     }
+                    // A whole frame can span many event-loop turns under
+                    // load. Renew only after the native ABI reports that this
+                    // tile completed; retries and dispatches are not progress.
+                    self.deadline = now() + STALL_TIMEOUT;
                 }
                 Err(err)
                     if matches!(
@@ -182,6 +199,7 @@ impl PendingPresentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn info() -> DisplayInfo {
         DisplayInfo {
@@ -195,6 +213,92 @@ mod tests {
     }
     fn pixels() -> Vec<u8> {
         (0..18).flat_map(|i| [i, i + 20, i + 40, 255]).collect()
+    }
+
+    #[test]
+    fn completed_tiles_refresh_stall_watchdog_beyond_total_five_seconds() {
+        // The same cursor drives ordinary pixels and the session-lock blank.
+        for black in [false, true] {
+            let start = Instant::now();
+            let now = Cell::new(start);
+            let mut pending = PendingPresentation::new(info(), false).unwrap();
+            pending.deadline = start + Duration::from_secs(5);
+            let rgba = pixels();
+            let mut calls = 0;
+            for tile in 1..=5 {
+                let done = pending
+                    .advance_pixels_with_clock(
+                        (!black).then_some(rgba.as_slice()),
+                        1,
+                        |_, bytes| {
+                            calls += 1;
+                            if black {
+                                assert!(bytes.iter().all(|byte| *byte == 0));
+                            }
+                            // Genuine completion every four seconds; the full
+                            // frame takes twenty, without a five-second stall.
+                            now.set(now.get() + Duration::from_secs(4));
+                            Ok(0)
+                        },
+                        || now.get(),
+                    )
+                    .unwrap();
+                assert_eq!(calls, tile);
+                assert_eq!(done, tile == 5, "partial frame was reported complete");
+            }
+            assert_eq!(now.get().duration_since(start), Duration::from_secs(20));
+        }
+    }
+
+    #[test]
+    fn busy_and_interrupted_attempts_do_not_refresh_stall_watchdog() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            let start = Instant::now();
+            let now = Cell::new(start);
+            let mut pending = PendingPresentation::new(info(), false).unwrap();
+            pending.deadline = start + Duration::from_secs(5);
+            let rgba = pixels();
+            let cursor = (pending.left, pending.top);
+            for second in [1, 2, 3, 4] {
+                now.set(start + Duration::from_secs(second));
+                let mut attempts = 0;
+                assert!(!pending
+                    .advance_pixels_with_clock(Some(&rgba), 16, |_, _| {
+                        attempts += 1;
+                        Err(kind.into())
+                    }, || now.get())
+                    .unwrap());
+                assert_eq!(attempts, 1);
+                assert_eq!((pending.left, pending.top), cursor);
+            }
+            // No completed tile in five seconds: no syscall at the deadline.
+            now.set(start + Duration::from_secs(5));
+            assert_eq!(pending
+                .advance_pixels_with_clock(Some(&rgba), 16, |_, _| panic!("expired cursor submitted"), || now.get())
+                .unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert!(pending
+                .advance_pixels_with_clock(Some(&rgba), 1, |_, _| panic!("timed-out cursor revived"), || now.get())
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn permanent_failure_is_terminal_despite_later_clock_or_progress_opportunity() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let mut pending = PendingPresentation::new(info(), false).unwrap();
+        pending.deadline = start + Duration::from_secs(5);
+        let rgba = pixels();
+        assert!(!pending
+            .advance_pixels_with_clock(Some(&rgba), 1, |_, _| Ok(0), || now.get())
+            .unwrap());
+        assert_eq!(pending
+            .advance_pixels_with_clock(Some(&rgba), 1, |_, _| Err(io::Error::from_raw_os_error(19)), || now.get())
+            .unwrap_err().raw_os_error(), Some(19));
+        now.set(start + Duration::from_secs(30));
+        assert!(pending
+            .advance_pixels_with_clock(Some(&rgba), 16, |_, _| panic!("failed cursor revived"), || now.get())
+            .is_err());
     }
 
     #[test]

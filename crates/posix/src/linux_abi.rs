@@ -30,8 +30,10 @@ pub enum Call {
     Fchmod,
     Fchmodat,
     Fcntl,
+    Fdatasync,
     Flock,
     Fstat,
+    Fsync,
     Ftruncate,
     Futex,
     Getcwd,
@@ -173,6 +175,10 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
                 args = [at, args[0], args[1], args[2], 0, 0];
                 Some(Call::Readlinkat)
             }
+            90 => {
+                args = [at, args[0], args[1], 0, 0, 0];
+                Some(Call::Fchmodat)
+            }
             213 => {
                 // Legacy epoll_create takes a signed C int, not a u64 size.
                 if (args[0] as i32) <= 0 {
@@ -240,6 +246,8 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             73 => Call::Ppoll,
             79 => Call::Newfstatat,
             80 => Call::Fstat,
+            82 => Call::Fsync,
+            83 => Call::Fdatasync,
             85 => Call::TimerfdCreate,
             86 => Call::TimerfdSettime,
             87 => Call::TimerfdGettime,
@@ -349,6 +357,8 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             63 => Call::Uname,
             72 => Call::Fcntl,
             73 => Call::Flock,
+            74 => Call::Fsync,
+            75 => Call::Fdatasync,
             77 => Call::Ftruncate,
             79 => Call::Getcwd,
             80 => Call::Chdir,

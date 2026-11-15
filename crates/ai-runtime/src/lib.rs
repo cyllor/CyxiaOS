@@ -869,6 +869,22 @@ pub fn user_dispatch_policy(
     if candidates.len() > 8 {
         return Err(Error::Invalid);
     }
+    Ok(rank_user_candidates(candidates))
+}
+
+/// The full-OS thread context pool has sixteen slots. Candidate count is not
+/// a feature of the per-candidate CPU model: reuse its unchanged ranking and
+/// starvation guard while keeping the separate process selector bounded to 8.
+pub fn full_os_thread_dispatch_policy(
+    candidates: &[Option<UserCandidate>],
+) -> Result<Option<UserDispatch>, Error> {
+    if candidates.len() > 16 {
+        return Err(Error::Invalid);
+    }
+    Ok(rank_user_candidates(candidates))
+}
+
+fn rank_user_candidates(candidates: &[Option<UserCandidate>]) -> Option<UserDispatch> {
     let oldest = candidates.iter().flatten().map(|c| c.waiting_ms).max();
     let guard = oldest.is_some_and(|age| age >= 100);
     let mut best: Option<(usize, i32, u64)> = None;
@@ -890,7 +906,7 @@ pub fn user_dispatch_policy(
             best = Some((index, score, candidate.waiting_ms));
         }
     }
-    Ok(best.map(|(index, _, _)| UserDispatch {
+    best.map(|(index, _, _)| UserDispatch {
         index,
         source: if guard {
             DecisionSource::SafetyGuard
@@ -898,5 +914,5 @@ pub fn user_dispatch_policy(
             DecisionSource::AiDirect
         },
         model: model::CPU_ID,
-    }))
+    })
 }

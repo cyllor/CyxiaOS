@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -124,7 +125,18 @@ def inspect_source(cache, source):
 
 
 def directory_bytes(root):
-    return sum(p.stat().st_size for p in Path(root).rglob('*') if p.is_file() and not p.is_symlink())
+    total = 0
+    for path in Path(root).rglob('*'):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            # Configure/compiler scratch files can disappear after enumeration.
+            # Their bytes are no longer present; other inspection errors remain
+            # failures, and every surviving regular file still counts.
+            continue
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+    return total
 
 
 def resource_check(root, min_free, max_bytes):

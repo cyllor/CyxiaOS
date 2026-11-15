@@ -28,7 +28,11 @@ pub const BACKLOG_MAX: usize = 8;
 pub fn linux_listen_backlog(raw: u64) -> usize {
     (raw as u32 as usize).clamp(1, BACKLOG_MAX)
 }
-const GENERATION_MAX: u64 = u64::MAX >> 8;
+// Pathname socket inodes occupy the high-half namespace rather than the small
+// RAMFS and boot-asset inode identities. Retire endpoint slots before their raw
+// identity could consume the tag bit, preserving uniqueness without masking.
+const PATHNAME_INODE_TAG: u64 = 1 << 63;
+const GENERATION_MAX: u64 = (PATHNAME_INODE_TAG - 1) >> 8;
 
 /// Opaque endpoint identity, not a Unix file descriptor. The low byte is a slot;
 /// upper bits are a nonzero generation. Raw values are always revalidated with
@@ -103,6 +107,8 @@ impl Pathname {
 struct Binding {
     path: Pathname,
     target: Option<Handle>,
+    inode: u64,
+    mode: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -447,6 +453,17 @@ impl UnixSockets {
     }
 
     pub fn bind(&mut self, owner: u32, handle: Handle, path: &[u8]) -> Result<(), Errno> {
+        self.bind_with_umask(owner, handle, path, 0)
+    }
+    /// Capture creation permissions with the binding. Abstract addresses have
+    /// no filesystem permissions; their mode is never exposed or consulted.
+    pub fn bind_with_umask(
+        &mut self,
+        owner: u32,
+        handle: Handle,
+        path: &[u8],
+        umask: u16,
+    ) -> Result<(), Errno> {
         let mut endpoint = self.owned(owner, handle)?;
         if endpoint.bound || !matches!(endpoint.kind, Kind::Unconnected) {
             return Err(Errno::Inval);
@@ -468,10 +485,56 @@ impl UnixSockets {
         self.bindings[slot] = Some(Binding {
             path,
             target: Some(handle),
+            inode: PATHNAME_INODE_TAG | handle.raw(),
+            mode: 0o777 & !umask,
         });
         endpoint.bound = true;
         endpoint.name = Some(path);
         self.endpoints[handle.slot()].endpoint = Some(endpoint);
+        Ok(())
+    }
+
+    /// The kernel authorizes real directory traversal before this lookup.
+    /// A closed listener leaves its inode and mode until explicit unlink.
+    pub fn pathname_stat(&self, path: &[u8]) -> Result<crate::FileInfo, Errno> {
+        if path == b"/" {
+            return Err(Errno::Noent);
+        }
+        let path = Pathname::parse(path)?;
+        if path.bytes[0] == 0 {
+            return Err(Errno::Noent);
+        }
+        let binding = self
+            .bindings
+            .iter()
+            .flatten()
+            .find(|binding| binding.path == path)
+            .ok_or(Errno::Noent)?;
+        Ok(crate::FileInfo {
+            inode: binding.inode,
+            size: 0,
+            mode: 0o140000 | u32::from(binding.mode),
+            links: 1,
+        })
+    }
+
+    /// All filesystem objects currently have UID 0. The kernel authenticates
+    /// that domain and path traversal; this mechanism stores the actual mode.
+    pub fn pathname_chmod(&mut self, path: &[u8], mode: u16) -> Result<(), Errno> {
+        if path == b"/" {
+            return Err(Errno::Noent);
+        }
+        let path = Pathname::parse(path)?;
+        if path.bytes[0] == 0 {
+            return Err(Errno::Noent);
+        }
+        let binding = self
+            .bindings
+            .iter_mut()
+            .flatten()
+            .find(|binding| binding.path == path)
+            .ok_or(Errno::Noent)?;
+        binding.mode = mode & 0o7777;
         Ok(())
     }
 
@@ -540,6 +603,11 @@ impl UnixSockets {
             .flatten()
             .find(|binding| binding.path == path)
             .ok_or(Errno::Noent)?;
+        // Match the implemented file domain's UID 0 owner-bit policy. PID
+        // capability ownership is separate from filesystem user credentials.
+        if path.bytes[0] != 0 && binding.mode & 0o200 == 0 {
+            return Err(Errno::Access);
+        }
         let listener_handle = binding.target.ok_or(Errno::Connrefused)?;
         let mut listener = self.live(listener_handle).map_err(|_| Errno::Connrefused)?;
         let Kind::Listening(mut pending) = listener.kind else {

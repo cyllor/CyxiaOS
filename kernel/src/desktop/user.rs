@@ -107,6 +107,8 @@ enum Wait {
     #[cfg(feature = "ported")]
     Retry(u64),
     #[cfg(feature = "ported")]
+    Checkpoint(u64),
+    #[cfg(feature = "ported")]
     TimerRead {
         descriptor: i32,
         identity: u64,
@@ -719,6 +721,22 @@ impl Runner {
             #[cfg(feature = "ported")]
             Some(Wait::Retry(until)) => time >= until,
             #[cfg(feature = "ported")]
+            Some(Wait::Checkpoint(generation)) => {
+                // The caller owns this staged generation, not the current FD
+                // number. Only the second completed device FLUSH permits 0.
+                match super::storage::checkpoint_complete(generation) {
+                    Ok(_) => {
+                        self.thread.context.set_result(0);
+                        true
+                    }
+                    Err(Errno::Again) => false,
+                    Err(error) => {
+                        self.thread.context.set_result((-(error as i64)) as u64);
+                        true
+                    }
+                }
+            }
+            #[cfg(feature = "ported")]
             Some(Wait::TimerRead {
                 descriptor,
                 identity,
@@ -1061,6 +1079,10 @@ impl Supervisor {
             "gtk-probe"
         } else if matches!(name, "pcmanfm-desktop" | "pcmanfm-home") {
             "pcmanfm"
+        } else if matches!(name, "fsync-verify" | "fsync-root") {
+            "fsync-probe"
+        } else if matches!(name, "fsync-concurrent" | "fsync-interrupt" | "fsync-reuse" | "fsync-admitted-interrupt" | "fsync-concurrent-verify") {
+            "fsync-concurrent-probe"
         } else if name == "heap-pool-hold" {
             "heap-pool-probe"
         } else if name == "thread-exit-bad-stack" {
@@ -1087,7 +1109,7 @@ impl Supervisor {
         // Read-only boot assets retain their bytes in kernel ROM mappings.
         // Directories use the real RAM filesystem and its ordinary AI admission.
         let mut directories = Process::empty(objects::table(), 0);
-        for path in ["/tmp", "/var", "/var/log"]
+        for path in ["/dev", "/tmp", "/var", "/var/log"]
             .into_iter()
             .chain(ROOT_FILES.iter().map(|(path, _)| *path))
         {
@@ -1098,7 +1120,7 @@ impl Supervisor {
                 }
             }
             if !ROOT_FILES.iter().any(|(file, _)| *file == path) {
-                match directories.mkdir(fs, path, 0o777) {
+                match directories.mkdir(fs, path, if path == "/dev" { 0o755 } else { 0o777 }) {
                     Ok(()) | Err(Errno::Exist) => {}
                     Err(error) => return Err(error),
                 }
@@ -1108,7 +1130,10 @@ impl Supervisor {
             let path = cyxia_ai_fs::Path::resolve(cyxia_ai_fs::Path::ROOT, path)?;
             fs.register_boot_file(path)?;
         }
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "flock-probe");
+        fs.register_boot_file(cyxia_ai_fs::Path::resolve(
+            cyxia_ai_fs::Path::ROOT, "/dev/null",
+        )?)?;
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1129,6 +1154,7 @@ impl Supervisor {
         let session_environment: &[&[u8]] = &[
             b"PATH=/bin", b"LANG=C", b"TZ=UTC", b"HOME=/",
             cyxia_posix::runtime_directory::ENVIRONMENT,
+            b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
         ];
         let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
         // Fixture roles select a workload, never the authenticated Wayland
@@ -1179,6 +1205,17 @@ impl Supervisor {
             b"--config-file",
             b"/etc/xdg/openbox/rc.xml",
         ];
+        let dbus_daemon_argv: &[&[u8]] = &[path.as_bytes(), b"--nofork", b"--nopidfile",
+            b"--print-address", b"--config-file=/etc/dbus-1/session.conf"];
+        let dbus_send_argv: &[&[u8]] = &[path.as_bytes(), b"--session", b"--print-reply",
+            b"--dest=org.freedesktop.DBus", b"/org/freedesktop/DBus", b"org.freedesktop.DBus.ListNames"];
+        let dbus_uuid_argv: &[&[u8]] = &[path.as_bytes(), b"--ensure=/etc/machine-id"];
+        let fsync_argv: &[&[u8]] = &[path.as_bytes(), match name {
+            "fsync-verify" => b"verify", "fsync-root" => b"sync-root",
+            "fsync-concurrent" => b"concurrent", "fsync-interrupt" => b"interrupt",
+            "fsync-admitted-interrupt" => b"admitted-interrupt",
+            "fsync-reuse" => b"reuse", "fsync-concurrent-verify" => b"verify", _ => b"",
+        }];
         let heap_hold_argv: &[&[u8]] = &[path.as_bytes(), b"hold"];
         let bad_stack_argv: &[&[u8]] = &[path.as_bytes(), b"bad-stack"];
         let egl_x11_argv: &[&[u8]] = &[path.as_bytes(), b"x11"];
@@ -1188,10 +1225,18 @@ impl Supervisor {
             &plan,
             super::exec_memory::StackInput {
                 random,
-                argv: if name == "heap-pool-hold" {
+                argv: if matches!(name, "fsync-verify" | "fsync-root" | "fsync-concurrent" | "fsync-interrupt" | "fsync-reuse" | "fsync-admitted-interrupt" | "fsync-concurrent-verify") {
+                    fsync_argv
+                } else if name == "heap-pool-hold" {
                     heap_hold_argv
                 } else if name == "thread-exit-bad-stack" {
                     bad_stack_argv
+                } else if image_name == "dbus-daemon" {
+                    dbus_daemon_argv
+                } else if image_name == "dbus-send" {
+                    dbus_send_argv
+                } else if image_name == "dbus-uuidgen" {
+                    dbus_uuid_argv
                 } else if image_name == "cosmic-comp" {
                     cosmic_argv
                 } else if name == "xorg" {

@@ -11,6 +11,97 @@ fn listener(sockets: &mut UnixSockets, owner: u32, name: &[u8], backlog: usize) 
 }
 
 #[test]
+fn pathname_metadata_and_chmod_survive_listener_close_until_unlink() {
+    let mut sockets = UnixSockets::new();
+    let server = listener(&mut sockets, 1, b"/bus", 1);
+    let initial = sockets.pathname_stat(b"/bus").unwrap();
+    assert_eq!(initial.mode, 0o140777);
+    assert_eq!(initial.size, 0);
+    assert_eq!(initial.links, 1);
+    assert_ne!(initial.inode & (1 << 63), 0);
+    sockets.pathname_chmod(b"/bus", 0o660).unwrap();
+    sockets.close(1, server).unwrap();
+    let closed = sockets.pathname_stat(b"/bus").unwrap();
+    assert_eq!(closed.inode, initial.inode);
+    assert_eq!(closed.mode, 0o140660);
+    sockets.pathname_chmod(b"/bus", 0o600).unwrap();
+    assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140600);
+    let client = sockets.socket(2).unwrap();
+    assert_eq!(sockets.connect(2, client, b"/bus"), Err(Errno::Connrefused));
+    assert_eq!(sockets.bind(2, client, b"/bus"), Err(Errno::Addrinuse));
+    sockets.unlink(b"/bus").unwrap();
+    assert_eq!(sockets.pathname_stat(b"/bus"), Err(Errno::Noent));
+    assert_eq!(sockets.pathname_chmod(b"/bus", 0o777), Err(Errno::Noent));
+    sockets.bind(2, client, b"/bus").unwrap();
+    assert_ne!(sockets.pathname_stat(b"/bus").unwrap().inode, initial.inode);
+}
+
+#[test]
+fn pathname_lookup_absence_allows_real_filesystem_fallback() {
+    let mut sockets = UnixSockets::new();
+    for path in [b"/".as_slice(), b"/ordinary", b"/missing/file"] {
+        assert_eq!(sockets.pathname_stat(path), Err(Errno::Noent));
+        assert_eq!(sockets.pathname_chmod(path, 0o755), Err(Errno::Noent));
+    }
+    let endpoint = sockets.socket(1).unwrap();
+    assert_eq!(sockets.bind(1, endpoint, b"/"), Err(Errno::Inval));
+}
+
+#[test]
+fn pathname_mode_controls_new_connections_without_changing_live_streams() {
+    let mut sockets = UnixSockets::new();
+    let server = listener(&mut sockets, 1, b"/bus", 1);
+    let client = sockets.socket(2).unwrap();
+    sockets.pathname_chmod(b"/bus", 0o002).unwrap();
+    let before = sockets.capacity();
+    // Every process has UID 0 in this implementation, so the owner permission
+    // bits apply independently of the endpoint's PID capability owner.
+    assert_eq!(sockets.connect(2, client, b"/bus"), Err(Errno::Access));
+    assert_eq!(sockets.capacity(), before);
+    sockets.pathname_chmod(b"/bus", 0o200).unwrap();
+    sockets.connect(2, client, b"/bus").unwrap();
+    let accepted = sockets.accept(1, server).unwrap();
+    sockets.pathname_chmod(b"/bus", 0).unwrap();
+    assert_eq!(sockets.write(2, client, b"live"), Ok(4));
+    let mut bytes = [0; 4];
+    assert_eq!(sockets.read(1, accepted, &mut bytes), Ok(4));
+    assert_eq!(&bytes, b"live");
+}
+
+#[test]
+fn abstract_sockets_have_no_path_metadata_or_mode_permissions() {
+    let mut sockets = UnixSockets::new();
+    let server = sockets.socket(1).unwrap();
+    sockets.bind_with_umask(1, server, b"\0bus", 0o777).unwrap();
+    sockets.listen(1, server, 1).unwrap();
+    assert_eq!(sockets.pathname_stat(b"\0bus"), Err(Errno::Noent));
+    assert_eq!(sockets.pathname_chmod(b"\0bus", 0), Err(Errno::Noent));
+    let client = sockets.socket(2).unwrap();
+    sockets.connect(2, client, b"\0bus").unwrap();
+    sockets.close(1, server).unwrap();
+    let replacement = sockets.socket(3).unwrap();
+    sockets.bind(3, replacement, b"\0bus").unwrap();
+}
+
+#[test]
+fn bind_snapshots_process_umask_without_consuming_or_reapplying_it() {
+    use cyxia_posix::{OpenDescriptions, Process};
+    let objects = OpenDescriptions::new();
+    let mut process = Process::new(&objects, 1).unwrap();
+    assert_eq!(process.current_umask(), 0o022);
+    assert_eq!(process.umask(0o1077), 0o022);
+    assert_eq!(process.current_umask(), 0o077);
+    let mut sockets = UnixSockets::new();
+    let server = sockets.socket(1).unwrap();
+    sockets.bind_with_umask(1, server, b"/bus", process.current_umask()).unwrap();
+    assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140700);
+    process.umask(0o777);
+    assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140700);
+    sockets.pathname_chmod(b"/bus", 0o777).unwrap();
+    assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140777);
+}
+
+#[test]
 fn pathname_connection_is_full_duplex_and_ready_before_accept() {
     let mut sockets = UnixSockets::new();
     let server = listener(&mut sockets, 10, b"/tmp/.X11-unix/X0", 2);

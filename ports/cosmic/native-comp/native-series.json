@@ -17,7 +17,7 @@
     },
     {
       "manifest": "ports/cosmic/native-comp/backend-patch.json",
-      "manifest_sha256": "3ff6d1b2f716314c3605f603755632aed3795c987281537a6e14944966e388d5",
+      "manifest_sha256": "5ddcda5b9496d6ce690b8abc24313c8d676bd2394d68aaedda71da34fe410964",
       "patch": "ports/cosmic/patches/cosmic-comp-native-backend.patch"
     }
   ]

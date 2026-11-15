@@ -12,6 +12,44 @@ from tools import build_cosmic as build
 
 
 class CosmicBuildTests(unittest.TestCase):
+    def test_budget_scan_tolerates_removed_scratch_without_omitting_live_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            stable = root / 'live.o'
+            stable.write_bytes(b'x' * 32)
+            temporary = root / 'conftest.err'
+            temporary.write_bytes(b'transient compiler diagnostic')
+            (root / 'alias').symlink_to(stable)
+            original_lstat = Path.lstat
+
+            def disappears(path, *args, **kwargs):
+                if path == temporary:
+                    temporary.unlink(missing_ok=True)
+                return original_lstat(path, *args, **kwargs)
+
+            # Reproduce a compiler unlink between enumeration and inspection.
+            # The old is_file/is_symlink/stat sequence leaks FileNotFoundError.
+            with patch.object(Path, 'lstat', disappears):
+                self.assertEqual(build.directory_bytes(root), 32)
+            with self.assertRaisesRegex(build.CosmicBuildError, 'byte budget'):
+                build.resource_check(root, 0, 31)
+
+    def test_budget_scan_does_not_swallow_permission_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            denied = root / 'unreadable.o'
+            denied.write_bytes(b'counting must not silently omit this')
+            original_lstat = Path.lstat
+
+            def inaccessible(path, *args, **kwargs):
+                if path == denied:
+                    raise PermissionError('budget inspection denied')
+                return original_lstat(path, *args, **kwargs)
+
+            with patch.object(Path, 'lstat', inaccessible):
+                with self.assertRaises(PermissionError):
+                    build.directory_bytes(root)
+
     def test_recipe_rejects_unbound_native_link_inputs(self):
         source = {'name': 'fixture', 'commit': 'a' * 40}
         recipe = {'schema_version': 1, 'component': 'fixture', 'commit': source['commit'],

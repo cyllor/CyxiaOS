@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dbus": {
+    "name": "dbus",
+    "version": "1.16.4",
+    "source_url": "https://dbus.freedesktop.org/releases/dbus/dbus-1.16.4.tar.xz",
+    "expected_sha256": "d08b05526c2cb7966a5fb79210d6112b1aca3d135f315c1b302e14b4b0297dac",
+    "hash_source": "https://dbus.freedesktop.org/releases/dbus/dbus-1.16.4.tar.xz.sha256sum",
+    "source_commit": null,
+    "archive_root": "dbus-1.16.4",
+    "license_file": "COPYING",
+    "license_description": "Preserve COPYING and LICENSES; libdbus is AFL-2.1 or GPL-2.0-or-later, and dbus-uuidgen is GPL-2.0-or-later.",
+    "depends_on": ["expat"]
+  },
+  "expat_source_manifest": "ports/libc/openbox-fonts.json",
+  "session_config": "ports/dbus/session.conf",
+  "scope": "Real upstream static daemon and clients for the existing single-UID session. Service activation is disabled. No system bus, COSMIC session, panel, or guest execution proof is claimed by the build."
+}

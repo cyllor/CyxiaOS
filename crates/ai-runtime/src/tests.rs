@@ -724,3 +724,47 @@ fn eight_dispatch_candidates_keep_model_ranking_ties_and_starvation_guard() {
     assert_eq!(selected.index, 7);
     assert_eq!(selected.source, DecisionSource::SafetyGuard);
 }
+
+#[test]
+fn full_os_thread_dispatch_reaches_sixteenth_slot_without_changing_process_limit() {
+    let cpu = UserCandidate {
+        waiting_ms: 1,
+        cpu_bound: true,
+    };
+    let mut candidates = [Some(cpu); 16];
+    candidates[15] = Some(UserCandidate {
+        cpu_bound: false,
+        ..cpu
+    });
+    let selected = full_os_thread_dispatch_policy(&candidates).unwrap().unwrap();
+    assert_eq!(selected.index, 15);
+    assert_eq!(selected.source, DecisionSource::AiDirect);
+    assert_eq!(selected.model, 12289);
+    candidates[14] = candidates[15];
+    assert_eq!(
+        full_os_thread_dispatch_policy(&candidates).unwrap().unwrap().index,
+        14
+    );
+    candidates[15] = Some(UserCandidate {
+        waiting_ms: 100,
+        ..cpu
+    });
+    let selected = full_os_thread_dispatch_policy(&candidates).unwrap().unwrap();
+    assert_eq!(selected.index, 15);
+    assert_eq!(selected.source, DecisionSource::SafetyGuard);
+    assert_eq!(selected.model, 12289);
+    assert!(full_os_thread_dispatch_policy(&[None; 16]).unwrap().is_none());
+    assert!(full_os_thread_dispatch_policy(&[]).unwrap().is_none());
+    assert_eq!(full_os_thread_dispatch_policy(&[None; 17]), Err(Error::Invalid));
+    assert_eq!(user_dispatch_policy(&[None; 9]), Err(Error::Invalid));
+}
+
+#[test]
+fn full_os_thread_context_pages_keep_the_existing_two_page_reserve() {
+    // Eighteen actual context/shared/spare pages, with the leader already live.
+    // Fifteen more one-page admissions stop at the existing two-page floor.
+    for free in 3..=17 {
+        assert_eq!(user_memory_policy(free, 1), Ok((true, 8193)));
+    }
+    assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
+}

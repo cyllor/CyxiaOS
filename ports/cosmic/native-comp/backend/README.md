@@ -26,6 +26,11 @@ screen filter and cursor. CPU readback waits for the rendering fence, then
 retains Smithay's real `GlesMapping` while a resumable cursor submits at most
 16 native XRGB tiles per timer dispatch. EAGAIN and EINTR return immediately
 to the event loop. No display-busy sleep blocks input or Wayland dispatch.
+The cursor fails after five seconds without a completed tile. Only a successful
+native tile completion renews this watchdog; EAGAIN, EINTR and timer dispatches
+do not. A progressing frame may take longer than five seconds in total. The
+same watchdog applies to session-lock blanking, whose acknowledgment still
+requires completion of every black tile.
 Failed partial presentation does not send frame callbacks or presented
 feedback. Presentation requests are captured before the first yield, so a
 newer commit is never reported as the older submitted frame.

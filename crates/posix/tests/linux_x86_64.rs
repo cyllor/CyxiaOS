@@ -1,6 +1,43 @@
 use cyxia_posix::ImageAbi;
 use cyxia_posix::linux_abi::{self, Call};
 #[test]
+fn x86_legacy_chmod_normalizes_to_the_real_fchmodat_operation() {
+    let path = 0x4000_1000;
+    let mode = 0o777;
+    let legacy = linux_abi::decode(ImageAbi::X86_64, 90, [path, mode, 9, 8, 7, 6]).unwrap();
+    assert_eq!(legacy.call, Call::Fchmodat);
+    assert_eq!(legacy.args, [(-100i64) as u64, path, mode, 0, 0, 0]);
+    for (abi, number) in [(ImageAbi::X86_64, 268), (ImageAbi::Aarch64, 53)] {
+        let args = [7, path, mode, 0, 0, 0];
+        let at = linux_abi::decode(abi, number, args).unwrap();
+        assert_eq!(at.call, Call::Fchmodat);
+        assert_eq!(at.args, args);
+    }
+}
+
+#[test]
+fn durable_file_calls_use_each_linux_isa_number_and_preserve_the_descriptor() {
+    for (abi, fsync, fdatasync) in [
+        (ImageAbi::X86_64, 74, 75),
+        (ImageAbi::Aarch64, 82, 83),
+    ] {
+        for (number, call) in [(fsync, Call::Fsync), (fdatasync, Call::Fdatasync)] {
+            for descriptor in [7, u64::MAX] {
+                let args = [descriptor, 0, 0, 0, 0, 0];
+                let invocation = linux_abi::decode(abi, number, args).unwrap();
+                assert_eq!(invocation.call, call);
+                assert_eq!(invocation.args, args);
+            }
+        }
+    }
+    // x86's legacy rename shares ARM's fsync number. Preserve its existing
+    // pathname normalization rather than confusing the two ABI operations.
+    let rename = linux_abi::decode(ImageAbi::X86_64, 82, [11, 22, 0, 0, 0, 0]).unwrap();
+    assert_eq!(rename.call, Call::Renameat);
+    assert_eq!(rename.args[..4], [(-100i64) as u64, 11, (-100i64) as u64, 22]);
+}
+
+#[test]
 fn inotify_uses_isa_numbers_and_legacy_init_has_no_flags() {
     for (abi, numbers) in [
         (ImageAbi::X86_64, [294, 254, 255]),

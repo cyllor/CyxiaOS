@@ -34,6 +34,7 @@ pub enum Errno {
     Srch = 3,
     Intr = 4,
     Io = 5,
+    Nxio = 6,
     Badf = 9,
     Child = 10,
     Again = 11,
@@ -60,6 +61,8 @@ pub enum Errno {
     Notempty = 39,
     Loop = 40,
     Overflow = 75,
+    Noprotoopt = 92,
+    Opnotsupp = 95,
     Addrinuse = 98,
     Nobufs = 105,
     Isconn = 106,
@@ -132,6 +135,16 @@ pub struct FileInfo {
     pub mode: u32,
     pub links: u32,
 }
+/// This bounded device namespace contains one immutable entry, not a mutable
+/// devtmpfs. Ordinary directory traversal and parent permissions still apply.
+pub const NULL_DEVICE_PATH: &str = "/dev/null";
+/// Metadata for the built-in null device, shared by descriptor and path stat.
+pub const NULL_DEVICE_INFO: FileInfo = FileInfo {
+    inode: 0,
+    size: 0,
+    mode: 0o20666,
+    links: 1,
+};
 /// A process owns descriptor table entries; the shared store owns descriptions.
 /// Drop is deliberately not implicit: callers must close_all with the filesystem
 /// and execute the returned backend releases before reusing a process slot.
@@ -153,7 +166,11 @@ impl<'a> Process<'a> {
         }
     }
     pub fn chmod(&mut self, fs: &mut FileSystem, path: &str, mode: u16) -> Result<(), Errno> {
-        fs.set_mode(self.path(fs, path)?, mode).map_err(Into::into)
+        let path = self.path(fs, path)?;
+        if path.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Rofs);
+        }
+        fs.set_mode(path, mode).map_err(Into::into)
     }
     pub fn resolved_path(&self, fs: &FileSystem, path: &str) -> Result<Path, Errno> {
         self.path(fs, path)
@@ -165,6 +182,9 @@ impl<'a> Process<'a> {
     /// Inspect a path immediately after `path_at` or `resolved_path` authorized
     /// its traversal. Do not restart at root: a directory FD is the lookup base.
     pub fn stat_resolved(&self, fs: &FileSystem, path: Path) -> Result<FileInfo, Errno> {
+        if path.as_str() == NULL_DEVICE_PATH {
+            return Ok(NULL_DEVICE_INFO);
+        }
         let info = fs.stat(path)?;
         Ok(FileInfo {
             inode: fs.identity(path)?,
@@ -244,13 +264,50 @@ impl<'a> Process<'a> {
                 mode: 0o20600,
                 links: 1,
             },
-            Object::Null | Object::Output => FileInfo {
+            Object::Null => NULL_DEVICE_INFO,
+            Object::Output => FileInfo {
                 inode: 0,
                 size: 0,
                 mode: 0o20600,
                 links: 1,
             },
         })
+    }
+    /// Open the built-in character device. It owns no filesystem inode and
+    /// uses the existing EOF/discard backend, never a writable regular file.
+    pub fn open_null(&mut self, flags: u32) -> Result<i32, Errno> {
+        let known = 3
+            | O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_APPEND
+            | O_NONBLOCK
+            | O_CLOEXEC
+            | O_DIRECTORY
+            | O_NOFOLLOW;
+        if flags & !known != 0 || flags & 3 == 3 {
+            return Err(Errno::Inval);
+        }
+        if flags & O_DIRECTORY != 0 {
+            return Err(Errno::Notdir);
+        }
+        if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
+            return Err(Errno::Exist);
+        }
+        let fd = self.free_fd()?;
+        let slot = self.objects.free_slots::<1>()?[0];
+        self.objects.create(
+            slot,
+            self.owner,
+            Description {
+                object: Object::Null,
+                offset: 0,
+                flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
+            },
+        )?;
+        self.fds[fd] = Some(slot);
+        self.cloexec[fd] = flags & O_CLOEXEC != 0;
+        Ok(fd as i32)
     }
     pub fn open_readonly(
         &mut self,
@@ -349,6 +406,9 @@ impl<'a> Process<'a> {
         let old = self.mask;
         self.mask = mask & 0o777;
         old
+    }
+    pub fn current_umask(&self) -> u16 {
+        self.mask
     }
     fn description(&self, fd: i32) -> Result<Handle, Errno> {
         self.fds
@@ -623,6 +683,9 @@ impl<'a> Process<'a> {
         if create {
             self.change_parent(fs, p)?;
         }
+        if p.as_str() == NULL_DEVICE_PATH {
+            return Err(if create { Errno::Addrinuse } else { Errno::Connrefused });
+        }
         if fs.stat(p).is_ok() {
             return Err(Errno::Addrinuse);
         }
@@ -641,6 +704,9 @@ impl<'a> Process<'a> {
         }
         let mut p = if s.starts_with('/') { Path::ROOT } else { base };
         for component in s.split('/').filter(|c| !c.is_empty()) {
+            if p.as_str() == NULL_DEVICE_PATH {
+                return Err(Errno::Notdir);
+            }
             let parent = fs.stat(p)?;
             if parent.kind != Kind::Directory {
                 return Err(Errno::Notdir);
@@ -650,7 +716,9 @@ impl<'a> Process<'a> {
             }
             p = Path::resolve(p, component)?;
         }
-        if s.ends_with('/') && fs.stat(p)?.kind != Kind::Directory {
+        if s.ends_with('/')
+            && (p.as_str() == NULL_DEVICE_PATH || fs.stat(p)?.kind != Kind::Directory)
+        {
             return Err(Errno::Notdir);
         }
         Ok(p)
@@ -703,6 +771,9 @@ impl<'a> Process<'a> {
         flags: u32,
         mode: u16,
     ) -> Result<i32, Errno> {
+        if p.as_str() == NULL_DEVICE_PATH {
+            return self.open_null(flags);
+        }
         let known = 3
             | O_CREAT
             | O_EXCL
@@ -1020,6 +1091,9 @@ impl<'a> Process<'a> {
     pub fn unlink(&mut self, fs: &mut FileSystem, path: &str) -> Result<(), Errno> {
         let p = self.path(fs, path)?;
         self.change_parent(fs, p)?;
+        if p.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Rofs);
+        }
         fs.remove(p, false)?;
         Ok(())
     }
@@ -1034,6 +1108,9 @@ impl<'a> Process<'a> {
     ) -> Result<(), Errno> {
         self.change_parent(fs, from)?;
         self.change_parent(fs, to)?;
+        if from.as_str() == NULL_DEVICE_PATH || to.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Rofs);
+        }
         fs.rename_file(from, to, no_replace)?;
         Ok(())
     }
@@ -1044,6 +1121,9 @@ impl<'a> Process<'a> {
         }
         let p = self.path(fs, path.trim_end_matches('/'))?;
         self.change_parent(fs, p)?;
+        if p.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Exist);
+        }
         fs.mkdir_with_mode(p, mode & !self.mask)?;
         Ok(())
     }
@@ -1052,6 +1132,9 @@ impl<'a> Process<'a> {
             return Err(Errno::Inval);
         }
         let p = self.path(fs, path)?;
+        if p.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Notdir);
+        }
         if p == Path::ROOT || p == self.cwd {
             return Err(Errno::Busy);
         }
@@ -1061,6 +1144,9 @@ impl<'a> Process<'a> {
     }
     pub fn chdir(&mut self, fs: &FileSystem, path: &str) -> Result<(), Errno> {
         let p = self.path(fs, path)?;
+        if p.as_str() == NULL_DEVICE_PATH {
+            return Err(Errno::Notdir);
+        }
         let e = fs.stat(p)?;
         if e.kind != Kind::Directory {
             return Err(Errno::Notdir);

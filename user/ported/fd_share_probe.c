@@ -282,7 +282,13 @@ int main(int argc, char **argv) {
     REQUIRE(accepted >= 0 && getsockopt(accepted, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) == 0 &&
             peer_size == sizeof peer && peer.pid == pid, "connecting-actor");
     REQUIRE(exact(accepted, "ping", 4) && write(accepted, "pong", 4) == 4 && joined(pid), "connect-roundtrip");
-    REQUIRE(close(accepted) == 0 && close(listener) == 0, "connection-close");
+    int accepted_alias = dup(accepted);
+    REQUIRE(accepted_alias >= 0 && close(accepted) == 0, "accepted-dup-after-peer-exit");
+    peer_size = sizeof peer;
+    REQUIRE(getsockopt(accepted_alias, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) == 0 &&
+            peer_size == sizeof peer && peer.pid == pid && peer.pid != getpid(),
+            "exited-peer-credential-snapshot");
+    REQUIRE(close(accepted_alias) == 0 && close(listener) == 0, "connection-close");
     puts("FD_SHARE_PROBE PEER_CREDENTIALS PASS");
 
     int output[2];

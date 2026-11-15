@@ -53,7 +53,11 @@ impl Runner {
                 links: 1,
             });
         }
-        self.process.stat_resolved(fs, path)
+        match super::unix::with(|s| s.pathname_stat(path.as_str().as_bytes())) {
+            Ok(info) => Ok(info),
+            Err(Errno::Noent) => self.process.stat_resolved(fs, path),
+            Err(error) => Err(error),
+        }
     }
     fn copy_stat(&mut self, address: u64, info: cyxia_posix::FileInfo) -> Result<u64, Errno> {
         if crate::process_arch::IMAGE_ABI == cyxia_posix::ImageAbi::X86_64 {
@@ -72,7 +76,7 @@ impl Runner {
         self.copy_to(address, &bytes)?;
         Ok(0)
     }
-    fn descriptor_stat(
+    pub(super) fn descriptor_stat(
         &self,
         fs: &FileSystem,
         descriptor: i32,
@@ -506,6 +510,7 @@ impl Runner {
                 .map(|fd| fd as u64),
             Call::EpollCtl => self.epoll_control(a, b, c, d),
             Call::Flock => self.flock(a, b),
+            Call::Fsync | Call::Fdatasync => self.sync_file(fs, a),
             Call::EpollPwait => self.epoll_wait(a, b, c, d, e, f),
             Call::TimerfdCreate => self
                 .process
@@ -601,10 +606,14 @@ impl Runner {
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
-                if a as i64 != -100 && !path.starts_with('/') {
-                    return Err(Errno::Badf);
+                let resolved = self.process.path_at(fs, a as i32, path)?;
+                match super::unix::with(|s| {
+                    s.pathname_chmod(resolved.as_str().as_bytes(), c as u16)
+                }) {
+                    Ok(()) => {}
+                    Err(Errno::Noent) => self.process.chmod(fs, resolved.as_str(), c as u16)?,
+                    Err(error) => return Err(error),
                 }
-                self.process.chmod(fs, path, c as u16)?;
                 Ok(0)
             }
             Call::Getsockname | Call::Getpeername => {
@@ -623,7 +632,7 @@ impl Runner {
             Call::Getsockopt => {
                 let handle = self.socket_handle(fd(a)?)?;
                 if b != 1 {
-                    return Err(Errno::Nosys);
+                    return Err(Errno::Noprotoopt);
                 }
                 self.copy_from(e, &mut bytes[..4])?;
                 let capacity = u32::from_le_bytes(bytes[..4].try_into().expect("socklen")) as usize;
@@ -652,7 +661,9 @@ impl Runner {
                         bytes[4..12].fill(0);
                         12
                     }
-                    _ => return Err(Errno::Nosys),
+                    // Optional features such as SO_PEERPIDFD must report an
+                    // unsupported option, not an unimplemented syscall.
+                    _ => return Err(Errno::Noprotoopt),
                 };
                 let size = capacity.min(size);
                 self.validate(d, size, true)?;
@@ -669,7 +680,10 @@ impl Runner {
             Call::Setsockopt => {
                 self.socket_handle(fd(a)?)?;
                 // SO_REUSEADDR has no effect on pathname AF_UNIX sockets.
-                if b != 1 || c != 2 || e != 4 {
+                if b != 1 || c != 2 {
+                    return Err(Errno::Noprotoopt);
+                }
+                if e != 4 {
                     return Err(Errno::Nosys);
                 }
                 self.copy_from(d, &mut bytes[..4])?;
@@ -901,8 +915,9 @@ impl Runner {
                 let binding = call == Call::Bind;
                 let (path, len) = self.socket_address(fs, b, c, binding)?;
                 if binding {
+                    let umask = self.process.current_umask();
                     super::unix::admit(0, 0, 1, |s| {
-                        s.bind(owner, super::unix::handle(raw), &path[..len])
+                        s.bind_with_umask(owner, super::unix::handle(raw), &path[..len], umask)
                     })?;
                 } else {
                     super::unix::admit(1, 1, 0, |s| {
@@ -1063,6 +1078,24 @@ impl Runner {
                         .open_readonly_mode(inode, bytes, flags, Self::asset_mode(resolved))
                         .map(|fd| fd as u64);
                 }
+                match super::unix::with(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
+                    Ok(_) => {
+                        // A socket's directory entry cannot be opened as a
+                        // regular file or replaced by O_CREAT in the RAMFS.
+                        if flags & (cyxia_posix::O_CREAT | cyxia_posix::O_EXCL)
+                            == cyxia_posix::O_CREAT | cyxia_posix::O_EXCL
+                        {
+                            return Err(Errno::Exist);
+                        }
+                        return Err(if flags & cyxia_posix::O_DIRECTORY != 0 {
+                            Errno::Notdir
+                        } else {
+                            Errno::Nxio
+                        });
+                    }
+                    Err(Errno::Noent) => {}
+                    Err(error) => return Err(error),
+                }
                 self.process
                     .open_resolved(fs, resolved, flags, d as u16)
                     .map(|fd| fd as u64)
@@ -1075,6 +1108,26 @@ impl Runner {
                     return Err(Errno::Badf);
                 }
                 if call == Call::Mkdirat {
+                    // mkdir permits a trailing slash, but must not create a
+                    // RAMFS directory over a retained socket directory entry.
+                    let candidate = path.trim_end_matches('/');
+                    if !candidate.is_empty() {
+                        match self.process.socket_path(fs, candidate, true) {
+                            Ok(resolved) => {
+                                match super::unix::with(|s| {
+                                    s.pathname_stat(resolved.as_str().as_bytes())
+                                }) {
+                                    Ok(_) => return Err(Errno::Exist),
+                                    Err(Errno::Noent) => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            // The ordinary filesystem or immutable device
+                            // already owns this name; mkdir supplies its error.
+                            Err(Errno::Addrinuse) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     self.process.mkdir(fs, path, c as u16)?;
                 } else if c == 0x200 {
                     self.process.rmdir(fs, path)?;
