@@ -498,6 +498,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                    all(name + '.elf' in manifest['external_inputs'] for name in
                        ('dbus-daemon', 'dbus-send', 'dbus-uuidgen', 'dbus-probe'))),
                    'D-Bus smoke requires genuine broker and clients')
+        pc.require(scenario not in ('cosmic-config', 'cosmic-config-library') or ('full-os' in manifest['features'] and
+                   'cosmic-config.elf' in manifest['external_inputs']),
+                   'COSMIC config smoke requires the genuine library client')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -554,6 +557,19 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     result['dbus_inputs'] = validate_inputs(manifest['sysroot'])
                     result['dbus_embedded'] = embedded_images(build, manifest, tuple(
                         name + '.elf' for name in ('dbus-daemon', 'dbus-send', 'dbus-uuidgen', 'dbus-probe')))
+                if scenario in ('cosmic-config', 'cosmic-config-library'):
+                    from os_cosmic_config import validate_inputs
+                    result['cosmic_config_inputs'] = validate_inputs(manifest['sysroot'])
+                    result['cosmic_config_embedded'] = embedded_images(build, manifest, ('cosmic-config.elf',))
+                    if recover_disk:
+                        prior_path = disk.parent / 'summary.json'
+                        prior = pc.read_json(prior_path)
+                        pc.require(prior.get('status') == 'OS_' + scenario.upper() + '_PASS' and
+                                   prior['source_sha256'] == result['source_sha256'] and
+                                   prior['disk_after_sha256'] == result['disk_before_sha256'] and
+                                   prior['cosmic_config_inputs'] == result['cosmic_config_inputs'],
+                                   'COSMIC config recovery requires the actual prior completed disk')
+                        result['recovery_summary_sha256'] = pc.sha(prior_path)
                 if scenario == 'socket-options':
                     result['socket_options_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'socket-options-probe')
                     result['socket_options_embedded_sha256'] = embedded_images(build, manifest, ('socket-options-probe.elf',))['socket-options-probe.elf']
@@ -608,11 +624,34 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         expected_id = prior['dbus']['machine_id']
                         result['recovery_summary_sha256'] = pc.sha(disk.parent / 'summary.json')
                     result['dbus'] = checks(console, expected_id)
+                if scenario in ('cosmic-config', 'cosmic-config-library'):
+                    from os_cosmic_config import checks
+                    result['cosmic_config'] = checks(console, recover=bool(recover_disk),
+                                                     library=scenario == 'cosmic-config-library')
                 if scenario == 'thread-capacity':
+                    from verify_ported import parse_processes
                     before = object_snapshot(console)
-                    at = console.program('posix exec thread-capacity-probe', b'THREAD_CAPACITY_PROBE PASS')
+                    at = console.command('posix exec thread-capacity-probe')
                     pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+                    armed = console.until(rb'THREAD_CAPACITY_PROBE CHILD_WAIT ARMED parent=(\d+) child=(\d+) waiters=15 gate=/thread-wait-go', at)
+                    pc.require(armed.group(1) == pid, 'child wait parent identity')
+                    child = int(armed.group(2))
+                    deadline = time.monotonic() + 10
+                    while True:
+                        listing = console.command('posix list')
+                        rows = parse_processes(bytes(console.raw[listing:]))
+                        parent, child_row = rows[int(pid)], rows[child]
+                        pc.require(child_row['state'] in ('Running', 'Waiting'), 'child exited before wait gate')
+                        if parent['state'] == 'Waiting' and parent['thread_count'] == 16:
+                            break
+                        pc.require(time.monotonic() < deadline, 'not all sixteen threads parked before child exit')
+                        time.sleep(.01)
+                    console.command('write /thread-wait-go go')
+                    console.until(rb'pid=' + str(child).encode() + rb' Exited code=37\b', at)
+                    console.until(rb'THREAD_CAPACITY_PROBE CHILD_WAIT PASS waiters=15 reaped=1 nochild=14', at, timeout=10)
+                    console.until(rb'THREAD_CAPACITY_PROBE PASS', at)
                     result['thread_capacity'] = reclaimed_probe(console, pid, before)
+                    result['thread_capacity']['child_wait'] = dict(parent_parked=parent, child_before_gate=child_row, waiters=15, reaped=1, nochild=14)
                     row = result['thread_capacity']['process']
                     pc.require(row['thread_peak'] == 16 and row['thread_denials'] == 2,
                                'full OS thread capacity/rejection not observed twice')
@@ -710,7 +749,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 # These scenarios establish durability through the tested
                 # fsync calls. A later operator checkpoint would mask a stale
                 # syscall snapshot when the same disk is rebooted.
-                if not recover_disk and scenario not in ('dbus', 'fsync', 'fsync-concurrent'):
+                if not recover_disk and scenario not in ('dbus', 'fsync', 'fsync-concurrent', 'cosmic-config', 'cosmic-config-library'):
                     console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=(?:[2-9]|[1-9][0-9]+)\b'])
                     if scenario == 'flock':
                         result['runtime_checkpoint'] = flock_checkpoint_proof(bytes(console.raw), console.commands)
@@ -781,6 +820,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'dbus':
                             pc.require(validate_inputs(manifest['sysroot']) == result['dbus_inputs'],
                                        'D-Bus build inputs changed during guest')
+                        if scenario in ('cosmic-config', 'cosmic-config-library'):
+                            pc.require(validate_inputs(manifest['sysroot']) == result['cosmic_config_inputs'],
+                                       'COSMIC config inputs changed during guest')
                         if scenario == 'socket-options':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'socket-options-probe') == result['socket_options_build_inputs'],
                                        'socket options probe inputs changed during VM')
@@ -803,7 +845,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules', 'heap-pool', 'socket-options', 'dbus', 'fsync', 'fsync-concurrent', 'fd-share', 'thread-capacity'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules', 'heap-pool', 'socket-options', 'dbus', 'fsync', 'fsync-concurrent', 'fd-share', 'thread-capacity', 'cosmic-config', 'cosmic-config-library'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

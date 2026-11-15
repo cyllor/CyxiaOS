@@ -1,16 +1,22 @@
 /* Real full-OS pthread capacity, private TLS/stacks, rejection and slot reuse.
  * All fifteen workers stay alive at the rejection boundary. Their futex gate
- * is opened only after the seventeenth simultaneous thread is refused. */
+ * is opened only after the seventeenth simultaneous thread is refused.
+ * A final child-wait phase parks fifteen workers in waitpid. The host must
+ * observe the parent Waiting with sixteen live threads before releasing the
+ * actual child through /thread-wait-go; creation order is not a slot identity. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "cyxia_spawn.h"
 
 enum { WORKERS = 15, STACK_BYTES = 64 * 1024, STACK_WORDS = 256 };
 #define INITIAL_TLS UINT64_C(0x3104bafd28ce6507)
@@ -20,6 +26,10 @@ static _Thread_local uint64_t tls_value = INITIAL_TLS;
 static unsigned ready, release_workers, worker_error;
 static pid_t main_tid;
 static unsigned cycle;
+static pid_t wait_child;
+static unsigned wait_started, wait_done, wait_reaped, wait_nochild;
+#define CHILD_GATE "/thread-wait-go"
+#define CHILD_EXIT 37
 
 struct worker {
     unsigned index;
@@ -57,6 +67,24 @@ static void *worker_main(void *raw) {
             break;
         }
     }
+    if (wait_child > 0) {
+        int status = 0x12345678;
+        pid_t result;
+        __atomic_fetch_add(&wait_started, 1, __ATOMIC_RELEASE);
+        do result = waitpid(wait_child, &status, 0); while (result < 0 && errno == EINTR);
+        int error = result < 0 ? errno : 0;
+        if (result == wait_child && WIFEXITED(status) && WEXITSTATUS(status) == CHILD_EXIT)
+            __atomic_fetch_add(&wait_reaped, 1, __ATOMIC_RELEASE);
+        else if (result == -1 && error == ECHILD && status == 0x12345678)
+            __atomic_fetch_add(&wait_nochild, 1, __ATOMIC_RELEASE);
+        else
+            STORE(&worker_error, 6);
+        printf("THREAD_CAPACITY_PROBE CHILD_WAIT RETURN tid=%d child=%d result=%d status=%d error=%d\n",
+               worker->tid, wait_child, result, status, error);
+        __atomic_fetch_add(&wait_done, 1, __ATOMIC_RELEASE);
+        if (syscall(SYS_futex, &wait_done, 129, INT_MAX, 0, 0, 0) < 0)
+            STORE(&worker_error, 7);
+    }
     if (tls_value != tag(worker->index, 0xf00d) ||
         (pid_t)syscall(SYS_gettid) != worker->tid)
         STORE(&worker_error, 4);
@@ -81,7 +109,10 @@ static int stop_workers(void) {
 static int fail(const char *stage, int error) {
     printf("THREAD_CAPACITY_PROBE FAIL stage=%s error=%d cycle=%u ready=%u created=%u\n",
            stage, error, cycle, LOAD(&ready), created);
-    (void)stop_workers();
+    /* A failed child-wait phase must not join workers held behind the host
+     * gate. Returning from main terminates the group; the child notices its
+     * actual reparenting below and exits instead of becoming a leaked orphan. */
+    if (wait_child <= 0) (void)stop_workers();
     return 1;
 }
 
@@ -99,8 +130,83 @@ static int wait_ready(void) {
     return 0;
 }
 
-int main(void) {
+static int gated_child(void) {
+    printf("THREAD_CAPACITY_PROBE CHILD_WAIT CHILD pid=%d gate=%s\n", getpid(), CHILD_GATE);
+    for (;;) {
+        if (getppid() == 0) return 74;
+        int gate = open(CHILD_GATE, O_RDONLY | O_CLOEXEC);
+        if (gate >= 0) {
+            char bytes[2];
+            ssize_t count = read(gate, bytes, sizeof(bytes));
+            if (close(gate) || count != 2 || memcmp(bytes, "go", 2) || unlink(CHILD_GATE))
+                return 71;
+            printf("THREAD_CAPACITY_PROBE CHILD_WAIT EXIT pid=%d code=%d\n", getpid(), CHILD_EXIT);
+            return CHILD_EXIT;
+        }
+        if (errno != ENOENT) return 72;
+        struct timespec delay = {0, 10000000};
+        if (nanosleep(&delay, NULL) && errno != EINTR) return 73;
+    }
+}
+
+static int child_wait_regression(pthread_attr_t *attr) {
+    if (unlink(CHILD_GATE) && errno != ENOENT) return fail("remove-stale-child-gate", errno);
+    char *args[] = {"/bin/thread-capacity-probe", "wait-child", NULL};
+    char *env[] = {NULL};
+    struct cyxia_mapping maps[] = {{-2, 0}, {1, 1}, {2, 2}};
+    wait_child = cyxia_spawn(args[0], args, env, maps, 3);
+    if (wait_child < 0) return fail("spawn-wait-child", errno);
+    cycle = 3;
+    STORE(&ready, 0);
+    STORE(&release_workers, 0);
+    STORE(&worker_error, 0);
+    memset(workers, 0, sizeof(workers));
+    for (unsigned index = 0; index < WORKERS; ++index) {
+        workers[index].index = index + 1;
+        int error = pthread_create(&threads[index], attr, worker_main, &workers[index]);
+        if (error) return fail("create-child-waiters", error);
+        ++created;
+    }
+    int error = wait_ready();
+    if (error) return fail("child-waiters-live", error);
+    STORE(&release_workers, 1);
+    if (syscall(SYS_futex, &release_workers, 129, INT_MAX, 0, 0, 0) < 0)
+        return fail("release-child-waiters", errno);
+    while (LOAD(&wait_started) != WORKERS) {
+        struct timespec delay = {0, 1000000};
+        if (nanosleep(&delay, NULL) && errno != EINTR) return fail("enter-child-waits", errno);
+    }
+    if (LOAD(&wait_done)) return fail("child-exited-before-host-observation", EIO);
+    printf("THREAD_CAPACITY_PROBE CHILD_WAIT ARMED parent=%d child=%d waiters=%u gate=%s\n",
+           getpid(), wait_child, LOAD(&wait_started), CHILD_GATE);
+    /* ARMED precedes some wait syscalls. The host releases the child only once
+     * this parent is Waiting with all sixteen threads still alive. With only
+     * this main thread outside waitpid, at least seven child waiters must then
+     * occupy slots 8..15, regardless of scheduler swaps. There is deliberately
+     * no timer/signal that could move a missed upper-slot waiter into slot 0. */
+    for (;;) {
+        unsigned done = LOAD(&wait_done);
+        if (done == WORKERS) break;
+        if (syscall(SYS_futex, &wait_done, 128, done, NULL, 0, 0) < 0 &&
+            errno != EAGAIN && errno != EINTR)
+            return fail("wait-child-completions", errno);
+    }
+    error = stop_workers();
+    if (error || LOAD(&worker_error) || LOAD(&wait_reaped) != 1 ||
+        LOAD(&wait_nochild) != WORKERS - 1 || tls_value != UINT64_C(0xffeeddccbbaa9988))
+        return fail("all-child-waiters-returned", error ? error : EIO);
+    int status = 0x12345678;
+    errno = 0;
+    if (waitpid(wait_child, &status, WNOHANG) != -1 || errno != ECHILD || status != 0x12345678)
+        return fail("child-reaped-once", EIO);
+    printf("THREAD_CAPACITY_PROBE CHILD_WAIT PASS waiters=%u reaped=%u nochild=%u\n",
+           LOAD(&wait_done), LOAD(&wait_reaped), LOAD(&wait_nochild));
+    return 0;
+}
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && !strcmp(argv[1], "wait-child")) return gated_child();
     main_tid = (pid_t)syscall(SYS_gettid);
     if (main_tid != getpid()) return fail("main-identity", EIO);
     tls_value = UINT64_C(0xffeeddccbbaa9988);
@@ -155,6 +261,7 @@ int main(void) {
         for (unsigned i = 0; i < WORKERS; ++i) previous[i] = workers[i].tid;
         printf("THREAD_CAPACITY_PROBE JOIN_REUSE PASS cycle=%u workers=15\n", cycle);
     }
+    if (child_wait_regression(&attr)) return 1;
     if ((error = pthread_attr_destroy(&attr))) return fail("destroy-attributes", error);
     puts("THREAD_CAPACITY_PROBE PASS");
     return 0;

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "scope": "Pinned upstream COSMIC compositor configuration defaults",
+  "packages": [
+    {
+      "name": "cosmic-comp",
+      "repository": "https://github.com/pop-os/cosmic-comp",
+      "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+      "checkout": "artifacts/cosmic-sources/cosmic-comp-epoch",
+      "license": "GPL-3.0-only",
+      "install_recipe": "justfile",
+      "files": [
+        {
+          "source": "data/keybindings.ron",
+          "destination": "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/defaults",
+          "bytes": 6925,
+          "sha256": "3baabdb662524ebfc98381e2d0a800ae798fcfa7288f343e3348f6341cc94d2c"
+        },
+        {
+          "source": "data/tiling-exceptions.ron",
+          "destination": "/usr/share/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_defaults",
+          "bytes": 1894,
+          "sha256": "c4ff4fc47c1f22eaf4054a6d76616b8cb7ac7086212bf7e0a986858ad6718ae4"
+        },
+        {
+          "source": "LICENSE",
+          "destination": "/usr/share/doc/cosmic-comp/LICENSE",
+          "bytes": 35149,
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        },
+        {
+          "source": "Cargo.toml",
+          "bytes": 4247,
+          "sha256": "c8ea062e0e285cce895b5dc5cd1670a30f723e451c84eed9f31fe1dc2e90c784"
+        },
+        {
+          "source": "debian/copyright",
+          "bytes": 277,
+          "sha256": "6dd5f08da634f5a28193aa8fd82a93b22006fdfbafeabbae38e00b9685cb956d"
+        },
+        {
+          "source": "justfile",
+          "bytes": 2478,
+          "sha256": "20752c971e5b4536d84da556d1c975a85e583e72c941f061e5942d94f03badf7"
+        }
+      ]
+    },
+    {
+      "name": "cosmic-settings-daemon",
+      "repository": "https://github.com/pop-os/cosmic-settings-daemon",
+      "commit": "e37160f14d1e7ee428f973cd2848b4e95f83dfe1",
+      "checkout": "artifacts/cosmic-cargo-cache/git/checkouts/cosmic-settings-daemon-8c237d6ae6a8c1ec/e37160f",
+      "license": "GPL-3.0-or-later",
+      "install_recipe": "Makefile",
+      "files": [
+        {
+          "source": "data/system_actions.ron",
+          "destination": "/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/system_actions",
+          "bytes": 2867,
+          "sha256": "2eb4fcd146153d62d62443830da5d2344aef0be7ccc4b53fba1d661776517060"
+        },
+        {
+          "source": "LICENSE",
+          "destination": "/usr/share/doc/cosmic-settings-daemon/LICENSE",
+          "bytes": 35158,
+          "sha256": "28de5ca4fa18fbdc2d7eeb06ba7afdd43c5e80a015d7901a76ccd6c591b97eae"
+        },
+        {
+          "source": "Cargo.toml",
+          "bytes": 1871,
+          "sha256": "ef4d7140f774d5bf54dc232f20fc7a520630a1fb8f5293a9805c84c8cd14fa96"
+        },
+        {
+          "source": "Makefile",
+          "bytes": 1262,
+          "sha256": "37f3f46ae8250ae8ed0f95d1f985ab99c688b6003e27fb26b94992f9e6946aa7"
+        }
+      ]
+    }
+  ]
+}

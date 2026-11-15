@@ -421,7 +421,7 @@ impl Supervisor {
             }
             // Move each parked record through the foreground usercopy context;
             // only this one process's address space is consulted.
-            for index in 0..8 {
+            for index in 0..super::threads::MAX_THREADS {
                 if index != 0 {
                     core::mem::swap(&mut runner.thread, &mut runner.threads.parked[index - 1]);
                 }

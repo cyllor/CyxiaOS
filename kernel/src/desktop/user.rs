@@ -1089,6 +1089,8 @@ impl Supervisor {
             "thread-exit-probe"
         } else if name == "cosmic-version" {
             "cosmic-comp"
+        } else if matches!(name, "cosmic-config-defaults" | "cosmic-config-init" | "cosmic-config-check" | "cosmic-config-verify" | "cosmic-config-raw" | "cosmic-config-values") {
+            "cosmic-config"
         } else if matches!(
             name,
             "smithay-dynamic-a"
@@ -1133,7 +1135,7 @@ impl Supervisor {
         fs.register_boot_file(cyxia_ai_fs::Path::resolve(
             cyxia_ai_fs::Path::ROOT, "/dev/null",
         )?)?;
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1152,11 +1154,16 @@ impl Supervisor {
             b"GTK_IM_MODULE=simple",
         ];
         let session_environment: &[&[u8]] = &[
-            b"PATH=/bin", b"LANG=C", b"TZ=UTC", b"HOME=/",
+            b"PATH=/bin", b"LANG=en_US.UTF-8", b"TZ=UTC", b"HOME=/",
             cyxia_posix::runtime_directory::ENVIRONMENT,
             b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
         ];
         let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
+        let config_argv: &[&[u8]] = &[path.as_bytes(), match name {
+            "cosmic-config-defaults" => b"defaults", "cosmic-config-init" => b"init",
+            "cosmic-config-check" => b"exercise", "cosmic-config-verify" => b"verify",
+            "cosmic-config-raw" => b"exercise-raw", "cosmic-config-values" => b"verify-values", _ => b"",
+        }];
         // Fixture roles select a workload, never the authenticated Wayland
         // identity: the compositor obtains that from the connected socket.
         let dynamic_role: &[u8] = match name {
@@ -1239,6 +1246,8 @@ impl Supervisor {
                     dbus_uuid_argv
                 } else if image_name == "cosmic-comp" {
                     cosmic_argv
+                } else if image_name == "cosmic-config" {
+                    config_argv
                 } else if name == "xorg" {
                     xorg_argv
                 } else if name == "twm" {
