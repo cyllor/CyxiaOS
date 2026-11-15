@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "comp-cyxia-native": {
+      "target_runtime_validated": false,
+      "purpose": "Real cosmic-comp Cyxia backend with linked Mesa and pixman. Compile/link alone is not guest admission or full COSMIC session.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 2147483648,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 16777216,
+      "image_bytes": 16777216,
+      "stack_bytes": 262144
+    }
+  }
+}

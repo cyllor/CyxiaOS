@@ -26,12 +26,12 @@ import time
 if __package__:
     from . import cosmic_ports as ports
     from . import cosmic_dependencies as dependencies
-    from .build_sysroot import inspect_elf
+    from .build_sysroot import BuildError as SysrootBuildError, inspect_elf
     from .target_profile import profile_for
 else:
     import cosmic_ports as ports
     import cosmic_dependencies as dependencies
-    from build_sysroot import inspect_elf
+    from build_sysroot import BuildError as SysrootBuildError, inspect_elf
     from target_profile import profile_for
 
 ROOT = ports.ROOT
@@ -317,6 +317,21 @@ def checked_name(name):
     return name
 
 
+def static_link_inputs(recipe):
+    """Only reviewed, hash-bound target archives can enter the linker group."""
+    selected = recipe.get('static_link_inputs', [])
+    if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
+        raise CosmicBuildError('static link inputs must be a path list')
+    if len(selected) != len(set(selected)):
+        raise CosmicBuildError('duplicate static link input')
+    declared = {item['path'] for item in recipe['native_inputs']}
+    for path in selected:
+        dependencies.relative_path(path)
+        if path not in declared or Path(path).suffix != '.a':
+            raise CosmicBuildError('static link input must be a bound native archive: ' + path)
+    return selected
+
+
 def validate_recipe(recipe, source):
     if (recipe.get('schema_version') != 1 or recipe.get('component') != source['name']
             or recipe.get('commit') != source['commit']):
@@ -338,6 +353,7 @@ def validate_recipe(recipe, source):
             raise CosmicBuildError('recipe needs pinned source/effective Cargo.lock identities')
     if not isinstance(recipe.get('native_inputs'), list) or not isinstance(recipe.get('patches'), list):
         raise CosmicBuildError('explicit native input and patch lists required')
+    static_link_inputs(recipe)
     if 'source_series' in recipe:
         series = recipe['source_series']
         dependencies.relative_path(series['path'])
@@ -439,6 +455,7 @@ def tools_and_sysroot(sysroot, recipe):
     unwind = libdir / 'self-contained/libunwind.a'
     ports.architecture(unwind, target=selected)
     return tools, {'target': selected.rust_target, 'architecture': selected.architecture, 'rustc_version': version, 'host': host, 'std': {'path': str(std[0]), 'sha256': digest(std[0])},
+                   'static_link_inputs': static_link_inputs(recipe),
                    'unwind': {'path': str(unwind), 'sha256': digest(unwind)}, 'native_inputs': native,
                    'tools': {name: {'path': str(path), 'sha256': digest(path) if path.is_file() else None,
                                     'available': path.is_file()} for name, path in tools.items()}}
@@ -526,6 +543,13 @@ def cargo_environment(tools, identities, sysroot, output, cargo_cache, control):
                CARGO_ENCODED_RUSTFLAGS='\x1f'.join(['-C', 'link-self-contained=no', '-C', 'relocation-model=static',
                    '-C', 'target-feature=+crt-static', '-L', 'native=' + str(native)]))
     env['CARGO_TARGET_' + selected.rust_target.replace('-', '_').upper() + '_LINKER'] = str(tools['target_cc'])
+    link_inputs = identities.get('static_link_inputs', [])
+    if link_inputs:
+        flags = ['-C', 'link-arg=-Wl,--start-group']
+        for relative in link_inputs:
+            flags += ['-C', 'link-arg=' + str(sysroot / relative)]
+        flags += ['-C', 'link-arg=-Wl,--end-group']
+        env['CARGO_ENCODED_RUSTFLAGS'] += '\x1f' + '\x1f'.join(flags)
     for target in (selected.rust_target, selected.rust_target.replace('-', '_')):
         env['CC_' + target] = str(tools['target_cc'])
         env['CXX_' + target] = str(target_cxx)
@@ -571,7 +595,7 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                   'builder_sha256': digest(Path(__file__)),
                   'profile_sha256': hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
                   'guest_execution': 'not performed', 'cosmic_session_ready': False,
-                  'operation': operation, 'target_linked': False,
+                  'operation': operation, 'link_completed': False, 'target_linked': False,
                   'cargo_offline': True, 'build_script_network_sandbox': False, 'toolchain': identities}
         output = new_output(output)
         report_path = output / 'build-report.json'
@@ -608,6 +632,7 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                 env = cargo_environment(tools, identities, sysroot, output, cargo_cache, control)
                 epoch = git(Path(record['path']), 'show', '-s', '--format=%ct')
                 env['SOURCE_DATE_EPOCH'] = epoch
+                env['CYXIA_COSMIC_UPSTREAM_COMMIT'] = source['commit']
                 common = ['--manifest-path', str(stage / 'Cargo.toml'), '--locked', '--offline']
                 features = ([] if recipe['default_features'] else ['--no-default-features'])
                 if recipe['features']:
@@ -636,6 +661,11 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                     raise CosmicBuildError('build modified pinned source inputs')
                 if tree_identity(sysroot / 'sysroot')['sha256'] != report['sysroot_before']['sha256']:
                     raise CosmicBuildError('build modified target sysroot')
+                for item in identities['native_inputs']:
+                    native_path = sysroot / item['path']
+                    if (not native_path.resolve().is_relative_to(sysroot.resolve())
+                            or digest(native_path) != item['sha256']):
+                        raise CosmicBuildError('build modified declared native input: ' + item['path'])
                 if digest(Path(__file__)) != report['builder_sha256']:
                     raise CosmicBuildError('builder changed during execution')
                 if verify_metadata(metadata, stage, cargo_cache, recipe) != report['cargo_dependencies']:
@@ -647,6 +677,11 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                 result = output / 'target' / selected.rust_target / 'release' / recipe['binary']
                 if not result.is_file() or not result.resolve().is_relative_to(output.resolve()):
                     raise CosmicBuildError('expected binary missing or escaped output')
+                # Preserve the actual link result even if the loader's strict
+                # admission contract rejects it. target_linked remains reserved
+                # for the validated output published below.
+                report.update(link_completed=True, linked_binary={
+                    'path': str(result), 'bytes': result.stat().st_size, 'sha256': digest(result)})
                 executable = inspect_elf(result, selected)
                 pages = sum(((p['vaddr'] + p['memsz'] + 4095) // 4096 - p['vaddr'] // 4096)
                             for p in executable['program_headers'] if p['type'] == 1)
@@ -658,7 +693,7 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                               target_linked=True)
                 if not report['source_preserved']:
                     raise CosmicBuildError('original source changed during build')
-        except (OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        except (OSError, ValueError, SysrootBuildError, subprocess.SubprocessError, KeyboardInterrupt) as error:
             report.update(status='failed', error=str(error))
             raise
         finally:
@@ -700,7 +735,7 @@ def main(argv=None):
                                sysroot, cache, profile, args.jobs, operation=args.action)
         print(json.dumps({'status': report['status'], 'report': str(args.output / 'build-report.json')}, indent=2))
         return 0
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, SysrootBuildError, subprocess.SubprocessError) as error:
         print('build_cosmic: ' + str(error), file=sys.stderr)
         return 2
 

@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "source_manifest": "ports/libc/pixman-source.json",
+  "scope": "Pinned static pixman-1 for the selected musl SDK; compile/link evidence only, no guest execution or COSMIC session claim."
+}

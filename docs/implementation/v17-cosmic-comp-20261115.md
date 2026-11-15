@@ -1,5 +1,8 @@
 # V0.17 cosmic-comp 源码解耦与 x86 交叉类型检查
 
+本文保留第一轮 `backend-winit` 验证记录；后续原生后端、静态依赖与链接进展见
+[Cyxia 原生后端记录](v17-cosmic-native-20261115.md)。下面的能力边界以第一轮结束时为准。
+
 2026-11-15，完整 CyxiaOS / COSMIC 主线。固定上游 cosmic-comp
 `41497b42d9744d9963c4c6d17e8add49489b45ee` 的真实合成器代码已通过
 `x86_64-unknown-linux-musl` 交叉类型检查；当前选用 `backend-winit` 检查公共代码。

@@ -1,0 +1,3225 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -114,6 +114,7 @@
+ default = ["systemd", "backend-kms", "backend-winit", "backend-x11"]
+ # Nested Winit uses the existing COSMIC shell and Glow renderer. Software EGL is
+ # selected by the EGL implementation, not by a replacement compositor.
++backend-cyxia = []
+ backend-winit = ["smithay/backend_winit"]
+ backend-x11 = ["smithay/backend_x11", "smithay/backend_vulkan"]
+ backend-kms = [
+--- /dev/null
++++ b/src/backend/cyxia/delivery.rs
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Track transitions actually forwarded to COSMIC, independently of decoding.
++//! A later read/resync failure can discard a decoded batch; cleanup must still
++//! release everything the compositor received, not the decoder's newer state.
++use super::native::InputAction;
++use std::io;
++
++#[derive(Debug)]
++pub struct DeliveredInput {
++    held: [u8; 96],
++}
++
++impl Default for DeliveredInput {
++    fn default() -> Self {
++        Self { held: [0; 96] }
++    }
++}
++
++impl DeliveredInput {
++    pub fn record(&mut self, action: InputAction) {
++        if let InputAction::Key { code, pressed } | InputAction::Button { code, pressed } = action {
++            let byte = &mut self.held[usize::from(code) / 8];
++            let mask = 1 << (code % 8);
++            if pressed {
++                *byte |= mask;
++            } else {
++                *byte &= !mask;
++            }
++        }
++    }
++
++    pub fn key_count(&self) -> u32 {
++        self.held[..31].iter().map(|byte| byte.count_ones()).sum()
++    }
++
++    pub fn releases(&self) -> io::Result<Vec<InputAction>> {
++        let mut actions = Vec::new();
++        actions.try_reserve_exact(251).map_err(|_| {
++            io::Error::new(io::ErrorKind::OutOfMemory, "native delivered input cleanup")
++        })?;
++        for code in (0u16..248).chain(272..=274) {
++            if self.held[usize::from(code) / 8] & (1 << (code % 8)) != 0 {
++                actions.push(if code < 248 {
++                    InputAction::Key {
++                        code,
++                        pressed: false,
++                    }
++                } else {
++                    InputAction::Button {
++                        code,
++                        pressed: false,
++                    }
++                });
++            }
++        }
++        Ok(actions)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::native::{InputDecoder, InputEvent};
++    use super::*;
++
++    fn packet(decoder: &mut InputDecoder, pressed: bool) -> Vec<InputAction> {
++        for code in [30, 272] {
++            decoder
++                .push(InputEvent {
++                    kind: 1,
++                    code,
++                    value: i32::from(pressed),
++                })
++                .unwrap();
++        }
++        decoder
++            .push(InputEvent {
++                kind: 0,
++                code: 0,
++                value: 0,
++            })
++            .unwrap()
++            .unwrap()
++    }
++
++    #[test]
++    fn discarded_decoded_release_cannot_hide_delivered_holds_at_shutdown() {
++        let mut decoder = InputDecoder::new();
++        let mut delivered = DeliveredInput::default();
++        for action in packet(&mut decoder, true) {
++            delivered.record(action);
++        }
++        // poll_input can decode these releases then encounter an I/O error in
++        // its next read. The entire undelivered Vec is discarded on that path.
++        drop(packet(&mut decoder, false));
++        assert!(decoder.resynchronize([0; 96]).unwrap().is_empty());
++        assert_eq!(
++            delivered.releases().unwrap(),
++            vec![
++                InputAction::Key {
++                    code: 30,
++                    pressed: false
++                },
++                InputAction::Button {
++                    code: 272,
++                    pressed: false
++                },
++            ]
++        );
++    }
++
++    #[test]
++    fn decoded_but_undelivered_press_does_not_invent_a_cleanup_release() {
++        let mut decoder = InputDecoder::new();
++        let delivered = DeliveredInput::default();
++        drop(packet(&mut decoder, true));
++        assert!(!decoder.resynchronize([0; 96]).unwrap().is_empty());
++        assert!(delivered.releases().unwrap().is_empty());
++    }
++
++    #[test]
++    fn delivered_releases_clear_keyboard_count_and_buttons_exactly_once() {
++        let mut delivered = DeliveredInput::default();
++        for action in [
++            InputAction::Key {
++                code: 42,
++                pressed: true,
++            },
++            InputAction::Button {
++                code: 274,
++                pressed: true,
++            },
++        ] {
++            delivered.record(action);
++            delivered.record(action); // duplicate delivery cannot inflate count
++        }
++        assert_eq!(delivered.key_count(), 1);
++        for action in delivered.releases().unwrap() {
++            delivered.record(action);
++        }
++        assert_eq!(delivered.key_count(), 0);
++        assert!(delivered.releases().unwrap().is_empty());
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/egl.rs
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Bootstrap Smithay's real EGL dispatch from the linked Mesa implementation.
++//! Cyxia's static musl process has no libEGL.so.1 loader. Keep this confined to
++//! native backend startup; the existing backends retain Smithay's normal loader.
++use anyhow::{Result, bail};
++use smithay::backend::egl::ffi::egl;
++use std::{
++    ffi::{CString, c_char, c_void},
++    sync::atomic::{AtomicBool, Ordering},
++};
++
++static OWNED: AtomicBool = AtomicBool::new(false);
++
++unsafe extern "C" {
++    #[link_name = "eglGetProcAddress"]
++    fn linked_get_proc_address(name: *const c_char) -> Option<unsafe extern "system" fn()>;
++}
++
++fn resolve(symbol: &str) -> *const c_void {
++    if symbol == "eglGetProcAddress" {
++        return linked_get_proc_address as *const c_void;
++    }
++    let Ok(name) = CString::new(symbol) else {
++        return std::ptr::null();
++    };
++    // SAFETY: the linked Mesa entry point owns returned functions for the
++    // process lifetime; name remains NUL-terminated throughout this call.
++    unsafe { linked_get_proc_address(name.as_ptr()) }
++        .map_or(std::ptr::null(), |function| function as *const c_void)
++}
++
++pub fn load() -> Result<()> {
++    // This same public Once guards Smithay's loader. Do not overwrite dispatch
++    // installed by another backend, and never mutate its dependency checkout.
++    egl::LOAD.call_once(|| {
++        egl::load_with(resolve);
++        egl::BindWaylandDisplayWL::load_with(resolve);
++        egl::UnbindWaylandDisplayWL::load_with(resolve);
++        egl::QueryWaylandBufferWL::load_with(resolve);
++        egl::DebugMessageControlKHR::load_with(resolve);
++        OWNED.store(true, Ordering::Release);
++    });
++    if !OWNED.load(Ordering::Acquire) {
++        bail!("Cyxia cannot replace an already initialized EGL provider");
++    }
++    macro_rules! require {
++        ($($name:ident),+ $(,)?) => { $(
++            if !egl::$name::is_loaded() { bail!(concat!("Linked Mesa lacks egl", stringify!($name))); }
++        )+ };
++    }
++    require!(
++        GetProcAddress,
++        GetError,
++        QueryString,
++        GetPlatformDisplayEXT,
++        Initialize,
++        Terminate,
++        BindAPI,
++        ChooseConfig,
++        GetConfigAttrib,
++        CreateContext,
++        DestroyContext,
++        MakeCurrent,
++        GetCurrentContext,
++        GetCurrentDisplay,
++        QueryContext,
++        ReleaseThread
++    );
++    // Smithay calls this unconditionally when Mesa advertises EGL_KHR_debug.
++    // Require it up front instead of allowing a generated missing-entry panic.
++    require!(DebugMessageControlKHR);
++    Ok(())
++}
++
++/// Called only after the native renderer and its context have been dropped.
++pub fn release_thread() -> Result<()> {
++    // SAFETY: native shutdown has destroyed its only renderer on this thread.
++    // Query and release are real linked Mesa functions, validated in load().
++    unsafe {
++        if egl::GetCurrentContext() != egl::NO_CONTEXT || egl::ReleaseThread() == egl::FALSE {
++            bail!("Cyxia EGL thread cleanup failed");
++        }
++    }
++    Ok(())
++}
+--- /dev/null
++++ b/src/backend/cyxia/input.rs
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Cyxia evdev records enter the normal COSMIC focus/shortcut/input pipeline.
++use smithay::backend::input::{
++    ButtonState, Device, DeviceCapability, Event, InputBackend, InputEvent, InputTime, KeyState,
++    KeyboardKeyEvent, Keycode, PointerButtonEvent, PointerMotionEvent, UnusedEvent,
++};
++use std::path::PathBuf;
++
++use super::{delivery::DeliveredInput, native::InputAction};
++
++#[derive(Debug)]
++pub struct CyxiaInput;
++
++/// ABI v1 exposes one ordered keyboard and relative-pointer queue.
++#[derive(Debug, PartialEq, Eq, Hash)]
++pub struct CyxiaDevice;
++
++impl Device for CyxiaDevice {
++    fn id(&self) -> String {
++        "cyxia-abi-1".into()
++    }
++    fn name(&self) -> String {
++        "Cyxia native keyboard and pointer".into()
++    }
++    fn has_capability(&self, capability: DeviceCapability) -> bool {
++        matches!(
++            capability,
++            DeviceCapability::Keyboard | DeviceCapability::Pointer
++        )
++    }
++    fn usb_id(&self) -> Option<(u32, u32)> {
++        None
++    }
++    fn syspath(&self) -> Option<PathBuf> {
++        None
++    }
++}
++
++#[derive(Debug)]
++pub struct KeyEvent {
++    time: InputTime,
++    code: u16,
++    pressed: bool,
++    count: u32,
++}
++#[derive(Debug)]
++pub struct ButtonEvent {
++    time: InputTime,
++    code: u16,
++    pressed: bool,
++}
++#[derive(Debug)]
++pub struct MotionEvent {
++    time: InputTime,
++    dx: i32,
++    dy: i32,
++}
++
++macro_rules! event {
++    ($ty:ty) => {
++        impl Event<CyxiaInput> for $ty {
++            fn time(&self) -> InputTime {
++                self.time
++            }
++            fn device(&self) -> CyxiaDevice {
++                CyxiaDevice
++            }
++        }
++    };
++}
++event!(KeyEvent);
++event!(ButtonEvent);
++event!(MotionEvent);
++
++impl KeyboardKeyEvent<CyxiaInput> for KeyEvent {
++    fn key_code(&self) -> Keycode {
++        (u32::from(self.code) + 8).into()
++    }
++    fn state(&self) -> KeyState {
++        if self.pressed {
++            KeyState::Pressed
++        } else {
++            KeyState::Released
++        }
++    }
++    fn count(&self) -> u32 {
++        self.count
++    }
++}
++impl PointerButtonEvent<CyxiaInput> for ButtonEvent {
++    fn button_code(&self) -> u32 {
++        self.code.into()
++    }
++    fn state(&self) -> ButtonState {
++        if self.pressed {
++            ButtonState::Pressed
++        } else {
++            ButtonState::Released
++        }
++    }
++}
++impl PointerMotionEvent<CyxiaInput> for MotionEvent {
++    fn delta_x(&self) -> f64 {
++        self.dx.into()
++    }
++    fn delta_y(&self) -> f64 {
++        self.dy.into()
++    }
++    fn delta_x_unaccel(&self) -> f64 {
++        self.dx.into()
++    }
++    fn delta_y_unaccel(&self) -> f64 {
++        self.dy.into()
++    }
++}
++
++impl InputBackend for CyxiaInput {
++    type Device = CyxiaDevice;
++    type KeyboardKeyEvent = KeyEvent;
++    type PointerButtonEvent = ButtonEvent;
++    type PointerMotionEvent = MotionEvent;
++    type PointerAxisEvent = UnusedEvent;
++    type PointerMotionAbsoluteEvent = UnusedEvent;
++    type GestureSwipeBeginEvent = UnusedEvent;
++    type GestureSwipeUpdateEvent = UnusedEvent;
++    type GestureSwipeEndEvent = UnusedEvent;
++    type GesturePinchBeginEvent = UnusedEvent;
++    type GesturePinchUpdateEvent = UnusedEvent;
++    type GesturePinchEndEvent = UnusedEvent;
++    type GestureHoldBeginEvent = UnusedEvent;
++    type GestureHoldEndEvent = UnusedEvent;
++    type TouchDownEvent = UnusedEvent;
++    type TouchUpEvent = UnusedEvent;
++    type TouchMotionEvent = UnusedEvent;
++    type TouchCancelEvent = UnusedEvent;
++    type TouchFrameEvent = UnusedEvent;
++    type TabletToolAxisEvent = UnusedEvent;
++    type TabletToolProximityEvent = UnusedEvent;
++    type TabletToolTipEvent = UnusedEvent;
++    type TabletToolButtonEvent = UnusedEvent;
++    type SwitchToggleEvent = UnusedEvent;
++    type SpecialEvent = UnusedEvent;
++}
++
++/// Decoder actions are already de-duplicated, including authoritative resync.
++#[derive(Debug, Default)]
++pub struct InputBridge {
++    pub delivered: DeliveredInput,
++}
++
++impl InputBridge {
++    pub fn event(&mut self, action: InputAction, time: InputTime) -> InputEvent<CyxiaInput> {
++        self.delivered.record(action);
++        match action {
++            InputAction::Key { code, pressed } => InputEvent::Keyboard {
++                event: KeyEvent {
++                    time,
++                    code,
++                    pressed,
++                    count: self.delivered.key_count(),
++                },
++            },
++            InputAction::Button { code, pressed } => InputEvent::PointerButton {
++                event: ButtonEvent {
++                    time,
++                    code,
++                    pressed,
++                },
++            },
++            InputAction::Motion { dx, dy } => InputEvent::PointerMotion {
++                event: MotionEvent { time, dx, dy },
++            },
++            InputAction::Resync => unreachable!("resync must query the native held-key bitmap"),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn keycode_offset_counts_and_release_are_preserved() {
++        let mut bridge = InputBridge::default();
++        for (code, pressed, count) in [(30, true, 1), (42, true, 2), (30, false, 1), (42, false, 0)]
++        {
++            let InputEvent::Keyboard { event } = bridge.event(
++                InputAction::Key { code, pressed },
++                InputTime::from_micros(101),
++            ) else {
++                panic!()
++            };
++            assert_eq!(u32::from(event.key_code()), u32::from(code) + 8);
++            assert_eq!(event.count(), count);
++            assert_eq!(event.time().micros(), 101);
++            assert_eq!(
++                event.state(),
++                if pressed {
++                    KeyState::Pressed
++                } else {
++                    KeyState::Released
++                }
++            );
++        }
++    }
++
++    #[test]
++    fn pointer_uses_evdev_buttons_and_relative_deltas() {
++        let mut bridge = InputBridge::default();
++        let time = InputTime::from_millis(5);
++        let InputEvent::PointerButton { event } = bridge.event(
++            InputAction::Button {
++                code: 272,
++                pressed: true,
++            },
++            time,
++        ) else {
++            panic!()
++        };
++        assert_eq!(event.button_code(), 272);
++        assert_eq!(event.state(), ButtonState::Pressed);
++        let InputEvent::PointerMotion { event } =
++            bridge.event(InputAction::Motion { dx: -7, dy: 13 }, time)
++        else {
++            panic!()
++        };
++        assert_eq!((event.delta_x(), event.delta_y()), (-7.0, 13.0));
++        assert_eq!(event.delta(), event.delta_unaccel());
++        assert!(!CyxiaDevice.has_capability(DeviceCapability::Touch));
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/linux_syscall.rs
+@@ -0,0 +1,40 @@
++//! Real Linux-personality register boundary for musl desktop programs.
++//! Logical Linux/custom syscall numbers are supplied by the caller; this module
++//! never reinterprets an ARM exception frame as an x86 frame.
++#![allow(dead_code)]
++
++/// # Safety
++/// The caller owns all pointer ranges for the duration of the synchronous call.
++pub unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
++    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "musl"))]
++    {
++        let mut result = args[0];
++        unsafe {
++            core::arch::asm!(
++                "svc #0", inlateout("x0") result,
++                in("x1") args[1], in("x2") args[2], in("x3") args[3],
++                in("x4") args[4], in("x5") args[5], in("x8") number,
++                options(nostack),
++            );
++        }
++        result as i64
++    }
++    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "musl"))]
++    {
++        let mut result = number;
++        unsafe {
++            core::arch::asm!(
++                "syscall", inlateout("rax") result,
++                in("rdi") args[0], in("rsi") args[1], in("rdx") args[2],
++                in("r10") args[3], in("r8") args[4], in("r9") args[5],
++                lateout("rcx") _, lateout("r11") _, options(nostack),
++            );
++        }
++        result as i64
++    }
++    #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), target_os = "linux", target_env = "musl")))]
++    {
++        let _ = (number, args);
++        -38
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/locking.rs
+@@ -0,0 +1,452 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Session-lock ownership cannot advance past native scanout completion.
++use super::native::{DisplayInfo, presentation::PendingPresentation};
++use std::io;
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum PendingInput {
++    DeviceLifecycle,
++    Release,
++    Other,
++}
++
++/// Releases reconcile pre-lock holds without opening the isolation barrier.
++/// New presses, movement and gestures remain blocked until black is complete.
++pub(crate) fn input_allowed(shielded: bool, input: PendingInput) -> bool {
++    !shielded || matches!(input, PendingInput::DeviceLifecycle | PendingInput::Release)
++}
++
++/// A live client does not imply that its lock protocol resource still exists.
++pub(crate) fn owner_is_live(resource_alive: bool, client_exists: bool) -> bool {
++    resource_alive && client_exists
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum LockFocusTarget {
++    Clear,
++    LockSurface {
++        alive: bool,
++        current_owner: bool,
++        registered: bool,
++    },
++    Layer {
++        show_on_lock: bool,
++    },
++    Popup {
++        root_show_on_lock: bool,
++    },
++    Other,
++}
++
++/// Applied at focus writes and before installing a popup keyboard grab. The
++/// provisional Shell barrier counts as locked even before public acknowledgment.
++pub(crate) fn lock_focus_allowed(locked: bool, target: LockFocusTarget) -> bool {
++    if !locked {
++        return true;
++    }
++    match target {
++        LockFocusTarget::Clear => true,
++        LockFocusTarget::LockSurface {
++            alive,
++            current_owner,
++            registered,
++        } => alive && current_owner && registered,
++        LockFocusTarget::Layer { show_on_lock } => show_on_lock,
++        LockFocusTarget::Popup { root_show_on_lock } => root_show_on_lock,
++        LockFocusTarget::Other => false,
++    }
++}
++
++pub struct LockBarrier<T> {
++    pending: Option<(T, PendingPresentation)>,
++    shielded: bool,
++}
++
++impl<T> Default for LockBarrier<T> {
++    fn default() -> Self {
++        Self {
++            pending: None,
++            shielded: false,
++        }
++    }
++}
++
++impl<T> LockBarrier<T> {
++    pub fn pending(&self) -> bool {
++        self.pending.is_some()
++    }
++    pub fn shielded(&self) -> bool {
++        self.shielded
++    }
++    pub fn owner(&self) -> Option<&T> {
++        self.pending.as_ref().map(|(owner, _)| owner)
++    }
++    pub fn cancel(&mut self) {
++        self.pending.take();
++        self.shielded = true;
++    }
++
++    /// Rejected owners are dropped, which refuses a real SessionLocker.
++    /// The old normal cursor is canceled before any black tile can be queued.
++    pub fn begin(
++        &mut self,
++        owner: T,
++        info: DisplayInfo,
++        cancel_normal: impl FnOnce(),
++    ) -> io::Result<bool> {
++        if self.pending() {
++            return Ok(false);
++        }
++        self.shielded = true;
++        cancel_normal();
++        let cursor = PendingPresentation::new(info, false)?;
++        self.pending = Some((owner, cursor));
++        Ok(true)
++    }
++
++    pub fn advance(
++        &mut self,
++        budget: usize,
++        valid: impl FnOnce(&T) -> bool,
++    ) -> io::Result<Option<T>> {
++        self.advance_with(|cursor| cursor.advance_black(budget), valid)
++    }
++
++    fn advance_with(
++        &mut self,
++        advance: impl FnOnce(&mut PendingPresentation) -> io::Result<bool>,
++        valid: impl FnOnce(&T) -> bool,
++    ) -> io::Result<Option<T>> {
++        let Some((_, cursor)) = self.pending.as_mut() else {
++            return Ok(None);
++        };
++        match advance(cursor) {
++            Ok(false) => Ok(None),
++            Ok(true) => {
++                let (owner, _) = self.pending.take().unwrap();
++                if valid(&owner) {
++                    self.shielded = false;
++                    Ok(Some(owner))
++                } else {
++                    // Finish black even if its client died, but never acknowledge
++                    // a dead owner or re-enable an unlocked normal render.
++                    self.shielded = true;
++                    Ok(None)
++                }
++            }
++            Err(err) => {
++                self.pending.take(); // Refuse/drop owner, never return it for acknowledgment.
++                Err(err)
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{cell::Cell, rc::Rc};
++
++    struct Owner(Rc<Cell<usize>>);
++    impl Drop for Owner {
++        fn drop(&mut self) {
++            self.0.set(self.0.get() + 1);
++        }
++    }
++    fn info() -> DisplayInfo {
++        DisplayInfo {
++            width: 6,
++            height: 3,
++            stride_bytes: 24,
++            format: 1,
++            max_rect_bytes: 16,
++            abi: 1,
++        }
++    }
++
++    #[test]
++    fn pending_input_releases_preserve_isolation_and_do_not_complete_the_lock() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(input_allowed(barrier.shielded(), PendingInput::Release));
++        assert!(input_allowed(
++            barrier.shielded(),
++            PendingInput::DeviceLifecycle
++        ));
++        assert!(!input_allowed(barrier.shielded(), PendingInput::Other));
++        assert!(barrier.pending());
++        assert!(barrier.shielded());
++        assert_eq!(dropped.get(), 0);
++        for input in [
++            PendingInput::Release,
++            PendingInput::DeviceLifecycle,
++            PendingInput::Other,
++        ] {
++            assert!(input_allowed(false, input));
++        }
++    }
++
++    #[test]
++    fn destroyed_lock_with_connected_client_can_be_replaced_without_stale_ack() {
++        assert!(!owner_is_live(false, true));
++        assert!(!owner_is_live(true, false));
++        assert!(owner_is_live(true, true));
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(1, |_, _| Ok(0)),
++                    |_| true
++                )
++                .unwrap()
++                .is_none()
++        );
++        // The Wayland client remains connected after destroying its lock.
++        if !owner_is_live(false, true) {
++            barrier.cancel();
++        }
++        assert_eq!(dropped.get(), 1);
++        assert!(barrier.shielded());
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(1, |_, _| Ok(0)),
++                    |_| true
++                )
++                .unwrap()
++                .is_none()
++        );
++        assert_eq!(dropped.get(), 1);
++        let replacement = barrier
++            .advance_with(
++                |cursor| cursor.advance_black_with(16, |_, _| Ok(0)),
++                |_| owner_is_live(true, true),
++            )
++            .unwrap();
++        assert!(replacement.is_some());
++        drop(replacement);
++        assert_eq!(dropped.get(), 2);
++    }
++
++    #[test]
++    fn pending_lock_rejects_layer_commit_and_popup_grab_focus_bypasses() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier.begin(Owner(dropped), info(), || {}).unwrap();
++        for target in [
++            LockFocusTarget::Layer {
++                show_on_lock: false,
++            },
++            LockFocusTarget::Popup {
++                root_show_on_lock: false,
++            },
++            LockFocusTarget::Other,
++        ] {
++            // The shell barrier exists immediately, not only after locked ACK.
++            assert!(!lock_focus_allowed(barrier.shielded(), target));
++            assert!(lock_focus_allowed(false, target));
++        }
++        assert!(barrier.pending());
++        assert!(lock_focus_allowed(true, LockFocusTarget::Clear));
++        assert!(lock_focus_allowed(
++            true,
++            LockFocusTarget::Layer { show_on_lock: true }
++        ));
++        assert!(lock_focus_allowed(
++            true,
++            LockFocusTarget::Popup {
++                root_show_on_lock: true
++            }
++        ));
++    }
++
++    #[test]
++    fn early_lock_surface_focus_requires_live_current_registered_owner() {
++        for (alive, current_owner, registered) in [
++            (true, true, true),
++            (false, true, true),
++            (true, false, true),
++            (true, true, false),
++        ] {
++            assert_eq!(
++                lock_focus_allowed(
++                    true,
++                    LockFocusTarget::LockSurface {
++                        alive,
++                        current_owner,
++                        registered,
++                    }
++                ),
++                alive && current_owner && registered
++            );
++        }
++    }
++
++    #[test]
++    fn partial_unlocked_frame_is_canceled_and_busy_black_cannot_acknowledge() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut normal = Some(PendingPresentation::new(info(), false).unwrap());
++        // A real old cursor already submitted a partial frame.
++        assert!(
++            !normal
++                .as_mut()
++                .unwrap()
++                .advance_black_with(1, |_, _| Ok(0))
++                .unwrap()
++        );
++        let mut barrier = LockBarrier::default();
++        assert!(
++            barrier
++                .begin(Owner(dropped.clone()), info(), || {
++                    normal.take();
++                })
++                .unwrap()
++        );
++        assert!(normal.is_none());
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(16, |_, bytes| {
++                        assert!(bytes.iter().all(|byte| *byte == 0));
++                        Err(io::ErrorKind::WouldBlock.into())
++                    }),
++                    |_| true
++                )
++                .unwrap()
++                .is_none()
++        );
++        assert!(barrier.pending());
++        assert_eq!(dropped.get(), 0);
++        for index in 0..5 {
++            let owner = barrier
++                .advance_with(
++                    |cursor| {
++                        cursor.advance_black_with(1, |_, bytes| {
++                            assert!(bytes.iter().all(|byte| *byte == 0));
++                            Ok(0)
++                        })
++                    },
++                    |_| true,
++                )
++                .unwrap();
++            assert_eq!(owner.is_some(), index == 4);
++        }
++        assert!(!barrier.pending());
++        assert_eq!(dropped.get(), 1);
++    }
++
++    #[test]
++    fn fatal_submission_refuses_owner_without_acknowledgment() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(1, |_, _| Ok(0)),
++                    |_| true
++                )
++                .unwrap()
++                .is_none()
++        );
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor
++                        .advance_black_with(1, |_, _| Err(io::Error::from_raw_os_error(19))),
++                    |_| true
++                )
++                .is_err()
++        );
++        assert!(!barrier.pending());
++        assert!(barrier.shielded());
++        assert_eq!(dropped.get(), 1);
++        assert!(
++            barrier
++                .advance_with(|_| panic!("failed blank resumed"), |_| true)
++                .unwrap()
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn duplicate_request_is_refused_without_restarting_the_active_blank() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            !barrier
++                .begin(Owner(dropped.clone()), info(), || panic!(
++                    "duplicate canceled active cursor"
++                ))
++                .unwrap()
++        );
++        assert_eq!(dropped.get(), 1);
++        assert!(barrier.pending());
++        drop(barrier);
++        assert_eq!(dropped.get(), 2);
++    }
++
++    #[test]
++    fn dead_owner_finishes_black_without_ack_and_replacement_owns_new_completion() {
++        let dropped = Rc::new(Cell::new(0));
++        let mut barrier = LockBarrier::default();
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(16, |_, _| Ok(0)),
++                    |_| false
++                )
++                .unwrap()
++                .is_none()
++        );
++        assert!(barrier.shielded());
++        assert!(!barrier.pending());
++        assert_eq!(dropped.get(), 1);
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        assert!(
++            barrier
++                .advance_with(
++                    |cursor| cursor.advance_black_with(1, |_, _| Ok(0)),
++                    |_| true
++                )
++                .unwrap()
++                .is_none()
++        );
++        barrier.cancel(); // A dead pending owner is replaced before final tile.
++        assert!(barrier.shielded());
++        assert_eq!(dropped.get(), 2);
++        barrier
++            .begin(Owner(dropped.clone()), info(), || {})
++            .unwrap();
++        let replacement = barrier
++            .advance_with(
++                |cursor| cursor.advance_black_with(16, |_, _| Ok(0)),
++                |_| true,
++            )
++            .unwrap();
++        assert!(replacement.is_some());
++        assert!(!barrier.shielded());
++        drop(replacement);
++        assert_eq!(dropped.get(), 3);
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/mod.rs
+@@ -0,0 +1,762 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Actual cosmic-comp backend for Cyxia ABI v1 and Mesa surfaceless EGL.
++//!
++//! The native ABI has no page-flip timestamps, refresh query, hotplug, power
++//! control, or DMA-BUF node. Presentation feedback therefore promises neither
++//! vsync nor hardware timing; wl_shm remains the client buffer path.
++mod delivery;
++mod egl;
++mod input;
++mod locking;
++mod native;
++mod scheduling;
++
++use crate::{
++    backend::render::{self, CursorMode, ScreenFilterStorage, init_shaders},
++    config::ScreenFilter,
++    input::InputBackendId,
++    shell::SessionLock,
++    state::{BackendData, Common, State},
++};
++use anyhow::{Context, Result, bail};
++use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState, TransformDef};
++use input::{CyxiaDevice, CyxiaInput, InputBridge};
++use locking::{LockBarrier, owner_is_live};
++pub(crate) use locking::{LockFocusTarget, PendingInput, input_allowed, lock_focus_allowed};
++use native::{InputAction, InputDecoder, NativeDisplay, presentation::PendingPresentation};
++use scheduling::RenderSchedule;
++use smithay::{
++    backend::{
++        allocator::Fourcc,
++        egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay},
++        input::{InputEvent, InputTime},
++        renderer::{
++            Bind, ExportMem, Offscreen, TextureMapping,
++            damage::{OutputDamageTracker, RenderOutputResult},
++            element::RenderElementStates,
++            gles::{GlesMapping, GlesRenderbuffer},
++            glow::GlowRenderer,
++        },
++    },
++    desktop::utils::OutputPresentationFeedback,
++    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
++    reexports::{
++        calloop::{
++            EventLoop, RegistrationToken,
++            timer::{TimeoutAction, Timer},
++        },
++        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
++        wayland_server::{DisplayHandle, Resource},
++    },
++    utils::{Rectangle, SERIAL_COUNTER, Transform},
++    wayland::{presentation::Refresh, session_lock::SessionLocker},
++};
++use std::{
++    borrow::BorrowMut,
++    cell::RefCell,
++    collections::HashMap,
++    fmt,
++    time::{Duration, Instant},
++};
++use tracing::{error, warn};
++
++const INPUT_INTERVAL: Duration = Duration::from_millis(8);
++const TILES_PER_TICK: usize = 16;
++
++fn validate_output_config(info: native::DisplayInfo, config: &OutputConfig) -> Result<()> {
++    if config.enabled != OutputState::Enabled
++        || config.mode.0 != (info.width as i32, info.height as i32)
++        || config.mode.1.is_some_and(|refresh| refresh != 60_000)
++        || config.transform != TransformDef::Flipped180
++        || config.vrr != AdaptiveSync::Disabled
++        || config.max_bpc.is_some_and(|bits| bits != 8)
++        || !config.scale.is_finite()
++        || config.scale <= 0.0
++    {
++        bail!("Cyxia ABI v1 requires its fixed enabled framebuffer, 8-bit color and no VRR");
++    }
++    Ok(())
++}
++
++struct PendingFrame {
++    mapping: GlesMapping,
++    presentation: PendingPresentation,
++    states: RenderElementStates,
++    feedback: Option<OutputPresentationFeedback>,
++}
++
++impl Drop for PendingFrame {
++    fn drop(&mut self) {
++        if let Some(feedback) = self.feedback.as_mut() {
++            feedback.discarded();
++        }
++    }
++}
++
++pub struct CyxiaState {
++    lock_barrier: LockBarrier<SessionLocker>,
++    // Drop any readback mapping before the framebuffer and EGL renderer.
++    pending: Option<PendingFrame>,
++    // Drop the framebuffer before its renderer even on an early init failure.
++    buffer: GlesRenderbuffer,
++    pub renderer: GlowRenderer,
++    native: NativeDisplay,
++    output: Output,
++    damage_tracker: OutputDamageTracker,
++    screen_filter_state: ScreenFilterStorage,
++    decoder: InputDecoder,
++    bridge: InputBridge,
++    input_registered: bool,
++    timer: Option<RegistrationToken>,
++    schedule: RenderSchedule,
++    failure: Option<anyhow::Error>,
++}
++
++impl fmt::Debug for CyxiaState {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("CyxiaState")
++            .field("output", &self.output)
++            .field("schedule", &self.schedule)
++            .field("failure", &self.failure)
++            .finish_non_exhaustive()
++    }
++}
++
++impl CyxiaState {
++    pub fn input_suspended(&self) -> bool {
++        self.lock_barrier.shielded()
++    }
++    pub fn all_outputs(&self) -> Vec<Output> {
++        vec![self.output.clone()]
++    }
++
++    pub fn schedule_render(&mut self, output: &Output) {
++        if output == &self.output {
++            self.schedule.request();
++        }
++    }
++
++    /// Validate before Common changes Output mode/geometry, including TEST_ONLY.
++    pub fn validate_config(&self) -> Result<()> {
++        let info = self.native.info();
++        let config = self
++            .output
++            .user_data()
++            .get::<RefCell<OutputConfig>>()
++            .unwrap()
++            .borrow();
++        validate_output_config(info, &config)
++    }
++
++    pub fn apply_config_for_outputs(&mut self, test_only: bool) -> Result<()> {
++        self.validate_config()?;
++        if !test_only {
++            self.schedule.request();
++        }
++        Ok(())
++    }
++
++    pub fn update_screen_filter(&mut self, filter: &ScreenFilter) -> Result<()> {
++        self.screen_filter_state.filter = filter.clone();
++        self.schedule.request();
++        Ok(())
++    }
++
++    fn poll_input(&mut self) -> Result<Vec<InputAction>> {
++        let mut actions = Vec::new();
++        // Cap work per dispatch so sustained input cannot starve Wayland/DBus.
++        for _ in 0..4 {
++            let mut events = [native::InputEvent::default(); 32];
++            let count = native::read_input(&mut events).context("Cyxia input read")?;
++            for event in &events[..count] {
++                match self.decoder.push(*event) {
++                    Ok(Some(frame)) => {
++                        for action in frame {
++                            if action == InputAction::Resync {
++                                actions.extend(
++                                    self.decoder.resynchronize(native::input_key_state()?)?,
++                                );
++                            } else {
++                                actions.push(action);
++                            }
++                        }
++                    }
++                    Ok(None) => {}
++                    // The decoder drops the whole packet and recovers at the
++                    // next SYN_REPORT. Do not commit its incomplete transitions.
++                    Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
++                        warn!(?err, "Unsupported native input packet; resynchronizing");
++                    }
++                    Err(err) => return Err(err.into()),
++                }
++            }
++            if count < events.len() {
++                break;
++            }
++        }
++        Ok(actions)
++    }
++
++    fn render_output(&mut self, common: &mut Common) -> Result<()> {
++        // Clear at rendering, never at tile completion: commits received while
++        // presentation is pending must remain dirty for the next real frame.
++        self.schedule.begin();
++        let mut fb = self
++            .renderer
++            .bind(&mut self.buffer)
++            .context("Bind Cyxia framebuffer")?;
++        let RenderOutputResult {
++            sync,
++            damage,
++            states,
++        } = render::render_output(
++            None,
++            &mut self.renderer,
++            &mut fb,
++            &mut self.damage_tracker,
++            1,
++            &common.shell,
++            common.clock.now(),
++            &self.output,
++            CursorMode::All,
++            &mut self.screen_filter_state,
++            &common.event_loop_handle,
++        )
++        .context("Render COSMIC output for Cyxia")?;
++        sync.wait().context("Wait for COSMIC rendering")?;
++        let mapping = if damage.is_some() {
++            let info = self.native.info();
++            Some(
++                self.renderer
++                    .copy_framebuffer(
++                        &fb,
++                        Rectangle::from_size((info.width as i32, info.height as i32).into()),
++                        Fourcc::Abgr8888,
++                    )
++                    .context("Read COSMIC framebuffer")?,
++            )
++        } else {
++            None
++        };
++        drop(fb);
++        // Select actual rendered surfaces and snapshot their presentation
++        // requests before yielding. A newer commit must not be reported as this
++        // frame. No frame.done or presented event is sent by this selection.
++        common.update_primary_output(&self.output, &states);
++        let feedback = common
++            .shell
++            .read()
++            .take_presentation_feedback(&self.output, &states);
++        if let Some(mapping) = mapping {
++            let presentation = PendingPresentation::new(self.native.info(), mapping.flipped())?;
++            self.pending = Some(PendingFrame {
++                mapping,
++                presentation,
++                states,
++                feedback: Some(feedback),
++            });
++        } else {
++            self.complete_frame(common, &states, feedback);
++        }
++        Ok(())
++    }
++
++    fn advance_presentation(&mut self, common: &mut Common) -> Result<()> {
++        let Some(frame) = self.pending.as_mut() else {
++            return Ok(());
++        };
++        let bytes = self
++            .renderer
++            .map_texture(&frame.mapping)
++            .context("Map COSMIC framebuffer")?;
++        if !frame
++            .presentation
++            .advance(bytes, TILES_PER_TICK)
++            .context("Submit Cyxia display tiles")?
++        {
++            return Ok(());
++        }
++        let mut frame = self.pending.take().unwrap();
++        let feedback = frame.feedback.take().unwrap();
++        self.complete_frame(common, &frame.states, feedback);
++        Ok(())
++    }
++
++    fn complete_frame(
++        &mut self,
++        common: &mut Common,
++        states: &RenderElementStates,
++        mut feedback: OutputPresentationFeedback,
++    ) {
++        // For damaged frames only the final successful native tile reaches
++        // here. Freshly visible surfaces need primary selection before the
++        // callback gate, because this backend may idle after this frame.
++        common.update_primary_output(&self.output, states);
++        common.send_frames(&self.output, None);
++        common.send_dmabuf_feedback(&self.output, states, |_| None);
++        feedback.presented(
++            common.clock.now(),
++            Refresh::Unknown,
++            0,
++            wp_presentation_feedback::Kind::empty(),
++        );
++        self.schedule.completed(Instant::now());
++    }
++}
++
++fn dispatch_actions(state: &mut State, actions: Vec<InputAction>) {
++    // Drain native decoding during blanking, but never record rejected events
++    // as delivered. The ledger contains only transitions sent to COSMIC.
++    if state.backend.cyxia().input_suspended() {
++        return;
++    }
++    for action in actions {
++        let event = state.backend.cyxia().bridge.event(action, InputTime::now());
++        state.process_input_event(event, InputBackendId::Normal);
++    }
++}
++
++fn tick(state: &mut State) -> Result<()> {
++    // init_backend_auto creates the real COSMIC seat after backend init.
++    if !state.backend.cyxia().input_registered {
++        state.process_input_event::<CyxiaInput>(
++            InputEvent::DeviceAdded {
++                device: CyxiaDevice,
++            },
++            InputBackendId::Normal,
++        );
++        state.backend.cyxia().input_registered = true;
++        let actions = state
++            .backend
++            .cyxia()
++            .decoder
++            .resynchronize(native::input_key_state()?)?;
++        dispatch_actions(state, actions);
++    }
++    let actions = state.backend.cyxia().poll_input()?;
++    if state.backend.cyxia().input_suspended() {
++        let owner = state
++            .backend
++            .cyxia()
++            .lock_barrier
++            .advance(TILES_PER_TICK, |locker| {
++                locker.ext_session_lock().is_alive()
++            })?;
++        if let Some(locker) = owner {
++            // The full native scanout is now opaque black. Preserve lock
++            // surfaces configured against the provisional isolation barrier.
++            state.accept_session_lock(locker);
++            Common::refresh_focus(state);
++            let backend = state.backend.cyxia();
++            backend.damage_tracker = OutputDamageTracker::from_output(&backend.output);
++            backend.schedule.request();
++        }
++        return Ok(());
++    }
++    let activity = !actions.is_empty();
++    dispatch_actions(state, actions);
++    let backend = state.backend.cyxia();
++    if activity {
++        backend.schedule.request();
++    }
++    if backend
++        .schedule
++        .due(Instant::now(), backend.pending.is_some())
++    {
++        backend.render_output(&mut state.common)?;
++    }
++    backend.advance_presentation(&mut state.common)?;
++    Ok(())
++}
++
++impl State {
++    pub(crate) fn begin_cyxia_lock(&mut self, locker: SessionLocker) {
++        if !locker.ext_session_lock().is_alive() {
++            return;
++        }
++        // A live current owner (including a pending provisional owner) wins.
++        if self
++            .common
++            .shell
++            .read()
++            .session_lock
++            .as_ref()
++            .is_some_and(|lock| {
++                owner_is_live(
++                    lock.ext_session_lock.is_alive(),
++                    self.common
++                        .display_handle
++                        .get_client(lock.ext_session_lock.id())
++                        .is_ok(),
++                )
++            })
++        {
++            return;
++        }
++        if self
++            .backend
++            .cyxia()
++            .lock_barrier
++            .owner()
++            .is_some_and(|owner| owner.ext_session_lock().is_alive())
++        {
++            return;
++        }
++        if self.backend.cyxia().lock_barrier.pending() {
++            // Replace a dead pending owner, retaining isolation. Its old black
++            // cursor can no longer acknowledge or submit after replacement.
++            self.backend.cyxia().lock_barrier.cancel();
++        }
++        self.common.shell.write().session_lock = Some(SessionLock {
++            ext_session_lock: locker.ext_session_lock().clone(),
++            surfaces: HashMap::new(),
++        });
++
++        // Provisional shell isolation protects direct virtual-keyboard paths,
++        // which do not pass through State::process_input_event. Clear old grabs
++        // and focus immediately, then let the real lock focus policy take over.
++        let seats = self
++            .common
++            .shell
++            .read()
++            .seats
++            .iter()
++            .cloned()
++            .collect::<Vec<_>>();
++        for seat in seats {
++            let serial = SERIAL_COUNTER.next_serial();
++            if let Some(keyboard) = seat.get_keyboard() {
++                keyboard.unset_grab(self);
++                keyboard.set_focus(self, None, serial);
++            }
++            if let Some(pointer) = seat.get_pointer() {
++                let time = InputTime::now();
++                pointer.unset_grab(self, serial, time);
++                pointer.motion(
++                    self,
++                    None,
++                    &smithay::input::pointer::MotionEvent {
++                        location: pointer.current_location(),
++                        serial,
++                        time,
++                    },
++                );
++                pointer.frame(self);
++            }
++        }
++        let result = (|| -> Result<()> {
++            let releases = self.backend.cyxia().bridge.delivered.releases()?;
++            // Normally not shielded yet. For a dead-owner replacement the
++            // previous transition already released this ledger completely.
++            dispatch_actions(self, releases);
++            let backend = self.backend.cyxia();
++            let info = backend.native.info();
++            backend.lock_barrier.begin(locker, info, || {
++                backend.pending.take();
++            })?;
++            backend.damage_tracker = OutputDamageTracker::from_output(&backend.output);
++            Ok(())
++        })();
++        if let Err(err) = result {
++            error!(?err, "Native session lock blanking failed");
++            self.backend.cyxia().pending.take();
++            self.backend.cyxia().lock_barrier.cancel();
++            self.backend.cyxia().failure = Some(err);
++            self.common.should_stop = true;
++        }
++        Common::refresh_focus(self);
++    }
++}
++
++pub fn init_backend(
++    _dh: &DisplayHandle,
++    event_loop: &mut EventLoop<'static, State>,
++    state: &mut State,
++) -> Result<()> {
++    // Query the real kernel ABI before creating EGL or advertising any output.
++    let native = NativeDisplay::connect().context("Connect Cyxia display ABI v1")?;
++    let info = native.info();
++    egl::load().context("Load linked Mesa EGL dispatch")?;
++    // SAFETY: the backend exclusively owns this EGL display/context on the
++    // event-loop thread. No native pointer or DRM fd is fabricated.
++    let display =
++        unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.context("Open surfaceless EGL")?;
++    let context = EGLContext::new(&display).context("Create Cyxia EGL context")?;
++    let mut renderer =
++        unsafe { GlowRenderer::new(context) }.context("Create Cyxia Glow renderer")?;
++    init_shaders(renderer.borrow_mut()).context("Initialize COSMIC shaders")?;
++    let size = (info.width as i32, info.height as i32);
++    let buffer = renderer
++        .create_buffer(Fourcc::Abgr8888, size.into())
++        .context("Allocate Cyxia output buffer")?;
++    let output = Output::new(
++        "CYXIA-0".into(),
++        PhysicalProperties {
++            size: (0, 0).into(),
++            subpixel: Subpixel::Unknown,
++            make: "CyxiaOS".into(),
++            model: "Native display ABI v1".into(),
++            serial_number: "Unknown".into(),
++        },
++    );
++    let mode = Mode {
++        size: size.into(),
++        refresh: 60_000,
++    };
++    output.add_mode(mode);
++    output.set_preferred(mode);
++    output.change_current_state(
++        Some(mode),
++        Some(Transform::Flipped180),
++        Some(Scale::Integer(1)),
++        Some((0, 0).into()),
++    );
++    output.user_data().insert_if_missing(|| {
++        RefCell::new(OutputConfig {
++            mode: (size, None),
++            transform: TransformDef::Flipped180,
++            vrr: AdaptiveSync::Disabled,
++            ..Default::default()
++        })
++    });
++    let timer = event_loop
++        .handle()
++        .insert_source(Timer::immediate(), |_, _, state| {
++            if state.common.should_stop {
++                return TimeoutAction::Drop;
++            }
++            if let Err(err) = tick(state) {
++                error!(?err, "Cyxia backend stopped");
++                state.backend.cyxia().failure = Some(err);
++                state.common.should_stop = true;
++                return TimeoutAction::Drop;
++            }
++            TimeoutAction::ToDuration(INPUT_INTERVAL)
++        })
++        .map_err(|err| anyhow::anyhow!("Register Cyxia input/render timer: {err}"))?;
++    state.backend = BackendData::Cyxia(CyxiaState {
++        lock_barrier: LockBarrier::default(),
++        pending: None,
++        renderer,
++        buffer,
++        native,
++        output: output.clone(),
++        damage_tracker: OutputDamageTracker::from_output(&output),
++        screen_filter_state: ScreenFilterStorage {
++            filter: state.common.config.dynamic_conf.screen_filter().clone(),
++            ..Default::default()
++        },
++        decoder: InputDecoder::new(),
++        bridge: InputBridge::default(),
++        input_registered: false,
++        timer: Some(timer),
++        schedule: RenderSchedule::new(Instant::now()),
++        failure: None,
++    });
++    state
++        .common
++        .output_configuration_state
++        .add_heads(std::iter::once(&output));
++    state.common.add_output(&output);
++    // Finish the temporary workspace update guard before error cleanup borrows
++    // the full State again (including its input seats and backend resources).
++    let config_result = state.common.config.read_outputs(
++        &mut state.common.output_configuration_state,
++        &mut state.backend,
++        &state.common.shell,
++        &state.common.event_loop_handle,
++        &mut state.common.workspace_state.update(),
++        &state.common.xdg_activation_state,
++        state.common.startup_done.clone(),
++        &state.common.clock,
++    );
++    if let Err(err) = config_result {
++        let _ = shutdown(state);
++        return Err(err).context("Configure Cyxia output");
++    }
++    state.common.refresh();
++    if state.common.with_xwayland {
++        state.launch_xwayland(None);
++    } else {
++        state.notify_ready();
++    }
++    Ok(())
++}
++
++/// Stop event sources, release held input, remove the output and unbind EGL.
++/// Called after the event loop exits even when dispatch returned an error.
++pub fn shutdown(state: &mut State) -> Result<()> {
++    if !matches!(state.backend, BackendData::Cyxia(_)) {
++        return Ok(());
++    }
++    if let Some(token) = state.backend.cyxia().timer.take() {
++        state.common.event_loop_handle.remove(token);
++    }
++    let mut cleanup_error = None;
++    if state.backend.cyxia().input_registered {
++        match state.backend.cyxia().bridge.delivered.releases() {
++            Ok(actions) => dispatch_actions(state, actions),
++            Err(err) => cleanup_error = Some(anyhow::Error::from(err)),
++        }
++        state.process_input_event::<CyxiaInput>(
++            InputEvent::DeviceRemoved {
++                device: CyxiaDevice,
++            },
++            InputBackendId::Normal,
++        );
++        state.backend.cyxia().input_registered = false;
++    }
++    let output = state.backend.cyxia().output.clone();
++    state
++        .common
++        .output_configuration_state
++        .remove_heads(std::iter::once(&output));
++    state.common.remove_output(&output);
++    let BackendData::Cyxia(backend) = std::mem::replace(&mut state.backend, BackendData::Unset)
++    else {
++        unreachable!();
++    };
++    let failure = backend.failure;
++    drop(backend.pending);
++    drop(backend.lock_barrier);
++    drop(backend.buffer);
++    // Drop renderer-owned shader/filter objects while its EGL context is alive.
++    drop(backend.screen_filter_state);
++    let unbound = backend
++        .renderer
++        .egl_context()
++        .unbind()
++        .context("Unbind Cyxia EGL context");
++    drop(backend.renderer);
++    let released = egl::release_thread();
++    if let Some(err) = failure.or(cleanup_error) {
++        return Err(err);
++    }
++    unbound?;
++    released
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn info() -> native::DisplayInfo {
++        native::DisplayInfo {
++            width: 800,
++            height: 600,
++            stride_bytes: 3200,
++            format: 1,
++            max_rect_bytes: 65536,
++            abi: 1,
++        }
++    }
++    fn config() -> OutputConfig {
++        OutputConfig {
++            mode: ((800, 600), None),
++            transform: TransformDef::Flipped180,
++            vrr: AdaptiveSync::Disabled,
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn fixed_output_rejects_unavailable_physical_capabilities() {
++        for unsupported in [
++            OutputConfig {
++                mode: ((1024, 768), None),
++                ..config()
++            },
++            OutputConfig {
++                mode: ((800, 600), Some(144_000)),
++                ..config()
++            },
++            OutputConfig {
++                transform: TransformDef::_90,
++                ..config()
++            },
++            OutputConfig {
++                enabled: OutputState::Disabled,
++                ..config()
++            },
++            OutputConfig {
++                enabled: OutputState::Mirroring("another-output".into()),
++                ..config()
++            },
++            OutputConfig {
++                vrr: AdaptiveSync::Force,
++                ..config()
++            },
++            OutputConfig {
++                max_bpc: Some(10),
++                ..config()
++            },
++            OutputConfig {
++                scale: 0.0,
++                ..config()
++            },
++            OutputConfig {
++                scale: f64::NAN,
++                ..config()
++            },
++        ] {
++            assert!(
++                validate_output_config(info(), &unsupported).is_err(),
++                "{unsupported:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn logical_output_scale_position_and_current_color_are_allowed() {
++        let request = OutputConfig {
++            mode: ((800, 600), Some(60_000)),
++            scale: 2.0,
++            position: (100, 200),
++            max_bpc: Some(8),
++            ..config()
++        };
++        let saved = request.clone();
++        assert!(validate_output_config(info(), &request).is_ok());
++        assert_eq!(request, saved);
++    }
++
++    #[test]
++    fn first_render_needs_primary_output_before_callback_eligibility() {
++        use smithay::backend::renderer::element::{
++            Id, PrimaryScanoutOutput, RenderElementPresentationState, RenderElementState,
++            RenderElementStates, default_primary_scanout_output_compare,
++        };
++        let output = Output::new(
++            "native-test".into(),
++            PhysicalProperties {
++                size: (0, 0).into(),
++                subpixel: Subpixel::Unknown,
++                make: "test".into(),
++                model: "test".into(),
++                serial_number: "test".into(),
++            },
++        );
++        let id = Id::new();
++        let mut states = RenderElementStates::default();
++        states.states.insert(
++            id.clone(),
++            RenderElementState {
++                visible_area: 100,
++                presentation_state: RenderElementPresentationState::Rendering { reason: None },
++                needs_capture: false,
++            },
++        );
++        let mut primary = PrimaryScanoutOutput::default();
++        // This is the actual Smithay state used by Common::send_frames' gate.
++        // Sending first would leave a fresh surface's callback unsent at idle.
++        assert_ne!(primary.current_output().as_ref(), Some(&output));
++        primary.update_from_render_element_states(
++            id,
++            &output,
++            None,
++            &states,
++            default_primary_scanout_output_compare,
++        );
++        assert_eq!(primary.current_output().as_ref(), Some(&output));
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/native.rs
+@@ -0,0 +1,673 @@
++//! CyxiaOS ABI v1 display/input adapter. Pixels come from Smithay readback.
++use std::io;
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++#[repr(C)]
++pub struct DisplayInfo {
++    pub width: u32,
++    pub height: u32,
++    pub stride_bytes: u32,
++    pub format: u32,
++    pub max_rect_bytes: u32,
++    pub abi: u32,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++#[repr(C)]
++pub struct InputEvent {
++    pub kind: u16,
++    pub code: u16,
++    pub value: i32,
++}
++
++const _: () = assert!(std::mem::size_of::<DisplayInfo>() == 24);
++const _: () = assert!(std::mem::size_of::<InputEvent>() == 8);
++
++#[derive(Clone, Copy, Debug)]
++struct Rectangle {
++    x: u32,
++    y: u32,
++    width: u32,
++    height: u32,
++}
++
++fn invalid(message: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidInput, message)
++}
++
++fn validate_info(info: DisplayInfo) -> io::Result<()> {
++    if info.abi != 1
++        || info.format != 1
++        || !(1..=4096).contains(&info.width)
++        || !(1..=4096).contains(&info.height)
++        || info.stride_bytes < info.width * 4
++        || !info.stride_bytes.is_multiple_of(4)
++        || !(4..=65536).contains(&info.max_rect_bytes)
++        || !info.max_rect_bytes.is_multiple_of(4)
++    {
++        return Err(invalid("unsupported native display layout"));
++    }
++    Ok(())
++}
++
++fn present_with(
++    info: DisplayInfo,
++    rectangle: Rectangle,
++    rgba: &[u8],
++    flipped: bool,
++    mut submit: impl FnMut(Rectangle, &[u8]) -> io::Result<()>,
++) -> io::Result<()> {
++    validate_info(info)?;
++    let Rectangle {
++        x,
++        y,
++        width,
++        height,
++    } = rectangle;
++    if width == 0
++        || height == 0
++        || x.checked_add(width).is_none_or(|end| end > info.width)
++        || y.checked_add(height).is_none_or(|end| end > info.height)
++        || u64::from(width) * u64::from(height) * 4 != rgba.len() as u64
++    {
++        return Err(invalid("out-of-bounds or incorrectly packed RGBA frame"));
++    }
++    // One reusable <=16KiB CPU staging allocation, independent of screen size.
++    // It follows the normal guest allocator/AI admission path.
++    let capacity = (info.max_rect_bytes as usize).min(16384);
++    let mut tile = Vec::new();
++    tile.try_reserve_exact(capacity)
++        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "display staging allocation"))?;
++    tile.resize(capacity, 0);
++    let mut left = 0;
++    while left < width {
++        let columns = (width - left).min(capacity as u32 / 4);
++        let max_rows = capacity as u32 / (columns * 4);
++        let mut top = 0;
++        while top < height {
++            let rows = (height - top).min(max_rows);
++            let length = (columns * rows * 4) as usize;
++            for row in 0..rows {
++                let source_row = if flipped {
++                    height - 1 - top - row
++                } else {
++                    top + row
++                };
++                for column in 0..columns {
++                    let source = ((source_row * width + left + column) * 4) as usize;
++                    let target = ((row * columns + column) * 4) as usize;
++                    // Smithay ABGR8888 readback is RGBA bytes. Native XRGB8888
++                    // is B,G,R,unused on little-endian ARM; alpha is already
++                    // composited against the renderer's opaque background.
++                    tile[target..target + 4].copy_from_slice(&[
++                        rgba[source + 2],
++                        rgba[source + 1],
++                        rgba[source],
++                        0,
++                    ]);
++                }
++            }
++            submit(
++                Rectangle {
++                    x: x + left,
++                    y: y + top,
++                    width: columns,
++                    height: rows,
++                },
++                &tile[..length],
++            )?;
++            top += rows;
++        }
++        left += columns;
++    }
++    Ok(())
++}
++
++/// Validated native output. A successful present has completed every GPU fence.
++pub struct NativeDisplay {
++    info: DisplayInfo,
++}
++
++fn syscall_result(value: i64) -> io::Result<usize> {
++    if value < 0 {
++        let errno = value
++            .checked_neg()
++            .and_then(|n| i32::try_from(n).ok())
++            .filter(|n| (1..=4095).contains(n));
++        Err(errno
++            .map(io::Error::from_raw_os_error)
++            .unwrap_or_else(|| io::Error::other("invalid native syscall result")))
++    } else {
++        usize::try_from(value).map_err(|_| io::Error::other("native result overflow"))
++    }
++}
++
++#[path = "linux_syscall.rs"]
++mod linux_syscall;
++use linux_syscall::syscall6;
++
++fn retry_submission(
++    deadline: std::time::Instant,
++    mut submit: impl FnMut() -> io::Result<usize>,
++) -> io::Result<()> {
++    loop {
++        if std::time::Instant::now() >= deadline {
++            return Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                "native display busy",
++            ));
++        }
++        match submit() {
++            Ok(0) => return Ok(()),
++            Ok(_) => return Err(io::Error::other("invalid display completion")),
++            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                std::thread::sleep(std::time::Duration::from_millis(1));
++            }
++            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++            Err(error) => return Err(error),
++        }
++    }
++}
++
++impl NativeDisplay {
++    pub fn connect() -> io::Result<Self> {
++        let mut info = DisplayInfo::default();
++        // SAFETY: repr(C) has the exact24-byte ABI; the exclusive reference
++        // remains valid until the kernel finishes copying the result.
++        let count = syscall_result(unsafe {
++            syscall6(
++                0x43595801,
++                [&mut info as *mut DisplayInfo as u64, 0, 0, 0, 0, 0],
++            )
++        })?;
++        if count != 0 {
++            return Err(io::Error::other("invalid display info result"));
++        }
++        validate_info(info)?;
++        Ok(Self { info })
++    }
++
++    pub fn info(&self) -> DisplayInfo {
++        self.info
++    }
++
++    /// Convert tightly packed RGBA readback into native tiles. `flipped` is
++    /// Smithay TextureMapping::flipped(), not an inferred host orientation.
++    /// Failed partial presentation is reported as an error, never frame.done.
++    pub fn present_rgba(
++        &self,
++        x: u32,
++        y: u32,
++        width: u32,
++        height: u32,
++        rgba: &[u8],
++        flipped: bool,
++    ) -> io::Result<()> {
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
++        present_with(
++            self.info,
++            Rectangle {
++                x,
++                y,
++                width,
++                height,
++            },
++            rgba,
++            flipped,
++            |tile, bytes| {
++                retry_submission(deadline, || {
++                    // SAFETY: tile bounds, byte length and packing were checked
++                    // before any submission; this slice lives through the fence.
++                    syscall_result(unsafe {
++                        syscall6(
++                            0x43595802,
++                            [
++                                u64::from(tile.x),
++                                u64::from(tile.y),
++                                u64::from(tile.width),
++                                u64::from(tile.height),
++                                bytes.as_ptr() as u64,
++                                bytes.len() as u64,
++                            ],
++                        )
++                    })
++                })
++            },
++        )
++    }
++}
++
++/// Raw ordered evdev records; an empty device queue returns zero.
++/// Consumers retain partial SYN frames and resynchronize after SYN_DROPPED.
++pub fn read_input(events: &mut [InputEvent]) -> io::Result<usize> {
++    if events.is_empty() || events.len() > 32 {
++        return Err(invalid("native input batch must contain 1..32 records"));
++    }
++    // SAFETY: repr(C) records are exactly8bytes and the kernel may write only
++    // this exclusively borrowed initialized slice.
++    match syscall_result(unsafe {
++        syscall6(
++            0x43595803,
++            [events.as_mut_ptr() as u64, events.len() as u64, 0, 0, 0, 0],
++        )
++    }) {
++        Ok(count) if count <= events.len() => Ok(count),
++        Ok(_) => Err(io::Error::other("invalid native input count")),
++        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
++        Err(error) => Err(error),
++    }
++}
++
++pub fn input_key_state() -> io::Result<[u8; 96]> {
++    let mut bits = [0; 96];
++    // SAFETY: the ABI copies exactly96bytes to this exclusive local buffer.
++    let result =
++        syscall_result(unsafe { syscall6(0x43595804, [bits.as_mut_ptr() as u64, 0, 0, 0, 0, 0]) })?;
++    if result != 0 {
++        return Err(io::Error::other("invalid native key state result"));
++    }
++    Ok(bits)
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum InputAction {
++    Key { code: u16, pressed: bool },
++    Button { code: u16, pressed: bool },
++    Motion { dx: i32, dy: i32 },
++    Resync,
++}
++
++pub struct InputDecoder {
++    pending: Vec<InputEvent>,
++    held: [u8; 96],
++    dropped: bool,
++}
++
++impl Default for InputDecoder {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl InputDecoder {
++    pub fn new() -> Self {
++        Self {
++            pending: Vec::new(),
++            held: [0; 96],
++            dropped: false,
++        }
++    }
++    pub fn push(&mut self, event: InputEvent) -> io::Result<Option<Vec<InputAction>>> {
++        if event.kind == 0 && event.code == 3 {
++            self.pending.clear();
++            self.dropped = true;
++            return Ok(None);
++        }
++        if event.kind == 0 && event.code == 0 {
++            if self.dropped {
++                let mut actions = Vec::new();
++                actions.try_reserve_exact(1).map_err(|_| {
++                    io::Error::new(io::ErrorKind::OutOfMemory, "input loss receipt")
++                })?;
++                actions.push(InputAction::Resync);
++                return Ok(Some(actions));
++            }
++            let mut actions = Vec::new();
++            actions
++                .try_reserve_exact(self.pending.len() + 1)
++                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "input actions"))?;
++            let mut dx: i32 = 0;
++            let mut dy: i32 = 0;
++            let flush_motion = |actions: &mut Vec<InputAction>, dx: &mut i32, dy: &mut i32| {
++                if *dx != 0 || *dy != 0 {
++                    actions.push(InputAction::Motion { dx: *dx, dy: *dy });
++                    *dx = 0;
++                    *dy = 0;
++                }
++            };
++            for event in self.pending.drain(..) {
++                if event.kind == 2 {
++                    let axis = if event.code == 0 { &mut dx } else { &mut dy };
++                    *axis = axis.saturating_add(event.value).clamp(-32767, 32767);
++                } else {
++                    flush_motion(&mut actions, &mut dx, &mut dy);
++                    if event.value == 2 {
++                        continue;
++                    } // Client-side repeat owns repetition.
++                    let pressed = event.value == 1;
++                    let byte = &mut self.held[usize::from(event.code) / 8];
++                    let mask = 1 << (event.code % 8);
++                    if (*byte & mask != 0) != pressed {
++                        if pressed {
++                            *byte |= mask;
++                        } else {
++                            *byte &= !mask;
++                        }
++                        actions.push(Self::key_action(event.code, pressed));
++                    }
++                }
++            }
++            flush_motion(&mut actions, &mut dx, &mut dy);
++            return Ok(Some(actions));
++        }
++        if self.dropped {
++            return Ok(None);
++        }
++        // This first native backend supports relative pointer and a keyboard.
++        // Wheel and absolute tablet scaling require their own advertised API.
++        let supported = match event.kind {
++            1 => {
++                (event.code < 248 || (272..=274).contains(&event.code))
++                    && (0..=2).contains(&event.value)
++            }
++            2 => event.code <= 1,
++            4 => return Ok(None), // EV_MSC is metadata, not an input transition.
++            _ => false,
++        };
++        if !supported {
++            self.pending.clear();
++            self.dropped = true;
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "unsupported native input record",
++            ));
++        }
++        if self.pending.len() == 128 {
++            self.pending.clear();
++            self.dropped = true;
++            return Ok(None);
++        }
++        if self.pending.capacity() < 128 {
++            self.pending
++                .try_reserve_exact(128 - self.pending.len())
++                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "input packet"))?;
++        }
++        self.pending.push(event);
++        Ok(None)
++    }
++    fn key_action(code: u16, pressed: bool) -> InputAction {
++        if (272..=274).contains(&code) {
++            InputAction::Button { code, pressed }
++        } else {
++            InputAction::Key { code, pressed }
++        }
++    }
++    /// Reconcile authoritative held state after loss. Relative motion cannot
++    /// be reconstructed; no synthetic movement is invented.
++    pub fn resynchronize(&mut self, bits: [u8; 96]) -> io::Result<Vec<InputAction>> {
++        let mut actions = Vec::new();
++        actions
++            .try_reserve_exact(251)
++            .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "input resynchronization"))?;
++        for code in (0u16..248).chain(272..=274) {
++            let index = usize::from(code) / 8;
++            let mask = 1 << (code % 8);
++            let pressed = bits[index] & mask != 0;
++            if (self.held[index] & mask != 0) != pressed {
++                actions.push(Self::key_action(code, pressed));
++            }
++        }
++        self.held = bits;
++        self.pending.clear();
++        self.dropped = false;
++        Ok(actions)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn info() -> DisplayInfo {
++        DisplayInfo {
++            width: 8,
++            height: 7,
++            stride_bytes: 32,
++            format: 1,
++            max_rect_bytes: 16,
++            abi: 1,
++        }
++    }
++
++    #[test]
++    fn native_info_requires_exact_known_layout_and_bounded_tiles() {
++        assert!(validate_info(info()).is_ok());
++        for bad in [
++            DisplayInfo { abi: 2, ..info() },
++            DisplayInfo {
++                format: 2,
++                ..info()
++            },
++            DisplayInfo { width: 0, ..info() },
++            DisplayInfo {
++                height: 4097,
++                ..info()
++            },
++            DisplayInfo {
++                stride_bytes: 31,
++                ..info()
++            },
++            DisplayInfo {
++                max_rect_bytes: 65540,
++                ..info()
++            },
++            DisplayInfo {
++                max_rect_bytes: 7,
++                ..info()
++            },
++        ] {
++            assert!(validate_info(bad).is_err(), "{bad:?}");
++        }
++    }
++
++    #[test]
++    fn asymmetric_rgba_is_converted_and_globally_flipped_across_tiles() {
++        let rectangle = Rectangle {
++            x: 1,
++            y: 2,
++            width: 6,
++            height: 3,
++        };
++        let rgba: Vec<u8> = (0..18).flat_map(|i| [i, i + 20, i + 40, 255]).collect();
++        for flipped in [false, true] {
++            let mut screen = vec![77u8; 8 * 7 * 4];
++            let mut visits = [0; 18];
++            present_with(info(), rectangle, &rgba, flipped, |tile, pixels| {
++                assert!(pixels.len() <= 16);
++                assert_eq!(pixels.len(), (tile.width * tile.height * 4) as usize);
++                for y in 0..tile.height {
++                    for x in 0..tile.width {
++                        let dx = tile.x + x;
++                        let dy = tile.y + y;
++                        let src = ((y * tile.width + x) * 4) as usize;
++                        let dst = ((dy * 8 + dx) * 4) as usize;
++                        screen[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
++                        visits[((dy - 2) * 6 + dx - 1) as usize] += 1;
++                    }
++                }
++                Ok(())
++            })
++            .unwrap();
++            assert!(visits.iter().all(|n| *n == 1));
++            for y in 0..7 {
++                for x in 0..8 {
++                    let dst = (y * 8 + x) * 4;
++                    if (1..7).contains(&x) && (2..5).contains(&y) {
++                        let row = if flipped { 4 - y } else { y - 2 };
++                        let n = (row * 6 + x - 1) as u8;
++                        assert_eq!(&screen[dst..dst + 4], &[n + 40, n + 20, n, 0]);
++                    } else {
++                        assert_eq!(&screen[dst..dst + 4], &[77; 4]);
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn rejected_frames_submit_nothing_and_device_error_stops_submission() {
++        let rectangle = Rectangle {
++            x: 1,
++            y: 1,
++            width: 6,
++            height: 3,
++        };
++        let rgba = [255; 72];
++        for (rect, bytes) in [
++            (
++                Rectangle {
++                    x: u32::MAX,
++                    ..rectangle
++                },
++                rgba.as_slice(),
++            ),
++            (Rectangle { y: 5, ..rectangle }, rgba.as_slice()),
++            (
++                Rectangle {
++                    width: 0,
++                    ..rectangle
++                },
++                rgba.as_slice(),
++            ),
++            (rectangle, &rgba[..71]),
++            (rectangle, &[0; 76]),
++        ] {
++            assert!(
++                present_with(info(), rect, bytes, false, |_, _| {
++                    panic!("invalid frame reached device")
++                })
++                .is_err()
++            );
++        }
++        let mut calls = 0;
++        let result = present_with(info(), rectangle, &rgba, false, |_, _| {
++            calls += 1;
++            Err(io::Error::from_raw_os_error(19))
++        });
++        assert_eq!(result.unwrap_err().raw_os_error(), Some(19));
++        assert_eq!(calls, 1);
++    }
++
++    #[test]
++    fn retry_never_treats_busy_or_partial_result_as_completion() {
++        use std::time::{Duration, Instant};
++        let mut calls = 0;
++        retry_submission(Instant::now() + Duration::from_secs(1), || {
++            calls += 1;
++            if calls < 3 {
++                Err(io::ErrorKind::WouldBlock.into())
++            } else {
++                Ok(0)
++            }
++        })
++        .unwrap();
++        assert_eq!(calls, 3);
++        assert!(retry_submission(Instant::now(), || panic!("expired deadline")).is_err());
++        assert!(retry_submission(Instant::now() + Duration::from_secs(1), || Ok(1)).is_err());
++        // raw errno is preserved; host macOS uses a different errno numbering
++        // from the actual ARM Linux-personality target.
++        assert_eq!(syscall_result(-11).unwrap_err().raw_os_error(), Some(11));
++        assert!(syscall_result(i64::MIN).is_err());
++    }
++
++    fn ev(kind: u16, code: u16, value: i32) -> InputEvent {
++        InputEvent { kind, code, value }
++    }
++
++    #[test]
++    fn input_frames_coalesce_axes_and_preserve_key_button_order() {
++        let mut d = InputDecoder::new();
++        for e in [
++            ev(2, 0, 4),
++            ev(2, 1, 3),
++            ev(1, 272, 1),
++            ev(1, 272, 0),
++            ev(1, 30, 1),
++            ev(1, 30, 2),
++        ] {
++            assert_eq!(d.push(e).unwrap(), None);
++        }
++        assert_eq!(
++            d.push(ev(0, 0, 0)).unwrap(),
++            Some(vec![
++                InputAction::Motion { dx: 4, dy: 3 },
++                InputAction::Button {
++                    code: 272,
++                    pressed: true
++                },
++                InputAction::Button {
++                    code: 272,
++                    pressed: false
++                },
++                InputAction::Key {
++                    code: 30,
++                    pressed: true
++                },
++            ])
++        );
++        d.push(ev(1, 30, 1)).unwrap();
++        d.push(ev(1, 30, 0)).unwrap();
++        assert_eq!(
++            d.push(ev(0, 0, 0)).unwrap(),
++            Some(vec![InputAction::Key {
++                code: 30,
++                pressed: false
++            },])
++        );
++    }
++
++    #[test]
++    fn input_loss_discards_uncommitted_keys_and_resync_reconciles_state() {
++        let mut d = InputDecoder::new();
++        d.push(ev(1, 30, 1)).unwrap();
++        d.push(ev(0, 0, 0)).unwrap();
++        d.push(ev(1, 16, 1)).unwrap();
++        d.push(ev(0, 3, 0)).unwrap();
++        d.push(ev(1, 272, 1)).unwrap();
++        assert_eq!(
++            d.push(ev(0, 0, 0)).unwrap(),
++            Some(vec![InputAction::Resync])
++        );
++        assert_eq!(
++            d.resynchronize([0; 96]).unwrap(),
++            vec![InputAction::Key {
++                code: 30,
++                pressed: false
++            },]
++        );
++        for _ in 0..129 {
++            d.push(ev(2, 0, 1)).unwrap();
++        }
++        assert_eq!(
++            d.push(ev(0, 0, 0)).unwrap(),
++            Some(vec![InputAction::Resync])
++        );
++        let mut bits = [0; 96];
++        bits[272 / 8] = 1 << (272 % 8);
++        assert_eq!(
++            d.resynchronize(bits).unwrap(),
++            vec![InputAction::Button {
++                code: 272,
++                pressed: true
++            },]
++        );
++    }
++
++    #[test]
++    fn unsupported_or_malformed_input_cannot_commit_a_partial_frame() {
++        for bad in [ev(3, 0, 10), ev(2, 8, 1), ev(1, 30, -1), ev(1, 280, 1)] {
++            let mut d = InputDecoder::new();
++            d.push(ev(1, 30, 1)).unwrap();
++            assert!(d.push(bad).is_err());
++            assert_eq!(
++                d.push(ev(0, 0, 0)).unwrap(),
++                Some(vec![InputAction::Resync])
++            );
++            assert!(d.resynchronize([0; 96]).unwrap().is_empty());
++        }
++    }
++}
++
++// COSMIC extension: resumable native submission; the ABI adapter above is unchanged.
++#[path = "native/presentation.rs"]
++pub mod presentation;
+--- /dev/null
++++ b/src/backend/cyxia/native/presentation.rs
+@@ -0,0 +1,326 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Bounded, resumable native tile submission for the actual COSMIC event loop.
++use super::{DisplayInfo, Rectangle, invalid, syscall_result, syscall6, validate_info};
++use std::{
++    io,
++    time::{Duration, Instant},
++};
++
++#[derive(Debug)]
++pub struct PendingPresentation {
++    info: DisplayInfo,
++    flipped: bool,
++    left: u32,
++    top: u32,
++    tile: Vec<u8>,
++    ready: bool,
++    failed: bool,
++    deadline: Instant,
++}
++
++fn submit_tile(rect: Rectangle, bytes: &[u8]) -> io::Result<usize> {
++    // SAFETY: the validated cursor emits in-bounds, tightly packed tiles.
++    // The slice stays alive through the synchronous ABI call.
++    syscall_result(unsafe {
++        syscall6(
++            0x43595802,
++            [
++                u64::from(rect.x),
++                u64::from(rect.y),
++                u64::from(rect.width),
++                u64::from(rect.height),
++                bytes.as_ptr() as u64,
++                bytes.len() as u64,
++            ],
++        )
++    })
++}
++
++impl PendingPresentation {
++    pub fn new(info: DisplayInfo, flipped: bool) -> io::Result<Self> {
++        validate_info(info)?;
++        let capacity = (info.max_rect_bytes as usize).min(16384);
++        let mut tile = Vec::new();
++        tile.try_reserve_exact(capacity)
++            .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "native tile allocation"))?;
++        tile.resize(capacity, 0);
++        Ok(Self {
++            info,
++            flipped,
++            left: 0,
++            top: 0,
++            tile,
++            ready: false,
++            failed: false,
++            deadline: Instant::now() + Duration::from_secs(5),
++        })
++    }
++
++    /// At most `budget` syscalls, no sleeping or retry loop on EAGAIN/EINTR.
++    /// `Ok(true)` means every tile completed; every other result forbids frame
++    /// or presentation completion. The mapping must remain unchanged until done.
++    pub fn advance(&mut self, rgba: &[u8], budget: usize) -> io::Result<bool> {
++        self.advance_pixels(Some(rgba), budget, submit_tile)
++    }
++
++    /// Submit opaque black scanout without allocating a full framebuffer.
++    pub fn advance_black(&mut self, budget: usize) -> io::Result<bool> {
++        self.advance_pixels(None, budget, submit_tile)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn advance_black_with(
++        &mut self,
++        budget: usize,
++        mut submit: impl FnMut((u32, u32, u32, u32), &[u8]) -> io::Result<usize>,
++    ) -> io::Result<bool> {
++        self.advance_pixels(None, budget, |rect, bytes| {
++            submit((rect.x, rect.y, rect.width, rect.height), bytes)
++        })
++    }
++
++    fn advance_with(
++        &mut self,
++        rgba: &[u8],
++        budget: usize,
++        submit: impl FnMut(Rectangle, &[u8]) -> io::Result<usize>,
++    ) -> io::Result<bool> {
++        self.advance_pixels(Some(rgba), budget, submit)
++    }
++
++    fn advance_pixels(
++        &mut self,
++        rgba: Option<&[u8]>,
++        budget: usize,
++        mut submit: impl FnMut(Rectangle, &[u8]) -> io::Result<usize>,
++    ) -> io::Result<bool> {
++        if self.failed {
++            return Err(io::Error::other("native presentation already failed"));
++        }
++        if rgba.is_some_and(|rgba| {
++            rgba.len() as u64 != u64::from(self.info.width) * u64::from(self.info.height) * 4
++        }) || budget == 0
++        {
++            self.failed = true;
++            return Err(invalid("invalid native framebuffer or tile budget"));
++        }
++        for _ in 0..budget {
++            if self.left == self.info.width {
++                return Ok(true);
++            }
++            if Instant::now() >= self.deadline {
++                self.failed = true;
++                return Err(io::Error::new(
++                    io::ErrorKind::TimedOut,
++                    "native presentation deadline",
++                ));
++            }
++            let columns = (self.info.width - self.left).min(self.tile.len() as u32 / 4);
++            let rows = (self.info.height - self.top).min(self.tile.len() as u32 / (columns * 4));
++            let length = (columns * rows * 4) as usize;
++            if !self.ready {
++                if let Some(rgba) = rgba {
++                    for row in 0..rows {
++                        let source_row = if self.flipped {
++                            self.info.height - 1 - self.top - row
++                        } else {
++                            self.top + row
++                        };
++                        for column in 0..columns {
++                            let source =
++                                ((source_row * self.info.width + self.left + column) * 4) as usize;
++                            let target = ((row * columns + column) * 4) as usize;
++                            self.tile[target..target + 4].copy_from_slice(&[
++                                rgba[source + 2],
++                                rgba[source + 1],
++                                rgba[source],
++                                0,
++                            ]);
++                        }
++                    }
++                } else {
++                    self.tile[..length].fill(0); // Native XRGB black, alpha unused.
++                }
++                self.ready = true;
++            }
++            let rect = Rectangle {
++                x: self.left,
++                y: self.top,
++                width: columns,
++                height: rows,
++            };
++            match submit(rect, &self.tile[..length]) {
++                Ok(0) => {
++                    self.ready = false;
++                    self.top += rows;
++                    if self.top == self.info.height {
++                        self.top = 0;
++                        self.left += columns;
++                    }
++                }
++                Err(err)
++                    if matches!(
++                        err.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
++                    ) =>
++                {
++                    return Ok(false);
++                }
++                result => {
++                    self.failed = true;
++                    return Err(match result {
++                        Err(err) => err,
++                        Ok(_) => io::Error::other("invalid native tile completion"),
++                    });
++                }
++            }
++        }
++        Ok(self.left == self.info.width)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn info() -> DisplayInfo {
++        DisplayInfo {
++            width: 6,
++            height: 3,
++            stride_bytes: 24,
++            format: 1,
++            max_rect_bytes: 16,
++            abi: 1,
++        }
++    }
++    fn pixels() -> Vec<u8> {
++        (0..18).flat_map(|i| [i, i + 20, i + 40, 255]).collect()
++    }
++
++    #[test]
++    fn busy_yields_after_one_attempt_and_retains_the_exact_tile() {
++        let mut pending = PendingPresentation::new(info(), false).unwrap();
++        let rgba = pixels();
++        let mut attempts = 0;
++        let mut blocked = Vec::new();
++        assert!(
++            !pending
++                .advance_with(&rgba, 16, |rect, bytes| {
++                    attempts += 1;
++                    assert_eq!((rect.x, rect.y), (0, 0));
++                    blocked = bytes.to_vec();
++                    Err(io::ErrorKind::WouldBlock.into())
++                })
++                .unwrap()
++        );
++        assert_eq!(attempts, 1);
++        assert_eq!((pending.left, pending.top), (0, 0));
++        assert!(
++            !pending
++                .advance_with(&rgba, 1, |rect, bytes| {
++                    assert_eq!((rect.x, rect.y), (0, 0));
++                    assert_eq!(bytes, blocked);
++                    Ok(0)
++                })
++                .unwrap()
++        );
++        assert_eq!((pending.left, pending.top), (0, 1));
++    }
++
++    #[test]
++    fn bounded_ticks_submit_every_pixel_once_with_global_flip() {
++        for flipped in [false, true] {
++            let mut pending = PendingPresentation::new(info(), flipped).unwrap();
++            let rgba = pixels();
++            let mut screen = vec![255; rgba.len()];
++            let mut visits = [0; 18];
++            let mut done = false;
++            let mut ticks = 0;
++            while !done {
++                let mut calls = 0;
++                done = pending
++                    .advance_with(&rgba, 1, |rect, bytes| {
++                        calls += 1;
++                        for y in 0..rect.height {
++                            for x in 0..rect.width {
++                                let dst = ((rect.y + y) * 6 + rect.x + x) as usize;
++                                let src = ((y * rect.width + x) * 4) as usize;
++                                screen[dst * 4..dst * 4 + 4].copy_from_slice(&bytes[src..src + 4]);
++                                visits[dst] += 1;
++                            }
++                        }
++                        Ok(0)
++                    })
++                    .unwrap();
++                assert_eq!(calls, 1);
++                ticks += 1;
++                assert!(ticks <= 5);
++                if ticks < 5 {
++                    assert!(!done);
++                }
++            }
++            assert_eq!(ticks, 5);
++            assert!(visits.iter().all(|v| *v == 1));
++            for y in 0..3 {
++                for x in 0..6 {
++                    let n = (if flipped { 2 - y } else { y }) * 6 + x;
++                    let dst = (y * 6 + x) * 4;
++                    assert_eq!(
++                        &screen[dst..dst + 4],
++                        &[n as u8 + 40, n as u8 + 20, n as u8, 0]
++                    );
++                }
++            }
++            assert!(
++                pending
++                    .advance_with(&rgba, 1, |_, _| panic!("already complete"))
++                    .unwrap()
++            );
++        }
++    }
++
++    #[test]
++    fn interruption_or_error_cannot_commit_an_incomplete_frame() {
++        let rgba = pixels();
++        let mut pending = PendingPresentation::new(info(), false).unwrap();
++        assert!(
++            !pending
++                .advance_with(&rgba, 2, |_, _| Err(io::ErrorKind::Interrupted.into()))
++                .unwrap()
++        );
++        assert_eq!((pending.left, pending.top), (0, 0));
++        assert!(!pending.advance_with(&rgba, 1, |_, _| Ok(0)).unwrap());
++        assert!(
++            pending
++                .advance_with(&rgba, 2, |_, _| Err(io::Error::from_raw_os_error(19)))
++                .is_err()
++        );
++        assert!(
++            pending
++                .advance_with(&rgba, 2, |_, _| panic!("failed cursor reused"))
++                .is_err()
++        );
++        let mut invalid_result = PendingPresentation::new(info(), false).unwrap();
++        assert!(invalid_result.advance_with(&rgba, 1, |_, _| Ok(1)).is_err());
++    }
++
++    #[test]
++    fn malformed_mapping_and_expiry_submit_nothing() {
++        let rgba = pixels();
++        let mut pending = PendingPresentation::new(info(), false).unwrap();
++        assert!(
++            pending
++                .advance_with(&rgba[..71], 1, |_, _| panic!("invalid frame"))
++                .is_err()
++        );
++        let mut expired = PendingPresentation::new(info(), false).unwrap();
++        expired.deadline = Instant::now();
++        assert_eq!(
++            expired
++                .advance_with(&rgba, 1, |_, _| panic!("expired frame"))
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::TimedOut
++        );
++    }
++}
+--- /dev/null
++++ b/src/backend/cyxia/scheduling.rs
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-3.0-only
++use std::time::{Duration, Instant};
++
++/// 60 Hz is a pacing policy; ABI v1 does not measure physical refresh.
++const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
++
++#[derive(Debug)]
++pub struct RenderSchedule {
++    dirty: bool,
++    not_before: Instant,
++}
++
++impl RenderSchedule {
++    pub fn new(now: Instant) -> Self {
++        Self {
++            dirty: true,
++            not_before: now,
++        }
++    }
++    pub fn request(&mut self) {
++        self.dirty = true;
++    }
++    pub fn due(&self, now: Instant, pending: bool) -> bool {
++        !pending && self.dirty && now >= self.not_before
++    }
++    pub fn begin(&mut self) {
++        self.dirty = false;
++    }
++    pub fn completed(&mut self, now: Instant) {
++        self.not_before = now + FRAME_INTERVAL;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn commit_while_presenting_survives_completion_and_is_paced() {
++        let now = Instant::now();
++        let mut schedule = RenderSchedule::new(now);
++        assert!(schedule.due(now, false));
++        schedule.begin();
++        schedule.request(); // A new Wayland commit while native scanout is busy.
++        assert!(!schedule.due(now + Duration::from_secs(1), true));
++        let completed = now + Duration::from_millis(50);
++        schedule.completed(completed);
++        assert!(!schedule.due(completed, false));
++        assert!(schedule.due(completed + FRAME_INTERVAL, false));
++    }
++
++    #[test]
++    fn completed_clean_frame_does_not_create_a_busy_render_loop() {
++        let now = Instant::now();
++        let mut schedule = RenderSchedule::new(now);
++        schedule.begin();
++        schedule.completed(now);
++        assert!(!schedule.due(now + Duration::from_secs(10), false));
++        schedule.request();
++        assert!(schedule.due(now + Duration::from_secs(10), false));
++    }
++}
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -9,6 +9,8 @@
+ use smithay::reexports::{calloop::EventLoop, wayland_server::DisplayHandle};
+ use tracing::{info, warn};
+ 
++#[cfg(feature = "backend-cyxia")]
++pub mod cyxia;
+ pub mod offscreen;
+ pub mod render;
+ mod selection;
+@@ -35,6 +37,8 @@
+     let mut res = Err(anyhow!("No COSMIC backend could be initialized"));
+     for backend in candidates {
+         res = match backend {
++            #[cfg(feature = "backend-cyxia")]
++            selection::Backend::Cyxia => cyxia::init_backend(dh, event_loop, state),
+             #[cfg(feature = "backend-x11")]
+             selection::Backend::X11 => x11::init_backend(dh, event_loop, state),
+             #[cfg(feature = "backend-winit")]
+--- a/src/backend/selection.rs
++++ b/src/backend/selection.rs
+@@ -2,6 +2,8 @@
+ //! Feature-aware selection, shared by normal startup and host regression tests.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(super) enum Backend {
++    #[cfg(feature = "backend-cyxia")]
++    Cyxia,
+     #[cfg(feature = "backend-x11")]
+     X11,
+     #[cfg(feature = "backend-winit")]
+@@ -16,15 +18,24 @@
+ ) -> Result<&'static [Backend], &'static str> {
+     if let Some(requested) = requested {
+         return match requested {
++            #[cfg(feature = "backend-cyxia")]
++            "cyxia" => Ok(&[Backend::Cyxia]),
+             #[cfg(feature = "backend-x11")]
+             "x11" => Ok(&[Backend::X11]),
+             #[cfg(feature = "backend-winit")]
+             "winit" => Ok(&[Backend::Winit]),
+             #[cfg(feature = "backend-kms")]
+             "kms" => Ok(&[Backend::Kms]),
++            #[cfg(not(feature = "backend-cyxia"))]
++            "cyxia" => Err("Requested COSMIC backend is disabled at build time"),
+             "x11" | "winit" | "kms" => Err("Requested COSMIC backend is disabled at build time"),
+             _ => Err("Unknown COSMIC_BACKEND value"),
+         };
++    }
++    // A native-only build does not inherit an unrelated parent DISPLAY.
++    #[cfg(feature = "backend-cyxia")]
++    if !cfg!(any(feature = "backend-kms", feature = "backend-winit", feature = "backend-x11")) {
++        return Ok(&[Backend::Cyxia]);
+     }
+     if nested {
+         let candidates: &'static [Backend] = &[
+@@ -43,7 +54,9 @@
+     {
+         Ok(&[Backend::Kms])
+     }
+-    #[cfg(not(feature = "backend-kms"))]
++    #[cfg(all(not(feature = "backend-kms"), feature = "backend-cyxia"))]
++    { Ok(&[Backend::Cyxia]) }
++    #[cfg(not(any(feature = "backend-kms", feature = "backend-cyxia")))]
+     {
+         Err("Nested COSMIC requires DISPLAY or WAYLAND_DISPLAY")
+     }
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -222,6 +222,19 @@
+     ) where
+         <B as InputBackend>::Device: 'static,
+     {
++        #[cfg(feature = "backend-cyxia")]
++        if let crate::state::BackendData::Cyxia(backend) = &self.backend {
++            use crate::backend::cyxia::{PendingInput, input_allowed};
++            let kind = match &event {
++                InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. } => PendingInput::DeviceLifecycle,
++                InputEvent::Keyboard { event } if smithay::backend::input::KeyboardKeyEvent::state(event) == KeyState::Released => PendingInput::Release,
++                InputEvent::PointerButton { event } if smithay::backend::input::PointerButtonEvent::state(event) == smithay::backend::input::ButtonState::Released => PendingInput::Release,
++                _ => PendingInput::Other,
++            };
++            // Focus is already isolated by the provisional Shell session lock.
++            // Allow releases to reconcile libei/pre-lock holds, never new input.
++            if !input_allowed(backend.input_suspended(), kind) { return; }
++        }
+         // An input device going away is not user activity, e.g. a wireless keyboard
+         // dropping its link when it sleeps, so it must not power displays back on.
+         // Device additions still wake: after a system resume the re-enumerated
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -39,7 +39,8 @@
+ #[cfg(not(any(
+     feature = "backend-kms",
+     feature = "backend-winit",
+-    feature = "backend-x11"
++    feature = "backend-x11",
++    feature = "backend-cyxia"
+ )))]
+ compile_error!("Enable at least one COSMIC backend");
+ pub mod backend;
+@@ -196,7 +197,7 @@
+     }
+ 
+     // run the event loop
+-    event_loop.run(None, &mut state, |state| {
++    let loop_result = event_loop.run(None, &mut state, |state| {
+         // shall we shut down?
+         if state.common.should_stop {
+             info!("Shutting down");
+@@ -248,7 +249,10 @@
+                 }
+             }
+         }
+-    })?;
++    });
++
++    #[cfg(feature = "backend-cyxia")]
++    let native_shutdown_result = backend::cyxia::shutdown(&mut state);
+ 
+     // kill kiosk child if loop exited
+     if let Some(mut child) = state.common.kiosk_child.take() {
+@@ -277,6 +281,10 @@
+     // drop eventloop & state before logger
+     std::mem::drop(event_loop);
+     std::mem::drop(state);
++
++    loop_result?;
++    #[cfg(feature = "backend-cyxia")]
++    native_shutdown_result?;
+ 
+     if let Some(code) = kiosk_exit_code {
+         process::exit(code);
+--- a/src/shell/focus/mod.rs
++++ b/src/shell/focus/mod.rs
+@@ -202,6 +202,8 @@
+         serial: Option<Serial>,
+         update_cursor: bool,
+     ) {
++        #[cfg(feature = "backend-cyxia")]
++        if !cyxia_lock_allows_focus(state, target) { return; }
+         let focus_target = match target {
+             Some(KeyboardFocusTarget::Element(mapped)) => Some(FocusTarget::Window(mapped.clone())),
+             Some(KeyboardFocusTarget::Fullscreen(surface)) => {
+@@ -372,6 +374,33 @@
+     }
+ }
+ 
++// Native blanking installs a provisional Shell barrier before protocol ACK.
++// Enforce it at every common focus write and before installing popup grabs;
++// periodic refresh alone cannot protect events within one Wayland dispatch.
++#[cfg(feature = "backend-cyxia")]
++pub(crate) fn cyxia_lock_allows_focus(state: &State, target: Option<&KeyboardFocusTarget>) -> bool {
++    use crate::backend::cyxia::{LockFocusTarget, lock_focus_allowed};
++    if !matches!(&state.backend, crate::state::BackendData::Cyxia(_)) { return true; }
++    let shell = state.common.shell.read();
++    let session_lock = shell.session_lock.as_ref();
++    let kind = match target {
++        None => LockFocusTarget::Clear,
++        Some(KeyboardFocusTarget::LockSurface(surface)) => LockFocusTarget::LockSurface {
++            alive: surface.alive() && surface.ext_session_lock().is_alive(),
++            current_owner: session_lock.is_some_and(|lock| &lock.ext_session_lock == surface.ext_session_lock()),
++            registered: session_lock.is_some_and(|lock| lock.surfaces.values().any(|registered| registered == surface)),
++        },
++        Some(KeyboardFocusTarget::LayerSurface(layer)) => LockFocusTarget::Layer {
++            show_on_lock: layer_show_on_lock(layer.wl_surface()),
++        },
++        Some(KeyboardFocusTarget::Popup(popup)) => LockFocusTarget::Popup {
++            root_show_on_lock: find_popup_root_surface(popup).is_ok_and(|root| layer_show_on_lock(&root)),
++        },
++        _ => LockFocusTarget::Other,
++    };
++    lock_focus_allowed(session_lock.is_some(), kind)
++}
++
+ /// Internal, used to ensure that ActiveFocus, KeyboardFocusTarget, and FocusedOutput are all in sync
+ #[profiling::function]
+ fn update_focus_state(
+@@ -381,6 +410,8 @@
+     serial: Option<Serial>,
+     should_update_cursor: bool,
+ ) {
++    #[cfg(feature = "backend-cyxia")]
++    if !cyxia_lock_allows_focus(state, target) { return; }
+     // update keyboard focus
+     if let Some(keyboard) = seat.get_keyboard() {
+         // remove constraint when target changed
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -1,4 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
++
++#[cfg(feature = "backend-cyxia")]
++use crate::backend::cyxia::CyxiaState;
+ 
+ #[cfg(feature = "backend-kms")]
+ use crate::backend::kms::{KmsGuard, KmsState};
+@@ -337,6 +340,8 @@
+ #[derive(Debug)]
+ #[allow(clippy::large_enum_variant)]
+ pub enum BackendData {
++    #[cfg(feature = "backend-cyxia")]
++    Cyxia(CyxiaState),
+     #[cfg(feature = "backend-x11")]
+     X11(X11State),
+     #[cfg(feature = "backend-winit")]
+@@ -349,6 +354,8 @@
+ }
+ 
+ pub enum LockedBackend<'a> {
++    #[cfg(feature = "backend-cyxia")]
++    Cyxia(&'a mut CyxiaState),
+     #[cfg(feature = "backend-x11")]
+     X11(&'a mut X11State),
+     #[cfg(feature = "backend-winit")]
+@@ -377,6 +384,14 @@
+ }
+ 
+ impl BackendData {
++    #[cfg(feature = "backend-cyxia")]
++    pub fn cyxia(&mut self) -> &mut CyxiaState {
++        match self {
++            BackendData::Cyxia(state) => state,
++            _ => unreachable!("Called cyxia in another backend"),
++        }
++    }
++
+     #[cfg(feature = "backend-kms")]
+     pub fn kms(&mut self) -> &mut KmsState {
+         match self {
+@@ -406,6 +421,8 @@
+ 
+     pub fn schedule_render(&mut self, output: &Output) {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            BackendData::Cyxia(state) => state.schedule_render(output),
+             #[cfg(feature = "backend-winit")]
+             BackendData::Winit(_) => {} // We cannot do this on the winit backend.
+             // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
+@@ -425,6 +442,8 @@
+         dmabuf: Dmabuf,
+     ) -> Result<Option<DrmNode>, anyhow::Error> {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            BackendData::Cyxia(_) => anyhow::bail!("Cyxia ABI v1 does not expose DMA-BUF import"),
+             #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => {
+                 return state.dmabuf_imported(client, global, dmabuf).map(Some);
+@@ -451,6 +470,8 @@
+         target: OffscreenTarget<'_>,
+     ) -> Result<RendererRef<'_>, GlMultiError> {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            BackendData::Cyxia(state) => Ok(RendererRef::Glow(&mut state.renderer)),
+             #[cfg(feature = "backend-kms")]
+             BackendData::Kms(kms) => kms.offscreen_renderer(target),
+             #[cfg(feature = "backend-winit")]
+@@ -463,6 +484,8 @@
+ 
+     pub fn update_screen_filter(&mut self, screen_filter: &ScreenFilter) -> anyhow::Result<()> {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            BackendData::Cyxia(state) => state.update_screen_filter(screen_filter),
+             #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => state.update_screen_filter(screen_filter),
+             #[cfg(feature = "backend-winit")]
+@@ -475,6 +498,8 @@
+ 
+     pub fn lock(&mut self) -> LockedBackend<'_> {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            BackendData::Cyxia(state) => LockedBackend::Cyxia(state),
+             #[cfg(feature = "backend-kms")]
+             BackendData::Kms(state) => LockedBackend::Kms(state.lock_devices()),
+             #[cfg(feature = "backend-x11")]
+@@ -489,6 +514,8 @@
+ impl LockedBackend<'_> {
+     pub fn all_outputs(&self) -> Vec<Output> {
+         match self {
++            #[cfg(feature = "backend-cyxia")]
++            LockedBackend::Cyxia(state) => state.all_outputs(),
+             #[cfg(feature = "backend-kms")]
+             LockedBackend::Kms(state) => state.all_outputs(),
+             #[cfg(feature = "backend-x11")]
+@@ -540,6 +567,11 @@
+         startup_done: Arc<AtomicBool>,
+         clock: &Clock<Monotonic>,
+     ) -> Result<(), anyhow::Error> {
++        #[cfg(feature = "backend-cyxia")]
++        if let LockedBackend::Cyxia(state) = self {
++            state.validate_config()?;
++            if test_only { return Ok(()); }
++        }
+         let all_outputs = self.all_outputs();
+ 
+         // update outputs, so that `OutputModeSource`s are correct
+@@ -583,6 +615,11 @@
+             ),
+             #[cfg(feature = "backend-winit")]
+             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
++            #[cfg(feature = "backend-cyxia")]
++            LockedBackend::Cyxia(state) => {
++                state.update_screen_filter(screen_filter)?;
++                state.apply_config_for_outputs(test_only)
++            },
+             #[cfg(feature = "backend-x11")]
+             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
+         }?;
+@@ -635,6 +672,8 @@
+                 LockedBackend::X11(state) => state.schedule_render(&output),
+                 #[cfg(feature = "backend-kms")]
+                 LockedBackend::Kms(state) => state.schedule_render(&output),
++                #[cfg(feature = "backend-cyxia")]
++                LockedBackend::Cyxia(state) => state.schedule_render(&output),
+             }
+         }
+ 
+--- a/src/wayland/handlers/session_lock.rs
++++ b/src/wayland/handlers/session_lock.rs
+@@ -17,29 +17,12 @@
+     }
+ 
+     fn lock(&mut self, locker: SessionLocker) {
+-        let mut shell = self.common.shell.write();
+-
+-        // Reject lock if sesion lock exists and is still valid
+-        if let Some(session_lock) = shell.session_lock.as_ref()
+-            && self
+-                .common
+-                .display_handle
+-                .get_client(session_lock.ext_session_lock.id())
+-                .is_ok()
+-        {
++        #[cfg(feature = "backend-cyxia")]
++        if matches!(self.backend, crate::state::BackendData::Cyxia(_)) {
++            self.begin_cyxia_lock(locker);
+             return;
+         }
+-
+-        let ext_session_lock = locker.ext_session_lock().clone();
+-        locker.lock();
+-        shell.session_lock = Some(SessionLock {
+-            ext_session_lock,
+-            surfaces: HashMap::new(),
+-        });
+-
+-        for output in shell.outputs() {
+-            self.backend.schedule_render(output);
+-        }
++        self.accept_session_lock(locker);
+     }
+ 
+     fn unlock(&mut self) {
+@@ -59,6 +42,8 @@
+     fn new_surface(&mut self, lock_surface: LockSurface, wl_output: WlOutput) {
+         let mut shell = self.common.shell.write();
+         if let Some(session_lock) = &mut shell.session_lock
++            && session_lock.ext_session_lock.is_alive()
++            && session_lock.ext_session_lock == *lock_surface.ext_session_lock()
+             && let Some(output) = Output::from_resource(&wl_output)
+         {
+             lock_surface.with_pending_state(|states| {
+@@ -72,3 +57,38 @@
+         }
+     }
+ }
++
++impl State {
++    pub(crate) fn accept_session_lock(&mut self, locker: SessionLocker) {
++        if !locker.ext_session_lock().is_alive() { return; }
++        let mut shell = self.common.shell.write();
++
++        // Reject lock if sesion lock exists and is still valid
++        if let Some(session_lock) = shell.session_lock.as_ref()
++            && session_lock.ext_session_lock != *locker.ext_session_lock()
++            && session_lock.ext_session_lock.is_alive()
++            && self
++                .common
++                .display_handle
++                .get_client(session_lock.ext_session_lock.id())
++                .is_ok()
++        {
++            return;
++        }
++
++        let ext_session_lock = locker.ext_session_lock().clone();
++        locker.lock();
++        // Native blanking already installed an internal barrier and may
++        // have configured lock surfaces before the public locked event.
++        if shell.session_lock.as_ref().is_none_or(|lock| lock.ext_session_lock != ext_session_lock) {
++            shell.session_lock = Some(SessionLock {
++                ext_session_lock,
++                surfaces: HashMap::new(),
++            });
++        }
++
++        for output in shell.outputs() {
++            self.backend.schedule_render(output);
++        }
++    }
++}
+--- a/src/wayland/handlers/xdg_shell/mod.rs
++++ b/src/wayland/handlers/xdg_shell/mod.rs
+@@ -111,6 +111,10 @@
+         });
+ 
+         if let Some(root) = maybe_root {
++            #[cfg(feature = "backend-cyxia")]
++            if !crate::shell::focus::cyxia_lock_allows_focus(self, Some(&root)) {
++                return;
++            }
+             let target = root;
+             let ret = self.common.popups.grab_popup(target, kind, &seat, serial);
+             match ret {

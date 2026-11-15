@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +12,25 @@ from tools import build_cosmic as build
 
 
 class CosmicBuildTests(unittest.TestCase):
+    def test_recipe_rejects_unbound_native_link_inputs(self):
+        source = {'name': 'fixture', 'commit': 'a' * 40}
+        recipe = {'schema_version': 1, 'component': 'fixture', 'commit': source['commit'],
+                  'target': 'x86_64-unknown-linux-musl', 'purpose': 'bounded-build-experiment',
+                  'package': 'fixture', 'binary': 'fixture', 'resource_profile': 'static',
+                  'default_features': False, 'features': [], 'patches': [],
+                  'source_lock_sha256': 'b' * 64, 'effective_lock_sha256': 'b' * 64,
+                  'native_inputs': [], 'static_link_inputs': ['sysroot/usr/lib/libgraphics.a']}
+        with self.assertRaisesRegex(ValueError, 'bound native archive'):
+            build.validate_recipe(recipe, source)
+        recipe['native_inputs'] = [{'path': 'sysroot/usr/lib/libgraphics.a', 'sha256': 'c' * 64}]
+        self.assertEqual(build.validate_recipe(recipe, source)['static_link_inputs'],
+                         ['sysroot/usr/lib/libgraphics.a'])
+        for invalid in (['../host/libgraphics.a'], ['sysroot/usr/lib/libgraphics.a'] * 2,
+                        ['sysroot/usr/lib/libgraphics.so']):
+            recipe['static_link_inputs'] = invalid
+            with self.assertRaises(ValueError):
+                build.validate_recipe(recipe, source)
+
     def local_source(self, root):
         source = root / 'fixture'
         subprocess.run(['git', 'init', '-q', str(source)], check=True)
@@ -209,6 +229,84 @@ class CosmicBuildTests(unittest.TestCase):
             self.assertIn('target C++ SDK is unavailable', result.stderr)
             self.assertEqual(result.stdout, '')
 
+    @unittest.skipUnless((build.ROOT / 'artifacts/sysroot/x86_64-musl/sysroot/usr/lib/libpixman-1.a').is_file(),
+                         'real target pixman archive unavailable')
+    def test_real_x86_link_requires_explicit_bound_pixman_archive(self):
+        sysroot = build.ROOT / 'artifacts/sysroot/x86_64-musl'
+        for linked in (False, True):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                source = self.local_source(root)
+                (root / 'fixture/src/main.rs').write_text(
+                    'unsafe extern "C" { fn pixman_version() -> i32; }\n'
+                    'fn main() { assert!(unsafe { pixman_version() } > 0); }\n')
+                subprocess.run(['git', '-C', str(root / 'fixture'), 'add', '.'], check=True)
+                subprocess.run(['git', '-C', str(root / 'fixture'), '-c', 'user.name=test', '-c',
+                                'user.email=test@example.invalid', 'commit', '-qm', 'pixman link'], check=True)
+                source['commit'] = build.git(root / 'fixture', 'rev-parse', 'HEAD')
+                record = build.inspect_source(root, source)
+                (root / 'cache').mkdir()
+                recipe = {'target': 'x86_64-unknown-linux-musl', 'package': 'fixture', 'binary': 'fixture',
+                          'default_features': False, 'features': [], 'patches': [], 'native_inputs': [],
+                          'effective_lock_sha256': build.digest(root / 'fixture/Cargo.lock'),
+                          'static_link_inputs': ['sysroot/usr/lib/libpixman-1.a'] if linked else []}
+                for name in ('libc.a', 'libclang_rt.builtins-x86_64.a', 'crt1.o', 'crti.o', 'crtn.o', 'libpixman-1.a'):
+                    relative = 'sysroot/usr/lib/' + name
+                    recipe['native_inputs'].append({'path': relative, 'sha256': build.digest(sysroot / relative)})
+                recipe_path = root / 'recipe.json'
+                recipe_path.write_text(json.dumps(recipe))
+                profile = {'min_free_bytes': 64 * 1024**2, 'max_build_bytes': 128 * 1024**2,
+                           'timeout_seconds': 60, 'max_elf_bytes': 16 * 1024**2,
+                           'image_bytes': 16 * 1024**2, 'stack_bytes': 256 * 1024}
+                def run():
+                    return build.perform_build(source, record, recipe, recipe_path, root / 'out',
+                                               sysroot, root / 'cache', profile, 1)
+                if linked:
+                    report = run()
+                    self.assertTrue(report['target_linked'])
+                    self.assertEqual(report['executable']['machine'], 62)
+                    self.assertEqual(report['guest_execution'], 'not performed')
+                else:
+                    with self.assertRaisesRegex(ValueError, 'exit 101'):
+                        run()
+                    self.assertIn('undefined symbol: pixman_version', (root / 'out/cargo.log').read_text())
+
+    @unittest.skipUnless((build.ROOT / 'artifacts/sysroot/x86_64-musl/sysroot/usr/lib/libc.a').is_file(),
+                         'real x86 SDK unavailable')
+    def test_build_script_cannot_mutate_declared_archive_outside_sysroot_tree(self):
+        original = build.ROOT / 'artifacts/sysroot/x86_64-musl'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            sdk = root / 'sdk'
+            shutil.copytree(original / 'bin', sdk / 'bin')
+            source = self.local_source(root)
+            extra = sdk / 'mesa/libextra.a'
+            extra.parent.mkdir()
+            shutil.copyfile(original / 'sysroot/usr/lib/libc.a', extra)
+            (root / 'fixture/build.rs').write_text(
+                'fn main() { std::fs::write(' + json.dumps(str(extra)) + ', b"changed").unwrap(); }\n')
+            subprocess.run(['git', '-C', str(root / 'fixture'), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root / 'fixture'), '-c', 'user.name=test', '-c',
+                            'user.email=test@example.invalid', 'commit', '-qm', 'input mutation'], check=True)
+            source['commit'] = build.git(root / 'fixture', 'rev-parse', 'HEAD')
+            record = build.inspect_source(root, source)
+            (root / 'cache').mkdir()
+            recipe = {'target': 'x86_64-unknown-linux-musl', 'package': 'fixture', 'binary': 'fixture',
+                      'default_features': False, 'features': [], 'patches': [],
+                      'native_inputs': [{'path': 'mesa/libextra.a', 'sha256': build.digest(extra)}],
+                      'effective_lock_sha256': build.digest(root / 'fixture/Cargo.lock')}
+            for name in ('libc.a', 'libclang_rt.builtins-x86_64.a', 'crt1.o', 'crti.o', 'crtn.o'):
+                relative = 'sysroot/usr/lib/' + name
+                (sdk / relative).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original / relative, sdk / relative)
+                recipe['native_inputs'].append({'path': relative, 'sha256': build.digest(sdk / relative)})
+            recipe_path = root / 'recipe.json'
+            recipe_path.write_text(json.dumps(recipe))
+            profile = {'min_free_bytes': 64 * 1024**2, 'max_build_bytes': 128 * 1024**2, 'timeout_seconds': 60}
+            with self.assertRaisesRegex(ValueError, 'modified declared native input'):
+                build.perform_build(source, record, recipe, recipe_path, root / 'out',
+                                    sdk, root / 'cache', profile, 1, operation='typecheck')
+
     @unittest.skipUnless((build.ROOT / 'artifacts/sysroot/x86_64-musl/sysroot/usr/lib/libc.a').is_file(),
                          'x86 target SDK unavailable')
     def test_real_x86_typecheck_reports_no_link_and_rejects_invalid_program(self):
@@ -251,6 +349,46 @@ class CosmicBuildTests(unittest.TestCase):
                     self.assertEqual(report['status'], 'failed')
                     self.assertFalse(report['target_linked'])
                     self.assertIn('mismatched types', (root / 'out/cargo.log').read_text())
+
+    @unittest.skipUnless((build.ROOT / 'artifacts/sysroot/x86_64-musl/sysroot/usr/lib/libc.a').is_file(),
+                         'real x86 SDK unavailable')
+    def test_real_oversized_elf_records_failed_admission_after_successful_link(self):
+        sysroot = build.ROOT / 'artifacts/sysroot/x86_64-musl'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = self.local_source(root)
+            (root / 'fixture/src/main.rs').write_text(
+                'static IMAGE: [u8; 17 * 1024 * 1024] = [7; 17 * 1024 * 1024];\n'
+                'fn main() { std::hint::black_box(&IMAGE); }\n')
+            subprocess.run(['git', '-C', str(root / 'fixture'), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root / 'fixture'), '-c', 'user.name=test', '-c',
+                            'user.email=test@example.invalid', 'commit', '-qm', 'oversized image'], check=True)
+            source['commit'] = build.git(root / 'fixture', 'rev-parse', 'HEAD')
+            record = build.inspect_source(root, source)
+            (root / 'cache').mkdir()
+            recipe = {'target': 'x86_64-unknown-linux-musl', 'package': 'fixture', 'binary': 'fixture',
+                      'default_features': False, 'features': [], 'patches': [], 'native_inputs': [],
+                      'effective_lock_sha256': build.digest(root / 'fixture/Cargo.lock')}
+            for name in ('libc.a', 'libclang_rt.builtins-x86_64.a', 'crt1.o', 'crti.o', 'crtn.o'):
+                relative = 'sysroot/usr/lib/' + name
+                recipe['native_inputs'].append({'path': relative, 'sha256': build.digest(sysroot / relative)})
+            recipe_path = root / 'recipe.json'
+            recipe_path.write_text(json.dumps(recipe))
+            profile = {'min_free_bytes': 64 * 1024**2, 'max_build_bytes': 256 * 1024**2,
+                       'timeout_seconds': 60, 'max_elf_bytes': 16 * 1024**2,
+                       'image_bytes': 16 * 1024**2, 'stack_bytes': 256 * 1024}
+            with self.assertRaisesRegex(RuntimeError, 'Invalid LOAD bounds'):
+                build.perform_build(source, record, recipe, recipe_path, root / 'out',
+                                    sysroot, root / 'cache', profile, 1)
+            report = json.loads((root / 'out/build-report.json').read_text())
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn('Invalid LOAD bounds', report['error'])
+            self.assertTrue(report['link_completed'])
+            self.assertFalse(report['target_linked'])
+            self.assertGreater(report['linked_binary']['bytes'], 16 * 1024**2)
+            linked = Path(report['linked_binary']['path'])
+            self.assertEqual(report['linked_binary']['sha256'], build.digest(linked))
+            self.assertFalse((root / 'out/fixture.elf').exists())
 
     @unittest.skipUnless((build.DEFAULT_SYSROOT / 'sysroot/usr/lib/libc.a').is_file(),
                          'real pinned target sysroot is not installed')
