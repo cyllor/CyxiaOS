@@ -297,7 +297,7 @@ impl Process<'_> {
             return Err(Errno::Inval);
         }
         let index = self.inotify_index(fd)?;
-        let path = self.path(fs, path)?;
+        let path = self.resolved_path_with_follow(fs, path, mask & DONT_FOLLOW == 0)?;
         let stat = fs.stat(path)?;
         if mask & ONLYDIR != 0 && stat.kind != Kind::Directory {
             return Err(Errno::Notdir);
@@ -305,8 +305,6 @@ impl Process<'_> {
         if stat.mode & 0o400 == 0 {
             return Err(Errno::Access);
         }
-        // The current VFS has no symbolic links. DONT_FOLLOW therefore needs
-        // no alternate resolution path, while retaining normal access checks.
         let inode = fs.identity(path)?;
         let mut table = self.objects.inner.borrow_mut();
         let instance = &mut table.inotifies[index];

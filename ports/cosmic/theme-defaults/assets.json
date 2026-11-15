@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/pop-os/libcosmic",
+  "commit": "5a8bd9482a35ae94c1e54edf77b331c6b970f170",
+  "license": "MPL-2.0",
+  "theme_version": 2,
+  "files": [
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/accent",
+      "bytes": 322,
+      "sha256": "84d3834684cfb04afcea10baa8d30597b7ac45f8fcf1c3f4d1dab905464a43b4"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/accent_button",
+      "bytes": 322,
+      "sha256": "57beafe01a8c11ca1a2eb830b32e3484981fed9c2fa9f57c133c3795670408c3"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/accent_text",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/active_hint",
+      "bytes": 1,
+      "sha256": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/alpha_map",
+      "bytes": 333,
+      "sha256": "4f55658f1af967b468162e4bfc3f24abeaba6ecaddeb7c0202f52c580919dc13"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/background",
+      "bytes": 495,
+      "sha256": "c84e03fe15651227b80f008fa08ff38b23a827a5dc2d79aabf8de05197aa4c76"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/button",
+      "bytes": 322,
+      "sha256": "b6f4a33730f1f55479d17bda856aeae30c05f42861174b58bfbd5d0bcfdfdd45"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/control_tint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/corner_radii",
+      "bytes": 237,
+      "sha256": "01c9d99f6eb90b75535d9c3e08ec6029d53bf66e531749d683704d6a7bf4a66d"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/destructive",
+      "bytes": 322,
+      "sha256": "49124d0a9c53936e0298c15d948be2bbed03ab6bf8e5aa46d44971dca46acfa7"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/destructive_button",
+      "bytes": 322,
+      "sha256": "a9e854d9c559e1ed9504e7768e6d1a68038f876e9a9eddf20e48c1bea56345aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted",
+      "bytes": 6,
+      "sha256": "8e588cd187741f1cd76f5fab77b7208782a8c21d764ce7d7a4cf3ac4e0968873"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_applets",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_maximized_apps",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_panel",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_system_interface",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_windows",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/gaps",
+      "bytes": 6,
+      "sha256": "a9a78cca07158ad04ad15c220dd1988182f5ba645589c77d6b5d6c8b7a6ea913"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/icon_button",
+      "bytes": 322,
+      "sha256": "6270d7b07334f1e206a3991fc235d26496d28d1531d90c36b107acea1f7e081d"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/is_dark",
+      "bytes": 4,
+      "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/is_high_contrast",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/link_button",
+      "bytes": 322,
+      "sha256": "230f0643a32e426fea31a824a2e8c050025b75a78e8fa953e84530c9b5b1b213"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/list_button",
+      "bytes": 322,
+      "sha256": "f9dfdd7391fad1c2f390f1bcc1ee57f49ed4d212f2dd81ddded3a4ffbcb5ce5e"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/name",
+      "bytes": 13,
+      "sha256": "c4607bbbe6503b2920d9b27c5a636ef7bf22cbec045110bf4792d83d5a21503b"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/palette",
+      "bytes": 964,
+      "sha256": "d1cf7e3a9be99020c94825e0bfdefacb970180c938d43af917a8b53d3abff932"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/primary",
+      "bytes": 495,
+      "sha256": "8f2c8c57b1509c812f1a0eda65726dad23190984fde05a7acabdeaae63ffc894"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/secondary",
+      "bytes": 495,
+      "sha256": "16e3f40d9a39c811cad1b990836df777dd294b92f982c0d19e97457b9c0464de"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/shade",
+      "bytes": 11,
+      "sha256": "91fc5259f72d483878b8edd1980b2f53926bddb0f49f3d0adc6bca5028d381d1"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/spacing",
+      "bytes": 186,
+      "sha256": "b254bdf6131ec1c5e9737ef6b5708a6a44f026b7d9d91227cb3f60b7e41ef918"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/success",
+      "bytes": 322,
+      "sha256": "fa9d802a9a33ba5132a4466018885057b66d1d248939bf562ef17ca2d76c08ab"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/success_button",
+      "bytes": 322,
+      "sha256": "db54b70212ef4b8e0982d51b4727efc4956408a752fb359419aa953430c02f33"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/text_button",
+      "bytes": 322,
+      "sha256": "63b04a86cac30f092db90fc3d35998796feafe27f5025fb8e1e423ce93872af7"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/text_tint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/transparent_background",
+      "bytes": 495,
+      "sha256": "a5bd34b4e24972eb1347910d5087fc74ff2335eb540cc5207a2e7338841fca50"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/transparent_primary",
+      "bytes": 495,
+      "sha256": "172e859d8ea9834dde397db5ffe0cbaae43b25fe03c76b6f040da98aa1e31eec"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/transparent_secondary",
+      "bytes": 495,
+      "sha256": "16e3f40d9a39c811cad1b990836df777dd294b92f982c0d19e97457b9c0464de"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/warning",
+      "bytes": 322,
+      "sha256": "089206cd04b043d611aafeab7da22e96a04d7b51d9b008a681dcd26dacf8087d"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/warning_button",
+      "bytes": 322,
+      "sha256": "e4ae2b86bb98c0e1ea55c5560618bf65cdb495fa268b72e92cd0763899cfb5fb"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Dark/v2/window_hint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/accent",
+      "bytes": 322,
+      "sha256": "95718323e683c1e480be56b75a017deed8254e41df0c7cdf09c65fb4099e0085"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/accent_button",
+      "bytes": 322,
+      "sha256": "15276d9c13fc14e2844abf46194ef4bbad418de73291f774e7507be7978866f2"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/accent_text",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/active_hint",
+      "bytes": 1,
+      "sha256": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/alpha_map",
+      "bytes": 333,
+      "sha256": "4f55658f1af967b468162e4bfc3f24abeaba6ecaddeb7c0202f52c580919dc13"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/background",
+      "bytes": 495,
+      "sha256": "5d6f56f7caf2e061f49b91d453fe09671fb6b40c10c9b2c6731e1728abe88f8a"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/button",
+      "bytes": 322,
+      "sha256": "d7ad7d67b2d9ef94c1771f637bc8ddb969023d77062ecbebba3355c1e9dcd5fd"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/control_tint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/corner_radii",
+      "bytes": 237,
+      "sha256": "01c9d99f6eb90b75535d9c3e08ec6029d53bf66e531749d683704d6a7bf4a66d"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/destructive",
+      "bytes": 322,
+      "sha256": "3c4a04eadb0b62db33d988460af47ca69474be654e94ab8783bb22360e2f79ea"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/destructive_button",
+      "bytes": 322,
+      "sha256": "dafb0c2bd5ac6ba6ed51be823daeb29e21e8a14c2098ed22b2140a25ff164dba"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted",
+      "bytes": 6,
+      "sha256": "8e588cd187741f1cd76f5fab77b7208782a8c21d764ce7d7a4cf3ac4e0968873"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted_applets",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted_maximized_apps",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted_panel",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted_system_interface",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/frosted_windows",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/gaps",
+      "bytes": 6,
+      "sha256": "a9a78cca07158ad04ad15c220dd1988182f5ba645589c77d6b5d6c8b7a6ea913"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/icon_button",
+      "bytes": 322,
+      "sha256": "c5176c6721b586d6dbb18e1c39ac7468e95bae70e60c81bbd234875c3218f02b"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/is_dark",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/is_high_contrast",
+      "bytes": 5,
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/link_button",
+      "bytes": 322,
+      "sha256": "e5afb9f04ae55ff12d29e37c64148dbb59eca3fecb233c26e88f115a9b83b8db"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/list_button",
+      "bytes": 322,
+      "sha256": "43a8a6c7e02d896124bab06ad62d5aa8209ec8e796db2d7d6a46ab3adf47884d"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/name",
+      "bytes": 14,
+      "sha256": "f2af9f525a37b7dc0137a84bacb6d25215d59db75bf5081de76c4c2245925bd5"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/palette",
+      "bytes": 965,
+      "sha256": "ae2ab0b62e95f116ea2f57628e20a60a2b66bdaa7377b4c8aef51abd766fa6e7"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/primary",
+      "bytes": 495,
+      "sha256": "69a41cb5ebada4fac4ac38961329b58a7f864ebc18e239db7c46acc187203678"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/secondary",
+      "bytes": 495,
+      "sha256": "e22e21b9248d3c7e0ecc1f7777b82af90297b40b5a09a0aba0cc9f613b77eb47"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/shade",
+      "bytes": 11,
+      "sha256": "2264676342b9d6ba04bd96309498f6ea849f831c9bf6e726e87cc11e6a47bd72"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/spacing",
+      "bytes": 186,
+      "sha256": "b254bdf6131ec1c5e9737ef6b5708a6a44f026b7d9d91227cb3f60b7e41ef918"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/success",
+      "bytes": 322,
+      "sha256": "3e73374d4f6367915a990f879233c24c0e665668d1ea97aece9cd06ce8c505fd"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/success_button",
+      "bytes": 322,
+      "sha256": "736fb1ac1f49c37dfe65ade2945aeac44a46143086b8878b55094fb4e1a4ab89"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/text_button",
+      "bytes": 322,
+      "sha256": "4fc863d72ec602272780239d7600f0fd63061575c4f8d17a109490e00587e6a2"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/text_tint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/transparent_background",
+      "bytes": 495,
+      "sha256": "99b32c7e59c098f14af4200eee57174c46a5b1077150a6112c530632de3477d1"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/transparent_primary",
+      "bytes": 495,
+      "sha256": "5d2e6c251b1b5dd23db2c715730f349c579db1851bd3ec6470ddece4f0698d40"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/transparent_secondary",
+      "bytes": 495,
+      "sha256": "e22e21b9248d3c7e0ecc1f7777b82af90297b40b5a09a0aba0cc9f613b77eb47"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/warning",
+      "bytes": 322,
+      "sha256": "5c2f38abe4b605eba21d6fdf15dc3c3087dac769be82dd765720661ea61690e3"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/warning_button",
+      "bytes": 322,
+      "sha256": "39885c469a0ac6f3149bfc9c10fff8dafbba3e618c96c91f25deceab4c683f1a"
+    },
+    {
+      "path": "/usr/share/cosmic/com.system76.CosmicTheme.Light/v2/window_hint",
+      "bytes": 4,
+      "sha256": "dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    {
+      "path": "/usr/share/doc/libcosmic/LICENSE",
+      "bytes": 16725,
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+    }
+  ],
+  "provenance": {
+    "source": {
+      "path": "artifacts/cosmic-cargo-cache/git/checkouts/libcosmic-41009aea1d72760b/5a8bd94/cosmic-theme/src/model/theme.rs",
+      "bytes": 55054,
+      "sha256": "9a2d7fc34b28c90c7c18227c2ac45a18b76980dc479799fe773a93768bad36f0"
+    },
+    "generator": {
+      "path": "ports/cosmic/theme-defaults/client.rs",
+      "bytes": 6266,
+      "sha256": "1003586674225500970f26fb895863d27c2baf89cd5e4d592338c19a59de94b2"
+    },
+    "build": {
+      "prefix": "artifacts/v017-cosmic-settings-20261115-r1/theme-defaults-prefix-01",
+      "receipt": {
+        "path": "artifacts/v017-cosmic-settings-20261115-r1/theme-defaults-prefix-01/cosmic-theme-defaults-build-report.json",
+        "bytes": 3989232,
+        "sha256": "fbaaa1a9cff5e06773d5f7edc01c52c7013f1818033b4ef1591bd11c9db3f092"
+      }
+    },
+    "captures": [
+      {
+        "mode": "dark",
+        "capture": {
+          "path": "artifacts/v017-cosmic-settings-20261115-r1/theme-dark-01/summary.json",
+          "bytes": 15809,
+          "sha256": "39d45235b588bd3906fec2c3d46d873913944bd3966e6517fa3733c907e28f82"
+        },
+        "serial": {
+          "path": "artifacts/v017-cosmic-settings-20261115-r1/theme-dark-01/serial.raw",
+          "bytes": 101963,
+          "sha256": "2c7609aba6b216126b742390d700e9c24f37ec546f51aea1cf48ea8cb4c11e40"
+        }
+      },
+      {
+        "mode": "light",
+        "capture": {
+          "path": "artifacts/v017-cosmic-settings-20261115-r1/theme-light-01/summary.json",
+          "bytes": 15810,
+          "sha256": "8c872d379d57de2bbef178bcd8c181bea862a15fe73fef73da48b966f60504bd"
+        },
+        "serial": {
+          "path": "artifacts/v017-cosmic-settings-20261115-r1/theme-light-01/serial.raw",
+          "bytes": 101973,
+          "sha256": "b2945d4c58ffe820f0a7645f7bfc985f71c0531e7b73f01c17d00c07cf56796d"
+        }
+      }
+    ]
+  }
+}

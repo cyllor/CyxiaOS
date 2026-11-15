@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "settings-static-x86_64-full-os-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Genuine pinned cosmic-settings-daemon target build. Growth is an experimental bound, not measured successful peak. Full-OS 64 MiB image including 2 MiB stack; unchanged builder retains its legacy 16 MiB LOAD inspector. Runtime needs real session bus and Wayland; audio/device/system service capabilities require separate validation.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 1610612736,
+      "timeout_seconds": 1200,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

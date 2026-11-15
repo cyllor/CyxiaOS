@@ -7,6 +7,93 @@ use std::{string::String, vec::Vec};
 fn path(name: &str) -> Path {
     Path::resolve(Path::ROOT, name).unwrap()
 }
+
+#[test]
+fn symlink_watch_following_and_nofollow_watch_distinguish_inode_lifetimes() {
+    let mut fs = FileSystem::new();
+    fs.write(path("/target"), b"initial", false).unwrap();
+    fs.symlink(path("/link"), "target").unwrap();
+    let objects = OpenDescriptions::new();
+    let mut p = Process::new(&objects, 1).unwrap();
+    let fd = p.inotify_init(&fs, O_NONBLOCK).unwrap();
+    let target = p
+        .inotify_add_watch(&fs, fd, "/link", MODIFY | DELETE_SELF)
+        .unwrap();
+    let link = p
+        .inotify_add_watch(&fs, fd, "/link", ATTRIB | DELETE_SELF | DONT_FOLLOW)
+        .unwrap();
+    assert_ne!(target, link);
+    assert_eq!(
+        p.inotify_add_watch(&fs, fd, "/target", MODIFY | DELETE_SELF),
+        Ok(target)
+    );
+
+    fs.write(path("/target"), b"updated", false).unwrap();
+    assert_eq!(
+        read(&mut p, &fs, fd),
+        std::vec![event(target, MODIFY, 0, "")]
+    );
+    p.unlink(&mut fs, "/link").unwrap();
+    assert_eq!(
+        read(&mut p, &fs, fd),
+        std::vec![
+            event(link, ATTRIB, 0, ""),
+            event(link, DELETE_SELF, 0, ""),
+            event(link, IGNORED, 0, "")
+        ]
+    );
+    fs.write(path("/target"), b"survives", false).unwrap();
+    assert_eq!(
+        read(&mut p, &fs, fd),
+        std::vec![event(target, MODIFY, 0, "")]
+    );
+    p.close_all(&mut fs).unwrap();
+}
+
+#[test]
+fn symlink_watch_directory_filter_permissions_and_child_type_follow_resolution() {
+    let mut fs = FileSystem::new();
+    fs.mkdir(path("/directory")).unwrap();
+    fs.symlink(path("/dirlink"), "directory").unwrap();
+    fs.symlink(path("/dangling"), "absent").unwrap();
+    fs.mkdir(path("/locked")).unwrap();
+    fs.write(path("/locked/secret"), b"hidden", false).unwrap();
+    fs.symlink(path("/secret"), "locked/secret").unwrap();
+    fs.set_mode(path("/locked"), 0).unwrap();
+    let objects = OpenDescriptions::new();
+    let mut p = Process::new(&objects, 1).unwrap();
+    let fd = p.inotify_init(&fs, O_NONBLOCK).unwrap();
+    let directory = p
+        .inotify_add_watch(&fs, fd, "/dirlink", CREATE | ONLYDIR)
+        .unwrap();
+    assert_eq!(
+        p.inotify_add_watch(&fs, fd, "/dirlink", CREATE | ONLYDIR | DONT_FOLLOW),
+        Err(Errno::Notdir)
+    );
+    assert_eq!(
+        p.inotify_add_watch(&fs, fd, "/dangling", DELETE_SELF),
+        Err(Errno::Noent)
+    );
+    assert!(
+        p.inotify_add_watch(&fs, fd, "/dangling", DELETE_SELF | DONT_FOLLOW)
+            .is_ok()
+    );
+    assert_eq!(
+        p.inotify_add_watch(&fs, fd, "/secret", MODIFY),
+        Err(Errno::Access)
+    );
+    assert!(
+        p.inotify_add_watch(&fs, fd, "/secret", DELETE_SELF | DONT_FOLLOW)
+            .is_ok()
+    );
+
+    fs.symlink(path("/directory/child"), "/absent").unwrap();
+    assert_eq!(
+        read(&mut p, &fs, fd),
+        std::vec![event(directory, CREATE, 0, "child")]
+    );
+    p.close_all(&mut fs).unwrap();
+}
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }

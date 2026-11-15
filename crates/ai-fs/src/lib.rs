@@ -11,8 +11,20 @@ mod weights;
 pub use brain::{LearningStatus, ValidationStatus};
 use cyxia_contracts::DecisionSource;
 
+#[cfg(not(feature = "full-os"))]
 pub const NODES: usize = 64;
+#[cfg(feature = "full-os")]
+pub const NODES: usize = 128;
+#[cfg(not(feature = "full-os"))]
 pub const FILE_BYTES: usize = 4096;
+#[cfg(feature = "full-os")]
+pub const FILE_BYTES: usize = 8192;
+/// Maximum retained payload, including symbolic-link targets and unlinked
+/// files whose open handles still own their bytes. Cache copies are separate.
+#[cfg(not(feature = "full-os"))]
+pub const RETAINED_BYTES: usize = NODES * FILE_BYTES;
+#[cfg(feature = "full-os")]
+pub const RETAINED_BYTES: usize = 256 * 1024;
 pub const PATH_BYTES: usize = 96;
 pub const CACHE_LINES: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +119,7 @@ impl Path {
 pub enum Kind {
     File,
     Directory,
+    Symlink,
 }
 #[derive(Clone, Copy)]
 struct Node {
@@ -314,7 +327,17 @@ impl FileSystem {
     fn admit(&mut self, new: bool, growth: usize) -> Result<u64, Error> {
         let next = self.revision.checked_add(1).ok_or(Error::Exhausted)?;
         let free = self.nodes.iter().filter(|n| !n.used).count();
-        if new && free == 0 {
+        let retained = self
+            .nodes
+            .iter()
+            .filter(|n| n.used)
+            .map(|n| n.len)
+            .sum::<usize>();
+        if (new && free == 0)
+            || retained
+                .checked_add(growth)
+                .is_none_or(|bytes| bytes > RETAINED_BYTES)
+        {
             self.policy.capacity_rejected = self.policy.capacity_rejected.saturating_add(1);
             self.last_source = DecisionSource::SafetyGuard;
             return Err(Error::Full);
@@ -361,6 +384,56 @@ impl FileSystem {
         self.record_change(i, events::Action::Create, 0);
         Ok(())
     }
+    /// Create a link inode without resolving or normalizing its UTF-8 target.
+    /// Path traversal and link following belong to the syscall adapter.
+    pub fn symlink(&mut self, p: Path, target: &str) -> Result<(), Error> {
+        Self::validate_link_target(target)?;
+        if self.stat(p).is_ok() {
+            return Err(Error::Exists);
+        }
+        self.directory(p.parent())?;
+        let parent = self.identity(p.parent())?;
+        let next = self.admit(true, target.len())?;
+        let i = self.nodes.iter().position(|n| !n.used).ok_or(Error::Full)?;
+        self.nodes[i] = Node {
+            path: p,
+            parent,
+            kind: Kind::Symlink,
+            used: true,
+            linked: true,
+            serial: next,
+            mode: 0o777,
+            len: target.len(),
+            ..Node::EMPTY
+        };
+        self.nodes[i].data[..target.len()].copy_from_slice(target.as_bytes());
+        self.changed(next);
+        self.record_change(i, events::Action::Create, 0);
+        Ok(())
+    }
+    fn validate_link_target(target: &str) -> Result<(), Error> {
+        if target.is_empty() || target.as_bytes().contains(&0) {
+            return Err(Error::InvalidPath);
+        }
+        if target.len() > PATH_BYTES {
+            return Err(Error::TooLong);
+        }
+        Ok(())
+    }
+    /// Return target bytes without a trailing NUL. A short output truncates
+    /// the byte string, as with POSIX readlink; it does not resolve the target.
+    pub fn readlink(&self, p: Path, out: &mut [u8]) -> Result<usize, Error> {
+        if p == Path::ROOT {
+            return Err(Error::InvalidPath);
+        }
+        let node = &self.nodes[self.find(p)?];
+        if node.kind != Kind::Symlink {
+            return Err(Error::InvalidPath);
+        }
+        let len = out.len().min(node.len);
+        out[..len].copy_from_slice(&node.data[..len]);
+        Ok(len)
+    }
     /// Atomic bounded write: failed validation/admission leaves existing bytes intact.
     pub fn write(&mut self, p: Path, data: &[u8], append: bool) -> Result<(), Error> {
         self.write_with_mode(p, data, append, Node::EMPTY.mode)
@@ -372,7 +445,13 @@ impl FileSystem {
         }
         self.write_with_mode(p, &[], false, mode)
     }
-    fn write_with_mode(&mut self, p: Path, data: &[u8], append: bool, mode: u16) -> Result<(), Error> {
+    fn write_with_mode(
+        &mut self,
+        p: Path,
+        data: &[u8],
+        append: bool,
+        mode: u16,
+    ) -> Result<(), Error> {
         if p == Path::ROOT {
             return Err(Error::IsDirectory);
         }
@@ -381,6 +460,9 @@ impl FileSystem {
         let existing = self.find(p).ok();
         if existing.is_some_and(|i| self.nodes[i].kind == Kind::Directory) {
             return Err(Error::IsDirectory);
+        }
+        if existing.is_some_and(|i| self.nodes[i].kind == Kind::Symlink) {
+            return Err(Error::InvalidPath);
         }
         let old = existing.map_or(0, |i| self.nodes[i].len);
         let start = if append { old } else { 0 };
@@ -432,13 +514,13 @@ impl FileSystem {
         }
         Ok(())
     }
-    /// Atomically rename a regular file, retaining both open inode identities
+    /// Atomically rename a file or link, retaining both open inode identities
     /// when replacing a destination. Directory/subtree moves are not yet part
     /// of this bounded operation. The syscall adapter checks both parents and
     /// rejects collisions with its separate immutable boot-file catalog.
     pub fn rename_file(&mut self, from: Path, to: Path, no_replace: bool) -> Result<(), Error> {
         let source = self.find(from)?;
-        if self.nodes[source].kind != Kind::File || to == Path::ROOT {
+        if self.nodes[source].kind == Kind::Directory || to == Path::ROOT {
             return Err(Error::IsDirectory);
         }
         self.directory(to.parent())?;
@@ -449,7 +531,7 @@ impl FileSystem {
         if from == to {
             return Ok(());
         }
-        if destination.is_some_and(|i| self.nodes[i].kind != Kind::File) {
+        if destination.is_some_and(|i| self.nodes[i].kind == Kind::Directory) {
             return Err(Error::IsDirectory);
         }
         let parent = self.identity(to.parent())?;
@@ -492,7 +574,7 @@ impl FileSystem {
             {
                 return Err(Error::NotEmpty);
             }
-        } else if self.nodes[i].kind != Kind::File {
+        } else if self.nodes[i].kind == Kind::Directory {
             return Err(Error::IsDirectory);
         }
         let next = self.revision.checked_add(1).ok_or(Error::Exhausted)?;
@@ -591,8 +673,10 @@ impl FileSystem {
         Ok(())
     }
     pub fn read(&mut self, p: Path, out: &mut [u8]) -> Result<usize, Error> {
-        if self.stat(p)?.kind != Kind::File {
-            return Err(Error::IsDirectory);
+        match self.stat(p)?.kind {
+            Kind::Directory => return Err(Error::IsDirectory),
+            Kind::Symlink => return Err(Error::InvalidPath),
+            Kind::File => {}
         }
         let i = self.find(p)?;
         self.read_index(i, out)
@@ -624,8 +708,10 @@ impl FileSystem {
     }
     pub fn pin(&mut self, p: Path) -> Result<Inode, Error> {
         let i = self.find(p)?;
-        if self.nodes[i].kind != Kind::File {
-            return Err(Error::IsDirectory);
+        match self.nodes[i].kind {
+            Kind::Directory => return Err(Error::IsDirectory),
+            Kind::Symlink => return Err(Error::InvalidPath),
+            Kind::File => {}
         }
         self.nodes[i].pins = self.nodes[i].pins.checked_add(1).ok_or(Error::Full)?;
         Ok(Inode {

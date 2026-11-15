@@ -161,12 +161,20 @@ class SessionInputs(unittest.TestCase):
         with patch.object(subject.build.subprocess, 'run', side_effect=only_git), \
              patch.object(subject.build.subprocess, 'check_output', side_effect=AssertionError('native probe')):
             self.publish()
+
             result = subject.validate_inputs(self.curated)
         self.assertEqual(result['status'], 'VALIDATED_NOT_RUN')
         self.assertFalse(result['cosmic_session_ready'])
         self.assertEqual(result['dependency_count'], 2)
         with self.assertRaisesRegex(ValueError, 'Preserving existing'):
             self.publish()
+
+    def test_component_selection_cannot_relabel_a_session_receipt(self):
+        with self.assertRaises(ValueError):
+            self.publish(component='cosmic-settings-daemon')
+        self.assertFalse((self.curated / 'cosmic-settings-daemon-origin.json').exists())
+        with self.assertRaisesRegex(ValueError, 'Unsupported COSMIC service'):
+            self.publish(component='../cosmic-session')
 
     def test_changed_copied_or_original_elf_is_rejected(self):
         self.publish()

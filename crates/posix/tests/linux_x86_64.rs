@@ -17,10 +17,7 @@ fn x86_legacy_chmod_normalizes_to_the_real_fchmodat_operation() {
 
 #[test]
 fn durable_file_calls_use_each_linux_isa_number_and_preserve_the_descriptor() {
-    for (abi, fsync, fdatasync) in [
-        (ImageAbi::X86_64, 74, 75),
-        (ImageAbi::Aarch64, 82, 83),
-    ] {
+    for (abi, fsync, fdatasync) in [(ImageAbi::X86_64, 74, 75), (ImageAbi::Aarch64, 82, 83)] {
         for (number, call) in [(fsync, Call::Fsync), (fdatasync, Call::Fdatasync)] {
             for descriptor in [7, u64::MAX] {
                 let args = [descriptor, 0, 0, 0, 0, 0];
@@ -34,7 +31,10 @@ fn durable_file_calls_use_each_linux_isa_number_and_preserve_the_descriptor() {
     // pathname normalization rather than confusing the two ABI operations.
     let rename = linux_abi::decode(ImageAbi::X86_64, 82, [11, 22, 0, 0, 0, 0]).unwrap();
     assert_eq!(rename.call, Call::Renameat);
-    assert_eq!(rename.args[..4], [(-100i64) as u64, 11, (-100i64) as u64, 22]);
+    assert_eq!(
+        rename.args[..4],
+        [(-100i64) as u64, 11, (-100i64) as u64, 22]
+    );
 }
 
 #[test]
@@ -189,4 +189,23 @@ fn legacy_epoll_create_uses_signed_32_bit_size_and_rejects_nonpositive_values() 
             .call,
         Call::EpollCreate1
     );
+}
+
+#[test]
+fn symbolic_link_calls_preserve_linux_argument_order_on_both_isas() {
+    let args = [11, 22, 33, 44, 55, 66];
+    let at = (-100i64) as u64;
+    let legacy = linux_abi::decode(ImageAbi::X86_64, 88, args).unwrap();
+    assert_eq!(legacy.call, Call::Symlinkat);
+    assert_eq!(legacy.args, [11, at, 22, 0, 0, 0]);
+    let read = linux_abi::decode(ImageAbi::X86_64, 89, args).unwrap();
+    assert_eq!(read.call, Call::Readlinkat);
+    assert_eq!(read.args, [at, 11, 22, 33, 0, 0]);
+    for (abi, symlink, readlink) in [(ImageAbi::X86_64, 266, 267), (ImageAbi::Aarch64, 36, 78)] {
+        for (number, call) in [(symlink, Call::Symlinkat), (readlink, Call::Readlinkat)] {
+            let decoded = linux_abi::decode(abi, number, args).unwrap();
+            assert_eq!(decoded.call, call);
+            assert_eq!(decoded.args, args);
+        }
+    }
 }

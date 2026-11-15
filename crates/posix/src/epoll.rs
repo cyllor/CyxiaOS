@@ -171,7 +171,10 @@ impl super::OpenDescriptions {
 impl Process<'_> {
     fn epoll_source(&self, object: Object, owner: u32) -> Result<Source, Errno> {
         if let Object::Inotify(index) = object {
-            Ok(Source::Local { read: self.objects.inotify_readable(index), write: false })
+            Ok(Source::Local {
+                read: self.objects.inotify_readable(index),
+                write: false,
+            })
         } else {
             source(object, owner)
         }

@@ -129,7 +129,9 @@ fn directory_cookies_permissions_assets_and_unlink_identity() {
         Ok(24)
     );
     assert_eq!(&buffer[19..22], b"..\0");
-    let n = process.getdents(&mut fs, alias, assets, &mut buffer).unwrap();
+    let n = process
+        .getdents(&mut fs, alias, assets, &mut buffer)
+        .unwrap();
     assert_eq!(n, 56);
     assert_eq!(&buffer[19..24], b"file\0");
     assert_eq!(&buffer[43..52], b"font.ttf\0");
@@ -478,8 +480,10 @@ fn native_image_isa_is_explicit_and_wrong_isa_does_not_mutate_arena() {
     arena.write(usermem::STACK_BASE, b"retained").unwrap();
     assert_eq!(image::load(&bytes, &mut arena), Err(Errno::Inval));
     assert_eq!(arena.read(usermem::STACK_BASE, 8).unwrap(), b"retained");
-    assert_eq!(image::load_for(&bytes, &mut arena, crate::ImageAbi::X86_64),
-        Ok(usermem::BASE + 1));
+    assert_eq!(
+        image::load_for(&bytes, &mut arena, crate::ImageAbi::X86_64),
+        Ok(usermem::BASE + 1)
+    );
     assert_eq!(arena.read(usermem::STACK_BASE, 8).unwrap(), &[0; 8]);
 }
 
@@ -538,7 +542,9 @@ fn readonly_mapping_source_preserves_ofd_offset_and_outlives_descriptors() {
     process.close(&mut fs, duplicate).unwrap();
     assert_eq!(source, ASSET);
     assert_eq!(process.readonly_file(fd), Err(Errno::Badf));
-    let file = process.open(&mut fs, "/mutable", O_CREAT | O_RDONLY, 0o400).unwrap();
+    let file = process
+        .open(&mut fs, "/mutable", O_CREAT | O_RDONLY, 0o400)
+        .unwrap();
     assert_eq!(process.readonly_file(file), Ok(None));
     assert_eq!(process.readonly_file(0), Ok(None));
     process.close_all(&mut fs).unwrap();

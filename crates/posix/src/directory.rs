@@ -32,7 +32,11 @@ impl Process<'_> {
                         cookie + 1,
                         entry.path.name(),
                         fs.identity(entry.path)?,
-                        if entry.kind == Kind::Directory { 4 } else { 8 },
+                        match entry.kind {
+                            Kind::Directory => 4,
+                            Kind::File => 8,
+                            Kind::Symlink => 10,
+                        },
                     )?
                 {
                     break;

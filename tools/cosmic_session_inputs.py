@@ -1,4 +1,4 @@
-"""Read-only provenance checks for the real, bounded cosmic-session build.
+"""Read-only provenance checks for real, bounded COSMIC service builds.
 
 No compiler, Cargo, version probe, patch application or guest is executed here.
 Origin publication binds logs and the installed Rust library set at publication;
@@ -9,6 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import tarfile
+import tomllib
 
 try:
     from . import build_cosmic as build
@@ -30,6 +32,12 @@ TARGET = ports.user_target('x86_64-unknown-linux-musl')
 ORIGIN_KEYS = {'schema_version', 'output', 'report_sha256', 'recipe_path',
                'resource_path', 'resource_sha256', 'source_export', 'logs_sha256',
                'patch_manifests', 'rust_libraries_sha256'}
+COMPONENT_SOURCES = {'cosmic-session': 'session', 'cosmic-settings-daemon': 'settings'}
+
+
+def component_files(component):
+    require(component in COMPONENT_SOURCES, 'Unsupported COSMIC service component')
+    return component + '.elf', component + '-origin.json'
 
 
 def require(value, message):
@@ -90,6 +98,55 @@ def tracked_files(source):
     return result
 
 
+def validate_registry_inputs(manifest, original, hashes):
+    """Verify exported registry origins against the original locked archives."""
+    records = manifest.get('registry_inputs', {})
+    require(isinstance(records, dict), 'Malformed registry origin map')
+    if not records:
+        return
+    locked = tomllib.loads((original / 'Cargo.lock').read_text())['package']
+    for key, record in records.items():
+        name, version = record['package'], record['version']
+        require(key == name and re.fullmatch(r'[a-zA-Z0-9_-]+', name)
+                and re.fullmatch(r'[a-zA-Z0-9.+_-]+', version), 'Invalid registry package identity')
+        selected = [p for p in locked if p['name'] == name and p['version'] == version
+                    and p.get('source') == record['source']]
+        require(len(selected) == 1 and selected[0]['checksum'] == record['checksum']
+                == record['archive_sha256'], 'Registry origin differs from original lock')
+        cache = ROOT / 'artifacts/cosmic-cargo-cache/registry'
+        archive = path(record['archive'], root=ROOT)
+        directory = path(record['path'], root=ROOT, directory=True)
+        require(archive.is_relative_to(cache / 'cache') and directory.is_relative_to(cache / 'src'),
+                'Registry origin escapes private cache')
+        require(archive.stat().st_size <= 2 * 1024**2, 'Registry archive exceeds input bound')
+        bind(archive, record['archive_sha256'], hashes)
+        files = {}; expanded = 0
+        with tarfile.open(archive, 'r:*') as packed:
+            for member in packed.getmembers():
+                relative = dependencies.relative_path(member.name)
+                require(relative.parts[0] == name + '-' + version, 'Wrong registry archive prefix')
+                if member.isdir():
+                    continue
+                require(member.isfile() and len(relative.parts) > 1, 'Non-regular registry member')
+                filename = str(Path(*relative.parts[1:]))
+                expanded += member.size
+                require(filename not in files and expanded <= 32 * 1024**2, 'Registry archive inventory bound')
+                files[filename] = hashlib.sha256(packed.extractfile(member).read()).hexdigest()
+        require(files == record['files'] and hashlib.sha256(json.dumps(files, sort_keys=True,
+                separators=(',', ':')).encode()).hexdigest() == record['tree_sha256'],
+                'Registry origin inventory differs from locked archive')
+        actual = build.tree_identity(directory)['files']
+        require(set(actual) - {'.cargo-ok', '.cargo-checksum.json'} == set(files),
+                'Registry extraction inventory changed')
+        for filename, digest in files.items():
+            bind(path(filename, root=directory), digest, hashes)
+        checksum_manifest = record.get('checksum_manifest')
+        if checksum_manifest is not None:
+            require(path(checksum_manifest['path']) == directory / '.cargo-checksum.json',
+                    'Wrong registry checksum manifest path')
+            bind(directory / '.cargo-checksum.json', checksum_manifest['sha256'], hashes)
+
+
 def validate_patches(recipe, recipe_path, report, origin, original, exported, hashes):
     require('source_series' not in recipe, 'Session source-series builds are unsupported')
     manifests = origin['patch_manifests']
@@ -105,7 +162,7 @@ def validate_patches(recipe, recipe_path, report, origin, original, exported, ha
         manifest_path = path(manifest_record['path'], root=ROOT)
         bind(manifest_path, manifest_record['sha256'], hashes)
         manifest = build.load_json(manifest_path)
-        require(manifest.get('schema_version') == 1 and manifest.get('component') == 'cosmic-session'
+        require(manifest.get('schema_version') == 1 and manifest.get('component') == recipe['component']
                 and manifest.get('commit') == recipe['commit']
                 and ports.repository_url(manifest.get('repository')) == report['component']['repository']
                 and manifest.get('patch_sha256') == patch['sha256']
@@ -123,10 +180,11 @@ def validate_patches(recipe, recipe_path, report, origin, original, exported, ha
             else:
                 expected[name] = checksum(after[name])
         sources = manifest.get('source_inputs')
-        require(isinstance(sources, dict) and 'session' in sources,
+        source_key = COMPONENT_SOURCES[recipe['component']]
+        require(isinstance(sources, dict) and source_key in sources,
                 'Patch manifest lacks source-input identities')
-        require(path(sources['session']['path'], root=ROOT, directory=True) == original
-                and sources['session']['commit'] == recipe['commit'],
+        require(path(sources[source_key]['path'], root=ROOT, directory=True) == original
+                and sources[source_key]['commit'] == recipe['commit'],
                 'Patch manifest session source differs from epoch checkout')
         for record in sources.values():
             selected = path(record['path'], root=ROOT, directory=True)
@@ -142,6 +200,7 @@ def validate_patches(recipe, recipe_path, report, origin, original, exported, ha
         require(isinstance(support, dict) and support, 'Patch manifest lacks support-input identities')
         for name, digest in support.items():
             bind(path(name, root=ROOT), digest, hashes)
+        validate_registry_inputs(manifest, original, hashes)
     require(report['patches'] == records, 'Build patch order or identity differs from the recipe')
     actual = build.tree_identity(exported)['files']
     require(all(set(entry) == {'bytes', 'sha256'} for entry in actual.values()),
@@ -256,7 +315,8 @@ def validate_metadata(report, recipe, output, exported):
     return jobs
 
 
-def _validate(prefix, origin):
+def _validate(prefix, origin, component='cosmic-session'):
+    program, _ = component_files(component)
     require(isinstance(origin, dict) and set(origin) == ORIGIN_KEYS and origin['schema_version'] == 1,
             'Unsupported cosmic-session origin receipt')
     prefix = artifact(prefix, directory=True)
@@ -275,12 +335,16 @@ def _validate(prefix, origin):
     resource_path = path(origin['resource_path'], root=ROOT)
     bind(recipe_path, report['recipe_sha256'], hashes)
     bind(resource_path, origin['resource_sha256'], hashes)
-    bind(path(ROOT / 'tools/build_cosmic.py'), report['builder_sha256'], hashes)
+    component_builder = component == 'cosmic-settings-daemon'
+    builder_name = 'build_cosmic_component.py' if component_builder else 'build_cosmic.py'
+    bind(path(ROOT / 'tools' / builder_name), report['builder_sha256'], hashes)
+    if component_builder:
+        bind(path(ROOT / 'tools/build_cosmic.py'), report['common_builder_sha256'], hashes)
     manifest = ports.load_manifest()
-    source, original, recipe = build.source_and_recipe('cosmic-session', recipe_path, manifest,
+    source, original, recipe = build.source_and_recipe(component, recipe_path, manifest,
                                                         ROOT / 'artifacts/cosmic-sources')
     require(report['component'] == source and report['recipe'] == recipe
-            and recipe['package'] == recipe['binary'] == 'cosmic-session'
+            and recipe['package'] == recipe['binary'] == component
             and recipe['target'] == TARGET.rust_target, 'Wrong session source or recipe identity')
     exported = artifact(origin['source_export'], directory=True)
     require(build.tree_identity(exported) == report['source_tree'], 'Preserved source export changed')
@@ -290,13 +354,30 @@ def _validate(prefix, origin):
             'Origin must bind all Cargo metadata and log files')
     for name in LOGS:
         bind(path(output / name), origin['logs_sha256'][name], hashes)
-    jobs = validate_metadata(report, recipe, output, exported)
+    metadata_report = report
+    if component_builder:
+        if __package__:
+            from .build_cosmic_component import local_package
+        else:
+            from build_cosmic_component import local_package
+        command = report['command']
+        require(command.count('--manifest-path') == command.count('--package') == 1,
+                'Malformed exact-package command')
+        old_source = Path(command[command.index('--manifest-path') + 1]).parent
+        selected = local_package(build.load_json(output / 'metadata.json'), old_source, recipe)
+        require(report['package_id'] == selected == command[command.index('--package') + 1],
+                'Build selected a different Cargo package ID')
+        # Reuse the ordinary dependency/command validator after separately
+        # validating the exact ID against the actual recorded root manifest.
+        metadata_report = copy.deepcopy(report)
+        metadata_report['command'][command.index('--package') + 1] = recipe['package']
+    jobs = validate_metadata(metadata_report, recipe, output, exported)
     profile = build.select_profile(build.load_json(resource_path), recipe['resource_profile'], jobs, TARGET)
     require(profile == report['resource_profile'] and canonical_hash(profile) == report['profile_sha256'],
             'Resource profile changed')
     validate_toolchain(report, recipe, output, origin, hashes)
-    original_elf = path(output / PROGRAM)
-    linked = path(output / 'target' / TARGET.rust_target / 'release/cosmic-session')
+    original_elf = path(output / program)
+    linked = path(output / 'target' / TARGET.rust_target / 'release' / component)
     require(report['linked_binary'] == {'path': str(linked), 'bytes': linked.stat().st_size,
                                         'sha256': build.digest(linked)}, 'Original link output changed')
     executable = inspect_elf(original_elf, TARGET)
@@ -306,7 +387,7 @@ def _validate(prefix, origin):
                 for p in executable['program_headers'] if p['type'] == 1)
     require(pages == report['image_load_pages'] and executable['bytes'] <= profile['max_elf_bytes']
             and pages * 4096 + profile['stack_bytes'] <= profile['image_bytes'], 'ELF exceeds build resource bounds')
-    copied = path(prefix / PROGRAM)
+    copied = path(prefix / program)
     for selected in (original_elf, linked, copied):
         bind(selected, executable['sha256'], hashes)
     inspect_elf(copied, TARGET)
@@ -316,20 +397,23 @@ def _validate(prefix, origin):
             'guest_execution': 'not performed by receipt validation', 'cosmic_session_ready': False}
 
 
-def validate_inputs(prefix):
+def validate_inputs(prefix, *, component='cosmic-session'):
     """Validate a curated executable and its origin without executing native tools."""
     prefix = artifact(prefix, directory=True)
-    origin_path = path(prefix / RECEIPT)
-    result = _validate(prefix, build.load_json(origin_path))
+    _, receipt = component_files(component)
+    origin_path = path(prefix / receipt)
+    result = _validate(prefix, build.load_json(origin_path), component)
     result['inputhashes'][str(origin_path)] = build.digest(origin_path)
     return result
 
 
-def record_origin(output, recipe, resource, source_export, prefix, *, patch_manifests=()):
+def record_origin(output, recipe, resource, source_export, prefix, *, patch_manifests=(),
+                  component='cosmic-session'):
     """Validate then create one fresh receipt; caller copies the real ELF first."""
     output = artifact(output, directory=True)
     prefix = artifact(prefix, directory=True)
-    receipt_path = prefix / RECEIPT
+    _, receipt = component_files(component)
+    receipt_path = prefix / receipt
     require(not receipt_path.exists() and not receipt_path.is_symlink(), 'Preserving existing session origin receipt')
     recipe, resource = path(recipe, root=ROOT), path(resource, root=ROOT)
     source_export = artifact(source_export, directory=True)
@@ -342,7 +426,7 @@ def record_origin(output, recipe, resource, source_export, prefix, *, patch_mani
               'patch_manifests': [{'path': str(path(item, root=ROOT)), 'sha256': build.digest(path(item, root=ROOT))}
                                   for item in patch_manifests],
               'rust_libraries_sha256': rust_libraries(report)}
-    _validate(prefix, origin)
+    _validate(prefix, origin, component)
     with receipt_path.open('x') as stream:
         stream.write(json.dumps(origin, indent=2) + '\n')
     return origin

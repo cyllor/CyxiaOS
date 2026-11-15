@@ -178,7 +178,10 @@ fn learning_needs_data_and_never_implicitly_activates() {
 }
 #[test]
 fn fixed_service_budget_and_counter_exhaustion() {
+    #[cfg(not(feature = "full-os"))]
     assert!(core::mem::size_of::<FileSystem>() < 320 * 1024);
+    #[cfg(feature = "full-os")]
+    assert!(core::mem::size_of::<FileSystem>() < 1152 * 1024);
     let mut fs = FileSystem::new();
     fs.revision = u64::MAX;
     assert_eq!(fs.write(p("/f"), b"data", false), Err(Error::Exhausted));
@@ -303,4 +306,240 @@ fn unicode_space_names_and_atomic_rename_keep_open_inodes() {
     fs.revision = u64::MAX;
     assert_eq!(fs.rename_file(target, source, false), Err(Error::Exhausted));
     assert_eq!(fs.identity(target), Ok(source_identity));
+}
+
+#[test]
+fn symlink_targets_preserve_exact_bytes_and_have_independent_inode_events() {
+    let mut fs = FileSystem::new();
+    fs.mkdir(p("/config")).unwrap();
+    fs.write(p("/target"), b"untouched", false).unwrap();
+    let target = "/config/../target//用户";
+    let before = fs.change_sequence();
+    let admissions = fs.status().policy.admission_allowed;
+    fs.symlink(p("/config/current"), target).unwrap();
+    let identity = fs.identity(p("/config/current")).unwrap();
+    let entry = fs.stat(p("/config/current")).unwrap();
+    assert_eq!(entry.kind, Kind::Symlink);
+    assert_eq!(entry.len, target.len());
+    assert_eq!(entry.mode, 0o777);
+    assert!(!entry.cached);
+    assert_eq!(fs.status().bytes, b"untouched".len() + target.len());
+    assert_eq!(fs.status().policy.admission_allowed, admissions + 1);
+    let created = fs.changes_after(before).next().unwrap();
+    assert_eq!(created.action, events::Action::Create);
+    assert_eq!(created.kind, Kind::Symlink);
+    assert_eq!(created.inode, identity);
+    assert_eq!(created.parent, fs.identity(p("/config")).unwrap());
+
+    let mut out = [0xa5; PATH_BYTES + 1];
+    assert_eq!(
+        fs.readlink(p("/config/current"), &mut out),
+        Ok(target.len())
+    );
+    assert_eq!(&out[..target.len()], target.as_bytes());
+    assert!(out[target.len()..].iter().all(|byte| *byte == 0xa5));
+    assert_eq!(fs.readlink(p("/config/current"), &mut out[..3]), Ok(3));
+    assert_eq!(&out[..3], &target.as_bytes()[..3]);
+    assert_eq!(fs.readlink(p("/config/current"), &mut []), Ok(0));
+    assert_eq!(fs.readlink(p("/target"), &mut out), Err(Error::InvalidPath));
+    assert_eq!(fs.readlink(Path::ROOT, &mut out), Err(Error::InvalidPath));
+
+    let revision = fs.status().revision;
+    let sequence = fs.change_sequence();
+    assert_eq!(
+        fs.write(p("/config/current"), b"replace", false),
+        Err(Error::InvalidPath)
+    );
+    assert_eq!(
+        fs.write(p("/config/current"), b"append", true),
+        Err(Error::InvalidPath)
+    );
+    assert_eq!(
+        fs.read(p("/config/current"), &mut out),
+        Err(Error::InvalidPath)
+    );
+    assert_eq!(fs.pin(p("/config/current")), Err(Error::InvalidPath));
+    assert_eq!(
+        fs.pin_directory(p("/config/current")),
+        Err(Error::NotDirectory)
+    );
+    assert_eq!(
+        fs.remove(p("/config/current"), true),
+        Err(Error::NotDirectory)
+    );
+    assert_eq!(fs.status().revision, revision);
+    assert_eq!(fs.change_sequence(), sequence);
+
+    fs.rename_file(p("/config/current"), p("/renamed"), false)
+        .unwrap();
+    assert_eq!(fs.identity(p("/renamed")), Ok(identity));
+    assert_eq!(fs.stat(p("/config/current")).err(), Some(Error::NotFound));
+    assert_eq!(fs.readlink(p("/renamed"), &mut out), Ok(target.len()));
+    assert_eq!(&out[..target.len()], target.as_bytes());
+    fs.remove(p("/renamed"), false).unwrap();
+    assert!(!fs.identity_alive(identity));
+    assert_eq!(fs.read(p("/target"), &mut out), Ok(b"untouched".len()));
+    assert_eq!(&out[..b"untouched".len()], b"untouched");
+}
+
+#[test]
+fn symlinks_replace_links_and_files_without_following_either_target() {
+    let mut fs = FileSystem::new();
+    fs.write(p("/file"), b"open bytes", false).unwrap();
+    let old = fs.pin(p("/file")).unwrap();
+    fs.symlink(p("/link"), "../missing").unwrap();
+    let link = fs.identity(p("/link")).unwrap();
+    fs.rename_file(p("/link"), p("/file"), false).unwrap();
+    assert_eq!(fs.identity(p("/file")), Ok(link));
+    let mut bytes = [0; PATH_BYTES];
+    assert_eq!(fs.read_at(old, 0, &mut bytes), Ok(10));
+    assert_eq!(&bytes[..10], b"open bytes");
+    assert_eq!(fs.readlink(p("/file"), &mut bytes), Ok(10));
+    assert_eq!(&bytes[..10], b"../missing");
+    assert_eq!(fs.status().bytes, 20);
+    fs.unpin(old).unwrap();
+    assert_eq!(fs.status().bytes, 10);
+    fs.write(p("/replacement"), b"regular", false).unwrap();
+    fs.rename_file(p("/replacement"), p("/file"), false)
+        .unwrap();
+    assert_eq!(fs.stat(p("/file")).unwrap().kind, Kind::File);
+    assert!(!fs.identity_alive(link));
+    assert_eq!(fs.status().bytes, 7);
+    fs.symlink(p("/first"), "./first").unwrap();
+    fs.symlink(p("/second"), "/second").unwrap();
+    assert_eq!(
+        fs.rename_file(p("/first"), p("/second"), true),
+        Err(Error::Exists)
+    );
+    fs.rename_file(p("/first"), p("/second"), false).unwrap();
+    assert_eq!(fs.readlink(p("/second"), &mut bytes), Ok(7));
+    assert_eq!(&bytes[..7], b"./first");
+}
+
+#[test]
+fn invalid_symlink_targets_are_atomic_and_maximum_target_is_supported() {
+    let mut fs = FileSystem::new();
+    let revision = fs.status().revision;
+    assert_eq!(fs.symlink(p("/link"), ""), Err(Error::InvalidPath));
+    assert_eq!(
+        fs.symlink(p("/link"), "bad\0target"),
+        Err(Error::InvalidPath)
+    );
+    let too_long = [b'x'; PATH_BYTES + 1];
+    assert_eq!(
+        fs.symlink(p("/link"), core::str::from_utf8(&too_long).unwrap()),
+        Err(Error::TooLong)
+    );
+    assert_eq!(fs.status().nodes, 0);
+    assert_eq!(fs.status().bytes, 0);
+    assert_eq!(fs.status().revision, revision);
+    assert_eq!(fs.status().policy.admission_proposals, 0);
+    assert_eq!(fs.change_sequence(), 0);
+    let target = [b'x'; PATH_BYTES];
+    fs.symlink(p("/link"), core::str::from_utf8(&target).unwrap())
+        .unwrap();
+    let mut out = [0; PATH_BYTES];
+    assert_eq!(fs.readlink(p("/link"), &mut out), Ok(PATH_BYTES));
+    assert_eq!(out, target);
+}
+
+#[cfg(feature = "full-os")]
+fn fill_retained_payload(fs: &mut FileSystem) {
+    for i in 0..RETAINED_BYTES / FILE_BYTES {
+        let name = [b'/', b'a' + (i / 26) as u8, b'a' + (i % 26) as u8];
+        fs.write(
+            p(core::str::from_utf8(&name).unwrap()),
+            &[7; FILE_BYTES],
+            false,
+        )
+        .unwrap();
+    }
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+}
+
+#[cfg(feature = "full-os")]
+#[test]
+fn aggregate_limit_rejects_growth_atomically_and_shrink_releases_capacity() {
+    let mut fs = FileSystem::new();
+    assert_eq!((NODES, FILE_BYTES, RETAINED_BYTES), (128, 8192, 256 * 1024));
+    fill_retained_payload(&mut fs);
+    fs.create_file(p("/empty"), 0o600).unwrap();
+    let empty = fs.pin(p("/empty")).unwrap();
+    let revision = fs.status().revision;
+    let sequence = fs.change_sequence();
+    let proposals = fs.status().policy.admission_proposals;
+    let rejected = fs.status().policy.capacity_rejected;
+    assert_eq!(fs.write(p("/extra"), b"x", false), Err(Error::Full));
+    assert_eq!(fs.write(p("/empty"), b"x", true), Err(Error::Full));
+    assert_eq!(fs.write_at(empty, 1, b"x"), Err(Error::Full));
+    assert_eq!(fs.symlink(p("/link"), "/aa"), Err(Error::Full));
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    assert_eq!(fs.status().revision, revision);
+    assert_eq!(fs.change_sequence(), sequence);
+    assert_eq!(fs.status().policy.admission_proposals, proposals);
+    assert_eq!(fs.status().policy.capacity_rejected, rejected + 4);
+    assert_eq!(fs.status().last_source, DecisionSource::SafetyGuard);
+    assert_eq!(fs.stat(p("/extra")).err(), Some(Error::NotFound));
+    assert_eq!(fs.stat(p("/link")).err(), Some(Error::NotFound));
+    assert_eq!(fs.inode_len(empty), Ok(0));
+    // Same-size writes remain possible at the cap, and a shorter replacement
+    // makes precisely its released bytes available to file and link growth.
+    fs.write(p("/aa"), &[8; FILE_BYTES], false).unwrap();
+    fs.write(p("/aa"), &[9; FILE_BYTES - 4], false).unwrap();
+    fs.symlink(p("/link"), "/aa").unwrap();
+    assert_eq!(fs.write_at(empty, 0, b"x"), Ok(1));
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    fs.remove(p("/link"), false).unwrap();
+    assert_eq!(fs.write_at(empty, 1, b"abc"), Ok(3));
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    fs.unpin(empty).unwrap();
+}
+
+#[cfg(feature = "full-os")]
+#[test]
+fn unlinked_and_rename_replaced_open_bytes_remain_charged_until_last_pin() {
+    let mut fs = FileSystem::new();
+    fill_retained_payload(&mut fs);
+    fs.write(p("/aa"), &[7; FILE_BYTES - 1], false).unwrap();
+    fs.write(p("/small"), b"x", false).unwrap();
+    let orphan = fs.pin(p("/small")).unwrap();
+    fs.remove(p("/small"), false).unwrap();
+    let sequence = fs.change_sequence();
+    assert_eq!(fs.write_at(orphan, 1, b"y"), Err(Error::Full));
+    assert_eq!(fs.inode_len(orphan), Ok(1));
+    assert_eq!(fs.change_sequence(), sequence);
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    fs.unpin(orphan).unwrap();
+    fs.write(p("/aa"), &[7; FILE_BYTES], false).unwrap();
+    let removed = fs.pin(p("/aa")).unwrap();
+    let removed_again = fs.pin(p("/aa")).unwrap();
+    fs.remove(p("/aa"), false).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    assert_eq!(fs.write(p("/aa"), b"new", false), Err(Error::Full));
+    fs.unpin(removed).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    fs.unpin(removed_again).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES - FILE_BYTES);
+    fs.write(p("/aa"), &[6; FILE_BYTES], false).unwrap();
+    let replaced = fs.pin(p("/ab")).unwrap();
+    fs.rename_file(p("/aa"), p("/ab"), false).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+    assert_eq!(fs.write(p("/extra"), b"x", false), Err(Error::Full));
+    fs.unpin(replaced).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES - FILE_BYTES);
+    fs.write(p("/extra"), &[5; FILE_BYTES], false).unwrap();
+    assert_eq!(fs.status().bytes, RETAINED_BYTES);
+}
+
+#[cfg(feature = "full-os")]
+#[test]
+fn unchanged_admission_weights_keep_the_synthetic_rule_across_full_os_inputs() {
+    // This checks the existing synthetic classification objective, not new
+    // training or measured workload quality outside the 64-node/4KiB domain.
+    let brain = brain::Brain::new();
+    for free in 0..=NODES {
+        for units in 0..=FILE_BYTES.div_ceil(256) {
+            assert_eq!(brain.admit(free, units * 256), free * 4 >= units);
+        }
+    }
 }

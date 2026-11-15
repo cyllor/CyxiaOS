@@ -25,7 +25,9 @@ pub const BASE: u64 = 0x200000;
 #[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const BASE: u64 = 0x04000000;
 #[cfg(feature = "full-os")]
-pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV3.layout().heap_base;
+pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV3
+    .layout()
+    .heap_base;
 pub const END: u64 = BASE + (PAGE_COUNT * PAGE_SIZE) as u64;
 pub const PAGE_SIZE: usize = 4096;
 #[cfg(not(feature = "large-memory"))]
@@ -33,7 +35,9 @@ pub const PAGE_COUNT: usize = 2048;
 #[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const PAGE_COUNT: usize = 4096;
 #[cfg(feature = "full-os")]
-pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV3.layout().heap_pages;
+pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV3
+    .layout()
+    .heap_pages;
 const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT % 512 == 0);
 const UNMAPPED: u16 = u16::MAX;
 
@@ -57,7 +61,10 @@ pub fn immutable_snapshot_bytes(
     }
     let offset = usize::try_from(offset).map_err(|_| Errno::Inval)?;
     let rounded = len.checked_add(PAGE_SIZE - 1).ok_or(Errno::Inval)? & !(PAGE_SIZE - 1);
-    let remaining = file_len.checked_sub(offset).filter(|&n| n != 0).ok_or(Errno::Inval)?;
+    let remaining = file_len
+        .checked_sub(offset)
+        .filter(|&n| n != 0)
+        .ok_or(Errno::Inval)?;
     // The final partial file page is accessible and zero-padded. A complete
     // page beyond EOF would require SIGBUS support, so refuse it up front.
     let pages = rounded / PAGE_SIZE;
@@ -465,7 +472,10 @@ mod tests {
         let mut vm = Vm::new();
         vm.allocate(3).unwrap();
         vm.seal_readonly(BASE, PAGE_SIZE + 1).unwrap();
-        assert_eq!(vm.protect(BASE + PAGE_SIZE as u64, PAGE_SIZE, 3), Err(Errno::Access));
+        assert_eq!(
+            vm.protect(BASE + PAGE_SIZE as u64, PAGE_SIZE, 3),
+            Err(Errno::Access)
+        );
         assert_eq!(vm.permissions(BASE + 2 * PAGE_SIZE as u64), Ok(3));
         vm.unmap(BASE, 2).unwrap();
         assert_eq!(vm.allocate(2).unwrap().start(), BASE);
@@ -480,10 +490,16 @@ mod tests {
             assert_eq!(immutable_snapshot_bytes(9000, 0, 1, 1, shared), Ok(4096));
             assert_eq!(immutable_snapshot_bytes(9000, 4096, 1, 1, shared), Ok(4096));
             assert_eq!(immutable_snapshot_bytes(9000, 8192, 1, 1, shared), Ok(808));
-            assert_eq!(immutable_snapshot_bytes(9000, 8192, 4096, 0, shared), Ok(808));
+            assert_eq!(
+                immutable_snapshot_bytes(9000, 8192, 4096, 0, shared),
+                Ok(808)
+            );
             assert_eq!(immutable_snapshot_bytes(4096, 0, 4096, 1, shared), Ok(4096));
         }
-        assert_eq!(immutable_snapshot_bytes(9000, 4096, 8192, 3, false), Ok(4904));
+        assert_eq!(
+            immutable_snapshot_bytes(9000, 4096, 8192, 3, false),
+            Ok(4904)
+        );
     }
 
     #[test]
@@ -499,13 +515,25 @@ mod tests {
             (9000, u64::MAX - 4095, 1),
             (9000, 0, usize::MAX),
         ] {
-            assert_eq!(immutable_snapshot_bytes(size, offset, len, 1, true), Err(Errno::Inval));
+            assert_eq!(
+                immutable_snapshot_bytes(size, offset, len, 1, true),
+                Err(Errno::Inval)
+            );
         }
         for protection in [2, 4, 5, 7, 255] {
-            assert_eq!(immutable_snapshot_bytes(4096, 0, 1, protection, false), Err(Errno::Inval));
+            assert_eq!(
+                immutable_snapshot_bytes(4096, 0, 1, protection, false),
+                Err(Errno::Inval)
+            );
         }
-        assert_eq!(immutable_snapshot_bytes(4096, 0, 1, 3, true), Err(Errno::Access));
-        assert_eq!(immutable_snapshot_bytes(4096, 0, 1, 2, true), Err(Errno::Access));
+        assert_eq!(
+            immutable_snapshot_bytes(4096, 0, 1, 3, true),
+            Err(Errno::Access)
+        );
+        assert_eq!(
+            immutable_snapshot_bytes(4096, 0, 1, 2, true),
+            Err(Errno::Access)
+        );
         assert_eq!(
             immutable_snapshot_bytes(usize::MAX, 0, PAGE_COUNT * PAGE_SIZE + 1, 1, true),
             Err(Errno::Nomem)
@@ -519,14 +547,17 @@ mod tests {
         vm.allocate_into(PAGE_COUNT, &mut batch).unwrap();
         assert_eq!(vm.largest_free_run(), 0);
         vm.unmap_into(BASE, 3, &mut batch).unwrap();
-        vm.unmap_into(BASE + 8 * PAGE_SIZE as u64, 5, &mut batch).unwrap();
+        vm.unmap_into(BASE + 8 * PAGE_SIZE as u64, 5, &mut batch)
+            .unwrap();
         assert_eq!(vm.free(), 8);
         assert_eq!(vm.largest_free_run(), 5);
         vm.allocate_into(4, &mut batch).unwrap();
         assert_eq!(vm.largest_free_run(), 3);
-        vm.protect(BASE + 3 * PAGE_SIZE as u64, 5 * PAGE_SIZE, 0).unwrap();
+        vm.protect(BASE + 3 * PAGE_SIZE as u64, 5 * PAGE_SIZE, 0)
+            .unwrap();
         assert_eq!(vm.largest_free_run(), 3); // PROT_NONE still owns its pages.
-        vm.unmap_into(BASE + 3 * PAGE_SIZE as u64, 5, &mut batch).unwrap();
+        vm.unmap_into(BASE + 3 * PAGE_SIZE as u64, 5, &mut batch)
+            .unwrap();
         assert_eq!(vm.largest_free_run(), 8);
     }
 
@@ -539,7 +570,10 @@ mod tests {
         vm.allocate_into(515, &mut batch).unwrap();
         assert_eq!(batch.start(), BASE + 8192 * PAGE_SIZE as u64);
         assert_eq!(vm.used(), 8192 + 515);
-        assert_eq!(vm.validate_access(batch.start(), 515 * PAGE_SIZE, true), Ok(()));
+        assert_eq!(
+            vm.validate_access(batch.start(), 515 * PAGE_SIZE, true),
+            Ok(())
+        );
         assert_eq!((BASE, END, PAGE_COUNT), (0x0c00_0000, 0x1000_0000, 16384));
         vm.unmap_into(BASE, 8192 + 515, &mut batch).unwrap();
         assert_eq!(vm.used(), 0);
@@ -563,12 +597,18 @@ mod tests {
         assert_eq!(batch.start(), tail);
         let last = batch.iter().last().unwrap();
         assert_eq!(vm.validate_access(last.address, PAGE_SIZE, true), Ok(()));
-        assert_eq!(vm.validate_access(last.address + PAGE_SIZE as u64, 1, false), Err(Errno::Fault));
+        assert_eq!(
+            vm.validate_access(last.address + PAGE_SIZE as u64, 1, false),
+            Err(Errno::Fault)
+        );
         assert_eq!(vm.allocate_into(1, &mut batch), Err(Errno::Nomem));
         vm.unmap_into(BASE, PAGE_COUNT, &mut batch).unwrap();
         assert_eq!(vm.used(), 0);
         vm.allocate_into(PAGE_COUNT, &mut batch).unwrap();
-        assert_eq!(vm.validate_access(tail, (PAGE_COUNT - 4096) * PAGE_SIZE, true), Ok(()));
+        assert_eq!(
+            vm.validate_access(tail, (PAGE_COUNT - 4096) * PAGE_SIZE, true),
+            Ok(())
+        );
     }
 
     #[test]

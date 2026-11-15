@@ -813,6 +813,7 @@ pub fn build() {
         std::fs::write(out.join("ported_catalog.rs"), catalog).expect("write ported catalog");
     }
     let cc = env::var("CYXIA_CC").unwrap_or_else(|_| "clang".into());
+    let file_bytes = if env::var_os("CARGO_FEATURE_FULL_OS").is_some() { 8192 } else { 4096 };
     let mut objects = Vec::new();
     for src in ["start.S", "libc.c", "demo.c"] {
         let obj = out.join(format!("{src}.o"));
@@ -832,6 +833,7 @@ pub fn build() {
                     "-Werror",
                     "-c",
                 ])
+                .arg(format!("-DCYXIA_FILE_BYTES={file_bytes}"))
                 .arg("-I")
                 .arg(root.join("include"))
                 .arg(root.join("src").join(src))

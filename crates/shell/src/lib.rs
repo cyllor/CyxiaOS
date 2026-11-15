@@ -314,6 +314,13 @@ impl Shell {
                         "dbus-probe" => "dbus-probe",
                         "session-process-probe" => "session-process-probe",
                         "cosmic-session" => "cosmic-session",
+                        "cosmic-settings-daemon" => "cosmic-settings-daemon",
+                        "settings-probe" => "settings-probe",
+                        "filesystem-probe" => "filesystem-probe",
+                        "theme-defaults-light" => "theme-defaults-light",
+                        "theme-defaults-dark" => "theme-defaults-dark",
+                        "filesystem-probe-verify" => "filesystem-probe-verify",
+                        "settings-probe-prepare" => "settings-probe-prepare",
                         "cosmic-session-version" => "cosmic-session-version",
                         "cosmic-config-defaults" => "cosmic-config-defaults",
                         "cosmic-config-init" => "cosmic-config-init",
@@ -414,11 +421,12 @@ impl Shell {
                 let s = self.fs.status();
                 writeln!(
                     out,
-                    "RAMFS nodes={}/{} bytes={} file_limit={} cache=4 persistent=no\r",
+                    "RAMFS nodes={}/{} bytes={} file_limit={} retained_limit={} cache=4 persistent=no\r",
                     s.nodes,
                     cyxia_ai_fs::NODES,
                     s.bytes,
-                    cyxia_ai_fs::FILE_BYTES
+                    cyxia_ai_fs::FILE_BYTES,
+                    cyxia_ai_fs::RETAINED_BYTES
                 )?;
             }
             "ai" => {
@@ -485,14 +493,14 @@ impl Shell {
                     Path::resolve(self.cwd, arg)?
                 };
                 let entry = self.fs.stat(path)?;
-                if entry.kind == Kind::File {
-                    writeln!(out, "f {} {}\r", entry.len, path.name())?;
+                if entry.kind != Kind::Directory {
+                    writeln!(out, "{} {} {}\r", if entry.kind == Kind::Symlink { "l" } else { "f" }, entry.len, path.name())?;
                 } else {
                     for e in self.fs.entries().filter(|e| e.path.parent() == path) {
                         writeln!(
                             out,
                             "{} {} {}\r",
-                            if e.kind == Kind::Directory { "d" } else { "f" },
+                            match e.kind { Kind::Directory => "d", Kind::Symlink => "l", Kind::File => "f" },
                             e.len,
                             e.path.name()
                         )?;

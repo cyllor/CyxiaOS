@@ -4,6 +4,7 @@
 pub mod ancillary;
 pub use cyxia_contracts::ImageAbi;
 mod directory;
+mod links;
 pub mod open_description;
 pub mod shared_memory;
 use open_description::Handle;
@@ -11,13 +12,13 @@ pub use open_description::{OpenDescriptions, Released};
 pub mod epoll;
 pub mod executable;
 pub mod flock;
-pub mod runtime_directory;
 pub mod image;
 pub mod inotify;
-pub mod limits;
 pub mod ipc;
+pub mod limits;
 pub mod pipe;
 pub mod pty;
+pub mod runtime_directory;
 pub mod signal;
 pub mod spawn;
 pub mod timerfd;
@@ -175,6 +176,14 @@ impl<'a> Process<'a> {
     pub fn resolved_path(&self, fs: &FileSystem, path: &str) -> Result<Path, Errno> {
         self.path(fs, path)
     }
+    pub fn resolved_path_with_follow(
+        &self,
+        fs: &FileSystem,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<Path, Errno> {
+        links::resolve(fs, self.cwd, path, follow_final)
+    }
     pub fn stat(&self, fs: &FileSystem, path: &str) -> Result<FileInfo, Errno> {
         let path = self.path(fs, path)?;
         self.stat_resolved(fs, path)
@@ -190,10 +199,10 @@ impl<'a> Process<'a> {
             inode: fs.identity(path)?,
             size: info.len as u64,
             mode: info.mode as u32
-                | if info.kind == Kind::Directory {
-                    0o40000
-                } else {
-                    0o100000
+                | match info.kind {
+                    Kind::Directory => 0o40000,
+                    Kind::File => 0o100000,
+                    Kind::Symlink => 0o120000,
                 },
             links: 1,
         })
@@ -246,12 +255,14 @@ impl<'a> Process<'a> {
                 mode: 0o140600,
                 links: 1,
             },
-            Object::Event { .. } | Object::Timer(_) | Object::Epoll(_) | Object::Inotify(_) => FileInfo {
-                inode: 0,
-                size: 0,
-                mode: 0o600,
-                links: 1,
-            },
+            Object::Event { .. } | Object::Timer(_) | Object::Epoll(_) | Object::Inotify(_) => {
+                FileInfo {
+                    inode: 0,
+                    size: 0,
+                    mode: 0o600,
+                    links: 1,
+                }
+            }
             Object::Pipe(handle) => FileInfo {
                 inode: handle & !1,
                 size: 0,
@@ -679,12 +690,16 @@ impl<'a> Process<'a> {
     /// Resolve and authorize a pathname for a local socket. The supervisor
     /// handles the socket namespace; this enforces real directory permissions.
     pub fn socket_path(&self, fs: &FileSystem, path: &str, create: bool) -> Result<Path, Errno> {
-        let p = self.path(fs, path)?;
+        let p = self.resolved_path_with_follow(fs, path, !create)?;
         if create {
             self.change_parent(fs, p)?;
         }
         if p.as_str() == NULL_DEVICE_PATH {
-            return Err(if create { Errno::Addrinuse } else { Errno::Connrefused });
+            return Err(if create {
+                Errno::Addrinuse
+            } else {
+                Errno::Connrefused
+            });
         }
         if fs.stat(p).is_ok() {
             return Err(Errno::Addrinuse);
@@ -693,41 +708,24 @@ impl<'a> Process<'a> {
     }
     /// Walk each component before interpreting '..'; lexical collapse alone is incorrect.
     fn path(&self, fs: &FileSystem, s: &str) -> Result<Path, Errno> {
-        self.path_from(fs, self.cwd, s)
-    }
-    fn path_from(&self, fs: &FileSystem, base: Path, s: &str) -> Result<Path, Errno> {
-        if s.is_empty() {
-            return Err(Errno::Noent);
-        }
-        if s.len() >= cyxia_ai_fs::PATH_BYTES {
-            return Err(Errno::Nametoolong);
-        }
-        let mut p = if s.starts_with('/') { Path::ROOT } else { base };
-        for component in s.split('/').filter(|c| !c.is_empty()) {
-            if p.as_str() == NULL_DEVICE_PATH {
-                return Err(Errno::Notdir);
-            }
-            let parent = fs.stat(p)?;
-            if parent.kind != Kind::Directory {
-                return Err(Errno::Notdir);
-            }
-            if parent.mode & 0o100 == 0 {
-                return Err(Errno::Access);
-            }
-            p = Path::resolve(p, component)?;
-        }
-        if s.ends_with('/')
-            && (p.as_str() == NULL_DEVICE_PATH || fs.stat(p)?.kind != Kind::Directory)
-        {
-            return Err(Errno::Notdir);
-        }
-        Ok(p)
+        self.resolved_path_with_follow(fs, s, true)
     }
     pub fn path_at(&self, fs: &FileSystem, fd: i32, path: &str) -> Result<Path, Errno> {
+        self.path_at_with_follow(fs, fd, path, true)
+    }
+    /// Follow intermediate links in all cases. A trailing slash also requires
+    /// the final component to resolve to a directory, even with nofollow.
+    pub fn path_at_with_follow(
+        &self,
+        fs: &FileSystem,
+        fd: i32,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<Path, Errno> {
         if fd == -100 || path.starts_with('/') {
-            return self.path(fs, path);
+            return self.resolved_path_with_follow(fs, path, follow_final);
         }
-        self.path_from(fs, self.directory_path(fs, fd)?, path)
+        links::resolve(fs, self.directory_path(fs, fd)?, path, follow_final)
     }
     fn directory_path(&self, fs: &FileSystem, fd: i32) -> Result<Path, Errno> {
         match self.objects.get(self.description(fd)?)?.object {
@@ -759,10 +757,13 @@ impl<'a> Process<'a> {
         flags: u32,
         mode: u16,
     ) -> Result<i32, Errno> {
-        let path = self.path(fs, path)?;
+        let follow_final =
+            flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
+        let path = self.resolved_path_with_follow(fs, path, follow_final)?;
         self.open_resolved(fs, path, flags, mode)
     }
-    /// Open immediately after `path_at` or `resolved_path` authorized traversal.
+    /// Open after resolving with nofollow for O_NOFOLLOW or O_CREAT|O_EXCL,
+    /// and with following otherwise. Never restart traversal at the root here.
     /// The final file and creation-parent permissions are still checked here.
     pub fn open_resolved(
         &mut self,
@@ -785,6 +786,14 @@ impl<'a> Process<'a> {
             | O_NOFOLLOW;
         if flags & !known != 0 || flags & 3 == 3 || flags & O_TRUNC != 0 && flags & 3 == O_RDONLY {
             return Err(Errno::Inval);
+        }
+        if let Ok(info) = fs.stat(p) {
+            if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
+                return Err(Errno::Exist);
+            }
+            if info.kind == Kind::Symlink {
+                return Err(Errno::Loop);
+            }
         }
         let fd = self.free_fd()?;
         let slot = self.objects.free_slots::<1>()?[0];
@@ -1089,7 +1098,10 @@ impl<'a> Process<'a> {
         Ok(next as u64)
     }
     pub fn unlink(&mut self, fs: &mut FileSystem, path: &str) -> Result<(), Errno> {
-        let p = self.path(fs, path)?;
+        let p = self.resolved_path_with_follow(fs, path, false)?;
+        self.unlink_resolved(fs, p)
+    }
+    pub fn unlink_resolved(&self, fs: &mut FileSystem, p: Path) -> Result<(), Errno> {
         self.change_parent(fs, p)?;
         if p.as_str() == NULL_DEVICE_PATH {
             return Err(Errno::Rofs);
@@ -1097,7 +1109,7 @@ impl<'a> Process<'a> {
         fs.remove(p, false)?;
         Ok(())
     }
-    /// Both paths must first be resolved through path_at/resolved_path. Keeping
+    /// Both paths must first be resolved with final-component nofollow. Keeping
     /// this step separate lets the syscall layer reject immutable boot assets.
     pub fn rename_file_resolved(
         &self,
@@ -1119,7 +1131,10 @@ impl<'a> Process<'a> {
         if !path.is_empty() && path.bytes().all(|b| b == b'/') {
             return Err(Errno::Exist);
         }
-        let p = self.path(fs, path.trim_end_matches('/'))?;
+        let p = self.resolved_path_with_follow(fs, path.trim_end_matches('/'), false)?;
+        self.mkdir_resolved(fs, p, mode)
+    }
+    pub fn mkdir_resolved(&self, fs: &mut FileSystem, p: Path, mode: u16) -> Result<(), Errno> {
         self.change_parent(fs, p)?;
         if p.as_str() == NULL_DEVICE_PATH {
             return Err(Errno::Exist);
@@ -1131,7 +1146,17 @@ impl<'a> Process<'a> {
         if path.split('/').rfind(|c| !c.is_empty()) == Some(".") {
             return Err(Errno::Inval);
         }
-        let p = self.path(fs, path)?;
+        // A trailing slash must not turn the directory-entry removal into a
+        // removal of a symbolic link's directory target.
+        let path = if path.bytes().all(|b| b == b'/') {
+            path
+        } else {
+            path.trim_end_matches('/')
+        };
+        let p = self.resolved_path_with_follow(fs, path, false)?;
+        self.rmdir_resolved(fs, p)
+    }
+    pub fn rmdir_resolved(&self, fs: &mut FileSystem, p: Path) -> Result<(), Errno> {
         if p.as_str() == NULL_DEVICE_PATH {
             return Err(Errno::Notdir);
         }

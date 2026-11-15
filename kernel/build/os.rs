@@ -74,7 +74,7 @@ fn catalog(root: &Path, out: &Path) {
     println!("cargo:rerun-if-env-changed=CYXIA_SYSROOT");
     let prefix = env::var_os("CYXIA_SYSROOT").map(PathBuf::from)
         .unwrap_or_else(|| root.join("artifacts/sysroot/x86_64-musl"));
-    let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "session-process-probe", "signal-probe", "desktop-api-probe",
+    let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "cosmic-settings-daemon", "settings-probe", "filesystem-probe", "theme-defaults", "session-process-probe", "signal-probe", "desktop-api-probe",
         "pipe-probe", "file-probe", "clock-probe", "event-probe", "timerfd-probe", "edge-probe", "fd-share-probe", "scm-probe",
         "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "xkb-rules-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "thread-capacity-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe", "thread-exit-probe", "heap-capacity-probe", "heap-pool-probe"];
     let mut required = vec!["probe"];
@@ -122,7 +122,10 @@ fn catalog(root: &Path, out: &Path) {
         println!("cargo:rerun-if-changed={}", rootfs.display());
         assets(&rootfs, &mut files);
         files.sort();
-        assert!(files.len() + paths.len() <= 128, "rootfs catalog count");
+        // Full COSMIC light/dark defaults contribute 78 immutable key files.
+        // They occupy ROM catalog entries, not mutable RAMFS file nodes.
+        let catalog_limit = if feature("full-os") { 256 } else { 128 };
+        assert!(files.len() + paths.len() <= catalog_limit, "rootfs catalog count");
         for (index, file) in files.iter().enumerate() {
             let name = format!("/{}", file.strip_prefix(&rootfs).expect("rootfs prefix").to_str().expect("UTF8 asset path"));
             assert!(name.len() < 96 && !paths.contains(&name), "rootfs asset path conflict/bound");
@@ -146,11 +149,13 @@ pub fn build() {
     println!("cargo:rerun-if-changed={}", user.display());
     println!("cargo:rerun-if-env-changed=CYXIA_CC");
     let cc = env::var("CYXIA_CC").unwrap_or_else(|_| "clang".into());
+    let file_bytes = if feature("full-os") { 8192 } else { 4096 };
     let mut objects = Vec::new();
     for source in ["start.S", "libc.c", "demo.c"] {
         let object = out.join(format!("{source}.o"));
         checked(Command::new(&cc).args(["--target=x86_64-none-elf", "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
             "-mno-red-zone", "-mno-sse", "-mno-mmx", "-msoft-float", "-fno-pic", "-O2", "-Wall", "-Wextra", "-Werror", "-c"])
+            .arg(format!("-DCYXIA_FILE_BYTES={file_bytes}"))
             .arg("-I").arg(user.join("include")).arg(user.join("src").join(source)).arg("-o").arg(&object));
         objects.push(object);
     }

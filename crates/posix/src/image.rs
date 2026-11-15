@@ -93,7 +93,10 @@ pub fn load_for(elf: &[u8], arena: &mut Arena, abi: crate::ImageAbi) -> Result<u
         });
     }
     let code = segments[0].ok_or(Errno::Inval)?;
-    if !entry.is_multiple_of(abi.entry_alignment()) || entry < code.va || entry >= code.va + code.files as u64 {
+    if !entry.is_multiple_of(abi.entry_alignment())
+        || entry < code.va
+        || entry >= code.va + code.files as u64
+    {
         return Err(Errno::Inval);
     }
     arena.clear();

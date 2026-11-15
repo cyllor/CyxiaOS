@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-settings-daemon",
+  "commit": "9e4ae69fc175191f15789d35423806ea0f093c9d",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-settings-daemon",
+  "binary": "cosmic-settings-daemon",
+  "resource_profile": "settings-static-x86_64-full-os-v1",
+  "default_features": false,
+  "features": [
+    "cyxia-native"
+  ],
+  "source_lock_sha256": "fc741c0a4f9b94a09d89a292aa94b402e1eb9ea4a4426d7e85c85999d8ea854e",
+  "effective_lock_sha256": "e6d6abd654506f118330d612d35228cdcc1ff42f8d8597dac65c0b5e80633393",
+  "patches": [
+    {
+      "path": "cosmic-settings-native.patch",
+      "sha256": "7739437ad0613d68d92b78110410159ad414e64df2e90961d9a45cba63bf1d2e"
+    }
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "82a08301217c17ad6c4eaeb4c5af6abaceb6cab2ad485a7c5007ec8ca0abe3a4"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "86e5f4038e8016e54d2c7bf03f217118e887b9c297c65daef014273940219930"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "4a4b3fcb4d6f4eeddf8e1cafd61d492019316574ffa863cf908d1968e42daa98"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "09e77229334ea3f4c2fd3b312e3b3d5fb195e4fa7d4caa4d2f9d8f1c50f17708"
+    }
+  ],
+  "static_link_inputs": [
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libxkbcommon.a"
+  ]
+}

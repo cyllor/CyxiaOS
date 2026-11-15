@@ -1097,6 +1097,12 @@ impl Supervisor {
             "thread-exit-probe"
         } else if name == "cosmic-session-version" {
             "cosmic-session"
+        } else if matches!(name, "theme-defaults-light" | "theme-defaults-dark") {
+            "theme-defaults"
+        } else if name == "filesystem-probe-verify" {
+            "filesystem-probe"
+        } else if name == "settings-probe-prepare" {
+            "settings-probe"
         } else if name == "cosmic-version" {
             "cosmic-comp"
         } else if matches!(name, "cosmic-config-defaults" | "cosmic-config-init" | "cosmic-config-check" | "cosmic-config-verify" | "cosmic-config-raw" | "cosmic-config-values") {
@@ -1145,7 +1151,7 @@ impl Supervisor {
         fs.register_boot_file(cyxia_ai_fs::Path::resolve(
             cyxia_ai_fs::Path::ROOT, "/dev/null",
         )?)?;
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "cosmic-settings-daemon" | "settings-probe" | "theme-defaults" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1175,6 +1181,17 @@ impl Supervisor {
             &[path.as_bytes(), b"/bin/cosmic-comp", b"--no-xwayland"]
         };
         let session_probe_argv: &[&[u8]] = &[path.as_bytes(), path.as_bytes()];
+        let settings_prepare_argv: &[&[u8]] = &[path.as_bytes(), b"prepare"];
+        let theme_defaults_argv: &[&[u8]] = &[path.as_bytes(), if name == "theme-defaults-light" { b"light" } else { b"dark" }];
+        let filesystem_verify_argv: &[&[u8]] = &[path.as_bytes(), b"verify"];
+        // The direct desktop shell entry targets the existing first compositor.
+        // Session-launched children instead inherit its actual SetEnv handoff.
+        let settings_environment: &[&[u8]] = &[
+            b"PATH=/bin", b"LANG=en_US.UTF-8", b"TZ=UTC", b"HOME=/",
+            cyxia_posix::runtime_directory::ENVIRONMENT,
+            b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
+            b"WAYLAND_DISPLAY=wayland-1", b"WAYLAND_DEBUG=client", b"RUST_LOG=warn",
+        ];
         let config_argv: &[&[u8]] = &[path.as_bytes(), match name {
             "cosmic-config-defaults" => b"defaults", "cosmic-config-init" => b"init",
             "cosmic-config-check" => b"exercise", "cosmic-config-verify" => b"verify",
@@ -1264,6 +1281,12 @@ impl Supervisor {
                     cosmic_argv
                 } else if image_name == "session-process-probe" {
                     session_probe_argv
+                } else if image_name == "theme-defaults" {
+                    theme_defaults_argv
+                } else if name == "filesystem-probe-verify" {
+                    filesystem_verify_argv
+                } else if name == "settings-probe-prepare" {
+                    settings_prepare_argv
                 } else if image_name == "cosmic-session" {
                     session_argv
                 } else if image_name == "cosmic-config" {
@@ -1287,7 +1310,8 @@ impl Supervisor {
                 } else {
                     normal_argv
                 },
-                envp: if uses_session_runtime { session_environment } else { legacy_environment },
+                envp: if image_name == "cosmic-settings-daemon" { settings_environment }
+                    else if uses_session_runtime { session_environment } else { legacy_environment },
                 execfn: path.as_bytes(),
             },
         ) {

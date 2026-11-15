@@ -3,5 +3,9 @@ name = "cyxia-ai-fs"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+full-os = []
+
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

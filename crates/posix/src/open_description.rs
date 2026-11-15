@@ -236,9 +236,11 @@ impl OpenDescriptions {
         if entry.references == 1 {
             let description = entry.value.ok_or(Errno::Badf)?;
             match description.object {
-                Object::File(inode) => fs.notify_close(Some(inode), description.flags & 3 != super::O_RDONLY)?,
+                Object::File(inode) => {
+                    fs.notify_close(Some(inode), description.flags & 3 != super::O_RDONLY)?
+                }
                 Object::Directory { inode, .. } => fs.notify_close(inode, false)?,
-                _ => {},
+                _ => {}
             }
         }
         if entry.references == 1
@@ -298,7 +300,8 @@ const _: () = assert!(CAPACITY <= 256);
 mod tests {
     use super::*;
     use crate::{
-        Console, OPEN_MAX, O_APPEND, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDWR, Process, spawn::Mapping,
+        Console, O_APPEND, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDWR, OPEN_MAX, Process,
+        spawn::Mapping,
     };
     use cyxia_ai_fs::FileSystem;
     struct Sink;
@@ -428,7 +431,9 @@ mod tests {
             core::array::from_fn(|i| Process::new(&objects, i as u32 + 1).unwrap());
         for process in &mut processes {
             for _ in 3..OPEN_MAX {
-                if objects.snapshot().live == CAPACITY { break; }
+                if objects.snapshot().live == CAPACITY {
+                    break;
+                }
                 process.eventfd(0, 0).unwrap();
             }
         }

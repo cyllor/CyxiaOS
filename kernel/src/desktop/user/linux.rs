@@ -30,7 +30,7 @@ impl Runner {
             0o444
         }
     }
-    fn readonly_asset(&self, path: cyxia_ai_fs::Path) -> Option<(u64, &'static [u8])> {
+    pub(super) fn readonly_asset(&self, path: cyxia_ai_fs::Path) -> Option<(u64, &'static [u8])> {
         super::ROOT_FILES
             .iter()
             .enumerate()
@@ -689,6 +689,8 @@ impl Runner {
                 self.copy_from(d, &mut bytes[..4])?;
                 Ok(0)
             }
+            Call::Symlinkat => self.symlink_at(fs, a, b as i32, c),
+            Call::Readlinkat => self.readlink_at(fs, a as i32, b, c, d),
             Call::Newfstatat => {
                 // AT_NO_AUTOMOUNT is a real no-op: this namespace has no
                 // automount points. GLib passes it when falling back from statx.
@@ -704,7 +706,7 @@ impl Runner {
                     return self.copy_stat(c, self.process.stat_empty_at(fs, a as i32)?);
                 }
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
-                let resolved = self.process.path_at(fs, a as i32, path)?;
+                let resolved = self.process.path_at_with_follow(fs, a as i32, path, d & 0x100 == 0)?;
                 self.copy_stat(c, self.resolved_stat(fs, resolved)?)
             }
             Call::Fstat => self.copy_stat(b, self.descriptor_stat(fs, fd(a)?)?),
@@ -1071,7 +1073,10 @@ impl Runner {
                 if path == "/dev/ptmx" || path.starts_with("/dev/pts/") {
                     return self.pty_open(path, flags).map(|fd| fd as u64);
                 }
-                let resolved = self.process.path_at(fs, a as i32, path)?;
+                let follow = flags & cyxia_posix::O_NOFOLLOW == 0
+                    && flags & (cyxia_posix::O_CREAT | cyxia_posix::O_EXCL)
+                        != cyxia_posix::O_CREAT | cyxia_posix::O_EXCL;
+                let resolved = self.process.path_at_with_follow(fs, a as i32, path, follow)?;
                 if let Some((inode, bytes)) = self.readonly_asset(resolved) {
                     return self
                         .process
@@ -1101,47 +1106,44 @@ impl Runner {
                     .map(|fd| fd as u64)
             }
             Call::Mkdirat | Call::Unlinkat => {
-                let mut path = [0u8; 96];
-                let n = self.path(b, &mut path)?;
-                let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
-                if a as i64 != -100 && !path.starts_with('/') {
-                    return Err(Errno::Badf);
+                let mut bytes = [0u8; cyxia_ai_fs::PATH_BYTES];
+                let n = self.path(b, &mut bytes)?;
+                let path = core::str::from_utf8(&bytes[..n]).map_err(|_| Errno::Inval)?;
+                if call == Call::Unlinkat && c != 0 && c != 0x200 {
+                    return Err(Errno::Inval);
+                }
+                let directory = call == Call::Mkdirat || c == 0x200;
+                if call == Call::Unlinkat && c == 0x200
+                    && path.rsplit('/').find(|part| !part.is_empty()) == Some(".")
+                {
+                    return Err(Errno::Inval);
+                }
+                // Directory creation/removal acts on a final link itself,
+                // including a name ending in '/'; never remove its target.
+                let trimmed = path.trim_end_matches('/');
+                let lookup = if directory && !trimmed.is_empty() { trimmed } else { path };
+                let resolved = self.process.path_at_with_follow(fs, a as i32, lookup, false)?;
+                if self.readonly_asset(resolved).is_some() {
+                    return Err(if call == Call::Mkdirat { Errno::Exist } else { Errno::Rofs });
                 }
                 if call == Call::Mkdirat {
-                    // mkdir permits a trailing slash, but must not create a
-                    // RAMFS directory over a retained socket directory entry.
-                    let candidate = path.trim_end_matches('/');
-                    if !candidate.is_empty() {
-                        match self.process.socket_path(fs, candidate, true) {
-                            Ok(resolved) => {
-                                match super::unix::with(|s| {
-                                    s.pathname_stat(resolved.as_str().as_bytes())
-                                }) {
-                                    Ok(_) => return Err(Errno::Exist),
-                                    Err(Errno::Noent) => {}
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            // The ordinary filesystem or immutable device
-                            // already owns this name; mkdir supplies its error.
-                            Err(Errno::Addrinuse) => {}
-                            Err(error) => return Err(error),
-                        }
+                    match super::unix::with(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
+                        Ok(_) => return Err(Errno::Exist),
+                        Err(Errno::Noent) => {}
+                        Err(error) => return Err(error),
                     }
-                    self.process.mkdir(fs, path, c as u16)?;
+                    self.process.mkdir_resolved(fs, resolved, c as u16)?;
                 } else if c == 0x200 {
-                    self.process.rmdir(fs, path)?;
-                } else if c == 0 {
-                    // Both namespaces resolve through the same real parent
-                    // permission checks. Socket unlink preserves live streams.
-                    if let Ok(p) = self.process.socket_path(fs, path, true)
-                        && super::unix::with(|s| s.unlink(p.as_str().as_bytes())).is_ok()
-                    {
-                        return Ok(0);
-                    }
-                    self.process.unlink(fs, path)?;
+                    self.process.rmdir_resolved(fs, resolved)?;
                 } else {
-                    return Err(Errno::Inval);
+                    // Authorize and unlink the exact nofollow RAMFS entry first.
+                    // ENOENT here has already checked parent write permission;
+                    // only then may the separate socket namespace remove it.
+                    match self.process.unlink_resolved(fs, resolved) {
+                        Ok(()) => {}
+                        Err(Errno::Noent) => super::unix::with(|s| s.unlink(resolved.as_str().as_bytes()))?,
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(0)
             }

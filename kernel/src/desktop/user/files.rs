@@ -2,6 +2,67 @@
 use super::{Errno, FileSystem, Runner};
 
 impl Runner {
+    pub(super) fn symlink_at(
+        &mut self,
+        fs: &mut FileSystem,
+        target_address: u64,
+        directory: i32,
+        name_address: u64,
+    ) -> Result<u64, Errno> {
+        let mut target = [0; cyxia_ai_fs::PATH_BYTES];
+        let mut name = [0; cyxia_ai_fs::PATH_BYTES];
+        let target_len = self.path(target_address, &mut target)?;
+        let name_len = self.path(name_address, &mut name)?;
+        let target = core::str::from_utf8(&target[..target_len]).map_err(|_| Errno::Inval)?;
+        let name = core::str::from_utf8(&name[..name_len]).map_err(|_| Errno::Inval)?;
+        let link = self
+            .process
+            .path_at_with_follow(fs, directory, name, false)?;
+        if self.readonly_asset(link).is_some() {
+            return Err(Errno::Exist);
+        }
+        match super::unix::with(|s| s.pathname_stat(link.as_str().as_bytes())) {
+            Ok(_) => return Err(Errno::Exist),
+            Err(Errno::Noent) => {}
+            Err(error) => return Err(error),
+        }
+        self.process.symlink_resolved(fs, target, link)?;
+        Ok(0)
+    }
+
+    pub(super) fn readlink_at(
+        &mut self,
+        fs: &FileSystem,
+        directory: i32,
+        name_address: u64,
+        output: u64,
+        size: u64,
+    ) -> Result<u64, Errno> {
+        if size == 0 || size > isize::MAX as u64 {
+            return Err(Errno::Inval);
+        }
+        let mut name = [0; cyxia_ai_fs::PATH_BYTES];
+        let mut target = [0; cyxia_ai_fs::PATH_BYTES];
+        let length = self.path(name_address, &mut name)?;
+        let name = core::str::from_utf8(&name[..length]).map_err(|_| Errno::Inval)?;
+        let capacity = (size as usize).min(target.len());
+        let link = self
+            .process
+            .path_at_with_follow(fs, directory, name, false)?;
+        if link.as_str() == "/dev/null" || self.readonly_asset(link).is_some() {
+            return Err(Errno::Inval);
+        }
+        match super::unix::with(|s| s.pathname_stat(link.as_str().as_bytes())) {
+            Ok(_) => return Err(Errno::Inval),
+            Err(Errno::Noent) => {}
+            Err(error) => return Err(error),
+        }
+        let length = fs.readlink(link, &mut target[..capacity])?;
+        // Linux copies only the returned bytes and does not append a NUL.
+        self.copy_to(output, &target[..length])?;
+        Ok(length as u64)
+    }
+
     pub(super) fn sync_file(&mut self, fs: &FileSystem, descriptor: u64) -> Result<u64, Errno> {
         let fd = super::fd(descriptor)?;
         let info = self.descriptor_stat(fs, fd)?;
@@ -70,15 +131,17 @@ impl Runner {
         let mut new = [0; cyxia_ai_fs::PATH_BYTES];
         let old_len = self.path(old_name, &mut old)?;
         let new_len = self.path(new_name, &mut new)?;
-        let from = self.process.path_at(
+        let from = self.process.path_at_with_follow(
             fs,
             old_fd,
             core::str::from_utf8(&old[..old_len]).map_err(|_| Errno::Inval)?,
+            false,
         )?;
-        let to = self.process.path_at(
+        let to = self.process.path_at_with_follow(
             fs,
             new_fd,
             core::str::from_utf8(&new[..new_len]).map_err(|_| Errno::Inval)?,
+            false,
         )?;
         if super::ROOT_FILES
             .iter()

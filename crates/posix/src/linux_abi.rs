@@ -5,6 +5,7 @@ use crate::{Errno, FileInfo, ImageAbi};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Call {
     Readlinkat,
+    Symlinkat,
     Accept,
     Accept4,
     ArchPrctl,
@@ -171,6 +172,10 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
                 args = [at, args[0], if number == 84 { 0x200 } else { 0 }, 0, 0, 0];
                 Some(Call::Unlinkat)
             }
+            88 => {
+                args = [args[0], at, args[1], 0, 0, 0];
+                Some(Call::Symlinkat)
+            }
             89 => {
                 args = [at, args[0], args[1], args[2], 0, 0];
                 Some(Call::Readlinkat)
@@ -226,6 +231,7 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             32 => Call::Flock,
             34 => Call::Mkdirat,
             35 => Call::Unlinkat,
+            36 => Call::Symlinkat,
             38 => Call::Renameat,
             46 => Call::Ftruncate,
             48 => Call::Faccessat,
@@ -244,6 +250,7 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             67 => Call::Pread64,
             68 => Call::Pwrite64,
             73 => Call::Ppoll,
+            78 => Call::Readlinkat,
             79 => Call::Newfstatat,
             80 => Call::Fstat,
             82 => Call::Fsync,
@@ -396,6 +403,8 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             262 => Call::Newfstatat,
             263 => Call::Unlinkat,
             264 => Call::Renameat,
+            266 => Call::Symlinkat,
+            267 => Call::Readlinkat,
             268 => Call::Fchmodat,
             269 => Call::Faccessat,
             271 => Call::Ppoll,

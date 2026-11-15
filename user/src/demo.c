@@ -2,6 +2,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#ifndef CYXIA_FILE_BYTES
+#error Native filesystem boundary must be supplied by the selected build profile
+#endif
 #if defined(__aarch64__)
 #define KERNEL_PROBE_ADDRESS 0xffffffc040200000UL
 #elif defined(__x86_64__)
@@ -86,7 +89,7 @@ int main(int argc,char **argv){
     CHECK(chdir("/")==0&&rmdir("/posix")==0);
     f=open("/posix-result",O_CREAT|O_TRUNC|O_RDWR,0644);CHECK(f>=3);
     CHECK(write(f,"hello from EL0",14)==14);
-    CHECK(lseek(f,4092,SEEK_SET)==4092&&write(f,"12345678",8)==4);
+    CHECK(lseek(f,CYXIA_FILE_BYTES-4,SEEK_SET)==CYXIA_FILE_BYTES-4&&write(f,"12345678",8)==4);
     CHECK(write(f,"x",1)==-1&&errno==EFBIG);
     CHECK(close(f)==0);
     f=open("/posix-result",O_WRONLY|O_TRUNC);CHECK(f>=3);

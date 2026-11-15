@@ -1,0 +1,90 @@
+# Genuine COSMIC settings daemon on CyxiaOS
+
+This is the next implementation slice of the approved full CyxiaOS/COSMIC
+plan, following `1d62412`. A03 remains cancelled. Full OS and complete COSMIC
+session acceptance remain false until all required components actually run.
+
+## Contract
+
+- Use the manifest-pinned cosmic-settings-daemon 1.10.0 at
+  `9e4ae69fc175191f15789d35423806ea0f093c9d`, with its real configuration/state
+  watch, D-Bus interfaces, theme handling and Wayland client. Never substitute a
+  probe or invented service for the daemon.
+- First record the real unmodified target build result. Preserve source pins,
+  logs, failed captures and previous verified artifacts. Native compilation,
+  source preparation and guest runs are serialized under the shared lease.
+- Isolate unavailable platform integrations behind explicit Cargo features.
+  Ordinary upstream defaults retain audio/PipeWire and udev/DDC behavior.
+  The selected Cyxia profile may omit those integrations while they are being
+  ported; it must report their absence, and exposed mutating methods must fail
+  with a real D-Bus NotSupported error rather than pretend to succeed.
+- Missing system services must not prevent local configuration/theme watching
+  or trap cancellation in an infinite retry loop. Do not invent logind,
+  timedate, device, audio or signal semantics. SA_RESTART remains unsupported
+  until interrupted waits are genuinely implemented and tested.
+- Build using a new bounded, hash-bound component recipe and preserved source
+  export. Existing compositor/session/sysroot builder inputs remain unchanged.
+- Add the actual executable to the native OS catalog and session environment.
+  Observe its real D-Bus ownership, WatchConfig/WatchState behavior and changed
+  signals after actual persistent writes, plus Wayland connection and cleanup.
+  Session-level integration must report the next actual missing dependency or
+  resource limit, without counting that as complete desktop acceptance.
+
+## Verification boundaries
+
+Use the previously authorized public seams: exact source/recipe validation,
+real target ELF build, guest process and filesystem syscalls, actual D-Bus
+messages and Wayland transport, and OS resource accounting before/after exit.
+Tests must exercise behavior, not duplicate internal patch transformations.
+Preserve negative build/run evidence. Run applicable host suites and actual
+guest regressions, obtain independent Standards/Spec reviews, then commit the
+coherent result on CyxiaOS-V0.17.
+
+## Measured filesystem prerequisite
+
+The real direct03/direct04 captures exhaust all 64 RAMFS nodes (`df` 64/64,
+546 data bytes, zero model denials); theme setup and the first WatchConfig call
+fail. The upstream GTK CSS template also exceeds the 4 KiB file bound and needs
+real symbolic links. Implement the underlying filesystem before qualifying the
+unchanged daemon/client behavior:
+
+- Full-OS profile: 128 nodes, 8 KiB per file, 256 KiB aggregate retained data,
+  including unlinked pinned content. Preserve the default 64-node/4 KiB profile.
+  Reject aggregate growth atomically before content/events/identity publication.
+- Keep existing disk slot geometry. Maximum full-OS snapshot is 276,512 bytes,
+  within the existing 392,704-byte payload and 128-page staging buffer. Read
+  validated legacy schema v1; use v2 for real link records. Reject malformed
+  targets/oversized inventories before restoring any node.
+- Real link nodes retain exact targets. A bounded component walker follows
+  relative/absolute/intermediate links, preserves permission and directory-FD
+  traversal and expands links before `..`. Return ELOOP for cycles. Respect
+  open/exclusive/nofollow, stat/lstat, unlink/rename, directory and inotify semantics.
+- Wire actual x86/ARM symlinkat/readlinkat syscalls and x86 legacy forms. Readlink
+  returns raw bytes without a terminating NUL. Resolve before immutable asset
+  lookup; links never permit mutation of boot assets.
+- Validate actual syscall behavior, capacity rejection/reuse, checkpoint/reboot
+  recovery and the same settings light-to-dark test. Preserve failed captures.
+  Existing AI weights stay explicitly identified; do not claim new model
+  training or qualification for the enlarged metadata range.
+
+## Measured theme-data prerequisite
+
+After filesystem repair, the startup-ready capture passes configuration/state
+notifications but exports dark CSS while the mode file says false. The pinned
+library's empty Light configuration falls back to its dark preferred default.
+Install complete genuine light/dark version-2 system defaults before qualifying
+the same light-to-dark behavior:
+
+- Link the explicit generator to the validated daemon build's actual pinned
+  cosmic-theme/cosmic-config libraries. Run each mode in a fresh guest; require
+  all 39 keys and a canonical write/read/write byte roundtrip with directory sync.
+- Bind the exact generated bytes to source, generator, build receipt and raw
+  successful guest capture. Publish both 39-key sets as immutable system data,
+  retaining MPL-2.0 license and user override precedence. Never synthesize CSS
+  or substitute a test service for the genuine settings daemon.
+- Allow 256 immutable catalog entries only in full-os (default remains 128):
+  78 keys plus their license exceed the previous catalog once combined with
+  existing binaries/assets. Byte, path, mutable-node and disk budgets remain.
+- Separate bus-name ownership from theme startup readiness within the existing
+  90-second startup budget. Retain the actual ten-second D-Bus RPC bound. A
+  startup-ready pass does not qualify responsiveness immediately on ownership.
