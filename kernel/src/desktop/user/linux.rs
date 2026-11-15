@@ -496,6 +496,7 @@ impl Runner {
                 .epoll_create(u32::try_from(a).map_err(|_| Errno::Inval)?)
                 .map(|fd| fd as u64),
             Call::EpollCtl => self.epoll_control(a, b, c, d),
+            Call::Flock => self.flock(a, b),
             Call::EpollPwait => self.epoll_wait(a, b, c, d, e, f),
             Call::TimerfdCreate => self
                 .process

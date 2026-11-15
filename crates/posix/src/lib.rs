@@ -10,6 +10,8 @@ use open_description::Handle;
 pub use open_description::{OpenDescriptions, Released};
 pub mod epoll;
 pub mod executable;
+pub mod flock;
+pub mod runtime_directory;
 pub mod image;
 pub mod ipc;
 pub mod pipe;

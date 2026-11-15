@@ -38,6 +38,7 @@ pub(crate) struct Entry {
     pub(crate) inflight: u16,
     pub(crate) owner: u32,
     pub(crate) value: Option<Description>,
+    pub(crate) flock: super::flock::Mode,
 }
 impl Entry {
     const EMPTY: Self = Self {
@@ -47,6 +48,7 @@ impl Entry {
         inflight: 0,
         owner: 0,
         value: None,
+        flock: super::flock::Mode::Unlocked,
     };
 }
 pub(crate) struct Table {
@@ -167,6 +169,7 @@ impl OpenDescriptions {
             inflight: 0,
             owner,
             value: Some(value),
+            flock: super::flock::Mode::Unlocked,
         };
         Ok(())
     }
@@ -249,6 +252,7 @@ impl OpenDescriptions {
         }
         table.entries[handle.slot].value = None;
         table.entries[handle.slot].references = 0;
+        table.entries[handle.slot].flock = super::flock::Mode::Unlocked;
         let owner = entry.owner;
         Ok(match description.object {
             Object::Socket(handle) => Some(Released::Socket { owner, handle }),

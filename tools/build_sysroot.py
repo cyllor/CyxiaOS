@@ -53,6 +53,7 @@ PROBES = {
     "timerfd-probe": ("timerfd_probe.c", []),
     "edge-probe": ("edge_probe.c", []),
     "fd-share-probe": ("fd_share_probe.c", []),
+    "flock-probe": ("flock_probe.c", []),
     "scm-probe": ("scm_probe.c", []),
     "memfd-probe": ("memfd_probe.c", []),
     "cyxia-save": ("cyxia_save.c", ["-lX11", "-lxcb", "-lXau"]),

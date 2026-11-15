@@ -82,6 +82,12 @@ pub fn run(info: &PcBootInfo) -> ! {
         crate::storage::poll(shell, &mut out);
         idle();
     }
+    #[cfg(feature = "full-os")]
+    {
+        cyxia_posix::runtime_directory::reset_at_boot(shell.fs_mut())
+            .expect("private session runtime directory after recovery");
+        crate::log(b"SESSION_RUNTIME_READY path=/run/user/0 mode=0700 uid=0\n");
+    }
     shell.banner(&mut out).expect("OS console");
     let mut io = SystemIo;
     loop {

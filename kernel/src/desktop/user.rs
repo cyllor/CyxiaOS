@@ -1102,6 +1102,10 @@ impl Supervisor {
             let path = cyxia_ai_fs::Path::resolve(cyxia_ai_fs::Path::ROOT, path)?;
             fs.register_boot_file(path)?;
         }
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "flock-probe");
+        if uses_session_runtime {
+            cyxia_posix::runtime_directory::validate(fs)?;
+        }
         let mut random = [0u8; 16];
         super::entropy::fill(&mut random)?;
         // Keep the existing per-process 8-page admission floor while the image
@@ -1111,6 +1115,15 @@ impl Supervisor {
         let runner = &mut self.runners[slot];
         let owner = runner.lease.ok_or(Errno::Io)?.0;
         let normal_argv: &[&[u8]] = &[path.as_bytes()];
+        let legacy_environment: &[&[u8]] = &[
+            b"PATH=/bin", b"LANG=C", b"TZ=UTC", b"DISPLAY=:0", b"HOME=/",
+            b"GSETTINGS_BACKEND=memory", b"GIO_USE_VFS=local", b"GTK_USE_PORTAL=0",
+            b"GTK_IM_MODULE=simple",
+        ];
+        let session_environment: &[&[u8]] = &[
+            b"PATH=/bin", b"LANG=C", b"TZ=UTC", b"HOME=/",
+            cyxia_posix::runtime_directory::ENVIRONMENT,
+        ];
         let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
         // Fixture roles select a workload, never the authenticated Wayland
         // identity: the compositor obtains that from the connected socket.
@@ -1188,17 +1201,7 @@ impl Supervisor {
                 } else {
                     normal_argv
                 },
-                envp: &[
-                    b"PATH=/bin",
-                    b"LANG=C",
-                    b"TZ=UTC",
-                    b"DISPLAY=:0",
-                    b"HOME=/",
-                    b"GSETTINGS_BACKEND=memory",
-                    b"GIO_USE_VFS=local",
-                    b"GTK_USE_PORTAL=0",
-                    b"GTK_IM_MODULE=simple",
-                ],
+                envp: if uses_session_runtime { session_environment } else { legacy_environment },
                 execfn: path.as_bytes(),
             },
         ) {

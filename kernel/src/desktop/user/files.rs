@@ -2,6 +2,24 @@
 use super::{Errno, FileSystem, Runner};
 
 impl Runner {
+    pub(super) fn flock(&mut self, descriptor: u64, operation: u64) -> Result<u64, Errno> {
+        let fd = descriptor as i32;
+        let operation = u32::try_from(operation).map_err(|_| Errno::Inval)?;
+        let result = self.process.flock(fd, operation);
+        if result == Err(Errno::Again) && operation & cyxia_posix::flock::LOCK_NB == 0 {
+            let identity = self.process.description_identity(fd)?;
+            self.thread.context.restart_syscall()?;
+            self.thread.retry_syscall = true;
+            self.thread.retry_descriptor = Some((fd, identity));
+            // Shared OFDs are serialized by CPU0. Yield until the next service
+            // tick and validate the exact descriptor generation before replay.
+            // Signals cancel this restart through the existing wait path.
+            self.block(super::Wait::Retry(super::now().saturating_add(1)));
+            return Ok(descriptor);
+        }
+        result.map(|()| 0)
+    }
+
     pub(super) fn rename_at(
         &mut self,
         fs: &mut FileSystem,

@@ -113,6 +113,116 @@ def ported_checks(console):
             for fault in ('MAPERR', 'READONLY', 'PROT_NONE'):
                 console.until(('RUST_STD_PROBE PF_' + fault + ' PASS').encode(), at)
 
+def flock_checks(console):
+    from verify_fd_share import objects
+    from verify_ported import parse_processes
+    def snapshot():
+        at = console.command('ai system')
+        console.until(rb'AI_SYSTEM_END\r?\n', at)
+        return objects(bytes(console.raw[at:]))
+    before_objects = snapshot()
+    pc.require(before_objects['live'] == before_objects['references'] == 0,
+               'flock capture begins with live open descriptions')
+    start = console.command('posix exec flock-probe')
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    for phase in ('RUNTIME_DIRECTORY', 'INDEPENDENT_DUP_RELEASE', 'SHARED_CONVERSION',
+                  'INVALID_INPUT', 'INODE_IDENTITY'):
+        console.until(('FLOCK_PROBE ' + phase + ' PASS').encode(), start)
+    phases = []
+    for phase in ('BLOCKING_UNLOCK', 'INTERRUPT', 'RETRY_REUSE'):
+        console.until(('FLOCK_PROBE WAIT ' + phase).encode(), start)
+        def waits():
+            at = console.command('posix status')
+            row = console.until(rb'UserStatus \{ pid: ' + pid + rb',[^\r\n]+', at).group(0)
+            pc.require(b'state: Running' in row or b'state: Waiting' in row,
+                       'flock process ended before its host gate')
+            count = re.search(rb'\bwaits: (\d+)', row)
+            pc.require(count is not None, 'missing real syscall wait counter')
+            return int(count.group(1))
+        before = waits()
+        deadline = time.monotonic() + 5
+        while True:
+            after = waits()
+            if after > before: break
+            pc.require(time.monotonic() < deadline, 'flock worker did not park and retry')
+            time.sleep(.01)
+        console.command('touch /run/user/0/flock-' + phase)
+        console.until(('FLOCK_PROBE ' + phase + ' PASS').encode(), start)
+        phases.append(dict(phase=phase, waits_before=before, waits_after=after))
+    console.until(rb'FLOCK_PROBE PASS', start)
+    console.until(rb'pid=' + pid + rb' Exited code=0\b', start)
+    at = console.command('posix list')
+    process = parse_processes(bytes(console.raw[at:]))[int(pid)]
+    for name, expected in dict(state='Exited', code=0, free_pages=64, heap_pages=0,
+                               image_pages=0, thread_count=0, heap_free=4096,
+                               image_free=16384).items():
+        pc.require(process.get(name) == expected, 'flock process did not reclaim ' + name)
+    after_objects = snapshot()
+    pc.require(after_objects == before_objects, 'flock open descriptions were not reclaimed')
+    return dict(pid=int(pid), phases=phases, process=process,
+                objects_before=before_objects, objects_after=after_objects)
+
+def flock_build_inputs(prefix):
+    from build_sysroot import inspect_elf
+    prefix = Path(prefix)
+    receipt_path = prefix / 'flock-probe-layout.json'
+    receipt = pc.read_json(receipt_path)
+    image = prefix / 'flock-probe.elf'
+    actual = inspect_elf(image, 'x86_64')
+    pc.require(all(receipt.get(key) == value for key, value in actual.items() if key != 'file'),
+               'flock probe layout differs from the actual target ELF')
+    source = pc.ROOT / 'user/ported/flock_probe.c'
+    sdk = pc.ROOT / 'artifacts/sysroot/x86_64-musl'
+    inputs = {'source_sha256': pc.sha(source),
+              'libc_sha256': pc.sha(sdk / 'sysroot/usr/lib/libc.a'),
+              'driver_sha256': pc.sha(sdk / 'bin/x86_64-linux-musl-cc')}
+    pc.require(all(receipt.get(key) == value for key, value in inputs.items()),
+               'flock probe source or SDK inputs changed since compilation')
+    return dict(inputs, receipt_sha256=pc.sha(receipt_path), image_sha256=actual['sha256'])
+
+def flock_checkpoint_proof(raw, commands):
+    expected = ['write /run/user/0/boot-expired stale-session',
+                'cat /run/user/0/boot-expired', 'storage checkpoint']
+    tail = commands[-3:]
+    pc.require([row.get('command') for row in tail] == expected,
+               'runtime sentinel must be read back immediately before checkpoint')
+    offsets = [row.get('serial_offset') for row in tail] + [len(raw)]
+    pc.require(all(isinstance(at, int) and at >= 0 for at in offsets) and
+               all(a < b for a, b in zip(offsets, offsets[1:])),
+               'invalid runtime checkpoint command offsets')
+    segments = [raw[a:b] for a, b in zip(offsets, offsets[1:])]
+    pc.require(re.search(rb'^stale-session\r?$', segments[1], re.MULTILINE),
+               'runtime sentinel was not present before checkpoint')
+    durable = re.search(rb'STORAGE_DURABLE generation=(\d+) slot=\d+ bytes=(\d+) flushes=(\d+)\b', segments[2])
+    pc.require(durable is not None, 'runtime checkpoint was not durable')
+    generation, size, flushes = map(int, durable.groups())
+    pc.require(generation > 0 and size > 0 and flushes >= 2, 'incomplete runtime checkpoint flush')
+    return dict(generation=generation, bytes=size, flushes=flushes)
+
+def flock_recovery_input(disk, current):
+    """Only recover the unchanged disk of a proven sentinel-bearing capture."""
+    directory = disk.parent
+    previous = pc.read_json(directory / 'summary.json')
+    pc.require(previous.get('status') == 'OS_FLOCK_PASS' and
+               previous.get('disk') == str(disk.resolve()) and
+               previous.get('disk_after_sha256') == pc.sha(disk),
+               'recovery disk differs from its successful cold flock capture')
+    for field in ('source_sha256', 'build_manifest_sha256', 'producer_sha256', 'producer_inputs_sha256'):
+        pc.require(previous.get(field) == current[field], 'recovery predecessor changed ' + field)
+    pc.require(pc.sha(directory / 'capture-producer.py') == previous['producer_sha256'],
+               'recovery predecessor producer copy changed')
+    hashes = {name: pc.sha(directory / name) for name in ('summary.json', 'serial.raw', 'commands.json')}
+    pc.require(hashes['serial.raw'] == previous.get('serial_sha256') and
+               hashes['commands.json'] == previous.get('commands_sha256'),
+               'recovery predecessor serial or command capture changed')
+    checkpoint = flock_checkpoint_proof(pc.bounded_bytes(directory / 'serial.raw', 4 * 1024 * 1024),
+                                        pc.read_json(directory / 'commands.json'))
+    pc.require(previous.get('runtime_checkpoint') == checkpoint,
+               'recovery predecessor checkpoint disagrees with actual serial output')
+    return dict(directory=str(directory), summary_sha256=hashes['summary.json'],
+                serial_sha256=hashes['serial.raw'], commands_sha256=hashes['commands.json'],
+                disk_sha256=previous['disk_after_sha256'], checkpoint=checkpoint)
+
 def parallel_checks(console, qmp, output):
     pids = []
     for _ in range(3):
@@ -218,6 +328,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                    'Smithay smoke requires actual server/client target images')
         pc.require(scenario != 'cosmic-version' or 'cosmic-desktop' in manifest['features'],
                    'COSMIC execution smoke requires the actual full-OS compositor image')
+        pc.require(scenario != 'flock' or (any(f in manifest['features'] for f in ('full-os', 'cosmic-desktop')) and
+                   'flock-probe.elf' in manifest['external_inputs']),
+                   'flock smoke requires full-OS runtime and the actual syscall probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -258,6 +371,16 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                                    for load in manifest['elf']['loads'] if not load['flags'] & 2),
                                'exact COSMIC image must be embedded once in a read-only load')
                     result['cosmic_embedded_sha256'] = pc.sha_bytes(program)
+                if scenario == 'flock':
+                    result['flock_build_inputs'] = flock_build_inputs(manifest['sysroot'])
+                    if recover_disk: result['recovery_input'] = flock_recovery_input(disk, result)
+                    program = (Path(manifest['sysroot']) / 'flock-probe.elf').read_bytes()
+                    kernel = (build / 'kernel.elf').read_bytes()
+                    pc.require(program and kernel.count(program) == 1 and
+                               any(program in kernel[load['offset']:load['offset']+load['size']]
+                                   for load in manifest['elf']['loads'] if not load['flags'] & 2),
+                               'exact flock syscall probe must be embedded once in a read-only load')
+                    result['flock_embedded_sha256'] = pc.sha_bytes(program)
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err, env=pc.env())
                 console = Console(connect(path / 's.sock', process), process, output / 'serial.raw')
                 qmp = Qmp(connect(path / 'q.sock', process))
@@ -276,6 +399,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 result['boot_display'] = verify_boot_frame(output / 'boot-display.ppm')
                 if recover_disk:
                     console.until(rb'STORAGE_RECOVERED generation=')
+                    if scenario == 'flock':
+                        generation = result['recovery_input']['checkpoint']['generation']
+                        console.until(rb'STORAGE_RECOVERED generation=' + str(generation).encode() + rb'\b')
                 else:
                     console.command('mkdir /v17')
                     console.command('write /v17/hello x86-os-persistence')
@@ -284,6 +410,16 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'flock':
+                    console.until(rb'SESSION_RUNTIME_READY path=/run/user/0 mode=0700 uid=0')
+                    at = console.command('ls /run/user/0')
+                    pc.require(b'boot-expired' not in console.raw[at:], 'runtime state survived reboot')
+                    result['flock'] = [flock_checks(console), flock_checks(console)]
+                    # This file enters the durable snapshot. Boot must discard
+                    # it after recovery, while preserving /v17/hello above.
+                    if not recover_disk:
+                        console.command('write /run/user/0/boot-expired stale-session')
+                        console.command('cat /run/user/0/boot-expired', [rb'^stale-session\r?$'])
                 if scenario == 'cosmic-version':
                     # Run the same real executable twice, proving teardown/reuse
                     # as well as entry and normal return. This does not start a session.
@@ -297,6 +433,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if egl: console.program('posix exec egl-probe', b'EGL_PROBE RESULT PASS mode=offscreen failures=0')
                 if not recover_disk:
                     console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=[2-9]'])
+                    if scenario == 'flock':
+                        result['runtime_checkpoint'] = flock_checkpoint_proof(bytes(console.raw), console.commands)
                 qmp.execute('screendump', {'filename': str(output / 'display.ppm')})
                 if scenario == 'smithay':
                     from verify_smithay_dynamic import scanout
@@ -328,7 +466,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 (output / 'serial.txt').write_text(raw.decode(errors='replace'))
                 pc.write_json(output / 'commands.json', console.commands if console else [])
                 result.update(serial_sha256=pc.sha_bytes(raw), elapsed_seconds=time.monotonic() - started,
-                              disk_after_sha256=pc.sha(disk))
+                              disk_after_sha256=pc.sha(disk), commands_sha256=pc.sha(output / 'commands.json'))
                 if result['status'] != 'FAIL':
                     try:
                         os_x86.validate_build(build)
@@ -338,6 +476,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'smithay':
                             pc.require(validate_inputs(Path(manifest['sysroot'])) == result['smithay_inputs'],
                                        'Smithay source/build receipt changed during VM')
+                        if scenario == 'flock':
+                            pc.require(flock_build_inputs(manifest['sysroot']) == result['flock_build_inputs'],
+                                       'flock source/build inputs changed during VM')
                         pc.require(result.get('returncode') == 0, 'QEMU did not exit normally')
                     except Exception as changed:
                         result.update(status='FAIL', error=repr(changed))
@@ -348,7 +489,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

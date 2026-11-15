@@ -293,6 +293,7 @@ impl Shell {
                         "smithay-dynamic-reject" => "smithay-dynamic-reject",
                         "cosmic-comp" => "cosmic-comp",
                         "cosmic-version" => "cosmic-version",
+                        "flock-probe" => "flock-probe",
                         "rust-egl-probe" => "rust-egl-probe",
                         "fd-share-probe" => "fd-share-probe",
                         "scm-probe" => "scm-probe",
