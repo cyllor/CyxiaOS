@@ -470,6 +470,20 @@ fn elf_loader_validates_before_mutating_and_rejects_wx_interpreter_and_overflows
 }
 
 #[test]
+fn native_image_isa_is_explicit_and_wrong_isa_does_not_mutate_arena() {
+    let mut bytes = elf();
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+    bytes[24..32].copy_from_slice(&(usermem::BASE + 1).to_le_bytes());
+    let mut arena = usermem::Arena::new();
+    arena.write(usermem::STACK_BASE, b"retained").unwrap();
+    assert_eq!(image::load(&bytes, &mut arena), Err(Errno::Inval));
+    assert_eq!(arena.read(usermem::STACK_BASE, 8).unwrap(), b"retained");
+    assert_eq!(image::load_for(&bytes, &mut arena, crate::ImageAbi::X86_64),
+        Ok(usermem::BASE + 1));
+    assert_eq!(arena.read(usermem::STACK_BASE, 8).unwrap(), &[0; 8]);
+}
+
+#[test]
 fn rmdir_dot_is_not_collapsed_into_a_removable_directory() {
     let mut fs = FileSystem::new();
     let objects = crate::OpenDescriptions::new();

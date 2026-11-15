@@ -9,6 +9,7 @@ import subprocess
 import time
 import tomllib
 
+from target_profile import profile_for, inspect_link_archive
 from build_cosmic import clean_environment, new_output, run_bounded, tree_identity
 from build_rust_egl_probe import extract, source_input
 from build_sysroot import ROOT, DEFAULT_OUTPUT, digest, inspect_elf, toolchain
@@ -16,7 +17,7 @@ from build_sysroot import ROOT, DEFAULT_OUTPUT, digest, inspect_elf, toolchain
 MANIFEST = ROOT / "ports/cosmic/smithay-wayland-source.json"
 PROBE = ROOT / "ports/cosmic/smithay-wayland/main.rs"
 LOCK = ROOT / "ports/cosmic/smithay-wayland.Cargo.lock"
-MODULES = [ROOT / "ports/cosmic/smithay-wayland/native.rs", ROOT / "ports/cosmic/smithay-wayland/us.xkb"]
+MODULES = [ROOT / "ports/cosmic/smithay-wayland/native.rs", ROOT / "ports/cosmic/smithay-wayland/linux_syscall.rs", ROOT / "ports/cosmic/smithay-wayland/us.xkb"]
 COSMIC_LOCK = ROOT / "artifacts/cosmic-sources/cosmic-comp-epoch/Cargo.lock"
 
 
@@ -27,6 +28,8 @@ class BuildProfile:
     binary_stem: str = "smithay-wayland"
     entrypoint: Path | None = None
     lto: str = "thin"
+    opt_level: str = 's'
+    icf: str = 'none'
     modules: tuple[Path, ...] = tuple(MODULES)
 
     def __post_init__(self):
@@ -34,6 +37,8 @@ class BuildProfile:
             raise ValueError("Invalid binary output name")
         if self.lto not in ("thin", "fat"):
             raise ValueError("Unsupported LTO profile")
+        if self.opt_level not in ('s', 'z') or self.icf not in ('none', 'safe'):
+            raise ValueError('Unsupported size optimization profile')
         names = [p.name.casefold() for p in self.modules]
         if "main.rs" in names or len(names) != len(set(names)):
             raise ValueError("Module filenames would overwrite a source input")
@@ -116,7 +121,9 @@ def workspace_preflight_environment(environment, cargo_home):
     return {**environment, "CARGO_HOME": str(cargo_home), "CARGO_NET_OFFLINE": "true"}
 
 
-def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
+def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile(), architecture="aarch64", sysroot=None):
+    selected_target = profile_for(architecture)
+    prefix = Path(sysroot or selected_target.default_output(ROOT)).resolve()
     manifest_path, probe = profile.manifest, profile.source
     manifest = json.loads(manifest_path.read_text())
     budget = manifest["budgets"]
@@ -136,6 +143,8 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
     mesa = json.loads(mesa_report.read_text())
     if mesa.get("status") != "libraries-compiled":
         raise ValueError("Mesa SDK is not compiled")
+    if selected_target.architecture != 'aarch64' or 'target_triple' in mesa:
+        selected_target.require_report(mesa)
     output = new_output(output)
     for name in ("logs", "source", "source/src", "source/.cargo", "vendor", "cargo-home", "native", "provenance"):
         (output / name).mkdir(parents=True, exist_ok=True)
@@ -143,17 +152,19 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
     rustc = str(Path.home() / ".cargo/bin/rustc")
     cargo = str(Path.home() / ".cargo/bin/cargo")
     env = clean_environment(str(Path.home() / ".cargo/bin") + ":/usr/bin:/bin:/opt/homebrew/bin")
-    env.update(CARGO_HOME=str(output / "cargo-home"), CARGO_TARGET_DIR=str(output / "target"))
+    env.update(CARGO_HOME=str(output / "cargo-home"), CARGO_TARGET_DIR=str(output / "target"),
+               CARGO_BUILD_JOBS='2')
     source = output / "source"
-    report = dict(status="FAIL", guest_execution="not performed", scope=manifest["scope"],
+    report = dict(status="FAIL", architecture=selected_target.architecture, target_triple=selected_target.rust_target, guest_execution="not performed", scope=manifest["scope"],
                   smithay_commit=manifest["smithay_commit"], features=manifest["features"],
                   source_sha256=digest(probe), manifest_sha256=digest(manifest_path),
                   build_profile=dict(manifest=str(manifest_path), source=str(probe),
-                                     binary_stem=profile.binary_stem, lto=profile.lto),
+                                     binary_stem=profile.binary_stem, lto=profile.lto,
+                                     opt_level=profile.opt_level, icf=profile.icf),
                   builder_sha256=digest(Path(__file__)), cargo_lock_sha256=digest(LOCK),
                   cosmic_lock_sha256=digest(COSMIC_LOCK), mesa_report_sha256=digest(mesa_report),
                   helper_sha256={str(ROOT / "tools" / p): digest(ROOT / "tools" / p)
-                                 for p in ("build_rust_egl_probe.py", "build_cosmic.py", "build_sysroot.py")},
+                                 for p in ("build_rust_egl_probe.py", "build_cosmic.py", "build_sysroot.py", "target_profile.py")},
                   patches_sha256={p: digest(ROOT / p) for p in manifest["patches"]},
                   modules_sha256={str(p): digest(p) for p in profile.modules},
                   commands=[], budgets=budget)
@@ -227,7 +238,7 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
             '[workspace]\nmembers=["smithay"]\n[dependencies]\n'
             'smithay={path="smithay",default-features=false,features='
             + json.dumps(manifest["features"]) + '}\nlibc="=0.2.182"\n'
-            '[profile.release]\nopt-level="s"\ndebug=1\ncodegen-units=1\nlto='
+            '[profile.release]\nopt-level=' + json.dumps(profile.opt_level) + '\ndebug=1\ncodegen-units=1\nlto='
             + json.dumps(profile.lto) + '\npanic="abort"\n')
         (source / ".cargo/config.toml").write_text(
             '[source.crates-io]\nreplace-with="checked-vendor"\n'
@@ -239,26 +250,30 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
         libraries = dict(mesa["target"]["link_dependencies_sha256"])
         # xkbcommon is mandatory upstream Smithay input, including in this
         # renderer-only feature set. Use the verified existing static target SDK.
-        xkb_path = DEFAULT_OUTPUT / "xkbcommon-build-report.json"
+        xkb_path = prefix / "xkbcommon-build-report.json"
         report["xkbcommon_report_sha256"] = digest(xkb_path)
         xkb = json.loads(xkb_path.read_text())
+        if selected_target.architecture != "aarch64" or "target_triple" in xkb:
+            selected_target.require_report(xkb)
         if xkb["status"] != "cross-built":
             raise ValueError("xkbcommon SDK is not compiled")
-        libraries[str(DEFAULT_OUTPUT / "sysroot/usr/lib/libxkbcommon.a")] = xkb["target"]["archive"]["sha256"]
+        libraries[str(prefix / "sysroot/usr/lib/libxkbcommon.a")] = xkb["target"]["archive"]["sha256"]
         for path, value in libraries.items():
+            if path.endswith(".a"):
+                inspect_link_archive(Path(path), prefix, selected_target)
             if digest(Path(path)) != value:
                 raise ValueError("Static link input changed: " + path)
         report["static_inputs_sha256"] = libraries
         shutil.copyfile(mesa_report, output / "mesa-build-report.json")
         shutil.copyfile(xkb_path, output / "xkbcommon-build-report.json")
-        target = manifest["target"]
+        target = selected_target.rust_target
         target_lib = Path(subprocess.check_output(
             [rustc, "--print", "target-libdir", "--target", target], env=env, text=True).strip())
         unwind = target_lib / "self-contained/libunwind.a"
         shutil.copyfile(unwind, output / "native/libunwind.a")
         report["rust_unwind_sha256"] = digest(unwind)
         report["rust_target_rlibs_sha256"] = {p.name: digest(p) for p in sorted(target_lib.glob("*.rlib"))}
-        cc = DEFAULT_OUTPUT / "bin/aarch64-linux-musl-cc"
+        cc = selected_target.cc(prefix)
         report["target_driver_sha256"] = digest(cc)
         input_files.update({cc: report["target_driver_sha256"], unwind: report["rust_unwind_sha256"],
                             mesa_report: report["mesa_report_sha256"],
@@ -268,8 +283,10 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
                  "-C", "relocation-model=static", "-C", "target-feature=+crt-static",
                  "-L", "native=" + str(output / "native"),
                  "-C", "link-arg=-Wl,--start-group"]
+        if profile.icf == 'safe':
+            flags += ['-C', 'link-arg=-Wl,--icf=safe']
         for path in libraries:
-            if path.endswith(".a") and Path(path).name not in ("libc.a", "libclang_rt.builtins-aarch64.a"):
+            if path.endswith(".a") and Path(path).name not in ("libc.a", selected_target.builtins_archive):
                 flags += ["-C", "link-arg=" + path]
         flags += ["-C", "link-arg=-Wl,--end-group"]
         run([cargo, "metadata", "--locked", "--offline", "--format-version=1",
@@ -292,11 +309,11 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
         binary = output / "target" / target / "release/cyxia-smithay-wayland"
         symbols = output / (profile.binary_stem + ".symbols.elf")
         shutil.copyfile(binary, symbols)
-        report["symbols"] = inspect_elf(symbols)
+        report["symbols"] = inspect_elf(symbols, selected_target)
         binary = output / (profile.binary_stem + ".elf")
         shutil.copyfile(symbols, binary)
         run([toolchain()["llvm-strip"], "--strip-all", binary], "strip")
-        report["probe"] = inspect_elf(binary)
+        report["probe"] = inspect_elf(binary, selected_target)
         report["image_pages"] = image_page_count(report["probe"]["program_headers"])
         report["generated_bindings"] = {str(p.relative_to(output)): digest(p)
                                        for p in (output / "target").rglob("*_bindings.rs")
@@ -321,6 +338,8 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
                                              allowed=True, model=8195):
             raise ValueError("Existing guest AI model rejects executable image; optimize before guest execution")
         for path, value in libraries.items():
+            if path.endswith(".a"):
+                inspect_link_archive(Path(path), prefix, selected_target)
             if digest(Path(path)) != value:
                 raise ValueError("Static link input changed during build: " + path)
         input_files.update({source / "src/main.rs": report["source_sha256"],
@@ -348,9 +367,11 @@ def build(output, cache, mesa_report, fetch=False, *, profile=BuildProfile()):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
+    parser.add_argument("--sysroot", type=Path)
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--mesa-report", required=True, type=Path)
     parser.add_argument("--fetch", action="store_true")
     args = parser.parse_args()
     print(json.dumps(build(args.output.resolve(), args.cache.resolve(),
-                           args.mesa_report.resolve(), args.fetch), indent=2))
+                           args.mesa_report.resolve(), args.fetch, architecture=args.arch, sysroot=args.sysroot), indent=2))

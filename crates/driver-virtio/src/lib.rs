@@ -1,5 +1,5 @@
 #![no_std]
-//! Modern VirtIO MMIO, one outstanding split-ring chain per queue.
+//! Modern VirtIO MMIO/PCI, one outstanding split-ring chain per queue.
 //! No allocator, interrupts, indirect descriptors, packed rings or legacy transport.
 use core::{
     cell::UnsafeCell,
@@ -163,89 +163,13 @@ impl QueueMemory {
     }
 }
 
-pub struct Transport {
-    base: usize,
-}
-impl Transport {
-    /// # Safety
-    /// `base..base+len` must be an exclusively owned, mapped Device-memory
-    /// VirtIO MMIO resource. Caller serializes all queue/configuration access.
-    pub unsafe fn attach(base: usize, len: usize) -> Result<Self, Error> {
-        if !base.is_multiple_of(4) || len < 0x200 || base.checked_add(len).is_none() {
-            return Err(Error::Address);
-        }
-        let s = Self { base };
-        if s.read(0) != 0x74726976 || s.read(4) != 2 {
-            return Err(Error::Unsupported);
-        }
-        Ok(s)
-    }
-    fn read(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.base + offset) as *const u32) }
-    }
-    fn write(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
-    }
-    pub fn device_id(&self) -> u32 {
-        self.read(8)
-    }
-    pub fn negotiate(&mut self, platform: &impl Platform) -> Result<(), Error> {
-        self.write(0x70, 0);
-        platform.barrier();
-        let start = platform.now_ms();
-        while self.read(0x70) != 0 {
-            if platform.now_ms().wrapping_sub(start) >= 100 {
-                return Err(Error::Timeout);
-            }
-        }
-        self.write(0x70, 1 | 2);
-        self.write(0x14, 1);
-        if self.read(0x10) & 1 == 0 {
-            self.fail();
-            return Err(Error::Features);
-        }
-        self.write(0x24, 0);
-        self.write(0x20, 0);
-        self.write(0x24, 1);
-        self.write(0x20, 1); // VERSION_1 only
-        self.write(0x70, 1 | 2 | 8);
-        platform.barrier();
-        if self.read(0x70) & (8 | 64 | 128) != 8 {
-            self.fail();
-            return Err(Error::Features);
-        }
-        Ok(())
-    }
-    pub fn start(&mut self, platform: &impl Platform) -> Result<(), Error> {
-        self.write(0x70, 1 | 2 | 8 | 4);
-        platform.barrier();
-        if self.read(0x70) != 15 {
-            self.fail();
-            return Err(Error::Device);
-        }
-        Ok(())
-    }
-    pub fn fail(&mut self) {
-        self.write(0x70, self.read(0x70) | 128);
-    }
-    fn check(&self) -> Result<(), Error> {
-        if self.read(0x70) & (64 | 128) != 0 {
-            Err(Error::Device)
-        } else {
-            Ok(())
-        }
-    }
-    fn address(&self, offset: usize, value: u64) {
-        self.write(offset, value as u32);
-        self.write(offset + 4, (value >> 32) as u32);
-    }
-}
-
+mod transport;
+pub use transport::{MappedRegion, PciRegions, Transport};
 /// DMA buffers are permanently reserved, including after timeout or Drop.
 /// This deliberately quarantines failed devices instead of reusing in-flight pages.
 pub struct Queue {
     memory: &'static mut QueueMemory,
-    index: u32,
+    notification: transport::Notification,
     available: u16,
     used: u16,
     writable: u32,
@@ -259,10 +183,11 @@ impl Queue {
         index: u32,
         platform: &impl Platform,
     ) -> Result<Self, Error> {
-        transport.write(0x30, index);
-        if transport.read(0x44) != 0 || transport.read(0x34) < 8 {
+        transport.select_queue(index)?;
+        if transport.queue_enabled() || transport.queue_max_size() < 8 {
             return Err(Error::Queue);
         }
+        let notification = transport.queue_notification(index)?;
         let size = core::mem::size_of::<QueueMemory>();
         let pa = platform.physical(memory as *mut _ as usize, size)?;
         if !pa.is_multiple_of(4096) || pa.checked_add(size as u64).is_none() {
@@ -277,15 +202,13 @@ impl Queue {
         unsafe {
             platform.sync(memory as *mut _ as usize, size);
         }
-        transport.write(0x38, 8);
-        transport.address(0x80, pa);
-        transport.address(0x90, pa + 4096);
-        transport.address(0xa0, pa + 8192);
+        transport.set_queue_size(8)?;
+        transport.set_queue_addresses(pa, pa + 4096, pa + 8192);
         platform.barrier();
-        transport.write(0x44, 1);
+        transport.enable_queue();
         Ok(Self {
             memory,
-            index,
+            notification,
             available: 0,
             used: 0,
             writable: 0,
@@ -341,9 +264,13 @@ impl Queue {
             platform.sync(m.avail.address(), 4096);
         }
         platform.barrier();
-        transport.write(0x50, self.index);
         self.writable = writable as u32;
         self.pending = true;
+        if let Err(error) = transport.notify(self.notification) {
+            self.poisoned = true;
+            transport.fail();
+            return Err(error);
+        }
         Ok(())
     }
     pub fn poll(
@@ -392,8 +319,7 @@ impl Queue {
         for (i, byte) in output[..length as usize].iter_mut().enumerate() {
             *byte = unsafe { read_volatile((m.response.address() + i) as *const u8) };
         }
-        let irq = transport.read(0x60);
-        transport.write(0x64, irq & 3);
+        transport.acknowledge_interrupt();
         self.used = index;
         self.pending = false;
         Ok(Some(length as usize))
@@ -465,8 +391,12 @@ impl EventQueue {
             platform.sync(queue.memory.avail.address(), 4096);
         }
         platform.barrier();
-        transport.write(0x50, queue.index);
         queue.available = 8;
+        if let Err(error) = transport.notify(queue.notification) {
+            // The handle is dropped, but its static DMA pages remain pinned.
+            transport.fail();
+            return Err(error);
+        }
         Ok(Self { queue })
     }
     pub fn poll(
@@ -537,9 +467,12 @@ impl EventQueue {
             platform.sync(q.memory.avail.address(), 4096);
         }
         platform.barrier();
-        transport.write(0x50, q.index);
-        let irq = transport.read(0x60);
-        transport.write(0x64, irq & 3);
+        if let Err(error) = transport.notify(q.notification) {
+            q.poisoned = true;
+            transport.fail();
+            return Err(error);
+        }
+        transport.acknowledge_interrupt();
         Ok(Some(event))
     }
 }

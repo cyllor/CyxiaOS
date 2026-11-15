@@ -3,6 +3,8 @@
 mod aarch64;
 #[path = "build/x86_64.rs"]
 mod x86_64;
+#[path = "build/os.rs"]
+mod os;
 
 fn main() {
     match std::env::var("TARGET").as_deref() {

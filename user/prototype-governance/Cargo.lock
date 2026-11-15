@@ -48,6 +48,7 @@ name = "cyxia-prototype-governance"
 version = "0.1.0"
 dependencies = [
  "cyxia-prototype",
+ "sha2",
 ]
 
 [[package]]

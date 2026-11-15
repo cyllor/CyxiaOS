@@ -1,9 +1,11 @@
 //! Pinned per-process anonymous RAM. CPU0 foreground owns all metadata and copies.
 use super::user::ai::{self, Domain};
+use crate::address_space::PageTable as Table;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_ai_runtime::accounting::Attempt;
-use cyxia_arch_aarch64::mmu;
-use cyxia_contracts::{BootInfo, PageCount, PhysAddr, RedemptionId};
+#[cfg(target_arch = "aarch64")]
+use cyxia_contracts::BootInfo;
+use cyxia_contracts::{PageCount, RedemptionId};
 use cyxia_kernel_core::grants::{
     AuthorizedGrantRequest, BoundedGrantLedger, Owner, ReleaseReceipt,
 };
@@ -15,6 +17,7 @@ use cyxia_posix::{
 
 const BYTES: u64 = (vm::PAGE_COUNT * vm::PAGE_SIZE) as u64;
 pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
+#[cfg(target_arch = "aarch64")]
 const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + RESERVED_BYTES <= cyxia_platform_virt::USER_RAM_END
 );
@@ -25,6 +28,7 @@ static POOL_BASE: AtomicU64 = AtomicU64::new(0);
 /// This pinned board already maps all RAM at HIGH+PA. Reserve outside the entire
 /// kernel load budget, never inside DTB/firmware reservations. Publish the range
 /// back to BootInfo so subsequent services cannot treat it as free RAM.
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
@@ -32,8 +36,6 @@ pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     Ok(())
 }
 
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
 #[derive(Clone, Copy)]
 struct Allocation {
     start: u64,
@@ -42,7 +44,7 @@ struct Allocation {
 }
 pub struct Heap {
     vm: Vm,
-    // CPU0 owns each Heap while EL0 is stopped. Reuse pinned output instead of
+    // CPU0 owns each Heap while user execution is stopped. Reuse pinned output instead of
     // copying whole-pool page lists through the guarded kernel stack.
     batch: PageBatch,
     tables: [Table; TABLES],
@@ -57,7 +59,7 @@ impl Heap {
         Self {
             vm: Vm::new(),
             batch: PageBatch::new(),
-            tables: [const { Table([0; 512]) }; TABLES],
+            tables: [const { Table::empty() }; TABLES],
             allocations: [None; ALLOCATIONS],
             ledger: BoundedGrantLedger::new(PageCount(vm::PAGE_COUNT as u32)),
             base: 0,
@@ -76,6 +78,7 @@ impl Heap {
         self.owner = Some(owner);
         self.model = 0;
     }
+    #[cfg(target_arch = "aarch64")]
     pub fn roots(&self) -> [u64; TABLES] {
         core::array::from_fn(|i| (&self.tables[i] as *const Table as u64 - super::HIGH) | 3)
     }
@@ -148,12 +151,13 @@ impl Heap {
                 core::ptr::write_bytes(self.pointer(page.slot, 0), 0, vm::PAGE_SIZE);
             }
             let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
-            self.tables[index / 512].0[index % 512] = mmu::encode_user_leaf(
-                PhysAddr(self.base + (page.slot * vm::PAGE_SIZE) as u64),
-                true,
-                false,
-            )
-            .expect("validated private RAM");
+            self.tables[index / 512]
+                .set(
+                    index % 512,
+                    self.base + (page.slot * vm::PAGE_SIZE) as u64,
+                    1 | if true { 2 } else { 0 } | if false { 4 } else { 0 },
+                )
+                .map_err(|_| Errno::Inval)?;
         }
         self.allocations[slot] = Some(Allocation {
             start: self.batch.start(),
@@ -174,10 +178,10 @@ impl Heap {
         self.vm.unmap_into(start, pages, &mut self.batch)?;
         for page in self.batch.iter() {
             let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
-            self.tables[index / 512].0[index % 512] = 0;
+            self.tables[index / 512].remove(index % 512);
         }
-        // enter() returned with TTBR0 disabled and a completed global TLBI/DSB;
-        // no other CPU/DMA can retain a user alias. Nothing executes EL0 here.
+        // The backend retired every user alias before this CPU0 syscall;
+        // no other CPU/DMA retains these pages while they are cleared.
         for page in self.batch.iter() {
             unsafe {
                 core::ptr::write_bytes(self.pointer(page.slot, 0), 0, vm::PAGE_SIZE);
@@ -197,10 +201,14 @@ impl Heap {
         for i in 0..ALLOCATIONS {
             if let Some(a) = self.allocations[i] {
                 self.unmap(a.start, a.pages)
-                    .expect("owned allocation after EL0 revoke");
+                    .expect("owned allocation after user revoke");
             }
         }
         self.owner = None;
+    }
+    #[cfg(all(feature = "ported", target_arch = "x86_64"))]
+    pub fn contains_mapping(&self, address: u64) -> bool {
+        self.vm.validate(address, 1).is_ok() // includes allocated PROT_NONE
     }
     pub fn validate_access(&self, address: u64, len: usize, write: bool) -> Result<(), Errno> {
         self.vm.validate_access(address, len, write)
@@ -223,19 +231,14 @@ impl Heap {
         let rounded = len.checked_add(4095).ok_or(Errno::Inval)? & !4095;
         for fragment in self.vm.fragments(address, rounded)? {
             let i = ((fragment.address - vm::BASE) / 4096) as usize;
-            self.tables[i / 512].0[i % 512] = if protection == 0 {
-                0
-            } else {
-                mmu::encode_user_leaf(
-                    PhysAddr(self.base + fragment.slot as u64 * 4096),
-                    protection & 2 != 0,
-                    false,
-                )
-                .map_err(|_| Errno::Io)?
-            };
+            self.tables[i / 512].set(
+                i % 512,
+                self.base + fragment.slot as u64 * 4096,
+                protection,
+            )?;
         }
-        // Caller is CPU0 after enter() disabled TTBR0 and completed TLBI/DSB;
-        // the next entry publishes the new descriptors before enabling walks.
+        // CPU0 owns the stopped process; the retired backend root has no stale
+        // user alias. The next entry publishes these desired permissions.
         Ok(())
     }
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Errno> {
@@ -273,6 +276,28 @@ impl Heap {
                 );
             }
             done += fragment.len;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn init_pc() -> Result<(), Errno> {
+    if POOL_BASE.load(Ordering::Acquire) != 0 {
+        return Err(Errno::Busy);
+    }
+    let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    POOL_BASE.store(base.0, Ordering::Release);
+    Ok(())
+}
+#[cfg(target_arch = "x86_64")]
+impl Heap {
+    pub fn publish_space(
+        &self,
+        space: &mut crate::address_space::ProcessSpace,
+    ) -> Result<(), Errno> {
+        for (index, table) in self.tables.iter().enumerate() {
+            table.publish(space, vm::BASE + index as u64 * 0x200000)?;
         }
         Ok(())
     }

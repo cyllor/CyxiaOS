@@ -1,4 +1,4 @@
-//! Bounded modern VirtIO-MMIO Ethernet driver (one RX and one TX credit).
+//! Bounded modern VirtIO Ethernet driver (one RX and one TX credit).
 use crate::{Error, Platform, QueueMemory, Transport};
 mod batched;
 pub use batched::BatchedNet;
@@ -14,6 +14,7 @@ struct Ring {
     id: u16,
     pending: bool,
     buffer_pa: u64,
+    notification: crate::transport::Notification,
 }
 
 impl Ring {
@@ -23,11 +24,12 @@ impl Ring {
         index: u32,
         platform: &impl Platform,
     ) -> Result<Self, Error> {
-        t.write(0x30, index);
+        t.select_queue(index)?;
         platform.barrier();
-        if t.read(0x44) != 0 || t.read(0x34) < 8 {
+        if t.queue_enabled() || t.queue_max_size() < 8 {
             return Err(Error::Queue);
         }
+        let notification = t.queue_notification(index)?;
         let size = core::mem::size_of::<QueueMemory>();
         let pa = platform.physical(memory as *mut _ as usize, size)?;
         if !pa.is_multiple_of(4096) || pa.checked_add(size as u64).is_none() {
@@ -40,14 +42,12 @@ impl Ring {
         memory.response.clear();
         memory.avail.put16(0, 1); // Polling, NO_INTERRUPT.
         unsafe { platform.sync(memory as *mut _ as usize, size) };
-        t.write(0x38, 8);
-        t.address(0x80, pa);
-        t.address(0x90, pa + 4096);
-        t.address(0xa0, pa + 8192);
+        t.set_queue_size(8)?;
+        t.set_queue_addresses(pa, pa + 4096, pa + 8192);
         platform.barrier();
-        t.write(0x44, 1);
+        t.enable_queue();
         platform.barrier();
-        if t.read(0x44) != 1 {
+        if !t.queue_enabled() {
             return Err(Error::Queue);
         }
         Ok(Self {
@@ -57,6 +57,7 @@ impl Ring {
             id: 0,
             pending: false,
             buffer_pa: pa + if index == 0 { 16384 } else { 12288 },
+            notification,
         })
     }
 
@@ -172,7 +173,10 @@ impl Net {
             net.fail(platform);
             return Err(e);
         }
-        net.transport.write(0x50, 0);
+        if let Err(error) = net.transport.notify(net.rx.notification) {
+            net.fail(platform);
+            return Err(error);
+        }
         Ok(net)
     }
 
@@ -191,40 +195,40 @@ impl Net {
 
     fn negotiate(t: &mut Transport, p: &impl Platform) -> Result<(), Error> {
         let result = (|| {
-            t.write(0x70, 0);
+            t.set_status(0);
             p.barrier();
             let start = p.now_ms();
-            while t.read(0x70) != 0 {
+            while t.status() != 0 {
                 if p.now_ms().wrapping_sub(start) >= 100 {
                     return Err(Error::Timeout);
                 }
                 core::hint::spin_loop();
             }
-            t.write(0x70, 3);
-            t.write(0x14, 0);
+            t.set_status(3);
+            t.select_device_features(0);
             p.barrier();
-            let low_features = t.read(0x10);
+            let low_features = t.device_features();
             if low_features & 32 == 0 {
                 return Err(Error::Features);
             }
-            t.write(0x14, 1);
+            t.select_device_features(1);
             p.barrier();
-            if t.read(0x10) & 1 == 0 {
+            if t.device_features() & 1 == 0 {
                 return Err(Error::Features);
             }
             // Optional MRG_RXBUF makes modern devices publish num_buffers.
             // Only one MTU-sized RX buffer is posted; multi-buffer packets are
             // still outside this bounded profile and are rejected. No checksum,
             // GSO/control/MQ/event-index/indirect features are accepted.
-            t.write(0x24, 0);
-            t.write(0x20, 32 | (low_features & (1 << 15)));
+            t.select_driver_features(0);
+            t.set_driver_features(32 | (low_features & (1 << 15)));
             p.barrier();
-            t.write(0x24, 1);
-            t.write(0x20, 1);
+            t.select_driver_features(1);
+            t.set_driver_features(1);
             p.barrier();
-            t.write(0x70, 3 | 8);
+            t.set_status(3 | 8);
             p.barrier();
-            if t.read(0x70) & (8 | 64 | 128) != 8 {
+            if t.status() & (8 | 64 | 128) != 8 {
                 return Err(Error::Features);
             }
             Ok(())
@@ -238,15 +242,14 @@ impl Net {
 
     fn read_mac(t: &Transport, p: &impl Platform) -> Result<[u8; 6], Error> {
         for _ in 0..8 {
-            let generation = t.read(0xfc);
+            let generation = t.config_generation();
             p.barrier();
             let mut mac = [0; 6];
             for (i, byte) in mac.iter_mut().enumerate() {
-                // SAFETY: Transport validates a mapped >=0x200-byte resource.
-                *byte = unsafe { core::ptr::read_volatile((t.base + 0x100 + i) as *const u8) };
+                *byte = t.read_config_u8(i)?;
             }
             p.barrier();
-            if generation == t.read(0xfc) {
+            if generation == t.config_generation() {
                 return if mac[0] & 1 == 0 && mac != [0; 6] {
                     Ok(mac)
                 } else {
@@ -267,7 +270,7 @@ impl Net {
         if self.failed {
             return Err(Error::Device);
         }
-        if self.transport.read(0x70) != 15 {
+        if self.transport.status() != 15 {
             self.fail(p);
             return Err(Error::Device);
         }
@@ -285,8 +288,7 @@ impl Net {
             self.fail(p);
         }
         if matches!(result, Ok(Some(_))) {
-            let irq = self.transport.read(0x60);
-            self.transport.write(0x64, irq & 3);
+            self.transport.acknowledge_interrupt();
         }
         result
     }
@@ -313,7 +315,10 @@ impl Net {
             self.tx.memory.request.put8(HEADER + i, *byte);
         }
         self.tx.post(false, HEADER + frame.len(), platform);
-        self.transport.write(0x50, 1);
+        if let Err(error) = self.transport.notify(self.tx.notification) {
+            self.fail(platform);
+            return Err(error);
+        }
         Ok(())
     }
     /// Poll once: true consumes one TX completion and returns its single credit.
@@ -370,7 +375,10 @@ impl Net {
         }
         self.received = None;
         self.rx.post(true, BUFFER, platform);
-        self.transport.write(0x50, 0);
+        if let Err(error) = self.transport.notify(self.rx.notification) {
+            self.fail(platform);
+            return Err(error);
+        }
         Ok(Some(length))
     }
 }

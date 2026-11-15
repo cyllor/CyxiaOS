@@ -20,7 +20,7 @@ pub(super) struct Thread {
     #[cfg(feature = "ported")]
     pub clear_tid: u64,
     // A readiness wake can precede the next dispatch. Keep the interrupted
-    // syscall identity until its rewound SVC actually executes again.
+    // syscall identity until its rewound syscall actually executes again.
     #[cfg(feature = "ported")]
     pub retry_syscall: bool,
     #[cfg(feature = "ported")]
@@ -194,11 +194,11 @@ impl Runner {
     pub(super) fn complete_display(&mut self, tid: u32, success: bool, time: u64) {
         let complete = |thread: &mut Thread| {
             if thread.active && thread.tid == tid && matches!(thread.waiting, Some(Wait::Display)) {
-                thread.context.regs[0] = if success {
+                thread.context.set_result(if success {
                     0
                 } else {
                     (-(Errno::Io as i64)) as u64
-                };
+                });
                 thread.waiting = None;
                 thread.ready_since = time;
                 true
@@ -280,14 +280,15 @@ mod linux_threads {
             if flags & !CLONE_DETACHED != REQUIRED_CLONE_FLAGS {
                 return Err(Errno::Nosys);
             }
-            if stack == 0 || !stack.is_multiple_of(16) {
-                return Err(Errno::Inval);
-            }
-            self.validate(stack, 16, true)?;
+            let stack_bytes = cyxia_posix::linux_abi::validate_clone_stack(
+                crate::process_arch::IMAGE_ABI,
+                stack,
+            )?;
+            self.validate(stack, stack_bytes, true)?;
             self.validate(parent_tid, 4, true)?;
             self.validate(child_tid, 4, true)?;
-            // TPIDR is an opaque userspace value. Its use is checked by the MMU,
-            // exactly like any other user register; it grants no kernel access.
+            // TLS is an opaque user value. The CPU backend validates its range;
+            // later user accesses are checked by the private address space.
             let Some(slot) = self.threads.parked.iter().position(|thread| !thread.active) else {
                 self.status.thread_denials = self.status.thread_denials.saturating_add(1);
                 return Err(Errno::Again);
@@ -308,21 +309,7 @@ mod linux_threads {
                 })
                 .map_err(|_| Errno::Again)?;
             let mut child = Thread::new();
-            let context = &self.thread.context;
-            child.context = Context {
-                regs: context.regs,
-                pc: context.pc,
-                status: context.status,
-                sp: stack,
-                esr: 0,
-                far: 0,
-                kind: 0,
-                tpidr_el0: tls,
-                simd: context.simd,
-                fpcr: context.fpcr,
-                fpsr: context.fpsr,
-            };
-            child.context.regs[0] = 0;
+            child.context = self.thread.context.clone_for_thread(stack, tls)?;
             child.signals.set_mask(self.thread.signals.mask());
             child.clear_tid = child_tid;
             child.tid = tid;
@@ -407,7 +394,7 @@ mod linux_threads {
                     && matches!(thread.waiting, Some(Wait::Futex { address: a, .. }) if a == address)
                 {
                     thread.waiting = None;
-                    thread.context.regs[0] = 0;
+                    thread.context.set_result(0);
                     thread.ready_since = time;
                     woke += 1;
                 }
@@ -515,12 +502,12 @@ mod linux_threads {
         }
         pub(in super::super) fn send_signal(
             &mut self,
-            number: u64,
+            number: cyxia_posix::linux_abi::Call,
             target: u64,
             thread_target: u64,
             signal: u64,
         ) -> Result<u64, Errno> {
-            let (tid, signal) = if number == 131 {
+            let (tid, signal) = if number == cyxia_posix::linux_abi::Call::Tgkill {
                 if target != self.status.pid as u64 {
                     return Err(Errno::Srch);
                 }
@@ -529,7 +516,11 @@ mod linux_threads {
                 (target, thread_target)
             };
             let info = Info {
-                code: if number == 129 { 0 } else { -6 },
+                code: if number == cyxia_posix::linux_abi::Call::Kill {
+                    0
+                } else {
+                    -6
+                },
                 sender_pid: self.status.pid,
                 address: 0,
             };
@@ -537,7 +528,7 @@ mod linux_threads {
             if signal > 64 {
                 return Err(Errno::Inval);
             }
-            if number == 129 {
+            if number == cyxia_posix::linux_abi::Call::Kill {
                 if tid != 0 && tid != self.status.pid as u64 {
                     return Err(Errno::Srch);
                 }

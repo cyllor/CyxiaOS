@@ -19,6 +19,7 @@ from build_sysroot import (ROOT, DEFAULT_OUTPUT, BUILD_TOOLS, Builder, BuildErro
                           validate_packages)
 from build_gtk_foundation import archive_architecture
 import desktop_ports
+from target_profile import profile_for
 
 MANIFEST = ROOT / 'ports/cosmic/xkbcommon-source.json'
 HOST = DEFAULT_OUTPUT / 'xkbcommon-host-tools'
@@ -53,12 +54,12 @@ def build_bison(builder, directory):
     builder.env['CC'] = builder.tools['clang']
     host_build = builder.output / 'xkbcommon-bison-build'
     fresh(host_build)
-    builder.run([str(directory / 'configure'), '--prefix=' + str(HOST), '--disable-nls'],
+    builder.run([str(directory / 'configure'), '--prefix=' + str((builder.output / "xkbcommon-host-tools")), '--disable-nls'],
                 'xkbcommon-bison-setup.log', host_build)
     builder.run([builder.tools['make'], '-j' + str(builder.jobs)],
                 'xkbcommon-bison-build.log', host_build)
     builder.run([builder.tools['make'], 'install'], 'xkbcommon-bison-install.log', host_build)
-    bison = HOST / 'bin/bison'
+    bison = builder.output / "xkbcommon-host-tools" / 'bin/bison'
     version = subprocess.check_output([str(bison), '--version'], env=builder.env,
                                       text=True).splitlines()[0]
     return {'path': str(bison), 'sha256': digest(bison), 'version': version}
@@ -68,7 +69,7 @@ def build_library(builder, source_dir):
     builder.env = clean_env()
     builder.target_environment()
     builder.env.pop('DESTDIR', None)
-    builder.env['PATH'] = os.pathsep.join((str(HOST / 'bin'), str(BUILD_TOOLS / 'bin'),
+    builder.env['PATH'] = os.pathsep.join((str((builder.output / "xkbcommon-host-tools") / 'bin'), str(BUILD_TOOLS / 'bin'),
                                          builder.env.get('PATH', '')))
     target = builder.output / 'sysroot'
     builder.env['PKG_CONFIG'] = str(builder.shell_wrapper('xkbcommon-target-pkg-config',
@@ -79,7 +80,7 @@ def build_library(builder, source_dir):
         'ar = ' + repr(builder.tools['llvm-ar']) + '\n' +
         'strip = ' + repr(builder.tools['llvm-strip']) + '\n' +
         'pkg-config = ' + repr(builder.env['PKG_CONFIG']) + '\n' +
-        "[host_machine]\nsystem = 'linux'\ncpu_family = 'aarch64'\ncpu = 'cortex-a53'\nendian = 'little'\n" +
+        builder.target.meson_machine() +
         '[properties]\nneeds_exe_wrapper = true\nsys_root = ' + repr(str(target)) + '\n' +
         'pkg_config_libdir = ' + repr(builder.env['PKG_CONFIG_LIBDIR'].split(os.pathsep)) + '\n')
     directory = builder.output / 'xkbcommon-target-build'
@@ -104,7 +105,7 @@ def build_library(builder, source_dir):
         builder.run([meson, 'install', '-C', str(directory), '--no-rebuild'], 'xkbcommon-target-install.log')
     finally:
         builder.env.pop('DESTDIR', None)
-    return {'options': options, 'archive': archive_architecture(target / 'usr/lib/libxkbcommon.a')}
+    return {'options': options, 'archive': archive_architecture(target / 'usr/lib/libxkbcommon.a', builder.target)}
 
 
 def link_probe(builder):
@@ -116,10 +117,10 @@ def link_probe(builder):
     builder.run([builder.env['CC'], '-Os', '-ffunction-sections', '-fdata-sections',
                  '-Wall', '-Wextra', '-Werror', '-Wl,--gc-sections',
                  str(path), *flags, '-o', str(temporary)], 'xkbcommon-probe-link.log')
-    layout = inspect_elf(temporary)
+    layout = inspect_elf(temporary, builder.target)
     shutil.copyfile(temporary, builder.output / 'xkbcommon-probe.symbols.elf')
     builder.run([builder.tools['llvm-strip'], '--strip-all', str(temporary)], 'xkbcommon-probe-strip.log')
-    probe = inspect_elf(temporary)
+    probe = inspect_elf(temporary, builder.target)
     temporary.replace(builder.output / 'xkbcommon-probe.elf')
     probe['file'] = str(builder.output / 'xkbcommon-probe.elf')
     return {'probe': probe, 'symbol_image_sha256': layout['sha256'], 'probe_source_sha256': digest(path)}
@@ -131,8 +132,14 @@ def main():
     parser.add_argument('--fetch', action='store_true')
     parser.add_argument('--reuse-host-tools', action='store_true',
                         help='Reuse native Bison only after checking its saved build provenance and binary hash')
+    parser.add_argument('--arch', choices=('aarch64', 'x86_64'), default='aarch64')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
+    selected_target = profile_for(args.arch)
+    output = (args.output or selected_target.default_output(ROOT)).resolve()
+    report_path = output / "xkbcommon-build-report.json"
+    host = output / "xkbcommon-host-tools"
     try:
         package = json.loads(MANIFEST.read_text())
         bison = package['host_tools'][0]
@@ -142,40 +149,40 @@ def main():
         if not 1 <= args.jobs <= 16:
             raise BuildError('--jobs must be in 1..16')
         if args.command == 'inventory':
-            print(json.dumps({'source': package, 'output': str(DEFAULT_OUTPUT),
+            print(json.dumps({'source': package, 'output': str(output),
                               'network': False, 'guest_execution': 'not performed'}, indent=2))
             return 0
-        if shutil.disk_usage(DEFAULT_OUTPUT).free < 512 * 1024 * 1024:
+        if shutil.disk_usage(output).free < 512 * 1024 * 1024:
             raise BuildError('At least 512 MiB free disk required')
-        for path in (DEFAULT_OUTPUT / 'sysroot/usr/lib/libc.a', BUILD_TOOLS / 'bin/meson'):
+        for path in (output / 'sysroot/usr/lib/libc.a', BUILD_TOOLS / 'bin/meson'):
             if not path.is_file():
                 raise BuildError('Missing prerequisite: ' + str(path))
-        with (DEFAULT_OUTPUT / '.build.lock').open('w') as lock:
+        with (output / '.build.lock').open('w') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise BuildError('Another sysroot build is active') from error
             reused_bison = None
             if args.reuse_host_tools:
-                previous = json.loads(REPORT.read_text())
+                previous = json.loads(report_path.read_text())
                 native = previous['native_bison']
                 if (previous['manifest_sha256'] != digest(MANIFEST)
                         or previous['sources'][1]['source']['sha256'] != bison['expected_sha256']
                         or native['version'] != 'bison (GNU Bison) 3.8.2'
-                        or native['sha256'] != digest(HOST / 'bin/bison')):
+                        or native['sha256'] != digest(host / 'bin/bison')):
                     raise BuildError('Native Bison provenance or binary changed; rebuild without --reuse-host-tools')
-                saved = HOST / 'bison-build-provenance.json'
+                saved = host / 'bison-build-provenance.json'
                 # Keep the original host build record when subsequent target
                 # builds reuse it, rather than overwriting its provenance chain.
                 if 'provenance_sha256' in native:
                     if native['provenance_sha256'] != digest(saved):
                         raise BuildError('Original native Bison build record changed')
                 else:
-                    shutil.copyfile(REPORT, saved)
+                    shutil.copyfile(report_path, saved)
                 reused_bison = {**native, 'reused': True, 'provenance_sha256': digest(saved)}
-            REPORT.unlink(missing_ok=True)
-            builder = Builder(DEFAULT_OUTPUT, toolchain(), args.jobs)
-            report = {'status': 'building', 'manifest_sha256': digest(MANIFEST),
+            report_path.unlink(missing_ok=True)
+            builder = Builder(output, toolchain(), args.jobs, selected_target)
+            report = {'status': 'building', 'architecture': selected_target.architecture, 'target_triple': selected_target.rust_target, 'manifest_sha256': digest(MANIFEST),
                       'builder_sha256': digest(Path(__file__)), 'toolchain': builder.tools,
                       'commands': builder.commands, 'guest_execution': 'not performed',
                       'scope': 'static core keymap/state library; embedded fixture, not full desktop layouts'}
@@ -186,14 +193,14 @@ def main():
                 report['native_bison'] = reused_bison or build_bison(builder, bison_source)
                 report['target'] = build_library(builder, xkb_source)
                 report.update(link_probe(builder))
-                report['target_libc_sha256'] = digest(DEFAULT_OUTPUT / 'sysroot/usr/lib/libc.a')
+                report['target_libc_sha256'] = digest(output / 'sysroot/usr/lib/libc.a')
                 report['status'] = 'cross-built'
             except Exception as error:
                 report['status'], report['error'] = 'failed', str(error)
                 raise
             finally:
-                REPORT.write_text(json.dumps(report, indent=2) + '\n')
-        print(json.dumps({'status': report['status'], 'report': str(REPORT),
+                report_path.write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps({'status': report['status'], 'report': str(report_path),
                           'probe': report['probe'], 'guest_execution': 'not performed'}, indent=2))
         return 0
     except (BuildError, desktop_ports.PortError, OSError, ValueError, subprocess.SubprocessError) as error:

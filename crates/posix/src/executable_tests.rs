@@ -78,6 +78,35 @@ fn load_plan_maps_text_data_and_zero_fill_without_copying() {
 }
 
 #[test]
+fn x86_plan_requires_explicit_isa_and_accepts_byte_aligned_entry() {
+    use crate::ImageAbi;
+    let mut bytes = image();
+    put16(&mut bytes, 18, 62);
+    put64(&mut bytes, 24, IMAGE_BASE + 2047);
+    assert!(parse(&bytes).is_err());
+    let plan = parse_for(&bytes, ImageAbi::X86_64).unwrap();
+    assert_eq!(plan.abi, ImageAbi::X86_64);
+    assert_eq!(plan.entry, IMAGE_BASE + 2047);
+    assert!(parse_for(&bytes, ImageAbi::Aarch64).is_err());
+    put32(&mut bytes, 64 + 4, 7);
+    assert!(matches!(parse_for(&bytes, ImageAbi::X86_64), Err(Error::Permissions)));
+}
+
+#[test]
+fn x86_initial_stack_preserves_sysv_alignment_and_real_entry() {
+    use crate::ImageAbi;
+    let mut bytes = [0u8; 4096];
+    let mut cfg = config();
+    cfg.entry += 1;
+    assert!(build_stack(&mut bytes, 0x0300_0000, &[b"app"], &[], &cfg).is_err());
+    let stack = build_stack_for(&mut bytes, 0x0300_0000, &[b"app"], &[], &cfg,
+        b"/bin/app", ImageAbi::X86_64).unwrap();
+    assert_eq!(stack.sp % 16, 0);
+    let offset = (stack.sp - 0x0300_0000) as usize;
+    assert_eq!(u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()), 1);
+}
+
+#[test]
 fn unwind_header_is_metadata_but_must_describe_real_file_bytes() {
     let mut bytes = image();
     put16(&mut bytes, 56, 3);

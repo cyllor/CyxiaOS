@@ -551,7 +551,7 @@ impl Driver {
             package_hash: package,
             cpu_milli: 100,
             memory_pages: 16,
-            isa: 183,
+            isa: cyxia_prototype_cluster::calls::ELF_MACHINE,
             abi: 1,
             peer: Some(node_key(self.engine.peer)),
         };
@@ -784,7 +784,7 @@ impl Driver {
                 }
                 let wire = QuoteWire {
                     status: 0,
-                    isa: 183,
+                    isa: cyxia_prototype_cluster::calls::ELF_MACHINE,
                     abi: 1,
                     node: self.driver.engine.local,
                     owner_boot: self.driver.engine.boot,
@@ -843,7 +843,7 @@ impl Driver {
             Err(error) => {
                 let negative = QuoteWire {
                     status: if error == DomainError::Capacity { 2 } else { 1 },
-                    isa: 183,
+                    isa: cyxia_prototype_cluster::calls::ELF_MACHINE,
                     abi: 1,
                     node: self.engine.local,
                     owner_boot: self.engine.boot,

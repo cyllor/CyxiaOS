@@ -179,7 +179,7 @@ mod clock;
     feature = "unified-runtime",
     all(feature = "ported", not(feature = "selftest"))
 ))]
-#[path = "../platform/virt/entropy.rs"]
+#[path = "../desktop/entropy.rs"]
 mod entropy;
 #[cfg(all(feature = "ported", not(feature = "selftest")))]
 #[path = "../desktop/memory/exec_memory.rs"]
@@ -202,6 +202,12 @@ mod storage;
 #[cfg(not(feature = "selftest"))]
 #[path = "../desktop/user.rs"]
 mod user;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/process_arch.rs"]
+mod process_arch;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/address_space.rs"]
+mod address_space;
 #[cfg(not(feature = "selftest"))]
 #[path = "../desktop/memory/user_heap.rs"]
 mod user_heap;

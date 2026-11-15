@@ -1,5 +1,7 @@
 #![no_std]
 extern crate alloc;
+#[path = "../../shared/calls.rs"]
+pub mod calls;
 pub mod abi;
 pub mod application;
 pub mod application_journal;

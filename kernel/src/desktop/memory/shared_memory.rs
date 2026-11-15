@@ -2,7 +2,9 @@
 //! OFD and mapping lifetimes independently keep the object alive.
 use crate::user::ai::{self, Domain};
 use cyxia_ai_runtime::accounting::Attempt;
-use cyxia_contracts::{BootInfo, PageCount, RedemptionId};
+#[cfg(target_arch = "aarch64")]
+use cyxia_contracts::BootInfo;
+use cyxia_contracts::{PageCount, RedemptionId};
 use cyxia_kernel_core::grants::{
     AuthorizedGrantRequest, BoundedGrantLedger, Owner, ReleaseReceipt,
 };
@@ -39,7 +41,7 @@ impl Store {
     fn release_batch(&mut self) -> Result<(), Errno> {
         for slot in self.batch.iter() {
             // All mapping references are gone, or shrink proved none existed.
-            // CPU0 returned from EL0 with TTBR0 disabled and global TLBI complete.
+            // CPU0 retired every process mapping/TLB before this owner runs.
             unsafe {
                 core::ptr::write_bytes(self.pointer(slot, 0), 0, PAGE_SIZE);
             }
@@ -129,6 +131,7 @@ fn with<T>(f: impl FnOnce(&mut Store) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: only serialized CPU0 foreground calls; IRQ/DMA never access this store.
     f(unsafe { &mut *core::ptr::addr_of_mut!(STORE) })
 }
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     #[cfg(feature = "large-memory")]
     {
@@ -352,4 +355,23 @@ pub fn status(out: &mut impl core::fmt::Write) {
             ledger.free,ledger.reserved_unredeemed,ledger.in_use,metadata::OBJECTS,metadata::PAGES).unwrap();
         Ok(())
     });
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn init_pc() -> Result<(), Errno> {
+    #[cfg(feature = "large-memory")]
+    {
+        let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+        with(|store| {
+            if store.base != 0 {
+                return Err(Errno::Busy);
+            }
+            store.base = base.0;
+            Ok(())
+        })
+    }
+    #[cfg(not(feature = "large-memory"))]
+    {
+        Err(Errno::Nodev)
+    }
 }

@@ -24,6 +24,17 @@ def successful_probe_log():
 
 
 class MesaPortTests(unittest.TestCase):
+    def test_native_profile_keeps_renderer_and_compute_without_x11_platform(self):
+        options = build.options_for('native-surfaceless')
+        self.assertIn('-Dplatforms=', options)
+        self.assertIn('-Degl-native-platform=surfaceless', options)
+        self.assertIn('-Dgallium-drivers=softpipe', options)
+        self.assertIn('-Dgles2=enabled', options)
+        self.assertIn('-Dcyxia-compute-oom=true', options)
+        self.assertIn('-Dplatforms=x11', build.options_for('x11'))
+        with self.assertRaises(build.BuildError):
+            build.options_for('unknown')
+
     def test_missing_failed_duplicate_and_interleaved_checks_cannot_pass(self):
         baseline = successful_probe_log()
         self.assertTrue(verify_egl.validate_offscreen(baseline))

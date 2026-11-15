@@ -1,4 +1,4 @@
-//! Strict static AArch64 ELF loader. No interpreter, relocations, W+X or arbitrary mapping.
+//! Strict static native ELF loader. No interpreter, relocations, W+X or arbitrary mapping.
 use crate::{
     Errno,
     usermem::{Arena, BASE, CODE_BYTES, DATA_BYTES},
@@ -35,9 +35,13 @@ struct Segment {
     size: usize,
 }
 pub fn load(elf: &[u8], arena: &mut Arena) -> Result<u64, Errno> {
+    load_for(elf, arena, crate::ImageAbi::Aarch64)
+}
+
+pub fn load_for(elf: &[u8], arena: &mut Arena, abi: crate::ImageAbi) -> Result<u64, Errno> {
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01")
         || u16_at(elf, 16)? != 2
-        || u16_at(elf, 18)? != 183
+        || u16_at(elf, 18)? != abi.machine()
         || u32_at(elf, 20)? != 1
         || u16_at(elf, 52)? != 64
         || u16_at(elf, 54)? != 56
@@ -89,7 +93,7 @@ pub fn load(elf: &[u8], arena: &mut Arena) -> Result<u64, Errno> {
         });
     }
     let code = segments[0].ok_or(Errno::Inval)?;
-    if !entry.is_multiple_of(4) || entry < code.va || entry >= code.va + code.files as u64 {
+    if !entry.is_multiple_of(abi.entry_alignment()) || entry < code.va || entry >= code.va + code.files as u64 {
         return Err(Errno::Inval);
     }
     arena.clear();

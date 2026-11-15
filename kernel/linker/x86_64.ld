@@ -14,6 +14,10 @@ SECTIONS {
  .boot : { KEEP(*(.boot)) } :text
  ASSERT(SIZEOF(.boot) <= 8192, "Multiboot header must fit the initial image window")
  .text : { *(.text .text.*) . = ALIGN(4096); } :text
+ .ap_trampoline : {
+   KEEP(*(.ap_trampoline))
+   . = ALIGN(4096);
+ } :text
  __text_end = .;
  __user_text_start = .;
  .user.text : { KEEP(*(.user.text)) . = ALIGN(4096); } :user
@@ -42,7 +46,14 @@ SECTIONS {
    __stack_top = .;
  } :data
  /* A CPL3 interrupt must never overwrite the suspended kernel call stack. */
- .trap_stack (NOLOAD) : { . += 32768; __trap_stack_top = .; } :data
+ .trap_stack (NOLOAD) : {
+   __trap_stack_guard = .; . += 4096;
+   . += 32768; __trap_stack_top = .;
+ } :data
+ .df_stack (NOLOAD) : {
+   __df_stack_guard = .; . += 4096;
+   . += 16384; __df_stack_top = .;
+ } :data
  .user_stack (NOLOAD) : {
    __user_stack_start = .;
    . += 16384;

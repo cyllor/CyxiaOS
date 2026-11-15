@@ -3,8 +3,10 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
+# include <X11/Xlib.h>
+# include <X11/Xutil.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -414,13 +416,19 @@ done:
 
 int main(int argc, char **argv)
 {
+#ifdef CYXIA_EGL_SURFACELESS_ONLY
+    const int x11 = 0;
+#else
     const int x11 = argc == 2 && strcmp(argv[1], "x11") == 0;
+#endif
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface surface = EGL_NO_SURFACE;
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
     Display *xdisplay = NULL;
     Window window = 0;
     Colormap colormap = 0;
+#endif
     GLuint program = 0, vertex = 0, fragment = 0, vao = 0, vbo = 0, texture = 0, fbo = 0;
     EGLConfig config;
     EGLint count = 0, major = 0, minor = 0;
@@ -431,19 +439,26 @@ int main(int argc, char **argv)
     const EGLint pbuffer_attributes[] = {EGL_WIDTH, SIDE, EGL_HEIGHT, SIDE, EGL_NONE};
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 2 || (argc == 2 && !x11 && strcmp(argv[1], "offscreen") != 0)) {
+#ifdef CYXIA_EGL_SURFACELESS_ONLY
+        puts("EGL_PROBE FAIL usage=egl-probe_offscreen");
+#else
         puts("EGL_PROBE FAIL usage=egl-probe_[offscreen|x11]");
+#endif
         return 2;
     }
     setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
     setenv("GALLIUM_DRIVER", "softpipe", 1);
     setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
     printf("EGL_PROBE START mode=%s\n", x11 ? "x11" : "offscreen");
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
     if (x11) {
         xdisplay = XOpenDisplay(NULL);
         if (!check(xdisplay != NULL, "x11-open"))
             goto done;
         display = eglGetDisplay((EGLNativeDisplayType)xdisplay);
-    } else {
+    } else
+#endif
+    {
         PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform =
             (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
         if (!check(get_platform != NULL, "platform-proc"))
@@ -459,6 +474,7 @@ int main(int argc, char **argv)
     context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
     if (!check(context != EGL_NO_CONTEXT, "gles3-context"))
         goto done;
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
     if (x11) {
         EGLint visual_id;
         XVisualInfo query, *visual;
@@ -484,7 +500,9 @@ int main(int argc, char **argv)
         XMapWindow(xdisplay, window);
         XSync(xdisplay, False);
         surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)window, NULL);
-    } else {
+    } else
+#endif
+    {
         surface = eglCreatePbufferSurface(display, config, pbuffer_attributes);
     }
     if (!check(surface != EGL_NO_SURFACE, "egl-surface") ||
@@ -549,12 +567,14 @@ int main(int argc, char **argv)
     if (!check(pixels_match(), "surface-exact-4096-pixels") ||
         !check(eglSwapBuffers(display, surface), "swap"))
         goto done;
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
     if (x11) {
         XSync(xdisplay, False);
         puts("EGL_PROBE PRESENT window=Cyxia_Mesa_EGL_Probe hold_seconds=5");
         const struct timespec delay = {.tv_sec = 5, .tv_nsec = 0};
         nanosleep(&delay, NULL);
     }
+#endif
 done:
     if (context != EGL_NO_CONTEXT && eglGetCurrentContext() == context) {
         glDeleteFramebuffers(1, &fbo);
@@ -569,9 +589,11 @@ done:
     if (surface != EGL_NO_SURFACE) check(eglDestroySurface(display, surface), "destroy-surface");
     if (context != EGL_NO_CONTEXT) check(eglDestroyContext(display, context), "destroy-context");
     if (display != EGL_NO_DISPLAY) check(eglTerminate(display), "terminate");
+#ifndef CYXIA_EGL_SURFACELESS_ONLY
     if (window) XDestroyWindow(xdisplay, window);
     if (colormap) XFreeColormap(xdisplay, colormap);
     if (xdisplay) XCloseDisplay(xdisplay);
+#endif
     printf("EGL_PROBE RESULT %s mode=%s failures=%d\n", failures ? "FAIL" : "PASS", x11 ? "x11" : "offscreen", failures);
     return failures ? 1 : 0;
 }

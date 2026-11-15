@@ -5,13 +5,12 @@ mod file;
 #[cfg(storage_fault_probe)]
 mod storage_fault;
 
+#[path = "../shared/calls.rs"]
+mod calls;
+
 #[inline(never)]
 fn call(operation: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> [u64; 4] {
-    let (mut x0, mut x1, mut x2, mut x3) = (a, b, c, d);
-    unsafe {
-        core::arch::asm!("svc #0x45",inlateout("x0")x0,inlateout("x1")x1,inlateout("x2")x2,inlateout("x3")x3,inlateout("x4")e=>_,in("x8")operation,options(nostack));
-    }
-    [x0, x1, x2, x3]
+    unsafe { calls::call::<0x45>([a, b, c, d, e], operation) }
 }
 fn finish(code: u64) -> ! {
     let _ = call(1, code, 0, 0, 0, 0);

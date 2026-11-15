@@ -8,6 +8,10 @@ edition = "2024"
 [dependencies]
 cyxia-prototype = { path = "../../crates/prototype" }
 
+# The isolated RX/RO image cannot carry a writable CPU-detection cache.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
+
 [[bin]]
 name = "prototype-governance"
 path = "main.rs"

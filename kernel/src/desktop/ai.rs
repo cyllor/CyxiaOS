@@ -6,11 +6,16 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
     if !shell.take_system_request() {
         return;
     }
+    #[cfg(target_arch = "aarch64")]
     let _ = writeln!(
         out,
         "\r\nAI_SYSTEM schema=1 architecture=aarch64 cpus=1 ram_mib={} models=local_integer full_contract=false\r",
         cyxia_platform_virt::RAM_MIB
     );
+    #[cfg(target_arch = "x86_64")]
+    let _ = writeln!(out,
+        "\r\nAI_SYSTEM schema=1 architecture=x86_64 cpus={} ram_bytes={} models=local_integer full_contract=false\r",
+        crate::machine::runtime::online_cpus().count_ones(), crate::os::memory_bytes());
     let _ = shell.ai_status(out);
     super::user::ai_status(out);
     super::storage::ai_status(out);
@@ -26,9 +31,13 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
         out,
         "AI_DOMAIN name=security policy=SAFETY_GUARD purpose=permissions_ownership_wx\r"
     );
+    #[cfg(target_arch = "aarch64")]
     let _ = writeln!(
         out,
         "AI_GAPS coordinator=absent network=absent smp=absent cross_platform=unverified global_learning=absent durable_model_state=absent\r"
     );
+    #[cfg(target_arch = "x86_64")]
+    let _ = writeln!(out,
+        "AI_GAPS coordinator=absent network=absent smp=independent_processes services=cpu0_serial execution_billing=unconnected global_learning=absent durable_model_state=absent\r");
     let _ = writeln!(out, "AI_SYSTEM_END\r");
 }

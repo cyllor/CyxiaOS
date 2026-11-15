@@ -28,6 +28,8 @@ extern "C" fn x86_boot_entry(magic: u32, info_address: u32) -> ! {
     )
     .expect("boot memory map");
     log(b"X86_BOOT_OK");
+    #[cfg(feature = "smp-selftest")]
+    let topology = unsafe { super::smp::prepare(&info, address, map_address, map_len) };
 
     let layout = arch::paging::Layout {
         text_start: core::ptr::addr_of!(__text_start) as u64,
@@ -42,8 +44,28 @@ extern "C" fn x86_boot_entry(magic: u32, info_address: u32) -> ! {
         guard_end: core::ptr::addr_of!(__stack_guard_end) as u64,
     };
     unsafe {
-        arch::interrupts::init(core::ptr::addr_of!(__trap_stack_top) as u64);
+        arch::interrupts::init_cpu(
+            0,
+            core::ptr::addr_of!(__trap_stack_top) as u64,
+            core::ptr::addr_of!(__df_stack_top) as u64,
+        );
+        #[cfg(not(feature = "smp-selftest"))]
         arch::paging::install(layout, pc::MAX_PHYSICAL_MEMORY).expect("paging layout");
+        #[cfg(feature = "smp-selftest")]
+        {
+            let guards = super::smp::guards();
+            arch::paging::install_smp(
+                layout,
+                pc::MAX_PHYSICAL_MEMORY,
+                arch::paging::SmpLayout {
+                    trampoline: arch::ap_boot::TRAMPOLINE_PHYSICAL,
+                    mailbox: arch::ap_boot::MAILBOX_PHYSICAL,
+                    lapic: topology.lapic_base,
+                    guards: &guards,
+                },
+            )
+            .expect("SMP paging layout");
+        }
     }
     assert_ne!(
         arch::cpu::read_cr0() & (1 << 16),
@@ -104,6 +126,8 @@ extern "C" fn x86_boot_entry(magic: u32, info_address: u32) -> ! {
     assert_eq!(result, 14, "user supervisor isolation");
     assert_eq!(USER_FAULTS.load(Ordering::Acquire), 1);
     log(b"USER_MODE_OK");
+    #[cfg(feature = "smp-selftest")]
+    super::smp::run(topology);
     log(b"X86_SELFTEST_OK");
     if cfg!(feature = "selftest") {
         exit(true);

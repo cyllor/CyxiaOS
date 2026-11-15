@@ -1,16 +1,13 @@
 //! Per-process virtual aliases of the independent shared backing pool.
 use super::ai::{self, Domain};
 use super::{Errno, Runner};
+use crate::address_space::PageTable as Table;
 use cyxia_ai_runtime::accounting::Attempt;
-use cyxia_arch_aarch64::mmu;
-use cyxia_contracts::PhysAddr;
 pub(super) use cyxia_posix::shared_memory::{BASE, END};
 use cyxia_posix::{
     FileInfo,
     shared_memory::{Mapping, Maps, PAGE_SIZE, PAGES},
 };
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
 pub(super) struct SharedMappings {
     maps: Maps,
     tables: [Table; PAGES / 512],
@@ -19,9 +16,10 @@ impl SharedMappings {
     pub const fn new() -> Self {
         Self {
             maps: Maps::new(),
-            tables: [const { Table([0; 512]) }; PAGES / 512],
+            tables: [const { Table::empty() }; PAGES / 512],
         }
     }
+    #[cfg(target_arch = "aarch64")]
     pub fn roots(&self) -> [(usize, u64); PAGES / 512] {
         core::array::from_fn(|i| {
             (
@@ -31,17 +29,16 @@ impl SharedMappings {
         })
     }
     fn publish(&mut self, m: Mapping) -> Result<(), Errno> {
-        // All slots and addresses are already proved by hold_mapping. No EL0
+        // All slots and addresses are already proved by hold_mapping. No user
         // execution occurs between validation and PTE publication.
         for page in 0..m.pages() {
             let i = ((m.start - BASE) / PAGE_SIZE as u64) as usize + page;
-            self.tables[i / 512].0[i % 512] = if m.protection == 0 {
-                0
+            if m.protection == 0 {
+                self.tables[i / 512].remove(i % 512);
             } else {
                 let pa = crate::shared_memory::physical(m.handle, m.offset / PAGE_SIZE + page)?;
-                mmu::encode_user_leaf(PhysAddr(pa), m.protection & 2 != 0, false)
-                    .map_err(|_| Errno::Io)?
-            };
+                self.tables[i / 512].set(i % 512, pa, m.protection)?;
+            }
         }
         Ok(())
     }
@@ -84,9 +81,9 @@ impl SharedMappings {
         let m = self.maps.whole(address, pages)?;
         for page in 0..m.pages() {
             let i = ((m.start - BASE) / PAGE_SIZE as u64) as usize + page;
-            self.tables[i / 512].0[i % 512] = 0;
+            self.tables[i / 512].remove(i % 512);
         }
-        // CPU0 has disabled TTBR0 and completed a global TLBI on EL0 return.
+        // CPU0 retired every active user root/TLB before this owner runs.
         // Revoke first; another process's alias retains its mapping reference.
         self.maps.remove(address, pages)?;
         crate::shared_memory::drop_mapping(m.handle, m.may_write)?;
@@ -102,6 +99,12 @@ impl SharedMappings {
             self.unmap(m.start, m.pages())
                 .expect("owned shared mapping after revoke");
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub fn contains_mapping(&self, address: u64) -> bool {
+        self.maps
+            .iter()
+            .any(|m| address >= m.start && address < m.start + (m.pages() * PAGE_SIZE) as u64)
     }
     pub fn validate(&self, address: u64, len: usize, write: bool) -> Result<(), Errno> {
         self.maps.access(address, len, write).map(|_| ())
@@ -318,7 +321,7 @@ impl Runner {
         let pages = len.div_ceil(PAGE_SIZE);
         let address = self.heap.allocate(pages)?;
         let result = (|| {
-            // CPU0 is serialized and EL0 remains stopped. The validated OFD
+            // CPU0 is serialized and user execution remains stopped. The validated OFD
             // retains immutable backing until this syscall completes. Copy in
             // bounded chunks without a page-sized exception-stack allocation.
             let mut bytes = [0; 256];
@@ -352,5 +355,18 @@ impl Runner {
         protection: u8,
     ) -> Result<(), Errno> {
         self.shared.protect(address, len, protection)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SharedMappings {
+    pub fn publish_space(
+        &self,
+        space: &mut crate::address_space::ProcessSpace,
+    ) -> Result<(), Errno> {
+        for (index, table) in self.tables.iter().enumerate() {
+            table.publish(space, BASE + index as u64 * 0x200000)?;
+        }
+        Ok(())
     }
 }

@@ -1,7 +1,8 @@
-//! Initial Linux AArch64 syscall personality for explicitly selected static ELF.
-//! Native SVC numbers remain a separate personality. Unsupported calls fail;
+//! Shared Linux syscall policy for admitted ARM64/x86-64 static ELF.
+//! Native OS calls remain a separate personality. Unsupported calls fail;
 //! successful musl probes do not imply general Linux binary compatibility.
 use super::{Errno, FileSystem, GrantLedger, LocalIpc, Output, Runner, UserState, count, fd};
+use cyxia_posix::linux_abi::Call;
 #[cfg(feature = "graphics")]
 static mut DRAW: [u32; 16384] = [0; 16384];
 
@@ -55,6 +56,10 @@ impl Runner {
         self.process.stat_resolved(fs, path)
     }
     fn copy_stat(&mut self, address: u64, info: cyxia_posix::FileInfo) -> Result<u64, Errno> {
+        if crate::process_arch::IMAGE_ABI == cyxia_posix::ImageAbi::X86_64 {
+            self.copy_to(address, &cyxia_posix::linux_abi::stat_x86_64(info))?;
+            return Ok(0);
+        }
         let mut bytes = [0u8; 128];
         bytes[..8].copy_from_slice(&1u64.to_le_bytes()); // Single RAM/rootfs device.
         bytes[8..16].copy_from_slice(&info.inode.to_le_bytes());
@@ -436,8 +441,7 @@ impl Runner {
         {
             let identity = self.process.description_identity(descriptor)?;
             let socket = self.process.socket(descriptor)?;
-            let pc = self.thread.context.pc.checked_sub(4).ok_or(Errno::Fault)?;
-            self.thread.context.pc = pc;
+            self.thread.context.restart_syscall()?;
             self.thread.retry_syscall = true;
             self.thread.retry_descriptor = Some((descriptor, identity));
             let wait = if let Some(raw) = socket {
@@ -455,7 +459,7 @@ impl Runner {
                 super::Wait::Retry(super::now().saturating_add(1))
             };
             self.block(wait);
-            return Ok(original_a); // Retry the identical SVC after identity validation.
+            return Ok(original_a); // Retry the identical syscall after identity validation.
         }
         self.thread.retry_syscall = false;
         self.thread.retry_descriptor = None;
@@ -467,32 +471,51 @@ impl Runner {
         ledger: &mut GrantLedger,
         ipc: &mut LocalIpc,
     ) -> Result<u64, Errno> {
-        let [a, b, c, d, e, f] = core::array::from_fn(|i| self.thread.context.regs[i]);
+        let invocation = cyxia_posix::linux_abi::decode(
+            crate::process_arch::IMAGE_ABI,
+            self.thread.context.syscall_number(),
+            self.thread.context.arguments(),
+        )?;
+        let call = invocation.call;
+        let [a, b, c, d, e, f] = invocation.args;
         let mut bytes = [0u8; 1024];
-        match self.thread.context.regs[8] {
-            20 => self
+        match call {
+            Call::ArchPrctl => match a {
+                0x1002 => {
+                    self.thread.context.set_tls(b)?;
+                    Ok(0)
+                }
+                0x1003 => {
+                    self.copy_to(b, &self.thread.context.tls().to_le_bytes())?;
+                    Ok(0)
+                }
+                _ => Err(Errno::Inval),
+            },
+            Call::EpollCreate1 => self
                 .process
                 .epoll_create(u32::try_from(a).map_err(|_| Errno::Inval)?)
                 .map(|fd| fd as u64),
-            21 => self.epoll_control(a, b, c, d),
-            22 => self.epoll_wait(a, b, c, d, e, f),
-            85 => self
+            Call::EpollCtl => self.epoll_control(a, b, c, d),
+            Call::EpollPwait => self.epoll_wait(a, b, c, d, e, f),
+            Call::TimerfdCreate => self
                 .process
                 .timerfd_create(a as i32, u32::try_from(b).map_err(|_| Errno::Inval)?)
                 .map(|fd| fd as u64),
-            86 => self.timerfd_settime(a, b, c, d),
-            87 => self.timerfd_gettime(a, b),
-            211 | 212 => self.socket_message(fs, a, b, c, self.thread.context.regs[8] == 211),
-            0x43595810 => self.request_spawn(a),
-            0x43595820 => super::super::storage::start_checkpoint(fs),
-            0x43595821 => super::super::storage::checkpoint_complete(a),
-            260 => self.request_wait(a, b, c, d),
-            173 => Ok(self.status.parent_pid as u64),
-            19 => self
+            Call::TimerfdSettime => self.timerfd_settime(a, b, c, d),
+            Call::TimerfdGettime => self.timerfd_gettime(a, b),
+            Call::Sendmsg | Call::Recvmsg => {
+                self.socket_message(fs, a, b, c, call == Call::Sendmsg)
+            }
+            Call::Spawn => self.request_spawn(a),
+            Call::CheckpointStart => super::super::storage::start_checkpoint(fs),
+            Call::CheckpointPoll => super::super::storage::checkpoint_complete(a),
+            Call::Wait4 => self.request_wait(a, b, c, d),
+            Call::Getppid => Ok(self.status.parent_pid as u64),
+            Call::Eventfd2 => self
                 .process
                 .eventfd(a as u32, u32::try_from(b).map_err(|_| Errno::Inval)?)
                 .map(|v| v as u64),
-            59 => {
+            Call::Pipe2 => {
                 let flags = u32::try_from(b).map_err(|_| Errno::Inval)?;
                 if flags & !(cyxia_posix::O_NONBLOCK | cyxia_posix::O_CLOEXEC) != 0 {
                     return Err(Errno::Inval);
@@ -518,7 +541,7 @@ impl Runner {
                 self.copy_to(a, &bytes[..8])?;
                 Ok(0)
             }
-            61 => {
+            Call::Getdents64 => {
                 let size = count(c)?.min(bytes.len());
                 self.validate(b, size, true)?;
                 let n = self
@@ -527,14 +550,14 @@ impl Runner {
                 self.copy_to(b, &bytes[..n])?;
                 Ok(n as u64)
             }
-            17 => {
+            Call::Getcwd => {
                 let capacity = count(b)?.min(bytes.len());
                 self.validate(a, capacity, true)?;
                 let n = self.process.getcwd(&mut bytes[..capacity])?;
                 self.copy_to(a, &bytes[..n])?;
                 Ok(n as u64)
             }
-            49 => {
+            Call::Chdir => {
                 let mut path = [0u8; 96];
                 let n = self.path(a, &mut path)?;
                 self.process.chdir(
@@ -543,18 +566,18 @@ impl Runner {
                 )?;
                 Ok(0)
             }
-            98 => self.futex(a, b, c, d, e, self.thread.context.regs[5]),
-            220 => self.clone_thread(a, b, c, d, e),
-            38 => self.rename_at(fs, a as i32, b, c as i32, d, 0),
-            276 => self.rename_at(fs, a as i32, b, c as i32, d, e),
-            160 => {
+            Call::Futex => self.futex(a, b, c, d, e, f),
+            Call::Clone => self.clone_thread(a, b, c, d, e),
+            Call::Renameat => self.rename_at(fs, a as i32, b, c as i32, d, 0),
+            Call::Renameat2 => self.rename_at(fs, a as i32, b, c as i32, d, e),
+            Call::Uname => {
                 let mut fields = [0u8; 390];
                 for (field, value) in fields.chunks_exact_mut(65).zip([
                     "CyxiaOS",
                     "cyxia",
                     "0.1",
-                    "native ARM kernel",
-                    "aarch64",
+                    crate::process_arch::KERNEL_DESCRIPTION,
+                    crate::process_arch::MACHINE,
                     "",
                 ]) {
                     field[..value.len()].copy_from_slice(value.as_bytes());
@@ -562,9 +585,9 @@ impl Runner {
                 self.copy_to(a, &fields)?;
                 Ok(0)
             }
-            166 => Ok(self.process.umask(a as u16) as u64),
-            52 => self.process.fchmod(fs, fd(a)?, b as u16).map(|_| 0),
-            53 => {
+            Call::Umask => Ok(self.process.umask(a as u16) as u64),
+            Call::Fchmod => self.process.fchmod(fs, fd(a)?, b as u16).map(|_| 0),
+            Call::Fchmodat => {
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
@@ -574,7 +597,7 @@ impl Runner {
                 self.process.chmod(fs, path, c as u16)?;
                 Ok(0)
             }
-            204 | 205 => {
+            Call::Getsockname | Call::Getpeername => {
                 let handle = self.socket_handle(fd(a)?)?;
                 let capacity = self.socket_address_capacity(b, c)?;
                 self.copy_socket_address(
@@ -583,11 +606,11 @@ impl Runner {
                     capacity,
                     handle,
                     self.process.backend_owner(fd(a)?)?,
-                    self.thread.context.regs[8] == 205,
+                    call == Call::Getpeername,
                 )?;
                 Ok(0)
             }
-            209 => {
+            Call::Getsockopt => {
                 let handle = self.socket_handle(fd(a)?)?;
                 if b != 1 {
                     return Err(Errno::Nosys);
@@ -627,13 +650,13 @@ impl Runner {
                 self.copy_to(e, &(size as u32).to_le_bytes())?;
                 Ok(0)
             }
-            210 => {
+            Call::Shutdown => {
                 let handle = self.socket_handle(fd(a)?)?;
                 let owner = self.process.backend_owner(fd(a)?)?;
                 super::unix::shutdown(fs, owner, handle, b)?;
                 Ok(0)
             }
-            208 => {
+            Call::Setsockopt => {
                 self.socket_handle(fd(a)?)?;
                 // SO_REUSEADDR has no effect on pathname AF_UNIX sockets.
                 if b != 1 || c != 2 || e != 4 {
@@ -642,7 +665,7 @@ impl Runner {
                 self.copy_from(d, &mut bytes[..4])?;
                 Ok(0)
             }
-            79 => {
+            Call::Newfstatat => {
                 // AT_NO_AUTOMOUNT is a real no-op: this namespace has no
                 // automount points. GLib passes it when falling back from statx.
                 if d & !(0x100 | 0x800 | 0x1000) != 0 {
@@ -660,10 +683,10 @@ impl Runner {
                 let resolved = self.process.path_at(fs, a as i32, path)?;
                 self.copy_stat(c, self.resolved_stat(fs, resolved)?)
             }
-            80 => self.copy_stat(b, self.descriptor_stat(fs, fd(a)?)?),
-            46 => self.memfd_resize(fd(a)?, b),
-            279 => self.memfd_create(a, b),
-            48 => {
+            Call::Fstat => self.copy_stat(b, self.descriptor_stat(fs, fd(a)?)?),
+            Call::Ftruncate => self.memfd_resize(fd(a)?, b),
+            Call::MemfdCreate => self.memfd_create(a, b),
+            Call::Faccessat => {
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
@@ -679,8 +702,8 @@ impl Runner {
                 }
                 Ok(0)
             }
-            163 | 261 => {
-                let (resource, new, old) = if self.thread.context.regs[8] == 163 {
+            Call::Getrlimit | Call::Prlimit64 => {
+                let (resource, new, old) = if call == Call::Getrlimit {
                     (a, 0, b)
                 } else {
                     if a != 0 && a != self.status.pid as u64 {
@@ -714,18 +737,18 @@ impl Runner {
                 }
                 Ok(0)
             }
-            132 => self.signal_stack(a, b),
-            134 => self.signal_action(a, b, c, d),
-            135 => self.signal_mask(a, b, c, d),
-            139 => match self.signal_return() {
+            Call::Sigaltstack => self.signal_stack(a, b),
+            Call::RtSigaction => self.signal_action(a, b, c, d),
+            Call::RtSigprocmask => self.signal_mask(a, b, c, d),
+            Call::RtSigreturn => match self.signal_return() {
                 Ok(value) => Ok(value),
                 Err(_) => {
                     self.finish(fs, ledger, ipc, UserState::Fault, 139);
                     Ok(0)
                 }
             },
-            129..=131 => self.send_signal(self.thread.context.regs[8], a, b, c),
-            154 => {
+            Call::Kill | Call::Tkill | Call::Tgkill => self.send_signal(call, a, b, c),
+            Call::Setpgid => {
                 if a != 0 && a != self.status.pid as u64 {
                     return Err(Errno::Noent);
                 }
@@ -734,21 +757,29 @@ impl Runner {
                 }
                 Ok(0) // Each boot-launched process owns its own initial group.
             }
-            155 | 156 => {
+            Call::Getpgid | Call::Getsid => {
                 if a == 0 || a == self.status.pid as u64 {
                     Ok(self.status.pid as u64)
                 } else {
                     Err(Errno::Noent)
                 }
             }
-            73 => {
+            Call::Ppoll | Call::Poll => {
                 // ppoll with a null temporary signal mask. Readiness and wait
                 // registration are serialized, so there is no lost-wakeup gap.
-                if d != 0 {
+                if call == Call::Ppoll && d != 0 {
                     return Err(Errno::Nosys);
                 }
                 let count = count(b)?;
-                let until = if c == 0 {
+                let until = if call == Call::Poll {
+                    if (c as i32) < 0 {
+                        u64::MAX
+                    } else {
+                        super::now()
+                            .saturating_add(u64::from(c as u32))
+                            .saturating_add(u64::from(c != 0))
+                    }
+                } else if c == 0 {
                     u64::MAX
                 } else {
                     self.relative_deadline(c)?
@@ -763,11 +794,16 @@ impl Runner {
                 }
                 Ok(ready as u64)
             }
-            101 => self.nanosleep(1, 0, a, b),
-            115 => self.nanosleep(a, b, c, d),
-            23 => self.process.dup(fd(a)?).map(|n| n as u64),
-            24 => {
+            Call::Nanosleep => self.nanosleep(1, 0, a, b),
+            Call::ClockNanosleep => self.nanosleep(a, b, c, d),
+            Call::Dup => self.process.dup(fd(a)?).map(|n| n as u64),
+            Call::Dup3 | Call::Dup2 => {
                 let (old, new) = (fd(a)?, fd(b)?);
+                let c = if call == Call::Dup2 { 0 } else { c };
+                if old == new && call == Call::Dup2 {
+                    self.process.flags(old)?;
+                    return Ok(old as u64);
+                }
                 if old == new || c & !(cyxia_posix::O_CLOEXEC as u64) != 0 {
                     return Err(Errno::Inval);
                 }
@@ -783,7 +819,7 @@ impl Runner {
                 self.process.set_close_on_exec(new, c != 0)?;
                 Ok(new as u64)
             }
-            25 => match b {
+            Call::Fcntl => match b {
                 0 | 1030 => self
                     .process
                     .dup_from(
@@ -794,11 +830,16 @@ impl Runner {
                     .map(|n| n as u64),
                 1 => self.process.close_on_exec(fd(a)?).map(u64::from),
                 2 if c <= 1 => self.process.set_close_on_exec(fd(a)?, c != 0).map(|_| 0),
-                3 => self.descriptor_flags(fd(a)?).map(u64::from),
+                3 => self.descriptor_flags(fd(a)?).map(|flags| {
+                    cyxia_posix::linux_abi::encode_open_flags(crate::process_arch::IMAGE_ABI, flags)
+                }),
                 4 => self
                     .set_descriptor_flags(
                         fd(a)?,
-                        u32::try_from(c).map_err(|_| Errno::Inval)? & !0x20000,
+                        cyxia_posix::linux_abi::decode_open_flags(
+                            crate::process_arch::IMAGE_ABI,
+                            c,
+                        )? as u32,
                     )
                     .map(|_| 0),
                 1032 if self.process.pipe(fd(a)?)?.is_some() => {
@@ -807,7 +848,7 @@ impl Runner {
                 1033 | 1034 => self.memfd_control(fd(a)?, b, c),
                 _ => Err(Errno::Inval),
             },
-            198 | 199 => {
+            Call::Socket | Call::Socketpair => {
                 let flags = u32::try_from(b).map_err(|_| Errno::Inval)?;
                 if a != 1
                     || c != 0
@@ -817,7 +858,7 @@ impl Runner {
                     return Err(Errno::Nosys);
                 }
                 let flags = flags & !1;
-                if self.thread.context.regs[8] == 198 {
+                if call == Call::Socket {
                     let handle = super::unix::admit(1, 0, 0, |s| s.socket(self.status.pid))?;
                     self.install_socket(fs, handle.raw(), flags)
                         .map(|n| n as u64)
@@ -844,10 +885,10 @@ impl Runner {
                     Ok(0)
                 }
             }
-            200 | 203 => {
+            Call::Bind | Call::Connect => {
                 let raw = self.socket_handle(fd(a)?)?;
                 let owner = self.process.backend_owner(fd(a)?)?;
-                let binding = self.thread.context.regs[8] == 200;
+                let binding = call == Call::Bind;
                 let (path, len) = self.socket_address(fs, b, c, binding)?;
                 if binding {
                     super::unix::admit(0, 0, 1, |s| {
@@ -865,7 +906,7 @@ impl Runner {
                 }
                 Ok(0)
             }
-            201 => {
+            Call::Listen => {
                 let raw = self.socket_handle(fd(a)?)?;
                 let owner = self.process.backend_owner(fd(a)?)?;
                 // Linux clamps large backlog values; zero still permits a pending connection.
@@ -879,8 +920,8 @@ impl Runner {
                 })?;
                 Ok(0)
             }
-            202 | 242 => {
-                let flags = if self.thread.context.regs[8] == 242 {
+            Call::Accept | Call::Accept4 => {
+                let flags = if call == Call::Accept4 {
                     u32::try_from(d).map_err(|_| Errno::Inval)?
                 } else {
                     0
@@ -918,7 +959,7 @@ impl Runner {
             // Explicit CyxiaOS extensions used by the native X.Org DDX. These
             // numbers are deliberately separate from the Linux syscall ABI.
             #[cfg(feature = "graphics")]
-            0x43595801 => {
+            Call::DisplayInfo => {
                 let (width, height) = super::super::graphics::info().map_err(display_error)?;
                 let fields = [width, height, width * 4, 1, 65536, 1];
                 for (field, chunk) in fields.iter().zip(bytes[..24].chunks_exact_mut(4)) {
@@ -928,7 +969,7 @@ impl Runner {
                 Ok(0)
             }
             #[cfg(feature = "graphics")]
-            0x43595802 => {
+            Call::DisplayBlit => {
                 let (x, y, width, height) = (count(a)?, count(b)?, count(c)?, count(d)?);
                 let n = width
                     .checked_mul(height)
@@ -961,7 +1002,7 @@ impl Runner {
                 Ok(0)
             }
             #[cfg(feature = "graphics")]
-            0x43595803 => {
+            Call::InputRead => {
                 let count = count(b)?;
                 if count == 0 || count > 32 {
                     return Err(Errno::Inval);
@@ -983,7 +1024,7 @@ impl Runner {
                 Ok(n as u64)
             }
             #[cfg(feature = "graphics")]
-            0x43595804 => {
+            Call::InputState => {
                 self.validate(a, 96, true)?;
                 let mut keys = [0u8; 96];
                 super::super::graphics::key_state(&mut keys);
@@ -991,16 +1032,17 @@ impl Runner {
                 Ok(0)
             }
             #[cfg(not(feature = "graphics"))]
-            0x43595801..=0x43595804 => Err(Errno::Nodev),
-            56 => {
+            Call::DisplayInfo | Call::DisplayBlit | Call::InputRead | Call::InputState => {
+                Err(Errno::Nodev)
+            }
+            Call::Openat => {
                 // openat resolves relative names against a real directory FD.
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
                 let flags = u32::try_from(c).map_err(|_| Errno::Inval)?;
-                // AArch64 O_LARGEFILE is redundant with our 64-bit offsets. All
-                // other unknown open flags remain rejected by Process::open.
-                let flags = flags & !0x20000;
+                // ISA flags were decoded at the syscall boundary; unknown
+                // internal flags remain rejected by the existing file policy.
                 if path == "/dev/ptmx" || path.starts_with("/dev/pts/") {
                     return self.pty_open(path, flags).map(|fd| fd as u64);
                 }
@@ -1015,14 +1057,14 @@ impl Runner {
                     .open_resolved(fs, resolved, flags, d as u16)
                     .map(|fd| fd as u64)
             }
-            34 | 35 => {
+            Call::Mkdirat | Call::Unlinkat => {
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
                 if a as i64 != -100 && !path.starts_with('/') {
                     return Err(Errno::Badf);
                 }
-                if self.thread.context.regs[8] == 34 {
+                if call == Call::Mkdirat {
                     self.process.mkdir(fs, path, c as u16)?;
                 } else if c == 0x200 {
                     self.process.rmdir(fs, path)?;
@@ -1040,8 +1082,8 @@ impl Runner {
                 }
                 Ok(0)
             }
-            57 => self.linux_close(fs, fd(a)?).map(|_| 0),
-            62 => {
+            Call::Close => self.linux_close(fs, fd(a)?).map(|_| 0),
+            Call::Lseek => {
                 let descriptor = fd(a)?;
                 let whence = u32::try_from(c).map_err(|_| Errno::Inval)?;
                 if self.process.memfd(descriptor)?.is_some() {
@@ -1050,8 +1092,8 @@ impl Runner {
                     self.process.lseek(fs, descriptor, b as i64, whence)
                 }
             }
-            63 | 207 => {
-                if self.thread.context.regs[8] == 207 {
+            Call::Read | Call::Recvfrom => {
+                if call == Call::Recvfrom {
                     self.socket_handle(fd(a)?)?;
                     if d & !64 != 0 || e != 0 {
                         return Err(Errno::Nosys);
@@ -1063,14 +1105,14 @@ impl Runner {
                 if let Ok(n) = result {
                     self.copy_to(b, &bytes[..n])?;
                 }
-                if self.thread.context.regs[8] == 207 && d & 64 != 0 {
+                if call == Call::Recvfrom && d & 64 != 0 {
                     result.map(|n| n as u64)
                 } else {
                     self.socket_wait(fd(a)?, false, a, result)
                 }
             }
-            67 | 68 => {
-                let writing = self.thread.context.regs[8] == 68;
+            Call::Pread64 | Call::Pwrite64 => {
+                let writing = call == Call::Pwrite64;
                 let descriptor = fd(a)?;
                 let offset = usize::try_from(d as i64).map_err(|_| Errno::Inval)?;
                 let requested = count(c)?;
@@ -1086,7 +1128,7 @@ impl Runner {
                     Ok(n as u64)
                 }
             }
-            206 => {
+            Call::Sendto => {
                 // Connected AF_UNIX streams: Rust std's send(MSG_NOSIGNAL)
                 // reaches sendto with no destination. Do not accept datagram
                 // destinations or silently ignore unsupported message flags.
@@ -1114,7 +1156,7 @@ impl Runner {
                     self.socket_wait(descriptor, true, a, result)
                 }
             }
-            64 => {
+            Call::Write => {
                 let n = count(c)?;
                 self.validate(b, n, false)?;
                 if self.process.pipe(fd(a)?)?.is_some() {
@@ -1129,27 +1171,27 @@ impl Runner {
                 let result = self.linux_write(fs, fd(a)?, &bytes[..n]);
                 self.socket_wait(fd(a)?, true, a, result)
             }
-            65 | 66 => {
-                let writing = self.thread.context.regs[8] == 66;
+            Call::Readv | Call::Writev => {
+                let writing = call == Call::Writev;
                 let result = self.vector_io(fs, fd(a)?, b, c, writing);
                 self.socket_wait(fd(a)?, writing, a, result)
             }
-            93 => {
+            Call::Exit => {
                 self.thread_exit(fs, ledger, ipc, (a & 255) as u32);
                 Ok(0)
             }
-            94 => {
+            Call::ExitGroup => {
                 self.finish(fs, ledger, ipc, UserState::Exited, (a & 255) as u32);
                 Ok(0)
             }
-            96 => {
+            Call::SetTidAddress => {
                 self.thread.clear_tid = a;
                 Ok(self.thread.tid as u64)
             }
-            172 => Ok(self.status.pid as u64),
-            178 => Ok(self.thread.tid as u64),
-            174..=177 => Ok(0), // The implemented file domain has one root UID/GID.
-            148 | 150 => {
+            Call::Getpid => Ok(self.status.pid as u64),
+            Call::Gettid => Ok(self.thread.tid as u64),
+            Call::Getuid | Call::Geteuid | Call::Getgid | Call::Getegid => Ok(0), // The implemented file domain has one root UID/GID.
+            Call::Getresuid | Call::Getresgid => {
                 // getresuid/getresgid: this file domain has one root identity.
                 // Linux writes each 32-bit result in order, so an EFAULT on a
                 // later pointer preserves the earlier successfully copied IDs.
@@ -1158,9 +1200,9 @@ impl Runner {
                 }
                 Ok(0)
             }
-            124 => Ok(0), // sched_yield; dispatch loop hands control back to AI.
-            214 => Ok(0), // No brk arena. musl's real allocator takes its mmap path.
-            222 => {
+            Call::SchedYield => Ok(0), // sched_yield; dispatch loop hands control back to AI.
+            Call::Brk => Ok(0),        // No brk arena. musl's real allocator takes its mmap path.
+            Call::Mmap => {
                 let len = count(b)?;
                 if d & 0x20 == 0 {
                     // Non-fixed file mappings only. Private mappings require
@@ -1196,7 +1238,7 @@ impl Runner {
                 }
                 result
             }
-            215 => {
+            Call::Munmap => {
                 let len = count(b)?;
                 if len == 0 || !a.is_multiple_of(4096) {
                     return Err(Errno::Inval);
@@ -1208,7 +1250,7 @@ impl Runner {
                 // First-stage ABI explicitly supports whole allocations only.
                 self.heap.unmap(a, pages).map(|_| 0)
             }
-            226 => {
+            Call::Mprotect => {
                 if c > 7 {
                     return Err(Errno::Inval);
                 }
@@ -1222,17 +1264,10 @@ impl Runner {
                 }
                 Ok(0)
             }
-            113 => {
+            Call::ClockGettime => {
                 let ns = match a {
                     0 => super::super::clock::realtime_seconds()? * 1_000_000_000,
-                    1 => {
-                        cyxia_kernel_core::time::ticks_to_ns(
-                            cyxia_arch_aarch64::timer::ticks(),
-                            cyxia_arch_aarch64::timer::frequency(),
-                        )
-                        .map_err(|_| Errno::Io)?
-                        .0
-                    }
+                    1 => super::now_ns(),
                     _ => return Err(Errno::Inval),
                 };
                 bytes[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
@@ -1240,16 +1275,13 @@ impl Runner {
                 self.copy_to(b, &bytes[..16])?;
                 Ok(0)
             }
-            114 => {
+            Call::ClockGetres => {
                 let (sec, ns) = match a {
                     0 => {
                         super::super::clock::realtime_seconds()?;
                         (1u64, 0u64)
                     }
-                    1 => (
-                        0,
-                        1_000_000_000u64.div_ceil(cyxia_arch_aarch64::timer::frequency()),
-                    ),
+                    1 => (0, crate::process_arch::resolution_ns()),
                     _ => return Err(Errno::Inval),
                 };
                 if b != 0 {
@@ -1259,7 +1291,7 @@ impl Runner {
                 }
                 Ok(0)
             }
-            169 => {
+            Call::Gettimeofday => {
                 if a != 0 {
                     let seconds = super::super::clock::realtime_seconds()?;
                     bytes[..8].copy_from_slice(&seconds.to_le_bytes());
@@ -1271,7 +1303,7 @@ impl Runner {
                 }
                 Ok(0)
             }
-            278 => {
+            Call::Getrandom => {
                 if c & !1 != 0 {
                     return Err(Errno::Inval);
                 }
@@ -1287,7 +1319,7 @@ impl Runner {
                 }
                 Ok(len as u64)
             }
-            29 => {
+            Call::Ioctl => {
                 if b == 0x5421 && self.process.socket(fd(a)?)?.is_some() {
                     self.copy_from(c, &mut bytes[..4])?;
                     self.process.set_socket_nonblocking(
@@ -1309,9 +1341,9 @@ impl Runner {
                     Err(Errno::Notty)
                 }
             }
-            number => {
+            _ => {
                 super::super::log(b"LINUX_ABI_UNSUPPORTED MECHANISM\n");
-                super::super::hex(number);
+                super::super::hex(self.thread.context.syscall_number());
                 Err(Errno::Nosys)
             }
         }

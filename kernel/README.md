@@ -7,17 +7,19 @@
 ```text
 kernel/
   build.rs                    选择目标架构的构建适配
-  build/{aarch64,x86_64}.rs    用户映像、资源及链接参数
-  linker/{aarch64,x86_64}.ld   架构链接布局
+  build/{aarch64,x86_64,os}.rs 用户映像、资源及链接参数
+  linker/                    ARM、PC 平台验证与高半区正式 OS 链接布局
   layout-migration.json       旧路径到当前路径的显式迁移记录
   src/
     main.rs                   架构选择与小范围集成接口
-    composition/aarch64.rs    ARM feature 约束、模块注册
+    composition/             ARM 与 x86 正式 OS 的 feature 约束、模块注册
     arch/
       aarch64/                启动、异常、控制台、SMP 接线
-      x86_64/                 PC 启动、控制台、平台验证/陷阱接线
-    platform/virt/            PL031、GIC、VirtIO、存储与平台快照适配
+      x86_64/                 PC 启动、陷阱、SMP、用户上下文/所有权派发接线
+    platform/virt/            ARM PL031、GIC、VirtIO 与平台快照适配
+    platform/pc/              PCI 设备发现、DMA、CMOS 墙钟适配
     runtime/
+      os.rs                   正式 PC 启动与持续运行的系统服务循环
       control/                控制提案、预算账本、模型/治理服务
       tasks/                  任务生命周期、派发、放置
       services/               共享服务窗口与服务投影
@@ -26,7 +28,10 @@ kernel/
       cluster/                双节点会话、任务、存储、重放
       learning/               采集、历史、预热、回放、模型代次
       recovery/               启动恢复与正式恢复验证
-    desktop/                  CPU0 桌面、shell、用户 ABI 与内存适配
+    desktop/                  共享 shell、存储、显示、熵、用户 ABI 与内存适配
+      process_arch.rs         ARM/x86 用户上下文与退出接口
+      address_space.rs        私有用户页表及权限接口
+      user/parallel.rs        共享进程策略到 AP 的所有权转移与完整排空
     diagnostics/              验收负载、证据采集、故障与生命周期诊断
     selftest/                 页框共享自测、网络机制自测
 ```
@@ -45,8 +50,9 @@ PC 设备实现仍由各自 crate 提供。符号名、陷阱布局、启动检�
 宿主源码测试仍跨越相同接口；迁移不会把测试 fake 或证据 fixture 放进生产共享核心。
 
 `runtime` 的归档不意味着这些集成模块已完全架构无关。ARM unified-runtime 与桌面仍含
-ARM 适配依赖；PC 当前只提供基础平台支持。移植时应把实际变化的 CPU/设备能力提取为
-接口，再接入对应实现，不能仅改 feature 名称就宣称完成另一平台的验收。
+ARM 适配依赖。PC 的 `os-runtime` 已复用真实共享桌面服务与 Linux64 子集；CPU0 准备
+私有页表、转移用户上下文到 AP，整批退出和页表撤销后再处理文件/设备等共享服务。
+该阶段仍有明确的串行服务边界；完整 COSMIC、网络和更大规模调度继续推进。
 
 ## 新代码放置规则
 
@@ -63,6 +69,7 @@ python3 -B tools/check_kernel_layout.py
 cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features selftest
 cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest
 python3 -B tools/build.py --arch x86_64 --output artifacts/x86-layout-build
+python3 tools/os_x86.py build --output artifacts/x86-os-build --graphics
 ```
 
 目录检查拒绝根目录重新堆积源码、遗漏迁移文件、失效的字面量模块/include 路径。

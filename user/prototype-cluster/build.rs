@@ -3,7 +3,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_IDENTITY");
     println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_LEAVE");
     println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_FAULT");
-    if env::var("TARGET").unwrap() != "aarch64-unknown-none" {
+    let target = env::var("TARGET").unwrap();
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none") {
+        return;
+    }
+    assert!(
+        matches!(target.as_str(), "aarch64-unknown-none" | "x86_64-unknown-none"),
+        "unsupported protected cluster user target: {target}"
+    );
+    if env::var_os("CARGO_FEATURE_GUEST").is_none() {
         return;
     }
     let root = PathBuf::from(

@@ -10,6 +10,11 @@ import build_smithay_xdg as xdg_builder
 
 
 class SmithayWaylandBuildTests(unittest.TestCase):
+    def test_size_profiles_reject_unsafe_or_unknown_link_optimizations(self):
+        for values in ({'opt_level': 'fast'}, {'icf': 'all'}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                builder.BuildProfile(**values)
+
     def test_trusted_workspace_preflight_resolves_its_own_locked_offline_closure(self):
         upstream = {"CARGO_HOME": "/fresh/server/cargo-home",
                     "CARGO_TARGET_DIR": "/fresh/server/target",

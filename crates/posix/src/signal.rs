@@ -51,6 +51,9 @@ impl Action {
         mask: 0,
     };
     pub fn decode(bytes: &[u8; 32]) -> Result<Self, Errno> {
+        Self::decode_for(bytes, crate::ImageAbi::Aarch64)
+    }
+    pub fn decode_for(bytes: &[u8; 32], abi: crate::ImageAbi) -> Result<Self, Errno> {
         // musl's public sa_flags is signed int, while its k_sigaction.flags is
         // unsigned long. SA_RESETHAND therefore arrives sign-extended on LP64.
         // Accept only canonical zero/int32 extensions; unrelated high bits
@@ -67,7 +70,7 @@ impl Action {
             restorer: get64(bytes, 16),
             mask: get64(bytes, 24) & !UNBLOCKABLE,
         };
-        action.validate()?;
+        action.validate_for(abi)?;
         Ok(action)
     }
     pub fn encode(self) -> [u8; 32] {
@@ -81,15 +84,18 @@ impl Action {
         bytes
     }
     pub fn validate(self) -> Result<(), Errno> {
+        self.validate_for(crate::ImageAbi::Aarch64)
+    }
+    pub fn validate_for(self, abi: crate::ImageAbi) -> Result<(), Errno> {
         // SIG_DFL/SIG_IGN never invoke a returning handler, so retaining
         // SA_RESTART creates no syscall-restart obligation. Real handlers
         // still reject it until interrupted syscall restarts are implemented.
         let supported = SUPPORTED_FLAGS | if self.handler <= 1 { SA_RESTART } else { 0 };
         if self.flags & !supported != 0
             || (self.handler > 1
-                && (!user_pc(self.handler)
+                && (!user_pc_for(self.handler, abi)
                     || self.flags & SA_RESTORER == 0
-                    || !user_pc(self.restorer)))
+                    || !user_pc_for(self.restorer, abi)))
         {
             return Err(Errno::Inval);
         }
@@ -109,6 +115,13 @@ impl AltStack {
         self.size != 0 && sp > self.base && sp <= self.base.saturating_add(self.size)
     }
     pub fn decode(bytes: &[u8; 24], setting: bool) -> Result<Self, Errno> {
+        Self::decode_for(bytes, setting, crate::ImageAbi::Aarch64)
+    }
+    pub fn decode_for(
+        bytes: &[u8; 24],
+        setting: bool,
+        abi: crate::ImageAbi,
+    ) -> Result<Self, Errno> {
         let flags = get32(bytes, 8);
         if flags == 2 {
             if !setting && (get64(bytes, 0) != 0 || get64(bytes, 16) != 0) {
@@ -123,7 +136,13 @@ impl AltStack {
             base: get64(bytes, 0),
             size: get64(bytes, 16),
         };
-        if stack.size < MINSIGSTKSZ {
+        if stack.size
+            < if abi == crate::ImageAbi::X86_64 {
+                2048
+            } else {
+                MINSIGSTKSZ
+            }
+        {
             return Err(Errno::Nomem);
         }
         if stack.base == 0 || stack.base.checked_add(stack.size).is_none() {
@@ -222,14 +241,29 @@ impl Actions {
         Ok(self.actions[index(signal)?])
     }
     pub fn validate_action(signal: u32, action: Action) -> Result<(), Errno> {
+        Self::validate_action_for(signal, action, crate::ImageAbi::Aarch64)
+    }
+    pub fn validate_action_for(
+        signal: u32,
+        action: Action,
+        abi: crate::ImageAbi,
+    ) -> Result<(), Errno> {
         index(signal)?;
         if signal == 9 || signal == 19 {
             return Err(Errno::Inval);
         }
-        action.validate()
+        action.validate_for(abi)
     }
-    pub fn set_action(&mut self, signal: u32, mut action: Action) -> Result<(), Errno> {
-        Self::validate_action(signal, action)?;
+    pub fn set_action(&mut self, signal: u32, action: Action) -> Result<(), Errno> {
+        self.set_action_for(signal, action, crate::ImageAbi::Aarch64)
+    }
+    pub fn set_action_for(
+        &mut self,
+        signal: u32,
+        mut action: Action,
+        abi: crate::ImageAbi,
+    ) -> Result<(), Errno> {
+        Self::validate_action_for(signal, action, abi)?;
         action.mask &= !UNBLOCKABLE;
         self.actions[index(signal)?] = action;
         Ok(())
@@ -388,10 +422,20 @@ impl Signals {
         address: u64,
         tls: u64,
     ) -> Result<(), Errno> {
+        self.enter_for(actions, signal, address, tls, crate::ImageAbi::Aarch64)
+    }
+    pub fn enter_for(
+        &mut self,
+        actions: &mut Actions,
+        signal: u32,
+        address: u64,
+        tls: u64,
+        abi: crate::ImageAbi,
+    ) -> Result<(), Errno> {
         self.can_enter()?;
         let action = actions.action(signal)?;
         if !matches!(self.next(actions), Some(Delivery::Handler { signal: s, .. }) if s == signal)
-            || !address.is_multiple_of(16)
+            || address % 16 != if abi == crate::ImageAbi::X86_64 { 8 } else { 0 }
         {
             return Err(Errno::Inval);
         }
@@ -1034,5 +1078,13 @@ mod tests {
             Err(Errno::Inval)
         );
         assert!(bytes.iter().all(|b| *b == 0xa5));
+    }
+}
+
+fn user_pc_for(value: u64, abi: crate::ImageAbi) -> bool {
+    if abi == crate::ImageAbi::Aarch64 {
+        user_pc(value)
+    } else {
+        (4096..0x0000_8000_0000_0000).contains(&value)
     }
 }

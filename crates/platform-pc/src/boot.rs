@@ -12,6 +12,8 @@ pub const MAX_MMAP_BYTES: usize = 4096;
 /// The first PC profile deliberately matches the shared pool's 65,536 pages.
 /// Larger RAM needs a separate profile and cannot be silently truncated.
 pub const MAX_PHYSICAL_MEMORY: u64 = 256 * 1024 * 1024;
+/// Explicit production profile; callers must map and manage this full window.
+pub const MAX_RUNTIME_PHYSICAL_MEMORY: u64 = 1024 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 const LOW_MEMORY_END: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 64;
@@ -56,6 +58,34 @@ impl PcBootInfo {
     pub fn reserved_regions(&self) -> &[MemoryRegion] {
         &self.reserved[..self.reserved_count]
     }
+
+    /// Reserve an actual contiguous RAM pool after all loader/firmware ranges.
+    /// Successful allocation publishes the reservation before returning; failure
+    /// leaves the boot map unchanged. This API does not grant user ownership.
+    pub fn reserve_pool(&mut self, bytes: u64, minimum: u64) -> Result<MemoryRegion, BootError> {
+        if bytes == 0 || !bytes.is_multiple_of(PAGE_SIZE) || !minimum.is_multiple_of(PAGE_SIZE) {
+            return Err(BootError::AddressRange);
+        }
+        for index in 0..self.ram_count {
+            let ram = self.ram[index];
+            let ram_end = ram.start.0.checked_add(ram.len).ok_or(BootError::AddressRange)?;
+            let mut candidate = ram.start.0.max(minimum);
+            for reserved in self.reserved_regions() {
+                let end = candidate.checked_add(bytes).ok_or(BootError::AddressRange)?;
+                if reserved.start.0 >= end { break; }
+                let reserved_end = reserved.start.0 + reserved.len;
+                if reserved_end > candidate { candidate = reserved_end; }
+            }
+            let Some(end) = candidate.checked_add(bytes).filter(|&end| end <= ram_end) else { continue };
+            let range = MemoryRegion { start: PhysAddr(candidate), len: bytes, kind: RegionKind::Reserved };
+            // Reserve on a copy: even capacity failure cannot publish a prefix.
+            let mut next = *self;
+            reserve(&mut next, candidate, end)?;
+            *self = next;
+            return Ok(range);
+        }
+        Err(BootError::NoUsableMemory)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -81,9 +111,18 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-fn bounded_range(start: u64, len: u64) -> Result<u64, BootError> {
+fn validate_limit(limit: u64) -> Result<(), BootError> {
+    if !(MAX_PHYSICAL_MEMORY..=MAX_RUNTIME_PHYSICAL_MEMORY).contains(&limit)
+        || !limit.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(BootError::UnsupportedMemory);
+    }
+    Ok(())
+}
+
+fn bounded_range(start: u64, len: u64, limit: u64) -> Result<u64, BootError> {
     let end = start.checked_add(len).ok_or(BootError::AddressRange)?;
-    if start == 0 || len == 0 || end > MAX_PHYSICAL_MEMORY {
+    if start == 0 || len == 0 || end > limit {
         return Err(BootError::AddressRange);
     }
     Ok(end)
@@ -94,6 +133,12 @@ fn bounded_range(start: u64, len: u64) -> Result<u64, BootError> {
 /// The returned map range is nonempty and lies below the 256 MiB boot limit.
 /// Ignored command-line/loader strings are never dereferenced or retained.
 pub fn memory_map_location(header: &[u8]) -> Result<(u64, usize), BootError> {
+    memory_map_location_with_limit(header, MAX_PHYSICAL_MEMORY)
+}
+
+/// Decode a loader map using the explicitly mapped production RAM window.
+pub fn memory_map_location_with_limit(header: &[u8], limit: u64) -> Result<(u64, usize), BootError> {
+    validate_limit(limit)?;
     if header.len() != MB_INFO_BYTES {
         return Err(BootError::HeaderLength);
     }
@@ -114,7 +159,7 @@ pub fn memory_map_location(header: &[u8]) -> Result<(u64, usize), BootError> {
             return Err(BootError::UnsupportedMemory);
         }
         let upper_end = u64::from(u32_at(header, 8)) * 1024 + LOW_MEMORY_END;
-        if upper_end > MAX_PHYSICAL_MEMORY {
+        if upper_end > limit {
             return Err(BootError::UnsupportedMemory);
         }
     }
@@ -123,7 +168,7 @@ pub fn memory_map_location(header: &[u8]) -> Result<(u64, usize), BootError> {
     if !(24..=MAX_MMAP_BYTES).contains(&len) {
         return Err(BootError::MemoryMapLength);
     }
-    bounded_range(address, len as u64).map_err(|_| BootError::MemoryMapAddress)?;
+    bounded_range(address, len as u64, limit).map_err(|_| BootError::MemoryMapAddress)?;
     Ok((address, len))
 }
 
@@ -207,21 +252,38 @@ pub fn parse_multiboot(
     kernel_start: u64,
     kernel_end: u64,
 ) -> Result<PcBootInfo, BootError> {
+    parse_multiboot_with_limit(magic, header, header_pa, mmap, mmap_pa, kernel_start,
+        kernel_end, MAX_PHYSICAL_MEMORY)
+}
+
+/// Parse the same strict loader contract with an explicit supported RAM limit.
+/// Available memory outside the limit is rejected, never silently discarded.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_multiboot_with_limit(
+    magic: u32,
+    header: &[u8],
+    header_pa: u64,
+    mmap: &[u8],
+    mmap_pa: u64,
+    kernel_start: u64,
+    kernel_end: u64,
+    limit: u64,
+) -> Result<PcBootInfo, BootError> {
     if magic != MULTIBOOT_BOOT_MAGIC {
         return Err(BootError::BadMagic);
     }
-    let (expected_pa, expected_len) = memory_map_location(header)?;
+    let (expected_pa, expected_len) = memory_map_location_with_limit(header, limit)?;
     if expected_pa != mmap_pa {
         return Err(BootError::MemoryMapAddress);
     }
     if expected_len != mmap.len() {
         return Err(BootError::MemoryMapLength);
     }
-    let header_end = bounded_range(header_pa, MB_INFO_BYTES as u64)?;
-    let mmap_end = bounded_range(mmap_pa, mmap.len() as u64)?;
+    let header_end = bounded_range(header_pa, MB_INFO_BYTES as u64, limit)?;
+    let mmap_end = bounded_range(mmap_pa, mmap.len() as u64, limit)?;
     if kernel_start < LOW_MEMORY_END
         || kernel_start >= kernel_end
-        || kernel_end > MAX_PHYSICAL_MEMORY
+        || kernel_end > limit
     {
         return Err(BootError::AddressRange);
     }
@@ -254,7 +316,7 @@ pub fn parse_multiboot(
         if len == 0 || kind == 0 {
             return Err(BootError::InvalidRecord);
         }
-        if kind == 1 && end > MAX_PHYSICAL_MEMORY {
+        if kind == 1 && end > limit {
             return Err(BootError::UnsupportedMemory);
         }
         if raw[..count]
@@ -289,8 +351,8 @@ pub fn parse_multiboot(
                 end,
                 RegionKind::Ram,
             )?;
-        } else if r.start < MAX_PHYSICAL_MEMORY {
-            reserve(&mut info, r.start, r.end.min(MAX_PHYSICAL_MEMORY))?;
+        } else if r.start < limit {
+            reserve(&mut info, r.start, r.end.min(limit))?;
         }
     }
     if info.ram_count == 0 {

@@ -1,12 +1,11 @@
-//! CPU0 foreground supervisor: independent EL0 roots, AI scheduling, native local IPC.
+//! CPU0 foreground supervisor: independent user roots, AI scheduling, native local IPC.
+use crate::process_arch::{self, Context, Exit};
 use core::fmt::Write;
 use cyxia_ai_fs::FileSystem;
 use cyxia_ai_runtime::accounting::Attempt;
-use cyxia_arch_aarch64::{
-    mmu,
-    user::{self, Context},
-};
-use cyxia_contracts::{DecisionSource, Generation, PageCount, PhysAddr, RedemptionId, TaskId};
+#[cfg(target_arch = "aarch64")]
+use cyxia_arch_aarch64::mmu;
+use cyxia_contracts::{DecisionSource, Generation, PageCount, RedemptionId, TaskId};
 use cyxia_kernel_core::grants::{AuthorizedGrantRequest, GrantLedger, Owner, ReleaseReceipt};
 use cyxia_posix::{
     Console, Errno, Process, UserRequest, UserState, UserStatus,
@@ -54,10 +53,24 @@ use ai::Domain as AiDomain;
 #[cfg(feature = "ported")]
 #[path = "user/unix.rs"]
 mod unix;
+#[cfg(target_arch = "aarch64")]
+use cyxia_contracts::PhysAddr;
 use threads::Thread;
+#[cfg(target_arch = "x86_64")]
+#[path = "user/parallel.rs"]
+mod parallel;
+#[cfg(target_arch = "aarch64")]
+const PROCESS_LABEL: &str = "EL0";
+#[cfg(target_arch = "x86_64")]
+const PROCESS_LABEL: &str = "USER";
+#[cfg(target_arch = "aarch64")]
+const FAULT_LABEL: &str = "esr";
+#[cfg(target_arch = "x86_64")]
+const FAULT_LABEL: &str = "fault";
 const SLOTS: usize = MAX_PROCESSES;
 const USER_POOL: u32 = POOL_PAGES;
 const _: () = assert!(core::mem::size_of::<Arena>() == MAPPED_PAGES as usize * 4096);
+#[cfg(target_arch = "aarch64")]
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
 #[derive(Clone, Copy)]
@@ -127,9 +140,14 @@ struct Runner {
     threads: threads::Group,
     #[cfg(feature = "ported")]
     pending_spawn: Option<spawn::Request>,
+    #[cfg(target_arch = "aarch64")]
     l1: Table,
+    #[cfg(target_arch = "aarch64")]
     l2: Table,
+    #[cfg(target_arch = "aarch64")]
     l3: Table,
+    #[cfg(target_arch = "x86_64")]
+    space: crate::address_space::ProcessSpace,
     process: Process<'static>,
     lease: Option<(Owner, RedemptionId)>,
     status: UserStatus,
@@ -152,9 +170,14 @@ impl Runner {
             threads: threads::Group::new(),
             #[cfg(feature = "ported")]
             pending_spawn: None,
+            #[cfg(target_arch = "aarch64")]
             l1: Table([0; 512]),
+            #[cfg(target_arch = "aarch64")]
             l2: Table([0; 512]),
+            #[cfg(target_arch = "aarch64")]
             l3: Table([0; 512]),
+            #[cfg(target_arch = "x86_64")]
+            space: crate::address_space::ProcessSpace::new(),
             process: Process::empty(objects::table(), 0),
             lease: None,
             status: UserStatus::EMPTY,
@@ -189,13 +212,9 @@ fn now() -> u64 {
     now_ns() / 1_000_000
 }
 fn now_ns() -> u64 {
-    cyxia_kernel_core::time::ticks_to_ns(
-        cyxia_arch_aarch64::timer::ticks(),
-        cyxia_arch_aarch64::timer::frequency(),
-    )
-    .unwrap()
-    .0
+    process_arch::now_ns()
 }
+
 struct Output;
 impl Console for Output {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
@@ -214,6 +233,7 @@ impl Runner {
         image: &[u8],
         pid: u32,
         lifetime: Option<u64>,
+        native_service: bool,
         ledger: &mut GrantLedger,
         attempt: &mut Attempt,
     ) -> Result<(), Errno> {
@@ -231,7 +251,8 @@ impl Runner {
         if objects.capacity - objects.live - objects.retired < 3 {
             return Err(Errno::Mfile);
         }
-        let entry = cyxia_posix::image::load(image, &mut self.arena)?;
+        process_arch::make_writable(self.arena.base_ptr() as u64, CODE_BYTES)?;
+        let entry = cyxia_posix::image::load_for(image, &mut self.arena, process_arch::IMAGE_ABI)?;
         attempt.proposed(8193);
         let (admitted, model) =
             cyxia_ai_runtime::user_memory_policy(ledger.snapshot().free, MAPPED_PAGES)
@@ -262,16 +283,19 @@ impl Runner {
         self.lease = Some((owner, redemption));
         ai::record(AiDomain::Process, |c| c.grant(u64::from(MAPPED_PAGES)));
         // All following sizes and addresses are fixed and proved by the loader.
-        self.l1.0.fill(0);
-        self.l2.0.fill(0);
-        self.l3.0.fill(0);
-        self.l1.0[0] = (&self.l2 as *const Table as u64 - super::HIGH) | 3;
-        self.l2.0[0] = (&self.l3 as *const Table as u64 - super::HIGH) | 3;
-        let base = self.arena.base_ptr() as u64 - super::HIGH;
-        for i in 0..MAPPED_PAGES as usize {
-            let page = if i < 6 { 256 + i } else { 257 + i };
-            self.l3.0[page] =
-                mmu::encode_user_leaf(PhysAddr(base + i as u64 * 4096), i >= 4, i < 4).unwrap();
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.l1.0.fill(0);
+            self.l2.0.fill(0);
+            self.l3.0.fill(0);
+            self.l1.0[0] = (&self.l2 as *const Table as u64 - super::HIGH) | 3;
+            self.l2.0[0] = (&self.l3 as *const Table as u64 - super::HIGH) | 3;
+            let base = self.arena.base_ptr() as u64 - super::HIGH;
+            for i in 0..MAPPED_PAGES as usize {
+                let page = if i < 6 { 256 + i } else { 257 + i };
+                self.l3.0[page] =
+                    mmu::encode_user_leaf(PhysAddr(base + i as u64 * 4096), i >= 4, i < 4).unwrap();
+            }
         }
         let name = STACK_TOP - 128;
         let arg = STACK_TOP - 96;
@@ -281,18 +305,18 @@ impl Runner {
         self.arena.write(argv, &name.to_le_bytes()).unwrap();
         self.arena.write(argv + 8, &arg.to_le_bytes()).unwrap();
         self.arena.write(argv + 16, &0u64.to_le_bytes()).unwrap();
-        self.thread.context = Context {
-            regs: [0; 31],
-            pc: entry,
-            status: 0,
-            sp: STACK_TOP - 256,
-            esr: 0,
-            far: 0,
-            kind: 0,
-            ..Context::empty()
-        };
-        self.thread.context.regs[0] = 2;
-        self.thread.context.regs[1] = argv;
+        self.thread.context = Context::initialize(entry, STACK_TOP - 256, false)?;
+        #[cfg(target_arch = "x86_64")]
+        if native_service {
+            // A Rust extern-C entry is a SysV function, unlike a raw ELF CRT.
+            let sp = STACK_TOP - 264;
+            self.arena.write(sp, &0u64.to_le_bytes())?;
+            self.thread.context.set_sp(sp)?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        let _ = native_service;
+        self.thread.context.set_argument(0, 2);
+        self.thread.context.set_argument(1, argv);
         self.process = Process::new(objects::table(), pid).expect("preflighted stdio capacity");
         self.started = now();
         self.thread.ready_since = self.started;
@@ -309,19 +333,10 @@ impl Runner {
             thread_peak: 1,
             ..UserStatus::EMPTY
         };
-        // Publish generated user instructions. Clean D-cache by architectural line
-        // size before invalidating I-cache; user and kernel aliases share physical RAM.
-        unsafe {
-            let ctr: u64;
-            core::arch::asm!("mrs {}, ctr_el0",out(reg)ctr);
-            let line = 4u64 << ((ctr >> 16) & 15);
-            let start = self.arena.base_ptr() as u64;
-            let mut p = start;
-            while p < start + CODE_BYTES as u64 {
-                core::arch::asm!("dc cvau, {}",in(reg)p);
-                p += line;
-            }
-            core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+        if let Err(error) = process_arch::publish_code(self.arena.base_ptr() as u64, CODE_BYTES) {
+            self.thread.active = false;
+            self.status.state = UserState::Fault;
+            return Err(error); // retain the grant and quarantine uncertain code.
         }
         Ok(())
     }
@@ -345,11 +360,18 @@ impl Runner {
         };
         self.thread.active = false;
         self.status.thread_count = 0;
-        // enter() has disabled TTBR0 walks and completed TLBI+DSB. No DMA/other CPU
-        // can reference this private arena. Revoke descriptors before releasing grant.
-        self.l1.0.fill(0);
-        self.l2.0.fill(0);
-        self.l3.0.fill(0);
+        // The CPU backend retired the user root/TLB before return. No DMA or
+        // other CPU can reference this arena. Revoke before releasing grants.
+        #[cfg(target_arch = "x86_64")]
+        self.space.retire();
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.l1.0.fill(0);
+            self.l2.0.fill(0);
+            self.l3.0.fill(0);
+        }
+        process_arch::make_writable(self.arena.base_ptr() as u64, CODE_BYTES)
+            .expect("retired native executable");
         #[cfg(feature = "ported")]
         self.executable.clear();
         #[cfg(feature = "ported")]
@@ -453,7 +475,7 @@ impl Runner {
         #[cfg(feature = "ported")]
         if self.linux {
             // Readiness only made the context runnable. Validate the saved
-            // OFD generation now, immediately before the actual SVC replay;
+            // OFD generation now, immediately before the actual syscall replay;
             // another thread may have closed/reused the FD in that interval.
             let binding = self.thread.retry_descriptor.take();
             self.thread.retry_syscall = false;
@@ -470,13 +492,13 @@ impl Runner {
                 for value in [
                     self.status.pid as u64,
                     self.thread.tid as u64,
-                    self.thread.context.pc,
-                    self.thread.context.regs[8],
-                    self.thread.context.regs[0],
-                    self.thread.context.regs[1],
-                    self.thread.context.regs[2],
-                    self.thread.context.regs[3],
-                    self.thread.context.regs[4],
+                    self.thread.context.pc(),
+                    self.thread.context.syscall_number(),
+                    self.thread.context.argument(0),
+                    self.thread.context.argument(1),
+                    self.thread.context.argument(2),
+                    self.thread.context.argument(3),
+                    self.thread.context.argument(4),
                     result.unwrap_or_else(|e| (-(e as i64)) as u64),
                 ] {
                     super::hex(value);
@@ -485,17 +507,17 @@ impl Runner {
             return result;
         }
         let [a, b, c] = [
-            self.thread.context.regs[0],
-            self.thread.context.regs[1],
-            self.thread.context.regs[2],
+            self.thread.context.argument(0),
+            self.thread.context.argument(1),
+            self.thread.context.argument(2),
         ];
         let mut buf = [0u8; 1024];
         let mut path = [0u8; 96];
-        match self.thread.context.regs[8] {
+        match self.thread.context.syscall_number() {
             1 | 8 | 9 | 10 | 11 => {
                 let n = self.path(a, &mut path)?;
                 let p = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
-                match self.thread.context.regs[8] {
+                match self.thread.context.syscall_number() {
                     1 => self
                         .process
                         .open(fs, p, u32::try_from(b).map_err(|_| Errno::Inval)?, c as u16)
@@ -643,6 +665,17 @@ impl Runner {
                     Err(Errno::Nodev)
                 }
             }
+            25 => match a {
+                0x1002 => {
+                    self.thread.context.set_tls(b)?;
+                    Ok(0)
+                }
+                0x1003 => {
+                    self.copy_to(b, &self.thread.context.tls().to_le_bytes())?;
+                    Ok(0)
+                }
+                _ => Err(Errno::Inval),
+            },
             _ => Err(Errno::Nosys),
         }
     }
@@ -658,15 +691,18 @@ impl Runner {
         }
         #[cfg(feature = "ported")]
         if self.linux && self.thread.signals.ready() {
-            // Blocking descriptor calls saved the SVC for retry. A caught signal
+            // Blocking descriptor calls saved the syscall for retry. A caught signal
             // interrupts that call instead; SA_RESTART is explicitly unsupported.
             if self.thread.retry_syscall {
-                self.thread.context.pc += 4;
+                self.thread
+                    .context
+                    .cancel_restart()
+                    .expect("saved syscall return PC");
                 self.thread.retry_syscall = false;
             }
             self.thread.retry_descriptor = None;
             let error = self.sleep_interrupted().err().unwrap_or(Errno::Intr);
-            self.thread.context.regs[0] = (-(error as i64)) as u64;
+            self.thread.context.set_result((-(error as i64)) as u64);
             self.thread.waiting = None;
             self.status.state = UserState::Running;
             self.thread.ready_since = time;
@@ -686,7 +722,7 @@ impl Runner {
                 identity,
             }) => {
                 // Keep a disarmed timer parked without repeatedly dispatching
-                // EL0. Rearming an alias is visible through the shared OFD.
+                // user code. Rearming an alias is visible through the shared OFD.
                 match self
                     .process
                     .validate_description_identity(descriptor, identity)
@@ -701,7 +737,9 @@ impl Runner {
             #[cfg(feature = "ported")]
             Some(Wait::Futex { until, .. }) => {
                 if time >= until {
-                    self.thread.context.regs[0] = (-(Errno::Timedout as i64)) as u64;
+                    self.thread
+                        .context
+                        .set_result((-(Errno::Timedout as i64)) as u64);
                     true
                 } else {
                     false
@@ -714,12 +752,12 @@ impl Runner {
                 until,
             }) => match self.poll_result(address, count) {
                 Ok(n) if n > 0 || time >= until => {
-                    self.thread.context.regs[0] = n as u64;
+                    self.thread.context.set_result(n as u64);
                     true
                 }
                 Ok(_) => false,
                 Err(error) => {
-                    self.thread.context.regs[0] = (-(error as i64)) as u64;
+                    self.thread.context.set_result((-(error as i64)) as u64);
                     true
                 }
             },
@@ -738,12 +776,12 @@ impl Runner {
                 };
                 match result {
                     Ok(n) if n > 0 || time >= until => {
-                        self.thread.context.regs[0] = n as u64;
+                        self.thread.context.set_result(n as u64);
                         true
                     }
                     Ok(_) => false,
                     Err(error) => {
-                        self.thread.context.regs[0] = (-(error as i64)) as u64;
+                        self.thread.context.set_result((-(error as i64)) as u64);
                         true
                     }
                 }
@@ -788,7 +826,7 @@ impl Runner {
             {
                 Ok(ready) => ready,
                 Err(error) => {
-                    self.thread.context.regs[0] = (-(error as i64)) as u64;
+                    self.thread.context.set_result((-(error as i64)) as u64);
                     true
                 }
             },
@@ -800,6 +838,77 @@ impl Runner {
             self.thread.ready_since = time;
             self.status.wakeups = self.status.wakeups.saturating_add(1);
         }
+    }
+    /// Shared syscall/fault policy, always executed by the CPU0 service owner.
+    fn complete_exit(
+        &mut self,
+        exit: Result<Exit, Errno>,
+        fs: &mut FileSystem,
+        ledger: &mut GrantLedger,
+        ipc: &mut LocalIpc,
+    ) -> bool {
+        if let Ok(exit) = exit {
+            process_arch::trace_fault(exit);
+        }
+        match exit {
+            Ok(Exit::Preempted) => {
+                self.status.preemptions += 1;
+                self.thread.cpu_bound = true;
+            }
+            Ok(Exit::Syscall) => {
+                self.status.syscalls += 1;
+                self.thread.cpu_bound = false;
+                let result = self.syscall(fs, ledger, ipc);
+                self.thread.context.set_result(match result {
+                    Ok(n) => n,
+                    Err(e) => (-(e as i64)) as u64,
+                });
+            }
+            Ok(Exit::Fault {
+                address,
+                instruction,
+                signal,
+                diagnostic,
+                vector,
+                code,
+            }) => {
+                self.status.esr = diagnostic;
+                self.status.far = address;
+                #[cfg(feature = "ported")]
+                if self.linux {
+                    #[cfg(target_arch = "x86_64")]
+                    let code = if vector == Some(14) {
+                        cyxia_posix::signal_x86_64::page_fault_code(
+                            diagnostic,
+                            self.contains_user_mapping(address),
+                        )
+                    } else {
+                        code
+                    };
+                    let info = cyxia_posix::signal::Info {
+                        code,
+                        sender_pid: self.status.pid,
+                        address: if code == 128 {
+                            0
+                        } else if signal == 4 {
+                            instruction
+                        } else {
+                            address
+                        },
+                    };
+                    if self.queue_signal(signal, info, true).is_ok() {
+                        return true;
+                    }
+                }
+                #[cfg(not(feature = "ported"))]
+                let _ = (instruction, signal, vector, code);
+                #[cfg(all(feature = "ported", target_arch = "aarch64"))]
+                let _ = vector;
+                self.finish(fs, ledger, ipc, UserState::Fault, 139);
+            }
+            Err(_) => self.finish(fs, ledger, ipc, UserState::Fault, 139),
+        }
+        false
     }
     fn tick(
         &mut self,
@@ -844,7 +953,15 @@ impl Runner {
                     break;
                 }
             }
+            #[cfg(target_arch = "aarch64")]
             let root = &self.l1 as *const Table as u64 - super::HIGH;
+            #[cfg(target_arch = "x86_64")]
+            if self.prepare_space().is_err() {
+                self.finish(fs, ledger, ipc, UserState::Fault, 139);
+                break;
+            }
+            #[cfg(target_arch = "x86_64")]
+            let root = self.space.root().expect("published private root");
             // Receipt at the actual execution boundary. Pending fatal signals or
             // expired test lifetimes must not inflate successful AI dispatches.
             if !entered {
@@ -875,52 +992,30 @@ impl Runner {
             ai::record(AiDomain::CpuQuantum, |c| c.entered());
             // Arena/context/tables are static, exclusively owned on CPU0; validated RX/RW
             // leaves expose no kernel memory. Handler only captures context, never FS.
-            unsafe { user::enter(&mut self.thread.context, root) };
+            let exit = unsafe {
+                process_arch::enter(
+                    &mut self.thread.context,
+                    root,
+                    now_ns().saturating_add(budget * 1_000_000),
+                )
+            };
+            #[cfg(target_arch = "x86_64")]
+            self.space.retire();
             ai::record(AiDomain::CpuQuantum, |c| c.returned());
-            if self.thread.context.kind == 9 {
-                self.status.preemptions += 1;
-                self.thread.cpu_bound = true;
-            } else if self.thread.context.esr >> 26 == 0x15 && self.thread.context.esr & 0xffff == 0
-            {
-                self.status.syscalls += 1;
-                self.thread.cpu_bound = false;
-                let result = self.syscall(fs, ledger, ipc);
-                self.thread.context.regs[0] = match result {
-                    Ok(n) => n,
-                    Err(e) => (-(e as i64)) as u64,
-                };
-            } else {
-                self.status.esr = self.thread.context.esr;
-                self.status.far = self.thread.context.far;
-                #[cfg(feature = "ported")]
-                if self.linux {
-                    let signal = if matches!(self.thread.context.esr >> 26, 0x20 | 0x24) {
-                        11
-                    } else {
-                        4
-                    };
-                    let info = cyxia_posix::signal::Info {
-                        code: 1,
-                        sender_pid: self.status.pid,
-                        address: if signal == 4 {
-                            self.thread.context.pc
-                        } else {
-                            self.thread.context.far
-                        },
-                    };
-                    if self.queue_signal(signal, info, true).is_ok() {
-                        continue;
-                    }
-                }
-                self.finish(fs, ledger, ipc, UserState::Fault, 139);
+            if self.complete_exit(exit, fs, ledger, ipc) {
+                continue;
             }
             let yield_number = 18;
             #[cfg(feature = "ported")]
-            let yield_number = if self.linux { 124 } else { yield_number };
+            let yield_number = if self.linux {
+                process_arch::LINUX_YIELD_NUMBER
+            } else {
+                yield_number
+            };
             if self.status.state != UserState::Running
                 || !self.thread.active
                 || self.thread.waiting.is_some()
-                || self.thread.context.regs[8] == yield_number
+                || self.thread.context.syscall_number() == yield_number
                 || now().saturating_sub(start) >= budget
             {
                 break;
@@ -979,7 +1074,8 @@ impl Supervisor {
             .iter()
             .find(|(n, _, _)| *n == image_name)
             .ok_or(Errno::Noent)?;
-        let plan = cyxia_posix::executable::parse(bytes).map_err(|_| Errno::Inval)?;
+        let plan = cyxia_posix::executable::parse_for(bytes, process_arch::IMAGE_ABI)
+            .map_err(|_| Errno::Inval)?;
         // Read-only boot assets retain their bytes in kernel ROM mappings.
         // Directories use the real RAM filesystem and its ordinary AI admission.
         let mut directories = Process::empty(objects::table(), 0);
@@ -1107,16 +1203,16 @@ impl Supervisor {
                 return Err(error);
             }
         };
-        runner.l2.0[0] = 0;
-        runner.arena.clear();
-        for (i, root) in runner.executable.roots() {
-            runner.l2.0[i] = root;
+        #[cfg(target_arch = "aarch64")]
+        {
+            runner.l2.0[0] = 0;
+            for (i, root) in runner.executable.roots() {
+                runner.l2.0[i] = root;
+            }
         }
-        runner.thread.context = Context {
-            pc: plan.entry,
-            sp,
-            ..Context::empty()
-        };
+        process_arch::make_writable(runner.arena.base_ptr() as u64, CODE_BYTES)?;
+        runner.arena.clear();
+        runner.thread.context = Context::initialize(plan.entry, sp, true)?;
         runner.linux = true;
         Ok(slot)
     }
@@ -1142,40 +1238,49 @@ impl Supervisor {
             .checked_add(1)
             .filter(|p| *p < 0x1000_0000)
             .ok_or(Errno::Overflow)?;
+        #[cfg(target_arch = "x86_64")]
+        self.runners[slot].space.bind(slot, pid);
         self.runners[slot].start(
             mode,
             if native { SERVICES } else { IMAGE },
             pid,
             if native { None } else { Some(500) },
+            native,
             &mut self.ledger,
             attempt,
         )?;
         let owner = self.runners[slot].lease.ok_or(Errno::Io)?.0;
         self.runners[slot].heap.bind(slot, owner);
-        for (index, root) in self.runners[slot].heap.roots().into_iter().enumerate() {
-            self.runners[slot].l2.0[index + (cyxia_posix::vm::BASE / 0x200000) as usize] = root;
-        }
-        #[cfg(feature = "ported")]
-        for (index, root) in self.runners[slot].shared.roots() {
-            self.runners[slot].l2.0[index] = root;
+        #[cfg(target_arch = "aarch64")]
+        {
+            for (index, root) in self.runners[slot].heap.roots().into_iter().enumerate() {
+                self.runners[slot].l2.0[index + (cyxia_posix::vm::BASE / 0x200000) as usize] = root;
+            }
+            #[cfg(feature = "ported")]
+            for (index, root) in self.runners[slot].shared.roots() {
+                self.runners[slot].l2.0[index] = root;
+            }
         }
         self.next_pid = next;
         self.focus_pid = pid;
         if native {
-            self.runners[slot].thread.context.regs[0] = match mode {
-                "idle" => 0,
-                "spin" => 1,
-                "fault" => 2,
-                "server" => 3,
-                "client" => 4,
-                "heap" => 5,
-                "heapfault" => 6,
-                "paint" => 7,
-                "fpu" => 8,
-                "heapexec" => 9,
-                _ => unreachable!(),
-            };
-            self.runners[slot].thread.context.regs[1] = 0;
+            self.runners[slot].thread.context.set_argument(
+                0,
+                match mode {
+                    "idle" => 0,
+                    "spin" => 1,
+                    "fault" => 2,
+                    "server" => 3,
+                    "client" => 4,
+                    "heap" => 5,
+                    "heapfault" => 6,
+                    "paint" => 7,
+                    "fpu" => 8,
+                    "heapexec" => 9,
+                    _ => unreachable!(),
+                },
+            );
+            self.runners[slot].thread.context.set_argument(1, 0);
         }
         Ok(slot)
     }
@@ -1191,8 +1296,14 @@ impl Supervisor {
         let pids = [self.runners[a].status.pid, self.runners[b].status.pid];
         match self.ipc.pair(pids[0], pids[1]) {
             Ok(handles) => {
-                self.runners[a].thread.context.regs[1] = handles[0] as u64;
-                self.runners[b].thread.context.regs[1] = handles[1] as u64;
+                self.runners[a]
+                    .thread
+                    .context
+                    .set_argument(1, handles[0] as u64);
+                self.runners[b]
+                    .thread
+                    .context
+                    .set_argument(1, handles[1] as u64);
                 Ok(pids)
             }
             Err(error) => {
@@ -1241,7 +1352,7 @@ impl Supervisor {
                 UserRequest::Execute(name) => {
                     #[cfg(feature = "ported")]
                     match self.launch_executable(name, shell.fs_mut()) {
-                        Ok(slot)=> writeln!(out,"\r\nELF pid={} started; ABI=Linux-AArch64-subset image AI_DIRECT model=8195 pages={}\r",self.runners[slot].status.pid,self.runners[slot].executable.pages()).unwrap(),
+                        Ok(slot)=> writeln!(out,"\r\nELF pid={} started; ABI=Linux-{}-subset image AI_DIRECT model=8195 pages={}\r",self.runners[slot].status.pid,if process_arch::IMAGE_ABI==cyxia_posix::ImageAbi::Aarch64 {"AArch64"} else {process_arch::MACHINE},self.runners[slot].executable.pages()).unwrap(),
                         Err(error)=>writeln!(out,"\r\nELF start failed: {error:?}\r").unwrap(),
                     }
                     #[cfg(not(feature = "ported"))]
@@ -1255,21 +1366,21 @@ impl Supervisor {
                     match self.launch(mode, matches!(request, UserRequest::Spawn(_))) {
                         Ok(slot) => writeln!(
                             out,
-                            "\r\nEL0 pid={} started; memory AI_DIRECT model=8193 pages=8\r",
+                            "\r\n{PROCESS_LABEL} pid={} started; memory AI_DIRECT model=8193 pages=8\r",
                             self.runners[slot].status.pid
                         )
                         .unwrap(),
-                        Err(error) => writeln!(out, "\r\nEL0 start failed: {error:?}\r").unwrap(),
+                        Err(error) => writeln!(out, "\r\n{PROCESS_LABEL} start failed: {error:?}\r").unwrap(),
                     }
                 }
                 UserRequest::Pair => match self.pair(shell.fs_mut()) {
                     Ok(pids) => writeln!(
                         out,
-                        "\r\nEL0 IPC pair server={} client={} memory AI_DIRECT model=8193\r",
+                        "\r\n{PROCESS_LABEL} IPC pair server={} client={} memory AI_DIRECT model=8193\r",
                         pids[0], pids[1]
                     )
                     .unwrap(),
-                    Err(error) => writeln!(out, "\r\nEL0 pair failed: {error:?}\r").unwrap(),
+                    Err(error) => writeln!(out, "\r\n{PROCESS_LABEL} pair failed: {error:?}\r").unwrap(),
                 },
                 UserRequest::Kill(pid) => {
                     let pid = pid.unwrap_or(self.focus_pid);
@@ -1285,9 +1396,9 @@ impl Supervisor {
                             UserState::Killed,
                             137,
                         );
-                        writeln!(out, "\r\nEL0 pid={pid} killed; pages reclaimed\r").unwrap();
+                        writeln!(out, "\r\n{PROCESS_LABEL} pid={pid} killed; pages reclaimed\r").unwrap();
                     } else {
-                        writeln!(out, "\r\nEL0 kill failed: Noent\r").unwrap();
+                        writeln!(out, "\r\n{PROCESS_LABEL} kill failed: Noent\r").unwrap();
                     }
                 }
             }
@@ -1312,6 +1423,9 @@ impl Supervisor {
                 cpu_bound: runner.thread.cpu_bound,
             })
         });
+        #[cfg(target_arch = "x86_64")]
+        self.dispatch_parallel(candidates, shell, out);
+        #[cfg(target_arch = "aarch64")]
         if let Some(decision) = cyxia_ai_runtime::user_dispatch_policy(&candidates).unwrap() {
             ai::record(AiDomain::CpuProcess, |c| c.proposal(decision.model));
             let ready = candidates.iter().flatten().count();
@@ -1350,7 +1464,7 @@ impl Supervisor {
             if !runner.status.state.active() {
                 writeln!(
                     out,
-                    "\r\nEL0 pid={} {:?} code={} free_pages={} esr={:#x} far={:#x}\r",
+                    "\r\n{PROCESS_LABEL} pid={} {:?} code={} free_pages={} {FAULT_LABEL}={:#x} far={:#x}\r",
                     runner.status.pid,
                     runner.status.state,
                     runner.status.code,
@@ -1387,15 +1501,18 @@ impl Supervisor {
     }
 }
 pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
-    // Static process roots/arenas are never moved. Only the CPU0 foreground owns
-    // this service; IRQ capture touches only the currently entered Context.
+    // CPU0 owns all process services and backing. Only owned architectural
+    // Context+ProcessSpace jobs cross to APs, and the whole phase is drained
+    // before this service accesses user memory or process metadata again.
     unsafe {
         (&mut *core::ptr::addr_of_mut!(SUPERVISOR)).poll(shell, out);
     }
 }
-/// Single-core foreground cumulative execution receipts; never resets on PID reuse.
+/// CPU0 snapshot of cumulative process/worker receipts; never resets on PID reuse.
 pub fn ai_status(out: &mut impl Write) {
     ai::status(out);
+    #[cfg(target_arch = "x86_64")]
+    parallel::status(out);
     object_status(out);
     #[cfg(feature = "ported")]
     crate::shared_memory::status(out);
@@ -1412,4 +1529,40 @@ pub fn object_status(out: &mut impl Write) {
     )
     .unwrap();
     writeln!(out, "ANCILLARY_OBJECTS messages={} references={} staged_messages={} inflight_messages={} staged_refs={} inflight_refs={} capacity_messages={} capacity_references={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r", s.staged_messages + s.inflight_messages, s.staged_references + s.inflight_references, s.staged_messages, s.inflight_messages, s.staged_references, s.inflight_references, cyxia_posix::ancillary::MESSAGES, cyxia_posix::ancillary::REFERENCES).unwrap();
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Runner {
+    #[cfg(feature = "ported")]
+    fn contains_user_mapping(&self, address: u64) -> bool {
+        self.heap.contains_mapping(address)
+            || self.executable.validate(address, 1, false).is_ok()
+            || self.shared.contains_mapping(address)
+    }
+    fn prepare_space(&mut self) -> Result<(), Errno> {
+        self.space.begin()?;
+        #[cfg(feature = "ported")]
+        if self.linux {
+            self.executable.publish_space(&mut self.space)?;
+        }
+        #[cfg(not(feature = "ported"))]
+        let native = true;
+        #[cfg(feature = "ported")]
+        let native = !self.linux;
+        if native {
+            let physical = self.arena.base_ptr() as u64 - super::HIGH;
+            for index in 0..MAPPED_PAGES as usize {
+                let virtual_page = if index < 6 { 256 + index } else { 257 + index };
+                self.space.map(
+                    virtual_page as u64 * 4096,
+                    physical + index as u64 * 4096,
+                    if index < 4 { 5 } else { 3 },
+                )?;
+            }
+        }
+        self.heap.publish_space(&mut self.space)?;
+        #[cfg(feature = "ported")]
+        self.shared.publish_space(&mut self.space)?;
+        Ok(())
+    }
 }

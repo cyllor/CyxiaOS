@@ -1,11 +1,9 @@
-//! Foreground-only Linux AArch64 signal delivery for explicitly selected ELF.
+//! Foreground Linux signal policy with architecture-owned frame serialization.
 //! The parent wakes interrupted waits and owns process termination. All frame
-//! I/O goes through Runner usercopy; no pointer supplied by EL0 is dereferenced.
-use super::{Context, Errno, Runner};
-use cyxia_posix::signal::{
-    self, Action, Actions, AltStack, Delivery, FRAME_BYTES, FrameState, Info, RT_FRAME_BYTES,
-    SA_ONSTACK, SA_SIGINFO, UCONTEXT_OFFSET,
-};
+//! I/O goes through Runner usercopy; no pointer supplied by user code is dereferenced.
+use super::{Errno, Runner};
+use crate::process_arch::{self, SIGNAL_FRAME_BYTES as FRAME_BYTES};
+use cyxia_posix::signal::{self, Action, Actions, AltStack, Delivery, Info, SA_ONSTACK};
 
 impl Runner {
     pub(super) fn signal_stack(&mut self, new: u64, old: u64) -> Result<u64, Errno> {
@@ -13,19 +11,19 @@ impl Runner {
         let next = if new == 0 {
             None
         } else {
-            if previous.contains(self.thread.context.sp) {
+            if previous.contains(self.thread.context.sp()) {
                 return Err(Errno::Perm);
             }
             let mut bytes = [0; 24];
             self.copy_from(new, &mut bytes)?;
-            let stack = AltStack::decode(&bytes, true)?;
+            let stack = AltStack::decode_for(&bytes, true, process_arch::IMAGE_ABI)?;
             if stack.size != 0 {
                 self.validate(stack.base, super::count(stack.size)?, true)?;
             }
             Some(stack)
         };
         if old != 0 {
-            self.copy_to(old, &previous.encode(self.thread.context.sp))?;
+            self.copy_to(old, &previous.encode(self.thread.context.sp()))?;
         }
         if let Some(stack) = next {
             self.thread.alt_stack = stack;
@@ -47,8 +45,8 @@ impl Runner {
         let new = if action != 0 {
             let mut bytes = [0; 32];
             self.copy_from(action, &mut bytes)?;
-            let new = Action::decode(&bytes)?;
-            Actions::validate_action(signal, new)?;
+            let new = Action::decode_for(&bytes, process_arch::IMAGE_ABI)?;
+            Actions::validate_action_for(signal, new, process_arch::IMAGE_ABI)?;
             Some(new)
         } else {
             None
@@ -59,7 +57,10 @@ impl Runner {
             self.copy_to(old, &previous.encode())?;
         }
         if let Some(new) = new {
-            self.threads.shared.actions.set_action(signal, new)?;
+            self.threads
+                .shared
+                .actions
+                .set_action_for(signal, new, process_arch::IMAGE_ABI)?;
             if self.threads.shared.actions.ignored(signal)? {
                 self.thread.signals.consume(signal)?;
                 self.threads.shared.pending.consume(signal)?;
@@ -115,7 +116,7 @@ impl Runner {
             .raise(&self.threads.shared.actions, signal, info, forced)
     }
 
-    /// Run before each EL0 entry. Some(code) requests default termination;
+    /// Run before each user entry. Some(code) requests default termination;
     /// any error building a handler frame must terminate with SIGSEGV/139.
     /// No context or mask changes occur before complete frame copy succeeds.
     pub(super) fn deliver_signal(&mut self) -> Result<Option<u32>, Errno> {
@@ -141,71 +142,37 @@ impl Runner {
                     info,
                 }) => {
                     self.thread.signals.can_enter()?;
-                    self.validate(action.handler, 4, false)?;
-                    self.validate(action.restorer, 4, false)?;
-                    let address = self
-                        .thread
-                        .alt_stack
-                        .frame_address(self.thread.context.sp, action.flags & SA_ONSTACK != 0)?;
+                    self.validate(action.handler, process_arch::INSTRUCTION_ALIGNMENT, false)?;
+                    self.validate(action.restorer, process_arch::INSTRUCTION_ALIGNMENT, false)?;
+                    let address = process_arch::signal_frame_address(
+                        self.thread.alt_stack,
+                        self.thread.context.sp(),
+                        action.flags & SA_ONSTACK != 0,
+                    )?;
                     self.validate(address, FRAME_BYTES, true)?;
-                    let mut state = FrameState {
-                        regs: self.thread.context.regs,
-                        sp: self.thread.context.sp,
-                        pc: self.thread.context.pc,
-                        pstate: self.thread.context.status,
-                        fault_address: self.thread.context.far,
-                        simd: self.thread.context.simd,
-                        fpcr: self.thread.context.fpcr as u32,
-                        fpsr: self.thread.context.fpsr as u32,
-                    };
-                    // Readiness may have made this thread runnable before a
-                    // process-directed signal arrived. The old SVC remains a
-                    // blocked syscall until it actually retries; a handler
-                    // must return EINTR rather than silently retrying it.
-                    if self.thread.retry_syscall {
-                        state.pc = state.pc.checked_add(4).ok_or(Errno::Fault)?;
-                        state.regs[0] = (-(Errno::Intr as i64)) as u64;
-                    }
                     let mut bytes = [0; FRAME_BYTES];
-                    signal::encode_frame(
+                    self.thread.context.encode_signal_frame(
                         &mut bytes,
-                        &state,
+                        address,
                         self.thread.signals.mask(),
                         signal,
                         info,
-                    )?;
-                    signal::set_frame_stack(
-                        &mut bytes,
                         self.thread.alt_stack,
-                        self.thread.context.sp,
-                    );
+                        action.restorer,
+                    )?;
                     self.copy_to(address, &bytes)?;
-                    self.thread.signals.enter(
+                    self.thread.signals.enter_for(
                         &mut self.threads.shared.actions,
                         signal,
                         address,
-                        self.thread.context.tpidr_el0,
+                        self.thread.context.tls(),
+                        process_arch::IMAGE_ABI,
                     )?;
                     self.thread.retry_syscall = false;
                     self.thread.retry_descriptor = None;
-                    self.thread.context.regs[0] = u64::from(signal);
-                    self.thread.context.regs[1] = if action.flags & SA_SIGINFO != 0 {
-                        address
-                    } else {
-                        0
-                    };
-                    self.thread.context.regs[2] = if action.flags & SA_SIGINFO != 0 {
-                        address + UCONTEXT_OFFSET as u64
-                    } else {
-                        0
-                    };
-                    self.thread.context.regs[29] = address + RT_FRAME_BYTES as u64;
-                    self.thread.context.regs[30] = action.restorer;
-                    self.thread.context.pc = action.handler;
-                    self.thread.context.sp = address;
-                    self.thread.context.status &= 0xf0000000;
-                    self.thread.context.kind = 0;
-                    self.thread.context.esr = 0;
+                    self.thread
+                        .context
+                        .signal_handler(action, address, signal)?;
                     return Ok(None);
                 }
             }
@@ -214,41 +181,26 @@ impl Runner {
     }
 
     /// A successful rt_sigreturn restores user-edited registers, mask and
-    /// FPSIMD contents. Return the restored x0 so ordinary syscall completion
+    /// floating-point state. Return the restored result so syscall completion
     /// does not overwrite it. An error is a bad frame: parent must terminate
     /// SIGSEGV, not resume the restorer with a fabricated syscall error value.
     pub(super) fn signal_return(&mut self) -> Result<u64, Errno> {
-        let address = self.thread.context.sp;
+        let address = self.thread.context.signal_return_address()?;
         let tls = self.thread.signals.frame_tls(address)?;
         let mut bytes = [0; FRAME_BYTES];
         self.copy_from(address, &mut bytes)?;
-        let stack = signal::frame_stack(&bytes)?;
+        let (context, mask, stack) = self
+            .thread
+            .context
+            .restore_signal_frame(&bytes, address, tls)?;
         if stack.size != 0 {
             self.validate(stack.base, super::count(stack.size)?, true)?;
         }
-        let (state, mask) = signal::decode_frame(&bytes)?;
-        self.validate(state.pc, 4, false)?;
-        self.validate(state.sp.checked_sub(1).ok_or(Errno::Fault)?, 1, true)?;
-        // The TLS register is not part of Linux's ordinary signal ucontext.
-        // Keep a private per-level copy so a handler cannot lose the thread's
-        // original TLS accidentally; no user bytes select another process.
+        self.validate(context.pc(), process_arch::INSTRUCTION_ALIGNMENT, false)?;
+        self.validate(context.sp().checked_sub(1).ok_or(Errno::Fault)?, 1, true)?;
         self.thread.signals.leave(address, mask)?;
-        // Linux restores uc_stack on return, including after a handler on the
-        // ordinary stack successfully changes its registered alternate stack.
-        // Validate all user edits before committing any restored state.
         self.thread.alt_stack = stack;
-        self.thread.context = Context {
-            regs: state.regs,
-            pc: state.pc,
-            status: state.pstate,
-            sp: state.sp,
-            far: state.fault_address,
-            tpidr_el0: tls,
-            simd: state.simd,
-            fpcr: u64::from(state.fpcr),
-            fpsr: u64::from(state.fpsr),
-            ..Context::empty()
-        };
-        Ok(self.thread.context.regs[0])
+        self.thread.context = context;
+        Ok(self.thread.context.result())
     }
 }

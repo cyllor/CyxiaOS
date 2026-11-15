@@ -1,0 +1,39 @@
+{
+  "capability": [
+    1129928753,
+    65543,
+    1264146433,
+    1000000000
+  ],
+  "dependencies": {
+    "berkeley-softfloat-3": {
+      "commit": "b64af41c3276f97f0e181920400ee056b9c88037",
+      "url": "https://gitlab.com/qemu-project/berkeley-softfloat-3.git"
+    },
+    "berkeley-testfloat-3": {
+      "commit": "e7af9751d9f9fd3b47911f51a5cfd08af256a9ab",
+      "url": "https://gitlab.com/qemu-project/berkeley-testfloat-3.git"
+    },
+    "keycodemapdb": {
+      "commit": "f5772a62ec52591ff6870b7e8ef32482371f22c6",
+      "url": "https://gitlab.com/qemu-project/keycodemapdb.git"
+    }
+  },
+  "patch_sha256": "a78d5be7ddc346aa404499a36618d2df8caeba34055935b3d0f5d431ebee8f73",
+  "profile": {
+    "accelerator": "tcg",
+    "icount": false,
+    "migration": false,
+    "threads": "multi"
+  },
+  "schema_version": 1,
+  "source_sha256": {
+    "accel/tcg/cpu-exec.c": "d49ac54fba75a2ee3fe58792e8bbcd0e4ca8ada5775d5facbccdfcb9bc990b2b",
+    "cpu-common.c": "a8ff07ef43971f63dc46e66905f5477151599c4ea04463739da4e684780bf243",
+    "include/hw/core/cpu.h": "de600db32b68fe9edd9d2f9afd2d9a887d03d33aca65c0c5a486e9c96f1e0e62",
+    "target/i386/cpu.c": "18e7b36ea535639e4a92fdcf932689eb40e412990f1c10a31b789a8cf9234c58",
+    "target/i386/cpu.h": "3e1de08117d1e3bc4e82199a73969e283255c7451c3bb81226582a13dfc95711",
+    "target/i386/tcg/system/misc_helper.c": "75a96ed1f6474824813cdf07268f7e5aad1000d3ddcd2921f0156141a45d954d"
+  },
+  "upstream_commit": "f8ed81651e61d9c2166df6121ce2af0f44f06b3e"
+}

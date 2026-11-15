@@ -8,3 +8,4 @@ large-memory = []
 
 [dependencies]
 cyxia-ai-fs = { path = "../ai-fs" }
+cyxia-contracts = { path = "../contracts" }

@@ -20,6 +20,7 @@ from build_sysroot import (ROOT, DEFAULT_OUTPUT, BUILD_TOOLS, Builder, BuildErro
                           validate_packages)
 from build_gtk_foundation import archive_architecture
 import desktop_ports
+from target_profile import profile_for
 
 MANIFEST = ROOT / 'ports/cosmic/wayland-source.json'
 EXPAT_MANIFEST = ROOT / 'ports/libc/openbox-fonts.json'
@@ -63,7 +64,7 @@ def native_environment(builder):
             builder.env.pop(key)
     builder.env.update(CC=builder.tools['clang'],
                        PATH=str(BUILD_TOOLS / 'bin') + os.pathsep + builder.env.get('PATH', ''),
-                       PKG_CONFIG_LIBDIR=str(HOST / 'lib/pkgconfig'),
+                       PKG_CONFIG_LIBDIR=str((builder.output / "wayland-host-tools") / 'lib/pkgconfig'),
                        PKG_CONFIG_PATH='')
 
 
@@ -71,7 +72,7 @@ def build_host(builder, wayland_source, expat_source):
     native_environment(builder)
     directory = builder.output / 'wayland-host-expat-build'
     fresh(directory)
-    builder.run([str(expat_source / 'configure'), '--prefix=' + str(HOST),
+    builder.run([str(expat_source / 'configure'), '--prefix=' + str((builder.output / "wayland-host-tools")),
                  '--disable-shared', '--enable-static', '--without-xmlwf',
                  '--without-examples', '--without-tests', '--without-docbook'],
                 'wayland-host-expat-setup.log', directory)
@@ -81,7 +82,7 @@ def build_host(builder, wayland_source, expat_source):
     directory = builder.output / 'wayland-host-build'
     fresh(directory)
     meson = str(BUILD_TOOLS / 'bin/meson')
-    options = ['--prefix=' + str(HOST), '--libdir=lib', '--wrap-mode=nofallback',
+    options = ['--prefix=' + str((builder.output / "wayland-host-tools")), '--libdir=lib', '--wrap-mode=nofallback',
                '-Dbuildtype=release', '-Ddefault_library=static', '-Dlibraries=false',
                '-Dscanner=true', '-Dtests=false', '-Ddocumentation=false', '-Ddtd_validation=false']
     builder.run([meson, 'setup', str(directory), str(wayland_source), *options],
@@ -89,11 +90,11 @@ def build_host(builder, wayland_source, expat_source):
     builder.run([meson, 'compile', '-C', str(directory), '-j', str(builder.jobs)],
                 'wayland-host-build.log')
     builder.run([meson, 'install', '-C', str(directory)], 'wayland-host-install.log')
-    scanner = HOST / 'bin/wayland-scanner'
+    scanner = builder.output / "wayland-host-tools" / 'bin/wayland-scanner'
     version = subprocess.check_output([str(scanner), '--version'], env=builder.env,
                                       stderr=subprocess.STDOUT, text=True).strip()
     return {'path': str(scanner), 'sha256': digest(scanner), 'version': version,
-            'expat_sha256': digest(HOST / 'lib/libexpat.a'), 'options': options}
+            'expat_sha256': digest(builder.output / "wayland-host-tools" / 'lib/libexpat.a'), 'options': options}
 
 
 def build_target(builder, wayland_source):
@@ -108,14 +109,14 @@ def build_target(builder, wayland_source):
     builder.env['PKG_CONFIG'] = str(builder.shell_wrapper('wayland-target-pkg-config', [pkg, '--static']))
     host_pkg = builder.shell_wrapper('wayland-host-pkg-config',
         ['env', '-u', 'PKG_CONFIG_SYSROOT_DIR', '-u', 'PKG_CONFIG_PATH',
-         'PKG_CONFIG_LIBDIR=' + str(HOST / 'lib/pkgconfig'), pkg, '--static'])
+         'PKG_CONFIG_LIBDIR=' + str((builder.output / "wayland-host-tools") / 'lib/pkgconfig'), pkg, '--static'])
     cross = builder.output / 'wayland-cross.ini'
     cross.write_text('[binaries]\n' +
         'c = ' + repr(builder.env['CC']) + '\n' +
         'ar = ' + repr(builder.tools['llvm-ar']) + '\n' +
         'strip = ' + repr(builder.tools['llvm-strip']) + '\n' +
         'pkg-config = ' + repr(builder.env['PKG_CONFIG']) + '\n' +
-        "[host_machine]\nsystem = 'linux'\ncpu_family = 'aarch64'\ncpu = 'cortex-a53'\nendian = 'little'\n" +
+        builder.target.meson_machine() +
         '[properties]\nneeds_exe_wrapper = true\nsys_root = ' + repr(str(target)) + '\n' +
         'pkg_config_libdir = ' + repr(builder.env['PKG_CONFIG_LIBDIR'].split(os.pathsep)) + '\n')
     native = builder.output / 'wayland-native.ini'
@@ -140,8 +141,28 @@ def build_target(builder, wayland_source):
     finally:
         builder.env.pop('DESTDIR', None)
     return {'options': options, 'archives': {
-        name: archive_architecture(target / 'usr/lib' / name) for name in
+        name: archive_architecture(target / 'usr/lib' / name, builder.target) for name in
         ('libwayland-client.a', 'libwayland-server.a', 'libwayland-cursor.a', 'libwayland-egl.a')}}
+
+
+def build_libffi(builder, fetch):
+    """Reuse the pinned libffi source/recipe needed by genuine Wayland calls."""
+    manifest = ROOT / 'ports/libc/openbox-foundation.json'
+    package = next(item for item in json.loads(manifest.read_text())['packages'] if item['name'] == 'libffi')
+    validate_packages([package])
+    directory, record = source(builder, package, fetch)
+    builder.target_environment()
+    build_dir = builder.output / 'wayland-libffi-build'
+    fresh(build_dir)
+    options = ['--prefix=/usr', '--host=' + builder.target.c_target,
+               '--disable-shared', '--enable-static', '--disable-multi-os-directory',
+               '--disable-docs', '--disable-exec-static-tramp']
+    builder.run([str(directory / 'configure'), *options], 'wayland-libffi-setup.log', build_dir)
+    builder.run([builder.tools['make'], '-j' + str(builder.jobs)], 'wayland-libffi-build.log', build_dir)
+    builder.run([builder.tools['make'], 'install', 'DESTDIR=' + str(builder.output / 'sysroot')],
+                'wayland-libffi-install.log', build_dir)
+    return dict(source=record, manifest_sha256=digest(manifest), options=options,
+                archive=builder.target.inspect_archive(builder.output / 'sysroot/usr/lib/libffi.a'))
 
 
 def link_probe(builder):
@@ -153,10 +174,10 @@ def link_probe(builder):
     builder.run([builder.env['CC'], '-Os', '-ffunction-sections', '-fdata-sections',
                  '-Wall', '-Wextra', '-Werror', '-Wl,--gc-sections',
                  str(path), *flags, '-o', str(temporary)], 'wayland-probe-link.log')
-    layout = inspect_elf(temporary)
+    layout = inspect_elf(temporary, builder.target)
     shutil.copyfile(temporary, builder.output / 'wayland-probe.symbols.elf')
     builder.run([builder.tools['llvm-strip'], '--strip-all', str(temporary)], 'wayland-probe-strip.log')
-    probe = inspect_elf(temporary)
+    probe = inspect_elf(temporary, builder.target)
     temporary.replace(builder.output / 'wayland-probe.elf')
     probe['file'] = str(builder.output / 'wayland-probe.elf')
     return {'probe': probe, 'symbol_image_sha256': layout['sha256'], 'source_sha256': digest(path)}
@@ -166,8 +187,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('inventory', 'build'), nargs='?', default='inventory')
     parser.add_argument('--fetch', action='store_true')
+    parser.add_argument('--bootstrap-libffi', action='store_true', help='Build the existing pinned libffi dependency first')
+    parser.add_argument('--arch', choices=('aarch64', 'x86_64'), default='aarch64')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
+    selected_target = profile_for(args.arch)
+    output = (args.output or selected_target.default_output(ROOT)).resolve()
+    report_path = output / "wayland-build-report.json"
+    host = output / "wayland-host-tools"
     try:
         wayland, expat = packages()
         if args.fetch and args.command != 'build':
@@ -176,44 +204,48 @@ def main():
             raise BuildError('--jobs must be in 1..16')
         if args.command == 'inventory':
             print(json.dumps({'wayland': wayland, 'host_expat': expat,
-                              'output': str(DEFAULT_OUTPUT), 'network': False,
+                              'output': str(output), 'network': False,
                               'guest_execution': 'not performed'}, indent=2))
             return 0
-        if shutil.disk_usage(DEFAULT_OUTPUT).free < 512 * 1024 * 1024:
+        if shutil.disk_usage(output).free < 512 * 1024 * 1024:
             raise BuildError('At least 512 MiB free disk required')
-        for path in (DEFAULT_OUTPUT / 'sysroot/usr/lib/libffi.a',
-                     DEFAULT_OUTPUT / 'sysroot/usr/lib/libc.a', BUILD_TOOLS / 'bin/meson'):
+        prerequisites = [output / 'sysroot/usr/lib/libc.a', BUILD_TOOLS / 'bin/meson']
+        if not args.bootstrap_libffi:
+            prerequisites.append(output / 'sysroot/usr/lib/libffi.a')
+        for path in prerequisites:
             if not path.is_file():
                 raise BuildError('Missing prerequisite: ' + str(path))
-        with (DEFAULT_OUTPUT / '.build.lock').open('w') as lock:
+        with (output / '.build.lock').open('w') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise BuildError('Another sysroot build is active') from error
-            REPORT.unlink(missing_ok=True)
-            builder = Builder(DEFAULT_OUTPUT, toolchain(), args.jobs)
-            report = {'status': 'building', 'manifest_sha256': digest(MANIFEST),
+            report_path.unlink(missing_ok=True)
+            builder = Builder(output, toolchain(), args.jobs, selected_target)
+            report = {'status': 'building', 'architecture': selected_target.architecture, 'target_triple': selected_target.rust_target, 'manifest_sha256': digest(MANIFEST),
                       'expat_manifest_sha256': digest(EXPAT_MANIFEST),
                       'builder_sha256': digest(Path(__file__)), 'toolchain': builder.tools,
                       'commands': builder.commands, 'guest_execution': 'not performed',
                       'limitations': ['No compositor or COSMIC desktop is built.',
                                       'No wl_shm, ancillary FD transfer, EGL rendering or GPU acceleration is claimed.']}
             try:
+                if args.bootstrap_libffi:
+                    report['libffi_producer'] = build_libffi(builder, args.fetch)
                 wl_source, wl_record = source(builder, wayland, args.fetch)
                 expat_source, expat_record = source(builder, expat, args.fetch)
                 report['sources'] = [wl_record, expat_record]
                 report['native_scanner'] = build_host(builder, wl_source, expat_source)
                 report['target'] = build_target(builder, wl_source)
                 report.update(link_probe(builder))
-                report['target_libffi_sha256'] = digest(DEFAULT_OUTPUT / 'sysroot/usr/lib/libffi.a')
-                report['target_libc_sha256'] = digest(DEFAULT_OUTPUT / 'sysroot/usr/lib/libc.a')
+                report['target_libffi_sha256'] = digest(output / 'sysroot/usr/lib/libffi.a')
+                report['target_libc_sha256'] = digest(output / 'sysroot/usr/lib/libc.a')
                 report['status'] = 'cross-built'
             except Exception as error:
                 report['status'], report['error'] = 'failed', str(error)
                 raise
             finally:
-                REPORT.write_text(json.dumps(report, indent=2) + '\n')
-        print(json.dumps({'status': report['status'], 'report': str(REPORT),
+                report_path.write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps({'status': report['status'], 'report': str(report_path),
                           'probe': report['probe'], 'guest_execution': 'not performed'}, indent=2))
         return 0
     except (BuildError, desktop_ports.PortError, OSError, ValueError, subprocess.SubprocessError) as error:

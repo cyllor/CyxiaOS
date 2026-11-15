@@ -35,6 +35,17 @@ impl Serial16550 {
         }
         Self { _private: () }
     }
+    pub fn try_read(&mut self) -> Result<Option<u8>, PlatformError> {
+        crate::uart::receive(self)
+    }
+}
+
+impl crate::uart::Registers for Serial16550 {
+    fn read_register(&mut self, offset: u16) -> u8 {
+        assert!(offset < 8, "UART register outside owned device");
+        // SAFETY: init grants this object sole ownership of the eight COM1 ports.
+        unsafe { inb(COM1_BASE + offset) }
+    }
 }
 
 impl ConsoleOps for Serial16550 {
@@ -117,4 +128,43 @@ pub unsafe fn mask_timer_irq() {
         let mask = inb(PIC_MASTER_COMMAND + 1);
         outb(PIC_MASTER_COMMAND + 1, mask | 1);
     }
+}
+
+/// # Safety
+/// BSP owns both PICs; interrupts disabled and legacy IRQ work has completed.
+pub unsafe fn mask_all_irqs() {
+    unsafe {
+        pic_write(PIC_MASTER_COMMAND + 1, 0xff);
+        pic_write(PIC_SLAVE_COMMAND + 1, 0xff);
+    }
+}
+
+/// Bounded PIT channel-2 one-shot delay, independent of local CPU/TSC rate.
+/// This measures board elapsed time, never execution debit.
+///
+/// # Safety
+/// BSP exclusively owns PIT channel 2 and port 61; no speaker user or other CPU
+/// may reprogram them. `micros` is in 1..=20000. Caller does not require IRQs.
+pub unsafe fn delay_us(micros: u32) -> Result<(), PlatformError> {
+    if micros == 0 || micros > 20000 {
+        return Err(PlatformError::Invalid);
+    }
+    let count = (u64::from(micros) * u64::from(crate::PIT_INPUT_HZ)).div_ceil(1_000_000) as u16;
+    unsafe {
+        let original = inb(0x61);
+        outb(0x61, original & !3); // speaker disconnected, gate low.
+        outb(PIT_COMMAND, 0xb0); // channel2, low/high, one-shot mode0.
+        outb(0x42, count as u8);
+        outb(0x42, (count >> 8) as u8);
+        outb(0x61, (original & !2) | 1); // gate high starts the counter.
+        for _ in 0..10_000_000 {
+            if inb(0x61) & 0x20 != 0 {
+                outb(0x61, original);
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        outb(0x61, original);
+    }
+    Err(PlatformError::Again)
 }

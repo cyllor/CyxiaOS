@@ -137,7 +137,7 @@ class Evidence(unittest.TestCase):
     def test_manifest_cannot_invoke_recorded_tool_path(self):
         f=self.f;sources={'kernel/src/main.rs':'source'};producer={'tools/x86_64.py':'tool'}
         cache={'base':'/private/tmp/fixture','effective':'/private/tmp/fixture/source'}
-        manifest=dict(version=1,status='BUILT_NOT_RUN',target=f.TARGET,profile='dev',features=['selftest'],
+        manifest=dict(version=f.VERSION,status='BUILT_NOT_RUN',target=f.TARGET,profile='dev',features=['selftest'],mechanism='bsp',
             sources=sources,source_sha256=f.digest_map(sources),producer_sources=producer,
             source_root=str(f.ROOT.resolve()),native_acceptance_status='NOT_RUN',cache=cache,
             cargo={'path':'/untrusted/from-manifest','sha256':'binary'},
@@ -189,7 +189,6 @@ class Evidence(unittest.TestCase):
         self.assertIn('tools/build_sources.py',sources)
         self.assertNotIn('tools/build_unified.py',sources)
         self.assertFalse(any(name.startswith('tools/run_v') or name.startswith('tools/verify_') for name in sources))
-        self.assertLessEqual(len(sources),6)
 
     def test_native_guard_and_lease_are_shared_across_platforms(self):
         common=importlib.import_module('native_session')

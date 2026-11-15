@@ -4,7 +4,8 @@
 //! a canonical read-only observation and cannot authorize or apply its command.
 #[path = "src/decision.rs"]
 mod decision;
-use core::arch::asm;
+#[path = "../shared/calls.rs"]
+mod calls;
 use cyxia_prototype::learning::coordinator_wire::{COMMAND_BYTES, SNAPSHOT_BYTES};
 
 const INPUT: u64 = 0x100000;
@@ -12,7 +13,7 @@ const OUTPUT: u64 = 0x101000;
 
 fn abort(code: u64) -> ! {
     unsafe {
-        asm!("svc #0x563", in("x0") code, options(nostack));
+        let _ = calls::call::<0x563>([code, 0, 0, 0, 0], 0);
     }
     loop {
         core::hint::spin_loop();
@@ -24,15 +25,15 @@ fn abort(code: u64) -> ! {
 extern "C" fn _start(mode: u64, input_len: u64, output_len: u64) -> ! {
     match mode {
         1 => unsafe {
-            asm!("str xzr, [{}]", in(reg) INPUT, options(nostack));
+            (INPUT as *mut u64).write_volatile(0);
             abort(1)
         },
         2 => unsafe {
-            asm!("str xzr, [{}]", in(reg) 0x80000u64, options(nostack));
+            (0x80000u64 as *mut u64).write_volatile(0);
             abort(2)
         },
         3 => unsafe {
-            asm!("ldr x9, [{}]", in(reg) 0x30000u64, out("x9") _, options(nostack));
+            core::hint::black_box((0x30000u64 as *const u64).read_volatile());
             abort(3)
         },
         4 => loop {
@@ -48,12 +49,7 @@ extern "C" fn _start(mode: u64, input_len: u64, output_len: u64) -> ! {
     let output = unsafe { core::slice::from_raw_parts_mut(OUTPUT as *mut u8, COMMAND_BYTES) };
     match decision::run(input, output) {
         Ok(COMMAND_BYTES) => unsafe {
-            asm!(
-                "svc #0x562",
-                in("x0") OUTPUT,
-                in("x1") COMMAND_BYTES as u64,
-                options(nostack)
-            );
+            let _ = calls::call::<0x562>([OUTPUT, COMMAND_BYTES as u64, 0, 0, 0], 0);
         },
         Ok(_) => abort(7),
         Err(error) => abort(0x100 + error as u64),

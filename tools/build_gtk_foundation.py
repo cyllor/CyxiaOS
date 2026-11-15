@@ -54,31 +54,16 @@ OPTIONS = {
 }
 
 
-def archive_architecture(path):
-    """Inspect every archive object, rather than assuming its filename is ARM."""
-    data = path.read_bytes()
-    if data[:8] != b'!<arch>\n':
-        raise BuildError(f'Not a regular static archive: {path}')
-    offset, count = 8, 0
-    while offset < len(data):
-        header = data[offset:offset + 60]
-        if len(header) != 60 or header[58:] != b'`\n':
-            raise BuildError(f'Invalid archive header: {path}')
-        size = int(header[48:58].strip())
-        body = data[offset + 60:offset + 60 + size]
-        name = header[:16].strip()
-        if name not in (b'/', b'//', b'/SYM64/'):
-            if len(body) < 20 or body[:6] != b'\x7fELF\x02\x01':
-                raise BuildError(f'Archive member is not ELF64 LE: {path}: {name!r}')
-            kind, machine = struct.unpack_from('<HH', body, 16)
-            if (kind, machine) != (1, 183):
-                raise BuildError(f'Archive member is not AArch64 ET_REL: {path}: {name!r}')
-            count += 1
-        offset += 60 + size + size % 2
-    if count == 0 or offset != len(data):
-        raise BuildError(f'Empty or truncated archive: {path}')
-    return {'sha256': digest(path), 'bytes': path.stat().st_size,
-            'aarch64_object_count': count}
+def archive_architecture(path, target="aarch64"):
+    """Validate every object against the explicitly selected target."""
+    from target_profile import profile_for
+    try:
+        result = profile_for(target).inspect_archive(path)
+    except ValueError as error:
+        raise BuildError(str(error)) from error
+    # Historical ARM report consumers keep their exact object-count field.
+    result[result["architecture"] + "_object_count"] = result["object_count"]
+    return result
 
 
 def link_probe(builder):

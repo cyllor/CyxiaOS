@@ -6,21 +6,31 @@
 主开发/加速验证宿主为 Linux x86-64，显式选择 KVM；macOS ARM 可继续交叉编译和运行 TCG 功能回归。
 ARM64 保留独立兼容适配与历史证据。最小原型配置 1.3、模型/协议版本和验收预算不随分支号改变。
 
-当前 PC 支持单 BSP、256 MiB、分页保护、异常、定时器和用户态往返；尚未完成 x86 SMP、
-生产运行时、PCI/VirtIO 和 A03 原生学习链。64 核/128 GiB 是宿主资源，不代表客体已经支持。
+当前开发目标为 **完整 CyxiaOS + COSMIC 桌面**，桌面沿用已有 COSMIC / Smithay / Wayland 移植线。
+用户已取消当前 A03 推进；原型测试保留回归用途，不再阻塞正式系统开发。
+2026-11-15：正式四核、1 GiB x86 系统已验证真实 PCI/VirtIO 块设备、显示与键鼠，
+Shell 文件读写和磁盘重启恢复；私有地址空间中的 C/Rust 程序、抢占、隔离、FP/TLS、堆与 IPC
+已实际运行通过。普通进程已接入三个 AP，捕获验证了三个独立进程同时处于用户态；CPU0 在
+所有用户核退出后处理共享服务。Linux64 的 musl、Rust std 线程/信号、Wayland 和 xkbcommon
+客体测试通过；Mesa 软件 EGL/GLES 渲染及 OOM 恢复通过。Smithay 已通过真实 x86 客体的
+独立客户端、12 个显示场景、键盘交互与资源回收验证，见 [系统与桌面集成记录](docs/implementation/v17-os-cosmic-20261115.md)。
+**尚未运行完整 COSMIC 会话。** 64 核/128 GiB 是宿主资源，不代表客体已经支持。
 [V0.17 平台设计](CyxiaOS-v0.17-platform-design.md) 是本分支的平台基线；
-[开发路线与 A03 缺口](docs/implementation/v17-development.md) 区分实现、测试和验收状态。
+[完整系统实施计划](docs/superpowers/plans/2026-11-14-v017-x86-runtime.md) 记录当前方向，
+[开发记录](docs/implementation/v17-development.md) 保留各阶段实现与验收状态。
 
 ```sh
-python3 -B tools/build.py --output artifacts/v017-x86-build
-python3 -B tools/x86_64.py run --build artifacts/v017-x86-build --output artifacts/v017-x86-run
-# Linux x86-64 上明确选择加速：上一条 run 命令增加 --accel kvm
-python3 -B tools/x86_64.py check --directory artifacts/v017-x86-run
+python3 tools/os_x86.py build --output artifacts/v017-os-build --graphics
+python3 tools/storage.py artifacts/v017-os-data.raw
+python3 tools/os_x86.py run --build artifacts/v017-os-build --disk artifacts/v017-os-data.raw
+# macOS 图形设备窗口：增加 --display cocoa；当前基础镜像仍是 Shell/显示测试面。
+# Linux x86-64 上明确选择 KVM：run 增加 --accel kvm；本轮实际验证使用 TCG。
+python3 tools/os_smoke.py --build artifacts/v017-os-build --output artifacts/v017-os-native-run --scenario native
 ```
 
-构建 CLI 默认 x86-64。ARM 回归必须传 `--arch aarch64`；原有 ARM 专项工具与 Python 构建 API
-保留其明确范围。平台自测不能替代 A03/A10；V0.17 的 A01–A16 均需重新取得与架构、源码、
-工具和实际运行绑定的证据，历史 PASS 不自动迁移。
+`os_x86.py` 是持续运行的正式系统入口；`x86_64.py` 保留独立平台机制回归。
+原 `build.py` 默认 x86-64，ARM 回归显式传 `--arch aarch64`。测试工具创建自己的专用磁盘；
+交互磁盘只在首次使用时创建，不覆盖已有文件。历史 A01–A16 PASS 不自动迁移，当前不再推进 A03。
 
 本分支承接 [V0.16 审核修复](docs/implementation/v16-source-summary.md)、
 [R15 x86 支持](docs/implementation/v16-x86-platform-20261114-r15.md) 与

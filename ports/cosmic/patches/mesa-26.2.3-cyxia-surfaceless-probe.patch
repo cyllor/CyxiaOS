@@ -1,0 +1,11 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -200,6 +200,7 @@
+     include_directories : inc_include,
+     link_with : [libegl, libgles2],
+-    dependencies : [dep_x11_xcb, dep_xcb],
++    dependencies : with_platform_x11 ? [dep_x11_xcb, dep_xcb] : [],
++    c_args : with_platform_x11 ? [] : ['-DCYXIA_EGL_SURFACELESS_ONLY=1'],
+     link_args : ['-Wl,--gc-sections'],
+     install : false)
+ endif

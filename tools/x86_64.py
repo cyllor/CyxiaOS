@@ -18,6 +18,7 @@ import sys
 import time
 
 import elf64
+import x86_smp
 from doctor import ROOT, env
 from build_sources import build_cache_context, code_source_map
 from native_session import DEFAULT_NATIVE_LOCK, native_lease, idle_native_host
@@ -30,7 +31,17 @@ MAX_SERIAL = 8 * 1024 * 1024
 MAX_ELF = 64 * 1024 * 1024
 MARKERS = ('X86_BOOT_OK', 'PAGING_WX_OK', 'EXCEPTION_OK', 'FRAME_POOL_OK',
            'SHARED_CORE_OK', 'TIMER_IRQ_OK', 'USER_MODE_OK', 'X86_SELFTEST_OK')
-VERSION = 1
+VERSION = 2
+
+
+def mechanism_features(mechanism):
+    require(mechanism in ('bsp', 'smp'), 'unsupported x86 mechanism profile')
+    return ['smp-selftest'] if mechanism == 'smp' else ['selftest']
+
+
+def mechanism_markers(mechanism):
+    mechanism_features(mechanism)
+    return MARKERS[:-1] + x86_smp.MARKERS + MARKERS[-1:] if mechanism == 'smp' else MARKERS
 
 
 def require(ok, message):
@@ -103,8 +114,8 @@ def tool_sources():
     return dict(sorted(result.items()))
 
 
-def inspect_elf(raw):
-    require(len(raw) <= MAX_ELF, 'ELF exceeds file budget')
+def inspect_elf(raw, *, runtime=False):
+    require(len(raw) <= (256 * 1024 * 1024 if runtime else MAX_ELF), 'ELF exceeds file budget')
     header = elf64.decode(raw)
     require(header['kind'] == 2 and header['machine'] == 62 and header['flags'] == 0,
             'not x86-64 executable')
@@ -114,7 +125,9 @@ def inspect_elf(raw):
         if s['type'] != 1 or s['mem'] == 0:
             continue
         pa, va, ms, fs, fl, al, off = (s[k] for k in ('pa', 'va', 'mem', 'size', 'flags', 'align', 'offset'))
-        require(LOAD_BASE <= pa < pa + ms <= LOAD_LIMIT and va == pa, 'load outside low identity pool')
+        limit = 512 * 1024 * 1024 if runtime else LOAD_LIMIT
+        require(LOAD_BASE <= pa < pa + ms <= limit, 'load outside physical kernel pool')
+        require(va == pa or (runtime and va == 0xffff800000000000 + pa), 'incorrect physical/virtual load mapping')
         require(fl in (4, 5, 6), 'writable executable or invalid segment permissions')
         require(al in (0, 1) or (al & (al - 1) == 0 and va % al == off % al), 'invalid segment alignment')
         for old in loads:
@@ -123,6 +136,11 @@ def inspect_elf(raw):
         loads.append({k: s[k] for k in ('pa', 'va', 'mem', 'size', 'offset', 'flags')})
     loads.sort(key=lambda s: s['pa'])
     require(loads and loads[0]['pa'] == LOAD_BASE, 'incorrect load base')
+    if runtime:
+        high = [s for s in loads if s['va'] != s['pa']]
+        require(high and any(s['flags'] == 5 for s in high), 'missing high-half kernel code')
+        require(all(s['pa'] + s['mem'] <= high[0]['pa'] for s in loads if s['va'] == s['pa']),
+                'low bootstrap overlaps high-half kernel allocation')
     entry = header['entry']
     require(any(s['flags'] & 1 and s['va'] <= entry < s['va'] + s['size'] for s in loads), 'entry not executable')
     require(entry < 2 ** 32, 'Multiboot entry exceeds 32-bit address')
@@ -133,8 +151,8 @@ def symbol(raw, name):
     return elf64.symbol(raw, name, inspect_elf(raw)['loads'])
 
 
-def boot_image(raw):
-    info = inspect_elf(raw)
+def boot_image(raw, *, runtime=False):
+    info = inspect_elf(raw, runtime=runtime)
     loads = info['loads']
     file_end = max(s['pa'] + s['size'] for s in loads if s['size'])
     mem_end = max(s['pa'] + s['mem'] for s in loads)
@@ -216,9 +234,9 @@ def fresh_output(path):
     return path
 
 
-def build_argv(cargo, profile):
+def build_argv(cargo, profile, mechanism='bsp'):
     argv = [cargo, 'build', '--locked', '--offline', '-p', 'cyxia-kernel', '--bin', 'cyxia-kernel',
-            '--target', TARGET, '--no-default-features', '--features', 'selftest']
+            '--target', TARGET, '--no-default-features', '--features', ','.join(mechanism_features(mechanism))]
     return argv + (['--release'] if profile == 'release' else [])
 
 
@@ -243,8 +261,9 @@ def compiler_tools(cargo, rustc):
     return versions, binaries
 
 
-def build(output, *, profile='dev', cargo='cargo', target_dir=None, native_lock=DEFAULT_NATIVE_LOCK):
+def build(output, *, profile='dev', mechanism='bsp', cargo='cargo', target_dir=None, native_lock=DEFAULT_NATIVE_LOCK):
     require(profile in ('dev', 'release'), 'invalid profile')
+    features = mechanism_features(mechanism)
     with native_lease(prepare_native_lock(native_lock)):
         idle_native_host()
         output = fresh_output(output)
@@ -253,7 +272,7 @@ def build(output, *, profile='dev', cargo='cargo', target_dir=None, native_lock=
         cache = build_cache_context(target_dir or ROOT / 'target' / 'x86_64', ROOT, sources)
         cargo = executable(cargo)
         rustc = executable('rustc')
-        argv = build_argv(cargo, profile)
+        argv = build_argv(cargo, profile, mechanism)
         environment = build_environment(cache)
         versions, binaries = compiler_tools(cargo, rustc)
         with (output / 'build.log').open('wb') as log:
@@ -268,7 +287,7 @@ def build(output, *, profile='dev', cargo='cargo', target_dir=None, native_lock=
         (output / 'kernel.elf').write_bytes(raw)
         (output / 'boot.bin').write_bytes(flat)
         manifest = dict(version=VERSION, status='BUILT_NOT_RUN', target=TARGET, profile=profile,
-            features=['selftest'], source_root=str(ROOT.resolve()), sources=sources, source_sha256=digest_map(sources),
+            features=features, mechanism=mechanism, source_root=str(ROOT.resolve()), sources=sources, source_sha256=digest_map(sources),
             producer_sources=producer, build_argv=argv, cache=cache, tool_versions=versions,
             compiler_binaries=binaries,
             cargo=dict(path=cargo, sha256=sha(cargo)), rustc=dict(path=rustc, sha256=sha(rustc)),
@@ -281,8 +300,10 @@ def build(output, *, profile='dev', cargo='cargo', target_dir=None, native_lock=
 def validate_build(directory, *, cargo='cargo'):
     directory = Path(directory).resolve(strict=True)
     manifest = read_json(directory / 'build-manifest.json')
+    mechanism = manifest.get('mechanism')
+    features = mechanism_features(mechanism)
     require(manifest.get('version') == VERSION and manifest.get('target') == TARGET
-            and manifest.get('status') == 'BUILT_NOT_RUN' and manifest.get('features') == ['selftest']
+            and manifest.get('status') == 'BUILT_NOT_RUN' and manifest.get('features') == features
             and manifest.get('profile') in ('dev', 'release'), 'unsupported build manifest')
     sources = code_source_map(ROOT)
     require(manifest.get('sources') == sources and manifest.get('source_sha256') == digest_map(sources), 'compiled source mismatch')
@@ -301,7 +322,7 @@ def validate_build(directory, *, cargo='cargo'):
     versions, binaries = compiler_tools(trusted_tools['cargo'], trusted_tools['rustc'])
     require(manifest.get('tool_versions') == versions and manifest.get('compiler_binaries') == binaries,
             'compiler toolchain identity mismatch')
-    require(manifest.get('build_argv') == build_argv(manifest['cargo']['path'], manifest['profile']),
+    require(manifest.get('build_argv') == build_argv(manifest['cargo']['path'], manifest['profile'], mechanism),
             'build argv mismatch')
     raw = bounded_bytes(directory / 'kernel.elf', MAX_ELF)
     flat = bounded_bytes(directory / 'boot.bin', LOAD_LIMIT - LOAD_BASE)
@@ -323,7 +344,8 @@ def decoded_serial(raw):
     return text, chunks, decoder
 
 
-def validate_serial(raw, returncode, *, forced, eof):
+def validate_serial(raw, returncode, *, forced, eof, mechanism='bsp'):
+    markers = mechanism_markers(mechanism)
     require(type(returncode) is int and returncode == 33 and forced is False and eof is True,
             'guest did not finish with owned, clean debug-exit success (33)')
     text, chunks, decoder = decoded_serial(raw)
@@ -334,10 +356,12 @@ def validate_serial(raw, returncode, *, forced, eof):
     else:
         lines = [chunk.decode('ascii') for chunk in chunks]
     require(not any('PANIC' in line.upper() or 'FAIL' in line.upper() for line in lines), 'guest failure marker')
-    observed = [line.strip() for line in lines if line.strip() in MARKERS]
-    require(observed == list(MARKERS), 'missing, duplicated or out-of-order x86 selftest markers')
-    require([line.strip() for line in lines if line.strip()][-1] == MARKERS[-1], 'selftest success is not terminal')
-    return dict(markers=observed, frames=decoder.frames, session=decoder.session,
+    observed = [line.strip() for line in lines if line.strip() in markers]
+    require(observed == list(markers), 'missing, duplicated or out-of-order x86 selftest markers')
+    require([line.strip() for line in lines if line.strip()][-1] == markers[-1], 'selftest success is not terminal')
+    smp = x86_smp.decode(lines) if mechanism == 'smp' else None
+    require(mechanism == 'smp' or not any(line.startswith('SMP_') for line in lines), 'SMP evidence in BSP profile')
+    return dict(markers=observed, frames=decoder.frames, session=decoder.session, smp=smp,
                 serial_sha256=sha_bytes(raw), text=text)
 
 
@@ -377,8 +401,10 @@ def close_process(proc):
     return True
 
 
-def launch_argv(qemu, image, accel):
-    return [str(qemu), '-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64', '-smp', '1', '-m', '256M',
+def launch_argv(qemu, image, accel, mechanism='bsp'):
+    mechanism_features(mechanism)
+    cpus = 'cpus=4,sockets=1,cores=4,threads=1' if mechanism == 'smp' else '1'
+    return [str(qemu), '-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64', '-smp', cpus, '-m', '256M',
             '-accel', accelerator(accel), '-display', 'none', '-monitor', 'none', '-serial', 'stdio',
             '-nic', 'none', '-no-reboot', '-device', 'isa-debug-exit,iobase=0xf4,iosize=4', '-kernel', str(image)]
 
@@ -399,13 +425,15 @@ def check(directory, *, qemu='qemu-system-x86_64', cargo='cargo'):
     directory = Path(directory).resolve(strict=True)
     before = inventory(directory)
     manifest = validate_build(directory / 'build', cargo=cargo)
+    mechanism = manifest['mechanism']
     request = read_json(directory / 'request.json')
     process = read_json(directory / 'process.json')
-    require(request.get('version') == VERSION and request.get('markers') == list(MARKERS), 'unsupported capture request')
+    require(request.get('version') == VERSION and request.get('mechanism') == mechanism
+            and request.get('markers') == list(mechanism_markers(mechanism)), 'unsupported capture request')
     validate_timeout(request.get('timeout'))
     qemu = executable(qemu)
     require(request.get('qemu') == dict(path=qemu, sha256=sha(qemu), version=version(qemu)), 'QEMU binary identity mismatch')
-    require(request.get('argv') == launch_argv(qemu, directory / 'build' / 'boot.bin', request['accel']), 'launch argv mismatch')
+    require(request.get('argv') == launch_argv(qemu, directory / 'build' / 'boot.bin', request['accel'], mechanism), 'launch argv mismatch')
     require(request.get('build_manifest_sha256') == sha(directory / 'build' / 'build-manifest.json'), 'build receipt mismatch')
     require(process.get('error') is None and type(process.get('pid')) is int and process['pid'] > 0,
             'capture error or missing owned process')
@@ -414,11 +442,12 @@ def check(directory, *, qemu='qemu-system-x86_64', cargo='cargo'):
     require(type(process.get('started_ns')) is int and type(process.get('ended_ns')) is int
             and 0 < process['started_ns'] <= process['ended_ns'], 'invalid process wall timestamps')
     serial = validate_serial(bounded_bytes(directory / 'serial.raw', MAX_SERIAL), process.get('returncode'),
-                             forced=process.get('forced'), eof=process.get('eof'))
+                             forced=process.get('forced'), eof=process.get('eof'), mechanism=mechanism)
     require(bounded_bytes(directory / 'serial.txt', MAX_SERIAL) == serial['text'].encode(), 'decoded serial mismatch')
     require(process.get('serial_sha256') == serial['serial_sha256'], 'process serial digest mismatch')
     require(inventory(directory) == before, 'capture mutated during verification')
-    return dict(version=VERSION, status='X86_PLATFORM_SELFTEST_PASS', native_acceptance_status='NOT_RUN',
+    return dict(version=VERSION, status='X86_SMP_SELFTEST_PASS' if mechanism == 'smp' else 'X86_PLATFORM_SELFTEST_PASS',
+                mechanism=mechanism, smp=serial['smp'], native_acceptance_status='NOT_RUN',
                 a01_a16_complete=False, unified_runtime_supported=False, markers=serial['markers'],
                 serial_frames=serial['frames'], serial_sha256=serial['serial_sha256'],
                 compiled_source_sha256=manifest['source_sha256'], evidence_inventory=before)
@@ -430,15 +459,17 @@ def run(build_dir, output, *, qemu='qemu-system-x86_64', cargo='cargo', accel='t
     with native_lease(prepare_native_lock(native_lock)):
         idle_native_host()
         build_dir = Path(build_dir).resolve(strict=True)
-        validate_build(build_dir, cargo=cargo)
+        manifest = validate_build(build_dir, cargo=cargo)
+        mechanism = manifest['mechanism']
         output = fresh_output(output)
         (output / 'build').mkdir()
         for name in ('kernel.elf', 'boot.bin', 'build-manifest.json'):
             shutil.copyfile(build_dir / name, output / 'build' / name)
         validate_build(output / 'build', cargo=cargo)
         qemu = executable(qemu)
-        argv = launch_argv(qemu, output / 'build' / 'boot.bin', accel)
-        request = dict(version=VERSION, argv=argv, accel=accel, timeout=timeout, markers=list(MARKERS),
+        argv = launch_argv(qemu, output / 'build' / 'boot.bin', accel, mechanism)
+        request = dict(version=VERSION, argv=argv, accel=accel, timeout=timeout, mechanism=mechanism,
+                       markers=list(mechanism_markers(mechanism)),
                        qemu=dict(path=qemu, sha256=sha(qemu), version=version(qemu)),
                        build_manifest_sha256=sha(output / 'build' / 'build-manifest.json'))
         write_json(output / 'request.json', request)
@@ -488,6 +519,7 @@ def main(argv=None):
     build_parser = commands.add_parser('build')
     build_parser.add_argument('--output', type=Path, required=True)
     build_parser.add_argument('--profile', choices=('dev', 'release'), default='dev')
+    build_parser.add_argument('--mechanism', choices=('bsp', 'smp'), default='bsp')
     build_parser.add_argument('--cargo', default='cargo')
     build_parser.add_argument('--target-dir', type=Path)
     build_parser.add_argument('--native-lock', type=Path, default=DEFAULT_NATIVE_LOCK)

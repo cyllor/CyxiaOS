@@ -33,40 +33,40 @@ impl Block {
         if transport.device_id() != 2 {
             return Err(Error::Device);
         }
-        transport.write(0x70, 0);
+        transport.set_status(0);
         platform.barrier();
         let start = platform.now_ms();
-        while transport.read(0x70) != 0 {
+        while transport.status() != 0 {
             if platform.now_ms().wrapping_sub(start) >= 100 {
                 return Err(Error::Timeout);
             }
         }
-        transport.write(0x70, 3);
-        transport.write(0x14, 1);
-        let modern = transport.read(0x10) & 1 != 0;
-        transport.write(0x14, 0);
-        let features = transport.read(0x10);
+        transport.set_status(3);
+        transport.select_device_features(1);
+        let modern = transport.device_features() & 1 != 0;
+        transport.select_device_features(0);
+        let features = transport.device_features();
         if !modern || features & FLUSH == 0 {
             transport.fail();
             return Err(Error::Features);
         }
-        transport.write(0x24, 0);
-        transport.write(0x20, features & (FLUSH | READ_ONLY));
-        transport.write(0x24, 1);
-        transport.write(0x20, 1);
-        transport.write(0x70, 11);
+        transport.select_driver_features(0);
+        transport.set_driver_features(features & (FLUSH | READ_ONLY));
+        transport.select_driver_features(1);
+        transport.set_driver_features(1);
+        transport.set_status(11);
         platform.barrier();
-        if transport.read(0x70) & (8 | 64 | 128) != 8 {
+        if transport.status() & (8 | 64 | 128) != 8 {
             transport.fail();
             return Err(Error::Features);
         }
         let mut sectors = None;
         for _ in 0..8 {
-            let before = transport.read(0xfc);
-            let low = transport.read(0x100);
-            let high = transport.read(0x104);
+            let before = transport.config_generation();
+            let low = transport.read_config_u32(0)?;
+            let high = transport.read_config_u32(4)?;
             platform.barrier();
-            if transport.read(0xfc) == before {
+            if transport.config_generation() == before {
                 sectors = Some(u64::from(low) | (u64::from(high) << 32));
                 break;
             }

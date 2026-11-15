@@ -1,8 +1,11 @@
-//! Boot-discovered VirtIO RNG. The hypervisor supplies entropy, not the AI model.
+//! Shared VirtIO entropy service. Board adapters supply actual transports.
 use super::virtio_platform::Board;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "unified-runtime")]
+use core::sync::atomic::AtomicU64;
 use cyxia_driver_virtio::{Transport, queue::BatchMemory as QueueMemory, rng::BatchedRng as Rng};
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "unified-runtime")]
 static IRQ: AtomicU64 = AtomicU64::new(0);
 struct Guard;
 impl Drop for Guard {
@@ -11,7 +14,11 @@ impl Drop for Guard {
     }
 }
 fn acquire() -> Result<Guard, Errno> {
-    if cyxia_arch_aarch64::cpu::slot() != 0 {
+    #[cfg(target_arch = "aarch64")]
+    let slot = cyxia_arch_aarch64::cpu::slot();
+    #[cfg(target_arch = "x86_64")]
+    let slot = crate::machine::runtime::cpu_slot();
+    if slot != 0 {
         return Err(Errno::Again);
     }
     BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -21,6 +28,7 @@ fn acquire() -> Result<Guard, Errno> {
 use cyxia_posix::Errno;
 static mut MEMORY: QueueMemory = QueueMemory::zeroed();
 static mut RNG: Option<Rng> = None;
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &cyxia_contracts::BootInfo) {
     for resource in &info.virtio[..info.virtio_count] {
         if resource.base.0 < 0x0a000000
@@ -45,48 +53,62 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
         if transport.device_id() != 4 {
             continue;
         }
-        let result = (|| {
-            let memory = unsafe { &mut *core::ptr::addr_of_mut!(MEMORY) };
-            Rng::attach(transport, memory, &Board)
-        })();
-        if let Ok(mut rng) = result {
-            IRQ.store(u64::from(resource.irq), Ordering::Release);
-            #[cfg(feature = "unified-runtime")]
-            {
-                if crate::domain_storage::register_notify_device(
-                    crate::domain_storage::RNG_NOTIFY,
-                    resource.base.0,
-                    rng.capacity(),
-                    resource.irq,
-                )
-                .is_err()
-                {
-                    super::log(b"ENTROPY_ERROR REGISTRY\n");
-                    return;
-                }
-                rng.set_notify_hooks(
-                    crate::domain_storage::rng_notify_command,
-                    crate::domain_storage::rng_notify_feedback,
-                );
-            }
-            // Submit at boot; no spin or invented seed. Completion is polled
-            // once by a nonblocking consumer or by the bounded blocking fill.
-            if rng.prefetch(&Board).is_err() {
-                super::log(b"ENTROPY_ERROR MECHANISM\n");
-                return;
-            }
-            // The static handle and queue have one CPU0 foreground owner.
-            unsafe {
-                *core::ptr::addr_of_mut!(RNG) = Some(rng);
-            }
-            super::log(b"ENTROPY_READY VIRTIO MECHANISM\n");
-        } else {
-            super::log(b"ENTROPY_ERROR MECHANISM\n");
-        }
+        attach(transport, resource.irq, resource.base.0);
         return;
     }
     super::log(b"ENTROPY_UNAVAILABLE MECHANISM\n");
 }
+
+#[cfg(target_arch = "x86_64")]
+pub fn init_transport(transport: Option<Transport>) {
+    if let Some(transport) = transport {
+        attach(transport, 0, 0);
+    } else {
+        super::log(b"ENTROPY_UNAVAILABLE MECHANISM\n");
+    }
+}
+fn attach(transport: Transport, _irq: u32, _base: u64) {
+    let result = (|| {
+        let memory = unsafe { &mut *core::ptr::addr_of_mut!(MEMORY) };
+        Rng::attach(transport, memory, &Board)
+    })();
+    if let Ok(mut rng) = result {
+        #[cfg(feature = "unified-runtime")]
+        IRQ.store(u64::from(_irq), Ordering::Release);
+        #[cfg(feature = "unified-runtime")]
+        {
+            if crate::domain_storage::register_notify_device(
+                crate::domain_storage::RNG_NOTIFY,
+                _base,
+                rng.capacity(),
+                _irq,
+            )
+            .is_err()
+            {
+                super::log(b"ENTROPY_ERROR REGISTRY\n");
+                return;
+            }
+            rng.set_notify_hooks(
+                crate::domain_storage::rng_notify_command,
+                crate::domain_storage::rng_notify_feedback,
+            );
+        }
+        // Submit at boot; no spin or invented seed. Completion is polled
+        // once by a nonblocking consumer or by the bounded blocking fill.
+        if rng.prefetch(&Board).is_err() {
+            super::log(b"ENTROPY_ERROR MECHANISM\n");
+            return;
+        }
+        // The static handle and queue have one CPU0 foreground owner.
+        unsafe {
+            *core::ptr::addr_of_mut!(RNG) = Some(rng);
+        }
+        super::log(b"ENTROPY_READY VIRTIO MECHANISM\n");
+    } else {
+        super::log(b"ENTROPY_ERROR MECHANISM\n");
+    }
+}
+
 pub fn fill(out: &mut [u8]) -> Result<(), Errno> {
     let _guard = acquire()?;
     // SAFETY: all calls are serialized by CPU0 foreground; IRQs never use RNG.

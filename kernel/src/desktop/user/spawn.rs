@@ -196,7 +196,7 @@ impl Runner {
         let value = result.unwrap_or_else(|e| (-(e as i64)) as u64);
         for thread in core::iter::once(&mut self.thread).chain(self.threads.parked.iter_mut()) {
             if thread.active && thread.tid == tid {
-                thread.context.regs[0] = value;
+                thread.context.set_result(value);
                 thread.waiting = None;
                 thread.ready_since = now();
                 self.status.wakeups = self.status.wakeups.saturating_add(1);
@@ -237,7 +237,8 @@ impl Supervisor {
             .iter()
             .find(|(_, p, _)| *p == resolved.as_str())
             .ok_or(Errno::Noent)?;
-        let plan = executable::parse(bytes).map_err(|_| Errno::Inval)?;
+        let plan = executable::parse_for(bytes, crate::process_arch::IMAGE_ABI)
+            .map_err(|_| Errno::Inval)?;
         let cwd = request
             .cwd_len
             .map(|n| core::str::from_utf8(&request.cwd[..n]).unwrap());
@@ -307,16 +308,19 @@ impl Supervisor {
                     execfn: actual_path.as_bytes(),
                 },
             )?;
-            runner.l2.0[0] = 0;
-            runner.arena.clear();
-            for (index, root) in runner.executable.roots() {
-                runner.l2.0[index] = root;
+            #[cfg(target_arch = "aarch64")]
+            {
+                runner.l2.0[0] = 0;
+                for (index, root) in runner.executable.roots() {
+                    runner.l2.0[index] = root;
+                }
             }
-            runner.thread.context = Context {
-                pc: plan.entry,
-                sp,
-                ..Context::empty()
-            };
+            crate::process_arch::make_writable(
+                runner.arena.base_ptr() as u64,
+                cyxia_posix::usermem::CODE_BYTES,
+            )?;
+            runner.arena.clear();
+            runner.thread.context = Context::initialize(plan.entry, sp, true)?;
             runner.thread.signals.set_mask(parent_mask);
             runner.threads.shared.actions = child_actions;
             runner.linux = true;

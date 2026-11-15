@@ -2,10 +2,12 @@
 #![forbid(unsafe_code)]
 mod audit;
 mod ids;
+mod image;
 mod platform;
 mod resource;
 pub use audit::*;
 pub use ids::*;
+pub use image::ImageAbi;
 pub use platform::*;
 pub use resource::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

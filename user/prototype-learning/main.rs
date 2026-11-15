@@ -4,19 +4,20 @@
 //! nor its protection/operator probes can create trusted replay labels.
 #[path = "src/compute.rs"]
 mod compute;
-use core::arch::asm;
+#[path = "../shared/calls.rs"]
+mod calls;
 const INPUT: u64 = 0x100000;
 const INPUT_BYTES: usize = 512 * 1024;
 const OUTPUT: u64 = 0x180000;
 const OUTPUT_BYTES: usize = 16 * 1024;
 fn yield_step(completed: u64) {
     unsafe {
-        asm!("svc #0x551",in("x0")completed,options(nostack));
+        let _ = calls::call::<0x551>([completed, 0, 0, 0, 0], 0);
     }
 }
 fn abort(code: u64) -> ! {
     unsafe {
-        asm!("svc #0x553",in("x0")code,options(nostack));
+        let _ = calls::call::<0x553>([code, 0, 0, 0, 0], 0);
     }
     loop {
         core::hint::spin_loop();
@@ -27,19 +28,19 @@ fn abort(code: u64) -> ! {
 extern "C" fn _start(mode: u64, input_len: u64, output_len: u64) -> ! {
     match mode {
         1 => unsafe {
-            asm!("str xzr, [{}]",in(reg)INPUT,options(nostack));
+            (INPUT as *mut u64).write_volatile(0);
             abort(1)
         },
         2 => unsafe {
-            asm!("str xzr, [{}]",in(reg)0x80000u64,options(nostack));
+            (0x80000u64 as *mut u64).write_volatile(0);
             abort(2)
         },
         3 => unsafe {
-            asm!("str xzr, [{}]",in(reg)0x1f0000u64,options(nostack));
+            (0x1f0000u64 as *mut u64).write_volatile(0);
             abort(3)
         },
         4 => unsafe {
-            asm!("ldr x9, [{}]",in(reg)0x30000u64,out("x9")_,options(nostack));
+            core::hint::black_box((0x30000u64 as *const u64).read_volatile());
             abort(4)
         },
         5 => loop {
@@ -63,7 +64,7 @@ extern "C" fn _start(mode: u64, input_len: u64, output_len: u64) -> ! {
     };
     match result {
         Ok(len) if len <= OUTPUT_BYTES => unsafe {
-            asm!("svc #0x552",in("x0")OUTPUT,in("x1")len as u64,options(nostack));
+            let _ = calls::call::<0x552>([OUTPUT, len as u64, 0, 0, 0], 0);
         },
         Ok(_) => abort(8),
         Err(error) => abort(0x100 + error as u64),

@@ -2,7 +2,15 @@ use super::*;
 
 static mut SERIAL: Option<pc::hardware::Serial16550> = None;
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-pub(super) fn log(payload: &[u8]) {
+pub(crate) fn log(payload: &[u8]) {
+    #[cfg(feature = "os-runtime")]
+    {
+        if try_log(payload).is_err() {
+            exit(false);
+        }
+        return;
+    }
+    #[cfg(not(feature = "os-runtime"))]
     // BSP owns the UART. Normal interrupt handlers never use it; fatal paths
     // have interrupts disabled and never return to an interrupted writer.
     unsafe {
@@ -15,7 +23,7 @@ pub(super) fn log(payload: &[u8]) {
     }
 }
 
-pub(super) fn exit(success: bool) -> ! {
+pub(crate) fn exit(success: bool) -> ! {
     arch::cpu::disable_interrupts();
     unsafe { arch::io::outl(0xf4, if success { 0x10 } else { 0x11 }) };
     arch::cpu::halt()
@@ -38,6 +46,14 @@ impl core::fmt::Write for Message {
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     use core::fmt::Write;
     arch::cpu::disable_interrupts();
+    #[cfg(all(feature = "smp-selftest", not(feature = "os-runtime")))]
+    if super::smp::panic_on_ap() {
+        arch::cpu::halt();
+    }
+    #[cfg(feature = "os-runtime")]
+    if super::runtime::panic_on_ap() {
+        arch::cpu::halt();
+    }
     let mut message = Message {
         bytes: [0; 96],
         len: 0,
@@ -47,6 +63,35 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     exit(false)
 }
 
-pub(super) unsafe fn init() {
+pub(crate) unsafe fn init() {
     unsafe { core::ptr::addr_of_mut!(SERIAL).write(Some(pc::hardware::Serial16550::init())) };
+}
+
+pub(crate) fn try_log(bytes: &[u8]) -> Result<(), cyxia_contracts::PlatformError> {
+    use cyxia_contracts::{ConsoleOps, PlatformError};
+    // CPU0 alone owns the serial object; hardware handlers and AP panic never
+    // borrow it. A partial raw write is terminal to this caller's operation.
+    let serial =
+        unsafe { (&mut *core::ptr::addr_of_mut!(SERIAL)).as_mut() }.ok_or(PlatformError::Again)?;
+    for chunk in bytes.chunks(64) {
+        if serial.try_write(chunk)? != chunk.len() {
+            return Err(PlatformError::Again);
+        }
+    }
+    Ok(())
+}
+pub(crate) fn try_read() -> Result<Option<u8>, cyxia_contracts::PlatformError> {
+    let serial = unsafe { (&mut *core::ptr::addr_of_mut!(SERIAL)).as_mut() }
+        .ok_or(cyxia_contracts::PlatformError::Again)?;
+    serial.try_read()
+}
+pub(crate) fn hex(value: u64) {
+    let mut text = *b"0000000000000000\n";
+    for (index, byte) in text[..16].iter_mut().enumerate() {
+        *byte = b"0123456789abcdef"[((value >> (60 - index * 4)) & 15) as usize];
+    }
+    log(&text);
+}
+pub(crate) fn halt() -> ! {
+    arch::cpu::halt()
 }

@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from tests.host.sdk_fixtures import object_archive
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import build_smithay_wayland_client as builder
@@ -15,7 +16,7 @@ class SmithayWaylandClientBuildTests(unittest.TestCase):
         hashes = {}
         for name in ("libwayland-client.a", "libffi.a", "libxkbcommon.a", "libc.a"):
             path = library / name
-            path.write_bytes(("unit-test archive identity: " + name).encode())
+            path.write_bytes(object_archive([183]))
             hashes[name] = builder.digest(path)
         for name in ("wayland", "xkbcommon"):
             manifest = builder.ROOT / "ports/cosmic" / (name + "-source.json")

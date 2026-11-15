@@ -29,42 +29,42 @@ impl BatchedBlock {
         if t.device_id() != 2 {
             return Err(Error::Device);
         }
-        t.write(0x70, 0);
+        t.set_status(0);
         p.barrier();
         let start = p.now_ms();
-        while t.read(0x70) != 0 {
+        while t.status() != 0 {
             if p.now_ms().wrapping_sub(start) >= 100 {
                 return Err(Error::Timeout);
             }
         }
-        t.write(0x70, 3);
-        t.write(0x14, 1);
+        t.set_status(3);
+        t.select_device_features(1);
         p.barrier();
-        let modern = t.read(0x10) & 1 != 0;
-        t.write(0x14, 0);
+        let modern = t.device_features() & 1 != 0;
+        t.select_device_features(0);
         p.barrier();
-        let features = t.read(0x10);
+        let features = t.device_features();
         if !modern || features & FLUSH == 0 {
             t.fail();
             return Err(Error::Features);
         }
-        t.write(0x24, 0);
-        t.write(0x20, features & (FLUSH | READ_ONLY));
-        t.write(0x24, 1);
-        t.write(0x20, 1);
-        t.write(0x70, 11);
+        t.select_driver_features(0);
+        t.set_driver_features(features & (FLUSH | READ_ONLY));
+        t.select_driver_features(1);
+        t.set_driver_features(1);
+        t.set_status(11);
         p.barrier();
-        if t.read(0x70) & (8 | 64 | 128) != 8 {
+        if t.status() & (8 | 64 | 128) != 8 {
             t.fail();
             return Err(Error::Features);
         }
         let mut sectors = None;
         for _ in 0..8 {
-            let before = t.read(0xfc);
-            let lo = t.read(0x100);
-            let hi = t.read(0x104);
+            let before = t.config_generation();
+            let lo = t.read_config_u32(0)?;
+            let hi = t.read_config_u32(4)?;
             p.barrier();
-            if t.read(0xfc) == before {
+            if t.config_generation() == before {
                 sectors = Some(u64::from(lo) | (u64::from(hi) << 32));
                 break;
             }

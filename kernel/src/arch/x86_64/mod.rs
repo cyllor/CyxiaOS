@@ -6,6 +6,7 @@ use cyxia_arch_x86_64 as arch;
 use cyxia_platform_pc as pc;
 
 use crate::selftest;
+#[cfg(not(feature = "os-runtime"))]
 core::arch::global_asm!(
     include_str!("../../../../crates/arch-x86_64/src/entry.S"),
     options(att_syntax)
@@ -42,6 +43,7 @@ unsafe extern "C" {
     static __stack_guard_start: u8;
     static __stack_guard_end: u8;
     static __trap_stack_top: u8;
+    static __df_stack_top: u8;
     fn x86_probe_read(address: u64);
     fn x86_read_fault();
     fn x86_read_resume();
@@ -67,7 +69,16 @@ static USER_PROBE: AtomicU64 = AtomicU64::new(0);
 struct NxPage([u8; 4096]);
 static mut NX_PROBE: NxPage = NxPage([0xc3; 4096]);
 
+#[cfg(not(feature = "os-runtime"))]
 mod boot;
+#[cfg(not(feature = "os-runtime"))]
 mod checks;
-mod console;
-use console::{exit, log};
+pub(crate) mod console;
+#[cfg(feature = "os-runtime")]
+pub(crate) mod runtime;
+#[cfg(feature = "os-runtime")]
+pub(crate) mod dispatch;
+#[cfg(all(feature = "smp-selftest", not(feature = "os-runtime")))]
+mod smp;
+pub(crate) use console::{exit, halt, hex, log, try_log, try_read};
+pub(crate) const HIGH: u64 = arch::space::KERNEL_BASE;

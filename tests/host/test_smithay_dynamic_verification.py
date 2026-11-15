@@ -117,6 +117,18 @@ class SmithayDynamicVerificationTests(unittest.TestCase):
         self.assertEqual((result["admitted_clients"],result["capacity_rejections"],result["reused_slots"]),(3,1,1))
         self.assertEqual(set(result["launches"]),{"1","2","3","4","5"})
 
+    def test_x86_lifecycle_requires_actual_target_labels_and_fault_reclamation(self):
+        # Synthetic transcript only tests rejection logic, never guest evidence.
+        data = valid_log().replace(b'Linux-AArch64-subset', b'Linux-x86_64-subset')
+        data = data.replace(b'EL0 pid=', b'USER pid=').replace(b'esr=0x0', b'fault=0x0')
+        self.assertEqual(gate.validate(data, architecture='x86_64')['independently_launched_processes'], 5)
+        with self.assertRaises(AssertionError): gate.validate(data)
+        with self.assertRaises(AssertionError): gate.validate(valid_log(), architecture='x86_64')
+        for bad in (data.replace(b'fault=0x0', b'fault=0xe', 1),
+                    data.replace(b'USER pid=3 Exited code=0', b'USER pid=3 Exited code=1', 1),
+                    data.replace(b'USER pid=3 ', b'EL0 pid=3 ', 1)):
+            with self.assertRaises(AssertionError): gate.validate(bad, architecture='x86_64')
+
     def test_every_actual_lifecycle_record_is_required_once(self):
         good=valid_log()
         for line in good.splitlines():

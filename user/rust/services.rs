@@ -3,7 +3,10 @@
 //! Native EL0 integration workloads for the desktop process/IPC foundation.
 //! This fixed image is not X.Org, a desktop app, or a Linux binary.
 use core::arch::asm;
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("fpu.S"));
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("fpu_x86_64.S"), options(att_syntax));
 unsafe extern "C" {
     fn cyxia_fp_probe(pid: u64) -> u64;
 }
@@ -11,8 +14,14 @@ use core::panic::PanicInfo;
 
 // Identical virtual addresses in every process, different expected contents.
 static mut PRIVATE: [u64; 16] = [0; 16];
+#[cfg(target_arch = "aarch64")]
+const KERNEL_PROBE_ADDRESS: u64 = 0xffffffc040200000;
+#[cfg(target_arch = "x86_64")]
+const KERNEL_PROBE_ADDRESS: u64 = 0xffff800000100000;
 
 fn call(number: u64, a: u64, b: u64, c: u64) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    {
     let mut result = a;
     // CyxiaOS native ABI preserves all registers except x0 across SVC. Pointer
     // ranges are checked in EL1; this assembly does not claim nomem/nostack.
@@ -20,6 +29,17 @@ fn call(number: u64, a: u64, b: u64, c: u64) -> i64 {
         asm!("svc #0", inout("x0") result, in("x1") b, in("x2") c, in("x8") number);
     }
     result as i64
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut result = number;
+        // NativeOs is distinct from the Linux SYSCALL and prototype int80 ABIs.
+        unsafe {
+            asm!("int 0x80", inlateout("rax") result, in("rdi") a,
+                 in("rsi") b, in("rdx") c, options(nostack));
+        }
+        result as i64
+    }
 }
 fn yield_cpu() {
     call(18, 0, 0, 0);
@@ -127,7 +147,7 @@ pub extern "C" fn _start(mode: u64, channel: u64) -> ! {
     if mode == 2 {
         // Deliberate isolation test: never expose the kernel mapping at EL0.
         unsafe {
-            core::ptr::read_volatile(0xffffffc040200000usize as *const u8);
+            core::ptr::read_volatile(KERNEL_PROBE_ADDRESS as *const u8);
         }
         exit(91);
     }
@@ -140,7 +160,7 @@ pub extern "C" fn _start(mode: u64, channel: u64) -> ! {
     }
     require(mode == 3 || mode == 4);
     let mut bytes = [0u8; 512];
-    require(call(16, channel, 0xffffffc040200000, 1) == -14);
+    require(call(16, channel, KERNEL_PROBE_ADDRESS, 1) == -14);
     require(call(17, channel, 0x100000, 1) == -14);
     require(call(16, 0, bytes.as_ptr() as u64, 1) == -9);
     let deadline = clock() + 5000;
@@ -279,7 +299,7 @@ fn paint() -> ! {
         exit(0);
     }
     require(first == 0);
-    require(call(24, at, dimensions, 0xffffffc040200000) == -14);
+    require(call(24, at, dimensions, KERNEL_PROBE_ADDRESS) == -14);
     require(call(24, 1023 | (767 << 32), dimensions, pixels.as_ptr() as u64) == -22);
     require(call(24, at, 0, pixels.as_ptr() as u64) == -22);
     print(b"NATIVE_PAINT_FIRST_PASS\r\n");

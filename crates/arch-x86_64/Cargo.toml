@@ -3,5 +3,8 @@ name = "cyxia-arch-x86_64"
 version.workspace = true
 edition.workspace = true
 
+[features]
+runtime = []
+
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

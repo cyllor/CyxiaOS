@@ -342,10 +342,9 @@ impl Service {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &cyxia_contracts::BootInfo) {
-    // Sole foreground boot owner. IRQ handlers never access this service.
-    let service = unsafe { &mut *core::ptr::addr_of_mut!(SERVICE) };
-    for resource in &info.virtio[..info.virtio_count] {
+    let transports = info.virtio[..info.virtio_count].iter().filter_map(|resource| {
         if resource.base.0 < 0x0a000000
             || resource
                 .base
@@ -353,16 +352,23 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
                 .checked_add(resource.len)
                 .is_none_or(|e| e > 0x0a200000)
         {
-            continue;
+            return None;
         }
-        let Ok(transport) = (unsafe {
+        unsafe {
             Transport::attach(
                 (super::HIGH + resource.base.0) as usize,
                 resource.len as usize,
             )
-        }) else {
-            continue;
-        };
+        }.ok()
+    });
+    init_transports(transports);
+}
+
+/// Shared durable checkpoint service, fed by the board's actual transport.
+pub fn init_transports(transports: impl IntoIterator<Item = Transport>) {
+    // Sole foreground boot owner. IRQ handlers never access this service.
+    let service = unsafe { &mut *core::ptr::addr_of_mut!(SERVICE) };
+    for transport in transports {
         if transport.device_id() != 2 {
             continue;
         }

@@ -1,7 +1,7 @@
 //! Strict bounded RX/RO ELF loader plan for the isolated control service.
 //! No relocations, dynamic loader, TLS, writable ELF segments or page aliases.
 //! Caller copies the approved bytes and maps per-page permissions exactly.
-use super::Error;
+use super::{Error, image_abi::ImageAbi};
 pub const BASE: u64 = 0x80000;
 pub const PAGES: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -35,10 +35,15 @@ fn u64at(b: &[u8], at: usize) -> Result<u64, Error> {
 }
 impl<'a> Image<'a> {
     pub fn parse(b: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_for(b, ImageAbi::Aarch64)
+    }
+
+    /// Validate an image for the architecture that will actually execute it.
+    pub fn parse_for(b: &'a [u8], abi: ImageAbi) -> Result<Self, Error> {
         if b.len() > 512 * 1024
             || get::<7>(b, 0)? != *b"\x7fELF\x02\x01\x01"
             || u16at(b, 16)? != 2
-            || u16at(b, 18)? != 183
+            || u16at(b, 18)? != abi.machine()
             || u32at(b, 20)? != 1
             || u16at(b, 52)? != 64
             || u16at(b, 54)? != 56
@@ -100,7 +105,7 @@ impl<'a> Image<'a> {
             found |= flags == 5
                 && entry >= address
                 && entry < address + file_size as u64
-                && entry.is_multiple_of(4);
+                && entry.is_multiple_of(abi.entry_alignment());
             result.segments[result.count] = Segment {
                 offset,
                 address,

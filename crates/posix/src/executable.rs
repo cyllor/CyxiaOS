@@ -1,4 +1,4 @@
-//! Validated static AArch64 ELF plans and bounded AArch64 process entry stacks.
+//! Validated static ELF plans and bounded native process entry stacks.
 //! No memory is published here. The caller owns AI admission, physical allocation,
 //! zeroing, privileged copies, final PTE permissions, TLS setup and entropy.
 //! This format does not select a syscall personality or imply Linux compatibility.
@@ -67,6 +67,7 @@ pub struct Page {
 
 #[derive(Debug)]
 pub struct Plan<'a> {
+    pub abi: crate::ImageAbi,
     pub entry: u64,
     pub phdr_address: u64,
     pub phnum: u16,
@@ -205,6 +206,10 @@ fn validate_notes(bytes: &[u8]) -> Result<(), Error> {
 /// metadata for the caller's post-relocation protection step; parsing does not
 /// claim it has already been enforced.
 pub fn parse(elf: &[u8]) -> Result<Plan<'_>, Error> {
+    parse_for(elf, crate::ImageAbi::Aarch64)
+}
+
+pub fn parse_for(elf: &[u8], abi: crate::ImageAbi) -> Result<Plan<'_>, Error> {
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01")
         || !matches!(elf.get(7), Some(0 | 3))
         || elf.get(8) != Some(&0)
@@ -212,7 +217,7 @@ pub fn parse(elf: &[u8]) -> Result<Plan<'_>, Error> {
             .get(9..16)
             .is_none_or(|padding| padding.iter().any(|&b| b != 0))
         || u16::from_le_bytes(number(elf, 16)?) != 2
-        || u16::from_le_bytes(number(elf, 18)?) != 183
+        || u16::from_le_bytes(number(elf, 18)?) != abi.machine()
         || word(elf, 20)? != 1
         || word(elf, 48)? != 0
         || u16::from_le_bytes(number(elf, 52)?) != 64
@@ -228,6 +233,7 @@ pub fn parse(elf: &[u8]) -> Result<Plan<'_>, Error> {
     }
     let headers = file_range(elf, offset, u64::from(phnum) * 56)?;
     let mut plan = Plan {
+        abi,
         entry,
         phdr_address: 0,
         phnum,
@@ -316,12 +322,12 @@ pub fn parse(elf: &[u8]) -> Result<Plan<'_>, Error> {
             _ => return Err(Error::Unsupported),
         }
     }
-    if !entry.is_multiple_of(4)
+    if !entry.is_multiple_of(abi.entry_alignment())
         || !plan.loads().any(|load| {
             load.permissions.execute
                 && entry >= load.address
                 && entry
-                    .checked_add(4)
+                    .checked_add(abi.entry_alignment())
                     .is_some_and(|end| end <= load.address + load.data.len() as u64)
         })
     {
@@ -460,6 +466,20 @@ pub fn build_stack_with_execfn(
     config: &StackConfig,
     execfn: &[u8],
 ) -> Result<InitialStack, Error> {
+    build_stack_for(stack, base, argv, envp, config, execfn, crate::ImageAbi::Aarch64)
+}
+
+/// Build the SysV argc/argv/auxv stack for the explicitly validated target ISA.
+/// Both supported process-entry ABIs require a 16-byte aligned initial SP.
+pub fn build_stack_for(
+    stack: &mut [u8],
+    base: u64,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    config: &StackConfig,
+    execfn: &[u8],
+    abi: crate::ImageAbi,
+) -> Result<InitialStack, Error> {
     if !base.is_multiple_of(16)
         || base == 0
         || base.checked_add(stack.len() as u64).is_none()
@@ -473,7 +493,7 @@ pub fn build_stack_with_execfn(
         || config.phnum == 0
         || usize::from(config.phnum) > MAX_HEADERS
         || !(IMAGE_BASE..IMAGE_END).contains(&config.entry)
-        || !config.entry.is_multiple_of(4)
+        || !config.entry.is_multiple_of(abi.entry_alignment())
     {
         return Err(Error::Stack);
     }

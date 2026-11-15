@@ -621,7 +621,7 @@ mod tests {
     fn device_fault_prevents_cpu_borrow_and_fence_counter_never_wraps() {
         let (mut gpu, host) = fixture();
         unsafe { gpu.show(host.frame, &host).unwrap() };
-        gpu.transport.write(0x70, 15 | 64);
+        gpu.transport.set_status(15 | 64);
         assert_eq!(
             gpu.update(|_| panic!("faulted device render"), &host),
             Err(Error::Device)

@@ -1,9 +1,11 @@
 //! Pinned ELF image pages and initial stack. CPU0 foreground is the sole owner.
 use super::user::ai::{self, Domain};
+use crate::address_space::PageTable as Table;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_ai_runtime::accounting::Attempt;
-use cyxia_arch_aarch64::mmu;
-use cyxia_contracts::{BootInfo, PageCount, PhysAddr, RedemptionId};
+#[cfg(target_arch = "aarch64")]
+use cyxia_contracts::BootInfo;
+use cyxia_contracts::{PageCount, RedemptionId};
 use cyxia_kernel_core::grants::{AuthorizedGrantRequest, GrantLedger, Owner, ReleaseReceipt};
 use cyxia_posix::{
     Errno,
@@ -13,6 +15,7 @@ use cyxia_posix::{
 const PAGES: usize = 4096;
 const BYTES: u64 = PAGES as u64 * 4096;
 pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
+#[cfg(target_arch = "aarch64")]
 const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + super::user_heap::RESERVED_BYTES + RESERVED_BYTES
         <= cyxia_platform_virt::USER_RAM_END
@@ -21,14 +24,13 @@ pub const STACK_BASE: u64 = 0x03000000;
 pub const STACK_PAGES: usize = 64;
 static POOL: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
     POOL.store(range.start.0, Ordering::Relaxed);
     Ok(())
 }
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
 pub struct StackInput<'a> {
     pub random: [u8; 16],
     pub argv: &'a [&'a [u8]],
@@ -48,8 +50,8 @@ pub struct ExecMemory {
 impl ExecMemory {
     pub const fn new() -> Self {
         Self {
-            tables: [const { Table([0; 512]) }; 8],
-            stack_table: Table([0; 512]),
+            tables: [const { Table::empty() }; 8],
+            stack_table: Table::empty(),
             slots: [0; PAGES],
             permissions: [0; PAGES],
             base: 0,
@@ -64,6 +66,7 @@ impl ExecMemory {
     pub fn free(&self) -> u32 {
         self.ledger.snapshot().free
     }
+    #[cfg(target_arch = "aarch64")]
     pub fn roots(&self) -> [(usize, u64); 9] {
         core::array::from_fn(|i| {
             if i < 8 {
@@ -131,7 +134,7 @@ impl ExecMemory {
         ai::record(Domain::Elf, |c| c.grant(count as u64));
         self.base = pool + slot as u64 * BYTES;
         self.pages = count as u32;
-        // Boot-reserved private RAM, no current TTBR0/DMA aliases; zero before
+        // Boot-reserved private RAM, no current user-root/DMA aliases; zero before
         // recording final mappings. Tables are not published until load returns.
         unsafe {
             core::ptr::write_bytes((super::HIGH + self.base) as *mut u8, 0, count * 4096);
@@ -143,34 +146,37 @@ impl ExecMemory {
                 self.permissions[i] = 1
                     | if page.permissions.write { 2 } else { 0 }
                     | if page.permissions.execute { 4 } else { 0 };
-                self.tables[i / 512].0[i % 512] = mmu::encode_user_leaf(
-                    PhysAddr(self.base + physical as u64 * 4096),
-                    page.permissions.write,
-                    page.permissions.execute,
-                )
-                .map_err(|_| Errno::Inval)?;
+                self.tables[i / 512]
+                    .set(
+                        i % 512,
+                        self.base + physical as u64 * 4096,
+                        1 | if page.permissions.write { 2 } else { 0 }
+                            | if page.permissions.execute { 4 } else { 0 },
+                    )
+                    .map_err(|_| Errno::Inval)?;
             }
             for segment in plan.loads() {
                 self.copy_into(segment.address, segment.data, false)?;
             }
             let stack_page = count - STACK_PAGES;
             for i in 0..STACK_PAGES {
-                self.stack_table.0[i] = mmu::encode_user_leaf(
-                    PhysAddr(self.base + (stack_page + i) as u64 * 4096),
-                    true,
-                    false,
-                )
-                .map_err(|_| Errno::Inval)?;
+                self.stack_table
+                    .set(
+                        i,
+                        self.base + (stack_page + i) as u64 * 4096,
+                        1 | if true { 2 } else { 0 } | if false { 4 } else { 0 },
+                    )
+                    .map_err(|_| Errno::Inval)?;
             }
             // The entire initial stack is private, contiguous, pinned and not yet
-            // exposed to EL0. No Rust alias or DMA pointer refers to this region.
+            // exposed to user code. No Rust alias or DMA pointer refers to this region.
             let stack = unsafe {
                 core::slice::from_raw_parts_mut(
                     (super::HIGH + self.base + stack_page as u64 * 4096) as *mut u8,
                     STACK_PAGES * 4096,
                 )
             };
-            let initial = executable::build_stack_with_execfn(
+            let initial = executable::build_stack_for(
                 stack,
                 STACK_BASE,
                 stack_input.argv,
@@ -187,25 +193,13 @@ impl ExecMemory {
                     random: stack_input.random,
                 },
                 stack_input.execfn,
+                plan.abi,
             )
             .map_err(|_| Errno::Inval)?;
-            // All pages are initialized. Publish instructions through the data
-            // cache before the next TTBR0 enable and I-cache invalidation.
-            let ctr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ctr_el0",out(reg)ctr);
-            }
-            let line = 4u64 << ((ctr >> 16) & 15);
-            let mut p = super::HIGH + self.base;
-            while p < super::HIGH + self.base + count as u64 * 4096 {
-                unsafe {
-                    core::arch::asm!("dc cvau, {}",in(reg)p);
-                }
-                p += line;
-            }
-            unsafe {
-                core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-            }
+            // Arm requires explicit D/I cache synchronization. x86 coherent
+            // instruction publication occurs after each RX page loses RW aliases.
+            #[cfg(target_arch = "aarch64")]
+            crate::process_arch::publish_code(super::HIGH + self.base, count * 4096)?;
             Ok(initial.sp)
         })();
         if result.is_err() {
@@ -302,23 +296,26 @@ impl ExecMemory {
         for at in (address..end).step_by(4096) {
             let i = ((at - executable::IMAGE_BASE) / 4096) as usize;
             self.permissions[i] = prot as u8;
-            self.tables[i / 512].0[i % 512] = mmu::encode_user_leaf(
-                PhysAddr(self.base + u64::from(self.slots[i] - 1) * 4096),
-                prot & 2 != 0,
-                prot & 4 != 0,
-            )
-            .map_err(|_| Errno::Io)?;
+            self.tables[i / 512]
+                .set(
+                    i % 512,
+                    self.base + u64::from(self.slots[i] - 1) * 4096,
+                    1 | if prot & 2 != 0 { 2 } else { 0 } | if prot & 4 != 0 { 4 } else { 0 },
+                )
+                .map_err(|_| Errno::Inval)?;
         }
         Ok(())
     }
     pub fn clear(&mut self) {
         if let Some((owner, id)) = self.lease.take() {
+            crate::process_arch::make_writable(super::HIGH + self.base, self.pages as usize * 4096)
+                .expect("retired executable frames before zero");
             for table in &mut self.tables {
-                table.0.fill(0);
+                table.clear();
             }
-            self.stack_table.0.fill(0);
-            // Caller returned from EL0 with EPD0/TLBI/DSB, or never published
-            // these tables. No other CPU or DMA can still refer to the pages.
+            self.stack_table.clear();
+            // The backend retired all user roots, or never published these
+            // mappings. No other CPU or DMA can still refer to these pages.
             unsafe {
                 core::ptr::write_bytes(
                     (super::HIGH + self.base) as *mut u8,
@@ -336,5 +333,30 @@ impl ExecMemory {
             self.permissions.fill(0);
             self.pages = 0;
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn init_pc() -> Result<(), Errno> {
+    if POOL.load(Ordering::Acquire) != 0 {
+        return Err(Errno::Busy);
+    }
+    let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    POOL.store(base.0, Ordering::Release);
+    Ok(())
+}
+#[cfg(target_arch = "x86_64")]
+impl ExecMemory {
+    pub fn publish_space(
+        &self,
+        space: &mut crate::address_space::ProcessSpace,
+    ) -> Result<(), Errno> {
+        if self.pages == 0 {
+            return Ok(());
+        }
+        for (index, table) in self.tables.iter().enumerate() {
+            table.publish(space, executable::IMAGE_BASE + index as u64 * 0x200000)?;
+        }
+        self.stack_table.publish(space, STACK_BASE)
     }
 }

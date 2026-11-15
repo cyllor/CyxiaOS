@@ -74,9 +74,12 @@ _start:
     rdmsr
     orl $0x900, %eax
     wrmsr
+    # Keep BSP/AP caching consistent. Drain the old cache before clearing the
+    # reset CD/NW flags; the fresh CR3 and PG transition replace old walks.
+    wbinvd
     movl %cr0, %eax
-    andl $0xfffffff3, %eax
-    orl $0x80010003, %eax
+    andl $0x9ffffff3, %eax
+    orl $0x80010023, %eax
     movl %eax, %cr0
     ljmp $0x08, $x86_long_entry
 

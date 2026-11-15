@@ -16,6 +16,7 @@ import sys
 import tarfile
 import time
 
+from target_profile import profile_for
 from build_cosmic import clean_environment, new_output, run_bounded
 from build_sysroot import ROOT, DEFAULT_OUTPUT, BuildError, digest, inspect_elf, toolchain
 from build_smithay_wayland_client import prerequisite_inputs
@@ -89,13 +90,15 @@ def dependency_inputs(depfile, source, prefix, generated):
     return {path: digest(path) for path in paths}
 
 
-def build(output, crate=DEFAULT_CRATE):
+def build(output, crate=DEFAULT_CRATE, *, architecture="aarch64", sysroot=None):
+    selected = profile_for(architecture)
+    prefix = Path(sysroot or selected.default_output(ROOT)).resolve()
     output = new_output(output)
     for name in ("logs", "provenance", "generated"):
         (output / name).mkdir()
     tools = toolchain()
     env = clean_environment("/usr/bin:/bin:/opt/homebrew/bin")
-    report = dict(status="FAIL", guest_execution="not performed",
+    report = dict(status="FAIL", architecture=selected.architecture, target_triple=selected.rust_target, guest_execution="not performed",
                   scope="Two concurrent independent xdg-shell clients; composition and input focus require actual guest verification",
                   budgets=BUDGET, commands=[], inputs_sha256={}, protocol=dict(
                       fd=3, compositor_version=4, seat_version=7, shm_format="ARGB8888",
@@ -118,14 +121,14 @@ def build(output, crate=DEFAULT_CRATE):
 
     try:
         # A shared read lock protects the existing SDK; this helper never installs.
-        with (DEFAULT_OUTPUT / ".build.lock").open("r") as lock:
+        with (prefix / ".build.lock").open("r") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            inputs.update(prerequisite_inputs(DEFAULT_OUTPUT))
-            library = DEFAULT_OUTPUT / "sysroot/usr/lib"
-            driver = DEFAULT_OUTPUT / "bin/aarch64-linux-musl-cc"
-            native = [driver, DEFAULT_OUTPUT / "bin/ld.lld",
+            inputs.update(prerequisite_inputs(prefix, selected))
+            library = prefix / "sysroot/usr/lib"
+            driver = selected.cc(prefix)
+            native = [driver, prefix / "bin/ld.lld",
                       *[library / name for name in
-                        ("crt1.o", "crti.o", "crtn.o", "libclang_rt.builtins-aarch64.a")],
+                        ("crt1.o", "crti.o", "crtn.o", selected.builtins_archive)],
                       Path(tools["clang"]), Path(tools["rust-lld"]), Path(tools["llvm-strip"])]
             for path in [SOURCE, Path(__file__).resolve(),
                          ROOT / "tools/build_sysroot.py", ROOT / "tools/build_cosmic.py",
@@ -134,9 +137,9 @@ def build(output, crate=DEFAULT_CRATE):
             report["toolchain"] = {name: tools[name] for name in ("clang", "rust-lld", "llvm-strip")}
             shutil.copyfile(SOURCE, output / "provenance" / SOURCE.name)
             for name in ("wayland", "xkbcommon"):
-                shutil.copyfile(DEFAULT_OUTPUT / (name + "-build-report.json"),
+                shutil.copyfile(prefix / (name + "-build-report.json"),
                                 output / "provenance" / (name + "-build-report.json"))
-            protocol_inputs, scanner = protocol_source(crate, DEFAULT_OUTPUT, output)
+            protocol_inputs, scanner = protocol_source(crate, prefix, output)
             inputs.update(protocol_inputs)
             generated = output / "generated"
             xml = generated / "xdg-shell.xml"
@@ -151,11 +154,11 @@ def build(output, crate=DEFAULT_CRATE):
             depfile = output / "target-dependencies.d"
             run([driver, "-M", "-MF", depfile, "-MT", "smithay-multi-client", "-I", generated, SOURCE],
                 "dependencies.log")
-            inputs.update(dependency_inputs(depfile, SOURCE, DEFAULT_OUTPUT, [header]))
+            inputs.update(dependency_inputs(depfile, SOURCE, prefix, [header]))
             generated_depfile = output / "protocol-dependencies.d"
             run([driver, "-M", "-MF", generated_depfile, "-MT", "smithay-multi-client", code],
                 "protocol-dependencies.log")
-            inputs.update(dependency_inputs(generated_depfile, code, DEFAULT_OUTPUT, []))
+            inputs.update(dependency_inputs(generated_depfile, code, prefix, []))
             report["inputs_sha256"] = {str(path): value for path, value in inputs.items()}
             symbols = output / "smithay-multi-client.symbols.elf"
             run([driver, "-std=c11", "-Os", "-ffunction-sections", "-fdata-sections",
@@ -163,11 +166,11 @@ def build(output, crate=DEFAULT_CRATE):
                  "-Wl,--gc-sections", "-I", generated, SOURCE, code, "-Wl,--start-group",
                  library / "libwayland-client.a", library / "libffi.a",
                  library / "libxkbcommon.a", "-Wl,--end-group", "-o", symbols], "link.log")
-            report["symbols"] = inspect_elf(symbols)
+            report["symbols"] = inspect_elf(symbols, selected)
             program = output / "smithay-multi-client.elf"
             shutil.copyfile(symbols, program)
             run([tools["llvm-strip"], "--strip-all", program], "strip.log")
-            report["client"] = inspect_elf(program)
+            report["client"] = inspect_elf(program, selected)
             for path, expected in inputs.items():
                 if digest(path) != expected:
                     raise BuildError("Build input changed: " + str(path))
@@ -183,10 +186,12 @@ def build(output, crate=DEFAULT_CRATE):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
+    parser.add_argument("--sysroot", type=Path)
     parser.add_argument("--protocol-crate", default=DEFAULT_CRATE, type=Path)
     args = parser.parse_args()
     try:
-        print(json.dumps(build(args.output.resolve(), args.protocol_crate.resolve()), indent=2))
+        print(json.dumps(build(args.output.resolve(), args.protocol_crate.resolve(), architecture=args.arch, sysroot=args.sysroot), indent=2))
     except (OSError, ValueError, BuildError, subprocess.SubprocessError) as error:
         print("smithay-multi-client: " + str(error), file=sys.stderr)
         raise SystemExit(1)

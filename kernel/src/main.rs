@@ -3,6 +3,8 @@
 // CPU selection and profile wiring are the only responsibilities of this root.
 #[cfg(target_arch = "aarch64")]
 include!("composition/aarch64.rs");
+#[cfg(all(target_arch = "x86_64", feature = "os-runtime"))]
+include!("composition/x86_64.rs");
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64/mod.rs"]
 mod machine;

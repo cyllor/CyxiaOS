@@ -15,7 +15,8 @@ mod boot_model;
 #[path = "../../crates/prototype/src/policy_wire.rs"]
 mod policy_wire;
 use abi::*;
-use core::arch::asm;
+#[path = "../shared/calls.rs"]
+mod calls;
 #[used]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".cyxia.model")]
@@ -25,19 +26,19 @@ static RUNTIME_MODEL: [u8; MODEL_BYTES] = model_bytes();
 extern "C" fn _start(mode: u64) -> ! {
     match mode {
         1 => unsafe {
-            asm!("str xzr, [{}]", in(reg) INPUT_VA, options(nostack));
+            (INPUT_VA as *mut u64).write_volatile(0);
             abort()
         },
         2 => unsafe {
-            asm!("str xzr, [{}]", in(reg) MODEL_VA, options(nostack));
+            (MODEL_VA as *mut u64).write_volatile(0);
             abort()
         },
         3 => unsafe {
-            asm!("str xzr, [{}]", in(reg) 0xb0000u64, options(nostack));
+            (0xb0000u64 as *mut u64).write_volatile(0);
             abort()
         },
         4 => unsafe {
-            asm!("ldr x9, [{}]", in(reg) 0x30000u64, out("x9") _, options(nostack));
+            core::hint::black_box((0x30000u64 as *const u64).read_volatile());
             abort()
         },
         5 => loop {
@@ -53,9 +54,7 @@ extern "C" fn _start(mode: u64) -> ! {
             }
             let passed = boot_model::check(core::hint::black_box(&bytes));
             unsafe {
-                asm!("svc #0x543", in("x0") boot_model::OUTPUT_MAGIC,
-                    in("x1") u64::from(passed), in("x2") boot_model::CASES as u64,
-                    options(nostack));
+                let _ = calls::call::<0x543>([boot_model::OUTPUT_MAGIC, u64::from(passed), boot_model::CASES as u64, 0, 0], 0);
             }
             abort()
         }
@@ -74,8 +73,7 @@ extern "C" fn _start(mode: u64) -> ! {
         let model = model::Model::parse(parameters).unwrap_or_else(|_| abort());
         native::evaluate_precleared(input, &model, output).unwrap_or_else(|_| abort());
         unsafe {
-            asm!("svc #0x541", in("x0") OUTPUT_VA,
-                in("x1") (native::OUTPUT_WORDS * 8) as u64, options(nostack));
+            let _ = calls::call::<0x541>([OUTPUT_VA, (native::OUTPUT_WORDS * 8) as u64, 0, 0, 0], 0);
         }
         abort()
     }
@@ -133,14 +131,13 @@ extern "C" fn _start(mode: u64) -> ! {
         }
     }
     unsafe {
-        asm!("svc #0x541", in("x0") OUTPUT_VA,
-        in("x1") (OUTPUT_WORDS * 8) as u64, options(nostack));
+        let _ = calls::call::<0x541>([OUTPUT_VA, (OUTPUT_WORDS * 8) as u64, 0, 0, 0], 0);
     }
     abort()
 }
 fn abort() -> ! {
     unsafe {
-        asm!("svc #0x542", options(nostack));
+        let _ = calls::call::<0x542>([0, 0, 0, 0, 0], 0);
     }
     loop {
         core::hint::spin_loop();

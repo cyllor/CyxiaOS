@@ -116,10 +116,12 @@ impl Runner {
         let operation = u32::try_from(operation).map_err(|_| Errno::Inval)?;
         let mut event = epoll::Event::default();
         if operation != 2 {
-            let mut bytes = [0u8; 16]; // AArch64 epoll_data_t is 8-byte aligned.
-            self.copy_from(address, &mut bytes)?;
+            let mut bytes = [0u8; 16];
+            let size = cyxia_posix::linux_abi::epoll_bytes(crate::process_arch::IMAGE_ABI);
+            let data = cyxia_posix::linux_abi::epoll_data_offset(crate::process_arch::IMAGE_ABI);
+            self.copy_from(address, &mut bytes[..size])?;
             event.events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-            event.data = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+            event.data = u64::from_le_bytes(bytes[data..data + 8].try_into().unwrap());
         }
         if operation == 1
             && let Some(raw) = self.process.socket(fd(target)?)?
@@ -149,18 +151,20 @@ impl Runner {
         if count == 0 {
             return Err(Errno::Inval);
         }
-        self.validate(address, count * 16, true)?;
+        let stride = cyxia_posix::linux_abi::epoll_bytes(crate::process_arch::IMAGE_ABI);
+        let data = cyxia_posix::linux_abi::epoll_data_offset(crate::process_arch::IMAGE_ABI);
+        self.validate(address, count * stride, true)?;
         let readiness = self.epoll_readiness(epfd)?;
         let mut events = [epoll::Event::default(); OPEN_MAX];
         let size = self
             .process
             .epoll_collect(epfd, &readiness, &mut events[..count])?;
         let mut encoded = [0u8; OPEN_MAX * 16];
-        for (event, bytes) in events[..size].iter().zip(encoded.chunks_exact_mut(16)) {
+        for (event, bytes) in events[..size].iter().zip(encoded.chunks_exact_mut(stride)) {
             bytes[..4].copy_from_slice(&event.events.to_le_bytes());
-            bytes[8..16].copy_from_slice(&event.data.to_le_bytes());
+            bytes[data..data + 8].copy_from_slice(&event.data.to_le_bytes());
         }
-        self.copy_to(address, &encoded[..size * 16])?;
+        self.copy_to(address, &encoded[..size * stride])?;
         Ok(size)
     }
 
@@ -371,7 +375,7 @@ impl Runner {
             self.copy_to(address, &header)?;
         }
         // Ancillary sends currently have one nonblocking commit attempt, even
-        // on a blocking socket. Replaying this SVC would re-resolve source FD
+        // on a blocking socket. Replaying this syscall would re-resolve source FD
         // numbers after another thread could close/reuse them. A future blocking
         // implementation must retain the staged ticket in thread wait state and
         // cancel it on every signal/exit path; never silently resend replacements.

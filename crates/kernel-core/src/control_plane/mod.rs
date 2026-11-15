@@ -67,6 +67,7 @@ pub mod wire;
 pub mod dispatch;
 pub mod exchange;
 pub mod image;
+pub mod image_abi;
 pub mod service;
 
 pub mod service_image;

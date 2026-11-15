@@ -1,4 +1,4 @@
-//! AArch64 timerfd ABI; validate all user memory before changing timer state.
+//! LP64 Linux timerfd ABI; validate all user memory before changing timer state.
 use super::{Errno, Runner, fd};
 use cyxia_posix::timerfd::Setting;
 

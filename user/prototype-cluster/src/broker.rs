@@ -1,4 +1,4 @@
-use core::arch::asm;
+use cyxia_prototype_cluster::calls;
 use cyxia_prototype_cluster::abi::*;
 const SERVICE_FAULT: u64 = include!(concat!(env!("OUT_DIR"), "/service-fault.rs"));
 pub fn service_fault_enabled() -> bool {
@@ -22,11 +22,9 @@ pub fn domain_feedback(feedback: DomainFeedback) {
             return;
         };
         sequence.write_volatile(base + 1);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        asm!("dmb ish", options(nostack, preserves_flags));
+        calls::release_shared();
         core::ptr::addr_of_mut!((*shared).domain_feedback).write_volatile(feedback);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        asm!("dmb ish", options(nostack, preserves_flags));
+        calls::release_shared();
         sequence.write_volatile(completed);
     }
 }
@@ -77,7 +75,7 @@ pub fn request(
         for (i, b) in input.iter().enumerate() {
             bytes.add(i).write_volatile(*b);
         }
-        asm!("svc #0x43", clobber_abi("C"), options(nostack));
+        let _ = calls::call::<0x43>([0; 5], 0);
         if core::ptr::addr_of!((*p).sequence).read_volatile() != seq {
             return Err(FAILED);
         }
@@ -93,10 +91,10 @@ pub fn request(
             *b = bytes.add(i).read_volatile();
         }
         if service_fault_due(SERVICE_FAULT, service_generation(), op, args[0]) {
-            // BRK is a genuine synchronous EL0 exception. The successful
+            // The target emits a genuine synchronous user exception. The successful
             // broker boundary is already externally owned; this context must
             // be retired and never return to its caller.
-            asm!("brk #0", options(noreturn, nostack));
+            calls::fault();
         }
         Ok((n, core::ptr::addr_of!((*p).arg0).read_volatile()))
     }

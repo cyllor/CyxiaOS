@@ -142,31 +142,9 @@ fn syscall_result(value: i64) -> io::Result<usize> {
     }
 }
 
-// SAFETY: Callers validate the ABI and keep all user buffers alive, uniquely
-// writable for output and readable for input, for the whole synchronous call.
-unsafe fn syscall6(number: u64, args: [u64; 6]) -> i64 {
-    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "musl"))]
-    {
-        let mut result = args[0];
-        // SAFETY: CyxiaOS's Linux personality preserves x1..x5/x8 across SVC,
-        // and copies/validates user pointers. No borrowed data outlives SVC.
-        unsafe {
-            std::arch::asm!(
-                "svc #0",
-                inlateout("x0") result,
-                in("x1") args[1], in("x2") args[2], in("x3") args[3],
-                in("x4") args[4], in("x5") args[5], in("x8") number,
-                options(nostack),
-            );
-        }
-        result as i64
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "linux", target_env = "musl")))]
-    {
-        let _ = (number, args);
-        -38
-    }
-}
+#[path = "linux_syscall.rs"]
+mod linux_syscall;
+use linux_syscall::syscall6;
 
 fn retry_submission(
     deadline: std::time::Instant,

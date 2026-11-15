@@ -87,7 +87,7 @@ pub struct Completion {
 
 pub struct BatchQueue {
     memory: &'static mut BatchMemory,
-    index: u32,
+    notification: crate::transport::Notification,
     size: u16,
     available: u16,
     used: u16,
@@ -110,10 +110,10 @@ impl BatchQueue {
         index: u32,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        t.write(0x30, index);
+        t.select_queue(index)?;
         p.barrier();
-        let max = t.read(0x34);
-        if t.read(0x44) != 0 || max < 2 {
+        let max = t.queue_max_size();
+        if t.queue_enabled() || max < 2 {
             return Err(Error::Queue);
         }
         let size = if max >= 16 {
@@ -125,6 +125,7 @@ impl BatchQueue {
         } else {
             2
         };
+        let notification = t.queue_notification(index)?;
         let bytes = core::mem::size_of::<BatchMemory>();
         let pa = p.physical(memory as *mut _ as usize, bytes)?;
         if !pa.is_multiple_of(4096) || pa.checked_add(bytes as u64).is_none() {
@@ -141,19 +142,17 @@ impl BatchQueue {
         }
         memory.avail.put16(0, 1);
         unsafe { p.sync(memory as *mut _ as usize, bytes) };
-        t.write(0x38, size);
-        t.address(0x80, pa);
-        t.address(0x90, pa + 4096);
-        t.address(0xa0, pa + 8192);
+        t.set_queue_size(size)?;
+        t.set_queue_addresses(pa, pa + 4096, pa + 8192);
         p.barrier();
-        t.write(0x44, 1);
+        t.enable_queue();
         p.barrier();
-        if t.read(0x44) != 1 {
+        if !t.queue_enabled() {
             return Err(Error::Queue);
         }
         Ok(Self {
             memory,
-            index,
+            notification,
             size: size as u16,
             available: 0,
             used: 0,
@@ -297,7 +296,7 @@ impl BatchQueue {
         if self.poisoned {
             return Err(Error::Device);
         }
-        if t.read(0x70) != 15 {
+        if t.status() != 15 {
             self.poison(t, p);
             return Err(Error::Device);
         }
@@ -393,7 +392,7 @@ impl BatchQueue {
         if self.count == 0 {
             return Ok(());
         }
-        if t.read(0x70) != 15 {
+        if t.status() != 15 {
             self.poison(t, p);
             return Err(Error::Device);
         }
@@ -421,7 +420,10 @@ impl BatchQueue {
         unsafe { p.sync(self.memory.used.address(), 4) };
         p.barrier();
         if self.memory.used.get16(0) & 1 == 0 {
-            t.write(0x50, self.index);
+            if let Err(error) = t.notify(self.notification) {
+                self.poison(t, p);
+                return Err(error);
+            }
             p.barrier();
             self.stats.doorbells = self.stats.doorbells.saturating_add(1);
         }
@@ -456,7 +458,7 @@ impl BatchQueue {
         if self.poisoned {
             return Err(Error::Device);
         }
-        if t.read(0x70) != 15 {
+        if t.status() != 15 {
             self.poison(t, p);
             return Err(Error::Device);
         }
@@ -471,8 +473,7 @@ impl BatchQueue {
         checkpoint();
         if end == self.used {
             p.diagnostic_stage(Stage::QueueIdleAck as u64);
-            let irq = t.read(0x60);
-            t.write(0x64, irq & 3);
+            t.acknowledge_interrupt();
             p.barrier();
             return Ok(None);
         }
@@ -527,8 +528,7 @@ impl BatchQueue {
         // Publish a complete, queryable token before paying for MMIO IRQ ACK.
         checkpoint();
         p.diagnostic_stage(Stage::QueueCompletionAck as u64);
-        let irq = t.read(0x60);
-        t.write(0x64, irq & 3);
+        t.acknowledge_interrupt();
         p.barrier();
         Ok(Some(Completion {
             token: Token {

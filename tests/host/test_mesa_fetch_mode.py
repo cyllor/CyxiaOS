@@ -6,6 +6,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import build_mesa as build
 class StopAfterFetch(Exception): pass
 class FetchModeTests(unittest.TestCase):
+    def test_generators_skip_python_too_new_for_pinned_binary_wheels(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            candidates = []
+            for minor in (15, 14):
+                executable = root / ('python3.' + str(minor))
+                executable.write_text('#!/bin/sh\nprintf "[3, ' + str(minor) + ', 3]\\n"\n')
+                executable.chmod(0o755)
+                candidates.append(executable)
+            result = build.select_host_python(candidates)
+            self.assertEqual(Path(result['executable']), candidates[1].resolve())
+            self.assertEqual(result['version'], [3, 14, 3])
+            with self.assertRaisesRegex(build.BuildError, 'Python 3.9'):
+                build.select_host_python(candidates[:1])
+
     def test_audit_cxx_fetch_passes_explicit_network_consent(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

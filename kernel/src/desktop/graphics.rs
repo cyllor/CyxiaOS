@@ -28,12 +28,9 @@ struct Input {
     queue: EventQueue,
 }
 
+#[cfg(target_arch = "aarch64")]
 pub fn init(info: &cyxia_contracts::BootInfo) {
-    // Called once on CPU0 before interrupts; no other owner accesses these pools.
-    super::log(b"GRAPHICS_BEGIN D1 BOOTSTRAP\n");
-    let mut gpu_found = false;
-    let mut inputs = 0;
-    for resource in &info.virtio[..info.virtio_count] {
+    let transports = info.virtio[..info.virtio_count].iter().filter_map(|resource| {
         // entry.S maps this board-specific 2 MiB Device window. Discovery remains
         // DTB-based, and resources outside the window are never dereferenced.
         if resource.base.0 < 0x0a000000
@@ -43,17 +40,24 @@ pub fn init(info: &cyxia_contracts::BootInfo) {
                 .checked_add(resource.len)
                 .is_none_or(|end| end > 0x0a200000)
         {
-            continue;
+            return None;
         }
-        let transport = unsafe {
+        unsafe {
             Transport::attach(
                 (super::HIGH + resource.base.0) as usize,
                 resource.len as usize,
             )
-        };
-        let Ok(mut transport) = transport else {
-            continue;
-        };
+        }.ok()
+    });
+    init_transports(transports);
+}
+
+/// Attach the existing display/input services to real board-discovered devices.
+pub fn init_transports(transports: impl IntoIterator<Item = Transport>) {
+    super::log(b"GRAPHICS_BEGIN D1 BOOTSTRAP\n");
+    let mut gpu_found = false;
+    let mut inputs = 0;
+    for mut transport in transports {
         match transport.device_id() {
             16 if !gpu_found => {
                 gpu_found = true;

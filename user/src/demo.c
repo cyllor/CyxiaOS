@@ -2,6 +2,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#if defined(__aarch64__)
+#define KERNEL_PROBE_ADDRESS 0xffffffc040200000UL
+#elif defined(__x86_64__)
+#define KERNEL_PROBE_ADDRESS 0xffff800000100000UL
+#endif
 static char buf[1100];
 static const char message[]="POSIX EL0 C program: PASS\r\n";
 #define CHECK(x) do {if(!(x)){write(2,"POSIX CHECK FAILED\r\n",20);return __LINE__;}} while(0)
@@ -9,13 +14,14 @@ static int same(const char*a,const char*b){while(*a&&*a==*b){a++;b++;}return *a=
 int main(int argc,char **argv){
     CHECK(argc==2);
     if(same(argv[1],"fault")){*(volatile unsigned long*)0=1;return 99;}
-    if(same(argv[1],"kernel")){buf[0]=*(volatile char*)0xffffffc040200000UL;return 99;}
+    if(same(argv[1],"kernel")){buf[0]=*(volatile char*)KERNEL_PROBE_ADDRESS;return 99;}
     if(same(argv[1],"readonly")){*(volatile char*)message='X';return 99;}
     if(same(argv[1],"guard")){buf[0]=*(volatile char*)0x106000;return 99;}
     if(same(argv[1],"execdata")){((void(*)(void))buf)();return 99;}
     if(same(argv[1],"spin")){for(;;)__asm__ volatile("":::"memory");}
     if(same(argv[1],"preempt")){
         unsigned long ok;
+#if defined(__aarch64__)
         __asm__ volatile(
             "mov x19, #0x1973\nmov x20, #0x2047\nmov x10, #0x1234\n"
             "movz x9, #0xc6c0\nmovk x9, #0x2d, lsl #16\n1: subs x9,x9,#1\nb.ne 1b\n"
@@ -23,6 +29,17 @@ int main(int argc,char **argv){
             "mov x11,#0x2047\ncmp x20,x11\nb.ne 2f\n"
             "mov x11,#0x1234\ncmp x10,x11\nb.ne 2f\nmov %0,#1\n2:"
             : "=r"(ok) : : "x9","x10","x11","x19","x20","cc");
+#elif defined(__x86_64__)
+        __asm__ volatile(
+            "mov $0x1973, %%r12\nmov $0x2047, %%r13\nmov $0x1234, %%r10\n"
+            "mov $3000000, %%rcx\n1: dec %%rcx\njnz 1b\n"
+            "mov $0, %0\ncmp $0x1973, %%r12\njne 2f\n"
+            "cmp $0x2047, %%r13\njne 2f\ncmp $0x1234, %%r10\njne 2f\n"
+            "mov $1, %0\n2:"
+            : "=r"(ok) : : "rcx","r10","r12","r13","cc");
+#else
+#error Unsupported CyxiaOS register probe architecture
+#endif
         CHECK(ok==1);CHECK(write(1,"EL0 REGISTERS PASS\r\n",20)==20);return 0;
     }
     CHECK(getpid()>0);
@@ -30,7 +47,7 @@ int main(int argc,char **argv){
     CHECK(open("/absent",O_RDONLY)==-1&&errno==ENOENT);
     CHECK(close(99)==-1&&errno==EBADF);
     CHECK(lseek(1,0,SEEK_SET)==-1&&errno==ESPIPE);
-    CHECK(write(1,(void*)0xffffffc040200000UL,1)==-1&&errno==EFAULT);
+    CHECK(write(1,(void*)KERNEL_PROBE_ADDRESS,1)==-1&&errno==EFAULT);
     CHECK(read(0,(void*)message,1)==-1&&errno==EFAULT);
     CHECK(write(1,(void*)-16UL,32)==-1&&errno==EFAULT);
     CHECK(mkdir("/posix",0700)==0);

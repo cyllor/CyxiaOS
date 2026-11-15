@@ -100,7 +100,7 @@ impl super::Runner {
         address: u64,
     ) -> Result<u64, Errno> {
         // Linux ioctl takes an unsigned 32-bit command. Musl's int request
-        // prototype may sign-extend _IOR values into the AArch64 register.
+        // prototype may sign-extend _IOR values into a 64-bit user register.
         let request = u64::from(request as u32);
         let owner = backend_owner;
         match request {

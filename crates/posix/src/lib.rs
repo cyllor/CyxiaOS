@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 //! Bounded, single-UID POSIX file API subset. No architecture or raw user pointers.
 pub mod ancillary;
+pub use cyxia_contracts::ImageAbi;
 mod directory;
 pub mod open_description;
 pub mod shared_memory;
@@ -1164,3 +1165,7 @@ impl UserStatus {
         image_free: 0,
     };
 }
+
+pub mod linux_abi;
+
+pub mod signal_x86_64;

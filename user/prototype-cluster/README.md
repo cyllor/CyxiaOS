@@ -1,9 +1,12 @@
 # Protected native cluster service
 
-This is a standalone Cargo workspace: EL0 uses standard `aarch64-unknown-none`
-with FP/SIMD; EL1 remains `aarch64-unknown-none-softfloat`. The kernel must save
-and restore SIMD registers across every exception/context switch and enable
-EL0 FP/SIMD. No NEON assertions or crypto checks are disabled.
+This is a standalone Cargo workspace. The default ARM user target is standard
+`aarch64-unknown-none` with FP/SIMD; the ARM kernel remains
+`aarch64-unknown-none-softfloat`. `tools/build.sh --arch x86_64` selects the
+actual `x86_64-unknown-none` target. The kernel must save and restore the complete
+enabled user register state across every exception/context switch. No crypto
+checks are disabled. The native call and entry conventions are documented in
+[the shared ABI](../shared/README.md).
 
 Provision outside the repository, then build each node separately:
 
@@ -22,7 +25,7 @@ identity must fail persistent-volume identity validation. Keep provisioning
 files and final images private. Host tests use separate test-only fixtures.
 
 `src/abi.rs` is the kernel's reusable source of truth. All service pointers stay
-inside its private address space. SVC 0x43 has no pointer arguments: the broker
+inside its private address space. Native call 0x43 has no pointer arguments: the broker
 reads a fixed request, validates the operation/count, performs one bounded
 operation, and writes the reply before the context resumes. Status 1 means
 would-block, 2 EOF, 3 failure, 4 missing record. No clock or counter entropy

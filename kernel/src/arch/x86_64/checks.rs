@@ -98,6 +98,10 @@ pub(super) fn shared_policy_check() {
 #[unsafe(no_mangle)]
 extern "C" fn x86_trap(frame: &mut TrapFrame) -> u64 {
     match frame.vector {
+        #[cfg(feature = "smp-selftest")]
+        240 | 241 if !frame.from_user() => super::smp::on_ipi(),
+        #[cfg(feature = "smp-selftest")]
+        255 if !frame.from_user() => {} // APIC spurious vector has no EOI.
         3 if !frame.from_user() => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         }

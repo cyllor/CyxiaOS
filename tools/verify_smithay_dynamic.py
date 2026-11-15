@@ -54,7 +54,7 @@ FATAL = (b"SMITHAY_DYN FAIL", b"DYN_CLIENT FAIL", b"KERNEL_FAULT",
 
 def check_console(data):
     assert not any(word in data for word in FATAL), data[-6000:]
-    assert not re.search(rb"EL0 pid=\d+ (?:Fault|Killed|Exited) code=(?!0\b)\d+", data), data[-6000:]
+    assert not re.search(rb"(?:EL0|USER) pid=\d+ (?:Fault|Killed|Exited) code=(?!0\b)\d+", data), data[-6000:]
 
 
 def scene_ready(scene):
@@ -112,8 +112,13 @@ def client_done(identity):
     return f"DYN_CLIENT RESULT PASS id={identity} cfg={configs} ack={configs} close=1"
 
 
-def validate(data):
+def validate(data, *, architecture="aarch64"):
     """Bind real peers, generations, wire lifecycle and independent shell launches."""
+    assert architecture in ("aarch64", "x86_64"), "Unsupported target lifecycle"
+    abi, process_label, fault_label = {
+        "aarch64": ("Linux-AArch64-subset", "EL0", "esr"),
+        "x86_64": ("Linux-x86_64-subset", "USER", "fault"),
+    }[architecture]
     check_console(data)
     server, client = rows(data, "SMITHAY_DYN"), rows(data, "DYN_CLIENT")
     assert all(len(line.encode())+1 <= 64 for line, _ in server+client), "Non-atomic telemetry"
@@ -271,16 +276,16 @@ def validate(data):
     assert set(line for line,_ in client)==expected_client,("Unexpected/missing client records",set(line for line,_ in client)^expected_client)
     before(LISTEN,READY,CANVAS,scene_ready(0))
     before(scene_ready(11),"SMITHAY_DYN REBIND PASS","SMITHAY_DYN SOCKET CLEAN",TOTAL,SUCCESS)
-    launches=rows(data,"ELF pid=");endings=rows(data,"EL0 pid=")
+    launches=rows(data,"ELF pid=");endings=rows(data,process_label+" pid=")
     launched={};exited={};active=set()
     for line,position in sorted(launches+endings,key=lambda pair:pair[1]):
         if line.startswith("ELF"):
-            match=re.fullmatch(r"ELF pid=(\d+) started; ABI=Linux-AArch64-subset image AI_DIRECT model=8195 pages=(\d+)",line)
+            match=re.fullmatch(r"ELF pid=(\d+) started; ABI="+re.escape(abi)+r" image AI_DIRECT model=8195 pages=(\d+)",line)
             assert match,line
             pid,pages=map(int,match.groups());assert pid not in launched and pid==len(launched)+1 and 64<pages<=4096
             launched[pid]=(position,pages);active.add(pid)
         else:
-            match=re.fullmatch(r"EL0 pid=(\d+) Exited code=0 free_pages=(\d+) esr=0x0 far=0x0",line);assert match,line
+            match=re.fullmatch(process_label+r" pid=(\d+) Exited code=0 free_pages=(\d+) "+fault_label+r"=0x0 far=0x0",line);assert match,line
             pid,free=map(int,match.groups());assert pid in active and pid not in exited
             active.remove(pid);assert free==64-8*len(active),(pid,free,active);exited[pid]=position
     assert set(launched)==set(exited)=={1,2,3,4,5} and not active

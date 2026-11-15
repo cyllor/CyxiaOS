@@ -22,7 +22,7 @@ impl Record {
         PlacementRequest { key: self.key, payload_hash: ring::digest::digest(
             &ring::digest::SHA256, &self.input).as_ref().try_into().unwrap(),
             package_hash: self.package_hash, cpu_milli: 100, memory_pages: 16,
-            isa: 183, abi: 1, peer: Some(peer) }
+            isa: crate::calls::ELF_MACHINE, abi: 1, peer: Some(peer) }
     }
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut bytes = alloc::vec![0; MAGIC.len() + 32 + SUBMISSION_HEADER + self.input.len() + 32];

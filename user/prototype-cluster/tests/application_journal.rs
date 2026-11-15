@@ -17,3 +17,17 @@ fn durable_record_binds_actor_sequence_epoch_package_and_copied_payload() {
     let wire = Status { key, state: REMOTE, target: ObjectKey { id: 88, generation: 2 } };
     assert_eq!(Status::decode(&wire.encode().unwrap()), Ok(wire));
 }
+
+#[test]
+fn placement_request_announces_the_compiled_target_isa() {
+    let record = Record::from_submission(Submission {
+        actor: ObjectKey { id: 51, generation: 9 }, sequence: 17,
+        key: ObjectKey { id: 4097, generation: 3 }, submitted_ns: 123,
+        input: &[3; 32],
+    }, [2; 32]);
+    let peer = ObjectKey { id: 88, generation: 2 };
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(record.request(peer).isa, 62);
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(record.request(peer).isa, 183);
+}

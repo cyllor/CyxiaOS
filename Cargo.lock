@@ -219,6 +219,7 @@ name = "cyxia-posix"
 version = "0.1.0"
 dependencies = [
  "cyxia-ai-fs",
+ "cyxia-contracts",
 ]
 
 [[package]]

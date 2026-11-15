@@ -31,7 +31,7 @@
     "kernel/src/user.rs": "kernel/src/desktop/user.rs",
     "kernel/src/cluster_transport.rs": "kernel/src/runtime/network/cluster_transport.rs",
     "kernel/src/x86_64.rs": "kernel/src/arch/x86_64/mod.rs",
-    "kernel/src/entropy.rs": "kernel/src/platform/virt/entropy.rs",
+    "kernel/src/platform/virt/entropy.rs": "kernel/src/desktop/entropy.rs",
     "kernel/src/domain_file_abi.rs": "kernel/src/runtime/files/domain_file_abi.rs",
     "kernel/src/learning_history.rs": "kernel/src/runtime/learning/learning_history.rs",
     "kernel/src/domain_storage.rs": "kernel/src/runtime/files/domain_storage.rs",

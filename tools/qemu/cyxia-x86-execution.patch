@@ -1,0 +1,295 @@
+From: CyxiaOS Prototype <cyxiaos@example.invalid>
+Subject: [PATCH] x86: expose fail-closed translated-TB execution nanoseconds
+
+Standalone patch against QEMU v10.2.2 f8ed81651e61d9c2166df6121ce2af0f44f06b3e.
+Does not include or alter the historical Arm PMU patch. Execution includes only
+translated guest code and synchronous helpers. CPUID ABI 1 identifies two
+readonly project MSRs: per-vCPU execution ns and separate shared QEMU virtual
+monotonic ns. Require healthy MTTCG with no icount; latch all clock faults.
+No live migration support. cyxia-exec-fail-after-ns is explicit fault injection.
+
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -585,6 +585,14 @@
+     /* track IOMMUs whose translations we've cached in the TCG TLB */
+     GArray *iommu_notifiers;
+ 
++    /* Cyxia x86 prototype: translated-TB thread CPU nanoseconds, not migrated. */
++    uint64_t cyxia_exec_ns;
++    uint64_t cyxia_exec_started_ns;
++    uint64_t cyxia_exec_last_clock_ns;
++    bool cyxia_exec_active;
++    bool cyxia_exec_initialized;
++    bool cyxia_exec_failed;
++
+     /*
+      * MUST BE LAST in order to minimize the displacement to CPUArchState.
+      */
+@@ -628,6 +636,10 @@
+     QTAILQ_FOREACH_SAFE_RCU(cpu, &cpus_queue, node, next_cpu)
+ 
+ extern __thread CPUState *current_cpu;
++
++void cyxia_cpu_exec_start(CPUState *cpu);
++void cyxia_cpu_exec_stop(CPUState *cpu);
++bool cyxia_cpu_exec_time_ns(CPUState *cpu, uint64_t *value);
+ 
+ /**
+  * cpu_paging_enabled:
+diff --git a/cpu-common.c b/cpu-common.c
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -122,6 +122,90 @@
+ 
+ /* current CPU in the current thread. It is only valid inside cpu_exec() */
+ __thread CPUState *current_cpu;
++
++/* BEGIN CYXIA_EXEC_CLOCK: extracted unchanged by the focused fault harness. */
++static bool cyxia_thread_cpu_time_ns(uint64_t *value)
++{
++#ifdef CLOCK_THREAD_CPUTIME_ID
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0 &&
++        ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000 &&
++        (uint64_t)ts.tv_sec <=
++            (UINT64_MAX - (uint64_t)ts.tv_nsec) / 1000000000ULL) {
++        *value = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
++        return true;
++    }
++#endif
++    return false;
++}
++
++static bool cyxia_exec_clock_read(CPUState *cpu, uint64_t *now)
++{
++    if (cpu->cyxia_exec_failed) {
++        return false;
++    }
++    if (!cyxia_thread_cpu_time_ns(now) ||
++        (cpu->cyxia_exec_initialized && *now < cpu->cyxia_exec_last_clock_ns)) {
++        cpu->cyxia_exec_failed = true;
++        return false;
++    }
++    cpu->cyxia_exec_initialized = true;
++    cpu->cyxia_exec_last_clock_ns = *now;
++    return true;
++}
++
++static bool cyxia_exec_sum(CPUState *cpu, uint64_t delta, uint64_t *total)
++{
++    if (UINT64_MAX - cpu->cyxia_exec_ns < delta) {
++        cpu->cyxia_exec_failed = true;
++        return false;
++    }
++    *total = cpu->cyxia_exec_ns + delta;
++    return true;
++}
++
++void cyxia_cpu_exec_start(CPUState *cpu)
++{
++    uint64_t now;
++
++    if (cpu->cyxia_exec_active) {
++        cpu->cyxia_exec_failed = true;
++        return;
++    }
++    if (!cyxia_exec_clock_read(cpu, &now)) {
++        return;
++    }
++    cpu->cyxia_exec_started_ns = now;
++    cpu->cyxia_exec_active = true;
++}
++
++void cyxia_cpu_exec_stop(CPUState *cpu)
++{
++    uint64_t now, total;
++
++    if (!cpu->cyxia_exec_active) {
++        return;
++    }
++    cpu->cyxia_exec_active = false;
++    if (cyxia_exec_clock_read(cpu, &now) &&
++        cyxia_exec_sum(cpu, now - cpu->cyxia_exec_started_ns, &total)) {
++        cpu->cyxia_exec_ns = total;
++    }
++}
++
++bool cyxia_cpu_exec_time_ns(CPUState *cpu, uint64_t *value)
++{
++    uint64_t now;
++
++    /* Guest reads are valid only inside the owning vCPU's current TB. */
++    if (current_cpu != cpu || !cpu->cyxia_exec_active ||
++        !cpu->cyxia_exec_initialized || !cyxia_exec_clock_read(cpu, &now)) {
++        return false;
++    }
++    return cyxia_exec_sum(cpu, now - cpu->cyxia_exec_started_ns, value);
++}
++/* END CYXIA_EXEC_CLOCK */
+ 
+ struct qemu_work_item {
+     QSIMPLEQ_ENTRY(qemu_work_item) node;
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -436,7 +436,9 @@
+     }
+ 
+     qemu_thread_jit_execute();
++    cyxia_cpu_exec_start(cpu);
+     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
++    cyxia_cpu_exec_stop(cpu);
+     cpu->neg.can_do_io = true;
+     qemu_plugin_disable_mem_helpers(cpu);
+     /*
+@@ -513,6 +515,7 @@
+ {
+     /* Non-buggy compilers preserve this; assert the correct value. */
+     g_assert(cpu == current_cpu);
++    cyxia_cpu_exec_stop(cpu);
+ 
+ #ifdef CONFIG_USER_ONLY
+     clear_helper_retaddr();
+diff --git a/target/i386/cpu.h b/target/i386/cpu.h
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -380,6 +380,13 @@
+ #define MCM_ADDR_PHYS    2      /* physical address */
+ #define MCM_ADDR_MEM     3      /* memory address */
+ #define MCM_ADDR_GENERIC 7      /* generic */
++
++/* Private Cyxia ABI 1, identified by CPUID 0x40000001; not architectural MSRs. */
++#define CYXIA_CLOCK_MAGIC               0x43595831U
++#define CYXIA_CLOCK_VERSION_FLAGS       0x00010007U
++#define MSR_CYXIA_EXEC_NS               0x4b595801U
++#define MSR_CYXIA_MONOTONIC_NS          0x4b595802U
++#define CYXIA_CLOCK_HZ                  1000000000U
+ 
+ #define MSR_IA32_TSC                    0x10
+ #define MSR_IA32_APICBASE               0x1b
+@@ -2182,6 +2189,9 @@
+ 
+     uint64_t ucode_rev;
+ 
++    /* Explicit test fault injection; UINT64_MAX disables it. Not migrated. */
++    uint64_t cyxia_exec_fail_after_ns;
++
+     uint32_t hyperv_spinlock_attempts;
+     char *hyperv_vendor;
+     bool hyperv_synic_kvm_only;
+@@ -2574,6 +2584,8 @@
+ uint32_t cpu_x86_virtual_addr_width(CPUX86State *env);
+ 
+ /* cpu.c other functions (cpuid) */
++bool cyxia_x86_clock_available(CPUX86State *env);
++
+ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                    uint32_t *eax, uint32_t *ebx,
+                    uint32_t *ecx, uint32_t *edx);
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -46,6 +46,8 @@
+ #include "hw/i386/sgx-epc.h"
+ #endif
+ #include "system/qtest.h"
++#include "system/tcg.h"
++#include "exec/icount.h"
+ #include "tcg/tcg-cpu.h"
+ 
+ #include "disas/capstone.h"
+@@ -7859,6 +7861,25 @@
+     }
+ }
+ 
++bool cyxia_x86_clock_available(CPUX86State *env)
++{
++#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
++    X86CPU *cpu = env_archcpu(env);
++    CPUState *cs = env_cpu(env);
++    uint64_t value;
++
++    if (tcg_enabled() && cpu->expose_tcg && qemu_tcg_mttcg_enabled() &&
++        !icount_enabled() && cyxia_cpu_exec_time_ns(cs, &value)) {
++        if (value >= cpu->cyxia_exec_fail_after_ns) {
++            cs->cyxia_exec_failed = true;
++            return false;
++        }
++        return true;
++    }
++#endif
++    return false;
++}
++
+ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+                    uint32_t *eax, uint32_t *ebx,
+                    uint32_t *ecx, uint32_t *edx)
+@@ -8333,6 +8354,12 @@
+         *ebx = 0;
+         *ecx = 0;
+         *edx = 0;
++        if (cyxia_x86_clock_available(env)) {
++            *eax = CYXIA_CLOCK_MAGIC;
++            *ebx = CYXIA_CLOCK_VERSION_FLAGS;
++            *ecx = MSR_CYXIA_EXEC_NS;
++            *edx = CYXIA_CLOCK_HZ;
++        }
+         break;
+     case 0x80000000:
+         *eax = env->cpuid_xlevel;
+@@ -10022,6 +10049,8 @@
+                      false),
+     DEFINE_PROP_BOOL("vmware-cpuid-freq", X86CPU, vmware_cpuid_freq, true),
+     DEFINE_PROP_BOOL("tcg-cpuid", X86CPU, expose_tcg, true),
++    DEFINE_PROP_UINT64("cyxia-exec-fail-after-ns", X86CPU,
++                       cyxia_exec_fail_after_ns, UINT64_MAX),
+     DEFINE_PROP_BOOL("x-migrate-smi-count", X86CPU, migrate_smi_count,
+                      true),
+     DEFINE_PROP_BOOL("x-migrate-error-code", X86CPU, migrate_error_code, true),
+diff --git a/target/i386/tcg/system/misc_helper.c b/target/i386/tcg/system/misc_helper.c
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/main-loop.h"
++#include "qemu/timer.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+ #include "accel/tcg/cpu-ldst.h"
+@@ -140,6 +141,9 @@
+         ((uint64_t)((uint32_t)env->regs[R_EDX]) << 32);
+ 
+     switch ((uint32_t)env->regs[R_ECX]) {
++    case MSR_CYXIA_EXEC_NS:
++    case MSR_CYXIA_MONOTONIC_NS:
++        goto error; /* Project clocks are read-only, even before admission. */
+     case MSR_IA32_SYSENTER_CS:
+         env->sysenter_cs = val & 0xffff;
+         break;
+@@ -334,6 +338,23 @@
+     cpu_svm_check_intercept_param(env, SVM_EXIT_MSR, 0, GETPC());
+ 
+     switch ((uint32_t)env->regs[R_ECX]) {
++    case MSR_CYXIA_EXEC_NS:
++    case MSR_CYXIA_MONOTONIC_NS:
++        if (!cyxia_x86_clock_available(env)) {
++            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
++        }
++        if ((uint32_t)env->regs[R_ECX] == MSR_CYXIA_EXEC_NS) {
++            if (!cyxia_cpu_exec_time_ns(env_cpu(env), &val)) {
++                raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
++            }
++        } else {
++            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++            if (now < 0) {
++                raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
++            }
++            val = now;
++        }
++        break;
+     case MSR_IA32_SYSENTER_CS:
+         val = env->sysenter_cs;
+         break;

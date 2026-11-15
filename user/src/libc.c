@@ -6,12 +6,19 @@
 #include <stdarg.h>
 int errno;
 static long call(long n,long a,long b,long c){
+#if defined(__aarch64__)
     register long x0 __asm__("x0")=a;
     register long x1 __asm__("x1")=b;
     register long x2 __asm__("x2")=c;
     register long x8 __asm__("x8")=n;
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1),"r"(x2),"r"(x8) : "memory","cc");
     if(x0<0){errno=(int)-x0;return -1;}return x0;
+#elif defined(__x86_64__)
+    __asm__ volatile("int $0x80" : "+a"(n) : "D"(a),"S"(b),"d"(c) : "memory","cc");
+    if(n<0){errno=(int)-n;return -1;}return n;
+#else
+#error Unsupported CyxiaOS native call architecture
+#endif
 }
 int open(const char *p,int f,...){
     mode_t m=0;if(f&O_CREAT){va_list a;va_start(a,f);m=va_arg(a,mode_t);va_end(a);}return (int)call(1,(long)p,f,m);

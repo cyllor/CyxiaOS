@@ -48,6 +48,58 @@ fn pc_map() -> Vec<u8> {
     map
 }
 
+#[test]
+fn runtime_profile_admits_full_gib_without_weakening_legacy_limit() {
+    use cyxia_platform_pc::boot::{MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit};
+    let limit = MAX_RUNTIME_PHYSICAL_MEMORY;
+    let mut map = Vec::new();
+    record(&mut map, 0, 0x9_fc00, 1);
+    record(&mut map, KERNEL_START, limit - KERNEL_START - 0x2_0000, 1);
+    record(&mut map, limit - 0x2_0000, 0x2_0000, 2);
+    record(&mut map, 0xfffc_0000, 0x4_0000, 2);
+    let mut h = header(&map, MAP_PA);
+    write_u32(&mut h, 8, ((limit - KERNEL_START) / 1024) as u32);
+    assert_eq!(parse_multiboot(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA, &map, MAP_PA,
+        KERNEL_START, KERNEL_END), Err(BootError::UnsupportedMemory));
+    let info = parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA, &map,
+        MAP_PA, KERNEL_START, KERNEL_END, limit).unwrap();
+    assert!(contains(info.ram_regions(), KERNEL_START, limit - 0x2_0000));
+    assert!(contains(info.reserved_regions(), limit - 0x2_0000, limit));
+    assert!(contains(info.reserved_regions(), 0, KERNEL_END));
+    assert!(info.ram_regions().iter().all(|r| r.start.0 + r.len <= limit));
+}
+
+#[test]
+fn explicit_memory_limit_rejects_invalid_limit_and_never_truncates_ram() {
+    use cyxia_platform_pc::boot::{MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit};
+    let map = pc_map();
+    for limit in [0, 4096, MAX_PHYSICAL_MEMORY + 1, MAX_RUNTIME_PHYSICAL_MEMORY + 4096] {
+        assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &header(&map, MAP_PA),
+            HEADER_PA, &map, MAP_PA, KERNEL_START, KERNEL_END, limit),
+            Err(BootError::UnsupportedMemory));
+    }
+    let mut map = Vec::new();
+    record(&mut map, KERNEL_START, MAX_RUNTIME_PHYSICAL_MEMORY, 1);
+    assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &header(&map, MAP_PA),
+        HEADER_PA, &map, MAP_PA, KERNEL_START, KERNEL_END, MAX_RUNTIME_PHYSICAL_MEMORY),
+        Err(BootError::UnsupportedMemory));
+}
+
+#[test]
+fn production_pool_reservations_exclude_firmware_kernel_and_previous_allocations() {
+    let mut info = parse(&pc_map()).unwrap();
+    let first = info.reserve_pool(8 * 4096, KERNEL_START).unwrap();
+    let second = info.reserve_pool(128 * 4096, KERNEL_START).unwrap();
+    assert_eq!(first.start.0, KERNEL_END);
+    assert_eq!(second.start.0, first.start.0 + first.len);
+    assert!(contains(info.reserved_regions(), first.start.0, second.start.0 + second.len));
+    assert!(!first.overlaps(second));
+    let before = info;
+    assert!(info.reserve_pool(1, KERNEL_START).is_err());
+    assert!(info.reserve_pool(MAX_PHYSICAL_MEMORY, KERNEL_START).is_err());
+    assert_eq!(info, before);
+}
+
 fn parse(map: &[u8]) -> Result<PcBootInfo, BootError> {
     parse_multiboot(
         MULTIBOOT_BOOT_MAGIC,

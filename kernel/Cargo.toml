@@ -11,6 +11,8 @@ bench = false
 
 [features]
 selftest = []
+# Long-running OS composition. Independent of bounded acceptance profiles.
+os-runtime = ["cyxia-arch-x86_64/runtime"]
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
@@ -53,6 +55,12 @@ cyxia-control-model = { path = "../crates/control-model" }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 cyxia-arch-x86_64 = { path = "../crates/arch-x86_64" }
 cyxia-platform-pc = { path = "../crates/platform-pc" }
+cyxia-prototype = { path = "../crates/prototype" }
+cyxia-shell = { path = "../crates/shell" }
+cyxia-ai-runtime = { path = "../crates/ai-runtime" }
+cyxia-posix = { path = "../crates/posix" }
+cyxia-ai-fs = { path = "../crates/ai-fs" }
+cyxia-driver-virtio = { path = "../crates/driver-virtio" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 cyxia-peer-billing = { path = "../crates/peer-billing", optional = true }

@@ -1,5 +1,14 @@
 # COSMIC 客体移植：源码、运行时与协议基础
 
+2026-11-15 平台增量：当前主线为完整 x86-64 CyxiaOS 与本 COSMIC/Smithay/Wayland 移植。
+真实 x86 musl、compiler-rt、Rust std、Wayland 和 xkbcommon 构建已经完成，NativeOs 用户态
+FP/TLS、私有内存、文件与 IPC 已在正式客体运行。Linux64 的 musl、Rust std、Wayland、
+xkbcommon 已通过真实客体测试；Mesa EGL/GLES 离屏渲染及 OOM 恢复也已通过，普通进程已
+实际运行在三个 AP。Smithay 已在 x86 客体完成独立客户端接入、12 个显示场景、键盘交互、
+正常/异常关闭与资源回收，详见 [本轮集成记录](v17-os-cosmic-20261115.md)。
+**尚未构建并运行完整 cosmic-comp/COSMIC 会话**。
+当前状态与证据见 [V0.17 开发记录](v17-development.md)。以下日期和通过状态保留其原 ARM 快照范围。
+
 更新于 2026-10-22。本阶段已固定官方源码，完成真实 Rust 标准库、Wayland、libxkbcommon 及 Smithay 原生表面显示/输入、xdg-shell 生命周期、双窗口合成/焦点和交互移动/缩放的有界客体集成，并提供可重复构建和 ARM/QEMU 门禁。**尚未编译或运行 CyxiaOS 客体内的 cosmic-comp，也未实现完整 COSMIC 桌面。** 现有 Xorg/Openbox/LXPanel 桌面的验收不计作 COSMIC 验收；宿主 macOS/Linux 的窗口也不计作客体移植结果。
 
 后续工作按 [COSMIC 移植实施计划](../../CyxiaOS-COSMIC-port-plan.md) 推进：对象/共享缓冲与真实 EGL 路线先验，随后交付合成器、核心开发会话、原生核心桌面和完整冻结套件。计划列出每阶段依赖、AI 资源契约、验收与替代路线；不改变本文记录的已完成范围。

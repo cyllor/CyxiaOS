@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
-// AArch64 ABI v1 pure vector_sum: immutable little-endian i64 input, checked
+// Native ABI v1 pure vector_sum: immutable little-endian i64 input, checked
 // signed sum, one result page. No syscalls/capabilities except terminal return.
+#[path = "../shared/calls.rs"]
+mod calls;
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 extern "C" fn _start() -> ! {
@@ -25,7 +27,7 @@ extern "C" fn _start() -> ! {
     unsafe {
         (0x30000 as *mut u64).write_volatile(status);
         (0x30008 as *mut i64).write_volatile(sum);
-        core::arch::asm!("svc #0x44", options(nostack));
+        let _ = calls::call::<0x44>([0; 5], 0);
     }
     loop {
         core::hint::spin_loop()

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 
+from target_profile import profile_for
 from build_cosmic import clean_environment, new_output, run_bounded
 from build_sysroot import ROOT, DEFAULT_OUTPUT, BuildError, digest, inspect_elf, toolchain
 
@@ -22,7 +23,8 @@ BUDGET = dict(timeout_seconds=60, min_free_bytes=512 * 1024 * 1024,
               max_build_bytes=32 * 1024 * 1024, max_download_bytes=0)
 
 
-def prerequisite_inputs(prefix):
+def prerequisite_inputs(prefix, target="aarch64"):
+    selected = profile_for(target)
     """Reject stale SDK manifests or libraries before linking any code."""
     paths = {}
     reports = {}
@@ -32,6 +34,10 @@ def prerequisite_inputs(prefix):
         report = json.loads(path.read_text())
         if report.get("status") != "cross-built" or digest(manifest) != report["manifest_sha256"]:
             raise BuildError("Unverified prerequisite: " + name)
+        # Historical ARM reports have no target field; actual objects still
+        # undergo strict ARM validation below. New/non-ARM reports are explicit.
+        if selected.architecture != "aarch64" or "target_triple" in report:
+            selected.require_report(report)
         paths[path] = digest(path)
         paths[manifest] = digest(manifest)
         reports[name] = report
@@ -48,6 +54,7 @@ def prerequisite_inputs(prefix):
         path = library / name
         if digest(path) != expected_hash:
             raise BuildError("Prerequisite archive changed: " + name)
+        selected.inspect_archive(path)
         paths[path] = expected_hash
     return paths
 
@@ -66,13 +73,15 @@ def dependency_inputs(depfile, source, prefix):
     return {path: digest(path) for path in paths}
 
 
-def build(output):
+def build(output, *, architecture="aarch64", sysroot=None):
+    selected = profile_for(architecture)
+    prefix = Path(sysroot or selected.default_output(ROOT)).resolve()
     output = new_output(output)
     for name in ("logs", "provenance"):
         (output / name).mkdir()
     tools = toolchain()
     env = clean_environment("/usr/bin:/bin:/opt/homebrew/bin")
-    report = dict(status="FAIL", guest_execution="not performed",
+    report = dict(status="FAIL", architecture=selected.architecture, target_triple=selected.rust_target, guest_execution="not performed",
                   scope="Independent libwayland client; rendering/input require actual guest verification",
                   budgets=BUDGET, commands=[], inputs_sha256={}, protocol=dict(
                       fd=3, compositor_version=4, seat_version=7, shm_format="ARGB8888",
@@ -92,14 +101,14 @@ def build(output):
 
     try:
         # A shared read lock protects the existing SDK; this helper never installs.
-        with (DEFAULT_OUTPUT / ".build.lock").open("r") as lock:
+        with (prefix / ".build.lock").open("r") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            inputs.update(prerequisite_inputs(DEFAULT_OUTPUT))
-            library = DEFAULT_OUTPUT / "sysroot/usr/lib"
-            driver = DEFAULT_OUTPUT / "bin/aarch64-linux-musl-cc"
-            native = [driver, DEFAULT_OUTPUT / "bin/ld.lld",
+            inputs.update(prerequisite_inputs(prefix, selected))
+            library = prefix / "sysroot/usr/lib"
+            driver = selected.cc(prefix)
+            native = [driver, prefix / "bin/ld.lld",
                       *[library / name for name in
-                        ("crt1.o", "crti.o", "crtn.o", "libclang_rt.builtins-aarch64.a")],
+                        ("crt1.o", "crti.o", "crtn.o", selected.builtins_archive)],
                       Path(tools["clang"]), Path(tools["rust-lld"]), Path(tools["llvm-strip"])]
             for path in [SOURCE, Path(__file__).resolve(),
                          ROOT / "tools/build_sysroot.py", ROOT / "tools/build_cosmic.py", *native]:
@@ -107,12 +116,12 @@ def build(output):
             report["toolchain"] = {name: tools[name] for name in ("clang", "rust-lld", "llvm-strip")}
             shutil.copyfile(SOURCE, output / "provenance" / SOURCE.name)
             for name in ("wayland", "xkbcommon"):
-                shutil.copyfile(DEFAULT_OUTPUT / (name + "-build-report.json"),
+                shutil.copyfile(prefix / (name + "-build-report.json"),
                                 output / "provenance" / (name + "-build-report.json"))
             depfile = output / "target-dependencies.d"
             run([driver, "-M", "-MF", depfile, "-MT", "smithay-wayland-client", SOURCE],
                 "dependencies.log")
-            inputs.update(dependency_inputs(depfile, SOURCE, DEFAULT_OUTPUT))
+            inputs.update(dependency_inputs(depfile, SOURCE, prefix))
             report["inputs_sha256"] = {str(path): value for path, value in inputs.items()}
             symbols = output / "smithay-wayland-client.symbols.elf"
             run([driver, "-std=c11", "-Os", "-ffunction-sections", "-fdata-sections",
@@ -120,11 +129,11 @@ def build(output):
                  "-Wl,--gc-sections", SOURCE, "-Wl,--start-group",
                  library / "libwayland-client.a", library / "libffi.a",
                  library / "libxkbcommon.a", "-Wl,--end-group", "-o", symbols], "link.log")
-            report["symbols"] = inspect_elf(symbols)
+            report["symbols"] = inspect_elf(symbols, selected)
             program = output / "smithay-wayland-client.elf"
             shutil.copyfile(symbols, program)
             run([tools["llvm-strip"], "--strip-all", program], "strip.log")
-            report["client"] = inspect_elf(program)
+            report["client"] = inspect_elf(program, selected)
             for path, expected in inputs.items():
                 if digest(path) != expected:
                     raise BuildError("Build input changed: " + str(path))
@@ -140,9 +149,11 @@ def build(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
+    parser.add_argument("--sysroot", type=Path)
     args = parser.parse_args()
     try:
-        print(json.dumps(build(args.output.resolve()), indent=2))
+        print(json.dumps(build(args.output.resolve(), architecture=args.arch, sysroot=args.sysroot), indent=2))
     except (OSError, ValueError, BuildError, subprocess.SubprocessError) as error:
         print("smithay-wayland-client: " + str(error), file=sys.stderr)
         raise SystemExit(1)
