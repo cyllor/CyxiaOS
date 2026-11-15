@@ -309,6 +309,7 @@ impl Shell {
                         "wayland-probe" => "wayland-probe",
                         "wayland-shm-probe" => "wayland-shm-probe",
                         "xkbcommon-probe" => "xkbcommon-probe",
+                        "xkb-rules-probe" => "xkb-rules-probe",
                         "cyxia-save" => "cyxia-save",
                         "cyxia-terminal" => "cyxia-terminal",
                         "cyxia-sh" => "cyxia-sh",

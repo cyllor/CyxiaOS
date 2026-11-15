@@ -11,7 +11,7 @@
 #define LARGE_BYTES (4 * MIB)
 #define CHUNK_BYTES ((size_t)64 * 1024)
 #define LARGE_MAPS 5
-#define MAX_MAPS 256
+#define MAX_MAPS 1100
 
 struct mapping {
     void *address;
@@ -202,6 +202,40 @@ int main(int argc, char **argv)
     if (large_cycle(2001, "second-cycle") || release_all("release-second"))
         return 1;
     puts("HEAP_CAPACITY_PROBE REUSE PASS");
+    /* Metadata capacity is independent of page capacity. Keep all one-page
+     * allocations live, then reuse alternating slots without touching peers. */
+    for (size_t slot = 0; slot < MAX_MAPS; ++slot) {
+        error = allocate_region(slot, PAGE_BYTES, 3001 + (unsigned)slot);
+        if (error) {
+            if (error != ENOMEM)
+                return fail("records-errno", error);
+            break;
+        }
+        if (prepare_region(slot, "records-zero"))
+            return 1;
+    }
+    if (mapping_count != 1024 || allocated_bytes != 1024 * PAGE_BYTES)
+        return fail("records-capacity", EOVERFLOW);
+    if (check_payload("records-denial-preserves-payload"))
+        return 1;
+    for (size_t slot = 0; slot < mapping_count; slot += 2)
+        if (release_region(slot, "records-release-alternate"))
+            return 1;
+    if (check_payload("records-surviving-payload"))
+        return 1;
+    for (size_t slot = 0; slot < mapping_count; slot += 2) {
+        error = allocate_region(slot, PAGE_BYTES, 5001 + (unsigned)slot);
+        if (error)
+            return fail("records-reuse-map", error);
+        if (prepare_region(slot, "records-reuse-zero"))
+            return 1;
+    }
+    if (check_payload("records-reuse-integrity"))
+        return 1;
+    printf("HEAP_CAPACITY_PROBE RECORDS PASS mappings=%zu pages=%zu\n",
+           mapping_count, allocated_bytes / PAGE_BYTES);
+    if (release_all("records-release-all"))
+        return 1;
     puts("HEAP_CAPACITY_PROBE PASS");
     return 0;
 }

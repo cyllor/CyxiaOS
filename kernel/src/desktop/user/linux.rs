@@ -1215,16 +1215,24 @@ impl Runner {
             Call::Mmap => {
                 let len = count(b)?;
                 if d & 0x20 == 0 {
-                    // Non-fixed file mappings only. Private mappings require
-                    // a fully immutable memfd and allocate a real private copy.
+                    // Non-fixed bootfile snapshots or memfd mappings only.
+                    // Immutable bootfiles may be shared read-only or private;
+                    // private memfd copies still require complete sealing.
                     // The address remains a hint; each arena chooses its VA.
-                    if !matches!(d, 1 | 2) || len == 0 || c > 3 || c == 2 {
+                    if !matches!(d, 1 | 2) || len == 0 || c > 3 {
+                        return Err(Errno::Inval);
+                    }
+                    let descriptor = fd(e)?;
+                    if let Some(bytes) = self.process.readonly_file(descriptor)? {
+                        return self.map_readonly_file(bytes, f, len, c as u8, d == 1);
+                    }
+                    if c == 2 {
                         return Err(Errno::Inval);
                     }
                     if d == 2 {
-                        return self.map_private_sealed(fd(e)?, f, len, c as u8);
+                        return self.map_private_sealed(descriptor, f, len, c as u8);
                     }
-                    return self.map_shared(fd(e)?, f, len, c as u8);
+                    return self.map_shared(descriptor, f, len, c as u8);
                 }
                 if len == 0
                     || c > 3

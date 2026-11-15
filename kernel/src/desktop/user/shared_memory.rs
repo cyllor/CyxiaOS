@@ -1,4 +1,4 @@
-//! Per-process virtual aliases of the independent shared backing pool.
+//! Per-process shared aliases and private copies of immutable file backing.
 use super::ai::{self, Domain};
 use super::{Errno, Runner};
 use crate::address_space::PageTable as Table;
@@ -302,6 +302,39 @@ impl Runner {
             protection,
             flags & 3 != cyxia_posix::O_RDONLY,
         )
+    }
+    /// Immutable boot files use eager private backing even for MAP_SHARED: their
+    /// source cannot change and shared copies cannot ever become writable.
+    /// Normal heap admission, page zeroing and whole-allocation reclaim apply.
+    #[cfg(feature = "ported")]
+    pub(super) fn map_readonly_file(
+        &mut self,
+        bytes: &'static [u8],
+        offset: u64,
+        len: usize,
+        protection: u8,
+        shared: bool,
+    ) -> Result<u64, Errno> {
+        let copy_len =
+            cyxia_posix::vm::immutable_snapshot_bytes(bytes.len(), offset, len, protection, shared)?;
+        let offset = usize::try_from(offset).map_err(|_| Errno::Inval)?;
+        let pages = len.div_ceil(PAGE_SIZE);
+        let address = self.heap.allocate(pages)?;
+        let result = (|| {
+            // CPU0 owns the stopped process. All backing pages were zeroed by
+            // the admitted heap allocation, including the partial EOF tail.
+            // Static source bytes require neither a retained OFD nor a seek.
+            self.heap.write(address, &bytes[offset..offset + copy_len])?;
+            if shared {
+                self.heap.seal_readonly(address, pages * PAGE_SIZE)?;
+            }
+            self.heap.protect(address, pages * PAGE_SIZE, protection)?;
+            Ok(address)
+        })();
+        if result.is_err() {
+            self.heap.unmap(address, pages)?;
+        }
+        result
     }
     /// Bounded MAP_PRIVATE of a fully immutable memfd. Eager copying uses the
     /// existing anonymous AI grant, PTE, mprotect and unmap ownership paths.

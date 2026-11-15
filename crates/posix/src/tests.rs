@@ -522,6 +522,29 @@ fn unified_socket_descriptors_share_status_but_not_close_on_exec() {
 }
 
 #[test]
+fn readonly_mapping_source_preserves_ofd_offset_and_outlives_descriptors() {
+    let mut fs = FileSystem::new();
+    let objects = crate::OpenDescriptions::new();
+    let mut process = Process::new(&objects, 1).unwrap();
+    static ASSET: &[u8] = b"immutable boot asset";
+    let fd = process.open_readonly(65536, ASSET, 0).unwrap();
+    let duplicate = process.dup(fd).unwrap();
+    process.lseek(&fs, duplicate, 7, 0).unwrap();
+    let source = process.readonly_file(fd).unwrap().unwrap();
+    assert_eq!(source, ASSET);
+    assert_eq!(process.readonly_file(duplicate), Ok(Some(ASSET)));
+    assert_eq!(process.lseek(&fs, duplicate, 0, 1), Ok(7));
+    process.close(&mut fs, fd).unwrap();
+    process.close(&mut fs, duplicate).unwrap();
+    assert_eq!(source, ASSET);
+    assert_eq!(process.readonly_file(fd), Err(Errno::Badf));
+    let file = process.open(&mut fs, "/mutable", O_CREAT | O_RDONLY, 0o400).unwrap();
+    assert_eq!(process.readonly_file(file), Ok(None));
+    assert_eq!(process.readonly_file(0), Ok(None));
+    process.close_all(&mut fs).unwrap();
+}
+
+#[test]
 fn readonly_boot_assets_use_real_offsets_stat_and_shared_open_descriptions() {
     let mut fs = FileSystem::new();
     let objects = crate::OpenDescriptions::new();

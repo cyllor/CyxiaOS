@@ -478,6 +478,14 @@ impl<'a> Process<'a> {
             _ => None,
         })
     }
+    /// Immutable bootfile bytes, independent of the shared description's offset.
+    /// The static backing remains valid after the final descriptor is closed.
+    pub fn readonly_file(&self, fd: i32) -> Result<Option<&'static [u8]>, Errno> {
+        Ok(match self.objects.get(self.description(fd)?)?.object {
+            Object::ReadOnly(_, bytes, _) => Some(bytes),
+            _ => None,
+        })
+    }
     pub fn memfd_position(&self, fd: i32, writing: bool) -> Result<(u64, u64, u32), Errno> {
         let d = self.objects.get(self.description(fd)?)?;
         let Object::Memfd(handle) = d.object else {

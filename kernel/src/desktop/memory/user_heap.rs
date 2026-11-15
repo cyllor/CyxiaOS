@@ -21,6 +21,11 @@ pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
 const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + RESERVED_BYTES <= cyxia_platform_virt::USER_RAM_END
 );
+// Real COSMIC keyboard compilation exceeds 512 live small mappings while
+// pages remain free. Grow only full-OS metadata; page admission is unchanged.
+#[cfg(feature = "full-os")]
+const ALLOCATIONS: usize = 1024;
+#[cfg(not(feature = "full-os"))]
 const ALLOCATIONS: usize = 512;
 const TABLES: usize = vm::PAGE_COUNT / 512;
 #[cfg(feature = "full-os")]
@@ -261,6 +266,11 @@ impl Heap {
             return Err(error);
         }
         Ok(address)
+    }
+    #[cfg(feature = "ported")]
+    pub fn seal_readonly(&mut self, address: u64, len: usize) -> Result<(), Errno> {
+        self.vm.seal_readonly(address, len)?;
+        self.protect(address, len, 1)
     }
     #[cfg(feature = "ported")]
     pub fn protect(&mut self, address: u64, len: usize, protection: u8) -> Result<(), Errno> {

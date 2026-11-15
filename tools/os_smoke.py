@@ -241,7 +241,7 @@ def heap_capacity_checks(console):
     pc.require(before['live'] == before['references'] == 0, 'heap capture begins with live objects')
     start = console.command('posix exec heap-capacity-probe')
     pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
-    for phase in ('ABOVE_LEGACY', 'RESERVE', 'REUSE'):
+    for phase in ('ABOVE_LEGACY', 'RESERVE', 'REUSE', 'RECORDS'):
         marker = ('HEAP_CAPACITY_PROBE ' + phase + ' PASS').encode()
         outcome = console.until(marker + rb'|HEAP_CAPACITY_PROBE FAIL[^\r\n]*|pid=' + pid +
                                 rb' (?:Fault|Exited) code=\d+\b', start)
@@ -251,8 +251,39 @@ def heap_capacity_checks(console):
     process = result['process']
     pc.require(7168 <= process['heap_peak'] <= 8160 and process['heap_model'] == 8198,
                'missing admitted full-OS heap growth/reserve')
-    pc.require(5 < process['heap_peak_allocations'] < 256, 'missing actual mapping growth')
+    pc.require(process['heap_peak_allocations'] == 1024, 'missing actual record-capacity exhaustion')
     return result
+
+def xkb_rules_checks(console):
+    before = object_snapshot(console)
+    pc.require(before['live'] == before['references'] == 0, 'XKB begins with live objects')
+    start = console.command('posix exec xkb-rules-probe')
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    console.until(rb'XKBRULES_PROBE PASS', start)
+    return reclaimed_probe(console, pid, before)
+
+def xkb_data_inputs(prefix):
+    from install_xkb_data import ASSETS, RULE_TARGET, load_package, MANIFEST
+    prefix = Path(prefix)
+    receipt_path = prefix / 'xkb-assets.json'
+    receipt = pc.read_json(receipt_path)
+    expected = {target for _, target in ASSETS} | {RULE_TARGET}
+    assets = receipt.get('assets', [])
+    pc.require(receipt.get('status') == 'PASS' and
+               receipt.get('generation', {}).get('repeat_identical') is True and
+               receipt.get('source', {}).get('sha256') == load_package()['expected_sha256'] and
+               receipt.get('manifest', {}).get('sha256') == pc.sha(MANIFEST),
+               'XKB assets lack the pinned source/generation receipt')
+    pc.require(len(assets) == len(expected) and {row['path'] for row in assets} == expected,
+               'XKB asset closure differs from the supported default')
+    identities = {}
+    for row in assets:
+        path = prefix / 'rootfs' / row['path'].lstrip('/')
+        pc.require(path.is_file() and not path.is_symlink() and
+                   path.stat().st_size == row['bytes'] and pc.sha(path) == row['sha256'],
+                   'installed XKB asset differs from its receipt')
+        identities[row['path']] = row['sha256']
+    return dict(receipt_sha256=pc.sha(receipt_path), assets=identities)
 
 def syscall_probe_inputs(prefix, name):
     from build_sysroot import inspect_elf, PROBES
@@ -268,6 +299,14 @@ def syscall_probe_inputs(prefix, name):
     inputs = {'source_sha256': pc.sha(source),
               'libc_sha256': pc.sha(sdk / 'sysroot/usr/lib/libc.a'),
               'driver_sha256': pc.sha(sdk / 'bin/x86_64-linux-musl-cc')}
+    if name == 'xkb-rules-probe':
+        inputs.update(xkbcommon_sha256=pc.sha(sdk / 'sysroot/usr/lib/libxkbcommon.a'),
+                      xkbcommon_build_report_sha256=pc.sha(sdk / 'xkbcommon-build-report.json'))
+        library = pc.read_json(sdk / 'xkbcommon-build-report.json')
+        pc.require(library.get('status') == 'cross-built' and
+                   library['target']['archive']['sha256'] == inputs['xkbcommon_sha256'] and
+                   library['manifest_sha256'] == pc.sha(pc.ROOT / 'ports/cosmic/xkbcommon-source.json'),
+                   'actual XKB library differs from its upstream build receipt')
     pc.require(all(receipt.get(key) == value for key, value in inputs.items()),
                name + ' source or SDK inputs changed since compilation')
     return dict(inputs, receipt_sha256=pc.sha(receipt_path), image_sha256=actual['sha256'])
@@ -447,6 +486,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'heap-capacity' or ('full-os' in manifest['features'] and
                    'heap-capacity-probe.elf' in manifest['external_inputs']),
                    'heap capacity smoke requires full-OS and actual musl probe')
+        pc.require(scenario != 'xkb-rules' or ('full-os' in manifest['features'] and
+                   'xkb-rules-probe.elf' in manifest['external_inputs']),
+                   'XKB rules smoke requires full-OS and actual libxkbcommon probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -482,6 +524,10 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'inotify':
                     result['inotify_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'inotify-probe')
                     result['inotify_embedded_sha256'] = embedded_images(build, manifest, ('inotify-probe.elf',))['inotify-probe.elf']
+                if scenario == 'xkb-rules':
+                    result['xkb_assets'] = xkb_data_inputs(manifest['sysroot'])
+                    result['xkb_rules_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe')
+                    result['xkb_rules_embedded_sha256'] = embedded_images(build, manifest, ('xkb-rules-probe.elf',))['xkb-rules-probe.elf']
                 if scenario == 'heap-capacity':
                     result['heap_capacity_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe')
                     result['heap_capacity_embedded_sha256'] = embedded_images(build, manifest, ('heap-capacity-probe.elf',))['heap-capacity-probe.elf']
@@ -517,6 +563,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'xkb-rules':
+                    result['xkb_rules'] = [xkb_rules_checks(console), xkb_rules_checks(console)]
                 if scenario == 'heap-capacity':
                     result['heap_capacity'] = [heap_capacity_checks(console), heap_capacity_checks(console)]
                 if scenario == 'thread-exit':
@@ -598,6 +646,11 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'inotify':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'inotify-probe') == result['inotify_build_inputs'],
                                        'inotify source/build inputs changed during VM')
+                        if scenario == 'xkb-rules':
+                            pc.require(xkb_data_inputs(manifest['sysroot']) == result['xkb_assets'],
+                                       'XKB asset receipt changed during VM')
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'xkb-rules-probe') == result['xkb_rules_build_inputs'],
+                                       'XKB probe source/library changed during VM')
                         if scenario == 'heap-capacity':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe') == result['heap_capacity_build_inputs'],
                                        'heap probe source/build inputs changed during VM')
@@ -614,7 +667,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity', 'xkb-rules'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

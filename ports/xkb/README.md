@@ -65,3 +65,43 @@ These host checks validate the keyboard data. They do not establish guest input
 delivery or completion of a desktop session. The guest must expose the complete
 read-only asset (larger than the small writable AI filesystem's per-file limit),
 load it successfully, and exercise actual VirtIO keyboard events through XKB.
+
+## COSMIC by-names keyboard assets
+
+COSMIC/libxkbcommon selects `evdev`, `pc105`, `us`, with empty variant and options.
+The separate offline installer stages that initial supported combination from
+the same pinned xkeyboard-config 2.42 archive:
+
+```sh
+python3 tools/install_xkb_data.py --output artifacts/xkb-data-new
+python3 -m unittest tests.host.test_install_xkb_data -v
+```
+
+The archive must already be verified in `artifacts/desktop-sources`; `--cache`
+selects another verified cache. There is no download mode. Python 3.12+ is the
+only required host runtime. Run generation under the shared native lease when
+other OS builds or guest captures are active. The output directory must be new;
+an existing directory, file, or symlink is refused. Successful output contains
+`rootfs/`, `report.json`, the extracted source, and both generation passes with
+their logs. Copy the complete staged `rootfs/` into a fresh SDK staging directory
+before the ordinary OS build; its catalog and capture bind the installed bytes.
+
+The installer runs upstream `generate-options-symbols.py`, `compat/map-variants.py`
+and `merge.py` with the complete default compatibility-rule recipe from
+`rules/meson.build`. Each generator uses an isolated Python interpreter and only
+the freshly verified source tree. Two independent generations must match byte
+for byte. It preserves the complete generated `rules/evdev`, 27 original include
+files, `geometry/pc`, and the complete upstream `COPYING`, totaling 30 assets.
+No source sections are trimmed and no handmade keymap or host layout database
+is used. Geometry is retained for the rules-selected `pc(pc105)` even though
+libxkbcommon does not compile geometry.
+
+The report records the archive pin, installer and interpreter identities,
+generator scripts and inputs, commands, output hashes, every installed file,
+and catalog bounds. These assets use 13 directory nodes including `/`, with a
+maximum absolute path length of 39 bytes. The installer reserves eight catalog
+slots for executables; the final kernel build still checks the entire catalog.
+The complete generated rules mention many layouts, but only the default
+`evdev/pc105/us` include closure is installed and supported by this initial
+profile. Successful staging does not prove guest mappings, keyboard input,
+compositor rendering, or a complete COSMIC session.

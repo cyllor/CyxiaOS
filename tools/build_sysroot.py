@@ -58,6 +58,7 @@ PROBES = {
     "inotify-probe": ("inotify_probe.c", []),
     "thread-exit-probe": ("thread_exit_probe.c", []),
     "heap-capacity-probe": ("heap_capacity_probe.c", []),
+    "xkb-rules-probe": ("xkb_rules_probe.c", ["-lxkbcommon"]),
     "scm-probe": ("scm_probe.c", []),
     "memfd-probe": ("memfd_probe.c", []),
     "cyxia-save": ("cyxia_save.c", ["-lX11", "-lxcb", "-lXau"]),
@@ -540,6 +541,8 @@ sys.exit(subprocess.call(cmd, env=env))
             required.append(lib / "libXau.a")
         if any("-lX11" in PROBES[name][1] for name in selected):
             required.extend((lib / "libX11.a", lib / "libxcb.a"))
+        if any("-lxkbcommon" in PROBES[name][1] for name in selected):
+            required.append(lib / "libxkbcommon.a")
         for path in required:
             if not path.is_file():
                 raise BuildError(f"Build the prerequisite target sysroot first: missing {path}")
@@ -565,6 +568,9 @@ sys.exit(subprocess.call(cmd, env=env))
             elf["source_sha256"] = report["source_sha256"][name]
             elf["libc_sha256"] = report["libc_sha256"]
             elf["driver_sha256"] = report["driver_sha256"]
+            if "-lxkbcommon" in libraries:
+                elf["xkbcommon_sha256"] = digest(lib / "libxkbcommon.a")
+                elf["xkbcommon_build_report_sha256"] = digest(out / "xkbcommon-build-report.json")
             (out / (name + "-layout.json")).write_text(json.dumps(elf, indent=2) + "\n")
             report["probes"][name] = elf
         (out / "probes-build-report.json").write_text(json.dumps(report, indent=2) + "\n")

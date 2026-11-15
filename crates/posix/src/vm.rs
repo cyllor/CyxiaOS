@@ -1,10 +1,11 @@
-//! Bounded anonymous user mappings, with no hardware or allocation-policy dependency.
+//! Bounded private user mappings, with no hardware or allocation-policy dependency.
 //!
 //! Each `Vm` describes one private physical pool and one bounded user virtual window
 //! (8 MiB normally, 16 MiB with `large-memory`, 32 MiB with `full-os`).
 //! Pool slots are indices, never physical addresses. Allocations default to RW/NX;
-//! per-page permissions may become NONE or R/NX. The kernel must enforce the metadata
-//! in PTEs; permissions do not change physical ownership or grant accounting.
+//! per-page permissions may become NONE or R/NX. Immutable shared snapshots also
+//! retain a permanent write ceiling. The kernel must enforce the metadata in PTEs;
+//! permissions do not change physical ownership or grant accounting.
 //!
 //! The kernel owns the physical pages, generation checks, AI admission and publication:
 //! 1. Validate an AI memory grant before calling `allocate`.
@@ -33,6 +34,39 @@ pub const PAGE_COUNT: usize = 4096;
 pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV2.layout().heap_pages;
 const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT % 512 == 0);
 const UNMAPPED: u16 = u16::MAX;
+
+/// Validate an immutable-file snapshot and return the bytes in its mapped pages.
+/// The caller zeroes whole pages before copying and applies the final permissions.
+pub fn immutable_snapshot_bytes(
+    file_len: usize,
+    offset: u64,
+    len: usize,
+    protection: u8,
+    shared: bool,
+) -> Result<usize, Errno> {
+    if len == 0 || !offset.is_multiple_of(PAGE_SIZE as u64) || protection > 3 {
+        return Err(Errno::Inval);
+    }
+    if shared && protection & 2 != 0 {
+        return Err(Errno::Access);
+    }
+    if protection == 2 {
+        return Err(Errno::Inval);
+    }
+    let offset = usize::try_from(offset).map_err(|_| Errno::Inval)?;
+    let rounded = len.checked_add(PAGE_SIZE - 1).ok_or(Errno::Inval)? & !(PAGE_SIZE - 1);
+    let remaining = file_len.checked_sub(offset).filter(|&n| n != 0).ok_or(Errno::Inval)?;
+    // The final partial file page is accessible and zero-padded. A complete
+    // page beyond EOF would require SIGBUS support, so refuse it up front.
+    let pages = rounded / PAGE_SIZE;
+    if pages > remaining.div_ceil(PAGE_SIZE) {
+        return Err(Errno::Inval);
+    }
+    if pages > PAGE_COUNT {
+        return Err(Errno::Nomem);
+    }
+    Ok(remaining.min(rounded))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// One user page and the backing slot reserved exclusively for it.
@@ -139,6 +173,7 @@ impl core::iter::FusedIterator for Fragments<'_> {}
 pub struct Vm {
     slots: [u16; PAGE_COUNT],
     protections: [u8; PAGE_COUNT],
+    may_write: [bool; PAGE_COUNT],
     physical_in_use: [bool; PAGE_COUNT],
     used: usize,
 }
@@ -154,6 +189,7 @@ impl Vm {
         Self {
             slots: [UNMAPPED; PAGE_COUNT],
             protections: [0; PAGE_COUNT],
+            may_write: [false; PAGE_COUNT],
             physical_in_use: [false; PAGE_COUNT],
             used: 0,
         }
@@ -183,7 +219,8 @@ impl Vm {
     ///
     /// `start` must be page aligned, and the nonzero byte length covers its final
     /// partial page. Every covered page must be allocated; a hole leaves the entire
-    /// range unchanged. Execute permission is never supported. The caller must stop
+    /// range unchanged. A write upgrade touching any sealed page also leaves all
+    /// pages unchanged. Execute permission is never supported. The caller must stop
     /// user execution, update its PTEs and finish TLB synchronization before resuming.
     pub fn protect(&mut self, start: u64, len_bytes: usize, protection: u8) -> Result<(), Errno> {
         if !matches!(protection, 0 | 1 | 3)
@@ -201,7 +238,21 @@ impl Vm {
         self.validate(start, len_bytes)?;
         let first = ((start - BASE) / PAGE_SIZE as u64) as usize;
         let last = ((end - 1 - BASE) / PAGE_SIZE as u64) as usize;
+        if protection & 2 != 0 && self.may_write[first..=last].contains(&false) {
+            return Err(Errno::Access);
+        }
         self.protections[first..=last].fill(protection);
+        Ok(())
+    }
+
+    /// Set pages read-only and permanently deny write upgrades until unmap.
+    /// Validation is failure-atomic, including holes and the final partial page.
+    /// The caller must apply read-only PTEs before resuming user execution.
+    pub fn seal_readonly(&mut self, start: u64, len_bytes: usize) -> Result<(), Errno> {
+        self.protect(start, len_bytes, 1)?;
+        let first = ((start - BASE) / PAGE_SIZE as u64) as usize;
+        let pages = len_bytes.div_ceil(PAGE_SIZE);
+        self.may_write[first..first + pages].fill(false);
         Ok(())
     }
 
@@ -272,6 +323,7 @@ impl Vm {
         }
         self.slots[first..first + page_count].copy_from_slice(&batch.slots[..page_count]);
         self.protections[first..first + page_count].fill(3);
+        self.may_write[first..first + page_count].fill(true);
         for &slot in &batch.slots[..page_count] {
             self.physical_in_use[usize::from(slot)] = true;
         }
@@ -320,7 +372,8 @@ impl Vm {
         }
         batch.slots[..page_count].copy_from_slice(&self.slots[range.clone()]);
         self.slots[range.clone()].fill(UNMAPPED);
-        self.protections[range].fill(0);
+        self.protections[range.clone()].fill(0);
+        self.may_write[range].fill(false);
         for &slot in &batch.slots[..page_count] {
             self.physical_in_use[usize::from(slot)] = false;
         }
@@ -370,6 +423,92 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn immutable_shared_pages_reject_write_upgrade_atomically() {
+        let mut vm = Vm::new();
+        vm.allocate(3).unwrap();
+        let middle = BASE + PAGE_SIZE as u64;
+        vm.seal_readonly(middle, PAGE_SIZE).unwrap();
+        assert_eq!(vm.validate_access(middle, 1, false), Ok(()));
+        assert_eq!(vm.validate_access(middle, 1, true), Err(Errno::Fault));
+        vm.protect(BASE, PAGE_SIZE, 0).unwrap();
+        assert_eq!(vm.protect(BASE, 3 * PAGE_SIZE, 3), Err(Errno::Access));
+        assert_eq!(vm.permissions(BASE), Ok(0));
+        assert_eq!(vm.permissions(middle), Ok(1));
+        assert_eq!(vm.permissions(middle + PAGE_SIZE as u64), Ok(3));
+        vm.protect(middle, PAGE_SIZE, 0).unwrap();
+        assert_eq!(vm.protect(middle, PAGE_SIZE, 3), Err(Errno::Access));
+        assert_eq!(vm.permissions(middle), Ok(0));
+        vm.protect(middle, PAGE_SIZE, 1).unwrap();
+        assert_eq!(vm.validate_access(middle, 1, false), Ok(()));
+    }
+
+    #[test]
+    fn immutable_seal_failure_preserves_writable_neighbors() {
+        let mut vm = Vm::new();
+        vm.allocate(3).unwrap();
+        vm.unmap(BASE + PAGE_SIZE as u64, 1).unwrap();
+        assert_eq!(vm.seal_readonly(BASE, 3 * PAGE_SIZE), Err(Errno::Fault));
+        assert_eq!(vm.permissions(BASE), Ok(3));
+        vm.protect(BASE, PAGE_SIZE, 0).unwrap();
+        assert_eq!(vm.protect(BASE, PAGE_SIZE, 3), Ok(()));
+        assert_eq!(vm.seal_readonly(BASE + 1, 1), Err(Errno::Inval));
+        assert_eq!(vm.seal_readonly(BASE, 0), Err(Errno::Inval));
+        assert_eq!(vm.seal_readonly(BASE, usize::MAX), Err(Errno::Inval));
+    }
+
+    #[test]
+    fn immutable_seal_covers_partial_last_page_and_resets_on_reuse() {
+        let mut vm = Vm::new();
+        vm.allocate(3).unwrap();
+        vm.seal_readonly(BASE, PAGE_SIZE + 1).unwrap();
+        assert_eq!(vm.protect(BASE + PAGE_SIZE as u64, PAGE_SIZE, 3), Err(Errno::Access));
+        assert_eq!(vm.permissions(BASE + 2 * PAGE_SIZE as u64), Ok(3));
+        vm.unmap(BASE, 2).unwrap();
+        assert_eq!(vm.allocate(2).unwrap().start(), BASE);
+        assert_eq!(vm.validate_access(BASE, 2 * PAGE_SIZE, true), Ok(()));
+        vm.protect(BASE, 2 * PAGE_SIZE, 1).unwrap();
+        assert_eq!(vm.protect(BASE, 2 * PAGE_SIZE, 3), Ok(()));
+    }
+
+    #[test]
+    fn immutable_snapshot_includes_file_bytes_through_the_final_mapped_page() {
+        for shared in [false, true] {
+            assert_eq!(immutable_snapshot_bytes(9000, 0, 1, 1, shared), Ok(4096));
+            assert_eq!(immutable_snapshot_bytes(9000, 4096, 1, 1, shared), Ok(4096));
+            assert_eq!(immutable_snapshot_bytes(9000, 8192, 1, 1, shared), Ok(808));
+            assert_eq!(immutable_snapshot_bytes(9000, 8192, 4096, 0, shared), Ok(808));
+            assert_eq!(immutable_snapshot_bytes(4096, 0, 4096, 1, shared), Ok(4096));
+        }
+        assert_eq!(immutable_snapshot_bytes(9000, 4096, 8192, 3, false), Ok(4904));
+    }
+
+    #[test]
+    fn immutable_snapshot_rejects_invalid_ranges_and_shared_writes() {
+        for (size, offset, len) in [
+            (9000, 0, 0),
+            (9000, 1, 1),
+            (0, 0, 1),
+            (4096, 4096, 1),
+            (9000, 12288, 1),
+            (9000, 8192, 4097),
+            (4096, 0, 4097),
+            (9000, u64::MAX - 4095, 1),
+            (9000, 0, usize::MAX),
+        ] {
+            assert_eq!(immutable_snapshot_bytes(size, offset, len, 1, true), Err(Errno::Inval));
+        }
+        for protection in [2, 4, 5, 7, 255] {
+            assert_eq!(immutable_snapshot_bytes(4096, 0, 1, protection, false), Err(Errno::Inval));
+        }
+        assert_eq!(immutable_snapshot_bytes(4096, 0, 1, 3, true), Err(Errno::Access));
+        assert_eq!(immutable_snapshot_bytes(4096, 0, 1, 2, true), Err(Errno::Access));
+        assert_eq!(
+            immutable_snapshot_bytes(usize::MAX, 0, PAGE_COUNT * PAGE_SIZE + 1, 1, true),
+            Err(Errno::Nomem)
+        );
+    }
 
     #[test]
     fn largest_free_run_distinguishes_fragmentation_from_free_capacity() {
