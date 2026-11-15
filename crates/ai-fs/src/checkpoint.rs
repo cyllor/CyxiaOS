@@ -152,6 +152,16 @@ impl FileSystem {
         for (node, e) in self.nodes.iter_mut().zip(&entries[..count]) {
             *node = Node {
                 path: e.path,
+                parent: if e.path.parent() == Path::ROOT {
+                    1
+                } else {
+                    entries[..count]
+                        .iter()
+                        .find(|parent| parent.path == e.path.parent())
+                        .expect("validated snapshot parent")
+                        .serial
+                        + 1
+                },
                 kind: e.kind,
                 used: true,
                 linked: true,
@@ -163,6 +173,7 @@ impl FileSystem {
             node.data[..e.len].copy_from_slice(&input[e.data..e.data + e.len]);
         }
         self.revision = revision;
+        self.changes = super::events::Journal::new();
         Ok(())
     }
 }

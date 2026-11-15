@@ -116,28 +116,28 @@ fn directory_cookies_permissions_assets_and_unlink_identity() {
     let assets: &[(&str, &[u8])] = &[("/dir/font.ttf", b"font"), ("/elsewhere", b"x")];
     let mut buffer = [0u8; 128];
     assert_eq!(
-        process.getdents(&fs, dir, assets, &mut buffer[..1]),
+        process.getdents(&mut fs, dir, assets, &mut buffer[..1]),
         Err(Errno::Inval)
     );
     assert_eq!(
-        process.getdents(&fs, dir, assets, &mut buffer[..24]),
+        process.getdents(&mut fs, dir, assets, &mut buffer[..24]),
         Ok(24)
     );
     assert_eq!(&buffer[19..21], b".\0");
     assert_eq!(
-        process.getdents(&fs, alias, assets, &mut buffer[..24]),
+        process.getdents(&mut fs, alias, assets, &mut buffer[..24]),
         Ok(24)
     );
     assert_eq!(&buffer[19..22], b"..\0");
-    let n = process.getdents(&fs, alias, assets, &mut buffer).unwrap();
+    let n = process.getdents(&mut fs, alias, assets, &mut buffer).unwrap();
     assert_eq!(n, 56);
     assert_eq!(&buffer[19..24], b"file\0");
     assert_eq!(&buffer[43..52], b"font.ttf\0");
-    assert_eq!(process.getdents(&fs, dir, assets, &mut buffer), Ok(0));
+    assert_eq!(process.getdents(&mut fs, dir, assets, &mut buffer), Ok(0));
     assert_eq!(process.path_at(&fs, dir, "file"), Ok(p("/dir/file")));
     process.lseek(&fs, alias, 0, 0).unwrap();
     assert_eq!(
-        process.getdents(&fs, dir, assets, &mut buffer[..24]),
+        process.getdents(&mut fs, dir, assets, &mut buffer[..24]),
         Ok(24)
     );
     assert_eq!(process.read(&mut fs, dir, &mut buffer), Err(Errno::Isdir));
@@ -153,7 +153,7 @@ fn directory_cookies_permissions_assets_and_unlink_identity() {
     assert_eq!(process.fstat(&fs, dir).unwrap().inode, identity);
     assert_eq!(process.fstat(&fs, dir).unwrap().links, 0);
     assert_eq!(
-        process.getdents(&fs, dir, assets, &mut buffer),
+        process.getdents(&mut fs, dir, assets, &mut buffer),
         Err(Errno::Noent)
     );
     assert_eq!(process.path_at(&fs, dir, "file"), Err(Errno::Noent));

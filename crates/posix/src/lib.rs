@@ -13,6 +13,8 @@ pub mod executable;
 pub mod flock;
 pub mod runtime_directory;
 pub mod image;
+pub mod inotify;
+pub mod limits;
 pub mod ipc;
 pub mod pipe;
 pub mod pty;
@@ -97,7 +99,7 @@ pub const O_NONBLOCK: u32 = 0x800;
 pub const O_CLOEXEC: u32 = 0x80000;
 pub const O_DIRECTORY: u32 = 0x4000; // Linux AArch64 ABI.
 pub const O_NOFOLLOW: u32 = 0x8000;
-pub const OPEN_MAX: usize = 16;
+pub const OPEN_MAX: usize = limits::PROFILE.fds_per_process;
 #[derive(Clone, Copy)]
 enum Object {
     File(Inode),
@@ -111,6 +113,7 @@ enum Object {
     Event { counter: u64, semaphore: bool },
     Timer(timerfd::Timer),
     Epoll(usize),
+    Inotify(usize),
     ReadOnly(u64, &'static [u8], u16),
 }
 #[derive(Clone, Copy)]
@@ -223,7 +226,7 @@ impl<'a> Process<'a> {
                 mode: 0o140600,
                 links: 1,
             },
-            Object::Event { .. } | Object::Timer(_) | Object::Epoll(_) => FileInfo {
+            Object::Event { .. } | Object::Timer(_) | Object::Epoll(_) | Object::Inotify(_) => FileInfo {
                 inode: 0,
                 size: 0,
                 mode: 0o600,
@@ -522,6 +525,7 @@ impl<'a> Process<'a> {
         let d = self.objects.get(self.description(fd)?)?;
         Ok(match d.object {
             Object::Event { counter, .. } => (counter != 0, counter < u64::MAX - 1),
+            Object::Inotify(index) => (self.objects.inotify_readable(index), false),
             Object::Socket(_)
             | Object::Pipe(_)
             | Object::Pty(_)
@@ -724,6 +728,7 @@ impl<'a> Process<'a> {
                     flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
                 },
             )?;
+            fs.notify_open(inode)?;
             self.fds[fd] = Some(slot);
             self.cloexec[fd] = flags & O_CLOEXEC != 0;
             return Ok(fd as i32);
@@ -754,8 +759,7 @@ impl<'a> Process<'a> {
             }
             Err(Error::NotFound) if flags & O_CREAT != 0 => {
                 self.change_parent(fs, p)?;
-                fs.write(p, b"", false)?;
-                fs.set_mode(p, mode & !self.mask)?;
+                fs.create_file(p, mode & !self.mask)?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -769,6 +773,7 @@ impl<'a> Process<'a> {
                 flags: flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC),
             },
         )?;
+        fs.notify_open(Some(inode))?;
         self.fds[fd] = Some(slot);
         self.cloexec[fd] = flags & O_CLOEXEC != 0;
         Ok(fd as i32)
@@ -844,6 +849,7 @@ impl<'a> Process<'a> {
             Object::Null => 0,
             Object::Output => return Err(Errno::Badf),
             Object::Epoll(_) => return Err(Errno::Inval),
+            Object::Inotify(_) => return self.inotify_read(fs, fd, out),
             Object::Socket(_)
             | Object::Pipe(_)
             | Object::Pty(_)
@@ -921,7 +927,7 @@ impl<'a> Process<'a> {
             }
             Object::Null => data.len(),
             Object::Output => io.write(data)?,
-            Object::Epoll(_) | Object::Timer(_) => return Err(Errno::Inval),
+            Object::Epoll(_) | Object::Timer(_) | Object::Inotify(_) => return Err(Errno::Inval),
             Object::Socket(_) | Object::Pipe(_) | Object::Pty(_) | Object::Memfd(_) => {
                 return Err(Errno::Nosys);
             }
@@ -1030,8 +1036,7 @@ impl<'a> Process<'a> {
         }
         let p = self.path(fs, path.trim_end_matches('/'))?;
         self.change_parent(fs, p)?;
-        fs.mkdir(p)?;
-        fs.set_mode(p, mode & !self.mask)?;
+        fs.mkdir_with_mode(p, mode & !self.mask)?;
         Ok(())
     }
     pub fn rmdir(&mut self, fs: &mut FileSystem, path: &str) -> Result<(), Errno> {

@@ -178,6 +178,40 @@ def nested_epoll_checks(console):
     pc.require(result['process']['waits'] > 0, 'nested epoll timer did not enter the actual wait path')
     return result
 
+def inotify_checks(console):
+    before_objects = object_snapshot(console)
+    pc.require(all(before_objects.get(key) == 0 for key in
+                   ('live', 'references', 'inotify_instances', 'inotify_watches', 'inotify_events')),
+               'inotify capture begins with live objects or missing accounting')
+    start = console.command('posix exec inotify-probe')
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    for phase in ('FLAGS_MASKS', 'FILE_EVENTS', 'RENAME', 'WATCH_LIFETIME',
+                  'UNLINK_POLICY', 'RECORDS_DUP', 'VECTORED_READ', 'READINESS', 'OVERFLOW'):
+        console.until(('INOTIFY_PROBE ' + phase + ' PASS').encode(), start)
+    phases = []
+    for phase in ('BLOCKING_READ', 'INTERRUPT', 'RETRY_REUSE'):
+        console.until(('INOTIFY_PROBE WAIT ' + phase).encode(), start)
+        def waits():
+            at = console.command('posix status')
+            row = console.until(rb'UserStatus \{ pid: ' + pid + rb',[^\r\n]+', at).group(0)
+            pc.require(b'state: Running' in row or b'state: Waiting' in row,
+                       'inotify process ended before its host gate')
+            count = re.search(rb'\bwaits: (\d+)', row)
+            pc.require(count is not None, 'missing real syscall wait counter')
+            return int(count.group(1))
+        before = waits()
+        deadline = time.monotonic() + 5
+        while True:
+            after = waits()
+            if after > before: break
+            pc.require(time.monotonic() < deadline, 'inotify worker did not park and retry')
+            time.sleep(.01)
+        console.command('touch /run/user/0/inotify-' + phase)
+        console.until(('INOTIFY_PROBE ' + phase + ' PASS').encode(), start)
+        phases.append(dict(phase=phase, waits_before=before, waits_after=after))
+    console.until(rb'INOTIFY_PROBE PASS', start)
+    return dict(reclaimed_probe(console, pid, before_objects), phases=phases)
+
 def syscall_probe_inputs(prefix, name):
     from build_sysroot import inspect_elf, PROBES
     prefix = Path(prefix)
@@ -362,6 +396,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'nested-epoll' or ('full-os' in manifest['features'] and
                    'nested-epoll-probe.elf' in manifest['external_inputs']),
                    'nested epoll smoke requires full-OS runtime and the actual syscall probe')
+        pc.require(scenario != 'inotify' or ('full-os' in manifest['features'] and
+                   'inotify-probe.elf' in manifest['external_inputs']),
+                   'inotify smoke requires full-OS runtime and the actual syscall probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -394,6 +431,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'nested-epoll':
                     result['nested_epoll_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'nested-epoll-probe')
                     result['nested_epoll_embedded_sha256'] = embedded_images(build, manifest, ('nested-epoll-probe.elf',))['nested-epoll-probe.elf']
+                if scenario == 'inotify':
+                    result['inotify_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'inotify-probe')
+                    result['inotify_embedded_sha256'] = embedded_images(build, manifest, ('inotify-probe.elf',))['inotify-probe.elf']
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err, env=pc.env())
                 console = Console(connect(path / 's.sock', process), process, output / 'serial.raw')
                 qmp = Qmp(connect(path / 'q.sock', process))
@@ -423,6 +463,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'inotify': result['inotify'] = [inotify_checks(console), inotify_checks(console)]
                 if scenario == 'nested-epoll': result['nested_epoll'] = [nested_epoll_checks(console), nested_epoll_checks(console)]
                 if scenario == 'flock':
                     console.until(rb'SESSION_RUNTIME_READY path=/run/user/0 mode=0700 uid=0')
@@ -496,6 +537,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'nested-epoll':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'nested-epoll-probe') == result['nested_epoll_build_inputs'],
                                        'nested epoll source/build inputs changed during VM')
+                        if scenario == 'inotify':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'inotify-probe') == result['inotify_build_inputs'],
+                                       'inotify source/build inputs changed during VM')
                         pc.require(result.get('returncode') == 0, 'QEMU did not exit normally')
                     except Exception as changed:
                         result.update(status='FAIL', error=repr(changed))
@@ -506,7 +550,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

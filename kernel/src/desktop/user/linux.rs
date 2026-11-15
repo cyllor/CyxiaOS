@@ -338,7 +338,7 @@ impl Runner {
         // Validate even when iovcnt=0; no bytes are consumed here.
         if writing {
             self.linux_write(fs, descriptor, &[])?;
-        } else {
+        } else if !self.process.is_inotify(descriptor)? {
             self.linux_read(fs, descriptor, &mut [])?;
         }
         let mut done = 0usize;
@@ -491,6 +491,15 @@ impl Runner {
                 }
                 _ => Err(Errno::Inval),
             },
+            Call::InotifyInit1 => self.process.inotify_init(fs, a as u32).map(|fd| fd as u64),
+            Call::InotifyAddWatch => {
+                let mut path = [0u8; 96];
+                let n = self.path(b, &mut path)?;
+                self.process.inotify_add_watch(fs, fd(a)?,
+                    core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?, c as u32)
+                    .map(|wd| wd as u64)
+            }
+            Call::InotifyRmWatch => self.process.inotify_rm_watch(fs, fd(a)?, b as i32).map(|()| 0),
             Call::EpollCreate1 => self
                 .process
                 .epoll_create(u32::try_from(a).map_err(|_| Errno::Inval)?)
@@ -1321,7 +1330,12 @@ impl Runner {
                 Ok(len as u64)
             }
             Call::Ioctl => {
-                if b == 0x5421 && self.process.socket(fd(a)?)?.is_some() {
+                if b == 0x541b && self.process.is_inotify(fd(a)?)? {
+                    self.validate(c, 4, true)?;
+                    let pending = self.process.inotify_pending(fd(a)?)?;
+                    self.copy_to(c, &(pending as u32).to_le_bytes())?;
+                    Ok(0)
+                } else if b == 0x5421 && self.process.socket(fd(a)?)?.is_some() {
                     self.copy_from(c, &mut bytes[..4])?;
                     self.process.set_socket_nonblocking(
                         fd(a)?,

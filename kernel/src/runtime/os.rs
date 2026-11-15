@@ -45,6 +45,11 @@ pub fn run(info: &PcBootInfo) -> ! {
     unsafe { core::ptr::addr_of_mut!(BOOT_MEMORY).write(Some(*info)); }
     crate::log(b"CYXIA_OS_BOOT architecture=x86_64 profile=os-runtime\n");
     let mut out = Output;
+    let objects = cyxia_posix::limits::PROFILE;
+    let _ = writeln!(out, "USER_OBJECT_PROFILE name={} fds={} ofds={} epolls_per_owner={} epolls={} inotify_per_owner={} inotify_instances={}",
+        objects.name, objects.fds_per_process, objects.open_descriptions,
+        objects.epolls_per_owner, objects.epoll_instances,
+        objects.inotify_per_owner, objects.inotify_instances);
     let ram_bytes: u64 = info.ram_regions().iter().map(|r| r.len).sum();
     let _ = writeln!(out, "RAM_DISCOVERED bytes={ram_bytes}");
     let tables = crate::address_space::init_pc().expect("private user page-table pool");

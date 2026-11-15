@@ -40,7 +40,14 @@ def objects(output):
     rows = re.findall(rb"(?m)^OFD_OBJECTS live=(\d+) references=(\d+) retired=(\d+) capacity=(\d+) epolls=(\d+) watches=(\d+)(?: [a-z_]+=\d+)*\r?$", output)
     if len(rows) != 1:
         raise AssertionError("Missing or ambiguous global OFD receipt: " + repr(output))
-    return dict(zip(("live", "references", "retired", "capacity", "epolls", "watches"), map(int, rows[0])))
+    result = dict(zip(("live", "references", "retired", "capacity", "epolls", "watches"), map(int, rows[0])))
+    for key in ('inotify_instances', 'inotify_watches', 'inotify_events'):
+        values = re.findall(rb'\b' + key.encode() + rb'=(\d+)', output)
+        if values:
+            if len(values) != 1:
+                raise AssertionError('Ambiguous ' + key + ' receipt')
+            result[key] = int(values[0])
+    return result
 
 
 def object_snapshot(guest):

@@ -1,12 +1,12 @@
 //! Shared, bounded open descriptions. The supervisor serializes access; this
-//! crate stays safe and allocation-free. The 128 entries replace the existing
-//! 8 admitted processes × 16 private entries, not a new resource-policy range.
-use super::{Description, Errno, OPEN_MAX, Object, epoll};
+//! crate stays safe and allocation-free. The versioned object profile owns
+//! actual shared metadata capacity independently of each process's FD quota.
+use super::{Description, Errno, Object, epoll};
 use core::cell::RefCell;
 use cyxia_ai_fs::FileSystem;
 
-pub const CAPACITY: usize = super::usermem::MAX_PROCESSES * OPEN_MAX;
-pub(crate) const EPOLLS: usize = super::usermem::MAX_PROCESSES * epoll::INSTANCES;
+pub const CAPACITY: usize = super::limits::PROFILE.open_descriptions;
+pub(crate) const EPOLLS: usize = super::limits::PROFILE.epoll_instances;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Handle {
@@ -55,6 +55,7 @@ pub(crate) struct Table {
     pub(crate) entries: [Entry; CAPACITY],
     pub(crate) rights: [super::ancillary::Slot; super::ancillary::MESSAGES],
     pub epolls: [epoll::Instance; EPOLLS],
+    pub(crate) inotifies: [super::inotify::Instance; super::inotify::GLOBAL_INSTANCES],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -69,6 +70,9 @@ pub struct Snapshot {
     pub retired: usize,
     pub epolls: usize,
     pub watches: usize,
+    pub inotify_instances: usize,
+    pub inotify_watches: usize,
+    pub inotify_events: usize,
 }
 pub struct OpenDescriptions {
     pub(crate) inner: RefCell<Table>,
@@ -85,6 +89,7 @@ impl OpenDescriptions {
                 entries: [Entry::EMPTY; CAPACITY],
                 rights: [super::ancillary::Slot::EMPTY; super::ancillary::MESSAGES],
                 epolls: [epoll::Instance::EMPTY; EPOLLS],
+                inotifies: [super::inotify::Instance::EMPTY; super::inotify::GLOBAL_INSTANCES],
             }),
         }
     }
@@ -122,6 +127,9 @@ impl OpenDescriptions {
                 .count(),
             epolls: table.epolls.iter().filter(|e| e.used).count(),
             watches: table.epolls.iter().map(|e| e.watch_count()).sum(),
+            inotify_instances: table.inotifies.iter().filter(|i| i.used).count(),
+            inotify_watches: table.inotifies.iter().map(|i| i.watch_count()).sum(),
+            inotify_events: table.inotifies.iter().map(|i| i.queued_count()).sum(),
         }
     }
     pub(crate) fn free_slots<const N: usize>(&self) -> Result<[Handle; N], Errno> {
@@ -225,6 +233,14 @@ impl OpenDescriptions {
         if class_refs == 0 {
             return Err(Errno::Badf);
         }
+        if entry.references == 1 {
+            let description = entry.value.ok_or(Errno::Badf)?;
+            match description.object {
+                Object::File(inode) => fs.notify_close(Some(inode), description.flags & 3 != super::O_RDONLY)?,
+                Object::Directory { inode, .. } => fs.notify_close(inode, false)?,
+                _ => {},
+            }
+        }
         if entry.references == 1
             && let Object::File(inode)
             | Object::Directory {
@@ -246,6 +262,9 @@ impl OpenDescriptions {
         let description = entry.value.ok_or(Errno::Badf)?;
         if let Object::Epoll(index) = description.object {
             table.epolls[index] = epoll::Instance::EMPTY;
+        }
+        if let Object::Inotify(index) = description.object {
+            table.inotifies[index] = super::inotify::Instance::EMPTY;
         }
         for instance in &mut table.epolls {
             instance.remove_description(handle);
@@ -279,7 +298,7 @@ const _: () = assert!(CAPACITY <= 256);
 mod tests {
     use super::*;
     use crate::{
-        Console, O_APPEND, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDWR, Process, spawn::Mapping,
+        Console, OPEN_MAX, O_APPEND, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDWR, Process, spawn::Mapping,
     };
     use cyxia_ai_fs::FileSystem;
     struct Sink;
@@ -409,6 +428,7 @@ mod tests {
             core::array::from_fn(|i| Process::new(&objects, i as u32 + 1).unwrap());
         for process in &mut processes {
             for _ in 3..OPEN_MAX {
+                if objects.snapshot().live == CAPACITY { break; }
                 process.eventfd(0, 0).unwrap();
             }
         }

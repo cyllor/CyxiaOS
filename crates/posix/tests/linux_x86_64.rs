@@ -1,6 +1,27 @@
 use cyxia_posix::ImageAbi;
 use cyxia_posix::linux_abi::{self, Call};
 #[test]
+fn inotify_uses_isa_numbers_and_legacy_init_has_no_flags() {
+    for (abi, numbers) in [
+        (ImageAbi::X86_64, [294, 254, 255]),
+        (ImageAbi::Aarch64, [26, 27, 28]),
+    ] {
+        for (number, call) in numbers.into_iter().zip([
+            Call::InotifyInit1,
+            Call::InotifyAddWatch,
+            Call::InotifyRmWatch,
+        ]) {
+            let args = [7, 8, 9, 0, 0, 0];
+            let invocation = linux_abi::decode(abi, number, args).unwrap();
+            assert_eq!(invocation.call, call);
+            assert_eq!(invocation.args, args);
+        }
+    }
+    let legacy = linux_abi::decode(ImageAbi::X86_64, 253, [u64::MAX; 6]).unwrap();
+    assert_eq!(legacy.call, Call::InotifyInit1);
+    assert_eq!(legacy.args[0], 0);
+}
+#[test]
 fn flock_uses_each_linux_isa_number_and_preserves_descriptor_and_operation() {
     for (abi, number) in [(ImageAbi::X86_64, 73), (ImageAbi::Aarch64, 32)] {
         let args = [7, 2 | 4, 0, 0, 0, 0];
@@ -8,8 +29,18 @@ fn flock_uses_each_linux_isa_number_and_preserves_descriptor_and_operation() {
         assert_eq!(invocation.call, Call::Flock);
         assert_eq!(invocation.args, args);
     }
-    assert_eq!(linux_abi::decode(ImageAbi::X86_64, 32, [0; 6]).unwrap().call, Call::Dup);
-    assert_eq!(linux_abi::decode(ImageAbi::Aarch64, 73, [0; 6]).unwrap().call, Call::Ppoll);
+    assert_eq!(
+        linux_abi::decode(ImageAbi::X86_64, 32, [0; 6])
+            .unwrap()
+            .call,
+        Call::Dup
+    );
+    assert_eq!(
+        linux_abi::decode(ImageAbi::Aarch64, 73, [0; 6])
+            .unwrap()
+            .call,
+        Call::Ppoll
+    );
 }
 #[test]
 fn x86_linux_numbers_and_clone_arguments_are_not_arm_or_native_numbers() {

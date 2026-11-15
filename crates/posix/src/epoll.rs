@@ -5,7 +5,7 @@
 use super::{Description, Errno, O_CLOEXEC, O_RDWR, OPEN_MAX, Object, Process};
 mod nesting;
 
-pub const INSTANCES: usize = 2;
+pub const INSTANCES: usize = super::limits::PROFILE.epolls_per_owner;
 pub const IN: u32 = 1;
 // A valid interest even on backends that never produce priority data. It is
 // retained in the watch and only returned when the backend reports this bit.
@@ -169,6 +169,13 @@ impl super::OpenDescriptions {
 }
 
 impl Process<'_> {
+    fn epoll_source(&self, object: Object, owner: u32) -> Result<Source, Errno> {
+        if let Object::Inotify(index) = object {
+            Ok(Source::Local { read: self.objects.inotify_readable(index), write: false })
+        } else {
+            source(object, owner)
+        }
+    }
     fn epoll_index(&self, fd: i32) -> Result<usize, Errno> {
         match self.objects.get(self.description(fd)?)?.object {
             Object::Epoll(index) => Ok(index),
@@ -241,6 +248,7 @@ impl Process<'_> {
             Object::Epoll(_) => {}
             Object::Event { .. }
             | Object::Timer(_)
+            | Object::Inotify(_)
             | Object::Socket(_)
             | Object::Pipe(_)
             | Object::Pty(_) => {}
@@ -298,7 +306,7 @@ impl Process<'_> {
             let d = self.objects.get(watch.description)?;
             let owner = self.objects.owner(watch.description)?;
             if !matches!(d.object, Object::Epoll(_)) {
-                *out = Some(source(d.object, owner)?);
+                *out = Some(self.epoll_source(d.object, owner)?);
             }
         }
         Ok(sources)
@@ -330,7 +338,7 @@ impl Process<'_> {
                 let description = self.objects.get(watch.description)?;
                 if !matches!(description.object, Object::Epoll(_)) {
                     let owner = self.objects.owner(watch.description)?;
-                    readiness[slot] = sample(source(description.object, owner)?)?;
+                    readiness[slot] = sample(self.epoll_source(description.object, owner)?)?;
                 }
             }
             let mut table = self.objects.inner.borrow_mut();

@@ -474,6 +474,7 @@ impl Runner {
     ) -> Result<u64, Errno> {
         #[cfg(feature = "ported")]
         if self.linux {
+            objects::table().observe_filesystem(fs);
             // Readiness only made the context runnable. Validate the saved
             // OFD generation now, immediately before the actual syscall replay;
             // another thread may have closed/reused the FD in that interval.
@@ -484,6 +485,7 @@ impl Runner {
                     .validate_description_identity(descriptor, identity)?;
             }
             let result = self.linux_syscall(fs, ledger, ipc);
+            objects::table().observe_filesystem(fs);
             #[cfg(feature = "abi-trace")]
             if self.status.pid > 1 {
                 super::log(
@@ -1329,6 +1331,8 @@ impl Supervisor {
         }
     }
     fn poll(&mut self, shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
+        // Shell mutations and final OFD releases feed the same committed journal.
+        objects::table().observe_filesystem(shell.fs_mut());
         #[cfg(feature = "ported")]
         {
             self.collect_children();
@@ -1532,8 +1536,8 @@ pub fn object_status(out: &mut impl Write) {
     let s = object_snapshot();
     writeln!(
         out,
-        "OFD_OBJECTS live={} references={} retired={} capacity={} epolls={} watches={} fd_refs={} staged_refs={} inflight_refs={} staged_messages={} inflight_messages={}\r",
-        s.live, s.references, s.retired, s.capacity, s.epolls, s.watches, s.fd_references, s.staged_references, s.inflight_references, s.staged_messages, s.inflight_messages
+        "OFD_OBJECTS live={} references={} retired={} capacity={} epolls={} watches={} fd_refs={} staged_refs={} inflight_refs={} staged_messages={} inflight_messages={} inotify_instances={} inotify_watches={} inotify_events={}\r",
+        s.live, s.references, s.retired, s.capacity, s.epolls, s.watches, s.fd_references, s.staged_references, s.inflight_references, s.staged_messages, s.inflight_messages, s.inotify_instances, s.inotify_watches, s.inotify_events
     )
     .unwrap();
     writeln!(out, "ANCILLARY_OBJECTS messages={} references={} staged_messages={} inflight_messages={} staged_refs={} inflight_refs={} capacity_messages={} capacity_references={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r", s.staged_messages + s.inflight_messages, s.staged_references + s.inflight_references, s.staged_messages, s.inflight_messages, s.staged_references, s.inflight_references, cyxia_posix::ancillary::MESSAGES, cyxia_posix::ancillary::REFERENCES).unwrap();

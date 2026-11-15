@@ -5,6 +5,7 @@
 //! service. No user authentication, background threads, or implicit data eviction.
 mod brain;
 pub mod checkpoint;
+pub mod events;
 #[rustfmt::skip]
 mod weights;
 pub use brain::{LearningStatus, ValidationStatus};
@@ -110,6 +111,7 @@ pub enum Kind {
 #[derive(Clone, Copy)]
 struct Node {
     path: Path,
+    parent: u64,
     kind: Kind,
     used: bool,
     linked: bool,
@@ -125,6 +127,7 @@ struct Node {
 impl Node {
     const EMPTY: Self = Self {
         path: Path::ROOT,
+        parent: 1,
         kind: Kind::File,
         used: false,
         linked: false,
@@ -221,6 +224,7 @@ pub struct FileSystem {
     misses: u64,
     last_source: DecisionSource,
     policy: PolicyStatus,
+    changes: events::Journal,
 }
 impl Default for FileSystem {
     fn default() -> Self {
@@ -241,6 +245,7 @@ impl FileSystem {
             misses: 0,
             last_source: DecisionSource::Bootstrap,
             policy: PolicyStatus::EMPTY,
+            changes: events::Journal::new(),
         }
     }
     fn find(&self, p: Path) -> Result<usize, Error> {
@@ -332,30 +337,47 @@ impl FileSystem {
         self.cache = [Cached::EMPTY; CACHE_LINES];
     }
     pub fn mkdir(&mut self, p: Path) -> Result<(), Error> {
+        self.mkdir_with_mode(p, 0o777)
+    }
+    pub fn mkdir_with_mode(&mut self, p: Path, mode: u16) -> Result<(), Error> {
         if self.stat(p).is_ok() {
             return Err(Error::Exists);
         }
         self.directory(p.parent())?;
+        let parent = self.identity(p.parent())?;
         let next = self.admit(true, 0)?;
         let i = self.nodes.iter().position(|n| !n.used).ok_or(Error::Full)?;
         self.nodes[i] = Node {
             path: p,
+            parent,
             kind: Kind::Directory,
             used: true,
             linked: true,
             serial: next,
-            mode: 0o777,
+            mode: mode & 0o7777,
             ..Node::EMPTY
         };
         self.changed(next);
+        self.record_change(i, events::Action::Create, 0);
         Ok(())
     }
     /// Atomic bounded write: failed validation/admission leaves existing bytes intact.
     pub fn write(&mut self, p: Path, data: &[u8], append: bool) -> Result<(), Error> {
+        self.write_with_mode(p, data, append, Node::EMPTY.mode)
+    }
+    /// Creation permissions are part of the new inode, not a later chmod.
+    pub fn create_file(&mut self, p: Path, mode: u16) -> Result<(), Error> {
+        if self.stat(p).is_ok() {
+            return Err(Error::Exists);
+        }
+        self.write_with_mode(p, &[], false, mode)
+    }
+    fn write_with_mode(&mut self, p: Path, data: &[u8], append: bool, mode: u16) -> Result<(), Error> {
         if p == Path::ROOT {
             return Err(Error::IsDirectory);
         }
         self.directory(p.parent())?;
+        let parent = self.identity(p.parent())?;
         let existing = self.find(p).ok();
         if existing.is_some_and(|i| self.nodes[i].kind == Kind::Directory) {
             return Err(Error::IsDirectory);
@@ -374,9 +396,11 @@ impl FileSystem {
         if existing.is_none() {
             self.nodes[i] = Node {
                 path: p,
+                parent,
                 used: true,
                 linked: true,
                 serial: next,
+                mode: mode & 0o7777,
                 ..Node::EMPTY
             };
         }
@@ -385,6 +409,12 @@ impl FileSystem {
         n.data[len..].fill(0);
         n.len = len;
         self.changed(next);
+        if existing.is_none() {
+            self.record_change(i, events::Action::Create, 0);
+        }
+        if !data.is_empty() || (existing.is_some() && !append) {
+            self.record_change(i, events::Action::Modify, 0);
+        }
         Ok(())
     }
     /// Register an immutable boot-catalog child after ordinary directory
@@ -422,16 +452,27 @@ impl FileSystem {
         if destination.is_some_and(|i| self.nodes[i].kind != Kind::File) {
             return Err(Error::IsDirectory);
         }
+        let parent = self.identity(to.parent())?;
         let next = self.admit(false, 0)?;
+        let cookie = self.changes.rename_cookie();
         if let Some(index) = destination {
-            if self.nodes[index].pins == 0 {
-                self.nodes[index] = Node::EMPTY;
-            } else {
-                self.nodes[index].linked = false;
-            }
+            self.nodes[index].linked = false;
         }
+        self.record_change(source, events::Action::MoveFrom, cookie);
         self.nodes[source].path = to;
+        self.nodes[source].parent = parent;
         self.changed(next);
+        self.record_change(source, events::Action::MoveTo, cookie);
+        if let Some(index) = destination {
+            self.record_change(index, events::Action::Unlink, 0);
+        }
+        self.record_change(source, events::Action::MoveSelf, 0);
+        if let Some(index) = destination
+            && self.nodes[index].pins == 0
+        {
+            self.record_change(index, events::Action::DeleteSelf, 0);
+            self.nodes[index] = Node::EMPTY;
+        }
         Ok(())
     }
     pub fn remove(&mut self, p: Path, directory: bool) -> Result<(), Error> {
@@ -455,10 +496,12 @@ impl FileSystem {
             return Err(Error::IsDirectory);
         }
         let next = self.revision.checked_add(1).ok_or(Error::Exhausted)?;
+        self.record_change(i, events::Action::Delete, 0);
+        self.nodes[i].linked = false;
+        self.record_change(i, events::Action::Unlink, 0);
         if self.nodes[i].pins == 0 {
+            self.record_change(i, events::Action::DeleteSelf, 0);
             self.nodes[i] = Node::EMPTY;
-        } else {
-            self.nodes[i].linked = false;
         }
         self.changed(next);
         self.last_source = DecisionSource::Operator;
@@ -574,6 +617,9 @@ impl FileSystem {
         self.brain.observe_read(i, x, valid);
         let proposal = self.proposal();
         self.commit_cache(proposal)?;
+        if len != 0 {
+            self.record_change(i, events::Action::Access, 0);
+        }
         Ok(len)
     }
     pub fn pin(&mut self, p: Path) -> Result<Inode, Error> {
@@ -622,6 +668,7 @@ impl FileSystem {
         let i = self.inode_index(h)?;
         self.nodes[i].pins -= 1;
         if self.nodes[i].pins == 0 && !self.nodes[i].linked {
+            self.record_change(i, events::Action::DeleteSelf, 0);
             self.nodes[i] = Node::EMPTY;
             self.cache = [Cached::EMPTY; CACHE_LINES];
             self.brain.invalidate_history();
@@ -639,7 +686,10 @@ impl FileSystem {
         if path == Path::ROOT {
             return Ok(1);
         }
-        Ok(self.nodes[self.find(path)?].serial + 1)
+        self.nodes[self.find(path)?]
+            .serial
+            .checked_add(1)
+            .ok_or(Error::Exhausted)
     }
     pub fn read_at(&mut self, h: Inode, offset: usize, out: &mut [u8]) -> Result<usize, Error> {
         let i = self.inode_index(h)?;
@@ -678,17 +728,20 @@ impl FileSystem {
         n.data[offset..end].copy_from_slice(&data[..count]);
         n.len = old.max(end);
         self.changed(next);
+        self.record_change(i, events::Action::Modify, 0);
         Ok(count)
     }
     /// Mode metadata for the single-UID compatibility layer; shell remains the trusted operator.
     pub fn set_mode(&mut self, p: Path, mode: u16) -> Result<(), Error> {
         let i = self.find(p)?;
         self.nodes[i].mode = mode & 0o7777;
+        self.record_change(i, events::Action::Attrib, 0);
         Ok(())
     }
     pub fn set_inode_mode(&mut self, inode: Inode, mode: u16) -> Result<(), Error> {
         let i = self.inode_index(inode)?;
         self.nodes[i].mode = mode & 0o7777;
+        self.record_change(i, events::Action::Attrib, 0);
         Ok(())
     }
     pub fn train(&mut self) -> Result<(), Error> {

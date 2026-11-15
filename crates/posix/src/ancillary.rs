@@ -121,6 +121,7 @@ impl Process<'_> {
                     | Object::Pipe(_)
                     | Object::Event { .. }
                     | Object::Memfd(_)
+                    | Object::Inotify(_)
             ) {
                 return Err(Errno::Nosys);
             }
@@ -410,7 +411,7 @@ mod tests {
         let t = sender.stage_rights(&[e, e, e]).unwrap();
         objects.commit_rights(t).unwrap();
         let mut receiver = Process::empty(&objects, 2);
-        for _ in 0..15 {
+        for _ in 0..crate::OPEN_MAX - 1 {
             receiver.eventfd(0, 0).unwrap();
         }
         let got = receiver.receive_rights(&mut fs, t, 2, false).unwrap();

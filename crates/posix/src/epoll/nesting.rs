@@ -52,7 +52,10 @@ impl Table {
         }
         let mut done = 0usize;
         let mut depths = [0; EPOLLS];
+        let wanted = self.epolls.iter().filter(|e| e.used).count();
         for _ in 0..EPOLLS {
+            if topology.count == wanted { break; }
+            let before = topology.count;
             for (index, instance) in self.epolls.iter().enumerate() {
                 if !instance.used
                     || done & (1 << index) != 0
@@ -74,6 +77,7 @@ impl Table {
                 topology.count += 1;
                 done |= 1 << index;
             }
+            if topology.count == before { return Err(Errno::Loop); }
         }
         if topology.count != self.epolls.iter().filter(|e| e.used).count() {
             return Err(Errno::Loop);

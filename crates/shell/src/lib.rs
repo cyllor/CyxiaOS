@@ -295,6 +295,7 @@ impl Shell {
                         "cosmic-version" => "cosmic-version",
                         "flock-probe" => "flock-probe",
                         "nested-epoll-probe" => "nested-epoll-probe",
+                        "inotify-probe" => "inotify-probe",
                         "rust-egl-probe" => "rust-egl-probe",
                         "fd-share-probe" => "fd-share-probe",
                         "scm-probe" => "scm-probe",

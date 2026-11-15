@@ -1,11 +1,12 @@
 # COSMIC 组件能力与依赖证据矩阵
 
-2026-11-15 最新：真实 x86 `cosmic-comp` 已完成原生链接，并在四核/1 GiB
-CyxiaOS 客体两次执行 `--version`、正常退出。运行时目录与真实 OFD 文件锁
-已通过阻塞、中断、资源回收和同盘重启验证；嵌套 epoll 已通过真实 socket、
-timer、边沿通知和代际回收验证。正常启动已越过 Wayland 事件源注册，现在因
-缺少 inotify 停在配置监听。见 [当前实现与证据](v17-cosmic-nested-epoll-20261115.md)
-及 [原生构建记录](v17-cosmic-native-20261115.md)。完整 COSMIC 会话仍未验收。
+2026-11-15 最新：真实 x86 `cosmic-comp` 已完成原生链接与 `--version`
+客体执行。运行时目录、OFD 文件锁、嵌套 epoll 和真实 inotify 均有 x86
+客体证据；inotify 两次运行通过文件事件、溢出、readv、阻塞、中断、FD 复用及
+退出回收。full-os 对象容量已明确扩展，旧配置保留。正常 COSMIC 启动已越过
+配置监听 ENOSYS，进入 EGL 初始化，随后发生 SIGSEGV（Fault 139），确切原因
+尚待定位。见 [当前实现与证据](v17-cosmic-inotify-20261115.md) 及
+[原生构建记录](v17-cosmic-native-20261115.md)。完整 COSMIC 会话仍未验收。
 下方 2026-10 月清单保留当时的依赖与工具边界；其中“全部未构建/未运行”
 及仅支持 ARM 的描述属于历史状态，`cosmic-comp` 的当前进度以本段链接为准。
 

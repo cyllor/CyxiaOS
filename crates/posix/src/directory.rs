@@ -4,7 +4,7 @@ use super::*;
 impl Process<'_> {
     pub fn getdents(
         &mut self,
-        fs: &FileSystem,
+        fs: &mut FileSystem,
         fd: i32,
         assets: &[(&str, &[u8])],
         out: &mut [u8],
@@ -67,6 +67,9 @@ impl Process<'_> {
                 ..description
             },
         )?;
+        if let Object::Directory { inode, .. } = description.object {
+            fs.notify_directory_access(inode)?;
+        }
         Ok(written)
     }
 }

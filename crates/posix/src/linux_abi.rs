@@ -53,6 +53,9 @@ pub enum Call {
     Gettid,
     Gettimeofday,
     Getuid,
+    InotifyInit1,
+    InotifyAddWatch,
+    InotifyRmWatch,
     Ioctl,
     Kill,
     Listen,
@@ -183,6 +186,10 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
                 args[5] = 0;
                 Some(Call::EpollPwait)
             }
+            253 => {
+                args[0] = 0;
+                Some(Call::InotifyInit1)
+            }
             284 => {
                 args[1] = 0;
                 Some(Call::Eventfd2)
@@ -206,6 +213,9 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             23 => Call::Dup,
             24 => Call::Dup3,
             25 => Call::Fcntl,
+            26 => Call::InotifyInit1,
+            27 => Call::InotifyAddWatch,
+            28 => Call::InotifyRmWatch,
             29 => Call::Ioctl,
             32 => Call::Flock,
             34 => Call::Mkdirat,
@@ -369,6 +379,8 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             231 => Call::ExitGroup,
             233 => Call::EpollCtl,
             234 => Call::Tgkill,
+            254 => Call::InotifyAddWatch,
+            255 => Call::InotifyRmWatch,
             257 => Call::Openat,
             258 => Call::Mkdirat,
             262 => Call::Newfstatat,
@@ -386,6 +398,7 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             291 => Call::EpollCreate1,
             292 => Call::Dup3,
             293 => Call::Pipe2,
+            294 => Call::InotifyInit1,
             302 => Call::Prlimit64,
             316 => Call::Renameat2,
             318 => Call::Getrandom,
