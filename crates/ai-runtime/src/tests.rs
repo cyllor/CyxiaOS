@@ -433,6 +433,110 @@ fn anonymous_memory_policy_bounds_and_capacity_conservatism() {
         }
     }
 }
+
+#[test]
+fn full_os_anonymous_policy_admits_growth_beyond_the_observed_cosmic_boundary() {
+    // The unchanged COSMIC image reached 4,056 live anonymous pages, then its
+    // 16-page Mesa allocation was denied with only 40 pages left in the old pool.
+    let observed_used = 4096 - 40;
+    assert_eq!(anonymous_memory_policy(40, 16), Ok((false, 8194)));
+    assert_eq!(
+        full_os_anonymous_memory_policy(8192 - observed_used, 16),
+        Ok((true, 8198))
+    );
+    // Actual use can cross the entire old arena without relaxing the reserve.
+    assert_eq!(
+        full_os_anonymous_memory_policy(8192 - 4096, 16),
+        Ok((true, 8198))
+    );
+    assert_eq!(
+        full_os_anonymous_memory_policy(8192, 2048),
+        Ok((true, 8198))
+    );
+    assert_eq!(full_os_anonymous_memory_policy(40, 16), Ok((false, 8198)));
+}
+
+#[test]
+fn full_os_anonymous_policy_rejects_invalid_inputs_and_preserves_reserve() {
+    assert_eq!(full_os_anonymous_memory_policy(0, 1), Ok((false, 8198)));
+    assert_eq!(full_os_anonymous_memory_policy(47, 16), Ok((false, 8198)));
+    assert_eq!(full_os_anonymous_memory_policy(48, 16), Ok((true, 8198)));
+    assert_eq!(
+        full_os_anonymous_memory_policy(2048, 2048),
+        Ok((false, 8198))
+    );
+    for (free, requested) in [
+        (8193, 1),
+        (u32::MAX, 1),
+        (8192, 0),
+        (8192, 2049),
+        (8192, u32::MAX),
+    ] {
+        assert_eq!(
+            full_os_anonymous_memory_policy(free, requested),
+            Err(Error::Invalid)
+        );
+    }
+}
+
+#[test]
+fn full_os_anonymous_policy_quantized_endpoints_keep_thirty_two_pages_spare() {
+    // Exercise every input cell at both physical endpoints, including the new
+    // free-page domain above 4,096. Rounding must never consume the reserve.
+    for free_units in 0..=512 {
+        let free_low = free_units * 16;
+        let free_high = (free_low + 15).min(8192);
+        for requested_units in 1..=128 {
+            let requested_low = (requested_units - 1) * 16 + 1;
+            let requested_high = requested_units * 16;
+            let reference =
+                full_os_anonymous_memory_policy(free_low, requested_high).unwrap();
+            assert_eq!(reference.1, 8198);
+            for free in [free_low, free_high] {
+                for requested in [requested_low, requested_high] {
+                    let decision = full_os_anonymous_memory_policy(free, requested).unwrap();
+                    assert_eq!(decision, reference, "free={free} requested={requested}");
+                    assert!(
+                        !decision.0 || requested + 32 <= free,
+                        "free={free} requested={requested}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn full_os_anonymous_extension_preserves_historical_policy_contracts() {
+    // Legacy and full-OS v1 anonymous admission retain their complete quantized
+    // boundary and identity, including for shared-memory and storage callers.
+    for free_units in 0..=256 {
+        let free_low = free_units * 16;
+        let free_high = (free_low + 15).min(4096);
+        for requested_units in 1..=128 {
+            let requested_low = (requested_units - 1) * 16 + 1;
+            let requested_high = requested_units * 16;
+            let expected = (free_units >= requested_units + 2, 8194);
+            for free in [free_low, free_high] {
+                for requested in [requested_low, requested_high] {
+                    assert_eq!(
+                        anonymous_memory_policy(free, requested),
+                        Ok(expected),
+                        "free={free} requested={requested}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(anonymous_memory_policy(4097, 1), Err(Error::Invalid));
+    assert_eq!(anonymous_memory_policy(4096, 2049), Err(Error::Invalid));
+    assert_eq!(executable_memory_policy(4096, 20), Ok((true, 8195)));
+    assert_eq!(
+        full_os_executable_memory_policy(16384, 9060),
+        Ok((true, 8197))
+    );
+}
+
 #[test]
 fn executable_memory_policy_cannot_overcommit_image_arena() {
     assert_eq!(executable_memory_policy(4096, 20), Ok((true, 8195)));

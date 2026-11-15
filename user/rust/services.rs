@@ -226,9 +226,11 @@ unsafe extern "C" fn memcpy(destination: *mut u8, source: *const u8, count: usiz
 }
 
 fn heap_test(mode: u64, pid: u64) -> ! {
-    let heap_pages = if cfg!(cyxia_large_memory) { 4096 } else { 2048 };
+    let heap_pages = if cfg!(cyxia_full_os) {
+        user_layout::ImageProfile::FullOsV2.layout().heap_pages as u64
+    } else if cfg!(cyxia_large_memory) { 4096 } else { 2048 };
     let heap_base = if cfg!(cyxia_full_os) {
-        user_layout::ImageProfile::FullOsV1.layout().heap_base
+        user_layout::ImageProfile::FullOsV2.layout().heap_base
     } else if cfg!(cyxia_large_memory) {
         user_layout::ImageProfile::Legacy.layout().heap_base
     } else {

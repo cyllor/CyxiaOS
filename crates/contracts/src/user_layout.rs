@@ -5,6 +5,7 @@
 pub enum ImageProfile {
     Legacy,
     FullOsV1,
+    FullOsV2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +24,7 @@ impl ImageProfile {
         match self {
             Self::Legacy => "legacy",
             Self::FullOsV1 => "full-os-v1",
+            Self::FullOsV2 => "full-os-v2",
         }
     }
 
@@ -46,6 +48,11 @@ impl ImageProfile {
                 heap_base: 0x0800_0000,
                 heap_pages: 4096,
             },
+            Self::FullOsV2 => ImageLayout {
+                heap_base: 0x0c00_0000,
+                heap_pages: 8192,
+                ..Self::FullOsV1.layout()
+            },
         }
     }
 }
@@ -62,27 +69,31 @@ mod tests {
 
     #[test]
     fn full_os_image_heap_stack_and_existing_shared_window_do_not_alias() {
-        let layout = ImageProfile::FullOsV1.layout();
-        let regions = [
-            (layout.image_base, layout.image_end),
-            (layout.stack_base, layout.stack_base + layout.stack_pages as u64 * 4096),
-            (layout.heap_base, layout.heap_base + layout.heap_pages as u64 * 4096),
-            (0x0600_0000, 0x0700_0000),
-        ];
-        for (i, &(start, end)) in regions.iter().enumerate() {
-            assert!(start < end && start % 0x200000 == 0 && end % 4096 == 0);
-            for &(other_start, other_end) in &regions[i + 1..] {
-                assert!(end <= other_start || start >= other_end);
+        for profile in [ImageProfile::FullOsV1, ImageProfile::FullOsV2] {
+            let layout = profile.layout();
+            let regions = [
+                (layout.image_base, layout.image_end),
+                (layout.stack_base, layout.stack_base + layout.stack_pages as u64 * 4096),
+                (layout.heap_base, layout.heap_base + layout.heap_pages as u64 * 4096),
+                (0x0600_0000, 0x0700_0000),
+            ];
+            for (i, &(start, end)) in regions.iter().enumerate() {
+                assert!(start < end && start % 0x200000 == 0 && end % 4096 == 0);
+                for &(other_start, other_end) in &regions[i + 1..] {
+                    assert!(end <= other_start || start >= other_end);
+                }
             }
+            // Actual cosmic-comp LOAD span from the independently parsed target ELF.
+            assert!(layout.image_base <= 16_777_216 && layout.image_end >= 51_788_596);
+            assert!(8548 + layout.stack_pages < layout.exec_pool_pages);
+            assert!(layout.exec_pool_pages < u16::MAX as usize);
+            // 128 actual page-table frames must cover even all these leaf tables,
+            // plus separate ancestor tables for the low user and high kernel halves.
+            let leaf_tables = layout.image_pages() / 512 + layout.heap_pages / 512 + 8 + 1;
+            assert!(leaf_tables + 8 < 128);
+            let stack_end = layout.stack_base + layout.stack_pages as u64 * 4096;
+            assert!(layout.heap_base > stack_end || layout.heap_base + layout.heap_pages as u64 * 4096 < layout.stack_base);
         }
-        // Actual cosmic-comp LOAD span from the independently parsed target ELF.
-        assert!(layout.image_base <= 16_777_216 && layout.image_end >= 51_788_596);
-        assert!(8548 + layout.stack_pages < layout.exec_pool_pages);
-        assert!(layout.exec_pool_pages < u16::MAX as usize);
-        // 128 actual page-table frames must cover even all these leaf tables,
-        // plus separate ancestor tables for the low user and high kernel halves.
-        let leaf_tables = layout.image_pages() / 512 + layout.heap_pages / 512 + 8 + 1;
-        assert!(leaf_tables + 8 < 128);
     }
 
     #[test]

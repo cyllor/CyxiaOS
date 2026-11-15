@@ -1245,6 +1245,12 @@ impl Runner {
                     super::super::log(b"MMAP_DENIED requested_pages,free_pages MECHANISM\n");
                     super::super::hex(pages as u64);
                     super::super::hex(self.heap.free() as u64);
+                    let usage = self.heap.usage();
+                    super::super::log(b"MMAP_USAGE used,peak,allocations,peak_allocations,largest_free MECHANISM\n");
+                    for value in [self.heap.used(), usage.peak_pages, usage.allocations,
+                                  usage.peak_allocations, usage.largest_free] {
+                        super::super::hex(value as u64);
+                    }
                 }
                 result
             }

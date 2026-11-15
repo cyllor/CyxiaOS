@@ -1,7 +1,7 @@
 //! Bounded anonymous user mappings, with no hardware or allocation-policy dependency.
 //!
 //! Each `Vm` describes one private physical pool and one bounded user virtual window
-//! (8 MiB normally, 16 MiB with `large-memory`).
+//! (8 MiB normally, 16 MiB with `large-memory`, 32 MiB with `full-os`).
 //! Pool slots are indices, never physical addresses. Allocations default to RW/NX;
 //! per-page permissions may become NONE or R/NX. The kernel must enforce the metadata
 //! in PTEs; permissions do not change physical ownership or grant accounting.
@@ -22,13 +22,16 @@ pub const BASE: u64 = 0x200000;
 #[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const BASE: u64 = 0x04000000;
 #[cfg(feature = "full-os")]
-pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV1.layout().heap_base;
+pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV2.layout().heap_base;
 pub const END: u64 = BASE + (PAGE_COUNT * PAGE_SIZE) as u64;
 pub const PAGE_SIZE: usize = 4096;
 #[cfg(not(feature = "large-memory"))]
 pub const PAGE_COUNT: usize = 2048;
-#[cfg(feature = "large-memory")]
+#[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const PAGE_COUNT: usize = 4096;
+#[cfg(feature = "full-os")]
+pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV2.layout().heap_pages;
+const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT % 512 == 0);
 const UNMAPPED: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +165,18 @@ impl Vm {
 
     pub const fn free(&self) -> usize {
         PAGE_COUNT - self.used
+    }
+
+    /// Largest contiguous unallocated virtual range, in pages. Physical free
+    /// capacity alone cannot explain whether a contiguous mmap can succeed.
+    pub fn largest_free_run(&self) -> usize {
+        let mut largest = 0;
+        let mut run = 0;
+        for &slot in &self.slots {
+            run = if slot == UNMAPPED { run + 1 } else { 0 };
+            largest = largest.max(run);
+        }
+        largest
     }
 
     /// Atomically change already allocated pages to NONE (0), R (1), or RW (3).
@@ -355,6 +370,49 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn largest_free_run_distinguishes_fragmentation_from_free_capacity() {
+        let mut vm = Vm::new();
+        let mut batch = PageBatch::new();
+        vm.allocate_into(PAGE_COUNT, &mut batch).unwrap();
+        assert_eq!(vm.largest_free_run(), 0);
+        vm.unmap_into(BASE, 3, &mut batch).unwrap();
+        vm.unmap_into(BASE + 8 * PAGE_SIZE as u64, 5, &mut batch).unwrap();
+        assert_eq!(vm.free(), 8);
+        assert_eq!(vm.largest_free_run(), 5);
+        vm.allocate_into(4, &mut batch).unwrap();
+        assert_eq!(vm.largest_free_run(), 3);
+        vm.protect(BASE + 3 * PAGE_SIZE as u64, 5 * PAGE_SIZE, 0).unwrap();
+        assert_eq!(vm.largest_free_run(), 3); // PROT_NONE still owns its pages.
+        vm.unmap_into(BASE + 3 * PAGE_SIZE as u64, 5, &mut batch).unwrap();
+        assert_eq!(vm.largest_free_run(), 8);
+    }
+
+    #[test]
+    #[cfg(feature = "full-os")]
+    fn full_os_heap_crosses_old_capacity_and_reclaims_protected_tail() {
+        let mut vm = Vm::new();
+        let mut batch = PageBatch::new();
+        vm.allocate_into(4096, &mut batch).unwrap();
+        vm.allocate_into(1024, &mut batch).unwrap();
+        let tail = batch.start();
+        assert_eq!(vm.used(), 5120);
+        vm.protect(tail, 1024 * PAGE_SIZE, 0).unwrap();
+        assert_eq!(vm.validate_access(tail, 1, false), Err(Errno::Fault));
+        assert_eq!(vm.validate_access(BASE, PAGE_SIZE, true), Ok(()));
+        vm.unmap_into(tail, 1024, &mut batch).unwrap();
+        vm.allocate_into(4096, &mut batch).unwrap();
+        assert_eq!(batch.start(), tail);
+        let last = batch.iter().last().unwrap();
+        assert_eq!(vm.validate_access(last.address, PAGE_SIZE, true), Ok(()));
+        assert_eq!(vm.validate_access(last.address + PAGE_SIZE as u64, 1, false), Err(Errno::Fault));
+        assert_eq!(vm.allocate_into(1, &mut batch), Err(Errno::Nomem));
+        vm.unmap_into(BASE, 8192, &mut batch).unwrap();
+        assert_eq!(vm.used(), 0);
+        vm.allocate_into(8192, &mut batch).unwrap();
+        assert_eq!(vm.validate_access(tail, 4096 * PAGE_SIZE, true), Ok(()));
+    }
 
     #[test]
     fn reusable_batch_clears_stale_receipts_and_preserves_mappings_on_failure() {

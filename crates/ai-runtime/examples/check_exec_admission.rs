@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(io::Error::other(
-                "usage: check_exec_admission [--profile legacy|full-os-v1] FREE REQUESTED",
+                "usage: check_exec_admission [--profile legacy|full-os-v1|full-os-v2] FREE REQUESTED",
             )
             .into());
         }
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let requested: u32 = requested.parse()?;
     let decision = match profile {
         "legacy" => cyxia_ai_runtime::executable_memory_policy(free, requested),
-        "full-os-v1" => cyxia_ai_runtime::full_os_executable_memory_policy(free, requested),
+        "full-os-v1" | "full-os-v2" => cyxia_ai_runtime::full_os_executable_memory_policy(free, requested),
         _ => return Err(io::Error::other("unknown executable admission profile").into()),
     };
     let (allowed, model) =

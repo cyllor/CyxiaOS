@@ -14,7 +14,10 @@ pub fn reserve_pool(bytes: u64) -> Result<cyxia_contracts::PhysAddr, cyxia_posix
     if crate::machine::runtime::cpu_slot() != 0 { return Err(Errno::Perm); }
     let memory = unsafe { (&mut *core::ptr::addr_of_mut!(BOOT_MEMORY)).as_mut() }
         .ok_or(Errno::Nodev)?;
-    memory.reserve_pool(bytes, 0x10_0000).map(|r| r.start).map_err(|_| Errno::Nomem)
+    let range = memory.reserve_pool(bytes, 0x10_0000).map_err(|_| Errno::Nomem)?;
+    let _ = writeln!(Output, "USER_MEMORY_POOL start={:#x} end={:#x} bytes={} backing=BOOTSTRAP",
+        range.start.0, range.start.0 + range.len, range.len);
+    Ok(range.start)
 }
 /// Actual discovered RAM, including reserved pools, for the CPU0 system snapshot.
 pub fn memory_bytes() -> u64 {

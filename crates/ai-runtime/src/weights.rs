@@ -7,3 +7,4 @@ pub const USER_QUANTUM: [i32; 4] = [-1, 1, -8, 0];
 pub const USER_MEMORY: [i32; 4] = [-433, 431, -434, 0];
 pub const EXEC_MEMORY: [i32; 4] = [-267, 420, -426, 0];
 pub const EXEC_MEMORY_FULL_OS: [i32; 4] = [-351, 350, -351, 0];
+pub const USER_MEMORY_FULL_OS: [i32; 4] = [-454, 444, -444, 0];

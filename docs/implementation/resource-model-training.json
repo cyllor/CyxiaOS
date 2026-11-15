@@ -114,6 +114,47 @@
       "teacher": "free_units - requested_units >= 2 (synthetic)",
       "quantized_inputs_checked": 65792,
       "unsafe_grants": 0
+    },
+    "USER_MEMORY_FULL_OS": {
+      "version": 1,
+      "weights": [
+        -454,
+        444,
+        -444,
+        0
+      ],
+      "train": 52531,
+      "heldout": 13133,
+      "correct": 13133,
+      "model_id": 8198,
+      "profile": "full-os-v2",
+      "epochs": 32,
+      "page_bytes": 4096,
+      "arena_pages": 8192,
+      "free_pages": [
+        0,
+        8192
+      ],
+      "requested_pages": [
+        1,
+        2048
+      ],
+      "feature_unit_pages": 16,
+      "free_units": [
+        0,
+        512
+      ],
+      "requested_units": [
+        1,
+        128
+      ],
+      "free_rounding": "floor",
+      "requested_rounding": "ceil",
+      "teacher": "free_units - requested_units >= 2 (synthetic)",
+      "teacher_reserve_pages": 32,
+      "minimum_admitted_spare_pages": 32,
+      "quantized_inputs_checked": 65664,
+      "unsafe_grants": 0
     }
   },
   "limitation": "Synthetic policy distillation; not workload performance validation."

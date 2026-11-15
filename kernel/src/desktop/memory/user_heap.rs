@@ -23,6 +23,10 @@ const _: () = assert!(
 );
 const ALLOCATIONS: usize = 512;
 const TABLES: usize = vm::PAGE_COUNT / 512;
+#[cfg(feature = "full-os")]
+const MODEL_ID: u64 = cyxia_ai_runtime::FULL_OS_ANON_MODEL_ID;
+#[cfg(not(feature = "full-os"))]
+const MODEL_ID: u64 = 8194;
 static POOL_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// This pinned board already maps all RAM at HIGH+PA. Reserve outside the entire
@@ -53,6 +57,24 @@ pub struct Heap {
     base: u64,
     owner: Option<Owner>,
     pub model: u64,
+    usage: Usage,
+}
+
+/// Lifetime high-water marks survive teardown until the slot is rebound.
+#[derive(Clone, Copy)]
+pub struct Usage {
+    pub peak_pages: u32,
+    pub allocations: u32,
+    pub peak_allocations: u32,
+    pub largest_free: u32,
+}
+impl Usage {
+    const EMPTY: Self = Self {
+        peak_pages: 0,
+        allocations: 0,
+        peak_allocations: 0,
+        largest_free: vm::PAGE_COUNT as u32,
+    };
 }
 impl Heap {
     pub const fn new() -> Self {
@@ -65,6 +87,7 @@ impl Heap {
             base: 0,
             owner: None,
             model: 0,
+            usage: Usage::EMPTY,
         }
     }
     pub fn bind(&mut self, slot: usize, owner: Owner) {
@@ -77,6 +100,7 @@ impl Heap {
         };
         self.owner = Some(owner);
         self.model = 0;
+        self.usage = Usage::EMPTY;
     }
     #[cfg(target_arch = "aarch64")]
     pub fn roots(&self) -> [u64; TABLES] {
@@ -87,6 +111,9 @@ impl Heap {
     }
     pub fn free(&self) -> u32 {
         self.ledger.snapshot().free
+    }
+    pub fn usage(&self) -> Usage {
+        self.usage
     }
     fn pointer(&self, slot: usize, offset: usize) -> *mut u8 {
         assert!(self.base != 0 && slot < vm::PAGE_COUNT && offset < vm::PAGE_SIZE);
@@ -105,8 +132,8 @@ impl Heap {
         if pages == 0 || pages > vm::PAGE_COUNT {
             return Err(Errno::Inval);
         }
-        // The unchanged model is trained for requests up to 2048 pages.
-        // A larger pool does not authorize extrapolating its request domain.
+        // Both profiles retain the independently validated 2048-page request
+        // domain. Pool growth does not authorize larger individual requests.
         if pages > 2048 || pages > self.free() as usize {
             return Err(Errno::Nomem);
         }
@@ -116,9 +143,13 @@ impl Heap {
             .position(Option::is_none)
             .ok_or(Errno::Nomem)?;
         let owner = self.owner.ok_or(Errno::Perm)?;
-        attempt.proposed(8194);
+        attempt.proposed(MODEL_ID);
+        #[cfg(not(feature = "full-os"))]
+        let policy = cyxia_ai_runtime::anonymous_memory_policy;
+        #[cfg(feature = "full-os")]
+        let policy = cyxia_ai_runtime::full_os_anonymous_memory_policy;
         let (admitted, model) =
-            cyxia_ai_runtime::anonymous_memory_policy(self.free(), pages as u32)
+            policy(self.free(), pages as u32)
                 .map_err(|_| Errno::Io)?;
         attempt.decided(admitted, model);
         self.model = model;
@@ -164,6 +195,10 @@ impl Heap {
             pages,
             redemption,
         });
+        self.usage.allocations += 1;
+        self.usage.peak_allocations = self.usage.peak_allocations.max(self.usage.allocations);
+        self.usage.peak_pages = self.usage.peak_pages.max(self.used());
+        self.usage.largest_free = self.vm.largest_free_run() as u32;
         Ok(self.batch.start())
     }
     /// Native first-stage API: unmap exactly one original allocation. Partial or
@@ -195,6 +230,8 @@ impl Heap {
             .map_err(|_| Errno::Io)?;
         ai::record(Domain::Anonymous, |c| c.release(pages as u64));
         self.allocations[slot] = None;
+        self.usage.allocations -= 1;
+        self.usage.largest_free = self.vm.largest_free_run() as u32;
         Ok(())
     }
     pub fn clear(&mut self) {

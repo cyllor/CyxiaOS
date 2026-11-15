@@ -88,6 +88,69 @@ fn private_roots_map_disjoint_frames_and_enforce_permissions() {
     assert_eq!(b.translate(0x1000000).unwrap().physical, 0x500000);
 }
 
+#[test]
+fn full_os_v2_complete_windows_fit_private_tables_and_preserve_stack_guard() {
+    use cyxia_contracts::user_layout::ImageProfile;
+
+    #[derive(Clone)]
+    #[repr(C, align(4096))]
+    struct TableFrame([u8; 4096]);
+
+    // Allocate directly on the host heap rather than putting a 512 KiB arena
+    // through the test thread's stack. These frames stay pinned until space drops.
+    let mut tables = vec![TableFrame([0; 4096]); 128];
+    let kernel = KernelMappings::new([0; 256], 1 << 30).unwrap();
+    let mut space = unsafe {
+        AddressSpace::new(
+            TableArena::from_raw(tables.as_mut_ptr().cast(), 0x200000, 128).unwrap(),
+            &kernel,
+            SpaceId {
+                id: 1,
+                generation: 1,
+            },
+        )
+    }
+    .unwrap();
+    let layout = ImageProfile::FullOsV2.layout();
+    let stack_end = layout.stack_base + layout.stack_pages as u64 * PAGE_BYTES;
+    let heap_end = layout.heap_base + layout.heap_pages as u64 * PAGE_BYTES;
+    assert_eq!(heap_end - layout.heap_base, 32 * 1024 * 1024);
+    let windows = [
+        (layout.image_base, layout.image_end, UserPermissions::RX),
+        // The existing shared-memory ABI window is independent of image profiles.
+        (0x0600_0000, 0x0700_0000, UserPermissions::RW),
+        (layout.stack_base, stack_end, UserPermissions::RW),
+        (layout.heap_base, heap_end, UserPermissions::RW),
+    ];
+    let backing_start = 0x1000_0000;
+    let mut physical = backing_start;
+    for (start, end, permissions) in windows {
+        for address in (start..end).step_by(PAGE_BYTES as usize) {
+            // Every user page has distinct backing below 1 GiB, disjoint from
+            // the table arena. No allocation beyond its 128 frames is possible.
+            space.map(address, physical, permissions).unwrap();
+            physical += PAGE_BYTES;
+        }
+    }
+    assert!(physical <= kernel.ram_bytes());
+    physical = backing_start;
+    for (start, end, permissions) in windows {
+        for address in (start..end).step_by(PAGE_BYTES as usize) {
+            for offset in [0, PAGE_BYTES - 1] {
+                let mapping = space.translate(address + offset).unwrap();
+                assert_eq!(mapping.physical, physical + offset);
+                assert_eq!(mapping.permissions, permissions);
+            }
+            physical += PAGE_BYTES;
+        }
+    }
+    assert!(space.translate(layout.stack_base - PAGE_BYTES).is_none());
+    assert!(space.translate(layout.stack_base - 1).is_none());
+    assert!(space.translate(stack_end).is_none());
+    assert!(space.translate(layout.heap_base - 1).is_none());
+    assert!(space.translate(heap_end).is_none());
+}
+
 // A user frame's MXCSR_MASK is not authority for the next signal restore.
 // Without preserving the original hardware mask, the second restore admits
 // bit31 and the next kernel FXRSTOR raises #GP instead of isolating the process.

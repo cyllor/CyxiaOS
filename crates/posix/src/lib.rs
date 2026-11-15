@@ -1133,6 +1133,10 @@ pub struct UserStatus {
     pub heap_pages: u32,
     pub heap_free: u32,
     pub heap_model: u64,
+    pub heap_peak: u32,
+    pub heap_allocations: u32,
+    pub heap_peak_allocations: u32,
+    pub heap_largest_free: u32,
     pub image_pages: u32,
     pub image_free: u32,
 }
@@ -1169,6 +1173,10 @@ impl UserStatus {
         heap_pages: 0,
         heap_free: vm::PAGE_COUNT as u32,
         heap_model: 0,
+        heap_peak: 0,
+        heap_allocations: 0,
+        heap_peak_allocations: 0,
+        heap_largest_free: vm::PAGE_COUNT as u32,
         image_pages: 0,
         image_free: 0,
     };

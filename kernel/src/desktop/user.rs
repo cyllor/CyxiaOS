@@ -1505,6 +1505,11 @@ impl Supervisor {
             runner.status.heap_pages = runner.heap.used();
             runner.status.heap_free = runner.heap.free();
             runner.status.heap_model = runner.heap.model;
+            let usage = runner.heap.usage();
+            runner.status.heap_peak = usage.peak_pages;
+            runner.status.heap_allocations = usage.allocations;
+            runner.status.heap_peak_allocations = usage.peak_allocations;
+            runner.status.heap_largest_free = usage.largest_free;
             #[cfg(feature = "ported")]
             {
                 runner.status.image_pages = runner.executable.pages();

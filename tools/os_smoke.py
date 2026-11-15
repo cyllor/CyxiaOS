@@ -125,7 +125,8 @@ def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0):
     at = console.command('posix list')
     process = parse_processes(bytes(console.raw[at:]))[int(pid)]
     for name, expected in dict(state=state, code=code, free_pages=64, heap_pages=0,
-                               image_pages=0, thread_count=0, heap_free=4096,
+                               image_pages=0, thread_count=0, heap_free=8192,
+                               heap_allocations=0, heap_largest_free=8192,
                                image_free=16384).items():
         pc.require(process.get(name) == expected, 'probe did not reclaim ' + name)
     after_objects = object_snapshot(console)
@@ -234,6 +235,24 @@ def thread_exit_checks(console, *, bad_stack=False):
         pc.require(result['process']['thread_admissions'] == 5 and result['process']['thread_peak'] == 2,
                    'missing actual repeated detached exit and join reuse')
     return dict(result, bad_stack=bad_stack)
+
+def heap_capacity_checks(console):
+    before = object_snapshot(console)
+    pc.require(before['live'] == before['references'] == 0, 'heap capture begins with live objects')
+    start = console.command('posix exec heap-capacity-probe')
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    for phase in ('ABOVE_LEGACY', 'RESERVE', 'REUSE'):
+        marker = ('HEAP_CAPACITY_PROBE ' + phase + ' PASS').encode()
+        outcome = console.until(marker + rb'|HEAP_CAPACITY_PROBE FAIL[^\r\n]*|pid=' + pid +
+                                rb' (?:Fault|Exited) code=\d+\b', start)
+        pc.require(outcome.group(0) == marker, 'heap capacity phase failed: ' + repr(outcome.group(0)))
+    console.until(rb'HEAP_CAPACITY_PROBE PASS', start)
+    result = reclaimed_probe(console, pid, before)
+    process = result['process']
+    pc.require(7168 <= process['heap_peak'] <= 8160 and process['heap_model'] == 8198,
+               'missing admitted full-OS heap growth/reserve')
+    pc.require(5 < process['heap_peak_allocations'] < 256, 'missing actual mapping growth')
+    return result
 
 def syscall_probe_inputs(prefix, name):
     from build_sysroot import inspect_elf, PROBES
@@ -425,6 +444,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'thread-exit' or ('full-os' in manifest['features'] and
                    'thread-exit-probe.elf' in manifest['external_inputs']),
                    'thread-exit smoke requires full-OS runtime and actual musl probe')
+        pc.require(scenario != 'heap-capacity' or ('full-os' in manifest['features'] and
+                   'heap-capacity-probe.elf' in manifest['external_inputs']),
+                   'heap capacity smoke requires full-OS and actual musl probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -460,6 +482,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'inotify':
                     result['inotify_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'inotify-probe')
                     result['inotify_embedded_sha256'] = embedded_images(build, manifest, ('inotify-probe.elf',))['inotify-probe.elf']
+                if scenario == 'heap-capacity':
+                    result['heap_capacity_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe')
+                    result['heap_capacity_embedded_sha256'] = embedded_images(build, manifest, ('heap-capacity-probe.elf',))['heap-capacity-probe.elf']
                 if scenario == 'thread-exit':
                     result['thread_exit_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'thread-exit-probe')
                     result['thread_exit_embedded_sha256'] = embedded_images(build, manifest, ('thread-exit-probe.elf',))['thread-exit-probe.elf']
@@ -492,6 +517,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'heap-capacity':
+                    result['heap_capacity'] = [heap_capacity_checks(console), heap_capacity_checks(console)]
                 if scenario == 'thread-exit':
                     result['thread_exit'] = [thread_exit_checks(console), thread_exit_checks(console, bad_stack=True), thread_exit_checks(console)]
                 if scenario == 'inotify': result['inotify'] = [inotify_checks(console), inotify_checks(console)]
@@ -571,6 +598,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'inotify':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'inotify-probe') == result['inotify_build_inputs'],
                                        'inotify source/build inputs changed during VM')
+                        if scenario == 'heap-capacity':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'heap-capacity-probe') == result['heap_capacity_build_inputs'],
+                                       'heap probe source/build inputs changed during VM')
                         if scenario == 'thread-exit':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'thread-exit-probe') == result['thread_exit_build_inputs'],
                                        'thread-exit source/build inputs changed during VM')
@@ -584,7 +614,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit', 'heap-capacity'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()
