@@ -90,13 +90,14 @@ fn catalog(root: &Path, out: &Path) {
         ("wayland-shm-probe", &["wayland-shm-probe"][..]), ("openbox", &["openbox"][..]),
         ("gtk", &["gtk-probe"][..]), ("pcmanfm", &["pcmanfm"][..]), ("lxpanel", &["lxpanel"][..]),
         ("spawn-test", &["glib-spawn-probe"][..]),
+        ("cosmic-desktop", &["cosmic-comp"][..]),
     ] {
         if feature(flag) { names.extend_from_slice(images); required.extend_from_slice(images); }
     }
     if prefix.join("Xcyxia.elf").is_file() { names.push("xorg"); }
     let mut text = String::from("const PORTED: &[(&str, &str, &[u8])] = &[\n");
     let mut paths = Vec::new();
-    let budget = if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
+    let budget = if feature("full-os") { 96 } else if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
     let mut total = 0usize;
     if feature("ported") {
         for name in names {
@@ -165,6 +166,9 @@ pub fn build() {
         "-C", "panic=abort", "-C", "opt-level=s", "-C", "relocation-model=static", "-C", "code-model=small", "-C", "no-redzone=yes",
         "-C", "strip=debuginfo", "-C", "link-arg=--build-id=none", "-C", "link-arg=-zmax-page-size=4096", "-D", "warnings"]);
     if feature("large-memory") { command.args(["--cfg", "cyxia_large_memory"]); }
+    command.arg("--check-cfg=cfg(cyxia_full_os)");
+    command.arg("--check-cfg=cfg(test)");
+    if feature("full-os") { command.args(["--cfg", "cyxia_full_os"]); }
     checked(command.arg("-C").arg(format!("link-arg=-T{}", user.join("linker.ld").display())).arg("-o").arg(out.join("native-services.elf")));
     let _ = x86_image(&out.join("posix-demo.elf"));
     let _ = x86_image(&out.join("native-services.elf"));

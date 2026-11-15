@@ -6,13 +6,16 @@ use super::{Description, Errno, O_CLOEXEC, O_RDWR, OPEN_MAX, Object, Process};
 
 pub const INSTANCES: usize = 2;
 pub const IN: u32 = 1;
+// A valid interest even on backends that never produce priority data. It is
+// retained in the watch and only returned when the backend reports this bit.
+pub const PRI: u32 = 2;
 pub const OUT: u32 = 4;
 pub const ERR: u32 = 8;
 pub const HUP: u32 = 16;
 pub const RDHUP: u32 = 0x2000;
 pub const ONESHOT: u32 = 1 << 30;
 pub const EDGE: u32 = 1 << 31;
-const SUPPORTED: u32 = IN | OUT | ERR | HUP | RDHUP | ONESHOT | EDGE;
+const SUPPORTED: u32 = IN | PRI | OUT | ERR | HUP | RDHUP | ONESHOT | EDGE;
 
 #[derive(Clone, Copy)]
 struct Watch {
@@ -351,6 +354,27 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
             Ok(bytes.len())
         }
+    }
+
+    #[test]
+    fn polling_priority_interest_does_not_turn_ordinary_reads_into_priority_events() {
+        // polling 3.11 registers IN|HUP|ERR|PRI|ONESHOT on its eventfd.
+        // Priority interest is valid even when this backend cannot produce it.
+        const PRIORITY: u32 = 2;
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let ep = p.epoll_create(O_CLOEXEC).unwrap();
+        let fd = p.eventfd(1, 0).unwrap();
+        let polling_interest = IN | HUP | ERR | PRIORITY | ONESHOT;
+        assert_eq!(p.epoll_ctl(ep, 1, fd, Event { events: polling_interest, data: 41 }), Ok(()));
+        let events = ready(&mut p, ep, 1);
+        assert_eq!(events[0], Event { events: IN, data: 41 });
+        assert_eq!(ready(&mut p, ep, 1)[0].events, 0);
+        p.epoll_ctl(ep, 3, fd, Event { events: PRIORITY | ONESHOT, data: 42 }).unwrap();
+        assert_eq!(ready(&mut p, ep, 1)[0].events, 0);
+        p.epoll_ctl(ep, 3, fd, Event { events: polling_interest, data: 43 }).unwrap();
+        assert_eq!(ready(&mut p, ep, 1)[0], Event { events: IN, data: 43 });
+        assert_eq!(p.epoll_ctl(ep, 3, fd, Event { events: 1 << 27, data: 44 }), Err(Errno::Inval));
     }
 
     #[test]

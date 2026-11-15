@@ -1,5 +1,6 @@
 extern crate std;
 use super::*;
+use cyxia_contracts::user_layout::ImageProfile;
 use std::{vec, vec::Vec};
 
 fn put16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -89,7 +90,10 @@ fn x86_plan_requires_explicit_isa_and_accepts_byte_aligned_entry() {
     assert_eq!(plan.entry, IMAGE_BASE + 2047);
     assert!(parse_for(&bytes, ImageAbi::Aarch64).is_err());
     put32(&mut bytes, 64 + 4, 7);
-    assert!(matches!(parse_for(&bytes, ImageAbi::X86_64), Err(Error::Permissions)));
+    assert!(matches!(
+        parse_for(&bytes, ImageAbi::X86_64),
+        Err(Error::Permissions)
+    ));
 }
 
 #[test]
@@ -99,11 +103,202 @@ fn x86_initial_stack_preserves_sysv_alignment_and_real_entry() {
     let mut cfg = config();
     cfg.entry += 1;
     assert!(build_stack(&mut bytes, 0x0300_0000, &[b"app"], &[], &cfg).is_err());
-    let stack = build_stack_for(&mut bytes, 0x0300_0000, &[b"app"], &[], &cfg,
-        b"/bin/app", ImageAbi::X86_64).unwrap();
+    let stack = build_stack_for(
+        &mut bytes,
+        0x0300_0000,
+        &[b"app"],
+        &[],
+        &cfg,
+        b"/bin/app",
+        ImageAbi::X86_64,
+    )
+    .unwrap();
     assert_eq!(stack.sp % 16, 0);
     let offset = (stack.sp - 0x0300_0000) as usize;
-    assert_eq!(u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()), 1);
+    assert_eq!(
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+        1
+    );
+}
+
+fn extended_x86_image() -> Vec<u8> {
+    let mut bytes = image();
+    put16(&mut bytes, 18, 62);
+    put64(&mut bytes, 24, 0x0300_1001);
+    header(&mut bytes, 1, 1, 5, 4096, 0x0300_1000, 32, 8192);
+    bytes
+}
+
+#[test]
+fn full_os_x86_entry_and_sparse_pages_require_explicit_profile() {
+    let bytes = extended_x86_image();
+    assert!(matches!(
+        parse_for(&bytes, crate::ImageAbi::X86_64),
+        Err(Error::Bounds)
+    ));
+    assert!(matches!(
+        parse_for_profile(&bytes, crate::ImageAbi::X86_64, ImageProfile::Legacy),
+        Err(Error::Bounds)
+    ));
+    let plan = parse_for_profile(&bytes, crate::ImageAbi::X86_64, ImageProfile::FullOsV1).unwrap();
+    assert_eq!(plan.profile, ImageProfile::FullOsV1);
+    assert_eq!(plan.entry, 0x0300_1001);
+    assert_eq!(plan.phdr_address, 0x0100_0040);
+    assert_eq!(
+        plan.pages().map(|page| page.address).collect::<Vec<_>>(),
+        [0x0100_0000, 0x0300_1000, 0x0300_2000]
+    );
+    assert!(
+        plan.pages()
+            .all(|page| page.permissions.execute && !page.permissions.write)
+    );
+    assert_eq!(parse(&image()).unwrap().profile, ImageProfile::Legacy);
+}
+
+#[test]
+fn profile_image_boundaries_include_last_page_and_reject_crossings() {
+    for (profile, end) in [
+        (ImageProfile::Legacy, 0x0200_0000),
+        (ImageProfile::FullOsV1, 0x0500_0000),
+    ] {
+        let mut bytes = image();
+        put16(&mut bytes, 18, 62);
+        header(&mut bytes, 1, 1, 6, 4096, end - 4096, 32, 4096);
+        let plan = parse_for_profile(&bytes, crate::ImageAbi::X86_64, profile).unwrap();
+        assert_eq!(
+            plan.pages().map(|page| page.address).collect::<Vec<_>>(),
+            [0x0100_0000, end - 4096]
+        );
+        for (address, size) in [
+            (0x00ff_f000, 4096),
+            (end, 4096),
+            (end - 4096, 4097),
+            (u64::MAX - 4095, 8192),
+        ] {
+            header(&mut bytes, 1, 1, 6, 4096, address, 32, size);
+            assert!(
+                matches!(
+                    parse_for_profile(&bytes, crate::ImageAbi::X86_64, profile),
+                    Err(Error::Bounds)
+                ),
+                "profile={profile:?} address={address:#x} size={size}"
+            );
+        }
+    }
+    let mut arm = image();
+    header(&mut arm, 1, 1, 6, 4096, 0x0200_0000, 32, 4096);
+    assert!(matches!(parse(&arm), Err(Error::Bounds)));
+}
+
+#[test]
+fn extended_image_retains_permissions_overlap_entry_and_phdr_checks() {
+    fn parse_full(bytes: &[u8]) -> Result<(), Error> {
+        parse_for_profile(bytes, crate::ImageAbi::X86_64, ImageProfile::FullOsV1).map(|_| ())
+    }
+    let mut bytes = extended_x86_image();
+    assert_eq!(parse_full(&bytes), Ok(()));
+    put32(&mut bytes, 64 + 56 + 4, 7);
+    assert_eq!(parse_full(&bytes), Err(Error::Permissions));
+    let mut bytes = extended_x86_image();
+    put16(&mut bytes, 56, 3);
+    header(&mut bytes, 2, 1, 4, 4128, 0x0300_1020, 16, 16);
+    assert_eq!(parse_full(&bytes), Err(Error::Overlap));
+    let mut bytes = extended_x86_image();
+    put64(&mut bytes, 24, 0x0300_1020);
+    assert_eq!(parse_full(&bytes), Err(Error::Entry));
+    let mut bytes = extended_x86_image();
+    put16(&mut bytes, 56, 3);
+    header(&mut bytes, 2, 6, 4, 64, 0x0300_1040, 168, 168);
+    put64(&mut bytes, 64 + 2 * 56 + 48, 8);
+    assert_eq!(parse_full(&bytes), Err(Error::Headers));
+}
+
+#[test]
+fn full_os_tls_respects_extended_image_boundary_and_real_template_bytes() {
+    let mut bytes = image();
+    put16(&mut bytes, 18, 62);
+    put16(&mut bytes, 56, 3);
+    header(&mut bytes, 1, 1, 6, 4096, 0x04ff_f000, 32, 4096);
+    header(&mut bytes, 2, 7, 4, 4112, 0x04ff_f010, 16, 4080);
+    put64(&mut bytes, 64 + 2 * 56 + 48, 16);
+    let plan = parse_for_profile(&bytes, crate::ImageAbi::X86_64, ImageProfile::FullOsV1).unwrap();
+    let tls = plan.tls().unwrap();
+    assert_eq!(tls.address, 0x04ff_f010);
+    assert_eq!(tls.memory_size, 4080);
+    assert_eq!(tls.data, &bytes[4112..4128]);
+    for (offset, address, files, memory) in [
+        (4112, 0x04ff_f010, 16, 4081),
+        (4128, 0x04ff_f010, 16, 16),
+        (4096, 0x0500_0000, 0, 16),
+        (4096, u64::MAX - 15, 0, 32),
+    ] {
+        header(&mut bytes, 2, 7, 4, offset, address, files, memory);
+        put64(&mut bytes, 64 + 2 * 56 + 48, 16);
+        assert!(matches!(
+            parse_for_profile(&bytes, crate::ImageAbi::X86_64, ImageProfile::FullOsV1),
+            Err(Error::Tls)
+        ));
+    }
+    header(&mut bytes, 2, 7, 4, 4096, 0x04ff_fff0, 0, 16);
+    put64(&mut bytes, 64 + 2 * 56 + 48, 16);
+    let plan = parse_for_profile(&bytes, crate::ImageAbi::X86_64, ImageProfile::FullOsV1).unwrap();
+    assert!(plan.tls().unwrap().data.is_empty());
+}
+
+#[test]
+fn full_os_initial_stack_carries_extended_entry_without_changing_legacy_limits() {
+    let mut cfg = config();
+    cfg.entry = 0x0300_1001;
+    let mut memory = vec![0x5a; 2 * 1024 * 1024];
+    assert_eq!(
+        build_stack_for(
+            &mut memory,
+            0x0a00_0000,
+            &[b"app"],
+            &[],
+            &cfg,
+            b"/bin/app",
+            crate::ImageAbi::X86_64
+        ),
+        Err(Error::Stack)
+    );
+    assert!(memory.iter().all(|byte| *byte == 0x5a));
+    let stack = build_stack_for_profile(
+        &mut memory,
+        0x0a00_0000,
+        &[b"app"],
+        &[],
+        &cfg,
+        b"/bin/app",
+        crate::ImageAbi::X86_64,
+        ImageProfile::FullOsV1,
+    )
+    .unwrap();
+    assert_eq!(stack.sp % 16, 0);
+    assert!((0x0a00_0000..0x0a20_0000).contains(&stack.sp));
+    let aux = (stack.auxiliary - 0x0a00_0000) as usize;
+    assert!(memory[aux..].chunks_exact(16).take(13).any(|pair| {
+        u64::from_le_bytes(pair[..8].try_into().unwrap()) == 9
+            && u64::from_le_bytes(pair[8..].try_into().unwrap()) == 0x0300_1001
+    }));
+    for entry in [0x00ff_ffff, 0x0500_0000, u64::MAX] {
+        cfg.entry = entry;
+        let mut untouched = [0x5a; 4096];
+        assert_eq!(
+            build_stack_for_profile(
+                &mut untouched,
+                0x0a00_0000,
+                &[b"app"],
+                &[],
+                &cfg,
+                b"/bin/app",
+                crate::ImageAbi::X86_64,
+                ImageProfile::FullOsV1
+            ),
+            Err(Error::Stack)
+        );
+        assert_eq!(untouched, [0x5a; 4096]);
+    }
 }
 
 #[test]

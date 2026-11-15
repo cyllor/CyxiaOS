@@ -1,7 +1,12 @@
 #![no_std]
 #![no_main]
+
 //! Native EL0 integration workloads for the desktop process/IPC foundation.
 //! This fixed image is not X.Org, a desktop app, or a Linux binary.
+// Standalone rustc image: share the contract without linking the kernel crate.
+#[allow(dead_code)]
+#[path = "../../crates/contracts/src/user_layout.rs"]
+mod user_layout;
 use core::arch::asm;
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("fpu.S"));
@@ -222,11 +227,17 @@ unsafe extern "C" fn memcpy(destination: *mut u8, source: *const u8, count: usiz
 
 fn heap_test(mode: u64, pid: u64) -> ! {
     let heap_pages = if cfg!(cyxia_large_memory) { 4096 } else { 2048 };
-    let heap_base = if cfg!(cyxia_large_memory) { 0x04000000 } else { 0x200000 };
+    let heap_base = if cfg!(cyxia_full_os) {
+        user_layout::ImageProfile::FullOsV1.layout().heap_base
+    } else if cfg!(cyxia_large_memory) {
+        user_layout::ImageProfile::Legacy.layout().heap_base
+    } else {
+        0x200000
+    };
     require(call(22, 0, 0, 0) == -22);
     require(call(22, heap_pages + 1, 0, 0) == -22);
     let address = call(22, 96, 0, 0);
-    require(address == heap_base);
+    require(address > 0 && address as u64 == heap_base);
     require(call(4, 1, address as u64, 0) == 0);
     require(call(4, 1, u64::MAX, 0) == 0);
     require(call(4, 999, address as u64, 0) == -9);

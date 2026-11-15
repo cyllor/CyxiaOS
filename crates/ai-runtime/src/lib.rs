@@ -768,6 +768,27 @@ pub fn executable_memory_policy(free: u32, requested: u32) -> Result<(bool, u64)
     Ok((score >= 0, 0x2003))
 }
 
+/// Separate synthetic executable-admission model for the full-OS v1 profile.
+pub const FULL_OS_EXEC_MODEL_ID: u64 = 0x2005;
+
+/// Executable-image admission for the full-OS v1 64 MiB private arena.
+/// Free pages round down and requested pages round up to 64-page features,
+/// within the separately trained 0..256 free / 1..256 request domain. Inputs
+/// outside the physical domain are rejected, never clamped. The kernel still
+/// enforces actual page capacity, permissions and ownership after admission.
+pub fn full_os_executable_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > 16384 || requested == 0 || requested > 16384 {
+        return Err(Error::Invalid);
+    }
+    let features = [1, (free / 64) as i32, requested.div_ceil(64) as i32, 0];
+    let score: i32 = weights::EXEC_MEMORY_FULL_OS
+        .into_iter()
+        .zip(features)
+        .map(|(w, x)| w * x)
+        .sum();
+    Ok((score >= 0, FULL_OS_EXEC_MODEL_ID))
+}
+
 /// User dispatch wall-time budget in milliseconds. Safety caps are enforced by the kernel.
 pub fn user_cpu_policy(cpu_bound: bool, competing: usize) -> Result<(u64, u64), Error> {
     if competing > 8 {

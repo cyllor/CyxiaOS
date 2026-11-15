@@ -42,6 +42,17 @@ class RuntimeElf(unittest.TestCase):
         with self.assertRaises(ValueError): x86_64.boot_image(raw, runtime=True)
 
 class UserBuildInputs(unittest.TestCase):
+    def test_full_os_capacity_is_explicit_and_cosmic_requires_graphics(self):
+        self.assertEqual(os_x86.select_features(ported=True, extras=['full-os']),
+                         ['os-runtime', 'ported', 'full-os'])
+        self.assertEqual(os_x86.select_features(graphics=True, ported=True,
+                         extras=['full-os', 'cosmic-desktop']),
+                         ['os-runtime', 'graphics', 'ported', 'cosmic-desktop', 'full-os'])
+        for options in (dict(extras=['full-os']),
+                        dict(ported=True, extras=['cosmic-desktop'])):
+            with self.assertRaises(ValueError): os_x86.select_features(**options)
+        self.assertEqual(os_x86.select_features(), ['os-runtime'])
+
     def test_external_image_and_asset_changes_invalidate_the_cache_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             prefix = Path(directory).resolve()

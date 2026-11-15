@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 large-memory = []
+full-os = ["large-memory"]
 
 [dependencies]
 cyxia-ai-fs = { path = "../ai-fs" }

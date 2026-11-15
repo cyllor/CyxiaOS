@@ -9,6 +9,18 @@ fn send(shell: &mut Shell, s: &[u8]) -> String {
     out
 }
 #[test]
+fn cosmic_catalog_commands_reach_the_process_supervisor() {
+    use cyxia_posix::UserRequest;
+    let mut shell = Shell::new();
+    for name in ["cosmic-comp", "cosmic-version"] {
+        let output = send(&mut shell, std::format!("posix exec {name}\r").as_bytes());
+        assert!(!output.contains("error:"), "{output}");
+        assert_eq!(shell.take_user_request(), Some(UserRequest::Execute(name)));
+    }
+    assert!(send(&mut shell, b"posix exec cosmic-comp extra\r").contains("invalid arguments"));
+    assert_eq!(shell.take_user_request(), None);
+}
+#[test]
 fn storage_requests_are_bounded_and_do_not_claim_durability() {
     let mut shell = Shell::new();
     let first = send(&mut shell, b"storage checkpoint\rstorage status\r");

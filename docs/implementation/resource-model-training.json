@@ -84,6 +84,36 @@
       "train": 52633,
       "heldout": 13159,
       "correct": 13107
+    },
+    "EXEC_MEMORY_FULL_OS": {
+      "version": 1,
+      "weights": [
+        -351,
+        350,
+        -351,
+        0
+      ],
+      "train": 52633,
+      "heldout": 13159,
+      "correct": 13159,
+      "model_id": 8197,
+      "epochs": 32,
+      "page_bytes": 4096,
+      "arena_pages": 16384,
+      "free_pages": [
+        0,
+        16384
+      ],
+      "requested_pages": [
+        1,
+        16384
+      ],
+      "feature_unit_pages": 64,
+      "free_rounding": "floor",
+      "requested_rounding": "ceil",
+      "teacher": "free_units - requested_units >= 2 (synthetic)",
+      "quantized_inputs_checked": 65792,
+      "unsafe_grants": 0
     }
   },
   "limitation": "Synthetic policy distillation; not workload performance validation."

@@ -7,6 +7,8 @@ mod x86_64;
 mod os;
 
 fn main() {
+    // Also included by the standalone native user-service compilation.
+    println!("cargo:rerun-if-changed=../crates/contracts/src/user_layout.rs");
     match std::env::var("TARGET").as_deref() {
         Ok("aarch64-unknown-none-softfloat") => aarch64::build(),
         Ok("x86_64-unknown-none") => x86_64::build(),

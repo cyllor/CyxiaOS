@@ -19,8 +19,10 @@ use crate::Errno;
 
 #[cfg(not(feature = "large-memory"))]
 pub const BASE: u64 = 0x200000;
-#[cfg(feature = "large-memory")]
+#[cfg(all(feature = "large-memory", not(feature = "full-os")))]
 pub const BASE: u64 = 0x04000000;
+#[cfg(feature = "full-os")]
+pub const BASE: u64 = cyxia_contracts::user_layout::ImageProfile::FullOsV1.layout().heap_base;
 pub const END: u64 = BASE + (PAGE_COUNT * PAGE_SIZE) as u64;
 pub const PAGE_SIZE: usize = 4096;
 #[cfg(not(feature = "large-memory"))]

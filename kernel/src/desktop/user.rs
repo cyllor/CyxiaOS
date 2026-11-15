@@ -1059,6 +1059,8 @@ impl Supervisor {
             "gtk-probe"
         } else if matches!(name, "pcmanfm-desktop" | "pcmanfm-home") {
             "pcmanfm"
+        } else if name == "cosmic-version" {
+            "cosmic-comp"
         } else if matches!(
             name,
             "smithay-dynamic-a"
@@ -1074,7 +1076,7 @@ impl Supervisor {
             .iter()
             .find(|(n, _, _)| *n == image_name)
             .ok_or(Errno::Noent)?;
-        let plan = cyxia_posix::executable::parse_for(bytes, process_arch::IMAGE_ABI)
+        let plan = cyxia_posix::executable::parse_for_profile(bytes, process_arch::IMAGE_ABI, super::exec_memory::PROFILE)
             .map_err(|_| Errno::Inval)?;
         // Read-only boot assets retain their bytes in kernel ROM mappings.
         // Directories use the real RAM filesystem and its ordinary AI admission.
@@ -1109,6 +1111,7 @@ impl Supervisor {
         let runner = &mut self.runners[slot];
         let owner = runner.lease.ok_or(Errno::Io)?.0;
         let normal_argv: &[&[u8]] = &[path.as_bytes()];
+        let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
         // Fixture roles select a workload, never the authenticated Wayland
         // identity: the compositor obtains that from the connected socket.
         let dynamic_role: &[u8] = match name {
@@ -1164,7 +1167,9 @@ impl Supervisor {
             &plan,
             super::exec_memory::StackInput {
                 random,
-                argv: if name == "xorg" {
+                argv: if image_name == "cosmic-comp" {
+                    cosmic_argv
+                } else if name == "xorg" {
                     xorg_argv
                 } else if name == "twm" {
                     twm_argv
@@ -1352,7 +1357,7 @@ impl Supervisor {
                 UserRequest::Execute(name) => {
                     #[cfg(feature = "ported")]
                     match self.launch_executable(name, shell.fs_mut()) {
-                        Ok(slot)=> writeln!(out,"\r\nELF pid={} started; ABI=Linux-{}-subset image AI_DIRECT model=8195 pages={}\r",self.runners[slot].status.pid,if process_arch::IMAGE_ABI==cyxia_posix::ImageAbi::Aarch64 {"AArch64"} else {process_arch::MACHINE},self.runners[slot].executable.pages()).unwrap(),
+                        Ok(slot)=> writeln!(out,"\r\nELF pid={} started; ABI=Linux-{}-subset image AI_DIRECT model={} pages={}\r",self.runners[slot].status.pid,if process_arch::IMAGE_ABI==cyxia_posix::ImageAbi::Aarch64 {"AArch64"} else {process_arch::MACHINE},self.runners[slot].executable.model(),self.runners[slot].executable.pages()).unwrap(),
                         Err(error)=>writeln!(out,"\r\nELF start failed: {error:?}\r").unwrap(),
                     }
                     #[cfg(not(feature = "ported"))]

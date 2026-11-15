@@ -14,7 +14,7 @@ ROOT = pc.ROOT
 VERSION = 2
 RUSTFLAGS = ['-C', 'relocation-model=static', '-C', 'code-model=large',
              '-C', 'no-redzone=yes', '-C', 'lto=off']
-DESKTOP_FEATURES = frozenset(('large-memory', 'rust-reactor-probe', 'rust-egl-probe',
+DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'rust-reactor-probe', 'rust-egl-probe',
     'mesa-probe', 'smithay-probe', 'smithay-wayland-probe', 'smithay-xdg-probe',
     'smithay-multi-probe', 'smithay-interactive-probe', 'smithay-resize-probe',
     'smithay-dynamic-probe', 'wayland-shm-probe'))
@@ -23,7 +23,7 @@ def select_features(*, graphics=False, ported=False, extras=()):
     extras = sorted(set(extras))
     pc.require(set(extras) <= DESKTOP_FEATURES, 'unsupported formal OS feature')
     pc.require(not extras or ported, 'desktop features require the ported catalog')
-    pc.require(not any(f != 'large-memory' for f in extras) or graphics,
+    pc.require(not any(f not in ('large-memory', 'full-os') for f in extras) or graphics,
                'desktop compositor features require graphics')
     return ['os-runtime'] + (['graphics'] if graphics else []) + (['ported'] if ported else []) + extras
 

@@ -105,8 +105,10 @@ PY
 
 按真实启动顺序，下一步已有以下明确工作，均不以 A03 为前置条件：
 
-1. 定义完整 OS 的地址空间和内存容量配置，一起调整镜像范围、栈位置、执行页池、
-   页索引及现有模型输入域；保留旧配置与证据。实测页数与栈冲突见上文。
+1. 镜像容量部分已完成：新增显式 full-os-v1 地址布局、实际执行页池和独立模型 8197，
+   同一个真实 ELF 已在客体两次执行并正常退出；旧配置保持不变。
+   正式启动还修复了 EPOLLPRI 注册兼容问题，当前实际停在 RuntimeDirNotSet。
+   详见 [完整 OS 镜像容量记录](v17-full-os-image-capacity-20261115.md)。
 2. 提供可写的绝对路径 `XDG_RUNTIME_DIR` 和真实 `flock` 生命周期/竞争语义。
    Wayland listener 的 `new_auto()` 在进入后端之前即要求两者；当前启动环境未提供该变量，
    x86 syscall 73 也未映射。已有 Unix bind/listen 可以复用。
@@ -116,7 +118,8 @@ PY
    但当前 16 个 FD、8 个线程尚未经完整合成器验证；D-Bus 总线进程、地址和服务顺序也需补齐。
    总线连接失败目前会记录日志，不能误报成无条件的后端初始化前崩溃。
 5. 将 cosmic-comp、完整 XKB rules/keycodes/types/compat/symbols 和字体纳入 x86 OS 包。
-   当前 rootfs 总文件上限 128，程序目录尚未注册合成器；单个 `.xkm` 不等于所需 XKB 数据。
+   当前 rootfs 总文件上限 128；合成器已注册到显式 cosmic-desktop 程序目录，
+   但单个 `.xkm` 不等于所需 XKB 数据。
    XKB 在后端成功后创建 seat 时加载，字体按实际文本使用验证。继续接入 cosmic-session、
    panel、launcher、terminal、files，再验证应用生命周期与重启后的数据持久性。
 

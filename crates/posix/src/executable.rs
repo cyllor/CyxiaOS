@@ -5,8 +5,11 @@
 //! Format references: <https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst>
 //! and <https://refspecs.linuxfoundation.org/elf/gabi4+/ch5.pheader.html>.
 
-pub const IMAGE_BASE: u64 = 0x0100_0000;
-pub const IMAGE_END: u64 = 0x0200_0000;
+use cyxia_contracts::user_layout::ImageProfile;
+
+/// Compatibility constants for the legacy 16-MiB image window.
+pub const IMAGE_BASE: u64 = ImageProfile::Legacy.layout().image_base;
+pub const IMAGE_END: u64 = ImageProfile::Legacy.layout().image_end;
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_LOADS: usize = 16;
 pub const MAX_HEADERS: usize = 64;
@@ -68,6 +71,7 @@ pub struct Page {
 #[derive(Debug)]
 pub struct Plan<'a> {
     pub abi: crate::ImageAbi,
+    pub profile: ImageProfile,
     pub entry: u64,
     pub phdr_address: u64,
     pub phnum: u16,
@@ -92,7 +96,8 @@ impl<'a> Plan<'a> {
     }
 
     pub fn pages(&self) -> impl Iterator<Item = Page> + '_ {
-        (IMAGE_BASE..IMAGE_END)
+        let layout = self.profile.layout();
+        (layout.image_base..layout.image_end)
             .step_by(PAGE_SIZE as usize)
             .filter_map(|address| {
                 self.loads()
@@ -210,6 +215,18 @@ pub fn parse(elf: &[u8]) -> Result<Plan<'_>, Error> {
 }
 
 pub fn parse_for(elf: &[u8], abi: crate::ImageAbi) -> Result<Plan<'_>, Error> {
+    parse_for_profile(elf, abi, ImageProfile::Legacy)
+}
+
+/// Validate an executable against an explicitly selected, versioned image window.
+/// The caller must use this same profile for backing capacity and process layout;
+/// validation does not grant or allocate any of the profile's memory.
+pub fn parse_for_profile(
+    elf: &[u8],
+    abi: crate::ImageAbi,
+    profile: ImageProfile,
+) -> Result<Plan<'_>, Error> {
+    let layout = profile.layout();
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01")
         || !matches!(elf.get(7), Some(0 | 3))
         || elf.get(8) != Some(&0)
@@ -234,6 +251,7 @@ pub fn parse_for(elf: &[u8], abi: crate::ImageAbi) -> Result<Plan<'_>, Error> {
     let headers = file_range(elf, offset, u64::from(phnum) * 56)?;
     let mut plan = Plan {
         abi,
+        profile,
         entry,
         phdr_address: 0,
         phnum,
@@ -264,7 +282,10 @@ pub fn parse_for(elf: &[u8], abi: crate::ImageAbi) -> Result<Plan<'_>, Error> {
                     return Err(Error::Alignment);
                 }
                 let end = h.address.checked_add(h.memory).ok_or(Error::Bounds)?;
-                if h.memory == 0 || h.files > h.memory || h.address < IMAGE_BASE || end > IMAGE_END
+                if h.memory == 0
+                    || h.files > h.memory
+                    || h.address < layout.image_base
+                    || end > layout.image_end
                 {
                     return Err(Error::Bounds);
                 }
@@ -355,10 +376,10 @@ pub fn parse_for(elf: &[u8], abi: crate::ImageAbi) -> Result<Plan<'_>, Error> {
     if let Some(h) = tls {
         if !matches!(h.flags, 4 | 6)
             || h.files > h.memory
-            || h.memory > IMAGE_END - IMAGE_BASE
+            || h.memory > layout.image_end - layout.image_base
             || !h.aligned()
-            || !(IMAGE_BASE..IMAGE_END).contains(&h.address)
-            || h.address.checked_add(h.memory).is_none_or(|end| end > IMAGE_END)
+            || !(layout.image_base..layout.image_end).contains(&h.address)
+            || h.address.checked_add(h.memory).is_none_or(|end| end > layout.image_end)
             // A zero-file-size TLS block is entirely .tbss; LLD may describe
             // it in alignment padding outside LOAD memory. libc zeroes each
             // thread's private block and must never read these template bytes.
@@ -466,7 +487,15 @@ pub fn build_stack_with_execfn(
     config: &StackConfig,
     execfn: &[u8],
 ) -> Result<InitialStack, Error> {
-    build_stack_for(stack, base, argv, envp, config, execfn, crate::ImageAbi::Aarch64)
+    build_stack_for(
+        stack,
+        base,
+        argv,
+        envp,
+        config,
+        execfn,
+        crate::ImageAbi::Aarch64,
+    )
 }
 
 /// Build the SysV argc/argv/auxv stack for the explicitly validated target ISA.
@@ -480,6 +509,33 @@ pub fn build_stack_for(
     execfn: &[u8],
     abi: crate::ImageAbi,
 ) -> Result<InitialStack, Error> {
+    build_stack_for_profile(
+        stack,
+        base,
+        argv,
+        envp,
+        config,
+        execfn,
+        abi,
+        ImageProfile::Legacy,
+    )
+}
+
+/// Build the entry stack for the same ISA and profile used to validate the image.
+/// The caller supplies its actual mapped stack buffer and virtual base; the
+/// profile selects the valid executable entry range, not a memory allocation.
+#[allow(clippy::too_many_arguments)] // Preserves the explicit ISA-aware stack interface.
+pub fn build_stack_for_profile(
+    stack: &mut [u8],
+    base: u64,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    config: &StackConfig,
+    execfn: &[u8],
+    abi: crate::ImageAbi,
+    profile: ImageProfile,
+) -> Result<InitialStack, Error> {
+    let layout = profile.layout();
     if !base.is_multiple_of(16)
         || base == 0
         || base.checked_add(stack.len() as u64).is_none()
@@ -492,7 +548,7 @@ pub fn build_stack_for(
         || config.phdr == 0
         || config.phnum == 0
         || usize::from(config.phnum) > MAX_HEADERS
-        || !(IMAGE_BASE..IMAGE_END).contains(&config.entry)
+        || !(layout.image_base..layout.image_end).contains(&config.entry)
         || !config.entry.is_multiple_of(abi.entry_alignment())
     {
         return Err(Error::Stack);

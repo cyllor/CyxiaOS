@@ -13,6 +13,9 @@ bench = false
 selftest = []
 # Long-running OS composition. Independent of bounded acceptance profiles.
 os-runtime = ["cyxia-arch-x86_64/runtime"]
+# Explicit x86 production image layout; preserves legacy runtime profiles.
+full-os = ["os-runtime", "ported", "large-memory", "cyxia-posix/full-os"]
+cosmic-desktop = ["full-os", "graphics"]
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]

@@ -216,6 +216,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(not egl or 'mesa-probe' in manifest['features'], 'EGL smoke requires the actual Mesa image')
         pc.require(scenario != 'smithay' or 'smithay-dynamic-probe' in manifest['features'],
                    'Smithay smoke requires actual server/client target images')
+        pc.require(scenario != 'cosmic-version' or 'cosmic-desktop' in manifest['features'],
+                   'COSMIC execution smoke requires the actual full-OS compositor image')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -248,6 +250,14 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                                    'Smithay image must be embedded in a read-only load')
                         embedded[name] = pc.sha_bytes(program)
                     result['smithay_embedded_sha256'] = embedded
+                if scenario == 'cosmic-version':
+                    program = (Path(manifest['sysroot']) / 'cosmic-comp.elf').read_bytes()
+                    kernel = (build / 'kernel.elf').read_bytes()
+                    pc.require(program and kernel.count(program) == 1 and
+                               any(program in kernel[load['offset']:load['offset']+load['size']]
+                                   for load in manifest['elf']['loads'] if not load['flags'] & 2),
+                               'exact COSMIC image must be embedded once in a read-only load')
+                    result['cosmic_embedded_sha256'] = pc.sha_bytes(program)
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err, env=pc.env())
                 console = Console(connect(path / 's.sock', process), process, output / 'serial.raw')
                 qmp = Qmp(connect(path / 'q.sock', process))
@@ -274,6 +284,16 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'cosmic-version':
+                    # Run the same real executable twice, proving teardown/reuse
+                    # as well as entry and normal return. This does not start a session.
+                    result['cosmic_executions'] = []
+                    for _ in range(2):
+                        at = console.program('posix exec cosmic-version', b'cosmic-comp ')
+                        admitted = console.until(rb'ELF pid=(\d+) started; ABI=Linux-x86_64-subset image AI_DIRECT model=8197 pages=(\d+)', at)
+                        result['cosmic_executions'].append(dict(pid=int(admitted.group(1)), pages=int(admitted.group(2))))
+                    console.program('posix exec probe', b'PORTED_PROBE PASS')
+                    result['scope'] = 'real cosmic-comp --version and image reuse; not compositor startup or a COSMIC session'
                 if egl: console.program('posix exec egl-probe', b'EGL_PROBE RESULT PASS mode=offscreen failures=0')
                 if not recover_disk:
                     console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=[2-9]'])
@@ -328,7 +348,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()

@@ -55,6 +55,12 @@ pub fn run(info: &PcBootInfo) -> ! {
     {
         crate::exec_memory::init_pc().expect("user executable pool");
         crate::shared_memory::init_pc().expect("user shared memory pool");
+        let profile = crate::exec_memory::PROFILE;
+        let layout = profile.layout();
+        let _ = writeln!(out, "USER_IMAGE_PROFILE name={} image_base={:#x} image_end={:#x} stack_base={:#x} stack_pages={} exec_pages={} heap_base={:#x} heap_pages={} reserved_exec_bytes={}",
+            profile.name(), layout.image_base, layout.image_end, layout.stack_base,
+            layout.stack_pages, layout.exec_pool_pages, cyxia_posix::vm::BASE,
+            cyxia_posix::vm::PAGE_COUNT, crate::exec_memory::RESERVED_BYTES);
     }
     let mut devices = unsafe { crate::devices::Devices::discover() }
         .expect("PC PCI discovery");

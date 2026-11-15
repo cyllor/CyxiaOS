@@ -452,6 +452,65 @@ fn executable_memory_policy_cannot_overcommit_image_arena() {
         }
     }
 }
+
+#[test]
+fn full_os_executable_policy_admits_real_cosmic_image_and_stack() {
+    // Measured linked cosmic-comp: 8,548 ELF LOAD pages plus 512 stack pages.
+    assert_eq!(
+        full_os_executable_memory_policy(16384, 9060),
+        Ok((true, 8197))
+    );
+    assert_eq!(executable_memory_policy(4096, 9060), Err(Error::Invalid));
+    assert_eq!(executable_memory_policy(4096, 20), Ok((true, 8195)));
+}
+
+#[test]
+fn full_os_executable_policy_rejects_invalid_inputs_and_preserves_reserve() {
+    assert_eq!(
+        full_os_executable_memory_policy(16384, 16384),
+        Ok((false, 8197))
+    );
+    assert_eq!(full_os_executable_memory_policy(0, 1), Ok((false, 8197)));
+    assert_eq!(full_os_executable_memory_policy(16384, 1), Ok((true, 8197)));
+    for (free, requested) in [
+        (16385, 1),
+        (u32::MAX, 1),
+        (16384, 0),
+        (16384, 16385),
+        (16384, u32::MAX),
+    ] {
+        assert_eq!(
+            full_os_executable_memory_policy(free, requested),
+            Err(Error::Invalid)
+        );
+    }
+}
+
+#[test]
+fn full_os_executable_policy_quantized_boundaries_never_overcommit() {
+    // Every possible quantized input, with both physical endpoints. This catches
+    // optimistic request rounding, optimistic free rounding and unsafe weights.
+    for free_units in 0..=256 {
+        let free_low = free_units * 64;
+        let free_high = (free_low + 63).min(16384);
+        for requested_units in 1..=256 {
+            let requested_low = (requested_units - 1) * 64 + 1;
+            let requested_high = requested_units * 64;
+            let reference = full_os_executable_memory_policy(free_low, requested_high).unwrap();
+            assert_eq!(reference.1, 8197);
+            for free in [free_low, free_high] {
+                for requested in [requested_low, requested_high] {
+                    let decision = full_os_executable_memory_policy(free, requested).unwrap();
+                    assert_eq!(decision, reference, "free={free} requested={requested}");
+                    assert!(
+                        !decision.0 || requested < free,
+                        "free={free} requested={requested}"
+                    );
+                }
+            }
+        }
+    }
+}
 #[test]
 fn isolated_process_selection_uses_model_and_bounds_starvation() {
     let io = UserCandidate {

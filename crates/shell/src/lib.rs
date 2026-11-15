@@ -291,6 +291,8 @@ impl Shell {
                         "smithay-dynamic-b" => "smithay-dynamic-b",
                         "smithay-dynamic-c" => "smithay-dynamic-c",
                         "smithay-dynamic-reject" => "smithay-dynamic-reject",
+                        "cosmic-comp" => "cosmic-comp",
+                        "cosmic-version" => "cosmic-version",
                         "rust-egl-probe" => "rust-egl-probe",
                         "fd-share-probe" => "fd-share-probe",
                         "scm-probe" => "scm-probe",
@@ -365,6 +367,7 @@ impl Shell {
             }
             "help" => {
                 no_args(rest)?;
+                writeln!(out, "posix exec cosmic-comp | cosmic-version (COSMIC startup or version, when installed)\r")?;
                 write!(
                     out,
                     "posix run demo|preempt|fault|spin|readonly|execdata|kernel|guard | posix status|list|kill [PID]\r\nposix spawn idle|spin|fault|heap|heapfault|paint|fpu|heapexec | posix pair (native Rust IPC check)\r\nposix exec probe|xau-probe|socket-probe|signal-probe|desktop-api-probe|pipe-probe|file-probe|thread-probe|spawn-probe|glib-spawn-probe (ported/test builds)\r\nposix exec xorg|twm|openbox|x11-probe|x11-interactive|x11-demo|gtk-probe|gtk-smoke|pcmanfm|pcmanfm-home|pcmanfm-desktop|lxpanel|cyxia-save|x11-inspect (desktop profiles)\r\nmem status|alloc|free|peek|poke|list | proc spawn|list|pause|resume|kill|reap\r\ndev list|write|read|batch|requests|cancel|reap|enable|disable | ai system|resources|audit\r\nhelp | pwd | cd PATH | ls [PATH] | mkdir PATH | touch PATH\r\nwrite PATH TEXT | append PATH TEXT | cat PATH | stat PATH\r\nrm PATH | rmdir PATH | df | ai status|cache|train|apply|rollback\r\nstorage status|checkpoint (dedicated raw disk; wait for STORAGE_DURABLE)\r\nPaths: UTF-8; shell path arguments cannot contain spaces. Text is literal UTF-8 (no quotes).\r\nCatalog user programs and Rust services; no shell pipelines or scripts. Ctrl+C cancels.\r\n"

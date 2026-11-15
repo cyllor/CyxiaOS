@@ -6,13 +6,22 @@ use cyxia_ai_runtime::accounting::Attempt;
 #[cfg(target_arch = "aarch64")]
 use cyxia_contracts::BootInfo;
 use cyxia_contracts::{PageCount, RedemptionId};
+use cyxia_contracts::user_layout::ImageProfile;
 use cyxia_kernel_core::grants::{AuthorizedGrantRequest, GrantLedger, Owner, ReleaseReceipt};
 use cyxia_posix::{
     Errno,
     executable::{self, Plan, StackConfig},
     usermem::MAX_PROCESSES,
 };
-const PAGES: usize = 4096;
+#[cfg(feature = "full-os")]
+pub const PROFILE: ImageProfile = ImageProfile::FullOsV1;
+#[cfg(not(feature = "full-os"))]
+pub const PROFILE: ImageProfile = ImageProfile::Legacy;
+const LAYOUT: cyxia_contracts::user_layout::ImageLayout = PROFILE.layout();
+const PAGES: usize = LAYOUT.exec_pool_pages;
+const IMAGE_TABLES: usize = LAYOUT.image_pages() / 512;
+const _: () = assert!(LAYOUT.image_pages() <= PAGES && PAGES < u16::MAX as usize);
+const _: () = assert!(LAYOUT.stack_pages <= 512 && LAYOUT.stack_base % 0x200000 == 0);
 const BYTES: u64 = PAGES as u64 * 4096;
 pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
 #[cfg(target_arch = "aarch64")]
@@ -20,8 +29,8 @@ const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + super::user_heap::RESERVED_BYTES + RESERVED_BYTES
         <= cyxia_platform_virt::USER_RAM_END
 );
-pub const STACK_BASE: u64 = 0x03000000;
-pub const STACK_PAGES: usize = 64;
+pub const STACK_BASE: u64 = LAYOUT.stack_base;
+pub const STACK_PAGES: usize = LAYOUT.stack_pages;
 static POOL: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "aarch64")]
@@ -38,30 +47,35 @@ pub struct StackInput<'a> {
     pub execfn: &'a [u8],
 }
 pub struct ExecMemory {
-    tables: [Table; 8],
+    tables: [Table; IMAGE_TABLES],
     stack_table: Table,
     slots: [u16; PAGES],
     permissions: [u8; PAGES],
     base: u64,
     pages: u32,
+    model: u64,
     ledger: GrantLedger,
     lease: Option<(Owner, RedemptionId)>,
 }
 impl ExecMemory {
     pub const fn new() -> Self {
         Self {
-            tables: [const { Table::empty() }; 8],
+            tables: [const { Table::empty() }; IMAGE_TABLES],
             stack_table: Table::empty(),
             slots: [0; PAGES],
             permissions: [0; PAGES],
             base: 0,
             pages: 0,
+            model: 0,
             ledger: GrantLedger::new(PageCount(PAGES as u32)),
             lease: None,
         }
     }
     pub fn pages(&self) -> u32 {
         self.pages
+    }
+    pub fn model(&self) -> u64 {
+        self.model
     }
     pub fn free(&self) -> u32 {
         self.ledger.snapshot().free
@@ -102,6 +116,9 @@ impl ExecMemory {
         stack_input: StackInput<'_>,
         attempt: &mut Attempt,
     ) -> Result<u64, Errno> {
+        if plan.profile != PROFILE {
+            return Err(Errno::Inval);
+        }
         if self.lease.is_some() || slot >= MAX_PROCESSES {
             return Err(Errno::Busy);
         }
@@ -113,10 +130,14 @@ impl ExecMemory {
         if count > PAGES || plan.pages().any(|p| !p.permissions.read) {
             return Err(Errno::Inval);
         }
-        attempt.proposed(8195);
-        let (allowed, model) =
-            cyxia_ai_runtime::executable_memory_policy(PAGES as u32, count as u32)
-                .map_err(|_| Errno::Io)?;
+        attempt.proposed(match PROFILE {
+            ImageProfile::Legacy => 8195,
+            ImageProfile::FullOsV1 => cyxia_ai_runtime::FULL_OS_EXEC_MODEL_ID,
+        });
+        let (allowed, model) = match PROFILE {
+            ImageProfile::Legacy => cyxia_ai_runtime::executable_memory_policy(PAGES as u32, count as u32),
+            ImageProfile::FullOsV1 => cyxia_ai_runtime::full_os_executable_memory_policy(PAGES as u32, count as u32),
+        }.map_err(|_| Errno::Io)?;
         attempt.decided(allowed, model);
         if !allowed {
             return Err(Errno::Nomem);
@@ -134,6 +155,7 @@ impl ExecMemory {
         ai::record(Domain::Elf, |c| c.grant(count as u64));
         self.base = pool + slot as u64 * BYTES;
         self.pages = count as u32;
+        self.model = model;
         // Boot-reserved private RAM, no current user-root/DMA aliases; zero before
         // recording final mappings. Tables are not published until load returns.
         unsafe {
@@ -141,7 +163,7 @@ impl ExecMemory {
         }
         let result = (|| {
             for (physical, page) in plan.pages().enumerate() {
-                let i = ((page.address - executable::IMAGE_BASE) / 4096) as usize;
+                let i = ((page.address - LAYOUT.image_base) / 4096) as usize;
                 self.slots[i] = (physical + 1) as u16;
                 self.permissions[i] = 1
                     | if page.permissions.write { 2 } else { 0 }
@@ -176,7 +198,7 @@ impl ExecMemory {
                     STACK_PAGES * 4096,
                 )
             };
-            let initial = executable::build_stack_for(
+            let initial = executable::build_stack_for_profile(
                 stack,
                 STACK_BASE,
                 stack_input.argv,
@@ -194,6 +216,7 @@ impl ExecMemory {
                 },
                 stack_input.execfn,
                 plan.abi,
+                PROFILE,
             )
             .map_err(|_| Errno::Inval)?;
             // Arm requires explicit D/I cache synchronization. x86 coherent
@@ -219,10 +242,10 @@ impl ExecMemory {
                 4096 - offset,
             ));
         }
-        if !(executable::IMAGE_BASE..executable::IMAGE_END).contains(&address) {
+        if !(LAYOUT.image_base..LAYOUT.image_end).contains(&address) {
             return Err(Errno::Fault);
         }
-        let i = ((address - executable::IMAGE_BASE) / 4096) as usize;
+        let i = ((address - LAYOUT.image_base) / 4096) as usize;
         if self.slots[i] == 0 || (write && self.permissions[i] & 2 == 0) {
             return Err(Errno::Fault);
         }
@@ -284,17 +307,17 @@ impl ExecMemory {
         let len = len.checked_add(4095).ok_or(Errno::Inval)? & !4095;
         self.validate(address, len, false)?;
         let end = address.checked_add(len as u64).ok_or(Errno::Inval)?;
-        if address < executable::IMAGE_BASE || end > executable::IMAGE_END {
+        if address < LAYOUT.image_base || end > LAYOUT.image_end {
             return Err(Errno::Access);
         }
         for at in (address..end).step_by(4096) {
-            let i = ((at - executable::IMAGE_BASE) / 4096) as usize;
+            let i = ((at - LAYOUT.image_base) / 4096) as usize;
             if (prot as u8) & !self.permissions[i] != 0 {
                 return Err(Errno::Access);
             }
         }
         for at in (address..end).step_by(4096) {
-            let i = ((at - executable::IMAGE_BASE) / 4096) as usize;
+            let i = ((at - LAYOUT.image_base) / 4096) as usize;
             self.permissions[i] = prot as u8;
             self.tables[i / 512]
                 .set(
@@ -332,6 +355,7 @@ impl ExecMemory {
             self.slots.fill(0);
             self.permissions.fill(0);
             self.pages = 0;
+            self.model = 0;
         }
     }
 }
@@ -355,7 +379,7 @@ impl ExecMemory {
             return Ok(());
         }
         for (index, table) in self.tables.iter().enumerate() {
-            table.publish(space, executable::IMAGE_BASE + index as u64 * 0x200000)?;
+            table.publish(space, LAYOUT.image_base + index as u64 * 0x200000)?;
         }
         self.stack_table.publish(space, STACK_BASE)
     }

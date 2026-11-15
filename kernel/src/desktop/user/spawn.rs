@@ -237,7 +237,7 @@ impl Supervisor {
             .iter()
             .find(|(_, p, _)| *p == resolved.as_str())
             .ok_or(Errno::Noent)?;
-        let plan = executable::parse_for(bytes, crate::process_arch::IMAGE_ABI)
+        let plan = executable::parse_for_profile(bytes, crate::process_arch::IMAGE_ABI, super::super::exec_memory::PROFILE)
             .map_err(|_| Errno::Inval)?;
         let cwd = request
             .cwd_len
@@ -338,7 +338,10 @@ impl Supervisor {
             auto_reap: request.flags & 1 != 0,
         });
         super::ai::record(super::ai::Domain::SpawnReceipt, |c| c.grant(1));
+        #[cfg(not(feature = "full-os"))]
         super::super::log(b"SPAWN_CHILD pid,parent AI_DIRECT model=8193 image_model=8195\n");
+        #[cfg(feature = "full-os")]
+        super::super::log(b"SPAWN_CHILD pid,parent AI_DIRECT model=8193 image_model=8197\n");
         super::super::hex(child_pid as u64);
         super::super::hex(parent_pid as u64);
         Ok(child_pid)
