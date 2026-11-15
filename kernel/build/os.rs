@@ -76,7 +76,7 @@ fn catalog(root: &Path, out: &Path) {
         .unwrap_or_else(|| root.join("artifacts/sysroot/x86_64-musl"));
     let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "signal-probe", "desktop-api-probe",
         "pipe-probe", "file-probe", "clock-probe", "event-probe", "timerfd-probe", "edge-probe", "fd-share-probe", "scm-probe",
-        "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe"];
+        "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe", "thread-exit-probe"];
     let mut required = vec!["probe"];
     for (flag, images) in [
         ("rust-reactor-probe", &["rust-reactor-probe"][..]), ("rust-egl-probe", &["rust-egl-probe"][..]),

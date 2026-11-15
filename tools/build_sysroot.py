@@ -56,6 +56,7 @@ PROBES = {
     "flock-probe": ("flock_probe.c", []),
     "nested-epoll-probe": ("nested_epoll_probe.c", []),
     "inotify-probe": ("inotify_probe.c", []),
+    "thread-exit-probe": ("thread_exit_probe.c", []),
     "scm-probe": ("scm_probe.c", []),
     "memfd-probe": ("memfd_probe.c", []),
     "cyxia-save": ("cyxia_save.c", ["-lX11", "-lxcb", "-lXau"]),

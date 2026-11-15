@@ -263,7 +263,7 @@ impl Context {
         Ok(())
     }
 }
-fn user_address(value: u64) -> Result<(), Error> {
+pub(crate) fn user_address(value: u64) -> Result<(), Error> {
     if !(4096..0x0000_8000_0000_0000).contains(&value) {
         Err(Error::Address)
     } else {

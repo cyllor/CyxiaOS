@@ -1061,6 +1061,8 @@ impl Supervisor {
             "gtk-probe"
         } else if matches!(name, "pcmanfm-desktop" | "pcmanfm-home") {
             "pcmanfm"
+        } else if name == "thread-exit-bad-stack" {
+            "thread-exit-probe"
         } else if name == "cosmic-version" {
             "cosmic-comp"
         } else if matches!(
@@ -1175,6 +1177,7 @@ impl Supervisor {
             b"--config-file",
             b"/etc/xdg/openbox/rc.xml",
         ];
+        let bad_stack_argv: &[&[u8]] = &[path.as_bytes(), b"bad-stack"];
         let egl_x11_argv: &[&[u8]] = &[path.as_bytes(), b"x11"];
         let sp = match runner.executable.load(
             slot,
@@ -1182,7 +1185,9 @@ impl Supervisor {
             &plan,
             super::exec_memory::StackInput {
                 random,
-                argv: if image_name == "cosmic-comp" {
+                argv: if name == "thread-exit-bad-stack" {
+                    bad_stack_argv
+                } else if image_name == "cosmic-comp" {
                     cosmic_argv
                 } else if name == "xorg" {
                     xorg_argv

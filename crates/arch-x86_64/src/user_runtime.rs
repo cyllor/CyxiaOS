@@ -117,14 +117,12 @@ pub unsafe fn resume(
         return Err(Error::NotReady);
     }
     let entry = space.translate(context.pc()).ok_or(Error::Mapping)?;
-    let stack = space
-        .translate(context.sp().checked_sub(1).ok_or(Error::Address)?)
-        .ok_or(Error::Mapping)?;
-    if !entry.permissions.executable
-        || entry.permissions.writable
-        || !stack.permissions.writable
-        || stack.permissions.executable
-    {
+    // musl's detached-thread tail unmaps its own stack/TLS before SYS_exit.
+    // IRET restores RSP without accessing that memory. Keep its user-range
+    // guard (a noncanonical RSP could fault in CPL0), and let ordinary CPL3
+    // memory accesses enforce page permissions when a stack is actually used.
+    user_address(context.sp())?;
+    if !entry.permissions.executable || entry.permissions.writable {
         return Err(Error::Mapping);
     }
     let flags: u64;

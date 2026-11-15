@@ -119,12 +119,12 @@ def object_snapshot(console):
     console.until(rb'AI_SYSTEM_END\r?\n', at)
     return objects(bytes(console.raw[at:]))
 
-def reclaimed_probe(console, pid, before_objects):
+def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0):
     from verify_ported import parse_processes
-    console.until(rb'pid=' + pid + rb' Exited code=0\b')
+    console.until(rb'pid=' + pid + b' ' + state.encode() + rb' code=' + str(code).encode() + rb'\b')
     at = console.command('posix list')
     process = parse_processes(bytes(console.raw[at:]))[int(pid)]
-    for name, expected in dict(state='Exited', code=0, free_pages=64, heap_pages=0,
+    for name, expected in dict(state=state, code=code, free_pages=64, heap_pages=0,
                                image_pages=0, thread_count=0, heap_free=4096,
                                image_free=16384).items():
         pc.require(process.get(name) == expected, 'probe did not reclaim ' + name)
@@ -211,6 +211,29 @@ def inotify_checks(console):
         phases.append(dict(phase=phase, waits_before=before, waits_after=after))
     console.until(rb'INOTIFY_PROBE PASS', start)
     return dict(reclaimed_probe(console, pid, before_objects), phases=phases)
+
+def thread_exit_checks(console, *, bad_stack=False):
+    before = object_snapshot(console)
+    pc.require(before['live'] == before['references'] == 0, 'thread capture begins with live objects')
+    start = console.command('posix exec ' + ('thread-exit-bad-stack' if bad_stack else 'thread-exit-probe'))
+    pid = console.until(rb'ELF pid=(\d+) started;', start).group(1)
+    if bad_stack:
+        console.until(rb'THREAD_EXIT_PROBE BAD_STACK BEGIN', start)
+        result = reclaimed_probe(console, pid, before, state='Fault', code=139)
+        pc.require(result['process']['esr'] == result['process']['far'] == 0,
+                   'bad stack caused an actual CPU fault instead of safe entry refusal')
+    else:
+        first = console.until(rb'THREAD_EXIT_PROBE DETACHED_EXIT PASS|pid=' + pid +
+                              rb' (?:Fault|Exited) code=\d+\b', start)
+        pc.require(first.group(0) == b'THREAD_EXIT_PROBE DETACHED_EXIT PASS',
+                   'detached-thread teardown ended the process before completing')
+        for phase in ('DETACHED_EXIT', 'JOIN_REUSE'):
+            console.until(('THREAD_EXIT_PROBE ' + phase + ' PASS').encode(), start)
+        console.until(rb'THREAD_EXIT_PROBE PASS', start)
+        result = reclaimed_probe(console, pid, before)
+        pc.require(result['process']['thread_admissions'] == 5 and result['process']['thread_peak'] == 2,
+                   'missing actual repeated detached exit and join reuse')
+    return dict(result, bad_stack=bad_stack)
 
 def syscall_probe_inputs(prefix, name):
     from build_sysroot import inspect_elf, PROBES
@@ -399,6 +422,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         pc.require(scenario != 'inotify' or ('full-os' in manifest['features'] and
                    'inotify-probe.elf' in manifest['external_inputs']),
                    'inotify smoke requires full-OS runtime and the actual syscall probe')
+        pc.require(scenario != 'thread-exit' or ('full-os' in manifest['features'] and
+                   'thread-exit-probe.elf' in manifest['external_inputs']),
+                   'thread-exit smoke requires full-OS runtime and actual musl probe')
         output = pc.fresh_output(output)
         producer = Path(__file__).read_bytes()
         helpers = os_x86.producer_sources(__file__)
@@ -434,6 +460,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario == 'inotify':
                     result['inotify_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'inotify-probe')
                     result['inotify_embedded_sha256'] = embedded_images(build, manifest, ('inotify-probe.elf',))['inotify-probe.elf']
+                if scenario == 'thread-exit':
+                    result['thread_exit_build_inputs'] = syscall_probe_inputs(manifest['sysroot'], 'thread-exit-probe')
+                    result['thread_exit_embedded_sha256'] = embedded_images(build, manifest, ('thread-exit-probe.elf',))['thread-exit-probe.elf']
                 process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err, env=pc.env())
                 console = Console(connect(path / 's.sock', process), process, output / 'serial.raw')
                 qmp = Qmp(connect(path / 'q.sock', process))
@@ -463,6 +492,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
+                if scenario == 'thread-exit':
+                    result['thread_exit'] = [thread_exit_checks(console), thread_exit_checks(console, bad_stack=True), thread_exit_checks(console)]
                 if scenario == 'inotify': result['inotify'] = [inotify_checks(console), inotify_checks(console)]
                 if scenario == 'nested-epoll': result['nested_epoll'] = [nested_epoll_checks(console), nested_epoll_checks(console)]
                 if scenario == 'flock':
@@ -540,6 +571,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                         if scenario == 'inotify':
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'inotify-probe') == result['inotify_build_inputs'],
                                        'inotify source/build inputs changed during VM')
+                        if scenario == 'thread-exit':
+                            pc.require(syscall_probe_inputs(manifest['sysroot'], 'thread-exit-probe') == result['thread_exit_build_inputs'],
+                                       'thread-exit source/build inputs changed during VM')
                         pc.require(result.get('returncode') == 0, 'QEMU did not exit normally')
                     except Exception as changed:
                         result.update(status='FAIL', error=repr(changed))
@@ -550,7 +584,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify'], default='core')
+    parser.add_argument('--scenario', choices=['core', 'native', 'ported', 'parallel', 'smithay', 'cosmic-version', 'flock', 'nested-epoll', 'inotify', 'thread-exit'], default='core')
     parser.add_argument('--recover-disk', type=Path)
     parser.add_argument('--egl', action='store_true')
     args = parser.parse_args()
