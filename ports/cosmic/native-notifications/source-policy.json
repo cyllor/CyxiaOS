@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-notifications",
+  "repository": "https://github.com/pop-os/cosmic-notifications",
+  "commit": "1e4c1f11fdcae273d6954fd0bfc54749a6145267",
+  "source_lock_sha256": "448b38cb6bff1447d0b4fcd3b2f5bafa0b0c72d5200174f2932887eea831953b",
+  "before": {
+    ".cargo/config.toml": "4072d29c310893343e33c041ca58f1a47b43540234474d5cf8bdd6589f8753c3"
+  },
+  "after": {
+    ".cargo/config.toml": null
+  },
+  "rust_flags": ["--cfg", "tokio_unstable"],
+  "rustdoc_flags": ["--cfg", "tokio_unstable"]
+}

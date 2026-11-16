@@ -6,7 +6,12 @@ use crate::{
     epoll::{ERR, HUP, IN, OUT},
 };
 
+#[cfg(feature = "full-os")]
+pub const PIPES: usize = 32;
+#[cfg(not(feature = "full-os"))]
 pub const PIPES: usize = 8;
+// Handles reserve their low byte for the slot index and endpoint direction.
+const _: () = assert!(PIPES <= 128);
 pub const PIPE_BUF: usize = 4096;
 pub const CAPACITY: usize = PIPE_BUF;
 const GENERATION_MAX: u64 = u64::MAX >> 8;
@@ -282,6 +287,69 @@ impl Pipes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_slot_preserves_identity_ownership_and_clean_reuse() {
+        let mut pipes = Pipes::new();
+        let mut handles = [[0; 2]; PIPES];
+        for (index, pair) in handles.iter_mut().enumerate() {
+            *pair = pipes.pair(10).unwrap();
+            pipes.set_flags(10, pair[0], crate::O_NONBLOCK).unwrap();
+            pipes.set_flags(10, pair[1], crate::O_NONBLOCK).unwrap();
+            assert_eq!(pipes.write(10, pair[1], &[index as u8, 0xa5]), Ok(2));
+            pipes.share(10, pair[0], 20).unwrap();
+            pipes.share(10, pair[1], 20).unwrap();
+        }
+        assert_eq!(pipes.free(), 0);
+        assert_eq!(pipes.pair(30), Err(Errno::Nospc));
+        for (index, pair) in handles.iter().enumerate() {
+            assert_ne!(pair[0], pair[1]);
+            for other in &handles[..index] {
+                assert!(!other.contains(&pair[0]));
+                assert!(!other.contains(&pair[1]));
+            }
+        }
+
+        pipes.close_owner(10);
+        assert_eq!(pipes.free(), 0);
+        for (index, [read, write]) in handles.iter().copied().enumerate() {
+            assert_eq!(pipes.read(10, read, &mut [0; 2]), Err(Errno::Badf));
+            assert_eq!(pipes.write(10, write, b"x"), Err(Errno::Badf));
+            let mut bytes = [0; 2];
+            assert_eq!(pipes.read(20, read, &mut bytes), Ok(2));
+            assert_eq!(bytes, [index as u8, 0xa5]);
+            assert_eq!(pipes.flags(20, write), Ok(crate::O_WRONLY | crate::O_NONBLOCK));
+            // Leave bytes and notifications queued when the final holder exits.
+            assert_eq!(pipes.write(20, write, b"stale"), Ok(5));
+        }
+        pipes.close_owner(20);
+        assert_eq!(pipes.free(), PIPES);
+
+        for (index, [old_read, old_write]) in handles.iter().copied().enumerate() {
+            let [read, write] = pipes.pair(30).unwrap();
+            assert_ne!(read, old_read);
+            assert_ne!(write, old_write);
+            assert_eq!(pipes.read(30, old_read, &mut [0; 1]), Err(Errno::Badf));
+            assert_eq!(pipes.write(30, old_write, b"x"), Err(Errno::Badf));
+            assert_eq!(pipes.close(30, old_read), Err(Errno::Badf));
+            assert_eq!(pipes.pending(30, read), Ok(0));
+            assert_eq!(pipes.read(30, read, &mut [0; 1]), Err(Errno::Again));
+            assert_eq!(pipes.flags(30, read), Ok(crate::O_RDONLY));
+            assert_eq!(pipes.flags(30, write), Ok(crate::O_WRONLY));
+            assert_eq!(pipes.poll(30, read), Ok(0));
+            assert_eq!(pipes.poll(30, write), Ok(0x104));
+            assert_eq!(pipes.wake_mask(30, read), Ok(0));
+            assert_eq!(pipes.wake_mask(30, write), Ok(0));
+            assert_eq!(pipes.write(30, write, &[index as u8]), Ok(1));
+            let mut byte = [0];
+            assert_eq!(pipes.read(30, read, &mut byte), Ok(1));
+            assert_eq!(byte, [index as u8]);
+        }
+        assert_eq!(pipes.free(), 0);
+        assert_eq!(pipes.pair(30), Err(Errno::Nospc));
+        pipes.close_owner(30);
+        assert_eq!(pipes.free(), PIPES);
+    }
+
     #[test]
     fn wake_notifications_survive_ready_levels_and_respect_lifetime() {
         use crate::epoll::{HUP, IN, OUT};

@@ -1,7 +1,17 @@
 //! CPU0 foreground pipe admission and storage, independent of the socket pool.
 use cyxia_posix::{Errno, pipe::Pipes};
+use core::fmt::Write;
 
 static mut PIPES: Pipes = Pipes::new();
+
+pub(super) fn status(out: &mut impl Write) {
+    // SAFETY: this snapshot runs on the same CPU0 foreground as pool mutation.
+    let free = unsafe { (&*core::ptr::addr_of!(PIPES)).free() };
+    let capacity = cyxia_posix::pipe::PIPES;
+    let _ = writeln!(out,
+        "PIPE_POOL capacity={} unavailable={} free={} bytes_per_pair={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r",
+        capacity, capacity - free, free, cyxia_posix::pipe::CAPACITY);
+}
 
 pub(super) fn with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: CPU0 foreground serializes all operations. IRQ/DMA cannot access

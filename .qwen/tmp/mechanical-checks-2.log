@@ -1,0 +1,144 @@
+=== KERNEL CHECK (aarch64-unknown-none-softfloat, smp-selftest) ===
+    Checking cfg-if v1.0.5
+    Checking cpufeatures v0.2.17
+   Compiling cyxia-kernel v0.1.0 (/Users/robin/CyxiaOS-V0.16/kernel)
+    Checking cyxia-driver-virtio v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/driver-virtio)
+   Compiling generic-array v0.14.7
+    Checking cyxia-ai-fs v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/ai-fs)
+    Checking cyxia-kernel-core v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/kernel-core)
+    Checking cyxia-arch-aarch64 v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/arch-aarch64)
+    Checking cyxia-driver-pl011 v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/driver-pl011)
+    Checking cyxia-driver-gicv2 v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/driver-gicv2)
+    Checking cyxia-platform-virt v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/platform-virt)
+    Checking cyxia-posix v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/posix)
+    Checking cyxia-ai-runtime v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/ai-runtime)
+    Checking cyxia-shell v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/shell)
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking cyxia-prototype v0.1.0 (/Users/robin/CyxiaOS-V0.16/crates/prototype)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.99s
+KERNEL_CHECK_EXIT=0
+=== FULL TEST ===
+     Running unittests src/lib.rs (target/debug/deps/cyxia_ai_fs-aec24fcee33db81c)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_ai_runtime-25d61b661c5648fb)
+test tests::task_and_request_capacity_errors_do_not_leak ... ok
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_arch_aarch64-3dbf605eb50c9a85)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/descriptors.rs (target/debug/deps/descriptors-13c4a3798449014e)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_cluster_transport-ba994c6146115bb7)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/checkpoints.rs (target/debug/deps/checkpoints-50287e3a7c365d24)
+test receive_error_preserves_checkpoints_and_poisoning_without_retry ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/crypto.rs (target/debug/deps/crypto-13d9ae9d6be63fd2)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/discovery.rs (target/debug/deps/discovery-ac80182d49fa1034)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/discovery_network.rs (target/debug/deps/discovery_network-50171d00b199ce3c)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/network.rs (target/debug/deps/network-72e9405b295dd189)
+test reconnect_retains_backoff_and_entropy_gates_for_terminal_errors ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/tls.rs (target/debug/deps/tls-3153d8e9e73acef5)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_contracts-4a1dab274e517072)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ids.rs (target/debug/deps/ids-8ec6b171ee2d4d8d)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/source.rs (target/debug/deps/source-5eb20d66b5025a65)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/transport.rs (target/debug/deps/transport-84cbffe9b096abe6)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_control_model-b447111abfdd4fde)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/model.rs (target/debug/deps/model-1c7629a6f8b0537a)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_driver_gicv2-da4e83ec80a8f6c4)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/route.rs (target/debug/deps/route-c76bb7bfecc4ca23)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_driver_pl011-4498b5227ace0556)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_driver_virtio-550e3f051ae2a07c)
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_kernel_core-2a7bf6a6975cf018)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/atomic_grants.rs (target/debug/deps/atomic_grants-2de5ba1143a1ba3b)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/cluster.rs (target/debug/deps/cluster-12907eded0a3eeb8)
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+     Running tests/control_plane.rs (target/debug/deps/control_plane-76f29a8921abd0f0)
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/control_service.rs (target/debug/deps/control_service-6fc8c04273dfa46a)
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/dispatch.rs (target/debug/deps/dispatch-b582ba4c18bd880f)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/frames.rs (target/debug/deps/frames-9d716ce5d48753ac)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/grants.rs (target/debug/deps/grants-9ade57dd94ef7aad)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_store.rs (target/debug/deps/native_store-1b361120c3aa55d4)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+     Running tests/service_image.rs (target/debug/deps/service_image-4afde7d8d7d9d7a2)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/service_restart.rs (target/debug/deps/service_restart-f07bea47db877502)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/task_admission.rs (target/debug/deps/task_admission-6a4769d35db80bb5)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/time.rs (target/debug/deps/time-3426e704ea0b67c4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_peer_billing-3dfcf4a9423bb4c9)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ledger.rs (target/debug/deps/ledger-5653670c51cbe21c)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_archive_packet.rs (target/debug/deps/native_archive_packet-211fb3fdaac62b36)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_attempt.rs (target/debug/deps/native_attempt-f4cdc9771c0cd4d4)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/native_late_archive.rs (target/debug/deps/native_late_archive-6a15a67b1d356c27)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+     Running tests/protocol.rs (target/debug/deps/protocol-ddf14ec8f470f630)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_platform_virt-6776d3436af32f85)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/fdt.rs (target/debug/deps/fdt-b589668c3ff60eb2)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/user_pools.rs (target/debug/deps/user_pools-e270d9ee72ca288c)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_posix-7e6cf75f47a5d6d5)
+test executable::tests::hostile_header_field_mutations_return_errors_without_panics ... ok
+test pty::tests::wake_notifications_preserve_partial_write_and_error_record_progress ... ok
+test shared_memory::tests::write_seal_without_mappings_is_supported_and_errors_are_atomic ... ok
+test tests::short_io_bounds_errors_and_no_offset_advance_on_failure ... ok
+test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running tests/fcntl_status.rs (target/debug/deps/fcntl_status-56af090b515da5d2)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/linux_socket_compat.rs (target/debug/deps/linux_socket_compat-438f7a860a54d54e)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/pty_echo_bounds.rs (target/debug/deps/pty_echo_bounds-46f20fd15a047375)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/unix.rs (target/debug/deps/unix-f987636f7b33482a)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cyxia_prototype-311d7106ea39b676)
+test learning::reward::bounded_cost::tests::cpu_coverage_boundaries_missing_evidence_and_numeric_errors_stay_identical ... ok
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/a10_cache_admission.rs (target/debug/deps/a10_cache_admission-07a040bbd22821b4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+     Running tests/application_request_diagnostic.rs (target/debug/deps/application_request_diagnostic-69e828df67d47330)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/boot.rs (target/debug/deps/boot-7cab8a85fa554ad2)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+     Running tests/boot_fault_matrix.rs (target/debug/deps/boot_fault_matrix-d240dd60febf1733)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+     Running tests/boot_model.rs (target/debug/deps/boot_model-04b945ba305f1f1b)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/cluster_engine.rs (target/debug/deps/cluster_engine-7110b70342bab5ac)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/cluster_volume.rs (target/debug/deps/cluster_volume-eaaaaa161ed2ca28)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+=== DONE ===

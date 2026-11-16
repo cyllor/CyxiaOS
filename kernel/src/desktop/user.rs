@@ -1099,6 +1099,8 @@ impl Supervisor {
             "cosmic-session"
         } else if matches!(name, "theme-defaults-light" | "theme-defaults-dark") {
             "theme-defaults"
+        } else if name == "pipe-capacity-legacy" {
+            "pipe-capacity-probe"
         } else if name == "filesystem-probe-verify" {
             "filesystem-probe"
         } else if name == "settings-probe-prepare" {
@@ -1183,6 +1185,7 @@ impl Supervisor {
         let session_probe_argv: &[&[u8]] = &[path.as_bytes(), path.as_bytes()];
         let settings_prepare_argv: &[&[u8]] = &[path.as_bytes(), b"prepare"];
         let theme_defaults_argv: &[&[u8]] = &[path.as_bytes(), if name == "theme-defaults-light" { b"light" } else { b"dark" }];
+        let pipe_capacity_legacy_argv: &[&[u8]] = &[path.as_bytes(), b"6"];
         let filesystem_verify_argv: &[&[u8]] = &[path.as_bytes(), b"verify"];
         // The direct desktop shell entry targets the existing first compositor.
         // Session-launched children instead inherit its actual SetEnv handoff.
@@ -1283,6 +1286,8 @@ impl Supervisor {
                     session_probe_argv
                 } else if image_name == "theme-defaults" {
                     theme_defaults_argv
+                } else if name == "pipe-capacity-legacy" {
+                    pipe_capacity_legacy_argv
                 } else if name == "filesystem-probe-verify" {
                     filesystem_verify_argv
                 } else if name == "settings-probe-prepare" {
@@ -1637,6 +1642,7 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
 /// CPU0 snapshot of cumulative process/worker receipts; never resets on PID reuse.
 pub fn ai_status(out: &mut impl Write) {
     ai::status(out);
+    pipes::status(out);
     #[cfg(target_arch = "x86_64")]
     parallel::status(out);
     object_status(out);

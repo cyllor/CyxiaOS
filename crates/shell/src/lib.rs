@@ -274,6 +274,8 @@ impl Shell {
                         "signal-probe" => "signal-probe",
                         "desktop-api-probe" => "desktop-api-probe",
                         "pipe-probe" => "pipe-probe",
+                        "pipe-capacity-probe" => "pipe-capacity-probe",
+                        "pipe-capacity-legacy" => "pipe-capacity-legacy",
                         "file-probe" => "file-probe",
                         "clock-probe" => "clock-probe",
                         "event-probe" => "event-probe",

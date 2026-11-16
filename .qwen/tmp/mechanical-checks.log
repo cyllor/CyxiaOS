@@ -1,0 +1,105 @@
+  11 error[E0433]: cannot find `timer` in `cyxia_arch_aarch64`
+   2 warning: this function has too many arguments (8/7)
+   2 warning: this `if` statement can be collapsed
+   2 warning: field assignment outside of initializer for an instance created with Default::default()
+   1 warning: methods `cancel_unstarted` and `hash_cursor` are never used
+   1 warning: getter function appears to return the wrong field
+   1 warning: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+   1 warning: build failed, waiting for other jobs to finish...
+   1 warning: `cyxia-prototype` (test "runtime_dynamic") generated 1 warning (run `cargo clippy --fix --test "runtime_dynamic" -p cyxia-prototype -- ` to apply 1 suggestion)
+   1 warning: `cyxia-prototype` (test "domain_network_placement") generated 2 warnings
+   1 warning: `cyxia-prototype` (lib) generated 2 warnings (2 duplicates)
+   1 warning: `cyxia-prototype` (lib) generated 2 warnings
+   1 warning: `cyxia-prototype` (lib test) generated 2 warnings (2 duplicates)
+   1 warning: `cyxia-peer-billing` (test "ledger") generated 1 warning
+   1 warning: `cyxia-driver-virtio` (lib test) generated 1 warning (run `cargo clippy --fix --lib -p cyxia-driver-virtio --tests -- ` to apply 1 suggestion)
+   1 warning: `cyxia-cluster-transport` (test "network") generated 1 warning
+   1 warning: `cyxia-cluster-transport` (lib) generated 1 warning (1 duplicate)
+   1 warning: `cyxia-cluster-transport` (lib) generated 1 warning
+   1 warning: `cyxia-cluster-transport` (lib test) generated 1 warning (1 duplicate)
+   1 error[E0433]: cannot find `user` in `cyxia_arch_aarch64`
+   1 error[E0432]: unresolved imports `cyxia_arch_aarch64::user`, `cyxia_arch_aarch64::user`
+   1 error[E0432]: unresolved import `cyxia_arch_aarch64::timer`
+   1 error: could not compile `cyxia-kernel` (bin "cyxia-kernel") due to 14 previous errors
+=== CLIPPY DONE ===
+   Doc-tests cyxia_arch_aarch64
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_cluster_transport
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_contracts
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_control_model
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_driver_gicv2
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_driver_pl011
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_driver_virtio
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_kernel_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_peer_billing
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_platform_virt
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_posix
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cyxia_prototype
+
+running 2 tests
+test crates/prototype/src/policy.rs - policy::SingleCanonicalPlan (line 104) - compile fail ... ok
+test crates/prototype/src/policy.rs - policy::CanonicalPlan (line 52) - compile fail ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+   Doc-tests cyxia_shell
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== TEST DONE ===
