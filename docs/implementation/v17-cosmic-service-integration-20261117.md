@@ -1051,6 +1051,106 @@ state or a supported confirmation that the exact old execution context and
 all its tasks have ended. Such recovery would be recorded separately; it
 would not turn this missing cleanup result into a successful build or test.
 
+## Full-session resource capacity: source findings
+
+A separate review checks 53 explicit source files and small retained receipts,
+including the actual session and panel source exports, the native child
+adapter, current kernel resource mechanisms and the formal OS2 profile.
+Their identities remain unchanged. The review SHA-256 is
+`dbead437be74442ae044313273b8bba0f1a367be8560481536c31608bc921700`;
+the root review of the critical source paths and arithmetic is recorded
+separately. This is source analysis, not a new guest process census, a larger
+approved resource budget or an explanation of the earlier capture failures.
+
+The selected session lists 13 direct child components. On one output the
+default Panel has 13 applet occurrences and Dock has five, with 16 unique
+IDs. The repeated AppButton and WorkspacesButton IDs belong to distinct
+container instances and are launched separately. If all those components
+are successfully started and alive together, broker plus session plus the
+13 direct children plus 18 applets gives a 33-process demand scenario.
+This is neither an observed count nor a universal upper bound: auxiliary
+helpers may terminate, while additional outputs, applications and activations
+can add processes. Independently of those auxiliary lifetimes, a panel with
+all 18 applet occurrences genuinely resident needs 19 distinct processes.
+
+| Resource | Current mechanism and admission | Conditional intact-default demand |
+| --- | --- | --- |
+| Process runners | Eight physical slots; normal admission permits seven resident processes | Panel plus 18 resident applets already needs 19 |
+| Waitable child receipts | Ten metadata slots; current admission permits eight occupied slots | The selected session lists 13 direct managed children |
+| Anonymous pipe pairs | 32 physical pairs; current admission permits 30 | Three retained management pipes per child; 54 for 18 applets, or 93 for all 31 managed children |
+| Per-process FD table | 64 entries, also enforced by the native child adapter | Panel retains at least 72 applet-management and nested-Wayland FDs for 18 live applets, before its own stdio, D-Bus and reactor FDs |
+| Global open descriptions | 256 entries | The full 31-child scenario needs at least 222 for management pipes and applet Wayland endpoints; this lower bound alone does not prove exhaustion |
+| Unix connections | 32 physical connections; current admission permits 30 | The 18 applet connections on one output exclude all other D-Bus/Wayland traffic |
+
+The process bound follows directly from
+`crates/ai-runtime/src/weights.rs`, `user_memory_policy` in
+`crates/ai-runtime/src/lib.rs`, and `Runner::start` / `Supervisor::launch`
+in `kernel/src/desktop/user.rs`. Each normal launch keeps its eight-page
+base grant from the 64-page ledger. Model 8193 evaluates
+`-39 + 42 * min(free, 32) - 47 * requested`; the eighth request has
+`free = requested = 8` and score -79, so it is denied. Linux loading later
+clears the demo Arena but retains that grant. The eight pages do not account
+for all process memory. Increasing `MAX_PROCESSES` alone also exceeds the
+memory-policy domain and the eight-candidate process-selector domain.
+
+The pipe and FD demand follows the actual ownership paths in
+`ports/cosmic/native-session/native_child.rs` and the retained launch-pad
+and panel sources. Each managed child keeps three parent pipe endpoints;
+each live applet also keeps one nested Wayland server endpoint in panel.
+Inheritance and `dup` share an existing open description, so they are not
+counted as new global descriptions. The adapter itself rejects an
+`RLIMIT_NOFILE` above its supported 64-entry ABI; changing only a kernel
+table would not update that contract.
+
+The actual OS2 machine has 1,024 MiB RAM and four CPUs. Current boot-time
+physical pool reservations include 512 MiB of executable backing
+(eight slots times 64 MiB), 256 MiB of shared-capacity/private-owner anonymous
+backing, 16 MiB of memfd backing and 4 MiB of hardware page tables: 788 MiB
+in total. The remaining 236 MiB is only a ceiling before kernel, ROM,
+metadata, firmware and device reservations, not measured free RAM.
+The named Arena, thread-context and x86 staging-table fields alone account
+for at least 688 KiB per Runner, excluding other indexes, ledgers and
+descriptor metadata. No native `sizeof(Runner)` measurement was performed.
+
+Keeping the current static executable-pool layout while raising the slot
+count to 15 would reserve 960 MiB for executable backing plus 256 MiB for
+anonymous memory, already above the original machine's RAM before other
+costs. Actual ELF/stack and page-table frames therefore need independent
+owner-aware, on-demand allocation and global accounting before a larger
+process inventory can be justified. Per-process ELF admission remains
+separate: compositor's 8,842 pages and panel's 7,432 pages must not be added
+and compared with one process's 16,256-page limit. Host `max_build_bytes`
+continues to denote a disk-directory budget, not RAM or RSS.
+
+The proposed implementation sequence preserves the original defaults and
+the separation between AI choices and kernel authority:
+
+1. Version Linux process and child-receipt allocation separately from the
+   demo Arena, charging real metadata and preserving PID/generation, wait,
+   failure rollback and reclamation before slot reuse.
+2. Allocate actual executable, stack and page-table frames from owner-tagged
+   pools while retaining the current virtual layout, W^X and complete
+   address-space retirement. Physical savings from immutable sharing are
+   not assumed.
+3. Coordinate the FD ABI, OFD identity, pipe/Unix buffers, SCM references and
+   epoll/memfd lifetimes with explicit resource-specific admission domains.
+   Preserve the three management pipes and genuine Wayland connections;
+   verify both steady use and transient launch peaks.
+4. Define AI-selected, variable core leases over the actual eligible online
+   CPU set. The mechanism validates exclusive ownership and waits for real
+   completion, drain and revocation. No service receives a permanently
+   fixed core allocation. The present three-AP worker ceiling is an existing
+   hardware-metadata boundary, not the desired allocation policy.
+5. Supply the genuine selected components, all 16 unique applet executables,
+   desktop entries and assets, then verify the actual default instances,
+   protocol ownership, rendering, input, restart and global reclamation.
+
+These steps are a source-backed implementation plan. No new process, FD,
+memory, CPU or timeout limit is applied by this review. Catalog2 still has
+nine ELF entries and no applet desktop entries; separately building and
+installing panel does not supply the default applet workload or solve the
+concurrency limits.
+
 ## Remaining acceptance work
 
 The real session version path, successful exit and stage reclamation have
