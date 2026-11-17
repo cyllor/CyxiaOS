@@ -404,18 +404,358 @@ Its receipt SHA-256 is
 `520200c46a6c61c88f369ba4a91b7cb5659a68ac436496b5380f8ad367807c3a`.
 No Cargo metadata, compilation or guest execution occurred in this source run.
 
+## Settings v2: preserve theme work while yielding the service executor
+
+The retained first service capture remains **FAIL**. The subsequent bounded PC
+analysis found the genuine settings main thread progressing through theme,
+configuration and GTK/Qt export work while the first WatchConfig call timed
+out. This supports executor starvation as a concrete candidate; it does not
+establish causality or a successful fix before a new guest run.
+
+The v2 source keeps the real current-thread Tokio runtime and LocalSet. It
+moves the original synchronous theme work into sequentially awaited
+`spawn_blocking` closures. All initial and later theme branches retain their
+original operations and ordering. The pinned Tokio blocking worker enters the
+runtime context, preserving the context used by existing upstream asynchronous
+helpers. No `spawn_local` operation is moved. The original release
+`panic=abort` profile remains; an end marker means that the synchronous closure
+returned, not that detached upstream helper tasks finished.
+
+The complete 11-member workspace and 502-package selected graph remain
+unchanged. Its normalized graph SHA-256 is
+`3a05c8c691eb9a7120aaaa99dc355788b2848116199da1646be3a653e5ad2734`.
+The actual installed build/consumer/installer suite passed all 44 cases, with
+no external processes. A preceding test coordinator had failed its own module
+origin lookup after those cases passed; that failed coordinator result is
+retained, and the corrected result explicitly binds the detached installer
+subject to the installed repository source.
+
+The genuine v2 producer completed in 715.830 seconds within the original
+1,200-second, two-job and 1.5 GiB build bounds. Its independent build consumer,
+installation and installation consumer also completed successfully. The new
+ELF is 7,424,856 bytes, SHA-256
+`e8472d9bdf74971f8c8f7cf8852cfaa010c4cd90f86b13128765fb702583d07a`.
+It requires 1,384 load pages plus the original 512 stack pages: 1,896 pages in
+total. No resource capacity or timeout was raised.
+
+| Actual settings v2 evidence | SHA-256 |
+| --- | --- |
+| Producer build report | `936a4698cbd440f2512caebd419d0328d809f3a6b0c4bc3d0675a8c627adea5b` |
+| Root build/install execution | `d4487924db4d4ad7a0a4fe6658c5b37c8baac6c315e02ef78fa1ef6ad4a174e4` |
+| Independent build consumer | `ea89bfa719916bb59ab395ccf3ec2ef85d0e4c8d29d44d11e08d21ab933d8d49` |
+| Installation receipt | `3b8f87b61f257070703ae06aa22934384c667c979508d8a24d857f0a56ec7f6e` |
+| Installation consumer | `0378ff8bde8a49104bbdd3cbefa7ae7c460113fd052808123242e3d50cebb3bb` |
+
+## Probe v2 and the actual upstream watcher ownership contract
+
+The genuine upstream service creates separate D-Bus connections for its
+configuration and state watchers. Consequently, the watcher's unique sender
+can differ from the main service owner while belonging to the same daemon
+process. Probe v2 authenticates each returned watch name through the actual
+broker, obtains its unique owner and Unix PID, and requires that PID to match
+the daemon and exclude the client. It matches Changed signals to that unique
+watcher connection and rechecks the returned name's owner/PID afterward. Main
+service ownership stability remains an independent requirement.
+
+The actual native build and independent consumer completed in 6.188 seconds.
+The probe ELF is 954,880 bytes, SHA-256
+`26cd8fc3fa992a67b37182cd0300ae0d2fe2d151dc8033074b32bebf05d64c45`,
+requiring 59 load pages plus 512 stack pages. Its build receipt SHA-256 is
+`e2999e3f9340fb3c5085f0314f6fa481e78e06a2413889f9f2de4e397f1420a3`.
+All 20 installed consumer cases passed without external processes.
+
+The new runtime controller accepts only the explicit v2 watcher marker
+contract. All 49 prior lifecycle tests are preserved, with 12 additional
+cases. The actual installed portable run reports 60 passes and one explicit
+UART-fixture skip; the separate run with the retained real UART reports all
+61 passes. The latter receipt is
+`0cdc4b235ff5bf4baa11c716f682f0c0bb98951a8b88448bcfdbf6491008daf6`.
+These are host parser/controller checks, not new guest protocol success.
+The original method, changed-signal, theme, first-frame and guest budgets
+remain unchanged.
+
+## Panel source cache, archive-reader correction and real metadata
+
+A fresh panel cache was prepared from the preserved genuine source caches.
+One bounded locked Cargo fetch acquired the remaining exact dependencies;
+there was no automatic retry. The preparation completed in 89.772 seconds,
+with 33,181,781 bytes of growth under the original 240-second/128 MiB bounds.
+All 516 exported source files were verified. The preparation receipt is
+`4648357af5d45b5b09a1f6dbdf9a57969d866d5bdb862f267d60b65d863a18b7`.
+Copy-size preservation is recorded separately from full source-byte checks;
+no whole-seed byte-hash claim is inferred from a reflink/copy.
+
+The first real metadata attempt failed before Cargo resolution. The genuine
+Gallium archive is 29,779,478 bytes. Its initial validation correctly used the
+existing 64 MiB native-archive bound, but two later archive reads omitted that
+argument and inherited the unrelated 16 MiB general-source default. A new
+contract version supplies the existing native bound at those two calls.
+The old failed producer report and original source versions remain unchanged;
+no resource bound was enlarged.
+
+All 20 installed cases passed, including the original 17 cases and three
+new archive-size/integrity cases. The new metadata producer then completed
+in 46.997 seconds, with no postcheck errors and the original workspace,
+default features, native libraries and budgets preserved. Its receipt is
+10,127,164 bytes, SHA-256
+`f7ebc183a635768336de41b91fb7a5325efc98fd11e770c1c52b94eaec877971`.
+The independently recomputed selected graph contains 473 nodes; all three
+workspace and default members remain present. The original panel/dock
+configuration retains its 18 applet instances, comprising 16 distinct IDs.
+This is actual offline metadata evidence; it does not establish a linked
+panel binary, applet startup or Wayland presentation.
+
+## Service catalog v2
+
+A fresh catalog was assembled from the completed genuine settings v2 and
+probe v2 results. The actual coordinator completed in 175.495 seconds; the
+outer execution and final receipt check completed in 178.497 seconds.
+Independent consumers were replayed against the real installations and their
+relocated catalog copies under the original native lease.
+
+The catalog contains 146 entries: nine ELFs and 137 assets, totaling
+89,818,322 bytes. Exactly the settings daemon and protocol probe changed;
+the other 144 guest inputs retain their prior identities and modes. The
+complete base, session and host-generated theme proof dictionaries remain
+equal, and the three installation receipts are exact byte copies. The original
+96 MiB, 256-entry and 95-byte guest-path limits remain in force. Panel has not
+been added to this catalog.
+
+The catalog origin is 310,494 bytes, SHA-256
+`71c3b9c715447fca8a60bcfc7714b606ea75ff4efcf739be8c7ca16dc40fb833`.
+The separate actual-result JSON review is
+`e94b9553c37d075fee4b7fcd39b28e9f51de243ed0692840fe034e70b1dcf079`.
+Assembly and static provenance remain distinct from formal OS embedding and
+actual guest protocol/lifecycle acceptance.
+
+## Formal service OS v2
+
+The formal OS coordinator completed in 35.073 seconds; its outer supervisor
+completed in 38.585 seconds. The actual source map contains exactly the prior
+1,251 entries plus ten reviewed source/policy additions, with SHA-256
+`8d9bffd5e25cf339bd9562a9ba6aae16cd25b81ae2dd4af65b24aea1743436e7`.
+All 18 original OS policy fields remain equal, including the original two-job,
+900-second, four-CPU and 1 GiB machine configuration. The generated catalog
+proves all nine exact ELFs embedded in read-only kernel segments and all
+137 assets, totaling 89,818,322 bytes.
+
+The actual coordinator receipt SHA-256 is
+`d097ade9f5afaf0119cf32cd1b8117aa8f1ed207ea1112adceef04b1b2a6415a`;
+the build manifest is
+`3757af0176bd518d4de00f72be9dad2d1b893df7723183a42ae00e600e900fc7`.
+The independent JSON association review is
+`a2c3a550b9c29c4cdcf28f87174c42f2c4709c19b045d5b50a62c0cec666e05c`.
+The actual outer supervisor observed the leader reaped and its process group
+gone, with no cleanup signals needed. A pre-execution source review had
+corrected the case where a failed leader could leave compiler descendants;
+that unexecuted earlier wrapper remains retained.
+
+## Actual service capture v2: protocol progress and retained failures
+
+The second real service capture used the new settings ELF and probe with the
+original protocol and runtime limits. Its nine strict protocol markers all
+completed. The broker authenticated main owner `:1.3` as daemon PID 7 and the
+client as PID 6. Config watcher `:1.4` and State watcher `:1.5` each belonged
+to the same genuine daemon PID 7, and their Changed signals matched their
+separate authenticated watcher identities. Light/dark theme behavior,
+unsupported capability responses and stable main ownership also passed the
+probe. The client subsequently exited with code 0 and released its own image,
+heap and thread ownership.
+
+This crosses the previous WatchConfig NoReply barrier under the same timeout.
+The before/after result supports the new implementation's protocol behavior;
+it does not by itself prove a unique causal explanation for every earlier
+startup delay. Wayland socket connection remains distinct from a verified
+Wayland client protocol or rendered pixels.
+
+The complete capture still records **FAIL**. Its first-frame failure was
+latched at 45.043961 seconds from compositor launch, and the late observation
+closed at 120.000137 seconds. All 339 recorded display snapshots have zero
+proposals, submissions and completions. Only the boot image was captured.
+The genuine service processes were then terminated by the explicit commands
+for PID 7, PID 5 and PID 3; each was observed as Killed/137 with zero image,
+heap and thread ownership. This is targeted test cleanup, not a graceful
+normal-session shutdown.
+
+The controller failed at the subsequent final arena check with
+`Missing process from final arena snapshot`. The last two complete process
+lists contain the four terminal PIDs `{3, 5, 6, 7}`, each reporting all 64
+Runner pages free. The kernel deliberately reuses an inactive Runner slot on
+later starts; earlier PID 1 was replaced by PID 2, then PID 3, and the
+short-lived query PID 4 was replaced by PID 5. The process list is a current
+slot inventory. The old controller incorrectly required historical PIDs 1
+and 2 to remain in that final inventory despite their separately completed
+phase checks.
+
+The old run never reached the final `ai system` after killing the broker.
+Consequently its final global OFD, shared-memory, anonymous-memory and pipe
+baseline is **unverified**. Its settings component remains
+`OBSERVED_NOT_FINALIZED`; resource/lifecycle completion flags remain false.
+The retained failure is not retrospectively relabeled using later parser
+logic.
+
+QMP quit was acknowledged, QEMU exited with code 0, no watchdog termination
+was forced, and the complete launch input identities were preserved. The
+producer's 220.670-second interval includes input validation; the outer
+344.247-second interval also includes surrounding proof checks. Neither is
+reported as pure guest execution time.
+
+| Actual capture v2 evidence | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `summary.json` | 1,263,634 | `e0dc03f6da6e1be3b70c8a752f68a24b87ec9c0f3ddd8796d4945e17b682b861` |
+| `serial.raw` | 3,780,285 | `c5bc67ae603b3f9a1df1f1a3de4fd6f1038175c0d09c3a96e61945261866bcb9` |
+| Host launch receipt | 27,332 | `57239ab8fcc04e6a2d2a421a4b96bae080895eacbb95e8f155cc825a0fcc42f9` |
+| Independent result review | 17,192 | `7cea1b9fb3adbf719d17af45ffea8bea03f50d94322a21692b2616459c5e7599` |
+
+## Runtime v5: current slots and separately proved earlier phases
+
+A new version adds `final_service_arena` and changes only the two final arena
+calls plus an explicit completed-version-phase prerequisite. The six launch
+identities remain a closed set of positive, distinct PIDs. The final snapshot
+must contain the four service-stage identities, and every fresh process row
+still participates in the original global arena check. All rows must be
+terminal, no process may remain active, and all 64 pages must be free. The
+client must be Exited/0; the three services must be Killed/137, with no image,
+heap or thread ownership remaining.
+
+Earlier version and preparation UART, PID, terminal-state, arena and global
+resource proofs remain mandatory in their own completed phases. The final
+real `ai system` and complete baseline comparison are still required. This
+corrects the historical-PID assumption while preserving the missing-evidence
+and resource-leak failures.
+
+All 14 other original function/class bodies and all 61 old test methods are
+byte-identical. Eight new cases include the actual old driver's failing
+slot-reuse case, the new driver's complete final resource read, missing early
+proofs, wrong PIDs, live rows, inconsistent free-page accounting and global
+resource leaks. Actual installed repository validation reports 67 passes plus
+two explicit optional-UART skips, and 69 passes when both complete fixed UART
+fixtures are selected. All 82 local module origins are the real repository,
+all source identities are preserved, and external-process calls are zero.
+The two installed receipts are
+`a0c712394caced2e41d9a17cb8bf1e38858e62b74339057d10108027458ba045`
+and `53ab321b30b016a9b2e9be1188aed9d459511b83a2ebc2e67e794bba4392bbbe`.
+The subsequent genuine guest run is recorded separately below; it failed
+before reaching this final arena path. The two new tool paths are outside the panel producer's
+31-file source closure and all 54 of its fixed inputs; those inputs matched
+before and after application.
+
+## Compositor initialization evidence
+
+One bounded, read-only symbol-mapping operation matched the actual capture v2
+PCs against the unchanged genuine compositor ELF. It completed in 1.637
+seconds under the original native lease and 30-second tool bound, preserving
+both inputs. The mapping report is
+`4204c303728bdc0000e65d56a59ed19faf89d01771c336a9c5ddeb5acb756f2c`;
+the independent timeline interpretation is
+`90b778b52a3f017763ec4902641ca4c3712aaf7ccb164344fb9c03c0be1b4554`.
+
+There are 339 running-process contexts and three killed-process residual
+contexts. The latter are excluded from continued-execution interpretations.
+Running samples progress through language/configuration/theme handling,
+regular-expression construction, EGL/context setup, then real GLSL/NIR shader
+work. The first sampled EGL function occurs after the first-frame gate's raw
+serial anchor; a sampled appearance is not the precise function-entry time.
+No sample establishes first-frame presentation, and the actual display
+counters remain zero throughout. Syscall-boundary samples and aggregate HPET
+prepare/retire spans are not converted into CPU percentages or wall-time shares.
+
+The earlier notification capture's saved top-64-row image also cannot prove a
+permanent rendering stall. The genuine backend submits 16 four-row tiles per
+tick, and the existing capture saves the first completed bounded rectangle
+candidate only. Source inspection finds full initial damage and continued
+pending-tile advancement, not a zero-canvas pixel-difference shortcut. That
+first-batch screenshot and this run's zero-submission initialization failure
+are separate observations.
+
+## Actual genuine panel build and independent consumption
+
+The corrected producer completed the real offline release build with the
+original full workspace, default features, exact native libraries and selected
+graph. The Cargo release compilation reported 10 minutes 18 seconds. The full
+producer interval was 693.798 seconds; the outer build-and-consumer interval
+was 711.461 seconds. These are separate intervals, not alternative measurements
+of the same compiler phase. The original 3,600-second shared build/consumer
+budget, two Cargo jobs, 3 GiB resource bound and 64 MiB ELF bound remain.
+
+The genuine `cosmic-panel.elf` is 33,718,544 bytes, SHA-256
+`4da6dab25872e0cdb9444fa6507f15b58c08b0726ed462dd772b407186b5d7f1`.
+The independent consumer accepted the exact ELF, provenance, dependencies and
+resource contract. It requires 6,920 load pages plus the original 512 stack
+pages, for 7,432 pages. Producer postcheck errors are empty. The outer owner
+observed both build and consumer exit zero, all owned process groups gone,
+unchanged fixed inputs, and no cleanup signals or errors.
+
+| Actual panel evidence | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Producer report | 10,137,170 | `870a8d35c59bf9d3cf21db2c26cb67d9824efd11d45d7dc2fbb02c62002152b5` |
+| Independent consumer | 37,147 | `10777abff77e0664f2794bbf2fa8d0f3b03336a1b943c145a343ae375671570c` |
+| Native ownership and execution report | 31,039 | `f1b15b62c463904a3ebc3990aa36137ad158728852174744cb7c92f3afeac3ef` |
+
+This result is **built and revalidated, not guest-run**. Panel installation,
+catalog admission, applet execution and actual presentation have not passed.
+Adding the unchanged 33,718,544-byte panel to the existing 89,818,322-byte
+catalog exceeds the original 96 MiB common catalog bound before its additional
+licenses. That packaging constraint needs an explicit solution. The executable
+grant ledger is separately constructed for each process slot; adding the
+compositor's and panel's page totals is not a valid test of one process's
+16,256-page model limit. No capacity is raised from that incorrect aggregate
+interpretation.
+
+## Actual service capture v3: retained transport failure
+
+The next actual run uses runtime v5 with the exact same OS v2, catalog v2,
+settings v2, probe v2, machine configuration and runtime deadlines. A preceding
+root invocation mistakenly supplied the literal review-hash placeholder. The
+immutable launcher's input check rejected it before creating output, changing
+native state or starting a child. That caller error is retained in a separate
+preflight receipt (`3fcfc5136553c7e43605e8a5956f0024729061828e71793cb01f2a8b7cf506f6`);
+only the caller's hash argument was corrected for the actual launch.
+
+The actual capture records **FAIL** at
+`Wayland socket readiness is not bound to the launched real client`.
+Session-version and preparation phases passed their original reclamation
+checks, and the actual launched client is PID 6. Its UART readiness line was
+interrupted by the controller's own complete `posix list` response:
+the prefix ends in `client_p`, followed by the command echo, three real status
+rows and the shell prompt, then the suffix `id=6 protocol_verified=false`.
+The command ledger's offsets 54,102 and 56,663 match that inserted response.
+The existing wide wait accepted the truncated first line, and the subsequent
+strict marker parser correctly refused it. This is concrete transport
+interleaving evidence; it is not proof of a wrong guest PID or permission to
+relax the PID, path or full marker contract.
+
+The daemon was not launched. No configuration/state/theme success or final
+service arena/global resource proof was reached. `first_frame_deadline_failed`
+is false because this run ended before that observation gate; it does not mean
+the first-frame gate passed. Only the boot frame is present. QMP quit was
+acknowledged, QEMU exited zero without forced termination, and all launch
+inputs were preserved. Runtime and outer intervals are 87.208 and 213.233
+seconds respectively, both including their documented validation work.
+
+| Actual capture v3 evidence | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `summary.json` | 1,247,355 | `5a39e04326ba67276a244ac5de7a759a28e996dffeb117cd9beea70e6c8a4863` |
+| `serial.raw` | 64,357 | `caff73b9ab1689c1fc3fb371307ef95c4ced458a10dad0f806376cf600df98e4` |
+| Host launch receipt | 33,908 | `dc63e3f973c9bcdcb68dc959de1ab1754942bfd222f9ba186cdab727a60a351f` |
+
+A separate controller repair is being prepared against the exact retained raw
+bytes and command receipts. No later parser can retrospectively finalize this
+run or fill its missing daemon, protocol and resource observations.
+
 ## Remaining acceptance work
 
-The real session version path, successful exit and reclamation have passed.
-Settings has reached its real owner/PID binding; the first WatchConfig response
-and the corrected per-watcher ownership contract remain the immediate work.
-Configuration/state subscriptions and signals, theme data, unsupported
-operations and complete lifecycle reclamation still need actual guest proof.
+The real session version path, successful exit and stage reclamation have
+passed. The actual new settings probe has completed configuration/state
+subscriptions and Changed signals, theme behavior, unsupported operations,
+main/watcher ownership checks and client exit. A fresh run of runtime v5 must
+still reach the final global resource baseline and finalize the complete
+manual service lifecycle. All three service captures remain failed records.
 A manual component test does not establish the normal session-owned startup
 and notification FD handoff chain.
 
-Full delivery additionally needs actual panel/applet binaries and their native
-Wayland EGL presentation, complete rendering within the original first-frame
+Full delivery additionally needs panel installation and catalog admission,
+actual applet binaries and their native Wayland EGL presentation, complete rendering within the original first-frame
 gate, notification registration and protocol behavior, visible content, input
 behavior, session supervision and resource reclamation. The default panel and
 dock contain 18 applet instances; this static inventory does not justify
