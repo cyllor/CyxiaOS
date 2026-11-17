@@ -6,14 +6,19 @@ use cyxia_posix::Errno;
 #[repr(C, align(4096))]
 pub struct PageTable(pub [u64; 512]);
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy)]
-struct Page {
-    physical: u64,
-    protection: u8,
+#[repr(C, align(4096))]
+pub struct PageTable {
+    // Aligned physical frames leave the low three bits for desired protection.
+    // These indexes describe private staging metadata, never live hardware PTEs.
+    pages: [u64; 512],
+    present: [u64; 8],
+    executable: [u64; 8],
 }
 #[cfg(target_arch = "x86_64")]
-#[repr(C, align(4096))]
-pub struct PageTable([Page; 512]);
+const _: () = {
+    assert!(core::mem::size_of::<PageTable>() == 8192);
+    assert!(core::mem::align_of::<PageTable>() == 4096);
+};
 impl PageTable {
     pub const fn empty() -> Self {
         #[cfg(target_arch = "aarch64")]
@@ -22,22 +27,18 @@ impl PageTable {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            Self(
-                [Page {
-                    physical: 0,
-                    protection: 0,
-                }; 512],
-            )
+            Self { pages: [0; 512], present: [0; 8], executable: [0; 8] }
         }
     }
     pub fn clear(&mut self) {
         #[cfg(target_arch = "aarch64")]
         self.0.fill(0);
         #[cfg(target_arch = "x86_64")]
-        self.0.fill(Page {
-            physical: 0,
-            protection: 0,
-        });
+        {
+            self.pages.fill(0);
+            self.present.fill(0);
+            self.executable.fill(0);
+        }
     }
     pub fn remove(&mut self, index: usize) {
         #[cfg(target_arch = "aarch64")]
@@ -46,10 +47,11 @@ impl PageTable {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            self.0[index] = Page {
-                physical: 0,
-                protection: 0,
-            };
+            // The first access retains the original bounds-panic boundary.
+            self.pages[index] = 0;
+            let bit = 1u64 << (index % 64);
+            self.present[index / 64] &= !bit;
+            self.executable[index / 64] &= !bit;
         }
     }
     pub fn set(&mut self, index: usize, physical: u64, protection: u8) -> Result<(), Errno> {
@@ -71,46 +73,67 @@ impl PageTable {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            self.0[index] = Page {
-                physical,
-                protection,
-            };
+            // No fallible operation follows validation. Overwrites update both
+            // indexes, including RX -> RO/RW, before metadata can be published.
+            self.pages[index] = physical | u64::from(protection);
+            let bit = 1u64 << (index % 64);
+            self.present[index / 64] |= bit;
+            if protection & 4 != 0 {
+                self.executable[index / 64] |= bit;
+            } else {
+                self.executable[index / 64] &= !bit;
+            }
         }
         Ok(())
     }
     #[cfg(target_arch = "x86_64")]
+    fn indices(bitmap: &[u64; 8]) -> impl Iterator<Item = usize> + '_ {
+        bitmap.iter().copied().enumerate().flat_map(|(word, mut bits)| {
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(index)
+            })
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn executable_runs(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
+        let mut executable = Self::indices(&self.executable).peekable();
+        core::iter::from_fn(move || {
+            let start = executable.next()?;
+            let physical = self.pages[start] & !7;
+            let mut previous = physical;
+            let mut end = start + 1;
+            // Preserve ascending order and the original adjacent virtual AND
+            // consecutive physical boundary. Never cross this staging table.
+            while let Some(&next) = executable.peek() {
+                let next_physical = self.pages[next] & !7;
+                if next != end || previous.checked_add(4096) != Some(next_physical) {
+                    break;
+                }
+                let _ = executable.next();
+                previous = next_physical;
+                end += 1;
+            }
+            Some((physical, (end - start) * 4096))
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
     pub fn publish(&self, space: &mut ProcessSpace, base: u64) -> Result<(), Errno> {
-        // Sealing acquires ALIAS_GATE and can fence real CPUs. Finish it before
-        // the mapping batch takes that gate; failed seals retain their phase.
-        let mut present = false;
-        let mut index = 0;
-        while index < self.0.len() {
-            let page = self.0[index];
-            present |= page.protection != 0;
-            if page.protection & 4 == 0 {
-                index += 1;
-                continue;
-            }
-            let start = index;
-            index += 1;
-            // Only adjacent RX entries with consecutive physical frames share
-            // a transaction. Never cross this 512-entry staging table.
-            while index < self.0.len()
-                && self.0[index].protection & 4 != 0
-                && self.0[index - 1].physical.checked_add(4096) == Some(self.0[index].physical)
-            {
-                index += 1;
-            }
-            crate::process_arch::publish_code(
-                crate::HIGH + page.physical,
-                (index - start) * 4096,
-            )?;
-        }
-        if !present {
+        if self.present.iter().all(|&word| word == 0) {
             return Ok(());
         }
-        space.map_pages(self.0.iter().enumerate().filter_map(|(index, page)| {
-            (page.protection != 0).then_some((base + index as u64 * 4096, page.physical, page.protection))
+        // Sealing acquires ALIAS_GATE and can fence real CPUs. Finish it before
+        // the mapping batch takes that gate; failed seals retain their phase.
+        for (physical, bytes) in self.executable_runs() {
+            crate::process_arch::publish_code(crate::HIGH + physical, bytes)?;
+        }
+        space.map_pages(Self::indices(&self.present).map(|index| {
+            let page = self.pages[index];
+            (base + index as u64 * 4096, page & !7, (page & 7) as u8)
         }))
     }
 }

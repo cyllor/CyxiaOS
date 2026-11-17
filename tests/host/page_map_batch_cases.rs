@@ -683,3 +683,185 @@ fn runtime_batch_single_removal_releases_its_guard_without_clearing_a_batch_owne
     assert!(runtime::end(owner));
     assert_eq!(runtime::operations(), (0, 0));
 }
+
+
+// Dense, external observations of the real PageTable publisher are the oracle.
+// No test reconstructs its private bitmaps, packed fields or range algorithm.
+fn assert_staging_snapshot(
+    table: &crate::staging::PageTable,
+    expected: &[(usize, u64, u8)],
+    ranges: &[(u64, usize)],
+) {
+    runtime::clear_observations();
+    let (_memory, space) = new_space(8);
+    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    table.publish(&mut owner, VA).unwrap();
+    let space = owner.current.as_ref().unwrap();
+    assert_eq!(space.epoch(), expected.len() as u64 + 1);
+    assert_eq!(runtime::ranges(), ranges);
+    for index in 0..512 {
+        let actual = space.translate(VA + index as u64 * 4096 + 17);
+        if let Some(&(_, physical, protection)) = expected.iter().find(|&&(i, _, _)| i == index) {
+            let actual = actual.unwrap();
+            assert_eq!(actual.physical, physical + 17, "staged index {index}");
+            assert_eq!(actual.permissions.writable, protection & 2 != 0);
+            assert_eq!(actual.permissions.executable, protection & 4 != 0);
+            let aliases = expected.iter().filter(|&&(_, pa, _)| pa == physical)
+                .fold(0, |counts, &(_, _, prot)| {
+                    counts + 1 + (u64::from(prot & 2 != 0) << 20)
+                        + (u64::from(prot & 4 != 0) << 40)
+                });
+            assert_eq!(runtime::count(physical), aliases);
+        } else {
+            assert!(actual.is_none(), "unexpected mapping at staged index {index}");
+        }
+    }
+    drop(owner); // Actual complete PTE walk removes every published alias.
+    for &(_, physical, _) in expected { assert_eq!(runtime::count(physical), 0); }
+}
+
+#[test]
+fn runtime_batch_staging_layout_and_sparse_word_boundaries_keep_all_translations() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    assert_eq!(core::mem::size_of::<crate::staging::PageTable>(), 8192);
+    assert_eq!(core::mem::align_of::<crate::staging::PageTable>(), 4096);
+    let mut table = crate::staging::PageTable::empty();
+    // Reverse insertion must not change publish order or join across holes.
+    let expected = [
+        (0, 0, 1), (63, PA, 5), (64, PA + 4096, 5),
+        (127, PA + 8192, 3), (128, PA + 12288, 1), (511, PA + 16384, 5),
+    ];
+    for &(index, physical, protection) in expected.iter().rev() {
+        table.set(index, physical, protection).unwrap();
+    }
+    assert_staging_snapshot(&table, &expected, &[(PA, 8192), (PA + 16384, 4096)]);
+}
+
+#[test]
+fn runtime_batch_staging_failed_mutations_leave_every_previous_mapping_unchanged() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    let expected = [(0, PA, 3), (63, PA + 4096, 5),
+                    (64, PA + 8192, 5), (511, PA + 12288, 1)];
+    for &(index, physical, protection) in &expected {
+        table.set(index, physical, protection).unwrap();
+    }
+    for (index, physical, protection) in [
+        (512, PA, 3), (usize::MAX, PA, 0),
+        (0, PA + 1, 0), (63, PA + 4097, 5),
+        (63, PA, 6), (64, PA, 7), (511, PA, 8), (511, PA, 255),
+    ] {
+        assert_eq!(table.set(index, physical, protection), Err(crate::Errno::Inval));
+    }
+    for index in [512, usize::MAX] {
+        assert!(catch_unwind(AssertUnwindSafe(|| table.remove(index))).is_err());
+    }
+    assert_staging_snapshot(&table, &expected, &[(PA + 4096, 8192)]);
+}
+
+#[test]
+fn runtime_batch_staging_repeated_permission_changes_use_real_seals_and_recovery() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    table.set(63, PA, 3).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 3)], &[]);
+    table.set(63, PA, 5).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 5)], &[(PA, 4096)]);
+    assert_eq!(runtime::current_phase(PA), Phase::StableSealed);
+    table.set(63, PA, 1).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 1)], &[]);
+    // Production requires actual retirement and writable recovery before reuse;
+    // metadata itself never unseals a physical frame.
+    crate::production_process_arch::make_writable(crate::HIGH + PA, 4096).unwrap();
+    assert!(runtime::zero_eligible(PA, 4096));
+    table.set(63, PA, 3).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 3)], &[]);
+    table.set(64, PA + 4096, 5).unwrap();
+    table.set(64, PA + 8192, 3).unwrap(); // Clear stale RX bit on physical overwrite.
+    table.set(511, PA + 12288, 5).unwrap();
+    table.set(511, PA + 16384, 0).unwrap(); // Zero protection removes old RX.
+    table.remove(63);
+    assert_staging_snapshot(&table, &[(64, PA + 8192, 3)], &[]);
+    assert_eq!(runtime::current_phase(PA + 4096), Phase::StableWritable);
+    assert_eq!(runtime::current_phase(PA + 12288), Phase::StableWritable);
+}
+
+#[test]
+fn runtime_batch_staging_clear_removes_all_bits_and_reuse_keeps_only_new_pages() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    for index in 0..512 {
+        table.set(index, PA + index as u64 * 4096, if index % 2 == 0 { 5 } else { 3 }).unwrap();
+    }
+    table.clear();
+    // An empty table must remain a no-op even without an owner and with a held
+    // alias gate. This catches stale present or executable entries after clear.
+    let mut owner = crate::staging::ProcessSpace { current: None, pid: 1 };
+    runtime::force_gate(true);
+    table.publish(&mut owner, VA).unwrap();
+    assert_eq!(runtime::seal_calls(), 0);
+    assert_eq!(runtime::locks(), (0, 0));
+    runtime::force_gate(false);
+    table.set(0, PA, 3).unwrap();
+    table.set(64, PA + 4096, 5).unwrap();
+    table.set(511, PA + 8192, 1).unwrap();
+    assert_staging_snapshot(&table, &[(0, PA, 3), (64, PA + 4096, 5), (511, PA + 8192, 1)],
+                            &[(PA + 4096, 4096)]);
+}
+
+#[test]
+fn runtime_batch_staging_sparse_failure_retains_exact_ascending_successful_prefix() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    for (index, physical, protection) in [
+        (511, PA + 12288, 3), (200, runtime::RAM, 1),
+        (64, PA + 8192, 3), (63, PA + 4096, 1), (0, PA, 3),
+    ] { table.set(index, physical, protection).unwrap(); }
+    let (_memory, space) = new_space(8);
+    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    assert_eq!(table.publish(&mut owner, VA), Err(crate::Errno::Io));
+    let space = owner.current.as_ref().unwrap();
+    assert_eq!(space.epoch(), 4);
+    for (index, physical) in [(0, PA), (63, PA + 4096), (64, PA + 8192)] {
+        assert_eq!(space.translate(VA + index * 4096).unwrap().physical, physical);
+    }
+    assert!(space.translate(VA + 200 * 4096).is_none());
+    assert!(space.translate(VA + 511 * 4096).is_none());
+    assert_eq!(runtime::count(PA + 12288), 0);
+    assert_eq!(runtime::seal_calls(), 0);
+    drop(owner);
+    for physical in [PA, PA + 4096, PA + 8192] { assert_eq!(runtime::count(physical), 0); }
+}
+
+#[test]
+fn runtime_batch_staging_packed_high_physical_bits_are_never_truncated_into_ram() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    table.set(63, PA, 3).unwrap();
+    table.set(64, u64::MAX - 4095, 1).unwrap(); // Original staging contract accepts aligned metadata.
+    table.set(65, 0, 1).unwrap();
+    let (_memory, space) = new_space(8);
+    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    assert_eq!(table.publish(&mut owner, VA), Err(crate::Errno::Io));
+    let space = owner.current.as_ref().unwrap();
+    assert_eq!(space.epoch(), 2);
+    assert_eq!(space.translate(VA + 63 * 4096).unwrap().physical, PA);
+    assert!(space.translate(VA + 64 * 4096).is_none());
+    assert!(space.translate(VA + 65 * 4096).is_none());
+    drop(owner);
+    assert_eq!(runtime::count(PA), 0);
+    table.set(64, PA + 4096, 1).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 3), (64, PA + 4096, 1), (65, 0, 1)], &[]);
+}
+
+#[test]
+fn runtime_batch_staging_nonread_protection_bits_preserve_original_x86_semantics() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let mut table = crate::staging::PageTable::empty();
+    table.set(63, PA, 2).unwrap(); // Original x86 staging does not require bit0.
+    table.set(64, PA + 4096, 4).unwrap();
+    assert_staging_snapshot(&table, &[(63, PA, 2), (64, PA + 4096, 4)], &[(PA + 4096, 4096)]);
+    table.set(63, PA + 8192, 0).unwrap();
+    table.remove(64);
+    assert_staging_snapshot(&table, &[], &[]);
+}
