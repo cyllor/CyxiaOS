@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "kind": "cosmic-font-assets-v1",
+  "source": {
+    "repository": "https://github.com/pop-os/libcosmic",
+    "commit": "5a8bd9482a35ae94c1e54edf77b331c6b970f170",
+    "git_tree": "d58817590f7e9e27540b0d42fc84652a10d7084f"
+  },
+  "notification_lock": {
+    "sha256": "448b38cb6bff1447d0b4fcd3b2f5bafa0b0c72d5200174f2932887eea831953b",
+    "package": {
+      "name": "libcosmic",
+      "version": "1.0.0",
+      "source": "git+https://github.com/pop-os/libcosmic#5a8bd9482a35ae94c1e54edf77b331c6b970f170"
+    }
+  },
+  "files": {
+    "/usr/share/fonts/cosmic/NotoSansMono-Bold.ttf": {
+      "source_relative": "res/noto/NotoSansMono-Bold.ttf",
+      "sha256": "b22563d5f03b345a62115e78d8789c9ed99c2cfa8059fad6e7a5c4ced288e21e",
+      "bytes": 523412,
+      "git_blob": "47179fae7696c95f71b9e15102cdfc44ca029daa",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/NotoSansMono-Regular.ttf": {
+      "source_relative": "res/noto/NotoSansMono-Regular.ttf",
+      "sha256": "6b692c4b6d15ccf59f1c1fe8d11cb8a92f51960f3e9f1f523781755a3af7e29f",
+      "bytes": 510612,
+      "git_blob": "dd3e6d008f88c9745e4a75f0a351854db6561d59",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/OpenSans-Bold.ttf": {
+      "source_relative": "res/open-sans/OpenSans-Bold.ttf",
+      "sha256": "5894a3649b213cf5b2d673b6e7a871815fd1d120fa68a463592f27db14eae323",
+      "bytes": 224592,
+      "git_blob": "fd79d43bea0293ac1b20e8aca1142627983d2c07",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/OpenSans-ExtraBold.ttf": {
+      "source_relative": "res/open-sans/OpenSans-ExtraBold.ttf",
+      "sha256": "0fcbdb5cbeea00ae532352c7c94a7d288ebc911ba85f4d595012032dcab64ba8",
+      "bytes": 222584,
+      "git_blob": "21f6f84a0799946fc4ae02c52b27e61c3762c745",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/OpenSans-Light.ttf": {
+      "source_relative": "res/open-sans/OpenSans-Light.ttf",
+      "sha256": "cf5f5184c1441a1660aa52526328e9d5c2793e77b6d8d3a3ad654bdb07ab8424",
+      "bytes": 222412,
+      "git_blob": "0d381897da20345fa63112f19042561f44ee3aa0",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/OpenSans-Regular.ttf": {
+      "source_relative": "res/open-sans/OpenSans-Regular.ttf",
+      "sha256": "e64e508b2aa2880f907e470c4550980ec4c0694d103a43f36150ac3f93189bee",
+      "bytes": 217360,
+      "git_blob": "db433349b7047f72f40072630c1bc110620bf09e",
+      "mode": "100644"
+    },
+    "/usr/share/fonts/cosmic/OpenSans-Semibold.ttf": {
+      "source_relative": "res/open-sans/OpenSans-Semibold.ttf",
+      "sha256": "aa3b0ef53db12e3d45094030cac0e69d384e44cc5978643dd4390041cad546e2",
+      "bytes": 221328,
+      "git_blob": "1a7679e3949fb045f152f456bc4adad31e8b9f55",
+      "mode": "100644"
+    },
+    "/usr/share/licenses/cosmic-fonts/NotoSansMono-LICENSE": {
+      "source_relative": "res/noto/LICENSE",
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "bytes": 4301,
+      "git_blob": "d952d62c065f3f35fb83a173496e90b21525aef3",
+      "mode": "100644"
+    },
+    "/usr/share/licenses/cosmic-fonts/OpenSans-LICENSE": {
+      "source_relative": "res/open-sans/LICENSE",
+      "sha256": "87a330d2f56cfe470431eed7996fa5423f694c79e2ad7c4c515ac75bc9a340d6",
+      "bytes": 4304,
+      "git_blob": "c91bd228cc20d2e531d65c2dbf1ade3f2749f78a",
+      "mode": "100644"
+    }
+  }
+}

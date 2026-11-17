@@ -317,6 +317,8 @@ impl Shell {
                         "session-process-probe" => "session-process-probe",
                         "cosmic-session" => "cosmic-session",
                         "cosmic-settings-daemon" => "cosmic-settings-daemon",
+                        "cosmic-notifications" => "cosmic-notifications",
+                        "notification-probe" => "notification-probe",
                         "settings-probe" => "settings-probe",
                         "filesystem-probe" => "filesystem-probe",
                         "theme-defaults-light" => "theme-defaults-light",

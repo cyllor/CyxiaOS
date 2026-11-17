@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "kind": "cosmic-session-native-linux-v1",
+  "component": "cosmic-session",
+  "version": "1.10.0",
+  "repository": "https://github.com/pop-os/cosmic-session",
+  "commit": "8093b59bb1262b0612d814e6540ba936303f735a",
+  "git_tree": "bae4cf7cfb4cba7d3b0ec883506ccbf669963067",
+  "directory": "cosmic-session",
+  "source_lock_sha256": "8cda0355e1b1b55abe8d71f7446a040e5e872cd9c5a1c03147e9c25a94157afd",
+  "effective_lock_sha256": "69a3d3c9796c3816d4dfedefded59b860e9ec4608ca881b3f15232404e7e30dd",
+  "patch_manifest": {
+    "path": "ports/cosmic/native-session/native-patch.json",
+    "sha256": "e819a9ab7908757b3949468f1ad9b421533370b8a2f3ffa7baf24e30f01b8af0"
+  },
+  "original_patch": {
+    "path": "ports/cosmic/native-session/cosmic-session-native.patch",
+    "sha256": "45f9afc4f664bde364d87ca12bedb014fa189f85e8b95feb23135f9286a6ce3d"
+  },
+  "support_inputs": {
+    "ports/cosmic/native-session/build_patch.py": "3918432cde60dfcc61d66f8ecbe383c11b7ccc536e1ae3a9f6d4c8aa010e4297",
+    "ports/cosmic/native-session/native_child.rs": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97"
+  },
+  "launch_pad": {
+    "repository": "https://github.com/pop-os/launch-pad",
+    "commit": "5b516ee6a012b5ad4a5acc0cf51b4472fc6733af",
+    "git_tree": "0d423e6603a036c4b59c8a95c5f5ac5e598dd84b",
+    "directory": "launch-pad-5b516ee",
+    "version": "1.0.1"
+  },
+  "default_features": false,
+  "features": [
+    "cyxia-native"
+  ],
+  "launch_pad_features": [
+    "cyxia-native"
+  ],
+  "guest_execution": false,
+  "cosmic_session_ready": false
+}

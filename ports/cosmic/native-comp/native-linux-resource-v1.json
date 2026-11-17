@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "comp-full-os-linux-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Genuine cosmic-comp with the reviewed native Cyxia backend, explicit Linux host tools and the existing FullOsV3 loader contract. Compilation and static admission do not establish a running desktop.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 3221225472,
+      "timeout_seconds": 3600,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

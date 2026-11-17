@@ -1153,7 +1153,7 @@ impl Supervisor {
         fs.register_boot_file(cyxia_ai_fs::Path::resolve(
             cyxia_ai_fs::Path::ROOT, "/dev/null",
         )?)?;
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "cosmic-settings-daemon" | "settings-probe" | "theme-defaults" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
+        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "cosmic-settings-daemon" | "cosmic-notifications" | "notification-probe" | "settings-probe" | "theme-defaults" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1315,7 +1315,7 @@ impl Supervisor {
                 } else {
                     normal_argv
                 },
-                envp: if image_name == "cosmic-settings-daemon" { settings_environment }
+                envp: if matches!(image_name, "cosmic-settings-daemon" | "cosmic-notifications") { settings_environment }
                     else if uses_session_runtime { session_environment } else { legacy_environment },
                 execfn: path.as_bytes(),
             },
@@ -1615,6 +1615,17 @@ impl Supervisor {
         }
         let free = self.ledger.snapshot().free;
         for runner in &mut self.runners {
+            // All dispatch contexts are back under CPU0 ownership here. These
+            // saved registers help locate slow initialization without sampling
+            // an active AP or changing scheduling/resource decisions.
+            runner.status.observed_tid = runner.thread.tid;
+            runner.status.observed_pc = runner.thread.context.pc();
+            runner.status.observed_sp = runner.thread.context.sp();
+            runner.status.observed_syscall = runner.thread.context.syscall_number();
+            #[cfg(target_arch = "x86_64")]
+            {
+                runner.status.space_retire_ns = runner.space.retired_ns();
+            }
             runner.status.free_pages = free;
             runner.status.heap_pages = runner.heap.used();
             runner.status.heap_free = runner.heap.free();
@@ -1680,6 +1691,16 @@ impl Runner {
             || self.shared.contains_mapping(address)
     }
     fn prepare_space(&mut self) -> Result<(), Errno> {
+        let started = now_ns();
+        let result = self.build_space();
+        self.status.space_rebuilds = self.status.space_rebuilds.saturating_add(1);
+        self.status.space_prepare_ns = self
+            .status
+            .space_prepare_ns
+            .saturating_add(now_ns().saturating_sub(started));
+        result
+    }
+    fn build_space(&mut self) -> Result<(), Errno> {
         self.space.begin()?;
         #[cfg(feature = "ported")]
         if self.linux {

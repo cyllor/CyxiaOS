@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-comp",
+  "binary": "cosmic-comp",
+  "resource_profile": "comp-full-os-linux-v1",
+  "default_features": false,
+  "features": [
+    "backend-cyxia"
+  ],
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "effective_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "patches": [],
+  "source_series": {
+    "path": "ports/cosmic/native-comp/native-series.json",
+    "sha256": "365242b0ed76c1c0e9e6df893d8f0db185d083989b411b3ec746f884ba74f8e6"
+  },
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "10b961035a37a810e298045e55bbafadb3af58f5f5dde7e9141e167e29ad5b38"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "4812a564193fc6589fe59af76e0f927afcc9f50f65f3d56117c68dd692489059"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "9807bd4504d88850c14ff9be38bf8ee8cd581bd4de61347697fc75c21dd82827"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+      "sha256": "1de9448784cfa4806ed3569c45a65d4f6f93d2bbcd9b421f8ec36db3d9c45aaf"
+    },
+    {
+      "path": "mesa-native-port/build/src/egl/libEGL.a",
+      "sha256": "93efb3f53dc55f7f0eae0d9571e68c0f01218f06ebaffa57493792f097d389a5"
+    },
+    {
+      "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+      "sha256": "ce206cea3d2101317b3d4a399857d3413433a0deee3959ec4684d25cbf08106b"
+    },
+    {
+      "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+      "sha256": "9ca241cce4535fa262469a2bece4f71c07796bd9352fdea8a529d445986eac10"
+    },
+    {
+      "path": "sysroot/usr/lib/libz.a",
+      "sha256": "6d891042ce5b64a7b22cdd807e970235ee8d2ba6d092e489ff3671bbe4a6a7bb"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "deb7a2d065e1022cdd3d32a5ea2ccc41e727b5f69ebd37942685c26d8d3956a3"
+    },
+    {
+      "path": "sysroot/usr/lib/libpixman-1.a",
+      "sha256": "8433fd8e3c18219e87d84e351367771a387bb4422c62fb10e3d7bb480c34c6e2"
+    }
+  ],
+  "static_link_inputs": [
+    "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+    "mesa-native-port/build/src/egl/libEGL.a",
+    "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+    "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+    "sysroot/usr/lib/libz.a",
+    "sysroot/usr/lib/libxkbcommon.a",
+    "sysroot/usr/lib/libpixman-1.a"
+  ]
+}

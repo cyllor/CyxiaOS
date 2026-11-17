@@ -111,6 +111,7 @@ pub struct ProcessSpace {
     current: Option<cyxia_arch_x86_64::space::AddressSpace<'static>>,
     slot: usize,
     pid: u32,
+    retire_ns: u64,
 }
 // SAFETY: this owner exclusively reserves its table frames in the globally
 // identical HIGH+PA direct map. Transfers occur only while no resume owns the
@@ -125,12 +126,14 @@ impl ProcessSpace {
             current: None,
             slot: usize::MAX,
             pid: 0,
+            retire_ns: 0,
         }
     }
     pub fn bind(&mut self, slot: usize, pid: u32) {
         assert!(self.current.is_none());
         self.slot = slot;
         self.pid = pid;
+        self.retire_ns = 0;
     }
     pub fn begin(&mut self) -> Result<(), Errno> {
         use cyxia_arch_x86_64::space::{AddressSpace, SpaceId, TableArena};
@@ -188,6 +191,17 @@ impl ProcessSpace {
     /// The caller already returned from resume: kernel CR3 is live, no PCID or
     /// global user mappings exist, and no other CPU may enter this process.
     pub fn retire(&mut self) {
+        if self.current.is_none() {
+            return;
+        }
+        let started = crate::process_arch::now_ns();
         drop(self.current.take());
+        self.retire_ns = self.retire_ns.saturating_add(
+            crate::process_arch::now_ns().saturating_sub(started),
+        );
+    }
+    /// Read only after the owned job has returned; no live AP is inspected.
+    pub fn retired_ns(&self) -> u64 {
+        self.retire_ns
     }
 }

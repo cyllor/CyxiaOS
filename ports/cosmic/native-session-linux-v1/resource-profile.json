@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "session-native-linux-x86_64-full-os-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Explicit Linux host build of pinned genuine cosmic-session and native launch-pad. One shared 900 s deadline and 512 MiB build growth budget; experimental bounds, not runtime proof. FullOsV3 loader admission includes a 2 MiB stack inside 64 MiB private image backing. No guest or session-ready claim.",
+      "jobs_max": 1,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 536870912,
+      "timeout_seconds": 900,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

@@ -2,6 +2,7 @@
 //! x86-64 instruction, descriptor and page-table mechanisms.
 //! PC discovery and device policy belong to the platform adapter.
 pub mod accounting;
+pub mod code_permissions;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub mod cpu;
 pub mod apic;

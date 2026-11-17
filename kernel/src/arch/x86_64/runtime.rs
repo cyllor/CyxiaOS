@@ -2,6 +2,7 @@
 use super::*;
 use arch::{
     apic::LocalApic,
+    code_permissions::{self, Backend, Pages, Phase, PhaseTable},
     space::{Error, KERNEL_BASE, KernelMappings},
 };
 use core::sync::atomic::AtomicBool;
@@ -49,7 +50,8 @@ static IRQ_HANDLER: AtomicU64 = AtomicU64::new(0);
 static TLB_EPOCH: AtomicU64 = AtomicU64::new(0);
 static TLB_ACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static TLB_GATE: AtomicBool = AtomicBool::new(false);
-static SEALED: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+// Two bits per physical page: writable, transition, or sealed after real fences.
+static CODE_PHASES: PhaseTable<8192> = PhaseTable::new();
 // Three 20-bit counts: all user mappings, writable aliases, executable aliases.
 static USER_ALIASES: [AtomicU64; 262144] = [const { AtomicU64::new(0) }; 262144];
 static ALIAS_GATE: AtomicBool = AtomicBool::new(false);
@@ -625,10 +627,22 @@ extern "C" fn x86_trap(frame: &mut TrapFrame) -> u64 {
         0
     } else {
         panic!(
-            "kernel trap {} at {:x} cr2 {:x}",
+            "kernel trap {} cpu={} error={:x} rip={:x} cr2={:x} cr3={:x} cs={:x} rsp={:x} ss={:x} flags={:x} rax={:x} rdi={:x} rdx={:x} rcx={:x} rbp={:x}",
             frame.vector,
+            cpu_slot(),
+            frame.error,
             frame.rip,
-            arch::cpu::read_cr2()
+            arch::cpu::read_cr2(),
+            arch::cpu::read_cr3(),
+            frame.cs,
+            frame.rsp,
+            frame.ss,
+            frame.rflags,
+            frame.rax,
+            frame.rdi,
+            frame.rdx,
+            frame.rcx,
+            frame.rbp
         );
     }
 }
@@ -673,12 +687,19 @@ pub fn synchronize_tlb() -> Result<(), Error> {
     }
     Ok(())
 }
+fn code_phase(physical: u64) -> Option<Phase> {
+    if physical >= RAM || physical % 4096 != 0 {
+        return None;
+    }
+    CODE_PHASES.get((physical / 4096) as usize)
+}
 #[unsafe(no_mangle)]
 extern "C" fn x86_runtime_code_sealed(physical: u64) -> bool {
-    physical < RAM
-        && SEALED[(physical / 4096 / 64) as usize].load(Ordering::Acquire)
-            & (1 << (physical / 4096 % 64))
-            != 0
+    code_phase(physical) == Some(Phase::StableSealed)
+}
+/// Transition is never treated as writable, even when SEALED was never committed.
+pub fn is_user_code_writable(physical: u64) -> bool {
+    code_phase(physical) == Some(Phase::StableWritable)
 }
 pub fn is_user_code_sealed(physical: u64) -> bool {
     x86_runtime_code_sealed(physical)
@@ -691,8 +712,10 @@ extern "C" fn x86_runtime_mapping_change(physical: u64, old: u64, new: u64) -> b
     let Ok(_guard) = alias_guard() else {
         return false;
     };
-    let sealed = x86_runtime_code_sealed(physical);
-    if new & 4 != 0 && !sealed || new & 2 != 0 && sealed {
+    let Some(phase) = code_phase(physical) else {
+        return false;
+    };
+    if !phase.permits_mapping(new) {
         return false;
     }
     let counter = &USER_ALIASES[(physical / 4096) as usize];
@@ -714,67 +737,44 @@ extern "C" fn x86_runtime_mapping_change(physical: u64, old: u64, new: u64) -> b
     counter.store(updated, Ordering::Release);
     true
 }
+// The board retains its existing alias lock, actual PTE writer, IPI delivery,
+// remote ACK handling and 100 ms deadline. The helper owns only transaction order.
+struct CodePermissions;
+impl Backend for CodePermissions {
+    fn phase(&self, physical: u64) -> Phase {
+        code_phase(physical).expect("validated code permission range")
+    }
+    fn record(&mut self, physical: u64, phase: Phase) {
+        CODE_PHASES.set((physical / 4096) as usize, phase)
+            .expect("validated code permission range");
+    }
+    fn aliases(&self, physical: u64) -> (u64, u64) {
+        let value = USER_ALIASES[(physical / 4096) as usize].load(Ordering::Acquire);
+        (value & 0xfffff, (value >> 20) & 0xfffff)
+    }
+    fn set_writable(&mut self, physical: u64, writable: bool) -> Result<(), Error> {
+        unsafe { arch::kernel_space::set_direct_permissions(physical, writable) }
+    }
+    fn synchronize(&mut self) -> Result<(), Error> {
+        synchronize_tlb()
+    }
+}
 /// Caller has exclusive allocation ownership and has stopped every context and
 /// device/reference that could mutate these frames. A timeout keeps them pinned.
 pub unsafe fn seal_user_code(physical: u64, length: usize) -> Result<(), Error> {
-    if length == 0
-        || physical % 4096 != 0
-        || length % 4096 != 0
-        || physical < pa(core::ptr::addr_of!(__rodata_end) as u64)
-        || physical
-            .checked_add(length as u64)
-            .is_none_or(|end| end > RAM)
-    {
+    let pages = Pages::new(physical, length, RAM)?;
+    if physical < pa(core::ptr::addr_of!(__rodata_end) as u64) {
         return Err(Error::Address);
     }
     let _guard = alias_guard()?;
-    for page in (physical..physical + length as u64).step_by(4096) {
-        if (USER_ALIASES[(page / 4096) as usize].load(Ordering::Acquire) >> 20) & 0xfffff != 0 {
-            return Err(Error::Permissions);
-        }
-    }
-    for page in (physical..physical + length as u64).step_by(4096) {
-        unsafe {
-            arch::kernel_space::set_direct_permissions(page, false)?;
-        }
-    }
-    synchronize_tlb()?;
-    for page in (physical..physical + length as u64).step_by(4096) {
-        SEALED[(page / 4096 / 64) as usize].fetch_or(1 << (page / 4096 % 64), Ordering::Release);
-    }
-    Ok(())
+    code_permissions::seal(pages, &mut CodePermissions)
 }
 /// # Safety
 /// All process mappings/contexts, shared loans and DMA owners of these frames
-/// were retired, and the caller retains custody until this flush completes.
+/// were retired, and the caller retains custody until both flushes complete.
+/// A partial transition must be repaired or quarantined, never skipped as RW.
 pub unsafe fn unseal_user_code(physical: u64, length: usize) -> Result<(), Error> {
-    if length == 0
-        || physical % 4096 != 0
-        || length % 4096 != 0
-        || physical
-            .checked_add(length as u64)
-            .is_none_or(|end| end > RAM)
-    {
-        return Err(Error::Address);
-    }
+    let pages = Pages::new(physical, length, RAM)?;
     let _guard = alias_guard()?;
-    for page in (physical..physical + length as u64).step_by(4096) {
-        if USER_ALIASES[(page / 4096) as usize].load(Ordering::Acquire) != 0 {
-            return Err(Error::Active);
-        }
-    }
-    for page in (physical..physical + length as u64).step_by(4096) {
-        if !x86_runtime_code_sealed(page) {
-            return Err(Error::Permissions);
-        }
-        SEALED[(page / 4096 / 64) as usize]
-            .fetch_and(!(1 << (page / 4096 % 64)), Ordering::Release);
-    }
-    synchronize_tlb()?;
-    for page in (physical..physical + length as u64).step_by(4096) {
-        unsafe {
-            arch::kernel_space::set_direct_permissions(page, true)?;
-        }
-    }
-    synchronize_tlb()
+    code_permissions::unseal(pages, &mut CodePermissions)
 }

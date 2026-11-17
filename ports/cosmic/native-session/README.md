@@ -66,7 +66,13 @@ including TERM (143), KILL (137), or a completed graceful exit. A failed kill/re
 reports an unknown status with its error logged. The guest probe covers both
 default TERM and delayed graceful exit as well as ignored TERM followed by KILL.
 
-The global eight-pipe pool remains a real capacity limit. A running manager uses
-three pipes per child; session completion also requires actual mandatory daemon,
-panel, and application images. This boundary port does not certify a complete
-COSMIC session.
+The `full-os` profile provides 32 global pipe pairs; the current admission policy
+reserves two, so 30 pairs are usable. The ordinary profile still has an
+eight-pair pool. `NativeChild::spawn` creates three pairs per child, and their
+actual lifetime depends on endpoint closure and child reaping. The current
+eight-Runner configuration admits seven concurrent processes, so full-session
+planning must include the manager, mandatory services and any helper children.
+The real FullOs pipe-capacity run is recorded in
+`docs/implementation/v17-cosmic-completion-20261116.md`; it does not establish
+that a complete COSMIC session fits or runs. Session acceptance still requires
+the actual daemon, panel and application images and their runtime evidence.

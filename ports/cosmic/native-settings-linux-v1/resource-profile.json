@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "settings-native-linux-x86_64-full-os-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Explicit Linux-host build of pinned genuine cosmic-settings-daemon using the unchanged reviewed native-settings patch. One shared 1200 s deadline, 2 jobs, and 1.5 GiB growth; original experimental bounds are unchanged. FullOsV3 admission includes a 2 MiB stack in 64 MiB image backing. Audio and backlight mutations remain NotSupported. No guest, settings behavior or session-ready claim.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 1610612736,
+      "timeout_seconds": 1200,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

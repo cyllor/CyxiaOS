@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-notifications",
+  "commit": "1e4c1f11fdcae273d6954fd0bfc54749a6145267",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-notifications",
+  "binary": "cosmic-notifications",
+  "resource_profile": "notifications-static-bindings-x86_64-full-os-v1",
+  "default_features": false,
+  "features": [
+    "cyxia-static"
+  ],
+  "source_lock_sha256": "448b38cb6bff1447d0b4fcd3b2f5bafa0b0c72d5200174f2932887eea831953b",
+  "effective_lock_sha256": "2b1590c107e77d72c3f29b45733f9a2ed470f39462e0b247e95dbfeac185dd78",
+  "patches": [
+    {
+      "path": "notifications-static-feature.patch",
+      "sha256": "183cfe416fb1a7133baa6c31e2bc170586da5d45d35f671d52e9d3b614d3f45a"
+    },
+    {
+      "path": "wayland-sys-0.31.11-static-client.patch",
+      "sha256": "6fc94cda00e21a5dba78381676fddfdef1c5f1d4a8fa9a8ffee81c848a256c25"
+    },
+    {
+      "path": "xkbcommon-dl-0.4.2-static-link.patch",
+      "sha256": "f019b8c65c58e6459924bbf3a2826d77be0c3106cb4359af74b038ce4d87bd17"
+    }
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "10b961035a37a810e298045e55bbafadb3af58f5f5dde7e9141e167e29ad5b38"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "4812a564193fc6589fe59af76e0f927afcc9f50f65f3d56117c68dd692489059"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "9807bd4504d88850c14ff9be38bf8ee8cd581bd4de61347697fc75c21dd82827"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "98fdfe49aa09676894c5e1d606a889e0a60f3a7ddfcd7768a59f109a2485bea0"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "f86d85b632cd041d6338616fa19b46110e68c6a399be8ad61da45a2927837d75"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "deb7a2d065e1022cdd3d32a5ea2ccc41e727b5f69ebd37942685c26d8d3956a3"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon-x11.a",
+      "sha256": "c407a8ad961f4dfbe73e75d81af93f2307ea13e9fa3e551d9b8524d5cddbae56"
+    },
+    {
+      "path": "sysroot/usr/lib/libxcb-xkb.a",
+      "sha256": "f264e120cc89b1331f81a7015f1b4d0308fa397a6a658468e04fb1247ea601e5"
+    },
+    {
+      "path": "sysroot/usr/lib/libxcb.a",
+      "sha256": "ae491225aa6028d0b2a83bdf3074dfdc19adfee5e6fab94e6faba2a3ffdc3dcd"
+    },
+    {
+      "path": "sysroot/usr/lib/libXau.a",
+      "sha256": "98b875627e7f0fbbbbf95f20a83a705db71784f374066795aeee7c44402ca3f9"
+    }
+  ],
+  "static_link_inputs": [
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libxkbcommon.a",
+    "sysroot/usr/lib/libxkbcommon-x11.a",
+    "sysroot/usr/lib/libxcb-xkb.a",
+    "sysroot/usr/lib/libxcb.a",
+    "sysroot/usr/lib/libXau.a"
+  ],
+  "static_source_policy": {
+    "path": "source-policy.json",
+    "sha256": "1d019f34e76492345c429ad0489904c1ff463e164fea57041015d5cc29f67c20"
+  },
+  "native_sdk_origin": {
+    "path": "runtime-sdk-origin.json",
+    "sha256": "bf26026042bca8b6d83727844e59fcbd70efe34e63835a838dbccbb78fe7b7f3"
+  },
+  "reviewed_rust_flags": [
+    "--cfg",
+    "tokio_unstable"
+  ],
+  "reviewed_rustdoc_flags": [
+    "--cfg",
+    "tokio_unstable"
+  ]
+}

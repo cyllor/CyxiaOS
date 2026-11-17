@@ -30,7 +30,10 @@ pub(crate) fn exit(success: bool) -> ! {
 }
 
 struct Message {
-    bytes: [u8; 96],
+    // A file/line prefix plus a complete kernel trap record exceeds 96 bytes.
+    // Keep fatal diagnostics bounded without discarding the fault address and
+    // registers needed to distinguish permission faults from invalid backing.
+    bytes: [u8; 512],
     len: usize,
 }
 impl core::fmt::Write for Message {
@@ -55,7 +58,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         arch::cpu::halt();
     }
     let mut message = Message {
-        bytes: [0; 96],
+        bytes: [0; 512],
         len: 0,
     };
     let _ = write!(&mut message, "X86_FAIL {}", info);

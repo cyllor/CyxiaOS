@@ -334,14 +334,13 @@ pub fn make_writable(address: u64, length: usize) -> Result<(), Errno> {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe extern "C" {
-            fn x86_runtime_code_sealed(physical: u64) -> bool;
-        }
         let physical = address.checked_sub(crate::HIGH).ok_or(Errno::Fault)?;
         for page in
             (physical..physical.checked_add(length as u64).ok_or(Errno::Fault)?).step_by(4096)
         {
-            if unsafe { x86_runtime_code_sealed(page) } {
+            // A failed seal/unseal may have changed a PTE without completing its
+            // fence. Only StableWritable permits zeroing or backing reuse.
+            if !crate::machine::runtime::is_user_code_writable(page) {
                 unsafe { crate::machine::runtime::unseal_user_code(page, 4096) }
                     .map_err(|_| Errno::Io)?;
             }
@@ -369,7 +368,8 @@ pub fn publish_code(address: u64, length: usize) -> Result<(), Errno> {
             fn x86_runtime_code_sealed(physical: u64) -> bool;
         }
         let physical = address.checked_sub(crate::HIGH).ok_or(Errno::Fault)?;
-        if !unsafe { x86_runtime_code_sealed(physical) } {
+        let end = physical.checked_add(length as u64).ok_or(Errno::Fault)?;
+        if (physical..end).step_by(4096).any(|page| !unsafe { x86_runtime_code_sealed(page) }) {
             unsafe { crate::machine::runtime::seal_user_code(physical, length) }
                 .map_err(|_| Errno::Io)?;
         }
