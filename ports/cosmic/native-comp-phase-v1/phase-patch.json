@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-comp",
+  "repository": "https://github.com/pop-os/cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "base_patch_sha256": "d519045791f3687fe0f3aa7de51f92e239dd50ab270da492f0bbe9c675b12851",
+  "patch_sha256": "2432dc596d2011b9ffd1f04afe94fb59ac4f944ca81346761cddad316cfed05b",
+  "before": {
+    "src/lib.rs": "376fa56a4c06d090e20996dfa2214d7789f3f05162c41e5a5063afccf2c36a01",
+    "src/backend/cyxia/mod.rs": "2b9bddc2f8d67739e9ddd53ddbeae934c99f46ba50692818b54e097d80d92d3d",
+    "src/backend/cyxia/native/presentation.rs": "6eea5ad12131719f9c9bcb70b102e9ba8d757f404473c14b56cfbcb345a7fc70",
+    "src/backend/cyxia/phase.rs": null
+  },
+  "after": {
+    "src/lib.rs": "1cc5b3d217475a10a345fe97473a4c6d5d20c09887f5b78555bc717898eae07a",
+    "src/backend/cyxia/mod.rs": "4ad4d65ada97e0e1b6bd4e7d34df11c4269b8173235c2d9b74fb67374fb746a7",
+    "src/backend/cyxia/native/presentation.rs": "e268bd488cc200d66c3f75c11ffc8bb7e0f418cb93d2e90af20e6261464a6632",
+    "src/backend/cyxia/phase.rs": "7c688b68ea73ae00535b6209e5a7b273265327bfab56872fb5f3f2f7e92a6ac9"
+  },
+  "status": "PHASE_OBSERVATION_SOURCE_CANDIDATE_NOT_BUILT_NOT_RUN"
+}

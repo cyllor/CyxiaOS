@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "kind": "cosmic-comp-native-linux-phase-v1",
+  "component": "cosmic-comp",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "source_lock_sha256": "ecfa6705314e3821534170a01afd5014478fd4800bd699abb7ccd04b7dfb34b8",
+  "base_series": {
+    "path": "ports/cosmic/native-comp/native-series.json",
+    "sha256": "365242b0ed76c1c0e9e6df893d8f0db185d083989b411b3ec746f884ba74f8e6"
+  },
+  "base_recipe": {
+    "path": "/workspace/scratch/99a018f40879/CyxiaOS-cosmic/artifacts/v017-cosmic-runtime-20261117/compositor-production-recipe-v2/native-linux-recipe-v1.json",
+    "sha256": "9904f0ab3651f42a52f88d870deddda89938f8c99407fe152cf57b5510345c52",
+    "reference_only": true
+  },
+  "phase_patch": {
+    "path": "ports/cosmic/native-comp-phase-v1/phase-patch.json",
+    "sha256": "3377f5d34eb8b05758d7f59615a89d908527a0f6f68b1003da0ce7632402f330"
+  },
+  "resource_profile": {
+    "path": "ports/cosmic/native-comp/native-linux-resource-v1.json",
+    "sha256": "1129e66fd05009989a4327b30da8a9eef757f7f1b0da2bc88218c37ad65d1824"
+  },
+  "preserved_resolution": {
+    "package_count": 468,
+    "normalized_graph_sha256": "d36b5d5db3d755b104a5b50af64fd650df1fad0b30e13958f86566427c41e4fd",
+    "workspace": [
+      {
+        "name": "cosmic-comp",
+        "version": "1.0.0",
+        "manifest": "Cargo.toml"
+      },
+      {
+        "name": "cosmic-comp-config",
+        "version": "1.0.0",
+        "manifest": "cosmic-comp-config/Cargo.toml"
+      }
+    ],
+    "default_members": [
+      "Cargo.toml"
+    ],
+    "root_features": [
+      "backend-cyxia"
+    ]
+  },
+  "resolution_basis": {
+    "path": "/workspace/scratch/99a018f40879/CyxiaOS-cosmic/artifacts/v017-cosmic-runtime-20261117/compositor-build-production-v2/metadata.json",
+    "bytes": 2333905,
+    "sha256": "f3f47787aa803335f4421c75a0b1e172355807cbc41bb952f2f14d687c34c18b",
+    "reference_only_not_new_build_proof": true,
+    "normalizer": {
+      "path": "tools/cosmic_notifications_static_v1.py",
+      "sha256": "b518ec759dfd35708ad2df0e7d2084e9aa592d2901b6bd24e3d1d6070e6f24d7"
+    }
+  },
+  "observation": {
+    "protocol": "CYXIA_COMP_PHASE_V1",
+    "clock": "std::time::Instant",
+    "origin": "state_begin_before_actual_State::new",
+    "unit": "nanoseconds",
+    "pid": "actual_std::process::id",
+    "events": [
+      "state_begin",
+      "state_end",
+      "egl_display_begin",
+      "egl_display_end",
+      "egl_context_begin",
+      "egl_context_end",
+      "renderer_begin",
+      "renderer_end",
+      "shaders_begin",
+      "shaders_end",
+      "first_render_begin",
+      "first_render_end",
+      "first_readback_copy_begin",
+      "first_readback_copy_end",
+      "first_readback_map_begin",
+      "first_readback_map_end",
+      "first_tile_submit_begin",
+      "first_tile_submit_end",
+      "first_full_scanout_complete"
+    ],
+    "max_record_attempts": 19,
+    "max_record_bytes": 160,
+    "max_output_bytes": 3040,
+    "write_errors": "ignored_after_once_claim_no_retry_by_observer",
+    "first_render_includes": "bind_render_and_sync_wait",
+    "first_full_scanout_complete": "same_first_render_cursor_all_native_tiles_completed_Ok_0",
+    "black_scanout_included": false,
+    "host_launch_clock": false,
+    "timing_gate_input": false,
+    "runtime_success_claim": false
+  },
+  "guest_execution": false
+}

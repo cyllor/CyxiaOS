@@ -1,0 +1,271 @@
+--- a/src/backend/cyxia/mod.rs
++++ b/src/backend/cyxia/mod.rs
+@@ -9,6 +9,7 @@
+ mod input;
+ mod locking;
+ mod native;
++pub(crate) mod phase;
+ mod scheduling;
+ 
+ use crate::{
+@@ -24,6 +25,7 @@
+ use locking::{LockBarrier, owner_is_live};
+ pub(crate) use locking::{LockFocusTarget, PendingInput, input_allowed, lock_focus_allowed};
+ use native::{InputAction, InputDecoder, NativeDisplay, presentation::PendingPresentation};
++use phase::Phase;
+ use scheduling::RenderSchedule;
+ use smithay::{
+     backend::{
+@@ -198,6 +200,7 @@
+     }
+ 
+     fn render_output(&mut self, common: &mut Common) -> Result<()> {
++        let first_frame = phase::mark_once(Phase::FirstRenderBegin);
+         // Clear at rendering, never at tile completion: commits received while
+         // presentation is pending must remain dirty for the next real frame.
+         self.schedule.begin();
+@@ -224,6 +227,12 @@
+         )
+         .context("Render COSMIC output for Cyxia")?;
+         sync.wait().context("Wait for COSMIC rendering")?;
++        if first_frame {
++            phase::mark_once(Phase::FirstRenderEnd);
++            if damage.is_some() {
++                phase::mark_once(Phase::FirstReadbackCopyBegin);
++            }
++        }
+         let mapping = if damage.is_some() {
+             let info = self.native.info();
+             Some(
+@@ -238,6 +247,9 @@
+         } else {
+             None
+         };
++        if first_frame && mapping.is_some() {
++            phase::mark_once(Phase::FirstReadbackCopyEnd);
++        }
+         drop(fb);
+         // Select actual rendered surfaces and snapshot their presentation
+         // requests before yielding. A newer commit must not be reported as this
+@@ -248,7 +260,8 @@
+             .read()
+             .take_presentation_feedback(&self.output, &states);
+         if let Some(mapping) = mapping {
+-            let presentation = PendingPresentation::new(self.native.info(), mapping.flipped())?;
++            let mut presentation = PendingPresentation::new(self.native.info(), mapping.flipped())?;
++            presentation.observe_first_frame(first_frame);
+             self.pending = Some(PendingFrame {
+                 mapping,
+                 presentation,
+@@ -265,10 +278,16 @@
+         let Some(frame) = self.pending.as_mut() else {
+             return Ok(());
+         };
++        if frame.presentation.observes_first_frame() {
++            phase::mark_once(Phase::FirstReadbackMapBegin);
++        }
+         let bytes = self
+             .renderer
+             .map_texture(&frame.mapping)
+             .context("Map COSMIC framebuffer")?;
++        if frame.presentation.observes_first_frame() {
++            phase::mark_once(Phase::FirstReadbackMapEnd);
++        }
+         if !frame
+             .presentation
+             .advance(bytes, TILES_PER_TICK)
+@@ -479,12 +498,20 @@
+     egl::load().context("Load linked Mesa EGL dispatch")?;
+     // SAFETY: the backend exclusively owns this EGL display/context on the
+     // event-loop thread. No native pointer or DRM fd is fabricated.
++    phase::mark_once(Phase::EglDisplayBegin);
+     let display =
+         unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.context("Open surfaceless EGL")?;
++    phase::mark_once(Phase::EglDisplayEnd);
++    phase::mark_once(Phase::EglContextBegin);
+     let context = EGLContext::new(&display).context("Create Cyxia EGL context")?;
++    phase::mark_once(Phase::EglContextEnd);
++    phase::mark_once(Phase::RendererBegin);
+     let mut renderer =
+         unsafe { GlowRenderer::new(context) }.context("Create Cyxia Glow renderer")?;
++    phase::mark_once(Phase::RendererEnd);
++    phase::mark_once(Phase::ShadersBegin);
+     init_shaders(renderer.borrow_mut()).context("Initialize COSMIC shaders")?;
++    phase::mark_once(Phase::ShadersEnd);
+     let size = (info.width as i32, info.height as i32);
+     let buffer = renderer
+         .create_buffer(Fourcc::Abgr8888, size.into())
+--- a/src/backend/cyxia/native/presentation.rs
++++ b/src/backend/cyxia/native/presentation.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ //! Bounded, resumable native tile submission for the actual COSMIC event loop.
++#[cfg(feature = "backend-cyxia")]
++use super::super::phase::{self, Phase};
+ use super::{DisplayInfo, Rectangle, invalid, syscall_result, syscall6, validate_info};
+ use std::{
+     io,
+@@ -17,6 +19,7 @@
+     tile: Vec<u8>,
+     ready: bool,
+     failed: bool,
++    observe_first_frame: bool,
+     // Only an actually completed tile renews this no-progress watchdog.
+     deadline: Instant,
+ }
+@@ -55,8 +58,18 @@
+             tile,
+             ready: false,
+             failed: false,
++            observe_first_frame: false,
+             deadline: Instant::now() + STALL_TIMEOUT,
+         })
++    }
++
++    /// Observe only the cursor bound to the first actual render attempt.
++    pub fn observe_first_frame(&mut self, observe: bool) {
++        self.observe_first_frame = observe;
++    }
++
++    pub fn observes_first_frame(&self) -> bool {
++        self.observe_first_frame
+     }
+ 
+     /// At most `budget` syscalls, no sleeping or retry loop on EAGAIN/EINTR.
+@@ -162,6 +175,10 @@
+                 width: columns,
+                 height: rows,
+             };
++            #[cfg(feature = "backend-cyxia")]
++            if self.observe_first_frame && rgba.is_some() {
++                phase::mark_once(Phase::FirstTileSubmitBegin);
++            }
+             match submit(rect, &self.tile[..length]) {
+                 Ok(0) => {
+                     self.ready = false;
+@@ -174,6 +191,13 @@
+                     // load. Renew only after the native ABI reports that this
+                     // tile completed; retries and dispatches are not progress.
+                     self.deadline = now() + STALL_TIMEOUT;
++                    #[cfg(feature = "backend-cyxia")]
++                    if self.observe_first_frame && rgba.is_some() {
++                        phase::mark_once(Phase::FirstTileSubmitEnd);
++                        if self.left == self.info.width {
++                            phase::mark_once(Phase::FirstFullScanoutComplete);
++                        }
++                    }
+                 }
+                 Err(err)
+                     if matches!(
+--- /dev/null
++++ b/src/backend/cyxia/phase.rs
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: GPL-3.0-only
++//! Once-only observations of genuine work, independent of all runtime gates.
++//!
++//! The clock starts at the first State::new begin marker, not at guest boot or
++//! host launch. These are bounded write attempts; I/O failure loses evidence
++//! and never changes rendering, error propagation or presentation completion.
++use std::{
++    io::Write,
++    sync::{OnceLock, atomic::{AtomicU32, Ordering}},
++    time::Instant,
++};
++
++static SEEN: AtomicU32 = AtomicU32::new(0);
++static ORIGIN: OnceLock<Instant> = OnceLock::new();
++static PID: OnceLock<u32> = OnceLock::new();
++const MAX_RECORD_BYTES: usize = 160;
++
++#[derive(Clone, Copy)]
++#[repr(u32)]
++pub(crate) enum Phase {
++    StateBegin,
++    StateEnd,
++    EglDisplayBegin,
++    EglDisplayEnd,
++    EglContextBegin,
++    EglContextEnd,
++    RendererBegin,
++    RendererEnd,
++    ShadersBegin,
++    ShadersEnd,
++    FirstRenderBegin,
++    FirstRenderEnd,
++    FirstReadbackCopyBegin,
++    FirstReadbackCopyEnd,
++    FirstReadbackMapBegin,
++    FirstReadbackMapEnd,
++    FirstTileSubmitBegin,
++    FirstTileSubmitEnd,
++    FirstFullScanoutComplete,
++}
++
++impl Phase {
++    fn name(self) -> &'static str {
++        match self {
++            Self::StateBegin => "state_begin",
++            Self::StateEnd => "state_end",
++            Self::EglDisplayBegin => "egl_display_begin",
++            Self::EglDisplayEnd => "egl_display_end",
++            Self::EglContextBegin => "egl_context_begin",
++            Self::EglContextEnd => "egl_context_end",
++            Self::RendererBegin => "renderer_begin",
++            Self::RendererEnd => "renderer_end",
++            Self::ShadersBegin => "shaders_begin",
++            Self::ShadersEnd => "shaders_end",
++            Self::FirstRenderBegin => "first_render_begin",
++            Self::FirstRenderEnd => "first_render_end",
++            Self::FirstReadbackCopyBegin => "first_readback_copy_begin",
++            Self::FirstReadbackCopyEnd => "first_readback_copy_end",
++            Self::FirstReadbackMapBegin => "first_readback_map_begin",
++            Self::FirstReadbackMapEnd => "first_readback_map_end",
++            Self::FirstTileSubmitBegin => "first_tile_submit_begin",
++            Self::FirstTileSubmitEnd => "first_tile_submit_end",
++            Self::FirstFullScanoutComplete => "first_full_scanout_complete",
++        }
++    }
++}
++
++/// Return whether this call claimed the event, even if the write fails.
++/// Nineteen closed enum variants permit at most nineteen 160-byte attempts.
++pub(crate) fn mark_once(phase: Phase) -> bool {
++    let bit = 1u32 << (phase as u32);
++    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
++        return false;
++    }
++    let elapsed_ns = ORIGIN.get_or_init(Instant::now).elapsed().as_nanos();
++    let pid = *PID.get_or_init(std::process::id);
++    let mut line = [0u8; MAX_RECORD_BYTES];
++    let mut remaining = &mut line[..];
++    let formatted = writeln!(
++        &mut remaining,
++        "CYXIA_COMP_PHASE_V1 pid={pid} phase={} elapsed_ns={elapsed_ns}",
++        phase.name(),
++    ).is_ok();
++    let length = MAX_RECORD_BYTES - remaining.len();
++    if formatted {
++        let _ = std::io::stderr().lock().write_all(&line[..length]);
++    }
++    true
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -177,6 +177,8 @@
+     // init wayland
+     let (display, socket) = init_wayland_display(&mut event_loop)?;
+     // init state
++    #[cfg(feature = "backend-cyxia")]
++    crate::backend::cyxia::phase::mark_once(crate::backend::cyxia::phase::Phase::StateBegin);
+     let mut state = state::State::new(
+         &display,
+         socket,
+@@ -185,6 +187,8 @@
+         with_xwayland,
+         kiosk_command,
+     );
++    #[cfg(feature = "backend-cyxia")]
++    crate::backend::cyxia::phase::mark_once(crate::backend::cyxia::phase::Phase::StateEnd);
+     // Set up the libei sender side before the backend spawns Xwayland.
+     let ei_sender = libei::setup_ei(&event_loop.handle());
+     state.common.dbus_state.set_ei_sender(ei_sender);
