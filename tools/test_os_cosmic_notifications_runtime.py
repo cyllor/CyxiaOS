@@ -806,5 +806,241 @@ class RuntimeBoundaries(unittest.TestCase):
                 channel.close()
 
 
+class LateFrameObservationBoundaries(unittest.TestCase):
+    """Controlled host clocks/I/O only; these are not guest or timing evidence."""
+
+    def frame_window(self, root, *, observe=True, available=60, global_deadline=240,
+                     command_delay=0, frame_delay=0, bad_frame=False, error=None, block_command=False,
+                     fail_milestone=False):
+        clock = SimpleNamespace(now=0.0)
+        console = subject.Console.__new__(subject.Console)
+        console.deadline, console.sock = global_deadline, SimpleNamespace(deadline=global_deadline)
+        console.raw, console.commands = bytearray(b'preserved partial background UART'), []
+        console.pump = lambda: subject.require(clock.now < console.deadline, 'fixture wait deadline')
+        qmp = SimpleNamespace(sock=SimpleNamespace(deadline=global_deadline + 8),
+                              observation_deadline=None, calls=[])
+        colors = [(255, 255, 255), (255, 255, 0), (0, 255, 255), (0, 255, 0),
+                  (255, 0, 255), (255, 0, 0), (0, 0, 255), (0, 0, 0)]
+        boot = b'P6\n1024 768\n255\n' + b''.join(bytes(color) * 128 for color in colors) * 768
+        (root / 'boot.ppm').write_bytes(boot)
+
+        def execute(command, args):
+            self.assertEqual(command, 'screendump')
+            qmp.calls.append((console.deadline, console.sock.deadline, qmp.sock.deadline,
+                              qmp.observation_deadline))
+            Path(args['filename']).write_bytes(boot if bad_frame else boot[:-3] + b'\x12\x34\x56')
+            clock.now += frame_delay
+
+        qmp.execute = execute
+
+        def observation(_):
+            clock.now += command_delay
+            if error is not None:
+                raise error
+            return subject.system_snapshot(snapshot(1, 3) if clock.now >= available else snapshot())
+
+        def active(*_):
+            if block_command:
+                clock.now = 119  # A first-loop command is still waiting near the absolute cap.
+                console.until(b'never emitted by this host fixture', timeout=30)
+
+        result = {'frames': [], 'observe_after_frame_deadline': observe, 'first_frame_deadline_failed': False}
+        caught = None
+        with patch.object(subject.time, 'monotonic', side_effect=lambda: clock.now), \
+                patch.object(subject.time, 'sleep', side_effect=lambda seconds: setattr(clock, 'now', clock.now + seconds)), \
+                patch.object(subject, 'active_processes', side_effect=active), \
+                patch.object(subject, 'system', side_effect=observation), \
+                patch.object(subject, 'write_json', wraps=subject.write_json,
+                             side_effect=OSError('host milestone write failure') if fail_milestone else None):
+            try:
+                subject.await_compositor_frame(console, qmp, root, subject.system_snapshot(snapshot()), 1, 3, result)
+            except (ValueError, TimeoutError) as failure:
+                caught = failure
+        self.assertEqual((console.deadline, console.sock.deadline, qmp.sock.deadline, qmp.observation_deadline),
+                         (global_deadline, global_deadline, global_deadline + 8, None))
+        self.assertEqual(console.raw, b'preserved partial background UART')
+        return result, clock, qmp, caught
+
+    def test_default_stops_at_original_gate_but_explicit_late_frame_keeps_failure(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result, clock, qmp, error = self.frame_window(root, observe=enabled)
+                if not enabled:
+                    self.assertIsInstance(error, ValueError)
+                    self.assertEqual(clock.now, 45)
+                    self.assertFalse(result['first_frame_deadline_failed'])
+                    self.assertFalse((root / 'first-frame-deadline-failure.json').exists())
+                    self.assertEqual(qmp.calls, [])
+                else:
+                    self.assertIsNone(error)
+                    self.assertEqual(clock.now, 60)
+                    self.assertTrue(result['first_frame_deadline_failed'])
+                    self.assertEqual(subject.document(root / 'first-frame-deadline-failure.json'),
+                                     result['first_frame_deadline_failure'])
+                    self.assertEqual(result['first_frame_deadline_failure']['status'], 'FAIL')
+                    self.assertEqual(qmp.calls, [(120, 120, 120, 120)])
+                    self.assertEqual(result['compositor_scanout']['completion']['receipt']['owner'], 3)
+                    self.assertEqual(result['compositor_scanout']['frame']['changed_pixels'], 1)
+                    self.assertFalse(result['compositor_scanout']['semantic_ui_verified'])
+
+    def test_commands_or_screenshots_crossing_45_are_late_without_duplicate_frames(self):
+        for command_delay, frame_delay in ((46, 0), (0, 46)):
+            with self.subTest(command_delay=command_delay, frame_delay=frame_delay), tempfile.TemporaryDirectory() as directory:
+                result, _, qmp, error = self.frame_window(Path(directory), available=0,
+                                                        command_delay=command_delay, frame_delay=frame_delay)
+                self.assertIsNone(error)
+                self.assertTrue(result['first_frame_deadline_failed'])
+                self.assertEqual(len(qmp.calls), 1)
+                self.assertEqual(len(result['frames']), 1)
+                self.assertEqual(result['compositor_scanout']['frame']['file'], 'compositor.ppm')
+
+    def test_late_window_never_extends_global_limit_and_rejects_missing_or_invalid_frame(self):
+        for global_deadline, expected_stop in ((240, 120), (60, 60)):
+            with self.subTest(global_deadline=global_deadline), tempfile.TemporaryDirectory() as directory:
+                result, clock, qmp, error = self.frame_window(Path(directory), available=999,
+                                                            global_deadline=global_deadline)
+                self.assertIsInstance(error, ValueError)
+                self.assertEqual(clock.now, expected_stop)
+                self.assertTrue(result['first_frame_deadline_failed'])
+                self.assertNotIn('compositor_scanout', result)
+                self.assertEqual(qmp.calls, [])
+        for change in ({'bad_frame': True}, {'available': 119, 'frame_delay': 2},
+                       {'error': ValueError('real command/fatal/process failure')},
+                       {'error': ValueError('original command failure after 45s'), 'command_delay': 46},
+                       {'error': ValueError('original survives milestone write failure'),
+                        'command_delay': 46, 'fail_milestone': True},
+                       {'block_command': True}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                result, clock, _, error = self.frame_window(Path(directory), **change)
+                self.assertIsInstance(error, ValueError)
+                self.assertNotIn('compositor_scanout', result)
+                self.assertEqual(result['first_frame_deadline_failed'],
+                                 'error' not in change or change.get('command_delay', 0) >= 45)
+                if 'error' in change:
+                    self.assertIs(error, change['error'])
+                if change.get('fail_milestone'):
+                    self.assertIn('host milestone write failure', result['first_frame_deadline_milestone_error'])
+                if change.get('block_command'):
+                    self.assertLess(clock.now, 120.01)
+
+    def test_qmp_real_receive_uses_earlier_cutoff_and_checks_already_pending_responses(self):
+        clock = SimpleNamespace(now=119.0)
+        channel = SimpleNamespace(timeout=0, sendall=lambda data: None)
+        channel.settimeout = lambda value: setattr(channel, 'timeout', value)
+
+        def timeout(_):
+            clock.now += channel.timeout
+            raise subject.socket.timeout('host fixture only')
+
+        channel.recv = timeout
+        qmp = subject.SessionQmp(channel)
+        with patch.object(subject.time, 'monotonic', side_effect=lambda: clock.now):
+            qmp.observation_deadline = 120
+            with self.assertRaisesRegex(TimeoutError, 'QMP response timeout'):
+                qmp.execute('screendump', {'filename': 'unused-host-fixture'})
+            self.assertEqual(clock.now, 120)
+            qmp.pending.append({'id': 1, 'return': {}})
+            with self.assertRaisesRegex(ValueError, 'Late frame observation deadline'):
+                qmp.receive(130)
+            qmp.observation_deadline = None
+            self.assertEqual(qmp.receive(130), {'id': 1, 'return': {}})
+
+    def test_actual_capture_finalizer_keeps_late_failure_and_rechecks_final_inputs_and_frames(self):
+        # Mock only the native/guest boundary. Execute the real capture finalizer,
+        # protocol parser, file hashes, summary writer and exit-status decision.
+        for mode in ('timely', 'late', 'changed-input', 'changed-frame', 'later-error'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ('build', 'dbus', 'comp', 'notify', 'probe', 'sdk', 'catalog', 'fonts', 'data', 'modules'):
+                    (root / name).mkdir()
+                (root / 'build/build-manifest.json').write_text(json.dumps({'sysroot': str(root / 'catalog')}))
+                for name, receipt in (('dbus', 'dbus-build-report.json'), ('comp', 'build-report.json'),
+                                      ('notify', 'build-report.json'), ('probe', 'build-report.json')):
+                    (root / name / receipt).write_text(json.dumps({'sysroot': str(root / 'sdk')}))
+                (root / 'catalog/cosmic-font-assets.json').write_text(json.dumps({'source': {'checkout': str(root / 'fonts')}}))
+                (root / 'catalog/ported_catalog.rs').write_bytes(b'host catalog fixture, not compiled')
+                (root / 'bios').write_bytes(b'host firmware fixture, not executable')
+                args = SimpleNamespace(build=root / 'build', dbus_build=root / 'dbus', compositor_build=root / 'comp',
+                                       notifications_build=root / 'notify', probe_build=root / 'probe', output=root / 'capture',
+                                       qemu_data=root / 'data', qemu_module_dir=root / 'modules', native_lock=root / 'lease',
+                                       bios=root / 'bios', observe_after_frame_deadline=mode != 'timely')
+                inputs = {'catalog': {'path': str(root / 'catalog/ported_catalog.rs')}}
+                machine = {'program': {'path': 'host-fixture-only'}, 'data_directory': str(root / 'data'),
+                           'module_directory': str(root / 'modules')}
+                raw = protocol()
+                pumps = []
+
+                class Channel:
+                    def __init__(self, path, deadline): self.deadline = deadline
+                    def connect(self, process): pass
+                    def close(self): pass
+
+                class GuestConsole:
+                    def __init__(self, *args): self.raw, self.commands = bytearray(raw), []
+                    def pump(self, *, require_running=True):
+                        pumps.append(require_running)
+                        if not require_running and mode == 'changed-frame':
+                            (args.output / 'host-frame.ppm').write_bytes(b'changed')
+
+                class Management:
+                    def __init__(self, channel): self.transcript = []
+                    def receive(self, deadline): return {'QMP': {}}
+                    def execute(self, command):
+                        self.transcript.append({'host_fixture_command': command})
+                        return {}
+
+                def session(console, qmp, output, values, result):
+                    result.update(launched={'cosmic-notifications': 31, 'notification-probe': 32},
+                                  probe_serial_start=0, protocol=subject.protocol_markers(raw, 31, 32, complete=True),
+                                  notification_protocol_observed=True)
+                    frame = output / 'host-frame.ppm'
+                    frame.write_bytes(b'explicit finalizer byte fixture, not a guest framebuffer')
+                    result['frames'].append({'file': frame.name, **subject.identity(frame)})
+                    if mode != 'timely':
+                        failure = {'status': 'FAIL', 'error': 'original 45s gate failed'}
+                        result.update(first_frame_deadline_failed=True, first_frame_deadline_failure=failure)
+                        subject.write_json(output / 'first-frame-deadline-failure.json', failure)
+                    if mode == 'later-error':
+                        raise ValueError('later real protocol error must survive')
+
+                def disk(path):
+                    path.write_bytes(b'explicit host disk fixture')
+                    return path
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(subject, 'native_lease', return_value=contextlib.nullcontext()))
+                    stack.enter_context(patch.object(subject, 'idle_native_host'))
+                    validator = stack.enter_context(patch.object(subject, 'validate_inputs', side_effect=[inputs,
+                        {'changed': True} if mode == 'changed-input' else inputs]))
+                    stack.enter_context(patch.object(subject, 'qemu_inputs', return_value=machine))
+                    stack.enter_context(patch.object(subject.pc, 'version', return_value='host fixture only'))
+                    stack.enter_context(patch.object(subject.pc, 'env', return_value={}))
+                    stack.enter_context(patch.object(subject.os_x86, 'launch_argv', return_value=['fixture', '-serial', 'stdio']))
+                    stack.enter_context(patch.object(subject, 'create_disk', side_effect=disk))
+                    stack.enter_context(patch.object(subject, 'PipeChannel', Channel))
+                    stack.enter_context(patch.object(subject, 'Console', GuestConsole))
+                    stack.enter_context(patch.object(subject, 'SessionQmp', Management))
+                    stack.enter_context(patch.object(subject, 'run_session', side_effect=session))
+                    stack.enter_context(patch.object(subject.threading, 'Timer'))
+                    spawn = stack.enter_context(patch.object(subject.subprocess, 'Popen'))
+                    spawn.return_value.wait.return_value = 0
+                    result = subject.capture(args)
+                self.assertEqual(pumps, [True, False])
+                self.assertEqual(validator.call_count, 1 if mode == 'later-error' else 2)
+                self.assertEqual(result['status'], subject.SUCCESS if mode == 'timely' else 'FAIL')
+                self.assertEqual(result['notification_protocol_verified'], mode == 'timely')
+                self.assertEqual(result['late_observation_evidence_verified'], mode == 'late')
+                self.assertTrue(result['notification_protocol_observed'])
+                self.assertEqual(subject.document(args.output / 'summary.json'), result)
+                if mode != 'timely':
+                    self.assertEqual(result['first_frame_deadline_failure']['error'], 'original 45s gate failed')
+                    if mode != 'late': self.assertNotEqual(result['error'], 'original 45s gate failed')
+                with patch.object(subject, 'capture', return_value=result), patch('builtins.print'):
+                    cli = sum(([f'--{name}', 'unused'] for name in ('build', 'dbus-build', 'compositor-build',
+                              'notifications-build', 'probe-build', 'output', 'qemu', 'qemu-data', 'qemu-module-dir', 'bios')), [])
+                    self.assertEqual(subject.main(cli), 0 if mode == 'timely' else 1)
+
+
 if __name__ == '__main__':
     unittest.main()

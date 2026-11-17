@@ -13,6 +13,25 @@ complete OS acceptance require additional services and workloads beyond this
 first runtime gate. A03 remains cancelled; x86 is primary and ARM remains a
 compatibility target.
 
+## Current verified boundary
+
+The paging, diagnostic and command-reader changes through capture v15 are
+committed locally as `2760bf2f81ac23421ef11769a53af5648e66b445`.
+Capture v16 uses that same OS v10 image and an explicitly bounded observation
+mode. The original 45-second first-frame gate failed; no compositor submission
+completed during the subsequent observation through the 120-second limit.
+No remote publication is included in this continuation.
+
+| Component or gate | Actual evidence | Still required |
+| --- | --- | --- |
+| D-Bus | Genuine daemon and client repeatedly complete `ListNames` in the guest | Full session service lifecycle |
+| COSMIC compositor | Genuine ELF runs through EGL initialization and Mesa shader work; v16 still has zero display submissions/completions at the last observed snapshot | Completed non-boot scanout within the unchanged first-frame gate |
+| Notifications | Genuine static ELF and real libdbus probe are built and embedded | Guest service launch, real notification exchange and rendered content |
+| Memory publication | Transaction/cleanup cases and 17 actual-source batching cases pass; three inline boundaries verified in actual machine code | Complete graphics/service guest lifecycle and controlled performance characterization |
+| Session/settings | Canonical source exports and host checks exist; actual offline metadata attempts retain their failures | Missing pinned dependencies, target ELF builds and guest execution |
+| Panel/default applets | Canonical panel source and integration requirements are inspected | Real presentation backend, applet binaries, FD handoffs and measured capacity/recovery work |
+| Complete COSMIC/OS | No acceptance claimed | All required services, visible behavior and resource lifecycle evidence |
+
 ## Source and build boundaries
 
 `tools/build_cosmic_notifications_static_v1.py` preserves the pinned upstream
@@ -517,11 +536,87 @@ Its last PC, `0x2d6fe16`, is the entry of the actual Mesa
 `_mesa_printed_blake3_equal` helper. No call stack was captured, so neither a
 particular caller/shader nor renderer completion follows from that sample.
 
-The next diagnostic will preserve the failed 45-second acceptance result
-while explicitly observing later startup under the original global bounds.
-A later real frame or protocol observation must not upgrade that acceptance
-result to PASS. The purpose is to expose any remaining functional failure
-beyond expensive initialization, using the same genuine OS and components.
+### Bounded late-startup observation
+
+The runtime consumer now has an explicit `--observe-after-frame-deadline`
+diagnostic option. It retains the original 45-second acceptance gate and the
+same post-launch clock. Both observation segments use an absolute wait bound
+of `min(original global deadline, original first-frame start + 120 seconds)`
+for Console, UART FIFO, QMP FIFO and QMP receive. No partial command is discarded
+at the 45-second boundary. The exact original I/O deadlines are restored on
+leaving the observation scope; the 240-second global budget, 4 MiB UART limit,
+96 MiB output limit and 24-frame limit are unchanged.
+
+A late command or screenshot irreversibly records the first-frame failure in
+the result and `first-frame-deadline-failure.json`. An original command/fatal/
+disconnect/deadline exception still propagates without retry; a milestone-file
+write error cannot replace that original exception. A screenshot crossing the
+gate is used once without replacing its original bytes or consuming another
+frame slot. Even if all later real protocol, reclamation, QMP shutdown, source
+identity and framebuffer checks succeed, the overall result stays `FAIL`, CLI
+exit remains 1 and `notification_protocol_verified` stays false. Only the
+separate `late_observation_evidence_verified` field may become true after all
+of those checks. Default captures do not enable the diagnostic mode.
+
+The first candidate was applied but never run in the guest. Independent review
+identified that its initial observation segment also needed the absolute
+120-second I/O bound; candidate v2 closes that gap. Both candidates, the initial
+host test failure and their original reports remain preserved.
+Eleven focused tests passed against the actual final repository files in
+2.686 seconds: five late-observation tests and six command-boundary tests.
+These exercise the real wait/finalization/parser code under explicit host I/O
+fixtures, including changed final inputs/frame bytes; they are not guest
+execution or renderer evidence. The tested runtime SHA is
+`dfddc1f071ced0a491bfa09e6664cacde87e5ac87d15f836d2a8dcea14555058`.
+
+Capture v16 subsequently ran the unchanged OS v10 and genuine component images.
+It failed after 165.824 seconds including preflight and shutdown; this is not
+165.824 seconds of compositor observation. The first-frame failure was recorded
+at 45.197898567 seconds on the original first-frame clock, at UART offset
+1,370,033. The bounded later observation also found no completed scanout.
+The final observed display counters were `proposals=0`, `submitted=0`,
+`completed=0`, with `failed=policy_invalid=clock_rejected=0` and phase `Idle`.
+Only the boot screenshot exists; no notification service or probe was launched.
+
+The last compositor snapshot remained Running with 7,209 syscalls, seven
+threads (peak eight), 10,723 address-space preparations and 7,559 heap pages.
+Its cumulative preparation/retirement observations were 50.494/16.864 seconds.
+Those are the existing owned HPET wall-time counters, not CPU billing or a
+controlled comparison against shorter runs. No entry-error or user-fault
+diagnostic was emitted. QMP quit was acknowledged, QEMU exited 0 and no forced
+termination occurred. The capture CLI correctly returned 1. VM shutdown does
+not establish explicit guest-service shutdown or resource reclamation.
+
+The last saved compositor PC, `50066799` / `0x2fbf56f`, uniquely falls inside
+the fixed ELF's `nir_algebraic_impl`: start `0x2fbf441`, size 1,588 bytes,
+offset `0x12e`. The actual Mesa `nir_search.c` implementation builds SSA state
+and an ALU work queue, then performs algebraic search/replacement. The retained
+softpipe NIR-to-TGSI path calls generated algebraic passes using this helper.
+The ELF hash remains `c4b35e727bb587a042fae928249ca5551bd08f5999fae70c3c183c4027df3538`.
+The query ran once under the shared native lease and finished in 1.258 seconds.
+There is no DWARF or captured call stack: this identifies actual Mesa shader
+optimization code, not a particular shader, pass, renderer initialization
+substage, infinite loop or proven cause of delay. Process and display snapshots
+were acquired separately and are not an atomic combined observation.
+
+The preserved v16 summary SHA is
+`67e25ba2284068ceb20947a51850eb4da8e1fd77b3cbd966fa3f0f5ce096ce86`;
+its 3,073,726-byte UART SHA is
+`9074b78e014ae183ed80d0f4bcb49b66b7ff54941ebcb2271a2018f7e5c0e63d`.
+The original failed gate, the absent late scanout and all still-unverified
+notification/session/full-OS fields remain separate evidence boundaries.
+
+Independent read-only review found 330 display snapshots with zero proposals,
+submissions, completions and failure counters, plus 329 compositor snapshots
+in Running state. The failed-gate offset is followed by another 1,703,693 UART
+bytes and 366 recorded commands. This confirms actual continued observation;
+120 seconds is the source-enforced absolute cap, not an independently measured
+120.000-second UART interval because command records contain byte offsets, not
+per-command monotonic timestamps. All eleven captured evidence-file identities,
+the OS v10 artifacts/manifest, eight OS producers and sixty capture producers
+were rechecked. This read-only review did not rerun all component validators.
+The review SHA is
+`c6c93f99434adff7c30211f40d92678915c5135706a4eb12147f57bfc5b2255b`.
 
 ## Preserved failures and corrections
 
@@ -553,6 +648,7 @@ beyond expensive initialization, using the same genuine OS and components.
 | Notification runtime capture v13 entry diagnostics | Compositor reached real Mesa shader IR conversion but completed no display submission within the original gate | Preserve the 96.170-second failure and final saved-PC source analysis. No entry or hardware-fault diagnostic was emitted; normal QMP quit/zero exit succeeded. |
 | Notification runtime capture v14 RX ranges | First preparation recorded 18.419 ms, but the compositor still completed no display submission within the original gate | Preserve the 92.520-second failure and all original limits. No entry/fault diagnostic; normal QMP quit/zero exit. The first-attempt observation does not establish overall performance or explain v12. |
 | Notification runtime capture v15 inline boundaries | Actual code generation removed the reviewed call boundaries, but no display submission completed within the original gate | Preserve the 87.771-second failure. All 17 integration cases passed on the current checkout; normal QMP quit/zero exit and no entry/fault diagnostic. No first frame or notification acceptance. |
+| Notification runtime capture v16 bounded late observation | Original 45-second gate failed; no display submission completed through the separate 120-second observation limit | Preserve the 165.824-second capture and independent first-frame failure file. CLI 1, acknowledged QMP quit, QEMU 0 without force; only boot pixels and the bus/compositor processes were observed. No notification or complete-session acceptance. |
 
 The notification failure occurred before final ELF linking. Passing absolute
 archive names to the final linker does not make them discoverable when rustc

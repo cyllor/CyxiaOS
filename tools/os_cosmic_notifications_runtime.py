@@ -9,6 +9,7 @@ complete. Framebuffer and Wayland observations remain separate review evidence.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import errno
 import hashlib
 import json
@@ -53,6 +54,8 @@ MAX_WALL_SECONDS = 240
 MAX_OUTPUT_BYTES = 96 * 1024**2
 MAX_FRAMES = 24
 MAX_DIAGNOSTIC_LOG_BYTES = 24 * 1024**2
+FIRST_FRAME_SECONDS = 45
+LATE_FRAME_SECONDS = 120
 IMAGE_NAMES = ('probe.elf', 'dbus-daemon.elf', 'dbus-send.elf', 'cosmic-comp.elf',
                'cosmic-notifications.elf', 'notification-probe.elf')
 FULL_OS = {'image_bytes': 64 * 1024**2, 'max_elf_bytes': 64 * 1024**2,
@@ -663,6 +666,107 @@ def query_bus(console, allowed, required):
             'notification_name_listed': bool(re.search(rb'(?m)^\s*string "org\.freedesktop\.Notifications"\r?$', bytes(console.raw[at:])))}
 
 
+class SessionQmp(Qmp):
+    """The original QMP protocol, with an optional earlier observation cutoff."""
+    observation_deadline = None
+
+    def receive(self, deadline):
+        if self.observation_deadline is None:
+            return super().receive(deadline)
+        require(time.monotonic() < self.observation_deadline, 'Late frame observation deadline exceeded')
+        value = super().receive(min(deadline, self.observation_deadline))
+        require(time.monotonic() < self.observation_deadline, 'Late frame observation deadline exceeded')
+        return value
+
+
+@contextmanager
+def late_frame_window(console, qmp, deadline):
+    # Tighten actual Console/FIFO/QMP waits; never restart the global clock.
+    owners = (console, console.sock, qmp.sock)
+    saved = tuple(owner.deadline for owner in owners)
+    previous = qmp.observation_deadline
+    try:
+        for owner, original in zip(owners, saved):
+            owner.deadline = min(original, deadline)
+        qmp.observation_deadline = deadline if previous is None else min(previous, deadline)
+        yield
+    finally:
+        for owner, original in zip(owners, saved):
+            owner.deadline = original
+        qmp.observation_deadline = previous
+
+
+def await_compositor_frame(console, qmp, output, initial, broker, compositor, result):
+    started = time.monotonic()  # Same origin as the original post-launch 45s gate.
+    observe = result.get('observe_after_frame_deadline', False)
+    crossed_frame = None
+
+    def record_first_frame_failure():
+        failure = {'schema_version': 1, 'status': 'FAIL', 'gate': 'first_compositor_frame',
+                   'deadline_seconds': FIRST_FRAME_SECONDS,
+                   'elapsed_seconds': time.monotonic() - started,
+                   'compositor_pid': compositor, 'serial_offset': len(console.raw),
+                   'error': 'No genuine compositor scanout candidate within the original first-frame gate'}
+        result['first_frame_deadline_failed'] = True
+        result['first_frame_deadline_failure'] = failure
+        write_json(output / 'first-frame-deadline-failure.json', failure)
+
+    for seconds in ((FIRST_FRAME_SECONDS, LATE_FRAME_SECONDS) if observe else (FIRST_FRAME_SECONDS,)):
+        late = seconds == LATE_FRAME_SECONDS
+        deadline = min(console.deadline, started + seconds)
+        scope = (late_frame_window(console, qmp, min(console.deadline, started + LATE_FRAME_SECONDS))
+                 if observe else nullcontext())
+        try:
+            with scope:
+                while time.monotonic() < deadline:
+                    active_processes(console, {broker, compositor}, {broker, compositor})
+                    observation = system(console)
+                    result['compositor_last_snapshot'] = observation
+                    for key in ('failed', 'policy_invalid', 'clock_rejected'):
+                        require(observation['display'].get(key) == initial['display'].get(key),
+                                'Compositor display mechanism failed: ' + key)
+                    try:
+                        ready = completed_scanout(initial, observation, compositor)
+                    except ValueError:
+                        console.pump()
+                        time.sleep(min(.25, max(0, deadline - time.monotonic())) if late else .25)
+                        continue
+                    if late:
+                        require(time.monotonic() < deadline, 'Late frame observation deadline exceeded')
+                    elif observe and time.monotonic() >= started + FIRST_FRAME_SECONDS:
+                        # A command may finish across the gate. Keep its complete
+                        # UART evidence, latch the failure, then observe separately.
+                        break
+                    frame = snapshot_frame(console, qmp, output, result['frames'], 'compositor', output / 'boot.ppm')
+                    require(not frame['boot_colorbars'] and frame['changed_pixels'] > 0,
+                            'Completed compositor transfer did not produce a non-boot scanout')
+                    if late:
+                        require(time.monotonic() < deadline, 'Late frame observation deadline exceeded')
+                    elif observe and time.monotonic() >= started + FIRST_FRAME_SECONDS:
+                        crossed_frame = {'completion': ready, 'frame': frame, 'semantic_ui_verified': False}
+                        break
+                    result['compositor_scanout'] = {'completion': ready, 'frame': frame,
+                                                    'semantic_ui_verified': False}
+                    return
+        except Exception:
+            if observe and not late and time.monotonic() >= started + FIRST_FRAME_SECONDS:
+                try:
+                    record_first_frame_failure()
+                except Exception as milestone_error:
+                    result['first_frame_deadline_milestone_error'] = repr(milestone_error)
+            raise  # Preserve the actual command, fatal, disconnect, or deadline error.
+        if observe and not late:
+            require(time.monotonic() >= started + FIRST_FRAME_SECONDS,
+                    'Global deadline expired before the first-frame observation window')
+            record_first_frame_failure()
+            if crossed_frame is not None:
+                require(time.monotonic() < min(console.deadline, started + LATE_FRAME_SECONDS),
+                        'Late frame observation deadline exceeded')
+                result['compositor_scanout'] = crossed_frame
+                return
+    require(False, 'No genuine compositor scanout candidate')
+
+
 def run_session(console, qmp, output, inputs, result):
     frames = result['frames']
     console.until(os_smoke.PROMPT)
@@ -690,28 +794,7 @@ def run_session(console, qmp, output, inputs, result):
     result['bus_queries'].append(query_bus(console, {broker}, {broker}))
     compositor, at = launch(console, 'cosmic-comp', inspections['cosmic-comp'])
     launched['cosmic-comp'] = compositor
-    deadline = min(console.deadline, time.monotonic() + 45)
-    ready = None
-    while time.monotonic() < deadline:
-        active_processes(console, {broker, compositor}, {broker, compositor})
-        observation = system(console)
-        result['compositor_last_snapshot'] = observation
-        for key in ('failed', 'policy_invalid', 'clock_rejected'):
-            require(observation['display'].get(key) == initial['display'].get(key),
-                    'Compositor display mechanism failed: ' + key)
-        try:
-            ready = completed_scanout(initial, observation, compositor)
-        except ValueError:
-            console.pump()
-            time.sleep(.25)
-            continue
-        frame = snapshot_frame(console, qmp, output, frames, 'compositor', output / 'boot.ppm')
-        require(not frame['boot_colorbars'] and frame['changed_pixels'] > 0,
-                'Completed compositor transfer did not produce a non-boot scanout')
-        result['compositor_scanout'] = {'completion': ready, 'frame': frame,
-                                         'semantic_ui_verified': False}
-        break
-    require(ready is not None and 'compositor_scanout' in result, 'No genuine compositor scanout candidate')
+    await_compositor_frame(console, qmp, output, initial, broker, compositor, result)
     daemon, notification_start = launch(console, 'cosmic-notifications', inspections['cosmic-notifications'])
     launched['cosmic-notifications'] = daemon
     deadline = min(console.deadline, time.monotonic() + 30)
@@ -826,6 +909,10 @@ def capture(args):
                   'notification_protocol_verified': False, 'notification_render_verified': False,
                   'notification_text_verified': False, 'cosmic_session_verified': False, 'full_os_verified': False,
                   'namespace_cleanup_verified': False,
+                  'observe_after_frame_deadline': bool(getattr(args, 'observe_after_frame_deadline', False)),
+                  'first_frame_deadline_failed': False, 'late_observation_evidence_verified': False,
+                  'first_frame_deadline_seconds': FIRST_FRAME_SECONDS,
+                  'late_frame_limit_seconds_from_compositor_launch': LATE_FRAME_SECONDS,
                   'diagnostic_interrupt_trace': bool(getattr(args, 'trace_interrupts', False)),
                   'diagnostic_log_limit_bytes': MAX_DIAGNOSTIC_LOG_BYTES,
                   'native_lock': str(lock), 'max_wall_seconds': MAX_WALL_SECONDS,
@@ -888,7 +975,7 @@ def capture(args):
                 watchdog.start()
                 serial.connect(process); management.connect(process)
                 console = Console(serial, process, output, deadline)
-                qmp = Qmp(management)
+                qmp = SessionQmp(management)
                 require('QMP' in qmp.receive(time.monotonic() + 10), 'Missing actual QMP greeting')
                 qmp.execute('qmp_capabilities')
                 run_session(console, qmp, output, inputs, result)
@@ -954,8 +1041,11 @@ def capture(args):
                             'QEMU, firmware, modules or capture producer changed')
                     for frame in result['frames']:
                         require(identity(output / frame['file'])['sha256'] == frame['sha256'], 'Captured framebuffer changed')
-                    result['notification_protocol_verified'] = True
-                    result['status'] = SUCCESS
+                    if result['first_frame_deadline_failed']:
+                        result['late_observation_evidence_verified'] = True
+                    else:
+                        result['notification_protocol_verified'] = True
+                        result['status'] = SUCCESS
                 except Exception as error:
                     result['error'] = repr(error)
             result['evidence_files'] = {}
@@ -966,8 +1056,13 @@ def capture(args):
                     except ValueError as error:
                         result['status'] = 'FAIL'
                         result['notification_protocol_verified'] = False
+                        result['late_observation_evidence_verified'] = False
                         result.setdefault('error', 'Cannot finalize bounded evidence: ' + repr(error))
                         result['evidence_files'][path.name] = {'bytes': path.stat().st_size, 'hash_verified': False}
+            if result['first_frame_deadline_failed']:
+                result['status'] = 'FAIL'
+                result['notification_protocol_verified'] = False
+                result.setdefault('error', result['first_frame_deadline_failure']['error'])
             write_json(output / 'summary.json', result)
         return result
 
@@ -981,11 +1076,15 @@ def main(argv=None):
     parser.add_argument('--native-lock', type=Path, default=NATIVE_LOCK)
     parser.add_argument('--trace-interrupts', action='store_true',
                         help='Retain bounded QEMU interrupt/exception diagnostics inside this capture')
+    parser.add_argument('--observe-after-frame-deadline', action='store_true',
+                        help='After the original 45s first-frame gate fails, observe up to launch+120s; acceptance remains FAIL')
     args = parser.parse_args(argv)
     try:
         result = capture(args)
         print(json.dumps({key: result.get(key) for key in ('status', 'error', 'returncode', 'forced',
-                         'elapsed_seconds', 'notification_protocol_verified', 'notification_render_verified')}, indent=2))
+                         'elapsed_seconds', 'notification_protocol_verified', 'notification_render_verified',
+                         'first_frame_deadline_failed', 'late_observation_evidence_verified',
+                         'notification_protocol_observed')}, indent=2))
         return 0 if result['status'] == SUCCESS else 1
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print('cosmic-notifications-runtime: ' + str(error), file=sys.stderr)
