@@ -21,16 +21,18 @@ try:
     from . import cosmic_ports as ports
     from . import cosmic_notifications_source as reviewed
     from . import cosmic_port_source as acquisition
+    from . import cosmic_notifications_toolchain as toolchain_selection
 except ImportError:
     import build_cosmic as build
     import cosmic_dependencies as dependencies
     import cosmic_ports as ports
     import cosmic_notifications_source as reviewed
     import cosmic_port_source as acquisition
+    import cosmic_notifications_toolchain as toolchain_selection
 
 
 def prepare(recipe_path, output, *, source_cache=ports.CACHE, cache=build.CARGO_CACHE,
-            timeout=900, min_free=1024**3, max_bytes=2 * 1024**3, offline=False):
+            timeout=900, min_free=1024**3, max_bytes=2 * 1024**3, offline=False, rust_root=None):
     producers = os_x86.producer_sources(__file__)
     if any(type(value) is not int or value <= 0 for value in (timeout, min_free, max_bytes)):
         raise build.CosmicBuildError('resource bounds must be positive integers')
@@ -86,7 +88,11 @@ def prepare(recipe_path, output, *, source_cache=ports.CACHE, cache=build.CARGO_
             report['lock'] = dependencies.lock_summary((stage / 'Cargo.lock').read_bytes())
             if report['lock']['unfixed_sources']:
                 raise build.CosmicBuildError('Cargo.lock contains unfixed dependency sources')
-            cargo, env = acquisition.acquisition_environment(cache)
+            if rust_root is None:
+                cargo, env = acquisition.acquisition_environment(cache)
+            else:
+                cargo, env, report['toolchain_selection'] = toolchain_selection.acquisition_environment(
+                    cache, rust_root)
             env = reviewed.cargo_environment(env, policy)
             env['CARGO_NET_OFFLINE'] = 'true' if offline else 'false'
             env['CARGO_TARGET_DIR'] = str(output / 'target')
@@ -150,10 +156,11 @@ def main(argv=None):
     parser.add_argument('--source-cache', type=Path, default=ports.CACHE)
     parser.add_argument('--cache', type=Path, default=build.CARGO_CACHE)
     parser.add_argument('--offline', action='store_true', help='only use already acquired source inputs')
+    parser.add_argument('--rust-root', type=Path, help='explicit installed Rust toolchain root')
     args = parser.parse_args(argv)
     try:
         result = prepare(args.recipe.resolve(), args.output, source_cache=args.source_cache,
-                         cache=args.cache, offline=args.offline)
+                         cache=args.cache, offline=args.offline, rust_root=args.rust_root)
         print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError, subprocess.SubprocessError) as error:

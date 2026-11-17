@@ -41,6 +41,24 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core -p cyxia-prototype -p cyxia-peer-billing -p cyxia-arch-x86_64 -p cyxia-platform-pc -p cyxia-arch --features cyxia-prototype/hardware-sha256
           python3 -B -m unittest discover -s tools -p test_x86_64.py -v
           python3 -B -m unittest discover -s tools -p test_verify_v17_a03_demand.py -v
+      - name: COSMIC and POSIX host regressions
+        env:
+          PYTHONPATH: tools:tests/host
+        run: |
+          test -x /usr/bin/git
+          python3 -B -m unittest \
+            tools.test_cosmic_notifications_dependencies \
+            tools.test_cosmic_notifications_source \
+            tools.test_cosmic_notifications_toolchain \
+            tools.test_cosmic_notifications_elf \
+            tools.test_install_cosmic_notifications -v
+          python3 -B -m unittest \
+            tools.test_os_smoke \
+            test_os_smoke_finalization \
+            test_build_pipe_capacity_probe \
+            tests.host.test_prototype_evidence \
+            test_child_exit_custody -v
+          cargo test --locked --offline -p cyxia-posix --test pc_clock --test x86_signal
       - name: Build PC images and enforce clippy
         run: |
           python3 -B tools/build.py --output artifacts/v017-ci-dev

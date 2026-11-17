@@ -1,8 +1,6 @@
 //! PC i440fx MC146818 UTC wall clock. CMOS time is never written by the OS.
-use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_platform_pc::rtc::{self, Cmos};
 use cyxia_posix::Errno;
-static READY: AtomicBool = AtomicBool::new(false);
 struct Hardware;
 impl Cmos for Hardware {
     fn read(&mut self, register: u8) -> u8 {
@@ -15,16 +13,17 @@ impl Cmos for Hardware {
     }
 }
 pub fn init() {
-    if rtc::read_seconds(&mut Hardware, 0x32).is_ok() {
-        READY.store(true, Ordering::Release);
-        crate::log(b"WALL_CLOCK_READY MC146818 resolution=1s\n");
-    } else {
-        crate::log(b"WALL_CLOCK_UNAVAILABLE MC146818\n");
+    // This probe reports boot status; it must not latch a transient update or
+    // invalid sample into permanent unavailability. Every request samples CMOS.
+    match rtc::read_seconds(&mut Hardware, 0x32) {
+        Ok(_) => crate::log(b"WALL_CLOCK_READY MC146818 resolution=1s\n"),
+        Err(rtc::Error::Busy) => crate::log(b"WALL_CLOCK_BUSY MC146818 retry=on-demand\n"),
+        Err(rtc::Error::Unavailable) => crate::log(b"WALL_CLOCK_UNAVAILABLE MC146818\n"),
+        Err(rtc::Error::Invalid) => crate::log(b"WALL_CLOCK_INVALID MC146818\n"),
     }
 }
 pub fn realtime_seconds() -> Result<u64, Errno> {
     if crate::machine::runtime::cpu_slot() != 0 { return Err(Errno::Again); }
-    if !READY.load(Ordering::Acquire) { return Err(Errno::Nodev); }
     rtc::read_seconds(&mut Hardware, 0x32).map_err(|e| match e {
         rtc::Error::Busy => Errno::Again,
         rtc::Error::Unavailable => Errno::Nodev,

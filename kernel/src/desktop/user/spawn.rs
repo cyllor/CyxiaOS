@@ -250,6 +250,10 @@ impl Supervisor {
         let parent_pid = self.runners[parent].status.pid;
         let parent_mask = self.runners[parent].thread.signals.mask();
         let child_actions = self.runners[parent].threads.shared.actions.for_exec();
+        // Completed auto-reap/orphan receipts must not consume admission space.
+        // This also freezes waitable exits before the nested launch reuses a
+        // Runner slot. Publication is idempotent and does not touch user memory.
+        self.publish_child_exits();
         let free = self
             .children
             .receipts
@@ -353,7 +357,11 @@ impl Supervisor {
             self.runners[parent].supervisor_result(request.tid, result);
         }
     }
-    pub(super) fn collect_children(&mut self) {
+    /// Freeze terminal outcomes while their Runner still owns the old PID.
+    /// CPU0 calls this before any slot reuse, as well as during normal collection.
+    /// No usercopy or scheduling occurs here; only the first publication sends
+    /// SIGCHLD, and each removed receipt releases its one accounting charge.
+    pub(super) fn publish_child_exits(&mut self) {
         for receipt in &mut self.children.receipts {
             let Some(child) = receipt else {
                 continue;
@@ -415,6 +423,10 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    pub(super) fn collect_children(&mut self) {
+        self.publish_child_exits();
         for runner in &mut self.runners {
             if !runner.status.state.active() {
                 continue;

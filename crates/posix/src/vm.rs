@@ -38,7 +38,7 @@ pub const PAGE_COUNT: usize = 4096;
 pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOsV3
     .layout()
     .heap_pages;
-const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT % 512 == 0);
+const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT.is_multiple_of(512));
 const UNMAPPED: u16 = u16::MAX;
 
 /// Validate an immutable-file snapshot and return the bytes in its mapped pages.

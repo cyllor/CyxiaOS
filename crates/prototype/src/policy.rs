@@ -88,6 +88,10 @@ impl<const N: usize> PlanView for CanonicalPlan<N> {
     fn header(&self) -> policy_wire::PlanHeader {
         self.header
     }
+    #[allow(
+        clippy::misnamed_getters,
+        reason = "PlanView counts decisions; the len field stores the encoded byte length."
+    )]
     fn len(&self) -> usize {
         self.count
     }
@@ -1566,6 +1570,10 @@ impl Registry {
             executor,
         )
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserve explicit publisher, canonical bytes, plan and budget inputs at the shared publication boundary."
+    )]
     fn submit_decoded_job_debited<P: PlanView, E: Executor<P>, C: Clock>(
         &mut self,
         publisher: Publisher,

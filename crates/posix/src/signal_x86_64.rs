@@ -126,6 +126,10 @@ pub fn frame_address(stack: AltStack, sp: u64, on_stack: bool) -> Result<u64, Er
     }
     Ok(address)
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the independently validated Linux signal-frame inputs explicit at the ABI boundary."
+)]
 pub fn encode_frame(
     out: &mut [u8; FRAME_BYTES],
     address: u64,

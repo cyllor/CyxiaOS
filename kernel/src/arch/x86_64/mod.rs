@@ -80,5 +80,8 @@ pub(crate) mod runtime;
 pub(crate) mod dispatch;
 #[cfg(all(feature = "smp-selftest", not(feature = "os-runtime")))]
 mod smp;
-pub(crate) use console::{exit, halt, hex, log, try_log, try_read};
+pub(crate) use console::{exit, log};
+#[cfg(feature = "os-runtime")]
+pub(crate) use console::{halt, hex, try_log, try_read};
+#[cfg(feature = "os-runtime")]
 pub(crate) const HIGH: u64 = arch::space::KERNEL_BASE;

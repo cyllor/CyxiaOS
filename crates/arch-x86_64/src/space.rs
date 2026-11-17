@@ -93,10 +93,9 @@ impl<'a> TableArena<'a> {
         physical_base: u64,
         pages: usize,
     ) -> Result<Self, Error> {
-        if pages < 4
-            || pages > 4096
+        if !(4..=4096).contains(&pages)
             || virtual_base.is_null()
-            || (virtual_base as usize) % 4096 != 0
+            || !(virtual_base as usize).is_multiple_of(4096)
             || physical_base == 0
             || !physical_base.is_multiple_of(PAGE_BYTES)
             || physical_base
@@ -180,8 +179,7 @@ impl<'a> AddressSpace<'a> {
         self.epoch.load(core::sync::atomic::Ordering::Acquire)
     }
     fn address(address: u64) -> Result<(), Error> {
-        if address < PAGE_BYTES
-            || address >= 0x0000_8000_0000_0000
+        if !(PAGE_BYTES..0x0000_8000_0000_0000).contains(&address)
             || !address.is_multiple_of(PAGE_BYTES)
         {
             return Err(Error::Address);
@@ -354,7 +352,7 @@ impl<'a> AddressSpace<'a> {
             .fetch_add(1, core::sync::atomic::Ordering::Release);
         Ok(())
     }
-    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
     pub(crate) fn enter_cpu(&self, slot: usize) -> Result<(), Error> {
         if slot >= 4 {
             return Err(Error::Address);
@@ -363,7 +361,7 @@ impl<'a> AddressSpace<'a> {
             .fetch_or(1 << slot, core::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
-    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
     pub(crate) fn leave_cpu(&self, slot: usize) {
         self.residents
             .fetch_and(!(1 << slot), core::sync::atomic::Ordering::Release);

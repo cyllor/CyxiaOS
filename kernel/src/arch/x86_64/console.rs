@@ -67,6 +67,7 @@ pub(crate) unsafe fn init() {
     unsafe { core::ptr::addr_of_mut!(SERIAL).write(Some(pc::hardware::Serial16550::init())) };
 }
 
+#[cfg(feature = "os-runtime")]
 pub(crate) fn try_log(bytes: &[u8]) -> Result<(), cyxia_contracts::PlatformError> {
     use cyxia_contracts::{ConsoleOps, PlatformError};
     // CPU0 alone owns the serial object; hardware handlers and AP panic never
@@ -80,11 +81,13 @@ pub(crate) fn try_log(bytes: &[u8]) -> Result<(), cyxia_contracts::PlatformError
     }
     Ok(())
 }
+#[cfg(feature = "os-runtime")]
 pub(crate) fn try_read() -> Result<Option<u8>, cyxia_contracts::PlatformError> {
     let serial = unsafe { (&mut *core::ptr::addr_of_mut!(SERIAL)).as_mut() }
         .ok_or(cyxia_contracts::PlatformError::Again)?;
     serial.try_read()
 }
+#[cfg(feature = "os-runtime")]
 pub(crate) fn hex(value: u64) {
     let mut text = *b"0000000000000000\n";
     for (index, byte) in text[..16].iter_mut().enumerate() {
@@ -92,6 +95,7 @@ pub(crate) fn hex(value: u64) {
     }
     log(&text);
 }
+#[cfg(feature = "os-runtime")]
 pub(crate) fn halt() -> ! {
     arch::cpu::halt()
 }

@@ -116,7 +116,7 @@ impl Context {
     pub fn initialize(&mut self, entry: u64, stack: u64, abi: UserAbi) -> Result<(), Error> {
         user_address(entry)?;
         user_address(stack)?;
-        if stack % 16 != 0 {
+        if !stack.is_multiple_of(16) {
             return Err(Error::Address);
         }
         *self = Self::empty();

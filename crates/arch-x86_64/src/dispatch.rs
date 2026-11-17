@@ -33,6 +33,11 @@ pub struct Handoff<J, R> {
 // Transfer also requires Send on the payloads: a board-specific owner must prove
 // that its pinned raw mappings remain valid on the receiving CPU.
 unsafe impl<J: Send, R: Send> Sync for Handoff<J, R> {}
+impl<J, R> Default for Handoff<J, R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl<J, R> Handoff<J, R> {
     pub const fn new() -> Self {
         Self {

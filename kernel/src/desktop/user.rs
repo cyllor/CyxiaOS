@@ -1351,6 +1351,11 @@ impl Supervisor {
         native: bool,
         attempt: &mut Attempt,
     ) -> Result<usize, Errno> {
+        // Every launch path reuses Runner storage here. Preserve the old PID's
+        // exit receipt before start() can replace its status, including exits
+        // from this poll's dispatch, signals and failed launch cleanup.
+        #[cfg(feature = "ported")]
+        self.publish_child_exits();
         let slot = self
             .runners
             .iter()
@@ -1642,6 +1647,7 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
 /// CPU0 snapshot of cumulative process/worker receipts; never resets on PID reuse.
 pub fn ai_status(out: &mut impl Write) {
     ai::status(out);
+    #[cfg(feature = "ported")]
     pipes::status(out);
     #[cfg(target_arch = "x86_64")]
     parallel::status(out);

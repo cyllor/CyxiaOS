@@ -19,20 +19,24 @@ try:
     from . import build_cosmic_component as component_builder
     from . import cosmic_notifications_source as reviewed
     from . import cosmic_notifications_dependencies as dependency_inputs
+    from . import cosmic_notifications_toolchain as toolchain_selection
 except ImportError:
     import build_cosmic as base
     import build_cosmic_component as component_builder
     import cosmic_notifications_source as reviewed
     import cosmic_notifications_dependencies as dependency_inputs
+    import cosmic_notifications_toolchain as toolchain_selection
 
 
-def perform_build(source, record, recipe, recipe_path, output, sysroot, cache, profile, jobs):
+def perform_build(source, record, recipe, recipe_path, output, sysroot, cache, profile, jobs,
+                  *, rust_root=None, host_cc=None):
     producers = os_x86.producer_sources(__file__)
     policy = reviewed.load_policy(recipe, recipe_path, source)
     target = base.ports.user_target(recipe['target'])
     with (sysroot / '.build.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        tools, identities = base.tools_and_sysroot(sysroot, recipe)
+        tools, identities = toolchain_selection.tools_and_sysroot(
+            sysroot, recipe, rust_root=rust_root, host_cc=host_cc)
         output = base.new_output(output)
         report = dict(status='building', component=source, recipe=recipe,
                       recipe_sha256=base.digest(recipe_path), resource_profile=profile,
@@ -149,17 +153,21 @@ def main():
     parser.add_argument('--sysroot', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=1)
+    parser.add_argument('--rust-root', type=Path, help='explicit installed Rust toolchain root')
+    parser.add_argument('--host-cc', type=Path, help='explicit host Clang executable')
+    parser.add_argument('--source-cache', type=Path, default=base.ports.CACHE)
+    parser.add_argument('--cache', type=Path, default=base.CARGO_CACHE)
     args = parser.parse_args()
     source, record, recipe = base.source_and_recipe(
-        'cosmic-notifications', args.recipe, base.ports.load_manifest(), base.ports.CACHE)
+        'cosmic-notifications', args.recipe, base.ports.load_manifest(), args.source_cache)
     target = base.ports.user_target(recipe['target'])
     profile = base.select_profile(base.load_json(args.resource_profile), recipe['resource_profile'],
                                   args.jobs, target)
     sysroot = base.no_symlink_path(args.sysroot)
-    cache = base.validate_cache(base.CARGO_CACHE)
+    cache = base.validate_cache(args.cache)
     base.resource_check(sysroot, profile['min_free_bytes'] + profile['max_build_bytes'], 2**63)
     report = perform_build(source, record, recipe, args.recipe.resolve(), args.output, sysroot,
-                           cache, profile, args.jobs)
+                           cache, profile, args.jobs, rust_root=args.rust_root, host_cc=args.host_cc)
     print(json.dumps({'status': report['status'], 'output': str(args.output)}))
 
 

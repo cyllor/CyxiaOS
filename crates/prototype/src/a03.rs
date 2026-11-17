@@ -52,11 +52,11 @@ pub fn completed_roundtrip(
     let mut previous_generation = 0;
     let mut seals = [0; 8];
     let mut result = None;
-    for i in 0..count as usize {
+    for (i, seal) in seals.iter_mut().enumerate().take(count as usize) {
         let row = 128 + i * OWNER_ROW;
         let mut r = |offset| read(row + offset);
         let publication = r(0);
-        seals[i] = publication;
+        *seal = publication;
         let desired = r(8);
         let operation = r(11);
         let job = r(14);

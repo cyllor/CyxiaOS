@@ -1,8 +1,9 @@
-"""Pinned workspace link/metadata negative fixtures; no Git/Cargo/native process."""
+"""Pinned dependency fixtures, including real Git; never Cargo or guest execution."""
 import copy
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -55,6 +56,8 @@ class NotificationDependencies(unittest.TestCase):
 
     def git(self, root, *arguments):
         self.assertEqual(root, self.checkout)
+        self.assertEqual(arguments[0], '--no-replace-objects')
+        arguments = arguments[1:]
         values = {('rev-parse', '--show-toplevel'): str(self.checkout),
                   ('rev-parse', 'HEAD'): subject.WINIT_COMMIT,
                   ('rev-parse', 'HEAD^{tree}'): subject.WINIT_TREE,
@@ -116,7 +119,7 @@ class NotificationDependencies(unittest.TestCase):
         for command in (('rev-parse', 'HEAD'), ('rev-parse', 'HEAD^{tree}'),
                         ('rev-parse', '--show-toplevel')):
             def wrong(root, *args):
-                return 'wrong' if args == command else original_git(root, *args)
+                return 'wrong' if args == ('--no-replace-objects', *command) else original_git(root, *args)
             with self.subTest(command=command), mock.patch.object(subject.build, 'git', side_effect=wrong), self.assertRaises(ValueError):
                 subject.checkout_identity(self.checkout / 'dpi/Cargo.toml', self.cache, subject.WINIT_SOURCE)
         spec = subject.WINIT_SOURCE.replace('pop-os/winit', 'elsewhere/winit')
@@ -147,6 +150,50 @@ class NotificationDependencies(unittest.TestCase):
                          'tools/target_profile.py', 'tools/cosmic_ports.py', 'tools/os_x86.py'} <= set(build))
         self.assertTrue({'tools/cosmic_notifications_source.py', 'tools/cosmic_port_source.py',
                          'tools/build_sysroot.py', 'tools/target_profile.py'} <= set(prepare))
+
+
+@unittest.skipUnless(Path('/usr/bin/git').is_file(), 'real Git is required')
+class NotificationReplacementObjects(unittest.TestCase):
+    def test_real_tree_replacement_cannot_relabel_changed_dependency_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary).resolve() / 'cache'
+            checkout = cache / 'git/checkouts/winit-fixture/pinned'
+            (checkout / 'dpi/src').mkdir(parents=True)
+            manifest = checkout / 'dpi/Cargo.toml'
+            manifest.write_text('[package]\nname="dpi"\nversion="0.1.0"\n')
+            code = checkout / 'dpi/src/lib.rs'
+            code.write_text('pub fn selected_source() -> u8 { 1 }\n')
+            (checkout / 'LICENSE').write_text('fixture license\n')
+            (checkout / 'dpi/LICENSE').symlink_to('../LICENSE')
+
+            def git(*arguments):
+                return subprocess.check_output(['/usr/bin/git', '-c', 'user.name=Dependency Test',
+                    '-c', 'user.email=dependency@example.invalid', '-C', str(checkout), *arguments],
+                    env=subject.build.clean_environment('/usr/bin:/bin'), text=True).strip()
+
+            git('init', '-q'); git('add', '.'); git('commit', '-qm', 'Pinned fixture')
+            commit, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
+            spec = 'git+https://github.com/pop-os/winit.git?rev=fixture#' + commit
+            (checkout / '.cargo-ok').write_text('')
+            with mock.patch.object(subject, 'WINIT_SOURCE', spec), \
+                 mock.patch.object(subject, 'WINIT_COMMIT', commit), \
+                 mock.patch.object(subject, 'WINIT_TREE', tree):
+                before = subject.checkout_identity(manifest, cache, spec)
+                code.write_text('pub fn selected_source() -> u8 { 9 }\n')
+                git('add', 'dpi/src/lib.rs')
+                git('replace', tree, git('write-tree'))
+                # The public commit/tree IDs remain pinned: this is the bypass
+                # that a plain ls-tree previously accepted as the original tree.
+                self.assertEqual(git('rev-parse', 'HEAD'), commit)
+                self.assertEqual(git('rev-parse', 'HEAD^{tree}'), tree)
+                self.assertNotEqual(git('ls-tree', '-r', 'HEAD'),
+                                    git('--no-replace-objects', 'ls-tree', '-r', 'HEAD'))
+                with self.assertRaisesRegex(ValueError, 'Pinned Git blob bytes changed'):
+                    subject.checkout_identity(manifest, cache, spec)
+                # Canonical bytes are still valid even while the cache retains
+                # the replacement; identity comes from objects, not local refs.
+                code.write_text('pub fn selected_source() -> u8 { 1 }\n')
+                self.assertEqual(subject.checkout_identity(manifest, cache, spec), before)
 
 
 if __name__ == '__main__':

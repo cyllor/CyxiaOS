@@ -16,14 +16,14 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs",
-        "kernel/src/smp.rs",
+        "kernel/src/desktop/user.rs",
+        "kernel/src/arch/aarch64/smp.rs",
         "crates/kernel-core/src/control_plane/dispatch.rs",
         "tools/verify_smp.py",
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -37,14 +37,14 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs",
-        "kernel/src/smp.rs",
+        "kernel/src/desktop/user.rs",
+        "kernel/src/arch/aarch64/smp.rs",
         "crates/kernel-core/src/control_plane/dispatch.rs",
         "tools/verify_smp.py",
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -58,14 +58,14 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs",
-        "kernel/src/smp.rs",
+        "kernel/src/desktop/user.rs",
+        "kernel/src/arch/aarch64/smp.rs",
         "crates/kernel-core/src/control_plane/dispatch.rs",
         "tools/verify_smp.py",
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -79,14 +79,14 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs",
-        "kernel/src/smp.rs",
+        "kernel/src/desktop/user.rs",
+        "kernel/src/arch/aarch64/smp.rs",
         "crates/kernel-core/src/control_plane/dispatch.rs",
         "tools/verify_smp.py",
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -98,9 +98,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -111,9 +111,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -124,9 +124,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -137,9 +137,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -151,7 +151,7 @@
       "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs"
       ],
       "evidence": null
@@ -163,7 +163,7 @@
       "status": "BLOCKED",
       "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
       "code": [
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -177,9 +177,9 @@
       "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs",
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -233,14 +233,14 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs",
-        "kernel/src/smp.rs",
+        "kernel/src/desktop/user.rs",
+        "kernel/src/arch/aarch64/smp.rs",
         "crates/kernel-core/src/control_plane/dispatch.rs",
         "tools/verify_smp.py",
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -258,7 +258,7 @@
         "crates/control-model/src/abi.rs",
         "crates/control-model/src/model.rs",
         "crates/kernel-core/src/control_plane/service.rs",
-        "kernel/src/control_service.rs",
+        "kernel/src/runtime/control/control_service.rs",
         "tools/verify_ai_control.py"
       ],
       "evidence": null
@@ -270,9 +270,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -324,7 +324,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -335,8 +335,8 @@
       "status": "BLOCKED",
       "gap": "已有进程/线程和受限准入；规范 spawn_tokens/group_parallelism 动作与执行回执未接入。",
       "code": [
-        "kernel/src/user/spawn.rs",
-        "kernel/src/user/threads.rs"
+        "kernel/src/desktop/user/spawn.rs",
+        "kernel/src/desktop/user/threads.rs"
       ],
       "evidence": null
     },
@@ -348,7 +348,7 @@
       "gap": "已有页所有权、共享映射与有界池；规范回收/缓存动作、跨核 TLB 及内存压力恢复未闭合。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs"
       ],
       "evidence": null
@@ -360,7 +360,7 @@
       "status": "BLOCKED",
       "gap": "已有 RAMFS 检查点和 VirtIO 双槽持久化；不能替代规范日志事务、页缓存回写和逐崩溃点验收。",
       "code": [
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -385,7 +385,7 @@
       "status": "BLOCKED",
       "gap": "已有 GIC/IRQ 分发；多核 IRQ 归属交接、不可迁保护及模型亲和性动作未接入。",
       "code": [
-        "kernel/src/interrupts.rs",
+        "kernel/src/platform/virt/interrupts.rs",
         "crates/driver-gicv2/src/lib.rs"
       ],
       "evidence": null
@@ -397,7 +397,7 @@
       "status": "BLOCKED",
       "gap": "已有单调时间/timerfd；显式 slack 的模型合并动作及硬截止保护验证未完成。",
       "code": [
-        "kernel/src/clock.rs",
+        "kernel/src/platform/virt/clock.rs",
         "crates/posix/src/timerfd.rs"
       ],
       "evidence": null
@@ -409,7 +409,7 @@
       "status": "BLOCKED",
       "gap": "已有 POSIX/Linux personality；按规范白名单执行 service_batch 动作及独立权限/顺序证据未完成。",
       "code": [
-        "kernel/src/user.rs",
+        "kernel/src/desktop/user.rs",
         "crates/posix/src/lib.rs"
       ],
       "evidence": null
@@ -421,7 +421,7 @@
       "status": "BLOCKED",
       "gap": "已有真实块设备与后台 checkpoint 策略；规范队列份额、合并动作及 flush/FUA 并发门禁仍待验收。",
       "code": [
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-runtime/src/storage_policy.rs"
       ],
       "evidence": null
@@ -433,7 +433,7 @@
       "status": "BLOCKED",
       "gap": "生产状态明确 network=absent；签名报文库不是 NIC/IP/可靠传输栈，不能关闭网络 AI 域。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/kernel-core/src/cluster/wire.rs"
       ],
       "evidence": null
@@ -446,7 +446,7 @@
       "gap": "已有 VirtIO 图形/输入/块设备；批次/队列策略和 DMA 生命周期联合动作尚未按本规范验证。",
       "code": [
         "crates/driver-virtio/src/lib.rs",
-        "kernel/src/virtio_platform.rs"
+        "kernel/src/platform/virt/virtio_platform.rs"
       ],
       "evidence": null
     },
@@ -469,7 +469,7 @@
       "status": "BLOCKED",
       "gap": "没有完成 duty-cycle AI 执行与 CPU 活动代理对比；不得以 QEMU 声称实体功耗优化。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/arch-aarch64/src/timer.rs"
       ],
       "evidence": null
@@ -481,7 +481,7 @@
       "status": "BLOCKED",
       "gap": "已有计数和故障管理状态机；真实受控恢复配方、紧急 IPC/内存恢复路径与动作效果未接入。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/kernel-core/src/control_plane/manager.rs"
       ],
       "evidence": null
@@ -494,7 +494,7 @@
       "gap": "已有 FDT/平台适配；HAL 自有 poll_budget 动作与运行证据未完成，拓扑描述不等于 AI 动作。",
       "code": [
         "crates/platform-virt/src/fdt.rs",
-        "kernel/src/virtio_platform.rs"
+        "kernel/src/platform/virt/virtio_platform.rs"
       ],
       "evidence": null
     },
@@ -533,7 +533,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -545,7 +545,7 @@
       "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs"
       ],
       "evidence": null
@@ -558,9 +558,9 @@
       "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs",
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -573,9 +573,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -586,9 +586,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -627,7 +627,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -640,7 +640,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -651,9 +651,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -664,7 +664,7 @@
       "status": "BLOCKED",
       "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
       "code": [
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -679,7 +679,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -692,7 +692,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -703,9 +703,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -718,7 +718,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -730,9 +730,9 @@
       "gap": "缺页缓存/回写/模型恢复联动的资源预留和实际组合故障证据；单模块成功不能证明无循环等待。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs",
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -1005,9 +1005,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -1018,9 +1018,9 @@
       "status": "BLOCKED",
       "gap": "现有资源 API 计数不对应规范 16 个一级子系统；缺统一强类型 Schema、全部实际动作/归因、黄金向量及故障基线。",
       "code": [
-        "kernel/src/ai.rs",
+        "kernel/src/desktop/ai.rs",
         "crates/ai-runtime/src/lib.rs",
-        "kernel/src/user/ai.rs"
+        "kernel/src/desktop/user/ai.rs"
       ],
       "evidence": null
     },
@@ -1046,7 +1046,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -1057,7 +1057,7 @@
       "status": "BLOCKED",
       "gap": "现有有界 checkpoint 不等同于全部日志事务/页缓存规范；需独立原生断电/挂载恢复证据，历史声明未导入 PASS。",
       "code": [
-        "kernel/src/storage.rs",
+        "kernel/src/desktop/storage.rs",
         "crates/ai-fs/src/checkpoint.rs",
         "crates/driver-virtio/src/snapshot.rs"
       ],
@@ -1071,7 +1071,7 @@
       "gap": "已有单核地址空间与页对象机制；本轮未执行原生映射/缺页/回收及跨核 shootdown 故障验证。",
       "code": [
         "crates/posix/src/vm.rs",
-        "kernel/src/shared_memory.rs",
+        "kernel/src/desktop/memory/shared_memory.rs",
         "crates/arch-aarch64/src/mmu.rs"
       ],
       "evidence": null
@@ -1085,7 +1085,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     },
@@ -1098,7 +1098,7 @@
       "code": [
         "crates/kernel-core/src/control_plane/manager.rs",
         "crates/arch-aarch64/src/entry.S",
-        "kernel/src/user.rs"
+        "kernel/src/desktop/user.rs"
       ],
       "evidence": null
     }

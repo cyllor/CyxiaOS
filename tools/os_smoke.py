@@ -46,7 +46,7 @@ class Console:
         self.capture_path.write_bytes(b'')
         self.sock.setblocking(False)
 
-    def pump(self):
+    def pump(self, *, require_running=True):
         while True:
             try:
                 data = self.sock.recv(65536)
@@ -59,7 +59,8 @@ class Console:
                    (b'X86_FAIL', b'NATIVE_SERVICE_PANIC', b'NATIVE_SERVICE_CHECK_FAILED',
                     b'POSIX CHECK FAILED', b'STORAGE_ERROR', b'_PROBE FAIL', b'_PROBE RESULT FAIL', b' panicked at ',
                     b'start failed:', b'pair failed:')), 'guest failure')
-        pc.require(self.process.poll() is None, 'QEMU exited unexpectedly')
+        if require_running:
+            pc.require(self.process.poll() is None, 'QEMU exited unexpectedly')
 
     def until(self, pattern, start=0, timeout=30):
         deadline = time.monotonic() + timeout
@@ -511,6 +512,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                       producer_sha256=pc.sha_bytes(producer), disk=str(disk), disk_before_sha256=pc.sha(disk))
         result['producer_inputs_sha256'] = helpers
         process = None; console = None; qmp = None; started = time.monotonic()
+        checks_passed = False
         with tempfile.TemporaryDirectory(prefix='cyx-os-') as temporary, (output / 'qemu-stderr.log').open('wb') as err:
             path = Path(temporary); qemu = pc.executable(qemu)
             argv = os_x86.launch_argv(qemu, build / 'boot.bin', disk=disk, qmp=path / 'q.sock')
@@ -758,7 +760,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     from verify_smithay_dynamic import scanout
                     result['display'] = scanout(output / 'display.ppm', 11)
                 else: result['display'] = verify_boot_frame(output / 'display.ppm')
-                result['status'] = 'OS_' + ('REBOOT_' if recover_disk else '') + scenario.upper() + '_PASS'
+                checks_passed = True
             except Exception as error:
                 result['error'] = repr(error)
                 if qmp:
@@ -769,7 +771,9 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
             finally:
                 if console:
                     try: console.pump()
-                    except Exception: pass
+                    except Exception as error:
+                        result.setdefault('error', repr(error))
+                        result.setdefault('finalization_errors', []).append(repr(error))
                 if qmp:
                     try: qmp.execute('quit')
                     except Exception: pass
@@ -779,13 +783,21 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     except subprocess.TimeoutExpired:
                         process.kill(); result['returncode'] = process.wait(); result['forced'] = True
                         result['status'] = 'FAIL'
+                if console:
+                    # QEMU has terminated, so consume its remaining serial bytes
+                    # without treating the expected process exit as a guest fault.
+                    # Failure markers and read errors still invalidate the capture.
+                    try: console.pump(require_running=False)
+                    except Exception as error:
+                        result.setdefault('error', repr(error))
+                        result.setdefault('finalization_errors', []).append(repr(error))
                 raw = bytes(console.raw) if console else b''
                 (output / 'serial.raw').write_bytes(raw)
                 (output / 'serial.txt').write_text(raw.decode(errors='replace'))
                 pc.write_json(output / 'commands.json', console.commands if console else [])
                 result.update(serial_sha256=pc.sha_bytes(raw), elapsed_seconds=time.monotonic() - started,
                               disk_after_sha256=pc.sha(disk), commands_sha256=pc.sha(output / 'commands.json'))
-                if result['status'] != 'FAIL':
+                if checks_passed and 'error' not in result and not result.get('forced'):
                     try:
                         os_x86.validate_build(build)
                         pc.require(Path(__file__).read_bytes() == producer, 'capture producer changed during VM')
@@ -836,6 +848,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                             pc.require(syscall_probe_inputs(manifest['sysroot'], 'thread-exit-probe') == result['thread_exit_build_inputs'],
                                        'thread-exit source/build inputs changed during VM')
                         pc.require(result.get('returncode') == 0, 'QEMU did not exit normally')
+                        result['status'] = 'OS_' + ('REBOOT_' if recover_disk else '') + scenario.upper() + '_PASS'
                     except Exception as changed:
                         result.update(status='FAIL', error=repr(changed))
                 pc.write_json(output / 'summary.json', result)

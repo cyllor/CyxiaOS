@@ -78,8 +78,7 @@ mod hardware {
         /// `mapped` is the supervisor UC alias of the discovered physical APIC.
         pub unsafe fn init_mapped(physical: u64, mapped: u64) -> Result<Self, Error> {
             initial_id()?;
-            if physical < 4096
-                || physical >= 1 << 32
+            if !(4096..(1_u64 << 32)).contains(&physical)
                 || !physical.is_multiple_of(4096)
                 || !mapped.is_multiple_of(4096)
             {

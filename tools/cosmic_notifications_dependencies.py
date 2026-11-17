@@ -35,6 +35,16 @@ def git_blob(data):
     return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
 
 
+def pinned_git(source, *arguments):
+    """Read canonical Git objects, never a cache's local replacement refs.
+
+    HEAD and HEAD^{tree} keep their original IDs under a tree replacement while
+    ls-tree follows the replacement. Apply this option to every identity read;
+    the frozen shared Git producer remains unchanged.
+    """
+    return build.git(source, '--no-replace-objects', *arguments)
+
+
 def parse_git_tree(text):
     records = {}
     for row in text.split('\0'):
@@ -125,12 +135,12 @@ def checkout_identity(manifest, cache, spec):
     require(len(relative.parts) >= 4, 'Git package lacks a checkout root and package path')
     root = checkouts / relative.parts[0] / relative.parts[1]
     require((root / '.git').is_dir() and not (root / '.git').is_symlink()
-            and Path(build.git(root, 'rev-parse', '--show-toplevel')) == root,
+            and Path(pinned_git(root, 'rev-parse', '--show-toplevel')) == root,
             'Git package is not in its own pinned checkout')
-    require(build.git(root, 'rev-parse', 'HEAD') == WINIT_COMMIT
-            and build.git(root, 'rev-parse', 'HEAD^{tree}') == WINIT_TREE,
+    require(pinned_git(root, 'rev-parse', 'HEAD') == WINIT_COMMIT
+            and pinned_git(root, 'rev-parse', 'HEAD^{tree}') == WINIT_TREE,
             'Git package checkout commit/tree differs from declared source')
-    declared = parse_git_tree(build.git(root, 'ls-tree', '-rz', 'HEAD'))
+    declared = parse_git_tree(pinned_git(root, 'ls-tree', '-rz', 'HEAD'))
     identity = validate_checkout_tree(root, declared)
     require(str(manifest.relative_to(root)) in declared, 'Package manifest is not in pinned Git tree')
     return {'path': str(root), 'source': spec, 'commit': WINIT_COMMIT, 'git_tree': WINIT_TREE,
