@@ -1,0 +1,3925 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -67,7 +67,7 @@
+ checksum = "710e8eae58854cdc1790fcb56cca04d712a17be849eeb81da2a724bf4bae2bc4"
+ dependencies = [
+  "anstyle",
+- "unicode-width",
++ "unicode-width 0.2.2",
+ ]
+ 
+ [[package]]
+@@ -362,7 +362,7 @@
+  "arrayvec",
+  "bitcode_derive",
+  "bytemuck",
+- "glam 0.34.0",
++ "glam",
+  "serde",
+ ]
+ 
+@@ -720,7 +720,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
+ dependencies = [
+- "unicode-width",
++ "unicode-width 0.2.2",
+ ]
+ 
+ [[package]]
+@@ -867,11 +867,14 @@
+ [[package]]
+ name = "cosmic-comp-config"
+ version = "1.0.0"
+-source = "git+https://github.com/pop-os/cosmic-comp#41497b42d9744d9963c4c6d17e8add49489b45ee"
+ dependencies = [
+  "cosmic-config",
++ "cosmic-randr-shell",
+  "input",
++ "libdisplay-info",
++ "ron 0.12.2",
+  "serde",
++ "tracing",
+ ]
+ 
+ [[package]]
+@@ -951,6 +954,16 @@
+  "wayland-protocols-wlr",
+  "wayland-scanner",
+  "wayland-server",
++]
++
++[[package]]
++name = "cosmic-randr-shell"
++version = "0.1.0"
++source = "git+https://github.com/pop-os/cosmic-randr/?rev=6e8e795970fa06d434af22775e415b517f7552d3#6e8e795970fa06d434af22775e415b517f7552d3"
++dependencies = [
++ "kdl",
++ "slotmap",
++ "thiserror 2.0.21",
+ ]
+ 
+ [[package]]
+@@ -1056,6 +1069,7 @@
+  "udev 0.9.3",
+  "upower_dbus",
+  "walkdir",
++ "wayland-sys",
+  "zbus",
+ ]
+ 
+@@ -2137,12 +2151,6 @@
+ version = "0.25.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
+-
+-[[package]]
+-name = "glam"
+-version = "0.34.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eece6af6447501f08d55ff4f6aed8a2753e4224e51899bccf3d5ae3d2de564b1"
+ 
+ [[package]]
+ name = "glob"
+@@ -2569,7 +2577,7 @@
+  "build_helpers",
+  "bytes",
+  "dnd",
+- "glam 0.25.0",
++ "glam",
+  "lilt",
+  "log",
+  "mime 0.1.0",
+@@ -2693,7 +2701,7 @@
+  "bytemuck",
+  "cryoglyph",
+  "futures",
+- "glam 0.25.0",
++ "glam",
+  "guillotiere",
+  "iced_debug",
+  "iced_graphics",
+@@ -3092,6 +3100,17 @@
+ checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+ dependencies = [
+  "mutate_once",
++]
++
++[[package]]
++name = "kdl"
++version = "6.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "81a29e7b50079ff44549f68c0becb1c73d7f6de2a4ea952da77966daf3d4761e"
++dependencies = [
++ "miette",
++ "num",
++ "winnow 0.6.24",
+ ]
+ 
+ [[package]]
+@@ -3206,6 +3225,40 @@
+ ]
+ 
+ [[package]]
++name = "libdisplay-info"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59fd96dbb2381ff31f314f07accbdf8550febdcc5cd8761ecaf7c1763361c359"
++dependencies = [
++ "bitflags 2.13.2",
++ "libc",
++ "libdisplay-info-derive",
++ "libdisplay-info-sys",
++ "thiserror 2.0.21",
++]
++
++[[package]]
++name = "libdisplay-info-derive"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8dc2c710cf5819e91220a446d9e64acc6814386cc22c509c3f0df83c0b874a98"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "libdisplay-info-sys"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "26590d55b8819f9c6b0d95d9d12dc9edbfd1f2413e88814a33b631ac049bb51f"
++dependencies = [
++ "semver",
++ "system-deps",
++]
++
++[[package]]
+ name = "libloading"
+ version = "0.8.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -3545,6 +3598,16 @@
+  "proc-macro2",
+  "quote",
+  "syn 1.0.109",
++]
++
++[[package]]
++name = "miette"
++version = "7.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
++dependencies = [
++ "cfg-if",
++ "unicode-width 0.1.14",
+ ]
+ 
+ [[package]]
+@@ -3752,10 +3815,74 @@
+ ]
+ 
+ [[package]]
++name = "num"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
++dependencies = [
++ "num-bigint",
++ "num-complex",
++ "num-integer",
++ "num-iter",
++ "num-rational",
++ "num-traits",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-complex"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
+ name = "num-conv"
+ version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
++
++[[package]]
++name = "num-integer"
++version = "0.1.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-iter"
++version = "0.1.45"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
++dependencies = [
++ "autocfg",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-rational"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
++dependencies = [
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
+ 
+ [[package]]
+ name = "num-traits"
+@@ -4799,6 +4926,12 @@
+ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
+ 
+ [[package]]
++name = "semver"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
++
++[[package]]
+ name = "serde"
+ version = "1.0.229"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -5343,7 +5476,7 @@
+ checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+ dependencies = [
+  "fastrand",
+- "getrandom 0.4.3",
++ "getrandom 0.3.4",
+  "once_cell",
+  "rustix 1.1.5",
+  "windows-sys 0.61.2",
+@@ -5580,7 +5713,7 @@
+  "toml_datetime",
+  "toml_parser",
+  "toml_writer",
+- "winnow",
++ "winnow 1.0.4",
+ ]
+ 
+ [[package]]
+@@ -5601,7 +5734,7 @@
+  "indexmap 2.14.2",
+  "toml_datetime",
+  "toml_parser",
+- "winnow",
++ "winnow 1.0.4",
+ ]
+ 
+ [[package]]
+@@ -5610,7 +5743,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+ dependencies = [
+- "winnow",
++ "winnow 1.0.4",
+ ]
+ 
+ [[package]]
+@@ -5882,6 +6015,12 @@
+ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b1d386ff53b415b7fe27b50bb44679e2cc4660272694b7b6f3326d8480823a94"
++
++[[package]]
++name = "unicode-width"
++version = "0.1.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
+ 
+ [[package]]
+ name = "unicode-width"
+@@ -6230,11 +6369,11 @@
+ [[package]]
+ name = "wayland-sys"
+ version = "0.31.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+ dependencies = [
+  "dlib",
++ "libc",
+  "log",
++ "memoffset",
+  "once_cell",
+  "pkg-config",
+ ]
+@@ -6773,6 +6912,15 @@
+ version = "0.53.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
++
++[[package]]
++name = "winnow"
++version = "0.6.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c8d71a593cc5c42ad7876e2c1fda56f314f3754c084128833e64f1345ff8a03a"
++dependencies = [
++ "memchr 2.8.3",
++]
+ 
+ [[package]]
+ name = "winnow"
+@@ -6939,7 +7087,7 @@
+  "uds_windows",
+  "uuid",
+  "windows-sys 0.61.2",
+- "winnow",
++ "winnow 1.0.4",
+  "zbus_macros",
+  "zbus_names",
+  "zvariant",
+@@ -6967,7 +7115,7 @@
+ checksum = "d8bf88b4a3ff53e883001e0e0115b297a9d53c31b9c1edd2bfdd853e3428624e"
+ dependencies = [
+  "serde",
+- "winnow",
++ "winnow 1.0.4",
+  "zvariant",
+ ]
+ 
+@@ -7266,7 +7414,7 @@
+  "endi",
+  "enumflags2",
+  "serde",
+- "winnow",
++ "winnow 1.0.4",
+  "zcheapstr",
+  "zvariant_derive",
+  "zvariant_utils",
+@@ -7295,5 +7443,5 @@
+  "quote",
+  "serde",
+  "syn 3.0.6",
+- "winnow",
+-]
++ "winnow 1.0.4",
++]
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,24 +26,31 @@
+ default-features = false
+ features = ["tokio"]
+ 
++[features]
++default = ["audio", "backlight"]
++audio = ["dep:cosmic-settings-audio-server", "dep:cosmic-settings-varlink-server"]
++backlight = ["dep:udev", "dep:ddc-hi", "cosmic-comp-config/libinput"]
++cyxia-native = ["dep:wayland-sys"]
++
+ [dependencies]
++wayland-sys = { path = "native-deps/wayland-sys", optional = true, default-features = false, features = ["cyxia-static-client"] }
+ anyhow = "1.0.99"
+ chrono = "0.4.42"
+-cosmic-comp-config = { git = "https://github.com/pop-os/cosmic-comp" }
++cosmic-comp-config = { path = "native-deps/cosmic-comp-config", default-features = false }
+ cosmic-config.workspace = true
+ cosmic-dbus-a11y = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+-cosmic-settings-audio-server = { path = "./audio-server" }
++cosmic-settings-audio-server = { path = "./audio-server", optional = true }
+ cosmic-settings-daemon-config = { path = "./cosmic-settings-daemon-config", features = [
+     "greeter",
+ ] }
+-cosmic-settings-varlink-server = { path = "./varlink-server" }
++cosmic-settings-varlink-server = { path = "./varlink-server", optional = true }
+ cosmic-theme.export = true
+ cosmic-theme.workspace = true
+-ddc-hi = "0.4.1"
++ddc-hi = { version = "0.4.1", optional = true }
+ dirs = "6.0.0"
+ futures = "0.3.31"
+ futures-util = "0.3.31"
+-geonames = { path = "geonames" }
++geonames = { path = "geonames", default-features = false }
+ libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false }
+ locale1 = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+ log = "0.4.28"
+@@ -52,11 +59,11 @@
+ notify-rust = "4.11.7"
+ serde = "1.0.228"
+ sunrise = "2.1.0"
+-tokio = { version = "1.47.1", features = ["macros", "net", "rt", "signal"] }
++tokio = { version = "1.47.1", features = ["macros", "net", "rt", "signal", "fs", "process", "sync", "time"] }
+ tokio-stream = "0.1.17"
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+-udev = "0.9.3"
++udev = { version = "0.9.3", optional = true }
+ upower_dbus = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+ walkdir = "2.5.0"
+ zbus = { version = "5.11.0", default-features = false, features = ["tokio"] }
+@@ -70,3 +77,6 @@
+ # iced_futures = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
+ # cosmic-config = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
+ # cosmic-theme = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
++
++[patch.crates-io]
++wayland-sys = { path = "native-deps/wayland-sys" }
+diff --git a/geonames/Cargo.toml b/geonames/Cargo.toml
+--- a/geonames/Cargo.toml
++++ b/geonames/Cargo.toml
+@@ -4,8 +4,17 @@
+ edition = "2024"
+ publish = false
+ 
++[features]
++default = ["generator"]
++generator = ["dep:reqwest", "dep:tokio", "dep:zip"]
++
++[[bin]]
++name = "geonames"
++path = "src/main.rs"
++required-features = ["generator"]
++
+ [dependencies]
+ bitcode = "0.6"
+-reqwest = "0.12"
+-tokio = { version = "1.47", features = ["full"] }
+-zip = "5"
++reqwest = { version = "0.12", optional = true }
++tokio = { version = "1.47", features = ["full"], optional = true }
++zip = { version = "5", optional = true }
+diff --git a/native-deps/cosmic-comp-config/Cargo.toml b/native-deps/cosmic-comp-config/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/Cargo.toml
+@@ -0,0 +1,22 @@
++[package]
++name = "cosmic-comp-config"
++version = "1.0.0"
++edition = "2024"
++
++[dependencies]
++cosmic-config = { git = "https://github.com/pop-os/libcosmic/" }
++cosmic-randr-shell = { git = "https://github.com/pop-os/cosmic-randr/", rev = "6e8e795970fa06d434af22775e415b517f7552d3", optional = true }
++input = { version = "0.10.0", optional = true }
++libdisplay-info = { version = "0.3.0", optional = true }
++serde = { version = "1", features = ["derive"] }
++ron = { version = "0.12", optional = true }
++tracing = { version = "0.1.44", features = [
++    "max_level_debug",
++    "release_max_level_info",
++], optional = true }
++
++[features]
++default = ["libinput"]
++libinput = ["dep:input"]
++output = ["ron", "tracing"]
++randr = ["cosmic-randr-shell", "output"]
+diff --git a/native-deps/cosmic-comp-config/LICENSE b/native-deps/cosmic-comp-config/LICENSE
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/LICENSE
+@@ -0,0 +1,674 @@
++                    GNU GENERAL PUBLIC LICENSE
++                       Version 3, 29 June 2007
++
++ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
++ Everyone is permitted to copy and distribute verbatim copies
++ of this license document, but changing it is not allowed.
++
++                            Preamble
++
++  The GNU General Public License is a free, copyleft license for
++software and other kinds of works.
++
++  The licenses for most software and other practical works are designed
++to take away your freedom to share and change the works.  By contrast,
++the GNU General Public License is intended to guarantee your freedom to
++share and change all versions of a program--to make sure it remains free
++software for all its users.  We, the Free Software Foundation, use the
++GNU General Public License for most of our software; it applies also to
++any other work released this way by its authors.  You can apply it to
++your programs, too.
++
++  When we speak of free software, we are referring to freedom, not
++price.  Our General Public Licenses are designed to make sure that you
++have the freedom to distribute copies of free software (and charge for
++them if you wish), that you receive source code or can get it if you
++want it, that you can change the software or use pieces of it in new
++free programs, and that you know you can do these things.
++
++  To protect your rights, we need to prevent others from denying you
++these rights or asking you to surrender the rights.  Therefore, you have
++certain responsibilities if you distribute copies of the software, or if
++you modify it: responsibilities to respect the freedom of others.
++
++  For example, if you distribute copies of such a program, whether
++gratis or for a fee, you must pass on to the recipients the same
++freedoms that you received.  You must make sure that they, too, receive
++or can get the source code.  And you must show them these terms so they
++know their rights.
++
++  Developers that use the GNU GPL protect your rights with two steps:
++(1) assert copyright on the software, and (2) offer you this License
++giving you legal permission to copy, distribute and/or modify it.
++
++  For the developers' and authors' protection, the GPL clearly explains
++that there is no warranty for this free software.  For both users' and
++authors' sake, the GPL requires that modified versions be marked as
++changed, so that their problems will not be attributed erroneously to
++authors of previous versions.
++
++  Some devices are designed to deny users access to install or run
++modified versions of the software inside them, although the manufacturer
++can do so.  This is fundamentally incompatible with the aim of
++protecting users' freedom to change the software.  The systematic
++pattern of such abuse occurs in the area of products for individuals to
++use, which is precisely where it is most unacceptable.  Therefore, we
++have designed this version of the GPL to prohibit the practice for those
++products.  If such problems arise substantially in other domains, we
++stand ready to extend this provision to those domains in future versions
++of the GPL, as needed to protect the freedom of users.
++
++  Finally, every program is threatened constantly by software patents.
++States should not allow patents to restrict development and use of
++software on general-purpose computers, but in those that do, we wish to
++avoid the special danger that patents applied to a free program could
++make it effectively proprietary.  To prevent this, the GPL assures that
++patents cannot be used to render the program non-free.
++
++  The precise terms and conditions for copying, distribution and
++modification follow.
++
++                       TERMS AND CONDITIONS
++
++  0. Definitions.
++
++  "This License" refers to version 3 of the GNU General Public License.
++
++  "Copyright" also means copyright-like laws that apply to other kinds of
++works, such as semiconductor masks.
++
++  "The Program" refers to any copyrightable work licensed under this
++License.  Each licensee is addressed as "you".  "Licensees" and
++"recipients" may be individuals or organizations.
++
++  To "modify" a work means to copy from or adapt all or part of the work
++in a fashion requiring copyright permission, other than the making of an
++exact copy.  The resulting work is called a "modified version" of the
++earlier work or a work "based on" the earlier work.
++
++  A "covered work" means either the unmodified Program or a work based
++on the Program.
++
++  To "propagate" a work means to do anything with it that, without
++permission, would make you directly or secondarily liable for
++infringement under applicable copyright law, except executing it on a
++computer or modifying a private copy.  Propagation includes copying,
++distribution (with or without modification), making available to the
++public, and in some countries other activities as well.
++
++  To "convey" a work means any kind of propagation that enables other
++parties to make or receive copies.  Mere interaction with a user through
++a computer network, with no transfer of a copy, is not conveying.
++
++  An interactive user interface displays "Appropriate Legal Notices"
++to the extent that it includes a convenient and prominently visible
++feature that (1) displays an appropriate copyright notice, and (2)
++tells the user that there is no warranty for the work (except to the
++extent that warranties are provided), that licensees may convey the
++work under this License, and how to view a copy of this License.  If
++the interface presents a list of user commands or options, such as a
++menu, a prominent item in the list meets this criterion.
++
++  1. Source Code.
++
++  The "source code" for a work means the preferred form of the work
++for making modifications to it.  "Object code" means any non-source
++form of a work.
++
++  A "Standard Interface" means an interface that either is an official
++standard defined by a recognized standards body, or, in the case of
++interfaces specified for a particular programming language, one that
++is widely used among developers working in that language.
++
++  The "System Libraries" of an executable work include anything, other
++than the work as a whole, that (a) is included in the normal form of
++packaging a Major Component, but which is not part of that Major
++Component, and (b) serves only to enable use of the work with that
++Major Component, or to implement a Standard Interface for which an
++implementation is available to the public in source code form.  A
++"Major Component", in this context, means a major essential component
++(kernel, window system, and so on) of the specific operating system
++(if any) on which the executable work runs, or a compiler used to
++produce the work, or an object code interpreter used to run it.
++
++  The "Corresponding Source" for a work in object code form means all
++the source code needed to generate, install, and (for an executable
++work) run the object code and to modify the work, including scripts to
++control those activities.  However, it does not include the work's
++System Libraries, or general-purpose tools or generally available free
++programs which are used unmodified in performing those activities but
++which are not part of the work.  For example, Corresponding Source
++includes interface definition files associated with source files for
++the work, and the source code for shared libraries and dynamically
++linked subprograms that the work is specifically designed to require,
++such as by intimate data communication or control flow between those
++subprograms and other parts of the work.
++
++  The Corresponding Source need not include anything that users
++can regenerate automatically from other parts of the Corresponding
++Source.
++
++  The Corresponding Source for a work in source code form is that
++same work.
++
++  2. Basic Permissions.
++
++  All rights granted under this License are granted for the term of
++copyright on the Program, and are irrevocable provided the stated
++conditions are met.  This License explicitly affirms your unlimited
++permission to run the unmodified Program.  The output from running a
++covered work is covered by this License only if the output, given its
++content, constitutes a covered work.  This License acknowledges your
++rights of fair use or other equivalent, as provided by copyright law.
++
++  You may make, run and propagate covered works that you do not
++convey, without conditions so long as your license otherwise remains
++in force.  You may convey covered works to others for the sole purpose
++of having them make modifications exclusively for you, or provide you
++with facilities for running those works, provided that you comply with
++the terms of this License in conveying all material for which you do
++not control copyright.  Those thus making or running the covered works
++for you must do so exclusively on your behalf, under your direction
++and control, on terms that prohibit them from making any copies of
++your copyrighted material outside their relationship with you.
++
++  Conveying under any other circumstances is permitted solely under
++the conditions stated below.  Sublicensing is not allowed; section 10
++makes it unnecessary.
++
++  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
++
++  No covered work shall be deemed part of an effective technological
++measure under any applicable law fulfilling obligations under article
++11 of the WIPO copyright treaty adopted on 20 December 1996, or
++similar laws prohibiting or restricting circumvention of such
++measures.
++
++  When you convey a covered work, you waive any legal power to forbid
++circumvention of technological measures to the extent such circumvention
++is effected by exercising rights under this License with respect to
++the covered work, and you disclaim any intention to limit operation or
++modification of the work as a means of enforcing, against the work's
++users, your or third parties' legal rights to forbid circumvention of
++technological measures.
++
++  4. Conveying Verbatim Copies.
++
++  You may convey verbatim copies of the Program's source code as you
++receive it, in any medium, provided that you conspicuously and
++appropriately publish on each copy an appropriate copyright notice;
++keep intact all notices stating that this License and any
++non-permissive terms added in accord with section 7 apply to the code;
++keep intact all notices of the absence of any warranty; and give all
++recipients a copy of this License along with the Program.
++
++  You may charge any price or no price for each copy that you convey,
++and you may offer support or warranty protection for a fee.
++
++  5. Conveying Modified Source Versions.
++
++  You may convey a work based on the Program, or the modifications to
++produce it from the Program, in the form of source code under the
++terms of section 4, provided that you also meet all of these conditions:
++
++    a) The work must carry prominent notices stating that you modified
++    it, and giving a relevant date.
++
++    b) The work must carry prominent notices stating that it is
++    released under this License and any conditions added under section
++    7.  This requirement modifies the requirement in section 4 to
++    "keep intact all notices".
++
++    c) You must license the entire work, as a whole, under this
++    License to anyone who comes into possession of a copy.  This
++    License will therefore apply, along with any applicable section 7
++    additional terms, to the whole of the work, and all its parts,
++    regardless of how they are packaged.  This License gives no
++    permission to license the work in any other way, but it does not
++    invalidate such permission if you have separately received it.
++
++    d) If the work has interactive user interfaces, each must display
++    Appropriate Legal Notices; however, if the Program has interactive
++    interfaces that do not display Appropriate Legal Notices, your
++    work need not make them do so.
++
++  A compilation of a covered work with other separate and independent
++works, which are not by their nature extensions of the covered work,
++and which are not combined with it such as to form a larger program,
++in or on a volume of a storage or distribution medium, is called an
++"aggregate" if the compilation and its resulting copyright are not
++used to limit the access or legal rights of the compilation's users
++beyond what the individual works permit.  Inclusion of a covered work
++in an aggregate does not cause this License to apply to the other
++parts of the aggregate.
++
++  6. Conveying Non-Source Forms.
++
++  You may convey a covered work in object code form under the terms
++of sections 4 and 5, provided that you also convey the
++machine-readable Corresponding Source under the terms of this License,
++in one of these ways:
++
++    a) Convey the object code in, or embodied in, a physical product
++    (including a physical distribution medium), accompanied by the
++    Corresponding Source fixed on a durable physical medium
++    customarily used for software interchange.
++
++    b) Convey the object code in, or embodied in, a physical product
++    (including a physical distribution medium), accompanied by a
++    written offer, valid for at least three years and valid for as
++    long as you offer spare parts or customer support for that product
++    model, to give anyone who possesses the object code either (1) a
++    copy of the Corresponding Source for all the software in the
++    product that is covered by this License, on a durable physical
++    medium customarily used for software interchange, for a price no
++    more than your reasonable cost of physically performing this
++    conveying of source, or (2) access to copy the
++    Corresponding Source from a network server at no charge.
++
++    c) Convey individual copies of the object code with a copy of the
++    written offer to provide the Corresponding Source.  This
++    alternative is allowed only occasionally and noncommercially, and
++    only if you received the object code with such an offer, in accord
++    with subsection 6b.
++
++    d) Convey the object code by offering access from a designated
++    place (gratis or for a charge), and offer equivalent access to the
++    Corresponding Source in the same way through the same place at no
++    further charge.  You need not require recipients to copy the
++    Corresponding Source along with the object code.  If the place to
++    copy the object code is a network server, the Corresponding Source
++    may be on a different server (operated by you or a third party)
++    that supports equivalent copying facilities, provided you maintain
++    clear directions next to the object code saying where to find the
++    Corresponding Source.  Regardless of what server hosts the
++    Corresponding Source, you remain obligated to ensure that it is
++    available for as long as needed to satisfy these requirements.
++
++    e) Convey the object code using peer-to-peer transmission, provided
++    you inform other peers where the object code and Corresponding
++    Source of the work are being offered to the general public at no
++    charge under subsection 6d.
++
++  A separable portion of the object code, whose source code is excluded
++from the Corresponding Source as a System Library, need not be
++included in conveying the object code work.
++
++  A "User Product" is either (1) a "consumer product", which means any
++tangible personal property which is normally used for personal, family,
++or household purposes, or (2) anything designed or sold for incorporation
++into a dwelling.  In determining whether a product is a consumer product,
++doubtful cases shall be resolved in favor of coverage.  For a particular
++product received by a particular user, "normally used" refers to a
++typical or common use of that class of product, regardless of the status
++of the particular user or of the way in which the particular user
++actually uses, or expects or is expected to use, the product.  A product
++is a consumer product regardless of whether the product has substantial
++commercial, industrial or non-consumer uses, unless such uses represent
++the only significant mode of use of the product.
++
++  "Installation Information" for a User Product means any methods,
++procedures, authorization keys, or other information required to install
++and execute modified versions of a covered work in that User Product from
++a modified version of its Corresponding Source.  The information must
++suffice to ensure that the continued functioning of the modified object
++code is in no case prevented or interfered with solely because
++modification has been made.
++
++  If you convey an object code work under this section in, or with, or
++specifically for use in, a User Product, and the conveying occurs as
++part of a transaction in which the right of possession and use of the
++User Product is transferred to the recipient in perpetuity or for a
++fixed term (regardless of how the transaction is characterized), the
++Corresponding Source conveyed under this section must be accompanied
++by the Installation Information.  But this requirement does not apply
++if neither you nor any third party retains the ability to install
++modified object code on the User Product (for example, the work has
++been installed in ROM).
++
++  The requirement to provide Installation Information does not include a
++requirement to continue to provide support service, warranty, or updates
++for a work that has been modified or installed by the recipient, or for
++the User Product in which it has been modified or installed.  Access to a
++network may be denied when the modification itself materially and
++adversely affects the operation of the network or violates the rules and
++protocols for communication across the network.
++
++  Corresponding Source conveyed, and Installation Information provided,
++in accord with this section must be in a format that is publicly
++documented (and with an implementation available to the public in
++source code form), and must require no special password or key for
++unpacking, reading or copying.
++
++  7. Additional Terms.
++
++  "Additional permissions" are terms that supplement the terms of this
++License by making exceptions from one or more of its conditions.
++Additional permissions that are applicable to the entire Program shall
++be treated as though they were included in this License, to the extent
++that they are valid under applicable law.  If additional permissions
++apply only to part of the Program, that part may be used separately
++under those permissions, but the entire Program remains governed by
++this License without regard to the additional permissions.
++
++  When you convey a copy of a covered work, you may at your option
++remove any additional permissions from that copy, or from any part of
++it.  (Additional permissions may be written to require their own
++removal in certain cases when you modify the work.)  You may place
++additional permissions on material, added by you to a covered work,
++for which you have or can give appropriate copyright permission.
++
++  Notwithstanding any other provision of this License, for material you
++add to a covered work, you may (if authorized by the copyright holders of
++that material) supplement the terms of this License with terms:
++
++    a) Disclaiming warranty or limiting liability differently from the
++    terms of sections 15 and 16 of this License; or
++
++    b) Requiring preservation of specified reasonable legal notices or
++    author attributions in that material or in the Appropriate Legal
++    Notices displayed by works containing it; or
++
++    c) Prohibiting misrepresentation of the origin of that material, or
++    requiring that modified versions of such material be marked in
++    reasonable ways as different from the original version; or
++
++    d) Limiting the use for publicity purposes of names of licensors or
++    authors of the material; or
++
++    e) Declining to grant rights under trademark law for use of some
++    trade names, trademarks, or service marks; or
++
++    f) Requiring indemnification of licensors and authors of that
++    material by anyone who conveys the material (or modified versions of
++    it) with contractual assumptions of liability to the recipient, for
++    any liability that these contractual assumptions directly impose on
++    those licensors and authors.
++
++  All other non-permissive additional terms are considered "further
++restrictions" within the meaning of section 10.  If the Program as you
++received it, or any part of it, contains a notice stating that it is
++governed by this License along with a term that is a further
++restriction, you may remove that term.  If a license document contains
++a further restriction but permits relicensing or conveying under this
++License, you may add to a covered work material governed by the terms
++of that license document, provided that the further restriction does
++not survive such relicensing or conveying.
++
++  If you add terms to a covered work in accord with this section, you
++must place, in the relevant source files, a statement of the
++additional terms that apply to those files, or a notice indicating
++where to find the applicable terms.
++
++  Additional terms, permissive or non-permissive, may be stated in the
++form of a separately written license, or stated as exceptions;
++the above requirements apply either way.
++
++  8. Termination.
++
++  You may not propagate or modify a covered work except as expressly
++provided under this License.  Any attempt otherwise to propagate or
++modify it is void, and will automatically terminate your rights under
++this License (including any patent licenses granted under the third
++paragraph of section 11).
++
++  However, if you cease all violation of this License, then your
++license from a particular copyright holder is reinstated (a)
++provisionally, unless and until the copyright holder explicitly and
++finally terminates your license, and (b) permanently, if the copyright
++holder fails to notify you of the violation by some reasonable means
++prior to 60 days after the cessation.
++
++  Moreover, your license from a particular copyright holder is
++reinstated permanently if the copyright holder notifies you of the
++violation by some reasonable means, this is the first time you have
++received notice of violation of this License (for any work) from that
++copyright holder, and you cure the violation prior to 30 days after
++your receipt of the notice.
++
++  Termination of your rights under this section does not terminate the
++licenses of parties who have received copies or rights from you under
++this License.  If your rights have been terminated and not permanently
++reinstated, you do not qualify to receive new licenses for the same
++material under section 10.
++
++  9. Acceptance Not Required for Having Copies.
++
++  You are not required to accept this License in order to receive or
++run a copy of the Program.  Ancillary propagation of a covered work
++occurring solely as a consequence of using peer-to-peer transmission
++to receive a copy likewise does not require acceptance.  However,
++nothing other than this License grants you permission to propagate or
++modify any covered work.  These actions infringe copyright if you do
++not accept this License.  Therefore, by modifying or propagating a
++covered work, you indicate your acceptance of this License to do so.
++
++  10. Automatic Licensing of Downstream Recipients.
++
++  Each time you convey a covered work, the recipient automatically
++receives a license from the original licensors, to run, modify and
++propagate that work, subject to this License.  You are not responsible
++for enforcing compliance by third parties with this License.
++
++  An "entity transaction" is a transaction transferring control of an
++organization, or substantially all assets of one, or subdividing an
++organization, or merging organizations.  If propagation of a covered
++work results from an entity transaction, each party to that
++transaction who receives a copy of the work also receives whatever
++licenses to the work the party's predecessor in interest had or could
++give under the previous paragraph, plus a right to possession of the
++Corresponding Source of the work from the predecessor in interest, if
++the predecessor has it or can get it with reasonable efforts.
++
++  You may not impose any further restrictions on the exercise of the
++rights granted or affirmed under this License.  For example, you may
++not impose a license fee, royalty, or other charge for exercise of
++rights granted under this License, and you may not initiate litigation
++(including a cross-claim or counterclaim in a lawsuit) alleging that
++any patent claim is infringed by making, using, selling, offering for
++sale, or importing the Program or any portion of it.
++
++  11. Patents.
++
++  A "contributor" is a copyright holder who authorizes use under this
++License of the Program or a work on which the Program is based.  The
++work thus licensed is called the contributor's "contributor version".
++
++  A contributor's "essential patent claims" are all patent claims
++owned or controlled by the contributor, whether already acquired or
++hereafter acquired, that would be infringed by some manner, permitted
++by this License, of making, using, or selling its contributor version,
++but do not include claims that would be infringed only as a
++consequence of further modification of the contributor version.  For
++purposes of this definition, "control" includes the right to grant
++patent sublicenses in a manner consistent with the requirements of
++this License.
++
++  Each contributor grants you a non-exclusive, worldwide, royalty-free
++patent license under the contributor's essential patent claims, to
++make, use, sell, offer for sale, import and otherwise run, modify and
++propagate the contents of its contributor version.
++
++  In the following three paragraphs, a "patent license" is any express
++agreement or commitment, however denominated, not to enforce a patent
++(such as an express permission to practice a patent or covenant not to
++sue for patent infringement).  To "grant" such a patent license to a
++party means to make such an agreement or commitment not to enforce a
++patent against the party.
++
++  If you convey a covered work, knowingly relying on a patent license,
++and the Corresponding Source of the work is not available for anyone
++to copy, free of charge and under the terms of this License, through a
++publicly available network server or other readily accessible means,
++then you must either (1) cause the Corresponding Source to be so
++available, or (2) arrange to deprive yourself of the benefit of the
++patent license for this particular work, or (3) arrange, in a manner
++consistent with the requirements of this License, to extend the patent
++license to downstream recipients.  "Knowingly relying" means you have
++actual knowledge that, but for the patent license, your conveying the
++covered work in a country, or your recipient's use of the covered work
++in a country, would infringe one or more identifiable patents in that
++country that you have reason to believe are valid.
++
++  If, pursuant to or in connection with a single transaction or
++arrangement, you convey, or propagate by procuring conveyance of, a
++covered work, and grant a patent license to some of the parties
++receiving the covered work authorizing them to use, propagate, modify
++or convey a specific copy of the covered work, then the patent license
++you grant is automatically extended to all recipients of the covered
++work and works based on it.
++
++  A patent license is "discriminatory" if it does not include within
++the scope of its coverage, prohibits the exercise of, or is
++conditioned on the non-exercise of one or more of the rights that are
++specifically granted under this License.  You may not convey a covered
++work if you are a party to an arrangement with a third party that is
++in the business of distributing software, under which you make payment
++to the third party based on the extent of your activity of conveying
++the work, and under which the third party grants, to any of the
++parties who would receive the covered work from you, a discriminatory
++patent license (a) in connection with copies of the covered work
++conveyed by you (or copies made from those copies), or (b) primarily
++for and in connection with specific products or compilations that
++contain the covered work, unless you entered into that arrangement,
++or that patent license was granted, prior to 28 March 2007.
++
++  Nothing in this License shall be construed as excluding or limiting
++any implied license or other defenses to infringement that may
++otherwise be available to you under applicable patent law.
++
++  12. No Surrender of Others' Freedom.
++
++  If conditions are imposed on you (whether by court order, agreement or
++otherwise) that contradict the conditions of this License, they do not
++excuse you from the conditions of this License.  If you cannot convey a
++covered work so as to satisfy simultaneously your obligations under this
++License and any other pertinent obligations, then as a consequence you may
++not convey it at all.  For example, if you agree to terms that obligate you
++to collect a royalty for further conveying from those to whom you convey
++the Program, the only way you could satisfy both those terms and this
++License would be to refrain entirely from conveying the Program.
++
++  13. Use with the GNU Affero General Public License.
++
++  Notwithstanding any other provision of this License, you have
++permission to link or combine any covered work with a work licensed
++under version 3 of the GNU Affero General Public License into a single
++combined work, and to convey the resulting work.  The terms of this
++License will continue to apply to the part which is the covered work,
++but the special requirements of the GNU Affero General Public License,
++section 13, concerning interaction through a network will apply to the
++combination as such.
++
++  14. Revised Versions of this License.
++
++  The Free Software Foundation may publish revised and/or new versions of
++the GNU General Public License from time to time.  Such new versions will
++be similar in spirit to the present version, but may differ in detail to
++address new problems or concerns.
++
++  Each version is given a distinguishing version number.  If the
++Program specifies that a certain numbered version of the GNU General
++Public License "or any later version" applies to it, you have the
++option of following the terms and conditions either of that numbered
++version or of any later version published by the Free Software
++Foundation.  If the Program does not specify a version number of the
++GNU General Public License, you may choose any version ever published
++by the Free Software Foundation.
++
++  If the Program specifies that a proxy can decide which future
++versions of the GNU General Public License can be used, that proxy's
++public statement of acceptance of a version permanently authorizes you
++to choose that version for the Program.
++
++  Later license versions may give you additional or different
++permissions.  However, no additional obligations are imposed on any
++author or copyright holder as a result of your choosing to follow a
++later version.
++
++  15. Disclaimer of Warranty.
++
++  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
++APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
++HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
++OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
++THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
++IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
++ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
++
++  16. Limitation of Liability.
++
++  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
++WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
++THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
++GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
++USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
++DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
++PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
++EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
++SUCH DAMAGES.
++
++  17. Interpretation of Sections 15 and 16.
++
++  If the disclaimer of warranty and limitation of liability provided
++above cannot be given local legal effect according to their terms,
++reviewing courts shall apply local law that most closely approximates
++an absolute waiver of all civil liability in connection with the
++Program, unless a warranty or assumption of liability accompanies a
++copy of the Program in return for a fee.
++
++                     END OF TERMS AND CONDITIONS
++
++            How to Apply These Terms to Your New Programs
++
++  If you develop a new program, and you want it to be of the greatest
++possible use to the public, the best way to achieve this is to make it
++free software which everyone can redistribute and change under these terms.
++
++  To do so, attach the following notices to the program.  It is safest
++to attach them to the start of each source file to most effectively
++state the exclusion of warranty; and each file should have at least
++the "copyright" line and a pointer to where the full notice is found.
++
++    <one line to give the program's name and a brief idea of what it does.>
++    Copyright (C) <year>  <name of author>
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++Also add information on how to contact you by electronic and paper mail.
++
++  If the program does terminal interaction, make it output a short
++notice like this when it starts in an interactive mode:
++
++    <program>  Copyright (C) <year>  <name of author>
++    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
++    This is free software, and you are welcome to redistribute it
++    under certain conditions; type `show c' for details.
++
++The hypothetical commands `show w' and `show c' should show the appropriate
++parts of the General Public License.  Of course, your program's commands
++might be different; for a GUI interface, you would use an "about box".
++
++  You should also get your employer (if you work as a programmer) or school,
++if any, to sign a "copyright disclaimer" for the program, if necessary.
++For more information on this, and how to apply and follow the GNU GPL, see
++<https://www.gnu.org/licenses/>.
++
++  The GNU General Public License does not permit incorporating your program
++into proprietary programs.  If your program is a subroutine library, you
++may consider it more useful to permit linking proprietary applications with
++the library.  If this is what you want to do, use the GNU Lesser General
++Public License instead of this License.  But first, please read
++<https://www.gnu.org/licenses/why-not-lgpl.html>.
+diff --git a/native-deps/cosmic-comp-config/src/input.rs b/native-deps/cosmic-comp-config/src/input.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/input.rs
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++#![allow(non_snake_case)]
++
++#[cfg(feature = "libinput")]
++pub use input::{AccelProfile, ClickMethod, ScrollMethod, TapButtonMap};
++use serde::{Deserialize, Serialize};
++
++// Backend-independent configuration values. Their RON representation is exactly
++// the same as the native libinput enums below; no device API is emulated.
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AccelProfile {
++    Flat,
++    Adaptive,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ClickMethod {
++    ButtonAreas,
++    Clickfinger,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ScrollMethod {
++    NoScroll,
++    TwoFinger,
++    Edge,
++    OnButtonDown,
++}
++#[cfg(not(feature = "libinput"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum TapButtonMap {
++    LeftRightMiddle,
++    LeftMiddleRight,
++}
++
++// Note: For the following values, None is used to represent the system default
++// Configuration for input devices
++#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
++pub struct InputConfig {
++    pub state: DeviceState,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub acceleration: Option<AccelConfig>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub calibration: Option<[f32; 6]>,
++    #[serde(with = "ClickMethodDef")]
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub click_method: Option<ClickMethod>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub disable_while_typing: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub left_handed: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub middle_button_emulation: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub rotation_angle: Option<u32>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub scroll_config: Option<ScrollConfig>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub tap_config: Option<TapConfig>,
++    #[serde(skip_serializing_if = "Option::is_none", default)]
++    pub map_to_output: Option<String>,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
++pub struct AccelConfig {
++    #[serde(with = "AccelProfileDef")]
++    pub profile: Option<AccelProfile>,
++    pub speed: f64,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
++pub struct ScrollConfig {
++    #[serde(with = "ScrollMethodDef")]
++    pub method: Option<ScrollMethod>,
++    pub natural_scroll: Option<bool>,
++    pub scroll_button: Option<u32>,
++    pub scroll_factor: Option<f64>,
++}
++
++#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
++pub enum DeviceState {
++    #[default]
++    Enabled,
++    Disabled,
++    DisabledOnExternalMouse,
++}
++
++#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum TouchpadOverride {
++    #[default]
++    None,
++    ForceDisable,
++}
++
++#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
++pub struct TapConfig {
++    pub enabled: bool,
++    #[serde(with = "TapButtonMapDef")]
++    pub button_map: Option<TapButtonMap>,
++    pub drag: bool,
++    pub drag_lock: bool,
++}
++
++mod ClickMethodDef {
++    use super::ClickMethod as ClickMethodOrig;
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++
++    #[derive(Debug, Serialize, Deserialize)]
++    pub enum ClickMethod {
++        ButtonAreas,
++        Clickfinger,
++    }
++
++    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ClickMethodOrig>, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let o = Option::deserialize(deserializer)?;
++        Ok(o.map(|x| match x {
++            ClickMethod::ButtonAreas => ClickMethodOrig::ButtonAreas,
++            ClickMethod::Clickfinger => ClickMethodOrig::Clickfinger,
++        }))
++    }
++
++    pub fn serialize<S>(arg: &Option<ClickMethodOrig>, ser: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        let arg = match arg {
++            Some(ClickMethodOrig::ButtonAreas) => Some(ClickMethod::ButtonAreas),
++            Some(ClickMethodOrig::Clickfinger) => Some(ClickMethod::Clickfinger),
++            Some(_) | None => None,
++        };
++        Option::serialize(&arg, ser)
++    }
++}
++
++mod AccelProfileDef {
++    use super::AccelProfile as AccelProfileOrig;
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++
++    #[derive(Debug, Serialize, Deserialize)]
++    enum AccelProfile {
++        Flat,
++        Adaptive,
++    }
++
++    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<AccelProfileOrig>, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let o = Option::deserialize(deserializer)?;
++        Ok(o.map(|x| match x {
++            AccelProfile::Flat => AccelProfileOrig::Flat,
++            AccelProfile::Adaptive => AccelProfileOrig::Adaptive,
++        }))
++    }
++
++    pub fn serialize<S>(arg: &Option<AccelProfileOrig>, ser: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        let arg = match arg {
++            Some(AccelProfileOrig::Flat) => Some(AccelProfile::Flat),
++            Some(AccelProfileOrig::Adaptive) => Some(AccelProfile::Adaptive),
++            Some(_) | None => None,
++        };
++        Option::serialize(&arg, ser)
++    }
++}
++
++mod ScrollMethodDef {
++    use super::ScrollMethod as ScrollMethodOrig;
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++
++    #[derive(Debug, Serialize, Deserialize)]
++    pub enum ScrollMethod {
++        NoScroll,
++        TwoFinger,
++        Edge,
++        OnButtonDown,
++    }
++
++    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ScrollMethodOrig>, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let o = Option::deserialize(deserializer)?;
++        Ok(o.map(|x| match x {
++            ScrollMethod::NoScroll => ScrollMethodOrig::NoScroll,
++            ScrollMethod::TwoFinger => ScrollMethodOrig::TwoFinger,
++            ScrollMethod::Edge => ScrollMethodOrig::Edge,
++            ScrollMethod::OnButtonDown => ScrollMethodOrig::OnButtonDown,
++        }))
++    }
++
++    pub fn serialize<S>(arg: &Option<ScrollMethodOrig>, ser: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        let arg = match arg {
++            Some(ScrollMethodOrig::NoScroll) => Some(ScrollMethod::NoScroll),
++            Some(ScrollMethodOrig::TwoFinger) => Some(ScrollMethod::TwoFinger),
++            Some(ScrollMethodOrig::Edge) => Some(ScrollMethod::Edge),
++            Some(ScrollMethodOrig::OnButtonDown) => Some(ScrollMethod::OnButtonDown),
++            Some(_) | None => None,
++        };
++        Option::serialize(&arg, ser)
++    }
++}
++
++mod TapButtonMapDef {
++    use super::TapButtonMap as TapButtonMapOrig;
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++
++    #[derive(Debug, Serialize, Deserialize)]
++    pub enum TapButtonMap {
++        LeftRightMiddle,
++        LeftMiddleRight,
++    }
++
++    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<TapButtonMapOrig>, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let o = Option::deserialize(deserializer)?;
++        Ok(o.map(|x| match x {
++            TapButtonMap::LeftRightMiddle => TapButtonMapOrig::LeftRightMiddle,
++            TapButtonMap::LeftMiddleRight => TapButtonMapOrig::LeftMiddleRight,
++        }))
++    }
++
++    pub fn serialize<S>(arg: &Option<TapButtonMapOrig>, ser: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        let arg = match arg {
++            Some(TapButtonMapOrig::LeftRightMiddle) => Some(TapButtonMap::LeftRightMiddle),
++            Some(TapButtonMapOrig::LeftMiddleRight) => Some(TapButtonMap::LeftMiddleRight),
++            Some(_) | None => None,
++        };
++        Option::serialize(&arg, ser)
++    }
++}
+diff --git a/native-deps/cosmic-comp-config/src/lib.rs b/native-deps/cosmic-comp-config/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/lib.rs
+@@ -0,0 +1,447 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use cosmic_config::{CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
++use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
++use std::time::Duration;
++
++use crate::input::TouchpadOverride;
++
++pub mod input;
++#[cfg(feature = "output")]
++pub mod output;
++pub mod workspace;
++
++#[derive(Debug, Deserialize, Serialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct EdidProduct {
++    pub manufacturer: [char; 3],
++    pub product: u16,
++    pub serial: Option<u32>,
++    pub manufacture_week: i32,
++    pub manufacture_year: i32,
++    pub model_year: Option<i32>,
++}
++
++#[cfg(feature = "libdisplay-info")]
++impl From<libdisplay_info::edid::VendorProduct> for EdidProduct {
++    fn from(vp: libdisplay_info::edid::VendorProduct) -> Self {
++        Self {
++            manufacturer: vp.manufacturer,
++            product: vp.product,
++            serial: vp.serial,
++            manufacture_week: vp.manufacture_week,
++            manufacture_year: vp.manufacture_year,
++            model_year: vp.model_year,
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
++pub struct KeyboardConfig {
++    /// Boot state for numlock
++    pub numlock_state: NumlockState,
++}
++
++#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub enum NumlockState {
++    BootOn,
++    #[default]
++    BootOff,
++    LastBoot,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub struct AppearanceConfig {
++    pub clip_floating_windows: bool,
++    pub clip_tiled_windows: bool,
++    pub shadow_tiled_windows: bool,
++}
++
++impl Default for AppearanceConfig {
++    fn default() -> Self {
++        AppearanceConfig {
++            clip_floating_windows: true,
++            clip_tiled_windows: true,
++            shadow_tiled_windows: false,
++        }
++    }
++}
++
++#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub enum DecorationPreference {
++    #[default]
++    ClientSide,
++    ServerSide,
++}
++
++#[derive(Clone, Debug, PartialEq, CosmicConfigEntry)]
++#[version = 1]
++pub struct CosmicCompConfig {
++    pub workspaces: workspace::WorkspaceConfig,
++    pub pinned_workspaces: Vec<workspace::PinnedWorkspace>,
++    pub input_default: input::InputConfig,
++    pub input_touchpad: input::InputConfig,
++    pub input_touchpad_override: TouchpadOverride,
++    pub input_devices: HashMap<String, input::InputConfig>,
++    pub xkb_config: XkbConfig,
++    pub keyboard_config: KeyboardConfig,
++    /// Autotiling enabled
++    pub autotile: bool,
++    /// Determines the behavior of the autotile variable
++    /// If set to Global, autotile applies to all windows in all workspaces
++    /// If set to PerWorkspace, autotile only applies to new windows, and new workspaces
++    pub autotile_behavior: TileBehavior,
++    /// Active hint enabled
++    pub active_hint: bool,
++    /// Enables changing keyboard focus to windows when the cursor passes into them
++    pub focus_follows_cursor: bool,
++    /// Enables warping the cursor to the focused window when focus changes due to keyboard input
++    pub cursor_follows_focus: bool,
++    /// The delay in milliseconds before focus follows mouse (if enabled)
++    pub focus_follows_cursor_delay: u64,
++    /// Let X11 applications scale themselves
++    pub descale_xwayland: XwaylandDescaling,
++    /// Let X11 applications snoop on certain key-presses to allow for global shortcuts
++    pub xwayland_eavesdropping: XwaylandEavesdropping,
++    /// The threshold before windows snap themselves to output edges
++    pub edge_snap_threshold: u32,
++    pub accessibility_zoom: ZoomConfig,
++    pub appearance_settings: AppearanceConfig,
++    /// When the cursor hides itself: idle, fullscreen idle, typing, touch
++    pub cursor_hide: CursorHideConfig,
++    /// Briefly magnify the cursor when the pointer is shaken, to help locate it
++    pub cursor_shake_to_find: bool,
++    pub activation_policy: ActivationPolicy,
++    pub decoration_preference: DecorationPreference,
++}
++
++impl Default for CosmicCompConfig {
++    fn default() -> Self {
++        Self {
++            workspaces: Default::default(),
++            pinned_workspaces: Vec::new(),
++            input_default: Default::default(),
++            // By default, enable tap-to-click and disable-while-typing.
++            input_touchpad: input::InputConfig {
++                state: input::DeviceState::Enabled,
++                click_method: Some(input::ClickMethod::Clickfinger),
++                disable_while_typing: Some(true),
++                tap_config: Some(input::TapConfig {
++                    enabled: true,
++                    button_map: Some(input::TapButtonMap::LeftRightMiddle),
++                    drag: true,
++                    drag_lock: false,
++                }),
++                ..Default::default()
++            },
++            input_touchpad_override: Default::default(),
++            input_devices: Default::default(),
++            xkb_config: Default::default(),
++            keyboard_config: Default::default(),
++            autotile: Default::default(),
++            autotile_behavior: Default::default(),
++            active_hint: true,
++            focus_follows_cursor: false,
++            cursor_follows_focus: false,
++            focus_follows_cursor_delay: 250,
++            descale_xwayland: XwaylandDescaling::Fractional,
++            xwayland_eavesdropping: XwaylandEavesdropping::default(),
++            edge_snap_threshold: 0,
++            accessibility_zoom: ZoomConfig::default(),
++            appearance_settings: AppearanceConfig::default(),
++            cursor_hide: CursorHideConfig::default(),
++            cursor_shake_to_find: true,
++            activation_policy: ActivationPolicy::default(),
++            decoration_preference: DecorationPreference::default(),
++        }
++    }
++}
++
++#[derive(Debug, Default, Copy, Clone, PartialEq, Deserialize, Serialize)]
++pub enum TileBehavior {
++    #[default]
++    Global,
++    PerWorkspace,
++}
++
++#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
++pub struct XkbConfig {
++    pub rules: String,
++    pub model: String,
++    pub layout: String,
++    pub variant: String,
++    pub options: Option<String>,
++    #[serde(default = "default_repeat_delay")]
++    pub repeat_delay: u32,
++    #[serde(default = "default_repeat_rate")]
++    pub repeat_rate: u32,
++}
++
++impl Default for XkbConfig {
++    fn default() -> XkbConfig {
++        XkbConfig {
++            rules: String::new(),
++            model: String::new(),
++            layout: String::new(),
++            variant: String::new(),
++            options: None,
++            repeat_delay: default_repeat_delay(),
++            repeat_rate: default_repeat_rate(),
++        }
++    }
++}
++
++fn default_repeat_rate() -> u32 {
++    25
++}
++
++fn default_repeat_delay() -> u32 {
++    600
++}
++
++/// What the cursor idle timer should do when it fires.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum HideDecision {
++    /// Nothing applies in this context; drop the timer until the next activity.
++    Drop,
++    /// Hide the cursor now.
++    Hide,
++    /// Not yet — re-arm for this long.
++    RearmAfter(Duration),
++}
++
++/// When the cursor hides itself. Every trigger is revealed by pointer input, so
++/// these differ only in what arms the hide and after how long.
++// `default`: a trigger added later must not make every existing file fail to
++// deserialize, which `get_entry` would swallow as "reset everyone to defaults".
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(default)]
++pub struct CursorHideConfig {
++    /// Seconds of pointer inactivity before hiding, anywhere. `None` disables.
++    pub idle_timeout: Option<u32>,
++    /// Seconds of pointer inactivity before hiding over a fullscreen window.
++    /// Shortens `idle_timeout` in fullscreen; it never lengthens it.
++    pub fullscreen_idle_timeout: Option<u32>,
++    /// Hide as soon as a key is pressed.
++    pub while_typing: bool,
++    /// Hide on touch input, until the pointer next moves.
++    pub after_touch: bool,
++}
++
++impl CursorHideConfig {
++    /// The shortest timeout that applies right now, if any.
++    pub fn effective_timeout(&self, fullscreen: bool) -> Option<Duration> {
++        let secs = if fullscreen {
++            match (self.idle_timeout, self.fullscreen_idle_timeout) {
++                (Some(a), Some(b)) => Some(a.min(b)),
++                (a, b) => a.or(b),
++            }
++        } else {
++            self.idle_timeout
++        }?;
++        Some(Duration::from_secs(secs as u64))
++    }
++
++    /// What to do when the idle timer fires after `elapsed` without pointer input.
++    pub fn resolve(&self, elapsed: Duration, fullscreen: bool) -> HideDecision {
++        match self.effective_timeout(fullscreen) {
++            None => HideDecision::Drop,
++            Some(timeout) if elapsed >= timeout => HideDecision::Hide,
++            Some(timeout) => HideDecision::RearmAfter(timeout - elapsed),
++        }
++    }
++
++    /// How long to wait before the idle timer should next fire, given how long
++    /// it has been since the last pointer event. Pessimistic: fullscreen only
++    /// ever shortens a timeout, so arming as if fullscreen cannot fire too
++    /// late, and `resolve` corrects an early fire once the context is known.
++    pub fn arm_delay(&self, since_pointer_activity: Duration) -> Option<Duration> {
++        Some(
++            self.effective_timeout(true)?
++                .saturating_sub(since_pointer_activity),
++        )
++    }
++}
++
++impl Default for CursorHideConfig {
++    fn default() -> Self {
++        CursorHideConfig {
++            idle_timeout: None,
++            fullscreen_idle_timeout: Some(3),
++            while_typing: false,
++            after_touch: true,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
++pub struct ZoomConfig {
++    pub start_on_login: bool,
++    pub show_overlay: bool,
++    pub increment: u32,
++    pub view_moves: ZoomMovement,
++    pub enable_mouse_zoom_shortcuts: bool,
++}
++
++impl ZoomConfig {
++    pub const ZOOM_INCREMENT_PRESETS: &[u32] = &[10, 25, 50, 75, 100, 150, 200];
++}
++
++impl Default for ZoomConfig {
++    fn default() -> Self {
++        ZoomConfig {
++            start_on_login: false,
++            show_overlay: true,
++            increment: 50,
++            view_moves: ZoomMovement::Continuously,
++            enable_mouse_zoom_shortcuts: true,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
++pub enum ZoomMovement {
++    OnEdge,
++    Centered,
++    Continuously,
++}
++
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
++pub struct XwaylandEavesdropping {
++    pub keyboard: EavesdroppingKeyboardMode,
++    pub pointer: bool,
++}
++
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
++pub enum EavesdroppingKeyboardMode {
++    #[default]
++    None,
++    Modifiers,
++    Combinations,
++    All,
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
++pub enum ActivationPolicy {
++    #[default]
++    Focus,
++    FocusIfActiveWorkspace,
++    Urgent,
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
++#[serde(rename_all = "lowercase")]
++pub enum XwaylandDescaling {
++    #[serde(rename = "true")]
++    Enabled,
++    #[serde(rename = "false")]
++    Disabled,
++    #[default]
++    Fractional,
++}
++
++#[cfg(test)]
++mod test {
++    use super::{CursorHideConfig, HideDecision};
++    use std::time::Duration;
++
++    const OFF: CursorHideConfig = CursorHideConfig {
++        idle_timeout: None,
++        fullscreen_idle_timeout: None,
++        while_typing: false,
++        after_touch: false,
++    };
++
++    fn secs(n: u64) -> Duration {
++        Duration::from_secs(n)
++    }
++
++    #[test]
++    fn no_timeout_never_hides() {
++        assert_eq!(OFF.resolve(secs(600), false), HideDecision::Drop);
++        assert_eq!(OFF.resolve(secs(600), true), HideDecision::Drop);
++    }
++
++    #[test]
++    fn global_timeout_applies_everywhere() {
++        let cfg = CursorHideConfig {
++            idle_timeout: Some(10),
++            ..OFF
++        };
++        assert_eq!(
++            cfg.resolve(secs(4), false),
++            HideDecision::RearmAfter(secs(6))
++        );
++        assert_eq!(cfg.resolve(secs(10), false), HideDecision::Hide);
++        // A fullscreen window must not suppress an enabled global timeout.
++        assert_eq!(cfg.resolve(secs(10), true), HideDecision::Hide);
++    }
++
++    #[test]
++    fn fullscreen_timeout_only_applies_in_fullscreen() {
++        let cfg = CursorHideConfig {
++            fullscreen_idle_timeout: Some(3),
++            ..OFF
++        };
++        assert_eq!(cfg.resolve(secs(3), true), HideDecision::Hide);
++        assert_eq!(cfg.resolve(secs(600), false), HideDecision::Drop);
++    }
++
++    #[test]
++    fn fullscreen_shortens_but_never_lengthens() {
++        let short_fs = CursorHideConfig {
++            idle_timeout: Some(10),
++            fullscreen_idle_timeout: Some(3),
++            ..OFF
++        };
++        assert_eq!(short_fs.resolve(secs(3), true), HideDecision::Hide);
++        assert_eq!(
++            short_fs.resolve(secs(3), false),
++            HideDecision::RearmAfter(secs(7))
++        );
++
++        let long_fs = CursorHideConfig {
++            idle_timeout: Some(3),
++            fullscreen_idle_timeout: Some(30),
++            ..OFF
++        };
++        assert_eq!(long_fs.resolve(secs(3), true), HideDecision::Hide);
++    }
++
++    #[test]
++    fn boundary_is_inclusive() {
++        let cfg = CursorHideConfig {
++            idle_timeout: Some(5),
++            ..OFF
++        };
++        assert_eq!(
++            cfg.resolve(Duration::from_millis(4999), false),
++            HideDecision::RearmAfter(Duration::from_millis(1))
++        );
++        assert_eq!(cfg.resolve(secs(5), false), HideDecision::Hide);
++        assert_eq!(cfg.resolve(secs(6), false), HideDecision::Hide);
++    }
++
++    #[test]
++    fn arm_delay_measures_from_the_last_pointer_event() {
++        let cfg = CursorHideConfig {
++            idle_timeout: Some(10),
++            ..OFF
++        };
++        assert_eq!(cfg.arm_delay(Duration::ZERO), Some(secs(10)));
++        assert_eq!(cfg.arm_delay(secs(4)), Some(secs(6)));
++        // Exactly due, and past due: fire immediately rather than deferring.
++        assert_eq!(cfg.arm_delay(secs(10)), Some(Duration::ZERO));
++        assert_eq!(cfg.arm_delay(secs(600)), Some(Duration::ZERO));
++
++        // Armed against the shortest timeout that any context could want.
++        let fs = CursorHideConfig {
++            idle_timeout: Some(10),
++            fullscreen_idle_timeout: Some(3),
++            ..OFF
++        };
++        assert_eq!(fs.arm_delay(secs(1)), Some(secs(2)));
++
++        assert_eq!(OFF.arm_delay(Duration::ZERO), None);
++    }
++}
+diff --git a/native-deps/cosmic-comp-config/src/output/comp.rs b/native-deps/cosmic-comp-config/src/output/comp.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/output/comp.rs
+@@ -0,0 +1,137 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use serde::{Deserialize, Serialize};
++use std::{collections::HashMap, fs::OpenOptions, path::Path};
++use tracing::{error, warn};
++
++#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
++#[serde(rename_all = "lowercase")]
++pub enum OutputState {
++    #[serde(rename = "true")]
++    Enabled,
++    #[serde(rename = "false")]
++    Disabled,
++    Mirroring(String),
++}
++
++fn default_state() -> OutputState {
++    OutputState::Enabled
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq)]
++#[serde(rename_all = "lowercase")]
++pub enum AdaptiveSync {
++    #[serde(rename = "true")]
++    Enabled,
++    #[serde(rename = "false")]
++    Disabled,
++    Force,
++}
++
++fn default_sync() -> AdaptiveSync {
++    AdaptiveSync::Enabled
++}
++
++#[derive(Debug, Clone, Deserialize, Serialize)]
++pub struct OutputsConfig {
++    pub config: HashMap<Vec<OutputInfo>, Vec<OutputConfig>>,
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
++pub struct OutputConfig {
++    pub mode: ((i32, i32), Option<u32>),
++    #[serde(default = "default_sync")]
++    pub vrr: AdaptiveSync,
++    pub scale: f64,
++    pub transform: TransformDef,
++    pub position: (u32, u32),
++    #[serde(default = "default_state")]
++    pub enabled: OutputState,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub max_bpc: Option<u32>,
++    #[serde(default)]
++    pub xwayland_primary: bool,
++}
++
++impl Default for OutputConfig {
++    fn default() -> OutputConfig {
++        OutputConfig {
++            mode: ((0, 0), None),
++            vrr: AdaptiveSync::Enabled,
++            scale: 1.0,
++            transform: TransformDef::Normal,
++            position: (0, 0),
++            enabled: OutputState::Enabled,
++            max_bpc: None,
++            xwayland_primary: false,
++        }
++    }
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct OutputInfo {
++    pub connector: String,
++    pub make: String,
++    pub model: String,
++}
++
++pub fn load_outputs(path: Option<impl AsRef<Path>>) -> OutputsConfig {
++    if let Some(path) = path.as_ref() {
++        let path: &Path = path.as_ref();
++        if path.exists() {
++            match ron::de::from_reader::<_, OutputsConfig>(
++                OpenOptions::new().read(true).open(path).unwrap(),
++            ) {
++                Ok(mut config) => {
++                    for (info, config) in config.config.iter_mut() {
++                        let config_clone = config.clone();
++                        for conf in config.iter_mut() {
++                            if let OutputState::Mirroring(conn) = &conf.enabled {
++                                if let Some((j, _)) = info
++                                    .iter()
++                                    .enumerate()
++                                    .find(|(_, info)| &info.connector == conn)
++                                {
++                                    if config_clone[j].enabled != OutputState::Enabled {
++                                        warn!(
++                                            "Invalid Mirroring tag, overriding with `Enabled` instead"
++                                        );
++                                        conf.enabled = OutputState::Enabled;
++                                    }
++                                } else {
++                                    warn!(
++                                        "Invalid Mirroring tag, overriding with `Enabled` instead"
++                                    );
++                                    conf.enabled = OutputState::Enabled;
++                                }
++                            }
++                        }
++                    }
++                    return config;
++                }
++                Err(err) => {
++                    warn!(?err, "Failed to read output_config, resetting..");
++                    if let Err(err) = std::fs::remove_file(path) {
++                        error!(?err, "Failed to remove output_config.");
++                    }
++                }
++            };
++        }
++    }
++
++    OutputsConfig {
++        config: HashMap::new(),
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum TransformDef {
++    Normal,
++    _90,
++    _180,
++    _270,
++    Flipped,
++    Flipped90,
++    Flipped180,
++    Flipped270,
++}
+diff --git a/native-deps/cosmic-comp-config/src/output/mod.rs b/native-deps/cosmic-comp-config/src/output/mod.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/output/mod.rs
+@@ -0,0 +1,6 @@
++/// Internal output configurations used by cosmic-comp
++pub mod comp;
++
++#[cfg(feature = "randr")]
++/// cosmic-randr style output configurations
++pub mod randr;
+diff --git a/native-deps/cosmic-comp-config/src/output/randr.rs b/native-deps/cosmic-comp-config/src/output/randr.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/output/randr.rs
+@@ -0,0 +1,95 @@
++use std::path::Path;
++
++use cosmic_randr_shell::{AdaptiveSyncState, List};
++
++use crate::output::comp::OutputState;
++
++pub struct CompList {
++    infos: Vec<super::comp::OutputInfo>,
++    outputs: Vec<super::comp::OutputConfig>,
++}
++
++impl From<CompList> for cosmic_randr_shell::List {
++    fn from(CompList { infos, outputs }: CompList) -> cosmic_randr_shell::List {
++        let mut list = cosmic_randr_shell::List::default();
++        for (info, output) in infos.into_iter().zip(outputs.into_iter()) {
++            let current = list.modes.insert(cosmic_randr_shell::Mode {
++                size: (output.mode.0.0 as u32, output.mode.0.1 as u32),
++                refresh_rate: output.mode.1.unwrap_or_default(),
++                // XXX not in config as far as i can tell
++                preferred: false,
++            });
++            let modes = vec![current];
++
++            // for mode in output. {}
++            list.outputs.insert(cosmic_randr_shell::Output {
++                name: info.connector,
++                enabled: !matches!(output.enabled, OutputState::Disabled),
++                mirroring: match output.enabled {
++                    OutputState::Mirroring(m) => Some(m),
++                    _ => None,
++                },
++                make: Some(info.make).filter(|make| make != "Unknown"),
++                model: if info.model.as_str() == "Unknown" {
++                    String::new()
++                } else {
++                    info.model
++                },
++                position: (output.position.0 as i32, output.position.1 as i32),
++                scale: output.scale,
++                transform: Some(match output.transform {
++                    crate::output::comp::TransformDef::Normal => {
++                        cosmic_randr_shell::Transform::Normal
++                    }
++                    crate::output::comp::TransformDef::_90 => {
++                        cosmic_randr_shell::Transform::Rotate90
++                    }
++                    crate::output::comp::TransformDef::_180 => {
++                        cosmic_randr_shell::Transform::Rotate180
++                    }
++                    crate::output::comp::TransformDef::_270 => {
++                        cosmic_randr_shell::Transform::Rotate270
++                    }
++                    crate::output::comp::TransformDef::Flipped => {
++                        cosmic_randr_shell::Transform::Flipped
++                    }
++                    crate::output::comp::TransformDef::Flipped90 => {
++                        cosmic_randr_shell::Transform::Flipped90
++                    }
++                    crate::output::comp::TransformDef::Flipped180 => {
++                        cosmic_randr_shell::Transform::Flipped180
++                    }
++                    crate::output::comp::TransformDef::Flipped270 => {
++                        cosmic_randr_shell::Transform::Flipped270
++                    }
++                }),
++                modes,
++                current: Some(current),
++                adaptive_sync: Some(match output.vrr {
++                    crate::output::comp::AdaptiveSync::Enabled => AdaptiveSyncState::Auto,
++                    crate::output::comp::AdaptiveSync::Disabled => AdaptiveSyncState::Disabled,
++                    crate::output::comp::AdaptiveSync::Force => AdaptiveSyncState::Always,
++                }),
++                xwayland_primary: Some(output.xwayland_primary),
++                // XXX no physical output size in the config
++                physical: (0, 0),
++                adaptive_sync_availability: None,
++                serial_number: String::new(),
++            });
++        }
++
++        list
++    }
++}
++
++pub fn load_outputs(path: Option<impl AsRef<Path>>) -> Vec<List> {
++    let output_config = crate::output::comp::load_outputs(path);
++    output_config
++        .config
++        .into_iter()
++        .map(|(infos, outputs)| {
++            let comp_config = CompList { infos, outputs };
++            List::from(comp_config)
++        })
++        .collect()
++}
+diff --git a/native-deps/cosmic-comp-config/src/workspace.rs b/native-deps/cosmic-comp-config/src/workspace.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/cosmic-comp-config/src/workspace.rs
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++use serde::{Deserialize, Serialize};
++
++use crate::EdidProduct;
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct WorkspaceConfig {
++    pub workspace_mode: WorkspaceMode,
++    #[serde(default)]
++    pub workspace_layout: WorkspaceLayout,
++    #[serde(default)]
++    pub action_on_typing: Action,
++    #[serde(default = "default_wraparound")]
++    pub workspace_wraparound: bool,
++}
++
++fn default_wraparound() -> bool {
++    true
++}
++
++impl Default for WorkspaceConfig {
++    fn default() -> Self {
++        Self {
++            workspace_mode: WorkspaceMode::default(),
++            workspace_layout: WorkspaceLayout::default(),
++            action_on_typing: Action::default(),
++            workspace_wraparound: default_wraparound(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub enum WorkspaceMode {
++    #[default]
++    OutputBound,
++    Global,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub enum WorkspaceLayout {
++    #[default]
++    Vertical,
++    Horizontal,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub enum Action {
++    #[default]
++    None,
++    OpenLauncher,
++    OpenApplications,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct OutputMatch {
++    pub name: String,
++    pub edid: Option<EdidProduct>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PinnedWorkspace {
++    pub output: OutputMatch,
++    pub tiling_enabled: bool,
++    pub id: Option<String>,
++    pub name: Option<String>,
++}
+diff --git a/native-deps/wayland-sys/.cargo_vcs_info.json b/native-deps/wayland-sys/.cargo_vcs_info.json
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/.cargo_vcs_info.json
+@@ -0,0 +1,6 @@
++{
++  "git": {
++    "sha1": "a3d7927d87799b2955bf491b51c7c2a3a82da661"
++  },
++  "path_in_vcs": "wayland-sys"
++}
+\ No newline at end of file
+diff --git a/native-deps/wayland-sys/CHANGELOG.md b/native-deps/wayland-sys/CHANGELOG.md
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/CHANGELOG.md
+@@ -0,0 +1,44 @@
++# CHANGELOG: wayland-sys
++
++## Unreleased
++
++## 0.31.1 -- 2023-07-13
++
++#### Bugfixes
++
++- When using dlopen, try the soname of the library first.
++
++## 0.31.0 -- 2023-06-05
++
++#### Breaking changes
++
++- `WAYLAND_*_OPTION` and `WAYLAND_*_HANDLE` are now functions with the same name:
++  `wayland_*_option()` and `wayland_*_handle()`.
++
++## 0.30.1
++
++#### Bugfixes
++
++- Fix UB in `rust_listener_create`
++
++## 0.30.0
++
++## 0.30.0-beta.10
++
++#### Bugfixes
++
++- Server-side, fix the prototype of `wl_resource_add_destroy_listener`
++
++## 0.30.0-alpha10
++
++#### Changes
++
++- The `ffi_dispatch!` macro no longer requires a trailing comma when invoking functions without
++  any argument.
++
++## 0.30.0-alpha1
++
++#### Changes
++
++- Errors when dynamiclaly loading the system libraries are now logged to `log` rather than
++  printed using `eprintln!`.
+diff --git a/native-deps/wayland-sys/Cargo.lock b/native-deps/wayland-sys/Cargo.lock
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/Cargo.lock
+@@ -0,0 +1,85 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 3
++
++[[package]]
++name = "autocfg"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
++
++[[package]]
++name = "dlib"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
++dependencies = [
++ "libloading",
++]
++
++[[package]]
++name = "libc"
++version = "0.2.182"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
++
++[[package]]
++name = "libloading"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
++dependencies = [
++ "cfg-if",
++ "windows-link",
++]
++
++[[package]]
++name = "log"
++version = "0.4.29"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
++
++[[package]]
++name = "memoffset"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
++
++[[package]]
++name = "pkg-config"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
++
++[[package]]
++name = "wayland-sys"
++version = "0.31.11"
++dependencies = [
++ "dlib",
++ "libc",
++ "log",
++ "memoffset",
++ "once_cell",
++ "pkg-config",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+diff --git a/native-deps/wayland-sys/Cargo.toml b/native-deps/wayland-sys/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/Cargo.toml
+@@ -0,0 +1,82 @@
++# THIS FILE IS AUTOMATICALLY GENERATED BY CARGO
++#
++# When uploading crates to the registry Cargo will automatically
++# "normalize" Cargo.toml files for maximal compatibility
++# with all versions of Cargo and also rewrite `path` dependencies
++# to registry (e.g., crates.io) dependencies.
++#
++# If you are reading this file be aware that the original Cargo.toml
++# will likely look very different (and much more reasonable).
++# See Cargo.toml.orig for the original contents.
++
++[package]
++edition = "2021"
++rust-version = "1.71"
++name = "wayland-sys"
++version = "0.31.11"
++authors = ["Elinor Berger <elinor@safaradeg.net>"]
++build = "build.rs"
++autolib = false
++autobins = false
++autoexamples = false
++autotests = false
++autobenches = false
++description = "FFI bindings to the various libwayland-*.so libraries. You should only need this crate if you are working on custom wayland protocol extensions. Look at the crate wayland-client for usable bindings."
++documentation = "https://docs.rs/wayland-sys/"
++readme = "README.md"
++categories = ["external-ffi-bindings"]
++license = "MIT"
++repository = "https://github.com/smithay/wayland-rs"
++
++[package.metadata.docs.rs]
++all-features = true
++rustdoc-args = [
++    "--cfg",
++    "docsrs",
++]
++
++[features]
++cyxia-static-client = ["client", "dlopen"]
++client = [
++    "dep:dlib",
++    "dep:log",
++]
++cursor = ["client"]
++dlopen = ["once_cell"]
++egl = ["client"]
++libwayland_client_1_23 = []
++libwayland_server_1_22 = []
++libwayland_server_1_23 = ["libwayland_server_1_22"]
++server = [
++    "libc",
++    "memoffset",
++    "dep:dlib",
++    "dep:log",
++]
++
++[lib]
++name = "wayland_sys"
++path = "src/lib.rs"
++
++[dependencies.dlib]
++version = "0.5.3"
++optional = true
++
++[dependencies.libc]
++version = "0.2"
++optional = true
++
++[dependencies.log]
++version = "0.4"
++optional = true
++
++[dependencies.memoffset]
++version = "0.9"
++optional = true
++
++[dependencies.once_cell]
++version = "1.0"
++optional = true
++
++[build-dependencies.pkg-config]
++version = "0.3.7"
+diff --git a/native-deps/wayland-sys/Cargo.toml.orig b/native-deps/wayland-sys/Cargo.toml.orig
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/Cargo.toml.orig
+@@ -0,0 +1,36 @@
++[package]
++name = "wayland-sys"
++version = "0.31.11"
++repository = "https://github.com/smithay/wayland-rs"
++documentation = "https://docs.rs/wayland-sys/"
++authors = ["Elinor Berger <elinor@safaradeg.net>"]
++description = "FFI bindings to the various libwayland-*.so libraries. You should only need this crate if you are working on custom wayland protocol extensions. Look at the crate wayland-client for usable bindings."
++license = "MIT"
++categories = ["external-ffi-bindings"]
++edition = "2021"
++rust-version = "1.71"
++readme = "README.md"
++
++[dependencies]
++dlib = { version = "0.5.3", optional = true }
++libc = { version = "0.2", optional = true }
++once_cell = { version = "1.0", optional = true }
++memoffset = { version = "0.9", optional = true }
++log = { version = "0.4", optional = true }
++
++[build-dependencies]
++pkg-config = "0.3.7"
++
++[features]
++dlopen = ["once_cell"]
++client = ["dep:dlib", "dep:log"]
++cursor = ["client"]
++egl = ["client"]
++server = ["libc", "memoffset", "dep:dlib", "dep:log"]
++libwayland_client_1_23 = []
++libwayland_server_1_22 = []
++libwayland_server_1_23 = ["libwayland_server_1_22"]
++
++[package.metadata.docs.rs]
++all-features = true
++rustdoc-args = ["--cfg", "docsrs"]
+diff --git a/native-deps/wayland-sys/LICENSE.txt b/native-deps/wayland-sys/LICENSE.txt
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/LICENSE.txt
+@@ -0,0 +1,19 @@
++Copyright (c) 2015 Elinor Berger
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
+diff --git a/native-deps/wayland-sys/README.md b/native-deps/wayland-sys/README.md
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/README.md
+@@ -0,0 +1,23 @@
++[![crates.io](https://img.shields.io/crates/v/wayland-sys.svg)](https://crates.io/crates/wayland-sys)
++[![docs.rs](https://docs.rs/wayland-sys/badge.svg)](https://docs.rs/wayland-sys)
++[![Continuous Integration](https://github.com/Smithay/wayland-rs/workflows/Continuous%20Integration/badge.svg)](https://github.com/Smithay/wayland-rs/actions?query=workflow%3A%22Continuous+Integration%22)
++[![codecov](https://codecov.io/gh/Smithay/wayland-rs/branch/master/graph/badge.svg)](https://codecov.io/gh/Smithay/wayland-rs)
++
++# wayland-sys
++
++This crate provides raw bindings to the system `libwayland-*.so` libraries. If you are
++looking for a Rust API over the Wayland protocol, see the `wayland-client` or `wayland-server`
++crates instead.
++
++Bindings to the different libraries are enabled by the different cargo features:
++
++- `client` for bindings to `libwayland-client.so`
++- `server` for bindings to `libwayland-server.so`
++- `cursor` for bindings to `libwayland-cursor.so`
++- `egl` for bindings to `libwayland-egl.so`
++
++Furthermore, the `dlopen` cargo feature will switch the library to a mode where, instead
++of directly linking to these system libraries, it'll instead try to open them at runtime.
++This allows to create binaries that can gracefully handle being run on non-Wayland
++environments. In that case the crate should be used with its provided `ffi_dispatch!()`
++macro, to support both modes seamlessly.
+diff --git a/native-deps/wayland-sys/build.rs b/native-deps/wayland-sys/build.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/build.rs
+@@ -0,0 +1,25 @@
++use pkg_config::Config;
++
++fn main() {
++    if std::env::var_os("CARGO_FEATURE_DLOPEN").is_some() {
++        if std::env::var_os("CARGO_FEATURE_CYXIA_STATIC_CLIENT").is_some() {
++            // The client table contains actual static library addresses. Other
++            // dlopen-enabled modules retain their original loading behavior.
++            Config::new().statik(true).probe("wayland-client").unwrap();
++        }
++        return;
++    }
++
++    if std::env::var_os("CARGO_FEATURE_CLIENT").is_some() {
++        Config::new().probe("wayland-client").unwrap();
++    }
++    if std::env::var_os("CARGO_FEATURE_CURSOR").is_some() {
++        Config::new().probe("wayland-cursor").unwrap();
++    }
++    if std::env::var_os("CARGO_FEATURE_EGL").is_some() {
++        Config::new().probe("wayland-egl").unwrap();
++    }
++    if std::env::var_os("CARGO_FEATURE_SERVER").is_some() {
++        Config::new().probe("wayland-server").unwrap();
++    }
++}
+diff --git a/native-deps/wayland-sys/src/client.rs b/native-deps/wayland-sys/src/client.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/client.rs
+@@ -0,0 +1,160 @@
++//! Bindings to the client library `libwayland-client.so`
++//!
++//! The generated handle is named `wayland_client_handle()`
++
++#![cfg_attr(rustfmt, rustfmt_skip)]
++
++#[cfg(all(feature = "client", feature = "dlopen"))]
++use once_cell::sync::Lazy;
++#[cfg(feature = "client")]
++use super::common::*;
++#[cfg(feature = "client")]
++use std::os::raw::{c_char, c_int, c_void};
++
++// Cyxia's static client binding retains the upstream function-table API.
++// Every entry is the address of a real libwayland-client function. Missing
++// target symbols are link failures; this does not implement a dynamic loader.
++#[cfg(feature = "cyxia-static-client")]
++macro_rules! external_library {
++    ($name:ident, $link:expr,
++        functions: $( $(#[$attribute:meta])* fn $function:ident($($argument:ty),*) -> $result:ty, )+
++        varargs: $( $(#[$variadic_attribute:meta])* fn $variadic:ident($($fixed:ty),+) -> $variadic_result:ty, )+
++    ) => {
++        pub struct $name {
++            $( $(#[$attribute])* pub $function: unsafe extern "C" fn($($argument),*) -> $result, )+
++            $( $(#[$variadic_attribute])* pub $variadic: unsafe extern "C" fn($($fixed,)+ ...) -> $variadic_result, )+
++        }
++
++        impl $name {
++            pub fn linked() -> Self {
++                #[link(name = $link, kind = "static")]
++                extern "C" {
++                    $( $(#[$attribute])* fn $function($(_: $argument),*) -> $result; )+
++                    $( $(#[$variadic_attribute])* fn $variadic($(_: $fixed,)+ ...) -> $variadic_result; )+
++                }
++                Self {
++                    $( $(#[$attribute])* $function, )+
++                    $( $(#[$variadic_attribute])* $variadic, )+
++                }
++            }
++        }
++    };
++}
++
++pub enum wl_proxy {}
++pub enum wl_display {}
++pub enum wl_event_queue {}
++
++#[cfg(feature = "client")]
++external_library!(WaylandClient, "wayland-client",
++    functions:
++    // display creation and destruction
++        fn wl_display_connect_to_fd(c_int) -> *mut wl_display,
++        fn wl_display_connect(*const c_char) -> *mut wl_display,
++        fn wl_display_disconnect(*mut wl_display) -> (),
++        fn wl_display_get_fd(*mut wl_display) -> c_int,
++    // display events handling
++        fn wl_display_roundtrip(*mut wl_display) -> c_int,
++        fn wl_display_read_events(*mut wl_display) -> c_int,
++        fn wl_display_prepare_read(*mut wl_display) -> c_int,
++        fn wl_display_cancel_read(*mut wl_display) -> (),
++        fn wl_display_dispatch(*mut wl_display) -> c_int,
++        fn wl_display_dispatch_pending(*mut wl_display) -> c_int,
++        #[cfg(feature = "libwayland_client_1_23")]
++        fn wl_display_set_max_buffer_size(*mut wl_display, usize) -> (),
++    // error handling
++        fn wl_display_get_error(*mut wl_display) -> c_int,
++        fn wl_display_get_protocol_error(*mut wl_display, *mut *const wl_interface, *mut u32) -> u32,
++    // requests handling
++        fn wl_display_flush(*mut wl_display) -> c_int,
++
++    // event queues
++        fn wl_event_queue_destroy(*mut wl_event_queue) -> (),
++        fn wl_display_create_queue(*mut wl_display) -> *mut wl_event_queue,
++        fn wl_display_roundtrip_queue(*mut wl_display, *mut wl_event_queue) -> c_int,
++        fn wl_display_prepare_read_queue(*mut wl_display, *mut wl_event_queue) -> c_int,
++        fn wl_display_dispatch_queue(*mut wl_display, *mut wl_event_queue) -> c_int,
++        fn wl_display_dispatch_queue_pending(*mut wl_display, *mut wl_event_queue) -> c_int,
++
++    // proxys
++        fn wl_proxy_create(*mut wl_proxy, *const wl_interface) -> *mut wl_proxy,
++        fn wl_proxy_destroy(*mut wl_proxy) -> (),
++        fn wl_proxy_add_listener(*mut wl_proxy, *mut extern "C" fn(), *mut c_void) -> c_int,
++        fn wl_proxy_get_listener(*mut wl_proxy) -> *const c_void,
++        fn wl_proxy_add_dispatcher(*mut wl_proxy, wl_dispatcher_func_t, *const c_void, *mut c_void) -> c_int,
++        fn wl_proxy_marshal_array_constructor(*mut wl_proxy, u32, *mut wl_argument, *const wl_interface) -> *mut wl_proxy,
++        fn wl_proxy_marshal_array_constructor_versioned(*mut wl_proxy, u32, *mut wl_argument, *const wl_interface, u32) -> *mut wl_proxy,
++        fn wl_proxy_marshal_array(*mut wl_proxy, u32, *mut wl_argument ) -> (),
++        fn wl_proxy_set_user_data(*mut wl_proxy, *mut c_void) -> (),
++        fn wl_proxy_get_user_data(*mut wl_proxy) -> *mut c_void,
++        fn wl_proxy_get_id(*mut wl_proxy) -> u32,
++        fn wl_proxy_get_class(*mut wl_proxy) -> *const c_char,
++        #[cfg(feature = "libwayland_client_1_23")]
++        fn wl_proxy_get_display(*mut wl_proxy) -> *mut wl_display,
++        fn wl_proxy_set_queue(*mut wl_proxy, *mut wl_event_queue) -> (),
++        fn wl_proxy_get_version(*mut wl_proxy) -> u32,
++        fn wl_proxy_create_wrapper(*mut wl_proxy) -> *mut wl_proxy,
++        fn wl_proxy_wrapper_destroy(*mut wl_proxy) -> (),
++
++    // log
++        fn wl_log_set_handler_client(wl_log_func_t) -> (),
++
++    // lists
++        fn wl_list_init(*mut wl_list) -> (),
++        fn wl_list_insert(*mut wl_list, *mut wl_list) -> (),
++        fn wl_list_remove(*mut wl_list) -> (),
++        fn wl_list_length(*const wl_list) -> c_int,
++        fn wl_list_empty(*const wl_list) -> c_int,
++        fn wl_list_insert_list(*mut wl_list,*mut wl_list) -> (),
++
++    // arrays
++        fn wl_array_init(*mut wl_array) -> (),
++        fn wl_array_release(*mut wl_array) -> (),
++        fn wl_array_add(*mut wl_array,usize) -> (),
++        fn wl_array_copy(*mut wl_array, *mut wl_array) -> (),
++
++    varargs:
++        fn wl_proxy_marshal_constructor(*mut wl_proxy, u32, *const wl_interface) -> *mut wl_proxy,
++        fn wl_proxy_marshal_constructor_versioned(*mut wl_proxy, u32, *const wl_interface, u32) -> *mut wl_proxy,
++        fn wl_proxy_marshal(*mut wl_proxy, u32) -> (),
++);
++
++#[cfg(all(feature = "client", feature = "dlopen"))]
++pub fn wayland_client_option() -> Option<&'static WaylandClient> {
++    #[cfg(feature = "cyxia-static-client")]
++    static WAYLAND_CLIENT_OPTION: Lazy<Option<WaylandClient>> =
++        Lazy::new(|| Some(WaylandClient::linked()));
++    #[cfg(not(feature = "cyxia-static-client"))]
++    static WAYLAND_CLIENT_OPTION: Lazy<Option<WaylandClient>> = Lazy::new(||{
++        let versions = ["libwayland-client.so.0", "libwayland-client.so"];
++        for ver in &versions {
++            match unsafe { WaylandClient::open(ver) } {
++                Ok(h) => return Some(h),
++                Err(::dlib::DlError::CantOpen(_)) => continue,
++                Err(::dlib::DlError::MissingSymbol(s)) => {
++                    log::error!("Found library {ver} cannot be used: symbol {s} is missing.");
++                    return None;
++                }
++            }
++        }
++        None
++    });
++
++    WAYLAND_CLIENT_OPTION.as_ref()
++}
++
++#[cfg(all(feature = "client", feature = "dlopen"))]
++pub fn wayland_client_handle() -> &'static WaylandClient {
++    static WAYLAND_CLIENT_HANDLE: Lazy<&'static WaylandClient> = Lazy::new(|| wayland_client_option().expect("Library libwayland-client.so could not be loaded."));
++
++    &WAYLAND_CLIENT_HANDLE
++}
++
++#[cfg(all(feature = "client", not(feature = "dlopen")))]
++pub fn is_lib_available() -> bool {
++    true
++}
++#[cfg(all(feature = "client", feature = "dlopen"))]
++pub fn is_lib_available() -> bool {
++    wayland_client_option().is_some()
++}
+diff --git a/native-deps/wayland-sys/src/common.rs b/native-deps/wayland-sys/src/common.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/common.rs
+@@ -0,0 +1,89 @@
++//! Various types and functions that are used by both the client and the server
++//! libraries.
++
++use std::os::unix::io::RawFd;
++use std::{
++    fmt,
++    os::raw::{c_char, c_int, c_void},
++};
++
++#[repr(C)]
++pub struct wl_message {
++    pub name: *const c_char,
++    pub signature: *const c_char,
++    pub types: *const *const wl_interface,
++}
++
++#[repr(C)]
++pub struct wl_interface {
++    pub name: *const c_char,
++    pub version: c_int,
++    pub request_count: c_int,
++    pub requests: *const wl_message,
++    pub event_count: c_int,
++    pub events: *const wl_message,
++}
++
++impl fmt::Debug for wl_interface {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "wl_interface@{self:p}")
++    }
++}
++
++unsafe impl Send for wl_interface {}
++unsafe impl Sync for wl_interface {}
++
++#[repr(C)]
++pub struct wl_list {
++    pub prev: *mut wl_list,
++    pub next: *mut wl_list,
++}
++
++#[repr(C)]
++pub struct wl_array {
++    pub size: usize,
++    pub alloc: usize,
++    pub data: *mut c_void,
++}
++
++pub type wl_fixed_t = i32;
++
++pub fn wl_fixed_to_double(f: wl_fixed_t) -> f64 {
++    f64::from(f) / 256.
++}
++
++pub fn wl_fixed_from_double(d: f64) -> wl_fixed_t {
++    (d * 256.) as i32
++}
++
++pub fn wl_fixed_to_int(f: wl_fixed_t) -> i32 {
++    f / 256
++}
++
++pub fn wl_fixed_from_int(i: i32) -> wl_fixed_t {
++    i * 256
++}
++
++// must be the appropriate size
++// can contain i32, u32 and pointers
++#[repr(C)]
++pub union wl_argument {
++    pub i: i32,
++    pub u: u32,
++    pub f: wl_fixed_t,
++    pub s: *const c_char,
++    pub o: *const c_void,
++    pub n: u32,
++    pub a: *const wl_array,
++    pub h: RawFd,
++}
++
++pub type wl_dispatcher_func_t = unsafe extern "C" fn(
++    *const c_void,
++    *mut c_void,
++    u32,
++    *const wl_message,
++    *const wl_argument,
++) -> c_int;
++
++pub type wl_log_func_t = unsafe extern "C" fn(*const c_char, *const c_void);
+diff --git a/native-deps/wayland-sys/src/cursor.rs b/native-deps/wayland-sys/src/cursor.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/cursor.rs
+@@ -0,0 +1,80 @@
++//! Bindings to the `wayland-cursor.so` library
++//!
++//! The created handle is named `wayland_cursor_handle()`.
++
++use crate::client::wl_proxy;
++#[cfg(feature = "dlopen")]
++use once_cell::sync::Lazy;
++use std::os::raw::{c_char, c_int, c_uint};
++
++pub enum wl_cursor_theme {}
++
++#[repr(C)]
++pub struct wl_cursor_image {
++    /// actual width
++    pub width: u32,
++    /// actual height
++    pub height: u32,
++    /// hot spot x (must be inside image)
++    pub hotspot_x: u32,
++    /// hot spot y (must be inside image)
++    pub hotspot_y: u32,
++    /// animation delay to next frame
++    pub delay: u32,
++}
++
++#[repr(C)]
++pub struct wl_cursor {
++    pub image_count: c_uint,
++    pub images: *mut *mut wl_cursor_image,
++    pub name: *mut c_char,
++}
++
++external_library!(WaylandCursor, "wayland-cursor",
++    functions:
++        fn wl_cursor_theme_load(*const c_char, c_int, *mut wl_proxy) -> *mut wl_cursor_theme,
++        fn wl_cursor_theme_destroy(*mut wl_cursor_theme) -> (),
++        fn wl_cursor_theme_get_cursor(*mut wl_cursor_theme, *const c_char) -> *mut wl_cursor,
++        fn wl_cursor_image_get_buffer(*mut wl_cursor_image) -> *mut wl_proxy,
++        fn wl_cursor_frame(*mut wl_cursor, u32) -> c_int,
++        fn wl_cursor_frame_and_duration(*mut wl_cursor, u32, *mut u32) -> c_int,
++);
++
++#[cfg(feature = "dlopen")]
++pub fn wayland_cursor_option() -> Option<&'static WaylandCursor> {
++    static WAYLAND_CURSOR_OPTION: Lazy<Option<WaylandCursor>> = Lazy::new(|| {
++        let versions = ["libwayland-cursor.so.0", "libwayland-cursor.so"];
++
++        for ver in &versions {
++            match unsafe { WaylandCursor::open(ver) } {
++                Ok(h) => return Some(h),
++                Err(::dlib::DlError::CantOpen(_)) => continue,
++                Err(::dlib::DlError::MissingSymbol(s)) => {
++                    log::error!("Found library {ver} cannot be used: symbol {s} is missing.");
++                    return None;
++                }
++            }
++        }
++        None
++    });
++
++    WAYLAND_CURSOR_OPTION.as_ref()
++}
++
++#[cfg(feature = "dlopen")]
++pub fn wayland_cursor_handle() -> &'static WaylandCursor {
++    static WAYLAND_CURSOR_HANDLE: Lazy<&'static WaylandCursor> = Lazy::new(|| {
++        wayland_cursor_option().expect("Library libwayland-cursor.so could not be loaded.")
++    });
++
++    &WAYLAND_CURSOR_HANDLE
++}
++
++#[cfg(not(feature = "dlopen"))]
++pub fn is_lib_available() -> bool {
++    true
++}
++#[cfg(feature = "dlopen")]
++pub fn is_lib_available() -> bool {
++    wayland_cursor_option().is_some()
++}
+diff --git a/native-deps/wayland-sys/src/egl.rs b/native-deps/wayland-sys/src/egl.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/egl.rs
+@@ -0,0 +1,58 @@
++//! Bindings to the EGL library `libwayland-egl.so`
++//!
++//! This lib allows to create EGL surfaces out of wayland surfaces.
++//!
++//! The created handle is named `wayland_egl_handle()`.
++
++use crate::client::wl_proxy;
++#[cfg(feature = "dlopen")]
++use once_cell::sync::Lazy;
++use std::os::raw::c_int;
++
++pub enum wl_egl_window {}
++
++external_library!(WaylandEgl, "wayland-egl",
++    functions:
++        fn wl_egl_window_create(*mut wl_proxy, c_int, c_int) -> *mut wl_egl_window,
++        fn wl_egl_window_destroy(*mut wl_egl_window) -> (),
++        fn wl_egl_window_resize(*mut wl_egl_window, c_int, c_int, c_int, c_int) -> (),
++        fn wl_egl_window_get_attached_size(*mut wl_egl_window, *mut c_int, *mut c_int) -> (),
++);
++
++#[cfg(feature = "dlopen")]
++pub fn wayland_egl_option() -> Option<&'static WaylandEgl> {
++    static WAYLAND_EGL_OPTION: Lazy<Option<WaylandEgl>> = Lazy::new(|| {
++        let versions = ["libwayland-egl.so.1", "libwayland-egl.so"];
++
++        for ver in &versions {
++            match unsafe { WaylandEgl::open(ver) } {
++                Ok(h) => return Some(h),
++                Err(::dlib::DlError::CantOpen(_)) => continue,
++                Err(::dlib::DlError::MissingSymbol(s)) => {
++                    log::error!("Found library {ver} cannot be used: symbol {s} is missing.");
++                    return None;
++                }
++            }
++        }
++        None
++    });
++
++    WAYLAND_EGL_OPTION.as_ref()
++}
++
++#[cfg(feature = "dlopen")]
++pub fn wayland_egl_handle() -> &'static WaylandEgl {
++    static WAYLAND_EGL_HANDLE: Lazy<&'static WaylandEgl> =
++        Lazy::new(|| wayland_egl_option().expect("Library libwayland-egl.so could not be loaded."));
++
++    &WAYLAND_EGL_HANDLE
++}
++
++#[cfg(not(feature = "dlopen"))]
++pub fn is_lib_available() -> bool {
++    true
++}
++#[cfg(feature = "dlopen")]
++pub fn is_lib_available() -> bool {
++    wayland_egl_option().is_some()
++}
+diff --git a/native-deps/wayland-sys/src/lib.rs b/native-deps/wayland-sys/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/lib.rs
+@@ -0,0 +1,75 @@
++//! FFI bindings to the wayland system libraries.
++//!
++//! The names exported by this crate should *not* be used directly, but through
++//! the `ffi_dispatch` macro, like this:
++//!
++//! ```ignore
++//! ffi_dispatch!(HANDLE_NAME, func_name, arg1, arg2, arg3);
++//! ```
++//!
++//! Where `HANDLE_NAME` is the name of the handle generated if the cargo feature `dlopen` is on.
++//!
++//! For this to work, you must ensure every needed symbol is in scope (aka the static handle
++//! if `dlopen` is on, the extern function if not). The easiest way to do this is to glob import
++//! the appropriate module. For example:
++//!
++//! ```ignore
++//! #[macro_use] extern crate wayland_sys;
++//!
++//! use wayland_sys::client::*;
++//!
++//! let display_ptr = unsafe {
++//!         ffi_dispatch!(wayland_client_handle(), wl_display_connect, ::std::ptr::null())
++//! };
++//! ```
++//!
++//! Each module except `common` corresponds to a system library. They all define a function named
++//! `is_lib_available()` which returns whether the library could be loaded. They always return true
++//! if the feature `dlopen` is absent, as we link against the library directly in that case.
++#![allow(non_camel_case_types)]
++#![forbid(improper_ctypes, unsafe_op_in_unsafe_fn)]
++// Doc feature labels can be tested locally by running RUSTDOCFLAGS="--cfg=docsrs" cargo +nightly doc -p <crate>
++#![cfg_attr(docsrs, feature(doc_cfg))]
++
++// If compiling with neither the `client` or `server` feature (non-sensical but
++// it's what happens when running `cargo test --all` from the workspace root),
++// dlib isn't actually used. This is not an issue, so don't warn about it.
++#[allow(unused_imports)]
++#[cfg(any(feature = "client", feature = "server"))]
++#[macro_use]
++extern crate dlib;
++
++pub mod common;
++
++pub mod client;
++
++pub mod server;
++
++#[cfg(all(feature = "egl", feature = "client"))]
++pub mod egl;
++
++#[cfg(all(feature = "cursor", feature = "client"))]
++pub mod cursor;
++
++#[cfg(feature = "server")]
++pub use libc::{gid_t, pid_t, uid_t};
++
++// We cannot just reexport dlib::ffi_dispatch, because it'd then
++// use the "dlopen" feature *on the crate invoking it* rather than
++// the "dlopen" feature of wayland-sys.
++
++#[cfg(feature = "dlopen")]
++#[macro_export]
++macro_rules! ffi_dispatch(
++    ($handle: expr, $func: ident $(, $arg: expr)* $(,)?) => (
++        ($handle.$func)($($arg),*)
++    )
++);
++
++#[cfg(not(feature = "dlopen"))]
++#[macro_export]
++macro_rules! ffi_dispatch(
++    ($handle: expr, $func: ident $(, $arg: expr)* $(,)?) => (
++        $func($($arg),*)
++    )
++);
+diff --git a/native-deps/wayland-sys/src/server.rs b/native-deps/wayland-sys/src/server.rs
+new file mode 100644
+--- /dev/null
++++ b/native-deps/wayland-sys/src/server.rs
+@@ -0,0 +1,317 @@
++//! Bindings to the client library `libwayland-server.so`
++//!
++//! The generated handle is named `wayland_server_handle()`
++
++#![cfg_attr(rustfmt, rustfmt_skip)]
++
++use super::common::*;
++#[cfg(feature = "server")]
++use libc::{gid_t, pid_t, uid_t};
++#[cfg(feature = "server")]
++use std::os::raw::c_char;
++use std::os::raw::{c_int, c_void};
++#[cfg(all(feature = "server", feature = "dlopen"))]
++use once_cell::sync::Lazy;
++
++pub enum wl_client {}
++pub enum wl_display {}
++pub enum wl_event_loop {}
++pub enum wl_event_source {}
++pub enum wl_global {}
++pub enum wl_resource {}
++pub enum wl_shm_buffer {}
++
++pub type wl_event_loop_fd_func_t = unsafe extern "C" fn(c_int, u32, *mut c_void) -> c_int;
++pub type wl_event_loop_timer_func_t = unsafe extern "C" fn(*mut c_void) -> c_int;
++pub type wl_event_loop_signal_func_t = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
++pub type wl_event_loop_idle_func_t = unsafe extern "C" fn(*mut c_void) -> ();
++pub type wl_global_bind_func_t = unsafe extern "C" fn(*mut wl_client, *mut c_void, u32, u32) -> ();
++pub type wl_notify_func_t = unsafe extern "C" fn(*mut wl_listener, *mut c_void) -> ();
++pub type wl_resource_destroy_func_t = unsafe extern "C" fn(*mut wl_resource) -> ();
++pub type wl_display_global_filter_func_t =
++    unsafe extern "C" fn(*const wl_client, *const wl_global, *mut c_void) -> bool;
++pub type wl_client_for_each_resource_iterator_func_t =
++    unsafe extern "C" fn(*mut wl_resource, *mut c_void) -> c_int;
++
++#[repr(C)]
++pub struct wl_listener {
++    pub link: wl_list,
++    pub notify: wl_notify_func_t,
++}
++
++#[repr(C)]
++pub struct wl_signal {
++    pub listener_list: wl_list,
++}
++
++#[cfg(feature = "server")]
++external_library!(WaylandServer, "wayland-server",
++    functions:
++    // wl_client
++        fn wl_client_flush(*mut wl_client) -> (),
++        fn wl_client_destroy(*mut wl_client) -> (),
++        fn wl_client_get_display(*mut wl_client) -> *mut wl_display,
++        fn wl_client_get_credentials(*mut wl_client, *mut pid_t, *mut uid_t, *mut gid_t) -> (),
++        fn wl_client_get_object(*mut wl_client, u32) -> *mut wl_resource,
++        fn wl_client_add_destroy_listener(*mut wl_client, *mut wl_listener) -> (),
++        fn wl_client_get_destroy_listener(*mut wl_client, wl_notify_func_t) -> *mut wl_listener,
++        fn wl_client_post_no_memory(*mut wl_client) -> (),
++        #[cfg(feature = "libwayland_server_1_23")]
++        fn wl_client_set_max_buffer_size(*mut wl_client, usize) -> (),
++        fn wl_resource_create(*mut wl_client, *const wl_interface, c_int, u32) -> *mut wl_resource,
++        fn wl_client_get_link(*mut wl_client) -> *mut wl_list,
++        fn wl_client_from_link(*mut wl_list) -> *mut wl_client,
++        fn wl_client_for_each_resource(*mut wl_client, wl_client_for_each_resource_iterator_func_t, *mut c_void) -> (),
++    // wl_display
++        fn wl_client_create(*mut wl_display, c_int) -> *mut wl_client,
++        fn wl_display_create() -> *mut wl_display,
++        fn wl_display_destroy(*mut wl_display) -> (),
++        fn wl_display_destroy_clients(*mut wl_display) -> (),
++        fn wl_display_get_serial(*mut wl_display) -> u32,
++        fn wl_display_next_serial(*mut wl_display) -> u32,
++        fn wl_display_add_socket(*mut wl_display, *const c_char) -> c_int,
++        fn wl_display_add_socket_auto(*mut wl_display) -> *const c_char,
++        fn wl_display_add_socket_fd(*mut wl_display, c_int) -> c_int,
++        fn wl_display_add_shm_format(*mut wl_display, u32) -> *mut u32,
++        fn wl_display_get_event_loop(*mut wl_display) -> *mut wl_event_loop,
++        fn wl_display_terminate(*mut wl_display) -> (),
++        fn wl_display_run(*mut wl_display) -> (),
++        fn wl_display_flush_clients(*mut wl_display) -> (),
++        fn wl_display_add_destroy_listener(*mut wl_display, *mut wl_listener) -> (),
++        fn wl_display_get_destroy_listener(*mut wl_display, wl_notify_func_t) -> *mut wl_listener,
++        fn wl_global_create(*mut wl_display, *const wl_interface, c_int, *mut c_void, wl_global_bind_func_t) -> *mut wl_global,
++        fn wl_display_init_shm(*mut wl_display) -> c_int,
++        fn wl_display_add_client_created_listener(*mut wl_display, *mut wl_listener) -> (),
++        fn wl_display_set_global_filter(*mut wl_display, wl_display_global_filter_func_t, *mut c_void) -> (),
++        fn wl_display_get_client_list(*mut wl_display) -> *mut wl_list,
++        #[cfg(feature = "libwayland_server_1_23")]
++        fn wl_display_set_default_max_buffer_size(*mut wl_display, usize) -> (),
++    // wl_event_loop
++        fn wl_event_loop_create() -> *mut wl_event_loop,
++        fn wl_event_loop_destroy(*mut wl_event_loop) -> (),
++        fn wl_event_loop_add_fd(*mut wl_event_loop, c_int, u32, wl_event_loop_fd_func_t, *mut c_void) -> *mut wl_event_source,
++        fn wl_event_loop_add_timer(*mut wl_event_loop, wl_event_loop_timer_func_t, *mut c_void) -> *mut wl_event_source,
++        fn wl_event_loop_add_signal(*mut wl_event_loop, c_int, wl_event_loop_signal_func_t, *mut c_void) -> *mut wl_event_source,
++        fn wl_event_loop_dispatch(*mut wl_event_loop, c_int) -> c_int,
++        fn wl_event_loop_dispatch_idle(*mut wl_event_loop) -> (),
++        fn wl_event_loop_add_idle(*mut wl_event_loop, wl_event_loop_idle_func_t, *mut c_void) -> *mut wl_event_source,
++        fn wl_event_loop_get_fd(*mut wl_event_loop) -> c_int,
++        fn wl_event_loop_add_destroy_listener(*mut wl_event_loop, *mut wl_listener) -> (),
++        fn wl_event_loop_get_destroy_listener(*mut wl_event_loop, wl_notify_func_t) -> *mut wl_listener,
++    // wl_event_source
++        fn wl_event_source_fd_update(*mut wl_event_source, u32) -> c_int,
++        fn wl_event_source_timer_update(*mut wl_event_source, c_int) -> c_int,
++        fn wl_event_source_remove(*mut wl_event_source) -> c_int,
++        fn wl_event_source_check(*mut wl_event_source) -> (),
++    // wl_global
++        fn wl_global_remove(*mut wl_global) -> (),
++        fn wl_global_destroy(*mut wl_global) -> (),
++        #[cfg(feature = "libwayland_server_1_22")]
++        fn wl_global_get_name(*mut wl_global, *mut wl_client) -> u32,
++        fn wl_global_get_user_data(*const wl_global) -> *mut c_void,
++    // wl_resource
++        fn wl_resource_post_event_array(*mut wl_resource, u32, *mut wl_argument) -> (),
++        fn wl_resource_queue_event_array(*mut wl_resource, u32, *mut wl_argument) -> (),
++        fn wl_resource_post_no_memory(*mut wl_resource) -> (),
++        fn wl_resource_set_implementation(*mut wl_resource, *const c_void, *mut c_void, Option<wl_resource_destroy_func_t>) -> (),
++        fn wl_resource_set_dispatcher(*mut wl_resource, wl_dispatcher_func_t, *const c_void, *mut c_void, Option<wl_resource_destroy_func_t>) -> (),
++        fn wl_resource_destroy(*mut wl_resource) -> (),
++        fn wl_resource_get_client(*mut wl_resource) -> *mut wl_client,
++        fn wl_resource_get_id(*mut wl_resource) -> u32,
++        fn wl_resource_get_link(*mut wl_resource) -> *mut wl_list,
++        fn wl_resource_from_link(*mut wl_list) -> *mut wl_resource,
++        fn wl_resource_find_for_client(*mut wl_list, *mut wl_client) -> (),
++        fn wl_resource_set_user_data(*mut wl_resource, *mut c_void) -> (),
++        fn wl_resource_get_user_data(*mut wl_resource) -> *mut c_void,
++        fn wl_resource_get_version(*mut wl_resource) -> c_int,
++        fn wl_resource_get_class(*mut wl_resource) -> *const c_char,
++        fn wl_resource_set_destructor(*mut wl_resource, Option<wl_resource_destroy_func_t>) -> (),
++        fn wl_resource_instance_of(*mut wl_resource, *const wl_interface, *const c_void) -> c_int,
++        fn wl_resource_add_destroy_listener(*mut wl_resource, *mut wl_listener) -> (),
++        fn wl_resource_get_destroy_listener(*mut wl_resource, wl_notify_func_t) -> *mut wl_listener,
++    // wl_shm
++        fn wl_shm_buffer_begin_access(*mut wl_shm_buffer) -> (),
++        fn wl_shm_buffer_end_access(*mut wl_shm_buffer) -> (),
++        fn wl_shm_buffer_get(*mut wl_resource) -> *mut wl_shm_buffer,
++        fn wl_shm_buffer_get_data(*mut wl_shm_buffer) -> *mut c_void,
++        fn wl_shm_buffer_get_stride(*mut wl_shm_buffer) -> i32,
++        fn wl_shm_buffer_get_format(*mut wl_shm_buffer) -> u32,
++        fn wl_shm_buffer_get_width(*mut wl_shm_buffer) -> i32,
++        fn wl_shm_buffer_get_height(*mut wl_shm_buffer) -> i32,
++    // wl_log
++        fn wl_log_set_handler_server(wl_log_func_t) -> (),
++    // wl_list
++        fn wl_list_init(*mut wl_list) -> (),
++        fn wl_list_insert(*mut wl_list, *mut wl_list) -> (),
++        fn wl_list_remove(*mut wl_list) -> (),
++        fn wl_list_length(*const wl_list) -> c_int,
++        fn wl_list_empty(*const wl_list) -> c_int,
++        fn wl_list_insert_list(*mut wl_list,*mut wl_list) -> (),
++
++    // arrays
++        fn wl_array_init(*mut wl_array) -> (),
++        fn wl_array_release(*mut wl_array) -> (),
++        fn wl_array_add(*mut wl_array,usize) -> (),
++        fn wl_array_copy(*mut wl_array, *mut wl_array) -> (),
++    varargs:
++        fn wl_resource_post_event(*mut wl_resource, u32) -> (),
++        fn wl_resource_queue_event(*mut wl_resource, u32) -> (),
++        fn wl_resource_post_error(*mut wl_resource, u32, *const c_char) -> (),
++);
++
++#[cfg(all(feature = "server", feature = "dlopen"))]
++pub fn wayland_server_option() -> Option<&'static WaylandServer> {
++    static WAYLAND_SERVER_OPTION: Lazy<Option<WaylandServer>> = Lazy::new(||{
++        let versions = ["libwayland-server.so.0", "libwayland-server.so"];
++        for ver in &versions {
++            match unsafe { WaylandServer::open(ver) } {
++                Ok(h) => return Some(h),
++                Err(::dlib::DlError::CantOpen(_)) => continue,
++                Err(::dlib::DlError::MissingSymbol(s)) => {
++                    log::error!("Found library {ver} cannot be used: symbol {s} is missing.");
++                    return None;
++                }
++            }
++        }
++        None
++    });
++
++    WAYLAND_SERVER_OPTION.as_ref()
++}
++
++#[cfg(all(feature = "server", feature = "dlopen"))]
++pub fn wayland_server_handle() -> &'static WaylandServer {
++    static WAYLAND_SERVER_HANDLE: Lazy<&'static WaylandServer> = Lazy::new(|| wayland_server_option().expect("Library libwayland-server.so could not be loaded."));
++
++    &WAYLAND_SERVER_HANDLE
++}
++
++#[cfg(all(feature = "server", not(feature = "dlopen")))]
++pub fn is_lib_available() -> bool {
++    true
++}
++#[cfg(all(feature = "server", feature = "dlopen"))]
++pub fn is_lib_available() -> bool {
++    wayland_server_option().is_some()
++}
++
++#[cfg(feature = "server")]
++pub mod signal {
++    #![allow(clippy::cast_ptr_alignment, clippy::missing_safety_doc)]
++    #[cfg(feature = "dlopen")]
++    use super::wayland_server_handle as wsh;
++    #[cfg(not(feature = "dlopen"))]
++    use super::{wl_list_init, wl_list_insert};
++    use super::{wl_listener, wl_notify_func_t, wl_signal};
++    use crate::common::wl_list;
++    use std::os::raw::c_void;
++    use std::ptr;
++
++    macro_rules! container_of(
++        ($ptr: expr, $container: ident, $field: ident) => {
++            ($ptr as *mut u8).sub(memoffset::offset_of!($container, $field)) as *mut $container
++        }
++    );
++
++    macro_rules! list_for_each(
++        ($pos: ident, $head:expr, $container: ident, $field: ident, $action: block) => {
++            let mut $pos = container_of!((*$head).next, $container, $field);
++            while &mut (*$pos).$field as *mut _ != $head {
++                $action;
++                $pos = container_of!((*$pos).$field.next, $container, $field);
++            }
++        }
++    );
++
++    macro_rules! list_for_each_safe(
++        ($pos: ident, $head: expr, $container: ident, $field: ident, $action: block) => {
++            let mut $pos = container_of!((*$head).next, $container, $field);
++            let mut tmp = container_of!((*$pos).$field.next, $container, $field);
++            while &mut (*$pos).$field as *mut _ != $head {
++                $action;
++                $pos = tmp;
++                tmp = container_of!((*$pos).$field.next, $container, $field);
++            }
++        }
++    );
++
++    pub unsafe fn wl_signal_init(signal: *mut wl_signal) {
++        // Safety: signal is a valid initialized wl_signal
++        ffi_dispatch!(wsh(), wl_list_init, unsafe { &mut (*signal).listener_list });
++    }
++
++    pub unsafe fn wl_signal_add(signal: *mut wl_signal, listener: *mut wl_listener) {
++        // Safety: signal and listener are valid pointers
++        ffi_dispatch!(
++            wsh(),
++            wl_list_insert,
++            unsafe { (*signal).listener_list.prev },
++            unsafe { &mut (*listener).link }
++        )
++    }
++
++    pub unsafe fn wl_signal_get(
++        signal: *mut wl_signal,
++        notify: wl_notify_func_t,
++    ) -> *mut wl_listener {
++        // Safety: the signal pointer is valid
++        unsafe {
++            list_for_each!(l, &mut (*signal).listener_list as *mut wl_list, wl_listener, link, {
++                // nightly only lint
++                #[allow(unknown_lints)]
++                #[allow(unpredictable_function_pointer_comparisons)]
++                if (*l).notify == notify {
++                    return l;
++                }
++            });
++        }
++
++        ptr::null_mut()
++    }
++
++    pub unsafe fn wl_signal_emit(signal: *mut wl_signal, data: *mut c_void) {
++        // Safety: the signal pointer is valid
++        unsafe {
++            list_for_each_safe!(l, &mut (*signal).listener_list as *mut wl_list, wl_listener, link, {
++                ((*l).notify)(l, data);
++            });
++        }
++    }
++
++    #[repr(C)]
++    struct ListenerWithUserData {
++        listener: wl_listener,
++        user_data: *mut c_void,
++    }
++
++    pub fn rust_listener_create(notify: wl_notify_func_t) -> *mut wl_listener {
++        let data = Box::into_raw(Box::new(ListenerWithUserData {
++            listener: wl_listener {
++                link: wl_list { prev: ptr::null_mut(), next: ptr::null_mut() },
++                notify,
++            },
++            user_data: ptr::null_mut(),
++        }));
++
++        // SAFETY: data is a valid pointer for `ListenerWithUserData`.
++        unsafe { std::ptr::addr_of_mut!((*data).listener) }
++    }
++
++    pub unsafe fn rust_listener_get_user_data(listener: *mut wl_listener) -> *mut c_void {
++        // Safety: listener is a valid pointer to a listener created by rust_listener_create
++        let data = unsafe { container_of!(listener, ListenerWithUserData, listener) };
++        unsafe { (*data).user_data }
++    }
++
++    pub unsafe fn rust_listener_set_user_data(listener: *mut wl_listener, user_data: *mut c_void) {
++        // Safety: listener is a valid pointer to a listener created by rust_listener_create
++        let data = unsafe { container_of!(listener, ListenerWithUserData, listener) };
++        unsafe { (*data).user_data = user_data }
++    }
++
++    pub unsafe fn rust_listener_destroy(listener: *mut wl_listener) {
++        // Safety: listener is a valid pointer to a listener created by rust_listener_create
++        let data = unsafe { container_of!(listener, ListenerWithUserData, listener) };
++        let _ = unsafe { Box::from_raw(data) };
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,22 +1,28 @@
+ // Copyright 2023 System76 <info@system76.com>
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
++#[cfg(feature = "backlight")]
+ use brightness_device::BrightnessDevice;
+ use cosmic_config::ConfigGet;
+ use futures::lock::Mutex;
++#[cfg(feature = "backlight")]
+ use logind_session::LogindSessionProxy;
+ use notify::event::ModifyKind;
+ use notify::{EventKind, Watcher};
+ use std::collections::{HashMap, HashSet};
++#[cfg(feature = "backlight")]
+ use std::io;
+ use std::os::unix::process::CommandExt;
++#[cfg(feature = "backlight")]
+ use std::path::PathBuf;
+ use std::process::ExitCode;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::time::Duration;
+ use theme::watch_theme;
++#[cfg(feature = "backlight")]
+ use tokio::io::Interest;
++#[cfg(feature = "backlight")]
+ use tokio::io::unix::AsyncFd;
+ use tokio::signal::unix::SignalKind;
+ use tokio::sync::RwLock;
+@@ -29,10 +35,12 @@
+ use zbus::zvariant::ObjectPath;
+ use zbus::{Connection, MatchRule, MessageStream};
+ mod battery;
++#[cfg(feature = "backlight")]
+ mod brightness_device;
+ mod greeter;
+ mod locale;
+ mod location;
++#[cfg(feature = "backlight")]
+ mod logind_session;
+ mod pipewire;
+ mod theme;
+@@ -52,9 +60,12 @@
+ 
+ struct SettingsDaemon {
+     /// Directly access varlink daemon methods within the DBus daemon.
++    #[cfg(feature = "audio")]
+     varlink_daemon: Arc<tokio::sync::Mutex<cosmic_settings_varlink_server::DaemonInner>>,
++    #[cfg(feature = "backlight")]
+     logind_session: Option<LogindSessionProxy<'static>>,
+     a11y_session: Option<Mutex<cosmic_dbus_a11y::StatusProxy<'static>>>,
++    #[cfg(feature = "backlight")]
+     display_brightness_device: BrightnessDevice,
+     #[allow(clippy::type_complexity)]
+     watched_configs: Arc<
+@@ -175,13 +186,17 @@
+ impl SettingsDaemon {
+     #[zbus(property)]
+     async fn display_brightness(&self) -> i32 {
+-        // XXX error
+-        self.display_brightness_device
+-            .brightness()
+-            .await
+-            .ok()
+-            .map(|x| x as i32)
+-            .unwrap_or(-1)
++        #[cfg(feature = "backlight")]
++        {
++            self.display_brightness_device
++                .brightness()
++                .await
++                .ok()
++                .map(|x| x as i32)
++                .unwrap_or(-1)
++        }
++        #[cfg(not(feature = "backlight"))]
++        { -1 }
+     }
+ 
+     /// Take the current xkb config and switch the active input source.
+@@ -191,61 +206,100 @@
+ 
+     #[zbus(property)]
+     async fn max_display_brightness(&self) -> i32 {
+-        self.display_brightness_device.max_brightness()
++        #[cfg(feature = "backlight")]
++        { self.display_brightness_device.max_brightness() }
++        #[cfg(not(feature = "backlight"))]
++        { -1 }
+     }
+ 
+     #[zbus(property)]
+-    async fn set_display_brightness(&self, value: i32) {
+-        if let Some(logind_session) = self.logind_session.as_ref() {
+-            // Align with slider behavior and device clamp: floor at 1 for backlight
+-            let max = self.display_brightness_device.max_brightness();
+-            let min = self.display_brightness_device.min_brightness() as i32;
+-
+-            if min > max {
+-                return;
+-            }
+-
+-            let clamped = value.clamp(min, max);
+-            _ = self
+-                .display_brightness_device
+-                .set_brightness(logind_session, clamped as u32)
+-                .await;
++    async fn set_display_brightness(&self, value: i32) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        {
++            if let Some(logind_session) = self.logind_session.as_ref() {
++                // Preserve the ordinary backend's clamp and device behavior.
++                let max = self.display_brightness_device.max_brightness();
++                let min = self.display_brightness_device.min_brightness() as i32;
++                if min > max {
++                    return Ok(());
++                }
++                let clamped = value.clamp(min, max);
++                _ = self.display_brightness_device
++                    .set_brightness(logind_session, clamped as u32).await;
++            }
++            Ok(())
++        }
++        #[cfg(not(feature = "backlight"))]
++        {
++            let _ = value;
++            Err(zbus::fdo::Error::NotSupported("Backlight integration is unavailable in this build".into()))
+         }
+     }
+ 
+     #[zbus(property)]
+-    async fn keyboard_brightness(&self) -> i32 {
+-        -1
+-    }
++    async fn keyboard_brightness(&self) -> i32 { -1 }
+ 
+     #[zbus(property)]
+-    async fn set_keyboard_brightness(&self, _value: i32) {}
++    async fn set_keyboard_brightness(&self, _value: i32) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        { Ok(()) }
++        #[cfg(not(feature = "backlight"))]
++        { Err(zbus::fdo::Error::NotSupported("Keyboard backlight integration is unavailable in this build".into())) }
++    }
+ 
+     async fn increase_display_brightness(
+         &self,
+         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+-    ) {
+-        let value = self.display_brightness().await;
+-        let max_raw = self.max_display_brightness().await;
+-        let target = next_target_raw(value, max_raw, 1);
+-        self.set_display_brightness(target).await;
+-        _ = self.display_brightness_changed(&emitter).await;
++    ) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        {
++            let value = self.display_brightness().await;
++            let max_raw = self.max_display_brightness().await;
++            let target = next_target_raw(value, max_raw, 1);
++            self.set_display_brightness(target).await?;
++            _ = self.display_brightness_changed(&emitter).await;
++            Ok(())
++        }
++        #[cfg(not(feature = "backlight"))]
++        {
++            let _ = emitter;
++            Err(zbus::fdo::Error::NotSupported("Backlight integration is unavailable in this build".into()))
++        }
+     }
+ 
+     async fn decrease_display_brightness(
+         &self,
+         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+-    ) {
+-        let value = self.display_brightness().await;
+-        let max_raw = self.max_display_brightness().await;
+-        let target = next_target_raw(value, max_raw, -1);
+-        self.set_display_brightness(target).await;
+-        _ = self.display_brightness_changed(&emitter).await;
+-    }
+-
+-    async fn increase_keyboard_brightness(&self) {}
+-
+-    async fn decrease_keyboard_brightness(&self) {}
++    ) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        {
++            let value = self.display_brightness().await;
++            let max_raw = self.max_display_brightness().await;
++            let target = next_target_raw(value, max_raw, -1);
++            self.set_display_brightness(target).await?;
++            _ = self.display_brightness_changed(&emitter).await;
++            Ok(())
++        }
++        #[cfg(not(feature = "backlight"))]
++        {
++            let _ = emitter;
++            Err(zbus::fdo::Error::NotSupported("Backlight integration is unavailable in this build".into()))
++        }
++    }
++
++    async fn increase_keyboard_brightness(&self) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        { Ok(()) }
++        #[cfg(not(feature = "backlight"))]
++        { Err(zbus::fdo::Error::NotSupported("Keyboard backlight integration is unavailable in this build".into())) }
++    }
++
++    async fn decrease_keyboard_brightness(&self) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "backlight")]
++        { Ok(()) }
++        #[cfg(not(feature = "backlight"))]
++        { Err(zbus::fdo::Error::NotSupported("Keyboard backlight integration is unavailable in this build".into())) }
++    }
+ 
+     async fn screen_reader(&mut self) {
+         if let Some(a11y) = self.a11y_session.as_ref() {
+@@ -256,45 +310,39 @@
+             };
+             let new_state = !current_state;
+             if let Err(err) = guard.set_is_enabled(new_state).await {
+-                log::error!(
+-                    "Failed to toggle screen reader. Could not apply current state. {err:?}"
+-                );
++                log::error!("Failed to toggle screen reader. Could not apply current state. {err:?}");
+                 return;
+             }
+             if let Err(err) = guard.set_screen_reader_enabled(new_state).await {
+-                log::error!(
+-                    "Failed to toggle screen reader. Could not apply current state. {err:?}"
+-                );
++                log::error!("Failed to toggle screen reader. Could not apply current state. {err:?}");
+             }
+         } else {
+             log::error!("Failed to toggle screen reader.")
+         }
+     }
+ 
+-    async fn volume_up(&self) {
+-        if let Err(why) = self
+-            .varlink_daemon
+-            .lock()
+-            .await
+-            .audio_server
+-            .sink_volume_raise()
+-            .await
++    async fn volume_up(&self) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "audio")]
+         {
+-            log::error!("Failed to raise volume: {}", why);
+-        }
+-    }
+-
+-    async fn volume_down(&self) {
+-        if let Err(why) = self
+-            .varlink_daemon
+-            .lock()
+-            .await
+-            .audio_server
+-            .sink_volume_lower()
+-            .await
++            if let Err(why) = self.varlink_daemon.lock().await.audio_server.sink_volume_raise().await {
++                log::error!("Failed to raise volume: {}", why);
++            }
++            Ok(())
++        }
++        #[cfg(not(feature = "audio"))]
++        { Err(zbus::fdo::Error::NotSupported("Audio integration is unavailable in this build".into())) }
++    }
++
++    async fn volume_down(&self) -> zbus::fdo::Result<()> {
++        #[cfg(feature = "audio")]
+         {
+-            log::error!("Failed to lower volume: {}", why);
+-        }
++            if let Err(why) = self.varlink_daemon.lock().await.audio_server.sink_volume_lower().await {
++                log::error!("Failed to lower volume: {}", why);
++            }
++            Ok(())
++        }
++        #[cfg(not(feature = "audio"))]
++        { Err(zbus::fdo::Error::NotSupported("Audio integration is unavailable in this build".into())) }
+     }
+ 
+     async fn watch_config(
+@@ -302,7 +350,6 @@
+         id: &str,
+         version: u64,
+     ) -> zbus::fdo::Result<(ObjectPath<'static>, WellKnownName<'static>)> {
+-        // create a new config, return the path and add it to our hashmap
+         Self::watch_config_inner(self, Config::new_config(), id, version).await
+     }
+ 
+@@ -345,12 +392,14 @@
+     }
+ }
+ 
++#[cfg(feature = "backlight")]
+ fn backlight_enumerate() -> io::Result<Vec<udev::Device>> {
+     let mut enumerator = udev::Enumerator::new()?;
+     enumerator.match_subsystem("backlight")?;
+     Ok(enumerator.scan_devices()?.collect())
+ }
+ 
++#[cfg(feature = "backlight")]
+ fn backlight_monitor() -> io::Result<AsyncFd<udev::MonitorSocket>> {
+     let socket = udev::MonitorBuilder::new()?
+         .match_subsystem("backlight")?
+@@ -359,6 +408,7 @@
+ }
+ 
+ // Choose backlight with most "precision". This is what `light` does.
++#[cfg(feature = "backlight")]
+ async fn choose_best_backlight(udev_devices: &HashMap<PathBuf, udev::Device>) -> BrightnessDevice {
+     let mut best_backlight = None;
+     let mut best_max_brightness = 0;
+@@ -379,6 +429,7 @@
+     best_backlight.unwrap_or_else(BrightnessDevice::external)
+ }
+ 
++#[cfg(feature = "backlight")]
+ async fn backlight_monitor_task(
+     mut backlights: HashMap<PathBuf, udev::Device>,
+     connection: zbus::Connection,
+@@ -446,6 +497,16 @@
+     Ping(String, u64),
+ }
+ 
++fn signal_or_report(kind: SignalKind, name: &str) -> Option<tokio::signal::unix::Signal> {
++    match tokio::signal::unix::signal(kind) {
++        Ok(signal) => Some(signal),
++        Err(why) => {
++            eprintln!("cosmic-settings-daemon: cannot register {name}: {why}; graceful signal cleanup/restart is unavailable");
++            None
++        }
++    }
++}
++
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() -> ExitCode {
+     let restart_signal = Arc::new(AtomicBool::new(false));
+@@ -455,9 +516,9 @@
+ 
+     let signal_term_fut = std::pin::pin!({
+         let restart_signal = Arc::clone(&restart_signal);
+-        let sigint = tokio::signal::unix::signal(SignalKind::interrupt()).ok();
+-        let sigterm = tokio::signal::unix::signal(SignalKind::terminate()).ok();
+-        let sighup = tokio::signal::unix::signal(SignalKind::hangup()).ok();
++        let sigint = signal_or_report(SignalKind::interrupt(), "SIGINT");
++        let sigterm = signal_or_report(SignalKind::terminate(), "SIGTERM");
++        let sighup = signal_or_report(SignalKind::hangup(), "SIGHUP");
+         async move {
+             let Some(((mut sigint, mut sigterm), mut sighup)) = sigint.zip(sigterm).zip(sighup)
+             else {
+@@ -491,38 +552,51 @@
+         .with(log_layer)
+         .init();
+ 
++    #[cfg(not(feature = "audio"))]
++    log::warn!("Audio integration is disabled; volume methods return NotSupported and no audio Varlink service is registered");
++    #[cfg(not(feature = "backlight"))]
++    log::warn!("Backlight integration is disabled; brightness reports unavailable and mutations return NotSupported");
++
+     if let Err(err) = greeter::sync_with_greeter() {
+         log::error!("Failed to sync with greeter. {err:?}");
+     }
+ 
+     let result: zbus::Result<()> = task::LocalSet::new()
+         .run_until(async move {
+-            let (varlink_daemon, varlink_backend) = cosmic_settings_varlink_server::init().await;
+-            let varlink_daemon_context = varlink_daemon.0.clone();
+-
+-            task::spawn_local(async move {
+-                futures::future::select(Box::pin(varlink_daemon.run()), Box::pin(varlink_backend))
+-                    .await;
+-            });
+-
+-            let backlights = match backlight_enumerate() {
+-                Ok(backlights) => backlights,
+-                Err(err) => {
+-                    log::error!("Failed to enumerate backlights: {}", err);
+-                    Vec::new()
++            #[cfg(feature = "audio")]
++            let varlink_daemon_context = {
++                let (varlink_daemon, varlink_backend) = cosmic_settings_varlink_server::init().await;
++                let varlink_daemon_context = varlink_daemon.0.clone();
++
++                task::spawn_local(async move {
++                    futures::future::select(Box::pin(varlink_daemon.run()), Box::pin(varlink_backend))
++                        .await;
++                });
++                varlink_daemon_context
++            };
++
++            #[cfg(feature = "backlight")]
++            let (backlights, display_brightness_device, logind_session) = {
++                let backlights = match backlight_enumerate() {
++                    Ok(backlights) => backlights,
++                    Err(err) => {
++                        log::error!("Failed to enumerate backlights: {}", err);
++                        Vec::new()
++                    }
++                };
++                let backlights: HashMap<_, _> = backlights
++                    .into_iter()
++                    .map(|i| (i.syspath().to_owned(), i))
++                    .collect();
++                let display_brightness_device = choose_best_backlight(&backlights).await;
++
++                let logind_session = async {
++                    let connection = zbus::Connection::system().await?;
++                    LogindSessionProxy::builder(&connection).build().await
+                 }
++                .await;
++                (backlights, display_brightness_device, logind_session)
+             };
+-            let backlights: HashMap<_, _> = backlights
+-                .into_iter()
+-                .map(|i| (i.syspath().to_owned(), i))
+-                .collect();
+-            let display_brightness_device = choose_best_backlight(&backlights).await;
+-
+-            let logind_session = async {
+-                let connection = zbus::Connection::system().await?;
+-                LogindSessionProxy::builder(&connection).build().await
+-            }
+-            .await;
+ 
+             let a11y_session = async {
+                 let connection = zbus::Connection::session().await?;
+@@ -614,9 +688,12 @@
+             let watched_configs = Arc::new(RwLock::new(HashMap::new()));
+             let watched_states = Arc::new(RwLock::new(HashMap::new()));
+             let settings_daemon = SettingsDaemon {
++                #[cfg(feature = "audio")]
+                 varlink_daemon: varlink_daemon_context.clone(),
++                #[cfg(feature = "backlight")]
+                 logind_session: logind_session.ok(),
+                 a11y_session: a11y_session.ok().map(Mutex::new),
++                #[cfg(feature = "backlight")]
+                 display_brightness_device,
+                 watched_configs: watched_configs.clone(),
+                 watched_states: watched_states.clone(),
+@@ -629,10 +706,13 @@
+                 .build()
+                 .await?;
+ 
+-            let conn_clone = connection.clone();
+-            task::spawn_local(async move {
+-                backlight_monitor_task(backlights, conn_clone).await;
+-            });
++            #[cfg(feature = "backlight")]
++            {
++                let conn_clone = connection.clone();
++                task::spawn_local(async move {
++                    backlight_monitor_task(backlights, conn_clone).await;
++                });
++            }
+ 
+             tokio::task::spawn_local(battery::low_power_monitor());
+ 
+@@ -659,7 +739,11 @@
+                     } else {
+                         break;
+                     }
+-                    tokio::time::sleep(sleep).await;
++                    // Cancellation also works when setup failed before watch_theme's loop.
++                    tokio::select! {
++                        _ = theme_cancel_rx.recv() => break,
++                        _ = tokio::time::sleep(sleep) => {}
++                    }
+                     sleep = sleep.saturating_mul(2);
+                 }
+             });
+@@ -713,23 +797,26 @@
+                                     log::error!("Failed to send xkb layout update: {err:?}");
+                                 }
+                             } else if id.as_str() == cosmic_settings_daemon_config::NAME {
+-                                let mut daemon = varlink_daemon_context.lock().await;
+-
+-                                let mono_sound = daemon
+-                                    .audio_server
+-                                    .backend
+-                                    .model
+-                                    .lock()
+-                                    .await
+-                                    .daemon_config_context
+-                                    .get::<bool>("mono_sound");
+-
+-                                match mono_sound {
+-                                    Ok(enabled) => {
+-                                        _ = daemon.audio_server.set_mono(enabled).await;
+-                                    }
+-                                    Err(_) => {
+-                                        tracing::warn!("failed to update settings daemon config");
++                                #[cfg(feature = "audio")]
++                                {
++                                    let mut daemon = varlink_daemon_context.lock().await;
++
++                                    let mono_sound = daemon
++                                        .audio_server
++                                        .backend
++                                        .model
++                                        .lock()
++                                        .await
++                                        .daemon_config_context
++                                        .get::<bool>("mono_sound");
++
++                                    match mono_sound {
++                                        Ok(enabled) => {
++                                            _ = daemon.audio_server.set_mono(enabled).await;
++                                        }
++                                        Err(_) => {
++                                            tracing::warn!("failed to update settings daemon config");
++                                        }
+                                     }
+                                 }
+                             }
+@@ -791,7 +878,8 @@
+ 
+     ExitCode::from(if restart_signal.load(Ordering::Relaxed) {
+         if let Some(current_exe) = current_exe {
+-            _ = std::process::Command::new(current_exe).exec();
++            let why = std::process::Command::new(current_exe).exec();
++            eprintln!("cosmic-settings-daemon: SIGHUP restart failed: {why}");
+         }
+         1
+     } else if let Err(why) = result {
+diff --git a/src/theme.rs b/src/theme.rs
+--- a/src/theme.rs
++++ b/src/theme.rs
+@@ -205,8 +205,18 @@
+     let (_location_handle, location_updates) = crate::location::receive_timezones();
+     futures::pin_mut!(location_updates);
+ 
+-    let (_time_handle, time_changes) = crate::time::watch_time_changes().await?;
+-    futures::pin_mut!(time_changes);
++    // Optional system time services must not disable local theme/config watching.
++    // A pending tail also prevents a closed system stream from busy-looping.
++    let (_time_handle, mut time_changes): (
++        Option<crate::time::TimeWatcher>,
++        std::pin::Pin<Box<dyn futures::Stream<Item = crate::time::TimeChange>>>,
++    ) = match crate::time::watch_time_changes().await {
++        Ok((handle, stream)) => (Some(handle), Box::pin(stream.chain(futures::stream::pending()))),
++        Err(why) => {
++            log::warn!("System time change monitoring is unavailable: {why}; local theme watching remains active");
++            (None, Box::pin(futures::stream::pending()))
++        }
++    };
+ 
+     // Track the most-recent coordinates so we can recompute sunrise/sunset after suspend or
+     // wall-clock changes.

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "settings-native-linux-x86_64-full-os-v2": {
+      "target_runtime_validated": false,
+      "purpose": "Independent Linux-v2 build with the original native patch followed by the exact src/theme.rs dispatch delta. Preserve all 11 workspace members, the original selected graph, cyxia-native root features, native SDK and all original resource limits. Source and retained PC evidence motivate a blocking-work dispatch hypothesis; no guest behavior, NoReply fix or session claim.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 1610612736,
+      "timeout_seconds": 1200,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "kind": "cosmic-settings-native-linux-v2",
+  "component": "cosmic-settings-daemon",
+  "version": "1.10.0",
+  "repository": "https://github.com/pop-os/cosmic-settings-daemon",
+  "commit": "9e4ae69fc175191f15789d35423806ea0f093c9d",
+  "git_tree": "c2abb89d6b4bdd04a5f6d86cae144ba987639423",
+  "directory": "cosmic-settings-daemon",
+  "source_lock_sha256": "fc741c0a4f9b94a09d89a292aa94b402e1eb9ea4a4426d7e85c85999d8ea854e",
+  "effective_lock_sha256": "e6d6abd654506f118330d612d35228cdcc1ff42f8d8597dac65c0b5e80633393",
+  "patch_manifest": {
+    "path": "ports/cosmic/native-settings/native-patch.json",
+    "sha256": "a11bc1945154b30118ff42c2a1f6ca4465ca7f07f1ac12926c529eff989afe67"
+  },
+  "original_patch": {
+    "path": "ports/cosmic/native-settings/cosmic-settings-native.patch",
+    "sha256": "7739437ad0613d68d92b78110410159ad414e64df2e90961d9a45cba63bf1d2e"
+  },
+  "support_inputs": {
+    "ports/cosmic/native-settings/Cargo.lock": "e6d6abd654506f118330d612d35228cdcc1ff42f8d8597dac65c0b5e80633393",
+    "ports/cosmic/native-settings/README.md": "52a4c8cba478ee7890192ff6ad215a0ace0be73aadbff726115d09b6da020761",
+    "ports/cosmic/native-settings/build_patch.py": "ba71b48c96e4152e64cc20c281925c8f0517bfa7b338b114b01c245914404aa4",
+    "ports/cosmic/native-settings/config-enums.rs.inc": "273c6bfe8928eefe3611414371150997946777aea563aff175df45a39d76b62b",
+    "ports/cosmic/native-settings/interface.rs.inc": "8a5ab999b67a35571ff442c156d4c012b012bfde83ec1a6c4d57be75fe982cb6",
+    "ports/cosmic/native-settings/wayland-client-static.rs.inc": "633638c90371725436f5eb11d3af844d611bedbc2135c509282b86ed7bed6184",
+    "ports/cosmic/recipes/cosmic-settings-daemon-x86_64.json": "6e923bd6d37faaa01d24b2a2a36c24b8fa2367044c8ceae4f4738a560ebfe76b"
+  },
+  "compositor": {
+    "repository": "https://github.com/pop-os/cosmic-comp",
+    "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+    "git_tree": "d383b640ebdd63b96f9d8ff35388827d693214d1",
+    "directory": "cosmic-comp-epoch",
+    "version": "1.0.0"
+  },
+  "registry_inputs": [
+    {
+      "archive_sha256": "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be",
+      "before_tree_sha256": "dd099417c7e65b8403d86ef995c87dee8b7e82436bc54e716c5197134c56f57f",
+      "files": {
+        ".cargo_vcs_info.json": {
+          "bytes": 105,
+          "mode": 420,
+          "sha256": "e845ad99e76106cfa8f0739da82d02ba30c5aca192f51b3fa304485a9687c5cd"
+        },
+        "CHANGELOG.md": {
+          "bytes": 797,
+          "mode": 420,
+          "sha256": "08ce934d669484697ee0914383151d2a4849a5b6b193339f9f673653b9fc992f"
+        },
+        "Cargo.lock": {
+          "bytes": 2276,
+          "mode": 420,
+          "sha256": "4b4f8b4c1b4d9bf93977a30b83b5cfc8679ce7f07e2ea040888268ac7a386738"
+        },
+        "Cargo.toml": {
+          "bytes": 1876,
+          "mode": 420,
+          "sha256": "9490484a9baf88ddcfef3473951b6212552cedd5f343bcb57999d54bed1d777f"
+        },
+        "Cargo.toml.orig": {
+          "bytes": 1172,
+          "mode": 420,
+          "sha256": "5b137e1b0591a3661e21b1b2ed261d9589638ff12c7b0591f979e3da117b97de"
+        },
+        "LICENSE.txt": {
+          "bytes": 1057,
+          "mode": 420,
+          "sha256": "1cb6f4dee8c649f175736380495f0af0c753c87f22d50931692968bb24bf2161"
+        },
+        "README.md": {
+          "bytes": 1398,
+          "mode": 420,
+          "sha256": "5ad17c5a9b8b182396a03623bef41195444d23c7542a68b2d64f2aeee17ec9e2"
+        },
+        "build.rs": {
+          "bytes": 639,
+          "mode": 420,
+          "sha256": "11473cb618b53e1fc980c9caf9d3ed8a969a3c33b6243a8e79b5da6fab03ce28"
+        },
+        "src/client.rs": {
+          "bytes": 5683,
+          "mode": 420,
+          "sha256": "710cf2eef09b2a51998c110a8e23ce211bd8b1293042ef89933ad39047931180"
+        },
+        "src/common.rs": {
+          "bytes": 1797,
+          "mode": 420,
+          "sha256": "8acfb5c95c6ff401b56af70ab7df7d126566a3a179354c08240e91026df500df"
+        },
+        "src/cursor.rs": {
+          "bytes": 2469,
+          "mode": 420,
+          "sha256": "23fa8657c697fd8eaa0e0a0886ac5ffedf81cb2f1bb794175b129857db040b40"
+        },
+        "src/egl.rs": {
+          "bytes": 1863,
+          "mode": 420,
+          "sha256": "4cb602801fd46d895c7fa3df7d545bc7f92e8ccb9534ae6c15ce0f65ef67ffe0"
+        },
+        "src/lib.rs": {
+          "bytes": 2481,
+          "mode": 420,
+          "sha256": "4b2f11efcbefc4b7b6551c6d1a695189a1f45f3481aa3d772041f060107dece8"
+        },
+        "src/server.rs": {
+          "bytes": 14904,
+          "mode": 420,
+          "sha256": "7983133534890c8a312f8ee23b0681aa34cd5b7dcdded4a1a12ee069d2ab9758"
+        }
+      },
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "name": "wayland-sys",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.31.11"
+    }
+  ],
+  "default_features": false,
+  "features": [
+    "cyxia-native"
+  ],
+  "boundary": {
+    "audio_mutations": "org.freedesktop.DBus.Error.NotSupported",
+    "brightness_mutations": "org.freedesktop.DBus.Error.NotSupported",
+    "brightness_unavailable_value": -1,
+    "audio_varlink_service": false,
+    "system_services_emulated": false,
+    "accessibility_behavior": "upstream; system service failures remain explicit"
+  },
+  "guest_execution": false,
+  "settings_verified": false,
+  "cosmic_session_ready": false,
+  "prior_linux": {
+    "source-policy.json": {
+      "path": "ports/cosmic/native-settings-linux-v1/source-policy.json",
+      "sha256": "9491dd501e250ad58f380e2b7c3e0c4d0074c97a86bf01d51bd68e945e562672"
+    },
+    "native-recipe.json": {
+      "path": "ports/cosmic/native-settings-linux-v1/native-recipe.json",
+      "sha256": "6e8d1365f0091877f6c12bedf40feef2132cf87700daa58c89627f46875510c7"
+    },
+    "resource-profile.json": {
+      "path": "ports/cosmic/native-settings-linux-v1/resource-profile.json",
+      "sha256": "35244c49b8c40df7a536227ca65ecb2676f6881a5fab4a87de955e016295a1f2"
+    }
+  },
+  "theme_dispatch": {
+    "patch": {
+      "path": "cosmic-settings-theme-dispatch.patch",
+      "sha256": "1ff39b97130a3e7ee8a5da2e7acf5fbbb6036496d69474961adc4cf4ce7b8835"
+    },
+    "files": {
+      "src/theme.rs": {
+        "before_sha256": "9692ccfd6223f1f3615c861f92f73351f41232da97b9ad2f9dc75a3ff68eaf33",
+        "after_sha256": "4d32318c6cd3c84211b840dea651fed088f91759618ef777f8a2f8125fdd6e41",
+        "mode": "100644"
+      }
+    },
+    "runtime": "tokio current_thread + LocalSet; unchanged",
+    "blocking_jobs": "one synchronously awaited spawn_blocking job per theme event; no cancellation race",
+    "panic_behavior": "unchanged release panic=abort; no panic recovery claim",
+    "phase_end_semantics": "synchronous work returned; existing detached GNOME/Flatpak tasks keep upstream behavior",
+    "guest_execution": false,
+    "no_reply_cause_proven": false,
+    "no_reply_fixed": false
+  },
+  "preserved_resolution": {
+    "package_count": 502,
+    "normalized_graph_sha256": "3a05c8c691eb9a7120aaaa99dc355788b2848116199da1646be3a653e5ad2734",
+    "workspace": [
+      {
+        "name": "cosmic-settings-daemon",
+        "version": "1.10.0",
+        "manifest": "Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-audio-client",
+        "version": "1.10.0",
+        "manifest": "audio-client/Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-audio-core",
+        "version": "1.10.0",
+        "manifest": "audio-core/Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-audio-server",
+        "version": "1.10.0",
+        "manifest": "audio-server/Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-config",
+        "version": "1.10.0",
+        "manifest": "config/Cargo.toml"
+      },
+      {
+        "name": "cosmic-pipewire",
+        "version": "1.10.0",
+        "manifest": "cosmic-pipewire/Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-daemon-config",
+        "version": "1.10.0",
+        "manifest": "cosmic-settings-daemon-config/Cargo.toml"
+      },
+      {
+        "name": "geonames",
+        "version": "1.10.0",
+        "manifest": "geonames/Cargo.toml"
+      },
+      {
+        "name": "cosmic-comp-config",
+        "version": "1.0.0",
+        "manifest": "native-deps/cosmic-comp-config/Cargo.toml"
+      },
+      {
+        "name": "wayland-sys",
+        "version": "0.31.11",
+        "manifest": "native-deps/wayland-sys/Cargo.toml"
+      },
+      {
+        "name": "cosmic-settings-varlink-server",
+        "version": "1.10.0",
+        "manifest": "varlink-server/Cargo.toml"
+      }
+    ],
+    "default_members": [
+      "Cargo.toml"
+    ],
+    "reference_metadata_sha256": "af86cb2e8044261f1ff7d4976109e227ed2e1bf2b15af774a155f29cbf300bf3",
+    "reference_is_new_build_proof": false
+  }
+}
