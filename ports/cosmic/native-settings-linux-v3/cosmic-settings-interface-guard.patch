@@ -1,0 +1,35 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -765,7 +765,13 @@
+                     else {
+                         continue;
+                     };
+-                    let settings_daemon = settings_daemon.get().await;
++                    let (watched_configs, watched_states) = {
++                        let settings_daemon = settings_daemon.get().await;
++                        (
++                            settings_daemon.watched_configs.clone(),
++                            settings_daemon.watched_states.clone(),
++                        )
++                    };
+                     for c in changes {
+                         if let Change::Config(id, key, version) = c {
+                             if id.as_str() == cosmic_theme::THEME_MODE_ID {
+@@ -820,7 +826,7 @@
+                                     }
+                                 }
+                             }
+-                            let read_guard = settings_daemon.watched_configs.read().await;
++                            let read_guard = watched_configs.read().await;
+                             let Some((conn, path, _)) = read_guard.get(&(id.to_string(), version))
+                             else {
+                                 continue;
+@@ -841,7 +847,7 @@
+                                 log::error!("Failed to send config changed signal: {}", err);
+                             }
+                         } else if let Change::State(id, key, version) = c {
+-                            let read_guard = settings_daemon.watched_states.read().await;
++                            let read_guard = watched_states.read().await;
+                             let Some((conn, path, _)) = read_guard.get(&(id.to_string(), version))
+                             else {
+                                 continue;

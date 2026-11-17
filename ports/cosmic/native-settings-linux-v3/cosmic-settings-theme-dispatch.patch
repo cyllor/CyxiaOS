@@ -1,0 +1,701 @@
+diff --git a/src/theme.rs b/src/theme.rs
+--- a/src/theme.rs
++++ b/src/theme.rs
+@@ -122,6 +122,24 @@
+     }
+ }
+ 
++// Theme parsing and export perform synchronous filesystem/CPU work. Keep them
++// off the current-thread Tokio executor that also serves real D-Bus requests.
++// Every caller awaits completion before processing another theme event. Do not
++// race cancellation against this JoinHandle: an unfinished blocking task must
++// not keep writing after watch_theme returns and main resets the exports.
++async fn run_theme_work<F>(phase: &'static str, work: F) -> anyhow::Result<()>
++where
++    F: FnOnce() + Send + 'static,
++{
++    tokio::task::spawn_blocking(move || {
++        eprintln!("cosmic-settings-daemon: theme work begin phase={phase}");
++        work();
++        eprintln!("cosmic-settings-daemon: theme work end phase={phase}");
++    })
++    .await?;
++    Ok(())
++}
++
+ pub async fn watch_theme(
+     theme_mode_rx: &mut tokio::sync::mpsc::Receiver<ThemeMsg>,
+     theme_cancel_rx: &mut tokio::sync::mpsc::Receiver<()>,
+@@ -165,39 +183,50 @@
+     let dark_helper = CosmicTheme::dark_config()?;
+ 
+     if tk.apply_theme_global {
+-        // Write the exports for both themes in case they have changed in the meantime
+-        let dark = match Theme::get_entry(&dark_helper) {
+-            Ok(t) => t,
+-            Err((errs, t)) => {
+-                for why in errs {
+-                    log::error!("{why}");
+-                }
+-                t
+-            }
+-        };
+-        _ = dark.write_exports();
+-        let light = match Theme::get_entry(&light_helper) {
+-            Ok(t) => t,
+-            Err((errs, t)) => {
+-                for why in errs {
+-                    log::error!("{why}");
+-                }
+-                t
+-            }
+-        };
+-        _ = light.write_exports();
+-        set_flatpak_overrides();
+-
+-        if !theme_mode.auto_switch {
+-            let t = if theme_mode.is_dark { dark } else { light };
+-            if let Err(err) = t.apply_exports() {
+-                log::error!("Failed to apply COSMIC theme exports. {err:?}");
+-            }
+-        }
+-
+-        set_gnome_desktop_interface(theme_mode.is_dark);
+-    } else if let Err(err) = Theme::reset_exports() {
+-        log::error!("Failed to reset the cosmic theme exports. {err:?}");
++        let dark_helper = dark_helper.clone();
++        let light_helper = light_helper.clone();
++        run_theme_work("initial-exports", move || {
++            // Write the exports for both themes in case they have changed in the meantime
++            let dark = match Theme::get_entry(&dark_helper) {
++                Ok(t) => t,
++                Err((errs, t)) => {
++                    for why in errs {
++                        log::error!("{why}");
++                    }
++                    t
++                }
++            };
++            _ = dark.write_exports();
++            let light = match Theme::get_entry(&light_helper) {
++                Ok(t) => t,
++                Err((errs, t)) => {
++                    for why in errs {
++                        log::error!("{why}");
++                    }
++                    t
++                }
++            };
++            _ = light.write_exports();
++            set_flatpak_overrides();
++
++            if !theme_mode.auto_switch {
++                let t = if theme_mode.is_dark { dark } else { light };
++                if let Err(err) = t.apply_exports() {
++                    log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                }
++            }
++
++            set_gnome_desktop_interface(theme_mode.is_dark);
++        })
++        .await?;
++    } else {
++
++        run_theme_work("initial-reset", move || {
++            if let Err(err) = Theme::reset_exports() {
++                log::error!("Failed to reset the cosmic theme exports. {err:?}");
++            }
++        })
++        .await?;
+     }
+ 
+     // TODO allow preference for config file instead?
+@@ -273,6 +302,307 @@
+                         }
+ 
+                         if tk.apply_theme_global {
++                            let dark_helper = dark_helper.clone();
++                            let light_helper = light_helper.clone();
++                            run_theme_work("theme-mode", move || {
++                                let theme = match if theme_mode.is_dark {
++                                    Theme::get_entry(&dark_helper)
++                                } else {
++                                    Theme::get_entry(&light_helper)
++                                } {
++                                    Ok(t) => t,
++                                    Err((errs, t)) => {
++                                        for err in errs {
++                                            log::error!("{err}");
++                                        }
++                                        t
++                                    }
++                                };
++
++                                if let Err(err) = theme.apply_exports() {
++                                    log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                                }
++
++                                set_gnome_desktop_interface(theme_mode.is_dark);
++                            })
++                            .await?;
++                        }
++                    },
++                    ThemeMsg::Tk(changes) => {
++                        let (errs, changes) = tk.update_keys(&tk_helper, &[changes]);
++
++                        for err in errs {
++                            log::error!("Error updating the theme toolkit config {err:?}");
++                        }
++
++                        if changes.contains(&"icon_theme") {
++                            set_gnome_icon_theme(tk.icon_theme.clone());
++                        }
++
++                        if changes.contains(&"interface_font") {
++                            set_gnome_font_name(tk.interface_font.family.clone(), "font-name");
++                        }
++
++                        if changes.contains(&"monospace_font") {
++                            set_gnome_font_name(tk.monospace_font.family.clone(), "monospace-font-name");
++                        }
++
++                        if changes.contains(&"show_maximize") || changes.contains(&"show_minimize") {
++                            set_gnome_button_layout(tk.show_maximize, tk.show_minimize);
++                        }
++
++                        if !changes.contains(&"apply_theme_global") {
++                            continue;
++                        }
++
++                        if tk.apply_theme_global {
++                            let dark_helper = dark_helper.clone();
++                            let light_helper = light_helper.clone();
++                            run_theme_work("toolkit-exports", move || {
++                                // Write the exports for both themes in case they have changed in the meantime
++                                let dark = match Theme::get_entry(&dark_helper) {
++                                    Ok(t) => t,
++                                    Err((errs, t)) => {
++                                        for why in errs {
++                                            log::error!("{why}");
++                                        }
++                                        t
++                                    }
++                                };
++                                _ = dark.write_exports();
++                                let light = match Theme::get_entry(&light_helper) {
++                                    Ok(t) => t,
++                                    Err((errs, t)) => {
++                                        for why in errs {
++                                            log::error!("{why}");
++                                        }
++                                        t
++                                    }
++                                };
++                                _ = light.write_exports();
++                                set_flatpak_overrides();
++
++                                let t = if theme_mode.is_dark { dark } else { light };
++                                if let Err(err) = t.apply_exports() {
++                                    log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                                }
++
++                                set_gnome_desktop_interface(theme_mode.is_dark);
++                            })
++                            .await?;
++                        } else {
++
++                            run_theme_work("toolkit-reset", move || {
++                                if let Err(err) = Theme::reset_exports() {
++                                    log::error!("Failed to reset the cosmic theme exports. {err:?}");
++                                }
++                            })
++                            .await?;
++                        }
++                    },
++                    ThemeMsg::Theme(is_dark) => {
++                        let dark_helper = dark_helper.clone();
++                        let light_helper = light_helper.clone();
++                        let helper = helper.clone();
++                        let apply_theme_global = tk.apply_theme_global;
++                        run_theme_work("theme-data", move || {
++                            let t = match Theme::get_entry(if is_dark {
++                                    &dark_helper
++                                } else {
++                                    &light_helper
++                                }) {
++                                    Ok(t) => t,
++                                    Err((errs, t)) => {
++                                        for err in errs {
++                                            log::error!("Failed to load the theme. {err:?}");
++                                        }
++                                        t
++                                    },
++                                };
++                            if apply_theme_global {
++                                if let Err(err) = t.write_exports() {
++                                    log::error!("Failed to write COSMIC theme exports. {err:?}");
++                                }
++                                let theme_mode = match ThemeMode::get_entry(&helper) {
++                                    Ok(t) => t,
++                                    Err((errs, t)) => {
++                                        for err in errs {
++                                            log::error!("Failed to load the theme mode. {err:?}");
++                                        }
++                                        t
++                                    },
++                                };
++                                if theme_mode.is_dark == is_dark
++                                    && let Err(err) = t.apply_exports() {
++                                        log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                                    }
++
++                                set_gnome_desktop_interface(theme_mode.is_dark);
++                            }
++                        })
++                        .await?;
++                    }
++                }
++
++
++            }
++            _ = sleep => {
++                if !theme_mode.auto_switch || override_until_next {
++                    override_until_next = false;
++                    continue;
++                }
++                // update the theme mode
++                let Some(is_dark) = sunrise_sunset.as_ref().and_then(|s| s.is_dark().ok()) else {
++                    continue;
++                };
++
++                if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
++                    log::error!("Failed to update theme mode {err:?}");
++                }
++                if tk.apply_theme_global {
++                    let dark_helper = dark_helper.clone();
++                    let light_helper = light_helper.clone();
++                    run_theme_work("scheduled-switch", move || {
++                        let theme = match if theme_mode.is_dark {
++                            Theme::get_entry(&dark_helper)
++                        } else {
++                            Theme::get_entry(&light_helper)
++                        } {
++                            Ok(t) => t,
++                            Err((errs, t)) => {
++                                for err in errs {
++                                    log::error!("{err}");
++                                }
++                                t
++                            }
++                        };
++                        if let Err(err) = theme.apply_exports() {
++                            log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                        }
++
++                        set_gnome_desktop_interface(theme_mode.is_dark);
++                    })
++                    .await?;
++                }
++            }
++            location_update = location_updates.next() => {
++                if override_until_next {
++                    continue;
++                }
++                // set the next timer
++                // update the theme if necessary
++                let Some(location_result) = location_update else {
++                    continue;
++                };
++
++                let Ok(new_timezone) = location_result else {
++                    continue;
++                };
++
++                let Some(&GeoPosition { latitude, longitude }) = geodata.get(&new_timezone) else {
++                    log::error!("no matching geodata for {new_timezone}");
++                    continue;
++                };
++
++                coords = Some((latitude, longitude));
++                match SunriseSunset::new(latitude, longitude, None) {
++                    Ok(s) => {
++                        sunrise_sunset = Some(s);
++                    },
++                    Err(err) => {
++                        log::error!("Failed to calculate sunrise and sunset for current location {err:?}");
++                        sunrise_sunset = None;
++                        continue;
++                    },
++                };
++
++                if !theme_mode.auto_switch {
++                    continue;
++                }
++
++                let Some(is_dark) = sunrise_sunset.as_ref().unwrap().is_dark().ok() else {
++                    continue;
++                };
++
++                if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
++                    log::error!("Failed to update theme mode {err:?}");
++                }
++                if tk.apply_theme_global {
++                    let dark_helper = dark_helper.clone();
++                    let light_helper = light_helper.clone();
++                    run_theme_work("location-switch", move || {
++                        let theme = match if theme_mode.is_dark {
++                            Theme::get_entry(&dark_helper)
++                        } else {
++                            Theme::get_entry(&light_helper)
++                        } {
++                            Ok(t) => t,
++                            Err((errs, t)) => {
++                                for err in errs {
++                                    log::error!("{err}");
++                                }
++                                t
++                            }
++                        };
++                        if let Err(err) = theme.apply_exports() {
++                            log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                        }
++
++                        set_gnome_desktop_interface(theme_mode.is_dark);
++                    })
++                    .await?;
++                }
++            }
++            time_change = time_changes.next() => {
++                let Some(time_change) = time_change else {
++                    continue;
++                };
++
++                // Suspend/resume and wall-clock steps (NTP, manual) do not advance tokio's
++                // monotonic `Instant` the same way. Recompute sunrise/sunset instants so the next
++                // sleep deadline and current day/night evaluation match wall-clock time.
++                let Some((latitude, longitude)) = coords else {
++                    continue;
++                };
++
++                match SunriseSunset::new(latitude, longitude, None) {
++                    Ok(s) => sunrise_sunset = Some(s),
++                    Err(err) => {
++                        log::error!("Failed to recalculate sunrise/sunset after {time_change:?}: {err:?}");
++                        sunrise_sunset = None;
++                        continue;
++                    }
++                };
++
++                // If auto-switch isn't enabled, keep the timer state fresh and bail.
++                if !theme_mode.auto_switch {
++                    continue;
++                }
++
++                let Some(is_dark) = sunrise_sunset.as_ref().and_then(|s| s.is_dark().ok()) else {
++                    continue;
++                };
++
++                // Expire manual override once the schedule catches up (important if we slept
++                // across the boundary).
++                if override_until_next && is_dark == theme_mode.is_dark {
++                    override_until_next = false;
++                }
++
++                if override_until_next {
++                    continue;
++                }
++
++                if theme_mode.is_dark != is_dark {
++                    if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
++                        log::error!("Failed to update theme mode after {time_change:?}: {err:?}");
++                        continue;
++                    }
++
++                    if tk.apply_theme_global {
++                        let dark_helper = dark_helper.clone();
++                        let light_helper = light_helper.clone();
++                        run_theme_work("clock-switch", move || {
+                             let theme = match if theme_mode.is_dark {
+                                 Theme::get_entry(&dark_helper)
+                             } else {
+@@ -286,276 +616,13 @@
+                                     t
+                                 }
+                             };
+-
+-                            if let Err(err) = theme.apply_exports() {
+-                                log::error!("Failed to apply COSMIC theme exports. {err:?}");
++                            if let Err(err) = Theme::apply_gtk(theme.is_dark) {
++                                log::error!("Failed to apply the theme to gtk. {err:?}");
+                             }
+ 
+                             set_gnome_desktop_interface(theme_mode.is_dark);
+-                        }
+-                    },
+-                    ThemeMsg::Tk(changes) => {
+-                        let (errs, changes) = tk.update_keys(&tk_helper, &[changes]);
+-
+-                        for err in errs {
+-                            log::error!("Error updating the theme toolkit config {err:?}");
+-                        }
+-
+-                        if changes.contains(&"icon_theme") {
+-                            set_gnome_icon_theme(tk.icon_theme.clone());
+-                        }
+-
+-                        if changes.contains(&"interface_font") {
+-                            set_gnome_font_name(tk.interface_font.family.clone(), "font-name");
+-                        }
+-
+-                        if changes.contains(&"monospace_font") {
+-                            set_gnome_font_name(tk.monospace_font.family.clone(), "monospace-font-name");
+-                        }
+-
+-                        if changes.contains(&"show_maximize") || changes.contains(&"show_minimize") {
+-                            set_gnome_button_layout(tk.show_maximize, tk.show_minimize);
+-                        }
+-
+-                        if !changes.contains(&"apply_theme_global") {
+-                            continue;
+-                        }
+-
+-                        if tk.apply_theme_global {
+-                            // Write the exports for both themes in case they have changed in the meantime
+-                            let dark = match Theme::get_entry(&dark_helper) {
+-                                Ok(t) => t,
+-                                Err((errs, t)) => {
+-                                    for why in errs {
+-                                        log::error!("{why}");
+-                                    }
+-                                    t
+-                                }
+-                            };
+-                            _ = dark.write_exports();
+-                            let light = match Theme::get_entry(&light_helper) {
+-                                Ok(t) => t,
+-                                Err((errs, t)) => {
+-                                    for why in errs {
+-                                        log::error!("{why}");
+-                                    }
+-                                    t
+-                                }
+-                            };
+-                            _ = light.write_exports();
+-                            set_flatpak_overrides();
+-
+-                            let t = if theme_mode.is_dark { dark } else { light };
+-                            if let Err(err) = t.apply_exports() {
+-                                log::error!("Failed to apply COSMIC theme exports. {err:?}");
+-                            }
+-
+-                            set_gnome_desktop_interface(theme_mode.is_dark);
+-                        } else if let Err(err) = Theme::reset_exports() {
+-                            log::error!("Failed to reset the cosmic theme exports. {err:?}");
+-                        }
+-                    },
+-                    ThemeMsg::Theme(is_dark) => {
+-                        let t = match Theme::get_entry(if is_dark {
+-                                &dark_helper
+-                            } else {
+-                                &light_helper
+-                            }) {
+-                                Ok(t) => t,
+-                                Err((errs, t)) => {
+-                                    for err in errs {
+-                                        log::error!("Failed to load the theme. {err:?}");
+-                                    }
+-                                    t
+-                                },
+-                            };
+-                        if tk.apply_theme_global {
+-                            if let Err(err) = t.write_exports() {
+-                                log::error!("Failed to write COSMIC theme exports. {err:?}");
+-                            }
+-                            let theme_mode = match ThemeMode::get_entry(&helper) {
+-                                Ok(t) => t,
+-                                Err((errs, t)) => {
+-                                    for err in errs {
+-                                        log::error!("Failed to load the theme mode. {err:?}");
+-                                    }
+-                                    t
+-                                },
+-                            };
+-                            if theme_mode.is_dark == is_dark
+-                                && let Err(err) = t.apply_exports() {
+-                                    log::error!("Failed to apply COSMIC theme exports. {err:?}");
+-                                }
+-
+-                            set_gnome_desktop_interface(theme_mode.is_dark);
+-                        }
+-                    }
+-                }
+-
+-
+-            }
+-            _ = sleep => {
+-                if !theme_mode.auto_switch || override_until_next {
+-                    override_until_next = false;
+-                    continue;
+-                }
+-                // update the theme mode
+-                let Some(is_dark) = sunrise_sunset.as_ref().and_then(|s| s.is_dark().ok()) else {
+-                    continue;
+-                };
+-
+-                if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
+-                    log::error!("Failed to update theme mode {err:?}");
+-                }
+-                if tk.apply_theme_global {
+-                    let theme = match if theme_mode.is_dark {
+-                        Theme::get_entry(&dark_helper)
+-                    } else {
+-                        Theme::get_entry(&light_helper)
+-                    } {
+-                        Ok(t) => t,
+-                        Err((errs, t)) => {
+-                            for err in errs {
+-                                log::error!("{err}");
+-                            }
+-                            t
+-                        }
+-                    };
+-                    if let Err(err) = theme.apply_exports() {
+-                        log::error!("Failed to apply COSMIC theme exports. {err:?}");
+-                    }
+-
+-                    set_gnome_desktop_interface(theme_mode.is_dark);
+-                }
+-            }
+-            location_update = location_updates.next() => {
+-                if override_until_next {
+-                    continue;
+-                }
+-                // set the next timer
+-                // update the theme if necessary
+-                let Some(location_result) = location_update else {
+-                    continue;
+-                };
+-
+-                let Ok(new_timezone) = location_result else {
+-                    continue;
+-                };
+-
+-                let Some(&GeoPosition { latitude, longitude }) = geodata.get(&new_timezone) else {
+-                    log::error!("no matching geodata for {new_timezone}");
+-                    continue;
+-                };
+-
+-                coords = Some((latitude, longitude));
+-                match SunriseSunset::new(latitude, longitude, None) {
+-                    Ok(s) => {
+-                        sunrise_sunset = Some(s);
+-                    },
+-                    Err(err) => {
+-                        log::error!("Failed to calculate sunrise and sunset for current location {err:?}");
+-                        sunrise_sunset = None;
+-                        continue;
+-                    },
+-                };
+-
+-                if !theme_mode.auto_switch {
+-                    continue;
+-                }
+-
+-                let Some(is_dark) = sunrise_sunset.as_ref().unwrap().is_dark().ok() else {
+-                    continue;
+-                };
+-
+-                if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
+-                    log::error!("Failed to update theme mode {err:?}");
+-                }
+-                if tk.apply_theme_global {
+-                    let theme = match if theme_mode.is_dark {
+-                        Theme::get_entry(&dark_helper)
+-                    } else {
+-                        Theme::get_entry(&light_helper)
+-                    } {
+-                        Ok(t) => t,
+-                        Err((errs, t)) => {
+-                            for err in errs {
+-                                log::error!("{err}");
+-                            }
+-                            t
+-                        }
+-                    };
+-                    if let Err(err) = theme.apply_exports() {
+-                        log::error!("Failed to apply COSMIC theme exports. {err:?}");
+-                    }
+-
+-                    set_gnome_desktop_interface(theme_mode.is_dark);
+-                }
+-            }
+-            time_change = time_changes.next() => {
+-                let Some(time_change) = time_change else {
+-                    continue;
+-                };
+-
+-                // Suspend/resume and wall-clock steps (NTP, manual) do not advance tokio's
+-                // monotonic `Instant` the same way. Recompute sunrise/sunset instants so the next
+-                // sleep deadline and current day/night evaluation match wall-clock time.
+-                let Some((latitude, longitude)) = coords else {
+-                    continue;
+-                };
+-
+-                match SunriseSunset::new(latitude, longitude, None) {
+-                    Ok(s) => sunrise_sunset = Some(s),
+-                    Err(err) => {
+-                        log::error!("Failed to recalculate sunrise/sunset after {time_change:?}: {err:?}");
+-                        sunrise_sunset = None;
+-                        continue;
+-                    }
+-                };
+-
+-                // If auto-switch isn't enabled, keep the timer state fresh and bail.
+-                if !theme_mode.auto_switch {
+-                    continue;
+-                }
+-
+-                let Some(is_dark) = sunrise_sunset.as_ref().and_then(|s| s.is_dark().ok()) else {
+-                    continue;
+-                };
+-
+-                // Expire manual override once the schedule catches up (important if we slept
+-                // across the boundary).
+-                if override_until_next && is_dark == theme_mode.is_dark {
+-                    override_until_next = false;
+-                }
+-
+-                if override_until_next {
+-                    continue;
+-                }
+-
+-                if theme_mode.is_dark != is_dark {
+-                    if let Err(err) = theme_mode.set_is_dark(&helper, is_dark) {
+-                        log::error!("Failed to update theme mode after {time_change:?}: {err:?}");
+-                        continue;
+-                    }
+-
+-                    if tk.apply_theme_global {
+-                        let theme = match if theme_mode.is_dark {
+-                            Theme::get_entry(&dark_helper)
+-                        } else {
+-                            Theme::get_entry(&light_helper)
+-                        } {
+-                            Ok(t) => t,
+-                            Err((errs, t)) => {
+-                                for err in errs {
+-                                    log::error!("{err}");
+-                                }
+-                                t
+-                            }
+-                        };
+-                        if let Err(err) = Theme::apply_gtk(theme.is_dark) {
+-                            log::error!("Failed to apply the theme to gtk. {err:?}");
+-                        }
+-
+-                        set_gnome_desktop_interface(theme_mode.is_dark);
++                        })
++                        .await?;
+                     }
+                 }
+             }

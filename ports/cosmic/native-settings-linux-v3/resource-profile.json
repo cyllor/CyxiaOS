@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "settings-native-linux-x86_64-full-os-v3": {
+      "target_runtime_validated": false,
+      "purpose": "Independent Linux-v3 build with the unchanged original native and theme-dispatch patches followed by the exact src/main.rs interface-read-guard delta. Preserve all 11 workspace members, the original 502-package selected graph, cyxia-native features, native SDK and every original resource limit. Source analysis motivates a channel-backpressure/guard contention candidate; actual capture4 causality, stable NoReply correction, guest and session behavior remain unproven.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 1610612736,
+      "timeout_seconds": 1200,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

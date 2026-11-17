@@ -1,0 +1,413 @@
+//! Deterministic host harness for the exact extracted production main_fut bodies.
+//! This tests Rust guard lifetime and event control flow. It is not a Tokio/zbus
+//! implementation test, a guest execution, or proof of capture4's actual cause.
+#![forbid(unsafe_code)]
+#![allow(dead_code, unexpected_cfgs)]
+
+extern crate self as log;
+
+use std::collections::{HashMap, VecDeque};
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
+}
+
+mod cosmic_theme {
+    pub const THEME_MODE_ID: &str = "com.system76.CosmicTheme.Mode";
+    pub const DARK_THEME_ID: &str = "com.system76.CosmicTheme.Dark";
+    pub const LIGHT_THEME_ID: &str = "com.system76.CosmicTheme.Light";
+}
+mod cosmic {
+    pub mod config { pub const ID: &str = "com.system76.CosmicTk"; }
+}
+mod cosmic_settings_daemon_config {
+    pub const NAME: &str = "com.system76.CosmicSettingsDaemon";
+}
+mod locale {
+    pub const COSMIC_COMP_ID: &str = "com.system76.CosmicComp";
+    pub const COSMIC_COMP_XDG_KEY: &str = "xkb_config";
+}
+mod theme {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum ThemeMsg { ThemeMode(String), Tk(String), Theme(bool) }
+}
+
+const DBUS_PATH: &str = "/com/system76/CosmicSettingsDaemon";
+const CAPACITY: usize = @@SOURCE_THEME_CAPACITY@@;
+
+#[derive(Clone)]
+enum Change { Config(String, String, u64), State(String, String, u64) }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Effect {
+    Theme(theme::ThemeMsg),
+    Xkb,
+    Changed { namespace: &'static str, id: String, key: String },
+}
+type Trace = Arc<Mutex<Vec<Effect>>>;
+
+/// Real standard-library read/write guards enforce the language-level lifetime.
+/// An unavailable lock returns Pending, without OS sleeps or timing assertions.
+struct AwaitLock<T>(RwLock<T>);
+impl<T> AwaitLock<T> {
+    fn new(value: T) -> Self { Self(RwLock::new(value)) }
+    async fn read(&self) -> RwLockReadGuard<'_, T> {
+        poll_fn(|_| match self.0.try_read() {
+            Ok(guard) => Poll::Ready(guard),
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            Err(TryLockError::Poisoned(_)) => panic!("fixture lock poisoned"),
+        }).await
+    }
+    async fn write(&self) -> RwLockWriteGuard<'_, T> {
+        poll_fn(|_| match self.0.try_write() {
+            Ok(guard) => Poll::Ready(guard),
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            Err(TryLockError::Poisoned(_)) => panic!("fixture lock poisoned"),
+        }).await
+    }
+}
+
+struct Channel<T> {
+    queue: VecDeque<T>,
+    capacity: usize,
+    closed: bool,
+    trace: Trace,
+    effect: Option<fn(&T) -> Effect>,
+}
+#[derive(Clone)]
+struct Sender<T>(Arc<Mutex<Channel<T>>>);
+#[derive(Clone)]
+struct Receiver<T>(Arc<Mutex<Channel<T>>>);
+#[derive(Debug)]
+struct SendFailure;
+
+fn channel<T>(capacity: usize, trace: Trace, effect: Option<fn(&T) -> Effect>) -> (Sender<T>, Receiver<T>) {
+    let state = Arc::new(Mutex::new(Channel {
+        queue: VecDeque::new(), capacity, closed: false, trace, effect,
+    }));
+    (Sender(state.clone()), Receiver(state))
+}
+impl<T> Sender<T> {
+    async fn send(&self, value: T) -> Result<(), SendFailure> {
+        let mut value = Some(value);
+        poll_fn(|_| {
+            let mut state = self.0.lock().unwrap();
+            if state.closed { return Poll::Ready(Err(SendFailure)); }
+            if state.queue.len() == state.capacity { return Poll::Pending; }
+            let value = value.take().expect("completed send polled again");
+            if let Some(effect) = state.effect {
+                state.trace.lock().unwrap().push(effect(&value));
+            }
+            state.queue.push_back(value);
+            Poll::Ready(Ok(()))
+        }).await
+    }
+    fn seed(&self, value: T) {
+        let mut state = self.0.lock().unwrap();
+        assert!(!state.closed && state.queue.len() < state.capacity);
+        state.queue.push_back(value);
+    }
+    fn close(&self) { self.0.lock().unwrap().closed = true; }
+}
+impl<T> Receiver<T> {
+    async fn recv(&mut self) -> Option<T> {
+        poll_fn(|_| {
+            let mut state = self.0.lock().unwrap();
+            if let Some(value) = state.queue.pop_front() { Poll::Ready(Some(value)) }
+            else if state.closed { Poll::Ready(None) }
+            else { Poll::Pending }
+        }).await
+    }
+    fn take_ready(&self) -> Option<T> { self.0.lock().unwrap().queue.pop_front() }
+    fn len(&self) -> usize { self.0.lock().unwrap().queue.len() }
+}
+
+type Registry = Arc<AwaitLock<HashMap<(String, u64), (Connection, String, String)>>>;
+struct SettingsDaemon { watched_configs: Registry, watched_states: Registry }
+struct Config;
+#[derive(Debug)]
+struct SignalFailure;
+impl std::fmt::Display for SignalFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fixture signal failure")
+    }
+}
+#[derive(Clone)]
+struct Emitter { trace: Trace, namespace: &'static str }
+#[derive(Clone)]
+enum Endpoint { Settings(Arc<AwaitLock<SettingsDaemon>>), Config(Arc<AwaitLock<Config>>) }
+#[derive(Clone)]
+struct Connection {
+    endpoint: Endpoint,
+    emitter: Emitter,
+    failed_settings_lookups: Arc<AtomicUsize>,
+}
+struct InterfaceRef<I> { lock: Arc<AwaitLock<I>>, emitter: Emitter }
+impl<I> InterfaceRef<I> {
+    async fn get(&self) -> RwLockReadGuard<'_, I> { self.lock.read().await }
+    fn signal_emitter(&self) -> &Emitter { &self.emitter }
+}
+trait SelectInterface: Sized {
+    fn select(connection: &Connection) -> Result<InterfaceRef<Self>, ()>;
+}
+impl SelectInterface for SettingsDaemon {
+    fn select(connection: &Connection) -> Result<InterfaceRef<Self>, ()> {
+        if connection.failed_settings_lookups.fetch_update(
+            Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return Err(());
+        }
+        match &connection.endpoint {
+            Endpoint::Settings(lock) => Ok(InterfaceRef { lock: lock.clone(), emitter: connection.emitter.clone() }),
+            Endpoint::Config(_) => Err(()),
+        }
+    }
+}
+impl SelectInterface for Config {
+    fn select(connection: &Connection) -> Result<InterfaceRef<Self>, ()> {
+        match &connection.endpoint {
+            Endpoint::Config(lock) => Ok(InterfaceRef { lock: lock.clone(), emitter: connection.emitter.clone() }),
+            Endpoint::Settings(_) => Err(()),
+        }
+    }
+}
+impl Connection {
+    fn object_server(&self) -> &Self { self }
+    async fn interface<P: AsRef<str>, I: SelectInterface>(&self, _path: P) -> Result<InterfaceRef<I>, ()> {
+        I::select(self)
+    }
+}
+impl Config {
+    async fn changed(emitter: &Emitter, id: String, key: String) -> Result<(), SignalFailure> {
+        emitter.trace.lock().unwrap().push(Effect::Changed { namespace: emitter.namespace, id, key });
+        Ok(())
+    }
+}
+
+struct LoopInputs {
+    conn_clone: Connection,
+    rx: Receiver<Vec<Change>>,
+    theme_tx: Sender<theme::ThemeMsg>,
+    xkb_tx: Sender<()>,
+}
+
+fn production_original(inputs: LoopInputs) -> impl Future<Output = ()> {
+    let LoopInputs { conn_clone, mut rx, theme_tx, xkb_tx } = inputs;
+    async move {
+@@ORIGINAL_MAIN_FUT_BODY@@
+    }
+}
+
+fn production_candidate(inputs: LoopInputs) -> impl Future<Output = ()> {
+    let LoopInputs { conn_clone, mut rx, theme_tx, xkb_tx } = inputs;
+    async move {
+@@CANDIDATE_MAIN_FUT_BODY@@
+    }
+}
+
+struct World {
+    trace: Trace,
+    service: Arc<AwaitLock<SettingsDaemon>>,
+    connection: Connection,
+    batches_tx: Sender<Vec<Change>>,
+    batches_rx: Receiver<Vec<Change>>,
+    theme_tx: Sender<theme::ThemeMsg>,
+    theme_rx: Receiver<theme::ThemeMsg>,
+    xkb_tx: Sender<()>,
+    xkb_rx: Receiver<()>,
+}
+impl World {
+    fn new() -> Self {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let service = Arc::new(AwaitLock::new(SettingsDaemon {
+            watched_configs: Arc::new(AwaitLock::new(HashMap::new())),
+            watched_states: Arc::new(AwaitLock::new(HashMap::new())),
+        }));
+        let connection = Connection {
+            endpoint: Endpoint::Settings(service.clone()),
+            emitter: Emitter { trace: trace.clone(), namespace: "main" },
+            failed_settings_lookups: Arc::new(AtomicUsize::new(0)),
+        };
+        let (batches_tx, batches_rx) = channel(8, trace.clone(), None);
+        let (theme_tx, theme_rx) = channel(CAPACITY, trace.clone(), Some(|value: &theme::ThemeMsg| Effect::Theme(value.clone())));
+        let (xkb_tx, xkb_rx) = channel(CAPACITY, trace.clone(), Some(|_| Effect::Xkb));
+        Self { trace, service, connection, batches_tx, batches_rx, theme_tx, theme_rx, xkb_tx, xkb_rx }
+    }
+    fn inputs(&self) -> LoopInputs {
+        LoopInputs { conn_clone: self.connection.clone(), rx: self.batches_rx.clone(),
+                     theme_tx: self.theme_tx.clone(), xkb_tx: self.xkb_tx.clone() }
+    }
+    fn watcher(&self, namespace: &'static str) -> (Connection, String, String) {
+        (Connection {
+            endpoint: Endpoint::Config(Arc::new(AwaitLock::new(Config))),
+            emitter: Emitter { trace: self.trace.clone(), namespace },
+            failed_settings_lookups: Arc::new(AtomicUsize::new(0)),
+        }, format!("/{namespace}"), format!("org.fixture.{namespace}"))
+    }
+    fn register(&self, namespace: &'static str, id: &str) {
+        let service = self.service.0.try_write().unwrap_or_else(|_| panic!("interface writer must be available"));
+        let registry = if namespace == "config" { &service.watched_configs } else { &service.watched_states };
+        registry.0.try_write().unwrap_or_else(|_| panic!("registry writer must be available"))
+            .insert((id.into(), 1), self.watcher(namespace));
+    }
+    fn saturate_theme(&self) {
+        assert_eq!(CAPACITY, 10);
+        for n in 0..CAPACITY { self.theme_tx.seed(theme::ThemeMsg::Tk(format!("old-{n}"))); }
+    }
+    fn events(&self) -> Vec<Effect> { self.trace.lock().unwrap().clone() }
+}
+
+struct Noop;
+impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    let waker = Waker::from(Arc::new(Noop));
+    future.poll(&mut Context::from_waker(&waker))
+}
+fn config(id: &str, key: &str) -> Change { Change::Config(id.into(), key.into(), 1) }
+fn state(id: &str, key: &str) -> Change { Change::State(id.into(), key.into(), 1) }
+fn changed(namespace: &'static str, id: &str, key: &str) -> Effect {
+    Effect::Changed { namespace, id: id.into(), key: key.into() }
+}
+
+#[test]
+fn original_source_holds_interface_read_guard_while_theme_send_is_blocked() {
+    let world = World::new();
+    world.saturate_theme();
+    world.batches_tx.seed(vec![config(cosmic_theme::THEME_MODE_ID, "is_dark")]);
+    world.batches_tx.close();
+    let mut actual = Box::pin(production_original(world.inputs()));
+    assert!(poll_once(actual.as_mut()).is_pending());
+    assert!(matches!(world.service.0.try_write(), Err(TryLockError::WouldBlock)));
+    assert_eq!(world.theme_rx.len(), CAPACITY);
+    assert!(world.events().is_empty());
+    assert!(world.theme_rx.take_ready().is_some());
+    assert!(poll_once(actual.as_mut()).is_ready());
+    assert!(world.service.0.try_write().is_ok());
+}
+
+#[test]
+fn candidate_source_releases_interface_before_the_same_blocked_send() {
+    let world = World::new();
+    world.saturate_theme();
+    world.batches_tx.seed(vec![config(cosmic_theme::THEME_MODE_ID, "is_dark")]);
+    world.batches_tx.close();
+    let mut actual = Box::pin(production_candidate(world.inputs()));
+    assert!(poll_once(actual.as_mut()).is_pending());
+    assert!(world.service.0.try_write().is_ok());
+    assert_eq!(world.theme_rx.len(), CAPACITY);
+    assert!(world.events().is_empty());
+    assert!(world.theme_rx.take_ready().is_some());
+    assert!(poll_once(actual.as_mut()).is_ready());
+    assert_eq!(world.events(), vec![Effect::Theme(theme::ThemeMsg::ThemeMode("is_dark".into()))]);
+}
+
+#[test]
+fn newly_registered_config_and_state_watchers_are_visible_through_the_same_arcs() {
+    let world = World::new();
+    world.saturate_theme();
+    let state_id = "org.fixture.State";
+    world.batches_tx.seed(vec![config(cosmic_theme::THEME_MODE_ID, "is_dark"), state(state_id, "value")]);
+    world.batches_tx.close();
+    let mut actual = Box::pin(production_candidate(world.inputs()));
+    assert!(poll_once(actual.as_mut()).is_pending());
+    // This takes the same exclusive interface guard required by &mut Watch*.
+    // Both new entries must reach the captured Arc registries, not stale copies.
+    world.register("config", cosmic_theme::THEME_MODE_ID);
+    world.register("state", state_id);
+    assert!(world.theme_rx.take_ready().is_some());
+    assert!(poll_once(actual.as_mut()).is_ready());
+    assert_eq!(world.events(), vec![
+        Effect::Theme(theme::ThemeMsg::ThemeMode("is_dark".into())),
+        changed("config", cosmic_theme::THEME_MODE_ID, "is_dark"),
+        changed("state", state_id, "value"),
+    ]);
+}
+
+#[test]
+fn failed_interface_lookup_still_skips_that_batch_and_processes_the_next_one() {
+    for candidate in [false, true] {
+        let world = World::new();
+        world.register("config", cosmic::config::ID);
+        world.connection.failed_settings_lookups.store(1, Ordering::SeqCst);
+        world.batches_tx.seed(vec![config(cosmic_theme::THEME_MODE_ID, "skipped")]);
+        world.batches_tx.seed(vec![config(cosmic::config::ID, "retained")]);
+        world.batches_tx.close();
+        let inputs = world.inputs();
+        if candidate {
+            let mut actual = Box::pin(production_candidate(inputs));
+            assert!(poll_once(actual.as_mut()).is_ready());
+        } else {
+            let mut actual = Box::pin(production_original(inputs));
+            assert!(poll_once(actual.as_mut()).is_ready());
+        }
+        assert_eq!(world.events(), vec![Effect::Theme(theme::ThemeMsg::Tk("retained".into())),
+                                       changed("config", cosmic::config::ID, "retained")]);
+    }
+}
+
+#[test]
+fn mixed_config_state_theme_and_xkb_effect_order_remains_exact() {
+    for candidate in [false, true] {
+        let world = World::new();
+        let custom_id = "org.fixture.Custom";
+        let state_id = "org.fixture.State";
+        for id in [cosmic::config::ID, cosmic_theme::DARK_THEME_ID, cosmic_theme::LIGHT_THEME_ID,
+                   cosmic_theme::THEME_MODE_ID, custom_id, locale::COSMIC_COMP_ID] { world.register("config", id); }
+        world.register("state", state_id);
+        world.batches_tx.seed(vec![config(cosmic::config::ID, "font"), state(state_id, "value"),
+            config(cosmic_theme::DARK_THEME_ID, "background"), config(custom_id, "data"),
+            config(cosmic_theme::LIGHT_THEME_ID, "foreground"), config(cosmic_theme::THEME_MODE_ID, "is_dark"),
+            config(locale::COSMIC_COMP_ID, locale::COSMIC_COMP_XDG_KEY)]);
+        world.batches_tx.close();
+        let inputs = world.inputs();
+        if candidate {
+            let mut actual = Box::pin(production_candidate(inputs));
+            assert!(poll_once(actual.as_mut()).is_ready());
+        } else {
+            let mut actual = Box::pin(production_original(inputs));
+            assert!(poll_once(actual.as_mut()).is_ready());
+        }
+        assert_eq!(world.events(), vec![
+            Effect::Theme(theme::ThemeMsg::Tk("font".into())), changed("config", cosmic::config::ID, "font"),
+            changed("state", state_id, "value"),
+            Effect::Theme(theme::ThemeMsg::Theme(true)), changed("config", cosmic_theme::DARK_THEME_ID, "background"),
+            changed("config", custom_id, "data"),
+            Effect::Theme(theme::ThemeMsg::Theme(false)), changed("config", cosmic_theme::LIGHT_THEME_ID, "foreground"),
+            Effect::Theme(theme::ThemeMsg::ThemeMode("is_dark".into())), changed("config", cosmic_theme::THEME_MODE_ID, "is_dark"),
+            Effect::Xkb, changed("config", locale::COSMIC_COMP_ID, locale::COSMIC_COMP_XDG_KEY),
+        ]);
+    }
+}
+
+#[test]
+fn capacity_ten_backpressure_retains_all_thirteen_updates_and_signal_order() {
+    let world = World::new();
+    world.register("config", cosmic_theme::THEME_MODE_ID);
+    let keys: Vec<_> = (0..13).map(|n| format!("key-{n}")).collect();
+    world.batches_tx.seed(keys.iter().map(|key| config(cosmic_theme::THEME_MODE_ID, key)).collect());
+    world.batches_tx.close();
+    let mut actual = Box::pin(production_candidate(world.inputs()));
+    assert!(poll_once(actual.as_mut()).is_pending());
+    assert_eq!(world.theme_rx.len(), 10);
+    assert_eq!(world.events().len(), 20);
+    assert!(world.service.0.try_write().is_ok());
+    let mut completed = false;
+    let mut received = Vec::new();
+    for _ in 0..14 {
+        if let Some(value) = world.theme_rx.take_ready() { received.push(value); }
+        if !completed { completed = poll_once(actual.as_mut()).is_ready(); }
+    }
+    assert!(completed);
+    assert_eq!(received, keys.iter().map(|key| theme::ThemeMsg::ThemeMode(key.clone())).collect::<Vec<_>>());
+    let expected: Vec<_> = keys.iter().flat_map(|key| [
+        Effect::Theme(theme::ThemeMsg::ThemeMode(key.clone())),
+        changed("config", cosmic_theme::THEME_MODE_ID, key),
+    ]).collect();
+    assert_eq!(world.events(), expected);
+    assert_eq!(world.theme_rx.len(), 0);
+}

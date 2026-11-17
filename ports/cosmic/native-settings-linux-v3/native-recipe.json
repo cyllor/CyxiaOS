@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-settings-daemon",
+  "commit": "9e4ae69fc175191f15789d35423806ea0f093c9d",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-settings-daemon",
+  "binary": "cosmic-settings-daemon",
+  "resource_profile": "settings-native-linux-x86_64-full-os-v3",
+  "default_features": false,
+  "features": [
+    "cyxia-native"
+  ],
+  "source_lock_sha256": "fc741c0a4f9b94a09d89a292aa94b402e1eb9ea4a4426d7e85c85999d8ea854e",
+  "effective_lock_sha256": "e6d6abd654506f118330d612d35228cdcc1ff42f8d8597dac65c0b5e80633393",
+  "patches": [
+    {
+      "path": "cosmic-settings-native.patch",
+      "sha256": "7739437ad0613d68d92b78110410159ad414e64df2e90961d9a45cba63bf1d2e"
+    },
+    {
+      "path": "cosmic-settings-theme-dispatch.patch",
+      "sha256": "1ff39b97130a3e7ee8a5da2e7acf5fbbb6036496d69474961adc4cf4ce7b8835"
+    },
+    {
+      "path": "cosmic-settings-interface-guard.patch",
+      "sha256": "1be2e0846fe6260120758039d2983580e5fcf33c4074215c6312fb05d7acae68"
+    }
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "10b961035a37a810e298045e55bbafadb3af58f5f5dde7e9141e167e29ad5b38"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "4812a564193fc6589fe59af76e0f927afcc9f50f65f3d56117c68dd692489059"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "9807bd4504d88850c14ff9be38bf8ee8cd581bd4de61347697fc75c21dd82827"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "98fdfe49aa09676894c5e1d606a889e0a60f3a7ddfcd7768a59f109a2485bea0"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "f86d85b632cd041d6338616fa19b46110e68c6a399be8ad61da45a2927837d75"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "deb7a2d065e1022cdd3d32a5ea2ccc41e727b5f69ebd37942685c26d8d3956a3"
+    }
+  ],
+  "static_link_inputs": [
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libxkbcommon.a"
+  ],
+  "native_sdk_origin": {
+    "path": "runtime-sdk-origin.json",
+    "sha256": "bf26026042bca8b6d83727844e59fcbd70efe34e63835a838dbccbb78fe7b7f3"
+  }
+}
