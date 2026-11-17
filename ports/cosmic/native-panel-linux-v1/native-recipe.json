@@ -1,0 +1,100 @@
+{
+  "binary": "cosmic-panel",
+  "commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+  "component": "cosmic-panel",
+  "default_features": true,
+  "effective_lock_sha256": "cc4162879f254d09f5002386e1b6f40a465f4ceddae4613d5ce9d3f2828cc321",
+  "features": [
+    "cosmic-panel-bin/cyxia-native"
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "10b961035a37a810e298045e55bbafadb3af58f5f5dde7e9141e167e29ad5b38"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "4812a564193fc6589fe59af76e0f927afcc9f50f65f3d56117c68dd692489059"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "9807bd4504d88850c14ff9be38bf8ee8cd581bd4de61347697fc75c21dd82827"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+      "sha256": "1de9448784cfa4806ed3569c45a65d4f6f93d2bbcd9b421f8ec36db3d9c45aaf"
+    },
+    {
+      "path": "mesa-native-port/build/src/egl/libEGL.a",
+      "sha256": "5d5296054b18b6d0e2ad358203cccc321255528b5be8f2dc9f731a0107ed09bd"
+    },
+    {
+      "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+      "sha256": "c29af86c0863a989dc01a4707c55ea583fcb0044f06b0489f0e62afef86a803f"
+    },
+    {
+      "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+      "sha256": "c8be209acc08de9284b62c7d12d8796e0fcbc6fd22c6ec355b805d34b805eb43"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "98fdfe49aa09676894c5e1d606a889e0a60f3a7ddfcd7768a59f109a2485bea0"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-server.a",
+      "sha256": "21a1977fc1a6d3a1f2fe8cc179adc856f26564f903c55ee708b68d630282c15f"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-egl.a",
+      "sha256": "ff8c06a61df62991f37ee5ec72f2cef93d221395f294c8e4943c88079d26de6a"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "f86d85b632cd041d6338616fa19b46110e68c6a399be8ad61da45a2927837d75"
+    },
+    {
+      "path": "sysroot/usr/lib/libz.a",
+      "sha256": "6d891042ce5b64a7b22cdd807e970235ee8d2ba6d092e489ff3671bbe4a6a7bb"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "deb7a2d065e1022cdd3d32a5ea2ccc41e727b5f69ebd37942685c26d8d3956a3"
+    }
+  ],
+  "native_sdk_origin": {
+    "path": "runtime-sdk-origin.json",
+    "sha256": "0fe1b1b44b35d20cbbf36c22e8eb9af489d7d839f587d6e19b14ceb8e53a72df"
+  },
+  "package": "cosmic-panel-bin",
+  "patches": [
+    {
+      "path": "cosmic-panel-native.patch",
+      "sha256": "62ce8c8c88ce0128243c70b327e74c3009147f4d82263f77f7cfba3faafdd2a2"
+    }
+  ],
+  "purpose": "bounded-build-experiment",
+  "resource_profile": "panel-native-linux-x86_64-full-os-v1",
+  "schema_version": 1,
+  "source_lock_sha256": "cdecce78a1d07b66dd6bb7cbb49631d2c7c9587b9a85861a96e3f9b564817651",
+  "static_link_inputs": [
+    "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+    "mesa-native-port/build/src/egl/libEGL.a",
+    "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+    "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libwayland-server.a",
+    "sysroot/usr/lib/libwayland-egl.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libz.a",
+    "sysroot/usr/lib/libxkbcommon.a"
+  ],
+  "target": "x86_64-unknown-linux-musl"
+}
