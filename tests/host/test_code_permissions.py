@@ -1,8 +1,10 @@
 """Execute actual code-permission wrappers and executable cleanup on host fixtures.
 
-The production transaction helper, make_writable, publish_code and clear are read
-from this checkout at test time. PTE/TLB operations and the owner ledger are
-explicit test doubles; these tests do not execute an OS, replace real AP fences,
+The production transaction helper, make_writable, publish_code, trace_entry_error
+and clear are read from this checkout at test time. The real bounded diagnostic
+formatter writes to an explicit host-only byte sink, not a UART. PTE/TLB operations
+and the owner ledger are explicit test doubles; these tests do not execute an OS,
+replace real AP fences,
 or prove the historical guest panic's cause. The host catches clear's fatal panic
 only to verify that zeroing and release were not reached. The production kernel
 terminates at that boundary; its already-taken lease Option is not misreported.
@@ -38,6 +40,7 @@ def production_program():
     pieces = {
         "@WRAPPERS@": "\n".join(function(arch, signature) for signature in (
             "pub fn make_writable(", "pub fn publish_code(")),
+        "@TRACE_ENTRY_ERROR@": function(arch, "pub fn trace_entry_error("),
         "@CLEAR@": function(executable, "pub fn clear(&mut self)"),
         "@ERROR@": function(space, "pub enum Error {"),
         "@PAGE_BYTES@": re.search(r"pub const PAGE_BYTES: u64 = [^;]+;", space).group(),
@@ -68,6 +71,12 @@ mod space {
 mod code_permissions;
 use code_permissions::{Backend, Pages, Phase};
 use space::Error;
+
+// Host-only output capture. This does not emulate UART or AP ownership.
+thread_local! { static HOST_DIAGNOSTICS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) }; }
+fn log(payload: &[u8]) {
+    HOST_DIAGNOSTICS.with(|bytes| bytes.borrow_mut().extend_from_slice(payload));
+}
 
 struct Hardware {
     base: u64, phase: [Phase; 3], pte: [bool; 3], local: [bool; 3], peer: [bool; 3],
@@ -124,6 +133,7 @@ extern "C" fn x86_runtime_code_sealed(p: u64) -> bool {
 mod process_arch {
     use crate::Errno;
     @WRAPPERS@
+    @TRACE_ENTRY_ERROR@
 }
 struct PageCount(u32);
 struct ReleaseReceipt(u32, u32, PageCount);

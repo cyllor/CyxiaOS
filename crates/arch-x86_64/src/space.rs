@@ -201,8 +201,9 @@ impl<'a> AddressSpace<'a> {
         }
         Some(unsafe { table.add(((address >> 12) & 511) as usize) })
     }
-    pub fn map(
-        &mut self,
+    #[inline(always)]
+    fn validate_mapping(
+        &self,
         address: u64,
         physical: u64,
         permissions: UserPermissions,
@@ -227,37 +228,78 @@ impl<'a> AddressSpace<'a> {
         if self.resident_cpus() != 0 {
             return Err(Error::Active);
         }
-        let mut table = self.arena.table(self.root)?;
-        for shift in [39, 30, 21] {
-            let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
-            let mut value = unsafe { entry.read_volatile() };
-            if value & P == 0 {
-                let child = self.arena.allocate()?;
-                value = child | P | W | U;
-                unsafe {
-                    entry.write_volatile(value);
+        Ok(())
+    }
+    pub fn map(
+        &mut self,
+        address: u64,
+        physical: u64,
+        permissions: UserPermissions,
+    ) -> Result<(), Error> {
+        // Preserve the single-page validation/error boundary before locking.
+        self.validate_mapping(address, physical, permissions)?;
+        self.map_pages(core::iter::once((address, physical, permissions)))
+    }
+    /// Publish trusted kernel metadata while this root has no resident CPU.
+    /// The iterator must not run services, allocate, seal code, or acquire locks.
+    /// Every successful prefix remains owned by this space on a later error.
+    pub fn map_pages(
+        &mut self,
+        pages: impl IntoIterator<Item = (u64, u64, UserPermissions)>,
+    ) -> Result<(), Error> {
+        let mut pages = pages.into_iter();
+        let Some(first) = pages.next() else {
+            return Ok(());
+        };
+        if self.resident_cpus() != 0 {
+            return Err(Error::Active);
+        }
+        self.validate_mapping(first.0, first.1, first.2)?;
+        let aliases = MappingBatch::acquire()?;
+        let mut publication = MappingPublication {
+            epoch: &self.epoch,
+            published: 0,
+            aliases,
+        };
+        let mut cached_leaf: Option<(u64, *mut u64)> = None;
+        for (address, physical, permissions) in core::iter::once(first).chain(pages) {
+            self.validate_mapping(address, physical, permissions)?;
+            let region = address >> 21;
+            let table = if let Some((cached_region, table)) = cached_leaf
+                && cached_region == region
+            {
+                table
+            } else {
+                let mut table = self.arena.table(self.root)?;
+                for shift in [39, 30, 21] {
+                    let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
+                    let mut value = unsafe { entry.read_volatile() };
+                    if value & P == 0 {
+                        let child = self.arena.allocate()?;
+                        value = child | P | W | U;
+                        unsafe { entry.write_volatile(value) };
+                    }
+                    if value & (1 << 7) != 0 {
+                        return Err(Error::Conflict);
+                    }
+                    table = self.arena.table(value & MASK)?;
                 }
-            }
-            if value & (1 << 7) != 0 {
+                cached_leaf = Some((region, table));
+                table
+            };
+            let leaf = unsafe { table.add(((address >> 12) & 511) as usize) };
+            if unsafe { leaf.read_volatile() } & P != 0 {
                 return Err(Error::Conflict);
             }
-            table = self.arena.table(value & MASK)?;
+            let value = physical
+                | P
+                | U
+                | if permissions.writable { W } else { 0 }
+                | if permissions.executable { 0 } else { NX };
+            publication.aliases.change(physical, None, Some(permissions))?;
+            unsafe { leaf.write_volatile(value) };
+            publication.published += 1;
         }
-        let leaf = unsafe { table.add(((address >> 12) & 511) as usize) };
-        if unsafe { leaf.read_volatile() } & P != 0 {
-            return Err(Error::Conflict);
-        }
-        let value = physical
-            | P
-            | U
-            | if permissions.writable { W } else { 0 }
-            | if permissions.executable { 0 } else { NX };
-        mapping_change(physical, None, Some(permissions))?;
-        unsafe {
-            leaf.write_volatile(value);
-        }
-        self.epoch
-            .fetch_add(1, core::sync::atomic::Ordering::Release);
         Ok(())
     }
     pub fn translate(&self, address: u64) -> Option<Translation> {
@@ -368,55 +410,108 @@ impl<'a> AddressSpace<'a> {
     }
 }
 
+// The guard is neither Clone nor Send: the runtime lease belongs to this CPU.
+struct MappingBatch {
+    owner: u64,
+    _same_cpu: PhantomData<*mut ()>,
+}
+impl MappingBatch {
+    fn acquire() -> Result<Self, Error> {
+        #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
+        let owner = {
+            unsafe extern "C" {
+                fn x86_runtime_mapping_batch_begin() -> u64;
+            }
+            let owner = unsafe { x86_runtime_mapping_batch_begin() };
+            if owner == 0 {
+                return Err(Error::Active);
+            }
+            owner
+        };
+        #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
+        let owner = 0;
+        Ok(Self { owner, _same_cpu: PhantomData })
+    }
+    #[inline(always)]
+    fn change(
+        &self,
+        physical: u64,
+        old: Option<UserPermissions>,
+        new: Option<UserPermissions>,
+    ) -> Result<(), Error> {
+        #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
+        {
+            unsafe extern "C" {
+                fn x86_runtime_mapping_batch_change(owner: u64, physical: u64, old: u64, new: u64) -> bool;
+            }
+            let flags = |p: Option<UserPermissions>| {
+                p.map_or(0, |p| 1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2)
+            };
+            if !unsafe { x86_runtime_mapping_batch_change(self.owner, physical, flags(old), flags(new)) } {
+                return Err(Error::Permissions);
+            }
+        }
+        #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
+        let _ = (self.owner, physical, old, new);
+        Ok(())
+    }
+}
+impl Drop for MappingBatch {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
+        {
+            unsafe extern "C" {
+                fn x86_runtime_mapping_batch_end(owner: u64) -> bool;
+            }
+            assert!(unsafe { x86_runtime_mapping_batch_end(self.owner) }, "mapping batch lost owner; retain backing");
+        }
+    }
+}
+struct MappingPublication<'a> {
+    epoch: &'a core::sync::atomic::AtomicU64,
+    published: u64,
+    aliases: MappingBatch,
+}
+impl Drop for MappingPublication<'_> {
+    fn drop(&mut self) {
+        if self.published != 0 {
+            // Exclusive owner, same wrapped final epoch as N one-page maps.
+            // Also publish the successful prefix on an error or unwind.
+            self.epoch.fetch_add(self.published, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
 fn mapping_change(
     physical: u64,
     old: Option<UserPermissions>,
     new: Option<UserPermissions>,
 ) -> Result<(), Error> {
-    #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
-    {
-        unsafe extern "C" {
-            fn x86_runtime_mapping_change(physical: u64, old: u64, new: u64) -> bool;
-        }
-        let flags = |p: Option<UserPermissions>| {
-            p.map_or(0, |p| {
-                1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2
-            })
-        };
-        if !unsafe { x86_runtime_mapping_change(physical, flags(old), flags(new)) } {
-            return Err(Error::Permissions);
-        }
-    }
-    #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
-    let _ = (physical, old, new);
-    Ok(())
+    MappingBatch::acquire()?.change(physical, old, new)
 }
 impl Drop for AddressSpace<'_> {
     fn drop(&mut self) {
         assert_eq!(self.resident_cpus(), 0, "dropping an entered address space");
-        fn retire(space: &AddressSpace<'_>, physical: u64, level: u8, entries: usize) {
-            let Ok(table) = space.arena.table(physical) else {
-                return;
-            };
+        let aliases = MappingBatch::acquire().expect("retiring mappings requires alias custody");
+        fn retire(space: &AddressSpace<'_>, aliases: &MappingBatch, physical: u64, level: u8, entries: usize) {
+            let table = space.arena.table(physical).expect("invalid retiring table; retain backing");
             for index in 0..entries {
                 let value = unsafe { table.add(index).read_volatile() };
                 if value & P == 0 {
                     continue;
                 }
                 if level == 1 {
-                    let _ = mapping_change(
+                    assert!(value & MASK < space.ram_bytes, "invalid retiring frame; retain backing");
+                    aliases.change(
                         value & MASK,
-                        Some(UserPermissions {
-                            writable: value & W != 0,
-                            executable: value & NX == 0,
-                        }),
+                        Some(UserPermissions { writable: value & W != 0, executable: value & NX == 0 }),
                         None,
-                    );
+                    ).expect("retiring alias count failed; retain backing");
                 } else {
-                    retire(space, value & MASK, level - 1, 512);
+                    assert_eq!(value & (1 << 7), 0, "unexpected large user leaf; retain backing");
+                    retire(space, aliases, value & MASK, level - 1, 512);
                 }
             }
         }
-        retire(self, self.root, 4, 256);
+        retire(self, &aliases, self.root, 4, 256);
     }
 }

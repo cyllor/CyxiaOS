@@ -333,6 +333,196 @@ failed publication attempts, not only successful user entries. Preparation is
 inclusive of `begin` retirement if a previous root remains, so these fields
 must not be described as universally disjoint CPU-time billing.
 
+The next tested change batches page-table publication while preserving the
+complete retirement boundary. A batch reuses a leaf-table lookup only within
+the same 2 MiB region, retains every page's address, permission, phase, conflict
+and alias-count checks, and publishes the original epoch increment for exactly
+the successful prefix. A non-Send guard holds the existing alias lock for the
+batch, with actual CPU ownership checked by the runtime. RX sealing finishes
+before the batch acquires that lock. Retirement still visits every mapping;
+invalid tables or failed alias decrements now terminate before backing can be
+cleared or released. Actual PTE fences, AI policy and all resource limits are
+unchanged.
+
+Twelve focused host cases passed using the actual runtime-enabled architecture
+code and exact production runtime/staging functions. The only platform switch
+in the generated architecture source is the documented `none` to `linux` cfg
+adaptation; CPU identity, physical backing and RX/TLB operations are explicit
+fixtures. The portable `tests/host/test_page_map_batch.py` reran those same
+twelve cases from the current checkout successfully in 1.488 seconds. These
+are twelve cases exercised twice, not twenty-four distinct cases. Two
+independent source reviews and an independent compiled-witness review found
+no remaining material defect in those tested boundaries.
+
+Formal OS v6 built in 66.114 seconds with source SHA256
+`19dccf7324ecbb12e941429748692c9ccb4ed6eeb479810f11a7acaa4acc880a`.
+Capture v9 then ran for 90.671 seconds and still failed the original first-frame
+gate. Normal QMP quit and zero exit succeeded. The compositor remained Running,
+with 1,764 syscalls, five threads and 2,144 construction attempts; display
+submissions remained zero. Its final cumulative preparation/retirement fields
+were 23.406 and 9.765 seconds. This run does not establish an overall performance
+improvement: preparation decreased while retirement increased, and the two
+runs reached different amounts of application work. The preserved v8/v9
+timing and compiled kernels are used to inspect the actual hot call paths
+before making a further change.
+
+The existing formal builder also supports an explicit `release` profile.
+OS v7 used that profile with the exact same source SHA, component inputs,
+features, compiler, CPU count and RAM as OS v6, and built in 68.153 seconds.
+Its manifest records the actual `--release` command. This is a distinct
+compiler-profile observation, not a controlled continuation of the dev
+timing comparison. Actual disassembly confirms that release inlines the GS
+CPU-slot read and phase checks while retaining owner validation; it does not
+by itself prove runtime performance or graphics initialization.
+
+Capture v10 stopped before starting QEMU after 33.050 seconds: the consumer
+searched the entire source cache and found both genuine debug and release
+generated catalogs. Both were identical, but each belonged to a different
+build profile. The corrected selector now uses the verified target/profile
+and requires exactly one kernel catalog inside that profile's build directory.
+Missing, duplicate or linked paths still fail; there is no fallback to another
+profile. All later catalog bytes, assets and actual read-only kernel embedding
+checks remain unchanged. Five focused host cases pass, and the old function
+still reproduces its original failure against the unchanged real cache.
+
+Capture v11 then genuinely booted the release OS and launched D-Bus and the
+compositor. It stopped after 72.147 seconds because an incomplete upstream
+configuration log directly preceded the complete `posix list` echo. The
+response contains both genuine process rows and the following prompt, but the
+consumer incorrectly required the echo to begin a line. Its final command
+span, starting at UART byte 151827, is preserved byte for byte. During the
+30-second command wait the compositor continued into actual EGL initialization
+and emitted DRI2 initialization errors followed by a Smithay display warning.
+Those later messages are not evidence of a completed scanout. No final display
+snapshot was requested during that wait, so this run does not establish a
+first-frame latency or successful rendering. Normal QMP quit and zero exit
+succeeded; the failed command recognition and original capture remain intact.
+
+The retained Smithay and Mesa sources narrow the meaning of those messages.
+In Smithay's `src/backend/egl/display.rs`, `eglInitialize` must return success
+and display-extension discovery must succeed before `get_dmabuf_formats` can
+emit the observed warning. Its missing-import-extension branch returns two
+empty format sets successfully. Mesa's `eglInitialize` permits an initial
+driver attempt, an optional Zink retry and then software fallback inside one
+call; failed intermediate surfaceless attempts emit the observed DRI2 error.
+Thus v11 reached successful EGL initialization and extension discovery. The
+later OpenGL ES API binding, context, renderer, shaders, buffer and scanout
+remain unverified by this log sequence.
+
+The fresh-echo correction removes only the line-start requirement from the
+complete literal command plus newline. It still starts at this command's fresh
+UART offset, requires the later anchored shell prompt, and checks expected
+results and errors within the resulting response. Replaying the complete
+2,543-byte original command span now recognizes both real process rows; the
+five existing command-boundary fixtures also pass. The portable suite now
+retains that complete, checksum-bound span and rejects the same response when
+its echo is changed to a different command. All six command-boundary tests
+passed in 0.141 seconds. The live runtime producer
+used next has SHA-256
+`2bc81de5c5d8f458e721679b7ea9bf845a04bb20b22e995ec4efe5a80466ed00`.
+
+Capture v12 used the unchanged release OS and corrected command reader. It
+stopped after 43.246 seconds because the required compositor had exited with
+normalized `Fault`/139 before any recorded syscall, preemption or successful
+user slice. Its saved PC still equaled the ELF entry, `0x1de4000`. One address
+space preparation attempt took 920,672,860 ns; retirement accumulated
+8,960,380 ns. Image, heap and thread ownership returned to zero, while the
+still-running real bus retained its eight native pages (56 globally free).
+Normal QMP quit was acknowledged and QEMU exited zero without force.
+
+That result is neither a hardware page-fault diagnosis nor proof of a TLB
+timeout. The runner also maps preparation and entry-mechanism errors to
+`Fault`/139, and currently discards their original architectural error variants.
+The next diagnostic must distinguish those paths, keep AP errors in the owned
+context until all workers drain, and retain the actual permission fences and
+execution policy. No notification service or non-boot compositor frame was
+observed in v12.
+
+The diagnostic change preserves original architectural error variants at
+address-space creation, mapping and code publication failures. A resume error
+is stored in its exclusively owned `Context`; CPU0 consumes it only after the
+existing drain and root-retirement boundary. The normalized error, exit and AI
+accounting remain unchanged. The fixed-size log is formatted only on failure;
+the mapping loop does not track a diagnostic value on every successful page.
+The portable permission integration suite still passes all four actual-method
+Rust cases through its Python driver (0.878 seconds).
+
+OS v8, with only those additional diagnostics, built in 87.636 seconds from
+source SHA `11b40d4ade91127578583726112d3e9492da2bcc8a1bc1320301cd39ab86449e`.
+Capture v13 then ran for 96.170 seconds and failed the unchanged first-frame
+gate. No entry-mechanism or hardware-fault diagnostic was emitted. The final
+compositor snapshot remained Running with 2,943 syscalls, seven threads
+(peak eight), 4,030 address-space preparations and 6,051 heap pages. Its
+cumulative preparation and retirement times were 19.096 and 5.516 seconds.
+QMP quit was acknowledged and QEMU exited zero without force.
+
+The final saved PC, `0x2fc5bfd`, lies uniquely inside the genuine compositor
+ELF's `nir_legacy_trivialize` symbol at offset `+0x68d`. Retained Mesa sources
+place that routine in shader IR/register conversion on the `nir_to_tgsi` path
+used by softpipe shader creation. Recent samples also reached GLES renderer
+and shader-linking functions. This is evidence of actual Mesa shader
+initialization work, not a completed renderer, specific shader identity or
+proof of an infinite loop. No buffer submission or notification launch was
+observed. The intermittent v12 entry failure was not reproduced or assigned a
+cause by this run.
+
+The next change groups only adjacent executable staging entries whose physical
+frames are consecutive. A hole, non-executable entry, physical discontinuity
+or 512-entry table boundary ends the group. Each group calls the existing
+whole-range permission transaction before the mapping batch acquires its
+alias gate. Per-page alias checks, Transition states, actual PTE writes, real
+TLB synchronization, its 100 ms limit and all recovery/retirement checks stay
+in place. The original comparator and all failed captures are retained.
+
+Seventeen portable Rust integration cases passed in 1.704 seconds. They
+extract the real staging publication, wrappers, runtime permission backend
+and transaction helper, using explicit CPU/PTE/TLB fixtures. The compositor's
+4,931-page contiguous RX layout exercises eleven groups and 4,931 PTE writes;
+other cases cover mixed ranges, physical gaps, writable aliases, failures in
+later groups, partial PTE changes, failed fences and failed recovery before
+zero eligibility. These fixtures do not claim real AP synchronization or
+actual guest reclamation.
+
+OS v9 built in 55.632 seconds from source SHA
+`d73336cbfce69621a8392cbc8936e4b96fae023e96ed84786dfd863dab64cf1e`.
+Capture v14 ran for 92.520 seconds and still failed the original first-frame
+gate, with normal QMP quit/zero exit and no entry or hardware-fault diagnostic.
+Its first preparation attempt recorded 18,419,300 ns, compared with
+851,846,830 ns in v13. These are single-run observations, not a controlled
+latency benchmark or a proven cause/fix for v12. At the final snapshot the
+compositor remained Running with 2,242 syscalls, seven threads and 3,079
+preparations; cumulative preparation/retirement were 19.034/6.015 seconds.
+No overall performance gain or completed compositor frame is claimed.
+
+Three compiler inline attributes were then added to the remaining measured
+mapping call boundaries. Removing those three attributes restores both source
+files byte for byte; no function body, guard, fence, timeout or AI policy
+changed. OS v10 built in 70.825 seconds from source SHA
+`caebe804a1ef3e3b28e7f7782b2935760f85611a45f945b032ec67389c55d2d8`.
+Actual v9/v10 disassembly verifies the intended code generation: the two
+private validation/wrapper calls disappear from `PageTable::publish`, and the
+runtime batch entry contains the checked alias core instead of tail-jumping
+to it. CPU owner, phase and the three checked counters remain. The containing
+functions grow from 1,996 to 2,393 bytes and 64 to 374 bytes respectively;
+code-size effects are retained rather than assuming an automatic speedup.
+
+All seventeen integration cases passed again against the exact current
+checkout (2.102 seconds inside the test driver). Capture v15 still failed the
+original first-frame gate after 87.771 seconds, with normal QMP quit/zero exit
+and no entry or hardware-fault diagnostic. The compositor remained Running:
+3,701 syscalls, 4,874 preparations, 6,391 heap pages and cumulative
+preparation/retirement of 18.263/5.880 seconds. These different workloads and
+wall-time samples do not constitute a controlled speedup measurement.
+Its last PC, `0x2d6fe16`, is the entry of the actual Mesa
+`_mesa_printed_blake3_equal` helper. No call stack was captured, so neither a
+particular caller/shader nor renderer completion follows from that sample.
+
+The next diagnostic will preserve the failed 45-second acceptance result
+while explicitly observing later startup under the original global bounds.
+A later real frame or protocol observation must not upgrade that acceptance
+result to PASS. The purpose is to expose any remaining functional failure
+beyond expensive initialization, using the same genuine OS and components.
+
 ## Preserved failures and corrections
 
 | Attempt | Actual result | Treatment |
@@ -356,6 +546,13 @@ must not be described as universally disjoint CPU-time billing.
 | Notification runtime capture v6 diagnostic kernel | Compositor remained alive but completed no display submission within 45 seconds | Preserve the 83.165-second capture and diagnostic-only OS. Normal QMP quit/exit succeeded; no rendering or notification protocol acceptance. |
 | Notification runtime capture v7 permission transaction | Real compositor executed regex construction but completed no display submission within 45 seconds | Preserve the 85.598-second capture, tested fix, exact OS and saved-PC symbolization. Normal QMP quit/exit succeeded; no notification or complete-session claim. |
 | Notification runtime capture v8 page-table timing | Compositor preparation and retirement accumulated 23.922 s and 5.937 s between the first and last snapshots; no first scanout | Preserve the 104.251-second failure, read-only timing source and 124 snapshots. QMP quit/exit succeeded; optimize measured publication overhead without widening acceptance. |
+| Notification runtime capture v9 page batching | No first scanout; final cumulative preparation 23.406 s and retirement 9.765 s across 2,144 attempts | Preserve the 90.671-second failure and actual compiled kernel. QMP quit/exit succeeded; no overall speedup, rendering or full-session acceptance is claimed. |
+| Notification runtime capture v10 release preflight | Two genuine profile catalogs were mistaken for an ambiguous catalog within one build | Preserve the 33.050-second failure and zero-byte UART; QEMU was not started. Select the exact verified target/profile without changing later byte checks. |
+| Notification runtime capture v11 release | A fresh, complete command echo followed a partial application log instead of starting a line | Preserve the 72.147-second failure and exact 2,543-byte command span. Actual command response and later EGL logs exist; rendering during the parser wait was not observed. |
+| Notification runtime capture v12 release | The compositor exited with normalized `Fault`/139 before any recorded syscall or successful user slice | Preserve the 43.246-second failure. Image, heap and threads were reclaimed; QMP quit and zero exit succeeded. Preserve the original preparation/entry error before assigning a cause. |
+| Notification runtime capture v13 entry diagnostics | Compositor reached real Mesa shader IR conversion but completed no display submission within the original gate | Preserve the 96.170-second failure and final saved-PC source analysis. No entry or hardware-fault diagnostic was emitted; normal QMP quit/zero exit succeeded. |
+| Notification runtime capture v14 RX ranges | First preparation recorded 18.419 ms, but the compositor still completed no display submission within the original gate | Preserve the 92.520-second failure and all original limits. No entry/fault diagnostic; normal QMP quit/zero exit. The first-attempt observation does not establish overall performance or explain v12. |
+| Notification runtime capture v15 inline boundaries | Actual code generation removed the reviewed call boundaries, but no display submission completed within the original gate | Preserve the 87.771-second failure. All 17 integration cases passed on the current checkout; normal QMP quit/zero exit and no entry/fault diagnostic. No first frame or notification acceptance. |
 
 The notification failure occurred before final ELF linking. Passing absolute
 archive names to the final linker does not make them discoverable when rustc

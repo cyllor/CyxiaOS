@@ -80,12 +80,38 @@ impl PageTable {
     }
     #[cfg(target_arch = "x86_64")]
     pub fn publish(&self, space: &mut ProcessSpace, base: u64) -> Result<(), Errno> {
-        for (index, page) in self.0.iter().enumerate() {
-            if page.protection != 0 {
-                space.map(base + index as u64 * 4096, page.physical, page.protection)?;
+        // Sealing acquires ALIAS_GATE and can fence real CPUs. Finish it before
+        // the mapping batch takes that gate; failed seals retain their phase.
+        let mut present = false;
+        let mut index = 0;
+        while index < self.0.len() {
+            let page = self.0[index];
+            present |= page.protection != 0;
+            if page.protection & 4 == 0 {
+                index += 1;
+                continue;
             }
+            let start = index;
+            index += 1;
+            // Only adjacent RX entries with consecutive physical frames share
+            // a transaction. Never cross this 512-entry staging table.
+            while index < self.0.len()
+                && self.0[index].protection & 4 != 0
+                && self.0[index - 1].physical.checked_add(4096) == Some(self.0[index].physical)
+            {
+                index += 1;
+            }
+            crate::process_arch::publish_code(
+                crate::HIGH + page.physical,
+                (index - start) * 4096,
+            )?;
         }
-        Ok(())
+        if !present {
+            return Ok(());
+        }
+        space.map_pages(self.0.iter().enumerate().filter_map(|(index, page)| {
+            (page.protection != 0).then_some((base + index as u64 * 4096, page.physical, page.protection))
+        }))
     }
 }
 
@@ -140,6 +166,9 @@ impl ProcessSpace {
         self.retire();
         let pool = TABLE_POOL.load(core::sync::atomic::Ordering::Acquire);
         if pool == 0 || self.slot >= cyxia_posix::usermem::MAX_PROCESSES || self.pid == 0 {
+            crate::process_arch::trace_entry_error("begin.owner", self.pid, 0, format_args!(
+                "error={:?} slot={} pool={pool:#x}", Errno::Nodev, self.slot,
+            ));
             return Err(Errno::Nodev);
         }
         let physical = pool + self.slot as u64 * TABLE_PAGES_PER_PROCESS as u64 * 4096;
@@ -150,7 +179,13 @@ impl ProcessSpace {
                 TABLE_PAGES_PER_PROCESS,
             )
         }
-        .map_err(|_| Errno::Nomem)?;
+        .map_err(|error| {
+            crate::process_arch::trace_entry_error("begin.arena", self.pid, 0, format_args!(
+                "error={error:?} va={:#x} pa={physical:#x} bytes={}",
+                crate::HIGH + physical, TABLE_PAGES_PER_PROCESS * 4096,
+            ));
+            Errno::Nomem
+        })?;
         self.current = Some(
             unsafe {
                 AddressSpace::new(
@@ -162,7 +197,13 @@ impl ProcessSpace {
                     },
                 )
             }
-            .map_err(|_| Errno::Io)?,
+            .map_err(|error| {
+                crate::process_arch::trace_entry_error("begin.root", self.pid, 0, format_args!(
+                    "error={error:?} va={:#x} pa={physical:#x} bytes={}",
+                    crate::HIGH + physical, TABLE_PAGES_PER_PROCESS * 4096,
+                ));
+                Errno::Io
+            })?,
         );
         Ok(())
     }
@@ -179,11 +220,38 @@ impl ProcessSpace {
             writable: protection & 2 != 0,
             executable: protection & 4 != 0,
         };
-        self.current
-            .as_mut()
-            .ok_or(Errno::Nodev)?
-            .map(virtual_address, physical, permissions)
-            .map_err(|_| Errno::Io)
+        let pid = self.pid;
+        self.current.as_mut().ok_or_else(|| {
+            crate::process_arch::trace_entry_error("map.owner", pid, 0, format_args!(
+                "error={:?} va={virtual_address:#x} pa={physical:#x} bytes=4096", Errno::Nodev,
+            ));
+            Errno::Nodev
+        })?.map(virtual_address, physical, permissions).map_err(|error| {
+            crate::process_arch::trace_entry_error("map", pid, 0, format_args!(
+                "error={error:?} va={virtual_address:#x} pa={physical:#x} bytes=4096",
+            ));
+            Errno::Io
+        })
+    }
+    /// Trusted staged metadata only; executable pages must be sealed first.
+    pub fn map_pages(&mut self, pages: impl IntoIterator<Item = (u64, u64, u8)>) -> Result<(), Errno> {
+        let pid = self.pid;
+        self.current.as_mut().ok_or_else(|| {
+            crate::process_arch::trace_entry_error("map_pages.owner", pid, 0, format_args!(
+                "error={:?}", Errno::Nodev,
+            ));
+            Errno::Nodev
+        })?.map_pages(pages.into_iter().map(|(address, physical, protection)| {
+            (address, physical, cyxia_arch_x86_64::space::UserPermissions {
+                writable: protection & 2 != 0,
+                executable: protection & 4 != 0,
+            })
+        })).map_err(|error| {
+            crate::process_arch::trace_entry_error("map_pages", pid, 0, format_args!(
+                "error={error:?}",
+            ));
+            Errno::Io
+        })
     }
     pub fn root(&self) -> Result<&cyxia_arch_x86_64::space::AddressSpace<'static>, Errno> {
         self.current.as_ref().ok_or(Errno::Nodev)

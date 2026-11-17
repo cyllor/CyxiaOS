@@ -55,6 +55,8 @@ static CODE_PHASES: PhaseTable<8192> = PhaseTable::new();
 // Three 20-bit counts: all user mappings, writable aliases, executable aliases.
 static USER_ALIASES: [AtomicU64; 262144] = [const { AtomicU64::new(0) }; 262144];
 static ALIAS_GATE: AtomicBool = AtomicBool::new(false);
+// A batched alias lease is held only by one synchronous, non-Send arch guard.
+static ALIAS_BATCH_OWNER: AtomicU64 = AtomicU64::new(0);
 struct AliasGuard;
 impl Drop for AliasGuard {
     fn drop(&mut self) {
@@ -706,12 +708,18 @@ pub fn is_user_code_sealed(physical: u64) -> bool {
 }
 #[unsafe(no_mangle)]
 extern "C" fn x86_runtime_mapping_change(physical: u64, old: u64, new: u64) -> bool {
-    if physical >= RAM || physical % 4096 != 0 {
-        return false;
-    }
     let Ok(_guard) = alias_guard() else {
         return false;
     };
+    mapping_change_locked(physical, old, new)
+}
+// Only the single-page guard or an authenticated batch owner may call this core.
+// Physical bounds, phase policy and all three 20-bit counts are unchanged.
+#[inline(always)]
+fn mapping_change_locked(physical: u64, old: u64, new: u64) -> bool {
+    if physical >= RAM || physical % 4096 != 0 {
+        return false;
+    }
     let Some(phase) = code_phase(physical) else {
         return false;
     };
@@ -735,6 +743,39 @@ extern "C" fn x86_runtime_mapping_change(physical: u64, old: u64, new: u64) -> b
         updated |= next << shift;
     }
     counter.store(updated, Ordering::Release);
+    true
+}
+#[unsafe(no_mangle)]
+extern "C" fn x86_runtime_mapping_batch_begin() -> u64 {
+    let cpu = cpu_slot();
+    if cpu >= 4 {
+        return 0;
+    }
+    let Ok(guard) = alias_guard() else {
+        return 0;
+    };
+    let owner = cpu as u64 + 1;
+    ALIAS_BATCH_OWNER.store(owner, Ordering::Release);
+    // The matching arch MappingBatch now owns exactly this acquired lease.
+    core::mem::forget(guard);
+    owner
+}
+fn mapping_batch_owned(owner: u64) -> bool {
+    owner != 0
+        && owner == cpu_slot() as u64 + 1
+        && ALIAS_BATCH_OWNER.load(Ordering::Acquire) == owner
+}
+#[unsafe(no_mangle)]
+extern "C" fn x86_runtime_mapping_batch_change(owner: u64, physical: u64, old: u64, new: u64) -> bool {
+    mapping_batch_owned(owner) && mapping_change_locked(physical, old, new)
+}
+#[unsafe(no_mangle)]
+extern "C" fn x86_runtime_mapping_batch_end(owner: u64) -> bool {
+    if !mapping_batch_owned(owner) {
+        return false;
+    }
+    ALIAS_BATCH_OWNER.store(0, Ordering::Release);
+    drop(AliasGuard);
     true
 }
 // The board retains its existing alias lock, actual PTE writer, IPI delivery,

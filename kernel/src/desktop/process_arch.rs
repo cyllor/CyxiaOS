@@ -36,6 +36,9 @@ pub struct Context {
     retry_pc: Option<u64>,
     #[cfg(target_arch = "x86_64")]
     fault: cyxia_posix::signal_x86_64::FaultState,
+    // AP records only; CPU0 consumes after the complete user phase is drained.
+    #[cfg(target_arch = "x86_64")]
+    entry_error: Option<cyxia_arch_x86_64::user::Error>,
 }
 impl Context {
     pub const fn empty() -> Self {
@@ -46,6 +49,8 @@ impl Context {
             retry_pc: None,
             #[cfg(target_arch = "x86_64")]
             fault: cyxia_posix::signal_x86_64::FaultState::EMPTY,
+            #[cfg(target_arch = "x86_64")]
+            entry_error: None,
         }
     }
     pub fn initialize(entry: u64, sp: u64, linux: bool) -> Result<Self, Errno> {
@@ -73,6 +78,14 @@ impl Context {
                 .map_err(|_| Errno::Inval)?;
         }
         Ok(context)
+    }
+    /// CPU0 only, after every user worker and root has been retired.
+    #[cfg(target_arch = "x86_64")]
+    pub fn trace_entry_failure(&mut self, pid: u32, tid: u32, errno: Errno) {
+        let error = self.entry_error.take();
+        trace_entry_error("complete_exit", pid, tid, format_args!(
+            "resume_error={error:?} errno={errno:?} pc={:#x} sp={:#x}", self.pc(), self.sp(),
+        ));
     }
     pub fn pc(&self) -> u64 {
         #[cfg(target_arch = "aarch64")]
@@ -232,6 +245,8 @@ impl Context {
             retry_pc: None,
             #[cfg(target_arch = "x86_64")]
             fault: self.fault,
+            #[cfg(target_arch = "x86_64")]
+            entry_error: None,
         };
         child.set_result(0);
         Ok(child)
@@ -296,8 +311,13 @@ pub unsafe fn enter(
     deadline: u64,
 ) -> Result<Exit, Errno> {
     use cyxia_arch_x86_64::user::UserExit;
+    context.entry_error = None;
     let exit = unsafe { cyxia_arch_x86_64::user::resume(&mut context.raw, root, deadline) }
-        .map_err(|_| Errno::Io)?;
+        .map_err(|error| {
+            // No printing on an AP. Existing ownership/drain carries this home.
+            context.entry_error = Some(error);
+            Errno::Io
+        })?;
     context.retry_pc = None;
     Ok(match exit {
         UserExit::Syscall(call) => {
@@ -371,7 +391,12 @@ pub fn publish_code(address: u64, length: usize) -> Result<(), Errno> {
         let end = physical.checked_add(length as u64).ok_or(Errno::Fault)?;
         if (physical..end).step_by(4096).any(|page| !unsafe { x86_runtime_code_sealed(page) }) {
             unsafe { crate::machine::runtime::seal_user_code(physical, length) }
-                .map_err(|_| Errno::Io)?;
+                .map_err(|error| {
+                    trace_entry_error("publish_code", 0, 0, format_args!(
+                        "error={error:?} va={address:#x} pa={physical:#x} bytes={length}",
+                    ));
+                    Errno::Io
+                })?;
         }
         Ok(())
     }
@@ -591,6 +616,7 @@ impl Context {
                     args: [0; 6],
                     retry_pc: None,
                     fault: self.fault,
+                    entry_error: None,
                 },
                 mask,
                 stack,
@@ -639,5 +665,27 @@ fn log_x86_fault(vector: u16, error: u64, address: u64, instruction: u64) {
         len: 0,
     };
     writeln!(line,"USER_FAULT vector={vector} error={error:#x} address={address:#x} instruction={instruction:#x}").expect("bounded hardware fault trace");
+    crate::log(&line.bytes[..line.len]);
+}
+
+/// Failure-only, bounded CPU0 output; fixed stages and finite error enums only.
+/// Never call while an AP user phase owns a context/root. Zero PID/TID means
+/// unavailable here; the enclosing prepare diagnostic supplies that identity.
+#[cfg(target_arch = "x86_64")]
+pub fn trace_entry_error(stage: &'static str, pid: u32, tid: u32, detail: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    struct Line { bytes: [u8; 384], len: usize }
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
+            self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?
+                .copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut line = Line { bytes: [0; 384], len: 0 };
+    writeln!(line, "USER_ENTRY_ERROR stage={stage} pid={pid} tid={tid} {detail}")
+        .expect("bounded user entry diagnostic");
     crate::log(&line.bytes[..line.len]);
 }

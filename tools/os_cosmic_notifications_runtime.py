@@ -376,11 +376,10 @@ class Console(os_smoke.Console):
         self.commands.append(dict(command=command, serial_offset=start))
         encoded = command.encode('ascii')
         self.sock.sendall(encoded + b'\r')
-        # Concurrent application tracing can arrive before the command echo.
+        # Concurrent tracing can leave a partial line before the complete echo.
         # Keep it in raw evidence, but require this command's own echo/prompt
         # and use only its response span for expected asynchronous markers.
-        echo = self.until(rb'(?m)^(?:' + os_smoke.PROMPT + rb')?'
-                          + re.escape(encoded) + rb'\r?\n', start)
+        echo = self.until(re.escape(encoded) + rb'\r?\n', start)
         response = start + echo.end()
         self.until(rb'(?m)^' + os_smoke.PROMPT, response)
         # Shell errors are standalone lines. A tracing message containing the
@@ -541,12 +540,28 @@ def font_inputs(prefix):
             'guest_font_loading_observed': False}
 
 
+def generated_catalog_path(manifest):
+    target, profile = manifest.get('target'), manifest.get('profile')
+    require(target == os_x86.pc.TARGET and type(profile) is str and profile in ('dev', 'release'),
+            'Unsupported OS catalog target/profile')
+    cache = plain_directory(manifest['cache']['effective'])
+    build = plain_directory(cache / target / ('debug' if profile == 'dev' else 'release') / 'build')
+    catalogs = []
+    for crate in sorted(build.glob('cyxia-kernel-*')):
+        crate = plain_directory(crate)
+        output = crate / 'out'
+        if output.exists() or output.is_symlink():
+            output = plain_directory(output)
+            catalog = output / 'ported_catalog.rs'
+            if catalog.exists() or catalog.is_symlink():
+                catalogs.append(probe_builder.no_symlink_path(catalog))
+    require(len(catalogs) == 1, 'Missing/ambiguous actual generated catalog')
+    return catalogs[0]
+
+
 def catalog_identity(build, manifest, programs):
     prefix = plain_directory(manifest['sysroot'])
-    cache = plain_directory(manifest['cache']['effective'])
-    catalogs = list(cache.rglob('ported_catalog.rs'))
-    require(len(catalogs) == 1, 'Missing/ambiguous actual generated catalog')
-    catalog = probe_builder.no_symlink_path(catalogs[0])
+    catalog = generated_catalog_path(manifest)
     raw = read_regular(catalog, 1024 * 1024)
     entries = re.findall(rb'^\("([^"\n]+)", "([^"\n]+)", include_bytes!\(concat!\(env!\("OUT_DIR"\), "/([^"\n]+)"\)\)\),$', raw, re.MULTILINE)
     bound = os_smoke.embedded_images(build, manifest, IMAGE_NAMES)

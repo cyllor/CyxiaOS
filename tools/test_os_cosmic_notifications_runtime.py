@@ -100,6 +100,86 @@ class FontFixture:
             return subject.font_inputs(self.prefix)
 
 
+class GeneratedCatalogSelection(unittest.TestCase):
+    """Real host paths only; catalog selection is not kernel or guest evidence."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.cache = self.root / 'cache'
+        self.cache.mkdir()
+        self.manifest = {'target': 'x86_64-unknown-none', 'profile': 'release',
+                         'cache': {'effective': str(self.cache)}}
+
+    def catalog(self, profile, suffix='a' * 16, *, target='x86_64-unknown-none'):
+        path = self.cache / target / profile / 'build' / ('cyxia-kernel-' + suffix) / 'out/ported_catalog.rs'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'HOST CATALOG PATH FIXTURE\n')
+        return path
+
+    def test_debug_and_release_coexist_and_only_manifest_profile_is_selected(self):
+        debug = self.catalog('debug')
+        release = self.catalog('release')
+        # Cargo may retain an otherwise empty build-script directory too.
+        (release.parents[2] / ('cyxia-kernel-' + 'c' * 16)).mkdir()
+        for profile, expected in [('dev', debug), ('release', release)]:
+            with self.subTest(profile=profile):
+                self.manifest['profile'] = profile
+                manifest = json.loads(json.dumps(self.manifest))
+                self.assertEqual(subject.generated_catalog_path(manifest), expected)
+                self.assertEqual(expected.read_bytes(), b'HOST CATALOG PATH FIXTURE\n')
+
+    def test_missing_selected_profile_cannot_fall_back_to_another_profile_or_target(self):
+        self.catalog('debug')
+        self.catalog('release', target='aarch64-unknown-none')
+        selected_build = self.cache / self.manifest['target'] / 'release/build'
+        with self.assertRaises(ValueError):
+            subject.generated_catalog_path(self.manifest)
+        selected_build.mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, 'Missing/ambiguous actual generated catalog'):
+            subject.generated_catalog_path(self.manifest)
+
+    def test_duplicate_catalogs_inside_selected_profile_are_rejected_even_with_equal_bytes(self):
+        self.catalog('debug')
+        first = self.catalog('release', 'a' * 16)
+        second = self.catalog('release', 'b' * 16)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'Missing/ambiguous actual generated catalog'):
+            subject.generated_catalog_path(self.manifest)
+
+    def test_unknown_or_nonmatching_target_and_profile_are_rejected(self):
+        self.catalog('release')
+        invalid = [('profile', value) for value in (None, '', 'debug', '../release', 'bench', True, [])]
+        invalid += [('target', value) for value in (None, '', 'x86_64-unknown-linux-musl',
+                    'aarch64-unknown-none', '../x86_64-unknown-none', True, [])]
+        for key, value in invalid:
+            with self.subTest(key=key, value=value):
+                manifest = copy.deepcopy(self.manifest)
+                manifest[key] = value
+                with self.assertRaisesRegex(ValueError, 'Unsupported OS catalog target/profile'):
+                    subject.generated_catalog_path(manifest)
+
+    def test_symlink_at_every_selected_path_boundary_and_dangling_catalog_are_rejected(self):
+        for boundary in ('cache', 'target', 'profile', 'build', 'crate', 'out', 'catalog', 'dangling'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                cache = root / 'cache'
+                catalog = cache / 'x86_64-unknown-none/release/build/cyxia-kernel-aaaaaaaaaaaaaaaa/out/ported_catalog.rs'
+                catalog.parent.mkdir(parents=True)
+                catalog.write_bytes(b'HOST CATALOG PATH FIXTURE\n')
+                selected = {'cache': cache, 'target': catalog.parents[4], 'profile': catalog.parents[3],
+                            'build': catalog.parents[2], 'crate': catalog.parents[1],
+                            'out': catalog.parent, 'catalog': catalog, 'dangling': catalog}[boundary]
+                moved = root / 'retained-original'
+                selected.rename(moved)
+                selected.symlink_to(root / 'absent' if boundary == 'dangling' else moved,
+                                    target_is_directory=moved.is_dir())
+                manifest = {'target': 'x86_64-unknown-none', 'profile': 'release',
+                            'cache': {'effective': str(cache)}}
+                with self.assertRaisesRegex(ValueError, 'symlink'):
+                    subject.generated_catalog_path(manifest)
+
+
 class ProbeReceiptJson(unittest.TestCase):
     @contextlib.contextmanager
     def consumer(self, fixture):
@@ -317,6 +397,22 @@ class CommandBoundaries(unittest.TestCase):
         b"cyxia:/> "
     )
 
+    # Actual capture-v11 span at serial offset 151827: an asynchronous
+    # logging line surrounds the complete echo/response/prompt. Preserve
+    # all 2543 bytes, including the later real EGL diagnostics.
+    ACTUAL_V11 = (
+        b'\x1b[2m2026-11-16T19:31:16.000000Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcosmic_settings_config::shortcuts\x1b[0m\x1b[2m:\x1b[0m shortcuts custom config error: GetKey("custom", Os { code: 2, kind: NotFound, message: "Noposix list\r\n'
+        b'EL0 UserStatus { pid: 1, parent_pid: 0, exit_signal: 0, state: Waiting, code: 0, syscalls: 211, observed_tid: 1, observed_pc: 17224220, observed_sp: 169866904, observed_syscall: 281, space_rebuilds: 305, space_prepare_ns: 216576020, space_retire_ns: 25640170, preemptions: 66, ai_slices: 277, cpu_model: 12290, last_slice_ms: 1, esr: 0, far: 0, free_pages: 48, rank_model: 12289, ai_selections: 276, guard_selections: 1, thread_count: 1, thread_peak: 1, thread_memory_model: 0, thread_admissions: 0, thread_denials: 0, thread_rank_model: 12289, thread_ai_selections: 276, thread_guard_selections: 1, ipc_sent: 0, ipc_received: 0, waits: 6, wakeups: 5, heap_pages: 11, heap_free: 16373, heap_model: 8199, heap_peak: 13, heap_allocations: 10, heap_peak_allocations: 11, heap_largest_free: 16371, image_pages: 629, image_free: 15755 }\r\n'
+        b'EL0 UserStatus { pid: 3, parent_pid: 0, exit_signal: 0, state: Running, code: 0, syscalls: 262, observed_tid: 3, observed_pc: 47236572, observed_sp: 169841336, observed_syscall: 1, space_rebuilds: 452, space_prepare_ns: 4685568610, space_retire_ns: 481881180, preemptions: 174, ai_slices: 436, cpu_model: 12290, last_slice_ms: 1, esr: 0, far: 0, free_pages: 48, rank_model: 12289, ai_selections: 435, guard_selections: 1, thread_count: 3, thread_peak: 3, thread_memory_model: 8193, thread_admissions: 2, thread_denials: 0, thread_rank_model: 12289, thread_ai_selections: 435, thread_guard_selections: 1, ipc_sent: 0, ipc_received: 0, waits: 4, wakeups: 2, heap_pages: 1090, heap_free: 15294, heap_model: 8199, heap_peak: 1100, heap_allocations: 32, heap_peak_allocations: 34, heap_largest_free: 15283, image_pages: 9069, image_free: 7315 }\r\n'
+        b'cyxia:/>  such file or directory" })\n'
+        b'UNIX_ADMISSION AI_DIRECT model=8193 committed=true\n'
+        b'UNIX_ADMISSION AI_DIRECT model=8193 committed=true\n'
+        b'UNIX_ADMISSION AI_DIRECT model=8193 committed=true\n'
+        b'\x1b[2m2026-11-16T19:31:38.000000Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2msmithay::backend::egl::ffi\x1b[0m\x1b[2m:\x1b[0m [EGL] 0x3001 (NOT_INITIALIZED) eglInitialize: DRI2: failed to load driver\n'
+        b'\x1b[2m2026-11-16T19:31:38.000000Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2msmithay::backend::egl::ffi\x1b[0m\x1b[2m:\x1b[0m [EGL] 0x3001 (NOT_INITIALIZED) eglInitialize: DRI2: failed to load driver\n'
+        b'\x1b[2m2026-11-16T19:31:40.000000Z\x1b[0m \x1b[33m WARN\x1b[0m \x1b[2msmithay::backend::egl::display\x1b[0m\x1b[2m:\x1b[0m Dmabuf import extension not available\n'
+    )
+
     @contextlib.contextmanager
     def replay(self, response):
         # Replay recorded bytes through the real Console methods. No guest,
@@ -350,6 +446,27 @@ class CommandBoundaries(unittest.TestCase):
             console.raw.extend(b'cyxia:/> ')
             console.capture_path.write_bytes(console.raw)
             yield console, channel
+
+    def test_actual_interleaved_echo_is_fresh_complete_and_preserves_all_raw_bytes(self):
+        self.assertEqual(len(self.ACTUAL_V11), 2543)
+        self.assertEqual(hashlib.sha256(self.ACTUAL_V11).hexdigest(),
+                         'f86d28c2c333dbcc5a249324cf340cee599920b56efe2568deffa69743f68249')
+        self.assertIn(b'message: "Noposix list\r\n', self.ACTUAL_V11)
+        with self.replay(self.ACTUAL_V11) as (console, channel):
+            rows = subject.active_processes(console, {1, 3}, {1, 3})
+            self.assertEqual(rows[1]['state'], 'Waiting')
+            self.assertEqual(rows[3]['state'], 'Running')
+            self.assertEqual(rows[3]['observed_pc'], 47236572)
+            self.assertEqual(subject.global_arena(rows)['free_pages'], 48)
+            self.assertEqual(channel.sent, [b'posix list\r'])
+            self.assertEqual(console.commands, [{'command': 'posix list', 'serial_offset': 9}])
+            self.assertEqual(bytes(console.raw), b'cyxia:/> ' + self.ACTUAL_V11)
+            self.assertEqual(console.capture_path.read_bytes(), bytes(console.raw))
+        # Complete status rows and a prompt cannot substitute for our exact echo.
+        changed = self.ACTUAL_V11.replace(b'posix list\r\n', b'posix list extra\r\n', 1)
+        with self.replay(changed) as (console, _):
+            with self.assertRaises(TimeoutError):
+                console.command('posix list')
 
     def test_actual_ansi_background_error_does_not_fail_a_successful_command(self):
         with self.replay(self.ACTUAL_V3) as (console, _):

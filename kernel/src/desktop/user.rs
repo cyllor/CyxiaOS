@@ -934,7 +934,13 @@ impl Runner {
                 let _ = vector;
                 self.finish(fs, ledger, ipc, UserState::Fault, 139);
             }
-            Err(_) => self.finish(fs, ledger, ipc, UserState::Fault, 139),
+            Err(error) => {
+                #[cfg(target_arch = "x86_64")]
+                self.thread.context.trace_entry_failure(self.status.pid, self.thread.tid, error);
+                #[cfg(target_arch = "aarch64")]
+                let _ = error;
+                self.finish(fs, ledger, ipc, UserState::Fault, 139);
+            }
         }
         false
     }
@@ -1698,13 +1704,24 @@ impl Runner {
             .status
             .space_prepare_ns
             .saturating_add(now_ns().saturating_sub(started));
+        if let Err(error) = result {
+            process_arch::trace_entry_error("prepare_space", self.status.pid, self.thread.tid,
+                format_args!("errno={error:?}"));
+        }
         result
     }
     fn build_space(&mut self) -> Result<(), Errno> {
-        self.space.begin()?;
+        let pid = self.status.pid;
+        let tid = self.thread.tid;
+        let fail = |stage: &'static str, error: Errno| {
+            process_arch::trace_entry_error(stage, pid, tid, format_args!("errno={error:?}"));
+            error
+        };
+        self.space.begin().map_err(|error| fail("build.begin", error))?;
         #[cfg(feature = "ported")]
         if self.linux {
-            self.executable.publish_space(&mut self.space)?;
+            self.executable.publish_space(&mut self.space)
+                .map_err(|error| fail("build.executable", error))?;
         }
         #[cfg(not(feature = "ported"))]
         let native = true;
@@ -1718,12 +1735,14 @@ impl Runner {
                     virtual_page as u64 * 4096,
                     physical + index as u64 * 4096,
                     if index < 4 { 5 } else { 3 },
-                )?;
+                ).map_err(|error| fail("build.native", error))?;
             }
         }
-        self.heap.publish_space(&mut self.space)?;
+        self.heap.publish_space(&mut self.space)
+            .map_err(|error| fail("build.heap", error))?;
         #[cfg(feature = "ported")]
-        self.shared.publish_space(&mut self.space)?;
+        self.shared.publish_space(&mut self.space)
+            .map_err(|error| fail("build.shared", error))?;
         Ok(())
     }
 }
