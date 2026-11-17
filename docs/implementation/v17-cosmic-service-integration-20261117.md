@@ -1051,6 +1051,14 @@ state or a supported confirmation that the exact old execution context and
 all its tasks have ended. Such recovery would be recorded separately; it
 would not turn this missing cleanup result into a successful build or test.
 
+A later read-only native-terminal check reached the shared workspace but
+observed only nine processes under a different isolated PID namespace, with
+`bwrap` as PID 1 and the same host boot identity. Its empty match list does
+not establish visibility over the old executor or prove that its descendants
+have ended. The recovery review remains negative; its receipt SHA-256 is
+`ccd49744112ee1f90139afc157767c35de416b5c421e962344a0f6c046c22339`.
+The original native owner remains recorded and no new native job was started.
+
 ## Full-session resource capacity: source findings
 
 A separate review checks 53 explicit source files and small retained receipts,
@@ -1141,9 +1149,17 @@ the separation between AI choices and kernel authority:
    completion, drain and revocation. No service receives a permanently
    fixed core allocation. The present three-AP worker ceiling is an existing
    hardware-metadata boundary, not the desired allocation policy.
-5. Supply the genuine selected components, all 16 unique applet executables,
-   desktop entries and assets, then verify the actual default instances,
+5. Supply the genuine selected components, executable entrypoints for all
+   16 applet IDs, desktop entries and assets, then verify the actual instances,
    protocol ownership, rendering, input, restart and global reclamation.
+
+Desktop IDs and independently running instances do not determine the number
+of distinct ELF build products. The retained dependency inventory includes a
+`cosmic-applets` umbrella package and 18 entrypoint ID literals; its actual
+executable, desktop `Exec` and argument-dispatch mapping still requires the
+complete pinned source and build contract. One genuine upstream binary may
+serve multiple entrypoints without merging their independent process
+lifetimes. The pinned upstream packaging and dispatch must be preserved.
 
 These steps are a source-backed implementation plan. No new process, FD,
 memory, CPU or timeout limit is applied by this review. Catalog2 still has
