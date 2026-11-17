@@ -421,3 +421,265 @@ fn runtime_batch_rx_tail_writable_alias_rejects_before_any_range_transition() {
     drop(owner);
     assert!(runtime::zero_eligible(PA, 12288));
 }
+
+// These cases exercise the extracted production core. Only the fixture state
+// setup below is synthetic; no mapping/count/phase algorithm is reimplemented.
+#[test]
+fn runtime_batch_zero_new_removals_keep_phase_and_match_checked_count_changes() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let before = 9 | (4 << 20) | (3 << 40);
+    for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+        for (old, initial, expected) in [
+            (0, before, before),
+            (1, before, 8 | (4 << 20) | (3 << 40)),
+            (3, before, 8 | (3 << 20) | (3 << 40)),
+            (5, before, 8 | (4 << 20) | (2 << 40)),
+            // The original core interprets the three old bits independently;
+            // old high bits do not introduce a new rejection policy here.
+            (7, before, 8 | (3 << 20) | (2 << 40)),
+            (8, before, before),
+            (11, before, 8 | (3 << 20) | (3 << 40)),
+            (13, before, 8 | (4 << 20) | (2 << 40)),
+            (u64::MAX, before, 8 | (3 << 20) | (2 << 40)),
+            (1, 1, 0),
+            (3, 1 | (1 << 20), 0),
+            (5, 1 | (1 << 40), 0),
+        ] {
+            runtime::phase(PA, phase);
+            runtime::set_count(PA, initial);
+            let owner = runtime::begin();
+            assert_eq!(owner, 1);
+            assert!(runtime::change(owner, PA, old, 0));
+            assert_eq!(runtime::count(PA), expected, "phase {phase:?}, old {old:#x}");
+            assert_eq!(runtime::current_phase(PA), phase);
+            assert_eq!(runtime::operations(), (0, 0));
+            assert!(runtime::gate());
+            assert_eq!(runtime::owner(), owner);
+            assert!(runtime::end(owner));
+        }
+    }
+}
+
+#[test]
+fn runtime_batch_zero_new_underflow_preserves_the_entire_packed_counter() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+        // Fault-injected component deficits isolate the first, second and
+        // third checked_sub. Upper bits also expose any premature store.
+        for (old, before) in [
+            (1, (0x9u64 << 60) | (2 << 20) | (3 << 40)),
+            (3, (0x9u64 << 60) | 2 | (3 << 40)),
+            (5, (0x9u64 << 60) | 2 | (3 << 20)),
+        ] {
+            runtime::phase(PA, phase);
+            runtime::set_count(PA, before);
+            let owner = runtime::begin();
+            assert_eq!(owner, 1);
+            assert!(!runtime::change(owner, PA, old, 0));
+            assert_eq!(runtime::count(PA), before, "phase {phase:?}, old {old:#x}");
+            assert_eq!(runtime::current_phase(PA), phase);
+            assert_eq!(runtime::operations(), (0, 0));
+            assert!(runtime::gate());
+            assert_eq!(runtime::owner(), owner);
+            assert!(runtime::end(owner));
+        }
+    }
+}
+
+#[test]
+fn runtime_batch_zero_new_physical_boundaries_preserve_the_original_core_contract() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    // Physical zero remains valid for this core, independently of any
+    // higher-level range policy. The last RAM page has real phase/count storage.
+    for physical in [0, runtime::RAM - 4096] {
+        let saved_phase = runtime::current_phase(physical);
+        runtime::phase(physical, Phase::Transition);
+        runtime::set_count(physical, 1 | (1 << 40));
+        let owner = runtime::begin();
+        assert_eq!(owner, 1);
+        assert!(runtime::change(owner, physical, 5, 0));
+        assert_eq!(runtime::count(physical), 0);
+        assert_eq!(runtime::current_phase(physical), Phase::Transition);
+        assert!(runtime::end(owner));
+        // reset() models the first 8192 pages; restore the tail explicitly.
+        runtime::phase(physical, saved_phase);
+    }
+    runtime::phase(PA, Phase::Transition);
+    let before = 1 | (1 << 20);
+    runtime::set_count(PA, before);
+    let owner = runtime::begin();
+    assert_eq!(owner, 1);
+    for physical in [1, 4095, PA + 1, runtime::RAM - 1, runtime::RAM,
+                     runtime::RAM + 4096, u64::MAX - 4095, u64::MAX] {
+        assert!(!runtime::change(owner, physical, 3, 0), "physical {physical:#x}");
+        assert_eq!(runtime::count(PA), before);
+        assert_eq!(runtime::count(0), 0);
+        assert_eq!(runtime::count(runtime::RAM - 4096), 0);
+        assert!(runtime::gate());
+        assert_eq!(runtime::owner(), owner);
+    }
+    assert_eq!(runtime::operations(), (0, 0));
+    assert!(runtime::end(owner));
+}
+
+#[test]
+fn runtime_batch_zero_new_wrong_or_inactive_owner_cannot_mutate_or_release() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    runtime::phase(PA, Phase::Transition);
+    let before = 1 | (1 << 20);
+    runtime::set_count(PA, before);
+    for token in [0, 1, 2, 5, u64::MAX] {
+        assert!(!runtime::change(token, PA, 3, 0));
+        assert!(!runtime::end(token));
+        assert_eq!(runtime::count(PA), before);
+        assert!(!runtime::gate());
+        assert_eq!(runtime::owner(), 0);
+    }
+    let owner = runtime::begin();
+    assert_eq!(owner, 1);
+    for token in [0, 2, 5, u64::MAX] {
+        assert!(!runtime::change(token, PA, 3, 0));
+        assert!(!runtime::end(token));
+        assert_eq!(runtime::count(PA), before);
+        assert!(runtime::gate());
+        assert_eq!(runtime::owner(), owner);
+    }
+    for cpu in [1, 3, 4] {
+        runtime::set_cpu(cpu);
+        assert!(!runtime::change(owner, PA, 3, 0));
+        assert!(!runtime::end(owner));
+        assert_eq!(runtime::begin(), 0);
+        assert_eq!(runtime::count(PA), before);
+        assert!(runtime::gate());
+        assert_eq!(runtime::owner(), owner);
+    }
+    runtime::set_cpu(0);
+    assert!(runtime::end(owner));
+    assert!(!runtime::change(owner, PA, 3, 0));
+    assert!(!runtime::end(owner));
+    assert_eq!(runtime::count(PA), before);
+    assert!(!runtime::gate());
+    assert_eq!(runtime::owner(), 0);
+    // CPU owner values are not nonces. This tests stale calls with no live
+    // lease, and does not assert replay rejection across a later same-CPU lease.
+    let successor = runtime::begin();
+    assert_eq!(successor, owner);
+    assert!(runtime::change(successor, PA, 3, 0));
+    assert_eq!(runtime::count(PA), 0);
+    assert!(runtime::end(successor));
+    assert_eq!(runtime::locks(), (2, 2));
+}
+
+#[test]
+fn runtime_batch_nonzero_flags_and_each_overflow_keep_the_original_rejection_path() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let before = 9 | (4 << 20) | (3 << 40);
+    for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+        runtime::phase(PA, phase);
+        runtime::set_count(PA, before);
+        let owner = runtime::begin();
+        assert_eq!(owner, 1);
+        for new in [2, 4, 6, 7, 8, 9, 11, 13, u64::MAX] {
+            assert!(!runtime::change(owner, PA, 0, new), "phase {phase:?}, new {new:#x}");
+            assert_eq!(runtime::count(PA), before);
+            assert_eq!(runtime::current_phase(PA), phase);
+        }
+        assert!(runtime::end(owner));
+    }
+    // Synthetic inconsistent counters isolate overflow after each preceding
+    // component has succeeded. No partial packed value may be committed.
+    for (phase, new, before) in [
+        (Phase::StableWritable, 1, 0xfffff | (3 << 20) | (2 << 40)),
+        (Phase::StableWritable, 3, 7 | (0xfffff << 20) | (2 << 40)),
+        (Phase::StableSealed, 5, 7 | (2 << 20) | (0xfffff << 40)),
+    ] {
+        runtime::phase(PA, phase);
+        runtime::set_count(PA, before);
+        let owner = runtime::begin();
+        assert_eq!(owner, 1);
+        assert!(!runtime::change(owner, PA, 0, new));
+        assert_eq!(runtime::count(PA), before);
+        assert_eq!(runtime::current_phase(PA), phase);
+        assert!(runtime::gate());
+        assert_eq!(runtime::owner(), owner);
+        assert!(runtime::end(owner));
+    }
+    assert_eq!(runtime::operations(), (0, 0));
+}
+
+#[test]
+fn runtime_batch_phase_coverage_matches_get_for_zero_one_and_two_words() {
+    use crate::code_permissions::PhaseTable;
+    fn check<const WORDS: usize>(table: PhaseTable<WORDS>, cases: &[(usize, bool)]) {
+        for &(page, covered) in cases {
+            assert_eq!(table.contains_page(page), covered, "words {WORDS}, page {page}");
+            assert_eq!(table.get(page).is_some(), covered);
+            if covered {
+                for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+                    table.set(page, phase).unwrap();
+                    assert!(table.contains_page(page));
+                    assert_eq!(table.get(page), Some(phase));
+                }
+            } else {
+                assert_eq!(table.set(page, Phase::StableSealed), Err(Error::Address));
+                assert_eq!(table.get(page), None);
+            }
+        }
+    }
+    check(PhaseTable::<0>::new(), &[
+        (0, false), (1, false), (31, false), (32, false),
+        (63, false), (64, false), (usize::MAX, false),
+    ]);
+    check(PhaseTable::<1>::new(), &[
+        (0, true), (1, true), (30, true), (31, true),
+        (32, false), (33, false), (usize::MAX, false),
+    ]);
+    check(PhaseTable::<2>::new(), &[
+        (0, true), (31, true), (32, true), (63, true),
+        (64, false), (65, false), (usize::MAX, false),
+    ]);
+}
+
+#[test]
+fn runtime_batch_single_removal_releases_its_guard_without_clearing_a_batch_owner() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+        runtime::phase(PA, phase);
+        runtime::set_count(PA, 1 | (1 << 20));
+        let (acquires, releases) = runtime::locks();
+        assert!(runtime::single_change(PA, 3, 0));
+        assert_eq!(runtime::count(PA), 0);
+        assert_eq!(runtime::current_phase(PA), phase);
+        assert_eq!(runtime::locks(), (acquires + 1, releases + 1));
+        assert!(!runtime::gate());
+        assert_eq!(runtime::owner(), 0);
+    }
+    for (physical, old, new, before) in [
+        (PA, 3, 0, 0),
+        (PA + 1, 3, 0, 1 | (1 << 20)),
+        (runtime::RAM, 3, 0, 1 | (1 << 20)),
+        (PA, 3, 8, 1 | (1 << 20)),
+    ] {
+        runtime::set_count(PA, before);
+        let (acquires, releases) = runtime::locks();
+        assert!(!runtime::single_change(physical, old, new));
+        assert_eq!(runtime::count(PA), before);
+        assert_eq!(runtime::locks(), (acquires + 1, releases + 1));
+        assert!(!runtime::gate());
+        assert_eq!(runtime::owner(), 0);
+    }
+    let before = 1 | (1 << 20);
+    runtime::set_count(PA, before);
+    let owner = runtime::begin();
+    assert_eq!(owner, 1);
+    let locks = runtime::locks();
+    assert!(!runtime::single_change(PA, 3, 0));
+    assert_eq!(runtime::locks(), locks);
+    assert_eq!(runtime::count(PA), before);
+    assert!(runtime::gate());
+    assert_eq!(runtime::owner(), owner);
+    assert!(runtime::change(owner, PA, 3, 0));
+    assert_eq!(runtime::count(PA), 0);
+    assert!(runtime::end(owner));
+    assert_eq!(runtime::operations(), (0, 0));
+}

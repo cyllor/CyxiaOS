@@ -10,7 +10,7 @@ PTE/TLB effects are fixtures. RX pre-publication executes the actual production
 wrapper and permission transaction. This is not a guest, TLB/IPI test, or proof
 of hardware retirement completion.
 
-The seventeen cases check real alias changes, prefixes, failures, ownership and
+The twenty-four cases check real alias changes, prefixes, failures, ownership and
 RX ranges through actual publish_code and permission transaction functions. The
 atomic gate fixture forwards operations to a real std::AtomicBool and only adds
 observations. A wrong CPU or failed guard cannot clear another owner's gate.
@@ -200,7 +200,7 @@ class PageMapBatchTransactions(unittest.TestCase):
             # The helper's nine embedded tests are covered by its own suite.
             ran, output = bounded([str(binary), "runtime_batch_", "--test-threads=1"], environment)
             self.assertEqual(ran, 0, output)
-            self.assertIn("17 passed; 0 failed", output)
+            self.assertIn("24 passed; 0 failed", output)
 
 
 if __name__ == "__main__":

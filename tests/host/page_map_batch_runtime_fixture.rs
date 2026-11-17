@@ -69,6 +69,9 @@ pub fn force_gate(value: bool) { ALIAS_GATE.0.store(value, Ordering::Release); }
 pub fn gate() -> bool { ALIAS_GATE.0.load(Ordering::Acquire) }
 pub fn owner() -> u64 { ALIAS_BATCH_OWNER.load(Ordering::Acquire) }
 pub fn set_cpu(cpu: usize) { CPU.store(cpu as u64, Ordering::Release); }
+pub fn single_change(physical: u64, old: u64, new: u64) -> bool {
+    x86_runtime_mapping_change(physical, old, new)
+}
 pub fn begin() -> u64 { x86_runtime_mapping_batch_begin() }
 pub fn change(owner: u64, physical: u64, old: u64, new: u64) -> bool {
     x86_runtime_mapping_batch_change(owner, physical, old, new)

@@ -720,11 +720,18 @@ fn mapping_change_locked(physical: u64, old: u64, new: u64) -> bool {
     if physical >= RAM || physical % 4096 != 0 {
         return false;
     }
-    let Some(phase) = code_phase(physical) else {
-        return false;
-    };
-    if !phase.permits_mapping(new) {
-        return false;
+    if new == 0 {
+        // Removal ignores phase state, but must retain its coverage check.
+        if !CODE_PHASES.contains_page((physical / 4096) as usize) {
+            return false;
+        }
+    } else {
+        let Some(phase) = code_phase(physical) else {
+            return false;
+        };
+        if !phase.permits_mapping(new) {
+            return false;
+        }
     }
     let counter = &USER_ALIASES[(physical / 4096) as usize];
     let value = counter.load(Ordering::Acquire);

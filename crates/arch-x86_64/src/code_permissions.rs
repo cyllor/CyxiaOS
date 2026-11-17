@@ -42,6 +42,10 @@ impl<const WORDS: usize> PhaseTable<WORDS> {
     pub const fn new() -> Self {
         Self { words: [const { AtomicU64::new(0) }; WORDS] }
     }
+    /// Whether this page has phase storage, without reading its current phase.
+    pub const fn contains_page(&self, page: usize) -> bool {
+        page / 32 < self.words.len()
+    }
     pub fn get(&self, page: usize) -> Option<Phase> {
         let word = self.words.get(page / 32)?.load(Ordering::Acquire);
         Some(match (word >> (page % 32 * 2)) & 3 {
