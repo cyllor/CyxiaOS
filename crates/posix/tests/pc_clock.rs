@@ -15,6 +15,10 @@ struct Device {
     registers: [u8; 128],
     selected: u8,
     reads: usize,
+    busy_reads: usize,
+    elapsed_ns: u64,
+    tick_ns: u64,
+    clock_calls: usize,
     cpu: usize,
     log: Vec<u8>,
 }
@@ -30,7 +34,8 @@ impl Device {
         ] {
             registers[register] = value;
         }
-        Self { registers, selected: 0, reads: 0, cpu: 0, log: Vec::new() }
+        Self { registers, selected: 0, reads: 0, busy_reads: 0,
+            elapsed_ns: 0, tick_ns: 10_000, clock_calls: 0, cpu: 0, log: Vec::new() }
     }
 }
 
@@ -56,6 +61,10 @@ pub mod io {
         DEVICE.with(|device| {
             let mut device = device.borrow_mut();
             device.reads += 1;
+            if device.selected == 10 && device.busy_reads != 0 {
+                device.busy_reads -= 1;
+                return device.registers[10] | 0x80;
+            }
             device.registers[usize::from(device.selected)]
         })
     }
@@ -66,6 +75,18 @@ pub mod machine {
         pub fn cpu_slot() -> usize {
             crate::DEVICE.with(|device| device.borrow().cpu)
         }
+    }
+}
+
+pub mod process_arch {
+    pub fn now_ns() -> u64 {
+        crate::DEVICE.with(|device| {
+            let mut device = device.borrow_mut();
+            device.clock_calls += 1;
+            let time = device.elapsed_ns;
+            device.elapsed_ns = device.elapsed_ns.saturating_add(device.tick_ns);
+            time
+        })
     }
 }
 
@@ -124,4 +145,64 @@ fn secondary_cpus_never_access_cmos() {
     });
     assert_eq!(clock::realtime_seconds(), Err(Errno::Again));
     DEVICE.with(|device| assert_eq!(device.borrow().reads, 0));
+}
+
+#[test]
+fn transient_update_returns_a_fresh_sample_without_exposing_eagain() {
+    clock::init();
+    DEVICE.with(|device| {
+        let mut device = device.borrow_mut();
+        device.registers[0] = 0x57;
+        device.busy_reads = 16;
+    });
+    // The first low-level sampling attempt sees UIP throughout. The next
+    // attempt sees a valid, changed RTC value, never the boot-time value.
+    assert_eq!(clock::realtime_seconds(), Ok(TIME + 1));
+}
+
+#[test]
+fn a_stopped_retry_timer_and_busy_rtc_still_return_in_bounded_work() {
+    clock::init();
+    DEVICE.with(|device| {
+        let mut device = device.borrow_mut();
+        device.registers[10] |= 0x80;
+        device.tick_ns = 0;
+        device.reads = 0;
+    });
+    assert_eq!(clock::realtime_seconds(), Err(Errno::Again));
+    DEVICE.with(|device| assert!(device.borrow().reads <= 40_000));
+}
+
+#[test]
+fn valid_samples_do_not_read_the_retry_timer() {
+    clock::init();
+    assert_eq!(clock::realtime_seconds(), Ok(TIME));
+    DEVICE.with(|device| assert_eq!(device.borrow().clock_calls, 0));
+}
+
+#[test]
+fn a_progressing_timer_stops_busy_retries_at_the_deadline() {
+    clock::init();
+    DEVICE.with(|device| {
+        let mut device = device.borrow_mut();
+        device.registers[10] |= 0x80;
+        device.reads = 0;
+    });
+    assert_eq!(clock::realtime_seconds(), Err(Errno::Again));
+    DEVICE.with(|device| {
+        let device = device.borrow();
+        assert!(device.clock_calls <= 102);
+        assert!(device.reads <= 3300);
+    });
+}
+
+#[test]
+fn an_invalid_fresh_sample_after_busy_keeps_its_hardware_error() {
+    clock::init();
+    DEVICE.with(|device| {
+        let mut device = device.borrow_mut();
+        device.busy_reads = 16;
+        device.registers[0] = 0x5a;
+    });
+    assert_eq!(clock::realtime_seconds(), Err(Errno::Io));
 }

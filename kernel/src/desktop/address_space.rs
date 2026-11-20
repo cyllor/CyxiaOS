@@ -122,6 +122,25 @@ impl PageTable {
         })
     }
     #[cfg(target_arch = "x86_64")]
+    fn contiguous_mapping(&self) -> Option<(usize, u64, u8, usize)> {
+        let mut indices = Self::indices(&self.present);
+        let start = indices.next()?;
+        let first = self.pages[start];
+        let mut previous = first & !7;
+        let mut end = start + 1;
+        for index in indices {
+            let page = self.pages[index];
+            if index != end || page & 7 != first & 7
+                || previous.checked_add(4096) != Some(page & !7)
+            {
+                return None;
+            }
+            previous = page & !7;
+            end += 1;
+        }
+        Some((start, first & !7, (first & 7) as u8, end - start))
+    }
+    #[cfg(target_arch = "x86_64")]
     pub fn publish(&self, space: &mut ProcessSpace, base: u64) -> Result<(), Errno> {
         if self.present.iter().all(|&word| word == 0) {
             return Ok(());
@@ -130,6 +149,13 @@ impl PageTable {
         // the mapping batch takes that gate; failed seals retain their phase.
         for (physical, bytes) in self.executable_runs() {
             crate::process_arch::publish_code(crate::HIGH + physical, bytes)?;
+        }
+        if let Some((start, physical, protection, pages)) = self.contiguous_mapping()
+            && let Some(address) = base.checked_add(start as u64 * 4096)
+            && address.checked_add((pages as u64 - 1) * 4096)
+                .is_some_and(|last| last >> 21 == address >> 21)
+        {
+            return space.map_table_run(address, physical, protection, pages);
         }
         space.map_pages(Self::indices(&self.present).map(|index| {
             let page = self.pages[index];
@@ -255,6 +281,19 @@ impl ProcessSpace {
             ));
             Errno::Io
         })
+    }
+    /// Trusted staged metadata only; executable pages must be sealed first.
+    pub fn map_table_run(&mut self, address: u64, physical: u64, protection: u8, pages: usize) -> Result<(), Errno> {
+        let pid = self.pid;
+        self.current.as_mut().ok_or(Errno::Nodev)?
+            .map_table_run(address, physical, cyxia_arch_x86_64::space::UserPermissions {
+                writable: protection & 2 != 0,
+                executable: protection & 4 != 0,
+            }, pages).map_err(|error| {
+                crate::process_arch::trace_entry_error("map_table_run", pid, 0,
+                    format_args!("error={error:?} va={address:#x} pa={physical:#x} pages={pages}"));
+                Errno::Io
+            })
     }
     /// Trusted staged metadata only; executable pages must be sealed first.
     pub fn map_pages(&mut self, pages: impl IntoIterator<Item = (u64, u64, u8)>) -> Result<(), Errno> {

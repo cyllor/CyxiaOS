@@ -92,11 +92,32 @@ class Console:
         self.until(rb'pid=' + pid + rb' ' + state.encode() + rb' code=' + str(code).encode() + rb'\b', start)
         return start
 
+def preemption_check(console):
+    # The finite register loop can finish within one quantum on a fast host.
+    # Keep its register check, and observe timer preemption on a separate task
+    # that cannot yield or exit by itself. Never accept another PID's counter.
+    at = console.command('posix spawn spin')
+    pid = console.until(rb'pid=(\d+) started;', at).group(1)
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            at = console.command('posix status')
+            match = re.search(rb'UserStatus \{ pid: ' + pid
+                              + rb',[^\r\n]*?preemptions: ([1-9]\d*)\b', console.raw[at:])
+            if match:
+                if time.monotonic() > deadline:
+                    break
+                return dict(pid=int(pid), preemptions=int(match[1]), source='syscall-free spin')
+            time.sleep(.01)
+        raise TimeoutError('own syscall-free task did not show timer preemption within 5 seconds')
+    finally:
+        console.command('posix kill ' + pid.decode(), [rb'pid=' + pid + rb' killed; pages reclaimed'])
+
+
 def native_checks(console):
     console.program('posix run demo', b'C program: PASS')
     console.program('posix run preempt', b'REGISTERS PASS')
-    at = console.command('posix status')
-    console.until(rb'preemptions: [1-9]\d*', at)
+    preemption = preemption_check(console)
     for mode in ('fault', 'readonly', 'execdata', 'kernel', 'guard'):
         console.program('posix run ' + mode, state='Fault', code=139)
     console.program('posix spawn fpu', b'NATIVE_FP_TLS_PASS')
@@ -105,6 +126,7 @@ def native_checks(console):
     console.until(rb'IPC pair server=(\d+) client=(\d+)', at)
     pair = re.search(rb'IPC pair server=(\d+) client=(\d+)', console.raw[at:])
     for pid in pair.groups(): console.until(rb'pid=' + pid + rb' Exited code=0\b', at)
+    return preemption
 
 def ported_checks(console):
     for name, marker in [('probe', b'PORTED_PROBE PASS'),
@@ -612,7 +634,8 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                     console.command('mkdir /v17')
                     console.command('write /v17/hello x86-os-persistence')
                 console.command('cat /v17/hello', [rb'^x86-os-persistence\r?$'])
-                if scenario in ('native', 'ported', 'parallel'): native_checks(console)
+                if scenario in ('native', 'ported', 'parallel'):
+                    result['native_preemption'] = native_checks(console)
                 if scenario in ('ported', 'parallel'): ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)

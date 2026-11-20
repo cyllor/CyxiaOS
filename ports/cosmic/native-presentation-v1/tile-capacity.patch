@@ -1,0 +1,13 @@
+--- a/src/backend/cyxia/native/presentation.rs
++++ b/src/backend/cyxia/native/presentation.rs
+@@ -45,7 +45,9 @@
+ impl PendingPresentation {
+     pub fn new(info: DisplayInfo, flipped: bool) -> io::Result<Self> {
+         validate_info(info)?;
+-        let capacity = (info.max_rect_bytes as usize).min(16384);
++        // validate_info bounds this to the existing 64 KiB ABI maximum.
++        // Use that advertised byte capacity instead of limiting it to 16 KiB.
++        let capacity = info.max_rect_bytes as usize;
+         let mut tile = Vec::new();
+         tile.try_reserve_exact(capacity)
+             .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "native tile allocation"))?;

@@ -302,6 +302,74 @@ impl<'a> AddressSpace<'a> {
         }
         Ok(())
     }
+    /// Publish a fixed contiguous run within one leaf table. Unlike map_pages,
+    /// this accepts no caller iterator: validation cannot invoke other services
+    /// or unwind between deferred alias updates and leaf publication.
+    pub fn map_table_run(
+        &mut self,
+        address: u64,
+        physical: u64,
+        permissions: UserPermissions,
+        pages: usize,
+    ) -> Result<(), Error> {
+        if pages == 0 {
+            return Ok(());
+        }
+        if self.resident_cpus() != 0 {
+            return Err(Error::Active);
+        }
+        if pages > 512 || address.checked_add((pages as u64 - 1) * PAGE_BYTES)
+            .is_none_or(|last| last >> 21 != address >> 21)
+        {
+            return Err(Error::Address);
+        }
+        self.validate_mapping(address, physical, permissions)?;
+        let aliases = MappingBatch::acquire()?;
+        let mut publication = MappingPublication { epoch: &self.epoch, published: 0, aliases };
+        let mut table = self.arena.table(self.root)?;
+        for shift in [39, 30, 21] {
+            let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
+            let mut value = unsafe { entry.read_volatile() };
+            if value & P == 0 {
+                let child = self.arena.allocate()?;
+                value = child | P | W | U;
+                unsafe { entry.write_volatile(value) };
+            }
+            if value & (1 << 7) != 0 {
+                return Err(Error::Conflict);
+            }
+            table = self.arena.table(value & MASK)?;
+        }
+        let leaf = unsafe { table.add(((address >> 12) & 511) as usize) };
+        let mut valid = 0;
+        let mut error = None;
+        for index in 0..pages {
+            let offset = index as u64 * PAGE_BYTES;
+            let result = physical.checked_add(offset).ok_or(Error::Address)
+                .and_then(|page| self.validate_mapping(address + offset, page, permissions));
+            if let Err(failure) = result {
+                error = Some(failure);
+                break;
+            }
+            if unsafe { leaf.add(index).read_volatile() } & P != 0 {
+                error = Some(Error::Conflict);
+                break;
+            }
+            valid += 1;
+        }
+        let changed = publication.aliases.change_run(physical, None, Some(permissions), valid);
+        for index in 0..changed {
+            let value = physical + index as u64 * PAGE_BYTES | P | U
+                | if permissions.writable { W } else { 0 }
+                | if permissions.executable { 0 } else { NX };
+            unsafe { leaf.add(index).write_volatile(value) };
+        }
+        publication.published = changed as u64;
+        if changed != valid {
+            return Err(Error::Permissions);
+        }
+        error.map_or(Ok(()), Err)
+    }
     pub fn translate(&self, address: u64) -> Option<Translation> {
         if address >= 0x0000_8000_0000_0000 {
             return None;
@@ -432,6 +500,25 @@ impl MappingBatch {
         let owner = 0;
         Ok(Self { owner, _same_cpu: PhantomData })
     }
+    fn change_run(&self, physical: u64, old: Option<UserPermissions>,
+                  new: Option<UserPermissions>, pages: usize) -> usize {
+        if pages == 0 { return 0; }
+        #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
+        {
+            unsafe extern "C" {
+                fn x86_runtime_mapping_batch_run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64;
+            }
+            let flags = |p: Option<UserPermissions>| {
+                p.map_or(0, |p| 1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2)
+            };
+            let changed = unsafe { x86_runtime_mapping_batch_run(
+                self.owner, physical, pages as u64, flags(old), flags(new)) } as usize;
+            assert!(changed <= pages, "invalid alias prefix; retain backing");
+            changed
+        }
+        #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
+        { let _ = (physical, old, new); pages }
+    }
     #[inline(always)]
     fn change(
         &self,
@@ -494,7 +581,40 @@ impl Drop for AddressSpace<'_> {
         let aliases = MappingBatch::acquire().expect("retiring mappings requires alias custody");
         fn retire(space: &AddressSpace<'_>, aliases: &MappingBatch, physical: u64, level: u8, entries: usize) {
             let table = space.arena.table(physical).expect("invalid retiring table; retain backing");
-            for index in 0..entries {
+            let mut first = 0;
+            if level == 1 {
+                // Batch only the first present contiguous run. Fragmented tails
+                // keep the scalar walk, without a second lookahead per page.
+                while first < entries {
+                    let value = unsafe { table.add(first).read_volatile() };
+                    if value & P == 0 {
+                        first += 1;
+                        continue;
+                    }
+                    let physical = value & MASK;
+                    assert!(physical < space.ram_bytes, "invalid retiring frame; retain backing");
+                    let mut end = first + 1;
+                    while end < entries {
+                        let next = unsafe { table.add(end).read_volatile() };
+                        if next & (P | W | NX) != value & (P | W | NX)
+                            || next & MASK != physical + (end - first) as u64 * PAGE_BYTES
+                            || next & MASK >= space.ram_bytes
+                        {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if end - first > 1 {
+                        let changed = aliases.change_run(physical,
+                            Some(UserPermissions { writable: value & W != 0, executable: value & NX == 0 }),
+                            None, end - first);
+                        assert_eq!(changed, end - first, "retiring alias count failed; retain backing");
+                        first = end;
+                    }
+                    break;
+                }
+            }
+            for index in first..entries {
                 let value = unsafe { table.add(index).read_volatile() };
                 if value & P == 0 {
                     continue;

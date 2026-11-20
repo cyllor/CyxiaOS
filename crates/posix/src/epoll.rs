@@ -4,6 +4,7 @@
 //! notifications and readiness transitions, not repeated scans of a ready FD.
 use super::{Description, Errno, O_CLOEXEC, O_RDWR, OPEN_MAX, Object, Process};
 mod nesting;
+pub(crate) use nesting::Topology;
 
 pub const INSTANCES: usize = super::limits::PROFILE.epolls_per_owner;
 pub const IN: u32 = 1;
@@ -232,6 +233,7 @@ impl Process<'_> {
             owner: self.owner,
             ..Instance::EMPTY
         };
+        self.objects.inner.borrow().epoll_topology.set(None);
         self.fds[fd] = Some(description);
         self.cloexec[fd] = flags & O_CLOEXEC != 0;
         Ok(fd as i32)
@@ -291,6 +293,9 @@ impl Process<'_> {
                 observed: 0,
             })
         };
+        if matches!(target, Object::Epoll(_)) && op != 3 {
+            table.epoll_topology.set(None);
+        }
         table.propagate_nested([false; super::open_description::EPOLLS]);
         Ok(())
     }
@@ -422,6 +427,7 @@ impl Process<'_> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use cyxia_ai_fs::FileSystem;
 
@@ -430,6 +436,86 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
             Ok(bytes.len())
         }
+    }
+
+    #[test]
+    fn unchanged_epoll_graph_has_bounded_sampling_work() {
+        // Same public sampling / backend notification / collection chain used
+        // by the guest event loop, with unrelated owners sharing the OFD pool.
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut other = Process::new(&objects, 2).unwrap();
+        let event = p.eventfd(1, 0).unwrap();
+        let unrelated = other.eventfd(1, 0).unwrap();
+        let mut root = -1;
+        for _ in 0..2 {
+            let ep = p.epoll_create(0).unwrap();
+            root = ep;
+            p.epoll_ctl(ep, 1, event, Event { events: IN, data: 42 }).unwrap();
+            let ep = other.epoll_create(0).unwrap();
+            other.epoll_ctl(ep, 1, unrelated, Event { events: IN, data: 99 }).unwrap();
+        }
+        let sample = |source| match source {
+            Source::Local { read, write } => Ok(u32::from(read) * IN | u32::from(write) * OUT),
+            _ => panic!("unexpected backend"),
+        };
+        p.epoll_sample(root, sample).unwrap();
+        {
+            let table = objects.inner.borrow();
+            table.topology_builds.set(0);
+            table.nested_lookups.set(0);
+        }
+        let started = std::time::Instant::now();
+        const ROUNDS: usize = 5000;
+        for _ in 0..ROUNDS {
+            let readiness = p.epoll_sample(root, sample).unwrap();
+            objects.observe_backend(|source| Some((sample(source).unwrap(), 0)));
+            let mut events = [Event::default(); 1];
+            assert_eq!(p.epoll_collect(root, &readiness, &mut events), Ok(1));
+            assert_eq!(events[0], Event { events: IN, data: 42 });
+        }
+        let table = objects.inner.borrow();
+        std::println!("EPOLL_STABLE_GRAPH rounds={ROUNDS} elapsed_ns={} graph_builds={} nested_lookups={}",
+            started.elapsed().as_nanos(), table.topology_builds.get(), table.nested_lookups.get());
+        assert!(table.topology_builds.get() <= 1, "unchanged graph was rebuilt on readiness sampling");
+        assert!(table.nested_lookups.get() <= ROUNDS * 4,
+            "flat epolls rescanned unrelated watches for nested propagation");
+    }
+
+    #[test]
+    fn warmed_graph_tracks_nested_changes_last_close_and_reuse() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        let fd = p.eventfd(1, 0).unwrap();
+        p.epoll_ctl(inner, 1, fd, Event { events: IN, data: 11 }).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 22 }).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 22);
+        p.epoll_ctl(outer, 2, inner, Event::default()).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 33 }).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 33);
+        // Closing an FD does not retire its aliased open description.
+        let alias = p.dup(inner).unwrap();
+        p.close(&mut fs, inner).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 33);
+        p.close(&mut fs, alias).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        let replacement = p.epoll_create(0).unwrap();
+        assert_eq!(replacement, inner);
+        p.epoll_ctl(replacement, 1, fd, Event { events: IN, data: 44 }).unwrap();
+        // The recycled slot must not remain reachable through an old edge.
+        p.epoll_sample(outer, |_| panic!("sampled retired epoll descendant")).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        p.epoll_ctl(outer, 1, replacement, Event { events: IN, data: 55 }).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 55);
+        assert_eq!(p.epoll_ctl(replacement, 1, outer, Event::default()), Err(Errno::Loop));
+        assert_eq!(ready(&mut p, outer, 1)[0].data, 55);
+        p.close_all(&mut fs).unwrap();
+        assert_eq!(objects.snapshot().live, 0);
     }
 
     #[test]

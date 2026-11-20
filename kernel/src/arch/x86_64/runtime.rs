@@ -776,6 +776,23 @@ fn mapping_batch_owned(owner: u64) -> bool {
 extern "C" fn x86_runtime_mapping_batch_change(owner: u64, physical: u64, old: u64, new: u64) -> bool {
     mapping_batch_owned(owner) && mapping_change_locked(physical, old, new)
 }
+/// One pinned caller, one already-held alias lease, at most one leaf table.
+/// Every page retains the same phase/count checks and successful-prefix rule.
+#[unsafe(no_mangle)]
+extern "C" fn x86_runtime_mapping_batch_run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
+    if pages == 0 || pages > 512 || !mapping_batch_owned(owner) {
+        return 0;
+    }
+    let mut changed = 0;
+    for index in 0..pages {
+        let Some(page) = physical.checked_add(index * 4096) else { break };
+        if !mapping_change_locked(page, old, new) {
+            break;
+        }
+        changed += 1;
+    }
+    changed
+}
 #[unsafe(no_mangle)]
 extern "C" fn x86_runtime_mapping_batch_end(owner: u64) -> bool {
     if !mapping_batch_owned(owner) {

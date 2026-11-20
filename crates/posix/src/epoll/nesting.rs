@@ -5,7 +5,8 @@ use crate::open_description::{EPOLLS, Handle, Table};
 // Linux permits five epoll instances in a path (four nesting edges).
 const MAX_DEPTH: usize = 5;
 
-pub(super) struct Topology {
+#[derive(Clone, Copy)]
+pub(crate) struct Topology {
     pub(super) order: [usize; EPOLLS],
     pub(super) count: usize,
     children: [usize; EPOLLS],
@@ -24,6 +25,8 @@ impl Topology {
 
 impl Table {
     fn nested_index(&self, handle: Handle) -> Option<usize> {
+        #[cfg(test)]
+        self.nested_lookups.set(self.nested_lookups.get() + 1);
         match self.entry(handle).ok()?.value?.object {
             Object::Epoll(index) => Some(index),
             _ => None,
@@ -34,6 +37,16 @@ impl Table {
         &self,
         extra: Option<(usize, usize)>,
     ) -> Result<Topology, Errno> {
+        // Readiness, EDGE delivery and ONESHOT disarming do not change graph
+        // edges. Keep their hot path independent of unrelated owners' watches.
+        // A proposed ADD is validated separately and must never enter the cache.
+        if extra.is_none()
+            && let Some(topology) = self.epoll_topology.get()
+        {
+            return Ok(topology);
+        }
+        #[cfg(test)]
+        self.topology_builds.set(self.topology_builds.get() + 1);
         let mut topology = Topology {
             order: [0; EPOLLS],
             count: 0,
@@ -86,6 +99,9 @@ impl Table {
         if topology.count != self.epolls.iter().filter(|e| e.used).count() {
             return Err(Errno::Loop);
         }
+        if extra.is_none() {
+            self.epoll_topology.set(Some(topology));
+        }
         Ok(topology)
     }
 
@@ -113,6 +129,9 @@ impl Table {
     pub(crate) fn propagate_nested(&mut self, mut wakes: [bool; EPOLLS]) {
         let topology = self.epoll_topology(None).expect("validated epoll graph");
         for &index in &topology.order[..topology.count] {
+            if topology.children[index] == 0 {
+                continue;
+            }
             for slot in 0..OPEN_MAX {
                 let Some(watch) = self.epolls[index].watches[slot] else {
                     continue;

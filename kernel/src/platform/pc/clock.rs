@@ -24,7 +24,22 @@ pub fn init() {
 }
 pub fn realtime_seconds() -> Result<u64, Errno> {
     if crate::machine::runtime::cpu_slot() != 0 { return Err(Errno::Again); }
-    rtc::read_seconds(&mut Hardware, 0x32).map_err(|e| match e {
+    let mut sample = rtc::read_seconds(&mut Hardware, 0x32);
+    if sample == Err(rtc::Error::Busy) {
+        // A normal RTC update may outlast the decoder's immediate samples.
+        // Retry fresh hardware reads, bounded by both elapsed time and work.
+        // Successful reads keep their original path and never sample HPET.
+        let started = crate::process_arch::now_ns();
+        for _ in 0..1024 {
+            if crate::process_arch::now_ns().saturating_sub(started) >= 1_000_000 {
+                break;
+            }
+            core::hint::spin_loop();
+            sample = rtc::read_seconds(&mut Hardware, 0x32);
+            if sample != Err(rtc::Error::Busy) { break; }
+        }
+    }
+    sample.map_err(|e| match e {
         rtc::Error::Busy => Errno::Again,
         rtc::Error::Unavailable => Errno::Nodev,
         rtc::Error::Invalid => Errno::Io,

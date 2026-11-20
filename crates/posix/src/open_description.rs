@@ -55,6 +55,12 @@ pub(crate) struct Table {
     pub(crate) entries: [Entry; CAPACITY],
     pub(crate) rights: [super::ancillary::Slot; super::ancillary::MESSAGES],
     pub epolls: [epoll::Instance; EPOLLS],
+    pub(crate) epoll_topology: core::cell::Cell<Option<epoll::Topology>>,
+    // Per-table test observations avoid cross-test/global timing noise.
+    #[cfg(test)]
+    pub(crate) topology_builds: core::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) nested_lookups: core::cell::Cell<usize>,
     pub(crate) inotifies: [super::inotify::Instance; super::inotify::GLOBAL_INSTANCES],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +95,11 @@ impl OpenDescriptions {
                 entries: [Entry::EMPTY; CAPACITY],
                 rights: [super::ancillary::Slot::EMPTY; super::ancillary::MESSAGES],
                 epolls: [epoll::Instance::EMPTY; EPOLLS],
+                epoll_topology: core::cell::Cell::new(None),
+                #[cfg(test)]
+                topology_builds: core::cell::Cell::new(0),
+                #[cfg(test)]
+                nested_lookups: core::cell::Cell::new(0),
                 inotifies: [super::inotify::Instance::EMPTY; super::inotify::GLOBAL_INSTANCES],
             }),
         }
@@ -264,6 +275,8 @@ impl OpenDescriptions {
         let description = entry.value.ok_or(Errno::Badf)?;
         if let Object::Epoll(index) = description.object {
             table.epolls[index] = epoll::Instance::EMPTY;
+            // The instance and all weak watches of it are retired below.
+            table.epoll_topology.set(None);
         }
         if let Object::Inotify(index) = description.object {
             table.inotifies[index] = super::inotify::Instance::EMPTY;

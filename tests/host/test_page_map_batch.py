@@ -1,8 +1,8 @@
 """Run actual page-table batching and alias ownership algorithms on host memory.
 
 The ordinary host arch build omits runtime alias hooks. This harness explicitly
-changes only space.rs's target_os selection from none to linux, enables feature
-runtime, and records that adaptation. Runtime guard, phase/count core and batch
+selects space.rs's runtime branches on the host and the x86 staging type, enables
+feature runtime, and records that adaptation. Runtime guard, phase/count core and batch
 FFI bodies, PageTable, ProcessSpace.map_pages, and the permission state helper all
 come from this checkout. The real bounded entry-error formatter writes to an
 explicit host-only byte sink. CPU identity, physical backing/link addresses and
@@ -10,7 +10,7 @@ PTE/TLB effects are fixtures. RX pre-publication executes the actual production
 wrapper and permission transaction. This is not a guest, TLB/IPI test, or proof
 of hardware retirement completion.
 
-The thirty-two cases check real alias changes, prefixes, failures, ownership and
+The cases check real alias changes, prefixes, failures, ownership and
 RX ranges through actual publish_code and permission transaction functions.
 Staging mutation tests inspect actual translations and retirement; a private
 child-module test observes checked RX ranges before invalid physical metadata
@@ -49,17 +49,19 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def production_files(address_source=None):
+def production_files(address_source=None, *, source_root=None):
     """Pure source extraction; no subprocess, compiler, lease or guest access."""
     names = ("crates/arch-x86_64/src/space.rs", "kernel/src/arch/x86_64/runtime.rs",
              "kernel/src/desktop/address_space.rs", "kernel/src/desktop/process_arch.rs")
-    sources = {name: (ROOT / name).read_text() for name in names}
+    selected_root = Path(source_root) if source_root is not None else ROOT
+    sources = {name: (selected_root / name).read_text() for name in names}
     # Private candidates may explicitly select their address_space source;
     # installed portable tests always read the production checkout by default.
     if address_source is not None:
         sources["kernel/src/desktop/address_space.rs"] = Path(address_source).read_text()
     space, runtime, address, arch = (sources[name] for name in names)
-    adapted = space.replace('target_os = "none"', 'target_os = "linux"')
+    selector = 'all(feature = "runtime", target_arch = "x86_64", target_os = "none")'
+    adapted = space.replace(selector, 'feature = "runtime"')
     if adapted == space:
         raise ValueError("Runtime platform selector missing; do not test no-op alias hooks")
     adapted += '\n#[cfg(test)]\n#[path = "cases.rs"]\nmod batch_tests;\n'
@@ -70,13 +72,15 @@ def production_files(address_source=None):
             fromfile="candidate/space.rs", tofile="host-tests/space-runtime-enabled.rs")),
     }
     guard = runtime[runtime.index("struct AliasGuard;"):runtime.index('unsafe extern "C" {')]
-    signatures = (
+    signatures = [
         "fn code_phase(", 'extern "C" fn x86_runtime_code_sealed(',
         'extern "C" fn x86_runtime_mapping_change(', "fn mapping_change_locked(",
         'extern "C" fn x86_runtime_mapping_batch_begin(', "fn mapping_batch_owned(",
         'extern "C" fn x86_runtime_mapping_batch_change(',
         'extern "C" fn x86_runtime_mapping_batch_end(',
-    )
+    ]
+    if 'extern "C" fn x86_runtime_mapping_batch_run(' in runtime:
+        signatures.append('extern "C" fn x86_runtime_mapping_batch_run(')
     parts = [guard]
     extracted = {"alias_guard_and_drop": guard}
     for signature in signatures:
@@ -92,6 +96,7 @@ def production_files(address_source=None):
     code_runtime.insert(1, "struct CodePermissions;")
     wrappers = "\n".join(function(arch, signature) for signature in (
         "pub fn make_writable(", "pub fn publish_code("))
+    wrappers = wrappers.replace('target_arch = "aarch64"', 'any()').replace('target_arch = "x86_64"', 'all()')
     extracted["permission_wrappers"] = wrappers
     fixture = (HERE / "page_map_batch_runtime_fixture.rs").read_text()
     substitutions = {"@PRODUCTION_ALIAS_RUNTIME@": "\n".join(parts),
@@ -106,17 +111,29 @@ def production_files(address_source=None):
             raise ValueError("Ambiguous fixture marker: " + marker)
         fixture = fixture.replace(marker, value)
     files["runtime-fixture.rs"] = fixture
+    if 'extern "C" fn x86_runtime_mapping_batch_run(' in runtime:
+        files['runtime-fixture.rs'] += '''
+pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
+    x86_runtime_mapping_batch_run(owner, physical, pages, old, new)
+}
+'''
     table = address[address.index('#[cfg(target_arch = "aarch64")]'):
                     address.index('#[cfg(target_arch = "x86_64")]\npub const TABLE_PAGES_PER_PROCESS')]
+    # Exercise x86 staging metadata on ARM/macOS hosts as well as x86/Linux.
+    table = table.replace('target_arch = "aarch64"', 'any()').replace('target_arch = "x86_64"', 'all()')
     map_pages = function(address, "    pub fn map_pages(")
+    extra_maps = function(address, "    pub fn map_table_run(") if "    pub fn map_table_run(" in address else ""
     diagnostic = function(arch, "pub fn trace_entry_error(")
     files["staging.rs"] = (
         "use crate::Errno;\n" + table
         + "pub struct ProcessSpace { pub current: Option<crate::space::AddressSpace<'static>>, pub pid: u32 }\n"
-        + "impl ProcessSpace {\n" + map_pages + "\n}\n"
+        + "impl ProcessSpace {\n" + map_pages + "\n" + extra_maps + "\n}\n"
         + '#[cfg(test)]\n#[path = "staging-cases.rs"]\nmod staging_tests;\n')
     files["staging-cases.rs"] = (HERE / "page_map_staging_cases.rs").read_text()
-    helper = ROOT / "crates/arch-x86_64/src/code_permissions.rs"
+    helper = selected_root / "crates/arch-x86_64/src/code_permissions.rs"
+    if not helper.is_file():
+        helper = ROOT / "crates/arch-x86_64/src/code_permissions.rs"
+    files['code-permissions.rs'] = helper.read_text()
     files["transactions.rs"] = '''#![allow(dead_code)]
 extern crate self as cyxia_arch_x86_64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,7 +148,7 @@ fn log(payload: &[u8]) {
 }
 #[path = "space-runtime-enabled.rs"]
 pub mod space;
-#[path = ''' + json.dumps(str(helper), ensure_ascii=False) + ''']
+#[path = "code-permissions.rs"]
 pub mod code_permissions;
 #[path = "runtime-fixture.rs"]
 mod runtime_fixture;
@@ -155,15 +172,20 @@ mod production_process_arch {
 }
 '''
     files["cases.rs"] = (HERE / "page_map_batch_cases.rs").read_text()
+    if 'pub fn map_table_run(' in space:
+        files['cases.rs'] += '\n' + (HERE / 'page_map_run_cases.rs').read_text()
+    files['cases.rs'] += '\n' + (HERE / 'page_retire_cases.rs').read_text()
+    files['cases.rs'] += '\n' + (HERE / 'page_alias_counter_cases.rs').read_text()
     identity = {
         "source_sha256": {name: digest(text) for name, text in sources.items()},
         "helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+        "helper_source_path": str(helper),
         "extracted_sha256": {name: digest(text) for name, text in extracted.items()},
         "staging_sha256": {"PageTable": digest(table), "ProcessSpace.map_pages": digest(map_pages)},
         "diagnostic_sha256": digest(diagnostic),
         "diagnostic_sink": "host-only thread-local bytes; no UART or AP ownership emulation",
         "generated_sha256": {name: digest(text) for name, text in files.items()},
-        "platform_adaptation": "space.rs target_os none -> linux; feature runtime enabled",
+        "platform_adaptation": "space.rs runtime selector -> feature runtime; x86 staging cfg selected on host",
         "runtime_branches_enabled": True,
         "hardware_tlb_exercised": False,
         "guest_execution": False,
@@ -205,7 +227,9 @@ class PageMapBatchTransactions(unittest.TestCase):
             # The helper's nine embedded tests are covered by its own suite.
             ran, output = bounded([str(binary), "runtime_batch_", "--test-threads=1"], environment)
             self.assertEqual(ran, 0, output)
-            self.assertIn("32 passed; 0 failed", output)
+            expected = files['cases.rs'].count('fn runtime_batch_') + files['staging-cases.rs'].count('fn runtime_batch_')
+            self.assertGreaterEqual(expected, 32)
+            self.assertIn(f"{expected} passed; 0 failed", output)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+{
+  "kind": "cosmic-native-presentation-v1",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "base_phase_source_sha256": "e268bd488cc200d66c3f75c11ffc8bb7e0f418cb93d2e90af20e6261464a6632",
+  "reference_inputs": {
+    "artifacts/v017-comp-prepare-sdk2/source/src/backend/cyxia/native/presentation.rs": "e268bd488cc200d66c3f75c11ffc8bb7e0f418cb93d2e90af20e6261464a6632",
+    "ports/cosmic/native-comp/backend/native.rs": "b3f2d541341f094ac563472646f36bbf9a85f1a3d24b7f796349aa9189cf76b8",
+    "ports/cosmic/native-comp/backend/linux_syscall.rs": "7a16b67042e5e767180835f24cc01095327ae8bdf3117f48a47b25307a707230"
+  },
+  "kernel_abi": {
+    "max_rect_bytes": 65536,
+    "max_pixels": 16384
+  },
+  "full_os_verified": false,
+  "patch_sha256": "73917067de3fd2b75307e044538425ffe873dc228dc36cdaa9398912eac19fcd",
+  "patched_source_sha256": "ecd2df7a18c61d822addb3b40035920b3d5167245eabb56a49eba11fdb2e2106"
+}
