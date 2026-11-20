@@ -70,11 +70,11 @@ fn runtime_profile_admits_full_gib_without_weakening_legacy_limit() {
 }
 
 #[test]
-fn two_gib_profile_preserves_upper_ram_and_keeps_smaller_profiles_strict() {
+fn two_gib_memory_is_rejected_instead_of_silently_truncated() {
     use cyxia_platform_pc::boot::{
-        MAX_RUNTIME_2G_PHYSICAL_MEMORY, MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit,
+        MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit,
     };
-    let limit = MAX_RUNTIME_2G_PHYSICAL_MEMORY;
+    let limit = 2 << 30;
     let mut map = Vec::new();
     record(&mut map, 0, 0x9_fc00, 1);
     record(&mut map, KERNEL_START, limit - KERNEL_START - 0x2_0000, 1);
@@ -86,14 +86,8 @@ fn two_gib_profile_preserves_upper_ram_and_keeps_smaller_profiles_strict() {
         assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA,
             &map, MAP_PA, KERNEL_START, KERNEL_END, smaller), Err(BootError::UnsupportedMemory));
     }
-    let mut info = parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA,
-        &map, MAP_PA, KERNEL_START, KERNEL_END, limit).unwrap();
-    assert!(contains(info.ram_regions(), 1 << 30, limit - 0x2_0000));
-    let upper = info.reserve_pool(8192, 1 << 30).unwrap();
-    assert_eq!(upper.start.0, 1 << 30);
-    assert!(contains(info.reserved_regions(), upper.start.0, upper.start.0 + upper.len));
     assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA,
-        &map, MAP_PA, KERNEL_START, KERNEL_END, limit + 4096), Err(BootError::UnsupportedMemory));
+        &map, MAP_PA, KERNEL_START, KERNEL_END, limit), Err(BootError::UnsupportedMemory));
 }
 
 #[test]

@@ -10,14 +10,28 @@ struct State {
     ready: [u64; 3],
     collected: [bool; 3],
     cancelled: Vec<usize>,
+    arrive_on_sleep: Option<usize>,
 }
 static STATE: Mutex<State> = Mutex::new(State {
-    now: 0, ready: [0; 3], collected: [false; 3], cancelled: Vec::new(),
+    now: 0, ready: [0; 3], collected: [false; 3], cancelled: Vec::new(), arrive_on_sleep: None,
 });
 fn now_ns() -> u64 { STATE.lock().unwrap().now }
 mod runtime {
+    fn deliver_completion() {
+        let mut state = STATE.lock().unwrap();
+        if let Some(index) = state.arrive_on_sleep.take() {
+            state.ready[index] = state.now;
+        }
+    }
     pub fn idle_until(until: u64) -> Result<(), ()> {
+        deliver_completion();
         STATE.lock().unwrap().now = until;
+        Ok(())
+    }
+    #[allow(dead_code)] // Available to the candidate; baseline still sleeps unconditionally.
+    pub fn idle_until_while(until: u64, should_sleep: impl FnOnce() -> bool) -> Result<(), ()> {
+        deliver_completion();
+        if should_sleep() { idle_until(until)?; }
         Ok(())
     }
     use super::STATE;
@@ -25,6 +39,12 @@ mod runtime {
 mod dispatch {
     use super::*;
     pub struct Drained { pub completions: [Option<Completion>; 3] }
+    #[allow(dead_code)]
+    pub fn is_complete(ticket: Ticket) -> Result<bool, ()> {
+        let state = STATE.lock().unwrap();
+        assert!(!state.collected[ticket.0]);
+        Ok(state.now >= state.ready[ticket.0])
+    }
     pub fn try_collect(ticket: Ticket) -> Result<Option<Completion>, ()> {
         let mut state = STATE.lock().unwrap();
         assert!(!state.collected[ticket.0], "completion collected twice");
@@ -46,14 +66,24 @@ mod dispatch {
 }
 
 fn run(ready: [u64; 3], active: [bool; 3]) -> [Option<Completion>; 3] {
+    run_with_arrival(ready, active, None)
+}
+fn run_with_arrival(ready: [u64; 3], active: [bool; 3], arrival: Option<usize>) -> [Option<Completion>; 3] {
     *STATE.lock().unwrap() = State {
-        now: 0, ready, collected: [false; 3], cancelled: Vec::new(),
+        now: 0, ready, collected: [false; 3], cancelled: Vec::new(), arrive_on_sleep: arrival,
     };
     let started = now_ns();
     let mut tickets = core::array::from_fn::<_, 3, _>(|i| active[i].then_some(Ticket(i)));
     let mut completions = core::array::from_fn::<_, 3, _>(|_| None);
     // PRODUCTION_PHASE
     completions
+}
+
+#[test]
+fn completion_after_last_poll_is_not_delayed_until_the_backstop_timer() {
+    let result = run_with_arrival([8_000_000, 0, 0], [true, false, false], Some(0));
+    assert!(result[0].is_some());
+    assert_eq!(now_ns(), 0, "completion published before sleep still paid a timer tick");
 }
 
 #[test]

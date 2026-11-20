@@ -195,14 +195,17 @@ impl Runner {
         if !self.status.state.active() {
             return;
         }
-        let runnable = self.thread.runnable();
-        #[cfg(feature = "ported")]
-        let runnable = runnable || self.threads.parked.iter().any(Thread::runnable);
-        self.status.state = if runnable {
+        self.status.state = if self.has_runnable_thread() {
             UserState::Running
         } else {
             UserState::Waiting
         };
+    }
+    pub(super) fn has_runnable_thread(&self) -> bool {
+        let runnable = self.thread.runnable();
+        #[cfg(feature = "ported")]
+        let runnable = runnable || self.threads.parked.iter().any(Thread::runnable);
+        runnable
     }
     #[cfg(feature = "graphics")]
     pub(super) fn complete_display(&mut self, tid: u32, success: bool, time: u64) {

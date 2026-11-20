@@ -13,8 +13,6 @@ bench = false
 selftest = []
 # Long-running OS composition. Independent of bounded acceptance profiles.
 os-runtime = ["cyxia-arch-x86_64/runtime"]
-# Explicit two-GiB PC window; the original one-GiB runtime stays available.
-ram-2g = ["os-runtime", "cyxia-arch-x86_64/ram-2g"]
 # Explicit x86 production image layout; preserves legacy runtime profiles.
 full-os = ["os-runtime", "ported", "large-memory", "cyxia-posix/full-os"]
 cosmic-desktop = ["full-os", "graphics"]

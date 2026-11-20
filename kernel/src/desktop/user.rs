@@ -1846,6 +1846,15 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
         (&mut *core::ptr::addr_of_mut!(SUPERVISOR)).poll(shell, out);
     }
 }
+/// CPU0 only, outside the drained AP phase. This hint does not select a thread,
+/// wake waiters, or change grants; ordinary policy still decides the next job.
+#[cfg(target_arch = "x86_64")]
+pub fn runnable() -> bool {
+    let supervisor = unsafe { &*core::ptr::addr_of!(SUPERVISOR) };
+    supervisor.runners.iter().any(|runner| {
+        runner.status.state.active() && runner.has_runnable_thread()
+    })
+}
 /// CPU0 snapshot of cumulative process/worker receipts; never resets on PID reuse.
 pub fn ai_status(out: &mut impl Write) {
     ai::status(out);

@@ -121,6 +121,7 @@ pub fn zero_eligible(physical: u64, bytes: usize) -> bool {
 static __rodata_end: u8 = 0;
 fn pa(_: u64) -> u64 { 0x00100000 }
 mod arch {
+    pub use crate::space;
     pub mod kernel_space {
         pub unsafe fn set_direct_permissions(physical: u64, writable: bool) -> Result<(), crate::space::Error> {
             super::super::write_direct_pte(physical, writable)

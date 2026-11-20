@@ -120,7 +120,8 @@ pub fn run(info: &PcBootInfo) -> ! {
     }
 }
 fn idle() {
-    crate::machine::runtime::idle_until(
-        crate::machine::runtime::now_ns().checked_add(1_000_000).expect("clock horizon")
+    crate::machine::runtime::idle_until_while(
+        crate::machine::runtime::now_ns().checked_add(1_000_000).expect("clock horizon"),
+        || !crate::user::runnable(),
     ).expect("OS deadline");
 }

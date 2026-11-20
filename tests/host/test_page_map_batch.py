@@ -66,20 +66,24 @@ def runtime_declaration(source, symbol):
 def production_files(address_source=None, *, source_root=None):
     """Pure source extraction; no subprocess, compiler, lease or guest access."""
     names = ("crates/arch-x86_64/src/space.rs", "kernel/src/arch/x86_64/runtime.rs",
-             "kernel/src/desktop/address_space.rs", "kernel/src/desktop/process_arch.rs")
+             "kernel/src/desktop/address_space.rs", "kernel/src/desktop/process_arch.rs",
+             "crates/posix/src/usermem.rs")
     selected_root = Path(source_root) if source_root is not None else ROOT
     sources = {name: (selected_root / name).read_text() for name in names}
     # Private candidates may explicitly select their address_space source;
     # installed portable tests always read the production checkout by default.
     if address_source is not None:
         sources["kernel/src/desktop/address_space.rs"] = Path(address_source).read_text()
-    space, runtime, address, arch = (sources[name] for name in names)
+    space, runtime, address, arch, usermem = (sources[name] for name in names)
+    limits = usermem[usermem.index('#[cfg(feature = "cosmic-session")]'):
+                     usermem.index('pub const POOL_PAGES:')]
     selector = 'all(feature = "runtime", target_arch = "x86_64", target_os = "none")'
     adapted = space.replace(selector, 'feature = "runtime"')
     if adapted == space:
         raise ValueError("Runtime platform selector missing; do not test no-op alias hooks")
     adapted += '\n#[cfg(test)]\n#[path = "cases.rs"]\nmod batch_tests;\n'
     files = {
+        "process-limits.rs": limits,
         "space-runtime-enabled.rs": adapted,
         "space-cfg-adaptation.patch": "".join(difflib.unified_diff(
             space.splitlines(True), adapted.splitlines(True),
@@ -169,7 +173,8 @@ extern crate self as cyxia_contracts;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Errno { Inval, Nodev, Io, Fault, Busy, Nomem, Access, Badf, Mfile, Overflow, Perm }
 pub struct PhysAddr(pub u64);
-pub mod usermem { pub const MAX_PROCESSES: usize = 16; }
+#[path = "process-limits.rs"]
+pub mod usermem;
 #[path = "user-layout.rs"]
 pub mod user_layout;
 #[path = "vm.rs"]
@@ -279,17 +284,20 @@ class PageMapBatchTransactions(unittest.TestCase):
                 (temporary / name).write_text(content)
             (temporary / "source-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
             binary = temporary / "batch-tests"
-            compiled, output = bounded(
-                [compiler, "--edition=2024", "--test", "--cfg", 'feature="runtime"',
-                 "-Dwarnings", str(temporary / "transactions.rs"), "-o", str(binary)], environment)
-            self.assertEqual(compiled, 0, output)
-            # The helper's nine embedded tests are covered by its own suite.
-            ran, output = bounded([str(binary), "runtime_batch_", "--test-threads=1"], environment)
-            self.assertEqual(ran, 0, output)
             expected = sum(files[name].count('fn runtime_batch_') for name in
                            ('cases.rs', 'staging-cases.rs', 'revoke-order.rs'))
             self.assertGreaterEqual(expected, 32)
-            self.assertIn(f"{expected} passed; 0 failed", output)
+            for session in (False, True):
+                with self.subTest(cosmic_session=session):
+                    flags = ['--cfg', 'feature="cosmic-session"'] if session else []
+                    compiled, output = bounded(
+                        [compiler, "--edition=2024", "--test", "--cfg", 'feature="runtime"',
+                         *flags, "-Dwarnings", str(temporary / "transactions.rs"), "-o", str(binary)], environment)
+                    self.assertEqual(compiled, 0, output)
+                    # The helper's nine embedded tests are covered by its own suite.
+                    ran, output = bounded([str(binary), "runtime_batch_", "--test-threads=1"], environment)
+                    self.assertEqual(ran, 0, output)
+                    self.assertIn(f"{expected} passed; 0 failed", output)
 
 
 if __name__ == "__main__":

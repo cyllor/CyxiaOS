@@ -313,8 +313,12 @@ impl Supervisor {
                     current < drain_deadline,
                     "AP completion timeout; retain all backing"
                 );
-                runtime::idle_until(drain_deadline.min(current.saturating_add(1_000_000)))
-                    .expect("AP completion wait");
+                runtime::idle_until_while(
+                    drain_deadline.min(current.saturating_add(1_000_000)),
+                    || tickets.iter().flatten().all(|&ticket| {
+                        !dispatch::is_complete(ticket).expect("owned dispatch ticket")
+                    }),
+                ).expect("AP completion wait");
             }
             let mut peers = [None; 3];
             let mut count = 0;

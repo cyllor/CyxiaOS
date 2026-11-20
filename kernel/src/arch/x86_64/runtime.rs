@@ -12,8 +12,7 @@ core::arch::global_asm!(
     ram_gib = const (RAM >> 30),
     options(att_syntax)
 );
-const RAM: u64 = if cfg!(feature = "ram-2g") { 2 << 30 } else { 1 << 30 };
-const _: () = assert!(RAM == arch::space::RUNTIME_RAM_BYTES);
+const RAM: u64 = arch::space::RUNTIME_RAM_BYTES;
 const TIMER: u8 = 239;
 const WAKE: u8 = 240;
 const TLB: u8 = 241;
@@ -253,8 +252,17 @@ pub fn idle_while(should_sleep: impl FnOnce() -> bool) {
 /// IF already enabled and later executing HLT can consume the only timer IRQ
 /// between those operations and sleep forever.
 pub fn idle_until(deadline_ns: u64) -> Result<(), Error> {
+    idle_until_while(deadline_ns, || true)
+}
+/// Recheck the caller's non-consuming work predicate with IF clear. A producer
+/// that publishes after this check leaves WAKE pending for STI/HLT; a producer
+/// already observed here needs no timer tick before foreground work resumes.
+pub fn idle_until_while(
+    deadline_ns: u64,
+    should_sleep: impl FnOnce() -> bool,
+) -> Result<(), Error> {
     arch::cpu::disable_interrupts();
-    if deadline_ns <= now_ns() {
+    if deadline_ns <= now_ns() || !should_sleep() {
         unsafe {
             arch::cpu::enable_interrupts();
         }
@@ -485,12 +493,6 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
         RAM,
     )
     .expect("PC boot");
-    #[cfg(feature = "ram-2g")]
-    let (info, high_page) = {
-        let mut info = info;
-        let page = info.reserve_pool(4096, 1 << 30).expect("upper-GiB probe reservation");
-        (info, page)
-    };
     let topology = unsafe { firmware() };
     assert!(
         info.ram_regions()
@@ -527,20 +529,6 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
         ));
     }
     KERNEL_ROOT.store(root, Ordering::Release);
-    #[cfg(feature = "ram-2g")]
-    {
-        // This bootstrap-owned page is reserved from the real loader map.
-        // Touch the second GiB only after its protected high mapping exists.
-        let address = kernel_va(high_page.start.0, 4096).expect("upper-GiB direct map");
-        let pointer = address as *mut u64;
-        unsafe {
-            pointer.write_volatile(0x435958324752414d);
-            assert_eq!(pointer.read_volatile(), 0x435958324752414d);
-            pointer.write_volatile(0);
-        }
-        log(b"X86_RAM_2G_OK high_page=");
-        super::hex(high_page.start.0);
-    }
     LAPIC.store(topology.lapic_base, Ordering::Release);
     for (slot, &id) in topology.apic_ids.iter().enumerate() {
         APIC_IDS[slot].store(id as u64, Ordering::Relaxed);

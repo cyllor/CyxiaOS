@@ -136,6 +136,13 @@ pub(crate) fn try_collect(ticket: Ticket) -> Result<Option<Completion>, Error> {
     }))
 }
 
+/// Non-consuming readiness check for the IF-clear sleep boundary. Completion
+/// ownership still transfers only through try_collect after the worker returns.
+pub(crate) fn is_complete(ticket: Ticket) -> Result<bool, Error> {
+    owner()?;
+    slot(ticket.cpu)?.is_done(ticket.generation).map_err(ticket_error)
+}
+
 /// Stop and recover the complete batch before foreground service work. On any
 /// error every uncollected slot remains owned/pinned; timeout is never a release.
 pub(crate) fn drain(tickets: &[Ticket], deadline_ns: u64) -> Result<Drained, Error> {

@@ -1,4 +1,4 @@
-"""Attribute startup stages to real tasks in the current two-GiB COSMIC image.
+"""Attribute startup stages to real tasks in the one-GiB COSMIC image.
 
 Snapshots are diagnostic wall observations, not CPU billing or session acceptance.
 No program, limit, startup dependency or timing deadline is replaced.
@@ -13,7 +13,7 @@ import time
 
 import elf64
 import os_smoke
-import os_x86_2g as profile
+import os_x86 as profile
 from native_session import DEFAULT_NATIVE_LOCK, idle_native_host, native_lease
 from run_qemu import Qmp
 from storage import create_disk
@@ -109,6 +109,8 @@ def main():
                     qmp.receive(time.monotonic() + 10)
                     qmp.execute('qmp_capabilities')
                     result['memory'] = qmp.execute('query-memory-size-summary')
+                    pc.require(result['memory'] == {'base-memory': 1 << 30, 'plugged-memory': 0},
+                               'Startup regression requires exactly one GiB')
                     console.until(os_smoke.PROMPT, timeout=90)
                     result['boot_to_prompt_seconds'] = time.monotonic() - launched
                     bus = time.monotonic()
