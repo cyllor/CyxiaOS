@@ -184,6 +184,10 @@ impl Runner {
         descriptor: i32,
         bytes: &[u8],
     ) -> Result<usize, Errno> {
+        #[cfg(feature = "ported")]
+        if descriptor == 2 && self.tee_stderr {
+            super::super::log(bytes);
+        }
         let owner = self.process.backend_owner(descriptor)?;
         if self.process.memfd(descriptor)?.is_some() {
             self.write_memfd(descriptor, bytes)

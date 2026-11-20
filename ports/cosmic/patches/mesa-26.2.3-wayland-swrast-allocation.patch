@@ -1,0 +1,51 @@
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -2887,6 +2887,7 @@
+                    dri2_surf->base.Height, &dri2_surf->back->data,
+                    &dri2_surf->back->data_size,
+                    &dri2_surf->back->wayland_buffer.buffer)) {
++               dri2_surf->back = NULL;
+                _eglError(EGL_BAD_ALLOC, "failed to allocate color buffer");
+                return -1;
+             }
+@@ -2941,8 +2942,7 @@
+ static void *
+ dri2_wl_swrast_get_backbuffer_data(struct dri2_egl_surface *dri2_surf)
+ {
+-   assert(dri2_surf->back);
+-   return dri2_surf->back->data;
++   return dri2_surf->back ? dri2_surf->back->data : NULL;
+ }
+ 
+ static void
+@@ -3042,6 +3042,10 @@
+    assert(copy_width <= stride);
+ 
+    dst = dri2_wl_swrast_get_backbuffer_data(dri2_surf);
++   if (!dst) {
++      _eglError(EGL_BAD_ALLOC, "missing software back buffer");
++      return;
++   }
+ 
+    dst += x_offset;
+    dst += y * dst_stride;
+@@ -3081,7 +3085,8 @@
+    if (!dri2_surf->wl_win)
+       return _eglError(EGL_BAD_NATIVE_WINDOW, "dri2_swap_buffers");
+ 
+-   (void)swrast_update_buffers(dri2_surf);
++   if (swrast_update_buffers(dri2_surf) < 0)
++      return EGL_FALSE;
+ 
+    if (dri2_wl_surface_throttle(dri2_surf))
+       wl_surface_attach(dri2_surf->wayland_surface.wrapper,
+@@ -3123,8 +3128,7 @@
+ static EGLBoolean
+ dri2_wl_swrast_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw)
+ {
+-   dri2_wl_swrast_swap_buffers_with_damage(disp, draw, NULL, 0);
+-   return EGL_TRUE;
++   return dri2_wl_swrast_swap_buffers_with_damage(disp, draw, NULL, 0);
+ }
+ 
+ static EGLint

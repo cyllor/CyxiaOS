@@ -4,7 +4,7 @@
 //! <https://github.com/torvalds/linux/blob/v6.12/arch/arm64/include/uapi/asm/sigcontext.h>
 //! <https://github.com/torvalds/linux/blob/v6.12/arch/arm64/include/uapi/asm/ucontext.h>
 //! The shipped musl 1.2.6 aarch64 bits/signal.h agrees with these offsets.
-//! Bounded per-thread alternate stacks; no handler syscall restart, job control,
+//! Bounded per-thread alternate stacks; x86 handler syscall restart, no job control,
 //! SVE/SME, or siglongjmp. Sigreturn restores a validated uc_stack descriptor.
 //! Each realtime signal has one pending slot; overflow returns Again, never
 //! silently coalesces. Standard signals coalesce as required by their ABI.
@@ -88,9 +88,14 @@ impl Action {
     }
     pub fn validate_for(self, abi: crate::ImageAbi) -> Result<(), Errno> {
         // SIG_DFL/SIG_IGN never invoke a returning handler, so retaining
-        // SA_RESTART creates no syscall-restart obligation. Real handlers
-        // still reject it until interrupted syscall restarts are implemented.
-        let supported = SUPPORTED_FLAGS | if self.handler <= 1 { SA_RESTART } else { 0 };
+        // SA_RESTART creates no syscall-restart obligation. Returning handlers
+        // support it on x86 only, where the kernel saves a replayable context.
+        let supported = SUPPORTED_FLAGS
+            | if self.handler <= 1 || abi == crate::ImageAbi::X86_64 {
+                SA_RESTART
+            } else {
+                0
+            };
         if self.flags & !supported != 0
             || (self.handler > 1
                 && (!user_pc_for(self.handler, abi)
@@ -100,6 +105,37 @@ impl Action {
             return Err(Errno::Inval);
         }
         Ok(())
+    }
+}
+
+/// Calls whose interrupted, unfinished waits may replay after an x86 handler.
+/// This is eligibility, not an instruction to replay a completed operation.
+/// In particular, timed futex waits need restart-block semantics and remain
+/// EINTR after a caught signal, just like poll/epoll and nanosleep.
+pub fn restartable_syscall(abi: crate::ImageAbi, number: u64, args: [u64; 6]) -> bool {
+    use crate::linux_abi::{Call, decode};
+    if abi != crate::ImageAbi::X86_64 {
+        return false;
+    }
+    let Ok(call) = decode(abi, number, args) else {
+        return false;
+    };
+    match call.call {
+        Call::Read
+        | Call::Readv
+        | Call::Write
+        | Call::Writev
+        | Call::Recvfrom
+        | Call::Recvmsg
+        | Call::Sendto
+        | Call::Sendmsg
+        | Call::Accept
+        | Call::Accept4
+        | Call::Connect
+        | Call::Flock
+        | Call::Wait4 => true,
+        Call::Futex => matches!(args[1] & !128, 0 | 9) && args[3] == 0,
+        _ => false,
     }
 }
 

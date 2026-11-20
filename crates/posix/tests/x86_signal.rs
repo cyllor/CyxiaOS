@@ -2,6 +2,79 @@ use cyxia_posix::{
     signal::{AltStack, Info},
     signal_x86_64 as codec,
 };
+
+#[test]
+fn x86_tokio_style_sigterm_registration_accepts_restart_action() {
+    use cyxia_posix::{
+        ImageAbi,
+        signal::{Action, SA_RESTART, SA_RESTORER, SA_SIGINFO},
+    };
+    let action = Action {
+        handler: 0x0100_0005,
+        flags: SA_SIGINFO | SA_RESTART | SA_RESTORER,
+        restorer: 0x0100_0007,
+        mask: 0,
+    };
+    let control = Action {
+        flags: action.flags & !SA_RESTART,
+        ..action
+    };
+    assert_eq!(
+        Action::decode_for(&control.encode(), ImageAbi::X86_64),
+        Ok(control)
+    );
+    assert_eq!(
+        Action::decode_for(&action.encode(), ImageAbi::X86_64),
+        Ok(action),
+        "Tokio SIGTERM action was rejected with EINVAL"
+    );
+}
+
+#[test]
+fn restart_eligibility_preserves_abi_and_timed_wait_boundaries() {
+    use cyxia_posix::{ImageAbi, signal::restartable_syscall};
+    for number in [0, 1, 19, 20, 42, 43, 44, 45, 46, 47, 61, 73, 288] {
+        assert!(
+            restartable_syscall(ImageAbi::X86_64, number, [0; 6]),
+            "{number}"
+        );
+    }
+    for number in [7, 35, 74, 75, 230, 232, 271, 281, u64::MAX] {
+        assert!(
+            !restartable_syscall(ImageAbi::X86_64, number, [0; 6]),
+            "{number}"
+        );
+    }
+    for operation in [0, 9, 128, 137] {
+        let mut args = [0; 6];
+        args[1] = operation;
+        assert!(restartable_syscall(ImageAbi::X86_64, 202, args));
+        args[3] = 0x1000;
+        assert!(!restartable_syscall(ImageAbi::X86_64, 202, args));
+    }
+    for operation in [1, 3, 4, 10, 256] {
+        let mut args = [0; 6];
+        args[1] = operation;
+        assert!(!restartable_syscall(ImageAbi::X86_64, 202, args));
+    }
+    assert!(!restartable_syscall(ImageAbi::Aarch64, 63, [0; 6]));
+    use cyxia_posix::signal::{Action, SA_RESTART, SA_RESTORER};
+    let action = Action {
+        handler: 0x100004,
+        flags: SA_RESTORER | SA_RESTART,
+        restorer: 0x100008,
+        mask: 0,
+    };
+    assert!(action.validate_for(ImageAbi::Aarch64).is_err());
+    assert!(
+        Action {
+            flags: action.flags | 0x20,
+            ..action
+        }
+        .validate_for(ImageAbi::X86_64)
+        .is_err()
+    );
+}
 #[test]
 fn x86_signal_frame_roundtrips_actual_register_order_redzone_and_fxsave() {
     let mut fxsave = [0; 512];

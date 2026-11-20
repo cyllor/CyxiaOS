@@ -47,6 +47,38 @@ pub fn validate(fs: &FileSystem) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Prepare the watch roots used by this single-UID COSMIC platform after
+/// recovery and runtime reset, before any user process starts. HOME=/ keeps
+/// its existing durable paths; direct service probes use the existing private
+/// runtime paths. Existing user data, modes and inode identities are preserved.
+pub fn prepare_cosmic(fs: &mut FileSystem) -> Result<(), Errno> {
+    validate(fs)?;
+    for name in [
+        "/.config",
+        "/.config/cosmic",
+        "/.local",
+        "/.local/state",
+        "/.local/state/cosmic",
+        "/run/user/0/.config",
+        "/run/user/0/.config/cosmic",
+        "/run/user/0/.local",
+        "/run/user/0/.local/state",
+        "/run/user/0/.local/state/cosmic",
+    ] {
+        let path = Path::resolve(Path::ROOT, name)?;
+        match fs.stat(path) {
+            Ok(entry) if entry.kind == Kind::Directory => {}
+            Ok(_) => return Err(Errno::Notdir),
+            Err(cyxia_ai_fs::Error::NotFound) => {
+                fs.mkdir(path)?;
+                fs.set_mode(path, 0o700)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

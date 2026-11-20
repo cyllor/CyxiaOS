@@ -1,0 +1,75 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1240,6 +1240,8 @@
+  "tracing",
+  "tracing-log",
+  "tracing-subscriber",
++ "wayland-sys",
++ "xkbcommon-dl",
+  "zbus",
+ ]
+ 
+@@ -6889,8 +6891,6 @@
+ [[package]]
+ name = "wayland-backend"
+ version = "0.3.17"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
+ dependencies = [
+  "cc",
+  "downcast-rs",
+@@ -7027,8 +7027,6 @@
+ [[package]]
+ name = "wayland-sys"
+ version = "0.31.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+ dependencies = [
+  "dlib",
+  "log",
+@@ -8045,8 +8043,6 @@
+ [[package]]
+ name = "xkbcommon-dl"
+ version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5"
+ dependencies = [
+  "bitflags 2.13.2",
+  "dlib",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,6 +23,7 @@
+ ]
+ 
+ resolver = "3"
++exclude = ["native-deps/wayland-sys", "native-deps/wayland-backend", "native-deps/xkbcommon-dl"]
+ 
+ [workspace.dependencies]
+ anyhow = "1.0.102"
+@@ -91,3 +92,8 @@
+ # cosmic-dbus-networkmanager = { path = "../dbus-settings-bindings/networkmanager" }
+ # upower_dbus = { path = "../dbus-settings-bindings/upower" }
+ # nm-secret-agent-manager = { path = "../dbus-settings-bindings/nm-secret-agent-manager" }
++
++[patch.crates-io]
++wayland-sys = { path = "native-deps/wayland-sys" }
++wayland-backend = { path = "native-deps/wayland-backend" }
++xkbcommon-dl = { path = "native-deps/xkbcommon-dl" }
+--- a/cosmic-applet-time/Cargo.toml
++++ b/cosmic-applet-time/Cargo.toml
+@@ -5,6 +5,8 @@
+ license = "GPL-3.0-only"
+ 
+ [dependencies]
++wayland-sys = { path = "../native-deps/wayland-sys" }
++xkbcommon-dl = { path = "../native-deps/xkbcommon-dl" }
+ cosmic-applets-config.workspace = true
+ jiff = "0.2"
+ i18n-embed-fl.workspace = true
+@@ -19,3 +21,6 @@
+ zbus.workspace = true
+ timedate-zbus = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+ logind-zbus = "5.3.2"
++
++[features]
++cyxia-native = ["wayland-sys/cyxia-static-client", "wayland-sys/cyxia-static-egl", "xkbcommon-dl/static-wayland"]

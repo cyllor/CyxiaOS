@@ -14,10 +14,10 @@ ROOT = pc.ROOT
 VERSION = 2
 RUSTFLAGS = ['-C', 'relocation-model=static', '-C', 'code-model=large',
              '-C', 'no-redzone=yes', '-C', 'lto=off']
-DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'rust-reactor-probe', 'rust-egl-probe',
+DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'cosmic-session', 'cosmic-core-services-v1', 'cosmic-time-applet-v1', 'rust-reactor-probe', 'rust-egl-probe',
     'mesa-probe', 'smithay-probe', 'smithay-wayland-probe', 'smithay-xdg-probe',
     'smithay-multi-probe', 'smithay-interactive-probe', 'smithay-resize-probe',
-    'smithay-dynamic-probe', 'wayland-shm-probe'))
+    'smithay-dynamic-probe', 'wayland-shm-probe', 'abi-trace'))
 
 def select_features(*, graphics=False, ported=False, extras=()):
     extras = sorted(set(extras))

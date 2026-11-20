@@ -6,6 +6,10 @@ edition.workspace = true
 [features]
 large-memory = []
 full-os = ["large-memory", "cyxia-ai-fs/full-os"]
+# Full-OS COSMIC session profile: widens the process layout to the session slot
+# count (see usermem::MAX_PROCESSES). Builds on full-os; the demo and existing
+# full-os builds are unchanged because this feature is opt-in and new.
+cosmic-session = ["full-os"]
 
 [dependencies]
 cyxia-ai-fs = { path = "../ai-fs" }

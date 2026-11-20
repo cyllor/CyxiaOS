@@ -6,6 +6,14 @@ pub const DATA_BYTES: usize = 8192;
 pub const STACK_BASE: u64 = BASE + 0x7000;
 pub const STACK_TOP: u64 = BASE + 0x9000;
 pub const MAPPED_PAGES: u32 = 8;
+/// Demo Arena layout: 8 process slots. The full-OS COSMIC session profile widens
+/// this to the session slot count (40 = 33 documented intact-default demand +
+/// headroom), matching `cyxia_ai_runtime::SESSION_PROCESS_SLOTS`; the kernel
+/// asserts the two agree under the session feature. Demo and existing full-os
+/// builds keep 8 because `cosmic-session` is a new opt-in feature.
+#[cfg(feature = "cosmic-session")]
+pub const MAX_PROCESSES: usize = 40;
+#[cfg(not(feature = "cosmic-session"))]
 pub const MAX_PROCESSES: usize = 8;
 pub const POOL_PAGES: u32 = MAPPED_PAGES * MAX_PROCESSES as u32;
 #[repr(C, align(4096))]

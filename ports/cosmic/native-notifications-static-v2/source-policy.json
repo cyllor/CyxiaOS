@@ -1,0 +1,244 @@
+{
+  "commit": "1e4c1f11fdcae273d6954fd0bfc54749a6145267",
+  "component": "cosmic-notifications",
+  "default_features": false,
+  "effective_lock_sha256": "2b1590c107e77d72c3f29b45733f9a2ed470f39462e0b247e95dbfeac185dd78",
+  "features": [
+    "cyxia-static"
+  ],
+  "git_tree": "567fe0fd0549693667aa33666debe067b4491a53",
+  "kind": "cosmic-notifications-static-v1",
+  "original_tree_sha256": "7078693826470e1129de087ad317ffca17f125567f837e22bcb9c00183e679a1",
+  "patches": [
+    {
+      "path": "notifications-static-feature.patch",
+      "sha256": "183cfe416fb1a7133baa6c31e2bc170586da5d45d35f671d52e9d3b614d3f45a"
+    },
+    {
+      "path": "wayland-sys-0.31.11-static-client.patch",
+      "sha256": "6fc94cda00e21a5dba78381676fddfdef1c5f1d4a8fa9a8ffee81c848a256c25"
+    },
+    {
+      "path": "xkbcommon-dl-0.4.2-static-link.patch",
+      "sha256": "f019b8c65c58e6459924bbf3a2826d77be0c3106cb4359af74b038ce4d87bd17"
+    }
+  ],
+  "registry_inputs": [
+    {
+      "after_tree_sha256": "7fc302c4bb59d783be9fbdbb9394001f58e31c3e71357e2950fde1df3c2e41e8",
+      "archive_sha256": "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be",
+      "before_tree_sha256": "dd099417c7e65b8403d86ef995c87dee8b7e82436bc54e716c5197134c56f57f",
+      "destination": "native-deps/wayland-sys",
+      "files": {
+        ".cargo_vcs_info.json": {
+          "bytes": 105,
+          "mode": 420,
+          "sha256": "e845ad99e76106cfa8f0739da82d02ba30c5aca192f51b3fa304485a9687c5cd"
+        },
+        "CHANGELOG.md": {
+          "bytes": 797,
+          "mode": 420,
+          "sha256": "08ce934d669484697ee0914383151d2a4849a5b6b193339f9f673653b9fc992f"
+        },
+        "Cargo.lock": {
+          "bytes": 2276,
+          "mode": 420,
+          "sha256": "4b4f8b4c1b4d9bf93977a30b83b5cfc8679ce7f07e2ea040888268ac7a386738"
+        },
+        "Cargo.toml": {
+          "bytes": 1876,
+          "mode": 420,
+          "sha256": "9490484a9baf88ddcfef3473951b6212552cedd5f343bcb57999d54bed1d777f"
+        },
+        "Cargo.toml.orig": {
+          "bytes": 1172,
+          "mode": 420,
+          "sha256": "5b137e1b0591a3661e21b1b2ed261d9589638ff12c7b0591f979e3da117b97de"
+        },
+        "LICENSE.txt": {
+          "bytes": 1057,
+          "mode": 420,
+          "sha256": "1cb6f4dee8c649f175736380495f0af0c753c87f22d50931692968bb24bf2161"
+        },
+        "README.md": {
+          "bytes": 1398,
+          "mode": 420,
+          "sha256": "5ad17c5a9b8b182396a03623bef41195444d23c7542a68b2d64f2aeee17ec9e2"
+        },
+        "build.rs": {
+          "bytes": 639,
+          "mode": 420,
+          "sha256": "11473cb618b53e1fc980c9caf9d3ed8a969a3c33b6243a8e79b5da6fab03ce28"
+        },
+        "src/client.rs": {
+          "bytes": 5683,
+          "mode": 420,
+          "sha256": "710cf2eef09b2a51998c110a8e23ce211bd8b1293042ef89933ad39047931180"
+        },
+        "src/common.rs": {
+          "bytes": 1797,
+          "mode": 420,
+          "sha256": "8acfb5c95c6ff401b56af70ab7df7d126566a3a179354c08240e91026df500df"
+        },
+        "src/cursor.rs": {
+          "bytes": 2469,
+          "mode": 420,
+          "sha256": "23fa8657c697fd8eaa0e0a0886ac5ffedf81cb2f1bb794175b129857db040b40"
+        },
+        "src/egl.rs": {
+          "bytes": 1863,
+          "mode": 420,
+          "sha256": "4cb602801fd46d895c7fa3df7d545bc7f92e8ccb9534ae6c15ce0f65ef67ffe0"
+        },
+        "src/lib.rs": {
+          "bytes": 2481,
+          "mode": 420,
+          "sha256": "4b2f11efcbefc4b7b6551c6d1a695189a1f45f3481aa3d772041f060107dece8"
+        },
+        "src/server.rs": {
+          "bytes": 14904,
+          "mode": 420,
+          "sha256": "7983133534890c8a312f8ee23b0681aa34cd5b7dcdded4a1a12ee069d2ab9758"
+        }
+      },
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "name": "wayland-sys",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.31.11"
+    },
+    {
+      "after_tree_sha256": "16b02c11041a59f55bf7853dcbfc90f20fabc7fc855eba79addfa739e48407f2",
+      "archive_sha256": "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5",
+      "before_tree_sha256": "dfe60c3d14f38e970ada40d4ebe51b311d7bf1798e39aaa6aba5480dc4211165",
+      "destination": "native-deps/xkbcommon-dl",
+      "files": {
+        ".cargo_vcs_info.json": {
+          "bytes": 94,
+          "mode": 420,
+          "sha256": "5274c6a532b16cb42f47d2e445784e364e297eca7626f619ea822d4bcb965556"
+        },
+        ".github/workflows/ci.yml": {
+          "bytes": 962,
+          "mode": 420,
+          "sha256": "9c346d45ba31b6b65dc9e6c82f84296e97c011959d48dd49e8bdbc80afae38da"
+        },
+        ".gitignore": {
+          "bytes": 32,
+          "mode": 420,
+          "sha256": "0fa28a6f316513e97783f2f9a00a5f19d77e1b3c5ff18166ca50425fc1c77dd3"
+        },
+        ".travis.yml": {
+          "bytes": 233,
+          "mode": 420,
+          "sha256": "253a622460a344afce20caeec23fe38cf8d9c98ab777f7582f9ec22930dd7761"
+        },
+        "Cargo.toml": {
+          "bytes": 1076,
+          "mode": 420,
+          "sha256": "4ef7dd0d9c14dc5ca3f8170450592f2ceaa3b666d1cc873af88d13df0dd07169"
+        },
+        "Cargo.toml.orig": {
+          "bytes": 484,
+          "mode": 420,
+          "sha256": "b475ef9921a405611b8adb4585cf1d8208f77a4d1cf0d0c6f154db5dd7e81b97"
+        },
+        "LICENSE": {
+          "bytes": 1082,
+          "mode": 420,
+          "sha256": "d1459611105ccc285fd21dec180864b33490d946150356599bd3105e40705861"
+        },
+        "README.md": {
+          "bytes": 494,
+          "mode": 420,
+          "sha256": "628a8a17a46e0485d001fee85719924f052d49e7783655402795c64192176d46"
+        },
+        "src/lib.rs": {
+          "bytes": 12821,
+          "mode": 420,
+          "sha256": "0b41b9c6b2989bb8bcdfff879685edafc50d860d888d0462d209831013a7754a"
+        },
+        "src/x11.rs": {
+          "bytes": 1607,
+          "mode": 420,
+          "sha256": "7df4c70ca277d025923926d76bfe4a01cc65ca398886af538bd245f4bbe1ae0a"
+        },
+        "update-docs.sh": {
+          "bytes": 499,
+          "mode": 420,
+          "sha256": "224603f732c0903a77e3a5f6b7f8be465af3c4c144e5035d475b8fdbdd4733f2"
+        }
+      },
+      "license_files": [
+        "LICENSE"
+      ],
+      "name": "xkbcommon-dl",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.2"
+    }
+  ],
+  "repository": "https://github.com/pop-os/cosmic-notifications",
+  "resolution": {
+    "baseline_metadata_sha256": "464545d9edb5548b9356f074660f6ece0e64d8aa2982d8cb03157d6e5c72c170",
+    "baseline_sha256": "ed6fe6c949ebbce1329c0c43d690fc0adcd74e0389b08de5265887ecd9449fa3",
+    "expected_sha256": "49a3bee6a78e71ce6f86d8e684776ba5ed1c74a806d8c11585803b85f2520255",
+    "feature_additions": {
+      "cosmic-notifications": [
+        "cyxia-static"
+      ],
+      "wayland-sys": [
+        "cyxia-static-client"
+      ],
+      "xkbcommon-dl": [
+        "static-link"
+      ]
+    },
+    "local_package_count": 5,
+    "lock_delta": {
+      "local_overrides": [
+        {
+          "name": "wayland-sys",
+          "removed_checksum": "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be",
+          "removed_source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.31.11"
+        },
+        {
+          "name": "xkbcommon-dl",
+          "removed_checksum": "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5",
+          "removed_source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.4.2"
+        }
+      ],
+      "other_packages_unchanged": true,
+      "root_added_dependencies": [
+        "wayland-sys",
+        "xkbcommon-dl"
+      ]
+    },
+    "package_count": 493,
+    "workspace_package_count": 3
+  },
+  "root_after": {
+    ".cargo/config.toml": null,
+    "Cargo.lock": "2b1590c107e77d72c3f29b45733f9a2ed470f39462e0b247e95dbfeac185dd78",
+    "Cargo.toml": "7f2c752d53f13816af42c45190875921e5cfbb877ef3d96371b03dec4d896628"
+  },
+  "root_before": {
+    ".cargo/config.toml": "4072d29c310893343e33c041ca58f1a47b43540234474d5cf8bdd6589f8753c3",
+    "Cargo.lock": "448b38cb6bff1447d0b4fcd3b2f5bafa0b0c72d5200174f2932887eea831953b",
+    "Cargo.toml": "0afda2244785144f1639f9f3ea7bd4dd6b658f6123fd07031381b54e3a8cf0b3"
+  },
+  "runtime_verified": false,
+  "rust_flags": [
+    "--cfg",
+    "tokio_unstable"
+  ],
+  "rustdoc_flags": [
+    "--cfg",
+    "tokio_unstable"
+  ],
+  "schema_version": 1,
+  "source_lock_sha256": "448b38cb6bff1447d0b4fcd3b2f5bafa0b0c72d5200174f2932887eea831953b",
+  "source_tree_sha256": "2a8aba9545fd84ffff8254ebc1d352f347b143b27574ad7d3de498c9e262867b"
+}

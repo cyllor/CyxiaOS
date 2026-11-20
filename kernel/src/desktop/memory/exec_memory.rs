@@ -23,7 +23,18 @@ const IMAGE_TABLES: usize = LAYOUT.image_pages() / 512;
 const _: () = assert!(LAYOUT.image_pages() <= PAGES && PAGES < u16::MAX as usize);
 const _: () = assert!(LAYOUT.stack_pages <= 512 && LAYOUT.stack_base % 0x200000 == 0);
 const BYTES: u64 = PAGES as u64 * 4096;
+#[cfg(feature = "cosmic-session")]
+#[path = "exec_memory/arena.rs"]
+mod arena;
+#[cfg(feature = "cosmic-session")]
+pub const RESERVED_BYTES: u64 = arena::BYTES;
+#[cfg(not(feature = "cosmic-session"))]
 pub const RESERVED_BYTES: u64 = BYTES * MAX_PROCESSES as u64;
+// The session arena must hold at least one full per-image virtual window and
+// stays within the reviewed shared budget. The aggregate boot fit against the
+// 1 GiB machine is verified by the guest boot loop, not assumed here.
+#[cfg(feature = "cosmic-session")]
+const _: () = assert!(BYTES <= arena::BYTES && arena::PAGES >= PAGES);
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(
     cyxia_platform_virt::KERNEL_POOL_END + super::user_heap::RESERVED_BYTES + RESERVED_BYTES
@@ -37,6 +48,8 @@ static POOL: AtomicU64 = AtomicU64::new(0);
 pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
+    #[cfg(feature = "cosmic-session")]
+    arena::init(range.start.0)?;
     POOL.store(range.start.0, Ordering::Relaxed);
     Ok(())
 }
@@ -147,13 +160,28 @@ impl ExecMemory {
         let request =
             unsafe { AuthorizedGrantRequest::validated_ai(owner, PageCount(count as u32), model) }
                 .map_err(|_| Errno::Io)?;
-        let id = self
-            .ledger
-            .commit_and_redeem(request)
-            .map_err(|_| Errno::Nomem)?;
+        // Reserve the physical run before charging the grant so a backing
+        // failure leaves no committed lease; a failed commit returns the run.
+        #[cfg(feature = "cosmic-session")]
+        let run_base = arena::allocate(count, owner).map_err(|_| Errno::Nomem)?;
+        let id = match self.ledger.commit_and_redeem(request) {
+            Ok(id) => id,
+            Err(_) => {
+                #[cfg(feature = "cosmic-session")]
+                arena::release(run_base, count, owner).expect("uncommitted exec run");
+                return Err(Errno::Nomem);
+            }
+        };
         self.lease = Some((owner, id));
         ai::record(Domain::Elf, |c| c.grant(count as u64));
-        self.base = pool + slot as u64 * BYTES;
+        #[cfg(feature = "cosmic-session")]
+        {
+            self.base = run_base;
+        }
+        #[cfg(not(feature = "cosmic-session"))]
+        {
+            self.base = pool + slot as u64 * BYTES;
+        }
         self.pages = count as u32;
         self.model = model;
         // Boot-reserved private RAM, no current user-root/DMA aliases; zero before
@@ -352,6 +380,9 @@ impl ExecMemory {
                 })
                 .expect("owned executable after revocation");
             ai::record(Domain::Elf, |c| c.release(u64::from(self.pages)));
+            #[cfg(feature = "cosmic-session")]
+            arena::release(self.base, self.pages as usize, owner)
+                .expect("owned executable run after revocation");
             self.slots.fill(0);
             self.permissions.fill(0);
             self.pages = 0;
@@ -366,6 +397,8 @@ pub fn init_pc() -> Result<(), Errno> {
         return Err(Errno::Busy);
     }
     let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    #[cfg(feature = "cosmic-session")]
+    arena::init(base.0)?;
     POOL.store(base.0, Ordering::Release);
     Ok(())
 }

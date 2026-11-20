@@ -185,6 +185,12 @@ struct Marker {
     start: u64,
     end: u64,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct RightsQueue {
+    pub owner: u32,
+    pub handle: Handle,
+    pub ticket: crate::ancillary::Ticket,
+}
 struct Stream {
     bytes: [u8; BUFFER_BYTES],
     head: usize,
@@ -888,6 +894,86 @@ impl UnixSockets {
             .iter()
             .flatten()
             .any(|c| c.incoming.iter().any(|s| s.marker_count != 0))
+    }
+    /// Each receive queue belongs to its endpoint's OFD. Before accept, the
+    /// listener is the only externally reachable owner of the reserved peer.
+    pub(crate) fn rights_queues(
+        &self,
+    ) -> Result<[Option<RightsQueue>; crate::ancillary::MESSAGES], Errno> {
+        let mut queues = [None; crate::ancillary::MESSAGES];
+        let mut count = 0;
+        for (index, slot) in self.endpoints.iter().enumerate() {
+            let Some(endpoint) = slot.endpoint else {
+                continue;
+            };
+            let (connection, side) = match endpoint.kind {
+                Kind::Connected { connection, side } | Kind::PendingAccept { connection, side } => {
+                    (connection, side)
+                }
+                _ => continue,
+            };
+            let incoming = &self.connections[connection]
+                .as_ref()
+                .ok_or(Errno::Io)?
+                .incoming[side];
+            if incoming.marker_count == 0 {
+                continue;
+            }
+            let current = Handle((slot.generation << 8) | index as u64);
+            let (owner, handle) = if matches!(endpoint.kind, Kind::PendingAccept { .. }) {
+                self.endpoints
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, slot)| {
+                        let e = slot.endpoint?;
+                        let Kind::Listening(pending) = e.kind else {
+                            return None;
+                        };
+                        pending.handles[..pending.len]
+                            .contains(&Some(current))
+                            .then_some((e.owner, Handle((slot.generation << 8) | i as u64)))
+                    })
+                    .ok_or(Errno::Io)?
+            } else {
+                (endpoint.owner, current)
+            };
+            for marker in incoming.markers[..incoming.marker_count].iter().flatten() {
+                if count == queues.len()
+                    || queues[..count]
+                        .iter()
+                        .flatten()
+                        .any(|q: &RightsQueue| q.ticket == marker.ticket)
+                {
+                    return Err(Errno::Io);
+                }
+                queues[count] = Some(RightsQueue {
+                    owner,
+                    handle,
+                    ticket: marker.ticket,
+                });
+                count += 1;
+            }
+        }
+        Ok(queues)
+    }
+    /// Detach only selected ownership markers. Payload is inaccessible once its
+    /// owner is unreachable, and is zeroed by the normal endpoint close path.
+    pub(crate) fn detach_rights(&mut self, tickets: &[Option<crate::ancillary::Ticket>]) {
+        for connection in self.connections.iter_mut().flatten() {
+            for stream in &mut connection.incoming {
+                let old_count = stream.marker_count;
+                let mut kept = 0;
+                for index in 0..old_count {
+                    let marker = stream.markers[index].expect("live message marker");
+                    if !tickets.contains(&Some(marker.ticket)) {
+                        stream.markers[kept] = Some(marker);
+                        kept += 1;
+                    }
+                }
+                stream.markers[kept..old_count].fill(None);
+                stream.marker_count = kept;
+            }
+        }
     }
     pub fn close_owner(&mut self, owner: u32) {
         // Byte-only compatibility API cannot silently lose strong references.

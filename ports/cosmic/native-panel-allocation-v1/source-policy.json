@@ -1,0 +1,18 @@
+{
+  "kind": "cosmic-panel-allocation-v1",
+  "upstream_commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+  "parent_port": "ports/cosmic/native-panel-linux-v2",
+  "parent_policy_sha256": "5953657424bbac8812a44eb6227421b9283611008def949bcc9057c048587aa9",
+  "patch_sha256": "70a78cf0ad80a57b78c2a654fa4e024682f1e634f0f19f2b8b3e0c40c35f9bef",
+  "before": {
+    "cosmic-panel-bin/src/xdg_shell_wrapper/util.rs": "e80167cfe0c33998540f8b036cdca02d8ac97d0343a07670552a028a43014114",
+    "cosmic-panel-bin/src/space/panel_space.rs": "d8d8753eb034420571a459cc364801844f2e0989e780784d24fa5023a05fceaa",
+    "cosmic-panel-bin/src/space/wrapper_space.rs": "0dedfd38c2fa1ab1ec8ab7daffda07d21310e76cc13478d59f22878fe014ac28"
+  },
+  "after": {
+    "cosmic-panel-bin/src/xdg_shell_wrapper/util.rs": "bdaf2bdc34dc65b628a6e9be4f4e7943658375901ef0f476291fe05cdcb2a520",
+    "cosmic-panel-bin/src/space/panel_space.rs": "3923c9f0354344f56d234a55e34151d1cedfd45b28c35d4cb4c3f1f528066fc6",
+    "cosmic-panel-bin/src/space/wrapper_space.rs": "831af7234ef76134ea91858e8b8eaf1bd3fb2e2c771d66692e71b0fe1cc364db"
+  },
+  "boundary": "Changes only allocation order and error propagation. All workspace members, native bindings, locked packages, default config and resource limits remain unchanged. No desktop/session success claim."
+}

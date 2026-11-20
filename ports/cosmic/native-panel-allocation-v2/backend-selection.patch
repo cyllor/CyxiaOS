@@ -1,0 +1,27 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,7 +5,7 @@
+     "xdg-shell-wrapper-config",
+ ]
+ resolver = "3"
+-exclude = ["native-deps/launch-pad", "native-deps/smithay", "native-deps/wayland-sys"]
++exclude = ["native-deps/launch-pad", "native-deps/smithay", "native-deps/wayland-sys", "native-deps/wayland-backend"]
+ 
+ [profile.dev]
+ opt-level = 1
+@@ -40,3 +40,4 @@
+ 
+ [patch.crates-io]
+ wayland-sys = { path = "native-deps/wayland-sys" }
++wayland-backend = { path = "native-deps/wayland-backend" }
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4628,8 +4628,6 @@
+ [[package]]
+ name = "wayland-backend"
+ version = "0.3.17"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
+ dependencies = [
+  "cc",
+  "downcast-rs",

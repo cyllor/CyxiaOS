@@ -105,6 +105,7 @@ impl Runner {
         let (budget_ms, model) =
             cyxia_ai_runtime::user_cpu_policy(self.thread.cpu_bound, competing.min(8))
                 .expect("bounded existing process quantum policy");
+        let budget_ms = if cfg!(feature = "cosmic-session") { budget_ms * 8 } else { budget_ms };
         ai::record(AiDomain::CpuQuantum, |c| c.proposal(model));
         Some((
             dispatch::Job {
@@ -225,7 +226,7 @@ impl Supervisor {
             + ready.saturating_sub(1);
         if online & 0b1110 == 0 {
             // Single-CPU machines retain the same existing synchronous backend.
-            if let Some(choice) = cyxia_ai_runtime::user_dispatch_policy(&candidates).unwrap() {
+            if let Some(choice) = super::process_dispatch_policy(&candidates) {
                 ai::record(AiDomain::CpuProcess, |c| c.proposal(choice.model));
                 let runner = &mut self.runners[choice.index];
                 let entered =
@@ -242,7 +243,7 @@ impl Supervisor {
             if online & (1 << (index + 1)) == 0 {
                 continue;
             }
-            let Some(choice) = cyxia_ai_runtime::user_dispatch_policy(&candidates).unwrap() else {
+            let Some(choice) = super::process_dispatch_policy(&candidates) else {
                 break;
             };
             candidates[choice.index] = None; // Distinct process; never sibling threads.
@@ -283,10 +284,13 @@ impl Supervisor {
             }
         }
         if tickets.iter().any(Option::is_some) {
-            // Wait for the first real completion, then stop every peer and drain
-            // the phase. A timeout cannot release roots or permit service work.
+            // Session workers keep their already granted, timer-bounded quanta:
+            // a polling parent's syscall must not repeatedly stop a CPU-bound
+            // child and force its complete address-space rebuild. Collect every
+            // real completion before any service work. Other profiles retain
+            // the original stop-on-first behavior and owned peer drain.
             let drain_deadline = started.saturating_add(1_000_000_000);
-            'first: loop {
+            'phase: loop {
                 for index in 0..3 {
                     if let Some(ticket) = tickets[index] {
                         if let Some(done) =
@@ -294,9 +298,14 @@ impl Supervisor {
                         {
                             completions[index] = Some(done);
                             tickets[index] = None;
-                            break 'first;
+                            if !cfg!(feature = "cosmic-session") {
+                                break 'phase;
+                            }
                         }
                     }
+                }
+                if tickets.iter().all(Option::is_none) {
+                    break;
                 }
                 let current = now_ns();
                 assert!(

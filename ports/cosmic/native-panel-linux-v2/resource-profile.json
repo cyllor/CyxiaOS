@@ -1,0 +1,17 @@
+{
+  "build_profiles": {
+    "panel-native-linux-x86_64-full-os-v1": {
+      "image_bytes": 67108864,
+      "jobs_max": 2,
+      "max_build_bytes": 3221225472,
+      "max_elf_bytes": 67108864,
+      "min_free_bytes": 1073741824,
+      "purpose": "Genuine original panel executable and all three workspace members; all 18 configured applet occurrences retained. Real native Wayland/EGL/child adapters; compilation and FullOs admission do not establish a running panel, applet lifecycle or complete COSMIC session.",
+      "stack_bytes": 2097152,
+      "target_runtime_validated": false,
+      "timeout_seconds": 3600
+    }
+  },
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl"
+}

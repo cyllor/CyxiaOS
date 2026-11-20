@@ -94,6 +94,9 @@ pub fn run(info: &PcBootInfo) -> ! {
     {
         cyxia_posix::runtime_directory::reset_at_boot(shell.fs_mut())
             .expect("private session runtime directory after recovery");
+        #[cfg(feature = "cosmic-session")]
+        cyxia_posix::runtime_directory::prepare_cosmic(shell.fs_mut())
+            .expect("COSMIC config and state watch roots after recovery");
         crate::log(b"SESSION_RUNTIME_READY path=/run/user/0 mode=0700 uid=0\n");
     }
     shell.banner(&mut out).expect("OS console");

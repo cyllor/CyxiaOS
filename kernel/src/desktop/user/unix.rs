@@ -11,8 +11,8 @@ pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> R
     // these pools. No borrowed reference escapes this serialized operation.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(SOCKETS) };
     let result = f(pool);
-    // Only this pool may be inspected here: ancillary cleanup can nest a
-    // different pool operation while the Unix pool is mutably borrowed.
+    // Other backend pools are released only after this borrow ends. Socket
+    // cleanup itself stays inside the safe POSIX pool operation without reentry.
     super::objects::table().observe_backend(|source| {
         let cyxia_posix::epoll::Source::Socket { owner, handle: raw } = source else {
             return None;
@@ -77,19 +77,16 @@ pub(super) fn handle(raw: u64) -> Handle {
     Handle::from_raw(raw)
 }
 
-/// Release detached tickets outside any OFD RefCell borrow. The whitelist
-/// excludes sockets, so this cannot recursively borrow the Unix socket pool.
+/// All socket effects are drained in one borrow; external effects follow it.
 fn discard(
     fs: &mut cyxia_ai_fs::FileSystem,
     ticket: cyxia_posix::ancillary::Ticket,
     cancelled: bool,
 ) -> Result<(), Errno> {
-    let (released, count) = super::objects::table().discard_rights(fs, ticket)?;
-    for item in released {
-        super::objects::release(fs, item)?;
-    }
-    receipt_release(count, cancelled);
-    Ok(())
+    let reclaimed = with(|sockets| {
+        super::objects::table().reclaim_socket_rights(fs, sockets, None, &[Some(ticket)], cancelled)
+    })?;
+    super::objects::finish_reclaim(fs, reclaimed)
 }
 pub(super) fn receipt_release(count: usize, cancelled: bool) {
     for (domain, units) in [
@@ -117,15 +114,16 @@ pub(super) fn read(
     Ok(n)
 }
 pub(super) fn close(fs: &mut cyxia_ai_fs::FileSystem, owner: u32, raw: u64) -> Result<(), Errno> {
-    let mut failed = None;
-    with(|s| {
-        s.close_with(owner, handle(raw), &mut |ticket| {
-            if let Err(e) = discard(fs, ticket, false) {
-                failed = Some(e);
-            }
-        })
+    let reclaimed = with(|sockets| {
+        super::objects::table().reclaim_socket_rights(
+            fs,
+            sockets,
+            Some(cyxia_posix::Released::Socket { owner, handle: raw }),
+            &[],
+            false,
+        )
     })?;
-    failed.map_or(Ok(()), Err)
+    super::objects::finish_reclaim(fs, reclaimed)
 }
 pub(super) fn shutdown(
     fs: &mut cyxia_ai_fs::FileSystem,
@@ -133,15 +131,12 @@ pub(super) fn shutdown(
     raw: u64,
     how: u64,
 ) -> Result<(), Errno> {
-    let mut failed = None;
-    with(|s| {
-        s.shutdown_with(owner, handle(raw), how, &mut |ticket| {
-            if let Err(e) = discard(fs, ticket, false) {
-                failed = Some(e);
-            }
-        })
+    let reclaimed = with(|sockets| {
+        let mut detached = cyxia_posix::ancillary::TicketBatch::new();
+        sockets.shutdown_with(owner, handle(raw), how, &mut |ticket| detached.push(ticket))?;
+        super::objects::table().reclaim_socket_rights(fs, sockets, None, detached.as_slice(), false)
     })?;
-    failed.map_or(Ok(()), Err)
+    super::objects::finish_reclaim(fs, reclaimed)
 }
 pub(super) fn write_rights(
     fs: &mut cyxia_ai_fs::FileSystem,

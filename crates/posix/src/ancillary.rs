@@ -3,6 +3,8 @@
 //! occupancy before staging; this mechanism never runs policy during cleanup.
 use crate::{Errno, Object, OpenDescriptions, Process, Released, open_description::Handle};
 use cyxia_ai_fs::FileSystem;
+mod socket;
+pub use socket::{DiscardedMessage, Reclaimed, TicketBatch};
 pub const MAX_RIGHTS: usize = 8;
 pub const MESSAGES: usize = 16;
 pub const REFERENCES: usize = 64;
@@ -117,6 +119,7 @@ impl Process<'_> {
             if !matches!(
                 object,
                 Object::File(_)
+                    | Object::Socket(_)
                     | Object::ReadOnly(..)
                     | Object::Pipe(_)
                     | Object::Event { .. }
@@ -380,12 +383,12 @@ mod tests {
         let mut fs = FileSystem::new();
         let mut p = Process::new(&objects, 1).unwrap();
         let event = p.eventfd(1, 0).unwrap();
-        let socket = p.install_socket(99, 0).unwrap();
+        let timer = p.timerfd_create(1, 0).unwrap();
         let ep = p.epoll_create(0).unwrap();
         let pty = p.install_pty(123, 0).unwrap();
         let dir = p.open(&mut fs, "/", crate::O_DIRECTORY, 0).unwrap();
         let before = objects.snapshot();
-        for unsupported in [0, socket, ep, pty, dir] {
+        for unsupported in [0, timer, ep, pty, dir] {
             assert_eq!(p.stage_rights(&[event, unsupported]), Err(Errno::Nosys));
             assert_eq!(objects.snapshot(), before);
         }

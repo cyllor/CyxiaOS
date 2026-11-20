@@ -83,9 +83,16 @@ impl Context {
     #[cfg(target_arch = "x86_64")]
     pub fn trace_entry_failure(&mut self, pid: u32, tid: u32, errno: Errno) {
         let error = self.entry_error.take();
-        trace_entry_error("complete_exit", pid, tid, format_args!(
-            "resume_error={error:?} errno={errno:?} pc={:#x} sp={:#x}", self.pc(), self.sp(),
-        ));
+        trace_entry_error(
+            "complete_exit",
+            pid,
+            tid,
+            format_args!(
+                "resume_error={error:?} errno={errno:?} pc={:#x} sp={:#x}",
+                self.pc(),
+                self.sp(),
+            ),
+        );
     }
     pub fn pc(&self) -> u64 {
         #[cfg(target_arch = "aarch64")]
@@ -318,7 +325,11 @@ pub unsafe fn enter(
             context.entry_error = Some(error);
             Errno::Io
         })?;
-    context.retry_pc = None;
+    // A timer may preempt the rewound SYSCALL before it executes. Keep its
+    // return PC until an actual exit consumes it, including signal delivery.
+    if !matches!(exit, UserExit::Preempted(_)) {
+        context.retry_pc = None;
+    }
     Ok(match exit {
         UserExit::Syscall(call) => {
             context.number = call.number;
@@ -389,14 +400,23 @@ pub fn publish_code(address: u64, length: usize) -> Result<(), Errno> {
         }
         let physical = address.checked_sub(crate::HIGH).ok_or(Errno::Fault)?;
         let end = physical.checked_add(length as u64).ok_or(Errno::Fault)?;
-        if (physical..end).step_by(4096).any(|page| !unsafe { x86_runtime_code_sealed(page) }) {
-            unsafe { crate::machine::runtime::seal_user_code(physical, length) }
-                .map_err(|error| {
-                    trace_entry_error("publish_code", 0, 0, format_args!(
-                        "error={error:?} va={address:#x} pa={physical:#x} bytes={length}",
-                    ));
+        if (physical..end)
+            .step_by(4096)
+            .any(|page| !unsafe { x86_runtime_code_sealed(page) })
+        {
+            unsafe { crate::machine::runtime::seal_user_code(physical, length) }.map_err(
+                |error| {
+                    trace_entry_error(
+                        "publish_code",
+                        0,
+                        0,
+                        format_args!(
+                            "error={error:?} va={address:#x} pa={physical:#x} bytes={length}",
+                        ),
+                    );
                     Errno::Io
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -452,6 +472,7 @@ impl Context {
         info: cyxia_posix::signal::Info,
         stack: cyxia_posix::signal::AltStack,
         restorer: u64,
+        restart: bool,
     ) -> Result<(), Errno> {
         #[cfg(target_arch = "aarch64")]
         {
@@ -471,7 +492,7 @@ impl Context {
             }
             cyxia_posix::signal::encode_frame(out, &state, mask, signal, info)?;
             cyxia_posix::signal::set_frame_stack(out, stack, self.sp());
-            let _ = (address, restorer);
+            let _ = (address, restorer, restart);
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
@@ -485,7 +506,7 @@ impl Context {
                 fault: self.fault,
                 fxsave: cpu.fxsave,
             };
-            if let Some(pc) = self.retry_pc {
+            if let Some(pc) = self.retry_pc.filter(|_| !restart) {
                 state.pc = pc;
                 state.registers[14] = (-(Errno::Intr as i64)) as u64;
             }
@@ -672,20 +693,36 @@ fn log_x86_fault(vector: u16, error: u64, address: u64, instruction: u64) {
 /// Never call while an AP user phase owns a context/root. Zero PID/TID means
 /// unavailable here; the enclosing prepare diagnostic supplies that identity.
 #[cfg(target_arch = "x86_64")]
-pub fn trace_entry_error(stage: &'static str, pid: u32, tid: u32, detail: core::fmt::Arguments<'_>) {
+pub fn trace_entry_error(
+    stage: &'static str,
+    pid: u32,
+    tid: u32,
+    detail: core::fmt::Arguments<'_>,
+) {
     use core::fmt::Write;
-    struct Line { bytes: [u8; 384], len: usize }
+    struct Line {
+        bytes: [u8; 384],
+        len: usize,
+    }
     impl core::fmt::Write for Line {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
             let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
-            self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?
+            self.bytes
+                .get_mut(self.len..end)
+                .ok_or(core::fmt::Error)?
                 .copy_from_slice(text.as_bytes());
             self.len = end;
             Ok(())
         }
     }
-    let mut line = Line { bytes: [0; 384], len: 0 };
-    writeln!(line, "USER_ENTRY_ERROR stage={stage} pid={pid} tid={tid} {detail}")
-        .expect("bounded user entry diagnostic");
+    let mut line = Line {
+        bytes: [0; 384],
+        len: 0,
+    };
+    writeln!(
+        line,
+        "USER_ENTRY_ERROR stage={stage} pid={pid} tid={tid} {detail}"
+    )
+    .expect("bounded user entry diagnostic");
     crate::log(&line.bytes[..line.len]);
 }

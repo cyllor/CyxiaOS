@@ -70,6 +70,32 @@ const FAULT_LABEL: &str = "fault";
 const SLOTS: usize = MAX_PROCESSES;
 const USER_POOL: u32 = POOL_PAGES;
 const _: () = assert!(core::mem::size_of::<Arena>() == MAPPED_PAGES as usize * 4096);
+// The session process layout must match the versioned session admission domain
+// (ai-runtime SESSION_PROCESS_SLOTS); a drift would silently mis-size the pools.
+#[cfg(feature = "cosmic-session")]
+const _: () = assert!(
+    cyxia_posix::usermem::MAX_PROCESSES == cyxia_ai_runtime::SESSION_PROCESS_SLOTS as usize
+);
+/// Admission model reported by the native process start markers; matches the
+/// policy selected in Runner::start (session 8200 vs demo 8193).
+#[cfg(feature = "cosmic-session")]
+const PROCESS_ADMISSION_MODEL: u64 = cyxia_ai_runtime::SESSION_PROCESS_MODEL_ID;
+#[cfg(not(feature = "cosmic-session"))]
+const PROCESS_ADMISSION_MODEL: u64 = 8193;
+/// Versioned process selector. The session profile widens the candidate domain
+/// to SESSION_PROCESS_SLOTS; the demo path stays bounded to 8. Mirrors the
+/// thread selector's feature-gated policy choice with unchanged ranking and
+/// starvation guard. Every caller historically unwrapped the policy result.
+fn process_dispatch_policy(
+    candidates: &[Option<cyxia_ai_runtime::UserCandidate>],
+) -> Option<cyxia_ai_runtime::UserDispatch> {
+    if cfg!(feature = "cosmic-session") {
+        cyxia_ai_runtime::session_process_dispatch_policy(candidates)
+    } else {
+        cyxia_ai_runtime::user_dispatch_policy(candidates)
+    }
+    .unwrap()
+}
 #[cfg(target_arch = "aarch64")]
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
@@ -139,6 +165,8 @@ struct Runner {
     shared: shared_memory::SharedMappings,
     #[cfg(feature = "ported")]
     linux: bool,
+    #[cfg(feature = "ported")]
+    tee_stderr: bool,
     thread: Thread,
     #[cfg(feature = "ported")]
     threads: threads::Group,
@@ -171,6 +199,8 @@ impl Runner {
             shared: shared_memory::SharedMappings::new(),
             #[cfg(feature = "ported")]
             linux: false,
+            #[cfg(feature = "ported")]
+            tee_stderr: false,
             thread: Thread::new(),
             #[cfg(feature = "ported")]
             threads: threads::Group::new(),
@@ -262,7 +292,17 @@ impl Runner {
         }
         process_arch::make_writable(self.arena.base_ptr() as u64, CODE_BYTES)?;
         let entry = cyxia_posix::image::load_for(image, &mut self.arena, process_arch::IMAGE_ABI)?;
+        // The session profile selects the versioned session admission domain
+        // (model 8200, 322-page ledger); the demo path keeps model 8193 unchanged.
+        #[cfg(feature = "cosmic-session")]
+        attempt.proposed(cyxia_ai_runtime::SESSION_PROCESS_MODEL_ID);
+        #[cfg(not(feature = "cosmic-session"))]
         attempt.proposed(8193);
+        #[cfg(feature = "cosmic-session")]
+        let (admitted, model) =
+            cyxia_ai_runtime::session_process_memory_policy(ledger.snapshot().free, MAPPED_PAGES)
+                .map_err(|_| Errno::Io)?;
+        #[cfg(not(feature = "cosmic-session"))]
         let (admitted, model) =
             cyxia_ai_runtime::user_memory_policy(ledger.snapshot().free, MAPPED_PAGES)
                 .map_err(|_| Errno::Io)?;
@@ -703,18 +743,29 @@ impl Runner {
         }
         #[cfg(feature = "ported")]
         if self.linux && self.thread.signals.ready() {
-            // Blocking descriptor calls saved the syscall for retry. A caught signal
-            // interrupts that call instead; SA_RESTART is explicitly unsupported.
-            if self.thread.retry_syscall {
-                self.thread
-                    .context
-                    .cancel_restart()
-                    .expect("saved syscall return PC");
-                self.thread.retry_syscall = false;
+            // Save a replayable context for unfinished restartable waits. The
+            // disposition can change before delivery: decide SA_RESTART when
+            // constructing the actual handler frame, not when waking here.
+            if self.signal_wait_restartable() {
+                if !self.thread.retry_syscall {
+                    self.thread
+                        .context
+                        .restart_syscall()
+                        .expect("saved syscall");
+                    self.thread.retry_syscall = true;
+                }
+            } else {
+                if self.thread.retry_syscall {
+                    self.thread
+                        .context
+                        .cancel_restart()
+                        .expect("saved syscall return PC");
+                    self.thread.retry_syscall = false;
+                }
+                self.thread.retry_descriptor = None;
+                let error = self.sleep_interrupted().err().unwrap_or(Errno::Intr);
+                self.thread.context.set_result((-(error as i64)) as u64);
             }
-            self.thread.retry_descriptor = None;
-            let error = self.sleep_interrupted().err().unwrap_or(Errno::Intr);
-            self.thread.context.set_result((-(error as i64)) as u64);
             self.thread.waiting = None;
             self.status.state = UserState::Running;
             self.thread.ready_since = time;
@@ -936,7 +987,9 @@ impl Runner {
             }
             Err(error) => {
                 #[cfg(target_arch = "x86_64")]
-                self.thread.context.trace_entry_failure(self.status.pid, self.thread.tid, error);
+                self.thread
+                    .context
+                    .trace_entry_failure(self.status.pid, self.thread.tid, error);
                 #[cfg(target_arch = "aarch64")]
                 let _ = error;
                 self.finish(fs, ledger, ipc, UserState::Fault, 139);
@@ -969,11 +1022,23 @@ impl Runner {
         let thread_decision = self.threads.shared.dispatch.take();
         let (budget, model) =
             cyxia_ai_runtime::user_cpu_policy(self.thread.cpu_bound, competing.min(8)).unwrap();
+        // COSMIC session: many-thread async runtimes collapse under 1/4ms quanta +
+        // per-dispatch wake overhead; larger quanta/caps restore throughput (demo unchanged).
+        let budget = if cfg!(feature = "cosmic-session") {
+            budget * 8
+        } else {
+            budget
+        };
+        const SYSCALL_CAP: usize = if cfg!(feature = "cosmic-session") {
+            512
+        } else {
+            32
+        };
         ai::record(AiDomain::CpuQuantum, |c| c.proposal(model));
         let mut entered = false;
         // AI controls 1/4ms dispatch budget; IRQ exits bound uncooperative code.
         // At most 32 syscall returns per dispatch is an independent safety cap.
-        for _ in 0..32 {
+        for _ in 0..SYSCALL_CAP {
             #[cfg(feature = "ported")]
             match self.deliver_signal() {
                 Ok(None) => {}
@@ -1095,7 +1160,14 @@ impl Supervisor {
             "pcmanfm"
         } else if matches!(name, "fsync-verify" | "fsync-root") {
             "fsync-probe"
-        } else if matches!(name, "fsync-concurrent" | "fsync-interrupt" | "fsync-reuse" | "fsync-admitted-interrupt" | "fsync-concurrent-verify") {
+        } else if matches!(
+            name,
+            "fsync-concurrent"
+                | "fsync-interrupt"
+                | "fsync-reuse"
+                | "fsync-admitted-interrupt"
+                | "fsync-concurrent-verify"
+        ) {
             "fsync-concurrent-probe"
         } else if name == "heap-pool-hold" {
             "heap-pool-probe"
@@ -1103,6 +1175,8 @@ impl Supervisor {
             "thread-exit-probe"
         } else if name == "cosmic-session-version" {
             "cosmic-session"
+        } else if name == "notifications-peer-handshake" {
+            "notifications-peer-probe"
         } else if matches!(name, "theme-defaults-light" | "theme-defaults-dark") {
             "theme-defaults"
         } else if name == "pipe-capacity-legacy" {
@@ -1113,7 +1187,15 @@ impl Supervisor {
             "settings-probe"
         } else if name == "cosmic-version" {
             "cosmic-comp"
-        } else if matches!(name, "cosmic-config-defaults" | "cosmic-config-init" | "cosmic-config-check" | "cosmic-config-verify" | "cosmic-config-raw" | "cosmic-config-values") {
+        } else if matches!(
+            name,
+            "cosmic-config-defaults"
+                | "cosmic-config-init"
+                | "cosmic-config-check"
+                | "cosmic-config-verify"
+                | "cosmic-config-raw"
+                | "cosmic-config-values"
+        ) {
             "cosmic-config"
         } else if matches!(
             name,
@@ -1130,8 +1212,12 @@ impl Supervisor {
             .iter()
             .find(|(n, _, _)| *n == image_name)
             .ok_or(Errno::Noent)?;
-        let plan = cyxia_posix::executable::parse_for_profile(bytes, process_arch::IMAGE_ABI, super::exec_memory::PROFILE)
-            .map_err(|_| Errno::Inval)?;
+        let plan = cyxia_posix::executable::parse_for_profile(
+            bytes,
+            process_arch::IMAGE_ABI,
+            super::exec_memory::PROFILE,
+        )
+        .map_err(|_| Errno::Inval)?;
         // Read-only boot assets retain their bytes in kernel ROM mappings.
         // Directories use the real RAM filesystem and its ordinary AI admission.
         let mut directories = Process::empty(objects::table(), 0);
@@ -1157,9 +1243,27 @@ impl Supervisor {
             fs.register_boot_file(path)?;
         }
         fs.register_boot_file(cyxia_ai_fs::Path::resolve(
-            cyxia_ai_fs::Path::ROOT, "/dev/null",
+            cyxia_ai_fs::Path::ROOT,
+            "/dev/null",
         )?)?;
-        let uses_session_runtime = matches!(image_name, "cosmic-comp" | "cosmic-config" | "cosmic-session" | "cosmic-settings-daemon" | "cosmic-notifications" | "notification-probe" | "settings-probe" | "theme-defaults" | "session-process-probe" | "flock-probe" | "dbus-daemon" | "dbus-send" | "dbus-probe");
+        let uses_session_runtime = matches!(
+            image_name,
+            "cosmic-comp"
+                | "cosmic-config"
+                | "cosmic-session"
+                | "session-env-probe"
+                | "cosmic-settings-daemon"
+                | "cosmic-panel"
+                | "cosmic-notifications"
+                | "notification-probe"
+                | "settings-probe"
+                | "theme-defaults"
+                | "session-process-probe"
+                | "flock-probe"
+                | "dbus-daemon"
+                | "dbus-send"
+                | "dbus-probe"
+        );
         if uses_session_runtime {
             cyxia_posix::runtime_directory::validate(fs)?;
         }
@@ -1173,39 +1277,76 @@ impl Supervisor {
         let owner = runner.lease.ok_or(Errno::Io)?.0;
         let normal_argv: &[&[u8]] = &[path.as_bytes()];
         let legacy_environment: &[&[u8]] = &[
-            b"PATH=/bin", b"LANG=C", b"TZ=UTC", b"DISPLAY=:0", b"HOME=/",
-            b"GSETTINGS_BACKEND=memory", b"GIO_USE_VFS=local", b"GTK_USE_PORTAL=0",
+            b"PATH=/bin",
+            b"LANG=C",
+            b"TZ=UTC",
+            b"DISPLAY=:0",
+            b"HOME=/",
+            b"GSETTINGS_BACKEND=memory",
+            b"GIO_USE_VFS=local",
+            b"GTK_USE_PORTAL=0",
             b"GTK_IM_MODULE=simple",
         ];
         let session_environment: &[&[u8]] = &[
-            b"PATH=/bin", b"LANG=en_US.UTF-8", b"TZ=UTC", b"HOME=/",
+            b"PATH=/bin",
+            b"LANG=en_US.UTF-8",
+            b"TZ=UTC",
+            b"HOME=/",
             cyxia_posix::runtime_directory::ENVIRONMENT,
             b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
         ];
-        let cosmic_argv: &[&[u8]] = &[path.as_bytes(), if name == "cosmic-version" { b"--version" } else { b"--no-xwayland" }];
+        let cosmic_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            if name == "cosmic-version" {
+                b"--version"
+            } else {
+                b"--no-xwayland"
+            },
+        ];
         let session_argv: &[&[u8]] = if name == "cosmic-session-version" {
             &[path.as_bytes(), b"--version"]
         } else {
             &[path.as_bytes(), b"/bin/cosmic-comp", b"--no-xwayland"]
         };
         let session_probe_argv: &[&[u8]] = &[path.as_bytes(), path.as_bytes()];
+        let notifications_handshake_argv: &[&[u8]] = &[path.as_bytes(), b"handshake"];
         let settings_prepare_argv: &[&[u8]] = &[path.as_bytes(), b"prepare"];
-        let theme_defaults_argv: &[&[u8]] = &[path.as_bytes(), if name == "theme-defaults-light" { b"light" } else { b"dark" }];
+        let theme_defaults_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            if name == "theme-defaults-light" {
+                b"light"
+            } else {
+                b"dark"
+            },
+        ];
         let pipe_capacity_legacy_argv: &[&[u8]] = &[path.as_bytes(), b"6"];
         let filesystem_verify_argv: &[&[u8]] = &[path.as_bytes(), b"verify"];
         // The direct desktop shell entry targets the existing first compositor.
         // Session-launched children instead inherit its actual SetEnv handoff.
         let settings_environment: &[&[u8]] = &[
-            b"PATH=/bin", b"LANG=en_US.UTF-8", b"TZ=UTC", b"HOME=/",
+            b"PATH=/bin",
+            b"LANG=en_US.UTF-8",
+            b"TZ=UTC",
+            b"HOME=/",
             cyxia_posix::runtime_directory::ENVIRONMENT,
             b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
-            b"WAYLAND_DISPLAY=wayland-1", b"WAYLAND_DEBUG=client", b"RUST_LOG=warn",
+            b"XDG_CONFIG_HOME=/run/user/0/.config",
+            b"XDG_STATE_HOME=/run/user/0/.local/state",
+            b"WAYLAND_DISPLAY=wayland-1",
+            b"RUST_LOG=debug",
         ];
-        let config_argv: &[&[u8]] = &[path.as_bytes(), match name {
-            "cosmic-config-defaults" => b"defaults", "cosmic-config-init" => b"init",
-            "cosmic-config-check" => b"exercise", "cosmic-config-verify" => b"verify",
-            "cosmic-config-raw" => b"exercise-raw", "cosmic-config-values" => b"verify-values", _ => b"",
-        }];
+        let config_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            match name {
+                "cosmic-config-defaults" => b"defaults",
+                "cosmic-config-init" => b"init",
+                "cosmic-config-check" => b"exercise",
+                "cosmic-config-verify" => b"verify",
+                "cosmic-config-raw" => b"exercise-raw",
+                "cosmic-config-values" => b"verify-values",
+                _ => b"",
+            },
+        ];
         // Fixture roles select a workload, never the authenticated Wayland
         // identity: the compositor obtains that from the connected socket.
         let dynamic_role: &[u8] = match name {
@@ -1254,17 +1395,35 @@ impl Supervisor {
             b"--config-file",
             b"/etc/xdg/openbox/rc.xml",
         ];
-        let dbus_daemon_argv: &[&[u8]] = &[path.as_bytes(), b"--nofork", b"--nopidfile",
-            b"--print-address", b"--config-file=/etc/dbus-1/session.conf"];
-        let dbus_send_argv: &[&[u8]] = &[path.as_bytes(), b"--session", b"--print-reply",
-            b"--dest=org.freedesktop.DBus", b"/org/freedesktop/DBus", b"org.freedesktop.DBus.ListNames"];
+        let dbus_daemon_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            b"--nofork",
+            b"--nopidfile",
+            b"--print-address",
+            b"--config-file=/etc/dbus-1/session.conf",
+        ];
+        let dbus_send_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            b"--session",
+            b"--print-reply",
+            b"--dest=org.freedesktop.DBus",
+            b"/org/freedesktop/DBus",
+            b"org.freedesktop.DBus.ListNames",
+        ];
         let dbus_uuid_argv: &[&[u8]] = &[path.as_bytes(), b"--ensure=/etc/machine-id"];
-        let fsync_argv: &[&[u8]] = &[path.as_bytes(), match name {
-            "fsync-verify" => b"verify", "fsync-root" => b"sync-root",
-            "fsync-concurrent" => b"concurrent", "fsync-interrupt" => b"interrupt",
-            "fsync-admitted-interrupt" => b"admitted-interrupt",
-            "fsync-reuse" => b"reuse", "fsync-concurrent-verify" => b"verify", _ => b"",
-        }];
+        let fsync_argv: &[&[u8]] = &[
+            path.as_bytes(),
+            match name {
+                "fsync-verify" => b"verify",
+                "fsync-root" => b"sync-root",
+                "fsync-concurrent" => b"concurrent",
+                "fsync-interrupt" => b"interrupt",
+                "fsync-admitted-interrupt" => b"admitted-interrupt",
+                "fsync-reuse" => b"reuse",
+                "fsync-concurrent-verify" => b"verify",
+                _ => b"",
+            },
+        ];
         let heap_hold_argv: &[&[u8]] = &[path.as_bytes(), b"hold"];
         let bad_stack_argv: &[&[u8]] = &[path.as_bytes(), b"bad-stack"];
         let egl_x11_argv: &[&[u8]] = &[path.as_bytes(), b"x11"];
@@ -1274,7 +1433,16 @@ impl Supervisor {
             &plan,
             super::exec_memory::StackInput {
                 random,
-                argv: if matches!(name, "fsync-verify" | "fsync-root" | "fsync-concurrent" | "fsync-interrupt" | "fsync-reuse" | "fsync-admitted-interrupt" | "fsync-concurrent-verify") {
+                argv: if matches!(
+                    name,
+                    "fsync-verify"
+                        | "fsync-root"
+                        | "fsync-concurrent"
+                        | "fsync-interrupt"
+                        | "fsync-reuse"
+                        | "fsync-admitted-interrupt"
+                        | "fsync-concurrent-verify"
+                ) {
                     fsync_argv
                 } else if name == "heap-pool-hold" {
                     heap_hold_argv
@@ -1290,6 +1458,8 @@ impl Supervisor {
                     cosmic_argv
                 } else if image_name == "session-process-probe" {
                     session_probe_argv
+                } else if name == "notifications-peer-handshake" {
+                    notifications_handshake_argv
                 } else if image_name == "theme-defaults" {
                     theme_defaults_argv
                 } else if name == "pipe-capacity-legacy" {
@@ -1321,8 +1491,22 @@ impl Supervisor {
                 } else {
                     normal_argv
                 },
-                envp: if matches!(image_name, "cosmic-settings-daemon" | "cosmic-notifications") { settings_environment }
-                    else if uses_session_runtime { session_environment } else { legacy_environment },
+                envp: if matches!(
+                    image_name,
+                    "cosmic-settings-daemon"
+                        | "cosmic-notifications"
+                        | "cosmic-panel"
+                        | "env-probe"
+                        | "rust-env-probe"
+                        | "wayland-client-probe"
+                        | "zbus-probe"
+                ) {
+                    settings_environment
+                } else if uses_session_runtime {
+                    session_environment
+                } else {
+                    legacy_environment
+                },
                 execfn: path.as_bytes(),
             },
         ) {
@@ -1343,6 +1527,9 @@ impl Supervisor {
         runner.arena.clear();
         runner.thread.context = Context::initialize(plan.entry, sp, true)?;
         runner.linux = true;
+        // Observability: tee cosmic-comp stderr to serial so session-child blocks
+        // are visible (its stderr is otherwise piped to launch_pad). Demo unaffected.
+        runner.tee_stderr = cfg!(feature = "cosmic-session") && image_name == "cosmic-comp";
         Ok(slot)
     }
     fn launch(&mut self, mode: &str, native: bool) -> Result<usize, Errno> {
@@ -1502,8 +1689,8 @@ impl Supervisor {
                     match self.launch(mode, matches!(request, UserRequest::Spawn(_))) {
                         Ok(slot) => writeln!(
                             out,
-                            "\r\n{PROCESS_LABEL} pid={} started; memory AI_DIRECT model=8193 pages=8\r",
-                            self.runners[slot].status.pid
+                            "\r\n{PROCESS_LABEL} pid={} started; memory AI_DIRECT model={} pages=8\r",
+                            self.runners[slot].status.pid, PROCESS_ADMISSION_MODEL
                         )
                         .unwrap(),
                         Err(error) => writeln!(out, "\r\n{PROCESS_LABEL} start failed: {error:?}\r").unwrap(),
@@ -1562,7 +1749,7 @@ impl Supervisor {
         #[cfg(target_arch = "x86_64")]
         self.dispatch_parallel(candidates, shell, out);
         #[cfg(target_arch = "aarch64")]
-        if let Some(decision) = cyxia_ai_runtime::user_dispatch_policy(&candidates).unwrap() {
+        if let Some(decision) = process_dispatch_policy(&candidates) {
             ai::record(AiDomain::CpuProcess, |c| c.proposal(decision.model));
             let ready = candidates.iter().flatten().count();
             let competing = shell
@@ -1705,8 +1892,12 @@ impl Runner {
             .space_prepare_ns
             .saturating_add(now_ns().saturating_sub(started));
         if let Err(error) = result {
-            process_arch::trace_entry_error("prepare_space", self.status.pid, self.thread.tid,
-                format_args!("errno={error:?}"));
+            process_arch::trace_entry_error(
+                "prepare_space",
+                self.status.pid,
+                self.thread.tid,
+                format_args!("errno={error:?}"),
+            );
         }
         result
     }
@@ -1717,10 +1908,13 @@ impl Runner {
             process_arch::trace_entry_error(stage, pid, tid, format_args!("errno={error:?}"));
             error
         };
-        self.space.begin().map_err(|error| fail("build.begin", error))?;
+        self.space
+            .begin()
+            .map_err(|error| fail("build.begin", error))?;
         #[cfg(feature = "ported")]
         if self.linux {
-            self.executable.publish_space(&mut self.space)
+            self.executable
+                .publish_space(&mut self.space)
                 .map_err(|error| fail("build.executable", error))?;
         }
         #[cfg(not(feature = "ported"))]
@@ -1731,17 +1925,21 @@ impl Runner {
             let physical = self.arena.base_ptr() as u64 - super::HIGH;
             for index in 0..MAPPED_PAGES as usize {
                 let virtual_page = if index < 6 { 256 + index } else { 257 + index };
-                self.space.map(
-                    virtual_page as u64 * 4096,
-                    physical + index as u64 * 4096,
-                    if index < 4 { 5 } else { 3 },
-                ).map_err(|error| fail("build.native", error))?;
+                self.space
+                    .map(
+                        virtual_page as u64 * 4096,
+                        physical + index as u64 * 4096,
+                        if index < 4 { 5 } else { 3 },
+                    )
+                    .map_err(|error| fail("build.native", error))?;
             }
         }
-        self.heap.publish_space(&mut self.space)
+        self.heap
+            .publish_space(&mut self.space)
             .map_err(|error| fail("build.heap", error))?;
         #[cfg(feature = "ported")]
-        self.shared.publish_space(&mut self.space)
+        self.shared
+            .publish_space(&mut self.space)
             .map_err(|error| fail("build.shared", error))?;
         Ok(())
     }

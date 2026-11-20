@@ -1,0 +1,77 @@
+--- a/src/subscriptions/applet.rs
++++ b/src/subscriptions/applet.rs
+@@ -15,11 +15,40 @@
+ use cosmic_notifications_config::DAEMON_NOTIFICATIONS_FD;
+ use std::os::unix::io::FromRawFd;
+ 
++/// Own the optional peer independently of the public notifications bus.
++/// Dropping Conns also cancels an idle peer and releases its socket.
++#[derive(Debug)]
++pub struct PanelTask(tokio::task::JoinHandle<()>);
++
++impl PanelTask {
++    pub fn spawn(tx: Sender<Input>) -> Self {
++        Self(tokio::spawn(async move {
++            match setup_panel_conn(tx).await {
++                Ok(conn) => {
++                    info!("Created panel dbus server");
++                    std::future::pending::<()>().await;
++                    drop(conn);
++                }
++                Err(err) => error!("Failed to setup panel dbus server {}", err),
++            }
++        }))
++    }
++}
++
++impl Drop for PanelTask {
++    fn drop(&mut self) {
++        self.0.abort();
++    }
++}
++
+ pub async fn setup_panel_conn(tx: Sender<Input>) -> Result<Connection> {
+     let socket = setup_panel_socket()?;
++    // The inherited socket may precede panel initialization. Keep the active
++    // authentication deadline, starting when the peer actually sends data.
++    socket.readable().await?;
+     let guid = Guid::generate();
+     let conn = tokio::time::timeout(
+-        tokio::time::Duration::from_secs(1),
++        tokio::time::Duration::from_secs(5),
+         Builder::socket(socket)
+             .p2p()
+             .server(guid)
+@@ -49,7 +78,7 @@
+         bail!("DAEMON_NOTIFICATIONS_FD is not a valid RawFd.");
+     };
+ 
+-    let fd = unsafe { BorrowedFd::borrow_raw(raw_fd).try_clone_to_owned().unwrap() };
++    let fd = unsafe { BorrowedFd::borrow_raw(raw_fd).try_clone_to_owned()? };
+     info!("Connecting to daemon on fd {}", raw_fd);
+ 
+     rustix::io::fcntl_setfd(
+--- a/src/subscriptions/notifications.rs
++++ b/src/subscriptions/notifications.rs
+@@ -24,19 +24,13 @@
+     notifications: Connection,
+     pub tx: Sender<Input>,
+     rx: Receiver<Input>,
+-    _panel: Option<Connection>,
++    _panel: applet::PanelTask,
+ }
+ 
+ impl Conns {
+     pub async fn new() -> zbus::Result<Self> {
+         let (tx, rx) = channel(100);
+-        let panel = match applet::setup_panel_conn(tx.clone()).await {
+-            Ok(conn) => Some(conn),
+-            Err(err) => {
+-                error!("Failed to setup panel dbus server {}", err.to_string());
+-                None
+-            }
+-        };
++        let panel = applet::PanelTask::spawn(tx.clone());
+ 
+         for _ in 0..5 {
+             if let Some(conn) = ConnectionBuilder::session()

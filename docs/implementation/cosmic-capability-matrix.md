@@ -1,5 +1,85 @@
 # COSMIC 组件能力与依赖证据矩阵
 
+2026-11-20 Mesa/日历增量：已修复真实 16 槽满额时的软件 back buffer 失败回滚、
+延迟复制回调判空及两种 swap 的错误传播。原生当前表面/真实 FD 压力复现同一
+空指针错误，修复后拒绝、释放恢复与真实 readback/扫描输出共 15 项通过；
+七项真实函数宿主回归通过。完整 473 包 panel 与 127 个其他目录输入保持，
+原资源上限不变。正常 session 的真实日历已完成两轮开关，五个核心进程与原
+时钟 PID 8 在最终输入后均存活，无异常退出，两次关闭均回到共享资源基线。
+打开约 45/54 秒、关闭约 17 秒，15 秒交互与原 45 秒首帧仍 FAIL，完整桌面未通过。
+见 [Mesa 失败传播、原生恢复与日历两轮交互](v17-cosmic-mesa-wayland-oom-20261120.md)。以下保留历史状态。
+
+2026-11-20 EGL/时钟增量：同一真实 SDK 的 Wayland EGL、ES3 绘制、readback、
+frame callback 和实际扫描输出九项通过。已补入固定 Epoch 1.10.0 的真实时钟，
+保留完整 19 成员源码、637 包解析图与全部 GUI 特性，正常 session 显示真实
+日期和时间。实际定位并修复 xkbcommon-dl 的动态加载失败，以及零字节 memfd
+元数据误用页面保留模型而只允许 14/16 槽的问题；各五项客体回归、54 项 AI
+与 22 项宿主回归通过，原页面/FD/堆上限保留。独立镜像目录使用显式 192 MiB
+ROM profile，原 profile 不变。日历约 39 秒后有真实输出；后续独立故障栈确认
+真实 16 槽满额后 Mesa 软件渲染未传播分配失败，panel 空指针复制、退出 139。
+交互回归和原 45 秒首帧保持 FAIL，完整会话未通过。
+详见 [真实 EGL、时钟与日历故障证据](v17-cosmic-egl-time-applet-20261120.md)。以下保留历史状态。
+
+2026-11-20 panel 分配增量：保留所有配置身份，在 desktop/Exec 有效后才创建
+连接；分配错误正常返回，正常退出不预分配替代连接。真实压力回归另定位到固定
+wayland-backend 的 C FD 所有权泄漏，现保留 Rust 所有权直到 C API 成功，两个
+FD 的退还与恢复五项实测通过。完整 473 包、默认特性、原三成员、18 个配置项及
+原资源上限保留。正常 session 原 panel 和五个核心进程在 90.049 秒均存活，
+134 从两次降为零，XDG/core 存活判定转为 PASS。完整 GetFd/action 六项及 Socket
+回收十项仍通过。画面仍没有可用 applet，正常 P2P Broken pipe 与 EGL 诊断仍在；
+完整会话与语义首帧保持未通过。见
+[按需连接、错误传播与 C FD 所有权](v17-cosmic-panel-allocation-20261120.md)。以下保留历史状态。
+
+2026-11-19 Socket FD 增量：已补齐 SCM_RIGHTS 的 Socket 支持及有界循环回收。
+真实 notifications 模块的完整 GetFd/action 六项回归由 ENOSYS 转为 PASS；
+跨进程身份、创建者退出、弱 watch、自身/交叉/有根环、shutdown 链、截断和取消
+十项客体回归通过。96 轮交叉环后内核 OFD/引用/消息/watch 全部归零，202 次
+消息事件和 203 个引用单位授予/释放对账。原 SCM 十项、POSIX 全套 288 项、
+旧配置九项及宿主边界 21 项均通过，产品资源上限保持不变。
+正常会话 45 秒替换检查与公共通知名称查询仍通过，但 panel 再次两次 134，
+90 秒画面仍只有背景与指针，core 存活与完整会话保持未通过；panel FD 分配、
+真实 applet/应用供给和实际桌面交互仍待补齐。见
+[Socket FD 传递与引用环回收](v17-cosmic-socket-rights-20261119.md)。以下保留历史状态。
+
+2026-11-19 前序通知握手增量：真实 notifications 已采用版本化 peer-v2 源码修复，
+启动等待与公共服务注册分离，并将主动认证期限与现有 panel 的 5 秒期限对齐。
+8 秒启动延迟、停滞认证、取消/FD 回收、EOF 四项实际模块回归通过；完整 GUI、
+493 包解析图与资源上限保留。正常会话实际注册公共通知服务，90 秒未再出现旧的
+服务端认证超时，45 秒启动色条替换检查通过，但画面仍只有背景与指针。
+完整协议仍因 socket FD 的 SCM_RIGHTS 白名单返回 ENOSYS 而 FAIL；panel 仍两次
+134，前序已捕获其 FD 64/64 后 F_DUPFD_CLOEXEC 返回 EMFILE。正常 P2P 交互与
+完整会话仍未独立验收。见 [通知启动、主动认证与 panel FD 缺口](v17-cosmic-notifications-peer-20261119.md)。
+
+2026-11-19 面板/目录增量：已装入固定上游完整 45 个面板默认配置文件及许可证，
+真实配置库验证 Panel/Dock、18 个 applet 项和用户覆盖优先级；启动阶段已准备
+实际 config/state watch 根目录，真实 inotify 注册及文件创建事件回归通过。
+正常 session 的 NoConfigDirectory 与 state watch ENOENT 消失，panel 推进至
+8 线程初始化。本轮 45 秒像素诊断仍为部分扫描输出，保持 FAIL；后续观察到
+notifications/panel 的 D-Bus 握手超时。完整会话仍未通过。见
+[面板默认配置与 state watch 根目录](v17-cosmic-panel-defaults-state-20261119.md)。
+
+2026-11-19 信号/语言增量：x86 `SA_RESTART` 已完成等待唤醒与信号帧恢复语义，
+真实 musl 10 项回归通过，正常 session 的 SIGTERM 注册 EINVAL 不再出现。
+已补入完整 libX11 Compose、映射/别名及许可证；真实 xkbcommon 在四种 locale
+名称下生成正确组合字符。正常 session 在原 45 秒内替换启动色条，画面仍为背景
+和指针。panel 配置、九个缺失程序及通知/输入/回收仍待验证，完整会话保持未通过。
+见 [信号重启与完整 Compose 数据](v17-cosmic-signals-compose-20261119.md)。
+
+2026-11-19 后续：真实 notifications 已完成固定源码/离线构建与独立安装校验，
+正常 session 两次实际启动 notifications（PID 5）及 panel（PID 6），旧通知 ENOENT
+已消失。新增显式 `cosmic-core-services-v1`：要求五个核心程序并使用 128 MiB 原始
+ROM 目录；既有 profile 上限保留。完整会话仍失败于 SIGTERM 处理器注册 EINVAL，
+其他九个默认程序与通知协议/输入/回收仍待验证。见
+[通知供给与核心服务目录](v17-cosmic-notifications-sdk-20261119.md)。
+
+2026-11-19 增量：修复会话并行批次中快速返回的进程提前中止其他 CPU 工作的问题，
+真实客体 compositor 抢占计数从 3,817 降至 1；dev 配置的 45 秒首帧诊断仍失败。
+相同组件的 release 独立 compositor 在 45 秒通过必要的启动色条替换检查。
+相同组件的 release 正常会话两次完成 compositor 环境握手并启动 settings，随后
+因目录缺少 `cosmic-notifications.elf` 收到 ENOENT 并失败。完整会话保持未通过。
+复现、实际对照和下一项供给缺口见
+[并行批次与当前启动阻塞](v17-cosmic-parallel-phase-20261119.md)。下方保留历史证据。
+
 2026-11-15 settings 增量：真实 `cosmic-settings-daemon` 1.10.0 已在 x86 客体
 运行，完成 D-Bus 配置／状态通知、Wayland registry 交换、GTK3/GTK4 浅色到深色
 导出切换和断连清理。当前未移植的音量／亮度变更接口返回真实 NotSupported。

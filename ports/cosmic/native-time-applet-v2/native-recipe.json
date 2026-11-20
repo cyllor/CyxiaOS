@@ -1,0 +1,100 @@
+{
+  "binary": "cosmic-applet-time",
+  "commit": "406d1b7d627138fdf4078f654268d3d8774e50f1",
+  "component": "cosmic-applet-time",
+  "default_features": true,
+  "effective_lock_sha256": "0f6b9233f9f8cf33af3936ad709a85fab013a53b47b3c69b2b980566fe513222",
+  "features": [
+    "cosmic-applet-time/cyxia-native"
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "0d6cc1e080e9fdf624203b4eeebe6ba94b6af04e34429d1318b78c1ffe8dd613"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+      "sha256": "c422f121249fb6c0b9e3d1c75517edddec992e351ddaa8de5f8decbf9fa378bf"
+    },
+    {
+      "path": "mesa-native-port/build/src/egl/libEGL.a",
+      "sha256": "4140f6ebb604ea0c665face1e13ce6a15ac0c500c745b3dd459b96969b3f0353"
+    },
+    {
+      "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+      "sha256": "08fafc1900dca57cbdebff5c5153c16d76fb48c058c8df38d2a7bd7a5d109939"
+    },
+    {
+      "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+      "sha256": "4967a57f8eec6448a1fec7fde350813468794d0ec52c28bef9521510f1400d50"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "86e5f4038e8016e54d2c7bf03f217118e887b9c297c65daef014273940219930"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-server.a",
+      "sha256": "3edf9512cdf0ba010cbe390924daecc9ef18f333e75674eb85fc14fa64a1a2e6"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-egl.a",
+      "sha256": "6fac0b8bc4b63727774c4b884a68f6b5bafc277f6a8fae8ae1110e48bd0bc754"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "4a4b3fcb4d6f4eeddf8e1cafd61d492019316574ffa863cf908d1968e42daa98"
+    },
+    {
+      "path": "sysroot/usr/lib/libz.a",
+      "sha256": "d19b7c1992d57d50b5665f74794e81f5b18e2e9e0ce6a5cea0882ba26b67b914"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "09e77229334ea3f4c2fd3b312e3b3d5fb195e4fa7d4caa4d2f9d8f1c50f17708"
+    }
+  ],
+  "native_sdk_origin": {
+    "path": "runtime-sdk-origin.json",
+    "sha256": "925a3c493b0bcc01e31dcf0e273b1915c7a0b6657a6f8648f384cf13a5a36217"
+  },
+  "package": "cosmic-applet-time",
+  "patches": [
+    {
+      "path": "native.patch",
+      "sha256": "61efc9cac51b6de4cd3be5d20c0ec7b83adaa152b3cd9a1b6d16bd01887de649"
+    }
+  ],
+  "purpose": "bounded-build-experiment",
+  "resource_profile": "time-native-linux-x86_64-full-os-v1",
+  "schema_version": 1,
+  "source_lock_sha256": "0bb890b60ec1f55d9fb915bc701f244a3bfe32396d24a3ee61076211e512236d",
+  "static_link_inputs": [
+    "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+    "mesa-native-port/build/src/egl/libEGL.a",
+    "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+    "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libwayland-server.a",
+    "sysroot/usr/lib/libwayland-egl.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libz.a",
+    "sysroot/usr/lib/libxkbcommon.a"
+  ],
+  "target": "x86_64-unknown-linux-musl"
+}

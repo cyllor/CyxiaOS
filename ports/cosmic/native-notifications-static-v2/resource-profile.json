@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "notifications-static-bindings-x86_64-full-os-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Genuine notifications with versioned static Wayland client and XKB function tables; preserve GUI, a11y and X11 features. Source/lock/dependency and SDK identities remain explicit. Native and guest readiness require independent execution evidence.",
+      "jobs_max": 2,
+      "min_free_bytes": 1073741824,
+      "max_build_bytes": 3221225472,
+      "timeout_seconds": 3600,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

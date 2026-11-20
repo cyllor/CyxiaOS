@@ -131,8 +131,9 @@ int main(int argc,char **argv) {
     int bad[]={event,999};
     CHECK(send_rights(pair[0],"no",2,bad,2)==-1 && errno==EBADF,"invalid-later-fd");
     CHECK(read(pair[1],data,1)==-1 && errno==EAGAIN,"no-invalid-prefix");
-    CHECK(send_rights(pair[0],"no",2,&pair[0],1)==-1 && errno==ENOSYS,"unsupported-cycle");
-    CHECK(read(pair[1],data,1)==-1 && errno==EAGAIN,"no-unsupported-prefix");
+    CHECK(send_rights(pair[0],"S",1,&pair[0],1)==1,"socket-reference"); count=8;
+    CHECK(receive_rights(pair[1],data,1,received,&count,&flags,MSG_CMSG_CLOEXEC)==1 &&
+            data[0]=='S' && count==1 && close(received[0])==0,"socket-reference-receive");
     CHECK(send_rights(pair[0],"E",1,&event,1)==1,"fault-send");
     struct iovec vector={data,1};
     struct msghdr fault={.msg_iov=&vector,.msg_iovlen=1,.msg_control=(void *)(uintptr_t)1,.msg_controllen=24};
@@ -158,8 +159,8 @@ int main(int argc,char **argv) {
     puts("SCM_PROBE CONTROL_TRUNCATION PASS");
 
     CHECK(send_rights(pair[0],"F",1,dupfds,2)==1,"fd-full-send");
-    int filled[16], filled_count=0, copy;
-    while((copy=dup(event))>=0) filled[filled_count++]=copy;
+    int filled[64], filled_count=0, copy;
+    while(filled_count<64 && (copy=dup(event))>=0) filled[filled_count++]=copy;
     CHECK(errno==EMFILE && filled_count>0,"fill-fd-table"); count=8;
     CHECK(receive_rights(pair[1],data,1,received,&count,&flags,0)==1 && data[0]=='F' &&
             count==0 && (flags&MSG_CTRUNC),"fd-full-consumes-truncates");

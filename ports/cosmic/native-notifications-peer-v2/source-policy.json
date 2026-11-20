@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "cosmic-notifications-peer-v2",
+  "parent_port": "ports/cosmic/native-notifications-static-v2",
+  "parent_recipe_sha256": "383fc3716988c513aee79ff06002206463929526a95e4b8f04cd2a962610a308",
+  "parent_policy_sha256": "1d019f34e76492345c429ad0489904c1ff463e164fea57041015d5cc29f67c20",
+  "patch": {
+    "path": "notifications-peer-lifecycle.patch",
+    "sha256": "40a138bf3b9d08b10c4a7f849a1437001f33a1218e2034605660a116aa5c89aa"
+  },
+  "changed_files": {
+    "src/subscriptions/applet.rs": {
+      "before": {
+        "bytes": 4986,
+        "sha256": "b5d57c457e00493e9d591cf1238c566ef3a649b2c47de1e01d134dfc2c0953c9"
+      },
+      "after": {
+        "bytes": 5915,
+        "sha256": "246cf8f7449d55d0430c668cced6e98af93f5bd9b458413580d42de979193d8b"
+      }
+    },
+    "src/subscriptions/notifications.rs": {
+      "before": {
+        "bytes": 18097,
+        "sha256": "36dc8f15c04ee54af38cd2490b1d05e885aa6a661de930cb5997e02f1271070a"
+      },
+      "after": {
+        "bytes": 17894,
+        "sha256": "1787695f90693517481d9be2f825b12446f479a365116b0c8709c9fd2c091842"
+      }
+    }
+  },
+  "source_tree_sha256": "a356e8d6a2418ee367b5de5a88e88ce1d8c4cb1f228d05f5220ac402ac6935f5",
+  "active_handshake_seconds": 5,
+  "full_os_verified": false,
+  "cosmic_session_verified": false,
+  "client_handshake_seconds": 5
+}

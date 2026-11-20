@@ -737,6 +737,54 @@ pub fn user_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Erro
     ))
 }
 
+/// Metadata-only shared object admission. Creating an empty memfd consumes one
+/// preallocated slot and no physical pages. Resize retains its separate page
+/// policy and ledger; the backing table still enforces its actual capacity.
+pub const SHARED_OBJECT_MODEL_ID: u64 = 0x2009;
+pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = 16;
+pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > SHARED_OBJECT_MODEL_CAPACITY || requested == 0 || requested > SHARED_OBJECT_MODEL_CAPACITY {
+        return Err(Error::Invalid);
+    }
+    let features = [1, free as i32, requested as i32, 0];
+    let score: i32 = weights::SHARED_OBJECT.into_iter().zip(features).map(|(w, x)| w * x).sum();
+    Ok((score >= 0, SHARED_OBJECT_MODEL_ID))
+}
+
+/// Process-admission model for the full-OS COSMIC session profile, versioned
+/// separately from the demo Arena model 8193 (which stays unchanged).
+pub const SESSION_PROCESS_MODEL_ID: u64 = 0x2008;
+/// Session profile provisions 40 resident slots: the documented intact-default
+/// demand is up to 33 processes (broker + session + 13 direct children + 18
+/// applets), plus headroom for auxiliary helpers, extra outputs and activations.
+pub const SESSION_PROCESS_SLOTS: u32 = 40;
+/// Historical per-process base grant, unchanged from the demo Arena path.
+pub const SESSION_PROCESS_BASE_GRANT: u32 = 8;
+/// Synthetic teacher reserve (pages), matching the demo MEMORY objective.
+pub const SESSION_PROCESS_RESERVE: u32 = 2;
+/// Session ledger capacity derived from the slot count, not a magic number.
+pub const SESSION_LEDGER_PAGES: u32 =
+    SESSION_PROCESS_SLOTS * SESSION_PROCESS_BASE_GRANT + SESSION_PROCESS_RESERVE;
+
+/// Process admission for the full-OS COSMIC session profile. Raw-page features
+/// over the separately trained 0..SESSION_LEDGER_PAGES free / 1..8 request domain;
+/// out-of-domain inputs are rejected, never clamped. The demo model 8193 and its
+/// 64-page/8-slot boundary are untouched. Admission confers no authority: the
+/// kernel still enforces actual slot and ledger capacity, PID/generation,
+/// ownership, wait, failure rollback and reclamation before slot reuse.
+pub fn session_process_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > SESSION_LEDGER_PAGES || requested == 0 || requested > SESSION_PROCESS_BASE_GRANT {
+        return Err(Error::Invalid);
+    }
+    let features = [1, free as i32, requested as i32, 0];
+    let score: i32 = weights::SESSION_PROCESS
+        .into_iter()
+        .zip(features)
+        .map(|(w, x)| w * x)
+        .sum();
+    Ok((score >= 0, SESSION_PROCESS_MODEL_ID))
+}
+
 /// Anonymous user memory admission. Features are conservative 16-page units,
 /// within the separately trained 0..256 free / 1..128 request domain. This model
 /// has no authority to exceed actual capacity or per-process mapping limits.
@@ -879,6 +927,20 @@ pub fn full_os_thread_dispatch_policy(
     candidates: &[Option<UserCandidate>],
 ) -> Result<Option<UserDispatch>, Error> {
     if candidates.len() > 16 {
+        return Err(Error::Invalid);
+    }
+    Ok(rank_user_candidates(candidates))
+}
+
+/// Process selector for the full-OS COSMIC session profile. The session provisions
+/// SESSION_PROCESS_SLOTS resident processes, so the candidate domain is widened to
+/// that slot count while reusing the unchanged per-candidate CPU ranking and
+/// starvation guard. The demo process selector stays bounded to 8 candidates;
+/// this is a separate versioned domain, not a relaxation of the demo path.
+pub fn session_process_dispatch_policy(
+    candidates: &[Option<UserCandidate>],
+) -> Result<Option<UserDispatch>, Error> {
+    if candidates.len() > SESSION_PROCESS_SLOTS as usize {
         return Err(Error::Invalid);
     }
     Ok(rank_user_candidates(candidates))

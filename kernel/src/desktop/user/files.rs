@@ -108,7 +108,7 @@ impl Runner {
             self.thread.retry_descriptor = Some((fd, identity));
             // Shared OFDs are serialized by CPU0. Yield until the next service
             // tick and validate the exact descriptor generation before replay.
-            // Signals cancel this restart through the existing wait path.
+            // Signal delivery chooses replay or EINTR from the caught action.
             self.block(super::Wait::Retry(super::now().saturating_add(1)));
             return Ok(descriptor);
         }

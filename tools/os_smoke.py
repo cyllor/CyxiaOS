@@ -57,8 +57,11 @@ class Console:
         pc.require(len(self.raw) < 4 * 1024 * 1024, 'OS serial capture budget')
         pc.require(not any(marker in self.raw for marker in
                    (b'X86_FAIL', b'NATIVE_SERVICE_PANIC', b'NATIVE_SERVICE_CHECK_FAILED',
-                    b'POSIX CHECK FAILED', b'STORAGE_ERROR', b'_PROBE FAIL', b'_PROBE RESULT FAIL', b' panicked at ',
-                    b'start failed:', b'pair failed:')), 'guest failure')
+                    b'POSIX CHECK FAILED', b'STORAGE_ERROR', b' panicked at ',
+                    b'start failed:', b'pair failed:'))
+                   # A UART chunk may end in the prefix of FAILURE_ATOMICITY.
+                   # Require an actual delimiter, including for split failures.
+                   and not re.search(rb'_PROBE (?:RESULT )?FAIL[\s:]', self.raw), 'guest failure')
         if require_running:
             pc.require(self.process.poll() is None, 'QEMU exited unexpectedly')
 

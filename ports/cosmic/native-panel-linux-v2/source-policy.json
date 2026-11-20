@@ -1,0 +1,478 @@
+{
+  "acquisition_rebind": {
+    "guest_execution": false,
+    "lineage": "Three exact panel sources shallow-fetched at pinned commits; git_identity MATCH verified",
+    "prior_source_acquisition": {
+      "path": "artifacts/v017-cosmic-runtime-20261117-next/panel-source-acquisition-v1/report.json",
+      "sha256": "520200c46a6c61c88f369ba4a91b7cb5659a68ac436496b5380f8ad367807c3a"
+    },
+    "source_acquisition": {
+      "path": "artifacts/v017-panel-local-provenance/panel-source-acquisition-v1/report.json",
+      "sha256": "281119d511c0bc3ea6dab38bbe9a3d72463a2c6b174d446c83f0de6aa4e09ec0"
+    },
+    "verification": "artifacts/panel-source-acquisition-check.json"
+  },
+  "binary": "cosmic-panel",
+  "boundary": "Genuine original panel executable and all three workspace members; all 18 configured applet occurrences retained. Real native Wayland/EGL/child adapters; compilation and FullOs admission do not establish a running panel, applet lifecycle or complete COSMIC session.",
+  "commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+  "component": "cosmic-panel",
+  "cosmic_session_ready": false,
+  "cosmic_session_verified": false,
+  "default_features": true,
+  "directory": "cosmic-panel",
+  "effective_lock_sha256": "cc4162879f254d09f5002386e1b6f40a465f4ceddae4613d5ce9d3f2828cc321",
+  "features": [
+    "cosmic-panel-bin/cyxia-native"
+  ],
+  "full_cosmic_complete": false,
+  "git_sources": {
+    "launch_pad": {
+      "cache": "original",
+      "commit": "5b516ee6a012b5ad4a5acc0cf51b4472fc6733af",
+      "directory": "launch-pad-5b516ee",
+      "file_count": 14,
+      "git_tree": "0d423e6603a036c4b59c8a95c5f5ac5e598dd84b",
+      "prefix": "native-deps/launch-pad/",
+      "source_bytes": 53480,
+      "tree_sha256": "e24fc3326fcb72f9c10416394c9b7e58886c6a5c94318d2d294350eab5409a4b"
+    },
+    "panel": {
+      "cache": "original",
+      "commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+      "directory": "cosmic-panel",
+      "file_count": 144,
+      "git_tree": "664e1b3dec3d7790a80375a50361bcc09bd54988",
+      "prefix": "",
+      "source_bytes": 925213,
+      "tree_sha256": "52e93d47fa061694ee5ebd21a74d0ff80e75c64100acaf818024da13d399d81e"
+    },
+    "smithay": {
+      "cache": "native",
+      "commit": "0ff00983b6007257a7a161a4fe8b14a778e2ac8f",
+      "directory": "smithay-0ff0098",
+      "file_count": 343,
+      "git_tree": "eb3094b1b4bdd1ae5b9c3429df6305915d683ccf",
+      "prefix": "native-deps/smithay/",
+      "source_bytes": 4491978,
+      "tree_sha256": "0989dbae487f6df76ade83127ffea71edc8504595126260e9d2a08fb8d03096b"
+    }
+  },
+  "git_tree": "664e1b3dec3d7790a80375a50361bcc09bd54988",
+  "guest_execution": false,
+  "kind": "cosmic-panel-native-linux-v2",
+  "mesa_validation_rebind": {
+    "guest_execution": false,
+    "lineage": "Mesa consumption proof regenerated from verified local nm/link/producer-input evidence",
+    "native_mesa_validation": {
+      "path": "artifacts/v017-panel-local-provenance/mesa-wayland-consumption-v1/report.json",
+      "sha256": "dac053a48b6efaf0d36624a53ad39bd62e1da205eb58175a63efc94b368520c5"
+    },
+    "prior_native_mesa_validation": {
+      "path": "artifacts/v017-cosmic-runtime-20261117-next/mesa-wayland-consumption-v1/report.json",
+      "sha256": "e7817eaf044b63693a0b1e93a8c447cd8b9695fcb04eeca70d6f900162bc1647"
+    },
+    "verification": "artifacts/v017-panel-local-provenance/generation-summary.json"
+  },
+  "native_child_postimages": {
+    "native-deps/launch-pad/Cargo.toml": "302a7c4d85dc995d815af1b01f49b1fa6ec5072c36f0570b34f32ab930332647",
+    "native-deps/launch-pad/src/lib.rs": "682a30766db42643c2c1a622e33d33a142a332748661492a58d38177e36d500e",
+    "native-deps/launch-pad/src/native_child.rs": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97"
+  },
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "0d6cc1e080e9fdf624203b4eeebe6ba94b6af04e34429d1318b78c1ffe8dd613"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+      "sha256": "c422f121249fb6c0b9e3d1c75517edddec992e351ddaa8de5f8decbf9fa378bf"
+    },
+    {
+      "path": "mesa-native-port/build/src/egl/libEGL.a",
+      "sha256": "4140f6ebb604ea0c665face1e13ce6a15ac0c500c745b3dd459b96969b3f0353"
+    },
+    {
+      "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+      "sha256": "08fafc1900dca57cbdebff5c5153c16d76fb48c058c8df38d2a7bd7a5d109939"
+    },
+    {
+      "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+      "sha256": "4967a57f8eec6448a1fec7fde350813468794d0ec52c28bef9521510f1400d50"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "86e5f4038e8016e54d2c7bf03f217118e887b9c297c65daef014273940219930"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-server.a",
+      "sha256": "3edf9512cdf0ba010cbe390924daecc9ef18f333e75674eb85fc14fa64a1a2e6"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-egl.a",
+      "sha256": "6fac0b8bc4b63727774c4b884a68f6b5bafc277f6a8fae8ae1110e48bd0bc754"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "4a4b3fcb4d6f4eeddf8e1cafd61d492019316574ffa863cf908d1968e42daa98"
+    },
+    {
+      "path": "sysroot/usr/lib/libz.a",
+      "sha256": "d19b7c1992d57d50b5665f74794e81f5b18e2e9e0ce6a5cea0882ba26b67b914"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "09e77229334ea3f4c2fd3b312e3b3d5fb195e4fa7d4caa4d2f9d8f1c50f17708"
+    }
+  ],
+  "native_mesa_validation": {
+    "path": "artifacts/v017-panel-local-provenance/mesa-wayland-consumption-v1/report.json",
+    "sha256": "dac053a48b6efaf0d36624a53ad39bd62e1da205eb58175a63efc94b368520c5"
+  },
+  "native_sdk_origin": {
+    "path": "runtime-sdk-origin.json",
+    "sha256": "925a3c493b0bcc01e31dcf0e273b1915c7a0b6657a6f8648f384cf13a5a36217"
+  },
+  "original_panel_configuration": {
+    "applets": [
+      "com.system76.CosmicPanelWorkspacesButton",
+      "com.system76.CosmicPanelAppButton",
+      "com.system76.CosmicAppletInputSources",
+      "com.system76.CosmicAppletA11y",
+      "com.system76.CosmicAppletStatusArea",
+      "com.system76.CosmicAppletTiling",
+      "com.system76.CosmicAppletAudio",
+      "com.system76.CosmicAppletBluetooth",
+      "com.system76.CosmicAppletNetwork",
+      "com.system76.CosmicAppletBattery",
+      "com.system76.CosmicAppletNotifications",
+      "com.system76.CosmicAppletPower",
+      "com.system76.CosmicAppletTime",
+      "com.system76.CosmicPanelLauncherButton",
+      "com.system76.CosmicPanelWorkspacesButton",
+      "com.system76.CosmicPanelAppButton",
+      "com.system76.CosmicAppList",
+      "com.system76.CosmicAppletMinimize"
+    ],
+    "occurrences": 18,
+    "path": "cosmic-panel-config/src/container_config.rs",
+    "sha256": "4ccbc83623b22873b3608b395a9d0375f0d570e4aefd75b5b8d727df0a58d620",
+    "unique_ids": 16
+  },
+  "package": "cosmic-panel-bin",
+  "panel_applet_lifecycle_verified": false,
+  "panel_verified": false,
+  "patch": {
+    "after": {
+      "Cargo.lock": "cc4162879f254d09f5002386e1b6f40a465f4ceddae4613d5ce9d3f2828cc321",
+      "Cargo.toml": "49960d143d4f2e27d93b133e1be7f61a23b7813fd57c6f02eba68b3f3838d876",
+      "cosmic-panel-bin/Cargo.toml": "09f9be979b30a0fbe0957b35408edb9da69ae0ad7ee8ec773216cb06e618dbca",
+      "native-deps/launch-pad/Cargo.toml": "302a7c4d85dc995d815af1b01f49b1fa6ec5072c36f0570b34f32ab930332647",
+      "native-deps/launch-pad/src/lib.rs": "682a30766db42643c2c1a622e33d33a142a332748661492a58d38177e36d500e",
+      "native-deps/launch-pad/src/native_child.rs": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97",
+      "native-deps/smithay/Cargo.toml": "0bbc8486a9f072be1c4558ed0740d1580c9a4aa866d864c24adf7ab2996498eb",
+      "native-deps/smithay/src/backend/egl/ffi.rs": "68b86eca01e09382db92fe2dc01cdd478e22ccedd26302e5db154a68bad56788",
+      "native-deps/wayland-sys/Cargo.toml": "dfabca594b36a8948ef87ebf2329ff166c1443386ac6f264fc0dbbc86bc91edf",
+      "native-deps/wayland-sys/build.rs": "7f164142b6f80b7782e0696898fa279ceb6179c625404c3acd4e3ea84764f163",
+      "native-deps/wayland-sys/src/client.rs": "307a810e3331c60f45c4342a2d35ae728afa3a25cacbfd117e6cdb850193639e",
+      "native-deps/wayland-sys/src/egl.rs": "f3f52de032fa8ebd2c8bd2a9b01185ba0062cdaf3e37f5c732feeefb17c02182",
+      "native-deps/wayland-sys/src/server.rs": "d270ebcc8de516bae028a6f24535bc4e469f70070f1fa9734da72f62df62f6ef"
+    },
+    "before": {
+      "Cargo.lock": "cdecce78a1d07b66dd6bb7cbb49631d2c7c9587b9a85861a96e3f9b564817651",
+      "Cargo.toml": "ceec8e6b28970628ba620802ebb398b24611de8155af0851dee64463e591d9c0",
+      "cosmic-panel-bin/Cargo.toml": "bba29a640e6eb32cc8f3a30330c4ad4c575190100c55f7484fab77ddce5498dd",
+      "native-deps/launch-pad/Cargo.toml": "bab4435e144fdc21a8d6b9abb005ccd6e1e279ae24adc03b05e09927733038cb",
+      "native-deps/launch-pad/src/lib.rs": "206c952b6c75d4be6a2a7fa16ae0bac20077392082dbf4977428fdb7d3a64ff0",
+      "native-deps/launch-pad/src/native_child.rs": null,
+      "native-deps/smithay/Cargo.toml": "b421b28abb421c3a983932039ed614e7422a22a8fc11673ed142b0db9d449837",
+      "native-deps/smithay/src/backend/egl/ffi.rs": "2a13f8e29d8c30a154af5cd23d5f072632391377a5914ec110ce647c1babe873",
+      "native-deps/wayland-sys/Cargo.toml": "9490484a9baf88ddcfef3473951b6212552cedd5f343bcb57999d54bed1d777f",
+      "native-deps/wayland-sys/build.rs": "11473cb618b53e1fc980c9caf9d3ed8a969a3c33b6243a8e79b5da6fab03ce28",
+      "native-deps/wayland-sys/src/client.rs": "710cf2eef09b2a51998c110a8e23ce211bd8b1293042ef89933ad39047931180",
+      "native-deps/wayland-sys/src/egl.rs": "4cb602801fd46d895c7fa3df7d545bc7f92e8ccb9534ae6c15ce0f65ef67ffe0",
+      "native-deps/wayland-sys/src/server.rs": "7983133534890c8a312f8ee23b0681aa34cd5b7dcdded4a1a12ee069d2ab9758"
+    },
+    "path": "cosmic-panel-native.patch",
+    "sha256": "62ce8c8c88ce0128243c70b327e74c3009147f4d82263f77f7cfba3faafdd2a2"
+  },
+  "prior_linux_v1": {
+    "native-recipe.json": {
+      "path": "ports/cosmic/native-panel-linux-v1/native-recipe.json",
+      "sha256": "5f7b1e984faae78e072647a6edcfbf9a7a973dccb226a768eddcd592ce2d2f4e"
+    },
+    "resource-profile.json": {
+      "path": "ports/cosmic/native-panel-linux-v1/resource-profile.json",
+      "sha256": "b96596aa56646e5ef4f812b488fe29f2251ec971fcbe9f6e1dce56f0daacefca"
+    },
+    "source-policy.json": {
+      "path": "ports/cosmic/native-panel-linux-v1/source-policy.json",
+      "sha256": "2e2fc7a554392e0b9aec6119374c53b9dd241157edc72ac82d8b4eae176b98eb"
+    }
+  },
+  "registry_inputs": [
+    {
+      "archive_sha256": "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be",
+      "before_tree_sha256": "dd099417c7e65b8403d86ef995c87dee8b7e82436bc54e716c5197134c56f57f",
+      "files": {
+        ".cargo_vcs_info.json": {
+          "bytes": 105,
+          "mode": 420,
+          "sha256": "e845ad99e76106cfa8f0739da82d02ba30c5aca192f51b3fa304485a9687c5cd"
+        },
+        "CHANGELOG.md": {
+          "bytes": 797,
+          "mode": 420,
+          "sha256": "08ce934d669484697ee0914383151d2a4849a5b6b193339f9f673653b9fc992f"
+        },
+        "Cargo.lock": {
+          "bytes": 2276,
+          "mode": 420,
+          "sha256": "4b4f8b4c1b4d9bf93977a30b83b5cfc8679ce7f07e2ea040888268ac7a386738"
+        },
+        "Cargo.toml": {
+          "bytes": 1876,
+          "mode": 420,
+          "sha256": "9490484a9baf88ddcfef3473951b6212552cedd5f343bcb57999d54bed1d777f"
+        },
+        "Cargo.toml.orig": {
+          "bytes": 1172,
+          "mode": 420,
+          "sha256": "5b137e1b0591a3661e21b1b2ed261d9589638ff12c7b0591f979e3da117b97de"
+        },
+        "LICENSE.txt": {
+          "bytes": 1057,
+          "mode": 420,
+          "sha256": "1cb6f4dee8c649f175736380495f0af0c753c87f22d50931692968bb24bf2161"
+        },
+        "README.md": {
+          "bytes": 1398,
+          "mode": 420,
+          "sha256": "5ad17c5a9b8b182396a03623bef41195444d23c7542a68b2d64f2aeee17ec9e2"
+        },
+        "build.rs": {
+          "bytes": 639,
+          "mode": 420,
+          "sha256": "11473cb618b53e1fc980c9caf9d3ed8a969a3c33b6243a8e79b5da6fab03ce28"
+        },
+        "src/client.rs": {
+          "bytes": 5683,
+          "mode": 420,
+          "sha256": "710cf2eef09b2a51998c110a8e23ce211bd8b1293042ef89933ad39047931180"
+        },
+        "src/common.rs": {
+          "bytes": 1797,
+          "mode": 420,
+          "sha256": "8acfb5c95c6ff401b56af70ab7df7d126566a3a179354c08240e91026df500df"
+        },
+        "src/cursor.rs": {
+          "bytes": 2469,
+          "mode": 420,
+          "sha256": "23fa8657c697fd8eaa0e0a0886ac5ffedf81cb2f1bb794175b129857db040b40"
+        },
+        "src/egl.rs": {
+          "bytes": 1863,
+          "mode": 420,
+          "sha256": "4cb602801fd46d895c7fa3df7d545bc7f92e8ccb9534ae6c15ce0f65ef67ffe0"
+        },
+        "src/lib.rs": {
+          "bytes": 2481,
+          "mode": 420,
+          "sha256": "4b2f11efcbefc4b7b6551c6d1a695189a1f45f3481aa3d772041f060107dece8"
+        },
+        "src/server.rs": {
+          "bytes": 14904,
+          "mode": 420,
+          "sha256": "7983133534890c8a312f8ee23b0681aa34cd5b7dcdded4a1a12ee069d2ab9758"
+        }
+      },
+      "license_files": [
+        "LICENSE.txt"
+      ],
+      "name": "wayland-sys",
+      "prefix": "native-deps/wayland-sys/",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.31.11"
+    }
+  ],
+  "repository": "https://github.com/pop-os/cosmic-panel",
+  "schema_version": 1,
+  "sdk_rebind": {
+    "guest_execution": false,
+    "lineage": "Locally rebuilt x86_64 musl SDK + native-wayland Mesa (mesa-native-port); build-input identity rebind only",
+    "native_inputs": [
+      {
+        "path": "sysroot/usr/lib/libc.a",
+        "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+      },
+      {
+        "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+        "sha256": "0d6cc1e080e9fdf624203b4eeebe6ba94b6af04e34429d1318b78c1ffe8dd613"
+      },
+      {
+        "path": "sysroot/usr/lib/crt1.o",
+        "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+      },
+      {
+        "path": "sysroot/usr/lib/crti.o",
+        "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+      },
+      {
+        "path": "sysroot/usr/lib/crtn.o",
+        "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+      },
+      {
+        "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+        "sha256": "c422f121249fb6c0b9e3d1c75517edddec992e351ddaa8de5f8decbf9fa378bf"
+      },
+      {
+        "path": "mesa-native-port/build/src/egl/libEGL.a",
+        "sha256": "4140f6ebb604ea0c665face1e13ce6a15ac0c500c745b3dd459b96969b3f0353"
+      },
+      {
+        "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+        "sha256": "08fafc1900dca57cbdebff5c5153c16d76fb48c058c8df38d2a7bd7a5d109939"
+      },
+      {
+        "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+        "sha256": "4967a57f8eec6448a1fec7fde350813468794d0ec52c28bef9521510f1400d50"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-client.a",
+        "sha256": "86e5f4038e8016e54d2c7bf03f217118e887b9c297c65daef014273940219930"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-server.a",
+        "sha256": "3edf9512cdf0ba010cbe390924daecc9ef18f333e75674eb85fc14fa64a1a2e6"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-egl.a",
+        "sha256": "6fac0b8bc4b63727774c4b884a68f6b5bafc277f6a8fae8ae1110e48bd0bc754"
+      },
+      {
+        "path": "sysroot/usr/lib/libffi.a",
+        "sha256": "4a4b3fcb4d6f4eeddf8e1cafd61d492019316574ffa863cf908d1968e42daa98"
+      },
+      {
+        "path": "sysroot/usr/lib/libz.a",
+        "sha256": "d19b7c1992d57d50b5665f74794e81f5b18e2e9e0ce6a5cea0882ba26b67b914"
+      },
+      {
+        "path": "sysroot/usr/lib/libxkbcommon.a",
+        "sha256": "09e77229334ea3f4c2fd3b312e3b3d5fb195e4fa7d4caa4d2f9d8f1c50f17708"
+      }
+    ],
+    "native_sdk_origin": {
+      "path": "runtime-sdk-origin.json",
+      "sha256": "925a3c493b0bcc01e31dcf0e273b1915c7a0b6657a6f8648f384cf13a5a36217"
+    },
+    "prior_native_inputs": [
+      {
+        "path": "sysroot/usr/lib/libc.a",
+        "sha256": "10b961035a37a810e298045e55bbafadb3af58f5f5dde7e9141e167e29ad5b38"
+      },
+      {
+        "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+        "sha256": "4812a564193fc6589fe59af76e0f927afcc9f50f65f3d56117c68dd692489059"
+      },
+      {
+        "path": "sysroot/usr/lib/crt1.o",
+        "sha256": "9807bd4504d88850c14ff9be38bf8ee8cd581bd4de61347697fc75c21dd82827"
+      },
+      {
+        "path": "sysroot/usr/lib/crti.o",
+        "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+      },
+      {
+        "path": "sysroot/usr/lib/crtn.o",
+        "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+      },
+      {
+        "path": "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+        "sha256": "1de9448784cfa4806ed3569c45a65d4f6f93d2bbcd9b421f8ec36db3d9c45aaf"
+      },
+      {
+        "path": "mesa-native-port/build/src/egl/libEGL.a",
+        "sha256": "5d5296054b18b6d0e2ad358203cccc321255528b5be8f2dc9f731a0107ed09bd"
+      },
+      {
+        "path": "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+        "sha256": "c29af86c0863a989dc01a4707c55ea583fcb0044f06b0489f0e62afef86a803f"
+      },
+      {
+        "path": "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+        "sha256": "c8be209acc08de9284b62c7d12d8796e0fcbc6fd22c6ec355b805d34b805eb43"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-client.a",
+        "sha256": "98fdfe49aa09676894c5e1d606a889e0a60f3a7ddfcd7768a59f109a2485bea0"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-server.a",
+        "sha256": "21a1977fc1a6d3a1f2fe8cc179adc856f26564f903c55ee708b68d630282c15f"
+      },
+      {
+        "path": "sysroot/usr/lib/libwayland-egl.a",
+        "sha256": "ff8c06a61df62991f37ee5ec72f2cef93d221395f294c8e4943c88079d26de6a"
+      },
+      {
+        "path": "sysroot/usr/lib/libffi.a",
+        "sha256": "f86d85b632cd041d6338616fa19b46110e68c6a399be8ad61da45a2927837d75"
+      },
+      {
+        "path": "sysroot/usr/lib/libz.a",
+        "sha256": "6d891042ce5b64a7b22cdd807e970235ee8d2ba6d092e489ff3671bbe4a6a7bb"
+      },
+      {
+        "path": "sysroot/usr/lib/libxkbcommon.a",
+        "sha256": "deb7a2d065e1022cdd3d32a5ea2ccc41e727b5f69ebd37942685c26d8d3956a3"
+      }
+    ],
+    "prior_native_sdk_origin": {
+      "path": "runtime-sdk-origin.json",
+      "sha256": "0fe1b1b44b35d20cbbf36c22e8eb9af489d7d839f587d6e19b14ceb8e53a72df"
+    }
+  },
+  "source_acquisition": {
+    "path": "artifacts/v017-panel-local-provenance/panel-source-acquisition-v1/report.json",
+    "sha256": "281119d511c0bc3ea6dab38bbe9a3d72463a2c6b174d446c83f0de6aa4e09ec0"
+  },
+  "source_lock_sha256": "cdecce78a1d07b66dd6bb7cbb49631d2c7c9587b9a85861a96e3f9b564817651",
+  "static_link_inputs": [
+    "mesa-native-port/cxx-runtime/libcyxia-mesa-cxx.a",
+    "mesa-native-port/build/src/egl/libEGL.a",
+    "mesa-native-port/build/src/gallium/targets/dri/libgallium-26.2.3.a",
+    "mesa-native-port/build/src/mesa/glapi/es2api/libGLESv2.a",
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libwayland-server.a",
+    "sysroot/usr/lib/libwayland-egl.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libz.a",
+    "sysroot/usr/lib/libxkbcommon.a"
+  ],
+  "support_inputs": {
+    "ports/cosmic/native-session/build_patch.py": "3918432cde60dfcc61d66f8ecbe383c11b7ccc536e1ae3a9f6d4c8aa010e4297",
+    "ports/cosmic/native-session/native_child.rs": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97"
+  },
+  "version": "1.10.0",
+  "workspace_members": [
+    "cosmic-panel-bin",
+    "cosmic-panel-config",
+    "xdg-shell-wrapper-config"
+  ]
+}

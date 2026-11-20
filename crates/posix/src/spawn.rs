@@ -14,6 +14,7 @@ struct Prepared {
     fds: [Option<Handle>; OPEN_MAX],
     cwd: cyxia_ai_fs::Path,
     nulls: [Handle; OPEN_MAX],
+    consoles: [Handle; OPEN_MAX],
 }
 
 impl<'a> Process<'a> {
@@ -38,9 +39,14 @@ impl<'a> Process<'a> {
                 slot: 0,
                 generation: 0,
             }; OPEN_MAX],
+            consoles: [Handle {
+                slot: 0,
+                generation: 0,
+            }; OPEN_MAX],
         };
         let mut used = [false; OPEN_MAX];
         let mut null_count = 0;
+        let mut console_count = 0;
         for map in mappings {
             let target = usize::try_from(map.target)
                 .ok()
@@ -57,6 +63,10 @@ impl<'a> Process<'a> {
                 null_count += 1;
                 continue;
             }
+            if map.source == -3 {
+                console_count += 1;
+                continue;
+            }
             let handle = self.description(map.source)?;
             self.objects
                 .references(handle)?
@@ -65,6 +75,7 @@ impl<'a> Process<'a> {
             prepared.fds[target] = Some(handle);
         }
         self.objects.free_into(&mut prepared.nulls[..null_count])?;
+        self.objects.free_into(&mut prepared.consoles[..console_count])?;
         Ok(prepared)
     }
     /// Validate before process admission/publication. No references are acquired.
@@ -112,6 +123,24 @@ impl<'a> Process<'a> {
                     object: Object::Null,
                     offset: 0,
                     flags: O_RDWR,
+                },
+            )?;
+            child.fds[map.target as usize] = Some(handle);
+        }
+        // -3: console stdio (fd0 Null, fd1/2 Output), matching Process::new.
+        for (map, handle) in mappings
+            .iter()
+            .filter(|m| m.source == -3)
+            .zip(prepared.consoles)
+        {
+            let is_stdin = map.target == 0;
+            self.objects.create(
+                handle,
+                child_owner,
+                Description {
+                    object: if is_stdin { Object::Null } else { Object::Output },
+                    offset: 0,
+                    flags: if is_stdin { super::O_RDONLY } else { super::O_WRONLY },
                 },
             )?;
             child.fds[map.target as usize] = Some(handle);

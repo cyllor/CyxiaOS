@@ -3,7 +3,9 @@
 //! I/O goes through Runner usercopy; no pointer supplied by user code is dereferenced.
 use super::{Errno, Runner, Supervisor, Wait};
 use crate::process_arch::{self, SIGNAL_FRAME_BYTES as FRAME_BYTES};
-use cyxia_posix::signal::{self, Action, Actions, AltStack, Delivery, Info, SA_ONSTACK};
+use cyxia_posix::signal::{
+    self, Action, Actions, AltStack, Delivery, Info, SA_ONSTACK, SA_RESTART,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct Request {
@@ -13,6 +15,30 @@ pub(super) struct Request {
 }
 
 impl Runner {
+    fn signal_retry_restartable(&self) -> bool {
+        signal::restartable_syscall(
+            process_arch::IMAGE_ABI,
+            self.thread.context.syscall_number(),
+            self.thread.context.arguments(),
+        )
+    }
+
+    pub(super) fn signal_wait_restartable(&self) -> bool {
+        self.signal_retry_restartable()
+            && match self.thread.waiting {
+                Some(Wait::Unix { .. } | Wait::TimerRead { .. } | Wait::Retry(_)) => {
+                    self.thread.retry_syscall
+                }
+                Some(Wait::Child {
+                    nonblock: false, ..
+                }) => true,
+                Some(Wait::Futex {
+                    until: u64::MAX, ..
+                }) => true,
+                _ => false,
+            }
+    }
+
     /// Cross-process lookup belongs to the supervisor after all AP contexts
     /// have returned. This request owns no target references or user pointers.
     pub(super) fn request_process_signal(
@@ -189,6 +215,9 @@ impl Runner {
                         info,
                         self.thread.alt_stack,
                         action.restorer,
+                        self.thread.retry_syscall
+                            && self.signal_retry_restartable()
+                            && action.flags & SA_RESTART != 0,
                     )?;
                     self.copy_to(address, &bytes)?;
                     self.thread.signals.enter_for(
@@ -199,6 +228,9 @@ impl Runner {
                         process_arch::IMAGE_ABI,
                     )?;
                     self.thread.retry_syscall = false;
+                    // After a handler, sigreturn re-enters user code and its
+                    // restored syscall performs a fresh FD lookup. If delivery
+                    // became ignored, keep the weak binding for normal replay.
                     self.thread.retry_descriptor = None;
                     self.thread
                         .context

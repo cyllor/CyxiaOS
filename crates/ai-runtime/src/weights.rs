@@ -9,3 +9,5 @@ pub const EXEC_MEMORY: [i32; 4] = [-267, 420, -426, 0];
 pub const EXEC_MEMORY_FULL_OS: [i32; 4] = [-351, 350, -351, 0];
 pub const USER_MEMORY_FULL_OS: [i32; 4] = [-454, 444, -444, 0];
 pub const USER_MEMORY_FULL_OS_POOL: [i32; 4] = [-452, 453, -456, 0];
+pub const SESSION_PROCESS: [i32; 4] = [-81, 90, -103, 0];
+pub const SHARED_OBJECT: [i32; 4] = [0, 5, -5, 0];

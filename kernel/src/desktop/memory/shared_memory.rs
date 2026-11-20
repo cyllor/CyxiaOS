@@ -127,6 +127,7 @@ impl Store {
     }
 }
 static mut STORE: Store = Store::new();
+const _: () = assert!(OBJECTS == cyxia_ai_runtime::SHARED_OBJECT_MODEL_CAPACITY as usize);
 fn with<T>(f: impl FnOnce(&mut Store) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: only serialized CPU0 foreground calls; IRQ/DMA never access this store.
     f(unsafe { &mut *core::ptr::addr_of_mut!(STORE) })
@@ -157,9 +158,9 @@ pub fn create(owner: Owner, allow_sealing: bool) -> Result<u64, Errno> {
         if s.base == 0 {
             return Err(Errno::Nodev);
         }
-        attempt.proposed(8193);
+        attempt.proposed(cyxia_ai_runtime::SHARED_OBJECT_MODEL_ID);
         let (allowed, model) =
-            cyxia_ai_runtime::user_memory_policy(s.backing.free_objects() as u32, 1)
+            cyxia_ai_runtime::shared_object_policy(s.backing.free_objects() as u32, 1)
                 .map_err(|_| Errno::Io)?;
         attempt.decided(allowed, model);
         if !allowed {

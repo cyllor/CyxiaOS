@@ -74,7 +74,7 @@ fn catalog(root: &Path, out: &Path) {
     println!("cargo:rerun-if-env-changed=CYXIA_SYSROOT");
     let prefix = env::var_os("CYXIA_SYSROOT").map(PathBuf::from)
         .unwrap_or_else(|| root.join("artifacts/sysroot/x86_64-musl"));
-    let mut names = vec!["probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "cosmic-settings-daemon", "cosmic-notifications", "settings-probe", "filesystem-probe", "theme-defaults", "session-process-probe", "signal-probe", "desktop-api-probe",
+    let mut names = vec!["probe", "env-probe", "rust-env-probe", "session-env-probe", "panel-config-probe", "panel-allocation-probe", "async-io-probe", "wayland-client-probe", "wayland-egl-probe", "zbus-probe", "zbus-peer-probe", "notifications-peer-probe", "socket-rights-probe", "wayland-server-probe", "wake-probe", "signal-restart-probe", "compose-probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "cosmic-settings-daemon", "cosmic-panel", "cosmic-applet-time", "cosmic-notifications", "settings-probe", "filesystem-probe", "theme-defaults", "session-process-probe", "signal-probe", "desktop-api-probe",
         "pipe-probe", "pipe-capacity-probe", "notification-probe", "file-probe", "clock-probe", "event-probe", "timerfd-probe", "edge-probe", "fd-share-probe", "scm-probe",
         "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "xkb-rules-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "thread-capacity-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe", "thread-exit-probe", "heap-capacity-probe", "heap-pool-probe"];
     let mut required = vec!["probe"];
@@ -94,10 +94,33 @@ fn catalog(root: &Path, out: &Path) {
     ] {
         if feature(flag) { names.extend_from_slice(images); required.extend_from_slice(images); }
     }
+    if feature("cosmic-core-services-v1") || feature("cosmic-time-applet-v1") {
+        // Missing genuine services must fail at the embedding boundary, rather
+        // than produce an image which later panics on an optional ENOENT.
+        for name in ["cosmic-comp", "cosmic-session", "cosmic-settings-daemon",
+                     "cosmic-notifications", "cosmic-panel"] {
+            if !names.contains(&name) { names.push(name); }
+            if !required.contains(&name) { required.push(name); }
+        }
+    }
+    if feature("cosmic-time-applet-v1") {
+        required.push("cosmic-applet-time");
+        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppletTime.desktop");
+        println!("cargo:rerun-if-changed={}", entry.display());
+        let desktop = fs::read_to_string(entry).expect("missing cosmic-applet-time desktop entry");
+        assert!(desktop.lines().any(|line| line == "Exec=cosmic-applet-time")
+            && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
+            "invalid cosmic-applet-time desktop entry");
+    }
     if prefix.join("Xcyxia.elf").is_file() { names.push("xorg"); }
     let mut text = String::from("const PORTED: &[(&str, &str, &[u8])] = &[\n");
     let mut paths = Vec::new();
-    let budget = if feature("full-os") { 96 } else if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
+    // The complete five-program core plus preserved probe/assets exceeds the
+    // old 96 MiB catalog. Only this explicit versioned image profile selects
+    // 128 MiB of ROM inputs; no process grant or physical pool is enlarged.
+    let budget = if feature("cosmic-time-applet-v1") { 192 }
+        else if feature("cosmic-core-services-v1") { 128 }
+        else if feature("full-os") { 96 } else if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
     let mut total = 0usize;
     if feature("ported") {
         for name in names {

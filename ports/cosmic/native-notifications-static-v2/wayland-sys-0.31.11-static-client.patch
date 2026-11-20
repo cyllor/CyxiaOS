@@ -1,0 +1,75 @@
+--- a/native-deps/wayland-sys/Cargo.toml
++++ b/native-deps/wayland-sys/Cargo.toml
+@@ -36,6 +36,7 @@
+ ]
+ 
+ [features]
++cyxia-static-client = ["client", "dlopen"]
+ client = [
+     "dep:dlib",
+     "dep:log",
+--- a/native-deps/wayland-sys/build.rs
++++ b/native-deps/wayland-sys/build.rs
+@@ -2,7 +2,11 @@
+ 
+ fn main() {
+     if std::env::var_os("CARGO_FEATURE_DLOPEN").is_some() {
+-        // Do not link to anything
++        if std::env::var_os("CARGO_FEATURE_CYXIA_STATIC_CLIENT").is_some() {
++            // The client table contains actual static library addresses. Other
++            // dlopen-enabled modules retain their original loading behavior.
++            Config::new().statik(true).probe("wayland-client").unwrap();
++        }
+         return;
+     }
+ 
+--- a/native-deps/wayland-sys/src/client.rs
++++ b/native-deps/wayland-sys/src/client.rs
+@@ -10,6 +10,36 @@
+ use super::common::*;
+ #[cfg(feature = "client")]
+ use std::os::raw::{c_char, c_int, c_void};
++
++// Cyxia's static client binding retains the upstream function-table API.
++// Every entry is the address of a real libwayland-client function. Missing
++// target symbols are link failures; this does not implement a dynamic loader.
++#[cfg(feature = "cyxia-static-client")]
++macro_rules! external_library {
++    ($name:ident, $link:expr,
++        functions: $( $(#[$attribute:meta])* fn $function:ident($($argument:ty),*) -> $result:ty, )+
++        varargs: $( $(#[$variadic_attribute:meta])* fn $variadic:ident($($fixed:ty),+) -> $variadic_result:ty, )+
++    ) => {
++        pub struct $name {
++            $( $(#[$attribute])* pub $function: unsafe extern "C" fn($($argument),*) -> $result, )+
++            $( $(#[$variadic_attribute])* pub $variadic: unsafe extern "C" fn($($fixed,)+ ...) -> $variadic_result, )+
++        }
++
++        impl $name {
++            pub fn linked() -> Self {
++                #[link(name = $link, kind = "static")]
++                extern "C" {
++                    $( $(#[$attribute])* fn $function($(_: $argument),*) -> $result; )+
++                    $( $(#[$variadic_attribute])* fn $variadic($(_: $fixed,)+ ...) -> $variadic_result; )+
++                }
++                Self {
++                    $( $(#[$attribute])* $function, )+
++                    $( $(#[$variadic_attribute])* $variadic, )+
++                }
++            }
++        }
++    };
++}
+ 
+ pub enum wl_proxy {}
+ pub enum wl_display {}
+@@ -91,6 +121,10 @@
+ 
+ #[cfg(all(feature = "client", feature = "dlopen"))]
+ pub fn wayland_client_option() -> Option<&'static WaylandClient> {
++    #[cfg(feature = "cyxia-static-client")]
++    static WAYLAND_CLIENT_OPTION: Lazy<Option<WaylandClient>> =
++        Lazy::new(|| Some(WaylandClient::linked()));
++    #[cfg(not(feature = "cyxia-static-client"))]
+     static WAYLAND_CLIENT_OPTION: Lazy<Option<WaylandClient>> = Lazy::new(||{
+         let versions = ["libwayland-client.so.0", "libwayland-client.so"];
+         for ver in &versions {

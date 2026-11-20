@@ -1,0 +1,30 @@
+--- a/native-deps/wayland-backend/src/sys/server_impl/mod.rs
++++ b/native-deps/wayland-backend/src/sys/server_impl/mod.rs
+@@ -4,7 +4,7 @@
+     ffi::{CStr, CString},
+     os::raw::{c_int, c_void},
+     os::unix::{
+-        io::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
++        io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+         net::UnixStream,
+     },
+     ptr::NonNull,
+@@ -927,7 +927,7 @@
+                 wayland_server_handle(),
+                 wl_client_create,
+                 self.display,
+-                stream.into_raw_fd()
++                stream.as_raw_fd()
+             )
+         };
+ 
+@@ -935,6 +935,9 @@
+             return Err(std::io::Error::last_os_error());
+         }
+ 
++        // wl_client_create takes ownership only on success. On failure the
++        // original UnixStream must remain owned so its Drop closes the FD.
++        std::mem::forget(stream);
+         Ok(unsafe { init_client(ret, data) })
+     }
+ 

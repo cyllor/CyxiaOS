@@ -1,0 +1,7 @@
+{
+  "mesa_version": "26.2.3",
+  "source_path": "src/egl/drivers/dri2/platform_wayland.c",
+  "upstream_sha256": "65011d905736ffd1dde99d4765098e9cbba1f2e919393a18d7e58079808cad53",
+  "original_sdk_origin_sha256": "925a3c493b0bcc01e31dcf0e273b1915c7a0b6657a6f8648f384cf13a5a36217",
+  "scope": "Complete original translation unit, retained for real function extraction and a versioned native archive repair; no target runtime acceptance implied"
+}

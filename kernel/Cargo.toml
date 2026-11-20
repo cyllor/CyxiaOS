@@ -16,6 +16,19 @@ os-runtime = ["cyxia-arch-x86_64/runtime"]
 # Explicit x86 production image layout; preserves legacy runtime profiles.
 full-os = ["os-runtime", "ported", "large-memory", "cyxia-posix/full-os"]
 cosmic-desktop = ["full-os", "graphics"]
+# Full-OS COSMIC session profile: widens the process layout to the session slot
+# count (cyxia-posix/cosmic-session) and selects the versioned session admission
+# policy. New opt-in feature; demo and existing full-os/cosmic-desktop builds are
+# unchanged. Guest session acceptance is still required separately.
+cosmic-session = ["cosmic-desktop", "cyxia-posix/cosmic-session"]
+# Explicit core-service image inventory. The capacity-only session profile above
+# remains usable for probes; this profile requires the genuine five programs
+# and selects their separate 128 MiB raw ROM catalog (legacy full-os: 96 MiB).
+cosmic-core-services-v1 = ["cosmic-session"]
+# The genuine clock plus the complete existing core catalog. ROM inputs alone
+# have a separate 192 MiB cap (128 MiB core + one 64 MiB FullOs applet).
+# Process image/heap/FD/thread and physical pool grants are unchanged.
+cosmic-time-applet-v1 = ["cosmic-core-services-v1"]
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]

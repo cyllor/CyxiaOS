@@ -1,0 +1,253 @@
+{
+  "kind": "cosmic-panel-allocation-v2",
+  "upstream_commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+  "parent_port": "ports/cosmic/native-panel-linux-v2",
+  "parent_policy_sha256": "5953657424bbac8812a44eb6227421b9283611008def949bcc9057c048587aa9",
+  "patch_sha256": "70a78cf0ad80a57b78c2a654fa4e024682f1e634f0f19f2b8b3e0c40c35f9bef",
+  "before": {
+    "cosmic-panel-bin/src/xdg_shell_wrapper/util.rs": "e80167cfe0c33998540f8b036cdca02d8ac97d0343a07670552a028a43014114",
+    "cosmic-panel-bin/src/space/panel_space.rs": "d8d8753eb034420571a459cc364801844f2e0989e780784d24fa5023a05fceaa",
+    "cosmic-panel-bin/src/space/wrapper_space.rs": "0dedfd38c2fa1ab1ec8ab7daffda07d21310e76cc13478d59f22878fe014ac28",
+    "native-deps/wayland-backend/src/sys/server_impl/mod.rs": "95f548b70b600b220bf75d0416c920d5a789db8cf76066b53a0eb0cd3b8c7039",
+    "Cargo.toml": "49960d143d4f2e27d93b133e1be7f61a23b7813fd57c6f02eba68b3f3838d876",
+    "Cargo.lock": "cc4162879f254d09f5002386e1b6f40a465f4ceddae4613d5ce9d3f2828cc321"
+  },
+  "after": {
+    "cosmic-panel-bin/src/xdg_shell_wrapper/util.rs": "bdaf2bdc34dc65b628a6e9be4f4e7943658375901ef0f476291fe05cdcb2a520",
+    "cosmic-panel-bin/src/space/panel_space.rs": "3923c9f0354344f56d234a55e34151d1cedfd45b28c35d4cb4c3f1f528066fc6",
+    "cosmic-panel-bin/src/space/wrapper_space.rs": "831af7234ef76134ea91858e8b8eaf1bd3fb2e2c771d66692e71b0fe1cc364db",
+    "native-deps/wayland-backend/src/sys/server_impl/mod.rs": "66c4b555fa7cb370f3fafac1ba94f88beb45d6e147d5244b0cf9e132d2b18382",
+    "Cargo.toml": "c60590b85daee2ccfba6555bfa88a99ccac35ac2ea84b4c2344aec25b51437bb",
+    "Cargo.lock": "8c82e5d7cbd95136aee8b95ff768a234d84915db962b1f3c7a2dc7eda50cc253"
+  },
+  "boundary": "Retains all 473 package versions, features, three original workspace members, native SDK and limits. Adds an exact-archive local wayland-backend patch for its documented C FD ownership contract. No session or applet completion claim.",
+  "parent_allocation_policy_sha256": "b138f55d3f577ac411bb7141e0120dc93774bf702d363c3e5806c3ce6175edc7",
+  "backend_registry_input": {
+    "name": "wayland-backend",
+    "version": "0.3.17",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "prefix": "native-deps/wayland-backend/",
+    "archive_sha256": "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078",
+    "before_tree_sha256": "a44bd20704d3bebaa5898e1e2f74a95cf558beb5f9b3fc64ff7d939285add519",
+    "license_files": [
+      "LICENSE.txt"
+    ],
+    "files": {
+      ".cargo_vcs_info.json": {
+        "bytes": 109,
+        "sha256": "be4e089a17e6f580938f0de69759c184394ee4d06551c812caebb62bedf0271c",
+        "mode": 420
+      },
+      "CHANGELOG.md": {
+        "bytes": 8091,
+        "sha256": "bcb74e66c8f379472610228820008215950c4a027f52b6111784549b339a1216",
+        "mode": 420
+      },
+      "Cargo.lock": {
+        "bytes": 13692,
+        "sha256": "8425c06013be503aef48355a3d56476fbec307dbb4aa5f0045dacfd2964ee9aa",
+        "mode": 420
+      },
+      "Cargo.toml": {
+        "bytes": 2443,
+        "sha256": "856dde0a224d8443808c433727a51886be14a07b9a1f8d211a1c51d725680eb3",
+        "mode": 420
+      },
+      "Cargo.toml.orig": {
+        "bytes": 1786,
+        "sha256": "3d20e0077a4a0f70734a6ca31a858e44605803c00137ff9c0aa36395d25104a1",
+        "mode": 420
+      },
+      "LICENSE.txt": {
+        "bytes": 1057,
+        "sha256": "1cb6f4dee8c649f175736380495f0af0c753c87f22d50931692968bb24bf2161",
+        "mode": 420
+      },
+      "README.md": {
+        "bytes": 1802,
+        "sha256": "e0fda47494b08b62835d258605e663b34e7d17ed024b685e6d260a6766d5a67d",
+        "mode": 420
+      },
+      "build.rs": {
+        "bytes": 595,
+        "sha256": "1cfc2d91bcb90aaa03e0ed572ae27efa8e6fcc5e9da0a70ae1885fd964468f5c",
+        "mode": 420
+      },
+      "src/client_api.rs": {
+        "bytes": 14645,
+        "sha256": "aaf1bfaf418b897821b856bf614932263e7b4b9d2293908b0b473ab57aab74f6",
+        "mode": 420
+      },
+      "src/core_interfaces.rs": {
+        "bytes": 3125,
+        "sha256": "4e8ca1b6b6d98fcd0e2032fe040d5bd753cb94e2ff7fc501b2507388073d9e99",
+        "mode": 420
+      },
+      "src/debug.rs": {
+        "bytes": 2482,
+        "sha256": "642b19cb664e4e22c36dafa34c4dd03132f58d8e77fdf72ca805a7313e79cc23",
+        "mode": 420
+      },
+      "src/lib.rs": {
+        "bytes": 4875,
+        "sha256": "77d28cc4fbfeae565eef01aeb59407da13adf574d3dd84f16834dbf3ab68e77d",
+        "mode": 420
+      },
+      "src/protocol.rs": {
+        "bytes": 12296,
+        "sha256": "5eca53f401250ab451a0b69f4f35c8dfc41430db6f77dafbf5385102155eddc2",
+        "mode": 420
+      },
+      "src/rs/client_impl/mod.rs": {
+        "bytes": 30636,
+        "sha256": "64c30ab1d10773b0940f3ef3063ff66b8923d151a9c5a09c571c38ecf445633c",
+        "mode": 420
+      },
+      "src/rs/map.rs": {
+        "bytes": 5025,
+        "sha256": "4aa55d1e87217a99cbba1bbb1df96880deb52d742dca8c9c7f113c276c67be49",
+        "mode": 420
+      },
+      "src/rs/mod.rs": {
+        "bytes": 644,
+        "sha256": "50255ed466bbc89d1b66c9786e45fd6df1675d2b42fa922836ded631e65b369d",
+        "mode": 420
+      },
+      "src/rs/server_impl/client.rs": {
+        "bytes": 30007,
+        "sha256": "af6e4774be6e26c0e41723192b7dd3c6f91e2971765e07e7bb0224ab794b9f8b",
+        "mode": 420
+      },
+      "src/rs/server_impl/common_poll.rs": {
+        "bytes": 13737,
+        "sha256": "a1fd4d71b41645b242188faca7e9fc8e495b076c34dd0f5e443de1ced7d35e27",
+        "mode": 420
+      },
+      "src/rs/server_impl/handle.rs": {
+        "bytes": 18117,
+        "sha256": "d0254fcef22b15097e4c12967752d0839abc9d41dabd7bebdc6ae7b1afe78730",
+        "mode": 420
+      },
+      "src/rs/server_impl/mod.rs": {
+        "bytes": 3342,
+        "sha256": "c0e106c9942a638aabce8d6a384b757146a99c75917e4d5be7423b0cf53b724c",
+        "mode": 420
+      },
+      "src/rs/server_impl/registry.rs": {
+        "bytes": 8437,
+        "sha256": "b7e7aadc37c227f6aafa6d62d85c87733b43465abb402a8a612b1a3145c060bf",
+        "mode": 420
+      },
+      "src/rs/socket.rs": {
+        "bytes": 21455,
+        "sha256": "ce61c3e937dfe78f26f5a26676aa6d8500e3ac4cb347e47b3594b57f34357f06",
+        "mode": 420
+      },
+      "src/rs/wire.rs": {
+        "bytes": 10500,
+        "sha256": "e2cba1e22e0ec230f91fb284bdce36c014e8f1abfe772b744162ef89bde9c7f6",
+        "mode": 420
+      },
+      "src/server_api.rs": {
+        "bytes": 23630,
+        "sha256": "d94f652c58b5ef49dd34af2b0d1c5c6dad0ddfc69095f295148506f2f3aaf212",
+        "mode": 420
+      },
+      "src/sys/client_impl/log_shim.c": {
+        "bytes": 549,
+        "sha256": "fabef27392212065db9ab4c00f45b31972a532dad1f7b0565926b028055debe8",
+        "mode": 420
+      },
+      "src/sys/client_impl/mod.rs": {
+        "bytes": 41538,
+        "sha256": "b7606de09034a7098e7c70733630c6f304caeef94c1fa3e99b7c0f8955d7d632",
+        "mode": 420
+      },
+      "src/sys/mod.rs": {
+        "bytes": 9087,
+        "sha256": "0ba2132bd106016e2a45219dc810343a152bb03700e0c4a282529f9e1732c379",
+        "mode": 420
+      },
+      "src/sys/server_impl/log_shim.c": {
+        "bytes": 549,
+        "sha256": "a80228f81c3065c37ebe5ba054906c62bcad9193e328d27cbae4b4f4df8d1919",
+        "mode": 420
+      },
+      "src/sys/server_impl/mod.rs": {
+        "bytes": 62338,
+        "sha256": "95f548b70b600b220bf75d0416c920d5a789db8cf76066b53a0eb0cd3b8c7039",
+        "mode": 420
+      },
+      "src/test/destroy_object.rs": {
+        "bytes": 9870,
+        "sha256": "7e0387fd37d466728eb129b92028c6ab649a1f9255508a17e9b0cef8ab650514",
+        "mode": 420
+      },
+      "src/test/destructors.rs": {
+        "bytes": 7051,
+        "sha256": "24a773ffe8ac33721f0a0a07f1a3aa2625bc1dbdeecc34ca99eea8e5f89d73c2",
+        "mode": 420
+      },
+      "src/test/many_args.rs": {
+        "bytes": 7287,
+        "sha256": "e7df9f48c81ca17fba4c663ebf8e98c75cf25f95a67819f2f35452bc3958aef2",
+        "mode": 420
+      },
+      "src/test/mod.rs": {
+        "bytes": 5483,
+        "sha256": "41461f237d3d936b1cfbb5109d72eb48d6064d6831abbaf4ebdec81025286ec6",
+        "mode": 420
+      },
+      "src/test/object_args.rs": {
+        "bytes": 17134,
+        "sha256": "0647c09a13282d455c2a5e533d93323c3ee65777a64055d6b5e01350d4e64e01",
+        "mode": 420
+      },
+      "src/test/protocol_error.rs": {
+        "bytes": 12223,
+        "sha256": "c98daafdb5db76242edbb95f7b89c5bb8825e25a91c84a576b6d690d24b38990",
+        "mode": 420
+      },
+      "src/test/server_created_objects.rs": {
+        "bytes": 5758,
+        "sha256": "e76ab9db49bd5dee74693d1170fb4f6684027307d09e6fd2051e38c2a7173172",
+        "mode": 420
+      },
+      "src/test/sync.rs": {
+        "bytes": 4578,
+        "sha256": "db6f40f2b6850b76a0727339aab7bb1963c7bdf8990e860bba155df1888be5eb",
+        "mode": 420
+      },
+      "src/types/client.rs": {
+        "bytes": 2517,
+        "sha256": "785417576cdd580e8579e5ad4b902f1a02b4a50cee72d41ea37f837fcd42d4e9",
+        "mode": 420
+      },
+      "src/types/mod.rs": {
+        "bytes": 32,
+        "sha256": "7184a01dc5c889b0ccc652ca1731c9706ce57e22461906d1ccbc0640ff3244b3",
+        "mode": 420
+      },
+      "src/types/server.rs": {
+        "bytes": 2279,
+        "sha256": "8c27da9339febc91b3a60edf21034b3cb3f0f2f70c94be84536081dfd662bc60",
+        "mode": 420
+      },
+      "tests/null_object.rs": {
+        "bytes": 960,
+        "sha256": "f2e72fc17f90f5f027584338b1524995eb7b2f2a612abd70a185fc36224bd480",
+        "mode": 420
+      },
+      "tests/rs_sys_impls.rs": {
+        "bytes": 4849,
+        "sha256": "4bc5a31b1d5383868df8c5c4572c0ea641220c78f320835ed9134a55b38266b9",
+        "mode": 420
+      }
+    }
+  },
+  "additional_patches": {
+    "backend-ownership.patch": "6afd002bce263613bcde8e65f6cad780a9e0a77113ed2e8fa57a65daa02b5b29",
+    "backend-selection.patch": "db3dabd003745ccff4e6213dc461ab217f79fc0958fc8f6dd3e2c0ea9c286b9a"
+  },
+  "effective_lock_sha256": "8c82e5d7cbd95136aee8b95ff768a234d84915db962b1f3c7a2dc7eda50cc253"
+}

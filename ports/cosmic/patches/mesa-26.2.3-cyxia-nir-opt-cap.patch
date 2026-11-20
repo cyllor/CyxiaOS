@@ -1,0 +1,25 @@
+--- a/src/compiler/glsl/gl_nir_linker.c
++++ b/src/compiler/glsl/gl_nir_linker.c
+@@ -46,6 +46,10 @@
+ gl_nir_opts(nir_shader *nir)
+ {
+    bool progress;
++   /* CyxiaOS: release-active oscillation guard + instrumentation. The spawn-child
++    * NIR loop was observed to never reach a fixed point; cap iterations so compile
++    * terminates (shaders remain correct, less optimized) and log the runaway. */
++   unsigned cyxia_nir_iter = 0;
+ 
+    MESA_TRACE_FUNC();
+ 
+@@ -114,7 +118,10 @@
+                (nir->options->lower_doubles_options & nir_lower_fp64_full_software))) {
+          NIR_PASS(progress, nir, nir_opt_loop_unroll);
+       }
+-   } while (progress);
++   } while (progress && ++cyxia_nir_iter < 1000);
++   if (cyxia_nir_iter >= 1000)
++      fprintf(stderr, "CYXIA_NIR_OPT_CAP stage=%u iterations=%u\n",
++              (unsigned)nir->info.stage, cyxia_nir_iter);
+ 
+    unsigned lower_flrp =
+       (nir->options->lower_flrp16 ? 16 : 0) |

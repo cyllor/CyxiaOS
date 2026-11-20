@@ -29,6 +29,21 @@ fn runtime() -> Runtime {
     r
 }
 #[test]
+fn shared_object_metadata_policy_exhaustive_and_page_policy_preserved() {
+    for free in 0..=16 {
+        for requested in 1..=16 {
+            assert_eq!(shared_object_policy(free, requested),
+                Ok((free >= requested, SHARED_OBJECT_MODEL_ID)));
+        }
+    }
+    assert_eq!(shared_object_policy(17, 1), Err(Error::Invalid));
+    assert_eq!(shared_object_policy(16, 0), Err(Error::Invalid));
+    assert_eq!(shared_object_policy(16, 17), Err(Error::Invalid));
+    assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
+    assert!(anonymous_memory_policy(2048, 2048).is_ok_and(|(allowed, _)| !allowed));
+}
+
+#[test]
 fn memory_is_real_owned_zeroed_and_accounted() {
     let mut r = runtime();
     let a = r.allocate(2).unwrap();
@@ -417,6 +432,53 @@ fn eight_slot_admission_keeps_the_trained_boundary_and_one_slot_reserve() {
     assert!(user_memory_policy(free + 8, 8).unwrap().0);
 }
 #[test]
+fn session_process_admission_versions_domain_and_admits_full_session_demand() {
+    // Out-of-domain inputs are rejected, never clamped.
+    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES + 1, 8), Err(Error::Invalid));
+    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES, 0), Err(Error::Invalid));
+    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES, 9), Err(Error::Invalid));
+    // The session model is versioned separately from the demo Arena model 8193.
+    assert_ne!(SESSION_PROCESS_MODEL_ID, 8193);
+    assert_eq!(
+        session_process_memory_policy(SESSION_LEDGER_PAGES, 8).unwrap().1,
+        SESSION_PROCESS_MODEL_ID
+    );
+    // Every in-domain decision matches the trained weights, never overcommits the
+    // ledger, and keeps the synthetic reserve for every admitted cell.
+    for free in 0..=SESSION_LEDGER_PAGES {
+        for requested in 1..=SESSION_PROCESS_BASE_GRANT {
+            let (allowed, id) = session_process_memory_policy(free, requested).unwrap();
+            assert_eq!(id, SESSION_PROCESS_MODEL_ID);
+            let score: i32 = weights::SESSION_PROCESS
+                .into_iter()
+                .zip([1, free as i32, requested as i32, 0])
+                .map(|(w, x)| w * x)
+                .sum();
+            assert_eq!(allowed, score >= 0);
+            assert!(!allowed || requested <= free);
+            assert!(!allowed || free - requested >= SESSION_PROCESS_RESERVE);
+        }
+    }
+    // The documented intact-default session demand (up to 33 resident processes:
+    // broker + session + 13 direct children + 18 applets) is admitted with headroom.
+    let mut free = SESSION_LEDGER_PAGES;
+    let mut admitted = 0;
+    while session_process_memory_policy(free, SESSION_PROCESS_BASE_GRANT).unwrap().0 {
+        admitted += 1;
+        free -= SESSION_PROCESS_BASE_GRANT;
+    }
+    assert!(admitted >= 33, "session must admit the 33-process demand, got {admitted}");
+    assert!(admitted <= SESSION_PROCESS_SLOTS);
+    // The demo model 8193 boundary is unchanged: still 7 admitted at 64 pages.
+    let mut demo_free = 64;
+    let mut demo_admitted = 0;
+    while user_memory_policy(demo_free, 8).unwrap().0 {
+        demo_admitted += 1;
+        demo_free -= 8;
+    }
+    assert_eq!(demo_admitted, 7);
+}
+#[test]
 fn anonymous_memory_policy_bounds_and_capacity_conservatism() {
     assert_eq!(anonymous_memory_policy(1024, 96), Ok((true, 8194)));
     assert_eq!(anonymous_memory_policy(128, 128), Ok((false, 8194)));
@@ -756,6 +818,44 @@ fn full_os_thread_dispatch_reaches_sixteenth_slot_without_changing_process_limit
     assert!(full_os_thread_dispatch_policy(&[None; 16]).unwrap().is_none());
     assert!(full_os_thread_dispatch_policy(&[]).unwrap().is_none());
     assert_eq!(full_os_thread_dispatch_policy(&[None; 17]), Err(Error::Invalid));
+    assert_eq!(user_dispatch_policy(&[None; 9]), Err(Error::Invalid));
+}
+
+#[test]
+fn session_process_dispatch_reaches_full_slot_count_without_changing_demo_limit() {
+    let cpu = UserCandidate {
+        waiting_ms: 1,
+        cpu_bound: true,
+    };
+    let slots = SESSION_PROCESS_SLOTS as usize;
+    let mut candidates = std::vec![Some(cpu); slots];
+    candidates[slots - 1] = Some(UserCandidate {
+        cpu_bound: false,
+        ..cpu
+    });
+    let selected = session_process_dispatch_policy(&candidates).unwrap().unwrap();
+    assert_eq!(selected.index, slots - 1);
+    assert_eq!(selected.source, DecisionSource::AiDirect);
+    assert_eq!(selected.model, 12289);
+    // Tie-break to the lower index, exactly as the unchanged ranking model does.
+    candidates[slots - 2] = candidates[slots - 1];
+    assert_eq!(
+        session_process_dispatch_policy(&candidates).unwrap().unwrap().index,
+        slots - 2
+    );
+    // Starvation guard still forces the oldest candidate.
+    candidates[slots - 1] = Some(UserCandidate {
+        waiting_ms: 100,
+        ..cpu
+    });
+    let selected = session_process_dispatch_policy(&candidates).unwrap().unwrap();
+    assert_eq!(selected.index, slots - 1);
+    assert_eq!(selected.source, DecisionSource::SafetyGuard);
+    assert_eq!(selected.model, 12289);
+    assert!(session_process_dispatch_policy(&std::vec![None; slots]).unwrap().is_none());
+    assert!(session_process_dispatch_policy(&[]).unwrap().is_none());
+    assert_eq!(session_process_dispatch_policy(&std::vec![None; slots + 1]), Err(Error::Invalid));
+    // The demo process selector remains bounded to 8 candidates.
     assert_eq!(user_dispatch_policy(&[None; 9]), Err(Error::Invalid));
 }
 

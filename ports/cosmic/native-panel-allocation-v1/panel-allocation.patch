@@ -1,0 +1,180 @@
+--- a/cosmic-panel-bin/src/xdg_shell_wrapper/util.rs
++++ b/cosmic-panel-bin/src/xdg_shell_wrapper/util.rs
+@@ -22,18 +22,18 @@
+ }
+ 
+ /// helper function for inserting a wrapped applet client
+-pub fn get_client_sock(display: &mut wayland_server::DisplayHandle) -> (Client, UnixStream) {
+-    let (display_sock, client_sock) = UnixStream::pair().unwrap();
++pub fn get_client_sock(display: &mut wayland_server::DisplayHandle) -> std::io::Result<(Client, UnixStream)> {
++    let (display_sock, client_sock) = UnixStream::pair()?;
+ 
+-    (
++    Ok((
+         display
+             .insert_client(
+                 display_sock,
+                 Arc::new(WrapperClientCompositorState { compositor_state: Default::default() }),
+             )
+-            .unwrap(),
++            ?,
+         client_sock,
+-    )
++    ))
+ }
+ 
+ pub(crate) fn write_and_attach_buffer(
+--- a/cosmic-panel-bin/src/space/panel_space.rs
++++ b/cosmic-panel-bin/src/space/panel_space.rs
+@@ -177,17 +177,13 @@
+ }
+ 
+ impl PanelClient {
+-    pub fn new(
+-        name: String,
+-        path: Option<PathBuf>,
+-        client: Client,
+-        stream: Option<UnixStream>,
+-    ) -> Self {
++    /// Keep configured identity without allocating a client before lookup.
++    pub fn pending(name: String) -> Self {
+         Self {
+             name,
+-            path,
+-            client: Some(client),
+-            stream,
++            path: None,
++            client: None,
++            stream: None,
+             security_ctx: None,
+             exec: None,
+             minimize_priority: None,
+--- a/cosmic-panel-bin/src/space/wrapper_space.rs
++++ b/cosmic-panel-bin/src/space/wrapper_space.rs
+@@ -391,10 +391,7 @@
+                 .cloned()
+                 .unwrap_or_default()
+                 .into_iter()
+-                .map(|name| {
+-                    let (c, s) = get_client_sock(&mut display);
+-                    PanelClient::new(name, None, c, Some(s))
+-                })
++                .map(PanelClient::pending)
+                 .collect();
+ 
+             *center_guard = self
+@@ -404,10 +401,7 @@
+                 .cloned()
+                 .unwrap_or_default()
+                 .into_iter()
+-                .map(|name| {
+-                    let (c, s) = get_client_sock(&mut display);
+-                    PanelClient::new(name, None, c, Some(s))
+-                })
++                .map(PanelClient::pending)
+                 .collect();
+ 
+             *right_guard = self
+@@ -417,10 +411,7 @@
+                 .cloned()
+                 .unwrap_or_default()
+                 .into_iter()
+-                .map(|name| {
+-                    let (c, s) = get_client_sock(&mut display);
+-                    PanelClient::new(name, None, c, Some(s))
+-                })
++                .map(PanelClient::pending)
+                 .collect();
+ 
+             let mut desktop_ids: Vec<_> = left_guard
+@@ -518,6 +509,10 @@
+                 }
+             }
+ 
++            for (missing, ..) in &desktop_ids {
++                tracing::warn!(applet = %missing.name, "Applet desktop entry missing or invalid");
++            }
++
+             // only allow 1 per panel
+             let mut has_minimize = false;
+             for (panel_client, my_list, panel_side) in panel_clients {
+@@ -525,10 +520,25 @@
+                     continue;
+                 }
+ 
+-                let Some(socket) = panel_client.stream.take() else {
+-                    error!("Failed to get socket for {}", &panel_client.name);
++                // Parse the selected desktop command before allocating any FD.
++                let mut exec_iter = Shlex::new(panel_client.exec.as_deref().unwrap());
++                let Some(exec) = exec_iter.next().filter(|word| !word.is_empty()) else {
++                    error!(applet = %panel_client.name, "Applet Exec has no command");
+                     continue;
+                 };
++                let args: Vec<_> = exec_iter.by_ref().collect();
++                if exec_iter.had_error {
++                    error!(applet = %panel_client.name, "Applet Exec has invalid quoting");
++                    continue;
++                }
++                let (client, socket) = match get_client_sock(&mut display) {
++                    Ok(pair) => pair,
++                    Err(why) => {
++                        error!(applet = %panel_client.name, ?why, "Failed to allocate applet connection");
++                        continue;
++                    },
++                };
++                panel_client.client = Some(client);
+ 
+                 // Ensure there is only one applet per panel with minimize
+                 panel_client.minimize_priority = if panel_client
+@@ -545,14 +555,7 @@
+                 let requests_wayland_display =
+                     panel_client.requests_wayland_display.unwrap_or(false);
+ 
+-                let mut exec_iter = Shlex::new(panel_client.exec.as_deref().unwrap());
+-                let exec = exec_iter.next().expect("exec parameter must contain at least on word");
+-
+-                let mut args = Vec::new();
+-                for arg in exec_iter {
+-                    trace!("child argument: {}", &arg);
+-                    args.push(arg);
+-                }
++                let mut args = args;
+                 let mut fds = Vec::with_capacity(2);
+                 let mut applet_env = Vec::new();
+                 applet_env.push((
+@@ -674,12 +677,13 @@
+                         let my_list = my_list.clone();
+                         let mut display_handle = display_handle.clone();
+                         let applet_tx_clone = applet_tx_clone.clone();
+-                        let (c, client_socket) = get_client_sock(&mut display_handle);
+-                        let raw_client_socket = client_socket.as_raw_fd();
++                        let should_restart = is_restarting && err_code.is_some();
++                        let replacement = should_restart.then(|| get_client_sock(&mut display_handle));
+                         let mut applet_env = Vec::with_capacity(1);
+                         let mut fds: Vec<OwnedFd> = Vec::with_capacity(2);
+-                        let should_restart = is_restarting && err_code.is_some();
+-                        let security_context = if requests_wayland_display && should_restart {
++                        let security_context = if requests_wayland_display
++                            && replacement.as_ref().is_some_and(Result::is_ok)
++                        {
+                             security_context_manager_clone.as_ref().and_then(
+                                 |security_context_manager| {
+                                     let active_output = active_output.clone();
+@@ -718,6 +722,17 @@
+                                 _ = pman.stop_process(key).await;
+                                 return;
+                             }
++
++                            let (c, client_socket) = match replacement {
++                                Some(Ok(pair)) => pair,
++                                Some(Err(why)) => {
++                                    error!(applet = %id_clone, ?why, "Failed to replace applet connection");
++                                    _ = pman.stop_process(key).await;
++                                    return;
++                                },
++                                None => return,
++                            };
++                            let raw_client_socket = client_socket.as_raw_fd();
+ 
+                             if is_notification_applet {
+                                 let (tx, rx) = oneshot::channel();

@@ -52,6 +52,18 @@ class UserBuildInputs(unittest.TestCase):
                         dict(ported=True, extras=['cosmic-desktop'])):
             with self.assertRaises(ValueError): os_x86.select_features(**options)
         self.assertEqual(os_x86.select_features(), ['os-runtime'])
+        self.assertEqual(os_x86.select_features(graphics=True, ported=True,
+                         extras=['cosmic-core-services-v1']),
+                         ['os-runtime', 'graphics', 'ported', 'cosmic-core-services-v1'])
+        for options in (dict(graphics=True, extras=['cosmic-core-services-v1']),
+                        dict(ported=True, extras=['cosmic-core-services-v1'])):
+            with self.assertRaises(ValueError): os_x86.select_features(**options)
+        self.assertEqual(os_x86.select_features(graphics=True, ported=True,
+                         extras=['cosmic-time-applet-v1']),
+                         ['os-runtime', 'graphics', 'ported', 'cosmic-time-applet-v1'])
+        for options in (dict(graphics=True, extras=['cosmic-time-applet-v1']),
+                        dict(ported=True, extras=['cosmic-time-applet-v1'])):
+            with self.assertRaises(ValueError): os_x86.select_features(**options)
 
     def test_external_image_and_asset_changes_invalidate_the_cache_identity(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,14 @@ use super::{Context, Errno, FileSystem, PORTED, Runner, Supervisor, UserState, W
 use cyxia_posix::{OPEN_MAX, executable, spawn::Mapping};
 
 const STRING_BYTES: usize = 4096;
+/// Waitable child-receipt slots. The demo layout keeps 10 (8 occupied under the
+/// demo admission reserve). The full-OS COSMIC session profile widens this to the
+/// session slot count so the 13 direct children plus 18 applets (31 managed
+/// children) plus headroom remain waitable; the session admission wiring selects
+/// the versioned policy. Demo and existing full-os builds keep 10.
+#[cfg(feature = "cosmic-session")]
+const RECEIPTS: usize = 40;
+#[cfg(not(feature = "cosmic-session"))]
 const RECEIPTS: usize = 10;
 #[derive(Clone, Copy)]
 pub(super) struct Request {
@@ -260,7 +268,16 @@ impl Supervisor {
             .iter()
             .filter(|r| r.is_none())
             .count();
+        // Session profile: versioned receipt admission over the widened receipt
+        // domain; demo keeps model 8193 and its 8-occupied reserve unchanged.
+        #[cfg(feature = "cosmic-session")]
+        attempt.proposed(cyxia_ai_runtime::SESSION_PROCESS_MODEL_ID);
+        #[cfg(not(feature = "cosmic-session"))]
         attempt.proposed(8193);
+        #[cfg(feature = "cosmic-session")]
+        let (allowed, model) =
+            cyxia_ai_runtime::session_process_memory_policy(free as u32, 1).map_err(|_| Errno::Io)?;
+        #[cfg(not(feature = "cosmic-session"))]
         let (allowed, model) =
             cyxia_ai_runtime::user_memory_policy(free as u32, 1).map_err(|_| Errno::Io)?;
         attempt.decided(allowed, model);
@@ -299,6 +316,13 @@ impl Supervisor {
                 let [start, len] = request.env[i];
                 &request.bytes[start as usize..(start + len) as usize]
             });
+            if cfg!(feature = "cosmic-session") && actual_path.as_bytes().ends_with(b"cosmic-comp") {
+                for entry in &env[..request.envc] {
+                    super::super::log(b"COMP_ENV ");
+                    super::super::log(entry);
+                    super::super::log(b"\n");
+                }
+            }
             let runner = &mut self.runners[slot];
             let owner = runner.lease.ok_or(Errno::Io)?.0;
             let sp = runner.executable.load(
@@ -328,6 +352,8 @@ impl Supervisor {
             runner.thread.signals.set_mask(parent_mask);
             runner.threads.shared.actions = child_actions;
             runner.linux = true;
+            runner.tee_stderr =
+                cfg!(feature = "cosmic-session") && actual_path.as_bytes().ends_with(b"cosmic-comp");
             runner.status.parent_pid = parent_pid;
             Ok(())
         })();
