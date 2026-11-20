@@ -136,20 +136,61 @@ pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
     map_pages = function(address, "    pub fn map_pages(")
     extra_maps = function(address, "    pub fn map_table_run(") if "    pub fn map_table_run(" in address else ""
     diagnostic = function(arch, "pub fn trace_entry_error(")
+    owner = address[address.index('#[cfg(target_arch = "x86_64")]\npub const TABLE_PAGES_PER_PROCESS'):]
+    owner = owner.replace('target_arch = "x86_64"', 'all()')
+    owner = owner.replace('    current: Option<', '    pub current: Option<')
     files["staging.rs"] = (
-        "use crate::Errno;\n" + table
-        + "pub struct ProcessSpace { pub current: Option<crate::space::AddressSpace<'static>>, pub pid: u32 }\n"
-        + "impl ProcessSpace {\n" + map_pages + "\n" + extra_maps + "\n}\n"
+        "use crate::Errno;\n" + table + owner
+        + "\nimpl ProcessSpace { pub fn test_owner(current: Option<crate::space::AddressSpace<'static>>) -> Self {"
+        + "let mut owner = Self::new(); owner.current = current; owner.slot = 0; owner.pid = 1; owner } }\n"
         + '#[cfg(test)]\n#[path = "staging-cases.rs"]\nmod staging_tests;\n')
     files["staging-cases.rs"] = (HERE / "page_map_staging_cases.rs").read_text()
     helper = selected_root / "crates/arch-x86_64/src/code_permissions.rs"
     if not helper.is_file():
         helper = ROOT / "crates/arch-x86_64/src/code_permissions.rs"
     files['code-permissions.rs'] = helper.read_text()
+    files['user-layout.rs'] = (ROOT / 'crates/contracts/src/user_layout.rs').read_text()
+    files['vm.rs'] = (ROOT / 'crates/posix/src/vm.rs').read_text()
+    files['shared-metadata.rs'] = (ROOT / 'crates/posix/src/shared_memory.rs').read_text()
+    heap = (ROOT / 'kernel/src/desktop/memory/user_heap.rs').read_text()
+    shared = (ROOT / 'kernel/src/desktop/user/shared_memory.rs').read_text()
+    # Compile the full-OS frame-release branch even in this host harness. Only
+    # frame/grant/object effects are witnesses; VM, unmap, PTE and alias bodies
+    # are production code. This does not replace the native memory probes.
+    heap_unmap = function(heap, '    pub fn unmap_with_revoke(')
+    heap_unmap = heap_unmap.replace('#[cfg(feature = "full-os")]', '#[cfg(all())]')
+    heap_unmap = heap_unmap.replace('#[cfg(not(feature = "full-os"))]', '#[cfg(any())]')
+    files['revoke-order.rs'] = (HERE / 'page_mapping_revoke_cases.rs').read_text().replace(
+        '// @HEAP_UNMAP@', heap_unmap).replace('// @SHARED_UNMAP@', function(shared, '    fn unmap_with_revoke('))
     files["transactions.rs"] = '''#![allow(dead_code)]
 extern crate self as cyxia_arch_x86_64;
+extern crate self as cyxia_posix;
+extern crate self as cyxia_contracts;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Errno { Inval, Nodev, Io, Fault }
+pub enum Errno { Inval, Nodev, Io, Fault, Busy, Nomem, Access, Badf, Mfile, Overflow, Perm }
+pub struct PhysAddr(pub u64);
+pub mod usermem { pub const MAX_PROCESSES: usize = 16; }
+#[path = "user-layout.rs"]
+pub mod user_layout;
+#[path = "vm.rs"]
+pub mod vm;
+#[path = "shared-metadata.rs"]
+pub mod shared_metadata;
+#[path = "revoke-order.rs"]
+mod revoke_order;
+mod shared_memory {
+    pub static DROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub fn drop_mapping(_: u64, _: bool) -> Result<(), crate::Errno> {
+        for pa in [0x400000, 0x401000] {
+            assert_eq!(crate::runtime_fixture::count(pa), 0, "shared object freed before PTE revoke");
+        }
+        DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+mod os {
+    pub fn reserve_pool(_: u64) -> Result<crate::PhysAddr, crate::Errno> { Err(crate::Errno::Nodev) }
+}
 pub const HIGH: u64 = 0xffff800000000000;
 // Host-only output capture. This does not emulate UART or AP ownership.
 std::thread_local! {
@@ -167,6 +208,7 @@ mod runtime_fixture;
 #[path = "staging.rs"]
 mod staging;
 mod process_arch {
+    pub fn now_ns() -> u64 { 0 }
     pub fn publish_code(address: u64, length: usize) -> Result<(), crate::Errno> {
         crate::runtime_fixture::publish_code_fixture(address, length)
     }
@@ -175,6 +217,10 @@ mod process_arch {
 mod machine {
     pub mod runtime {
         pub use crate::runtime_fixture::{is_user_code_writable, seal_user_code, unseal_user_code};
+        pub fn kernel_mappings() -> &'static crate::space::KernelMappings {
+            static KERNEL: std::sync::OnceLock<crate::space::KernelMappings> = std::sync::OnceLock::new();
+            KERNEL.get_or_init(|| crate::space::KernelMappings::new([0; 256], crate::runtime_fixture::RAM).unwrap())
+        }
     }
 }
 mod production_process_arch {
@@ -188,12 +234,13 @@ mod production_process_arch {
         files['cases.rs'] += '\n' + (HERE / 'page_map_run_cases.rs').read_text()
     files['cases.rs'] += '\n' + (HERE / 'page_retire_cases.rs').read_text()
     files['cases.rs'] += '\n' + (HERE / 'page_alias_counter_cases.rs').read_text()
+    files['cases.rs'] += '\n' + (HERE / 'page_space_reuse_cases.rs').read_text()
     identity = {
         "source_sha256": {name: digest(text) for name, text in sources.items()},
         "helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
         "helper_source_path": str(helper),
         "extracted_sha256": {name: digest(text) for name, text in extracted.items()},
-        "staging_sha256": {"PageTable": digest(table), "ProcessSpace.map_pages": digest(map_pages)},
+        "staging_sha256": {"PageTable": digest(table), "ProcessSpace": digest(owner), "ProcessSpace.map_pages": digest(map_pages)},
         "diagnostic_sha256": digest(diagnostic),
         "diagnostic_sink": "host-only thread-local bytes; no UART or AP ownership emulation",
         "generated_sha256": {name: digest(text) for name, text in files.items()},
@@ -239,7 +286,8 @@ class PageMapBatchTransactions(unittest.TestCase):
             # The helper's nine embedded tests are covered by its own suite.
             ran, output = bounded([str(binary), "runtime_batch_", "--test-threads=1"], environment)
             self.assertEqual(ran, 0, output)
-            expected = files['cases.rs'].count('fn runtime_batch_') + files['staging-cases.rs'].count('fn runtime_batch_')
+            expected = sum(files[name].count('fn runtime_batch_') for name in
+                           ('cases.rs', 'staging-cases.rs', 'revoke-order.rs'))
             self.assertGreaterEqual(expected, 32)
             self.assertIn(f"{expected} passed; 0 failed", output)
 

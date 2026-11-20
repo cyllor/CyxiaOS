@@ -18,7 +18,7 @@ fn error(value: FrameError) -> Errno {
     }
 }
 fn with<T>(f: impl FnOnce(&mut FramePool<'static>) -> Result<T, Errno>) -> Result<T, Errno> {
-    // SAFETY: foreground CPU0 only. All AP roots are retired before these calls;
+    // SAFETY: foreground CPU0 only. All APs have returned before these calls;
     // neither interrupts nor DMA access this metadata or its owned user pages.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
     f(pool.as_mut().ok_or(Errno::Nodev)?)
@@ -66,7 +66,7 @@ pub fn check_owned(handle: FrameHandle, owner: TaskId) -> Result<(), Errno> {
 pub fn release(handle: FrameHandle, owner: TaskId) -> Result<(), Errno> {
     with(|pool| {
         // Validate identity/owner before touching the physical address. The
-        // caller has removed every user PTE after all AP roots were retired.
+        // caller has removed every affected user PTE after all APs returned.
         pool.begin_revoke(handle, owner).map_err(error)?;
         Zero.zero(handle.address()).map_err(error)?;
         pool.finish_revoke(handle, unsafe { RevokeComplete::after_unmap(handle) })

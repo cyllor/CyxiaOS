@@ -41,7 +41,7 @@ fn ecc_mapping_benchmark() {
                 let kernel = KernelMappings::new([0; 256], runtime::RAM).unwrap();
                 let arena = unsafe { TableArena::from_raw(memory.0.as_mut_ptr(), 0x00200000, 128) }.unwrap();
                 let space = unsafe { AddressSpace::new(arena, &kernel, SpaceId { id: 1, generation: 1 }) }.unwrap();
-                let mut owner = ProcessSpace { current: Some(space), pid: 1 };
+                let mut owner = ProcessSpace::test_owner(Some(space));
                 let before = runtime::owner_reads();
                 let before_arithmetic = runtime::alias_arithmetic_pages();
                 let start = Instant::now();

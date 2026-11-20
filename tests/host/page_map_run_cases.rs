@@ -122,7 +122,7 @@ fn runtime_batch_staging_dense_metadata_changes_and_policy_are_rechecked() {
             _ => {}
         }
         let (_memory, space) = new_space(8);
-        let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+        let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
         let result = table.publish(&mut owner, VA);
         let space = owner.current.as_ref().unwrap();
         if change == 4 {
@@ -145,7 +145,7 @@ fn runtime_batch_staging_cross_leaf_dense_range_keeps_the_scalar_path() {
     let mut table = crate::staging::PageTable::empty();
     for i in 0..512 { table.set(i, PA + i as u64 * 4096, 3).unwrap(); }
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     table.publish(&mut owner, VA + 4096).unwrap();
     for i in 0..512 {
         assert_eq!(owner.current.as_ref().unwrap().translate(VA + (i + 1) * 4096).unwrap().physical, PA + i * 4096);
@@ -167,7 +167,7 @@ fn runtime_batch_staging_cached_shape_tracks_permission_overwrites() {
         // phases and all per-page permissions must still be checked.
         for _ in 0..2 {
             let (_memory, space) = new_space(8);
-            let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+            let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
             table.publish(&mut owner, VA).unwrap();
             for i in 0..3 {
                 let actual = owner.current.as_ref().unwrap().translate(VA + i * 4096).unwrap();

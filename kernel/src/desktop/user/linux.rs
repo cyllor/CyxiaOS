@@ -1331,7 +1331,7 @@ impl Runner {
                     return self.unmap_shared(a, pages).map(|_| 0);
                 }
                 // First-stage ABI explicitly supports whole allocations only.
-                self.heap.unmap(a, pages).map(|_| 0)
+                self.unmap_heap(a, pages).map(|_| 0)
             }
             Call::Mprotect => {
                 if c > 7 {

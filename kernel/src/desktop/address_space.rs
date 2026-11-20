@@ -13,6 +13,7 @@ pub struct PageTable {
     pages: [u64; 512],
     present: [u64; 8],
     executable: [u64; 8],
+    dirty: [u64; 8],
 }
 #[cfg(target_arch = "x86_64")]
 const _: () = {
@@ -27,7 +28,7 @@ impl PageTable {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            Self { pages: [0; 512], present: [0; 8], executable: [0; 8] }
+            Self { pages: [0; 512], present: [0; 8], executable: [0; 8], dirty: [0; 8] }
         }
     }
     pub fn clear(&mut self) {
@@ -35,6 +36,9 @@ impl PageTable {
         self.0.fill(0);
         #[cfg(target_arch = "x86_64")]
         {
+            for (dirty, present) in self.dirty.iter_mut().zip(self.present) {
+                *dirty |= present;
+            }
             self.pages.fill(0);
             self.present.fill(0);
             self.executable.fill(0);
@@ -52,6 +56,7 @@ impl PageTable {
             let bit = 1u64 << (index % 64);
             self.present[index / 64] &= !bit;
             self.executable[index / 64] &= !bit;
+            self.dirty[index / 64] |= bit;
         }
     }
     pub fn set(&mut self, index: usize, physical: u64, protection: u8) -> Result<(), Errno> {
@@ -78,6 +83,7 @@ impl PageTable {
             self.pages[index] = physical | u64::from(protection);
             let bit = 1u64 << (index % 64);
             self.present[index / 64] |= bit;
+            self.dirty[index / 64] |= bit;
             if protection & 4 != 0 {
                 self.executable[index / 64] |= bit;
             } else {
@@ -162,6 +168,53 @@ impl PageTable {
             (base + index as u64 * 4096, page & !7, (page & 7) as u8)
         }))
     }
+    /// Reconcile only changed staging entries while every user CPU is stopped.
+    /// `fresh` is true for every table in a newly created root, including tables
+    /// whose dirty bits were cleared by a previous root. Failed syncs retain
+    /// their dirty set and owned successful prefix; the caller must not enter.
+    #[cfg(target_arch = "x86_64")]
+    pub fn synchronize(&mut self, space: &mut ProcessSpace, base: u64, fresh: bool) -> Result<(), Errno> {
+        if fresh {
+            self.publish(space, base)?;
+            self.dirty.fill(0);
+            return Ok(());
+        }
+        if self.dirty.iter().all(|&bits| bits == 0) {
+            return Ok(());
+        }
+        space.quiescent()?;
+        let mut changed = self.dirty;
+        for index in Self::indices(&self.dirty) {
+            let address = base.checked_add(index as u64 * 4096).ok_or(Errno::Inval)?;
+            let desired = self.pages[index];
+            let old = space.root()?.translate(address);
+            let matches = match old {
+                Some(old) => desired & 7 != 0 && old.physical == (desired & !7)
+                    && old.permissions.writable == (desired & 2 != 0)
+                    && old.permissions.executable == (desired & 4 != 0),
+                None => desired & 7 == 0,
+            };
+            if matches {
+                changed[index / 64] &= !(1u64 << (index % 64));
+            } else if old.is_some() {
+                space.revoke_page(address)?;
+            }
+        }
+        // Remove old aliases before sealing new executable backing. The
+        // original W^X/phase transaction and alias gate remain authoritative.
+        for index in Self::indices(&changed) {
+            let page = self.pages[index];
+            if page & 4 != 0 {
+                crate::process_arch::publish_code(crate::HIGH + (page & !7), 4096)?;
+            }
+        }
+        space.map_pages(Self::indices(&changed).filter_map(|index| {
+            let page = self.pages[index];
+            (page & 7 != 0).then_some((base + index as u64 * 4096, page & !7, (page & 7) as u8))
+        }))?;
+        self.dirty.fill(0);
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -187,6 +240,7 @@ pub struct ProcessSpace {
     slot: usize,
     pid: u32,
     retire_ns: u64,
+    revoke_ns: u64,
 }
 // SAFETY: this owner exclusively reserves its table frames in the globally
 // identical HIGH+PA direct map. Transfers occur only while no resume owns the
@@ -202,6 +256,7 @@ impl ProcessSpace {
             slot: usize::MAX,
             pid: 0,
             retire_ns: 0,
+            revoke_ns: 0,
         }
     }
     pub fn bind(&mut self, slot: usize, pid: u32) {
@@ -209,10 +264,16 @@ impl ProcessSpace {
         self.slot = slot;
         self.pid = pid;
         self.retire_ns = 0;
+        self.revoke_ns = 0;
     }
-    pub fn begin(&mut self) -> Result<(), Errno> {
+    /// Return whether a new root was created. A stopped root keeps its PTEs and
+    /// alias ownership across dispatches; CPU departure is not destruction.
+    pub fn begin(&mut self) -> Result<bool, Errno> {
         use cyxia_arch_x86_64::space::{AddressSpace, SpaceId, TableArena};
-        self.retire();
+        if self.current.is_some() {
+            self.quiescent()?;
+            return Ok(false);
+        }
         let pool = TABLE_POOL.load(core::sync::atomic::Ordering::Acquire);
         if pool == 0 || self.slot >= cyxia_posix::usermem::MAX_PROCESSES || self.pid == 0 {
             crate::process_arch::trace_entry_error("begin.owner", self.pid, 0, format_args!(
@@ -254,7 +315,7 @@ impl ProcessSpace {
                 Errno::Io
             })?,
         );
-        Ok(())
+        Ok(true)
     }
     pub fn map(
         &mut self,
@@ -317,6 +378,46 @@ impl ProcessSpace {
     }
     pub fn root(&self) -> Result<&cyxia_arch_x86_64::space::AddressSpace<'static>, Errno> {
         self.current.as_ref().ok_or(Errno::Nodev)
+    }
+    pub fn quiescent(&self) -> Result<(), Errno> {
+        if self.root()?.resident_cpus() != 0 {
+            return Err(Errno::Busy);
+        }
+        Ok(())
+    }
+    /// Revoke real PTEs and alias references BEFORE backing is cleared/freed.
+    /// All APs have returned to kernel CR3; user mappings are non-global and
+    /// PCID is disabled, so no stopped CPU retains a usable user translation.
+    pub fn revoke_range(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        self.quiescent()?;
+        if !address.is_multiple_of(4096) || address < 4096 || address >= 0x8000_0000_0000
+            || pages.checked_mul(4096).and_then(|bytes| address.checked_add(bytes as u64))
+                .is_none_or(|end| end > 0x8000_0000_0000)
+        {
+            return Err(Errno::Inval);
+        }
+        let started = crate::process_arch::now_ns();
+        let result = (0..pages).try_for_each(|index| self.revoke_page(address + index as u64 * 4096));
+        self.revoke_ns = self.revoke_ns.saturating_add(
+            crate::process_arch::now_ns().saturating_sub(started),
+        );
+        result
+    }
+    // Called by incremental preparation (already timed in space_prepare_ns),
+    // or the separately timed backing-release boundary above. Never count a
+    // revocation in both wall-time buckets.
+    fn revoke_page(&mut self, address: u64) -> Result<(), Errno> {
+        let space = self.current.as_mut().ok_or(Errno::Nodev)?;
+        if space.translate(address).is_some() {
+            space.unmap(address).map_err(|_| Errno::Io)?;
+        }
+        Ok(())
+    }
+    pub fn revoked_ns(&self) -> u64 {
+        self.revoke_ns
     }
     /// The caller already returned from resume: kernel CR3 is live, no PCID or
     /// global user mappings exist, and no other CPU may enter this process.

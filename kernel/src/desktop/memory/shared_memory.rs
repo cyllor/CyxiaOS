@@ -41,7 +41,8 @@ impl Store {
     fn release_batch(&mut self) -> Result<(), Errno> {
         for slot in self.batch.iter() {
             // All mapping references are gone, or shrink proved none existed.
-            // CPU0 retired every process mapping/TLB before this owner runs.
+            // Each owner revoked its real PTEs before dropping its mapping ref;
+            // all APs are stopped and have returned to kernel CR3.
             unsafe {
                 core::ptr::write_bytes(self.pointer(slot, 0), 0, PAGE_SIZE);
             }

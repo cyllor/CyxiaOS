@@ -365,7 +365,7 @@ impl ExecMemory {
                 table.clear();
             }
             self.stack_table.clear();
-            // The backend retired all user roots, or never published these
+            // The owner retired this process root, or never published these
             // mappings. No other CPU or DMA can still refer to these pages.
             unsafe {
                 core::ptr::write_bytes(
@@ -405,15 +405,16 @@ pub fn init_pc() -> Result<(), Errno> {
 #[cfg(target_arch = "x86_64")]
 impl ExecMemory {
     pub fn publish_space(
-        &self,
+        &mut self,
         space: &mut crate::address_space::ProcessSpace,
+        fresh: bool,
     ) -> Result<(), Errno> {
         if self.pages == 0 {
             return Ok(());
         }
-        for (index, table) in self.tables.iter().enumerate() {
-            table.publish(space, LAYOUT.image_base + index as u64 * 0x200000)?;
+        for (index, table) in self.tables.iter_mut().enumerate() {
+            table.synchronize(space, LAYOUT.image_base + index as u64 * 0x200000, fresh)?;
         }
-        self.stack_table.publish(space, STACK_BASE)
+        self.stack_table.synchronize(space, STACK_BASE, fresh)
     }
 }

@@ -410,8 +410,8 @@ impl Runner {
         };
         self.thread.active = false;
         self.status.thread_count = 0;
-        // The CPU backend retired the user root/TLB before return. No DMA or
-        // other CPU can reference this arena. Revoke before releasing grants.
+        // All user CPUs have returned and no DMA owns private process backing.
+        // Destroy the retained root before clearing memory or releasing grants.
         #[cfg(target_arch = "x86_64")]
         self.space.retire();
         #[cfg(target_arch = "aarch64")]
@@ -683,8 +683,7 @@ impl Runner {
                 if c != 0 {
                     return Err(Errno::Inval);
                 }
-                self.heap
-                    .unmap(a, usize::try_from(b).map_err(|_| Errno::Inval)?)?;
+                self.unmap_heap(a, usize::try_from(b).map_err(|_| Errno::Inval)?)?;
                 Ok(0)
             }
             24 => {
@@ -1098,8 +1097,6 @@ impl Runner {
                     now_ns().saturating_add(budget * 1_000_000),
                 )
             };
-            #[cfg(target_arch = "x86_64")]
-            self.space.retire();
             ai::record(AiDomain::CpuQuantum, |c| c.returned());
             if self.complete_exit(exit, fs, ledger, ipc) {
                 continue;
@@ -1818,6 +1815,7 @@ impl Supervisor {
             #[cfg(target_arch = "x86_64")]
             {
                 runner.status.space_retire_ns = runner.space.retired_ns();
+                runner.status.space_revoke_ns = runner.space.revoked_ns();
             }
             runner.status.free_pages = free;
             runner.status.heap_pages = runner.heap.used();
@@ -1886,7 +1884,6 @@ impl Runner {
     fn prepare_space(&mut self) -> Result<(), Errno> {
         let started = now_ns();
         let result = self.build_space();
-        self.status.space_rebuilds = self.status.space_rebuilds.saturating_add(1);
         self.status.space_prepare_ns = self
             .status
             .space_prepare_ns
@@ -1908,20 +1905,25 @@ impl Runner {
             process_arch::trace_entry_error(stage, pid, tid, format_args!("errno={error:?}"));
             error
         };
-        self.space
+        let fresh = self.space
             .begin()
             .map_err(|error| fail("build.begin", error))?;
+        if fresh {
+            self.status.space_rebuilds = self.status.space_rebuilds.saturating_add(1);
+        } else {
+            self.status.space_reuses = self.status.space_reuses.saturating_add(1);
+        }
         #[cfg(feature = "ported")]
         if self.linux {
             self.executable
-                .publish_space(&mut self.space)
+                .publish_space(&mut self.space, fresh)
                 .map_err(|error| fail("build.executable", error))?;
         }
         #[cfg(not(feature = "ported"))]
         let native = true;
         #[cfg(feature = "ported")]
         let native = !self.linux;
-        if native {
+        if native && fresh {
             let physical = self.arena.base_ptr() as u64 - super::HIGH;
             for index in 0..MAPPED_PAGES as usize {
                 let virtual_page = if index < 6 { 256 + index } else { 257 + index };
@@ -1935,12 +1937,23 @@ impl Runner {
             }
         }
         self.heap
-            .publish_space(&mut self.space)
+            .publish_space(&mut self.space, fresh)
             .map_err(|error| fail("build.heap", error))?;
         #[cfg(feature = "ported")]
         self.shared
-            .publish_space(&mut self.space)
+            .publish_space(&mut self.space, fresh)
             .map_err(|error| fail("build.shared", error))?;
         Ok(())
+    }
+}
+
+impl Runner {
+    fn unmap_heap(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
+        #[cfg(target_arch = "x86_64")]
+        return self.heap.unmap_with_revoke(address, pages, |start, count| {
+            self.space.revoke_range(start, count).expect("heap PTE revoke failed; retain backing");
+        });
+        #[cfg(target_arch = "aarch64")]
+        self.heap.unmap(address, pages)
     }
 }

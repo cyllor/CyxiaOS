@@ -1,6 +1,7 @@
 //! Parallel CPU mechanism for the existing process/thread policy. CPU0 prepares
-//! every root, transfers owned contexts, drains the complete phase, retires every
-//! root, and only then runs the shared syscall/fault/service implementation.
+//! each root, transfers owned contexts, drains the complete phase, and only then
+//! runs shared syscall/fault/service code. Stopped roots retain stable mappings;
+//! mapping owners revoke affected PTEs before clearing or releasing backing.
 use super::*;
 use crate::machine::{dispatch, runtime};
 use cyxia_ai_runtime::{UserCandidate, UserDispatch};
@@ -135,7 +136,7 @@ impl Runner {
         ledger: &mut GrantLedger,
         ipc: &mut LocalIpc,
     ) {
-        // Supervisor already retired ALL roots and restored ALL runner owners.
+        // Supervisor already stopped ALL roots and restored ALL runner owners.
         if entered {
             self.status.last_slice_ms = slice.budget_ms;
             self.status.cpu_model = slice.model;
@@ -334,13 +335,14 @@ impl Supervisor {
                 }
             }
         }
-        // ALL workers have returned to kernel CR3. Retire ALL roots before the
-        // first syscall can unmap/free shared backing or modify any user byte.
-        for job in jobs.iter_mut().flatten() {
-            job.space.retire();
+        // ALL workers have returned to kernel CR3 and left residency. Keep roots
+        // owned but stopped. VM owners revoke affected PTEs before freeing any
+        // backing; ordinary syscalls need no page-table/alias reconstruction.
+        for job in jobs.iter().flatten() {
+            job.space.quiescent().expect("unpublished root must be stopped");
         }
-        for done in completions.iter_mut().flatten() {
-            done.job.space.retire();
+        for done in completions.iter().flatten() {
+            done.job.space.quiescent().expect("completed root must be stopped");
         }
         let mut outcomes = [None; 3];
         for index in 0..3 {

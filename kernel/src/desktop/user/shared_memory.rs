@@ -78,12 +78,19 @@ impl SharedMappings {
         result
     }
     pub fn unmap(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
+        // Teardown has already retired this owner's complete hardware root.
+        self.unmap_with_revoke(address, pages, |_, _| {})
+    }
+    fn unmap_with_revoke(
+        &mut self, address: u64, pages: usize, revoke: impl FnOnce(u64, usize),
+    ) -> Result<(), Errno> {
         let m = self.maps.whole(address, pages)?;
+        revoke(address, pages);
         for page in 0..m.pages() {
             let i = ((m.start - BASE) / PAGE_SIZE as u64) as usize + page;
             self.tables[i / 512].remove(i % 512);
         }
-        // CPU0 retired every active user root/TLB before this owner runs.
+        // The owner revoked these hardware PTEs after every AP returned.
         // Revoke first; another process's alias retains its mapping reference.
         self.maps.remove(address, pages)?;
         crate::shared_memory::drop_mapping(m.handle, m.may_write)?;
@@ -332,7 +339,7 @@ impl Runner {
             Ok(address)
         })();
         if result.is_err() {
-            self.heap.unmap(address, pages)?;
+            self.unmap_heap(address, pages)?;
         }
         result
     }
@@ -374,11 +381,16 @@ impl Runner {
             Ok(address)
         })();
         if result.is_err() {
-            self.heap.unmap(address, pages)?;
+            self.unmap_heap(address, pages)?;
         }
         result
     }
     pub(super) fn unmap_shared(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
+        #[cfg(target_arch = "x86_64")]
+        return self.shared.unmap_with_revoke(address, pages, |start, count| {
+            self.space.revoke_range(start, count).expect("shared PTE revoke failed; retain backing");
+        });
+        #[cfg(target_arch = "aarch64")]
         self.shared.unmap(address, pages)
     }
     pub(super) fn protect_shared(
@@ -394,11 +406,12 @@ impl Runner {
 #[cfg(target_arch = "x86_64")]
 impl SharedMappings {
     pub fn publish_space(
-        &self,
+        &mut self,
         space: &mut crate::address_space::ProcessSpace,
+        fresh: bool,
     ) -> Result<(), Errno> {
-        for (index, table) in self.tables.iter().enumerate() {
-            table.publish(space, BASE + index as u64 * 0x200000)?;
+        for (index, table) in self.tables.iter_mut().enumerate() {
+            table.synchronize(space, BASE + index as u64 * 0x200000, fresh)?;
         }
         Ok(())
     }

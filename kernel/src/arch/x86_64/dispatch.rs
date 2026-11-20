@@ -58,7 +58,8 @@ pub(crate) struct Completion {
 }
 pub(crate) struct Drained {
     /// Index = AP logical CPU slot minus one. Every requested job is returned;
-    /// unused CPUs are None. Caller retires all roots before service work.
+    /// unused CPUs are None. Caller verifies all roots stopped before services;
+    /// mapping owners revoke affected PTEs before releasing backing.
     pub completions: [Option<Completion>; 3],
 }
 static SLOTS: [Handoff<Job, ExitRecord>; 3] = [const { Handoff::new() }; 3];

@@ -1,4 +1,4 @@
-//! Private anonymous mappings. CPU0 owns metadata after all AP roots retire.
+//! Private anonymous mappings. CPU0 owns metadata after all APs return.
 use super::user::ai::{self, Domain};
 use crate::address_space::PageTable as Table;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -82,8 +82,9 @@ pub struct Heap {
     usage: Usage,
 }
 
-// Desired PTEs are private staging metadata. The caller has retired every AP
-// root; no user CPU or DMA can observe these pages until Heap::publish_space.
+// Desired PTEs are private staging metadata. Every AP is stopped. New frames
+// have no published alias until Heap::publish_space; old frames were revoked
+// before release and cannot remain mapped when the pool reuses them.
 struct HeapBacking<'a> {
     tables: &'a mut [Table; TABLES],
     #[cfg(feature = "full-os")]
@@ -293,6 +294,13 @@ impl Heap {
     /// Native first-stage API: unmap exactly one original allocation. Partial or
     /// combined munmap semantics are deliberately not advertised as POSIX yet.
     pub fn unmap(&mut self, start: u64, pages: usize) -> Result<(), Errno> {
+        // Only unpublished allocations or a fully retired process use this
+        // entry. Live process owners must supply their hardware revocation.
+        self.unmap_with_revoke(start, pages, |_, _| {})
+    }
+    pub fn unmap_with_revoke(
+        &mut self, start: u64, pages: usize, revoke: impl FnOnce(u64, usize),
+    ) -> Result<(), Errno> {
         let slot = self
             .allocations
             .iter()
@@ -304,12 +312,15 @@ impl Heap {
         for fragment in self.vm.fragments(start, pages * vm::PAGE_SIZE)? {
             pool::check_owned(self.frames[fragment.slot].ok_or(Errno::Io)?, owner.task)?;
         }
+        // Validation precedes revocation; a rejected munmap preserves the live
+        // root. Failure to revoke must stop before any VM/grant/backing release.
+        revoke(start, pages);
         self.vm.unmap_into(start, pages, &mut self.batch)?;
         for page in self.batch.iter() {
             let index = ((page.address - vm::BASE) / vm::PAGE_SIZE as u64) as usize;
             self.tables[index / 512].remove(index % 512);
         }
-        // The backend retired every user alias before this CPU0 syscall;
+        // The owner revoked every affected user alias before reaching here;
         // no other CPU/DMA retains these pages while they are cleared.
         for page in self.batch.iter() {
             #[cfg(feature = "full-os")]
@@ -376,8 +387,8 @@ impl Heap {
             let physical = self.physical(fragment.slot);
             self.tables[i / 512].set(i % 512, physical, protection)?;
         }
-        // CPU0 owns the stopped process; the retired backend root has no stale
-        // user alias. The next entry publishes these desired permissions.
+        // CPU0 owns the stopped process. The next entry synchronizes these
+        // dirty PTEs before any CPU can use the retained root again.
         Ok(())
     }
     pub fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Errno> {
@@ -434,11 +445,12 @@ pub fn init_pc() -> Result<(), Errno> {
 #[cfg(target_arch = "x86_64")]
 impl Heap {
     pub fn publish_space(
-        &self,
+        &mut self,
         space: &mut crate::address_space::ProcessSpace,
+        fresh: bool,
     ) -> Result<(), Errno> {
-        for (index, table) in self.tables.iter().enumerate() {
-            table.publish(space, vm::BASE + index as u64 * 0x200000)?;
+        for (index, table) in self.tables.iter_mut().enumerate() {
+            table.synchronize(space, vm::BASE + index as u64 * 0x200000, fresh)?;
         }
         Ok(())
     }

@@ -1232,10 +1232,15 @@ pub struct UserStatus {
     pub observed_pc: u64,
     pub observed_sp: u64,
     pub observed_syscall: u64,
-    /// Cumulative x86 publication wall time; observations, never CPU billing.
+    /// Actual x86 root creations, rather than dispatch/preparation calls.
     pub space_rebuilds: u64,
+    /// Preparations that retain an existing stopped root.
+    pub space_reuses: u64,
+    /// Cumulative x86 preparation wall time; observations, never CPU billing.
     pub space_prepare_ns: u64,
     pub space_retire_ns: u64,
+    /// Backing-release PTE revocation wall time, disjoint from preparation.
+    pub space_revoke_ns: u64,
     pub preemptions: u64,
     pub ai_slices: u64,
     pub cpu_model: u64,
@@ -1281,8 +1286,10 @@ impl UserStatus {
         observed_sp: 0,
         observed_syscall: 0,
         space_rebuilds: 0,
+        space_reuses: 0,
         space_prepare_ns: 0,
         space_retire_ns: 0,
+        space_revoke_ns: 0,
         preemptions: 0,
         ai_slices: 0,
         cpu_model: 0,

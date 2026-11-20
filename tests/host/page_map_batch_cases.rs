@@ -221,7 +221,7 @@ fn runtime_batch_drop_failures_never_report_completed_retirement() {
 fn runtime_batch_actual_page_table_publishes_rx_before_gate_and_skips_empty() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     let mut table = crate::staging::PageTable::empty();
     runtime::force_gate(true);
     table.publish(&mut owner, VA).unwrap();
@@ -242,7 +242,7 @@ fn runtime_batch_actual_page_table_publishes_rx_before_gate_and_skips_empty() {
 fn runtime_batch_actual_rx_prepass_failure_does_not_publish_that_table() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     let mut table = crate::staging::PageTable::empty();
     table.set(0, PA, 5).unwrap();
     table.set(1, PA + 4096, 5).unwrap();
@@ -270,7 +270,7 @@ fn runtime_batch_actual_rx_prepass_failure_does_not_publish_that_table() {
 fn runtime_batch_rx_actual_compositor_shape_stops_at_every_staging_boundary() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, space) = new_space(32);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     // Actual ELF's 4931 RX pages begin at 0x1de4000, index 484 in its first table.
     // These literal expected lengths come from the retained program headers,
     // not from another copy of the candidate's run scanner.
@@ -306,7 +306,7 @@ fn runtime_batch_rx_actual_compositor_shape_stops_at_every_staging_boundary() {
 fn runtime_batch_rx_holes_non_rx_and_noncontiguous_physical_frames_split_ranges() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     let mut table = crate::staging::PageTable::empty();
     let pages = [(0, 0, 5), (1, 1, 5), (2, 2, 3), (3, 3, 5),
                  (4, 6, 5), (5, 7, 5), (7, 8, 5), (8, 9, 1), (9, 10, 5), (10, 8, 5)];
@@ -340,7 +340,7 @@ fn runtime_batch_rx_whole_range_cache_checks_mixed_stable_and_pending_pages() {
     let mut table = crate::staging::PageTable::empty();
     for page in 0..3 { table.set(page, PA + page as u64 * 4096, 5).unwrap(); }
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     table.publish(&mut owner, VA).unwrap();
     assert_eq!(runtime::ranges(), vec![(PA, 12288)]);
     assert_eq!(runtime::operations(), (3, 1));
@@ -351,7 +351,7 @@ fn runtime_batch_rx_whole_range_cache_checks_mixed_stable_and_pending_pages() {
     drop(owner);
     runtime::clear_observations();
     let (_memory2, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     table.publish(&mut owner, VA).unwrap();
     assert_eq!(runtime::ranges(), vec![(PA, 12288)]);
     assert_eq!(runtime::operations(), (0, 0)); // Entire range was already stable RX.
@@ -366,7 +366,7 @@ fn runtime_batch_rx_partial_hardware_failures_keep_whole_range_pending_until_rec
         runtime::reset();
         let (_memory, mut space) = new_space(8);
         space.map(VA + 0x200000, PA + 10 * 4096, UserPermissions::RW).unwrap();
-        let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+        let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
         let mut table = crate::staging::PageTable::empty();
         for page in 0..3 { table.set(page, PA + page as u64 * 4096, 5).unwrap(); }
         runtime::clear_observations();
@@ -407,7 +407,7 @@ fn runtime_batch_rx_tail_writable_alias_rejects_before_any_range_transition() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, mut space) = new_space(8);
     space.map(VA + 0x200000, PA + 8192, UserPermissions::RW).unwrap();
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     let mut table = crate::staging::PageTable::empty();
     for page in 0..3 { table.set(page, PA + page as u64 * 4096, 5).unwrap(); }
     runtime::clear_observations();
@@ -694,7 +694,7 @@ fn assert_staging_snapshot(
 ) {
     runtime::clear_observations();
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     table.publish(&mut owner, VA).unwrap();
     let space = owner.current.as_ref().unwrap();
     assert_eq!(space.epoch(), expected.len() as u64 + 1);
@@ -796,7 +796,7 @@ fn runtime_batch_staging_clear_removes_all_bits_and_reuse_keeps_only_new_pages()
     table.clear();
     // An empty table must remain a no-op even without an owner and with a held
     // alias gate. This catches stale present or executable entries after clear.
-    let mut owner = crate::staging::ProcessSpace { current: None, pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(None);
     runtime::force_gate(true);
     table.publish(&mut owner, VA).unwrap();
     assert_eq!(runtime::seal_calls(), 0);
@@ -818,7 +818,7 @@ fn runtime_batch_staging_sparse_failure_retains_exact_ascending_successful_prefi
         (64, PA + 8192, 3), (63, PA + 4096, 1), (0, PA, 3),
     ] { table.set(index, physical, protection).unwrap(); }
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     assert_eq!(table.publish(&mut owner, VA), Err(crate::Errno::Io));
     let space = owner.current.as_ref().unwrap();
     assert_eq!(space.epoch(), 4);
@@ -841,7 +841,7 @@ fn runtime_batch_staging_packed_high_physical_bits_are_never_truncated_into_ram(
     table.set(64, u64::MAX - 4095, 1).unwrap(); // Original staging contract accepts aligned metadata.
     table.set(65, 0, 1).unwrap();
     let (_memory, space) = new_space(8);
-    let mut owner = crate::staging::ProcessSpace { current: Some(space), pid: 1 };
+    let mut owner = crate::staging::ProcessSpace::test_owner(Some(space));
     assert_eq!(table.publish(&mut owner, VA), Err(crate::Errno::Io));
     let space = owner.current.as_ref().unwrap();
     assert_eq!(space.epoch(), 2);
