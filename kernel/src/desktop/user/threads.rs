@@ -148,13 +148,21 @@ impl Runner {
             }
             self.wake(time, ipc);
             for index in 0..MAX_THREADS - 1 {
-                core::mem::swap(&mut self.thread, &mut self.threads.parked[index]);
-                if self.thread.active {
-                    self.threads
-                        .shared
-                        .pending
-                        .transfer_ready(&mut self.thread.signals, &self.threads.shared.actions);
+                let thread = &mut self.threads.parked[index];
+                if !thread.active {
+                    continue;
                 }
+                self.threads
+                    .shared
+                    .pending
+                    .transfer_ready(&mut thread.signals, &self.threads.shared.actions);
+                // Transfer signals in the original order, in place. Only a
+                // blocked thread needs the selected-context wake machinery;
+                // empty and already runnable 4KiB contexts need no round trip.
+                if thread.waiting.is_none() {
+                    continue;
+                }
+                core::mem::swap(&mut self.thread, &mut self.threads.parked[index]);
                 self.wake(time, ipc);
                 core::mem::swap(&mut self.thread, &mut self.threads.parked[index]);
             }

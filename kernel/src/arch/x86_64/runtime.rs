@@ -150,12 +150,29 @@ fn lapic_read(register: u64) -> u32 {
         )
     }
 }
+fn counter_ns(counter: u64, period: u64) -> u64 {
+    // Whole-nanosecond HPET periods (including QEMU's) need no wide divide.
+    // Fractional periods retain the exact original arithmetic and truncation.
+    let value = if period.is_multiple_of(1_000_000) {
+        counter.checked_mul(period / 1_000_000)
+    } else {
+        u64::try_from(u128::from(counter) * u128::from(period) / 1_000_000).ok()
+    };
+    value.expect("monotonic overflow")
+}
+fn deadline_count(delta: u64, hz: u64) -> u32 {
+    // Any product exceeding u64::MAX already exceeds u32::MAX * 1e9,
+    // so its rounded/clamped result is known without a u128 division.
+    delta.checked_mul(hz)
+        .map(|product| product.div_ceil(1_000_000_000).clamp(1, u64::from(u32::MAX)) as u32)
+        .unwrap_or(u32::MAX)
+}
 pub fn now_ns() -> u64 {
     let base = HPET.load(Ordering::Acquire);
     let period = HPET_PERIOD.load(Ordering::Acquire);
     assert!(base != 0 && period != 0, "monotonic clock unavailable");
     let counter = unsafe { core::ptr::read_volatile((KERNEL_BASE + base + 0xf0) as *const u64) };
-    u64::try_from(u128::from(counter) * u128::from(period) / 1_000_000).expect("monotonic overflow")
+    counter_ns(counter, period)
 }
 pub fn monotonic_resolution_ns() -> u64 {
     let period = HPET_PERIOD.load(Ordering::Acquire);
@@ -171,9 +188,7 @@ pub fn arm_deadline(deadline_ns: u64) -> Result<(), Error> {
         return Err(Error::Unsupported);
     }
     let delta = deadline_ns.saturating_sub(now_ns());
-    let count = (u128::from(delta) * u128::from(hz))
-        .div_ceil(1_000_000_000)
-        .clamp(1, u32::MAX as u128) as u32;
+    let count = deadline_count(delta, hz);
     lapic_write(0x320, u32::from(TIMER));
     lapic_write(0x380, count);
     Ok(())

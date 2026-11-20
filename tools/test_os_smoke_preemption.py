@@ -65,7 +65,7 @@ class TimerPreemptionSmoke(unittest.TestCase):
 
     def test_late_nonzero_counter_does_not_pass_the_deadline(self):
         console = ConsoleFixture([(5, 1)])
-        with self.assertRaisesRegex(TimeoutError, 'timer preemption'):
+        with self.assertRaisesRegex(TimeoutError, 'timer preemption.*pid=5 preemptions=1'):
             self.observe(console, [0, 1, 6])
         self.assertEqual(console.commands[-1], 'posix kill 5')
 

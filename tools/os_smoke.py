@@ -106,7 +106,8 @@ def preemption_check(console):
                               + rb',[^\r\n]*?preemptions: ([1-9]\d*)\b', console.raw[at:])
             if match:
                 if time.monotonic() > deadline:
-                    break
+                    raise TimeoutError('own timer preemption observed after 5-second deadline: '
+                                       f'pid={int(pid)} preemptions={int(match[1])}')
                 return dict(pid=int(pid), preemptions=int(match[1]), source='syscall-free spin')
             time.sleep(.01)
         raise TimeoutError('own syscall-free task did not show timer preemption within 5 seconds')
