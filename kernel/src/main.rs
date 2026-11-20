@@ -2,6 +2,8 @@
 #![no_main]
 #[cfg(all(feature = "full-os", not(target_arch = "x86_64")))]
 compile_error!("full-os is currently an explicit x86 runtime profile");
+#[cfg(all(feature = "ram-2g", not(target_arch = "x86_64")))]
+compile_error!("ram-2g is an explicit x86 runtime profile");
 // CPU selection and profile wiring are the only responsibilities of this root.
 #[cfg(target_arch = "aarch64")]
 include!("composition/aarch64.rs");

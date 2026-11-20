@@ -1,0 +1,75 @@
+--- a/src/backend/cyxia/mod.rs
++++ b/src/backend/cyxia/mod.rs
+@@ -332,11 +332,21 @@
+     }
+ }
+ 
+-fn dispatch_actions(state: &mut State, actions: Vec<InputAction>) {
++fn dispatch_actions(state: &mut State, mut actions: Vec<InputAction>) {
+     // Drain native decoding during blanking, but never record rejected events
+     // as delivered. The ledger contains only transitions sent to COSMIC.
+     if state.backend.cyxia().input_suspended() {
+         return;
++    }
++    // Batch only ungrabbed background motion with no held keys/buttons.
++    // Application-focused and drag input keeps its original event sequence.
++    let background = state.common.shell.read().seats.iter().all(|seat| {
++        seat.get_pointer().is_none_or(|pointer| {
++            pointer.current_focus().is_none() && !pointer.is_grabbed()
++        })
++    });
++    if background && state.backend.cyxia().bridge.delivered.is_idle() {
++        native::coalesce_desktop_motion(&mut actions);
+     }
+     for action in actions {
+         let event = state.backend.cyxia().bridge.event(action, InputTime::now());
+--- a/src/backend/cyxia/native.rs
++++ b/src/backend/cyxia/native.rs
+@@ -275,6 +275,34 @@
+     Button { code: u16, pressed: bool },
+     Motion { dx: i32, dy: i32 },
+     Resync,
++}
++
++/// Coalesce one already-decoded batch of background motion, without allocation.
++/// Non-motion records are barriers for the entire batch. Only collinear,
++/// same-direction deltas combine: turns/reversals retain their clipping path,
++/// and unrepresentable sums remain separate instead of saturating or wrapping.
++pub fn coalesce_desktop_motion(actions: &mut Vec<InputAction>) {
++    if actions.iter().any(|action| !matches!(action, InputAction::Motion { .. })) {
++        return;
++    }
++    let mut written = 0;
++    for index in 0..actions.len() {
++        let action = actions[index];
++        if written > 0
++            && let (InputAction::Motion { dx: ax, dy: ay }, InputAction::Motion { dx: bx, dy: by }) =
++                (actions[written - 1], action)
++            && i64::from(ax) * i64::from(by) == i64::from(ay) * i64::from(bx)
++            && i64::from(ax) * i64::from(bx) >= 0
++            && i64::from(ay) * i64::from(by) >= 0
++            && let (Some(dx), Some(dy)) = (ax.checked_add(bx), ay.checked_add(by))
++        {
++            actions[written - 1] = InputAction::Motion { dx, dy };
++            continue;
++        }
++        actions[written] = action;
++        written += 1;
++    }
++    actions.truncate(written);
+ }
+ 
+ pub struct InputDecoder {
+--- a/src/backend/cyxia/delivery.rs
++++ b/src/backend/cyxia/delivery.rs
+@@ -27,6 +27,10 @@
+                 *byte &= !mask;
+             }
+         }
++    }
++
++    pub fn is_idle(&self) -> bool {
++        self.held.iter().all(|byte| *byte == 0)
+     }
+ 
+     pub fn key_count(&self) -> u32 {

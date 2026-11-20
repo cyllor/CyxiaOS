@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 runtime = []
+ram-2g = ["runtime"]
 
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

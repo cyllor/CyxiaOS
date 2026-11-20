@@ -43,13 +43,18 @@ _start:
     movl $runtime_pd,%eax
     orl $3,%eax
     movl %eax,runtime_pdpt
+    .if {ram_gib} == 2
+    movl $(runtime_pd+4096),%eax
+    orl $3,%eax
+    movl %eax,runtime_pdpt+8
+    .endif
     xorl %ecx,%ecx
 1:  movl %ecx,%eax
     shll $21,%eax
     orl $0x83,%eax
     movl %eax,runtime_pd(,%ecx,8)
     incl %ecx
-    cmpl $512,%ecx
+    cmpl $(512*{ram_gib}),%ecx
     jne 1b
     lgdt runtime_gdtr
     movl %cr4,%eax
@@ -105,6 +110,6 @@ runtime_gdtr:
 .balign 4096
 runtime_root: .skip 4096
 runtime_pdpt: .skip 4096
-runtime_pd: .skip 4096
+runtime_pd: .skip (4096*{ram_gib})
 runtime_magic: .long 0
 runtime_info: .long 0

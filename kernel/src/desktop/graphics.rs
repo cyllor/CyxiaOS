@@ -364,33 +364,43 @@ pub fn poll() {
     // CPU0 foreground sole owner; IRQ handlers never inspect device queues.
     let inputs = unsafe { &mut *core::ptr::addr_of_mut!(INPUTS) };
     let events = unsafe { &mut *core::ptr::addr_of_mut!(EVENTS) };
-    for (source, entry) in inputs.iter_mut().enumerate() {
-        let Some(input) = entry else {
-            continue;
-        };
-        match input.queue.poll(&mut input.transport, &Board) {
-            Ok(Some(event)) => {
-                if event.kind == 1 || event.kind == 2 {
-                    super::log(b"GRAPHICS_INPUT_EVENT MECHANISM\n");
-                    super::hex(
-                        (u64::from(event.kind) << 48)
-                            | (u64::from(event.code) << 32)
-                            | u64::from(event.value as u32),
-                    );
+    // Drain ready packets together instead of delaying each event until the
+    // next OS turn. Round-robin service keeps both devices fair, and 32 rounds
+    // bound foreground work to at most 64 polls without growing the buffer.
+    for _ in 0..32 {
+        let mut progressed = false;
+        for (source, entry) in inputs.iter_mut().enumerate() {
+            let Some(input) = entry else {
+                continue;
+            };
+            match input.queue.poll(&mut input.transport, &Board) {
+                Ok(Some(event)) => {
+                    progressed = true;
+                    if event.kind == 1 || event.kind == 2 {
+                        super::log(b"GRAPHICS_INPUT_EVENT MECHANISM\n");
+                        super::hex(
+                            (u64::from(event.kind) << 48)
+                                | (u64::from(event.code) << 32)
+                                | u64::from(event.value as u32),
+                        );
+                    }
+                    if events.push(source, event) == Ok(true) {
+                        super::log(b"GRAPHICS_INPUT_DROPPED MECHANISM\n");
+                    }
                 }
-                if events.push(source, event) == Ok(true) {
-                    super::log(b"GRAPHICS_INPUT_DROPPED MECHANISM\n");
+                Ok(None) => {}
+                Err(_) => {
+                    input.transport.fail();
+                    *entry = None;
+                    // Preserve a visible loss record and release this device's
+                    // known keys. Pending DMA storage itself remains quarantined.
+                    let _ = events.disconnect(source);
+                    super::log(b"GRAPHICS_INPUT_STOPPED MECHANISM\n");
                 }
             }
-            Ok(None) => {}
-            Err(_) => {
-                input.transport.fail();
-                *entry = None;
-                // Preserve a visible loss record and release this device's
-                // known keys. Pending DMA storage itself remains quarantined.
-                let _ = events.disconnect(source);
-                super::log(b"GRAPHICS_INPUT_STOPPED MECHANISM\n");
-            }
+        }
+        if !progressed {
+            break;
         }
     }
 }

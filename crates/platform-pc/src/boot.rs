@@ -14,6 +14,8 @@ pub const MAX_MMAP_BYTES: usize = 4096;
 pub const MAX_PHYSICAL_MEMORY: u64 = 256 * 1024 * 1024;
 /// Explicit production profile; callers must map and manage this full window.
 pub const MAX_RUNTIME_PHYSICAL_MEMORY: u64 = 1024 * 1024 * 1024;
+/// Separate two-GiB runtime profile; callers must map and track its full range.
+pub const MAX_RUNTIME_2G_PHYSICAL_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 const LOW_MEMORY_END: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 64;
@@ -112,7 +114,8 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 fn validate_limit(limit: u64) -> Result<(), BootError> {
-    if !(MAX_PHYSICAL_MEMORY..=MAX_RUNTIME_PHYSICAL_MEMORY).contains(&limit)
+    if (!(MAX_PHYSICAL_MEMORY..=MAX_RUNTIME_PHYSICAL_MEMORY).contains(&limit)
+        && limit != MAX_RUNTIME_2G_PHYSICAL_MEMORY)
         || !limit.is_multiple_of(PAGE_SIZE)
     {
         return Err(BootError::UnsupportedMemory);

@@ -1,0 +1,156 @@
+--- a/src/backend/cyxia/mod.rs
++++ b/src/backend/cyxia/mod.rs
+@@ -260,7 +260,16 @@
+             .read()
+             .take_presentation_feedback(&self.output, &states);
+         if let Some(mapping) = mapping {
+-            let mut presentation = PendingPresentation::new(self.native.info(), mapping.flipped())?;
++            // Damage is in the output coordinates used by the native scanout.
++            // Keep the complete readback for global row orientation and submit
++            // only the enclosing changed region, including the old cursor.
++            let mut presentation = PendingPresentation::for_damage(
++                self.native.info(),
++                mapping.flipped(),
++                damage.into_iter().flatten().map(|rect| {
++                    (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
++                }),
++            )?;
+             presentation.observe_first_frame(first_frame);
+             self.pending = Some(PendingFrame {
+                 mapping,
+--- a/src/backend/cyxia/native/presentation.rs
++++ b/src/backend/cyxia/native/presentation.rs
+@@ -14,6 +14,7 @@
+ pub struct PendingPresentation {
+     info: DisplayInfo,
+     flipped: bool,
++    region: Rectangle,
+     left: u32,
+     top: u32,
+     tile: Vec<u8>,
+@@ -55,6 +56,7 @@
+         Ok(Self {
+             info,
+             flipped,
++            region: Rectangle { x: 0, y: 0, width: info.width, height: info.height },
+             left: 0,
+             top: 0,
+             tile,
+@@ -63,6 +65,44 @@
+             observe_first_frame: false,
+             deadline: Instant::now() + STALL_TIMEOUT,
+         })
++    }
++
++    /// Cover every damaged pixel with one clipped bounding rectangle. The full
++    /// readback remains immutable; source rows are still indexed in that full
++    /// mapping, including its global vertical flip. Empty damage conservatively
++    /// preserves the full-frame path. Session-lock black scanout uses `new`.
++    pub fn for_damage(
++        info: DisplayInfo,
++        flipped: bool,
++        damage: impl IntoIterator<Item = (i32, i32, i32, i32)>,
++    ) -> io::Result<Self> {
++        let mut pending = Self::new(info, flipped)?;
++        let mut bounds: Option<(i64, i64, i64, i64)> = None;
++        for (x, y, width, height) in damage {
++            if width < 0 || height < 0 {
++                return Err(invalid("invalid native damage extent"));
++            }
++            let left = i64::from(x).max(0);
++            let top = i64::from(y).max(0);
++            let right = (i64::from(x) + i64::from(width)).min(i64::from(info.width));
++            let bottom = (i64::from(y) + i64::from(height)).min(i64::from(info.height));
++            if left >= right || top >= bottom {
++                continue;
++            }
++            bounds = Some(match bounds {
++                None => (left, top, right, bottom),
++                Some((a, b, c, d)) => (a.min(left), b.min(top), c.max(right), d.max(bottom)),
++            });
++        }
++        if let Some((left, top, right, bottom)) = bounds {
++            pending.region = Rectangle {
++                x: left as u32,
++                y: top as u32,
++                width: (right - left) as u32,
++                height: (bottom - top) as u32,
++            };
++        }
++        Ok(pending)
+     }
+ 
+     /// Observe only the cursor bound to the first actual render attempt.
+@@ -133,7 +173,7 @@
+             return Err(invalid("invalid native framebuffer or tile budget"));
+         }
+         for _ in 0..budget {
+-            if self.left == self.info.width {
++            if self.left == self.region.width {
+                 return Ok(true);
+             }
+             if now() >= self.deadline {
+@@ -143,20 +183,20 @@
+                     "native presentation stalled",
+                 ));
+             }
+-            let columns = (self.info.width - self.left).min(self.tile.len() as u32 / 4);
+-            let rows = (self.info.height - self.top).min(self.tile.len() as u32 / (columns * 4));
++            let columns = (self.region.width - self.left).min(self.tile.len() as u32 / 4);
++            let rows = (self.region.height - self.top).min(self.tile.len() as u32 / (columns * 4));
+             let length = (columns * rows * 4) as usize;
+             if !self.ready {
+                 if let Some(rgba) = rgba {
+                     for row in 0..rows {
+                         let source_row = if self.flipped {
+-                            self.info.height - 1 - self.top - row
++                            self.info.height - 1 - self.region.y - self.top - row
+                         } else {
+-                            self.top + row
++                            self.region.y + self.top + row
+                         };
+                         for column in 0..columns {
+                             let source =
+-                                ((source_row * self.info.width + self.left + column) * 4) as usize;
++                                ((source_row * self.info.width + self.region.x + self.left + column) * 4) as usize;
+                             let target = ((row * columns + column) * 4) as usize;
+                             self.tile[target..target + 4].copy_from_slice(&[
+                                 rgba[source + 2],
+@@ -172,8 +212,8 @@
+                 self.ready = true;
+             }
+             let rect = Rectangle {
+-                x: self.left,
+-                y: self.top,
++                x: self.region.x + self.left,
++                y: self.region.y + self.top,
+                 width: columns,
+                 height: rows,
+             };
+@@ -185,7 +225,7 @@
+                 Ok(0) => {
+                     self.ready = false;
+                     self.top += rows;
+-                    if self.top == self.info.height {
++                    if self.top == self.region.height {
+                         self.top = 0;
+                         self.left += columns;
+                     }
+@@ -196,7 +236,7 @@
+                     #[cfg(feature = "backend-cyxia")]
+                     if self.observe_first_frame && rgba.is_some() {
+                         phase::mark_once(Phase::FirstTileSubmitEnd);
+-                        if self.left == self.info.width {
++                        if self.left == self.region.width {
+                             phase::mark_once(Phase::FirstFullScanoutComplete);
+                         }
+                     }
+@@ -218,7 +258,7 @@
+                 }
+             }
+         }
+-        Ok(self.left == self.info.width)
++        Ok(self.left == self.region.width)
+     }
+ }
+ 

@@ -1,0 +1,20 @@
+{
+  "kind": "cosmic-native-pointer-damage-v1",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "base_tile_policy": "ports/cosmic/native-presentation-v1/source-policy.json",
+  "base_sources": {
+    "mod.rs": "4ad4d65ada97e0e1b6bd4e7d34df11c4269b8173235c2d9b74fb67374fb746a7",
+    "native/presentation.rs": "ecd2df7a18c61d822addb3b40035920b3d5167245eabb56a49eba11fdb2e2106"
+  },
+  "kernel_abi": {
+    "max_rect_bytes": 65536,
+    "max_pixels": 16384
+  },
+  "preserve_full_readback": true,
+  "full_os_verified": false,
+  "patch_sha256": "1ebc4ba6a2b01c9815d76c1626d664ada49de59de28571abdcb8a58bb707b432",
+  "patched_sources": {
+    "mod.rs": "c3a6b2a1aa8bb280e193caff7c7484b457bebab94e5ea4431c68d6fbb07d4385",
+    "native/presentation.rs": "43d79886ee134f133061838e2622b801d14818e379263981e0d79b26c204fe84"
+  }
+}

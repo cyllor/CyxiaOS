@@ -4,6 +4,8 @@ use core::marker::PhantomData;
 
 pub const PAGE_BYTES: u64 = 4096;
 pub const KERNEL_BASE: u64 = 0xffff800000000000;
+/// Explicit runtime direct-map capacity, also used by physical-page guards.
+pub const RUNTIME_RAM_BYTES: u64 = if cfg!(feature = "ram-2g") { 2 << 30 } else { 1 << 30 };
 const MASK: u64 = 0x000f_ffff_ffff_f000;
 const P: u64 = 1;
 const W: u64 = 2;

@@ -170,6 +170,7 @@ pub use transport::{MappedRegion, PciRegions, Transport};
 pub struct Queue {
     memory: &'static mut QueueMemory,
     notification: transport::Notification,
+    size: u16,
     available: u16,
     used: u16,
     writable: u32,
@@ -184,9 +185,19 @@ impl Queue {
         platform: &impl Platform,
     ) -> Result<Self, Error> {
         transport.select_queue(index)?;
-        if transport.queue_enabled() || transport.queue_max_size() < 8 {
+        let maximum = transport.queue_max_size();
+        if transport.queue_enabled() || maximum < 8 {
             return Err(Error::Queue);
         }
+        // Input reports consume one descriptor per event. Use up to 64 of the
+        // existing pinned slots so a short motion burst is not silently lost.
+        // Request/response devices retain their original eight-entry ring.
+        let queue_size = if transport.device_id() == 18 {
+            let limit = maximum.min(64);
+            1u32 << (31 - limit.leading_zeros())
+        } else {
+            8
+        };
         let notification = transport.queue_notification(index)?;
         let size = core::mem::size_of::<QueueMemory>();
         let pa = platform.physical(memory as *mut _ as usize, size)?;
@@ -202,13 +213,14 @@ impl Queue {
         unsafe {
             platform.sync(memory as *mut _ as usize, size);
         }
-        transport.set_queue_size(8)?;
+        transport.set_queue_size(queue_size)?;
         transport.set_queue_addresses(pa, pa + 4096, pa + 8192);
         platform.barrier();
         transport.enable_queue();
         Ok(Self {
             memory,
             notification,
+            size: queue_size as u16,
             available: 0,
             used: 0,
             writable: 0,
@@ -256,7 +268,7 @@ impl Queue {
             platform.sync(m.response.address(), 4096);
             platform.sync(m.desc.address(), 4096);
         }
-        m.avail.put16(4 + usize::from(self.available % 8) * 2, 0);
+        m.avail.put16(4 + usize::from(self.available % self.size) * 2, 0);
         self.available = self.available.wrapping_add(1);
         platform.barrier();
         m.avail.put16(2, self.available);
@@ -305,7 +317,7 @@ impl Queue {
             platform.sync(m.used.address(), 4096);
         }
         platform.barrier();
-        let at = 4 + usize::from(self.used % 8) * 8;
+        let at = 4 + usize::from(self.used % self.size) * 8;
         let length = m.used.get32(at + 4);
         if index.wrapping_sub(self.used) != 1 || m.used.get32(at) != 0 || length > self.writable {
             self.poisoned = true;
@@ -359,7 +371,7 @@ const _: () = assert!(core::mem::offset_of!(InputEvent, kind) == 0);
 const _: () = assert!(core::mem::offset_of!(InputEvent, code) == 2);
 const _: () = assert!(core::mem::offset_of!(InputEvent, value) == 4);
 
-/// Eight independently posted event buffers: one keyboard/mouse report may
+/// Bounded independently posted event buffers: one keyboard/mouse report may
 /// contain multiple events plus SYN_REPORT, so a single posted buffer is invalid.
 pub struct EventQueue {
     queue: Queue,
@@ -373,8 +385,11 @@ impl EventQueue {
         if queue.pending || queue.poisoned || queue.available != 0 {
             return Err(Error::Busy);
         }
+        if queue.size < 8 || queue.size > 64 || !queue.size.is_power_of_two() {
+            return Err(Error::Queue);
+        }
         let pa = platform.physical(queue.memory.response.address(), 4096)?;
-        for slot in 0..8 {
+        for slot in 0..usize::from(queue.size) {
             queue.memory.desc.put64(slot * 16, pa + slot as u64 * 8);
             queue.memory.desc.put32(slot * 16 + 8, 8);
             queue.memory.desc.put16(slot * 16 + 12, 2);
@@ -386,12 +401,12 @@ impl EventQueue {
             platform.sync(queue.memory.response.address(), 4096);
         }
         platform.barrier();
-        queue.memory.avail.put16(2, 8);
+        queue.memory.avail.put16(2, queue.size);
         unsafe {
             platform.sync(queue.memory.avail.address(), 4096);
         }
         platform.barrier();
-        queue.available = 8;
+        queue.available = queue.size;
         if let Err(error) = transport.notify(queue.notification) {
             // The handle is dropped, but its static DMA pages remain pinned.
             transport.fail();
@@ -426,17 +441,17 @@ impl EventQueue {
         // Snapshot the entire currently completed batch before re-posting any
         // ID. Otherwise a duplicate used ID could be mistaken for a fresh event.
         let count = end.wrapping_sub(q.used) as usize;
-        if count > 8 {
+        if count > usize::from(q.size) {
             q.poisoned = true;
             transport.fail();
             return Err(Error::Queue);
         }
-        let mut seen = [false; 8];
+        let mut seen = [false; 64];
         let mut first_slot = 0;
         for n in 0..count {
-            let offset = 4 + usize::from(q.used.wrapping_add(n as u16) % 8) * 8;
+            let offset = 4 + usize::from(q.used.wrapping_add(n as u16) % q.size) * 8;
             let id = q.memory.used.get32(offset) as usize;
-            if id >= 8 || seen[id] || q.memory.used.get32(offset + 4) != 8 {
+            if id >= usize::from(q.size) || seen[id] || q.memory.used.get32(offset + 4) != 8 {
                 q.poisoned = true;
                 transport.fail();
                 return Err(Error::Queue);
@@ -459,7 +474,7 @@ impl EventQueue {
         q.used = q.used.wrapping_add(1);
         q.memory
             .avail
-            .put16(4 + usize::from(q.available % 8) * 2, slot as u16);
+            .put16(4 + usize::from(q.available % q.size) * 2, slot as u16);
         q.available = q.available.wrapping_add(1);
         platform.barrier();
         q.memory.avail.put16(2, q.available);
@@ -605,6 +620,94 @@ mod tests {
                 value: 0
             }))
         );
+        assert_eq!(e.poll(&mut t, &Host), Ok(None));
+    }
+    #[test]
+    fn pointer_burst_retains_all_motion_when_device_has_more_ring_capacity() {
+        let mmio = Box::leak(Box::new(Page::zeroed()));
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 18); // Actual VirtIO input device, not a request/response queue.
+        mmio.put32(0x34, 128);
+        let mut transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let memory = Box::leak(Box::new(QueueMemory::zeroed()));
+        let queue = Queue::configure(&mut transport, memory, 0, &Host).unwrap();
+        let mut events = EventQueue::prime(queue, &mut transport, &Host).unwrap();
+        // Real input devices cannot retain host reports without posted buffers.
+        // The device boundary writes only the buffers this driver advertised.
+        let posted = events.queue.memory.avail.get16(2) as usize;
+        let delivered = posted.min(24 * 2);
+        for index in 0..delivered {
+            let slot = events.queue.memory.avail.get16(4 + index * 2) as usize;
+            events.queue.memory.response.put16(slot * 8, if index % 2 == 0 { 2 } else { 0 });
+            events.queue.memory.response.put16(slot * 8 + 2, 0);
+            events.queue.memory.response.put32(slot * 8 + 4, if index % 2 == 0 { 8 } else { 0 });
+            events.queue.memory.used.put32(4 + index * 8, slot as u32);
+            events.queue.memory.used.put32(8 + index * 8, 8);
+        }
+        events.queue.memory.used.put16(2, delivered as u16);
+        let mut delta = 0;
+        let mut reports = 0;
+        while let Some(event) = events.poll(&mut transport, &Host).unwrap() {
+            if event.kind == 2 { delta += event.value; }
+            if event.kind == 0 && event.code == 0 { reports += 1; }
+        }
+        assert_eq!(delta, 192, "driver lost motion before the software input buffer");
+        assert_eq!(reports, 24);
+        assert_eq!(core::mem::size_of::<QueueMemory>(), 5 * 4096);
+    }
+    fn input_fixture(maximum: u32) -> (Transport, EventQueue, &'static Page) {
+        let mmio = Box::leak(Box::new(Page::zeroed()));
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 18);
+        mmio.put32(0x34, maximum);
+        let mut transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let queue = Queue::configure(&mut transport,
+            Box::leak(Box::new(QueueMemory::zeroed())), 0, &Host).unwrap();
+        let events = EventQueue::prime(queue, &mut transport, &Host).unwrap();
+        (transport, events, mmio)
+    }
+    #[test]
+    fn input_ring_respects_device_limits_without_growing_dma_storage() {
+        for (maximum, expected) in [(8, 8), (12, 8), (16, 16), (31, 16), (64, 64), (128, 64)] {
+            let (_, queue, mmio) = input_fixture(maximum);
+            assert_eq!(mmio.get32(0x38), expected);
+            assert_eq!(queue.queue.memory.avail.get16(2), expected as u16);
+        }
+        let (mut t, mut q) = fixture();
+        q.submit(&mut t, b"gpu-like request", 8, &Host).unwrap();
+        assert_eq!(q.size, 8);
+        assert_eq!(core::mem::size_of::<QueueMemory>(), 20_480);
+    }
+    #[test]
+    fn large_input_ring_still_rejects_duplicate_ids_bad_lengths_and_overruns() {
+        for scenario in 0..4 {
+            let (mut t, mut e, _) = input_fixture(64);
+            let published = e.queue.available;
+            e.queue.memory.used.put32(4, if scenario == 0 { 64 } else { 63 });
+            e.queue.memory.used.put32(8, if scenario == 1 { 9 } else { 8 });
+            e.queue.memory.used.put32(12, 63);
+            e.queue.memory.used.put32(16, 8);
+            e.queue.memory.used.put16(2, match scenario { 2 => 2, 3 => 65, _ => 1 });
+            assert_eq!(e.poll(&mut t, &Host), Err(Error::Queue));
+            assert_eq!(e.queue.available, published, "invalid device metadata reposted a buffer");
+            assert_eq!(e.poll(&mut t, &Host), Err(Error::Device));
+        }
+    }
+    #[test]
+    fn large_input_ring_keeps_signed_values_and_wraps_16_bit_indices() {
+        let (mut t, mut e, _) = input_fixture(64);
+        e.queue.used = u16::MAX;
+        e.queue.available = 63;
+        e.queue.memory.used.put32(4 + 63 * 8, 63);
+        e.queue.memory.used.put32(8 + 63 * 8, 8);
+        e.queue.memory.used.put16(2, 0);
+        e.queue.memory.response.put16(63 * 8, 2);
+        e.queue.memory.response.put32(63 * 8 + 4, (-7i32) as u32);
+        assert_eq!(e.poll(&mut t, &Host), Ok(Some(InputEvent { kind: 2, code: 0, value: -7 })));
+        assert_eq!(e.queue.used, 0);
+        assert_eq!(e.queue.available, 64);
         assert_eq!(e.poll(&mut t, &Host), Ok(None));
     }
     #[test]

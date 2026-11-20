@@ -1,15 +1,17 @@
 //! Formal-kernel high mapping. Lower-half process tables never inherit boot RAM.
-use crate::space::{Error, KERNEL_BASE, KernelMappings};
+use crate::space::{Error, KERNEL_BASE, KernelMappings, RUNTIME_RAM_BYTES};
 const P: u64 = 1;
 const W: u64 = 2;
 const NX: u64 = 1 << 63;
 const MASK: u64 = 0x000f_ffff_ffff_f000;
+const RAM_DIRECTORIES: usize = (RUNTIME_RAM_BYTES >> 30) as usize;
+const RAM_LEAF_TABLES: usize = (RUNTIME_RAM_BYTES >> 21) as usize;
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
 static mut ROOT: Table = Table([0; 512]);
 static mut RAM_PDPT: Table = Table([0; 512]);
-static mut RAM_PD: Table = Table([0; 512]);
-static mut RAM_PT: [Table; 512] = [const { Table([0; 512]) }; 512];
+static mut RAM_PD: [Table; RAM_DIRECTORIES] = [const { Table([0; 512]) }; RAM_DIRECTORIES];
+static mut RAM_PT: [Table; RAM_LEAF_TABLES] = [const { Table([0; 512]) }; RAM_LEAF_TABLES];
 static mut MMIO_PD: Table = Table([0; 512]);
 static mut LOW_PDPT: Table = Table([0; 512]);
 static mut LOW_PD: Table = Table([0; 512]);
@@ -29,7 +31,7 @@ fn physical(pointer: *const Table) -> u64 {
 /// BSP on temporary high+low identity root, IF clear; all supplied physical
 /// ranges valid and exclusively reserved, no AP/user can access these tables.
 pub unsafe fn install(layout: KernelLayout<'_>) -> Result<u64, Error> {
-    if layout.ram_bytes == 0 || layout.ram_bytes > 1 << 30 || layout.ram_bytes % 4096 != 0 {
+    if layout.ram_bytes == 0 || layout.ram_bytes > RUNTIME_RAM_BYTES || layout.ram_bytes % 4096 != 0 {
         return Err(Error::Address);
     }
     for &(a, b) in core::iter::once(&layout.text)
@@ -42,18 +44,20 @@ pub unsafe fn install(layout: KernelLayout<'_>) -> Result<u64, Error> {
     }
     let root = core::ptr::addr_of_mut!(ROOT);
     let pdpt = core::ptr::addr_of_mut!(RAM_PDPT);
-    let pd = core::ptr::addr_of_mut!(RAM_PD);
+    let directories = core::ptr::addr_of_mut!(RAM_PD).cast::<Table>();
     let leaves = core::ptr::addr_of_mut!(RAM_PT).cast::<Table>();
     let mmio = core::ptr::addr_of_mut!(MMIO_PD);
     unsafe {
         (*root).0 = [0; 512];
         (*pdpt).0 = [0; 512];
-        (*pd).0 = [0; 512];
         (*root).0[256] = physical(pdpt) | P | W;
-        (*pdpt).0[0] = physical(pd) | P | W;
+        for index in 0..RAM_DIRECTORIES {
+            (*directories.add(index)).0 = [0; 512];
+            (*pdpt).0[index] = physical(directories.add(index)) | P | W;
+        }
         (*pdpt).0[3] = physical(mmio) | P | W;
-        for i in 0..512 {
-            (*pd).0[i] = physical(leaves.add(i)) | P | W;
+        for i in 0..RAM_LEAF_TABLES {
+            (*directories.add(i / 512)).0[i % 512] = physical(leaves.add(i)) | P | W;
             for j in 0..512 {
                 let address = (i * 512 + j) as u64 * 4096;
                 let flags = if address == 0
@@ -73,6 +77,8 @@ pub unsafe fn install(layout: KernelLayout<'_>) -> Result<u64, Error> {
                 };
                 (*leaves.add(i)).0[j] = flags;
             }
+        }
+        for i in 0..512 {
             (*mmio).0[i] = (0xc0000000 + i as u64 * (1 << 21)) | P | W | 0x98 | NX;
         }
         let low_pdpt = core::ptr::addr_of_mut!(LOW_PDPT);
@@ -106,7 +112,7 @@ pub fn mappings(ram_bytes: u64) -> Result<KernelMappings, Error> {
 /// Caller owns the frame and prevents all user/reference reuse until its real
 /// cross-CPU invalidation completes. Only an existing normal RAM alias changes.
 pub unsafe fn set_direct_permissions(physical: u64, writable: bool) -> Result<(), Error> {
-    if physical == 0 || physical >= 1 << 30 || physical % 4096 != 0 {
+    if physical == 0 || physical >= RUNTIME_RAM_BYTES || physical % 4096 != 0 {
         return Err(Error::Address);
     }
     let entry = unsafe {

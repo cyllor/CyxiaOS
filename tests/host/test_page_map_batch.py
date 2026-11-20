@@ -49,6 +49,20 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def runtime_declaration(source, symbol):
+    starts = list(re.finditer(r"(?m)^(?:const|static) " + re.escape(symbol) + r": ", source))
+    if len(starts) != 1:
+        raise ValueError("Ambiguous runtime fixture declaration: " + symbol)
+    start = starts[0].start()
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        depth += (char in "([{") - (char in ")]}")
+        if char == ";" and depth == 0:
+            return source[start:index + 1]
+    raise ValueError("Unterminated runtime fixture declaration: " + symbol)
+
+
 def production_files(address_source=None, *, source_root=None):
     """Pure source extraction; no subprocess, compiler, lease or guest access."""
     names = ("crates/arch-x86_64/src/space.rs", "kernel/src/arch/x86_64/runtime.rs",
@@ -102,10 +116,8 @@ def production_files(address_source=None, *, source_root=None):
     substitutions = {"@PRODUCTION_ALIAS_RUNTIME@": "\n".join(parts),
                      "@PRODUCTION_CODE_RUNTIME@": "\n".join(code_runtime)}
     for symbol in ("RAM", "CODE_PHASES", "USER_ALIASES", "ALIAS_GATE", "ALIAS_BATCH_OWNER"):
-        declaration = re.findall(r"(?m)^(?:const|static) " + symbol + r": [^\n]+", runtime)
-        if len(declaration) != 1:
-            raise ValueError("Ambiguous runtime fixture declaration: " + symbol)
-        substitutions["@" + symbol + "@"] = ("pub " if symbol == "RAM" else "") + declaration[0]
+        declaration = runtime_declaration(runtime, symbol)
+        substitutions["@" + symbol + "@"] = ("pub " if symbol == "RAM" else "") + declaration
     for marker, value in substitutions.items():
         if fixture.count(marker) != 1:
             raise ValueError("Ambiguous fixture marker: " + marker)

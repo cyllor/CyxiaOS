@@ -9,9 +9,11 @@ use core::sync::atomic::AtomicBool;
 
 core::arch::global_asm!(
     include_str!("../../../../crates/arch-x86_64/src/entry_runtime.S"),
+    ram_gib = const (RAM >> 30),
     options(att_syntax)
 );
-const RAM: u64 = 1 << 30;
+const RAM: u64 = if cfg!(feature = "ram-2g") { 2 << 30 } else { 1 << 30 };
+const _: () = assert!(RAM == arch::space::RUNTIME_RAM_BYTES);
 const TIMER: u8 = 239;
 const WAKE: u8 = 240;
 const TLB: u8 = 241;
@@ -51,9 +53,10 @@ static TLB_EPOCH: AtomicU64 = AtomicU64::new(0);
 static TLB_ACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static TLB_GATE: AtomicBool = AtomicBool::new(false);
 // Two bits per physical page: writable, transition, or sealed after real fences.
-static CODE_PHASES: PhaseTable<8192> = PhaseTable::new();
+static CODE_PHASES: PhaseTable<{ (RAM / 4096 / 32) as usize }> = PhaseTable::new();
 // Three 20-bit counts: all user mappings, writable aliases, executable aliases.
-static USER_ALIASES: [AtomicU64; 262144] = [const { AtomicU64::new(0) }; 262144];
+static USER_ALIASES: [AtomicU64; (RAM / 4096) as usize] =
+    [const { AtomicU64::new(0) }; (RAM / 4096) as usize];
 static ALIAS_GATE: AtomicBool = AtomicBool::new(false);
 // A batched alias lease is held only by one synchronous, non-Send arch guard.
 static ALIAS_BATCH_OWNER: AtomicU64 = AtomicU64::new(0);
@@ -482,6 +485,12 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
         RAM,
     )
     .expect("PC boot");
+    #[cfg(feature = "ram-2g")]
+    let (info, high_page) = {
+        let mut info = info;
+        let page = info.reserve_pool(4096, 1 << 30).expect("upper-GiB probe reservation");
+        (info, page)
+    };
     let topology = unsafe { firmware() };
     assert!(
         info.ram_regions()
@@ -518,6 +527,20 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
         ));
     }
     KERNEL_ROOT.store(root, Ordering::Release);
+    #[cfg(feature = "ram-2g")]
+    {
+        // This bootstrap-owned page is reserved from the real loader map.
+        // Touch the second GiB only after its protected high mapping exists.
+        let address = kernel_va(high_page.start.0, 4096).expect("upper-GiB direct map");
+        let pointer = address as *mut u64;
+        unsafe {
+            pointer.write_volatile(0x435958324752414d);
+            assert_eq!(pointer.read_volatile(), 0x435958324752414d);
+            pointer.write_volatile(0);
+        }
+        log(b"X86_RAM_2G_OK high_page=");
+        super::hex(high_page.start.0);
+    }
     LAPIC.store(topology.lapic_base, Ordering::Release);
     for (slot, &id) in topology.apic_ids.iter().enumerate() {
         APIC_IDS[slot].store(id as u64, Ordering::Relaxed);
