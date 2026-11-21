@@ -6,7 +6,11 @@ use crate::{
     epoll::{ERR, HUP, IN, OUT},
 };
 
-#[cfg(feature = "full-os")]
+// Six session children, four panel children and one application launch can
+// own three stdio pipes each. Leave room for the admission reserve and startup.
+#[cfg(feature = "cosmic-app-library-v1")]
+pub const PIPES: usize = 40;
+#[cfg(all(feature = "full-os", not(feature = "cosmic-app-library-v1")))]
 pub const PIPES: usize = 32;
 #[cfg(not(feature = "full-os"))]
 pub const PIPES: usize = 8;

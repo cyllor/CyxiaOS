@@ -52,17 +52,36 @@ class RuntimeElf(unittest.TestCase):
         with self.assertRaises(ValueError): x86_64.boot_image(raw, runtime=True)
 
 class UserBuildInputs(unittest.TestCase):
-    def test_workspace_kernel_file_bound_is_separate_from_legacy_and_ram(self):
-        self.assertEqual(os_x86.kernel_file_limit(['cosmic-workspace-applets-v1']), 384 * 1024**2)
+    def test_applet_kernel_file_bound_is_separate_from_legacy_and_ram(self):
+        for name in ('cosmic-workspace-applets-v1', 'cosmic-notifications-applet-v1'):
+            self.assertEqual(os_x86.kernel_file_limit([name]), 384 * 1024**2)
         for features in ([], ['full-os'], ['cosmic-core-services-v1'], ['cosmic-time-applet-v1']):
             self.assertEqual(os_x86.kernel_file_limit(features), 256 * 1024**2)
         command = os_x86.launch_argv('/qemu', '/boot')
         self.assertEqual(command[command.index('-m') + 1], '1024M')
 
-    def test_workspace_applets_have_an_explicit_graphics_and_ported_profile(self):
-        name = 'cosmic-workspace-applets-v1'
-        self.assertEqual(os_x86.select_features(graphics=True, ported=True, extras=[name]),
-                         ['os-runtime', 'graphics', 'ported', name])
+    def test_applets_have_an_explicit_graphics_and_ported_profile(self):
+        for name in ('cosmic-workspace-applets-v1', 'cosmic-notifications-applet-v1'):
+            self.assertEqual(os_x86.select_features(graphics=True, ported=True, extras=[name]),
+                             ['os-runtime', 'graphics', 'ported', name])
+            for options in (dict(graphics=True), dict(ported=True), {}):
+                with self.subTest(name=name, options=options), self.assertRaises(ValueError):
+                    os_x86.select_features(extras=[name], **options)
+
+    def test_wallpaper_profile_includes_the_desktop_catalog_bound(self):
+        name = 'cosmic-bg-v1'
+        features = os_x86.select_features(graphics=True, ported=True, extras=[name])
+        self.assertEqual(features, ['os-runtime', 'graphics', 'ported', name])
+        self.assertEqual(os_x86.kernel_file_limit(features), 384 * 1024**2)
+        with self.assertRaises(ValueError):
+            os_x86.select_features(ported=True, extras=[name])
+
+    def test_application_library_uses_the_one_gib_desktop_profile(self):
+        name = 'cosmic-app-library-v1'
+        features = os_x86.select_features(graphics=True, ported=True, extras=[name])
+        self.assertEqual(features, ['os-runtime', 'graphics', 'ported', name])
+        self.assertIn(name, os_x86.NOTIFICATIONS_OBJECT_FEATURES)
+        self.assertEqual(os_x86.kernel_file_limit(features), 384 * 1024**2)
         for options in (dict(graphics=True), dict(ported=True), {}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 os_x86.select_features(extras=[name], **options)

@@ -20,6 +20,13 @@ class NativeHostContract(unittest.TestCase):
                 host_source_policy_sha256=hashlib.sha256((subject.ROOT / 'ports/cosmic/native-applet-hosts-v1/source-policy.json').read_bytes()).hexdigest())
             inputs[subject.BUS] = value['session_bus_sha256']
             path.write_text(json.dumps(value)); subject.validate(root, inputs)
+            with self.assertRaises(ValueError):
+                subject.validate(root, inputs, notifications=True)
+            notification_profile = {**value, **subject.NOTIFICATIONS_FIELDS}
+            path.write_text(json.dumps(notification_profile))
+            self.assertEqual(subject.validate(root, inputs, notifications=True)['shared_objects'], 48)
+            with self.assertRaises(ValueError):
+                subject.validate(root, inputs)
             for change in (dict(fds_per_process=64), dict(shared_objects=16), dict(shared_mappings_per_process=16),
                            dict(session_bus_sha256='0' * 64), dict(session_bus_connections=16),
                            dict(panel_popup_source_policy_sha256='0' * 64),

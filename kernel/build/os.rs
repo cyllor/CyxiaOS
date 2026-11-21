@@ -92,6 +92,9 @@ fn catalog(root: &Path, out: &Path) {
         ("spawn-test", &["glib-spawn-probe"][..]),
         ("cosmic-desktop", &["cosmic-comp"][..]),
         ("cosmic-workspace-applets-v1", &["cosmic-applet-workspaces", "cosmic-applet-tiling"][..]),
+        ("cosmic-notifications-applet-v1", &["cosmic-applet-notifications"][..]),
+        ("cosmic-bg-v1", &["cosmic-bg"][..]),
+        ("cosmic-app-library-v1", &["cosmic-app-library"][..]),
     ] {
         if feature(flag) { names.extend_from_slice(images); required.extend_from_slice(images); }
     }
@@ -119,9 +122,17 @@ fn catalog(root: &Path, out: &Path) {
         let contract = prefix.join("rootfs/usr/share/cyxia/cosmic-applets-v1.json");
         println!("cargo:rerun-if-changed={}", contract.display());
         let contract = fs::read_to_string(contract).expect("missing cosmic applet object contract");
-        for field in ["\"profile\": \"cosmic-applets-objects-v1\"", "\"fds_per_process\": 128",
+        let (profile, shared_objects) = if feature("cosmic-notifications-applet-v1") {
+            ("cosmic-notifications-applet-objects-v1", 48)
+        } else {
+            ("cosmic-applets-objects-v1", 32)
+        };
+        assert!(contract.contains(&format!("\"profile\": \"{profile}\""))
+            && contract.contains(&format!("\"shared_objects\": {shared_objects}")),
+            "cosmic applet shared-object contract mismatch");
+        for field in ["\"fds_per_process\": 128",
                       "\"open_descriptions\": 512", "\"unix_endpoints\": 128", "\"unix_connections\": 64",
-                      "\"shared_objects\": 32", "\"shared_mappings_per_process\": 32",
+                      "\"shared_mappings_per_process\": 32",
                       "\"session_bus_connections\": 32", "\"panel_popup_input\": \"cosmic-panel-popup-input-v1\""] {
             assert!(contract.contains(field), "cosmic applet object contract mismatch");
         }
@@ -133,6 +144,36 @@ fn catalog(root: &Path, out: &Path) {
                 && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
                 "invalid {name} desktop entry");
         }
+    }
+    if feature("cosmic-notifications-applet-v1") {
+        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppletNotifications.desktop");
+        println!("cargo:rerun-if-changed={}", entry.display());
+        let desktop = fs::read_to_string(entry).expect("missing cosmic-applet-notifications desktop entry");
+        assert!(["Exec=cosmic-applet-notifications", "X-CosmicApplet=true", "X-NotificationsApplet=true"]
+            .iter().all(|field| desktop.lines().any(|line| line == *field)),
+            "invalid COSMIC notification applet desktop entry");
+    }
+    if feature("cosmic-bg-v1") {
+        for relative in [
+            "rootfs/usr/share/cosmic/com.system76.CosmicBackground/v1/all",
+            "rootfs/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg",
+        ] {
+            let asset = prefix.join(relative);
+            println!("cargo:rerun-if-changed={}", asset.display());
+            assert!(asset.is_file(), "missing COSMIC background asset {relative}");
+        }
+    }
+    if feature("cosmic-app-library-v1") {
+        names.push("app-library-fixture");
+        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppLibrary.desktop");
+        println!("cargo:rerun-if-changed={}", entry.display());
+        let desktop = fs::read_to_string(entry).expect("missing COSMIC application library desktop entry");
+        assert!(desktop.lines().any(|line| line == "Exec=cosmic-app-library"),
+            "invalid COSMIC application library desktop entry");
+        let icon = prefix.join(
+            "rootfs/usr/share/icons/hicolor/scalable/apps/com.system76.CosmicAppLibrary.svg");
+        println!("cargo:rerun-if-changed={}", icon.display());
+        assert!(icon.is_file(), "missing COSMIC application library icon");
     }
     if prefix.join("Xcyxia.elf").is_file() { names.push("xorg"); }
     let mut text = String::from("const PORTED: &[(&str, &str, &[u8])] = &[\n");

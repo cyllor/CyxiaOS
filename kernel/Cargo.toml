@@ -33,6 +33,13 @@ cosmic-time-applet-v1 = ["cosmic-core-services-v1"]
 # One-GiB guest; image/stack/heap and physical page pools remain unchanged.
 # The separate FD/socket/shared-metadata envelope requires paired native hosts.
 cosmic-workspace-applets-v1 = ["cosmic-time-applet-v1", "cyxia-posix/cosmic-applets-v1", "cyxia-ai-runtime/cosmic-applets-v1"]
+cosmic-notifications-applet-v1 = [
+    "cosmic-workspace-applets-v1",
+    "cyxia-posix/cosmic-notifications-applet-v1",
+    "cyxia-ai-runtime/cosmic-notifications-applet-v1",
+]
+cosmic-bg-v1 = ["cosmic-notifications-applet-v1"]
+cosmic-app-library-v1 = ["cosmic-bg-v1", "cyxia-posix/cosmic-app-library-v1"]
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]

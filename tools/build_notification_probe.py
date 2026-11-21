@@ -148,7 +148,7 @@ class Builder(GenericBuilder):
             raise BuildError(str(error)) from error
 
 
-def build(output, sysroot, dbus_build, architecture='x86_64', *, native_lock=NATIVE_LOCK):
+def build(output, sysroot, dbus_build, architecture='x86_64', *, native_lock=NATIVE_LOCK, panel_clear=False):
     target = profile_for(architecture)
     sdk = no_symlink_path(sysroot).resolve(strict=True)
     dbus = no_symlink_path(dbus_build).resolve(strict=True)
@@ -166,7 +166,8 @@ def build(output, sysroot, dbus_build, architecture='x86_64', *, native_lock=NAT
         report = {'schema_version': 1, 'status': 'FAILED', 'architecture': target.architecture,
                   'target': target.c_target, 'target_profile': target.identity(),
                   'source_root': str(ROOT), 'source': str(SOURCE),
-                  'expected_server': SERVER_IDENTITY, 'capture_window_ms': 5000,
+                  'expected_server': SERVER_IDENTITY, 'capture_window_ms': 0 if panel_clear else 5000,
+                  'panel_clear': panel_clear,
                   'guest_execution': False, 'notifications_verified': False,
                   'render_verified': False, 'cosmic_session_verified': False,
                   'native_lock': str(lock),
@@ -188,12 +189,13 @@ def build(output, sysroot, dbus_build, architecture='x86_64', *, native_lock=NAT
             library = sdk / 'sysroot/usr/lib'
             obj = output / 'notification-probe.o'
             temporary = output / (EXECUTABLE + '.tmp')
+            mode = ['-DNOTIFICATION_PROBE_PANEL_CLEAR=1'] if panel_clear else []
             builder.run([tools['clang'], *target.clang_args, '-nostdinc', '-isystem',
                          sdk / 'sysroot/usr/include', '-I', stage / 'usr/include/dbus-1.0',
                          '-I', stage / 'usr/lib/dbus-1.0/include', '-std=c11', '-O2',
                          '-ffp-contract=off', '-fno-stack-protector', '-fno-pie',
                          '-ffunction-sections', '-fdata-sections', '-Wall', '-Wextra', '-Werror',
-                         '-c', SOURCE, '-o', obj], 'compile.log')
+                         *mode, '-c', SOURCE, '-o', obj], 'compile.log')
             builder.run([tools['rust-lld'], '-flavor', 'gnu', '-m', target.linker_emulation,
                          '--image-base=0x01000000', '-z', 'max-page-size=4096', '-z', 'separate-code',
                          '-static', '--no-pie', '--build-id=sha1', '--gc-sections',
@@ -230,9 +232,11 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--arch', choices=('x86_64', 'aarch64'), default='x86_64')
     parser.add_argument('--native-lock', type=Path, default=NATIVE_LOCK)
+    parser.add_argument('--panel-clear', action='store_true', help='Wait for the real UI to close the notification')
     args = parser.parse_args(argv)
     try:
-        build(args.output, args.sysroot, args.dbus_build, args.arch, native_lock=args.native_lock)
+        build(args.output, args.sysroot, args.dbus_build, args.arch, native_lock=args.native_lock,
+              panel_clear=args.panel_clear)
         print(args.output.resolve() / RECEIPT)
         return 0
     except (BuildError, CosmicBuildError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:

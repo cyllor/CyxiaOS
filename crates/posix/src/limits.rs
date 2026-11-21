@@ -12,7 +12,11 @@ pub struct ObjectProfile {
 
 pub const PROFILE: ObjectProfile = if cfg!(feature = "cosmic-applets-v1") {
     ObjectProfile {
-        name: "cosmic-applets-objects-v1",
+        name: if cfg!(feature = "cosmic-notifications-applet-v1") {
+            "cosmic-notifications-applet-objects-v1"
+        } else {
+            "cosmic-applets-objects-v1"
+        },
         fds_per_process: 128,
         open_descriptions: 512,
         epolls_per_owner: 16,

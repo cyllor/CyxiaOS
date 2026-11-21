@@ -1,0 +1,14 @@
+{
+  "kind": "cosmic-notifications-applet-v1",
+  "commit": "406d1b7d627138fdf4078f654268d3d8774e50f1",
+  "parent_policy_sha256": "39c353bc10e9a7f88f3deb63947987abfe400d7fdcecd5542b41782e414cd55b",
+  "patch_sha256": "909c22aabcfbac6b2037658cc35e025386d02e8dec02f241b12f9c48850d3341",
+  "before": {
+    "Cargo.lock": "a6587132d85d92cfbea34ac25698e95b681467d59d1e474517249089388db145",
+    "cosmic-applet-notifications/Cargo.toml": "9a80f3c4570101162bfe9f415adb5fd7eaea881ea8e73bd87bd807c61f4b4d0c"
+  },
+  "after": {
+    "Cargo.lock": "e192b256f183375b3e33ca44267cd79791b7bedf6a923c0d9bc50dfc490cfa69",
+    "cosmic-applet-notifications/Cargo.toml": "766de2cdc150dfbfb38399ad901d021f0a57db65032a15113746c5efe3eb0b64"
+  }
+}

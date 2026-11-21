@@ -15,7 +15,10 @@ ROOT = pc.ROOT
 VERSION = 2
 RUSTFLAGS = ['-C', 'relocation-model=static', '-C', 'code-model=large',
              '-C', 'no-redzone=yes', '-C', 'lto=off']
-DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'cosmic-session', 'cosmic-core-services-v1', 'cosmic-time-applet-v1', 'cosmic-workspace-applets-v1', 'rust-reactor-probe', 'rust-egl-probe',
+WALLPAPER_FEATURES = frozenset(('cosmic-bg-v1', 'cosmic-app-library-v1'))
+NOTIFICATIONS_OBJECT_FEATURES = WALLPAPER_FEATURES | {applet_objects.NOTIFICATIONS_FEATURE}
+APPLET_OBJECT_FEATURES = NOTIFICATIONS_OBJECT_FEATURES | {'cosmic-workspace-applets-v1'}
+DESKTOP_FEATURES = APPLET_OBJECT_FEATURES | frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'cosmic-session', 'cosmic-core-services-v1', 'cosmic-time-applet-v1', 'rust-reactor-probe', 'rust-egl-probe',
     'mesa-probe', 'smithay-probe', 'smithay-wayland-probe', 'smithay-xdg-probe',
     'smithay-multi-probe', 'smithay-interactive-probe', 'smithay-resize-probe',
     'smithay-dynamic-probe', 'wayland-shm-probe', 'abi-trace'))
@@ -74,7 +77,7 @@ def build_environment(cache, cc, prefix):
 def kernel_file_limit(features):
     # The ELF contains immutable catalog bytes and initialized kernel storage.
     # This is a file-read bound; QEMU RAM and process grants remain unchanged.
-    return (384 if 'cosmic-workspace-applets-v1' in features else 256) * 1024**2
+    return (384 if APPLET_OBJECT_FEATURES.intersection(features) else 256) * 1024**2
 
 def producer_sources(entry=None):
     """Bind the selected producer and its transitive local Python imports."""
@@ -104,8 +107,8 @@ def build(output, *, profile='dev', graphics=False, ported=False, extras=(), sys
         output = pc.fresh_output(output)
         sources = code_source_map(ROOT); producer = producer_sources()
         inputs = catalog_inputs(prefix) if ported else {}
-        if 'cosmic-workspace-applets-v1' in features:
-            applet_objects.validate(prefix, inputs)
+        if APPLET_OBJECT_FEATURES.intersection(features):
+            applet_objects.validate(prefix, inputs, notifications=bool(NOTIFICATIONS_OBJECT_FEATURES.intersection(features)))
         cache = build_cache_context(ROOT / 'target' / 'x86-os', ROOT,
                                     cache_sources(sources, features, prefix, inputs))
         cargo = pc.executable(cargo); rustc = pc.executable('rustc')
@@ -162,8 +165,8 @@ def validate_build(directory, *, cc='clang'):
     pc.require(isinstance(prefix, str) if 'ported' in features else prefix is None, 'OS sysroot contract')
     inputs = catalog_inputs(prefix) if prefix else {}
     pc.require(manifest.get('external_inputs') == inputs, 'OS embedded input identity mismatch')
-    if 'cosmic-workspace-applets-v1' in features:
-        applet_objects.validate(prefix, inputs)
+    if APPLET_OBJECT_FEATURES.intersection(features):
+        applet_objects.validate(prefix, inputs, notifications=bool(NOTIFICATIONS_OBJECT_FEATURES.intersection(features)))
     cache = build_cache_context(ROOT / 'target' / 'x86-os', ROOT, cache_sources(sources, features, prefix, inputs))
     pc.require(manifest.get('cache') == cache, 'OS cache identity mismatch')
     cargo = pc.executable('cargo'); rustc = pc.executable('rustc')

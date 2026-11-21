@@ -73,7 +73,8 @@ const USER_POOL: u32 = POOL_PAGES;
 const _: () = assert!(cyxia_posix::OPEN_MAX == 128
     && cyxia_posix::open_description::CAPACITY == 512
     && cyxia_posix::unix::ENDPOINTS == 128 && cyxia_posix::unix::CONNECTIONS == 64
-    && cyxia_posix::shared_memory::OBJECTS == 32
+    && cyxia_posix::shared_memory::OBJECTS
+        == if cfg!(feature = "cosmic-notifications-applet-v1") { 48 } else { 32 }
     && cyxia_posix::shared_memory::MAPPINGS == cyxia_ai_runtime::COSMIC_SHARED_MAPPING_CAPACITY as usize);
 const _: () = assert!(core::mem::size_of::<Arena>() == MAPPED_PAGES as usize * 4096);
 // The session process layout must match the versioned session admission domain
@@ -1257,6 +1258,7 @@ impl Supervisor {
                 | "session-env-probe"
                 | "cosmic-settings-daemon"
                 | "cosmic-panel"
+                | "cosmic-app-library"
                 | "cosmic-applet-workspaces"
                 | "cosmic-applet-tiling"
                 | "workspace-state-probe"
@@ -1503,6 +1505,7 @@ impl Supervisor {
                     "cosmic-settings-daemon"
                         | "cosmic-notifications"
                         | "cosmic-panel"
+                        | "cosmic-app-library"
                         | "cosmic-applet-workspaces"
                         | "cosmic-applet-tiling"
                         | "workspace-state-probe"

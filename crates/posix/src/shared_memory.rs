@@ -5,10 +5,13 @@ use crate::Errno;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGES: usize = 4096;
-#[cfg(not(feature = "cosmic-applets-v1"))]
-pub const OBJECTS: usize = 16;
-#[cfg(feature = "cosmic-applets-v1")]
-pub const OBJECTS: usize = 32;
+pub const OBJECTS: usize = if cfg!(feature = "cosmic-notifications-applet-v1") {
+    48
+} else if cfg!(feature = "cosmic-applets-v1") {
+    32
+} else {
+    16
+};
 pub const OBJECT_PAGES: usize = 2048;
 #[cfg(not(feature = "cosmic-applets-v1"))]
 pub const MAPPINGS: usize = 16;

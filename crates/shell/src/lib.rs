@@ -300,6 +300,8 @@ impl Shell {
                         "smithay-dynamic-reject" => "smithay-dynamic-reject",
                         "cosmic-comp" => "cosmic-comp",
                         "cosmic-panel" => "cosmic-panel",
+                        "cosmic-app-library" => "cosmic-app-library",
+                        "app-library-fixture" => "app-library-fixture",
                         "cosmic-applet-time" => "cosmic-applet-time",
                         "cosmic-applet-workspaces" => "cosmic-applet-workspaces",
                         "cosmic-applet-tiling" => "cosmic-applet-tiling",

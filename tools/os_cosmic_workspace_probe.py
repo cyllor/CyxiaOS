@@ -11,6 +11,7 @@ import sys
 import time
 
 import os_cosmic_startup_probe as startup
+import os_cosmic_bg_probe as background
 import os_cosmic_time_probe as clock
 import os_x86
 import os_cosmic_pointer_probe as pointer_probe
@@ -63,7 +64,8 @@ def interaction(console, qmp, output, **options):
         pc.write_json(output / 'workspace-qmp.json', qmp.transcript)
 
 
-def _interaction(console, qmp, output, *, workspace_x=None, workspace_first_x=28, tiling_x=1004, toggle_x=985, toggle_y=64, repeat_tiling=False, _result):
+def _interaction(console, qmp, output, *, workspace_x=None, workspace_first_x=28, tiling_x=1004, toggle_x=985, toggle_y=64,
+                 repeat_tiling=False, notifications_applet=False, _result):
     result = _result
     result.update(status='FAIL', full_os_verified=False, cosmic_session_verified=False,
                   scope='original_applet_pointer_actions_and_independent_compositor_state')
@@ -187,7 +189,8 @@ def _interaction(console, qmp, output, *, workspace_x=None, workspace_first_x=28
     # opaque white/black reference pixel instead of reusing an empty-scene sum.
     move_pointer(500, 400)
     result['shared_before'] = clock.shared_state(console, compact=True)
-    pc.require({1, 2, 3, 4, 5, 6} <= active and len(children) == (3 if workspace_x is not None else 2),
+    expected_children = 2 + int(workspace_x is not None) + int(notifications_applet)
+    pc.require({1, 2, 3, 4, 5, 6} <= active and len(children) == expected_children,
                'Not the original core plus expected real applet processes: children=' + repr(sorted(children)))
     before = state(); result['before'] = before
     open_tiling('tiling_open')
@@ -291,6 +294,8 @@ def _interaction(console, qmp, output, *, workspace_x=None, workspace_first_x=28
         for pid in pids: console.command('posix kill ' + str(pid), [rb'killed; pages reclaimed'])
     else: raise RuntimeError('Desktop process teardown exceeded bounded retries')
     shared = clock.shared_state(console, compact=True)
+    pc.require(shared['metadata_capacity'] == (48 if notifications_applet else 32),
+               'Shared object capacity differs from the active applet profile')
     pc.require(all(shared[k] == 0 for k in ('objects', 'pages', 'mappings', 'description_refs',
                'mapping_refs', 'grant_reserved', 'grant_used')), 'Shared resources retained after teardown')
     at = console.command('ai objects'); console.until(rb'AI_OBJECTS_END\r?\n', at)
@@ -302,7 +307,8 @@ def _interaction(console, qmp, output, *, workspace_x=None, workspace_first_x=28
     for name, fields in re.findall(rb'^AI_DOMAIN name=(shared_\w+) ([^\r\n]+)', raw, re.MULTILINE):
         pc.require(name.decode() not in domains, 'Duplicate shared admission receipt')
         domains[name.decode()] = {key.decode(): int(value) for key, value in re.findall(rb'(\w+)=(\d+)', fields)}
-    expected_models = dict(shared_pages=8194, shared_objects=8203, shared_mappings=8204)
+    expected_models = dict(shared_pages=8194, shared_objects=8205 if notifications_applet else 8203,
+                           shared_mappings=8204)
     pc.require(set(domains) == set(expected_models), 'Incomplete shared admission receipts')
     for name, model in expected_models.items():
         row = domains[name]
@@ -343,12 +349,20 @@ def main():
     args, remaining = parser.parse_known_args()
     sys.argv = [sys.argv[0], *remaining]
     build = Path(remaining[remaining.index('--build') + 1])
-    os_x86.validate_build(build)
+    manifest = os_x86.validate_build(build)
     output = Path(remaining[remaining.index('--output') + 1])
     producers = os_x86.producer_sources(__file__)
     snapshot = {name: (pc.ROOT / name).read_bytes() for name in producers}
+    def check(console, qmp, output):
+        if os_x86.WALLPAPER_FEATURES.intersection(manifest['features']):
+            # Match the flat compositor background used by the cursor reference.
+            background.solid_background(console, qmp, output, rgb=(39, 41, 42))
+        return interaction(
+            console, qmp, output,
+            notifications_applet=bool(os_x86.NOTIFICATIONS_OBJECT_FEATURES.intersection(manifest['features'])),
+            **vars(args))
     try:
-        return startup.main(after_observation=lambda *a: interaction(*a, **vars(args)))
+        return startup.main(after_observation=check)
     finally:
         if output.is_dir():
             pc.require(os_x86.producer_sources(__file__) == producers, 'Interaction producer changed during capture')

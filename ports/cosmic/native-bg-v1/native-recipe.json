@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "component": "cosmic-bg",
+  "commit": "91d525b7310f5a497c9fd09a25d2710eb9f8a6f7",
+  "target": "x86_64-unknown-linux-musl",
+  "purpose": "bounded-build-experiment",
+  "package": "cosmic-bg",
+  "binary": "cosmic-bg",
+  "resource_profile": "cosmic-bg-x86_64-v1",
+  "default_features": true,
+  "features": [
+    "cyxia-native"
+  ],
+  "source_lock_sha256": "eab0b1c38acb5562541d445f72e2e36757d42284e2982c8ebe34603fc3f8d29e",
+  "effective_lock_sha256": "003d91adc8fb1b9e48d78943d8f587f72210ce57224e11d4c8741425ce1d6b25",
+  "patches": [
+    {
+      "path": "native.patch",
+      "sha256": "ab9cc8b47961b982f9fad8eba69fbb5a05a91703377aaa8b59f1f422226bf494"
+    },
+    {
+      "path": "colored-sdr.patch",
+      "sha256": "14c435960d0553eed13411f8f004c466b0eb2e5d6b94a548d5bb80f705e4200c"
+    }
+  ],
+  "native_inputs": [
+    {
+      "path": "sysroot/usr/lib/libc.a",
+      "sha256": "6403740f0bb48d398258893dc7b89fc2bafdf157f09f66663f512075a8c61ca2"
+    },
+    {
+      "path": "sysroot/usr/lib/libclang_rt.builtins-x86_64.a",
+      "sha256": "0d6cc1e080e9fdf624203b4eeebe6ba94b6af04e34429d1318b78c1ffe8dd613"
+    },
+    {
+      "path": "sysroot/usr/lib/crt1.o",
+      "sha256": "f8cade33f5bbf4c84cbd8ac23f9ad7570c0ec2aec3b010c9f5963f8b4a824755"
+    },
+    {
+      "path": "sysroot/usr/lib/crti.o",
+      "sha256": "db272440036cb7259bc88fc94b34e5d4966e7cd72ad778995688607c95d58455"
+    },
+    {
+      "path": "sysroot/usr/lib/crtn.o",
+      "sha256": "4455d3ab8b9893624eebf605495c610f1b7156684118d394b0278bbea6c2f250"
+    },
+    {
+      "path": "sysroot/usr/lib/libwayland-client.a",
+      "sha256": "86e5f4038e8016e54d2c7bf03f217118e887b9c297c65daef014273940219930"
+    },
+    {
+      "path": "sysroot/usr/lib/libffi.a",
+      "sha256": "4a4b3fcb4d6f4eeddf8e1cafd61d492019316574ffa863cf908d1968e42daa98"
+    },
+    {
+      "path": "sysroot/usr/lib/libxkbcommon.a",
+      "sha256": "09e77229334ea3f4c2fd3b312e3b3d5fb195e4fa7d4caa4d2f9d8f1c50f17708"
+    },
+    {
+      "path": "sysroot/usr/lib/libdav1d.a",
+      "sha256": "7d1e078511d7feacce06f03b80abedcb90cdc87763762f6bf2b8f3df98410e1e"
+    }
+  ],
+  "static_link_inputs": [
+    "sysroot/usr/lib/libwayland-client.a",
+    "sysroot/usr/lib/libffi.a",
+    "sysroot/usr/lib/libxkbcommon.a",
+    "sysroot/usr/lib/libdav1d.a"
+  ]
+}

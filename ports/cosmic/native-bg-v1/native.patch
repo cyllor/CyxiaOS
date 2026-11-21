@@ -1,0 +1,44 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,6 +9,7 @@
+ [features]
+ default = ["avif"]
+ avif = ["image/avif-native"]
++cyxia-native = ["wayland-sys/cyxia-static-client"]
+ 
+ [dependencies]
+ color-eyre = "0.6.5"
+@@ -26,9 +27,14 @@
+ tracing = { workspace = true }
+ tracing-subscriber = "0.3.23"
+ walkdir = "2.5"
++wayland-sys = { path = "native-deps/wayland-sys" }
+ 
+ [workspace]
+ members = ["config"]
++exclude = ["native-deps/wayland-sys"]
++
++[patch.crates-io]
++wayland-sys = { path = "native-deps/wayland-sys" }
+ 
+ [workspace.dependencies]
+ colorgrad = "0.8.0"
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -499,6 +499,7 @@
+  "tracing",
+  "tracing-subscriber",
+  "walkdir",
++ "wayland-sys",
+ ]
+ 
+ [[package]]
+@@ -2966,8 +2967,6 @@
+ [[package]]
+ name = "wayland-sys"
+ version = "0.31.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+ dependencies = [
+  "dlib",
+  "log",

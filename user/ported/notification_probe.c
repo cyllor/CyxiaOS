@@ -13,7 +13,11 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { TIMEOUT_MS = 5000, CAPTURE_MS = 5000, MESSAGE_LIMIT = 1024 };
+#ifndef NOTIFICATION_PROBE_PANEL_CLEAR
+#define NOTIFICATION_PROBE_PANEL_CLEAR 0
+#endif
+
+enum { TIMEOUT_MS = 5000, CAPTURE_MS = 5000, PANEL_CLEAR_TIMEOUT_MS = 45000, MESSAGE_LIMIT = 1024 };
 static const char address[] = "unix:path=/run/user/0/bus";
 static const char service[] = "org.freedesktop.Notifications";
 static const char object[] = "/org/freedesktop/Notifications";
@@ -202,7 +206,8 @@ static void close_notification(void) {
 }
 
 static void wait_closed(void) {
-    int64_t deadline = milliseconds() + TIMEOUT_MS;
+    int64_t deadline = milliseconds() +
+        (NOTIFICATION_PROBE_PANEL_CLEAR ? PANEL_CLEAR_TIMEOUT_MS : TIMEOUT_MS);
     unsigned messages = 0;
     for (;;) {
         DBusMessage *message;
@@ -251,10 +256,12 @@ int main(void) {
     created_id = notify();
     CHECK(created_id > 0, "nonzero-notification-id");
     printf("NOTIFICATION_PROBE CREATED id=%u service_pid=%u capture_ms=%u render_verified=false\n",
-           created_id, pid, (unsigned)CAPTURE_MS);
+           created_id, pid, NOTIFICATION_PROBE_PANEL_CLEAR ? 0u : (unsigned)CAPTURE_MS);
     fflush(stdout);
-    capture_window();
-    close_notification();
+    if (!NOTIFICATION_PROBE_PANEL_CLEAR) {
+        capture_window();
+        close_notification();
+    }
     wait_closed();
     char final_owner[sizeof(owner)];
     get_owner(final_owner, sizeof(final_owner));

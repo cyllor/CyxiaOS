@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "cosmic-app-library-x86_64-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Pinned native application library with the Wayland software renderer.",
+      "jobs_max": 2,
+      "min_free_bytes": 167772160,
+      "max_build_bytes": 2147483648,
+      "timeout_seconds": 1500,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

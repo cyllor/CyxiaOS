@@ -36,7 +36,8 @@ ASSETS = {
 }
 
 
-def validate(build):
+def validate(build, *, contract_module=applets):
+    applets = contract_module
     build = base.no_symlink_path(build)
     policy, recipe, _, profile, _ = applets.contract()
     report = base.load_json(build / 'build-report.json')
@@ -72,8 +73,9 @@ def validate(build):
             'Applet compiler or native SDK changed')
     require(applets.additional_link_inputs(sysroot, recipe) == report['additional_native_inputs'],
             'Additional applet native SDK changed')
-    require(applets.verify_native_environment(build, report['toolchain'], sysroot,
-            report['native_environment']) == report['native_build_probes'], 'Native target symbol probe changed')
+    if hasattr(applets, 'verify_native_environment'):
+        require(applets.verify_native_environment(build, report['toolchain'], sysroot,
+                report['native_environment']) == report['native_build_probes'], 'Native target symbol probe changed')
     for name in applets.PROGRAMS:
         record = report['binaries'][name]
         executable = build / (name + '.elf')

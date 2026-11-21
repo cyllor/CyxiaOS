@@ -752,14 +752,15 @@ pub fn cosmic_unix_policy(free: u32, requested: u32) -> Result<(bool, u64), Erro
 /// Metadata-only shared object admission. Creating an empty memfd consumes one
 /// preallocated slot and no physical pages. Resize retains its separate page
 /// policy and ledger; the backing table still enforces its actual capacity.
-#[cfg(not(feature = "cosmic-applets-v1"))]
-pub const SHARED_OBJECT_MODEL_ID: u64 = 0x2009;
-#[cfg(feature = "cosmic-applets-v1")]
-pub const SHARED_OBJECT_MODEL_ID: u64 = 0x200b;
-#[cfg(not(feature = "cosmic-applets-v1"))]
-pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = 16;
-#[cfg(feature = "cosmic-applets-v1")]
-pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = 32;
+const SHARED_OBJECT_MODEL: (u64, u32) = if cfg!(feature = "cosmic-notifications-applet-v1") {
+    (0x200d, 48)
+} else if cfg!(feature = "cosmic-applets-v1") {
+    (0x200b, 32)
+} else {
+    (0x2009, 16)
+};
+pub const SHARED_OBJECT_MODEL_ID: u64 = SHARED_OBJECT_MODEL.0;
+pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = SHARED_OBJECT_MODEL.1;
 pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
     if free > SHARED_OBJECT_MODEL_CAPACITY || requested == 0 || requested > SHARED_OBJECT_MODEL_CAPACITY {
         return Err(Error::Invalid);

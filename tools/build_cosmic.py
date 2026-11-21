@@ -594,7 +594,8 @@ def verify_metadata(metadata, source, cache, recipe):
 
 
 def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_cache, profile, jobs,
-                  *, operation='build'):
+                  *, operation='build', prepare_source=None, inspect_dependencies=None,
+                  bundle_static_archives=False, inspect_image=None):
     if operation not in ('build', 'typecheck'):
         raise CosmicBuildError('unsupported compilation operation')
     selected = ports.user_target(recipe["target"])
@@ -621,6 +622,8 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                         raise CosmicBuildError('Cargo control directory has inherited configuration')
                 stage = control / 'source'
                 export_source(Path(record['path']), stage)
+                if prepare_source is not None:
+                    report['native_source'] = prepare_source(stage, cargo_cache)
                 if 'source_series' in recipe:
                     if __package__:
                         from . import prepare_cosmic_comp as comp
@@ -642,6 +645,16 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                 before = tree_identity(stage)
                 report['source_tree'] = before
                 env = cargo_environment(tools, identities, sysroot, output, cargo_cache, control)
+                if bundle_static_archives:
+                    # rustc also needs these archives when it produces rlibs.
+                    report['bundled_archives'] = {}
+                    for relative in identities['static_link_inputs']:
+                        source_archive = sysroot / relative
+                        target_archive = output / 'native' / source_archive.name
+                        if target_archive.exists():
+                            raise CosmicBuildError('Duplicate native archive: ' + target_archive.name)
+                        shutil.copyfile(source_archive, target_archive)
+                        report['bundled_archives'][target_archive.name] = digest(source_archive)
                 epoch = git(Path(record['path']), 'show', '-s', '--format=%ct')
                 env['SOURCE_DATE_EPOCH'] = epoch
                 env['CYXIA_COSMIC_UPSTREAM_COMMIT'] = source['commit']
@@ -661,7 +674,8 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                     metadata = json.loads((output / 'metadata.json').read_text())
                 except json.JSONDecodeError as error:
                     raise CosmicBuildError('Cargo metadata did not produce one complete JSON document') from error
-                report['cargo_dependencies'] = verify_metadata(metadata, stage, cargo_cache, recipe)
+                package_identity = inspect_dependencies or verify_metadata
+                report['cargo_dependencies'] = package_identity(metadata, stage, cargo_cache, recipe)
                 report['sysroot_before'] = tree_identity(sysroot / 'sysroot')
                 command = [str(tools['cargo']), 'check' if operation == 'typecheck' else 'build',
                            '--release', '--target', selected.rust_target, '--jobs', str(jobs),
@@ -673,6 +687,9 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                     raise CosmicBuildError('build modified pinned source inputs')
                 if tree_identity(sysroot / 'sysroot')['sha256'] != report['sysroot_before']['sha256']:
                     raise CosmicBuildError('build modified target sysroot')
+                for name, checksum in report.get('bundled_archives', {}).items():
+                    if digest(output / 'native' / name) != checksum:
+                        raise CosmicBuildError('bundled archive changed: ' + name)
                 for item in identities['native_inputs']:
                     native_path = sysroot / item['path']
                     if (not native_path.resolve().is_relative_to(sysroot.resolve())
@@ -680,7 +697,7 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                         raise CosmicBuildError('build modified declared native input: ' + item['path'])
                 if digest(Path(__file__)) != report['builder_sha256']:
                     raise CosmicBuildError('builder changed during execution')
-                if verify_metadata(metadata, stage, cargo_cache, recipe) != report['cargo_dependencies']:
+                if package_identity(metadata, stage, cargo_cache, recipe) != report['cargo_dependencies']:
                     raise CosmicBuildError('build modified dependency source inputs')
                 report['source_preserved'] = inspect_source(Path(record['path']).parent, source)['verified']
                 if operation == 'typecheck':
@@ -694,14 +711,15 @@ def perform_build(source, record, recipe, recipe_path, output, sysroot, cargo_ca
                 # for the validated output published below.
                 report.update(link_completed=True, linked_binary={
                     'path': str(result), 'bytes': result.stat().st_size, 'sha256': digest(result)})
-                executable = inspect_elf(result, selected)
+                image_identity = inspect_image or (lambda path: inspect_elf(path, selected))
+                executable = image_identity(result)
                 pages = sum(((p['vaddr'] + p['memsz'] + 4095) // 4096 - p['vaddr'] // 4096)
                             for p in executable['program_headers'] if p['type'] == 1)
                 if executable['bytes'] > profile['max_elf_bytes'] or pages * 4096 + profile['stack_bytes'] > profile['image_bytes']:
                     raise CosmicBuildError('linked ELF exceeds admitted image profile')
                 final = output / (recipe['binary'] + '.elf')
                 shutil.copyfile(result, final)
-                report.update(status='cross-built', executable=inspect_elf(final, selected), image_load_pages=pages,
+                report.update(status='cross-built', executable=image_identity(final), image_load_pages=pages,
                               target_linked=True)
                 if not report['source_preserved']:
                     raise CosmicBuildError('original source changed during build')

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "build_profiles": {
+    "cosmic-bg-x86_64-v1": {
+      "target_runtime_validated": false,
+      "purpose": "Genuine COSMIC background service with default AVIF on the one-GiB desktop.",
+      "jobs_max": 2,
+      "min_free_bytes": 268435456,
+      "max_build_bytes": 1073741824,
+      "timeout_seconds": 1200,
+      "max_elf_bytes": 67108864,
+      "image_bytes": 67108864,
+      "stack_bytes": 2097152
+    }
+  }
+}

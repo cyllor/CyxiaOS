@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 cosmic-applets-v1 = []
+cosmic-notifications-applet-v1 = ["cosmic-applets-v1"]
 
 [dependencies]
 cyxia-contracts = { path = "../contracts" }

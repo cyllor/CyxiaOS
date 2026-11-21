@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/pop-os/cosmic-wallpapers",
+  "commit": "da595bba495cb8fc57f26505621fc25000218349",
+  "file": "orion_nebula_nasa_heic0601a.jpg",
+  "sha256": "7500f702f0488d4a8df2c5abeb7ca9107a7ca7998e0441727cbaf79465b02388",
+  "source_notes_sha256": "58eeecb8c2567f485e5560c96a7494e70df1255c3cd68aef10b4b2071456daec",
+  "source": "https://esahubble.org/images/heic0601a/",
+  "license": "https://hubblesite.org/copyright",
+  "credit": "NASA, ESA, M. Robberto (STScI/ESA), and the Hubble Space Telescope Orion Treasury Project Team",
+  "packed_pixels": [1920, 1080]
+}

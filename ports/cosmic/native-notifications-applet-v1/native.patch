@@ -1,0 +1,29 @@
+--- a/cosmic-applet-notifications/Cargo.toml
++++ b/cosmic-applet-notifications/Cargo.toml
+@@ -5,6 +5,8 @@
+ license = "GPL-3.0-only"
+ 
+ [dependencies]
++wayland-sys = { path = "../native-deps/wayland-sys" }
++xkbcommon-dl = { path = "../native-deps/xkbcommon-dl" }
+ cosmic-notifications-util = { git = "https://github.com/pop-os/cosmic-notifications" }
+ cosmic-notifications-config = { git = "https://github.com/pop-os/cosmic-notifications" }
+ anyhow.workspace = true
+@@ -23,3 +25,6 @@
+ rust-embed.workspace = true
+ zbus = { workspace = true, features = ["tokio", "p2p"] }
+ url = "2.5.8"
++
++[features]
++cyxia-native = ["wayland-sys/cyxia-static-client", "wayland-sys/cyxia-static-egl", "xkbcommon-dl/static-wayland"]
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1158,6 +1158,8 @@
+  "tracing-log",
+  "tracing-subscriber",
+  "url",
++ "wayland-sys",
++ "xkbcommon-dl",
+  "zbus",
+ ]
+ 

@@ -72,14 +72,17 @@ static int dispatch(struct wl_display *display) {
     if (ready && (fd.revents & POLLIN)) return wl_display_read_events(display);
     wl_display_cancel_read(display); return 0;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    // The application library can still be redrawing and closing its overlay
+    // while the new client is connecting on the software-rendered TCG guest.
+    int startup_ms = argc == 2 && !strcmp(argv[1], "--app-library") ? 20000 : 5000;
     setbuf(stdout, NULL);
     struct wl_display *display = wl_display_connect(NULL);
     if (!display) { puts("WORKSPACE_WINDOW FAIL connect"); return 1; }
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     int64_t start = milliseconds();
-    while ((!compositor || !shm || !wm || !xrgb) && milliseconds() - start < 5000) {
+    while ((!compositor || !shm || !wm || !xrgb) && milliseconds() - start < startup_ms) {
         if (dispatch(display) < 0) return 2;
     }
     if (!compositor || !shm || !wm || !xrgb) { puts("WORKSPACE_WINDOW FAIL globals"); return 2; }
@@ -107,7 +110,7 @@ int main(void) {
     while (!closed && milliseconds() - start < 180000) {
         if (dispatch(display) < 0) { puts("WORKSPACE_WINDOW FAIL dispatch"); return 4; }
         if (configured && !announced) { wl_display_flush(display); puts("WORKSPACE_WINDOW READY"); announced = 1; }
-        if (!configured && milliseconds() - start >= 5000) { puts("WORKSPACE_WINDOW FAIL configure"); return 4; }
+        if (!configured && milliseconds() - start >= startup_ms) { puts("WORKSPACE_WINDOW FAIL configure"); return 4; }
     }
     xdg_toplevel_destroy(toplevel); xdg_surface_destroy(xdg); wl_surface_destroy(surface);
     wl_buffer_destroy(buffer); munmap(pixels, BYTES); wl_registry_destroy(registry); wl_display_disconnect(display);

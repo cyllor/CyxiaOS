@@ -54,7 +54,7 @@ class Fixture(SdkFixture):
             raise subject.BuildError(self.validation_error)
         return copy.deepcopy(self.proof)
 
-    def build(self):
+    def build(self, *, panel_clear=False):
         fixture = self
         def run(builder, command, log, cwd=None):
             fixture.run(builder, [str(item) for item in command], log, cwd)
@@ -65,7 +65,7 @@ class Fixture(SdkFixture):
                 patch.object(subject.build_dbus, 'validate_build', side_effect=self.validate_dbus), \
                 patch.object(subject.Builder, 'run', run):
             return subject.build(self.output, self.sdk, self.dbus, self.target.architecture,
-                                 native_lock=self.root / 'native.lock')
+                                 native_lock=self.root / 'native.lock', panel_clear=panel_clear)
 
     def failed_receipt(self):
         report = json.loads((self.output / subject.RECEIPT).read_text())
@@ -118,6 +118,13 @@ class NotificationProbeProducer(unittest.TestCase):
             self.assertEqual(report['probe']['machine'], 183)
             self.assertIn('aarch64elf', report['commands'][-1])
             self.assertIn('--target=aarch64-linux-musl', report['commands'][-2])
+
+    def test_panel_clear_mode_requires_the_ui_to_close_the_notification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Fixture(Path(directory)).build(panel_clear=True)
+            self.assertIs(report['panel_clear'], True)
+            self.assertEqual(report['capture_window_ms'], 0)
+            self.assertIn('-DNOTIFICATION_PROBE_PANEL_CLEAR=1', report['commands'][-2])
 
     def test_bad_dbus_provenance_target_sdk_and_development_inputs_fail_before_compiler(self):
         for mutation in ('provenance', 'arch', 'sdk', 'detached', 'foreign_archive', 'header'):

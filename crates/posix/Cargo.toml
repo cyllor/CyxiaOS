@@ -12,6 +12,8 @@ full-os = ["large-memory", "cyxia-ai-fs/full-os"]
 cosmic-session = ["full-os"]
 # Versioned applet FD/object metadata; old large-memory/full-os/session limits remain.
 cosmic-applets-v1 = ["cosmic-session"]
+cosmic-notifications-applet-v1 = ["cosmic-applets-v1"]
+cosmic-app-library-v1 = ["cosmic-notifications-applet-v1"]
 
 [dependencies]
 cyxia-ai-fs = { path = "../ai-fs" }

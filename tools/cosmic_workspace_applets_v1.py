@@ -162,9 +162,10 @@ def additional_link_inputs(sysroot, recipe):
                 static_link_probe=receipt['static_link_probe'], licenses=recipe['additional_native_licenses'])
 
 
-def verify_export(stage, inputs):
+def verify_export(stage, inputs, *, overlay=None):
     policy, _, _, _, _ = contract()
     original_policy = parent.contract()[0]
+    after = {**policy['after'], **(overlay or {})}
     expected = {name: {'sha256': row['sha256'], 'mode': 0o755 if row['mode'] == '100755' else 0o644}
                 for name, row in inputs['originals']['applets']['files'].items()}
     for name, binding in inputs['native_bindings'].items():
@@ -176,7 +177,7 @@ def verify_export(stage, inputs):
     actual = parent.files.read_tree(stage)
     require(set(actual['files']) == set(expected), 'Complete workspace applet inventory changed')
     for name, record in expected.items():
-        digest = policy['after'].get(name, record['sha256'])
+        digest = after.get(name, record['sha256'])
         require(actual['files'][name]['sha256'] == digest
                 and stat.S_IMODE((stage / name).stat().st_mode) == record['mode'],
                 'Workspace applet source changed: ' + name)
@@ -204,15 +205,15 @@ def export(source_cache, native_cache, cargo_cache, stage):
     return inputs, verify_export(stage, inputs)
 
 
-def metadata_identity(metadata, stage, cache, recipe, policy):
+def metadata_identity(metadata, stage, cache, recipe, policy, *, programs=PROGRAMS):
     original_policy, original_recipe, _, _, _ = parent.contract()
     # This checks every registry archive and pinned Git tree, all 19 original
     # members and native bindings. The child patch adds no package/version.
     identity = parent.metadata_identity(metadata, stage, cache, original_recipe, original_policy)
     packages = {p['id']: p for p in metadata['packages']}
     nodes = {n['id']: n for n in metadata['resolve']['nodes']}
-    programs = {}
-    for name in PROGRAMS:
+    selected = {}
+    for name in programs:
         identifier = identity['resolution']['workspace_members'][name]
         package = packages[identifier]
         require(package['source'] is None and package['version'] == '1.10.0'
@@ -220,22 +221,23 @@ def metadata_identity(metadata, stage, cache, recipe, policy):
                 and any(t['name'] == name and 'bin' in t['kind']
                     and Path(t['src_path']) == stage / name / 'src/main.rs' for t in package['targets']),
                 'Missing genuine workspace applet binary or complete native features: ' + name)
-        programs[name] = identifier
-    return dict(dependencies=identity, programs=programs, features=FEATURES, metadata_features=METADATA_FEATURES,
-                default_features_preserved=True)
+        selected[name] = identifier
+    return dict(dependencies=identity, programs=selected, features=recipe['features'],
+                metadata_features=recipe['metadata_features'], default_features_preserved=True)
 
 
-def commands(cargo, stage, recipe, jobs, programs=None):
-    require(recipe['features'] == FEATURES and recipe['default_features'] is True,
+def commands(cargo, stage, recipe, jobs, programs=None, *, names=PROGRAMS):
+    features = [name + '/cyxia-native' for name in names]
+    require(recipe['features'] == features and recipe['default_features'] is True,
             'Incomplete workspace applet feature selection')
     options = ['--manifest-path', str(stage / 'Cargo.toml'), '--locked', '--offline',
-               '--features', ','.join(FEATURES)]
-    metadata_options = [*options[:-1], ','.join(METADATA_FEATURES)]
+               '--features', ','.join(features)]
+    metadata_options = [*options[:-1], ','.join(recipe['metadata_features'])]
     metadata = [str(cargo), 'metadata', '--format-version', '1', '--filter-platform', parent.TARGET, *metadata_options]
     if programs is None:
         return metadata, None
-    require(set(programs) == set(PROGRAMS), 'Incomplete workspace applet package selection')
+    require(set(programs) == set(names), 'Incomplete workspace applet package selection')
     command = [str(cargo), 'build', '--release', '--target', parent.TARGET, '--jobs', str(jobs)]
-    for name in PROGRAMS:
+    for name in names:
         command += ['--package', programs[name]]
     return metadata, command + ['--bins', *options]

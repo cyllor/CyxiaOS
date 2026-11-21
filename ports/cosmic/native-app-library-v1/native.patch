@@ -1,0 +1,294 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,20 +8,25 @@
+ [features]
+ default = ["wgpu"]
+ wgpu = ["libcosmic/wgpu"]
++cyxia-native = [
++    "dep:cosmic-settings-config",
++    "dep:launch-pad",
++    "dep:wayland-sys",
++    "dep:xkbcommon-dl",
++]
+ 
+ [build-dependencies]
+ xdgen = "0.1.0"
+ 
+ [dependencies]
+ zbus = "5.12"
+-libcosmic = { git = "https://github.com/pop-os/libcosmic", features = [
++libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+     "dbus-config",
+     "desktop",
+     "winit",
+     "wayland",
+     "tokio",
+     "single-instance",
+-    "desktop-systemd-scope",
+     "xdg-portal",
+ ] }
+ tokio = { version = "1.48", features = ["sync", "rt", "process"] }
+@@ -50,6 +55,29 @@
+ cosmic-app-list-config = { git = "https://github.com/pop-os/cosmic-applets" }
+ # cosmic-app-list-config = { path = "../cosmic-applets/cosmic-app-list/cosmic-app-list-config/" }
+ 
++[dependencies.cosmic-settings-config]
++git = "https://github.com/pop-os/cosmic-settings-daemon"
++optional = true
++
++[dependencies.launch-pad]
++path = "native-deps/launch-pad"
++features = ["cyxia-native"]
++optional = true
++
++[dependencies.wayland-sys]
++path = "native-deps/wayland-sys"
++features = ["cyxia-static-client"]
++optional = true
++
++[dependencies.xkbcommon-dl]
++path = "native-deps/xkbcommon-dl"
++features = ["static-wayland"]
++optional = true
++
++[patch.crates-io]
++wayland-sys = { path = "native-deps/wayland-sys" }
++xkbcommon-dl = { path = "native-deps/xkbcommon-dl" }
++
+ [profile.release]
+ lto = "thin"
+ 
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1015,10 +1015,12 @@
+  "anyhow",
+  "clap",
+  "cosmic-app-list-config",
++ "cosmic-settings-config",
+  "futures",
+  "i18n-embed",
+  "i18n-embed-fl",
+  "itertools",
++ "launch-pad",
+  "libcosmic",
+  "log",
+  "nix",
+@@ -1033,7 +1035,9 @@
+  "switcheroo-control",
+  "tokio",
+  "url",
++ "wayland-sys",
+  "xdgen",
++ "xkbcommon-dl",
+  "zbus",
+ ]
+ 
+@@ -2409,7 +2413,6 @@
+  "cosmic-client-toolkit",
+  "dnd",
+  "glam",
+- "iced_accessibility",
+  "lilt",
+  "log",
+  "mime 0.1.0",
+@@ -2500,7 +2503,6 @@
+  "bytes",
+  "cosmic-client-toolkit",
+  "dnd",
+- "iced_accessibility",
+  "iced_core",
+  "iced_futures",
+  "raw-window-handle",
+@@ -2565,7 +2567,6 @@
+  "build_helpers",
+  "cosmic-client-toolkit",
+  "dnd",
+- "iced_accessibility",
+  "iced_renderer",
+  "iced_runtime",
+  "log",
+@@ -2586,7 +2587,6 @@
+  "cosmic-client-toolkit",
+  "cursor-icon",
+  "dnd",
+- "iced_accessibility",
+  "iced_debug",
+  "iced_futures",
+  "iced_graphics",
+@@ -3075,6 +3075,21 @@
+ ]
+ 
+ [[package]]
++name = "launch-pad"
++version = "1.0.1"
++dependencies = [
++ "libc",
++ "log",
++ "rand 0.9.5",
++ "rustix 1.1.5",
++ "slotmap",
++ "sync_wrapper",
++ "thiserror 2.0.21",
++ "tokio",
++ "tokio-util",
++]
++
++[[package]]
+ name = "lazy_static"
+ version = "1.5.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -3111,7 +3126,6 @@
+  "i18n-embed",
+  "i18n-embed-fl",
+  "iced",
+- "iced_accessibility",
+  "iced_core",
+  "iced_futures",
+  "iced_renderer",
+@@ -5078,6 +5092,12 @@
+ ]
+ 
+ [[package]]
++name = "sync_wrapper"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
++
++[[package]]
+ name = "synstructure"
+ version = "0.14.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -5323,6 +5343,19 @@
+ checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+ dependencies = [
+  "futures-core",
++ "pin-project-lite",
++ "tokio",
++]
++
++[[package]]
++name = "tokio-util"
++version = "0.7.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
++dependencies = [
++ "bytes",
++ "futures-core",
++ "futures-sink",
+  "pin-project-lite",
+  "tokio",
+ ]
+@@ -5844,8 +5877,6 @@
+ [[package]]
+ name = "wayland-sys"
+ version = "0.31.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+ dependencies = [
+  "dlib",
+  "log",
+@@ -6843,8 +6874,6 @@
+ [[package]]
+ name = "xkbcommon-dl"
+ version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5"
+ dependencies = [
+  "bitflags 2.13.2",
+  "dlib",
+--- a/build.rs
++++ b/build.rs
+@@ -9,7 +9,9 @@
+     let app = App::new(FluentString("xdg-title"))
+         .comment(FluentString("xdg-comment"))
+         .keywords(FluentString("xdg-keywords"));
+-    let output = PathBuf::from("target/xdgen");
++    println!("cargo:rerun-if-changed=data");
++    println!("cargo:rerun-if-changed=i18n");
++    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo build output directory"));
+     fs::create_dir_all(&output).unwrap();
+     fs::write(
+         output.join(format!("{}.desktop", id)),
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,6 +4,8 @@
+ mod app_group;
+ mod icon_cache;
+ mod localize;
++#[cfg(feature = "cyxia-native")]
++mod native_launch;
+ mod subscriptions;
+ mod widgets;
+ 
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -896,8 +896,11 @@
+                     env_vars.extend(gpus[idx].environment.clone());
+                 }
+                 tokio::spawn(async move {
++                    #[cfg(feature = "cyxia-native")]
++                    crate::native_launch::spawn(&exec, env_vars, &app_id, terminal).await;
++                    #[cfg(not(feature = "cyxia-native"))]
+                     cosmic::desktop::spawn_desktop_exec(exec, env_vars, Some(&app_id), terminal)
+-                        .await
++                        .await;
+                 });
+                 return self.update(Message::Hide);
+             }
+--- /dev/null
++++ b/src/native_launch.rs
+@@ -0,0 +1,54 @@
++use cosmic_settings_config::shortcuts::{self, action::System};
++use launch_pad::native_child::NativeChild;
++use std::borrow::Cow;
++use tokio::io::{self, AsyncRead};
++
++pub async fn spawn(exec: &str, environment: Vec<(String, String)>, app_id: &str, terminal: bool) {
++    let command = if terminal {
++        let terminal = shortcuts::context()
++            .ok()
++            .and_then(|config| {
++                shortcuts::system_actions(&config)
++                    .get(&System::Terminal)
++                    .cloned()
++            })
++            .unwrap_or_else(|| "cosmic-term".to_string());
++        Cow::Owned(format!("{terminal} -e {exec}"))
++    } else {
++        Cow::Borrowed(exec)
++    };
++    let mut fields = shlex::Shlex::new(&command);
++    let Some(executable) = fields
++        .next()
++        .filter(|name| !name.is_empty() && !name.contains('='))
++    else {
++        log::warn!("Invalid desktop command for {app_id}");
++        return;
++    };
++    // Match libcosmic's handling of field codes for launches without files.
++    let arguments = fields
++        .by_ref()
++        .filter(|field| !field.starts_with('%'))
++        .collect::<Vec<_>>();
++    if fields.had_error {
++        log::warn!("Invalid desktop command for {app_id}");
++        return;
++    }
++    let mut child = match NativeChild::spawn(&executable, &arguments, &environment, &[]) {
++        Ok(child) => child,
++        Err(error) => {
++            log::error!("Could not launch {app_id}: {error}");
++            return;
++        }
++    };
++    let stdout = child.stdout.take().expect("native child stdout");
++    let stderr = child.stderr.take().expect("native child stderr");
++    let (result, _, _) = tokio::join!(child.wait(), drain(stdout), drain(stderr));
++    if let Err(error) = result {
++        log::warn!("Could not collect {app_id}: {error}");
++    }
++}
++
++async fn drain(mut stream: impl AsyncRead + Unpin) -> io::Result<u64> {
++    io::copy(&mut stream, &mut io::sink()).await
++}
