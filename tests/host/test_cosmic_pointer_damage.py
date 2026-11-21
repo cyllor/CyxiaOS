@@ -18,12 +18,19 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from native_session import DEFAULT_NATIVE_LOCK, idle_native_host, native_lease
 
 PORT = ROOT / 'ports/cosmic/native-pointer-damage-v1'
+DISPATCH_PORT = ROOT / 'ports/cosmic/native-pointer-dispatch-v1'
 
 
 class NativePointerDamage(unittest.TestCase):
     def test_real_presentation_damage_and_completion_guards(self):
-        baseline = os.environ.get('CYXIA_DAMAGE_BASELINE') == '1'
+        self.check_damage(baseline=os.environ.get('CYXIA_DAMAGE_BASELINE') == '1')
+
+    def test_disjoint_panel_and_cursor_regions(self):
+        self.check_damage(disjoint=True)
+
+    def check_damage(self, *, baseline=False, disjoint=False):
         policy = json.loads((PORT / 'source-policy.json').read_text())
+        regions_baseline = disjoint and os.environ.get('CYXIA_REGIONS_BASELINE') == '1'
         with native_lease(DEFAULT_NATIVE_LOCK), tempfile.TemporaryDirectory(prefix='cyx-damage-') as tmp:
             idle_native_host()
             tmp = Path(tmp)
@@ -44,6 +51,17 @@ class NativePointerDamage(unittest.TestCase):
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 for name, digest in policy['patched_sources'].items():
                     self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), digest)
+            if disjoint and not regions_baseline:
+                layer = json.loads((DISPATCH_PORT / 'source-policy.json').read_text())
+                patch = DISPATCH_PORT / 'dispatch.patch'
+                relative = 'src/backend/cyxia/native/presentation.rs'
+                self.assertEqual(hashlib.sha256(patch.read_bytes()).hexdigest(), layer['patch_sha256'])
+                self.assertEqual(hashlib.sha256((tmp / relative).read_bytes()).hexdigest(),
+                                 layer['base_sources'][relative])
+                subprocess.run(['git', 'apply', f'--include={relative}', str(patch)],
+                               cwd=tmp, check=True, capture_output=True)
+                self.assertEqual(hashlib.sha256((tmp / relative).read_bytes()).hexdigest(),
+                                 layer['patched_sources'][relative])
             presentation = folder / 'native/presentation.rs'
             presentation.write_text(presentation.read_text() + '\n' +
                                     (ROOT / 'tests/host/cosmic_tile_capacity.rs').read_text() + '\n' +
@@ -56,11 +74,15 @@ class NativePointerDamage(unittest.TestCase):
                        '-o', str(tmp / 'tests')]
             if baseline:
                 command.extend(['--cfg', 'cyxia_damage_baseline'])
+            if disjoint:
+                command.extend(['--cfg', 'cyxia_damage_regions'])
             compiled = subprocess.run(command, capture_output=True, text=True, timeout=60)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             command = [str(tmp / 'tests'), '--nocapture', '--test-threads=1']
             if baseline:
                 command.append('small_cursor_motion_submits_one_damage_tile')
+            if regions_baseline:
+                command.append('panel_and_cursor_damage_cover_only_their_changed_pixels')
             result = subprocess.run(command, capture_output=True, text=True, timeout=30)
             print(result.stdout, end='')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

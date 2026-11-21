@@ -61,24 +61,25 @@ def pointer_motion(console, qmp, output):
     console.command('posix list')
     position = (0, 0)
     actions = [
-        ('move-right-down', (256, 192), 1, 0),
-        ('move-right', (640, 192), 1, 0),
-        ('move-down', (640, 512), 1, 0),
-        ('motion-burst', (832, 512), 24, 0),
-        ('motion-stream-left', (448, 512), 96, .005),
+        ('move-right-down', [(256, 192)], 0),
+        ('move-right', [(384, 0)], 0),
+        ('move-down', [(0, 320)], 0),
+        ('motion-burst', [(8, 0)] * 24, 0),
+        ('motion-stream-left', [(-4, 0)] * 96, .005),
+        ('motion-stream-turning', [(-2, -1), (-1, -2)] * 120, .005),
     ]
-    for name, target, packets, interval in actions:
+    for name, deltas, interval in actions:
         path = output / (name + '.ppm')
-        dx, dy = target[0] - position[0], target[1] - position[1]
+        target = (position[0] + sum(dx for dx, _ in deltas),
+                  position[1] + sum(dy for _, dy in deltas))
+        console.pump()
+        input_start = len(console.raw)
         started = time.monotonic()
-        for i in range(packets):
-            events = []
-            for axis, delta in [('x', dx), ('y', dy)]:
-                part = (delta * (i + 1) // packets) - (delta * i // packets)
-                if part:
-                    events.append({'type': 'rel', 'data': {'axis': axis, 'value': part}})
+        for i, (dx, dy) in enumerate(deltas):
+            events = [{'type': 'rel', 'data': {'axis': axis, 'value': value}}
+                      for axis, value in [('x', dx), ('y', dy)] if value]
             qmp.execute('input-send-event', {'events': events})
-            if interval and i + 1 < packets:
+            if interval and i + 1 < len(deltas):
                 time.sleep(interval)
         accepted = time.monotonic()
         matched = False
@@ -102,14 +103,16 @@ def pointer_motion(console, qmp, output):
         # deadline. Both durations are retained so the distinction is explicit.
         origin = accepted if interval else started
         latency = time.monotonic() - origin
+        console.pump()
+        losses = console.raw[input_start:].count(b'GRAPHICS_INPUT_DROPPED MECHANISM')
         result['samples'].append(dict(name=name, start=position, target=target,
-            packets=packets, matched=matched, elapsed_seconds=round(elapsed, 6),
+            packets=len(deltas), matched=matched, elapsed_seconds=round(elapsed, 6),
             latency_seconds=round(latency, 6),
             deadline_origin='last_input_ack' if interval else 'first_input',
             packet_interval_seconds=interval,
             input_ack_seconds=round(accepted - started, 6),
             after_last_ack_seconds=round(time.monotonic() - accepted, 6),
-            within_deadline=matched and latency <= DEADLINE_SECONDS,
+            within_deadline=matched and latency <= DEADLINE_SECONDS, guest_loss_markers=losses,
             target_pixels=current_ink, old_pixels=old_ink, lower_bright_pixels=bright,
             captures=count, sha256=pc.sha(path)))
         if not matched:
@@ -120,7 +123,8 @@ def pointer_motion(console, qmp, output):
         row['within_deadline'] for row in result['samples'])
     result['all_targets_matched'] = len(result['samples']) == len(actions) and all(
         row['matched'] for row in result['samples'])
-    result['status'] = 'PASS' if result['all_moves_within_deadline'] else 'FAIL'
+    result['guest_loss_markers'] = sum(row['guest_loss_markers'] for row in result['samples'])
+    result['status'] = 'PASS' if result['all_moves_within_deadline'] and not result['guest_loss_markers'] else 'FAIL'
     pc.write_json(output / 'pointer-qmp.json', qmp.transcript)
     pc.write_json(output / 'pointer-measurements.json', result)
     return result

@@ -74,19 +74,9 @@ impl Runner {
             epoll::Source::Timer { deadline } => {
                 u32::from(deadline.is_some_and(|deadline| super::now_ns() >= deadline))
             }
-            epoll::Source::Socket { owner, handle } => {
-                let ready = super::unix::with(|s| s.poll(owner, super::unix::handle(handle)))?;
-                u32::from(ready.readable)
-                    | (u32::from(ready.writable) << 2)
-                    | if ready.hangup { epoll::HUP } else { 0 }
-                    | if ready.read_hangup { epoll::RDHUP } else { 0 }
-            }
-            epoll::Source::Pipe { owner, handle } => {
-                u32::from(super::pipes::with(|p| p.poll(owner, handle))?)
-            }
-            epoll::Source::Pty { owner, handle } => {
-                u32::from(super::pty::with(|p| p.poll(owner, handle))?)
-            }
+            epoll::Source::Socket { owner, handle } => super::unix::poll(owner, handle)?,
+            epoll::Source::Pipe { owner, handle } => u32::from(super::pipes::poll(owner, handle)?),
+            epoll::Source::Pty { owner, handle } => u32::from(super::pty::poll(owner, handle)?),
         })
     }
 
@@ -122,12 +112,7 @@ impl Runner {
             // This bounded stream implementation supports connected sockets
             // and listeners. Reject an unconnected watch at registration, not
             // later when it would poison a wait for other ready descriptors.
-            super::unix::with(|s| {
-                s.poll(
-                    self.process.backend_owner(fd(target)?)?,
-                    super::unix::handle(raw),
-                )
-            })?;
+            super::unix::poll(self.process.backend_owner(fd(target)?)?, raw)?;
         }
         self.process
             .epoll_ctl(fd(epfd)?, operation, fd(target)?, event)?;

@@ -5,7 +5,7 @@ use core::fmt::Write;
 use cyxia_ai_runtime::display_policy::{self, Pacer, Phase};
 use cyxia_driver_virtio::{
     Error, EventQueue, InputEvent, Platform, Queue, QueueMemory, Transport,
-    gpu::{Gpu, HEIGHT, WIDTH},
+    gpu::{Gpu, HEIGHT, UpdateRect, WIDTH},
     input_buffer::{InputBuffer, KEY_BYTES},
 };
 
@@ -21,7 +21,7 @@ static mut EVENTS: InputBuffer = InputBuffer::new();
 // complete accepted rectangle across a model-selected wait without borrowing
 // a syscall's temporary buffer or changing the X.Org ABI.
 static mut STAGED: [u32; display_policy::MAX_PIXELS] = [0; display_policy::MAX_PIXELS];
-static mut RECT: (usize, usize, usize, usize) = (0, 0, 0, 0);
+static mut RECT: UpdateRect = UpdateRect::FULL;
 static mut PACER: Pacer = Pacer::new();
 struct Input {
     transport: Transport,
@@ -85,7 +85,7 @@ pub fn init_transports(transports: impl IntoIterator<Item = Transport>) {
                 match result {
                     Ok(gpu) => {
                         // CPU0's foreground owns this handle from now on. FRAME
-                        // may only be borrowed through Gpu::submit_update after show.
+                        // may only be borrowed through the GPU render callback after show.
                         unsafe { *core::ptr::addr_of_mut!(GPU) = Some(gpu) };
                         super::log(b"GRAPHICS_FRAME_OK 1024x768 BOOTSTRAP\n");
                     }
@@ -140,12 +140,8 @@ pub fn begin_blit(
     height: usize,
     pixels: &[u32],
 ) -> Result<(), Error> {
-    if width == 0
-        || height == 0
-        || x.checked_add(width).is_none_or(|right| right > WIDTH)
-        || y.checked_add(height).is_none_or(|bottom| bottom > HEIGHT)
-        || width.checked_mul(height) != Some(pixels.len())
-        || pixels.len() > display_policy::MAX_PIXELS
+    let rect = UpdateRect::new(x, y, width, height)?;
+    if width.checked_mul(height) != Some(pixels.len()) || pixels.len() > display_policy::MAX_PIXELS
     {
         return Err(Error::Address);
     }
@@ -169,7 +165,7 @@ pub fn begin_blit(
     unsafe {
         let staged = &mut *core::ptr::addr_of_mut!(STAGED);
         staged[..pixels.len()].copy_from_slice(pixels);
-        *core::ptr::addr_of_mut!(RECT) = (x, y, width, height);
+        *core::ptr::addr_of_mut!(RECT) = rect;
     }
     if pacer.ready(now) {
         submit_staged()?;
@@ -185,7 +181,8 @@ fn submit_staged() -> Result<(), Error> {
     if !pacer.ready(now) {
         return Err(Error::Busy);
     }
-    let (x, y, width, height) = unsafe { *core::ptr::addr_of!(RECT) };
+    let rect = unsafe { *core::ptr::addr_of!(RECT) };
+    let (x, y, width, height) = rect.bounds();
     let pixels = unsafe { &*core::ptr::addr_of!(STAGED) };
     // SAFETY: the single CPU foreground serializes all calls. No IRQ handler
     // touches these statics. Gpu guards CPU access against in-flight DMA.
@@ -194,7 +191,8 @@ fn submit_staged() -> Result<(), Error> {
         let _ = pacer.finish(now, false);
         return Err(Error::Device);
     };
-    let result = gpu.submit_update(
+    let result = gpu.submit_update_rect(
+        rect,
         |frame| {
             for row in 0..height {
                 let destination = (y + row) * WIDTH + x;
@@ -376,6 +374,8 @@ pub fn poll() {
             match input.queue.poll(&mut input.transport, &Board) {
                 Ok(Some(event)) => {
                     progressed = true;
+                    // Keep tracing out of the display/input service budget.
+                    #[cfg(feature = "abi-trace")]
                     if event.kind == 1 || event.kind == 2 {
                         super::log(b"GRAPHICS_INPUT_EVENT MECHANISM\n");
                         super::hex(

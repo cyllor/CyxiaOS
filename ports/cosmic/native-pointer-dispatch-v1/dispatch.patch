@@ -1,0 +1,286 @@
+--- a/src/backend/cyxia/mod.rs
++++ b/src/backend/cyxia/mod.rs
+@@ -15,7 +15,7 @@
+ use crate::{
+     backend::render::{self, CursorMode, ScreenFilterStorage, init_shaders},
+     config::ScreenFilter,
+-    input::InputBackendId,
++    input::{InputBackendId, MotionBatch},
+     shell::SessionLock,
+     state::{BackendData, Common, State},
+ };
+@@ -348,9 +348,21 @@
+     if background && state.backend.cyxia().bridge.delivered.is_idle() {
+         native::coalesce_desktop_motion(&mut actions);
+     }
++    // Native records carry no timestamp. Sample at the start of a
++    // consecutive motion run and keep every decoded direction and focus step.
++    let mut motion_clock = None;
+     for action in actions {
+-        let event = state.backend.cyxia().bridge.event(action, InputTime::now());
+-        state.process_input_event(event, InputBackendId::Normal);
++        let (time, batch) = if matches!(action, InputAction::Motion { .. }) {
++            let first = motion_clock.is_none();
++            let (time, now) =
++                *motion_clock.get_or_insert_with(|| (InputTime::now(), Instant::now()));
++            (time, Some(MotionBatch { time: now, first }))
++        } else {
++            motion_clock = None;
++            (InputTime::now(), None)
++        };
++        let event = state.backend.cyxia().bridge.event(action, time);
++        state.process_input_event_in_batch(event, InputBackendId::Normal, batch);
+     }
+ }
+ 
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -210,18 +210,35 @@
+ 
+     pub fn clear(&self, backend_id: &InputBackendId) {
+         self.0.borrow_mut().remove(backend_id);
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++pub(crate) struct MotionBatch {
++    pub time: Instant,
++    pub first: bool,
++}
++
+ impl State {
+-    #[profiling::function]
+     pub fn process_input_event<B: InputBackend>(
+         &mut self,
+         event: InputEvent<B>,
+         backend_id: InputBackendId,
++    ) where
++        <B as InputBackend>::Device: 'static,
++    {
++        self.process_input_event_in_batch(event, backend_id, None);
++    }
++
++    #[profiling::function]
++    pub(crate) fn process_input_event_in_batch<B: InputBackend>(
++        &mut self,
++        event: InputEvent<B>,
++        backend_id: InputBackendId,
++        motion_batch: Option<MotionBatch>,
+     ) where
+         <B as InputBackend>::Device: 'static,
+     {
+         #[cfg(feature = "backend-cyxia")]
+         if let crate::state::BackendData::Cyxia(backend) = &self.backend {
+             use crate::backend::cyxia::{PendingInput, input_allowed};
+@@ -380,27 +397,32 @@
+                 let shell = self.common.shell.write();
+                 if let Some(seat) = shell
+                     .seats
+                     .for_device(&event.device(), &backend_id)
+                     .cloned()
+                 {
+-                    self.common.idle_notifier_state.notify_activity(&seat);
+-                    notify_cursor_activity(self, &seat, PointerEventKind::Motion);
++                    // One native batch has one sampled activity time.
++                    // Keep the first wake before any motion delivery.
++                    if motion_batch.is_none_or(|batch| batch.first) {
++                        self.common.idle_notifier_state.notify_activity(&seat);
++                        notify_cursor_activity(self, &seat, PointerEventKind::Motion);
++                    }
+                     let current_output = seat.active_output();
+ 
+                     if self.common.config.cosmic_conf.cursor_shake_to_find
+                         && seat
+                             .get_pointer()
+                             .is_some_and(|pointer| !pointer.is_grabbed())
+                         && let Some(cursor_state) =
+                             seat.user_data()
+                                 .get::<crate::backend::render::cursor::CursorState>()
+                     {
+                         let active = {
+                             let mut cursor = cursor_state.lock().unwrap();
+-                            cursor.detect_shake(event.delta(), std::time::Instant::now());
++                            let time = motion_batch.map_or_else(Instant::now, |batch| batch.time);
++                            cursor.detect_shake(event.delta(), time);
+                             cursor.is_magnifying()
+                         };
+                         if active {
+                             self.backend.schedule_render(&current_output);
+                         }
+                     }
+@@ -682,15 +704,16 @@
+                     if pointer_confined && new_under.is_none() {
+                         ptr.frame(self);
+                         return;
+                     }
+ 
+                     let serial = SERIAL_COUNTER.next_serial();
++                    // Route motion and the next click to the destination surface.
+                     ptr.motion(
+                         self,
+-                        under,
++                        new_under.clone(),
+                         &PointerMotionEvent {
+                             location: position.as_logical(),
+                             serial,
+                             time: event.time(),
+                         },
+                     );
+--- a/src/backend/cyxia/native/presentation.rs
++++ b/src/backend/cyxia/native/presentation.rs
+@@ -8,6 +8,7 @@
+     time::{Duration, Instant},
+ };
+ 
++const MAX_DAMAGE_REGIONS: usize = 16;
+ const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+ 
+ #[derive(Debug)]
+@@ -15,6 +16,9 @@
+     info: DisplayInfo,
+     flipped: bool,
+     region: Rectangle,
++    regions: [Rectangle; MAX_DAMAGE_REGIONS],
++    region_count: usize,
++    region_index: usize,
+     left: u32,
+     top: u32,
+     tile: Vec<u8>,
+@@ -53,10 +57,16 @@
+         tile.try_reserve_exact(capacity)
+             .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "native tile allocation"))?;
+         tile.resize(capacity, 0);
++        let region = Rectangle { x: 0, y: 0, width: info.width, height: info.height };
++        let mut regions = [Rectangle { x: 0, y: 0, width: 0, height: 0 }; MAX_DAMAGE_REGIONS];
++        regions[0] = region;
+         Ok(Self {
+             info,
+             flipped,
+-            region: Rectangle { x: 0, y: 0, width: info.width, height: info.height },
++            region,
++            regions,
++            region_count: 1,
++            region_index: 0,
+             left: 0,
+             top: 0,
+             tile,
+@@ -67,17 +77,17 @@
+         })
+     }
+ 
+-    /// Cover every damaged pixel with one clipped bounding rectangle. The full
+-    /// readback remains immutable; source rows are still indexed in that full
+-    /// mapping, including its global vertical flip. Empty damage conservatively
+-    /// preserves the full-frame path. Session-lock black scanout uses `new`.
++    /// Keep individual damage regions and merge touching or overlapping rectangles.
++    /// Excess fragmentation uses a full update. Source pixels use the full readback.
+     pub fn for_damage(
+         info: DisplayInfo,
+         flipped: bool,
+         damage: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+     ) -> io::Result<Self> {
+         let mut pending = Self::new(info, flipped)?;
+-        let mut bounds: Option<(i64, i64, i64, i64)> = None;
++        let mut regions = pending.regions;
++        let mut count = 0;
++        let mut overflow = false;
+         for (x, y, width, height) in damage {
+             if width < 0 || height < 0 {
+                 return Err(invalid("invalid native damage extent"));
+@@ -86,21 +96,43 @@
+             let top = i64::from(y).max(0);
+             let right = (i64::from(x) + i64::from(width)).min(i64::from(info.width));
+             let bottom = (i64::from(y) + i64::from(height)).min(i64::from(info.height));
+-            if left >= right || top >= bottom {
++            if left >= right || top >= bottom || overflow {
+                 continue;
+             }
+-            bounds = Some(match bounds {
+-                None => (left, top, right, bottom),
+-                Some((a, b, c, d)) => (a.min(left), b.min(top), c.max(right), d.max(bottom)),
+-            });
+-        }
+-        if let Some((left, top, right, bottom)) = bounds {
+-            pending.region = Rectangle {
+-                x: left as u32,
+-                y: top as u32,
+-                width: (right - left) as u32,
+-                height: (bottom - top) as u32,
++            let mut rect = Rectangle {
++                x: left as u32, y: top as u32,
++                width: (right - left) as u32, height: (bottom - top) as u32,
+             };
++            let mut index = 0;
++            while index < count {
++                let other = regions[index];
++                if rect.x <= other.x + other.width && other.x <= rect.x + rect.width
++                    && rect.y <= other.y + other.height && other.y <= rect.y + rect.height
++                {
++                    let right = (rect.x + rect.width).max(other.x + other.width);
++                    let bottom = (rect.y + rect.height).max(other.y + other.height);
++                    rect.x = rect.x.min(other.x);
++                    rect.y = rect.y.min(other.y);
++                    rect.width = right - rect.x;
++                    rect.height = bottom - rect.y;
++                    count -= 1;
++                    regions[index] = regions[count];
++                    index = 0; // A merged rectangle may now touch another one.
++                } else {
++                    index += 1;
++                }
++            }
++            if count == regions.len() {
++                overflow = true;
++            } else {
++                regions[count] = rect;
++                count += 1;
++            }
++        }
++        if count != 0 && !overflow {
++            pending.regions = regions;
++            pending.region = regions[0];
++            pending.region_count = count;
+         }
+         Ok(pending)
+     }
+@@ -173,7 +205,7 @@
+             return Err(invalid("invalid native framebuffer or tile budget"));
+         }
+         for _ in 0..budget {
+-            if self.left == self.region.width {
++            if self.region_index == self.region_count {
+                 return Ok(true);
+             }
+             if now() >= self.deadline {
+@@ -229,6 +261,13 @@
+                         self.top = 0;
+                         self.left += columns;
+                     }
++                    if self.left == self.region.width {
++                        self.region_index += 1;
++                        if self.region_index < self.region_count {
++                            self.region = self.regions[self.region_index];
++                            self.left = 0;
++                        }
++                    }
+                     // A whole frame can span many event-loop turns under
+                     // load. Renew only after the native ABI reports that this
+                     // tile completed; retries and dispatches are not progress.
+@@ -236,7 +275,7 @@
+                     #[cfg(feature = "backend-cyxia")]
+                     if self.observe_first_frame && rgba.is_some() {
+                         phase::mark_once(Phase::FirstTileSubmitEnd);
+-                        if self.left == self.region.width {
++                        if self.region_index == self.region_count {
+                             phase::mark_once(Phase::FirstFullScanoutComplete);
+                         }
+                     }
+@@ -258,7 +297,7 @@
+                 }
+             }
+         }
+-        Ok(self.left == self.region.width)
++        Ok(self.region_index == self.region_count)
+     }
+ }
+ 

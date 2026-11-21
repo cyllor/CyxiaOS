@@ -7,7 +7,9 @@
 
 use crate::{Error, InputEvent};
 
-pub const CAPACITY: usize = 128;
+// One page of queued records absorbs bursts while the consumer presents a
+// frame. The syscall read budget remains independent of the backlog size.
+pub const CAPACITY: usize = 4096 / core::mem::size_of::<InputEvent>();
 pub const READ_LIMIT: usize = 32;
 pub const KEY_BYTES: usize = 96;
 pub const SOURCES: usize = 2;
@@ -186,6 +188,26 @@ mod tests {
                 assert_eq!(e.value, (group * READ_LIMIT + i) as i32);
             }
         }
+    }
+
+    #[test]
+    fn motion_backlog_preserves_two_axes_and_button_order() {
+        let mut queue = InputBuffer::new();
+        let mut expected = std::vec![event(1, 272, 1), SYN_REPORT];
+        for n in 0..128 {
+            expected.extend([event(2, 0, 1 + n % 2), event(2, 1, 2 - n % 2), SYN_REPORT]);
+        }
+        expected.extend([event(1, 272, 0), SYN_REPORT]);
+
+        for &event in &expected {
+            assert_eq!(queue.push(0, event), Ok(false));
+        }
+        let mut out = [EMPTY; READ_LIMIT];
+        for chunk in expected.chunks(READ_LIMIT) {
+            assert_eq!(queue.read(&mut out), Ok(chunk.len()));
+            assert_eq!(&out[..chunk.len()], chunk);
+        }
+        assert_eq!(queue.read(&mut out), Err(Error::Busy));
     }
 
     #[test]

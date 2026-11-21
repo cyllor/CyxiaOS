@@ -104,18 +104,14 @@ impl Runner {
                 match self.process.socket(descriptor) {
                     Ok(Some(raw)) => {
                         let owner = self.process.backend_owner(descriptor)?;
-                        let ready = super::unix::with(|s| s.poll(owner, super::unix::handle(raw)))?;
-                        u16::from(ready.readable)
-                            | (u16::from(ready.writable) << 2)
-                            | (u16::from(ready.hangup) << 4)
-                            | (u16::from(ready.read_hangup) << 13)
+                        super::unix::poll(owner, raw)? as u16
                     }
                     Ok(None) => {
                         let owner = self.process.backend_owner(descriptor)?;
                         if let Some(raw) = self.process.pipe(descriptor)? {
-                            super::pipes::with(|p| p.poll(owner, raw))?
+                            super::pipes::poll(owner, raw)?
                         } else if let Some(raw) = self.process.pty(descriptor)? {
-                            super::pty::with(|p| p.poll(owner, raw))?
+                            super::pty::poll(owner, raw)?
                         } else if self.process.is_timerfd(descriptor)? {
                             u16::from(self.process.timerfd_ready(descriptor, super::now_ns())?)
                         } else if self.process.is_epoll(descriptor)? {

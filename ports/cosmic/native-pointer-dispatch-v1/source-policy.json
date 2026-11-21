@@ -1,0 +1,15 @@
+{
+  "kind": "cosmic-native-pointer-dispatch-v1",
+  "commit": "41497b42d9744d9963c4c6d17e8add49489b45ee",
+  "base_sources": {
+    "src/backend/cyxia/mod.rs": "4e8c5054bd63c6a745863dea8217f149e5e46e4a7c09a578cbb092e2e56dec73",
+    "src/input/mod.rs": "1ba608acac40bdccd4f5fc31529af2338e890452b8a144d8174324815d871e08",
+    "src/backend/cyxia/native/presentation.rs": "43d79886ee134f133061838e2622b801d14818e379263981e0d79b26c204fe84"
+  },
+  "patched_sources": {
+    "src/backend/cyxia/mod.rs": "5993fe73a985f09dba242dd71af8b7e19084601f7a9005d0363757bff4207782",
+    "src/input/mod.rs": "e5ffdf159706d291bd220c047f9f7447a37557b4747a4a40c2df96885f3b726c",
+    "src/backend/cyxia/native/presentation.rs": "0da87ba736cc376b5a8466ed6143bbe44ee5300f3066e2a23cf93a9a9bef9338"
+  },
+  "patch_sha256": "364c722b4ec479cc7fdb735284fdb72d2269b2a164206c9d24ae5df07952be92"
+}

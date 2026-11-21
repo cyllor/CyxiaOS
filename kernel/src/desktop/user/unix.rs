@@ -1,8 +1,8 @@
 //! Foreground-owned local socket pool. AI decides ordinary object admission;
 //! generation/owner/path/capacity enforcement remains a kernel mechanism.
 use cyxia_posix::{
-    Errno,
-    unix::{Handle, UnixSockets},
+    Errno, epoll,
+    unix::{Handle, Ready, UnixSockets},
 };
 static mut SOCKETS: UnixSockets = UnixSockets::new();
 #[cfg(feature = "cosmic-workspace-applets-v1")]
@@ -28,26 +28,27 @@ pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> R
     // Other backend pools are released only after this borrow ends. Socket
     // cleanup itself stays inside the safe POSIX pool operation without reentry.
     super::objects::table().observe_backend(|source| {
-        let cyxia_posix::epoll::Source::Socket { owner, handle: raw } = source else {
+        let epoll::Source::Socket { owner, handle: raw } = source else {
             return None;
         };
         let ready = pool.poll(owner, handle(raw)).ok()?;
-        let bits = u32::from(ready.readable)
-            | (u32::from(ready.writable) << 2)
-            | if ready.hangup {
-                cyxia_posix::epoll::HUP
-            } else {
-                0
-            }
-            | if ready.read_hangup {
-                cyxia_posix::epoll::RDHUP
-            } else {
-                0
-            };
-        Some((bits, pool.wake_mask(owner, handle(raw)).unwrap_or(0)))
+        Some((ready_bits(ready), pool.wake_mask(owner, handle(raw)).unwrap_or(0)))
     });
     pool.clear_wakes();
     result
+}
+
+fn ready_bits(ready: Ready) -> u32 {
+    (u32::from(ready.readable) * epoll::IN)
+        | (u32::from(ready.writable) * epoll::OUT)
+        | (u32::from(ready.hangup) * epoll::HUP)
+        | (u32::from(ready.read_hangup) * epoll::RDHUP)
+}
+
+pub(super) fn poll(owner: u32, raw: u64) -> Result<u32, Errno> {
+    // SAFETY: CPU0 foreground serializes this snapshot with pool mutations.
+    let pool = unsafe { &*core::ptr::addr_of!(SOCKETS) };
+    pool.poll(owner, handle(raw)).map(ready_bits)
 }
 
 /// Admit logical pool occupancy, then record the actual mechanism outcome.

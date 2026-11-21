@@ -30,6 +30,13 @@ pub(super) fn with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<
     pool.clear_wakes();
     result
 }
+
+pub(super) fn poll(owner: u32, handle: u64) -> Result<u16, Errno> {
+    // SAFETY: CPU0 foreground serializes this snapshot with pipe mutations.
+    let pool = unsafe { &*core::ptr::addr_of!(PIPES) };
+    pool.poll(owner, handle)
+}
+
 pub(super) fn pair(owner: u32) -> Result<[u64; 2], Errno> {
     let mut attempt = cyxia_ai_runtime::accounting::Attempt::default();
     let result = (|| {

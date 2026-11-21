@@ -5,6 +5,60 @@ pub const WIDTH: usize = 1024;
 pub const HEIGHT: usize = 768;
 pub const FRAME_BYTES: usize = WIDTH * HEIGHT * 4;
 
+/// A nonempty region within the attached 2D resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+impl UpdateRect {
+    pub const FULL: Self = Self {
+        x: 0,
+        y: 0,
+        width: WIDTH as u32,
+        height: HEIGHT as u32,
+    };
+
+    pub fn new(x: usize, y: usize, width: usize, height: usize) -> Result<Self, Error> {
+        if width == 0
+            || height == 0
+            || x.checked_add(width).is_none_or(|right| right > WIDTH)
+            || y.checked_add(height).is_none_or(|bottom| bottom > HEIGHT)
+        {
+            return Err(Error::Address);
+        }
+        Ok(Self {
+            x: x as u32,
+            y: y as u32,
+            width: width as u32,
+            height: height as u32,
+        })
+    }
+
+    pub fn bounds(self) -> (usize, usize, usize, usize) {
+        (
+            self.x as usize,
+            self.y as usize,
+            self.width as usize,
+            self.height as usize,
+        )
+    }
+
+    fn encode(self, bytes: &mut [u8]) {
+        put32(bytes, 0, self.x);
+        put32(bytes, 4, self.y);
+        put32(bytes, 8, self.width);
+        put32(bytes, 12, self.height);
+    }
+
+    fn backing_offset(self) -> u64 {
+        // Rows retain the full resource stride even when only part is sent.
+        (u64::from(self.y) * WIDTH as u64 + u64::from(self.x)) * 4
+    }
+}
+
 #[derive(Clone, Copy)]
 enum State {
     Empty,
@@ -20,7 +74,7 @@ enum State {
 }
 #[derive(Clone, Copy)]
 enum Phase {
-    Transfer,
+    Transfer(UpdateRect),
     Flush,
 }
 
@@ -124,7 +178,7 @@ impl Gpu {
     /// mapped and physically contiguous for the lifetime of the device,
     /// including after errors or dropping `Gpu`. Ownership is exclusively given
     /// to this object: no CPU, device, alias or interrupt may access these bytes
-    /// outside the temporary render borrow supplied by `submit_update`. Platform cache
+    /// outside the temporary render borrow supplied by `submit_update_rect`. Platform cache
     /// operations must cover the complete backing without touching other owners.
     /// Errors after commands have been submitted require permanent quarantine;
     /// setting FAILED alone does not prove that DMA has stopped.
@@ -159,7 +213,7 @@ impl Gpu {
         self.command(0x106, &attach, 0x1100, platform)?;
         self.transfer(backing, platform)?;
         let mut scanout = [0; 24];
-        rectangle(&mut scanout);
+        UpdateRect::FULL.encode(&mut scanout);
         put32(&mut scanout, 20, 1);
         self.command(0x103, &scanout, 0x1100, platform)?;
         self.flush(platform)?;
@@ -182,6 +236,16 @@ impl Gpu {
     }
 
     /// Render and queue a complete frame without waiting for device completion.
+    pub fn submit_update(
+        &mut self,
+        render: impl FnOnce(&mut [u32]),
+        platform: &impl Platform,
+    ) -> Result<(), Error> {
+        self.submit_update_rect(UpdateRect::FULL, render, platform)
+    }
+
+    /// Queue the changed rectangle. `render` may address the full backing for
+    /// row stride, and every modified pixel must be inside `rect` to be shown.
     /// The callback's borrow ends before cache synchronization and DMA. Call
     /// [`Self::poll_update`] to receive completion of both transfer and flush.
     ///
@@ -189,8 +253,9 @@ impl Gpu {
     /// error, or while a previous update is pending (`Error::Busy`). Every
     /// submission/response failure permanently disables rendering through this
     /// object. The backing remains reserved even if this is dropped.
-    pub fn submit_update(
+    pub fn submit_update_rect(
         &mut self,
+        rect: UpdateRect,
         render: impl FnOnce(&mut [u32]),
         platform: &impl Platform,
     ) -> Result<(), Error> {
@@ -210,10 +275,10 @@ impl Gpu {
         render(unsafe { core::slice::from_raw_parts_mut(backing as *mut u32, WIDTH * HEIGHT) });
         self.sync_frame(backing, platform);
         let started = platform.now_ms();
-        self.submit_command(0x105, &transfer_body(), platform)?;
+        self.submit_command(0x105, &transfer_body(rect), platform)?;
         self.state = State::Pending {
             backing,
-            phase: Phase::Transfer,
+            phase: Phase::Transfer(rect),
             started,
         };
         Ok(())
@@ -258,9 +323,9 @@ impl Gpu {
             return Err(error);
         }
         match phase {
-            Phase::Transfer => {
+            Phase::Transfer(rect) => {
                 let started = platform.now_ms();
-                self.submit_command(0x104, &flush_body(), platform)?;
+                self.submit_command(0x104, &flush_body(rect), platform)?;
                 self.state = State::Pending {
                     backing,
                     phase: Phase::Flush,
@@ -285,27 +350,24 @@ impl Gpu {
     }
     fn transfer(&mut self, backing: usize, platform: &impl Platform) -> Result<(), Error> {
         self.sync_frame(backing, platform);
-        self.command(0x105, &transfer_body(), 0x1100, platform)
+        self.command(0x105, &transfer_body(UpdateRect::FULL), 0x1100, platform)
     }
     fn flush(&mut self, platform: &impl Platform) -> Result<(), Error> {
-        self.command(0x104, &flush_body(), 0x1100, platform)
+        self.command(0x104, &flush_body(UpdateRect::FULL), 0x1100, platform)
     }
 }
-fn transfer_body() -> [u8; 32] {
+fn transfer_body(rect: UpdateRect) -> [u8; 32] {
     let mut transfer = [0; 32];
-    rectangle(&mut transfer);
+    rect.encode(&mut transfer);
+    transfer[16..24].copy_from_slice(&rect.backing_offset().to_le_bytes());
     put32(&mut transfer, 24, 1);
     transfer
 }
-fn flush_body() -> [u8; 24] {
+fn flush_body(rect: UpdateRect) -> [u8; 24] {
     let mut flush = [0; 24];
-    rectangle(&mut flush);
+    rect.encode(&mut flush);
     put32(&mut flush, 16, 1);
     flush
-}
-fn rectangle(bytes: &mut [u8]) {
-    put32(bytes, 8, WIDTH as u32);
-    put32(bytes, 12, HEIGHT as u32);
 }
 fn put32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -484,6 +546,53 @@ mod tests {
             assert_eq!(&transfer[48..52], &1u32.to_le_bytes());
             assert_eq!(&commands[index + 1][..4], &0x104u32.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn cropped_update_preserves_rectangle_and_backing_offset() {
+        let (mut gpu, host) = fixture();
+        unsafe { gpu.show(host.frame, &host).unwrap() };
+        let (x, y, width, height) = (1017, 764, 7, 4);
+        gpu.submit_update_rect(
+            UpdateRect::new(x, y, width, height).unwrap(),
+            |pixels| {
+                for row in y..y + height {
+                    pixels[row * WIDTH + x..row * WIDTH + x + width].fill(0x123456);
+                }
+            },
+            &host,
+        )
+        .unwrap();
+        assert_eq!(gpu.poll_update(&host), Ok(false));
+        assert_eq!(gpu.poll_update(&host), Ok(true));
+        let commands = host.commands.borrow();
+        assert_eq!(commands.len(), 8);
+        for (request, kind) in [(&commands[6], 0x105u32), (&commands[7], 0x104)] {
+            assert_eq!(&request[..4], &kind.to_le_bytes());
+            let geometry: [u32; 4] = core::array::from_fn(|i| {
+                u32::from_le_bytes(request[24 + 4 * i..28 + 4 * i].try_into().unwrap())
+            });
+            assert_eq!(geometry, [1017, 764, 7, 4], "cropped GPU update expanded");
+        }
+        let offset = u64::from_le_bytes(commands[6][40..48].try_into().unwrap());
+        assert_eq!(offset, 764 * 4096 + 1017 * 4);
+        assert_eq!(&commands[6][48..52], &1u32.to_le_bytes());
+        assert_eq!(&commands[7][40..44], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn update_rect_rejects_empty_outside_and_wrapping_extents() {
+        for (x, y, width, height) in [
+            (0, 0, 0, 1),
+            (0, 0, 1, 0),
+            (WIDTH - 1, 0, 2, 1),
+            (0, HEIGHT - 1, 1, 2),
+            (usize::MAX, 0, 1, 1),
+            (0, usize::MAX, 1, 1),
+        ] {
+            assert_eq!(UpdateRect::new(x, y, width, height), Err(Error::Address));
+        }
+        assert_eq!(UpdateRect::new(0, 0, WIDTH, HEIGHT), Ok(UpdateRect::FULL));
     }
 
     #[test]

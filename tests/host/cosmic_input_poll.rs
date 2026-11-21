@@ -1,7 +1,25 @@
 #![allow(dead_code)]
 mod desktop {
-    fn log(_: &[u8]) {}
-    fn hex(_: u64) {}
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static INPUT_LOGS: AtomicUsize = AtomicUsize::new(0);
+    static HEX_WRITES: AtomicUsize = AtomicUsize::new(0);
+    static LOSS_LOGS: AtomicUsize = AtomicUsize::new(0);
+    static FAILURE_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+    fn log(bytes: &[u8]) {
+        let counter = match bytes {
+            b"GRAPHICS_INPUT_EVENT MECHANISM\n" => &INPUT_LOGS,
+            b"GRAPHICS_INPUT_DROPPED MECHANISM\n" => &LOSS_LOGS,
+            b"GRAPHICS_INPUT_STOPPED MECHANISM\n" => &FAILURE_LOGS,
+            _ => panic!("unexpected input log {bytes:?}"),
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn hex(_: u64) {
+        HEX_WRITES.fetch_add(1, Ordering::Relaxed);
+    }
     mod graphics {
         use cyxia_driver_virtio::{Error, InputEvent, input_buffer::{InputBuffer, SYN_DROPPED, SYN_REPORT, KEY_BYTES}};
         use std::{collections::VecDeque, sync::atomic::{AtomicUsize, Ordering}};
@@ -32,6 +50,10 @@ mod desktop {
                 *core::ptr::addr_of_mut!(EVENTS) = InputBuffer::new();
             }
             FAILURES.store(0, Ordering::Relaxed);
+            for counter in [&super::INPUT_LOGS, &super::HEX_WRITES,
+                            &super::LOSS_LOGS, &super::FAILURE_LOGS] {
+                counter.store(0, Ordering::Relaxed);
+            }
         }
         fn event(kind: u16, code: u16, value: i32) -> InputEvent { InputEvent { kind, code, value } }
         fn drain() -> Vec<InputEvent> {
@@ -75,6 +97,22 @@ mod desktop {
         }
 
         #[test]
+        fn event_logging_is_opt_in_and_loss_is_always_visible() {
+            let motion = event(2, 0, 9);
+            reset([device([Ok(motion), Ok(SYN_REPORT)]), None]);
+            poll();
+            assert_eq!(drain(), [motion, SYN_REPORT]);
+            let trace = usize::from(cfg!(feature = "abi-trace"));
+            assert_eq!(super::INPUT_LOGS.load(Ordering::Relaxed), trace);
+            assert_eq!(super::HEX_WRITES.load(Ordering::Relaxed), trace);
+
+            reset([device([Ok(SYN_DROPPED), Ok(SYN_REPORT)]), None]);
+            poll();
+            assert_eq!(drain(), [SYN_DROPPED, SYN_REPORT]);
+            assert_eq!(super::LOSS_LOGS.load(Ordering::Relaxed), 1);
+        }
+
+        #[test]
         fn device_failure_resynchronizes_without_releasing_the_other_devices_key() {
             let down = event(1, 30, 1);
             let motion = event(2, 0, -7);
@@ -90,6 +128,7 @@ mod desktop {
             unsafe { &*core::ptr::addr_of!(EVENTS) }.key_state(&mut keys);
             assert_eq!(keys[30 / 8] & (1 << (30 % 8)), 1 << (30 % 8));
             assert_eq!(FAILURES.load(Ordering::Relaxed), 1);
+            assert_eq!(super::FAILURE_LOGS.load(Ordering::Relaxed), 1);
             let inputs = unsafe { &*core::ptr::addr_of!(INPUTS) };
             assert!(inputs[0].is_none() && inputs[1].is_some());
         }

@@ -33,15 +33,18 @@ class CosmicInputPoll(unittest.TestCase):
             (tmp / 'harness.rs').write_text(template.replace('// PRODUCTION_POLL', body))
             (tmp / 'Cargo.toml').write_text(
                 '[package]\nname="cosmic-input-poll-regression"\nversion="0.1.0"\nedition="2024"\n'
-                '[lib]\npath="harness.rs"\n[workspace]\n[dependencies]\n'
+                '[lib]\npath="harness.rs"\n[features]\nabi-trace=[]\n[workspace]\n[dependencies]\n'
                 'cyxia-driver-virtio={path=' + json.dumps(str(ROOT / 'crates/driver-virtio')) + '}\n')
             env = dict(os.environ, CARGO_NET_OFFLINE='true', CARGO_INCREMENTAL='0',
                        CARGO_TARGET_DIR=str(ROOT / 'target/host-cosmic-input-poll' / key))
-            result = subprocess.run([shutil.which('cargo'), 'test', '--offline', '--manifest-path',
-                                     str(tmp / 'Cargo.toml'), '--', '--nocapture', '--test-threads=1'],
-                                    cwd=tmp, env=env, capture_output=True, text=True, timeout=90)
-            print(result.stdout, end='')
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for trace in (False, True):
+                with self.subTest(abi_trace=trace):
+                    flags = ['--features', 'abi-trace'] if trace else []
+                    result = subprocess.run([shutil.which('cargo'), 'test', '--offline', '--manifest-path',
+                                             str(tmp / 'Cargo.toml'), *flags, '--', '--nocapture', '--test-threads=1'],
+                                            cwd=tmp, env=env, capture_output=True, text=True, timeout=90)
+                    print(result.stdout, end='')
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

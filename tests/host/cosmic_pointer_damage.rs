@@ -66,6 +66,7 @@ mod damage_contract {
     }
 
     #[test]
+    #[cfg(not(cyxia_damage_regions))]
     fn horizontal_vertical_and_diagonal_motion_have_bounded_work() {
         for (damage, expected) in [
             (vec![(255, 191, 20, 30), (639, 191, 20, 30)], 1),
@@ -77,6 +78,7 @@ mod damage_contract {
     }
 
     #[test]
+    #[cfg(not(cyxia_damage_regions))]
     fn damage_pixels_match_full_frame_at_global_coordinates_in_both_orientations() {
         for flipped in [false, true] {
             let (_, _, screen, visits) = collect(flipped, &[(20, 30, 10, 9), (9, 60, 6, 20)]);
@@ -95,6 +97,40 @@ mod damage_contract {
                 }
             }
         }
+    }
+
+    #[cfg(cyxia_damage_regions)]
+    #[test]
+    fn panel_and_cursor_damage_cover_only_their_changed_pixels() {
+        let damage = [(0, 0, 1024, 32), (160, 430, 64, 64), (180, 440, 64, 64)];
+        let rgba = pixels();
+        for flipped in [false, true] {
+            let (count, rects, screen, visits) = collect(flipped, &damage);
+            assert_eq!(count, 3);
+            assert_eq!(rects, [(0, 0, 1024, 16), (0, 16, 1024, 16), (160, 430, 84, 74)]);
+            for (index, (actual, &count)) in screen.chunks_exact(4).zip(&visits).enumerate() {
+                let x = index % 1024;
+                let y = index / 1024;
+                let covered = y < 32 || ((160..244).contains(&x) && (430..504).contains(&y));
+                assert_eq!(count, u8::from(covered));
+                if covered {
+                    let source_y = if flipped { 767 - y } else { y };
+                    let at = (source_y * 1024 + x) * 4;
+                    assert_eq!(actual, [rgba[at + 2], rgba[at + 1], rgba[at], 0]);
+                } else {
+                    assert_eq!(actual, [255; 4]);
+                }
+            }
+        }
+    }
+
+    #[cfg(cyxia_damage_regions)]
+    #[test]
+    fn fragmented_damage_falls_back_to_a_complete_frame() {
+        let damage: Vec<_> = (0..17).map(|x| (x * 50, 80, 20, 10)).collect();
+        let (count, _, _, visits) = collect(false, &damage);
+        assert_eq!(count, 48);
+        assert!(visits.iter().all(|&count| count == 1));
     }
 
     #[test]

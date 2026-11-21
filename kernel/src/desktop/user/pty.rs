@@ -20,6 +20,13 @@ pub(super) fn with<T>(f: impl FnOnce(&mut Ptys) -> Result<T, Errno>) -> Result<T
     pool.clear_wakes();
     result
 }
+
+pub(super) fn poll(owner: u32, handle: u64) -> Result<u16, Errno> {
+    // SAFETY: CPU0 foreground serializes this snapshot with PTY mutations.
+    let pool = unsafe { &*core::ptr::addr_of!(PTYS) };
+    pool.poll(owner, handle)
+}
+
 pub(super) fn open_master(owner: u32, flags: u32) -> Result<u64, Errno> {
     let mut attempt = cyxia_ai_runtime::accounting::Attempt::default();
     let result = (|| {
