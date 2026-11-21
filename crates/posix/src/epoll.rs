@@ -18,6 +18,7 @@ pub const RDHUP: u32 = 0x2000;
 pub const ONESHOT: u32 = 1 << 30;
 pub const EDGE: u32 = 1 << 31;
 const SUPPORTED: u32 = IN | PRI | OUT | ERR | HUP | RDHUP | ONESHOT | EDGE;
+const _: () = assert!(OPEN_MAX <= u128::BITS as usize);
 
 #[derive(Clone, Copy)]
 struct Watch {
@@ -46,30 +47,60 @@ impl Watch {
     }
 }
 
+struct WatchSlots(u128);
+
+impl Iterator for WatchSlots {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let slot = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(slot)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Instance {
     pub(crate) used: bool,
     owner: u32,
     watches: [Option<Watch>; OPEN_MAX],
+    occupied: u128,
     cursor: usize,
 }
 impl Instance {
     fn readable(&self) -> bool {
-        self.watches.iter().flatten().any(Watch::deliverable)
+        self.live_slots()
+            .any(|slot| self.watches[slot].as_ref().is_some_and(Watch::deliverable))
     }
     pub(crate) const EMPTY: Self = Self {
         used: false,
         owner: 0,
         watches: [None; OPEN_MAX],
+        occupied: 0,
         cursor: 0,
     };
+    fn live_slots(&self) -> WatchSlots {
+        WatchSlots(self.occupied)
+    }
+    fn set_watch(&mut self, slot: usize, watch: Option<Watch>) {
+        self.watches[slot] = watch;
+        let bit = 1u128 << slot;
+        if watch.is_some() {
+            self.occupied |= bit;
+        } else {
+            self.occupied &= !bit;
+        }
+    }
     pub(crate) fn watch_count(&self) -> usize {
         self.watches.iter().flatten().count()
     }
     pub(crate) fn remove_description(&mut self, description: super::open_description::Handle) {
-        for watch in &mut self.watches {
-            if watch.is_some_and(|w| w.description == description) {
-                *watch = None;
+        for slot in self.live_slots() {
+            if self.watches[slot].is_some_and(|watch| watch.description == description) {
+                self.set_watch(slot, None);
             }
         }
     }
@@ -109,24 +140,29 @@ fn source(object: Object, owner: u32) -> Result<Source, Errno> {
 
 impl super::OpenDescriptions {
     /// The closure must only inspect the already borrowed backend pool. It must
-    /// not call another pool or reenter this OFD table. At most 256 watches.
+    /// not call another pool or reenter this OFD table. Empty watch slots need
+    /// no readiness work, even in an instance whose descriptor limit is large.
     pub fn observe_backend(&self, mut sample: impl FnMut(Source) -> Option<(u32, u32)>) {
         let mut table = self.inner.borrow_mut();
         let mut wakes = [false; super::open_description::EPOLLS];
         let super::open_description::Table {
-            entries, epolls, ..
+            entries,
+            epolls,
+            #[cfg(test)]
+            backend_slots_visited,
+            ..
         } = &mut *table;
         for (index, instance) in epolls
             .iter_mut()
             .enumerate()
             .filter(|(_, instance)| instance.used)
         {
-            for watch in instance
-                .watches
-                .iter_mut()
-                .flatten()
-                .filter(|watch| watch.armed)
-            {
+            for slot in instance.live_slots() {
+                #[cfg(test)]
+                backend_slots_visited.set(backend_slots_visited.get() + 1);
+                let Some(watch) = instance.watches[slot].as_mut().filter(|watch| watch.armed) else {
+                    continue;
+                };
                 let entry = &entries[watch.description.slot];
                 if entry.generation != watch.description.generation {
                     continue;
@@ -159,8 +195,10 @@ impl super::OpenDescriptions {
             .enumerate()
             .filter(|(_, instance)| instance.used)
         {
-            for watch in instance.watches.iter_mut().flatten() {
-                if watch.description == handle {
+            for slot in instance.live_slots() {
+                if let Some(watch) = &mut instance.watches[slot]
+                    && watch.description == handle
+                {
                     notifications[index] |= watch.observe(readiness, wakes);
                 }
             }
@@ -280,7 +318,7 @@ impl Process<'_> {
         {
             table.epoll_topology(Some((index, child)))?;
         }
-        table.epolls[index].watches[slot] = if op == 2 {
+        let watch = if op == 2 {
             None
         } else {
             Some(Watch {
@@ -293,6 +331,7 @@ impl Process<'_> {
                 observed: 0,
             })
         };
+        table.epolls[index].set_watch(slot, watch);
         if matches!(target, Object::Epoll(_)) && op != 3 {
             table.epoll_topology.set(None);
         }
@@ -436,6 +475,42 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
             Ok(bytes.len())
         }
+    }
+
+    #[test]
+    fn backend_observation_visits_only_live_watch_slots_after_deletion() {
+        let objects = crate::OpenDescriptions::new();
+        let mut fs = FileSystem::new();
+        let mut owner = Process::new(&objects, 1).unwrap();
+        let mut other = Process::new(&objects, 2).unwrap();
+        let epfd = owner.epoll_create(0).unwrap();
+        let targets: [i32; OPEN_MAX - 4] = core::array::from_fn(|slot| {
+            let fd = owner.eventfd(1, 0).unwrap();
+            owner
+                .epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data: slot as u64 })
+                .unwrap();
+            fd
+        });
+        owner.epoll_ctl(epfd, 2, targets[0], Event::default()).unwrap();
+        for &fd in &targets[1..targets.len() - 1] {
+            owner.close(&mut fs, fd).unwrap();
+        }
+        let other_epfd = other.epoll_create(0).unwrap();
+        let other_fd = other.eventfd(1, 0).unwrap();
+        other
+            .epoll_ctl(other_epfd, 1, other_fd, Event { events: IN, data: 999 })
+            .unwrap();
+
+        let source_readiness = |source| match source {
+            Source::Local { read, .. } => Ok(u32::from(read) * IN),
+            _ => panic!("expected a real eventfd watch"),
+        };
+        objects.observe_backend(|source| Some((source_readiness(source).unwrap(), 0)));
+        assert_eq!(objects.inner.borrow().backend_slots_visited.get(), 2);
+        let readiness = owner.epoll_sample(epfd, source_readiness).unwrap();
+        let mut events = [Event::default(); 1];
+        assert_eq!(owner.epoll_collect(epfd, &readiness, &mut events).unwrap(), 1);
+        assert_eq!(events[0], Event { events: IN, data: (targets.len() - 1) as u64 });
     }
 
     #[test]

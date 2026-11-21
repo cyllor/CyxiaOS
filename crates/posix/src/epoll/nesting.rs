@@ -54,8 +54,10 @@ impl Table {
         };
         for (index, instance) in self.epolls.iter().enumerate().filter(|(_, e)| e.used) {
             // Disarmed watches remain graph edges: MOD must not resurrect a cycle.
-            for watch in instance.watches.iter().flatten() {
-                if let Some(child) = self.nested_index(watch.description) {
+            for slot in instance.live_slots() {
+                if let Some(watch) = instance.watches[slot]
+                    && let Some(child) = self.nested_index(watch.description)
+                {
                     topology.children[index] |= 1 << child;
                 }
             }
@@ -111,10 +113,11 @@ impl Table {
         readiness: &mut [u32; OPEN_MAX],
     ) -> bool {
         let mut notified = false;
-        for (slot, ready) in readiness.iter_mut().enumerate() {
+        for slot in self.epolls[index].live_slots() {
             let Some(watch) = self.epolls[index].watches[slot] else {
                 continue;
             };
+            let ready = &mut readiness[slot];
             if let Some(child) = self.nested_index(watch.description) {
                 *ready = u32::from(self.epolls[child].readable()) * IN;
             }
@@ -132,7 +135,7 @@ impl Table {
             if topology.children[index] == 0 {
                 continue;
             }
-            for slot in 0..OPEN_MAX {
+            for slot in self.epolls[index].live_slots() {
                 let Some(watch) = self.epolls[index].watches[slot] else {
                     continue;
                 };

@@ -67,6 +67,8 @@ pub(crate) struct Table {
     pub(crate) topology_builds: core::cell::Cell<usize>,
     #[cfg(test)]
     pub(crate) nested_lookups: core::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) backend_slots_visited: core::cell::Cell<usize>,
     pub(crate) inotifies: [super::inotify::Instance; super::inotify::GLOBAL_INSTANCES],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +108,8 @@ impl OpenDescriptions {
                 topology_builds: core::cell::Cell::new(0),
                 #[cfg(test)]
                 nested_lookups: core::cell::Cell::new(0),
+                #[cfg(test)]
+                backend_slots_visited: core::cell::Cell::new(0),
                 inotifies: [super::inotify::Instance::EMPTY; super::inotify::GLOBAL_INSTANCES],
             }),
         }
