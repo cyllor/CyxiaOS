@@ -5,9 +5,15 @@ use crate::Errno;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGES: usize = 4096;
+#[cfg(not(feature = "cosmic-applets-v1"))]
 pub const OBJECTS: usize = 16;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const OBJECTS: usize = 32;
 pub const OBJECT_PAGES: usize = 2048;
+#[cfg(not(feature = "cosmic-applets-v1"))]
 pub const MAPPINGS: usize = 16;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const MAPPINGS: usize = 32;
 pub const BASE: u64 = 0x0600_0000;
 pub const END: u64 = BASE + (PAGES * PAGE_SIZE) as u64;
 pub const SEAL_SEAL: u32 = 1;

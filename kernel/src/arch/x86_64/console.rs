@@ -1,6 +1,9 @@
 use super::*;
 
 static mut SERIAL: Option<pc::hardware::Serial16550> = None;
+#[cfg(feature = "os-runtime")]
+static mut OUTPUT: cyxia_kernel_core::console::OutputQueue<{ 128 * 1024 }> =
+    cyxia_kernel_core::console::OutputQueue::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn log(payload: &[u8]) {
     #[cfg(feature = "os-runtime")]
@@ -25,6 +28,8 @@ pub(crate) fn log(payload: &[u8]) {
 
 pub(crate) fn exit(success: bool) -> ! {
     arch::cpu::disable_interrupts();
+    #[cfg(feature = "os-runtime")]
+    let _ = flush_logs(128 * 1024);
     unsafe { arch::io::outl(0xf4, if success { 0x10 } else { 0x11 }) };
     arch::cpu::halt()
 }
@@ -72,17 +77,20 @@ pub(crate) unsafe fn init() {
 
 #[cfg(feature = "os-runtime")]
 pub(crate) fn try_log(bytes: &[u8]) -> Result<(), cyxia_contracts::PlatformError> {
-    use cyxia_contracts::{ConsoleOps, PlatformError};
-    // CPU0 alone owns the serial object; hardware handlers and AP panic never
-    // borrow it. A partial raw write is terminal to this caller's operation.
+    // CPU0 alone enqueues. IRQ handlers and AP panic never borrow this queue.
+    // Acceptance is atomic; only the foreground drain touches the UART.
+    unsafe { (&mut *core::ptr::addr_of_mut!(OUTPUT)).enqueue(bytes) }
+}
+#[cfg(feature = "os-runtime")]
+pub(crate) fn log_pending() -> usize {
+    unsafe { (&*core::ptr::addr_of!(OUTPUT)).pending() }
+}
+#[cfg(feature = "os-runtime")]
+pub(crate) fn flush_logs(budget: usize) -> Result<usize, cyxia_contracts::PlatformError> {
+    use cyxia_contracts::PlatformError;
     let serial =
         unsafe { (&mut *core::ptr::addr_of_mut!(SERIAL)).as_mut() }.ok_or(PlatformError::Again)?;
-    for chunk in bytes.chunks(64) {
-        if serial.try_write(chunk)? != chunk.len() {
-            return Err(PlatformError::Again);
-        }
-    }
-    Ok(())
+    unsafe { (&mut *core::ptr::addr_of_mut!(OUTPUT)).drain(serial, budget) }
 }
 #[cfg(feature = "os-runtime")]
 pub(crate) fn try_read() -> Result<Option<u8>, cyxia_contracts::PlatformError> {

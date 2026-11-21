@@ -26,15 +26,16 @@ def ink(raw, bounds):
                for y in range(y1, y2) for x in range(x1, x2))
 
 
-def shared_state(console):
-    at = console.command('ai system')
-    console.until(rb'AI_SYSTEM_END\r?\n', at)
+def shared_state(console, compact=False):
+    at = console.command('ai objects' if compact else 'ai system')
+    console.until(rb'AI_OBJECTS_END\r?\n' if compact else rb'AI_SYSTEM_END\r?\n', at)
     rows = re.findall(rb'^SHARED_OBJECTS ([^\r\n]+)', console.raw[at:], re.MULTILINE)
     pc.require(len(rows) == 1, 'Missing actual live shared-object receipt')
     return {key.decode(): int(value) for key, value in re.findall(rb'(\w+)=(\d+)', rows[0])}
 
 
-def interaction(console, qmp, output):
+def interaction(console, qmp, output, expected_panel_children=1, compact_objects=False):
+    read_shared = lambda console: shared_state(console, compact=compact_objects)
     result = dict(status='FAIL', scope='eventual_calendar_pixels_two_cycles_and_original_process_liveness',
                   clock_rendered_verified=False,
                   semantic_frame_verified=False, cosmic_session_verified=False, full_os_verified=False)
@@ -48,9 +49,9 @@ def interaction(console, qmp, output):
     children = [int(p) for p, parent, _ in statuses if int(parent) == 6]
     result.update(core_children_alive={2, 3, 4, 5, 6} <= active, panel_children=children,
                   glyph_candidate=result['clock_glyph_candidate_pixels'] >= 100)
-    if not (result['core_children_alive'] and len(children) == 1 and result['glyph_candidate']):
+    if not (result['core_children_alive'] and len(children) == expected_panel_children and result['glyph_candidate']):
         return result
-    result['shared_before_input'] = shared_state(console)
+    result['shared_before_input'] = read_shared(console)
     input_start = len(console.raw)
     # The only installed applet is the unchanged upstream center clock. Mouse
     # input travels through QEMU's actual input device and guest compositor.
@@ -98,18 +99,18 @@ def interaction(console, qmp, output):
     # original 15-second interaction check pass. The boot gate is also unchanged.
     result['calendar_open'] = capture_until('calendar-open.ppm', lambda pixels: pixels >= 500, 120, True)
     if result['calendar_open']['matched']:
-        result['shared_calendar_open'] = shared_state(console)
+        result['shared_calendar_open'] = read_shared(console)
         click()
         result['calendar_closed'] = capture_until('calendar-closed.ppm', lambda pixels: pixels < 100)
         if result['calendar_closed']['matched']:
-            result['shared_calendar_closed'] = shared_state(console)
+            result['shared_calendar_closed'] = read_shared(console)
             click()
             result['calendar_reopened'] = capture_until('calendar-reopened.ppm', lambda pixels: pixels >= 500, 120, True)
             if result['calendar_reopened']['matched']:
                 click()
                 result['calendar_closed_again'] = capture_until('calendar-closed-again.ppm', lambda pixels: pixels < 100)
-                result['shared_after_second_close'] = shared_state(console)
-    result['shared_after_input'] = shared_state(console)
+                result['shared_after_second_close'] = read_shared(console)
+    result['shared_after_input'] = read_shared(console)
     result['all_interactions_within_15_seconds'] = all(
         result.get(name, {}).get('within_deadline', False)
         for name in ('calendar_open', 'calendar_closed', 'calendar_reopened', 'calendar_closed_again'))

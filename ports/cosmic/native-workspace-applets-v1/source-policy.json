@@ -1,0 +1,42 @@
+{
+  "kind": "cosmic-workspace-applets-v1",
+  "commit": "406d1b7d627138fdf4078f654268d3d8774e50f1",
+  "parent_policy_sha256": "36763cbbfed108955f6b7582cf5a6cb8fd2a7968161b00e1034996907d2171b7",
+  "before": {
+    "cosmic-applet-workspaces/Cargo.toml": "5d070d525032aa48ceb124a89820fe8b4c74ca3e36d588538ae217ed50c0ef2f",
+    "cosmic-applet-tiling/Cargo.toml": "3db4aa0afffe6149c2e510d8886f39f4f665eb8f6866ab3546030c46a33893d2",
+    "Cargo.lock": "0f6b9233f9f8cf33af3936ad709a85fab013a53b47b3c69b2b980566fe513222"
+  },
+  "after": {
+    "cosmic-applet-workspaces/Cargo.toml": "9488c40bb6392132998fa3356e98b2e5c3ec9b72075e46865b8ba7c46305e208",
+    "cosmic-applet-tiling/Cargo.toml": "5a4b6d77ec0ed1de645ec7709542802e19d089db6ac4a5e8069c1758c1ebcfec",
+    "Cargo.lock": "a6587132d85d92cfbea34ac25698e95b681467d59d1e474517249089388db145"
+  },
+  "patch_sha256": "cc1cd4d34cc4d9d69d5108d922862bf1dfa64f64529bf1e75d5b0fcd77fc0ccd",
+  "native_sdk_extension": {
+    "path": "native-input-sdk-origin.json",
+    "sha256": "7258bd2069de580a8c4298e0e84f8a47a70ed55623326e81d64b2d4fdd85370f"
+  },
+  "additional_native_licenses": [
+    {
+      "path": "native-input-port/sources/libinput-1.29.0.tar.gz/libinput-1.29.0/COPYING",
+      "destination": "usr/share/doc/libinput/COPYING",
+      "sha256": "80de50b2022a840db044c56db804ca3565600a692c0714babface587acc6d1b0"
+    },
+    {
+      "path": "native-input-port/sources/eudev-3.2.15.tar.gz/eudev-3.2.15/COPYING",
+      "destination": "usr/share/doc/libudev/COPYING",
+      "sha256": "ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6"
+    },
+    {
+      "path": "native-input-port/sources/libevdev-1.13.4.tar.xz/libevdev-1.13.4/COPYING",
+      "destination": "usr/share/doc/libevdev/COPYING",
+      "sha256": "6f13de7ce28e4948ba95170e0723ee1254c1978ce1f127af82aeca597b567cb9"
+    },
+    {
+      "path": "native-input-port/sources/mtdev-1.1.7.tar.bz2/mtdev-1.1.7/COPYING",
+      "destination": "usr/share/doc/libmtdev/COPYING",
+      "sha256": "795bfe74daae59a97d3a0c8ec0ba0f08c243adf94a3aa7981a4136fce31d55b4"
+    }
+  ]
+}

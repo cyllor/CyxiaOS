@@ -1,0 +1,810 @@
+{
+  "schema": 1,
+  "scope": "Original Epoch tiling and optional workspace-list applets; bounded native profile, not full COSMIC acceptance",
+  "upstream_applets_commit": "406d1b7d627138fdf4078f654268d3d8774e50f1",
+  "workspace_members": 19,
+  "metadata_packages": 637,
+  "guest_ram_mib": 1024,
+  "guest_cpus": 4,
+  "full_os_verified": false,
+  "cosmic_session_verified": false,
+  "semantic_frame_verified": false,
+  "build_receipts": [
+    {
+      "path": "artifacts/v017-cosmic-input-sdk-v3/native-input-sdk-origin.json",
+      "bytes": 13496,
+      "sha256": "7258bd2069de580a8c4298e0e84f8a47a70ed55623326e81d64b2d4fdd85370f"
+    },
+    {
+      "path": "artifacts/v017-workspace-applets-build-v6/build-report.json",
+      "bytes": 13340613,
+      "sha256": "0d063081aee1b7b714c4754a0de593afbf0266a333f85d935894d6648ffb62c8"
+    },
+    {
+      "path": "artifacts/v017-session-applet-host-build-v1/build-report.json",
+      "bytes": 308038,
+      "sha256": "9fef9ad2b6f3731588227c1d2638d39831ee3efd17144c81a9d602eac08dee53"
+    },
+    {
+      "path": "artifacts/v017-panel-applet-host-build-v2/build-report.json",
+      "bytes": 9390193,
+      "sha256": "5d92bff076df75f2ba813832b6291ea3f597557aa5d0ab3c2b3d37f7ca9d953e"
+    },
+    {
+      "path": "artifacts/v017-workspace-applets-mesa-relink-v2/relink-report.json",
+      "bytes": 15237,
+      "sha256": "2cb24c92f36fb973e3b68e6c4c768b88c3eee861b4a2e0ed998de0c661825200"
+    },
+    {
+      "path": "artifacts/v017-workspace-state-probe-v2/workspace-probe-origin.json",
+      "bytes": 22592,
+      "sha256": "a13987d56f2a1f55715dbc97437853ba9c6966ffa1bdef36575aeb4a029271c2"
+    },
+    {
+      "path": "artifacts/v017-workspace-applets-catalog-v5/cosmic-workspace-applets-origin.json",
+      "bytes": 43099,
+      "sha256": "530a48fc21b5590c7c30a2f7201e53edf52100f094e5980b13e108574a17120e"
+    },
+    {
+      "path": "artifacts/v017-workspace-applets-optional-catalog-v4/optional-workspace-user-config-origin.json",
+      "bytes": 19925,
+      "sha256": "61a1c81756497663172e0be58896be1fad5295053ff50ca511188cae16cfdfcc"
+    }
+  ],
+  "source_policies": [
+    {
+      "path": "ports/cosmic/native-workspace-applets-v1/source-policy.json",
+      "bytes": 2069,
+      "sha256": "39c353bc10e9a7f88f3deb63947987abfe400d7fdcecd5542b41782e414cd55b"
+    },
+    {
+      "path": "ports/cosmic/native-applet-hosts-v1/source-policy.json",
+      "bytes": 1634,
+      "sha256": "754e49144f991e91e2198e0d31f2ab07537f6b20eb126ac0eba10094ef1f6d98"
+    },
+    {
+      "path": "ports/cosmic/native-popup-input-v1/source-policy.json",
+      "bytes": 1294,
+      "sha256": "6c92ad8a1b4ac3945f53c1161e5c4afce4ef2dc84c90e7e8db6be5132d02bfd3"
+    }
+  ],
+  "native_images": {
+    "cosmic-applet-tiling": {
+      "path": "artifacts/v017-workspace-applets-catalog-v5/cosmic-applet-tiling.elf",
+      "bytes": 24483120,
+      "sha256": "bb7667c342a99d89182a2a3f27c649d07b46edee9688dcf1df2e6dbf5ded212b"
+    },
+    "cosmic-applet-workspaces": {
+      "path": "artifacts/v017-workspace-applets-catalog-v5/cosmic-applet-workspaces.elf",
+      "bytes": 23585376,
+      "sha256": "b774c00a1f272fe578150e8fdf2533b5215e79caa7619251d7b00bc5d099add2"
+    },
+    "cosmic-session": {
+      "path": "artifacts/v017-workspace-applets-catalog-v5/cosmic-session.elf",
+      "bytes": 5313136,
+      "sha256": "80b6395435def1c8f32090639122a01be8c98b5c5b0fa805cd54955d02d3d408"
+    },
+    "cosmic-panel": {
+      "path": "artifacts/v017-workspace-applets-catalog-v5/cosmic-panel.elf",
+      "bytes": 33682168,
+      "sha256": "bc706eaa32525ab3ec3e5a16ee9c5f9fab7f085ae447cd6682607e6a356b1175"
+    }
+  },
+  "catalog": {
+    "inputs": 147,
+    "raw_bytes": 204723970,
+    "added_inputs": 18,
+    "replaced_inputs": [
+      "cosmic-panel.elf",
+      "cosmic-session.elf",
+      "rootfs/etc/dbus-1/session.conf"
+    ],
+    "other_original_inputs_preserved": true
+  },
+  "final_images": [
+    {
+      "manifest": {
+        "path": "artifacts/v017-os-workspace-applets-1g-v14/build-manifest.json",
+        "bytes": 198963,
+        "sha256": "1eb97481bc66e85f4876276369015721a428ce05d5dcfc477e7b38df6cbf013e"
+      },
+      "artifacts": {
+        "boot.bin": "0c4caf191fe0b0654adfd5b270955389143bd5f398db87ad3ed86cb8ef95e7ad",
+        "kernel.elf": "6e908358b5b8a92b80a5b204b99f1d242d3ca94be575d1d3e627a01dd9228416"
+      },
+      "earlier_manifest": {
+        "path": "artifacts/v017-os-workspace-applets-1g-v12/build-manifest.json",
+        "bytes": 198963,
+        "sha256": "3ba63907078b82f63f4d01fe32eb15f3eb0cd159b434cf4966d3dd872c6a955b"
+      },
+      "kernel_and_boot_byte_identical": true,
+      "reason": "Only the port README changed in the OS source closure; final binary identities match captured images"
+    },
+    {
+      "manifest": {
+        "path": "artifacts/v017-os-workspace-applets-1g-v15/build-manifest.json",
+        "bytes": 199117,
+        "sha256": "beffe9abd6748f1ce7441a294f72f7f76e6230fea76a330f6b6734ffb5abe99a"
+      },
+      "artifacts": {
+        "boot.bin": "bde1be471c6e7bdf2389911eaaab72e44f36418cfe37ef9d3a37c8b55de41372",
+        "kernel.elf": "dc38fe2f78f63ad3cfc37c527fea01c31422318f7a35a268db6cd4b596b7824f"
+      },
+      "earlier_manifest": {
+        "path": "artifacts/v017-os-workspace-applets-1g-v13/build-manifest.json",
+        "bytes": 199117,
+        "sha256": "c1ca9d7832da299dd3e8da0e57f5a8b8bf93785925b75485e75786fe2881f3e5"
+      },
+      "kernel_and_boot_byte_identical": true,
+      "reason": "Only the port README changed in the OS source closure; final binary identities match captured images"
+    }
+  ],
+  "captures": [
+    {
+      "name": "v017-workspace-tiling-1g-v9",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v9/result.json",
+          "bytes": 26501,
+          "sha256": "b9f40e0e215d84a5e54a9318e1f50a11735f7603d466d5724689a368b2db3535"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v9/workspace-result.json",
+          "bytes": 22914,
+          "sha256": "26b1fbf0e9abcfb338082de2b7f1a00a29babf3cab6fa18d8aff26d1a889e2c2"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v9/workspace-qmp.json",
+          "bytes": 80249,
+          "sha256": "996787c2928655e56231338677af334dc33732a9156c1992e8fc57f3ac13aacd"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v9/interaction-producers.json",
+          "bytes": 4666,
+          "sha256": "1b2c0e5df6ba147afb5c8ae476a03fdfc3ccc7c53c1dec03e8b6cd5a348a0dd5"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v9/serial.raw",
+          "bytes": 107193,
+          "sha256": "df3cd4e2a72ca874ce6490f8db39941c5fae76cb1af55674d7277851e9a61c81"
+        }
+      ],
+      "status": "PASS",
+      "functional_status": "PASS",
+      "controls_status": "PASS",
+      "all_actions_within_15_seconds": true,
+      "panel_children": [
+        7,
+        8
+      ],
+      "boot_scanout_replaced": true,
+      "opening_gesture": "press_until_original_popup_present_then_release",
+      "open_pressed_seconds": [
+        6.486,
+        4.9
+      ],
+      "action_elapsed_seconds": {
+        "repeat_tiling_changed": 4.243,
+        "repeat_tiling_open": 5.793,
+        "repeat_tiling_restored": 2.964,
+        "tiling_changed": 4.795,
+        "tiling_open": 7.363,
+        "tiling_recovery": 5.75,
+        "tiling_restored": 2.817
+      },
+      "repeat_recovery": {
+        "deadline_seconds": 15,
+        "elapsed_seconds": 5.464,
+        "gesture": "press_parent_icon_until_hidden_then_release",
+        "matched": true,
+        "observation_limit_seconds": 60,
+        "observations": [
+          {
+            "description_refs": 17,
+            "free_pages": 3976,
+            "grant_reserved": 0,
+            "grant_used": 120,
+            "mapping_refs": 30,
+            "mappings": 30,
+            "metadata_capacity": 32,
+            "objects": 17,
+            "page_capacity": 4096,
+            "pages": 120
+          }
+        ],
+        "popup_hidden": true,
+        "pressed_seconds": 4.327,
+        "resource_comparison": {
+          "baseline_equal": true,
+          "deltas": {
+            "description_refs": 0,
+            "free_pages": 0,
+            "grant_reserved": 0,
+            "grant_used": 0,
+            "mapping_refs": 0,
+            "mappings": 0,
+            "metadata_capacity": 0,
+            "objects": 0,
+            "page_capacity": 0,
+            "pages": 0
+          },
+          "nonincreasing": true,
+          "rule": "each_usage_nonincreasing_free_pages_nondecreasing_capacity_unchanged",
+          "same_fields": true,
+          "valid_counters": true
+        },
+        "scanout": {
+          "path": "repeat-tiling-closed.ppm",
+          "sha256": "754a4d9261c17bf5cf8ac08d3e170be3d2a6cb94fc98e1171a8804caeddf95ee"
+        },
+        "within_deadline": true
+      },
+      "calendar_elapsed_seconds": {
+        "calendar_closed": 14.876,
+        "calendar_closed_again": 14.897,
+        "calendar_open": 7.196,
+        "calendar_reopened": 6.069
+      },
+      "shared_before": {
+        "description_refs": 17,
+        "free_pages": 3976,
+        "grant_reserved": 0,
+        "grant_used": 120,
+        "mapping_refs": 30,
+        "mappings": 30,
+        "metadata_capacity": 32,
+        "objects": 17,
+        "page_capacity": 4096,
+        "pages": 120
+      },
+      "shared_after_tiling": {
+        "description_refs": 17,
+        "free_pages": 3976,
+        "grant_reserved": 0,
+        "grant_used": 120,
+        "mapping_refs": 30,
+        "mappings": 30,
+        "metadata_capacity": 32,
+        "objects": 17,
+        "page_capacity": 4096,
+        "pages": 120
+      },
+      "final_stricter_popup_hidden_and_no_growth_postconditions": true,
+      "complete_teardown": {
+        "anonymous_used": 0,
+        "open_descriptions": 0,
+        "shared": {
+          "description_refs": 0,
+          "free_pages": 4096,
+          "grant_reserved": 0,
+          "grant_used": 0,
+          "mapping_refs": 0,
+          "mappings": 0,
+          "metadata_capacity": 32,
+          "objects": 0,
+          "page_capacity": 4096,
+          "pages": 0
+        },
+        "unix": {
+          "connections": 64,
+          "endpoints": 128,
+          "free_bindings": 126,
+          "free_connections": 64,
+          "free_endpoints": 128
+        }
+      },
+      "shared_admission": {
+        "shared_mappings": {
+          "ai": 74,
+          "approved": 74,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 74,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 74,
+          "granted": 74,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8204,
+          "proposals": 74,
+          "release_units": 74,
+          "released": 74,
+          "requests": 74,
+          "returns": 0
+        },
+        "shared_objects": {
+          "ai": 40,
+          "approved": 40,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 40,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 40,
+          "granted": 40,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8203,
+          "proposals": 40,
+          "release_units": 40,
+          "released": 40,
+          "requests": 40,
+          "returns": 0
+        },
+        "shared_pages": {
+          "ai": 61,
+          "approved": 61,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 133,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 3361,
+          "granted": 3361,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8194,
+          "proposals": 61,
+          "release_units": 3361,
+          "released": 3361,
+          "requests": 133,
+          "returns": 0
+        }
+      }
+    },
+    {
+      "name": "v017-workspace-list-1g-v10",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-list-1g-v10/result.json",
+          "bytes": 29239,
+          "sha256": "87502356872ac772dae994a6fb2bee7d70af96c4e6e769a10da32a8650894c06"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v10/workspace-result.json",
+          "bytes": 25441,
+          "sha256": "20bcb928d19673a36a87f087a57f3a4d3454356e9da1077d5ef17dd396ff9950"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v10/workspace-qmp.json",
+          "bytes": 96724,
+          "sha256": "b3774c0dd4278ba6259e05cffec2d6c93307ddaaa6d042575f7f252af04ade3f"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v10/interaction-producers.json",
+          "bytes": 4666,
+          "sha256": "0fa18afda78d8e3fb87445a56d3c300290bc5b084716af79f5599af8d1dacf94"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v10/serial.raw",
+          "bytes": 122953,
+          "sha256": "16256f2a73817b26f816a43c385b329bfd7e3383163a1e512c9b96a7cfe5f4bd"
+        }
+      ],
+      "status": "FAIL",
+      "functional_status": "PASS",
+      "controls_status": "PASS",
+      "all_actions_within_15_seconds": false,
+      "panel_children": [
+        7,
+        8,
+        9
+      ],
+      "boot_scanout_replaced": true,
+      "opening_gesture": "press_until_original_popup_present_then_release",
+      "open_pressed_seconds": [
+        8.362,
+        7.103
+      ],
+      "action_elapsed_seconds": {
+        "repeat_tiling_changed": 4.947,
+        "repeat_tiling_open": 7.987,
+        "repeat_tiling_restored": 6.567,
+        "tiling_changed": 6.243,
+        "tiling_open": 9.249,
+        "tiling_recovery": 4.13,
+        "tiling_restored": 5.826,
+        "workspace_changed": 3.125,
+        "workspace_restored": 4.916
+      },
+      "repeat_recovery": {
+        "deadline_seconds": 15,
+        "elapsed_seconds": 5.165,
+        "gesture": "press_parent_icon_until_hidden_then_release",
+        "matched": true,
+        "observation_limit_seconds": 60,
+        "observations": [
+          {
+            "description_refs": 22,
+            "free_pages": 3971,
+            "grant_reserved": 0,
+            "grant_used": 125,
+            "mapping_refs": 40,
+            "mappings": 40,
+            "metadata_capacity": 32,
+            "objects": 22,
+            "page_capacity": 4096,
+            "pages": 125
+          }
+        ],
+        "popup_hidden": true,
+        "pressed_seconds": 4.038,
+        "resource_comparison": {
+          "baseline_equal": true,
+          "deltas": {
+            "description_refs": 0,
+            "free_pages": 0,
+            "grant_reserved": 0,
+            "grant_used": 0,
+            "mapping_refs": 0,
+            "mappings": 0,
+            "metadata_capacity": 0,
+            "objects": 0,
+            "page_capacity": 0,
+            "pages": 0
+          },
+          "nonincreasing": true,
+          "rule": "each_usage_nonincreasing_free_pages_nondecreasing_capacity_unchanged",
+          "same_fields": true,
+          "valid_counters": true
+        },
+        "scanout": {
+          "path": "repeat-tiling-closed.ppm",
+          "sha256": "f3b0af18634bdadd84c8dd373728e0753c17a58274147bf6d25ba791b3e924a4"
+        },
+        "within_deadline": true
+      },
+      "calendar_elapsed_seconds": {
+        "calendar_closed": 22.691,
+        "calendar_closed_again": 19.9,
+        "calendar_open": 7.698,
+        "calendar_reopened": 7.161
+      },
+      "shared_before": {
+        "description_refs": 22,
+        "free_pages": 3971,
+        "grant_reserved": 0,
+        "grant_used": 125,
+        "mapping_refs": 40,
+        "mappings": 40,
+        "metadata_capacity": 32,
+        "objects": 22,
+        "page_capacity": 4096,
+        "pages": 125
+      },
+      "shared_after_tiling": {
+        "description_refs": 22,
+        "free_pages": 3971,
+        "grant_reserved": 0,
+        "grant_used": 125,
+        "mapping_refs": 40,
+        "mappings": 40,
+        "metadata_capacity": 32,
+        "objects": 22,
+        "page_capacity": 4096,
+        "pages": 125
+      },
+      "final_stricter_popup_hidden_and_no_growth_postconditions": true,
+      "complete_teardown": {
+        "anonymous_used": 0,
+        "open_descriptions": 0,
+        "shared": {
+          "description_refs": 0,
+          "free_pages": 4096,
+          "grant_reserved": 0,
+          "grant_used": 0,
+          "mapping_refs": 0,
+          "mappings": 0,
+          "metadata_capacity": 32,
+          "objects": 0,
+          "page_capacity": 4096,
+          "pages": 0
+        },
+        "unix": {
+          "connections": 64,
+          "endpoints": 128,
+          "free_bindings": 126,
+          "free_connections": 64,
+          "free_endpoints": 128
+        }
+      },
+      "shared_admission": {
+        "shared_mappings": {
+          "ai": 94,
+          "approved": 94,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 94,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 94,
+          "granted": 94,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8204,
+          "proposals": 94,
+          "release_units": 94,
+          "released": 94,
+          "requests": 94,
+          "returns": 0
+        },
+        "shared_objects": {
+          "ai": 46,
+          "approved": 46,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 46,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 46,
+          "granted": 46,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8203,
+          "proposals": 46,
+          "release_units": 46,
+          "released": 46,
+          "requests": 46,
+          "returns": 0
+        },
+        "shared_pages": {
+          "ai": 71,
+          "approved": 71,
+          "cancelled": 0,
+          "capacity": 0,
+          "committed": 143,
+          "denied": 0,
+          "elapsed_ms": 0,
+          "enters": 0,
+          "failed": 0,
+          "grant_units": 3388,
+          "granted": 3388,
+          "guard": 0,
+          "invalid": 0,
+          "last_errno": 0,
+          "last_model": 8194,
+          "proposals": 71,
+          "release_units": 3388,
+          "released": 3388,
+          "requests": 143,
+          "returns": 0
+        }
+      }
+    }
+  ],
+  "native_smoke": {
+    "receipts": [
+      {
+        "path": "artifacts/v017-workspace-native-1g-v2/summary.json",
+        "bytes": 7991,
+        "sha256": "3fd30aa7278901f07a073270098f1842499f8460377ba4795874066e24216c8c"
+      },
+      {
+        "path": "artifacts/v017-workspace-native-1g-v2/serial.raw",
+        "bytes": 5277,
+        "sha256": "dd0dbfe31633f1bb3beb6a5bf928a4a19962e11160a8e85b0fa37ac1952dd38d"
+      },
+      {
+        "path": "artifacts/v017-workspace-native-1g-v2/qmp.json",
+        "bytes": 11987,
+        "sha256": "504e90361cc5c633a762a02d7c0b5f9e36598664f08360f2b4dd7c4fde497c51"
+      }
+    ],
+    "status": "OS_NATIVE_PASS",
+    "native_preemption": {
+      "pid": 3,
+      "preemptions": 1,
+      "source": "syscall-free spin"
+    },
+    "full_os_verified": false,
+    "cosmic_session_verified": false
+  },
+  "host_checks": [
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/mapping-posix-new.log",
+        "bytes": 19561,
+        "sha256": "9ea73130b87b4f25dd02e00cd3d12baaaaa95074a2199a39ee9c264072add7f6"
+      },
+      "passed": 215,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/mapping-posix-legacy.log",
+        "bytes": 19391,
+        "sha256": "c388c739b5185ad704cfcea5e82003d60c24744c2cb2b91662ed215f0892131e"
+      },
+      "passed": 213,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/mapping-ai-new.log",
+        "bytes": 4811,
+        "sha256": "4909fcf62f5c3fd58dc90aa124bc27c54fff78df0cec73785b054cc04f148015"
+      },
+      "passed": 56,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/mapping-ai-legacy.log",
+        "bytes": 4811,
+        "sha256": "ba6754e5aabf39a04437c0a0357e64271de6f59800b9cc8ccad6ad05504c4e3f"
+      },
+      "passed": 56,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/compact-shell-green.log",
+        "bytes": 1591,
+        "sha256": "6a4370e855114c3295349c52c174c81a493ea96a2d69ab3b1a0758daf956c1dd"
+      },
+      "passed": 15,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/console-backpressure-green.log",
+        "bytes": 2471,
+        "sha256": "7d146e112ac8c751e2bcc4a72188db1048012edbdca88684ac4cbeaf1fd9125d"
+      },
+      "passed": 20,
+      "scope": "related selected checks; not whole-repository CI"
+    },
+    {
+      "receipt": {
+        "path": "artifacts/debug/cosmic-workspace-applets-20261121/final-workspace-tools-green.log",
+        "bytes": 10687,
+        "sha256": "a7907fabb62aa6d3ebfc85570da5073d661f8be8bb9f057b974b2c9864e67853"
+      },
+      "passed": 63,
+      "scope": "related selected checks; not whole-repository CI"
+    }
+  ],
+  "historical_failures_retained": [
+    {
+      "name": "v017-workspace-tiling-1g-v3",
+      "note": "Real shared mapping admission failure and child 139",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v3/result.json",
+          "bytes": 15273,
+          "sha256": "22a1e8e8a7b2bc642a785444ca26b491e681ea5f3a32a7ddfe2ae0520736c043"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v3/workspace-result.json",
+          "bytes": 12913,
+          "sha256": "da3e7bc7d969d93b2f476075a6f62cb8ff5932746a729c437068431b335fe0fa"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v3/serial.raw",
+          "bytes": 164138,
+          "sha256": "0ac5d498a49e5b6d6163ed3e53313046efb1125e20bc8867b97d1722b62f75cc"
+        }
+      ]
+    },
+    {
+      "name": "v017-workspace-tiling-1g-v6",
+      "note": "Serial snapshot truncated; no final teardown verdict",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v6/result.json",
+          "bytes": 1316,
+          "sha256": "f7a08eac81ae03a8b279b19f10a0f3420baf995c91df97f8bf603c984ae3c22c"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v6/serial.raw",
+          "bytes": 75060,
+          "sha256": "efb99fa72ac752a4478a581178ebb3fd22ed947f3b9529a2875863b3048fdf04"
+        }
+      ]
+    },
+    {
+      "name": "v017-workspace-tiling-1g-v8",
+      "note": "Calendar close exceeded 15 seconds",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v8/result.json",
+          "bytes": 12173,
+          "sha256": "81720f1643aaa18761603998b6f5b628a280e8faba556b7125a48be3297f8209"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v8/workspace-result.json",
+          "bytes": 10271,
+          "sha256": "9c7132853c127b9231dd6bd4f1ace94aa07376fe4958e8e39140b6d62a0cf580"
+        },
+        {
+          "path": "artifacts/v017-workspace-tiling-1g-v8/serial.raw",
+          "bytes": 102841,
+          "sha256": "7c48cf89dba168891695ce422436a0392f5ad02e391ce6b89e0aedfa02458000"
+        }
+      ]
+    },
+    {
+      "name": "v017-workspace-list-1g-v4",
+      "note": "Popup was not verified open; cannot prove repeated lifecycle",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-list-1g-v4/result.json",
+          "bytes": 42219,
+          "sha256": "33ee0bbac53cdaa293349fb1ea6ccc2890eb7c7cac57699e8a5859061fe168d2"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v4/workspace-result.json",
+          "bytes": 37077,
+          "sha256": "d61c353b9bf2beb6cb398cce1578bd50b11dc95a2c8588056a2e5da949fefa22"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v4/serial.raw",
+          "bytes": 164431,
+          "sha256": "7551cea8722316b3fea29749e7654d35527a0569c6d0a750da37e735d8fe56ef"
+        }
+      ]
+    },
+    {
+      "name": "v017-workspace-list-1g-v8",
+      "note": "Escape did not close popup; bounded capture stopped",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-list-1g-v8/result.json",
+          "bytes": 1335,
+          "sha256": "5e2076871622a48fe92a8a406ae90e61c12d14040dd78947804d3b55aaca03ba"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v8/serial.raw",
+          "bytes": 119126,
+          "sha256": "a48b0c0061ee25fcd092e99993683276d61c8dcd9fa8cf03dc06832449be045f"
+        }
+      ]
+    },
+    {
+      "name": "v017-workspace-list-1g-v9",
+      "note": "Exact-equality oracle rejected a real release; original FAIL retained",
+      "receipts": [
+        {
+          "path": "artifacts/v017-workspace-list-1g-v9/result.json",
+          "bytes": 61333,
+          "sha256": "d4cb532966b08118af5825cd7e56b01beed5cb2c12b1283bcfe1c0c3f9bb4cbd"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v9/workspace-result.json",
+          "bytes": 55093,
+          "sha256": "2570b34d0165ddc94f708b9851f743f84f1eebad2cd88ca63598b4326af519e4"
+        },
+        {
+          "path": "artifacts/v017-workspace-list-1g-v9/serial.raw",
+          "bytes": 347498,
+          "sha256": "4dbcfd5790ac262db8d543a009232dce3e43dcf74f79e756f47557db8764e2e1"
+        }
+      ]
+    }
+  ],
+  "remaining_limits": [
+    "Ordinary short click is not verified; popup opening uses a long press until the actual frame appears",
+    "Optional three-applet calendar closes exceeded 15 seconds; default two-applet PASS is one capture, not stable latency certification",
+    "Nine required main programs and remaining default applets still missing or unverified",
+    "Workspace list is distinct from the default overview button and cosmic-workspaces main program",
+    "Two persistent socket filesystem names remain after all live endpoint/connection objects are released",
+    "Native input SDK build does not prove Linux device, sysfs or netlink support",
+    "Raw artifacts are local referenced evidence; this index is a compact digest, not a replacement for the original receipts"
+  ]
+}

@@ -1,0 +1,12 @@
+[Icon Theme]
+Name=Hicolor
+Comment=Fallback index for installed CyxiaOS application icons
+Hidden=true
+Directories=scalable/apps
+
+[scalable/apps]
+Size=48
+MinSize=8
+MaxSize=512
+Type=Scalable
+Context=Applications

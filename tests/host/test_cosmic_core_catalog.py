@@ -1,5 +1,6 @@
 """Execute the real OS catalog producer; ELF fixtures never enter a guest."""
 from pathlib import Path
+import json
 import struct
 import subprocess
 import sys
@@ -58,7 +59,7 @@ class CosmicCoreCatalog(unittest.TestCase):
         self.number = 0
         elf(self.sdk / 'probe.elf')
 
-    def run_catalog(self, core=False, full=True, clock=False):
+    def run_catalog(self, core=False, full=True, clock=False, workspace=False):
         self.number += 1
         output = self.root / f'output-{self.number}'
         output.mkdir()
@@ -67,12 +68,14 @@ class CosmicCoreCatalog(unittest.TestCase):
         environment.update(CYXIA_SYSROOT=str(self.sdk), CARGO_FEATURE_PORTED='1')
         if full:
             environment['CARGO_FEATURE_FULL_OS'] = '1'
-        if core or clock:
+        if core or clock or workspace:
             for feature in ('COSMIC_CORE_SERVICES_V1', 'COSMIC_SESSION', 'COSMIC_DESKTOP',
                             'FULL_OS', 'LARGE_MEMORY', 'GRAPHICS'):
                 environment['CARGO_FEATURE_' + feature] = '1'
-        if clock:
+        if clock or workspace:
             environment['CARGO_FEATURE_COSMIC_TIME_APPLET_V1'] = '1'
+        if workspace:
+            environment['CARGO_FEATURE_COSMIC_WORKSPACE_APPLETS_V1'] = '1'
         ran = subprocess.run([str(self.binary), str(self.root), str(output)],
                              env=environment, capture_output=True, text=True, timeout=15)
         return ran, output
@@ -80,6 +83,62 @@ class CosmicCoreCatalog(unittest.TestCase):
     def populate(self):
         for name in CORE:
             elf(self.sdk / (name + '.elf'))
+
+    def workspace_assets(self):
+        contract = self.sdk / 'rootfs/usr/share/cyxia/cosmic-applets-v1.json'
+        contract.parent.mkdir(parents=True, exist_ok=True)
+        contract.write_text(json.dumps(dict(profile='cosmic-applets-objects-v1', fds_per_process=128,
+            open_descriptions=512, unix_endpoints=128, unix_connections=64, shared_objects=32, shared_mappings_per_process=32,
+            session_bus_connections=32, panel_popup_input='cosmic-panel-popup-input-v1')))
+        for name, identity in (('cosmic-applet-time', 'Time'),
+                               ('cosmic-applet-workspaces', 'Workspaces'),
+                               ('cosmic-applet-tiling', 'Tiling')):
+            elf(self.sdk / (name + '.elf'))
+            entry = self.sdk / f'rootfs/usr/share/applications/com.system76.CosmicApplet{identity}.desktop'
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text(f'[Desktop Entry]\nExec={name}\nX-CosmicApplet=true\n')
+
+    def test_workspace_profile_requires_the_paired_host_object_contract(self):
+        self.populate(); self.workspace_assets()
+        path = self.sdk / 'rootfs/usr/share/cyxia/cosmic-applets-v1.json'
+        original = path.read_text(); path.unlink()
+        ran, _ = self.run_catalog(workspace=True)
+        self.assertNotEqual(ran.returncode, 0); self.assertIn('object contract', ran.stderr)
+        path.write_text(original.replace('128', '64'))
+        ran, _ = self.run_catalog(workspace=True)
+        self.assertNotEqual(ran.returncode, 0); self.assertIn('object contract', ran.stderr)
+
+    def test_workspace_profile_rejects_missing_binary_and_wrong_desktop_identity(self):
+        self.populate(); self.workspace_assets()
+        for name in ('cosmic-applet-workspaces', 'cosmic-applet-tiling'):
+            image = self.sdk / (name + '.elf'); pristine = image.read_bytes(); image.unlink()
+            ran, _ = self.run_catalog(workspace=True)
+            self.assertNotEqual(ran.returncode, 0, 'new genuine applet was silently omitted')
+            self.assertIn(name, ran.stderr); image.write_bytes(pristine)
+        entry = self.sdk / 'rootfs/usr/share/applications/com.system76.CosmicAppletTiling.desktop'
+        pristine = entry.read_text(); entry.write_text(pristine.replace('Exec=cosmic-applet-tiling', 'Exec=probe'))
+        ran, _ = self.run_catalog(workspace=True)
+        self.assertNotEqual(ran.returncode, 0)
+        entry.write_text(pristine)
+        ran, output = self.run_catalog(workspace=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        generated = (output / 'ported_catalog.rs').read_text()
+        for name in ('cosmic-applet-workspaces', 'cosmic-applet-tiling'):
+            self.assertIn('/bin/' + name, generated)
+
+    def test_workspace_catalog_has_a_separate_256_mib_boundary(self):
+        self.populate(); self.workspace_assets()
+        for name in (*CORE, 'cosmic-applet-time', 'cosmic-applet-workspaces', 'cosmic-applet-tiling'):
+            elf(self.sdk / (name + '.elf'), 28 * MIB)
+        other = sum(path.stat().st_size for path in self.sdk.rglob('*')
+                    if path.is_file() and path.name != 'probe.elf')
+        elf(self.sdk / 'probe.elf', 256 * MIB - other)
+        ran, _ = self.run_catalog(workspace=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        (self.sdk / 'rootfs/one-extra-byte').write_bytes(b'x')
+        ran, _ = self.run_catalog(workspace=True)
+        self.assertNotEqual(ran.returncode, 0)
+        self.assertIn('catalog', ran.stderr)
 
     def test_missing_core_program_is_rejected_before_an_image_can_boot(self):
         self.populate()

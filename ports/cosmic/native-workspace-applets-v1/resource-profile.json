@@ -1,0 +1,11 @@
+{
+  "image_bytes": 67108864,
+  "jobs_max": 2,
+  "max_build_bytes": 3221225472,
+  "max_elf_bytes": 67108864,
+  "min_free_bytes": 1073741824,
+  "purpose": "Two genuine complete Epoch workspace and tiling applets; unchanged FullOs process/build bounds, 1GiB guest regression.",
+  "stack_bytes": 2097152,
+  "target_runtime_validated": false,
+  "timeout_seconds": 3600
+}

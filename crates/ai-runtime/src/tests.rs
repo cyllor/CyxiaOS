@@ -29,18 +29,45 @@ fn runtime() -> Runtime {
     r
 }
 #[test]
+fn cosmic_unix_domain_is_bounded_and_keeps_original_admission_scores() {
+    for free in 0..=COSMIC_UNIX_MODEL_CAPACITY {
+        for requested in 1..=2 {
+            assert_eq!(cosmic_unix_policy(free, requested),
+                Ok((user_memory_policy(free.min(64), requested).unwrap().0, COSMIC_UNIX_MODEL_ID)));
+        }
+    }
+    for (free, requested) in [(129, 1), (128, 0), (128, 3)] {
+        assert_eq!(cosmic_unix_policy(free, requested), Err(Error::Invalid));
+    }
+    assert_eq!(user_memory_policy(65, 1), Err(Error::Invalid));
+}
+#[test]
 fn shared_object_metadata_policy_exhaustive_and_page_policy_preserved() {
-    for free in 0..=16 {
-        for requested in 1..=16 {
+    for free in 0..=SHARED_OBJECT_MODEL_CAPACITY {
+        for requested in 1..=SHARED_OBJECT_MODEL_CAPACITY {
             assert_eq!(shared_object_policy(free, requested),
                 Ok((free >= requested, SHARED_OBJECT_MODEL_ID)));
         }
     }
-    assert_eq!(shared_object_policy(17, 1), Err(Error::Invalid));
-    assert_eq!(shared_object_policy(16, 0), Err(Error::Invalid));
-    assert_eq!(shared_object_policy(16, 17), Err(Error::Invalid));
+    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY + 1, 1), Err(Error::Invalid));
+    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY, 0), Err(Error::Invalid));
+    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY, SHARED_OBJECT_MODEL_CAPACITY + 1), Err(Error::Invalid));
     assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
     assert!(anonymous_memory_policy(2048, 2048).is_ok_and(|(allowed, _)| !allowed));
+}
+
+#[test]
+fn applet_shared_mapping_policy_covers_every_slot_and_rejects_outside_domain() {
+    for free in 0..=COSMIC_SHARED_MAPPING_CAPACITY {
+        for requested in 1..=COSMIC_SHARED_MAPPING_CAPACITY {
+            assert_eq!(cosmic_shared_mapping_policy(free, requested),
+                Ok((free >= requested, COSMIC_SHARED_MAPPING_MODEL_ID)));
+        }
+    }
+    for (free, requested) in [(33, 1), (32, 0), (32, 33)] {
+        assert_eq!(cosmic_shared_mapping_policy(free, requested), Err(Error::Invalid));
+    }
+    assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
 }
 
 #[test]

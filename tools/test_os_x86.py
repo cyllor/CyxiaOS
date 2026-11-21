@@ -21,6 +21,16 @@ def runtime_elf():
     return bytes(raw)
 
 class RuntimeElf(unittest.TestCase):
+    def test_larger_catalog_file_read_requires_the_explicit_runtime_bound(self):
+        raw = runtime_elf() + bytes(256 * 1024**2 + 1 - len(runtime_elf()))
+        with self.assertRaisesRegex(ValueError, 'file budget'):
+            x86_64.inspect_elf(raw, runtime=True)
+        x86_64.inspect_elf(raw, runtime=True, max_file_bytes=384 * 1024**2)
+        x86_64.boot_image(raw, runtime=True, max_file_bytes=384 * 1024**2)
+        for options in (dict(max_file_bytes=384 * 1024**2), dict(runtime=True, max_file_bytes=512 * 1024**2)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                x86_64.inspect_elf(runtime_elf(), **options)
+
     def test_physical_loader_preserves_high_virtual_kernel(self):
         raw = runtime_elf()
         with self.assertRaises(ValueError): x86_64.boot_image(raw)
@@ -42,6 +52,21 @@ class RuntimeElf(unittest.TestCase):
         with self.assertRaises(ValueError): x86_64.boot_image(raw, runtime=True)
 
 class UserBuildInputs(unittest.TestCase):
+    def test_workspace_kernel_file_bound_is_separate_from_legacy_and_ram(self):
+        self.assertEqual(os_x86.kernel_file_limit(['cosmic-workspace-applets-v1']), 384 * 1024**2)
+        for features in ([], ['full-os'], ['cosmic-core-services-v1'], ['cosmic-time-applet-v1']):
+            self.assertEqual(os_x86.kernel_file_limit(features), 256 * 1024**2)
+        command = os_x86.launch_argv('/qemu', '/boot')
+        self.assertEqual(command[command.index('-m') + 1], '1024M')
+
+    def test_workspace_applets_have_an_explicit_graphics_and_ported_profile(self):
+        name = 'cosmic-workspace-applets-v1'
+        self.assertEqual(os_x86.select_features(graphics=True, ported=True, extras=[name]),
+                         ['os-runtime', 'graphics', 'ported', name])
+        for options in (dict(graphics=True), dict(ported=True), {}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                os_x86.select_features(extras=[name], **options)
+
     def test_full_os_capacity_is_explicit_and_cosmic_requires_graphics(self):
         self.assertEqual(os_x86.select_features(ported=True, extras=['full-os']),
                          ['os-runtime', 'ported', 'full-os'])

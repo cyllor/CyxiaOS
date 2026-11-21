@@ -78,12 +78,19 @@ pub(crate) fn admission<T>(domain: Domain, attempt: Attempt, result: &Result<T, 
     };
     record(domain, |c| c.admission(attempt, outcome, errno));
 }
-pub(super) fn status(out: &mut impl Write) {
-    // A bounded foreground copy is coherent on the current single-core target.
+fn status_domains(out: &mut impl Write, selected: impl Fn(usize) -> bool) {
+    // A bounded copy is coherent at the CPU0 foreground service boundary.
     let snapshot = unsafe { *core::ptr::addr_of!(COUNTERS) };
-    for (name, c) in NAMES.into_iter().zip(snapshot) {
+    for (index, (name, c)) in NAMES.into_iter().zip(snapshot).enumerate() {
+        if !selected(index) { continue; }
         writeln!(out, "AI_DOMAIN name={name} requests={} proposals={} approved={} denied={} capacity={} invalid={} failed={} committed={} granted={} released={} grant_units={} release_units={} ai={} guard={} cancelled={} enters={} returns={} elapsed_ms={} last_model={} last_errno={}\r", c.requests, c.proposals, c.approved, c.denied, c.capacity, c.invalid, c.failed, c.committed, c.granted, c.released, c.grant_units, c.release_units, c.ai, c.guard, c.cancelled, c.enters, c.returns, c.elapsed_ms, c.last_model, c.last_errno).unwrap();
     }
+}
+pub(super) fn shared_status(out: &mut impl Write) {
+    status_domains(out, |i| i >= Domain::SharedPages as usize);
+}
+pub(super) fn status(out: &mut impl Write) {
+    status_domains(out, |_| true);
     writeln!(
         out,
         "AI_SCOPE name=native_ipc policy=operator_test_mechanism online_learning=false\r"

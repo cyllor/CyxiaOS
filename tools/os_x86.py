@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import x86_64 as pc
+import cosmic_applet_object_profile_v1 as applet_objects
 from build_sources import code_source_map, build_cache_context
 from native_session import native_lease, idle_native_host, DEFAULT_NATIVE_LOCK
 
@@ -14,7 +15,7 @@ ROOT = pc.ROOT
 VERSION = 2
 RUSTFLAGS = ['-C', 'relocation-model=static', '-C', 'code-model=large',
              '-C', 'no-redzone=yes', '-C', 'lto=off']
-DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'cosmic-session', 'cosmic-core-services-v1', 'cosmic-time-applet-v1', 'rust-reactor-probe', 'rust-egl-probe',
+DESKTOP_FEATURES = frozenset(('large-memory', 'full-os', 'cosmic-desktop', 'cosmic-session', 'cosmic-core-services-v1', 'cosmic-time-applet-v1', 'cosmic-workspace-applets-v1', 'rust-reactor-probe', 'rust-egl-probe',
     'mesa-probe', 'smithay-probe', 'smithay-wayland-probe', 'smithay-xdg-probe',
     'smithay-multi-probe', 'smithay-interactive-probe', 'smithay-resize-probe',
     'smithay-dynamic-probe', 'wayland-shm-probe', 'abi-trace'))
@@ -70,6 +71,11 @@ def build_environment(cache, cc, prefix):
     if prefix is not None: environment['CYXIA_SYSROOT'] = prefix
     return environment
 
+def kernel_file_limit(features):
+    # The ELF contains immutable catalog bytes and initialized kernel storage.
+    # This is a file-read bound; QEMU RAM and process grants remain unchanged.
+    return (384 if 'cosmic-workspace-applets-v1' in features else 256) * 1024**2
+
 def producer_sources(entry=None):
     """Bind the selected producer and its transitive local Python imports."""
     pending = [Path(entry or __file__).resolve()]
@@ -98,6 +104,8 @@ def build(output, *, profile='dev', graphics=False, ported=False, extras=(), sys
         output = pc.fresh_output(output)
         sources = code_source_map(ROOT); producer = producer_sources()
         inputs = catalog_inputs(prefix) if ported else {}
+        if 'cosmic-workspace-applets-v1' in features:
+            applet_objects.validate(prefix, inputs)
         cache = build_cache_context(ROOT / 'target' / 'x86-os', ROOT,
                                     cache_sources(sources, features, prefix, inputs))
         cargo = pc.executable(cargo); rustc = pc.executable('rustc')
@@ -112,8 +120,8 @@ def build(output, *, profile='dev', graphics=False, ported=False, extras=(), sys
         elf = Path(cache['effective']) / pc.TARGET / ('debug' if profile == 'dev' else 'release') / 'cyxia-kernel'
         pc.require(elf.resolve(strict=True).is_relative_to(Path(cache['effective']).resolve()),
                    'OS artifact outside selected Cargo cache')
-        raw = pc.bounded_bytes(elf, 256 * 1024 * 1024)
-        flat = pc.boot_image(raw, runtime=True)
+        raw = pc.bounded_bytes(elf, kernel_file_limit(features))
+        flat = pc.boot_image(raw, runtime=True, max_file_bytes=kernel_file_limit(features))
         (output / 'kernel.elf').write_bytes(raw); (output / 'boot.bin').write_bytes(flat)
         pc.require(code_source_map(ROOT) == sources and producer_sources() == producer,
                    'source changed during compilation; artifacts are unbound development outputs')
@@ -127,7 +135,7 @@ def build(output, *, profile='dev', graphics=False, ported=False, extras=(), sys
                         cc=dict(path=cc, sha256=pc.sha(cc), version=pc.version(cc)),
                         sysroot=prefix, external_inputs=inputs,
                         build_argv=command, cache=cache, ram_mib=1024, cpus=4,
-                        elf=pc.inspect_elf(raw, runtime=True),
+                        elf=pc.inspect_elf(raw, runtime=True, max_file_bytes=kernel_file_limit(features)),
                         artifacts={'kernel.elf': pc.sha_bytes(raw), 'boot.bin': pc.sha_bytes(flat)},
                         full_os_verified=False, cosmic_session_verified=False)
         pc.write_json(output / 'build-manifest.json', manifest)
@@ -154,6 +162,8 @@ def validate_build(directory, *, cc='clang'):
     pc.require(isinstance(prefix, str) if 'ported' in features else prefix is None, 'OS sysroot contract')
     inputs = catalog_inputs(prefix) if prefix else {}
     pc.require(manifest.get('external_inputs') == inputs, 'OS embedded input identity mismatch')
+    if 'cosmic-workspace-applets-v1' in features:
+        applet_objects.validate(prefix, inputs)
     cache = build_cache_context(ROOT / 'target' / 'x86-os', ROOT, cache_sources(sources, features, prefix, inputs))
     pc.require(manifest.get('cache') == cache, 'OS cache identity mismatch')
     cargo = pc.executable('cargo'); rustc = pc.executable('rustc')
@@ -167,10 +177,10 @@ def validate_build(directory, *, cc='clang'):
                'OS C compiler mismatch')
     build_environment(cache, cc_path, prefix)
     pc.require(manifest.get('build_argv') == build_argv(cargo, manifest.get('profile'), features), 'OS build argv mismatch')
-    raw = pc.bounded_bytes(directory / 'kernel.elf', 256 * 1024 * 1024)
-    flat = pc.boot_image(raw, runtime=True)
+    raw = pc.bounded_bytes(directory / 'kernel.elf', kernel_file_limit(features))
+    flat = pc.boot_image(raw, runtime=True, max_file_bytes=kernel_file_limit(features))
     pc.require(pc.bounded_bytes(directory / 'boot.bin', 512 * 1024 * 1024) == flat, 'OS load image mismatch')
-    pc.require(manifest.get('elf') == pc.inspect_elf(raw, runtime=True) and
+    pc.require(manifest.get('elf') == pc.inspect_elf(raw, runtime=True, max_file_bytes=kernel_file_limit(features)) and
                manifest.get('artifacts') == {'kernel.elf': pc.sha_bytes(raw), 'boot.bin': pc.sha_bytes(flat)},
                'OS ELF identity mismatch')
     return manifest

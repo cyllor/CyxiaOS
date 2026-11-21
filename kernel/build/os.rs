@@ -91,6 +91,7 @@ fn catalog(root: &Path, out: &Path) {
         ("gtk", &["gtk-probe"][..]), ("pcmanfm", &["pcmanfm"][..]), ("lxpanel", &["lxpanel"][..]),
         ("spawn-test", &["glib-spawn-probe"][..]),
         ("cosmic-desktop", &["cosmic-comp"][..]),
+        ("cosmic-workspace-applets-v1", &["cosmic-applet-workspaces", "cosmic-applet-tiling"][..]),
     ] {
         if feature(flag) { names.extend_from_slice(images); required.extend_from_slice(images); }
     }
@@ -112,13 +113,35 @@ fn catalog(root: &Path, out: &Path) {
             && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
             "invalid cosmic-applet-time desktop entry");
     }
+    if feature("cosmic-workspace-applets-v1") {
+        names.push("workspace-state-probe");
+        names.push("workspace-window-probe");
+        let contract = prefix.join("rootfs/usr/share/cyxia/cosmic-applets-v1.json");
+        println!("cargo:rerun-if-changed={}", contract.display());
+        let contract = fs::read_to_string(contract).expect("missing cosmic applet object contract");
+        for field in ["\"profile\": \"cosmic-applets-objects-v1\"", "\"fds_per_process\": 128",
+                      "\"open_descriptions\": 512", "\"unix_endpoints\": 128", "\"unix_connections\": 64",
+                      "\"shared_objects\": 32", "\"shared_mappings_per_process\": 32",
+                      "\"session_bus_connections\": 32", "\"panel_popup_input\": \"cosmic-panel-popup-input-v1\""] {
+            assert!(contract.contains(field), "cosmic applet object contract mismatch");
+        }
+        for (name, identity) in [("cosmic-applet-workspaces", "Workspaces"), ("cosmic-applet-tiling", "Tiling")] {
+            let entry = prefix.join(format!("rootfs/usr/share/applications/com.system76.CosmicApplet{identity}.desktop"));
+            println!("cargo:rerun-if-changed={}", entry.display());
+            let desktop = fs::read_to_string(entry).unwrap_or_else(|_| panic!("missing {name} desktop entry"));
+            assert!(desktop.lines().any(|line| line == format!("Exec={name}"))
+                && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
+                "invalid {name} desktop entry");
+        }
+    }
     if prefix.join("Xcyxia.elf").is_file() { names.push("xorg"); }
     let mut text = String::from("const PORTED: &[(&str, &str, &[u8])] = &[\n");
     let mut paths = Vec::new();
     // The complete five-program core plus preserved probe/assets exceeds the
     // old 96 MiB catalog. Only this explicit versioned image profile selects
     // 128 MiB of ROM inputs; no process grant or physical pool is enlarged.
-    let budget = if feature("cosmic-time-applet-v1") { 192 }
+    let budget = if feature("cosmic-workspace-applets-v1") { 256 }
+        else if feature("cosmic-time-applet-v1") { 192 }
         else if feature("cosmic-core-services-v1") { 128 }
         else if feature("full-os") { 96 } else if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
     let mut total = 0usize;

@@ -19,6 +19,7 @@ pub struct Shell {
     user_request: Option<cyxia_posix::UserRequest>,
     storage_request: Option<StorageRequest>,
     system_request: bool,
+    objects_request: bool,
     user_status: cyxia_posix::UserStatus,
     user_processes: [cyxia_posix::UserStatus; cyxia_posix::usermem::MAX_PROCESSES],
     line: [u8; LINE_BYTES],
@@ -42,6 +43,7 @@ impl Shell {
             user_request: None,
             storage_request: None,
             system_request: false,
+            objects_request: false,
             user_status: cyxia_posix::UserStatus::EMPTY,
             user_processes: [cyxia_posix::UserStatus::EMPTY; cyxia_posix::usermem::MAX_PROCESSES],
             line: [0; LINE_BYTES],
@@ -61,6 +63,9 @@ impl Shell {
     /// The kernel services this read-only request at a CPU0 foreground boundary.
     pub fn take_system_request(&mut self) -> bool {
         core::mem::take(&mut self.system_request)
+    }
+    pub fn take_objects_request(&mut self) -> bool {
+        core::mem::take(&mut self.objects_request)
     }
     /// Trusted runnable work observed by the kernel; clipped to the model domain.
     /// This is load, not authorization, and never cancels already committed I/O.
@@ -296,6 +301,10 @@ impl Shell {
                         "cosmic-comp" => "cosmic-comp",
                         "cosmic-panel" => "cosmic-panel",
                         "cosmic-applet-time" => "cosmic-applet-time",
+                        "cosmic-applet-workspaces" => "cosmic-applet-workspaces",
+                        "cosmic-applet-tiling" => "cosmic-applet-tiling",
+                        "workspace-state-probe" => "workspace-state-probe",
+                        "workspace-window-probe" => "workspace-window-probe",
                         "env-probe" => "env-probe",
                         "rust-env-probe" => "rust-env-probe",
                         "async-io-probe" => "async-io-probe",
@@ -432,7 +441,7 @@ impl Shell {
                 writeln!(out, "posix exec cosmic-comp | cosmic-version (COSMIC startup or version, when installed)\r")?;
                 write!(
                     out,
-                    "posix run demo|preempt|fault|spin|readonly|execdata|kernel|guard | posix status|list|kill [PID]\r\nposix spawn idle|spin|fault|heap|heapfault|paint|fpu|heapexec | posix pair (native Rust IPC check)\r\nposix exec probe|xau-probe|socket-probe|signal-probe|desktop-api-probe|pipe-probe|file-probe|thread-probe|spawn-probe|glib-spawn-probe (ported/test builds)\r\nposix exec xorg|twm|openbox|x11-probe|x11-interactive|x11-demo|gtk-probe|gtk-smoke|pcmanfm|pcmanfm-home|pcmanfm-desktop|lxpanel|cyxia-save|x11-inspect (desktop profiles)\r\nmem status|alloc|free|peek|poke|list | proc spawn|list|pause|resume|kill|reap\r\ndev list|write|read|batch|requests|cancel|reap|enable|disable | ai system|resources|audit\r\nhelp | pwd | cd PATH | ls [PATH] | mkdir PATH | touch PATH\r\nwrite PATH TEXT | append PATH TEXT | cat PATH | stat PATH\r\nrm PATH | rmdir PATH | df | ai status|cache|train|apply|rollback\r\nstorage status|checkpoint (dedicated raw disk; wait for STORAGE_DURABLE)\r\nPaths: UTF-8; shell path arguments cannot contain spaces. Text is literal UTF-8 (no quotes).\r\nCatalog user programs and Rust services; no shell pipelines or scripts. Ctrl+C cancels.\r\n"
+                    "posix run demo|preempt|fault|spin|readonly|execdata|kernel|guard | posix status|list|kill [PID]\r\nposix spawn idle|spin|fault|heap|heapfault|paint|fpu|heapexec | posix pair (native Rust IPC check)\r\nposix exec probe|xau-probe|socket-probe|signal-probe|desktop-api-probe|pipe-probe|file-probe|thread-probe|spawn-probe|glib-spawn-probe (ported/test builds)\r\nposix exec xorg|twm|openbox|x11-probe|x11-interactive|x11-demo|gtk-probe|gtk-smoke|pcmanfm|pcmanfm-home|pcmanfm-desktop|lxpanel|cyxia-save|x11-inspect (desktop profiles)\r\nmem status|alloc|free|peek|poke|list | proc spawn|list|pause|resume|kill|reap\r\ndev list|write|read|batch|requests|cancel|reap|enable|disable | ai system|objects|resources|audit\r\nhelp | pwd | cd PATH | ls [PATH] | mkdir PATH | touch PATH\r\nwrite PATH TEXT | append PATH TEXT | cat PATH | stat PATH\r\nrm PATH | rmdir PATH | df | ai status|cache|train|apply|rollback\r\nstorage status|checkpoint (dedicated raw disk; wait for STORAGE_DURABLE)\r\nPaths: UTF-8; shell path arguments cannot contain spaces. Text is literal UTF-8 (no quotes).\r\nCatalog user programs and Rust services; no shell pipelines or scripts. Ctrl+C cancels.\r\n"
                 )?;
             }
             "pwd" => {
@@ -456,11 +465,18 @@ impl Shell {
                 no_args(tail)?;
                 match arg {
                     "system" => {
-                        if self.system_request {
+                        if self.system_request || self.objects_request {
                             return Err(cyxia_ai_runtime::Error::Busy.into());
                         }
                         self.system_request = true;
                         writeln!(out, "AI_SYSTEM_REQUEST queued\r")?;
+                    }
+                    "objects" => {
+                        if self.system_request || self.objects_request {
+                            return Err(cyxia_ai_runtime::Error::Busy.into());
+                        }
+                        self.objects_request = true;
+                        writeln!(out, "AI_OBJECTS_REQUEST queued\r")?;
                     }
                     "resources" => self.resource_status(out)?,
                     "audit" => self.resource_audit(out)?,

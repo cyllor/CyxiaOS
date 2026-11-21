@@ -3,6 +3,11 @@
 use core::fmt::Write;
 
 pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
+    if shell.take_objects_request() {
+        let _ = writeln!(out, "\r\nAI_OBJECTS schema=1 scope=live_objects_and_shared_admission\r");
+        super::user::object_details(out);
+        let _ = writeln!(out, "AI_OBJECTS_END\r");
+    }
     if !shell.take_system_request() {
         return;
     }

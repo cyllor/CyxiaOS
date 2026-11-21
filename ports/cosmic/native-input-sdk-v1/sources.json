@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-musl",
+  "sources": {
+    "mtdev-1.1.7.tar.bz2": {
+      "url": "https://bitmath.org/code/mtdev/mtdev-1.1.7.tar.bz2",
+      "sha256": "a107adad2101fecac54ac7f9f0e0a0dd155d954193da55c2340c97f2ff1d814e",
+      "bytes": 301994
+    },
+    "libevdev-1.13.4.tar.xz": {
+      "url": "https://www.freedesktop.org/software/libevdev/libevdev-1.13.4.tar.xz",
+      "sha256": "f00ab8d42ad8b905296fab67e13b871f1a424839331516642100f82ad88127cd",
+      "bytes": 464556
+    },
+    "eudev-3.2.15.tar.gz": {
+      "url": "https://github.com/eudev-project/eudev/releases/download/v3.2.15/eudev-3.2.15.tar.gz",
+      "sha256": "eb69809fc0d1187f2463ab2149c53aa9f42a78e59f14ebea68eae6cb6b4fc1c3",
+      "bytes": 2516637
+    },
+    "linux-6.18.tar.xz": {
+      "url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz",
+      "sha256": "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b",
+      "bytes": 154309096
+    },
+    "make-4.4.1.tar.gz": {
+      "url": "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",
+      "sha256": "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3",
+      "bytes": 2348200
+    },
+    "libinput-1.29.0.tar.gz": {
+      "url": "https://gitlab.freedesktop.org/libinput/libinput/-/archive/1.29.0/libinput-1.29.0.tar.gz",
+      "sha256": "ec71f6ec6632108a62756f49d86e864494108e70cf670e85f8b7579e970e152c",
+      "bytes": 1121262
+    }
+  }
+}

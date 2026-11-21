@@ -13,12 +13,17 @@ use crate::{
 
 #[cfg(not(feature = "large-memory"))]
 pub const ENDPOINTS: usize = 16;
-#[cfg(feature = "large-memory")]
+#[cfg(all(feature = "large-memory", not(feature = "cosmic-applets-v1")))]
 pub const ENDPOINTS: usize = 64;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const ENDPOINTS: usize = 128;
 #[cfg(not(feature = "large-memory"))]
 pub const CONNECTIONS: usize = 8;
-#[cfg(feature = "large-memory")]
+#[cfg(all(feature = "large-memory", not(feature = "cosmic-applets-v1")))]
 pub const CONNECTIONS: usize = 32;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const CONNECTIONS: usize = 64;
+const _: () = assert!(ENDPOINTS <= 256);
 pub const BUFFER_BYTES: usize = 4096;
 pub const PATH_BYTES: usize = 108;
 pub const BACKLOG_MAX: usize = 8;

@@ -1,0 +1,56 @@
+--- a/cosmic-applet-workspaces/Cargo.toml
++++ b/cosmic-applet-workspaces/Cargo.toml
+@@ -6,6 +6,8 @@
+ license = "GPL-3.0-only"
+ 
+ [dependencies]
++wayland-sys = { path = "../native-deps/wayland-sys" }
++xkbcommon-dl = { path = "../native-deps/xkbcommon-dl" }
+ libcosmic.workspace = true
+ cctk.workspace = true
+ tracing.workspace = true
+@@ -17,3 +19,6 @@
+ i18n-embed.workspace = true
+ i18n-embed-fl.workspace = true
+ rust-embed.workspace = true
++
++[features]
++cyxia-native = ["wayland-sys/cyxia-static-client", "wayland-sys/cyxia-static-egl", "xkbcommon-dl/static-wayland"]
+--- a/cosmic-applet-tiling/Cargo.toml
++++ b/cosmic-applet-tiling/Cargo.toml
+@@ -5,6 +5,8 @@
+ license = "GPL-3.0-only"
+ 
+ [dependencies]
++wayland-sys = { path = "../native-deps/wayland-sys" }
++xkbcommon-dl = { path = "../native-deps/xkbcommon-dl" }
+ libcosmic.workspace = true
+ anyhow.workspace = true
+ cctk.workspace = true
+@@ -18,3 +20,6 @@
+ tracing-log.workspace = true
+ tracing-subscriber.workspace = true
+ tracing.workspace = true
++
++[features]
++cyxia-native = ["wayland-sys/cyxia-static-client", "wayland-sys/cyxia-static-egl", "xkbcommon-dl/static-wayland"]
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1221,6 +1221,8 @@
+  "tracing",
+  "tracing-log",
+  "tracing-subscriber",
++ "wayland-sys",
++ "xkbcommon-dl",
+ ]
+ 
+ [[package]]
+@@ -1260,6 +1262,8 @@
+  "tracing",
+  "tracing-log",
+  "tracing-subscriber",
++ "wayland-sys",
++ "xkbcommon-dl",
+ ]
+ 
+ [[package]]

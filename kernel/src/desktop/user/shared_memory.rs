@@ -61,8 +61,16 @@ impl SharedMappings {
             if offset.checked_add(len).is_none_or(|end| end > info.size) {
                 return Err(Errno::Inval);
             }
-            attempt.proposed(8193);
-            let (allowed, model) = cyxia_ai_runtime::user_memory_policy(self.maps.free() as u32, 1)
+            #[cfg(feature = "cosmic-workspace-applets-v1")]
+            let policy = cyxia_ai_runtime::cosmic_shared_mapping_policy;
+            #[cfg(feature = "cosmic-workspace-applets-v1")]
+            let proposed = cyxia_ai_runtime::COSMIC_SHARED_MAPPING_MODEL_ID;
+            #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
+            let policy = cyxia_ai_runtime::user_memory_policy;
+            #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
+            let proposed = 8193;
+            attempt.proposed(proposed);
+            let (allowed, model) = policy(self.maps.free() as u32, 1)
                 .map_err(|_| Errno::Io)?;
             attempt.decided(allowed, model);
             if !allowed {

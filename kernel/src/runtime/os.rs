@@ -102,7 +102,12 @@ pub fn run(info: &PcBootInfo) -> ! {
     shell.banner(&mut out).expect("OS console");
     let mut io = SystemIo;
     loop {
+        crate::machine::flush_logs(1024).expect("OS console drain");
         for _ in 0..64 {
+            // Do not start another verbose command while the previous output
+            // is backpressured. A full production process listing fits the
+            // reserved 128 KiB stream queue; user memory grants are unrelated.
+            if crate::machine::log_pending() > 4096 { break; }
             match crate::machine::try_read() {
                 Ok(Some(byte)) => shell.input(byte, &mut out).expect("OS console"),
                 Ok(None) => break,
@@ -116,6 +121,7 @@ pub fn run(info: &PcBootInfo) -> ! {
         crate::graphics::poll();
         crate::user::poll(shell, &mut out);
         crate::ai::poll(shell, &mut out);
+        crate::machine::flush_logs(1024).expect("OS console drain");
         idle();
     }
 }

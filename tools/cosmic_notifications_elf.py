@@ -33,6 +33,11 @@ U64_MAX = (1 << 64) - 1
 # (OS_NATIVE_PASS plus a 39-process session census verified). The other three
 # pinned sources are byte-identical, so the hardcoded Python interpretation of
 # the loader remains valid after this reviewed physical-backing change.
+# 2026-11-21 reviewed e43b8e3: publish_space now synchronizes dirty executable
+# and stack leaves into the retained process root. The diff changes only that
+# publication method and its retirement comment; layout, parsing, page counts,
+# allocation grants and W^X admission are unchanged. Native mapping/protection
+# evidence is recorded in v17-cosmic-audit-hotpaths-20261121.md.
 _REVIEWED_LOADER_CONTRACT = (
     ('crates/contracts/src/user_layout.rs',
      '10edd3b77ee0896563fef4f19662d2b366b729198f35adb2982eb8fb812365f3'),
@@ -41,7 +46,7 @@ _REVIEWED_LOADER_CONTRACT = (
     ('crates/posix/src/executable.rs',
      '0a2310be332d66a2c1e06ededc28c06fe41c4949db686b35f53e7ccd53e2b5e7'),
     ('kernel/src/desktop/memory/exec_memory.rs',
-     'a4db2614268bb3a30193807149d0e9c38956146a5dcd82570f0b7c9d8a77f934'),
+     '01fb28784f093149d1d4e851bf200f7b0617b2282b595f7be0614b9b8088fc70'),
 )
 
 

@@ -1,0 +1,11 @@
+--- a/native-deps/launch-pad/src/native_child.rs
++++ b/native-deps/launch-pad/src/native_child.rs
+@@ -16,7 +16,7 @@
+ use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, unix::AsyncFd};
+ 
+ const SPAWN: libc::c_long = 0x43595810;
+-const MAX_FDS: usize = 64;
++const MAX_FDS: usize = 128;
+ const MAX_VECTOR: usize = 32;
+ const MAX_STRINGS: usize = 4096;
+ const MAX_PATH: usize = 95;

@@ -5,6 +5,20 @@ use cyxia_posix::{
     unix::{Handle, UnixSockets},
 };
 static mut SOCKETS: UnixSockets = UnixSockets::new();
+#[cfg(feature = "cosmic-workspace-applets-v1")]
+const ADMISSION_MODEL: u64 = cyxia_ai_runtime::COSMIC_UNIX_MODEL_ID;
+#[cfg(not(feature = "cosmic-workspace-applets-v1"))]
+const ADMISSION_MODEL: u64 = 8193;
+#[cfg(feature = "cosmic-workspace-applets-v1")]
+const _: () = assert!(cyxia_posix::unix::ENDPOINTS == cyxia_ai_runtime::COSMIC_UNIX_MODEL_CAPACITY as usize);
+
+pub(super) fn status(out: &mut impl core::fmt::Write) {
+    // CPU0 snapshot only: reading counters must not sample epoll or clear wakes.
+    let capacity = unsafe { (&*core::ptr::addr_of!(SOCKETS)).capacity() };
+    writeln!(out, "UNIX_POOL endpoints={} free_endpoints={} connections={} free_connections={} free_bindings={} backing=BOOTSTRAP\r",
+        cyxia_posix::unix::ENDPOINTS, capacity.free_endpoints,
+        cyxia_posix::unix::CONNECTIONS, capacity.free_connections, capacity.free_bindings).unwrap();
+}
 
 pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: CPU0 foreground is the sole caller; IRQs and DMA never reference
@@ -55,8 +69,12 @@ pub(super) fn admit<T>(
             (capacity.free_bindings, bindings),
         ] {
             if needed != 0 {
-                attempt.proposed(8193);
-                let (allowed, model) = cyxia_ai_runtime::user_memory_policy(free as u32, needed)
+                attempt.proposed(ADMISSION_MODEL);
+                #[cfg(feature = "cosmic-workspace-applets-v1")]
+                let decision = cyxia_ai_runtime::cosmic_unix_policy(free as u32, needed);
+                #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
+                let decision = cyxia_ai_runtime::user_memory_policy(free as u32, needed);
+                let (allowed, model) = decision
                     .map_err(|_| Errno::Io)?;
                 attempt.decided(allowed, model);
                 if !allowed {
@@ -68,7 +86,10 @@ pub(super) fn admit<T>(
     })();
     super::ai::admission(super::ai::Domain::Unix, attempt, &result);
     if result.is_ok() {
+        #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
         super::super::log(b"UNIX_ADMISSION AI_DIRECT model=8193 committed=true\n");
+        #[cfg(feature = "cosmic-workspace-applets-v1")]
+        super::super::log(b"UNIX_ADMISSION AI_DIRECT model=8202 committed=true\n");
     }
     result
 }

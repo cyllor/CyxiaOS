@@ -1,0 +1,20 @@
+{
+  "protocols": [
+    {
+      "name": "ext-workspace",
+      "path": "artifacts/cosmic-comp-cache/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-protocols-0.32.13/protocols/staging/ext-workspace/ext-workspace-v1.xml",
+      "sha256": "9b449d9d5d40f6032eba9813d18093b84f249a2cf38d6755dec7bca7eb96b0f3"
+    },
+    {
+      "name": "cosmic-workspace",
+      "path": "artifacts/cosmic-comp-cache/git/checkouts/cosmic-protocols-1292b541ae7bfaf6/c0cff4d/unstable/cosmic-workspace-unstable-v2.xml",
+      "sha256": "18718216a8d1477af5a14d0e6a770515d45a10c678c5b08c92264713f2dde88d"
+    },
+    {
+      "name": "xdg-shell",
+      "path": "artifacts/cosmic-comp-cache/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml",
+      "sha256": "7ba7f9c8473deee674cb1f154a18abd0bb0cc072604fc055b0c15e459fc4c7df"
+    }
+  ],
+  "purpose": "read-only workspace observer plus a separate real xdg window; neither sends workspace activation or tiling requests"
+}

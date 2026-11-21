@@ -114,8 +114,11 @@ def tool_sources():
     return dict(sorted(result.items()))
 
 
-def inspect_elf(raw, *, runtime=False):
-    require(len(raw) <= (256 * 1024 * 1024 if runtime else MAX_ELF), 'ELF exceeds file budget')
+def inspect_elf(raw, *, runtime=False, max_file_bytes=None):
+    require(max_file_bytes is None or (runtime and type(max_file_bytes) is int
+            and max_file_bytes in (256 * 1024**2, 384 * 1024**2)), 'unsupported runtime ELF file budget')
+    limit = max_file_bytes if max_file_bytes is not None else (256 * 1024**2 if runtime else MAX_ELF)
+    require(len(raw) <= limit, 'ELF exceeds file budget')
     header = elf64.decode(raw)
     require(header['kind'] == 2 and header['machine'] == 62 and header['flags'] == 0,
             'not x86-64 executable')
@@ -151,8 +154,8 @@ def symbol(raw, name):
     return elf64.symbol(raw, name, inspect_elf(raw)['loads'])
 
 
-def boot_image(raw, *, runtime=False):
-    info = inspect_elf(raw, runtime=runtime)
+def boot_image(raw, *, runtime=False, max_file_bytes=None):
+    info = inspect_elf(raw, runtime=runtime, max_file_bytes=max_file_bytes)
     loads = info['loads']
     file_end = max(s['pa'] + s['size'] for s in loads if s['size'])
     mem_end = max(s['pa'] + s['mem'] for s in loads)

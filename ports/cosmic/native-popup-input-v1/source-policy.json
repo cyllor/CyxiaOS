@@ -1,0 +1,23 @@
+{
+  "kind": "cosmic-panel-popup-input-v1",
+  "parent_source_policy_sha256": "754e49144f991e91e2198e0d31f2ab07537f6b20eb126ac0eba10094ef1f6d98",
+  "before_tree_sha256": "2a69af06a3451d8d1bf74e999f709f9d7e387989c4f79aafa8de6dcbcb15d0a7",
+  "after_tree_sha256": "d6ec63b8fb18c0a07fc4bba8e6ecf70f3f7f63808d5513fc027c82356dc5edfe",
+  "mode_sha256": "c1e79875e488e1a176fcfd0fa043e3e50fc0dd145e5fef102637930faacb1fa0",
+  "changed_files": {
+    "cosmic-panel-bin/src/xdg_shell_wrapper/space/popup.rs": {
+      "before": "30f1745910fd15d8390f4db74cb823574d06cd7c437ec818cf1177adce44c3e8",
+      "after": "bbd45950a3fc9173c262745908161bcc77f29f539ff525a1aff4a89284ec84e7"
+    },
+    "cosmic-panel-bin/src/space/wrapper_space.rs": {
+      "before": "831af7234ef76134ea91858e8b8eaf1bd3fb2e2c771d66692e71b0fe1cc364db",
+      "after": "124c157188f61d90255e49df4789915d3257889cb894454d7934582705e7ad88"
+    },
+    "cosmic-panel-bin/src/space/overflow.rs": {
+      "before": "46729d2b07e57002deb80dab2040e694b3027e97d31817fcf7d8f7f1f09278c1",
+      "after": "ef17621bd213f565ff40fb7fb2d11f405535efb157585991f72079ffec26dfe1"
+    }
+  },
+  "patch_sha256": "bd8e2337850bab28aa0bc4c4d1e9f79111202bd1707d4e2d6cf7c9a04d0f8030",
+  "helper_sha256": "6606371f733ecf436444c9e72b8c1e7d74bc822ba586aec0e445815950444eb6"
+}

@@ -10,7 +10,17 @@ pub struct ObjectProfile {
     pub inotify_instances: usize,
 }
 
-pub const PROFILE: ObjectProfile = if cfg!(feature = "full-os") {
+pub const PROFILE: ObjectProfile = if cfg!(feature = "cosmic-applets-v1") {
+    ObjectProfile {
+        name: "cosmic-applets-objects-v1",
+        fds_per_process: 128,
+        open_descriptions: 512,
+        epolls_per_owner: 16,
+        epoll_instances: 64,
+        inotify_per_owner: 8,
+        inotify_instances: 32,
+    }
+} else if cfg!(feature = "full-os") {
     ObjectProfile {
         name: "full-os-objects-v1",
         fds_per_process: 64,

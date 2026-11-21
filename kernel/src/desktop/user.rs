@@ -69,6 +69,12 @@ const FAULT_LABEL: &str = "esr";
 const FAULT_LABEL: &str = "fault";
 const SLOTS: usize = MAX_PROCESSES;
 const USER_POOL: u32 = POOL_PAGES;
+#[cfg(feature = "cosmic-workspace-applets-v1")]
+const _: () = assert!(cyxia_posix::OPEN_MAX == 128
+    && cyxia_posix::open_description::CAPACITY == 512
+    && cyxia_posix::unix::ENDPOINTS == 128 && cyxia_posix::unix::CONNECTIONS == 64
+    && cyxia_posix::shared_memory::OBJECTS == 32
+    && cyxia_posix::shared_memory::MAPPINGS == cyxia_ai_runtime::COSMIC_SHARED_MAPPING_CAPACITY as usize);
 const _: () = assert!(core::mem::size_of::<Arena>() == MAPPED_PAGES as usize * 4096);
 // The session process layout must match the versioned session admission domain
 // (ai-runtime SESSION_PROCESS_SLOTS); a drift would silently mis-size the pools.
@@ -1251,6 +1257,10 @@ impl Supervisor {
                 | "session-env-probe"
                 | "cosmic-settings-daemon"
                 | "cosmic-panel"
+                | "cosmic-applet-workspaces"
+                | "cosmic-applet-tiling"
+                | "workspace-state-probe"
+                | "workspace-window-probe"
                 | "cosmic-notifications"
                 | "notification-probe"
                 | "settings-probe"
@@ -1493,6 +1503,10 @@ impl Supervisor {
                     "cosmic-settings-daemon"
                         | "cosmic-notifications"
                         | "cosmic-panel"
+                        | "cosmic-applet-workspaces"
+                        | "cosmic-applet-tiling"
+                        | "workspace-state-probe"
+                        | "workspace-window-probe"
                         | "env-probe"
                         | "rust-env-probe"
                         | "wayland-client-probe"
@@ -1860,6 +1874,8 @@ pub fn ai_status(out: &mut impl Write) {
     ai::status(out);
     #[cfg(feature = "ported")]
     pipes::status(out);
+    #[cfg(feature = "ported")]
+    unix::status(out);
     #[cfg(target_arch = "x86_64")]
     parallel::status(out);
     object_status(out);
@@ -1880,6 +1896,23 @@ pub fn object_status(out: &mut impl Write) {
     )
     .unwrap();
     writeln!(out, "ANCILLARY_OBJECTS messages={} references={} staged_messages={} inflight_messages={} staged_refs={} inflight_refs={} capacity_messages={} capacity_references={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r", s.staged_messages + s.inflight_messages, s.staged_references + s.inflight_references, s.staged_messages, s.inflight_messages, s.staged_references, s.inflight_references, cyxia_posix::ancillary::MESSAGES, cyxia_posix::ancillary::REFERENCES).unwrap();
+}
+/// Compact read-only foreground snapshot, separate from the full system dump.
+pub fn object_details(out: &mut impl Write) {
+    object_status(out);
+    ai::shared_status(out);
+    #[cfg(feature = "ported")]
+    unix::status(out);
+    #[cfg(feature = "full-os")]
+    crate::user_heap::pool_status(out);
+    #[cfg(feature = "ported")]
+    crate::shared_memory::status(out);
+    // Bounded by the actual production slot/FD tables.
+    let supervisor = unsafe { &*core::ptr::addr_of!(SUPERVISOR) };
+    for runner in supervisor.runners.iter().filter(|r| r.status.state.active()) {
+        let live = (0..cyxia_posix::OPEN_MAX).filter(|&fd| runner.process.flags(fd as i32).is_ok()).count();
+        writeln!(out, "PROCESS_FDS pid={} live={} capacity={}\r", runner.status.pid, live, cyxia_posix::OPEN_MAX).unwrap();
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

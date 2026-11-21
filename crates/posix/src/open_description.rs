@@ -7,6 +7,12 @@ use cyxia_ai_fs::FileSystem;
 
 pub const CAPACITY: usize = super::limits::PROFILE.open_descriptions;
 pub(crate) const EPOLLS: usize = super::limits::PROFILE.epoll_instances;
+// Weak retry identities need enough slot bits for the selected production pool.
+// The legacy/version-one 256-slot encoding remains byte-for-byte unchanged.
+#[cfg(feature = "cosmic-applets-v1")]
+const SLOT_BITS: u32 = 9;
+#[cfg(not(feature = "cosmic-applets-v1"))]
+const SLOT_BITS: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Handle {
@@ -15,10 +21,10 @@ pub(crate) struct Handle {
 }
 impl Handle {
     pub(crate) fn identity(self) -> u64 {
-        (self.generation << 8) | self.slot as u64
+        (self.generation << SLOT_BITS) | self.slot as u64
     }
 }
-const MAX_GENERATION: u64 = u64::MAX >> 8;
+const MAX_GENERATION: u64 = u64::MAX >> SLOT_BITS;
 
 /// Final-reference cleanup, including the stable backend capability identity.
 /// The resource owner is not the PID making an operation (e.g. TIOCSCTTY).
@@ -307,7 +313,7 @@ impl Table {
     }
 }
 
-const _: () = assert!(CAPACITY <= 256);
+const _: () = assert!(CAPACITY <= 1 << SLOT_BITS);
 
 #[cfg(test)]
 mod tests {
@@ -318,6 +324,21 @@ mod tests {
     };
     use cyxia_ai_fs::FileSystem;
     struct Sink;
+    #[test]
+    fn retry_identities_separate_every_actual_slot_and_generation_boundary() {
+        let mut seen = [0u64; CAPACITY * 3];
+        let mut count = 0;
+        for generation in [1, 2, MAX_GENERATION] {
+            for slot in 0..CAPACITY {
+                let identity = Handle { slot, generation }.identity();
+                assert!(!seen[..count].contains(&identity),
+                        "retry identity aliased slot {slot} generation {generation}");
+                seen[count] = identity;
+                count += 1;
+            }
+        }
+        assert_eq!(Handle { slot: 0, generation: 1 }.identity(), 1 << SLOT_BITS);
+    }
     impl Console for Sink {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
             Ok(bytes.len())

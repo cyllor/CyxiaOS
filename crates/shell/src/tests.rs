@@ -12,7 +12,8 @@ fn send(shell: &mut Shell, s: &[u8]) -> String {
 fn cosmic_catalog_commands_reach_the_process_supervisor() {
     use cyxia_posix::UserRequest;
     let mut shell = Shell::new();
-    for name in ["cosmic-comp", "cosmic-version"] {
+    for name in ["cosmic-comp", "cosmic-version", "cosmic-applet-workspaces",
+                 "cosmic-applet-tiling", "workspace-state-probe", "workspace-window-probe"] {
         let output = send(&mut shell, std::format!("posix exec {name}\r").as_bytes());
         assert!(!output.contains("error:"), "{output}");
         assert_eq!(shell.take_user_request(), Some(UserRequest::Execute(name)));
@@ -190,6 +191,21 @@ fn system_snapshot_requests_are_bounded_read_only_and_not_fabricated() {
     assert!(!output.contains("AI_SYSTEM_END"));
     assert!(shell.take_system_request());
     assert!(!shell.take_system_request());
+    assert_eq!(shell.fs.status().revision, before);
+}
+
+#[test]
+fn object_snapshot_is_read_only_single_pending_and_kernel_completed() {
+    let mut shell = Shell::new();
+    let before = shell.fs.status().revision;
+    let output = send(&mut shell, b"ai objects extra\rai objects\rai system\rai objects\r");
+    assert!(output.contains("invalid arguments"));
+    assert_eq!(output.matches("AI_OBJECTS_REQUEST queued").count(), 1);
+    assert_eq!(output.matches("error: Busy").count(), 2);
+    assert!(!output.contains("AI_OBJECTS_END"));
+    assert!(!shell.take_system_request());
+    assert!(shell.take_objects_request());
+    assert!(!shell.take_objects_request());
     assert_eq!(shell.fs.status().revision, before);
 }
 

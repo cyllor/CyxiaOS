@@ -1,0 +1,28 @@
+{
+  "kind": "cosmic-applet-hosts-v1",
+  "fd_limit": 128,
+  "components": {
+    "panel": {
+      "commit": "3ce6ce1cec97669f91e809962d9446aaefe8a06e",
+      "recipe_sha256": "c3f55caeba06a1df51f1a7d0b4e78f9c6b4e15409ea17b2011a7cb4b7147831c",
+      "source_path": "native-deps/launch-pad/src/native_child.rs",
+      "before_tree_sha256": "47ed336f266b4e48b222fa2e14f763f0ac91bcf9a8daff8a42e17657bad42cf6",
+      "before": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97",
+      "mode_sha256": "c1e79875e488e1a176fcfd0fa043e3e50fc0dd145e5fef102637930faacb1fa0",
+      "after_tree_sha256": "2a69af06a3451d8d1bf74e999f709f9d7e387989c4f79aafa8de6dcbcb15d0a7",
+      "after": "2fff683ace89c0107e5adaf6d7a8e03b520c741f53d50fd4ce997718eea86a25",
+      "patch_sha256": "dedaeb0fdcd6ad57394b88ed852ad091210f51627b64a4d12c02179f36fce5f2"
+    },
+    "session": {
+      "commit": "8093b59bb1262b0612d814e6540ba936303f735a",
+      "recipe_sha256": "97ab75910236d1e38b0af812bfcad51b1766189cb23e4cb84fd7dca466454440",
+      "source_path": "native-deps/launch-pad/src/native_child.rs",
+      "before_tree_sha256": "d243b50ede051e15f8e9b69d04afb03c6fc1d79425dfa877b3a54056740d9cc1",
+      "before": "dc1cf8195fcb1c171064c5a16c97cd5fa347571acdfada02a2f97581564faa97",
+      "mode_sha256": "1582fa668c061751dceb65f4209efcaf82d38f8c18b8a2c88892d8013c21024c",
+      "after_tree_sha256": "4c885b3997742c403bd911708b65f5da4b110bf19d9a4a83176ad4a2a108395f",
+      "after": "2fff683ace89c0107e5adaf6d7a8e03b520c741f53d50fd4ce997718eea86a25",
+      "patch_sha256": "dedaeb0fdcd6ad57394b88ed852ad091210f51627b64a4d12c02179f36fce5f2"
+    }
+  }
+}

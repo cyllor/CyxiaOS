@@ -737,11 +737,29 @@ pub fn user_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Erro
     ))
 }
 
+/// Versioned COSMIC applet socket metadata domain. Retain the original memory
+/// model's conservative low-capacity decisions; free capacity above its trained
+/// 32-unit range saturates rather than extrapolating the weights.
+pub const COSMIC_UNIX_MODEL_ID: u64 = 0x200a;
+pub const COSMIC_UNIX_MODEL_CAPACITY: u32 = 128;
+pub fn cosmic_unix_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > COSMIC_UNIX_MODEL_CAPACITY || requested == 0 || requested > 2 {
+        return Err(Error::Invalid);
+    }
+    Ok((model::memory((free as usize).min(PAGES), requested as usize), COSMIC_UNIX_MODEL_ID))
+}
+
 /// Metadata-only shared object admission. Creating an empty memfd consumes one
 /// preallocated slot and no physical pages. Resize retains its separate page
 /// policy and ledger; the backing table still enforces its actual capacity.
+#[cfg(not(feature = "cosmic-applets-v1"))]
 pub const SHARED_OBJECT_MODEL_ID: u64 = 0x2009;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const SHARED_OBJECT_MODEL_ID: u64 = 0x200b;
+#[cfg(not(feature = "cosmic-applets-v1"))]
 pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = 16;
+#[cfg(feature = "cosmic-applets-v1")]
+pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = 32;
 pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
     if free > SHARED_OBJECT_MODEL_CAPACITY || requested == 0 || requested > SHARED_OBJECT_MODEL_CAPACITY {
         return Err(Error::Invalid);
@@ -749,6 +767,21 @@ pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Er
     let features = [1, free as i32, requested as i32, 0];
     let score: i32 = weights::SHARED_OBJECT.into_iter().zip(features).map(|(w, x)| w * x).sum();
     Ok((score >= 0, SHARED_OBJECT_MODEL_ID))
+}
+
+/// Versioned metadata-only alias admission for the applet profile. Reuse the
+/// linear shared-object weights over the exhaustively checked 0..32 domain.
+/// Holding a mapping consumes no additional physical pages; backing admission,
+/// actual map slots, permissions and revoke-before-release remain authoritative.
+pub const COSMIC_SHARED_MAPPING_MODEL_ID: u64 = 0x200c;
+pub const COSMIC_SHARED_MAPPING_CAPACITY: u32 = 32;
+pub fn cosmic_shared_mapping_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+    if free > COSMIC_SHARED_MAPPING_CAPACITY || requested == 0 || requested > COSMIC_SHARED_MAPPING_CAPACITY {
+        return Err(Error::Invalid);
+    }
+    let features = [1, free as i32, requested as i32, 0];
+    let score: i32 = weights::SHARED_OBJECT.into_iter().zip(features).map(|(w, x)| w * x).sum();
+    Ok((score >= 0, COSMIC_SHARED_MAPPING_MODEL_ID))
 }
 
 /// Process-admission model for the full-OS COSMIC session profile, versioned
