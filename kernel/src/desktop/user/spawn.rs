@@ -461,6 +461,11 @@ impl Supervisor {
             // only this one process's address space is consulted.
             for index in 0..super::threads::MAX_THREADS {
                 if index != 0 {
+                    // Only Child waits need this selected usercopy context.
+                    // Other 4KiB records retain their owner and wait state in place.
+                    if !matches!(runner.threads.parked[index - 1].waiting, Some(Wait::Child { .. })) {
+                        continue;
+                    }
                     core::mem::swap(&mut runner.thread, &mut runner.threads.parked[index - 1]);
                 }
                 if let Some(Wait::Child {

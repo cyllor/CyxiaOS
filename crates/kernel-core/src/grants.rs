@@ -103,6 +103,10 @@ pub struct LedgerSnapshot {
 }
 pub struct BoundedGrantLedger<const RECORDS: usize> {
     capacity: u32,
+    // Exact sums of the live grant records, updated after validation. Their
+    // combined value is bounded by capacity, including promised pages.
+    reserved_unredeemed: u32,
+    in_use: u32,
     grants: [Option<ResourceGrant>; RECORDS],
     redemptions: [Option<Redemption>; RECORDS],
     next_grant: u64,
@@ -112,6 +116,8 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     pub const fn new(capacity: PageCount) -> Self {
         Self {
             capacity: capacity.0,
+            reserved_unredeemed: 0,
+            in_use: 0,
             grants: [None; RECORDS],
             redemptions: [None; RECORDS],
             next_grant: 1,
@@ -119,18 +125,12 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
         }
     }
     pub fn snapshot(&self) -> LedgerSnapshot {
-        let mut s = LedgerSnapshot {
+        LedgerSnapshot {
             capacity: self.capacity,
-            free: self.capacity,
-            reserved_unredeemed: 0,
-            in_use: 0,
-        };
-        for g in self.grants.iter().flatten() {
-            s.reserved_unredeemed += g.remaining;
-            s.in_use += g.in_use;
+            free: self.capacity - (self.reserved_unredeemed + self.in_use),
+            reserved_unredeemed: self.reserved_unredeemed,
+            in_use: self.in_use,
         }
-        s.free -= s.reserved_unredeemed + s.in_use;
-        s
     }
     pub fn commit(&mut self, r: AuthorizedGrantRequest) -> Result<GrantId, GrantError> {
         if r.pages == 0 {
@@ -170,6 +170,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             closed: false,
         });
         self.next_grant = next;
+        self.reserved_unredeemed += r.pages;
         Ok(id)
     }
     /// Atomically admit and redeem one indivisible allocation. Unlike commit(),
@@ -230,6 +231,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
         });
         self.next_grant = next_grant;
         self.next_redemption = next_redemption;
+        self.in_use += r.pages;
         Ok(id)
     }
     fn index(&self, id: GrantId, owner: Owner) -> Result<usize, GrantError> {
@@ -277,6 +279,8 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             ..g
         });
         self.next_redemption = next;
+        self.reserved_unredeemed -= pages.0;
+        self.in_use += pages.0;
         Ok(rid)
     }
     pub fn cancel_unused(&mut self, id: GrantId, owner: Owner) -> Result<PageCount, GrantError> {
@@ -294,6 +298,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
                 ..g
             })
         };
+        self.reserved_unredeemed -= g.remaining;
         Ok(PageCount(g.remaining))
     }
     pub fn release_completed(&mut self, r: ReleaseReceipt) -> Result<(), GrantError> {
@@ -315,12 +320,171 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
         } else {
             Some(ResourceGrant { in_use: used, ..g })
         };
+        self.in_use -= r.pages;
         Ok(())
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn assert_rescan<const N: usize>(ledger: &BoundedGrantLedger<N>) {
+        // Independent oracle: never use the cached aggregates to derive totals.
+        let reserved: u64 = ledger
+            .grants
+            .iter()
+            .flatten()
+            .map(|g| u64::from(g.remaining))
+            .sum();
+        let used: u64 = ledger
+            .grants
+            .iter()
+            .flatten()
+            .map(|g| u64::from(g.in_use))
+            .sum();
+        let redeemed: u64 = ledger
+            .redemptions
+            .iter()
+            .flatten()
+            .map(|r| u64::from(r.pages))
+            .sum();
+        assert_eq!(used, redeemed);
+        assert!(reserved + used <= u64::from(ledger.capacity));
+        assert_eq!(
+            ledger.snapshot(),
+            LedgerSnapshot {
+                capacity: ledger.capacity,
+                free: (u64::from(ledger.capacity) - reserved - used) as u32,
+                reserved_unredeemed: reserved as u32,
+                in_use: used as u32,
+            }
+        );
+    }
+    #[test]
+    fn snapshots_match_records_across_reuse_and_rejected_transitions() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let other = Owner {
+            generation: Generation::new(2).unwrap(),
+            ..owner
+        };
+        let request = |pages| unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(pages)) };
+        let mut ledger = BoundedGrantLedger::<4>::new(PageCount(12));
+        assert_rescan(&ledger);
+        for _ in 0..1000 {
+            assert_eq!(ledger.commit(request(0)), Err(GrantError::Invalid));
+            assert_eq!(
+                ledger.commit_and_redeem(request(0)),
+                Err(GrantError::Invalid)
+            );
+            assert_rescan(&ledger);
+            let grant = ledger.commit(request(3)).unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(
+                ledger.redeem(grant, other, PageCount(1)),
+                Err(GrantError::Owner)
+            );
+            assert_eq!(
+                ledger.redeem(grant, owner, PageCount(0)),
+                Err(GrantError::Invalid)
+            );
+            assert_eq!(
+                ledger.redeem(grant, owner, PageCount(4)),
+                Err(GrantError::Invalid)
+            );
+            assert_eq!(ledger.cancel_unused(grant, other), Err(GrantError::Owner));
+            assert_rescan(&ledger);
+            let first = ledger.redeem(grant, owner, PageCount(1)).unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(ledger.commit(request(2)), Err(GrantError::Metadata));
+            assert_rescan(&ledger);
+            let second = ledger.commit_and_redeem(request(5)).unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(
+                ledger.commit_and_redeem(request(5)),
+                Err(GrantError::Capacity)
+            );
+            assert_eq!(ledger.commit(request(5)), Err(GrantError::Capacity));
+            assert_rescan(&ledger);
+            assert_eq!(ledger.cancel_unused(grant, owner), Ok(PageCount(2)));
+            assert_rescan(&ledger);
+            assert_eq!(ledger.cancel_unused(grant, owner), Err(GrantError::Stale));
+            assert_eq!(
+                ledger.redeem(grant, owner, PageCount(1)),
+                Err(GrantError::Invalid)
+            );
+            // No real mappings exist in this accounting-only test.
+            let receipt = unsafe { ReleaseReceipt::after_revoke(first, owner, PageCount(1)) };
+            assert_eq!(
+                ledger.release_completed(ReleaseReceipt {
+                    owner: other,
+                    ..receipt
+                }),
+                Err(GrantError::Invalid)
+            );
+            assert_eq!(
+                ledger.release_completed(ReleaseReceipt {
+                    pages: 2,
+                    ..receipt
+                }),
+                Err(GrantError::Invalid)
+            );
+            assert_rescan(&ledger);
+            ledger.release_completed(receipt).unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(ledger.release_completed(receipt), Err(GrantError::Stale));
+            assert_rescan(&ledger);
+            ledger
+                .release_completed(unsafe {
+                    ReleaseReceipt::after_revoke(second, owner, PageCount(5))
+                })
+                .unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(ledger.snapshot().free, 12);
+            // Release an open grant before consuming its remaining promise.
+            let grant = ledger.commit(request(2)).unwrap();
+            let redemption = ledger.redeem(grant, owner, PageCount(1)).unwrap();
+            ledger
+                .release_completed(unsafe {
+                    ReleaseReceipt::after_revoke(redemption, owner, PageCount(1))
+                })
+                .unwrap();
+            assert_rescan(&ledger);
+            assert_eq!(ledger.cancel_unused(grant, owner), Ok(PageCount(1)));
+            assert_rescan(&ledger);
+            assert_eq!(ledger.snapshot().free, 12);
+        }
+    }
+    #[test]
+    fn snapshot_totals_support_entire_u32_capacity() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let mut ledger = BoundedGrantLedger::<2>::new(PageCount(u32::MAX));
+        let first = ledger
+            .commit_and_redeem(unsafe {
+                AuthorizedGrantRequest::bootstrap(owner, PageCount(u32::MAX - 1))
+            })
+            .unwrap();
+        let second = ledger
+            .commit_and_redeem(unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1)) })
+            .unwrap();
+        assert_rescan(&ledger);
+        assert_eq!(ledger.snapshot().free, 0);
+        ledger
+            .release_completed(unsafe {
+                ReleaseReceipt::after_revoke(first, owner, PageCount(u32::MAX - 1))
+            })
+            .unwrap();
+        assert_rescan(&ledger);
+        ledger
+            .release_completed(unsafe { ReleaseReceipt::after_revoke(second, owner, PageCount(1)) })
+            .unwrap();
+        assert_rescan(&ledger);
+        assert_eq!(ledger.snapshot().free, u32::MAX);
+    }
     #[test]
     fn large_atomic_redemption_is_one_record_and_capacity_failures_are_atomic() {
         let owner = Owner {

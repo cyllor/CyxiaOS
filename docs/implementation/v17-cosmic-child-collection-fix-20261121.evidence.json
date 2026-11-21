@@ -1,0 +1,170 @@
+{
+  "baseline_calendar_seconds": {
+    "calendar_closed": 22.691,
+    "calendar_closed_again": 19.9,
+    "calendar_open": 7.698,
+    "calendar_reopened": 7.161
+  },
+  "baseline_commit": "1e1e26ab3ab4d2a0aedf7349dbc8ccac244a808c",
+  "compiled_source_changes": [
+    "crates/kernel-core/src/grants.rs",
+    "kernel/src/desktop/user/spawn.rs",
+    "user/ported/workspace_state_probe.c"
+  ],
+  "complete_teardown": {
+    "anonymous_used": 0,
+    "open_descriptions": 0,
+    "shared": {
+      "description_refs": 0,
+      "free_pages": 4096,
+      "grant_reserved": 0,
+      "grant_used": 0,
+      "mapping_refs": 0,
+      "mappings": 0,
+      "metadata_capacity": 32,
+      "objects": 0,
+      "page_capacity": 4096,
+      "pages": 0
+    },
+    "unix": {
+      "connections": 64,
+      "endpoints": 128,
+      "free_bindings": 126,
+      "free_connections": 64,
+      "free_endpoints": 128
+    }
+  },
+  "cosmic_session_verified": false,
+  "cpus": 4,
+  "deadline_seconds": 15,
+  "embedded_input_changes": [
+    "workspace-state-probe.elf"
+  ],
+  "full_os_verified": false,
+  "image_artifacts": {
+    "boot.bin": "acba952e526fbabbc8f52f93e1680a18d1f984e97144c83f0ea0729b43cff6d1",
+    "kernel.elf": "70b706a095cec5b7356f1c6f56376fed13fdcf43728b18f1fadb13244179d169"
+  },
+  "ram_mib": 1024,
+  "receipts": [
+    {
+      "bytes": 199117,
+      "path": "artifacts/v017-os-workspace-applets-1g-v15/build-manifest.json",
+      "sha256": "beffe9abd6748f1ce7441a294f72f7f76e6230fea76a330f6b6734ffb5abe99a"
+    },
+    {
+      "bytes": 199117,
+      "path": "artifacts/v017-os-calendar-ledger-fix-1g-v1/build-manifest.json",
+      "sha256": "573425b7c7480e37bac6c8dc2b7dd59d43eed3d70a814bdba65421d861211d96"
+    },
+    {
+      "bytes": 199117,
+      "path": "artifacts/v017-os-calendar-observer-fix-1g-v1/build-manifest.json",
+      "sha256": "23f956048ae6d512718d814b5b119f541bfecedddb02743772eb5fda2d173675"
+    },
+    {
+      "bytes": 25441,
+      "path": "artifacts/v017-workspace-list-1g-v10/workspace-result.json",
+      "sha256": "20bcb928d19673a36a87f087a57f3a4d3454356e9da1077d5ef17dd396ff9950"
+    },
+    {
+      "bytes": 25283,
+      "path": "artifacts/v017-workspace-calendar-ledger-1g-v1/workspace-result.json",
+      "sha256": "33728e3b5c70b1368f0c6f5a0cd45c88bee07b989b474937c0e9f94819d7fc5e"
+    },
+    {
+      "bytes": 9317,
+      "path": "artifacts/v017-workspace-calendar-ledger-1g-v2/workspace-result.json",
+      "sha256": "3ce2ffeb68821d22dc8838b4c761467c051afad827c4c6fd08cc5a9738e157e9"
+    },
+    {
+      "bytes": 831883,
+      "path": "artifacts/v017-calendar-ledger-fixed-three-v1/calendar-audit.json",
+      "sha256": "d8486d6557945d856f7aa89c88c52155d28768edb6da599228a736ee3ac2ad0f"
+    },
+    {
+      "bytes": 29418,
+      "path": "artifacts/v017-workspace-calendar-observer-1g-v1/result.json",
+      "sha256": "1c5895bd5761e735758574c72d8e5be5ababd26658132f2aa66f7a160a67f955"
+    },
+    {
+      "bytes": 25604,
+      "path": "artifacts/v017-workspace-calendar-observer-1g-v1/workspace-result.json",
+      "sha256": "89198858d96c8061c8926a25f81fb0eda1fb240a0e80689ef63e08352d1c3dac"
+    },
+    {
+      "bytes": 123155,
+      "path": "artifacts/v017-workspace-calendar-observer-1g-v1/serial.raw",
+      "sha256": "1092eb35fba8d0fa7f174f5af5b7c16bbda4740c280edbe22daf856f178b03ed"
+    },
+    {
+      "bytes": 4666,
+      "path": "artifacts/v017-workspace-calendar-observer-1g-v1/interaction-producers.json",
+      "sha256": "1b2c0e5df6ba147afb5c8ae476a03fdfc3ccc7c53c1dec03e8b6cd5a348a0dd5"
+    },
+    {
+      "bytes": 83362,
+      "path": "artifacts/v017-workspace-calendar-observer-1g-v1/workspace-qmp.json",
+      "sha256": "065ee2e93d36241a7ff44876bbb6b11aadbd5d3804718530d0387ece50f8efb9"
+    },
+    {
+      "bytes": 8009,
+      "path": "artifacts/v017-native-calendar-observer-1g-v1/summary.json",
+      "sha256": "a6d442590fa2b06b60b2b20c9dc6bbc16137fc282d5e2aa8da7efeaf1edb8697"
+    },
+    {
+      "bytes": 5277,
+      "path": "artifacts/v017-native-calendar-observer-1g-v1/serial.raw",
+      "sha256": "7070795db3f9b7975c5a8db34d1118225791d9ccad5d755f2ccb0d5ee3102a49"
+    },
+    {
+      "bytes": 22592,
+      "path": "artifacts/v017-workspace-state-probe-v3/workspace-probe-origin.json",
+      "sha256": "154bdc0d3b7d76e4a7cad2cc2c68ea4a492da217e4b5353a0001face92b792bc"
+    },
+    {
+      "bytes": 9252,
+      "path": "artifacts/debug/child-collection-fix-20261121/red.log",
+      "sha256": "23813e9b5a2fdb181c3d205cd8221eda328fecd54256f9cd8fac01495c8b610d"
+    },
+    {
+      "bytes": 1182,
+      "path": "artifacts/debug/child-collection-fix-20261121/ledger-red.log",
+      "sha256": "8ffa8f3833a24b19966f3038b52c93d41cf2ede45d1aaabafa6c119a0d5d09f9"
+    },
+    {
+      "bytes": 1966,
+      "path": "artifacts/debug/child-collection-fix-20261121/workspace-output-cap-red.log",
+      "sha256": "2d897b5e0e0d8b55c16e6db2dd2e3f68af03cdcf31b9b97602a2652a7e175b9f"
+    },
+    {
+      "bytes": 1417,
+      "path": "artifacts/debug/child-collection-fix-20261121/host-final.log",
+      "sha256": "b13d7355952a0b604bfa4be52b548378a3e64f01052d8fa9c710b71233952beb"
+    },
+    {
+      "bytes": 51295,
+      "path": "artifacts/debug/child-collection-fix-20261121/ledger-core-posix-ai-final.log",
+      "sha256": "380c4d06b1ef926a6a3b209a7aa0be1e4b71e700a518441f535618acff12eb24"
+    },
+    {
+      "bytes": 425,
+      "path": "artifacts/debug/child-collection-fix-20261121/full-os-object-profile-final.log",
+      "sha256": "89cf88e2db5810f06f595065af21a75fe02621543945d0062dd041e5ad8d660a"
+    },
+    {
+      "bytes": 420,
+      "path": "artifacts/debug/child-collection-fix-20261121/workspace-output-green.log",
+      "sha256": "756a60a172e495ab203ad11fc0bc3635adaa869ce46f6fe8a0ecc03dc8b90f60"
+    }
+  ],
+  "schema": 1,
+  "scope": "One-GiB three-applet workspace, tiling and calendar regression",
+  "semantic_frame_verified": false,
+  "verified_calendar_seconds": {
+    "calendar_closed": 11.562,
+    "calendar_closed_again": 11.002,
+    "calendar_open": 6.598,
+    "calendar_reopened": 6.089
+  }
+}

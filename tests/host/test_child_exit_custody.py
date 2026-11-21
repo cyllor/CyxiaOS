@@ -37,7 +37,8 @@ def production_program():
     runner = [function(user, "fn finish("), function(user, "fn block("),
               function(spawn, "pub(super) fn request_wait("),
               function(spawn, "pub(super) fn supervisor_result("),
-              function(threads, "pub(super) fn refresh_thread_state(")]
+              function(threads, "pub(super) fn refresh_thread_state("),
+              function(threads, "pub(super) fn has_runnable_thread(")]
     template = template.replace("// RUNNER_METHODS", "\n".join(runner))
     supervisor = [
         function(user, "fn launch(&mut self,"), launch,
@@ -58,7 +59,7 @@ class ChildExitCustody(unittest.TestCase):
             source = directory / "harness.rs"
             (directory / "Cargo.toml").write_text(
                 '[package]\nname="child-exit-custody"\nversion="0.1.0"\nedition="2024"\n'
-                '[lib]\npath="harness.rs"\n[features]\ndefault=["ported"]\nported=[]\nfull-os=[]\n'
+                '[lib]\npath="harness.rs"\n[features]\ndefault=["ported"]\nported=[]\nfull-os=[]\ncosmic-session=["full-os"]\n'
                 '[dependencies]\ncyxia-posix={path=' + json.dumps(str(ROOT / "crates/posix"))
                 + '}\ncyxia-ai-runtime={path=' + json.dumps(str(ROOT / "crates/ai-runtime"))
                 + '}\n[workspace]\n')
@@ -98,6 +99,8 @@ fn mark(out: &mut impl Write, name: &str) { write!(out, "{name} ").unwrap(); }
 mod ai { pub fn status(out: &mut impl std::fmt::Write) { super::mark(out, "ai"); } }
 #[cfg(feature = "ported")]
 mod pipes { pub fn status(out: &mut impl std::fmt::Write) { super::mark(out, "pipes"); } }
+#[cfg(feature = "ported")]
+mod unix { pub fn status(out: &mut impl std::fmt::Write) { super::mark(out, "unix"); } }
 mod parallel { pub fn status(out: &mut impl std::fmt::Write) { super::mark(out, "parallel"); } }
 #[cfg(feature = "ported")]
 mod shared_memory { pub fn status(out: &mut impl std::fmt::Write) { super::mark(out, "shared"); } }
@@ -109,6 +112,7 @@ fn actual_status_uses_only_built_domains() {
     ai_status(&mut output);
     assert!(output.contains("ai ") && output.contains("objects "));
     assert_eq!(output.contains("pipes "), cfg!(feature = "ported"));
+    assert_eq!(output.contains("unix "), cfg!(feature = "ported"));
     assert_eq!(output.contains("shared "), cfg!(feature = "ported"));
 }
 '''

@@ -4,7 +4,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <time.h>
+#include <unistd.h>
 #include <wayland-client.h>
 #include "ext-workspace.h"
 #include "cosmic-workspace.h"
@@ -142,6 +144,41 @@ static int roundtrip(struct wl_display *display) {
     }
     return 0;
 }
+
+static int write_state_record(char *line, size_t size) {
+    enum { CONSOLE_CHUNK = 64, MAX_VECTORS = 16 };
+    struct iovec vectors[MAX_VECTORS];
+    int count = 0;
+    if (size == 0 || size > CONSOLE_CHUNK * MAX_VECTORS) return 0;
+
+    // CPU0 handles the whole writev in one service turn, including the chunks
+    // of long hex names. Keep every vector within the console write limit.
+    for (size_t offset = 0; offset < size; offset += CONSOLE_CHUNK) {
+        size_t remain = size - offset;
+        vectors[count++] = (struct iovec){
+            .iov_base = line + offset,
+            .iov_len = remain < CONSOLE_CHUNK ? remain : CONSOLE_CHUNK,
+        };
+    }
+    return writev(STDOUT_FILENO, vectors, count) == (ssize_t)size;
+}
+
+static int report_workspace(const struct workspace *w) {
+    static const char hex[] = "0123456789abcdef";
+    char name_hex[2 * sizeof(w->name) + 1];
+    size_t used = 0;
+    for (const unsigned char *s = (const unsigned char *)w->name; *s; s++) {
+        name_hex[used++] = hex[*s >> 4];
+        name_hex[used++] = hex[*s & 15];
+    }
+    name_hex[used] = '\0';
+    char line[sizeof(name_hex) + 64];
+    int size = snprintf(line, sizeof(line), "WORKSPACE_STATE workspace name_hex=%s active=%u tiling=%u\n",
+                        name_hex, (unsigned)(w->state & 1), w->tiling);
+    if (size <= 0 || (size_t)size >= sizeof(line)) return 0;
+    return write_state_record(line, (size_t)size);
+}
+
 int main(void) {
     setbuf(stdout, NULL);
     struct wl_display *display = wl_display_connect(NULL);
@@ -157,13 +194,16 @@ int main(void) {
         struct workspace *w = &workspaces[i];
         if (w->removed) continue;
         if (!w->named || !w->tiled) invalid = 1;
-        printf("WORKSPACE_STATE workspace name_hex=");
-        for (const unsigned char *s = (unsigned char *)w->name; *s; s++) printf("%02x", *s);
-        printf(" active=%u tiling=%u\n", !!(w->state & 1), w->tiling);
+        if (!report_workspace(w)) invalid = 1;
         live++; active += !!(w->state & 1);
     }
     int passed = !invalid && completed && manager && cosmic_manager && live && active == 1;
-    printf("WORKSPACE_STATE %s workspaces=%u active=%u\n", passed ? "PASS" : "FAIL", live, active);
+    char summary[64];
+    int size = snprintf(summary, sizeof(summary), "WORKSPACE_STATE %s workspaces=%u active=%u\n",
+                        passed ? "PASS" : "FAIL", live, active);
+    if (size <= 0 || (size_t)size >= sizeof(summary) || !write_state_record(summary, (size_t)size)) {
+        passed = 0;
+    }
     wl_registry_destroy(registry);
     wl_display_disconnect(display);
     return passed ? 0 : 3;
