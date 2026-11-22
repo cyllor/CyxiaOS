@@ -109,8 +109,11 @@ pub struct BoundedGrantLedger<const RECORDS: usize> {
     in_use: u32,
     grants: [Option<ResourceGrant>; RECORDS],
     redemptions: [Option<Redemption>; RECORDS],
+    live_redemptions: usize,
     next_grant: u64,
     next_redemption: u64,
+    #[cfg(test)]
+    record_checks: core::cell::Cell<usize>,
 }
 impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     pub const fn new(capacity: PageCount) -> Self {
@@ -120,8 +123,11 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             in_use: 0,
             grants: [None; RECORDS],
             redemptions: [None; RECORDS],
+            live_redemptions: 0,
             next_grant: 1,
             next_redemption: 1,
+            #[cfg(test)]
+            record_checks: core::cell::Cell::new(0),
         }
     }
     /// Restrict a fresh ledger to the frames actually reserved at boot.
@@ -143,6 +149,26 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             in_use: self.in_use,
         }
     }
+    fn find_record<T>(
+        &self,
+        records: &[Option<T>; RECORDS],
+        id: u64,
+        mut accepts: impl FnMut(&Option<T>) -> bool,
+    ) -> Option<usize> {
+        let preferred = id.checked_rem(RECORDS as u64)? as usize;
+        let mut check = |record: &Option<T>| {
+            #[cfg(test)]
+            self.record_checks.set(self.record_checks.get() + 1);
+            accepts(record)
+        };
+        // IDs retain their full identity. Collisions can place a record away
+        // from its preferred slot, so lookups validate the record and fall back.
+        if check(&records[preferred]) {
+            Some(preferred)
+        } else {
+            records.iter().position(check)
+        }
+    }
     pub fn commit(&mut self, r: AuthorizedGrantRequest) -> Result<GrantId, GrantError> {
         if r.pages == 0 {
             return Err(GrantError::Invalid);
@@ -158,14 +184,11 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             return Err(GrantError::Exhausted);
         }
         // One future redemption record per unredeemed page guarantees bounded metadata.
-        let records = self.redemptions.iter().flatten().count();
-        if records as u64 + s.reserved_unredeemed as u64 + r.pages as u64 > RECORDS as u64 {
+        if self.live_redemptions as u64 + promised_ids > RECORDS as u64 {
             return Err(GrantError::Metadata);
         }
         let slot = self
-            .grants
-            .iter()
-            .position(Option::is_none)
+            .find_record(&self.grants, self.next_grant, Option::is_none)
             .ok_or(GrantError::Metadata)?;
         let next = self
             .next_grant
@@ -202,19 +225,14 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
         if promised_ids > u64::MAX - self.next_redemption {
             return Err(GrantError::Exhausted);
         }
-        let records = self.redemptions.iter().flatten().count();
-        if records as u64 + promised_ids > RECORDS as u64 {
+        if self.live_redemptions as u64 + promised_ids > RECORDS as u64 {
             return Err(GrantError::Metadata);
         }
         let grant_slot = self
-            .grants
-            .iter()
-            .position(Option::is_none)
+            .find_record(&self.grants, self.next_grant, Option::is_none)
             .ok_or(GrantError::Metadata)?;
         let redemption_slot = self
-            .redemptions
-            .iter()
-            .position(Option::is_none)
+            .find_record(&self.redemptions, self.next_redemption, Option::is_none)
             .ok_or(GrantError::Metadata)?;
         let next_grant = self
             .next_grant
@@ -240,6 +258,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             owner: r.owner,
             pages: r.pages,
         });
+        self.live_redemptions += 1;
         self.next_grant = next_grant;
         self.next_redemption = next_redemption;
         self.in_use += r.pages;
@@ -247,9 +266,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     }
     fn index(&self, id: GrantId, owner: Owner) -> Result<usize, GrantError> {
         let i = self
-            .grants
-            .iter()
-            .position(|g| g.is_some_and(|g| g.id == id))
+            .find_record(&self.grants, id.get(), |g| g.is_some_and(|g| g.id == id))
             .ok_or(GrantError::Stale)?;
         if self.grants[i].unwrap().owner != owner {
             Err(GrantError::Owner)
@@ -269,9 +286,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             return Err(GrantError::Invalid);
         }
         let j = self
-            .redemptions
-            .iter()
-            .position(Option::is_none)
+            .find_record(&self.redemptions, self.next_redemption, Option::is_none)
             .ok_or(GrantError::Metadata)?;
         let next = self
             .next_redemption
@@ -284,6 +299,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             owner,
             pages: pages.0,
         });
+        self.live_redemptions += 1;
         self.grants[i] = Some(ResourceGrant {
             remaining: g.remaining - pages.0,
             in_use: g.in_use + pages.0,
@@ -314,9 +330,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     }
     pub fn release_completed(&mut self, r: ReleaseReceipt) -> Result<(), GrantError> {
         let j = self
-            .redemptions
-            .iter()
-            .position(|x| x.is_some_and(|x| x.id == r.id))
+            .find_record(&self.redemptions, r.id.get(), |x| x.is_some_and(|x| x.id == r.id))
             .ok_or(GrantError::Stale)?;
         let d = self.redemptions[j].unwrap();
         if d.owner != r.owner || d.pages != r.pages {
@@ -326,6 +340,7 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
         let g = self.grants[i].unwrap();
         let used = g.in_use.checked_sub(r.pages).ok_or(GrantError::Invalid)?;
         self.redemptions[j] = None;
+        self.live_redemptions -= 1;
         self.grants[i] = if used == 0 && g.remaining == 0 {
             None
         } else {
@@ -338,6 +353,76 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noncolliding_ids_check_one_record_per_table_at_full_occupancy() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let request = unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(1)) };
+        let mut ledger = GrantLedger::new(PageCount(129));
+        let mut last = None;
+        for _ in 0..ledger.grants.len() {
+            ledger.record_checks.set(0);
+            last = Some(ledger.commit_and_redeem(request).unwrap());
+            assert_eq!(ledger.record_checks.get(), 2);
+        }
+        assert_eq!(ledger.commit_and_redeem(request), Err(GrantError::Metadata));
+        ledger.record_checks.set(0);
+        let receipt = unsafe { ReleaseReceipt::after_revoke(last.unwrap(), owner, PageCount(1)) };
+        ledger.release_completed(receipt).unwrap();
+        assert_eq!(ledger.record_checks.get(), 2);
+        assert_eq!(ledger.snapshot().free, 2);
+        assert_rescan(&ledger);
+    }
+
+    #[test]
+    fn colliding_ids_keep_generations_owners_and_receipts_distinct() {
+        let owner = Owner {
+            task: TaskId::new(1).unwrap(),
+            generation: Generation::new(1).unwrap(),
+        };
+        let other = Owner {
+            generation: Generation::new(2).unwrap(),
+            ..owner
+        };
+        let request = |owner, pages| unsafe {
+            AuthorizedGrantRequest::bootstrap(owner, PageCount(pages))
+        };
+        let receipt = |id, owner| unsafe { ReleaseReceipt::after_revoke(id, owner, PageCount(1)) };
+        let mut ledger = BoundedGrantLedger::<3>::new(PageCount(12));
+        let first = ledger.commit(request(owner, 1)).unwrap();
+        let first_redemption = ledger.redeem(first, owner, PageCount(1)).unwrap();
+        for _ in 0..2 {
+            let temporary = ledger.commit_and_redeem(request(other, 1)).unwrap();
+            ledger.release_completed(receipt(temporary, other)).unwrap();
+        }
+        let colliding = ledger.commit(request(other, 2)).unwrap();
+        let second_redemption = ledger.redeem(colliding, other, PageCount(1)).unwrap();
+        assert_eq!(colliding.get() - first.get(), 3);
+        assert_eq!(second_redemption.get() - first_redemption.get(), 3);
+        let before = ledger.snapshot();
+        assert_eq!(ledger.cancel_unused(colliding, owner), Err(GrantError::Owner));
+        assert_eq!(
+            ledger.release_completed(receipt(second_redemption, owner)),
+            Err(GrantError::Invalid)
+        );
+        assert_eq!(ledger.snapshot(), before);
+        assert_rescan(&ledger);
+
+        ledger.release_completed(receipt(first_redemption, owner)).unwrap();
+        assert_eq!(ledger.cancel_unused(first, owner), Err(GrantError::Stale));
+        assert_eq!(
+            ledger.release_completed(receipt(first_redemption, owner)),
+            Err(GrantError::Stale)
+        );
+        assert_eq!(ledger.cancel_unused(colliding, other), Ok(PageCount(1)));
+        ledger.release_completed(receipt(second_redemption, other)).unwrap();
+        assert_eq!(ledger.snapshot().free, 12);
+        assert_rescan(&ledger);
+    }
+
     fn assert_rescan<const N: usize>(ledger: &BoundedGrantLedger<N>) {
         // Independent oracle: never use the cached aggregates to derive totals.
         let reserved: u64 = ledger
@@ -358,6 +443,10 @@ mod tests {
             .flatten()
             .map(|r| u64::from(r.pages))
             .sum();
+        assert_eq!(
+            ledger.live_redemptions,
+            ledger.redemptions.iter().flatten().count()
+        );
         assert_eq!(used, redeemed);
         assert!(reserved + used <= u64::from(ledger.capacity));
         assert_eq!(
