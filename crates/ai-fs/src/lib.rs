@@ -608,19 +608,32 @@ impl FileSystem {
     }
     fn proposal(&mut self) -> CacheDecision {
         let (x, valid) = self.features();
+        self.proposal_from(x, valid)
+    }
+    /// A read already computed these features for the learning window; scoring
+    /// the same node table twice per read is redundant.
+    fn proposal_from(
+        &mut self, x: [[i32; 4]; NODES], valid: [bool; NODES],
+    ) -> CacheDecision {
         let ai_selected = valid.iter().filter(|valid| **valid).count() > CACHE_LINES;
         if ai_selected {
             self.policy.cache_proposals = self.policy.cache_proposals.saturating_add(1);
         }
         let mut ids = [None; CACHE_LINES];
+        // Rank each candidate once. Re-scoring both sides of every comparison
+        // repeated the same dot product O(CACHE_LINES * NODES) times per read.
+        let mut rank = [0i32; NODES];
+        for i in 0..NODES {
+            if valid[i] {
+                rank[i] = self.brain.rank(x[i]);
+            }
+        }
         for slot in 0..CACHE_LINES {
             let mut best = None;
             for i in 0..NODES {
                 if valid[i]
                     && !ids.contains(&Some(i))
-                    && best.is_none_or(|b: usize| {
-                        ai_selected && self.brain.rank(x[i]) > self.brain.rank(x[b])
-                    })
+                    && best.is_none_or(|b: usize| ai_selected && rank[i] > rank[b])
                 {
                     best = Some(i);
                 }
@@ -713,7 +726,7 @@ impl FileSystem {
         self.nodes[i].last = next;
         let (x, valid) = self.features();
         self.brain.observe_read(i, x, valid);
-        let proposal = self.proposal();
+        let proposal = self.proposal_from(x, valid);
         self.commit_cache(proposal)?;
         if len != 0 {
             self.record_change(i, events::Action::Access, 0);
