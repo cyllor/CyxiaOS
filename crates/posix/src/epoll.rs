@@ -122,6 +122,25 @@ pub enum Source {
     Pty { owner: u32, handle: u64 },
 }
 
+/// Which pool answers a watch. A backend observation names its own kind so the
+/// shared table can skip unrelated watches without exposing the object table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Local,
+    Socket,
+    Pipe,
+    Pty,
+}
+
+fn backend_of(object: Object) -> Backend {
+    match object {
+        Object::Socket(_) => Backend::Socket,
+        Object::Pipe(_) => Backend::Pipe,
+        Object::Pty(_) => Backend::Pty,
+        _ => Backend::Local,
+    }
+}
+
 fn source(object: Object, owner: u32) -> Result<Source, Errno> {
     Ok(match object {
         Object::Event { counter, .. } => Source::Local {
@@ -142,7 +161,11 @@ impl super::OpenDescriptions {
     /// The closure must only inspect the already borrowed backend pool. It must
     /// not call another pool or reenter this OFD table. Empty watch slots need
     /// no readiness work, even in an instance whose descriptor limit is large.
-    pub fn observe_backend(&self, mut sample: impl FnMut(Source) -> Option<(u32, u32)>) {
+    pub fn observe_backend(
+        &self,
+        backend: Backend,
+        mut sample: impl FnMut(Source) -> Option<(u32, u32)>,
+    ) {
         let mut table = self.inner.borrow_mut();
         let mut wakes = [false; super::open_description::EPOLLS];
         let super::open_description::Table {
@@ -170,6 +193,13 @@ impl super::OpenDescriptions {
                 let Some(description) = entry.value else {
                     continue;
                 };
+                // A pool only answers for its own backend kind. Skipping the
+                // others here is equivalent to the closure returning None, but
+                // avoids the entry lookup, source construction and call for
+                // every unrelated watch in the shared table.
+                if backend_of(description.object) != backend {
+                    continue;
+                }
                 if let Ok(source) = source(description.object, entry.owner)
                     && let Some((ready, notifications)) = sample(source)
                 {
@@ -507,7 +537,7 @@ mod tests {
             Source::Local { read, .. } => Ok(u32::from(read) * IN),
             _ => panic!("expected a real eventfd watch"),
         };
-        objects.observe_backend(|source| Some((source_readiness(source).unwrap(), 0)));
+        objects.observe_backend(Backend::Local, |source| Some((source_readiness(source).unwrap(), 0)));
         assert_eq!(objects.inner.borrow().backend_slots_visited.get(), 2);
         let readiness = owner.epoll_sample(epfd, source_readiness).unwrap();
         let mut events = [Event::default(); 1];
@@ -546,7 +576,7 @@ mod tests {
         const ROUNDS: usize = 5000;
         for _ in 0..ROUNDS {
             let readiness = p.epoll_sample(root, sample).unwrap();
-            objects.observe_backend(|source| Some((sample(source).unwrap(), 0)));
+            objects.observe_backend(Backend::Local, |source| Some((sample(source).unwrap(), 0)));
             let mut events = [Event::default(); 1];
             assert_eq!(p.epoll_collect(root, &readiness, &mut events), Ok(1));
             assert_eq!(events[0], Event { events: IN, data: 42 });
@@ -831,6 +861,40 @@ mod tests {
         p.close_all(&mut fs).unwrap();
     }
 
+    /// A pool observation must not even call the sampler for a foreign kind.
+    /// Before the kind filter the closure ran for every occupied watch and
+    /// rejected the mismatched Source itself.
+    #[test]
+    fn backend_observation_samples_only_its_own_kind() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut pipes = crate::pipe::Pipes::new();
+        let handles = pipes.pair(1).unwrap();
+        let [reader, _writer] = p.install_pipe(handles, 0).unwrap();
+        let event = p.eventfd(1, 0).unwrap();
+        let ep = p.epoll_create(0).unwrap();
+        p.epoll_ctl(ep, 1, reader, Event { events: IN, data: 1 }).unwrap();
+        p.epoll_ctl(ep, 1, event, Event { events: IN, data: 2 }).unwrap();
+        let mut sampled = 0;
+        objects.observe_backend(Backend::Pipe, |source| {
+            let Source::Pipe { .. } = source else {
+                panic!("pipe observation sampled a foreign backend");
+            };
+            sampled += 1;
+            Some((IN, 0))
+        });
+        assert_eq!(sampled, 1, "the pipe watch was not observed");
+        let mut local = 0;
+        objects.observe_backend(Backend::Local, |source| {
+            let Source::Local { .. } = source else {
+                panic!("local observation sampled a foreign backend");
+            };
+            local += 1;
+            Some((IN, 0))
+        });
+        assert_eq!(local, 1, "the local watch was not observed");
+    }
+
     #[test]
     fn nested_backend_sampling_allows_notifications_and_ignores_unrelated_owners() {
         let objects = crate::OpenDescriptions::new();
@@ -885,7 +949,7 @@ mod tests {
                     let ready = u32::from(pipes.poll(owner, handle)?);
                     // This is the actual backend-wrapper callback pattern. It must
                     // not encounter a held OFD borrow or lose its pending edge.
-                    objects.observe_backend(|source| match source {
+                    objects.observe_backend(Backend::Pipe, |source| match source {
                         Source::Pipe { owner, handle } => Some((
                             u32::from(pipes.poll(owner, handle).unwrap()),
                             pipes.wake_mask(owner, handle).unwrap(),

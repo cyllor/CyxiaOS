@@ -32,13 +32,16 @@ pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> R
     let result = f(pool);
     // Other backend pools are released only after this borrow ends. Socket
     // cleanup itself stays inside the safe POSIX pool operation without reentry.
-    super::objects::table().observe_backend(|source| {
-        let epoll::Source::Socket { owner, handle: raw } = source else {
-            return None;
-        };
-        let ready = pool.poll(owner, handle(raw)).ok()?;
-        Some((ready_bits(ready), pool.wake_mask(owner, handle(raw)).unwrap_or(0)))
-    });
+    super::objects::table().observe_backend(
+        epoll::Backend::Socket,
+        |source| {
+            let epoll::Source::Socket { owner, handle: raw } = source else {
+                return None;
+            };
+            let ready = pool.poll(owner, handle(raw)).ok()?;
+            Some((ready_bits(ready), pool.wake_mask(owner, handle(raw)).unwrap_or(0)))
+        },
+    );
     pool.clear_wakes();
     result
 }

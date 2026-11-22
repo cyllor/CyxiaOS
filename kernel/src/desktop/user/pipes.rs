@@ -25,15 +25,18 @@ pub(super) fn with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<
     // the pool and the callback cannot return a reference to its entries.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
     let result = f(pool);
-    super::objects::table().observe_backend(|source| {
-        let cyxia_posix::epoll::Source::Pipe { owner, handle } = source else {
-            return None;
-        };
-        Some((
-            u32::from(pool.poll(owner, handle).ok()?),
-            pool.wake_mask(owner, handle).unwrap_or(0),
-        ))
-    });
+    super::objects::table().observe_backend(
+        cyxia_posix::epoll::Backend::Pipe,
+        |source| {
+            let cyxia_posix::epoll::Source::Pipe { owner, handle } = source else {
+                return None;
+            };
+            Some((
+                u32::from(pool.poll(owner, handle).ok()?),
+                pool.wake_mask(owner, handle).unwrap_or(0),
+            ))
+        },
+    );
     pool.clear_wakes();
     result
 }
