@@ -156,12 +156,17 @@ impl Pipes {
             return Err(Errno::Again);
         }
         let n = out.len().min(pipe.len);
-        for (i, byte) in out[..n].iter_mut().enumerate() {
-            let offset = (pipe.head + i) % CAPACITY;
-            *byte = pipe.bytes[offset];
-            pipe.bytes[offset] = 0;
+        // Two contiguous runs instead of a per-byte modulo: the ring wraps at
+        // most once, so each run is a single slice copy and a single clear.
+        let start = pipe.head;
+        let first = n.min(CAPACITY - start);
+        out[..first].copy_from_slice(&pipe.bytes[start..start + first]);
+        pipe.bytes[start..start + first].fill(0);
+        if first < n {
+            out[first..n].copy_from_slice(&pipe.bytes[..n - first]);
+            pipe.bytes[..n - first].fill(0);
         }
-        pipe.head = (pipe.head + n) % CAPACITY;
+        pipe.head = (start + n) % CAPACITY;
         pipe.len -= n;
         if n != 0 {
             pipe.wakes[1] |= OUT;
@@ -205,8 +210,11 @@ impl Pipes {
             return Err(Errno::Again);
         }
         let n = free.min(bytes.len());
-        for (i, byte) in bytes[..n].iter().enumerate() {
-            pipe.bytes[(pipe.head + pipe.len + i) % CAPACITY] = *byte;
+        let start = (pipe.head + pipe.len) % CAPACITY;
+        let first = n.min(CAPACITY - start);
+        pipe.bytes[start..start + first].copy_from_slice(&bytes[..first]);
+        if first < n {
+            pipe.bytes[..n - first].copy_from_slice(&bytes[first..n]);
         }
         pipe.len += n;
         pipe.wakes[0] |= IN;

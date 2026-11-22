@@ -169,6 +169,7 @@ pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
     # frame/grant/object effects are witnesses; VM, unmap, PTE and alias bodies
     # are production code. This does not replace the native memory probes.
     heap_unmap = function(heap, '    pub fn unmap_with_revoke(')
+    heap_unmap += '\n' + function(heap, '    fn unmap_slot_with_revoke(')
     heap_unmap = heap_unmap.replace('#[cfg(feature = "full-os")]', '#[cfg(all())]')
     heap_unmap = heap_unmap.replace('#[cfg(not(feature = "full-os"))]', '#[cfg(any())]')
     files['revoke-order.rs'] = (HERE / 'page_mapping_revoke_cases.rs').read_text().replace(

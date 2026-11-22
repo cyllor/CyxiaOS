@@ -306,7 +306,15 @@ impl Heap {
             .iter()
             .position(|a| a.is_some_and(|a| a.start == start && a.pages == pages))
             .ok_or(Errno::Inval)?;
+        self.unmap_slot_with_revoke(slot, revoke)
+    }
+    /// Release a known record without searching for it again. Teardown already
+    /// walks every slot, so re-identifying each one by address made it O(A²).
+    fn unmap_slot_with_revoke(
+        &mut self, slot: usize, revoke: impl FnOnce(u64, usize),
+    ) -> Result<(), Errno> {
         let allocation = self.allocations[slot].ok_or(Errno::Io)?;
+        let (start, pages) = (allocation.start, allocation.pages);
         let owner = self.owner.ok_or(Errno::Io)?;
         #[cfg(feature = "full-os")]
         for fragment in self.vm.fragments(start, pages * vm::PAGE_SIZE)? {
@@ -346,9 +354,9 @@ impl Heap {
         Ok(())
     }
     pub fn clear(&mut self) {
-        for i in 0..ALLOCATIONS {
-            if let Some(a) = self.allocations[i] {
-                self.unmap(a.start, a.pages)
+        for slot in 0..ALLOCATIONS {
+            if self.allocations[slot].is_some() {
+                self.unmap_slot_with_revoke(slot, |_, _| {})
                     .expect("owned allocation after user revoke");
             }
         }

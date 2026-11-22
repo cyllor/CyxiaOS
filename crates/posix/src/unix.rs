@@ -234,10 +234,14 @@ impl Stream {
             count = count.min((marker.end - self.sequence) as usize);
             ticket = Some(marker.ticket);
         }
-        for (index, byte) in out[..count].iter_mut().enumerate() {
-            let slot = (self.head + index) % BUFFER_BYTES;
-            *byte = self.bytes[slot];
-            self.bytes[slot] = 0;
+        // The ring wraps at most once: copy and clear two contiguous runs
+        // instead of taking a modulo per byte.
+        let first = count.min(BUFFER_BYTES - self.head);
+        out[..first].copy_from_slice(&self.bytes[self.head..self.head + first]);
+        self.bytes[self.head..self.head + first].fill(0);
+        if first < count {
+            out[first..count].copy_from_slice(&self.bytes[..count - first]);
+            self.bytes[..count - first].fill(0);
         }
         self.head = (self.head + count) % BUFFER_BYTES;
         self.len -= count;
@@ -272,8 +276,11 @@ impl Stream {
             .checked_add(self.len as u64)
             .ok_or(Errno::Overflow)?;
         let end = start.checked_add(count as u64).ok_or(Errno::Overflow)?;
-        for (index, byte) in bytes[..count].iter().enumerate() {
-            self.bytes[(self.head + self.len + index) % BUFFER_BYTES] = *byte;
+        let offset = (self.head + self.len) % BUFFER_BYTES;
+        let first = count.min(BUFFER_BYTES - offset);
+        self.bytes[offset..offset + first].copy_from_slice(&bytes[..first]);
+        if first < count {
+            self.bytes[..count - first].copy_from_slice(&bytes[first..count]);
         }
         self.len += count;
         if let Some(ticket) = ticket {
@@ -1062,6 +1069,28 @@ impl UnixSockets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_ring_copies_and_clears_across_the_wrap() {
+        let mut stream = Stream::new();
+        let mut out = [0u8; BUFFER_BYTES];
+        assert_eq!(stream.write(&[3; BUFFER_BYTES - 2], None), Ok(BUFFER_BYTES - 2));
+        assert_eq!(
+            stream.read(&mut out[..BUFFER_BYTES - 3], true),
+            Ok((BUFFER_BYTES - 3, None))
+        );
+        assert!(out[..BUFFER_BYTES - 3].iter().all(|v| *v == 3));
+        assert_eq!(stream.head, BUFFER_BYTES - 3);
+        // Straddling write: three bytes at the tail, the rest at the front.
+        assert_eq!(stream.write(&[9; BUFFER_BYTES - 1], None), Ok(BUFFER_BYTES - 1));
+        assert_eq!(stream.len, BUFFER_BYTES);
+        // Straddling read returns the tail byte first, then the wrapped run.
+        assert_eq!(stream.read(&mut out, true), Ok((BUFFER_BYTES, None)));
+        assert_eq!(out[0], 3);
+        assert!(out[1..].iter().all(|v| *v == 9));
+        assert_eq!(stream.len, 0);
+        assert!(stream.bytes.iter().all(|v| *v == 0), "consumed bytes were not cleared");
+    }
 
     #[test]
     fn wake_notifications_repeat_on_committed_io_without_level_transition() {
