@@ -653,14 +653,21 @@ impl FileSystem {
             }
         }
         for (c, id) in self.cache.iter_mut().zip(p.ids) {
-            *c = match id {
-                Some(i) => Cached {
-                    id: Some(i),
-                    len: self.nodes[i].len,
-                    data: self.nodes[i].data,
-                },
-                None => Cached::EMPTY,
-            };
+            match id {
+                // Every mutation clears the whole cache, so a slot still holding
+                // this identity already mirrors the authoritative bytes. Steady
+                // state reads must not recopy FILE_BYTES per line to say so.
+                Some(i) if c.id == Some(i) && c.len == self.nodes[i].len => {}
+                Some(i) => {
+                    *c = Cached {
+                        id: Some(i),
+                        len: self.nodes[i].len,
+                        data: self.nodes[i].data,
+                    }
+                }
+                None if c.id.is_none() => {}
+                None => *c = Cached::EMPTY,
+            }
         }
         if p.ai_selected {
             self.policy.cache_selected = self.policy.cache_selected.saturating_add(1);
@@ -686,12 +693,19 @@ impl FileSystem {
         if out.len() < len {
             return Err(Error::TooLarge);
         }
+        self.read_range(i, 0, &mut out[..len])?;
+        Ok(len)
+    }
+    /// One read event: copy only the requested window, then apply the same
+    /// clock, learning, cache and inotify effects a whole-file read applies.
+    fn read_range(&mut self, i: usize, offset: usize, out: &mut [u8]) -> Result<(), Error> {
+        let len = self.nodes[i].len;
         let next = self.clock.checked_add(1).ok_or(Error::Exhausted)?;
         if let Some(c) = self.cache.iter().find(|c| c.id == Some(i)) {
-            out[..c.len].copy_from_slice(&c.data[..c.len]);
+            out.copy_from_slice(&c.data[offset..offset + out.len()]);
             self.hits = self.hits.saturating_add(1);
         } else {
-            out[..len].copy_from_slice(&self.nodes[i].data[..len]);
+            out.copy_from_slice(&self.nodes[i].data[offset..offset + out.len()]);
             self.misses = self.misses.saturating_add(1);
         }
         self.clock = next;
@@ -704,7 +718,7 @@ impl FileSystem {
         if len != 0 {
             self.record_change(i, events::Action::Access, 0);
         }
-        Ok(len)
+        Ok(())
     }
     pub fn pin(&mut self, p: Path) -> Result<Inode, Error> {
         let i = self.find(p)?;
@@ -785,10 +799,8 @@ impl FileSystem {
         if out.is_empty() || offset >= self.nodes[i].len {
             return Ok(0);
         }
-        let mut bytes = [0; FILE_BYTES];
-        let len = self.read_index(i, &mut bytes)?;
-        let n = out.len().min(len - offset);
-        out[..n].copy_from_slice(&bytes[offset..offset + n]);
+        let n = out.len().min(self.nodes[i].len - offset);
+        self.read_range(i, offset, &mut out[..n])?;
         Ok(n)
     }
     /// Positional write preserves the suffix and zero-fills holes. AI rejection is atomic.

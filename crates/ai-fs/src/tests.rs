@@ -97,6 +97,28 @@ fn cache_write_remove_and_reuse_never_return_old_data() {
     assert_eq!(&out[..4], b"safe");
 }
 #[test]
+fn positional_reads_copy_only_the_window_and_never_serve_stale_bytes() {
+    let mut fs = FileSystem::new();
+    fs.write(p("/data"), b"0123456789abcdef", false).unwrap();
+    let inode = fs.pin(p("/data")).unwrap();
+    let mut out = [0u8; 16];
+    assert_eq!(fs.read_at(inode, 0, &mut out), Ok(16));
+    assert_eq!(&out, b"0123456789abcdef");
+    assert_eq!(fs.read_at(inode, 4, &mut out[..6]), Ok(6));
+    assert_eq!(&out[..6], b"456789");
+    assert_eq!(fs.read_at(inode, 14, &mut out), Ok(2));
+    assert_eq!(&out[..2], b"ef");
+    assert_eq!(fs.read_at(inode, 16, &mut out), Ok(0));
+    // Warm the cache, then prove a positional write still invalidates it.
+    assert_eq!(fs.read_at(inode, 0, &mut out), Ok(16));
+    fs.write_at(inode, 4, b"XYZ").unwrap();
+    assert_eq!(fs.read_at(inode, 0, &mut out), Ok(16));
+    assert_eq!(&out, b"0123XYZ789abcdef");
+    assert_eq!(fs.read_at(inode, 4, &mut out[..3]), Ok(3));
+    assert_eq!(&out[..3], b"XYZ");
+}
+
+#[test]
 fn invalid_and_stale_ai_plans_cannot_change_cache() {
     let mut fs = FileSystem::new();
     fs.write(p("/f"), b"x", false).unwrap();
