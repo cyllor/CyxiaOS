@@ -17,13 +17,28 @@ pub enum Error {
     State,
 }
 
+// Reflected IEEE CRC-32 with the on-disk initial and final XOR. Compute the
+// eight bit steps per possible byte once at compile time.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
-        }
+    for &byte in bytes {
+        crc = (crc >> 8) ^ CRC32_TABLE[usize::from(crc as u8 ^ byte)];
     }
     !crc
 }
@@ -256,6 +271,24 @@ mod tests {
         h.length = MAX_PAYLOAD + 1;
         assert_eq!(Header::decode(&h.encode()), Err(Error::Length));
     }
+    #[test]
+    fn payload_crc_matches_ieee_vectors_across_sector_boundaries() {
+        let bytes: [u8; 4097] = core::array::from_fn(|i| (i * 103 + 53) as u8);
+        // Independent zlib.crc32 results for these exact prefixes.
+        for (length, expected) in [
+            (0, 0x00000000),
+            (1, 0x84b12bae),
+            (255, 0x7657a253),
+            (256, 0x5cca57d6),
+            (511, 0x05ce144a),
+            (512, 0x38d266a0),
+            (513, 0x525f5a20),
+            (4097, 0xe998a587),
+        ] {
+            assert_eq!(crc32(&bytes[..length]), expected);
+        }
+    }
+
     #[test]
     fn checksum_and_completion_order_are_strict() {
         assert_eq!(crc32(b"123456789"), 0xcbf43926);

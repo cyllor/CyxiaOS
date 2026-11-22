@@ -13,8 +13,7 @@ import x86_64 as pc
 
 
 def checks(console, qmp, output):
-    from os_smoke import object_snapshot, reclaimed_probe
-    from verify_ported import parse_processes
+    from os_smoke import boot_user_capacity, object_snapshot, reclaimed_probe, reclaimed_processes
     baseline = object_snapshot(console)
     pc.require(baseline['live'] == baseline['references'] == 0,
                'fsync contention starts with live descriptions')
@@ -45,14 +44,8 @@ def checks(console, qmp, output):
                    'killed fsync was already durable')
         console.command('posix kill ' + killed_pid.decode(),
                         [rb'pid=' + killed_pid + rb' killed; pages reclaimed'])
-        at = console.command('posix list')
-        killed_process = parse_processes(bytes(console.raw[at:]))[int(killed_pid)]
-        for name, expected in dict(state='Killed', code=137, free_pages=64,
-                                   heap_pages=0, image_pages=0, thread_count=0,
-                                   heap_free=16384, heap_allocations=0,
-                                   heap_largest_free=16384, image_free=16384).items():
-            pc.require(killed_process.get(name) == expected,
-                       'killed fsync retained ' + name)
+        killed_process, = reclaimed_processes(
+            console, [killed_pid], state='Killed', code=137, **boot_user_capacity(console))
         pc.require(object_snapshot(console) == baseline, 'killed fsync retained descriptions')
         pc.require(re.search(pending_pattern, console.raw[kill_start:]) is None,
                    'commit finished before killed-caller reclamation was observed')
@@ -62,21 +55,26 @@ def checks(console, qmp, output):
         rb'STORAGE_DURABLE generation=' + str(killed_generation).encode() +
         rb' [^\r\n]* flushes=(\d+)', kill_start, timeout=60)
     killed_flushes = int(completed.group(1))
+
+    def durable_status():
+        at = console.command('storage status')
+        row = console.until(rb'STORAGE_STATUS state=Ready generation=(\d+) [^\r\n]*'
+                            rb' writes=(\d+) flushes=(\d+)\b', at)
+        return tuple(map(int, row.groups()))
+
+    before_reuse = durable_status()
     resumed_at = console.program('posix exec fsync-root', b'FSYNC_PROBE ROOT_DURABLE PASS')
     resumed_pid = console.until(rb'ELF pid=(\d+) started;', resumed_at).group(1)
     resumed = reclaimed_probe(console, resumed_pid, baseline)
-    resumed_generation = int(console.until(
-        rb'STORAGE_CHECKPOINT_BEGIN generation=(\d+) ', resumed_at).group(1))
-    resumed_flushes = int(console.until(
-        rb'STORAGE_DURABLE generation=' + str(resumed_generation).encode() +
-        rb' [^\r\n]* flushes=(\d+)', resumed_at).group(1))
-    pc.require(resumed_generation > killed_generation and resumed_flushes - killed_flushes == 2,
-               'new fsync did not commit normally after a killed caller')
+    resumed_generation, resumed_writes, resumed_flushes = durable_status()
+    pc.require((resumed_generation, resumed_writes, resumed_flushes) == before_reuse
+               and resumed_generation == killed_generation and resumed_flushes == killed_flushes,
+               "unchanged root fsync did not reuse the killed caller's durable image")
     killed = dict(pid=int(killed_pid), process=killed_process,
                   generation=killed_generation, flushes=killed_flushes,
                   reclaimed_while_commit_pending=True, commit_survived_process_kill=True,
                   subsequent_fsync=resumed, subsequent_generation=resumed_generation,
-                  subsequent_flushes=resumed_flushes)
+                  subsequent_writes=resumed_writes, subsequent_flushes=resumed_flushes)
 
     results = []
     for mode in ('concurrent', 'interrupt', 'reuse', 'admitted-interrupt'):

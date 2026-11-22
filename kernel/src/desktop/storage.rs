@@ -143,16 +143,26 @@ impl Service {
             "STORAGE_ERROR {error:?} MECHANISM; disk retained; restart required\r"
         );
     }
-    fn checkpoint(&mut self, fs: &FileSystem, buffer: &mut [u8], out: &mut impl Write) {
+    fn checkpoint(
+        &mut self,
+        fs: &mut FileSystem,
+        buffer: &mut [u8],
+        out: &mut impl Write,
+    ) -> Option<u64> {
         if self.phase != Phase::Ready {
             self.checkpoint_rejected = self.checkpoint_rejected.saturating_add(1);
             let _ = writeln!(out, "STORAGE_CHECKPOINT_REJECT {:?}\r", self.phase);
-            return;
+            return None;
         }
         if self.block.as_ref().is_none_or(Block::read_only) {
             self.checkpoint_rejected = self.checkpoint_rejected.saturating_add(1);
             let _ = writeln!(out, "STORAGE_CHECKPOINT_REJECT read-only or absent\r");
-            return;
+            return None;
+        }
+        if let Some((_, header)) = self.active
+            && fs.snapshot_generation() == Some(header.generation)
+        {
+            return Some(header.generation);
         }
         let result = (|| {
             self.acquire(false)?;
@@ -163,16 +173,19 @@ impl Service {
                 "STORAGE_CHECKPOINT_BEGIN generation={} bytes={} memory_model=8194 pages={} io_model=20481 trigger=OPERATOR memory_source=AI_DIRECT budget_unit=new_operations_per_8ms\r",
                 commit.header.generation, size, LEASE_PAGES
             );
+            let generation = commit.header.generation;
+            fs.bind_snapshot_generation(generation);
             self.commit = Some(commit);
             self.phase = Phase::Commit;
             self.checkpoint_started = self.checkpoint_started.saturating_add(1);
-            Ok::<(), Error>(())
+            Ok::<u64, Error>(generation)
         })();
         if let Err(error) = result {
             self.checkpoint_rejected = self.checkpoint_rejected.saturating_add(1);
             self.release(buffer);
             let _ = writeln!(out, "STORAGE_CHECKPOINT_REJECT {error:?}\r");
         }
+        result.ok()
     }
     fn step(
         &mut self,
@@ -220,6 +233,7 @@ impl Service {
                         if header.verify(&buffer[..header.length]).is_ok()
                             && fs.restore_snapshot(&buffer[..header.length]).is_ok()
                         {
+                            fs.bind_snapshot_generation(header.generation);
                             self.active = Some((slot, header));
                             self.phase = Phase::Ready;
                             self.release(buffer);
@@ -422,9 +436,9 @@ impl Write for Audit {
 }
 
 /// The explicit guest save command uses the same AI-admitted checkpoint path
-/// as the serial shell. Returning a generation acknowledges staging only.
+/// as the serial shell. Poll the returned generation to confirm durability.
 #[cfg(feature = "ported")]
-pub fn start_checkpoint(fs: &FileSystem) -> Result<u64, cyxia_posix::Errno> {
+pub fn start_checkpoint(fs: &mut FileSystem) -> Result<u64, cyxia_posix::Errno> {
     use cyxia_posix::Errno;
     // SAFETY: the syscall runs only in CPU0 foreground; poll is not reentrant.
     let service = unsafe { &mut *core::ptr::addr_of_mut!(SERVICE) };
@@ -439,12 +453,7 @@ pub fn start_checkpoint(fs: &FileSystem) -> Result<u64, cyxia_posix::Errno> {
     }
     // SAFETY: CPU0 owns this pinned buffer and no DMA references it.
     let buffer = unsafe { &mut (*core::ptr::addr_of_mut!(BUFFER)).0 };
-    service.checkpoint(fs, buffer, &mut Audit);
-    service
-        .commit
-        .as_ref()
-        .map(|commit| commit.header.generation)
-        .ok_or(Errno::Io)
+    service.checkpoint(fs, buffer, &mut Audit).ok_or(Errno::Io)
 }
 
 /// Only the successful second device FLUSH advances `active`. A caller must
@@ -483,7 +492,15 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
     let buffer = unsafe { &mut (*core::ptr::addr_of_mut!(BUFFER)).0 };
     match shell.take_storage_request() {
         Some(cyxia_shell::StorageRequest::Checkpoint) => {
-            service.checkpoint(shell.fs_mut(), buffer, out)
+            if let Some(generation) = service.checkpoint(shell.fs_mut(), buffer, out)
+                && service.phase == Phase::Ready
+            {
+                let _ = writeln!(
+                    out,
+                    "STORAGE_CHECKPOINT_UNCHANGED generation={generation} flushes={}\r",
+                    service.flushes
+                );
+            }
         }
         Some(cyxia_shell::StorageRequest::Status) => {
             let _ = writeln!(

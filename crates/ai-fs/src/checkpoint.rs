@@ -28,6 +28,18 @@ impl Entry {
 }
 
 impl FileSystem {
+    /// Last staged or recovered image with exactly the current snapshot bytes.
+    /// Only the storage service can establish whether that image is durable.
+    pub fn snapshot_generation(&self) -> Option<u64> {
+        self.snapshot_generation
+    }
+
+    /// Bind the current image immediately after successful staging or recovery,
+    /// while the CPU0 owner still excludes intervening filesystem mutations.
+    pub fn bind_snapshot_generation(&mut self, generation: u64) {
+        self.snapshot_generation = Some(generation);
+    }
+
     /// CPU0 must exclude mutations for this bounded copy. No grant is created
     /// here: the storage service admits and owns its staging memory separately.
     pub fn write_snapshot(&self, output: &mut [u8]) -> Result<usize, Error> {
@@ -62,11 +74,11 @@ impl FileSystem {
         } else {
             1u32
         };
-        output[..length].fill(0);
         output[..8].copy_from_slice(MAGIC);
         output[8..12].copy_from_slice(&version.to_le_bytes());
         output[12..16].copy_from_slice(&(count as u32).to_le_bytes());
         output[16..24].copy_from_slice(&self.revision.to_le_bytes());
+        output[24..HEADER].fill(0);
         let mut at = HEADER;
         for n in self.nodes.iter().filter(|n| n.used && n.linked) {
             output[at] = match n.kind {
@@ -78,7 +90,9 @@ impl FileSystem {
             output[at + 2..at + 4].copy_from_slice(&n.mode.to_le_bytes());
             output[at + 4..at + 12].copy_from_slice(&n.serial.to_le_bytes());
             output[at + 12..at + 16].copy_from_slice(&(n.len as u32).to_le_bytes());
-            output[at + 16..at + 16 + n.path.len].copy_from_slice(n.path.as_str().as_bytes());
+            let path_end = at + 16 + n.path.len;
+            output[at + 16..path_end].copy_from_slice(n.path.as_str().as_bytes());
+            output[path_end..at + RECORD].fill(0);
             output[at + RECORD..at + RECORD + n.len].copy_from_slice(&n.data[..n.len]);
             at += RECORD + n.len;
         }
@@ -201,6 +215,7 @@ impl FileSystem {
             node.data[..e.len].copy_from_slice(&input[e.data..e.data + e.len]);
         }
         self.revision = revision;
+        self.snapshot_generation = None;
         self.changes = super::events::Journal::new();
         Ok(())
     }
@@ -297,6 +312,31 @@ mod tests {
         let mut written = [0xa5; HEADER + RECORD + 3];
         assert_eq!(fs.write_snapshot(&mut written), Ok(legacy.len()));
         assert_eq!(written, legacy);
+    }
+
+    #[test]
+    fn v2_rewrites_only_the_exact_image_in_a_dirty_buffer() {
+        // Legacy v2 header followed by one fixed-size directory record and one
+        // variable-size symlink record. The initial zeros include all padding.
+        let mut legacy = [0; 32 + 112 + 112 + 6];
+        legacy[..8].copy_from_slice(b"CYXRAM01");
+        legacy[8..12].copy_from_slice(&2u32.to_le_bytes());
+        legacy[12..16].copy_from_slice(&2u32.to_le_bytes());
+        legacy[16..24].copy_from_slice(&9u64.to_le_bytes());
+        legacy[32..36].copy_from_slice(&[2, 2, 0xed, 1]);
+        legacy[36..44].copy_from_slice(&7u64.to_le_bytes());
+        legacy[48..50].copy_from_slice(b"/d");
+        legacy[144..148].copy_from_slice(&[3, 6, 0xff, 1]);
+        legacy[148..156].copy_from_slice(&8u64.to_le_bytes());
+        legacy[156..160].copy_from_slice(&6u32.to_le_bytes());
+        legacy[160..166].copy_from_slice(b"/d/ref");
+        legacy[256..].copy_from_slice(b"/fresh");
+        let mut fs = FileSystem::new();
+        fs.restore_snapshot(&legacy).unwrap();
+        let mut output = [0xa5; 263];
+        assert_eq!(fs.write_snapshot(&mut output), Ok(262));
+        assert_eq!(&output[..262], &legacy[..]);
+        assert_eq!(output[262], 0xa5);
     }
 
     #[test]

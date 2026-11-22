@@ -63,7 +63,7 @@ impl Runner {
         Ok(length as u64)
     }
 
-    pub(super) fn sync_file(&mut self, fs: &FileSystem, descriptor: u64) -> Result<u64, Errno> {
+    pub(super) fn sync_file(&mut self, fs: &mut FileSystem, descriptor: u64) -> Result<u64, Errno> {
         let fd = super::fd(descriptor)?;
         let info = self.descriptor_stat(fs, fd)?;
         if !matches!(info.mode & 0o170000, 0o100000 | 0o040000) {
@@ -78,14 +78,17 @@ impl Runner {
         // Staging copies the data and namespace synchronously on CPU0, so a
         // later close/reuse cannot change the admitted generation's contents.
         match super::super::storage::start_checkpoint(fs) {
-            Ok(generation) => {
-                self.block(super::Wait::Checkpoint(generation));
-                Ok(0)
-            }
+            Ok(generation) => match super::super::storage::checkpoint_complete(generation) {
+                Ok(_) => Ok(0),
+                Err(Errno::Again) => {
+                    self.block(super::Wait::Checkpoint(generation));
+                    Ok(0)
+                }
+                Err(error) => Err(error),
+            },
             Err(Errno::Busy) => {
                 // An older snapshot may predate this caller's writes. Wait
-                // for admission, then capture a fresh snapshot; never claim
-                // that merely completing another caller's generation suffices.
+                // for admission, then recheck this descriptor and the current RAMFS.
                 let identity = self.process.description_identity(fd)?;
                 self.thread.context.restart_syscall()?;
                 self.thread.retry_syscall = true;

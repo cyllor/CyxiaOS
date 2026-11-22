@@ -230,6 +230,7 @@ pub struct FileSystem {
     cache: [Cached; CACHE_LINES],
     brain: brain::Brain,
     revision: u64,
+    snapshot_generation: Option<u64>,
     clock: u64,
     decisions: u64,
     denied: u64,
@@ -251,6 +252,7 @@ impl FileSystem {
             cache: [Cached::EMPTY; CACHE_LINES],
             brain: brain::Brain::new(),
             revision: 1,
+            snapshot_generation: None,
             clock: 0,
             decisions: 0,
             denied: 0,
@@ -355,6 +357,7 @@ impl FileSystem {
     }
     fn changed(&mut self, next: u64) {
         self.revision = next;
+        self.snapshot_generation = None;
         self.brain.invalidate_history();
         // Write-through backing store is authoritative. Invalidate all read copies on mutation.
         self.cache = [Cached::EMPTY; CACHE_LINES];
@@ -845,15 +848,21 @@ impl FileSystem {
     /// Mode metadata for the single-UID compatibility layer; shell remains the trusted operator.
     pub fn set_mode(&mut self, p: Path, mode: u16) -> Result<(), Error> {
         let i = self.find(p)?;
-        self.nodes[i].mode = mode & 0o7777;
-        self.record_change(i, events::Action::Attrib, 0);
+        self.set_node_mode(i, mode);
         Ok(())
     }
     pub fn set_inode_mode(&mut self, inode: Inode, mode: u16) -> Result<(), Error> {
         let i = self.inode_index(inode)?;
-        self.nodes[i].mode = mode & 0o7777;
-        self.record_change(i, events::Action::Attrib, 0);
+        self.set_node_mode(i, mode);
         Ok(())
+    }
+    fn set_node_mode(&mut self, i: usize, mode: u16) {
+        let mode = mode & 0o7777;
+        if self.nodes[i].linked && self.nodes[i].mode != mode {
+            self.snapshot_generation = None;
+        }
+        self.nodes[i].mode = mode;
+        self.record_change(i, events::Action::Attrib, 0);
     }
     pub fn train(&mut self) -> Result<(), Error> {
         self.brain.train()
