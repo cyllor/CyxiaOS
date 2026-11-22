@@ -51,12 +51,12 @@ impl Runner {
         Ok(0)
     }
 
-    pub(super) fn sleep_interrupted(&mut self) -> Result<(), Errno> {
-        if let Some(Wait::Nanosleep {
+    pub(super) fn sleep_interrupted(&mut self, wait: Wait) -> Result<(), Errno> {
+        if let Wait::Nanosleep {
             deadline_ns,
             remaining,
             ..
-        }) = self.thread.waiting
+        } = wait
             && remaining != 0
         {
             let left = deadline_ns.saturating_sub(super::now_ns());
@@ -81,11 +81,13 @@ impl Runner {
     }
 
     fn epoll_readiness(&self, epfd: i32) -> Result<[u32; OPEN_MAX], Errno> {
-        self.process.epoll_sample(epfd, Self::source_readiness)
+        self.process.epoll_sample_at(epfd, super::now_ns, Self::source_readiness)
     }
 
-    pub(super) fn epoll_readable(&mut self, epfd: i32) -> Result<bool, Errno> {
-        let readiness = self.epoll_readiness(epfd)?;
+    pub(super) fn epoll_readable(
+        &mut self, epfd: i32, clock: impl FnOnce() -> u64,
+    ) -> Result<bool, Errno> {
+        let readiness = self.process.epoll_sample_at(epfd, clock, Self::source_readiness)?;
         self.process.epoll_readable(epfd, &readiness)
     }
 
@@ -124,14 +126,18 @@ impl Runner {
         epfd: i32,
         address: u64,
         count: usize,
+        resample: bool,
     ) -> Result<usize, Errno> {
         let count = count.min(OPEN_MAX);
         if count == 0 {
             return Err(Errno::Inval);
         }
         let stride = cyxia_posix::linux_abi::epoll_bytes(crate::process_arch::IMAGE_ABI);
-        let data = cyxia_posix::linux_abi::epoll_data_offset(crate::process_arch::IMAGE_ABI);
         self.validate(address, count * stride, true)?;
+        if !resample {
+            return Ok(0);
+        }
+        let data = cyxia_posix::linux_abi::epoll_data_offset(crate::process_arch::IMAGE_ABI);
         let readiness = self.epoll_readiness(epfd)?;
         let mut events = [epoll::Event::default(); OPEN_MAX];
         let size = self
@@ -171,12 +177,13 @@ impl Runner {
                 .saturating_add(u64::from(timeout as u32))
                 .saturating_add(u64::from(timeout != 0))
         };
-        let ready = self.epoll_result(descriptor, address, count)?;
+        let ready = self.epoll_result(descriptor, address, count, true)?;
         if ready == 0 && super::now() < until {
             let identity = self.process.epoll_identity(descriptor)?;
             self.block(Wait::Epoll {
                 descriptor,
                 identity,
+                epoch: self.process.epoll_invalidation_epoch(),
                 address,
                 count,
                 until,

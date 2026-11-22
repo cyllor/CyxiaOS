@@ -41,8 +41,9 @@ mod kernel {
         use cyxia_ai_runtime::accounting::{Attempt, Counters};
         use cyxia_posix::{UserState, UserStatus, OPEN_MAX, signal, spawn::Mapping};
 
-        const SLOTS: usize = 8;
-        const MAPPED_PAGES: u32 = 8;
+        const SLOTS: usize = cyxia_posix::usermem::MAX_PROCESSES;
+        const MAPPED_PAGES: u32 = cyxia_posix::usermem::MAPPED_PAGES;
+        // THREAD_SLOTS
         const CODE_BYTES: usize = cyxia_posix::usermem::CODE_BYTES;
         const IMAGE: &[u8] = b"host loader boundary";
         const SERVICES: &[u8] = b"host native loader boundary";
@@ -108,9 +109,12 @@ mod kernel {
                 self.inner.raise(actions, number, info, forced)
             }
         }
-        struct Shared { pending: Pending, actions: signal::Actions }
+        #[derive(Clone, Copy)]
+        struct IdleWait { has_child: bool }
+        struct Shared { idle_wait: Option<IdleWait>, pending: Pending, actions: signal::Actions, parked_active: u16 }
         struct Threads { parked: [Thread; 2], shared: Shared }
         impl Threads {
+            // PARKED_SLOTS
             fn new() -> Self {
                 let mut actions = signal::Actions::new();
                 actions.set_action_for(17, signal::Action {
@@ -118,7 +122,7 @@ mod kernel {
                     flags: signal::SA_RESTORER, mask: 0,
                 }, process_arch::IMAGE_ABI).unwrap();
                 Self { parked: core::array::from_fn(|_| Thread::new(0)),
-                       shared: Shared { actions, pending: Pending {
+                       shared: Shared { idle_wait: None, actions, parked_active: 0, pending: Pending {
                            inner: signal::Signals::new(), calls: Vec::new() } } }
             }
         }
@@ -229,11 +233,13 @@ mod kernel {
                     thread.active = false;
                     thread.waiting = None;
                 }
+                self.threads.shared.parked_active = 0;
             }
             // RUNNER_METHODS
         }
         struct Supervisor {
             runners: [Runner; SLOTS],
+            occupied_runners: u64,
             children: Children,
             ledger: GrantLedger,
             ipc: LocalIpc,
@@ -255,6 +261,7 @@ mod kernel {
             }
             FAIL_IMAGE_LOAD.store(false, Ordering::SeqCst);
             let mut s = Supervisor { runners: core::array::from_fn(|_| Runner::new(0, 0)),
+                occupied_runners: 0b11,
                 children: Children::new(), ledger: GrantLedger { free: 48, starts: 0, fail_start: None },
                 ipc: LocalIpc, next_pid: 3, focus_pid: 1 };
             s.runners[0] = Runner::new(1, 0);
@@ -266,6 +273,7 @@ mod kernel {
         }
         fn terminate(s: &mut Supervisor, slot: usize, state: UserState, code: u32) {
             s.runners[slot].finish(&mut FileSystem, &mut s.ledger, &mut s.ipc, state, code);
+            s.occupied_runners &= !(1 << slot);
         }
         fn wait(s: &mut Supervisor, pid: i32, address: u64, nonblock: bool) {
             s.runners[0].request_wait(pid as i64 as u64, address, u64::from(nonblock), 0).unwrap();
@@ -355,6 +363,7 @@ mod kernel {
                 assert_eq!(s.runners[0].thread.context.result, Some(2));
                 for _ in 0..3 { s.collect_children(); }
                 assert_eq!(counters(AiDomain::SpawnReceipt).release_units, 1);
+                assert_eq!(s.launch("idle", true), Ok(1), "failed start or pair rollback hid the lowest free slot");
             }
         }
 
@@ -454,6 +463,7 @@ mod kernel {
             terminate(&mut s, 1, UserState::Exited, 11);
             s.launch("idle", true).unwrap();
             s.runners[0].threads.parked[0] = Thread::new(0x1000_0001);
+            s.runners[0].threads.shared.parked_active |= 1;
             s.runners[0].threads.parked[0].waiting =
                 Some(Wait::Child { pid: 2, status: 0, nonblock: false });
             wait(&mut s, -1, 0, false);

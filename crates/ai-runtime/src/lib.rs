@@ -951,7 +951,7 @@ pub fn user_dispatch_policy(
     if candidates.len() > 8 {
         return Err(Error::Invalid);
     }
-    Ok(rank_user_candidates(candidates))
+    Ok(rank_user_candidates(candidates, false))
 }
 
 /// The full-OS thread context pool has sixteen slots. Candidate count is not
@@ -963,24 +963,25 @@ pub fn full_os_thread_dispatch_policy(
     if candidates.len() > 16 {
         return Err(Error::Invalid);
     }
-    Ok(rank_user_candidates(candidates))
+    Ok(rank_user_candidates(candidates, false))
 }
 
 /// Process selector for the full-OS COSMIC session profile. The session provisions
-/// SESSION_PROCESS_SLOTS resident processes, so the candidate domain is widened to
-/// that slot count while reusing the unchanged per-candidate CPU ranking and
-/// starvation guard. The demo process selector stays bounded to 8 candidates;
-/// this is a separate versioned domain, not a relaxation of the demo path.
+/// SESSION_PROCESS_SLOTS resident processes. Reuse the CPU model and starvation
+/// guard, and decay the recent preemption estimate over the model's age window.
 pub fn session_process_dispatch_policy(
     candidates: &[Option<UserCandidate>],
 ) -> Result<Option<UserDispatch>, Error> {
     if candidates.len() > SESSION_PROCESS_SLOTS as usize {
         return Err(Error::Invalid);
     }
-    Ok(rank_user_candidates(candidates))
+    Ok(rank_user_candidates(candidates, true))
 }
 
-fn rank_user_candidates(candidates: &[Option<UserCandidate>]) -> Option<UserDispatch> {
+fn rank_user_candidates(
+    candidates: &[Option<UserCandidate>],
+    decay_cpu_work: bool,
+) -> Option<UserDispatch> {
     let oldest = candidates.iter().flatten().map(|c| c.waiting_ms).max();
     let guard = oldest.is_some_and(|age| age >= 100);
     let mut best: Option<(usize, i32, u64)> = None;
@@ -991,11 +992,18 @@ fn rank_user_candidates(candidates: &[Option<UserCandidate>]) -> Option<UserDisp
         if guard && Some(candidate.waiting_ms) != oldest {
             continue;
         }
-        let score = model::cpu(
-            candidate.waiting_ms,
-            1,
-            if candidate.cpu_bound { 4096 } else { 256 },
-        );
+        let work_units = if !candidate.cpu_bound {
+            1
+        } else if decay_cpu_work && !guard {
+            // Last exit's preemption is recent evidence. Fade its 15 extra
+            // work units to zero as the ready candidate ages. The 100 ms
+            // guard still uses the original ranking among oldest-age ties.
+            let remaining = model::CPU_AGE_LIMIT.saturating_sub(candidate.waiting_ms);
+            1 + (15 * remaining).div_ceil(model::CPU_AGE_LIMIT) as u32
+        } else {
+            16
+        };
+        let score = model::cpu(candidate.waiting_ms, 1, work_units * 256);
         if best
             .is_none_or(|(_, prior_score, age)| (score, candidate.waiting_ms) > (prior_score, age))
         {

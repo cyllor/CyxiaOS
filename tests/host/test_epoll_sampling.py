@@ -23,11 +23,22 @@ class EpollSampling(unittest.TestCase):
             ('PTY_OPERATIONS', 'pty', ['pub(super) fn with<']),
         ]:
             source = (user / (module + '.rs')).read_text()
-            symbols = original + [symbol for symbol in ('pub(super) fn poll(', 'fn ready_bits(')
+            symbols = original + [symbol for symbol in ('pub(super) fn inspect<', 'fn observe_with<',
+                                                         'pub(super) fn poll(', 'fn ready_bits(')
                                   if symbol in source]
-            fixture = fixture.replace('// ' + marker, '\n'.join(function(source, name) for name in symbols))
+            operations = [function(source, name) for name in symbols]
+            if module == 'unix':
+                operations = [body.replace('    pool.poll(owner, handle(raw)).map(ready_bits)',
+                    '    super::RAW_POLLS.fetch_add(1, super::Ordering::Relaxed);\n'
+                    '    pool.poll(owner, handle(raw)).map(ready_bits)') for body in operations]
+            fixture = fixture.replace('// ' + marker, '\n'.join(operations))
         event = (user / 'event.rs').read_text()
         fixture = fixture.replace('// SOURCE_READINESS', function(event, 'fn source_readiness('))
+        linux = (user / 'linux.rs').read_text()
+        fixture = fixture.replace('// POLL_SNAPSHOT', function(linux, 'pub(super) struct PollSnapshot')
+                                  + '\n' + function(linux, 'impl PollSnapshot'))
+        fixture = fixture.replace('// POLL_METHODS', function(linux, 'pub(super) fn poll_result(')
+                                  + '\n' + function(event, 'pub(super) fn epoll_readable('))
         with native_lease(DEFAULT_NATIVE_LOCK), tempfile.TemporaryDirectory(prefix='cyx-epoll-sampling-') as tmp:
             idle_native_host()
             directory = Path(tmp)
@@ -36,7 +47,8 @@ class EpollSampling(unittest.TestCase):
             manifest.write_text(
                 '[package]\nname="epoll-sampling-regression"\nversion="0.1.0"\nedition="2024"\n'
                 '[lib]\npath="fixture.rs"\n[workspace]\n[dependencies]\n'
-                'cyxia-posix={path=' + json.dumps(str(ROOT / 'crates/posix')) + ',features=["cosmic-applets-v1"]}\n')
+                'cyxia-posix={path=' + json.dumps(str(ROOT / 'crates/posix')) + ',features=["cosmic-applets-v1"]}\n'
+                'cyxia-ai-fs={path=' + json.dumps(str(ROOT / 'crates/ai-fs')) + '}\n')
             environment = dict(os.environ, CARGO_INCREMENTAL='0', RUST_MIN_STACK='16777216',
                                CARGO_TARGET_DIR=str(ROOT / 'target/host-epoll-sampling'))
             result = subprocess.run(['cargo', 'test', '--offline', '--manifest-path', str(manifest),

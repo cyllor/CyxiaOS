@@ -410,6 +410,34 @@ impl<'a> Process<'a> {
             Err(Errno::Badf)
         }
     }
+
+    pub fn poll_readiness_epoch(&self) -> u64 {
+        self.objects.inner.borrow().poll_readiness_epoch
+    }
+
+    /// An exact binding whose readiness is fixed or published by its producer.
+    /// Numeric invalidity and unclassified object types require full sampling.
+    pub fn poll_snapshot_identity(&self, fd: i32) -> Option<u64> {
+        if fd < 0 {
+            return Some(0);
+        }
+        let handle = self.description(fd).ok()?;
+        match self.objects.get(handle).ok()?.object {
+            Object::File(_)
+            | Object::Directory { .. }
+            | Object::Null
+            | Object::Output
+            | Object::ReadOnly(..)
+            | Object::Memfd(_)
+            | Object::Socket(_)
+            | Object::Pipe(_)
+            | Object::Pty(_)
+            | Object::Event { .. }
+            | Object::Timer(_)
+            | Object::Epoll(_)
+            | Object::Inotify(_) => Some(handle.identity()),
+        }
+    }
     pub fn backend_owner(&self, fd: i32) -> Result<u32, Errno> {
         self.objects.owner(self.description(fd)?)
     }

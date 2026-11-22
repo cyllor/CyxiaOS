@@ -38,7 +38,11 @@ def production_fixture():
         .replace('// USER_STATE', function(posix, 'pub enum UserState') + '\n' + function(posix, 'impl UserState'))
         .replace('// RECEIPT_TYPES', '#[derive(Clone, Copy)]\n' + function(spawn, 'struct Receipt')
                  + '\n' + function(spawn, 'pub(super) struct Children') + '\n' + function(spawn, 'impl Children'))
-        .replace('// RUNNABLE', function(threads, '    fn runnable('))
+        .replace('// RUNNABLE', function(threads, '    fn runnable(').replace(
+            '        self.active &&', '        if self.tid == 987 { CHECKS.fetch_add(1, Ordering::SeqCst); }\n        self.active &&'))
+        .replace('// THREAD_SLOTS', function(threads, 'fn thread_slots('))
+        .replace('// GROUP_METHODS', '\n'.join(function(threads, name)
+            for name in ('    fn parked_slots(', '    fn sync_parked_slot(')))
         .replace('// RUNNER_METHODS', '\n'.join([function(spawn, '    pub(super) fn supervisor_result('),
             function(threads, '    pub(super) fn refresh_thread_state('),
             function(threads, '    pub(super) fn has_runnable_thread(')]))
@@ -63,7 +67,7 @@ class ChildCollection(unittest.TestCase):
                     ran = subprocess.run([str(binary), '--test-threads=1'], capture_output=True,
                                          text=True, env=environment, timeout=15)
                     self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-                    self.assertIn('8 passed; 0 failed', ran.stdout)
+                    self.assertIn('9 passed; 0 failed', ran.stdout)
 
 
 if __name__ == '__main__':

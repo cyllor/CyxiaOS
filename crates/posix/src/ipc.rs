@@ -57,6 +57,7 @@ struct Channel {
 pub struct LocalIpc {
     channels: [Option<Channel>; CHANNELS],
     next: u32,
+    readiness_epoch: u64,
 }
 impl Default for LocalIpc {
     fn default() -> Self {
@@ -68,7 +69,13 @@ impl LocalIpc {
         Self {
             channels: [const { None }; CHANNELS],
             next: 1,
+            readiness_epoch: 0,
         }
+    }
+    /// CPU0 samples this after testing a wait. At saturation, callers must
+    /// continue querying each endpoint directly.
+    pub fn readiness_epoch(&self) -> u64 {
+        self.readiness_epoch
     }
     /// Trusted supervisor only: attach a pair to two live process identities.
     /// This allocates no dynamic pages; bounded rings are boot-reserved metadata.
@@ -89,6 +96,7 @@ impl LocalIpc {
             incoming: [const { Stream::new() }; 2],
         });
         self.next = next;
+        self.readiness_epoch = self.readiness_epoch.saturating_add(1);
         Ok(handles)
     }
     fn endpoint(&mut self, owner: u32, handle: u32) -> Result<(&mut Channel, usize), Errno> {
@@ -107,11 +115,19 @@ impl LocalIpc {
         if channel.owners[peer].is_none() {
             return Err(Errno::Pipe);
         }
-        channel.incoming[peer].write(data)
+        let written = channel.incoming[peer].write(data)?;
+        if written != 0 {
+            self.readiness_epoch = self.readiness_epoch.saturating_add(1);
+        }
+        Ok(written)
     }
     pub fn read(&mut self, owner: u32, handle: u32, out: &mut [u8]) -> Result<usize, Errno> {
         let (channel, side) = self.endpoint(owner, handle)?;
-        channel.incoming[side].read(out, channel.owners[side ^ 1].is_some())
+        let read = channel.incoming[side].read(out, channel.owners[side ^ 1].is_some())?;
+        if read != 0 {
+            self.readiness_epoch = self.readiness_epoch.saturating_add(1);
+        }
+        Ok(read)
     }
     /// A closed peer is ready: the next operation must observe EOF/EPIPE instead
     /// of sleeping forever. Check and registration are serialized by the caller.
@@ -131,6 +147,7 @@ impl LocalIpc {
                 for side in 0..2 {
                     if channel.owners[side] == Some(owner) {
                         channel.owners[side] = None;
+                        self.readiness_epoch = self.readiness_epoch.saturating_add(1);
                         channel.incoming[side] = Stream::new();
                     }
                 }
@@ -145,6 +162,30 @@ impl LocalIpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_epoch_notifies_sleepers_on_io_and_peer_close() {
+        let mut ipc = LocalIpc::new();
+        let [a, b] = ipc.pair(10, 20).unwrap();
+        let empty = ipc.readiness_epoch();
+        assert!(!ipc.ready(20, b, Interest::Readable).unwrap());
+        assert_eq!(ipc.read(20, b, &mut [0]), Err(Errno::Again));
+        assert_eq!(ipc.write(10, a, &[]), Ok(0));
+        assert_eq!(ipc.readiness_epoch(), empty);
+        ipc.write(10, a, &[0x5a; CAPACITY]).unwrap();
+        let full = ipc.readiness_epoch();
+        assert_ne!(full, empty);
+        assert!(!ipc.ready(10, a, Interest::Writable).unwrap());
+        assert_eq!(ipc.write(10, a, &[11]), Err(Errno::Again));
+        assert_eq!(ipc.readiness_epoch(), full);
+        ipc.read(20, b, &mut [0]).unwrap();
+        let writable = ipc.readiness_epoch();
+        assert_ne!(writable, full);
+        assert!(ipc.ready(10, a, Interest::Writable).unwrap());
+        ipc.close_owner(20);
+        assert_ne!(ipc.readiness_epoch(), writable);
+        assert!(ipc.ready(10, a, Interest::Readable).unwrap());
+    }
 
     #[test]
     fn full_duplex_partial_io_wrap_and_backpressure() {

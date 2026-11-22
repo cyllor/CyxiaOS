@@ -2,7 +2,9 @@
 //! Watches hold weak generational OFD identities, not reusable numeric FDs or
 //! lifetime-extending references. Edge candidates come from committed backend
 //! notifications and readiness transitions, not repeated scans of a ready FD.
+use super::open_description::{EPOLLS, Handle, Table};
 use super::{Description, Errno, O_CLOEXEC, O_RDWR, OPEN_MAX, Object, Process};
+use core::num::NonZeroU16;
 mod nesting;
 pub(crate) use nesting::Topology;
 
@@ -19,16 +21,20 @@ pub const ONESHOT: u32 = 1 << 30;
 pub const EDGE: u32 = 1 << 31;
 const SUPPORTED: u32 = IN | PRI | OUT | ERR | HUP | RDHUP | ONESHOT | EDGE;
 const _: () = assert!(OPEN_MAX <= u128::BITS as usize);
+const _: () = assert!(EPOLLS * OPEN_MAX <= u16::MAX as usize);
 
 #[derive(Clone, Copy)]
 struct Watch {
     fd: i32,
-    description: super::open_description::Handle,
+    description: Handle,
     events: u32,
     data: u64,
     armed: bool,
     pending: bool,
     observed: u32,
+    backend: Option<Backend>,
+    prev: Option<NonZeroU16>,
+    next: Option<NonZeroU16>,
 }
 impl Watch {
     fn observe(&mut self, readiness: u32, notifications: u32) -> bool {
@@ -66,42 +72,153 @@ impl Iterator for WatchSlots {
 pub(crate) struct Instance {
     pub(crate) used: bool,
     owner: u32,
+    description: Option<Handle>,
     watches: [Option<Watch>; OPEN_MAX],
     occupied: u128,
+    ready: u128,
+    backends: [u128; 4],
     cursor: usize,
 }
 impl Instance {
     fn readable(&self) -> bool {
-        self.live_slots()
-            .any(|slot| self.watches[slot].as_ref().is_some_and(Watch::deliverable))
+        self.ready != 0
     }
     pub(crate) const EMPTY: Self = Self {
         used: false,
         owner: 0,
+        description: None,
         watches: [None; OPEN_MAX],
         occupied: 0,
+        ready: 0,
+        backends: [0; 4],
         cursor: 0,
     };
     fn live_slots(&self) -> WatchSlots {
         WatchSlots(self.occupied)
     }
     fn set_watch(&mut self, slot: usize, watch: Option<Watch>) {
-        self.watches[slot] = watch;
         let bit = 1u128 << slot;
+        if let Some(backend) = self.watches[slot].and_then(|watch| watch.backend) {
+            self.backends[backend as usize] &= !bit;
+        }
+        self.watches[slot] = watch;
+        if let Some(backend) = watch.and_then(|watch| watch.backend) {
+            self.backends[backend as usize] |= bit;
+        }
         if watch.is_some() {
             self.occupied |= bit;
         } else {
             self.occupied &= !bit;
         }
+        self.refresh_ready(slot);
+    }
+    fn refresh_ready(&mut self, slot: usize) {
+        let bit = 1u128 << slot;
+        if self.watches[slot].as_ref().is_some_and(Watch::deliverable) {
+            self.ready |= bit;
+        } else {
+            self.ready &= !bit;
+        }
+    }
+    fn observe_watch(&mut self, slot: usize, readiness: u32, wakes: u32) -> bool {
+        let notified = self.watches[slot].as_mut().unwrap().observe(readiness, wakes);
+        self.refresh_ready(slot);
+        notified
     }
     pub(crate) fn watch_count(&self) -> usize {
-        self.watches.iter().flatten().count()
+        self.occupied.count_ones() as usize
     }
-    pub(crate) fn remove_description(&mut self, description: super::open_description::Handle) {
-        for slot in self.live_slots() {
-            if self.watches[slot].is_some_and(|watch| watch.description == description) {
-                self.set_watch(slot, None);
+}
+
+fn watch_indices(link: NonZeroU16) -> (usize, usize) {
+    let index = usize::from(link.get() - 1);
+    (index / OPEN_MAX, index % OPEN_MAX)
+}
+
+impl Table {
+    fn linked_watch(&mut self, link: NonZeroU16) -> &mut Watch {
+        let (index, slot) = watch_indices(link);
+        self.epolls[index].watches[slot].as_mut().unwrap()
+    }
+
+    fn set_epoll_watch(&mut self, index: usize, slot: usize, mut watch: Option<Watch>) {
+        let was_readable = self.epolls[index].readable();
+        if let Some(old) = self.epolls[index].watches[slot] {
+            if let Some(prev) = old.prev {
+                self.linked_watch(prev).next = old.next;
+            } else {
+                self.watch_heads[old.description.slot] = old.next;
             }
+            if let Some(next) = old.next {
+                self.linked_watch(next).prev = old.prev;
+            }
+        }
+        if let Some(new) = &mut watch {
+            let link = NonZeroU16::new((index * OPEN_MAX + slot + 1) as u16);
+            new.next = self.watch_heads[new.description.slot];
+            if let Some(next) = new.next {
+                self.linked_watch(next).prev = link;
+            }
+            self.watch_heads[new.description.slot] = link;
+        }
+        self.epolls[index].set_watch(slot, watch);
+        self.note_epoll_readability(index, was_readable);
+    }
+
+    fn note_epoll_readability(&mut self, index: usize, was_readable: bool) {
+        if self.epolls[index].readable() != was_readable {
+            self.epoll_dirty |= 1 << index;
+            self.publish_poll_change();
+        }
+    }
+
+    pub(crate) fn observe_description(
+        &mut self,
+        handle: Handle,
+        readiness: u32,
+        notifications: u32,
+    ) -> usize {
+        let mut link = self.watch_heads[handle.slot];
+        if link.is_none() || self.entry(handle).is_err() {
+            return 0;
+        }
+        let mut wakes = 0;
+        while let Some(current) = link {
+            let (index, slot) = watch_indices(current);
+            let watch = self.epolls[index].watches[slot].unwrap();
+            debug_assert_eq!(watch.description, handle);
+            link = watch.next;
+            #[cfg(test)]
+            {
+                let visited = if watch.backend.is_some() {
+                    &self.local_slots_visited
+                } else {
+                    &self.nested_watches_visited
+                };
+                visited.set(visited.get() + 1);
+            }
+            let was_readable = self.epolls[index].readable();
+            if self.epolls[index].observe_watch(slot, readiness, notifications) {
+                wakes |= 1 << index;
+            }
+            self.note_epoll_readability(index, was_readable);
+        }
+        wakes
+    }
+
+    pub(crate) fn clear_epoll(&mut self, index: usize) {
+        for slot in self.epolls[index].live_slots() {
+            self.set_epoll_watch(index, slot, None);
+        }
+        self.epolls[index] = Instance::EMPTY;
+        self.epoll_dirty &= !(1 << index);
+        self.epoll_topology.set(None);
+    }
+
+    pub(crate) fn remove_epoll_description(&mut self, handle: Handle) {
+        while let Some(link) = self.watch_heads[handle.slot] {
+            let (index, slot) = watch_indices(link);
+            self.set_epoll_watch(index, slot, None);
         }
     }
 }
@@ -125,6 +242,7 @@ pub enum Source {
 /// Which pool answers a watch. A backend observation names its own kind so the
 /// shared table can skip unrelated watches without exposing the object table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Backend {
     Local,
     Socket,
@@ -132,13 +250,14 @@ pub enum Backend {
     Pty,
 }
 
-fn backend_of(object: Object) -> Backend {
-    match object {
+fn backend_of(object: Object) -> Option<Backend> {
+    Some(match object {
+        Object::Epoll(_) => return None,
         Object::Socket(_) => Backend::Socket,
         Object::Pipe(_) => Backend::Pipe,
         Object::Pty(_) => Backend::Pty,
         _ => Backend::Local,
-    }
+    })
 }
 
 fn source(object: Object, owner: u32) -> Result<Source, Errno> {
@@ -167,10 +286,13 @@ impl super::OpenDescriptions {
         mut sample: impl FnMut(Source) -> Option<(u32, u32)>,
     ) {
         let mut table = self.inner.borrow_mut();
-        let mut wakes = [false; super::open_description::EPOLLS];
-        let super::open_description::Table {
+        let mut wakes = 0;
+        let mut incomplete = false;
+        let mut readiness_changed = false;
+        let Table {
             entries,
             epolls,
+            epoll_dirty,
             #[cfg(test)]
             backend_slots_visited,
             ..
@@ -180,10 +302,11 @@ impl super::OpenDescriptions {
             .enumerate()
             .filter(|(_, instance)| instance.used)
         {
-            for slot in instance.live_slots() {
+            let was_readable = instance.readable();
+            for slot in WatchSlots(instance.backends[backend as usize]) {
                 #[cfg(test)]
                 backend_slots_visited.set(backend_slots_visited.get() + 1);
-                let Some(watch) = instance.watches[slot].as_mut().filter(|watch| watch.armed) else {
+                let Some(watch) = instance.watches[slot].filter(|watch| watch.armed) else {
                     continue;
                 };
                 let entry = &entries[watch.description.slot];
@@ -193,47 +316,46 @@ impl super::OpenDescriptions {
                 let Some(description) = entry.value else {
                     continue;
                 };
-                // A pool only answers for its own backend kind. Skipping the
-                // others here is equivalent to the closure returning None, but
-                // avoids the entry lookup, source construction and call for
-                // every unrelated watch in the shared table.
-                if backend_of(description.object) != backend {
+                // A backend wake can add an edge while this epoll is
+                // already readable.
+                let Some((ready, notifications)) = source(description.object, entry.owner)
+                    .ok()
+                    .and_then(&mut sample)
+                else {
+                    // A backend error must be visible through the next full
+                    // wait sample, even if this instance remains unreadable.
+                    incomplete = true;
                     continue;
-                }
-                if let Ok(source) = source(description.object, entry.owner)
-                    && let Some((ready, notifications)) = sample(source)
-                {
-                    // A backend wake can add an event while this epoll is
-                    // already readable; its ancestors still need that edge.
-                    wakes[index] |= watch.observe(ready, notifications);
+                };
+                if instance.observe_watch(slot, ready, notifications) {
+                    wakes |= 1 << index;
                 }
             }
+            if instance.readable() != was_readable {
+                *epoll_dirty |= 1 << index;
+                readiness_changed = true;
+            }
+        }
+        if incomplete {
+            table.epoll_invalidation_epoch = table.epoll_invalidation_epoch.saturating_add(1);
+        }
+        if incomplete || readiness_changed {
+            table.publish_poll_change();
         }
         table.propagate_nested(wakes);
     }
     pub(crate) fn observe_local(
         &self,
-        handle: super::open_description::Handle,
+        handle: Handle,
         readiness: u32,
         wakes: u32,
     ) {
         let mut table = self.inner.borrow_mut();
-        let mut notifications = [false; super::open_description::EPOLLS];
-        for (index, instance) in table
-            .epolls
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, instance)| instance.used)
-        {
-            for slot in instance.live_slots() {
-                if let Some(watch) = &mut instance.watches[slot]
-                    && watch.description == handle
-                {
-                    notifications[index] |= watch.observe(readiness, wakes);
-                }
-            }
+        if wakes != 0 {
+            table.publish_poll_change();
         }
-        table.propagate_nested(notifications);
+        let parents = table.observe_description(handle, readiness, wakes);
+        table.propagate_nested(parents);
     }
 }
 
@@ -263,6 +385,31 @@ impl Process<'_> {
     pub fn epoll_identity(&self, fd: i32) -> Result<u64, Errno> {
         self.epoll_index(fd)?;
         Ok(self.description(fd)?.identity())
+    }
+    /// Retain after a full wait sample returned zero. Backend publications
+    /// maintain the ready bits. Committed watch changes and unresolved
+    /// backend samples invalidate the proof independently of those bits.
+    pub fn epoll_invalidation_epoch(&self) -> u64 {
+        self.objects.inner.borrow().epoll_invalidation_epoch
+    }
+
+    /// A parked waiter may trust the published unreadable state only after
+    /// the foreground has observed filesystem changes and expired due timers.
+    /// Its caller must still validate the user output range and check timeout
+    /// and signal priority on every wake attempt.
+    pub fn epoll_wait_needs_sample(&self, fd: i32, identity: u64, epoch: u64) -> Result<bool, Errno> {
+        let description = self.description(fd)?;
+        if description.identity() != identity {
+            return Err(Errno::Badf);
+        }
+        let table = self.objects.inner.borrow();
+        let Object::Epoll(index) = table.entry(description)?.value.ok_or(Errno::Badf)?.object else {
+            return Err(Errno::Badf);
+        };
+        Ok(table.epoll_invalidation_epoch == u64::MAX
+            || table.epoll_invalidation_epoch != epoch
+            || table.epoll_dirty != 0
+            || table.epolls[index].readable())
     }
     pub fn epoll_create(&mut self, flags: u32) -> Result<i32, Errno> {
         if flags & !O_CLOEXEC != 0 {
@@ -301,6 +448,7 @@ impl Process<'_> {
         self.objects.inner.borrow_mut().epolls[index] = Instance {
             used: true,
             owner: self.owner,
+            description: Some(description),
             ..Instance::EMPTY
         };
         self.objects.inner.borrow().epoll_topology.set(None);
@@ -361,13 +509,29 @@ impl Process<'_> {
                 armed: true,
                 pending: true, // ADD/MOD must re-poll even an already ready FD.
                 observed: 0,
+                backend: backend_of(target),
+                prev: None,
+                next: None,
             })
         };
-        table.epolls[index].set_watch(slot, watch);
-        if matches!(target, Object::Epoll(_)) && op != 3 {
-            table.epoll_topology.set(None);
+        table.set_epoll_watch(index, slot, watch);
+        table.epoll_invalidation_epoch = table.epoll_invalidation_epoch.saturating_add(1);
+        table.publish_poll_change();
+        let mut wakes = 0;
+        if let Object::Epoll(child) = target {
+            if op != 3 {
+                table.epoll_topology.set(None);
+            }
+            if op != 2 {
+                let ready = u32::from(table.epolls[child].readable()) * IN;
+                let was_readable = table.epolls[index].readable();
+                if table.epolls[index].observe_watch(slot, ready, 0) {
+                    wakes |= 1 << index;
+                }
+                table.note_epoll_readability(index, was_readable);
+            }
         }
-        table.propagate_nested([false; super::open_description::EPOLLS]);
+        table.propagate_nested(wakes);
         Ok(())
     }
     /// Weak OFD identities resolve independently of this process's FD table.
@@ -397,37 +561,76 @@ impl Process<'_> {
     pub fn epoll_sample(
         &self,
         epfd: i32,
+        sample: impl FnMut(Source) -> Result<u32, Errno>,
+    ) -> Result<[u32; OPEN_MAX], Errno> {
+        self.sample_epoll(self.epoll_index(epfd)?, None::<fn() -> u64>, sample)
+    }
+
+    /// Resolve timerfd readiness against one monotonic clock sample. Read the
+    /// clock on the first relevant timer in the epoll graph.
+    pub fn epoll_sample_at(
+        &self,
+        epfd: i32,
+        clock: impl FnOnce() -> u64,
+        sample: impl FnMut(Source) -> Result<u32, Errno>,
+    ) -> Result<[u32; OPEN_MAX], Errno> {
+        self.sample_epoll(self.epoll_index(epfd)?, Some(clock), sample)
+    }
+
+    fn sample_epoll(
+        &self,
+        root: usize,
+        mut clock: Option<impl FnOnce() -> u64>,
         mut sample: impl FnMut(Source) -> Result<u32, Errno>,
     ) -> Result<[u32; OPEN_MAX], Errno> {
-        let root = self.epoll_index(epfd)?;
+        let use_deadlines = clock.is_some();
         let topology = self.objects.inner.borrow().epoll_topology(None)?;
         let reachable = topology.reachable(root);
-        let mut result = [0; OPEN_MAX];
-        let mut wakes = [false; super::open_description::EPOLLS];
-        for &index in &topology.order[..topology.count] {
-            if reachable & (1 << index) == 0 {
-                continue;
-            }
-            let watches = self.objects.inner.borrow().epolls[index].watches;
-            let mut readiness = [0; OPEN_MAX];
-            for (slot, watch) in watches.into_iter().enumerate() {
-                let Some(watch) = watch.filter(|w| w.armed) else {
+        let mut wakes = 0;
+        let sampled = (|| {
+            let mut result = [0; OPEN_MAX];
+            for &index in &topology.order[..topology.count] {
+                if reachable & (1 << index) == 0 {
                     continue;
-                };
-                let description = self.objects.get(watch.description)?;
-                if !matches!(description.object, Object::Epoll(_)) {
-                    let owner = self.objects.owner(watch.description)?;
-                    readiness[slot] = sample(self.epoll_source(description.object, owner)?)?;
+                }
+                let slots = self.objects.inner.borrow().epolls[index].live_slots();
+                let mut readiness = [0; OPEN_MAX];
+                for slot in slots {
+                    let watch = self.objects.inner.borrow().epolls[index].watches[slot];
+                    let Some(watch) = watch.filter(|w| w.armed) else {
+                        continue;
+                    };
+                    let description = self.objects.get(watch.description)?;
+                    match description.object {
+                        Object::Epoll(_) => {}
+                        Object::Timer(timer) if use_deadlines => {
+                            if timer.deadline.is_some() && let Some(read_clock) = clock.take() {
+                                self.objects.expire_timers(read_clock);
+                            }
+                            let scheduled = self.objects.inner.borrow().timer_deadlines
+                                .scheduled(watch.description.slot);
+                            readiness[slot] = u32::from(timer.deadline.is_some() && !scheduled) * IN;
+                        }
+                        object => {
+                            let owner = self.objects.owner(watch.description)?;
+                            readiness[slot] = sample(self.epoll_source(object, owner)?)?;
+                        }
+                    }
+                }
+                let mut table = self.objects.inner.borrow_mut();
+                if table.observe_epoll(index, &mut readiness) {
+                    wakes |= 1 << index;
+                }
+                if index == root {
+                    result = readiness;
                 }
             }
-            let mut table = self.objects.inner.borrow_mut();
-            wakes[index] |= table.observe_epoll(index, &mut readiness);
-            if index == root {
-                result = readiness;
-            }
-        }
+            Ok(result)
+        })();
+        // Earlier instances have already committed their observations. Publish
+        // their edges even when a later backend sample fails.
         self.objects.inner.borrow_mut().propagate_nested(wakes);
-        Ok(result)
+        sampled
     }
     pub fn epoll_collect(
         &mut self,
@@ -442,10 +645,10 @@ impl Process<'_> {
         let mut table = self.objects.inner.borrow_mut();
         // Observe every watch before applying maxevents, retaining candidates
         // beyond the returned prefix. No loss and no allocation under pressure.
-        let mut wakes = [false; super::open_description::EPOLLS];
         let mut readiness = *readiness;
-        wakes[index] = table.observe_epoll(index, &mut readiness);
+        let wakes = (table.observe_epoll(index, &mut readiness) as usize) << index;
         let instance = &mut table.epolls[index];
+        let was_readable = instance.readable();
         let start = instance.cursor;
         let mut count = 0;
         for offset in 0..OPEN_MAX {
@@ -468,12 +671,14 @@ impl Process<'_> {
             if watch.events & ONESHOT != 0 {
                 watch.armed = false;
             }
+            instance.refresh_ready(slot);
             instance.cursor = (slot + 1) % OPEN_MAX;
             count += 1;
             if count == out.len() {
                 break;
             }
         }
+        table.note_epoll_readability(index, was_readable);
         table.propagate_nested(wakes);
         Ok(count)
     }
@@ -487,9 +692,8 @@ impl Process<'_> {
     ) -> Result<bool, Errno> {
         let index = self.epoll_index(epfd)?;
         let mut table = self.objects.inner.borrow_mut();
-        let mut wakes = [false; super::open_description::EPOLLS];
         let mut readiness = *readiness;
-        wakes[index] = table.observe_epoll(index, &mut readiness);
+        let wakes = (table.observe_epoll(index, &mut readiness) as usize) << index;
         let readable = table.epolls[index].readable();
         table.propagate_nested(wakes);
         Ok(readable)
@@ -587,6 +791,77 @@ mod tests {
         assert!(table.topology_builds.get() <= 1, "unchanged graph was rebuilt on readiness sampling");
         assert!(table.nested_lookups.get() <= ROUNDS * 4,
             "flat epolls rescanned unrelated watches for nested propagation");
+    }
+
+    #[test]
+    fn failed_graph_sample_publishes_committed_edges_to_shared_parents() {
+        let objects = crate::OpenDescriptions::new();
+        let mut process = Process::new(&objects, 1).unwrap();
+        let shared = process.epoll_create(0).unwrap();
+        let other_root = process.epoll_create(0).unwrap();
+        let inherited = crate::spawn::Mapping { source: shared, target: 3 };
+        let mut other = process.spawn_descriptors(&FileSystem::new(), None, &[inherited], 2).unwrap();
+        let bad_child = other.epoll_create(0).unwrap();
+        let bad_root = other.epoll_create(0).unwrap();
+        let mut pipes = crate::pipe::Pipes::new();
+        let [pipe, _] = other.install_pipe(pipes.pair(2).unwrap(), 0).unwrap();
+        let first = process.eventfd(1, 0).unwrap();
+        let second = process.eventfd(1, 0).unwrap();
+        let level = Event { events: IN, data: 1 };
+        process.epoll_ctl(shared, 1, first, level).unwrap();
+        process.epoll_ctl(other_root, 1, shared, Event { events: IN | EDGE, data: 1 }).unwrap();
+        other.epoll_ctl(bad_child, 1, pipe, level).unwrap();
+        other.epoll_ctl(bad_root, 1, inherited.target, level).unwrap();
+        other.epoll_ctl(bad_root, 1, bad_child, level).unwrap();
+        let sample = |source| match source {
+            Source::Local { read, .. } => Ok(u32::from(read) * IN),
+            Source::Pipe { .. } => Err(Errno::Io),
+            _ => panic!("unexpected watch"),
+        };
+        let mut events = [Event::default(); 1];
+        let readiness = process.epoll_sample(other_root, sample).unwrap();
+        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(1));
+        let readiness = process.epoll_sample(other_root, sample).unwrap();
+        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(0));
+
+        // Sampling this newly added watch commits a fresh edge while the
+        // first watch keeps the shared child level-readable throughout.
+        process.epoll_ctl(shared, 1, second, Event { events: IN, data: 2 }).unwrap();
+        assert_eq!(other.epoll_sample(bad_root, sample), Err(Errno::Io));
+        let readiness = process.epoll_sample(other_root, sample).unwrap();
+        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(1));
+        assert_eq!(events[0], Event { events: IN, data: 1 });
+    }
+
+    #[test]
+    fn nested_notifications_skip_an_unrelated_tree_even_when_it_is_readable() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut other = Process::new(&objects, 2).unwrap();
+        let mut fs = FileSystem::new();
+        let root = p.epoll_create(0).unwrap();
+        let child = p.epoll_create(0).unwrap();
+        let event = p.eventfd(0, 0).unwrap();
+        p.epoll_ctl(root, 1, child, Event { events: IN | EDGE, data: 10 }).unwrap();
+        p.epoll_ctl(child, 1, event, Event { events: IN, data: 11 }).unwrap();
+
+        let unrelated = other.epoll_create(0).unwrap();
+        let unrelated_child = other.epoll_create(0).unwrap();
+        let unrelated_event = other.eventfd(1, 0).unwrap();
+        other.epoll_ctl(unrelated, 1, unrelated_child, Event { events: IN, data: 20 }).unwrap();
+        other.epoll_ctl(unrelated_child, 1, unrelated_event, Event { events: IN, data: 21 }).unwrap();
+        assert_eq!(ready(&mut other, unrelated, 1)[0].events, IN);
+        assert_eq!(ready(&mut p, root, 1)[0].events, 0);
+
+        for _ in 0..2 {
+            objects.inner.borrow().nested_watches_visited.set(0);
+            p.write(&mut fs, &mut Sink, event, &1u64.to_le_bytes()).unwrap();
+            assert_eq!(objects.inner.borrow().nested_watches_visited.get(), 1);
+            let mut out = [Event::default(); 1];
+            assert_eq!(p.epoll_collect(root, &[0; OPEN_MAX], &mut out), Ok(1));
+            assert_eq!(out[0], Event { events: IN, data: 10 });
+            assert_eq!(p.epoll_collect(root, &[0; OPEN_MAX], &mut out), Ok(0));
+        }
     }
 
     #[test]
@@ -884,6 +1159,7 @@ mod tests {
             Some((IN, 0))
         });
         assert_eq!(sampled, 1, "the pipe watch was not observed");
+        assert_eq!(objects.inner.borrow().backend_slots_visited.get(), 1);
         let mut local = 0;
         objects.observe_backend(Backend::Local, |source| {
             let Source::Local { .. } = source else {
@@ -893,6 +1169,42 @@ mod tests {
             Some((IN, 0))
         });
         assert_eq!(local, 1, "the local watch was not observed");
+        assert_eq!(objects.inner.borrow().backend_slots_visited.get(), 2);
+    }
+
+    #[test]
+    fn local_notification_visits_only_watches_of_the_committed_description() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let mut fs = FileSystem::new();
+        let event = p.eventfd(0, 0).unwrap();
+        let alias = p.dup(event).unwrap();
+        let other = p.eventfd(0, 0).unwrap();
+        let epfd = p.epoll_create(0).unwrap();
+        for (fd, data) in [(event, 1), (alias, 2), (other, 3)] {
+            p.epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data }).unwrap();
+        }
+        p.close(&mut fs, event).unwrap();
+        p.write(&mut fs, &mut Sink, alias, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(objects.inner.borrow().local_slots_visited.get(), 2);
+        let events = ready(&mut p, epfd, 3);
+        assert_eq!(&events[..3], &[
+            Event { events: IN, data: 1 },
+            Event { events: IN, data: 2 },
+            Event::default(),
+        ]);
+        let retired = p.description(alias).unwrap();
+        p.close(&mut fs, alias).unwrap();
+        let replacement = p.eventfd(0, 0).unwrap();
+        let live = p.description(replacement).unwrap();
+        assert_eq!(live.slot, retired.slot);
+        assert_ne!(live.generation, retired.generation);
+        p.epoll_ctl(epfd, 1, replacement, Event { events: IN, data: 4 }).unwrap();
+        objects.observe_local(retired, IN, IN);
+        assert_eq!(p.epoll_collect(epfd, &[0; OPEN_MAX], &mut [Event::default(); 1]), Ok(0));
+        p.write(&mut fs, &mut Sink, replacement, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(ready(&mut p, epfd, 2)[0], Event { events: IN, data: 4 });
+        assert_eq!(objects.inner.borrow().local_slots_visited.get(), 3);
     }
 
     #[test]

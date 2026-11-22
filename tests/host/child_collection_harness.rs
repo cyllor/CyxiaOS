@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 // PROCESS_CAPACITY
+static CHECKS: AtomicUsize = AtomicUsize::new(0);
 static SWAPS: AtomicUsize = AtomicUsize::new(0);
 static RELEASES: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,8 +59,19 @@ mod user {
     impl Thread {
         // RUNNABLE
     }
+    // THREAD_SLOTS
+    #[derive(Clone, Copy)]
+    struct IdleWait { has_child: bool }
+    struct Shared {
+        idle_wait: Option<IdleWait>,
+        parked_active: u16,
+    }
     struct Group {
         parked: [Thread; threads::MAX_THREADS - 1],
+        shared: Shared,
+    }
+    impl Group {
+        // GROUP_METHODS
     }
     struct Status {
         pid: u32,
@@ -147,6 +159,7 @@ mod user {
                         thread: thread(10, i < active),
                         threads: Group {
                             parked: core::array::from_fn(|i| thread(11 + i as u32, false)),
+                            shared: Shared { parked_active: 0, idle_wait: None },
                         },
                         copy_fault: false,
                         writes: vec![],
@@ -187,13 +200,32 @@ mod user {
             assert_eq!(RELEASES.load(Ordering::SeqCst), 0);
         }
         #[test]
+        fn child_collection_skips_registered_sleepers_and_keeps_reaping_live_waits() {
+            let mut s = setup(2);
+            s.runners[0].thread.tid = 987;
+            s.runners[0].thread.waiting = Some(Wait::Sleep);
+            s.runners[0].status.state = UserState::Waiting;
+            s.runners[0].threads.shared.idle_wait = Some(IdleWait { has_child: false });
+            wait(&mut s.runners[1].thread, 200, false);
+            s.runners[1].status.state = UserState::Waiting;
+            s.runners[1].threads.shared.idle_wait = Some(IdleWait { has_child: true });
+            s.publication.push(receipt(101, 200, Some(7)));
+            CHECKS.store(0, Ordering::SeqCst);
+            s.collect_children();
+            assert_eq!(s.runners[1].thread.context.result, Some(200));
+            assert_eq!(CHECKS.load(Ordering::SeqCst), 0, "scanned a registered non-child sleeper");
+            assert_eq!(s.publications, 1);
+        }
+        #[test]
         fn other_waits_keep_context_bytes_owner_and_wait_state_without_exchanges() {
             let mut s = setup(1);
             let r = &mut s.runners[0];
             r.thread.waiting = Some(Wait::Spawn);
-            for thread in &mut r.threads.parked {
+            for slot in 0..r.threads.parked.len() {
+                let thread = &mut r.threads.parked[slot];
                 thread.active = true;
                 thread.waiting = Some(Wait::Sleep);
+                r.threads.sync_parked_slot(slot);
             }
             let selected = r.thread.clone();
             let parked = r.threads.parked.clone();
@@ -225,6 +257,7 @@ mod user {
             let selected = s.runners[0].thread.clone();
             let last = threads::MAX_THREADS - 2;
             wait(&mut s.runners[0].threads.parked[last], 200, false);
+            s.runners[0].threads.sync_parked_slot(last);
             let tid = s.runners[0].threads.parked[last].tid;
             s.children.receipts[0] = Some(receipt(100, 200, Some(0)));
             s.collect_children();
@@ -241,6 +274,7 @@ mod user {
             let mut s = setup(1);
             let last = threads::MAX_THREADS - 2;
             wait(&mut s.runners[0].threads.parked[last], 200, false);
+            s.runners[0].threads.sync_parked_slot(last);
             s.runners[0].copy_fault = true;
             s.children.receipts[0] = Some(receipt(100, 200, Some(7 << 8)));
             s.collect_children();
@@ -263,6 +297,7 @@ mod user {
             let mut s = setup(1);
             for i in 0..2 {
                 wait(&mut s.runners[0].threads.parked[i], 200, false);
+                s.runners[0].threads.sync_parked_slot(i);
             }
             s.children.receipts[0] = Some(receipt(100, 200, Some(0)));
             s.collect_children();
@@ -281,6 +316,7 @@ mod user {
             wait(&mut s.runners[0].thread, -1, true);
             let last = threads::MAX_THREADS - 2;
             wait(&mut s.runners[0].threads.parked[last], 200, false);
+            s.runners[0].threads.sync_parked_slot(last);
             s.children.receipts[0] = Some(receipt(100, 200, None));
             s.collect_children();
             assert_eq!(s.runners[0].thread.context.result, Some(0));

@@ -3,8 +3,44 @@
 //! successful musl probes do not imply general Linux binary compatibility.
 use super::{Errno, FileSystem, GrantLedger, LocalIpc, Output, Runner, UserState, count, fd};
 use cyxia_posix::linux_abi::Call;
+use cyxia_posix::{OPEN_MAX, Process};
 #[cfg(feature = "graphics")]
 static mut DRAW: [u32; 16384] = [0; 16384];
+
+pub(super) struct PollSnapshot {
+    epoch: u64,
+    count: usize,
+    // pollfd is eight bytes, but a successful zero result proves revents == 0.
+    inputs: [[u8; 6]; OPEN_MAX],
+    identities: [u64; OPEN_MAX],
+}
+
+impl PollSnapshot {
+    pub(super) const fn new() -> Self {
+        Self {
+            epoch: u64::MAX,
+            count: 0,
+            inputs: [[0; 6]; OPEN_MAX],
+            identities: [0; OPEN_MAX],
+        }
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.epoch = u64::MAX;
+    }
+
+    fn descriptor(record: &[u8]) -> i32 {
+        i32::from_le_bytes(record[..4].try_into().unwrap())
+    }
+
+    fn matches(&self, process: &Process<'_>, records: &[u8], epoch: u64) -> bool {
+        self.epoch != u64::MAX && self.epoch == epoch && self.count * 8 == records.len()
+            && records.chunks_exact(8).enumerate().all(|(i, record)| {
+                record[..6] == self.inputs[i] && record[6..] == [0; 2]
+                    && process.poll_snapshot_identity(Self::descriptor(record)) == Some(self.identities[i])
+            })
+    }
+}
 
 #[cfg(feature = "graphics")]
 fn display_error(error: cyxia_driver_virtio::Error) -> Errno {
@@ -53,7 +89,7 @@ impl Runner {
                 links: 1,
             });
         }
-        match super::unix::with(|s| s.pathname_stat(path.as_str().as_bytes())) {
+        match super::unix::inspect(|s| s.pathname_stat(path.as_str().as_bytes())) {
             Ok(info) => Ok(info),
             Err(Errno::Noent) => self.process.stat_resolved(fs, path),
             Err(error) => Err(error),
@@ -87,16 +123,30 @@ impl Runner {
             self.process.fstat(fs, descriptor)
         }
     }
-    pub(super) fn poll_result(&mut self, address: u64, count: usize) -> Result<usize, Errno> {
-        let mut bytes = [0u8; cyxia_posix::OPEN_MAX * 8];
-        if count > cyxia_posix::OPEN_MAX {
+    pub(super) fn poll_result(
+        &mut self,
+        address: u64,
+        count: usize,
+        waiting_slot: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let mut bytes = [0u8; OPEN_MAX * 8];
+        if count > OPEN_MAX {
             return Err(Errno::Inval);
         }
-        self.validate(address, count * 8, true)?;
-        self.copy_from(address, &mut bytes[..count * 8])?;
+        let records = &mut bytes[..count * 8];
+        self.validate(address, records.len(), true)?;
+        self.copy_from(address, records)?;
+        let epoch = waiting_slot.map(|_| self.process.poll_readiness_epoch());
+        if let (Some(slot), Some(epoch)) = (waiting_slot, epoch)
+            && self.thread_at(slot).poll_snapshot.matches(&self.process, records, epoch)
+        {
+            return Ok(0);
+        }
         let mut ready_count = 0;
-        for record in bytes[..count * 8].chunks_exact_mut(8) {
-            let descriptor = i32::from_le_bytes(record[..4].try_into().map_err(|_| Errno::Inval)?);
+        let mut timer_now = None;
+        let mut clock = || *timer_now.get_or_insert_with(super::now_ns);
+        for record in records.chunks_exact_mut(8) {
+            let descriptor = PollSnapshot::descriptor(record);
             let events = u16::from_le_bytes(record[4..6].try_into().map_err(|_| Errno::Inval)?);
             let available = if descriptor < 0 {
                 0
@@ -113,9 +163,9 @@ impl Runner {
                         } else if let Some(raw) = self.process.pty(descriptor)? {
                             super::pty::poll(owner, raw)?
                         } else if self.process.is_timerfd(descriptor)? {
-                            u16::from(self.process.timerfd_ready(descriptor, super::now_ns())?)
+                            u16::from(self.process.timerfd_ready(descriptor, clock())?)
                         } else if self.process.is_epoll(descriptor)? {
-                            u16::from(self.epoll_readable(descriptor)?)
+                            u16::from(self.epoll_readable(descriptor, &mut clock)?)
                         } else {
                             let (read, write) = self.process.local_readiness(descriptor)?;
                             u16::from(read) | (u16::from(write) << 2)
@@ -129,7 +179,28 @@ impl Runner {
             record[6..8].copy_from_slice(&revents.to_le_bytes());
             ready_count += usize::from(revents != 0);
         }
-        self.copy_to(address, &bytes[..count * 8])?;
+        self.copy_to(address, records)?;
+        if let (Some(slot), Some(epoch)) = (waiting_slot, epoch) {
+            // Sampling a later nested epoll can publish readiness for an FD
+            // sampled earlier in the sweep. Never cache that mixed result.
+            self.thread_at_mut(slot).poll_snapshot.invalidate();
+            if ready_count == 0 && epoch != u64::MAX && epoch == self.process.poll_readiness_epoch() {
+                let captured = records.chunks_exact(8).enumerate().all(|(i, record)| {
+                    let Some(identity) = self.process.poll_snapshot_identity(PollSnapshot::descriptor(record)) else {
+                        return false;
+                    };
+                    let snapshot = &mut self.thread_at_mut(slot).poll_snapshot;
+                    snapshot.inputs[i].copy_from_slice(&record[..6]);
+                    snapshot.identities[i] = identity;
+                    true
+                });
+                if captured {
+                    let snapshot = &mut self.thread_at_mut(slot).poll_snapshot;
+                    snapshot.count = count;
+                    snapshot.epoch = epoch;
+                }
+            }
+        }
         Ok(ready_count)
     }
     fn relative_deadline(&self, address: u64) -> Result<u64, Errno> {
@@ -398,7 +469,7 @@ impl Runner {
         peer: bool,
     ) -> Result<(), Errno> {
         let (wire, len) =
-            super::unix::with(|s| s.socket_name(owner, super::unix::handle(handle), peer))?;
+            super::unix::inspect(|s| s.socket_name(owner, super::unix::handle(handle), peer))?;
         self.copy_to(address, &wire[..len.min(capacity)])?;
         self.copy_to(length, &(len as u32).to_le_bytes())
     }
@@ -654,7 +725,7 @@ impl Runner {
                     }
                     17 => {
                         let capability_owner = self.process.backend_owner(fd(a)?)?;
-                        let owner = super::unix::with(|s| {
+                        let owner = super::unix::inspect(|s| {
                             s.peer_owner(capability_owner, super::unix::handle(handle))
                         })?;
                         bytes[..4].copy_from_slice(&owner.to_le_bytes());
@@ -810,7 +881,9 @@ impl Runner {
                 } else {
                     self.relative_deadline(c)?
                 };
-                let ready = self.poll_result(a, count)?;
+                let waiting_slot = (super::now() < until).then_some(0);
+                self.thread.poll_snapshot.invalidate();
+                let ready = self.poll_result(a, count, waiting_slot)?;
                 if ready == 0 && super::now() < until {
                     self.block(super::Wait::Poll {
                         address: a,
@@ -1083,7 +1156,7 @@ impl Runner {
                         .open_readonly_mode(inode, bytes, flags, Self::asset_mode(resolved))
                         .map(|fd| fd as u64);
                 }
-                match super::unix::with(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
+                match super::unix::inspect(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
                     Ok(_) => {
                         // A socket's directory entry cannot be opened as a
                         // regular file or replaced by O_CREAT in the RAMFS.
@@ -1127,7 +1200,7 @@ impl Runner {
                     return Err(if call == Call::Mkdirat { Errno::Exist } else { Errno::Rofs });
                 }
                 if call == Call::Mkdirat {
-                    match super::unix::with(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
+                    match super::unix::inspect(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
                         Ok(_) => return Err(Errno::Exist),
                         Err(Errno::Noent) => {}
                         Err(error) => return Err(error),
@@ -1416,7 +1489,7 @@ impl Runner {
                 {
                     self.validate(c, 4, true)?;
                     let owner = self.process.backend_owner(fd(a)?)?;
-                    let pending = super::pipes::with(|p| p.pending(owner, raw))?;
+                    let pending = super::pipes::inspect(|p| p.pending(owner, raw))?;
                     self.copy_to(c, &(pending as u32).to_le_bytes())?;
                     Ok(0)
                 } else {

@@ -1,7 +1,9 @@
-//! Bounded monotonic timers; elapsed time comes from the supervisor.
-//! One timer lives in its existing open description. No separate queue, heap
-//! allocation, background callback or reference extending epoll watch exists.
+//! Bounded monotonic timers. Each timer belongs to its open description and
+//! future expirations are ordered in a fixed-capacity deadline heap.
 use super::{Description, Errno, O_CLOEXEC, O_NONBLOCK, O_RDWR, Object, Process};
+use super::open_description::Handle;
+mod deadlines;
+pub(crate) use deadlines::Deadlines;
 
 pub const ABSTIME: u32 = 1;
 
@@ -83,6 +85,53 @@ impl Timer {
     }
 }
 
+impl super::OpenDescriptions {
+    /// Publish due timer readiness before consulting cached epoll readiness.
+    pub fn expire_timers(&self, clock: impl FnOnce() -> u64) {
+        if self.inner.borrow().timer_deadlines.is_empty() {
+            return;
+        }
+        let now = clock();
+        let mut table = self.inner.borrow_mut();
+        let mut wakes = 0;
+        let mut expired = false;
+        while let Some(handle) = table.timer_deadlines.pop_due(now) {
+            // The timer stays readable until read or rearm. Its original
+            // deadline remains in the OFD to count missed periodic ticks.
+            wakes |= table.observe_description(handle, super::epoll::IN, 0);
+            expired = true;
+        }
+        if expired {
+            table.publish_poll_change();
+        }
+        table.propagate_nested(wakes);
+    }
+
+    fn store_timer(
+        &self,
+        handle: Handle,
+        description: Description,
+        timer: Timer,
+        now: u64,
+        rearm: bool,
+    ) -> Result<(), Errno> {
+        let mut table = self.inner.borrow_mut();
+        table.entry(handle)?;
+        table.entries[handle.slot].value = Some(Description {
+            object: Object::Timer(timer),
+            ..description
+        });
+        table.timer_deadlines
+            .set(handle, timer.deadline.filter(|&deadline| deadline > now));
+        table.publish_poll_change();
+        let ready = u32::from(timer.ready(now)) * super::epoll::IN;
+        let notification = if rearm { ready } else { 0 };
+        let wakes = table.observe_description(handle, ready, notification);
+        table.propagate_nested(wakes);
+        Ok(())
+    }
+}
+
 impl Process<'_> {
     pub fn timerfd_create(&mut self, clock: i32, flags: u32) -> Result<i32, Errno> {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
@@ -141,17 +190,9 @@ impl Process<'_> {
         };
         let previous = timer.get(now);
         timer.set(now, flags, setting)?;
-        self.objects.update(
-            slot,
-            Description {
-                object: Object::Timer(timer),
-                ..d
-            },
-        )?;
         // Rearming replaces unread expirations. An already expired new timer
         // must notify edge watches even if the previous timer was also ready.
-        let ready = u32::from(timer.ready(now));
-        self.objects.observe_local(slot, ready, ready);
+        self.objects.store_timer(slot, d, timer, now, true)?;
         Ok(previous)
     }
     pub fn timerfd_read(&mut self, fd: i32, now: u64, out: &mut [u8]) -> Result<usize, Errno> {
@@ -164,15 +205,7 @@ impl Process<'_> {
             return Err(Errno::Inval);
         }
         let ticks = timer.read(now)?;
-        self.objects.update(
-            slot,
-            Description {
-                object: Object::Timer(timer),
-                ..d
-            },
-        )?;
-        self.objects
-            .observe_local(slot, u32::from(timer.ready(now)), 0);
+        self.objects.store_timer(slot, d, timer, now, false)?;
         out[..8].copy_from_slice(&ticks.to_le_bytes());
         Ok(8)
     }
@@ -182,6 +215,59 @@ impl Process<'_> {
 mod tests {
     use super::*;
     use crate::{O_CLOEXEC, O_NONBLOCK, OpenDescriptions, Process};
+
+    #[test]
+    fn timer_epoll_samples_one_clock_and_tracks_rearm_read_and_final_close() {
+        use crate::epoll::{EDGE, Event, IN};
+        let objects = OpenDescriptions::new();
+        let mut process = Process::new(&objects, 1).unwrap();
+        let mut fs = cyxia_ai_fs::FileSystem::new();
+        let epfd = process.epoll_create(0).unwrap();
+        let late = process.timerfd_create(1, O_NONBLOCK).unwrap();
+        let periodic = process.timerfd_create(1, O_NONBLOCK).unwrap();
+        let removed = process.timerfd_create(1, O_NONBLOCK).unwrap();
+        for (fd, data, value, interval) in [(late, 1, 40, 0), (periodic, 2, 20, 10), (removed, 3, 10, 0)] {
+            process.epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data }).unwrap();
+            process.timerfd_set(fd, 0, ABSTIME, Setting { value, interval }).unwrap();
+        }
+        process.timerfd_set(late, 0, ABSTIME, Setting { value: 70, interval: 0 }).unwrap();
+        process.close(&mut fs, removed).unwrap();
+        let replacement = process.timerfd_create(1, O_NONBLOCK).unwrap();
+        assert_eq!(replacement, removed);
+        process.epoll_ctl(epfd, 1, replacement, Event { events: IN | EDGE, data: 4 }).unwrap();
+        let unrelated = process.epoll_create(0).unwrap();
+        process.epoll_sample_at(unrelated, || panic!("queried the clock for an unrelated epoll"), |_| {
+            panic!("sampled an unwatched timer")
+        }).unwrap();
+
+        let wait = |process: &mut Process, time, expected_data: Option<u64>, clock_reads| {
+            let reads = core::cell::Cell::new(0);
+            let clock = || {
+                reads.set(reads.get() + 1);
+                time
+            };
+            let readiness = process.epoll_sample_at(epfd, clock, |_| panic!("timer escaped the deadline queue")).unwrap();
+            assert_eq!(reads.get(), clock_reads, "clock reads at {time}");
+            let mut events = [Event::default(); 3];
+            let delivered = process.epoll_collect(epfd, &readiness, &mut events).unwrap();
+            assert_eq!(delivered, usize::from(expected_data.is_some()), "events at {time}");
+            if let Some(data) = expected_data {
+                assert_eq!(events[0], Event { events: IN, data });
+            }
+        };
+        wait(&mut process, 10, None, 1);
+        wait(&mut process, 45, Some(2), 1);
+        let mut ticks = [0; 8];
+        process.timerfd_read(periodic, 45, &mut ticks).unwrap();
+        assert_eq!(u64::from_le_bytes(ticks), 3);
+        wait(&mut process, 49, None, 1);
+        wait(&mut process, 50, Some(2), 1);
+        wait(&mut process, 70, Some(1), 1);
+        process.timerfd_set(periodic, 70, 0, Setting::default()).unwrap();
+        process.timerfd_read(late, 70, &mut ticks).unwrap();
+        assert_eq!(u64::from_le_bytes(ticks), 1);
+        wait(&mut process, 80, None, 0);
+    }
 
     #[test]
     fn edge_past_absolute_rearm_notifies_without_consuming_previous_timer() {

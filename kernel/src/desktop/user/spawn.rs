@@ -358,7 +358,7 @@ impl Supervisor {
             Ok(())
         })();
         if let Err(error) = result {
-            self.runners[slot].finish(fs, &mut self.ledger, &mut self.ipc, UserState::Killed, 137);
+            self.kill_runner(slot, fs);
             return Err(error);
         }
         self.children.receipts[receipt] = Some(Receipt {
@@ -454,7 +454,10 @@ impl Supervisor {
     pub(super) fn collect_children(&mut self) {
         self.publish_child_exits();
         for runner in &mut self.runners {
-            if !runner.status.state.active() {
+            if !runner.status.state.active()
+                || (runner.status.state == UserState::Waiting
+                    && runner.threads.shared.idle_wait.is_some_and(|idle| !idle.has_child))
+            {
                 continue;
             }
             // Move each parked record through the foreground usercopy context;

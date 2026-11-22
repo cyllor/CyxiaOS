@@ -4,6 +4,18 @@ use cyxia_posix::{Errno, pty::Ptys};
 static mut PTYS: Ptys = Ptys::new();
 
 pub(super) fn with<T>(f: impl FnOnce(&mut Ptys) -> Result<T, Errno>) -> Result<T, Errno> {
+    let result = observe_with(f);
+    // A failing mutation can commit a prefix. Mark even if no FD has an
+    // epoll watch, and leave pure queries on the inspection path.
+    super::objects::table().publish_poll_change();
+    result
+}
+
+pub(super) fn inspect<T>(f: impl FnOnce(&Ptys) -> Result<T, Errno>) -> Result<T, Errno> {
+    observe_with(|pool| f(pool))
+}
+
+fn observe_with<T>(f: impl FnOnce(&mut Ptys) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: the supervisor serializes foreground calls; no borrowed pool
     // reference may escape the callback, and IRQ handlers do not touch PTYS.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
@@ -33,7 +45,7 @@ pub(super) fn poll(owner: u32, handle: u64) -> Result<u16, Errno> {
 pub(super) fn open_master(owner: u32, flags: u32) -> Result<u64, Errno> {
     let mut attempt = cyxia_ai_runtime::accounting::Attempt::default();
     let result = (|| {
-        let free = with(|p| Ok(p.free()))?;
+        let free = inspect(|p| Ok(p.free()))?;
         // Fixed backing is BOOTSTRAP; this model grants only logical occupancy.
         attempt.proposed(8193);
         let (allowed, model) =
@@ -52,13 +64,13 @@ pub(super) fn open_master(owner: u32, flags: u32) -> Result<u64, Errno> {
 }
 
 pub(super) fn release_actor(actor: u32) {
-    let _ = with(|p| {
+    let _ = observe_with(|p| {
         p.release_actor(actor);
         Ok(())
     });
 }
 pub(super) fn take_signal() -> Option<(u32, u8)> {
-    with(|p| Ok(p.take_signal())).ok().flatten()
+    observe_with(|p| Ok(p.take_signal())).ok().flatten()
 }
 
 impl super::Runner {
@@ -116,7 +128,7 @@ impl super::Runner {
         match request {
             0x80045430 => {
                 self.validate(address, 4, true)?;
-                let n = with(|p| p.number(owner, handle))?;
+                let n = inspect(|p| p.number(owner, handle))?;
                 self.copy_to(address, &(n as u32).to_le_bytes())?;
                 Ok(0)
             }
@@ -133,14 +145,14 @@ impl super::Runner {
             0x5441 => {
                 let flags = u32::try_from(address).map_err(|_| Errno::Inval)?;
                 Self::pty_flags(flags)?;
-                let n = with(|p| p.number(owner, handle))?;
+                let n = inspect(|p| p.number(owner, handle))?;
                 let slave =
                     with(|p| p.open_slave(self.status.pid, n, flags & cyxia_posix::O_NONBLOCK))?;
                 self.install_pty(slave, flags).map(|fd| fd as u64)
             }
             0x5401 => {
                 self.validate(address, 36, true)?;
-                let t = with(|p| p.termios(owner, handle))?;
+                let t = inspect(|p| p.termios(owner, handle))?;
                 let mut bytes = [0; 36];
                 for (i, field) in [t.input, t.output, t.control, t.local]
                     .into_iter()
@@ -187,7 +199,7 @@ impl super::Runner {
             }
             0x540f => {
                 self.validate(address, 4, true)?;
-                let pid = with(|p| p.foreground(owner, handle))?;
+                let pid = inspect(|p| p.foreground(owner, handle))?;
                 self.copy_to(address, &pid.to_le_bytes())?;
                 Ok(0)
             }
@@ -214,7 +226,7 @@ impl super::Runner {
             }
             0x5413 => {
                 self.validate(address, 8, true)?;
-                let size = with(|p| p.winsize(owner, handle))?;
+                let size = inspect(|p| p.winsize(owner, handle))?;
                 let mut bytes = [0; 8];
                 for (v, b) in size.iter().zip(bytes.chunks_exact_mut(2)) {
                     b.copy_from_slice(&v.to_le_bytes());

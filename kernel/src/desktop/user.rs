@@ -71,6 +71,7 @@ const FAULT_LABEL: &str = "esr";
 #[cfg(target_arch = "x86_64")]
 const FAULT_LABEL: &str = "fault";
 const SLOTS: usize = MAX_PROCESSES;
+const _: () = assert!(SLOTS <= u64::BITS as usize);
 const USER_POOL: u32 = POOL_PAGES;
 #[cfg(feature = "cosmic-workspace-applets-v1")]
 const _: () = assert!(cyxia_posix::OPEN_MAX == 128
@@ -93,9 +94,8 @@ const PROCESS_ADMISSION_MODEL: u64 = cyxia_ai_runtime::SESSION_PROCESS_MODEL_ID;
 #[cfg(not(feature = "cosmic-session"))]
 const PROCESS_ADMISSION_MODEL: u64 = 8193;
 /// Versioned process selector. The session profile widens the candidate domain
-/// to SESSION_PROCESS_SLOTS; the demo path stays bounded to 8. Mirrors the
-/// thread selector's feature-gated policy choice with unchanged ranking and
-/// starvation guard. Every caller historically unwrapped the policy result.
+/// to SESSION_PROCESS_SLOTS and decays the recent preemption work estimate
+/// with runnable age. Both profiles use the same starvation guard.
 fn process_dispatch_policy(
     candidates: &[Option<cyxia_ai_runtime::UserCandidate>],
 ) -> Option<cyxia_ai_runtime::UserDispatch> {
@@ -161,6 +161,7 @@ enum Wait {
     Epoll {
         descriptor: i32,
         identity: u64,
+        epoch: u64,
         address: u64,
         count: usize,
         until: u64,
@@ -236,6 +237,9 @@ impl Runner {
 }
 struct Supervisor {
     runners: [Runner; SLOTS],
+    // CPU0 publishes occupancy after start and clears it on terminal dispatch
+    // or explicit kill.
+    occupied_runners: u64,
     ledger: GrantLedger,
     ipc: LocalIpc,
     next_pid: u32,
@@ -247,6 +251,7 @@ struct Supervisor {
 }
 static mut SUPERVISOR: Supervisor = Supervisor {
     runners: [const { Runner::new() }; SLOTS],
+    occupied_runners: 0,
     ledger: GrantLedger::new(PageCount(USER_POOL)),
     ipc: LocalIpc::new(),
     next_pid: 1,
@@ -752,74 +757,72 @@ impl Runner {
         }
     }
     fn block(&mut self, wait: Wait) {
+        #[cfg(feature = "ported")]
+        {
+            self.threads.shared.idle_wait = None;
+        }
         self.thread.waiting = Some(wait);
         self.status.state = UserState::Waiting;
         self.status.waits = self.status.waits.saturating_add(1);
         self.refresh_thread_state();
     }
-    fn wake(&mut self, time: u64, ipc: &mut LocalIpc) {
-        if !self.thread.active || self.thread.waiting.is_none() {
+    fn wake(&mut self, slot: usize, time: u64, ipc: &mut LocalIpc) {
+        let thread = self.thread_at(slot);
+        let Some(wait) = thread.waiting else { return };
+        if !thread.active {
             return;
         }
         #[cfg(feature = "ported")]
-        if self.linux && self.thread.signals.ready() {
-            // Save a replayable context for unfinished restartable waits. The
-            // disposition can change before delivery: decide SA_RESTART when
-            // constructing the actual handler frame, not when waking here.
-            if self.signal_wait_restartable() {
-                if !self.thread.retry_syscall {
-                    self.thread
-                        .context
-                        .restart_syscall()
-                        .expect("saved syscall");
-                    self.thread.retry_syscall = true;
+        if self.linux && thread.signals.ready() {
+            // The disposition may change before delivery. Save a replayable
+            // context here and decide SA_RESTART when building the handler frame.
+            if thread.signal_wait_restartable() {
+                let thread = self.thread_at_mut(slot);
+                if !thread.retry_syscall {
+                    thread.context.restart_syscall().expect("saved syscall");
+                    thread.retry_syscall = true;
                 }
             } else {
-                if self.thread.retry_syscall {
-                    self.thread
-                        .context
-                        .cancel_restart()
-                        .expect("saved syscall return PC");
-                    self.thread.retry_syscall = false;
+                let thread = self.thread_at_mut(slot);
+                if thread.retry_syscall {
+                    thread.context.cancel_restart().expect("saved syscall return PC");
+                    thread.retry_syscall = false;
                 }
-                self.thread.retry_descriptor = None;
-                let error = self.sleep_interrupted().err().unwrap_or(Errno::Intr);
-                self.thread.context.set_result((-(error as i64)) as u64);
+                thread.retry_descriptor = None;
+                let error = self.sleep_interrupted(wait).err().unwrap_or(Errno::Intr);
+                self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
             }
-            self.thread.waiting = None;
-            self.status.state = UserState::Running;
-            self.thread.ready_since = time;
-            self.status.wakeups = self.status.wakeups.saturating_add(1);
+            self.finish_wake(slot, time);
             return;
         }
-        let ready = match self.thread.waiting {
+        let ready = match wait {
             #[cfg(feature = "ported")]
-            Some(Wait::Nanosleep { until, .. }) => time >= until,
+            Wait::Nanosleep { until, .. } => time >= until,
             #[cfg(feature = "ported")]
-            Some(Wait::Spawn | Wait::Signal | Wait::Child { .. }) => false,
+            Wait::Spawn | Wait::Signal | Wait::Child { .. } => false,
             #[cfg(feature = "ported")]
-            Some(Wait::Retry(until)) => time >= until,
+            Wait::Retry(until) => time >= until,
             #[cfg(feature = "ported")]
-            Some(Wait::Checkpoint(generation)) => {
+            Wait::Checkpoint(generation) => {
                 // The caller owns this staged generation, not the current FD
                 // number. Only the second completed device FLUSH permits 0.
                 match super::storage::checkpoint_complete(generation) {
                     Ok(_) => {
-                        self.thread.context.set_result(0);
+                        self.thread_at_mut(slot).context.set_result(0);
                         true
                     }
                     Err(Errno::Again) => false,
                     Err(error) => {
-                        self.thread.context.set_result((-(error as i64)) as u64);
+                        self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
                         true
                     }
                 }
             }
             #[cfg(feature = "ported")]
-            Some(Wait::TimerRead {
+            Wait::TimerRead {
                 descriptor,
                 identity,
-            }) => {
+            } => {
                 // Keep a disarmed timer parked without repeatedly dispatching
                 // user code. Rearming an alias is visible through the shared OFD.
                 match self
@@ -834,9 +837,9 @@ impl Runner {
                 }
             }
             #[cfg(feature = "ported")]
-            Some(Wait::Futex { until, .. }) => {
+            Wait::Futex { until, .. } => {
                 if time >= until {
-                    self.thread
+                    self.thread_at_mut(slot)
                         .context
                         .set_result((-(Errno::Timedout as i64)) as u64);
                     true
@@ -845,62 +848,71 @@ impl Runner {
                 }
             }
             #[cfg(feature = "ported")]
-            Some(Wait::Poll {
+            Wait::Poll {
                 address,
                 count,
                 until,
-            }) => match self.poll_result(address, count) {
+            } => match self.poll_result(address, count, (time < until).then_some(slot)) {
                 Ok(n) if n > 0 || time >= until => {
-                    self.thread.context.set_result(n as u64);
+                    self.thread_at_mut(slot).context.set_result(n as u64);
                     true
                 }
                 Ok(_) => false,
                 Err(error) => {
-                    self.thread.context.set_result((-(error as i64)) as u64);
+                    self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
                     true
                 }
             },
             #[cfg(feature = "ported")]
-            Some(Wait::Epoll {
+            Wait::Epoll {
                 descriptor,
                 identity,
+                epoch,
                 address,
                 count,
                 until,
-            }) => {
-                let result = if self.process.epoll_identity(descriptor) == Ok(identity) {
-                    self.epoll_result(descriptor, address, count)
-                } else {
-                    Err(Errno::Badf)
-                };
+            } => {
+                let timed_out = time >= until;
+                let result = (|| -> Result<usize, Errno> {
+                    let resample = self.process.epoll_wait_needs_sample(descriptor, identity, epoch)?;
+                    let n = self.epoll_result(descriptor, address, count, resample || timed_out)?;
+                    if n == 0 && resample && !timed_out {
+                        let epoch = self.process.epoll_invalidation_epoch();
+                        let Some(Wait::Epoll { epoch: observed, .. }) = &mut self.thread_at_mut(slot).waiting else {
+                            unreachable!("epoll waiter remained parked while sampling");
+                        };
+                        *observed = epoch;
+                    }
+                    Ok(n)
+                })();
                 match result {
-                    Ok(n) if n > 0 || time >= until => {
-                        self.thread.context.set_result(n as u64);
+                    Ok(n) if n > 0 || timed_out => {
+                        self.thread_at_mut(slot).context.set_result(n as u64);
                         true
                     }
                     Ok(_) => false,
                     Err(error) => {
-                        self.thread.context.set_result((-(error as i64)) as u64);
+                        self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
                         true
                     }
                 }
             }
             #[cfg(feature = "ported")]
-            Some(Wait::Unix {
+            Wait::Unix {
                 handle,
                 descriptor,
                 write,
-            }) => {
+            } => {
                 // Wake a cancelled binding even if an alias keeps the old
                 // endpoint alive and unready. The actual retry also rechecks.
                 match (|| {
-                    let (bound_fd, identity) = self.thread.retry_descriptor.ok_or(Errno::Badf)?;
+                    let (bound_fd, identity) = thread.retry_descriptor.ok_or(Errno::Badf)?;
                     if bound_fd != descriptor {
                         return Err(Errno::Badf);
                     }
                     self.process
                         .validate_description_identity(descriptor, identity)?;
-                    unix::with(|s| {
+                    unix::inspect(|s| {
                         s.poll(
                             self.process.backend_owner(descriptor)?,
                             unix::handle(handle),
@@ -919,24 +931,31 @@ impl Runner {
                 }
             }
             #[cfg(feature = "graphics")]
-            Some(Wait::Display) => false,
-            Some(Wait::Sleep(until)) => time >= until,
-            Some(Wait::Ipc(handle, interest)) => match ipc.ready(self.status.pid, handle, interest)
+            Wait::Display => false,
+            Wait::Sleep(until) => time >= until,
+            Wait::Ipc(handle, interest) => match ipc.ready(self.status.pid, handle, interest)
             {
                 Ok(ready) => ready,
                 Err(error) => {
-                    self.thread.context.set_result((-(error as i64)) as u64);
+                    self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
                     true
                 }
             },
-            None => unreachable!(),
         };
         if ready {
-            self.thread.waiting = None;
-            self.status.state = UserState::Running;
-            self.thread.ready_since = time;
-            self.status.wakeups = self.status.wakeups.saturating_add(1);
+            self.finish_wake(slot, time);
         }
+    }
+    fn finish_wake(&mut self, slot: usize, time: u64) {
+        let thread = self.thread_at_mut(slot);
+        #[cfg(feature = "ported")]
+        if matches!(thread.waiting, Some(Wait::Poll { .. })) {
+            thread.poll_snapshot.invalidate();
+        }
+        thread.waiting = None;
+        thread.ready_since = time;
+        self.status.state = UserState::Running;
+        self.status.wakeups = self.status.wakeups.saturating_add(1);
     }
     /// Shared syscall/fault policy, always executed by the CPU0 service owner.
     fn complete_exit(
@@ -1540,7 +1559,7 @@ impl Supervisor {
         ) {
             Ok(sp) => sp,
             Err(error) => {
-                runner.finish(fs, &mut self.ledger, &mut self.ipc, UserState::Killed, 137);
+                self.kill_runner(slot, fs);
                 return Err(error);
             }
         };
@@ -1581,12 +1600,10 @@ impl Supervisor {
         let slots = crate::address_space::process_slots();
         #[cfg(target_arch = "aarch64")]
         let slots = SLOTS;
-        let slot = self
-            .runners
-            .iter()
-            .take(slots)
-            .position(|r| !r.status.state.active())
-            .ok_or(Errno::Again)?;
+        let slot = self.occupied_runners.trailing_ones() as usize;
+        if slot >= slots {
+            return Err(Errno::Again);
+        }
         let pid = self.next_pid;
         let next = pid
             .checked_add(1)
@@ -1603,6 +1620,7 @@ impl Supervisor {
             &mut self.ledger,
             attempt,
         )?;
+        self.occupied_runners |= 1 << slot;
         let owner = self.runners[slot].lease.ok_or(Errno::Io)?.0;
         self.runners[slot].heap.bind(slot, owner);
         #[cfg(target_arch = "aarch64")]
@@ -1638,12 +1656,16 @@ impl Supervisor {
         }
         Ok(slot)
     }
+    fn kill_runner(&mut self, slot: usize, fs: &mut FileSystem) {
+        self.runners[slot].finish(fs, &mut self.ledger, &mut self.ipc, UserState::Killed, 137);
+        self.occupied_runners &= !(1 << slot);
+    }
     fn pair(&mut self, fs: &mut FileSystem) -> Result<[u32; 2], Errno> {
         let a = self.launch("server", true)?;
         let b = match self.launch("client", true) {
             Ok(slot) => slot,
             Err(error) => {
-                self.runners[a].finish(fs, &mut self.ledger, &mut self.ipc, UserState::Killed, 137);
+                self.kill_runner(a, fs);
                 return Err(error);
             }
         };
@@ -1662,13 +1684,7 @@ impl Supervisor {
             }
             Err(error) => {
                 for slot in [a, b] {
-                    self.runners[slot].finish(
-                        fs,
-                        &mut self.ledger,
-                        &mut self.ipc,
-                        UserState::Killed,
-                        137,
-                    );
+                    self.kill_runner(slot, fs);
                 }
                 Err(error)
             }
@@ -1740,18 +1756,12 @@ impl Supervisor {
                 },
                 UserRequest::Kill(pid) => {
                     let pid = pid.unwrap_or(self.focus_pid);
-                    if let Some(runner) = self
+                    if let Some(slot) = self
                         .runners
-                        .iter_mut()
-                        .find(|r| r.status.pid == pid && r.status.state.active())
+                        .iter()
+                        .position(|r| r.status.pid == pid && r.status.state.active())
                     {
-                        runner.finish(
-                            shell.fs_mut(),
-                            &mut self.ledger,
-                            &mut self.ipc,
-                            UserState::Killed,
-                            137,
-                        );
+                        self.kill_runner(slot, shell.fs_mut());
                         writeln!(out, "\r\n{PROCESS_LABEL} pid={pid} killed; pages reclaimed\r").unwrap();
                     } else {
                         writeln!(out, "\r\n{PROCESS_LABEL} kill failed: Noent\r").unwrap();
@@ -1759,7 +1769,10 @@ impl Supervisor {
                 }
             }
         }
-        let time = now();
+        let time_ns = now_ns();
+        let time = time_ns / 1_000_000;
+        #[cfg(feature = "ported")]
+        objects::table().expire_timers(|| time_ns);
         #[cfg(feature = "graphics")]
         if let Some((pid, tid)) = self.display_owner
             && let Some(result) = super::graphics::poll_blit()
@@ -1818,6 +1831,7 @@ impl Supervisor {
             }
             runner.thread.ready_since = now();
             if !runner.status.state.active() {
+                self.occupied_runners &= !(1 << decision.index);
                 writeln!(
                     out,
                     "\r\n{PROCESS_LABEL} pid={} {:?} code={} free_pages={} {FAULT_LABEL}={:#x} far={:#x}\r",

@@ -55,7 +55,7 @@ impl Table {
         for (index, instance) in self.epolls.iter().enumerate().filter(|(_, e)| e.used) {
             // Disarmed watches remain graph edges: MOD must not resurrect a cycle.
             for slot in instance.live_slots() {
-                if let Some(watch) = instance.watches[slot]
+                if let Some(watch) = instance.watches[slot].filter(|watch| watch.backend.is_none())
                     && let Some(child) = self.nested_index(watch.description)
                 {
                     topology.children[index] |= 1 << child;
@@ -112,43 +112,43 @@ impl Table {
         index: usize,
         readiness: &mut [u32; OPEN_MAX],
     ) -> bool {
+        let was_readable = self.epolls[index].readable();
         let mut notified = false;
         for slot in self.epolls[index].live_slots() {
             let Some(watch) = self.epolls[index].watches[slot] else {
                 continue;
             };
             let ready = &mut readiness[slot];
-            if let Some(child) = self.nested_index(watch.description) {
+            if watch.backend.is_none()
+                && let Some(child) = self.nested_index(watch.description)
+            {
                 *ready = u32::from(self.epolls[child].readable()) * IN;
             }
-            notified |= self.epolls[index].watches[slot]
-                .as_mut()
-                .unwrap()
-                .observe(*ready, 0);
+            notified |= self.epolls[index].observe_watch(slot, *ready, 0);
         }
+        self.note_epoll_readability(index, was_readable);
         notified
     }
 
-    pub(crate) fn propagate_nested(&mut self, mut wakes: [bool; EPOLLS]) {
+    pub(crate) fn propagate_nested(&mut self, mut wakes: usize) {
+        let mut dirty = core::mem::take(&mut self.epoll_dirty) | wakes;
+        if dirty == 0 {
+            return;
+        }
         let topology = self.epoll_topology(None).expect("validated epoll graph");
-        for &index in &topology.order[..topology.count] {
-            if topology.children[index] == 0 {
+        // Child before parent, including when a child shared by multiple
+        // parents remains readable and only contributes a new edge.
+        for &child in &topology.order[..topology.count] {
+            let bit = 1 << child;
+            if dirty & bit == 0 {
                 continue;
             }
-            for slot in self.epolls[index].live_slots() {
-                let Some(watch) = self.epolls[index].watches[slot] else {
-                    continue;
-                };
-                let Some(child) = self.nested_index(watch.description) else {
-                    continue;
-                };
-                let ready = u32::from(self.epolls[child].readable()) * IN;
-                let notification = u32::from(wakes[child]) * IN;
-                wakes[index] |= self.epolls[index].watches[slot]
-                    .as_mut()
-                    .unwrap()
-                    .observe(ready, notification);
-            }
+            let handle = self.epolls[child].description.expect("live epoll description");
+            let ready = u32::from(self.epolls[child].readable()) * IN;
+            let notification = u32::from(wakes & bit != 0) * IN;
+            let parents = self.observe_description(handle, ready, notification);
+            wakes |= parents;
+            dirty |= parents | core::mem::take(&mut self.epoll_dirty);
         }
     }
 }

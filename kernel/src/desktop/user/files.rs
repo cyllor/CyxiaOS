@@ -21,7 +21,7 @@ impl Runner {
         if self.readonly_asset(link).is_some() {
             return Err(Errno::Exist);
         }
-        match super::unix::with(|s| s.pathname_stat(link.as_str().as_bytes())) {
+        match super::unix::inspect(|s| s.pathname_stat(link.as_str().as_bytes())) {
             Ok(_) => return Err(Errno::Exist),
             Err(Errno::Noent) => {}
             Err(error) => return Err(error),
@@ -52,7 +52,7 @@ impl Runner {
         if link.as_str() == "/dev/null" || self.readonly_asset(link).is_some() {
             return Err(Errno::Inval);
         }
-        match super::unix::with(|s| s.pathname_stat(link.as_str().as_bytes())) {
+        match super::unix::inspect(|s| s.pathname_stat(link.as_str().as_bytes())) {
             Ok(_) => return Err(Errno::Inval),
             Err(Errno::Noent) => {}
             Err(error) => return Err(error),
@@ -152,7 +152,7 @@ impl Runner {
         // Moving either socket entry requires one atomic update across both
         // namespaces. Until that exists, reject before touching either name.
         for path in [from, to] {
-            match super::unix::with(|s| s.pathname_stat(path.as_str().as_bytes())) {
+            match super::unix::inspect(|s| s.pathname_stat(path.as_str().as_bytes())) {
                 Ok(_) => return Err(Errno::Opnotsupp),
                 Err(Errno::Noent) => {}
                 Err(error) => return Err(error),

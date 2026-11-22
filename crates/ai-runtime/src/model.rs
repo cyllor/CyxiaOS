@@ -1,6 +1,7 @@
 use crate::weights;
 pub const MEMORY_ID: u64 = 0x2001;
 pub const CPU_ID: u64 = 0x3001;
+pub const CPU_AGE_LIMIT: u64 = 32;
 pub const DEVICE_ID: u64 = 0x4001;
 fn score(w: [i32; 4], x: [i32; 4]) -> i32 {
     w.into_iter().zip(x).map(|(a, b)| a * b).sum()
@@ -13,7 +14,7 @@ pub fn cpu(age: u64, priority: u8, remaining: u32) -> i32 {
         weights::CPU,
         [
             1,
-            age.min(32) as i32,
+            age.min(CPU_AGE_LIMIT) as i32,
             priority as i32,
             remaining.div_ceil(256).min(16) as i32,
         ],

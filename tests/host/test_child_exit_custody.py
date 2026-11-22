@@ -34,6 +34,8 @@ def production_program():
         function(spawn, "impl Children"),
     ]
     template = template.replace("// RECEIPT_TYPES", "\n".join(types))
+    template = template.replace("// THREAD_SLOTS", function(threads, "fn thread_slots("))
+    template = template.replace("// PARKED_SLOTS", function(threads, "fn parked_slots("))
     runner = [function(user, "fn finish("), function(user, "fn block("),
               function(spawn, "pub(super) fn request_wait("),
               function(spawn, "pub(super) fn supervisor_result("),
@@ -42,6 +44,7 @@ def production_program():
     template = template.replace("// RUNNER_METHODS", "\n".join(runner))
     supervisor = [
         function(user, "fn launch(&mut self,"), launch,
+        function(user, "fn kill_runner("),
         function(user, "fn pair(&mut self,"),
         function(spawn, "fn spawn_image("), admit,
         function(spawn, "pub(super) fn service_spawn("),

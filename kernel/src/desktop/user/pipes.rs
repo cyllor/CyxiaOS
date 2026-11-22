@@ -21,6 +21,18 @@ pub(super) fn status(out: &mut impl Write) {
 }
 
 pub(super) fn with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<T, Errno> {
+    let result = observe_with(f);
+    // A failing mutation can commit a prefix. Mark even if no FD has an
+    // epoll watch, and leave pure queries on the inspection path.
+    super::objects::table().publish_poll_change();
+    result
+}
+
+pub(super) fn inspect<T>(f: impl FnOnce(&Pipes) -> Result<T, Errno>) -> Result<T, Errno> {
+    observe_with(|pool| f(pool))
+}
+
+fn observe_with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: CPU0 foreground serializes all operations. IRQ/DMA cannot access
     // the pool and the callback cannot return a reference to its entries.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
@@ -50,7 +62,7 @@ pub(super) fn poll(owner: u32, handle: u64) -> Result<u16, Errno> {
 pub(super) fn pair(owner: u32) -> Result<[u64; 2], Errno> {
     let mut attempt = cyxia_ai_runtime::accounting::Attempt::default();
     let result = (|| {
-        let free = with(|p| Ok(p.free()))?;
+        let free = inspect(|p| Ok(p.free()))?;
         // Fixed backing is BOOTSTRAP; this model grants only logical occupancy.
         attempt.proposed(8193);
         let (allowed, model) =

@@ -18,7 +18,10 @@ from test_governance_billing_priority import function
 class ReadyIdle(unittest.TestCase):
     def test_actual_readiness_checks_selected_and_parked_threads(self):
         threads = (ROOT / 'kernel/src/desktop/user/threads.rs').read_text()
-        methods = ('impl Thread {\n' + function(threads, '    fn runnable(') + '\n}\n'
+        methods = (function(threads, 'fn thread_slots(')
+                   + '\nimpl Group {\n' + function(threads, '    fn parked_slots(')
+                   + '\n' + function(threads, '    fn sync_parked_slot(') + '\n}\n'
+                   + 'impl Thread {\n' + function(threads, '    fn runnable(') + '\n}\n'
                    + 'impl Runner {\n' + function(threads, '    pub(super) fn has_runnable_thread(')
                    .replace('pub(super)', 'pub') + '\n}\n')
         capacities = [line for line in threads.splitlines()
@@ -27,13 +30,16 @@ class ReadyIdle(unittest.TestCase):
         source = '#![allow(dead_code)]\n' + capacities[0].replace('pub(super)', 'pub') + '''
 #[derive(Clone, Copy)]
 struct Thread { active: bool, waiting: Option<()> }
-struct Group { parked: [Thread; MAX_THREADS - 1] }
+struct Shared { parked_active: u16 }
+struct Group { parked: [Thread; MAX_THREADS - 1], shared: Shared }
 struct Runner { thread: Thread, threads: Group }
 ''' + methods + '''
 #[test]
 fn readiness_tracks_every_live_thread_without_running_waiters() {
     let inactive = Thread { active: false, waiting: None };
-    let mut runner = Runner { thread: inactive, threads: Group { parked: [inactive; MAX_THREADS - 1] } };
+    let mut runner = Runner { thread: inactive, threads: Group {
+        parked: [inactive; MAX_THREADS - 1], shared: Shared { parked_active: 0 }
+    } };
     assert!(!runner.has_runnable_thread());
     runner.thread.active = true;
     assert!(runner.has_runnable_thread());
@@ -41,10 +47,12 @@ fn readiness_tracks_every_live_thread_without_running_waiters() {
     assert!(!runner.has_runnable_thread());
     for index in 0..MAX_THREADS - 1 {
         runner.threads.parked[index] = Thread { active: true, waiting: None };
+        runner.threads.sync_parked_slot(index);
         assert_eq!(runner.has_runnable_thread(), cfg!(feature = "ported"));
         runner.threads.parked[index].waiting = Some(());
         assert!(!runner.has_runnable_thread());
         runner.threads.parked[index] = inactive;
+        runner.threads.sync_parked_slot(index);
     }
 }
 '''

@@ -61,6 +61,12 @@ pub(crate) struct Table {
     pub(crate) entries: [Entry; CAPACITY],
     pub(crate) rights: [super::ancillary::Slot; super::ancillary::MESSAGES],
     pub epolls: [epoll::Instance; EPOLLS],
+    // Each live OFD slot heads its weak watches, including registered FD aliases.
+    pub(crate) watch_heads: [Option<core::num::NonZeroU16>; CAPACITY],
+    pub(crate) epoll_dirty: usize,
+    pub(crate) epoll_invalidation_epoch: u64,
+    pub(crate) poll_readiness_epoch: u64,
+    pub(crate) timer_deadlines: super::timerfd::Deadlines,
     pub(crate) epoll_topology: core::cell::Cell<Option<epoll::Topology>>,
     // Per-table test observations avoid cross-test/global timing noise.
     #[cfg(test)]
@@ -68,7 +74,11 @@ pub(crate) struct Table {
     #[cfg(test)]
     pub(crate) nested_lookups: core::cell::Cell<usize>,
     #[cfg(test)]
+    pub(crate) nested_watches_visited: core::cell::Cell<usize>,
+    #[cfg(test)]
     pub(crate) backend_slots_visited: core::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) local_slots_visited: core::cell::Cell<usize>,
     pub(crate) inotifies: [super::inotify::Instance; super::inotify::GLOBAL_INSTANCES],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,13 +115,22 @@ impl OpenDescriptions {
                 entries: [Entry::EMPTY; CAPACITY],
                 rights: [super::ancillary::Slot::EMPTY; super::ancillary::MESSAGES],
                 epolls: [epoll::Instance::EMPTY; EPOLLS],
+                watch_heads: [None; CAPACITY],
+                epoll_dirty: 0,
+                epoll_invalidation_epoch: 0,
+                poll_readiness_epoch: 0,
+                timer_deadlines: super::timerfd::Deadlines::new(),
                 epoll_topology: core::cell::Cell::new(None),
                 #[cfg(test)]
                 topology_builds: core::cell::Cell::new(0),
                 #[cfg(test)]
                 nested_lookups: core::cell::Cell::new(0),
                 #[cfg(test)]
+                nested_watches_visited: core::cell::Cell::new(0),
+                #[cfg(test)]
                 backend_slots_visited: core::cell::Cell::new(0),
+                #[cfg(test)]
+                local_slots_visited: core::cell::Cell::new(0),
                 inotifies: [super::inotify::Instance::EMPTY; super::inotify::GLOBAL_INSTANCES],
             }),
         }
@@ -129,6 +148,11 @@ impl OpenDescriptions {
     }
     pub fn limits(&self) -> limits::ObjectProfile {
         self.limits.get()
+    }
+    /// Publish a possible change in an external backend, including descriptors
+    /// with no epoll watch. Pure backend queries never call this method.
+    pub fn publish_poll_change(&self) {
+        self.inner.borrow_mut().publish_poll_change();
     }
     pub fn snapshot(&self) -> Snapshot {
         let table = self.inner.borrow();
@@ -301,20 +325,19 @@ impl OpenDescriptions {
         }
         let description = entry.value.ok_or(Errno::Badf)?;
         if let Object::Epoll(index) = description.object {
-            table.epolls[index] = epoll::Instance::EMPTY;
-            // The instance and all weak watches of it are retired below.
-            table.epoll_topology.set(None);
+            table.clear_epoll(index);
         }
         if let Object::Inotify(index) = description.object {
             table.inotifies[index] = super::inotify::Instance::EMPTY;
         }
-        for instance in &mut table.epolls {
-            instance.remove_description(handle);
+        if matches!(description.object, Object::Timer(_)) {
+            table.timer_deadlines.remove(handle.slot);
         }
+        table.remove_epoll_description(handle);
         table.entries[handle.slot].value = None;
         table.entries[handle.slot].references = 0;
         table.entries[handle.slot].flock = super::flock::Mode::Unlocked;
-        table.propagate_nested([false; EPOLLS]);
+        table.propagate_nested(0);
         let owner = entry.owner;
         Ok(match description.object {
             Object::Socket(handle) => Some(Released::Socket { owner, handle }),
@@ -326,6 +349,10 @@ impl OpenDescriptions {
     }
 }
 impl Table {
+    pub(crate) fn publish_poll_change(&mut self) {
+        self.poll_readiness_epoch = self.poll_readiness_epoch.saturating_add(1);
+    }
+
     pub(crate) fn entry(&self, handle: Handle) -> Result<&Entry, Errno> {
         self.entries
             .get(handle.slot)

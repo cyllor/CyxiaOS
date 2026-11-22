@@ -214,6 +214,7 @@ impl Supervisor {
             self.display_owner = Some((runner.status.pid, runner.thread.tid));
         }
         if !runner.status.state.active() {
+            self.occupied_runners &= !(1 << index);
             writeln!(out, "\r\n{PROCESS_LABEL} pid={} {:?} code={} free_pages={} {FAULT_LABEL}={:#x} far={:#x}\r",
                 runner.status.pid, runner.status.state, runner.status.code,
                 self.ledger.snapshot().free, runner.status.esr, runner.status.far).unwrap();

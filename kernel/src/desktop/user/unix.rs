@@ -26,6 +26,18 @@ pub(super) fn status(out: &mut impl core::fmt::Write) {
 }
 
 pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> Result<T, Errno> {
+    let result = observe_with(f);
+    // A failing mutation can commit a prefix. Mark even if no FD has an
+    // epoll watch, and leave pure queries on the inspection path.
+    super::objects::table().publish_poll_change();
+    result
+}
+
+pub(super) fn inspect<T>(f: impl FnOnce(&UnixSockets) -> Result<T, Errno>) -> Result<T, Errno> {
+    observe_with(|pool| f(pool))
+}
+
+fn observe_with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> Result<T, Errno> {
     // SAFETY: CPU0 foreground is the sole caller; IRQs and DMA never reference
     // these pools. No borrowed reference escapes this serialized operation.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(SOCKETS) };
@@ -69,7 +81,7 @@ pub(super) fn admit<T>(
 ) -> Result<T, Errno> {
     let mut attempt = cyxia_ai_runtime::accounting::Attempt::default();
     let result = (|| {
-        let capacity = with(|s| Ok(s.capacity()))?;
+        let capacity = inspect(|s| Ok(s.capacity()))?;
         // The foreground cannot interleave a mutation between observation and
         // operation. A multi-pool rejection reserves nothing and needs no refund.
         for (free, needed) in [

@@ -1,7 +1,7 @@
 //! Foreground Linux signal policy with architecture-owned frame serialization.
 //! The parent wakes interrupted waits and owns process termination. All frame
 //! I/O goes through Runner usercopy; no pointer supplied by user code is dereferenced.
-use super::{Errno, Runner, Supervisor, Wait};
+use super::{Errno, Runner, Supervisor, Thread, Wait};
 use crate::process_arch::{self, SIGNAL_FRAME_BYTES as FRAME_BYTES};
 use cyxia_posix::signal::{
     self, Action, Actions, AltStack, Delivery, Info, SA_ONSTACK, SA_RESTART,
@@ -14,20 +14,20 @@ pub(super) struct Request {
     signal: u32,
 }
 
-impl Runner {
+impl Thread {
     fn signal_retry_restartable(&self) -> bool {
         signal::restartable_syscall(
             process_arch::IMAGE_ABI,
-            self.thread.context.syscall_number(),
-            self.thread.context.arguments(),
+            self.context.syscall_number(),
+            self.context.arguments(),
         )
     }
 
     pub(super) fn signal_wait_restartable(&self) -> bool {
         self.signal_retry_restartable()
-            && match self.thread.waiting {
+            && match self.waiting {
                 Some(Wait::Unix { .. } | Wait::TimerRead { .. } | Wait::Retry(_)) => {
-                    self.thread.retry_syscall
+                    self.retry_syscall
                 }
                 Some(Wait::Child {
                     nonblock: false, ..
@@ -38,7 +38,9 @@ impl Runner {
                 _ => false,
             }
     }
+}
 
+impl Runner {
     /// Cross-process lookup belongs to the supervisor after all AP contexts
     /// have returned. This request owns no target references or user pointers.
     pub(super) fn request_process_signal(
@@ -167,6 +169,7 @@ impl Runner {
         info: Info,
         forced: bool,
     ) -> Result<(), Errno> {
+        self.threads.shared.idle_wait = None;
         self.thread
             .signals
             .raise(&self.threads.shared.actions, signal, info, forced)
@@ -216,7 +219,7 @@ impl Runner {
                         self.thread.alt_stack,
                         action.restorer,
                         self.thread.retry_syscall
-                            && self.signal_retry_restartable()
+                            && self.thread.signal_retry_restartable()
                             && action.flags & SA_RESTART != 0,
                     )?;
                     self.copy_to(address, &bytes)?;

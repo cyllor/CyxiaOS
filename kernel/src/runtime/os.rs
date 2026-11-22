@@ -122,10 +122,10 @@ pub fn run(info: &PcBootInfo) -> ! {
     let scanout = crate::graphics::scanout_bytes();
     #[cfg(not(feature = "graphics"))]
     let scanout = 0;
-    let _ = writeln!(out, "SYSTEM_CAPACITY schema=1 cpus={} dispatch_aps={} ram_bytes={} free_bytes={} budget_percent={} process_slots={} threads={} threads_per_process={} block_sectors={} scanout_bytes={} ip_sockets=0",
+    let _ = writeln!(out, "SYSTEM_CAPACITY schema=1 cpus={} dispatch_aps={} ram_bytes={} free_bytes={} budget_percent={} process_slots={} threads={} threads_per_process={} block_sectors={} scanout_bytes={} ip_sockets=0 process_grant_pages={}",
         cpus, cpus - 1, ram_bytes, plan.free_bytes, plan.percent, crate::address_space::process_slots(),
         crate::user::capacity::thread_limit(), crate::user::capacity::per_process_thread_limit(),
-        crate::storage::capacity_sectors(), scanout);
+        crate::storage::capacity_sectors(), scanout, cyxia_posix::usermem::POOL_PAGES);
     #[cfg(feature = "full-os")]
     {
         cyxia_posix::runtime_directory::reset_at_boot(shell.fs_mut())

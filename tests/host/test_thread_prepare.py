@@ -21,11 +21,32 @@ def production_fixture(source=None):
     # Only the memory swap primitive is observed; each call forwards to the
     # real core::mem::swap. The production control flow and policies are intact.
     prepare = prepare.replace('core::mem::swap', 'observed_swap')
+    runnable = function(source, '    fn runnable(').replace(
+        '        self.active &&', '        RUNNABLE_CHECKS.fetch_add(1, Ordering::SeqCst);\n        self.active &&')
     methods = '\n'.join(function(source, signature) for signature in
-        ('    pub(super) fn refresh_thread_state(', '    pub(super) fn has_runnable_thread('))
+        ('    pub(super) fn thread_at(', '    pub(super) fn thread_at_mut(',
+         '    fn active_thread_slots(', '    pub(super) fn refresh_thread_state(',
+         '    pub(super) fn has_runnable_thread(', '    pub(super) fn complete_display('))
+    group = '\n'.join(function(source, signature) for signature in
+        ('    fn parked_slots(', '    fn first_free_parked(', '    fn sync_parked_slot('))
+    wake = (ROOT / 'kernel/src/desktop/user.rs').read_text()
+    signals = (ROOT / 'kernel/src/desktop/user/signals.rs').read_text()
+    event = (ROOT / 'kernel/src/desktop/user/event.rs').read_text()
+    wake_fixture = (ROOT / 'tests/host/thread_wake_harness.rs').read_text()
+    wake_fixture = (wake_fixture.replace('// PRODUCTION_WAIT', function(wake, 'enum Wait {'))
+        .replace('// PRODUCTION_RESTART', function(signals, '    fn signal_retry_restartable(')
+                 + '\n' + function(signals, '    pub(super) fn signal_wait_restartable('))
+        .replace('// PRODUCTION_WAKE', function(wake, '    fn wake(')
+                 + '\n' + function(wake, '    fn finish_wake(') + '\n' + function(wake, '    fn block('))
+        .replace('// PRODUCTION_SLEEP_INTERRUPTED', function(event, '    pub(super) fn sleep_interrupted(')))
     return ((ROOT / 'tests/host/thread_prepare_harness.rs').read_text()
+        .replace('// WAKE_FIXTURE', wake_fixture)
         .replace('// PRODUCTION_CAPACITY', capacity[0].replace('pub(super)', 'pub'))
-        .replace('// PRODUCTION_RUNNABLE', function(source, '    fn runnable('))
+        .replace('// PRODUCTION_THREAD_SLOTS', function(source, 'fn thread_slots('))
+        .replace('// PRODUCTION_RUNNABLE', runnable)
+        .replace('// PRODUCTION_IDLE_TYPE', '#[derive(Clone, Copy)]\n' + function(source, 'pub(super) struct IdleWait'))
+        .replace('// PRODUCTION_IDLE_IMPL', function(source, 'impl IdleWait {'))
+        .replace('// PRODUCTION_GROUP', group)
         .replace('// PRODUCTION_PREPARE', prepare + '\n' + methods))
 
 
@@ -40,13 +61,13 @@ class ThreadPreparation(unittest.TestCase):
                     binary = directory / ('full-os' if full_os else 'legacy')
                     flags = ['--cfg', 'feature="full-os"'] if full_os else []
                     built = subprocess.run([str(RUST_BIN / 'rustc'), '--edition=2024', '--test',
-                        '--cfg', 'feature="ported"', *flags, '-Dwarnings', str(source), '-o', str(binary)],
+                        '--cfg', 'feature="ported"', '--cfg', 'feature="graphics"', *flags, '-Dwarnings', str(source), '-o', str(binary)],
                         env=env(), capture_output=True, text=True, timeout=30)
                     self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
                     ran = subprocess.run([str(binary), '--test-threads=1'], capture_output=True,
                                          text=True, timeout=10)
                     self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-                    self.assertIn('4 passed; 0 failed', ran.stdout)
+                    self.assertIn('12 passed; 0 failed', ran.stdout)
 
 
 if __name__ == '__main__':

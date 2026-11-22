@@ -9,6 +9,17 @@ use super::{Context, LocalIpc, Runner, UserState, Wait};
 
 #[cfg(feature = "ported")]
 pub(super) const MAX_THREADS: usize = if cfg!(feature = "full-os") { 16 } else { 8 };
+#[cfg(feature = "ported")]
+fn thread_slots(mut occupied: u16) -> impl Iterator<Item = usize> {
+    core::iter::from_fn(move || {
+        if occupied == 0 {
+            return None;
+        }
+        let slot = occupied.trailing_zeros() as usize;
+        occupied &= occupied - 1;
+        Some(slot)
+    })
+}
 #[repr(C, align(4096))]
 pub(super) struct Thread {
     pub context: Context,
@@ -26,6 +37,8 @@ pub(super) struct Thread {
     pub retry_syscall: bool,
     #[cfg(feature = "ported")]
     pub retry_descriptor: Option<(i32, u64)>, // FD + global OFD generation, weak binding
+    #[cfg(feature = "ported")]
+    pub poll_snapshot: super::linux::PollSnapshot,
     pub tid: u32,
     pub active: bool,
     pub waiting: Option<Wait>,
@@ -48,6 +61,8 @@ impl Thread {
             retry_syscall: false,
             #[cfg(feature = "ported")]
             retry_descriptor: None,
+            #[cfg(feature = "ported")]
+            poll_snapshot: super::linux::PollSnapshot::new(),
             tid: 0,
             active: false,
             waiting: None,
@@ -66,6 +81,7 @@ impl Thread {
             self.clear_tid = 0;
             self.retry_syscall = false;
             self.retry_descriptor = None;
+            self.poll_snapshot.invalidate();
         }
         self.tid = 0;
         self.active = false;
@@ -79,12 +95,64 @@ impl Thread {
 }
 const _: () = assert!(core::mem::size_of::<Thread>() == 4096);
 
+/// Registration for an entirely blocked process, built after an authoritative
+/// scan. A direct completion publishes Running through refresh_thread_state.
+#[cfg(feature = "ported")]
+#[derive(Clone, Copy)]
+pub(super) struct IdleWait {
+    until: u64,
+    ipc_epoch: Option<u64>,
+    checkpoint: Option<u64>,
+    pub(super) has_child: bool,
+}
+#[cfg(feature = "ported")]
+impl IdleWait {
+    fn register(runner: &Runner, ipc: &LocalIpc) -> Option<Self> {
+        let mut idle = Self {
+            until: u64::MAX,
+            ipc_epoch: None,
+            checkpoint: None,
+            has_child: false,
+        };
+        for slot in runner.active_thread_slots() {
+            match runner.thread_at(slot).waiting? {
+                Wait::Sleep(until)
+                | Wait::Retry(until)
+                | Wait::Nanosleep { until, .. }
+                | Wait::Futex { until, .. } => idle.until = idle.until.min(until),
+                Wait::Ipc(..) => idle.ipc_epoch = Some(ipc.readiness_epoch()),
+                // Only the single in-flight storage generation can return Again.
+                Wait::Checkpoint(generation) => idle.checkpoint = Some(generation),
+                Wait::Child { .. } => idle.has_child = true,
+                Wait::Spawn | Wait::Signal => {}
+                #[cfg(feature = "graphics")]
+                Wait::Display => {}
+                // Descriptor bindings, user poll arrays and timers have their
+                // own readiness rules. Leave these runners on the sampling path.
+                Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Unix { .. }
+                | Wait::TimerRead { .. } => return None,
+            }
+        }
+        Some(idle)
+    }
+
+    fn unchanged(self, time: u64, ipc: &LocalIpc) -> bool {
+        time < self.until
+            && self.ipc_epoch.is_none_or(|epoch| epoch != u64::MAX && epoch == ipc.readiness_epoch())
+            && self.checkpoint.is_none_or(|generation| {
+                super::super::storage::checkpoint_complete(generation) == Err(Errno::Again)
+            })
+    }
+}
+
 #[cfg(feature = "ported")]
 #[repr(C, align(4096))]
 pub(super) struct Shared {
     pub actions: cyxia_posix::signal::Actions,
     pub pending: cyxia_posix::signal::Signals,
     pub dispatch: Option<(u64, cyxia_contracts::DecisionSource)>,
+    parked_active: u16,
+    pub(super) idle_wait: Option<IdleWait>,
 }
 #[cfg(feature = "ported")]
 #[repr(C, align(4096))]
@@ -107,6 +175,8 @@ impl Group {
         self.shared.actions = cyxia_posix::signal::Actions::new();
         self.shared.pending = cyxia_posix::signal::Signals::new();
         self.shared.dispatch = None;
+        self.shared.parked_active = 0;
+        self.shared.idle_wait = None;
     }
     pub const fn new() -> Self {
         Self {
@@ -115,9 +185,23 @@ impl Group {
                 actions: cyxia_posix::signal::Actions::new(),
                 pending: cyxia_posix::signal::Signals::new(),
                 dispatch: None,
+                parked_active: 0,
+                idle_wait: None,
             },
             spare: [0; 4096],
         }
+    }
+    fn parked_slots(&self) -> impl Iterator<Item = usize> + use<> {
+        thread_slots(self.shared.parked_active)
+    }
+    fn first_free_parked(&self) -> Option<usize> {
+        let slot = self.shared.parked_active.trailing_ones() as usize;
+        (slot < MAX_THREADS - 1).then_some(slot)
+    }
+    fn sync_parked_slot(&mut self, slot: usize) {
+        let bit = 1u16 << slot;
+        self.shared.parked_active =
+            (self.shared.parked_active & !bit) | (u16::from(self.parked[slot].active) << slot);
     }
 }
 #[cfg(feature = "ported")]
@@ -131,50 +215,72 @@ const _: () = {
             == (MAX_THREADS + 2) * 4096
     );
     assert!(RESERVED_CONTEXT_PAGES <= 64); // Model 8193's existing input domain.
+    assert!(MAX_THREADS <= u16::BITS as usize);
 };
 
 impl Runner {
+    // Slot zero owns the selected context. Non-ported profiles have only it.
+    pub(super) fn thread_at(&self, slot: usize) -> &Thread {
+        #[cfg(feature = "ported")]
+        if slot != 0 {
+            return &self.threads.parked[slot - 1];
+        }
+        debug_assert_eq!(slot, 0);
+        &self.thread
+    }
+
+    pub(super) fn thread_at_mut(&mut self, slot: usize) -> &mut Thread {
+        #[cfg(feature = "ported")]
+        if slot != 0 {
+            return &mut self.threads.parked[slot - 1];
+        }
+        debug_assert_eq!(slot, 0);
+        &mut self.thread
+    }
+
+    #[cfg(feature = "ported")]
+    fn active_thread_slots(&self) -> impl Iterator<Item = usize> + use<> {
+        thread_slots((self.threads.shared.parked_active << 1) | u16::from(self.thread.active))
+    }
+
     pub(super) fn prepare_threads(&mut self, time: u64, ipc: &mut LocalIpc) {
         if !self.status.state.active() {
             return;
         }
         #[cfg(feature = "ported")]
         {
+            if self.status.state == UserState::Waiting
+                && self.threads.shared.idle_wait.is_some_and(|idle| idle.unchanged(time, ipc))
+                && self.threads.shared.pending.pending() == 0
+            {
+                return;
+            }
+            self.threads.shared.idle_wait = None;
             if self.thread.active {
                 self.threads
                     .shared
                     .pending
                     .transfer_ready(&mut self.thread.signals, &self.threads.shared.actions);
             }
-            self.wake(time, ipc);
-            for index in 0..MAX_THREADS - 1 {
+            self.wake(0, time, ipc);
+            for index in self.threads.parked_slots() {
                 let thread = &mut self.threads.parked[index];
-                if !thread.active {
-                    continue;
-                }
                 self.threads
                     .shared
                     .pending
                     .transfer_ready(&mut thread.signals, &self.threads.shared.actions);
-                // Transfer signals in the original order, in place. Only a
-                // blocked thread needs the selected-context wake machinery;
-                // empty and already runnable 4KiB contexts need no round trip.
-                if thread.waiting.is_none() {
-                    continue;
+                if thread.waiting.is_some() {
+                    self.wake(index + 1, time, ipc);
                 }
-                core::mem::swap(&mut self.thread, &mut self.threads.parked[index]);
-                self.wake(time, ipc);
-                core::mem::swap(&mut self.thread, &mut self.threads.parked[index]);
             }
-            let candidates = core::array::from_fn::<_, MAX_THREADS, _>(|index| {
+            let mut candidates = [None; MAX_THREADS];
+            for index in self.active_thread_slots() {
                 let thread = self.thread_at(index);
-                thread
-                    .runnable()
-                    .then_some(cyxia_ai_runtime::UserCandidate {
-                        waiting_ms: time.saturating_sub(thread.ready_since),
-                        cpu_bound: thread.cpu_bound,
-                    })
-            });
+                candidates[index] = thread.runnable().then_some(cyxia_ai_runtime::UserCandidate {
+                    waiting_ms: time.saturating_sub(thread.ready_since),
+                    cpu_bound: thread.cpu_bound,
+                });
+            }
             // Same bounded local model as process selection. Ages advance until
             // the chosen thread actually executes; parked threads never consume
             // a CPU slice merely because their process was considered.
@@ -191,12 +297,16 @@ impl Runner {
                 super::ai::record(super::ai::Domain::CpuThread, |c| c.proposal(choice.model));
                 self.threads.shared.dispatch = Some((choice.model, choice.source));
                 if choice.index > 0 {
-                    core::mem::swap(&mut self.thread, &mut self.threads.parked[choice.index - 1]);
+                    let slot = choice.index - 1;
+                    core::mem::swap(&mut self.thread, &mut self.threads.parked[slot]);
+                    self.threads.sync_parked_slot(slot);
                 }
+            } else {
+                self.threads.shared.idle_wait = IdleWait::register(self, ipc);
             }
         }
         #[cfg(not(feature = "ported"))]
-        self.wake(time, ipc);
+        self.wake(0, time, ipc);
         self.refresh_thread_state();
     }
     pub(super) fn refresh_thread_state(&mut self) {
@@ -212,7 +322,8 @@ impl Runner {
     pub(super) fn has_runnable_thread(&self) -> bool {
         let runnable = self.thread.runnable();
         #[cfg(feature = "ported")]
-        let runnable = runnable || self.threads.parked.iter().any(Thread::runnable);
+        let runnable = runnable
+            || self.threads.parked_slots().any(|slot| self.threads.parked[slot].runnable());
         runnable
     }
     #[cfg(feature = "graphics")]
@@ -258,23 +369,9 @@ mod linux_threads {
     const REQUIRED_CLONE_FLAGS: u64 = 0x003d_0f00;
     const CLONE_DETACHED: u64 = 0x0040_0000;
     impl Runner {
-        pub(super) fn thread_at(&self, index: usize) -> &Thread {
-            if index == 0 {
-                &self.thread
-            } else {
-                &self.threads.parked[index - 1]
-            }
-        }
-        fn thread_at_mut(&mut self, index: usize) -> &mut Thread {
-            if index == 0 {
-                &mut self.thread
-            } else {
-                &mut self.threads.parked[index - 1]
-            }
-        }
         fn live_threads(&self) -> usize {
             usize::from(self.thread.active)
-                + self.threads.parked.iter().filter(|t| t.active).count()
+                + self.threads.shared.parked_active.count_ones() as usize
         }
         pub(in super::super) fn clone_thread(
             &mut self,
@@ -321,7 +418,7 @@ mod linux_threads {
             }
             // TLS is an opaque user value. The CPU backend validates its range;
             // later user accesses are checked by the private address space.
-            let Some(slot) = self.threads.parked.iter().position(|thread| !thread.active) else {
+            let Some(slot) = self.threads.first_free_parked() else {
                 self.status.thread_denials = self.status.thread_denials.saturating_add(1);
                 return Err(Errno::Again);
             };
@@ -353,6 +450,7 @@ mod linux_threads {
             // execute either context midway through these two writes.
             self.copy_to(parent_tid, &tid.to_le_bytes())?;
             self.threads.parked[slot] = child;
+            self.threads.sync_parked_slot(slot);
             #[cfg(target_arch = "x86_64")]
             super::super::capacity::thread_started();
             ai::record(Domain::Thread, |c| c.grant(1));
@@ -411,6 +509,7 @@ mod linux_threads {
                 thread.retry_syscall = false;
                 thread.retry_descriptor = None;
             }
+            self.threads.shared.parked_active = 0;
         }
         fn read_futex(&self, address: u64) -> Result<u32, Errno> {
             if !address.is_multiple_of(4) {
@@ -426,11 +525,12 @@ mod linux_threads {
         fn wake_futex_mask(&mut self, address: u64, count: usize, mask: u32) -> usize {
             let mut woke = 0;
             let time = now();
-            for index in 0..MAX_THREADS {
+            for index in self.active_thread_slots() {
+                if woke == count {
+                    break;
+                }
                 let thread = self.thread_at_mut(index);
-                if woke < count
-                    && thread.active
-                    && thread.futex_mask & mask != 0
+                if thread.futex_mask & mask != 0
                     && matches!(thread.waiting, Some(Wait::Futex { address: a, .. }) if a == address)
                 {
                     thread.waiting = None;
@@ -524,11 +624,12 @@ mod linux_threads {
                 }
                 let woke = self.wake_futex(address, count as usize);
                 let mut moved = 0;
-                for index in 0..MAX_THREADS {
+                for index in self.active_thread_slots() {
+                    if moved == requeue as usize {
+                        break;
+                    }
                     let thread = self.thread_at_mut(index);
-                    if moved < requeue as usize
-                        && thread.active
-                        && let Some(Wait::Futex {
+                    if let Some(Wait::Futex {
                             address: source, ..
                         }) = &mut thread.waiting
                         && *source == address
@@ -595,6 +696,7 @@ mod linux_threads {
                     })
                     .ok_or(Errno::Srch)?;
                 if signal != 0 {
+                    self.threads.shared.idle_wait = None;
                     if index == 0 {
                         self.thread.signals.raise(
                             &self.threads.shared.actions,

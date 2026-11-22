@@ -887,6 +887,70 @@ fn session_process_dispatch_reaches_full_slot_count_without_changing_demo_limit(
 }
 
 #[test]
+fn session_process_dispatch_selects_aged_preempted_work_in_a_contended_batch() {
+    let preempted = UserCandidate {
+        waiting_ms: 16,
+        cpu_bound: true,
+    };
+    let io = |waiting_ms| {
+        Some(UserCandidate {
+            waiting_ms,
+            cpu_bound: false,
+        })
+    };
+    let candidates = [Some(preempted), io(14), io(13), io(12)];
+    let batch = |select: fn(&[Option<UserCandidate>]) -> Result<Option<UserDispatch>, Error>| {
+        let mut ready = candidates;
+        core::array::from_fn::<_, 3, _>(|_| {
+            let decision = select(&ready).unwrap().unwrap();
+            assert_eq!(decision.source, DecisionSource::AiDirect);
+            assert_eq!(decision.model, 12289);
+            ready[decision.index] = None;
+            decision.index
+        })
+    };
+
+    assert_eq!(batch(user_dispatch_policy), [1, 2, 3]);
+    assert_eq!(batch(full_os_thread_dispatch_policy), [1, 2, 3]);
+    assert_eq!(batch(session_process_dispatch_policy), [1, 0, 2]);
+
+    // Age resets after a real slice. For equal ages, fresh I/O wins, and the
+    // preemption estimate reaches the same floor as I/O at 32 ms.
+    for (waiting_ms, index) in [(0, 1), (31, 1), (32, 0), (99, 0)] {
+        let cpu = UserCandidate { waiting_ms, ..preempted };
+        let decision = session_process_dispatch_policy(&[Some(cpu), io(waiting_ms)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.index, index, "age={waiting_ms}");
+        assert_eq!(decision.source, DecisionSource::AiDirect);
+    }
+}
+
+#[test]
+fn session_process_dispatch_preserves_oldest_guard_and_guard_tie_break() {
+    let cpu = |waiting_ms| {
+        Some(UserCandidate {
+            waiting_ms,
+            cpu_bound: true,
+        })
+    };
+    let io = Some(UserCandidate { waiting_ms: 100, cpu_bound: false });
+    let oldest = session_process_dispatch_policy(&[cpu(100), io, cpu(101)])
+        .unwrap()
+        .unwrap();
+    let tie = session_process_dispatch_policy(&[cpu(100), io, cpu(99)])
+        .unwrap()
+        .unwrap();
+    for (decision, index) in [(oldest, 2), (tie, 1)] {
+        assert_eq!(decision, UserDispatch {
+            index,
+            source: DecisionSource::SafetyGuard,
+            model: 12289,
+        });
+    }
+}
+
+#[test]
 fn full_os_thread_context_pages_keep_the_existing_two_page_reserve() {
     // Eighteen actual context/shared/spare pages, with the leader already live.
     // Fifteen more one-page admissions stop at the existing two-page floor.
