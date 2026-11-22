@@ -10,7 +10,6 @@ pub struct BatchedNet {
     tx: BatchQueue,
     mac: [u8; 6],
     received: Option<(Token, usize)>,
-    packet: [u8; BUFFER],
     failed: bool,
     last_completed: u64,
     hooks: Option<(NotifyRequest, NotifyFeedback)>,
@@ -37,7 +36,6 @@ impl BatchedNet {
             tx,
             mac,
             received: None,
-            packet: [0; BUFFER],
             failed: false,
             last_completed: 0,
             hooks: None,
@@ -194,26 +192,27 @@ impl BatchedNet {
         if self.received.is_some() {
             return Ok(true);
         }
-        let c =
-            match self
-                .rx
-                .poll_with_checkpoint(&mut self.transport, &mut self.packet, p, checkpoint)
-            {
-                Ok(Some(c)) => c,
-                Ok(None) => {
-                    self.report(p, true);
-                    return Ok(false);
-                }
-                Err(e) => {
-                    self.fail(p);
-                    return Err(e);
-                }
-            };
+        let c = match self
+            .rx
+            .poll_in_place_with_checkpoint(&mut self.transport, p, checkpoint)
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                self.report(p, true);
+                return Ok(false);
+            }
+            Err(e) => {
+                self.fail(p);
+                return Err(e);
+            }
+        };
         p.diagnostic_stage(Stage::NetRxHeader as u64);
-        let flags = self.packet[0];
-        let gso = self.packet[1];
-        let buffers = u16::from_le_bytes([self.packet[10], self.packet[11]]);
-        if !(HEADER + 14..=BUFFER).contains(&c.len) || flags & 7 != 0 || gso != 0 || buffers != 1 {
+        let valid = (HEADER + 14..=BUFFER).contains(&c.len)
+            && self.rx.completed_response(c.token).is_ok_and(|page| {
+                let [flags, gso] = page.get16(0).to_le_bytes();
+                flags & 7 == 0 && gso == 0 && page.get16(10) == 1
+            });
+        if !valid {
             self.fail(p);
             return Err(Error::Response);
         }
@@ -244,7 +243,9 @@ impl BatchedNet {
             return Err(Error::Address);
         }
         p.diagnostic_stage(Stage::NetRxCopy as u64);
-        out[..len].copy_from_slice(&self.packet[HEADER..HEADER + len]);
+        self.rx
+            .completed_response(token)?
+            .copy_range_to(HEADER, &mut out[..len]);
         checkpoint();
         p.diagnostic_stage(Stage::NetRxRearm as u64);
         self.rx.release(token)?;
@@ -301,7 +302,6 @@ mod tests {
             tx,
             mac: [2, 0, 0, 0, 0, 1],
             received: None,
-            packet: [0; BUFFER],
             failed: false,
             last_completed: 0,
             hooks: None,
@@ -323,6 +323,104 @@ mod tests {
             write_volatile((u + 2) as *mut u16, n.wrapping_add(1).to_le());
         }
     }
+    fn device_receive(base: usize, id: u16, head: [u8; 12], frame: &[u8], len: u32) {
+        let descriptor = base + usize::from(id) * 16;
+        unsafe {
+            let response = u64::from_le(read_volatile(descriptor as *const u64)) as usize;
+            for (i, byte) in head.into_iter().chain(frame.iter().copied()).enumerate() {
+                write_volatile((response + i) as *mut u8, byte);
+            }
+            used(base, id, len);
+        }
+    }
+    const GOOD_HEADER: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+    #[test]
+    fn rx_owner_fits_below_one_receive_buffer() {
+        assert!(
+            core::mem::size_of::<BatchedNet>() < BUFFER,
+            "the RX owner still reserves space for a staged packet"
+        );
+    }
+
+    #[test]
+    fn rx_copies_exact_frame_into_unaligned_output() {
+        #[repr(align(8))]
+        struct Aligned([u8; 1516]);
+
+        let (mut n, p, rx, _) = fixture();
+        let frame: [u8; 1514] = core::array::from_fn(|i| i.wrapping_mul(17) as u8);
+        for len in [14, 19, 64, 1514] {
+            let mut header = GOOD_HEADER;
+            header[0] = 0x80;
+            device_receive(rx, 0, header, &frame[..len], (12 + len) as u32);
+            assert_eq!(n.poll_rx(&p), Ok(true));
+            let mut storage = Aligned([0xa5; 1516]);
+            let out = &mut storage.0;
+            assert_eq!(n.receive(&mut out[1..], &p), Ok(Some(len)));
+            assert_eq!(&out[1..len + 1], &frame[..len]);
+            assert_eq!(out[0], 0xa5);
+            assert!(out[len + 1..].iter().all(|&byte| byte == 0xa5));
+        }
+    }
+
+    #[test]
+    fn rx_rejects_malformed_completions_without_delivery_or_rearm() {
+        for (flags, gso, buffers, len, error) in [
+            (0, 0, 1u16, 0, Error::Response),
+            (0, 0, 1, 25, Error::Response),
+            (0, 0, 1, 1527, Error::Queue),
+            (1, 0, 1, 26, Error::Response),
+            (2, 0, 1, 26, Error::Response),
+            (4, 0, 1, 26, Error::Response),
+            (0, 1, 1, 26, Error::Response),
+            (0, 0, 0, 26, Error::Response),
+            (0, 0, 2, 26, Error::Response),
+            (0, 0, 256, 26, Error::Response),
+        ] {
+            let (mut n, p, rx, _) = fixture();
+            let mut header = GOOD_HEADER;
+            header[0] = flags;
+            header[1] = gso;
+            header[10..].copy_from_slice(&buffers.to_le_bytes());
+            device_receive(rx, 0, header, &[0x62; 14], len);
+            let mut out = [0xa5; 64];
+            assert_eq!(n.receive(&mut out, &p), Err(error));
+            assert_eq!(out, [0xa5; 64]);
+            assert_eq!(n.notify_stats().published, 8);
+            assert_eq!(n.notify_stats().errors, 1);
+            assert_eq!(n.poll_rx(&p), Err(Error::Device));
+        }
+    }
+
+    #[test]
+    fn rx_accepts_another_completion_during_delivery_checkpoint() {
+        let (mut n, p, rx, _) = fixture();
+        device_receive(rx, 4, GOOD_HEADER, &[0x44; 64], 76);
+        let mut checkpoints = 0;
+        let mut out = [0; 64];
+        assert_eq!(
+            n.receive_with_checkpoint(&mut out, &p, &mut || {
+                checkpoints += 1;
+                let avail = unsafe { read_volatile((rx + 4098) as *const u16) };
+                assert_eq!(u16::from_le(avail), 8, "published before rearm");
+                if checkpoints == 10 {
+                    device_receive(rx, 0, GOOD_HEADER, &[0x22; 64], 76);
+                }
+            }),
+            Ok(Some(64))
+        );
+        assert_eq!(checkpoints, 10);
+        assert_eq!(out, [0x44; 64]);
+        assert_eq!(n.notify_stats().completed, 1);
+        assert_eq!(n.notify_stats().published, 9);
+        assert_eq!(n.receive(&mut out, &p), Ok(Some(64)));
+        assert_eq!(out, [0x22; 64]);
+        assert_eq!(n.notify_stats().completed, 2);
+        assert_eq!(n.notify_stats().published, 10);
+        assert_eq!(n.receive(&mut out, &p), Ok(None));
+    }
+
     #[test]
     fn tx_publication_is_real_bounded_and_tracks_completed_version() {
         let (mut n, p, _, tx) = fixture();
@@ -345,16 +443,13 @@ mod tests {
     #[test]
     fn rx_short_consumer_holds_completed_buffer_until_consumption() {
         let (mut n, p, rx, _) = fixture();
-        unsafe {
-            let response = u64::from_le(read_volatile(rx as *const u64)) as usize;
-            for i in 0..76 {
-                write_volatile((response + i) as *mut u8, if i < 12 { 0 } else { 0x62 });
-            }
-            write_volatile((response + 10) as *mut u16, 1u16.to_le());
-            used(rx, 0, 76);
-        }
-        assert_eq!(n.receive(&mut [0; 12], &p), Err(Error::Address));
+        device_receive(rx, 0, GOOD_HEADER, &[0x62; 64], 76);
+        let mut short = [0xa5; 12];
+        assert_eq!(n.receive(&mut short, &p), Err(Error::Address));
+        assert_eq!(short, [0xa5; 12]);
         assert_eq!(n.rx.free(), 0);
+        assert_eq!(n.rx.stats().completed, 1);
+        assert_eq!(n.rx.stats().published, 8);
         let mut frame = [0; 64];
         assert_eq!(n.receive(&mut frame, &p), Ok(Some(64)));
         assert_eq!(frame, [0x62; 64]);

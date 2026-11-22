@@ -452,6 +452,25 @@ impl BatchQueue {
         p: &impl Platform,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<Option<Completion>, Error> {
+        self.poll_completion(t, Some(out), p, checkpoint)
+    }
+    /// Acquire and publish the completion while leaving its response in the
+    /// pinned page. The caller holds the token until it finishes reading.
+    pub(crate) fn poll_in_place_with_checkpoint(
+        &mut self,
+        t: &mut Transport,
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<Completion>, Error> {
+        self.poll_completion(t, None, p, checkpoint)
+    }
+    fn poll_completion(
+        &mut self,
+        t: &mut Transport,
+        out: Option<&mut [u8]>,
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<Completion>, Error> {
         p.diagnostic_stage(Stage::QueueStatus as u64);
         if self.poisoned {
             return Err(Error::Device);
@@ -505,7 +524,7 @@ impl BatchQueue {
             self.poison(t, p);
             return Err(Error::Queue);
         }
-        if out.len() < len as usize {
+        if out.as_ref().is_some_and(|out| out.len() < len as usize) {
             return Err(Error::Address);
         }
         checkpoint();
@@ -515,10 +534,12 @@ impl BatchQueue {
             p.barrier();
         }
         // DMA cache acquisition can be the cold part of a native QEMU turn.
-        // Settle it before copying, while the completed chain is still owned.
+        // Settle it before publishing completion, while the chain is owned.
         checkpoint();
         p.diagnostic_stage(Stage::QueueCopyPublish as u64);
-        self.memory.response[index].copy_prefix_to(out, len as usize);
+        if let Some(out) = out {
+            self.memory.response[index].copy_prefix_to(out, len as usize);
+        }
         self.slots[index].state = State::Complete;
         self.used = self.used.wrapping_add(1);
         self.stats.completed = self.stats.completed.saturating_add(1);
@@ -537,6 +558,14 @@ impl BatchQueue {
             version: s.version,
             latency_ns: p.now_ns().saturating_sub(s.started),
         }))
+    }
+    /// Only the CPU-owned generation is readable. The caller must bound its
+    /// accesses by the length in the matching completion.
+    pub(crate) fn completed_response(&self, token: Token) -> Result<&Page, Error> {
+        if self.slot(token)?.state != State::Complete {
+            return Err(Error::Busy);
+        }
+        Ok(&self.memory.response[usize::from(token.slot)])
     }
     pub fn release(&mut self, token: Token) -> Result<(), Error> {
         if self.slot(token)?.state != State::Complete {

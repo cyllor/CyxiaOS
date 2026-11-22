@@ -105,20 +105,30 @@ impl Page {
         }
     }
     fn copy_prefix_to(&self, out: &mut [u8], bytes: usize) {
-        debug_assert!(bytes <= 4096 && bytes <= out.len());
-        let wide = bytes & !7;
-        for offset in (0..wide).step_by(8) {
+        self.copy_range_to(0, &mut out[..bytes]);
+    }
+    fn copy_range_to(&self, offset: usize, out: &mut [u8]) {
+        assert!(offset <= 4096 && out.len() <= 4096 - offset);
+        let address = self.address() + offset;
+        // The source must be aligned for wide volatile reads. Peel off any
+        // leading bytes, then handle the aligned words and trailing bytes.
+        let prefix = (offset.next_multiple_of(8) - offset).min(out.len());
+        let (head, rest) = out.split_at_mut(prefix);
+        for (i, byte) in head.iter_mut().enumerate() {
+            *byte = unsafe { read_volatile((address + i) as *const u8) };
+        }
+        let address = address + prefix;
+        let wide = rest.len() & !7;
+        for i in (0..wide).step_by(8) {
             // DMA ownership has already transferred to the CPU. Preserve
             // volatile device-memory reads while avoiding one translated
             // helper per byte for maximum-MTU responses. The destination may
             // be unaligned, hence the explicit unaligned ordinary store.
-            let value = unsafe { read_volatile((self.address() + offset) as *const u64) };
-            unsafe {
-                core::ptr::write_unaligned(out.as_mut_ptr().add(offset).cast::<u64>(), value)
-            };
+            let value = unsafe { read_volatile((address + i) as *const u64) };
+            unsafe { core::ptr::write_unaligned(rest.as_mut_ptr().add(i).cast::<u64>(), value) };
         }
-        for (offset, byte) in out[wide..bytes].iter_mut().enumerate() {
-            *byte = unsafe { read_volatile((self.address() + wide + offset) as *const u8) };
+        for (i, byte) in rest[wide..].iter_mut().enumerate() {
+            *byte = unsafe { read_volatile((address + wide + i) as *const u8) };
         }
     }
     /// Mirror of `copy_prefix_to` for the request direction. A maximum-MTU

@@ -25,33 +25,14 @@ class NativeTaskCredit(unittest.TestCase):
         self.assertIn("service_detail(6);\n    // with() has released", service)
 
     def test_batched_rx_custody_transitions_are_independently_settleable(self):
-        driver = (ROOT / "crates/driver-virtio/src/net/batched.rs").read_text()
-        queue = (ROOT / "crates/driver-virtio/src/queue.rs").read_text()
-        transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
+        from test_network_piece_trace import NetworkPieceTrace
 
-        receive = driver[driver.index("pub fn receive_with_checkpoint"):]
-        self.assertIn("self.poll_rx_with_checkpoint(p, checkpoint)?;\n        checkpoint();", receive)
-        self.assertIn("copy_from_slice", receive)
-        copied=receive.index("copy_from_slice")
-        boundary=receive.index("checkpoint();",copied)
-        rearm=receive.index("Stage::NetRxRearm",boundary)
-        self.assertLess(boundary,rearm)
-        self.assertLess(rearm,receive.index("self.rx.release(token)?;"))
+        NetworkPieceTrace(
+            "test_real_driver_reports_fixed_rx_and_queue_stages_without_new_checkpoints"
+        ).debug()
+        transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
         self.assertIn("receive_frame_with_checkpoint", transport)
         self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
-        record = queue[queue.index("let at = 4 + usize::from(self.used % self.size) * 8;") :]
-        self.assertLess(record.index("p.sync("), record.index("checkpoint();"))
-        self.assertLess(record.index("checkpoint();"), record.index("let id ="))
-        response = record[record.index("if len != 0 {") :]
-        self.assertIn("p.barrier();\n        }\n        // DMA cache acquisition", response)
-        self.assertLess(response.index("// DMA cache acquisition"),
-                        response.index("checkpoint();"))
-        self.assertLess(response.index("checkpoint();"),
-                        response.index("copy_prefix_to"))
-        published = response[response.index("copy_prefix_to") :]
-        self.assertLess(published.index("last_completed_version"),
-                        published.index("checkpoint();"))
-        self.assertLess(published.index("checkpoint();"), published.index("let irq"))
 
     def test_native_tcp_ingress_and_handshake_have_separate_bounded_credits(self):
         tcp = (ROOT / "crates/cluster-transport/src/tcp.rs").read_text()
