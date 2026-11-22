@@ -11,6 +11,7 @@ const P: u64 = 1;
 const W: u64 = 2;
 const U: u64 = 4;
 const NX: u64 = 1 << 63;
+const MAX_TABLE_PAGES: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Address,
@@ -84,18 +85,22 @@ pub struct TableArena<'a> {
     physical_base: u64,
     pages: usize,
     used: usize,
+    free: u64,
+    free_count: u16,
+    reclaim_pending: bool,
     _owner: PhantomData<&'a mut [u8]>,
 }
 impl<'a> TableArena<'a> {
     /// # Safety
     /// The caller exclusively owns `pages` contiguous aligned frames and their
-    /// writable kernel mapping. They remain pinned for the arena's lifetime.
+    /// writable kernel mapping. They remain pinned for the arena's lifetime
+    /// and cannot serve as user-mapped data or page tables for another root.
     pub unsafe fn from_raw(
         virtual_base: *mut u8,
         physical_base: u64,
         pages: usize,
     ) -> Result<Self, Error> {
-        if !(4..=4096).contains(&pages)
+        if !(4..=MAX_TABLE_PAGES).contains(&pages)
             || virtual_base.is_null()
             || !(virtual_base as usize).is_multiple_of(4096)
             || physical_base == 0
@@ -111,10 +116,21 @@ impl<'a> TableArena<'a> {
             physical_base,
             pages,
             used: 0,
+            free: 0,
+            free_count: 0,
+            reclaim_pending: false,
             _owner: PhantomData,
         })
     }
     fn allocate(&mut self) -> Result<u64, Error> {
+        if self.free != 0 {
+            let physical = self.free;
+            let table = self.table(physical)?;
+            self.free = unsafe { table.read_volatile() };
+            self.free_count -= 1;
+            unsafe { core::ptr::write_bytes(table, 0, 512) };
+            return Ok(physical);
+        }
         if self.used == self.pages {
             return Err(Error::Capacity);
         }
@@ -125,14 +141,124 @@ impl<'a> TableArena<'a> {
         }
         Ok(self.physical_base + index as u64 * PAGE_BYTES)
     }
-    fn table(&self, physical: u64) -> Result<*mut u64, Error> {
+    fn index(&self, physical: u64) -> Result<usize, Error> {
         let offset = physical
             .checked_sub(self.physical_base)
             .ok_or(Error::Address)?;
         if !offset.is_multiple_of(PAGE_BYTES) || offset / PAGE_BYTES >= self.used as u64 {
             return Err(Error::Address);
         }
-        Ok(unsafe { self.virtual_base.add(offset as usize).cast() })
+        Ok((offset / PAGE_BYTES) as usize)
+    }
+    fn table(&self, physical: u64) -> Result<*mut u64, Error> {
+        let index = self.index(physical)?;
+        Ok(unsafe { self.virtual_base.add(index * 4096).cast() })
+    }
+    fn mapping_table(&mut self, root: u64, address: u64) -> Result<*mut u64, Error> {
+        let result = self.extend_path(root, address);
+        if result == Err(Error::Capacity) && self.reclaim_empty(root) {
+            // Earlier pointers belonged to the old tree. Walk again after
+            // unlinking empty paths, even if this was the path being extended.
+            return self.extend_path(root, address);
+        }
+        result
+    }
+    fn extend_path(&mut self, root: u64, address: u64) -> Result<*mut u64, Error> {
+        let mut table = self.table(root)?;
+        for (needed, shift) in [(3, 39), (2, 30), (1, 21)] {
+            let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
+            let mut value = unsafe { entry.read_volatile() };
+            if value & P == 0 {
+                // All lower levels would be new. Reject the whole path if
+                // it would consume table frames without reaching a leaf.
+                if self.pages - self.used + usize::from(self.free_count) < needed {
+                    return Err(Error::Capacity);
+                }
+                value = self.allocate()? | P | W | U;
+                unsafe { entry.write_volatile(value) };
+            }
+            if value & (1 << 7) != 0 {
+                return Err(Error::Conflict);
+            }
+            table = self.table(value & MASK)?;
+        }
+        Ok(table)
+    }
+    /// Called only after a failed allocation with the root exclusively owned
+    /// and nonresident. An arena never reclaims the root or the kernel half.
+    #[cold]
+    fn reclaim_empty(&mut self, root: u64) -> bool {
+        if !self.reclaim_pending {
+            return false;
+        }
+        let mut visited = [0u64; MAX_TABLE_PAGES / 64];
+        let mut free = self.free;
+        for _ in 0..self.free_count {
+            let Some(table) = self.visit_table(free, &mut visited) else {
+                return false;
+            };
+            free = unsafe { table.read_volatile() };
+        }
+        if free != 0 || !self.validate_tree(root, 4, &mut visited) {
+            return false;
+        }
+        let before = self.free_count;
+        self.reclaim_pending = false;
+        self.detach_empty(root, 4);
+        self.free_count > before
+    }
+    fn visit_table(&self, physical: u64, visited: &mut [u64]) -> Option<*mut u64> {
+        let index = self.index(physical).ok()?;
+        let bit = 1 << (index % 64);
+        let word = &mut visited[index / 64];
+        if *word & bit != 0 {
+            return None;
+        }
+        *word |= bit;
+        Some(unsafe { self.virtual_base.add(index * 4096).cast() })
+    }
+    fn validate_tree(&self, physical: u64, level: u8, visited: &mut [u64]) -> bool {
+        let Some(table) = self.visit_table(physical, visited) else {
+            return false;
+        };
+        if level == 1 {
+            return true;
+        }
+        (0..if level == 4 { 256 } else { 512 }).all(|index| {
+            let value = unsafe { table.add(index).read_volatile() };
+            value & P == 0
+                || (value & (1 << 7) == 0 && self.validate_tree(value & MASK, level - 1, visited))
+        })
+    }
+    fn detach_empty(&mut self, physical: u64, level: u8) -> bool {
+        let table = self.table(physical).expect("validated private table");
+        if level == 1 {
+            return (0..512).all(|index| unsafe { table.add(index).read_volatile() } & P == 0);
+        }
+        let mut empty = true;
+        for index in 0..if level == 4 { 256 } else { 512 } {
+            let entry = unsafe { table.add(index) };
+            let value = unsafe { entry.read_volatile() };
+            if value & P == 0 {
+                continue;
+            }
+            let child = value & MASK;
+            if self.detach_empty(child, level - 1) {
+                // The previous CPU restores kernel CR3 before clearing its
+                // resident bit. User leaves are non-global and PCID is off,
+                // so no stale translation or cached walk can reach this page.
+                let detached = self.table(child).expect("validated private child table");
+                unsafe {
+                    entry.write_volatile(0);
+                    detached.write_volatile(self.free);
+                }
+                self.free = child;
+                self.free_count += 1;
+            } else {
+                empty = false;
+            }
+        }
+        empty
     }
 }
 pub struct AddressSpace<'a> {
@@ -145,8 +271,9 @@ pub struct AddressSpace<'a> {
 }
 impl<'a> AddressSpace<'a> {
     /// # Safety
-    /// Kernel upper entries refer to immutable pinned supervisor tables. The
-    /// arena is exclusively owned and remains pinned while contexts can run.
+    /// Kernel upper entries refer to immutable pinned supervisor tables
+    /// outside the arena. This arena is exclusively owned and remains pinned
+    /// while contexts can run.
     pub unsafe fn new(
         mut arena: TableArena<'a>,
         kernel: &KernelMappings,
@@ -272,20 +399,7 @@ impl<'a> AddressSpace<'a> {
             {
                 table
             } else {
-                let mut table = self.arena.table(self.root)?;
-                for shift in [39, 30, 21] {
-                    let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
-                    let mut value = unsafe { entry.read_volatile() };
-                    if value & P == 0 {
-                        let child = self.arena.allocate()?;
-                        value = child | P | W | U;
-                        unsafe { entry.write_volatile(value) };
-                    }
-                    if value & (1 << 7) != 0 {
-                        return Err(Error::Conflict);
-                    }
-                    table = self.arena.table(value & MASK)?;
-                }
+                let table = self.arena.mapping_table(self.root, address)?;
                 cached_leaf = Some((region, table));
                 table
             };
@@ -298,7 +412,11 @@ impl<'a> AddressSpace<'a> {
                 | U
                 | if permissions.writable { W } else { 0 }
                 | if permissions.executable { 0 } else { NX };
-            publication.aliases.change(physical, None, Some(permissions))?;
+            if let Err(error) = publication.aliases.change(physical, None, Some(permissions)) {
+                // The new path may now contain an empty table even without an unmap.
+                self.arena.reclaim_pending = true;
+                return Err(error);
+            }
             unsafe { leaf.write_volatile(value) };
             publication.published += 1;
         }
@@ -328,20 +446,7 @@ impl<'a> AddressSpace<'a> {
         self.validate_mapping(address, physical, permissions)?;
         let aliases = MappingBatch::acquire()?;
         let mut publication = MappingPublication { epoch: &self.epoch, published: 0, aliases };
-        let mut table = self.arena.table(self.root)?;
-        for shift in [39, 30, 21] {
-            let entry = unsafe { table.add(((address >> shift) & 511) as usize) };
-            let mut value = unsafe { entry.read_volatile() };
-            if value & P == 0 {
-                let child = self.arena.allocate()?;
-                value = child | P | W | U;
-                unsafe { entry.write_volatile(value) };
-            }
-            if value & (1 << 7) != 0 {
-                return Err(Error::Conflict);
-            }
-            table = self.arena.table(value & MASK)?;
-        }
+        let table = self.arena.mapping_table(self.root, address)?;
         let leaf = unsafe { table.add(((address >> 12) & 511) as usize) };
         let mut valid = 0;
         let mut error = None;
@@ -368,6 +473,7 @@ impl<'a> AddressSpace<'a> {
         }
         publication.published = changed as u64;
         if changed != valid {
+            self.arena.reclaim_pending |= changed == 0;
             return Err(Error::Permissions);
         }
         error.map_or(Ok(()), Err)
@@ -409,6 +515,7 @@ impl<'a> AddressSpace<'a> {
         unsafe {
             leaf.write_volatile(0);
         }
+        self.arena.reclaim_pending = true;
         let epoch = self
             .epoch
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel)
@@ -450,9 +557,80 @@ impl<'a> AddressSpace<'a> {
         unsafe {
             leaf.write_volatile(0);
         }
+        self.arena.reclaim_pending = true;
         self.epoch
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         Ok(true)
+    }
+    /// Revoke up to one leaf table under one alias lease. Absent entries are
+    /// skipped. If an alias check fails, publish only the successful prefix;
+    /// the caller must retain all backing until the whole request succeeds.
+    pub fn unmap_table_run(&mut self, address: u64, pages: usize) -> Result<(), Error> {
+        if pages == 0 {
+            return Ok(());
+        }
+        Self::address(address)?;
+        let leaf_index = ((address / PAGE_BYTES) & 511) as usize;
+        if pages > 512 - leaf_index {
+            return Err(Error::Address);
+        }
+        if self.resident_cpus() != 0 {
+            return Err(Error::Active);
+        }
+        let Some(leaf) = self.leaf(address) else {
+            return Ok(());
+        };
+        let Some((mut index, mut value)) = (0..pages).find_map(|index| {
+            let value = unsafe { leaf.add(index).read_volatile() };
+            (value & P != 0).then_some((index, value))
+        }) else {
+            return Ok(());
+        };
+        let mut publication = MappingPublication {
+            epoch: &self.epoch,
+            published: 0,
+            aliases: MappingBatch::acquire()?,
+        };
+        while index < pages {
+            if value & P == 0 {
+                index += 1;
+                if index < pages {
+                    value = unsafe { leaf.add(index).read_volatile() };
+                }
+                continue;
+            }
+            let physical = value & MASK;
+            let flags = value & (P | W | NX);
+            let old = UserPermissions {
+                writable: flags & W != 0,
+                executable: flags & NX == 0,
+            };
+            let mut end = index + 1;
+            // Only physical adjacency and the alias-accounting flags matter.
+            // Keep the last decoded entry for the start of the next run.
+            while end < pages {
+                value = unsafe { leaf.add(end).read_volatile() };
+                if value & (P | W | NX) != flags
+                    || value & MASK != physical + (end - index) as u64 * PAGE_BYTES
+                {
+                    break;
+                }
+                end += 1;
+            }
+            let changed = publication.aliases.change_run(physical, Some(old), None, end - index);
+            for at in index..index + changed {
+                unsafe { leaf.add(at).write_volatile(0) };
+            }
+            // The root is quiescent and the gate still excludes physical
+            // permission changes until all cleared entries and the epoch publish.
+            publication.published += changed as u64;
+            if changed != end - index {
+                return Err(Error::Permissions);
+            }
+            index = end;
+        }
+        self.arena.reclaim_pending = true;
+        Ok(())
     }
     pub fn protect(&mut self, address: u64, permissions: UserPermissions) -> Result<(), Error> {
         Self::address(address)?;
@@ -508,6 +686,8 @@ impl<'a> AddressSpace<'a> {
         Ok(())
     }
     #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
+    // Resume restores kernel CR3 before publishing departure. Empty table
+    // reclamation relies on that invalidation preceding a zero resident mask.
     pub(crate) fn leave_cpu(&self, slot: usize) {
         self.residents
             .fetch_and(!(1 << slot), core::sync::atomic::Ordering::Release);
@@ -598,7 +778,7 @@ struct MappingPublication<'a> {
 impl Drop for MappingPublication<'_> {
     fn drop(&mut self) {
         if self.published != 0 {
-            // Exclusive owner, same wrapped final epoch as N one-page maps.
+            // Exclusive owner, same wrapped final epoch as N one-page changes.
             // Also publish the successful prefix on an error or unwind.
             self.epoch.fetch_add(self.published, core::sync::atomic::Ordering::Release);
         }

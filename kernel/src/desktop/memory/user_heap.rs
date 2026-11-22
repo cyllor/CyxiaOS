@@ -40,6 +40,7 @@ const _: () = assert!(
 const ALLOCATIONS: usize = 1024;
 #[cfg(not(feature = "full-os"))]
 const ALLOCATIONS: usize = 512;
+const _: () = assert!(ALLOCATIONS.is_multiple_of(64));
 const TABLES: usize = vm::PAGE_COUNT / 512;
 #[cfg(feature = "full-os")]
 const MODEL_ID: u64 = cyxia_ai_runtime::FULL_OS_POOL_ANON_MODEL_ID;
@@ -75,6 +76,7 @@ pub struct Heap {
     frames: [Option<FrameHandle>; vm::PAGE_COUNT],
     tables: [Table; TABLES],
     allocations: [Option<Allocation>; ALLOCATIONS],
+    free_allocations: [u64; ALLOCATIONS / 64],
     ledger: BoundedGrantLedger<ALLOCATIONS>,
     base: u64,
     owner: Option<Owner>,
@@ -157,6 +159,7 @@ impl Heap {
             frames: [None; vm::PAGE_COUNT],
             tables: [const { Table::empty() }; TABLES],
             allocations: [None; ALLOCATIONS],
+            free_allocations: [u64::MAX; ALLOCATIONS / 64],
             ledger: BoundedGrantLedger::new(PageCount(vm::PAGE_COUNT as u32)),
             base: 0,
             owner: None,
@@ -217,6 +220,24 @@ impl Heap {
         ai::admission(Domain::Anonymous, attempt, &result);
         result
     }
+    fn free_allocation_slot(&self) -> Option<usize> {
+        let (word, bits) = self
+            .free_allocations
+            .iter()
+            .enumerate()
+            .find(|(_, bits)| **bits != 0)?;
+        Some(word * 64 + bits.trailing_zeros() as usize)
+    }
+    fn store_allocation(&mut self, slot: usize, allocation: Option<Allocation>) {
+        self.allocations[slot] = allocation;
+        let bit = 1u64 << (slot % 64);
+        let word = &mut self.free_allocations[slot / 64];
+        if allocation.is_some() {
+            *word &= !bit;
+        } else {
+            *word |= bit;
+        }
+    }
     fn allocate_accounted(&mut self, pages: usize, attempt: &mut Attempt) -> Result<u64, Errno> {
         if self.base == 0 {
             return Err(Errno::Nodev);
@@ -229,11 +250,7 @@ impl Heap {
         if pages > 2048 || pages > self.free() as usize {
             return Err(Errno::Nomem);
         }
-        let slot = self
-            .allocations
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Errno::Nomem)?;
+        let slot = self.free_allocation_slot().ok_or(Errno::Nomem)?;
         let owner = self.owner.ok_or(Errno::Perm)?;
         attempt.proposed(MODEL_ID);
         #[cfg(not(feature = "full-os"))]
@@ -280,11 +297,14 @@ impl Heap {
                 })
             },
         )?;
-        self.allocations[slot] = Some(Allocation {
-            start: self.batch.start(),
-            pages,
-            redemption,
-        });
+        self.store_allocation(
+            slot,
+            Some(Allocation {
+                start: self.batch.start(),
+                pages,
+                redemption,
+            }),
+        );
         self.usage.allocations += 1;
         self.usage.peak_allocations = self.usage.peak_allocations.max(self.usage.allocations);
         self.usage.peak_pages = self.usage.peak_pages.max(self.used());
@@ -348,7 +368,7 @@ impl Heap {
             })
             .map_err(|_| Errno::Io)?;
         ai::record(Domain::Anonymous, |c| c.release(pages as u64));
-        self.allocations[slot] = None;
+        self.store_allocation(slot, None);
         self.usage.allocations -= 1;
         self.usage.largest_free = self.vm.largest_free_run() as u32;
         Ok(())

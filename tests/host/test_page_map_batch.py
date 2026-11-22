@@ -81,6 +81,10 @@ def production_files(address_source=None, *, source_root=None):
     adapted = space.replace(selector, 'feature = "runtime"')
     if adapted == space:
         raise ValueError("Runtime platform selector missing; do not test no-op alias hooks")
+    # Count actual epoch read-modify-writes while forwarding the same atomic
+    # operations and ordering. Residency and every other atomic stay unchanged.
+    adapted = re.sub(r"(epoch: (?:&'a )?)core::sync::atomic::AtomicU64",
+                     r"\1crate::runtime_fixture::MappingEpoch", adapted)
     adapted += '\n#[cfg(test)]\n#[path = "cases.rs"]\nmod batch_tests;\n'
     files = {
         "process-limits.rs": limits,
@@ -126,7 +130,21 @@ def production_files(address_source=None, *, source_root=None):
         if fixture.count(marker) != 1:
             raise ValueError("Ambiguous fixture marker: " + marker)
         fixture = fixture.replace(marker, value)
-    files["runtime-fixture.rs"] = fixture
+    files["runtime-fixture.rs"] = fixture + '''
+static EPOCH_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
+pub struct MappingEpoch(AtomicU64);
+impl MappingEpoch {
+    pub const fn new(value: u64) -> Self { Self(AtomicU64::new(value)) }
+    pub fn load(&self, order: Ordering) -> u64 { self.0.load(order) }
+    pub fn store(&self, value: u64, order: Ordering) { self.0.store(value, order); }
+    pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
+        let before = self.0.fetch_add(value, order);
+        EPOCH_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+        before
+    }
+}
+pub fn take_epoch_publications() -> u64 { EPOCH_PUBLICATIONS.swap(0, Ordering::Relaxed) }
+'''
     if 'extern "C" fn x86_runtime_mapping_batch_run(' in runtime:
         files['runtime-fixture.rs'] += '''
 pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
@@ -165,15 +183,21 @@ pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
     files['shared-metadata.rs'] = (ROOT / 'crates/posix/src/shared_memory.rs').read_text()
     heap = (ROOT / 'kernel/src/desktop/memory/user_heap.rs').read_text()
     shared = (ROOT / 'kernel/src/desktop/user/shared_memory.rs').read_text()
+    heap_limits = heap[heap.index('#[cfg(feature = "full-os")]\nconst ALLOCATIONS:'):
+                       heap.index('const TABLES:')].replace('feature = "full-os"', 'feature = "cosmic-session"')
     # Compile the full-OS frame-release branch even in this host harness. Only
     # frame/grant/object effects are witnesses; VM, unmap, PTE and alias bodies
     # are production code. This does not replace the native memory probes.
     heap_unmap = function(heap, '    pub fn unmap_with_revoke(')
     heap_unmap += '\n' + function(heap, '    fn unmap_slot_with_revoke(')
+    for signature in ('    fn free_allocation_slot(', '    fn store_allocation('):
+        heap_unmap += '\n' + function(heap, signature)
     heap_unmap = heap_unmap.replace('#[cfg(feature = "full-os")]', '#[cfg(all())]')
     heap_unmap = heap_unmap.replace('#[cfg(not(feature = "full-os"))]', '#[cfg(any())]')
-    files['revoke-order.rs'] = (HERE / 'page_mapping_revoke_cases.rs').read_text().replace(
-        '// @HEAP_UNMAP@', heap_unmap).replace('// @SHARED_UNMAP@', function(shared, '    fn unmap_with_revoke('))
+    files['revoke-order.rs'] = ((HERE / 'page_mapping_revoke_cases.rs').read_text()
+        .replace('// @HEAP_LIMITS@', heap_limits)
+        .replace('// @HEAP_UNMAP@', heap_unmap)
+        .replace('// @SHARED_UNMAP@', function(shared, '    fn unmap_with_revoke(')))
     files["transactions.rs"] = '''#![allow(dead_code)]
 extern crate self as cyxia_arch_x86_64;
 extern crate self as cyxia_posix;
@@ -259,7 +283,7 @@ mod production_process_arch {
         "diagnostic_sha256": digest(diagnostic),
         "diagnostic_sink": "host-only thread-local bytes; no UART or AP ownership emulation",
         "generated_sha256": {name: digest(text) for name, text in files.items()},
-        "platform_adaptation": "space.rs runtime selector -> feature runtime; x86 staging cfg selected on host",
+        "platform_adaptation": "space.rs runtime selector -> feature runtime; mapping epoch atomic observed; x86 staging cfg selected on host",
         "runtime_branches_enabled": True,
         "hardware_tlb_exercised": False,
         "guest_execution": False,

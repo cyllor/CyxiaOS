@@ -43,8 +43,10 @@ mod ai {
     impl Counter { pub fn release(&mut self, _: u64) {} }
     pub fn record(_: super::Domain, f: impl FnOnce(&mut Counter)) { f(&mut Counter); }
 }
+// @HEAP_LIMITS@
 struct Heap {
-    allocations: [Option<Allocation>; 1], owner: Option<Owner>,
+    allocations: [Option<Allocation>; ALLOCATIONS], owner: Option<Owner>,
+    free_allocations: [u64; ALLOCATIONS / 64],
     frames: Vec<Option<Frame>>, vm: vm::Vm, batch: vm::PageBatch,
     tables: Vec<PageTable>, ledger: Ledger, usage: Usage,
 }
@@ -73,11 +75,12 @@ fn heap(space: &mut ProcessSpace) -> Heap {
     let mut batch = vm::PageBatch::new();
     vm.allocate_into(2, &mut batch).unwrap();
     let mut heap = Heap {
-        allocations: [Some(Allocation { start: vm::BASE, pages: 2, redemption: 1 })],
+        allocations: [None; ALLOCATIONS], free_allocations: [u64::MAX; ALLOCATIONS / 64],
         owner: Some(Owner { task: 1 }), frames: vec![None; vm::PAGE_COUNT], vm, batch,
         tables: (0..vm::PAGE_COUNT / 512).map(|_| PageTable::empty()).collect(),
         ledger: Ledger, usage: Usage { allocations: 1, largest_free: 0 },
     };
+    heap.store_allocation(0, Some(Allocation { start: vm::BASE, pages: 2, redemption: 1 }));
     for page in heap.batch.iter() {
         let pa = PA + page.slot as u64 * 4096;
         heap.frames[page.slot] = Some(Frame(pa));
@@ -89,6 +92,27 @@ fn heap(space: &mut ProcessSpace) -> Heap {
 }
 
 #[test]
+fn runtime_batch_heap_free_slots_preserve_first_fit_through_fill_and_reuse() {
+    let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
+    let (_memory, mut space) = owner();
+    let mut heap = heap(&mut space);
+    let allocation = heap.allocations[0];
+    for slot in 1..ALLOCATIONS {
+        assert_eq!(heap.free_allocation_slot(), Some(slot));
+        heap.store_allocation(slot, allocation);
+    }
+    assert_eq!(heap.free_allocation_slot(), None);
+    for slot in [ALLOCATIONS - 1, 64, 63] {
+        heap.store_allocation(slot, None);
+        assert_eq!(heap.free_allocation_slot(), Some(slot));
+    }
+    heap.store_allocation(63, allocation);
+    assert_eq!(heap.free_allocation_slot(), Some(64));
+    heap.store_allocation(64, allocation);
+    assert_eq!(heap.free_allocation_slot(), Some(ALLOCATIONS - 1));
+}
+
+#[test]
 fn runtime_batch_heap_unmap_revokes_real_ptes_before_frame_and_grant_release() {
     let _lock = runtime::TEST.lock().unwrap(); runtime::reset();
     let (_memory, mut space) = owner();
@@ -96,6 +120,7 @@ fn runtime_batch_heap_unmap_revokes_real_ptes_before_frame_and_grant_release() {
     heap.unmap_with_revoke(vm::BASE, 2, |address, pages| space.revoke_range(address, pages).unwrap()).unwrap();
     assert_eq!(heap.vm.used(), 0);
     assert!(heap.allocations[0].is_none());
+    assert_eq!(heap.free_allocation_slot(), Some(0));
     assert_eq!(heap.usage.allocations, 0);
     assert_eq!(RELEASES.load(Ordering::Relaxed), 2);
     assert!(space.root().unwrap().translate(vm::BASE).is_none());
@@ -115,10 +140,38 @@ fn runtime_batch_rejected_or_failed_heap_revoke_preserves_vm_frames_and_grants()
     assert!(failed.is_err());
     assert_eq!(heap.vm.used(), 2);
     assert!(heap.allocations[0].is_some());
+    assert_eq!(heap.free_allocation_slot(), Some(1));
     assert!(heap.frames[0].is_some());
     assert_eq!(RELEASES.load(Ordering::Relaxed), 0);
     assert_eq!(runtime::count(PA), 1 | 1 << 20);
     assert_eq!(runtime::count(PA + 4096), 1 | 1 << 20);
+}
+
+#[test]
+fn runtime_batch_failed_alias_revoke_publishes_prefix_but_releases_no_heap_backing() {
+    let _lock = runtime::TEST.lock().unwrap();
+    runtime::reset();
+    let (_memory, mut space) = owner();
+    let mut heap = heap(&mut space);
+    let epoch = space.root().unwrap().epoch();
+    runtime::set_count(PA + 4096, 0);
+    runtime::take_epoch_publications();
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        heap.unmap_with_revoke(vm::BASE, 2, |address, pages| space.revoke_range(address, pages).unwrap()).unwrap();
+    }));
+    // Restore the corrupted count before any test panic could run the root destructor.
+    runtime::set_count(PA + 4096, 1 | 1 << 20);
+    assert!(failed.is_err());
+    assert!(space.root().unwrap().translate(vm::BASE).is_none());
+    assert_eq!(space.root().unwrap().translate(vm::BASE + 4096).unwrap().physical, PA + 4096);
+    assert_eq!(space.root().unwrap().epoch(), epoch + 1);
+    assert_eq!(runtime::take_epoch_publications(), 1);
+    assert_eq!(runtime::count(PA), 0);
+    assert!(!runtime::gate());
+    assert_eq!(heap.vm.used(), 2);
+    assert!(heap.allocations[0].is_some());
+    assert!(heap.frames[..2].iter().all(Option::is_some));
+    assert_eq!(RELEASES.load(Ordering::Relaxed), 0);
 }
 
 #[test]

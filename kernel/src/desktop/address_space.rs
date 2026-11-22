@@ -109,6 +109,7 @@ impl PageTable {
     fn executable_runs(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.executable_runs_in(&self.executable)
     }
+    #[cfg(target_arch = "x86_64")]
     fn executable_runs_in<'a>(
         &'a self, bitmap: &'a [u64; 8],
     ) -> impl Iterator<Item = (u64, usize)> + 'a {
@@ -407,10 +408,12 @@ impl ProcessSpace {
     /// All APs have returned to kernel CR3; user mappings are non-global and
     /// PCID is disabled, so no stopped CPU retains a usable user translation.
     pub fn revoke_range(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
-        if self.current.is_none() {
+        let Some(space) = self.current.as_mut() else {
             return Ok(());
+        };
+        if space.resident_cpus() != 0 {
+            return Err(Errno::Busy);
         }
-        self.quiescent()?;
         if !address.is_multiple_of(4096) || address < 4096 || address >= 0x8000_0000_0000
             || pages.checked_mul(4096).and_then(|bytes| address.checked_add(bytes as u64))
                 .is_none_or(|end| end > 0x8000_0000_0000)
@@ -418,7 +421,18 @@ impl ProcessSpace {
             return Err(Errno::Inval);
         }
         let started = crate::process_arch::now_ns();
-        let result = (0..pages).try_for_each(|index| self.revoke_page(address + index as u64 * 4096));
+        let result = (|| {
+            let mut address = address;
+            let mut remaining = pages;
+            while remaining != 0 {
+                let leaf_pages = 512 - ((address / 4096) & 511) as usize;
+                let count = remaining.min(leaf_pages);
+                space.unmap_table_run(address, count).map_err(|_| Errno::Io)?;
+                address += count as u64 * 4096;
+                remaining -= count;
+            }
+            Ok(())
+        })();
         self.revoke_ns = self.revoke_ns.saturating_add(
             crate::process_arch::now_ns().saturating_sub(started),
         );
