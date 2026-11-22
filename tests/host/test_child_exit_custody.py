@@ -1,7 +1,7 @@
 """Execute production Runner reuse, child publication and wait delivery bodies.
 
 Hardware/ELF/filesystem operations are explicit facades; POSIX signals/statuses,
-admission policy and kernel AI counters are real. Negative controls remove each
+thread accounting, admission policy and kernel AI counters are real. Negative controls remove each
 publication boundary and must fail the semantic witness that requires it.
 """
 import json
@@ -22,6 +22,8 @@ def production_program():
     user = (ROOT / "kernel/src/desktop/user.rs").read_text()
     spawn = (ROOT / "kernel/src/desktop/user/spawn.rs").read_text()
     threads = (ROOT / "kernel/src/desktop/user/threads.rs").read_text()
+    capacity = (ROOT / "kernel/src/desktop/user/capacity.rs").read_text()
+    address_space = (ROOT / "kernel/src/desktop/address_space.rs").read_text()
     launch = function(user, "fn launch_accounted(")
     admit = function(spawn, "fn spawn_image_accounted(")
     template = (ROOT / "tests/host/child_exit_custody_harness.rs").read_text()
@@ -36,6 +38,11 @@ def production_program():
     template = template.replace("// RECEIPT_TYPES", "\n".join(types))
     template = template.replace("// THREAD_SLOTS", function(threads, "fn thread_slots("))
     template = template.replace("// PARKED_SLOTS", function(threads, "fn parked_slots("))
+    template = template.replace("// PROCESS_SLOTS", function(address_space, "pub fn process_slots("))
+    template = template.replace("// CAPACITY_METHODS", "\n".join(
+        function(capacity, signature) for signature in (
+            "pub(crate) fn thread_limit(", "pub(super) fn thread_available(",
+            "pub(super) fn thread_started(", "pub(super) fn threads_released(")))
     runner = [function(user, "fn finish("), function(user, "fn block("),
               function(spawn, "pub(super) fn request_wait("),
               function(spawn, "pub(super) fn supervisor_result("),
@@ -85,6 +92,7 @@ class ChildExitCustody(unittest.TestCase):
                                         cwd=ROOT, env=env(), capture_output=True, text=True, timeout=120)
                 output = result.stdout + result.stderr
                 self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("0 passed; 1 failed", output)
                 self.assertIn(failure, output)
             source.write_text(program)
             result = subprocess.run(command + ["--", "--test-threads=1"],

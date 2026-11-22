@@ -100,16 +100,26 @@ class FullOsElf(unittest.TestCase):
 
     def test_reviewed_production_contract_rejects_drift(self):
         contracts = self.root / 'contracts'
-        for name in subject.loader_contract():
+        names = tuple(subject.loader_contract())
+        for name in names:
             destination = contracts / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(subject.ROOT / name, destination)
         with mock.patch.object(subject, 'ROOT', contracts):
             self.inspect()
-            path = contracts / 'crates/posix/src/executable.rs'
-            path.write_bytes(path.read_bytes() + b'\n// unreviewed parser drift\n')
-            with self.assertRaisesRegex(subject.FullOsElfError, 'Reviewed loader contract changed'):
-                self.inspect()
+            for name in names:
+                with self.subTest(source=name):
+                    path = contracts / name
+                    original = path.read_bytes()
+                    try:
+                        path.write_bytes(original + b'\n// unreviewed loader drift\n')
+                        with self.assertRaises(subject.FullOsElfError) as raised:
+                            self.inspect()
+                        self.assertEqual(str(raised.exception),
+                                         'Reviewed loader contract changed: ' + name)
+                    finally:
+                        path.write_bytes(original)
+            self.inspect()
 
     def test_only_bounded_regular_unlinked_inputs_are_read(self):
         self.path.write_bytes(fixture())

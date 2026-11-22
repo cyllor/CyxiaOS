@@ -1,6 +1,6 @@
 //! Production launch/publication/wait bodies over explicit host mechanism facades.
-//! Real POSIX status/signal types and kernel AI counters remain in use. This is
-//! not native execution, MMU/resource-release validation, or a timing claim.
+//! Real POSIX status/signal types, thread accounting and kernel AI counters remain
+//! in use. This is not native execution, MMU/backing-release validation, or a timing claim.
 #![allow(dead_code)]
 
 use cyxia_posix::Errno;
@@ -18,6 +18,15 @@ mod entropy {
 mod process_arch {
     pub const IMAGE_ABI: cyxia_posix::ImageAbi = cyxia_posix::ImageAbi::X86_64;
     pub fn make_writable(_: u64, _: usize) -> Result<(), cyxia_posix::Errno> { Ok(()) }
+}
+mod address_space {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TABLE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+    pub fn set_process_slots(slots: usize) {
+        assert!(slots <= cyxia_posix::usermem::MAX_PROCESSES);
+        TABLE_SLOTS.store(slots, Ordering::Release);
+    }
+    // PROCESS_SLOTS
 }
 mod exec_memory {
     pub const PROFILE: () = ();
@@ -51,6 +60,23 @@ mod kernel {
         const STRING_BYTES: usize = 4096;
         const RECEIPTS: usize = 10;
         fn now() -> u64 { 123 }
+
+        mod capacity {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(0);
+            static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+            pub(super) fn reset(live: usize) {
+                THREAD_LIMIT.store(super::SLOTS * super::super::threads::MAX_THREADS,
+                                   Ordering::Relaxed);
+                LIVE_THREADS.store(live, Ordering::Relaxed);
+            }
+            pub(super) fn live_threads() -> usize { LIVE_THREADS.load(Ordering::Relaxed) }
+            pub(super) fn set_limit(limit: usize) {
+                assert!(live_threads() <= limit);
+                THREAD_LIMIT.store(limit, Ordering::Relaxed);
+            }
+            // CAPACITY_METHODS
+        }
 
         #[derive(Default)]
         struct FileSystem;
@@ -211,6 +237,7 @@ mod kernel {
             // supervisor launch body must publish before reaching this overwrite.
             fn start(&mut self, _: &str, _: &[u8], pid: u32, _: Option<u64>, _: bool,
                      ledger: &mut GrantLedger, attempt: &mut Attempt) -> Result<(), Errno> {
+                if !capacity::thread_available() { return Err(Errno::Again); }
                 ledger.starts += 1;
                 if ledger.fail_start == Some(ledger.starts) { return Err(Errno::Io); }
                 let (allowed, model) = cyxia_ai_runtime::user_memory_policy(ledger.free, MAPPED_PAGES)
@@ -220,6 +247,7 @@ mod kernel {
                 *self = Self::new(pid, 0);
                 ledger.free -= MAPPED_PAGES;
                 ai::record(AiDomain::Process, |c| c.grant(u64::from(MAPPED_PAGES)));
+                capacity::thread_started();
                 Ok(())
             }
             fn validate(&self, _: u64, _: usize, _: bool) -> Result<(), Errno> { Ok(()) }
@@ -260,6 +288,8 @@ mod kernel {
                 ai::record(domain, |c| *c = Counters::ZERO);
             }
             FAIL_IMAGE_LOAD.store(false, Ordering::SeqCst);
+            crate::address_space::set_process_slots(SLOTS);
+            capacity::reset(2);
             let mut s = Supervisor { runners: core::array::from_fn(|_| Runner::new(0, 0)),
                 occupied_runners: 0b11,
                 children: Children::new(), ledger: GrantLedger { free: 48, starts: 0, fail_start: None },
@@ -272,8 +302,15 @@ mod kernel {
             s
         }
         fn terminate(s: &mut Supervisor, slot: usize, state: UserState, code: u32) {
+            let live = capacity::live_threads();
+            let released = s.runners[slot].status.thread_count as usize;
             s.runners[slot].finish(&mut FileSystem, &mut s.ledger, &mut s.ipc, state, code);
             s.occupied_runners &= !(1 << slot);
+            assert_eq!(capacity::live_threads(), live - released,
+                       "finish did not return every published thread credit");
+            assert_eq!(s.runners[slot].status.thread_count, 0);
+            assert!(!s.runners[slot].thread.active);
+            assert!(s.runners[slot].threads.parked.iter().all(|thread| !thread.active));
         }
         fn wait(s: &mut Supervisor, pid: i32, address: u64, nonblock: bool) {
             s.runners[0].request_wait(pid as i64 as u64, address, u64::from(nonblock), 0).unwrap();
@@ -298,9 +335,17 @@ mod kernel {
         fn launch_modes_publish_before_overwrite_and_wait_once() {
             for (mode, native) in [("hello", false), ("idle", true), ("spin", true)] {
                 let mut s = fixture(false);
+                crate::address_space::set_process_slots(2);
+                assert_eq!(s.launch(mode, native), Err(Errno::Again),
+                           "launch ignored the effective process-slot limit");
+                crate::address_space::set_process_slots(SLOTS);
+                capacity::set_limit(2);
+                assert_eq!(s.launch(mode, native), Err(Errno::Again));
+                assert_eq!((s.next_pid, capacity::live_threads()), (3, 2));
                 terminate(&mut s, 1, UserState::Exited, 42);
                 let slot = s.launch(mode, native).unwrap();
                 assert_eq!(slot, 1);
+                assert_eq!(capacity::live_threads(), 2);
                 assert_eq!(receipt(&s, 2).unwrap().status, Some(42 << 8),
                            "terminal receipt was overwritten at the shared launch boundary");
                 assert_eq!(s.runners[0].threads.shared.pending.calls.len(), 1);
@@ -357,6 +402,8 @@ mod kernel {
                 terminate(&mut s, 1, UserState::Exited, 5);
                 s.ledger.fail_start = Some(fail_start);
                 assert_eq!(s.pair(&mut FileSystem), Err(Errno::Io));
+                assert_eq!(capacity::live_threads(), 1,
+                           "failed launch or pair rollback leaked a thread credit");
                 assert_eq!(receipt(&s, 2).unwrap().status, Some(5 << 8));
                 assert_eq!(s.runners[0].threads.shared.pending.calls.len(), 1);
                 wait(&mut s, 2, 0, false);
@@ -464,6 +511,8 @@ mod kernel {
             s.launch("idle", true).unwrap();
             s.runners[0].threads.parked[0] = Thread::new(0x1000_0001);
             s.runners[0].threads.shared.parked_active |= 1;
+            s.runners[0].status.thread_count += 1;
+            capacity::thread_started();
             s.runners[0].threads.parked[0].waiting =
                 Some(Wait::Child { pid: 2, status: 0, nonblock: false });
             wait(&mut s, -1, 0, false);
@@ -471,6 +520,8 @@ mod kernel {
             assert_eq!(s.runners[0].threads.parked[0].context.result, Some(errno(Errno::Child)));
             assert!(s.runners[0].threads.parked[0].waiting.is_none());
             assert_eq!(counters(AiDomain::SpawnReceipt).released, 1);
+            terminate(&mut s, 0, UserState::Exited, 0);
+            assert_eq!(capacity::live_threads(), 1);
         }
 
         #[test]
@@ -494,6 +545,8 @@ mod kernel {
             terminate(&mut s, 1, UserState::Exited, 19);
             FAIL_IMAGE_LOAD.store(true, Ordering::SeqCst);
             assert_eq!(s.spawn_image(0, &request(), &mut FileSystem), Err(Errno::Nomem));
+            assert_eq!(capacity::live_threads(), 1,
+                       "failed image load retained its unpublished thread credit");
             assert_eq!(s.runners[1].status.pid, 3);
             assert!(!s.runners[1].status.state.active());
             assert!(receipt(&s, 3).is_none());
