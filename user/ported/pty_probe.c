@@ -129,7 +129,9 @@ int main(int argc, char **argv) {
     /* A maliciously long command must not execute its valid-looking prefix. */
     char too_long[801]; memset(too_long, 'x', sizeof too_long);
     memcpy(too_long, "write /pty-truncated ", 21); too_long[800] = '\n';
-    if (transfer(master, too_long, sizeof too_long, 1) || expect(master, "entire line discarded.")) return fail("shell long line rejection");
+    /* Consume the prompt for the rejected line before waiting for the next one. */
+    if (transfer(master, too_long, sizeof too_long, 1) ||
+        expect(master, "entire line discarded.\r\ncyxia$ ")) return fail("shell long line rejection");
     errno = 0;
     if (access("/pty-truncated", F_OK) != -1 || errno != ENOENT) return fail("truncated command was executed");
     char command[] = "write /pty-shell.txt 'real PTY shell file'\n";

@@ -1,4 +1,5 @@
 """Recovery evidence invariants; synthetic receipts do not certify guest execution."""
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +63,83 @@ class RuntimeRecovery(unittest.TestCase):
                 os_smoke.flock_recovery_input(self.disk, dict(self.current, **{field: 'changed'}))
         (self.root / 'serial.raw').write_bytes(b'changed capture')
         with self.assertRaises(ValueError): os_smoke.flock_recovery_input(self.disk, self.current)
+
+
+class StorageCheckpoint(unittest.TestCase):
+    class Console:
+        def __init__(self, previous, outcome):
+            self.raw = bytearray(previous)
+            self.outcome = outcome
+
+        def command(self, command, expected=()):
+            if command != 'storage checkpoint':
+                raise AssertionError(command)
+            start = len(self.raw)
+            self.raw.extend(self.outcome)
+            for pattern in expected:
+                self.until(pattern, start)
+            return start
+
+        def until(self, pattern, start=0):
+            match = re.search(pattern, self.raw[start:], re.MULTILINE)
+            if match is None:
+                raise ValueError('checkpoint result missing')
+            return match
+
+    def test_unchanged_checkpoint_requires_latest_matching_durability_witness(self):
+        durable = b'STORAGE_DURABLE generation=7 slot=0 bytes=1183 flushes=2 MECHANISM\r\n'
+        reused = b'STORAGE_CHECKPOINT_UNCHANGED generation=7 flushes=2\r\n'
+        self.assertEqual(os_smoke.storage_checkpoint(self.Console(durable, reused)),
+                         dict(generation=7, flushes=2, reused=True))
+        for previous in (b'', durable.replace(b'generation=7', b'generation=8'),
+                         durable + durable.replace(b'generation=7', b'generation=8')):
+            with self.subTest(previous=previous), self.assertRaises(ValueError):
+                os_smoke.storage_checkpoint(self.Console(previous, reused))
+
+
+class ParallelProcessReclamation(unittest.TestCase):
+    def test_validates_each_killed_pid_against_the_boot_profile(self):
+        class Console:
+            raw = bytearray(
+                b'USER_IMAGE_PROFILE name=test exec_pages=4096 heap_pages=65536 reserved_exec_bytes=1\r\n'
+                b'SYSTEM_CAPACITY schema=1 cpus=4 process_grant_pages=320\r\n')
+            next_pid = 16
+
+            def command(self, command, expected=()):
+                start = len(self.raw)
+                if command == 'posix spawn spin':
+                    self.raw.extend(f'USER pid={self.next_pid} started;\r\n'.encode())
+                    self.next_pid += 1
+                elif command.startswith('posix kill '):
+                    self.raw.extend(f'USER pid={command.split()[-1]} killed; pages reclaimed\r\n'.encode())
+                elif command == 'posix status':
+                    self.raw.extend(b'UserStatus { pid: 18, free_pages: 320 }\r\n')
+                elif command == 'posix list':
+                    for pid in (16, 17, 18):
+                        self.raw.extend((f'UserStatus {{ pid: {pid}, state: Killed, code: 137, free_pages: 320, '
+                                         'heap_pages: 0, heap_free: 65536, image_pages: 0, image_free: 4096, '
+                                         'thread_count: 0, heap_allocations: 0, heap_largest_free: 65536 }\r\n').encode())
+                else:
+                    raise AssertionError(command)
+                for pattern in expected:
+                    self.until(pattern, start)
+                return start
+
+            def until(self, pattern, start=0):
+                match = re.search(pattern, self.raw[start:], re.MULTILINE)
+                if match is None:
+                    raise AssertionError(f'Unmatched console pattern {pattern!r}')
+                return match
+
+        class Qmp:
+            def execute(self, command, params=None):
+                if command == 'human-monitor-command':
+                    return '\n'.join(f'CPU#{cpu}\nCPL=3' for cpu in (1, 2, 3))
+
+        with tempfile.TemporaryDirectory() as output:
+            result = os_smoke.parallel_checks(Console(), Qmp(), Path(output))
+        self.assertEqual([(row['pid'], row['free_pages']) for row in result['reclaimed']],
+                         [(16, 320), (17, 320), (18, 320)])
 
 
 if __name__ == '__main__': unittest.main()

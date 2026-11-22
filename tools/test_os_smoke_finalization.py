@@ -85,6 +85,7 @@ class CaptureFinalization(unittest.TestCase):
                     (os_smoke, 'Console', {'new': Console}),
                     (os_smoke, 'Qmp', {'new': Qmp}),
                     (os_smoke, 'verify_boot_frame', {'return_value': {'verified_pixels': 786432}}),
+                    (os_smoke, 'storage_checkpoint', {'return_value': {'generation': 1, 'flushes': 2, 'reused': False}}),
                 ]:
                     stack.enter_context(patch.object(target, name, **options))
                 result = os_smoke.capture(build, root / 'capture', qemu='/usr/bin/true')

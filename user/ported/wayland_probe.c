@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -91,9 +92,11 @@ static void global_remove(void *data, struct wl_registry *registry, uint32_t nam
 }
 static const struct wl_registry_listener registry_listener = {global, global_remove};
 
-static void ancillary_rejection(void) {
-    int pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) fail("negative socketpair");
+static void ancillary_transfer(void) {
+    int pair[2], pipe_fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) fail("ancillary socketpair");
+    if (pipe2(pipe_fds, O_NONBLOCK) || fcntl(pipe_fds[1], F_GETFD) != 0)
+        fail("ancillary pipe");
     char payload = 'X';
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control = {0};
     struct iovec iov = {.iov_base = &payload, .iov_len = 1};
@@ -103,19 +106,45 @@ static void ancillary_rejection(void) {
     header->cmsg_level = SOL_SOCKET;
     header->cmsg_type = SCM_RIGHTS;
     header->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(header), &pair[0], sizeof(int));
-    errno = 0;
-    if (sendmsg(pair[0], &message, MSG_DONTWAIT | MSG_NOSIGNAL) != -1 || errno != ENOSYS)
-        fail("ancillary must reject explicitly");
+    int invalid_fd = -1;
+    memcpy(CMSG_DATA(header), &invalid_fd, sizeof(invalid_fd));
+    if (sendmsg(pair[0], &message, MSG_DONTWAIT | MSG_NOSIGNAL) != -1 || errno != EBADF)
+        fail("ancillary invalid descriptor");
     if (recv(pair[1], &payload, 1, MSG_DONTWAIT) != -1 || errno != EAGAIN)
         fail("rejected ancillary leaked payload");
-    close(pair[0]); close(pair[1]);
-    puts("WAYLAND_PROBE ANCILLARY_REJECT no_payload=1");
+    puts("WAYLAND_PROBE ANCILLARY_REJECT bad_fd=1 no_payload=1");
+
+    payload = 'R';
+    memcpy(CMSG_DATA(header), &pipe_fds[1], sizeof(pipe_fds[1]));
+    if (sendmsg(pair[0], &message, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 || close(pipe_fds[1]))
+        fail("ancillary send and close");
+    if (read(pipe_fds[0], &payload, 1) != -1 || errno != EAGAIN)
+        fail("queued ancillary lost writer");
+
+    payload = 0;
+    memset(&control, 0, sizeof(control));
+    if (recvmsg(pair[1], &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 1 || payload != 'R' ||
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
+        fail("ancillary receive payload");
+    header = CMSG_FIRSTHDR(&message);
+    if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len != CMSG_LEN(sizeof(int)))
+        fail("ancillary receive control");
+    int received_fd;
+    memcpy(&received_fd, CMSG_DATA(header), sizeof(received_fd));
+    if (fcntl(received_fd, F_GETFD) != FD_CLOEXEC || write(received_fd, "P", 1) != 1 ||
+        read(pipe_fds[0], &payload, 1) != 1 || payload != 'P')
+        fail("ancillary received writer");
+    /* EOF with the sockets still open proves the queue released its writer reference. */
+    if (close(received_fd) || read(pipe_fds[0], &payload, 1) != 0)
+        fail("ancillary writer not released");
+    if (close(pipe_fds[0]) || close(pair[0]) || close(pair[1])) fail("ancillary cleanup");
+    puts("WAYLAND_PROBE ANCILLARY_TRANSFER cloexec=1 pipe_eof=1");
 }
 
 int main(void) {
     setbuf(stdout, NULL);
-    ancillary_rejection();
+    ancillary_transfer();
     server = wl_display_create();
     if (!server) fail("server display");
     struct wl_global *advertisement = wl_global_create(server, &wl_output_interface, 2, NULL, bind_output);
@@ -142,6 +171,6 @@ int main(void) {
         fail("server join");
     wl_global_destroy(advertisement);
     wl_display_destroy(server);
-    puts("WAYLAND_PROBE PASS upstream=1.24.0 roundtrips=2 server_threads=1 cleanup=1 render=0 fd_passing=0");
+    puts("WAYLAND_PROBE PASS upstream=1.24.0 roundtrips=2 server_threads=1 cleanup=1 render=0 fd_passing=1");
     return 0;
 }

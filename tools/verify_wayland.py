@@ -1,7 +1,7 @@
 """Verify real upstream Wayland client/server transport inside the ARM guest.
 
-This proves registry/bind/events/sync, explicit unsupported-FD rejection and
-process/thread memory reclamation. It is not a compositor or rendering gate.
+This verifies registry, binding, events, synchronization, UNIX descriptor
+transfer and process/thread reclamation. It does not measure rendering.
 """
 import argparse
 import hashlib
@@ -16,10 +16,11 @@ from verify_x11 import wait
 
 
 EXPECTED = [
-    b'WAYLAND_PROBE ANCILLARY_REJECT no_payload=1',
+    b'WAYLAND_PROBE ANCILLARY_REJECT bad_fd=1 no_payload=1',
+    b'WAYLAND_PROBE ANCILLARY_TRANSFER cloexec=1 pipe_eof=1',
     b'WAYLAND_PROBE REGISTRY globals=1 interface=wl_output version=2',
     b'WAYLAND_PROBE OUTPUT geometry=1 mode=640x480 refresh=60000 done=1 scale=1',
-    b'WAYLAND_PROBE PASS upstream=1.24.0 roundtrips=2 server_threads=1 cleanup=1 render=0 fd_passing=0',
+    b'WAYLAND_PROBE PASS upstream=1.24.0 roundtrips=2 server_threads=1 cleanup=1 render=0 fd_passing=1',
 ]
 
 

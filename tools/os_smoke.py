@@ -130,15 +130,35 @@ def native_checks(console):
     return preemption
 
 def ported_checks(console):
-    for name, marker in [('probe', b'PORTED_PROBE PASS'),
-                         ('xkbcommon-probe', b'XKBCOMMON_PROBE PASS'),
-                         ('wayland-probe', b'WAYLAND_PROBE PASS'),
-                         ('rust-std-probe', b'RUST_STD_PROBE PASS')]:
-        at = console.program('posix exec ' + name, marker)
-        if name == 'rust-std-probe':
-            console.until(b'RUST_STD_PROBE EPOLL_SIZE PASS', at)
-            for fault in ('MAPERR', 'READONLY', 'PROT_NONE'):
-                console.until(('RUST_STD_PROBE PF_' + fault + ' PASS').encode(), at)
+    from os_signal_restart import rights_snapshot
+    from verify_wayland import EXPECTED
+
+    console.program('posix exec probe', b'PORTED_PROBE PASS')
+    console.program('posix exec xkbcommon-probe', b'XKBCOMMON_PROBE PASS')
+    capacity = boot_user_capacity(console)
+    before = rights_snapshot(console)
+    pc.require(before['objects']['live'] == before['objects']['references'] == 0,
+               'Wayland probe begins with live open descriptions')
+    at = console.program('posix exec wayland-probe', EXPECTED[-1])
+    pid = console.until(rb'ELF pid=(\d+) started;', at).group(1)
+    stages = re.findall(rb'^(?:cyxia:/> )?(WAYLAND_PROBE [^\r\n]*)\r?$', console.raw[at:], re.MULTILINE)
+    pc.require(stages == EXPECTED, 'missing or reordered Wayland probe stages')
+    process, = reclaimed_processes(console, [pid], state='Exited', code=0, **capacity)
+    pc.require(process['thread_peak'] == 2 and process['thread_admissions'] == 1 and
+               process['thread_denials'] == 0, 'missing Wayland server thread lifecycle')
+    after = rights_snapshot(console)
+    pc.require(after['objects'] == before['objects'], 'Wayland probe leaked open descriptions')
+    for domain, counters in after['domains'].items():
+        pc.require(all(counters[key] - before['domains'][domain][key] == 1
+                       for key in ('granted', 'released', 'grant_units', 'release_units')),
+                   'missing Wayland descriptor transfer or release receipt: ' + domain)
+
+    at = console.program('posix exec rust-std-probe', b'RUST_STD_PROBE PASS')
+    console.until(b'RUST_STD_PROBE EPOLL_SIZE PASS', at)
+    for fault in ('MAPERR', 'READONLY', 'PROT_NONE'):
+        console.until(('RUST_STD_PROBE PF_' + fault + ' PASS').encode(), at)
+    return dict(wayland=dict(process=process, markers=[stage.decode() for stage in stages],
+                             rights_before=before, rights_after=after))
 
 def object_snapshot(console):
     from verify_fd_share import objects
@@ -146,16 +166,35 @@ def object_snapshot(console):
     console.until(rb'AI_SYSTEM_END\r?\n', at)
     return objects(bytes(console.raw[at:]))
 
-def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0, free_pages=64):
+def boot_user_capacity(console):
+    grant_pages = console.until(
+        rb'^SYSTEM_CAPACITY schema=1 [^\r\n]* process_grant_pages=([1-9]\d*)\r?\n')[1]
+    profile = console.until(rb'^USER_IMAGE_PROFILE [^\r\n]*\bexec_pages=([1-9]\d*) '
+                            rb'[^\r\n]*\bheap_pages=([1-9]\d*)\b[^\r\n]*\r?\n')
+    return dict(free_pages=int(grant_pages), exec_pages=int(profile[1]), heap_pages=int(profile[2]))
+
+def reclaimed_processes(console, pids, *, state, code, free_pages, heap_pages, exec_pages):
     from verify_ported import parse_processes
-    console.until(rb'pid=' + pid + b' ' + state.encode() + rb' code=' + str(code).encode() + rb'\b')
     at = console.command('posix list')
-    process = parse_processes(bytes(console.raw[at:]))[int(pid)]
-    for name, expected in dict(state=state, code=code, free_pages=free_pages, heap_pages=0,
-                               image_pages=0, thread_count=0, heap_free=16384,
-                               heap_allocations=0, heap_largest_free=16384,
-                               image_free=16384).items():
-        pc.require(process.get(name) == expected, 'probe did not reclaim ' + name)
+    processes = parse_processes(bytes(console.raw[at:]))
+    selected = []
+    for pid in map(int, pids):
+        process = processes.get(pid)
+        pc.require(process is not None, f'missing final process status for pid {pid}')
+        for name, expected in dict(state=state, code=code, free_pages=free_pages, heap_pages=0,
+                                   image_pages=0, thread_count=0, heap_free=heap_pages,
+                                   heap_allocations=0, heap_largest_free=heap_pages,
+                                   image_free=exec_pages).items():
+            pc.require(process.get(name) == expected, f'pid {pid} did not reclaim {name}')
+        selected.append(process)
+    return selected
+
+def reclaimed_probe(console, pid, before_objects, *, state="Exited", code=0, free_pages=None):
+    capacity = boot_user_capacity(console)
+    if free_pages is not None:
+        capacity['free_pages'] = free_pages
+    console.until(rb'pid=' + pid + b' ' + state.encode() + rb' code=' + str(code).encode() + rb'\b')
+    process, = reclaimed_processes(console, [pid], state=state, code=code, **capacity)
     after_objects = object_snapshot(console)
     pc.require(after_objects == before_objects, 'probe open descriptions were not reclaimed')
     return dict(pid=int(pid), process=process, objects_before=before_objects, objects_after=after_objects)
@@ -350,6 +389,22 @@ def embedded_images(build, manifest, names):
         embedded[name] = pc.sha_bytes(program)
     return embedded
 
+def storage_checkpoint(console):
+    durable = rb'STORAGE_DURABLE generation=([1-9]\d*) slot=\d+ bytes=[1-9]\d* flushes=(\d+) MECHANISM\r?\n'
+    unchanged = rb'STORAGE_CHECKPOINT_UNCHANGED generation=([1-9]\d*) flushes=(\d+)\r?\n'
+    start = console.command('storage checkpoint')
+    outcome = console.until(durable + b'|' + unchanged, start)
+    reused = outcome[1] is None
+    receipt = outcome.groups()[2:] if reused else outcome.groups()[:2]
+    generation, flushes = map(int, receipt)
+    pc.require(flushes >= 2, 'checkpoint lacks both device flushes')
+    if reused:
+        previous = re.findall(durable, console.raw[:start])
+        pc.require(previous and previous[-1] == receipt,
+                   'unchanged checkpoint lacks the matching durable generation')
+    return dict(generation=generation, flushes=flushes, reused=reused)
+
+
 def flock_checkpoint_proof(raw, commands):
     expected = ['write /run/user/0/boot-expired stale-session',
                 'cat /run/user/0/boot-expired', 'storage checkpoint']
@@ -394,6 +449,7 @@ def flock_recovery_input(disk, current):
                 disk_sha256=previous['disk_after_sha256'], checkpoint=checkpoint)
 
 def parallel_checks(console, qmp, output):
+    capacity = boot_user_capacity(console)
     pids = []
     for _ in range(3):
         start = console.command('posix spawn spin')
@@ -420,9 +476,9 @@ def parallel_checks(console, qmp, output):
         console.pump(); time.sleep(.005)
     for pid in pids:
         console.command('posix kill ' + pid.decode(), [rb'pid=' + pid + rb' killed; pages reclaimed'])
-    console.command('posix status', [rb'free_pages: 64\b'])
+    reclaimed = reclaimed_processes(console, pids, state='Killed', code=137, **capacity)
     return dict(cpus=[1, 2, 3], pids=[int(pid) for pid in pids], observations=attempts,
-                method='QMP stop; hardware CPL3 on all three APs; QMP cont')
+                method='QMP stop; hardware CPL3 on all three APs; QMP cont', reclaimed=reclaimed)
 
 def smithay_checks(console, qmp, output):
     """Run the existing real Smithay/Wayland lifecycle on the x86 OS transport.
@@ -491,8 +547,10 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
         build = Path(build).resolve(strict=True)
         manifest = os_x86.validate_build(build)
         pc.require('graphics' in manifest['features'], 'smoke requires the actual display build')
-        pc.require(scenario not in ('ported', 'parallel') or 'ported' in manifest['features'],
-                   'ported smoke requires actual target program catalog')
+        pc.require(scenario not in ('ported', 'parallel') or ('ported' in manifest['features'] and
+                   all(name + '.elf' in manifest['external_inputs'] for name in
+                       ('probe', 'xkbcommon-probe', 'wayland-probe', 'rust-std-probe'))),
+                   'ported smoke requires the C, XKB, Wayland and Rust std probes in the build catalog')
         pc.require(not egl or 'mesa-probe' in manifest['features'], 'EGL smoke requires the actual Mesa image')
         pc.require(scenario != 'smithay' or 'smithay-dynamic-probe' in manifest['features'],
                    'Smithay smoke requires actual server/client target images')
@@ -637,7 +695,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 console.command('cat /v17/hello', [rb'^x86-os-persistence\r?$'])
                 if scenario in ('native', 'ported', 'parallel'):
                     result['native_preemption'] = native_checks(console)
-                if scenario in ('ported', 'parallel'): ported_checks(console)
+                if scenario in ('ported', 'parallel'): result['ported'] = ported_checks(console)
                 if scenario == 'parallel': result['parallel_user'] = parallel_checks(console, qmp, output)
                 if scenario == 'smithay': result['smithay'] = smithay_checks(console, qmp, output)
                 if scenario == 'xkb-rules':
@@ -779,7 +837,7 @@ def capture(build, output, *, scenario='core', recover_disk=None, egl=False, qem
                 # fsync calls. A later operator checkpoint would mask a stale
                 # syscall snapshot when the same disk is rebooted.
                 if not recover_disk and scenario not in ('dbus', 'fsync', 'fsync-concurrent', 'cosmic-config', 'cosmic-config-library'):
-                    console.command('storage checkpoint', [rb'STORAGE_DURABLE generation=\d+ .*flushes=(?:[2-9]|[1-9][0-9]+)\b'])
+                    result['checkpoint'] = storage_checkpoint(console)
                     if scenario == 'flock':
                         result['runtime_checkpoint'] = flock_checkpoint_proof(bytes(console.raw), console.commands)
                 qmp.execute('screendump', {'filename': str(output / 'display.ppm')})

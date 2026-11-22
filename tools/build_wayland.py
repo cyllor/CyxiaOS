@@ -227,7 +227,7 @@ def main():
                       'builder_sha256': digest(Path(__file__)), 'toolchain': builder.tools,
                       'commands': builder.commands, 'guest_execution': 'not performed',
                       'limitations': ['No compositor or COSMIC desktop is built.',
-                                      'No wl_shm, ancillary FD transfer, EGL rendering or GPU acceleration is claimed.']}
+                                      'No wl_shm, EGL rendering or GPU acceleration is claimed.']}
             try:
                 if args.bootstrap_libffi:
                     report['libffi_producer'] = build_libffi(builder, args.fetch)
