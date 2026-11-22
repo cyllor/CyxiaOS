@@ -136,6 +136,8 @@ fn full_dirty_continues(budget: usize) {
     let mut scratch = [0; 8192];
     let mut fs = FileSystem::<512>::new();
     fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+    fs.initialize_business(&mut journal, &mut disk, &mut scratch)
+        .unwrap();
     fs.set_cache_partition(budget, 16).unwrap();
     fs.create("/pressure", &mut journal, &mut disk, &mut scratch)
         .unwrap();
@@ -257,6 +259,8 @@ fn required_writeback_does_not_bypass_exhausted_real_completion_credits() {
         let mut scratch = [0; 8192];
         let mut fs = FileSystem::<512>::new();
         fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        fs.initialize_business(&mut journal, &mut disk, &mut scratch)
+            .unwrap();
         fs.set_cache_partition(16, 16).unwrap();
         fs.create("/credits", &mut journal, &mut disk, &mut scratch)
             .unwrap();

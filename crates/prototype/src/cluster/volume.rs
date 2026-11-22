@@ -1,16 +1,17 @@
-//! Two ordinary contiguous growing files reserve sixteen MiB. Append and inode,
-//! allocation and directory publication share one journal transaction.
+//! Two system files use a fixed, format-time sixteen MiB reservation.
+//! Logical used lengths grow atomically with redo data, outside business snapshots.
 use crate::{
     journal::{self, AfterImage, BlockDevice, Journal, Scratch},
     storage::{
-        self, BITMAP_START, BLOCK_SIZE, DATA_START, DirectoryEntry, Extent, INODE_START, Inode,
-        InodeKind,
+        self, BITMAP_START, BLOCK_SIZE, CLUSTER_INODES, DirectoryEntry, Extent, INODE_START, Inode,
+        InodeKind, SYSTEM_ROOT_BLOCK, SYSTEM_ROOT_INODE,
     },
 };
 pub type VolumeScratch = [[u8; 4096]; 16];
 pub const NAMES: [&str; 2] = [".cyxia-cluster-a", ".cyxia-cluster-b"];
-pub const FILE_BLOCKS: u32 = 2048;
-pub const START: u32 = DATA_START + 2;
+pub const FILE_BLOCKS: u32 = storage::CLUSTER_FILE_BLOCKS;
+pub const START: u32 = storage::CLUSTER_START;
+const INODE_BLOCK: u32 = INODE_START + SYSTEM_ROOT_INODE / 16;
 pub const CLOSE_RESERVE: u64 = 1024 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<E> {
@@ -39,20 +40,46 @@ impl Volume {
         s: &mut Scratch,
         w: &mut VolumeScratch,
     ) -> Result<Self, Error<D::Error>> {
-        j.read_block(d, INODE_START, &mut w[0], s)
+        j.read_block(d, INODE_BLOCK, &mut w[0], s)
             .map_err(Error::Journal)?;
+        j.read_block(d, BITMAP_START, &mut w[13], s)
+            .map_err(Error::Journal)?;
+        j.read_block(d, SYSTEM_ROOT_BLOCK, &mut w[14], s)
+            .map_err(Error::Journal)?;
+        let root = Inode::decode(SYSTEM_ROOT_INODE, &w[0][..256]).map_err(Error::Format)?;
+        if root.size != 4 * 128
+            || root.extent_count != 1
+            || root.extents[0]
+                != (Extent {
+                    logical_start: 0,
+                    physical_start: SYSTEM_ROOT_BLOCK,
+                    block_count: 1,
+                })
+        {
+            return Err(Error::Layout);
+        }
         let mut sizes = [0; 2];
         for (i, size) in sizes.iter_mut().enumerate() {
-            let id = i + 2;
-            let f =
-                Inode::decode(id as u32, &w[0][id * 256..id * 256 + 256]).map_err(Error::Format)?;
-            if f.kind == InodeKind::Free {
-                continue;
-            }
-            if !valid_file(i, &f) {
+            let id = CLUSTER_INODES[i];
+            let at = (id % 16) as usize * 256;
+            let f = Inode::decode(id, &w[0][at..at + 256]).map_err(Error::Format)?;
+            if !valid_file(i, &f)
+                || DirectoryEntry::decode(&w[14][(i + 1) * 128..(i + 2) * 128])
+                    .map_err(Error::Format)?
+                    != (DirectoryEntry {
+                        inode_id: id,
+                        inode_generation: f.generation,
+                        name: NAMES[i],
+                    })
+            {
                 return Err(Error::Layout);
             }
             *size = f.size;
+        }
+        for block in START..START + 2 * FILE_BLOCKS {
+            if w[13][block as usize / 8] & (1 << (block % 8)) == 0 {
+                return Err(Error::Layout);
+            }
         }
         Ok(Self { sizes })
     }
@@ -115,21 +142,18 @@ impl Volume {
             let at = old as usize % BLOCK_SIZE + i;
             w[at / BLOCK_SIZE][at % BLOCK_SIZE] = *byte;
         }
-        j.read_block(d, INODE_START, &mut w[12], s)
+        j.read_block(d, INODE_BLOCK, &mut w[12], s)
             .map_err(Error::Journal)?;
         j.read_block(d, BITMAP_START, &mut w[13], s)
             .map_err(Error::Journal)?;
-        j.read_block(d, DATA_START, &mut w[14], s)
-            .map_err(Error::Journal)?;
-        let id = (file + 2) as u32;
-        let at = id as usize * 256;
+        let id = CLUSTER_INODES[file];
+        let at = (id % 16) as usize * 256;
         let mut inode = Inode::decode(id, &w[12][at..at + 256]).map_err(Error::Format)?;
-        let fresh = inode.kind == InodeKind::Free;
-        if (!fresh && (!valid_file(file, &inode) || inode.size != old)) || (fresh && old != 0) {
+        if !valid_file(file, &inode) || inode.size != old {
             return Err(Error::Layout);
         }
         inode.kind = InodeKind::File;
-        inode.parent_inode = 0;
+        inode.parent_inode = SYSTEM_ROOT_INODE;
         inode.parent_generation = 1;
         inode.size = new;
         inode.durable_write_seq = inode
@@ -147,44 +171,12 @@ impl Volume {
             .map_err(Error::Format)?;
         for block in old.div_ceil(BLOCK_SIZE as u64) as u32..inode.extents[0].block_count {
             let n = START + file as u32 * FILE_BLOCKS + block;
-            let index = n as usize / 8;
-            if w[13][index] & (1 << (n % 8)) != 0 {
+            if w[13][n as usize / 8] & (1 << (n % 8)) == 0 {
                 return Err(Error::Layout);
             }
-            w[13][index] |= 1 << (n % 8);
-        }
-        if fresh {
-            let mut root = Inode::decode(0, &w[12][..256]).map_err(Error::Format)?;
-            if root.kind != InodeKind::Directory
-                || root.extent_count == 0
-                || root.extents[0].physical_start != DATA_START
-                || root.size < 128
-            {
-                return Err(Error::Layout);
-            }
-            let slot = (file + 1) * 128;
-            if slot < root.size as usize
-                && DirectoryEntry::decode(&w[14][slot..slot + 128]).map_err(Error::Format)?
-                    != DirectoryEntry::EMPTY
-            {
-                return Err(Error::Layout);
-            }
-            root.size = root.size.max((file as u64 + 2) * 128);
-            root.durable_write_seq = root
-                .durable_write_seq
-                .checked_add(1)
-                .ok_or(Error::Capacity)?;
-            root.encode(0, &mut w[12][..256]).map_err(Error::Format)?;
-            DirectoryEntry {
-                inode_id: id,
-                inode_generation: inode.generation,
-                name: NAMES[file],
-            }
-            .encode(&mut w[14][(file + 1) * 128..(file + 2) * 128])
-            .map_err(Error::Format)?;
         }
         let mut images = [AfterImage {
-            home_block: INODE_START,
+            home_block: INODE_BLOCK,
             bytes: &w[12],
         }; 15];
         for i in 0..count {
@@ -194,22 +186,14 @@ impl Volume {
             };
         }
         images[count] = AfterImage {
-            home_block: INODE_START,
+            home_block: INODE_BLOCK,
             bytes: &w[12],
         };
-        images[count + 1] = AfterImage {
-            home_block: BITMAP_START,
-            bytes: &w[13],
-        };
-        images[count + 2] = AfterImage {
-            home_block: DATA_START,
-            bytes: &w[14],
-        };
-        let needed = (count as u32 + 3) * 2 + 2;
+        let needed = (count as u32 + 1) * 2 + 2;
         if j.remaining_log_blocks() < needed {
             j.checkpoint(d, s).map_err(Error::Journal)?;
         }
-        j.commit(d, &images[..count + 3], s)
+        j.commit(d, &images[..count + 1], s)
             .map_err(Error::Journal)?;
         self.sizes[file] = new;
         Ok(())
@@ -279,16 +263,23 @@ impl Volume {
     }
 }
 pub(crate) fn valid_file(i: usize, f: &Inode) -> bool {
-    f.kind == InodeKind::File
-        && f.size > 0
+    i < 2
+        && f.kind == InodeKind::File
+        && f.generation == 1
         && f.size <= 8 * 1024 * 1024
-        && f.parent_inode == 0
+        && f.parent_inode == SYSTEM_ROOT_INODE
         && f.parent_generation == 1
-        && f.extent_count == 1
-        && f.extents[0]
-            == (Extent {
-                logical_start: 0,
-                physical_start: START + i as u32 * FILE_BLOCKS,
-                block_count: f.size.div_ceil(BLOCK_SIZE as u64) as u32,
-            })
+        && f.ext_block == 0
+        && f.ext_count == 0
+        && if f.size == 0 {
+            f.extent_count == 0 && f.extents == [Extent::EMPTY; 16] && f.durable_write_seq == 0
+        } else {
+            f.extent_count == 1
+                && f.extents[0]
+                    == (Extent {
+                        logical_start: 0,
+                        physical_start: START + i as u32 * FILE_BLOCKS,
+                        block_count: f.size.div_ceil(BLOCK_SIZE as u64) as u32,
+                    })
+        }
 }

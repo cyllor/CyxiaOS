@@ -91,6 +91,9 @@ impl BatchedBlock {
     pub fn capacity(&self) -> usize {
         self.queue.capacity()
     }
+    pub fn is_quiescent(&self) -> bool {
+        !self.failed && self.pending.iter().all(Option::is_none) && self.queue.is_quiescent()
+    }
     pub fn free(&self) -> usize {
         self.queue.free()
     }
@@ -327,6 +330,7 @@ mod tests {
     #[test]
     fn real_four_sector_batch_retains_buffers_through_ack() {
         let (mut b, p, m) = fixture();
+        assert!(b.is_quiescent());
         b.set_notify_policy(4, 9, 1_000_000, 0).unwrap();
         let mut ts = [Token {
             slot: 0,
@@ -338,6 +342,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(b.notify_stats().doorbells, 1);
+        assert!(!b.is_quiescent());
         assert_eq!(b.notify_stats().last_completed_version, 0);
         unsafe {
             complete(m, ts[2].slot, true, 0);
@@ -350,6 +355,7 @@ mod tests {
         assert_eq!(c.notify_version, 9);
         b.acknowledge(c.token).unwrap();
         assert_eq!(b.free(), 5);
+        assert!(!b.is_quiescent());
     }
     #[test]
     fn predeadline_empty_poll_cannot_timeout_after_completion_during_ack() {
@@ -366,8 +372,13 @@ mod tests {
         assert_eq!(completion.token, token);
         assert_eq!(out, [0x5a; 512]);
         assert_eq!(b.notify_stats().errors, 0);
+        assert!(
+            !b.is_quiescent(),
+            "completion still owns DMA until acknowledge"
+        );
         b.acknowledge(token).unwrap();
         assert_eq!(b.free(), b.capacity());
+        assert!(b.is_quiescent());
     }
     #[test]
     fn empty_queue_observed_after_original_deadline_still_times_out() {
@@ -379,6 +390,7 @@ mod tests {
         assert_eq!(b.poll(&mut [0; 512], &p), Ok(None));
         p.clock.set(250_000_000);
         assert_eq!(b.poll(&mut [0; 512], &p), Err(Error::Timeout));
+        assert!(!b.is_quiescent());
         assert_eq!(b.free(), b.capacity() - 1);
         assert!(b.acknowledge(token).is_err());
         assert_eq!(

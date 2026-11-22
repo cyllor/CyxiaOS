@@ -69,12 +69,15 @@ fn boot_counter_recovers_from_journal_without_home_checkpoint() {
         .unwrap();
     assert_eq!(first.epoch, 1);
     assert_eq!(first.filesystem, [7; 16]);
-    assert!(!disk.durable.contains_key(&(DATA_START + 1)));
+    assert_eq!(
+        &disk.durable[&(DATA_START + 1)][24..32],
+        &0_u64.to_le_bytes()
+    );
     disk.crash();
     let mut journal = Journal::new();
     let recovery = journal.mount(&mut disk, &mut [0; 8192]).unwrap();
     assert_eq!(recovery.committed_transactions, 1);
-    assert_eq!(recovery.replayed_blocks, 4);
+    assert_eq!(recovery.replayed_blocks, 2);
     let second = BootSession::new()
         .allocate(
             &mut journal,
@@ -225,7 +228,7 @@ fn lost_second_flush_response_preserves_unknown_and_recovers_committed_epoch() {
 
 #[test]
 fn counter_exhaustion_never_wraps_or_mutates_storage() {
-    use cyxia_prototype::storage::{INODE_START, Inode, crc32c};
+    use cyxia_prototype::storage::{BOOT_INODE, INODE_START, Inode, SYSTEM_ROOT_INODE, crc32c};
     let (mut disk, mut journal) = fixture();
     BootSession::new()
         .allocate(
@@ -236,10 +239,13 @@ fn counter_exhaustion_never_wraps_or_mutates_storage() {
         )
         .unwrap();
     journal.checkpoint(&mut disk, &mut [0; 8192]).unwrap();
-    let table = disk.durable.get_mut(&INODE_START).unwrap();
-    let mut inode = Inode::decode(1, &table[256..512]).unwrap();
+    let table = disk
+        .durable
+        .get_mut(&(INODE_START + SYSTEM_ROOT_INODE / 16))
+        .unwrap();
+    let mut inode = Inode::decode(BOOT_INODE, &table[256..512]).unwrap();
     inode.durable_write_seq = u64::MAX;
-    inode.encode(1, &mut table[256..512]).unwrap();
+    inode.encode(BOOT_INODE, &mut table[256..512]).unwrap();
     let body = disk.durable.get_mut(&(DATA_START + 1)).unwrap();
     body[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
     let crc = crc32c(&body[..32]);

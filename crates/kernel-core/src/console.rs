@@ -68,6 +68,11 @@ impl<const N: usize> OutputQueue<N> {
         Ok(done)
     }
 }
+impl<const N: usize> Default for OutputQueue<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     extern crate std;

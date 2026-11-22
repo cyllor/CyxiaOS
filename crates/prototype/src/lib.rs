@@ -10,6 +10,7 @@ pub mod cores;
 pub mod journal;
 pub mod learning;
 pub mod model;
+pub mod snapshot;
 pub mod storage;
 
 pub mod cluster;

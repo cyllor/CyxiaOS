@@ -139,7 +139,7 @@ impl Page {
         let mut at = 0;
         // Wide volatile stores must stay 8-aligned for architectures that trap
         // unaligned device accesses, so emit the leading bytes individually.
-        while at < bytes.len() && (offset + at) % 8 != 0 {
+        while at < bytes.len() && !(offset + at).is_multiple_of(8) {
             self.put8(offset + at, bytes[at]);
             at += 1;
         }
@@ -149,8 +149,8 @@ impl Page {
             chunk.copy_from_slice(&bytes[at + step..at + step + 8]);
             self.put64(offset + at + step, u64::from_le_bytes(chunk));
         }
-        for index in at + wide..bytes.len() {
-            self.put8(offset + index, bytes[index]);
+        for (index, &byte) in bytes.iter().enumerate().skip(at + wide) {
+            self.put8(offset + index, byte);
         }
     }
     fn put8(&self, offset: usize, value: u8) {

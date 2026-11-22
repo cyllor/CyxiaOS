@@ -41,6 +41,18 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core -p cyxia-prototype -p cyxia-peer-billing -p cyxia-arch-x86_64 -p cyxia-platform-pc -p cyxia-arch --features cyxia-prototype/hardware-sha256
           python3 -B -m unittest discover -s tools -p test_x86_64.py -v
           python3 -B -m unittest discover -s tools -p test_verify_v17_a03_demand.py -v
+      - name: Immutable journal snapshots and file capabilities
+        env:
+          PYTHONPATH: tools:tests/host
+        run: |
+          python3 -B -m unittest \
+            tests.host.test_v13_disk \
+            tests.host.test_v13_filesystem \
+            tests.host.test_v2_filesystem \
+            tests.host.test_snapshot_file_abi \
+            tests.host.test_snapshot_capability_custody \
+            tests.host.test_snapshot_probe_budget \
+            tools.test_snapshot_probe -v
       - name: COSMIC and POSIX host regressions
         env:
           PYTHONPATH: tools:tests/host

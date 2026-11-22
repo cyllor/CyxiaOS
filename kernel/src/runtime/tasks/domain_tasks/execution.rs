@@ -4,6 +4,62 @@ use cyxia_prototype::domains::tasks::ThreadReservation;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 
+// Dedicated opt-in evidence. Each role's actual task key is bound at root
+// admission; cleanup publishes its real exit code only after pending work and
+// task resources have retired. This is not an EL0-writable success marker.
+// Schema 2 uses words 12..16 for the first consumed CPU0 budget failure:
+// stage, dispatch sequence (published last), actual ns, reserved ns.
+#[cfg(snapshot_probe)]
+#[used]
+#[unsafe(no_mangle)]
+static SNAPSHOT_PROBE_EVIDENCE: [AtomicU64; 16] = [
+    AtomicU64::new(0x4359534e415031),
+    AtomicU64::new(2),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(snapshot_probe)]
+fn bind_snapshot_probe(role: u64, key: ObjectKey) {
+    let at = role as usize * 4;
+    SNAPSHOT_PROBE_EVIDENCE[at].store(key.id, Ordering::Relaxed);
+    SNAPSHOT_PROBE_EVIDENCE[at + 1].store(key.generation, Ordering::Release);
+}
+#[cfg(snapshot_probe)]
+fn snapshot_probe_exited(key: ObjectKey, code: u64) {
+    for at in [4, 8] {
+        if SNAPSHOT_PROBE_EVIDENCE[at].load(Ordering::Acquire) == key.id
+            && SNAPSHOT_PROBE_EVIDENCE[at + 1].load(Ordering::Acquire) == key.generation
+        {
+            SNAPSHOT_PROBE_EVIDENCE[at + 3].store(code, Ordering::Relaxed);
+            SNAPSHOT_PROBE_EVIDENCE[at + 2].store(1, Ordering::Release);
+        }
+    }
+}
+#[cfg(snapshot_probe)]
+pub(super) fn snapshot_probe_service_overrun(sequence: u64, actual: u64, reserved: u64) {
+    // The task owner has already settled this exact dispatch as Budget.
+    // Diagnostics never authorize another turn or alter quarantine.
+    if SNAPSHOT_PROBE_EVIDENCE[13].load(Ordering::Acquire) == 0 {
+        SNAPSHOT_PROBE_EVIDENCE[12]
+            .store(crate::unified::completed_service_stage(), Ordering::Relaxed);
+        SNAPSHOT_PROBE_EVIDENCE[14].store(actual, Ordering::Relaxed);
+        SNAPSHOT_PROBE_EVIDENCE[15].store(reserved, Ordering::Relaxed);
+        SNAPSHOT_PROBE_EVIDENCE[13].store(sequence, Ordering::Release);
+    }
+}
+
 struct Creator<'a> {
     tasks: &'a mut [Task; TASKS],
     launches: &'a [Launch; LAUNCHES],
@@ -291,10 +347,48 @@ impl Creator<'_> {
             context.pc = 0x10000;
             context.sp = 0x41000;
             if client {
-                let file =
-                    crate::domain_file_abi::grant(key, crate::domain_file_abi::abi::ALL_RIGHTS)?;
+                let rights = crate::domain_file_abi::abi::ALL_RIGHTS;
+                #[cfg(snapshot_probe)]
+                let rights = {
+                    if r.caller != KERNEL_CALLER || launch.len != 8 {
+                        return Err(Error::Auth);
+                    }
+                    match u64::from_le_bytes(launch.input[..8].try_into().unwrap()) {
+                        1 => rights,
+                        2 => crate::domain_file_abi::abi::RIGHT_READ,
+                        _ => return Err(Error::Auth),
+                    }
+                };
+                let file = crate::domain_file_abi::grant(key, rights)?;
                 context.regs[0] = file.id;
                 context.regs[1] = file.generation;
+                #[cfg(snapshot_probe)]
+                {
+                    use crate::domain_file_abi::{self as files, abi::snapshot as rights};
+                    let uuid = crate::domain_storage::snapshot_uuid()?;
+                    let snapshot = if u64::from_le_bytes(launch.input[..8].try_into().unwrap()) == 1
+                    {
+                        files::grant_snapshots(
+                            key,
+                            uuid,
+                            0,
+                            1,
+                            rights::RIGHT_CREATE | rights::RIGHT_LIST | rights::RIGHT_HISTORY_READ,
+                            "/snapshot-probe",
+                        )?
+                    } else {
+                        files::grant_snapshot_recovery(
+                            key,
+                            uuid,
+                            15,
+                            1,
+                            rights::RIGHT_LIST | rights::RIGHT_RESTORE | rights::RIGHT_PROTECTION,
+                            "",
+                        )?
+                    };
+                    context.regs[2] = snapshot.id;
+                    context.regs[3] = snapshot.generation;
+                }
             } else {
                 context.regs[0] = cap;
                 context.regs[1] = inherited.id;
@@ -917,6 +1011,8 @@ fn cleanup_inner(s: &mut State, i: usize) -> Result<(), Error> {
     if s.probe_key == Some(key) {
         s.probe_exit = Some(s.tasks[i].exit_code);
     }
+    #[cfg(snapshot_probe)]
+    snapshot_probe_exited(key, s.tasks[i].exit_code);
     if let Some(slot) = exit_slot {
         s.exits[slot] = Some(ExitRecord {
             key,
@@ -1408,6 +1504,8 @@ fn service_vectors() {
     // opportunity each pump pass. One opportunity still calls exactly one
     // policy-bounded batch; it cannot enlarge that policy or borrow file credit.
     let _ = service_segment(|| {
+        #[cfg(snapshot_probe)]
+        diagnostic_service_stage(75);
         locked(|s| {
             let next = (0..TASKS)
                 .map(|n| (s.vector_cursor + n) % TASKS)
@@ -1633,7 +1731,7 @@ fn process_return_inner(s: &mut State, i: usize, c: &mut user::Context) {
             state = RunState::Exited;
         }
     } else if c.kind == 8 && c.esr >> 26 == 0x15 && c.esr & 0xffff == 0x45 {
-        if c.regs[8] == 0x40 {
+        if matches!(c.regs[8], 0x40 | 0x50) {
             s.tasks[i].life = Life::Waiting;
             state = RunState::Blocked;
             FILE_PENDING[i].store(true, Ordering::Release);
@@ -1789,6 +1887,8 @@ pub fn service_io_piece<R>(
         crate::learning_evidence::observe_service_io(attempt, cpu_started);
     }
     let mut resume = || {
+        #[cfg(snapshot_probe)]
+        let suspended_stage = crate::unified::current_service_stage();
         let (first_ns, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
         if let Some(mut attempt) = capture.take() {
             let _ = crate::learning_evidence::finish_attempt(&mut attempt, first_ns, finished_ns);
@@ -1798,6 +1898,8 @@ pub fn service_io_piece<R>(
             progress();
             if begin_service_segment().is_some() && revalidate_service_segment() {
                 cpu_started = timer::cpu_ticks();
+                #[cfg(snapshot_probe)]
+                crate::unified::service_stage(suspended_stage);
                 capture = source.and_then(|key| {
                     crate::learning_evidence::attempt(
                         key,
@@ -1825,6 +1927,8 @@ pub fn service_io_piece<R>(
 
 fn service_file(progress: &mut dyn FnMut()) {
     let Some(next) = service_segment(|| {
+        #[cfg(snapshot_probe)]
+        diagnostic_service_stage(76);
         locked(|s| {
             // A completed but undelivered receipt owns the file staging buffer.
             // Deliver it before admitting another caller, regardless of slot order.
@@ -1881,7 +1985,11 @@ fn service_file(progress: &mut dyn FnMut()) {
         return;
     }
     let mut segment_started = timer::cpu_ticks();
+    #[cfg(snapshot_probe)]
+    diagnostic_service_stage(77);
     let mut file_progress = || {
+        #[cfg(snapshot_probe)]
+        let suspended_stage = crate::unified::current_service_stage();
         let (_, finished_ns, actual_ns) = finish_cpu_interval(segment_started);
         let _ = complete_builtin(0, actual_ns, finished_ns);
         // The operation remains in custody across budget windows. Completion,
@@ -1891,6 +1999,8 @@ fn service_file(progress: &mut dyn FnMut()) {
             progress();
             if matches!(begin_file_credit(key), Ok(Some(_))) {
                 segment_started = timer::cpu_ticks();
+                #[cfg(snapshot_probe)]
+                crate::unified::service_stage(suspended_stage);
                 break;
             }
             core::hint::spin_loop();
@@ -2634,6 +2744,61 @@ pub fn start_storage_client(role: u64) -> Result<ObjectKey, Error> {
         match s.admission.query(KERNEL_CALLER, id)? {
             SpawnState::Created(key) => Ok(key),
             SpawnState::Failed(e) => Err(e),
+            _ => Err(Error::Again),
+        }
+    })
+}
+#[cfg(snapshot_probe)]
+pub fn start_snapshot_client(role: u64) -> Result<ObjectKey, Error> {
+    if !SELFTEST_ENABLED || !(1..=2).contains(&role) || cpu::slot() != 0 {
+        return Err(Error::Auth);
+    }
+    locked(|s| {
+        let id = 0xd0a15000 + role;
+        match s.admission.query(KERNEL_CALLER, id) {
+            Ok(SpawnState::Created(key)) => {
+                bind_snapshot_probe(role, key);
+                if role == 1 {
+                    s.probe_key = Some(key);
+                }
+                return Ok(key);
+            }
+            Ok(SpawnState::Failed(error)) => return Err(error),
+            Ok(SpawnState::Cancelled) => return Err(Error::Conflict),
+            Ok(_) => (),
+            Err(Error::NotFound) => {
+                let deadline = now_ns()
+                    .checked_add(60_000_000_000)
+                    .ok_or(Error::Overflow)?;
+                s.facts.attempts = s.facts.attempts.saturating_add(1);
+                s.facts.spawn[3].add(now_ns(), 1);
+                if let SpawnState::Failed(error) = submit_package(
+                    s,
+                    CLIENT_PACKAGE,
+                    KERNEL_CALLER,
+                    id,
+                    group(4),
+                    &role.to_le_bytes(),
+                    3,
+                    deadline,
+                    false,
+                    0,
+                )? {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        advance_admission(s)?;
+        match s.admission.query(KERNEL_CALLER, id)? {
+            SpawnState::Created(key) => {
+                bind_snapshot_probe(role, key);
+                if role == 1 {
+                    s.probe_key = Some(key);
+                }
+                Ok(key)
+            }
+            SpawnState::Failed(error) => Err(error),
             _ => Err(Error::Again),
         }
     })

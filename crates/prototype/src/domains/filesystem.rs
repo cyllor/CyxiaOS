@@ -1,22 +1,24 @@
-//! Ordinary bounded files on the same redo journal as BootEpoch and contracts.
+//! Bounded immutable business views over the shared ordered-data redo journal.
 //! Mutable journal/disk ownership is borrowed per operation, never duplicated.
 use super::{Action, Error, ObjectKey, PolicyStamp};
 use crate::journal::{self, AfterImage, BlockDevice, Journal, Scratch};
 use crate::storage::{
-    BITMAP_START, BLOCK_SIZE, DATA_START, DirectoryEntry, Extent, INODE_START, Inode, InodeKind,
-    MAX_FILE_SIZE, TOTAL_BLOCKS,
+    BITMAP_START, BLOCK_SIZE, BOOT_INODE, BUSINESS_INODE_COUNT, DATA_START, DirectoryEntry, Extent,
+    ExtentBlock, FIRST_BUSINESS_BLOCK, INODE_START, Inode, InodeKind, MAX_EXTENTS, MAX_FILE_SIZE,
+    SYSTEM_ROOT_INODE, TOTAL_BLOCKS,
 };
+mod cow;
+mod snapshots;
 mod validation;
-pub use validation::validate_volume;
+pub use validation::{GC_SCRATCH_BYTES, validate_volume};
 
 pub const MAX_PATH: usize = 512;
 pub const MAX_IO: usize = 65536;
-pub const FIRST_ORDINARY_INODE: usize = 4;
-pub const FIRST_ORDINARY_BLOCK: u32 =
-    crate::cluster::volume::START + 2 * crate::cluster::volume::FILE_BLOCKS;
+pub const FIRST_ORDINARY_INODE: usize = 1;
+pub const FIRST_ORDINARY_BLOCK: u32 = FIRST_BUSINESS_BLOCK;
 const MAP_BYTES: usize = TOTAL_BLOCKS as usize / 8;
 const TX_CAPACITY: usize = 40;
-pub const BACKGROUND_RESERVATION_BYTES: u64 = (2 + 2 * TX_CAPACITY as u64) * BLOCK_SIZE as u64;
+pub const BACKGROUND_RESERVATION_BYTES: u64 = (2 + 3 * TX_CAPACITY as u64) * BLOCK_SIZE as u64;
 /// Already accepted dirty pages need bounded writeback when a shrinking quota
 /// owns debt, or when the exact quota contains no clean replacement page.
 /// This grants no new cache capacity and earns no optional policy receipt.
@@ -32,6 +34,8 @@ const EMPTY_INODE: Inode = Inode {
     parent_inode: 0,
     parent_generation: 0,
     extents: [Extent::EMPTY; 16],
+    ext_block: 0,
+    ext_count: 0,
 };
 fn journal_error<E>(error: journal::Error<E>) -> Error {
     match error {
@@ -66,7 +70,13 @@ struct Open {
     object_generation: u64,
     generation: u64,
     mode: OpenMode,
+    live_epoch: u64,
+    frozen: Option<usize>,
 }
+/// Per-slot core custody, including the vacant-slot discriminant. Native file
+/// brokers must include this amount in their combined 128-byte handle budget.
+pub const HANDLE_STORAGE_BYTES: usize = core::mem::size_of::<Option<Open>>();
+const _: () = assert!(HANDLE_STORAGE_BYTES <= 128);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stat {
     pub object: ObjectKey,
@@ -88,6 +98,7 @@ pub struct SyncReceipt {
     pub object: ObjectKey,
     pub write_seq: u64,
     pub transactions: u32,
+    pub live_view_epoch: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlushReceipt {
@@ -120,7 +131,14 @@ struct Cache {
     inode: usize,
     logical: u32,
     physical: u32,
+    extent_reservation: u32,
 }
+const _: () = assert!(core::mem::size_of::<Cache>() <= 32);
+// Committed inode sizes are CoW version records alongside page reservations.
+// Count every cache record, including its preexisting fields, and all inode
+// version counters against the 128 KiB maximum at the 4096-page native limit.
+const _: () =
+    assert!(4096 * core::mem::size_of::<Cache>() + 256 * core::mem::size_of::<u64>() <= 128 * 1024);
 impl Cache {
     const EMPTY: Self = Self {
         valid: false,
@@ -130,6 +148,7 @@ impl Cache {
         inode: 0,
         logical: 0,
         physical: 0,
+        extent_reservation: 0,
     };
 }
 #[repr(C, align(4096))]
@@ -142,7 +161,11 @@ pub struct FileSystem<const CACHE: usize = 64> {
     inodes: [Inode; 256],
     bitmap: [u8; MAP_BYTES],
     write_seq: [u64; 256],
-    handles: [Option<Open>; 64],
+    committed_size: [u64; 256],
+    handles: [Option<Open>; 128],
+    frozen: [Option<snapshots::Frozen>; 64],
+    snapshots: crate::snapshot::Manager,
+    capture_barrier: Option<crate::snapshot::FileReqKey>,
     handle_generation: u64,
     cache: [Cache; CACHE],
     resident: usize,
@@ -178,7 +201,11 @@ impl<const C: usize> FileSystem<C> {
             inodes: [EMPTY_INODE; 256],
             bitmap: [0; MAP_BYTES],
             write_seq: [0; 256],
-            handles: [None; 64],
+            committed_size: [0; 256],
+            handles: [None; 128],
+            frozen: [None; 64],
+            snapshots: crate::snapshot::Manager::new(),
+            capture_barrier: None,
             handle_generation: 0,
             cache: [Cache::EMPTY; C],
             resident: 0,
@@ -258,12 +285,17 @@ impl<const C: usize> FileSystem<C> {
             s,
             (&mut self.tx[..4]).try_into().unwrap(),
         )?;
-        if self.inodes[1].kind == InodeKind::Free {
+        if self.inodes[BOOT_INODE as usize].kind == InodeKind::Free {
             return Err(Error::NotReady);
         }
         for i in 0..256 {
             self.write_seq[i] = self.inodes[i].durable_write_seq;
+            self.committed_size[i] = self.inodes[i].size;
         }
+        self.snapshots
+            .mount(j, d, s, &mut self.tx)
+            .map_err(snapshots::snapshot_error)?;
+        self.validate_snapshot_roots(j, d, s)?;
         self.ready = true;
         Ok(())
     }
@@ -454,27 +486,7 @@ impl<const C: usize> FileSystem<C> {
             .find(|b| !self.allocated(*b) && !excluded.contains(b))
             .ok_or(Error::Capacity)
     }
-    fn append_block(inode: &mut Inode, block: u32) -> Result<(), Error> {
-        let count = usize::from(inode.extent_count);
-        let logical = inode.extents[..count].iter().map(|e| e.block_count).sum();
-        if count > 0
-            && inode.extents[count - 1].physical_start + inode.extents[count - 1].block_count
-                == block
-        {
-            inode.extents[count - 1].block_count += 1;
-            return Ok(());
-        }
-        if count == 16 {
-            return Err(Error::Capacity);
-        }
-        inode.extents[count] = Extent {
-            logical_start: logical,
-            physical_start: block,
-            block_count: 1,
-        };
-        inode.extent_count += 1;
-        Ok(())
-    }
+
     fn begin_tx(&mut self) {
         self.tx_count = 0;
     }
@@ -542,23 +554,33 @@ impl<const C: usize> FileSystem<C> {
         d: &mut D,
         s: &mut Scratch,
     ) -> Result<journal::CommitReceipt, Error> {
-        if j.remaining_log_blocks() < 2 + 2 * self.tx_count as u32
-            && let Err(e) = j.checkpoint(d, s)
-        {
-            self.failed = true;
-            return Err(journal_error(e));
-        }
-        let mut images = [AfterImage {
+        let empty = AfterImage {
             home_block: 0,
             bytes: &self.tx[0],
-        }; TX_CAPACITY];
-        for (i, image) in images[..self.tx_count].iter_mut().enumerate() {
-            *image = AfterImage {
-                home_block: self.homes[i],
-                bytes: &self.tx[i],
+        };
+        let mut redos = [empty; TX_CAPACITY];
+        let mut ordered = [empty; TX_CAPACITY];
+        let (mut redo_count, mut data_count) = (0, 0);
+        for at in 0..self.tx_count {
+            let image = AfterImage {
+                home_block: self.homes[at],
+                bytes: &self.tx[at],
             };
+            if self.homes[at] >= FIRST_BUSINESS_BLOCK {
+                ordered[data_count] = image;
+                data_count += 1;
+            } else {
+                redos[redo_count] = image;
+                redo_count += 1;
+            }
         }
-        match j.commit(d, &images[..self.tx_count], s) {
+        if j.remaining_log_blocks() < 2 + 2 * redo_count as u32
+            && let Err(e) = j.checkpoint(d, s)
+        {
+            self.failed = !j.is_writable();
+            return Err(journal_error(e));
+        }
+        match j.commit_ordered(d, &ordered[..data_count], &redos[..redo_count], s) {
             Ok(v) => Ok(v),
             Err(e) => {
                 self.failed = !j.is_writable();
@@ -569,28 +591,12 @@ impl<const C: usize> FileSystem<C> {
     fn refresh_reserved<D: BlockDevice>(
         &mut self,
         j: &mut Journal,
-        d: &mut D,
-        s: &mut Scratch,
+        _d: &mut D,
+        _s: &mut Scratch,
     ) -> Result<(), Error> {
-        self.check_journal(j)?;
-        j.read_block(d, INODE_START, &mut self.tx[0], s)
-            .map_err(journal_error)?;
-        for id in 0..4 {
-            self.inodes[id] = Inode::decode(id as u32, &self.tx[0][id * 256..id * 256 + 256])
-                .map_err(|_| Error::Format)?;
-            self.write_seq[id] = self.inodes[id].durable_write_seq;
-        }
-        // The cluster allocator cannot touch ordinary data. Merge its current
-        // reservation bits without discarding any ordinary dirty reservations.
-        j.read_block(d, BITMAP_START, &mut self.tx[0], s)
-            .map_err(journal_error)?;
-        for block in DATA_START..FIRST_ORDINARY_BLOCK {
-            self.set_allocated(
-                block,
-                self.tx[0][block as usize / 8] & (1 << (block % 8)) != 0,
-            );
-        }
-        Ok(())
+        // System objects have a fixed, disjoint allocation domain in v2. Their
+        // updates cannot invalidate any business inode or dirty reservation.
+        self.check_journal(j)
     }
     fn path(path: &str) -> Result<(), Error> {
         if !path.starts_with('/') || path.len() > MAX_PATH || path.as_bytes().contains(&0) {
@@ -620,14 +626,20 @@ impl<const C: usize> FileSystem<C> {
         }
         j.read_block(d, physical(&inode, index as u32 / 32)?, &mut self.tx[0], s)
             .map_err(journal_error)?;
-        let e = DirectoryEntry::decode(&self.tx[0][index % 32 * 128..index % 32 * 128 + 128])
-            .map_err(|_| Error::Format)?;
+        let e = match DirectoryEntry::decode(&self.tx[0][index % 32 * 128..index % 32 * 128 + 128])
+        {
+            Ok(entry) => entry,
+            Err(_) => return self.guard_integrity(Err(Error::Format), j, d, s),
+        };
         if e == DirectoryEntry::EMPTY {
             return Ok(None);
         }
+        if e.inode_id >= BUSINESS_INODE_COUNT {
+            return self.guard_integrity(Err(Error::Conflict), j, d, s);
+        }
         let target = self.inodes[e.inode_id as usize];
         if target.kind == InodeKind::Free || target.generation != e.inode_generation {
-            return Err(Error::Stale);
+            return self.guard_integrity(Err(Error::Stale), j, d, s);
         }
         let mut name = [0; 63];
         name[..e.name.len()].copy_from_slice(e.name.as_bytes());
@@ -706,21 +718,18 @@ impl<const C: usize> FileSystem<C> {
         d: &mut D,
         s: &mut Scratch,
     ) -> Result<ObjectKey, Error> {
-        self.refresh_reserved(j, d, s)?;
+        self.check_writes(j)?;
         let (parent, name) = self.parent(path, j, d, s)?;
         if self.lookup(parent, name, j, d, s)?.is_some() {
             return Err(Error::Exists);
         }
-        let id = (FIRST_ORDINARY_INODE..256)
+        let id = (FIRST_ORDINARY_INODE..BUSINESS_INODE_COUNT as usize)
             .find(|&i| {
                 self.inodes[i].kind == InodeKind::Free && self.inodes[i].generation != u64::MAX
             })
             .ok_or(Error::Capacity)?;
-        let mut parent_inode = self.inodes[parent];
-        let first = if parent == 0 { 3 } else { 0 };
-        let old_slots = parent_inode.size as usize / 128;
-        let mut index = old_slots.max(first);
-        for slot in first..old_slots {
+        let mut index = self.inodes[parent].size as usize / 128;
+        for slot in 0..index {
             if self.entry(parent, slot, j, d, s)?.is_none() {
                 index = slot;
                 break;
@@ -733,48 +742,30 @@ impl<const C: usize> FileSystem<C> {
             kind,
             generation: self.inodes[id].generation + 1,
             parent_inode: parent as u32,
-            parent_generation: parent_inode.generation,
+            parent_generation: self.inodes[parent].generation,
             ..EMPTY_INODE
         };
-        let new_size = parent_inode.size.max((index + 1) as u64 * 128);
-        let mut allocated = None;
-        if new_size.div_ceil(BLOCK_SIZE as u64) > parent_inode.size.div_ceil(BLOCK_SIZE as u64) {
-            let block = self.free_block(&[])?;
-            Self::append_block(&mut parent_inode, block)?;
-            allocated = Some(block);
-        }
-        parent_inode.size = new_size;
-        parent_inode.durable_write_seq = parent_inode
-            .durable_write_seq
-            .checked_add(1)
-            .ok_or(Error::Overflow)?;
         self.begin_tx();
-        let home = physical(&parent_inode, index as u32 / 32)?;
-        let at = self.tx_load(home, allocated == Some(home), j, d, s)?;
-        for slot in old_slots..index {
-            DirectoryEntry::EMPTY
-                .encode(&mut self.tx[at][slot % 32 * 128..slot % 32 * 128 + 128])
-                .map_err(|_| Error::Format)?;
-        }
-        DirectoryEntry {
-            inode_id: id as u32,
-            inode_generation: inode.generation,
-            name,
-        }
-        .encode(&mut self.tx[at][index % 32 * 128..index % 32 * 128 + 128])
-        .map_err(|_| Error::Format)?;
-        if let Some(block) = allocated {
-            self.tx_bit(block, true, j, d, s)?;
-        }
-        self.tx_inode(parent, parent_inode, j, d, s)?;
+        let (parent_inode, block) = self.cow_directory(
+            parent,
+            index,
+            DirectoryEntry {
+                inode_id: id as u32,
+                inode_generation: inode.generation,
+                name,
+            },
+            j,
+            d,
+            s,
+        )?;
         self.tx_inode(id, inode, j, d, s)?;
         self.commit(j, d, s)?;
-        if let Some(block) = allocated {
-            self.set_allocated(block, true);
-        }
+        self.set_allocated(block, true);
         self.inodes[parent] = parent_inode;
+        self.committed_size[parent] = parent_inode.size;
         self.write_seq[parent] = parent_inode.durable_write_seq;
         self.inodes[id] = inode;
+        self.committed_size[id] = inode.size;
         self.write_seq[id] = 0;
         Ok(ObjectKey {
             id: id as u64,
@@ -807,7 +798,7 @@ impl<const C: usize> FileSystem<C> {
             .get(id)
             .filter(|i| i.kind != InodeKind::Free && i.generation == key.generation)
             .ok_or(Error::Stale)?;
-        if (1..4).contains(&id) {
+        if id >= BUSINESS_INODE_COUNT as usize {
             return Err(Error::Auth);
         }
         Ok(Stat {
@@ -847,8 +838,7 @@ impl<const C: usize> FileSystem<C> {
         if stat.kind != InodeKind::Directory && mode == OpenMode::Directory {
             return Err(Error::NotDirectory);
         }
-        let at = self
-            .handles
+        let at = self.handles[..112]
             .iter()
             .position(Option::is_none)
             .ok_or(Error::Capacity)?;
@@ -861,6 +851,8 @@ impl<const C: usize> FileSystem<C> {
             object_generation: stat.object.generation,
             generation: self.handle_generation,
             mode,
+            live_epoch: self.live_view_epoch(),
+            frozen: None,
         });
         Ok(Handle {
             slot: at as u16,
@@ -874,12 +866,20 @@ impl<const C: usize> FileSystem<C> {
             .and_then(|v| *v)
             .filter(|v| {
                 v.generation == h.generation
-                    && self.inodes[v.inode].generation == v.object_generation
+                    && if let Some(frozen) = v.frozen {
+                        self.frozen[frozen].is_some()
+                    } else {
+                        v.live_epoch == self.live_view_epoch()
+                            && self.inodes[v.inode].generation == v.object_generation
+                    }
             })
             .ok_or(Error::Stale)
     }
     pub fn handle_object(&self, h: Handle) -> Result<ObjectKey, Error> {
         let o = self.opened(h)?;
+        if o.frozen.is_some() {
+            return Err(Error::Auth);
+        }
         Ok(ObjectKey {
             id: o.inode as u64,
             generation: o.object_generation,
@@ -892,6 +892,9 @@ impl<const C: usize> FileSystem<C> {
             .ok_or(Error::Stale)?;
         if slot.is_none_or(|o| o.generation != h.generation) {
             return Err(Error::Stale);
+        }
+        if let Some(view) = slot.and_then(|o| o.frozen) {
+            self.frozen[view] = None;
         }
         *slot = None;
         Ok(())
@@ -907,6 +910,9 @@ impl<const C: usize> FileSystem<C> {
         let open = self.opened(h)?;
         if open.mode != OpenMode::Directory {
             return Err(Error::NotDirectory);
+        }
+        if let Some(view) = open.frozen {
+            return self.snapshot_readdir(view, cookie, j, d, s);
         }
         self.refresh_reserved(j, d, s)?;
         for index in usize::from(cookie)..self.inodes[open.inode].size as usize / 128 {
@@ -941,6 +947,9 @@ impl<const C: usize> FileSystem<C> {
         if length > MAX_IO {
             return Err(Error::Range);
         }
+        if let Some(view) = open.frozen {
+            return Ok(length != 0 && offset < self.frozen[view].ok_or(Error::Stale)?.inode.size);
+        }
         let inode = self.inodes[open.inode];
         if length == 0 || offset >= inode.size {
             return Ok(false);
@@ -960,6 +969,9 @@ impl<const C: usize> FileSystem<C> {
     /// A write needs foreground disk reads solely for an uncached old page.
     pub fn write_io_demand(&self, h: Handle, offset: u64, length: usize) -> Result<bool, Error> {
         let open = self.opened(h)?;
+        if open.frozen.is_some() {
+            return Err(Error::ReadOnly);
+        }
         if !matches!(open.mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(Error::Auth);
         }
@@ -973,6 +985,9 @@ impl<const C: usize> FileSystem<C> {
         }
         if length == 0 {
             return Ok(false);
+        }
+        if inode.ext_block != 0 {
+            return Ok(true);
         }
         self.range_io_demand(
             open.inode,
@@ -1006,7 +1021,7 @@ impl<const C: usize> FileSystem<C> {
         let mut present = 0u128;
         for page in &self.cache {
             let inside = page.valid && page.inode == id && (first..end).contains(&page.logical);
-            if inside && physical(&self.inodes[id], page.logical)? == page.physical {
+            if inside {
                 present |= 1u128 << (page.logical - first);
             }
             // Writes pin their existing destination pages before admitting a
@@ -1115,6 +1130,9 @@ impl<const C: usize> FileSystem<C> {
         if out.len() > MAX_IO {
             return Err(Error::Range);
         }
+        if let Some(view) = open.frozen {
+            return self.snapshot_read(view, offset, out, j, d, s);
+        }
         let inode = self.inodes[open.inode];
         if offset >= inode.size || out.is_empty() {
             return Ok(0);
@@ -1124,7 +1142,7 @@ impl<const C: usize> FileSystem<C> {
         while done < len {
             let pos = offset as usize + done;
             let logical = (pos / BLOCK_SIZE) as u32;
-            let home = physical(&inode, logical)?;
+            let home = self.live_physical(open.inode, logical, j, d, s)?;
             let at = self.page(open.inode, logical, home, false, false, j, d, s)?;
             let n = (BLOCK_SIZE - pos % BLOCK_SIZE).min(len - done);
             out[done..done + n]
@@ -1144,7 +1162,7 @@ impl<const C: usize> FileSystem<C> {
         for logical in
             first..(first + u32::from(count)).min(inode.size.div_ceil(BLOCK_SIZE as u64) as u32)
         {
-            let home = physical(&inode, logical)?;
+            let home = self.live_physical(open.inode, logical, j, d, s)?;
             match self.page(open.inode, logical, home, false, true, j, d, s) {
                 Ok(_) => (),
                 Err(Error::Again) => break,
@@ -1171,7 +1189,7 @@ impl<const C: usize> FileSystem<C> {
         if offset >= stat.size {
             return Err(Error::Range);
         }
-        let home = physical(&self.inodes[key.id as usize], page as u32)?;
+        let home = self.live_physical(key.id as usize, page as u32, j, d, s)?;
         if let Some(at) = self.cached(key.id as usize, page as u32, home) {
             self.metrics.cache_hits += 1;
             out.copy_from_slice(&self.pages[at].0);
@@ -1194,115 +1212,145 @@ impl<const C: usize> FileSystem<C> {
     ) -> Result<usize, Error> {
         self.check_journal(j)?;
         let open = self.opened(h)?;
+        if open.frozen.is_some() {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writes(j)?;
         if !matches!(open.mode, OpenMode::Write | OpenMode::ReadWrite) {
             return Err(Error::Auth);
         }
         let id = open.inode;
         let original = self.inodes[id];
-        if data.len() > MAX_IO || offset > original.size {
-            return Err(Error::Range);
-        }
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(Error::Overflow)?;
-        if end > MAX_FILE_SIZE {
+        if data.len() > MAX_IO || offset > original.size || end > MAX_FILE_SIZE {
             return Err(Error::Range);
         }
         if data.is_empty() {
             return Ok(0);
         }
         let seq = self.write_seq[id].checked_add(1).ok_or(Error::Overflow)?;
-        let mut inode = original;
-        let mut blocks = [0u32; 17];
-        let mut count = 0;
-        for _ in original.size.div_ceil(BLOCK_SIZE as u64)..end.div_ceil(BLOCK_SIZE as u64) {
-            let block = self.free_block(&blocks[..count])?;
-            Self::append_block(&mut inode, block)?;
-            blocks[count] = block;
-            count += 1;
-        }
-        inode.size = original.size.max(end);
-        inode.validate(id as u32).map_err(|_| Error::Format)?;
-        let first = offset as u32 / BLOCK_SIZE as u32;
-        let last = (end - 1) as u32 / BLOCK_SIZE as u32;
-        for logical in first..=last {
-            let home = physical(&inode, logical)?;
-            if let Some(at) = self.cached(id, logical, home) {
-                self.cache[at].pinned = true;
+        let first = (offset / BLOCK_SIZE as u64) as u32;
+        let last = end.div_ceil(BLOCK_SIZE as u64) as u32;
+        let mut map = [0; cow::FILE_BLOCKS];
+        let committed = self.committed_inode(id, j, d, s)?;
+        let integrity = cow::load_map(id, &committed, j, d, s, &mut map);
+        self.guard_integrity(integrity, j, d, s)?;
+        let committed_map = map;
+        for p in &self.cache {
+            if p.valid && p.dirty && p.inode == id {
+                map[p.logical as usize] = p.physical;
             }
         }
-        let prepared = (|| {
-            for logical in first..=last {
-                let home = physical(&inode, logical)?;
-                let at = self.page(
-                    id,
-                    logical,
-                    home,
-                    blocks[..count].contains(&home),
-                    false,
-                    j,
-                    d,
-                    s,
-                )?;
-                self.cache[at].pinned = true;
+        let mut homes = [0u32; 17];
+        let mut reserves = [0u32; 17];
+        let mut excluded = [0u32; 34];
+        let mut allocated = 0;
+        for logical in first..last {
+            let i = (logical - first) as usize;
+            if let Some(p) = self
+                .cache
+                .iter()
+                .find(|p| p.valid && p.dirty && p.inode == id && p.logical == logical)
+            {
+                homes[i] = p.physical;
+                reserves[i] = p.extent_reservation;
+            } else {
+                homes[i] = self.reserve_block(&excluded[..allocated], j, d, s)?;
+                excluded[allocated] = homes[i];
+                allocated += 1;
             }
-            Ok::<(), Error>(())
-        })();
-        if let Err(e) = prepared {
-            for p in &mut self.cache {
-                p.pinned = false;
-                if p.valid && p.inode == id && blocks[..count].contains(&p.physical) {
-                    *p = Cache::EMPTY;
-                    self.resident -= 1;
+            map[logical as usize] = homes[i];
+        }
+        // Reserve data first so sequential payloads remain contiguous. Spare
+        // indirect pages follow the batch and cannot fragment every data block.
+        for reserve in &mut reserves[..(last - first) as usize] {
+            if *reserve == 0 {
+                *reserve = self.reserve_block(&excluded[..allocated], j, d, s)?;
+                excluded[allocated] = *reserve;
+                allocated += 1;
+            }
+        }
+        let size = original.size.max(end);
+        let blocks = size.div_ceil(BLOCK_SIZE as u64) as usize;
+        if cow::extent_count(&map[..blocks]) > MAX_EXTENTS {
+            return Err(Error::Capacity);
+        }
+        // Any ordered dirty prefix may be flushed by the bounded background
+        // worker. Reject before acceptance if an intermediate view cannot fit.
+        let mut prefix = committed_map;
+        let mut prefix_blocks = committed.size.div_ceil(BLOCK_SIZE as u64) as usize;
+        for logical in 0..blocks {
+            if map[logical] != prefix[logical] {
+                prefix[logical] = map[logical];
+                prefix_blocks = prefix_blocks.max(logical + 1);
+                if cow::extent_count(&prefix[..prefix_blocks]) > MAX_EXTENTS {
+                    return Err(Error::Capacity);
                 }
             }
-            return Err(e);
+        }
+        // Admission may evict clean pages, but cannot alter accepted data until
+        // every destination page, CoW block and extent reservation is owned.
+        for p in &mut self.cache {
+            if p.valid && p.inode == id && (first..last).contains(&p.logical) {
+                p.pinned = true;
+            }
+        }
+        let mut slots = [0usize; 17];
+        let load = (|| -> Result<(), Error> {
+            for logical in first..last {
+                let i = (logical - first) as usize;
+                let at = if let Some(at) = self
+                    .cache
+                    .iter()
+                    .position(|p| p.valid && p.inode == id && p.logical == logical)
+                {
+                    at
+                } else {
+                    let old = committed_map[logical as usize];
+                    self.page(id, logical, old, old == 0, false, j, d, s)?
+                };
+                self.cache[at].pinned = true;
+                slots[i] = at;
+            }
+            Ok(())
+        })();
+        if let Err(error) = load {
+            for p in &mut self.cache {
+                p.pinned = false;
+            }
+            return Err(error);
+        }
+        for &block in &excluded[..allocated] {
+            self.set_allocated(block, true);
         }
         let mut done = 0;
-        while done < data.len() {
+        for logical in first..last {
+            let i = (logical - first) as usize;
+            let at = slots[i];
             let pos = offset as usize + done;
-            let logical = (pos / BLOCK_SIZE) as u32;
-            let at = self
-                .cached(id, logical, physical(&inode, logical)?)
-                .ok_or(Error::Conflict)?;
             let n = (BLOCK_SIZE - pos % BLOCK_SIZE).min(data.len() - done);
             self.pages[at].0[pos % BLOCK_SIZE..pos % BLOCK_SIZE + n]
                 .copy_from_slice(&data[done..done + n]);
             if !self.cache[at].dirty {
-                self.cache[at].dirty = true;
                 self.metrics.dirty_pages += 1;
             }
+            self.cache[at].dirty = true;
+            self.cache[at].physical = homes[i];
+            self.cache[at].extent_reservation = reserves[i];
+            self.cache[at].prefetched = false;
             done += n;
         }
         for p in &mut self.cache {
             p.pinned = false;
         }
-        for block in &blocks[..count] {
-            self.set_allocated(*block, true);
-        }
-        self.inodes[id] = inode;
+        self.inodes[id].size = size;
         self.write_seq[id] = seq;
         self.metrics.write_bytes = self.metrics.write_bytes.saturating_add(done as u64);
         Ok(done)
     }
-    fn prefix(inode: Inode, size: u64) -> Inode {
-        let mut result = inode;
-        result.size = size;
-        result.extents = [Extent::EMPTY; 16];
-        result.extent_count = 0;
-        let mut left = size.div_ceil(BLOCK_SIZE as u64) as u32;
-        for extent in &inode.extents[..usize::from(inode.extent_count)] {
-            if left == 0 {
-                break;
-            }
-            let mut e = *extent;
-            e.block_count = e.block_count.min(left);
-            result.extents[usize::from(result.extent_count)] = e;
-            result.extent_count += 1;
-            left -= e.block_count;
-        }
-        result
-    }
+
     fn flush_inode<D: BlockDevice>(
         &mut self,
         id: usize,
@@ -1312,7 +1360,7 @@ impl<const C: usize> FileSystem<C> {
         d: &mut D,
         s: &mut Scratch,
     ) -> Result<Option<FlushReceipt>, Error> {
-        self.check()?;
+        self.check_journal(j)?;
         let mut selected = [0usize; 32];
         let mut count = 0;
         let mut after = None;
@@ -1336,46 +1384,56 @@ impl<const C: usize> FileSystem<C> {
         if count == 0 {
             return Ok(None);
         }
-        self.begin_tx();
-        let inode_at = self.tx_load(INODE_START + id as u32 / 16, false, j, d, s)?;
-        let old = Inode::decode(
-            id as u32,
-            &self.tx[inode_at][id % 16 * 256..id % 16 * 256 + 256],
-        )
-        .map_err(|_| Error::Format)?;
-        let size = old.size.max(
-            self.inodes[id]
-                .size
-                .min((u64::from(after.unwrap()) + 1) * BLOCK_SIZE as u64),
-        );
-        let mut published = Self::prefix(self.inodes[id], size);
+        let old = self.committed_inode(id, j, d, s)?;
+        let accepted_size = self.inodes[id].size;
+        let size = old
+            .size
+            .max(accepted_size.min((u64::from(after.unwrap()) + 1) * BLOCK_SIZE as u64));
+        let mut map = [0; cow::FILE_BLOCKS];
+        let integrity = cow::load_map(id, &old, j, d, s, &mut map);
+        self.guard_integrity(integrity, j, d, s)?;
+        for &at in &selected[..count] {
+            map[self.cache[at].logical as usize] = self.cache[at].physical;
+        }
+        let spare = self.cache[selected[0]].extent_reservation;
+        let (mut published, indirect) = cow::mapped_inode(id, old, size, &map, spare)?;
         let remaining = self
             .cache
             .iter()
             .filter(|p| p.valid && p.dirty && p.inode == id)
             .count()
             - count;
-        published.durable_write_seq = if remaining == 0 {
-            self.write_seq[id]
-        } else {
-            old.durable_write_seq
-        };
-        for &at in &selected[..count] {
-            let slot = self.tx_load(self.cache[at].physical, true, j, d, s)?;
-            self.tx[slot].copy_from_slice(&self.pages[at].0);
+        if remaining == 0 {
+            published.durable_write_seq = self.write_seq[id];
         }
-        for logical in
-            old.size.div_ceil(BLOCK_SIZE as u64) as u32..size.div_ceil(BLOCK_SIZE as u64) as u32
-        {
-            self.tx_bit(physical(&published, logical)?, true, j, d, s)?;
+        self.begin_tx();
+        for &at in &selected[..count] {
+            let block = self.cache[at].physical;
+            let slot = self.tx_load(block, true, j, d, s)?;
+            self.tx[slot].copy_from_slice(&self.pages[at].0);
+            self.tx_bit(block, true, j, d, s)?;
+        }
+        if let Some(indirect) = indirect {
+            let slot = self.tx_load(spare, true, j, d, s)?;
+            indirect
+                .encode(&mut self.tx[slot])
+                .map_err(|_| Error::Format)?;
+            self.tx_bit(spare, true, j, d, s)?;
         }
         self.tx_inode(id, published, j, d, s)?;
         let receipt = self.commit(j, d, s)?;
         for &at in &selected[..count] {
+            let reserve = self.cache[at].extent_reservation;
+            if reserve != 0 && reserve != published.ext_block {
+                self.set_allocated(reserve, false);
+            }
+            self.cache[at].extent_reservation = 0;
             self.cache[at].dirty = false;
             self.metrics.dirty_pages -= 1;
         }
-        self.inodes[id].durable_write_seq = published.durable_write_seq;
+        self.inodes[id] = published;
+        self.committed_size[id] = published.size;
+        self.inodes[id].size = accepted_size;
         self.metrics.flushed_pages += count as u64;
         self.metrics.last_flush_version = self.metrics.last_flush_version.max(version);
         Ok(Some(FlushReceipt {
@@ -1402,6 +1460,9 @@ impl<const C: usize> FileSystem<C> {
         if open.mode == OpenMode::Directory {
             return Err(Error::IsDirectory);
         }
+        if open.frozen.is_some() {
+            return Err(Error::ReadOnly);
+        }
         let seq = self.write_seq[open.inode];
         let mut transactions = 0;
         while self.flush_inode(open.inode, 32, 0, j, d, s)?.is_some() {
@@ -1417,6 +1478,7 @@ impl<const C: usize> FileSystem<C> {
             },
             write_seq: seq,
             transactions,
+            live_view_epoch: self.live_view_epoch(),
         })
     }
     pub fn background_flush<D: BlockDevice>(
@@ -1477,13 +1539,18 @@ impl<const C: usize> FileSystem<C> {
         d: &mut D,
         s: &mut Scratch,
     ) -> Result<(), Error> {
-        self.refresh_reserved(j, d, s)?;
+        self.check_writes(j)?;
         let (parent, name) = self.parent(path, j, d, s)?;
         let (id, index) = self.lookup(parent, name, j, d, s)?.ok_or(Error::NotFound)?;
-        if id < FIRST_ORDINARY_INODE {
+        if id < FIRST_ORDINARY_INODE || id >= BUSINESS_INODE_COUNT as usize {
             return Err(Error::Auth);
         }
-        if self.handles.iter().flatten().any(|h| h.inode == id) {
+        if self
+            .handles
+            .iter()
+            .flatten()
+            .any(|h| h.frozen.is_none() && h.live_epoch == self.live_view_epoch() && h.inode == id)
+        {
             return Err(Error::Busy);
         }
         let inode = self.inodes[id];
@@ -1494,45 +1561,34 @@ impl<const C: usize> FileSystem<C> {
                 }
             }
         }
-        let mut parent_inode = self.inodes[parent];
-        parent_inode.durable_write_seq = parent_inode
-            .durable_write_seq
-            .checked_add(1)
-            .ok_or(Error::Overflow)?;
         self.begin_tx();
-        let at = self.tx_load(physical(&parent_inode, index as u32 / 32)?, false, j, d, s)?;
-        DirectoryEntry::EMPTY
-            .encode(&mut self.tx[at][index % 32 * 128..index % 32 * 128 + 128])
-            .map_err(|_| Error::Format)?;
-        for extent in &inode.extents[..usize::from(inode.extent_count)] {
-            for block in extent.physical_start..extent.physical_start + extent.block_count {
-                self.tx_bit(block, false, j, d, s)?;
-            }
-        }
-        self.tx_inode(parent, parent_inode, j, d, s)?;
+        let (parent_inode, home) =
+            self.cow_directory(parent, index, DirectoryEntry::EMPTY, j, d, s)?;
         let free = Inode {
             generation: inode.generation,
             ..EMPTY_INODE
         };
         self.tx_inode(id, free, j, d, s)?;
         self.commit(j, d, s)?;
-        for extent in &inode.extents[..usize::from(inode.extent_count)] {
-            for block in extent.physical_start..extent.physical_start + extent.block_count {
-                self.set_allocated(block, false);
-            }
-        }
-        for page in &mut self.cache {
-            if page.valid && page.inode == id {
-                if page.dirty {
+        self.set_allocated(home, true);
+        // Published blocks may still be owned by a historical view. Only
+        // never-published dirty reservations can be returned immediately.
+        for at in 0..C {
+            if self.cache[at].valid && self.cache[at].inode == id {
+                if self.cache[at].dirty {
+                    self.set_allocated(self.cache[at].physical, false);
+                    self.set_allocated(self.cache[at].extent_reservation, false);
                     self.metrics.dirty_pages -= 1;
                 }
-                *page = Cache::EMPTY;
+                self.cache[at] = Cache::EMPTY;
                 self.resident -= 1;
             }
         }
         self.inodes[parent] = parent_inode;
+        self.committed_size[parent] = parent_inode.size;
         self.write_seq[parent] = parent_inode.durable_write_seq;
         self.inodes[id] = free;
+        self.committed_size[id] = 0;
         self.write_seq[id] = 0;
         Ok(())
     }

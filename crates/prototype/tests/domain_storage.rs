@@ -144,6 +144,7 @@ fn expired_cache_partition_closes_admission_and_required_writeback_drains_dirty_
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.set_cache_partition(4, 2).unwrap();
         let stamp = PolicyStamp::new(1, 0, 0).unwrap();
         fs.set_cache_partition_expiring(32, 4, stamp, 0).unwrap();
@@ -183,6 +184,7 @@ fn control_reads_do_not_perform_cache_expiry_or_release_actual_dirty_occupancy()
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.set_cache_partition(4, 2).unwrap();
         let stamp = PolicyStamp::new(1, 0, 0).unwrap();
         fs.set_cache_partition_expiring(32, 4, stamp, 0).unwrap();
@@ -327,6 +329,7 @@ fn ordinary_crud_fsync_reboot_and_generation_custody() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.mkdir("/data", &mut j, &mut d, &mut s).unwrap();
         let key = fs.create("/data/a", &mut j, &mut d, &mut s).unwrap();
         let h = fs
@@ -362,6 +365,7 @@ fn ordinary_crud_fsync_reboot_and_generation_custody() {
         );
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/data/a", OpenMode::Read, &mut j, &mut d, &mut s)
             .unwrap();
@@ -404,6 +408,7 @@ fn accepted_write_is_not_durability_and_unknown_second_flush_never_replies_succe
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/a", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/a", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -414,6 +419,7 @@ fn accepted_write_is_not_durability_and_unknown_second_flush_never_replies_succe
         j.mount(&mut d, &mut s).unwrap();
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         assert_eq!(fs.stat("/a", &mut j, &mut d, &mut s).unwrap().size, 0);
         let h = fs
             .open("/a", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -429,6 +435,7 @@ fn accepted_write_is_not_durability_and_unknown_second_flush_never_replies_succe
         j.mount(&mut d, &mut s).unwrap();
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let stat = fs.stat("/a", &mut j, &mut d, &mut s).unwrap();
         assert_eq!((stat.size, stat.durable_write_seq), (22, 1));
     });
@@ -441,6 +448,7 @@ fn partial_background_commit_exposes_only_initialized_prefix() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/prefix", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/prefix", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -457,6 +465,7 @@ fn partial_background_commit_exposes_only_initialized_prefix() {
         j.mount(&mut d, &mut s).unwrap();
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let stat = fs.stat("/prefix", &mut j, &mut d, &mut s).unwrap();
         assert_eq!((stat.size, stat.durable_write_seq), (16384, 0));
         let h = fs
@@ -473,12 +482,13 @@ fn partial_background_commit_exposes_only_initialized_prefix() {
 }
 
 #[test]
-fn ordinary_and_reserved_cluster_files_share_metadata_without_overwriting_slots() {
+fn business_and_system_namespaces_remain_disjoint_during_cluster_updates() {
     large(|| {
         let (mut d, mut j) = fixture();
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         for i in 0..40 {
             fs.create(&format!("/f{i}"), &mut j, &mut d, &mut s)
                 .unwrap();
@@ -494,7 +504,7 @@ fn ordinary_and_reserved_cluster_files_share_metadata_without_overwriting_slots(
         }
         assert_eq!(
             fs.open("/.cyxia-cluster-a", OpenMode::Read, &mut j, &mut d, &mut s),
-            Err(Error::Auth)
+            Err(Error::NotFound)
         );
         let mut cursor = Cursor::new();
         let mut body = [0; 64];
@@ -525,6 +535,7 @@ fn selected_readahead_and_writeback_versions_execute_real_io() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/a", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/a", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -562,6 +573,7 @@ fn selected_readahead_and_writeback_versions_execute_real_io() {
         j.checkpoint(&mut d, &mut s).unwrap();
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/a", OpenMode::Read, &mut j, &mut d, &mut s)
             .unwrap();
@@ -602,6 +614,7 @@ fn configured_writeback_baseline_batches_without_policy_credit() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/baseline", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/baseline", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -637,6 +650,7 @@ fn cache_shrink_is_bounded_and_never_discards_dirty_data() {
         assert_eq!(base % 4096, 0);
         assert_eq!(bytes, 64 * 4096);
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/cache", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/cache", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -689,6 +703,8 @@ fn foreground_demand_distinguishes_disk_misses_from_cached_and_zero_filled_work(
         let mut scratch = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        fs.initialize_business(&mut journal, &mut disk, &mut scratch)
+            .unwrap();
         fs.create("/demand", &mut journal, &mut disk, &mut scratch)
             .unwrap();
         let h = fs
@@ -712,6 +728,8 @@ fn foreground_demand_distinguishes_disk_misses_from_cached_and_zero_filled_work(
 
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        fs.initialize_business(&mut journal, &mut disk, &mut scratch)
+            .unwrap();
         let h = fs
             .open(
                 "/demand",
@@ -798,6 +816,8 @@ fn replay_cold_reset_requires_real_durability_and_preserves_other_objects() {
         let mut scratch = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+        fs.initialize_business(&mut journal, &mut disk, &mut scratch)
+            .unwrap();
         let object = fs
             .create("/replay", &mut journal, &mut disk, &mut scratch)
             .unwrap();
@@ -893,6 +913,7 @@ fn allocation_limits_and_full_volume_owner_validation_are_enforced() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let a = fs.create("/a", &mut j, &mut d, &mut s).unwrap();
         let b = fs.create("/b", &mut j, &mut d, &mut s).unwrap();
         for path in ["/a", "/b"] {
@@ -936,6 +957,7 @@ fn all_ordinary_inode_slots_and_eight_mib_file_are_real() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         fs.create("/full", &mut j, &mut d, &mut s).unwrap();
         let h = fs
             .open("/full", OpenMode::ReadWrite, &mut j, &mut d, &mut s)
@@ -965,7 +987,7 @@ fn all_ordinary_inode_slots_and_eight_mib_file_are_real() {
         );
         assert_eq!(last, [0x79; 4096]);
         fs.close(h).unwrap();
-        for i in 1..252 {
+        for i in 1..223 {
             fs.create(&format!("/f{i:03}"), &mut j, &mut d, &mut s)
                 .unwrap();
         }
@@ -984,6 +1006,7 @@ fn absolute_utf8_paths_have_real_512_byte_bound() {
         let mut s = [0; 8192];
         let mut fs = FileSystem::<64>::new();
         fs.mount(&mut j, &mut d, &mut s).unwrap();
+        fs.initialize_business(&mut j, &mut d, &mut s).unwrap();
         let mut path = String::new();
         for _ in 0..7 {
             path.push('/');

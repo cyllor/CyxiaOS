@@ -46,10 +46,13 @@ mod local_evidence;
 #[path = "domain_tasks/replay.rs"]
 pub mod replay;
 pub use abi::{
-    close_network, fault, grant_endpoint, grant_file_cap, network_drain, network_key,
-    network_pending, network_write, open_network, syscall,
+    close_network, fault, file_capabilities_invalidated, grant_endpoint, grant_file_cap,
+    invalidate_file_capabilities, network_drain, network_key, network_pending, network_write,
+    open_network, syscall,
 };
 pub use execution::start_memory_client;
+#[cfg(snapshot_probe)]
+pub use execution::start_snapshot_client;
 pub use execution::{
     acknowledge_local_result, cancel_spawn, close_admission, dispatch, heartbeat_ns,
     init_recoverable, local_result, probe_status, query_local, query_spawn, readonly_drained,
@@ -1382,6 +1385,14 @@ fn complete_locked(s: &mut State, slot: usize) -> Result<(), Error> {
         return result;
     }
     if result == Err(Error::Budget) {
+        #[cfg(snapshot_probe)]
+        if slot == 0 {
+            execution::snapshot_probe_service_overrun(
+                active.dispatch.sequence,
+                actual,
+                active.dispatch.reserved_ns,
+            );
+        }
         if let Some(row) = match slot {
             0 => Some(2),
             2 => Some(12),
@@ -1431,6 +1442,10 @@ pub fn complete_builtin(slot: usize, actual_ns: u64, finished_ns: u64) -> Result
     }
     if COMPLETE_READY[slot].load(Ordering::Acquire) {
         return Err(Error::Busy);
+    }
+    #[cfg(snapshot_probe)]
+    if slot == 0 {
+        crate::unified::capture_service_completion_stage();
     }
     finish_capture(slot, finished_ns.saturating_sub(actual_ns), finished_ns);
     COMPLETE_ACTUAL[slot].store(actual_ns, Ordering::Relaxed);

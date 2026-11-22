@@ -101,6 +101,8 @@ fn two_real_anonymous_owners_survive_real_clean_file_cache_replacement() {
         .unwrap();
     let mut fs = FileSystem::<64>::new();
     fs.mount(&mut j, &mut disk, &mut scratch).unwrap();
+    fs.initialize_business(&mut j, &mut disk, &mut scratch)
+        .unwrap();
     fs.create("/anonymous-pressure", &mut j, &mut disk, &mut scratch)
         .unwrap();
     let h = fs

@@ -126,7 +126,7 @@ fn exercise(previous_epoch: u64) {
             .iter()
             .any(|op| matches!(op, Operation::Write(_)))
     );
-    assert_eq!(operations.len(), if previous_epoch == 0 { 12 } else { 8 });
+    assert_eq!(operations.len(), 8);
     assert_eq!(
         operations
             .iter()

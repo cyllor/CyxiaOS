@@ -29,7 +29,7 @@ def superblock(data: bytes) -> dict:
     return dict(uuid=data[16:32],generation=generation,checkpoint=checkpoint,epoch=epoch)
 
 @contextmanager
-def committed_volume(path: Path):
+def committed_volume(path: Path, *, superblock_decoder=superblock, redo_end=COUNT):
     """Read the highest valid committed prefix without modifying the image."""
     require(path.stat().st_size==BLOCK*COUNT, 'wrong boot volume size')
     with path.open('rb') as disk:
@@ -39,7 +39,7 @@ def committed_volume(path: Path):
             require(len(data)==BLOCK,'short disk read'); return data
         copies=[]
         for index in (0,1):
-            try: copies.append(superblock(read(index)))
+            try: copies.append(superblock_decoder(read(index)))
             except ValueError: pass
         require(copies,'no valid superblock')
         copies.sort(key=lambda s:s['generation'])
@@ -65,7 +65,7 @@ def committed_volume(path: Path):
                         and r_lsn+redos+1<2**64,'invalid BEGIN payload')
             elif kind==2:
                 begin=r_lsn-index-1
-                require(4098<=home<COUNT and 0<=index<count<=128 and begin>0
+                require(4098<=home<redo_end and 0<=index<count<=128 and begin>0
                         and begin+count+1<2**64,'invalid REDO fields')
             else:
                 found,begin,last,redos,reserved=struct.unpack_from('<QQQII',body)
@@ -84,7 +84,7 @@ def committed_volume(path: Path):
                 at=cursor+1+2*item
                 require(at+1<4098,'REDO outside journal')
                 k,t,s,h,i,n,image=record(at)
-                require((k,t,s,i,n)==(2,found,begin+1+item,item,count) and 4098<=h<COUNT and h not in pending,'invalid REDO chain')
+                require((k,t,s,i,n)==(2,found,begin+1+item,item,count) and 4098<=h<redo_end and h not in pending,'invalid REDO chain')
                 pending[h]=image; digest.update(struct.pack('<Q',h));digest.update(image)
             at=cursor+1+2*count
             require(at<4098,'COMMIT outside journal')

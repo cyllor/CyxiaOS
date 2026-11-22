@@ -344,12 +344,29 @@ pub fn build() {
         println!("cargo:rerun-if-env-changed=CYXIA_CLUSTER_UNIX_SECONDS");
         println!("cargo:rerun-if-env-changed=CYXIA_DOMAIN_SELFTEST");
         println!("cargo:rerun-if-env-changed=CYXIA_STORAGE_FAULT_PROBE");
+        println!("cargo:rerun-if-env-changed=CYXIA_SNAPSHOT_PROBE");
+        println!("cargo:rustc-check-cfg=cfg(snapshot_probe)");
         println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
         let storage_probe = env::var("CYXIA_STORAGE_FAULT_PROBE").unwrap_or_else(|_| "0".into());
+        let snapshot_probe = env::var("CYXIA_SNAPSHOT_PROBE").unwrap_or_else(|_| "0".into());
+        assert!(
+            ["0", "1"].contains(&snapshot_probe.as_str()),
+            "CYXIA_SNAPSHOT_PROBE must be 0 or 1"
+        );
         println!("cargo:rerun-if-env-changed=CYXIA_MEMORY_FAULT_PROBE");
         let memory_probe = env::var("CYXIA_MEMORY_FAULT_PROBE").unwrap_or_else(|_| "0".into());
+        assert!(
+            snapshot_probe != "1"
+                || (storage_probe == "0"
+                    && memory_probe == "0"
+                    && env::var("CYXIA_DOMAIN_SELFTEST").as_deref() == Ok("1")),
+            "snapshot probe requires an independent ordinary-client selftest image"
+        );
+        if snapshot_probe == "1" {
+            println!("cargo:rustc-cfg=snapshot_probe");
+        }
         assert!(["0", "1"].contains(&memory_probe.as_str()));
         assert!(
             memory_probe != "1"
@@ -428,6 +445,8 @@ pub fn build() {
                     .arg(source.join("main.rs"))
                     .args(if name == "prototype-client" && storage_probe == "1" {
                         vec!["--cfg", "storage_fault_probe"]
+                    } else if name == "prototype-client" && snapshot_probe == "1" {
+                        vec!["--cfg", "snapshot_probe"]
                     } else {
                         vec![]
                     })
@@ -813,7 +832,11 @@ pub fn build() {
         std::fs::write(out.join("ported_catalog.rs"), catalog).expect("write ported catalog");
     }
     let cc = env::var("CYXIA_CC").unwrap_or_else(|_| "clang".into());
-    let file_bytes = if env::var_os("CARGO_FEATURE_FULL_OS").is_some() { 8192 } else { 4096 };
+    let file_bytes = if env::var_os("CARGO_FEATURE_FULL_OS").is_some() {
+        8192
+    } else {
+        4096
+    };
     let mut objects = Vec::new();
     for src in ["start.S", "libc.c", "demo.c"] {
         let obj = out.join(format!("{src}.o"));

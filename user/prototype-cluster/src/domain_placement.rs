@@ -59,6 +59,7 @@ fn error_code(e: Error) -> u16 {
         Error::Io => 18,
         Error::Overflow => 19,
         Error::NotReady => 20,
+        Error::ReadOnly => 21,
     }
 }
 fn error(code: u16) -> Result<Error, Error> {
@@ -83,6 +84,7 @@ fn error(code: u16) -> Result<Error, Error> {
         18 => Error::Io,
         19 => Error::Overflow,
         20 => Error::NotReady,
+        21 => Error::ReadOnly,
         _ => return Err(Error::Format),
     })
 }

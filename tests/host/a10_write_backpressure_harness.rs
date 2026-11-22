@@ -28,6 +28,7 @@ mod storage_fault_capture{use super::*;pub const PROFILE:bool=false;pub fn selec
 pub fn entered(_:ObjectKey,_:&[u8])->Result<(),Error>{Ok(())}pub fn snapshot()->Option<[u64;4]>{None}
 pub fn delivered(_:ObjectKey,_:&[u8],_:&[u8],_:u64,_:[u64;4]){}pub fn snapshot_failed(){}}
 mod domain_storage{use super::*;
+ include!("__SNAPSHOT_ADAPTER__");
  pub fn read(h:Handle,o:u64,b:&mut[u8],_:&mut dyn FnMut())->Result<usize,Error>{with_fs(|f,j,d,s|{let misses=f.metrics().cache_misses;let reads=DISK_READS.load(Ordering::Relaxed);let result=f.read(h,o,b,clock(),j,d,s);READS.lock().unwrap().push((f.metrics().cache_misses-misses,DISK_READS.load(Ordering::Relaxed)-reads));result})}
  pub fn write(h:Handle,o:u64,b:&[u8],_:&mut dyn FnMut())->Result<usize,Error>{with_fs(|f,j,d,s|{
  let key=f.handle_object(h).unwrap();let a=f.stat("/a10/pressure-a",j,d,s).unwrap();let path=if a.object==key{"/a10/pressure-a"}else{"/a10/pressure-b"};let before=f.stat(path,j,d,s).unwrap();let metric=f.metrics();let dw=DISK_WRITES.load(Ordering::Relaxed);let usage=f.cache_usage();let result=f.write(h,o,b,j,d,s);
@@ -92,7 +93,7 @@ fn run(){
  let case=std::env::args().nth(1).unwrap_or_else(||"normal".into());
  STALLED.store(case=="stalled"||case=="identity",Ordering::Relaxed);EXPIRE.store(case=="deadline",Ordering::Relaxed);
  let mut disk=Disk::default();let mut scratch=[0;8192];journal::format(&mut disk,[1;16],&mut scratch).unwrap();let mut journal=Journal::new();journal.mount(&mut disk,&mut scratch).unwrap();cyxia_prototype::boot::BootSession::new().allocate(&mut journal,&mut disk,&mut scratch,&mut[[0;4096];4]).unwrap();
- let mut fs=FileSystem::<4096>::new();fs.mount(&mut journal,&mut disk,&mut scratch).unwrap();fs.set_cache_partition(if case=="partial"{191}else{192},16).unwrap();fs.set_writeback_baseline(32).unwrap();fs.mkdir("/a10",&mut journal,&mut disk,&mut scratch).unwrap();fs.create("/a10/value",&mut journal,&mut disk,&mut scratch).unwrap();let h=fs.open("/a10/value",OpenMode::ReadWrite,&mut journal,&mut disk,&mut scratch).unwrap();
+ let mut fs=FileSystem::<4096>::new();fs.mount(&mut journal,&mut disk,&mut scratch).unwrap();fs.initialize_business(&mut journal,&mut disk,&mut scratch).unwrap();fs.set_cache_partition(if case=="partial"{191}else{192},16).unwrap();fs.set_writeback_baseline(32).unwrap();fs.mkdir("/a10",&mut journal,&mut disk,&mut scratch).unwrap();fs.create("/a10/value",&mut journal,&mut disk,&mut scratch).unwrap();let h=fs.open("/a10/value",OpenMode::ReadWrite,&mut journal,&mut disk,&mut scratch).unwrap();
  for version in 1..=3u64{let mut data=[0u8;4096];for(i,b)in data.chunks_exact_mut(8).enumerate(){b.copy_from_slice(&(0xa100_0000_0000_0000u64|(version<<32)|i as u64).to_le_bytes());}fs.write(h,0,&data,&mut journal,&mut disk,&mut scratch).unwrap();fs.fsync(h,&mut journal,&mut disk,&mut scratch).unwrap();}fs.close(h).unwrap();
  FS.with(|s|*s.borrow_mut()=Some(State{fs,journal,disk,scratch}));let a=broker::grant(owner(),if case=="auth"{file::ALL_RIGHTS&!file::RIGHT_WRITE}else{file::ALL_RIGHTS}).unwrap();put(0x20000,40);put(0x21000,1);put(0x21008,4);put(0x21010,2);put(0x21018,1);put(0x21020,21_600_000_000_000);
  DEADLINE.store(clock()+21_600_000_000_000,Ordering::Relaxed);

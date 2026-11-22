@@ -47,6 +47,8 @@ unsafe impl Sync for ServiceDetail {}
 #[unsafe(no_mangle)]
 static DOMAIN_SERVICE_DETAIL: ServiceDetail = ServiceDetail(UnsafeCell::new([0; 16]));
 fn service_detail(phase: usize) {
+    #[cfg(snapshot_probe)]
+    crate::unified::service_stage(160 + phase as u64);
     if phase + 1 < 16 {
         unsafe {
             DOMAIN_SERVICE_DETAIL

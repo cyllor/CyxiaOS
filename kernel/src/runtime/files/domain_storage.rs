@@ -28,6 +28,7 @@ static mut SYNC_BINS: [u64; 64] = [0; 64];
 static mut SYNC_WINDOW: u64 = 0;
 static FS_ID: AtomicU64 = AtomicU64::new(0);
 static FS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_NEXT_MAINTENANCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 struct FileView {
     at: u64,
@@ -157,7 +158,12 @@ pub fn init() -> Result<(), Error> {
     }
     let id = storage::identity().ok_or(Error::NotReady)?;
     with_files(|f| {
-        storage::try_with_class(Class::Recovery, &mut || {}, |j, d, s| f.mount(j, d, s))??;
+        storage::try_with_class(Class::Recovery, &mut || {}, |j, d, s| {
+            f.mount(j, d, s)?;
+            // The filesystem itself checks the virgin control generation;
+            // existing protection or recovery gates are never reopened here.
+            f.initialize_business(j, d, s)
+        })??;
         f.set_cache_partition(192, 16)
     })?;
     FS_ID.store(
@@ -261,16 +267,29 @@ pub fn cache_reclaim_turn() -> Result<usize, Error> {
 pub fn validate_file_object(key: ObjectKey) -> Result<(), Error> {
     ready_read()?;
     storage::validate_io_health()?;
-    read_files(|f| f.stat_object(key).map(|_| ()))
+    read_files(|f| {
+        if crate::domain_tasks::file_capabilities_invalidated() {
+            return Err(Error::Stale);
+        }
+        f.stat_object(key).map(|_| ())
+    })
 }
 pub fn stat_file_object(key: ObjectKey) -> Result<u64, Error> {
     ready_read()?;
     storage::validate_io_health()?;
-    read_files(|f| f.stat_object(key).map(|v| v.size))
+    read_files(|f| {
+        if crate::domain_tasks::file_capabilities_invalidated() {
+            return Err(Error::Stale);
+        }
+        f.stat_object(key).map(|v| v.size)
+    })
 }
 pub fn read_cache_page(key: ObjectKey, page: u64, out: &mut [u8; 4096]) -> Result<(), Error> {
     ready()?;
     with_files(|f| {
+        if crate::domain_tasks::file_capabilities_invalidated() {
+            return Err(Error::Stale);
+        }
         storage::try_with_class(Class::Foreground, &mut || {}, |j, d, s| {
             f.read_cache_page(key, page, out, j, d, s)
         })?
@@ -392,8 +411,117 @@ pub fn unlink(path: &str, p: &mut dyn FnMut()) -> Result<(), Error> {
     crate::domain_tasks::invalidate_file(key);
     Ok(())
 }
+
+pub fn snapshot_uuid() -> Result<[u8; 16], Error> {
+    read_files(|f| f.snapshot_control().map(|control| control.fs_uuid))
+}
+pub fn snapshot_live_epoch() -> Result<u64, Error> {
+    read_files(|f| f.snapshot_control().map(|control| control.live_view_epoch))
+}
+pub fn snapshot_execute(
+    request: cyxia_prototype::snapshot::Request,
+    operation: u16,
+    payload: &[u8],
+    progress: &mut dyn FnMut(),
+) -> Result<cyxia_prototype::snapshot::RequestRecord, Error> {
+    ready()?;
+    with_files(|f| {
+        let before = f.snapshot_control()?.live_view_epoch;
+        let result = storage::try_with_class(Class::Recovery, progress, |j, d, s| {
+            f.snapshot_execute(request, operation, payload, j, d, s)
+        })?;
+        let changed = f
+            .snapshot_control()
+            .is_ok_and(|control| control.live_view_epoch != before);
+        if changed {
+            crate::domain_tasks::invalidate_file_capabilities();
+        }
+        result
+    })
+}
+pub fn snapshot_open(
+    key: cyxia_prototype::snapshot::SnapshotKey,
+    path: &str,
+    prefix: &str,
+    progress: &mut dyn FnMut(),
+) -> Result<Handle, Error> {
+    ready()?;
+    // Resolving a historical root is bounded management I/O. Subsequent data
+    // reads use the existing Foreground path and its real demand admission.
+    with_files(|f| {
+        storage::try_with_class(Class::Recovery, progress, |j, d, s| {
+            f.snapshot_open(key, path, prefix, j, d, s)
+        })?
+    })
+}
+pub fn snapshot_handle_object(handle: Handle) -> Result<ObjectKey, Error> {
+    read_files(|f| f.snapshot_handle_object(handle))
+}
+pub fn snapshot_open_recovery(
+    key: cyxia_prototype::snapshot::SnapshotKey,
+    path: &str,
+    prefix: &str,
+    progress: &mut dyn FnMut(),
+) -> Result<Handle, Error> {
+    ready()?;
+    with_files(|f| {
+        storage::try_with_class(Class::Recovery, progress, |j, d, s| {
+            f.snapshot_open_recovery(key, path, prefix, j, d, s)
+        })?
+    })
+}
+pub fn snapshot_query_request(
+    key: cyxia_prototype::snapshot::FileReqKey,
+    progress: &mut dyn FnMut(),
+) -> Result<cyxia_prototype::snapshot::RequestRecord, Error> {
+    ready()?;
+    with_files(|f| {
+        storage::try_with_class(Class::Recovery, progress, |j, d, s| {
+            f.snapshot_query_request(key, j, d, s)
+        })?
+    })
+}
+pub fn snapshot_ack(
+    key: cyxia_prototype::snapshot::FileReqKey,
+    digest: [u8; 32],
+    progress: &mut dyn FnMut(),
+) -> Result<(), Error> {
+    ready()?;
+    with_files(|f| {
+        storage::try_with_class(Class::Recovery, progress, |j, d, s| {
+            f.snapshot_ack(key, digest, j, d, s)
+        })?
+    })
+}
+#[path = "domain_storage/snapshot_wire.rs"]
+mod snapshot_wire;
+pub fn snapshot_status(out: &mut [u8]) -> Result<usize, Error> {
+    read_files(|f| snapshot_wire::encode(f, None, out))
+}
+pub fn snapshot_query(
+    key: cyxia_prototype::snapshot::SnapshotKey,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    read_files(|f| snapshot_wire::encode(f, Some(key), out))
+}
 pub fn background_flush(now: u64, p: &mut dyn FnMut()) -> Result<Option<FlushReceipt>, Error> {
     ready()?;
+    if now >= SNAPSHOT_NEXT_MAINTENANCE.load(Ordering::Acquire) {
+        #[cfg(snapshot_probe)]
+        crate::unified::service_stage(200);
+        with_files(|f| {
+            storage::try_with_class(Class::Recovery, p, |j, d, s| {
+                f.snapshot_maintenance(now, j, d, s)
+            })?
+        })?;
+        #[cfg(snapshot_probe)]
+        crate::unified::service_stage(201);
+        SNAPSHOT_NEXT_MAINTENANCE.store(
+            now.checked_add(cyxia_prototype::snapshot::SECOND_NS)
+                .ok_or(Error::Overflow)?,
+            Ordering::Release,
+        );
+    }
     let usage = cache_partition_status()?;
     // Read the stopped file callers before borrowing FILES or the disk. Busy
     // is not proof of an empty foreground queue, so it forbids borrowing but

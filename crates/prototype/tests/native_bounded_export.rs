@@ -214,6 +214,9 @@ fn reset() {
         .unwrap();
     let mut files = FileSystem::<64>::new();
     files.mount(&mut journal, &mut disk, &mut scratch).unwrap();
+    files
+        .initialize_business(&mut journal, &mut disk, &mut scratch)
+        .unwrap();
     *BACKEND.lock().unwrap() = Some(Box::new(Backend {
         files,
         disk,

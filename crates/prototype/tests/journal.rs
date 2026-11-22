@@ -1,7 +1,7 @@
 use cyxia_prototype::journal::{self, AfterImage, BlockDevice, Error, Journal, Scratch};
 use cyxia_prototype::storage::{
-    self, BITMAP_START, BLOCK_SIZE, DATA_START, INODE_START, Inode, InodeKind, LogPayload, Record,
-    Superblock, TOTAL_BLOCKS,
+    self, BITMAP_START, BLOCK_SIZE, CLUSTER_START as DATA_START, FIRST_BUSINESS_BLOCK, INODE_START,
+    Inode, InodeKind, LogPayload, Record, Superblock, TOTAL_BLOCKS,
 };
 use std::collections::BTreeMap;
 
@@ -28,6 +28,12 @@ struct Disk {
     cut: Option<Cut>,
     reads: usize,
     capacity: u32,
+    reservations: Vec<u64>,
+    endings: Vec<bool>,
+    reject_reservation: bool,
+    fail_flush: Option<usize>,
+    fail_read: Option<u32>,
+    cpu_progress_calls: usize,
 }
 impl Disk {
     fn blank() -> Self {
@@ -38,7 +44,16 @@ impl Disk {
     }
     fn before(&mut self, operation: Operation) -> Result<(), Fault> {
         self.operations.push(operation);
-        if matches!(self.cut, Some(Cut::Before(n)) if self.operations.len() == n) {
+        if matches!(self.cut, Some(Cut::Before(n)) if self.operations.len() == n)
+            || (operation == Operation::Flush
+                && self.fail_flush
+                    == Some(
+                        self.operations
+                            .iter()
+                            .filter(|op| **op == Operation::Flush)
+                            .count(),
+                    ))
+        {
             Err(Fault::Injected)
         } else {
             Ok(())
@@ -56,6 +71,7 @@ impl Disk {
         // not the fault model; only successful FLUSH survives this cut.
         self.pending.clear();
         self.cut = None;
+        self.fail_flush = None;
         self.operations.clear();
     }
     fn home(&self, block: u32) -> Block {
@@ -73,6 +89,9 @@ impl BlockDevice for Disk {
     fn read_block(&mut self, block: u32, output: &mut Block) -> Result<(), Fault> {
         assert!(block < TOTAL_BLOCKS);
         self.reads += 1;
+        if self.fail_read == Some(block) {
+            return Err(Fault::Injected);
+        }
         match self.pending.get(&block) {
             Some(Some(bytes)) => output.copy_from_slice(&bytes[..]),
             Some(None) => output.fill(0),
@@ -106,6 +125,19 @@ impl BlockDevice for Disk {
             }
         }
         self.after()
+    }
+    fn transaction_begin(&mut self, bytes: u64) -> Result<(), Fault> {
+        if self.reject_reservation {
+            return Err(Fault::Injected);
+        }
+        self.reservations.push(bytes);
+        Ok(())
+    }
+    fn transaction_end(&mut self, success: bool) {
+        self.endings.push(success);
+    }
+    fn cpu_progress(&mut self) {
+        self.cpu_progress_calls += 1;
     }
 }
 fn scratch() -> Scratch {
@@ -189,7 +221,7 @@ fn formatter_checks_every_block_and_publishes_valid_initial_metadata() {
         let bitmap = disk.home(BITMAP_START + block / (BLOCK_SIZE as u32 * 8));
         let allocated =
             bitmap[(block % (BLOCK_SIZE as u32 * 8) / 8) as usize] & (1 << (block % 8)) != 0;
-        assert_eq!(allocated, block < DATA_START);
+        assert_eq!(allocated, block < FIRST_BUSINESS_BLOCK);
     }
     for id in 0..256 {
         let bytes = disk.home(INODE_START + id / 16);
@@ -197,8 +229,10 @@ fn formatter_checks_every_block_and_publishes_valid_initial_metadata() {
         let inode = Inode::decode(id, &bytes[slot..slot + 256]).unwrap();
         assert_eq!(
             inode.kind,
-            if id == 0 {
+            if id == 0 || id == storage::SYSTEM_ROOT_INODE {
                 InodeKind::Directory
+            } else if (storage::BOOT_INODE..=storage::REQUEST_INODE).contains(&id) {
+                InodeKind::File
             } else {
                 InodeKind::Free
             }
@@ -517,6 +551,8 @@ fn every_recovery_write_and_flush_boundary_preserves_acknowledged_fsync_sequence
             let key = {
                 let mut fs = FileSystem::<64>::new();
                 fs.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
+                fs.initialize_business(&mut journal, &mut disk, &mut scratch())
+                    .unwrap();
                 let key = fs
                     .create("/durable", &mut journal, &mut disk, &mut scratch())
                     .unwrap();
@@ -652,6 +688,7 @@ fn independent_checker_keeps_real_boot_prefix_when_final_commit_did_not_flush() 
             &mut [[0; BLOCK_SIZE]; 4],
         )
         .unwrap();
+    let acknowledged_lsn = journal.last_commit_lsn();
     journal.checkpoint(&mut disk, &mut scratch()).unwrap();
     disk.operations.clear();
     // The next BootEpoch updates two home blocks. Its BEGIN and REDOs are
@@ -673,9 +710,9 @@ fn independent_checker_keeps_real_boot_prefix_when_final_commit_did_not_flush() 
     let result = independent_image(
         &disk,
         "boot-prefix",
-        "import sys; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v13_disk import inspect; r=inspect(Path(sys.argv[1])); print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions'], r['discarded_tail'])",
+        "import sys; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v2_filesystem import inspect; r=inspect(Path(sys.argv[1])); print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions'], r['discarded_tail'])",
     );
-    assert_eq!(result, "1 6 0 True");
+    assert_eq!(result, format!("1 {acknowledged_lsn} 0 True"));
 }
 
 #[test]
@@ -689,22 +726,24 @@ fn independent_checker_reads_real_ordinary_fsync_prefix_and_ignores_uncommitted_
         BootSession::new().allocate(&mut journal, &mut disk, &mut scratch(), &mut [[0; BLOCK_SIZE]; 4]).unwrap();
         let mut files = FileSystem::<64>::new();
         files.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
+        files.initialize_business(&mut journal, &mut disk, &mut scratch()).unwrap();
         files.mkdir("/a10", &mut journal, &mut disk, &mut scratch()).unwrap();
         let object = files.create("/a10/value", &mut journal, &mut disk, &mut scratch()).unwrap();
-        assert_eq!((object.id, object.generation), (5, 2));
+        assert!(object.id > 0 && object.id < u64::from(storage::BUSINESS_INODE_COUNT));
         let handle = files.open("/a10/value", OpenMode::ReadWrite, &mut journal, &mut disk, &mut scratch()).unwrap();
         for (byte, sequence) in [(0x11, 1), (0x22, 2)] {
             files.write(handle, 0, &[byte; BLOCK_SIZE], &mut journal, &mut disk, &mut scratch()).unwrap();
             assert_eq!(files.fsync(handle, &mut journal, &mut disk, &mut scratch()).unwrap().write_seq, sequence);
         }
-        assert_eq!(journal.last_commit_lsn(), 24);
+        let acknowledged_lsn = journal.last_commit_lsn();
         files.write(handle, 0, &[0x33; BLOCK_SIZE], &mut journal, &mut disk, &mut scratch()).unwrap();
-        disk.operations.clear(); disk.cut = Some(Cut::Before(8));
+        disk.operations.clear(); disk.fail_flush = Some(2);
         assert!(files.fsync(handle, &mut journal, &mut disk, &mut scratch()).is_err());
-        assert_eq!(disk.operations[7], Operation::Flush);
+        assert_eq!(disk.operations.last(), Some(&Operation::Flush));
+        assert_eq!(disk.operations.iter().filter(|op| **op == Operation::Flush).count(), 2);
         disk.power_cut();
-        let result = independent_image(&disk, "ordinary-prefix", "import sys,hashlib; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v13_filesystem import inspect; r=inspect(Path(sys.argv[1])); v=r['files']['/a10/value']; print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions'], r['replayed_blocks'], r['discarded_tail'], v['inode'], v['generation'], v['size'], v['durable_write_seq'], v['sha256']==hashlib.sha256(bytes([0x22])*4096).hexdigest())");
-        assert_eq!(result, "1 24 5 6 True 5 2 4096 2 True");
+        let result = independent_image(&disk, "ordinary-prefix", "import sys,hashlib; from pathlib import Path; sys.path.insert(0, 'tools'); from check_v2_filesystem import inspect; r=inspect(Path(sys.argv[1])); v=r['files']['/a10/value']; print(r['boot_epoch'], r['last_commit_lsn'], r['committed_transactions']>0, r['discarded_tail'], v['inode'], v['generation'], v['size'], v['durable_write_seq'], v['sha256']==hashlib.sha256(bytes([0x22])*4096).hexdigest())");
+        assert_eq!(result, format!("1 {acknowledged_lsn} True True {} {} 4096 2 True", object.id, object.generation));
     }).unwrap().join().unwrap();
 }
 
@@ -839,13 +878,13 @@ fn ordered_digest_matches_independent_python_sha256_golden() {
     let LogPayload::Commit { ordered_digest, .. } = record.payload else {
         panic!("not COMMIT")
     };
-    // hashlib.sha256((4118).to_bytes(8,'little') + bytes([0xa5])*4096)
+    // hashlib.sha256((4242).to_bytes(8,'little') + bytes([0xa5])*4096)
     assert_eq!(
         ordered_digest,
         [
-            0x59, 0x17, 0xbc, 0xb9, 0xfa, 0x23, 0x56, 0x5f, 0x39, 0x05, 0xda, 0x91, 0x7b, 0x7e,
-            0x53, 0xe0, 0x67, 0x9f, 0x71, 0x3d, 0xb8, 0x22, 0x76, 0x13, 0x04, 0xd9, 0x70, 0x39,
-            0x0e, 0x33, 0x59, 0x99
+            0x7d, 0xe8, 0x45, 0xba, 0xb6, 0x1c, 0x84, 0x6d, 0x0f, 0x58, 0x93, 0x10, 0x7e, 0xe1,
+            0xf2, 0xc1, 0xad, 0xf2, 0x87, 0x9c, 0x5f, 0x96, 0x46, 0xfd, 0x6c, 0x97, 0x0d, 0x7d,
+            0xa3, 0x0b, 0x18, 0xca
         ]
     );
 }
@@ -945,8 +984,24 @@ fn full_log_at_exact_boundary_recovers_every_distinct_home_and_never_overwrites_
 
 #[test]
 fn interrupted_format_never_publishes_before_metadata_and_log_flush() {
+    let mut reference = Disk::blank();
+    journal::format(&mut reference, [0x42; 16], &mut scratch()).unwrap();
+    let operations = reference.operations;
+    let first_publish_flush = operations
+        .iter()
+        .position(|op| *op == Operation::Write(0))
+        .unwrap()
+        + 2;
+    let mut boundaries = vec![1, 20, 21];
+    for (index, operation) in operations.iter().enumerate() {
+        if *operation == Operation::Flush {
+            boundaries.extend([index.max(1), index + 1, (index + 2).min(operations.len())]);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
     for after in [false, true] {
-        for point in [1, 20, 21, 22, 4117, 4118, 4119, 4120, 4121, 4122] {
+        for &point in &boundaries {
             let mut disk = Disk::blank();
             disk.cut = Some(if after {
                 Cut::After(point)
@@ -959,7 +1014,10 @@ fn interrupted_format_never_publishes_before_metadata_and_log_flush() {
             );
             disk.power_cut();
             let has_published = disk.stable.contains_key(&0);
-            assert_eq!(has_published, point > 4120 || (point == 4120 && after));
+            assert_eq!(
+                has_published,
+                point > first_publish_flush || (point == first_publish_flush && after)
+            );
             let mut journal = Journal::new();
             let result = journal.mount(&mut disk, &mut scratch());
             if has_published {
@@ -1025,4 +1083,391 @@ fn generation_epoch_and_lsn_exhaustion_are_rejected_before_io() {
         Err(Error::Counter)
     );
     assert!(disk.operations.is_empty());
+}
+
+fn allocated_bit(bytes: &Block, block: u32) -> bool {
+    let local = block as usize % (BLOCK_SIZE * 8);
+    bytes[local / 8] & (1 << (local % 8)) != 0
+}
+fn set_bit(bytes: &mut Block, block: u32) {
+    let local = block as usize % (BLOCK_SIZE * 8);
+    bytes[local / 8] |= 1 << (local % 8);
+}
+
+#[test]
+fn ordered_cow_reserves_complete_write_set_and_publishes_only_after_two_flushes() {
+    let (mut disk, mut journal) = mounted();
+    let target = FIRST_BUSINESS_BLOCK;
+    let mut bitmap = read(&mut journal, &mut disk, BITMAP_START);
+    set_bit(&mut bitmap, target);
+    let data = [0x72; BLOCK_SIZE];
+    let expected = journal.peek_next_commit(1).unwrap();
+    let receipt = journal
+        .commit_ordered(
+            &mut disk,
+            &[AfterImage {
+                home_block: target,
+                bytes: &data,
+            }],
+            &[AfterImage {
+                home_block: BITMAP_START,
+                bytes: &bitmap,
+            }],
+            &mut scratch(),
+        )
+        .unwrap();
+    assert_eq!(receipt, expected);
+    assert_eq!(disk.reservations, [5 * BLOCK_SIZE as u64]);
+    assert_eq!(disk.endings, [true]);
+    assert_eq!(
+        disk.operations,
+        [
+            Operation::Write(target),
+            Operation::Write(2),
+            Operation::Write(3),
+            Operation::Write(4),
+            Operation::Flush,
+            Operation::Write(5),
+            Operation::Flush
+        ]
+    );
+    assert_eq!(disk.home(target), data);
+    assert!(!allocated_bit(&disk.home(BITMAP_START), target));
+    assert!(allocated_bit(
+        &read(&mut journal, &mut disk, BITMAP_START),
+        target
+    ));
+    disk.operations.clear();
+    journal.checkpoint(&mut disk, &mut scratch()).unwrap();
+    assert!(!disk.operations.contains(&Operation::Write(target)));
+    assert!(allocated_bit(&disk.home(BITMAP_START), target));
+}
+
+#[test]
+fn ordered_cow_rejects_allocated_duplicate_unpublished_and_unreserved_targets_before_writes() {
+    let (mut disk, mut journal) = mounted();
+    let target = FIRST_BUSINESS_BLOCK;
+    let original = read(&mut journal, &mut disk, BITMAP_START);
+    let mut bitmap = original;
+    set_bit(&mut bitmap, target);
+    let data = [1; BLOCK_SIZE];
+    let ordered = AfterImage {
+        home_block: target,
+        bytes: &data,
+    };
+    let metadata = AfterImage {
+        home_block: BITMAP_START,
+        bytes: &bitmap,
+    };
+    for (data_set, metadata_set) in [
+        (vec![ordered, ordered], vec![metadata]),
+        (vec![ordered], vec![]),
+        (
+            vec![ordered],
+            vec![AfterImage {
+                home_block: BITMAP_START,
+                bytes: &original,
+            }],
+        ),
+        (
+            vec![AfterImage {
+                home_block: DATA_START,
+                bytes: &data,
+            }],
+            vec![metadata],
+        ),
+        (vec![], vec![ordered]),
+        (vec![ordered; storage::MAX_ORDERED + 1], vec![metadata]),
+    ] {
+        assert_eq!(
+            journal.commit_ordered(&mut disk, &data_set, &metadata_set, &mut scratch()),
+            Err(Error::Invalid)
+        );
+        assert!(journal.is_writable());
+        assert!(disk.operations.is_empty());
+        assert!(disk.reservations.is_empty());
+    }
+    disk.reject_reservation = true;
+    assert_eq!(
+        journal.commit_ordered(&mut disk, &[ordered], &[metadata], &mut scratch()),
+        Err(Error::Io(Fault::Injected))
+    );
+    assert!(journal.is_writable());
+    assert!(disk.operations.is_empty());
+    assert!(disk.endings.is_empty());
+    disk.reject_reservation = false;
+    journal
+        .commit_ordered(&mut disk, &[ordered], &[metadata], &mut scratch())
+        .unwrap();
+    disk.operations.clear();
+    // The bitmap home remains free until checkpoint: only the committed overlay
+    // prevents an illegal second write into the immutable, already allocated block.
+    assert!(!allocated_bit(&disk.home(BITMAP_START), target));
+    assert_eq!(
+        journal.commit_ordered(&mut disk, &[ordered], &[metadata], &mut scratch()),
+        Err(Error::Invalid)
+    );
+    assert!(disk.operations.is_empty());
+    assert!(journal.is_writable());
+}
+
+#[test]
+fn every_ordered_cow_write_and_flush_cut_preserves_old_data_and_never_publishes_unflushed_bytes() {
+    let (mut original, mut journal) = mounted();
+    let old = FIRST_BUSINESS_BLOCK;
+    let target = old + 1;
+    let mut bitmap = read(&mut journal, &mut original, BITMAP_START);
+    set_bit(&mut bitmap, old);
+    journal
+        .commit_ordered(
+            &mut original,
+            &[AfterImage {
+                home_block: old,
+                bytes: &[0x31; BLOCK_SIZE],
+            }],
+            &[AfterImage {
+                home_block: BITMAP_START,
+                bytes: &bitmap,
+            }],
+            &mut scratch(),
+        )
+        .unwrap();
+    journal.checkpoint(&mut original, &mut scratch()).unwrap();
+    set_bit(&mut bitmap, target);
+    for after in [false, true] {
+        for point in 1..=7 {
+            let mut disk = original.clone();
+            disk.power_cut();
+            let mut live = Journal::new();
+            live.mount(&mut disk, &mut scratch()).unwrap();
+            disk.operations.clear();
+            disk.cut = Some(if after {
+                Cut::After(point)
+            } else {
+                Cut::Before(point)
+            });
+            assert_eq!(
+                live.commit_ordered(
+                    &mut disk,
+                    &[AfterImage {
+                        home_block: target,
+                        bytes: &[0x62; BLOCK_SIZE]
+                    }],
+                    &[AfterImage {
+                        home_block: BITMAP_START,
+                        bytes: &bitmap
+                    }],
+                    &mut scratch()
+                ),
+                Err(Error::Io(Fault::Injected)),
+                "after={after}, point={point}"
+            );
+            assert!(!live.is_writable());
+            assert_eq!(disk.endings.last(), Some(&false));
+            disk.power_cut();
+            let mut recovered = Journal::new();
+            recovered.mount(&mut disk, &mut scratch()).unwrap();
+            assert_eq!(disk.home(old), [0x31; BLOCK_SIZE]);
+            let published = allocated_bit(&read(&mut recovered, &mut disk, BITMAP_START), target);
+            assert_eq!(
+                published,
+                after && point == 7,
+                "after={after}, point={point}"
+            );
+            if published {
+                assert_eq!(disk.home(target), [0x62; BLOCK_SIZE]);
+            }
+        }
+    }
+}
+
+#[test]
+fn valid_crc_business_redo_with_a_durable_commit_is_middle_corruption() {
+    let (mut disk, mut journal) = mounted();
+    commit(&mut journal, &mut disk, DATA_START, 9);
+    // Bypass the encoder to emulate a corrupted on-disk destination, retaining
+    // valid record CRCs. A later valid COMMIT prevents tail-discard recovery.
+    let header = disk.stable.get_mut(&3).unwrap();
+    header[40..48].copy_from_slice(&u64::from(FIRST_BUSINESS_BLOCK).to_le_bytes());
+    header[56..60].fill(0);
+    let crc = storage::crc32c(&header[..64]);
+    header[56..60].copy_from_slice(&crc.to_le_bytes());
+    disk.power_cut();
+    assert_eq!(
+        Journal::new().mount(&mut disk, &mut scratch()),
+        Err(Error::Corrupt)
+    );
+    assert!(disk.operations.is_empty());
+    assert_eq!(disk.home(FIRST_BUSINESS_BLOCK), [0; BLOCK_SIZE]);
+}
+
+#[test]
+fn maximum_ordered_batch_spans_all_four_bitmaps_without_business_redo() {
+    let (mut disk, mut journal) = mounted();
+    let mut maps = [[0; BLOCK_SIZE]; 4];
+    let mut targets = Vec::new();
+    for (index, map) in maps.iter_mut().enumerate() {
+        *map = read(&mut journal, &mut disk, BITMAP_START + index as u32);
+        let first = if index == 0 {
+            FIRST_BUSINESS_BLOCK
+        } else {
+            index as u32 * 32768
+        };
+        for offset in 0..32 {
+            let block = first + offset;
+            set_bit(map, block);
+            targets.push(block);
+        }
+    }
+    let bytes = [0x85; BLOCK_SIZE];
+    let ordered: Vec<_> = targets
+        .iter()
+        .map(|block| AfterImage {
+            home_block: *block,
+            bytes: &bytes,
+        })
+        .collect();
+    let changes: Vec<_> = maps
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| AfterImage {
+            home_block: BITMAP_START + index as u32,
+            bytes,
+        })
+        .collect();
+    assert_eq!(ordered.len(), storage::MAX_ORDERED);
+    journal
+        .commit_ordered(&mut disk, &ordered, &changes, &mut scratch())
+        .unwrap();
+    assert_eq!(disk.reservations, [138 * BLOCK_SIZE as u64]);
+    disk.power_cut();
+    let mut recovered = Journal::new();
+    let report = recovered.mount(&mut disk, &mut scratch()).unwrap();
+    assert_eq!(report.replayed_blocks, 4);
+    for block in targets {
+        assert_eq!(disk.home(block), bytes);
+        assert!(allocated_bit(
+            &disk.home(BITMAP_START + block / 32768),
+            block
+        ));
+        assert!(!disk.operations.contains(&Operation::Write(block)));
+    }
+}
+
+#[test]
+fn scratch_read_uses_latest_redo_and_rejects_wrong_record_identity() {
+    let (mut disk, mut journal) = mounted();
+    commit(&mut journal, &mut disk, DATA_START, 0x45);
+    let mut work = scratch();
+    assert_eq!(
+        journal
+            .read_block_scratch(&mut disk, DATA_START, &mut work)
+            .unwrap(),
+        &[0x45; BLOCK_SIZE]
+    );
+    rewrite_record(&mut disk, 3, |record| record.log_epoch += 1);
+    assert_eq!(
+        journal.read_block_scratch(&mut disk, DATA_START, &mut work),
+        Err(Error::Corrupt)
+    );
+    assert!(!journal.is_writable());
+}
+
+#[test]
+fn immutable_business_read_needs_no_redo_buffer_and_rejects_mutable_homes() {
+    let (mut disk, mut journal) = mounted();
+    disk.stable
+        .insert(FIRST_BUSINESS_BLOCK, Box::new([0x7a; BLOCK_SIZE]));
+    let mut block = [0; BLOCK_SIZE];
+    assert_eq!(
+        journal.read_business_block(&mut disk, DATA_START, &mut block),
+        Err(Error::Invalid)
+    );
+    assert!(journal.is_writable());
+    journal
+        .read_business_block(&mut disk, FIRST_BUSINESS_BLOCK, &mut block)
+        .unwrap();
+    assert_eq!(block, [0x7a; BLOCK_SIZE]);
+    assert_eq!(
+        journal
+            .read_block_scratch(&mut disk, FIRST_BUSINESS_BLOCK, &mut scratch())
+            .unwrap(),
+        &[0x7a; BLOCK_SIZE]
+    );
+}
+
+fn progress_read(
+    journal: &mut Journal,
+    disk: &mut Disk,
+    use_scratch: bool,
+    home: u32,
+) -> Result<Block, Error<Fault>> {
+    if use_scratch {
+        journal
+            .read_block_scratch(disk, home, &mut scratch())
+            .copied()
+    } else {
+        let mut out = [0; BLOCK_SIZE];
+        journal.read_block(disk, home, &mut out, &mut scratch())?;
+        Ok(out)
+    }
+}
+
+#[test]
+fn cpu_progress_follows_successful_direct_and_validated_redo_reads() {
+    for use_scratch in [false, true] {
+        let (mut disk, mut journal) = mounted();
+        disk.cpu_progress_calls = 0;
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, DATA_START).unwrap(),
+            [0; BLOCK_SIZE]
+        );
+        assert_eq!(disk.cpu_progress_calls, 1);
+        commit(&mut journal, &mut disk, DATA_START, 0x59);
+        let before = disk.cpu_progress_calls;
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, DATA_START).unwrap(),
+            [0x59; BLOCK_SIZE]
+        );
+        assert_eq!(disk.cpu_progress_calls, before + 1);
+        rewrite_record(&mut disk, 3, |record| record.log_epoch += 1);
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, DATA_START),
+            Err(Error::Corrupt)
+        );
+        assert_eq!(disk.cpu_progress_calls, before + 1);
+        assert!(!journal.is_writable());
+    }
+}
+
+#[test]
+fn invalid_unknown_io_and_corrupt_crc_reads_never_publish_cpu_progress() {
+    for use_scratch in [false, true] {
+        let (mut disk, mut journal) = mounted();
+        disk.cpu_progress_calls = 0;
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, 0),
+            Err(Error::Invalid)
+        );
+        assert_eq!(disk.cpu_progress_calls, 0);
+        assert!(journal.is_writable());
+        disk.fail_read = Some(DATA_START);
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, DATA_START),
+            Err(Error::Io(Fault::Injected))
+        );
+        assert_eq!(disk.cpu_progress_calls, 0);
+        assert!(!journal.is_writable());
+
+        let (mut disk, mut journal) = mounted();
+        commit(&mut journal, &mut disk, DATA_START, 0x66);
+        disk.cpu_progress_calls = 0;
+        disk.corrupt(3, 64);
+        assert_eq!(
+            progress_read(&mut journal, &mut disk, use_scratch, DATA_START),
+            Err(Error::Corrupt)
+        );
+        assert_eq!(disk.cpu_progress_calls, 0);
+        assert!(!journal.is_writable());
+    }
 }

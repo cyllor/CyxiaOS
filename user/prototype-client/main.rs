@@ -2,6 +2,8 @@
 #![no_main]
 #[path = "../prototype-task/files_abi.rs"]
 mod file;
+#[cfg(snapshot_probe)]
+mod snapshot_probe;
 #[cfg(storage_fault_probe)]
 mod storage_fault;
 
@@ -628,15 +630,25 @@ fn run(authority: file::Capability) -> u64 {
 }
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-extern "C" fn _start(id: u64, generation: u64) -> ! {
+extern "C" fn _start(id: u64, generation: u64, snapshot_id: u64, snapshot_generation: u64) -> ! {
+    #[cfg(snapshot_probe)]
+    finish(snapshot_probe::run(
+        file::Capability { id, generation },
+        file::Capability {
+            id: snapshot_id,
+            generation: snapshot_generation,
+        },
+    ));
     #[cfg(storage_fault_probe)]
     finish(storage_fault::run(file::Capability { id, generation }));
-    #[cfg(not(storage_fault_probe))]
+    #[cfg(not(any(storage_fault_probe, snapshot_probe)))]
     {
-    // Ordinary EL0 request through the same protected affinity admission used
-    // by every task. CPU1 initially belongs to C; this must return E_AUTH.
-    if call(21, 2, 0, 0, 0, 0)[0] as i64 != -13 { finish(190); }
-    finish(run(file::Capability { id, generation }))
+        // Ordinary EL0 request through the same protected affinity admission used
+        // by every task. CPU1 initially belongs to C; this must return E_AUTH.
+        if call(21, 2, 0, 0, 0, 0)[0] as i64 != -13 {
+            finish(190);
+        }
+        finish(run(file::Capability { id, generation }))
     }
 }
 #[panic_handler]

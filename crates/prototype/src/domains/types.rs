@@ -23,6 +23,7 @@ pub enum Error {
     Io,
     Overflow,
     NotReady,
+    ReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]

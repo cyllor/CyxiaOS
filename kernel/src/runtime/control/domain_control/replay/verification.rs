@@ -34,6 +34,7 @@ pub(super) fn evidence_error(error: Error) -> learning::Error {
         | Error::NotEmpty
         | Error::Range
         | Error::Io
+        | Error::ReadOnly
         | Error::Overflow => learning::Error::Evidence,
     }
 }

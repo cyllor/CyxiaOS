@@ -1,4 +1,4 @@
-//! Fixed disk-format codecs for the v1.3 functional profile, sections 9.2–9.2.1.
+//! Fixed disk-format codecs for the v1.4 immutable-snapshot profile.
 //!
 //! These codecs validate local structure, checksums, bounds, and reserved bytes.
 //! They do **not** validate filesystem-wide bitmap/ownership/reference consistency,
@@ -15,17 +15,48 @@ pub const BLOCK_SIZE: usize = 4096;
 pub const TOTAL_BLOCKS: u32 = 131_072;
 pub const BITMAP_START: u32 = 4098;
 pub const INODE_START: u32 = 4102;
-pub const DATA_START: u32 = 4118;
+pub const CONTROL_START: u32 = 4118;
+pub const CATALOG_START: u32 = 4119;
+pub const SNAPSHOT_START: u32 = 4120;
+pub const SNAPSHOT_SLOTS: u32 = 8;
+pub const SNAPSHOT_STRIDE: u32 = 15;
+pub const BUSINESS_INODE_COUNT: u32 = 224;
+pub const SYSTEM_ROOT_INODE: u32 = 224;
+pub const BOOT_INODE: u32 = 225;
+pub const CLUSTER_INODES: [u32; 2] = [226, 227];
+pub const REQUEST_INODE: u32 = 228;
+pub const DATA_START: u32 = 4240;
+pub const SYSTEM_ROOT_BLOCK: u32 = DATA_START;
+pub const BOOT_BLOCK: u32 = DATA_START + 1;
+pub const CLUSTER_START: u32 = DATA_START + 2;
+pub const CLUSTER_FILE_BLOCKS: u32 = 2048;
+pub const SNAPSHOT_REQUEST_START: u32 = DATA_START + 4098;
+pub const SNAPSHOT_REQUEST_BLOCKS: u32 = 16;
+pub const FIRST_BUSINESS_BLOCK: u32 = DATA_START + 4114;
 pub const INODE_COUNT: u32 = 256;
 pub const INODE_SIZE: usize = 256;
 pub const DIRECTORY_SLOT_SIZE: usize = 128;
 pub const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 pub const MAX_DIRECTORY_SIZE: u64 = 256 * DIRECTORY_SLOT_SIZE as u64;
 pub const MAX_REDOS: u32 = 128;
+pub const MAX_ORDERED: usize = 128;
+pub const MAX_INLINE_EXTENTS: usize = 16;
+pub const MAX_INDIRECT_EXTENTS: usize = 338;
+pub const MAX_EXTENTS: usize = MAX_INLINE_EXTENTS + MAX_INDIRECT_EXTENTS;
 pub const LOG_HEADER_SIZE: usize = 64;
 const SUPERBLOCK_MAGIC: u32 = 0x4359_4653;
 const INODE_MAGIC: u32 = 0x4359_494e;
 const LOG_MAGIC: u32 = 0x4359_4c47;
+const EXTENT_MAGIC: u32 = 0x4359_4558;
+
+/// The complete mutable-home domain. All later blocks are immutable CoW data.
+pub const fn is_redo_home(block: u32) -> bool {
+    block >= BITMAP_START && block < FIRST_BUSINESS_BLOCK
+}
+
+pub const fn is_business_block(block: u32) -> bool {
+    block >= FIRST_BUSINESS_BLOCK && block < TOTAL_BLOCKS
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -46,12 +77,28 @@ pub enum Error {
     Range,
 }
 
-fn crc_byte(mut crc: u32, byte: u8) -> u32 {
-    crc ^= u32::from(byte);
-    for _ in 0..8 {
-        crc = (crc >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(crc & 1));
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = (value >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(value & 1));
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
     }
-    crc
+    table
+}
+
+// One compile-time 1 KiB read-only table keeps page validation bounded on
+// platforms without CRC instructions. No mutable state or runtime allocation.
+static CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+fn crc_byte(crc: u32, byte: u8) -> u32 {
+    (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize]
 }
 
 /// Reflected CRC32C (Castagnoli), with initial and final XOR of 0xffffffff.
@@ -63,7 +110,7 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn checksum(bytes: &[u8], offset: usize) -> u32 {
+pub(crate) fn checksum(bytes: &[u8], offset: usize) -> u32 {
     let mut crc = u32::MAX;
     for (index, &byte) in bytes.iter().enumerate() {
         crc = crc_byte(
@@ -162,8 +209,8 @@ impl Superblock {
         self.validate()?;
         bytes.fill(0);
         put32(bytes, 0, SUPERBLOCK_MAGIC);
-        put16(bytes, 4, 1);
-        put16(bytes, 6, 80);
+        put16(bytes, 4, 2);
+        put16(bytes, 6, 112);
         put32(bytes, 8, BLOCK_SIZE as u32);
         put32(bytes, 12, TOTAL_BLOCKS);
         bytes[16..32].copy_from_slice(&self.fs_uuid);
@@ -174,20 +221,28 @@ impl Superblock {
         put32(bytes, 60, INODE_START);
         put32(bytes, 64, DATA_START);
         put32(bytes, 68, INODE_COUNT);
-        write_checksum(bytes, 76);
+        put32(bytes, 76, CONTROL_START);
+        put32(bytes, 80, CATALOG_START);
+        put32(bytes, 84, SNAPSHOT_START);
+        put32(bytes, 88, SNAPSHOT_SLOTS);
+        put32(bytes, 92, SNAPSHOT_STRIDE);
+        put32(bytes, 96, BUSINESS_INODE_COUNT);
+        put32(bytes, 100, SYSTEM_ROOT_INODE);
+        write_checksum(bytes, 108);
         Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         check_len(bytes, BLOCK_SIZE)?;
-        check_checksum(bytes, 76)?;
         if u32_at(bytes, 0) != SUPERBLOCK_MAGIC {
             return Err(Error::Magic);
         }
-        if u16_at(bytes, 4) != 1 {
+        // A v1 image needs an offline export/import; never reinterpret it in place.
+        if u16_at(bytes, 4) != 2 {
             return Err(Error::Version);
         }
-        if u16_at(bytes, 6) != 80
+        check_checksum(bytes, 108)?;
+        if u16_at(bytes, 6) != 112
             || u32_at(bytes, 8) != BLOCK_SIZE as u32
             || u32_at(bytes, 12) != TOTAL_BLOCKS
             || u32_at(bytes, 56) != BITMAP_START
@@ -195,10 +250,18 @@ impl Superblock {
             || u32_at(bytes, 64) != DATA_START
             || u32_at(bytes, 68) != INODE_COUNT
             || u32_at(bytes, 72) != 0
+            || u32_at(bytes, 76) != CONTROL_START
+            || u32_at(bytes, 80) != CATALOG_START
+            || u32_at(bytes, 84) != SNAPSHOT_START
+            || u32_at(bytes, 88) != SNAPSHOT_SLOTS
+            || u32_at(bytes, 92) != SNAPSHOT_STRIDE
+            || u32_at(bytes, 96) != BUSINESS_INODE_COUNT
+            || u32_at(bytes, 100) != SYSTEM_ROOT_INODE
+            || u32_at(bytes, 104) != 0
         {
             return Err(Error::Layout);
         }
-        zeros(&bytes[80..])?;
+        zeros(&bytes[112..])?;
         let mut fs_uuid = [0; 16];
         fs_uuid.copy_from_slice(&bytes[16..32]);
         let value = Self {
@@ -271,6 +334,8 @@ pub struct Inode {
     pub parent_inode: u32,
     pub parent_generation: u64,
     pub extents: [Extent; 16],
+    pub ext_block: u32,
+    pub ext_count: u16,
 }
 
 impl Inode {
@@ -290,24 +355,30 @@ impl Inode {
         }
         if self.kind == InodeKind::Free {
             if inode_id == 0
+                || inode_id == SYSTEM_ROOT_INODE
                 || self.size != 0
                 || self.durable_write_seq != 0
                 || count != 0
                 || self.parent_inode != 0
                 || self.parent_generation != 0
                 || self.extents != [Extent::EMPTY; 16]
+                || self.ext_block != 0
+                || self.ext_count != 0
             {
                 return Err(Error::Layout);
             }
             return Ok(());
         }
-        if self.parent_inode >= INODE_COUNT || self.parent_generation == 0 {
+        if self.parent_inode >= INODE_COUNT
+            || self.parent_generation == 0
+            || (inode_id < BUSINESS_INODE_COUNT) != (self.parent_inode < BUSINESS_INODE_COUNT)
+        {
             return Err(Error::Identity);
         }
-        if inode_id == 0 {
+        if inode_id == 0 || inode_id == SYSTEM_ROOT_INODE {
             if self.kind != InodeKind::Directory
                 || self.generation != 1
-                || self.parent_inode != 0
+                || self.parent_inode != inode_id
                 || self.parent_generation != 1
             {
                 return Err(Error::Identity);
@@ -326,6 +397,15 @@ impl Inode {
         if self.size > maximum {
             return Err(Error::Range);
         }
+        if usize::from(self.ext_count) > MAX_INDIRECT_EXTENTS
+            || (self.ext_block == 0) != (self.ext_count == 0)
+            || (self.ext_block != 0
+                && (count != MAX_INLINE_EXTENTS
+                    || inode_id >= BUSINESS_INODE_COUNT
+                    || !is_business_block(self.ext_block)))
+        {
+            return Err(Error::Extent);
+        }
         if self.extents[count..]
             .iter()
             .any(|&extent| extent != Extent::EMPTY)
@@ -337,7 +417,11 @@ impl Inode {
         for (index, extent) in self.extents[..count].iter().enumerate() {
             if extent.logical_start != logical_end
                 || extent.block_count == 0
-                || extent.physical_start < DATA_START
+                || if inode_id < BUSINESS_INODE_COUNT {
+                    !is_business_block(extent.physical_start)
+                } else {
+                    !(DATA_START..FIRST_BUSINESS_BLOCK).contains(&extent.physical_start)
+                }
             {
                 return Err(Error::Extent);
             }
@@ -348,7 +432,15 @@ impl Inode {
                 .physical_start
                 .checked_add(extent.block_count)
                 .ok_or(Error::Extent)?;
-            if physical_end > TOTAL_BLOCKS {
+            if physical_end
+                > if inode_id < BUSINESS_INODE_COUNT {
+                    TOTAL_BLOCKS
+                } else {
+                    FIRST_BUSINESS_BLOCK
+                }
+                || (self.ext_block != 0
+                    && (extent.physical_start..physical_end).contains(&self.ext_block))
+            {
                 return Err(Error::Extent);
             }
             for previous in &self.extents[..index] {
@@ -359,7 +451,11 @@ impl Inode {
                 }
             }
         }
-        if u64::from(logical_end) != required {
+        if (self.ext_count == 0 && u64::from(logical_end) != required)
+            || (self.ext_count != 0
+                && (u64::from(logical_end) >= required
+                    || u64::from(logical_end) + u64::from(self.ext_count) > required))
+        {
             return Err(Error::Extent);
         }
         Ok(())
@@ -391,6 +487,8 @@ impl Inode {
             put32(bytes, offset + 4, extent.physical_start);
             put32(bytes, offset + 8, extent.block_count);
         }
+        put32(bytes, 240, self.ext_block);
+        put16(bytes, 244, self.ext_count);
         write_checksum(bytes, 252);
         Ok(())
     }
@@ -403,7 +501,7 @@ impl Inode {
         }
         zeros(&bytes[6..8])?;
         zeros(&bytes[34..36])?;
-        zeros(&bytes[240..252])?;
+        zeros(&bytes[246..252])?;
         let kind = match u16_at(bytes, 4) {
             0 => InodeKind::Free,
             1 => InodeKind::File,
@@ -428,8 +526,252 @@ impl Inode {
             parent_inode: u32_at(bytes, 36),
             parent_generation: u64_at(bytes, 40),
             extents,
+            ext_block: u32_at(bytes, 240),
+            ext_count: u16_at(bytes, 244),
         };
         value.validate(inode_id)?;
+        Ok(value)
+    }
+}
+
+/// One immutable indirect extent page. Its identity is bound to the inode
+/// generation; `validate_for` also checks the complete inline+indirect mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentBlock {
+    pub inode_id: u32,
+    pub inode_generation: u64,
+    pub count: u16,
+    pub extents: [Extent; MAX_INDIRECT_EXTENTS],
+}
+
+impl ExtentBlock {
+    pub const fn empty(inode_id: u32, inode_generation: u64) -> Self {
+        Self {
+            inode_id,
+            inode_generation,
+            count: 0,
+            extents: [Extent::EMPTY; MAX_INDIRECT_EXTENTS],
+        }
+    }
+
+    /// Extract one entry without copying the 338-entry page into a second
+    /// buffer. Call `validate_bytes_for` once before iterating a mapping; this
+    /// accessor checks the exact page length and the entry/count bounds only.
+    pub fn extent_from_bytes(bytes: &[u8], index: usize) -> Result<Extent, Error> {
+        check_len(bytes, BLOCK_SIZE)?;
+        let count = usize::from(u16_at(bytes, 12));
+        if count == 0 || count > MAX_INDIRECT_EXTENTS || index >= count {
+            return Err(Error::Extent);
+        }
+        let offset = 32 + index * 12;
+        Ok(Extent {
+            logical_start: u32_at(bytes, offset),
+            physical_start: u32_at(bytes, offset + 4),
+            block_count: u32_at(bytes, offset + 8),
+        })
+    }
+
+    /// Borrowed equivalent of `decode(bytes)?.validate_for(inode_id, inode)`.
+    /// It validates every byte and the complete inline+indirect mapping while
+    /// using only one entry at a time, for the bounded streaming GC workspace.
+    pub fn validate_bytes_for(bytes: &[u8], inode_id: u32, inode: &Inode) -> Result<(), Error> {
+        check_len(bytes, BLOCK_SIZE)?;
+        check_checksum(bytes, 4092)?;
+        if u32_at(bytes, 0) != EXTENT_MAGIC {
+            return Err(Error::Magic);
+        }
+        if u16_at(bytes, 4) != 2 {
+            return Err(Error::Version);
+        }
+        if u16_at(bytes, 6) != 32 {
+            return Err(Error::Layout);
+        }
+        zeros(&bytes[14..16])?;
+        zeros(&bytes[24..32])?;
+        let count = usize::from(u16_at(bytes, 12));
+        if count == 0 || count > MAX_INDIRECT_EXTENTS {
+            return Err(Error::Extent);
+        }
+        zeros(&bytes[32 + count * 12..4092])?;
+        inode.validate(inode_id)?;
+        if inode_id >= BUSINESS_INODE_COUNT
+            || u32_at(bytes, 8) != inode_id
+            || u64_at(bytes, 16) != inode.generation
+            || count != usize::from(inode.ext_count)
+            || inode.ext_block == 0
+        {
+            return Err(Error::Identity);
+        }
+        let last = inode.extents[MAX_INLINE_EXTENTS - 1];
+        let mut logical_end = last.logical_start + last.block_count;
+        for index in 0..count {
+            let extent = Self::extent_from_bytes(bytes, index)?;
+            if extent.logical_start != logical_end
+                || extent.block_count == 0
+                || !is_business_block(extent.physical_start)
+            {
+                return Err(Error::Extent);
+            }
+            logical_end = logical_end
+                .checked_add(extent.block_count)
+                .ok_or(Error::Extent)?;
+            let end = extent
+                .physical_start
+                .checked_add(extent.block_count)
+                .ok_or(Error::Extent)?;
+            if end > TOTAL_BLOCKS
+                || (extent.physical_start..end).contains(&inode.ext_block)
+                || inode.extents.iter().any(|inline| {
+                    extent.physical_start < inline.physical_start + inline.block_count
+                        && inline.physical_start < end
+                })
+            {
+                return Err(Error::Extent);
+            }
+            for previous in 0..index {
+                let previous = Self::extent_from_bytes(bytes, previous)?;
+                if extent.physical_start < previous.physical_start + previous.block_count
+                    && previous.physical_start < end
+                {
+                    return Err(Error::Extent);
+                }
+            }
+        }
+        if u64::from(logical_end) != inode.size.div_ceil(BLOCK_SIZE as u64) {
+            return Err(Error::Extent);
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        if self.inode_id >= BUSINESS_INODE_COUNT || self.inode_generation == 0 {
+            return Err(Error::Identity);
+        }
+        let count = usize::from(self.count);
+        if count == 0 || count > MAX_INDIRECT_EXTENTS {
+            return Err(Error::Extent);
+        }
+        if self.extents[count..]
+            .iter()
+            .any(|extent| *extent != Extent::EMPTY)
+        {
+            return Err(Error::Reserved);
+        }
+        let mut logical_end = self.extents[0].logical_start;
+        if logical_end < MAX_INLINE_EXTENTS as u32 {
+            return Err(Error::Extent);
+        }
+        for (index, extent) in self.extents[..count].iter().enumerate() {
+            if extent.logical_start != logical_end
+                || extent.block_count == 0
+                || !is_business_block(extent.physical_start)
+            {
+                return Err(Error::Extent);
+            }
+            logical_end = logical_end
+                .checked_add(extent.block_count)
+                .ok_or(Error::Extent)?;
+            let end = extent
+                .physical_start
+                .checked_add(extent.block_count)
+                .ok_or(Error::Extent)?;
+            if end > TOTAL_BLOCKS || u64::from(logical_end) > MAX_FILE_SIZE / BLOCK_SIZE as u64 {
+                return Err(Error::Extent);
+            }
+            if self.extents[..index].iter().any(|previous| {
+                extent.physical_start < previous.physical_start + previous.block_count
+                    && previous.physical_start < end
+            }) {
+                return Err(Error::Extent);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, inode_id: u32, inode: &Inode) -> Result<(), Error> {
+        self.validate()?;
+        inode.validate(inode_id)?;
+        if self.inode_id != inode_id
+            || self.inode_generation != inode.generation
+            || self.count != inode.ext_count
+            || inode.ext_block == 0
+        {
+            return Err(Error::Identity);
+        }
+        let inline_last = inode.extents[MAX_INLINE_EXTENTS - 1];
+        if self.extents[0].logical_start != inline_last.logical_start + inline_last.block_count {
+            return Err(Error::Extent);
+        }
+        let last = self.extents[usize::from(self.count) - 1];
+        if u64::from(last.logical_start + last.block_count)
+            != inode.size.div_ceil(BLOCK_SIZE as u64)
+        {
+            return Err(Error::Extent);
+        }
+        for extent in &self.extents[..usize::from(self.count)] {
+            let end = extent.physical_start + extent.block_count;
+            if (extent.physical_start..end).contains(&inode.ext_block)
+                || inode.extents.iter().any(|inline| {
+                    extent.physical_start < inline.physical_start + inline.block_count
+                        && inline.physical_start < end
+                })
+            {
+                return Err(Error::Extent);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, bytes: &mut [u8]) -> Result<(), Error> {
+        check_len(bytes, BLOCK_SIZE)?;
+        self.validate()?;
+        bytes.fill(0);
+        put32(bytes, 0, EXTENT_MAGIC);
+        put16(bytes, 4, 2);
+        put16(bytes, 6, 32);
+        put32(bytes, 8, self.inode_id);
+        put16(bytes, 12, self.count);
+        put64(bytes, 16, self.inode_generation);
+        for (index, extent) in self.extents[..usize::from(self.count)].iter().enumerate() {
+            let offset = 32 + index * 12;
+            put32(bytes, offset, extent.logical_start);
+            put32(bytes, offset + 4, extent.physical_start);
+            put32(bytes, offset + 8, extent.block_count);
+        }
+        write_checksum(bytes, 4092);
+        Ok(())
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        check_len(bytes, BLOCK_SIZE)?;
+        check_checksum(bytes, 4092)?;
+        if u32_at(bytes, 0) != EXTENT_MAGIC {
+            return Err(Error::Magic);
+        }
+        if u16_at(bytes, 4) != 2 {
+            return Err(Error::Version);
+        }
+        if u16_at(bytes, 6) != 32 {
+            return Err(Error::Layout);
+        }
+        zeros(&bytes[14..16])?;
+        zeros(&bytes[24..32])?;
+        let count = u16_at(bytes, 12);
+        if usize::from(count) > MAX_INDIRECT_EXTENTS {
+            return Err(Error::Extent);
+        }
+        zeros(&bytes[32 + usize::from(count) * 12..4092])?;
+        let mut value = Self::empty(u32_at(bytes, 8), u64_at(bytes, 16));
+        value.count = count;
+        for (index, extent) in value.extents[..usize::from(count)].iter_mut().enumerate() {
+            let offset = 32 + index * 12;
+            *extent = Extent {
+                logical_start: u32_at(bytes, offset),
+                physical_start: u32_at(bytes, offset + 4),
+                block_count: u32_at(bytes, offset + 8),
+            };
+        }
+        value.validate()?;
         Ok(value)
     }
 }
@@ -564,7 +906,8 @@ impl<'a> Record<'a> {
             } => {
                 check_count(count)?;
                 if index >= count
-                    || !(u64::from(BITMAP_START)..u64::from(TOTAL_BLOCKS)).contains(&home_block)
+                    || !(u64::from(BITMAP_START)..u64::from(FIRST_BUSINESS_BLOCK))
+                        .contains(&home_block)
                 {
                     return Err(Error::Range);
                 }
@@ -728,5 +1071,54 @@ impl<'a> Record<'a> {
         };
         value.validate()?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::{checksum, crc32c};
+
+    fn bitwise_reference(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0x82f6_3b78
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn table_crc_matches_independent_bitwise_golden_and_page_lengths() {
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        assert_eq!(crc32c(b""), 0);
+        let bytes: [u8; 8192] = core::array::from_fn(|i| (i.wrapping_mul(131) ^ (i >> 3)) as u8);
+        for length in (0..=512).chain([1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192]) {
+            assert_eq!(
+                crc32c(&bytes[..length]),
+                bitwise_reference(&bytes[..length])
+            );
+        }
+    }
+
+    #[test]
+    fn zeroed_checksum_field_matches_independent_bitwise_crc() {
+        let bytes: [u8; 8192] = core::array::from_fn(|i| (i.wrapping_mul(73) ^ (i >> 5)) as u8);
+        let mut zeroed = bytes;
+        for length in [4, 16, 64, 128, 256, 512, 4096, 8192] {
+            for offset in [0, (length - 4) / 2, length - 4] {
+                zeroed[..length].copy_from_slice(&bytes[..length]);
+                zeroed[offset..offset + 4].fill(0);
+                assert_eq!(
+                    checksum(&bytes[..length], offset),
+                    bitwise_reference(&zeroed[..length])
+                );
+            }
+        }
     }
 }
