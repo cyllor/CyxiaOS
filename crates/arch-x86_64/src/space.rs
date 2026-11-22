@@ -466,7 +466,7 @@ impl<'a> AddressSpace<'a> {
         }
         let changed = publication.aliases.change_run(physical, None, Some(permissions), valid);
         for index in 0..changed {
-            let value = physical + index as u64 * PAGE_BYTES | P | U
+            let value = (physical + index as u64 * PAGE_BYTES) | P | U
                 | if permissions.writable { W } else { 0 }
                 | if permissions.executable { 0 } else { NX };
             unsafe { leaf.add(index).write_volatile(value) };
