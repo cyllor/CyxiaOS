@@ -1,44 +1,36 @@
 # CyxiaOS
 
-## V0.17：x86-64 主开发平台
+## V0.18 开发基线
 
-当前分支为 **`CyxiaOS-V0.17`**，软件版本 **`0.17.0-dev`**。主目标改为 **x86-64**；
-主开发/加速验证宿主为 Linux x86-64，显式选择 KVM；macOS ARM 可继续交叉编译和运行 TCG 功能回归。
-ARM64 保留独立兼容适配与历史证据。最小原型配置 1.3、模型/协议版本和验收预算不随分支号改变。
+当前分支为 **`CyxiaOS-V0.18`**，软件版本为 **`0.18.0-dev`**。本版整合 V0.17 的
+x86-64 正式运行时、COSMIC 移植、启动容量探测及内核热路径优化。x86-64 是主开发目标，
+AArch64 保留兼容验证。默认 x86 客体配置为 **1 GiB、4 vCPU**。
 
-当前开发目标为 **完整 CyxiaOS + COSMIC 桌面**，桌面沿用已有 COSMIC / Smithay / Wayland 移植线。
-用户已取消当前 A03 推进；原型测试保留回归用途，不再阻塞正式系统开发。
-2026-11-15：正式四核、1 GiB x86 系统已验证真实 PCI/VirtIO 块设备、显示与键鼠，
-Shell 文件读写和磁盘重启恢复；私有地址空间中的 C/Rust 程序、抢占、隔离、FP/TLS、堆与 IPC
-已实际运行通过。普通进程已接入三个 AP，捕获验证了三个独立进程同时处于用户态；CPU0 在
-所有用户核退出后处理共享服务。Linux64 的 musl、Rust std 线程/信号、Wayland 和 xkbcommon
-客体测试通过；Mesa 软件 EGL/GLES 渲染及 OOM 恢复通过。Smithay 已通过真实 x86 客体的
-独立客户端、12 个显示场景、键盘交互与资源回收验证，见 [系统与桌面集成记录](docs/implementation/v17-os-cosmic-20261115.md)。
-**尚未运行完整 COSMIC 会话。** 64 核/128 GiB 是宿主资源，不代表客体已经支持。
-[V0.17 平台设计](CyxiaOS-v0.17-platform-design.md) 是本分支的平台基线；
-[完整系统实施计划](docs/superpowers/plans/2026-11-14-v017-x86-runtime.md) 记录当前方向，
-[开发记录](docs/implementation/v17-development.md) 保留各阶段实现与验收状态。
+[版本说明](docs/releases/v0.18.md) 汇总主要改动和逐项验证状态。
+[V0.17 平台设计](CyxiaOS-v0.17-platform-design.md) 记录平台选择，
+[系统与桌面集成记录](docs/implementation/v17-os-cosmic-20261115.md)
+和 [V0.17 开发记录](docs/implementation/v17-development.md) 保存历史验证。
+
+`os_x86.py` 是持续运行的正式系统入口。以下命令使用本地已准备的 x86-64 COSMIC
+移植目录，其中包含该配置所需的 ELF、资源和构建凭据。
 
 ```sh
-python3 tools/os_x86.py build --output artifacts/v017-os-build --graphics
-python3 tools/storage.py artifacts/v017-os-data.raw
-python3 tools/os_x86.py run --build artifacts/v017-os-build --disk artifacts/v017-os-data.raw
-# macOS 图形设备窗口：增加 --display cocoa；当前基础镜像仍是 Shell/显示测试面。
-# Linux x86-64 上明确选择 KVM：run 增加 --accel kvm；本轮实际验证使用 TCG。
-python3 tools/os_smoke.py --build artifacts/v017-os-build --output artifacts/v017-os-native-run --scenario native
+CATALOG=/absolute/path/to/cosmic-app-library-catalog
+python3 tools/os_x86.py build --output artifacts/v018-os-build \
+  --profile release --graphics --ported --feature full-os \
+  --feature cosmic-app-library-v1 --sysroot "$CATALOG"
+python3 tools/storage.py artifacts/v018-os-data.raw
+python3 tools/os_x86.py run --build artifacts/v018-os-build --disk artifacts/v018-os-data.raw
+python3 tools/os_smoke.py --build artifacts/v018-os-build --output artifacts/v018-os-native --scenario native
 ```
 
-`os_x86.py` 是持续运行的正式系统入口；`x86_64.py` 保留独立平台机制回归。
-原 `build.py` 默认 x86-64，ARM 回归显式传 `--arch aarch64`。测试工具创建自己的专用磁盘；
-交互磁盘只在首次使用时创建，不覆盖已有文件。历史 A01–A16 PASS 不自动迁移，当前不再推进 A03。
-
-本分支承接 [V0.16 审核修复](docs/implementation/v16-source-summary.md)、
-[R15 x86 支持](docs/implementation/v16-x86-platform-20261114-r15.md) 与
-[R16 kernel 整理](docs/implementation/v16-kernel-layout-20261114-r16.md)。历史记录保持原版本含义。
+Linux x86-64 可显式选择 `run --accel kvm`。macOS ARM 可用 TCG 功能回归，
+并用 `run --display cocoa` 打开显示窗口。交互运行可复用已有数据盘路径。
+`storage.py` 用于首次创建数据盘。ARM 构建通过 `tools/build.py --arch aarch64` 选择。
 
 ## 历史桌面、Shell 与独立配置说明
 
-以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，历史状态以相应版本记录为准，当前平台状态以上述 V0.17 基线为准。
+以下保留已有桌面和独立切片的入口及历史验证范围；这些配置不等于配置 1.3 全矩阵验收，历史状态以相应版本记录为准，当前平台状态以上述 V0.18 基线为准。
 
 不基于 Linux 的实验性操作系统。目标是由本地 AI 决策资源分配，由内核执行安全约束和资源机制。
 
