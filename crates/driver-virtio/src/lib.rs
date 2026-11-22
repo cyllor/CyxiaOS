@@ -121,6 +121,28 @@ impl Page {
             *byte = unsafe { read_volatile((self.address() + wide + offset) as *const u8) };
         }
     }
+    /// Mirror of `copy_prefix_to` for the request direction. A maximum-MTU
+    /// frame or a sector payload otherwise pays one translated volatile helper
+    /// per byte; the device page is 8-aligned at every wide offset.
+    fn copy_prefix_from(&self, offset: usize, bytes: &[u8]) {
+        debug_assert!(offset + bytes.len() <= 4096);
+        let mut at = 0;
+        // Wide volatile stores must stay 8-aligned for architectures that trap
+        // unaligned device accesses, so emit the leading bytes individually.
+        while at < bytes.len() && (offset + at) % 8 != 0 {
+            self.put8(offset + at, bytes[at]);
+            at += 1;
+        }
+        let wide = (bytes.len() - at) & !7;
+        for step in (0..wide).step_by(8) {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[at + step..at + step + 8]);
+            self.put64(offset + at + step, u64::from_le_bytes(chunk));
+        }
+        for index in at + wide..bytes.len() {
+            self.put8(offset + index, bytes[index]);
+        }
+    }
     fn put8(&self, offset: usize, value: u8) {
         // SAFETY: every caller bounds offsets to this page; volatile accesses are
         // serialized by Queue's exclusive CPU owner and descriptor ownership.
@@ -248,9 +270,7 @@ impl Queue {
         let m = &self.memory;
         let response_pa = platform.physical(m.response.address(), 4096)?;
         let request_pa = platform.physical(m.request.address(), 4096)?;
-        for (i, byte) in request.iter().enumerate() {
-            m.request.put8(i, *byte);
-        }
+        m.request.copy_prefix_from(0, request);
         let response_descriptor = if request.is_empty() { 0 } else { 16 };
         if !request.is_empty() {
             m.desc.put64(0, request_pa);
@@ -511,6 +531,28 @@ mod tests {
             0
         }
     }
+    /// Wide request stores must stay byte-exact, including the unaligned head
+    /// and tail runs used by the 12-byte virtio-net header offset.
+    #[test]
+    fn wide_request_copies_preserve_bytes_at_unaligned_offsets() {
+        let page = Box::leak(Box::new(Page::zeroed()));
+        let mut source = [0u8; 300];
+        for (index, byte) in source.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let mut back = std::vec![0u8; 4096];
+        for offset in [0usize, 1, 7, 12] {
+            for len in [0usize, 1, 7, 8, 9, 15, 16, 300] {
+                page.clear_prefix(4096);
+                page.copy_prefix_from(offset, &source[..len]);
+                page.copy_prefix_to(&mut back, 4096);
+                assert_eq!(&back[offset..offset + len], &source[..len], "offset={offset} len={len}");
+                assert!(back[..offset].iter().all(|v| *v == 0), "wrote before offset");
+                assert!(back[offset + len..].iter().all(|v| *v == 0), "wrote past the prefix");
+            }
+        }
+    }
+
     fn fixture() -> (Transport, Queue) {
         let mmio = Box::leak(Box::new(Page::zeroed()));
         mmio.put32(0, 0x74726976);

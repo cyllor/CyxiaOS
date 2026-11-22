@@ -308,12 +308,8 @@ impl Net {
         // Even an idle ring must reject unsolicited/replayed used records before
         // a new descriptor is exposed, rather than treating them as its result.
         self.completion(false, platform)?;
-        for i in 0..HEADER {
-            self.tx.memory.request.put8(i, 0);
-        }
-        for (i, byte) in frame.iter().enumerate() {
-            self.tx.memory.request.put8(HEADER + i, *byte);
-        }
+        self.tx.memory.request.clear_prefix(HEADER);
+        self.tx.memory.request.copy_prefix_from(HEADER, frame);
         self.tx.post(false, HEADER + frame.len(), platform);
         if let Err(error) = self.transport.notify(self.tx.notification) {
             self.fail(platform);

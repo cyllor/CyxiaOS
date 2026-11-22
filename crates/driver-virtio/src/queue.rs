@@ -314,9 +314,7 @@ impl BatchQueue {
         let m = &self.memory;
         let request_pa = p.physical(m.request[at].address(), 4096)?;
         let response_pa = p.physical(m.response[at].address(), 4096)?;
-        for (i, b) in request.iter().enumerate() {
-            m.request[at].put8(i, *b);
-        }
+        m.request[at].copy_prefix_from(0, request);
         // A Free slot is either zero-initialized or has passed through
         // release(), which clears its complete prior descriptor-owned range.
         // A later wider descriptor exposes only the still-zero initial tail,
