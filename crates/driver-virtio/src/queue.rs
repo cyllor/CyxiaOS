@@ -172,6 +172,15 @@ impl BatchQueue {
     pub fn capacity(&self) -> usize {
         usize::from(self.size / 2)
     }
+    /// Only a healthy queue with every descriptor released proves that old
+    /// DMA/completion custody ended. Timeout or poison never manufactures idle.
+    pub fn is_quiescent(&self) -> bool {
+        !self.poisoned
+            && self.count == 0
+            && self.slots[..self.capacity()]
+                .iter()
+                .all(|slot| slot.state == State::Free)
+    }
     pub fn free(&self) -> usize {
         self.slots[..self.capacity()]
             .iter()

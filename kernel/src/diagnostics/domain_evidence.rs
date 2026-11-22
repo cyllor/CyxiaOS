@@ -359,6 +359,7 @@ fn error(error: Error) -> u64 {
         Error::Io => 18,
         Error::Overflow => 19,
         Error::NotReady => 20,
+        Error::ReadOnly => 21,
     }
 }
 fn state(value: ExecutionState) -> (u64, u64) {

@@ -1,6 +1,6 @@
 use cyxia_prototype::storage::{
-    BLOCK_SIZE, DATA_START, DirectoryEntry, Error, Extent, Inode, InodeKind, LogPayload,
-    MAX_FILE_SIZE, Record, Superblock, crc32c, select_superblock,
+    BLOCK_SIZE, DirectoryEntry, Error, Extent, ExtentBlock, FIRST_BUSINESS_BLOCK as DATA_START,
+    Inode, InodeKind, LogPayload, MAX_FILE_SIZE, Record, Superblock, crc32c, select_superblock,
 };
 
 fn superblock(generation: u64, checkpoint_lsn: u64, log_epoch: u64) -> Superblock {
@@ -45,6 +45,8 @@ fn file() -> Inode {
         parent_generation: 1,
         extent_count: 2,
         extents,
+        ext_block: 0,
+        ext_count: 0,
     }
 }
 
@@ -58,6 +60,8 @@ fn root() -> Inode {
         parent_generation: 1,
         extent_count: 0,
         extents: [Extent::EMPTY; 16],
+        ext_block: 0,
+        ext_count: 0,
     }
 }
 
@@ -77,7 +81,9 @@ fn superblock_has_exact_little_endian_layout_and_zero_tail() {
     let bytes = encode_superblock(value);
     assert_eq!(
         &bytes[..16],
-        &[0x53, 0x46, 0x59, 0x43, 1, 0, 80, 0, 0, 16, 0, 0, 0, 0, 2, 0]
+        &[
+            0x53, 0x46, 0x59, 0x43, 2, 0, 112, 0, 0, 16, 0, 0, 0, 0, 2, 0
+        ]
     );
     assert_eq!(&bytes[16..32], &[0x23; 16]);
     assert_eq!(&bytes[32..40], &7_u64.to_le_bytes());
@@ -86,20 +92,34 @@ fn superblock_has_exact_little_endian_layout_and_zero_tail() {
     assert_eq!(
         &bytes[56..76],
         &[
-            2, 16, 0, 0, 6, 16, 0, 0, 22, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0
+            2, 16, 0, 0, 6, 16, 0, 0, 144, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0
         ]
     );
-    assert!(bytes[80..].iter().all(|&b| b == 0));
+    assert!(bytes[112..].iter().all(|&b| b == 0));
+    for (offset, value) in [
+        (76, 4118_u32),
+        (80, 4119),
+        (84, 4120),
+        (88, 8),
+        (92, 15),
+        (96, 224),
+        (100, 224),
+        (104, 0),
+    ] {
+        assert_eq!(&bytes[offset..offset + 4], &value.to_le_bytes());
+    }
     assert_eq!(Superblock::decode(&bytes).unwrap(), value);
 }
 
 #[test]
 fn superblock_rejects_mutation_even_with_recomputed_crc() {
     let bytes = encode_superblock(superblock(1, 0, 1));
-    for offset in [0, 4, 6, 8, 12, 56, 60, 64, 68, 72, 80, 4095] {
+    for offset in [
+        0, 4, 6, 8, 12, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 112, 4095,
+    ] {
         let mut bad = bytes;
         bad[offset] ^= 1;
-        checksum_at(&mut bad, 76);
+        checksum_at(&mut bad, 108);
         assert!(
             Superblock::decode(&bad).is_err(),
             "accepted unsupported byte {offset}"
@@ -111,7 +131,7 @@ fn superblock_rejects_mutation_even_with_recomputed_crc() {
     for range in [16..32, 32..40, 48..56] {
         let mut bad = bytes;
         bad[range].fill(0);
-        checksum_at(&mut bad, 76);
+        checksum_at(&mut bad, 108);
         assert!(Superblock::decode(&bad).is_err());
     }
 }
@@ -140,7 +160,7 @@ fn superblock_selection_rejects_split_identity_and_regressing_tuples() {
         Err(Error::Conflict)
     );
     let mut corrupt = new;
-    corrupt[76] ^= 1;
+    corrupt[108] ^= 1;
     assert_eq!(
         select_superblock(&old, &corrupt).unwrap(),
         superblock(3, 20, 7)
@@ -155,7 +175,15 @@ fn inode_roundtrip_has_exact_extents_and_free_slot_encoding() {
     assert_eq!(&bytes[0..8], &[0x4e, 0x49, 0x59, 0x43, 1, 0, 0, 0]);
     assert_eq!(&bytes[24..32], &19_u64.to_le_bytes());
     assert_eq!(&bytes[32..40], &[2, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(&bytes[48..60], &[0, 0, 0, 0, 22, 16, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(
+        &bytes[48..60],
+        &[
+            0_u32.to_le_bytes(),
+            DATA_START.to_le_bytes(),
+            2_u32.to_le_bytes()
+        ]
+        .concat()
+    );
     assert!(bytes[72..252].iter().all(|&b| b == 0));
     assert_eq!(Inode::decode(1, &bytes).unwrap(), file());
     let free = Inode {
@@ -592,8 +620,8 @@ fn maximum_file_extent_directory_and_record_bounds_remain_encodable() {
         };
     }
     let mut bytes = [0; 256];
-    maximum.encode(255, &mut bytes).unwrap();
-    assert_eq!(Inode::decode(255, &bytes).unwrap(), maximum);
+    maximum.encode(223, &mut bytes).unwrap();
+    assert_eq!(Inode::decode(223, &bytes).unwrap(), maximum);
     let mut last_block = file();
     last_block.size = 4096;
     last_block.extent_count = 1;
@@ -622,7 +650,7 @@ fn maximum_file_extent_directory_and_record_bounds_remain_encodable() {
         lsn: 129,
         log_epoch: u64::MAX,
         payload: LogPayload::Redo {
-            home_block: 131071,
+            home_block: u64::from(DATA_START - 1),
             index: 127,
             count: 128,
             after_image: &image,
@@ -710,4 +738,158 @@ fn redo_rejects_recomputed_crc_for_local_metadata_and_nonzero_padding() {
     assert!(Record::decode(&original[..4096]).is_err());
     original[4095] ^= 1;
     assert_eq!(Record::decode(&original), Err(Error::Checksum));
+}
+
+#[test]
+fn v1_superblocks_and_business_redos_are_rejected_by_v2_codecs() {
+    let mut legacy = encode_superblock(superblock(1, 0, 1));
+    legacy[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    legacy[6..8].copy_from_slice(&80_u16.to_le_bytes());
+    legacy[64..68].copy_from_slice(&4118_u32.to_le_bytes());
+    legacy[76..].fill(0);
+    checksum_at(&mut legacy, 76);
+    assert_eq!(Superblock::decode(&legacy), Err(Error::Version));
+    for block in [DATA_START, DATA_START + 1, 131071] {
+        let record = Record {
+            txid: 1,
+            lsn: 2,
+            log_epoch: 1,
+            payload: LogPayload::Redo {
+                home_block: u64::from(block),
+                index: 0,
+                count: 1,
+                after_image: &[0; BLOCK_SIZE],
+            },
+        };
+        let mut output = [0xaa; BLOCK_SIZE * 2];
+        assert_eq!(record.encode(&mut output), Err(Error::Range));
+        assert!(output.iter().all(|byte| *byte == 0xaa));
+    }
+}
+
+#[test]
+fn system_namespace_has_a_separate_root_and_cannot_alias_business_blocks() {
+    use cyxia_prototype::storage::{SYSTEM_ROOT_BLOCK, SYSTEM_ROOT_INODE};
+    let system = Inode {
+        parent_inode: SYSTEM_ROOT_INODE,
+        ..root()
+    };
+    let mut bytes = [0; 256];
+    system.encode(SYSTEM_ROOT_INODE, &mut bytes).unwrap();
+    assert_eq!(Inode::decode(SYSTEM_ROOT_INODE, &bytes).unwrap(), system);
+    assert!(system.encode(0, &mut bytes).is_err());
+    assert!(root().encode(SYSTEM_ROOT_INODE, &mut bytes).is_err());
+    let mut system_file = file();
+    system_file.parent_inode = SYSTEM_ROOT_INODE;
+    system_file.extents[0].physical_start = SYSTEM_ROOT_BLOCK + 10;
+    system_file.extents[1].physical_start = SYSTEM_ROOT_BLOCK + 20;
+    system_file.encode(230, &mut bytes).unwrap();
+    assert!(system_file.encode(1, &mut bytes).is_err());
+    system_file.extents[0].physical_start = DATA_START;
+    assert!(system_file.encode(230, &mut bytes).is_err());
+}
+
+fn indirect_fixture() -> (Inode, ExtentBlock) {
+    let mut inode = file();
+    inode.size = 354 * BLOCK_SIZE as u64;
+    inode.extent_count = 16;
+    inode.ext_block = DATA_START + 1000;
+    inode.ext_count = 338;
+    for (index, extent) in inode.extents.iter_mut().enumerate() {
+        *extent = Extent {
+            logical_start: index as u32,
+            physical_start: DATA_START + index as u32 * 2,
+            block_count: 1,
+        };
+    }
+    let mut indirect = ExtentBlock::empty(1, inode.generation);
+    indirect.count = 338;
+    for (index, extent) in indirect.extents.iter_mut().enumerate() {
+        *extent = Extent {
+            logical_start: 16 + index as u32,
+            physical_start: DATA_START + 32 + index as u32 * 2,
+            block_count: 1,
+        };
+    }
+    (inode, indirect)
+}
+
+#[test]
+fn indirect_extent_codec_covers_all_354_mappings_and_strict_identity() {
+    let (inode, indirect) = indirect_fixture();
+    indirect.validate_for(1, &inode).unwrap();
+    let mut inode_bytes = [0; 256];
+    inode.encode(1, &mut inode_bytes).unwrap();
+    assert_eq!(&inode_bytes[240..244], &inode.ext_block.to_le_bytes());
+    assert_eq!(&inode_bytes[244..246], &338_u16.to_le_bytes());
+    assert_eq!(Inode::decode(1, &inode_bytes).unwrap(), inode);
+    let mut bytes = [0; BLOCK_SIZE];
+    indirect.encode(&mut bytes).unwrap();
+    assert_eq!(&bytes[..8], &[0x58, 0x45, 0x59, 0x43, 2, 0, 32, 0]);
+    assert_eq!(ExtentBlock::decode(&bytes).unwrap(), indirect);
+    for offset in [0, 4, 6, 14, 24, 4088] {
+        let mut corrupt = bytes;
+        corrupt[offset] ^= 1;
+        checksum_at(&mut corrupt, 4092);
+        assert!(ExtentBlock::decode(&corrupt).is_err(), "offset={offset}");
+    }
+    let mut wrong = indirect;
+    wrong.inode_generation += 1;
+    assert_eq!(wrong.validate_for(1, &inode), Err(Error::Identity));
+    let mut wrong = indirect;
+    wrong.extents[0].physical_start = inode.extents[0].physical_start;
+    assert_eq!(wrong.validate_for(1, &inode), Err(Error::Extent));
+    let mut wrong = indirect;
+    wrong.extents[0].physical_start = inode.ext_block;
+    assert_eq!(wrong.validate_for(1, &inode), Err(Error::Extent));
+    let mut wrong = indirect;
+    wrong.extents[1].logical_start += 1;
+    assert!(wrong.encode(&mut bytes).is_err());
+    let mut wrong = inode;
+    wrong.extent_count = 15;
+    wrong.extents[15] = Extent::EMPTY;
+    assert!(wrong.encode(1, &mut inode_bytes).is_err());
+    let mut wrong = indirect;
+    wrong.count = 337;
+    assert!(wrong.encode(&mut bytes).is_err());
+}
+
+#[test]
+fn borrowed_indirect_validation_matches_owned_codec_without_an_extent_array() {
+    let (inode, indirect) = indirect_fixture();
+    let mut bytes = [0; BLOCK_SIZE];
+    indirect.encode(&mut bytes).unwrap();
+    ExtentBlock::validate_bytes_for(&bytes, 1, &inode).unwrap();
+    for index in 0..338 {
+        assert_eq!(
+            ExtentBlock::extent_from_bytes(&bytes, index).unwrap(),
+            indirect.extents[index]
+        );
+    }
+    assert!(ExtentBlock::extent_from_bytes(&bytes, 338).is_err());
+    assert!(ExtentBlock::extent_from_bytes(&bytes[..4095], 0).is_err());
+    let mut mutations = Vec::new();
+    for offset in [0, 4, 6, 8, 12, 14, 16, 24, 32, 4088] {
+        let mut invalid = bytes;
+        invalid[offset] ^= 1;
+        checksum_at(&mut invalid, 4092);
+        mutations.push(invalid);
+    }
+    for physical in [
+        inode.ext_block,
+        inode.extents[0].physical_start,
+        indirect.extents[1].physical_start,
+        131072,
+    ] {
+        let mut invalid = bytes;
+        invalid[36..40].copy_from_slice(&physical.to_le_bytes());
+        checksum_at(&mut invalid, 4092);
+        mutations.push(invalid);
+    }
+    for invalid in mutations {
+        let owned = ExtentBlock::decode(&invalid).and_then(|value| value.validate_for(1, &inode));
+        let borrowed = ExtentBlock::validate_bytes_for(&invalid, 1, &inode);
+        assert!(owned.is_err());
+        assert!(borrowed.is_err());
+    }
 }

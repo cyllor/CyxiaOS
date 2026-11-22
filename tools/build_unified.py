@@ -123,11 +123,12 @@ def service_fault_scope(profile):
 
 
 def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',leave=False,unix_seconds=None,
-          selftest=False,storage_fault=False,memory_probe=False,cargo=None,cc=None,target_dir=None):
+          selftest=False,storage_fault=False,memory_probe=False,snapshot_probe=False,cargo=None,cc=None,target_dir=None):
     require(fault in ('normal','hang-once','no-stop-ack'),'unknown runtime fault')
     service_fault_nodes = service_fault_scope(service_fault)
     require(not storage_fault or (selftest and fault == 'normal' and not leave), 'storage fault profile requires selftest, normal runtime and no leave')
     require(not memory_probe or (selftest and fault=='normal' and service_fault=='none' and not leave and not storage_fault), 'A09 requires independent normal ordinary-client profile')
+    require(not snapshot_probe or (selftest and fault=='normal' and service_fault=='none' and not leave and not storage_fault and not memory_probe), 'snapshot probe requires an independent normal selftest image')
     if unix_seconds is None:
         unix_seconds=int(os.environ.get('SOURCE_DATE_EPOCH',str(int(time.time()))))
     require(0<unix_seconds<(1<<63),'invalid provisioned UTC epoch')
@@ -160,7 +161,7 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     billing_seeds=[(p/'billing.seed').read_bytes() for p in identities]
     artifacts={};commands=[];task_hash=None;governance_hash=None
     for index,name in enumerate(('a','b')):
-        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault_nodes[name],CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0',CYXIA_MEMORY_FAULT_PROBE='1' if memory_probe else '0')
+        per_node=dict(environment,CYXIA_CLUSTER_IDENTITY=str(identities[index]),CYXIA_CLUSTER_LEAVE='1' if leave else '0',CYXIA_CLUSTER_FAULT=service_fault_nodes[name],CYXIA_CLUSTER_UNIX_SECONDS=str(unix_seconds),CYXIA_RUNTIME_FAULT='none' if fault=='normal' else fault,CYXIA_DOMAIN_SELFTEST='1' if selftest else '0',CYXIA_STORAGE_FAULT_PROBE='1' if storage_fault else '0',CYXIA_MEMORY_FAULT_PROBE='1' if memory_probe else '0',CYXIA_SNAPSHOT_PROBE='1' if snapshot_probe else '0')
         service_command=[str(ROOT/'user/prototype-cluster/tools/build.sh')]
         commands.append(dict(node=name,stage='service',argv=service_command,service_fault=service_fault_nodes[name]))
         print(f'Building node {name} EL0 service',flush=True)
@@ -176,6 +177,11 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
         kernel=cache_artifact(kernel,target_dir)
         actual_out=cache_artifact(actual_out,target_dir)
         image=output/f'node-{name}.elf';shutil.copyfile(kernel,image);image.chmod(0o600)
+        if snapshot_probe:
+            snapshot_client=actual_out/'prototype-client.elf'
+            audit_embedded_role(image.read_bytes(),snapshot_client.read_bytes(),'immutable snapshot EL0 ordinary/recovery probe')
+            shutil.copyfile(snapshot_client,output/f'snapshot-client-{name}.elf')
+            (output/f'snapshot-client-{name}.elf').chmod(0o600)
         if memory_probe:
             memory=actual_out/'memory-client.elf'
             audit_embedded_role(image.read_bytes(),memory.read_bytes(),'A09 ordinary memory client')
@@ -212,6 +218,15 @@ def build(identity_a,identity_b,output,*,fault='normal',service_fault='none',lea
     for path in sorted(output.iterdir()):
         if path.is_file():artifacts[path.name]=dict(sha256=sha(path),bytes=path.stat().st_size)
     report=dict(schema_version=1,status='BUILT_NOT_RUN',profiles=dict(fault=fault,service_fault=service_fault,service_fault_nodes=service_fault_nodes,leave=bool(leave),unix_seconds=unix_seconds,selftest=bool(selftest),storage_fault=bool(storage_fault),memory_probe=bool(memory_probe)),code_source_map=before,code_source_sha256=hashlib.sha256(json.dumps(before,sort_keys=True,separators=(',',':')).encode()).hexdigest(),builder_sha256=builder_digest,build_cache=cache_context,tools=versions,nodes=dict(zip(('a','b'),metadata)),artifacts=artifacts,commands=commands,embedded_roles=dict(governance=dict(sha256=governance_hash,bytes=(output/'governance.elf').stat().st_size)),own_private_key_only_verified=True,preparation_stack=stack_proof,scope='Reproducible source/image binding, separate private identities and selected preparation stack check; native execution and acceptance require the independent runner.')
+    if snapshot_probe:
+        # The optional profile extends the evidence schema explicitly. Existing
+        # ordinary, A09 and A10 build manifests retain their original shape.
+        report['profiles']['snapshot_probe'] = True
+        report['storage_schemas'] = dict(media=2,file_service=2,snapshot_request=1,snapshot_policy=1)
+        report['embedded_roles']['snapshot_probe'] = {
+            name: dict(sha256=sha(output/f'snapshot-client-{name}.elf'),
+                       bytes=(output/f'snapshot-client-{name}.elf').stat().st_size)
+            for name in ('a','b')}
     (output/'build-manifest.json').write_text(json.dumps(report,indent=2)+'\n');(output/'build-manifest.json').chmod(0o600)
     return report
 
@@ -227,13 +242,14 @@ def main():
     parser.add_argument('--selftest',action='store_true',help='enable the native ordinary EL0 client and file probe')
     parser.add_argument('--storage-fault',action='store_true',help='dedicated A10 ordinary-file workload (requires --selftest)')
     parser.add_argument('--memory-probe',action='store_true',help='dedicated A09 ordinary anonymous/file-pressure workload')
+    parser.add_argument('--snapshot-probe',action='store_true',help='opt-in immutable snapshot ordinary/recovery EL0 probe; fresh v2 disk required')
     parser.add_argument('--cargo',default=os.environ.get('CARGO'),help='Cargo executable (also accepts CARGO)')
     parser.add_argument('--cc',help='bare-metal C compiler (also accepts CC_aarch64_unknown_none or CC)')
     parser.add_argument('--target-dir',type=Path,help='cache base; source/checkout namespace is derived inside it (also accepts CARGO_TARGET_DIR)')
     parser.add_argument('--unix-seconds',type=int,default=None,help='provisioned UTC epoch; defaults to SOURCE_DATE_EPOCH or current UTC')
     args=parser.parse_args()
     build(args.identity_a,args.identity_b,args.output,fault=args.fault,service_fault=args.service_fault,leave=args.leave,unix_seconds=args.unix_seconds,
-          selftest=args.selftest,storage_fault=args.storage_fault,memory_probe=args.memory_probe,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
+          selftest=args.selftest,storage_fault=args.storage_fault,memory_probe=args.memory_probe,snapshot_probe=args.snapshot_probe,cargo=args.cargo,cc=args.cc,target_dir=args.target_dir)
     print(args.output/'build-manifest.json')
 
 

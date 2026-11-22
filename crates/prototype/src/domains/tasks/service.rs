@@ -217,6 +217,15 @@ impl ServiceBatch {
             }
         }
     }
+    /// Revoke a complete view-scoped service without affecting capabilities
+    /// for other services. Pending vectors resolve these identities again.
+    pub fn revoke_service(&mut self, service: ObjectKey) {
+        for capability in &mut self.capabilities {
+            if capability.is_some_and(|capability| capability.service == service) {
+                *capability = None;
+            }
+        }
+    }
     pub fn policy(&self, now: u64) -> u8 {
         if self.stamp.live(now) {
             self.batch as u8

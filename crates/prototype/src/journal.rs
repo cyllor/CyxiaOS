@@ -1,4 +1,4 @@
-//! Bounded, synchronous redo journal for the v1.3 512 MiB disk format.
+//! Bounded metadata redo and ordered CoW for the v2 512 MiB disk format.
 //!
 //! The caller serializes this service and supplies the 8 KiB scratch buffer.
 //! A successful write is only a device completion; only `flush` establishes
@@ -7,8 +7,11 @@
 //! Filesystem-wide inode/bitmap ownership checks belong to the file service.
 
 use crate::storage::{
-    self, BITMAP_START, BLOCK_SIZE, DATA_START, Extent, INODE_COUNT, INODE_SIZE, INODE_START,
-    Inode, InodeKind, LogPayload, MAX_REDOS, Record, Superblock, TOTAL_BLOCKS,
+    self, BITMAP_START, BLOCK_SIZE, BOOT_BLOCK, BOOT_INODE, CATALOG_START, CLUSTER_INODES,
+    CONTROL_START, DATA_START, DirectoryEntry, Extent, FIRST_BUSINESS_BLOCK, INODE_COUNT,
+    INODE_SIZE, INODE_START, Inode, InodeKind, LogPayload, MAX_ORDERED, MAX_REDOS, REQUEST_INODE,
+    Record, SNAPSHOT_REQUEST_BLOCKS, SNAPSHOT_REQUEST_START, SNAPSHOT_START, SYSTEM_ROOT_BLOCK,
+    SYSTEM_ROOT_INODE, Superblock, TOTAL_BLOCKS,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,10 +28,22 @@ pub trait BlockDevice {
     fn read_block(&mut self, block: u32, output: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error>;
     fn write_block(&mut self, block: u32, bytes: &[u8; BLOCK_SIZE]) -> Result<(), Self::Error>;
     fn flush(&mut self) -> Result<(), Self::Error>;
+    /// Return a completed, bounded CPU piece to the original caller's paid
+    /// progress path. This has no I/O or durability meaning and retains all
+    /// journal, scratch and device ownership across the callback.
+    fn cpu_progress(&mut self) {}
+    /// Prove that no queued request, DMA, completion or uncertain I/O still
+    /// owns physical blocks. Never treat an error as cancellation or reset a
+    /// device here. The default is only for fully synchronous implementations;
+    /// asynchronous adapters must inspect their real custody state.
+    fn quiesce(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     /// Enter the independent progress reservation for checkpoint/recovery I/O.
     fn recovery_enter(&mut self) {}
     fn recovery_exit(&mut self) {}
-    /// Reserve the complete ordinary send entitlement before writing BEGIN.
+    /// Reserve the complete ordinary send entitlement, including ordered CoW
+    /// data, before the first write or BEGIN.
     /// This hook must have no media side effects on rejection.
     fn transaction_begin(&mut self, _bytes: u64) -> Result<(), Self::Error> {
         Ok(())
@@ -140,6 +155,48 @@ impl Journal {
         LOG_END - self.next_block
     }
 
+    /// A required barrier before reclaiming/reusing blocks. The device must
+    /// prove all old I/O completed; failure permanently closes this instance.
+    pub fn require_quiescent<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+    ) -> Result<(), Error<D::Error>> {
+        if !self.writable {
+            return Err(Error::Poisoned);
+        }
+        if let Err(error) = device.quiesce() {
+            self.writable = false;
+            return Err(Error::Io(error));
+        }
+        Ok(())
+    }
+
+    /// Predict the receipt while the caller holds the single-writer boundary.
+    /// Checkpoint first if necessary; any intervening commit/checkpoint invalidates
+    /// this value. Actual destination and device-entitlement checks remain in commit.
+    pub fn peek_next_commit(&self, redo_count: usize) -> Option<CommitReceipt> {
+        if !self.writable
+            || redo_count == 0
+            || redo_count > MAX_REDOS as usize
+            || 2 + 2 * redo_count as u32 > self.remaining_log_blocks()
+        {
+            return None;
+        }
+        self.superblock.generation.checked_add(1)?;
+        self.superblock.log_epoch.checked_add(1)?;
+        self.next_txid.checked_add(1)?;
+        let commit_lsn = self.next_lsn.checked_add(redo_count as u64 + 1)?;
+        commit_lsn.checked_add(1)?;
+        Some(CommitReceipt {
+            key: TransactionKey {
+                fs_uuid: self.superblock.fs_uuid,
+                log_epoch: self.superblock.log_epoch,
+                txid: self.next_txid,
+            },
+            commit_lsn,
+        })
+    }
+
     /// Recovery first validates the complete accepted prefix, then writes each
     /// latest home image once. It always starts a fresh durable epoch before
     /// admitting a new transaction, including an empty-log mount.
@@ -153,6 +210,9 @@ impl Journal {
         if device.block_count() != TOTAL_BLOCKS {
             return Err(Error::WrongCapacity);
         }
+        // Reinitializing the journal does not prove that an old device request
+        // stopped. Native adapters must reject a same-boot unknown DMA owner.
+        device.quiesce().map_err(Error::Io)?;
         read_half(device, 0, scratch, 0)?;
         read_half(device, 1, scratch, 1)?;
         let selected = storage::select_superblock(&scratch[..BLOCK_SIZE], &scratch[BLOCK_SIZE..])
@@ -293,17 +353,54 @@ impl Journal {
         changes: &[AfterImage<'_>],
         scratch: &mut Scratch,
     ) -> Result<CommitReceipt, Error<D::Error>> {
+        self.commit_ordered(device, &[], changes, scratch)
+    }
+
+    /// Commit immutable business blocks and their mutable publication metadata.
+    /// Every ordered target must be free in the currently committed bitmap and
+    /// allocated by this same transaction. All capacity checks and the combined
+    /// device reservation precede writes. CoW data and BEGIN/REDO share the first
+    /// FLUSH; only a second FLUSH can make COMMIT and the new roots visible.
+    pub fn commit_ordered<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        ordered_data: &[AfterImage<'_>],
+        changes: &[AfterImage<'_>],
+        scratch: &mut Scratch,
+    ) -> Result<CommitReceipt, Error<D::Error>> {
         if !self.writable {
             return Err(Error::Poisoned);
         }
-        if changes.is_empty() || changes.len() > MAX_REDOS as usize {
+        if changes.is_empty()
+            || changes.len() > MAX_REDOS as usize
+            || ordered_data.len() > MAX_ORDERED
+        {
             return Err(Error::Invalid);
         }
         for (index, change) in changes.iter().enumerate() {
-            if !(BITMAP_START..TOTAL_BLOCKS).contains(&change.home_block)
+            if !storage::is_redo_home(change.home_block)
                 || changes[..index]
                     .iter()
                     .any(|previous| previous.home_block == change.home_block)
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        for (index, change) in ordered_data.iter().enumerate() {
+            if !storage::is_business_block(change.home_block)
+                || ordered_data[..index]
+                    .iter()
+                    .any(|previous| previous.home_block == change.home_block)
+                || self.entries[..self.used]
+                    .iter()
+                    .any(|entry| entry.home == change.home_block)
+            {
+                return Err(Error::Invalid);
+            }
+            let bitmap_home = BITMAP_START + change.home_block / (BLOCK_SIZE as u32 * 8);
+            if !changes
+                .iter()
+                .any(|metadata| metadata.home_block == bitmap_home)
             {
                 return Err(Error::Invalid);
             }
@@ -345,11 +442,46 @@ impl Journal {
             log_epoch: self.superblock.log_epoch,
             txid: self.next_txid,
         };
+        // Read through the committed redo overlay, never the stale home bitmap.
+        // One bounded page suffices even when a transaction spans all bitmaps.
+        if !ordered_data.is_empty() {
+            let mut bitmap = [0; BLOCK_SIZE];
+            for bitmap_index in 0..4_u32 {
+                let base = bitmap_index * (BLOCK_SIZE as u32 * 8);
+                if !ordered_data
+                    .iter()
+                    .any(|change| change.home_block / (BLOCK_SIZE as u32 * 8) == bitmap_index)
+                {
+                    continue;
+                }
+                let home = BITMAP_START + bitmap_index;
+                let after = changes
+                    .iter()
+                    .find(|change| change.home_block == home)
+                    .ok_or(Error::Invalid)?;
+                self.read_block(device, home, &mut bitmap, scratch)?;
+                for change in ordered_data
+                    .iter()
+                    .filter(|change| change.home_block / (BLOCK_SIZE as u32 * 8) == bitmap_index)
+                {
+                    let offset = (change.home_block - base) as usize;
+                    let mask = 1 << (offset % 8);
+                    if bitmap[offset / 8] & mask != 0 || after.bytes[offset / 8] & mask == 0 {
+                        return Err(Error::Invalid);
+                    }
+                }
+            }
+        }
         device
-            .transaction_begin(u64::from(needed) * BLOCK_SIZE as u64)
+            .transaction_begin((u64::from(needed) + ordered_data.len() as u64) * BLOCK_SIZE as u64)
             .map_err(Error::Io)?;
         let result = (|| {
             self.writable = false;
+            for change in ordered_data {
+                device
+                    .write_block(change.home_block, change.bytes)
+                    .map_err(Error::Io)?;
+            }
             let mut cursor = self.next_block;
             write_record(
                 device,
@@ -422,6 +554,81 @@ impl Journal {
     }
 
     /// Read the newest committed image, including data not yet checkpointed.
+    /// Immutable business data needs no redo scratch or additional page buffer.
+    pub fn read_business_block<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        home: u32,
+        output: &mut [u8; BLOCK_SIZE],
+    ) -> Result<(), Error<D::Error>> {
+        if !self.writable {
+            return Err(Error::Poisoned);
+        }
+        if !storage::is_business_block(home) {
+            return Err(Error::Invalid);
+        }
+        if self.entries[..self.used]
+            .iter()
+            .any(|entry| entry.home == home)
+        {
+            self.writable = false;
+            return Err(Error::Corrupt);
+        }
+        let result = device.read_block(home, output).map_err(Error::Io);
+        if result.is_err() {
+            self.writable = false;
+        }
+        result
+    }
+
+    /// Read a committed image into the first half of the existing journal
+    /// scratch. This preserves redo identity/CRC validation without another
+    /// 4 KiB stack page for streaming validation and GC.
+    pub fn read_block_scratch<'a, D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        home: u32,
+        scratch: &'a mut Scratch,
+    ) -> Result<&'a [u8; BLOCK_SIZE], Error<D::Error>> {
+        if !self.writable {
+            return Err(Error::Poisoned);
+        }
+        if !(BITMAP_START..TOTAL_BLOCKS).contains(&home) {
+            return Err(Error::Invalid);
+        }
+        let result = (|| {
+            if let Some(entry) = self.entries[..self.used]
+                .iter()
+                .find(|entry| entry.home == home)
+            {
+                let length = read_record(device, entry.record, scratch)?;
+                match Record::decode(&scratch[..length]) {
+                    Ok(Record {
+                        log_epoch,
+                        payload: LogPayload::Redo { home_block, .. },
+                        ..
+                    }) if log_epoch == self.superblock.log_epoch
+                        && home_block == u64::from(home) => {}
+                    _ => return Err(Error::Corrupt),
+                }
+                scratch.copy_within(64..64 + BLOCK_SIZE, 0);
+            } else {
+                read_half(device, home, scratch, 0)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.writable = false;
+            return Err(error);
+        }
+        let output = (&scratch[..BLOCK_SIZE])
+            .try_into()
+            .map_err(|_| Error::Invalid)?;
+        device.cpu_progress();
+        Ok(output)
+    }
+
+    /// Read the newest committed image, including metadata not yet checkpointed.
     pub fn read_block<D: BlockDevice>(
         &mut self,
         device: &mut D,
@@ -445,6 +652,8 @@ impl Journal {
         };
         if result.is_err() {
             self.writable = false;
+        } else {
+            device.cpu_progress();
         }
         result
     }
@@ -567,7 +776,7 @@ pub fn format<D: BlockDevice>(
         for (byte, value) in scratch[..BLOCK_SIZE].iter_mut().enumerate() {
             let first_block = bitmap * (BLOCK_SIZE as u32 * 8) + byte as u32 * 8;
             for bit in 0..8 {
-                if first_block + bit < DATA_START {
+                if first_block + bit < FIRST_BUSINESS_BLOCK {
                     *value |= 1 << bit;
                 }
             }
@@ -583,20 +792,61 @@ pub fn format<D: BlockDevice>(
         parent_inode: 0,
         parent_generation: 0,
         extents: [Extent::EMPTY; 16],
+        ext_block: 0,
+        ext_count: 0,
     };
     for block in 0..16_u32 {
         scratch[..BLOCK_SIZE].fill(0);
         for slot in 0..16_u32 {
             let id = block * 16 + slot;
-            let inode = if id == 0 {
+            let mut inode = if id == 0 {
                 Inode {
                     kind: InodeKind::Directory,
+                    parent_generation: 1,
+                    ..free
+                }
+            } else if id == SYSTEM_ROOT_INODE {
+                Inode {
+                    kind: InodeKind::Directory,
+                    size: 4 * 128,
+                    extent_count: 1,
+                    parent_inode: SYSTEM_ROOT_INODE,
+                    parent_generation: 1,
+                    ..free
+                }
+            } else if id == BOOT_INODE || CLUSTER_INODES.contains(&id) || id == REQUEST_INODE {
+                Inode {
+                    kind: InodeKind::File,
+                    parent_inode: SYSTEM_ROOT_INODE,
                     parent_generation: 1,
                     ..free
                 }
             } else {
                 free
             };
+            if id == SYSTEM_ROOT_INODE {
+                inode.extents[0] = Extent {
+                    logical_start: 0,
+                    physical_start: SYSTEM_ROOT_BLOCK,
+                    block_count: 1,
+                };
+            } else if id == BOOT_INODE {
+                inode.size = 64;
+                inode.extent_count = 1;
+                inode.extents[0] = Extent {
+                    logical_start: 0,
+                    physical_start: BOOT_BLOCK,
+                    block_count: 1,
+                };
+            } else if id == REQUEST_INODE {
+                inode.size = u64::from(SNAPSHOT_REQUEST_BLOCKS) * BLOCK_SIZE as u64;
+                inode.extent_count = 1;
+                inode.extents[0] = Extent {
+                    logical_start: 0,
+                    physical_start: SNAPSHOT_REQUEST_START,
+                    block_count: SNAPSHOT_REQUEST_BLOCKS,
+                };
+            }
             let offset = slot as usize * INODE_SIZE;
             inode
                 .encode(id, &mut scratch[offset..offset + INODE_SIZE])
@@ -605,6 +855,53 @@ pub fn format<D: BlockDevice>(
         write_half(device, INODE_START + block, scratch, 0)?;
     }
     debug_assert_eq!(INODE_COUNT, 256);
+    crate::snapshot::Control::initial(fs_uuid)
+        .encode(&mut scratch[..BLOCK_SIZE])
+        .map_err(Error::Format)?;
+    write_half(device, CONTROL_START, scratch, 0)?;
+    crate::snapshot::Catalog::initial(fs_uuid)
+        .encode(&mut scratch[..BLOCK_SIZE])
+        .map_err(Error::Format)?;
+    write_half(device, CATALOG_START, scratch, 0)?;
+    scratch[..BLOCK_SIZE].fill(0);
+    for block in SNAPSHOT_START..DATA_START {
+        write_half(device, block, scratch, 0)?;
+    }
+    for (slot, (inode_id, name)) in [
+        (BOOT_INODE, ".cyxia-boot"),
+        (CLUSTER_INODES[0], crate::cluster::volume::NAMES[0]),
+        (CLUSTER_INODES[1], crate::cluster::volume::NAMES[1]),
+        (REQUEST_INODE, ".cyxia-snapshot-requests"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        DirectoryEntry {
+            inode_id,
+            inode_generation: 1,
+            name,
+        }
+        .encode(&mut scratch[slot * 128..(slot + 1) * 128])
+        .map_err(Error::Format)?;
+    }
+    write_half(device, SYSTEM_ROOT_BLOCK, scratch, 0)?;
+    scratch[..BLOCK_SIZE].fill(0);
+    scratch[..8].copy_from_slice(b"CYXBOOT1");
+    scratch[8..24].copy_from_slice(&fs_uuid);
+    let boot_crc = storage::crc32c(&scratch[..32]);
+    scratch[32..36].copy_from_slice(&boot_crc.to_le_bytes());
+    write_half(device, BOOT_BLOCK, scratch, 0)?;
+    scratch[..BLOCK_SIZE].fill(0);
+    for block in storage::CLUSTER_START..SNAPSHOT_REQUEST_START {
+        write_half(device, block, scratch, 0)?;
+    }
+    for index in 0..SNAPSHOT_REQUEST_BLOCKS {
+        let page = (&mut scratch[..BLOCK_SIZE])
+            .try_into()
+            .map_err(|_| Error::Invalid)?;
+        crate::snapshot::format_request_block(index, fs_uuid, page).map_err(Error::Format)?;
+        write_half(device, SNAPSHOT_REQUEST_START + index, scratch, 0)?;
+    }
     device.flush().map_err(Error::Io)?;
     scratch[..BLOCK_SIZE].fill(0);
     for block in LOG_START..LOG_END {

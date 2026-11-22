@@ -128,12 +128,29 @@ pub(super) fn release_vector_leases(s: &mut State, i: usize) -> Result<(), Error
     Ok(())
 }
 
+static FILE_CAPABILITIES_INVALIDATED: AtomicBool = AtomicBool::new(false);
+/// A restored business root must become inaccessible through every old file
+/// capability before another task-owner borrow can succeed. The atomic barrier
+/// closes that gap even when the task owner is temporarily busy.
+pub fn invalidate_file_capabilities() {
+    FILE_CAPABILITIES_INVALIDATED.store(true, Ordering::Release);
+    super::memory::invalidate_file(ObjectKey {
+        id: 0,
+        generation: 0,
+    });
+}
+pub fn file_capabilities_invalidated() -> bool {
+    FILE_CAPABILITIES_INVALIDATED.load(Ordering::Acquire)
+}
 pub fn grant_file_cap(caller: ObjectKey, object: ObjectKey) -> Result<u64, Error> {
     if cpu::slot() != 0 {
         return Err(Error::Auth);
     }
     locked(|s| {
         task_index(&s.tasks, caller)?;
+        if FILE_CAPABILITIES_INVALIDATED.swap(false, Ordering::AcqRel) {
+            s.services.revoke_service(FILE_SERVICE);
+        }
         s.validate_file.ok_or(Error::NotReady)?(object)?;
         s.services.grant(caller, object, FILE_SERVICE, 1)
     })

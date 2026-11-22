@@ -4,6 +4,8 @@
 pub mod abi;
 #[path = "domain_file_abi/diagnostics.rs"]
 mod diagnostics;
+#[path = "domain_file_abi/snapshots.rs"]
+mod snapshots;
 use crate::{domain_storage as storage, domain_tasks};
 use abi::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +17,7 @@ use cyxia_prototype::{
     },
     storage::InodeKind,
 };
+pub use snapshots::{grant_snapshot_recovery, grant_snapshots};
 #[derive(Clone, Copy)]
 struct Grant {
     owner: ObjectKey,
@@ -27,9 +30,24 @@ struct Open {
     owner: ObjectKey,
     cap: ObjectKey,
     file: Handle,
-    object: ObjectKey,
     readable: bool,
+    // Historical handles retain the complete authority identity that opened
+    // them. A zero key is the ordinary-handle sentinel; minted authorities
+    // always have nonzero identity fields. Retain both history fields without
+    // a second Option discriminant or a duplicate core inode identity.
+    history: ObjectKey,
 }
+const NO_HISTORY: ObjectKey = ObjectKey {
+    id: 0,
+    generation: 0,
+};
+pub(crate) const HANDLE_STORAGE_BYTES: usize = core::mem::size_of::<Option<Open>>();
+pub(crate) const SNAPSHOT_AUTHORITY_STORAGE_BYTES: usize = snapshots::AUTHORITY_STORAGE_BYTES;
+pub(crate) const SNAPSHOT_COMPLETION_STORAGE_BYTES: usize = snapshots::COMPLETION_STORAGE_BYTES;
+pub(crate) const SNAPSHOT_COORDINATION_STORAGE_BYTES: usize = snapshots::COORDINATION_STORAGE_BYTES;
+const _: () = assert!(
+    HANDLE_STORAGE_BYTES + cyxia_prototype::domains::filesystem::HANDLE_STORAGE_BYTES <= 128
+);
 struct Delivery {
     owner: ObjectKey,
     address: u64,
@@ -44,7 +62,8 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static PENDING_ID: AtomicU64 = AtomicU64::new(0);
 static PENDING_GENERATION: AtomicU64 = AtomicU64::new(0);
 static mut GRANTS: [Option<Grant>; 64] = [None; 64];
-static mut HANDLES: [Option<Open>; 64] = [None; 64];
+const ORDINARY_HANDLES: usize = 112;
+static mut HANDLES: [Option<Open>; 128] = [None; 128];
 static mut GENERATION: u64 = 0;
 static mut DATA: [u8; MAX_IO] = [0; MAX_IO];
 static mut PENDING: Option<Delivery> = None;
@@ -171,6 +190,7 @@ fn clear_pending() {
     }
     PENDING_ID.store(0, Ordering::Release);
     PENDING_GENERATION.store(0, Ordering::Relaxed);
+    snapshots::clear_pending();
 }
 pub fn exit(owner: ObjectKey) -> Result<(), Error> {
     let _guard = acquire()?;
@@ -187,6 +207,7 @@ pub fn exit(owner: ObjectKey) -> Result<(), Error> {
             *g = None;
         }
     }
+    snapshots::revoke(owner);
     if pending_delivery(owner) {
         clear_pending();
     }
@@ -209,6 +230,7 @@ fn errno(e: Error) -> i64 {
         Error::Expired => -110,
         Error::NotReady => -19,
         Error::Unsupported => -38,
+        Error::ReadOnly => -30,
         _ => -22,
     }
 }
@@ -220,6 +242,16 @@ fn handle(owner: ObjectKey, frame: &Frame) -> Result<(usize, Open), Error> {
         id: frame.u64(OFF_HANDLE_ID),
         generation: frame.u64(OFF_HANDLE_GENERATION),
     };
+    if cap.generation == 0 {
+        return unsafe { &*core::ptr::addr_of!(HANDLES) }
+            .iter()
+            .enumerate()
+            .find_map(|(at, h)| {
+                h.filter(|h| h.owner == owner && h.cap == cap && h.history != NO_HISTORY)
+                    .map(|h| (at, h))
+            })
+            .ok_or(Error::Stale);
+    }
     let at =
         usize::try_from(cap.id.checked_sub(1).ok_or(Error::Stale)?).map_err(|_| Error::Stale)?;
     let h = unsafe { (*core::ptr::addr_of!(HANDLES)).get(at).copied().flatten() }
@@ -239,6 +271,13 @@ fn stat_result(frame: &mut Frame, s: Stat) {
     frame.set_u64(OFF_DURABLE_SEQ, s.durable_write_seq);
 }
 fn authorize(owner: ObjectKey, f: &Frame) -> Result<usize, Error> {
+    if matches!(
+        f.u16(OFF_OPERATION),
+        READ | WRITE | FSYNC | CLOSE | READDIR | GET_STAT_CAP
+    ) && f.u64(OFF_HANDLE_GENERATION) == 0
+    {
+        return snapshots::authorize_read(owner, f).map(|at| at + 64);
+    }
     let cap = ObjectKey {
         id: f.u64(OFF_AUTH_ID),
         generation: f.u64(OFF_AUTH_GENERATION),
@@ -406,7 +445,7 @@ fn run(
                 _ => return Err(Error::Format),
             };
             let at = unsafe {
-                (&*core::ptr::addr_of!(HANDLES))
+                (&*core::ptr::addr_of!(HANDLES))[..ORDINARY_HANDLES]
                     .iter()
                     .position(Option::is_none)
             }
@@ -428,11 +467,11 @@ fn run(
                     owner,
                     cap,
                     file,
-                    object: key,
                     readable: matches!(
                         mode,
                         OpenMode::Read | OpenMode::ReadWrite | OpenMode::Directory
                     ),
+                    history: NO_HISTORY,
                 });
             }
             out.set_u64(OFF_HANDLE_ID, cap.id);
@@ -441,19 +480,31 @@ fn run(
         }
         READ => {
             let (_, h) = handle(owner, input)?;
+            let key = if h.history == NO_HISTORY {
+                storage::handle_object(h.file)?
+            } else {
+                storage::snapshot_handle_object(h.file)?
+            };
             let n = storage::read(h.file, offset, &mut data[..length], progress)?;
             out.set_u64(OFF_COUNT, n as u64);
-            object(out, h.object);
+            object(out, key);
             return Ok(n);
         }
         WRITE => {
             let (_, h) = handle(owner, input)?;
+            if h.history != NO_HISTORY {
+                return Err(Error::ReadOnly);
+            }
+            let key = storage::handle_object(h.file)?;
             let n = storage::write(h.file, offset, &data[..length], progress)?;
             out.set_u64(OFF_COUNT, n as u64);
-            object(out, h.object);
+            object(out, key);
         }
         FSYNC => {
             let (_, h) = handle(owner, input)?;
+            if h.history != NO_HISTORY {
+                return Err(Error::ReadOnly);
+            }
             let receipt = storage::fsync(h.file, progress)?;
             object(out, receipt.object);
             out.set_u64(OFF_WRITE_SEQ, receipt.write_seq);
@@ -493,12 +544,13 @@ fn run(
         STAT => stat_result(out, storage::stat(path, progress)?),
         GET_STAT_CAP => {
             let (_, h) = handle(owner, input)?;
-            if !h.readable {
+            if !h.readable || h.history != NO_HISTORY {
                 return Err(Error::Auth);
             }
-            let cap = domain_tasks::grant_file_cap(owner, h.object)?;
+            let key = storage::handle_object(h.file)?;
+            let cap = domain_tasks::grant_file_cap(owner, key)?;
             out.set_u64(OFF_COUNT, cap);
-            object(out, h.object);
+            object(out, key);
         }
         _ => return Err(Error::Unsupported),
     }
@@ -552,6 +604,9 @@ pub(crate) fn dispatch(
     context: &mut Context,
     progress: &mut dyn FnMut(),
 ) -> DispatchResult {
+    if context.regs[8] == abi::snapshot::SERVICE_CALL {
+        return snapshots::dispatch(owner, context, progress);
+    }
     if context.regs[8] != DISPATCH {
         return DispatchResult::NotHandled;
     }
@@ -662,11 +717,15 @@ pub(crate) fn dispatch(
         }
         // Even an uncertain media error consumes this invocation. Its result is
         // retained below, while a user retry requires a fresh request identity.
-        unsafe {
-            (*core::ptr::addr_of_mut!(GRANTS))[grant]
-                .as_mut()
-                .unwrap()
-                .last_request = input.u64(OFF_REQUEST);
+        if grant >= 64 {
+            snapshots::consume_read(grant - 64, input.u64(OFF_REQUEST));
+        } else {
+            unsafe {
+                (*core::ptr::addr_of_mut!(GRANTS))[grant]
+                    .as_mut()
+                    .unwrap()
+                    .last_request = input.u64(OFF_REQUEST);
+            }
         }
         result
     })();

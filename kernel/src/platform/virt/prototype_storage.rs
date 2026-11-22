@@ -75,6 +75,7 @@ pub struct NativeDisk {
     irq_enabled: bool,
     class: Class,
     recovery_from: Option<Class>,
+    recovery_depth: u32,
     permit: Option<BytePermit>,
     background: Option<Admission>,
     first_admission: Option<Admission>,
@@ -264,6 +265,23 @@ impl NativeDisk {
         self.publish(Board.now_ns());
     }
     fn perform(
+        &mut self,
+        operations: &[Operation],
+        input: &[[u8; 512]; 8],
+        output: &mut [[u8; 512]; 8],
+        progress: &mut dyn FnMut(),
+    ) -> Result<(), Error> {
+        let result = self.perform_inner(operations, input, output, progress);
+        // Every early error, including drain/dispatch/ack failures, may leave
+        // private or device custody behind. Preserve it and close the owner.
+        if result.is_err() && !self.failed {
+            self.failed = true;
+            self.errors = self.errors.saturating_add(1);
+            self.publish(Board.now_ns());
+        }
+        result
+    }
+    fn perform_inner(
         &mut self,
         operations: &[Operation],
         input: &[[u8; 512]; 8],
@@ -475,15 +493,61 @@ impl NativeDisk {
         Ok(())
     }
     fn recovery_enter(&mut self) {
-        if self.recovery_from.is_none() {
+        if self.recovery_depth == 0 {
             self.recovery_from = Some(self.class);
             self.class = Class::Recovery;
         }
+        match self.recovery_depth.checked_add(1) {
+            Some(depth) => self.recovery_depth = depth,
+            None => self.failed = true,
+        }
     }
     fn recovery_exit(&mut self) {
-        if let Some(class) = self.recovery_from.take() {
-            self.class = class;
+        if self.recovery_depth == 0 {
+            self.failed = true;
+            return;
         }
+        self.recovery_depth -= 1;
+        if self.recovery_depth == 0 {
+            if let Some(class) = self.recovery_from.take() {
+                self.class = class;
+            } else {
+                self.failed = true;
+            }
+        }
+    }
+    fn quiesce(&mut self) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Device);
+        }
+        // An unactivated admission has no DMA side effect and can be cancelled.
+        // An activated/unknown permit is retained and is never reset here.
+        if let Some(grant) = self.background {
+            if let Err(error) = self.scheduler.cancel_admission(grant) {
+                self.failed = true;
+                self.publish(Board.now_ns());
+                return Err(driver_error(error));
+            }
+            self.background = None;
+            self.publish(Board.now_ns());
+        }
+        let usage = self.scheduler.usage();
+        if !self.device.is_quiescent()
+            || self.permit.is_some()
+            || self.first_admission.is_some()
+            || self.scheduler.reserved_slots() != 0
+            || self.scheduler.reserved_bytes() != 0
+            || usage.queued != 0
+            || usage.inflight != 0
+            || usage.completed != 0
+            || usage.pages != 0
+            || usage.descriptors != 0
+        {
+            self.failed = true;
+            self.publish(Board.now_ns());
+            return Err(Error::Device);
+        }
+        Ok(())
     }
 }
 impl BlockDevice for NativeDisk {
@@ -519,6 +583,9 @@ impl BlockDevice for NativeDisk {
     }
     fn transaction_end(&mut self, s: bool) {
         self.end_transaction(s)
+    }
+    fn quiesce(&mut self) -> Result<(), Error> {
+        NativeDisk::quiesce(self)
     }
 }
 fn attach(info: &BootInfo) -> Result<NativeDisk, BootFailure> {
@@ -576,6 +643,7 @@ fn attach(info: &BootInfo) -> Result<NativeDisk, BootFailure> {
         irq_enabled: false,
         class: Class::Recovery,
         recovery_from: None,
+        recovery_depth: 0,
         permit: None,
         background: None,
         first_admission: None,
@@ -751,6 +819,19 @@ impl BlockDevice for ProgressDisk<'_> {
     fn flush(&mut self) -> Result<(), Error> {
         self.disk.barrier(self.progress)
     }
+    fn cpu_progress(&mut self) {
+        // Pure metadata work uses the same paid continuation as device waits.
+        // This keeps the existing file/journal/transaction custody intact.
+        #[cfg(snapshot_probe)]
+        let stage = {
+            let stage = crate::unified::current_service_stage();
+            crate::unified::service_stage(stage + 0x10000);
+            stage
+        };
+        (self.progress)();
+        #[cfg(snapshot_probe)]
+        crate::unified::service_stage(stage);
+    }
     fn recovery_enter(&mut self) {
         self.disk.recovery_enter()
     }
@@ -762,6 +843,9 @@ impl BlockDevice for ProgressDisk<'_> {
     }
     fn transaction_end(&mut self, s: bool) {
         self.disk.end_transaction(s)
+    }
+    fn quiesce(&mut self) -> Result<(), Error> {
+        self.disk.quiesce()
     }
 }
 pub fn try_with_class<R>(

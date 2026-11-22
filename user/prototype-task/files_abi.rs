@@ -1,4 +1,8 @@
 //! Fixed little-endian file service frame shared verbatim by EL0 and EL1.
+#[path = "snapshot_abi.rs"]
+pub mod snapshot;
+#[path = "snapshot_client.rs"]
+pub mod snapshot_client;
 pub const SVC: u16 = 0x45;
 pub const DISPATCH: u64 = 0x40;
 pub const MAGIC: u64 = 0x435946494c453031;

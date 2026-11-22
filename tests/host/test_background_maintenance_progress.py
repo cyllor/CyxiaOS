@@ -97,6 +97,7 @@ class BackgroundMaintenance(unittest.TestCase):
         minimal = MINIMAL_HEADER + fixture + MINIMAL_MAIN
         full = (ROOT / 'tests/host/a10_write_backpressure_harness.rs').read_text()
         full = full.replace('__BROKER__', str(ROOT / 'kernel/src/runtime/files/domain_file_abi.rs'))
+        full = full.replace('__SNAPSHOT_ADAPTER__', str(ROOT / 'tests/host/snapshot_storage_adapter.rs'))
         full = full.replace('__CLIENT__', str(ROOT / 'user/prototype-client/storage_fault.rs'))
         full = full.replace('// ACTUAL_FILE_CALL', function(
             (ROOT / 'user/prototype-client/main.rs').read_text(), 'fn file_call('))

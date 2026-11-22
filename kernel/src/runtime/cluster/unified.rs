@@ -71,11 +71,27 @@ unsafe impl Sync for ServiceStage {}
 #[unsafe(no_mangle)]
 static UNIFIED_SERVICE_STAGE: ServiceStage = ServiceStage(UnsafeCell::new(0));
 pub(crate) fn service_stage(stage: u64) {
-    // CPU0 is the sole writer and no live Rust code reads this diagnostic.
-    // The verifier consumes it only from a stopped guest snapshot, so a
-    // volatile store preserves the evidence without an atomic TCG helper in a
-    // measured service segment.
+    // CPU0 is the sole writer. The opt-in snapshot probe also reads it on
+    // CPU0 to preserve the suspended owner's stage across progress callbacks
+    // and attach the exact stage to an already consumed budget failure.
+    // Stopped readers need no atomic TCG helper in a measured service segment.
     unsafe { UNIFIED_SERVICE_STAGE.0.get().write_volatile(stage) }
+}
+#[cfg(snapshot_probe)]
+pub(crate) fn current_service_stage() -> u64 {
+    debug_assert_eq!(cpu::slot(), 0);
+    unsafe { UNIFIED_SERVICE_STAGE.0.get().read_volatile() }
+}
+#[cfg(snapshot_probe)]
+pub(crate) fn capture_service_completion_stage() {
+    // Word 23 is the opt-in CPU0 pending-bill stage. The completion-ready
+    // publication binds it to that exact bill, even if the task gate defers
+    // settlement and a later caller has already changed the current stage.
+    UNIFIED_EVIDENCE.words[23].store(current_service_stage(), Ordering::Relaxed);
+}
+#[cfg(snapshot_probe)]
+pub(crate) fn completed_service_stage() -> u64 {
+    UNIFIED_EVIDENCE.words[23].load(Ordering::Relaxed)
 }
 fn line(args: core::fmt::Arguments<'_>) {
     struct Text {
@@ -497,9 +513,13 @@ fn service_work<R>(
 ) -> R {
     let mut started = service_start(coordinator, tcp, epoch);
     let mut advance = || {
+        #[cfg(snapshot_probe)]
+        let suspended_stage = current_service_stage();
         finish_service(started);
         progress(coordinator, tcp, epoch);
         started = service_start(coordinator, tcp, epoch);
+        #[cfg(snapshot_probe)]
+        service_stage(suspended_stage);
     };
     let result = work(&mut advance);
     drop(advance);
@@ -602,6 +622,15 @@ pub fn run(info: &BootInfo) -> ! {
     let mut service_lifecycle = Lifecycle::new(boot.epoch, 1).expect("valid service identity");
     let mut context = unsafe { load() };
     initialize_shared(boot.epoch, boot.filesystem, service_lifecycle.generation());
+    #[cfg(snapshot_probe)]
+    {
+        let key = startup(15, || crate::domain_tasks::start_snapshot_client(1));
+        startup(15, || crate::domain_tasks::start_snapshot_client(2));
+        UNIFIED_EVIDENCE.words[16].store(1, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[17].store(key.id, Ordering::Relaxed);
+        UNIFIED_EVIDENCE.words[18].store(key.generation, Ordering::Release);
+    }
+    #[cfg(not(snapshot_probe))]
     if crate::memory_fault_capture::PROFILE {
         startup(15, || crate::memory_fault_capture::activate(boot.epoch));
         startup(15, || crate::domain_tasks::start_memory_client(1));

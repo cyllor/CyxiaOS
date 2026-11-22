@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "status": "IMPLEMENTED_HOST_VERIFIED_NATIVE_BLOCKED",
+  "observation_date": "2026-11-22",
+  "project": "CyxiaOS-Code",
+  "software_version": "0.18.0-dev",
+  "base_commit": "e9442cd7ffb56373ca180beb532e99aa4a736385",
+  "ci_backport_commit": "d98e92985db786c1d35e2a268c92285191aef9f4",
+  "feature_branch": "feat/v0.18-immutable-journal-snapshots",
+  "source_binding": {
+    "compiled_code_sha256": "05db276789fbd6a05733549c97447b0408ff6c7c59d9a2152a150854040efe72",
+    "compiled_source_matches_build_004": true,
+    "verification_input_sha256": "63f26fd3a1e08d2fb91c12c4ce8f8a512dfc9eac35f9495548fefbcdb9103e2f",
+    "verification_input_files": 2545,
+    "verification_input_roots": [
+      ".cargo",
+      ".github",
+      "crates",
+      "kernel",
+      "ports",
+      "tests",
+      "tools",
+      "user"
+    ],
+    "verification_root_files": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "rust-toolchain.toml",
+      "rust-toolchain"
+    ],
+    "excluded_components": [
+      "docs",
+      "target",
+      "__pycache__",
+      ".git"
+    ],
+    "digest_encoding": "SHA-256 of UTF-8 json.dumps(path_to_file_sha256, sort_keys=True, separators=(comma, colon))",
+    "note": "Compiled source identity excludes tests and documentation under the existing build contract. Verification input identity also binds test harnesses, tools and workflows. Documentation was updated after native observation; native source manifests retain their original documents."
+  },
+  "host_verification": {
+    "workspace_rust": {
+      "status": "PASS",
+      "command": "cargo +1.95.0 test --locked --offline --workspace --exclude cyxia-kernel",
+      "passed": 1661,
+      "failed": 0,
+      "ignored": 0,
+      "result_sections": 215,
+      "receipt": {
+        "path": "artifacts/debug/immutable-release-workspace.log",
+        "sha256": "56f952f87da8e7748f9ffd56afb7d703525b8c20e037a12860455bd956186eb5",
+        "bytes": 183530
+      }
+    },
+    "focused_python": {
+      "status": "PASS",
+      "passed": 37,
+      "command": "PYTHONPATH=tools:tests/host python3 -B -m unittest tests.host.test_v13_disk tests.host.test_v13_filesystem tests.host.test_v2_filesystem tests.host.test_snapshot_file_abi tests.host.test_snapshot_capability_custody tests.host.test_snapshot_probe_budget tools.test_snapshot_probe",
+      "receipt": {
+        "path": "artifacts/debug/immutable-release-final-focused-host.log",
+        "sha256": "105133b6e8167e0678c594916a667ba62a2866b4bcaa93d17cc33ba8c94d086c",
+        "bytes": 136
+      }
+    },
+    "prototype_clippy": {
+      "status": "PASS",
+      "package": "cyxia-prototype",
+      "warnings_as_errors": true,
+      "all_targets_confirmed": false,
+      "note": "The successful receipt and -D warnings result were retained, but the original full invocation was not. No all-targets claim is made.",
+      "receipt": {
+        "path": "artifacts/debug/immutable-maintenance-cpu-boundaries-clippy.log",
+        "sha256": "2f1a9b76ef9d4778de012e78d97740a75d5d95b8fc149ddeea9ef0791ff4dadc",
+        "bytes": 171
+      }
+    },
+    "x86_kernel_clippy": {
+      "status": "PASS",
+      "command": "cargo +1.95.0 clippy --locked --offline -p cyxia-kernel --target x86_64-unknown-none --features selftest -- -D warnings",
+      "receipt": {
+        "path": "artifacts/debug/immutable-release-x86-clippy.log",
+        "sha256": "f3960deeb01c84a7b7045ed46e1f3d20ea15126c052901f164efc87fa3083e2e",
+        "bytes": 314
+      }
+    },
+    "power_cut_model": {
+      "status": "PASS",
+      "scope": "Host BlockDevice with separate volatile/stable writes; every CREATE, RESTORE and GC block write/FLUSH is cut before and after, with unflushed writes discarded. Part of workspace tests; not native power cuts."
+    },
+    "maximum_dirty_pages": {
+      "status": "PASS",
+      "pages": 4096,
+      "files": 2,
+      "bytes_per_file": 8388608,
+      "verification": "All dirty pages drained, durable write sequences confirmed; historical first/middle/last pages sampled for each file. No claim of exhaustive byte comparison or native latency."
+    },
+    "full_legacy_python_lane": {
+      "status": "NOT_FULLY_PASSED",
+      "limitations": [
+        "Existing source-extraction harness and stub/manifest drift",
+        "Environment restrictions",
+        "Two page-map harness SIGSEGV observations"
+      ],
+      "note": "Focused suite does not establish whole legacy host lane PASS."
+    },
+    "full_workspace_format": {
+      "status": "BASELINE_DIFFERENCES",
+      "changed_snapshot_source_format": "PASS",
+      "note": "Existing formatting differences were not swept into this feature."
+    }
+  },
+  "native_build": {
+    "status": "PASS",
+    "scope": "Two source-bound AArch64 EL1 images with real EL0 service and snapshot actors; compile/link evidence only.",
+    "build_manifest": {
+      "path": "artifacts/debug/immutable-snapshot-native-build-004/build-manifest.json",
+      "sha256": "20e5bfb606fc2b50d97dbec2e18016ce6703a2f8d73beb6d2193d98a578177d1",
+      "bytes": 192478
+    },
+    "build_status": {
+      "path": "artifacts/debug/immutable-snapshot-native-status-004.json",
+      "sha256": "65affbdb3ee08aecfc8732b4dbc7d5708fd0b9a131d8938070f44cf12f5b382c",
+      "bytes": 2826
+    },
+    "probe_rx_bytes": 7796,
+    "probe_rx_limit": 16384,
+    "preparation_stack": {
+      "peak_bytes": 34576,
+      "exception_reserve": 4096,
+      "limit_bytes": 65536,
+      "scope": "Selected direct secondary preparation calls, not every snapshot stack path."
+    }
+  },
+  "native_environment": {
+    "qemu_version": "QEMU emulator version 10.2.2 (v10.2.2-dirty)\nCopyright (c) 2003-2025 Fabrice Bellard and the QEMU Project developers\n",
+    "qemu_sha256": "c66d0d610d82aa80c83244953390fc3c241cefe6dbefd5d7edcd1d84ddff5395",
+    "qemu_pmu_patch_attested": true,
+    "qemu_source_commit": "f8ed81651e61d9c2166df6121ce2af0f44f06b3e",
+    "qemu_patch_sha256": "b92d2ce14bca13cae43338729de3226c1ad9f469dc9947e1bd5c465d753876fd",
+    "qemu_source_sha256": {
+      "include/hw/core/cpu.h": "4696335a01617de2504f2ab09dd10dc8c86ec854fecf244aa24e31469d60ced1",
+      "cpu-common.c": "5a309695dd5c559b93ce7cf13171b3bdfc4b526092b42e49bbbcabeee22fdf13",
+      "accel/tcg/cpu-exec.c": "d49ac54fba75a2ee3fe58792e8bbcd0e4ca8ada5775d5facbccdfcb9bc990b2b",
+      "target/arm/cpregs-pmu.c": "f09a95b22f4b67e0d22bffa2523b3055cabe8d2bf943cfb313e5d4fc16364556"
+    }
+  },
+  "native_execution": {
+    "end_to_end_snapshot_status": "FAIL",
+    "cpu_budget_ns": 2500000,
+    "budget_or_quarantine_relaxed": false,
+    "runs": [
+      {
+        "scope": "full-unified",
+        "status": "FAIL",
+        "summary": {
+          "path": "artifacts/debug/immutable-snapshot-native-smoke-003/summary.json",
+          "sha256": "68140dc9079f611b89b5218d5fed0eec5b87ff8b88dfb3cf6f8d621a2996a9b0",
+          "bytes": 2811
+        },
+        "elapsed_seconds": 23.783159,
+        "first_cpu0_failure": {
+          "node": "a",
+          "service_stage": 62,
+          "network_diagnostic_stage": 27,
+          "network_stage_name": "IpcDrain",
+          "sequence": 80206,
+          "actual_cpu_ns": 6106048,
+          "reserved_cpu_ns": 2500000
+        },
+        "both_disks_structurally_valid": true,
+        "live_view_epochs": [
+          1,
+          1
+        ],
+        "actors_completed": false
+      },
+      {
+        "scope": "local-filesystem",
+        "status": "FAIL",
+        "summary": {
+          "path": "artifacts/debug/immutable-snapshot-native-local-004/summary.json",
+          "sha256": "c867049b81f59779216c498def3917d010e3923371ad629a329996b3963abf3b",
+          "bytes": 3048
+        },
+        "triage": {
+          "path": "artifacts/debug/immutable-snapshot-native-local-004/triage.json",
+          "sha256": "f0168ca459fbd902c71b0af8204a90138baacf1aaed23d2d9ea41d207c7a32b3",
+          "bytes": 6266
+        },
+        "elapsed_seconds": 11.639164,
+        "network_backend": "hubport,id=net0,hubid=0 in each separate QEMU process",
+        "first_cpu0_failure": {
+          "node": "a",
+          "service_stage": 65,
+          "network_diagnostic_stage": 14,
+          "network_stage_name": "QueueIdleAck",
+          "sequence": 21569,
+          "actual_cpu_ns": 4112474,
+          "reserved_cpu_ns": 2500000
+        },
+        "other_control_failure": {
+          "node": "b",
+          "cpu": 1,
+          "sequence": 3521,
+          "window": 35,
+          "algorithm_phase": null,
+          "actual_cpu_ns": 3123719,
+          "reserved_cpu_ns": 2500000
+        },
+        "both_disks_structurally_valid": true,
+        "live_view_epochs": [
+          1,
+          1
+        ],
+        "actors_completed": false,
+        "full_unified_accepted": false
+      }
+    ],
+    "causal_limit": "Evidence identifies budgeted segments. Matching baseline function bodies does not prove that the baseline was runtime-tested here or establish an instruction-level timing root cause."
+  },
+  "not_verified": [
+    "Native end-to-end create/history/restore completion",
+    "Native power-cut matrix",
+    "R01-R30 complete native acceptance",
+    "Maximum dirty-page native latency",
+    "Real hardware",
+    "Natural six-hour and multi-day retention rotation"
+  ],
+  "migration": {
+    "media_version": 2,
+    "v1_writable_mount": "REJECTED",
+    "in_place_migration_provided": false,
+    "path": "Offline export with the old version; create a new v2 volume; import and verify."
+  }
+}

@@ -45,6 +45,7 @@ mod storage_fault_capture{use super::*;pub const PROFILE:bool=false;pub fn selec
 pub fn entered(_:ObjectKey,_:&[u8])->Result<(),Error>{Ok(())}pub fn snapshot()->Option<[u64;4]>{None}
 pub fn delivered(_:ObjectKey,_:&[u8],_:&[u8],_:u64,_:[u64;4]){}pub fn snapshot_failed(){}}
 mod domain_storage{use super::*;
+ include!("SNAPSHOT_ADAPTER_PATH");
  pub fn read(h:Handle,o:u64,b:&mut[u8],_:&mut dyn FnMut())->Result<usize,Error>{with_fs(|f,j,d,s|f.read(h,o,b,clock(),j,d,s))}
  pub fn write(h:Handle,o:u64,b:&[u8],_:&mut dyn FnMut())->Result<usize,Error>{with_fs(|f,j,d,s|f.write(h,o,b,j,d,s))}
  pub fn create(p:&str,_:&mut dyn FnMut())->Result<ObjectKey,Error>{with_fs(|f,j,d,s|f.create(p,j,d,s))}
@@ -93,7 +94,7 @@ impl Client{
 fn run(){
  let mut disk=Disk::default();let mut scratch=[0;8192];journal::format(&mut disk,[1;16],&mut scratch).unwrap();let mut journal=Journal::new();journal.mount(&mut disk,&mut scratch).unwrap();
  cyxia_prototype::boot::BootSession::new().allocate(&mut journal,&mut disk,&mut scratch,&mut[[0;4096];4]).unwrap();
- let mut fs=FileSystem::<64>::new();fs.mount(&mut journal,&mut disk,&mut scratch).unwrap();fs.create("/data",&mut journal,&mut disk,&mut scratch).unwrap();let h=fs.open("/data",OpenMode::ReadWrite,&mut journal,&mut disk,&mut scratch).unwrap();
+ let mut fs=FileSystem::<64>::new();fs.mount(&mut journal,&mut disk,&mut scratch).unwrap();fs.initialize_business(&mut journal,&mut disk,&mut scratch).unwrap();fs.create("/data",&mut journal,&mut disk,&mut scratch).unwrap();let h=fs.open("/data",OpenMode::ReadWrite,&mut journal,&mut disk,&mut scratch).unwrap();
  for page in 0..65u64{fs.write(h,page*4096,&[page as u8;4096],&mut journal,&mut disk,&mut scratch).unwrap();fs.fsync(h,&mut journal,&mut disk,&mut scratch).unwrap();}fs.close(h).unwrap();
  FS.with(|s|*s.borrow_mut()=Some(State{fs,journal,disk,scratch}));let a=broker::grant(owner(),file::ALL_RIGHTS).unwrap();let mut c=Client{authority:file::Capability{id:a.id,generation:a.generation},next:0,deadline:1_000_000};
  let mut f=c.frame(file::OPEN);f.set_path("/data");f.set_u16(file::OFF_MODE,file::MODE_READ);c.run(&mut f);assert_eq!(f.result(),0);let id=f.u64(file::OFF_HANDLE_ID);let generation=f.u64(file::OFF_HANDLE_GENERATION);
@@ -109,6 +110,7 @@ fn run(){
 fn main(){std::thread::Builder::new().stack_size(32*1024*1024).spawn(run).unwrap().join().unwrap();}
 '''
         program=program.replace('BROKER_PATH',str(ROOT/'kernel/src/runtime/files/domain_file_abi.rs'))
+        program=program.replace('SNAPSHOT_ADAPTER_PATH',str(ROOT/'tests/host/snapshot_storage_adapter.rs'))
         for marker,name in [('ACTUAL_FRAME','fn frame('),('ACTUAL_RUN','fn run('),('ACTUAL_READ','fn read_batch(')]:
             program=program.replace('// '+marker,function(client,name))
         deps,library=build_host_prototype_library()
