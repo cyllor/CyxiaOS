@@ -107,7 +107,12 @@ impl PageTable {
     }
     #[cfg(target_arch = "x86_64")]
     fn executable_runs(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
-        let mut executable = Self::indices(&self.executable).peekable();
+        self.executable_runs_in(&self.executable)
+    }
+    fn executable_runs_in<'a>(
+        &'a self, bitmap: &'a [u64; 8],
+    ) -> impl Iterator<Item = (u64, usize)> + 'a {
+        let mut executable = Self::indices(bitmap).peekable();
         core::iter::from_fn(move || {
             let start = executable.next()?;
             let physical = self.pages[start] & !7;
@@ -202,11 +207,13 @@ impl PageTable {
         }
         // Remove old aliases before sealing new executable backing. The
         // original W^X/phase transaction and alias gate remain authoritative.
-        for index in Self::indices(&changed) {
-            let page = self.pages[index];
-            if page & 4 != 0 {
-                crate::process_arch::publish_code(crate::HIGH + (page & !7), 4096)?;
-            }
+        // Seal consecutive changed executable backing in one range. Each seal
+        // acquires the alias gate and can fence every CPU, so a per-page call
+        // turned one JIT/module load into one full shootdown per page. Only the
+        // executable subset is sealable; `changed` also carries RO/RW edits.
+        let sealable = core::array::from_fn::<_, 8, _>(|word| changed[word] & self.executable[word]);
+        for (physical, bytes) in self.executable_runs_in(&sealable) {
+            crate::process_arch::publish_code(crate::HIGH + physical, bytes)?;
         }
         space.map_pages(Self::indices(&changed).filter_map(|index| {
             let page = self.pages[index];

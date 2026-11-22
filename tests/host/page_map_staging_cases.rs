@@ -71,3 +71,22 @@ fn runtime_batch_staging_rx_ranges_do_not_wrap_or_join_across_bitmap_holes() {
         (0x500000, 4096), (0x501000, 4096), (0x600000, 8192),
     ]);
 }
+
+/// synchronize seals the changed subset, not the whole executable index: a
+/// changed RW page must never be sealed, and consecutive RX pages share one
+/// range instead of one shootdown per page.
+#[test]
+fn changed_subset_seals_only_executable_pages_in_consecutive_runs() {
+    let mut table = super::PageTable::empty();
+    for (index, physical, protection) in [
+        (0usize, 0x400000u64, 5u8), (1, 0x401000, 5), (2, 0x402000, 3),
+        (3, 0x403000, 5), (4, 0x404000, 5),
+    ] {
+        table.set(index, physical, protection).unwrap();
+    }
+    let sealable = core::array::from_fn::<_, 8, _>(|word| table.dirty[word] & table.executable[word]);
+    assert_eq!(sealable[0] & 0b11111, 0b11011, "the changed RW page stayed sealable");
+    assert_eq!(table.executable_runs_in(&sealable).collect::<Vec<_>>(), vec![
+        (0x400000, 8192), (0x403000, 8192),
+    ]);
+}
