@@ -357,6 +357,62 @@ pub unsafe fn enter(
         }
     })
 }
+/// Finish a nonblocking Linux clock syscall in the AP's owned job. Decline
+/// complex outputs so CPU0 applies the ordinary copy and errno policy.
+///
+/// # Safety
+/// The caller owns this stopped context and its matching root. The CPU0
+/// service owner and other workers cannot access its private backing.
+#[cfg(all(target_arch = "x86_64", feature = "cosmic-session", not(feature = "abi-trace")))]
+pub(crate) unsafe fn complete_ap_clock(
+    context: &mut Context,
+    root: &cyxia_arch_x86_64::space::AddressSpace<'_>,
+    deadline: u64,
+) -> bool {
+    use cyxia_arch_x86_64::{space::PAGE_BYTES, user::UserAbi};
+    use cyxia_posix::linux_abi::{CLOCK_MONOTONIC, X86_64_CLOCK_GETTIME, encode_timespec};
+
+    let Some(call) = context.raw.syscall() else {
+        return false;
+    };
+    if call.abi != UserAbi::Linux64
+        || call.number != X86_64_CLOCK_GETTIME
+        || call.args[0] != CLOCK_MONOTONIC
+    {
+        return false;
+    }
+    const LAYOUT: cyxia_contracts::user_layout::ImageLayout = crate::exec_memory::PROFILE.layout();
+    const BYTES: usize = 16;
+    let address = call.args[1];
+    // Only the private image, initial stack and anonymous heap are eligible.
+    // A single-page output delegates cross-page validation to CPU0.
+    let private = (LAYOUT.image_base..LAYOUT.image_end).contains(&address)
+        || (LAYOUT.stack_base..LAYOUT.stack_base + LAYOUT.stack_pages as u64 * PAGE_BYTES)
+            .contains(&address)
+        || (cyxia_posix::vm::BASE..cyxia_posix::vm::END).contains(&address);
+    if !private || address % PAGE_BYTES > PAGE_BYTES - BYTES as u64 {
+        return false;
+    }
+    debug_assert_eq!(root.resident_cpus(), 0);
+    let Some(mapping) = root.translate(address) else {
+        return false;
+    };
+    if !mapping.permissions.writable || mapping.permissions.executable {
+        return false;
+    }
+    let Ok(output) = crate::machine::runtime::kernel_va(mapping.physical, BYTES) else {
+        return false;
+    };
+    let ns = now_ns();
+    if ns >= deadline {
+        return false;
+    }
+    // The admitted writable private mapping pins a complete 16-byte span.
+    unsafe { core::ptr::copy_nonoverlapping(encode_timespec(ns).as_ptr(), output as *mut u8, BYTES) };
+    context.set_result(0);
+    true
+}
+
 pub fn make_writable(address: u64, length: usize) -> Result<(), Errno> {
     #[cfg(target_arch = "aarch64")]
     {

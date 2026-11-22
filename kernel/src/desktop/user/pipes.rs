@@ -4,10 +4,17 @@ use core::fmt::Write;
 
 static mut PIPES: Pipes = Pipes::new();
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn set_boot_limit(limit: usize) -> Result<(), Errno> {
+    // Initialization runs on CPU0 before any process can access the pool.
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPES)).set_boot_limit(limit) }
+}
+
 pub(super) fn status(out: &mut impl Write) {
     // SAFETY: this snapshot runs on the same CPU0 foreground as pool mutation.
-    let free = unsafe { (&*core::ptr::addr_of!(PIPES)).free() };
-    let capacity = cyxia_posix::pipe::PIPES;
+    let pool = unsafe { &*core::ptr::addr_of!(PIPES) };
+    let free = pool.free();
+    let capacity = pool.capacity();
     let _ = writeln!(out,
         "PIPE_POOL capacity={} unavailable={} free={} bytes_per_pair={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r",
         capacity, capacity - free, free, cyxia_posix::pipe::CAPACITY);

@@ -188,10 +188,13 @@ def validate_build(directory, *, cc='clang'):
                'OS ELF identity mismatch')
     return manifest
 
-def launch_argv(qemu, image, *, accel='tcg', display='none', disk=None, qmp=None):
+def launch_argv(qemu, image, *, accel='tcg', display='none', disk=None, qmp=None,
+                cpus=4, ram_mib=1024):
     pc.require(display in ('none', 'cocoa', 'gtk', 'sdl'), 'unsupported display')
+    pc.require(type(cpus) is int and 1 <= cpus <= 4, 'PC runtime supports 1–4 CPUs')
+    pc.require(type(ram_mib) is int and 256 <= ram_mib <= 1024, 'PC runtime supports 256–1024 MiB')
     command = [str(qemu), '-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64',
-               '-smp', 'cpus=4,sockets=1,cores=4,threads=1', '-m', '1024M',
+               '-smp', f'cpus={cpus},sockets=1,cores={cpus},threads=1', '-m', f'{ram_mib}M',
                '-accel', pc.accelerator(accel), '-display', display,
                '-vga', 'none',
                '-serial', 'stdio', '-monitor', 'none', '-no-reboot',
@@ -226,6 +229,8 @@ def main():
     r.add_argument('--cc', default='clang', help='explicit compiler used to produce this build')
     r.add_argument('--accel', choices=['tcg', 'kvm'], default='tcg')
     r.add_argument('--display', choices=['none', 'cocoa', 'gtk', 'sdl'], default='none')
+    r.add_argument('--cpus', type=int, default=4)
+    r.add_argument('--ram-mib', type=int, default=1024)
     args = parser.parse_args()
     if args.command == 'build':
         build(args.output, profile=args.profile, graphics=args.graphics, ported=args.ported,
@@ -236,6 +241,7 @@ def main():
         with native_lease(pc.prepare_native_lock(DEFAULT_NATIVE_LOCK)):
             idle_native_host()
             subprocess.run(launch_argv(pc.executable(args.qemu), args.build / 'boot.bin',
-                           accel=args.accel, display=args.display, disk=args.disk), check=True)
+                           accel=args.accel, display=args.display, disk=args.disk,
+                           cpus=args.cpus, ram_mib=args.ram_mib), check=True)
 
 if __name__ == '__main__': main()

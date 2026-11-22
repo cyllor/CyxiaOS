@@ -24,7 +24,8 @@ impl<'a> Process<'a> {
         cwd: Option<&str>,
         mappings: &[Mapping],
     ) -> Result<Prepared, Errno> {
-        if mappings.len() > OPEN_MAX {
+        let limit = self.fd_limit();
+        if mappings.len() > limit {
             return Err(Errno::Inval);
         }
         let mut directory = Self::empty(self.objects, self.owner);
@@ -50,7 +51,7 @@ impl<'a> Process<'a> {
         for map in mappings {
             let target = usize::try_from(map.target)
                 .ok()
-                .filter(|v| *v < OPEN_MAX)
+                .filter(|v| *v < limit)
                 .ok_or(Errno::Badf)?;
             if used[target] {
                 return Err(Errno::Inval);

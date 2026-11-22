@@ -29,6 +29,9 @@ mod files;
 mod linux;
 #[path = "user/objects.rs"]
 mod objects;
+#[cfg(target_arch = "x86_64")]
+#[path = "user/capacity.rs"]
+pub(crate) mod capacity;
 #[cfg(feature = "ported")]
 #[path = "user/pipes.rs"]
 mod pipes;
@@ -285,6 +288,10 @@ impl Runner {
         if self.status.state.active() {
             return Err(Errno::Busy);
         }
+        #[cfg(target_arch = "x86_64")]
+        if !capacity::thread_available() {
+            return Err(Errno::Again);
+        }
         #[cfg(feature = "ported")]
         {
             self.linux = false;
@@ -391,9 +398,12 @@ impl Runner {
         };
         if let Err(error) = process_arch::publish_code(self.arena.base_ptr() as u64, CODE_BYTES) {
             self.thread.active = false;
+            self.status.thread_count = 0;
             self.status.state = UserState::Fault;
             return Err(error); // retain the grant and quarantine uncertain code.
         }
+        #[cfg(target_arch = "x86_64")]
+        capacity::thread_started();
         Ok(())
     }
     fn finish(
@@ -404,6 +414,8 @@ impl Runner {
         state: UserState,
         code: u32,
     ) {
+        #[cfg(target_arch = "x86_64")]
+        let threads_released = self.status.thread_count as usize;
         #[cfg(feature = "ported")]
         {
             self.pending_spawn = None;
@@ -451,6 +463,8 @@ impl Runner {
         self.status.state = state;
         self.status.code = code;
         self.status.free_pages = ledger.snapshot().free;
+        #[cfg(target_arch = "x86_64")]
+        capacity::threads_released(threads_released);
     }
     fn validate(&self, address: u64, len: usize, write: bool) -> Result<(), Errno> {
         // No bytes are accessed for an empty I/O request; descriptor/handle
@@ -1563,9 +1577,14 @@ impl Supervisor {
         // from this poll's dispatch, signals and failed launch cleanup.
         #[cfg(feature = "ported")]
         self.publish_child_exits();
+        #[cfg(target_arch = "x86_64")]
+        let slots = crate::address_space::process_slots();
+        #[cfg(target_arch = "aarch64")]
+        let slots = SLOTS;
         let slot = self
             .runners
             .iter()
+            .take(slots)
             .position(|r| !r.status.state.active())
             .ok_or(Errno::Again)?;
         let pid = self.next_pid;
@@ -1914,7 +1933,7 @@ pub fn object_details(out: &mut impl Write) {
     let supervisor = unsafe { &*core::ptr::addr_of!(SUPERVISOR) };
     for runner in supervisor.runners.iter().filter(|r| r.status.state.active()) {
         let live = (0..cyxia_posix::OPEN_MAX).filter(|&fd| runner.process.flags(fd as i32).is_ok()).count();
-        writeln!(out, "PROCESS_FDS pid={} live={} capacity={}\r", runner.status.pid, live, cyxia_posix::OPEN_MAX).unwrap();
+        writeln!(out, "PROCESS_FDS pid={} live={} capacity={}\r", runner.status.pid, live, runner.process.fd_limit()).unwrap();
     }
 }
 

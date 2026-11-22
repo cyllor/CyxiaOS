@@ -429,10 +429,13 @@ impl<'a> Process<'a> {
             .ok_or(Errno::Badf)
     }
     fn free_fd(&self) -> Result<usize, Errno> {
-        self.fds
+        self.fds[..self.fd_limit()]
             .iter()
             .position(Option::is_none)
             .ok_or(Errno::Mfile)
+    }
+    pub fn fd_limit(&self) -> usize {
+        self.objects.limits().fds_per_process
     }
     /// Install an already authorized socket into the same descriptor namespace
     /// as files. The supervisor retains endpoint lifetime/owner responsibility.
@@ -468,7 +471,8 @@ impl<'a> Process<'a> {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(Errno::Inval);
         }
-        let mut fds = self.fds.iter().enumerate().filter(|(_, v)| v.is_none());
+        let mut fds = self.fds[..self.fd_limit()]
+            .iter().enumerate().filter(|(_, v)| v.is_none());
         let read_fd = fds.next().ok_or(Errno::Mfile)?.0;
         let write_fd = fds.next().ok_or(Errno::Mfile)?.0;
         let [read_slot, write_slot] = self.objects.free_slots::<2>()?;
@@ -675,11 +679,12 @@ impl<'a> Process<'a> {
     }
     pub fn dup_from(&mut self, fd: i32, start: i32, cloexec: bool) -> Result<i32, Errno> {
         let slot = self.description(fd)?;
+        let limit = self.fd_limit();
         let start = usize::try_from(start)
             .ok()
-            .filter(|n| *n < OPEN_MAX)
+            .filter(|n| *n < limit)
             .ok_or(Errno::Inval)?;
-        let new = (start..OPEN_MAX)
+        let new = (start..limit)
             .find(|i| self.fds[*i].is_none())
             .ok_or(Errno::Mfile)?;
         self.objects.retain(slot)?;
@@ -897,7 +902,7 @@ impl<'a> Process<'a> {
         new: i32,
     ) -> Result<(i32, Option<Released>), Errno> {
         let slot = self.description(old)?;
-        if new < 0 || new as usize >= OPEN_MAX {
+        if new < 0 || new as usize >= self.fd_limit() {
             return Err(Errno::Badf);
         }
         if old == new {

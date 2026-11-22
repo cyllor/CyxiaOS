@@ -18,13 +18,27 @@ fn runtime_batch_process_owner_checks_first_last_and_out_of_range_slots() {
     // Valid slots must reach the REAL arena validator; invalid slots must stop
     // at the REAL owner guard before arena arithmetic or access. No HIGH+PA
     // translation is substituted, and no successful guest allocation is claimed.
-    struct Restore(u64);
+    struct Restore {
+        pool: u64,
+        #[cfg(boot_pool_plan)]
+        slots: usize,
+    }
     impl Drop for Restore {
-        fn drop(&mut self) { super::TABLE_POOL.store(self.0, core::sync::atomic::Ordering::Release); }
+        fn drop(&mut self) {
+            super::TABLE_POOL.store(self.pool, core::sync::atomic::Ordering::Release);
+            #[cfg(boot_pool_plan)]
+            super::TABLE_SLOTS.store(self.slots, core::sync::atomic::Ordering::Release);
+        }
     }
     let pool = 0x200001;
-    let _restore = Restore(super::TABLE_POOL.swap(pool, core::sync::atomic::Ordering::AcqRel));
     let slots = crate::usermem::MAX_PROCESSES;
+    #[cfg(boot_pool_plan)]
+    let slots = slots - 1;
+    let _restore = Restore {
+        pool: super::TABLE_POOL.swap(pool, core::sync::atomic::Ordering::AcqRel),
+        #[cfg(boot_pool_plan)]
+        slots: super::TABLE_SLOTS.swap(slots, core::sync::atomic::Ordering::AcqRel),
+    };
     for slot in [0, slots - 1, slots, slots + 1, usize::MAX] {
         crate::HOST_DIAGNOSTICS.with(|bytes| bytes.borrow_mut().clear());
         let mut owner = super::ProcessSpace::new();

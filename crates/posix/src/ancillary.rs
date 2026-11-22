@@ -189,7 +189,7 @@ impl Process<'_> {
         let count = slot
             .count
             .min(limit)
-            .min(self.fds.iter().filter(|f| f.is_none()).count());
+            .min(self.fds[..self.fd_limit()].iter().filter(|f| f.is_none()).count());
         let mut out = Received {
             fds: [-1; MAX_RIGHTS],
             count,

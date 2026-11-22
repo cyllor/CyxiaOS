@@ -23,8 +23,10 @@ fn with<T>(f: impl FnOnce(&mut FramePool<'static>) -> Result<T, Errno>) -> Resul
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
     f(pool.as_mut().ok_or(Errno::Nodev)?)
 }
-pub fn init(base: u64) -> Result<(), Errno> {
-    if base == 0 || base % 4096 != 0 || base.checked_add(BYTES).is_none() {
+pub fn init(base: u64, bytes: u64) -> Result<(), Errno> {
+    if base == 0 || base % 4096 != 0 || bytes == 0 || bytes > BYTES
+        || bytes % 4096 != 0 || base.checked_add(bytes).is_none()
+    {
         return Err(Errno::Inval);
     }
     // The caller exclusively reserved this exact range through firmware-aware
@@ -35,7 +37,7 @@ pub fn init(base: u64) -> Result<(), Errno> {
     }
     let region = MemoryRegion {
         start: PhysAddr(base),
-        len: BYTES,
+        len: bytes,
         kind: RegionKind::Ram,
     };
     let metadata = unsafe { &mut *core::ptr::addr_of_mut!(METADATA) };

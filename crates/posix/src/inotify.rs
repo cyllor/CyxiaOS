@@ -248,6 +248,7 @@ impl Process<'_> {
         }
         let fd = self.free_fd()?;
         let description = self.objects.free_slots::<1>()?[0];
+        let limits = self.objects.limits();
         let index = {
             let table = self.objects.inner.borrow();
             if table
@@ -255,13 +256,14 @@ impl Process<'_> {
                 .iter()
                 .filter(|i| i.used && i.owner == self.owner)
                 .count()
-                >= INSTANCES
+                >= limits.inotify_per_owner
             {
                 return Err(Errno::Mfile);
             }
             table
                 .inotifies
                 .iter()
+                .take(limits.inotify_instances)
                 .position(|i| !i.used)
                 .ok_or(Errno::Mfile)?
         };

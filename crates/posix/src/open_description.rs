@@ -1,8 +1,8 @@
 //! Shared, bounded open descriptions. The supervisor serializes access; this
 //! crate stays safe and allocation-free. The versioned object profile owns
 //! actual shared metadata capacity independently of each process's FD quota.
-use super::{Description, Errno, Object, epoll};
-use core::cell::RefCell;
+use super::{Description, Errno, Object, epoll, limits};
+use core::cell::{Cell, RefCell};
 use cyxia_ai_fs::FileSystem;
 
 pub const CAPACITY: usize = super::limits::PROFILE.open_descriptions;
@@ -90,6 +90,7 @@ pub struct Snapshot {
 }
 pub struct OpenDescriptions {
     pub(crate) inner: RefCell<Table>,
+    limits: Cell<limits::ObjectProfile>,
 }
 impl Default for OpenDescriptions {
     fn default() -> Self {
@@ -99,6 +100,7 @@ impl Default for OpenDescriptions {
 impl OpenDescriptions {
     pub const fn new() -> Self {
         Self {
+            limits: Cell::new(limits::PROFILE),
             inner: RefCell::new(Table {
                 entries: [Entry::EMPTY; CAPACITY],
                 rights: [super::ancillary::Slot::EMPTY; super::ancillary::MESSAGES],
@@ -114,10 +116,24 @@ impl OpenDescriptions {
             }),
         }
     }
+    /// Configure an unused table before any handle can have escaped it.
+    pub fn set_boot_limits(&self, profile: limits::ObjectProfile) -> Result<(), Errno> {
+        if !profile.is_within_build() {
+            return Err(Errno::Inval);
+        }
+        if self.inner.borrow().entries.iter().any(|e| e.generation != 0) {
+            return Err(Errno::Busy);
+        }
+        self.limits.set(profile);
+        Ok(())
+    }
+    pub fn limits(&self) -> limits::ObjectProfile {
+        self.limits.get()
+    }
     pub fn snapshot(&self) -> Snapshot {
         let table = self.inner.borrow();
         Snapshot {
-            capacity: CAPACITY,
+            capacity: self.limits().open_descriptions,
             live: table.entries.iter().filter(|e| e.value.is_some()).count(),
             references: table
                 .entries
@@ -166,6 +182,7 @@ impl OpenDescriptions {
         let mut free = table
             .entries
             .iter()
+            .take(self.limits().open_descriptions)
             .enumerate()
             .filter(|(_, e)| e.value.is_none() && e.generation < MAX_GENERATION);
         for out in slots {

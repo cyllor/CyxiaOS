@@ -220,19 +220,30 @@ impl PageTable {
 #[cfg(target_arch = "x86_64")]
 pub const TABLE_PAGES_PER_PROCESS: usize = 128;
 #[cfg(target_arch = "x86_64")]
+pub const TABLE_BYTES_PER_PROCESS: u64 = (TABLE_PAGES_PER_PROCESS * 4096) as u64;
+#[cfg(target_arch = "x86_64")]
 pub const TABLE_POOL_BYTES: u64 =
-    (TABLE_PAGES_PER_PROCESS * 4096 * cyxia_posix::usermem::MAX_PROCESSES) as u64;
+    TABLE_BYTES_PER_PROCESS * cyxia_posix::usermem::MAX_PROCESSES as u64;
 #[cfg(target_arch = "x86_64")]
 static TABLE_POOL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(target_arch = "x86_64")]
-pub fn init_pc() -> Result<cyxia_contracts::PhysAddr, Errno> {
+static TABLE_SLOTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+pub fn process_slots() -> usize {
+    TABLE_SLOTS.load(core::sync::atomic::Ordering::Acquire)
+}
+#[cfg(target_arch = "x86_64")]
+pub fn init_pc(range: cyxia_contracts::MemoryRegion) -> Result<(), Errno> {
     use core::sync::atomic::Ordering;
     if TABLE_POOL.load(Ordering::Acquire) != 0 {
         return Err(Errno::Busy);
     }
-    let base = crate::os::reserve_pool(TABLE_POOL_BYTES)?;
-    TABLE_POOL.store(base.0, Ordering::Release);
-    Ok(base)
+    if range.len == 0 || range.len > TABLE_POOL_BYTES || range.len % TABLE_BYTES_PER_PROCESS != 0 {
+        return Err(Errno::Inval);
+    }
+    TABLE_SLOTS.store((range.len / TABLE_BYTES_PER_PROCESS) as usize, Ordering::Release);
+    TABLE_POOL.store(range.start.0, Ordering::Release);
+    Ok(())
 }
 #[cfg(target_arch = "x86_64")]
 pub struct ProcessSpace {
@@ -275,13 +286,13 @@ impl ProcessSpace {
             return Ok(false);
         }
         let pool = TABLE_POOL.load(core::sync::atomic::Ordering::Acquire);
-        if pool == 0 || self.slot >= cyxia_posix::usermem::MAX_PROCESSES || self.pid == 0 {
+        if pool == 0 || self.slot >= process_slots() || self.pid == 0 {
             crate::process_arch::trace_entry_error("begin.owner", self.pid, 0, format_args!(
                 "error={:?} slot={} pool={pool:#x}", Errno::Nodev, self.slot,
             ));
             return Err(Errno::Nodev);
         }
-        let physical = pool + self.slot as u64 * TABLE_PAGES_PER_PROCESS as u64 * 4096;
+        let physical = pool + self.slot as u64 * TABLE_BYTES_PER_PROCESS;
         let arena = unsafe {
             TableArena::from_raw(
                 (crate::HIGH + physical) as *mut u8,

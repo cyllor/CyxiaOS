@@ -224,7 +224,8 @@ pub fn register_irq(handler: fn(u8) -> bool) -> Result<(), Error> {
         .map_err(|_| Error::Conflict)
 }
 pub fn release_aps(entry: extern "C" fn(usize) -> !) -> Result<(), Error> {
-    if cpu_slot() != 0 || online_cpus() != 15 {
+    let online = online_cpus();
+    if cpu_slot() != 0 || online & 1 == 0 {
         return Err(Error::Identity);
     }
     ENTRY
@@ -236,7 +237,9 @@ pub fn release_aps(entry: extern "C" fn(usize) -> !) -> Result<(), Error> {
         )
         .map_err(|_| Error::Conflict)?;
     for slot in 1..4 {
-        wake(slot)?;
+        if online & (1 << slot) != 0 {
+            wake(slot)?;
+        }
     }
     Ok(())
 }
@@ -477,9 +480,7 @@ unsafe fn firmware() -> pc::acpi::CpuTopology {
     let hpet = hpet.expect("HPET absent");
     map_device(hpet, 4096).expect("HPET MMIO");
     HPET.store(hpet, Ordering::Release);
-    let topology = topology.expect("MADT absent");
-    assert_eq!(topology.count, 4);
-    topology
+    topology.expect("MADT absent")
 }
 
 #[unsafe(no_mangle)]
@@ -545,7 +546,7 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
     }
     KERNEL_ROOT.store(root, Ordering::Release);
     LAPIC.store(topology.lapic_base, Ordering::Release);
-    for (slot, &id) in topology.apic_ids.iter().enumerate() {
+    for (slot, &id) in topology.apic_ids[..topology.count].iter().enumerate() {
         APIC_IDS[slot].store(id as u64, Ordering::Relaxed);
     }
     let (_, trap, ist) = stack(0);
@@ -559,7 +560,7 @@ extern "C" fn x86_runtime_boot_entry(magic: u32, info_pa: u32) -> ! {
     initialize_clock();
     initialize_timer(0);
     ONLINE.store(1, Ordering::Release);
-    for slot in 1..4 {
+    for slot in 1..topology.count {
         unsafe {
             arch::ap_boot::prepare(arch::ap_boot::Mailbox {
                 root,

@@ -1,5 +1,6 @@
 //! Explicit metadata envelopes. Per-process quotas do not reserve a share of
 //! the global pools; global exhaustion remains an ordinary checked error.
+#[derive(Clone, Copy)]
 pub struct ObjectProfile {
     pub name: &'static str,
     pub fds_per_process: usize,
@@ -8,6 +9,17 @@ pub struct ObjectProfile {
     pub epoll_instances: usize,
     pub inotify_per_owner: usize,
     pub inotify_instances: usize,
+}
+
+impl ObjectProfile {
+    pub(crate) fn is_within_build(self) -> bool {
+        (3..=PROFILE.fds_per_process).contains(&self.fds_per_process)
+            && (3..=PROFILE.open_descriptions).contains(&self.open_descriptions)
+            && (1..=PROFILE.epolls_per_owner).contains(&self.epolls_per_owner)
+            && (1..=PROFILE.epoll_instances).contains(&self.epoll_instances)
+            && (1..=PROFILE.inotify_per_owner).contains(&self.inotify_per_owner)
+            && (1..=PROFILE.inotify_instances).contains(&self.inotify_instances)
+    }
 }
 
 pub const PROFILE: ObjectProfile = if cfg!(feature = "cosmic-applets-v1") {

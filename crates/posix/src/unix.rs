@@ -61,6 +61,8 @@ impl Handle {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
+    pub endpoints: usize,
+    pub connections: usize,
     pub free_endpoints: usize,
     pub free_connections: usize,
     pub free_bindings: usize,
@@ -312,6 +314,8 @@ pub struct UnixSockets {
     endpoints: [Slot; ENDPOINTS],
     connections: [Option<Connection>; CONNECTIONS],
     bindings: [Option<Binding>; ENDPOINTS],
+    endpoint_limit: usize,
+    connection_limit: usize,
 }
 impl Default for UnixSockets {
     fn default() -> Self {
@@ -324,21 +328,39 @@ impl UnixSockets {
             endpoints: [const { Slot::new() }; ENDPOINTS],
             connections: [const { None }; CONNECTIONS],
             bindings: [None; ENDPOINTS],
+            endpoint_limit: ENDPOINTS,
+            connection_limit: CONNECTIONS,
         }
+    }
+    pub fn set_boot_limits(&mut self, endpoints: usize, connections: usize) -> Result<(), Errno> {
+        if !(2..=ENDPOINTS).contains(&endpoints)
+            || !(1..=CONNECTIONS).contains(&connections)
+            || connections > endpoints / 2
+        {
+            return Err(Errno::Inval);
+        }
+        if self.endpoints.iter().any(|s| s.generation != 0) {
+            return Err(Errno::Busy);
+        }
+        self.endpoint_limit = endpoints;
+        self.connection_limit = connections;
+        Ok(())
     }
     pub fn capacity(&self) -> Capacity {
         Capacity {
+            endpoints: self.endpoint_limit,
+            connections: self.connection_limit,
             free_endpoints: self
-                .endpoints
+                .endpoints[..self.endpoint_limit]
                 .iter()
                 .filter(|s| s.endpoint.is_none() && s.generation < GENERATION_MAX)
                 .count(),
-            free_connections: self.connections.iter().filter(|c| c.is_none()).count(),
-            free_bindings: self.bindings.iter().filter(|b| b.is_none()).count(),
+            free_connections: self.connections[..self.connection_limit].iter().filter(|c| c.is_none()).count(),
+            free_bindings: self.bindings[..self.endpoint_limit].iter().filter(|b| b.is_none()).count(),
         }
     }
     fn free_endpoint(&self, excluded: Option<usize>) -> Result<usize, Errno> {
-        self.endpoints
+        self.endpoints[..self.endpoint_limit]
             .iter()
             .enumerate()
             .find_map(|(index, slot)| {
@@ -350,7 +372,7 @@ impl UnixSockets {
             .ok_or(Errno::Nospc)
     }
     fn free_connection(&self) -> Result<usize, Errno> {
-        self.connections
+        self.connections[..self.connection_limit]
             .iter()
             .position(Option::is_none)
             .ok_or(Errno::Nospc)
@@ -489,7 +511,7 @@ impl UnixSockets {
             return Err(Errno::Addrinuse);
         }
         let slot = self
-            .bindings
+            .bindings[..self.endpoint_limit]
             .iter()
             .position(Option::is_none)
             .ok_or(Errno::Nospc)?;

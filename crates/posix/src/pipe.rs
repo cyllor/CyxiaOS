@@ -67,6 +67,7 @@ impl Pipe {
 
 pub struct Pipes {
     entries: [Pipe; PIPES],
+    limit: usize,
 }
 impl Default for Pipes {
     fn default() -> Self {
@@ -77,10 +78,24 @@ impl Pipes {
     pub const fn new() -> Self {
         Self {
             entries: [const { Pipe::new() }; PIPES],
+            limit: PIPES,
         }
     }
+    pub fn set_boot_limit(&mut self, limit: usize) -> Result<(), Errno> {
+        if !(1..=PIPES).contains(&limit) {
+            return Err(Errno::Inval);
+        }
+        if self.entries.iter().any(|p| p.generation != 0) {
+            return Err(Errno::Busy);
+        }
+        self.limit = limit;
+        Ok(())
+    }
+    pub fn capacity(&self) -> usize {
+        self.limit
+    }
     pub fn free(&self) -> usize {
-        self.entries
+        self.entries[..self.limit]
             .iter()
             .filter(|p| p.open == [false; 2] && p.generation < GENERATION_MAX)
             .count()
@@ -91,7 +106,7 @@ impl Pipes {
             return Err(Errno::Inval);
         }
         let (index, pipe) = self
-            .entries
+            .entries[..self.limit]
             .iter_mut()
             .enumerate()
             .find(|(_, p)| p.open == [false; 2] && p.generation < GENERATION_MAX)

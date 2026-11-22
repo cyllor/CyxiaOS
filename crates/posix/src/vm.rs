@@ -19,6 +19,8 @@
 //! Returned batches are snapshots, not generation-checked authority. The kernel must
 //! serialize these operations with user execution and guard against stale receipts.
 use crate::Errno;
+mod free_ranges;
+use free_ranges::FreeRanges;
 
 #[cfg(not(feature = "large-memory"))]
 pub const BASE: u64 = 0x200000;
@@ -40,6 +42,8 @@ pub const PAGE_COUNT: usize = cyxia_contracts::user_layout::ImageProfile::FullOs
     .heap_pages;
 const _: () = assert!(PAGE_COUNT < u16::MAX as usize && PAGE_COUNT.is_multiple_of(512));
 const UNMAPPED: u16 = u16::MAX;
+const SLOT_WORD_BITS: usize = u64::BITS as usize;
+const SLOT_WORDS: usize = PAGE_COUNT / SLOT_WORD_BITS;
 
 /// Validate an immutable-file snapshot and return the bytes in its mapped pages.
 /// The caller zeroes whole pages before copying and applies the final permissions.
@@ -183,7 +187,8 @@ pub struct Vm {
     slots: [u16; PAGE_COUNT],
     protections: [u8; PAGE_COUNT],
     may_write: [bool; PAGE_COUNT],
-    physical_in_use: [bool; PAGE_COUNT],
+    physical_in_use: [u64; SLOT_WORDS],
+    virtual_free: FreeRanges,
     used: usize,
 }
 
@@ -199,7 +204,8 @@ impl Vm {
             slots: [UNMAPPED; PAGE_COUNT],
             protections: [0; PAGE_COUNT],
             may_write: [false; PAGE_COUNT],
-            physical_in_use: [false; PAGE_COUNT],
+            physical_in_use: [0; SLOT_WORDS],
+            virtual_free: FreeRanges::new(),
             used: 0,
         }
     }
@@ -215,13 +221,7 @@ impl Vm {
     /// Largest contiguous unallocated virtual range, in pages. Physical free
     /// capacity alone cannot explain whether a contiguous mmap can succeed.
     pub fn largest_free_run(&self) -> usize {
-        let mut largest = 0;
-        let mut run = 0;
-        for &slot in &self.slots {
-            run = if slot == UNMAPPED { run + 1 } else { 0 };
-            largest = largest.max(run);
-        }
-        largest
+        self.virtual_free.longest()
     }
 
     /// Atomically change already allocated pages to NONE (0), R (1), or RW (3).
@@ -312,18 +312,20 @@ impl Vm {
             return Err(Errno::Nomem);
         }
         let first = self
-            .slots
-            .windows(page_count)
-            .position(|window| window.iter().all(|&slot| slot == UNMAPPED))
+            .virtual_free
+            .first_fit(&self.slots, page_count)
             .ok_or(Errno::Nomem)?;
         let mut selected = 0;
-        for (slot, in_use) in self.physical_in_use.iter().enumerate() {
-            if !in_use {
+        'select: for (word, &in_use) in self.physical_in_use.iter().enumerate() {
+            let mut free = !in_use;
+            while free != 0 {
+                let slot = word * SLOT_WORD_BITS + free.trailing_zeros() as usize;
                 batch.slots[selected] = slot as u16;
                 selected += 1;
                 if selected == page_count {
-                    break;
+                    break 'select;
                 }
+                free &= free - 1;
             }
         }
         // Keep this method failure-atomic even if internal accounting changes later.
@@ -334,8 +336,10 @@ impl Vm {
         self.protections[first..first + page_count].fill(3);
         self.may_write[first..first + page_count].fill(true);
         for &slot in &batch.slots[..page_count] {
-            self.physical_in_use[usize::from(slot)] = true;
+            let slot = usize::from(slot);
+            self.physical_in_use[slot / SLOT_WORD_BITS] |= 1 << (slot % SLOT_WORD_BITS);
         }
+        self.virtual_free.refresh(&self.slots, first, page_count);
         self.used += page_count;
         batch.start = BASE + (first * PAGE_SIZE) as u64;
         batch.count = page_count;
@@ -384,8 +388,10 @@ impl Vm {
         self.protections[range.clone()].fill(0);
         self.may_write[range].fill(false);
         for &slot in &batch.slots[..page_count] {
-            self.physical_in_use[usize::from(slot)] = false;
+            let slot = usize::from(slot);
+            self.physical_in_use[slot / SLOT_WORD_BITS] &= !(1 << (slot % SLOT_WORD_BITS));
         }
+        self.virtual_free.refresh(&self.slots, first, page_count);
         self.used -= page_count;
         batch.start = start;
         batch.count = page_count;
@@ -959,7 +965,10 @@ mod tests {
                     seen[usize::from(slot)] = true;
                 }
             }
-            assert_eq!(seen, vm.physical_in_use);
+            for (slot, used) in seen.iter().enumerate() {
+                let mask = 1 << (slot % SLOT_WORD_BITS);
+                assert_eq!(*used, vm.physical_in_use[slot / SLOT_WORD_BITS] & mask != 0);
+            }
             assert_eq!(seen.iter().filter(|used| **used).count(), vm.used());
             for i in 0..PAGE_COUNT {
                 if vm.slots[i] != UNMAPPED {

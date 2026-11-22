@@ -1,8 +1,10 @@
-//! CPU-only AP execution. CPU0 retains every process/service/allocator policy.
+//! AP execution of owned user jobs. CPU0 retains process/service/allocator policy.
 //! Integration must drain the whole user phase before CPU0 accesses user bytes,
 //! destroys a process, changes backing, or publishes another set of mappings.
 use super::runtime;
 use crate::{address_space::ProcessSpace, process_arch};
+#[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_arch_x86_64::{cpu, dispatch::Handoff, space::Error as CpuError};
 use cyxia_posix::Errno;
 
@@ -10,6 +12,8 @@ pub(crate) struct Job {
     pub context: process_arch::Context,
     pub space: ProcessSpace,
     pub deadline_ns: u64,
+    #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+    pub allow_local_clock: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket {
@@ -46,6 +50,7 @@ struct ExitRecord {
     entered: bool,
     entered_ns: u64,
     returned_ns: u64,
+    local_syscalls: u64,
 }
 pub(crate) struct Completion {
     pub ticket: Ticket,
@@ -55,6 +60,7 @@ pub(crate) struct Completion {
     pub entered: bool,
     pub entered_ns: u64,
     pub returned_ns: u64,
+    pub local_syscalls: u64,
 }
 pub(crate) struct Drained {
     /// Index = AP logical CPU slot minus one. Every requested job is returned;
@@ -63,6 +69,8 @@ pub(crate) struct Drained {
     pub completions: [Option<Completion>; 3],
 }
 static SLOTS: [Handoff<Job, ExitRecord>; 3] = [const { Handoff::new() }; 3];
+#[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+static CPU0_SERVICE_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn owner() -> Result<(), Error> {
     if runtime::cpu_slot() != 0 {
@@ -70,6 +78,15 @@ fn owner() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// CPU0 calls this after collecting the previous phase and before publishing
+/// any job in the next one. The hint only limits optional in-worker batching.
+#[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+pub(crate) fn begin_phase() {
+    owner().expect("CPU0 owns parallel user phases");
+    CPU0_SERVICE_PENDING.store(false, Ordering::Release);
+}
+
 fn slot(cpu: usize) -> Result<&'static Handoff<Job, ExitRecord>, Error> {
     if !(1..4).contains(&cpu) || runtime::online_cpus() & (1 << cpu) == 0 {
         return Err(Error::Cpu);
@@ -133,6 +150,7 @@ pub(crate) fn try_collect(ticket: Ticket) -> Result<Option<Completion>, Error> {
         entered: record.entered,
         entered_ns: record.entered_ns,
         returned_ns: record.returned_ns,
+        local_syscalls: record.local_syscalls,
     }))
 }
 
@@ -189,7 +207,7 @@ pub(crate) fn drain(tickets: &[Ticket], deadline_ns: u64) -> Result<Drained, Err
 }
 
 /// Register this callback through runtime::release_aps at integration time.
-/// APs touch only their mailbox, architectural Context/root, and local timers.
+/// APs touch their owned context/root, private syscall output, and local timers.
 pub(crate) extern "C" fn worker(cpu_slot: usize) -> ! {
     assert_eq!(runtime::cpu_slot(), cpu_slot);
     let handoff = slot(cpu_slot).expect("online worker AP");
@@ -201,20 +219,53 @@ pub(crate) extern "C" fn worker(cpu_slot: usize) -> ! {
         let ran = unsafe {
             handoff.run(|job, cancel| {
                 let started = runtime::now_ns();
+                #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+                let mut local_syscalls = 0;
+                #[cfg(not(all(feature = "cosmic-session", not(feature = "abi-trace"))))]
+                let local_syscalls = 0;
                 let exit = if cancel.is_requested() || job.deadline_ns <= started {
                     Err(Errno::Again)
                 } else {
                     match job.space.root() {
-                        Ok(root) => process_arch::enter(&mut job.context, root, job.deadline_ns),
+                        Ok(root) => loop {
+                            let exit = process_arch::enter(&mut job.context, root, job.deadline_ns);
+                            // The original absolute deadline and pending wake
+                            // bound re-entry. Cap local completions so a polling
+                            // job still hands off to CPU0 regularly. Allow the
+                            // first clock read even when a peer has returned.
+                            #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+                            if job.allow_local_clock
+                                && local_syscalls < 8
+                                && matches!(exit, Ok(process_arch::Exit::Syscall))
+                                && !cancel.is_requested()
+                                && (local_syscalls == 0
+                                    || !CPU0_SERVICE_PENDING.load(Ordering::Acquire))
+                                && process_arch::complete_ap_clock(
+                                    &mut job.context, root, job.deadline_ns,
+                                )
+                            {
+                                local_syscalls += 1;
+                                continue;
+                            }
+                            break exit;
+                        },
                         Err(error) => Err(error),
                     }
                 };
+                // Keep the hint set even if CPU0 collects this worker early.
+                // Peers still leave their roots through the ordinary return.
+                #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+                if !matches!(exit, Ok(process_arch::Exit::Preempted) | Err(Errno::Again)) {
+                    CPU0_SERVICE_PENDING.store(true, Ordering::Release);
+                }
                 runtime::cancel_timer();
+                let entered = exit.is_ok() || local_syscalls != 0;
                 ExitRecord {
-                    entered: exit.is_ok(),
-                    entered_ns: if exit.is_ok() { started } else { 0 },
+                    entered,
+                    entered_ns: if entered { started } else { 0 },
                     returned_ns: runtime::now_ns(),
                     exit,
+                    local_syscalls,
                 }
             })
         };

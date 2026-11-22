@@ -2,6 +2,18 @@
 //! Number sources: pinned musl 1.2.6 arch/{aarch64,x86_64}/bits/syscall.h.in.
 //! Unsupported operations return Nosys; an x86 number is never interpreted as Arm.
 use crate::{Errno, FileInfo, ImageAbi};
+
+pub const X86_64_CLOCK_GETTIME: u64 = 228;
+pub const CLOCK_MONOTONIC: u64 = 1;
+
+/// The admitted 64-bit Linux ABIs both use two little-endian 64-bit fields.
+pub fn encode_timespec(ns: u64) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    bytes[8..].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
+    bytes
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Call {
     Readlinkat,
@@ -390,7 +402,7 @@ pub fn decode(abi: ImageAbi, number: u64, mut args: [u64; 6]) -> Result<Invocati
             202 => Call::Futex,
             217 => Call::Getdents64,
             218 => Call::SetTidAddress,
-            228 => Call::ClockGettime,
+            X86_64_CLOCK_GETTIME => Call::ClockGettime,
             229 => Call::ClockGetres,
             230 => Call::ClockNanosleep,
             231 => Call::ExitGroup,

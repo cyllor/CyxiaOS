@@ -744,7 +744,7 @@ impl Runner {
                     3 => (super::super::exec_memory::STACK_PAGES * 4096) as u64,
                     4 => 0,
                     6 => 3,
-                    7 => cyxia_posix::OPEN_MAX as u64,
+                    7 => self.process.fd_limit() as u64,
                     11 => 64,
                     _ => u64::MAX,
                 };
@@ -1346,12 +1346,10 @@ impl Runner {
             Call::ClockGettime => {
                 let ns = match a {
                     0 => super::super::clock::realtime_seconds()? * 1_000_000_000,
-                    1 => super::now_ns(),
+                    cyxia_posix::linux_abi::CLOCK_MONOTONIC => super::now_ns(),
                     _ => return Err(Errno::Inval),
                 };
-                bytes[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
-                bytes[8..16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
-                self.copy_to(b, &bytes[..16])?;
+                self.copy_to(b, &cyxia_posix::linux_abi::encode_timespec(ns))?;
                 Ok(0)
             }
             Call::ClockGetres => {

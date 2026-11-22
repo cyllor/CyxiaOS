@@ -3,21 +3,40 @@
 //! one implementation. This entry has no acceptance timeout or A03 campaign.
 use core::fmt::Write;
 use cyxia_platform_pc::PcBootInfo;
+use cyxia_platform_pc::boot::{BootPoolPlan, PoolSize};
 
 static mut SHELL: cyxia_shell::Shell = cyxia_shell::Shell::new();
 static mut BOOT_MEMORY: Option<PcBootInfo> = None;
 
-/// CPU0 foreground reserves boot-backed physical pools before publishing them.
-/// The recorded exclusions include firmware, loader, kernel and previous pools.
-pub fn reserve_pool(bytes: u64) -> Result<cyxia_contracts::PhysAddr, cyxia_posix::Errno> {
-    use cyxia_posix::Errno;
-    if crate::machine::runtime::cpu_slot() != 0 { return Err(Errno::Perm); }
-    let memory = unsafe { (&mut *core::ptr::addr_of_mut!(BOOT_MEMORY)).as_mut() }
-        .ok_or(Errno::Nodev)?;
-    let range = memory.reserve_pool(bytes, 0x10_0000).map_err(|_| Errno::Nomem)?;
-    let _ = writeln!(Output, "USER_MEMORY_POOL start={:#x} end={:#x} bytes={} backing=BOOTSTRAP",
-        range.start.0, range.start.0 + range.len, range.len);
-    Ok(range.start)
+fn plan_user_memory(info: &PcBootInfo) -> BootPoolPlan<4> {
+    const MIB: u64 = 1024 * 1024;
+    use crate::address_space::{TABLE_BYTES_PER_PROCESS, TABLE_POOL_BYTES};
+    let heap = crate::user_heap::RESERVED_BYTES;
+    #[cfg(feature = "ported")]
+    let exec = crate::exec_memory::RESERVED_BYTES;
+    #[cfg(not(feature = "ported"))]
+    let exec = 0;
+    #[cfg(all(feature = "ported", feature = "large-memory"))]
+    let shared = crate::shared_memory::RESERVED_BYTES;
+    #[cfg(not(all(feature = "ported", feature = "large-memory")))]
+    let shared = 0;
+    let (pools, minimum, keep_free) = if cfg!(feature = "cosmic-session") {
+        // Keep the measured desktop working sets inside the compact envelope.
+        let tables = 24 * TABLE_BYTES_PER_PROCESS;
+        ([
+            PoolSize::bounded(tables, TABLE_POOL_BYTES, TABLE_BYTES_PER_PROCESS),
+            PoolSize::bounded(224 * MIB, heap, MIB),
+            PoolSize::bounded(240 * MIB, exec, MIB),
+            PoolSize::bounded(12 * MIB, shared, MIB),
+        ], tables + (224 + 240 + 12) * MIB, 96 * MIB)
+    } else {
+        ([TABLE_POOL_BYTES, heap, exec, shared].map(PoolSize::fixed),
+            TABLE_POOL_BYTES + heap + exec + shared, 0)
+    };
+    info.plan_pools(pools, keep_free).unwrap_or_else(|error| {
+        panic!("boot memory {error:?}: usable_bytes={} minimum_pool_bytes={minimum} system_reserve_bytes={keep_free}",
+            info.free_ram_bytes());
+    })
 }
 /// Actual discovered RAM, including reserved pools, for the CPU0 system snapshot.
 pub fn memory_bytes() -> u64 {
@@ -45,30 +64,38 @@ impl cyxia_ai_runtime::DeviceIo for SystemIo {
 
 pub fn run(info: &PcBootInfo) -> ! {
     assert_eq!(crate::machine::runtime::cpu_slot(), 0);
-    unsafe { core::ptr::addr_of_mut!(BOOT_MEMORY).write(Some(*info)); }
     crate::log(b"CYXIA_OS_BOOT architecture=x86_64 profile=os-runtime\n");
     let mut out = Output;
-    let objects = cyxia_posix::limits::PROFILE;
+    let plan = plan_user_memory(info);
+    let [tables, anonymous, _exec, _shared] = plan.ranges;
+    unsafe { core::ptr::addr_of_mut!(BOOT_MEMORY).write(Some(plan.memory)); }
+    let objects = crate::user::capacity::configure(plan.percent).expect("boot object limits");
     let _ = writeln!(out, "USER_OBJECT_PROFILE name={} fds={} ofds={} epolls_per_owner={} epolls={} inotify_per_owner={} inotify_instances={}",
         objects.name, objects.fds_per_process, objects.open_descriptions,
         objects.epolls_per_owner, objects.epoll_instances,
         objects.inotify_per_owner, objects.inotify_instances);
     let ram_bytes: u64 = info.ram_regions().iter().map(|r| r.len).sum();
     let _ = writeln!(out, "RAM_DISCOVERED bytes={ram_bytes}");
-    let tables = crate::address_space::init_pc().expect("private user page-table pool");
-    crate::user_heap::init_pc().expect("user heap pool");
+    for range in plan.ranges.into_iter().filter(|r| r.len != 0) {
+        let _ = writeln!(out, "USER_MEMORY_POOL start={:#x} end={:#x} bytes={} backing=BOOTSTRAP",
+            range.start.0, range.start.0 + range.len, range.len);
+    }
+    crate::address_space::init_pc(tables).expect("private user page-table pool");
+    crate::user_heap::init_pc(anonymous).expect("user heap pool");
     let _ = writeln!(out, "PROCESS_MEMORY_READY table_base={:#x} table_bytes={} foreground_cpu=0",
-                     tables.0, crate::address_space::TABLE_POOL_BYTES);
+                     tables.start.0, tables.len);
     #[cfg(feature = "ported")]
     {
-        crate::exec_memory::init_pc().expect("user executable pool");
-        crate::shared_memory::init_pc().expect("user shared memory pool");
+        crate::exec_memory::init_pc(_exec).expect("user executable pool");
+        #[cfg(feature = "large-memory")]
+        crate::shared_memory::init_pc(_shared, crate::user::capacity::scale(cyxia_posix::shared_memory::OBJECTS, 40, plan.percent))
+            .expect("user shared memory pool");
         let profile = crate::exec_memory::PROFILE;
         let layout = profile.layout();
         let _ = writeln!(out, "USER_IMAGE_PROFILE name={} image_base={:#x} image_end={:#x} stack_base={:#x} stack_pages={} exec_pages={} heap_base={:#x} heap_pages={} reserved_exec_bytes={}",
             profile.name(), layout.image_base, layout.image_end, layout.stack_base,
             layout.stack_pages, layout.exec_pool_pages, cyxia_posix::vm::BASE,
-            cyxia_posix::vm::PAGE_COUNT, crate::exec_memory::RESERVED_BYTES);
+            cyxia_posix::vm::PAGE_COUNT, _exec.len);
     }
     let mut devices = unsafe { crate::devices::Devices::discover() }
         .expect("PC PCI discovery");
@@ -90,6 +117,15 @@ pub fn run(info: &PcBootInfo) -> ! {
         crate::storage::poll(shell, &mut out);
         idle();
     }
+    let cpus = crate::machine::runtime::online_cpus().count_ones();
+    #[cfg(feature = "graphics")]
+    let scanout = crate::graphics::scanout_bytes();
+    #[cfg(not(feature = "graphics"))]
+    let scanout = 0;
+    let _ = writeln!(out, "SYSTEM_CAPACITY schema=1 cpus={} dispatch_aps={} ram_bytes={} free_bytes={} budget_percent={} process_slots={} threads={} threads_per_process={} block_sectors={} scanout_bytes={} ip_sockets=0",
+        cpus, cpus - 1, ram_bytes, plan.free_bytes, plan.percent, crate::address_space::process_slots(),
+        crate::user::capacity::thread_limit(), crate::user::capacity::per_process_thread_limit(),
+        crate::storage::capacity_sectors(), scanout);
     #[cfg(feature = "full-os")]
     {
         cyxia_posix::runtime_directory::reset_at_boot(shell.fs_mut())

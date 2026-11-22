@@ -85,6 +85,8 @@ pub struct Backings {
     objects: [Object; OBJECTS],
     used: [bool; PAGES],
     pages: usize,
+    page_limit: usize,
+    object_limit: usize,
 }
 impl Default for Backings {
     fn default() -> Self {
@@ -97,7 +99,26 @@ impl Backings {
             objects: [const { Object::EMPTY }; OBJECTS],
             used: [false; PAGES],
             pages: 0,
+            page_limit: PAGES,
+            object_limit: OBJECTS,
         }
+    }
+    pub fn set_boot_limits(&mut self, pages: usize, objects: usize) -> Result<(), Errno> {
+        if !(1..=PAGES).contains(&pages) || !(1..=OBJECTS).contains(&objects) {
+            return Err(Errno::Inval);
+        }
+        if self.objects.iter().any(|object| object.generation != 0) {
+            return Err(Errno::Busy);
+        }
+        self.page_limit = pages;
+        self.object_limit = objects;
+        Ok(())
+    }
+    pub fn page_capacity(&self) -> usize {
+        self.page_limit
+    }
+    pub fn object_capacity(&self) -> usize {
+        self.object_limit
     }
     fn index(&self, handle: u64) -> Result<usize, Errno> {
         let i = (handle & 255) as usize;
@@ -108,10 +129,10 @@ impl Backings {
             .ok_or(Errno::Badf)
     }
     pub fn free_pages(&self) -> usize {
-        PAGES - self.pages
+        self.page_limit - self.pages
     }
     pub fn free_objects(&self) -> usize {
-        self.objects
+        self.objects[..self.object_limit]
             .iter()
             .filter(|o| !o.live && o.generation < MAX_GENERATION)
             .count()
@@ -130,7 +151,7 @@ impl Backings {
     }
     pub fn create(&mut self, allow_sealing: bool) -> Result<u64, Errno> {
         let i = self
-            .objects
+            .objects[..self.object_limit]
             .iter()
             .position(|o| !o.live && o.generation < MAX_GENERATION)
             .ok_or(Errno::Mfile)?;
@@ -248,7 +269,7 @@ impl Backings {
         let old = self.objects[i].size.div_ceil(PAGE_SIZE);
         let new = size.div_ceil(PAGE_SIZE);
         if new > old {
-            for slot in 0..PAGES {
+            for slot in 0..self.page_limit {
                 if !self.used[slot] {
                     batch.slots[batch.count] = slot as u16;
                     batch.count += 1;

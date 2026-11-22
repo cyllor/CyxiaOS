@@ -121,6 +121,39 @@ fn production_pool_reservations_exclude_firmware_kernel_and_previous_allocations
     assert_eq!(info, before);
 }
 
+#[test]
+fn boot_pool_plan_scales_with_unreserved_ram_and_keeps_the_system_budget() {
+    use cyxia_platform_pc::boot::PoolSize;
+    const MIB: u64 = 1024 * 1024;
+    let info = parse(&pc_map()).unwrap();
+    let plan = info.plan_pools([
+        PoolSize::fixed(4 * MIB),
+        PoolSize::bounded(96 * MIB, 128 * MIB, MIB),
+        PoolSize::bounded(64 * MIB, 96 * MIB, MIB),
+    ], 64 * MIB).unwrap();
+    assert_eq!(plan.percent, 40);
+    assert_eq!(plan.ranges.map(|r| r.len / MIB), [4, 108, 76]);
+    assert_eq!(plan.free_bytes, 66 * MIB - 0x2_0000);
+    assert!(plan.ranges.windows(2).all(|r| !r[0].overlaps(r[1])));
+    assert!(plan.ranges.iter().all(|r| contains(plan.memory.reserved_regions(), r.start.0, r.start.0 + r.len)));
+    assert_eq!(info, parse(&pc_map()).unwrap());
+}
+
+#[test]
+fn boot_pool_plan_checks_contiguous_ranges_and_leaves_input_intact_on_failure() {
+    use cyxia_platform_pc::boot::PoolSize;
+    const MIB: u64 = 1024 * 1024;
+    let mut map = Vec::new();
+    record(&mut map, MIB, 79 * MIB, 1);
+    record(&mut map, 80 * MIB, 32 * MIB, 2);
+    record(&mut map, 112 * MIB, 80 * MIB, 1);
+    let info = parse(&map).unwrap();
+    let plan = info.plan_pools([PoolSize::bounded(64 * MIB, 104 * MIB, MIB)], 32 * MIB).unwrap();
+    assert_eq!((plan.ranges[0].start.0, plan.ranges[0].len), (112 * MIB, 80 * MIB));
+    assert_eq!(info.plan_pools([PoolSize::fixed(81 * MIB)], 32 * MIB).err(), Some(BootError::NoUsableMemory));
+    assert_eq!(info, parse(&map).unwrap());
+}
+
 fn parse(map: &[u8]) -> Result<PcBootInfo, BootError> {
     parse_multiboot(
         MULTIBOOT_BOOT_MAGIC,

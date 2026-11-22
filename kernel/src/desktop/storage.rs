@@ -401,6 +401,16 @@ pub fn recovering() -> bool {
     )
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn capacity_sectors() -> u64 {
+    // CPU0 publishes its boot capacity after device attach and recovery.
+    let service = unsafe { &*core::ptr::addr_of!(SERVICE) };
+    if matches!(service.phase, Phase::Failed) {
+        return 0;
+    }
+    service.block.as_ref().map_or(0, Block::sectors)
+}
+
 #[cfg(feature = "ported")]
 struct Audit;
 #[cfg(feature = "ported")]

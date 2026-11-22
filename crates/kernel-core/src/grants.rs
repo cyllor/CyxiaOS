@@ -124,6 +124,17 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
             next_redemption: 1,
         }
     }
+    /// Restrict a fresh ledger to the frames actually reserved at boot.
+    pub fn limit_boot_capacity(&mut self, capacity: PageCount) -> Result<(), GrantError> {
+        if self.next_grant != 1 || self.next_redemption != 1 {
+            return Err(GrantError::NotReady);
+        }
+        if capacity.0 == 0 || capacity.0 > self.capacity {
+            return Err(GrantError::Capacity);
+        }
+        self.capacity = capacity.0;
+        Ok(())
+    }
     pub fn snapshot(&self) -> LedgerSnapshot {
         LedgerSnapshot {
             capacity: self.capacity,

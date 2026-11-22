@@ -1,6 +1,7 @@
 //! Parallel CPU mechanism for the existing process/thread policy. CPU0 prepares
 //! each root, transfers owned contexts, drains the complete phase, and only then
-//! runs shared syscall/fault/service code. Stopped roots retain stable mappings;
+//! runs shared syscall/fault/service code. A worker can finish private clock
+//! reads within its own grant. Stopped roots retain stable mappings;
 //! mapping owners revoke affected PTEs before clearing or releasing backing.
 use super::*;
 use crate::machine::{dispatch, runtime};
@@ -12,6 +13,7 @@ struct CpuReceipt {
     cancelled: u64,
     preemptions: u64,
     syscalls: u64,
+    local_syscalls: u64,
     faults: u64,
     pid: u32,
     tid: u32,
@@ -23,6 +25,7 @@ const EMPTY_RECEIPT: CpuReceipt = CpuReceipt {
     cancelled: 0,
     preemptions: 0,
     syscalls: 0,
+    local_syscalls: 0,
     faults: 0,
     pid: 0,
     tid: 0,
@@ -34,10 +37,10 @@ static mut RECEIPTS: [CpuReceipt; 3] = [EMPTY_RECEIPT; 3];
 pub(super) fn status(out: &mut impl Write) {
     let receipts = unsafe { *core::ptr::addr_of!(RECEIPTS) };
     for (index, receipt) in receipts.into_iter().enumerate() {
-        writeln!(out, "USER_AP cpu={} enters={} cancelled={} preemptions={} syscalls={} faults={} last_pid={} last_tid={} entered_ns={} returned_ns={} source=HPET_WALL cpu_billing=false\r",
+        writeln!(out, "USER_AP cpu={} enters={} cancelled={} preemptions={} syscalls={} faults={} last_pid={} last_tid={} entered_ns={} returned_ns={} local_syscalls={} source=HPET_WALL cpu_billing=false\r",
             index + 1, receipt.entries, receipt.cancelled, receipt.preemptions,
             receipt.syscalls, receipt.faults, receipt.pid, receipt.tid,
-            receipt.entered_ns, receipt.returned_ns).unwrap();
+            receipt.entered_ns, receipt.returned_ns, receipt.local_syscalls).unwrap();
     }
 }
 fn receipt(index: usize, pid: u32, tid: u32, done: &dispatch::Completion) {
@@ -47,6 +50,7 @@ fn receipt(index: usize, pid: u32, tid: u32, done: &dispatch::Completion) {
         return;
     }
     record.entries = record.entries.saturating_add(1);
+    record.local_syscalls = record.local_syscalls.saturating_add(done.local_syscalls);
     record.pid = pid;
     record.tid = tid;
     record.entered_ns = done.entered_ns;
@@ -117,6 +121,10 @@ impl Runner {
                 ),
                 // Set only after all roots have been prepared, before publication.
                 deadline_ns: 0,
+                #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+                allow_local_clock: self.linux
+                    && !self.thread.retry_syscall
+                    && self.thread.retry_descriptor.is_none(),
             },
             Slice {
                 budget_ms,
@@ -233,6 +241,10 @@ impl Supervisor {
                 let entered =
                     runner.tick(shell.fs_mut(), &mut self.ledger, &mut self.ipc, competing);
                 runner.record_selection(choice, entered);
+                // Age must restart after a granted slice, exactly as the AP and
+                // aarch64 paths do. Otherwise the starvation guard freezes on the
+                // permanently oldest candidate and CPU0 never rotates.
+                runner.thread.ready_since = now();
                 self.report_dispatch(choice.index, out);
             }
             return;
@@ -265,6 +277,10 @@ impl Supervisor {
         }
         // Publication starts only after every root and signal frame is complete.
         // From here to full retirement CPU0 accesses NO user bytes or services.
+        #[cfg(all(feature = "cosmic-session", not(feature = "abi-trace")))]
+        if ready != 0 {
+            dispatch::begin_phase();
+        }
         let mut tickets = [None; 3];
         let mut completions: [Option<dispatch::Completion>; 3] = core::array::from_fn(|_| None);
         let started = now_ns();
@@ -354,12 +370,9 @@ impl Supervisor {
                 continue;
             };
             let (job, exit, entered, elapsed) = if let Some(done) = completions[index].take() {
-                receipt(
-                    index,
-                    self.runners[choice.index].status.pid,
-                    self.runners[choice.index].thread.tid,
-                    &done,
-                );
+                let runner = &mut self.runners[choice.index];
+                receipt(index, runner.status.pid, runner.thread.tid, &done);
+                runner.status.syscalls = runner.status.syscalls.saturating_add(done.local_syscalls);
                 (
                     done.job,
                     done.exit,

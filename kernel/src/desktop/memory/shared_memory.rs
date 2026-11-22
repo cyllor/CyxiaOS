@@ -10,7 +10,7 @@ use cyxia_kernel_core::grants::{
 };
 use cyxia_posix::{
     Errno,
-    shared_memory::{self as metadata, Backings, Batch, Info, OBJECTS, PAGE_SIZE, PAGES},
+    shared_memory::{Backings, Batch, Info, OBJECTS, PAGE_SIZE, PAGES},
 };
 
 #[cfg(feature = "large-memory")]
@@ -35,7 +35,7 @@ impl Store {
         }
     }
     fn pointer(&self, slot: usize, offset: usize) -> *mut u8 {
-        assert!(self.base != 0 && slot < PAGES && offset < PAGE_SIZE);
+        assert!(self.base != 0 && slot < self.backing.page_capacity() && offset < PAGE_SIZE);
         (crate::HIGH + self.base + (slot * PAGE_SIZE + offset) as u64) as *mut u8
     }
     fn release_batch(&mut self) -> Result<(), Errno> {
@@ -352,28 +352,26 @@ pub fn status(out: &mut impl core::fmt::Write) {
     let _ = with(|s| {
         let ledger = s.ledger.snapshot();
         writeln!(out,"SHARED_OBJECTS available={} objects={} pages={} mappings={} description_refs={} mapping_refs={} free_pages={} grant_reserved={} grant_used={} metadata_capacity={} page_capacity={} MECHANISM\r",
-            s.base!=0,s.backing.live_objects(),PAGES-s.backing.free_pages(),s.backing.mapping_count(),
+            s.base!=0,s.backing.live_objects(),s.backing.page_capacity()-s.backing.free_pages(),s.backing.mapping_count(),
             s.backing.description_count(),s.backing.mapping_count(),
-            ledger.free,ledger.reserved_unredeemed,ledger.in_use,metadata::OBJECTS,metadata::PAGES).unwrap();
+            ledger.free,ledger.reserved_unredeemed,ledger.in_use,s.backing.object_capacity(),s.backing.page_capacity()).unwrap();
         Ok(())
     });
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn init_pc() -> Result<(), Errno> {
-    #[cfg(feature = "large-memory")]
-    {
-        let base = crate::os::reserve_pool(RESERVED_BYTES)?;
-        with(|store| {
-            if store.base != 0 {
-                return Err(Errno::Busy);
-            }
-            store.base = base.0;
-            Ok(())
-        })
+#[cfg(all(target_arch = "x86_64", feature = "large-memory"))]
+pub fn init_pc(range: cyxia_contracts::MemoryRegion, objects: usize) -> Result<(), Errno> {
+    if range.len > RESERVED_BYTES || range.len % PAGE_SIZE as u64 != 0 {
+        return Err(Errno::Inval);
     }
-    #[cfg(not(feature = "large-memory"))]
-    {
-        Err(Errno::Nodev)
-    }
+    let pages = (range.len / PAGE_SIZE as u64) as usize;
+    with(|store| {
+        if store.base != 0 {
+            return Err(Errno::Busy);
+        }
+        store.backing.set_boot_limits(pages, objects)?;
+        store.ledger.limit_boot_capacity(PageCount(pages as u32)).map_err(|_| Errno::Inval)?;
+        store.base = range.start.0;
+        Ok(())
+    })
 }

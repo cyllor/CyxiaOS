@@ -55,7 +55,7 @@ pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
     #[cfg(feature = "full-os")]
-    pool::init(range.start.0)?;
+    pool::init(range.start.0, range.len)?;
     POOL_BASE.store(range.start.0, Ordering::Relaxed);
     Ok(())
 }
@@ -432,14 +432,17 @@ impl Heap {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn init_pc() -> Result<(), Errno> {
+pub fn init_pc(range: cyxia_contracts::MemoryRegion) -> Result<(), Errno> {
     if POOL_BASE.load(Ordering::Acquire) != 0 {
         return Err(Errno::Busy);
     }
-    let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    #[cfg(not(feature = "full-os"))]
+    if range.len != RESERVED_BYTES {
+        return Err(Errno::Inval);
+    }
     #[cfg(feature = "full-os")]
-    pool::init(base.0)?;
-    POOL_BASE.store(base.0, Ordering::Release);
+    pool::init(range.start.0, range.len)?;
+    POOL_BASE.store(range.start.0, Ordering::Release);
     Ok(())
 }
 #[cfg(target_arch = "x86_64")]

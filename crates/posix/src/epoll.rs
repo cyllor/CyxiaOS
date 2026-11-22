@@ -240,6 +240,7 @@ impl Process<'_> {
         }
         let fd = self.free_fd()?;
         let description = self.objects.free_slots::<1>()?[0];
+        let limits = self.objects.limits();
         let index = {
             let table = self.objects.inner.borrow();
             if table
@@ -247,13 +248,14 @@ impl Process<'_> {
                 .iter()
                 .filter(|e| e.used && e.owner == self.owner)
                 .count()
-                >= INSTANCES
+                >= limits.epolls_per_owner
             {
                 return Err(Errno::Mfile);
             }
             table
                 .epolls
                 .iter()
+                .take(limits.epoll_instances)
                 .position(|e| !e.used)
                 .ok_or(Errno::Mfile)?
         };
@@ -591,6 +593,31 @@ mod tests {
         assert_eq!(ready(&mut p, outer, 1)[0].data, 55);
         p.close_all(&mut fs).unwrap();
         assert_eq!(objects.snapshot().live, 0);
+    }
+
+    #[test]
+    fn deleted_nested_watch_stops_sampling_the_detached_child() {
+        let objects = crate::OpenDescriptions::new();
+        let mut p = Process::new(&objects, 1).unwrap();
+        let outer = p.epoll_create(0).unwrap();
+        let inner = p.epoll_create(0).unwrap();
+        let fd = p.eventfd(1, 0).unwrap();
+        p.epoll_ctl(inner, 1, fd, Event { events: IN, data: 11 }).unwrap();
+        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 22 }).unwrap();
+        let sampled = core::cell::Cell::new(0usize);
+        p.epoll_sample(outer, |_| {
+            sampled.set(sampled.get() + 1);
+            Ok(IN)
+        })
+        .unwrap();
+        assert_eq!(sampled.get(), 1, "attached child backend was not sampled");
+        p.epoll_ctl(outer, 2, inner, Event::default()).unwrap();
+        // DEL drops the graph edge, so the detached child must leave the
+        // reachable set instead of being sampled through the outer descriptor.
+        p.epoll_sample(outer, |_| panic!("sampled a detached epoll descendant")).unwrap();
+        assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
+        // The child stays independently usable through its own descriptor.
+        assert_eq!(ready(&mut p, inner, 1)[0].data, 11);
     }
 
     #[test]

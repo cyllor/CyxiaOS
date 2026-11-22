@@ -5,6 +5,11 @@ use cyxia_posix::{
     unix::{Handle, Ready, UnixSockets},
 };
 static mut SOCKETS: UnixSockets = UnixSockets::new();
+#[cfg(target_arch = "x86_64")]
+pub(super) fn set_boot_limits(endpoints: usize, connections: usize) -> Result<(), Errno> {
+    // Initialization runs on CPU0 before any process can acquire an endpoint.
+    unsafe { (&mut *core::ptr::addr_of_mut!(SOCKETS)).set_boot_limits(endpoints, connections) }
+}
 #[cfg(feature = "cosmic-workspace-applets-v1")]
 const ADMISSION_MODEL: u64 = cyxia_ai_runtime::COSMIC_UNIX_MODEL_ID;
 #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
@@ -16,8 +21,8 @@ pub(super) fn status(out: &mut impl core::fmt::Write) {
     // CPU0 snapshot only: reading counters must not sample epoll or clear wakes.
     let capacity = unsafe { (&*core::ptr::addr_of!(SOCKETS)).capacity() };
     writeln!(out, "UNIX_POOL endpoints={} free_endpoints={} connections={} free_connections={} free_bindings={} backing=BOOTSTRAP\r",
-        cyxia_posix::unix::ENDPOINTS, capacity.free_endpoints,
-        cyxia_posix::unix::CONNECTIONS, capacity.free_connections, capacity.free_bindings).unwrap();
+        capacity.endpoints, capacity.free_endpoints,
+        capacity.connections, capacity.free_connections, capacity.free_bindings).unwrap();
 }
 
 pub(super) fn with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> Result<T, Errno> {

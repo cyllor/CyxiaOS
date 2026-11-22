@@ -312,6 +312,13 @@ mod linux_threads {
             self.validate(stack, stack_bytes, true)?;
             self.validate(parent_tid, 4, true)?;
             self.validate(child_tid, 4, true)?;
+            #[cfg(target_arch = "x86_64")]
+            if !super::super::capacity::thread_available()
+                || self.live_threads() >= super::super::capacity::per_process_thread_limit()
+            {
+                self.status.thread_denials = self.status.thread_denials.saturating_add(1);
+                return Err(Errno::Again);
+            }
             // TLS is an opaque user value. The CPU backend validates its range;
             // later user accesses are checked by the private address space.
             let Some(slot) = self.threads.parked.iter().position(|thread| !thread.active) else {
@@ -346,6 +353,8 @@ mod linux_threads {
             // execute either context midway through these two writes.
             self.copy_to(parent_tid, &tid.to_le_bytes())?;
             self.threads.parked[slot] = child;
+            #[cfg(target_arch = "x86_64")]
+            super::super::capacity::thread_started();
             ai::record(Domain::Thread, |c| c.grant(1));
             self.status.thread_admissions = self.status.thread_admissions.saturating_add(1);
             self.status.thread_count = self.live_threads() as u32;
@@ -366,6 +375,10 @@ mod linux_threads {
             }
             if self.thread.active && self.thread.tid >= 0x1000_0000 {
                 ai::record(Domain::Thread, |c| c.release(1));
+            }
+            #[cfg(target_arch = "x86_64")]
+            if self.thread.active {
+                super::super::capacity::threads_released(1);
             }
             self.thread.active = false;
             self.thread.waiting = None;

@@ -50,6 +50,28 @@ pub struct PcBootInfo {
     pub resources: BoardResources,
 }
 
+#[derive(Clone, Copy)]
+pub struct PoolSize {
+    minimum: u64,
+    maximum: u64,
+    unit: u64,
+}
+impl PoolSize {
+    pub const fn fixed(bytes: u64) -> Self {
+        Self::bounded(bytes, bytes, PAGE_SIZE)
+    }
+    pub const fn bounded(minimum: u64, maximum: u64, unit: u64) -> Self {
+        Self { minimum, maximum, unit }
+    }
+}
+
+pub struct BootPoolPlan<const N: usize> {
+    pub memory: PcBootInfo,
+    pub ranges: [MemoryRegion; N],
+    pub percent: u64,
+    pub free_bytes: u64,
+}
+
 impl PcBootInfo {
     pub fn ram_regions(&self) -> &[MemoryRegion] {
         &self.ram[..self.ram_count]
@@ -57,6 +79,58 @@ impl PcBootInfo {
 
     pub fn reserved_regions(&self) -> &[MemoryRegion] {
         &self.reserved[..self.reserved_count]
+    }
+
+    pub fn free_ram_bytes(&self) -> u64 {
+        self.ram_regions().iter().map(|ram| {
+            let end = ram.start.0 + ram.len;
+            let reserved: u64 = self.reserved_regions().iter().map(|r| {
+                end.min(r.start.0 + r.len).saturating_sub(ram.start.0.max(r.start.0))
+            }).sum();
+            ram.len - reserved
+        }).sum()
+    }
+
+    /// Prefer the full envelope, then try smaller envelopes in bounded steps.
+    /// A failed trial leaves the input map untouched. Each nonempty pool must
+    /// fit an actual contiguous firmware-backed range.
+    pub fn plan_pools<const N: usize>(
+        &self,
+        sizes: [PoolSize; N],
+        keep_free: u64,
+    ) -> Result<BootPoolPlan<N>, BootError> {
+        if sizes.iter().any(|s| {
+            s.unit == 0 || !s.unit.is_multiple_of(PAGE_SIZE)
+                || !s.minimum.is_multiple_of(s.unit) || !s.maximum.is_multiple_of(s.unit)
+                || s.minimum > s.maximum || s.maximum > MAX_RUNTIME_PHYSICAL_MEMORY
+        }) {
+            return Err(BootError::AddressRange);
+        }
+        let available = self.free_ram_bytes();
+        'candidate: for percent in (0..=100).rev().step_by(10) {
+            let mut memory = *self;
+            let mut ranges = [MemoryRegion::EMPTY; N];
+            let mut free_bytes = available;
+            for (range, size) in ranges.iter_mut().zip(sizes) {
+                let steps = (size.maximum - size.minimum) / size.unit;
+                let bytes = size.minimum + (steps * percent / 100) * size.unit;
+                if bytes == 0 {
+                    continue;
+                }
+                let Some(left) = free_bytes.checked_sub(bytes).filter(|n| *n >= keep_free) else {
+                    continue 'candidate;
+                };
+                let Ok(pool) = memory.reserve_pool(bytes, LOW_MEMORY_END) else {
+                    continue 'candidate;
+                };
+                *range = pool;
+                free_bytes = left;
+            }
+            if free_bytes >= keep_free {
+                return Ok(BootPoolPlan { memory, ranges, percent, free_bytes });
+            }
+        }
+        Err(BootError::NoUsableMemory)
     }
 
     /// Reserve an actual contiguous RAM pool after all loader/firmware ranges.

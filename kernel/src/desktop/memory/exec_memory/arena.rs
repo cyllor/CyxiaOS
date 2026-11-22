@@ -31,14 +31,17 @@ fn with<T>(
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
     f(pool.as_mut().ok_or(Errno::Nodev)?)
 }
-pub fn init(base: u64) -> Result<(), Errno> {
+pub fn init(base: u64, bytes: u64) -> Result<(), Errno> {
+    if bytes > BYTES || bytes % 4096 != 0 {
+        return Err(Errno::Inval);
+    }
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
     if pool.is_some() {
         return Err(Errno::Busy);
     }
     // The caller exclusively reserved this exact range through firmware-aware
     // reserve_pool. Never describe the rest of RAM as allocatable here.
-    *pool = Some(ContigFramePool::new(base, PAGES).map_err(error)?);
+    *pool = Some(ContigFramePool::new(base, (bytes / 4096) as usize).map_err(error)?);
     Ok(())
 }
 pub fn allocate(pages: usize, owner: Owner) -> Result<u64, Errno> {

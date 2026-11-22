@@ -49,7 +49,7 @@ pub fn init(info: &mut BootInfo) -> Result<(), Errno> {
     let range =
         cyxia_platform_virt::reserve_user_pool(info, RESERVED_BYTES).map_err(|_| Errno::Nomem)?;
     #[cfg(feature = "cosmic-session")]
-    arena::init(range.start.0)?;
+    arena::init(range.start.0, range.len)?;
     POOL.store(range.start.0, Ordering::Relaxed);
     Ok(())
 }
@@ -392,14 +392,17 @@ impl ExecMemory {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn init_pc() -> Result<(), Errno> {
+pub fn init_pc(range: cyxia_contracts::MemoryRegion) -> Result<(), Errno> {
     if POOL.load(Ordering::Acquire) != 0 {
         return Err(Errno::Busy);
     }
-    let base = crate::os::reserve_pool(RESERVED_BYTES)?;
+    #[cfg(not(feature = "cosmic-session"))]
+    if range.len != RESERVED_BYTES {
+        return Err(Errno::Inval);
+    }
     #[cfg(feature = "cosmic-session")]
-    arena::init(base.0)?;
-    POOL.store(base.0, Ordering::Release);
+    arena::init(range.start.0, range.len)?;
+    POOL.store(range.start.0, Ordering::Release);
     Ok(())
 }
 #[cfg(target_arch = "x86_64")]

@@ -148,13 +148,20 @@ pub fn run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
         + "\nimpl ProcessSpace { pub fn test_owner(current: Option<crate::space::AddressSpace<'static>>) -> Self {"
         + "let mut owner = Self::new(); owner.current = current; owner.slot = 0; owner.pid = 1; owner } }\n"
         + '#[cfg(test)]\n#[path = "staging-cases.rs"]\nmod staging_tests;\n')
-    files["staging-cases.rs"] = (HERE / "page_map_staging_cases.rs").read_text()
+    staging_cases = (HERE / "page_map_staging_cases.rs").read_text()
+    selector = "all()" if "static TABLE_SLOTS:" in address else "any()"
+    files["staging-cases.rs"] = staging_cases.replace("cfg(boot_pool_plan)", f"cfg({selector})")
+    resource = (selected_root / "crates/contracts/src/resource.rs").read_text()
+    memory_region = resource[resource.rindex("#[derive", 0, resource.index("pub enum RegionKind")):
+                             resource.index("impl MemoryRegion")]
     helper = selected_root / "crates/arch-x86_64/src/code_permissions.rs"
     if not helper.is_file():
         helper = ROOT / "crates/arch-x86_64/src/code_permissions.rs"
     files['code-permissions.rs'] = helper.read_text()
     files['user-layout.rs'] = (ROOT / 'crates/contracts/src/user_layout.rs').read_text()
     files['vm.rs'] = (ROOT / 'crates/posix/src/vm.rs').read_text()
+    # The fixture loads vm.rs through #[path], which resolves its child here.
+    files['free_ranges.rs'] = (ROOT / 'crates/posix/src/vm/free_ranges.rs').read_text()
     files['shared-metadata.rs'] = (ROOT / 'crates/posix/src/shared_memory.rs').read_text()
     heap = (ROOT / 'kernel/src/desktop/memory/user_heap.rs').read_text()
     shared = (ROOT / 'kernel/src/desktop/user/shared_memory.rs').read_text()
@@ -172,7 +179,9 @@ extern crate self as cyxia_posix;
 extern crate self as cyxia_contracts;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Errno { Inval, Nodev, Io, Fault, Busy, Nomem, Access, Badf, Mfile, Overflow, Perm }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);
+''' + memory_region + '''
 #[path = "process-limits.rs"]
 pub mod usermem;
 #[path = "user-layout.rs"]
