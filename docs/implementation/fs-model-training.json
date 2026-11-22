@@ -28,5 +28,8 @@
     -21
   ],
   "heldout_correct": 5660,
+  "canary_distinct": 16,
+  "canary_positive": 4,
+  "canary_correct": 10,
   "limitation": "Synthetic workload only; no production performance claim."
 }
