@@ -88,6 +88,39 @@ fn private_roots_map_disjoint_frames_and_enforce_permissions() {
     assert_eq!(b.translate(0x1000000).unwrap().physical, 0x500000);
 }
 
+/// Revocation walks the table once. An absent page must stay a no-op exactly as
+/// the translate-then-unmap pair behaved, and a present page must retire while
+/// leaving neighbouring translations intact.
+#[test]
+fn unmap_present_matches_translate_then_unmap() {
+    let mut tables = Box::new(Tables([0; 8 * 4096]));
+    let kernel = KernelMappings::new([0; 256], 0x40000000).unwrap();
+    let mut space = unsafe {
+        AddressSpace::new(
+            TableArena::from_raw(tables.0.as_mut_ptr(), 0x200000, 8).unwrap(),
+            &kernel,
+            SpaceId {
+                id: 1,
+                generation: 1,
+            },
+        )
+    }
+    .unwrap();
+    assert!(!space.unmap_present(0x1000000).unwrap());
+    assert!(space.translate(0x1000000).is_none());
+    // translate() reports None above the user half, so revocation skips it.
+    assert!(!space.unmap_present(0xffff800000000000).unwrap());
+    space.map(0x1000000, 0x400000, UserPermissions::RX).unwrap();
+    space.map(0x1001000, 0x401000, UserPermissions::RW).unwrap();
+    assert!(space.unmap_present(0x1000000).unwrap());
+    assert!(space.translate(0x1000000).is_none());
+    assert_eq!(space.translate(0x1001000).unwrap().physical, 0x401000);
+    // Revoking twice is a no-op the second time, not an error.
+    assert!(!space.unmap_present(0x1000000).unwrap());
+    assert!(space.unmap_present(0x1001000).unwrap());
+    assert!(space.translate(0x1001000).is_none());
+}
+
 #[test]
 fn full_os_v3_complete_windows_fit_private_tables_and_preserve_stack_guard() {
     full_os_windows_fit_private_tables(

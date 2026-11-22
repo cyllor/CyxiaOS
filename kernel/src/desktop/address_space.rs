@@ -429,9 +429,7 @@ impl ProcessSpace {
     // revocation in both wall-time buckets.
     fn revoke_page(&mut self, address: u64) -> Result<(), Errno> {
         let space = self.current.as_mut().ok_or(Errno::Nodev)?;
-        if space.translate(address).is_some() {
-            space.unmap(address).map_err(|_| Errno::Io)?;
-        }
+        space.unmap_present(address).map_err(|_| Errno::Io)?;
         Ok(())
     }
     pub fn revoked_ns(&self) -> u64 {

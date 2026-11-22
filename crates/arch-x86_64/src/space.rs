@@ -420,6 +420,40 @@ impl<'a> AddressSpace<'a> {
             virtual_address: address,
         })
     }
+    /// Unmap one page only if it is mapped, walking the table once. Revocation
+    /// used translate() followed by unmap(), paying two full walks per page.
+    /// Presence is decided before any validation so an absent page stays a
+    /// no-op exactly as the translate-then-unmap pair behaved.
+    pub fn unmap_present(&mut self, address: u64) -> Result<bool, Error> {
+        if address >= 0x0000_8000_0000_0000 {
+            return Ok(false);
+        }
+        let Some(leaf) = self.leaf(address) else {
+            return Ok(false);
+        };
+        let old = unsafe { leaf.read_volatile() };
+        if old & P == 0 {
+            return Ok(false);
+        }
+        Self::address(address)?;
+        if self.resident_cpus() != 0 {
+            return Err(Error::Active);
+        }
+        mapping_change(
+            old & MASK,
+            Some(UserPermissions {
+                writable: old & W != 0,
+                executable: old & NX == 0,
+            }),
+            None,
+        )?;
+        unsafe {
+            leaf.write_volatile(0);
+        }
+        self.epoch
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Ok(true)
+    }
     pub fn protect(&mut self, address: u64, permissions: UserPermissions) -> Result<(), Error> {
         Self::address(address)?;
         if self.resident_cpus() != 0 {
