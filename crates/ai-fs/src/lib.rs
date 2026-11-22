@@ -609,6 +609,7 @@ impl FileSystem {
         }
         (x, valid)
     }
+    #[cfg(test)]
     fn proposal(&mut self) -> CacheDecision {
         let (x, valid) = self.features();
         self.proposal_from(x, valid)

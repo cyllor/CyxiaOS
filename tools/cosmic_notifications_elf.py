@@ -38,6 +38,13 @@ U64_MAX = (1 << 64) - 1
 # publication method and its retirement comment; layout, parsing, page counts,
 # allocation grants and W^X admission are unchanged. Native mapping/protection
 # evidence is recorded in v17-cosmic-audit-hotpaths-20261121.md.
+# 2026-11-22 reviewed e5d8306: init_pc takes the firmware-reserved MemoryRegion
+# selected by BootPoolPlan, and both init paths pass its actual length to the
+# session arena. Non-session backing still requires RESERVED_BYTES; the session
+# arena checks page alignment and its existing maximum. Only physical pool
+# initialization changed since e43b8e3: load_accounted, virtual bounds, stack
+# budget, page counting and W^X admission are byte-identical. The other three
+# pinned sources remain unchanged; this does not establish runtime readiness.
 _REVIEWED_LOADER_CONTRACT = (
     ('crates/contracts/src/user_layout.rs',
      '10edd3b77ee0896563fef4f19662d2b366b729198f35adb2982eb8fb812365f3'),
@@ -46,7 +53,7 @@ _REVIEWED_LOADER_CONTRACT = (
     ('crates/posix/src/executable.rs',
      '0a2310be332d66a2c1e06ededc28c06fe41c4949db686b35f53e7ccd53e2b5e7'),
     ('kernel/src/desktop/memory/exec_memory.rs',
-     '01fb28784f093149d1d4e851bf200f7b0617b2282b595f7be0614b9b8088fc70'),
+     '824b5132ea3f215e8ace9aacf848ca74e0d9603cb71569a0afcb4dde6fab91bc'),
 )
 
 

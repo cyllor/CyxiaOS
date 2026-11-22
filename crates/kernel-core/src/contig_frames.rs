@@ -82,14 +82,13 @@ impl<const N: usize> ContigFramePool<N> {
     /// without freeing anything; an unknown identity is stale.
     pub fn release(&mut self, base: u64, pages: usize, owner: TaskId) -> Result<(), FrameError> {
         for run in self.runs.iter_mut() {
-            if let Some(r) = run {
-                if r.base == base && r.pages == pages {
-                    if r.owner != owner {
-                        return Err(FrameError::Owner);
-                    }
-                    *run = None;
-                    return Ok(());
+            if let Some(r) = run
+                && r.base == base && r.pages == pages {
+                if r.owner != owner {
+                    return Err(FrameError::Owner);
                 }
+                *run = None;
+                return Ok(());
             }
         }
         Err(FrameError::Stale)
