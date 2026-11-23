@@ -114,7 +114,7 @@ fn read_op(tag:u64)->syscall::ReadOperation {
 }
 #[test] fn j12_failed_boot_epoch_does_not_grant_new_publish_right() {
     let ordinary=file::FileCapability::from_registry(7,0,1,file::READ);
-    assert_eq!(ordinary.protected_store(7),Err(Error::Unauthorized));
+    assert_eq!(ordinary.protected_store(7,0,1),Err(Error::Unauthorized));
     let ai=syscall::ProtectedRole::from_kernel(1,1);
     let publisher=syscall::ProtectedRole::from_kernel(2,1);
     assert_eq!(syscall::can_publish(ai,publisher),Err(Error::Unauthorized));

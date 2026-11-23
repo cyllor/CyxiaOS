@@ -40,7 +40,8 @@ pub fn authorize_mapping(
     rights: Permissions,
     shared: Option<SharedGrant>,
 ) -> Result<(), Error> {
-    if caller == 0 || frame.generation == 0 || frame.kind != FrameKind::User {
+    if caller == 0 || frame.owner == 0
+        || frame.generation == 0 || frame.kind != FrameKind::User {
         return Err(Error::Unauthorized);
     }
     if frame.owner != caller && !shared.is_some_and(|g| {
@@ -207,6 +208,11 @@ mod tests {
         assert_eq!(authorize_data_frame_slot(15, 16, 256), Err(Error::Unauthorized));
         assert_eq!(authorize_data_frame_slot(256, 16, 256), Err(Error::Unauthorized));
         assert_eq!(authorize_data_frame_slot(17, 256, 256), Err(Error::Invalid));
+    }
+    #[test] fn v019_sec_m01_zero_owner_cannot_be_shared_into_el0() {
+        let frame=Frame { owner:0, ..user() };
+        let forged=SharedGrant::from_registry(0,7,frame.generation);
+        assert_eq!(authorize_mapping(frame,7,data(),Some(forged)),Err(Error::Unauthorized));
     }
     #[test] fn sec_m08_stale_tlb_generation_not_an_ack() {
         let mut s = Shootdown::begin(1, 2, 1, 0, 0, 0).unwrap();

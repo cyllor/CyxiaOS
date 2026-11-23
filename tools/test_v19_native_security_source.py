@@ -137,6 +137,20 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("static NEXT_SESSION: AtomicU64", tls)
         self.assertIn("pub fn local_echo_proof(&self)", tls)
 
+    def test_v019_other_five_tracks_fail_closed_with_fixed_control_roles(self):
+        process = source(CORE / "process.rs")
+        file = source(CORE / "file.rs")
+        memory = source(CORE / "memory.rs")
+        device = source(CORE / "device.rs")
+        syscall = source(CORE / "syscall.rs")
+        manager = source(ROOT / "crates/kernel-core/src/control_plane/manager.rs")
+        self.assertIn("if cpu < 2 { return Err(Error::Unauthorized); }", process)
+        self.assertIn("protected_inode: u16, protected_generation: u64", file)
+        self.assertIn("frame.owner == 0", memory)
+        self.assertIn("total.checked_add(usize::from(lease.descriptors))", device)
+        self.assertIn("pub fn can_publish_fixed(", syscall)
+        self.assertIn("security::syscall::can_publish_fixed(", manager)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

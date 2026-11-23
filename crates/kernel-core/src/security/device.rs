@@ -76,6 +76,18 @@ impl<const N: usize> Queue<N> {
                 Err(Error::Conflict)
             };
         }
+        // Count all reserved/published/UNKNOWN chains, not only occupied
+        // request slots. A queue of eight descriptors cannot admit eight
+        // eight-descriptor chains. UNKNOWN still consumes real DMA credit.
+        let allocated = self.slots.iter().flatten()
+            .try_fold(0usize, |total, lease| {
+                total.checked_add(usize::from(lease.descriptors))
+            }).ok_or(Error::Capacity)?;
+        if allocated.checked_add(usize::from(descriptors))
+            .is_none_or(|total|total > MAX_CHAINS)
+        {
+            return Err(Error::Capacity);
+        }
         let at = self.slots.iter().position(Option::is_none).ok_or(Error::Capacity)?;
         let next = self.generations[at].checked_add(1).ok_or(Error::Exhausted)?;
         let token = Token {
@@ -167,6 +179,16 @@ mod tests {
         assert_eq!(q.prepare(1,9,1,true),Err(Error::Invalid));
         assert!(q.prepare(1,1,1,true).is_ok());
         assert_eq!(q.prepare(2,1,1,true),Err(Error::Capacity));
+    }
+    #[test] fn v019_sec_d02_aggregate_descriptors_stay_reserved_while_unknown() {
+        let mut q=Queue::<2>::new(1,1);
+        let t=q.prepare(1,5,1,true).unwrap();
+        assert_eq!(q.prepare(2,4,1,true),Err(Error::Capacity));
+        q.publish(t).unwrap();
+        q.timeout(t).unwrap();
+        assert_eq!(q.prepare(2,4,1,true),Err(Error::Capacity));
+        q.complete(t,CompletionProof::from_driver(t)).unwrap();
+        assert!(q.prepare(2,4,1,true).is_ok());
     }
     #[test] fn sec_d03_duplicate_submit_is_not_a_second_lease() {
         let mut q=Queue::<2>::new(1,1);

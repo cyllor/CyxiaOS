@@ -57,6 +57,10 @@ pub fn authorize_business_core(
     draining_mask: u64,
     quarantined_mask: u64,
 ) -> Result<(), Error> {
+    // V0.19 native four-core layout: CPU0 is the EL1 mechanism broker,
+    // CPU1 is the only advisory-control CPU; neither can run business tasks,
+    // even when an incorrect mask claims the CPU is healthy business.
+    if cpu < 2 { return Err(Error::Unauthorized); }
     let bit = 1u64.checked_shl(u32::from(cpu)).ok_or(Error::Invalid)?;
     if core_generation == 0
         || bit & business_mask & healthy_mask & !draining_mask & !quarantined_mask == 0
@@ -249,6 +253,11 @@ mod tests {
         assert_eq!(authorize_business_core(2, 1, 0b1100, 0b1100, 0, 0b0100), Err(Error::Unauthorized));
         assert_eq!(authorize_business_core(1, 1, 0b1100, 0b1100, 0, 0), Err(Error::Unauthorized));
         assert_eq!(authorize_business_core(64, 1, u64::MAX, u64::MAX, 0, 0), Err(Error::Invalid));
+    }
+    #[test] fn v019_sec_p06_protected_cpu_misclassification_fails_closed() {
+        assert_eq!(authorize_business_core(0,1,u64::MAX,u64::MAX,0,0),Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(1,1,u64::MAX,u64::MAX,0,0),Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(2,1,0b1100,0b1100,0,0),Ok(()));
     }
     #[test] fn sec_p08_no_ai_required_for_local_admission() {
         let mut l = SpawnLedger::<1>::new();

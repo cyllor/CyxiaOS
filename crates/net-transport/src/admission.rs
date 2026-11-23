@@ -243,6 +243,10 @@ impl Admission {
             return Err(Error::Busy);
         }
         self.sources[at]=None;
+        // Successful expiry is itself a trusted monotonic-clock observation.
+        // A later request cannot rewind to an older instant to mint a fresh
+        // four-token burst after eviction.
+        self.clock=second;
         Ok(())
     }
 }
@@ -287,6 +291,16 @@ mod tests {
         admission.evict_idle(1,33).unwrap();
         let new=admission.begin(33,33,16).unwrap();
         admission.reject(new).unwrap();
+    }
+    #[test]
+    fn sec_n04_eviction_advances_global_clock_and_blocks_rewind() {
+        let mut gate=Admission::new();
+        let ticket=gate.begin(7,1,4).unwrap();
+        gate.reject(ticket).unwrap();
+        gate.evict_idle(7,10).unwrap();
+        assert_eq!(gate.begin(7,2,4),Err(Error::Invalid));
+        let fresh=gate.begin(7,10,4).unwrap();
+        gate.reject(fresh).unwrap();
     }
     #[test]
     fn sec_n08_restart_never_drops_unknown_pending_or_resets_tokens() {

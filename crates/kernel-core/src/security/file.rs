@@ -67,9 +67,21 @@ impl FileCapability {
     }
     /// BootEpoch and other protected-system records cannot be reached by
     /// ordinary file capabilities, including through a fabricated path.
-    pub fn protected_store(self, owner: u64) -> Result<(), Error> {
-        if self.owner != owner || owner == 0 || self.permissions & SYSTEM_STORE == 0 {
+    /// A caller supplies *trusted native registry* identity and generation;
+    /// no protected inode encoding is invented here (DEC-01 is not frozen).
+    /// A matching SYSTEM_STORE bit on an unrelated normal inode is insufficient.
+    pub fn protected_store(
+        self, owner: u64, protected_inode: u16, protected_generation: u64,
+    ) -> Result<(), Error> {
+        if self.owner != owner || owner == 0
+            || self.permissions & SYSTEM_STORE == 0
+        {
             return Err(Error::Unauthorized);
+        }
+        if self.inode != protected_inode || self.generation == 0
+            || protected_generation == 0 || self.generation != protected_generation
+        {
+            return Err(Error::Stale);
         }
         Ok(())
     }
@@ -196,9 +208,15 @@ mod tests {
         assert_eq!(t.submit(2, [4;32]), Err(Error::Capacity));
     }
     #[test] fn sec_f08_boot_epoch_store_is_not_ordinary_file() {
-        assert_eq!(cap().protected_store(7), Err(Error::Unauthorized));
+        assert_eq!(cap().protected_store(7,0,1), Err(Error::Unauthorized));
         let system = FileCapability::from_registry(7, 0, 1, SYSTEM_STORE);
-        assert_eq!(system.protected_store(7), Ok(()));
-        assert_eq!(system.protected_store(8), Err(Error::Unauthorized));
+        assert_eq!(system.protected_store(7,0,1), Ok(()));
+        assert_eq!(system.protected_store(8,0,1), Err(Error::Unauthorized));
+    }
+    #[test] fn v019_sec_f08_trusted_system_registry_scope_and_generation_required() {
+        let malicious = FileCapability::from_registry(7, 2, 3, SYSTEM_STORE);
+        assert_eq!(malicious.protected_store(7,0,1), Err(Error::Stale));
+        let stale = FileCapability::from_registry(7, 0, 0, SYSTEM_STORE);
+        assert_eq!(stale.protected_store(7,0,1), Err(Error::Stale));
     }
 }

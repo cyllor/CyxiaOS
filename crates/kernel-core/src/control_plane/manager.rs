@@ -112,7 +112,15 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         let owner = crate::security::syscall::ProtectedRole::from_kernel(
             self.publisher.id, self.publisher.generation,
         );
-        if crate::security::syscall::can_publish(caller, owner).is_err()
+        let authorization = if self.ownership.fixed_control() {
+            crate::security::syscall::can_publish_fixed(
+                caller, owner, cpu, self.snapshot().control,
+            )
+        } else {
+            // Historical transition test fixtures are not native V0.19.
+            crate::security::syscall::can_publish(caller, owner)
+        };
+        if authorization.is_err()
             || !self.snapshot().permits(cpu, Plane::Control)
         {
             Err(Error::Denied)

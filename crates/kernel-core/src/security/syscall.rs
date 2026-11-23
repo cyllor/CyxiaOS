@@ -113,6 +113,21 @@ pub fn can_publish(caller:ProtectedRole,publisher:ProtectedRole)->Result<(),Erro
     }
     Ok(())
 }
+/// V0.19 fixed native publisher gate. A matching EL1 identity is not
+/// sufficient if the caller runs on CPU0, CPU2 or CPU3, or if the control
+/// mask was silently expanded by an obsolete CoreSet decision.
+pub fn can_publish_fixed(
+    caller:ProtectedRole, publisher:ProtectedRole,
+    executing_cpu:usize, control_mask:u64,
+)->Result<(),Error>{
+    can_publish(caller,publisher)?;
+    if executing_cpu != crate::control_plane::fixed::CONTROL_CPU
+        || control_mask != crate::control_plane::fixed::CONTROL_MASK
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
 pub fn can_report_completion(
     caller:ProtectedRole,executor:ProtectedRole,
     reported_generation:u64,
@@ -197,6 +212,13 @@ mod tests {
     #[test]fn sec_s04_only_publisher_can_submit_plan(){
         assert_eq!(can_publish(role(1),role(2)),Err(Error::Unauthorized));
         assert_eq!(can_publish(role(2),role(2)),Ok(()));
+    }
+    #[test]fn v019_sec_s04_fixed_publisher_cannot_run_on_business_or_broker_cpu(){
+        assert_eq!(can_publish_fixed(role(2),role(2),1,0b10),Ok(()));
+        assert_eq!(can_publish_fixed(role(2),role(2),0,0b10),Err(Error::Unauthorized));
+        assert_eq!(can_publish_fixed(role(2),role(2),2,0b10),Err(Error::Unauthorized));
+        assert_eq!(can_publish_fixed(role(2),role(2),1,0b110),Err(Error::Unauthorized));
+        assert_eq!(can_publish_fixed(role(1),role(2),1,0b10),Err(Error::Unauthorized));
     }
     #[test]fn sec_s05_old_executor_generation_cannot_report(){
         assert_eq!(can_report_completion(role(2),role(2),2),Err(Error::Stale));
