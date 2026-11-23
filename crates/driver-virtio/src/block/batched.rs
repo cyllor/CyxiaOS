@@ -1,5 +1,10 @@
 //! Multi-request block owner. Returned buffers remain pinned until acknowledge.
 use super::{FLUSH, Operation, READ_ONLY, SECTOR_BYTES};
+// Keep the exact completed token in the existing pending record until the
+// caller acknowledges and the underlying queue releases its pinned DMA slot.
+// This sentinel is never a start time and allocates no additional metadata.
+const COMPLETED_RETAINED: u64 = u64::MAX;
+
 use crate::{
     Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, MAX_CHAINS, NotifyStats, Token},
@@ -167,7 +172,14 @@ impl BatchedBlock {
                 return Err(e);
             }
         };
-        self.pending[usize::from(token.slot)] = Some((token, operation, p.now_ms()));
+        let started = p.now_ms();
+        // u64::MAX is reserved for a fully verified, not-yet-acknowledged
+        // completion; accepting it as a start tick could forge that state.
+        if started == COMPLETED_RETAINED {
+            self.fail(p);
+            return Err(Error::Timeout);
+        }
+        self.pending[usize::from(token.slot)] = Some((token, operation, started));
         Ok(token)
     }
     pub fn drain(&mut self, p: &impl Platform) -> Result<(), Error> {
@@ -212,7 +224,11 @@ impl BatchedBlock {
             if expected == 513 {
                 out.copy_from_slice(&bytes[..512]);
             }
-            self.pending[usize::from(token.slot)] = None;
+            // A device completion is not the caller's acknowledgment.
+            // Retain the original token/custody until acknowledge() actually
+            // frees the pinned queue buffers, including if the caller fails.
+            self.pending[usize::from(token.slot)] =
+                Some((token, operation, COMPLETED_RETAINED));
             self.last_completed = self.last_completed.max(c.version);
             return Ok(Some(BlockCompletion {
                 token,
@@ -225,7 +241,9 @@ impl BatchedBlock {
             .pending
             .iter()
             .flatten()
-            .any(|(_, _, start)| observed_ms.wrapping_sub(*start) >= 250)
+            .any(|(_, _, start)| {
+                *start != COMPLETED_RETAINED && observed_ms.wrapping_sub(*start) >= 250
+            })
         {
             self.fail(p);
             return Err(Error::Timeout);
@@ -233,7 +251,15 @@ impl BatchedBlock {
         Ok(None)
     }
     pub fn acknowledge(&mut self, token: Token) -> Result<(), Error> {
-        self.queue.release(token)
+        let at = usize::from(token.slot);
+        // Fail closed on an early, stale or forged acknowledgment. Only the
+        // exact completion observed by poll() can terminate its DMA custody.
+        if !matches!(self.pending.get(at), Some(Some((owned, _, COMPLETED_RETAINED))) if *owned == token) {
+            return Err(Error::Response);
+        }
+        self.queue.release(token)?;
+        self.pending[at] = None;
+        Ok(())
     }
 }
 
@@ -421,6 +447,31 @@ mod tests {
         assert_eq!(completion.operation, Operation::Flush);
         b.acknowledge(token).unwrap();
     }
+    #[test]
+    fn native_sec_d06_completion_keeps_exact_token_until_valid_ack() {
+        let (mut b, p, m) = fixture();
+        let token = b
+            .begin(Operation::Flush, &[0; 512], true, true, &p)
+            .unwrap();
+        // A caller cannot return DMA/descriptor custody before the actual
+        // used-ring completion and checked device status are observed.
+        assert_eq!(b.acknowledge(token), Err(Error::Response));
+        unsafe { complete(m, token.slot, false, 0) };
+        let c = b.poll(&mut [0; 512], &p).unwrap().unwrap();
+        assert_eq!(c.token, token);
+        assert_eq!(c.operation, Operation::Flush);
+        assert!(!b.is_quiescent());
+        // A delayed ACK does not convert the held completion into a timeout.
+        p.clock.set(300_000_000);
+        assert_eq!(b.poll(&mut [0; 512], &p), Ok(None));
+        let forged = Token { generation: token.generation + 1, ..token };
+        assert_eq!(b.acknowledge(forged), Err(Error::Response));
+        assert!(!b.is_quiescent());
+        b.acknowledge(token).unwrap();
+        assert!(b.is_quiescent());
+        assert_eq!(b.acknowledge(token), Err(Error::Response));
+    }
+
     #[test]
     fn invalid_device_status_never_releases_or_acknowledges_policy() {
         let (mut b, p, m) = fixture();

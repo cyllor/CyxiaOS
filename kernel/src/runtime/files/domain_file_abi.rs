@@ -325,7 +325,12 @@ fn validate_shape(address: u64, f: &Frame) -> Result<(), Error> {
         if path == 0 {
             return Err(Error::Format);
         }
-        core::str::from_utf8(&f.bytes[OFF_PATH..OFF_PATH + path]).map_err(|_| Error::Format)?;
+        // SEC-F01: check the complete stable kernel copy, never the EL0
+        // pointer again. Reject dot traversal, empty components, invalid
+        // UTF-8 and NUL before authority or any inode/log allocation.
+        cyxia_kernel_core::security::file::validate_absolute_path(
+            &f.bytes[OFF_PATH..OFF_PATH + path],
+        ).map_err(|_| Error::Format)?;
     } else if path != 0 {
         return Err(Error::Format);
     }

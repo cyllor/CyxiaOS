@@ -71,3 +71,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `cyxia_prototype::domains::tasks::Scheduler::quarantine_mask()` 新增常数时间可信读取，不遍历线程表。
 - AArch64 `Creator::authorize/build` 调用受保护 `security::process::authorize_business_core` 时，除了健康业务核和代际，现还同时传入真实调度器隔离位图；已被隔离 CPU 不能作为新任务创建目标。
 - 本地 CI 新增原 `domain_tasks` 主机调度/生命周期回归；完整 ARM 运行时仍需独立构建与故障注入。
+
+### G2 增量：SEC-F 与 SEC-D 原生入口（本轮）
+
+- `kernel/src/runtime/files/domain_file_abi.rs::validate_shape` 在已稳定复制的 EL0 文件 ABI 帧上调用 `security::file::validate_absolute_path`；非法路径与组件在 inode 分配、日志或文件系统操作前拒绝。仅对包含路径的既有操作生效，不修改 ABI 或磁盘格式。
+- `crates/driver-virtio/src/block/batched.rs` 的块设备完成已验证时保留原 token 的代际与完成占用，直到调用者 `acknowledge` 且 `queue.release` 成功才释放。本驱动复用原有 `pending` 槽，无新增缓冲或完成池；超时不会将已完成但未 ACK 的 DMA 误当成未完成并释放。
+- 新增 `native_sec_d06_completion_keeps_exact_token_until_valid_ack`，检查过早 ACK、失效代际、重复 ACK、延期 ACK 和真正可静默性；新增路径输入负向单元测试及源码接线回归。
+- 这些是实际原生入口的代码改动，但 *不等于* 真实掉电/恶意设备/DMA/TLS 故障验收。需在 AArch64 目标构建和 QEMU 注入下继续 G2/G3/G4。

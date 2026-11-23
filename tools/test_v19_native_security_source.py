@@ -46,6 +46,23 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("domain_network::submit_placement_request(", src)
         self.assertNotIn("domain_network::placement_request_status(", src)
 
+    def test_file_service_checks_stable_path_before_side_effect(self):
+        src = source(ROOT / "kernel/src/runtime/files/domain_file_abi.rs")
+        guard = src.find("security::file::validate_absolute_path(")
+        stable = src.find("memory.copyin(address, &mut f.bytes)?;")
+        run = src.find("let result = run(owner, &input, &mut output, data, progress);")
+        self.assertGreater(guard, 0)
+        self.assertGreater(stable, 0)
+        self.assertGreater(run, guard)
+        self.assertIn("validate_shape(address, f)?;", src)
+
+    def test_block_completion_retains_dma_until_exact_ack(self):
+        src = source(ROOT / "crates/driver-virtio/src/block/batched.rs")
+        self.assertIn("COMPLETED_RETAINED", src)
+        self.assertIn("self.queue.release(token)?;", src)
+        self.assertIn("self.pending[at] = None;", src)
+        self.assertIn("native_sec_d06_completion_keeps_exact_token_until_valid_ack", src)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

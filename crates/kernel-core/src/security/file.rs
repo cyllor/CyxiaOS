@@ -151,6 +151,13 @@ mod tests {
         }
         assert_eq!(validate_absolute_path(b"/valid/path"), Ok(()));
     }
+    #[test] fn native_path_guard_rejects_duplicate_slashes_nul_and_invalid_utf8() {
+        assert_eq!(validate_absolute_path(b"/a//b"), Err(Error::Invalid));
+        assert_eq!(validate_absolute_path(b"/dir/"), Err(Error::Invalid));
+        assert_eq!(validate_absolute_path(b"/a\0b"), Err(Error::Invalid));
+        assert_eq!(validate_absolute_path(&[b'/', 0xff]), Err(Error::Invalid));
+        assert_eq!(validate_absolute_path(b"/a/b"), Ok(()));
+    }
     #[test] fn sec_f02_capabilities_do_not_cross_owner_or_rights() {
         assert_eq!(cap().permits(8, 2, 3, READ), Err(Error::Unauthorized));
         assert_eq!(cap().permits(7, 2, 3, DELETE), Err(Error::Unauthorized));
