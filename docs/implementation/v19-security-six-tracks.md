@@ -65,3 +65,9 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - SEC-P 在 AArch64 的 `Creator::authorize` 和 `Creator::build` 中复用 `security::process::authorize_business_core`，由原生 `CpuLayout`（已排除 draining）核验健康业务核心及配置代际；请求不能凭模型建议把新任务放入 C/T/Q 核。真正的调度承诺、资源账户与 rollback 仍由原 `SpawnAdmission` 和 scheduler 完成，不建立并行账本。
 - SEC-M 在原生 `Pages::map` 和 `Pages::revoke` 前验证 frame 不属于启动期页表/代码保留前缀或物理池外；拒绝时不发布新 PTE，也不释放仍受账本监管的页。真实 owner、清零、全局 TLBI/DSB/ISB 仍来自既有 `Memory` 与架构层。
 - 两处增加了纯单元负向测试，验证错误 CPU、draining、quarantine、错误代际以及保护帧/越界帧的拒绝。**测试通过不构成“所有 DMA/TLB ACK 已实施”或真实 SMP 故障注入通过**。
+
+### G2 隔离核拒绝追加
+
+- `cyxia_prototype::domains::tasks::Scheduler::quarantine_mask()` 新增常数时间可信读取，不遍历线程表。
+- AArch64 `Creator::authorize/build` 调用受保护 `security::process::authorize_business_core` 时，除了健康业务核和代际，现还同时传入真实调度器隔离位图；已被隔离 CPU 不能作为新任务创建目标。
+- 本地 CI 新增原 `domain_tasks` 主机调度/生命周期回归；完整 ARM 运行时仍需独立构建与故障注入。

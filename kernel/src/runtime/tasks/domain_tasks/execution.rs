@@ -198,7 +198,7 @@ impl Creator<'_> {
             self.layout.business_mask,
             self.layout.healthy_mask,
             0, // already masked by effective_layout
-            0, // quarantines remain checked by the scheduler
+            self.scheduler.quarantine_mask(), // protected live quarantine
         )
         .map_err(|_| Error::NotReady)?;
         let client = r.package == CLIENT_PACKAGE || r.package == MEMORY_PACKAGE;
@@ -527,7 +527,7 @@ impl TaskBackend for Creator<'_> {
                 self.layout.business_mask,
                 self.layout.healthy_mask,
                 0, // effective_layout already removes draining CPUs
-                0, // scheduler independently enforces its quarantine mask
+                self.scheduler.quarantine_mask(), // source: protected scheduler
             )
             .is_err()
         {

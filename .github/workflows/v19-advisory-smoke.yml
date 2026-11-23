@@ -36,6 +36,8 @@ jobs:
           git diff --check HEAD^ HEAD
       - name: Core control and six-track host contract tests
         run: cargo test --locked --offline -p cyxia-kernel-core
+      - name: Prototype scheduler and task lifecycle host tests
+        run: cargo test --locked --offline -p cyxia-prototype --test domain_tasks
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)

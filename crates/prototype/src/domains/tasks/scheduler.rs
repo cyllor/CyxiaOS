@@ -1091,6 +1091,11 @@ impl Scheduler {
         self.threads[i].as_mut().ok_or(Error::Stale)?.spec.cpu = cpu as u16;
         Ok(())
     }
+    /// Constant-time trusted scheduler quarantine snapshot for native
+    /// admission gates. Unlike stats(), this does not scan runnable tasks.
+    pub const fn quarantine_mask(&self) -> u64 {
+        self.stats.quarantine_mask
+    }
     pub fn stats(&self) -> SchedulerStats {
         let mut s = self.stats;
         s.runnable = self
