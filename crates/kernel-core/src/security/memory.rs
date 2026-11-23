@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(authorize_data_frame_slot(256, 16, 256), Err(Error::Unauthorized));
         assert_eq!(authorize_data_frame_slot(17, 256, 256), Err(Error::Invalid));
     }
-
+    #[test] fn sec_m08_stale_tlb_generation_not_an_ack() {
         let mut s = Shootdown::begin(1, 2, 1, 0, 0, 0).unwrap();
         s.revoke_pte();
         assert_eq!(s.acknowledge(1, 1, 0), Err(Error::Stale));
