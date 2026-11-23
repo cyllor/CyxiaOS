@@ -100,3 +100,5 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 交叉编译初次尝试在 `ring` 的 freestanding C 构建中缺少 `assert.h` 而失败，不能标记 ARM PASS。下一次按发布模式编译，并对裸机 C 加 `-DNDEBUG`（只禁用标准 C 调试断言，不改变 TLS 证书、身份、ALPN 或 Rust 协议验证的代码路径）；必须重新检查 CI 编译日志，且依旧不代表设备实际通信验收。
 
 检查了仓库中同版本 ring 的 `include/ring-core/check.h`，其明确提供 `RING_CORE_NOSTDLIBINC`（在没有 `assert.h` 时使用受控的 `__builtin_trap` 调试检查）。因此 AArch64 cross-C 代码改用正式裸机宏，而不通过手写空头文件或跳过密码学验证来求得构建通过。此前 `-DNDEBUG` 不能解决无头文件问题的失败记录仍保留。
+
+实测第二次目标编译通过了裸机 C 头文件阶段，但触发了 `ring` 的 `_AARCH64_HAS_NEON` 静态断言。检查原生 `user/prototype-cluster/.cargo/config.toml` 与 `tools/build.sh` 后，确认**原设计的 EL0 TLS 服务使用 `aarch64-unknown-none`（含必要 FP/SIMD），只有 EL1 内核使用 `aarch64-unknown-none-softfloat`**。下一次 CI 因此按原有 EL0 TLS 目标/编译标志验证，而非给内核软浮点 ABI 擅自加 NEON。此时目标编译仍不得声称 QEMU PASS。
