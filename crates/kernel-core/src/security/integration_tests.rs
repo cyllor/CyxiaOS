@@ -75,11 +75,11 @@ fn read_op(tag:u64)->syscall::ReadOperation {
 }
 #[test] fn j07_irq_change_cannot_route_to_draining_core() {
     assert_eq!(
-        device::validate_irq_route(device::IrqKind::VirtioSpi,1,1,0b1110,1<<1,0,true),
+        device::validate_irq_route(device::IrqKind::VirtioSpi,2,1,0b1110,1<<2,0,true),
         Err(Error::Unauthorized)
     );
     let mut tasks=process::SpawnLedger::<1>::new();
-    assert_eq!(tasks.admit(request(),permit(1<<1)),Err(Error::Unauthorized));
+    assert_eq!(tasks.admit(request(),permit(1<<2)),Err(Error::Unauthorized));
 }
 #[test] fn j08_network_batch_does_not_hold_lonely_virtqueue_request() {
     assert_eq!(device::must_notify(1,8,50_000,false),Ok(true));
