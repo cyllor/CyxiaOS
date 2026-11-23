@@ -91,6 +91,29 @@ class NativeSecurityWiring(unittest.TestCase):
         assert "pub enum Kind" not in echo and "ClusterId" not in echo
         assert "pub const READONLY_ECHO: u16 = 1" in echo
 
+    def test_v019_cpu1_fixed_and_two_brains_have_no_runtime_scale_path(self):
+        native = source(ROOT / "kernel/src/runtime/control/prototype_runtime.rs")
+        model = source(ROOT / "user/prototype-runtime/main.rs")
+        role = source(ROOT / "crates/kernel-core/src/control_plane/fixed.rs")
+        cores = source(ROOT / "crates/prototype/src/cores.rs")
+        manager = source(ROOT / "crates/kernel-core/src/control_plane/manager.rs")
+        self.assertIn("Cores::new_fixed(CoreSet::from_bits(15))", native)
+        self.assertNotIn("self.poll_handoff(now);", native)
+        self.assertNotIn("self.poll_secondary(now);", native)
+        self.assertNotIn("self.propose(target, accepted_at);", native)
+        self.assertNotIn("core_candidates(input[15])", model)
+        self.assertIn("const CONTROL_CPU: usize = 1;", role)
+        self.assertIn("pub fn review", role)
+        self.assertIn("pub fn new_fixed(online: CoreSet)", cores)
+        self.assertIn("if self.fixed_control { return Err(Error::Invalid); }", cores)
+        self.assertIn("fn review_brains", manager)
+
+    def test_v019_native_domain_never_publishes_moved_control_cpu(self):
+        native = source(ROOT / "kernel/src/runtime/control/domain_control.rs")
+        self.assertIn("context.control_mask != 0b10", native)
+        self.assertIn("Action::ControlSet(mask) if mask != 0b10", native)
+        self.assertIn("self.provenance.at(submission::Stage::Stamp)", native)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

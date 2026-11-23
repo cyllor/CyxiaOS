@@ -802,6 +802,7 @@ pub fn publish_context(context: Context) -> Result<(), Error> {
     with(|s| {
         if context.core_generation == 0
             || context.ledger_generation == 0
+            || (cfg!(feature = "unified-runtime") && context.control_mask != 0b10)
             || context.control_mask & context.business_mask != 0
         {
             return Err(Error::Conflict);
@@ -949,8 +950,14 @@ fn tiers(current: Action) -> ([Option<Action>; 32], usize) {
             }
         }
         Action::ControlSet(mask) => {
-            add(Action::ControlSet(mask));
-            add(Action::ControlSet(mask ^ 4));
+            if cfg!(feature = "unified-runtime") {
+                // V0.19: the only legal control identity is unchanged CPU1.
+                add(Action::ControlSet(0b10));
+            } else {
+                // Archived dynamic transition self-tests retain old fixtures.
+                add(Action::ControlSet(mask));
+                add(Action::ControlSet(mask ^ 4));
+            }
         }
         Action::SpawnTokens(_) => {
             for v in [1, 2, 4, 8] {
@@ -1096,6 +1103,13 @@ fn validate_selection_with_at(
         .ok_or(Error::Stale)?;
     if guard.family() != (action.domain(), action.kind()) || guard.target() != target {
         return Err(Error::Stale);
+    }
+    // V0.19 native refuses every model suggestion to expand or move the
+    // control CPU. Keeping the old action encoding is ABI compatibility only.
+    if cfg!(feature = "unified-runtime")
+        && matches!(action, Action::ControlSet(mask) if mask != 0b10)
+    {
+        return Err(Error::Denied);
     }
     let current = current()?;
     if action == current {
@@ -2633,6 +2647,14 @@ impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
             }
             let mut stamps = [PolicyStamp::default(); 16];
             for (index, d) in plan.iter().enumerate() {
+                // Enforce again at final publication, not only at the AI
+                // selection gate. Any stale/forged control migration plan
+                // is rejected before the first policy stamp or executor work.
+                if cfg!(feature = "unified-runtime")
+                    && matches!(d.action, Action::ControlSet(mask) if mask != 0b10)
+                {
+                    return Err(Error::Denied);
+                }
                 self.provenance.at(submission::Stage::Stamp);
                 stamps[index] = PolicyStamp::for_action(
                     d.action,

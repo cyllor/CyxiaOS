@@ -34,8 +34,11 @@ jobs:
           test -f crates/prototype/src/snapshot/manager.rs
           test -f crates/kernel-core/src/control_plane/advisory.rs
           git diff --check HEAD^ HEAD
-      - name: Core control and six-track host contract tests
-        run: cargo test --locked --offline -p cyxia-kernel-core
+      - name: Core fixed-control and six-track host contract tests
+        run: |
+          cargo test --locked --offline -p cyxia-kernel-core
+          cargo test --locked --offline -p cyxia-kernel-core --test control_plane
+          cargo test --locked --offline -p cyxia-prototype --lib v019_fixed_tests
       - name: Prototype scheduler and task lifecycle host tests
         run: cargo test --locked --offline -p cyxia-prototype --test domain_tasks
       - name: VirtIO DMA/FLUSH, redo crash cuts and immutable snapshot regressions

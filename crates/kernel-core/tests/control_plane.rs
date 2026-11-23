@@ -759,3 +759,53 @@ fn audit_stale_timestamp_cannot_suppress_fault_containment() {
     assert!(!m.snapshot().permits(0, Plane::Control));
     assert_ne!(m.snapshot().quarantined & 1, 0);
 }
+
+#[test]
+fn v019_manager_rejects_control_scaling_and_keeps_business_ownership() {
+    use cyxia_kernel_core::control_plane::fixed::CONTROL_MASK;
+    let ownership=Ownership::<4>::new_fixed(15,[100;4],[1,2,4,8],limits()).unwrap();
+    assert_eq!(ownership.snapshot().control,CONTROL_MASK);
+    assert_eq!(ownership.snapshot().business,15 & !CONTROL_MASK);
+    let mut m=Manager::new_fixed(ownership,id(10),epochs(),limits(),[env().limits;16]).unwrap();
+    let before=m.snapshot();
+    for target in [1,3,6,15] {
+        let scale=Request::Scale {
+            epochs:m.epochs(),
+            proposal: ScaleProposal {
+                generation:m.epochs().cores,
+                resource_epoch:1,
+                sequence:1,
+                desired_control:target,
+                deadline:100,
+            }
+        };
+        assert_eq!(m.submit(id(10),1,scale.encode(),10),Err(Error::Denied));
+        assert_eq!(m.snapshot(),before);
+    }
+    assert!(!m.snapshot().permits(2,Plane::Control));
+    assert!(m.snapshot().permits(2,Plane::Business));
+}
+#[test]
+fn v019_two_brains_are_only_auxiliary_to_trusted_fixed_control_manager() {
+    use cyxia_kernel_core::control_plane::{
+        advisory::{Advice,Controller,Rule},
+        fixed::{Brain,ChoiceSource,Pair},
+    };
+    let ownership=Ownership::<4>::new_fixed(15,[100;4],[1,2,4,8],limits()).unwrap();
+    let m=Manager::new_fixed(ownership,id(10),epochs(),limits(),[env().limits;16]).unwrap();
+    let mut pair=Pair::new(id(100),id(200)).unwrap();
+    let advice=|candidate| Advice {
+        epochs:m.epochs(), model_generation:m.epochs().model,
+        domain:1,target:id(20),candidate,snapshot_ns:8,expires_ns:20,
+    };
+    let rules=Controller::new([Rule{baseline:2,options:&[1,2,4]};15]).unwrap();
+    let no_ai=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
+    assert_eq!(no_ai.source,ChoiceSource::Baseline);
+    pair.submit(Brain::Operations,id(100),1,advice(4)).unwrap();
+    pair.submit(Brain::Security,id(200),1,advice(1)).unwrap();
+    let conflict=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
+    assert_eq!(conflict.source,ChoiceSource::ConflictFallback);
+    assert_eq!(conflict.candidate,2);
+    assert_eq!(m.snapshot().control,2);
+    assert_eq!(m.epochs(),epochs());
+}

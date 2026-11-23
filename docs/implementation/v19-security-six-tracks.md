@@ -102,3 +102,7 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 检查了仓库中同版本 ring 的 `include/ring-core/check.h`，其明确提供 `RING_CORE_NOSTDLIBINC`（在没有 `assert.h` 时使用受控的 `__builtin_trap` 调试检查）。因此 AArch64 cross-C 代码改用正式裸机宏，而不通过手写空头文件或跳过密码学验证来求得构建通过。此前 `-DNDEBUG` 不能解决无头文件问题的失败记录仍保留。
 
 实测第二次目标编译通过了裸机 C 头文件阶段，但触发了 `ring` 的 `_AARCH64_HAS_NEON` 静态断言。检查原生 `user/prototype-cluster/.cargo/config.toml` 与 `tools/build.sh` 后，确认**原设计的 EL0 TLS 服务使用 `aarch64-unknown-none`（含必要 FP/SIMD），只有 EL1 内核使用 `aarch64-unknown-none-softfloat`**。下一次 CI 因此按原有 EL0 TLS 目标/编译标志验证，而非给内核软浮点 ABI 擅自加 NEON。此时目标编译仍不得声称 QEMU PASS。
+
+### G2 固定 CPU1 / 双 AI 建议前置架构
+
+六专项后续接线必须复用 V0.19 固定角色：CPU1 是唯一 AI 控制核（CPU0 仅为确定性 EL1 机制 broker），两个逻辑隔离的建议邮箱无执行权、不参与资源栅栏的签发。业务内核/IRQ/TLB/DMA/文件事务安全拒绝不能由运营或安全 AI 消除。模型建议不触发 CoreSet 伸缩/跨核接管。双 EL0 推理进程实际隔离、并行调度以及 AArch64 QEMU 证明仍缺失，G2/G3/G4 状态不因契约测试通过而升级。

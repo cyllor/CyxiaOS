@@ -1,4 +1,4 @@
-//! Continuous experimental CACP runtime and bounded native ownership handoff.
+//! V0.19 fixed-CPU1 advisory runtime. Historical handoff state is inert.
 //!
 //! CPU1 owns the restartable EL0 model. CPU0 owns scheduling accounting; neither
 //! business CPU waits for inference. This profile has no native DMA/reference
@@ -741,7 +741,7 @@ impl Coordinator {
         assert!(frequency >= 1000);
         let origin = timer::ticks();
         CLOCK_ORIGIN.store(origin, Ordering::Release);
-        let mut owner = Cores::new(CoreSet::from_bits(15), CoreSet::from_bits(2)).unwrap();
+        let mut owner = Cores::new_fixed(CoreSet::from_bits(15)).expect("V0.19 fixed CPU1 role");
         let threads = [2, 3].map(|slot| {
             Some(
                 owner
@@ -826,7 +826,8 @@ impl Coordinator {
             secondary_input: [0; abi::INPUT_WORDS],
         }
     }
-    /// One bounded CPU0 mechanism turn. Device/network work belongs between turns.
+    /// One bounded CPU0 mechanism turn. CPU1 alone hosts advisory AI work.
+    /// Device/network work belongs between turns.
     pub(crate) fn poll(&mut self) {
         #[cfg(feature = "unified-runtime")]
         {
@@ -844,8 +845,10 @@ impl Coordinator {
             if self.wake_pulse.due(now) {
                 wake_workers();
             }
-            self.poll_handoff(now);
-            self.poll_secondary(now);
+            // V0.19: no control-core scaling, CPU2 secondary control worker,
+            // or ownership handoff. CPU2/3 remain business-only. Control
+            // advice is bounded by CPU1; the CPU0 mechanism broker remains
+            // authoritative and independent of model completion.
         }
         // Reap credits before advancing the ledger. A slice from the old window
         // cannot be hidden by reset or by controller restart.
@@ -856,7 +859,9 @@ impl Coordinator {
                         self.window_ticks[slot - 2] += ELAPSED[slot].load(Ordering::Relaxed);
                         self.completions[slot - 2] += 1;
                         if cfg!(feature = "unified-runtime") {
-                            self.control_work = (self.control_work + 1).min(32);
+                            // Former overflow capacity request is retired.
+                            // Completed business work never requests a
+                            // second control CPU in V0.19.
                         }
                     } else {
                         self.expired[slot - 2] += 1;
@@ -972,8 +977,9 @@ impl Coordinator {
                     self.successes += 1;
                     outcome = 1;
                     if cfg!(feature = "unified-runtime") {
-                        self.control_work = self.control_work.saturating_sub(1);
-                        self.propose(target, accepted_at);
+                        // No AI output may trigger a control-core transition.
+                        // Retain the bounded resource-weight suggestion only;
+                        // the deterministic owner continues to arbitrate.
                     }
                 } else if state == 4 {
                     self.faults += 1;
@@ -1347,59 +1353,11 @@ fn secondary_control_step(worker: &mut Worker) {
 }
 
 impl Coordinator {
-    fn propose(&mut self, target: u64, now: u64) {
-        let state = self.owner.snapshot();
-        let ms = now.saturating_sub(self.origin) * 1000 / self.frequency;
-        if target == state.control.bits()
-            || self.handoff.is_some()
-            || self
-                .last_handoff_ms
-                .is_some_and(|last| ms.saturating_sub(last) < 1000)
-        {
-            return;
-        }
-        let Ok(mut handoff) = Handoff::new(&state, target, ms) else {
-            return;
-        };
-        // Close dispatch at its linearization point before publishing draining
-        // in the serialized owner. An already-entered permit remains old work.
-        let gate = &GATES[2];
-        let view = gate.view();
-        if !view.enabled || gate.close(view.token.unwrap()).is_err() {
-            return;
-        }
-        let handoff_result = handoff.poll_with_thread(
-            &mut self.owner,
-            NativeStop::default(),
-            ms,
-            &mut self.threads[0],
-        );
-        #[cfg(feature = "unified-runtime")]
-        self.capture_ownership();
-        if handoff_result.is_err() {
-            // An unexpected admission failure leaves the physical fence closed
-            // and preserves source obligations, rather than reviving work.
-            let _ = self.owner.suspect(2);
-            #[cfg(feature = "unified-runtime")]
-            self.capture_ownership();
-            return;
-        }
-        self.handoff_sequence += 1;
-        self.handoff_target = target;
-        self.handoff_model_sequence = self.requests;
-        self.handoff = Some(handoff);
-        // Revocation is one bounded CAS per turn; no busy wait or cross-module lock.
-        #[cfg(feature = "unified-runtime")]
-        native::publish_stop_measure(self.handoff_sequence, &self.native);
-        STOP_OPERATION.store(self.handoff_sequence, Ordering::Release);
-        wake_workers();
-        self.last_handoff_ms = Some(ms);
-        report(
-            "DYNAMIC_V13_DRAIN",
-            self.requests,
-            target,
-            self.handoff_sequence,
-        );
+    /// Historical entry retained for source/API continuity. Native V0.19
+    /// must never begin a CPU2 handoff; this function is deterministic no-op.
+    #[allow(dead_code)]
+    fn propose(&mut self, _target: u64, _now: u64) {
+        // No model-driven core count or ownership mutation.
     }
     #[cfg(feature = "unified-runtime")]
     fn capture_ownership(&self) {
@@ -1416,120 +1374,9 @@ impl Coordinator {
             ],
         );
     }
-    fn poll_handoff(&mut self, now: u64) {
-        if self.handoff.is_none() {
-            return;
-        }
-        let gate = &GATES[2];
-        let view = gate.view();
-        if view.enabled {
-            match gate.close(view.token.unwrap()) {
-                Ok(()) | Err(Error::Busy) => (),
-                Err(_) => fatal(191),
-            }
-        }
-        let operation = self.handoff_sequence;
-        let stop = NativeStop {
-            dispatch: gate.quiescent(),
-            tasks: STOP_TASK_ACK.load(Ordering::Acquire) == operation,
-            irq: STOP_IRQ_ACK.load(Ordering::Acquire) == operation
-                && DEVICE_IRQ_OWNERS.load(Ordering::Acquire) & 4 == 0,
-            dma: DEVICE_REGISTRY_READY.load(Ordering::Acquire)
-                && DMA_OWNERS.load(Ordering::Acquire) & 4 == 0,
-            tlb: STOP_TLB_ACK.load(Ordering::Acquire) == operation,
-            references: STOP_REF_ACK.load(Ordering::Acquire) == operation,
-        };
-        let ms = now.saturating_sub(self.origin) * 1000 / self.frequency;
-        let result = self.handoff.as_mut().unwrap().poll_with_thread(
-            &mut self.owner,
-            stop,
-            ms,
-            &mut self.threads[0],
-        );
-        #[cfg(feature = "unified-runtime")]
-        self.capture_ownership();
-        match result {
-            Ok(false) => (),
-            Ok(true) => {
-                self.transitions += 1;
-                let state = self.owner.snapshot();
-                if self.handoff_target == 2 {
-                    // Cores retains source spending through release/re-admission.
-                    // If that window lacks capacity, defer business admission to
-                    // the next aligned window; ownership publication stays valid.
-                    self.admit_movable();
-                }
-                let generation = gate.view().token.unwrap().generation + 1;
-                #[cfg(feature = "unified-runtime")]
-                if let Some(apply) = native::active_core_apply(&self.native) {
-                    let proofs = u64::from(stop.dispatch)
-                        | (u64::from(stop.tasks) << 1)
-                        | (u64::from(stop.irq) << 2)
-                        | (u64::from(stop.dma) << 3)
-                        | (u64::from(stop.tlb) << 4)
-                        | (u64::from(stop.references) << 5);
-                    crate::ownership_evidence::published(
-                        apply,
-                        operation,
-                        &self.owner,
-                        native::ns(timer::ticks()),
-                        proofs,
-                        STOP_ACK.load(Ordering::Acquire),
-                    );
-                }
-                gate.open(Token {
-                    generation,
-                    plane: plane(self.handoff_target, 2),
-                })
-                .unwrap();
-                wake_workers();
-                let offset = 16 + ((self.transitions - 1) as usize % 16) * 16;
-                for (n, value) in [
-                    operation,
-                    self.handoff_model_sequence,
-                    self.last_handoff_ms.unwrap(),
-                    ms,
-                    self.handoff_target,
-                    state.control.bits(),
-                    state.business.bits(),
-                    state.core_generation,
-                    generation,
-                    63,
-                    PROGRESS[4].load(Ordering::Acquire),
-                    PROGRESS[5].load(Ordering::Acquire),
-                    PROGRESS[6].load(Ordering::Acquire),
-                    self.secondary_jobs,
-                    self.control_work,
-                    self.boot.epoch,
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    DYNAMIC_V13_EVIDENCE.words[offset + n].store(value, Ordering::Relaxed);
-                }
-                DYNAMIC_V13_EVIDENCE.words[0].store(0x43595844594e3133, Ordering::Relaxed);
-                DYNAMIC_V13_EVIDENCE.words[1].store(self.transitions, Ordering::Release);
-                report(
-                    "DYNAMIC_V13_PUBLISH",
-                    self.handoff_model_sequence,
-                    self.handoff_target,
-                    self.transitions,
-                );
-                self.handoff = None;
-            }
-            Err(error) => {
-                // Gate remains closed. Missing native completion never resumes
-                // old execution or gives CPU2 to another plane.
-                report(
-                    "DYNAMIC_V13_RECONCILE",
-                    operation,
-                    self.owner.snapshot().suspect.bits(),
-                    error as u64,
-                );
-                self.handoff = None;
-            }
-        }
-    }
+    /// Legacy async handoff machinery is disabled; no core can be promoted.
+    #[allow(dead_code)]
+    fn poll_handoff(&mut self, _now: u64) {}
     fn admit_movable(&mut self) {
         if self.threads[0].is_none() && self.owner.permits(2, OwnerPlane::Business) {
             self.threads[0] = self
@@ -1543,57 +1390,10 @@ impl Coordinator {
                 .ok();
         }
     }
-    fn poll_secondary(&mut self, _now: u64) {
-        match SECOND_REQUEST.load(Ordering::Acquire) {
-            3 => {
-                let output: [u64; abi::OUTPUT_WORDS] = core::array::from_fn(|n| unsafe {
-                    (*output_ptr(2)).0.as_ptr().add(n).read_volatile()
-                });
-                if output[..4]
-                    == [
-                        abi::OUTPUT_MAGIC,
-                        2,
-                        self.secondary_sequence,
-                        self.service_generation,
-                    ]
-                    && output[7] == self.boot.epoch
-                    && output[4] & 0xff < 2
-                {
-                    self.secondary_jobs += 1;
-                    self.control_work = self.control_work.saturating_sub(1);
-                }
-                SECOND_REQUEST.store(0, Ordering::Release);
-            }
-            4 => {
-                SECOND_REQUEST.store(0, Ordering::Release);
-            }
-            _ => (),
-        }
-        self.admit_movable();
-        if self.control_work == 0
-            || self.handoff.is_some()
-            || !self.owner.permits(2, OwnerPlane::Control)
-            || SECOND_REQUEST.load(Ordering::Acquire) != 0
-        {
-            return;
-        }
-        self.secondary_sequence += 1;
-        self.secondary_input = self.input;
-        self.secondary_input[0] = abi::INPUT_MAGIC;
-        self.secondary_input[1] = 2;
-        self.secondary_input[2] = self.secondary_sequence;
-        self.secondary_input[3] = self.service_generation;
-        self.secondary_input[6] = self.owner.snapshot().core_generation;
-        self.secondary_input[7] = self.owner.snapshot().ledger_generation;
-        self.secondary_input[14] = self.boot.epoch;
-        self.secondary_input[15] = self.control_work;
-        unsafe {
-            (&mut (*input_ptr(2)).0)[..abi::INPUT_WORDS].copy_from_slice(&self.secondary_input);
-            core::arch::asm!("dsb ish", options(nostack));
-        }
-        SECOND_REQUEST.store(1, Ordering::Release);
-        wake_workers();
-    }
+    /// CPU2 is permanently business-only. Never submit an AI job to it.
+    #[allow(dead_code)]
+    fn poll_secondary(&mut self, _now: u64) {}
+
 }
 
 /// CPU0's unified boot adapter calls this after attaching every native device.

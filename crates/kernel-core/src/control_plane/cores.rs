@@ -1,5 +1,6 @@
-//! Dynamic exclusive CPU ownership. Core IDs/counts are never chosen here.
-//! A caller supplies the AI's desired set; this module only checks constraints.
+//! Bounded legacy transition ledger plus V0.19 fixed one-core control role.
+//! Production V0.19 uses new_fixed; old dynamic new is retained only for
+//! historical transition-replay compatibility and MUST NOT be called natively.
 use super::{Error, Plane};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +134,7 @@ pub struct Ownership<const N: usize> {
     transition: Option<Transition>,
     recovery: Option<Recovery>,
     halted: bool,
+    fixed_control: bool,
 }
 impl<const N: usize> Ownership<N> {
     pub fn new(
@@ -178,6 +180,7 @@ impl<const N: usize> Ownership<N> {
             transition: None,
             recovery: None,
             halted: false,
+            fixed_control: false,
         };
         value.validate_partition(control, online & !control, limits)?;
         for i in 0..N {
@@ -194,6 +197,22 @@ impl<const N: usize> Ownership<N> {
         }
         Ok(value)
     }
+    /// V0.19 native constructor: CPU1 alone is the dedicated AI control CPU;
+    /// CPU0's mechanism broker does not count toward the control core.
+    pub fn new_fixed(
+        online: u64,
+        capacity: [u32; N],
+        groups: [u64; N],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        if !super::fixed::valid_layout(online, super::fixed::CONTROL_MASK) {
+            return Err(Error::Invalid);
+        }
+        let mut owner=Self::new(online, super::fixed::CONTROL_MASK, capacity, groups, limits)?;
+        owner.fixed_control=true;
+        Ok(owner)
+    }
+    pub const fn fixed_control(&self) -> bool { self.fixed_control }
     /// Called by Manager only after authenticating a newer controller epoch.
     /// Ticket generations/serials are never reset.
     pub(super) fn restart_sequence(&mut self) -> Result<(), Error> {
@@ -296,6 +315,7 @@ impl<const N: usize> Ownership<N> {
     /// VALIDATE + RESERVE are one serialized transaction; failures change nothing.
     /// DRAIN removes all changing cores from BOTH dispatch sets immediately.
     pub fn begin(&mut self, p: ScaleProposal, now: u64, limits: Limits) -> Result<Ticket, Error> {
+        if self.fixed_control { return Err(Error::Denied); }
         self.time(now)?;
         if self.halted {
             return Err(Error::Exhausted);

@@ -99,8 +99,8 @@ extern "C" fn _start(mode: u64) -> ! {
         abort();
     }
     let selected = model.select(&candidates).unwrap_or_else(|_| abort());
-    let core_options = core_candidates(input[15]);
-    let core_selected = model.select(&core_options).unwrap_or_else(|_| abort());
+    // V0.19: fixed CPU1 control plane. No AI model evaluates a grow/shrink
+    // target; legacy ABI2 keeps its upper output field pinned to 0b10.
     let dynamic = input[1] == 2;
     let output = [
         OUTPUT_MAGIC,
@@ -109,20 +109,12 @@ extern "C" fn _start(mode: u64) -> ! {
         input[3],
         selected as u64
             | if dynamic {
-                (if core_selected == 0 { 2 } else { 6 }) << 8
+                2 << 8
             } else {
                 0
             },
-        model.score(if dynamic {
-            &core_options[0]
-        } else {
-            &candidates[0]
-        }) as u16 as u64,
-        model.score(if dynamic {
-            &core_options[1]
-        } else {
-            &candidates[1]
-        }) as u16 as u64,
+        model.score(&candidates[0]) as u16 as u64,
+        model.score(&candidates[1]) as u16 as u64,
         input[14],
     ];
     for (i, value) in output.into_iter().enumerate() {

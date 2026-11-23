@@ -54,6 +54,35 @@ impl<const C: usize, const D: usize> Manager<C, D> {
             last_time: 0,
         })
     }
+    /// Read-only auxiliary review of independently authenticated Operations
+    /// and Security AI suggestions. EL1 builds the trusted scope; a reviewed
+    /// candidate is NOT a policy, capability, executor instruction or approval.
+    /// Publication remains confined to submit()/the native policy ledger.
+    pub fn review_brains<const A: usize>(
+        &self,
+        pair: &super::fixed::Pair,
+        rules: &super::advisory::Controller<A>,
+        domain: usize,
+        subject: Identity,
+        now: u64,
+    ) -> Result<super::fixed::Review, Error> {
+        self.check_time(now)?;
+        let snapshot = self.snapshot();
+        if !self.ownership.fixed_control()
+            || snapshot.control != super::fixed::CONTROL_MASK
+            || snapshot.phase != super::cores::Phase::Stable
+            || !snapshot.permits(super::fixed::CONTROL_CPU, Plane::Control)
+            || !subject.valid()
+        {
+            return Err(Error::Denied);
+        }
+        pair.review(rules, super::advisory::TrustedScope {
+            epochs: self.epochs,
+            domain,
+            target: subject,
+            now_ns: now,
+        })
+    }
     pub const fn epochs(&self) -> Epochs {
         self.epochs
     }

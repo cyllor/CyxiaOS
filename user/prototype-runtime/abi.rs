@@ -36,7 +36,8 @@ pub fn candidates(delta: [u64; 2]) -> [[i16; 64]; 2] {
     out
 }
 
-/// Score fixed candidate identities [one control core, two control cores].
+/// Legacy 1.3 test fixture only; V0.19 no longer calls this to choose
+/// a control core count. The native controller remains pinned to CPU1.
 pub fn core_candidates(backlog: u64) -> [[i16; 64]; 2] {
     let mut out = [[0; 64]; 2];
     // Same local MLP and stable argmax as resource selection. These are candidate
