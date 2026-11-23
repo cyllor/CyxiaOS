@@ -1,0 +1,50 @@
+name: V0.19 core advisory smoke (NOT release acceptance)
+
+on:
+  push:
+    branches: [CyxiaOS-V0.19]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v019-advisory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisory-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Assert WIP version and v18 snapshot inheritance
+        run: |
+          test "$(cat VERSION)" = 0.19.0-dev
+          test -f crates/prototype/src/snapshot/manager.rs
+          test -f crates/kernel-core/src/control_plane/advisory.rs
+          git diff --check HEAD^ HEAD
+      - name: Core control and advisory tests
+        run: cargo test --locked --offline -p cyxia-kernel-core
+      - name: Archive exact branch commit (not a release)
+        if: always()
+        run: |
+          mkdir -p artifacts/v019-wip-source
+          git rev-parse HEAD > artifacts/v019-wip-source/commit.txt
+          git archive --format=tar.gz --prefix=CyxiaOS-V0.19/ --output=artifacts/v019-wip-source/source.tar.gz HEAD
+          sha256sum artifacts/v019-wip-source/source.tar.gz > artifacts/v019-wip-source/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v019-wip-source-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v019-wip-source/
