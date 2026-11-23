@@ -171,13 +171,16 @@ pub(super) fn prepare(
     len: usize,
     write: bool,
 ) -> Result<(), Error> {
-    let end = address
-        .checked_add(len as u64)
-        .filter(|end| *end <= USER_LIMIT)
-        .ok_or(Error::Range)?;
+    // SEC-S01/S02: check pointer arithmetic before touching any page or
+    // user-owned memory. The syscall adapter still enforces task ownership,
+    // mappings, PTE permissions and reclaim/TLB synchronization below.
     if len == 0 {
         return Ok(());
     }
+    let (_, end) = cyxia_kernel_core::security::syscall::user_copy_span(
+        address, len, 0, USER_LIMIT, usize::MAX,
+    )
+    .map_err(|_| Error::Range)?;
     let mut backend = Pages {
         tasks,
         remote,

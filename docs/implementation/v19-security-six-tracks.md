@@ -52,3 +52,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 给实际事务/队列/进程/映射加线性化点、必要停止/FLUSH/ACK 栅栏，并保持固定容量； 
 - 完成 ABI/磁盘/对象格式冻结、编译和静态/单元测试，再跑原生负向及 J01–J12 矩阵；
 - 按 `AI_DISABLED`、`SHADOW`、`ASSISTED` 分别保存可核验结果；任何强制项 FAIL 或 NOT_RUN 时不可宣布“六大安全专项实施完成”。
+
+## G2 接线增量：可信入口（AArch64 原生运行时）
+
+- `kernel/src/runtime/tasks/domain_tasks/abi.rs` 的批量只读请求在读取到**内核私有稳定副本**后、分配 vector ID 与执行服务 preflight 之前，调用 `security::syscall::validate_readonly_batch` 校验批次长度、flags、合法 opcode 与 tag 唯一性。对象/能力代际等由既有 `ServiceBatch::preflight/resolve` 逐项裁决，避免错误的全批回滚。
+- `kernel/src/runtime/tasks/domain_tasks/memory.rs` 的用户复制准备阶段已使用 `security::syscall::user_copy_span` 做可溢出地址范围拒绝；页实际归属、访问权限和缺页处理仍由原生 pager 校验。
+- 旧本机业务接口 19/20（跨节点放置、结果查询）现在在内核 syscall 入口**直接返回 Unsupported**，不会接收远端任务、授予资源或触碰用户缓冲区。其余 `unified-runtime` 集群代码仍在，故不能声称已移除整个分布式系统。
+- 这是代码接线，不是运行保证；必须由目标 AArch64 构建、用户态伪造调用、非法/旧能力与链路断开注入证明真实拒绝。安全引擎、权限记录和审计上限未被扩容。

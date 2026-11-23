@@ -60,16 +60,38 @@ pub struct ReadOperation {
 }
 pub const FILE_STAT_BY_CAP:u16=1;
 pub const TASK_QUERY_BY_CAP:u16=2;
-pub fn validate_vector(items:&[ReadOperation]) -> Result<(),Error> {
-    if items.is_empty() || items.len()>MAX_VECTOR {return Err(Error::Invalid);}
-    for (at,item) in items.iter().enumerate() {
-        if item.flags!=0
-            || !matches!(item.op,FILE_STAT_BY_CAP | TASK_QUERY_BY_CAP)
-            || item.capability==0 || item.generation==0
-            || items[..at].iter().any(|prior|prior.tag==item.tag)
-        {return Err(Error::Invalid);}
+/// Format-only preflight for a frozen, copied readonly vector. This is a
+/// fixed-cost validator without extra stack buffers; the trusted caller
+/// supplies a stable snapshot, not a live EL0 pointer.
+/// Capability validity and object generations are *per-item* failures and
+/// MUST NOT reject the whole vector or roll back unrelated completed items.
+pub fn validate_readonly_batch(
+    count: usize,
+    item: impl Fn(usize) -> (u16, u16, u64),
+) -> Result<(), Error> {
+    if count == 0 || count > MAX_VECTOR {
+        return Err(Error::Invalid);
+    }
+    for at in 0..count {
+        let (op, flags, tag) = item(at);
+        if flags != 0 || !matches!(op, FILE_STAT_BY_CAP | TASK_QUERY_BY_CAP) {
+            return Err(Error::Invalid);
+        }
+        for earlier in 0..at {
+            if item(earlier).2 == tag {
+                return Err(Error::Invalid);
+            }
+        }
     }
     Ok(())
+}
+/// The model-facing typed adapter uses the same format gate as the native
+/// vector decoder, without treating a missing/stale cap as a global error.
+pub fn validate_vector(items: &[ReadOperation]) -> Result<(), Error> {
+    validate_readonly_batch(items.len(), |at| {
+        let item = &items[at];
+        (item.op, item.flags, item.tag)
+    })
 }
 
 /// Construct only from EL1 protected identity. Neither AI scores nor a
@@ -189,8 +211,16 @@ mod tests {
         assert_eq!(validate_vector(&ops),Err(Error::Invalid));
     }
     #[test]fn sec_s07_vector_tags_stable_and_single_item_does_not_cancel_peer(){
-        let ops=[item(1),ReadOperation{op:TASK_QUERY_BY_CAP,..item(2)}];
+        let ops=[
+            ReadOperation { capability: 0, generation: 0, ..item(1) },
+            ReadOperation { op: TASK_QUERY_BY_CAP, ..item(2) },
+        ];
+        // This is structurally legal: the first item's missing cap is an
+        // authorization error for that item, not an all-vector format error.
         validate_vector(&ops).unwrap();
+        assert_eq!(validate_readonly_batch(2, |at| {
+            (ops[at].op, ops[at].flags, ops[at].tag)
+        }), Ok(()));
         let results=[Err(Error::Stale),Ok(5u64)];
         assert!(results[0].is_err());
         assert_eq!(results[1],Ok(5));

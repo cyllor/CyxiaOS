@@ -487,6 +487,16 @@ pub(super) fn syscall_locked(
                     tag: u64::from_le_bytes(row[24..32].try_into().unwrap()),
                 };
             }
+            // SEC-S06: validate the *entire frozen input* before any IPC or
+            // resource side effect. No extra stack copy is needed: this
+            // closure reads only the kernel-owned decoded item table.
+            // Invalid capabilities/generations are per-item outcomes in the
+            // existing service executor, NOT whole-vector format failures.
+            cyxia_kernel_core::security::syscall::validate_readonly_batch(count, |at| {
+                let item = &items[at];
+                (item.op, item.flags, item.tag)
+            })
+            .map_err(|_| Error::Format)?;
             let id = s.vector_ids[i].checked_add(1).ok_or(Error::Overflow)?;
             s.services
                 .preflight(task.key, &items[..count], args[2], now_ns())?;
@@ -605,36 +615,12 @@ pub(super) fn syscall_locked(
                 return Err(Error::Auth);
             }
         }
-        19 => {
-            let len = usize::try_from(args[2]).map_err(|_| Error::Range)?;
-            if args[0] == 0
-                || len == 0
-                || len > 3984
-                || !len.is_multiple_of(8)
-                || args[3] != 0
-                || args[4] != 0
-            {
-                return Err(Error::Range);
-            }
-            let mut bytes = [0; 3984];
-            read(s, task.key, args[1], &mut bytes[..len])?;
-            let key =
-                crate::domain_network::submit_placement_request(task.key, args[0], &bytes[..len])?;
-            context.regs[1] = key.id;
-            context.regs[2] = key.generation;
-        }
-        20 => {
-            if args[2..].iter().any(|value| *value != 0) {
-                return Err(Error::Format);
-            }
-            let result = crate::domain_network::placement_request_status(
-                task.key,
-                ObjectKey {
-                    id: args[0],
-                    generation: args[1],
-                },
-            )?;
-            context.regs[1..4].copy_from_slice(&result);
+        19 | 20 => {
+            // V0.19: old remote placement/request-status entry points are
+            // permanently closed before parsing user memory or submitting an
+            // asynchronous cross-node operation. Keeping the numeric slots
+            // reserved avoids silently reinterpreting stale client requests.
+            return Err(Error::Unsupported);
         }
         21 => {
             if args[1..].iter().any(|value| *value != 0) {
