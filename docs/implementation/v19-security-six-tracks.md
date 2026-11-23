@@ -1,0 +1,54 @@
+# CyxiaOS V0.19 — 六大安全专项代码实施与证据边界
+
+状态：**WIP / 未通过 G2–G4 原生验收**。本文件对应《CyxiaOS V0.19 六大安全方向并行细化设计》（2026-11-23），不更改现有 syscall ABI、PolicyEnvelope、PlanHeader、磁盘格式或 D01–D15 动作集合。原有分布式 D16/集群运行时代码仍须在独立的单机化变更中移除。
+
+## 源代码
+
+| 专项 | 新增确定性机制 | 源码 | 单域主机测试 |
+| --- | --- | --- | --- |
+| SEC-P 进程安全 | 受限包/调用者与业务核准入、spawn 去重、退出/引用/TLB/DMA 栅栏 | `crates/kernel-core/src/security/process.rs` | `sec_p01`–`sec_p08` |
+| SEC-F 文件安全 | 路径字节边界、能力/代际/受保护系统对象、redo 提交阶段与 UNKNOWN 收据 | `.../security/file.rs` | `sec_f01`–`sec_f08` |
+| SEC-M 内存安全 | 帧归属、W^X/别名、清零门、TLB ACK 与 DMA pin/reference 退役 | `.../security/memory.rs` | `sec_m01`–`sec_m08` |
+| SEC-N 网络安全 | 本机只读 Echo 帧边界、限流/握手额度、TLS 版本与受限授权契约 | `.../security/network.rs` | `sec_n01`–`sec_n08` |
+| SEC-D 设备安全 | 有界描述符租约、完成/复位证据、UNKNOWN 资源留存、IRQ 路由合法性 | `.../security/device.rs` | `sec_d01`–`sec_d08` |
+| SEC-S 系统调用安全 | 已有调用号白名单、稳定复制、svc_submitv 输入前检、角色检查、幂等终态 | `.../security/syscall.rs` | `sec_s01`–`sec_s08` |
+
+共 48 个单域 **主机契约** 测试函数，以及 12 个 `j01`–`j12` 跨模块**主机模型**测试。测试名称不意味着满足同名 SEC/J 的原生设备/负载/故障注入验收：例如 SEC-N01 的真实 TLS 签名、SEC-N07 的密钥泄漏观测、SEC-F05 的掉电 FLUSH 和 SEC-D05 的真实设备复位均须在受保护客体中独立证明。
+
+### 当前实际接线
+
+- `control_plane::manager::actor` 的唯一发布者检查调用 `security::syscall::can_publish`，保留既有控制核权限检查。
+- 其余五域的纯机制对象**尚未**全部连接至内核 syscall/EL0、地址空间装载、VirtIO/TLS/文件持久化执行器。
+- `VerifiedTls`、`ReliableReset`、`CompletionProof` 和 `SharedGrant` 的内部构造器只表示预期的可信调用边界；不能由此宣称已有实际 TLS/IRQ/TLB/设备停止的硬件证据。
+- `SpawnLedger`、`DurableReceipts` 和 `ReceiptTable` 的有界历史空间不会自动回收；生产接线前必须冻结墓碑保留/重放水位与资源背压策略，禁止静默淘汰 UNKNOWN。
+- 既有 `cyxia-prototype` 域机制、V0.18 不可变日志快照和原生执行器保持原状；没有使用本补丁更改磁盘记录或宣称 fsync 已经过新 SEC-F 审核。
+- V0.18 独立内存安全增量 `fd526faff0517d06baca99073a0536f99f7cb13c` 仍须拿到源码、比对、合入并复测，不能用此模块充当那个补丁。
+
+## 验收关口（原设计 G0–G4）
+
+| 门槛 | 状态 | 现有证据与缺口 |
+| --- | --- | --- |
+| G0 基线与 ABI 冻结 | **PARTIAL** | V0.19 分支和新模块未扩 ABI；原有历史设计与新设计 v2 协议仍需逐项冻结对账 |
+| G1 对象/权限/收据契约 | **PARTIAL** | 六域安全数据结构已加入源码；DEC-01–05 和实际角色/能力绑定需冻结 |
+| G2 六域原生代码 | **NOT_RUN** | 主机机制代码已写入；EL1/EL0 全域接线、故障注入、可信 TLS 与 DMA 证据未完成 |
+| G3 十二项跨域交错 | **NOT_RUN** | 仅 J01–J12 主机模型测试代码；真实 CPU/IPI/TLB/DMA/断电并发尚未执行 |
+| G4 全系统安全验收 | **NOT_RUN** | 原 A/E/H 强制用例、48 SEC 和 12 J 的原生 PASS 及三 AI 模式证据缺失 |
+
+本提交环境无可执行的 Rust 工具链或 QEMU；任何测试命令都 **未被本提交者执行**，GitHub Actions 后续的报告也不能自动替代客体故障验收。
+
+## 主机检查命令（执行后须留记录）
+
+```sh
+cargo test --locked --offline -p cyxia-kernel-core --lib security::
+cargo test --locked --offline -p cyxia-kernel-core --test control_plane
+cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
+```
+
+对每个 SEC/J 原生用例，必须另记录源码/模型/Schema/RuleProfile/镜像 hash、客体平台和 AI 模式、种子与故障时刻、原始对象/代际、权限拒绝、前后账本、真实完成/保留证据及独立判定器版本。缺任一完整链路不得置 PASS。网络仅取得只读回声权限；AI 从不取得安全拒绝、资源授予、页表、设备停止或文件持久化的裁决权。
+
+## 下一项可合并条件
+
+- 在单机版原生内核中用受保护的任务/能力/文件/帧/设备/网络注册表构造上述证据，不接受业务或 AI 伪造的字段；
+- 给实际事务/队列/进程/映射加线性化点、必要停止/FLUSH/ACK 栅栏，并保持固定容量； 
+- 完成 ABI/磁盘/对象格式冻结、编译和静态/单元测试，再跑原生负向及 J01–J12 矩阵；
+- 按 `AI_DISABLED`、`SHADOW`、`ASSISTED` 分别保存可核验结果；任何强制项 FAIL 或 NOT_RUN 时不可宣布“六大安全专项实施完成”。

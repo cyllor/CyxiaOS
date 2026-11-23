@@ -68,7 +68,15 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         }
     }
     fn actor(&self, actor: Identity, cpu: usize) -> Result<(), Error> {
-        if actor != self.publisher || !self.snapshot().permits(cpu, Plane::Control) {
+        // SEC-S04: a protected local publisher identity, never an AI proposal
+        // or a claimed network identity, is the only admissible submitter.
+        let caller = crate::security::syscall::ProtectedRole::from_kernel(actor.id, actor.generation);
+        let owner = crate::security::syscall::ProtectedRole::from_kernel(
+            self.publisher.id, self.publisher.generation,
+        );
+        if crate::security::syscall::can_publish(caller, owner).is_err()
+            || !self.snapshot().permits(cpu, Plane::Control)
+        {
             Err(Error::Denied)
         } else {
             Ok(())
