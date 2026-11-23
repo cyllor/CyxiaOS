@@ -5,9 +5,10 @@ edition = "2024"
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:ring", "dep:getrandom"]
+tls = ["dep:rustls", "dep:ring", "dep:getrandom", "dep:cyxia-net-transport", "cyxia-net-transport/tls"]
 
 [dependencies]
+cyxia-net-transport = { path = "../net-transport", default-features = false, optional = true }
 cyxia-driver-virtio = { path = "../driver-virtio" }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"], optional = true }

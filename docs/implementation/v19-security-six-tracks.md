@@ -85,3 +85,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `crates/prototype/tests/journal.rs` 增加 SEC-F01 原生文件系统模型的无副作用非法路径测试；CI 还运行整个 journal 断电/两次 FLUSH/重启测试文件，保留现有不可变快照回归。
 - `crates/driver-virtio/src/block/batched.rs` 增加真实 split-ring 模拟的部分完成、另一个请求超过 250ms 超时测试：仅已证实完成的 token 可单独 ACK，未知在途描述符及 DMA 缓冲维持占用，队列失效并拒新 I/O。
 - 以上均属于主机可复现机制与模拟故障验证，**不是**在 AArch64 QEMU 中证明物理 DMA 停止，也不是完整 SEC-F05/SEC-D05 的原生验收。
+
+### G2 单机网络/TLS 协议隔离增量（本次）
+
+- 新增独立 `crates/net-transport`：将原来集群包中的同一份 rustls TLS 1.3 双向 Ed25519 钉扎、X25519、密钥清除及无恢复票据实现**迁到无集群依赖的基础库**。旧 `cyxia-cluster-transport::tls` 只做兼容 re-export，保持旧 ABI/ALPN 和既有历史测试可用，避免两套不一致的 TLS 安全实现。
+- `Pairing::new_local_echo` 使用独立的 `cyxia-echo/1` ALPN；旧 `Pairing::new` 仍保留历史 `cyxia-cluster/1`。只有实际钉扎 TLS 握手完成且会话协议为单机 Echo 时，`Session::accept_local_echo` 才允许解析已解密应用字节；在握手前或旧集群会话中拒绝。
+- `crates/net-transport/src/echo.rs` 仅支持固定 16 字节小端头和 `READONLY_ECHO=1`、最大 4096 字节正文。精确长度/版本/操作码检查；任务、远程放置、资源授权、文件修改以及 Plan 发布操作没有任何解码入口。
+- CI 新增从独立包执行的完整 TLS 测试、legacy TLS 兼容测试，及相应源代码守卫。此增量**不是**原生 EL0 Echo 服务或可认证设备 TCP/TLS 运行验收；单机网络实体执行、16/4 连接额度、来源限流、实际证书配置和 QEMU 故障交错仍需 G2/G3 证明。

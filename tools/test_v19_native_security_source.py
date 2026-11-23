@@ -76,6 +76,18 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("every_recovery_write_and_flush_boundary_preserves_acknowledged_fsync_sequence", journal)
         self.assertIn("v019_sec_f01_direct_filesystem_rejects_ambiguous_path_without_disk_effect", journal)
 
+    def test_local_echo_tls_is_protocol_isolated_from_cluster_rpc(self):
+        source = (ROOT / "crates/net-transport/src/tls.rs").read_text(encoding="utf-8")
+        echo = (ROOT / "crates/net-transport/src/echo.rs").read_text(encoding="utf-8")
+        legacy = (ROOT / "crates/cluster-transport/src/tls.rs").read_text(encoding="utf-8")
+        assert "cyxia-echo/1" in source and "cyxia-cluster/1" in source
+        assert "new_local_echo" in source and "accept_local_echo" in source
+        assert "authenticated_peer().is_none()" in source
+        assert "READONLY_ECHO: u16 = 1" in echo
+        assert "MAX_PAYLOAD: usize = 4096" in echo
+        assert "cyxia_net_transport::tls::*" in legacy
+        assert "cluster_id" not in echo and "remote" not in echo
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

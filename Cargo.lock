@@ -125,6 +125,7 @@ name = "cyxia-cluster-transport"
 version = "0.1.0"
 dependencies = [
  "cyxia-driver-virtio",
+ "cyxia-net-transport",
  "getrandom",
  "ring",
  "rustls",
@@ -188,6 +189,15 @@ dependencies = [
  "cyxia-contracts",
  "cyxia-control-model",
  "cyxia-prototype",
+]
+
+[[package]]
+name = "cyxia-net-transport"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "ring",
+ "rustls",
 ]
 
 [[package]]

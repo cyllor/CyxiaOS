@@ -1,0 +1,13 @@
+[package]
+name = "cyxia-net-transport"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:ring", "dep:getrandom"]
+
+[dependencies]
+rustls = { version = "=0.23.45", default-features = false, features = ["ring"], optional = true }
+ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"], optional = true }
+getrandom = { version = "=0.2.17", default-features = false, features = ["custom"], optional = true }

@@ -43,6 +43,10 @@ jobs:
           cargo test --locked --offline -p cyxia-driver-virtio
           cargo test --locked --offline -p cyxia-prototype --test journal
           cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
+      - name: Independent local Echo TLS and legacy TLS compatibility
+        run: |
+          cargo test --locked --offline -p cyxia-net-transport --features tls
+          cargo test --locked --offline -p cyxia-cluster-transport --features tls
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)
