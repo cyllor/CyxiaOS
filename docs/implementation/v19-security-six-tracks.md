@@ -59,3 +59,9 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `kernel/src/runtime/tasks/domain_tasks/memory.rs` 的用户复制准备阶段已使用 `security::syscall::user_copy_span` 做可溢出地址范围拒绝；页实际归属、访问权限和缺页处理仍由原生 pager 校验。
 - 旧本机业务接口 19/20（跨节点放置、结果查询）现在在内核 syscall 入口**直接返回 Unsupported**，不会接收远端任务、授予资源或触碰用户缓冲区。其余 `unified-runtime` 集群代码仍在，故不能声称已移除整个分布式系统。
 - 这是代码接线，不是运行保证；必须由目标 AArch64 构建、用户态伪造调用、非法/旧能力与链路断开注入证明真实拒绝。安全引擎、权限记录和审计上限未被扩容。
+
+## G2 增量：SEC-P/SEC-M 原生强制入口（本次）
+
+- SEC-P 在 AArch64 的 `Creator::authorize` 和 `Creator::build` 中复用 `security::process::authorize_business_core`，由原生 `CpuLayout`（已排除 draining）核验健康业务核心及配置代际；请求不能凭模型建议把新任务放入 C/T/Q 核。真正的调度承诺、资源账户与 rollback 仍由原 `SpawnAdmission` 和 scheduler 完成，不建立并行账本。
+- SEC-M 在原生 `Pages::map` 和 `Pages::revoke` 前验证 frame 不属于启动期页表/代码保留前缀或物理池外；拒绝时不发布新 PTE，也不释放仍受账本监管的页。真实 owner、清零、全局 TLBI/DSB/ISB 仍来自既有 `Memory` 与架构层。
+- 两处增加了纯单元负向测试，验证错误 CPU、draining、quarantine、错误代际以及保护帧/越界帧的拒绝。**测试通过不构成“所有 DMA/TLB ACK 已实施”或真实 SMP 故障注入通过**。

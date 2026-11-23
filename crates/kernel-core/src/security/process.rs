@@ -45,6 +45,27 @@ impl VerifiedSpawn {
             && cpu & self.business & self.healthy & !self.draining & !self.suspect != 0
     }
 }
+
+/// Gate for the actual native business-core placement. A snapshot is supplied
+/// by the protected scheduler/ownership adapter, never by the AI or a task.
+/// It is checked again at creation publication; it does not reserve a CPU.
+pub fn authorize_business_core(
+    cpu: u16,
+    core_generation: u64,
+    business_mask: u64,
+    healthy_mask: u64,
+    draining_mask: u64,
+    quarantined_mask: u64,
+) -> Result<(), Error> {
+    let bit = 1u64.checked_shl(u32::from(cpu)).ok_or(Error::Invalid)?;
+    if core_generation == 0
+        || bit & business_mask & healthy_mask & !draining_mask & !quarantined_mask == 0
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ticket {
     pub slot: u16,
@@ -220,6 +241,14 @@ mod tests {
         l.publish_runnable(t, cap()).unwrap();
         l.begin_exit(t, 0, 0).unwrap();
         assert_eq!(l.hold_ref(t), Err(Error::Busy));
+    }
+    #[test] fn native_business_core_guard_refuses_draining_quarantine_and_wrong_generation() {
+        assert_eq!(authorize_business_core(2, 1, 0b1100, 0b1100, 0, 0), Ok(()));
+        assert_eq!(authorize_business_core(2, 0, 0b1100, 0b1100, 0, 0), Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(2, 1, 0b1100, 0b1100, 0b0100, 0), Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(2, 1, 0b1100, 0b1100, 0, 0b0100), Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(1, 1, 0b1100, 0b1100, 0, 0), Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core(64, 1, u64::MAX, u64::MAX, 0, 0), Err(Error::Invalid));
     }
     #[test] fn sec_p08_no_ai_required_for_local_admission() {
         let mut l = SpawnLedger::<1>::new();

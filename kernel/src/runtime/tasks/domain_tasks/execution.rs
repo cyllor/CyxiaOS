@@ -188,6 +188,19 @@ impl Creator<'_> {
     ) -> Result<(), Error> {
         trace.step(10); // Original immutable launch lookup.
         let launch = &self.launches[self.launch(r)?];
+        // SEC-P06: admission's CPU budget reservation is not enough on its own.
+        // Recheck current native business ownership before any task/PTE side
+        // effects. The held task gate prevents a concurrent core handoff
+        // between this check and the final runnable publication.
+        cyxia_kernel_core::security::process::authorize_business_core(
+            launch.cpu,
+            self.layout.generation,
+            self.layout.business_mask,
+            self.layout.healthy_mask,
+            0, // already masked by effective_layout
+            0, // quarantines remain checked by the scheduler
+        )
+        .map_err(|_| Error::NotReady)?;
         let client = r.package == CLIENT_PACKAGE || r.package == MEMORY_PACKAGE;
         let memory_client = r.package == MEMORY_PACKAGE;
         let local = r.caller == CLUSTER_CALLER;
@@ -508,7 +521,15 @@ impl TaskBackend for Creator<'_> {
             return Err(Error::Auth);
         }
         if !(2..=3).contains(&launch.cpu)
-            || self.layout.business_mask & self.layout.healthy_mask & (1u64 << launch.cpu) == 0
+            || cyxia_kernel_core::security::process::authorize_business_core(
+                launch.cpu,
+                self.layout.generation,
+                self.layout.business_mask,
+                self.layout.healthy_mask,
+                0, // effective_layout already removes draining CPUs
+                0, // scheduler independently enforces its quarantine mask
+            )
+            .is_err()
         {
             return Err(Error::NotReady);
         }

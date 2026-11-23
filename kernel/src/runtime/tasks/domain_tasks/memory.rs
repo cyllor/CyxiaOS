@@ -102,6 +102,15 @@ impl MemoryBackend for Pages<'_> {
         frame: usize,
         writable: bool,
     ) -> Result<(), Error> {
+        // SEC-M01: an ordinary EL0 mapping must never draw a frame from
+        // the kernel's boot-time page-table or executable loader pool.
+        // The memory owner ledger separately proves owner, quota and zeroing.
+        cyxia_kernel_core::security::memory::authorize_data_frame_slot(
+            frame,
+            TABLE_PAGES + CODE_PAGES,
+            PAGES,
+        )
+        .map_err(|_| Error::Auth)?;
         let entry = self.entry(owner, address)?;
         let value = mmu::encode_user_leaf(PhysAddr(frame_phys(frame)?), writable, false)
             .map_err(|_| Error::Range)?;
@@ -115,6 +124,14 @@ impl MemoryBackend for Pages<'_> {
         Ok(())
     }
     fn revoke(&mut self, owner: ObjectKey, address: u64, frame: usize) -> Result<(), Error> {
+        // SEC-M04: a corrupted protected-frame index must fail closed;
+        // the caller retains ledger custody when this check rejects.
+        cyxia_kernel_core::security::memory::authorize_data_frame_slot(
+            frame,
+            TABLE_PAGES + CODE_PAGES,
+            PAGES,
+        )
+        .map_err(|_| Error::Auth)?;
         let entry = self.entry(owner, address)?;
         let physical = frame_phys(frame)?;
         unsafe {

@@ -34,8 +34,10 @@ jobs:
           test -f crates/prototype/src/snapshot/manager.rs
           test -f crates/kernel-core/src/control_plane/advisory.rs
           git diff --check HEAD^ HEAD
-      - name: Core control and advisory tests
+      - name: Core control and six-track host contract tests
         run: cargo test --locked --offline -p cyxia-kernel-core
+      - name: Native source wiring regression (NOT a native pass)
+        run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)
         if: always()
         run: |

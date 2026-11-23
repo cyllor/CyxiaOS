@@ -70,6 +70,24 @@ pub fn checked_user_span(
     if base < window_base || end > window_end { return Err(Error::Unauthorized); }
     Ok((base, end))
 }
+
+/// The privileged mapper may only publish ordinary data/progress pool frames,
+/// never the initial protected page-table or executable loader frame prefix.
+/// The native memory ledger remains responsible for owner, pin and zero proofs.
+pub fn authorize_data_frame_slot(
+    frame: usize,
+    protected_prefix_pages: usize,
+    physical_pool_pages: usize,
+) -> Result<(), Error> {
+    if protected_prefix_pages == 0 || protected_prefix_pages >= physical_pool_pages {
+        return Err(Error::Invalid);
+    }
+    if frame < protected_prefix_pages || frame >= physical_pool_pages {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Shootdown {
     pub request_id: u64,
@@ -184,7 +202,13 @@ mod tests {
         s.release_reference().unwrap();
         assert!(s.may_reuse());
     }
-    #[test] fn sec_m08_stale_tlb_generation_not_an_ack() {
+    #[test] fn native_frame_pool_guard_blocks_tables_loader_and_overflow() {
+        assert_eq!(authorize_data_frame_slot(17, 16, 256), Ok(()));
+        assert_eq!(authorize_data_frame_slot(15, 16, 256), Err(Error::Unauthorized));
+        assert_eq!(authorize_data_frame_slot(256, 16, 256), Err(Error::Unauthorized));
+        assert_eq!(authorize_data_frame_slot(17, 256, 256), Err(Error::Invalid));
+    }
+
         let mut s = Shootdown::begin(1, 2, 1, 0, 0, 0).unwrap();
         s.revoke_pte();
         assert_eq!(s.acknowledge(1, 1, 0), Err(Error::Stale));
