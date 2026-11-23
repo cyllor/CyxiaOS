@@ -63,6 +63,19 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("self.pending[at] = None;", src)
         self.assertIn("native_sec_d06_completion_keeps_exact_token_until_valid_ack", src)
 
+    def test_internal_filesystem_path_cannot_normalize_empty_components(self):
+        src = source(ROOT / "crates/prototype/src/domains/filesystem.rs")
+        self.assertIn("for part in path[1..].split('/')", src)
+        self.assertIn("part.is_empty()", src)
+        self.assertNotIn("path.split('/').filter(|s| !s.is_empty())", src)
+
+    def test_real_journal_power_cut_matrix_is_in_ci_scope(self):
+        workflow = source(ROOT / ".github/workflows/v19-advisory-smoke.yml")
+        self.assertIn("--test journal", workflow)
+        journal = source(ROOT / "crates/prototype/tests/journal.rs")
+        self.assertIn("every_recovery_write_and_flush_boundary_preserves_acknowledged_fsync_sequence", journal)
+        self.assertIn("v019_sec_f01_direct_filesystem_rejects_ambiguous_path_without_disk_effect", journal)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

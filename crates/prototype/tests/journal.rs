@@ -1471,3 +1471,62 @@ fn invalid_unknown_io_and_corrupt_crc_reads_never_publish_cpu_progress() {
         assert!(!journal.is_writable());
     }
 }
+
+#[test]
+fn v019_sec_f01_direct_filesystem_rejects_ambiguous_path_without_disk_effect() {
+    use cyxia_prototype::{
+        boot::BootSession,
+        domains::{Error as DomainError, filesystem::FileSystem},
+    };
+    // Keep the fixed-size native-shaped filesystem and journal off the small
+    // default host-test thread stack. No fake capability or AI is involved.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut disk, mut journal) = mounted();
+            BootSession::new()
+                .allocate(
+                    &mut journal,
+                    &mut disk,
+                    &mut scratch(),
+                    &mut [[0; BLOCK_SIZE]; 4],
+                )
+                .unwrap();
+            let mut files = FileSystem::<64>::new();
+            files.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
+            files.initialize_business(&mut journal, &mut disk, &mut scratch())
+                .unwrap();
+            let durable_before = journal.last_commit_lsn();
+            disk.operations.clear();
+            for invalid in [
+                "//a", "/a//b", "/a/", "/./a", "/a/../b", "/a/.", "/a/..",
+            ] {
+                assert_eq!(
+                    files.create(invalid, &mut journal, &mut disk, &mut scratch()),
+                    Err(DomainError::Format),
+                    "ambiguous path {invalid:?}"
+                );
+                assert_eq!(journal.last_commit_lsn(), durable_before);
+                assert!(disk.operations.is_empty(), "path {invalid:?} had disk side effects");
+            }
+            assert_eq!(
+                files.create("/a\0b", &mut journal, &mut disk, &mut scratch()),
+                Err(DomainError::Range),
+            );
+            let excessive = format!("/{}", "a".repeat(512));
+            assert_eq!(
+                files.create(&excessive, &mut journal, &mut disk, &mut scratch()),
+                Err(DomainError::Range),
+            );
+            assert!(journal.is_writable());
+            assert!(disk.operations.is_empty());
+            // Valid ordinary creation still goes through the existing redo,
+            // bitmap, inode and flush protocol after the guard.
+            files.create("/valid", &mut journal, &mut disk, &mut scratch())
+                .unwrap();
+            assert!(journal.last_commit_lsn() > durable_before);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

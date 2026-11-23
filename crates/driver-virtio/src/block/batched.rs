@@ -472,6 +472,43 @@ mod tests {
         assert_eq!(b.acknowledge(token), Err(Error::Response));
     }
 
+
+    #[test]
+    fn native_sec_d04_partial_completion_and_timeout_keep_unknown_dma_pinned() {
+        let (mut block, platform, memory_base) = fixture();
+        block.set_notify_policy(2, 10, 1_000_000, 0).unwrap();
+        let first = block
+            .begin(Operation::Read(0), &[0; 512], false, false, &platform)
+            .unwrap();
+        let second = block
+            .begin(Operation::Read(1), &[0; 512], false, false, &platform)
+            .unwrap();
+        assert_ne!(first, second);
+        unsafe { complete(memory_base, first.slot, true, 0) };
+        let mut out = [0; 512];
+        let finished = block.poll(&mut out, &platform).unwrap().unwrap();
+        assert_eq!(finished.token, first);
+        assert_eq!(out, [0x5a; 512]);
+        assert_eq!(block.free(), block.capacity() - 2);
+        // Only the first request has a checked device completion. After the
+        // other times out, the second request's descriptor and DMA pages must
+        // never be reused or inferred cancelled.
+        platform.clock.set(250_000_000);
+        assert_eq!(block.poll(&mut out, &platform), Err(Error::Timeout));
+        assert!(!block.is_quiescent());
+        assert_eq!(block.free(), block.capacity() - 2);
+        assert_eq!(
+            block.begin(Operation::Read(2), &[0; 512], true, true, &platform),
+            Err(Error::Device)
+        );
+        assert_eq!(block.acknowledge(second), Err(Error::Response));
+        // The independent first completion is proven; returning its pages
+        // does not turn the still-unknown second request into a free slot.
+        block.acknowledge(first).unwrap();
+        assert!(!block.is_quiescent());
+        assert_eq!(block.free(), block.capacity() - 1);
+    }
+
     #[test]
     fn invalid_device_status_never_releases_or_acknowledges_policy() {
         let (mut b, p, m) = fixture();

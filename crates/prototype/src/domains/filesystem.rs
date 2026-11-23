@@ -599,11 +599,18 @@ impl<const C: usize> FileSystem<C> {
         self.check_journal(j)
     }
     fn path(path: &str) -> Result<(), Error> {
+        // SEC-F01: enforce path structure even for direct internal callers,
+        // not just the EL0 file broker. Do not normalize ambiguous separators:
+        // an empty component must never silently change the directory anchor.
+        // Input is already UTF-8 because it is &str; limits are byte limits.
         if !path.starts_with('/') || path.len() > MAX_PATH || path.as_bytes().contains(&0) {
             return Err(Error::Range);
         }
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            if part.len() > 63 || part == "." || part == ".." {
+        if path == "/" {
+            return Ok(());
+        }
+        for part in path[1..].split('/') {
+            if part.is_empty() || part.len() > 63 || part == "." || part == ".." {
                 return Err(Error::Format);
             }
         }

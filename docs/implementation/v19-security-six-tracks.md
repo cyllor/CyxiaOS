@@ -78,3 +78,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `crates/driver-virtio/src/block/batched.rs` 的块设备完成已验证时保留原 token 的代际与完成占用，直到调用者 `acknowledge` 且 `queue.release` 成功才释放。本驱动复用原有 `pending` 槽，无新增缓冲或完成池；超时不会将已完成但未 ACK 的 DMA 误当成未完成并释放。
 - 新增 `native_sec_d06_completion_keeps_exact_token_until_valid_ack`，检查过早 ACK、失效代际、重复 ACK、延期 ACK 和真正可静默性；新增路径输入负向单元测试及源码接线回归。
 - 这些是实际原生入口的代码改动，但 *不等于* 真实掉电/恶意设备/DMA/TLS 故障验收。需在 AArch64 目标构建和 QEMU 注入下继续 G2/G3/G4。
+
+### G2 下一步：文件系统内部路径与设备部分完成超时（本轮）
+
+- `crates/prototype/src/domains/filesystem.rs` 的内部 `FileSystem::path` 也拒绝空组件、重复斜杠、尾部斜杠、`.`/`..`，且遵守 512/63 字节界限；这补足了已有 EL0 文件服务输入检查以外的直接内部调用边界，不新增磁盘格式或权限位。
+- `crates/prototype/tests/journal.rs` 增加 SEC-F01 原生文件系统模型的无副作用非法路径测试；CI 还运行整个 journal 断电/两次 FLUSH/重启测试文件，保留现有不可变快照回归。
+- `crates/driver-virtio/src/block/batched.rs` 增加真实 split-ring 模拟的部分完成、另一个请求超过 250ms 超时测试：仅已证实完成的 token 可单独 ACK，未知在途描述符及 DMA 缓冲维持占用，队列失效并拒新 I/O。
+- 以上均属于主机可复现机制与模拟故障验证，**不是**在 AArch64 QEMU 中证明物理 DMA 停止，也不是完整 SEC-F05/SEC-D05 的原生验收。

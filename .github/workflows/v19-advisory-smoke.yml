@@ -38,9 +38,10 @@ jobs:
         run: cargo test --locked --offline -p cyxia-kernel-core
       - name: Prototype scheduler and task lifecycle host tests
         run: cargo test --locked --offline -p cyxia-prototype --test domain_tasks
-      - name: VirtIO DMA/FLUSH and immutable snapshot host regressions
+      - name: VirtIO DMA/FLUSH, redo crash cuts and immutable snapshot regressions
         run: |
           cargo test --locked --offline -p cyxia-driver-virtio
+          cargo test --locked --offline -p cyxia-prototype --test journal
           cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
