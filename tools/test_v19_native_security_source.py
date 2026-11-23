@@ -114,6 +114,15 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("Action::ControlSet(mask) if mask != 0b10", native)
         self.assertIn("self.provenance.at(submission::Stage::Stamp)", native)
 
+    def test_sec_n_source_bound_active_credits_and_bounded_idle_eviction(self):
+        network = source(CORE / "network.rs")
+        self.assertIn("pub fn close_active_from(&mut self, ip: u32)", network)
+        self.assertIn("entry.active != 0", network)
+        self.assertIn("if self.active >= MAX_ACTIVE { return Err(Error::Capacity); }", network)
+        self.assertIn("source.inflight -= 1;", network)
+        self.assertIn("source.active -= 1;", network)
+        self.assertNotIn("pub fn close_active(&mut self)", network)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

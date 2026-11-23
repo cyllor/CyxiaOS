@@ -67,6 +67,7 @@ struct Source {
     last_second: u64,
     last_request: u64,
     inflight: u8,
+    active: u8, // successful sessions are still owned by this source
 }
 pub struct RateLimiter {
     sources: [Option<Source>; MAX_SOURCES],
@@ -97,7 +98,7 @@ impl RateLimiter {
             self.sources.iter().position(Option::is_none).ok_or(Error::Capacity)?
         };
         let current = self.sources[at].unwrap_or(Source {
-            ip, tokens: 4, last_second: second, last_request: second, inflight: 0,
+            ip, tokens: 4, last_second: second, last_request: second, inflight: 0, active: 0,
         });
         if second < current.last_second { return Err(Error::Invalid); }
         let global = Self::refill(self.global_tokens, second - self.global_second, rate);
@@ -116,17 +117,32 @@ impl RateLimiter {
         Ok(())
     }
     pub fn finish_handshake(&mut self, ip: u32, success: bool) -> Result<(), Error> {
+        // Caller supplies the independently authenticated source from the
+        // native TCP endpoint, NEVER a source claimed in TLS plaintext.
         let source = self.sources.iter_mut().flatten().find(|s| s.ip == ip)
             .ok_or(Error::Stale)?;
         if source.inflight == 0 || self.pending == 0 { return Err(Error::Stale); }
-        if success && self.active >= MAX_ACTIVE { return Err(Error::Capacity); }
+        // A completed rejected/full handshake no longer owns a pending slot;
+        // it must never take a free active slot or silently leave a stale
+        // pending credit behind. Native caller closes any unadmitted TLS.
         source.inflight -= 1;
         self.pending -= 1;
-        if success { self.active += 1; }
+        if success {
+            if self.active >= MAX_ACTIVE { return Err(Error::Capacity); }
+            source.active = source.active.checked_add(1).ok_or(Error::Exhausted)?;
+            self.active += 1;
+        }
         Ok(())
     }
-    pub fn close_active(&mut self) -> Result<(), Error> {
-        self.active = self.active.checked_sub(1).ok_or(Error::Stale)?;
+    /// Reclaim only a genuinely closed session of this authenticated source.
+    /// Generic "close one" APIs let one failed peer steal another peer's
+    /// active capacity. This caller remains trusted by the native endpoint.
+    pub fn close_active_from(&mut self, ip: u32) -> Result<(), Error> {
+        let source = self.sources.iter_mut().flatten().find(|s| s.ip == ip)
+            .ok_or(Error::Stale)?;
+        if source.active == 0 || self.active == 0 { return Err(Error::Stale); }
+        source.active -= 1;
+        self.active -= 1;
         Ok(())
     }
     /// Source entries are never evicted while an allowance is owed or a
@@ -138,6 +154,7 @@ impl RateLimiter {
         if second < entry.last_request.saturating_add(1)
             || second < entry.last_second
             || entry.inflight != 0
+            || entry.active != 0
             || Self::refill(entry.tokens, second - entry.last_second, 8) != 4
         {
             return Err(Error::Busy);
@@ -209,12 +226,47 @@ mod tests {
         bytes[0]=1; bytes[2]=1; bytes[4..8].copy_from_slice(&4097u32.to_le_bytes());
         assert!(matches!(parse_read_only_echo(cap(),&bytes),Err(Error::Invalid)));
     }
+    #[test] fn v019_sec_n03_full_active_pool_releases_new_failed_handshake() {
+        let mut limiter = RateLimiter::new();
+        for ip in 1..=16 {
+            limiter.request_handshake(ip, u64::from(ip), 16).unwrap();
+            limiter.finish_handshake(ip, true).unwrap();
+        }
+        assert_eq!(limiter.active(), 16);
+        assert_eq!(limiter.pending(), 0);
+        limiter.request_handshake(17, 17, 16).unwrap();
+        assert_eq!(limiter.pending(), 1);
+        assert_eq!(limiter.finish_handshake(17, true), Err(Error::Capacity));
+        assert_eq!(limiter.active(), 16);
+        assert_eq!(limiter.pending(), 0);
+        assert_eq!(limiter.close_active_from(17), Err(Error::Stale));
+    }
+    #[test] fn v019_sec_n04_one_source_cannot_steal_other_active_credit() {
+        let mut limiter = RateLimiter::new();
+        limiter.request_handshake(7, 0, 4).unwrap();
+        limiter.finish_handshake(7, true).unwrap();
+        assert_eq!(limiter.active(), 1);
+        assert_eq!(limiter.close_active_from(8), Err(Error::Stale));
+        assert_eq!(limiter.active(), 1);
+        limiter.close_active_from(7).unwrap();
+        assert_eq!(limiter.active(), 0);
+        assert_eq!(limiter.close_active_from(7), Err(Error::Stale));
+    }
+    #[test] fn v019_sec_n04_connected_source_is_never_evicted_or_replenished_by_forgetting() {
+        let mut limiter = RateLimiter::new();
+        limiter.request_handshake(7, 0, 4).unwrap();
+        limiter.finish_handshake(7, true).unwrap();
+        assert_eq!(limiter.evict_idle(7, 10), Err(Error::Busy));
+        limiter.close_active_from(7).unwrap();
+        limiter.evict_idle(7, 10).unwrap();
+        assert_eq!(limiter.active(), 0);
+    }
     #[test] fn sec_n08_no_model_is_needed_for_rate_limit_and_echo() {
         let mut limiter = RateLimiter::new();
         limiter.request_handshake(7,0,4).unwrap();
         limiter.finish_handshake(7,true).unwrap();
         assert_eq!(limiter.active(),1);
-        limiter.close_active().unwrap();
+        limiter.close_active_from(7).unwrap();
         assert_eq!(limiter.active(),0);
     }
 }

@@ -106,3 +106,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 ### G2 固定 CPU1 / 双 AI 建议前置架构
 
 六专项后续接线必须复用 V0.19 固定角色：CPU1 是唯一 AI 控制核（CPU0 仅为确定性 EL1 机制 broker），两个逻辑隔离的建议邮箱无执行权、不参与资源栅栏的签发。业务内核/IRQ/TLB/DMA/文件事务安全拒绝不能由运营或安全 AI 消除。模型建议不触发 CoreSet 伸缩/跨核接管。双 EL0 推理进程实际隔离、并行调度以及 AArch64 QEMU 证明仍缺失，G2/G3/G4 状态不因契约测试通过而升级。
+
+### G2 SEC-N 活动连接/来源额度加固（固定控制核之后）
+
+- `cyxia-kernel-core::security::network::RateLimiter` 按受保护网络端点来源记录活动会话占用；以前泛化的 `close_active()` 改成 `close_active_from(ip)`，拒绝错误来源、重复关闭，防止攻击连接错误归还另一来源的活动 credit。
+- 即便 16 个活动额度已满，已结束或拒绝的握手仍精确释放其对应待认证 credit，不得因返回 Capacity 将 4 个 pending credit 永久占住。真实未授予会话必须由原生 TLS 适配器关闭。
+- 32 个来源槽的空闲驱逐新增 `active == 0` 条件；只靠令牌回满/静默不能驱逐仍有活动连接的来源，避免下次重入偷偷重置 burst。
+- 新增满额、跨来源关闭/重复关闭、活跃来源驱逐共 3 个单元负向测试，以及源代码回归检查。这里的来源身份必须来自受保护的 TCP endpoint，而非模型或应用字节；当前仍是主机机制级，原生 TCP 端点接线和 QEMU 网络洪泛故障验收尚未完成。
