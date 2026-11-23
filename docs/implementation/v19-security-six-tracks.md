@@ -113,3 +113,13 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 即便 16 个活动额度已满，已结束或拒绝的握手仍精确释放其对应待认证 credit，不得因返回 Capacity 将 4 个 pending credit 永久占住。真实未授予会话必须由原生 TLS 适配器关闭。
 - 32 个来源槽的空闲驱逐新增 `active == 0` 条件；只靠令牌回满/静默不能驱逐仍有活动连接的来源，避免下次重入偷偷重置 burst。
 - 新增满额、跨来源关闭/重复关闭、活跃来源驱逐共 3 个单元负向测试，以及源代码回归检查。这里的来源身份必须来自受保护的 TCP endpoint，而非模型或应用字节；当前仍是主机机制级，原生 TCP 端点接线和 QEMU 网络洪泛故障验收尚未完成。
+
+### SEC-N G2 协议层：真实 TLS 会话代际与连接额度联动（本次）
+
+- 新增 `crates/net-transport/src/admission.rs`：32 个来源、4 个待认证、16 个活动连接的固定容量无堆 admission ledger。每次握手获取不对外解码的 `PendingTicket{slot,generation}`，过期/重复回执不能回收另一握手；限流参数和来源 IPv4 仅允许由可信原生 TCP 适配器提供。
+- 真实 Rustls `Session` 使用当前 EL0 服务生命周期内单调的会话序列，`local_echo_proof()` 只有在双向钉扎 TLS 已完成且实际协商 ALPN 为 `cyxia-echo/1` 时产生。`Admission::authenticate` 持有该 *精确会话* 的证明，防止同 IP 或同一认证公钥的不同连接替用旧 active ticket、同一会话占用两个活动槽。
+- `Admission::reply(active, &session, output)` **只消费 session.plaintext()**（Rustls 真实解密数据），不接受任意声称已解密的字节缓存；解析仍限 16 字节 header / 4096 字节正文 / 只读 opcode，返回值仅为有界回复数据，不是文件、内存、设备、计划发布权。
+- 断链/服务重启调用 `begin_drain` 或 `begin_restart` 时保留原 token 和 credit。只有可信本机适配器在**实际** TCP/TLS 输出、VirtIO 描述符、DMA pin 与完成对账后才能调用 `finish_drain`。该函数本身不是硬件证明，测试用例模拟这一外部前提；重启不会自动清空信用账本或重置源限流。
+- 新增票据代际、pending/来源容量、服务重启与 TLS 真握手后 Echo、来源重放及 17 号活动连接拒绝的主机负向测试。**仍缺实际 AArch64 EL0 单机网络服务使用此 ledger 的构造/消亡适配，以及 SEC-N07 密钥/遥测实测与 SEC-N08 QEMU 网络丢包/断链故障注入。** G2/G3/G4 原生证据不升级。
+
+生产级接线门槛：`security::network::RateLimiter` 是此前独立的主机契约模型，`net-transport::admission::Admission` 是本轮与真实 TLS Session 绑定的建议迁移实现。**不可在同一条生产连接上同时使用两套额度计账**；必须在原生网络服务迁移时指定唯一权威账本、对齐旧连接代际，并以真实 TX/DMA 完成证据管理 `finish_drain`。在完成该单点接线前，不得声称 SEC-N G2 原生完成。

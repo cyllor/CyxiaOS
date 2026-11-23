@@ -119,3 +119,24 @@ fn read_op(tag:u64)->syscall::ReadOperation {
     let publisher=syscall::ProtectedRole::from_kernel(2,1);
     assert_eq!(syscall::can_publish(ai,publisher),Err(Error::Unauthorized));
 }
+
+#[test]
+fn v019_j11_network_logical_close_does_not_erase_unknown_device_custody() {
+    // Host cross-domain bookkeeper probe, not an EL1 DMA-stop witness.
+    let mut network=network::RateLimiter::new();
+    network.request_handshake(7,0,4).unwrap();
+    network.finish_handshake(7,true).unwrap();
+    let mut dma=device::Queue::<1>::new(1,1);
+    let token=dma.prepare(17,1,1,true).unwrap();
+    dma.publish(token).unwrap();
+    dma.timeout(token).unwrap();
+    network.close_active_from(7).unwrap();
+    assert_eq!(network.active(),0);
+    assert!(dma.has_inflight());
+    assert_eq!(dma.state(token),Ok(device::State::Unknown));
+    // A logical connection close never constitutes driver quiesce+reconcile.
+    assert_eq!(
+        dma.reset(device::ReliableReset::from_driver(1,1,true,false,false)),
+        Err(Error::Unknown),
+    );
+}

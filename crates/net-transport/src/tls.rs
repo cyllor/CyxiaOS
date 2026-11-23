@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use crate::IDLE_TIMEOUT_SECS;
+use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use ring::digest;
 use rustls::{
@@ -32,6 +33,14 @@ const _: () = assert!(HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000);
 /// ALPNs are disjoint: the single-node read-only service is not the
 /// historical remote-placement/member protocol.
 pub const LOCAL_ECHO_ALPN: &[u8] = b"cyxia-echo/1";
+// Session identities are monotonic within one isolated EL0 service lifetime.
+// A failed/wrapped allocation refuses new TLS: no ABA receipt reuse.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+/// Unforgeable within a single native TLS service instance: never decoded
+/// from a network message. A matching peer pin alone is NOT connection identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EchoProof { session: u64, peer: [u8; 32] }
+
 pub const LEGACY_CLUSTER_ALPN: &[u8] = b"cyxia-cluster/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationProtocol {
@@ -404,6 +413,7 @@ pub struct Session<'a> {
     connection: Connection,
     buffers: &'a mut Buffers,
     application: ApplicationProtocol,
+    session_serial: u64,
     input: usize,
     output: usize,
     received: usize,
@@ -436,6 +446,10 @@ impl<'a> Session<'a> {
         let handshake_deadline = now_ms
             .checked_add(HANDSHAKE_TIMEOUT_MS)
             .ok_or(Error::Clock)?;
+        let session_serial = NEXT_SESSION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .map_err(|_| Error::Clock)?
+            .checked_add(1).ok_or(Error::Clock)?;
         buffers.input.fill(0);
         buffers.output.fill(0);
         buffers.received.fill(0);
@@ -444,6 +458,7 @@ impl<'a> Session<'a> {
             connection,
             buffers,
             application,
+            session_serial,
             input: 0,
             output: 0,
             received: 0,
@@ -464,6 +479,20 @@ impl<'a> Session<'a> {
             None
         }
     }
+    /// Proof of one live rustls session and its *negotiated* Echo ALPN.
+    /// The private serial binds it to a single native TLS connection and
+    /// cannot be constructed by a peer, a model or an application wire frame.
+    pub fn local_echo_proof(&self) -> Option<EchoProof> {
+        let peer = self.authenticated_peer()?;
+        if self.application != ApplicationProtocol::LocalEcho { return None; }
+        let negotiated = match &self.connection {
+            Connection::Client(connection) => connection.alpn_protocol(),
+            Connection::Server(connection) => connection.alpn_protocol(),
+        };
+        (negotiated == Some(LOCAL_ECHO_ALPN)).then_some(EchoProof {
+            session: self.session_serial, peer,
+        })
+    }
     /// A checked local read-only application message can be created only
     /// after a *real* pinned TLS handshake on the local-Echo ALPN. No network
     /// frame grants task, file, MMIO, device or policy rights.
@@ -474,16 +503,7 @@ impl<'a> Session<'a> {
         if self.authenticated_peer().is_none() {
             return Err(Error::Handshake);
         }
-        // Identity and the configured profile alone are insufficient: a
-        // nonconforming client can omit ALPN. Only rustls' *actually*
-        // negotiated local Echo ALPN authorizes this application dispatcher.
-        let negotiated = match &self.connection {
-            Connection::Client(connection) => connection.alpn_protocol(),
-            Connection::Server(connection) => connection.alpn_protocol(),
-        };
-        if self.application != ApplicationProtocol::LocalEcho
-            || negotiated != Some(LOCAL_ECHO_ALPN)
-        {
+        if self.local_echo_proof().is_none() {
             return Err(Error::Direction);
         }
         crate::echo::parse_request(message).map_err(|_| Error::Buffer)

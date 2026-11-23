@@ -123,6 +123,20 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("source.active -= 1;", network)
         self.assertNotIn("pub fn close_active(&mut self)", network)
 
+    def test_sec_n_handshake_and_tls_echo_use_generation_bound_credits(self):
+        gate = source(ROOT / "crates/net-transport/src/admission.rs")
+        tls = source(ROOT / "crates/net-transport/src/tls.rs")
+        self.assertIn("pub struct PendingTicket", gate)
+        self.assertIn("pub struct ActiveTicket", gate)
+        self.assertIn("self.pending_entry(ticket)?", gate)
+        self.assertIn("tls.local_echo_proof()", gate)
+        self.assertIn("row.proof==proof", gate)
+        self.assertIn("tls.accept_local_echo(tls.plaintext())", gate)
+        self.assertIn("pub fn begin_restart(&mut self)", gate)
+        self.assertIn("self.active_count()!=0", gate)
+        self.assertIn("static NEXT_SESSION: AtomicU64", tls)
+        self.assertIn("pub fn local_echo_proof(&self)", tls)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

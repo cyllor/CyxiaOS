@@ -48,6 +48,7 @@ jobs:
           cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
       - name: Independent local Echo TLS and legacy TLS compatibility
         run: |
+          cargo test --locked --offline -p cyxia-net-transport
           cargo test --locked --offline -p cyxia-net-transport --features tls
           cargo test --locked --offline -p cyxia-cluster-transport --features tls
       - name: AArch64 EL0 TLS target compile (NOT QEMU evidence)

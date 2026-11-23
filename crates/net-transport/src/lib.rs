@@ -7,4 +7,6 @@
 pub const IDLE_TIMEOUT_SECS: u64 = 60;
 pub mod echo;
 #[cfg(feature = "tls")]
+pub mod admission;
+#[cfg(feature = "tls")]
 pub mod tls;

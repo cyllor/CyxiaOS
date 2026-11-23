@@ -345,3 +345,108 @@ fn local_echo_requires_pinned_handshake_and_distinct_alpn() {
     handshake(&mut la,&mut lb);
     assert!(matches!(lb.accept_local_echo(&raw),Err(Error::Direction)));
 }
+
+fn v019_local_pairings() -> [Pairing; 2] {
+    let mut fixtures = [
+        (&include_bytes!("../tests/fixtures/a-test-cert.der")[..],
+         &include_bytes!("../tests/fixtures/a-test-key.der")[..]),
+        (&include_bytes!("../tests/fixtures/b-test-cert.der")[..],
+         &include_bytes!("../tests/fixtures/b-test-key.der")[..]),
+    ];
+    fixtures.sort_by_key(|(cert, _)| node_id(&CertificateDer::from(*cert)).unwrap());
+    core::array::from_fn(|i| Pairing::new_local_echo(
+        CertificateDer::from(fixtures[i].0),
+        PrivatePkcs8KeyDer::from(fixtures[i].1).into(),
+        node_id(&CertificateDer::from(fixtures[1-i].0)).unwrap(),
+        Arc::new(Time),
+    ).unwrap())
+}
+#[test]
+fn v019_sec_n06_actual_tls_plaintext_requires_exact_generation_bound_active_ticket() {
+    use crate::admission::{Admission, Error as AdmissionError};
+    let locals=v019_local_pairings();
+    let mut admission=Admission::new();
+    let invalid=admission.begin(7,0,4).unwrap();
+    let mut first_buffer=Buffers::new();
+    let first=locals[1].server(&mut first_buffer,0).unwrap();
+    assert_eq!(admission.authenticate(invalid,&first),Err(AdmissionError::Unauthenticated));
+    assert_eq!(admission.pending_count(),0);
+    drop(first);
+    let ticket=admission.begin(7,0,4).unwrap();
+    let mut client_buf=Buffers::new();
+    let mut server_buf=Buffers::new();
+    let mut a=locals[0].client(&mut client_buf,0).unwrap();
+    let mut b=locals[1].server(&mut server_buf,0).unwrap();
+    handshake(&mut a,&mut b);
+    let active=admission.authenticate(ticket,&b).unwrap();
+    assert_eq!(admission.active_count(),1);
+    let duplicate=admission.begin(7,0,4).unwrap();
+    assert_eq!(admission.authenticate(duplicate,&b),Err(AdmissionError::Duplicate));
+    assert_eq!(admission.pending_count(),0);
+    let mut frame=[0u8;20];
+    frame[..2].copy_from_slice(&1u16.to_le_bytes());
+    frame[2..4].copy_from_slice(&1u16.to_le_bytes());
+    frame[4..8].copy_from_slice(&4u32.to_le_bytes());
+    frame[8..16].copy_from_slice(&9u64.to_le_bytes());
+    frame[16..20].copy_from_slice(&[1,2,3,4]);
+    a.send_plaintext(&frame).unwrap();
+    for now in 1..=16 {
+        a.pump(now).unwrap();
+        transfer(&mut a,&mut b);
+        b.pump(now).unwrap();
+        if b.plaintext()==frame.as_slice() { break; }
+    }
+    assert_eq!(b.plaintext(),frame.as_slice());
+    let mut reply=[0u8;20];
+    assert_eq!(admission.reply(active,&b,&mut reply),Ok(20));
+    assert_eq!(reply,frame);
+    let mut unrelated_buf=Buffers::new();
+    let unrelated=locals[1].server(&mut unrelated_buf,0).unwrap();
+    assert_eq!(admission.reply(active,&unrelated,&mut reply),Err(AdmissionError::Unauthenticated));
+    assert_eq!(admission.finish_drain(active),Err(AdmissionError::Busy));
+    b.consume_plaintext(20).unwrap();
+    b.abort();
+    assert_eq!(admission.reply(active,&b,&mut reply),Err(AdmissionError::Unauthenticated));
+    assert_eq!(admission.active_count(),1); // abort never frees unknown DMA
+    admission.begin_drain(active).unwrap();
+    admission.finish_drain(active).unwrap(); // host witness; native must prove TX/DMA
+    assert_eq!(admission.finish_drain(active),Err(AdmissionError::Stale));
+}
+#[test]
+fn v019_sec_n03_16_authenticated_connections_do_not_steal_17th_active_credit() {
+    use crate::admission::{Admission, Error as AdmissionError, ACTIVE};
+    let locals=v019_local_pairings();
+    let mut gate=Admission::new();
+    let mut tickets=[None; ACTIVE];
+    for (i, out) in tickets.iter_mut().enumerate() {
+        let pending=gate.begin(i as u32+1,i as u64+1,32).unwrap();
+        let mut client_buf=Buffers::new();
+        let mut server_buf=Buffers::new();
+        let mut client=locals[0].client(&mut client_buf,0).unwrap();
+        let mut server=locals[1].server(&mut server_buf,0).unwrap();
+        handshake(&mut client,&mut server);
+        *out=Some(gate.authenticate(pending,&server).unwrap());
+    }
+    assert_eq!(gate.active_count(),ACTIVE);
+    let pending=gate.begin(99,17,32).unwrap();
+    let mut client_buf=Buffers::new();
+    let mut server_buf=Buffers::new();
+    let mut client=locals[0].client(&mut client_buf,0).unwrap();
+    let mut server=locals[1].server(&mut server_buf,0).unwrap();
+    handshake(&mut client,&mut server);
+    assert_eq!(gate.authenticate(pending,&server),Err(AdmissionError::Capacity));
+    assert_eq!(gate.active_count(),ACTIVE);
+    assert_eq!(gate.pending_count(),0);
+    gate.begin_restart();
+    assert!(gate.restarting());
+    assert_eq!(gate.finish_restart(),Err(AdmissionError::Busy));
+    assert_eq!(gate.begin(100,18,32),Err(AdmissionError::Busy));
+    for ticket in tickets.into_iter().flatten() {
+        gate.finish_drain(ticket).unwrap();
+    }
+    assert_eq!(gate.active_count(),0);
+    gate.finish_restart().unwrap();
+    assert!(!gate.restarting());
+    let fresh=gate.begin(100,18,32).unwrap();
+    gate.reject(fresh).unwrap();
+}
