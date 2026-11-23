@@ -8,6 +8,7 @@
 //! document; the existing CPU0-only kernel must not advertise SMP isolation.
 #![forbid(unsafe_code)]
 
+pub mod advisory;
 pub mod budget;
 pub mod cores;
 pub mod policy;
