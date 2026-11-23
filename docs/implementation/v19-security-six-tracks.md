@@ -92,3 +92,7 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `Pairing::new_local_echo` 使用独立的 `cyxia-echo/1` ALPN；旧 `Pairing::new` 仍保留历史 `cyxia-cluster/1`。只有实际钉扎 TLS 握手完成且会话协议为单机 Echo 时，`Session::accept_local_echo` 才允许解析已解密应用字节；在握手前或旧集群会话中拒绝。 进一步要求 Rustls 回报的**实际协商 ALPN** 与 Echo 标识一致，不能仅以配置文件、服务名称或已认证身份推断 ALPN。
 - `crates/net-transport/src/echo.rs` 仅支持固定 16 字节小端头和 `READONLY_ECHO=1`、最大 4096 字节正文。精确长度/版本/操作码检查；任务、远程放置、资源授权、文件修改以及 Plan 发布操作没有任何解码入口。
 - CI 新增从独立包执行的完整 TLS 测试、legacy TLS 兼容测试，及相应源代码守卫。此增量**不是**原生 EL0 Echo 服务或可认证设备 TCP/TLS 运行验收；单机网络实体执行、16/4 连接额度、来源限流、实际证书配置和 QEMU 故障交错仍需 G2/G3 证明。
+
+### AArch64 目标编译门（开发 CI，不是原生验收）
+
+增加 `cyxia-net-transport` 开启 TLS 特性的 `aarch64-unknown-none-softfloat` 交叉编译检查，用于发现 ARM 裸机目标中的 rustls/ring/Crypto 兼容性问题。此检查不实例化网络设备、不驱动 TLS 会话、没有实际 QEMU 数据包/证书/断线证据；结果必须以对应 GitHub Actions 记录为准。G2/G3/G4 状态不因编译成功而升级。

@@ -47,6 +47,12 @@ jobs:
         run: |
           cargo test --locked --offline -p cyxia-net-transport --features tls
           cargo test --locked --offline -p cyxia-cluster-transport --features tls
+      - name: AArch64 freestanding TLS compile (NOT QEMU evidence)
+        run: |
+          rustup target add aarch64-unknown-none-softfloat --toolchain 1.95.0
+          CC_aarch64_unknown_none_softfloat=clang \
+          CFLAGS_aarch64_unknown_none_softfloat=--target=aarch64-unknown-none-elf \
+          cargo check --locked --offline -p cyxia-net-transport --features tls --target aarch64-unknown-none-softfloat
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)
