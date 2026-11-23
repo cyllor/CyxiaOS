@@ -22,7 +22,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("self.layout.business_mask", src)
         self.assertIn("self.layout.healthy_mask", src)
         self.assertIn("self.layout.generation", src)
-        self.assertRegex(src, r"self\\s*\\.\\s*scheduler\\s*\\.\\s*prepare_admission\\(")
+        self.assertRegex(src, r"self\s*\.\s*scheduler\s*\.\s*prepare_admission\(")
 
     def test_data_pte_mapping_and_revoke_reject_protected_frame_slots(self):
         src = source(ARM / "memory.rs")
