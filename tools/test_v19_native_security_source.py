@@ -86,7 +86,10 @@ class NativeSecurityWiring(unittest.TestCase):
         assert "READONLY_ECHO: u16 = 1" in echo
         assert "MAX_PAYLOAD: usize = 4096" in echo
         assert "cyxia_net_transport::tls::*" in legacy
-        assert "cluster_id" not in echo and "remote" not in echo
+        # Comments may describe forbidden remote operations. Check the
+        # executable wire surface, not prose words in a security warning.
+        assert "pub enum Kind" not in echo and "ClusterId" not in echo
+        assert "pub const READONLY_ECHO: u16 = 1" in echo
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

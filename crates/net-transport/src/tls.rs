@@ -474,7 +474,16 @@ impl<'a> Session<'a> {
         if self.authenticated_peer().is_none() {
             return Err(Error::Handshake);
         }
-        if self.application != ApplicationProtocol::LocalEcho {
+        // Identity and the configured profile alone are insufficient: a
+        // nonconforming client can omit ALPN. Only rustls' *actually*
+        // negotiated local Echo ALPN authorizes this application dispatcher.
+        let negotiated = match &self.connection {
+            Connection::Client(connection) => connection.alpn_protocol(),
+            Connection::Server(connection) => connection.alpn_protocol(),
+        };
+        if self.application != ApplicationProtocol::LocalEcho
+            || negotiated != Some(LOCAL_ECHO_ALPN)
+        {
             return Err(Error::Direction);
         }
         crate::echo::parse_request(message).map_err(|_| Error::Buffer)

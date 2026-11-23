@@ -329,6 +329,8 @@ fn local_echo_requires_pinned_handshake_and_distinct_alpn() {
     let mut b=locals[1].server(&mut b_buf,0).unwrap();
     assert!(matches!(b.accept_local_echo(&raw),Err(Error::Handshake)));
     handshake(&mut a,&mut b);
+    assert!(matches!(&b.connection, Connection::Server(server)
+        if server.alpn_protocol() == Some(LOCAL_ECHO_ALPN)));
     let parsed=b.accept_local_echo(&raw).unwrap();
     assert_eq!(parsed.id(),0x1234);
     assert_eq!(parsed.payload(),&[1,2,3,4]);
