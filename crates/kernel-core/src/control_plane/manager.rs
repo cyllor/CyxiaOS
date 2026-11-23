@@ -31,6 +31,15 @@ pub struct Manager<const C: usize, const D: usize> {
     last_time: u64,
 }
 impl<const C: usize, const D: usize> Manager<C, D> {
+    /// Production V0.19 constructor: forbid historical mutable control-core
+    /// topology from entering the trusted manager.
+    pub fn new_fixed(
+        ownership: Ownership<C>, publisher: Identity, epochs: Epochs,
+        limits: Limits, policy_limits: [policy::Limits; D],
+    ) -> Result<Self, Error> {
+        if !ownership.fixed_control() { return Err(Error::Invalid); }
+        Self::new(ownership, publisher, epochs, limits, policy_limits)
+    }
     pub fn new(
         ownership: Ownership<C>,
         publisher: Identity,
