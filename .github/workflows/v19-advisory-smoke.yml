@@ -22,6 +22,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 2 # HEAD^ is required by the source-diff check
       - name: Pinned Rust toolchain
         run: |
           rustup toolchain install 1.95.0 --profile minimal --no-self-update
