@@ -134,3 +134,9 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - SEC-N：来源记录经合法静默驱逐也要推进全局可信单调时钟，不能在服务时间回退后凭重建来源记录获得新的 burst。
 
 这些是六专项契约与既有原生入口的局部加固，**不改 syscall ABI/文件格式/模型动作位**，不证明未接线的实际 DMA、TLB、系统卷、启动/宕机故障流程。G2/G3/G4 仍须原生硬件/模拟器证据。
+
+### 固定 CPU1 的旧 SEC-P/SEC-D 模型假设清理
+
+- 将未接原生驱动的 `SEC-P::VerifiedSpawn` 主机账本测试迁到 CPU2 业务核，并明确拒绝 CPU0/CPU1，即使损坏的业务掩码或健康掩码宣称其可用；J01 的 DRAIN/任务退出模型同步使用 CPU2。
+- `SEC-D::validate_irq_route` 明确拒绝将普通 VirtIO SPI 路由至固定控制 CPU1，即使错误的 `healthy_business` 位图包含 CPU1；CPU0 作为 EL1 机制 broker 的设备中断属于独立的受保护设备所有者，不由这个普通业务路由门签发。
+- 执行边界仍是原生受保护 CPU owner/设备路由适配；这些 host check 不替代 QEMU GIC/IRQ 实际交错验收。

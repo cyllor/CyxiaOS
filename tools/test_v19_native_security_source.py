@@ -145,6 +145,8 @@ class NativeSecurityWiring(unittest.TestCase):
         syscall = source(CORE / "syscall.rs")
         manager = source(ROOT / "crates/kernel-core/src/control_plane/manager.rs")
         self.assertIn("if cpu < 2 { return Err(Error::Unauthorized); }", process)
+        self.assertIn("request.cpu >= 2", process)
+        self.assertIn("if target_cpu == 1 || kind != IrqKind::VirtioSpi", device)
         self.assertIn("protected_inode: u16, protected_generation: u64", file)
         self.assertIn("frame.owner == 0", memory)
         self.assertIn("total.checked_add(usize::from(lease.descriptors))", device)

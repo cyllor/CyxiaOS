@@ -42,6 +42,10 @@ impl VerifiedSpawn {
             && self.group == request.group
             && self.package == request.package
             && cpu != 0
+            // Standalone SEC-P ledger shares the same V0.19 native role
+            // boundary as authorize_business_core: CPU0 mechanism broker and
+            // CPU1 fixed advisory-control may not be ordinary business CPUs.
+            && request.cpu >= 2
             && cpu & self.business & self.healthy & !self.draining & !self.suspect != 0
     }
 }
@@ -187,7 +191,7 @@ impl<const N: usize> SpawnLedger<N> {
 mod tests {
     use super::*;
     fn req(id: u64) -> Request {
-        Request { id, caller: 7, group: 2, package: [5; 32], cpu: 1 }
+        Request { id, caller: 7, group: 2, package: [5; 32], cpu: 2 }
     }
     fn cap() -> VerifiedSpawn {
         VerifiedSpawn::from_registry(7, 2, [5; 32], 0b1110, 0b1110, 0, 0)
@@ -226,18 +230,29 @@ mod tests {
         let t = l.admit(req(1), cap()).unwrap();
         l.publish_runnable(t, cap()).unwrap();
         l.hold_ref(t).unwrap();
-        l.begin_exit(t, 1<<1, 0).unwrap();
+        l.begin_exit(t, 1<<2, 0).unwrap();
         assert_eq!(l.mark_reapable(t), Err(Error::Busy));
         l.end_ref(t).unwrap();
-        l.ack_tlb(t, 1).unwrap();
+        l.ack_tlb(t, 2).unwrap();
         l.mark_reapable(t).unwrap();
     }
     #[test] fn sec_p06_no_control_or_draining_cpu() {
         let mut l = SpawnLedger::<1>::new();
         let denied = VerifiedSpawn::from_registry(7,2,[5;32],0b0001,0b1111,0,0);
         assert_eq!(l.admit(req(1), denied), Err(Error::Unauthorized));
-        let draining = VerifiedSpawn::from_registry(7,2,[5;32],0b1110,0b1111,1<<1,0);
+        let draining = VerifiedSpawn::from_registry(7,2,[5;32],0b1110,0b1111,1<<2,0);
         assert_eq!(l.admit(req(1), draining), Err(Error::Unauthorized));
+    }
+    #[test] fn v019_sec_p06_bad_registry_cannot_make_cpu0_or_cpu1_business() {
+        let mut l=SpawnLedger::<2>::new();
+        let misclassified=VerifiedSpawn::from_registry(7,2,[5;32],u64::MAX,u64::MAX,0,0);
+        for cpu in [0,1] {
+            let mut input=req(u64::from(cpu)+1);
+            input.cpu=cpu;
+            assert_eq!(l.admit(input,misclassified),Err(Error::Unauthorized));
+        }
+        assert_eq!(l.rows.iter().flatten().count(),0);
+        assert!(l.admit(req(7),misclassified).is_ok());
     }
     #[test] fn sec_p07_exiting_cannot_take_new_references() {
         let mut l = SpawnLedger::<1>::new();

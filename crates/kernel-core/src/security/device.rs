@@ -152,7 +152,11 @@ pub fn validate_irq_route(
     source_quiesced: bool,
 ) -> Result<(), Error> {
     let bit = 1u64.checked_shl(target_cpu as u32).ok_or(Error::Invalid)?;
-    if kind != IrqKind::VirtioSpi || core_generation == 0 || !source_quiesced
+    // CPU1 is the single V0.19 advisory-control CPU. Ordinary VirtIO SPI
+    // work must never be rerouted there even if a damaged mask marks it
+    // as healthy business; CPU0's mechanism-broker IRQ is a separate owner.
+    if target_cpu == 1 || kind != IrqKind::VirtioSpi
+        || core_generation == 0 || !source_quiesced
         || bit & healthy_business & !draining & !suspect == 0
     {
         return Err(Error::Unauthorized);
@@ -222,7 +226,8 @@ mod tests {
     #[test] fn sec_d07_irq_must_target_healthy_business_only() {
         assert_eq!(validate_irq_route(IrqKind::Timer,1,1,0b10,0,0,true),Err(Error::Unauthorized));
         assert_eq!(validate_irq_route(IrqKind::VirtioSpi,1,1,0b10,0b10,0,true),Err(Error::Unauthorized));
-        assert_eq!(validate_irq_route(IrqKind::VirtioSpi,1,1,0b10,0,0,true),Ok(()));
+        assert_eq!(validate_irq_route(IrqKind::VirtioSpi,1,1,0b10,0,0,true),Err(Error::Unauthorized));
+        assert_eq!(validate_irq_route(IrqKind::VirtioSpi,2,1,0b100,0,0,true),Ok(()));
     }
     #[test] fn sec_d08_lonely_chain_reaches_notification_deadline() {
         assert_eq!(must_notify(1,8,49_999,false),Ok(false));

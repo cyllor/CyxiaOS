@@ -3,7 +3,7 @@
 use super::{device, file, memory, network, process, syscall, Error};
 
 fn request() -> process::Request {
-    process::Request { id: 1, caller: 7, group: 2, package: [5;32], cpu: 1 }
+    process::Request { id: 1, caller: 7, group: 2, package: [5;32], cpu: 2 }
 }
 fn permit(draining: u64) -> process::VerifiedSpawn {
     process::VerifiedSpawn::from_registry(7,2,[5;32],0b1110,0b1110,draining,0)
@@ -18,7 +18,7 @@ fn read_op(tag:u64)->syscall::ReadOperation {
 }
 #[test] fn j01_spawn_drain_and_tlb_ack_is_not_free() {
     let mut tasks=process::SpawnLedger::<1>::new();
-    assert_eq!(tasks.admit(request(),permit(1<<1)),Err(Error::Unauthorized));
+    assert_eq!(tasks.admit(request(),permit(1<<2)),Err(Error::Unauthorized));
     let mut shot=memory::Shootdown::begin(1,1,1<<1,0,0,0).unwrap();
     shot.revoke_pte();
     assert!(!shot.may_reuse());
