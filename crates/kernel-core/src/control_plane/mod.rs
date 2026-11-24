@@ -16,6 +16,7 @@ pub mod decision_record_v3;
 pub mod registered_gate_v3;
 pub mod svc_bridge_v3;
 pub mod plan_wire_v2;
+pub mod apply_report_v1;
 pub mod budget;
 pub mod cores;
 pub mod policy;
