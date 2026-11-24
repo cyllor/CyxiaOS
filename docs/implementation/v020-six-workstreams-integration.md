@@ -15,6 +15,22 @@
 | [文件与介质 #25](https://github.com/cyllor/CyxiaOS/pull/25) | `security/file_service_v4.rs` 的 FileServiceRequest v4/Reply v3 15 op 长度、版本、能力选择器和 UNKNOWN 拒绝；`security/file_media_v0199.rs` 严格超级块 v1 4096B + 收据 v4 192B CRC32C 只读校验 | [run 45348079942](https://github.com/cyllor/CyxiaOS/actions/runs/45348079942) 4/4 PASS | **P0** 当前持久盘是 v2/4240，规范 v1/4118 + v4 收据索引/ACL/BootEpoch/SecurityState；需要新镜像/离线迁移、真实 FILE_AUTH、redo/FLUSH、快照保留期及断电恢复证明 |
 | [去分布式 #26](https://github.com/cyllor/CyxiaOS/pull/26) | 默认内核 `v0199-local-native`；`kernel/src/main.rs` 禁止默认构建旧 `unified-runtime`/远端 TCP/CPU1 原型控制；旧 peer/cluster crates 排出 workspace，锁文件准确重生成；保留本地原生 net/TLS | [run 45348177711](https://github.com/cyllor/CyxiaOS/actions/runs/45348177711) 4/4 PASS | **P1** 历史 `kernel/src/runtime/cluster`、`kernel-core/src/cluster`、`prototype/src/cluster`、可选 Cargo features 与 D16 历史兼容解码仍在；需确认所有目标可达性及新介质无旧集群对象后分批删除 |
 
+## 六工作流之后的原生闭环进展（2026-11-24）
+
+下列后续工作均合并在本 Draft PR #20 的开发分支，**没有合并到** `CyxiaOS-V0.20`：
+
+| 工作项 | 真实证据 | 仍未通过的门 |
+| --- | --- | --- |
+| [#27 冻结决定重试](https://github.com/cyllor/CyxiaOS/pull/27) | 同键 Frozen 重试再次核验真实 RuleProfile/资源代际/快照/有效期，UNKNOWN 禁止重新登记；主机和 ARM/x86 CI PASS | 真正角色2→0x50→EL1→角色8→0x41 原生处理链未端到端证明 |
+| [#28 文件安全介质](https://github.com/cyllor/CyxiaOS/pull/28) | FileStreamIndex v4 4096B、SecurityStateStore v2、128×192B 收据跨 6 个 4KiB 块边界/CRC32C、单调水位/保护不回退；CI PASS | 格式 v2→v1/4118 的离线迁移与真实 redo/FLUSH、文件恢复及不可变快照仍未验收 |
+| [#29 单机依赖闭包](https://github.com/cyllor/CyxiaOS/pull/29) | ARM 和 x86 目标独立 Cargo tree 均不包含活动 cyxia-cluster-transport/peer-billing；本地 TCP/TLS 单独编译/测试 PASS | 残余旧集群目录/功能/持久对象仍在源码中 |
+| [#30 ET_DYN 可信装载](https://github.com/cyllor/CyxiaOS/pull/30) | 仅静态 AArch64 PIE、hash/段权限/入口/重定位核验、私有暂存+清零、错误不修改目标；主机/构建 CI PASS | 八个真正不同角色二进制的能力清单、TTBR 与容错/启动集成未验收 |
+| [#31 ApplyReport v1](https://github.com/cyllor/CyxiaOS/pull/31) | v1 96B+≤256B 回执、64B PlanQuery、只接受登记执行器/冻结动作/原生终态核验、UNKNOWN 不自动回收；CI PASS | 真实执行器 0x43 系统调用、TLB/DMA/redo 完成及故障注入 |
+| [#33 x86 QEMU 固件修复](https://github.com/cyllor/CyxiaOS/pull/33) | QEMU 10.2.2 固定提交 SeaBIOS 256KiB 随独立二进制打包；显式 -L 和请求 SHA256；[run 45354173108](https://github.com/cyllor/CyxiaOS/actions/runs/45354173108) **ARM SMP + x86 SMP 原生机制夹具均 PASS** | 不是完整 x86 原生操作系统 G4。历史 x86 SMP FAIL 的原因是测试环境缺 `bios-256k.bin`，不是已证实的客体内核缺陷 |
+| [#32 CPU0 八个真实 EL0 页表上下文夹具](https://github.com/cyllor/CyxiaOS/pull/32) | [run 45356057576](https://github.com/cyllor/CyxiaOS/actions/runs/45356057576)：固定 QEMU A53 4vCPU，CPU0 实际进入八个独立 TTBR0/私有数据页的 EL0 上下文，CPU1–3 业务进度合计 30，串口/QMP 内存页 SHA256 同验，PASS。ARM/x86/主机/归档 [run 45356068957](https://github.com/cyllor/CyxiaOS/actions/runs/45356068957) 4/4 PASS | 八个上下文执行的是同一小型独立测试程序，不是运营 AI / 安全 AI / 确定性控制器 / 发布代理等正式服务启动；完整单核控制预算/真实 SVC/角色重启和 G4 仍未验收 |
+
+**原生证据边界：** 固定 QEMU A53 4vCPU 和两架构 SMP 回归的机制 PASS 不等于完整 OS 符合性。G0 正式架构一致性仍 **BLOCKED**（没有真正八个控制服务、完整映射/IRQ和预算）；G1 **NOT_READY**；G4-QEMU 127 项 **NOT_RUN**；G5-ARCH 实体 A53 **NOT_RUN**。所有原有失败的 QEMU/断言记录必须留存，不能用最后一次绿灯覆盖不同提交的失败证据。
+
 ## 不可颠倒的 G0 / G1 / G4 判定顺序
 
 1. **G0** 先冻实际真实 CPU0 控制核、三 B 核与 8 个互不越权的 EL0 角色，在 4-vCPU AArch64 QEMU 内读回 TTBR/IRQ/定时器/CPU 亲和证据。CPU0 单核 70ms/100ms 是全部控制角色总额，不允许 CPU1 再运行第二个 C。
