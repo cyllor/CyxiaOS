@@ -21,6 +21,8 @@ mod boot;
 mod console;
 mod exceptions;
 pub(crate) use console::{UART, halt, log, try_log};
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(crate) use console::enqueue_v0199;
 pub(crate) use exceptions::ExceptionFrame;
 #[cfg(not(feature = "smp-selftest"))]
 pub(crate) use exceptions::hex;
