@@ -38,3 +38,5 @@ pub mod durable_role_epoch_v0199;
 pub mod epoch_redo_v0199;
 
 pub mod offline_config_v1;
+
+pub mod cap_record_v3;
