@@ -167,6 +167,14 @@ impl TrialTable{
         verify_native(h)?;
         r.count=count;r.accepted=true;r.last=Some(h.key);Ok(())
     }
+    pub(super) fn hold_is_settled(&self,h:Hold)->Result<bool,Error>{
+        let r=self.row(h.permit_id)?;
+        Ok(r.hold.is_none()&&r.last==Some(h.key))
+    }
+    #[cfg(test)]
+    pub(super) fn insert_fixture(&mut self,p:Permit)->Result<(),Error>{
+        p.encode()?;self.insert(p)
+    }
     /// Only independent real acceptance/recovery may settle the hold.
     /// Failed-to-prove leaves it retained. Actual CPU overruns stay charged
     /// and permanently close the permit; no clamping or automatic retry.
