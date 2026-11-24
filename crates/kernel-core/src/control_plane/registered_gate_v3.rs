@@ -479,7 +479,8 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if permit.flags!=0||rec.rule_id!=rule.rule_id||rec.choice_policy!=rule.choice_policy
             ||rec.allowed_mask!=rule.allowed_mask||rec.fallback_index!=rule.fallback_index
             ||rec.selected_index!=rule.fallback_index||!rec.matches_candidate_count(local.static_ordinals.len())
-            ||act.expires_local_ns>permit.expires_ns{return Err(Error::Denied);}
+            ||act.expires_local_ns>permit.expires_ns
+            ||plan.header.active_until_local_ns>permit.expires_ns{return Err(Error::Denied);}
         Ok((permit,ordinal))
     }
     /// Restricted ordinary one-action trial. Unlike ordinary rule matching
@@ -1127,6 +1128,40 @@ mod tests {
             candidate_set_hash:[1;32],static_ordinals:ordinals,
             raw_fields:[None;7], action_payload:payload,
         }]
+    }
+    #[test]
+    fn trial_registration_publication_and_cost_custody_are_independent(){
+        use super::super::trial_permit_v1::{Permit,TrialTable};
+        let mut rules=profile_bytes();rules[48..50].copy_from_slice(&2u16.to_le_bytes());
+        let profile=Profile::parse(&rules).unwrap();let ctx=trusted(&rules);
+        let plan=plan_bytes();let mut rec=decision(&plan,&rules);
+        rec[99]=2;rec[100]=3;rec[108..112].copy_from_slice(&5u32.to_le_bytes());
+        rec[136..144].copy_from_slice(&1u64.to_le_bytes());
+        rec[152..156].copy_from_slice(&1u32.to_le_bytes());
+        rec[158..160].copy_from_slice(&2u16.to_le_bytes());
+        let actions=frozen(&[2,4],&[2,0]);let local=&actions[0];
+        let mut order=[u16::MAX;32];order[..2].copy_from_slice(&[2,4]);
+        let p=Permit{permit_id:1,boot_epoch:1,rules_generation:7,target_id:17,target_generation:1,
+            start_ns:100,expires_ns:20_000_000_000,rule_id:1,domain:1,order_count:2,flags:0,
+            max_submissions:2,cpu_budget_ns:100,memory_budget_bytes:20,rule_hash:ctx.rules_hash,
+            model_hash:[0;32],template_id:1,model_generation:0,order};
+        let mut table=TrialTable::new(1,CONTROLLER,2).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        assert_eq!(gate.register_trial_one(CONTROLLER,&plan,&rec,&profile,local,ctx,&table),Err(Error::Stale));
+        table.insert_fixture(p).unwrap();
+        assert_eq!(gate.register_trial_one(CONTROLLER,&plan,&rec,&profile,local,ctx,&table),Ok(Registration::Frozen));
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,||panic!()),Err(Error::Denied));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|Err(Error::Denied),||panic!()),Err(Error::Denied));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|Ok(()),||Ok(())),Ok(Publication::AdapterAccepted));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|panic!(),||panic!()),Ok(Publication::ReplayNoEffect));
+        assert_eq!(gate.settle_with_native_proof(SUPERVISOR,terminal_proof(&plan),|_|panic!()),Err(Error::NotReady));
+        assert_eq!(gate.settle_trial_costs(SUPERVISOR,1,&mut table,true,10,1,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.settle_trial_costs(SUPERVISOR,1,&mut table,true,10,1,|_,_|Ok(())).unwrap();
+        gate.settle_with_native_proof(SUPERVISOR,terminal_proof(&plan),|_|Ok(())).unwrap();
+        assert_eq!(table.next(1,1,local.target,1,151,7,ctx.rules_hash).unwrap().1,4);
     }
     #[test]
     fn authenticated_exact_registration_and_single_shot_native_callback() {
