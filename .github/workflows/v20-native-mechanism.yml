@@ -37,7 +37,7 @@ jobs:
           "$RUNNER_TEMP/qemu-bin/qemu-system-x86_64" --version | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/x86-version.txt"
           sha256sum "$RUNNER_TEMP"/qemu-bin/qemu-system-* | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/binaries.sha256"
           tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/artifacts/v020-qemu/qemu-bin.tar.gz" qemu-bin
-          sha256sum "$GITHUB_WORKSPACE/artifacts/v020-qemu/qemu-bin.tar.gz" > "$GITHUB_WORKSPACE/artifacts/v020-qemu/archive.sha256"
+          (cd "$GITHUB_WORKSPACE/artifacts/v020-qemu" && sha256sum qemu-bin.tar.gz > archive.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -70,7 +70,7 @@ jobs:
       - name: Run actual four-vCPU AArch64 SMP mechanism fixture
         run: |
           set -euo pipefail
-          sed 's#artifacts/v020-qemu/##' qemu-evidence/archive.sha256 | (cd qemu-evidence && sha256sum -c /dev/stdin)
+          (cd qemu-evidence && sha256sum -c archive.sha256)
           tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/qemu-bin" >> "$GITHUB_PATH"
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest
@@ -107,7 +107,7 @@ jobs:
       - name: Run actual four-vCPU x86-64 SMP mechanism fixture
         run: |
           set -euo pipefail
-          sed 's#artifacts/v020-qemu/##' qemu-evidence/archive.sha256 | (cd qemu-evidence && sha256sum -c /dev/stdin)
+          (cd qemu-evidence && sha256sum -c archive.sha256)
           tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
           mkdir -p artifacts/v020-x86-native
           python3 tools/x86_64.py build --output artifacts/v020-x86-native/build --mechanism smp
