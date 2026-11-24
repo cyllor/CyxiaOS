@@ -10,6 +10,10 @@ test = false
 bench = false
 
 [features]
+# The native single-node V0.19.9 release profile must never silently
+# activate historical D16/peer-billing or cluster transport paths.
+default = ["v0199-local-native"]
+v0199-local-native = []
 selftest = []
 # Long-running OS composition. Independent of bounded acceptance profiles.
 os-runtime = ["cyxia-arch-x86_64/runtime"]
