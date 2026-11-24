@@ -95,3 +95,10 @@ pub mod role_budget_v0199;
 pub mod feedback_v0199;
 
 pub mod action_schema_v2;
+
+pub mod control_rpc_v1;
+pub mod apply_work_v1;
+
+pub mod snapshot_store_v3;
+
+pub mod trial_permit_v1;

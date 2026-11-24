@@ -237,6 +237,12 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                             'incomplete/corrupt framed UART transport')
                     validator = validate if acceptance is None else acceptance.validate
                     report['observations'] = validator(bytes(decoded), (output / 'native-page.bin').read_bytes(), len(actual_cpus))
+                    # Optional independent extra physical memory proof, while
+                    # every guest CPU is still stopped. Only the explicit
+                    # acceptance profile may request bounded known spans.
+                    if acceptance is not None and hasattr(acceptance, 'capture_extra'):
+                        extra = acceptance.capture_extra(qmp, output, (output / 'native-page.bin').read_bytes())
+                        report['observations'].update(extra)
                     require(sha(elf) == report['elf_sha256'], 'ELF changed during guest run')
                     require(before == manifest(), 'source changed during guest run')
                     if scratch_disk is not None:

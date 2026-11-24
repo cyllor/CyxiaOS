@@ -7,3 +7,5 @@ pub mod model;
 
 // Current local snapshot/feature/integer inference contract (no authority).
 pub mod native_v0199;
+
+pub mod reward_v2;

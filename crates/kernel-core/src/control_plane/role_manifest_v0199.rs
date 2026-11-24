@@ -138,7 +138,24 @@ pub struct NativeRoleManifest {
     pub other_protected_pool_bytes:usize,
     pub other_control_ns_per_100ms:u64,
 }
+/// An immutable, fully validated manifest borrow. A replacement must
+/// finish using this borrow before changing any registered role. Admission
+/// may then avoid repeating the complete eight-role overlap scan on each
+/// individual SVC without accepting unvalidated or stale manifest fields.
+pub struct ValidatedRoleManifest<'a>(&'a NativeRoleManifest);
+impl<'a> ValidatedRoleManifest<'a>{
+    pub fn manifest(&self)->&'a NativeRoleManifest{self.0}
+    pub fn check_snapshot_view(&self,actor:Identity,endpoint:u64,cpu:usize,view:SnapshotView)->Result<(),Error>{
+        self.0.check_snapshot_view_validated(actor,endpoint,cpu,view)
+    }
+    pub fn check_aux(&self,actor:Identity,endpoint:u64,cpu:usize,op:AuxOperation)->Result<Role,Error>{
+        self.0.check_aux_validated(actor,endpoint,cpu,op)
+    }
+}
 impl NativeRoleManifest {
+    pub fn validated(&self)->Result<ValidatedRoleManifest<'_>,Error>{
+        self.validate()?;Ok(ValidatedRoleManifest(self))
+    }
     pub fn validate(&self)->Result<(),Error>{
         if self.online_mask != REQUIRED_ONLINE_MASK
             || self.other_control_ns_per_100ms>=CONTROL_NS_PER_100MS
@@ -190,7 +207,7 @@ impl NativeRoleManifest {
     fn endpoint_holder(&self, actor:Identity, registered_endpoint:u64, cpu:usize)
         ->Result<NativeRole,Error>
     {
-        self.validate()?;
+        // Called only through validated paths below.
         if cpu!=CONTROL_CPU || !actor.valid() || registered_endpoint==0 {
             return Err(Error::Denied);
         }
@@ -202,6 +219,11 @@ impl NativeRoleManifest {
     /// holder generation, sequence, completion credit and protected operands.
     /// A successful preflight is not execution authority or an ACK receipt.
     pub fn check_aux(&self,actor:Identity,registered_endpoint:u64,cpu:usize,op:AuxOperation)
+        ->Result<Role,Error>
+    {
+        self.validated()?.check_aux(actor,registered_endpoint,cpu,op)
+    }
+    fn check_aux_validated(&self,actor:Identity,registered_endpoint:u64,cpu:usize,op:AuxOperation)
         ->Result<Role,Error>
     {
         let entry=self.endpoint_holder(actor,registered_endpoint,cpu)?;
@@ -230,6 +252,10 @@ impl NativeRoleManifest {
     /// Mandatory views only. Optional redacted validator/supervisor views
     /// require a separately registered per-view cap.
     pub fn check_snapshot_view(&self, actor:Identity, registered_endpoint:u64,
+        cpu:usize,view:SnapshotView)->Result<(),Error>{
+        self.validated()?.check_snapshot_view(actor,registered_endpoint,cpu,view)
+    }
+    fn check_snapshot_view_validated(&self,actor:Identity,registered_endpoint:u64,
         cpu:usize,view:SnapshotView)->Result<(),Error>{
         let e=self.endpoint_holder(actor,registered_endpoint,cpu)?;
         let allowed=matches!((e.role,view),
@@ -282,6 +308,20 @@ mod tests{
             other_protected_pool_bytes:5*1024*1024,
             other_control_ns_per_100ms:45_000_000,
         }
+    }
+    #[test]
+    fn validated_borrow_checks_exact_holder_view_and_endpoint(){
+        let mut m=manifest();
+        let ops=m.members[0];let ctl=m.members[2];
+        let checked=m.validated().unwrap();
+        assert_eq!(checked.check_snapshot_view(ops.actor,ops.endpoint_id,0,SnapshotView::Operations),Ok(()));
+        assert_eq!(checked.check_snapshot_view(ops.actor,ctl.endpoint_id,0,SnapshotView::Operations),Err(Error::Denied));
+        assert_eq!(checked.check_snapshot_view(ops.actor,ops.endpoint_id,1,SnapshotView::Operations),Err(Error::Denied));
+        assert_eq!(checked.check_snapshot_view(ops.actor,ops.endpoint_id,0,SnapshotView::ControllerRawEvidence),Err(Error::Denied));
+        assert_eq!(checked.check_aux(ops.actor,ops.endpoint_id,0,AuxOperation::DecisionRead),Err(Error::Denied));
+        // A generation/physical inventory update requires a new proof.
+        m.members[2].ttbr0_root=m.members[0].ttbr0_root;
+        assert!(m.validated().is_err());
     }
     #[test]
     fn v0199_requires_eight_distinct_native_el0_roles_on_cpu0(){

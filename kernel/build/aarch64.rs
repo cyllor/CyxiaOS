@@ -33,7 +33,8 @@ fn assets(directory: &std::path::Path, paths: &mut Vec<PathBuf>) {
 mod v0199_roles;
 
 pub fn build() {
-    if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some() {
+    if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
+        || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some() {
         v0199_roles::build();
     }
     println!("cargo:rerun-if-env-changed=CYXIA_A03_DEMAND");

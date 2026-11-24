@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 from doctor import RUST_BIN, env
-from host_prototype_library import build_host_file_broker_libraries
+from host_prototype_library import build_host_file_broker_libraries, host_library_search_flags
 
 
 class SnapshotFileAbi(unittest.TestCase):
@@ -38,7 +38,7 @@ class SnapshotFileAbi(unittest.TestCase):
             source_path.write_text(source)
             result = subprocess.run([
                 str(RUST_BIN / 'rustc'), '--edition=2024', '-C', 'opt-level=1', '-C', 'panic=abort',
-                str(source_path), '-L', 'dependency=' + str(deps),
+                str(source_path), *host_library_search_flags(deps),
                 '--extern', 'cyxia_prototype=' + str(library), '--extern', 'cyxia_kernel_core=' + str(kernel_core), '-o', str(binary),
             ], env=env(), capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)

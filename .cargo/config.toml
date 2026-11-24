@@ -5,4 +5,6 @@ rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
 # The low identity-linked PC image uses small; prebuilt core uses kernel.
 # Do not merge incompatible LLVM code-model flags through workspace release LTO.
 # Keep ARM release LTO unchanged; x86 still uses the release optimization level.
-rustflags = ["-C", "relocation-model=static", "-C", "code-model=small", "-C", "no-redzone=yes", "-C", "lto=off"]
+# Force integer serial Curve25519 on the freestanding soft-float target.
+# The default x86 SIMD backend crashes rustc 1.95 during target codegen.
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=small", "-C", "no-redzone=yes", "-C", "lto=off", "--cfg", "curve25519_dalek_backend=\"serial\""]

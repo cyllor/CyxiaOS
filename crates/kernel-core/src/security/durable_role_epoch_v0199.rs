@@ -52,6 +52,9 @@ pub struct DurableEpochGate{
     pending:Option<Pending>,
     last:Option<(PreparedEpoch,CommitEvidence,Outcome)>,
     boot_confirmed:bool,
+    paired_store:bool,
+    startup_verified:bool,
+    paired_confirmed:bool,
 }
 impl DurableEpochGate{
     /// The native storage/manifest adapter must verify the recovered state
@@ -68,10 +71,40 @@ impl DurableEpochGate{
             }
         }
         verify_recovered(&state)?;
-        Ok(Self{committed:state,slots,pending:None,last:None,boot_confirmed:false})
+        Ok(Self{committed:state,slots,pending:None,last:None,boot_confirmed:false,
+            paired_store:false,startup_verified:false,paired_confirmed:false})
+    }
+    /// Reconcile both actual protected startup stores. This alone is
+    /// not signed production startup; scratch media can exercise it.
+    pub fn recovered_pair(raw:&[u8],boot_raw:&[u8],slots:[SlotBinding;ROLE_COUNT],
+        verify_recovered:impl FnOnce(&SecurityStateStoreV2)->Result<(),Error>)->Result<Self,Error>{
+        let boot=super::boot_epoch_v1::BootEpochStoreV1::decode(boot_raw)?;
+        let mut gate=Self::recovered(raw,slots,|state|{
+            if !boot.matches(state){return Err(Error::Conflict);}
+            verify_recovered(state)
+        })?;
+        gate.paired_store=true;Ok(gate)
+    }
+    /// Production startup additionally requires both committed stores,
+    /// independently verified signed config and mounted-volume identity.
+    pub fn recovered_for_startup(raw:&[u8],boot_raw:&[u8],slots:[SlotBinding;ROLE_COUNT],
+        config:&super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        verify_recovered:impl FnOnce(&SecurityStateStoreV2)->Result<(),Error>)
+        ->Result<Self,Error>{
+        let mut gate=Self::recovered_pair(raw,boot_raw,slots,|state|{
+            config.check_committed(state)?;verify_recovered(state)
+        })?;
+        gate.startup_verified=true;Ok(gate)
     }
     pub fn boot_epoch(&self)->Option<u64>{
         (self.boot_confirmed && self.pending.is_none()).then_some(self.committed.last_boot_epoch)
+    }
+    /// Revalidate the committed signed startup configuration before
+    /// constructing or issuing actual static control roots.
+    pub fn confirmed_config_boot(&self,config:&super::offline_config_v1::VerifiedOfflineConfig<'_>)->Result<u64,Error>{
+        if !self.startup_verified||!self.paired_confirmed{return Err(Error::Unauthorized);}
+        config.check_committed(&self.committed)?;
+        self.boot_epoch().ok_or(Error::Busy)
     }
     fn slot(&self,role:Role)->Result<usize,Error>{
         self.slots.iter().find(|s|s.role==role).map(|s|usize::from(s.slot)).ok_or(Error::Unauthorized)
@@ -157,6 +190,26 @@ impl DurableEpochGate{
             readback,receipt.txid,receipt.commit_lsn)?;
         self.confirm(ticket,receipt,readback,verify_native)
     }
+    /// Atomic startup proof: both exact state and BootEpochStore images
+    /// appear in the same complete committed transaction, and actual native
+    /// FLUSH/readback verification is mandatory. Single-store confirmation
+    /// cannot publish a production BootEpoch.
+    pub fn confirm_boot_from_redo(
+        &mut self,ticket:PreparedEpoch,receipt:CommitEvidence,readback:&[u8],boot_readback:&[u8],
+        superblock_raw:&[u8],first_log_block:u32,state_home:u32,boot_home:u32,
+        begin:&[u8],redos:&[&[u8]],commit:&[u8],
+        verify_native:impl FnOnce(&PreparedEpoch,&CommitEvidence,&[u8])->Result<(),Error>,
+    )->Result<Outcome,Error>{
+        if !self.paired_store||ticket.change!=Change::AllocateBoot{return Err(Error::Unauthorized);}
+        let sb=super::file_media_v0199::SuperblockV1::decode(superblock_raw)?;
+        if sb.fs_uuid!=receipt.fs_uuid||sb.log_epoch!=receipt.log_epoch{return Err(Error::Conflict);}
+        let state=super::boot_epoch_v1::verify_boot_pair(sb,first_log_block,state_home,boot_home,
+            begin,redos,commit,readback,boot_readback,receipt.txid,receipt.commit_lsn)?;
+        if state.last_boot_epoch!=ticket.target_boot_epoch{return Err(Error::Conflict);}
+        let outcome=self.confirm_inner(ticket,receipt,readback,true,|t,r|verify_native(t,r,boot_readback))?;
+        self.paired_confirmed=true;Ok(outcome)
+    }
+
     /// Caller must obtain a stable read-back from the actual native file
     /// owner. The independent verifier authenticates the complete commit
     /// identity, exact after-image and real redo/FLUSH before releasing it.
@@ -167,6 +220,12 @@ impl DurableEpochGate{
         verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
         ->Result<Outcome,Error>
     {
+        self.confirm_inner(ticket,receipt,readback,false,verify_commit)
+    }
+    fn confirm_inner(&mut self,ticket:PreparedEpoch,receipt:CommitEvidence,readback:&[u8],
+        paired:bool,verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
+        ->Result<Outcome,Error>{
+        if self.paired_store&&ticket.change==Change::AllocateBoot&&!paired{return Err(Error::Unauthorized);}
         // The prior receipt is historical, not current startup authority.
         // Never return its successful outcome while a newer transaction
         // fences boot/service generation reads (even if bytes still match).

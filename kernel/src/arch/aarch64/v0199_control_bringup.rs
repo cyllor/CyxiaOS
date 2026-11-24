@@ -7,7 +7,7 @@
 use super::*;
 use cyxia_kernel_core::control_plane::{
     Identity,Error,
-    role_manifest_v0199::{NativeRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
+    role_manifest_v0199::{NativeRoleManifest,ValidatedRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
         SnapshotView,AuxOperation,CONTROL_MASK,REQUIRED_ONLINE_MASK},
     pie_image_v0199::{RolePackageSpec,RolePackageInput,VerifiedRolePackage,RelativeRelocation,ROLE_STACK_BYTES},
     role_budget_v0199::{Class,Cpu0BudgetLedger,Turn,Settlement,WINDOW_NS,KERNEL_COORDINATION_LIMIT_NS},
@@ -29,7 +29,11 @@ const OTHER_CPU_NS:u64=10_000_000; // 8ms recovery + 2ms kernel coordination
 // Leave headroom for EL0 exit, SVC dispatch and accounting settlement;
 // never extend the reservation or discard any observed execution time.
 const TURN_EXIT_GUARD_NS:u64=100_000;
-const DECISION_SLICE_NS:u64=100_000;
+// PR88 capture-3, role2: 253984ns against a 250000ns reservation,
+// before the initial eight-role milestone. A validated manifest borrow
+// alone did not eliminate the overrun. Shorten only the diagnostic
+// execution slice and retain all measured trap/dispatch overhead.
+const DECISION_SLICE_NS:u64=50_000;
 const E_AUTH:i64=-1;const E_FORMAT:i64=-2;const E_UNSUPPORTED:i64=-11;
 const EFAULT:i64=-12;const EAGAIN:i64=-13;
 const MAGIC:u64=0x4359_5838_424f_4f54;
@@ -44,10 +48,27 @@ struct Tables {root:Page,mid:Page,leaf:Page}
 impl Tables{const ZERO:Self=Self{root:Page::ZERO,mid:Page::ZERO,leaf:Page::ZERO};}
 #[repr(align(4096))]
 struct CopyBuffer([u8;COPY]);
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut BACKING:[Backing;ROLE_COUNT]=[const{Backing::ZERO};ROLE_COUNT];
 // A replacement uses a different physical root; the retired bank stays unmapped.
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut TABLES:[Tables;2*ROLE_COUNT]=[const{Tables::ZERO};2*ROLE_COUNT];
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut COPY_BUFFER:CopyBuffer=CopyBuffer([0;COPY]);
+#[cfg(feature="v0199-epoch-disk-selftest")]
+static DISK_CONTROL_BASE:AtomicU64=AtomicU64::new(0);
+const DISK_TABLE_OFFSET:usize=core::mem::size_of::<[Backing;ROLE_COUNT]>();
+const DISK_COPY_OFFSET:usize=DISK_TABLE_OFFSET+core::mem::size_of::<[Tables;2*ROLE_COUNT]>();
+const _:()=assert!(DISK_COPY_OFFSET+COPY<=8*1024*1024&&DISK_COPY_OFFSET%4096==0);
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn install_disk_control_pool(va:u64){
+    assert!(va>=super::super::HIGH&&va%4096==0);
+    assert!(DISK_CONTROL_BASE.compare_exchange(0,va,Ordering::AcqRel,Ordering::Acquire).is_ok());
+}
+#[cfg(feature="v0199-epoch-disk-selftest")]
+fn disk_pool()->u64{
+    let va=DISK_CONTROL_BASE.load(Ordering::Acquire);assert_ne!(va,0);va
+}
 const _:()=assert!(core::mem::size_of::<Backing>()==IMAGE+ROLE_STACK_BYTES);
 const _:()=assert!(core::mem::size_of::<Tables>()==3*PAGE);
 
@@ -222,11 +243,17 @@ fn cap_kind(role:Role)->CapKind{
 /// or a DMA queue. No EL0 context can exist during initial stage/seal.
 fn backing(index:usize)->*mut Backing{
     assert!(index<ROLE_COUNT);
-    unsafe{core::ptr::addr_of_mut!(BACKING).cast::<Backing>().add(index)}
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    {unsafe{(disk_pool() as *mut Backing).add(index)}}
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
+    {unsafe{core::ptr::addr_of_mut!(BACKING).cast::<Backing>().add(index)}}
 }
 fn tables(index:usize,bank:usize)->*mut Tables{
     assert!(index<ROLE_COUNT&&bank<2);
-    unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(bank*ROLE_COUNT+index)}
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    {unsafe{((disk_pool()+DISK_TABLE_OFFSET as u64) as *mut Tables).add(bank*ROLE_COUNT+index)}}
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
+    {unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(bank*ROLE_COUNT+index)}}
 }
 fn root_pa(index:usize,bank:usize)->u64{
     phys(tables(index,bank) as u64)
@@ -285,6 +312,9 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     let b=backing(index);let t=tables(index,bank);
     // SAFETY: CPU0 is the only loader and none of these contexts has been
     // published. The exclusive source scratch is scrubbed after each image.
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    let scratch=unsafe{&mut *((disk_pool()+DISK_COPY_OFFSET as u64) as *mut [u8;COPY])};
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
     scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
     checkpoint();
@@ -299,8 +329,18 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
     checkpoint();
     let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
-    stack.fill(0);
-    assert!(stack.iter().all(|&v|v==0));
+    // Diagnostic startup payload is program-specific, not an added ABI
+    // field. The generic ABI3 contract supplies arg_va/args_len and SP.
+    let mut args=[0u8;24];
+    args[..8].copy_from_slice(&cap.selector.to_le_bytes());
+    args[8..16].copy_from_slice(&0u64.to_le_bytes()); // no live target
+    args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
+    let startup=cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack,STACK_BASE,&args)
+        .expect("private ABI3 startup arguments");
+    assert_eq!(startup.sp,STACK_END-32);
+    assert!(stack[..ROLE_STACK_BYTES-32].iter().all(|&v|v==0));
+    assert_eq!(&stack[ROLE_STACK_BYTES-32..ROLE_STACK_BYTES-8],&args);
+    assert!(stack[ROLE_STACK_BYTES-8..].iter().all(|&v|v==0));
     checkpoint();
     let mut map=[0u8;IMAGE/PAGE];
     for seg in verified.load_segments(){
@@ -352,10 +392,10 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
         caps:role.allowed_caps(),control_ns_per_100ms:ROLE_QUOTAS[index],
         cpu_mask:CONTROL_MASK,thread_count:1,endpoint_id:endpoint};
     let mut context=user::Context::empty();
-    context.pc=entry;context.sp=STACK_END;
-    context.regs[0]=cap.selector;
-    context.regs[1]=0; // no authorized target exists before persistent boot verification
-    context.regs[2]=actor.generation;
+    context.pc=entry;context.sp=startup.sp;
+    context.regs[0]=startup.x0;context.regs[1]=startup.x1;
+    assert!(context.regs[2..].iter().all(|&v|v==0));
+    assert!(context.simd.iter().flatten().all(|&v|v==0));
     (member,Running{context,cap,abi:spec.abi,bank,entry,wake_ns:0,clocks:0,role_calls:0,yields:0,
         charges:0,turns:0,last_status:0,preemptions:0,fault_esr:0,fault_far:0})
 }
@@ -405,8 +445,8 @@ fn valid_audit_request(b:&[u8],actor:Identity,now:u64)->bool{
 // Native model arithmetic evidence from an independently linked brain's
 // actual private RW page, captured while its EL0 context is stopped at CLOCK.
 // This fixture never converts the result to an authorized model or suggestion.
-fn capture_model_probe(index:usize,r:&Running,actor:Identity){
-    assert!(index<2&&matches!(actor.generation,1|2));
+fn model_probe_row(index:usize,r:&Running,actor:Identity)->[u64;4]{
+    assert!(index<2&&actor.generation!=0);
     const OFFSET:usize=0xf000;
     let address=backing(index) as u64+OFFSET as u64;
     let t=tables(index,r.bank);
@@ -415,6 +455,11 @@ fn capture_model_probe(index:usize,r:&Running,actor:Identity){
     let row:[u64;4]=core::array::from_fn(|i|unsafe{((address as *const u64).add(i)).read_volatile()});
     assert_eq!(row[0],0x4359_4d4c_5052_4f42);
     assert_eq!(row[1],actor.generation);
+    row
+}
+fn capture_model_probe(index:usize,r:&Running,actor:Identity){
+    assert!(matches!(actor.generation,1|2));
+    let row=model_probe_row(index,r,actor);
     let at=493+index*8+(actor.generation as usize-1)*4;
     assert_eq!(SMP_EVIDENCE.words[at].load(Ordering::Relaxed),0);
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[at+i].store(v,Ordering::Relaxed);}
@@ -423,8 +468,8 @@ fn capture_model_probe(index:usize,r:&Running,actor:Identity){
 /// Full production cap issuance, boot identity, IPC and service backend
 /// are absent, so no publication, inference authorization or audit ACK is
 /// fabricated. Identity derives from the selected EL1 context, never x0.
-fn dispatch(index:usize,m:&NativeRoleManifest,r:&mut Running)->bool{
-    let member=m.members[index];
+fn dispatch(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running)->bool{
+    let member=m.manifest().members[index];
     assert_eq!(r.cap.holder,member.actor);
     let Ok(call)=decode_aarch64_svc_v3(r.abi,r.context.esr,&r.context.regs) else {
         r.context.regs[0]=E_FORMAT as u64;return false;
@@ -479,10 +524,11 @@ fn class(role:Role)->(Class,u16,u64){
         Role::Validator|Role::Learner=>(Class::Optional,0,500_000),
     }
 }
-fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter,expect_fault:bool)->bool{
+fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut BudgetMeter,expect_fault:bool)->bool{
     let (now,began)=budget.sample_gap();if now<r.wake_ns{return false;}
-    let (class,domain,quota)=class(m.members[index].role);
-    let token=match budget.ledger.reserve_role_with_wall(m,m.members[index].actor,cpu::slot(),class,domain,quota,50_000_000,now){
+    let member=m.manifest().members[index];
+    let (class,domain,quota)=class(member.role);
+    let token=match budget.ledger.reserve_validated_role_with_wall(m,member.actor,cpu::slot(),class,domain,quota,50_000_000,now){
         Ok(t)=>t,
         Err(Error::Exhausted|Error::Busy)=>return false,
         Err(e)=>panic!("native control budget refused: {e:?}"),
@@ -504,7 +550,7 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter
         if class==Class::Decision{interval=interval.min(DECISION_SLICE_NS);}
         unsafe{
             timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
-            let root=m.members[index].ttbr0_root;
+            let root=member.ttbr0_root;
             assert_eq!(root,root_pa(index,r.bank));
             // Each live root is immutable, private, and all leaves are nG.
             // Retire_root disconnects it and completes TLBI before reclaim.
@@ -528,7 +574,7 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter
     let receipt=budget.settle(token,began);
     r.charges=r.charges.checked_add(receipt.actual_ns).unwrap();r.turns+=1;
     if receipt.overrun||receipt.crossed_window{
-        report("V0199_BOOTSTRAP_OVERRUN",m.members[index].role.id() as u64,receipt.actual_ns,quota);
+        report("V0199_BOOTSTRAP_OVERRUN",member.role.id() as u64,receipt.actual_ns,quota);
         fatal(620+index as u64);
     }
     // Actual accounting, not elapsed host wall or a model-provided scalar.
@@ -571,6 +617,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
     use cyxia_kernel_core::control_plane::service_restart::{Lifecycle,RestartDecision};
     let until=now_ns().checked_add(15_000_000_000).unwrap();
     for i in 0..ROLE_COUNT{
+        let checked=manifest.validated().expect("current survivor inventory");
         let old=manifest.members[i];
         let old_cap=running[i].cap;
         let old_root=old.ttbr0_root;
@@ -588,7 +635,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             if now_ns()>=until{fatal(680);}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
             let turns=running[i].turns;
-            let _=turn(i,manifest,&mut running[i],budget,true);
+            let _=turn(i,&checked,&mut running[i],budget,true);
             if running[i].turns==turns{budget.idle_retry();}
         }
         let esr=running[i].fault_esr;let far=running[i].fault_far;
@@ -617,7 +664,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
                 if j==i||progressed&(1u64<<j)!=0{continue;}
                 if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
                 let turns=running[j].turns;
-                let _=turn(j,manifest,&mut running[j],budget,false);
+                let _=turn(j,&checked,&mut running[j],budget,false);
                 ran|=running[j].turns!=turns;
                 if running[j].clocks>before[j].0&&running[j].role_calls>before[j].1{
                     progressed|=1u64<<j;
@@ -648,7 +695,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         assert_eq!(unsafe{(*tables(i,old_bank)).root.0[0]},0);
         assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
         manifest.members[i]=member;
-        manifest.validate().unwrap();
+        let checked=manifest.validated().expect("replacement inventory");
         let receipt=budget.settle(credit,start);
         let actual=receipt.actual_ns;
         if receipt.overrun||receipt.crossed_window{
@@ -661,7 +708,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             if now_ns()>=until{fatal(684);}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
             let turns=running[i].turns;
-            let _=turn(i,manifest,&mut running[i],budget,false);
+            let _=turn(i,&checked,&mut running[i],budget,false);
             if running[i].turns==turns{budget.idle_retry();}
         }
         // READY here means only the actual diagnostic client reentered.
@@ -682,6 +729,76 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         report("V0199_PACKAGE_RELOAD",old.role.id() as u64,old_root,member.ttbr0_root);
     }
 }
+/// Dedicated durable scratch-disk profile uses the actual role7 ELF and
+/// the same verified relocation/W^X/32KiB stack loader as eight-role boot.
+/// It does not grant an Active model or live snapshot: the diagnostic
+/// snapshot call must remain EAGAIN. Disk I/O is not covered by this probe.
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) struct DiskSecurityRun{
+    pub root:u64,pub stack:u64,pub generation:u64,pub clocks:u64,pub snapshots:u64,
+    pub score:u64,pub severity:u64,pub esr:u64,pub far:u64,pub image_sha256:[u8;32],
+}
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn disk_security_run(generation:u64,bank:usize,stop:bool)->DiskSecurityRun{
+    assert_eq!(cpu::slot(),0);
+    let i=1usize;
+    let (m,mut r)=load(i,generation,bank);
+    assert_eq!(m.role,Role::Security);assert_eq!(m.actor.generation,generation);
+    let enter=|r:&mut Running|{
+        unsafe{
+            timer::arm(timer::ticks().checked_add(ticks_for(1_000_000)).unwrap());
+            user::enter_pinned_until_retired(&mut r.context,m.ttbr0_root,role_asid(i,bank));
+            cpu::disable_timer();
+        }
+    };
+    let mut probe=None;let mut yielded=false;
+    for _ in 0..128{
+        enter(&mut r);
+        if r.context.kind==9{continue;}
+        assert_eq!(r.context.kind,8);
+        let call=decode_aarch64_svc_v3(r.abi,r.context.esr,&r.context.regs).expect("actual role7 ABI3");
+        let result=match call.operation{
+            Syscall::Clock=>{
+                if r.clocks==0{probe=Some(model_probe_row(i,&r,m.actor));}
+                r.clocks+=1;i64::try_from(now_ns()).unwrap()
+            }
+            Syscall::ReadSnapshot=>{
+                let a=call.args;
+                assert!(r.cap.holder==m.actor&&r.cap.kind==CapKind::Snapshot(SnapshotView::RedactedSecurity)
+                    &&a[0]==r.cap.selector&&a[1]==12&&a[2]==0&&a[4]==264);
+                assert!(stack_span(i,bank,a[3],264,true).is_some());
+                r.role_calls+=1;EAGAIN
+            }
+            Syscall::Yield=>{r.yields+=1;yielded=true;0}
+            _=>panic!("unexpected role7 diagnostic syscall"),
+        };
+        r.context.regs[0]=result as u64;
+        if yielded&&r.role_calls>0{break;}
+    }
+    assert!(yielded&&r.clocks>0&&r.role_calls>0);
+    let row=probe.expect("role7 actually executed integer probe");
+    let root=m.ttbr0_root;
+    let stack=phys(unsafe{core::ptr::addr_of!((*backing(i)).stack)} as u64);
+    let mut esr=0;let mut far=0;
+    if stop{
+        r.context.pc=STACK_BASE-PAGE as u64;
+        for _ in 0..128{
+            enter(&mut r);
+            if r.context.kind==9{continue;}
+            assert_eq!(r.context.kind,8);assert_eq!(r.context.esr>>26,0x20);
+            assert_eq!(r.context.esr&0x3f,7);assert_eq!(r.context.far,STACK_BASE-PAGE as u64);
+            esr=r.context.esr;far=r.context.far;break;
+        }
+        assert_ne!(esr,0);
+        // This stopped diagnostic instance has no DMA, accepted work or
+        // issued production caps. Do not publish another old context.
+        r.cap.selector=0;retire_root(i,bank);
+        assert_eq!(unsafe{(*tables(i,bank)).root.0[0]},0);
+    }
+    DiskSecurityRun{root,stack,generation,clocks:r.clocks,snapshots:r.role_calls,
+        score:row[2],severity:row[3],esr,far,image_sha256:CATALOG[i].image_sha256}
+}
+
 pub(super) fn run()->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
@@ -697,7 +814,7 @@ pub(super) fn run()->!{
         other_protected_pool_bytes:core::mem::size_of::<[Tables;2*ROLE_COUNT]>()+COPY+1024*1024,
         other_control_ns_per_100ms:OTHER_CPU_NS,
     };
-    manifest.validate().expect("complete eight role physical inventory");
+    let checked=manifest.validated().expect("complete eight role physical inventory");
     budget.wait_for(||(1..REQUIRED).all(|slot|PROGRESS[slot*2].load(Ordering::Acquire)>=2));
     let until=now_ns().checked_add(5_000_000_000).unwrap();
     // Controller/publisher/supervisor before optional model/learning work.
@@ -710,13 +827,14 @@ pub(super) fn run()->!{
             // Do not begin an evaluation in a near-expired 100ms window.
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
             let turns=running[i].turns;
-            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            let _=turn(i,&checked,&mut running[i],&mut budget,false);
             ran|=running[i].turns!=turns;
         }
         if !ran{budget.idle_retry();}
     }
     report("V0199_BOOTSTRAP_INITIAL_ROLES",ROLE_COUNT as u64,0,0);
     restart_each(&mut manifest,&mut running,&mut budget);
+    let checked=manifest.validated().expect("post-restart inventory");
     // Exercise every reloaded diagnostic context in a common post-restart
     // round. They remain live together on the one fixed control CPU; the
     // evidence must not be a union of eight independent one-process boots.
@@ -731,7 +849,7 @@ pub(super) fn run()->!{
             if progressed&(1u64<<i)!=0{continue;}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
             let turns=running[i].turns;
-            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            let _=turn(i,&checked,&mut running[i],&mut budget,false);
             ran|=running[i].turns!=turns;
             if running[i].clocks>start[i].0&&running[i].role_calls>start[i].1{
                 progressed|=1u64<<i;

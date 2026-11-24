@@ -1,8 +1,9 @@
 //! Bounded, no-alloc EL1 DecisionRecord v3 registration/publication guard.
 //!
-//! Narrow V0.19.9 G1 vertical slice: RULE_ONLY without causal fallback and
-//! single-action AI_ASSISTED with an atomic admitted-advice disposition.
-//! Trials and causal fallback remain fail-closed as NotReady. This is not an SVC
+//! V0.19.9 G1 vertical slices: RULE_ONLY, single-action causal fallback
+//! and AI_ASSISTED with atomic admitted-advice disposition.
+//! Ordinary single-action authorized trials use a retained signed permit.
+//! Canary remains fail-closed. This is not an SVC
 //! handler, credential loader or proof of a native driver APPLY. The only way
 //! to call the publication adapter is via an exact previously frozen plan.
 //! The adapter must be an EL1 native owner, and must report actual acceptance
@@ -101,6 +102,10 @@ pub struct AssistedScope<'a>{
     pub assisted_mode:bool,
     pub offline_model_authorized:bool,
 }
+#[derive(Clone,Copy)]
+struct ClaimedWork { frame:super::apply_work_v1::WorkFrame, origin:apply_report_v1::ReportOrigin, accepted_ns:u64 }
+#[derive(Clone,Copy)]
+struct TrialProof{permit_id:u64,permit_hash:[u8;32],hold:Option<super::trial_permit_v1::Hold>,cost_settled:bool}
 struct Pending {
     plan_seq: u64,
     plan_digest: [u8;32],
@@ -109,27 +114,47 @@ struct Pending {
     status: PendingStatus,
     expires_ns: u64,
     assisted:Option<AssistedProof>,
+    claimed:[Option<ClaimedWork>;MAX_ACTIONS],
+    trial:Option<TrialProof>,
 }
+
+/// 64 published nonterminal obligations plus one unpublished candidate.
+/// Native owner places this storage in its already accounted control pool;
+/// do not construct it on the kernel stack. No slot eviction is permitted.
+pub const MAX_PUBLISHED_PLANS:usize=64;
+pub struct PublishedPlanPool{
+    bound:bool,
+    slots:[Option<Pending>;MAX_PUBLISHED_PLANS+1],
+}
+impl PublishedPlanPool{
+    pub const fn new()->Self{Self{bound:false,slots:[const{None};MAX_PUBLISHED_PLANS+1]}}
+    pub const fn bytes()->usize{core::mem::size_of::<Self>()}
+    fn count_published(&self)->usize{
+        self.slots.iter().flatten().filter(|p|p.status!=PendingStatus::Frozen).count()
+    }
+}
+const _:()=assert!(PublishedPlanPool::bytes()<1024*1024);
 
 /// Fixed-memory guard. This can be owned by a protected, serialized EL1
 /// executor; no public entry point grants a new CPU, memory page or capability.
 /// The caller-supplied Identity must be authenticated by the architecture
 /// adapter before reaching this object.
-pub struct RegisteredDecisionGate {
+pub struct RegisteredDecisionGate<'pool> {
     controller: Identity,
     publisher: Identity,
     boot_epoch: u64,
     controller_epoch: u64,
     last_plan_seq: u64,
     last_decision_seq: u64,
-    pending: Option<Pending>,
+    pending: Option<Pending>, // legacy single-plan component profile
+    pool: Option<&'pool mut PublishedPlanPool>,
     /// Only an EL1-authenticated independent terminal/recovery owner can
     /// close an accepted/UNKNOWN plan. Unconfigured gates stay fail-closed.
     terminal_owner: Option<Identity>,
     history: [Option<TerminalSummary>; TERMINAL_HISTORY],
     history_next: usize,
 }
-impl RegisteredDecisionGate {
+impl<'pool> RegisteredDecisionGate<'pool> {
     pub fn new(controller: Identity, publisher: Identity, boot: u64, epoch: u64)
         -> Result<Self, Error>
     {
@@ -138,7 +163,7 @@ impl RegisteredDecisionGate {
         {return Err(Error::Invalid);}
         Ok(Self {
             controller, publisher, boot_epoch:boot, controller_epoch:epoch,
-            last_plan_seq:0,last_decision_seq:0,pending:None,
+            last_plan_seq:0,last_decision_seq:0,pending:None,pool:None,
             terminal_owner:None,history:[None;TERMINAL_HISTORY],history_next:0,
         })
     }
@@ -155,6 +180,66 @@ impl RegisteredDecisionGate {
         let mut gate=Self::new(controller,publisher,boot,epoch)?;
         gate.terminal_owner=Some(terminal_owner);
         Ok(gate)
+    }
+
+    /// Full-capacity profile, borrowing an exclusive, preallocated pool.
+    /// Its boot-scoped authority remains unique; an occupied pool cannot
+    /// be rebound to a new gate or cleared to recover capacity.
+    pub fn with_pool(controller:Identity,publisher:Identity,terminal_owner:Identity,
+        boot:u64,epoch:u64,pool:&'pool mut PublishedPlanPool)->Result<Self,Error>{
+        if pool.bound||pool.slots.iter().any(Option::is_some){return Err(Error::Busy);}
+        let mut gate=Self::new_with_terminal_owner(controller,publisher,terminal_owner,boot,epoch)?;
+        pool.bound=true;gate.pool=Some(pool);Ok(gate)
+    }
+    fn lookup(&self,seq:u64)->Option<&Pending>{
+        if let Some(pool)=self.pool.as_deref(){
+            pool.slots.iter().flatten().find(|p|p.plan_seq==seq)
+        }else{self.pending.as_ref().filter(|p|p.plan_seq==seq)}
+    }
+    fn lookup_mut(&mut self,seq:u64)->Option<&mut Pending>{
+        if let Some(pool)=self.pool.as_deref_mut(){
+            pool.slots.iter_mut().flatten().find(|p|p.plan_seq==seq)
+        }else{self.pending.as_mut().filter(|p|p.plan_seq==seq)}
+    }
+    fn frozen_or_legacy_busy(&self)->Option<&Pending>{
+        if let Some(pool)=self.pool.as_deref(){
+            pool.slots.iter().flatten().find(|p|p.status==PendingStatus::Frozen)
+        }else{self.pending.as_ref()}
+    }
+    fn check_registration_slot(&self)->Result<(),Error>{
+        if self.frozen_or_legacy_busy().is_some(){return Err(Error::Busy);}
+        if self.pool.as_deref().is_some_and(|p|p.slots.iter().all(Option::is_some)){
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    fn insert_frozen(&mut self,pending:Pending){
+        // Checked before any advice ledger mutation. Serialized EL1 owner
+        // ensures no competing insertion between preflight and this store.
+        if let Some(pool)=self.pool.as_deref_mut(){
+            *pool.slots.iter_mut().find(|p|p.is_none()).expect("preflighted pool slot")=Some(pending);
+        }else{assert!(self.pending.is_none());self.pending=Some(pending);}
+    }
+    fn begin_publish(&mut self,seq:u64)->Result<(),Error>{
+        if self.published_count()>=MAX_PUBLISHED_PLANS{return Err(Error::Busy);}
+        let p=self.lookup_mut(seq).ok_or(Error::Stale)?;
+        if p.status!=PendingStatus::Frozen{return Err(Error::Busy);}
+        p.status=PendingStatus::AdapterUnknown;
+        Ok(())
+    }
+    fn release(&mut self,seq:u64){
+        if let Some(pool)=self.pool.as_deref_mut(){
+            let slot=pool.slots.iter_mut().find(|v|v.as_ref().is_some_and(|p|p.plan_seq==seq))
+                .expect("retained plan");*slot=None;
+        }else{assert_eq!(self.pending.as_ref().map(|p|p.plan_seq),Some(seq));self.pending=None;}
+    }
+    pub fn published_count(&self)->usize{
+        self.pool.as_deref().map_or_else(
+            ||usize::from(self.pending.as_ref().is_some_and(|p|p.status!=PendingStatus::Frozen)),
+            PublishedPlanPool::count_published)
+    }
+    pub fn has_unpublished(&self)->bool{
+        self.frozen_or_legacy_busy().is_some_and(|p|p.status==PendingStatus::Frozen)
     }
 
     fn check_identity_and_context(&self, context: TrustedRegistrationScope)
@@ -187,8 +272,8 @@ impl RegisteredDecisionGate {
     ) -> Result<Registration,Error> {
         if actor != self.controller {return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        if let Some(pending)=&self.pending {
-            if pending.assisted.is_some(){return Err(Error::Busy);}
+        if let Some(pending)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()) {
+            if pending.assisted.is_some()||pending.trial.is_some(){return Err(Error::Busy);}
             let same_key=plan.header.plan_seq==pending.plan_seq;
             let same_bytes=same_key
                 && sha256(plan_wire)==pending.plan_digest
@@ -201,7 +286,7 @@ impl RegisteredDecisionGate {
                     // bypass a revoked rule, changed ledger or expired scope.
                     PendingStatus::Frozen => {
                         self.validate_rule_only(
-                            plan_wire, &plan, records, rule_profile, actions, context
+                            plan_wire, &plan, records, rule_profile, actions, context,false
                         )?;
                         Ok(Registration::ExactRetry)
                     }
@@ -218,7 +303,8 @@ impl RegisteredDecisionGate {
                 Err(Error::Busy)
             };
         }
-        self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context)?;
+        self.check_registration_slot()?;
+        self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context,false)?;
         if plan.header.plan_seq<=self.last_plan_seq {return Err(Error::Stale);}
         let mut last=self.last_decision_seq;
         for raw in records {
@@ -232,14 +318,14 @@ impl RegisteredDecisionGate {
         for index in 0..usize::from(plan.header.action_count) {
             expires=expires.min(plan.action(index)?.expires_local_ns);
         }
-        self.pending=Some(Pending {
+        self.insert_frozen(Pending {
             plan_seq:plan.header.plan_seq,
             plan_digest:sha256(plan_wire),
             count:records.len(),
             decision_bytes:copied,
             status:PendingStatus::Frozen,
             expires_ns:expires,
-            assisted:None,
+            assisted:None,claimed:[None;MAX_ACTIONS],trial:None,
         });
         self.last_plan_seq=plan.header.plan_seq;
         self.last_decision_seq=last;
@@ -254,6 +340,7 @@ impl RegisteredDecisionGate {
         profile:&Profile<'_>,
         actions:&[FrozenAction<'_>],
         context: TrustedRegistrationScope,
+        causal_fallback:bool,
     ) -> Result<(),Error> {
         self.check_identity_and_context(context)?;
         if plan.header.flags != 0 {return Err(Error::NotReady);}
@@ -286,7 +373,7 @@ impl RegisteredDecisionGate {
                 return Err(Error::Denied);
             }
             if rec.source!=DecisionSource::RuleOnly
-                || rec.reason_code==7 // requires frozen AdviceDisposition v1
+                || (rec.reason_code==7)!=causal_fallback // only atomic causal path
             {return Err(Error::NotReady);}
             if rec.boot_epoch!=context.boot_epoch
                 || rec.rules_generation!=context.rules_generation
@@ -333,9 +420,9 @@ impl RegisteredDecisionGate {
         native_accept:impl FnOnce()->Result<(),Error>,
     ) -> Result<Publication,Error> {
         if actor!=self.publisher {return Err(Error::Denied);}
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
-        if pending.assisted.is_some(){return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
+        let pending=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
+        if pending.assisted.is_some()||pending.trial.is_some(){return Err(Error::Denied);}
         if plan.header.plan_seq!=pending.plan_seq
             || sha256(plan_wire)!=pending.plan_digest
             || records.len()!=pending.count
@@ -350,17 +437,136 @@ impl RegisteredDecisionGate {
             PendingStatus::AdapterUnknown => return Err(Error::NotReady),
             PendingStatus::Frozen => {}
         }
-        self.validate_rule_only(plan_wire,&plan,records,profile,actions,context)?;
+        self.validate_rule_only(plan_wire,&plan,records,profile,actions,context,false)?;
         // Mark before the potentially side-effecting callback; failures
         // cannot safely be interpreted as "nothing happened".
-        self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterUnknown;
+        self.begin_publish(plan.header.plan_seq)?;
         let result=native_accept();
         if result.is_ok() {
-            self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterAccepted;
+            self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?.status=PendingStatus::AdapterAccepted;
             Ok(Publication::AdapterAccepted)
         } else {
             result.map(|_|Publication::AdapterAccepted)
         }
+    }
+
+    fn validate_trial_one(&self,plan_wire:&[u8],plan:&PlanV2<'_>,
+        record:&[u8;DECISION_BYTES],profile:&Profile<'_>,local:&FrozenAction<'_>,
+        context:TrustedRegistrationScope,table:&super::trial_permit_v1::TrialTable,
+    )->Result<(super::trial_permit_v1::Permit,u16),Error>{
+        self.check_identity_and_context(context)?;
+        if plan.header.flags!=0||plan.header.action_count!=1||rule_profile_mismatch(profile,context)
+            ||plan.header.base_plan_version!=context.base_plan_version||plan.ledger_generation!=context.ledger_generation
+            ||plan.core_generation!=context.core_generation||plan.header.controller_epoch!=context.controller_epoch
+            ||plan.header.snapshot_seq!=context.snapshot_seq{return Err(Error::Stale);}
+        plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
+        let rec=DecisionRecordV3::decode(record)?;let act=plan.action(0)?;
+        let end=context.sampled_ns.checked_add(100_000_000).ok_or(Error::Clock)?;
+        let installed=context.sampled_ns.checked_add(10_000_000_000).ok_or(Error::Clock)?;
+        if rec.source!=DecisionSource::AuthorizedTrial||rec.boot_epoch!=context.boot_epoch
+            ||rec.rules_generation!=context.rules_generation||rec.rules_hash!=context.rules_hash
+            ||rec.plan_digest!=sha256(plan_wire)||rec.target_id!=local.target.id||rec.target_generation!=local.target.generation
+            ||rec.domain_id!=local.domain_id||act.candidate_set_hash!=local.candidate_set_hash
+            ||rec.candidate_set_hash!=local.candidate_set_hash||act.action_payload!=local.action_payload
+            ||act.expires_local_ns<=context.now_ns||act.expires_local_ns>end
+            ||plan.header.active_until_local_ns!=if act.domain_id==14{0}else{installed}{
+            return Err(Error::Denied);
+        }
+        let (permit,ordinal)=table.next(rec.trial_permit_id,context.boot_epoch,local.target,local.domain_id,
+            context.now_ns,context.rules_generation,context.rules_hash)?;
+        let rule=profile.match_trial(permit.rule_id,local.domain_id,local.target.id,ordinal,local.raw_fields,
+            super::rule_profile_v2::Candidates{static_ordinals:local.static_ordinals})?;
+        if permit.flags!=0||rec.rule_id!=rule.rule_id||rec.choice_policy!=rule.choice_policy
+            ||rec.allowed_mask!=rule.allowed_mask||rec.fallback_index!=rule.fallback_index
+            ||rec.selected_index!=rule.fallback_index||!rec.matches_candidate_count(local.static_ordinals.len())
+            ||act.expires_local_ns>permit.expires_ns
+            ||plan.header.active_until_local_ns>permit.expires_ns{return Err(Error::Denied);}
+        Ok((permit,ordinal))
+    }
+    /// Restricted ordinary one-action trial. Unlike ordinary rule matching
+    /// it requires a real protected signed permit, not an AI-provided value.
+    pub fn register_trial_one(&mut self,actor:Identity,plan_wire:&[u8],record:&[u8;DECISION_BYTES],
+        profile:&Profile<'_>,local:&FrozenAction<'_>,context:TrustedRegistrationScope,
+        table:&super::trial_permit_v1::TrialTable)->Result<Registration,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        if let Some(p)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()){
+            if p.plan_seq!=plan.header.plan_seq{return Err(Error::Busy);}
+            let trial=p.trial.ok_or(Error::Denied)?;
+            if p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
+            return match p.status{
+                PendingStatus::AdapterAccepted=>Ok(Registration::ExactRetry),
+                PendingStatus::AdapterUnknown=>Err(Error::NotReady),
+                PendingStatus::Frozen=>{
+                    let (permit,_)=self.validate_trial_one(plan_wire,&plan,record,profile,local,context,table)?;
+                    if permit.permit_id!=trial.permit_id||sha256(&permit.encode()?)!=trial.permit_hash{return Err(Error::Stale);}
+                    Ok(Registration::ExactRetry)
+                }
+            };
+        }
+        self.check_registration_slot()?;
+        let (permit,_)=self.validate_trial_one(plan_wire,&plan,record,profile,local,context,table)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        if plan.header.plan_seq<=self.last_plan_seq||rec.decision_seq<=self.last_decision_seq{return Err(Error::Stale);}
+        let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
+        self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),count:1,
+            decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:plan.action(0)?.expires_local_ns,
+            assisted:None,claimed:[None;MAX_ACTIONS],
+            trial:Some(TrialProof{permit_id:permit.permit_id,permit_hash:sha256(&permit.encode()?),
+                hold:None,cost_settled:false})});
+        self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
+        Ok(Registration::Frozen)
+    }
+    pub fn publish_trial_one(&mut self,actor:Identity,plan_wire:&[u8],record:&[u8;DECISION_BYTES],
+        profile:&Profile<'_>,local:&FrozenAction<'_>,context:TrustedRegistrationScope,
+        table:&mut super::trial_permit_v1::TrialTable,cpu:u64,memory:u64,
+        verify_native_reservation:impl FnOnce(&super::trial_permit_v1::Permit)->Result<(),Error>,
+        native_accept:impl FnOnce()->Result<(),Error>,
+    )->Result<Publication,Error>{
+        use super::trial_permit_v1::UseKey;
+        if actor!=self.publisher{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let p=self.lookup(plan.header.plan_seq).ok_or(Error::Stale)?;
+        let trial=p.trial.ok_or(Error::Denied)?;
+        if p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
+        match p.status{
+            PendingStatus::AdapterAccepted=>return Ok(Publication::ReplayNoEffect),
+            PendingStatus::AdapterUnknown=>return Err(Error::NotReady),
+            PendingStatus::Frozen=>{},
+        }
+        if self.published_count()>=MAX_PUBLISHED_PLANS{return Err(Error::Busy);}
+        let (permit,ordinal)=self.validate_trial_one(plan_wire,&plan,record,profile,local,context,table)?;
+        if permit.permit_id!=trial.permit_id||sha256(&permit.encode()?)!=trial.permit_hash{return Err(Error::Stale);}
+        let rec=DecisionRecordV3::decode(record)?;
+        let hold=table.reserve(permit.permit_id,UseKey{controller_epoch:self.controller_epoch,
+            plan_seq:plan.header.plan_seq,decision_seq:rec.decision_seq},ordinal,cpu,memory,
+            context.now_ns,verify_native_reservation)?;
+        // Preflighted while serialized: no fallible work between
+        // reservation and recording the potentially unknown publication.
+        self.begin_publish(plan.header.plan_seq).expect("preflighted trial publication");
+        self.lookup_mut(plan.header.plan_seq).unwrap().trial.as_mut().unwrap().hold=Some(hold);
+        native_accept()?;
+        table.confirm_accept(hold,|_|Ok(()))?;
+        self.lookup_mut(plan.header.plan_seq).unwrap().status=PendingStatus::AdapterAccepted;
+        Ok(Publication::AdapterAccepted)
+    }
+    /// Exact terminal cost/acceptance recovery must close the permit
+    /// obligation before releasing the corresponding registered plan.
+    /// Actual overrun closes the permit but preserves its charged costs.
+    pub fn settle_trial_costs(&mut self,actor:Identity,plan_seq:u64,
+        table:&mut super::trial_permit_v1::TrialTable,accepted:bool,cpu:u64,memory:u64,
+        verify_native:impl FnOnce(super::trial_permit_v1::Hold,bool)->Result<(),Error>,
+    )->Result<(),Error>{
+        if self.terminal_owner!=Some(actor){return Err(Error::Denied);}
+        let p=self.lookup_mut(plan_seq).ok_or(Error::Stale)?;
+        let trial=p.trial.as_mut().ok_or(Error::Denied)?;
+        if trial.cost_settled{return Err(Error::Stale);}
+        let hold=trial.hold.ok_or(Error::NotReady)?;
+        if p.status==PendingStatus::AdapterAccepted&&!accepted{return Err(Error::Denied);}
+        let result=table.settle(hold,accepted,cpu,memory,verify_native);
+        // Only an actually completed settlement clears this exact hold.
+        if table.hold_is_settled(hold)?{trial.cost_settled=true;}
+        result
     }
 
     /// Narrow one-action assisted vertical slice. Unlike RULE_ONLY the
@@ -436,7 +642,7 @@ impl RegisteredDecisionGate {
     {
         if actor!=self.controller{return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        if let Some(p)=&self.pending{
+        if let Some(p)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()){
             if plan.header.plan_seq!=p.plan_seq{return Err(Error::Busy);}
             let proof=p.assisted.ok_or(Error::Denied)?;
             if p.count!=1||sha256(plan_wire)!=p.plan_digest||p.decision_bytes[0]!=*record
@@ -450,6 +656,7 @@ impl RegisteredDecisionGate {
                 PendingStatus::AdapterUnknown=>Err(Error::NotReady),
             };
         }
+        self.check_registration_slot()?;
         let disp=AdviceDispositionV1::decode(disposition)?;
         if disp.state!=1||disp.processed_ns!=context.now_ns{return Err(Error::Denied);}
         let key=AdviceKey{boot_epoch:disp.boot_epoch,advisor_epoch:disp.advisor_epoch,advice_seq:disp.advice_seq};
@@ -463,11 +670,111 @@ impl RegisteredDecisionGate {
         let expiry=plan.action(0)?.expires_local_ns.min(AdviceEnvelopeV1::decode(&advice_wire)?.expires_ns);
         let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
         ledger.finalize_registered_adoption(actor,disposition,record,context.now_ns)?;
-        self.pending=Some(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
+        self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
             count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
-            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)})});
+            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),claimed:[None;MAX_ACTIONS],trial:None});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
         Ok(Registration::Frozen)
+    }
+
+    /// Atomically freeze RULE_ONLY reason7 and REJECTED_FALLBACK state2.
+    /// The current legal fallback is independently recomputed. The old
+    /// recommendation never becomes an action authority or training label.
+    /// This restricted path accepts one action, same snapshot and target;
+    /// mismatched old advice must instead be handled as observation only.
+    pub fn register_rejected_fallback_one(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],disposition:&[u8;DISPOSITION_BYTES],
+        profile:&Profile<'_>,local:&FrozenAction<'_>,context:TrustedRegistrationScope,
+        scope:&AssistedScope<'_>,ledger:&mut EvidenceLedger,
+        verify_hard_rejection:impl FnOnce(&AdviceEnvelopeV1,&FrozenAction<'_>)->Result<(),Error>,
+    )->Result<Registration,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let disp=AdviceDispositionV1::decode(disposition)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        if disp.state!=2||rec.source!=DecisionSource::RuleOnly||rec.reason_code!=7
+            ||plan.header.action_count!=1{return Err(Error::Denied);}
+        if let Some(p)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()){
+            if p.plan_seq!=plan.header.plan_seq{return Err(Error::Busy);}
+            let proof=p.assisted.ok_or(Error::Denied)?;
+            if p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record
+                ||proof.disposition_digest!=sha256(disposition){return Err(Error::Denied);}
+            return match p.status{
+                PendingStatus::Frozen=>{
+                    self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+                        core::slice::from_ref(local),context,true)?;
+                    Ok(Registration::ExactRetry)
+                }
+                PendingStatus::AdapterAccepted=>Ok(Registration::ExactRetry),
+                PendingStatus::AdapterUnknown=>Err(Error::NotReady),
+            };
+        }
+        self.check_registration_slot()?;
+        self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+            core::slice::from_ref(local),context,true)?;
+        if !scope.assisted_mode||!scope.offline_model_authorized||rec.mode!=2
+            ||matches!(local.domain_id,6|11|12|14)||disp.processed_ns!=context.now_ns{
+            return Err(Error::Denied);
+        }
+        let trusted=scope.advice;
+        if !trusted.epochs.valid()||trusted.epochs.boot!=context.boot_epoch
+            ||trusted.epochs.controller!=context.controller_epoch
+            ||trusted.epochs.resources!=context.ledger_generation||trusted.epochs.cores!=context.core_generation
+            ||trusted.snapshot_seq!=context.snapshot_seq||trusted.sampled_ns!=context.sampled_ns
+            ||trusted.now_ns!=context.now_ns||trusted.domain!=local.domain_id||trusted.target!=local.target
+            ||trusted.candidates!=local.static_ordinals||trusted.candidate_set_hash!=local.candidate_set_hash{
+            return Err(Error::Denied);
+        }
+        let key=AdviceKey{boot_epoch:disp.boot_epoch,advisor_epoch:disp.advisor_epoch,advice_seq:disp.advice_seq};
+        let advice_wire=ledger.admitted_wire(actor,key)?;
+        let advice=AdviceEnvelopeV1::decode(&advice_wire)?;
+        disp.matches_decision_pair(self.boot_epoch,&advice_wire,record)?;
+        // Rejection reason is independently determined; expiry/model
+        // change takes precedence. A stale source epoch is never adopted,
+        // and requires observation/recovery rather than a new causal pair.
+        if advice.advisor_epoch!=trusted.advisor_epoch{return Err(Error::Stale);}
+        let reason=if context.now_ns>=advice.expires_ns||advice.active_model_generation!=trusted.epochs.model
+            ||advice.model_hash!=trusted.model_hash{4}
+        else if rec.choice_policy!=1{2}
+        else if rec.allowed_mask&(1u32<<advice.recommended_index)==0{1}
+        else{verify_hard_rejection(&advice,local)?;3};
+        if disp.reason_code!=reason{return Err(Error::Denied);}
+        if plan.header.plan_seq<=self.last_plan_seq||rec.decision_seq<=self.last_decision_seq{return Err(Error::Stale);}
+        let expiry=plan.action(0)?.expires_local_ns;
+        let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
+        // No fallible mutation after the causal ledger is finalized.
+        ledger.finalize_registered_fallback(actor,disposition,record,context.now_ns)?;
+        self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
+            count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
+            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),
+            claimed:[None;MAX_ACTIONS],trial:None});
+        self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
+        Ok(Registration::Frozen)
+    }
+    /// Separate exact publisher gate for a causal rule fallback. Even if
+    /// the rejected advice expired, the independent *current* fallback
+    /// still needs current rule, candidate, resource and lease validation.
+    pub fn publish_rejected_fallback_one(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],profile:&Profile<'_>,local:&FrozenAction<'_>,
+        context:TrustedRegistrationScope,native_accept:impl FnOnce()->Result<(),Error>,
+    )->Result<Publication,Error>{
+        if actor!=self.publisher{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        let p=self.lookup(plan.header.plan_seq).ok_or(Error::Stale)?;
+        if rec.source!=DecisionSource::RuleOnly||rec.reason_code!=7||p.assisted.is_none()
+            ||p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
+        match p.status{
+            PendingStatus::AdapterAccepted=>return Ok(Publication::ReplayNoEffect),
+            PendingStatus::AdapterUnknown=>return Err(Error::NotReady),
+            PendingStatus::Frozen=>{},
+        }
+        self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+            core::slice::from_ref(local),context,true)?;
+        self.begin_publish(plan.header.plan_seq)?;
+        native_accept()?;
+        self.lookup_mut(plan.header.plan_seq).unwrap().status=PendingStatus::AdapterAccepted;
+        Ok(Publication::AdapterAccepted)
     }
 
     /// The distinct publisher presents the same frozen registered decision.
@@ -480,7 +787,7 @@ impl RegisteredDecisionGate {
     {
         if actor!=self.publisher{return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        let p=self.pending.as_ref().ok_or(Error::Stale)?;
+        let p=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
         let proof=p.assisted.ok_or(Error::Denied)?;
         if plan.header.plan_seq!=p.plan_seq||p.count!=1||sha256(plan_wire)!=p.plan_digest
             ||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
@@ -490,9 +797,9 @@ impl RegisteredDecisionGate {
             PendingStatus::Frozen=>{},
         }
         self.validate_assisted_one(plan_wire,&plan,record,profile,local,context,scope,&proof.advice)?;
-        self.pending.as_mut().unwrap().status=PendingStatus::AdapterUnknown;
+        self.begin_publish(plan.header.plan_seq)?;
         native_accept()?;
-        self.pending.as_mut().unwrap().status=PendingStatus::AdapterAccepted;
+        self.lookup_mut(plan.header.plan_seq).unwrap().status=PendingStatus::AdapterAccepted;
         Ok(Publication::AdapterAccepted)
     }
 
@@ -514,8 +821,8 @@ impl RegisteredDecisionGate {
         if self.terminal_owner!=Some(actor) || !actor.valid() {
             return Err(Error::Denied);
         }
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
-        if pending.status==PendingStatus::Frozen {
+        let pending=self.lookup(terminal.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
+        if pending.status==PendingStatus::Frozen||pending.trial.is_some_and(|t|!t.cost_settled) {
             return Err(Error::NotReady);
         }
         let required=(1u32.checked_shl(pending.count as u32).ok_or(Error::Invalid)?-1) as u16;
@@ -540,8 +847,66 @@ impl RegisteredDecisionGate {
         };
         self.history[self.history_next]=Some(summary);
         self.history_next=(self.history_next+1)%TERMINAL_HISTORY;
-        self.pending=None;
+        self.release(summary.plan_seq);
         Ok(summary)
+    }
+
+    /// Native EXECUTOR_FETCH/EL1 acceptance linearization boundary.
+    /// Before a returned WorkFrame can execute, the real resource owner
+    /// must atomically check desired/current version, object generation,
+    /// reservation, dependencies and executor cap. The callback is a
+    /// protected native gate, not user-provided authorization.
+    /// Repeated fetch with a *new* RPC key is not a second execution.
+    pub fn claim_apply_work(&mut self,plan_wire:&[u8],index:usize,
+        scope:TrustedApplyScope,binding:ExecutorBindingV1,
+        origin:apply_report_v1::ReportOrigin,
+        verify_and_accept:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>)->Result<(),Error>,
+    )->Result<super::apply_work_v1::WorkFrame,Error>{
+        let plan=PlanV2::decode(plan_wire)?;
+        if plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
+            ||scope.now_ns==0{return Err(Error::Denied);}
+        let boot=self.boot_epoch;
+        let p=self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
+        if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
+        if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
+        if p.claimed[index].is_some(){return Err(Error::Busy);}
+        if plan.header.active_until_local_ns!=0&&scope.now_ns>=plan.header.active_until_local_ns{
+            return Err(Error::Expired);
+        }
+        let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,boot,
+            scope.plan_version,binding,origin)?;
+        let work=super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
+        // Contract: this callback commits atomically or makes NO effect.
+        // Unknown external operations are not allowed in this admission
+        // callback; actual execution occurs only after the retained claim.
+        verify_and_accept(&work)?;
+        p.claimed[index]=Some(ClaimedWork{frame,origin,accepted_ns:scope.now_ns});
+        Ok(frame)
+    }
+
+    pub fn publisher_scope(&self,actor:Identity)->Result<(u64,u64),Error>{
+        if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
+        Ok((self.boot_epoch,self.controller_epoch))
+    }
+
+    /// Read the exact retained registered DecisionRecord (ControlRPC op9).
+    /// The only authorized EL0 reader is the independently registered
+    /// publisher. No record reconstruction and no implicit publication.
+    pub fn read_decision(&self,actor:Identity,boot:u64,epoch:u64,seq:u64)
+        ->Result<[u8;DECISION_BYTES],Error>{
+        if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
+        if boot!=self.boot_epoch||epoch!=self.controller_epoch||seq==0{return Err(Error::Stale);}
+        let find=|p:&Pending|->Result<Option<[u8;DECISION_BYTES]>,Error>{
+            for raw in &p.decision_bytes[..p.count]{
+                let d=DecisionRecordV3::decode(raw)?;
+                if d.decision_seq==seq{return Ok(Some(*raw));}
+            }
+            Ok(None)
+        };
+        if let Some(pool)=self.pool.as_deref(){
+            for p in pool.slots.iter().flatten(){if let Some(raw)=find(p)?{return Ok(raw);}}
+        }else if let Some(p)=self.pending.as_ref(){if let Some(raw)=find(p)?{return Ok(raw);}}
+        Err(Error::Stale)
     }
 
     /// Query is limited to authenticated local roles; old terminal keys
@@ -579,7 +944,7 @@ impl RegisteredDecisionGate {
             return Err(Error::Denied);
         }
         let plan=PlanV2::decode(plan_wire)?;
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        let pending=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
         if pending.status==PendingStatus::Frozen {
             return Err(Error::NotReady);
         }
@@ -588,6 +953,18 @@ impl RegisteredDecisionGate {
             || plan.header.controller_epoch!=self.controller_epoch
             || scope.boot_epoch!=self.boot_epoch
         {return Err(Error::Denied);}
+        if pending.trial.is_some_and(|t|!t.cost_settled){return Err(Error::NotReady);}
+        // A valid current executor binding alone is insufficient. Every
+        // report must refer to an already accepted exact ApplyWork key;
+        // a stale or never-accepted report cannot reach the effect verifier.
+        for copied in report_frames{
+            let r=ApplyReportV1::decode(copied.bytes)?;
+            let i=usize::from(r.action_index);
+            let claim=pending.claimed.get(i).and_then(|v|v.as_ref()).ok_or(Error::NotReady)?;
+            let work=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if claim.origin!=copied.origin||!work.matches_report(r)
+                ||r.completed_ns<claim.accepted_ns{return Err(Error::Denied);}
+        }
         // Retain the exact causal sidecar from registration, not a new
         // model-supplied explanation. A missing pair never becomes a label.
         match (pending.assisted,causal){
@@ -652,13 +1029,10 @@ impl RegisteredDecisionGate {
         &mut self, actor:Identity, now_ns:u64
     ) -> Result<bool,Error> {
         if actor!=self.controller {return Err(Error::Denied);}
-        if let Some(p)=&self.pending {
-            if p.status!=PendingStatus::Frozen {return Err(Error::NotReady);}
-            if now_ns>=p.expires_ns {
-                self.pending=None;
-                return Ok(true);
-            }
-        }
+        if let Some(p)=self.frozen_or_legacy_busy(){
+            if p.status!=PendingStatus::Frozen{return Err(Error::NotReady);}
+            if now_ns>=p.expires_ns{let seq=p.plan_seq;self.release(seq);return Ok(true);}
+        }else if self.published_count()!=0{return Err(Error::NotReady);}
         Ok(false)
     }
 }
@@ -754,6 +1128,40 @@ mod tests {
             candidate_set_hash:[1;32],static_ordinals:ordinals,
             raw_fields:[None;7], action_payload:payload,
         }]
+    }
+    #[test]
+    fn trial_registration_publication_and_cost_custody_are_independent(){
+        use super::super::trial_permit_v1::{Permit,TrialTable};
+        let mut rules=profile_bytes();rules[48..50].copy_from_slice(&2u16.to_le_bytes());
+        let profile=Profile::parse(&rules).unwrap();let ctx=trusted(&rules);
+        let plan=plan_bytes();let mut rec=decision(&plan,&rules);
+        rec[99]=2;rec[100]=3;rec[108..112].copy_from_slice(&5u32.to_le_bytes());
+        rec[136..144].copy_from_slice(&1u64.to_le_bytes());
+        rec[152..156].copy_from_slice(&1u32.to_le_bytes());
+        rec[158..160].copy_from_slice(&2u16.to_le_bytes());
+        let actions=frozen(&[2,4],&[2,0]);let local=&actions[0];
+        let mut order=[u16::MAX;32];order[..2].copy_from_slice(&[2,4]);
+        let p=Permit{permit_id:1,boot_epoch:1,rules_generation:7,target_id:17,target_generation:1,
+            start_ns:100,expires_ns:20_000_000_000,rule_id:1,domain:1,order_count:2,flags:0,
+            max_submissions:2,cpu_budget_ns:100,memory_budget_bytes:20,rule_hash:ctx.rules_hash,
+            model_hash:[0;32],template_id:1,model_generation:0,order};
+        let mut table=TrialTable::new(1,CONTROLLER,2).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        assert_eq!(gate.register_trial_one(CONTROLLER,&plan,&rec,&profile,local,ctx,&table),Err(Error::Stale));
+        table.insert_fixture(p).unwrap();
+        assert_eq!(gate.register_trial_one(CONTROLLER,&plan,&rec,&profile,local,ctx,&table),Ok(Registration::Frozen));
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,||panic!()),Err(Error::Denied));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|Err(Error::Denied),||panic!()),Err(Error::Denied));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|Ok(()),||Ok(())),Ok(Publication::AdapterAccepted));
+        assert_eq!(gate.publish_trial_one(PUBLISHER,&plan,&rec,&profile,local,ctx,&mut table,
+            20,1,|_|panic!(),||panic!()),Ok(Publication::ReplayNoEffect));
+        assert_eq!(gate.settle_with_native_proof(SUPERVISOR,terminal_proof(&plan),|_|panic!()),Err(Error::NotReady));
+        assert_eq!(gate.settle_trial_costs(SUPERVISOR,1,&mut table,true,10,1,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.settle_trial_costs(SUPERVISOR,1,&mut table,true,10,1,|_,_|Ok(())).unwrap();
+        gate.settle_with_native_proof(SUPERVISOR,terminal_proof(&plan),|_|Ok(())).unwrap();
+        assert_eq!(table.next(1,1,local.target,1,151,7,ctx.rules_hash).unwrap().1,4);
     }
     #[test]
     fn authenticated_exact_registration_and_single_shot_native_callback() {
@@ -980,6 +1388,11 @@ mod tests {
     fn verified_scope()->TrustedApplyScope{
         TrustedApplyScope{boot_epoch:1,plan_version:7,now_ns:200}
     }
+    fn claim_test_work(gate:&mut RegisteredDecisionGate,plan:&[u8]){
+        let scope=TrustedApplyScope{now_ns:150,..verified_scope()};
+        gate.claim_apply_work(plan,0,scope,verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|Ok(())).unwrap();
+    }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof(){
         let bytes=profile_bytes();
@@ -1000,6 +1413,13 @@ mod tests {
             |_,_|{verifications+=1;Ok(())}
         ),Err(Error::Denied));
         assert_eq!(verifications,0);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
+            |_,_|panic!("unaccepted work")
+        ),Err(Error::NotReady));
+        claim_test_work(&mut gate,&plan);
+        assert_eq!(gate.claim_apply_work(&plan,0,verified_scope(),verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|panic!("duplicate accept")),Err(Error::Busy));
         assert_eq!(gate.settle_verified_apply_reports(
             SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{verifications+=1;Err(Error::NotReady)}
@@ -1025,6 +1445,7 @@ mod tests {
             CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
         gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
         gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        claim_test_work(&mut gate,&plan);
         let learner=Identity{id:10,generation:1};
         let mut inbox=FeedbackInbox::new(SUPERVISOR,learner).unwrap();
         let report=executor_report(1);
@@ -1062,6 +1483,7 @@ mod tests {
         ).unwrap();
         gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
         gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        claim_test_work(&mut gate,&plan);
         let report=executor_report(3);
         let mut checked=0;
         assert_eq!(gate.settle_verified_apply_reports(
@@ -1094,6 +1516,57 @@ mod tests {
         assert!(RegisteredDecisionGate::new_with_terminal_owner(
             CONTROLLER,PUBLISHER,CONTROLLER,1,2
         ).is_err());
+    }
+
+    #[test]
+    fn sixty_four_inflight_plus_one_frozen_preserve_unknown_and_release_by_exact_key(){
+        // The production adapter must allocate this pool in the protected
+        // 8MiB control pool. Give the host test an independent larger stack
+        // for initialization, never a kernel-sized stack.
+        extern crate std;
+        std::thread::Builder::new().stack_size(8*1024*1024).spawn(||{
+            let bytes=profile_bytes();let profile=Profile::parse(&bytes).unwrap();
+            let ctx=trusted(&bytes);let actions=frozen(&[2,4],&[2,0]);
+            let mut pool=PublishedPlanPool::new();
+            let mut gate=RegisteredDecisionGate::with_pool(CONTROLLER,PUBLISHER,SUPERVISOR,1,2,&mut pool).unwrap();
+            let plan_and_record=|seq:u64|{
+                let mut plan=plan_bytes();
+                plan[16..24].copy_from_slice(&seq.to_le_bytes());
+                plan[88..96].copy_from_slice(&(seq+3).to_le_bytes());
+                let mut record=decision(&plan,&bytes);
+                record[24..32].copy_from_slice(&(seq+3).to_le_bytes());
+                record[32..40].copy_from_slice(&seq.to_le_bytes());
+                (plan,record)
+            };
+            for seq in 1..=64{
+                let (plan,rec)=plan_and_record(seq);
+                gate.register_rule_only(CONTROLLER,&plan,&[rec],&profile,&actions,ctx).unwrap();
+                let result=gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,
+                    ||if seq==1{Err(Error::NotReady)}else{Ok(())});
+                if seq==1{assert_eq!(result,Err(Error::NotReady));}else{assert_eq!(result,Ok(Publication::AdapterAccepted));}
+                assert_eq!(gate.published_count(),seq as usize);assert!(!gate.has_unpublished());
+            }
+            let (frozen_plan,frozen_record)=plan_and_record(65);
+            gate.register_rule_only(CONTROLLER,&frozen_plan,&[frozen_record],&profile,&actions,ctx).unwrap();
+            assert!(gate.has_unpublished());
+            let (extra,extra_record)=plan_and_record(66);
+            assert_eq!(gate.register_rule_only(CONTROLLER,&extra,&[extra_record],&profile,&actions,ctx),Err(Error::Busy));
+            assert_eq!(gate.publish_once(PUBLISHER,&frozen_plan,&[frozen_record],&profile,&actions,ctx,||panic!("full pool")),Err(Error::Busy));
+            let (old,old_record)=plan_and_record(1);
+            assert_eq!(gate.publish_once(PUBLISHER,&old,&[old_record],&profile,&actions,ctx,||panic!("unknown replay")),Err(Error::NotReady));
+            let (other,other_record)=plan_and_record(32);
+            assert_eq!(gate.read_decision(PUBLISHER,1,2,35),Ok(other_record));
+            assert_eq!(gate.publish_once(PUBLISHER,&other,&[other_record],&profile,&actions,ctx,||panic!("accepted replay")),Ok(Publication::ReplayNoEffect));
+            let mut proof=terminal_proof(&other);proof.plan_seq=32;
+            assert_eq!(gate.settle_with_native_proof(SUPERVISOR,proof,|_|Err(Error::NotReady)),Err(Error::NotReady));
+            assert_eq!(gate.published_count(),64);
+            gate.settle_with_native_proof(SUPERVISOR,proof,|_|Ok(())).unwrap();
+            assert_eq!(gate.published_count(),63);assert!(gate.has_unpublished());
+            gate.publish_once(PUBLISHER,&frozen_plan,&[frozen_record],&profile,&actions,ctx,||Ok(())).unwrap();
+            assert_eq!(gate.published_count(),64);assert!(!gate.has_unpublished());
+            assert!(gate.terminal_summary(SUPERVISOR,32).unwrap().is_some());
+            assert_eq!(gate.publish_once(PUBLISHER,&old,&[old_record],&profile,&actions,ctx,||panic!("old unknown")),Err(Error::NotReady));
+        }).unwrap().join().unwrap();
     }
 
     #[test]
@@ -1250,6 +1723,68 @@ mod tests {
         let alias=Identity{id:CONTROLLER.id,generation:2};
         assert!(RegisteredDecisionGate::new(CONTROLLER,alias,1,2).is_err());
         assert!(RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,alias,1,2).is_err());
+    }
+
+    #[test]
+    fn reason7_fallback_requires_exact_admitted_advice_and_actual_rejection_reason(){
+        use super::super::{Epochs,advice_ledger_v0199::{AdviceKey,AdviceResult}};
+        let rules=profile_bytes(); // ordinary choice_policy 0
+        let profile=Profile::parse(&rules).unwrap();
+        let plan=plan_bytes();let mut rec=decision(&plan,&rules);
+        rec[98]=2;rec[108..112].copy_from_slice(&7u32.to_le_bytes());
+        let ctx=trusted(&rules);let actions=frozen(&[2,4],&[2,0]);let local=&actions[0];
+        let mut advice=[0;ADVICE_BYTES];
+        advice[..4].copy_from_slice(&0x43594131u32.to_le_bytes());
+        advice[4..6].copy_from_slice(&1u16.to_le_bytes());
+        advice[6..8].copy_from_slice(&152u16.to_le_bytes());
+        for (at,v) in [(8,1u64),(16,1),(24,3),(32,17),(40,1),(48,5),(56,6),(64,200),(72,9)]{
+            advice[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at,v) in [(80,1u16),(82,1),(84,1),(86,2)]{advice[at..at+2].copy_from_slice(&v.to_le_bytes());}
+        advice[88..120].fill(3);advice[120..152].fill(1);
+        let mut disp=[0;DISPOSITION_BYTES];
+        disp[..4].copy_from_slice(&0x43594144u32.to_le_bytes());
+        disp[4..6].copy_from_slice(&1u16.to_le_bytes());disp[6..8].copy_from_slice(&240u16.to_le_bytes());
+        for (at,v) in [(8,1u64),(16,1),(24,1),(32,3),(40,2),(48,4),(56,17),(64,1),(72,9),(80,150)]{
+            disp[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at,v) in [(88,1u16),(90,1),(92,2),(94,2),(100,0),(102,1),(104,0),(106,0)]{
+            disp[at..at+2].copy_from_slice(&v.to_le_bytes());
+        }
+        disp[96..100].copy_from_slice(&3u32.to_le_bytes());
+        disp[112..144].fill(1);disp[144..176].copy_from_slice(&sha256(&advice));
+        disp[176..208].copy_from_slice(&sha256(&rec));disp[208..240].copy_from_slice(&sha256(&rules));
+        let trusted=TrustedAdviceScope{epochs:Epochs{boot:1,controller:2,model:9,resources:5,cores:6},
+            advisor_epoch:1,snapshot_seq:3,domain:1,target:local.target,sampled_ns:100,now_ns:150,
+            action_kind:1,candidates:&[2,4],model_hash:[3;32],candidate_set_hash:[1;32]};
+        let scope=AssistedScope{advice:&trusted,assisted_mode:true,offline_model_authorized:true};
+        let ops=Identity{id:6,generation:1};
+        let mut ledger=EvidenceLedger::new(ops,CONTROLLER,SUPERVISOR,1,1).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        assert_eq!(ledger.record(ops,&advice,&trusted),Ok(AdviceResult::Recorded));
+        assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&[rec],&profile,&actions,ctx),Err(Error::NotReady));
+        let mut bad=disp;bad[94..96].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(gate.register_rejected_fallback_one(CONTROLLER,&plan,&rec,&bad,&profile,local,ctx,&scope,
+            &mut ledger,|_,_|panic!("policy rejection needs no fabricated hard proof")),Err(Error::Denied));
+        let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        assert_eq!(ledger.admitted_wire(CONTROLLER,key),Ok(advice));
+        assert_eq!(gate.register_rejected_fallback_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&scope,
+            &mut ledger,|_,_|panic!("policy rejection is independently derived")),Ok(Registration::Frozen));
+        assert_eq!(ledger.admitted_wire(CONTROLLER,key),Err(Error::Stale));
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,||panic!("ordinary bypass")),Err(Error::Denied));
+        assert_eq!(gate.publish_rejected_fallback_one(PUBLISHER,&plan,&rec,&profile,local,ctx,||Ok(())),Ok(Publication::AdapterAccepted));
+        assert_eq!(gate.publish_rejected_fallback_one(PUBLISHER,&plan,&rec,&profile,local,ctx,||panic!("no replay")),Ok(Publication::ReplayNoEffect));
+        claim_test_work(&mut gate,&plan);
+        let report=executor_report(1);let bound=[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}];
+        let learner=Identity{id:10,generation:1};
+        let mut feedback=super::super::feedback_v0199::FeedbackInbox::new(SUPERVISOR,learner).unwrap();
+        let pair=super::super::feedback_v0199::CausalPair{advice:&advice,disposition:&disp};
+        gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&bound,&[verified_binding()],
+            verified_scope(),Some(pair),|_,_|Ok(()),|batch|feedback.retain(SUPERVISOR,batch)).unwrap();
+        let row=feedback.read(learner,0).unwrap().unwrap();
+        assert_eq!(row.causal_label,super::super::feedback_v0199::CausalLabel::NoAdoption);
+        assert_eq!(row.report_bytes(),&report);
+        assert_eq!(row.decision,rec);
     }
 
     #[test]

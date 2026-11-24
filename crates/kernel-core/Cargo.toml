@@ -7,6 +7,7 @@ edition.workspace = true
 cyxia-contracts = { path = "../contracts" }
 cyxia-control-model = { path = "../control-model" }
 sha2 = { version = "=0.10.9", default-features = false }
+ed25519-dalek = { version = "=2.2.0", default-features = false }
 
 [dev-dependencies]
 cyxia-prototype = { path = "../prototype" }

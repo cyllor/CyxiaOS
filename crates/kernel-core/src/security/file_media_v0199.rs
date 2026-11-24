@@ -184,10 +184,59 @@ pub fn probe_snapshot_media_pair(
         return if a == b { Ok(a) } else { Err(Error::Conflict) };
     }
     let (older, newer) = if a.generation < b.generation { (a, b) } else { (b, a) };
-    if newer.checkpoint_lsn < older.checkpoint_lsn || newer.log_epoch <= older.log_epoch {
+    // V0.19.9 §9.5: two valid copies are necessary but their generations
+    // must also prove exactly one alternating checkpoint transition.
+    if older.generation.checked_add(1)!=Some(newer.generation)
+        ||older.log_epoch.checked_add(1)!=Some(newer.log_epoch)
+        ||newer.checkpoint_lsn<older.checkpoint_lsn {
         return Err(Error::Conflict);
     }
     Ok(newer)
+}
+
+/// Read-only §9.4 full aligned redo area preflight. A valid high-epoch
+/// record or an unprovable malformed candidate blocks normal mount.
+/// Never stop at the first empty block: a newer header can be anywhere.
+/// A passing result is only checkpoint selection, not replay or mount.
+pub fn preflight_baseline_checkpoint(
+    first:&[u8],second:&[u8],
+    scratch:&mut [u8;2*SUPER_BYTES],
+    mut read_block:impl FnMut(u32,&mut[u8;SUPER_BYTES])->Result<(),Error>,
+)->Result<SuperblockV1,Error>{
+    let probe=probe_snapshot_media_pair(first,second)?;
+    if probe.kind!=SnapshotMediaKind::BaselineV1{return Err(Error::Unauthorized);}
+    let selected=if SuperblockV1::decode(first)?.generation==probe.generation{
+        SuperblockV1::decode(first)?
+    }else{SuperblockV1::decode(second)?};
+    // This scans physical candidates, including possible header-like
+    // bytes in an afterimage. Conservative denial of ambiguous evidence
+    // is intentional; never silently infer that a newer log is absent.
+    for block in 2u32..4098{
+        let (head,tail)=scratch.split_at_mut(SUPER_BYTES);
+        read_block(block,head.try_into().map_err(|_|Error::Invalid)?)?;
+        if le32(head,0)?!=0x4359_4c47{continue;}
+        let kind=le16(head,6)?;
+        let (length,padded)=match kind{1=>(80usize,4096usize),2=>(4160,8192),3=>(128,4096),
+            _=>return Err(Error::Unknown)};
+        let epoch=le64(head,32)?;
+        if le16(head,4)?!=1||le32(head,8)? as usize!=length||epoch==0
+            ||le64(head,16)?==0||le64(head,24)?==0||le32(head,60)?!=0
+            ||le32(head,56)?!=crc32c_zeroed(&head[..64],56)?
+            ||(kind!=2&&head[40..56].iter().any(|&v|v!=0)){
+            return Err(Error::Unknown);
+        }
+        if kind==2{
+            if block==4097||!(u64::from(BITMAP_START)..u64::from(BLOCK_COUNT)).contains(&le64(head,40)?)
+                ||le32(head,52)?==0||le32(head,52)?>128||le32(head,48)?>=le32(head,52)?{
+                return Err(Error::Unknown);
+            }
+            read_block(block+1,tail.try_into().map_err(|_|Error::Invalid)?)?;
+        }
+        if le32(scratch,12)?!=crc32c_payload(&scratch[64..length])
+            ||scratch[length..padded].iter().any(|&v|v!=0){return Err(Error::Unknown);}
+        if epoch>selected.log_epoch{return Err(Error::Conflict);}
+    }
+    Ok(selected)
 }
 
 /// Read-only verification of one complete baseline-v1 redo transaction.
@@ -493,6 +542,46 @@ mod tests{
         let crc=crc32c_zeroed(&next,108).unwrap();
         next[108..112].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(probe_snapshot_media_pair(&v2,&next),Err(Error::Conflict));
+    }
+    #[test]
+    fn whole_log_scan_never_ignores_newer_or_torn_candidate_after_empty_prefix(){
+        let sb=super_v1();let selected=SuperblockV1::decode(&sb).unwrap();
+        let mut scratch=[0;2*SUPER_BYTES];let mut scanned=0;
+        assert_eq!(preflight_baseline_checkpoint(&sb,&sb,&mut scratch,|_,out|{
+            out.fill(0);scanned+=1;Ok(())
+        }),Ok(selected));
+        assert_eq!(scanned,4096);
+        let mut header=[0u8;SUPER_BYTES];
+        header[..4].copy_from_slice(&0x43594c47u32.to_le_bytes());
+        header[4..6].copy_from_slice(&1u16.to_le_bytes());header[6..8].copy_from_slice(&1u16.to_le_bytes());
+        header[8..12].copy_from_slice(&80u32.to_le_bytes());
+        header[16..24].copy_from_slice(&1u64.to_le_bytes());header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        header[32..40].copy_from_slice(&(selected.log_epoch+1).to_le_bytes());
+        header[64..68].copy_from_slice(&1u32.to_le_bytes());header[72..80].copy_from_slice(&4096u64.to_le_bytes());
+        let crc=crc32c_payload(&header[64..80]);header[12..16].copy_from_slice(&crc.to_le_bytes());
+        let crc=crc32c_zeroed(&header[..64],56).unwrap();header[56..60].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(preflight_baseline_checkpoint(&sb,&sb,&mut scratch,|block,out|{
+            out.fill(0);if block==4097{*out=header;}Ok(())
+        }),Err(Error::Conflict));
+        header[72]^=1;
+        assert_eq!(preflight_baseline_checkpoint(&sb,&sb,&mut scratch,|block,out|{
+            out.fill(0);if block==4097{*out=header;}Ok(())
+        }),Err(Error::Unknown));
+    }
+    #[test]
+    fn v0199_checkpoint_requires_adjacent_generation_and_log_epoch(){
+        let a=super_v1();let old=SuperblockV1::decode(&a).unwrap();
+        let next=|generation:u64,epoch:u64,lsn:u64|{
+            let mut b=a;b[32..40].copy_from_slice(&generation.to_le_bytes());
+            b[40..48].copy_from_slice(&lsn.to_le_bytes());b[48..56].copy_from_slice(&epoch.to_le_bytes());
+            let c=crc32c_zeroed(&b,76).unwrap();b[76..80].copy_from_slice(&c.to_le_bytes());b
+        };
+        let good=next(old.generation+1,old.log_epoch+1,old.checkpoint_lsn+3);
+        assert_eq!(probe_snapshot_media_pair(&good,&a).unwrap().generation,old.generation+1);
+        for bad in [next(old.generation+2,old.log_epoch+1,old.checkpoint_lsn+3),
+                    next(old.generation+1,old.log_epoch+2,old.checkpoint_lsn+3)]{
+            assert_eq!(probe_snapshot_media_pair(&a,&bad),Err(Error::Conflict));
+        }
     }
     #[test]
     fn v0199_superblock_golden_offsets_and_crc_fail_closed(){

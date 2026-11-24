@@ -1,0 +1,20 @@
+# V0.20 G01–G11 integration increment
+
+Base: PR #84 head 0614647c0bf048dd7c3a1e1b6bc6a122dcb946d9, descendant of merged V0.20 ed68dc8345da18217f17e23e8a1c47f4da7ccd48. All eight native EL0 roles, fixed CPU0, control budget and 127 baseline IDs remain unchanged. No release acceptance is claimed.
+
+## Observed baseline
+- PR #84 run 45438465115: 98 control-plane component tests and 3 current-model component tests PASS.
+- PR #84 run 45438465197: native ARM and x86 cross-build, exact-source and security host checks PASS.
+- PR #83 native 256MiB/1GiB matrix (six trials) and scratch-disk persistence PASS, not full G4 proof.
+
+## Implementation increments (new evidence pending)
+- G01/G11: canonical OfflineConfigEnvelope v1 verification with exact payload/catalog hash, immutable boot-key Ed25519 backend contract, sub-schema verification callback, committed volume config/minima check and recovered_for_startup gate. There is no real signed production catalog in this increment; host tests exercise the transport/verifier contract, not a real signature KAT or completed schema freeze. No online admin or isolation clearance is enabled.
+- G02/G03: generation-scoped protected SnapshotStore v3 and exact 0x40 bridge for all 15 domains. Retain actual capture batches only after authenticated native-source verification; per-cap target and field redaction; age and live ledger/core generation checked at read. The actual subsystem capture adapters and full native SVC copyout loop still need integration.
+- G04/G05: optional external preallocated plan pool supports 64 published nonterminal/UNKNOWN records and one frozen candidate without slot eviction. Keep exact old decisions/claims and release only specific independently terminal key. Legacy single-plan constructor retained for component profiles. Regression checks full pool, unknown retry, out-of-order settlement and backpressure. No native pool allocation or cross-controller-epoch reconciliation claim; terminal exact-retry summaries, trial/causal fallback, full authoritative installed-root/effect proof remain open.
+- G07: replace tiny assembly client in the separate disk fixture with actual independently linked role7 ABI3 ELF using same verified PIE/RELRO loader and 32KiB stack, observed native clock/snapshot calls, model operator probe and guard abort, old root retirement and true durable generation commit before replacement. Two-process verifier binds role7 ELF hash and real operator result. Snapshot calls remain EAGAIN because signed config/real target/Active model are missing. Scratch-disk profile remains distinct from production file service and complete CPU0 accounting.
+- G10: exact Verdict v4 archive parser/aggregator, frozen input and evidence-object hash verification, 127 ID / 262 G4 / 26 added G5 class coverage, fail dominance and missing/invalid evidence blocking. It is NOT a semantic case checker or trust anchor. Caller must independently authenticate the frozen run manifest and actual checker outputs. Unit test inputs are synthetic structural fixtures, never real evidence. No new formal verdict is issued.
+
+## Open production workstreams
+G01 signed actual package/profile/config, entropy, FrameMeta, real cap issuance. G02 full native service IPC/dispatch/lifecycle. G03 actual current trained weights and per-domain raw capture. G04 native pooled gate owner, independent rules and real root publish, trial/fallback and epoch handling. G05 all 15 actual effects. G06 actual paired replay dataset, reward/learning and governance. G07 mounted production filesystem/real service, arbitrary crash-tail reconciliation. G08 immutable snapshot format/ABI freeze, native COW/GC/recovery. G09 exact full-path budget, early architecture and terminal accounting, window split and real loaded stress. G10 every formal test and physical A53 proof. G11 normative sub-schema/format decisions and actual signed catalog. Do not mark these closed without appropriate independent proof.
+
+PR includes only development changes. New component and guest build/run status must be queried at exact head. Prior successful diagnostic runs cannot substitute for new guest evidence.

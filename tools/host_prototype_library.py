@@ -52,6 +52,20 @@ def _build_host_libraries(packages):
     return deps, resolved
 
 
+def host_library_search_flags(deps):
+    """Include the matching Cargo host proc-macro artifact directory.
+    A --target host build separates target rlibs from host proc macros;
+    rustc still resolves derive metadata dependencies of the current rlib.
+    Do not search unrelated build trees or stale wildcard artifacts.
+    """
+    deps = Path(deps).resolve(strict=True)
+    host_deps = deps.parents[2] / deps.parent.name / 'deps'
+    flags = ['-L', 'dependency=' + str(deps)]
+    if host_deps != deps and host_deps.is_dir():
+        flags += ['-L', 'dependency=' + str(host_deps.resolve(strict=True))]
+    return flags
+
+
 def build_host_prototype_library():
     deps, libraries = _build_host_libraries(('cyxia-prototype',))
     return deps, libraries['cyxia_prototype']
