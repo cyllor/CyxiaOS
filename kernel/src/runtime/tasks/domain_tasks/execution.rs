@@ -2548,9 +2548,13 @@ pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(),
             .iter()
             .find(|t| t.key == expected && t.start_apply == Some(apply))
         {
-            return if t.life != Life::Free {
+            return if matches!(t.life, Life::Ready | Life::Running | Life::Waiting)
+                && t.failure.is_none()
+            {
                 Ok(())
             } else {
+                // A matching partially rolled-back/retiring generation is
+                // still owned; do not certify a successful start or retry.
                 Err(Error::NotReady)
             };
         }
@@ -2612,13 +2616,20 @@ pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(),
             generation: &mut s.generation,
             local_failure: None,
         };
-        let result = backend.build(&request, i, expected, None, &mut BuildTrace::new(false));
+        let mut result = backend.build(&request, i, expected, None, &mut BuildTrace::new(false));
         if let Err(error) = result {
             if backend.rollback(i, expected).is_ok() {
                 backend.tasks[i] = prior;
             } else {
                 backend.tasks[i].life = Life::Exiting;
                 backend.tasks[i].failure = Some(error);
+                if backend.tasks[i].key == expected {
+                    backend.tasks[i].start_apply = Some(apply);
+                }
+                // A failed cleanup still owns mappings/capabilities or
+                // references. Report uncertainty rather than the original
+                // construction error, which might look terminal upstream.
+                result = Err(Error::NotReady);
             }
         }
         s.launches[slot].input.fill(0);

@@ -301,8 +301,12 @@ impl BackgroundBudgets {
 pub trait RecoveryBackend {
     fn close_admission(&mut self, target: ObjectKey) -> Result<(), Error>;
     fn readonly_drained(&mut self, target: ObjectKey) -> Result<bool, Error>;
+    /// A definite error means no stop was issued. If its effect cannot be
+    /// proved absent, return Io/NotReady and retain custody for observation.
     fn request_stop(&mut self, target: ObjectKey) -> Result<(), Error>;
     fn stopped(&mut self, target: ObjectKey) -> Result<bool, Error>;
+    /// A definite error means construction was fully rolled back. An
+    /// uncertain start or incomplete rollback must return Io/NotReady.
     fn start_generation(&mut self, target: ObjectKey, next_generation: u64) -> Result<(), Error>;
     fn running(&mut self, target: ObjectKey, generation: u64) -> Result<bool, Error>;
     /// Passive observation after the original step and record update. The
@@ -350,6 +354,7 @@ struct Recovery {
     phase: u8,
     issued: bool,
     order: u64,
+    last_poll_ns: u64,
 }
 pub struct RecoverySupervisor {
     services: [Option<Service>; 16],
@@ -538,6 +543,7 @@ impl RecoverySupervisor {
             phase: 0,
             issued: false,
             order: self.sequence,
+            last_poll_ns: now,
         });
         let service = self.services[i].as_mut().ok_or(Error::Stale)?;
         service.seen_epoch = apply.controller_epoch;
@@ -562,9 +568,10 @@ impl RecoverySupervisor {
         if r.receipt.state.terminal() {
             return Ok(r.receipt);
         }
-        if now < r.receipt.started_ns {
+        if now < r.last_poll_ns {
             return Err(Error::Range);
         }
+        r.last_poll_ns = now;
         let phase_before = r.phase;
         let issued_before = r.issued;
         let state_before = r.receipt.state;
@@ -619,6 +626,12 @@ impl RecoverySupervisor {
                 if r.phase == 2 || r.phase == 3 {
                     r.issued = true;
                 }
+            }
+            Err(_) if r.issued && matches!(r.phase, 2 | 3) => {
+                // A failed observation is not a negative completion proof.
+                // Keep the exact issued stop/start owned until a positive
+                // reconciliation or a future authoritative failure protocol.
+                r.receipt.state = ExecutionState::Unknown;
             }
             Err(e) => {
                 r.receipt.state = ExecutionState::Failed(e);
