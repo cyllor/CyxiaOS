@@ -16,12 +16,36 @@ import verify_smp
 ROLES=(6,7,2,8,9,3,10,11)
 MAGIC=0x43595838424f4f54
 PATCH=Path(__file__).resolve().parent/'qemu/cyxia-per-vcpu-pmu.patch'
+def relative_count(elf:bytes,sidecar:bytes)->int:
+    require=verify_smp.require
+    require(len(elf)>=64 and elf[:6]==b'\x7fELF\x02\x01','invalid role ELF')
+    shoff=struct.unpack_from('<Q',elf,40)[0]
+    entsize,count=struct.unpack_from('<HH',elf,58)
+    require(entsize==64 and 0<count and shoff+entsize*count<=len(elf),'invalid role section table')
+    relas=[]
+    for i in range(count):
+        _,kind,flags,addr,off,size,link,info,align,entry=struct.unpack_from('<IIQQQQIIQQ',elf,shoff+i*64)
+        require(kind not in (9,19) or size==0,'unexpected REL/RELR')
+        if kind==4 and size:
+            require(not relas and entry==24 and size%24==0 and flags&2 and off+size<=len(elf),
+                    'invalid allocated RELA table')
+            relas=list(struct.iter_unpack('<QQq',elf[off:off+size]))
+    require(len(relas)<=512 and len({r[0] for r in relas})==len(relas)
+            and all(o%8==0 and info==1027 for o,info,a in relas),'invalid relative relocation inventory')
+    canonical=b'CyxiaOS-v0199-relative-sidecar'+struct.pack('<I',len(relas))+b''.join(
+        struct.pack('<QQq',*r) for r in relas)
+    require(sidecar==canonical,'ELF and authenticated sidecar disagree')
+    return len(relas)
+
 class Bringup:
     completion=b'V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n'
     def __init__(self, packages:Path, qemu_sha256:str, patch_sha256:str):
         self.expected={role:hashlib.sha256((packages/f'v0199-role-{role}.elf').read_bytes()).digest()
                        for role in ROLES}
         verify_smp.require(len(set(self.expected.values()))==8,'role packages are not distinct')
+        self.relocations={role:relative_count(
+            (packages/f'v0199-role-{role}.elf').read_bytes(),
+            (packages/f'v0199-role-{role}.relative.bin').read_bytes()) for role in ROLES}
         self.qemu_sha256=qemu_sha256
         verify_smp.require(hashlib.sha256(PATCH.read_bytes()).hexdigest()==patch_sha256,
                            'wrong PMU accounting patch')
@@ -47,7 +71,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,6,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,7,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -71,7 +95,7 @@ class Bringup:
                     and stack==image+65536 and 0x10000<=entry<0x20000 and entry%4==0
                     and guard==0,'invalid private root, image, stack or guard')
             asid=words[at+18]
-            require(asid==0x98+index and words[at+19]==0,'incorrect one-shot replacement ASID')
+            require(asid==0x98+index and words[at+19]==self.relocations[role],'incorrect ASID or relocation count')
             roots.add(root);spans.append((image,stack+32768))
             require(clocks>=2 and calls>=2 and turns>=1 and actual>0,'missing real ABI3 or CPU charge')
             restricted=role in (6,7,2,11)
@@ -83,7 +107,7 @@ class Bringup:
             require(boot[index]==(role,root,clocks) and charges[index]==(role,actual,turns),
                     'UART and stopped guest evidence disagree')
             details.append(dict(role=role,package_sha256=digest.hex(),ttbr0=root,
-                                stack_bytes=32768,asid=asid,clocks=clocks,role_calls=calls,
+                                stack_bytes=32768,asid=asid,relative_relocations=self.relocations[role],clocks=clocks,role_calls=calls,
                                 actual_cpu_ns=actual,turns=turns,timer_preemptions=preemptions))
         for i,(a,b) in enumerate(spans):
             require(all(not(a<=r<b) for r in roots),'page-table root overlaps role backing')
