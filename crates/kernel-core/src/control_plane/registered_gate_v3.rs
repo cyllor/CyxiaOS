@@ -117,7 +117,7 @@ impl RegisteredDecisionGate {
         -> Result<Self, Error>
     {
         if !controller.valid() || !publisher.valid()
-            || controller == publisher || boot == 0 || epoch == 0
+            || controller.id == publisher.id || boot == 0 || epoch == 0
         {return Err(Error::Invalid);}
         Ok(Self {
             controller, publisher, boot_epoch:boot, controller_epoch:epoch,
@@ -133,7 +133,7 @@ impl RegisteredDecisionGate {
         boot:u64,epoch:u64
     ) -> Result<Self,Error> {
         if !terminal_owner.valid()
-            || terminal_owner==controller || terminal_owner==publisher
+            || terminal_owner.id==controller.id || terminal_owner.id==publisher.id
         {return Err(Error::Invalid);}
         let mut gate=Self::new(controller,publisher,boot,epoch)?;
         gate.terminal_owner=Some(terminal_owner);
@@ -242,6 +242,8 @@ impl RegisteredDecisionGate {
         if records.len()!=usize::from(plan.header.action_count)
             || actions.len()!=records.len()
             || plan.header.base_plan_version!=context.base_plan_version
+            || plan.ledger_generation!=context.ledger_generation
+            || plan.core_generation!=context.core_generation
             || plan.header.controller_epoch!=context.controller_epoch
             || plan.header.snapshot_seq!=context.snapshot_seq
         {return Err(Error::Stale);}
@@ -251,9 +253,12 @@ impl RegisteredDecisionGate {
             .ok_or(Error::Clock)?;
         let installed_end=context.sampled_ns.checked_add(10_000_000_000)
             .ok_or(Error::Clock)?;
-        if plan.header.active_until_local_ns!=0
-            && plan.header.active_until_local_ns!=installed_end
-        {return Err(Error::Invalid);}
+        // D14 is the single one-shot family. A continuous parameter
+        // cannot be accepted with a zero lease (or be extended at APPLY).
+        let required_lease=if plan.action(0)?.domain_id==14 {0}else{installed_end};
+        if plan.header.active_until_local_ns!=required_lease {
+            return Err(Error::Invalid);
+        }
         let mut last_seq=0u64;
         for (index,(raw,local)) in records.iter().zip(actions).enumerate() {
             let rec=DecisionRecordV3::decode(raw)?;
@@ -977,4 +982,48 @@ mod tests {
             CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
         ).is_err());
     }
+    #[test]
+    fn actual_resource_or_core_generation_change_blocks_frozen_publication(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        for stale in [
+            TrustedRegistrationScope{ledger_generation:ctx.ledger_generation+1,..ctx},
+            TrustedRegistrationScope{core_generation:ctx.core_generation+1,..ctx}
+        ]{
+            assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,stale),Err(Error::Stale));
+        }
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        for stale in [
+            TrustedRegistrationScope{ledger_generation:ctx.ledger_generation+1,..ctx},
+            TrustedRegistrationScope{core_generation:ctx.core_generation+1,..ctx}
+        ]{
+            assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,stale),Err(Error::Stale));
+            assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,stale,
+                ||panic!("stale authority reached native publication")),Err(Error::Stale));
+        }
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())),
+            Ok(Publication::AdapterAccepted));
+    }
+
+    #[test]
+    fn continuous_plan_requires_exact_lease_and_distinct_live_role_ids(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let mut plan=plan_bytes();
+        plan[56..64].fill(0);
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx),Err(Error::Invalid));
+        let alias=Identity{id:CONTROLLER.id,generation:2};
+        assert!(RegisteredDecisionGate::new(CONTROLLER,alias,1,2).is_err());
+        assert!(RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,alias,1,2).is_err());
+    }
+
 }
