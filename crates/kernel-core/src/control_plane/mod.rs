@@ -85,3 +85,4 @@ pub mod service_image;
 pub mod service_restart;
 
 pub mod task_admission;
+pub mod role_manifest_v0199;
