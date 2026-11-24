@@ -103,6 +103,13 @@ fn tables(index:usize,bank:usize)->*mut Tables{
 fn root_pa(index:usize,bank:usize)->u64{
     phys(tables(index,bank) as u64)
 }
+// This exclusive bootstrap profile uses ASIDs 0x90..0x9f, separate from
+// the mechanism probes (0x80..0x83) and their ordinary ASID 0.
+// A stopped/reloaded role always moves to bank 1; no root/ASID is reused.
+fn role_asid(index:usize,bank:usize)->u8{
+    assert!(index<ROLE_COUNT&&bank<2);
+    (0x90+bank*ROLE_COUNT+index) as u8
+}
 /// The high half direct-map descriptor for a reserved RAM page. The original
 /// boot map uses normal EL1 RW-XN. Seal RO/RX image pages *before* publishing
 /// the low user mapping; no writable alias of executable code remains.
@@ -316,7 +323,10 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
     let mut parked=false;
     // One prepaid role turn may traverse several real SVCs; the advisory
     // slot is not refilled per syscall or timer preemption.
-    for _ in 0..32{
+    // The 0.25ms diagnostic decision slice may only service one trap;
+    // additional work must be independently admitted under the same 0.5ms
+    // combined decision/publication limit for this domain and window.
+    for _ in 0..if class==Class::Decision{1}else{32}{
         let actual=timer::cpu_elapsed_ns(began);
         let wall=now_ns();
         let cpu_left=quota.saturating_sub(actual);
@@ -326,7 +336,11 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
         if class==Class::Decision{interval=interval.min(DECISION_SLICE_NS);}
         unsafe{
             timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
-            user::enter(&mut r.context,m.members[index].ttbr0_root);
+            let root=m.members[index].ttbr0_root;
+            assert_eq!(root,root_pa(index,r.bank));
+            // Each live root is immutable, private, and all leaves are nG.
+            // Retire_root disconnects it and completes TLBI before reclaim.
+            user::enter_pinned_until_retired(&mut r.context,root,role_asid(index,r.bank));
             cpu::disable_timer();
         }
         // Settle immediately after a timer exit instead of re-entering in
@@ -570,6 +584,7 @@ pub(super) fn run()->!{
         for (j,chunk) in CATALOG[i].image_sha256.chunks_exact(8).enumerate(){
             SMP_EVIDENCE.words[128+i*20+14+j].store(u64::from_le_bytes(chunk.try_into().unwrap()),Ordering::Relaxed);
         }
+        SMP_EVIDENCE.words[128+i*20+18].store(u64::from(role_asid(i,r.bank)),Ordering::Relaxed);
         report("V0199_BOOTSTRAP_ROLE",u64::from(m.role.id()),m.ttbr0_root,r.clocks);
         report("V0199_BOOTSTRAP_CHARGE",u64::from(m.role.id()),r.charges,r.turns);
     }
@@ -590,7 +605,7 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[16+slot*4+i].store(value,Ordering::Relaxed);
         }
     }
-    let summary=[MAGIC,3,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let summary=[MAGIC,4,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
