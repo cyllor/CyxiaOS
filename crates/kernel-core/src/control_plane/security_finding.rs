@@ -114,10 +114,8 @@ impl SecurityFinding {
                 _ => false,
             }
     }
-    /// True merely requests a new deterministic RuleProfile review.
-    pub fn requests_review(&self, trusted: FrozenObservation) -> bool {
+    fn matches_scope(&self, trusted: FrozenObservation) -> bool {
         self.structurally_valid()
-            && self.hint == 1
             && self.boot_epoch == trusted.boot_epoch
             && self.security_epoch == trusted.security_epoch
             && self.snapshot_seq == trusted.snapshot_seq
@@ -130,6 +128,177 @@ impl SecurityFinding {
             && trusted.sampled_ns.checked_add(MAX_FINDING_AGE_NS)
                 .is_some_and(|end| self.expires_ns <= end)
     }
+
+    /// True merely requests a new deterministic RuleProfile review.
+    pub fn requests_review(&self, trusted: FrozenObservation) -> bool {
+        self.hint == 1 && self.matches_scope(trusted)
+    }
+}
+
+/// Protected role7/role11 evaluation and review custody. The native EL1
+/// adapter supplies these scopes from an authorized 0x40 snapshot, binds
+/// both actor identities and the offline mode, and separately accounts CPU.
+/// No field or method grants an action, capability, restriction or APPLIED.
+pub const FINDING_SLOTS: usize = 16;
+pub const EVALUATIONS_PER_WINDOW: u8 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FindingMode { Disabled, Shadow, Assisted }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisteredObservation {
+    pub scope: FrozenObservation,
+    pub evidence_count: u16,
+    pub evidence_digest: [u8;32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewTarget {
+    pub finding_seq: u64,
+    pub domain_id: u16,
+    pub target: Identity,
+    pub evidence_digest: [u8;32],
+    /// Only an index for a fresh independent deterministic review.
+    pub request_review: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FindingRow {
+    observation: RegisteredObservation,
+    mode: FindingMode,
+    expires_ns: u64,
+    finding: Option<SecurityFinding>,
+    consumed: bool,
+}
+const _: () = assert!(core::mem::size_of::<Option<FindingRow>>() <= 512);
+
+pub struct FindingCustody {
+    security: Identity,
+    supervisor: Identity,
+    boot_epoch: u64,
+    security_epoch: u64,
+    high_water: u64,
+    last_ns: u64,
+    window: u64,
+    evaluations: u8,
+    rows: [Option<FindingRow>; FINDING_SLOTS],
+}
+
+impl FindingCustody {
+    pub fn new(security: Identity, supervisor: Identity, boot_epoch:u64, security_epoch:u64)
+        -> Result<Self, Error>
+    {
+        if !security.valid() || !supervisor.valid() || security.id==supervisor.id
+            || boot_epoch==0 || security_epoch==0
+        {return Err(Error::Invalid);}
+        Ok(Self {security,supervisor,boot_epoch,security_epoch,high_water:0,
+            last_ns:0,window:0,evaluations:0,rows:[None;FINDING_SLOTS]})
+    }
+    fn time(&mut self, now:u64)->Result<(),Error>{
+        if now<self.last_ns{return Err(Error::Clock);}
+        self.last_ns=now;
+        let window=now/MAX_FINDING_AGE_NS;
+        if window!=self.window {self.window=window;self.evaluations=0;}
+        Ok(())
+    }
+    fn same_context(a:FrozenObservation,b:FrozenObservation)->bool{
+        a.boot_epoch==b.boot_epoch && a.security_epoch==b.security_epoch
+            && a.snapshot_seq==b.snapshot_seq && a.domain_id==b.domain_id
+            && a.target==b.target
+    }
+    fn valid_observation(&self,o:RegisteredObservation)->bool{
+        let s=o.scope;
+        s.boot_epoch==self.boot_epoch && s.security_epoch==self.security_epoch
+            && s.snapshot_seq!=0 && s.target.valid()
+            && (1..=5).any(|kind|domain_for_kind(kind)==Some(s.domain_id))
+            && s.sampled_ns<=s.now_ns
+            && s.sampled_ns.checked_add(MAX_FINDING_AGE_NS).is_some_and(|end|s.now_ns<end)
+            && s.model_hash!=[0;32] && s.config_hash!=[0;32]
+            && o.evidence_count!=0 && o.evidence_digest!=[0;32]
+    }
+    /// Reserve before copying an authorized safety view to EL0. Full queues
+    /// and exhausted evaluation counts drop only advisory work.
+    pub fn reserve(&mut self,actor:Identity,observation:RegisteredObservation,mode:FindingMode)
+        ->Result<(),Error>
+    {
+        if actor!=self.security || mode==FindingMode::Disabled{return Err(Error::Denied);}
+        if !self.valid_observation(observation){return Err(Error::Invalid);}
+        self.time(observation.scope.now_ns)?;
+        if self.rows.iter().flatten().any(|r|Self::same_context(r.observation.scope,observation.scope)){
+            return Err(Error::Busy);
+        }
+        if self.evaluations>=EVALUATIONS_PER_WINDOW{return Err(Error::Exhausted);}
+        let at=self.rows.iter().position(Option::is_none).ok_or(Error::Exhausted)?;
+        let expires_ns=observation.scope.sampled_ns.checked_add(MAX_FINDING_AGE_NS).ok_or(Error::Invalid)?;
+        self.rows[at]=Some(FindingRow{observation,mode,expires_ns,finding:None,consumed:false});
+        self.evaluations+=1;
+        Ok(())
+    }
+    pub fn submit(&mut self,actor:Identity,wire:&[u8],now:u64)->Result<(),Error>{
+        if actor!=self.security{return Err(Error::Denied);}
+        let finding=SecurityFinding::decode(wire)?;
+        self.time(now)?;
+        let domain=domain_for_kind(finding.kind).ok_or(Error::Invalid)?;
+        let at=self.rows.iter().position(|r|r.is_some_and(|r|{
+            let s=r.observation.scope;
+            s.boot_epoch==finding.boot_epoch && s.security_epoch==finding.security_epoch
+                && s.snapshot_seq==finding.snapshot_seq && s.target==finding.target
+                && s.domain_id==domain
+        })).ok_or(Error::Stale)?;
+        let row=self.rows[at].as_mut().ok_or(Error::Stale)?;
+        if row.consumed{return Err(Error::Stale);}
+        let mut scope=row.observation.scope;
+        scope.now_ns=now;
+        if !finding.matches_scope(scope) || finding.evidence_count!=row.observation.evidence_count
+            || finding.evidence_digest!=row.observation.evidence_digest
+        {return Err(Error::Denied);}
+        if let Some(existing)=row.finding{
+            return if existing==finding{Ok(())}else{Err(Error::Denied)};
+        }
+        if finding.finding_seq<=self.high_water{return Err(Error::Stale);}
+        row.finding=Some(finding);
+        self.high_water=finding.finding_seq;
+        Ok(())
+    }
+    /// Only role11 may consume. SHADOW, mode downgrade and missing current
+    /// offline authorization yield observation-only evidence. A stale or
+    /// relabelled context never creates a review target.
+    pub fn consume(
+        &mut self,actor:Identity,finding_seq:u64,current:RegisteredObservation,
+        mode:FindingMode,offline_review_allowed:bool
+    )->Result<ReviewTarget,Error>{
+        if actor!=self.supervisor{return Err(Error::Denied);}
+        if !self.valid_observation(current){return Err(Error::Invalid);}
+        self.time(current.scope.now_ns)?;
+        let row=self.rows.iter_mut().flatten().find(|r|r.finding.is_some_and(|f|f.finding_seq==finding_seq))
+            .ok_or(Error::Stale)?;
+        if row.consumed{return Err(Error::Stale);}
+        let f=row.finding.ok_or(Error::NotReady)?;
+        let mut registered=row.observation;
+        registered.scope.now_ns=current.scope.now_ns;
+        if registered!=current || !f.matches_scope(current.scope){
+            return Err(Error::Denied);
+        }
+        row.consumed=true;
+        // Retain the context tombstone until expiry so a reread of the same
+        // snapshot cannot reserve another evaluation and reissue its finding.
+        Ok(ReviewTarget{finding_seq,domain_id:current.scope.domain_id,target:f.target,
+            evidence_digest:f.evidence_digest,
+            request_review:row.mode==FindingMode::Assisted && mode==FindingMode::Assisted
+                && offline_review_allowed && f.hint==1})
+    }
+    pub fn reap_expired(&mut self,actor:Identity,now:u64)->Result<usize,Error>{
+        if actor!=self.supervisor{return Err(Error::Denied);}
+        self.time(now)?;
+        let mut count=0;
+        for row in &mut self.rows{
+            if row.is_some_and(|r|now>=r.expires_ns){
+                *row=None;count+=1;
+            }
+        }
+        Ok(count)
+    }
+    pub fn occupied(&self)->usize{self.rows.iter().flatten().count()}
 }
 
 #[cfg(test)]
@@ -194,4 +363,72 @@ mod tests {
         let mut b=wire(); b[136]=0;
         assert!(SecurityFinding::decode(&b).is_err());
     }
+    const ROLE7: Identity=Identity{id:7,generation:1};
+    const ROLE11: Identity=Identity{id:11,generation:1};
+    fn registered()->RegisteredObservation{
+        RegisteredObservation{scope:observation(),evidence_count:1,evidence_digest:{
+            let mut h=[0;32];h[0]=1;h
+        }}
+    }
+    #[test]
+    fn bounded_context_custody_binds_evidence_and_consumes_review_once(){
+        let mut q=FindingCustody::new(ROLE7,ROLE11,1,2).unwrap();
+        let o=registered();
+        assert_eq!(q.submit(ROLE7,&wire(),150),Err(Error::Stale));
+        assert_eq!(q.reserve(ROLE7,o,FindingMode::Disabled),Err(Error::Denied));
+        q.reserve(ROLE7,o,FindingMode::Assisted).unwrap();
+        let mut wrong=wire();wrong[72]=9;
+        assert_eq!(q.submit(ROLE7,&wrong,150),Err(Error::Denied));
+        assert_eq!(q.submit(ROLE11,&wire(),150),Err(Error::Denied));
+        q.submit(ROLE7,&wire(),150).unwrap();
+        q.submit(ROLE7,&wire(),150).unwrap();
+        let mut current=o;current.scope.now_ns=151;
+        assert_eq!(q.consume(ROLE7,3,current,FindingMode::Assisted,true),Err(Error::Denied));
+        let mut forged=current;forged.scope.target.generation+=1;
+        assert_eq!(q.consume(ROLE11,3,forged,FindingMode::Assisted,true),Err(Error::Denied));
+        assert!(q.consume(ROLE11,3,current,FindingMode::Assisted,true).unwrap().request_review);
+        assert_eq!(q.consume(ROLE11,3,current,FindingMode::Assisted,true),Err(Error::Stale));
+        assert_eq!(q.reserve(ROLE7,current,FindingMode::Assisted),Err(Error::Busy));
+        assert_eq!(q.submit(ROLE7,&wire(),151),Err(Error::Stale));
+        assert_eq!(q.reap_expired(ROLE11,100+MAX_FINDING_AGE_NS),Ok(1));
+        assert_eq!(q.occupied(),0);
+    }
+    #[test]
+    fn shadow_and_offline_downgrade_never_enqueue_review(){
+        for (registered_mode,current_mode,authorized) in [
+            (FindingMode::Shadow,FindingMode::Assisted,true),
+            (FindingMode::Assisted,FindingMode::Shadow,true),
+            (FindingMode::Assisted,FindingMode::Assisted,false),
+            (FindingMode::Assisted,FindingMode::Disabled,true)
+        ]{
+            let mut q=FindingCustody::new(ROLE7,ROLE11,1,2).unwrap();
+            let o=registered();
+            q.reserve(ROLE7,o,registered_mode).unwrap();
+            q.submit(ROLE7,&wire(),150).unwrap();
+            assert!(!q.consume(ROLE11,3,o,current_mode,authorized).unwrap().request_review);
+        }
+    }
+    #[test]
+    fn fixed_evaluation_window_and_slots_cannot_be_refilled_by_retries(){
+        let mut q=FindingCustody::new(ROLE7,ROLE11,1,2).unwrap();
+        for i in 0..16u64{
+            let mut o=registered();
+            o.scope.snapshot_seq=10+i;
+            o.scope.sampled_ns=100+(i/4)*MAX_FINDING_AGE_NS;
+            o.scope.now_ns=o.scope.sampled_ns;
+            q.reserve(ROLE7,o,FindingMode::Shadow).unwrap();
+            if i%4==3{
+                o.scope.snapshot_seq+=100;
+                assert_eq!(q.reserve(ROLE7,o,FindingMode::Shadow),Err(Error::Exhausted));
+            }
+        }
+        assert_eq!(q.occupied(),16);
+        let mut o=registered();o.scope.snapshot_seq=99;
+        o.scope.sampled_ns=4*MAX_FINDING_AGE_NS+100;o.scope.now_ns=o.scope.sampled_ns;
+        assert_eq!(q.reserve(ROLE7,o,FindingMode::Shadow),Err(Error::Exhausted));
+        assert_eq!(q.reap_expired(ROLE7,o.scope.now_ns),Err(Error::Denied));
+        assert_eq!(q.reap_expired(ROLE11,o.scope.now_ns),Ok(16));
+        q.reserve(ROLE7,o,FindingMode::Shadow).unwrap();
+    }
+
 }
