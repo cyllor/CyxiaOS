@@ -3,7 +3,7 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 
 on:
   push:
-    branches: [work/v020-native-control-safety]
+    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
       - 'kernel/**'
