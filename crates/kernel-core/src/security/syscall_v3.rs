@@ -25,6 +25,27 @@ pub struct ValidatedCall {
 fn span(address: u64, length: u64) -> bool {
     address != 0 && address.checked_add(length).is_some()
 }
+// The ABI declares disjoint input/output intervals. Adjacent buffers are
+// legal; even partially overlapping ones are rejected before any user copy.
+fn disjoint(a: u64, alen: u64, b: u64, blen: u64) -> bool {
+    match (a.checked_add(alen), b.checked_add(blen)) {
+        (Some(aend), Some(bend)) => aend <= b || bend <= a,
+        _ => false,
+    }
+}
+
+/// Decode the architectural exception syndrome and register image together.
+/// Only the lower-AArch64 synchronous exception adapter may call this with
+/// its saved ESR_EL1 and trusted package ABI. This remains preflight, not
+/// capability authorization or a completed syscall.
+pub fn decode_aarch64_svc_v3(
+    verified_package_abi: u16, esr: u64, regs: &[u64; 31],
+) -> Result<ValidatedCall, Error> {
+    // EC=SVC64 (0x15), IL=1 (32-bit instruction), ISS immediate=0, RES0.
+    if esr != 0x5600_0000 { return Err(Error::Invalid); }
+    decode_v3(verified_package_abi, regs[8],
+        [regs[0],regs[1],regs[2],regs[3],regs[4],regs[5]])
+}
 fn vector_shape(input_len: u64, output_cap: u64) -> bool {
     if !(44..=464).contains(&input_len) || (input_len - 16) % 28 != 0 {
         return false;
@@ -117,6 +138,15 @@ pub fn decode_v3(verified_package_abi:u16,x8:u64,args:[u64;6])
         _ => true,
     };
     if !bounded { return Err(Error::Invalid); }
+    let separate = match x8 {
+        0x10 => disjoint(args[1],args[2],args[3],args[4]),
+        0x32 | 0x42 => disjoint(args[0],args[1],args[2],args[3]),
+        0x41 => args[3].checked_mul(DECISION_RECORD_BYTES as u64)
+            .is_some_and(|n| disjoint(args[0],args[1],args[2],n)),
+        0x50 => disjoint(args[1],args[2],args[4],args[5]),
+        _ => true,
+    };
+    if !separate { return Err(Error::Invalid); }
     Ok(ValidatedCall {operation,args})
 }
 
@@ -214,6 +244,23 @@ mod tests{
         assert!(!allowed(0x42,[top-23,24,0x2000,64,0,0]));
         assert!(!allowed(0x43,[1,top-95,96,0,0,0]));
         assert!(!allowed(0x50,[1,0x1000,32,1,top,2]));
+    }
+
+    #[test]
+    fn disjoint_copies_and_actual_svc_syndrome_fail_closed() {
+        assert!(allowed(0x10,[1,0x1000,32,0x1020,48,0]));
+        assert!(!allowed(0x10,[1,0x1000,32,0x101f,48,0]));
+        assert!(!allowed(0x32,[0x1000,44,0x1001,80,100,0]));
+        assert!(!allowed(0x42,[0x1000,24,0x0fff,64,0,0]));
+        assert!(!allowed(0x41,[0x1000,212,0x10d3,1,0,0]));
+        assert!(!allowed(0x50,[3,0x1000,256,0,0x10ff,8]));
+        assert!(allowed(0x50,[3,0x1000,256,0,0x1100,8]));
+        let mut regs=[0;31];regs[8]=4;
+        assert_eq!(decode_aarch64_svc_v3(3,0x5600_0000,&regs).unwrap().operation,Syscall::Clock);
+        for esr in [0x5600_0001,0x5400_0000,0x5400_0004,0x5a00_0000,0x5601_0000] {
+            assert!(decode_aarch64_svc_v3(3,esr,&regs).is_err());
+        }
+        assert!(decode_aarch64_svc_v3(1,0x5600_0000,&regs).is_err());
     }
 
 }

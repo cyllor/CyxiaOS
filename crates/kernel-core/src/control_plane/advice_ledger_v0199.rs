@@ -32,8 +32,10 @@ struct Slot{
     advice_hash:[u8;32],
     disposition_hash:[u8;32],
     has_terminal:bool,
+    received_ns:u64,
+    controller_epoch:u64,
 }
-const _:()=assert!(core::mem::size_of::<Slot>()<=SLOT_LIMIT_BYTES);
+const _:()=assert!(core::mem::size_of::<Option<Slot>>()<=SLOT_LIMIT_BYTES);
 fn digest(x:&[u8])->[u8;32]{let mut d=Sha256::new();d.update(x);d.finalize().into()}
 pub struct EvidenceLedger{
     operations:Identity,
@@ -42,6 +44,7 @@ pub struct EvidenceLedger{
     boot_epoch:u64,
     advisor_epoch:u64,
     hi:u64,
+    last_ns:u64,
     rows:[Option<Slot>;ADVICE_SLOTS],
 }
 impl EvidenceLedger{
@@ -50,12 +53,12 @@ impl EvidenceLedger{
         boot_epoch:u64,advisor_epoch:u64
     )->Result<Self,Error>{
         if !operations.valid() || !controller.valid() || !supervisor.valid()
-            || operations==controller || operations==supervisor
-            || controller==supervisor
+            || operations.id==controller.id || operations.id==supervisor.id
+            || controller.id==supervisor.id
             || boot_epoch==0 || advisor_epoch==0
         {return Err(Error::Invalid);}
         Ok(Self{
-            operations,controller,supervisor,boot_epoch,advisor_epoch,hi:0,
+            operations,controller,supervisor,boot_epoch,advisor_epoch,hi:0,last_ns:0,
             rows:[None;ADVICE_SLOTS]
         })
     }
@@ -65,10 +68,11 @@ impl EvidenceLedger{
     )->Result<AdviceResult,Error>{
         if actor!=self.operations {return Err(Error::Denied);}
         let packet=AdviceEnvelopeV1::decode(wire)?;
-        packet.into_advice(trusted)?;
         if trusted.epochs.boot!=self.boot_epoch
             || packet.advisor_epoch!=self.advisor_epoch
         {return Err(Error::Stale);}
+        if trusted.now_ns<self.last_ns{return Err(Error::Clock);}
+        self.last_ns=trusted.now_ns;
         let key=AdviceKey{
             boot_epoch:self.boot_epoch,
             advisor_epoch:packet.advisor_epoch,
@@ -82,6 +86,9 @@ impl EvidenceLedger{
             }else{Err(Error::Denied)};
         }
         if key.advice_seq<=self.hi {return Err(Error::Stale);}
+        // A retained key is query-only, including after expiry. Only new
+        // admissions require the current model/snapshot/candidate authority.
+        packet.into_advice(trusted)?;
         let at=self.rows.iter().position(Option::is_none)
             .ok_or(Error::Exhausted)?;
         let mut copy=[0u8;ADVICE_BYTES];copy.copy_from_slice(wire);
@@ -89,16 +96,23 @@ impl EvidenceLedger{
             key,advice_wire:copy,advice_hash:hash,
             disposition_wire:[0;DISPOSITION_BYTES],
             disposition_hash:[0;32],has_terminal:false,
+            received_ns:trusted.now_ns,controller_epoch:trusted.epochs.controller,
         });
         self.hi=key.advice_seq;
+        self.last_ns=trusted.now_ns;
         Ok(AdviceResult::Recorded)
     }
     pub fn finalize(
         &mut self,actor:Identity,disposition:&[u8],
         decision:Option<&[u8]>,
+        // Trusted monotonic timestamp supplied by the serialized EL1 owner,
+        // not extracted from the copied disposition itself.
+        now_ns:u64,
     )->Result<AdviceResult,Error>{
-        if actor!=self.controller {return Err(Error::Denied);}
+        if actor!=self.controller && actor!=self.supervisor{return Err(Error::Denied);}
         let disp=AdviceDispositionV1::decode(disposition)?;
+        if actor==self.supervisor && disp.state!=4{return Err(Error::Denied);}
+        if now_ns<self.last_ns{return Err(Error::Clock);}
         let key=AdviceKey{
             boot_epoch:disp.boot_epoch,
             advisor_epoch:disp.advisor_epoch,
@@ -117,7 +131,18 @@ impl EvidenceLedger{
             || disp.advisor_epoch!=self.advisor_epoch
         {return Err(Error::Denied);}
         disp.matches_advice(self.boot_epoch, &row.advice_wire)?;
+        let advice=AdviceEnvelopeV1::decode(&row.advice_wire)?;
+        if disp.processed_ns!=now_ns || now_ns<row.received_ns{
+            return Err(Error::Clock);
+        }
+        if actor==self.supervisor && now_ns<advice.expires_ns{return Err(Error::Denied);}
+        // Expiry has precedence over observation/adoption. The only causal
+        // fallback after expiry is reason 4, with its own current decision.
+        if now_ns>=advice.expires_ns && !(disp.state==4 || (disp.state==2 && disp.reason_code==4)){
+            return Err(Error::Expired);
+        }
         if matches!(disp.state,1|2){
+            if disp.controller_epoch!=row.controller_epoch{return Err(Error::Denied);}
             let d=decision.ok_or(Error::NotReady)?;
             if d.len()!=DECISION_BYTES{return Err(Error::Invalid);}
             disp.matches_decision_pair(self.boot_epoch,&row.advice_wire,d)?;
@@ -129,6 +154,7 @@ impl EvidenceLedger{
         row.disposition_wire.copy_from_slice(disposition);
         row.disposition_hash=digest_new;
         row.has_terminal=true;
+        self.last_ns=now_ns;
         Ok(AdviceResult::Finalized)
     }
     pub fn consume(
@@ -215,9 +241,9 @@ mod tests {
             // while retaining the exact recorded advice digest.
             bad[at]=if at==102 {1} else {bad[at].wrapping_add(1)};
             assert!(AdviceDispositionV1::decode(&bad).is_ok(),"offset {at}");
-            assert_eq!(ledger.finalize(CONTROLLER,&bad,None),Err(Error::Denied),"offset {at}");
+            assert_eq!(ledger.finalize(CONTROLLER,&bad,None,150),Err(Error::Denied),"offset {at}");
         }
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
     }
     #[test]
     fn bounded_advice_slot_is_never_a_capability_or_replayable_after_ack(){
@@ -230,12 +256,12 @@ mod tests {
         assert_eq!(ledger.record(OPERATIONS,&forged,&trusted()),Err(Error::Denied));
         assert_eq!(ledger.pending(),1);
         let disp=shadow_disposition(&frame);
-        assert_eq!(ledger.finalize(OPERATIONS,&disp,None),Err(Error::Denied));
+        assert_eq!(ledger.finalize(OPERATIONS,&disp,None,150),Err(Error::Denied));
         assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{
             boot_epoch:1,advisor_epoch:1,advice_seq:1
         }),Err(Error::NotReady));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
         assert_eq!(ledger.consume(OPERATIONS,AdviceKey{
             boot_epoch:1,advisor_epoch:1,advice_seq:1
         }),Err(Error::Denied));
@@ -246,4 +272,27 @@ mod tests {
         assert_eq!(ledger.pending(),0);
         assert_eq!(ledger.record(OPERATIONS,&frame,&trusted()),Err(Error::Stale));
     }
+    #[test]
+    fn exact_advice_retry_does_not_reauthorize_and_supervisor_only_expires(){
+        let mut ledger=EvidenceLedger::new(OPERATIONS,CONTROLLER,SUPERVISOR,1,1).unwrap();
+        let frame=advice();
+        ledger.record(OPERATIONS,&frame,&trusted()).unwrap();
+        let mut later=trusted();later.now_ns=200;
+        assert_eq!(ledger.record(OPERATIONS,&frame,&later),Ok(AdviceResult::ExactRetry));
+        let mut disp=shadow_disposition(&frame);
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,199),Err(Error::Clock));
+        disp[80..88].copy_from_slice(&200u64.to_le_bytes());
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,200),Err(Error::Expired));
+        assert_eq!(ledger.finalize(SUPERVISOR,&disp,None,200),Err(Error::Denied));
+        disp[92..94].copy_from_slice(&4u16.to_le_bytes());
+        disp[94..96].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(ledger.finalize(SUPERVISOR,&disp,None,200),Ok(AdviceResult::Finalized));
+        later.now_ns=201;
+        assert_eq!(ledger.record(OPERATIONS,&frame,&later),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(SUPERVISOR,&disp,None,201),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1}).unwrap().state,4);
+        assert_eq!(ledger.record(OPERATIONS,&frame,&later),Err(Error::Stale));
+        assert!(EvidenceLedger::new(OPERATIONS,Identity{id:OPERATIONS.id,generation:2},SUPERVISOR,1,1).is_err());
+    }
+
 }

@@ -1585,6 +1585,58 @@ fn new_protection_relaxations_cannot_bypass_a_pending_capture_barrier() {
 }
 
 #[test]
+fn periodic_delete_refuses_corrupt_surviving_image_and_retains_valid_root() {
+    for automatic in [false, true] {
+        let mut h = Harness::new();
+        let old = h.periodic(PeriodicLayer::Short);
+        let survivor = h.periodic(PeriodicLayer::Short);
+        h.advance(0);
+        h.advance(SHORT_RETENTION_SECONDS * SECOND_NS);
+        h.checkpoint();
+        let home = descriptor_block(survivor.snapshot_key.slot as usize) + 1;
+        h.disk.stable.get_mut(&home).unwrap()[17] ^= 1;
+        let request = h.request(if automatic {14} else {0}, if automatic {3} else {1}, 0);
+        assert_eq!(h.manager.delete(
+            &mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx,
+            request, old.snapshot_key, false, automatic
+        ), Err(Error::Status(Status::Corrupt)));
+        assert!(h.manager.active(old.snapshot_key).is_ok());
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);
+        assert_eq!(h.query(request.key), Err(Error::Status(Status::Stale)));
+    }
+}
+
+#[test]
+fn retention_clock_regression_between_samples_and_after_anchor_reset_freezes_cleanup() {
+    for reset in [false,true] {
+        let mut h=Harness::new();
+        assert_eq!(h.advance(100*SECOND_NS),0);
+        assert_eq!(h.advance(140*SECOND_NS),0);
+        if reset {
+            let request=h.request(0,1,1);
+            h.create(request,3600).unwrap();
+        }
+        assert_eq!(h.manager.advance_age(
+            &mut h.journal,&mut h.disk,&mut h.scratch,&mut h.tx,130*SECOND_NS
+        ),Err(Error::Status(Status::Invalid)));
+        assert_eq!(h.manager.control.online_age_ns,0);
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.business_write_gate,Gate::Frozen);
+        // A second lower sample must not replace the high-water.
+        assert_eq!(h.manager.advance_age(
+            &mut h.journal,&mut h.disk,&mut h.scratch,&mut h.tx,139*SECOND_NS
+        ),Err(Error::Status(Status::Invalid)));
+        h.disk.crash();
+        let mut recovered=Harness::mount(h.disk);
+        // A new boot legitimately starts a new clock origin, not a new
+        // durable retention age or an automatically open write gate.
+        assert_eq!(recovered.advance(0),0);
+        assert!(recovered.manager.control.cleanup_freeze);
+    }
+}
+
+#[test]
 fn internal_fault_freeze_retries_rejected_durability_before_any_relaxation() {
     let mut h = Harness::new();
     h.bootstrap();
