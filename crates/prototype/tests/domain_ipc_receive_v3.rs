@@ -26,19 +26,29 @@ fn actual_fifo_copy_fault_and_lost_return_never_dequeue_twice(){
     assert_eq!(q.prepare(key(1),ep,1,551,0,&mut b,||panic!("short output")),Err(Error::Range));
     assert_eq!(q.prepare(key(1),ep,1,552,0,&mut b,||Err(Error::Capacity)),Err(Error::Capacity));
     let ticket=q.prepare(key(1),ep,1,552,0,&mut b,||Ok(7)).unwrap().ticket();
-    let mut frame=[0;552];let length=q.stage(ticket,&mut frame,&mut b).unwrap();
+    let mut frame=[0;552];let first_copy=q.stage(ticket,&mut frame,&mut b).unwrap();
+    let length=first_copy.len();
+    assert_eq!(q.stage(ticket,&mut [0;552],&mut b),Err(Error::Busy));
     assert_eq!(length,45);assert_eq!(&frame[40..45],b"first");
     assert_eq!(u64::from_le_bytes(frame[0..8].try_into().unwrap()),2);
     assert_eq!(u64::from_le_bytes(frame[24..32].try_into().unwrap()),ep.generation);
-    assert_eq!(q.commit_copied(ticket,length-1,0,&mut b),Err(Error::Range));
+    assert_eq!(q.commit_copied(first_copy,length-1,0,&mut b),Err(Error::Range));
     assert_eq!(q.stats(ep).unwrap().depth,2);
     assert_eq!(q.ack(key(1),ep,1,&mut b,|_|panic!("not DONE")),Err(Error::Busy));
     assert_eq!(q.prepare(key(1),ep,1,552,0,&mut b,||panic!("duplicate credit")),Ok(ReceivePrepared::Existing(ticket)));
-    b.deny=true;assert_eq!(q.commit_copied(ticket,length,0,&mut b),Err(Error::Auth));b.deny=false;
-    assert_eq!(q.commit_copied(ticket,length,0,&mut b),Ok(length));
-    let mut retry=[0;552];assert_eq!(q.stage(ticket,&mut retry,&mut b),Ok(length));
+    b.deny=true;assert_eq!(q.commit_copied(first_copy,length,0,&mut b),Err(Error::Auth));b.deny=false;
+    q.abort_copy(first_copy).unwrap();
+    assert_eq!(q.abort_copy(first_copy),Err(Error::Stale));
+    let mut retry=[0;552];let second_copy=q.stage(ticket,&mut retry,&mut b).unwrap();
+    assert_ne!(first_copy,second_copy);assert_eq!(retry,frame);
+    assert_eq!(q.commit_copied(first_copy,length,0,&mut b),Err(Error::Stale));
+    assert_eq!(q.commit_copied(second_copy,length,0,&mut b),Ok(length));
+    // A lost return replays the retained DONE bytes under a new lease.
+    let replay=q.stage(ticket,&mut retry,&mut b).unwrap();
     assert_eq!(retry,frame);
-    assert_eq!(q.commit_copied(ticket,length,0,&mut b),Ok(length));
+    assert_eq!(q.ack(key(1),ep,1,&mut b,|_|panic!("copy still active")),Err(Error::Busy));
+    assert_eq!(q.commit_copied(replay,length,0,&mut b),Ok(length));
+    assert_eq!(q.commit_copied(replay,length,0,&mut b),Err(Error::Stale));
     assert_eq!(q.stats(ep).unwrap().depth,1);
     assert_eq!(q.prepare(key(1),ep,2,552,0,&mut b,||panic!("unacked")),Err(Error::Busy));
     assert_eq!(q.ack(key(1),ep,1,&mut b,|_|Err(Error::Busy)),Err(Error::Busy));
@@ -46,8 +56,9 @@ fn actual_fifo_copy_fault_and_lost_return_never_dequeue_twice(){
     q.ack(key(1),ep,1,&mut b,|_|panic!("duplicate release")).unwrap();
     assert_eq!(q.prepare(key(1),ep,1,552,0,&mut b,||panic!("old seq")),Err(Error::Stale));
     let second=q.prepare(key(1),ep,2,552,0,&mut b,||Ok(8)).unwrap().ticket();
-    assert_eq!(q.stage(second,&mut retry,&mut b),Ok(46));assert_eq!(&retry[40..46],b"second");
-    q.commit_copied(second,46,0,&mut b).unwrap();
+    let copy=q.stage(second,&mut retry,&mut b).unwrap();
+    assert_eq!(copy.len(),46);assert_eq!(&retry[40..46],b"second");
+    q.commit_copied(copy,46,0,&mut b).unwrap();
     q.ack(key(1),ep,2,&mut b,|credit|{assert_eq!(credit,8);Ok(())}).unwrap();
     assert_eq!(q.stats(ep).unwrap().delivered,2);
 }
@@ -57,12 +68,17 @@ fn closed_holder_cannot_erase_reserved_or_done_custody(){
         let mut q=Box::new(IpcV3::<8>::new());let mut b=Backend::default();
         let ep=q.open(key(1)).unwrap();enqueue(&mut q,ep,1,b"x",&mut b);
         let t=q.prepare(key(1),ep,1,552,0,&mut b,||Ok(9)).unwrap().ticket();
-        if done{q.commit_copied(t,41,0,&mut b).unwrap();}
+        let copy=q.stage(t,&mut [0;552],&mut b).unwrap();
+        if done{q.commit_copied(copy,41,0,&mut b).unwrap();}
+        let active=if done{q.stage(t,&mut [0;552],&mut b).unwrap()}else{copy};
         q.close_admission(key(1),ep).unwrap();
         assert_eq!(q.stage(t,&mut [0;552],&mut b),Err(Error::Stale));
         assert_eq!(q.reserve_send(key(2),ep,2,0,&mut b),Err(Error::Stale));
         assert_eq!(q.close_empty(key(1),ep,&mut b),Err(Error::Busy));
         assert_eq!(q.retire_closed(ep,false,true,|_|panic!("not stopped")),Err(Error::Busy));
+        assert_eq!(q.retire_closed(ep,true,true,|_|panic!("copy not joined")),Err(Error::Busy));
+        assert_eq!(q.commit_copied(active,41,0,&mut b),Err(Error::Stale));
+        q.abort_copy(active).unwrap();
         if done{assert_eq!(q.retire_closed(ep,true,false,|_|panic!("not audited")),Err(Error::Busy));}
         q.retire_closed(ep,true,done,|credit|{assert_eq!(credit,9);Ok(())}).unwrap();
         assert_eq!(q.stats(ep).unwrap().depth,usize::from(!done));

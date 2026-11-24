@@ -24,12 +24,27 @@ impl ReceivePrepared {
         match self {Self::New(t)|Self::Existing(t)=>t}
     }
 }
+/// Unique kernel-owned copy attempt. The receive identity survives faults and
+/// lost returns, but a completed/aborted copy attempt is never reusable.
+/// The native adapter must retain this lease until copyout and pin release
+/// are reliably joined, even if the holder exits or its cap is revoked.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct ReceiveCopyLease {
+    ticket:ReceiveTicket,
+    serial:u64,
+    len:usize,
+}
+impl ReceiveCopyLease {
+    pub fn len(self)->usize{self.len}
+    pub fn is_empty(self)->bool{self.len==0}
+}
 #[derive(Clone,Copy)]
 struct ReceiveRecord {
     ticket:ReceiveTicket,
     bytes:[u8;RECEIVE_V3_REPLY_CAP],
     len:u16,
     done:bool,
+    active_copy:u64, // 0 means no copy/pin obligation
 }
 #[derive(Clone,Copy)]
 struct ReceiveSlot {
@@ -50,13 +65,14 @@ const _:()=assert!(core::mem::size_of::<[ReceiveSlot;MAX_ENDPOINTS]>()<=32*1024)
 pub struct IpcV3<const B:usize=512> {
     fifo:Ipc<B>,
     receivers:[ReceiveSlot;MAX_ENDPOINTS],
+    copy_serial:u64,
 }
 impl<const B:usize> Default for IpcV3<B>{
     fn default()->Self{Self::new()}
 }
 impl<const B:usize> IpcV3<B>{
     pub const fn new()->Self{
-        Self{fifo:Ipc::new(),receivers:[ReceiveSlot::EMPTY;MAX_ENDPOINTS]}
+        Self{fifo:Ipc::new(),receivers:[ReceiveSlot::EMPTY;MAX_ENDPOINTS],copy_serial:0}
     }
     pub fn open(&mut self,holder:ObjectKey)->Result<ObjectKey,Error>{
         if B==0 || B>RECEIVE_V3_MAX_PAYLOAD{return Err(Error::Range);}
@@ -135,39 +151,68 @@ impl<const B:usize> IpcV3<B>{
         let completion_credit=reserve_credit()?;
         // The trusted pool must never return a zero or aliased credit.
         // A violated adapter contract fails closed before any FIFO change.
-        if completion_credit==0{return Err(Error::Conflict);}
+        if completion_credit==0 || self.receivers.iter().any(|slot|
+            slot.record.is_some_and(|r|r.ticket.completion_credit==completion_credit)){
+            return Err(Error::Conflict);
+        }
         let ticket=ReceiveTicket{endpoint,holder,recv_seq,head_sequence,completion_credit};
         let slot=&mut self.receivers[at];
         slot.high=recv_seq;
-        slot.record=Some(ReceiveRecord{ticket,bytes,len:length,done:false});
+        slot.record=Some(ReceiveRecord{ticket,bytes,len:length,done:false,active_copy:0});
         Ok(ReceivePrepared::New(ticket))
     }
     fn record(&self,ticket:ReceiveTicket,at:usize)->Result<&ReceiveRecord,Error>{
         self.receivers[at].record.as_ref().filter(|r|r.ticket==ticket).ok_or(Error::Stale)
     }
-    /// Copy to private *kernel* staging under the owner lock. The adapter
-    /// then drops the lock and performs actual checked copyout. An EFAULT or
-    /// timeout does not call commit and leaves the exact same queue head.
-    pub fn stage(&self,ticket:ReceiveTicket,out:&mut [u8;RECEIVE_V3_REPLY_CAP],
-        backend:&mut impl IpcBackend<B>)->Result<usize,Error>
+    /// Acquire an exclusive copy lease and stage the exact frozen response
+    /// under the owner lock. A concurrent exact receive retry cannot acquire
+    /// a second copy lease. The adapter drops the lock, pins/copies/unpins,
+    /// and then commits or aborts only after that copy obligation has joined.
+    pub fn stage(&mut self,ticket:ReceiveTicket,out:&mut [u8;RECEIVE_V3_REPLY_CAP],
+        backend:&mut impl IpcBackend<B>)->Result<ReceiveCopyLease,Error>
     {
         let at=self.authorized(ticket.holder,ticket.endpoint,backend)?;
-        let r=self.record(ticket,at)?;
+        let serial=self.copy_serial.checked_add(1).ok_or(Error::Overflow)?;
+        let r=self.receivers[at].record.as_mut().filter(|r|r.ticket==ticket).ok_or(Error::Stale)?;
+        if r.active_copy!=0{return Err(Error::Busy);}
         out.copy_from_slice(&r.bytes);
-        Ok(usize::from(r.len))
+        r.active_copy=serial;
+        let len=usize::from(r.len);
+        self.copy_serial=serial;
+        Ok(ReceiveCopyLease{ticket,serial,len})
     }
-    /// Called only after verified complete copyout to the actual holder and
-    /// revalidation of its pinned mapping/generation. A retry after a lost
-    /// return reuses DONE bytes; it never consumes a second queue head.
-    pub fn commit_copied(&mut self,ticket:ReceiveTicket,copied_bytes:usize,now:u64,
+    fn copy_record(&self,lease:ReceiveCopyLease,at:usize)->Result<&ReceiveRecord,Error>{
+        let r=self.record(lease.ticket,at)?;
+        if lease.serial==0 || r.active_copy!=lease.serial || usize::from(r.len)!=lease.len{
+            return Err(Error::Stale);
+        }
+        Ok(r)
+    }
+    /// Trusted copy adapter only: after proving all copying/pins have
+    /// stopped, release the attempt without changing FIFO or DONE custody.
+    /// This is also available after revoke/close; it grants no new copy.
+    pub fn abort_copy(&mut self,lease:ReceiveCopyLease)->Result<(),Error>{
+        let at=self.index(lease.ticket.endpoint)?;
+        self.copy_record(lease,at)?;
+        self.receivers[at].record.as_mut().unwrap().active_copy=0;
+        Ok(())
+    }
+    /// Verified full copyout plus joined pin/copy obligation and current
+    /// authenticated holder. Exact DONE retries stage a fresh lease, never
+    /// pop another head. A failed validation leaves the old lease owned.
+    pub fn commit_copied(&mut self,lease:ReceiveCopyLease,copied_bytes:usize,now:u64,
         backend:&mut impl IpcBackend<B>)->Result<usize,Error>
     {
         self.fifo.time(now)?;
+        let ticket=lease.ticket;
         let at=self.authorized(ticket.holder,ticket.endpoint,backend)?;
-        let record=self.record(ticket,at)?;
+        let record=self.copy_record(lease,at)?;
         let len=usize::from(record.len);
         if copied_bytes!=len{return Err(Error::Range);}
-        if record.done{return Ok(len);}
+        if record.done{
+            self.receivers[at].record.as_mut().unwrap().active_copy=0;
+            return Ok(len);
+        }
         let e=self.fifo.endpoints[at].as_mut().ok_or(Error::Stale)?;
         if e.len==0{return Err(Error::Conflict);}
         let cell=usize::from(e.order[e.head]);
@@ -183,7 +228,9 @@ impl<const B:usize> IpcV3<B>{
         e.stats.delivered=e.stats.delivered.saturating_add(1);
         if e.stamp.live(now){e.applied_version=e.applied_version.max(e.stamp.version);}
         if e.len!=0{e.wake=true;}
-        self.receivers[at].record.as_mut().unwrap().done=true;
+        let r=self.receivers[at].record.as_mut().unwrap();
+        r.done=true;
+        r.active_copy=0;
         // Independent notification failure never undoes the committed receive.
         self.fifo.notify_endpoint(at,backend);
         Ok(len)
@@ -202,7 +249,7 @@ impl<const B:usize> IpcV3<B>{
         if recv_seq<slot.retired{return Err(Error::Stale);}
         let r=slot.record.as_ref().ok_or(Error::Again)?;
         if r.ticket.recv_seq!=recv_seq{return Err(Error::Again);}
-        if !r.done{return Err(Error::Busy);}
+        if !r.done || r.active_copy!=0{return Err(Error::Busy);}
         release(r.ticket.completion_credit)?;
         slot.retired=recv_seq;
         slot.record=None;
@@ -226,7 +273,7 @@ impl<const B:usize> IpcV3<B>{
         let slot=&mut self.receivers[at];
         if !slot.closed || !stopped{return Err(Error::Busy);}
         let Some(r)=slot.record else{return Ok(());};
-        if r.done && !done_audited{return Err(Error::Busy);}
+        if r.active_copy!=0 || (r.done && !done_audited){return Err(Error::Busy);}
         release(r.ticket.completion_credit)?;
         slot.retired=r.ticket.recv_seq;
         slot.record=None;
