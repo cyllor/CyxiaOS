@@ -331,6 +331,41 @@ impl FileReceiptV4 {
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn baseline_state_redo_requires_complete_ordered_chain(){
+        use sha2::{Digest,Sha256};
+        fn put16(b:&mut[u8],i:usize,v:u16){b[i..i+2].copy_from_slice(&v.to_le_bytes());}
+        fn put32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
+        fn put64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
+        fn seal(b:&mut[u8],kind:u16,len:usize,lsn:u64){
+            put32(b,0,0x4359_4c47);put16(b,4,1);put16(b,6,kind);
+            put32(b,8,len as u32);put64(b,16,7);put64(b,24,lsn);put64(b,32,2);
+            let p=cyxia_prototype::storage::crc32c(&b[64..len]);put32(b,12,p);
+            let h=crc32c_zeroed(&b[..64],56).unwrap();put32(b,56,h);
+        }
+        let sb=SuperblockV1{fs_uuid:[1;16],generation:2,checkpoint_lsn:10,log_epoch:2};
+        let state=[0x5au8;4096];
+        let home=7000u64;
+        let mut begin=[0u8;4096];put32(&mut begin,64,1);put64(&mut begin,72,4096);
+        seal(&mut begin,1,80,11);
+        let mut redo=[0u8;8192];put64(&mut redo,40,home);put32(&mut redo,52,1);
+        redo[64..4160].copy_from_slice(&state);seal(&mut redo,2,4160,12);
+        let mut commit=[0u8;4096];put64(&mut commit,64,7);put64(&mut commit,72,11);
+        put64(&mut commit,80,12);put32(&mut commit,88,1);
+        let mut digest=Sha256::new();digest.update(home.to_le_bytes());digest.update(&state);
+        commit[96..128].copy_from_slice(&digest.finalize());seal(&mut commit,3,128,13);
+        let check=|sb,first,home,redo:&[u8],commit:&[u8],image:&[u8]|
+            verify_state_redo_v1(sb,first,home,&begin,&[redo],commit,image,7,13);
+        assert_eq!(check(sb,2,home,&redo,&commit,&state),Ok(()));
+        assert_eq!(check(sb,4096,home,&redo,&commit,&state),Err(Error::Invalid));
+        assert_eq!(check(SuperblockV1{checkpoint_lsn:11,..sb},2,home,&redo,&commit,&state),Err(Error::Stale));
+        assert_eq!(check(sb,2,home+1,&redo,&commit,&state),Err(Error::Conflict));
+        let mut bad=redo;bad[64]^=1;
+        assert_eq!(check(sb,2,home,&bad,&commit,&state),Err(Error::Invalid));
+        let mut bad=commit;bad[96]^=1;seal(&mut bad,3,128,13);
+        assert_eq!(check(sb,2,home,&redo,&bad,&state),Err(Error::Conflict));
+        assert_eq!(check(sb,2,home,&redo,&commit,&[0u8;4096]),Err(Error::Conflict));
+    }
     fn super_v1()->[u8;SUPER_BYTES] {
         let mut b=[0u8;SUPER_BYTES];
         b[0..4].copy_from_slice(&SUPER_MAGIC.to_le_bytes());
