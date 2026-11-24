@@ -99,10 +99,10 @@ pub(super) fn run(boot:u64){
     let mut clock=NativeClock;
     let owner=unsafe{&mut *core::ptr::addr_of_mut!(OWNER)};
     owner.bind(boot,TARGET,1,||if base==super::super::HIGH+0x09000000{Ok(())}else{Err(Error::Denied)}).unwrap();
-    let baseline=super::super::console::enqueue_v0199(owner,BASE_PAYLOAD,now()).unwrap();
+    let baseline=crate::machine::enqueue_v0199(owner,BASE_PAYLOAD,now()).unwrap();
     let (_,baseline_calls,baseline_max,baseline_cpu)=drain(owner,&mut tx,&mut clock);
     assert_eq!(owner.written(),baseline as u64);assert!(baseline_max>0&&baseline_max<=8);
-    let applied=super::super::console::enqueue_v0199(owner,APPLY_PAYLOAD,now()).unwrap();
+    let applied=crate::machine::enqueue_v0199(owner,APPLY_PAYLOAD,now()).unwrap();
     let sample=now();let fields=owner.observe(sample).unwrap();
     let mut raw=[None;12];raw[8..].copy_from_slice(&fields);
     let snap=SnapshotReplyV3{snapshot_seq:1,boot_epoch:boot,ledger_generation:1,core_generation:1,
