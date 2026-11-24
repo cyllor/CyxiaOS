@@ -544,6 +544,11 @@ impl RegisteredDecisionGate {
         Ok(summary)
     }
 
+    pub fn publisher_scope(&self,actor:Identity)->Result<(u64,u64),Error>{
+        if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
+        Ok((self.boot_epoch,self.controller_epoch))
+    }
+
     /// Read the exact retained registered DecisionRecord (ControlRPC op9).
     /// The only authorized EL0 reader is the independently registered
     /// publisher. No record reconstruction and no implicit publication.
