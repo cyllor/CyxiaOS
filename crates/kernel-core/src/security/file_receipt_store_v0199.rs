@@ -141,7 +141,10 @@ fn scan_receipts_inner(
             if usize::from(group_counts[group_at]) > STREAMS_PER_GROUP {
                 return Err(Error::Invalid);
             }
-            if matches!(record.status, 1 | 2) {
+            // UNKNOWN may still own the original execution. It is not a
+            // terminal predecessor and cannot coexist with a second inflight
+            // request in the same stream.
+            if matches!(record.status, 1 | 2 | 5) {
                 if inflight[stream_at] { return Err(Error::Invalid); }
                 inflight[stream_at] = true;
             }
@@ -285,6 +288,11 @@ mod tests {
         }
         data[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
         data[..RECEIPT_BYTES].copy_from_slice(&receipt((1u64<<56)|1,1));
+        assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
+        // UNKNOWN is unresolved even if its binding digest is present.
+        data[96..98].copy_from_slice(&5u16.to_le_bytes());
+        data[108]=1;
+        reseal(&mut data[..RECEIPT_BYTES]);
         assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
         // A bound, proven terminal predecessor can coexist with one pending.
         data[96..98].copy_from_slice(&3u16.to_le_bytes());
