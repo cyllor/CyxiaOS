@@ -123,6 +123,7 @@ impl FileStreamIndexV4 {
                     || stream.retired_through != 0
                 ))
                 || (stream.flags != 0 && stream.generation == 0)
+                || (stream.flags != 0 && groups[i / STREAMS_PER_GROUP].flags == 0)
             { return Err(Error::Invalid); }
             streams[i] = stream;
         }
@@ -142,17 +143,27 @@ impl FileStreamIndexV4 {
             || self.global_request_id_hi < old.global_request_id_hi
             || self.generation < old.generation
         { return false; }
+        // An identical committed generation has one canonical value.
+        // Monotone individual counters do not prove which conflicting
+        // same-generation index is authoritative.
+        if self.generation == old.generation { return self == old; }
         for i in 0..GROUP_COUNT {
             if self.groups[i].manifest_principal_id
                 != old.groups[i].manifest_principal_id
                 || self.groups[i].generation < old.groups[i].generation
                 || self.groups[i].boot_epoch < old.groups[i].boot_epoch
+                || (self.groups[i].generation == old.groups[i].generation
+                    && self.groups[i].boot_epoch != old.groups[i].boot_epoch)
             { return false; }
         }
         for i in 0..STREAM_COUNT {
             if self.streams[i].generation < old.streams[i].generation
                 || self.streams[i].issued_hi < old.streams[i].issued_hi
                 || self.streams[i].retired_through < old.streams[i].retired_through
+                // A stream generation cannot be reused while any older
+                // receipt is still unretired in the successor index.
+                || (self.streams[i].generation != old.streams[i].generation
+                    && self.streams[i].retired_through < old.streams[i].issued_hi)
             { return false; }
         }
         true
@@ -214,6 +225,7 @@ impl SecurityStateStoreV2 {
     /// Isolation clearance requires separate protected authorization and
     /// cannot be inferred from this monotonic comparison alone.
     pub fn no_rollback_from(&self, old: &Self) -> bool {
+        if self.state_generation == old.state_generation { return self == old; }
         self.fs_uuid == old.fs_uuid
             && self.state_generation >= old.state_generation
             && self.rule_min_generation >= old.rule_min_generation
@@ -363,6 +375,43 @@ mod tests {
         assert!(FileStreamIndexV4::decode(&bad).is_err());
         bad=index();bad[4]=3;finalize_crc(&mut bad,CRC_OFFSET);
         assert!(FileStreamIndexV4::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn divergent_same_generation_and_unretired_stream_reuse_are_not_committed_successors() {
+        let old=FileStreamIndexV4::decode(&index()).unwrap();
+        let mut next=old;
+        next.global_request_id_hi=1;
+        assert!(!next.no_counter_rollback_from(&old));
+        next.generation+=1;
+        assert!(next.no_counter_rollback_from(&old));
+        next.groups[0].flags=1;
+        next.groups[0].generation=1;
+        next.groups[0].boot_epoch=1;
+        next.streams[0].flags=1;
+        next.streams[0].generation=1;
+        next.streams[0].issued_hi=2;
+        let committed=next;
+        next.generation+=1;
+        next.groups[0].boot_epoch=2;
+        assert!(!next.no_counter_rollback_from(&committed));
+        next.groups[0].generation+=1;
+        next.streams[0].generation+=1;
+        assert!(!next.no_counter_rollback_from(&committed));
+        next.streams[0].retired_through=2;
+        assert!(next.no_counter_rollback_from(&committed));
+
+        let old=SecurityStateStoreV2::decode(&security()).unwrap();
+        let mut state=old;
+        state.rule_min_generation=1;
+        assert!(!state.no_rollback_from(&old));
+        state.state_generation+=1;
+        assert!(state.no_rollback_from(&old));
+        let mut orphan=index();
+        orphan[448..452].copy_from_slice(&1u32.to_le_bytes());
+        orphan[452..456].copy_from_slice(&1u32.to_le_bytes());
+        finalize_crc(&mut orphan,CRC_OFFSET);
+        assert!(FileStreamIndexV4::decode(&orphan).is_err());
     }
     #[test]
     fn security_state_v2_enforces_crc_reserved_isolation_and_monotonic_minima() {

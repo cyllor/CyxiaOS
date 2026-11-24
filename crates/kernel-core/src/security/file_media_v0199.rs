@@ -204,6 +204,14 @@ pub struct FileReceiptV4 {
     pub request_id:u64,
     pub owner_principal_id:u64,
 }
+/// The local request identity is a deterministic projection of the full key,
+/// never a caller-chosen second identifier. This is format, not authority.
+pub const fn local_request_id(group_id:u32,stream_slot:u64,request_seq:u64)->Option<u64>{
+    if group_id>=16 || stream_slot>=8 || request_seq==0 || request_seq>MAX_REQUEST_SEQ {
+        return None;
+    }
+    Some(((group_id as u64+1)<<56)|(stream_slot<<53)|request_seq)
+}
 impl FileReceiptV4 {
     pub fn decode(bytes:&[u8])->Result<Self,Error>{
         if bytes.len()!=RECEIPT_BYTES
@@ -240,14 +248,20 @@ impl FileReceiptV4 {
             || value.stream_generation==0 || value.stream_generation>u32::MAX as u64
             || value.request_seq==0 || value.request_seq>MAX_REQUEST_SEQ
             || !(1..=6).contains(&value.status)
-            || value.request_id==0 || value.owner_principal_id==0
-            || (value.status==1
-                && (value.log_epoch!=0 || value.txid!=0
+            || local_request_id(value.group_id,value.stream_slot,value.request_seq)!=Some(value.request_id)
+            || value.owner_principal_id==0
+            // A transaction identity is either absent or complete.
+            || ((value.log_epoch==0 || value.txid==0 || value.commit_lsn==0)
+                && (value.log_epoch!=0 || value.txid!=0 || value.commit_lsn!=0))
+            // CANCEL_UNBOUND may retire a proven no-effect unbound ticket.
+            // Zero operation digest is legal only for ISSUED or that
+            // cancelled form, and all unbound operation fields stay zero.
+            || (value.operation_digest==[0;32]
+                && (!matches!(value.status,1|6) || value.log_epoch!=0 || value.txid!=0
                     || value.commit_lsn!=0 || value.write_seq!=0
                     || value.result!=0 || value.completed_prefix!=0
-                    || value.operation_digest!=[0;32]
                     || value.output_digest!=[0;32]))
-            || (value.status!=1 && value.operation_digest==[0;32])
+            || (value.status==1 && value.operation_digest!=[0;32])
         {return Err(Error::Invalid);}
         Ok(value)
     }
@@ -285,7 +299,7 @@ mod tests{
         b[48..56].copy_from_slice(&1u64.to_le_bytes());
         b[56..64].copy_from_slice(&1u64.to_le_bytes());
         b[96..98].copy_from_slice(&1u16.to_le_bytes());
-        b[172..180].copy_from_slice(&1u64.to_le_bytes());
+        b[172..180].copy_from_slice(&local_request_id(0,0,1).unwrap().to_le_bytes());
         b[180..188].copy_from_slice(&2u64.to_le_bytes());
         let crc=crc32c_zeroed(&b,188).unwrap();
         b[188..192].copy_from_slice(&crc.to_le_bytes());
@@ -387,6 +401,31 @@ mod tests{
         b=super_v1();b[16]^=1;
         assert!(SuperblockV1::decode(&b).is_err());
         assert_eq!(crc32c_zeroed(&[0u8;2],0),Err(Error::Invalid));
+    }
+    #[test]
+    fn receipt_canonical_local_identity_and_unbound_cancel_shape() {
+        let mut b=receipt();
+        b[96..98].copy_from_slice(&6u16.to_le_bytes());
+        let reseal=|b:&mut [u8;RECEIPT_BYTES]| {
+            let crc=crc32c_zeroed(b,188).unwrap();
+            b[188..192].copy_from_slice(&crc.to_le_bytes());
+        };
+        reseal(&mut b);
+        assert_eq!(FileReceiptV4::decode(&b).unwrap().status,6);
+        let cancelled=b;
+        for at in [64usize,72,80,88,100,104,140,172] {
+            b=cancelled;b[at]^=1;reseal(&mut b);
+            assert!(FileReceiptV4::decode(&b).is_err(),"offset {at}");
+        }
+        b=cancelled;b[96..98].copy_from_slice(&2u16.to_le_bytes());
+        reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_err());
+        b[108]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_ok());
+        b[64]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_err());
+        b[72]=1;b[80]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_ok());
+        assert_eq!(local_request_id(15,7,MAX_REQUEST_SEQ),Some((16u64<<56)|(7u64<<53)|MAX_REQUEST_SEQ));
+        assert_eq!(local_request_id(16,0,1),None);
+        assert_eq!(local_request_id(0,8,1),None);
+        assert_eq!(local_request_id(0,0,0),None);
     }
     #[test]
     fn v0199_receipt_v4_rejects_old_version_crc_and_unbound_forgery(){
