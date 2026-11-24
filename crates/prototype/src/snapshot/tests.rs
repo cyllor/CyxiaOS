@@ -1604,3 +1604,32 @@ fn periodic_delete_refuses_corrupt_surviving_image_and_retains_valid_root() {
         assert_eq!(h.query(request.key), Err(Error::Status(Status::Stale)));
     }
 }
+
+#[test]
+fn retention_clock_regression_between_samples_and_after_anchor_reset_freezes_cleanup() {
+    for reset in [false,true] {
+        let mut h=Harness::new();
+        assert_eq!(h.advance(100*SECOND_NS),0);
+        assert_eq!(h.advance(140*SECOND_NS),0);
+        if reset {
+            let request=h.request(0,1,1);
+            h.create(request,3600).unwrap();
+        }
+        assert_eq!(h.manager.advance_age(
+            &mut h.journal,&mut h.disk,&mut h.scratch,&mut h.tx,130*SECOND_NS
+        ),Err(Error::Status(Status::Invalid)));
+        assert_eq!(h.manager.control.online_age_ns,0);
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.business_write_gate,Gate::Frozen);
+        // A second lower sample must not replace the high-water.
+        assert_eq!(h.manager.advance_age(
+            &mut h.journal,&mut h.disk,&mut h.scratch,&mut h.tx,139*SECOND_NS
+        ),Err(Error::Status(Status::Invalid)));
+        h.disk.crash();
+        let mut recovered=Harness::mount(h.disk);
+        // A new boot legitimately starts a new clock origin, not a new
+        // durable retention age or an automatically open write gate.
+        assert_eq!(recovered.advance(0),0);
+        assert!(recovered.manager.control.cleanup_freeze);
+    }
+}
