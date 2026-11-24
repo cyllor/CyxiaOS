@@ -247,6 +247,7 @@ pub(super) fn run(info:&BootInfo)->!{
     let new=super::v0199_control_bringup::disk_security_run(new_generation,1,false);
     assert_ne!(new.root,old.root);assert_eq!(old.image_sha256,new.image_sha256);
     report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new.root,boot);
+    super::v0199_d15_fixture::run(boot);
     assert_eq!((disk.writes,disk.flushes),(11+12*reset,6+reset));
     let final_txid=recovered+2;
     let final_state=scratch.verify(sb,8,HOME,final_txid,7*(final_txid/2)).unwrap();
@@ -261,7 +262,7 @@ pub(super) fn run(info:&BootInfo)->!{
     QUIT.store(true,Ordering::Release);
     wait(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
-    let row=[MAGIC,6,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,7*(final_txid/2),
+    let row=[MAGIC,7,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,7*(final_txid/2),
         8,disk.flushes,disk.reads,disk.writes,u64::from(HOME)];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     for(i,b)in final_digest.chunks_exact(8).enumerate(){
