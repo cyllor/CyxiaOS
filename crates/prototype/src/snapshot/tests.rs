@@ -1581,3 +1581,26 @@ fn new_protection_relaxations_cannot_bypass_a_pending_capture_barrier() {
     assert!(h.manager.control.cleanup_freeze);
     assert_eq!(h.query(creating.key).unwrap().state, RequestState::Pending);
 }
+
+#[test]
+fn periodic_delete_refuses_corrupt_surviving_image_and_retains_valid_root() {
+    for automatic in [false, true] {
+        let mut h = Harness::new();
+        let old = h.periodic(PeriodicLayer::Short);
+        let survivor = h.periodic(PeriodicLayer::Short);
+        h.advance(0);
+        h.advance(SHORT_RETENTION_SECONDS * SECOND_NS);
+        h.checkpoint();
+        let home = descriptor_block(survivor.snapshot_key.slot as usize) + 1;
+        h.disk.stable.get_mut(&home).unwrap()[17] ^= 1;
+        let request = h.request(if automatic {14} else {0}, if automatic {3} else {1}, 0);
+        assert_eq!(h.manager.delete(
+            &mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx,
+            request, old.snapshot_key, false, automatic
+        ), Err(Error::Status(Status::Corrupt)));
+        assert!(h.manager.active(old.snapshot_key).is_ok());
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);
+        assert_eq!(h.query(request.key), Err(Error::Status(Status::Stale)));
+    }
+}

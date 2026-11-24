@@ -659,6 +659,28 @@ impl<const C: usize> FileSystem<C> {
 
     /// Typed owner entry used by the versioned broker after capability checks.
     /// Length/reserved-field checks are repeated before any disk side effect.
+    // Both automatic rotation and explicit deletion pass the same proof
+    // boundary. The exclusive filesystem owner prevents allocation, writes,
+    // and new root opens between this validation and the root-drop commit.
+    fn delete_with_tree_proof<D: BlockDevice>(
+        &mut self,
+        request: Request,
+        key: SnapshotKey,
+        automatic: bool,
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+    ) -> Result<RequestRecord, Error> {
+        let refs = self.frozen.iter().flatten().any(|v| v.key == key);
+        if key.slot < 6 && self.snapshots.periodic_delete_requires_tree_proof(
+            j, d, s, &mut self.tx, request, key, refs, automatic
+        ).map_err(snapshot_error)? {
+            self.validate_snapshot_roots(j, d, s)?;
+        }
+        self.snapshots.delete(j, d, s, &mut self.tx, request, key, refs, automatic)
+            .map_err(snapshot_error)
+    }
+
     pub fn snapshot_execute<D: BlockDevice>(
         &mut self,
         request: Request,
@@ -683,10 +705,7 @@ impl<const C: usize> FileSystem<C> {
             }
             snapshot::OP_DELETE if payload.len() == 40 => {
                 let key = SnapshotKey::decode(payload).map_err(|_| Error::Format)?;
-                let refs = self.frozen.iter().flatten().any(|v| v.key == key);
-                self.snapshots
-                    .delete(j, d, s, &mut self.tx, request, key, refs, false)
-                    .map_err(snapshot_error)
+                self.delete_with_tree_proof(request, key, false, j, d, s)
             }
             snapshot::OP_RESTORE if payload.len() == 48 && u32_at(payload, 44) == 0 => {
                 let key = SnapshotKey::decode(&payload[..40]).map_err(|_| Error::Format)?;
@@ -934,22 +953,13 @@ impl<const C: usize> FileSystem<C> {
                     .snapshots
                     .next_request_key(j, d, s, &mut self.tx, 14)
                     .map_err(snapshot_error)?;
-                let result = self
-                    .snapshots
-                    .delete(
-                        j,
-                        d,
-                        s,
-                        &mut self.tx,
-                        Request {
-                            key: request_key,
-                            expected_live_view_epoch: 0,
-                        },
-                        key,
-                        false,
-                        true,
-                    )
-                    .map_err(snapshot_error)?;
+                let result = self.delete_with_tree_proof(
+                    Request {
+                        key: request_key,
+                        expected_live_view_epoch: 0,
+                    },
+                    key, true, j, d, s,
+                )?;
                 self.snapshots
                     .ack(j, d, s, &mut self.tx, request_key, result.result_digest)
                     .map_err(snapshot_error)?;
