@@ -232,6 +232,37 @@ impl SvcV3Bridge<'_,'_>{
             frozen.rules,&frozen.actions[0],frozen.context,native_accept)
     }
 
+    /// Canonical existing ABI3 register/publish endpoints for ordinary
+    /// trial decisions. All user spans/caps still require architecture
+    /// preflight; no TrialPermit is reconstructed from the DecisionRecord.
+    pub fn register_trial_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied:&[u8],frozen:&FrozenNativePlan<'_>,table:&super::trial_permit_v1::TrialTable)
+        ->Result<Registration,Error>{
+        decode_v3(caller.package_abi,0x50,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.decision_endpoint_cap||args[0]!=caller.endpoint_cap
+            ||args[2]!=DECISION_BYTES as u64||copied.len()!=DECISION_BYTES||args[3]!=0||args[5]<8
+            ||frozen.actions.len()!=1||frozen.sidecars.len()!=1{return Err(Error::Denied);}
+        let record:&[u8;DECISION_BYTES]=copied.try_into().map_err(|_|Error::Invalid)?;
+        if record!=&frozen.sidecars[0]{return Err(Error::Denied);}
+        self.gate.register_trial_one(caller.identity,frozen.bytes,record,frozen.rules,
+            &frozen.actions[0],frozen.context,table)
+    }
+    pub fn publish_trial_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied_plan:&[u8],copied_sidecars:&[[u8;DECISION_BYTES]],frozen:&FrozenNativePlan<'_>,
+        table:&mut super::trial_permit_v1::TrialTable,cpu:u64,memory:u64,
+        verify_native_reservation:impl FnOnce(&super::trial_permit_v1::Permit)->Result<(),Error>,
+        native_accept:impl FnOnce()->Result<(),Error>,
+    )->Result<Publication,Error>{
+        decode_v3(caller.package_abi,0x41,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.publisher_cap||args[1]!=copied_plan.len() as u64||args[3]!=1
+            ||copied_sidecars.len()!=1||copied_plan!=frozen.bytes
+            ||copied_sidecars!=frozen.sidecars||frozen.actions.len()!=1{return Err(Error::Denied);}
+        self.gate.publish_trial_one(caller.identity,copied_plan,&copied_sidecars[0],
+            frozen.rules,&frozen.actions[0],frozen.context,table,cpu,memory,verify_native_reservation,native_accept)
+    }
+
     pub fn publish_assisted_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
         copied_plan:&[u8],copied_sidecars:&[[u8;DECISION_BYTES]],
         frozen:&FrozenNativePlan<'_>,scope:&AssistedScope<'_>,
