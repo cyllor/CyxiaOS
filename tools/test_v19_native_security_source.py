@@ -137,6 +137,19 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("static NEXT_SESSION: AtomicU64", tls)
         self.assertIn("pub fn local_echo_proof(&self)", tls)
 
+    def test_sec_n_tls_echo_dispatch_retains_egress_credit_until_drained(self):
+        gate = source(ROOT / "crates/net-transport/src/admission.rs")
+        tls = source(ROOT / "crates/net-transport/src/tls.rs")
+        self.assertIn("pub fn dispatch_echo(", gate)
+        self.assertIn("tls.send_plaintext(&response[..encoded])", gate)
+        self.assertIn("tls.consume_plaintext(consumed)", gate)
+        self.assertIn("tls_egress_pending", gate)
+        self.assertIn("pub fn confirm_tls_output_drained(", gate)
+        self.assertIn("tls.has_pending_plaintext() || !tls.pending_tls().is_empty()", gate)
+        self.assertIn("row.state!=State::Draining || row.tls_egress_pending", gate)
+        self.assertIn("pub(crate) fn reply(", gate)
+        self.assertIn("pub fn local_echo_proof(&self)", tls)
+
     def test_v019_other_five_tracks_fail_closed_with_fixed_control_roles(self):
         process = source(CORE / "process.rs")
         file = source(CORE / "file.rs")

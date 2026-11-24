@@ -53,6 +53,9 @@ struct ActiveEntry {
     ip: u32,
     proof: EchoProof,
     state: State,
+    /// Exactly one TLS-owned plaintext reply may be outstanding per session.
+    /// This is only the TLS queue stage; native NIC/DMA custody is separate.
+    tls_egress_pending: bool,
 }
 /// No heap or implicit eviction. The native producer must admit a pending slot
 /// before creating an expensive TLS handshake and supply actual source IPv4,
@@ -171,7 +174,8 @@ impl Admission {
         self.sources[at]=Some(s);
         self.pending[ticket.slot as usize]=None;
         self.active[slot]=Some(ActiveEntry{
-            generation:ticket.generation,ip:p.ip,proof,state:State::Open
+            generation:ticket.generation,ip:p.ip,proof,state:State::Open,
+            tls_egress_pending:false,
         });
         Ok(ActiveTicket{slot:u8::try_from(slot).map_err(|_|Error::Exhausted)?,generation:ticket.generation})
     }
@@ -179,7 +183,7 @@ impl Admission {
     /// alternate frame: this prevents a service-side bug from claiming plaintext
     /// it never received from this session. The reply is a *copy*; the caller
     /// still has to pass it through the same TLS Session for encryption.
-    pub fn reply(
+    pub(crate) fn reply(
         &self, key: ActiveTicket, tls: &Session<'_>, out: &mut [u8],
     ) -> Result<usize, Error> {
         let active=self.active_entry(key)?;
@@ -192,6 +196,61 @@ impl Admission {
         let request=tls.accept_local_echo(tls.plaintext())
             .map_err(|_|Error::Invalid)?;
         request.encode_reply(out).map_err(|_|Error::Invalid)
+    }
+
+    /// Authoritative application dispatch for the local read-only Echo path.
+    /// Copy a *single complete* TLS-owned frame into a bounded response, then
+    /// atomically queue it back onto the SAME pinned, negotiated TLS session.
+    /// Incoming plaintext is consumed only after rustls accepted its reply.
+    /// On WouldBlock, the original authenticated request remains untouched;
+    /// the caller may retry after the preceding outbound TLS record drains.
+    ///
+    /// Success is only a plaintext enqueue, NOT network egress completion or
+    /// DMA release. The native socket owner retains credits until real TX ACK.
+    pub fn dispatch_echo(
+        &mut self, key: ActiveTicket, tls: &mut Session<'_>,
+    ) -> Result<usize, Error> {
+        if self.active_entry(key)?.tls_egress_pending {
+            return Err(Error::Busy);
+        }
+        let mut response = [0u8; crate::echo::MAX_FRAME];
+        let encoded = self.reply(key, tls, &mut response)?;
+        // Exact-frame validation above means these bytes are one request.
+        let consumed = tls.plaintext().len();
+        match tls.send_plaintext(&response[..encoded]) {
+            Ok(()) => {
+                // The authenticated TLS-owned bytes are retained across any
+                // transient send refusal and released only once encrypted
+                // output is accepted into rustls' bounded outgoing buffer.
+                tls.consume_plaintext(consumed).map_err(|_| Error::Invalid)?;
+                self.active[key.slot as usize]
+                    .as_mut().ok_or(Error::Stale)?.tls_egress_pending=true;
+                Ok(encoded)
+            }
+            Err(crate::tls::Error::WouldBlock) => Err(Error::Busy),
+            Err(_) => Err(Error::Invalid),
+        }
+    }
+
+    /// Called by the socket owner only after the same verified TLS session
+    /// has encrypted its accepted reply and *all ciphertext* has been handed
+    /// out of TLS's bounded buffer. This does NOT prove socket TX ACK or DMA
+    /// completion: those retain independent native ownership records.
+    /// A wrong/restarted TLS session cannot clear another connection's debt.
+    pub fn confirm_tls_output_drained(
+        &mut self, key: ActiveTicket, tls: &Session<'_>,
+    ) -> Result<(), Error> {
+        let row=self.active_entry(key)?;
+        if !row.tls_egress_pending {return Err(Error::Stale);}
+        if tls.local_echo_proof()!=Some(row.proof) {
+            return Err(Error::Unauthenticated);
+        }
+        if tls.has_pending_plaintext() || !tls.pending_tls().is_empty() {
+            return Err(Error::Busy);
+        }
+        self.active[key.slot as usize].as_mut()
+            .ok_or(Error::Stale)?.tls_egress_pending=false;
+        Ok(())
     }
 
     /// Stops admitting new work on this connection but retains active credit.
@@ -207,7 +266,9 @@ impl Admission {
     /// method retires only logical credits; it proves no hardware drain.
     pub fn finish_drain(&mut self, key: ActiveTicket) -> Result<(), Error> {
         let row=self.active_entry(key)?;
-        if row.state!=State::Draining { return Err(Error::Busy); }
+        if row.state!=State::Draining || row.tls_egress_pending {
+            return Err(Error::Busy);
+        }
         let at=self.source(row.ip)?;
         let mut source=self.sources[at].ok_or(Error::Stale)?;
         source.active=source.active.checked_sub(1).ok_or(Error::Stale)?;

@@ -450,3 +450,86 @@ fn v019_sec_n03_16_authenticated_connections_do_not_steal_17th_active_credit() {
     let fresh=gate.begin(100,18,32).unwrap();
     gate.reject(fresh).unwrap();
 }
+
+#[test]
+fn v019_sec_n06_echo_dispatch_encrypts_authenticated_request_before_consuming() {
+    use crate::admission::Admission;
+    let pairs=v019_local_pairings();
+    let mut gate=Admission::new();
+    let ticket=gate.begin(7,0,16).unwrap();
+    let mut a_buf=Buffers::new();
+    let mut b_buf=Buffers::new();
+    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
+    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
+    handshake(&mut client,&mut server);
+    let key=gate.authenticate(ticket,&server).unwrap();
+
+    let mut frame=[0u8;20];
+    frame[..2].copy_from_slice(&1u16.to_le_bytes());
+    frame[2..4].copy_from_slice(&1u16.to_le_bytes());
+    frame[4..8].copy_from_slice(&4u32.to_le_bytes());
+    frame[8..16].copy_from_slice(&123u64.to_le_bytes());
+    frame[16..20].copy_from_slice(&[5,6,7,8]);
+
+    client.send_plaintext(&frame).unwrap();
+    for now in 1..=16 {
+        client.pump(now).unwrap();
+        transfer(&mut client,&mut server);
+        server.pump(now).unwrap();
+        if server.plaintext()==frame.as_slice() { break; }
+    }
+    assert_eq!(server.plaintext(),frame.as_slice());
+    assert_eq!(gate.dispatch_echo(key,&mut server).unwrap(),frame.len());
+    assert!(server.plaintext().is_empty());
+    assert!(server.has_pending_plaintext());
+    assert_eq!(gate.confirm_tls_output_drained(key,&server),
+        Err(crate::admission::Error::Busy));
+    assert_eq!(gate.dispatch_echo(key,&mut server),
+        Err(crate::admission::Error::Busy));
+    gate.begin_drain(key).unwrap();
+    assert_eq!(gate.finish_drain(key),Err(crate::admission::Error::Busy));
+    // Plaintext was accepted only into the real pinned TLS session; the
+    // ciphertext must traverse the live TLS record output to reach the peer.
+    for now in 17..=40 {
+        server.pump(now).unwrap();
+        transfer(&mut server,&mut client);
+        client.pump(now).unwrap();
+        if client.plaintext()==frame.as_slice() { break; }
+    }
+    assert_eq!(client.plaintext(),frame.as_slice());
+    client.consume_plaintext(frame.len()).unwrap();
+    assert!(!server.has_pending_plaintext());
+    gate.confirm_tls_output_drained(key,&server).unwrap();
+    assert_eq!(gate.confirm_tls_output_drained(key,&server),
+        Err(crate::admission::Error::Stale));
+    gate.finish_drain(key).unwrap(); // host only: native TX/DMA proof still required
+}
+
+#[test]
+fn v019_sec_n06_echo_dispatch_rejects_mutating_opcode_without_queuing_response() {
+    use crate::admission::{Admission,Error as AdmissionError};
+    let pairs=v019_local_pairings();
+    let mut gate=Admission::new();
+    let ticket=gate.begin(7,0,16).unwrap();
+    let mut a_buf=Buffers::new();
+    let mut b_buf=Buffers::new();
+    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
+    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
+    handshake(&mut client,&mut server);
+    let active=gate.authenticate(ticket,&server).unwrap();
+    let mut bad=[0u8;16];
+    bad[..2].copy_from_slice(&1u16.to_le_bytes());
+    bad[2..4].copy_from_slice(&19u16.to_le_bytes()); // removed remote-placement RPC
+    bad[8..16].copy_from_slice(&31u64.to_le_bytes());
+    client.send_plaintext(&bad).unwrap();
+    for now in 1..=16 {
+        client.pump(now).unwrap();
+        transfer(&mut client,&mut server);
+        server.pump(now).unwrap();
+        if server.plaintext()==bad.as_slice() {break;}
+    }
+    assert_eq!(server.plaintext(),bad.as_slice());
+    assert_eq!(gate.dispatch_echo(active,&mut server),Err(AdmissionError::Invalid));
+    assert_eq!(server.plaintext(),bad.as_slice());
+    assert!(!server.has_pending_plaintext());
+}

@@ -140,3 +140,10 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 将未接原生驱动的 `SEC-P::VerifiedSpawn` 主机账本测试迁到 CPU2 业务核，并明确拒绝 CPU0/CPU1，即使损坏的业务掩码或健康掩码宣称其可用；J01 的 DRAIN/任务退出模型同步使用 CPU2。
 - `SEC-D::validate_irq_route` 明确拒绝将普通 VirtIO SPI 路由至固定控制 CPU1，即使错误的 `healthy_business` 位图包含 CPU1；CPU0 作为 EL1 机制 broker 的设备中断属于独立的受保护设备所有者，不由这个普通业务路由门签发。
 - 执行边界仍是原生受保护 CPU owner/设备路由适配；这些 host check 不替代 QEMU GIC/IRQ 实际交错验收。
+
+### SEC-N 新增：TLS 回声实际发送与排空门（本轮）
+
+- 在 `crates/net-transport/src/admission.rs` 将 `dispatch_echo` 绑定已授权的活动票据与实际 Rustls Session。仅从该 Session 的已认证明文解析只读 Echo，回复写入**同一个 TLS 会话**的加密发送队列；写入前的拒绝/背压不吞掉原明文。
+- 新增一位有界 `tls_egress_pending` 账本。一次回复成功被 TLS 接纳后，直到 `confirm_tls_output_drained` 验证该会话没有待编码明文或尚未交出的 TLS 密文，才允许清除此债务。重新发送期间拒绝第二次调度或重复退账；`finish_drain` 不得绕开这项 TLS 排空债务。
+- 此处只判定 **TLS 内部输出缓冲已排空**，并不证明 TCP 对端 ACK、VirtIO TX 使用环、DMA pin 或 NIC 完成。这些仍必须由受保护原生网络/设备适配器对账；当前尚未完成实际原生服务接线，不能将 G2/G3/G4 记为通过。
+- 新增实际双向 TLS 会话的回声收发、非法写操作码、回复待发送与延迟排空测试；同时运行主机/源代码回归与 AArch64 EL0 TLS 交叉编译。
