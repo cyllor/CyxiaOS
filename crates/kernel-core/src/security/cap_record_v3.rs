@@ -26,7 +26,7 @@ pub struct CapRecordV3{
 }
 impl CapRecordV3{
     fn valid(self)->bool{
-        if self.cap_id==0||!self.holder.valid()||!self.target.valid()
+        if self.cap_id==0||!self.holder.valid()||self.target.generation==0
             ||self.record_generation==0||!(1..=3).contains(&self.state)||self.depth>8
             ||!(1..=15).contains(&self.source_role)||!(self.owner_group<=15||self.owner_group==u32::MAX){
             return false;
@@ -70,36 +70,32 @@ impl CapRecordV3{
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Label{
     OperationsView,SecurityView,ControllerView,AdviceSend,FindingSend,
-    RulesRead,DecisionRegister,DecisionRead,Publish,TrialNormal,Disposition,
-    CandidateRead,ValidationRegister,ModelManage,TrialD15,FeedbackRead,CandidateSubmit,
-    AuditRead,AuditAck,EpochAllocate,FindingReview,
+    DecisionRegister,ControlAux,Publish,FindingReceive,
 }
 impl Label{
-    fn requirement(self)->(Role,u64,u16,u64){
+    fn requirement(self,source_role:u32)->Result<(Role,u64,u16,u64),Error>{
         use Label::*;
-        match self{
+        Ok(match self{
             OperationsView=>(Role::Operations,rm::SNAPSHOT,12,SNAPSHOT_READ),
             SecurityView=>(Role::Security,rm::SNAPSHOT,12,SNAPSHOT_READ),
             ControllerView=>(Role::DeterministicController,rm::SNAPSHOT,12,SNAPSHOT_READ),
             AdviceSend=>(Role::Operations,rm::SEND_ADVICE,4,IPC_SEND),
             FindingSend=>(Role::Security,rm::SEND_FINDING,4,IPC_SEND),
-            RulesRead=>(Role::DeterministicController,rm::READ_RULES,8,IPC_SEND),
             DecisionRegister=>(Role::DeterministicController,rm::DECISION_REGISTER,8,CONTROL_DECISION),
-            DecisionRead=>(Role::Publisher,rm::READ_DECISIONS,8,IPC_SEND),
             Publish=>(Role::Publisher,rm::PUBLISH_PLAN,7,PLAN_PUBLISH),
-            TrialNormal=>(Role::DeterministicController,rm::TRIAL_NORMAL,8,IPC_SEND),
-            Disposition=>(Role::DeterministicController,rm::ADVICE_DISPOSITION,8,IPC_SEND),
-            CandidateRead=>(Role::Validator,rm::CANDIDATE_READ,8,IPC_SEND),
-            ValidationRegister=>(Role::Validator,rm::VALIDATION_REGISTER,8,IPC_SEND),
-            ModelManage=>(Role::ModelManager,rm::MODEL_MANAGE,8,IPC_SEND),
-            TrialD15=>(Role::ModelManager,rm::TRIAL_D15,8,IPC_SEND),
-            FeedbackRead=>(Role::Learner,rm::LEARNING_FEEDBACK,8,IPC_SEND),
-            CandidateSubmit=>(Role::Learner,rm::CANDIDATE_SUBMIT,8,IPC_SEND),
-            AuditRead=>(Role::Supervisor,rm::AUDIT_READ,8,IPC_SEND),
-            AuditAck=>(Role::Supervisor,rm::AUDIT_ACK,8,IPC_SEND),
-            EpochAllocate=>(Role::Supervisor,rm::EPOCH_ALLOC,8,IPC_SEND),
-            FindingReview=>(Role::Supervisor,rm::FINDING_REVIEW,4,IPC_RECV),
-        }
+            FindingReceive=>(Role::Supervisor,rm::FINDING_REVIEW,4,IPC_RECV),
+            // One canonical CONTROL_AUX label; individual ops remain
+            // restricted by the real manifest and ControlRPC whitelist.
+            ControlAux=>match source_role{
+                2=>(Role::DeterministicController,rm::ADVICE_DISPOSITION,8,IPC_SEND),
+                3=>(Role::ModelManager,rm::MODEL_MANAGE,8,IPC_SEND),
+                8=>(Role::Publisher,rm::READ_DECISIONS,8,IPC_SEND),
+                9=>(Role::Validator,rm::VALIDATION_REGISTER,8,IPC_SEND),
+                10=>(Role::Learner,rm::CANDIDATE_SUBMIT,8,IPC_SEND),
+                11=>(Role::Supervisor,rm::AUDIT_READ,8,IPC_SEND),
+                _=>return Err(Error::Unauthorized),
+            },
+        })
     }
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -114,8 +110,8 @@ impl<const N:usize> StaticControlCaps<N>{
     }
     fn issue_checked(&mut self,manifest:&NativeRoleManifest,label:Label,r:CapRecordV3,
         verify_catalog_and_object:impl FnOnce(Label,&CapRecordV3)->Result<(),Error>)->Result<u64,Error>{
-        let (role,authority,kind,rights)=label.requirement();
-        if !r.valid()||r.state!=1||r.depth!=0||r.object_kind!=kind||r.rights!=rights
+        let (role,authority,kind,rights)=label.requirement(r.source_role)?;
+        if !r.valid()||!r.target.valid()||r.state!=1||r.depth!=0||r.object_kind!=kind||r.rights!=rights
             ||r.source_role!=u32::from(role.id())||r.owner_group!=u32::MAX
             ||r.record_generation!=1
             ||self.rows.iter().flatten().any(|e|e.record.cap_id==r.cap_id){
@@ -134,7 +130,7 @@ impl<const N:usize> StaticControlCaps<N>{
         manifest:&NativeRoleManifest,label:Label,r:CapRecordV3,
         verify_catalog_and_object:impl FnOnce(Label,&CapRecordV3)->Result<(),Error>)->Result<u64,Error>{
         if epochs.confirmed_config_boot(config)?!=self.boot{return Err(Error::Stale);}
-        let role=label.requirement().0;
+        let role=label.requirement(r.source_role)?.0;
         if epochs.service_generation(role)?!=r.holder.generation{return Err(Error::Stale);}
         self.issue_checked(manifest,label,r,verify_catalog_and_object)
     }
