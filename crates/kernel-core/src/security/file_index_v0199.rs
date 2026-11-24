@@ -184,6 +184,29 @@ pub struct SecurityStateStoreV2 {
     pub service_generations: [u64; 16],
 }
 impl SecurityStateStoreV2 {
+    /// Canonical protected 4KiB after-image. CRC is an integrity check,
+    /// not proof that a native redo transaction or FLUSH succeeded.
+    pub fn encode(&self)->Result<[u8;BLOCK_BYTES],Error>{
+        let mut out=[0;BLOCK_BYTES];
+        out[0..4].copy_from_slice(&SECURITY_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&SECURITY_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&(SECURITY_HEADER as u16).to_le_bytes());
+        out[8..24].copy_from_slice(&self.fs_uuid);
+        for (at,value) in [(24,self.state_generation),(32,self.rule_min_generation),
+            (40,self.security_min_generation),(48,self.key_generation),
+            (56,self.isolated_service_bitmap),(64,self.last_boot_epoch),
+            (80,self.offline_config_generation)]{
+            out[at..at+8].copy_from_slice(&value.to_le_bytes());
+        }
+        out[88..120].copy_from_slice(&self.offline_config_hash);
+        for (i,value) in self.service_generations.iter().enumerate(){
+            let at=120+i*8;out[at..at+8].copy_from_slice(&value.to_le_bytes());
+        }
+        let crc=crc32c_zeroed(&out,72)?;
+        out[72..76].copy_from_slice(&crc.to_le_bytes());
+        if Self::decode(&out)?!=*self{return Err(Error::Invalid);}
+        Ok(out)
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() != BLOCK_BYTES
             || u32_at(bytes, 0)? != SECURITY_MAGIC
