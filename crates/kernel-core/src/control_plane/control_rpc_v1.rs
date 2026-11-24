@@ -146,10 +146,21 @@ impl RpcTable{
     pub const fn new()->Self{Self{boot_epoch:0,slots:[const{Slot::empty()};NORMAL_SLOTS+RECOVERY_SLOTS]}}
     pub fn bind(&mut self,caller:Caller,recovery:bool)->Result<(),Error>{
         if !caller.valid()||(self.boot_epoch!=0&&self.boot_epoch!=caller.boot_epoch)
-            ||self.slots.iter().filter_map(|s|s.caller).any(|c|c.holder.id==caller.holder.id){
+            ||self.slots.iter().filter_map(|s|s.caller).any(|c|
+                c.holder.id==caller.holder.id||c.cap==caller.cap){
             return Err(Error::Auth);
         }
-        let range=if recovery{NORMAL_SLOTS..NORMAL_SLOTS+RECOVERY_SLOTS}else{0..NORMAL_SLOTS};
+        let range=if recovery{
+            // The EL1 caller must authenticate the separately reserved
+            // recovery allocation; ordinary endpoint creation never uses it.
+            NORMAL_SLOTS..NORMAL_SLOTS+RECOVERY_SLOTS
+        }else if caller.role==12{
+            8..10
+        }else{
+            let i=super::role_manifest_v0199::ROLES.iter()
+                .position(|r|r.id()==caller.role).ok_or(Error::Auth)?;
+            i..i+1
+        };
         let i=range.into_iter().find(|&i|self.slots[i].caller.is_none()).ok_or(Error::Capacity)?;
         self.boot_epoch=caller.boot_epoch;self.slots[i].caller=Some(caller);Ok(())
     }
@@ -243,6 +254,7 @@ impl RpcTable{
         if !new.valid()||new.boot_epoch!=old.boot_epoch||new.role!=old.role
             ||new.holder.id!=old.holder.id||old.holder.generation.checked_add(1)!=Some(new.holder.generation)
             ||new.cap==old.cap{return Err(Error::Auth);}
+        if self.slots.iter().filter_map(|s|s.caller).any(|c|c!=old&&c.cap==new.cap){return Err(Error::Auth);}
         let slot=self.slot(old)?;
         if !slot.closed||!slot.rebind_ready||slot.entry.is_some(){return Err(Error::Busy);}
         verify_replacement()?;
@@ -303,6 +315,19 @@ mod tests{
         assert_eq!(t.replace_closed(c,replacement,||Err(Error::Io)),Err(Error::Io));
         t.replace_closed(c,replacement,||Ok(())).unwrap();
         assert_eq!(t.admit(c,&r[..n],192,10,1000,7,|_|panic!()),Err(Error::Auth));
+    }
+    #[test]
+    fn ordinary_role_slots_and_executor_capacity_do_not_borrow_recovery(){
+        let mut t=RpcTable::new();let c=caller();t.bind(c,false).unwrap();
+        assert_eq!(t.bind(Caller{holder:Identity{id:111,generation:1},cap:100,..c},false),Err(Error::Capacity));
+        for i in 0..2{
+            t.bind(Caller{boot_epoch:1,holder:Identity{id:120+i,generation:1},role:12,
+                endpoint:20+i,cap:200+i},false).unwrap();
+        }
+        assert_eq!(t.bind(Caller{boot_epoch:1,holder:Identity{id:122,generation:1},role:12,
+            endpoint:22,cap:202},false),Err(Error::Capacity));
+        assert_eq!(t.bind(Caller{boot_epoch:2,holder:Identity{id:99,generation:1},role:8,
+            endpoint:23,cap:203},false),Err(Error::Auth));
     }
     #[test]
     fn unauthorized_or_invalid_new_request_does_not_consume_sequence(){
