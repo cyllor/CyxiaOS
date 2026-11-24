@@ -101,6 +101,8 @@ pub struct AssistedScope<'a>{
     pub assisted_mode:bool,
     pub offline_model_authorized:bool,
 }
+#[derive(Clone,Copy)]
+struct ClaimedWork { frame:super::apply_work_v1::WorkFrame, origin:apply_report_v1::ReportOrigin, accepted_ns:u64 }
 struct Pending {
     plan_seq: u64,
     plan_digest: [u8;32],
@@ -109,6 +111,7 @@ struct Pending {
     status: PendingStatus,
     expires_ns: u64,
     assisted:Option<AssistedProof>,
+    claimed:[Option<ClaimedWork>;MAX_ACTIONS],
 }
 
 /// Fixed-memory guard. This can be owned by a protected, serialized EL1
@@ -239,7 +242,7 @@ impl RegisteredDecisionGate {
             decision_bytes:copied,
             status:PendingStatus::Frozen,
             expires_ns:expires,
-            assisted:None,
+            assisted:None,claimed:[None;MAX_ACTIONS],
         });
         self.last_plan_seq=plan.header.plan_seq;
         self.last_decision_seq=last;
@@ -465,7 +468,7 @@ impl RegisteredDecisionGate {
         ledger.finalize_registered_adoption(actor,disposition,record,context.now_ns)?;
         self.pending=Some(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
             count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
-            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)})});
+            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),claimed:[None;MAX_ACTIONS]});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
         Ok(Registration::Frozen)
     }
@@ -544,6 +547,38 @@ impl RegisteredDecisionGate {
         Ok(summary)
     }
 
+    /// Native EXECUTOR_FETCH/EL1 acceptance linearization boundary.
+    /// Before a returned WorkFrame can execute, the real resource owner
+    /// must atomically check desired/current version, object generation,
+    /// reservation, dependencies and executor cap. The callback is a
+    /// protected native gate, not user-provided authorization.
+    /// Repeated fetch with a *new* RPC key is not a second execution.
+    pub fn claim_apply_work(&mut self,plan_wire:&[u8],index:usize,
+        scope:TrustedApplyScope,binding:ExecutorBindingV1,
+        origin:apply_report_v1::ReportOrigin,
+        verify_and_accept:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>)->Result<(),Error>,
+    )->Result<super::apply_work_v1::WorkFrame,Error>{
+        let plan=PlanV2::decode(plan_wire)?;
+        let p=self.pending.as_mut().ok_or(Error::Stale)?;
+        if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
+        if plan.header.plan_seq!=p.plan_seq||sha256(plan_wire)!=p.plan_digest
+            ||plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
+            ||index>=p.count||scope.now_ns==0{return Err(Error::Denied);}
+        if p.claimed[index].is_some(){return Err(Error::Busy);}
+        if plan.header.active_until_local_ns!=0&&scope.now_ns>=plan.header.active_until_local_ns{
+            return Err(Error::Expired);
+        }
+        let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,self.boot_epoch,
+            scope.plan_version,binding,origin)?;
+        let work=super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
+        // Contract: this callback commits atomically or makes NO effect.
+        // Unknown external operations are not allowed in this admission
+        // callback; actual execution occurs only after the retained claim.
+        verify_and_accept(&work)?;
+        p.claimed[index]=Some(ClaimedWork{frame,origin,accepted_ns:scope.now_ns});
+        Ok(frame)
+    }
+
     pub fn publisher_scope(&self,actor:Identity)->Result<(u64,u64),Error>{
         if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
         Ok((self.boot_epoch,self.controller_epoch))
@@ -608,6 +643,17 @@ impl RegisteredDecisionGate {
             || plan.header.controller_epoch!=self.controller_epoch
             || scope.boot_epoch!=self.boot_epoch
         {return Err(Error::Denied);}
+        // A valid current executor binding alone is insufficient. Every
+        // report must refer to an already accepted exact ApplyWork key;
+        // a stale or never-accepted report cannot reach the effect verifier.
+        for copied in report_frames{
+            let r=ApplyReportV1::decode(copied.bytes)?;
+            let i=usize::from(r.action_index);
+            let claim=pending.claimed.get(i).and_then(|v|v.as_ref()).ok_or(Error::NotReady)?;
+            let work=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if claim.origin!=copied.origin||!work.matches_report(r)
+                ||r.completed_ns<claim.accepted_ns{return Err(Error::Denied);}
+        }
         // Retain the exact causal sidecar from registration, not a new
         // model-supplied explanation. A missing pair never becomes a label.
         match (pending.assisted,causal){
@@ -1000,6 +1046,11 @@ mod tests {
     fn verified_scope()->TrustedApplyScope{
         TrustedApplyScope{boot_epoch:1,plan_version:7,now_ns:200}
     }
+    fn claim_test_work(gate:&mut RegisteredDecisionGate,plan:&[u8]){
+        let scope=TrustedApplyScope{now_ns:150,..verified_scope()};
+        gate.claim_apply_work(plan,0,scope,verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|Ok(())).unwrap();
+    }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof(){
         let bytes=profile_bytes();
@@ -1020,6 +1071,13 @@ mod tests {
             |_,_|{verifications+=1;Ok(())}
         ),Err(Error::Denied));
         assert_eq!(verifications,0);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
+            |_,_|panic!("unaccepted work")
+        ),Err(Error::NotReady));
+        claim_test_work(&mut gate,&plan);
+        assert_eq!(gate.claim_apply_work(&plan,0,verified_scope(),verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|panic!("duplicate accept")),Err(Error::Busy));
         assert_eq!(gate.settle_verified_apply_reports(
             SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{verifications+=1;Err(Error::NotReady)}
@@ -1045,6 +1103,7 @@ mod tests {
             CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
         gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
         gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        claim_test_work(&mut gate,&plan);
         let learner=Identity{id:10,generation:1};
         let mut inbox=FeedbackInbox::new(SUPERVISOR,learner).unwrap();
         let report=executor_report(1);
@@ -1082,6 +1141,7 @@ mod tests {
         ).unwrap();
         gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
         gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        claim_test_work(&mut gate,&plan);
         let report=executor_report(3);
         let mut checked=0;
         assert_eq!(gate.settle_verified_apply_reports(
