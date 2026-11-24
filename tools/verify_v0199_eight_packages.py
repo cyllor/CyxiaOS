@@ -47,7 +47,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,2,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,3,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -88,6 +88,11 @@ class Bringup:
             require(all(b<=x or y<=a for x,y in spans[:i]),'shared private role backing')
         reloads=rows('V0199_PACKAGE_RELOAD')
         require(len(reloads)==8,'missing actual fault and reload evidence')
+        survivors=rows('V0199_RESTART_SURVIVORS')
+        starts=rows('V0199_RESTART_BEGIN')
+        faults=rows('V0199_RESTART_GUARD_FAULT')
+        require(rows('V0199_BOOTSTRAP_INITIAL_ROLES')==[(8,0,0)],'missing initial eight-role milestone')
+        require(len(survivors)==len(starts)==len(faults)==8,'missing isolated-survivor progress evidence')
         old_roots=set()
         for i,role in enumerate(ROLES):
             at=304+i*12
@@ -104,6 +109,20 @@ class Bringup:
             require((old_cap==new_cap==0) or (old_cap and new_cap and old_cap!=new_cap),
                     'old issued capability was reused')
             require(reloads[i]==(role,old_root,new_root),'reload UART/QMP mismatch')
+            require(starts[i]==(role,old,old_root) and faults[i]==(role,esr,far),
+                    'restart start/fault UART and memory mismatch')
+            mask,*deltas=words[400+i*9:409+i*9]
+            require(mask==255^(1<<i) and deltas[i]==0
+                    and all(delta>0 for j,delta in enumerate(deltas) if j!=i),
+                    'a surviving EL0 role did not progress with faulted peer stopped')
+            require(survivors[i]==(role,mask,sum(deltas)),
+                    'survivor SVC UART and memory mismatch')
+            phase=[f'V0199_RESTART_BEGIN a={role} b={old} c={old_root}',
+                   f'V0199_RESTART_GUARD_FAULT a={role} b={esr} c={far}',
+                   f'V0199_RESTART_SURVIVORS a={role} b={mask} c={sum(deltas)}',
+                   f'V0199_PACKAGE_RELOAD a={role} b={old_root} c={new_root}']
+            positions=[serial.index((line+'\n').encode('ascii')) for line in phase]
+            require(positions==sorted(set(positions)),'restart phases out of order')
         business=rows('V0199_BOOTSTRAP_BUSINESS')
         require(len(business)==3,'missing independent business progress')
         for slot in range(1,4):
@@ -116,7 +135,8 @@ class Bringup:
                     'business progress evidence mismatch')
         return dict(guest_cpus=4,fixed_control_cpu=0,business_cpu_mask=14,
                     distinct_native_packages=8,private_stack_bytes=32768,
-                    native_diagnostic_package_reloads=8,durable_role_restarts=False,
+                    native_diagnostic_package_reloads=8,native_survivor_role_progress_pairs=56,
+                    durable_role_restarts=False,
                     roles=details,production_g0=False,real_services_tested=False)
 
 def main():
