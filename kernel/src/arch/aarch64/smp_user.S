@@ -12,6 +12,8 @@ smp_user_start:
  b.eq smp_bounded
  cmp x2, #5
  b.eq smp_registers
+ cmp x2, #6
+ b.eq smp_v3_probe
  b smp_probe
 smp_busy:
  ldr x10, [x1]
@@ -117,6 +119,83 @@ smp_register_loop:
  b smp_register_loop
 smp_register_bad:
  svc #0x60f
+ b .
+// Actual AArch64 trap, not a synthetic Rust register tuple. x3 is the
+// fixture's case selector; syscall number/arguments are written here in EL0.
+smp_v3_probe:
+ mov x9, x3
+ mov x0, #0
+ mov x1, #0
+ mov x2, #0
+ mov x3, #0
+ mov x4, #0
+ mov x5, #0
+ mov x8, #4
+ cmp x9, #1
+ b.eq smp_v3_reserved
+ cmp x9, #2
+ b.eq smp_v3_unknown
+ cmp x9, #3
+ b.eq smp_v3_old_immediate
+ cmp x9, #5
+ b.eq smp_v3_overflow
+ cmp x9, #6
+ b.eq smp_v3_overlap
+ cmp x9, #7
+ b.hs smp_v3_copy
+ b smp_v3_call
+smp_v3_reserved:
+ mov x5, #1
+ b smp_v3_call
+smp_v3_unknown:
+ mov x8, #0x51
+ b smp_v3_call
+smp_v3_old_immediate:
+ svc #4
+ b .
+smp_v3_overflow:
+ mov x8, #0x50
+ mov x0, #3
+ mov x1, #-1
+ mov x2, #2
+ mov x4, #0x2000
+ mov x5, #8
+ b smp_v3_call
+smp_v3_overlap:
+ mov x8, #0x50
+ mov x0, #3
+ mov x1, #0x1000
+ mov x2, #256
+ mov x4, #0x1000
+ mov x5, #8
+ b smp_v3_call
+// Construct the input in actual EL0 private RW memory. The fixture adapter
+// must inspect the saved arguments and the real registered leaf descriptors.
+smp_v3_copy:
+ mov x10, #0x20000
+ mov x11, #0x1234
+ str x11, [x10, #64]
+ mov x8, #0x50
+ mov x0, #3
+ add x1, x10, #64
+ mov x2, #8
+ mov x4, #0x30000
+ add x4, x4, #64
+ mov x5, #8
+ cmp x9, #8
+ b.ne 1f
+ add x1, x10, #4092
+1:
+ cmp x9, #9
+ b.ne 2f
+ mov x4, #0x10000
+ add x4, x4, #64
+2:
+ cmp x9, #10
+ b.ne smp_v3_call
+ add x4, x10, #4096
+smp_v3_call:
+ svc #0
  b .
 .global smp_user_end
 smp_user_end:
