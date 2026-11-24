@@ -33,6 +33,9 @@ pub struct Manager {
     age_anchor_ns: Option<u64>,
     create_token: Option<FileReqKey>,
     restore_token: Option<(FileReqKey, u64)>,
+    // The in-memory tightening is not a durable success until its
+    // recovery transaction returns a verified commit.
+    fault_freeze_pending: bool,
 }
 impl Default for Manager {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Manager {
             age_anchor_ns: None,
             create_token: None,
             restore_token: None,
+            fault_freeze_pending: false,
         }
     }
     pub fn control(&self) -> &Control {
@@ -61,6 +65,7 @@ impl Manager {
     }
     pub fn writes_open(&self) -> bool {
         self.mounted
+            && !self.fault_freeze_pending
             && self.control.business_write_gate == Gate::Open
             && self.control.gc_phase == GcPhase::Idle
             && self.control.restore_phase == RestorePhase::Idle
@@ -121,6 +126,7 @@ impl Manager {
         tx: &mut Workspace,
     ) -> Result<(), Error<D::Error>> {
         self.mounted = false;
+        self.fault_freeze_pending = false; // cold, quiescent journal recovery only
         self.age_anchor_ns = None;
         self.create_token = None;
         self.restore_token = None;
@@ -1137,6 +1143,11 @@ impl Manager {
         if request.key.client_slot != 15 {
             return Err(Status::Permission.into());
         }
+        // The retained exact-request branch above remains queryable. No
+        // new protection relaxation may cross an uncommitted fault freeze.
+        if self.fault_freeze_pending {
+            return Err(Status::Busy.into());
+        }
         if self.control.gc_phase != GcPhase::Idle {
             return Err(Status::Busy.into());
         }
@@ -1256,6 +1267,12 @@ impl Manager {
         monotonic_now_ns: u64,
     ) -> Result<u64, Error<D::Error>> {
         self.ready(j)?;
+        // Trusted maintenance retries an effect-free admission failure.
+        // If persistence is uncertain the journal is not writable, so no
+        // new age or protection transition can be fabricated.
+        if self.fault_freeze_pending {
+            self.fault_freeze(j, d, s, tx)?;
+        }
         if self.control.gc_phase != GcPhase::Idle {
             return Err(Status::Busy.into());
         }
@@ -1362,14 +1379,19 @@ impl Manager {
         tx: &mut Workspace,
     ) -> Result<(), Error<D::Error>> {
         self.ready(j)?;
-        if self.control.cleanup_freeze && self.control.business_write_gate == Gate::Frozen {
+        if !self.fault_freeze_pending && self.control.cleanup_freeze
+            && self.control.business_write_gate == Gate::Frozen
+        {
             return Ok(());
         }
+        self.fault_freeze_pending = true;
         self.control.cleanup_freeze = true;
         self.control.business_write_gate = Gate::Frozen;
         let mut control = self.control;
         control.protection_generation = inc(control.protection_generation)?;
-        self.commit_control(j, d, s, tx, control)
+        self.commit_control(j, d, s, tx, control)?;
+        self.fault_freeze_pending = false;
+        Ok(())
     }
 
     /// Caller has frozen allocation, accepted writes, root changes and I/O.
