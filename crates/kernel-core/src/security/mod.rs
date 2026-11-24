@@ -46,3 +46,5 @@ pub mod snapshot_restore_gate;
 pub mod ipc_receive_v3;
 
 pub mod file_structure_v1;
+
+pub mod recovery_v1;
