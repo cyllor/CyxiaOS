@@ -131,7 +131,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("self.pending_entry(ticket)?", gate)
         self.assertIn("tls.local_echo_proof()", gate)
         self.assertIn("row.proof==proof", gate)
-        self.assertIn("tls.accept_local_echo(tls.plaintext())", gate)
+        self.assertIn("tls.accept_local_echo(&bytes[..length])", gate)
         self.assertIn("pub fn begin_restart(&mut self)", gate)
         self.assertIn("self.active_count()!=0", gate)
         self.assertIn("static NEXT_SESSION: AtomicU64", tls)
