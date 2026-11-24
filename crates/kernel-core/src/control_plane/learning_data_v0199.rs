@@ -154,14 +154,18 @@ impl Holdouts{
             ||model.parent!=<[u8;32]>::from(Sha256::digest(active))
             ||!sgd_v2::frozen_equal(active,&model.bytes){return Err(Error::Denied);}
         split_ok(holdout,training.schemas,4)?;
-        let mut groups=[None;MAX_SAMPLES];let mut n=0;
-        for s in holdout{
+        let mut n=0;
+        for (i,s) in holdout.iter().enumerate(){
             if training.rows.iter().any(|t|t.group==s.group||duplicates(t,s))
                 ||self.used[..self.len].contains(&Some(s.group)){return Err(Error::Denied);}
-            if !groups[..n].contains(&Some(s.group)){groups[n]=Some(s.group);n+=1;}
+            if !holdout[..i].iter().any(|t|t.group==s.group){n+=1;}
         }
         if n>MAX_SAMPLES-self.len{return Err(Error::Exhausted);}
-        self.used[self.len..self.len+n].copy_from_slice(&groups[..n]);self.len+=n;
+        for (i,s) in holdout.iter().enumerate(){
+            if !holdout[..i].iter().any(|t|t.group==s.group){
+                self.used[self.len]=Some(s.group);self.len+=1;
+            }
+        }
         verify_native(validator,active,model,holdout)?;
         sgd_v2::operator_selftest().map_err(|_|Error::Denied)?;
         let old=Model::parse(active).map_err(|_|Error::Invalid)?;
