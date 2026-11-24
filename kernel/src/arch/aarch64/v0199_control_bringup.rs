@@ -7,7 +7,7 @@
 use super::*;
 use cyxia_kernel_core::control_plane::{
     Identity,Error,
-    role_manifest_v0199::{NativeRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
+    role_manifest_v0199::{NativeRoleManifest,ValidatedRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
         SnapshotView,AuxOperation,CONTROL_MASK,REQUIRED_ONLINE_MASK},
     pie_image_v0199::{RolePackageSpec,RolePackageInput,VerifiedRolePackage,RelativeRelocation,ROLE_STACK_BYTES},
     role_budget_v0199::{Class,Cpu0BudgetLedger,Turn,Settlement,WINDOW_NS,KERNEL_COORDINATION_LIMIT_NS},
@@ -438,8 +438,8 @@ fn capture_model_probe(index:usize,r:&Running,actor:Identity){
 /// Full production cap issuance, boot identity, IPC and service backend
 /// are absent, so no publication, inference authorization or audit ACK is
 /// fabricated. Identity derives from the selected EL1 context, never x0.
-fn dispatch(index:usize,m:&NativeRoleManifest,r:&mut Running)->bool{
-    let member=m.members[index];
+fn dispatch(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running)->bool{
+    let member=m.manifest().members[index];
     assert_eq!(r.cap.holder,member.actor);
     let Ok(call)=decode_aarch64_svc_v3(r.abi,r.context.esr,&r.context.regs) else {
         r.context.regs[0]=E_FORMAT as u64;return false;
@@ -494,10 +494,11 @@ fn class(role:Role)->(Class,u16,u64){
         Role::Validator|Role::Learner=>(Class::Optional,0,500_000),
     }
 }
-fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter,expect_fault:bool)->bool{
+fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut BudgetMeter,expect_fault:bool)->bool{
     let (now,began)=budget.sample_gap();if now<r.wake_ns{return false;}
-    let (class,domain,quota)=class(m.members[index].role);
-    let token=match budget.ledger.reserve_role_with_wall(m,m.members[index].actor,cpu::slot(),class,domain,quota,50_000_000,now){
+    let member=m.manifest().members[index];
+    let (class,domain,quota)=class(member.role);
+    let token=match budget.ledger.reserve_validated_role_with_wall(m,member.actor,cpu::slot(),class,domain,quota,50_000_000,now){
         Ok(t)=>t,
         Err(Error::Exhausted|Error::Busy)=>return false,
         Err(e)=>panic!("native control budget refused: {e:?}"),
@@ -519,7 +520,7 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter
         if class==Class::Decision{interval=interval.min(DECISION_SLICE_NS);}
         unsafe{
             timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
-            let root=m.members[index].ttbr0_root;
+            let root=member.ttbr0_root;
             assert_eq!(root,root_pa(index,r.bank));
             // Each live root is immutable, private, and all leaves are nG.
             // Retire_root disconnects it and completes TLBI before reclaim.
@@ -543,7 +544,7 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter
     let receipt=budget.settle(token,began);
     r.charges=r.charges.checked_add(receipt.actual_ns).unwrap();r.turns+=1;
     if receipt.overrun||receipt.crossed_window{
-        report("V0199_BOOTSTRAP_OVERRUN",m.members[index].role.id() as u64,receipt.actual_ns,quota);
+        report("V0199_BOOTSTRAP_OVERRUN",member.role.id() as u64,receipt.actual_ns,quota);
         fatal(620+index as u64);
     }
     // Actual accounting, not elapsed host wall or a model-provided scalar.
@@ -586,6 +587,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
     use cyxia_kernel_core::control_plane::service_restart::{Lifecycle,RestartDecision};
     let until=now_ns().checked_add(15_000_000_000).unwrap();
     for i in 0..ROLE_COUNT{
+        let checked=manifest.validated().expect("current survivor inventory");
         let old=manifest.members[i];
         let old_cap=running[i].cap;
         let old_root=old.ttbr0_root;
@@ -603,7 +605,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             if now_ns()>=until{fatal(680);}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
             let turns=running[i].turns;
-            let _=turn(i,manifest,&mut running[i],budget,true);
+            let _=turn(i,&checked,&mut running[i],budget,true);
             if running[i].turns==turns{budget.idle_retry();}
         }
         let esr=running[i].fault_esr;let far=running[i].fault_far;
@@ -632,7 +634,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
                 if j==i||progressed&(1u64<<j)!=0{continue;}
                 if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
                 let turns=running[j].turns;
-                let _=turn(j,manifest,&mut running[j],budget,false);
+                let _=turn(j,&checked,&mut running[j],budget,false);
                 ran|=running[j].turns!=turns;
                 if running[j].clocks>before[j].0&&running[j].role_calls>before[j].1{
                     progressed|=1u64<<j;
@@ -663,7 +665,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         assert_eq!(unsafe{(*tables(i,old_bank)).root.0[0]},0);
         assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
         manifest.members[i]=member;
-        manifest.validate().unwrap();
+        let checked=manifest.validated().expect("replacement inventory");
         let receipt=budget.settle(credit,start);
         let actual=receipt.actual_ns;
         if receipt.overrun||receipt.crossed_window{
@@ -676,7 +678,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             if now_ns()>=until{fatal(684);}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
             let turns=running[i].turns;
-            let _=turn(i,manifest,&mut running[i],budget,false);
+            let _=turn(i,&checked,&mut running[i],budget,false);
             if running[i].turns==turns{budget.idle_retry();}
         }
         // READY here means only the actual diagnostic client reentered.
@@ -782,7 +784,7 @@ pub(super) fn run()->!{
         other_protected_pool_bytes:core::mem::size_of::<[Tables;2*ROLE_COUNT]>()+COPY+1024*1024,
         other_control_ns_per_100ms:OTHER_CPU_NS,
     };
-    manifest.validate().expect("complete eight role physical inventory");
+    let checked=manifest.validated().expect("complete eight role physical inventory");
     budget.wait_for(||(1..REQUIRED).all(|slot|PROGRESS[slot*2].load(Ordering::Acquire)>=2));
     let until=now_ns().checked_add(5_000_000_000).unwrap();
     // Controller/publisher/supervisor before optional model/learning work.
@@ -795,13 +797,14 @@ pub(super) fn run()->!{
             // Do not begin an evaluation in a near-expired 100ms window.
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
             let turns=running[i].turns;
-            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            let _=turn(i,&checked,&mut running[i],&mut budget,false);
             ran|=running[i].turns!=turns;
         }
         if !ran{budget.idle_retry();}
     }
     report("V0199_BOOTSTRAP_INITIAL_ROLES",ROLE_COUNT as u64,0,0);
     restart_each(&mut manifest,&mut running,&mut budget);
+    let checked=manifest.validated().expect("post-restart inventory");
     // Exercise every reloaded diagnostic context in a common post-restart
     // round. They remain live together on the one fixed control CPU; the
     // evidence must not be a union of eight independent one-process boots.
@@ -816,7 +819,7 @@ pub(super) fn run()->!{
             if progressed&(1u64<<i)!=0{continue;}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
             let turns=running[i].turns;
-            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            let _=turn(i,&checked,&mut running[i],&mut budget,false);
             ran|=running[i].turns!=turns;
             if running[i].clocks>start[i].0&&running[i].role_calls>start[i].1{
                 progressed|=1u64<<i;
