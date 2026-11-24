@@ -2,7 +2,7 @@
 //! policy or substitutes for task/reference/DMA quiescence acknowledgements.
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_arch_aarch64::cpu;
-use cyxia_driver_gicv2::Gic;
+use cyxia_driver_gicv2::{CpuTargets, Gic};
 use cyxia_prototype::domains::{
     Error,
     platform::{IpiAck, IpiKey, IpiMailboxes, IpiProgress, IpiPublication, IpiResult},
@@ -11,7 +11,7 @@ use cyxia_prototype::domains::{
 const CPUS: usize = 8;
 const WAKE_SGI: u8 = 0;
 const SELFTEST: bool = include!(concat!(env!("OUT_DIR"), "/domain-selftest.rs"));
-static TARGETS: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
+static TARGETS: CpuTargets = CpuTargets::new();
 static MAILBOXES: IpiMailboxes = IpiMailboxes::new();
 static mut PROBE: Option<IpiKey> = None;
 static mut PROBE_SEQUENCE: u64 = 0;
@@ -42,23 +42,14 @@ pub fn register_ipi_cpu(gic: &Gic, slot: usize) -> Result<(), Error> {
     if slot >= CPUS || cpu::slot() != slot {
         return Err(Error::Auth);
     }
-    let target = u64::from(gic.local_target_mask().map_err(|_| Error::Unsupported)?);
-    for (other, value) in TARGETS.iter().enumerate() {
-        if other != slot && value.load(Ordering::Acquire) == target {
-            return Err(Error::Conflict);
-        }
-    }
-    match TARGETS[slot].compare_exchange(0, target, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {}
-        Err(old) if old == target => {}
-        Err(_) => return Err(Error::Conflict),
-    }
+    let target = gic.local_target_mask().map_err(|_| Error::Unsupported)?;
+    TARGETS.register(slot, target).map_err(|_| Error::Conflict)?;
     MAILBOXES.register(
         slot as u16,
         super::CORE_GENERATION.load(Ordering::Acquire).max(1),
     )?;
     gic.enable(u32::from(WAKE_SGI)).map_err(|_| Error::Io)?;
-    put(row(slot) + 3, target);
+    put(row(slot) + 3, u64::from(target));
     IPI_EVIDENCE.words[2].fetch_or(1 << slot, Ordering::Release);
     put(1, 1);
     put(0, 0x4359_4950_4900_0001);
@@ -68,8 +59,8 @@ pub fn register_ipi_cpu(gic: &Gic, slot: usize) -> Result<(), Error> {
 /// A topology epoch is a conservative generation for every registered CPU.
 /// Updating it leaves all pending requests and sticky old ACKs intact.
 pub(super) fn publish_generation(core: u64) -> Result<(), Error> {
-    for (slot, target) in TARGETS.iter().enumerate() {
-        if target.load(Ordering::Acquire) != 0 {
+    for slot in 0..CPUS {
+        if TARGETS.target(slot).is_some() {
             MAILBOXES.register(slot as u16, core)?;
         }
     }
@@ -77,17 +68,16 @@ pub(super) fn publish_generation(core: u64) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) fn registered_target(slot: usize) -> Result<u8, Error> {
+    if slot >= CPUS { return Err(Error::Range); }
+    TARGETS.target(slot).ok_or(Error::NotReady)
+}
+
 pub fn request_ipi(key: IpiKey) -> Result<IpiProgress, Error> {
     if cpu::slot() != 0 {
         return Err(Error::Auth);
     }
-    let target = TARGETS
-        .get(usize::from(key.cpu))
-        .ok_or(Error::Range)?
-        .load(Ordering::Acquire);
-    if target == 0 {
-        return Err(Error::NotReady);
-    }
+    let target = registered_target(usize::from(key.cpu))?;
     if key.cpu_generation != super::CORE_GENERATION.load(Ordering::Acquire) {
         return Err(Error::Stale);
     }
@@ -101,7 +91,7 @@ pub fn request_ipi(key: IpiKey) -> Result<IpiProgress, Error> {
             // Never clear an ACK here: a delayed earlier SGI may already
             // have woken the receiver after this mailbox was published.
             crate::smp::gic()
-                .send_sgi(WAKE_SGI, target as u8)
+                .send_sgi(WAKE_SGI, target)
                 .map_err(|_| Error::Io)?;
             inc(4);
             // A receiver may be publishing its ACK concurrently; acceptance
@@ -200,7 +190,7 @@ pub(super) fn probe_turn(now: u64) {
     }
     let generation = super::CORE_GENERATION.load(Ordering::Acquire);
     if generation == 0
-        || TARGETS[3].load(Ordering::Acquire) == 0
+        || TARGETS.target(3).is_none()
         || now.saturating_sub(unsafe { *core::ptr::addr_of!(PROBE_AT) }) < 100_000_000
     {
         return;

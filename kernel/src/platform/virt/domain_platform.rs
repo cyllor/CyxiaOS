@@ -325,8 +325,11 @@ impl IrqHardware for Hardware {
                 .route_generation
                 .checked_add(1)
                 .ok_or(Error::Overflow)?;
+            // Logical CPU affinity was rechecked above; translate through
+            // the actual hardware target registered on that CPU, not 1<<cpu.
+            let target = ipi::registered_target(usize::from(guard.target_cpu))?;
             crate::smp::gic()
-                .route_masked_spi(irq, guard.target_cpu)
+                .route_masked_spi_target(irq, target)
                 .map_err(platform_error)?;
             TARGET[i].store(guard.target_cpu as u64, Ordering::Relaxed);
             ROUTE_GENERATION[i].store(generation, Ordering::Release);
