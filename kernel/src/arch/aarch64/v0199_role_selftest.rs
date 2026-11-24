@@ -21,6 +21,7 @@ pub(super) fn run() -> ! {
     assert_eq!(cpu::slot(), 0, "only boot CPU0 can own control EL0 role turns");
     assert_eq!(PRIVATE_SPACES, FIRST_ROLE_SPACE + ROLE_COUNT);
     assert_eq!(ONLINE.load(Ordering::Acquire), profile::ONLINE);
+    report("V0199_STAGE",1,0,0);
     let fixed_limits = Limits {
         resource_epoch: 1,
         min_control_cores: 1,
@@ -37,6 +38,7 @@ pub(super) fn run() -> ! {
     ).expect("fixed CPU0 control ownership");
     let snapshot=ownership.snapshot();
     profile::validate_snapshot(snapshot).expect("single CPU0 + three business cores");
+    report("V0199_STAGE",2,snapshot.control,snapshot.business);
     assert_eq!(snapshot.control, 1);
     assert_eq!(snapshot.business, 14);
 
@@ -73,13 +75,16 @@ pub(super) fn run() -> ! {
         other_control_ns_per_100ms:45_000_000,
     };
     manifest.validate().expect("8 distinct native TTBR/role/capability entries");
+    report("V0199_STAGE",3,manifest.members[0].ttbr0_root,manifest.members[0].private_rw.base);
     // Unlike the legacy CPU1 fixture, the controller is CPU0 itself.
     // CPU1..3 are already running their own guest EL0 business loop.
     wait(||(1..REQUIRED).all(|slot| {
         PROGRESS[slot*2].load(Ordering::Acquire)>=2
     }));
+    report("V0199_STAGE",4,PROGRESS[2].load(Ordering::Acquire),PROGRESS[4].load(Ordering::Acquire));
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 native timer PPI must be enabled");
+    report("V0199_STAGE",5,TIMER_IRQ.load(Ordering::Acquire),0);
 
     for index in 0..ROLE_COUNT {
         let space=FIRST_ROLE_SPACE+index;
@@ -91,7 +96,9 @@ pub(super) fn run() -> ! {
         let root=m.ttbr0_root;
         assert!(root!=0 && root%4096==0);
         // Dedicated per-role TTBR0 + writable data and stack, shared RX code.
+        report("V0199_STAGE",10+index as u64,m.role.id() as u64,m.ttbr0_root);
         execute(&mut ctx,space);
+        report("V0199_STAGE",20+index as u64,ctx.kind,ctx.esr);
         if ctx.kind!=8 || ctx.esr>>26!=0x15 || ctx.esr&0xffff!=4
             || ctx.regs[0]!=cookie(space)
             || ctx.tpidr_el0!=cookie(space)
