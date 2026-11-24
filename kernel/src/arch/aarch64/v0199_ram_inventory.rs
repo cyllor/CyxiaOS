@@ -12,8 +12,8 @@ pub(super) struct Pools{
     pub inventory:Inventory,pub sample_pa:u64,pub sample_generation:u64,
 }
 impl Pools{
-    pub fn control_va(&self)->u64{super::HIGH+self.control_pa}
-    pub fn progress_va(&self)->u64{super::HIGH+self.progress_pa}
+    pub fn control_va(&self)->u64{super::super::HIGH+self.control_pa}
+    pub fn progress_va(&self)->u64{super::super::HIGH+self.progress_pa}
 }
 fn zero_page(pa:u64)->Result<(),SecError>{
     if pa%fm::PAGE!=0||!(cyxia_platform_virt::KERNEL_POOL_END..cyxia_platform_virt::USER_RAM_END).contains(&pa){
@@ -22,7 +22,7 @@ fn zero_page(pa:u64)->Result<(),SecError>{
     // Only the serialized owner may call this after reserving a free
     // frame, or after quarantine with no EL0 or DMA reference.
     unsafe{
-        let p=(super::HIGH+pa) as *mut u8;
+        let p=(super::super::HIGH+pa) as *mut u8;
         core::ptr::write_bytes(p,0,fm::PAGE as usize);
         core::arch::asm!("dsb ish",options(nostack));
         if !(0..fm::PAGE as usize).all(|i|p.add(i).read_volatile()==0){return Err(SecError::Unknown);}
@@ -42,7 +42,7 @@ pub(super) fn initialize(info:&BootInfo)->Pools{
     // The entire physical table has the exact canonical 40B row layout;
     // initialize from real allocated RAM, not a host or static byte count.
     let rows=unsafe{
-        let p=(super::HIGH+metadata.start.0) as *mut FrameMeta;
+        let p=(super::super::HIGH+metadata.start.0) as *mut FrameMeta;
         core::ptr::write_bytes(p,0,fm::COUNT);
         core::slice::from_raw_parts_mut(p,fm::COUNT)
     };
@@ -58,7 +58,7 @@ pub(super) fn initialize(info:&BootInfo)->Pools{
     ledger.commit(h,true,zero_page).unwrap();
     assert_eq!(ledger.inventory().unwrap().allocated,1);
     unsafe{
-        let p=(super::HIGH+pa) as *mut u64;
+        let p=(super::super::HIGH+pa) as *mut u64;
         p.write_volatile(0x4359585345435245);
         assert_eq!(p.read_volatile(),0x4359585345435245);
     }
@@ -75,7 +75,7 @@ pub(super) fn initialize(info:&BootInfo)->Pools{
     // redo workspace take their backing from these exclusive regions.
     unsafe{
         for r in [control,progress]{
-            core::ptr::write_bytes((super::HIGH+r.start.0) as *mut u8,0,r.len as usize);
+            core::ptr::write_bytes((super::super::HIGH+r.start.0) as *mut u8,0,r.len as usize);
         }
         core::arch::asm!("dsb ish",options(nostack));
     }
