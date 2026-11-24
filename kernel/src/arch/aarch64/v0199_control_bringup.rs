@@ -527,6 +527,34 @@ pub(super) fn run()->!{
     }
     report("V0199_BOOTSTRAP_INITIAL_ROLES",ROLE_COUNT as u64,0,0);
     restart_each(&mut manifest,&mut running,&mut budget);
+    // Exercise every reloaded diagnostic context in a common post-restart
+    // round. They remain live together on the one fixed control CPU; the
+    // evidence must not be a union of eight independent one-process boots.
+    let start:[(u64,u64);ROLE_COUNT]=core::array::from_fn(|i|(running[i].clocks,running[i].role_calls));
+    let until=now_ns().checked_add(5_000_000_000).unwrap();
+    let mask=(1u64<<ROLE_COUNT)-1;
+    let mut progressed=0u64;
+    while progressed!=mask{
+        if now_ns()>=until{fatal(686);}
+        for i in order{
+            if progressed&(1u64<<i)!=0{continue;}
+            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            if running[i].clocks>start[i].0&&running[i].role_calls>start[i].1{
+                progressed|=1u64<<i;
+            }
+        }
+        core::hint::spin_loop();
+    }
+    SMP_EVIDENCE.words[472].store(progressed,Ordering::Relaxed);
+    let mut total_delta=0u64;
+    for i in 0..ROLE_COUNT{
+        assert_eq!(manifest.members[i].actor.generation,2);
+        let delta=running[i].role_calls.checked_sub(start[i].1).unwrap();
+        total_delta=total_delta.checked_add(delta).unwrap();
+        SMP_EVIDENCE.words[473+i].store(delta,Ordering::Relaxed);
+    }
+    report("V0199_BOOTSTRAP_ALL_LIVE",ROLE_COUNT as u64,progressed,total_delta);
     // All eight independently linked diagnostic clients have executed, faulted,
     // reloaded under a new root and reentered. No real service effect is claimed.
     for (i,r) in running.iter().enumerate(){
