@@ -35,6 +35,7 @@ jobs:
           cargo fetch --locked
           cargo test --locked --offline -p cyxia-kernel-core --lib control_plane 2>&1 | tee artifacts/control-gates/control-plane.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/control-gates/model.log
+          cargo test --locked --offline -p cyxia-control-model reward_v2 2>&1 | tee artifacts/control-gates/reward-v2.log
           cargo test --locked --offline -p cyxia-kernel-core --lib offline_config_v1 2>&1 | tee artifacts/control-gates/offline-config.log
           (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts) 2>&1 | tee artifacts/control-gates/verdict-custody.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
