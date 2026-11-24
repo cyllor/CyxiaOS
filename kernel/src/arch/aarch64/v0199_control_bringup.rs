@@ -123,24 +123,33 @@ impl BudgetMeter {
     /// No work was admitted. Use a real masked physical timer wakeup rather
     /// than repeatedly burning CPU0's uncharged execution time in a busy loop.
     /// The diagnostic profile keeps EL1 IRQs masked outside EL0 entry.
-    fn idle_retry(&mut self){
-        self.sample_gap();
+    fn idle_until(&mut self,deadline_ns:u64){
+        let (now,_)=self.sample_gap();
         let daif:u64;
         unsafe {
             core::arch::asm!("mrs {}, daif",out(reg)daif,options(nomem,nostack));
             assert_ne!(daif&(1<<7),0);
-            timer::arm(timer::ticks().checked_add(ticks_for(1_000_000)).unwrap());
+            timer::arm(timer::ticks().checked_add(ticks_for(deadline_ns.saturating_sub(now).max(1))).unwrap());
             timer::idle();
             cpu::disable_timer();
         }
         self.sample_gap();
+    }
+    // The previous 1ms polling loop exhausted the 2ms EL1 coordination
+    // envelope in all three 1GiB runs (run 45428678180). On a complete
+    // no-admission pass, wait for the next aligned replenishment instead.
+    // This is bounded diagnostic scheduling, not a production latency SLA.
+    fn idle_retry(&mut self){
+        let now=now_ns();
+        let next=(now/WINDOW_NS).checked_add(1).and_then(|w|w.checked_mul(WINDOW_NS)).unwrap();
+        self.idle_until(next);
     }
     fn wait_for(&mut self,mut ready:impl FnMut()->bool){
         let until=now_ns().checked_add(5_000_000_000).unwrap();
         while !ready(){
             check_failures();
             if now_ns()>=until{fatal(688);}
-            self.idle_retry();
+            self.idle_until(now_ns().checked_add(1_000_000).unwrap());
         }
     }
 }
