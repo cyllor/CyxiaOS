@@ -294,7 +294,7 @@ mod tests {
     fn malformed_lengths_retired_disposition_and_rule_bypass_fail_closed() {
         assert!(DecisionRecordV3::decode(&baseline()[..255]).is_err());
         for (offset, value) in [
-            (4, 1u8), (6, 0), (99, 3), (100, 2), (101, 2),
+            (4, 1u8), (6, 1), (99, 3), (100, 2), (101, 2),
             (106, 1), (152, 0), (156, 3), (160, 0),
         ] {
             let mut b=baseline();
