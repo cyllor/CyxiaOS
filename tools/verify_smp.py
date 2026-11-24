@@ -143,8 +143,15 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             binary = shutil.which('qemu-system-aarch64')
             require(binary is not None, 'qemu-system-aarch64 is missing')
             version = subprocess.check_output([binary, '--version'], timeout=10, text=True)
-            require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
-                    'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
+            # The ordinary SMP fixtures keep their exact upstream version
+            # gate. A specialized accounting verifier additionally requires
+            # exact immutable patched-binary and source-patch SHA evidence.
+            qemu_check = getattr(acceptance, 'verify_qemu', None)
+            if qemu_check is not None:
+                qemu_check(Path(binary), version)
+            else:
+                require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
+                        'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
             report['qemu_version'] = version
             report['qemu_sha256'] = sha(Path(binary))
             path = str(Path(td) / 'q.sock')
