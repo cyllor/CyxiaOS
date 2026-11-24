@@ -119,10 +119,11 @@ struct Pending {
 /// do not construct it on the kernel stack. No slot eviction is permitted.
 pub const MAX_PUBLISHED_PLANS:usize=64;
 pub struct PublishedPlanPool{
+    bound:bool,
     slots:[Option<Pending>;MAX_PUBLISHED_PLANS+1],
 }
 impl PublishedPlanPool{
-    pub const fn new()->Self{Self{slots:[const{None};MAX_PUBLISHED_PLANS+1]}}
+    pub const fn new()->Self{Self{bound:false,slots:[const{None};MAX_PUBLISHED_PLANS+1]}}
     pub const fn bytes()->usize{core::mem::size_of::<Self>()}
     fn count_published(&self)->usize{
         self.slots.iter().flatten().filter(|p|p.status!=PendingStatus::Frozen).count()
@@ -182,9 +183,9 @@ impl<'pool> RegisteredDecisionGate<'pool> {
     /// be rebound to a new gate or cleared to recover capacity.
     pub fn with_pool(controller:Identity,publisher:Identity,terminal_owner:Identity,
         boot:u64,epoch:u64,pool:&'pool mut PublishedPlanPool)->Result<Self,Error>{
-        if pool.slots.iter().any(Option::is_some){return Err(Error::Busy);}
+        if pool.bound||pool.slots.iter().any(Option::is_some){return Err(Error::Busy);}
         let mut gate=Self::new_with_terminal_owner(controller,publisher,terminal_owner,boot,epoch)?;
-        gate.pool=Some(pool);Ok(gate)
+        pool.bound=true;gate.pool=Some(pool);Ok(gate)
     }
     fn lookup(&self,seq:u64)->Option<&Pending>{
         if let Some(pool)=self.pool.as_deref(){
@@ -1263,6 +1264,7 @@ mod tests {
         // The production adapter must allocate this pool in the protected
         // 8MiB control pool. Give the host test an independent larger stack
         // for initialization, never a kernel-sized stack.
+        extern crate std;
         std::thread::Builder::new().stack_size(8*1024*1024).spawn(||{
             let bytes=profile_bytes();let profile=Profile::parse(&bytes).unwrap();
             let ctx=trusted(&bytes);let actions=frozen(&[2,4],&[2,0]);
