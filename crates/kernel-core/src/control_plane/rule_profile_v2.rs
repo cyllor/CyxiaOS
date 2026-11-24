@@ -48,6 +48,9 @@ pub struct Profile<'a> {
     pub rule_count: u32,
 }
 impl<'a> Profile<'a> {
+    /// Exact canonical bytes; the EL1 owner hashes these, never a model claim.
+    pub fn canonical_bytes(&self) -> &'a [u8] { self.bytes }
+
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < HEADER || bytes.len() > MAX_BYTES
             || get32(bytes, 0)? != RULE_MAGIC
