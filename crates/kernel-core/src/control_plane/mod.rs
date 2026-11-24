@@ -98,3 +98,5 @@ pub mod action_schema_v2;
 
 pub mod control_rpc_v1;
 pub mod apply_work_v1;
+
+pub mod snapshot_store_v3;
