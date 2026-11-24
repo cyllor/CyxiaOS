@@ -170,7 +170,11 @@ impl Pair {
         frozen_candidates: &[u16],
         assisted: bool,
     ) -> Result<Review, Error> {
-        if !trusted.epochs.valid() || !trusted.target.valid()
+        // RULE_ONLY/AI_DISABLED must work with no Active model epoch.
+        // Model generation is required only to adopt model advice.
+        if trusted.epochs.boot == 0 || trusted.epochs.controller == 0
+            || trusted.epochs.resources == 0 || trusted.epochs.cores == 0
+            || !trusted.target.valid()
             || trusted.domain == 0 || trusted.domain > 15
         {
             return Err(Error::Denied);
@@ -185,7 +189,8 @@ impl Pair {
         )?.ok_or(Error::Denied)?;
         let mut chosen = usize::from(frozen.fallback_index);
         let mut source = ChoiceSource::Baseline;
-        if assisted && frozen.choice_policy == 1
+        if assisted && trusted.epochs.model != 0
+            && frozen.choice_policy == 1
             && !matches!(trusted.domain, 6 | 11 | 12 | 14)
         {
             if let Some(advice) = self.operations.advice {
@@ -415,6 +420,16 @@ mod tests {
         assert_eq!(brain.review_with_rule_profile(
             &rules,2,trusted,[None;7],&candidates,true
         ),Err(Error::Stale));
+        let mut no_model=trusted;
+        no_model.epochs.model=0;
+        let rule_only=brain.review_with_rule_profile(
+            &rules,1,no_model,[None;7],&candidates,false
+        ).unwrap();
+        assert_eq!(rule_only.candidate,4);
+        assert_eq!(rule_only.source,ChoiceSource::Baseline);
+        assert_eq!(brain.review_with_rule_profile(
+            &rules,1,no_model,[None;7],&candidates,true
+        ).unwrap().source,ChoiceSource::Baseline);
     }
     #[test] fn stale_epoch_illegal_choice_and_expired_advice_revert_to_baseline() {
         let mut p=pair();
