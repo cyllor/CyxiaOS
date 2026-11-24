@@ -78,6 +78,9 @@ pub struct FramePool<'a> {
     capacity: usize,
     free: usize,
     next_zeroed: usize,
+    // Conservative lower bound on the first dirty frame. Revocation may
+    // lower it; cleaning advances it without changing first-fit ordering.
+    next_dirty: usize,
 }
 impl<'a> FramePool<'a> {
     pub fn from_regions(
@@ -171,6 +174,7 @@ impl<'a> FramePool<'a> {
             capacity: free,
             free,
             next_zeroed: 0,
+            next_dirty: 0,
         })
     }
     pub fn snapshot(&self) -> FrameSnapshot {
@@ -302,17 +306,26 @@ impl<'a> FramePool<'a> {
         }
         m.owner = None;
         m.state = State::Dirty;
+        self.next_dirty = self.next_dirty.min(h.index);
         self.free += 1;
         Ok(())
     }
     pub fn clean_one(&mut self, zeroer: &mut impl PageZeroer) -> Result<bool, FrameError> {
-        if let Some(m) = self.meta.iter_mut().find(|m| m.state == State::Dirty) {
-            zeroer.zero(m.address)?;
-            m.state = State::Clean;
-            Ok(true)
-        } else {
-            Ok(false)
+        // Avoid rescanning the same already-clean/reserved prefix for every
+        // page of a sequential clear. Preserve the historical lowest-index
+        // dirty choice and lower the cursor whenever a revoke returns a page.
+        while self.next_dirty < self.meta.len() {
+            let m = &mut self.meta[self.next_dirty];
+            if m.state == State::Dirty {
+                // On failure this page remains dirty and the cursor stays here.
+                zeroer.zero(m.address)?;
+                m.state = State::Clean;
+                self.next_dirty += 1;
+                return Ok(true);
+            }
+            self.next_dirty += 1;
         }
+        Ok(false)
     }
 }
 
@@ -325,6 +338,38 @@ mod tests {
         fn zero(&mut self, _: PhysAddr) -> Result<(), FrameError> {
             panic!("retired or clean pages must not invoke the zeroer");
         }
+    }
+
+    #[test]
+    fn dirty_scan_advances_linearly_and_revoke_lowers_cursor() {
+        struct Zero(bool);
+        impl PageZeroer for Zero {
+            fn zero(&mut self, _: PhysAddr) -> Result<(), FrameError> {
+                if self.0 { Err(FrameError::ZeroFailed) } else { Ok(()) }
+            }
+        }
+        let ram = [MemoryRegion { start: PhysAddr(0x1000), len: 4 * 4096, kind: RegionKind::Ram }];
+        let mut metadata = [FrameMeta::EMPTY; 4];
+        let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
+        let mut zero = Zero(false);
+        for expected in 1..=4 {
+            assert!(pool.clean_one(&mut zero).unwrap());
+            assert_eq!(pool.next_dirty, expected);
+        }
+        assert!(!pool.clean_one(&mut zero).unwrap());
+        let owner = TaskId::new(1).unwrap();
+        let frame = pool.alloc_clean(owner).unwrap();
+        assert_eq!(frame.index(), 0);
+        pool.begin_revoke(frame, owner).unwrap();
+        assert!(!pool.clean_one(&mut zero).unwrap());
+        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) }).unwrap();
+        assert_eq!(pool.next_dirty, 0);
+        zero.0 = true;
+        assert_eq!(pool.clean_one(&mut zero), Err(FrameError::ZeroFailed));
+        assert_eq!(pool.next_dirty, 0);
+        zero.0 = false;
+        assert!(pool.clean_one(&mut zero).unwrap());
+        assert_eq!(pool.alloc_clean(owner).unwrap().index(), 0);
     }
 
     #[test]
@@ -341,6 +386,7 @@ mod tests {
                 capacity: 1,
                 free: 1,
                 next_zeroed: 0,
+                next_dirty: 0,
             };
             let owner = TaskId::new(1).unwrap();
             let result = if zeroed {
@@ -375,6 +421,7 @@ mod tests {
             capacity: 2,
             free: 0,
             next_zeroed: 0,
+            next_dirty: 0,
         };
         for index in [1, usize::MAX] {
             let forged = FrameHandle { index, address: PhysAddr(0x1000), generation: 1 };
