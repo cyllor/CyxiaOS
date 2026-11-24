@@ -82,7 +82,7 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
 /// independent. Call only from the serialized native console owner;
 /// no direct/emergency writer may interleave an admitted partial frame.
 #[cfg(feature="v0199-epoch-disk-selftest")]
-pub(super) fn enqueue_v0199(owner:&mut cyxia_kernel_core::control_plane::d15_owner_v0199::Owner,
+pub(crate) fn enqueue_v0199(owner:&mut cyxia_kernel_core::control_plane::d15_owner_v0199::Owner,
     payload:&[u8],now:u64)->Result<usize,cyxia_kernel_core::control_plane::Error>{
     use cyxia_kernel_core::control_plane::Error;
     let seq=LOG_SEQUENCE.load(Ordering::Relaxed);
