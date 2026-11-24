@@ -17,7 +17,7 @@ pub struct FrozenCandidates{
 }
 pub struct View<'a>{set:&'a FrozenCandidates,refs:[&'a[u8];32]}
 impl<'a> View<'a>{
-    pub fn selected(&'a self,index:u16)->Result<FrozenAction<'a>,Error>{
+    pub fn selected(&self,index:u16)->Result<FrozenAction<'_>,Error>{
         let s=self.set;let payload=*self.refs[..s.len].get(usize::from(index)).ok_or(Error::Denied)?;
         Ok(FrozenAction{domain_id:s.snapshot.domain,target:Identity{id:s.snapshot.target_id,generation:s.snapshot.target_generation},
             candidate_set_hash:s.digest,static_ordinals:&s.ordinals[..s.len],candidate_payloads:&self.refs[..s.len],
