@@ -240,7 +240,7 @@ class NativeSecurityWiring(unittest.TestCase):
         lock = source(ROOT / "Cargo.lock")
         self.assertIn('ring = { path = "user/prototype-cluster/vendor/ring" }', manifest)
         self.assertIn('name = "ring"\nversion = "0.17.14"\ndependencies', lock)
-        self.assertNotIn('name = "ring"\\nversion = "0.17.14"\\nsource = "registry+', lock)
+        self.assertNotIn('name = "ring"\nversion = "0.17.14"\nsource = "registry+', lock)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
