@@ -14,6 +14,10 @@ on:
       - 'tools/verify_smp.py'
       - 'kernel/Cargo.toml'
       - 'crates/arch-aarch64/src/user.rs'
+      - 'crates/control-model/src/native_v0199.rs'
+      - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
+      - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
+      - 'tools/verify_v0199_epoch_disk.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -142,4 +146,92 @@ jobs:
         with:
           name: v020-eight-native-evidence-${{ matrix.ram }}m-${{ github.sha }}
           path: artifacts/eight-native/
+          retention-days: 7
+
+  host-model-epoch-components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compile and run new current-model and epoch journal tests
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/epoch-components
+          cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/epoch-components/model.log
+          cargo test --locked --offline -p cyxia-kernel-core epoch_redo_v0199 2>&1 | tee artifacts/epoch-components/redo.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-model-epoch-components-${{ github.sha }}
+          path: artifacts/epoch-components/
+          retention-days: 7
+  arm-epoch-disk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build separate 1GiB native epoch scratch-disk fixture
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/epoch-disk
+          git rev-parse HEAD > artifacts/epoch-disk/commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/epoch-disk/kernel.elf
+          (cd artifacts/epoch-disk; sha256sum kernel.elf > image.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-epoch-disk-build-${{ github.sha }}
+          path: artifacts/epoch-disk/
+          retention-days: 7
+  native-epoch-disk:
+    needs: [arm-epoch-disk,qemu-accounting]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-epoch-disk-build-${{ github.sha }}
+          path: artifacts/epoch-disk
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-eight-accounting-qemu-${{ github.sha }}
+          path: artifacts/eight-qemu
+      - name: Real FLUSH and two distinct force-stopped native QEMU processes
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          test "$(cat artifacts/epoch-disk/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/epoch-disk; sha256sum -c image.sha256)
+          (cd artifacts/eight-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/eight-qemu/patch.sha256
+          PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py \
+            --elf artifacts/epoch-disk/kernel.elf \
+            --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
+            --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
+            --output artifacts/epoch-disk/capture 2>&1 | tee artifacts/epoch-disk/verify.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-epoch-disk-evidence-${{ github.sha }}
+          path: artifacts/epoch-disk/
           retention-days: 7
