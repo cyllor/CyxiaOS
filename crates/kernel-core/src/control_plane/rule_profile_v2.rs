@@ -60,6 +60,7 @@ impl<'a> Profile<'a> {
             return Err(Error::Invalid);
         }
         let count = get32(bytes, 16)?;
+        if count == 0 { return Err(Error::Invalid); }
         let mut at = HEADER;
         let mut previous_id = 0u32;
         for _ in 0..count {
@@ -198,10 +199,10 @@ impl<'a> Profile<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sample() -> Vec<u8> {
+    fn sample() -> [u8; 96] {
         // One v2 D01 assisted rule: field 1 GE 7; ordinals 1 and 3,
         // rank 0 belongs to ordinal 3 (candidate index 1).
-        let mut b = vec![0u8; 96];
+        let mut b = [0u8; 96];
         b[0..4].copy_from_slice(&RULE_MAGIC.to_le_bytes());
         b[4..6].copy_from_slice(&RULE_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&(HEADER as u16).to_le_bytes());
@@ -222,7 +223,7 @@ mod tests {
         b[80..82].copy_from_slice(&1u16.to_le_bytes());
         b[82..84].copy_from_slice(&1u16.to_le_bytes());
         b[88..90].copy_from_slice(&3u16.to_le_bytes());
-        b // intentionally invalid until the second rank is set (zero).
+        b // second rank is zero, completing the canonical rank permutation.
     }
     #[test]
     fn profile_intersects_current_candidates_without_granting_execution() {
