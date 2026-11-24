@@ -96,7 +96,12 @@ impl<const D: usize> Controller<D> {
             return Err(Error::Denied);
         }
         let rule = &self.rules[trusted.domain - 1];
-        let adopted = advice.is_some_and(|value| {
+        // V0.19.9 §6.1 and §8: these four security-sensitive domains
+        // may observe model output, but choice_policy=1 is never authorized.
+        // A separate offline TrialPermit can be evaluated by a different
+        // deterministic pathway; it cannot be created by this advisory API.
+        let sensitive = matches!(trusted.domain, 6 | 11 | 12 | 14);
+        let adopted = !sensitive && advice.is_some_and(|value| {
             value.domain == trusted.domain
                 && value.target == trusted.target
                 && value.epochs == trusted.epochs
@@ -104,6 +109,9 @@ impl<const D: usize> Controller<D> {
                 && value.snapshot_ns <= trusted.now_ns
                 && value.expires_ns > trusted.now_ns
                 && value.expires_ns > value.snapshot_ns
+                // Max lifetime binds to the snapshot, not the time the
+                // untrusted message happens to reach the reviewer.
+                && value.expires_ns <= value.snapshot_ns.saturating_add(100_000_000)
                 && rule.options.contains(&value.candidate)
         });
         Ok(Reviewed {
@@ -169,6 +177,49 @@ mod tests {
         value = advice();
         value.model_generation = 1;
         assert_eq!(controller.review(scope(), Some(value)).unwrap().choice(), 2);
+    }
+    #[test]
+    fn security_sensitive_domains_never_adopt_model_candidates() {
+        let controller = Controller::new([RULE; 15]).unwrap();
+        for domain in [6, 11, 12, 14] {
+            let mut trusted = scope();
+            trusted.domain = domain;
+            let mut candidate = advice();
+            candidate.domain = domain;
+            assert_eq!(
+                controller.review(trusted, Some(candidate)).unwrap().source(),
+                Source::DeterministicBaseline
+            );
+            assert_eq!(
+                controller.review(trusted, Some(candidate)).unwrap().choice(),
+                RULE.baseline
+            );
+        }
+        // Other 11 eligible domains may still nominate a candidate, subject
+        // to subsequent RuleProfile, ledger and native execution checks.
+        let mut trusted = scope();
+        trusted.domain = 10;
+        let mut candidate = advice();
+        candidate.domain = 10;
+        assert_eq!(
+            controller.review(trusted, Some(candidate)).unwrap().source(),
+            Source::AdoptedAdvice
+        );
+    }
+    #[test]
+    fn advice_expiring_more_than_100ms_after_snapshot_is_not_adopted() {
+        let controller = Controller::new([RULE; 15]).unwrap();
+        let mut v = advice();
+        v.expires_ns = v.snapshot_ns + 100_000_001;
+        assert_eq!(
+            controller.review(scope(), Some(v)).unwrap().source(),
+            Source::DeterministicBaseline
+        );
+        v.expires_ns = v.snapshot_ns + 100_000_000;
+        assert_eq!(
+            controller.review(scope(), Some(v)).unwrap().source(),
+            Source::AdoptedAdvice
+        );
     }
     #[test]
     fn remote_domain_and_invalid_rule_tables_cannot_be_approved() {
