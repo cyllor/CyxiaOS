@@ -1568,6 +1568,68 @@ mod tests {
     }
 
     #[test]
+    fn reason7_fallback_requires_exact_admitted_advice_and_actual_rejection_reason(){
+        use super::super::{Epochs,advice_ledger_v0199::{AdviceKey,AdviceResult}};
+        let rules=profile_bytes(); // ordinary choice_policy 0
+        let profile=Profile::parse(&rules).unwrap();
+        let plan=plan_bytes();let mut rec=decision(&plan,&rules);
+        rec[98]=2;rec[108..112].copy_from_slice(&7u32.to_le_bytes());
+        let ctx=trusted(&rules);let actions=frozen(&[2,4],&[2,0]);let local=&actions[0];
+        let mut advice=[0;ADVICE_BYTES];
+        advice[..4].copy_from_slice(&0x43594131u32.to_le_bytes());
+        advice[4..6].copy_from_slice(&1u16.to_le_bytes());
+        advice[6..8].copy_from_slice(&152u16.to_le_bytes());
+        for (at,v) in [(8,1u64),(16,1),(24,3),(32,17),(40,1),(48,5),(56,6),(64,200),(72,9)]{
+            advice[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at,v) in [(80,1u16),(82,1),(84,1),(86,2)]{advice[at..at+2].copy_from_slice(&v.to_le_bytes());}
+        advice[88..120].fill(3);advice[120..152].fill(1);
+        let mut disp=[0;DISPOSITION_BYTES];
+        disp[..4].copy_from_slice(&0x43594144u32.to_le_bytes());
+        disp[4..6].copy_from_slice(&1u16.to_le_bytes());disp[6..8].copy_from_slice(&240u16.to_le_bytes());
+        for (at,v) in [(8,1u64),(16,1),(24,1),(32,3),(40,2),(48,4),(56,17),(64,1),(72,9),(80,150)]{
+            disp[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at,v) in [(88,1u16),(90,1),(92,2),(94,2),(100,0),(102,1),(104,0),(106,0)]{
+            disp[at..at+2].copy_from_slice(&v.to_le_bytes());
+        }
+        disp[96..100].copy_from_slice(&3u32.to_le_bytes());
+        disp[112..144].fill(1);disp[144..176].copy_from_slice(&sha256(&advice));
+        disp[176..208].copy_from_slice(&sha256(&rec));disp[208..240].copy_from_slice(&sha256(&rules));
+        let trusted=TrustedAdviceScope{epochs:Epochs{boot:1,controller:2,model:9,resources:5,cores:6},
+            advisor_epoch:1,snapshot_seq:3,domain:1,target:local.target,sampled_ns:100,now_ns:150,
+            action_kind:1,candidates:&[2,4],model_hash:[3;32],candidate_set_hash:[1;32]};
+        let scope=AssistedScope{advice:&trusted,assisted_mode:true,offline_model_authorized:true};
+        let ops=Identity{id:6,generation:1};
+        let mut ledger=EvidenceLedger::new(ops,CONTROLLER,SUPERVISOR,1,1).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        assert_eq!(ledger.record(ops,&advice,&trusted),Ok(AdviceResult::Recorded));
+        assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&[rec],&profile,&actions,ctx),Err(Error::NotReady));
+        let mut bad=disp;bad[94..96].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(gate.register_rejected_fallback_one(CONTROLLER,&plan,&rec,&bad,&profile,local,ctx,&scope,
+            &mut ledger,|_,_|panic!("policy rejection needs no fabricated hard proof")),Err(Error::Denied));
+        let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        assert_eq!(ledger.admitted_wire(CONTROLLER,key),Ok(advice));
+        assert_eq!(gate.register_rejected_fallback_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&scope,
+            &mut ledger,|_,_|panic!("policy rejection is independently derived")),Ok(Registration::Frozen));
+        assert_eq!(ledger.admitted_wire(CONTROLLER,key),Err(Error::Stale));
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,||panic!("ordinary bypass")),Err(Error::Denied));
+        assert_eq!(gate.publish_rejected_fallback_one(PUBLISHER,&plan,&rec,&profile,local,ctx,||Ok(())),Ok(Publication::AdapterAccepted));
+        assert_eq!(gate.publish_rejected_fallback_one(PUBLISHER,&plan,&rec,&profile,local,ctx,||panic!("no replay")),Ok(Publication::ReplayNoEffect));
+        claim_test_work(&mut gate,&plan);
+        let report=executor_report(1);let bound=[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}];
+        let learner=Identity{id:10,generation:1};
+        let mut feedback=super::super::feedback_v0199::FeedbackInbox::new(SUPERVISOR,learner).unwrap();
+        let pair=super::super::feedback_v0199::CausalPair{advice:&advice,disposition:&disp};
+        gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&bound,&[verified_binding()],
+            verified_scope(),Some(pair),|_,_|Ok(()),|batch|feedback.retain(SUPERVISOR,batch)).unwrap();
+        let row=feedback.read(learner,0).unwrap().unwrap();
+        assert_eq!(row.causal_label,super::super::feedback_v0199::CausalLabel::NoAdoption);
+        assert_eq!(row.report_bytes(),&report);
+        assert_eq!(row.decision,rec);
+    }
+
+    #[test]
     fn assisted_advice_is_not_authority_and_exact_disposition_and_model_are_rechecked(){
         use super::super::advice_ledger_v0199::{AdviceResult,AdviceKey};
         use super::super::Epochs;
