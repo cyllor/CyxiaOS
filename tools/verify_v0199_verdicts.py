@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Independent structural/custody verification and G4/G5 aggregation.
+
+This is NOT a case checker: it never manufactures PASS or FAIL Verdict v4
+records, interprets a diagnostic log as a formal proof, or certifies the
+trusted origin of a run manifest. The operator supplies the *previously
+frozen authenticated* manifest and exact expected digest. Native/static/
+model/architecture checkers produce the individual canonical records.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import struct
+import sys
+
+CLASSES={"RUNTIME_QEMU":1,"STATIC_EL1":2,"ARCH_A53":3,"MODEL_CHECK":4}
+NAMES={v:k for k,v in CLASSES.items()}
+STATUS={0:"NOT_RUN",1:"PASS",2:"FAIL"}
+REASONS={0:{1,2,7,8,9},1:{0},2:{3,4,5,6}}
+INVENTORY=Path(__file__).resolve().parent/"v0199-required-proof-inventory.json"
+def require(ok,msg):
+    if not ok: raise ValueError(msg)
+def digest(data):return hashlib.sha256(data).hexdigest()
+def sha_path(path):
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda:f.read(1024*1024),b""):h.update(chunk)
+    return h.hexdigest()
+def hash_value(v):
+    require(isinstance(v,str) and len(v)==64 and v==v.lower(),"invalid canonical SHA256")
+    try: bytes.fromhex(v)
+    except ValueError: raise ValueError("invalid canonical SHA256")
+    require(len(bytes.fromhex(v))==32,"invalid canonical SHA256")
+    return v
+def safe_file(root,relative):
+    require(isinstance(relative,str) and relative!="","missing relative evidence path")
+    p=Path(relative)
+    require(not p.is_absolute() and ".." not in p.parts,"evidence escapes root")
+    cur=root
+    for part in p.parts:
+        cur=cur/part
+        require(not cur.is_symlink(),"symlink evidence rejected")
+    require(cur.is_file(),"missing evidence file")
+    require(cur.resolve().is_relative_to(root.resolve()),"evidence escapes root")
+    return cur
+def inventory():
+    raw=INVENTORY.read_bytes()
+    j=json.loads(raw)
+    cases=j["cases"]
+    require(j["required_ids"]==len(cases)==127 and len({x["test_id"] for x in cases})==127,"inventory invalid")
+    g4={(c["test_id"],CLASSES[p]) for c in cases for p in c["g4_required"]}
+    g5=g4|{(c["test_id"],CLASSES[p]) for c in cases for p in c["g5_additional"]}
+    require(len(g4)==262 and len(g5-g4)==26,"inventory proof count mismatch")
+    return g4,g5,{c["test_id"]:c["id"] for c in cases},digest(raw)
+def parse(raw):
+    require(len(raw)==320,"wrong Verdict v4 size")
+    magic,ver,size,run,test,status,proof,checker,checker_version,reason,count=struct.unpack_from("<IHHQIHHIIII",raw)
+    require((magic,ver,size)==(0x43595632,4,320),"wrong Verdict v4 header")
+    require(status in STATUS and proof in NAMES and reason in REASONS[status],"invalid status/reason/class")
+    require(run>0 and checker_version>0 and checker>>16==test>>16 and checker&0xffff,"invalid checker identity")
+    epochs=struct.unpack_from("<7Q",raw,40)
+    require(epochs[-1]==0,"nonzero reserved field")
+    hashes=[raw[i:i+32].hex() for i in range(96,288,32)]
+    require(digest(b"CYX/VERDICT/v4"+raw[:288])==raw[288:].hex(),"record digest mismatch")
+    empty=hashes[-1]=="0"*64
+    require((count==0)==empty and (status==0 or count>0),"PASS/FAIL without evidence")
+    return dict(run_id=run,test_id=test,proof_class=proof,status=STATUS[status],checker_id=checker,
+                checker_version=checker_version,reason=reason,evidence_count=count,
+                boot_epoch=epochs[0],controller_epoch=epochs[1],security_epoch=epochs[2],
+                object_or_stream_generation=epochs[3],seed=epochs[4],fault_point_id=epochs[5],
+                **dict(zip(("design_hash","binary_hash","security_profile_hash","input_hash","rule_hash","evidence_digest"),hashes)))
+
+FIELDS=("checker_id","checker_version","boot_epoch","controller_epoch","security_epoch",
+        "object_or_stream_generation","seed","fault_point_id","design_hash","binary_hash",
+        "security_profile_hash","input_hash","rule_hash")
+def aggregate(manifest_raw,locked_digest,root):
+    require(digest(manifest_raw)==hash_value(locked_digest),"run manifest not the locked input")
+    j=json.loads(manifest_raw)
+    g4,g5,ids,inv_hash=inventory()
+    require(j["schema"]=="cyxia-frozen-verdict-run/v1" and j["inventory_sha256"]==inv_hash,"wrong inventory binding")
+    run=j["run_id"]
+    require(type(run) is int and run>0,"invalid run id")
+    expected={}
+    for item in j["proofs"]:
+        key=(item["test_id"],CLASSES[item["proof_class"]])
+        require(key in g5 and key not in expected,"duplicate/unknown expected proof")
+        require(all(k in item for k in FIELDS),"incomplete frozen expected input")
+        for k in FIELDS:
+            if k.endswith("_hash"):
+                require(hash_value(item[k])!="0"*64,"zero expected hash")
+            else:require(type(item[k]) is int and 0<=item[k]<2**64,"invalid expected integer")
+        require(item["checker_id"]>>16==key[0]>>16 and item["checker_id"]&0xffff
+                and item["checker_version"]>0,"invalid expected checker")
+        expected[key]=item
+    rows={}
+    for key in sorted(g5):
+        base=dict(test_id=key[0],id=ids[key[0]],proof_class=NAMES[key[1]])
+        item=expected.get(key)
+        if item is None:
+            rows[key]={**base,"status":"NOT_RUN","reason":"missing frozen expected input"};continue
+        # Fixed file naming is an internal archive convention, not a new
+        # guest ABI. The manifest commits the checker/build/input fields.
+        stem=f'{key[0]:08x}-{key[1]}'
+        rel=f'verdicts/{stem}.bin'
+        path=root/rel
+        if not path.exists():
+            rows[key]={**base,"status":"NOT_RUN","reason":"missing verdict"};continue
+        try:
+            raw=safe_file(root,rel).read_bytes()
+            v=parse(raw)
+            require((v["run_id"],v["test_id"],v["proof_class"])==(run,*key),"wrong run/proof key")
+            require(all(v[k]==item[k] for k in FIELDS),"frozen input mismatch")
+            if v["evidence_count"]:
+                # Digest of the exact external manifest bytes; each member's
+                # SHA256/size is then independently read from the archive.
+                m=safe_file(root,f'evidence/{stem}.json').read_bytes()
+                require(digest(m)==v["evidence_digest"],"evidence manifest digest mismatch")
+                members=json.loads(m)["files"]
+                require(isinstance(members,list) and len(members)==v["evidence_count"],"evidence count mismatch")
+                require(len({e["path"] for e in members})==len(members),"duplicate evidence member")
+                for e in members:
+                    p=safe_file(root,e["path"])
+                    require(p.stat().st_size==e["bytes"] and sha_path(p)==hash_value(e["sha256"]),"evidence object mismatch")
+            rows[key]={**base,"status":v["status"],"reason_code":v["reason"],"evidence_count":v["evidence_count"],
+                       "record_sha256":digest(raw)}
+        except (OSError,ValueError,KeyError,TypeError,struct.error) as exc:
+            # A malformed archive is an integration blocker. Do not invent
+            # a checker Verdict v4 FAIL, or override reliable prior verdicts.
+            rows[key]={**base,"status":"INVALID_EVIDENCE","reason":str(exc)}
+    def summary(keys):
+        counts={s:sum(rows[k]["status"]==s for k in keys) for s in ("PASS","FAIL","NOT_RUN","INVALID_EVIDENCE")}
+        status="FAIL" if counts["FAIL"] else "BLOCKED_INVALID_EVIDENCE" if counts["INVALID_EVIDENCE"] else "NOT_RUN" if counts["NOT_RUN"] else "PASS"
+        return dict(status=status,required=len(keys),counts=counts,
+                    complete_ids=sum(all(rows[k]["status"]=="PASS" for k in keys if k[0]==i) for i in ids))
+    return dict(schema="cyxia-verdict-aggregation/v1",run_id=run,manifest_sha256=locked_digest,
+                scope="archive integrity and proof coverage only; checker semantics and trusted origin external",
+                G4_QEMU=summary(g4),G5_ARCH=summary(g5),proofs=list(rows.values()))
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--manifest",type=Path,required=True)
+    p.add_argument("--manifest-sha256",required=True)
+    p.add_argument("--evidence-root",type=Path,required=True)
+    p.add_argument("--output",type=Path,required=True)
+    a=p.parse_args()
+    result=aggregate(a.manifest.read_bytes(),a.manifest_sha256,a.evidence_root.resolve(strict=True))
+    with a.output.open("x",encoding="utf-8") as f:json.dump(result,f,ensure_ascii=False,indent=2);f.write("\n")
+    print(json.dumps({k:result[k] for k in ("run_id","G4_QEMU","G5_ARCH")},indent=2))
+    return 0 if result["G4_QEMU"]["status"]==result["G5_ARCH"]["status"]=="PASS" else 1
+if __name__=="__main__":
+    raise SystemExit(main())
