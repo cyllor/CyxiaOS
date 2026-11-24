@@ -47,7 +47,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,3,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,4,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -70,6 +70,8 @@ class Bringup:
             require(root and root%4096==0 and root not in roots and image and image%4096==0
                     and stack==image+65536 and 0x10000<=entry<0x20000 and entry%4==0
                     and guard==0,'invalid private root, image, stack or guard')
+            asid=words[at+18]
+            require(asid==0x98+index and words[at+19]==0,'incorrect one-shot replacement ASID')
             roots.add(root);spans.append((image,stack+32768))
             require(clocks>=2 and calls>=2 and turns>=1 and actual>0,'missing real ABI3 or CPU charge')
             restricted=role in (6,7,2,11)
@@ -81,7 +83,7 @@ class Bringup:
             require(boot[index]==(role,root,clocks) and charges[index]==(role,actual,turns),
                     'UART and stopped guest evidence disagree')
             details.append(dict(role=role,package_sha256=digest.hex(),ttbr0=root,
-                                stack_bytes=32768,clocks=clocks,role_calls=calls,
+                                stack_bytes=32768,asid=asid,clocks=clocks,role_calls=calls,
                                 actual_cpu_ns=actual,turns=turns,timer_preemptions=preemptions))
         for i,(a,b) in enumerate(spans):
             require(all(not(a<=r<b) for r in roots),'page-table root overlaps role backing')
