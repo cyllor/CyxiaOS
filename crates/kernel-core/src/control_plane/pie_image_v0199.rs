@@ -353,6 +353,10 @@ impl<'a> VerifiedRolePackage<'a>{
         Ok(Self{spec,image,relative:input.relative})
     }
     pub fn role(&self)->Role{self.spec.role}
+    pub fn load_segments(&self)->impl Iterator<Item=LoadSegment>+'_ {
+        self.image.loads[..self.image.load_count].iter().flatten().copied()
+    }
+    pub fn relro(&self)->Option<(u64,u64)>{self.image.relro}
     /// All writes remain in unpublished staging. The native owner separately
     /// accounts mapped pages, guard stack, RELRO, TLB/cache sync and publication.
     pub fn stage(&self,staging:&mut[u8],base:u64,start:u64,end:u64)->Result<u64,Error>{

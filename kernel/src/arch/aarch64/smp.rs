@@ -29,6 +29,9 @@ pub(crate) mod prototype_runtime;
 #[cfg(feature = "v0199-cpu0-role-selftest")]
 #[path = "v0199_role_selftest.rs"]
 mod v0199_role_selftest;
+#[cfg(feature = "v0199-control-bringup")]
+#[path = "v0199_control_bringup.rs"]
+mod v0199_control_bringup;
 #[cfg(feature = "register-v15-selftest")]
 #[path = "../../diagnostics/register_evidence.rs"]
 mod register_evidence;
@@ -967,7 +970,9 @@ pub fn run(info: &BootInfo) -> ! {
     super::net_selftest::run(info);
     #[cfg(feature = "model-v13-selftest")]
     prototype_model::run();
-    #[cfg(feature = "v0199-cpu0-role-selftest")]
+    #[cfg(feature = "v0199-control-bringup")]
+    v0199_control_bringup::run();
+    #[cfg(all(feature = "v0199-cpu0-role-selftest", not(feature = "v0199-control-bringup")))]
     v0199_role_selftest::run();
     #[cfg(not(any(
         feature = "v0199-cpu0-role-selftest",

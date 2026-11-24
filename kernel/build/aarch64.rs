@@ -29,7 +29,13 @@ fn assets(directory: &std::path::Path, paths: &mut Vec<PathBuf>) {
         }
     }
 }
+#[path = "v0199_roles.rs"]
+mod v0199_roles;
+
 pub fn build() {
+    if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some() {
+        v0199_roles::build();
+    }
     println!("cargo:rerun-if-env-changed=CYXIA_A03_DEMAND");
     let demand = env::var("CYXIA_A03_DEMAND").unwrap_or_else(|_| "off".into());
     assert!(

@@ -1,0 +1,18 @@
+ENTRY(_start)
+PHDRS {
+  text PT_LOAD FLAGS(5);
+  ro PT_LOAD FLAGS(4);
+  data PT_LOAD FLAGS(6);
+  stack PT_GNU_STACK FLAGS(6);
+}
+SECTIONS {
+  . = 0x1000;
+  .text : { KEEP(*(.text.entry)) *(.text .text.*) } :text
+  . = ALIGN(4096);
+  .rodata : { KEEP(*(.rodata.role)) *(.rodata .rodata.*) BYTE(0); } :ro
+  . = ALIGN(4096);
+  .data : { BYTE(0); *(.data .data.*) *(.got .got.*) } :data
+  .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) } :data
+  /DISCARD/ : { *(.eh_frame*) *(.comment*) }
+  ASSERT(. <= 0x10000, "native role exceeds its 64KiB image backing")
+}
