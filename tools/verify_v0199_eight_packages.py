@@ -47,7 +47,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,4,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,5,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -96,6 +96,7 @@ class Bringup:
         require(rows('V0199_BOOTSTRAP_INITIAL_ROLES')==[(8,0,0)],'missing initial eight-role milestone')
         require(len(survivors)==len(starts)==len(faults)==8,'missing isolated-survivor progress evidence')
         old_roots=set()
+        recovery_cpu_ns=0
         for i,role in enumerate(ROLES):
             at=304+i*12
             rid,old,new,old_root,new_root,old_cap,new_cap,esr,far,cost,scrubbed,ready=words[at:at+12]
@@ -108,6 +109,7 @@ class Bringup:
             require(esr>>26==0x20 and esr&0x3f==7 and far==0x2f000,
                     'not a real EL0 guard instruction abort')
             require(0<cost<=8_000_000,'recovery was not debited in its own reservation')
+            recovery_cpu_ns+=cost
             require((old_cap==new_cap==0) or (old_cap and new_cap and old_cap!=new_cap),
                     'old issued capability was reused')
             require(reloads[i]==(role,old_root,new_root),'reload UART/QMP mismatch')
@@ -144,10 +146,23 @@ class Bringup:
             reported=business[slot-1]
             require(reported[0]==slot and 2<=reported[1]<=progress and reported[2]==0,
                     'business progress evidence mismatch')
+        elapsed,accounted,upper,crossings,start_ns,end_ns,*classes=words[481:493]
+        require(0<elapsed==accounted==sum(classes) and all(cost>0 for cost in classes),
+                'unclassified or duplicated CPU0 PMU time')
+        require(classes[4]==recovery_cpu_ns,'recovery ledger disagrees with actual reloads')
+        require(0<upper<=70_000_000 and start_ns<end_ns,
+                'invalid aligned-window upper bound or sampled interval')
+        require(rows('V0199_BOOTSTRAP_ACCOUNTING')==[(elapsed,accounted,upper)],
+                'CPU0 accounting UART and stopped memory disagree')
+        require(all(v==0 for v in words[493:]),'nonzero reserved accounting evidence')
         return dict(guest_cpus=4,fixed_control_cpu=0,business_cpu_mask=14,
                     distinct_native_packages=8,private_stack_bytes=32768,
                     native_diagnostic_package_reloads=8,native_survivor_role_progress_pairs=56,
                     post_restart_live_roles=8,
+                    sampled_cpu0_ns=elapsed,accounted_cpu0_ns=accounted,
+                    control_window_upper_bound_ns=upper,coordination_gap_crossings=crossings,
+                    class_cpu_ns=classes,accounting_interval_ns=[start_ns,end_ns],
+                    exact_per_window_split=False,complete_production_accounting=False,
                     durable_role_restarts=False,
                     roles=details,production_g0=False,real_services_tested=False)
 
