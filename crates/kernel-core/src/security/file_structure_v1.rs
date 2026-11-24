@@ -203,8 +203,8 @@ mod tests{
     fn put32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
     fn put64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
     fn seal(b:&mut[u8],at:usize){let crc=crc32c_zeroed(b,at).unwrap();put32(b,at,crc);}
-    fn inode(b:&mut[u8],kind:u16,gen:u64,size:u64,physical:u32,blocks:u32){
-        b.fill(0);put32(b,0,0x4359494e);put16(b,4,kind);put64(b,8,gen);
+    fn inode(b:&mut[u8],kind:u16,generation:u64,size:u64,physical:u32,blocks:u32){
+        b.fill(0);put32(b,0,0x4359494e);put16(b,4,kind);put64(b,8,generation);
         if kind!=0{
             put64(b,16,size);put64(b,40,1);
             if blocks!=0{put16(b,32,1);put32(b,52,physical);put32(b,56,blocks);}
