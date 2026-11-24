@@ -194,3 +194,52 @@ impl Holdouts{
     }
 }
 impl Default for Holdouts{fn default()->Self{Self::new()}}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use cyxia_control_model::reward_v2::{Metrics,Performance,Cost};
+    // Synthetic component fixtures exercise custody arithmetic only.
+    // They cannot enter Sample::capture or supply native verdict evidence.
+    const SCHEMAS:SchemaBinding=SchemaBinding{feature:[1;32],action:[2;32],reward:[3;32],learning:[4;32]};
+    fn id(n:u64)->[u8;32]{let mut b=[0;32];b[..8].copy_from_slice(&n.to_le_bytes());b}
+    fn sample(i:usize,per_domain:usize,offset:u64)->Sample{
+        let metrics=Metrics{performance:Performance{emitted:100,completed:100,rejected:0,timed_out:0,
+            pending:0,penalty_p99_ns:1,actual_p99_ns:Some(1)},cost:Cost{union_ns:0,by_class:[0;3],raw_tagged:[0;3]}};
+        let key=offset+i as u64;
+        Sample{group:ReplayGroup{seed:key,workload:[1;32],initial_image:[2;32]},
+            schemas:SCHEMAS,domain:(i/per_domain+1) as u16,input:[0;64],
+            reward:Reward{candidate:metrics,baseline:metrics,delta_x:F64::ZERO,delta_l:F64::ZERO,
+                raw_cost:F64::ZERO,clipped_cost:F64::ZERO,value:F64::ZERO},
+            candidate_receipt:id(key*3),baseline_receipt:id(key*3+1),pair:id(key*3+2)}
+    }
+    #[test]
+    fn per_domain_minimum_and_duplicate_evidence(){
+        let mut rows:[Sample;120]=core::array::from_fn(|i|sample(i,8,100));
+        assert!(TrainingData::freeze(&rows,SCHEMAS).is_ok());
+        assert!(matches!(TrainingData::freeze(&rows[..119],SCHEMAS),Err(Error::NotReady)));
+        rows[119].baseline_receipt=rows[0].candidate_receipt;
+        assert!(matches!(TrainingData::freeze(&rows,SCHEMAS),Err(Error::Denied)));
+    }
+    #[test]
+    fn ordered_training_and_holdout_consumed_even_on_failed_verifier(){
+        let rows:[Sample;120]=core::array::from_fn(|i|sample(i,8,100));
+        let mut holdout:[Sample;60]=core::array::from_fn(|i|sample(i,4,1000));
+        let active=[0u8;MODEL_BYTES];
+        let actor=Identity{id:10,generation:1};let validator=Identity{id:11,generation:1};
+        let mut trainer=Trainer::start(TrainingData::freeze(&rows,SCHEMAS).unwrap(),&active,actor,|_,_,_|Ok(())).unwrap();
+        assert_eq!(trainer.step(validator,||panic!()),Err(Error::Denied));
+        for _ in 0..120{trainer.step(actor,||Ok(())).unwrap();}
+        assert_eq!(trainer.step(actor,||panic!()),Err(Error::Stale));
+        let model=trainer.finish().unwrap();
+        let training=TrainingData::freeze(&rows,SCHEMAS).unwrap();
+        let mut ledger=Holdouts::new();let group=holdout[0].group;
+        holdout[0].group=rows[0].group;
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+        holdout[0].group=group;
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady)));
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+        let fresh:[Sample;60]=core::array::from_fn(|i|sample(i,4,2000));
+        assert!(ledger.validate(validator,&active,&model,&training,&fresh,|_,_,_,_|Ok(())).is_ok());
+    }
+}
