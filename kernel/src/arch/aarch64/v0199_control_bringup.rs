@@ -44,10 +44,27 @@ struct Tables {root:Page,mid:Page,leaf:Page}
 impl Tables{const ZERO:Self=Self{root:Page::ZERO,mid:Page::ZERO,leaf:Page::ZERO};}
 #[repr(align(4096))]
 struct CopyBuffer([u8;COPY]);
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut BACKING:[Backing;ROLE_COUNT]=[const{Backing::ZERO};ROLE_COUNT];
 // A replacement uses a different physical root; the retired bank stays unmapped.
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut TABLES:[Tables;2*ROLE_COUNT]=[const{Tables::ZERO};2*ROLE_COUNT];
+#[cfg(not(feature="v0199-epoch-disk-selftest"))]
 static mut COPY_BUFFER:CopyBuffer=CopyBuffer([0;COPY]);
+#[cfg(feature="v0199-epoch-disk-selftest")]
+static DISK_CONTROL_BASE:AtomicU64=AtomicU64::new(0);
+const DISK_TABLE_OFFSET:usize=core::mem::size_of::<[Backing;ROLE_COUNT]>();
+const DISK_COPY_OFFSET:usize=DISK_TABLE_OFFSET+core::mem::size_of::<[Tables;2*ROLE_COUNT]>();
+const _:()=assert!(DISK_COPY_OFFSET+COPY<=8*1024*1024&&DISK_COPY_OFFSET%4096==0);
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn install_disk_control_pool(va:u64){
+    assert!(va>=super::HIGH&&va%4096==0);
+    assert!(DISK_CONTROL_BASE.compare_exchange(0,va,Ordering::AcqRel,Ordering::Acquire).is_ok());
+}
+#[cfg(feature="v0199-epoch-disk-selftest")]
+fn disk_pool()->u64{
+    let va=DISK_CONTROL_BASE.load(Ordering::Acquire);assert_ne!(va,0);va
+}
 const _:()=assert!(core::mem::size_of::<Backing>()==IMAGE+ROLE_STACK_BYTES);
 const _:()=assert!(core::mem::size_of::<Tables>()==3*PAGE);
 
@@ -222,11 +239,17 @@ fn cap_kind(role:Role)->CapKind{
 /// or a DMA queue. No EL0 context can exist during initial stage/seal.
 fn backing(index:usize)->*mut Backing{
     assert!(index<ROLE_COUNT);
-    unsafe{core::ptr::addr_of_mut!(BACKING).cast::<Backing>().add(index)}
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    {unsafe{(disk_pool() as *mut Backing).add(index)}}
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
+    {unsafe{core::ptr::addr_of_mut!(BACKING).cast::<Backing>().add(index)}}
 }
 fn tables(index:usize,bank:usize)->*mut Tables{
     assert!(index<ROLE_COUNT&&bank<2);
-    unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(bank*ROLE_COUNT+index)}
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    {unsafe{((disk_pool()+DISK_TABLE_OFFSET as u64) as *mut Tables).add(bank*ROLE_COUNT+index)}}
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
+    {unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(bank*ROLE_COUNT+index)}}
 }
 fn root_pa(index:usize,bank:usize)->u64{
     phys(tables(index,bank) as u64)
@@ -285,6 +308,9 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     let b=backing(index);let t=tables(index,bank);
     // SAFETY: CPU0 is the only loader and none of these contexts has been
     // published. The exclusive source scratch is scrubbed after each image.
+    #[cfg(feature="v0199-epoch-disk-selftest")]
+    let scratch=unsafe{&mut *((disk_pool()+DISK_COPY_OFFSET as u64) as *mut [u8;COPY])};
+    #[cfg(not(feature="v0199-epoch-disk-selftest"))]
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
     scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
     checkpoint();
