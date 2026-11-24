@@ -8,6 +8,9 @@ on:
       - 'crates/control-model/**'
       - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
       - '.github/workflows/v20-protected-control-gates.yml'
+      - 'tools/verify_v0199_verdicts.py'
+      - 'tools/test_verify_v0199_verdicts.py'
+      - 'tools/v0199-required-proof-inventory.json'
   workflow_dispatch:
 permissions:
   contents: read
@@ -32,6 +35,8 @@ jobs:
           cargo fetch --locked
           cargo test --locked --offline -p cyxia-kernel-core --lib control_plane 2>&1 | tee artifacts/control-gates/control-plane.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/control-gates/model.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib offline_config_v1 2>&1 | tee artifacts/control-gates/offline-config.log
+          (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts) 2>&1 | tee artifacts/control-gates/verdict-custody.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
