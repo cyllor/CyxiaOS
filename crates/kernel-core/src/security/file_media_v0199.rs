@@ -184,7 +184,11 @@ pub fn probe_snapshot_media_pair(
         return if a == b { Ok(a) } else { Err(Error::Conflict) };
     }
     let (older, newer) = if a.generation < b.generation { (a, b) } else { (b, a) };
-    if newer.checkpoint_lsn < older.checkpoint_lsn || newer.log_epoch <= older.log_epoch {
+    // V0.19.9 §9.5: two valid copies are necessary but their generations
+    // must also prove exactly one alternating checkpoint transition.
+    if older.generation.checked_add(1)!=Some(newer.generation)
+        ||older.log_epoch.checked_add(1)!=Some(newer.log_epoch)
+        ||newer.checkpoint_lsn<older.checkpoint_lsn {
         return Err(Error::Conflict);
     }
     Ok(newer)
@@ -493,6 +497,21 @@ mod tests{
         let crc=crc32c_zeroed(&next,108).unwrap();
         next[108..112].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(probe_snapshot_media_pair(&v2,&next),Err(Error::Conflict));
+    }
+    #[test]
+    fn v0199_checkpoint_requires_adjacent_generation_and_log_epoch(){
+        let a=super_v1();let old=SuperblockV1::decode(&a).unwrap();
+        let next=|generation:u64,epoch:u64,lsn:u64|{
+            let mut b=a;b[32..40].copy_from_slice(&generation.to_le_bytes());
+            b[40..48].copy_from_slice(&lsn.to_le_bytes());b[48..56].copy_from_slice(&epoch.to_le_bytes());
+            let c=crc32c_zeroed(&b,76).unwrap();b[76..80].copy_from_slice(&c.to_le_bytes());b
+        };
+        let good=next(old.generation+1,old.log_epoch+1,old.checkpoint_lsn+3);
+        assert_eq!(probe_snapshot_media_pair(&good,&a).unwrap().generation,old.generation+1);
+        for bad in [next(old.generation+2,old.log_epoch+1,old.checkpoint_lsn+3),
+                    next(old.generation+1,old.log_epoch+2,old.checkpoint_lsn+3)]{
+            assert_eq!(probe_snapshot_media_pair(&a,&bad),Err(Error::Conflict));
+        }
     }
     #[test]
     fn v0199_superblock_golden_offsets_and_crc_fail_closed(){
