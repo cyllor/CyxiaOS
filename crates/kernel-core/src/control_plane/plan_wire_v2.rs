@@ -137,6 +137,8 @@ impl<'a> PlanV2<'a> {
         let mut at=PLAN_HEADER_BYTES;
         let mut first_ledger=None;
         let mut first_core=None;
+        let mut first_model_hash=None;
+        let mut last_decision_seq=0u64;
         let mut keys=[(0u16,0u64,0u16);MAX_ACTIONS];
         let mut found_d14=false;
         for i in 0..count {
@@ -147,7 +149,12 @@ impl<'a> PlanV2<'a> {
                 || (flags == 0 && a.model_hash != [0;32])
                 || (flags == 1 && a.model_hash == [0;32])
                 || keys[..i].contains(&(a.domain_id,a.target_id,a.action_kind))
+                || a.decision_seq<=last_decision_seq
             { return Err(Error::Invalid); }
+            if let Some(current_model_hash)=first_model_hash {
+                if a.model_hash != current_model_hash {return Err(Error::Invalid);}
+            } else { first_model_hash=Some(a.model_hash); }
+            last_decision_seq=a.decision_seq;
             if let Some(seen_generation)=first_ledger {
                 if a.ledger_generation != seen_generation {return Err(Error::Invalid);}
             } else { first_ledger=Some(a.ledger_generation); }
@@ -320,6 +327,29 @@ mod tests {
         assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
     }
 
+    #[test]
+    fn multi_action_plan_v2_requires_one_model_and_increasing_decision_sequences() {
+        let one=plan();
+        let mut two=[0u8;360];
+        two[..212].copy_from_slice(&one);
+        two[212..].copy_from_slice(&one[64..212]);
+        two[8..12].copy_from_slice(&360u32.to_le_bytes());
+        two[12..14].copy_from_slice(&2u16.to_le_bytes());
+        // The second action must be a different target and later decision.
+        two[212+40..212+48].copy_from_slice(&18u64.to_le_bytes());
+        two[212+24..212+32].copy_from_slice(&5u64.to_le_bytes());
+        assert!(PlanV2::decode(&two).is_ok());
+        two[212+24..212+32].copy_from_slice(&4u64.to_le_bytes());
+        assert!(PlanV2::decode(&two).is_err()); // replayed decision sequence
+        two[212+24..212+32].copy_from_slice(&5u64.to_le_bytes());
+        two[14..16].copy_from_slice(&1u16.to_le_bytes()); // AI mode
+        two[32..40].copy_from_slice(&1u64.to_le_bytes()); // active model gen
+        two[64+80..64+112].copy_from_slice(&[3u8;32]);
+        two[212+80..212+112].copy_from_slice(&[4u8;32]);
+        assert!(PlanV2::decode(&two).is_err()); // model mismatch
+        two[212+80..212+112].copy_from_slice(&[3u8;32]);
+        assert!(PlanV2::decode(&two).is_ok());
+    }
     #[test]
     fn sidecar_count_cannot_be_forged_into_a_ready_to_publish_plan() {
         let frame=plan();
