@@ -22,6 +22,7 @@ pub mod process;
 pub mod file;
 pub mod file_service_v4;
 pub mod file_media_v0199;
+pub mod file_index_v0199;
 pub mod memory;
 pub mod network;
 pub mod device;
