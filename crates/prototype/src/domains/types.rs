@@ -154,6 +154,12 @@ pub enum Action {
 }
 
 impl Action {
+    /// Native V0.19.9 local-only authorization gate. Legacy cluster/CoreSet
+    /// variants remain decodable for offline evidence and old media inspection,
+    /// but MUST NOT reach a new native prepare/apply/publish operation.
+    pub const fn permitted_v0199_local(self) -> bool {
+        !matches!(self, Self::ControlSet(_) | Self::OfferCpu(_) | Self::Placement(_))
+    }
     pub const fn domain(self) -> u16 {
         match self {
             Self::CpuWeight(_) | Self::ControlSet(_) => 1,
