@@ -199,6 +199,39 @@ impl SvcV3Bridge<'_,'_>{
         self.gate.register_assisted_one(caller.identity,frozen.bytes,record,disposition,
             frozen.rules,&frozen.actions[0],frozen.context,scope,ledger)
     }
+    /// Existing CONTROL_DECISION_REGISTER v3 496-byte causal fallback
+    /// request. Current task/cap and stable user copy are authenticated
+    /// by the architecture adapter before entering this bridge.
+    pub fn register_rejected_fallback_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied:&[u8],frozen:&FrozenNativePlan<'_>,scope:&AssistedScope<'_>,
+        ledger:&mut EvidenceLedger,
+        verify_hard_rejection:impl FnOnce(&super::advice_envelope_v1::AdviceEnvelopeV1,&FrozenAction<'_>)->Result<(),Error>,
+    )->Result<Registration,Error>{
+        decode_v3(caller.package_abi,0x50,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.decision_endpoint_cap||args[0]!=caller.endpoint_cap
+            ||args[2]!=(DECISION_BYTES+DISPOSITION_BYTES) as u64
+            ||copied.len()!=DECISION_BYTES+DISPOSITION_BYTES||args[3]!=0||args[5]<8
+            ||frozen.sidecars.len()!=1||frozen.actions.len()!=1{return Err(Error::Denied);}
+        let record:&[u8;DECISION_BYTES]=copied[..DECISION_BYTES].try_into().map_err(|_|Error::Invalid)?;
+        let disposition:&[u8;DISPOSITION_BYTES]=copied[DECISION_BYTES..].try_into().map_err(|_|Error::Invalid)?;
+        if record!=&frozen.sidecars[0]{return Err(Error::Denied);}
+        self.gate.register_rejected_fallback_one(caller.identity,frozen.bytes,record,disposition,
+            frozen.rules,&frozen.actions[0],frozen.context,scope,ledger,verify_hard_rejection)
+    }
+    pub fn publish_rejected_fallback_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied_plan:&[u8],copied_sidecars:&[[u8;DECISION_BYTES]],frozen:&FrozenNativePlan<'_>,
+        native_accept:impl FnOnce()->Result<(),Error>,
+    )->Result<Publication,Error>{
+        decode_v3(caller.package_abi,0x41,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.publisher_cap||args[1]!=copied_plan.len() as u64||args[3]!=1
+            ||copied_sidecars.len()!=1||copied_plan!=frozen.bytes
+            ||copied_sidecars!=frozen.sidecars||frozen.actions.len()!=1{return Err(Error::Denied);}
+        self.gate.publish_rejected_fallback_one(caller.identity,copied_plan,&copied_sidecars[0],
+            frozen.rules,&frozen.actions[0],frozen.context,native_accept)
+    }
+
     pub fn publish_assisted_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
         copied_plan:&[u8],copied_sidecars:&[[u8;DECISION_BYTES]],
         frozen:&FrozenNativePlan<'_>,scope:&AssistedScope<'_>,
