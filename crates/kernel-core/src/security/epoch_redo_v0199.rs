@@ -155,6 +155,11 @@ mod tests{
         assert!(matches!(scratch.append(&mut failing,sb,2,7000,1,3,ticket,&image),Err(Error::Unknown)));
         assert_eq!(failing.events[..6],[2,3,4,9,5,9]);assert_eq!(gate.boot_epoch(),None);
         assert!(matches!(scratch.append(&mut failing,sb,2,7000,1,3,ticket,&image),Err(Error::Conflict)));
+        // Separate successful scenario: never retry the unknown transaction
+        // on another device or extent under the original gate.
+        let mut gate=DurableEpochGate::recovered(&raw,slots,|_|Ok(())).unwrap();
+        let ticket=gate.prepare(Change::AllocateBoot,|_|panic!("not a stop")).unwrap();
+        let image=gate.after_image(ticket).unwrap();
         let mut ok=disk(false);
         let proof=scratch.append(&mut ok,sb,2,7000,1,3,ticket,&image).unwrap();
         assert_eq!(ok.events[..6],[2,3,4,9,5,9]);
