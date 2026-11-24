@@ -223,6 +223,19 @@ mod tests {
         );
     }
     #[test]
+    fn overflowing_timestamp_never_extends_advice_lifetime() {
+        let controller = Controller::new([RULE; 15]).unwrap();
+        let mut trusted=scope();
+        trusted.now_ns=u64::MAX-2;
+        let mut candidate=advice();
+        candidate.snapshot_ns=u64::MAX-10;
+        candidate.expires_ns=u64::MAX-1;
+        assert_eq!(
+            controller.review(trusted, Some(candidate)).unwrap().source(),
+            Source::DeterministicBaseline
+        );
+    }
+    #[test]
     fn remote_domain_and_invalid_rule_tables_cannot_be_approved() {
         assert!(matches!(Controller::<16>::new([RULE; 16]), Err(Error::Invalid)));
         assert!(matches!(Controller::new([Rule { baseline: 9, options: &[1] }; 15]), Err(Error::Invalid)));
