@@ -4,6 +4,7 @@
 //! The guest never calls task, store, cluster membership or policy RPC.
 //! Kernel-side capability checks remain independently authoritative.
 
+pub mod abi;
 pub mod broker_surface {
     pub const ENTROPY: u64 = 1;
     pub const TIME: u64 = 2;

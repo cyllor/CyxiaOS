@@ -174,6 +174,6 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 
 - 新增 `user/local-echo` 独立的 Rust `#![no_std]` AArch64 EL0 服务项目。它依赖 `cyxia-net-transport` TLS/Echo 和受保护的本机 Cyxia SVC 共享页，但**不依赖** `cyxia-cluster-transport`、集群任务引擎或成员发现服务。自身只读 broker allowlist 限定为随机数、时钟、状态轮询、TCP 密文读写、关闭与 yield；WRITE 固定采用受限的原生 TLS 密文通路，不允许文件写、远程任务、存储或策略修改操作。
 - 服务入口从外部 provisioned 本机证书、私钥和对端公钥 pin 构造原生 Rustls TLS 1.3；当前只作为被动 Echo 服务端。证书身份需匹配受保护内核共享页，`Admission` 的 32/4/16 信用、握手票据/实际 TLS 会话代际及 `native_tcp::turn` 均在客体中实际运行。本地 TLS 会话异常后进入 fail-closed，**不**以连接断开冒充 DMA 已停止。
-- 为不扩大应用权限，guest 重用了旧内核已有的 `SVC #0x43` 共享页**布局**，但这不是重新激活旧集群 RPC：可调用范围在新 guest broker 及测试中显式限死。真正的最小权限还必须由内核执行上下文的能力/操作白名单验证，不能仅依靠用户态检查。
+- 为不扩大应用权限，guest 使用独立的 `user/local-echo/src/abi.rs` **只读共享页字段视图**与旧内核 `SVC #0x43` 二进制布局兼容；其保留填充不导出旧集群任务或存储类型。新增 `tests/native_shared_layout.rs` 以**仅限测试**的 `cyxia-prototype` 依赖将所有实际访问字段偏移与原受保护 ABI 对账，运行时 guest 不引入集群引擎。真正的最小权限仍需内核执行上下文按凭据/能力实施操作白名单，不能只依靠用户态检查。
 - 构建新增 `cyxia-local-echo` 工作区成员、独立 linker 和外部凭据提供门。CI 运行无客户身份的 broker allowlist 单元测试，并用临时测试证书仅作 `aarch64-unknown-none` 交叉类型检查，不生成部署镜像，也绝不发布测试私钥作为生产证书。
 - **尚未完成**：从旧 `unified-runtime` 内核启动链独立部署新 Echo guest，按本机网络配置关闭集群发现/远程任务分发；为此 guest 提供来自 EL1 的真实端口来源、TCP/VirtIO TX 静默证明及服务重启信用留存。guest 在缺少这些证明时保守停止，不默许重连，因此 G2/G3/G4 原生验收仍是 NOT_RUN。

@@ -9,7 +9,7 @@ use crate::broker;
 use alloc::sync::Arc;
 use core::time::Duration;
 use cyxia_net_transport::{
-    admission::{Admission, Error as AdmissionError},
+    admission::Admission,
     native_tcp::{self, NativeSocket, SocketError},
     tls::{Buffers, Pairing, Session, node_id},
 };

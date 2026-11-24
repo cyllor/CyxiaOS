@@ -196,6 +196,7 @@ name = "cyxia-local-echo"
 version = "0.1.0"
 dependencies = [
  "cyxia-net-transport",
+ "cyxia-prototype",
  "getrandom",
  "rustls",
 ]

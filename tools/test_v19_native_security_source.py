@@ -225,6 +225,14 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("gate.begin_restart();", guest)
         self.assertIn("fn terminal_tx_quiescent(&self)->bool{false}", guest)
         self.assertIn("CYXIA_LOCAL_ECHO_IDENTITY", build)
+        abi=source(ROOT / "user/local-echo/src/abi.rs")
+        main=source(ROOT / "user/local-echo/src/main.rs")
+        self.assertIn("pub struct DomainSourceView", abi)
+        self.assertIn("offset_of!(Shared,payload)==2696",abi)
+        self.assertNotIn("cyxia_prototype",abi)
+        self.assertNotIn("prototype-cluster/src/abi.rs",main)
+        fixture=source(ROOT / "user/local-echo/tests/native_shared_layout.rs")
+        self.assertIn("native_local_echo_shared_page_matches_kernel_broker_offsets",fixture)
         self.assertIn("cargo check --release --locked --offline -p cyxia-local-echo --features guest", source(ROOT / ".github/workflows/v19-advisory-smoke.yml"))
 
     def test_ai_proposals_are_not_capabilities(self):

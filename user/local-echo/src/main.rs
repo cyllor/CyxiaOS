@@ -4,11 +4,9 @@ extern crate alloc;
 mod arena;
 mod broker;
 mod runtime;
-// These are kernel-owned legacy shared-page ABI layout definitions and the
-// common Cyxia native call instruction, NOT imports of the cluster engine.
-// A standalone V0.19 service ABI remains a future versioned migration gate.
-#[path = "../../prototype-cluster/src/abi.rs"]
-mod abi;
+// The V0.19 local read-only ABI view is layout-compatible with the native
+// broker, but neither imports the cluster task engine nor decodes its RPCs.
+use cyxia_local_echo::abi;
 #[path = "../../shared/calls.rs"]
 mod calls;
 
