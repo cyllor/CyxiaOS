@@ -9,6 +9,8 @@ pub struct Token {
     pub slot: u8,
     pub generation: u64,
     pub submit_id: u64,
+    pub device_generation: u64,
+    pub queue_generation: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State { Private, Published, Unknown }
@@ -93,6 +95,8 @@ impl<const N: usize> Queue<N> {
         let token = Token {
             slot: u8::try_from(at).map_err(|_| Error::Capacity)?,
             generation: next, submit_id,
+            device_generation: self.device_generation,
+            queue_generation: self.queue_generation,
         };
         self.generations[at] = next;
         self.slots[at] = Some(Lease {
@@ -101,6 +105,14 @@ impl<const N: usize> Queue<N> {
         Ok(token)
     }
     fn lease(&mut self, token: Token) -> Result<&mut Lease, Error> {
+        // A newly constructed queue can begin its slot counters at one.
+        // Bind every transition to the registered device/queue lifecycle,
+        // not just a slot and local submit ID. The native registry must also
+        // select the correct physical queue before invoking this component.
+        if token.device_generation != self.device_generation
+            || token.queue_generation != self.queue_generation {
+            return Err(Error::Stale);
+        }
         let lease = self.slots.get_mut(token.slot as usize).and_then(Option::as_mut)
             .ok_or(Error::Stale)?;
         if lease.token != token { return Err(Error::Stale); }
@@ -240,6 +252,25 @@ mod tests {
         assert_eq!(q.complete(Token { generation: 2, ..t },CompletionProof::from_driver(Token { generation: 2, ..t })),Err(Error::Stale));
         q.complete(t,CompletionProof::from_driver(t)).unwrap();
         assert_eq!(q.complete(t,CompletionProof::from_driver(t)),Err(Error::Stale));
+    }
+    #[test] fn v0199_recreated_queue_rejects_old_lifecycle_completion() {
+        let mut old=Queue::<1>::new(1,1);
+        let old_token=old.prepare(7,1,1,true).unwrap();
+        old.publish(old_token).unwrap();
+        old.timeout(old_token).unwrap();
+        // The registry obtains reliable reset proof before reconstruction.
+        old.reset(ReliableReset::from_driver(1,1,true,true,true)).unwrap();
+        let mut fresh=Queue::<1>::new(2,2);
+        let new_token=fresh.prepare(7,1,1,true).unwrap();
+        fresh.publish(new_token).unwrap();
+        assert_eq!(old_token.generation,new_token.generation);
+        assert_eq!(old_token.submit_id,new_token.submit_id);
+        assert_eq!(fresh.complete(old_token,CompletionProof::from_driver(old_token)),Err(Error::Stale));
+        assert_eq!(fresh.complete(new_token,CompletionProof::from_driver(old_token)),Err(Error::Unauthorized));
+        assert_eq!(fresh.state(new_token),Ok(State::Published));
+        assert!(fresh.has_inflight());
+        fresh.complete(new_token,CompletionProof::from_driver(new_token)).unwrap();
+        assert!(!fresh.has_inflight());
     }
     #[test] fn sec_d07_irq_must_target_healthy_business_only() {
         assert_eq!(validate_irq_route(IrqKind::Timer,1,1,0b10,0,0,true),Err(Error::Unauthorized));
