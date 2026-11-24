@@ -10,6 +10,7 @@ pub const HEADER:usize=256;
 pub const SIGNATURE:usize=64;
 pub const MAX_PAYLOAD:usize=65536;
 pub const SIGNATURE_LABEL:&[u8]=b"CYX/OFFLINE/v1";
+pub const MAX_SIGNED_BYTES:usize=SIGNATURE_LABEL.len()+HEADER+MAX_PAYLOAD;
 fn u16at(b:&[u8],i:usize)->u16{u16::from_le_bytes(b[i..i+2].try_into().unwrap())}
 fn u32at(b:&[u8],i:usize)->u32{u32::from_le_bytes(b[i..i+4].try_into().unwrap())}
 fn u64at(b:&[u8],i:usize)->u64{u64::from_le_bytes(b[i..i+8].try_into().unwrap())}
@@ -36,11 +37,30 @@ pub struct VerifiedOfflineConfig<'a>{
     header:ConfigHeader,principals:[Principal;16],digest:[u8;32],wire:&'a[u8],
 }
 impl<'a> VerifiedOfflineConfig<'a>{
-    /// The caller supplies immutable private copied bytes and a real
-    /// Ed25519 verifier. Signature is over label || exact header || payload,
-    /// NOT a hash standing in for this message. A backend error denies boot.
-    /// verify_payload must validate all *current frozen* sub-schema bytes.
+    /// Mandatory real strict Ed25519 verification; no production callback
+    /// may manufacture signature success. Caller provides an exclusive
+    /// accounted control-pool scratch span, not a ~64KiB kernel stack array.
+    /// The signed message is label || header || payload, NOT its SHA256.
     pub fn verify(
+        wire:&'a[u8],locked_public_key:&[u8;32],catalog:CatalogBindings,
+        scratch:&mut[u8],
+        verify_payload:impl FnOnce(&ConfigHeader,&[Principal;16],&[u8])->Result<(),Error>,
+    )->Result<Self,Error>{
+        Self::verify_with(wire,locked_public_key,catalog,|key,label,message,sig|{
+            let used=label.len().checked_add(message.len()).ok_or(Error::Invalid)?;
+            let work=scratch.get_mut(..used).ok_or(Error::Capacity)?;
+            work[..label.len()].copy_from_slice(label);
+            work[label.len()..].copy_from_slice(message);
+            let result=ed25519_dalek::VerifyingKey::from_bytes(key)
+                .and_then(|k|k.verify_strict(work,&ed25519_dalek::Signature::from_bytes(sig)))
+                .map_err(|_|Error::Unauthorized);
+            work.fill(0);
+            result
+        },verify_payload)
+    }
+    // Only this module can substitute the verifier (unit tests exercise
+    // transport structure). All external callers use the actual algorithm.
+    fn verify_with(
         wire:&'a[u8],locked_public_key:&[u8;32],catalog:CatalogBindings,
         verify_ed25519:impl FnOnce(&[u8;32],&[u8],&[u8],&[u8;64])->Result<(),Error>,
         verify_payload:impl FnOnce(&ConfigHeader,&[Principal;16],&[u8])->Result<(),Error>,
@@ -129,7 +149,7 @@ mod tests{
     // A transport test double, explicitly not an Ed25519 KAT or signed
     // production fixture. Assert the complete signed message is passed.
     fn parsed<'a>(b:&'a[u8],c:CatalogBindings)->Result<VerifiedOfflineConfig<'a>,Error>{
-        VerifiedOfflineConfig::verify(b,&[1;32],c,|key,label,message,sig|{
+        VerifiedOfflineConfig::verify_with(b,&[1;32],c,|key,label,message,sig|{
             assert_eq!(key,&[1;32]);assert_eq!(label,b"CYX/OFFLINE/v1");
             assert_eq!(message,&b[..513]);
             if sig==&[9;64]{Ok(())}else{Err(Error::Unauthorized)}
@@ -151,12 +171,37 @@ mod tests{
         state.offline_config_generation=6;assert_eq!(v.check_committed(&state),Err(Error::Busy));
     }
     #[test]
+    fn real_ed25519_signature_binds_exact_config_and_domain_label(){
+        use ed25519_dalek::{SigningKey,Signer};
+        let (mut b,c)=fixture();
+        // Host regression key only. Never install this seed in a boot
+        // catalog or treat this artificial payload as frozen schemas.
+        let signer=SigningKey::from_bytes(&[0x37;32]);
+        let key=signer.verifying_key().to_bytes();
+        let mut message=[0u8;SIGNATURE_LABEL.len()+513];
+        message[..SIGNATURE_LABEL.len()].copy_from_slice(SIGNATURE_LABEL);
+        message[SIGNATURE_LABEL.len()..].copy_from_slice(&b[..513]);
+        b[513..].copy_from_slice(&signer.sign(&message).to_bytes());
+        let mut work=[0u8;SIGNATURE_LABEL.len()+513];
+        assert!(VerifiedOfflineConfig::verify(&b,&key,c,&mut work,|_,_,p|{
+            if p==[42]{Ok(())}else{Err(Error::Invalid)}
+        }).is_ok());
+        assert!(work.iter().all(|&v|v==0));
+        let mut wrong=b;wrong[200]=1;
+        assert!(matches!(VerifiedOfflineConfig::verify(&wrong,&key,c,&mut work,|_,_,_|panic!()),Err(Error::Unauthorized)));
+        let mut wrong=b;wrong[576]^=1;
+        assert!(matches!(VerifiedOfflineConfig::verify(&wrong,&key,c,&mut work,|_,_,_|panic!()),Err(Error::Unauthorized)));
+        let other=SigningKey::from_bytes(&[0x38;32]).verifying_key().to_bytes();
+        assert!(matches!(VerifiedOfflineConfig::verify(&b,&other,c,&mut work,|_,_,_|panic!()),Err(Error::Unauthorized)));
+        assert!(matches!(VerifiedOfflineConfig::verify(&b,&key,c,&mut work[..1],|_,_,_|panic!()),Err(Error::Capacity)));
+    }
+    #[test]
     fn invalid_signature_catalog_reserved_and_payload_deny_admission(){
         let (b,c)=fixture();
         let mut bad=b;bad[513]^=1;assert!(matches!(parsed(&bad,c),Err(Error::Unauthorized)));
         let mut bad=b;bad[512]^=1;assert!(matches!(parsed(&bad,c),Err(Error::Conflict)));
         let mut bad=b;bad[202]=1;assert!(matches!(parsed(&bad,c),Err(Error::Invalid)));
         assert!(matches!(parsed(&b,CatalogBindings{key_generation:6,..c}),Err(Error::Conflict)));
-        assert!(matches!(VerifiedOfflineConfig::verify(&b,&[1;32],c,|_,_,_,_|Ok(()),|_,_,_|Err(Error::Invalid)),Err(Error::Invalid)));
+        assert!(matches!(VerifiedOfflineConfig::verify_with(&b,&[1;32],c,|_,_,_,_|Ok(()),|_,_,_|Err(Error::Invalid)),Err(Error::Invalid)));
     }
 }
