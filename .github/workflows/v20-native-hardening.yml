@@ -64,6 +64,8 @@ jobs:
           mkdir -p artifacts/v020-security
           cargo test --locked --offline -p cyxia-kernel-core 2>&1 | tee artifacts/v020-security/kernel-core.log
           cargo test --locked --offline -p cyxia-prototype --test control_extra_budget 2>&1 | tee artifacts/v020-security/control-extra-budget.log
+          # Explicit default-members gate: local network/Echo, no default cluster transport.
+          cargo test --locked --offline 2>&1 | tee artifacts/v020-security/workspace-default.log
           python3 -B -m unittest tools.test_v19_native_security_source -v 2>&1 | tee artifacts/v020-security/security-source-guard.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
