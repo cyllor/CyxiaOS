@@ -85,8 +85,23 @@ pub struct FrozenAction<'a> {
     pub target: Identity,
     pub candidate_set_hash: [u8;32],
     pub static_ordinals: &'a [u16],
+    pub candidate_payloads: &'a [&'a [u8]],
     pub raw_fields: [Option<u64>;7],
     pub action_payload: &'a [u8],
+}
+impl FrozenAction<'_>{
+    fn verify_selected(&self,index:u16)->Result<(),Error>{
+        if self.static_ordinals.len()!=self.candidate_payloads.len()
+            ||self.static_ordinals.is_empty()||self.static_ordinals.len()>32{return Err(Error::Denied);}
+        for (i,payload) in self.candidate_payloads.iter().enumerate(){
+            super::action_schema_v2::ActionV2::decode(self.domain_id,1,payload)?;
+            if self.candidate_payloads[..i].contains(payload){return Err(Error::Denied);}
+        }
+        if self.candidate_payloads.get(usize::from(index)).copied()!=Some(self.action_payload){
+            return Err(Error::Denied);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingStatus { Frozen, AdapterAccepted, AdapterUnknown }
@@ -369,6 +384,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         for (index,(raw,local)) in records.iter().zip(actions).enumerate() {
             let rec=DecisionRecordV3::decode(raw)?;
             let act=plan.action(index)?;
+            local.verify_selected(rec.selected_index)?;
             if super::action_schema_v2::ActionV2::decode(act.domain_id,act.action_kind,act.action_payload)?.requires_trial(){
                 return Err(Error::Denied);
             }
@@ -461,6 +477,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             ||plan.header.snapshot_seq!=context.snapshot_seq{return Err(Error::Stale);}
         plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
         let rec=DecisionRecordV3::decode(record)?;let act=plan.action(0)?;
+        local.verify_selected(rec.selected_index)?;
         let end=context.sampled_ns.checked_add(100_000_000).ok_or(Error::Clock)?;
         let installed=context.sampled_ns.checked_add(10_000_000_000).ok_or(Error::Clock)?;
         if rec.source!=DecisionSource::AuthorizedTrial||rec.boot_epoch!=context.boot_epoch
@@ -604,6 +621,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
         let rec=DecisionRecordV3::decode(record)?;
         let act=plan.action(0)?;
+        local.verify_selected(rec.selected_index)?;
         let end=context.sampled_ns.checked_add(100_000_000).ok_or(Error::Clock)?;
         let installed=context.sampled_ns.checked_add(10_000_000_000).ok_or(Error::Clock)?;
         if matches!(local.domain_id,6|11|12|14)||rec.source!=DecisionSource::AiAssisted
@@ -1126,8 +1144,19 @@ mod tests {
         [FrozenAction {
             domain_id:1, target:Identity{id:17,generation:1},
             candidate_set_hash:[1;32],static_ordinals:ordinals,
+            candidate_payloads:&[&[2,0],&[4,0]],
             raw_fields:[None;7], action_payload:payload,
         }]
+    }
+    #[test]
+    fn selected_candidate_index_must_bind_exact_payload_even_if_value_is_legal(){
+        let mut a=frozen(&[2,4],&[2,0]);
+        assert_eq!(a[0].verify_selected(0),Ok(()));
+        assert_eq!(a[0].verify_selected(1),Err(Error::Denied));
+        a[0].action_payload=&[4,0];assert_eq!(a[0].verify_selected(0),Err(Error::Denied));
+        assert_eq!(a[0].verify_selected(1),Ok(()));
+        a[0].candidate_payloads=&[&[4,0],&[4,0]];
+        assert_eq!(a[0].verify_selected(0),Err(Error::Denied));
     }
     #[test]
     fn trial_registration_publication_and_cost_custody_are_independent(){
