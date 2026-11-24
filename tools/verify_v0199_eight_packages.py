@@ -38,6 +38,7 @@ def relative_count(elf:bytes,sidecar:bytes)->int:
     return len(relas)
 
 class Bringup:
+    post_uart_seal=True
     completion=b'V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n'
     def __init__(self, packages:Path, qemu_sha256:str, patch_sha256:str):
         self.expected={role:hashlib.sha256((packages/f'v0199-role-{role}.elf').read_bytes()).digest()
@@ -71,7 +72,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,7,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,8,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -176,8 +177,17 @@ class Bringup:
         require(classes[4]==recovery_cpu_ns,'recovery ledger disagrees with actual reloads')
         require(0<upper<=70_000_000 and start_ns<end_ns,
                 'invalid aligned-window upper bound or sampled interval')
-        require(rows('V0199_BOOTSTRAP_ACCOUNTING')==[(elapsed,accounted,upper)],
-                'CPU0 accounting UART and stopped memory disagree')
+        loads=rows('V0199_INITIAL_LOAD')
+        require(len(loads)==8 and [r[0] for r in loads]==list(ROLES)
+                and all(0<cost<=quota<=2_000_000 for _,cost,quota in loads)
+                and tuple(r[1] for r in loads)==words[32:40],
+                'initial role loading not fully prepaid/measured')
+        prefix,prefix_accounted,prefix_upper=words[40:43]
+        require(0<prefix==prefix_accounted<elapsed and 0<prefix_upper<=upper
+                and sum(words[32:40])<=classes[3],
+                'initial loading/final UART not covered by ledger')
+        require(rows('V0199_BOOTSTRAP_ACCOUNTING')==[(prefix,prefix_accounted,prefix_upper)],
+                'CPU0 accounting prefix UART and stopped memory disagree')
         # Independent integer reference for the two test-only seed inputs:
         # operations scores 48 and 272 (selected 1), security score 342
         # (severity 2). Both original and replacement EL0 must produce them.
@@ -199,6 +209,7 @@ class Bringup:
                     sampled_cpu0_ns=elapsed,accounted_cpu0_ns=accounted,
                     control_window_upper_bound_ns=upper,coordination_gap_crossings=crossings,
                     class_cpu_ns=classes,accounting_interval_ns=[start_ns,end_ns],
+                    initial_role_load_cpu_ns=list(words[32:40]),final_uart_tail_cpu_ns=elapsed-prefix,
                     exact_per_window_split=False,complete_production_accounting=False,
                     durable_role_restarts=False,
                     roles=details,production_g0=False,real_services_tested=False)
