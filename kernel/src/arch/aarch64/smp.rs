@@ -29,7 +29,7 @@ pub(crate) mod prototype_runtime;
 #[cfg(feature = "v0199-cpu0-role-selftest")]
 #[path = "v0199_role_selftest.rs"]
 mod v0199_role_selftest;
-#[cfg(feature = "v0199-control-bringup")]
+#[cfg(any(feature = "v0199-control-bringup",feature = "v0199-epoch-disk-selftest"))]
 #[path = "v0199_control_bringup.rs"]
 mod v0199_control_bringup;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
