@@ -155,6 +155,66 @@ impl<const N:usize> DirectionalEndpoint<N>{
     }
     pub fn drained(&self)->bool{self.closed&&self.reservation.is_none()&&self.len==0}
 }
+/// Wire adapter for native SVC64 0x30/0x31. The architecture caller
+/// passes actual saved registers, stable copied input or fully preflighted
+/// output, and the exact registered endpoint. Check the real cap table
+/// before consuming a queue slot or a receive completion credit.
+pub mod svc {
+    use super::*;
+    use crate::security::{cap_record_v3::{CapRecordV3,Label,StaticControlCaps},
+        syscall::{Syscall},syscall_v3::{decode_aarch64_svc_v3,ValidatedCall}};
+    #[derive(Clone,Copy)]
+    pub struct Caller{pub boot:u64,pub actor:Identity,pub cpu:usize,pub abi:u16}
+    fn authorize<const M:usize>(caps:&StaticControlCaps<M>,caller:Caller,cap:u64,label:Label,
+        ep:Endpoint,verify_live:impl FnOnce(&CapRecordV3)->Result<(),crate::security::Error>)->Result<(),Error>{
+        caps.lookup(caller.boot,caller.actor,caller.cpu,cap,label,Identity{id:ep.id,generation:ep.generation},verify_live)
+            .map(|_|()).map_err(|e|match e{crate::security::Error::Stale=>Error::Stale,_=>Error::Auth})
+    }
+    fn call(c:Caller,esr:u64,regs:&[u64;31],op:Syscall)->Result<ValidatedCall,Error>{
+        let v=decode_aarch64_svc_v3(c.abi,esr,regs).map_err(|_|Error::Format)?;
+        if v.operation!=op{return Err(Error::Format);}Ok(v)
+    }
+    pub fn send<const N:usize,const M:usize>(q:&mut DirectionalEndpoint<N>,caps:&StaticControlCaps<M>,
+        caller:Caller,esr:u64,regs:&[u64;31],label:Label,stable:&[u8],
+        verify_live:impl FnOnce(&CapRecordV3)->Result<(),crate::security::Error>,
+        now:u64,verify_payload:impl FnOnce(&[u8])->Result<(),Error>)->Result<(),Error>{
+        if !matches!(label,Label::AdviceSend|Label::FindingSend|Label::DecisionSend){return Err(Error::Auth);}
+        let a=call(caller,esr,regs,Syscall::IpcSend)?.args;
+        let ep=q.endpoint();
+        authorize(caps,caller,a[0],label,ep,verify_live)?;
+        if a[2]!=stable.len() as u64{return Err(Error::Format);}
+        if a[5]&1==0&&a[4]<=now{return Err(Error::Timeout);}
+        // Advice/Finding/decision source and sub-schema authorization
+        // remain mandatory in their receiving service-specific owner.
+        verify_payload(stable)?;
+        q.send(caller.actor,ep.generation,a[3],stable)
+    }
+    /// No pointer dereference or user copy under the queue lock. The
+    /// returned ticket is copied outside it, then finish_copy is called.
+    pub fn receive<const N:usize,const M:usize>(q:&mut DirectionalEndpoint<N>,caps:&StaticControlCaps<M>,
+        caller:Caller,esr:u64,regs:&[u64;31],label:Label,now:u64,
+        verify_live:impl FnOnce(&CapRecordV3)->Result<(),crate::security::Error>,
+        preflight_output:impl FnOnce(u64,u64)->Result<(),Error>,
+        reserve_credit:impl FnOnce()->Result<(),Error>)->Result<ReceiveTicket,Error>{
+        if !matches!(label,Label::AdviceReceive|Label::FindingReceive|Label::DecisionReceive){return Err(Error::Auth);}
+        let a=call(caller,esr,regs,Syscall::IpcRecv)?.args;
+        if a[4]&2!=0{return Err(Error::Format);}
+        let ep=q.endpoint();authorize(caps,caller,a[0],label,ep,verify_live)?;
+        preflight_output(a[1],a[2])?;
+        let cap=usize::try_from(a[2]).map_err(|_|Error::Format)?;
+        q.reserve_receive(caller.actor,ep.generation,a[5],cap,a[4]&1!=0,a[3],now,reserve_credit)
+    }
+    pub fn ack<const N:usize,const M:usize>(q:&mut DirectionalEndpoint<N>,caps:&StaticControlCaps<M>,
+        caller:Caller,esr:u64,regs:&[u64;31],label:Label,
+        verify_live:impl FnOnce(&CapRecordV3)->Result<(),crate::security::Error>,
+        release_credit:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if !matches!(label,Label::AdviceReceive|Label::FindingReceive|Label::DecisionReceive){return Err(Error::Auth);}
+        let a=call(caller,esr,regs,Syscall::IpcRecv)?.args;
+        if a[4]!=2{return Err(Error::Format);}
+        let ep=q.endpoint();authorize(caps,caller,a[0],label,ep,verify_live)?;
+        q.ack(caller.actor,ep.generation,a[5],release_credit)
+    }
+}
 #[cfg(test)]
 mod tests{
     use super::*;
