@@ -6,6 +6,9 @@
 use super::{Error,Identity,role_manifest_v0199::{NativeRoleManifest,Role,ROLE_COUNT,CONTROL_CPU}};
 pub const WINDOW_NS:u64=100_000_000;
 pub const LIMIT_NS:u64=70_000_000;
+// 6ms of the 8ms coordination class belongs to model manager/supervisor.
+// EL1 coordination and dispatch overhead must not borrow those role slots.
+pub const KERNEL_COORDINATION_LIMIT_NS:u64=2_000_000;
 pub const CLASS_LIMITS:[u64;6]=[30_000_000,8_000_000,7_500_000,8_000_000,8_000_000,8_500_000];
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Class { Operations, Security, Decision, Coordination, Recovery, Optional }
@@ -38,6 +41,7 @@ pub struct Cpu0BudgetLedger {
     active:Option<Turn>,
     spent:[u64;6],
     role_spent:[u64;ROLE_COUNT],
+    kernel_coordination_spent:u64,
     operations_seen:u16,
     security_count:u8,
     decision_spent:[u64;15],
@@ -46,12 +50,16 @@ pub struct Cpu0BudgetLedger {
 impl Default for Cpu0BudgetLedger {fn default()->Self{Self::new()}}
 impl Cpu0BudgetLedger {
     pub const fn new()->Self{Self{
-        window:None,last_ns:0,serial:0,active:None,spent:[0;6],role_spent:[0;ROLE_COUNT],
+        window:None,last_ns:0,serial:0,active:None,spent:[0;6],role_spent:[0;ROLE_COUNT],kernel_coordination_spent:0,
         operations_seen:0,security_count:0,decision_spent:[0;15],
         ordinary_closed:false,
     }}
     pub fn spent(&self,class:Class)->u64{self.spent[class.index()]}
     pub fn ordinary_closed(&self)->bool{self.ordinary_closed}
+    pub fn kernel_coordination_spent(&self)->u64{self.kernel_coordination_spent}
+    pub fn total_spent(&self)->Result<u64,Error>{
+        self.spent.iter().try_fold(0u64,|sum,&v|sum.checked_add(v)).ok_or(Error::Exhausted)
+    }
     fn time(&mut self,now:u64)->Result<(),Error>{
         if now<self.last_ns{return Err(Error::Clock);}
         self.last_ns=now;Ok(())
@@ -61,7 +69,7 @@ impl Cpu0BudgetLedger {
         let end=w.checked_add(1).and_then(|x|x.checked_mul(WINDOW_NS)).ok_or(Error::Clock)?;
         if self.window!=Some(w){
             if self.active.is_some(){return Err(Error::Busy);}
-            self.window=Some(w);self.spent=[0;6];self.role_spent=[0;ROLE_COUNT];self.operations_seen=0;
+            self.window=Some(w);self.spent=[0;6];self.role_spent=[0;ROLE_COUNT];self.kernel_coordination_spent=0;self.operations_seen=0;
             self.security_count=0;self.decision_spent=[0;15];
             // A new time window does not clear an observed execution fault.
         }
@@ -121,6 +129,10 @@ impl Cpu0BudgetLedger {
         if let Some((index,quota))=role{
             if requested>quota.saturating_sub(self.role_spent[index]){return Err(Error::Exhausted);}
         }
+        if actor.is_none() && class==Class::Coordination
+            && requested>KERNEL_COORDINATION_LIMIT_NS.saturating_sub(self.kernel_coordination_spent){
+            return Err(Error::Exhausted);
+        }
         let mut bit=0u16;
         match class {
             Class::Operations=>{
@@ -168,13 +180,19 @@ impl Cpu0BudgetLedger {
             Some(index)=>Some((index,self.role_spent[index].checked_add(actual).ok_or(Error::Exhausted)?)),
             None=>None,
         };
+        let kernel_coordination=turn.class==Class::Coordination&&turn.role_index.is_none();
+        let kernel_total=if kernel_coordination{
+            self.kernel_coordination_spent.checked_add(actual).ok_or(Error::Exhausted)?
+        }else{self.kernel_coordination_spent};
         if crossed{
             self.window=Some(now/WINDOW_NS);self.spent=[0;6];self.role_spent=[0;ROLE_COUNT];
+            self.kernel_coordination_spent=if kernel_coordination{actual}else{0};
             self.operations_seen=0;self.security_count=0;self.decision_spent=[0;15];
             self.spent[idx]=actual;
             if let Some((index,_))=role_total{self.role_spent[index]=actual;}
             if turn.class==Class::Decision{self.decision_spent[usize::from(turn.domain-1)]=actual;}
         }else{
+            self.kernel_coordination_spent=kernel_total;
             self.spent[idx]=total;
             if let Some((index,v))=role_total{self.role_spent[index]=v;}
             if let Some(v)=decision{self.decision_spent[usize::from(turn.domain-1)]=v;}
@@ -232,6 +250,26 @@ mod tests{
             q.settle(0,t,2_000_000,22_000_000+i*2_000_000).unwrap();
         }
         assert_eq!(q.reserve_role(&m,sec,0,Class::Security,12,1,28_000_000),Err(Error::Exhausted));
+    }
+    #[test]
+    fn kernel_coordination_is_prepaid_and_cannot_borrow_role_or_recovery_credit(){
+        let m=manifest();let mut q=Cpu0BudgetLedger::new();
+        assert_eq!(q.reserve_kernel(0,Class::Coordination,2_000_001,0),Err(Error::Exhausted));
+        let a=q.reserve_kernel(0,Class::Coordination,2_000_000,0).unwrap();
+        q.settle(0,a,2_000_000,2_000_000).unwrap();
+        assert_eq!(q.kernel_coordination_spent(),2_000_000);
+        assert_eq!(q.reserve_kernel(0,Class::Coordination,1,2_000_000),Err(Error::Exhausted));
+        for i in [5,7]{
+            let t=q.reserve_role(&m,m.members[i].actor,0,Class::Coordination,0,3_000_000,3_000_000*i as u64).unwrap();
+            q.settle(0,t,3_000_000,3_000_000*(i as u64+1)).unwrap();
+        }
+        assert_eq!(q.spent(Class::Coordination),8_000_000);
+        let r=q.reserve_kernel(0,Class::Recovery,8_000_000,30_000_000).unwrap();
+        q.settle(0,r,8_000_000,38_000_000).unwrap();
+        assert_eq!(q.total_spent(),Ok(16_000_000));
+        let a=q.reserve_kernel(0,Class::Coordination,2_000_000,WINDOW_NS).unwrap();
+        q.settle(0,a,1_000_000,WINDOW_NS+1_000_000).unwrap();
+        assert_eq!(q.kernel_coordination_spent(),1_000_000);
     }
     #[test]
     fn cpu_quota_and_wall_deadline_are_independently_enforced(){
