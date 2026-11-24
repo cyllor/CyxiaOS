@@ -718,6 +718,42 @@ mod tests {
     }
 
     #[test]
+    fn bounded_terminal_summary_history_retains_only_latest_256_distinct_plan_keys() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        for seq in 1u64..=257 {
+            let mut plan=plan_bytes();
+            plan[16..24].copy_from_slice(&seq.to_le_bytes());
+            let decision_seq=seq+3;
+            plan[64+24..64+32].copy_from_slice(&decision_seq.to_le_bytes());
+            let mut record=decision(&plan,&bytes);
+            record[24..32].copy_from_slice(&decision_seq.to_le_bytes());
+            record[32..40].copy_from_slice(&seq.to_le_bytes());
+            gate.register_rule_only(
+                CONTROLLER,&plan,&[record],&catalog,&frozen,ctx
+            ).unwrap();
+            gate.publish_once(
+                PUBLISHER,&plan,&[record],&catalog,&frozen,ctx,||Ok(())
+            ).unwrap();
+            let mut proof=terminal_proof(&plan);
+            proof.plan_seq=seq;
+            gate.settle_with_native_proof(
+                SUPERVISOR,proof, |_|Ok(())
+            ).unwrap();
+        }
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        assert!(gate.terminal_summary(SUPERVISOR,2).unwrap().is_some());
+        assert!(gate.terminal_summary(SUPERVISOR,257).unwrap().is_some());
+        assert_eq!(gate.terminal_summary(PUBLISHER,258),Ok(None));
+        assert_eq!(gate.last_plan_seq,257);
+        assert_eq!(gate.last_decision_seq,260);
+    }
+    #[test]
     fn trial_and_advice_without_disposition_or_permit_are_not_authorized() {
         let rules=profile_bytes();
         let catalog=Profile::parse(&rules).unwrap();
