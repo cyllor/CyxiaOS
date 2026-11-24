@@ -204,6 +204,51 @@ impl<'a> PieImage<'a> {
     /// Validate all independently signed RELATIVE relocation sidecars before
     /// the caller modifies unpublished RW mappings. Relocations to RX, BSS
     /// values outside the sandbox or duplicate offsets fail as a whole.
+    /// Stage the verified static PIE into a private, *unpublished* kernel
+    /// buffer. All bounds, hashes and relocation permissions are checked
+    /// before modifying the destination. Entire backing is scrubbed first,
+    /// so an incomplete ELF cannot expose a previous process's bytes.
+    ///
+    /// This is not a page-table publish: EL1 must separately grant mapped
+    /// ownership, apply final RX/RO/RW-XN permissions, I/D cache sync and
+    /// rollback all staging on any failure before making a task RUNNABLE.
+    pub fn stage_private_image(
+        &self,
+        staging:&mut [u8],
+        random_base:u64,
+        el0_start:u64,
+        el0_end:u64,
+        relocations:&[RelativeRelocation],
+    )->Result<(),Error>{
+        if staging.is_empty() || staging.len()>MAX_IMAGE_BYTES {
+            return Err(Error::Invalid);
+        }
+        self.validate_relative_sidecar(relocations,random_base,el0_start,el0_end)?;
+        // Fail atomically on undersized private staging before zeroing it.
+        for seg in self.loads[..self.load_count].iter().flatten() {
+            let at=usize::try_from(seg.virtual_address).map_err(|_|Error::Invalid)?;
+            let bytes=usize::try_from(seg.memory_bytes).map_err(|_|Error::Invalid)?;
+            if at.checked_add(bytes).is_none_or(|end|end>staging.len()) {
+                return Err(Error::Invalid);
+            }
+        }
+        staging.fill(0);
+        for seg in self.loads[..self.load_count].iter().flatten() {
+            let off=usize::try_from(seg.file_offset).map_err(|_|Error::Invalid)?;
+            let n=usize::try_from(seg.file_bytes).map_err(|_|Error::Invalid)?;
+            let at=usize::try_from(seg.virtual_address).map_err(|_|Error::Invalid)?;
+            staging[at..at+n].copy_from_slice(&self.verified_bytes[off..off+n]);
+            // The remaining p_memsz-p_filesz bytes are already zero.
+        }
+        for relocation in relocations {
+            let at=usize::try_from(relocation.offset).map_err(|_|Error::Invalid)?;
+            let value=(random_base as i128)+(relocation.addend as i128);
+            let relocated=u64::try_from(value).map_err(|_|Error::Invalid)?;
+            staging[at..at+8].copy_from_slice(&relocated.to_le_bytes());
+        }
+        Ok(())
+    }
+
     pub fn validate_relative_sidecar(
         &self,
         entries:&[RelativeRelocation],
@@ -312,6 +357,37 @@ mod tests {
             &[reloc[0],reloc[0]],0x4000_0000,0x4000_0000,0x5000_0000
         ).is_err());
     }
+    #[test]
+    fn private_staging_copies_rx_clears_bss_and_applies_only_verified_rw_relocations(){
+        let b=elf();
+        let image=parse(&b).unwrap();
+        let reloc=[RelativeRelocation{
+            offset:0x2008,info:R_AARCH64_RELATIVE,addend:0x1000,
+        }];
+        let mut out=vec![0xaau8;0x4000];
+        image.stage_private_image(
+            &mut out,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
+        ).unwrap();
+        assert_eq!(&out[0x1000..0x1004],&[0x1f,0x20,0x03,0xd5]);
+        assert!(out[0x1004..0x2000].iter().all(|b|*b==0));
+        assert_eq!(
+            u64::from_le_bytes(out[0x2008..0x2010].try_into().unwrap()),
+            0x4000_1000
+        );
+        assert!(out[0..0x1000].iter().all(|b|*b==0));
+        let mut short=vec![0xaau8;0x2100];
+        assert!(image.stage_private_image(
+            &mut short,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
+        ).is_err());
+        assert!(short.iter().all(|b|*b==0xaa)); // validation precedes writes
+        let mut bad=reloc;bad[0].offset=0x1000;
+        let mut previous=vec![0x55u8;0x4000];
+        assert!(image.stage_private_image(
+            &mut previous,0x4000_0000,0x4000_0000,0x5000_0000,&bad
+        ).is_err());
+        assert!(previous.iter().all(|b|*b==0x55));
+    }
+
     #[test]
     fn legacy_exec_wrong_machine_dynamic_loader_and_wx_rejected(){
         let mut b=elf();
