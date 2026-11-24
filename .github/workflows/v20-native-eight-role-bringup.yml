@@ -54,7 +54,7 @@ jobs:
           catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
           test "$(printf '%s\n' "$catalog" | wc -l)" = 1
           source_dir=$(dirname "$catalog")
-          cp "$source_dir"/v0199-role-*.elf "$catalog" artifacts/eight-native/packages/
+          cp "$source_dir"/v0199-role-*.elf "$source_dir"/v0199-role-*.relative.bin "$catalog" artifacts/eight-native/packages/
           (cd artifacts/eight-native; sha256sum kernel.elf packages/* > image.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
