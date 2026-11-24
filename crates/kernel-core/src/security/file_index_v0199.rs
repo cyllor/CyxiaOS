@@ -334,6 +334,34 @@ mod tests {
         b
     }
     #[test]
+    fn snapshot_restore_unknown_keeps_write_gate_closed_and_old_epoch_fenced(){
+        use crate::control_plane::Identity;
+        use super::super::snapshot_restore_gate::{RestoreGate,View,SnapshotKey,RestoreKey,Commit,Phase};
+        let idx=index();let sec=security();
+        let owner=Identity{id:4,generation:2};let reopen=Identity{id:11,generation:3};
+        let view=View{fs_uuid:[1;16],live_epoch:3,protection_generation:5,root_hash:[6;32],retention_watermark:9};
+        let mut gate=RestoreGate::from_frozen(view,owner,reopen,|_|Ok(())).unwrap();
+        let key=RestoreKey{principal:Identity{id:9,generation:1},request_seq:7};
+        let snap=SnapshotKey{fs_uuid:[1;16],snapshot_id:4,slot:0,generation:1,root_hash:[8;32]};
+        let p=gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|Ok(())).unwrap();
+        assert_eq!(gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|panic!()),Ok(p));
+        assert_eq!(gate.submit(owner,p,||Err(Error::Unknown)),Err(Error::Unknown));
+        assert_eq!(gate.phase(),Phase::Unknown);
+        assert_eq!(gate.submit(owner,p,||panic!("no repeated transaction")),Err(Error::Busy));
+        assert_eq!(gate.reopen(reopen,view,|_,_|panic!()),Err(Error::Busy));
+        let restored=View{live_epoch:4,root_hash:[8;32],..view};
+        let c=Commit{key,txid:1,log_epoch:1,commit_lsn:3,view:restored,request_hash:[7;32]};
+        let mut rolled=sec;rolled[24..32].copy_from_slice(&2u64.to_le_bytes());finalize_crc(&mut rolled,72);
+        assert_eq!(gate.confirm(owner,p,c,&idx,&sec,&idx,&rolled,|_,_|panic!()),Err(Error::Conflict));
+        assert_eq!(gate.confirm(owner,p,c,&idx,&sec,&idx,&sec,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
+        assert_eq!(gate.confirm(owner,p,c,&idx,&sec,&idx,&sec,|_,_|Ok(())),Ok(restored));
+        assert_eq!(gate.phase(),Phase::RestoredFrozen);
+        assert!(!gate.may_write(4,5));
+        assert_eq!(gate.reopen(owner,restored,|_,_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(gate.reopen(reopen,restored,|_,_|Ok(())),Ok(()));
+        assert!(!gate.may_write(3,5));assert!(gate.may_write(4,5));
+    }
+    #[test]
     fn snapshot_restore_preserves_current_system_state_exactly() {
         let old_index=index();
         let old_security=security();
