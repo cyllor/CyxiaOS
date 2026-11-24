@@ -227,7 +227,7 @@ fn observations(start: u64, count: u64, latency: u64, pending: u64) -> Vec<WorkR
 fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
     let owners = Owners { extend: true };
     let mut b = ExtraBudget::new();
-    b.record_mandatory(0, 61_000_000).unwrap();
+    b.record_mandatory(0, 61_500_000).unwrap();
     let credit = b
         .reserve(Role::Training, 1, 1, 1024 * 1024, 0, 4_000_000, &owners)
         .unwrap();
@@ -252,11 +252,11 @@ fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
             1,
             1024 * 1024,
             4_000_000,
-            5_000_000,
+            4_500_000,
             &owners,
         )
         .unwrap();
-    b.settle(credit, 5_000_000, 9_000_000).unwrap();
+    b.settle(credit, 4_500_000, 8_500_000).unwrap();
     assert_eq!(
         b.reserve(Role::Canary, 1, 1, 1024 * 1024, 9_000_000, 1, &owners)
             .err(),
