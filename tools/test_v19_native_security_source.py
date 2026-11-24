@@ -235,6 +235,13 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("native_local_echo_shared_page_matches_kernel_broker_offsets",fixture)
         self.assertIn("cargo check --release --locked --offline -p cyxia-local-echo --features guest", source(ROOT / ".github/workflows/v19-advisory-smoke.yml"))
 
+    def test_v019_freestanding_ring_uses_existing_native_crypto_patch(self):
+        manifest = source(ROOT / "Cargo.toml")
+        lock = source(ROOT / "Cargo.lock")
+        self.assertIn('ring = { path = "user/prototype-cluster/vendor/ring" }', manifest)
+        self.assertIn('name = "ring"\\nversion = "0.17.14"\\ndependencies', lock)
+        self.assertNotIn('name = "ring"\\nversion = "0.17.14"\\nsource = "registry+', lock)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

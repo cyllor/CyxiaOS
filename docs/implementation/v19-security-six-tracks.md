@@ -179,3 +179,5 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - **尚未完成**：从旧 `unified-runtime` 内核启动链独立部署新 Echo guest，按本机网络配置关闭集群发现/远程任务分发；为此 guest 提供来自 EL1 的真实端口来源、TCP/VirtIO TX 静默证明及服务重启信用留存。guest 在缺少这些证明时保守停止，不默许重连，因此 G2/G3/G4 原生验收仍是 NOT_RUN。
 
 - 新增 CI-only `cargo build --release` 的 AArch64 ELF 实际链接/LOAD 段检查。使用 runner 临时测试证书及无效 peer pin，只用于揭示 freestanding 目标与 guest linker/BSS 越界错误。**这个测试 ELF 绝不上传、部署或当成可信发行产物**；源码打包仍通过 `git archive` 不包含 `target/`。
+
+- 实际 ELF 链接检查曾暴露根工作区采用 crates.io 原版 `ring 0.17.14` 时缺失 freestanding AArch64 汇编符号；根工作区现统一使用仓库旧 EL0 原生服务已验证的同版本 `user/prototype-cluster/vendor/ring` 裸机适配补丁。该目录**仅是 vendored 密码学库**，不会把集群成员/RPC 依赖加回独立 Echo 程序。全工作区受影响的宿主 TLS 测试与 AArch64 EL0 链接需重新运行并留 CI 记录。
