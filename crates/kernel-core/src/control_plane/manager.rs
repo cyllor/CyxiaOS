@@ -40,6 +40,19 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         if !ownership.fixed_control() { return Err(Error::Invalid); }
         Self::new(ownership, publisher, epochs, limits, policy_limits)
     }
+    /// V0.19.9 reference topology: true CPU0 controller with CPU1-3
+    /// business cores. Native EL0 scheduling and IRQ migration must be
+    /// independently boot-tested before this constructor is selected there.
+    pub fn new_v0199_cpu0(
+        ownership: Ownership<C>, publisher: Identity, epochs: Epochs,
+        limits: Limits, policy_limits: [policy::Limits; D],
+    ) -> Result<Self,Error> {
+        if !ownership.native_cpu0_v0199()
+            || !ownership.fixed_control()
+            || super::cpu0_v0199::validate_snapshot(ownership.snapshot()).is_err()
+        {return Err(Error::Invalid);}
+        Self::new(ownership,publisher,epochs,limits,policy_limits)
+    }
     pub fn new(
         ownership: Ownership<C>,
         publisher: Identity,
@@ -77,10 +90,15 @@ impl<const C: usize, const D: usize> Manager<C, D> {
     ) -> Result<super::fixed::Review, Error> {
         self.check_time(now)?;
         let snapshot = self.snapshot();
+        let (control, cpu)=if self.ownership.native_cpu0_v0199() {
+            (super::cpu0_v0199::CONTROL_MASK,super::cpu0_v0199::CONTROL_CPU)
+        } else {
+            (super::fixed::CONTROL_MASK,super::fixed::CONTROL_CPU)
+        };
         if !self.ownership.fixed_control()
-            || snapshot.control != super::fixed::CONTROL_MASK
+            || snapshot.control != control
             || snapshot.phase != super::cores::Phase::Stable
-            || !snapshot.permits(super::fixed::CONTROL_CPU, Plane::Control)
+            || !snapshot.permits(cpu, Plane::Control)
             || !subject.valid()
         {
             return Err(Error::Denied);
@@ -112,7 +130,11 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         let owner = crate::security::syscall::ProtectedRole::from_kernel(
             self.publisher.id, self.publisher.generation,
         );
-        let authorization = if self.ownership.fixed_control() {
+        let authorization = if self.ownership.native_cpu0_v0199() {
+            crate::security::syscall::can_publish_cpu0_v0199(
+                caller, owner, cpu, self.snapshot().control,
+            )
+        } else if self.ownership.fixed_control() {
             crate::security::syscall::can_publish_fixed(
                 caller, owner, cpu, self.snapshot().control,
             )
