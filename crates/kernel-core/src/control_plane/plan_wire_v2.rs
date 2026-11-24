@@ -277,6 +277,48 @@ mod tests {
         b=plan(); b[14]=1;
         assert!(PlanV2::decode(&b).is_err()); // AI flag needs model id
     }
+    fn registered_decision() -> [u8; DECISION_BYTES] {
+        let mut b=[0u8; DECISION_BYTES];
+        b[0..4].copy_from_slice(&0x4359_4431u32.to_le_bytes());
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[6..8].copy_from_slice(&256u16.to_le_bytes());
+        for (at,value) in [
+            (8,1u64), (16,2), (24,4), (32,1), (40,3),
+            (48,17), (56,1), (64,5), (72,6), (80,7), (144,200),
+        ] {b[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        b[88..92].copy_from_slice(&8u32.to_le_bytes());
+        b[94..96].copy_from_slice(&1u16.to_le_bytes());
+        b[96..98].copy_from_slice(&1u16.to_le_bytes());
+        b[102..104].copy_from_slice(&1u16.to_le_bytes());
+        b[104..106].copy_from_slice(&u16::MAX.to_le_bytes());
+        b[108..112].copy_from_slice(&2u32.to_le_bytes());
+        b[152..156].copy_from_slice(&0b11u32.to_le_bytes());
+        b[156..158].copy_from_slice(&1u16.to_le_bytes());
+        b[160]=1; b[192]=2; b[224]=1;
+        b
+    }
+    #[test]
+    fn sidecar_cross_binding_checks_native_target_epoch_and_actual_candidate_index() {
+        let plan=plan();
+        let decoded=PlanV2::decode(&plan).unwrap();
+        assert!(decoded.matches_untrusted_sidecars(&[registered_decision()]).is_ok());
+
+        let mut changed=registered_decision();
+        changed[102..104].copy_from_slice(&0u16.to_le_bytes());
+        // This is a structurally valid other fallback, but it did not match
+        // the actual PolicyEnvelope's frozen chosen candidate index.
+        assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
+        changed=registered_decision();
+        changed[72..80].copy_from_slice(&9u64.to_le_bytes());
+        assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
+        changed=registered_decision();
+        changed[104..106].copy_from_slice(&0u16.to_le_bytes());
+        assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
+        changed=registered_decision();
+        changed[4]=2;
+        assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
+    }
+
     #[test]
     fn sidecar_count_cannot_be_forged_into_a_ready_to_publish_plan() {
         let p=PlanV2::decode(&plan()).unwrap();
