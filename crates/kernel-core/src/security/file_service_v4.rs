@@ -152,7 +152,10 @@ impl<'a> Reply<'a>{
 
 #[cfg(test)]
 mod tests{
+    extern crate std;
     use super::*;
+    use std::vec;
+    use std::vec::Vec;
     fn request(op:u16,payload:&[u8],id:u64)->Vec<u8>{
         let mut b=vec![0u8;REQUEST_HEADER+payload.len()];
         b[0..4].copy_from_slice(&REQUEST_MAGIC.to_le_bytes());
