@@ -62,13 +62,8 @@ fn read_record(io:&mut impl EpochBlockIo,block:u32,raw:&mut[u8;2*BLOCK])
 /// A clean/truncated suffix may contain old-epoch residue, but no later
 /// selected-epoch record. A malformed aligned candidate fails conservatively
 /// in the independent full-area preflight; never infer missing high epochs.
-fn no_current_suffix(io:&mut impl EpochBlockIo,from:u32,epoch:u64,raw:&mut[u8;2*BLOCK])->Result<(),Error>{
-    for block in from..END{
-        let head:&mut[u8;BLOCK]=(&mut raw[..BLOCK]).try_into().unwrap();
-        io.read(block,head)?;
-        if u32at(head,0)==MAGIC&&u64at(head,32)>=epoch{return Err(Error::Conflict);}
-    }
-    Ok(())
+fn no_current_suffix(from:u32,last_current:u32)->Result<(),Error>{
+    if last_current>=from{return Err(Error::Conflict);}Ok(())
 }
 fn current_record(io:&mut impl EpochBlockIo,block:u32,epoch:u64,raw:&mut[u8;2*BLOCK])
     ->Result<Option<Header>,Error>{
@@ -84,13 +79,21 @@ fn current_record(io:&mut impl EpochBlockIo,block:u32,epoch:u64,raw:&mut[u8;2*BL
 pub fn scan(io:&mut impl EpochBlockIo,w:&mut RecoveryWorkspace)->Result<RecoveryEvidence,Error>{
     w.evidence=None;w.count=0;
     io.read(0,&mut w.first)?;io.read(1,&mut w.second)?;
-    let sb=preflight_baseline_checkpoint(&w.first,&w.second,&mut w.raw,|b,out|io.read(b,out))?;
+    let epoch=super::file_media_v0199::probe_snapshot_media_pair(&w.first,&w.second)?.log_epoch;
+    let mut last_current=0u32;
+    // Track aligned current-epoch header candidates during the mandatory
+    // full area scan. Avoid rescanning 4096 blocks after an empty suffix.
+    let sb=preflight_baseline_checkpoint(&w.first,&w.second,&mut w.raw,|b,out|{
+        io.read(b,out)?;
+        if u32at(out,0)==MAGIC&&u64at(out,32)==epoch{last_current=last_current.max(b);}
+        Ok(())
+    })?;
     w.selected=if SuperblockV1::decode(&w.first)?==sb{0}else{1};
     let mut at=FIRST;let mut last=sb.checkpoint_lsn;let mut last_tx=0u64;
     let mut transactions=0u32;let mut incomplete=false;
     'chain:while at<END{
         let Some(begin)=current_record(io,at,sb.log_epoch,&mut w.raw)?else{
-            no_current_suffix(io,at+1,sb.log_epoch,&mut w.raw)?;break;
+            no_current_suffix(at+1,last_current)?;break;
         };
         if begin.kind!=1||begin.txid<=last_tx||last.checked_add(1)!=Some(begin.lsn){return Err(Error::Conflict);}
         let n=u32at(&w.raw,64) as usize;
@@ -102,7 +105,7 @@ pub fn scan(io:&mut impl EpochBlockIo,w:&mut RecoveryWorkspace)->Result<Recovery
         for i in 0..n{
             let pos=at+1+2*i as u32;
             let Some(redo)=current_record(io,pos,sb.log_epoch,&mut w.raw)?else{
-                no_current_suffix(io,pos+1,sb.log_epoch,&mut w.raw)?;incomplete=true;break 'chain;
+                no_current_suffix(pos+1,last_current)?;incomplete=true;break 'chain;
             };
             if redo.kind!=2||redo.txid!=begin.txid||begin.lsn.checked_add(i as u64+1)!=Some(redo.lsn)
                 ||u32at(&w.raw,48)!=i as u32||u32at(&w.raw,52)!=n as u32{return Err(Error::Conflict);}
@@ -114,7 +117,7 @@ pub fn scan(io:&mut impl EpochBlockIo,w:&mut RecoveryWorkspace)->Result<Recovery
             w.pending[i]=Row{home,log:pos,commit_lsn:0,digest:hash(&w.raw)};
         }
         let Some(commit)=current_record(io,commit_at,sb.log_epoch,&mut w.raw)?else{
-            no_current_suffix(io,commit_at+1,sb.log_epoch,&mut w.raw)?;incomplete=true;break;
+            no_current_suffix(commit_at+1,last_current)?;incomplete=true;break;
         };
         let digest:[u8;32]=ordered.finalize().into();
         if commit.kind!=3||commit.txid!=begin.txid||begin.lsn.checked_add(n as u64+1)!=Some(commit.lsn)
@@ -162,6 +165,15 @@ pub fn replay_home(io:&mut impl EpochBlockIo,w:&mut RecoveryWorkspace)->Result<R
         io.write(row.home,w.raw[64..4160].try_into().unwrap()).map_err(|_|Error::Unknown)?;
     }
     io.flush().map_err(|_|Error::Unknown)?;
+    // Native readback is not a substitute for FLUSH; verify both.
+    for i in 0..w.count{
+        let row=w.rows[i];
+        read_exact_image(io,row,e.superblock.log_epoch,&mut w.raw).map_err(|_|Error::Unknown)?;
+        let expected=hash(&w.raw[64..4160]);
+        let out:&mut[u8;BLOCK]=(&mut w.raw[..BLOCK]).try_into().unwrap();
+        io.read(row.home,out).map_err(|_|Error::Unknown)?;
+        if hash(out)!=expected{return Err(Error::Unknown);}
+    }
     Ok(e)
 }
 /// Complete mount recovery under one exclusive file owner. Verify the
@@ -195,4 +207,105 @@ pub fn recover_checkpoint<I:EpochBlockIo>(io:&mut I,w:&mut RecoveryWorkspace,
     if SuperblockV1::decode(out).map_err(|_|Error::Unknown)?!=next{return Err(Error::Unknown);}
     w.evidence=None;
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests{
+    extern crate std;
+    use super::*;
+    use std::{boxed::Box,collections::BTreeMap,vec::Vec};
+    #[derive(Default)]
+    struct Disk{blocks:BTreeMap<u32,Box<[u8;BLOCK]>>,events:Vec<u32>,flushes:u32,fail_flush:u32}
+    impl EpochBlockIo for Disk{
+        fn read(&mut self,block:u32,out:&mut[u8;BLOCK])->Result<(),Error>{
+            if let Some(b)=self.blocks.get(&block){*out=**b;}else{out.fill(0);}Ok(())
+        }
+        fn write(&mut self,block:u32,data:&[u8;BLOCK])->Result<(),Error>{
+            self.events.push(block);self.blocks.insert(block,Box::new(*data));Ok(())
+        }
+        fn flush(&mut self)->Result<(),Error>{
+            self.events.push(u32::MAX);self.flushes+=1;
+            if self.flushes==self.fail_flush{return Err(Error::Unknown);}Ok(())
+        }
+    }
+    fn p16(b:&mut[u8],i:usize,v:u16){b[i..i+2].copy_from_slice(&v.to_le_bytes());}
+    fn p32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
+    fn p64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
+    fn superblock()->[u8;BLOCK]{
+        let mut b=[0;BLOCK];p32(&mut b,0,0x43594653);p16(&mut b,4,1);p16(&mut b,6,80);
+        p32(&mut b,8,4096);p32(&mut b,12,131072);b[16..32].fill(1);
+        p64(&mut b,32,1);p64(&mut b,48,1);p32(&mut b,56,4098);p32(&mut b,60,4102);
+        p32(&mut b,64,4118);p32(&mut b,68,256);let c=crc32c_zeroed(&b,76).unwrap();p32(&mut b,76,c);b
+    }
+    fn seal(b:&mut[u8],kind:u16,len:usize,txid:u64,lsn:u64){
+        p32(b,0,MAGIC);p16(b,4,1);p16(b,6,kind);p32(b,8,len as u32);
+        p64(b,16,txid);p64(b,24,lsn);p64(b,32,1);
+        let c=crc32c_payload(&b[64..len]);p32(b,12,c);
+        let c=crc32c_zeroed(&b[..64],56).unwrap();p32(b,56,c);
+    }
+    fn append(d:&mut Disk,first:u32,txid:u64,lsn:u64,images:&[(u32,u8)],committed:bool)->u32{
+        let n=images.len();
+        let mut b=[0;BLOCK];p32(&mut b,64,n as u32);p64(&mut b,72,n as u64*BLOCK as u64);
+        seal(&mut b,1,80,txid,lsn);d.blocks.insert(first,Box::new(b));
+        let mut digest=Sha256::new();
+        for(i,&(home,value))in images.iter().enumerate(){
+            let mut raw=[0;2*BLOCK];p64(&mut raw,40,u64::from(home));p32(&mut raw,48,i as u32);p32(&mut raw,52,n as u32);
+            raw[64..4160].fill(value);
+            digest.update(u64::from(home).to_le_bytes());digest.update(&raw[64..4160]);
+            seal(&mut raw,2,4160,txid,lsn+i as u64+1);
+            d.blocks.insert(first+1+2*i as u32,Box::new(raw[..BLOCK].try_into().unwrap()));
+            d.blocks.insert(first+2+2*i as u32,Box::new(raw[BLOCK..].try_into().unwrap()));
+        }
+        let at=first+1+2*n as u32;
+        if committed{
+            let mut c=[0;BLOCK];p64(&mut c,64,txid);p64(&mut c,72,lsn);
+            p64(&mut c,80,lsn+n as u64);p32(&mut c,88,n as u32);
+            c[96..128].copy_from_slice(&digest.finalize());
+            seal(&mut c,3,128,txid,lsn+n as u64+1);
+            d.blocks.insert(at,Box::new(c));
+        }
+        at+1
+    }
+    fn disk()->Disk{
+        let mut d=Disk::default();d.blocks.insert(0,Box::new(superblock()));d.blocks.insert(1,Box::new(superblock()));
+        let next=append(&mut d,2,1,1,&[(7000,1)],true);
+        let next=append(&mut d,next,2,4,&[(7000,2),(7001,3)],true);
+        append(&mut d,next,3,8,&[(7001,4)],false);
+        d
+    }
+    #[test]
+    fn highest_committed_afterimage_once_then_flush_validate_and_checkpoint(){
+        let mut d=disk();let mut w=RecoveryWorkspace::new();
+        let e=scan(&mut d,&mut w).unwrap();
+        assert_eq!((e.transactions,e.last_commit_lsn,e.distinct_home_blocks,e.incomplete_tail),(2,7,2,true));
+        let next=recover_checkpoint(&mut d,&mut w,|io,_|{
+            assert_eq!(&io.events[..],&[7000,7001,u32::MAX]);
+            assert!(io.blocks[&7000].iter().all(|&v|v==2));
+            assert!(io.blocks[&7001].iter().all(|&v|v==3));
+            Ok(())
+        }).unwrap();
+        assert_eq!((next.generation,next.log_epoch,next.checkpoint_lsn),(2,2,7));
+        assert_eq!(&d.events[..],&[7000,7001,u32::MAX,1,u32::MAX]);
+        // Old incomplete records remain physically present; a fresh
+        // scan of the new checkpoint ignores the now older epoch.
+        assert_eq!(scan(&mut d,&mut w).unwrap().transactions,0);
+    }
+    #[test]
+    fn holes_and_flush_failure_cannot_advance_checkpoint(){
+        let mut w=RecoveryWorkspace::new();let mut broken=disk();
+        // Remove the second transaction's first REDO header while its
+        // later commit remains. This is not a harmless truncated tail.
+        broken.blocks.remove(&7);
+        assert!(scan(&mut broken,&mut w).is_err());
+        assert!(broken.events.is_empty());assert_eq!(replay_home(&mut broken,&mut w),Err(Error::Busy));
+        let mut d=disk();d.fail_flush=1;
+        assert_eq!(recover_checkpoint(&mut d,&mut w,|_,_|panic!("home not flushed")),Err(Error::Unknown));
+        assert!(!d.events.contains(&1));
+        assert_eq!(SuperblockV1::decode(&*d.blocks[&1]).unwrap().generation,1);
+        d.fail_flush=0;d.events.clear();
+        assert_eq!(recover_checkpoint(&mut d,&mut w,|_,_|Err(Error::Unauthorized)),Err(Error::Unauthorized));
+        assert!(!d.events.contains(&1));
+        d.events.clear();
+        assert_eq!(recover_checkpoint(&mut d,&mut w,|_,_|Ok(())).unwrap().generation,2);
+    }
 }
