@@ -184,6 +184,21 @@ mod tests{
     fn allowed(n:u64,a:[u64;6])->bool{decode_v3(3,n,a).is_ok()}
 
     #[test]
+    fn spawn_args_are_private_aligned_and_fresh_registers_are_exact(){
+        let mut stack=[0xa5u8;8192];
+        let a=stage_spawn_args(&mut stack,0x10000,&[1;17]).unwrap();
+        assert_eq!(a,StartupRegisters{sp:0x11fe0,x0:0x11fe0,x1:17});
+        assert!(stack[..8160].iter().all(|&v|v==0));
+        assert_eq!(&stack[8160..8177],&[1;17]);
+        assert!(stack[8177..].iter().all(|&v|v==0));
+        let a=stage_spawn_args(&mut stack,0x10000,&[]).unwrap();
+        assert_eq!(a,StartupRegisters{sp:0x12000,x0:0,x1:0});
+        assert!(stack.iter().all(|&v|v==0));
+        assert!(stage_spawn_args(&mut stack,0x10001,&[]).is_err());
+        assert!(stage_spawn_args(&mut stack,u64::MAX-4095,&[]).is_err());
+        assert!(stage_spawn_args(&mut stack,0x10000,&[1;257]).is_err());
+    }
+    #[test]
     fn frozen_nineteen_calls_have_unique_syscall_numbers(){
         let mut seen=[false;256];
         let nums=[0x01,0x02,0x03,0x04,0x10,0x11,0x12,0x13,
