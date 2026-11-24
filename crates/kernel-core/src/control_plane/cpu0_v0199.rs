@@ -21,6 +21,19 @@ pub const CONTROL_WINDOW_NS:u64=100_000_000;
 pub const fn fixed_masks(online:u64,control:u64,business:u64)->bool {
     online==ONLINE && control==CONTROL_MASK && business==BUSINESS_MASK
 }
+/// Shared fail-closed task/IRQ admission predicate for the fixed four-vCPU
+/// topology. A corrupted ownership mask cannot create another business CPU.
+/// Health may contain CPU0 (shared EL1 observation) but only B is eligible.
+pub const fn permits_business(
+    cpu: u16, business: u64, healthy: u64, draining: u64, suspect: u64,
+) -> bool {
+    if cpu == 0 || cpu > 3 || business & !BUSINESS_MASK != 0
+        || healthy & !ONLINE != 0 || draining & !ONLINE != 0 || suspect & !ONLINE != 0
+    {
+        return false;
+    }
+    (1u64 << cpu) & business & healthy & !draining & !suspect != 0
+}
 pub fn validate_snapshot(snapshot:Snapshot)->Result<(),Error>{
     if snapshot.phase!=Phase::Stable
         || snapshot.transition!=0 || snapshot.quarantined!=0
