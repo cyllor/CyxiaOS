@@ -31,6 +31,9 @@ pub struct Manager {
     pub catalog: Catalog,
     mounted: bool,
     age_anchor_ns: Option<u64>,
+    // Sample high-water is independent of the conservative charging anchor.
+    // Create/extend/commit may clear the latter, never the former.
+    age_last_sample_ns: Option<u64>,
     create_token: Option<FileReqKey>,
     restore_token: Option<(FileReqKey, u64)>,
 }
@@ -46,6 +49,7 @@ impl Manager {
             catalog: Catalog::initial([0; 16]),
             mounted: false,
             age_anchor_ns: None,
+            age_last_sample_ns: None,
             create_token: None,
             restore_token: None,
         }
@@ -122,6 +126,7 @@ impl Manager {
     ) -> Result<(), Error<D::Error>> {
         self.mounted = false;
         self.age_anchor_ns = None;
+        self.age_last_sample_ns = None;
         self.create_token = None;
         self.restore_token = None;
         j.require_quiescent(d)?;
@@ -1259,6 +1264,11 @@ impl Manager {
         if self.control.gc_phase != GcPhase::Idle {
             return Err(Status::Busy.into());
         }
+        if self.age_last_sample_ns.is_some_and(|last| monotonic_now_ns < last) {
+            self.fault_freeze(j, d, s, tx)?;
+            return Err(Status::Invalid.into());
+        }
+        self.age_last_sample_ns = Some(monotonic_now_ns);
         let Some(anchor) = self.age_anchor_ns else {
             self.age_anchor_ns = Some(monotonic_now_ns);
             return Ok(self.control.online_age_ns);
@@ -1327,6 +1337,7 @@ impl Manager {
                 return Err(Status::Invalid.into());
             }
             self.age_anchor_ns = Some(after);
+            self.age_last_sample_ns = Some(after);
         }
         Ok(age)
     }
