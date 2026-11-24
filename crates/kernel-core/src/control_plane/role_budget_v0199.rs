@@ -3,7 +3,7 @@
 //! No model-supplied time/role or scheduler migration is trusted. Actual timer
 //! programming, CPU counter observation and task stop proof remain native
 //! adapter duties; this ledger is not that adapter.
-use super::{Error,Identity,role_manifest_v0199::{NativeRoleManifest,Role,ROLE_COUNT,CONTROL_CPU}};
+use super::{Error,Identity,role_manifest_v0199::{NativeRoleManifest,ValidatedRoleManifest,Role,ROLE_COUNT,CONTROL_CPU}};
 pub const WINDOW_NS:u64=100_000_000;
 pub const LIMIT_NS:u64=70_000_000;
 // 6ms of the 8ms coordination class belongs to model manager/supervisor.
@@ -184,9 +184,17 @@ impl Cpu0BudgetLedger {
         cpu:usize,class:Class,domain:u16,requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>
     {
         if wall_ns==0 || wall_ns>50_000_000{return Err(Error::Invalid);}
-        manifest.validate()?;
+        self.reserve_validated_role_with_wall(&manifest.validated()?,actor,cpu,class,domain,requested,wall_ns,now)
+    }
+    /// Same admission rules with an immutable inventory validated before
+    /// the turn. The caller must account for validation in coordination or
+    /// recovery; the full-inventory check is not removed from CPU accounting.
+    pub fn reserve_validated_role_with_wall(&mut self,manifest:&ValidatedRoleManifest<'_>,actor:Identity,
+        cpu:usize,class:Class,domain:u16,requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>
+    {
+        if wall_ns==0 || wall_ns>50_000_000{return Err(Error::Invalid);}
         if cpu!=CONTROL_CPU{return Err(Error::Denied);}
-        let (index,member)=manifest.members.iter().enumerate().find(|(_,m)|m.actor==actor).ok_or(Error::Denied)?;
+        let (index,member)=manifest.manifest().members.iter().enumerate().find(|(_,m)|m.actor==actor).ok_or(Error::Denied)?;
         let allowed=matches!((member.role,class),
             (Role::Operations,Class::Operations|Class::Optional)
             |(Role::Security,Class::Security)
