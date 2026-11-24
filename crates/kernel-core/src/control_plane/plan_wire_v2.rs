@@ -106,6 +106,7 @@ fn action_at(frame: &[u8], at: usize) -> Result<(PolicyActionV2<'_>,usize), Erro
         || a.core_generation == 0 || a.expires_local_ns == 0
         || a.candidate_index >= 32 || a.candidate_set_hash == [0;32]
     { return Err(Error::Invalid); }
+    super::action_schema_v2::ActionV2::decode(a.domain_id,a.action_kind,a.action_payload)?;
     Ok((a,end))
 }
 
