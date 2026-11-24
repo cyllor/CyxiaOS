@@ -114,25 +114,42 @@ struct Pending {
     claimed:[Option<ClaimedWork>;MAX_ACTIONS],
 }
 
+/// 64 published nonterminal obligations plus one unpublished candidate.
+/// Native owner places this storage in its already accounted control pool;
+/// do not construct it on the kernel stack. No slot eviction is permitted.
+pub const MAX_PUBLISHED_PLANS:usize=64;
+pub struct PublishedPlanPool{
+    slots:[Option<Pending>;MAX_PUBLISHED_PLANS+1],
+}
+impl PublishedPlanPool{
+    pub const fn new()->Self{Self{slots:[const{None};MAX_PUBLISHED_PLANS+1]}}
+    pub const fn bytes()->usize{core::mem::size_of::<Self>()}
+    fn count_published(&self)->usize{
+        self.slots.iter().flatten().filter(|p|p.status!=PendingStatus::Frozen).count()
+    }
+}
+const _:()=assert!(PublishedPlanPool::bytes()<1024*1024);
+
 /// Fixed-memory guard. This can be owned by a protected, serialized EL1
 /// executor; no public entry point grants a new CPU, memory page or capability.
 /// The caller-supplied Identity must be authenticated by the architecture
 /// adapter before reaching this object.
-pub struct RegisteredDecisionGate {
+pub struct RegisteredDecisionGate<'pool> {
     controller: Identity,
     publisher: Identity,
     boot_epoch: u64,
     controller_epoch: u64,
     last_plan_seq: u64,
     last_decision_seq: u64,
-    pending: Option<Pending>,
+    pending: Option<Pending>, // legacy single-plan component profile
+    pool: Option<&'pool mut PublishedPlanPool>,
     /// Only an EL1-authenticated independent terminal/recovery owner can
     /// close an accepted/UNKNOWN plan. Unconfigured gates stay fail-closed.
     terminal_owner: Option<Identity>,
     history: [Option<TerminalSummary>; TERMINAL_HISTORY],
     history_next: usize,
 }
-impl RegisteredDecisionGate {
+impl<'pool> RegisteredDecisionGate<'pool> {
     pub fn new(controller: Identity, publisher: Identity, boot: u64, epoch: u64)
         -> Result<Self, Error>
     {
@@ -141,7 +158,7 @@ impl RegisteredDecisionGate {
         {return Err(Error::Invalid);}
         Ok(Self {
             controller, publisher, boot_epoch:boot, controller_epoch:epoch,
-            last_plan_seq:0,last_decision_seq:0,pending:None,
+            last_plan_seq:0,last_decision_seq:0,pending:None,pool:None,
             terminal_owner:None,history:[None;TERMINAL_HISTORY],history_next:0,
         })
     }
@@ -158,6 +175,66 @@ impl RegisteredDecisionGate {
         let mut gate=Self::new(controller,publisher,boot,epoch)?;
         gate.terminal_owner=Some(terminal_owner);
         Ok(gate)
+    }
+
+    /// Full-capacity profile, borrowing an exclusive, preallocated pool.
+    /// Its boot-scoped authority remains unique; an occupied pool cannot
+    /// be rebound to a new gate or cleared to recover capacity.
+    pub fn with_pool(controller:Identity,publisher:Identity,terminal_owner:Identity,
+        boot:u64,epoch:u64,pool:&'pool mut PublishedPlanPool)->Result<Self,Error>{
+        if pool.slots.iter().any(Option::is_some){return Err(Error::Busy);}
+        let mut gate=Self::new_with_terminal_owner(controller,publisher,terminal_owner,boot,epoch)?;
+        gate.pool=Some(pool);Ok(gate)
+    }
+    fn lookup(&self,seq:u64)->Option<&Pending>{
+        if let Some(pool)=self.pool.as_deref(){
+            pool.slots.iter().flatten().find(|p|p.plan_seq==seq)
+        }else{self.pending.as_ref().filter(|p|p.plan_seq==seq)}
+    }
+    fn lookup_mut(&mut self,seq:u64)->Option<&mut Pending>{
+        if let Some(pool)=self.pool.as_deref_mut(){
+            pool.slots.iter_mut().flatten().find(|p|p.plan_seq==seq)
+        }else{self.pending.as_mut().filter(|p|p.plan_seq==seq)}
+    }
+    fn frozen_or_legacy_busy(&self)->Option<&Pending>{
+        if let Some(pool)=self.pool.as_deref(){
+            pool.slots.iter().flatten().find(|p|p.status==PendingStatus::Frozen)
+        }else{self.pending.as_ref()}
+    }
+    fn check_registration_slot(&self)->Result<(),Error>{
+        if self.frozen_or_legacy_busy().is_some(){return Err(Error::Busy);}
+        if self.pool.as_deref().is_some_and(|p|p.slots.iter().all(Option::is_some)){
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    fn insert_frozen(&mut self,pending:Pending){
+        // Checked before any advice ledger mutation. Serialized EL1 owner
+        // ensures no competing insertion between preflight and this store.
+        if let Some(pool)=self.pool.as_deref_mut(){
+            *pool.slots.iter_mut().find(|p|p.is_none()).expect("preflighted pool slot")=Some(pending);
+        }else{assert!(self.pending.is_none());self.pending=Some(pending);}
+    }
+    fn begin_publish(&mut self,seq:u64)->Result<(),Error>{
+        if self.published_count()>=MAX_PUBLISHED_PLANS{return Err(Error::Busy);}
+        let p=self.lookup_mut(seq).ok_or(Error::Stale)?;
+        if p.status!=PendingStatus::Frozen{return Err(Error::Busy);}
+        p.status=PendingStatus::AdapterUnknown;
+        Ok(())
+    }
+    fn release(&mut self,seq:u64){
+        if let Some(pool)=self.pool.as_deref_mut(){
+            let slot=pool.slots.iter_mut().find(|v|v.as_ref().is_some_and(|p|p.plan_seq==seq))
+                .expect("retained plan");*slot=None;
+        }else{assert_eq!(self.pending.as_ref().map(|p|p.plan_seq),Some(seq));self.pending=None;}
+    }
+    pub fn published_count(&self)->usize{
+        self.pool.as_deref().map_or_else(
+            ||usize::from(self.pending.as_ref().is_some_and(|p|p.status!=PendingStatus::Frozen)),
+            PublishedPlanPool::count_published)
+    }
+    pub fn has_unpublished(&self)->bool{
+        self.frozen_or_legacy_busy().is_some_and(|p|p.status==PendingStatus::Frozen)
     }
 
     fn check_identity_and_context(&self, context: TrustedRegistrationScope)
@@ -190,7 +267,7 @@ impl RegisteredDecisionGate {
     ) -> Result<Registration,Error> {
         if actor != self.controller {return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        if let Some(pending)=&self.pending {
+        if let Some(pending)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()) {
             if pending.assisted.is_some(){return Err(Error::Busy);}
             let same_key=plan.header.plan_seq==pending.plan_seq;
             let same_bytes=same_key
@@ -221,6 +298,7 @@ impl RegisteredDecisionGate {
                 Err(Error::Busy)
             };
         }
+        self.check_registration_slot()?;
         self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context)?;
         if plan.header.plan_seq<=self.last_plan_seq {return Err(Error::Stale);}
         let mut last=self.last_decision_seq;
@@ -235,7 +313,7 @@ impl RegisteredDecisionGate {
         for index in 0..usize::from(plan.header.action_count) {
             expires=expires.min(plan.action(index)?.expires_local_ns);
         }
-        self.pending=Some(Pending {
+        self.insert_frozen(Pending {
             plan_seq:plan.header.plan_seq,
             plan_digest:sha256(plan_wire),
             count:records.len(),
@@ -336,9 +414,9 @@ impl RegisteredDecisionGate {
         native_accept:impl FnOnce()->Result<(),Error>,
     ) -> Result<Publication,Error> {
         if actor!=self.publisher {return Err(Error::Denied);}
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
-        if pending.assisted.is_some(){return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
+        let pending=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
+        if pending.assisted.is_some(){return Err(Error::Denied);}
         if plan.header.plan_seq!=pending.plan_seq
             || sha256(plan_wire)!=pending.plan_digest
             || records.len()!=pending.count
@@ -356,10 +434,10 @@ impl RegisteredDecisionGate {
         self.validate_rule_only(plan_wire,&plan,records,profile,actions,context)?;
         // Mark before the potentially side-effecting callback; failures
         // cannot safely be interpreted as "nothing happened".
-        self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterUnknown;
+        self.begin_publish(plan.header.plan_seq)?;
         let result=native_accept();
         if result.is_ok() {
-            self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterAccepted;
+            self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?.status=PendingStatus::AdapterAccepted;
             Ok(Publication::AdapterAccepted)
         } else {
             result.map(|_|Publication::AdapterAccepted)
@@ -439,7 +517,7 @@ impl RegisteredDecisionGate {
     {
         if actor!=self.controller{return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        if let Some(p)=&self.pending{
+        if let Some(p)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()){
             if plan.header.plan_seq!=p.plan_seq{return Err(Error::Busy);}
             let proof=p.assisted.ok_or(Error::Denied)?;
             if p.count!=1||sha256(plan_wire)!=p.plan_digest||p.decision_bytes[0]!=*record
@@ -453,6 +531,7 @@ impl RegisteredDecisionGate {
                 PendingStatus::AdapterUnknown=>Err(Error::NotReady),
             };
         }
+        self.check_registration_slot()?;
         let disp=AdviceDispositionV1::decode(disposition)?;
         if disp.state!=1||disp.processed_ns!=context.now_ns{return Err(Error::Denied);}
         let key=AdviceKey{boot_epoch:disp.boot_epoch,advisor_epoch:disp.advisor_epoch,advice_seq:disp.advice_seq};
@@ -466,7 +545,7 @@ impl RegisteredDecisionGate {
         let expiry=plan.action(0)?.expires_local_ns.min(AdviceEnvelopeV1::decode(&advice_wire)?.expires_ns);
         let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
         ledger.finalize_registered_adoption(actor,disposition,record,context.now_ns)?;
-        self.pending=Some(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
+        self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
             count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
             assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),claimed:[None;MAX_ACTIONS]});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
@@ -483,7 +562,7 @@ impl RegisteredDecisionGate {
     {
         if actor!=self.publisher{return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
-        let p=self.pending.as_ref().ok_or(Error::Stale)?;
+        let p=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
         let proof=p.assisted.ok_or(Error::Denied)?;
         if plan.header.plan_seq!=p.plan_seq||p.count!=1||sha256(plan_wire)!=p.plan_digest
             ||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
@@ -493,9 +572,9 @@ impl RegisteredDecisionGate {
             PendingStatus::Frozen=>{},
         }
         self.validate_assisted_one(plan_wire,&plan,record,profile,local,context,scope,&proof.advice)?;
-        self.pending.as_mut().unwrap().status=PendingStatus::AdapterUnknown;
+        self.begin_publish(plan.header.plan_seq)?;
         native_accept()?;
-        self.pending.as_mut().unwrap().status=PendingStatus::AdapterAccepted;
+        self.lookup_mut(plan.header.plan_seq).unwrap().status=PendingStatus::AdapterAccepted;
         Ok(Publication::AdapterAccepted)
     }
 
@@ -517,7 +596,7 @@ impl RegisteredDecisionGate {
         if self.terminal_owner!=Some(actor) || !actor.valid() {
             return Err(Error::Denied);
         }
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        let pending=self.lookup(terminal.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
         if pending.status==PendingStatus::Frozen {
             return Err(Error::NotReady);
         }
@@ -543,7 +622,7 @@ impl RegisteredDecisionGate {
         };
         self.history[self.history_next]=Some(summary);
         self.history_next=(self.history_next+1)%TERMINAL_HISTORY;
-        self.pending=None;
+        self.release(summary.plan_seq);
         Ok(summary)
     }
 
@@ -559,16 +638,17 @@ impl RegisteredDecisionGate {
         verify_and_accept:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>)->Result<(),Error>,
     )->Result<super::apply_work_v1::WorkFrame,Error>{
         let plan=PlanV2::decode(plan_wire)?;
-        let p=self.pending.as_mut().ok_or(Error::Stale)?;
+        if plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
+            ||scope.now_ns==0{return Err(Error::Denied);}
+        let boot=self.boot_epoch;
+        let p=self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
         if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
-        if plan.header.plan_seq!=p.plan_seq||sha256(plan_wire)!=p.plan_digest
-            ||plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
-            ||index>=p.count||scope.now_ns==0{return Err(Error::Denied);}
+        if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
         if p.claimed[index].is_some(){return Err(Error::Busy);}
         if plan.header.active_until_local_ns!=0&&scope.now_ns>=plan.header.active_until_local_ns{
             return Err(Error::Expired);
         }
-        let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,self.boot_epoch,
+        let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,boot,
             scope.plan_version,binding,origin)?;
         let work=super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
         // Contract: this callback commits atomically or makes NO effect.
@@ -591,11 +671,16 @@ impl RegisteredDecisionGate {
         ->Result<[u8;DECISION_BYTES],Error>{
         if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
         if boot!=self.boot_epoch||epoch!=self.controller_epoch||seq==0{return Err(Error::Stale);}
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
-        for raw in &pending.decision_bytes[..pending.count]{
-            let d=DecisionRecordV3::decode(raw)?;
-            if d.decision_seq==seq{return Ok(*raw);}
-        }
+        let find=|p:&Pending|->Result<Option<[u8;DECISION_BYTES]>,Error>{
+            for raw in &p.decision_bytes[..p.count]{
+                let d=DecisionRecordV3::decode(raw)?;
+                if d.decision_seq==seq{return Ok(Some(*raw));}
+            }
+            Ok(None)
+        };
+        if let Some(pool)=self.pool.as_deref(){
+            for p in pool.slots.iter().flatten(){if let Some(raw)=find(p)?{return Ok(raw);}}
+        }else if let Some(p)=self.pending.as_ref(){if let Some(raw)=find(p)?{return Ok(raw);}}
         Err(Error::Stale)
     }
 
@@ -634,7 +719,7 @@ impl RegisteredDecisionGate {
             return Err(Error::Denied);
         }
         let plan=PlanV2::decode(plan_wire)?;
-        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        let pending=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()).ok_or(Error::Stale)?;
         if pending.status==PendingStatus::Frozen {
             return Err(Error::NotReady);
         }
@@ -718,13 +803,10 @@ impl RegisteredDecisionGate {
         &mut self, actor:Identity, now_ns:u64
     ) -> Result<bool,Error> {
         if actor!=self.controller {return Err(Error::Denied);}
-        if let Some(p)=&self.pending {
-            if p.status!=PendingStatus::Frozen {return Err(Error::NotReady);}
-            if now_ns>=p.expires_ns {
-                self.pending=None;
-                return Ok(true);
-            }
-        }
+        if let Some(p)=self.frozen_or_legacy_busy(){
+            if p.status!=PendingStatus::Frozen{return Err(Error::NotReady);}
+            if now_ns>=p.expires_ns{let seq=p.plan_seq;self.release(seq);return Ok(true);}
+        }else if self.published_count()!=0{return Err(Error::NotReady);}
         Ok(false)
     }
 }
