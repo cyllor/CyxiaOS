@@ -135,6 +135,7 @@ pub struct Ownership<const N: usize> {
     recovery: Option<Recovery>,
     halted: bool,
     fixed_control: bool,
+    native_cpu0_v0199: bool,
 }
 impl<const N: usize> Ownership<N> {
     pub fn new(
@@ -181,6 +182,7 @@ impl<const N: usize> Ownership<N> {
             recovery: None,
             halted: false,
             fixed_control: false,
+            native_cpu0_v0199: false,
         };
         value.validate_partition(control, online & !control, limits)?;
         for i in 0..N {
@@ -212,7 +214,32 @@ impl<const N: usize> Ownership<N> {
         owner.fixed_control=true;
         Ok(owner)
     }
+    /// Reference V0.19.9 constructor; does not silently enable old CPU1
+    /// control workers or claim native IRQ/EL0 launch has been migrated.
+    pub fn new_v0199_cpu0(
+        online: u64,
+        capacity: [u32; N],
+        groups: [u64; N],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        if N!=4
+            || !super::cpu0_v0199::fixed_masks(
+                online, super::cpu0_v0199::CONTROL_MASK,
+                super::cpu0_v0199::BUSINESS_MASK,
+            )
+            || limits.min_control_cores!=1
+            || limits.protected_control!=super::cpu0_v0199::CONTROL_MASK
+            || limits.protected_business!=super::cpu0_v0199::BUSINESS_MASK
+        {return Err(Error::Invalid);}
+        let mut owner=Self::new(
+            online,super::cpu0_v0199::CONTROL_MASK,capacity,groups,limits
+        )?;
+        owner.fixed_control=true;
+        owner.native_cpu0_v0199=true;
+        Ok(owner)
+    }
     pub const fn fixed_control(&self) -> bool { self.fixed_control }
+    pub const fn native_cpu0_v0199(&self) -> bool { self.native_cpu0_v0199 }
     /// Called by Manager only after authenticating a newer controller epoch.
     /// Ticket generations/serials are never reset.
     pub(super) fn restart_sequence(&mut self) -> Result<(), Error> {
