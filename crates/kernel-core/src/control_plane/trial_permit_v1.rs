@@ -77,7 +77,7 @@ pub struct UseKey{pub controller_epoch:u64,pub plan_seq:u64,pub decision_seq:u64
 pub struct Hold{pub permit_id:u64,pub key:UseKey,pub ordinal:u16,pub accepted_count:u32,
     pub cpu_reserved:u64,pub memory_reserved:u64}
 #[derive(Clone,Copy)]
-struct Row{permit:Permit,count:u32,cpu_used:u64,memory_used:u64,last:Option<UseKey>,hold:Option<Hold>,closed:bool}
+struct Row{permit:Permit,count:u32,cpu_used:u64,memory_used:u64,last:Option<UseKey>,hold:Option<Hold>,accepted:bool,closed:bool}
 pub struct TrialTable{boot:u64,controller:Identity,epoch:u64,hi:u64,rows:[Option<Row>;MAX_PERMITS]}
 impl TrialTable{
     pub fn new(boot:u64,controller:Identity,epoch:u64)->Result<Self,Error>{
@@ -102,6 +102,12 @@ impl TrialTable{
         if t.flags!=0||t.target_id!=target.id||t.rules_generation!=profile.generation
             ||t.rule_hash!=hash(profile.canonical_bytes())||t.rules_generation!=config.header().rule_generation
             ||t.rule_hash!=config.header().rule_hash{return Err(Error::Denied);}
+        // Include all retained permit slots in the shared 64KiB rule/permit
+        // budget. The owner must also account for all signed templates.
+        if profile.canonical_bytes().len().checked_add(core::mem::size_of::<Self>()).and_then(|n|n.checked_add(BYTES)).is_none_or(|n|n>65536){
+            return Err(Error::Exhausted);
+        }
+        profile.validate_trial_template(t.rule_id,t.domain,t.target_id,&t.order[..usize::from(t.order_count)])?;
         verify_signed_entry(template_offset,&t)?;
         let id=self.hi.checked_add(1).ok_or(Error::Exhausted)?;
         let p=Permit{permit_id:id,boot_epoch:self.boot,target_generation:target.generation,start_ns,
@@ -111,11 +117,11 @@ impl TrialTable{
     }
     fn insert(&mut self,p:Permit)->Result<(),Error>{
         if p.boot_epoch!=self.boot||self.rows.iter().flatten().any(|r|r.permit.permit_id==p.permit_id
-            ||!r.closed&&r.permit.template_id==p.template_id&&r.permit.target_id==p.target_id){
+            ||r.permit.template_id==p.template_id&&r.permit.target_id==p.target_id){
             return Err(Error::Busy);
         }
         let slot=self.rows.iter_mut().find(|v|v.is_none()).ok_or(Error::Exhausted)?;
-        *slot=Some(Row{permit:p,count:0,cpu_used:0,memory_used:0,last:None,hold:None,closed:false});Ok(())
+        *slot=Some(Row{permit:p,count:0,cpu_used:0,memory_used:0,last:None,hold:None,accepted:false,closed:false});Ok(())
     }
     fn row(&self,id:u64)->Result<&Row,Error>{self.rows.iter().flatten().find(|r|r.permit.permit_id==id).ok_or(Error::Stale)}
     fn row_mut(&mut self,id:u64)->Result<&mut Row,Error>{self.rows.iter_mut().flatten().find(|r|r.permit.permit_id==id).ok_or(Error::Stale)}
@@ -149,7 +155,17 @@ impl TrialTable{
             ||memory>r.permit.memory_budget_bytes.saturating_sub(r.memory_used){return Err(Error::Exhausted);}
         verify_native(&r.permit)?;
         let h=Hold{permit_id:id,key,ordinal,accepted_count:r.count,cpu_reserved:cpu,memory_reserved:memory};
-        r.hold=Some(h);Ok(h)
+        r.hold=Some(h);r.accepted=false;Ok(h)
+    }
+    /// Count only at real publication acceptance. The reservation remains
+    /// owned until the independent completion/cost verifier settles it.
+    pub fn confirm_accept(&mut self,h:Hold,verify_native:impl FnOnce(Hold)->Result<(),Error>)->Result<(),Error>{
+        let r=self.row_mut(h.permit_id)?;
+        if r.hold!=Some(h){return Err(Error::Stale);}
+        if r.accepted{return Ok(());}
+        let count=r.count.checked_add(1).ok_or(Error::Exhausted)?;
+        verify_native(h)?;
+        r.count=count;r.accepted=true;r.last=Some(h.key);Ok(())
     }
     /// Only independent real acceptance/recovery may settle the hold.
     /// Failed-to-prove leaves it retained. Actual CPU overruns stay charged
@@ -160,9 +176,10 @@ impl TrialTable{
         if r.hold!=Some(h){return Err(Error::Stale);}
         let cpu=r.cpu_used.checked_add(actual_cpu).ok_or(Error::Exhausted)?;
         let memory=r.memory_used.checked_add(actual_memory).ok_or(Error::Exhausted)?;
-        let count=r.count.checked_add(u32::from(accepted)).ok_or(Error::Exhausted)?;
+        if r.accepted&&!accepted{return Err(Error::Denied);}
+        let count=r.count.checked_add(u32::from(accepted&&!r.accepted)).ok_or(Error::Exhausted)?;
         verify_native(h,accepted)?;
-        r.cpu_used=cpu;r.memory_used=memory;r.count=count;r.last=Some(h.key);r.hold=None;
+        r.cpu_used=cpu;r.memory_used=memory;r.count=count;r.last=Some(h.key);r.hold=None;r.accepted=false;
         if actual_cpu>h.cpu_reserved||actual_memory>h.memory_reserved
             ||cpu>r.permit.cpu_budget_ns||memory>r.permit.memory_budget_bytes{
             r.closed=true;return Err(Error::Exhausted);
