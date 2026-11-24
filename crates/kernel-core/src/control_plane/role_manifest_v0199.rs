@@ -34,6 +34,28 @@ pub const LEARNING_FEEDBACK:u64=1<<11;
 pub const CANDIDATE_SUBMIT:u64=1<<12;
 pub const AUDIT_READ:u64=1<<13;
 pub const FINDING_REVIEW:u64=1<<14;
+// Abstract manifest permissions, not the on-wire CapabilityRights bit numbers.
+pub const TRIAL_NORMAL:u64=1<<15;
+pub const ADVICE_DISPOSITION:u64=1<<16;
+pub const EPOCH_ALLOC:u64=1<<17;
+pub const AUDIT_ACK:u64=1<<18;
+
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum SnapshotView {
+    Operations, RedactedSecurity, ControllerRawEvidence,
+    RedactedValidation, RedactedSupervision,
+}
+/// Classification after EL1 capability lookup and canonical RPC decoding.
+/// Trial domain comes from a frozen offline template, not message claims.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum AuxOperation {
+    AuditRead, AuditAck, ModelPromote, ModelRollback,
+    EpochAllocate { target: Role },
+    TrialInstantiate { template_domain:u16 },
+    ValidationRegister, CandidateSubmit, DecisionRead, AdviceDisposition,
+    Ack,
+}
+
 
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Role{
@@ -59,12 +81,12 @@ impl Role{
         match self{
             Self::Operations=>SNAPSHOT|SEND_ADVICE,
             Self::Security=>SNAPSHOT|SEND_FINDING,
-            Self::DeterministicController=>READ_RULES|DECISION_REGISTER,
+            Self::DeterministicController=>SNAPSHOT|READ_RULES|DECISION_REGISTER|TRIAL_NORMAL|ADVICE_DISPOSITION,
             Self::Publisher=>READ_DECISIONS|PUBLISH_PLAN,
             Self::Validator=>CANDIDATE_READ|VALIDATION_REGISTER,
             Self::ModelManager=>MODEL_MANAGE|TRIAL_D15,
             Self::Learner=>LEARNING_FEEDBACK|CANDIDATE_SUBMIT,
-            Self::Supervisor=>AUDIT_READ|FINDING_REVIEW,
+            Self::Supervisor=>AUDIT_READ|AUDIT_ACK|EPOCH_ALLOC|FINDING_REVIEW,
         }
     }
 }
@@ -161,6 +183,60 @@ impl NativeRoleManifest {
         if charge_ns>CONTROL_NS_PER_100MS || pool>CONTROL_POOL_LIMIT {
             return Err(Error::Exhausted);
         }
+        Ok(())
+    }
+
+    /// Resolve an authenticated holder against its registered endpoint.
+    fn endpoint_holder(&self, actor:Identity, registered_endpoint:u64, cpu:usize)
+        ->Result<NativeRole,Error>
+    {
+        self.validate()?;
+        if cpu!=CONTROL_CPU || !actor.valid() || registered_endpoint==0 {
+            return Err(Error::Denied);
+        }
+        self.members.iter().copied().find(|m|m.actor==actor && m.endpoint_id==registered_endpoint)
+            .ok_or(Error::Denied)
+    }
+
+    /// CONTROL_AUX v1 preflight. EL1 must ALSO validate actual cap type/label,
+    /// holder generation, sequence, completion credit and protected operands.
+    /// A successful preflight is not execution authority or an ACK receipt.
+    pub fn check_aux(&self,actor:Identity,registered_endpoint:u64,cpu:usize,op:AuxOperation)
+        ->Result<Role,Error>
+    {
+        let entry=self.endpoint_holder(actor,registered_endpoint,cpu)?;
+        use AuxOperation::*;
+        let required=match op{
+            AuditRead=>AUDIT_READ,
+            AuditAck=>AUDIT_ACK,
+            ModelPromote|ModelRollback=>MODEL_MANAGE,
+            EpochAllocate{target} if target!=Role::Supervisor=>EPOCH_ALLOC,
+            EpochAllocate{..}=>return Err(Error::Denied),
+            TrialInstantiate{template_domain:15} if entry.role==Role::ModelManager=>TRIAL_D15,
+            TrialInstantiate{template_domain:1..=14}=>TRIAL_NORMAL,
+            TrialInstantiate{..}=>return Err(Error::Denied),
+            ValidationRegister=>VALIDATION_REGISTER,
+            CandidateSubmit=>CANDIDATE_SUBMIT,
+            DecisionRead=>READ_DECISIONS,
+            AdviceDisposition=>ADVICE_DISPOSITION,
+            // ACK still needs the actual holder's existing terminal slot.
+            Ack if !matches!(entry.role,Role::Operations|Role::Security)=>0,
+            Ack=>return Err(Error::Denied),
+        };
+        if required!=0 && entry.caps&required!=required{return Err(Error::Denied);}
+        Ok(entry.role)
+    }
+
+    /// Mandatory views only. Optional redacted validator/supervisor views
+    /// require a separately registered per-view cap.
+    pub fn check_snapshot_view(&self, actor:Identity, registered_endpoint:u64,
+        cpu:usize,view:SnapshotView)->Result<(),Error>{
+        let e=self.endpoint_holder(actor,registered_endpoint,cpu)?;
+        let allowed=matches!((e.role,view),
+            (Role::Operations,SnapshotView::Operations)
+            |(Role::Security,SnapshotView::RedactedSecurity)
+            |(Role::DeterministicController,SnapshotView::ControllerRawEvidence));
+        if !allowed || e.caps&SNAPSHOT==0{return Err(Error::Denied);}
         Ok(())
     }
 
@@ -268,4 +344,46 @@ mod tests{
         m=manifest();m.online_mask=0b0111;
         assert_eq!(m.validate(),Err(Error::Denied));
     }
+    #[test]
+    fn actual_holder_aux_matrix_keeps_brains_out_of_privileged_operations(){
+        use AuxOperation::*;
+        let m=manifest();
+        let cases=[
+            (AuditRead,Role::Supervisor),(AuditAck,Role::Supervisor),
+            (ModelPromote,Role::ModelManager),(ModelRollback,Role::ModelManager),
+            (EpochAllocate{target:Role::Publisher},Role::Supervisor),
+            (TrialInstantiate{template_domain:1},Role::DeterministicController),
+            (TrialInstantiate{template_domain:15},Role::ModelManager),
+            (ValidationRegister,Role::Validator),(CandidateSubmit,Role::Learner),
+            (DecisionRead,Role::Publisher),(AdviceDisposition,Role::DeterministicController),
+        ];
+        for (op,owner) in cases{
+            for member in m.members{
+                assert_eq!(m.check_aux(member.actor,member.endpoint_id,0,op).is_ok(),member.role==owner,"{:?} {:?}",member.role,op);
+                assert_eq!(m.check_aux(member.actor,member.endpoint_id,1,op),Err(Error::Denied));
+                assert_eq!(m.check_aux(Identity{id:member.actor.id,generation:2},member.endpoint_id,0,op),Err(Error::Denied));
+            }
+        }
+        let s=m.members[7];
+        assert_eq!(m.check_aux(s.actor,s.endpoint_id,0,EpochAllocate{target:Role::Supervisor}),Err(Error::Denied));
+        let ops=m.members[0];let controller=m.members[2];
+        assert_eq!(m.check_aux(ops.actor,controller.endpoint_id,0,AdviceDisposition),Err(Error::Denied));
+        assert_eq!(m.check_aux(ops.actor,ops.endpoint_id,0,Ack),Err(Error::Denied));
+    }
+
+    #[test]
+    fn mandatory_snapshot_views_are_not_interchangeable(){
+        let m=manifest();
+        for (view,role) in [
+            (SnapshotView::Operations,Role::Operations),
+            (SnapshotView::RedactedSecurity,Role::Security),
+            (SnapshotView::ControllerRawEvidence,Role::DeterministicController)] {
+            for member in m.members{
+                assert_eq!(m.check_snapshot_view(member.actor,member.endpoint_id,0,view).is_ok(),member.role==role);
+            }
+        }
+        let v=m.members[4];
+        assert_eq!(m.check_snapshot_view(v.actor,v.endpoint_id,0,SnapshotView::RedactedValidation),Err(Error::Denied));
+    }
+
 }
