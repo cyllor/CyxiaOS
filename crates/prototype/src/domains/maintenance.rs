@@ -825,7 +825,13 @@ impl ConsolePump {
                 Ok(false) => {
                     receipt.tx_full = true;
                     self.full = self.full.saturating_add(1);
-                    self.retry_ns = start.checked_add(100_000).ok_or(Error::Overflow)?;
+                    match start.checked_add(100_000) {
+                        Some(retry) => self.retry_ns = retry,
+                        None => {
+                            self.poisoned = true;
+                            failure = Some(Error::Overflow);
+                        }
+                    }
                     break;
                 }
                 Err(error) => {
@@ -835,6 +841,10 @@ impl ConsolePump {
                 }
             }
         }
+        // The accepted UART prefix is irrevocable regardless of subsequent
+        // timestamp or retry arithmetic failures. Settle its byte watermark
+        // before consulting the clock so the replay owner cannot lose custody.
+        self.written = self.written.saturating_add(u64::from(receipt.chars));
         let end = hardware.now_ns();
         if end < start {
             self.poisoned = true;
@@ -845,7 +855,6 @@ impl ConsolePump {
             receipt.policy_version = self.stamp.version;
         }
         self.cpu_ns = self.cpu_ns.saturating_add(receipt.cpu_ns);
-        self.written = self.written.saturating_add(u64::from(receipt.chars));
         if let Some(error) = failure {
             return Err(error);
         }
