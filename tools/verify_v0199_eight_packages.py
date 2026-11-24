@@ -47,7 +47,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,5,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,6,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -154,11 +154,24 @@ class Bringup:
                 'invalid aligned-window upper bound or sampled interval')
         require(rows('V0199_BOOTSTRAP_ACCOUNTING')==[(elapsed,accounted,upper)],
                 'CPU0 accounting UART and stopped memory disagree')
-        require(all(v==0 for v in words[493:]),'nonzero reserved accounting evidence')
+        # Independent integer reference for the two test-only seed inputs:
+        # operations scores 48 and 272 (selected 1), security score 342
+        # (severity 2). Both original and replacement EL0 must produce them.
+        probes=[]
+        expected=[(6,48|(272<<16),1),(7,342,2)]
+        for i,(role,packed,selected) in enumerate(expected):
+            for generation in (1,2):
+                at=493+i*8+(generation-1)*4
+                require(words[at:at+4]==(0x43594d4c50524f42,generation,packed,selected),
+                        'native EL0 integer model fixture output mismatch')
+                probes.append((role,generation,packed))
+        require(rows('V0199_MODEL_PROBE')==probes,'model fixture UART/QMP mismatch')
+        require(all(v==0 for v in words[509:]),'nonzero reserved evidence')
         return dict(guest_cpus=4,fixed_control_cpu=0,business_cpu_mask=14,
                     distinct_native_packages=8,private_stack_bytes=32768,
                     native_diagnostic_package_reloads=8,native_survivor_role_progress_pairs=56,
                     post_restart_live_roles=8,
+                    native_brain_operator_probes=4,trained_model_inference_verified=False,
                     sampled_cpu0_ns=elapsed,accounted_cpu0_ns=accounted,
                     control_window_upper_bound_ns=upper,coordination_gap_crossings=crossings,
                     class_cpu_ns=classes,accounting_interval_ns=[start_ns,end_ns],
