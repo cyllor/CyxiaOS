@@ -49,6 +49,9 @@ smp-selftest = ["selftest"]
 # Dedicated V0.19.9 4-vCPU native CPU0 EL0 role/TTBR isolation fixture.
 # Not a certification of the 8 real control services or G4.
 v0199-cpu0-role-selftest = ["smp-selftest"]
+# Real EL0 SVC #0 / x8=0x50 and 0x41 native mechanism fixture;
+# role2 and role8 execute separately inside CPU0's isolated TTBR0 tables.
+v0199-cpu0-svc-selftest = ["v0199-cpu0-role-selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
