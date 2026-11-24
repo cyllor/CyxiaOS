@@ -208,7 +208,7 @@ impl<'a> PlanV2<'a> {
                 || (self.header.flags == 1
                     && rec.advice_model_generation != self.header.active_model_generation)
             { return Err(Error::Denied); }
-            if rules_generation.is_some_and(|gen| gen!=rec.rules_generation)
+            if rules_generation.is_some_and(|seen_generation| seen_generation!=rec.rules_generation)
                 || rules_hash.is_some_and(|h| h!=rec.rules_hash)
                 || plan_digest.is_some_and(|h| h!=rec.plan_digest)
             { return Err(Error::Denied); }
