@@ -111,7 +111,7 @@ impl<'a> PieImage<'a> {
         if table_end>bytes.len(){return Err(Error::Invalid);}
         let entry=le64(bytes,24)?;
         if entry==0 || entry%4!=0{return Err(Error::Invalid);}
-        let mut loads=[None;MAX_HEADERS];
+        let mut loads: [Option<LoadSegment>; MAX_HEADERS] = [None; MAX_HEADERS];
         let mut count=0usize;
         let mut relro=None;
         let mut phdr=None;
