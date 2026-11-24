@@ -1,0 +1,1212 @@
+{
+  "schema": "cyxia-v0199-required-proof-inventory/v1",
+  "normative_source": "docs/design/baselines/v0.19.9-implementation-spec.txt",
+  "section": "安§7.4 pp.171–172",
+  "note": "Required proof inventory only. It is not a Verdict v4 record, proof, or PASS. All absent evidence remains NOT_RUN.",
+  "required_ids": 127,
+  "cases": [
+    {
+      "id": "P01",
+      "test_id": 65537,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P02",
+      "test_id": 65538,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P03",
+      "test_id": 65539,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P04",
+      "test_id": 65540,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P05",
+      "test_id": 65541,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P06",
+      "test_id": 65542,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P07",
+      "test_id": 65543,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P08",
+      "test_id": 65544,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P09",
+      "test_id": 65545,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "P10",
+      "test_id": 65546,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "P11",
+      "test_id": 65547,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "P12",
+      "test_id": 65548,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "P13",
+      "test_id": 65549,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F01",
+      "test_id": 131073,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F02",
+      "test_id": 131074,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F03",
+      "test_id": 131075,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F04",
+      "test_id": 131076,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F05",
+      "test_id": 131077,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F06",
+      "test_id": 131078,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F07",
+      "test_id": 131079,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F08",
+      "test_id": 131080,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F09",
+      "test_id": 131081,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F10",
+      "test_id": 131082,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F11",
+      "test_id": 131083,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F12",
+      "test_id": 131084,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "F13",
+      "test_id": 131085,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M01",
+      "test_id": 196609,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M02",
+      "test_id": 196610,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M03",
+      "test_id": 196611,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M04",
+      "test_id": 196612,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M05",
+      "test_id": 196613,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M06",
+      "test_id": 196614,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M07",
+      "test_id": 196615,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M08",
+      "test_id": 196616,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M09",
+      "test_id": 196617,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M10",
+      "test_id": 196618,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M11",
+      "test_id": 196619,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M12",
+      "test_id": 196620,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M13",
+      "test_id": 196621,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "M14",
+      "test_id": 196622,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "M15",
+      "test_id": 196623,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "N01",
+      "test_id": 262145,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N02",
+      "test_id": 262146,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N03",
+      "test_id": 262147,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N04",
+      "test_id": 262148,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N05",
+      "test_id": 262149,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N06",
+      "test_id": 262150,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N07",
+      "test_id": 262151,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N08",
+      "test_id": 262152,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N09",
+      "test_id": 262153,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N10",
+      "test_id": 262154,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N11",
+      "test_id": 262155,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N12",
+      "test_id": 262156,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N13",
+      "test_id": 262157,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N14",
+      "test_id": 262158,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N15",
+      "test_id": 262159,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "N16",
+      "test_id": 262160,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D01",
+      "test_id": 327681,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D02",
+      "test_id": 327682,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D03",
+      "test_id": 327683,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D04",
+      "test_id": 327684,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "D05",
+      "test_id": 327685,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D06",
+      "test_id": 327686,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "D07",
+      "test_id": 327687,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D08",
+      "test_id": 327688,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D09",
+      "test_id": 327689,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "D10",
+      "test_id": 327690,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "D11",
+      "test_id": 327691,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D12",
+      "test_id": 327692,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D13",
+      "test_id": 327693,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "D14",
+      "test_id": 327694,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "S01",
+      "test_id": 393217,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S02",
+      "test_id": 393218,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S03",
+      "test_id": 393219,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S04",
+      "test_id": 393220,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S05",
+      "test_id": 393221,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S06",
+      "test_id": 393222,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S07",
+      "test_id": 393223,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S08",
+      "test_id": 393224,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S09",
+      "test_id": 393225,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "S10",
+      "test_id": 393226,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S11",
+      "test_id": 393227,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S12",
+      "test_id": 393228,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "S13",
+      "test_id": 393229,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "J01",
+      "test_id": 458753,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "J02",
+      "test_id": 458754,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "J03",
+      "test_id": 458755,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J04",
+      "test_id": 458756,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J05",
+      "test_id": 458757,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J06",
+      "test_id": 458758,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J07",
+      "test_id": 458759,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "J08",
+      "test_id": 458760,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J09",
+      "test_id": 458761,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J10",
+      "test_id": 458762,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J11",
+      "test_id": 458763,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J12",
+      "test_id": 458764,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "J13",
+      "test_id": 458765,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A01",
+      "test_id": 524289,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "A02",
+      "test_id": 524290,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A03",
+      "test_id": 524291,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A04",
+      "test_id": 524292,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "A05",
+      "test_id": 524293,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A06",
+      "test_id": 524294,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "A07",
+      "test_id": 524295,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A08",
+      "test_id": 524296,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A09",
+      "test_id": 524297,
+      "g4_required": [
+        "RUNTIME_QEMU"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A10",
+      "test_id": 524298,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A11",
+      "test_id": 524299,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A15",
+      "test_id": 524303,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "A16",
+      "test_id": 524304,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E01",
+      "test_id": 589825,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E02",
+      "test_id": 589826,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E03",
+      "test_id": 589827,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "E04",
+      "test_id": 589828,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E05",
+      "test_id": 589829,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E06",
+      "test_id": 589830,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E07",
+      "test_id": 589831,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E08",
+      "test_id": 589832,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": [
+        "ARCH_A53"
+      ]
+    },
+    {
+      "id": "E13",
+      "test_id": 589837,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E14",
+      "test_id": 589838,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "E15",
+      "test_id": 589839,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H01",
+      "test_id": 655361,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H02",
+      "test_id": 655362,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H03",
+      "test_id": 655363,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H04",
+      "test_id": 655364,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H05",
+      "test_id": 655365,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    },
+    {
+      "id": "H06",
+      "test_id": 655366,
+      "g4_required": [
+        "RUNTIME_QEMU",
+        "STATIC_EL1",
+        "MODEL_CHECK"
+      ],
+      "g5_additional": []
+    }
+  ]
+}
