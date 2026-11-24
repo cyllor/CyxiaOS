@@ -1,0 +1,213 @@
+//! Canonical CapRecord v3 and protected static-control capability registry.
+//! No user can manufacture a record/handle by changing wire fields. Root
+//! issuance requires a confirmed durable boot, actual role registry and
+//! the independently signed startup catalog. This module covers static
+//! control roots, not general business object creation/derived-cap graph.
+use super::{Error,durable_role_epoch_v0199::DurableEpochGate,offline_config_v1::VerifiedOfflineConfig};
+use crate::control_plane::{Identity,role_manifest_v0199::{self as rm,NativeRoleManifest,Role}};
+pub const RECORD_BYTES:usize=128;
+pub const IPC_SEND:u64=1<<16;
+pub const IPC_RECV:u64=1<<17;
+pub const PLAN_PUBLISH:u64=1<<26;
+pub const CONTROL_DECISION:u64=1<<27;
+pub const SNAPSHOT_READ:u64=1<<28;
+fn u16at(b:&[u8],i:usize)->u16{u16::from_le_bytes(b[i..i+2].try_into().unwrap())}
+fn u32at(b:&[u8],i:usize)->u32{u32::from_le_bytes(b[i..i+4].try_into().unwrap())}
+fn u64at(b:&[u8],i:usize)->u64{u64::from_le_bytes(b[i..i+8].try_into().unwrap())}
+fn put16(b:&mut[u8],i:usize,v:u16){b[i..i+2].copy_from_slice(&v.to_le_bytes());}
+fn put32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
+fn put64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct CapRecordV3{
+    pub cap_id:u64,pub holder:Identity,pub target:Identity,
+    pub parent_cap_id:u64,pub parent_generation:u64,pub deny_generation:u64,pub rights:u64,
+    pub object_kind:u16,pub state:u16,pub depth:u16,pub source_role:u32,
+    pub owner_group:u32,pub record_generation:u64,
+}
+impl CapRecordV3{
+    fn valid(self)->bool{
+        if self.cap_id==0||!self.holder.valid()||!self.target.valid()
+            ||self.record_generation==0||!(1..=3).contains(&self.state)||self.depth>8
+            ||!(1..=15).contains(&self.source_role)||!(self.owner_group<=15||self.owner_group==u32::MAX){
+            return false;
+        }
+        if if self.depth==0{self.parent_cap_id!=0||self.parent_generation!=0}
+           else{self.parent_cap_id==0||self.parent_generation==0||self.parent_cap_id==self.cap_id}{
+            return false;
+        }
+        let mask=match self.object_kind{
+            1=>0b1110,2=>(1<<8)|(1<<9)|(1<<13),3=>(1<<10)|(1<<11)|(1<<12)|(1<<14),
+            4=>IPC_SEND|IPC_RECV,5=>1<<24,6=>1<<25,7=>PLAN_PUBLISH,
+            8=>if self.rights&CONTROL_DECISION!=0{CONTROL_DECISION}else{IPC_SEND|IPC_RECV},
+            9|10=>0,11=>1,12=>SNAPSHOT_READ,_=>return false,
+        };
+        self.rights&!mask==0
+    }
+    pub fn decode(b:&[u8])->Result<Self,Error>{
+        if b.len()!=128||u32at(b,0)!=0x43594350||u16at(b,4)!=3||u16at(b,6)!=128
+            ||u16at(b,86)!=0||b[104..].iter().any(|&v|v!=0){return Err(Error::Invalid);}
+        let r=Self{cap_id:u64at(b,8),holder:Identity{id:u64at(b,16),generation:u64at(b,24)},
+            target:Identity{id:u64at(b,32),generation:u64at(b,40)},parent_cap_id:u64at(b,48),
+            parent_generation:u64at(b,56),deny_generation:u64at(b,64),rights:u64at(b,72),
+            object_kind:u16at(b,80),state:u16at(b,82),depth:u16at(b,84),source_role:u32at(b,88),
+            owner_group:u32at(b,92),record_generation:u64at(b,96)};
+        if !r.valid(){return Err(Error::Invalid);}Ok(r)
+    }
+    pub fn encode(self)->Result<[u8;128],Error>{
+        if !self.valid(){return Err(Error::Invalid);}
+        let mut b=[0;128];put32(&mut b,0,0x43594350);put16(&mut b,4,3);put16(&mut b,6,128);
+        for (at,v) in [(8,self.cap_id),(16,self.holder.id),(24,self.holder.generation),
+            (32,self.target.id),(40,self.target.generation),(48,self.parent_cap_id),
+            (56,self.parent_generation),(64,self.deny_generation),(72,self.rights),(96,self.record_generation)]{
+            put64(&mut b,at,v);
+        }
+        put16(&mut b,80,self.object_kind);put16(&mut b,82,self.state);put16(&mut b,84,self.depth);
+        put32(&mut b,88,self.source_role);put32(&mut b,92,self.owner_group);Ok(b)
+    }
+}
+/// Internal protected labels, NOT additional wire ABI or new cap bits.
+/// Distinct actual endpoint objects are allocated by the boot registry.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum Label{
+    OperationsView,SecurityView,ControllerView,AdviceSend,FindingSend,
+    RulesRead,DecisionRegister,DecisionRead,Publish,TrialNormal,Disposition,
+    CandidateRead,ValidationRegister,ModelManage,TrialD15,FeedbackRead,CandidateSubmit,
+    AuditRead,AuditAck,EpochAllocate,FindingReview,
+}
+impl Label{
+    fn requirement(self)->(Role,u64,u16,u64){
+        use Label::*;
+        match self{
+            OperationsView=>(Role::Operations,rm::SNAPSHOT,12,SNAPSHOT_READ),
+            SecurityView=>(Role::Security,rm::SNAPSHOT,12,SNAPSHOT_READ),
+            ControllerView=>(Role::DeterministicController,rm::SNAPSHOT,12,SNAPSHOT_READ),
+            AdviceSend=>(Role::Operations,rm::SEND_ADVICE,4,IPC_SEND),
+            FindingSend=>(Role::Security,rm::SEND_FINDING,4,IPC_SEND),
+            RulesRead=>(Role::DeterministicController,rm::READ_RULES,8,IPC_SEND),
+            DecisionRegister=>(Role::DeterministicController,rm::DECISION_REGISTER,8,CONTROL_DECISION),
+            DecisionRead=>(Role::Publisher,rm::READ_DECISIONS,8,IPC_SEND),
+            Publish=>(Role::Publisher,rm::PUBLISH_PLAN,7,PLAN_PUBLISH),
+            TrialNormal=>(Role::DeterministicController,rm::TRIAL_NORMAL,8,IPC_SEND),
+            Disposition=>(Role::DeterministicController,rm::ADVICE_DISPOSITION,8,IPC_SEND),
+            CandidateRead=>(Role::Validator,rm::CANDIDATE_READ,8,IPC_SEND),
+            ValidationRegister=>(Role::Validator,rm::VALIDATION_REGISTER,8,IPC_SEND),
+            ModelManage=>(Role::ModelManager,rm::MODEL_MANAGE,8,IPC_SEND),
+            TrialD15=>(Role::ModelManager,rm::TRIAL_D15,8,IPC_SEND),
+            FeedbackRead=>(Role::Learner,rm::LEARNING_FEEDBACK,8,IPC_SEND),
+            CandidateSubmit=>(Role::Learner,rm::CANDIDATE_SUBMIT,8,IPC_SEND),
+            AuditRead=>(Role::Supervisor,rm::AUDIT_READ,8,IPC_SEND),
+            AuditAck=>(Role::Supervisor,rm::AUDIT_ACK,8,IPC_SEND),
+            EpochAllocate=>(Role::Supervisor,rm::EPOCH_ALLOC,8,IPC_SEND),
+            FindingReview=>(Role::Supervisor,rm::FINDING_REVIEW,4,IPC_RECV),
+        }
+    }
+}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+struct Entry{label:Label,record:CapRecordV3}
+/// Preallocated table. Retired records are tombstones until boot ends;
+/// no slot reuse or old-generation handle resurrection.
+pub struct StaticControlCaps<const N:usize>{boot:u64,rows:[Option<Entry>;N]}
+impl<const N:usize> StaticControlCaps<N>{
+    pub fn new(epochs:&DurableEpochGate,config:&VerifiedOfflineConfig<'_>)->Result<Self,Error>{
+        let boot=epochs.confirmed_config_boot(config)?;
+        Ok(Self{boot,rows:[None;N]})
+    }
+    fn issue_checked(&mut self,manifest:&NativeRoleManifest,label:Label,r:CapRecordV3,
+        verify_catalog_and_object:impl FnOnce(Label,&CapRecordV3)->Result<(),Error>)->Result<u64,Error>{
+        let (role,authority,kind,rights)=label.requirement();
+        if !r.valid()||r.state!=1||r.depth!=0||r.object_kind!=kind||r.rights!=rights
+            ||r.source_role!=u32::from(role.id())||r.owner_group!=u32::MAX
+            ||r.record_generation!=1
+            ||self.rows.iter().flatten().any(|e|e.record.cap_id==r.cap_id){
+            return Err(Error::Unauthorized);
+        }
+        manifest.can_act(role,r.holder,authority,0).map_err(|_|Error::Unauthorized)?;
+        let at=self.rows.iter().position(Option::is_none).ok_or(Error::Capacity)?;
+        let index=u32::try_from(at).map_err(|_|Error::Capacity)?;
+        verify_catalog_and_object(label,&r)?;
+        self.rows[at]=Some(Entry{label,record:r});
+        Ok((1u64<<32)|u64::from(index))
+    }
+    /// Actual catalog/target owner validates the exact root grant and object
+    /// lifetime. Manifest permission masks alone are not an issued cap.
+    pub fn issue_root(&mut self,epochs:&DurableEpochGate,config:&VerifiedOfflineConfig<'_>,
+        manifest:&NativeRoleManifest,label:Label,r:CapRecordV3,
+        verify_catalog_and_object:impl FnOnce(Label,&CapRecordV3)->Result<(),Error>)->Result<u64,Error>{
+        if epochs.confirmed_config_boot(config)?!=self.boot{return Err(Error::Stale);}
+        let role=label.requirement().0;
+        if epochs.service_generation(role)?!=r.holder.generation{return Err(Error::Stale);}
+        self.issue_checked(manifest,label,r,verify_catalog_and_object)
+    }
+    /// Recheck the authenticated task, cap handle, static label and exact
+    /// object generation at every use. Source-role wire fields confer nothing.
+    pub fn lookup(&self,boot:u64,holder:Identity,cpu:usize,handle:u64,label:Label,target:Identity,
+        verify_live:impl FnOnce(&CapRecordV3)->Result<(),Error>)->Result<CapRecordV3,Error>{
+        if boot!=self.boot||cpu!=0||!holder.valid(){return Err(Error::Unauthorized);}
+        let entry=self.rows.get(handle as u32 as usize).and_then(Option::as_ref).ok_or(Error::Unauthorized)?;
+        let r=entry.record;
+        if holder.id!=r.holder.id{return Err(Error::Unauthorized);}
+        if holder!=r.holder||handle>>32!=r.record_generation||r.state!=1||target!=r.target{return Err(Error::Stale);}
+        if entry.label!=label{return Err(Error::Unauthorized);}
+        verify_live(&r)?;Ok(r)
+    }
+    /// Seal new use before stopping/draining the role. Retirement requires
+    /// independent native reference/DMA/IPC/accepted-work evidence.
+    pub fn fence_holder(&mut self,holder:Identity)->Result<(),Error>{
+        let mut found=false;
+        for e in self.rows.iter_mut().flatten(){if e.record.holder==holder&&e.record.state==1{
+            e.record.state=2;found=true;
+        }}
+        if found{Ok(())}else{Err(Error::Stale)}
+    }
+    pub fn retire_holder(&mut self,holder:Identity,
+        mut verify_stop:impl FnMut(&CapRecordV3)->Result<(),Error>)->Result<(),Error>{
+        let mut found=false;
+        for e in self.rows.iter().flatten().filter(|e|e.record.holder==holder){
+            if e.record.state==1{return Err(Error::Busy);}
+            if e.record.state==2{verify_stop(&e.record)?;found=true;}
+        }
+        if !found{return Err(Error::Stale);}
+        for e in self.rows.iter_mut().flatten().filter(|e|e.record.holder==holder&&e.record.state==2){
+            e.record.state=3;
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use crate::control_plane::role_manifest_v0199::{NativeRole,PrivateRegion,ROLES};
+    fn manifest()->NativeRoleManifest{
+        NativeRoleManifest{online_mask:15,other_protected_pool_bytes:1024,other_control_ns_per_100ms:1,
+            members:core::array::from_fn(|i|NativeRole{role:ROLES[i],
+                actor:Identity{id:u64::from(ROLES[i].id()),generation:1},ttbr0_root:0x100000+i as u64*4096,
+                private_rw:PrivateRegion{base:0x200000+i as u64*4096,bytes:4096},caps:ROLES[i].allowed_caps(),
+                control_ns_per_100ms:1,cpu_mask:1,thread_count:1,endpoint_id:10+i as u64})}
+    }
+    fn publisher()->CapRecordV3{
+        CapRecordV3{cap_id:17,holder:Identity{id:8,generation:1},target:Identity{id:90,generation:3},
+            parent_cap_id:0,parent_generation:0,deny_generation:1,rights:PLAN_PUBLISH,object_kind:7,
+            state:1,depth:0,source_role:8,owner_group:u32::MAX,record_generation:1}
+    }
+    #[test]
+    fn record_type_rights_and_exact_holder_cap_lookup(){
+        let m=manifest();let r=publisher();let b=r.encode().unwrap();assert_eq!(CapRecordV3::decode(&b),Ok(r));
+        let mut bad=b;bad[104]=1;assert_eq!(CapRecordV3::decode(&bad),Err(Error::Invalid));
+        assert!(CapRecordV3{rights:PLAN_PUBLISH|SNAPSHOT_READ,..r}.encode().is_err());
+        // Private helper exercises the table only; no test signature or
+        // durable generation is issued as a real production credential.
+        let mut table=StaticControlCaps::<2>{boot:1,rows:[None;2]};
+        let wrong=CapRecordV3{holder:m.members[0].actor,source_role:6,..r};
+        assert_eq!(table.issue_checked(&m,Label::Publish,wrong,|_,_|panic!()),Err(Error::Unauthorized));
+        let h=table.issue_checked(&m,Label::Publish,r,|_,_|Ok(())).unwrap();
+        assert_eq!(table.lookup(1,r.holder,0,h,Label::Publish,r.target,|_|Ok(())),Ok(r));
+        assert_eq!(table.lookup(1,m.members[0].actor,0,h,Label::Publish,r.target,|_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(table.lookup(1,r.holder,1,h,Label::Publish,r.target,|_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(table.lookup(1,r.holder,0,h,Label::DecisionRegister,r.target,|_|panic!()),Err(Error::Unauthorized));
+        table.fence_holder(r.holder).unwrap();
+        assert_eq!(table.lookup(1,r.holder,0,h,Label::Publish,r.target,|_|panic!()),Err(Error::Stale));
+        assert_eq!(table.retire_holder(r.holder,|_|Err(Error::Unknown)),Err(Error::Unknown));
+        table.retire_holder(r.holder,|_|Ok(())).unwrap();
+        assert_eq!(table.issue_checked(&m,Label::Publish,r,|_,_|panic!()),Err(Error::Unauthorized));
+    }
+}
