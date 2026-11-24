@@ -100,8 +100,9 @@ impl FeedbackInbox{
         if batch.count()==0||batch.count()>MAX_ACTIONS{return Err(Error::Invalid);}
         // Complete preflight before installing any record. Retrying the
         // exact same batch is harmless; a conflicting decision is denied.
-        let mut staged:[Option<FeedbackRecord>;MAX_ACTIONS]=[None;MAX_ACTIONS];
-        for (i,slot) in staged[..batch.count()].iter_mut().enumerate(){
+        let mut needed=0usize;
+        let mut missing=0u16;
+        for i in 0..batch.count(){
             let r=batch.record(i)?;
             let d=DecisionRecordV3::decode(&r.decision)?;
             if let Some(old)=self.rows.iter().flatten().find(|old|{
@@ -109,12 +110,18 @@ impl FeedbackInbox{
                     (v.boot_epoch,v.controller_epoch,v.decision_seq)==(d.boot_epoch,d.controller_epoch,d.decision_seq))
             }){
                 if old.evidence_digest()!=r.evidence_digest(){return Err(Error::Denied);}
-            }else{*slot=Some(r);}
+            }else{needed+=1;missing|=1u16<<i;}
         }
-        if staged.iter().flatten().count()>self.rows.iter().filter(|r|r.is_none()).count(){
-            return Err(Error::Exhausted);
+        if needed>self.rows.iter().filter(|r|r.is_none()).count(){return Err(Error::Exhausted);}
+        // Repeat the deterministic decode of immutable verified input, rather
+        // than allocating an entire 16-record (~16KiB) EL1 stack staging array.
+        // No new fallible external work occurs after preflight.
+        for i in 0..batch.count(){
+            if missing&(1u16<<i)!=0{
+                let r=batch.record(i).expect("immutable feedback preflight");
+                *self.rows.iter_mut().find(|v|v.is_none()).unwrap()=Some(r);
+            }
         }
-        for r in staged.into_iter().flatten(){*self.rows.iter_mut().find(|v|v.is_none()).unwrap()=Some(r);}
         Ok(())
     }
     pub fn read(&self,actor:Identity,index:usize)->Result<Option<&FeedbackRecord>,Error>{
