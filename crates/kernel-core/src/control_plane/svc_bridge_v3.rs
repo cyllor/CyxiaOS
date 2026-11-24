@@ -45,6 +45,22 @@ pub struct SvcV3Bridge<'a,'pool> {
     pub decision_endpoint_cap:u64,
     pub publisher_cap:u64,
 }
+/// ABI3 0x40 native read adapter. The caller owns the stopped context and
+/// has independently preflighted the entire writable user span. This
+/// function resolves the exact registered view and returns immutable
+/// bytes for checked copyout; it cannot create observations or caps.
+pub fn read_snapshot_rpc(
+    store:&super::snapshot_store_v3::SnapshotStore,
+    manifest:&super::role_manifest_v0199::NativeRoleManifest,
+    caller:VerifiedNativeCaller,args:[u64;6],ledger:u64,cores:u64,now_ns:u64,
+    verify_live_cap:impl FnOnce(super::snapshot_store_v3::ViewGrant)->Result<(),Error>,
+)->Result<[u8;264],Error>{
+    decode_v3(caller.package_abi,0x40,args).map_err(|_|Error::Invalid)?;
+    if args[0]!=caller.endpoint_cap||caller.endpoint_cap==0||caller.cpu!=0{return Err(Error::Denied);}
+    store.read(manifest,caller.identity,caller.cpu,caller.endpoint_cap,args[1] as u16,
+        args[2],ledger,cores,now_ns,verify_live_cap)
+}
+
 /// Existing 0x50 CONTROL_AUX op9/op12, not the separate registration
 /// endpoint. The native adapter supplies a current authenticated caller
 /// from the protected capability registry, and a checked output buffer.
