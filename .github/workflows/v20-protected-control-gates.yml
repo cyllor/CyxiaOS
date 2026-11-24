@@ -1,0 +1,40 @@
+name: V0.20 protected control gate components
+on:
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'crates/kernel-core/src/control_plane/**'
+      - 'crates/kernel-core/src/security/**'
+      - 'crates/control-model/**'
+      - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
+      - '.github/workflows/v20-protected-control-gates.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  protected-gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify complete control-plane component regressions
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/control-gates
+          git rev-parse HEAD > artifacts/control-gates/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/control-gates/tree.txt
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+          cargo test --locked --offline -p cyxia-kernel-core --lib control_plane 2>&1 | tee artifacts/control-gates/control-plane.log
+          cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/control-gates/model.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-protected-gate-components-${{ github.sha }}
+          path: artifacts/control-gates/
+          retention-days: 7
