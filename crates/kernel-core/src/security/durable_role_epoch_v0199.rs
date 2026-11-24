@@ -136,6 +136,27 @@ impl DurableEpochGate{
         if hash(&bytes)!=ticket.after_digest{return Err(Error::Conflict);}
         Ok(bytes)
     }
+    /// Production adapter entry: require a complete baseline-v1 redo chain
+    /// covering the exact prepared state image. In addition, the EL1 file
+    /// owner must authenticate the superblock and state inode mapping, prove
+    /// both real device FLUSH completions in order, and establish that this
+    /// transaction is the current committed version (not historical media).
+    /// This entry never writes blocks, fabricates FLUSH or accepts v2 media.
+    pub fn confirm_from_redo(
+        &mut self,ticket:PreparedEpoch,receipt:CommitEvidence,readback:&[u8],
+        superblock_raw:&[u8],first_log_block:u32,state_home:u64,
+        begin:&[u8],redos:&[&[u8]],commit:&[u8],
+        verify_native:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>,
+    )->Result<Outcome,Error>{
+        use super::file_media_v0199::{SuperblockV1,verify_state_redo_v1};
+        let superblock=SuperblockV1::decode(superblock_raw)?;
+        if superblock.fs_uuid!=receipt.fs_uuid || superblock.log_epoch!=receipt.log_epoch{
+            return Err(Error::Conflict);
+        }
+        verify_state_redo_v1(superblock,first_log_block,state_home,begin,redos,commit,
+            readback,receipt.txid,receipt.commit_lsn)?;
+        self.confirm(ticket,receipt,readback,verify_native)
+    }
     /// Caller must obtain a stable read-back from the actual native file
     /// owner. The independent verifier authenticates the complete commit
     /// identity, exact after-image and real redo/FLUSH before releasing it.
