@@ -189,6 +189,7 @@ dependencies = [
  "cyxia-contracts",
  "cyxia-control-model",
  "cyxia-prototype",
+ "sha2",
 ]
 
 [[package]]
