@@ -1,0 +1,19 @@
+# V0.20 native service integration increment
+
+Base: PR #81 head 61aaee04f454c1fb70b77de5cdb30726787f925b. Keep all eight formal roles, fixed CPU0, separate EL0 protection domains, 32 KiB stacks, 70 ms / 100 ms and all 127 stable acceptance IDs unchanged.
+
+## Observed baseline (not results of this increment)
+
+Run 45431088081: current model unit tests 3 PASS, epoch redo unit test 1 PASS, 1GiB scratch-disk native build and native run PASS. Two fresh QEMU processes recovered boot epochs 0 -> 1 -> 2 with two real FLUSH completions per process; both processes were force-stopped, and independent on-disk bytes matched. Artifact 14940095256. Both eight-role ELF builds failed with unbound runtime relocation; no new eight-role guest run. Fixed-control and snapshot component workflows PASS.
+
+## This increment
+
+- Native package build: extract at most 512 symbol-zero AArch64 RELATIVE entries, reject other relocation kinds/external linkage, authenticate exact sidecar bytes and counts in immutable catalog; stage then seal RELRO before mapping. Independent verifier compares sidecar to ELF and native evidence. Minimal local AArch64 clang/LLD assembly sample confirmed the explicit RELRO layout and inert SYMBOLIC/PIE flags; this is not a Rust package build or a guest run.
+- Scratch-disk native fixture: extend the previous successful two-process boot test to four redo transactions. On each boot, actually run an isolated diagnostic EL0 client, inject a guard instruction abort, disconnect the old root, complete TLBI and scrub its private pages, persist the next security-role service generation with real FLUSH, then run a replacement private diagnostic context. Recover actual redo image on next process instead of reconstructing from a volatile counter. This intentionally uses shared immutable fixture code and 4KiB scratch client stacks, not the production role7 executable, full service lifecycle, or production filesystem inode ownership. It rejects incomplete prior boot pairs; arbitrary crash-tail recovery remains unimplemented.
+- Continuous diagnostic CPU0 accounting now starts before the first native package load. Initial loading is charged against the existing EL1 coordination subledger; no recovery borrowing or cap increase. Final UART output precedes the final sample and release seal. QMP resumes a not-yet-sealed capture. Earlier architectural/SMP boot and the final memory seal/halt remain outside this measurement, aligned-window split still conservative. Do not claim production exact coverage.
+- Add canonical local ActionSchema v2 static payload validation for all fifteen domains at the PlanV2 boundary; D12 subminimum rates remain trial-only. Actual subsystem authority, execution, and effect evidence must still be supplied by native owners.
+- Add a protected bounded 64-record execution feedback inbox and report-based terminal settlement requiring exact retained DecisionRecord/ApplyReport and registered AdviceDisposition/Advice bytes before release. Learner read is generation-bound; supervisor retirement requires independent custody. No reward/paired replay/trained model provenance is fabricated. The production SVC dispatcher and actual protected pool allocation are still to be wired. The inbox is an internal component, not a new wire ABI.
+
+## Pending gates
+
+Authentic trained initial models and signed current-schema provenance, real domain observations, eight functional role service loops and IPC, actual native per-domain executor effects, complete independent learning/reward pipeline, full filesystem mount/replay/role restart with real persistent identities, exact complete CPU0 accounting, formal G0/G1 and 127 G4 IDs remain open. G5 hardware remains independent. All new code and expanded fixture results require CI validation; do not merge or mark formal PASS on the basis of this increment alone.
