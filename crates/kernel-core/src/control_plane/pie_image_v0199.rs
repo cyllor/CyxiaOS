@@ -155,7 +155,7 @@ impl<'a> PieImage<'a> {
                     count+=1;
                 }
                 PT_PHDR=>{
-                    if phdr.is_some() || file==0
+                    if phdr.is_some() || file==0 || mem!=file
                         || off!=ph_off || file!=ph_num as u64*56
                         || range_end(va,mem).is_err()
                     {return Err(Error::Invalid);}
@@ -191,8 +191,12 @@ impl<'a> PieImage<'a> {
             {return Err(Error::Denied);}
         }
         if let Some((start,len))=phdr {
-            if !loads[..count].iter().flatten()
-                .any(|seg|seg.contains_file(start,len))
+            // A mapped interval alone is insufficient: it must map the
+            // exact verified program-header bytes from the file.
+            if !loads[..count].iter().flatten().any(|seg|
+                seg.contains_file(start,len)
+                && start.checked_sub(seg.virtual_address)
+                    .and_then(|offset|seg.file_offset.checked_add(offset))==Some(ph_off))
             {return Err(Error::Denied);}
         }
         Ok(Self{
@@ -293,6 +297,84 @@ impl<'a> PieImage<'a> {
         }
         Ok(())
     }
+}
+
+/// Protected launch inventory, not a new wire schema. These entries must
+/// originate in the read-only boot manifest. Eight role identities may share
+/// immutable code pages, but never silently reuse an unregistered package ID.
+use super::role_manifest_v0199::{Role, ROLES, ROLE_COUNT};
+pub const ROLE_STACK_BYTES: usize = 32*1024;
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct RolePackageSpec {
+    pub role:Role,
+    pub package_id:u64,
+    pub abi:u16,
+    pub image_bytes:usize,
+    pub image_sha256:[u8;32],
+    pub relative_count:usize,
+    pub relative_sha256:[u8;32],
+    pub stack_bytes:usize,
+}
+#[derive(Clone,Copy)]
+pub struct RolePackageInput<'a>{
+    pub package_id:u64,
+    pub bytes:&'a[u8],
+    pub relative:&'a[RelativeRelocation],
+}
+/// The build/boot adapter hashes the canonical LE triples, including count.
+/// It must authenticate this hash with the immutable role/package manifest,
+/// separately from the ELF bytes. No relocations are read from live EL0.
+pub fn relative_sidecar_digest(entries:&[RelativeRelocation])->Result<[u8;32],Error>{
+    if entries.len()>MAX_RELOCATIONS{return Err(Error::Exhausted);}
+    let mut h=Sha256::new();
+    h.update(b"CyxiaOS-v0199-relative-sidecar");
+    h.update((entries.len() as u32).to_le_bytes());
+    for e in entries{
+        h.update(e.offset.to_le_bytes());h.update(e.info.to_le_bytes());h.update(e.addend.to_le_bytes());
+    }
+    Ok(h.finalize().into())
+}
+/// Bound package, immutable image copy and sidecar share one lifetime.
+/// The parsed image is private so consumers cannot replace its entry/loads.
+pub struct VerifiedRolePackage<'a>{
+    spec:RolePackageSpec,
+    image:PieImage<'a>,
+    relative:&'a[RelativeRelocation],
+}
+impl<'a> VerifiedRolePackage<'a>{
+    pub fn verify(spec:RolePackageSpec,input:RolePackageInput<'a>)->Result<Self,Error>{
+        if spec.package_id==0 || input.package_id!=spec.package_id
+            || spec.abi!=crate::security::syscall_v3::ABI_VERSION
+            || spec.stack_bytes!=ROLE_STACK_BYTES || spec.image_bytes!=input.bytes.len()
+            || spec.relative_count!=input.relative.len()
+            || spec.relative_sha256!=relative_sidecar_digest(input.relative)?
+        {return Err(Error::Denied);}
+        let image=PieImage::parse_verified(input.bytes,spec.image_sha256)?;
+        Ok(Self{spec,image,relative:input.relative})
+    }
+    pub fn role(&self)->Role{self.spec.role}
+    /// All writes remain in unpublished staging. The native owner separately
+    /// accounts mapped pages, guard stack, RELRO, TLB/cache sync and publication.
+    pub fn stage(&self,staging:&mut[u8],base:u64,start:u64,end:u64)->Result<u64,Error>{
+        let entry=base.checked_add(self.image.entry).ok_or(Error::Invalid)?;
+        self.image.stage_private_image(staging,base,start,end,self.relative)?;
+        Ok(entry)
+    }
+}
+/// Inventory preflight only: every role has exactly one explicit ABI3
+/// registration and checked immutable package. No mapping or RUNNABLE
+/// state is produced. The real boot loader verifies/stages one package at a
+/// time, under its exclusive staging reservation, immediately before launch.
+pub fn verify_role_inventory(
+    specs:&[RolePackageSpec;ROLE_COUNT], inputs:&[RolePackageInput<'_>;ROLE_COUNT]
+)->Result<(),Error>{
+    for i in 0..ROLE_COUNT{
+        if specs[i].role!=ROLES[i] || specs[..i].iter().any(|s|s.package_id==specs[i].package_id){
+            return Err(Error::Denied);
+        }
+        VerifiedRolePackage::verify(specs[i],inputs[i])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,4 +501,55 @@ mod tests {
         bad[64+32..64+40].copy_from_slice(&0x2000u64.to_le_bytes());
         assert!(parse(&bad).is_err()); // p_filesz>p_memsz
     }
+    #[test]
+    fn role_inventory_requires_exact_package_sidecar_abi_and_stack(){
+        let bytes=elf();
+        let r=[RelativeRelocation{offset:0x2000,info:R_AARCH64_RELATIVE,addend:0x1000}];
+        let specs=core::array::from_fn(|i|RolePackageSpec{
+            role:ROLES[i],package_id:i as u64+1,abi:3,image_bytes:bytes.len(),
+            image_sha256:Sha256::digest(&bytes).into(),relative_count:1,
+            relative_sha256:relative_sidecar_digest(&r).unwrap(),stack_bytes:ROLE_STACK_BYTES,
+        });
+        let inputs=core::array::from_fn(|i|RolePackageInput{package_id:i as u64+1,bytes:&bytes,relative:&r});
+        assert!(verify_role_inventory(&specs,&inputs).is_ok());
+        for i in 0..ROLE_COUNT{
+            let mut bad=specs;bad[i].abi=1;
+            assert!(verify_role_inventory(&bad,&inputs).is_err());
+            bad=specs;bad[i].stack_bytes=4096;
+            assert!(verify_role_inventory(&bad,&inputs).is_err());
+            bad=specs;bad[i].image_sha256[0]^=1;
+            assert!(verify_role_inventory(&bad,&inputs).is_err());
+        }
+        let mut bad=specs;bad[1].role=bad[0].role;
+        assert!(verify_role_inventory(&bad,&inputs).is_err());
+        bad=specs;bad[1].package_id=bad[0].package_id;
+        assert!(verify_role_inventory(&bad,&inputs).is_err());
+        let mut alternate=r;alternate[0].addend=0x1004;
+        let mut substituted=inputs;substituted[0].relative=&alternate;
+        assert!(verify_role_inventory(&specs,&substituted).is_err());
+        let verified=VerifiedRolePackage::verify(specs[0],inputs[0]).unwrap();
+        let mut out=vec![0xaa;0x3000];
+        assert_eq!(verified.stage(&mut out,0x4000_0000,0x4000_0000,0x5000_0000),Ok(0x4000_1000));
+        assert_eq!(u64::from_le_bytes(out[0x2000..0x2008].try_into().unwrap()),0x4000_1000);
+    }
+    #[test]
+    fn phdr_must_describe_the_actual_verified_header_bytes(){
+        let mut b=elf();
+        b[56..58].copy_from_slice(&3u16.to_le_bytes());
+        // Map file offset zero through a read-only LOAD at virtual 0.
+        // Existing RX and RW segments stay independently page aligned.
+        let at=64+2*56;
+        b[at..at+4].copy_from_slice(&PT_PHDR.to_le_bytes());
+        b[at+4..at+8].copy_from_slice(&4u32.to_le_bytes());
+        b[at+8..at+16].copy_from_slice(&64u64.to_le_bytes());
+        b[at+16..at+24].copy_from_slice(&0x1040u64.to_le_bytes());
+        b[at+32..at+40].copy_from_slice(&168u64.to_le_bytes());
+        b[at+40..at+48].copy_from_slice(&168u64.to_le_bytes());
+        // The VA is inside RX file-backed bytes, but those bytes are
+        // offset 0x1040 rather than the verified header at offset 64.
+        assert!(parse(&b).is_err());
+        b[64+8..64+16].copy_from_slice(&0u64.to_le_bytes());
+        assert!(parse(&b).is_ok());
+    }
+
 }
