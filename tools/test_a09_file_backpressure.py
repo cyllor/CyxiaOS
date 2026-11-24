@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from doctor import ROOT,RUST_BIN,env
-from host_prototype_library import build_host_prototype_library
+from host_prototype_library import build_host_file_broker_libraries
 from test_a01_formal_recorder import function
 
 
@@ -113,10 +113,10 @@ fn main(){std::thread::Builder::new().stack_size(32*1024*1024).spawn(run).unwrap
         program=program.replace('SNAPSHOT_ADAPTER_PATH',str(ROOT/'tests/host/snapshot_storage_adapter.rs'))
         for marker,name in [('ACTUAL_FRAME','fn frame('),('ACTUAL_RUN','fn run('),('ACTUAL_READ','fn read_batch(')]:
             program=program.replace('// '+marker,function(client,name))
-        deps,library=build_host_prototype_library()
+        deps, library, kernel_core = build_host_file_broker_libraries()
         with tempfile.TemporaryDirectory(prefix='cyx-a09-file-') as temp:
             source,binary=Path(temp)/'harness.rs',Path(temp)/'harness';source.write_text(program)
-            result=subprocess.run([str(RUST_BIN/'rustc'),'--edition=2024','-C','panic=abort',str(source),'-L','dependency='+str(deps),'--extern','cyxia_prototype='+str(library),'-o',str(binary)],env=env(),capture_output=True,text=True,timeout=30)
+            result=subprocess.run([str(RUST_BIN/'rustc'),'--edition=2024','-C','panic=abort',str(source),'-L','dependency='+str(deps),'--extern','cyxia_prototype='+str(library), '--extern', 'cyxia_kernel_core=' + str(kernel_core),'-o',str(binary)],env=env(),capture_output=True,text=True,timeout=30)
             self.assertEqual(result.returncode,0,result.stderr)
             result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=10)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)

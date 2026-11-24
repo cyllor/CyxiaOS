@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from doctor import ROOT,RUST_BIN,env
-from host_prototype_library import build_host_prototype_library
+from host_prototype_library import build_host_file_broker_libraries
 from test_a01_formal_recorder import function
 
 CLIENT_SOURCE=ROOT/'user/prototype-client/storage_fault.rs'
@@ -19,8 +19,8 @@ class ActualWriteBackpressure(unittest.TestCase):
         source=source.replace('__SNAPSHOT_ADAPTER__',str(ROOT/'tests/host/snapshot_storage_adapter.rs'))
         source=source.replace('// ACTUAL_FILE_CALL',function((ROOT/'user/prototype-client/main.rs').read_text(),'fn file_call('))
         path=cls.directory/'harness.rs';path.write_text(source)
-        deps,library=build_host_prototype_library();cls.binary=cls.directory/'harness'
-        result=subprocess.run([str(RUST_BIN/'rustc'),'--edition=2024','-C','panic=abort','-C','opt-level=1',str(path),'-L','dependency='+str(deps),'--extern','cyxia_prototype='+str(library),'-o',str(cls.binary)],env=env(),capture_output=True,text=True,timeout=60)
+        deps, library, kernel_core = build_host_file_broker_libraries();cls.binary=cls.directory/'harness'
+        result=subprocess.run([str(RUST_BIN/'rustc'),'--edition=2024','-C','panic=abort','-C','opt-level=1',str(path),'-L','dependency='+str(deps),'--extern','cyxia_prototype='+str(library), '--extern', 'cyxia_kernel_core=' + str(kernel_core),'-o',str(cls.binary)],env=env(),capture_output=True,text=True,timeout=60)
         if result.returncode:raise AssertionError(result.stderr)
 
     @classmethod

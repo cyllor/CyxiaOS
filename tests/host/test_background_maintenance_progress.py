@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 from doctor import RUST_BIN, env
-from host_prototype_library import build_host_prototype_library
+from host_prototype_library import build_host_file_broker_libraries
 from test_a01_formal_recorder import function
 
 SERVICE_SOURCE = ROOT / 'kernel/src/runtime/services/domain_services.rs'
@@ -114,7 +114,7 @@ class BackgroundMaintenance(unittest.TestCase):
         full = full.replace('FS.with(|s|*s.borrow_mut()=Some(State{fs,journal,disk,scratch}));',
             'FS.with(|s|*s.borrow_mut()=Some(State{fs,journal,disk,scratch}));domain_platform::setup();')
         full += '\n' + fixture
-        deps, library = build_host_prototype_library()
+        deps, library, kernel_core = build_host_file_broker_libraries()
         cls.binaries = {}
         for label, rendered in [('minimal', minimal), ('full', full)]:
             path = cls.directory / (label + '.rs')
@@ -122,7 +122,7 @@ class BackgroundMaintenance(unittest.TestCase):
             binary = cls.directory / label
             command = [str(RUST_BIN / 'rustc'), '--edition=2024', '-C', 'panic=abort', '-C',
                 'opt-level=1', str(path), '-L', 'dependency=' + str(deps), '--extern',
-                'cyxia_prototype=' + str(library), '-o', str(binary)]
+                'cyxia_prototype=' + str(library), '--extern', 'cyxia_kernel_core=' + str(kernel_core), '-o', str(binary)]
             result = subprocess.run(command, env=env(), capture_output=True, text=True, timeout=60)
             if result.returncode:
                 raise AssertionError(result.stderr)
