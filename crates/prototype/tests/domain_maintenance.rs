@@ -299,3 +299,41 @@ fn audit_storage_is_independent_and_uncertain_serial_is_not_retried() {
     p.audit_ack(8).unwrap();
     assert_eq!(p.audit_read(&mut bytes), 0);
 }
+
+
+#[test]
+fn console_accepted_prefix_remains_accounted_when_clock_or_retry_fails() {
+    struct Script {
+        start: u64,
+        end: u64,
+        reads: usize,
+        accepted: Vec<u8>,
+    }
+    impl ConsoleHardware for Script {
+        fn try_write(&mut self, byte:u8)->Result<bool,Error>{
+            if self.accepted.is_empty(){
+                self.accepted.push(byte);Ok(true)
+            }else{Ok(false)}
+        }
+        fn now_ns(&mut self)->u64{
+            self.reads+=1;
+            if self.reads==1{self.start}else{self.end}
+        }
+    }
+    for (start,end,expected) in [(10,9,Error::Range),(u64::MAX-10,u64::MAX,Error::Overflow)]{
+        let mut p=ConsolePump::new();
+        p.enqueue(b"ab",0).unwrap();
+        let mut hw=Script{start,end,reads:0,accepted:vec![]};
+        assert_eq!(p.pump(0,&mut hw),Err(expected));
+        assert_eq!(hw.accepted,b"a");
+        assert_eq!(p.written,1);
+        assert_eq!(p.queued(),1);
+        assert!(p.poisoned());
+        assert_eq!(p.pump(0,&mut hw),Err(Error::Io));
+        assert_eq!(hw.accepted,b"a");
+        p.audit_enqueue(b"fault").unwrap();
+        let mut audit=[0;5];
+        assert_eq!(p.audit_read(&mut audit),5);
+        assert_eq!(&audit,b"fault");
+    }
+}
