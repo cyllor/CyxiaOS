@@ -560,14 +560,16 @@ impl RegisteredDecisionGate {
     /// signed/authenticated executor identity, device/redo completion,
     /// accepted apply_id and pin/resource accounting. The report body itself
     /// is only a claim and must not authorize APPLIED or reference release.
-    pub fn settle_verified_apply_reports(
+    pub fn settle_verified_apply_reports_with_feedback(
         &mut self,
         supervisor:Identity,
         plan_wire:&[u8],
         report_frames:&[BoundReport<'_>],
         bindings:&[ExecutorBindingV1],
         scope:TrustedApplyScope,
+        causal:Option<super::feedback_v0199::CausalPair<'_>>,
         mut verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
+        retain:impl FnOnce(&super::feedback_v0199::VerifiedFeedbackBatch<'_>)->Result<(),Error>,
     )->Result<TerminalSummary,Error>{
         // Validate the terminal owner before invoking any verifier callback.
         if !supervisor.valid() || self.terminal_owner!=Some(supervisor){
@@ -583,11 +585,30 @@ impl RegisteredDecisionGate {
             || plan.header.controller_epoch!=self.controller_epoch
             || scope.boot_epoch!=self.boot_epoch
         {return Err(Error::Denied);}
+        // Retain the exact causal sidecar from registration, not a new
+        // model-supplied explanation. A missing pair never becomes a label.
+        match (pending.assisted,causal){
+            (Some(frozen),Some(pair)) if pending.count==1
+                && frozen.advice==*pair.advice
+                && frozen.disposition_digest==sha256(pair.disposition)=>{
+                AdviceDispositionV1::decode(pair.disposition)?.matches_decision_pair(
+                    self.boot_epoch,pair.advice,&pending.decision_bytes[0])?;
+            }
+            (None,None)=>(),
+            _=>return Err(Error::Denied),
+        }
         let terminal_mask=apply_report_v1::verified_bound_terminal_mask(
             &plan,report_frames,bindings,scope,|index,report|{
                 verify_native(index,report)
             }
         )?;
+        // The native effect verifier above must be observational. Only
+        // release the pending plan after the protected feedback owner has
+        // accepted the whole batch. Failure/backpressure keeps it owned.
+        let batch=super::feedback_v0199::VerifiedFeedbackBatch{
+            plan_wire,decisions:&pending.decision_bytes[..pending.count],reports:report_frames,causal,
+        };
+        retain(&batch)?;
         // Full copied-byte digest is a searchable audit link, not proof by
         // itself; only the preceding independent native callback is proof.
         let mut h=Sha256::new();
@@ -607,6 +628,18 @@ impl RegisteredDecisionGate {
             evidence_digest,
         };
         self.settle_with_native_proof(supervisor,proof,|_|Ok(()))
+    }
+
+    // Historical unit-test helper; production report closure must retain
+    // exact feedback through the new interface.
+    #[cfg(test)]
+    fn settle_verified_apply_reports(
+        &mut self,supervisor:Identity,plan_wire:&[u8],report_frames:&[BoundReport<'_>],
+        bindings:&[ExecutorBindingV1],scope:TrustedApplyScope,
+        verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
+    )->Result<TerminalSummary,Error>{
+        self.settle_verified_apply_reports_with_feedback(supervisor,plan_wire,report_frames,
+            bindings,scope,None,verify_native,|_|Ok(()))
     }
 
     /// Expired *unpublished* registration may be discarded by the controller;
@@ -978,6 +1011,40 @@ mod tests {
         assert_eq!(gate.register_rule_only(
             CONTROLLER,&plan,&records,&catalog,&frozen,ctx
         ),Err(Error::Stale));
+    }
+    #[test]
+    fn feedback_must_retain_real_terminal_bytes_before_plan_release(){
+        use super::super::feedback_v0199::{FeedbackInbox,CausalLabel};
+        let bytes=profile_bytes();let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        let learner=Identity{id:10,generation:1};
+        let mut inbox=FeedbackInbox::new(SUPERVISOR,learner).unwrap();
+        let report=executor_report(1);
+        let frames=[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}];
+        let bindings=[verified_binding()];
+        assert_eq!(gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&frames,&bindings,
+            verified_scope(),None,|_,_|Err(Error::NotReady),|_|panic!("not a real effect")),Err(Error::NotReady));
+        assert_eq!(gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&frames,&bindings,
+            verified_scope(),None,|_,_|Ok(()),|_|Err(Error::Exhausted)),Err(Error::Exhausted));
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&frames,&bindings,
+            verified_scope(),None,|_,_|Ok(()),|batch|inbox.retain(SUPERVISOR,batch)).unwrap();
+        assert_eq!(inbox.len(),1);
+        let row=inbox.read(learner,0).unwrap().unwrap();
+        assert_eq!(row.decision,records[0]);assert_eq!(row.report_bytes(),&report);
+        assert_eq!(row.causal_label,CausalLabel::NoAdoption);
+        let digest=row.evidence_digest();
+        assert!(matches!(inbox.read(CONTROLLER,0),Err(Error::Denied)));
+        assert_eq!(inbox.retire(learner,0,digest,|_|Ok(())),Err(Error::Denied));
+        assert_eq!(inbox.retire(SUPERVISOR,0,digest,|_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(inbox.len(),1);
+        inbox.retire(SUPERVISOR,0,digest,|_|Ok(())).unwrap();
+        assert_eq!(inbox.len(),0);
     }
     #[test]
     fn unknown_apply_report_remains_owned_even_with_time_and_matching_bytes(){
