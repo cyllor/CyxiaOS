@@ -108,14 +108,32 @@ impl EvidenceLedger{
     /// all registration checks pass.
     pub(super) fn admitted_wire(&self,actor:Identity,key:AdviceKey)->Result<[u8;ADVICE_BYTES],Error>{
         if actor!=self.controller{return Err(Error::Denied);}
-        self.rows.iter().flatten().find(|row|row.key==key)
+        self.rows.iter().flatten().find(|row|row.key==key && !row.has_terminal)
             .map(|row|row.advice_wire).ok_or(Error::Stale)
     }
+    /// CONTROL_AUX observation/expiry path: states 3..6 only. A matching
+    /// DecisionRecord digest is not evidence of a registered decision.
     pub fn finalize(
-        &mut self,actor:Identity,disposition:&[u8],
-        decision:Option<&[u8]>,
-        // Trusted monotonic timestamp supplied by the serialized EL1 owner,
-        // not extracted from the copied disposition itself.
+        &mut self,actor:Identity,disposition:&[u8],decision:Option<&[u8]>,now_ns:u64,
+    )->Result<AdviceResult,Error>{
+        if actor!=self.controller && actor!=self.supervisor{return Err(Error::Denied);}
+        let disp=AdviceDispositionV1::decode(disposition)?;
+        if matches!(disp.state,1|2)||decision.is_some(){return Err(Error::Denied);}
+        self.finalize_inner(actor,disposition,None,now_ns)
+    }
+    /// Called by the protected decision registration gate ONLY after all
+    /// independent rule, model, candidate, identity and sequence checks.
+    /// State 2 stays closed until an atomic reason7 fallback gate exists.
+    pub(super) fn finalize_registered_adoption(
+        &mut self,actor:Identity,disposition:&[u8],decision:&[u8;DECISION_BYTES],now_ns:u64,
+    )->Result<AdviceResult,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        if AdviceDispositionV1::decode(disposition)?.state!=1{return Err(Error::NotReady);}
+        self.finalize_inner(actor,disposition,Some(decision),now_ns)
+    }
+    fn finalize_inner(
+        &mut self,actor:Identity,disposition:&[u8],decision:Option<&[u8]>,
+        // Trusted monotonic timestamp supplied by the serialized EL1 owner.
         now_ns:u64,
     )->Result<AdviceResult,Error>{
         if actor!=self.controller && actor!=self.supervisor{return Err(Error::Denied);}
