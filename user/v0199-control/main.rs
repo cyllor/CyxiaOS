@@ -147,14 +147,14 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
     // x0/x1 follow ABI3 SpawnRequest. This package's 24-byte startup
     // payload is copied to the owned stack by EL1; the data itself is
     // never proof of authority. Copy before the first syscall.
-    assert_eq!(args_len,24);
-    assert!(arg_va!=0&&arg_va%16==0);
-    let mut words=[0u64;3];
-    for(i,v)in words.iter_mut().enumerate(){
-        *v=u64::from_le(unsafe{(arg_va as *const u64).add(i).read_volatile()});
-    }
-    let [cap,target,generation]=words;
-    assert_ne!(generation,0);
+    // Avoid formatting/assert_eq! paths from the non-PIC prebuilt core
+    // in this freestanding PIE entry. Invalid args terminate fail-closed.
+    if args_len!=24||arg_va==0||arg_va%16!=0{reject_startup();}
+    let p=arg_va as *const u64;
+    let cap=u64::from_le(unsafe{p.read_volatile()});
+    let target=u64::from_le(unsafe{p.add(1).read_volatile()});
+    let generation=u64::from_le(unsafe{p.add(2).read_volatile()});
+    if generation==0{reject_startup();}
     #[cfg(any(control_role="6",control_role="7"))]
     model_probe(generation);
     loop{
@@ -162,6 +162,11 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
         if now>=0 {role_step(cap,target,generation,now as u64);}
         yield_now();
     }
+}
+#[inline(never)]
+fn reject_startup()->!{
+    let _=call(1,[u64::MAX,0,0,0,0,0]);
+    loop{core::hint::spin_loop();}
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo)->!{
