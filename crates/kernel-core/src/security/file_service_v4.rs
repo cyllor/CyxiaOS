@@ -26,6 +26,14 @@ fn le64(b:&[u8],at:usize)->Result<u64,Error>{
     let s=b.get(at..at+8).ok_or(Error::Invalid)?;
     Ok(u64::from_le_bytes([s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7]]))
 }
+/// A directory-relative request carries exactly one UTF-8 component.
+/// Reject traversal and invalid scalar encodings before any native lookup.
+fn valid_component(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= MAX_NAME_BYTES
+        && name != b"." && name != b".."
+        && !name.iter().any(|b| *b == 0 || *b == b'/')
+        && core::str::from_utf8(name).is_ok()
+}
 pub const fn persistent_op(op:u16)->bool {matches!(op,1|5|7|9)}
 pub const fn no_cap_selector(op:u16)->bool {matches!(op,10|11|12|13|14|15)}
 
@@ -62,7 +70,7 @@ impl<'a> Request<'a>{
                 let n=usize::from(le16(payload,0)?);
                 n>0 && n<=MAX_NAME_BYTES && payload.len()==n+10
                     && le32(payload,n+6)?==0
-                    && !payload[2..n+2].iter().any(|c|*c==0||*c==b'/')
+                    && valid_component(&payload[2..n+2])
             }
             3=>{
                 payload.len()==12
@@ -82,7 +90,7 @@ impl<'a> Request<'a>{
                 let n=usize::from(le16(payload,0)?);
                 n>0 && n<=MAX_NAME_BYTES && payload.len()==n+6
                     && le32(payload,n+2)?==0
-                    && !payload[2..n+2].iter().any(|c|*c==0||*c==b'/')
+                    && valid_component(&payload[2..n+2])
             }
             10=>payload.len()==16 && payload[0]<8
                 && payload[1..8].iter().all(|x|*x==0)
@@ -192,6 +200,30 @@ mod tests{
         assert!(Request::decode(&request(6,&empty,4),123).is_ok());
         for op in [11u16,13]{assert!(Request::decode(&request(op,&[0;56],4),0).is_ok());}
         for op in [12u16]{assert!(Request::decode(&request(op,&[0;88],4),0).is_ok());}
+    }
+    #[test]
+    fn all_name_operations_reject_non_utf8_and_ambiguous_components() {
+        for op in [1u16, 2, 7, 9] {
+            for name in [b".".as_slice(), b"..", b"a/b", b"a\0b",
+                &[0xff], &[0xc0, 0xaf], &[0xed, 0xa0, 0x80], &[0xf4, 0x90, 0x80, 0x80]] {
+                let mut payload=vec![];
+                payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                payload.extend_from_slice(name);
+                if op != 9 { payload.extend_from_slice(&1u32.to_le_bytes()); }
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                assert!(Request::decode(&request(op,&payload,4),123).is_err(), "op {op}, name {name:?}");
+            }
+            // Valid non-ASCII names retain their exact byte spelling.
+            let name="快照".as_bytes();
+            let mut payload=vec![];
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            payload.extend_from_slice(name);
+            if op != 9 { payload.extend_from_slice(&1u32.to_le_bytes()); }
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            let frame=request(op,&payload,4);
+            let decoded=Request::decode(&frame,123).unwrap();
+            assert_eq!(&decoded.payload[2..2+name.len()],name);
+        }
     }
     #[test]
     fn file_read_write_limits_and_wrong_source_rejected(){
