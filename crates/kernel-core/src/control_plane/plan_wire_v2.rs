@@ -322,7 +322,8 @@ mod tests {
 
     #[test]
     fn sidecar_count_cannot_be_forged_into_a_ready_to_publish_plan() {
-        let p=PlanV2::decode(&plan()).unwrap();
+        let frame=plan();
+        let p=PlanV2::decode(&frame).unwrap();
         assert!(p.matches_untrusted_sidecars(&[]).is_err());
     }
 }
