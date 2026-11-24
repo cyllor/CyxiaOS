@@ -151,10 +151,8 @@ impl FileStreamIndexV4 {
         }
         for i in 0..STREAM_COUNT {
             if self.streams[i].generation < old.streams[i].generation
-                || (self.streams[i].generation == old.streams[i].generation
-                    && (self.streams[i].issued_hi < old.streams[i].issued_hi
-                        || self.streams[i].retired_through
-                            < old.streams[i].retired_through))
+                || self.streams[i].issued_hi < old.streams[i].issued_hi
+                || self.streams[i].retired_through < old.streams[i].retired_through
             { return false; }
         }
         true
@@ -223,6 +221,12 @@ impl SecurityStateStoreV2 {
             && self.key_generation >= old.key_generation
             && self.last_boot_epoch >= old.last_boot_epoch
             && self.offline_config_generation >= old.offline_config_generation
+            && (self.offline_config_generation != old.offline_config_generation
+                || self.offline_config_hash == old.offline_config_hash)
+            // Offline clearance requires an independent authorized transition;
+            // default monotonic validation can only accumulate isolation.
+            && self.isolated_service_bitmap & old.isolated_service_bitmap
+                == old.isolated_service_bitmap
             && self.service_generations.iter().zip(old.service_generations)
                 .all(|(new,old)| *new >= old)
     }
@@ -310,6 +314,16 @@ mod tests {
         let current=SecurityStateStoreV2::decode(&next).unwrap();
         assert!(current.no_rollback_from(&old));
         assert!(!old.no_rollback_from(&current));
+        let mut clearance=raw;
+        clearance[24..32].copy_from_slice(&3u64.to_le_bytes());
+        finalize_crc(&mut clearance,72);
+        assert!(!SecurityStateStoreV2::decode(&clearance).unwrap()
+            .no_rollback_from(&current)); // no silent isolation clearance
+        let mut same_config=next;
+        same_config[88..120].copy_from_slice(&[3u8;32]);
+        finalize_crc(&mut same_config,72);
+        assert!(!SecurityStateStoreV2::decode(&same_config).unwrap()
+            .no_rollback_from(&current));
         let mut bad=next;bad[56..64].copy_from_slice(&(1u64<<17).to_le_bytes());
         finalize_crc(&mut bad,72);
         assert!(SecurityStateStoreV2::decode(&bad).is_err());
