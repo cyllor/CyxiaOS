@@ -194,6 +194,7 @@ impl AdviceDispositionV1 {
             || self.selected_index!=decision.selected_index
             || self.choice_policy!=decision.choice_policy
             || self.rules_hash!=decision.rules_hash
+            || self.candidate_set_hash!=decision.candidate_set_hash
             || !decision.matches_candidate_count(usize::from(advice.candidate_count))
         {return Err(Error::Denied);}
         match self.state{
@@ -202,6 +203,7 @@ impl AdviceDispositionV1 {
                 && decision.advisor_epoch==self.advisor_epoch
                 && decision.advice_seq==self.advice_seq
                 && decision.advice_model_generation==self.model_generation
+                && decision.recommended_index==self.recommended_index
                 && self.processed_ns<advice.expires_ns =>Ok(()),
             2 if decision.source==DecisionSource::RuleOnly
                 && decision.reason_code==7
@@ -310,6 +312,13 @@ mod tests{
         b[176..208].copy_from_slice(&sha256(&d));
         let parsed=AdviceDispositionV1::decode(&b).unwrap();
         assert_eq!(parsed.matches_decision_pair(1,&a,&d),Ok(()));
+        let mut other=d;
+        other[102..104].copy_from_slice(&1u16.to_le_bytes());
+        other[104..106].copy_from_slice(&1u16.to_le_bytes());
+        assert!(DecisionRecordV3::decode(&other).is_ok());
+        let mut rebound=b;
+        rebound[176..208].copy_from_slice(&sha256(&other));
+        assert_eq!(AdviceDispositionV1::decode(&rebound).unwrap().matches_decision_pair(1,&a,&other),Err(Error::Denied));
         d[120..128].copy_from_slice(&10u64.to_le_bytes());
         assert!(parsed.matches_decision_pair(1,&a,&d).is_err());
     }
@@ -341,7 +350,9 @@ mod tests{
     #[test]
     fn causal_pair_denies_relabelled_resource_generations_and_expired_decision(){
         let a=advice();
-        for at in [64usize,72]{
+        // The disposition digest is recomputed over the forged decision:
+        // byte integrity alone cannot substitute for matching its scope.
+        for at in [64usize,72,224]{
             let mut d=decision();d[at]^=1;
             let b=disposition(&a,&d);
             assert_eq!(AdviceDispositionV1::decode(&b).unwrap().matches_decision_pair(1,&a,&d),Err(Error::Denied));
