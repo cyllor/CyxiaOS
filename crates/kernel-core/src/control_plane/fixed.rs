@@ -7,6 +7,7 @@
 use super::{
     Epochs, Error, Identity,
     advisory::{Advice, Controller, Source, TrustedScope},
+    advice_envelope_v1::{AdviceEnvelopeV1, TrustedAdviceScope},
     security_finding::{FrozenObservation, SecurityFinding},
 };
 
@@ -121,6 +122,23 @@ impl Pair {
         }
     }
 
+    /// Authenticated operations IPC intake, with the target, candidate table,
+    /// model identity and epochs supplied by protected kernel snapshots.
+    /// The model's recommended_index is never treated as a raw parameter.
+    pub fn submit_operations_wire(
+        &mut self,
+        authenticated_actor: Identity,
+        frame: &[u8],
+        scope: &TrustedAdviceScope<'_>,
+    ) -> Result<(), Error> {
+        if authenticated_actor != self.operations.identity || !authenticated_actor.valid() {
+            return Err(Error::Denied);
+        }
+        let packet = AdviceEnvelopeV1::decode(frame)?;
+        let checked = packet.into_advice(scope)?;
+        self.operations.submit(authenticated_actor, packet.advice_seq, checked)
+    }
+
     /// Records an independently decoded v2 risk report; no policy/ledger effect.
     pub fn submit_finding(
         &mut self,
@@ -210,6 +228,53 @@ mod tests {
             sampled_ns: 80, now_ns: 100,
             model_hash: [2; 32], config_hash: [3; 32],
         }
+    }
+    #[test]
+    fn canonical_operations_frame_cannot_be_replayed_by_security_actor() {
+        let mut packet = [0u8; 152];
+        packet[0..4].copy_from_slice(&0x43594131u32.to_le_bytes());
+        packet[4..6].copy_from_slice(&1u16.to_le_bytes());
+        packet[6..8].copy_from_slice(&152u16.to_le_bytes());
+        for (at, value) in [
+            (8, 1u64), (16, 1), (24, 9), (32, 99),
+            (40, 1), (48, 1), (56, 1), (64, 150), (72, 1),
+        ] {
+            packet[at..at+8].copy_from_slice(&value.to_le_bytes());
+        }
+        packet[80..82].copy_from_slice(&1u16.to_le_bytes());
+        packet[82..84].copy_from_slice(&1u16.to_le_bytes());
+        packet[84..86].copy_from_slice(&2u16.to_le_bytes());
+        packet[86..88].copy_from_slice(&3u16.to_le_bytes());
+        packet[88] = 1;
+        packet[120] = 2;
+        let scope = TrustedAdviceScope {
+            epochs: scope().epochs,
+            advisor_epoch: 1, snapshot_seq: 9,
+            domain: 1, target: scope().target,
+            sampled_ns: 80, now_ns: 100, action_kind: 1,
+            candidates: &[1, 2, 4],
+            model_hash: { let mut b=[0;32]; b[0]=1; b },
+            candidate_set_hash: { let mut b=[0;32]; b[0]=2; b },
+        };
+        let mut p=pair();
+        assert_eq!(
+            p.submit_operations_wire(Identity{id:20,generation:1}, &packet, &scope),
+            Err(Error::Denied)
+        );
+        assert_eq!(review(&p).candidate, 2);
+        p.submit_operations_wire(Identity{id:10,generation:1}, &packet, &scope).unwrap();
+        assert_eq!(review(&p).candidate, 4);
+        assert_eq!(
+            p.submit_operations_wire(Identity{id:10,generation:1}, &packet, &scope),
+            Err(Error::Stale)
+        );
+        let mut bad=packet;
+        bad[56..64].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(
+            p.submit_operations_wire(Identity{id:10,generation:1}, &bad, &scope),
+            Err(Error::Denied)
+        );
+        assert_eq!(review(&p).candidate, 4);
     }
     #[test] fn distinct_brains_have_no_cross_channel_write() {
         assert!(Pair::new(Identity {id:1,generation:1},Identity {id:1,generation:1}).is_err());
