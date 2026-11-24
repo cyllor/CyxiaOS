@@ -1,13 +1,16 @@
-//! Explicit native scratch-disk fixture, NOT a production filesystem mount.
-//! It uses the real VirtIO block queue and two ordered FLUSH completions.
-//! The immutable fixture UUID/marker and initial state must match before
-//! any write. Never run on a real user volume; no control caps are issued.
+//! Formatted baseline-v1 mount/recovery fixture on real native VirtIO.
+//! Both startup stores, all inodes/bitmap/ACLs/receipts and alternating
+//! checkpoints are exercised. A fixed TEST volume/manifest is mandatory.
+//! No production signed catalog or ordinary file authority is issued.
 use super::*;
 use crate::virtio_platform::Board;
 use cyxia_driver_virtio::{Transport,QueueMemory,block::{Block,Operation,SECTOR_BYTES}};
 use cyxia_kernel_core::security::{
     Error as SecurityError,
-    file_media_v0199::{SuperblockV1,BLOCK_COUNT},
+    file_media_v0199::{SuperblockV1,BLOCK_COUNT,probe_snapshot_media_pair},
+    file_mount_v1::{self,Workspace as MountWorkspace,Acl},
+    file_structure_v1::{Inode,SystemObject,SystemKind},
+    offline_config_v1::Principal,
     file_index_v0199::{SecurityStateStoreV2,BLOCK_BYTES},
     epoch_redo_v0199::{EpochBlockIo,OneStateRedo},
     recovery_v1::{self,RecoveryWorkspace},
@@ -17,15 +20,25 @@ use cyxia_kernel_core::security::{
 use cyxia_kernel_core::control_plane::role_manifest_v0199::{ROLES,Role};
 use sha2::{Digest,Sha256};
 
-const UUID:[u8;16]=*b"CYX-TEST-EPOCH!!";
-const MARKER:&[u8]=b"CYXIA_V0199_EPOCH_SCRATCH_ONLY";
+const UUID:[u8;16]=*b"CYX-TEST-MOUNT!!";
+const MARKER:&[u8]=b"CYXIA_V0199_MOUNT_FIXTURE_ONLY";
 const HOME:u32=7000;
 const BOOT_HOME:u32=7002;
+const RECEIPTS_HOME:u32=7003;
+const ACL_HOME:u32=7010;
+const ROOT_HOME:u32=7014;
+const SYSTEM:[SystemObject;4]=[
+    SystemObject{kind:SystemKind::BootEpoch,inode:2,generation:1,first_block:BOOT_HOME},
+    SystemObject{kind:SystemKind::Receipts,inode:3,generation:1,first_block:RECEIPTS_HOME},
+    SystemObject{kind:SystemKind::Acl,inode:4,generation:1,first_block:ACL_HOME},
+    SystemObject{kind:SystemKind::Security,inode:5,generation:1,first_block:HOME},
+];
 const MAGIC:u64=0x4359_4550_4f43_4831;
 static mut QUEUE:QueueMemory=QueueMemory::zeroed();
 static mut SCRATCH:OneStateRedo=OneStateRedo::zeroed();
 static mut RECOVERY:RecoveryWorkspace=RecoveryWorkspace::new();
 static mut BOOT_PAIR:BootPairRedo=BootPairRedo::new();
+static mut MOUNT:MountWorkspace=MountWorkspace::new();
 
 struct Disk{device:Block,reads:u64,writes:u64,flushes:u64,replay_home_allowed:bool}
 impl Disk{
@@ -52,10 +65,10 @@ impl EpochBlockIo for Disk{
         self.reads+=1;Ok(())
     }
     fn write(&mut self,block:u32,data:&[u8;BLOCK_BYTES])->Result<(),SecurityError>{
-        // Only the validated journal extents or the one signed-fixture
-        // startup store locations during replay. Never write superblocks, bitmap,
-        // marker, or arbitrary data in this non-filesystem fixture.
-        if !(2..22).contains(&block)&&!(matches!(block,HOME|BOOT_HOME)&&self.replay_home_allowed){
+        // This test file owner may write its ten journal blocks and,
+        // exclusively during recovery, its two homes and superblocks.
+        // Bitmap, ACL, receipts, marker, and every other block stay sealed.
+        if !(2..12).contains(&block)&&!(matches!(block,0|1|HOME|BOOT_HOME)&&self.replay_home_allowed){
             return Err(SecurityError::Unauthorized);
         }
         for (i,part) in data.chunks_exact(SECTOR_BYTES).enumerate(){
@@ -105,7 +118,7 @@ fn append_restart(disk:&mut Disk,scratch:&mut OneStateRedo,gate:&mut DurableEpoc
         if stop==Some(v){Ok(())}else{Err(SecurityError::Unauthorized)}
     }).unwrap();
     let image=gate.after_image(ticket).unwrap();
-    assert_eq!(txid%2,0);let first=8+10*(txid as u32/2-1);let lsn=7*(txid/2);
+    assert_eq!(txid%2,0);let first=8;let lsn=7*(txid/2);
     let proof=scratch.append(disk,sb,first,HOME,txid,lsn,ticket,&image).unwrap();
     let receipt=proof.receipt();
     gate.confirm_from_redo(ticket,receipt,scratch.image(),sb_raw,first,u64::from(HOME),
@@ -116,76 +129,97 @@ fn append_boot(disk:&mut Disk,pair:&mut BootPairRedo,gate:&mut DurableEpochGate,
     assert_eq!(txid%2,1);
     let ticket=gate.prepare(Change::AllocateBoot,|_|panic!("boot does not authorize restart")).unwrap();
     let image=gate.after_image(ticket).unwrap();
-    let first=2+10*(txid as u32/2);let lsn=7*(txid/2)+4;
+    let first=2;let lsn=7*(txid/2)+4;
     let proof=pair.append(disk,sb,first,HOME,BOOT_HOME,txid,lsn,ticket,&image).unwrap();
     let receipt=proof.receipt();
     gate.confirm_boot_from_redo(ticket,receipt,pair.state_image(),pair.boot_image(),sb_raw,
         first,HOME,BOOT_HOME,&pair.begin,&[&pair.state_redo,&pair.boot_redo],&pair.commit,
         |t,r,b|proof.verifies(t,r,b)).unwrap()
 }
+fn fixture_acl(a:Acl,inode:Inode,system:Option<SystemKind>)->Result<(),SecurityError>{
+    // Test-only immutable volume ACL policy. No general user may
+    // access hidden system objects or obtain recovery authority.
+    let expected=match a.inode_id{
+        0=>(1,1,1<<14,0,1),
+        1=>(1,1,1<<8,0,1),
+        2..=5=>(1,1,0,(1<<8)|(1<<9)|(1<<13),1),
+        _=>(0,0,0,0,0),
+    };
+    if (a.principal.id,a.principal.generation,a.owner_rights,a.system_rights,a.acl_generation)!=expected
+        ||a.parent!=0||a.state!=u32::from(a.inode_id<6)
+        ||(2..=5).contains(&a.inode_id)!=system.is_some()
+        ||(a.inode_id==0)!=(inode.kind==2)
+        ||a.inode_id==0&&inode.runs[0].physical!=ROOT_HOME
+        ||a.inode_id==1&&inode.runs[0].physical!=HOME+1{
+        return Err(SecurityError::Unauthorized);
+    }
+    Ok(())
+}
+fn check_mount(disk:&mut Disk,sb:SuperblockV1,txid:u64)->Result<file_mount_v1::MountEvidence,SecurityError>{
+    let w=unsafe{&mut *core::ptr::addr_of_mut!(MOUNT)};
+    let principals=core::array::from_fn(|i|Principal{id:i as u64+1,generation:1});
+    let e=file_mount_v1::validate(disk,sb,&SYSTEM,&principals,w,fixture_acl)?;
+    if e.security!=state(txid)||e.boot.boot_epoch!=(txid+1)/2||e.structure.live_inodes!=6
+        ||e.structure.data_blocks!=15||e.structure.directory_entries!=1||e.system_blocks!=13
+        ||e.receipts.occupied!=0||e.usage[0].inodes!=2||e.usage[0].blocks!=2
+        ||e.usage[0].directory_slots!=1{return Err(SecurityError::Conflict);}
+    Ok(e)
+}
 pub(super) fn run(info:&BootInfo)->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
     let mut disk=attach(info);
     let mut sb_raw=[0;BLOCK_BYTES];disk.read(0,&mut sb_raw).unwrap();
-    let mut buf=[0;BLOCK_BYTES];disk.read(1,&mut buf).unwrap();assert_eq!(buf,sb_raw);
-    let sb=SuperblockV1::decode(&sb_raw).unwrap();
-    assert_eq!(sb,SuperblockV1{fs_uuid:UUID,generation:1,checkpoint_lsn:0,log_epoch:1});
+    let mut buf=[0;BLOCK_BYTES];disk.read(1,&mut buf).unwrap();
+    let probe=probe_snapshot_media_pair(&sb_raw,&buf).unwrap();
+    let old_sb=if SuperblockV1::decode(&sb_raw).unwrap().generation==probe.generation{
+        SuperblockV1::decode(&sb_raw).unwrap()
+    }else{SuperblockV1::decode(&buf).unwrap()};
+    assert_eq!(old_sb.fs_uuid,UUID);assert!(matches!(old_sb.generation,1|2));
+    assert_eq!(old_sb.log_epoch,old_sb.generation);assert_eq!(old_sb.checkpoint_lsn,0);
+    let recovered=2*(old_sb.generation-1);
+    // Authenticate the dedicated test volume and original complete
+    // formatted structure before permitting any recovery writes.
     disk.read(HOME+1,&mut buf).unwrap();
-    assert_eq!(&buf[..MARKER.len()],MARKER);assert!(buf[MARKER.len()..].iter().all(|v|*v==0));
-    disk.read(HOME,&mut buf).unwrap();
-    assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),state(0));
-    let mut boot_raw=[0;BLOCK_BYTES];
-    disk.read(BOOT_HOME,&mut boot_raw).unwrap();
-    assert_eq!(BootEpochStoreV1::decode(&boot_raw).unwrap(),BootEpochStoreV1{fs_uuid:UUID,boot_epoch:0});
+    assert_eq!(&buf[..MARKER.len()],MARKER);assert!(buf[MARKER.len()..].iter().all(|v|v==0));
+    check_mount(&mut disk,old_sb,0).unwrap();
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(SCRATCH)};
     let pair=unsafe{&mut *core::ptr::addr_of_mut!(BOOT_PAIR)};
-    let mut recovered=0u64;
-    let mut empty_seen=false;
-    // Recover the exact committed after-image; never derive it from a
-    // volatile counter or silently rewrite a partial journal tail.
-    for i in 0..2u32{
-        let txid=u64::from(i)*2+1;
-        pair.read(&mut disk,2+10*i).unwrap();
-        if pair.blank(){
-            empty_seen=true;
-            scratch.read(&mut disk,8+10*i).unwrap();assert!(scratch.blank());
-            continue;
-        }
-        assert!(!empty_seen);
-        let next=pair.verify(sb,2+10*i,HOME,BOOT_HOME,txid,7*u64::from(i)+4).unwrap();
-        assert_eq!(next,state(txid));
-        boot_raw.copy_from_slice(pair.boot_image());
-        scratch.read(&mut disk,8+10*i).unwrap();
-        assert!(!scratch.blank(),"incomplete boot pair is not this fixture's accepted restart boundary");
-        let next=scratch.verify(sb,8+10*i,HOME,txid+1,7*(u64::from(i)+1)).unwrap();
-        assert_eq!(next,state(txid+1));buf.copy_from_slice(scratch.image());
-        recovered=txid+1;
+    pair.read(&mut disk,2).unwrap();scratch.read(&mut disk,8).unwrap();
+    if recovered==0{assert!(pair.blank()&&scratch.blank());}
+    else{
+        assert_eq!(pair.verify(old_sb,2,HOME,BOOT_HOME,1,4).unwrap(),state(1));
+        assert_eq!(scratch.verify(old_sb,8,HOME,2,7).unwrap(),state(2));
     }
-    assert!(matches!(recovered,0|2),"fixture requires complete previous boot pair");
-    // Independently scan the actual full baseline-v1 log, rather than
-    // trusting the four known scratch transaction offsets as a mount
-    // algorithm. Merge both prior commits to a single latest home image.
     let workspace=unsafe{&mut *core::ptr::addr_of_mut!(RECOVERY)};
-    let recovered_chain=recovery_v1::scan(&mut disk,workspace).unwrap();
-    assert_eq!(recovered_chain.superblock,sb);
-    assert_eq!(u64::from(recovered_chain.transactions),recovered);
-    assert_eq!(recovered_chain.last_commit_lsn,7*(recovered/2));
-    assert!(!recovered_chain.incomplete_tail);
-    assert_eq!(recovered_chain.distinct_home_blocks,2*u32::from(recovered!=0));
-    let mut replay_flushes=0;
-    if recovered!=0{
-        let before=(disk.writes,disk.flushes);
-        disk.replay_home_allowed=true;
-        assert_eq!(recovery_v1::replay_home(&mut disk,workspace),Ok(recovered_chain));
-        disk.replay_home_allowed=false;
-        assert_eq!((disk.writes-before.0,disk.flushes-before.1),(2,1));
-        replay_flushes=1;
-        disk.read(HOME,&mut buf).unwrap();
-        assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),state(recovered));
-        disk.read(BOOT_HOME,&mut boot_raw).unwrap();
-        assert_eq!(BootEpochStoreV1::decode(&boot_raw).unwrap().boot_epoch,recovered/2);
+    disk.replay_home_allowed=true;
+    let mut mounted=None;
+    let (chain,sb)=recovery_v1::recover_checkpoint_with_evidence(&mut disk,workspace,|io,current|{
+        mounted=Some(check_mount(io,current,recovered)?);Ok(())
+    }).unwrap();
+    disk.replay_home_allowed=false;
+    let mounted=mounted.unwrap();
+    assert_eq!(chain.superblock,old_sb);assert_eq!(u64::from(chain.transactions),recovered);
+    assert_eq!(chain.last_commit_lsn,7*(recovered/2));
+    assert!(!chain.incomplete_tail);
+    assert_eq!(chain.distinct_home_blocks,2*u32::from(recovered!=0));
+    assert_eq!((sb.generation,sb.log_epoch,sb.checkpoint_lsn),(old_sb.generation+1,old_sb.log_epoch+1,7*(recovered/2)));
+    // Recover_checkpoint has FLUSHed home images then the inactive
+    // superblock and read it back. Only now may old log space be reused.
+    let checkpoint_slot=if recovered==0{1}else{0};
+    disk.read(checkpoint_slot,&mut sb_raw).unwrap();assert_eq!(SuperblockV1::decode(&sb_raw).unwrap(),sb);
+    assert_eq!((disk.writes,disk.flushes),(1+u64::from(chain.distinct_home_blocks),2));
+    let reset=u64::from(recovered!=0);
+    if reset!=0{
+        buf.fill(0);
+        for block in 2..12{disk.write(block,&buf).unwrap();}
+        disk.flush().unwrap();
     }
-    report("V0199_EPOCH_REPLAY_HOME",recovered,u64::from(recovered_chain.distinct_home_blocks),replay_flushes);
+    report("V0199_EPOCH_REPLAY_HOME",recovered,u64::from(chain.distinct_home_blocks),1);
+    report("V0199_MOUNT_CHECKPOINT",sb.generation,sb.log_epoch,sb.checkpoint_lsn);
+    report("V0199_MOUNT_STRUCTURE",u64::from(mounted.structure.live_inodes),u64::from(mounted.structure.data_blocks),u64::from(mounted.structure.directory_entries));
+    disk.read(HOME,&mut buf).unwrap();assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),mounted.security);
+    let mut boot_raw=[0;BLOCK_BYTES];disk.read(BOOT_HOME,&mut boot_raw).unwrap();
+    assert_eq!(BootEpochStoreV1::decode(&boot_raw).unwrap(),mounted.boot);
     let prior=SecurityStateStoreV2::decode(&buf).unwrap();
     let prior_boot=prior.last_boot_epoch;let old_generation=prior.service_generations[1];
     report("V0199_EPOCH_DISK_RECOVERED",prior_boot,prior.state_generation,old_generation);
@@ -210,9 +244,9 @@ pub(super) fn run(info:&BootInfo)->!{
     let new=super::v0199_control_bringup::disk_security_run(new_generation,1,false);
     assert_ne!(new.root,old.root);assert_eq!(old.image_sha256,new.image_sha256);
     report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new.root,boot);
-    assert_eq!((disk.writes,disk.flushes),(10+2*replay_flushes,4+replay_flushes));
+    assert_eq!((disk.writes,disk.flushes),(11+12*reset,6+reset));
     let final_txid=recovered+2;
-    let final_state=scratch.verify(sb,8+10*(final_txid as u32/2-1),HOME,final_txid,7*(final_txid/2)).unwrap();
+    let final_state=scratch.verify(sb,8,HOME,final_txid,7*(final_txid/2)).unwrap();
     assert_eq!(final_state,state(final_txid));
     let final_digest:[u8;32]=Sha256::digest(scratch.image()).into();
     disk.read(HOME,&mut buf).unwrap();
@@ -224,8 +258,8 @@ pub(super) fn run(info:&BootInfo)->!{
     QUIT.store(true,Ordering::Release);
     wait(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
-    let row=[MAGIC,5,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,7*(final_txid/2),
-        u64::from(8+10*(final_txid as u32/2-1)),disk.flushes,disk.reads,disk.writes,u64::from(HOME)];
+    let row=[MAGIC,6,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,7*(final_txid/2),
+        8,disk.flushes,disk.reads,disk.writes,u64::from(HOME)];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     for(i,b)in final_digest.chunks_exact(8).enumerate(){
         SMP_EVIDENCE.words[14+i].store(u64::from_le_bytes(b.try_into().unwrap()),Ordering::Relaxed);
@@ -240,7 +274,7 @@ pub(super) fn run(info:&BootInfo)->!{
     }
     report("V0199_EPOCH_ROLE7_OPERATOR",old_generation,old.score,old.severity);
     report("V0199_EPOCH_ROLE7_OPERATOR",new_generation,new.score,new.severity);
-    for(i,v)in [recovered,u64::from(recovered_chain.distinct_home_blocks),recovered_chain.last_commit_lsn,replay_flushes].into_iter().enumerate(){
+    for(i,v)in [recovered,u64::from(chain.distinct_home_blocks),chain.last_commit_lsn,1].into_iter().enumerate(){
         SMP_EVIDENCE.words[39+i].store(v,Ordering::Relaxed);
     }
     let boot_digest:[u8;32]=Sha256::digest(pair.boot_image()).into();
@@ -248,6 +282,12 @@ pub(super) fn run(info:&BootInfo)->!{
         SMP_EVIDENCE.words[43+i].store(u64::from_le_bytes(v.try_into().unwrap()),Ordering::Relaxed);
     }
     SMP_EVIDENCE.words[47].store(u64::from(BOOT_HOME),Ordering::Relaxed);
+    for(i,v)in [sb.generation,sb.log_epoch,sb.checkpoint_lsn,u64::from(checkpoint_slot),reset,
+        u64::from(mounted.structure.live_inodes),u64::from(mounted.structure.data_blocks),
+        u64::from(mounted.structure.directory_entries),u64::from(mounted.system_blocks),
+        mounted.receipts.occupied as u64,u64::from(mounted.usage[0].inodes),u64::from(mounted.usage[0].blocks)].into_iter().enumerate(){
+        SMP_EVIDENCE.words[48+i].store(v,Ordering::Relaxed);
+    }
     report("V0199_EPOCH_DISK_COMMITTED",prior_boot,boot,disk.flushes);
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EPOCH_DISK_FIXTURE_PASS production=false\n");
