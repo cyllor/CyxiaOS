@@ -10,6 +10,10 @@ test = false
 bench = false
 
 [features]
+# The native single-node V0.19.9 release profile must never silently
+# activate historical D16/peer-billing or cluster transport paths.
+default = ["v0199-local-native"]
+v0199-local-native = []
 selftest = []
 # Long-running OS composition. Independent of bounded acceptance profiles.
 os-runtime = ["cyxia-arch-x86_64/runtime"]
@@ -42,6 +46,9 @@ cosmic-bg-v1 = ["cosmic-notifications-applet-v1"]
 cosmic-app-library-v1 = ["cosmic-bg-v1", "cyxia-posix/cosmic-app-library-v1"]
 # Four-vCPU native mechanism acceptance; not the desktop production boot.
 smp-selftest = ["selftest"]
+# Dedicated V0.19.9 4-vCPU native CPU0 EL0 role/TTBR isolation fixture.
+# Not a certification of the 8 real control services or G4.
+v0199-cpu0-role-selftest = ["smp-selftest"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.

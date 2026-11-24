@@ -1,0 +1,64 @@
+# Immutable QEMU binary replay for rapid diagnosis. Full source build in
+# v20-cpu0-role-native.yml independently verifies pinned source provenance.
+name: V0.20 CPU0 role native QEMU replay (pinned artifact)
+on:
+  push:
+    branches: [work/v020-gap-cpu0-native-role-fixture]
+    paths:
+      - '.github/workflows/v20-cpu0-role-replay.yml'
+      - 'kernel/src/arch/aarch64/**'
+      - 'kernel/Cargo.toml'
+      - 'tools/verify_v0199_cpu0_roles.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  cpu0-guest-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          run-id: 45353678377
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: v020-cpu0-role-qemu-edb61100b4e991c5d44be50ecafdfea9e7a0ba87
+          path: pinned-qemu
+      - name: Verify immutable QEMU 10.2.2 binary and dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          (cd pinned-qemu && sha256sum -c archive.sha256)
+          tar -xzf pinned-qemu/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          echo "916f0ef78c7ec99b3ab2bd537eb6f7d2bb050f9d313143d5d04890abc392e529  $RUNNER_TEMP/qemu-bin/qemu-system-aarch64" | sha256sum -c -
+          "$RUNNER_TEMP/qemu-bin/qemu-system-aarch64" --version
+      - name: Rebuild exact current four-vCPU CPU0 test guest
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/v020-role-replay
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+            2>&1 | tee artifacts/v020-role-replay/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-role-replay/kernel.elf
+          sha256sum artifacts/v020-role-replay/kernel.elf > artifacts/v020-role-replay/kernel.sha256
+      - name: Run and collect native guest serial/QMP role evidence
+        run: |
+          set -euo pipefail
+          PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 -B tools/verify_v0199_cpu0_roles.py \
+            --elf artifacts/v020-role-replay/kernel.elf \
+            --output artifacts/v020-role-replay/capture --timeout 45 \
+            2>&1 | tee artifacts/v020-role-replay/verification.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-cpu0-role-replay-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v020-role-replay/

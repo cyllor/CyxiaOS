@@ -227,7 +227,7 @@ fn observations(start: u64, count: u64, latency: u64, pending: u64) -> Vec<WorkR
 fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
     let owners = Owners { extend: true };
     let mut b = ExtraBudget::new();
-    b.record_mandatory(0, 61_000_000).unwrap();
+    b.record_mandatory(0, 61_500_000).unwrap();
     let credit = b
         .reserve(Role::Training, 1, 1, 1024 * 1024, 0, 4_000_000, &owners)
         .unwrap();
@@ -252,11 +252,11 @@ fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
             1,
             1024 * 1024,
             4_000_000,
-            5_000_000,
+            4_500_000,
             &owners,
         )
         .unwrap();
-    b.settle(credit, 5_000_000, 9_000_000).unwrap();
+    b.settle(credit, 4_500_000, 8_500_000).unwrap();
     assert_eq!(
         b.reserve(Role::Canary, 1, 1, 1024 * 1024, 9_000_000, 1, &owners)
             .err(),
@@ -281,6 +281,29 @@ fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
             .err(),
         Some(Error::Budget)
     );
+}
+
+#[test]
+fn v0199_mandatory_and_optional_roles_share_exact_70ms_control_ceiling() {
+    let owners = Owners { extend: true };
+    let mut budget = ExtraBudget::new();
+    assert_eq!(MANDATORY_NS, 61_500_000);
+    assert_eq!(EXTRA_NS, 8_500_000);
+    assert_eq!(CONTROL_NS, MANDATORY_NS + EXTRA_NS);
+    budget.record_mandatory(0, MANDATORY_NS).unwrap();
+    let credit = budget
+        .reserve(Role::Validation, 1, 1, 1024 * 1024, 0, EXTRA_NS, &owners)
+        .unwrap();
+    budget.settle(credit, EXTRA_NS, EXTRA_NS).unwrap();
+    assert_eq!(budget.spent_ns(), EXTRA_NS);
+    assert!(matches!(
+        budget.reserve(Role::Shadow, 1, 1, 1024 * 1024, EXTRA_NS, 1, &owners),
+        Err(Error::Budget)
+    ));
+    // One additional nanosecond of actual mandatory work faults the ledger;
+    // the already spent optional work cannot be refunded on failure.
+    assert_eq!(budget.record_mandatory(EXTRA_NS, 1), Err(Error::Budget));
+    assert!(budget.faulted());
 }
 
 #[test]

@@ -1,0 +1,980 @@
+//! Bounded, no-alloc EL1 DecisionRecord v3 registration/publication guard.
+//!
+//! Narrow V0.19.9 G1 vertical slice: RULE_ONLY plans without an AI disposition
+//! or TrialPermit. Other sources FAIL CLOSED as NotReady. This is not an SVC
+//! handler, credential loader or proof of a native driver APPLY. The only way
+//! to call the publication adapter is via an exact previously frozen plan.
+//! The adapter must be an EL1 native owner, and must report actual acceptance
+//! separately from any eventual per-action APPLIED/UNKNOWN receipt.
+use sha2::{Digest, Sha256};
+use super::{
+    Error, Identity,
+    decision_record_v3::{DecisionRecordV3, DecisionSource, DECISION_BYTES},
+    plan_wire_v2::{PlanV2, MAX_ACTIONS},
+    rule_profile_v2::Profile,
+    apply_report_v1::{self,ApplyReportV1,TrustedExecutor},
+};
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest=Sha256::new();
+    digest.update(bytes);
+    digest.finalize().into()
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Registration {
+    Frozen,
+    ExactRetry,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    AdapterAccepted,
+    ReplayNoEffect,
+}
+
+/// Recent terminal summaries are read-only audit/query evidence, not new
+/// authorization and never an APPLIED result synthesized by an AI role.
+pub const TERMINAL_HISTORY: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedTerminal {
+    pub boot_epoch: u64,
+    pub controller_epoch: u64,
+    pub plan_seq: u64,
+    pub plan_digest: [u8; 32],
+    /// Every action must have a separately verified durable or device terminal.
+    pub action_count: u16,
+    pub terminal_mask: u16,
+    pub unknown_mask: u16,
+    pub evidence_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSummary {
+    pub plan_seq: u64,
+    pub plan_digest: [u8; 32],
+    pub action_count: u16,
+    pub evidence_digest: [u8; 32],
+}
+
+/// The EL1 caller must derive every field from protected local state, never
+/// from model-advertised identities, hashes or clock values.
+#[derive(Clone, Copy, Debug)]
+pub struct TrustedRegistrationScope {
+    pub boot_epoch: u64,
+    pub controller_epoch: u64,
+    pub rules_generation: u64,
+    pub rules_hash: [u8;32],
+    pub base_plan_version: u64,
+    pub ledger_generation: u64,
+    pub core_generation: u64,
+    pub snapshot_seq: u64,
+    pub sampled_ns: u64,
+    pub now_ns: u64,
+}
+
+/// One frozen local candidate set registered by the deterministic controller.
+/// ActionSchema decoding, memory/CPU quotas and permission checks must already
+/// have been performed independently by EL1 and be rechecked at PUBLISH.
+pub struct FrozenAction<'a> {
+    pub domain_id: u16,
+    pub target: Identity,
+    pub candidate_set_hash: [u8;32],
+    pub static_ordinals: &'a [u16],
+    pub raw_fields: [Option<u64>;7],
+    pub action_payload: &'a [u8],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingStatus { Frozen, AdapterAccepted, AdapterUnknown }
+struct Pending {
+    plan_seq: u64,
+    plan_digest: [u8;32],
+    count: usize,
+    decision_bytes: [[u8;DECISION_BYTES];MAX_ACTIONS],
+    status: PendingStatus,
+    expires_ns: u64,
+}
+
+/// Fixed-memory guard. This can be owned by a protected, serialized EL1
+/// executor; no public entry point grants a new CPU, memory page or capability.
+/// The caller-supplied Identity must be authenticated by the architecture
+/// adapter before reaching this object.
+pub struct RegisteredDecisionGate {
+    controller: Identity,
+    publisher: Identity,
+    boot_epoch: u64,
+    controller_epoch: u64,
+    last_plan_seq: u64,
+    last_decision_seq: u64,
+    pending: Option<Pending>,
+    /// Only an EL1-authenticated independent terminal/recovery owner can
+    /// close an accepted/UNKNOWN plan. Unconfigured gates stay fail-closed.
+    terminal_owner: Option<Identity>,
+    history: [Option<TerminalSummary>; TERMINAL_HISTORY],
+    history_next: usize,
+}
+impl RegisteredDecisionGate {
+    pub fn new(controller: Identity, publisher: Identity, boot: u64, epoch: u64)
+        -> Result<Self, Error>
+    {
+        if !controller.valid() || !publisher.valid()
+            || controller == publisher || boot == 0 || epoch == 0
+        {return Err(Error::Invalid);}
+        Ok(Self {
+            controller, publisher, boot_epoch:boot, controller_epoch:epoch,
+            last_plan_seq:0,last_decision_seq:0,pending:None,
+            terminal_owner:None,history:[None;TERMINAL_HISTORY],history_next:0,
+        })
+    }
+
+    /// Native EL1 must assign an independently authenticated terminal owner
+    /// (e.g. role11 supervisor) from its capability table, never EL0 input.
+    pub fn new_with_terminal_owner(
+        controller:Identity,publisher:Identity,terminal_owner:Identity,
+        boot:u64,epoch:u64
+    ) -> Result<Self,Error> {
+        if !terminal_owner.valid()
+            || terminal_owner==controller || terminal_owner==publisher
+        {return Err(Error::Invalid);}
+        let mut gate=Self::new(controller,publisher,boot,epoch)?;
+        gate.terminal_owner=Some(terminal_owner);
+        Ok(gate)
+    }
+
+    fn check_identity_and_context(&self, context: TrustedRegistrationScope)
+        -> Result<(),Error>
+    {
+        if context.boot_epoch != self.boot_epoch
+            || context.controller_epoch != self.controller_epoch
+            || context.boot_epoch == 0 || context.controller_epoch == 0
+            || context.rules_generation == 0 || context.rules_hash == [0;32]
+            || context.ledger_generation == 0 || context.core_generation == 0
+            || context.snapshot_seq == 0
+            || context.sampled_ns > context.now_ns
+            || !context.sampled_ns.checked_add(100_000_000)
+                .is_some_and(|end| context.now_ns < end)
+        {return Err(Error::Stale);}
+        Ok(())
+    }
+
+    /// No user/model-provided SHA, no unregistered sidecar, and no AI/trial
+    /// source is accepted. Idempotent retries preserve the *first* frozen
+    /// bytes and do not reset expiry or high-water sequence numbers.
+    pub fn register_rule_only(
+        &mut self,
+        actor: Identity,
+        plan_wire: &[u8],
+        records: &[[u8; DECISION_BYTES]],
+        rule_profile: &Profile<'_>,
+        actions: &[FrozenAction<'_>],
+        context: TrustedRegistrationScope,
+    ) -> Result<Registration,Error> {
+        if actor != self.controller {return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        if let Some(pending)=&self.pending {
+            let same_key=plan.header.plan_seq==pending.plan_seq;
+            let same_bytes=same_key
+                && sha256(plan_wire)==pending.plan_digest
+                && records.len()==pending.count
+                && records.iter().zip(pending.decision_bytes[..pending.count].iter())
+                    .all(|(a,b)| a==b);
+            return if same_bytes {
+                match pending.status {
+                    // No effects occurred yet: even an exact retry must not
+                    // bypass a revoked rule, changed ledger or expired scope.
+                    PendingStatus::Frozen => {
+                        self.validate_rule_only(
+                            plan_wire, &plan, records, rule_profile, actions, context
+                        )?;
+                        Ok(Registration::ExactRetry)
+                    }
+                    // A previously accepted plan is only queryable by its
+                    // immutable identity. It is never re-authorized or applied.
+                    PendingStatus::AdapterAccepted => Ok(Registration::ExactRetry),
+                    // Unknown real-device outcomes cannot be re-registered
+                    // as if they were safely awaiting a new submission.
+                    PendingStatus::AdapterUnknown => Err(Error::NotReady),
+                }
+            } else if same_key {
+                Err(Error::Denied)
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context)?;
+        if plan.header.plan_seq<=self.last_plan_seq {return Err(Error::Stale);}
+        let mut last=self.last_decision_seq;
+        for raw in records {
+            let record=DecisionRecordV3::decode(raw)?;
+            if record.decision_seq<=last {return Err(Error::Stale);}
+            last=record.decision_seq;
+        }
+        let mut copied=[[0u8;DECISION_BYTES];MAX_ACTIONS];
+        for (dest,src) in copied.iter_mut().zip(records) {*dest=*src;}
+        let mut expires=u64::MAX;
+        for index in 0..usize::from(plan.header.action_count) {
+            expires=expires.min(plan.action(index)?.expires_local_ns);
+        }
+        self.pending=Some(Pending {
+            plan_seq:plan.header.plan_seq,
+            plan_digest:sha256(plan_wire),
+            count:records.len(),
+            decision_bytes:copied,
+            status:PendingStatus::Frozen,
+            expires_ns:expires,
+        });
+        self.last_plan_seq=plan.header.plan_seq;
+        self.last_decision_seq=last;
+        Ok(Registration::Frozen)
+    }
+
+    fn validate_rule_only(
+        &self,
+        plan_wire:&[u8],
+        plan:&PlanV2<'_>,
+        records:&[[u8;DECISION_BYTES]],
+        profile:&Profile<'_>,
+        actions:&[FrozenAction<'_>],
+        context: TrustedRegistrationScope,
+    ) -> Result<(),Error> {
+        self.check_identity_and_context(context)?;
+        if plan.header.flags != 0 {return Err(Error::NotReady);}
+        if rule_profile_mismatch(profile,context) {return Err(Error::Stale);}
+        if records.len()!=usize::from(plan.header.action_count)
+            || actions.len()!=records.len()
+            || plan.header.base_plan_version!=context.base_plan_version
+            || plan.header.controller_epoch!=context.controller_epoch
+            || plan.header.snapshot_seq!=context.snapshot_seq
+        {return Err(Error::Stale);}
+        plan.matches_untrusted_sidecars(records)?;
+        let digest=sha256(plan_wire);
+        let admission_end=context.sampled_ns.checked_add(100_000_000)
+            .ok_or(Error::Clock)?;
+        let installed_end=context.sampled_ns.checked_add(10_000_000_000)
+            .ok_or(Error::Clock)?;
+        if plan.header.active_until_local_ns!=0
+            && plan.header.active_until_local_ns!=installed_end
+        {return Err(Error::Invalid);}
+        let mut last_seq=0u64;
+        for (index,(raw,local)) in records.iter().zip(actions).enumerate() {
+            let rec=DecisionRecordV3::decode(raw)?;
+            let act=plan.action(index)?;
+            if rec.source!=DecisionSource::RuleOnly
+                || rec.reason_code==7 // requires frozen AdviceDisposition v1
+            {return Err(Error::NotReady);}
+            if rec.boot_epoch!=context.boot_epoch
+                || rec.rules_generation!=context.rules_generation
+                || rec.rules_hash!=context.rules_hash
+                || rec.plan_digest!=digest
+                || rec.decision_seq<=last_seq
+                || rec.target_id!=local.target.id
+                || rec.target_generation!=local.target.generation
+                || rec.domain_id!=local.domain_id
+                || act.candidate_set_hash!=local.candidate_set_hash
+                || rec.candidate_set_hash!=local.candidate_set_hash
+                || act.action_payload!=local.action_payload
+                || act.expires_local_ns<=context.now_ns
+                || act.expires_local_ns>admission_end
+                || !local.target.valid()
+            {return Err(Error::Denied);}
+            let rule=profile.match_candidates(
+                local.domain_id,local.target.id,local.raw_fields,
+                super::rule_profile_v2::Candidates {
+                    static_ordinals:local.static_ordinals,
+                },
+            )?.ok_or(Error::Denied)?;
+            if !rec.matches_rule(rule)
+                || !rec.matches_candidate_count(local.static_ordinals.len())
+                || rec.selected_index!=rule.fallback_index
+            {return Err(Error::Denied);}
+            last_seq=rec.decision_seq;
+        }
+        Ok(())
+    }
+
+    /// Invokes the caller's **EL1 native publication adapter at most once**,
+    /// only for the exact frozen bytes and a still-current trusted snapshot.
+    /// A callback failure is UNKNOWN: never replay it as not-executed. A
+    /// successful adapter return only means accepted, NOT per-action APPLIED.
+    pub fn publish_once(
+        &mut self,
+        actor: Identity,
+        plan_wire:&[u8],
+        records:&[[u8;DECISION_BYTES]],
+        profile:&Profile<'_>,
+        actions:&[FrozenAction<'_>],
+        context: TrustedRegistrationScope,
+        native_accept:impl FnOnce()->Result<(),Error>,
+    ) -> Result<Publication,Error> {
+        if actor!=self.publisher {return Err(Error::Denied);}
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        let plan=PlanV2::decode(plan_wire)?;
+        if plan.header.plan_seq!=pending.plan_seq
+            || sha256(plan_wire)!=pending.plan_digest
+            || records.len()!=pending.count
+            || !records.iter().zip(pending.decision_bytes[..pending.count].iter())
+                .all(|(a,b)| a==b)
+        {return Err(Error::Denied);}
+        match pending.status {
+            PendingStatus::AdapterAccepted => return Ok(Publication::ReplayNoEffect),
+            // A failed adapter call may have committed a partial side
+            // effect. Never return success or invoke it again without an
+            // independent native reconciliation/terminal proof.
+            PendingStatus::AdapterUnknown => return Err(Error::NotReady),
+            PendingStatus::Frozen => {}
+        }
+        self.validate_rule_only(plan_wire,&plan,records,profile,actions,context)?;
+        // Mark before the potentially side-effecting callback; failures
+        // cannot safely be interpreted as "nothing happened".
+        self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterUnknown;
+        let result=native_accept();
+        if result.is_ok() {
+            self.pending.as_mut().ok_or(Error::Stale)?.status=PendingStatus::AdapterAccepted;
+            Ok(Publication::AdapterAccepted)
+        } else {
+            result.map(|_|Publication::AdapterAccepted)
+        }
+    }
+
+    /// Release the single pending plan only after a distinct EL1 terminal
+    /// owner has independently established a final state for EVERY action.
+    /// A digest or boolean supplied by the model, publisher or the plan
+    /// itself is never sufficient: `verify_native` must validate authoritative
+    /// executor/device/persistent evidence and exact action identities.
+    ///
+    /// An UNKNOWN publication may be settled ONLY with such independent proof,
+    /// never by elapsed time. The plan/decision key high-water remains burned
+    /// after release; the most recent 256 terminal digests remain queryable.
+    pub fn settle_with_native_proof(
+        &mut self,
+        actor:Identity,
+        terminal:TrustedTerminal,
+        verify_native:impl FnOnce(&TrustedTerminal)->Result<(),Error>,
+    ) -> Result<TerminalSummary,Error> {
+        if self.terminal_owner!=Some(actor) || !actor.valid() {
+            return Err(Error::Denied);
+        }
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        if pending.status==PendingStatus::Frozen {
+            return Err(Error::NotReady);
+        }
+        let required=(1u32.checked_shl(pending.count as u32).ok_or(Error::Invalid)?-1) as u16;
+        if terminal.boot_epoch!=self.boot_epoch
+            || terminal.controller_epoch!=self.controller_epoch
+            || terminal.plan_seq!=pending.plan_seq
+            || terminal.plan_digest!=pending.plan_digest
+            || usize::from(terminal.action_count)!=pending.count
+            || terminal.terminal_mask!=required
+            || terminal.unknown_mask!=0
+            || terminal.evidence_digest==[0;32]
+        {
+            return Err(Error::Denied);
+        }
+        // Independent authority check executes before modifying any state.
+        verify_native(&terminal)?;
+        let summary=TerminalSummary {
+            plan_seq:pending.plan_seq,
+            plan_digest:pending.plan_digest,
+            action_count:terminal.action_count,
+            evidence_digest:terminal.evidence_digest,
+        };
+        self.history[self.history_next]=Some(summary);
+        self.history_next=(self.history_next+1)%TERMINAL_HISTORY;
+        self.pending=None;
+        Ok(summary)
+    }
+
+    /// Query is limited to authenticated local roles; old terminal keys
+    /// outside the 256-record retention window are stale, never re-executed.
+    pub fn terminal_summary(
+        &self,actor:Identity,plan_seq:u64
+    ) -> Result<Option<TerminalSummary>,Error> {
+        if actor!=self.controller && actor!=self.publisher
+            && self.terminal_owner!=Some(actor)
+        {return Err(Error::Denied);}
+        if !actor.valid() {return Err(Error::Denied);}
+        Ok(self.history.iter().flatten().copied()
+            .find(|item|item.plan_seq==plan_seq))
+    }
+
+    /// Terminal integration from exact copied 0x43 ApplyReport v1 bytes.
+    ///
+    /// This method still requires a TRUE native EL1 evidence verifier:
+    /// signed/authenticated executor identity, device/redo completion,
+    /// accepted apply_id and pin/resource accounting. The report body itself
+    /// is only a claim and must not authorize APPLIED or reference release.
+    pub fn settle_verified_apply_reports(
+        &mut self,
+        supervisor:Identity,
+        plan_wire:&[u8],
+        report_frames:&[&[u8]],
+        executor:TrustedExecutor,
+        mut verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
+    )->Result<TerminalSummary,Error>{
+        // Validate the terminal owner before invoking any verifier callback.
+        if !supervisor.valid() || self.terminal_owner!=Some(supervisor){
+            return Err(Error::Denied);
+        }
+        let plan=PlanV2::decode(plan_wire)?;
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        if pending.status==PendingStatus::Frozen {
+            return Err(Error::NotReady);
+        }
+        if plan.header.plan_seq!=pending.plan_seq
+            || sha256(plan_wire)!=pending.plan_digest
+            || plan.header.controller_epoch!=self.controller_epoch
+            || executor.boot_epoch!=self.boot_epoch
+        {return Err(Error::Denied);}
+        let terminal_mask=apply_report_v1::verified_terminal_mask(
+            &plan,report_frames,executor,|index,report|{
+                verify_native(index,report)
+            }
+        )?;
+        // Full copied-byte digest is a searchable audit link, not proof by
+        // itself; only the preceding independent native callback is proof.
+        let mut h=Sha256::new();
+        for frame in report_frames {
+            h.update((frame.len() as u32).to_le_bytes());
+            h.update(frame);
+        }
+        let evidence_digest:[u8;32]=h.finalize().into();
+        let proof=TrustedTerminal {
+            boot_epoch:self.boot_epoch,
+            controller_epoch:self.controller_epoch,
+            plan_seq:pending.plan_seq,
+            plan_digest:pending.plan_digest,
+            action_count:plan.header.action_count,
+            terminal_mask,
+            unknown_mask:0,
+            evidence_digest,
+        };
+        self.settle_with_native_proof(supervisor,proof,|_|Ok(()))
+    }
+
+    /// Expired *unpublished* registration may be discarded by the controller;
+    /// all high-water keys remain burned. In-flight/unknown work is never
+    /// freed without an independent native terminal/recovery proof.
+    pub fn expire_unpublished(
+        &mut self, actor:Identity, now_ns:u64
+    ) -> Result<bool,Error> {
+        if actor!=self.controller {return Err(Error::Denied);}
+        if let Some(p)=&self.pending {
+            if p.status!=PendingStatus::Frozen {return Err(Error::NotReady);}
+            if now_ns>=p.expires_ns {
+                self.pending=None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+fn rule_profile_mismatch(profile:&Profile<'_>, ctx:TrustedRegistrationScope) ->bool {
+    profile.generation!=ctx.rules_generation
+        || sha256(profile.canonical_bytes())!=ctx.rules_hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTROLLER:Identity=Identity{id:2,generation:1};
+    const PUBLISHER:Identity=Identity{id:8,generation:1};
+
+    fn profile_bytes() -> [u8;80] {
+        let mut b=[0u8;80];
+        b[0..4].copy_from_slice(&0x4359_5255u32.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&32u16.to_le_bytes());
+        b[8..16].copy_from_slice(&7u64.to_le_bytes());
+        b[16..20].copy_from_slice(&1u32.to_le_bytes());
+        b[20..24].copy_from_slice(&80u32.to_le_bytes());
+        b[32..36].copy_from_slice(&1u32.to_le_bytes());
+        b[36..38].copy_from_slice(&1u16.to_le_bytes()); // D01
+        b[38..40].copy_from_slice(&1u16.to_le_bytes()); // kind=1
+        b[40..48].copy_from_slice(&17u64.to_le_bytes());
+        b[52..54].copy_from_slice(&2u16.to_le_bytes()); // two legal values
+        b[56..60].copy_from_slice(&48u32.to_le_bytes());
+        b[64..66].copy_from_slice(&2u16.to_le_bytes()); // ordinal 2, rank 0
+        b[72..74].copy_from_slice(&4u16.to_le_bytes()); // ordinal 4
+        b[74..76].copy_from_slice(&1u16.to_le_bytes()); // rank 1
+        b
+    }
+    fn plan_bytes() -> [u8;212] {
+        let mut b=[0u8;212];
+        b[0..4].copy_from_slice(&0x4359_4c31u32.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&64u16.to_le_bytes());
+        b[8..12].copy_from_slice(&212u32.to_le_bytes());
+        b[12..14].copy_from_slice(&1u16.to_le_bytes()); // action count
+        b[16..24].copy_from_slice(&1u64.to_le_bytes()); // plan sequence
+        b[40..48].copy_from_slice(&2u64.to_le_bytes()); // controller epoch
+        b[48..56].copy_from_slice(&3u64.to_le_bytes()); // snapshot sequence
+        b[56..64].copy_from_slice(&10_000_000_100u64.to_le_bytes());
+        let h=64;
+        b[h..h+4].copy_from_slice(&0x4359_5031u32.to_le_bytes());
+        b[h+4..h+6].copy_from_slice(&2u16.to_le_bytes());
+        b[h+6..h+8].copy_from_slice(&144u16.to_le_bytes());
+        b[h+8..h+10].copy_from_slice(&1u16.to_le_bytes()); // D01
+        b[h+10..h+12].copy_from_slice(&1u16.to_le_bytes()); // action kind
+        b[h+12..h+16].copy_from_slice(&4u32.to_le_bytes()); // payload len
+        for (at,value) in [
+            (16,2u64), (24,4), (32,3), (40,17),
+            (48,1), (56,5), (64,6), (72,200),
+        ] { b[h+at..h+at+8].copy_from_slice(&value.to_le_bytes()); }
+        b[h+112..h+144].copy_from_slice(&[1u8;32]); // candidate set digest
+        b[h+144..h+146].copy_from_slice(&0u16.to_le_bytes()); // candidate index
+        b[h+146..h+148].copy_from_slice(&[2u8,0]); // native D01 action payload
+        b
+    }
+    fn decision(plan:&[u8],rules:&[u8]) -> [u8;DECISION_BYTES] {
+        let mut b=[0u8;DECISION_BYTES];
+        b[0..4].copy_from_slice(&0x4359_4431u32.to_le_bytes());
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[6..8].copy_from_slice(&256u16.to_le_bytes());
+        for (at,value) in [
+            (8,1u64), (16,2), (24,4), (32,1), (40,3),
+            (48,17), (56,1), (64,5), (72,6), (80,7), (144,200),
+        ] { b[at..at+8].copy_from_slice(&value.to_le_bytes()); }
+        b[88..92].copy_from_slice(&1u32.to_le_bytes());
+        b[94..96].copy_from_slice(&1u16.to_le_bytes());
+        b[96..98].copy_from_slice(&1u16.to_le_bytes());
+        b[104..106].copy_from_slice(&u16::MAX.to_le_bytes());
+        b[108..112].copy_from_slice(&2u32.to_le_bytes()); // RULE_ONLY baseline
+        b[152..156].copy_from_slice(&3u32.to_le_bytes());
+        b[160..192].copy_from_slice(&sha256(rules));
+        b[192..224].copy_from_slice(&sha256(plan));
+        b[224..256].copy_from_slice(&[1u8;32]);
+        b
+    }
+    fn trusted(rules:&[u8]) -> TrustedRegistrationScope {
+        TrustedRegistrationScope {
+            boot_epoch:1, controller_epoch:2, rules_generation:7,
+            rules_hash:sha256(rules), base_plan_version:0,
+            ledger_generation:5, core_generation:6, snapshot_seq:3,
+            sampled_ns:100, now_ns:150,
+        }
+    }
+    fn frozen<'a>(ordinals:&'a[u16],payload:&'a[u8]) -> [FrozenAction<'a>;1] {
+        [FrozenAction {
+            domain_id:1, target:Identity{id:17,generation:1},
+            candidate_set_hash:[1;32],static_ordinals:ordinals,
+            raw_fields:[None;7], action_payload:payload,
+        }]
+    }
+    #[test]
+    fn authenticated_exact_registration_and_single_shot_native_callback() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        assert_eq!(gate.register_rule_only(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Denied));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::Frozen));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::ExactRetry));
+        let mut invoked=0u32;
+        assert_eq!(gate.publish_once(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Err(Error::Denied));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Ok(Publication::AdapterAccepted));
+        assert_eq!(invoked,1);
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Ok(Publication::ReplayNoEffect));
+        assert_eq!(invoked,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,201),Err(Error::NotReady));
+    }
+    #[test]
+    fn tampered_digest_rule_epoch_target_or_decision_will_not_reach_native_adapter() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let mut rec=decision(&plan,&bytes);
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        let mut wrong=rec;wrong[192]=wrong[192].wrapping_add(1);
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[wrong],&catalog,&frozen,ctx
+        ),Err(Error::Denied));
+        let mut stale=ctx;stale.rules_generation=8;
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,stale
+        ),Err(Error::Stale));
+        rec[48..56].copy_from_slice(&18u64.to_le_bytes());
+        assert!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ).is_err());
+        rec=decision(&plan,&bytes);
+        gate.register_rule_only(CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx).unwrap();
+        let mut bad_plan=plan;bad_plan[209]=1;
+        let mut invoked=false;
+        assert!(gate.publish_once(
+            PUBLISHER,&bad_plan,&[rec],&catalog,&frozen,ctx,
+            ||{invoked=true;Ok(())}
+        ).is_err());
+        assert!(!invoked);
+        let mut bad_record=rec;bad_record[224]=2;
+        assert!(gate.publish_once(
+            PUBLISHER,&plan,&[bad_record],&catalog,&frozen,ctx,
+            ||{invoked=true;Ok(())}
+        ).is_err());
+        assert!(!invoked);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,200),Ok(true));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ),Err(Error::Stale));
+    }
+    #[test]
+    fn unknown_adapter_result_keeps_key_consumed_and_blocks_reexecution() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let mut attempts=0u32;
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{attempts+=1;Err(Error::Busy)}
+        ),Err(Error::Busy));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{attempts+=1;Ok(())}
+        ),Err(Error::NotReady));
+        assert_eq!(attempts,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,200),Err(Error::NotReady));
+    }
+    const SUPERVISOR: Identity=Identity{id:11,generation:1};
+
+    fn terminal_proof(plan:&[u8]) -> TrustedTerminal {
+        TrustedTerminal {
+            boot_epoch:1,controller_epoch:2,plan_seq:1,
+            plan_digest:sha256(plan),
+            action_count:1,terminal_mask:1,unknown_mask:0,
+            evidence_digest:[9;32],
+        }
+    }
+
+    #[test]
+    fn independent_terminal_proof_releases_capacity_without_replaying_old_keys() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let proof=terminal_proof(&plan);
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,proof, |_|Ok(())
+        ),Err(Error::NotReady)); // no native publication was accepted
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        assert_eq!(gate.settle_with_native_proof(
+            PUBLISHER,proof, |_|Ok(())
+        ),Err(Error::Denied)); // publisher cannot forge its own completion
+        let mut bad=proof;bad.terminal_mask=0;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        bad=proof;bad.unknown_mask=1;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        bad=proof;bad.evidence_digest=[0;32];
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        let mut verifier_called=0;
+        assert_eq!(gate.settle_with_native_proof(SUPERVISOR,proof, |_|{
+            verifier_called+=1; Err(Error::NotReady)
+        }),Err(Error::NotReady));
+        assert_eq!(verifier_called,1);
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        let result=gate.settle_with_native_proof(SUPERVISOR,proof, |_|{
+            verifier_called+=1; Ok(())
+        }).unwrap();
+        assert_eq!(verifier_called,2);
+        assert_eq!(result.plan_seq,1);
+        assert_eq!(gate.terminal_summary(PUBLISHER,1),Ok(Some(result)));
+        assert_eq!(gate.terminal_summary(Identity{id:6,generation:1},1),Err(Error::Denied));
+        assert_eq!(gate.terminal_summary(SUPERVISOR,0),Ok(None));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Stale)); // old idempotent key cannot restart on eviction
+
+        let mut plan2=plan;
+        plan2[16..24].copy_from_slice(&2u64.to_le_bytes());
+        plan2[64+24..64+32].copy_from_slice(&5u64.to_le_bytes());
+        let mut record2=decision(&plan2,&bytes);
+        record2[24..32].copy_from_slice(&5u64.to_le_bytes());
+        record2[32..40].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan2,&[record2],&catalog,&frozen,ctx
+        ),Ok(Registration::Frozen)); // new, genuine work can progress
+    }
+
+    #[test]
+    fn unknown_adapter_result_requires_independent_terminal_reconciliation() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let mut invocations=0;
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invocations+=1;Err(Error::Busy)}
+        ),Err(Error::Busy));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invocations+=1;Ok(())}
+        ),Err(Error::NotReady));
+        assert_eq!(invocations,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+        let mut corrupted=terminal_proof(&plan);
+        corrupted.plan_digest[0]^=1;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,corrupted, |_|Ok(())
+        ),Err(Error::Denied));
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,terminal_proof(&plan), |_|Ok(())
+        ).unwrap().action_count,1);
+        assert_eq!(invocations,1);
+    }
+
+    fn executor_report(state:u16)->[u8;98]{
+        let mut b=[0u8;98];
+        for (at,value) in [
+            (0,1u64),(8,2),(16,1),(32,17),(40,1),
+            (48,9),(56,7),(72,180),
+        ]{b[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        b[26..28].copy_from_slice(&1u16.to_le_bytes());
+        b[28..30].copy_from_slice(&state.to_le_bytes());
+        b[68..72].copy_from_slice(&2u32.to_le_bytes());
+        b[96..98].copy_from_slice(&[2u8,0]);
+        b
+    }
+    fn verified_executor()->TrustedExecutor{
+        TrustedExecutor{
+            actor:Identity{id:12,generation:9},
+            authorized_executor:Identity{id:12,generation:9},
+            executor_generation:9,boot_epoch:1,plan_version:7,now_ns:200,
+        }
+    }
+    #[test]
+    fn native_apply_reports_require_supervisor_and_real_completion_proof(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        let report=executor_report(1);
+        let mut verifications=0;
+        assert_eq!(gate.settle_verified_apply_reports(
+            PUBLISHER,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Ok(())}
+        ),Err(Error::Denied));
+        assert_eq!(verifications,0);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Err(Error::NotReady)}
+        ),Err(Error::NotReady));
+        assert_eq!(verifications,1);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Ok(())}
+        ).unwrap().action_count,1);
+        assert_eq!(verifications,2);
+        assert!(gate.terminal_summary(SUPERVISOR,1).unwrap().is_some());
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Stale));
+    }
+    #[test]
+    fn unknown_apply_report_remains_owned_even_with_time_and_matching_bytes(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        let report=executor_report(3);
+        let mut checked=0;
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{checked+=1;Ok(())}
+        ),Err(Error::NotReady));
+        assert_eq!(checked,0);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+    }
+
+    #[test]
+    fn unconfigured_terminal_authority_never_releases_inflight_plan() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        assert_eq!(gate.settle_with_native_proof(
+            CONTROLLER,terminal_proof(&plan), |_|Ok(())
+        ),Err(Error::Denied));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::ExactRetry));
+        assert_eq!(gate.expire_unpublished(CONTROLLER,10000),Err(Error::NotReady));
+        assert!(RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,CONTROLLER,1,2
+        ).is_err());
+    }
+
+    #[test]
+    fn bounded_terminal_summary_history_retains_only_latest_256_distinct_plan_keys() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        for seq in 1u64..=257 {
+            let mut plan=plan_bytes();
+            plan[16..24].copy_from_slice(&seq.to_le_bytes());
+            let decision_seq=seq+3;
+            plan[64+24..64+32].copy_from_slice(&decision_seq.to_le_bytes());
+            let mut record=decision(&plan,&bytes);
+            record[24..32].copy_from_slice(&decision_seq.to_le_bytes());
+            record[32..40].copy_from_slice(&seq.to_le_bytes());
+            gate.register_rule_only(
+                CONTROLLER,&plan,&[record],&catalog,&frozen,ctx
+            ).unwrap();
+            gate.publish_once(
+                PUBLISHER,&plan,&[record],&catalog,&frozen,ctx,||Ok(())
+            ).unwrap();
+            let mut proof=terminal_proof(&plan);
+            proof.plan_seq=seq;
+            gate.settle_with_native_proof(
+                SUPERVISOR,proof, |_|Ok(())
+            ).unwrap();
+        }
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        assert!(gate.terminal_summary(SUPERVISOR,2).unwrap().is_some());
+        assert!(gate.terminal_summary(SUPERVISOR,257).unwrap().is_some());
+        assert_eq!(gate.terminal_summary(PUBLISHER,258),Ok(None));
+        assert_eq!(gate.last_plan_seq,257);
+        assert_eq!(gate.last_decision_seq,260);
+    }
+    #[test]
+    fn exact_unpublished_retry_cannot_bypass_current_rule_or_expired_scope() {
+        let rule_bytes=profile_bytes();
+        let profile=Profile::parse(&rule_bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&rule_bytes)];
+        let frozen=frozen(&[2,4],&[2,0]);
+        let ctx=trusted(&rule_bytes);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx).unwrap();
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx),
+            Ok(Registration::ExactRetry)
+        );
+        // Caller-supplied idempotence cannot revive a stale EL1 snapshot.
+        let mut stale=ctx;
+        stale.now_ns=ctx.sampled_ns+100_000_000;
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,stale),
+            Err(Error::Stale)
+        );
+        // A newly frozen rule generation invalidates *unpublished* retries.
+        stale=ctx;
+        stale.rules_generation+=1;
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,stale),
+            Err(Error::Stale)
+        );
+        // Cross-role exact wire replay is not registration authority.
+        assert_eq!(
+            gate.register_rule_only(PUBLISHER,&plan,&records,&profile,&frozen,ctx),
+            Err(Error::Denied)
+        );
+    }
+
+    #[test]
+    fn once_native_adapter_unknown_retry_is_never_advertised_as_frozen() {
+        let rule_bytes=profile_bytes();
+        let profile=Profile::parse(&rule_bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&rule_bytes)];
+        let frozen=frozen(&[2,4],&[2,0]);
+        let ctx=trusted(&rule_bytes);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx).unwrap();
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&profile,&frozen,ctx,
+            ||Err(Error::Busy)
+        ),Err(Error::Busy));
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx),
+            Err(Error::NotReady)
+        );
+        // Neither EL1 timeout nor repeated SVC input releases the slot.
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+    }
+
+    #[test]
+    fn trial_and_advice_without_disposition_or_permit_are_not_authorized() {
+        let rules=profile_bytes();
+        let catalog=Profile::parse(&rules).unwrap();
+        let mut plan=plan_bytes();
+        let mut rec=decision(&plan,&rules);
+        rec[108..112].copy_from_slice(&7u32.to_le_bytes());
+        let ctx=trusted(&rules);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ),Err(Error::NotReady)); // source0 reason7 needs frozen AdviceDisposition
+        rec=decision(&plan,&rules);
+        plan[14]=1; // AI assisted header, no trusted Active model
+        assert!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ).is_err());
+    }
+}

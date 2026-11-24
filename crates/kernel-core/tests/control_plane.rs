@@ -761,6 +761,41 @@ fn audit_stale_timestamp_cannot_suppress_fault_containment() {
 }
 
 #[test]
+fn v0199_cpu0_manager_authenticates_only_control_core_and_never_scales() {
+    use cyxia_kernel_core::control_plane::cpu0_v0199 as topology;
+    let mut l=limits();
+    l.min_business_capacity=300;
+    l.committed_business_capacity=300;
+    l.protected_control=topology::CONTROL_MASK;
+    l.protected_business=topology::BUSINESS_MASK;
+    let owner=Ownership::<4>::new_v0199_cpu0(
+        0b1111,[100;4],[1,2,4,8],l
+    ).unwrap();
+    assert_eq!(owner.snapshot().business,0b1110);
+    assert!(Manager::new_fixed(
+        Ownership::<4>::new_fixed(0b1111,[100;4],[1,2,4,8],limits()).unwrap(),
+        id(10),epochs(),limits(),[env().limits;16]
+    ).is_ok());
+    let mut m=Manager::new_v0199_cpu0(
+        owner,id(10),epochs(),l,[env().limits;16]
+    ).unwrap();
+    let plan=Request::Policy(plan()).encode();
+    assert_eq!(m.submit(id(10),1,plan,10),Err(Error::Denied));
+    assert_eq!(m.submit(id(11),0,plan,10),Err(Error::Denied));
+    assert!(m.submit(id(10),0,plan,10).is_ok());
+    let old=m.snapshot();
+    let scale=Request::Scale {
+        epochs:m.epochs(),
+        proposal:ScaleProposal {
+            generation:m.epochs().cores,
+            resource_epoch:1,sequence:1,
+            desired_control:0b0010,deadline:100,
+        },
+    };
+    assert_eq!(m.submit(id(10),0,scale.encode(),11),Err(Error::Denied));
+    assert_eq!(m.snapshot(),old);
+}
+#[test]
 fn v019_manager_rejects_control_scaling_and_keeps_business_ownership() {
     use cyxia_kernel_core::control_plane::fixed::CONTROL_MASK;
     let ownership=Ownership::<4>::new_fixed(15,[100;4],[1,2,4,8],limits()).unwrap();
@@ -802,10 +837,11 @@ fn v019_two_brains_are_only_auxiliary_to_trusted_fixed_control_manager() {
     let no_ai=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
     assert_eq!(no_ai.source,ChoiceSource::Baseline);
     pair.submit(Brain::Operations,id(100),1,advice(4)).unwrap();
-    pair.submit(Brain::Security,id(200),1,advice(1)).unwrap();
-    let conflict=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
-    assert_eq!(conflict.source,ChoiceSource::ConflictFallback);
-    assert_eq!(conflict.candidate,2);
+    // Security findings do not have an Action-voting path.
+    assert_eq!(pair.submit(Brain::Security,id(200),1,advice(1)),Err(Error::Denied));
+    let reviewed=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
+    assert_eq!(reviewed.source,ChoiceSource::OperationsAdvice);
+    assert_eq!(reviewed.candidate,4);
     assert_eq!(m.snapshot().control,2);
     assert_eq!(m.epochs(),epochs());
 }

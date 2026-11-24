@@ -2566,6 +2566,11 @@ impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
         self.provenance.enter(submission::Callback::Check);
         let result = (|| {
             self.provenance.at(submission::Stage::Context);
+            // V0.19.9 local-only policy gate: reject retired D01 CoreSet and
+            // D16 remote actions before family lookup, reservations or effects.
+            if !d.action.permitted_v0199_local() {
+                return Err(Error::Unsupported);
+            }
             let c = self.owner.context;
             if d.envelope.core_generation != c.core_generation
                 || d.envelope.ledger_generation != c.ledger_generation
@@ -2647,13 +2652,11 @@ impl<S: PublicationScope, P: PlanView> policy::Executor<P> for Executor<'_, S> {
             }
             let mut stamps = [PolicyStamp::default(); 16];
             for (index, d) in plan.iter().enumerate() {
-                // Enforce again at final publication, not only at the AI
-                // selection gate. Any stale/forged control migration plan
-                // is rejected before the first policy stamp or executor work.
-                if cfg!(feature = "unified-runtime")
-                    && matches!(d.action, Action::ControlSet(mask) if mask != 0b10)
-                {
-                    return Err(Error::Denied);
+                // No legacy CoreSet (including mask=CPU1), offer or
+                // remote-placement action may be published for the native
+                // single-device profile. Recheck after PREPARE as well.
+                if !d.action.permitted_v0199_local() {
+                    return Err(Error::Unsupported);
                 }
                 self.provenance.at(submission::Stage::Stamp);
                 stamps[index] = PolicyStamp::for_action(

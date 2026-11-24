@@ -1,5 +1,15 @@
 // Feature/profile registration for the ARM integration. No runtime behavior lives here.
 #[cfg(all(
+    feature = "v0199-cpu0-role-selftest",
+    any(
+        feature = "ai-control-selftest", feature = "prototype-runtime",
+        feature = "unified-runtime", feature = "net-selftest",
+        feature = "model-v13-selftest", feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest", feature = "register-v15-selftest"
+    )
+))]
+compile_error!("V0.19.9 CPU0 role fixture cannot mix historical control/cluster acceptance profiles");
+#[cfg(all(
     feature = "register-v15-selftest",
     any(
         feature = "prototype-runtime",

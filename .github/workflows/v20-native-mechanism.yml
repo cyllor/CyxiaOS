@@ -3,7 +3,7 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 
 on:
   push:
-    branches: [work/v020-native-control-safety]
+    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
       - 'kernel/**'
@@ -46,6 +46,12 @@ jobs:
           ninja -C build qemu-system-aarch64 qemu-system-x86_64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/build.log"
           mkdir -p "$RUNNER_TEMP/qemu-bin"
           cp build/qemu-system-aarch64 build/qemu-system-x86_64 "$RUNNER_TEMP/qemu-bin/"
+          # Standalone QEMU cannot find its built-in PC BIOS unless the pinned
+          # pc-bios directory is shipped alongside the binary and explicitly -L.
+          cp -a pc-bios "$RUNNER_TEMP/qemu-bin/pc-bios"
+          test -s "$RUNNER_TEMP/qemu-bin/pc-bios/bios-256k.bin"
+          sha256sum "$RUNNER_TEMP/qemu-bin/pc-bios/bios-256k.bin" \
+            > "$GITHUB_WORKSPACE/artifacts/v020-qemu/sea-bios-256k.sha256"
           "$RUNNER_TEMP/qemu-bin/qemu-system-aarch64" --version | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/arm-version.txt"
           "$RUNNER_TEMP/qemu-bin/qemu-system-x86_64" --version | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/x86-version.txt"
           sha256sum "$RUNNER_TEMP"/qemu-bin/qemu-system-* | tee "$GITHUB_WORKSPACE/artifacts/v020-qemu/binaries.sha256"
@@ -124,7 +130,10 @@ jobs:
           tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
           mkdir -p artifacts/v020-x86-native
           python3 tools/x86_64.py build --output artifacts/v020-x86-native/build --mechanism smp
-          PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 tools/x86_64.py run             --build artifacts/v020-x86-native/build --output artifacts/v020-x86-native/capture --timeout 35
+          CYXIA_PINNED_QEMU_FIRMWARE="$RUNNER_TEMP/qemu-bin/pc-bios" \
+            PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 tools/x86_64.py run \
+            --build artifacts/v020-x86-native/build \
+            --output artifacts/v020-x86-native/capture --timeout 35
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
