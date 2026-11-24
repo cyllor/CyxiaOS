@@ -119,8 +119,23 @@ def validate(serial: bytes, page: bytes, cpu_count: int) -> dict:
             'business_progress_during_control_stop': stall[0][2] - stall[0][1]}
 
 
-def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None) -> dict:
-    require(1 <= timeout <= 60 and cpus in (1, 4), 'invalid execution budget/configuration')
+def boot_ram_mib(elf: bytes) -> int:
+    """Read the actual linked boot profile; never trust a user-provided RAM label."""
+    layout = inspect_elf(elf)
+    marker = symbol(elf, 'CYXIA_BOOT_PROFILE')
+    require(marker['size'] == 24, 'wrong boot profile size')
+    for seg in layout['loads']:
+        delta = marker['pa'] - seg['pa']
+        if 0 <= delta and delta + 24 <= seg['size']:
+            version, ram_mib, _pages = struct.unpack_from('<3Q', elf, seg['offset'] + delta)
+            require(version == 1 and ram_mib in (256, 512, 1024), 'invalid linked RAM profile')
+            return ram_mib
+    raise ValueError('boot profile not backed by loaded ELF bytes')
+
+
+def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256) -> dict:
+    require(1 <= timeout <= 60 and cpus in (1, 4) and ram_mib in (256, 1024),
+            'invalid execution budget/configuration')
     elf = elf.resolve(strict=True)
     output = output.resolve()
     require(not output.exists(), 'refuse to reuse evidence output')
@@ -140,6 +155,8 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             location = profile(elf.read_bytes()) if acceptance is None else acceptance.profile(elf.read_bytes())
             if acceptance is not None:
                 report.update(acceptance.metadata())
+            if acceptance is not None:
+                require(boot_ram_mib(elf.read_bytes()) == ram_mib, 'ELF/QEMU RAM profile mismatch')
             binary = shutil.which('qemu-system-aarch64')
             require(binary is not None, 'qemu-system-aarch64 is missing')
             version = subprocess.check_output([binary, '--version'], timeout=10, text=True)
@@ -156,7 +173,7 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             report['qemu_sha256'] = sha(Path(binary))
             path = str(Path(td) / 'q.sock')
             args = [binary, '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
-                    '-cpu', 'cortex-a53', '-smp', str(cpus), '-m', '256M', '-accel', 'tcg,thread=multi',
+                    '-cpu', 'cortex-a53', '-smp', str(cpus), '-m', f'{ram_mib}M', '-accel', 'tcg,thread=multi',
                     '-display', 'none', '-monitor', 'none', '-nic', 'none',
                     '-chardev', 'ringbuf,id=cyxlog,size=1048576', '-serial', 'chardev:cyxlog',
                     '-qmp', f'unix:{path},server=on,wait=off', '-kernel', str(elf), '-no-reboot']
@@ -174,6 +191,12 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             qmp.execute('qmp_capabilities')
             actual_cpus = qmp.execute('query-cpus-fast')
             report['qmp_cpus'] = actual_cpus
+            if acceptance is not None:
+                memory = qmp.execute('query-memory-size-summary')
+                report['qmp_memory'] = memory
+                require(memory['base-memory'] == ram_mib * 1024 * 1024 and memory.get('plugged-memory', 0) == 0,
+                        'QMP RAM topology disagrees with linked boot profile')
+                report['guest_ram_mib'] = ram_mib
             while time.monotonic() < end:
                 require(proc.poll() is None, 'QEMU exited before acceptance')
                 value = qmp.execute('ringbuf-read', {'device': 'cyxlog', 'size': 1048576, 'format': 'base64'})
