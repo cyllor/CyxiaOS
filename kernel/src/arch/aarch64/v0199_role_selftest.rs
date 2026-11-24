@@ -256,6 +256,118 @@ pub(super) fn run() -> ! {
         report("V0199_SVC_COPY",case as u64,evidence[2],evidence[5]);
     }
 
+    // Exercise all eight existing hardware address spaces, not only the
+    // operations role. Each negative access must trap with the exact ESR/FAR;
+    // then stop the old context, scrub exclusive data/stack and reenter.
+    // This is a SAME-ROOT STATIC FIXTURE, not the production fault/rebuild
+    // protocol (no durable epoch or capability registry is claimed).
+    use cyxia_kernel_core::control_plane::service_restart::{Lifecycle,RestartDecision};
+    let kernel_address=(core::ptr::addr_of!(BOOT_READY) as u64)&!7;
+    for index in 0..ROLE_COUNT{
+        let space=FIRST_ROLE_SPACE+index;
+        let member=manifest.members[index];
+        let role=u64::from(member.role.id());
+        let mut life=Lifecycle::new(1,member.actor.generation).unwrap();
+        life.peer_ready(1,member.actor.generation).unwrap();
+        let before:[u64;ROLE_COUNT]=core::array::from_fn(|i|unsafe{
+            let p=core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(FIRST_ROLE_SPACE+i);
+            core::ptr::read_volatile(core::ptr::addr_of!((*p).0[1]))
+        });
+        for (case,(mode,address,ec,fsc)) in [
+            (1,kernel_address,0x24,0x0f),
+            (1,0x40000,0x24,0x07),
+            (2,CODE,0x24,0x4f),
+            (3,DATA,0x20,0x0f),
+            (2,STACK-4096,0x24,0x47),
+        ].into_iter().enumerate(){
+            let mut ctx=context(space);ctx.regs[1]=address;ctx.regs[2]=mode;
+            let mut trapped=false;
+            for _ in 0..32{
+                execute(&mut ctx,space);
+                if ctx.kind==9{continue;}
+                if ctx.kind!=8 || ctx.esr>>26!=ec || ctx.far!=address || ctx.esr&0x7f!=fsc{
+                    fatal(300+index as u64);
+                }
+                trapped=true;break;
+            }
+            if !trapped{fatal(310+index as u64);}
+            let at=304+index*15+case*3;
+            for (i,value) in [ctx.kind,ctx.esr,ctx.far].into_iter().enumerate(){
+                SMP_EVIDENCE.words[at+i].store(value,Ordering::Relaxed);
+            }
+            report("V0199_ROLE_FAULT",role,case as u64,ctx.esr);
+        }
+        // The old context has returned through the real exception vector,
+        // and the fixture never dispatches it again. No other CPU owns its
+        // static private pages. A component generation transition does not
+        // certify real production device/capability/epoch reconciliation.
+        let old=member.actor.generation;
+        let next=match life.fault(1,old).unwrap(){
+            RestartDecision::Restart{generation}=>generation,
+            RestartDecision::Isolate=>fatal(320+index as u64),
+        };
+        assert_eq!(next,old+1);
+        assert!(!life.accepts(1,old) && !life.accepts(1,next));
+        assert!(life.reset_complete(1,old).is_err());
+        let (data,stack)=unsafe{
+            let data=core::ptr::addr_of_mut!(DATA_PAGES).cast::<Page>().add(space);
+            let stack=core::ptr::addr_of_mut!(USER_STACKS).cast::<Page>().add(space);
+            // These pages are exclusive to the stopped CPU0 fixture context;
+            // write and independently read back every physical word.
+            for word in 0..512{
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*data).0[word]),0);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*stack).0[word]),0);
+            }
+            (data,stack)
+        };
+        let mut scrubbed=0u64;
+        for word in 0..512{
+            let pair=unsafe{
+                (core::ptr::read_volatile(core::ptr::addr_of!((*data).0[word])),
+                 core::ptr::read_volatile(core::ptr::addr_of!((*stack).0[word])))
+            };
+            if pair!=(0,0){fatal(330+index as u64);}
+            scrubbed+=16;
+        }
+        unsafe{
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*data).0[0]),cookie(space));
+            core::arch::asm!("dsb ishst",options(nostack));
+        }
+        life.reset_complete(1,next).unwrap();
+        let mut restarted=context(space);restarted.regs[2]=4;
+        let mut resumed=false;
+        for _ in 0..32{
+            execute(&mut restarted,space);
+            if restarted.kind==9{continue;}
+            if restarted.kind!=8 || restarted.esr>>26!=0x15 || restarted.esr&0xffff!=4{
+                fatal(340+index as u64);
+            }
+            resumed=true;break;
+        }
+        if !resumed || restarted.regs[0]!=cookie(space) || restarted.tpidr_el0!=cookie(space){
+            fatal(350+index as u64);
+        }
+        life.peer_ready(1,next).unwrap();
+        assert!(life.ready() && life.accepts(1,next) && !life.accepts(1,old));
+        let count=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*data).0[1]))};
+        assert_eq!(count,16);
+        for other in 0..ROLE_COUNT{
+            if other!=index{
+                let observed=unsafe{
+                    let p=core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(FIRST_ROLE_SPACE+other);
+                    core::ptr::read_volatile(core::ptr::addr_of!((*p).0[1]))
+                };
+                assert_eq!(observed,before[other]);
+            }
+        }
+        let row=[role,old,next,scrubbed,restarted.kind,restarted.esr,count,
+            member.ttbr0_root,u64::from(life.ready())];
+        for (i,value) in row.into_iter().enumerate(){
+            SMP_EVIDENCE.words[424+index*9+i].store(value,Ordering::Relaxed);
+        }
+        report("V0199_ROLE_RESTART",role,next,count);
+    }
+
     // Prove all three business CPUs progressed while CPU0 owned the only
     // control EL0 role sequence. Do not promote CPU1 even if CPU0 stops.
     for slot in 1..REQUIRED {
