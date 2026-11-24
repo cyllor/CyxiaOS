@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 from doctor import RUST_BIN, env
-from host_prototype_library import build_host_prototype_library
+from host_prototype_library import build_host_file_broker_libraries
 
 
 class SnapshotFileAbi(unittest.TestCase):
@@ -28,7 +28,7 @@ class SnapshotFileAbi(unittest.TestCase):
             self.assertIn('4 passed', result.stdout)
 
     def test_real_broker_authority_history_and_retained_completion(self):
-        deps, library = build_host_prototype_library()
+        deps, library, kernel_core = build_host_file_broker_libraries()
         source = (ROOT / 'tests/host/snapshot_file_broker_harness.rs').read_text()
         source = source.replace('__BROKER__', str(ROOT / 'kernel/src/runtime/files/domain_file_abi.rs'))
         source = source.replace('__SNAPSHOT_ADAPTER__', str(ROOT / 'tests/host/snapshot_storage_adapter.rs'))
@@ -39,7 +39,7 @@ class SnapshotFileAbi(unittest.TestCase):
             result = subprocess.run([
                 str(RUST_BIN / 'rustc'), '--edition=2024', '-C', 'opt-level=1', '-C', 'panic=abort',
                 str(source_path), '-L', 'dependency=' + str(deps),
-                '--extern', 'cyxia_prototype=' + str(library), '-o', str(binary),
+                '--extern', 'cyxia_prototype=' + str(library), '--extern', 'cyxia_kernel_core=' + str(kernel_core), '-o', str(binary),
             ], env=env(), capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)

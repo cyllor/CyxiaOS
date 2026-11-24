@@ -10,6 +10,8 @@ on:
       - 'crates/kernel-core/src/security/file_*'
       - 'tests/host/test_snapshot*'
       - 'tools/test_snapshot_probe.py'
+      - 'tools/host_prototype_library.py'
+      - 'kernel/src/runtime/files/domain_file_abi.rs'
       - '.github/workflows/v20-snapshot-components.yml'
   push:
     branches: ['work/v020-snapshot-*']
