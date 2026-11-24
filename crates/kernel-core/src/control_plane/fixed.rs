@@ -140,6 +140,21 @@ impl Pair {
         self.operations.submit(authenticated_actor, packet.advice_seq, checked)
     }
 
+    /// Authenticated role7 IPC intake. Reject legacy Safety+Action advice
+    /// and malformed v2 frames before touching the bounded security slot.
+    /// The supervisor still independently freezes scope and deduplicates.
+    pub fn submit_security_wire(
+        &mut self,
+        authenticated_actor: Identity,
+        frame: &[u8],
+    ) -> Result<(), Error> {
+        if authenticated_actor != self.security.identity || !authenticated_actor.valid() {
+            return Err(Error::Denied);
+        }
+        let finding = SecurityFinding::decode(frame)?;
+        self.security.submit(authenticated_actor, finding)
+    }
+
     /// Records an independently decoded v2 risk report; no policy/ledger effect.
     pub fn submit_finding(
         &mut self,
@@ -346,6 +361,34 @@ mod tests {
             Err(Error::Denied)
         );
         assert_eq!(review(&p).candidate, 4);
+    }
+    #[test]
+    fn role7_security_wire_is_canonical_and_never_chooses_actions() {
+        let mut raw=[0u8;192];
+        raw[0..4].copy_from_slice(&0x4359_4644u32.to_le_bytes());
+        raw[4..6].copy_from_slice(&2u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&192u16.to_le_bytes());
+        for (at,value) in [
+            (8,1u64), (16,1), (24,1), (32,1), (40,99),
+            (48,1), (56,150),
+        ] {raw[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        raw[64..66].copy_from_slice(&1u16.to_le_bytes());
+        raw[66]=2;raw[67]=1;
+        raw[68..70].copy_from_slice(&1u16.to_le_bytes());
+        raw[72]=1;raw[104]=2;raw[136]=3;
+        raw[168..170].copy_from_slice(&256i16.to_le_bytes());
+        let mut p=pair();
+        assert_eq!(p.submit_security_wire(
+            Identity{id:10,generation:1},&raw),Err(Error::Denied));
+        let mut bad=raw;bad[171]=1;
+        assert_eq!(p.submit_security_wire(
+            Identity{id:20,generation:1},&bad),Err(Error::Invalid));
+        assert_eq!(review(&p).source,ChoiceSource::Baseline);
+        p.submit_security_wire(Identity{id:20,generation:1},&raw).unwrap();
+        assert!(p.security_review_requested(observation()));
+        assert_eq!(review(&p).candidate,2);
+        assert_eq!(p.submit_security_wire(
+            Identity{id:20,generation:1},&raw),Err(Error::Stale));
     }
     #[test] fn distinct_brains_have_no_cross_channel_write() {
         assert!(Pair::new(Identity {id:1,generation:1},Identity {id:1,generation:1}).is_err());
