@@ -92,8 +92,8 @@ def check_disk(path,epoch,out):
 class EpochFixture:
     scratch_epoch_disk=True
     completion=b'V0199_EPOCH_DISK_FIXTURE_PASS production=false\n'
-    def __init__(self,epoch,qemu_hash,patch_hash):
-        self.epoch=epoch;self.qemu_hash=qemu_hash
+    def __init__(self,epoch,qemu_hash,patch_hash,role7_hash):
+        self.epoch=epoch;self.qemu_hash=qemu_hash;self.role7_hash=role7_hash
         verify_smp.require(verify_smp.sha(PATCH)==patch_hash,'accounting patch mismatch')
     def verify_qemu(self,binary,version):
         verify_smp.require(version.splitlines()[0].startswith('QEMU emulator version 10.2.2')
@@ -114,7 +114,7 @@ class EpochFixture:
         w=struct.unpack('<512Q',page)
         e=self.epoch
         txid=2*e
-        require(w[:11]==(MAGIC,2,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),4),
+        require(w[:11]==(MAGIC,3,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),4),
                 'wrong durable boot/service transition identity')
         require(w[11]>=32 and w[12:14]==(8,HOME),'missing actual block I/O counts')
         require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
@@ -126,17 +126,30 @@ class EpochFixture:
         restarted=f'V0199_EPOCH_CLIENT_RELOADED a={new} b={new_root} c={e}\n'.encode()
         require(serial.count(stopped)==1 and serial.count(restarted)==1
                 and serial.index(stopped)<serial.index(restarted),'native stop/reload evidence mismatch')
-        require(all(v==0 for v in w[24:]),'nonzero reserved evidence')
+        old_stack,new_stack,stack_bytes,old_clock,old_snapshot,new_clock,new_snapshot,old_score,old_severity,new_score,new_severity=w[24:35]
+        require(old_stack and old_stack%4096==0 and new_stack==old_stack and stack_bytes==32768,
+                'wrong private role7 stack or reclaimed backing')
+        require(min(old_clock,old_snapshot,new_clock,new_snapshot)>0,'role7 did not execute real ABI3 calls')
+        require((old_score,old_severity,new_score,new_severity)==(342,2,342,2),
+                'role7 integer operator evidence differs from independent reference')
+        require(page[35*8:39*8]==self.role7_hash,'role7 verified package digest mismatch')
+        for generation in (old,new):
+            line=f'V0199_EPOCH_ROLE7_OPERATOR a={generation} b=342 c=2\n'.encode()
+            require(serial.count(line)==1,'role7 operator UART/QMP disagreement')
+        require(all(v==0 for v in w[39:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c=4\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
                     commit_lsn=txid*3,actual_flush_completions=4,block_reads=w[11],block_writes=w[12],
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
-                    native_diagnostic_restart_verified=True,production_service_restart_verified=False)
+                    native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
+                    role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
+                    role7_operator_results=[old_score,new_score],production_service_restart_verified=False)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--elf',type=Path,required=True)
+    p.add_argument('--role7',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--qemu-sha256',required=True)
     p.add_argument('--patch-sha256',required=True)
@@ -150,7 +163,7 @@ def main():
         previous=verify_smp.sha(disk)
         for epoch in (1,2):
             capture=out/f'boot-{epoch}'
-            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256),
+            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256,hashlib.sha256(a.role7.read_bytes()).digest()),
                                    ram_mib=1024,scratch_disk=disk)
             result['boots'].append(summary)
             verify_smp.require(summary['status']=='PASS' and summary.get('forced_process_stop'),
