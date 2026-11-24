@@ -282,6 +282,9 @@ impl RegisteredDecisionGate {
         for (index,(raw,local)) in records.iter().zip(actions).enumerate() {
             let rec=DecisionRecordV3::decode(raw)?;
             let act=plan.action(index)?;
+            if super::action_schema_v2::ActionV2::decode(act.domain_id,act.action_kind,act.action_payload)?.requires_trial(){
+                return Err(Error::Denied);
+            }
             if rec.source!=DecisionSource::RuleOnly
                 || rec.reason_code==7 // requires frozen AdviceDisposition v1
             {return Err(Error::NotReady);}
