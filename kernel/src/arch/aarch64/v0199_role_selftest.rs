@@ -155,6 +155,36 @@ pub(super) fn run() -> ! {
         report("V0199_CPU0_EL0_ROLE",m.role.id() as u64,root,count);
     }
 
+
+    // Physical SVC64 boundary smoke: each case enters the actual EL0
+    // operations-role address space, writes x8/arguments in assembly,
+    // traps back through the exception vector and uses the saved context.
+    // No userspace pointer is dereferenced and no service is executed.
+    use cyxia_kernel_core::security::{syscall::Syscall, syscall_v3::decode_aarch64_svc_v3};
+    for case in 0..7usize {
+        let mut probe=context(FIRST_ROLE_SPACE);
+        probe.regs[2]=6;
+        probe.regs[3]=case as u64;
+        let abi=if case==4 {1} else {3};
+        let mut trapped=false;
+        for _ in 0..32 {
+            execute(&mut probe,FIRST_ROLE_SPACE);
+            if probe.kind==9 {continue;}
+            if probe.kind!=8 || probe.esr>>26!=0x15 {fatal(170+case as u64);}
+            trapped=true;
+            break;
+        }
+        if !trapped {fatal(180+case as u64);}
+        let decoded=decode_aarch64_svc_v3(abi,probe.esr,&probe.regs);
+        let accepted=matches!(decoded,Ok(call) if call.operation==Syscall::Clock);
+        if accepted!=(case==0) || (case!=0 && decoded.is_ok()) {fatal(190+case as u64);}
+        let offset=224+case*5;
+        for (i,value) in [case as u64,u64::from(abi),probe.esr,probe.regs[8],u64::from(accepted)].into_iter().enumerate(){
+            SMP_EVIDENCE.words[offset+i].store(value,Ordering::Relaxed);
+        }
+        report("V0199_SVC_PREFLIGHT",case as u64,probe.esr,u64::from(accepted));
+    }
+
     // Prove all three business CPUs progressed while CPU0 owned the only
     // control EL0 role sequence. Do not promote CPU1 even if CPU0 stops.
     for slot in 1..REQUIRED {

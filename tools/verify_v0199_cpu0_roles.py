@@ -101,6 +101,19 @@ class NativeRoles:
                                "role did not complete genuine bounded EL0 svc turn")
             roots.add(root)
             private.add(private_page)
+        # Verify genuine EL0 trap syndromes and saved register-derived result;
+        # this is not a full syscall dispatch or user-memory access test.
+        svc_rows=rows("V0199_SVC_PREFLIGHT")
+        verify_smp.require(len(svc_rows)==7,"missing actual SVC64 preflight cases")
+        for case in range(7):
+            idx,abi,esr,x8,accepted=words[224+case*5:229+case*5]
+            expected_esr=0x56000004 if case==3 else 0x56000000
+            expected_x8=0x51 if case==2 else (0x50 if case in (5,6) else 4)
+            verify_smp.require((idx,abi,esr,x8,accepted)==(
+                case,1 if case==4 else 3,expected_esr,expected_x8,int(case==0)),
+                "wrong SVC64 exception or register preflight evidence")
+            verify_smp.require(svc_rows[case]==(case,esr,accepted),
+                               "SVC64 serial and guest memory disagree")
         serial_business=rows("V0199_CPU0_BUSINESS")
         verify_smp.require(len(serial_business)==3,"missing business progress")
         business_progress=0
@@ -117,6 +130,7 @@ class NativeRoles:
             "fixed_control_cpu":0,
             "business_cpu_mask":14,
             "distinct_el0_role_address_spaces":8,
+            "physical_svc64_register_preflight_cases":7,
             "role_ids":list(ROLE_IDS),
             "business_progress_turns":business_progress,
             "real_services_tested":False,
