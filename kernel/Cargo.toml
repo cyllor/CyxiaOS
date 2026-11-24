@@ -51,6 +51,8 @@ smp-selftest = ["selftest"]
 v0199-cpu0-role-selftest = ["smp-selftest"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
+# Same diagnostic program inventory with the normative RAM topology; not G0.
+v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
