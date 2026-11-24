@@ -70,6 +70,18 @@ impl DurableEpochGate{
         verify_recovered(&state)?;
         Ok(Self{committed:state,slots,pending:None,last:None,boot_confirmed:false})
     }
+    /// Production startup additionally requires an independently verified
+    /// signed config and actual mounted/recovered volume identity. The
+    /// older recovered() is retained for isolated media component fixtures.
+    pub fn recovered_for_startup(raw:&[u8],slots:[SlotBinding;ROLE_COUNT],
+        config:&super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        verify_recovered:impl FnOnce(&SecurityStateStoreV2)->Result<(),Error>)
+        ->Result<Self,Error>{
+        Self::recovered(raw,slots,|state|{
+            config.check_committed(state)?;
+            verify_recovered(state)
+        })
+    }
     pub fn boot_epoch(&self)->Option<u64>{
         (self.boot_confirmed && self.pending.is_none()).then_some(self.committed.last_boot_epoch)
     }
