@@ -3,7 +3,7 @@ name: V0.20 fixed-control native hardening (WIP)
 
 on:
   push:
-    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps, 'work/v020-gap-*']
+    branches: [CyxiaOS-V0.20, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, 'work/v020-gap-*']
   pull_request:
     branches: [CyxiaOS-V0.20, fix/v020-v0199-contract-gaps]
   workflow_dispatch:
@@ -21,6 +21,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0 # Allow the original, pinned V0.20 baseline tree to be archived.
       - name: Archive exact checked-out source and provenance
+        env:
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts/v020-source
@@ -35,7 +37,16 @@ jobs:
           printf '%s\n' "$base" > artifacts/v020-source/baseline-commit.txt
           (cd artifacts/v020-source && sha256sum source.tar.gz baseline.tar.gz > SHA256SUMS)
           test "$(cat VERSION)" = 0.20.0-dev
-          git diff --check
+          # On a clean checkout, plain git diff --check proves nothing
+          # about the committed patch. Compare the actual PR/push boundary.
+          test -z "$(git status --porcelain --untracked-files=no)"
+          compare_base="$EVENT_BASE"
+          if [ -z "$compare_base" ] || [ "$compare_base" = "0000000000000000000000000000000000000000" ]; then
+            compare_base="$(git rev-parse HEAD^)"
+          fi
+          git cat-file -e "$compare_base^{commit}"
+          printf '%s\n' "$compare_base" > artifacts/v020-source/diff-base.txt
+          git diff --check "$compare_base" HEAD
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
