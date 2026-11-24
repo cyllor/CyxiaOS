@@ -30,6 +30,31 @@ pub enum Publication {
     ReplayNoEffect,
 }
 
+/// Recent terminal summaries are read-only audit/query evidence, not new
+/// authorization and never an APPLIED result synthesized by an AI role.
+pub const TERMINAL_HISTORY: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedTerminal {
+    pub boot_epoch: u64,
+    pub controller_epoch: u64,
+    pub plan_seq: u64,
+    pub plan_digest: [u8; 32],
+    /// Every action must have a separately verified durable or device terminal.
+    pub action_count: u16,
+    pub terminal_mask: u16,
+    pub unknown_mask: u16,
+    pub evidence_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSummary {
+    pub plan_seq: u64,
+    pub plan_digest: [u8; 32],
+    pub action_count: u16,
+    pub evidence_digest: [u8; 32],
+}
+
 /// The EL1 caller must derive every field from protected local state, never
 /// from model-advertised identities, hashes or clock values.
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +105,11 @@ pub struct RegisteredDecisionGate {
     last_plan_seq: u64,
     last_decision_seq: u64,
     pending: Option<Pending>,
+    /// Only an EL1-authenticated independent terminal/recovery owner can
+    /// close an accepted/UNKNOWN plan. Unconfigured gates stay fail-closed.
+    terminal_owner: Option<Identity>,
+    history: [Option<TerminalSummary>; TERMINAL_HISTORY],
+    history_next: usize,
 }
 impl RegisteredDecisionGate {
     pub fn new(controller: Identity, publisher: Identity, boot: u64, epoch: u64)
@@ -91,7 +121,22 @@ impl RegisteredDecisionGate {
         Ok(Self {
             controller, publisher, boot_epoch:boot, controller_epoch:epoch,
             last_plan_seq:0,last_decision_seq:0,pending:None,
+            terminal_owner:None,history:[None;TERMINAL_HISTORY],history_next:0,
         })
+    }
+
+    /// Native EL1 must assign an independently authenticated terminal owner
+    /// (e.g. role11 supervisor) from its capability table, never EL0 input.
+    pub fn new_with_terminal_owner(
+        controller:Identity,publisher:Identity,terminal_owner:Identity,
+        boot:u64,epoch:u64
+    ) -> Result<Self,Error> {
+        if !terminal_owner.valid()
+            || terminal_owner==controller || terminal_owner==publisher
+        {return Err(Error::Invalid);}
+        let mut gate=Self::new(controller,publisher,boot,epoch)?;
+        gate.terminal_owner=Some(terminal_owner);
+        Ok(gate)
     }
 
     fn check_identity_and_context(&self, context: TrustedRegistrationScope)
@@ -272,6 +317,67 @@ impl RegisteredDecisionGate {
         } else {
             result.map(|_|Publication::AdapterAccepted)
         }
+    }
+
+    /// Release the single pending plan only after a distinct EL1 terminal
+    /// owner has independently established a final state for EVERY action.
+    /// A digest or boolean supplied by the model, publisher or the plan
+    /// itself is never sufficient: `verify_native` must validate authoritative
+    /// executor/device/persistent evidence and exact action identities.
+    ///
+    /// An UNKNOWN publication may be settled ONLY with such independent proof,
+    /// never by elapsed time. The plan/decision key high-water remains burned
+    /// after release; the most recent 256 terminal digests remain queryable.
+    pub fn settle_with_native_proof(
+        &mut self,
+        actor:Identity,
+        terminal:TrustedTerminal,
+        verify_native:impl FnOnce(&TrustedTerminal)->Result<(),Error>,
+    ) -> Result<TerminalSummary,Error> {
+        if self.terminal_owner!=Some(actor) || !actor.valid() {
+            return Err(Error::Denied);
+        }
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        if pending.status==PendingStatus::Frozen {
+            return Err(Error::NotReady);
+        }
+        let required=(1u32.checked_shl(pending.count as u32).ok_or(Error::Invalid)?-1) as u16;
+        if terminal.boot_epoch!=self.boot_epoch
+            || terminal.controller_epoch!=self.controller_epoch
+            || terminal.plan_seq!=pending.plan_seq
+            || terminal.plan_digest!=pending.plan_digest
+            || usize::from(terminal.action_count)!=pending.count
+            || terminal.terminal_mask!=required
+            || terminal.unknown_mask!=0
+            || terminal.evidence_digest==[0;32]
+        {
+            return Err(Error::Denied);
+        }
+        // Independent authority check executes before modifying any state.
+        verify_native(&terminal)?;
+        let summary=TerminalSummary {
+            plan_seq:pending.plan_seq,
+            plan_digest:pending.plan_digest,
+            action_count:terminal.action_count,
+            evidence_digest:terminal.evidence_digest,
+        };
+        self.history[self.history_next]=Some(summary);
+        self.history_next=(self.history_next+1)%TERMINAL_HISTORY;
+        self.pending=None;
+        Ok(summary)
+    }
+
+    /// Query is limited to authenticated local roles; old terminal keys
+    /// outside the 256-record retention window are stale, never re-executed.
+    pub fn terminal_summary(
+        &self,actor:Identity,plan_seq:u64
+    ) -> Result<Option<TerminalSummary>,Error> {
+        if actor!=self.controller && actor!=self.publisher
+            && self.terminal_owner!=Some(actor)
+        {return Err(Error::Denied);}
+        if !actor.valid() {return Err(Error::Denied);}
+        Ok(self.history.iter().flatten().copied()
+            .find(|item|item.plan_seq==plan_seq))
     }
 
     /// Expired *unpublished* registration may be discarded by the controller;
