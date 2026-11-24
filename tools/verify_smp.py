@@ -223,6 +223,16 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                     qmp.execute('stop')
                     qmp.execute('pmemsave', {'val': location['pa'], 'size': 4096,
                                             'filename': str(output / 'native-page.bin')})
+                    if getattr(acceptance, 'post_uart_seal', False):
+                        # The final UART frame is itself inside the metered
+                        # interval. Resume an incompletely sealed memory row;
+                        # no unsealed prefix can pass the independent checker.
+                        page = (output / 'native-page.bin').read_bytes()
+                        require(len(page) == 4096, 'incomplete seal page')
+                        if struct.unpack_from('<Q', page, 16)[0] != 1:
+                            qmp.execute('cont')
+                            time.sleep(.001)
+                            continue
                     require(decoder.loss == 0 and decoder.corrupt == 0 and not decoder.buffer,
                             'incomplete/corrupt framed UART transport')
                     validator = validate if acceptance is None else acceptance.validate
