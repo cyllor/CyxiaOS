@@ -186,6 +186,9 @@ impl AdviceDispositionV1 {
             || self.target.generation!=decision.target_generation
             || self.domain_id!=decision.domain_id
             || self.action_kind!=decision.action_kind
+            || advice.ledger_generation!=decision.ledger_generation
+            || advice.core_generation!=decision.core_generation
+            || self.processed_ns>=decision.decision_expires_ns
             || self.allowed_mask!=decision.allowed_mask
             || self.fallback_index!=decision.fallback_index
             || self.selected_index!=decision.selected_index
@@ -335,4 +338,23 @@ mod tests{
         b[94..96].copy_from_slice(&2u16.to_le_bytes());
         assert!(AdviceDispositionV1::decode(&b).is_err()); // sensitive only
     }
+    #[test]
+    fn causal_pair_denies_relabelled_resource_generations_and_expired_decision(){
+        let a=advice();
+        for at in [64usize,72]{
+            let mut d=decision();d[at]^=1;
+            let b=disposition(&a,&d);
+            assert_eq!(AdviceDispositionV1::decode(&b).unwrap().matches_decision_pair(1,&a,&d),Err(Error::Denied));
+        }
+        let d=decision();let mut b=disposition(&a,&d);
+        b[80..88].copy_from_slice(&200u64.to_le_bytes());
+        assert_eq!(AdviceDispositionV1::decode(&b).unwrap().matches_decision_pair(1,&a,&d),Err(Error::Denied));
+        // Expired-advice fallback remains a rule-only decision when it has
+        // its own current admission deadline, not an AI adoption.
+        let mut d=decision();d[144..152].copy_from_slice(&250u64.to_le_bytes());
+        let mut b=disposition(&a,&d);b[80..88].copy_from_slice(&200u64.to_le_bytes());
+        b[94..96].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(AdviceDispositionV1::decode(&b).unwrap().matches_decision_pair(1,&a,&d),Ok(()));
+    }
+
 }
