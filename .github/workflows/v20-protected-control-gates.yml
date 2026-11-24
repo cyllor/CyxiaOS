@@ -43,6 +43,8 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core --lib ipc_receive_v3 2>&1 | tee artifacts/control-gates/ipc-receive.log
           cargo test --locked --offline -p cyxia-kernel-core --lib syscall_v3 2>&1 | tee artifacts/control-gates/syscall-v3.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_structure_v1 2>&1 | tee artifacts/control-gates/file-structure.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib recovery_v1 2>&1 | tee artifacts/control-gates/recovery-v1.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib boot_epoch_v1 2>&1 | tee artifacts/control-gates/boot-pair.log
           (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts) 2>&1 | tee artifacts/control-gates/verdict-custody.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
