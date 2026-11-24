@@ -20,6 +20,19 @@ pub struct ValidatedCall {
     pub args:[u64;6],
 }
 
+// Check only register-level arithmetic. Actual user VA ownership, mapping,
+// access permissions and stable copy-in/out remain mandatory in EL1.
+fn span(address: u64, length: u64) -> bool {
+    address != 0 && address.checked_add(length).is_some()
+}
+fn vector_shape(input_len: u64, output_cap: u64) -> bool {
+    if !(44..=464).contains(&input_len) || (input_len - 16) % 28 != 0 {
+        return false;
+    }
+    let count = (input_len - 16) / 28;
+    output_cap >= 16 + 64 * count
+}
+
 /// The package's trusted ABI selection must be checked at every native trap.
 /// This module intentionally has no auto-migration from the v1 calling
 /// convention (SVC immediate + x0..x4 + multiple return registers).
@@ -79,6 +92,31 @@ pub fn decode_v3(verified_package_abi:u16,x8:u64,args:[u64;6])
         _=>false,
     };
     if !allowed{return Err(Error::Invalid);}
+    // Validate both advertised buffer ranges and exact register-level sizes
+    // before the native adapter can reserve quota or copy user data.
+    let bounded = match x8 {
+        0x10 => (32..=288).contains(&args[2]) && args[4] >= 48
+            && span(args[1], args[2]) && span(args[3], args[4]),
+        0x11 => args[3] >= 48 && span(args[2], args[3]),
+        0x13 => args[4] >= 48 && span(args[3], args[4]),
+        0x20 => args[5] >= 32 && span(args[4], args[5])
+            && (args[0] == 0 || span(args[0], args[1])),
+        0x21 => args[2].checked_add(4096).is_some(),
+        0x22 => args[1].checked_add(args[2]).is_some(),
+        0x30 => span(args[1], args[2]),
+        0x31 => args[4] == 2 || span(args[1], args[2]),
+        0x32 => vector_shape(args[1], args[3])
+            && span(args[0], args[1]) && span(args[2], args[3]),
+        0x40 => span(args[3], args[4]),
+        0x41 => span(args[0], args[1])
+            && args[3].checked_mul(DECISION_RECORD_BYTES as u64)
+                .is_some_and(|n| span(args[2], n)),
+        0x42 => span(args[0], args[1]) && span(args[2], args[3]),
+        0x43 => span(args[1], args[2]),
+        0x50 => span(args[1], args[2]) && span(args[4], args[5]),
+        _ => true,
+    };
+    if !bounded { return Err(Error::Invalid); }
     Ok(ValidatedCall {operation,args})
 }
 
@@ -148,7 +186,34 @@ mod tests{
         assert!(!allowed(0x30,[3,0x1000,32,1,100,2]));
         assert!(allowed(0x40,[4,12,1,0x1000,264,0]));
         assert!(!allowed(0x40,[4,16,1,0x1000,264,0]));
-        assert!(allowed(0x32,[0x1000,32,0x2000,512,100,0]));
-        assert!(!allowed(0x32,[0x1000,32,0x2000,512,100,1]));
+        assert!(allowed(0x32,[0x1000,44,0x2000,512,100,0]));
+        assert!(!allowed(0x32,[0x1000,44,0x2000,512,100,1]));
     }
+    #[test]
+    fn syscall_spans_and_fixed_reply_capacity_fail_before_dispatch() {
+        let top=u64::MAX;
+        assert!(allowed(0x10,[1,0x1000,32,0x2000,48,0]));
+        assert!(!allowed(0x10,[1,0x1000,289,0x2000,48,0]));
+        assert!(!allowed(0x10,[1,top-15,32,0x2000,48,0]));
+        assert!(!allowed(0x11,[1,1,0x2000,47,0,0]));
+        assert!(!allowed(0x13,[1,1,100,top-20,48,0]));
+        assert!(allowed(0x20,[0,4096,0,1,0x2000,32]));
+        assert!(!allowed(0x20,[0,4096,0,1,0x2000,31]));
+        assert!(!allowed(0x20,[top-4095,8192,0,1,0x2000,32]));
+        assert!(!allowed(0x21,[1,1,top-4095,1,1,0]));
+        assert!(!allowed(0x22,[1,top-4095,4096,1,0,0]));
+        assert!(!allowed(0x30,[1,top-2,3,1,0,1]));
+        assert!(!allowed(0x31,[1,top-500,552,0,1,1]));
+        assert!(allowed(0x31,[1,0,0,0,2,1]));
+        assert!(allowed(0x32,[0x1000,464,0x2000,1040,100,0]));
+        assert!(!allowed(0x32,[0x1000,464,0x2000,1039,100,0]));
+        assert!(!allowed(0x32,[0x1000,45,0x2000,1040,100,0]));
+        assert!(!allowed(0x32,[0x1000,16,0x2000,1040,100,0]));
+        assert!(!allowed(0x40,[1,4,1,top-100,264,0]));
+        assert!(!allowed(0x41,[0x1000,212,top-255,1,0,0]));
+        assert!(!allowed(0x42,[top-23,24,0x2000,64,0,0]));
+        assert!(!allowed(0x43,[1,top-95,96,0,0,0]));
+        assert!(!allowed(0x50,[1,0x1000,32,1,top,2]));
+    }
+
 }
