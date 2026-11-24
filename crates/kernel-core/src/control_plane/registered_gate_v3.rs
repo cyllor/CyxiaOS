@@ -1259,6 +1259,56 @@ mod tests {
     }
 
     #[test]
+    fn sixty_four_inflight_plus_one_frozen_preserve_unknown_and_release_by_exact_key(){
+        // The production adapter must allocate this pool in the protected
+        // 8MiB control pool. Give the host test an independent larger stack
+        // for initialization, never a kernel-sized stack.
+        std::thread::Builder::new().stack_size(8*1024*1024).spawn(||{
+            let bytes=profile_bytes();let profile=Profile::parse(&bytes).unwrap();
+            let ctx=trusted(&bytes);let actions=frozen(&[2,4],&[2,0]);
+            let mut pool=PublishedPlanPool::new();
+            let mut gate=RegisteredDecisionGate::with_pool(CONTROLLER,PUBLISHER,SUPERVISOR,1,2,&mut pool).unwrap();
+            let plan_and_record=|seq:u64|{
+                let mut plan=plan_bytes();
+                plan[16..24].copy_from_slice(&seq.to_le_bytes());
+                plan[88..96].copy_from_slice(&(seq+3).to_le_bytes());
+                let mut record=decision(&plan,&bytes);
+                record[24..32].copy_from_slice(&(seq+3).to_le_bytes());
+                record[32..40].copy_from_slice(&seq.to_le_bytes());
+                (plan,record)
+            };
+            for seq in 1..=64{
+                let (plan,rec)=plan_and_record(seq);
+                gate.register_rule_only(CONTROLLER,&plan,&[rec],&profile,&actions,ctx).unwrap();
+                let result=gate.publish_once(PUBLISHER,&plan,&[rec],&profile,&actions,ctx,
+                    ||if seq==1{Err(Error::NotReady)}else{Ok(())});
+                if seq==1{assert_eq!(result,Err(Error::NotReady));}else{assert_eq!(result,Ok(Publication::AdapterAccepted));}
+                assert_eq!(gate.published_count(),seq as usize);assert!(!gate.has_unpublished());
+            }
+            let (frozen_plan,frozen_record)=plan_and_record(65);
+            gate.register_rule_only(CONTROLLER,&frozen_plan,&[frozen_record],&profile,&actions,ctx).unwrap();
+            assert!(gate.has_unpublished());
+            let (extra,extra_record)=plan_and_record(66);
+            assert_eq!(gate.register_rule_only(CONTROLLER,&extra,&[extra_record],&profile,&actions,ctx),Err(Error::Busy));
+            assert_eq!(gate.publish_once(PUBLISHER,&frozen_plan,&[frozen_record],&profile,&actions,ctx,||panic!("full pool")),Err(Error::Busy));
+            let (old,old_record)=plan_and_record(1);
+            assert_eq!(gate.publish_once(PUBLISHER,&old,&[old_record],&profile,&actions,ctx,||panic!("unknown replay")),Err(Error::NotReady));
+            let (other,other_record)=plan_and_record(32);
+            assert_eq!(gate.read_decision(PUBLISHER,1,2,35),Ok(other_record));
+            assert_eq!(gate.publish_once(PUBLISHER,&other,&[other_record],&profile,&actions,ctx,||panic!("accepted replay")),Ok(Publication::ReplayNoEffect));
+            let mut proof=terminal_proof(&other);proof.plan_seq=32;
+            assert_eq!(gate.settle_with_native_proof(SUPERVISOR,proof,|_|Err(Error::NotReady)),Err(Error::NotReady));
+            assert_eq!(gate.published_count(),64);
+            gate.settle_with_native_proof(SUPERVISOR,proof,|_|Ok(())).unwrap();
+            assert_eq!(gate.published_count(),63);assert!(gate.has_unpublished());
+            gate.publish_once(PUBLISHER,&frozen_plan,&[frozen_record],&profile,&actions,ctx,||Ok(())).unwrap();
+            assert_eq!(gate.published_count(),64);assert!(!gate.has_unpublished());
+            assert!(gate.terminal_summary(SUPERVISOR,32).unwrap().is_some());
+            assert_eq!(gate.publish_once(PUBLISHER,&old,&[old_record],&profile,&actions,ctx,||panic!("old unknown")),Err(Error::NotReady));
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
     fn bounded_terminal_summary_history_retains_only_latest_256_distinct_plan_keys() {
         let bytes=profile_bytes();
         let catalog=Profile::parse(&bytes).unwrap();
