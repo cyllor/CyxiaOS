@@ -3,7 +3,7 @@
 //! No model-supplied time/role or scheduler migration is trusted. Actual timer
 //! programming, CPU counter observation and task stop proof remain native
 //! adapter duties; this ledger is not that adapter.
-use super::{Error,Identity,role_manifest_v0199::{NativeRoleManifest,Role,CONTROL_CPU}};
+use super::{Error,Identity,role_manifest_v0199::{NativeRoleManifest,Role,ROLE_COUNT,CONTROL_CPU}};
 pub const WINDOW_NS:u64=100_000_000;
 pub const LIMIT_NS:u64=70_000_000;
 pub const CLASS_LIMITS:[u64;6]=[30_000_000,8_000_000,7_500_000,8_000_000,8_000_000,8_500_000];
@@ -16,6 +16,7 @@ pub struct Turn {
     window:u64,
     class:Class,
     actor:Option<Identity>,
+    role_index:Option<usize>,
     domain:u16,
     deadline_ns:u64,
     reserved_ns:u64,
@@ -36,6 +37,7 @@ pub struct Cpu0BudgetLedger {
     serial:u64,
     active:Option<Turn>,
     spent:[u64;6],
+    role_spent:[u64;ROLE_COUNT],
     operations_seen:u16,
     security_count:u8,
     decision_spent:[u64;15],
@@ -44,7 +46,7 @@ pub struct Cpu0BudgetLedger {
 impl Default for Cpu0BudgetLedger {fn default()->Self{Self::new()}}
 impl Cpu0BudgetLedger {
     pub const fn new()->Self{Self{
-        window:None,last_ns:0,serial:0,active:None,spent:[0;6],
+        window:None,last_ns:0,serial:0,active:None,spent:[0;6],role_spent:[0;ROLE_COUNT],
         operations_seen:0,security_count:0,decision_spent:[0;15],
         ordinary_closed:false,
     }}
@@ -59,7 +61,7 @@ impl Cpu0BudgetLedger {
         let end=w.checked_add(1).and_then(|x|x.checked_mul(WINDOW_NS)).ok_or(Error::Clock)?;
         if self.window!=Some(w){
             if self.active.is_some(){return Err(Error::Busy);}
-            self.window=Some(w);self.spent=[0;6];self.operations_seen=0;
+            self.window=Some(w);self.spent=[0;6];self.role_spent=[0;ROLE_COUNT];self.operations_seen=0;
             self.security_count=0;self.decision_spent=[0;15];
             // A new time window does not clear an observed execution fault.
         }
@@ -73,7 +75,7 @@ impl Cpu0BudgetLedger {
     {
         manifest.validate()?;
         if cpu!=CONTROL_CPU{return Err(Error::Denied);}
-        let member=manifest.members.iter().find(|m|m.actor==actor).ok_or(Error::Denied)?;
+        let (index,member)=manifest.members.iter().enumerate().find(|(_,m)|m.actor==actor).ok_or(Error::Denied)?;
         let allowed=matches!((member.role,class),
             (Role::Operations,Class::Operations|Class::Optional)
             |(Role::Security,Class::Security)
@@ -81,7 +83,7 @@ impl Cpu0BudgetLedger {
             |(Role::Supervisor|Role::ModelManager,Class::Coordination)
             |(Role::Validator|Role::Learner,Class::Optional));
         if !allowed{return Err(Error::Denied);}
-        self.reserve(Some(actor),class,domain,requested,now)
+        self.reserve(Some(actor),Some((index,member.control_ns_per_100ms)),class,domain,requested,now)
     }
     /// Separate trusted EL1 recovery/coordination entry. There is no user
     /// request field that can select this authority.
@@ -89,9 +91,9 @@ impl Cpu0BudgetLedger {
         if cpu!=CONTROL_CPU || !matches!(class,Class::Coordination|Class::Recovery){
             return Err(Error::Denied);
         }
-        self.reserve(None,class,0,requested,now)
+        self.reserve(None,None,class,0,requested,now)
     }
-    fn reserve(&mut self,actor:Option<Identity>,class:Class,domain:u16,
+    fn reserve(&mut self,actor:Option<Identity>,role:Option<(usize,u64)>,class:Class,domain:u16,
         requested:u64,now:u64)->Result<Turn,Error>{
         self.time(now)?;
         if self.active.is_some(){return Err(Error::Busy);}
@@ -102,6 +104,9 @@ impl Cpu0BudgetLedger {
             || requested>LIMIT_NS.saturating_sub(total)
             || requested>CLASS_LIMITS[class.index()].saturating_sub(self.spent[class.index()]){
             return Err(Error::Exhausted);
+        }
+        if let Some((index,quota))=role{
+            if requested>quota.saturating_sub(self.role_spent[index]){return Err(Error::Exhausted);}
         }
         let mut bit=0u16;
         match class {
@@ -123,7 +128,7 @@ impl Cpu0BudgetLedger {
             _=>if domain!=0{return Err(Error::Invalid);},
         }
         let serial=self.serial.checked_add(1).ok_or(Error::Exhausted)?;
-        let turn=Turn{serial,window:now/WINDOW_NS,class,actor,domain,deadline_ns:end.min(now+requested),reserved_ns:requested};
+        let turn=Turn{serial,window:now/WINDOW_NS,class,actor,role_index:role.map(|(index,_)|index),domain,deadline_ns:end.min(now+requested),reserved_ns:requested};
         self.serial=serial;
         self.active=Some(turn);
         self.operations_seen|=bit;
@@ -146,13 +151,19 @@ impl Cpu0BudgetLedger {
         let decision=if turn.class==Class::Decision{
             Some(self.decision_spent[usize::from(turn.domain-1)].checked_add(actual).ok_or(Error::Exhausted)?)
         }else{None};
+        let role_total=match turn.role_index{
+            Some(index)=>Some((index,self.role_spent[index].checked_add(actual).ok_or(Error::Exhausted)?)),
+            None=>None,
+        };
         if crossed{
-            self.window=Some(now/WINDOW_NS);self.spent=[0;6];
+            self.window=Some(now/WINDOW_NS);self.spent=[0;6];self.role_spent=[0;ROLE_COUNT];
             self.operations_seen=0;self.security_count=0;self.decision_spent=[0;15];
             self.spent[idx]=actual;
+            if let Some((index,_))=role_total{self.role_spent[index]=actual;}
             if turn.class==Class::Decision{self.decision_spent[usize::from(turn.domain-1)]=actual;}
         }else{
             self.spent[idx]=total;
+            if let Some((index,v))=role_total{self.role_spent[index]=v;}
             if let Some(v)=decision{self.decision_spent[usize::from(turn.domain-1)]=v;}
         }
         self.active=None;
@@ -171,9 +182,9 @@ mod tests{
                 role:ROLES[i],actor:Identity{id:i as u64+1,generation:1},
                 ttbr0_root:0x100000+i as u64*PAGE_SIZE,
                 private_rw:PrivateRegion{base:0x200000+i as u64*0x10000,bytes:PAGE_SIZE},
-                caps:ROLES[i].allowed_caps(),control_ns_per_100ms:2_000_000,
+                caps:ROLES[i].allowed_caps(),control_ns_per_100ms:[30_000_000,8_000_000,4_000_000,3_500_000,4_000_000,3_000_000,4_500_000,3_000_000][i],
                 cpu_mask:1,thread_count:1,endpoint_id:i as u64+1}),
-            other_protected_pool_bytes:5*1024*1024,other_control_ns_per_100ms:45_000_000}
+            other_protected_pool_bytes:5*1024*1024,other_control_ns_per_100ms:10_000_000}
     }
     #[test]
     fn fixed_categories_share_single_cpu_and_recovery_cannot_be_borrowed(){
@@ -185,9 +196,12 @@ mod tests{
         assert_eq!(q.reserve_role(&m,ops,1,Class::Operations,1,1,0),Err(Error::Denied));
         assert_eq!(q.reserve_role(&m,ops,0,Class::Recovery,0,1,0),Err(Error::Denied));
         assert_eq!(q.reserve_role(&m,learner,0,Class::Optional,0,8_500_001,0),Err(Error::Exhausted));
-        let a=q.reserve_role(&m,learner,0,Class::Optional,0,8_500_000,0).unwrap();
+        let a=q.reserve_role(&m,learner,0,Class::Optional,0,4_500_000,0).unwrap();
         assert_eq!(q.reserve_kernel(0,Class::Recovery,1,0),Err(Error::Busy));
-        q.settle(0,a,8_500_000,8_500_000).unwrap();
+        q.settle(0,a,4_500_000,4_500_000).unwrap();
+        assert_eq!(q.reserve_role(&m,learner,0,Class::Optional,0,1,4_500_000),Err(Error::Exhausted));
+        let a=q.reserve_role(&m,m.members[4].actor,0,Class::Optional,0,4_000_000,4_500_000).unwrap();
+        q.settle(0,a,4_000_000,8_500_000).unwrap();
         let r=q.reserve_kernel(0,Class::Recovery,8_000_000,8_500_000).unwrap();
         q.settle(0,r,8_000_000,16_500_000).unwrap();
         let a=q.reserve_role(&m,ctl,0,Class::Decision,1,300_000,17_000_000).unwrap();
