@@ -222,7 +222,25 @@ class EpochFixture:
         checkpoint=f'V0199_MOUNT_CHECKPOINT a={e+1} b={e+1} c={7*replay}\n'.encode()
         require(serial.count(checkpoint)==1 and serial.count(b'V0199_MOUNT_STRUCTURE a=6 b=15 c=1\n')==1,
                 'mount/checkpoint UART and QMP mismatch')
-        require(all(v==0 for v in w[60:]),'nonzero reserved evidence')
+        frame_count,meta,meta_bytes,control,control_bytes,progress,progress_bytes,arena,fw,free,reserved,allocated,quarantined,permanent,page_pa,generation,scrubs,redo,boot_redo,used=w[60:80]
+        require((frame_count,meta_bytes,control_bytes,progress_bytes,arena)==(262144,10*1024*1024,8*1024*1024,8*1024*1024,16384),
+                'incorrect formal RAM inventory or pool sizes')
+        spans=[(meta,meta_bytes),(control,control_bytes),(progress,progress_bytes),(page_pa,BLOCK)]
+        for i,(base,length) in enumerate(spans):
+            require(base%BLOCK==0 and 0x44000000<=base<base+length<=0x80000000,
+                    'inventory span outside actual ordinary RAM')
+            require(all(base+length<=p or p+n<=base for p,n in spans[:i]),'overlapping protected pool/frame spans')
+        require(reserved==allocated==quarantined==0 and free+permanent==frame_count
+                and permanent==arena+fw+2560+2048+2048 and generation==2 and scrubs==2,
+                'RAM ledger or actual page lifecycle mismatch')
+        require(control<=old_root<control+control_bytes and control<=new_root<control+control_bytes
+                and control<=old_stack<old_stack+32768<=control+control_bytes,
+                'native role7 backing is not in the actual control pool')
+        require(redo==progress and boot_redo==progress+16384 and used==40960,
+                'redo buffers are not in the actual progress pool')
+        require(serial.count(f'V0199_FRAME_LEDGER a=262144 b={permanent} c={free}\n'.encode())==1,
+                'frame ledger UART/memory mismatch')
+        require(all(v==0 for v in w[80:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -232,11 +250,49 @@ class EpochFixture:
                     formatted_v1_structure_verified=True,system_objects_verified=4,acl_slots_verified=256,
                     checkpoint_generation=e+1,checkpoint_log_epoch=e+1,checkpoint_lsn=7*replay,
                     native_checkpoint_flush_verified=True,
+                    frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
+                    control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
+                    permanent_frames=permanent,frame_meta_physical_dump_verified=False,
                     paired_boot_epoch_redo_verified=True,
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
                     native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
                     role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
                     role7_operator_results=[old_score,new_score],production_service_restart_verified=False)
+
+    def capture_extra(self,qmp,out,page):
+        # This hook runs after validate(), with all four CPUs stopped.
+        # Read the actual full FrameMeta table, not just guest counters.
+        w=struct.unpack('<512Q',page)
+        _,meta,meta_bytes,control,control_bytes,progress,progress_bytes,arena,fw,free,_,_,_,permanent,page_pa,generation,*_=w[60:80]
+        path=out/'frame-meta.bin'
+        qmp.execute('pmemsave',{'val':meta,'size':meta_bytes,'filename':str(path)})
+        raw=path.read_bytes()
+        require=verify_smp.require
+        require(len(raw)==262144*40,'incomplete FrameMeta physical dump')
+        fixed=[(0x40000000,arena*BLOCK),(meta,meta_bytes),(control,control_bytes),(progress,progress_bytes)]
+        counts=[0,0];extra=0
+        for i,row in enumerate(struct.iter_unpack('<IIQQIIII',raw)):
+            pa=0x40000000+i*BLOCK
+            owner,flags,owner_generation,frame_generation,refs,pins,dma,shares=row
+            require(owner==0xffffffff and owner_generation==refs==pins==dma==shares==0,
+                    'unexpected live owner/reference in stopped inventory')
+            named=any(base<=pa<base+n for base,n in fixed)
+            if named:
+                require(flags==4 and frame_generation==0,'named fixed region is not permanently reserved')
+            elif pa==page_pa:
+                require(flags==0 and frame_generation==generation,'reclaimed frame generation/clean state missing')
+            elif flags==4:
+                require(frame_generation==0,'unexpected retired frame')
+                extra+=1
+            else:
+                require(flags==8 and frame_generation==0,'unexpected ordinary frame state')
+            counts[int(flags==4)]+=1
+        require(counts==[free,permanent] and extra==fw,'physical per-frame conservation differs from guest evidence')
+        sample=out/'reclaimed-frame.bin'
+        qmp.execute('pmemsave',{'val':page_pa,'size':BLOCK,'filename':str(sample)})
+        require(sample.read_bytes()==bytes(BLOCK),'secret page was not actually zero after reclaim')
+        return dict(frame_meta_physical_dump_verified=True,frame_meta_sha256=hashlib.sha256(raw).hexdigest(),
+                    reclaimed_page_zero_verified=True)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
