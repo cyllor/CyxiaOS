@@ -32,8 +32,11 @@ pub(super) fn run() -> ! {
         protected_business: profile::BUSINESS_MASK,
         cooldown_ticks: 0,
     };
-    let ownership = Ownership::<C>::new_v0199_cpu0(
-        profile::ONLINE, [1;C], core::array::from_fn(|i|1<<i),
+    // BOOT_CPUS is the 8-slot platform capacity table. The QEMU contract is
+    // exactly REQUIRED=4 online vCPUs; do not pass the larger slot capacity
+    // as the instantiated native SMP ownership topology.
+    let ownership = Ownership::<REQUIRED>::new_v0199_cpu0(
+        profile::ONLINE, [1;REQUIRED], core::array::from_fn(|i|1<<i),
         fixed_limits,
     ).expect("fixed CPU0 control ownership");
     let snapshot=ownership.snapshot();
