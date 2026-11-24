@@ -40,3 +40,5 @@ pub mod epoch_redo_v0199;
 pub mod offline_config_v1;
 
 pub mod cap_record_v3;
+
+pub mod snapshot_restore_gate;
