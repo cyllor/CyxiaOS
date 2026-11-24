@@ -181,6 +181,8 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                 raw.extend(data)
                 require(len(raw) <= 2 * 1024 * 1024, 'serial budget exceeded')
                 for frame in decoder.feed(data): decoded.extend(frame)
+                if b'V0199_BOOTSTRAP_OVERRUN' in decoded:
+                    raise ValueError('native CPU0 execution overrun (see framed UART)')
                 if b'FAIL' in decoded or b'SMP_ERROR' in decoded: raise ValueError('guest failure')
                 completion = b'SMP_SELFTEST_PASS cpus=4\n' if acceptance is None else acceptance.completion
                 if completion in decoded:
