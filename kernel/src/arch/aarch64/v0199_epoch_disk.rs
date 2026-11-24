@@ -180,7 +180,7 @@ pub(super) fn run(info:&BootInfo)->!{
     // Authenticate the dedicated test volume and original complete
     // formatted structure before permitting any recovery writes.
     disk.read(HOME+1,&mut buf).unwrap();
-    assert_eq!(&buf[..MARKER.len()],MARKER);assert!(buf[MARKER.len()..].iter().all(|v|v==0));
+    assert_eq!(&buf[..MARKER.len()],MARKER);assert!(buf[MARKER.len()..].iter().all(|v|*v==0));
     check_mount(&mut disk,old_sb,0).unwrap();
     // Both types contain only fixed byte arrays. The actual exclusive
     // progress pool was fully cleared by the native inventory owner.
