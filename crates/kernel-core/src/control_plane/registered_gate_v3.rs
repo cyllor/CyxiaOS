@@ -1,8 +1,8 @@
 //! Bounded, no-alloc EL1 DecisionRecord v3 registration/publication guard.
 //!
-//! Narrow V0.19.9 G1 vertical slice: RULE_ONLY without causal fallback and
-//! single-action AI_ASSISTED with an atomic admitted-advice disposition.
-//! Trials and causal fallback remain fail-closed as NotReady. This is not an SVC
+//! V0.19.9 G1 vertical slices: RULE_ONLY, single-action causal fallback
+//! and AI_ASSISTED with atomic admitted-advice disposition.
+//! Authorized trials remain fail-closed as NotReady. This is not an SVC
 //! handler, credential loader or proof of a native driver APPLY. The only way
 //! to call the publication adapter is via an exact previously frozen plan.
 //! The adapter must be an EL1 native owner, and must report actual acceptance
@@ -282,7 +282,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
                     // bypass a revoked rule, changed ledger or expired scope.
                     PendingStatus::Frozen => {
                         self.validate_rule_only(
-                            plan_wire, &plan, records, rule_profile, actions, context
+                            plan_wire, &plan, records, rule_profile, actions, context,false
                         )?;
                         Ok(Registration::ExactRetry)
                     }
@@ -300,7 +300,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             };
         }
         self.check_registration_slot()?;
-        self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context)?;
+        self.validate_rule_only(plan_wire, &plan, records, rule_profile, actions,context,false)?;
         if plan.header.plan_seq<=self.last_plan_seq {return Err(Error::Stale);}
         let mut last=self.last_decision_seq;
         for raw in records {
@@ -336,6 +336,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         profile:&Profile<'_>,
         actions:&[FrozenAction<'_>],
         context: TrustedRegistrationScope,
+        causal_fallback:bool,
     ) -> Result<(),Error> {
         self.check_identity_and_context(context)?;
         if plan.header.flags != 0 {return Err(Error::NotReady);}
@@ -368,7 +369,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
                 return Err(Error::Denied);
             }
             if rec.source!=DecisionSource::RuleOnly
-                || rec.reason_code==7 // requires frozen AdviceDisposition v1
+                || (rec.reason_code==7)!=causal_fallback // only atomic causal path
             {return Err(Error::NotReady);}
             if rec.boot_epoch!=context.boot_epoch
                 || rec.rules_generation!=context.rules_generation
@@ -432,7 +433,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             PendingStatus::AdapterUnknown => return Err(Error::NotReady),
             PendingStatus::Frozen => {}
         }
-        self.validate_rule_only(plan_wire,&plan,records,profile,actions,context)?;
+        self.validate_rule_only(plan_wire,&plan,records,profile,actions,context,false)?;
         // Mark before the potentially side-effecting callback; failures
         // cannot safely be interpreted as "nothing happened".
         self.begin_publish(plan.header.plan_seq)?;
@@ -551,6 +552,106 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),claimed:[None;MAX_ACTIONS]});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
         Ok(Registration::Frozen)
+    }
+
+    /// Atomically freeze RULE_ONLY reason7 and REJECTED_FALLBACK state2.
+    /// The current legal fallback is independently recomputed. The old
+    /// recommendation never becomes an action authority or training label.
+    /// This restricted path accepts one action, same snapshot and target;
+    /// mismatched old advice must instead be handled as observation only.
+    pub fn register_rejected_fallback_one(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],disposition:&[u8;DISPOSITION_BYTES],
+        profile:&Profile<'_>,local:&FrozenAction<'_>,context:TrustedRegistrationScope,
+        scope:&AssistedScope<'_>,ledger:&mut EvidenceLedger,
+        verify_hard_rejection:impl FnOnce(&AdviceEnvelopeV1,&FrozenAction<'_>)->Result<(),Error>,
+    )->Result<Registration,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let disp=AdviceDispositionV1::decode(disposition)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        if disp.state!=2||rec.source!=DecisionSource::RuleOnly||rec.reason_code!=7
+            ||plan.header.action_count!=1{return Err(Error::Denied);}
+        if let Some(p)=self.lookup(plan.header.plan_seq).or_else(||self.frozen_or_legacy_busy()){
+            if p.plan_seq!=plan.header.plan_seq{return Err(Error::Busy);}
+            let proof=p.assisted.ok_or(Error::Denied)?;
+            if p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record
+                ||proof.disposition_digest!=sha256(disposition){return Err(Error::Denied);}
+            return match p.status{
+                PendingStatus::Frozen=>{
+                    self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+                        core::slice::from_ref(local),context,true)?;
+                    Ok(Registration::ExactRetry)
+                }
+                PendingStatus::AdapterAccepted=>Ok(Registration::ExactRetry),
+                PendingStatus::AdapterUnknown=>Err(Error::NotReady),
+            };
+        }
+        self.check_registration_slot()?;
+        self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+            core::slice::from_ref(local),context,true)?;
+        if !scope.assisted_mode||!scope.offline_model_authorized||rec.mode!=2
+            ||matches!(local.domain_id,6|11|12|14)||disp.processed_ns!=context.now_ns{
+            return Err(Error::Denied);
+        }
+        let trusted=scope.advice;
+        if !trusted.epochs.valid()||trusted.epochs.boot!=context.boot_epoch
+            ||trusted.epochs.controller!=context.controller_epoch
+            ||trusted.epochs.resources!=context.ledger_generation||trusted.epochs.cores!=context.core_generation
+            ||trusted.snapshot_seq!=context.snapshot_seq||trusted.sampled_ns!=context.sampled_ns
+            ||trusted.now_ns!=context.now_ns||trusted.domain!=local.domain_id||trusted.target!=local.target
+            ||trusted.candidates!=local.static_ordinals||trusted.candidate_set_hash!=local.candidate_set_hash{
+            return Err(Error::Denied);
+        }
+        let key=AdviceKey{boot_epoch:disp.boot_epoch,advisor_epoch:disp.advisor_epoch,advice_seq:disp.advice_seq};
+        let advice_wire=ledger.admitted_wire(actor,key)?;
+        let advice=AdviceEnvelopeV1::decode(&advice_wire)?;
+        disp.matches_decision_pair(self.boot_epoch,&advice_wire,record)?;
+        // Rejection reason is independently determined; expiry/model
+        // change takes precedence. A stale source epoch is never adopted,
+        // and requires observation/recovery rather than a new causal pair.
+        if advice.advisor_epoch!=trusted.advisor_epoch{return Err(Error::Stale);}
+        let reason=if context.now_ns>=advice.expires_ns||advice.active_model_generation!=trusted.epochs.model
+            ||advice.model_hash!=trusted.model_hash{4}
+        else if rec.choice_policy!=1{2}
+        else if rec.allowed_mask&(1u32<<advice.recommended_index)==0{1}
+        else{verify_hard_rejection(&advice,local)?;3};
+        if disp.reason_code!=reason{return Err(Error::Denied);}
+        if plan.header.plan_seq<=self.last_plan_seq||rec.decision_seq<=self.last_decision_seq{return Err(Error::Stale);}
+        let expiry=plan.action(0)?.expires_local_ns;
+        let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
+        // No fallible mutation after the causal ledger is finalized.
+        ledger.finalize_registered_fallback(actor,disposition,record,context.now_ns)?;
+        self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
+            count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
+            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),
+            claimed:[None;MAX_ACTIONS]});
+        self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
+        Ok(Registration::Frozen)
+    }
+    /// Separate exact publisher gate for a causal rule fallback. Even if
+    /// the rejected advice expired, the independent *current* fallback
+    /// still needs current rule, candidate, resource and lease validation.
+    pub fn publish_rejected_fallback_one(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],profile:&Profile<'_>,local:&FrozenAction<'_>,
+        context:TrustedRegistrationScope,native_accept:impl FnOnce()->Result<(),Error>,
+    )->Result<Publication,Error>{
+        if actor!=self.publisher{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        let p=self.lookup(plan.header.plan_seq).ok_or(Error::Stale)?;
+        if rec.source!=DecisionSource::RuleOnly||rec.reason_code!=7||p.assisted.is_none()
+            ||p.count!=1||p.plan_digest!=sha256(plan_wire)||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
+        match p.status{
+            PendingStatus::AdapterAccepted=>return Ok(Publication::ReplayNoEffect),
+            PendingStatus::AdapterUnknown=>return Err(Error::NotReady),
+            PendingStatus::Frozen=>{},
+        }
+        self.validate_rule_only(plan_wire,&plan,core::slice::from_ref(record),profile,
+            core::slice::from_ref(local),context,true)?;
+        self.begin_publish(plan.header.plan_seq)?;
+        native_accept()?;
+        self.lookup_mut(plan.header.plan_seq).unwrap().status=PendingStatus::AdapterAccepted;
+        Ok(Publication::AdapterAccepted)
     }
 
     /// The distinct publisher presents the same frozen registered decision.
