@@ -9,7 +9,7 @@ use cyxia_kernel_core::control_plane::{
     Identity,Error,
     role_manifest_v0199::{NativeRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
         SnapshotView,AuxOperation,CONTROL_MASK,REQUIRED_ONLINE_MASK},
-    pie_image_v0199::{RolePackageSpec,RolePackageInput,VerifiedRolePackage,ROLE_STACK_BYTES},
+    pie_image_v0199::{RolePackageSpec,RolePackageInput,VerifiedRolePackage,RelativeRelocation,ROLE_STACK_BYTES},
     role_budget_v0199::{Class,Cpu0BudgetLedger,Turn,Settlement,WINDOW_NS,KERNEL_COORDINATION_LIMIT_NS},
 };
 use cyxia_kernel_core::security::syscall::{Syscall,StableCopy};
@@ -34,7 +34,7 @@ const E_AUTH:i64=-1;const E_FORMAT:i64=-2;const E_UNSUPPORTED:i64=-11;
 const EFAULT:i64=-12;const EAGAIN:i64=-13;
 const MAGIC:u64=0x4359_5838_424f_4f54;
 
-struct BootPackage {role_id:u16,bytes:&'static[u8],image_sha256:[u8;32],relative_sha256:[u8;32]}
+struct BootPackage {role_id:u16,bytes:&'static[u8],image_sha256:[u8;32],relative_sha256:[u8;32],relative:&'static[RelativeRelocation]}
 static CATALOG:[BootPackage;ROLE_COUNT]=include!(concat!(env!("OUT_DIR"),"/v0199-role-catalog.rs"));
 #[repr(C,align(4096))]
 struct Backing {image:[u8;IMAGE],stack:[u8;ROLE_STACK_BYTES]}
@@ -229,11 +229,11 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
     scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
     let spec=RolePackageSpec{role,package_id:u64::from(role.id()),abi:3,image_bytes:pkg.bytes.len(),
-        image_sha256:pkg.image_sha256,relative_count:0,relative_sha256:pkg.relative_sha256,
+        image_sha256:pkg.image_sha256,relative_count:pkg.relative.len(),relative_sha256:pkg.relative_sha256,
         stack_bytes:ROLE_STACK_BYTES};
     let verified=VerifiedRolePackage::verify(spec,RolePackageInput{package_id:spec.package_id,
-        bytes:&scratch[..pkg.bytes.len()],relative:&[]}).expect("trusted ABI3 role package");
-    assert!(verified.relro().is_none(),"bootstrap loader cannot silently skip RELRO");
+        bytes:&scratch[..pkg.bytes.len()],relative:pkg.relative}).expect("trusted ABI3 role package");
+    let relro=verified.relro();
     let image=unsafe{&mut *core::ptr::addr_of_mut!((*b).image)};
     let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
     let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
@@ -245,6 +245,15 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
         let end=(seg.virtual_address+seg.memory_bytes).div_ceil(PAGE as u64) as usize;
         assert!(start<end&&end<=map.len());
         for page in &mut map[start..end]{assert_eq!(*page,0);*page=seg.flags as u8;}
+    }
+    if let Some((start,len))=relro{
+        assert_eq!(start%PAGE as u64,0,"RELRO start not page-aligned");
+        let end=start.checked_add(len).unwrap().div_ceil(PAGE as u64);
+        assert!(end<=map.len() as u64);
+        for page in &mut map[start as usize/PAGE..end as usize]{
+            assert_eq!(*page,6,"RELRO must originate in private RW LOAD");
+            *page=4; // stage already applied verified relocations; seal now
+        }
     }
     scratch.fill(0);
     let image_base=b as u64;
@@ -695,6 +704,7 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[128+i*20+14+j].store(u64::from_le_bytes(chunk.try_into().unwrap()),Ordering::Relaxed);
         }
         SMP_EVIDENCE.words[128+i*20+18].store(u64::from(role_asid(i,r.bank)),Ordering::Relaxed);
+        SMP_EVIDENCE.words[128+i*20+19].store(CATALOG[i].relative.len() as u64,Ordering::Relaxed);
         report("V0199_BOOTSTRAP_ROLE",u64::from(m.role.id()),m.ttbr0_root,r.clocks);
         report("V0199_BOOTSTRAP_CHARGE",u64::from(m.role.id()),r.charges,r.turns);
     }
@@ -727,7 +737,7 @@ pub(super) fn run()->!{
         budget.ledger.lifetime_spent(Class::Recovery),budget.ledger.lifetime_spent(Class::Optional)];
     for(i,value)in ledger_row.into_iter().enumerate(){SMP_EVIDENCE.words[481+i].store(value,Ordering::Relaxed);}
     report("V0199_BOOTSTRAP_ACCOUNTING",elapsed,accounted,upper);
-    let summary=[MAGIC,6,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let summary=[MAGIC,7,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
