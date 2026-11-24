@@ -184,6 +184,14 @@ pub fn replay_home(io:&mut impl EpochBlockIo,w:&mut RecoveryWorkspace)->Result<R
 pub fn recover_checkpoint<I:EpochBlockIo>(io:&mut I,w:&mut RecoveryWorkspace,
     verify_post_replay:impl FnOnce(&mut I,SuperblockV1)->Result<(),Error>)
     ->Result<SuperblockV1,Error>{
+    recover_checkpoint_with_evidence(io,w,verify_post_replay).map(|(_,next)|next)
+}
+/// Same exclusive recovery operation, returning the actual scanned chain
+/// as well as the durably verified new checkpoint. No second full scan
+/// is needed merely to obtain evidence for the completed transaction.
+pub fn recover_checkpoint_with_evidence<I:EpochBlockIo>(io:&mut I,w:&mut RecoveryWorkspace,
+    verify_post_replay:impl FnOnce(&mut I,SuperblockV1)->Result<(),Error>)
+    ->Result<(RecoveryEvidence,SuperblockV1),Error>{
     let e=scan(io,w)?;
     let next=SuperblockV1{fs_uuid:e.superblock.fs_uuid,
         generation:e.superblock.generation.checked_add(1).ok_or(Error::Exhausted)?,
@@ -206,7 +214,7 @@ pub fn recover_checkpoint<I:EpochBlockIo>(io:&mut I,w:&mut RecoveryWorkspace,
     io.read(dest,out).map_err(|_|Error::Unknown)?;
     if SuperblockV1::decode(out).map_err(|_|Error::Unknown)?!=next{return Err(Error::Unknown);}
     w.evidence=None;
-    Ok(next)
+    Ok((e,next))
 }
 
 #[cfg(test)]
