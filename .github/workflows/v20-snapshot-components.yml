@@ -11,10 +11,16 @@ on:
       - 'tests/host/test_snapshot*'
       - 'tools/test_snapshot_probe.py'
       - 'tools/host_prototype_library.py'
-      - 'kernel/src/runtime/files/domain_file_abi.rs'
+      - 'kernel/src/runtime/files/**'
+      - 'crates/prototype/src/journal*'
+      - 'crates/prototype/src/storage*'
+      - 'crates/kernel-core/src/security/file.rs'
+      - 'tests/host/test_background_maintenance_progress.py'
+      - 'tools/test_a09_file_backpressure.py'
+      - 'tools/test_a10_write_backpressure.py'
       - '.github/workflows/v20-snapshot-components.yml'
   push:
-    branches: ['work/v020-snapshot-*']
+    branches: [CyxiaOS-V0.20, 'work/v020-snapshot-*']
   workflow_dispatch:
 
 permissions:
@@ -51,6 +57,10 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONPATH=tools:tests/host python3 -B -m unittest tests.host.test_v2_filesystem tests.host.test_snapshot_file_abi tests.host.test_snapshot_capability_custody tests.host.test_snapshot_probe_budget tools.test_snapshot_probe -v 2>&1 | tee artifacts/snapshot-host/python.log
+      - name: Joint real-broker backpressure and maintenance host regressions
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools:tests/host python3 -B -m unittest tests.host.test_background_maintenance_progress tools.test_a09_file_backpressure tools.test_a10_write_backpressure -v 2>&1 | tee artifacts/snapshot-host/broker-regression.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
