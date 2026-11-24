@@ -588,6 +588,135 @@ mod tests {
         assert_eq!(attempts,1);
         assert_eq!(gate.expire_unpublished(CONTROLLER,200),Err(Error::NotReady));
     }
+    const SUPERVISOR: Identity=Identity{id:11,generation:1};
+
+    fn terminal_proof(plan:&[u8]) -> TrustedTerminal {
+        TrustedTerminal {
+            boot_epoch:1,controller_epoch:2,plan_seq:1,
+            plan_digest:sha256(plan),
+            action_count:1,terminal_mask:1,unknown_mask:0,
+            evidence_digest:[9;32],
+        }
+    }
+
+    #[test]
+    fn independent_terminal_proof_releases_capacity_without_replaying_old_keys() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let proof=terminal_proof(&plan);
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,proof, |_|Ok(())
+        ),Err(Error::NotReady)); // no native publication was accepted
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        assert_eq!(gate.settle_with_native_proof(
+            PUBLISHER,proof, |_|Ok(())
+        ),Err(Error::Denied)); // publisher cannot forge its own completion
+        let mut bad=proof;bad.terminal_mask=0;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        bad=proof;bad.unknown_mask=1;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        bad=proof;bad.evidence_digest=[0;32];
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,bad, |_|Ok(())
+        ),Err(Error::Denied));
+        let mut verifier_called=0;
+        assert_eq!(gate.settle_with_native_proof(SUPERVISOR,proof, |_|{
+            verifier_called+=1; Err(Error::NotReady)
+        }),Err(Error::NotReady));
+        assert_eq!(verifier_called,1);
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        let result=gate.settle_with_native_proof(SUPERVISOR,proof, |_|{
+            verifier_called+=1; Ok(())
+        }).unwrap();
+        assert_eq!(verifier_called,2);
+        assert_eq!(result.plan_seq,1);
+        assert_eq!(gate.terminal_summary(PUBLISHER,1),Ok(Some(result)));
+        assert_eq!(gate.terminal_summary(Identity{id:6,generation:1},1),Err(Error::Denied));
+        assert_eq!(gate.terminal_summary(SUPERVISOR,0),Ok(None));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Stale)); // old idempotent key cannot restart on eviction
+
+        let mut plan2=plan;
+        plan2[16..24].copy_from_slice(&2u64.to_le_bytes());
+        plan2[64+24..64+32].copy_from_slice(&5u64.to_le_bytes());
+        let mut record2=decision(&plan2,&bytes);
+        record2[24..32].copy_from_slice(&5u64.to_le_bytes());
+        record2[32..40].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan2,&[record2],&catalog,&frozen,ctx
+        ),Ok(Registration::Frozen)); // new, genuine work can progress
+    }
+
+    #[test]
+    fn unknown_adapter_result_requires_independent_terminal_reconciliation() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let mut invocations=0;
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invocations+=1;Err(Error::Busy)}
+        ),Err(Error::Busy));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invocations+=1;Ok(())}
+        ),Err(Error::NotReady));
+        assert_eq!(invocations,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+        let mut corrupted=terminal_proof(&plan);
+        corrupted.plan_digest[0]^=1;
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,corrupted, |_|Ok(())
+        ),Err(Error::Denied));
+        assert_eq!(gate.settle_with_native_proof(
+            SUPERVISOR,terminal_proof(&plan), |_|Ok(())
+        ).unwrap().action_count,1);
+        assert_eq!(invocations,1);
+    }
+
+    #[test]
+    fn unconfigured_terminal_authority_never_releases_inflight_plan() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        assert_eq!(gate.settle_with_native_proof(
+            CONTROLLER,terminal_proof(&plan), |_|Ok(())
+        ),Err(Error::Denied));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::ExactRetry));
+        assert_eq!(gate.expire_unpublished(CONTROLLER,10000),Err(Error::NotReady));
+        assert!(RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,CONTROLLER,1,2
+        ).is_err());
+    }
+
     #[test]
     fn trial_and_advice_without_disposition_or_permit_are_not_authorized() {
         let rules=profile_bytes();
