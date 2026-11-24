@@ -150,6 +150,27 @@ pub fn decode_v3(verified_package_abi:u16,x8:u64,args:[u64;6])
     Ok(ValidatedCall {operation,args})
 }
 
+/// Canonical private-stack startup placement (V0.19.9 §2.2.1).
+/// The caller owns and has mapped this exact private RW stack backing.
+/// Fresh stack bytes are scrubbed before copying the bounded argument block.
+/// Returned initial x0/x1/SP do not confer capabilities.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct StartupRegisters{pub sp:u64,pub x0:u64,pub x1:u64}
+pub fn stage_spawn_args(stack:&mut[u8],base:u64,args:&[u8])->Result<StartupRegisters,Error>{
+    if stack.len()<4096||stack.len()%4096!=0||base%4096!=0||args.len()>256{
+        return Err(Error::Invalid);
+    }
+    let end=base.checked_add(u64::try_from(stack.len()).map_err(|_|Error::Invalid)?)
+        .ok_or(Error::Invalid)?;
+    let offset=stack.len().checked_sub(args.len()).ok_or(Error::Invalid)?&!15;
+    let sp=base.checked_add(offset as u64).ok_or(Error::Invalid)?;
+    if sp&15!=0||sp<base||sp>end{return Err(Error::Invalid);}
+    stack.fill(0);
+    if args.is_empty(){return Ok(StartupRegisters{sp:end,x0:0,x1:0});}
+    stack[offset..offset+args.len()].copy_from_slice(args);
+    Ok(StartupRegisters{sp,x0:sp,x1:args.len() as u64})
+}
+
 /// An independently authenticated EL1 role/capability check must run on both
 /// sides of any blocking/retry boundary. A caller may not select its role by
 /// changing x8, a service ID or any user-visible field.
