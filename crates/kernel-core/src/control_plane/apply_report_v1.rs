@@ -77,9 +77,10 @@ impl<'a> ApplyReportV1<'a>{
             id:le64(frame,32)?,generation:le64(frame,40)?,
         };
         let generation=le64(frame,48)?;
+        let plan_version=le64(frame,56)?;
         let completed_ns=le64(frame,72)?;
         let result=le32(frame,64)? as i32;
-        if !key.valid() || !target.valid() || generation==0
+        if !key.valid() || !target.valid() || generation==0 || plan_version==0
             || le16(frame,24)? >=MAX_ACTIONS as u16
             || !(1..=15).contains(&le16(frame,26)?)
             || completed_ns==0 || (state==ActionStatus::Applied&&result!=0)
@@ -87,7 +88,7 @@ impl<'a> ApplyReportV1<'a>{
         Ok(Self {
             key,action_index:le16(frame,24)?,domain_id:le16(frame,26)?,
             state,target,executor_generation:generation,
-            plan_version:le64(frame,56)?,result,completed_ns,
+            plan_version,result,completed_ns,
             action:&frame[APPLY_HEADER_BYTES..],
         })
     }
@@ -104,7 +105,7 @@ impl<'a> ApplyReportV1<'a>{
             || self.key.boot_epoch!=current.boot_epoch
             || self.key.controller_epoch!=plan.header.controller_epoch
             || self.key.plan_seq!=plan.header.plan_seq
-            || self.plan_version!=current.plan_version
+            || current.plan_version==0 || self.plan_version!=current.plan_version
             || self.executor_generation!=current.executor_generation
             || self.completed_ns>current.now_ns
         {return Err(Error::Denied);}
@@ -283,6 +284,22 @@ mod tests{
         r=report();r[28..30].copy_from_slice(&1u16.to_le_bytes());
         r[64..68].copy_from_slice(&(-1i32).to_le_bytes());
         assert!(ApplyReportV1::decode(&r).is_err());
+    }
+    #[test]
+    fn unpublished_zero_version_cannot_claim_any_apply_result() {
+        let raw=plan();
+        let p=PlanV2::decode(&raw).unwrap();
+        let mut r=report();
+        r[56..64].fill(0);
+        for state in 1u16..=4 {
+            r[28..30].copy_from_slice(&state.to_le_bytes());
+            assert!(ApplyReportV1::decode(&r).is_err());
+        }
+        let valid=report();
+        let mut forged=ApplyReportV1::decode(&valid).unwrap();
+        forged.plan_version=0;
+        let mut context=executor();context.plan_version=0;
+        assert_eq!(forged.matches_frozen(&p,context),Err(Error::Denied));
     }
     #[test]
     fn plan_query_is_not_an_apply_receipt(){
