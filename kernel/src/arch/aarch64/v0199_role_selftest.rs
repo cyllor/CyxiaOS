@@ -100,10 +100,24 @@ pub(super) fn run() -> ! {
         assert!(root!=0 && root%4096==0);
         // Dedicated per-role TTBR0 + writable data and stack, shared RX code.
         report("V0199_STAGE",10+index as u64,m.role.id() as u64,m.ttbr0_root);
-        execute(&mut ctx,space);
+        let mut finished=false;
+        for turn in 0..32 {
+            // A real per-core PPI may preempt a user context before its
+            // bounded SVC #4. The context/TTBR/FP bank must be restored,
+            // not treated as an EL0 failure or restarted from its entry PC.
+            execute(&mut ctx,space);
+            if ctx.kind==9 {
+                report("V0199_CPU0_PREEMPT",m.role.id() as u64,turn as u64,IRQS[0].load(Ordering::Acquire));
+                continue;
+            }
+            if ctx.kind==8 && ctx.esr>>26==0x15 && ctx.esr&0xffff==4 {
+                finished=true;
+                break;
+            }
+            fatal(101+index as u64);
+        }
         report("V0199_STAGE",20+index as u64,ctx.kind,ctx.esr);
-        if ctx.kind!=8 || ctx.esr>>26!=0x15 || ctx.esr&0xffff!=4
-            || ctx.regs[0]!=cookie(space)
+        if !finished || ctx.regs[0]!=cookie(space)
             || ctx.tpidr_el0!=cookie(space)
         {fatal(101+index as u64);}
         let data=unsafe {
