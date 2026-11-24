@@ -317,6 +317,31 @@ mod tests{
         assert_eq!(bridge.register_rule_only(
             role2,register_args,&sidecars[0],&frozen
         ),Ok(Registration::Frozen));
+        // A real registered record must be retrievable via the frozen
+        // RPC transport by role8 only, including a lost reply retry.
+        use super::super::control_rpc_v1::{Caller,RpcTable,State,Error as RpcError};
+        let mut table=RpcTable::new();
+        let caller=Caller{boot_epoch:1,holder:role8.identity,role:8,endpoint:801,cap:89};
+        table.bind(caller,false).unwrap();
+        let native=VerifiedNativeCaller{endpoint_cap:89,..role8};
+        let mut request=[0u8;72];
+        request[..4].copy_from_slice(&0x43594351u32.to_le_bytes());
+        request[4..6].copy_from_slice(&1u16.to_le_bytes());
+        request[6..8].copy_from_slice(&48u16.to_le_bytes());
+        request[8..10].copy_from_slice(&9u16.to_le_bytes());
+        request[12..16].copy_from_slice(&24u32.to_le_bytes());
+        for (at,v) in [(16,1u64),(32,2),(40,200),(48,1),(56,2)]{
+            request[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        request[64..72].copy_from_slice(&sidecars[0][24..32]);
+        let args=[89,4096,72,0,8192,304];
+        assert_eq!(read_registered_decision_rpc(bridge.gate,&mut table,caller,role2,args,&request,150,200),Err(RpcError::Auth));
+        let reply=read_registered_decision_rpc(bridge.gate,&mut table,caller,native,args,&request,150,200).unwrap();
+        assert_eq!(reply.state(),State::Done);
+        assert_eq!(&reply.bytes()[48..],&sidecars[0]);
+        assert_eq!(read_registered_decision_rpc(bridge.gate,&mut table,caller,native,args,&request,201,200),Ok(reply));
+        let mut changed=request;changed[64]^=2;
+        assert_eq!(read_registered_decision_rpc(bridge.gate,&mut table,caller,native,args,&changed,150,200),Err(RpcError::Conflict));
         let mut invoked=0;
         assert_eq!(bridge.publish_plan(
             role2,publish_args,&plan,&sidecars,&frozen,
