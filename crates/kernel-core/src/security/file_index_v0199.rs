@@ -232,6 +232,39 @@ impl SecurityStateStoreV2 {
     }
 }
 
+/// V0.19.10 candidate, business-root projection only. A historical restore
+/// may replace business inode/data roots; it must not import historical
+/// FileStreamIndex or SecurityStateStore bytes. The trusted file owner must
+/// supply the current committed bytes and the planned projection under the
+/// same serialization boundary. This conservative check grants NO permission
+/// to restore or reopen writes, does not validate ACL/receipts/other objects,
+/// and does not attest redo, FLUSH, or any native execution.
+///
+/// New request/receipt bookkeeping, if needed, belongs to the separately
+/// authorized current-state transaction, never to historical-root import.
+pub fn validate_snapshot_restore_system_projection(
+    fs_uuid: [u8; 16],
+    current_index: &[u8],
+    current_security: &[u8],
+    projected_index: &[u8],
+    projected_security: &[u8],
+) -> Result<(), Error> {
+    if fs_uuid == [0; 16] {
+        return Err(Error::Invalid);
+    }
+    let index = FileStreamIndexV4::decode(current_index)?;
+    let security = SecurityStateStoreV2::decode(current_security)?;
+    if index.fs_uuid != fs_uuid || security.fs_uuid != fs_uuid {
+        return Err(Error::Conflict);
+    }
+    // Exact preservation also protects flags and configuration fields which
+    // cannot safely be inferred from monotonic counter comparison alone.
+    if current_index != projected_index || current_security != projected_security {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +297,35 @@ mod tests {
         b[88..120].copy_from_slice(&[2u8;32]);
         finalize_crc(&mut b,72);
         b
+    }
+    #[test]
+    fn snapshot_restore_preserves_current_system_state_exactly() {
+        let old_index=index();
+        let old_security=security();
+        let mut live_index=old_index;
+        live_index[24..32].copy_from_slice(&9u64.to_le_bytes());
+        live_index[32..40].copy_from_slice(&2u64.to_le_bytes());
+        finalize_crc(&mut live_index,CRC_OFFSET);
+        let mut live_security=old_security;
+        live_security[24..32].copy_from_slice(&2u64.to_le_bytes());
+        live_security[32..40].copy_from_slice(&7u64.to_le_bytes());
+        live_security[56..64].copy_from_slice(&1u64.to_le_bytes());
+        finalize_crc(&mut live_security,72);
+        let check=|idx:&[u8],sec:&[u8]| validate_snapshot_restore_system_projection(
+            [1;16],&live_index,&live_security,idx,sec);
+        assert_eq!(check(&live_index,&live_security),Ok(()));
+        assert_eq!(check(&old_index,&live_security),Err(Error::Conflict));
+        assert_eq!(check(&live_index,&old_security),Err(Error::Conflict));
+        let mut modified=live_security;
+        modified[56..64].fill(0);
+        finalize_crc(&mut modified,72);
+        assert_eq!(check(&live_index,&modified),Err(Error::Conflict));
+        assert_eq!(validate_snapshot_restore_system_projection(
+            [2;16],&live_index,&live_security,&live_index,&live_security),Err(Error::Conflict));
+        let mut bad=live_index;
+        bad[CRC_OFFSET]^=1;
+        assert!(validate_snapshot_restore_system_projection(
+            [1;16],&bad,&live_security,&bad,&live_security).is_err());
     }
     #[test]
     fn exact_index_v4_and_counter_monotonicity() {
