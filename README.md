@@ -4,7 +4,7 @@
 
 当前开发工作分支 `work/v020-native-control-safety`（基于 `CyxiaOS-V0.20`）使用版本号 `0.20.0-dev`。已收紧 CPU1 单控制核准入和 CPU0 机制核的业务准入边界；这**不是** ARM 控制预算、双大脑独立 EL0 隔离、全本地域 AI 实施、六大安全专项 G2–G4、去分布式或双架构完整回归的完成声明。
 
-[**V0.20 变更与逐项验收状态**](docs/releases/v0.20.md) · [**V0.20 并行 CI（源码归档/主机测试/两架构构建）**](.github/workflows/v20-native-hardening.yml)。所有关键用例在取得原生证据前仍为 NOT_RUN。
+[**V0.20 原生单机架构规范草案**](docs/design/v0.20-native-local-system.md) · [**V0.20 变更与逐项验收状态**](docs/releases/v0.20.md) · [**V0.20 并行 CI（源码归档/主机测试/两架构构建）**](.github/workflows/v20-native-hardening.yml)。所有关键用例在取得原生证据前仍为 NOT_RUN。
 
 ---
 
