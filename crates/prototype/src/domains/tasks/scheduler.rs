@@ -1044,11 +1044,19 @@ impl Scheduler {
         let i = self.thread(key)?;
         let initial = self.threads[i].ok_or(Error::Stale)?;
         let old = usize::from(initial.spec.cpu);
-        if old == cpu {
-            return Ok(());
-        }
         if !layout.permits(cpu) || initial.spec.allowed_mask & (1u64 << cpu) == 0 {
             return Err(Error::Auth);
+        }
+        if self.cpus[cpu].quarantine_generation != 0 {
+            return Err(Error::NotReady);
+        }
+        if initial.state == RunState::Exited {
+            return Err(Error::Stale);
+        }
+        // Even an affinity-preserving relocation must recheck the current
+        // topology and quarantine. A no-op never certifies an illegal CPU.
+        if old == cpu {
+            return Ok(());
         }
         if self
             .cpus
@@ -1058,9 +1066,6 @@ impl Scheduler {
             || self.cpus[cpu].control.is_some()
         {
             return Err(Error::Busy);
-        }
-        if self.cpus[cpu].quarantine_generation != 0 {
-            return Err(Error::NotReady);
         }
         self.roll(old, now)?;
         self.roll(cpu, now)?;
@@ -1081,6 +1086,18 @@ impl Scheduler {
             .saturating_add(t.spec.budget_ns)
             > CPU_BUDGET_NS
         {
+            return Err(Error::Budget);
+        }
+        // Like new admission, migration must leave enough wall-window
+        // capacity for every runnable minimum, not just aggregate CPU quota.
+        let destination_minimum: u64 = self.threads.iter().flatten()
+            .filter(|peer| usize::from(peer.spec.cpu) == cpu && peer.state == RunState::Runnable)
+            .map(|peer| peer.spec.minimum_ns.saturating_sub(peer.spent))
+            .sum();
+        let incoming_minimum = if t.state == RunState::Runnable {
+            t.spec.minimum_ns.saturating_sub(t.spent)
+        } else { 0 };
+        if destination_minimum.saturating_add(incoming_minimum) > WINDOW_NS - now % WINDOW_NS {
             return Err(Error::Budget);
         }
         // Destination accounts carried consumption; source debits are retained
@@ -1239,6 +1256,12 @@ impl Scheduler {
             return Err(Error::Range);
         }
         self.time(now)?;
+        // A credit is not issuable unless the exact aligned expiry is
+        // representable. Otherwise complete_control cannot settle its key.
+        let end = (now / WINDOW_NS).checked_add(1)
+            .and_then(|window| window.checked_mul(WINDOW_NS))
+            .ok_or(Error::Overflow)?;
+        let remaining_ns = end - now;
         if self.cpus[cpu].active.is_some() || self.cpus[cpu].control.is_some() {
             return Err(Error::Busy);
         }
@@ -1246,13 +1269,13 @@ impl Scheduler {
             return Err(Error::NotReady);
         }
         self.roll(cpu, now)?;
-        if WINDOW_NS - now % WINDOW_NS < headroom_ns {
+        if remaining_ns < headroom_ns {
             return Ok(None);
         }
         let c = self.cpus[cpu];
         if required_ns > CPU_BUDGET_NS.saturating_sub(c.spent)
             || required_ns > CONTROL_BUDGET_NS.saturating_sub(c.control_spent)
-            || required_ns > WINDOW_NS - now % WINDOW_NS
+            || required_ns > remaining_ns
         {
             return Ok(None);
         }
