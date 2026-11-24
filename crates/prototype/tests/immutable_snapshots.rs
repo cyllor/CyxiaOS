@@ -844,3 +844,27 @@ fn observed_snapshot_corruption_freezes_cleanup_and_cannot_be_cleared_without_re
         assert_eq!(read(&mut fs, &mut j, &mut d, history), b"protected");
     });
 }
+
+#[test]
+fn explicit_periodic_drop_requires_live_integrity_proof_not_only_active_count() {
+    large(|| {
+        let (mut d, mut j, mut fs) = blank();
+        let mut s = [0;8192];
+        // Advance trusted time and create a second short-tier protection point.
+        fs.snapshot_maintenance(0, &mut j, &mut d, &mut s).unwrap();
+        fs.snapshot_maintenance(snapshot::SHORT_RETENTION_SECONDS * snapshot::SECOND_NS,
+            &mut j, &mut d, &mut s).unwrap();
+        let entries=fs.snapshot_entries().unwrap();
+        let old=entries[0].key(fs.snapshot_uuid().unwrap(),0);
+        assert_eq!(entries[0].state,State::Active);
+        assert_eq!(entries[1].state,State::Active);
+        j.checkpoint(&mut d,&mut s).unwrap();
+        d.stable.get_mut(&entries[1].descriptor_block).unwrap()[100]^=0x80;
+        let req=request(&fs,0,1,false);
+        assert_eq!(fs.snapshot_execute(req,snapshot::OP_DELETE,&key_bytes(old),
+            &mut j,&mut d,&mut s),Err(Error::Format));
+        assert_eq!(fs.snapshot_entries().unwrap()[0].state,State::Active);
+        assert!(fs.snapshot_control().unwrap().cleanup_freeze);
+        assert_eq!(fs.snapshot_control().unwrap().business_write_gate,Gate::Frozen);
+    });
+}
