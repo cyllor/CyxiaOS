@@ -18,6 +18,7 @@ CAPACITY=512*1024*1024
 UUID=b'CYX-TEST-EPOCH!!'
 MARKER=b'CYXIA_V0199_EPOCH_SCRATCH_ONLY'
 HOME=7000
+BOOT_HOME=7002
 MAGIC=0x435945504f434831
 PATCH=Path(__file__).resolve().parent/'qemu/cyxia-per-vcpu-pmu.patch'
 
@@ -53,26 +54,44 @@ def state(txid):
     put(b,72,'I',crc(b))
     return bytes(b)
 
+def boot_store(epoch):
+    b=bytearray(BLOCK)
+    put(b,0,'IHH',0x43594245,1,40)
+    b[8:24]=UUID
+    put(b,24,'Q',epoch)
+    put(b,32,'I',crc(b))
+    return bytes(b)
+
 def seal(b,kind,length,txid,lsn):
     put(b,0,'IHHIIQQQ',0x43594c47,1,kind,length,crc(b[64:length]),txid,lsn,1)
     put(b,56,'I',crc(b[:64]))
     return bytes(b)
 
-def transaction(epoch):
-    image=state(epoch)
-    begin_lsn=epoch*3-2
-    b=bytearray(BLOCK);put(b,64,'IIQ',1,0,BLOCK)
-    r=bytearray(2*BLOCK);put(r,40,'QII',HOME,0,1);r[64:64+BLOCK]=image
-    c=bytearray(BLOCK);put(c,64,'QQQII',epoch,begin_lsn,begin_lsn+1,1,0)
-    c[96:128]=hashlib.sha256(struct.pack('<Q',HOME)+image).digest()
-    return seal(b,1,80,epoch,begin_lsn)+seal(r,2,4160,epoch,begin_lsn+1)+seal(c,3,128,epoch,begin_lsn+2)
+def transaction(txid):
+    # Independent canonical two-home boot and one-home role restart log.
+    if txid%2:
+        begin_lsn=7*(txid//2)+1
+        images=[(HOME,state(txid)),(BOOT_HOME,boot_store((txid+1)//2))]
+    else:
+        begin_lsn=7*(txid//2-1)+5
+        images=[(HOME,state(txid))]
+    n=len(images)
+    b=bytearray(BLOCK);put(b,64,'IIQ',n,0,BLOCK*n)
+    redos=[];h=hashlib.sha256()
+    for i,(home,image) in enumerate(images):
+        r=bytearray(2*BLOCK);put(r,40,'QII',home,i,n);r[64:64+BLOCK]=image
+        h.update(struct.pack('<Q',home)+image)
+        redos.append(seal(r,2,4160,txid,begin_lsn+i+1))
+    c=bytearray(BLOCK);put(c,64,'QQQII',txid,begin_lsn,begin_lsn+n,n,0)
+    c[96:128]=h.digest()
+    return seal(b,1,80,txid,begin_lsn)+b''.join(redos)+seal(c,3,128,txid,begin_lsn+n+1)
 
 def create_disk(path):
     assert crc(b'123456789')==0xe3069283 and len(UUID)==16
     with path.open('xb') as f:
         f.truncate(CAPACITY)
         f.seek(0);f.write(superblock()*2)
-        f.seek(HOME*BLOCK);f.write(state(0));f.write(MARKER.ljust(BLOCK,b'\0'))
+        f.seek(HOME*BLOCK);f.write(state(0));f.write(MARKER.ljust(BLOCK,b'\0'));f.write(boot_store(0))
         f.flush()
 
 def check_disk(path,epoch,out):
@@ -80,11 +99,11 @@ def check_disk(path,epoch,out):
     with path.open('rb') as f:
         original=f.read(2*BLOCK)
         require(original==superblock()*2,'superblocks unexpectedly modified')
-        log=f.read(16*BLOCK)
-        expected=b''.join(transaction(i) for i in range(1,2*epoch+1)).ljust(16*BLOCK,b'\0')
+        log=f.read(20*BLOCK)
+        expected=b''.join(transaction(i) for i in range(1,2*epoch+1)).ljust(20*BLOCK,b'\0')
         require(log==expected,'actual on-disk redo differs from independent reference')
-        f.seek(HOME*BLOCK);home=f.read(2*BLOCK)
-        require(home==state(2*(epoch-1))+MARKER.ljust(BLOCK,b'\0'),'replayed home or fixture marker differs from independent latest prior commit')
+        f.seek(HOME*BLOCK);home=f.read(3*BLOCK)
+        require(home==state(2*(epoch-1))+MARKER.ljust(BLOCK,b'\0')+boot_store(epoch-1),'replayed home or fixture marker differs from independent latest prior commit')
     (out/'superblocks.bin').write_bytes(original)
     (out/'redo-blocks.bin').write_bytes(log)
     (out/'home-and-marker.bin').write_bytes(home)
@@ -116,9 +135,9 @@ class EpochFixture:
         txid=2*e
         replay=e-1
         flushes=4+replay
-        require(w[:11]==(MAGIC,4,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),flushes),
+        require(w[:11]==(MAGIC,5,1,e-1,e,txid-1,txid+1,txid,7*e,8+10*(e-1),flushes),
                 'wrong durable boot/service transition identity')
-        require(w[11]>=4096 and w[12:14]==(8+replay,HOME),'missing actual full-log scan or block I/O counts')
+        require(w[11]>=4096 and w[12:14]==(10+2*replay,HOME),'missing actual full-log scan or block I/O counts')
         require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
         old,new,old_root,new_root,esr,far=w[18:24]
         require((old,new)==(e,e+1) and old_root and new_root and old_root!=new_root
@@ -138,16 +157,19 @@ class EpochFixture:
         for generation in (old,new):
             line=f'V0199_EPOCH_ROLE7_OPERATOR a={generation} b=342 c=2\n'.encode()
             require(serial.count(line)==1,'role7 operator UART/QMP disagreement')
-        require(w[39:43]==(2*replay,replay,6*replay,replay),'wrong merged recovery chain evidence')
-        recovery=f'V0199_EPOCH_REPLAY_HOME a={2*replay} b={replay} c={replay}\n'.encode()
+        require(w[39:43]==(2*replay,2*replay,7*replay,replay),'wrong merged recovery chain evidence')
+        recovery=f'V0199_EPOCH_REPLAY_HOME a={2*replay} b={2*replay} c={replay}\n'.encode()
         require(serial.count(recovery)==1,'full redo recovery UART/QMP mismatch')
-        require(all(v==0 for v in w[43:]),'nonzero reserved evidence')
+        require(page[43*8:47*8]==hashlib.sha256(boot_store(e)).digest() and w[47]==BOOT_HOME,
+                'independent BootEpochStore committed image mismatch')
+        require(all(v==0 for v in w[48:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
-                    commit_lsn=txid*3,actual_flush_completions=flushes,block_reads=w[11],block_writes=w[12],
+                    commit_lsn=7*e,actual_flush_completions=flushes,block_reads=w[11],block_writes=w[12],
                     full_log_scan_verified=True,prior_commits_replayed=2*replay,
-                    distinct_home_blocks_replayed=replay,home_replay_flushes=replay,
+                    distinct_home_blocks_replayed=2*replay,home_replay_flushes=replay,
+                    paired_boot_epoch_redo_verified=True,
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
                     native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
                     role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
@@ -183,6 +205,7 @@ def main():
         result['cross_process_boot_epoch_fixture_verified']=True
         result['cross_process_service_generation_fixture_verified']=True
         result['cross_process_merged_home_replay_fixture_verified']=True
+        result['cross_process_paired_boot_epoch_fixture_verified']=True
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
