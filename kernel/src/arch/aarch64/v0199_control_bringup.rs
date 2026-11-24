@@ -317,6 +317,23 @@ fn valid_audit_request(b:&[u8],actor:Identity,now:u64)->bool{
         && u64at(24)==0 && u64at(32)==actor.generation && u64at(48)==actor.generation
         && u64at(56)==0 && now<u64at(40) && u64at(40)-now<=500_000_000
 }
+// Native model arithmetic evidence from an independently linked brain's
+// actual private RW page, captured while its EL0 context is stopped at CLOCK.
+// This fixture never converts the result to an authorized model or suggestion.
+fn capture_model_probe(index:usize,r:&Running,actor:Identity){
+    assert!(index<2&&matches!(actor.generation,1|2));
+    const OFFSET:usize=0xf000;
+    let address=backing(index) as u64+OFFSET as u64;
+    let t=tables(index,r.bank);
+    let pte=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*t).leaf.0[(BASE as usize+OFFSET)/PAGE]))};
+    mmu::checked_user_leaf_span(pte,PhysAddr(phys(address)),0,32,true).expect("private probe result ownership");
+    let row:[u64;4]=core::array::from_fn(|i|unsafe{((address as *const u64).add(i)).read_volatile()});
+    assert_eq!(row[0],0x4359_4d4c_5052_4f42);
+    assert_eq!(row[1],actor.generation);
+    let at=493+index*8+(actor.generation as usize-1)*4;
+    assert_eq!(SMP_EVIDENCE.words[at].load(Ordering::Relaxed),0);
+    for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[at+i].store(v,Ordering::Relaxed);}
+}
 /// Actual SVC64 dispatch for this deliberately restricted bootstrap profile.
 /// Full production cap issuance, boot identity, IPC and service backend
 /// are absent, so no publication, inference authorization or audit ACK is
@@ -331,7 +348,10 @@ fn dispatch(index:usize,m:&NativeRoleManifest,r:&mut Running)->bool{
     let now=now_ns();
     let mut park=false;
     let result=match call.operation{
-        Syscall::Clock=>{r.clocks+=1;i64::try_from(now).unwrap_or(E_FORMAT)}
+        Syscall::Clock=>{
+            if index<2&&r.clocks==0{capture_model_probe(index,r,member.actor);}
+            r.clocks+=1;i64::try_from(now).unwrap_or(E_FORMAT)
+        }
         Syscall::Yield=>{r.yields+=1;park=true;0}
         Syscall::Sleep=>{
             r.role_calls+=1;r.wake_ns=a[0].max(now);park=true;0
@@ -643,6 +663,13 @@ pub(super) fn run()->!{
         SMP_EVIDENCE.words[473+i].store(delta,Ordering::Relaxed);
     }
     report("V0199_BOOTSTRAP_ALL_LIVE",ROLE_COUNT as u64,progressed,total_delta);
+    for (i,role) in ROLES[..2].iter().enumerate(){
+        for generation in 1..=2{
+            let at=493+i*8+(generation-1)*4;
+            report("V0199_MODEL_PROBE",u64::from(role.id()),generation as u64,
+                SMP_EVIDENCE.words[at+2].load(Ordering::Relaxed));
+        }
+    }
     // All eight independently linked diagnostic clients have executed, faulted,
     // reloaded under a new root and reentered. No real service effect is claimed.
     for (i,r) in running.iter().enumerate(){
@@ -691,7 +718,7 @@ pub(super) fn run()->!{
         budget.ledger.lifetime_spent(Class::Recovery),budget.ledger.lifetime_spent(Class::Optional)];
     for(i,value)in ledger_row.into_iter().enumerate(){SMP_EVIDENCE.words[481+i].store(value,Ordering::Relaxed);}
     report("V0199_BOOTSTRAP_ACCOUNTING",elapsed,accounted,upper);
-    let summary=[MAGIC,5,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let summary=[MAGIC,6,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
