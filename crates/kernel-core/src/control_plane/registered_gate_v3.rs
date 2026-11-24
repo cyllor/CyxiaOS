@@ -290,3 +290,210 @@ fn rule_profile_mismatch(profile:&Profile<'_>, ctx:TrustedRegistrationScope) ->b
     profile.generation!=ctx.rules_generation
         || sha256(profile.canonical_bytes())!=ctx.rules_hash
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTROLLER:Identity=Identity{id:2,generation:1};
+    const PUBLISHER:Identity=Identity{id:8,generation:1};
+
+    fn profile_bytes() -> [u8;80] {
+        let mut b=[0u8;80];
+        b[0..4].copy_from_slice(&0x4359_5255u32.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&32u16.to_le_bytes());
+        b[8..16].copy_from_slice(&7u64.to_le_bytes());
+        b[16..20].copy_from_slice(&1u32.to_le_bytes());
+        b[20..24].copy_from_slice(&80u32.to_le_bytes());
+        b[32..36].copy_from_slice(&1u32.to_le_bytes());
+        b[36..38].copy_from_slice(&1u16.to_le_bytes()); // D01
+        b[38..40].copy_from_slice(&1u16.to_le_bytes()); // kind=1
+        b[40..48].copy_from_slice(&17u64.to_le_bytes());
+        b[52..54].copy_from_slice(&2u16.to_le_bytes()); // two legal values
+        b[56..60].copy_from_slice(&48u32.to_le_bytes());
+        b[64..66].copy_from_slice(&2u16.to_le_bytes()); // ordinal 2, rank 0
+        b[72..74].copy_from_slice(&4u16.to_le_bytes()); // ordinal 4
+        b[74..76].copy_from_slice(&1u16.to_le_bytes()); // rank 1
+        b
+    }
+    fn plan_bytes() -> [u8;212] {
+        let mut b=[0u8;212];
+        b[0..4].copy_from_slice(&0x4359_4c31u32.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&64u16.to_le_bytes());
+        b[8..12].copy_from_slice(&212u32.to_le_bytes());
+        b[12..14].copy_from_slice(&1u16.to_le_bytes()); // action count
+        b[16..24].copy_from_slice(&1u64.to_le_bytes()); // plan sequence
+        b[40..48].copy_from_slice(&2u64.to_le_bytes()); // controller epoch
+        b[48..56].copy_from_slice(&3u64.to_le_bytes()); // snapshot sequence
+        b[56..64].copy_from_slice(&10_000_000_100u64.to_le_bytes());
+        let h=64;
+        b[h..h+4].copy_from_slice(&0x4359_5031u32.to_le_bytes());
+        b[h+4..h+6].copy_from_slice(&2u16.to_le_bytes());
+        b[h+6..h+8].copy_from_slice(&144u16.to_le_bytes());
+        b[h+8..h+10].copy_from_slice(&1u16.to_le_bytes()); // D01
+        b[h+10..h+12].copy_from_slice(&1u16.to_le_bytes()); // action kind
+        b[h+12..h+16].copy_from_slice(&4u32.to_le_bytes()); // payload len
+        for (at,value) in [
+            (16,2u64), (24,4), (32,3), (40,17),
+            (48,1), (56,5), (64,6), (72,200),
+        ] { b[h+at..h+at+8].copy_from_slice(&value.to_le_bytes()); }
+        b[h+112..h+144].copy_from_slice(&[1u8;32]); // candidate set digest
+        b[h+144..h+146].copy_from_slice(&0u16.to_le_bytes()); // candidate index
+        b[h+146..h+148].copy_from_slice(&[2u8,0]); // native D01 action payload
+        b
+    }
+    fn decision(plan:&[u8],rules:&[u8]) -> [u8;DECISION_BYTES] {
+        let mut b=[0u8;DECISION_BYTES];
+        b[0..4].copy_from_slice(&0x4359_4431u32.to_le_bytes());
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[6..8].copy_from_slice(&256u16.to_le_bytes());
+        for (at,value) in [
+            (8,1u64), (16,2), (24,4), (32,1), (40,3),
+            (48,17), (56,1), (64,5), (72,6), (80,7), (144,200),
+        ] { b[at..at+8].copy_from_slice(&value.to_le_bytes()); }
+        b[88..92].copy_from_slice(&1u32.to_le_bytes());
+        b[94..96].copy_from_slice(&1u16.to_le_bytes());
+        b[96..98].copy_from_slice(&1u16.to_le_bytes());
+        b[104..106].copy_from_slice(&u16::MAX.to_le_bytes());
+        b[108..112].copy_from_slice(&2u32.to_le_bytes()); // RULE_ONLY baseline
+        b[152..156].copy_from_slice(&3u32.to_le_bytes());
+        b[160..192].copy_from_slice(&sha256(rules));
+        b[192..224].copy_from_slice(&sha256(plan));
+        b[224..256].copy_from_slice(&[1u8;32]);
+        b
+    }
+    fn trusted(rules:&[u8]) -> TrustedRegistrationScope {
+        TrustedRegistrationScope {
+            boot_epoch:1, controller_epoch:2, rules_generation:7,
+            rules_hash:sha256(rules), base_plan_version:0,
+            ledger_generation:5, core_generation:6, snapshot_seq:3,
+            sampled_ns:100, now_ns:150,
+        }
+    }
+    fn frozen<'a>(ordinals:&'a[u16],payload:&'a[u8]) -> [FrozenAction<'a>;1] {
+        [FrozenAction {
+            domain_id:1, target:Identity{id:17,generation:1},
+            candidate_set_hash:[1;32],static_ordinals:ordinals,
+            raw_fields:[None;7], action_payload:payload,
+        }]
+    }
+    #[test]
+    fn authenticated_exact_registration_and_single_shot_native_callback() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        assert_eq!(gate.register_rule_only(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Denied));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::Frozen));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Ok(Registration::ExactRetry));
+        let mut invoked=0u32;
+        assert_eq!(gate.publish_once(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Err(Error::Denied));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Ok(Publication::AdapterAccepted));
+        assert_eq!(invoked,1);
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{invoked+=1;Ok(())}
+        ),Ok(Publication::ReplayNoEffect));
+        assert_eq!(invoked,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,201),Err(Error::NotReady));
+    }
+    #[test]
+    fn tampered_digest_rule_epoch_target_or_decision_will_not_reach_native_adapter() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let mut rec=decision(&plan,&bytes);
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        let mut wrong=rec;wrong[192]=wrong[192].wrapping_add(1);
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[wrong],&catalog,&frozen,ctx
+        ),Err(Error::Denied));
+        let mut stale=ctx;stale.rules_generation=8;
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,stale
+        ),Err(Error::Stale));
+        rec[48..56].copy_from_slice(&18u64.to_le_bytes());
+        assert!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ).is_err());
+        rec=decision(&plan,&bytes);
+        gate.register_rule_only(CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx).unwrap();
+        let mut bad_plan=plan;bad_plan[209]=1;
+        let mut invoked=false;
+        assert!(gate.publish_once(
+            PUBLISHER,&bad_plan,&[rec],&catalog,&frozen,ctx,
+            ||{invoked=true;Ok(())}
+        ).is_err());
+        assert!(!invoked);
+        let mut bad_record=rec;bad_record[224]=2;
+        assert!(gate.publish_once(
+            PUBLISHER,&plan,&[bad_record],&catalog,&frozen,ctx,
+            ||{invoked=true;Ok(())}
+        ).is_err());
+        assert!(!invoked);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,200),Ok(true));
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ),Err(Error::Stale));
+    }
+    #[test]
+    fn unknown_adapter_result_keeps_key_consumed_and_blocks_reexecution() {
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        let mut attempts=0u32;
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{attempts+=1;Err(Error::Busy)}
+        ),Err(Error::Busy));
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
+            ||{attempts+=1;Ok(())}
+        ),Ok(Publication::ReplayNoEffect));
+        assert_eq!(attempts,1);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,200),Err(Error::NotReady));
+    }
+    #[test]
+    fn trial_and_advice_without_disposition_or_permit_are_not_authorized() {
+        let rules=profile_bytes();
+        let catalog=Profile::parse(&rules).unwrap();
+        let mut plan=plan_bytes();
+        let mut rec=decision(&plan,&rules);
+        rec[108..112].copy_from_slice(&7u32.to_le_bytes());
+        let ctx=trusted(&rules);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ),Err(Error::NotReady)); // source0 reason7 needs frozen AdviceDisposition
+        rec=decision(&plan,&rules);
+        plan[14]=1; // AI assisted header, no trusted Active model
+        assert!(gate.register_rule_only(
+            CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
+        ).is_err());
+    }
+}
