@@ -127,7 +127,8 @@ impl SecurityFinding {
             && self.config_hash == trusted.config_hash
             && trusted.sampled_ns <= trusted.now_ns
             && trusted.now_ns < self.expires_ns
-            && self.expires_ns <= trusted.sampled_ns.saturating_add(MAX_FINDING_AGE_NS)
+            && trusted.sampled_ns.checked_add(MAX_FINDING_AGE_NS)
+                .is_some_and(|end| self.expires_ns <= end)
     }
 }
 
