@@ -305,6 +305,7 @@ mod tests {
 
         let mut changed=registered_decision();
         changed[102..104].copy_from_slice(&0u16.to_le_bytes());
+        changed[156..158].copy_from_slice(&0u16.to_le_bytes());
         // This is a structurally valid other fallback, but it did not match
         // the actual PolicyEnvelope's frozen chosen candidate index.
         assert!(decoded.matches_untrusted_sidecars(&[changed]).is_err());
