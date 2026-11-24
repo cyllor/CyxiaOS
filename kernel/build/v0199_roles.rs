@@ -55,6 +55,10 @@ pub fn build(){
     let script=root.join("user/v0199-control/linker.ld");
     println!("cargo:rerun-if-changed={}",source.display());
     println!("cargo:rerun-if-changed={}",script.display());
+    for rel in ["crates/control-model/src/native_v0199.rs","crates/prototype/src/model.rs",
+        "crates/prototype/src/learning/seed.rs"]{
+        println!("cargo:rerun-if-changed={}",root.join(rel).display());
+    }
     println!("cargo:rerun-if-changed=build/v0199_roles.rs");
     let out=PathBuf::from(env::var("OUT_DIR").unwrap());
     let empty=out.join("v0199-empty-relative.bin");
