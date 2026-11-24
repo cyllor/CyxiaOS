@@ -84,7 +84,7 @@ def check_disk(path,epoch,out):
         expected=b''.join(transaction(i) for i in range(1,2*epoch+1)).ljust(16*BLOCK,b'\0')
         require(log==expected,'actual on-disk redo differs from independent reference')
         f.seek(HOME*BLOCK);home=f.read(2*BLOCK)
-        require(home==state(0)+MARKER.ljust(BLOCK,b'\0'),'home/fixture marker changed')
+        require(home==state(2*(epoch-1))+MARKER.ljust(BLOCK,b'\0'),'replayed home or fixture marker differs from independent latest prior commit')
     (out/'superblocks.bin').write_bytes(original)
     (out/'redo-blocks.bin').write_bytes(log)
     (out/'home-and-marker.bin').write_bytes(home)
@@ -114,9 +114,11 @@ class EpochFixture:
         w=struct.unpack('<512Q',page)
         e=self.epoch
         txid=2*e
-        require(w[:11]==(MAGIC,3,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),4),
+        replay=e-1
+        flushes=4+replay
+        require(w[:11]==(MAGIC,4,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),flushes),
                 'wrong durable boot/service transition identity')
-        require(w[11]>=32 and w[12:14]==(8,HOME),'missing actual block I/O counts')
+        require(w[11]>=4096 and w[12:14]==(8+replay,HOME),'missing actual full-log scan or block I/O counts')
         require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
         old,new,old_root,new_root,esr,far=w[18:24]
         require((old,new)==(e,e+1) and old_root and new_root and old_root!=new_root
@@ -136,11 +138,16 @@ class EpochFixture:
         for generation in (old,new):
             line=f'V0199_EPOCH_ROLE7_OPERATOR a={generation} b=342 c=2\n'.encode()
             require(serial.count(line)==1,'role7 operator UART/QMP disagreement')
-        require(all(v==0 for v in w[39:]),'nonzero reserved evidence')
-        expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c=4\n'.encode()
+        require(w[39:43]==(2*replay,replay,6*replay,replay),'wrong merged recovery chain evidence')
+        recovery=f'V0199_EPOCH_REPLAY_HOME a={2*replay} b={replay} c={replay}\n'.encode()
+        require(serial.count(recovery)==1,'full redo recovery UART/QMP mismatch')
+        require(all(v==0 for v in w[43:]),'nonzero reserved evidence')
+        expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
-                    commit_lsn=txid*3,actual_flush_completions=4,block_reads=w[11],block_writes=w[12],
+                    commit_lsn=txid*3,actual_flush_completions=flushes,block_reads=w[11],block_writes=w[12],
+                    full_log_scan_verified=True,prior_commits_replayed=2*replay,
+                    distinct_home_blocks_replayed=replay,home_replay_flushes=replay,
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
                     native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
                     role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
@@ -175,6 +182,7 @@ def main():
         result['status']='PASS'
         result['cross_process_boot_epoch_fixture_verified']=True
         result['cross_process_service_generation_fixture_verified']=True
+        result['cross_process_merged_home_replay_fixture_verified']=True
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
