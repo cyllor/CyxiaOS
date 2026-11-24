@@ -147,37 +147,65 @@ impl BudgetMeter {
     // Startup has no admitted roles. Initial loader work uses the same
     // fixed EL1 coordination sub-budget, not the protected recovery quota.
     // No estimate is substituted for the actual PMU debit.
-    fn load_initial(&mut self,index:usize)->(NativeRole,Running){
+    fn reserve_coordination(&mut self)->(Turn,u64){
         let until=now_ns().checked_add(5_000_000_000).unwrap();
-        let (token,began)=loop{
+        loop{
             let (now,began)=self.sample_gap();
             if now>=until{fatal(689);}
             let remaining=KERNEL_COORDINATION_LIMIT_NS.saturating_sub(self.ledger.kernel_coordination_spent());
+            // Keep explicit headroom for settlement and idle-entry work.
             if remaining<1_500_000 || now%WINDOW_NS>WINDOW_NS-5_000_000{
                 self.idle_retry();continue;
             }
-            match self.ledger.reserve_kernel_with_wall(0,Class::Coordination,remaining,50_000_000,now){
-                Ok(t)=>break (t,began),
+            match self.ledger.reserve_kernel_with_wall(0,Class::Coordination,remaining-200_000,50_000_000,now){
+                Ok(t)=>return (t,began),
                 Err(Error::Exhausted|Error::Busy)=>{self.idle_retry();},
                 Err(e)=>panic!("initial role load budget: {e:?}"),
             }
-        };
-        let pair=load(index,1,0);
+        }
+    }
+    fn settle_coordination(&mut self,token:Turn,began:u64)->u64{
         let receipt=self.settle(token,began);
         if receipt.overrun||receipt.crossed_window{
             report("V0199_BOOTSTRAP_OVERRUN",0,receipt.actual_ns,token.reserved_ns());
             fatal(690);
         }
-        SMP_EVIDENCE.words[32+index].store(receipt.actual_ns,Ordering::Relaxed);
-        report("V0199_INITIAL_LOAD",u64::from(ROLES[index].id()),receipt.actual_ns,token.reserved_ns());
+        receipt.actual_ns
+    }
+    fn load_initial(&mut self,index:usize)->(NativeRole,Running){
+        let (mut token,mut began)=self.reserve_coordination();
+        let mut total=0u64;let mut largest=0u64;let mut slices=0u64;
+        let pair=load_checkpointed(index,1,0,||{
+            // The verified copy and unpublished backing stay exclusively
+            // owned by the loader across these cooperative boundaries.
+            if timer::cpu_elapsed_ns(began)>=450_000
+                || token.deadline_ns().saturating_sub(now_ns())<2_000_000{
+                let cost=self.settle_coordination(token,began);
+                total=total.checked_add(cost).unwrap();largest=largest.max(cost);slices+=1;
+                (token,began)=self.reserve_coordination();
+            }
+        });
+        let cost=self.settle_coordination(token,began);
+        total=total.checked_add(cost).unwrap();largest=largest.max(cost);slices+=1;
+        SMP_EVIDENCE.words[32+index].store(total,Ordering::Relaxed);
+        SMP_EVIDENCE.words[48+index].store(slices,Ordering::Relaxed);
+        report("V0199_INITIAL_LOAD",u64::from(ROLES[index].id()),total,largest);
         pair
+    }
+    /// Reserve before an individual bounded coordination operation. For
+    /// final evidence, do not burn an entire window in a long UART burst.
+    fn coordinated<T>(&mut self,work:impl FnOnce()->T)->T{
+        let (token,began)=self.reserve_coordination();
+        let result=work();
+        self.settle_coordination(token,began);
+        result
     }
     fn wait_for(&mut self,mut ready:impl FnMut()->bool){
         let until=now_ns().checked_add(5_000_000_000).unwrap();
         while !ready(){
             check_failures();
             if now_ns()>=until{fatal(688);}
-            self.idle_until(now_ns().checked_add(1_000_000).unwrap());
+            self.idle_retry();
         }
     }
 }
@@ -244,6 +272,9 @@ fn seal_page(pa:u64){
     tlbi();
 }
 fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
+    load_checkpointed(index,generation,bank,||{})
+}
+fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl FnMut())->(NativeRole,Running){
     let role=ROLES[index];let pkg=&CATALOG[index];
     assert_eq!(pkg.role_id,role.id());
     assert!(pkg.bytes.len()<=COPY);
@@ -256,17 +287,21 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
     // published. The exclusive source scratch is scrubbed after each image.
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
     scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
+    checkpoint();
     let spec=RolePackageSpec{role,package_id:u64::from(role.id()),abi:3,image_bytes:pkg.bytes.len(),
         image_sha256:pkg.image_sha256,relative_count:pkg.relative.len(),relative_sha256:pkg.relative_sha256,
         stack_bytes:ROLE_STACK_BYTES};
-    let verified=VerifiedRolePackage::verify(spec,RolePackageInput{package_id:spec.package_id,
-        bytes:&scratch[..pkg.bytes.len()],relative:pkg.relative}).expect("trusted ABI3 role package");
+    let verified=VerifiedRolePackage::verify_checkpointed(spec,RolePackageInput{package_id:spec.package_id,
+        bytes:&scratch[..pkg.bytes.len()],relative:pkg.relative},&mut checkpoint).expect("trusted ABI3 role package");
     let relro=verified.relro();
+    checkpoint();
     let image=unsafe{&mut *core::ptr::addr_of_mut!((*b).image)};
     let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
+    checkpoint();
     let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
     stack.fill(0);
     assert!(stack.iter().all(|&v|v==0));
+    checkpoint();
     let mut map=[0u8;IMAGE/PAGE];
     for seg in verified.load_segments(){
         let start=seg.virtual_address as usize/PAGE;
@@ -284,8 +319,11 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
         }
     }
     scratch.fill(0);
+    checkpoint();
     let image_base=b as u64;
-    sync_code(image_base,IMAGE);
+    for (i,flags) in map.iter().copied().enumerate(){
+        if flags&1!=0{sync_code(image_base+i as u64*PAGE as u64,PAGE);checkpoint();}
+    }
     unsafe{
         (*t).root.0[0]=phys(core::ptr::addr_of!((*t).mid) as u64)|3;
         (*t).mid.0[0]=phys(core::ptr::addr_of!((*t).leaf) as u64)|3;
@@ -294,7 +332,7 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
         if flags==0{continue;}
         let pa=phys(image_base+i as u64*PAGE as u64);
         let write=flags&2!=0;let execute=flags&1!=0;
-        if !write{seal_page(pa);}
+        if !write{seal_page(pa);checkpoint();}
         let desc=mmu::encode_user_leaf(PhysAddr(pa),write,execute).unwrap();
         unsafe{(*t).leaf.0[BASE as usize/PAGE+i]=desc;}
     }
@@ -303,6 +341,7 @@ fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
         let pa=phys(stack_base+i as u64*PAGE as u64);
         unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE+i]=mmu::encode_user_leaf(PhysAddr(pa),true,false).unwrap();}
     }
+    checkpoint();
     // Guard and image holes have never had user mappings.
     assert_eq!(unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE-1]},0);
     tlbi();
@@ -712,8 +751,8 @@ pub(super) fn run()->!{
     for (i,role) in ROLES[..2].iter().enumerate(){
         for generation in 1..=2{
             let at=493+i*8+(generation-1)*4;
-            report("V0199_MODEL_PROBE",u64::from(role.id()),generation as u64,
-                SMP_EVIDENCE.words[at+2].load(Ordering::Relaxed));
+            budget.coordinated(||report("V0199_MODEL_PROBE",u64::from(role.id()),generation as u64,
+                SMP_EVIDENCE.words[at+2].load(Ordering::Relaxed)));
         }
     }
     // All eight independently linked diagnostic clients have executed, faulted,
@@ -733,13 +772,13 @@ pub(super) fn run()->!{
         }
         SMP_EVIDENCE.words[128+i*20+18].store(u64::from(role_asid(i,r.bank)),Ordering::Relaxed);
         SMP_EVIDENCE.words[128+i*20+19].store(CATALOG[i].relative.len() as u64,Ordering::Relaxed);
-        report("V0199_BOOTSTRAP_ROLE",u64::from(m.role.id()),m.ttbr0_root,r.clocks);
-        report("V0199_BOOTSTRAP_CHARGE",u64::from(m.role.id()),r.charges,r.turns);
+        budget.coordinated(||report("V0199_BOOTSTRAP_ROLE",u64::from(m.role.id()),m.ttbr0_root,r.clocks));
+        budget.coordinated(||report("V0199_BOOTSTRAP_CHARGE",u64::from(m.role.id()),r.charges,r.turns));
     }
     for slot in 1..REQUIRED{
         assert!(PROGRESS[slot*2].load(Ordering::Acquire)>=2);
         assert_eq!(PROGRESS[slot*2+1].load(Ordering::Acquire),0);
-        report("V0199_BOOTSTRAP_BUSINESS",slot as u64,PROGRESS[slot*2].load(Ordering::Acquire),0);
+        budget.coordinated(||report("V0199_BOOTSTRAP_BUSINESS",slot as u64,PROGRESS[slot*2].load(Ordering::Acquire),0));
     }
     for gate in GATES.iter().take(REQUIRED).skip(1){close_gate(gate);}
     budget.wait_for(||(1..REQUIRED).all(|i|GATES[i].quiescent()));
@@ -764,10 +803,10 @@ pub(super) fn run()->!{
     for (i,v) in [prefix,prefix_accounted,prefix_upper].into_iter().enumerate(){
         SMP_EVIDENCE.words[40+i].store(v,Ordering::Relaxed);
     }
-    report("V0199_BOOTSTRAP_ACCOUNTING",prefix,prefix_accounted,prefix_upper);
-    let summary=[MAGIC,8,0,15,1,14,8,0,0,0];
+    budget.coordinated(||report("V0199_BOOTSTRAP_ACCOUNTING",prefix,prefix_accounted,prefix_upper));
+    let summary=[MAGIC,9,0,15,1,14,8,0,0,0];
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
-    super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
+    budget.coordinated(||super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n"));
     let (sample_end_ns,end)=budget.sample_gap();
     let elapsed=timer::cpu_ns(end.checked_sub(budget.initial_tick).unwrap());
     let accounted=budget.ledger.lifetime_total().unwrap();
