@@ -857,10 +857,13 @@ impl Manager {
         {
             return Err(Status::Busy.into());
         }
-        if automatic {
-            if request.key.client_slot != 14 || entry.slot_class != SlotClass::Periodic {
-                return Err(Status::Permission.into());
-            }
+        if automatic && (request.key.client_slot != 14 || entry.slot_class != SlotClass::Periodic) {
+            return Err(Status::Permission.into());
+        }
+        // V0.19.10 candidate: the protection floor applies to every root drop,
+        // not only automatic rotation. Explicit delete authority is not a
+        // bypass; a second ACTIVE root in the same tier must exist first.
+        if entry.slot_class == SlotClass::Periodic {
             let range = if key.slot < 3 { 0..3 } else { 3..6 };
             if range
                 .filter(|i| self.catalog.entries[*i].state == State::Active)
