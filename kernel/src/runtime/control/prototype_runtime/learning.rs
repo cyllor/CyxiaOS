@@ -1268,7 +1268,7 @@ pub(super) fn allow_mandatory(worker: &Worker, required: u64, now: u64) -> bool 
     } else {
         0
     };
-    spent.checked_add(required).is_some_and(|n| n <= 61_000_000)
+    spent.checked_add(required).is_some_and(|n| n <= cyxia_prototype::learning::governance::MANDATORY_NS)
 }
 pub(super) fn mandatory(worker: &mut Worker, started: u64, actual: u64) {
     if cpu::slot() != 1 {
@@ -1957,7 +1957,7 @@ pub(super) fn step(worker: &mut Worker) {
     } else {
         0
     };
-    if spent.saturating_add(RESERVE_NS) > 9_000_000 {
+    if spent.saturating_add(RESERVE_NS) > cyxia_prototype::learning::governance::EXTRA_NS {
         return;
     }
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(RESERVE_NS, false) else {
