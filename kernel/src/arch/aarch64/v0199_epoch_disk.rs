@@ -10,6 +10,7 @@ use cyxia_kernel_core::security::{
     file_media_v0199::{SuperblockV1,BLOCK_COUNT},
     file_index_v0199::{SecurityStateStoreV2,BLOCK_BYTES},
     epoch_redo_v0199::{EpochBlockIo,OneStateRedo},
+    recovery_v1::{self,RecoveryWorkspace},
     durable_role_epoch_v0199::{DurableEpochGate,SlotBinding,Change,Outcome,StopEvidence},
 };
 use cyxia_kernel_core::control_plane::role_manifest_v0199::{ROLES,Role};
@@ -21,8 +22,9 @@ const HOME:u32=7000;
 const MAGIC:u64=0x4359_4550_4f43_4831;
 static mut QUEUE:QueueMemory=QueueMemory::zeroed();
 static mut SCRATCH:OneStateRedo=OneStateRedo::zeroed();
+static mut RECOVERY:RecoveryWorkspace=RecoveryWorkspace::new();
 
-struct Disk{device:Block,reads:u64,writes:u64,flushes:u64}
+struct Disk{device:Block,reads:u64,writes:u64,flushes:u64,replay_home_allowed:bool}
 impl Disk{
     fn sector(&mut self,operation:Operation,input:&[u8;SECTOR_BYTES],output:&mut[u8;SECTOR_BYTES])
         ->Result<(),SecurityError>{
@@ -47,9 +49,12 @@ impl EpochBlockIo for Disk{
         self.reads+=1;Ok(())
     }
     fn write(&mut self,block:u32,data:&[u8;BLOCK_BYTES])->Result<(),SecurityError>{
-        // An additional fixture-only physical restriction. Never write
-        // home, superblocks, bitmap or arbitrary data. Four log appends.
-        if !(2..18).contains(&block){return Err(SecurityError::Unauthorized);}
+        // Only the validated journal extents or the one signed-fixture
+        // state location during replay. Never write superblocks, bitmap,
+        // marker, or arbitrary data in this non-filesystem fixture.
+        if !(2..18).contains(&block)&&!(block==HOME&&self.replay_home_allowed){
+            return Err(SecurityError::Unauthorized);
+        }
         for (i,part) in data.chunks_exact(SECTOR_BYTES).enumerate(){
             self.sector(Operation::Write(u64::from(block)*8+i as u64),
                 part.try_into().unwrap(),&mut[0;SECTOR_BYTES])?;
@@ -72,7 +77,7 @@ fn attach(info:&BootInfo)->Disk{
         unsafe{&mut *core::ptr::addr_of_mut!(QUEUE)},&Board).expect("modern VirtIO FLUSH device");
     assert_eq!(device.sectors(),u64::from(BLOCK_COUNT)*8);
     assert!(!device.read_only());
-    Disk{device,reads:0,writes:0,flushes:0}
+    Disk{device,reads:0,writes:0,flushes:0,replay_home_allowed:false}
 }
 // Independent expected sequence for the restricted fixture, not a recovery
 // source. Recovered bytes below are copied from the actual verified redo.
@@ -130,6 +135,28 @@ pub(super) fn run(info:&BootInfo)->!{
         recovered=txid;
     }
     assert!(matches!(recovered,0|2),"fixture requires complete previous boot pair");
+    // Independently scan the actual full baseline-v1 log, rather than
+    // trusting the four known scratch transaction offsets as a mount
+    // algorithm. Merge both prior commits to a single latest home image.
+    let workspace=unsafe{&mut *core::ptr::addr_of_mut!(RECOVERY)};
+    let recovered_chain=recovery_v1::scan(&mut disk,workspace).unwrap();
+    assert_eq!(recovered_chain.superblock,sb);
+    assert_eq!(u64::from(recovered_chain.transactions),recovered);
+    assert_eq!(recovered_chain.last_commit_lsn,3*recovered);
+    assert!(!recovered_chain.incomplete_tail);
+    assert_eq!(recovered_chain.distinct_home_blocks,u32::from(recovered!=0));
+    let mut replay_flushes=0;
+    if recovered!=0{
+        let before=(disk.writes,disk.flushes);
+        disk.replay_home_allowed=true;
+        assert_eq!(recovery_v1::replay_home(&mut disk,workspace),Ok(recovered_chain));
+        disk.replay_home_allowed=false;
+        assert_eq!((disk.writes-before.0,disk.flushes-before.1),(1,1));
+        replay_flushes=1;
+        disk.read(HOME,&mut buf).unwrap();
+        assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),state(recovered));
+    }
+    report("V0199_EPOCH_REPLAY_HOME",recovered,u64::from(recovered_chain.distinct_home_blocks),replay_flushes);
     let prior=SecurityStateStoreV2::decode(&buf).unwrap();
     let prior_boot=prior.last_boot_epoch;let old_generation=prior.service_generations[1];
     report("V0199_EPOCH_DISK_RECOVERED",prior_boot,prior.state_generation,old_generation);
@@ -154,19 +181,19 @@ pub(super) fn run(info:&BootInfo)->!{
     let new=super::v0199_control_bringup::disk_security_run(new_generation,1,false);
     assert_ne!(new.root,old.root);assert_eq!(old.image_sha256,new.image_sha256);
     report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new.root,boot);
-    assert_eq!((disk.writes,disk.flushes),(8,4));
+    assert_eq!((disk.writes,disk.flushes),(8+replay_flushes,4+replay_flushes));
     let final_txid=recovered+2;
     let final_state=scratch.verify(sb,2+4*(final_txid as u32-1),HOME,final_txid,3*final_txid).unwrap();
     assert_eq!(final_state,state(final_txid));
     let final_digest:[u8;32]=Sha256::digest(scratch.image()).into();
     disk.read(HOME,&mut buf).unwrap();
-    assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),state(0));
+    assert_eq!(SecurityStateStoreV2::decode(&buf).unwrap(),state(recovered));
     for gate in GATES.iter().take(REQUIRED).skip(1){close_gate(gate);}
     wait(||(1..REQUIRED).all(|i|GATES[i].quiescent()));
     QUIT.store(true,Ordering::Release);
     wait(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
-    let row=[MAGIC,3,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,3*final_txid,
+    let row=[MAGIC,4,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,3*final_txid,
         u64::from(2+4*(final_txid as u32-1)),disk.flushes,disk.reads,disk.writes,u64::from(HOME)];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     for(i,b)in final_digest.chunks_exact(8).enumerate(){
@@ -182,6 +209,9 @@ pub(super) fn run(info:&BootInfo)->!{
     }
     report("V0199_EPOCH_ROLE7_OPERATOR",old_generation,old.score,old.severity);
     report("V0199_EPOCH_ROLE7_OPERATOR",new_generation,new.score,new.severity);
+    for(i,v)in [recovered,u64::from(recovered_chain.distinct_home_blocks),recovered_chain.last_commit_lsn,replay_flushes].into_iter().enumerate(){
+        SMP_EVIDENCE.words[39+i].store(v,Ordering::Relaxed);
+    }
     report("V0199_EPOCH_DISK_COMMITTED",prior_boot,boot,disk.flushes);
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EPOCH_DISK_FIXTURE_PASS production=false\n");
