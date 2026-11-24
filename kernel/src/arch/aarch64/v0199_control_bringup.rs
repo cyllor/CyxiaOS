@@ -29,7 +29,11 @@ const OTHER_CPU_NS:u64=10_000_000; // 8ms recovery + 2ms kernel coordination
 // Leave headroom for EL0 exit, SVC dispatch and accounting settlement;
 // never extend the reservation or discard any observed execution time.
 const TURN_EXIT_GUARD_NS:u64=100_000;
-const DECISION_SLICE_NS:u64=100_000;
+// PR88 capture-3, role2: 253984ns against a 250000ns reservation,
+// before the initial eight-role milestone. A validated manifest borrow
+// alone did not eliminate the overrun. Shorten only the diagnostic
+// execution slice and retain all measured trap/dispatch overhead.
+const DECISION_SLICE_NS:u64=50_000;
 const E_AUTH:i64=-1;const E_FORMAT:i64=-2;const E_UNSUPPORTED:i64=-11;
 const EFAULT:i64=-12;const EAGAIN:i64=-13;
 const MAGIC:u64=0x4359_5838_424f_4f54;
