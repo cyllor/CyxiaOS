@@ -10,6 +10,7 @@
 
 pub mod advisory;
 pub mod advice_envelope_v1;
+pub mod decision_record_v3;
 pub mod budget;
 pub mod cores;
 pub mod policy;
