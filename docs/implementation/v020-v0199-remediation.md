@@ -19,6 +19,9 @@
 | F11 | 冻结决定登记及单次提交门 | `control_plane/registered_gate_v3.rs`：锁定准确 Plan/RuleProfile SHA-256 与 256B 决定、唯一控制器/发布者身份、单未发布计划、序号高水位、精确重试和 UNKNOWN 不重放；新增测试 | `RULE_ONLY` 无 AdviceDisposition/TrialPermit 的受限纵向切片；已编译/主机测试，但尚未绑定 ARM SVC 0x50/0x41 及实际原生设备执行 |
 | F12 | 禁止未获独立证据的模型与试验授权 | v3 登记门仅允许符合本机受保护 RuleProfile 的普通确定性回退，拒绝 AI_ASSISTED、AUTHORIZED_TRIAL 和 source0/reason7 缺失 AdviceDisposition ；无模型代际仍走 RULE_ONLY | 受限功能，完整 AI 采纳与许可链尚未实现 |
 | F13 | 规范风险 IPC 及期限溢出 | `fixed::submit_security_wire` 用 192B `SecurityFinding v2` 检查角色/旧版本/保留位/重放；运营建议与风险建议的期限均用 checked_add；独立负向测试 | 组件级 IPC，真实 EL0 页表/能力/队列仍未接线 |
+| F14 | 已发布计划终态与槽回收 | `registered_gate_v3.rs`：独立终态持有者、每动作终结位图/UNKNOWN=0、原 Plan SHA-256 与全量证据复核；只在验证器批准后安全释放唯一活动登记、保留最近256终态摘要和 plan/decision 高水位 | 组件级状态机，真实设备/持久收据及原生仲裁证据仍须接线 |
+| F15 | AdviceDisposition v1 因果封包 | `control_plane/advice_disposition_v1.rs`：固定240B Little-Endian、6类处置及 state/reason 组合、真实 Advice 152B 和 Decision 256B 的 SHA-256 对应检查，source0/reason7 与 source1/reason8 语义隔离 | 纯编解码/因果校验，受保护 role2 的496B 决定登记尚未接线 |
+| F16 | 19项 Syscall ABI v3 准入 | `security/syscall_v3.rs`：可信启动包 ABI3 + x8/x0..x5 参数和保留寄存器检查、Plan v2/Decision v3 参数、向量及 IPC ACK 负向测试；ABI v1 不自动升级 | 静态入口验收组件，AArch64 trap 仍采用旧原生 syscall，缺实际逐入口路由与 copyin/out/Fault tests |
 
  
 ## 完成定义与保留阻断
@@ -27,7 +30,7 @@
  
 **P0：核心版本化封包。** 旧原生 `policy_wire.rs` 仍在处理 PlanHeader/PolicyEnvelope v1；本分支新增 v2/v3 解析与**固定内存的 RULE_ONLY 冻结登记/唯一发布者回调守门组件**（真实 SHA-256），但**尚未接线实际 AArch64 SVC 0x50 / 0x41、原生注册能力/EL0 角色/执行器与 ApplyReport，也未实现经核验的 AdviceDisposition v1 / TrialPermit 路径**。新增组件不是 G1 全量通过或原生 PUBLISH 已迁移。旧 v1 不得被称为 v2。G1 **NOT_READY**。
  
-**P0：任务与存储 ABI。** Syscall x8/x0–x5 ABI v3、ET_DYN/PIE 安全装载、FileService v4/Reply v3、磁盘超级块 v1(80B)/data_start=4118、Receipt/Index v4 与安全状态持久对象尚未一致迁移。禁止尝试用旧格式数据直接改变版本号。当前数据磁盘不可视为符合规范。
+**P0：任务与存储 ABI。** 新增 19 调用的 `security::syscall_v3` 只读寄存器准入门，但 **AArch64 原生 syscall dispatcher 尚未整体迁移到可信包 ABI v3 和 x8/x0–x5 所有语义**。ET_DYN/PIE 安全装载、FileService v4/Reply v3、磁盘超级块 v1(80B)/data_start=4118、Receipt/Index v4 与安全状态持久对象尚未一致迁移。禁止尝试用旧格式数据直接改变版本号。当前数据磁盘不可视为符合规范。
  
 **P1：同等十五域和学习。** 旧 `FAMILIES=18`、FeatureSchema/ActionSchema/RewardSchema/LearningConfig 旧代际、15 领域原生动作/反馈链仍未移除 D16 并整体完成；主机旧兼容测试不能代替新的 A05/A08/127 项验收。
  
