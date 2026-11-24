@@ -69,7 +69,7 @@ impl<'a> Profile<'a> {
             let id = get32(hdr, 0)?;
             let domain = get16(hdr, 4)?;
             let kind = get16(hdr, 6)?;
-            let target = get64(hdr, 8)?;
+            let _target = get64(hdr, 8)?;
             let policy = get16(hdr, 16)?;
             let predicates = usize::from(get16(hdr, 18)?);
             let values = usize::from(get16(hdr, 20)?);
