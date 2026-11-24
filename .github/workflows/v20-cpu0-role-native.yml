@@ -57,12 +57,39 @@ jobs:
           retention-days: 7
           path: artifacts/v020-qemu-role/
 
-  native-role-fixture:
-    needs: qemu-pinned
+  arm-role-compile:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     env:
       RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin freestanding ARM Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Compile actual four-vCPU CPU0-role guest code
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-cpu0-native
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+            2>&1 | tee artifacts/v020-cpu0-native/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-cpu0-native/kernel.elf
+          sha256sum artifacts/v020-cpu0-native/kernel.elf > artifacts/v020-cpu0-native/kernel.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-cpu0-role-elf-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v020-cpu0-native/
+
+  native-role-fixture:
+    needs: [qemu-pinned, arm-role-compile]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -71,21 +98,14 @@ jobs:
         with:
           name: v020-cpu0-role-qemu-${{ github.sha }}
           path: qemu-evidence
-      - name: Install ARM compiler and QEMU runtime
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-cpu0-role-elf-${{ github.sha }}
+          path: artifacts/v020-cpu0-native
+      - name: Install pinned QEMU runtime dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
-          rustup override set 1.95.0
-          cargo fetch --locked
-      - name: Build real four-vCPU native role fixture without legacy CPU1 controller
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts/v020-cpu0-native
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
-            2>&1 | tee artifacts/v020-cpu0-native/build.log
-          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-cpu0-native/kernel.elf
-          sha256sum artifacts/v020-cpu0-native/kernel.elf > artifacts/v020-cpu0-native/kernel.sha256
       - name: Run pinned QEMU and attest actual guest EL0 role TTBR evidence
         run: |
           set -euo pipefail
