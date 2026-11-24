@@ -144,6 +144,23 @@ pub(super) fn run() -> ! {
     QUIT.store(true,Ordering::Release);
     wait(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
+    for slot in 1..REQUIRED {
+        let at=16+slot*4;
+        for (offset,value) in [
+            AFFINITIES[slot].load(Ordering::Acquire),
+            PROGRESS[slot*2].load(Ordering::Acquire),
+            PROGRESS[slot*2+1].load(Ordering::Acquire),
+            IRQS[slot].load(Ordering::Acquire),
+        ].into_iter().enumerate(){
+            SMP_EVIDENCE.words[at+offset].store(value,Ordering::Relaxed);
+        }
+        report(
+            "V0199_CPU0_BUSINESS",
+            slot as u64,
+            PROGRESS[slot*2].load(Ordering::Acquire),
+            PROGRESS[slot*2+1].load(Ordering::Acquire)
+        );
+    }
     let summary=[
         0x4359_5856_3139_3939u64, // "CYXV1999" fixture marker
         1,
