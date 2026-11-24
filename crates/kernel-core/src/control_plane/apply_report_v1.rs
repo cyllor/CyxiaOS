@@ -200,7 +200,7 @@ impl ExecutorBindingV1{
                 self.role==1&&self.holder.id==0&&self.holder.generation==0&&self.endpoint_cap_id==0
             }
     }
-    fn permits(self,origin:ReportOrigin)->bool{
+    pub(super) fn permits(self,origin:ReportOrigin)->bool{
         self.valid()&&self.active&&match origin{
             ReportOrigin::Kernel=>self.role==1,
             ReportOrigin::User{holder,cap_id}=>self.role==12&&holder==self.holder
