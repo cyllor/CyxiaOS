@@ -11,10 +11,12 @@ use super::{
     decision_record_v3::DECISION_BYTES,
     plan_wire_v2::{MAX_PLAN_BYTES,PlanV2},
     registered_gate_v3::{
-        FrozenAction,RegisteredDecisionGate,Registration,Publication,
+        FrozenAction,RegisteredDecisionGate,Registration,Publication,AssistedScope,
         TrustedRegistrationScope,
     },
     rule_profile_v2::Profile,
+    advice_disposition_v1::DISPOSITION_BYTES,
+    advice_ledger_v0199::EvidenceLedger,
 };
 use crate::security::syscall_v3::{decode_v3,ABI_VERSION};
 
@@ -71,6 +73,41 @@ impl SvcV3Bridge<'_>{
             frozen.bytes,frozen.sidecars,
             frozen.rules,frozen.actions,frozen.context
         )
+    }
+
+    /// Exact 496B assisted registration (DecisionRecord + Disposition).
+    /// Native trap owner must first authorize holder/cap and stable copy.
+    pub fn register_assisted_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied:&[u8],frozen:&FrozenNativePlan<'_>,scope:&AssistedScope<'_>,
+        ledger:&mut EvidenceLedger)->Result<Registration,Error>
+    {
+        decode_v3(caller.package_abi,0x50,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.decision_endpoint_cap||args[0]!=caller.endpoint_cap
+            ||args[2]!=(DECISION_BYTES+DISPOSITION_BYTES) as u64
+            ||copied.len()!=DECISION_BYTES+DISPOSITION_BYTES||args[3]!=0||args[5]<8
+            ||frozen.sidecars.len()!=1||frozen.actions.len()!=1
+        {return Err(Error::Denied);}
+        let record:&[u8;DECISION_BYTES]=copied[..DECISION_BYTES].try_into().map_err(|_|Error::Invalid)?;
+        let disposition:&[u8;DISPOSITION_BYTES]=copied[DECISION_BYTES..].try_into().map_err(|_|Error::Invalid)?;
+        if record!=&frozen.sidecars[0]{return Err(Error::Denied);}
+        self.gate.register_assisted_one(caller.identity,frozen.bytes,record,disposition,
+            frozen.rules,&frozen.actions[0],frozen.context,scope,ledger)
+    }
+    pub fn publish_assisted_one(&mut self,caller:VerifiedNativeCaller,args:[u64;6],
+        copied_plan:&[u8],copied_sidecars:&[[u8;DECISION_BYTES]],
+        frozen:&FrozenNativePlan<'_>,scope:&AssistedScope<'_>,
+        native_accept:impl FnOnce()->Result<(),Error>)->Result<Publication,Error>
+    {
+        decode_v3(caller.package_abi,0x41,args).map_err(|_|Error::Invalid)?;
+        if caller.cpu!=0||!caller.identity.valid()||caller.endpoint_cap==0
+            ||caller.endpoint_cap!=self.publisher_cap
+            ||args[1]!=copied_plan.len() as u64||args[3]!=1
+            ||copied_sidecars.len()!=1||copied_plan!=frozen.bytes
+            ||copied_sidecars!=frozen.sidecars||frozen.actions.len()!=1
+        {return Err(Error::Denied);}
+        self.gate.publish_assisted_once(caller.identity,copied_plan,&copied_sidecars[0],
+            frozen.rules,&frozen.actions[0],frozen.context,scope,native_accept)
     }
 
     pub fn publish_plan(
