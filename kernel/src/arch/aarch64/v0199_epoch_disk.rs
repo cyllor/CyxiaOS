@@ -35,9 +35,7 @@ const SYSTEM:[SystemObject;4]=[
 ];
 const MAGIC:u64=0x4359_4550_4f43_4831;
 static mut QUEUE:QueueMemory=QueueMemory::zeroed();
-static mut SCRATCH:OneStateRedo=OneStateRedo::zeroed();
 static mut RECOVERY:RecoveryWorkspace=RecoveryWorkspace::new();
-static mut BOOT_PAIR:BootPairRedo=BootPairRedo::new();
 static mut MOUNT:MountWorkspace=MountWorkspace::new();
 
 struct Disk{device:Block,reads:u64,writes:u64,flushes:u64,replay_home_allowed:bool}
@@ -167,6 +165,8 @@ fn check_mount(disk:&mut Disk,sb:SuperblockV1,txid:u64)->Result<file_mount_v1::M
 }
 pub(super) fn run(info:&BootInfo)->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
+    let pools=super::v0199_ram_inventory::initialize(info);
+    super::v0199_control_bringup::install_disk_control_pool(pools.control_va());
     let mut disk=attach(info);
     let mut sb_raw=[0;BLOCK_BYTES];disk.read(0,&mut sb_raw).unwrap();
     let mut buf=[0;BLOCK_BYTES];disk.read(1,&mut buf).unwrap();
@@ -182,8 +182,11 @@ pub(super) fn run(info:&BootInfo)->!{
     disk.read(HOME+1,&mut buf).unwrap();
     assert_eq!(&buf[..MARKER.len()],MARKER);assert!(buf[MARKER.len()..].iter().all(|v|v==0));
     check_mount(&mut disk,old_sb,0).unwrap();
-    let scratch=unsafe{&mut *core::ptr::addr_of_mut!(SCRATCH)};
-    let pair=unsafe{&mut *core::ptr::addr_of_mut!(BOOT_PAIR)};
+    // Both types contain only fixed byte arrays. The actual exclusive
+    // progress pool was fully cleared by the native inventory owner.
+    let scratch=unsafe{&mut *(pools.progress_va() as *mut OneStateRedo)};
+    let pair_va=pools.progress_va()+core::mem::size_of::<OneStateRedo>() as u64;
+    let pair=unsafe{&mut *(pair_va as *mut BootPairRedo)};
     pair.read(&mut disk,2).unwrap();scratch.read(&mut disk,8).unwrap();
     if recovered==0{assert!(pair.blank()&&scratch.blank());}
     else{
@@ -287,6 +290,15 @@ pub(super) fn run(info:&BootInfo)->!{
         u64::from(mounted.structure.directory_entries),u64::from(mounted.system_blocks),
         mounted.receipts.occupied as u64,u64::from(mounted.usage[0].inodes),u64::from(mounted.usage[0].blocks)].into_iter().enumerate(){
         SMP_EVIDENCE.words[48+i].store(v,Ordering::Relaxed);
+    }
+    let i=pools.inventory;
+    for (index,value) in [262144,pools.metadata_pa,10*1024*1024,pools.control_pa,8*1024*1024,
+        pools.progress_pa,8*1024*1024,u64::from(i.arena),u64::from(i.firmware_extra),
+        u64::from(i.free),u64::from(i.reserved),u64::from(i.allocated),u64::from(i.quarantined),
+        u64::from(i.permanent),pools.sample_pa,pools.sample_generation,
+        2,pools.progress_pa,pools.progress_pa+core::mem::size_of::<OneStateRedo>() as u64,
+        (core::mem::size_of::<OneStateRedo>()+core::mem::size_of::<BootPairRedo>()) as u64].into_iter().enumerate(){
+        SMP_EVIDENCE.words[60+index].store(value,Ordering::Relaxed);
     }
     report("V0199_EPOCH_DISK_COMMITTED",prior_boot,boot,disk.flushes);
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
