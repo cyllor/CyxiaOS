@@ -58,6 +58,13 @@ fn crc32c_byte(crc: u32, byte: u8) -> u32 {
     (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize]
 }
 
+/// CRC32C of an ordinary payload with no embedded checksum field.
+pub fn crc32c_payload(bytes:&[u8])->u32{
+    let mut crc=u32::MAX;
+    for &byte in bytes{crc=crc32c_byte(crc,byte);}
+    !crc
+}
+
 /// Reflected CRC32C (Castagnoli); the stored crc32c field itself reads zero.
 /// Visit each byte exactly once, with no per-byte bit loop or copied page.
 pub fn crc32c_zeroed(bytes: &[u8], offset: usize) -> Result<u32, Error> {
@@ -206,7 +213,7 @@ pub fn verify_state_redo_v1(
             || le64(b,16)?!=txid || le64(b,24)?!=lsn || lsn==0
             || le64(b,32)?!=epoch || le32(b,60)?!=0
             || le32(b,56)?!=crc32c_zeroed(&b[..64],56)?
-            || le32(b,12)?!=cyxia_prototype::storage::crc32c(&b[64..length])
+            || le32(b,12)?!=crc32c_payload(&b[64..length])
             || b[length..].iter().any(|x|*x!=0)
             || (kind!=2 && b[40..56].iter().any(|x|*x!=0))
         {return Err(Error::Invalid);}
@@ -415,6 +422,8 @@ mod tests{
     }
     #[test]
     fn crc_matches_bitwise_reference_and_real_legacy_encoder() {
+        assert_eq!(crc32c_payload(b"123456789"),0xe306_9283);
+        assert_eq!(crc32c_payload(&[]),0);
         // Compare with the independent old bitwise calculation, including
         // offset zero, unaligned fields, the last four bytes and overflow.
         fn reference(b: &[u8], at: usize) -> u32 {
