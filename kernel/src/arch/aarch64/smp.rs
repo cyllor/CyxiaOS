@@ -26,10 +26,14 @@ mod prototype_model;
 #[cfg(feature = "prototype-runtime")]
 #[path = "../../runtime/control/prototype_runtime.rs"]
 pub(crate) mod prototype_runtime;
+#[cfg(feature = "v0199-cpu0-role-selftest")]
+#[path = "v0199_role_selftest.rs"]
+mod v0199_role_selftest;
 #[cfg(feature = "register-v15-selftest")]
 #[path = "../../diagnostics/register_evidence.rs"]
 mod register_evidence;
 const C: usize = cyxia_contracts::BOOT_CPUS;
+const PRIVATE_SPACES: usize = C * 2 + if cfg!(feature = "v0199-cpu0-role-selftest") { 8 } else { 0 };
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x20000;
@@ -54,11 +58,11 @@ static mut STACKS: Stacks = Stacks([0; C * STACK_BYTES]);
 static mut SMP_STACK_TOPS: [u64; C] = [0; C];
 // CPU0 writes these before releasing BOOT_READY. Thereafter only CPU i writes
 // the two data/stack pages belonging to its slot; tables are never modified.
-static mut ROOTS: [Page; C * 2] = [const { Page::ZERO }; C * 2];
-static mut MIDDLES: [Page; C * 2] = [const { Page::ZERO }; C * 2];
-static mut LEAVES: [Page; C * 2] = [const { Page::ZERO }; C * 2];
-static mut DATA_PAGES: [Page; C * 2] = [const { Page::ZERO }; C * 2];
-static mut USER_STACKS: [Page; C * 2] = [const { Page::ZERO }; C * 2];
+static mut ROOTS: [Page; PRIVATE_SPACES] = [const { Page::ZERO }; PRIVATE_SPACES];
+static mut MIDDLES: [Page; PRIVATE_SPACES] = [const { Page::ZERO }; PRIVATE_SPACES];
+static mut LEAVES: [Page; PRIVATE_SPACES] = [const { Page::ZERO }; PRIVATE_SPACES];
+static mut DATA_PAGES: [Page; PRIVATE_SPACES] = [const { Page::ZERO }; PRIVATE_SPACES];
+static mut USER_STACKS: [Page; PRIVATE_SPACES] = [const { Page::ZERO }; PRIVATE_SPACES];
 static mut GICS: [Option<Gic>; C] = [const { None }; C];
 static mut RESOURCE: Option<GicResource> = None;
 static AFFINITIES: [AtomicU64; C] = [const { AtomicU64::new(u64::MAX) }; C];
@@ -390,7 +394,7 @@ unsafe fn init_memory() {
         let code = core::ptr::addr_of!(smp_user_start) as u64;
         let end = core::ptr::addr_of!(smp_user_end) as u64;
         assert!(code.is_multiple_of(4096) && end - code <= 4096);
-        for i in 0..C * 2 {
+        for i in 0..PRIVATE_SPACES {
             let root = core::ptr::addr_of_mut!(ROOTS).cast::<Page>().add(i);
             let mid = core::ptr::addr_of_mut!(MIDDLES).cast::<Page>().add(i);
             let leaf = core::ptr::addr_of_mut!(LEAVES).cast::<Page>().add(i);
@@ -941,7 +945,11 @@ pub fn run(info: &BootInfo) -> ! {
     for (slot, gate) in GATES.iter().enumerate().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,
-            plane: plane(2, slot),
+            plane: if cfg!(feature = "v0199-cpu0-role-selftest") {
+                Plane::Business
+            } else {
+                plane(2, slot)
+            },
         })
         .unwrap();
     }
@@ -959,7 +967,10 @@ pub fn run(info: &BootInfo) -> ! {
     super::net_selftest::run(info);
     #[cfg(feature = "model-v13-selftest")]
     prototype_model::run();
+    #[cfg(feature = "v0199-cpu0-role-selftest")]
+    v0199_role_selftest::run();
     #[cfg(not(any(
+        feature = "v0199-cpu0-role-selftest",
         feature = "net-selftest",
         feature = "model-v13-selftest",
         feature = "prototype-runtime",
@@ -971,6 +982,7 @@ pub fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "ai-control-selftest")]
     controller::run(ownership);
     #[cfg(not(any(
+        feature = "v0199-cpu0-role-selftest",
         feature = "ai-control-selftest",
         feature = "net-selftest",
         feature = "model-v13-selftest",
