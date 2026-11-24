@@ -296,10 +296,10 @@ fn v0199_mandatory_and_optional_roles_share_exact_70ms_control_ceiling() {
         .unwrap();
     budget.settle(credit, EXTRA_NS, EXTRA_NS).unwrap();
     assert_eq!(budget.spent_ns(), EXTRA_NS);
-    assert_eq!(
+    assert!(matches!(
         budget.reserve(Role::Shadow, 1, 1, 1024 * 1024, EXTRA_NS, 1, &owners),
         Err(Error::Budget)
-    );
+    ));
     // One additional nanosecond of actual mandatory work faults the ledger;
     // the already spent optional work cannot be refunded on failure.
     assert_eq!(budget.record_mandatory(EXTRA_NS, 1), Err(Error::Budget));
