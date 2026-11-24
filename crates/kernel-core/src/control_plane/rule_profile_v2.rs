@@ -125,6 +125,61 @@ impl<'a> Profile<'a> {
         Ok(Self { bytes, generation: get64(bytes, 8)?, rule_count: count })
     }
 
+    /// Independent template catalog check. The rule ID names an exact
+    /// trial-only rule; every template ordinal must occur in its list.
+    /// Repeated ordinals in the template are intentional cycle entries.
+    pub fn validate_trial_template(&self,rule:u32,domain:u16,target:u64,order:&[u16])->Result<(),Error>{
+        if rule==0||!(1..=15).contains(&domain)||order.is_empty()||order.len()>32{return Err(Error::Invalid);}
+        let mut at=HEADER;
+        for _ in 0..self.rule_count{
+            let hdr=&self.bytes[at..at+ENTRY];
+            let predicates=usize::from(get16(hdr,18)?);
+            let values=usize::from(get16(hdr,20)?);
+            let len=get32(hdr,24)? as usize;
+            let frame=&self.bytes[at..at+len];at+=len;
+            if get32(hdr,0)?!=rule{continue;}
+            if get16(hdr,4)?!=domain||get16(hdr,16)?!=2
+                ||(get64(hdr,8)?!=target&&get64(hdr,8)?!=u64::MAX){return Err(Error::Denied);}
+            for &ordinal in order{
+                if ordinal==u16::MAX||!(0..values).any(|i|
+                    get16(frame,ENTRY+predicates*PREDICATE+i*VALUE)==Ok(ordinal)){
+                    return Err(Error::Denied);
+                }
+            }
+            return Ok(());
+        }
+        Err(Error::Denied)
+    }
+    /// Trial matching does not authorize a permit; caller already owns the
+    /// protected next ordinal from that permit. Recompute raw predicates
+    /// and its one-bit current candidate intersection.
+    pub(super) fn match_trial(&self,rule:u32,domain:u16,target:u64,ordinal:u16,
+        raw_fields:[Option<u64>;7],candidates:Candidates<'_>)->Result<RuleMatch,Error>{
+        self.validate_trial_template(rule,domain,target,&[ordinal])?;
+        if candidates.static_ordinals.is_empty()||candidates.static_ordinals.len()>32{return Err(Error::Invalid);}
+        for (i,&v) in candidates.static_ordinals.iter().enumerate(){
+            if v==u16::MAX||candidates.static_ordinals[..i].contains(&v){return Err(Error::Invalid);}
+        }
+        let index=candidates.static_ordinals.iter().position(|&v|v==ordinal).ok_or(Error::Denied)?;
+        let mut at=HEADER;
+        for _ in 0..self.rule_count{
+            let hdr=&self.bytes[at..at+ENTRY];
+            let predicates=usize::from(get16(hdr,18)?);
+            let len=get32(hdr,24)? as usize;
+            let frame=&self.bytes[at..at+len];at+=len;
+            if get32(hdr,0)?!=rule{continue;}
+            for i in 0..predicates{
+                let off=ENTRY+i*PREDICATE;let field=usize::from(get16(frame,off)?)-1;
+                let value=get64(frame,off+8)?;
+                if !raw_fields[field].is_some_and(|v|match frame[off+2]{
+                    1=>v==value,2=>v<=value,3=>v>=value,_=>false,
+                }){return Err(Error::Denied);}
+            }
+            return Ok(RuleMatch{rule_id:rule,choice_policy:2,allowed_mask:1u32<<index,fallback_index:index as u16});
+        }
+        Err(Error::Denied)
+    }
+
     /// Ordered first matching rule; invalid/unavailable predicates do not match.
     /// A missing candidate intersection returns None and MUST force SAFE_EXEC
     /// for that target, never a fabricated fallback.
