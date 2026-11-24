@@ -42,6 +42,8 @@ pub struct Cpu0BudgetLedger {
     spent:[u64;6],
     role_spent:[u64;ROLE_COUNT],
     kernel_coordination_spent:u64,
+    lifetime_spent:[u64;6],
+    max_window_upper_ns:u64,
     operations_seen:u16,
     security_count:u8,
     decision_spent:[u64;15],
@@ -50,7 +52,7 @@ pub struct Cpu0BudgetLedger {
 impl Default for Cpu0BudgetLedger {fn default()->Self{Self::new()}}
 impl Cpu0BudgetLedger {
     pub const fn new()->Self{Self{
-        window:None,last_ns:0,serial:0,active:None,spent:[0;6],role_spent:[0;ROLE_COUNT],kernel_coordination_spent:0,
+        window:None,last_ns:0,serial:0,active:None,spent:[0;6],role_spent:[0;ROLE_COUNT],kernel_coordination_spent:0,lifetime_spent:[0;6],max_window_upper_ns:0,
         operations_seen:0,security_count:0,decision_spent:[0;15],
         ordinary_closed:false,
     }}
@@ -59,6 +61,50 @@ impl Cpu0BudgetLedger {
     pub fn kernel_coordination_spent(&self)->u64{self.kernel_coordination_spent}
     pub fn total_spent(&self)->Result<u64,Error>{
         self.spent.iter().try_fold(0u64,|sum,&v|sum.checked_add(v)).ok_or(Error::Exhausted)
+    }
+    /// Cumulative actual CPU time; never reset by a window or role reload.
+    pub fn lifetime_spent(&self,class:Class)->u64{self.lifetime_spent[class.index()]}
+    pub fn lifetime_total(&self)->Result<u64,Error>{
+        self.lifetime_spent.iter().try_fold(0u64,|sum,&v|sum.checked_add(v)).ok_or(Error::Exhausted)
+    }
+    pub fn max_window_upper_ns(&self)->u64{self.max_window_upper_ns}
+
+    /// Account a trusted continuous CPU0 interval outside all active turns.
+    /// These intervals use the preallocated 2ms EL1 coordination envelope.
+    /// They include scheduler bookkeeping and idle entry/return, not an
+    /// invented elapsed-wall-time cost. Call at each dispatch boundary.
+    ///
+    /// When the interval straddles aligned windows, its actual CPU debit
+    /// is made exactly once, to the later window. Check the conservative
+    /// upper bound in BOTH endpoint windows (and implicitly all empty
+    /// intervening windows). This can deny otherwise legal work, never
+    /// manufacture unused credit. It is not a measured per-window split.
+    pub fn account_coordination_gap(&mut self,cpu:usize,start_ns:u64,now_ns:u64,
+        actual:u64)->Result<Settlement,Error>{
+        if cpu!=CONTROL_CPU{return Err(Error::Denied);}
+        if self.active.is_some(){return Err(Error::Busy);}
+        if start_ns<self.last_ns||now_ns<start_ns{return Err(Error::Clock);}
+        self.time(start_ns)?;
+        self.enter_window(start_ns)?;
+        let idx=Class::Coordination.index();
+        let checked_upper=|q:&Self|->Result<(u64,bool),Error>{
+            let total=q.total_spent()?.checked_add(actual).ok_or(Error::Exhausted)?;
+            let class=q.spent[idx].checked_add(actual).ok_or(Error::Exhausted)?;
+            let kernel=q.kernel_coordination_spent.checked_add(actual).ok_or(Error::Exhausted)?;
+            Ok((total,total>LIMIT_NS||class>CLASS_LIMITS[idx]||kernel>KERNEL_COORDINATION_LIMIT_NS))
+        };
+        let (before,early_overrun)=checked_upper(self)?;
+        let crossed=start_ns/WINDOW_NS!=now_ns/WINDOW_NS;
+        self.time(now_ns)?;
+        self.enter_window(now_ns)?;
+        let (after,late_overrun)=checked_upper(self)?;
+        self.max_window_upper_ns=self.max_window_upper_ns.max(before).max(after);
+        self.spent[idx]=self.spent[idx].checked_add(actual).ok_or(Error::Exhausted)?;
+        self.kernel_coordination_spent=self.kernel_coordination_spent.checked_add(actual).ok_or(Error::Exhausted)?;
+        self.lifetime_spent[idx]=self.lifetime_spent[idx].checked_add(actual).ok_or(Error::Exhausted)?;
+        let overrun=early_overrun||late_overrun;
+        if overrun{self.ordinary_closed=true;}
+        Ok(Settlement{actual_ns:actual,overrun,crossed_window:crossed})
     }
     fn time(&mut self,now:u64)->Result<(),Error>{
         if now<self.last_ns{return Err(Error::Clock);}
@@ -173,6 +219,8 @@ impl Cpu0BudgetLedger {
         let overrun=actual>turn.reserved_ns || now>turn.deadline_ns;
         let idx=turn.class.index();
         let total=self.spent[idx].checked_add(actual).ok_or(Error::Exhausted)?;
+        let lifetime=self.lifetime_spent[idx].checked_add(actual).ok_or(Error::Exhausted)?;
+        let upper=self.total_spent()?.checked_add(actual).ok_or(Error::Exhausted)?;
         let decision=if turn.class==Class::Decision{
             Some(self.decision_spent[usize::from(turn.domain-1)].checked_add(actual).ok_or(Error::Exhausted)?)
         }else{None};
@@ -197,6 +245,8 @@ impl Cpu0BudgetLedger {
             if let Some((index,v))=role_total{self.role_spent[index]=v;}
             if let Some(v)=decision{self.decision_spent[usize::from(turn.domain-1)]=v;}
         }
+        self.lifetime_spent[idx]=lifetime;
+        self.max_window_upper_ns=self.max_window_upper_ns.max(upper).max(self.total_spent()?);
         self.active=None;
         if crossed||overrun{self.ordinary_closed=true;}
         Ok(Settlement{actual_ns:actual,overrun,crossed_window:crossed})
@@ -270,6 +320,25 @@ mod tests{
         let a=q.reserve_kernel(0,Class::Coordination,2_000_000,WINDOW_NS).unwrap();
         q.settle(0,a,1_000_000,WINDOW_NS+1_000_000).unwrap();
         assert_eq!(q.kernel_coordination_spent(),1_000_000);
+    }
+    #[test]
+    fn continuous_gap_accounting_charges_once_and_bounds_both_windows(){
+        let mut q=Cpu0BudgetLedger::new();
+        let a=q.account_coordination_gap(0,0,10,1_000_000).unwrap();
+        assert!(!a.overrun&&!a.crossed_window);
+        let b=q.account_coordination_gap(0,10,WINDOW_NS+10,900_000).unwrap();
+        assert!(!b.overrun&&b.crossed_window);
+        assert_eq!(q.lifetime_total(),Ok(1_900_000));
+        assert_eq!(q.kernel_coordination_spent(),900_000);
+        assert_eq!(q.max_window_upper_ns(),1_900_000);
+        let t=q.reserve_kernel(0,Class::Recovery,1000,WINDOW_NS+10).unwrap();
+        assert_eq!(q.account_coordination_gap(0,WINDOW_NS+10,WINDOW_NS+11,1),Err(Error::Busy));
+        q.settle(0,t,1000,WINDOW_NS+20).unwrap();
+        let c=q.account_coordination_gap(0,WINDOW_NS+20,2*WINDOW_NS+10,1_100_001).unwrap();
+        assert!(c.overrun&&c.crossed_window);
+        assert_eq!(q.lifetime_total(),Ok(3_001_001));
+        assert!(q.ordinary_closed());
+        assert_eq!(q.reserve_kernel(0,Class::Coordination,1,2*WINDOW_NS+10),Err(Error::Denied));
     }
     #[test]
     fn cpu_quota_and_wall_deadline_are_independently_enforced(){
