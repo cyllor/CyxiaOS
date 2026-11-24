@@ -406,7 +406,7 @@ mod tests{
         let action_bytes=[2u8,0u8];
         let actions=[FrozenAction{
             domain_id:1,target:Identity{id:17,generation:1},
-            candidate_set_hash:[1;32],static_ordinals:&static_ordinals,
+            candidate_set_hash:[1;32],static_ordinals:&static_ordinals,candidate_payloads:&[&[2,0],&[4,0]],
             raw_fields:[None;7],action_payload:&action_bytes
         }];
         let frozen=FrozenNativePlan {
@@ -505,7 +505,7 @@ mod tests{
         let mut d=decision(&plan,&rules_bytes);d[94..96].copy_from_slice(&4u16.to_le_bytes());
         let records=[d];let ordinals=[2,4];
         let actions=[FrozenAction{domain_id:4,target:Identity{id:17,generation:1},candidate_set_hash:[1;32],
-            static_ordinals:&ordinals,raw_fields:[None;7],action_payload:&payload}];
+            static_ordinals:&ordinals,candidate_payloads:&[&[2,0,8,0],&[8,0,16,0]],raw_fields:[None;7],action_payload:&payload}];
         let context=TrustedRegistrationScope{boot_epoch:1,controller_epoch:2,rules_generation:7,
             rules_hash:sha(&rules_bytes),base_plan_version:0,ledger_generation:5,core_generation:6,
             snapshot_seq:3,sampled_ns:100,now_ns:150};
