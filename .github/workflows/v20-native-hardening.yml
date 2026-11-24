@@ -14,11 +14,12 @@ permissions:
 jobs:
   exact-source:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0 # Allow the original, pinned V0.20 baseline tree to be archived.
       - name: Archive exact checked-out source and provenance
         run: |
           set -euo pipefail
@@ -26,7 +27,13 @@ jobs:
           git rev-parse HEAD > artifacts/v020-source/commit.txt
           git rev-parse HEAD^{tree} > artifacts/v020-source/tree.txt
           git archive --format=tar.gz --prefix=CyxiaOS-V0.20/ --output=artifacts/v020-source/source.tar.gz HEAD
-          sha256sum artifacts/v020-source/source.tar.gz > artifacts/v020-source/SHA256SUMS
+          # This immutable baseline is the requested V0.20 branch head at task start,
+          # not the working branch's WIP fixes. Exact tree identity must match.
+          base=0e832f6ed145d283bcbf08bd1ae680d04c1c1d4a
+          test "$(git rev-parse "$base^{tree}")" = 89ca1dd698979b1a9689f021d225843f73eaf7dd
+          git archive --format=tar.gz --prefix=CyxiaOS-V0.20-baseline/ --output=artifacts/v020-source/baseline.tar.gz "$base"
+          printf '%s\n' "$base" > artifacts/v020-source/baseline-commit.txt
+          (cd artifacts/v020-source && sha256sum source.tar.gz baseline.tar.gz > SHA256SUMS)
           test "$(cat VERSION)" = 0.20.0-dev
           git diff --check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
