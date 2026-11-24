@@ -140,6 +140,22 @@ pub unsafe fn enter_immutable(context: &mut Context, root: u64, asid: u8) {
     debug_assert!(root >> 48 == 0);
     unsafe { enter_inner(context, root | (u64::from(asid) << 48), true, false) };
 }
+/// Enter a pinned private root with a one-shot ASID. Unlike
+/// `enter_immutable`, this root may be retired, but never entered again.
+///
+/// # Safety
+/// The caller owns the stopped context, all reachable tables and all mapped
+/// frames. Every user leaf must be non-global; descriptors and frame ownership
+/// must remain immutable throughout the live instance. The ASID must be
+/// boot-unique, including retired roots. Before any reuse of frames or writes
+/// to a retired mapping, stop all users of the root, disconnect the root,
+/// complete an architectural inner-shareable TLBI with DSB/ISB, then scrub.
+/// This call does not itself prove retirement or DMA quiescence.
+pub unsafe fn enter_pinned_until_retired(context: &mut Context, root: u64, asid: u8) {
+    assert!(asid != 0 && root >> 48 == 0 && root.is_multiple_of(4096));
+    unsafe { enter_inner(context, root | (u64::from(asid) << 48), true, false) };
+}
+
 /// Enter a protection probe that must fault before executing any FP/SIMD
 /// instruction. Its verified immutable code contains no such opcode. The
 /// transition leaves both feature controls and the initialized FP/SIMD bank

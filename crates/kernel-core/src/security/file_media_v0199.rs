@@ -58,6 +58,13 @@ fn crc32c_byte(crc: u32, byte: u8) -> u32 {
     (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize]
 }
 
+/// CRC32C of an ordinary payload with no embedded checksum field.
+pub fn crc32c_payload(bytes:&[u8])->u32{
+    let mut crc=u32::MAX;
+    for &byte in bytes{crc=crc32c_byte(crc,byte);}
+    !crc
+}
+
 /// Reflected CRC32C (Castagnoli); the stored crc32c field itself reads zero.
 /// Visit each byte exactly once, with no per-byte bit loop or copied page.
 pub fn crc32c_zeroed(bytes: &[u8], offset: usize) -> Result<u32, Error> {
@@ -183,6 +190,67 @@ pub fn probe_snapshot_media_pair(
     Ok(newer)
 }
 
+/// Read-only verification of one complete baseline-v1 redo transaction.
+/// The journal owner supplies the stable records, physical log position,
+/// authenticated current superblock and protected state file's home block.
+/// A valid chain is NOT proof of actual FLUSH or of latest committed state.
+pub fn verify_state_redo_v1(
+    superblock:SuperblockV1, first_log_block:u32, state_home:u64,
+    begin:&[u8], redos:&[&[u8]], commit:&[u8], expected_state:&[u8],
+    txid:u64, commit_lsn:u64,
+)->Result<(),Error>{
+    use sha2::{Digest,Sha256};
+    let n=redos.len();
+    if !(1..=128).contains(&n) || !(2..=4097).contains(&first_log_block)
+        || first_log_block.checked_add(2+2*n as u32).is_none_or(|end|end>4098)
+        || !(u64::from(DATA_START)..u64::from(BLOCK_COUNT)).contains(&state_home)
+        || expected_state.len()!=SUPER_BYTES || superblock.fs_uuid==[0;16]
+        || superblock.generation==0 || superblock.log_epoch==0 || txid==0
+    {return Err(Error::Invalid);}
+    fn record(b:&[u8],kind:u16,length:usize,padded:usize,txid:u64,epoch:u64,lsn:u64)->Result<(),Error>{
+        if b.len()!=padded || le32(b,0)?!=0x4359_4c47 || le16(b,4)?!=1
+            || le16(b,6)?!=kind || le32(b,8)?!=length as u32
+            || le64(b,16)?!=txid || le64(b,24)?!=lsn || lsn==0
+            || le64(b,32)?!=epoch || le32(b,60)?!=0
+            || le32(b,56)?!=crc32c_zeroed(&b[..64],56)?
+            || le32(b,12)?!=crc32c_payload(&b[64..length])
+            || b[length..].iter().any(|x|*x!=0)
+            || (kind!=2 && b[40..56].iter().any(|x|*x!=0))
+        {return Err(Error::Invalid);}
+        Ok(())
+    }
+    let begin_lsn=commit_lsn.checked_sub(n as u64+1).ok_or(Error::Invalid)?;
+    if begin_lsn<=superblock.checkpoint_lsn{return Err(Error::Stale);}
+    record(begin,1,80,4096,txid,superblock.log_epoch,begin_lsn)?;
+    record(commit,3,128,4096,txid,superblock.log_epoch,commit_lsn)?;
+    if le32(begin,64)?!=n as u32 || le32(begin,68)?!=0
+        || le64(begin,72)?!=4096*n as u64 || le64(commit,64)?!=txid
+        || le64(commit,72)?!=begin_lsn || le64(commit,80)?!=commit_lsn-1
+        || le32(commit,88)?!=n as u32 || le32(commit,92)?!=0
+    {return Err(Error::Conflict);}
+    let mut homes=[0u64;128];
+    let mut ordered=Sha256::new();
+    let mut found=false;
+    for (i,b) in redos.iter().enumerate(){
+        record(b,2,4160,8192,txid,superblock.log_epoch,begin_lsn+i as u64+1)?;
+        let home=le64(b,40)?;
+        if !(u64::from(BITMAP_START)..u64::from(BLOCK_COUNT)).contains(&home)
+            || homes[..i].contains(&home)
+            || le32(b,48)?!=i as u32 || le32(b,52)?!=n as u32
+        {return Err(Error::Conflict);}
+        homes[i]=home;
+        let image=&b[64..4160];
+        ordered.update(home.to_le_bytes());ordered.update(image);
+        if home==state_home{
+            if image!=expected_state{return Err(Error::Conflict);}
+            found=true;
+        }
+    }
+    let digest:[u8;32]=ordered.finalize().into();
+    if !found || digest.as_slice()!=&commit[96..128]{return Err(Error::Conflict);}
+    Ok(())
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct FileReceiptV4 {
     pub fs_uuid:[u8;16],
@@ -270,6 +338,41 @@ impl FileReceiptV4 {
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn baseline_state_redo_requires_complete_ordered_chain(){
+        use sha2::{Digest,Sha256};
+        fn put16(b:&mut[u8],i:usize,v:u16){b[i..i+2].copy_from_slice(&v.to_le_bytes());}
+        fn put32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
+        fn put64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
+        fn seal(b:&mut[u8],kind:u16,len:usize,lsn:u64){
+            put32(b,0,0x4359_4c47);put16(b,4,1);put16(b,6,kind);
+            put32(b,8,len as u32);put64(b,16,7);put64(b,24,lsn);put64(b,32,2);
+            let p=cyxia_prototype::storage::crc32c(&b[64..len]);put32(b,12,p);
+            let h=crc32c_zeroed(&b[..64],56).unwrap();put32(b,56,h);
+        }
+        let sb=SuperblockV1{fs_uuid:[1;16],generation:2,checkpoint_lsn:10,log_epoch:2};
+        let state=[0x5au8;4096];
+        let home=7000u64;
+        let mut begin=[0u8;4096];put32(&mut begin,64,1);put64(&mut begin,72,4096);
+        seal(&mut begin,1,80,11);
+        let mut redo=[0u8;8192];put64(&mut redo,40,home);put32(&mut redo,52,1);
+        redo[64..4160].copy_from_slice(&state);seal(&mut redo,2,4160,12);
+        let mut commit=[0u8;4096];put64(&mut commit,64,7);put64(&mut commit,72,11);
+        put64(&mut commit,80,12);put32(&mut commit,88,1);
+        let mut digest=Sha256::new();digest.update(home.to_le_bytes());digest.update(&state);
+        commit[96..128].copy_from_slice(&digest.finalize());seal(&mut commit,3,128,13);
+        let check=|sb,first,home,redo:&[u8],commit:&[u8],image:&[u8]|
+            verify_state_redo_v1(sb,first,home,&begin,&[redo],commit,image,7,13);
+        assert_eq!(check(sb,2,home,&redo,&commit,&state),Ok(()));
+        assert_eq!(check(sb,4096,home,&redo,&commit,&state),Err(Error::Invalid));
+        assert_eq!(check(SuperblockV1{checkpoint_lsn:11,..sb},2,home,&redo,&commit,&state),Err(Error::Stale));
+        assert_eq!(check(sb,2,home+1,&redo,&commit,&state),Err(Error::Conflict));
+        let mut bad=redo;bad[64]^=1;
+        assert_eq!(check(sb,2,home,&bad,&commit,&state),Err(Error::Invalid));
+        let mut bad=commit;bad[96]^=1;seal(&mut bad,3,128,13);
+        assert_eq!(check(sb,2,home,&redo,&bad,&state),Err(Error::Conflict));
+        assert_eq!(check(sb,2,home,&redo,&commit,&[0u8;4096]),Err(Error::Conflict));
+    }
     fn super_v1()->[u8;SUPER_BYTES] {
         let mut b=[0u8;SUPER_BYTES];
         b[0..4].copy_from_slice(&SUPER_MAGIC.to_le_bytes());
@@ -319,6 +422,8 @@ mod tests{
     }
     #[test]
     fn crc_matches_bitwise_reference_and_real_legacy_encoder() {
+        assert_eq!(crc32c_payload(b"123456789"),0xe306_9283);
+        assert_eq!(crc32c_payload(&[]),0);
         // Compare with the independent old bitwise calculation, including
         // offset zero, unaligned fields, the last four bytes and overflow.
         fn reference(b: &[u8], at: usize) -> u32 {

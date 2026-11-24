@@ -1,0 +1,237 @@
+# Native bring-up only. Production G0 remains BLOCKED without durable identity,
+# eight fully operational services, resource execution and real restart proof.
+name: V0.20 eight native ABI3 package bring-up
+on:
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - '.github/workflows/v20-native-eight-role-bringup.yml'
+      - 'user/v0199-control/**'
+      - 'kernel/build/v0199_roles.rs'
+      - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
+      - 'crates/kernel-core/src/control_plane/role_budget_v0199.rs'
+      - 'tools/verify_v0199_eight_packages.py'
+      - 'tools/verify_smp.py'
+      - 'kernel/Cargo.toml'
+      - 'crates/arch-aarch64/src/user.rs'
+      - 'crates/control-model/src/native_v0199.rs'
+      - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
+      - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
+      - 'tools/verify_v0199_epoch_disk.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v020-eight-packages-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  arm-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        ram: [256, 1024]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build exact independently linked packages and kernel
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/eight-native/packages
+          git rev-parse HEAD > artifacts/eight-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/eight-native/tree.txt
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          feature=v0199-control-bringup
+          if [ '${{ matrix.ram }}' = 1024 ]; then feature=v0199-control-bringup-1g; fi
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$feature" 2>&1 | tee artifacts/eight-native/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/eight-native/kernel.elf
+          catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
+          test "$(printf '%s\n' "$catalog" | wc -l)" = 1
+          source_dir=$(dirname "$catalog")
+          cp "$source_dir"/v0199-role-*.elf "$source_dir"/v0199-role-*.relative.bin "$catalog" artifacts/eight-native/packages/
+          (cd artifacts/eight-native; sha256sum kernel.elf packages/* > image.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-eight-package-build-${{ matrix.ram }}m-${{ github.sha }}
+          path: artifacts/eight-native/
+          retention-days: 7
+  qemu-accounting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build pinned QEMU with exact per-vCPU accounting patch
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv
+          mkdir -p artifacts/eight-qemu
+          sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > artifacts/eight-qemu/patch.sha256
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          git -C "$RUNNER_TEMP/qemu-source" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/qemu-source" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" diff --binary > artifacts/eight-qemu/applied.patch
+          git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD > artifacts/eight-qemu/upstream.txt
+          cd "$RUNNER_TEMP/qemu-source"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/eight-qemu/configure.log"
+          ninja -C build qemu-system-aarch64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/eight-qemu/build.log"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/eight-qemu/bin"
+          cp build/qemu-system-aarch64 "$GITHUB_WORKSPACE/artifacts/eight-qemu/bin/"
+          cd "$GITHUB_WORKSPACE/artifacts/eight-qemu"
+          bin/qemu-system-aarch64 --version > version.txt
+          sha256sum bin/qemu-system-aarch64 > binary.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-eight-accounting-qemu-${{ github.sha }}
+          path: artifacts/eight-qemu/
+          retention-days: 7
+  native-eight-packages:
+    needs: [arm-packages,qemu-accounting]
+    strategy:
+      fail-fast: false
+      matrix:
+        ram: [256, 1024]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-eight-package-build-${{ matrix.ram }}m-${{ github.sha }}
+          path: artifacts/eight-native
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-eight-accounting-qemu-${{ github.sha }}
+          path: artifacts/eight-qemu
+      - name: Verify exact package and accounting binary provenance, run native guest
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          test "$(cat artifacts/eight-native/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/eight-native; sha256sum -c image.sha256)
+          (cd artifacts/eight-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/eight-qemu/patch.sha256
+          status=0
+          for attempt in 1 2 3; do
+            if PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_eight_packages.py \
+              --elf artifacts/eight-native/kernel.elf --packages artifacts/eight-native/packages \
+              --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
+              --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
+              --ram-mib '${{ matrix.ram }}' \
+              --output "artifacts/eight-native/capture-$attempt" 2>&1 | tee "artifacts/eight-native/verify-$attempt.log"; then
+              :
+            else
+              status=1
+            fi
+          done
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-eight-native-evidence-${{ matrix.ram }}m-${{ github.sha }}
+          path: artifacts/eight-native/
+          retention-days: 7
+
+  host-model-epoch-components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compile and run new current-model and epoch journal tests
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/epoch-components
+          cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/epoch-components/model.log
+          cargo test --locked --offline -p cyxia-kernel-core epoch_redo_v0199 2>&1 | tee artifacts/epoch-components/redo.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-model-epoch-components-${{ github.sha }}
+          path: artifacts/epoch-components/
+          retention-days: 7
+  arm-epoch-disk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build separate 1GiB native epoch scratch-disk fixture
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/epoch-disk
+          git rev-parse HEAD > artifacts/epoch-disk/commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/epoch-disk/kernel.elf
+          (cd artifacts/epoch-disk; sha256sum kernel.elf > image.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-epoch-disk-build-${{ github.sha }}
+          path: artifacts/epoch-disk/
+          retention-days: 7
+  native-epoch-disk:
+    needs: [arm-epoch-disk,qemu-accounting]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-epoch-disk-build-${{ github.sha }}
+          path: artifacts/epoch-disk
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-eight-accounting-qemu-${{ github.sha }}
+          path: artifacts/eight-qemu
+      - name: Real FLUSH and two distinct force-stopped native QEMU processes
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          test "$(cat artifacts/epoch-disk/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/epoch-disk; sha256sum -c image.sha256)
+          (cd artifacts/eight-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/eight-qemu/patch.sha256
+          PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py \
+            --elf artifacts/epoch-disk/kernel.elf \
+            --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
+            --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
+            --output artifacts/epoch-disk/capture 2>&1 | tee artifacts/epoch-disk/verify.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-epoch-disk-evidence-${{ github.sha }}
+          path: artifacts/epoch-disk/
+          retention-days: 7

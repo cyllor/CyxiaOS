@@ -49,6 +49,12 @@ smp-selftest = ["selftest"]
 # Dedicated V0.19.9 4-vCPU native CPU0 EL0 role/TTBR isolation fixture.
 # Not a certification of the 8 real control services or G4.
 v0199-cpu0-role-selftest = ["smp-selftest"]
+# Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
+v0199-control-bringup = ["v0199-cpu0-role-selftest"]
+# Same diagnostic program inventory with the normative RAM topology; not G0.
+v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
+# Separate native scratch journal, never a production mounted filesystem.
+v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.

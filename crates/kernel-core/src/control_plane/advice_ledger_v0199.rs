@@ -102,11 +102,38 @@ impl EvidenceLedger{
         self.last_ns=trusted.now_ns;
         Ok(AdviceResult::Recorded)
     }
+    /// Controller-side read of the exact admitted AdviceKey. It is not
+    /// a capability or a new inference. The decision gate independently
+    /// checks the current authority and commits the disposition only after
+    /// all registration checks pass.
+    pub(super) fn admitted_wire(&self,actor:Identity,key:AdviceKey)->Result<[u8;ADVICE_BYTES],Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        self.rows.iter().flatten().find(|row|row.key==key && !row.has_terminal)
+            .map(|row|row.advice_wire).ok_or(Error::Stale)
+    }
+    /// CONTROL_AUX observation/expiry path: states 3..6 only. A matching
+    /// DecisionRecord digest is not evidence of a registered decision.
     pub fn finalize(
-        &mut self,actor:Identity,disposition:&[u8],
-        decision:Option<&[u8]>,
-        // Trusted monotonic timestamp supplied by the serialized EL1 owner,
-        // not extracted from the copied disposition itself.
+        &mut self,actor:Identity,disposition:&[u8],decision:Option<&[u8]>,now_ns:u64,
+    )->Result<AdviceResult,Error>{
+        if actor!=self.controller && actor!=self.supervisor{return Err(Error::Denied);}
+        let disp=AdviceDispositionV1::decode(disposition)?;
+        if matches!(disp.state,1|2)||decision.is_some(){return Err(Error::Denied);}
+        self.finalize_inner(actor,disposition,None,now_ns)
+    }
+    /// Called by the protected decision registration gate ONLY after all
+    /// independent rule, model, candidate, identity and sequence checks.
+    /// State 2 stays closed until an atomic reason7 fallback gate exists.
+    pub(super) fn finalize_registered_adoption(
+        &mut self,actor:Identity,disposition:&[u8],decision:&[u8;DECISION_BYTES],now_ns:u64,
+    )->Result<AdviceResult,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        if AdviceDispositionV1::decode(disposition)?.state!=1{return Err(Error::NotReady);}
+        self.finalize_inner(actor,disposition,Some(decision),now_ns)
+    }
+    fn finalize_inner(
+        &mut self,actor:Identity,disposition:&[u8],decision:Option<&[u8]>,
+        // Trusted monotonic timestamp supplied by the serialized EL1 owner.
         now_ns:u64,
     )->Result<AdviceResult,Error>{
         if actor!=self.controller && actor!=self.supervisor{return Err(Error::Denied);}
@@ -157,8 +184,14 @@ impl EvidenceLedger{
         self.last_ns=now_ns;
         Ok(AdviceResult::Finalized)
     }
-    pub fn consume(
-        &mut self,actor:Identity,key:AdviceKey
+    /// Release a terminal slot only after the independent EL1 evidence
+    /// owner verifies external custody of the exact admitted and disposition
+    /// bytes (and, for a decision-bearing disposition, the linked registered
+    /// DecisionRecord). An error leaves the original evidence and credit
+    /// intact. The callback is a trusted mechanism, never an EL0 boolean.
+    pub fn consume_verified(
+        &mut self,actor:Identity,key:AdviceKey,
+        verify_custody:impl FnOnce(&AdviceEvidence,&[u8;ADVICE_BYTES],&[u8;DISPOSITION_BYTES])->Result<(),Error>,
     )->Result<AdviceEvidence,Error>{
         if actor!=self.supervisor{return Err(Error::Denied);}
         let at=self.rows.iter().position(|row|row.is_some_and(|v|v.key==key))
@@ -170,6 +203,7 @@ impl EvidenceLedger{
             key,advice_hash:row.advice_hash,
             disposition_hash:row.disposition_hash,state,
         };
+        verify_custody(&evidence,&row.advice_wire,&row.disposition_wire)?;
         self.rows[at]=None; // key high-water stays burned
         Ok(evidence)
     }
@@ -257,16 +291,23 @@ mod tests {
         assert_eq!(ledger.pending(),1);
         let disp=shadow_disposition(&frame);
         assert_eq!(ledger.finalize(OPERATIONS,&disp,None,150),Err(Error::Denied));
-        assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{
+        assert_eq!(ledger.consume_verified(SUPERVISOR,AdviceKey{
             boot_epoch:1,advisor_epoch:1,advice_seq:1
+        },|_,_,_|Ok(())),Err(Error::NotReady));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.consume_verified(OPERATIONS,AdviceKey{
+            boot_epoch:1,advisor_epoch:1,advice_seq:1
+        },|_,_,_|Ok(())),Err(Error::Denied));
+        let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        assert_eq!(ledger.consume_verified(SUPERVISOR,key,|e,a,d|{
+            assert_eq!(e.key,key);assert_eq!(a,&frame);assert_eq!(d,&disp);
+            Err(Error::NotReady)
         }),Err(Error::NotReady));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.consume(OPERATIONS,AdviceKey{
-            boot_epoch:1,advisor_epoch:1,advice_seq:1
-        }),Err(Error::Denied));
-        let evidence=ledger.consume(SUPERVISOR,AdviceKey{
-            boot_epoch:1,advisor_epoch:1,advice_seq:1
+        assert_eq!(ledger.pending(),1);
+        let evidence=ledger.consume_verified(SUPERVISOR,key,|e,a,d|{
+            assert_eq!(e.advice_hash,digest(a));assert_eq!(e.disposition_hash,digest(d));
+            assert_eq!(a,&frame);assert_eq!(d,&disp);Ok(())
         }).unwrap();
         assert_eq!(evidence.state,5);
         assert_eq!(ledger.pending(),0);
@@ -290,7 +331,7 @@ mod tests {
         later.now_ns=201;
         assert_eq!(ledger.record(OPERATIONS,&frame,&later),Ok(AdviceResult::Finalized));
         assert_eq!(ledger.finalize(SUPERVISOR,&disp,None,201),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1}).unwrap().state,4);
+        assert_eq!(ledger.consume_verified(SUPERVISOR,AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1},|_,_,_|Ok(())).unwrap().state,4);
         assert_eq!(ledger.record(OPERATIONS,&frame,&later),Err(Error::Stale));
         assert!(EvidenceLedger::new(OPERATIONS,Identity{id:OPERATIONS.id,generation:2},SUPERVISOR,1,1).is_err());
     }

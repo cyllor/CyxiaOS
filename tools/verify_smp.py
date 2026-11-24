@@ -119,8 +119,23 @@ def validate(serial: bytes, page: bytes, cpu_count: int) -> dict:
             'business_progress_during_control_stop': stall[0][2] - stall[0][1]}
 
 
-def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None) -> dict:
-    require(1 <= timeout <= 60 and cpus in (1, 4), 'invalid execution budget/configuration')
+def boot_ram_mib(elf: bytes) -> int:
+    """Read the actual linked boot profile; never trust a user-provided RAM label."""
+    layout = inspect_elf(elf)
+    marker = symbol(elf, 'CYXIA_BOOT_PROFILE')
+    require(marker['size'] == 24, 'wrong boot profile size')
+    for seg in layout['loads']:
+        delta = marker['pa'] - seg['pa']
+        if 0 <= delta and delta + 24 <= seg['size']:
+            version, ram_mib, _pages = struct.unpack_from('<3Q', elf, seg['offset'] + delta)
+            require(version == 1 and ram_mib in (256, 512, 1024), 'invalid linked RAM profile')
+            return ram_mib
+    raise ValueError('boot profile not backed by loaded ELF bytes')
+
+
+def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None) -> dict:
+    require(1 <= timeout <= 60 and cpus in (1, 4) and ram_mib in (256, 1024),
+            'invalid execution budget/configuration')
     elf = elf.resolve(strict=True)
     output = output.resolve()
     require(not output.exists(), 'refuse to reuse evidence output')
@@ -140,19 +155,39 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             location = profile(elf.read_bytes()) if acceptance is None else acceptance.profile(elf.read_bytes())
             if acceptance is not None:
                 report.update(acceptance.metadata())
+            if acceptance is not None:
+                require(boot_ram_mib(elf.read_bytes()) == ram_mib, 'ELF/QEMU RAM profile mismatch')
             binary = shutil.which('qemu-system-aarch64')
             require(binary is not None, 'qemu-system-aarch64 is missing')
             version = subprocess.check_output([binary, '--version'], timeout=10, text=True)
-            require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
-                    'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
+            # The ordinary SMP fixtures keep their exact upstream version
+            # gate. A specialized accounting verifier additionally requires
+            # exact immutable patched-binary and source-patch SHA evidence.
+            qemu_check = getattr(acceptance, 'verify_qemu', None)
+            if qemu_check is not None:
+                qemu_check(Path(binary), version)
+            else:
+                require(version.splitlines()[0] in ('QEMU emulator version 10.2.2',
+                        'QEMU emulator version 10.2.2 (v10.2.2)'), 'unverified QEMU version')
             report['qemu_version'] = version
             report['qemu_sha256'] = sha(Path(binary))
             path = str(Path(td) / 'q.sock')
             args = [binary, '-machine', 'virt-10.2,gic-version=2,secure=off,virtualization=off',
-                    '-cpu', 'cortex-a53', '-smp', str(cpus), '-m', '256M', '-accel', 'tcg,thread=multi',
+                    '-cpu', 'cortex-a53', '-smp', str(cpus), '-m', f'{ram_mib}M', '-accel', 'tcg,thread=multi',
                     '-display', 'none', '-monitor', 'none', '-nic', 'none',
                     '-chardev', 'ringbuf,id=cyxlog,size=1048576', '-serial', 'chardev:cyxlog',
                     '-qmp', f'unix:{path},server=on,wait=off', '-kernel', str(elf), '-no-reboot']
+            if scratch_disk is not None:
+                require(getattr(acceptance, 'scratch_epoch_disk', False) and ram_mib == 1024,
+                        'disk restricted to explicit native epoch scratch fixture')
+                require(not scratch_disk.is_symlink(), 'scratch disk must not be a symlink')
+                scratch_disk = scratch_disk.resolve(strict=True)
+                require(scratch_disk.is_file() and scratch_disk.stat().st_size == 512*1024*1024
+                        and ',' not in str(scratch_disk), 'invalid scratch image')
+                report['scratch_disk_before_sha256'] = sha(scratch_disk)
+                args += ['-global', 'virtio-mmio.force-legacy=false',
+                         '-drive', f'file={scratch_disk},if=none,id=epoch,format=raw,cache=none',
+                         '-device', 'virtio-blk-device,drive=epoch']
             report['argv'] = args
             proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
             end = started + timeout
@@ -167,6 +202,12 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
             qmp.execute('qmp_capabilities')
             actual_cpus = qmp.execute('query-cpus-fast')
             report['qmp_cpus'] = actual_cpus
+            if acceptance is not None:
+                memory = qmp.execute('query-memory-size-summary')
+                report['qmp_memory'] = memory
+                require(memory['base-memory'] == ram_mib * 1024 * 1024 and memory.get('plugged-memory', 0) == 0,
+                        'QMP RAM topology disagrees with linked boot profile')
+                report['guest_ram_mib'] = ram_mib
             while time.monotonic() < end:
                 require(proc.poll() is None, 'QEMU exited before acceptance')
                 value = qmp.execute('ringbuf-read', {'device': 'cyxlog', 'size': 1048576, 'format': 'base64'})
@@ -174,18 +215,38 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                 raw.extend(data)
                 require(len(raw) <= 2 * 1024 * 1024, 'serial budget exceeded')
                 for frame in decoder.feed(data): decoded.extend(frame)
+                if b'V0199_BOOTSTRAP_OVERRUN' in decoded:
+                    raise ValueError('native CPU0 execution overrun (see framed UART)')
                 if b'FAIL' in decoded or b'SMP_ERROR' in decoded: raise ValueError('guest failure')
                 completion = b'SMP_SELFTEST_PASS cpus=4\n' if acceptance is None else acceptance.completion
                 if completion in decoded:
                     qmp.execute('stop')
                     qmp.execute('pmemsave', {'val': location['pa'], 'size': 4096,
                                             'filename': str(output / 'native-page.bin')})
+                    if getattr(acceptance, 'post_uart_seal', False):
+                        # The final UART frame is itself inside the metered
+                        # interval. Resume an incompletely sealed memory row;
+                        # no unsealed prefix can pass the independent checker.
+                        page = (output / 'native-page.bin').read_bytes()
+                        require(len(page) == 4096, 'incomplete seal page')
+                        if struct.unpack_from('<Q', page, 16)[0] != 1:
+                            qmp.execute('cont')
+                            time.sleep(.001)
+                            continue
                     require(decoder.loss == 0 and decoder.corrupt == 0 and not decoder.buffer,
                             'incomplete/corrupt framed UART transport')
                     validator = validate if acceptance is None else acceptance.validate
                     report['observations'] = validator(bytes(decoded), (output / 'native-page.bin').read_bytes(), len(actual_cpus))
                     require(sha(elf) == report['elf_sha256'], 'ELF changed during guest run')
                     require(before == manifest(), 'source changed during guest run')
+                    if scratch_disk is not None:
+                        # Force a new QEMU process, not guest reset or graceful
+                        # device shutdown that could hide a missing guest FLUSH.
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        require(proc.returncode == -9, 'scratch VM not forcibly stopped')
+                        report['forced_process_stop'] = True
+                        report['scratch_disk_after_sha256'] = sha(scratch_disk)
                     report['status'] = 'PASS'
                     report['native_smp_mechanism_verified'] = True
                     if acceptance is not None:

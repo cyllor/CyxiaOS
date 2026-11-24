@@ -89,3 +89,9 @@ pub mod service_restart;
 
 pub mod task_admission;
 pub mod role_manifest_v0199;
+
+pub mod role_budget_v0199;
+
+pub mod feedback_v0199;
+
+pub mod action_schema_v2;

@@ -32,3 +32,7 @@ pub mod syscall_v3;
 
 #[cfg(test)]
 mod integration_tests;
+
+pub mod durable_role_epoch_v0199;
+
+pub mod epoch_redo_v0199;

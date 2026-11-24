@@ -4,3 +4,6 @@
 //! Inference is pure integer arithmetic; no kernel service is invoked here.
 pub mod abi;
 pub mod model;
+
+// Current local snapshot/feature/integer inference contract (no authority).
+pub mod native_v0199;
