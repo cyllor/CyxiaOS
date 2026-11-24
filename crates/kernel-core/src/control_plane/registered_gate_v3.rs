@@ -1239,10 +1239,17 @@ mod tests {
         // CONTROL_AUX must not create the audit fact ADOPTED merely from
         // canonical paired bytes, even when the caller is the controller.
         assert_eq!(ledger.finalize(CONTROLLER,&disp,Some(&rec),150),Err(Error::Denied));
-        assert_eq!(ledger.consume(SUPERVISOR,key),Err(Error::NotReady));
+        assert_eq!(ledger.consume_verified(SUPERVISOR,key,|_,_,_|panic!("unregistered decision")),Err(Error::NotReady));
         assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::Frozen));
         assert_eq!(ledger.admitted_wire(CONTROLLER,key),Err(Error::Stale));
-        assert_eq!(ledger.consume(SUPERVISOR,key).unwrap().state,1);
+        assert_eq!(ledger.consume_verified(SUPERVISOR,key,|_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(ledger.pending(),1);
+        assert_eq!(ledger.consume_verified(SUPERVISOR,key,|e,a,d|{
+            assert_eq!(a,&advice);assert_eq!(d,&disp);
+            assert_eq!(e.disposition_hash,sha256(d));
+            assert_eq!(AdviceDispositionV1::decode(d).unwrap().decision_digest,sha256(&rec));
+            Ok(())
+        }).unwrap().state,1);
         assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::ExactRetry));
         assert_eq!(gate.publish_assisted_once(ops,&plan,&rec,&profile,local,ctx,&allowed,||panic!("AI cannot publish")),Err(Error::Denied));
         assert_eq!(gate.publish_assisted_once(PUBLISHER,&plan,&rec,&profile,local,ctx,&shadow,||panic!("SHADOW cannot publish")),Err(Error::Denied));
