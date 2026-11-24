@@ -137,6 +137,7 @@ struct Service {
     stops: usize,
     start_unknown: bool,
     fail: bool,
+    running_error: Option<Error>,
 }
 impl RecoveryBackend for Service {
     fn close_admission(&mut self, _: ObjectKey) -> Result<(), Error> {
@@ -165,7 +166,7 @@ impl RecoveryBackend for Service {
         }
     }
     fn running(&mut self, _: ObjectKey, _: u64) -> Result<bool, Error> {
-        Ok(true)
+        self.running_error.map_or(Ok(true), Err)
     }
 }
 #[test]
@@ -190,6 +191,24 @@ fn recovery_unknown_start_is_queried_not_repeated() {
     assert_eq!(again.generation, 2);
     assert_eq!(backend.starts, 1);
 }
+
+#[test]
+fn recovery_failed_observation_keeps_issued_start_owned_and_rejects_clock_rewind() {
+    let mut supervisor=RecoverySupervisor::new();
+    supervisor.register(key(),1).unwrap();
+    let mut backend=Service{running_error:Some(Error::Auth),..Service::default()};
+    supervisor.begin(apply(1),1,0).unwrap();
+    for now in 1..=6 {supervisor.poll(apply(1),now,&mut backend).unwrap();}
+    assert_eq!(supervisor.query(apply(1)).unwrap().state,ExecutionState::Unknown);
+    assert_eq!(backend.starts,1);
+    assert_eq!(supervisor.poll(apply(1),5,&mut backend),Err(Error::Range));
+    assert_eq!(supervisor.begin(apply(2),1,1_000_000_001),Err(Error::Busy));
+    assert_eq!(supervisor.recover_stopped(key()),Err(Error::Busy));
+    backend.running_error=None;
+    assert_eq!(supervisor.poll(apply(1),7,&mut backend).unwrap().state,ExecutionState::Applied);
+    assert_eq!(backend.starts,1);
+}
+
 #[test]
 fn recovery_whitelist_failures_and_evicted_identity_fail_closed() {
     let mut s = RecoverySupervisor::new();
