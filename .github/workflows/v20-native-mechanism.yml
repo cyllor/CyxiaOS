@@ -4,7 +4,20 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 on:
   push:
     branches: [work/v020-native-control-safety]
+    paths:
+      - '.github/workflows/v20-native-mechanism.yml'
+      - 'kernel/**'
+      - 'crates/kernel-core/**'
+      - 'crates/prototype/**'
+      - 'crates/arch-aarch64/**'
+      - 'crates/arch-x86_64/**'
+      - 'tools/verify_smp.py'
+      - 'tools/x86_64.py'
   workflow_dispatch:
+
+concurrency:
+  group: v020-native-mechanism-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
