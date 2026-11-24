@@ -24,6 +24,7 @@ pub mod memory;
 pub mod network;
 pub mod device;
 pub mod syscall;
+pub mod syscall_v3;
 
 #[cfg(test)]
 mod integration_tests;
