@@ -45,6 +45,47 @@ pub struct SvcV3Bridge<'a> {
     pub decision_endpoint_cap:u64,
     pub publisher_cap:u64,
 }
+/// Existing 0x50 CONTROL_AUX op9/op12, not the separate registration
+/// endpoint. The native adapter supplies a current authenticated caller
+/// from the protected capability registry, and a checked output buffer.
+/// A read-only decision lookup never calls the publication adapter.
+pub fn read_registered_decision_rpc(
+    gate:&RegisteredDecisionGate,
+    table:&mut super::control_rpc_v1::RpcTable,
+    caller:super::control_rpc_v1::Caller,
+    native:VerifiedNativeCaller,args:[u64;6],copied:&[u8],
+    now_ns:u64,parent_deadline:u64,
+)->Result<super::control_rpc_v1::Frame,super::control_rpc_v1::Error>{
+    use super::control_rpc_v1::{Admission,Error as RpcError,Op,Request,State};
+    decode_v3(native.package_abi,0x50,args).map_err(|_|RpcError::Format)?;
+    if native.cpu!=0||caller.role!=8||caller.holder!=native.identity
+        ||caller.cap==0||caller.cap!=native.endpoint_cap||args[0]!=caller.cap||args[3]!=0{
+        return Err(RpcError::Auth);
+    }
+    if args[2]!=copied.len() as u64{return Err(RpcError::Format);}
+    let r=Request::decode(copied)?;
+    if !matches!(r.op,Op::DecisionRead|Op::Ack){return Err(RpcError::Auth);}
+    let (boot,epoch)=gate.publisher_scope(caller.holder).map_err(|_|RpcError::Auth)?;
+    if caller.boot_epoch!=boot{return Err(RpcError::Stale);}
+    let cap=usize::try_from(args[5]).map_err(|_|RpcError::Format)?;
+    match table.admit(caller,copied,cap,now_ns,parent_deadline,epoch,|_|Ok(()))?{
+        Admission::Replay(reply)|Admission::Acknowledged(reply)=>Ok(reply),
+        Admission::Execute(ticket)=>{
+            // Canonical op9 payload is exactly DecisionKey, three u64s.
+            let at=|i:usize|u64::from_le_bytes(r.payload[i..i+8].try_into().unwrap());
+            let record=gate.read_decision(caller.holder,at(0),at(8),at(16));
+            match record{
+                Ok(bytes)=>table.complete(ticket,State::Done,0,epoch,&bytes,||Ok(())),
+                Err(e)=>{
+                    let result=match e{Error::Denied=>RpcError::Auth,Error::Stale=>RpcError::Stale,
+                        Error::NotReady=>RpcError::Again,_=>RpcError::Format};
+                    table.complete(ticket,State::Done,result as i32,epoch,&[],||Ok(()))
+                }
+            }
+        }
+    }
+}
+
 impl SvcV3Bridge<'_>{
     pub fn register_rule_only(
         &mut self,
