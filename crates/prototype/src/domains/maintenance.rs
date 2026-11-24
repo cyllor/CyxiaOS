@@ -25,6 +25,8 @@ struct Group {
     status: OptionalStatus,
     stamp: PolicyStamp,
     window: u64,
+    last_ns: u64,
+    carry_window: Option<u64>,
     carry_ns: u64,
 }
 pub struct BackgroundBudgets {
@@ -82,6 +84,8 @@ impl BackgroundBudgets {
             },
             stamp: PolicyStamp::default(),
             window: now / WINDOW_NS,
+            last_ns: now,
+            carry_window: None,
             carry_ns: 0,
         });
         Ok(())
@@ -89,16 +93,18 @@ impl BackgroundBudgets {
     fn refresh(&mut self, index: usize, now: u64) -> Result<(), Error> {
         let group = self.groups[index].as_mut().ok_or(Error::Stale)?;
         let window = now / WINDOW_NS;
-        if window < group.window {
+        if now < group.last_ns || window < group.window {
             return Err(Error::Range);
         }
+        group.last_ns = now;
         if window > group.window {
             if self.debits.iter().flatten().any(|d| d.key == group.key) {
                 group.status.freeze_admission = true;
                 return Err(Error::Busy);
             }
             group.window = window;
-            group.status.spent_ns = group.carry_ns;
+            group.status.spent_ns = if group.carry_window == Some(window) { group.carry_ns } else { 0 };
+            group.carry_window = None;
             group.carry_ns = 0;
             group.status.freeze_admission = group.status.overrun;
         }
@@ -218,7 +224,11 @@ impl BackgroundBudgets {
             .position(|d| *d == Some(debit))
             .ok_or(Error::Stale)?;
         let index = self.index(debit.key)?;
-        if finished_ns < debit.started_ns || actual_ns > finished_ns - debit.started_ns {
+        // Execution and monotonic wall time are independently measured in
+        // the native accounting adapter. A real debit must settle even when
+        // the CPU counter exceeds the wall delta. Charge overrun, do not leak
+        // an outstanding debit after the scheduler has retired its receipt.
+        if finished_ns < debit.started_ns {
             return Err(Error::Range);
         }
         let g = self.groups[index].as_mut().ok_or(Error::Stale)?;
@@ -227,10 +237,19 @@ impl BackgroundBudgets {
             .spent_ns
             .checked_add(actual_ns)
             .ok_or(Error::Overflow)?;
-        let carry = if finished_ns / WINDOW_NS > debit.window {
-            g.carry_ns.checked_add(actual_ns).ok_or(Error::Overflow)?
+        let completion_window = finished_ns / WINDOW_NS;
+        // Retain the most recent completion window explicitly. Out-of-order
+        // receipts still settle the original window; they cannot erase a
+        // later carry or charge that carry into an unrelated future window.
+        let (carry_window, carry) = if completion_window <= debit.window {
+            (g.carry_window, g.carry_ns)
         } else {
-            g.carry_ns
+            match g.carry_window {
+                Some(window) if window > completion_window => (g.carry_window, g.carry_ns),
+                Some(window) if window == completion_window =>
+                    (g.carry_window, g.carry_ns.checked_add(actual_ns).ok_or(Error::Overflow)?),
+                _ => (Some(completion_window), actual_ns),
+            }
         };
         g.status.reserved_ns = g
             .status
@@ -238,7 +257,9 @@ impl BackgroundBudgets {
             .checked_sub(debit.reserved_ns)
             .ok_or(Error::Conflict)?;
         g.status.spent_ns = spent;
+        g.carry_window = carry_window;
         g.carry_ns = carry;
+        g.last_ns = g.last_ns.max(finished_ns);
         self.debits[slot] = None;
         if actual_ns > debit.reserved_ns {
             g.status.overrun = true;
@@ -257,7 +278,7 @@ impl BackgroundBudgets {
     pub fn peek_status(&self, key: ObjectKey, now: u64) -> Result<OptionalStatus, Error> {
         let group = self.groups[self.index(key)?].ok_or(Error::Stale)?;
         let window = now / WINDOW_NS;
-        if window < group.window {
+        if now < group.last_ns || window < group.window {
             return Err(Error::Range);
         }
         let mut status = group.status;
@@ -265,7 +286,7 @@ impl BackgroundBudgets {
             if self.debits.iter().flatten().any(|debit| debit.key == key) {
                 return Err(Error::Busy);
             }
-            status.spent_ns = group.carry_ns;
+            status.spent_ns = if group.carry_window == Some(window) { group.carry_ns } else { 0 };
             status.freeze_admission = status.overrun;
         }
         if group.stamp.version != 0 && !group.stamp.live(now) {
