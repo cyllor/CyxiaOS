@@ -284,6 +284,29 @@ fn all_extra_roles_share_prepaid_budget_and_unknown_credit_cannot_reset_it() {
 }
 
 #[test]
+fn v0199_mandatory_and_optional_roles_share_exact_70ms_control_ceiling() {
+    let owners = Owners { extend: true };
+    let mut budget = ExtraBudget::new();
+    assert_eq!(MANDATORY_NS, 61_500_000);
+    assert_eq!(EXTRA_NS, 8_500_000);
+    assert_eq!(CONTROL_NS, MANDATORY_NS + EXTRA_NS);
+    budget.record_mandatory(0, MANDATORY_NS).unwrap();
+    let credit = budget
+        .reserve(Role::Validation, 1, 1, 1024 * 1024, 0, EXTRA_NS, &owners)
+        .unwrap();
+    budget.settle(credit, EXTRA_NS, EXTRA_NS).unwrap();
+    assert_eq!(budget.spent_ns(), EXTRA_NS);
+    assert_eq!(
+        budget.reserve(Role::Shadow, 1, 1, 1024 * 1024, EXTRA_NS, 1, &owners),
+        Err(Error::Budget)
+    );
+    // One additional nanosecond of actual mandatory work faults the ledger;
+    // the already spent optional work cannot be refunded on failure.
+    assert_eq!(budget.record_mandatory(EXTRA_NS, 1), Err(Error::Budget));
+    assert!(budget.faulted());
+}
+
+#[test]
 fn shadow_has_no_execution_permit_and_canary_lease_excludes_old_target_writes() {
     support::with_candidate(|candidate, old| {
         let binding = ModelBinding {
