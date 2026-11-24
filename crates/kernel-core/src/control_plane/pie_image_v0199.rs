@@ -92,7 +92,7 @@ impl<'a> PieImage<'a> {
     )->Result<Self,Error>{
         if bytes.len()<64 || bytes.len()>MAX_IMAGE_BYTES
             || expected_manifest_sha256==[0;32]
-            || bytes.get(0..4)!=Some(b"\x7fELF")
+            || bytes.get(0..4)!=Some(&b"\x7fELF"[..])
             || bytes[4]!=2 || bytes[5]!=1 || bytes[6]!=1
             || le16(bytes,16)?!=TYPE_DYN
             || le16(bytes,18)?!=MACHINE_AARCH64
@@ -132,7 +132,7 @@ impl<'a> PieImage<'a> {
                         || flags&!(PF_R|PF_W|PF_X)!=0
                         || flags&PF_R==0
                         || flags&(PF_W|PF_X)==(PF_W|PF_X)
-                        || (align!=PAGE_BYTES && align!=1)
+                        || align!=PAGE_BYTES
                         || va%PAGE_BYTES!=off%PAGE_BYTES
                         || !within(off,file,0,bytes.len() as u64)
                         || range_end(va,mem).is_err()
@@ -172,7 +172,7 @@ impl<'a> PieImage<'a> {
                     relro=Some((va,mem));
                 }
                 PT_NOTE=>{
-                    if flags&PF_W!=0 || !within(off,file,0,bytes.len() as u64)
+                    if flags&(PF_W|PF_X)!=0 || !within(off,file,0,bytes.len() as u64)
                         || file>64*1024
                     {return Err(Error::Invalid);}
                 }
@@ -238,6 +238,13 @@ impl<'a> PieImage<'a> {
             if value<el0_start as i128 || value>=el0_end as i128 {
                 return Err(Error::Denied);
             }
+            let value=value as u64;
+            if !self.loads[..self.load_count].iter().flatten().any(|seg|
+                randomized_base.checked_add(seg.virtual_address)
+                    .is_some_and(|mapped|within(
+                        value,1,mapped,mapped.saturating_add(seg.memory_bytes)
+                    ))
+            ) {return Err(Error::Denied);}
         }
         Ok(())
     }
