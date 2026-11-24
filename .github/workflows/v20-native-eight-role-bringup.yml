@@ -191,7 +191,10 @@ jobs:
           cargo fetch --locked
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/epoch-disk/kernel.elf
-          (cd artifacts/epoch-disk; sha256sum kernel.elf > image.sha256)
+          catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
+          test "$(printf '%s\n' "$catalog" | wc -l)" = 1
+          cp "$(dirname "$catalog")/v0199-role-7.elf" artifacts/epoch-disk/role7.elf
+          (cd artifacts/epoch-disk; sha256sum kernel.elf role7.elf > image.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -225,7 +228,7 @@ jobs:
           chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/eight-qemu/patch.sha256
           PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py \
-            --elf artifacts/epoch-disk/kernel.elf \
+            --elf artifacts/epoch-disk/kernel.elf --role7 artifacts/epoch-disk/role7.elf \
             --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
             --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
             --output artifacts/epoch-disk/capture 2>&1 | tee artifacts/epoch-disk/verify.log
