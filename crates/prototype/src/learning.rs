@@ -88,7 +88,7 @@ pub fn reward_schema() -> SchemaBinding {
 }
 
 pub fn learning_config() -> SchemaBinding {
-    binding(b"last_layer_clip_project_v1.3\0shape=64,32,16,1;frozen=W1,W2,b1,b2;train_min_per_family=8;validation_min_per_family=4;families=18;group=seed,workload,initial_image;split=exclusive;ordered_one_pass;init=wq/64,bq/256;bq_seed=-32768..32767;h=integer_hidden2/256;prediction=leftfold_j0..15(w*h)+b;binary64_RNE_noFMA;error=prediction-R;finite_before_clip;gradient=clip(error*h,-1,1),clip(error,-1,1);simultaneous_update=theta-gradient/256;project_w=-2..127/64;project_b=-128..32767/256;quantize_once_half_away=w*64,b*256;preserve_other_bytes;validation=full_integer_MLP_output/256;MSE=fixed_order_leftfold_square_divide;overall_tolerance=0;family_tolerance=1/65536;workspace_max=1048576;extra_control_ns_per_100ms=9000000")
+    binding(b"last_layer_clip_project_v1.3\0shape=64,32,16,1;frozen=W1,W2,b1,b2;train_min_per_family=8;validation_min_per_family=4;families=18;group=seed,workload,initial_image;split=exclusive;ordered_one_pass;init=wq/64,bq/256;bq_seed=-32768..32767;h=integer_hidden2/256;prediction=leftfold_j0..15(w*h)+b;binary64_RNE_noFMA;error=prediction-R;finite_before_clip;gradient=clip(error*h,-1,1),clip(error,-1,1);simultaneous_update=theta-gradient/256;project_w=-2..127/64;project_b=-128..32767/256;quantize_once_half_away=w*64,b*256;preserve_other_bytes;validation=full_integer_MLP_output/256;MSE=fixed_order_leftfold_square_divide;overall_tolerance=0;family_tolerance=1/65536;workspace_max=1048576;extra_control_ns_per_100ms=8500000")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
