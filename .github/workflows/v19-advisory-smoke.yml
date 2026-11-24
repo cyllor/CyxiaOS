@@ -69,6 +69,18 @@ jobs:
           head -c 32 /dev/zero > /tmp/cyxia-v019-echo-ci-identity/peer.pin
           CYXIA_LOCAL_ECHO_IDENTITY=/tmp/cyxia-v019-echo-ci-identity \
             cargo check --release --locked --offline -p cyxia-local-echo --features guest --target aarch64-unknown-none
+      - name: CI-only AArch64 Echo guest ELF link smoke (NOT a deployable image)
+        run: |
+          export CC_aarch64_unknown_none=clang
+          export CFLAGS_aarch64_unknown_none="--target=aarch64-none-elf -ffreestanding -fno-stack-protector -mno-outline-atomics -DRING_CORE_NOSTDLIBINC"
+          export RUSTFLAGS="-C relocation-model=static -C code-model=large -C strip=debuginfo"
+          # Uses CI test key solely inside this runner. Its ELF is NEVER
+          # installed on a CyxiaOS guest or attached to the source artifact.
+          CYXIA_LOCAL_ECHO_IDENTITY=/tmp/cyxia-v019-echo-ci-identity \
+            cargo build --release --locked --offline -p cyxia-local-echo --features guest --target aarch64-unknown-none
+          test -s target/aarch64-unknown-none/release/cyxia-local-echo
+          readelf -h target/aarch64-unknown-none/release/cyxia-local-echo | grep -q AArch64
+          readelf -l target/aarch64-unknown-none/release/cyxia-local-echo | grep -q LOAD
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)
