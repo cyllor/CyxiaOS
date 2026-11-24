@@ -184,8 +184,14 @@ impl EvidenceLedger{
         self.last_ns=now_ns;
         Ok(AdviceResult::Finalized)
     }
-    pub fn consume(
-        &mut self,actor:Identity,key:AdviceKey
+    /// Release a terminal slot only after the independent EL1 evidence
+    /// owner verifies external custody of the exact admitted and disposition
+    /// bytes (and, for a decision-bearing disposition, the linked registered
+    /// DecisionRecord). An error leaves the original evidence and credit
+    /// intact. The callback is a trusted mechanism, never an EL0 boolean.
+    pub fn consume_verified(
+        &mut self,actor:Identity,key:AdviceKey,
+        verify_custody:impl FnOnce(&AdviceEvidence,&[u8;ADVICE_BYTES],&[u8;DISPOSITION_BYTES])->Result<(),Error>,
     )->Result<AdviceEvidence,Error>{
         if actor!=self.supervisor{return Err(Error::Denied);}
         let at=self.rows.iter().position(|row|row.is_some_and(|v|v.key==key))
@@ -197,6 +203,7 @@ impl EvidenceLedger{
             key,advice_hash:row.advice_hash,
             disposition_hash:row.disposition_hash,state,
         };
+        verify_custody(&evidence,&row.advice_wire,&row.disposition_wire)?;
         self.rows[at]=None; // key high-water stays burned
         Ok(evidence)
     }
@@ -284,16 +291,23 @@ mod tests {
         assert_eq!(ledger.pending(),1);
         let disp=shadow_disposition(&frame);
         assert_eq!(ledger.finalize(OPERATIONS,&disp,None,150),Err(Error::Denied));
-        assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{
+        assert_eq!(ledger.consume_verified(SUPERVISOR,AdviceKey{
             boot_epoch:1,advisor_epoch:1,advice_seq:1
+        },|_,_,_|Ok(())),Err(Error::NotReady));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
+        assert_eq!(ledger.consume_verified(OPERATIONS,AdviceKey{
+            boot_epoch:1,advisor_epoch:1,advice_seq:1
+        },|_,_,_|Ok(())),Err(Error::Denied));
+        let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        assert_eq!(ledger.consume_verified(SUPERVISOR,key,|e,a,d|{
+            assert_eq!(e.key,key);assert_eq!(a,&frame);assert_eq!(d,&disp);
+            Err(Error::NotReady)
         }),Err(Error::NotReady));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.finalize(CONTROLLER,&disp,None,150),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.consume(OPERATIONS,AdviceKey{
-            boot_epoch:1,advisor_epoch:1,advice_seq:1
-        }),Err(Error::Denied));
-        let evidence=ledger.consume(SUPERVISOR,AdviceKey{
-            boot_epoch:1,advisor_epoch:1,advice_seq:1
+        assert_eq!(ledger.pending(),1);
+        let evidence=ledger.consume_verified(SUPERVISOR,key,|e,a,d|{
+            assert_eq!(e.advice_hash,digest(a));assert_eq!(e.disposition_hash,digest(d));
+            assert_eq!(a,&frame);assert_eq!(d,&disp);Ok(())
         }).unwrap();
         assert_eq!(evidence.state,5);
         assert_eq!(ledger.pending(),0);
@@ -317,7 +331,7 @@ mod tests {
         later.now_ns=201;
         assert_eq!(ledger.record(OPERATIONS,&frame,&later),Ok(AdviceResult::Finalized));
         assert_eq!(ledger.finalize(SUPERVISOR,&disp,None,201),Ok(AdviceResult::Finalized));
-        assert_eq!(ledger.consume(SUPERVISOR,AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1}).unwrap().state,4);
+        assert_eq!(ledger.consume_verified(SUPERVISOR,AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1},|_,_,_|Ok(())).unwrap().state,4);
         assert_eq!(ledger.record(OPERATIONS,&frame,&later),Err(Error::Stale));
         assert!(EvidenceLedger::new(OPERATIONS,Identity{id:OPERATIONS.id,generation:2},SUPERVISOR,1,1).is_err());
     }
