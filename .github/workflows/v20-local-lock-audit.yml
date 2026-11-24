@@ -1,0 +1,33 @@
+name: V0.20 local-only Cargo lock audit (diagnostic)
+on:
+  push:
+    branches: [work/v020-gap-local-only]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regenerate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+      - name: Resolve exact workspace lockfile and print delta
+        run: |
+          set -eu
+          cargo generate-lockfile
+          mkdir -p artifacts/v020-local-lock
+          git diff -- Cargo.lock | tee artifacts/v020-local-lock/lock.patch
+          cp Cargo.lock artifacts/v020-local-lock/Cargo.lock
+          sha256sum Cargo.lock > artifacts/v020-local-lock/Cargo.lock.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v020-local-lock-audit-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: artifacts/v020-local-lock/
