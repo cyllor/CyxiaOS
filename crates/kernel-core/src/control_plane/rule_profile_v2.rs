@@ -76,7 +76,7 @@ impl<'a> Profile<'a> {
             let len = usize::try_from(get32(hdr, 24)?).map_err(|_| Error::Invalid)?;
             let expected = ENTRY + PREDICATE * predicates + VALUE * values;
             if id <= previous_id || domain == 0 || domain > 15
-                || kind != 1 || target == 0 || policy > 2
+                || kind != 1 || policy > 2
                 || (policy == 1 && matches!(domain, 6 | 11 | 12 | 14))
                 || predicates > 8 || values == 0 || values > 32
                 || get16(hdr, 22)? != 0 || get32(hdr, 28)? != 0
@@ -97,20 +97,23 @@ impl<'a> Profile<'a> {
                 }
             }
             let mut ranks = 0u32;
-            let mut ordinals = 0u32;
+            // ActionSchema ordinals are per-family static u16 identifiers,
+            // NOT indexes into this 32-element candidate array. In particular
+            // a valid ordinal 32 or higher must not be rejected as an index.
+            let mut seen_ordinals = [u16::MAX; 32];
             for i in 0..values {
                 let start = ENTRY + predicates * PREDICATE + i * VALUE;
-                let ordinal = u32::from(get16(frame, start)?);
+                let ordinal = get16(frame, start)?;
                 let rank = u32::from(get16(frame, start + 2)?);
-                if ordinal >= 32 || rank >= values as u32
+                if ordinal == u16::MAX || rank >= values as u32
                     || get32(frame, start + 4)? != 0
                     || ranks & (1 << rank) != 0
-                    || ordinals & (1 << ordinal) != 0
+                    || seen_ordinals[..i].contains(&ordinal)
                 {
                     return Err(Error::Invalid);
                 }
                 ranks |= 1 << rank;
-                ordinals |= 1 << ordinal;
+                seen_ordinals[i] = ordinal;
             }
             previous_id = id;
             at += len;
@@ -129,18 +132,18 @@ impl<'a> Profile<'a> {
         raw_fields: [Option<u64>; 7],
         candidates: Candidates<'_>,
     ) -> Result<Option<RuleMatch>, Error> {
-        if domain == 0 || domain > 15 || target == 0
+        if domain == 0 || domain > 15
             || candidates.static_ordinals.is_empty()
             || candidates.static_ordinals.len() > 32
         {
             return Err(Error::Invalid);
         }
-        let mut seen = 0u32;
-        for &ordinal in candidates.static_ordinals {
-            if ordinal >= 32 || seen & (1 << ordinal) != 0 {
+        for (index, &ordinal) in candidates.static_ordinals.iter().enumerate() {
+            if ordinal == u16::MAX
+                || candidates.static_ordinals[..index].contains(&ordinal)
+            {
                 return Err(Error::Invalid);
             }
-            seen |= 1 << ordinal;
         }
         let mut at = HEADER;
         for _ in 0..self.rule_count {
@@ -169,6 +172,11 @@ impl<'a> Profile<'a> {
                     })
             });
             if !matches { continue; }
+            // An explicit offline TrialPermit is mandatory for choice_policy=2.
+            // This read-only ordinary-rule API has no TrialPermit input, hence
+            // it MUST NOT return a trial candidate or silently treat one as
+            // ordinary permission. A verified-trial entry point is separate.
+            if get16(hdr, 16)? == 2 { continue; }
             let mut allowed_mask = 0u32;
             let mut fallback_index = 0xffffu16;
             let mut best_rank = u16::MAX;
@@ -241,6 +249,43 @@ mod tests {
             Candidates { static_ordinals: &[1, 3] }).unwrap().is_none());
         assert!(profile.match_candidates(1, 44, [Some(7); 7],
             Candidates { static_ordinals: &[2] }).unwrap().is_none());
+    }
+    #[test]
+    fn static_ordinals_are_not_candidate_indices_and_target_zero_is_exact() {
+        let mut b = sample();
+        b[40..48].copy_from_slice(&0u64.to_le_bytes());
+        b[80..82].copy_from_slice(&1024u16.to_le_bytes());
+        b[88..90].copy_from_slice(&32768u16.to_le_bytes());
+        let profile = Profile::parse(&b).unwrap();
+        let outcome = profile.match_candidates(
+            1, 0, [Some(7); 7],
+            Candidates { static_ordinals: &[1024, 32768] }
+        ).unwrap().unwrap();
+        assert_eq!(outcome.allowed_mask, 0b11);
+        assert_eq!(outcome.fallback_index, 1);
+        assert!(profile.match_candidates(
+            1, 1, [Some(7); 7],
+            Candidates { static_ordinals: &[1024, 32768] }
+        ).unwrap().is_none());
+        assert!(profile.match_candidates(
+            1, 0, [Some(7); 7],
+            Candidates { static_ordinals: &[1024, 1024] }
+        ).is_err());
+        b[88..90].copy_from_slice(&1024u16.to_le_bytes());
+        assert!(Profile::parse(&b).is_err());
+        b[88..90].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(Profile::parse(&b).is_err());
+    }
+
+    #[test]
+    fn trial_rule_never_grants_an_ordinary_candidate_without_a_permit() {
+        let mut b = sample();
+        b[48..50].copy_from_slice(&2u16.to_le_bytes());
+        let p = Profile::parse(&b).unwrap();
+        assert!(p.match_candidates(
+            1, 22, [Some(7); 7],
+            Candidates { static_ordinals: &[1, 3] }
+        ).unwrap().is_none());
     }
     #[test]
     fn reject_old_version_wrong_length_unsafe_mode_and_reserved_bytes() {
