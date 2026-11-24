@@ -73,7 +73,6 @@ pub mod wire;
 pub mod dispatch;
 pub mod exchange;
 pub mod fixed;
-pub mod role_manifest_v0199;
 pub mod security_finding;
 pub mod rule_profile_v2;
 pub mod image;
@@ -84,3 +83,4 @@ pub mod service_image;
 pub mod service_restart;
 
 pub mod task_admission;
+pub mod role_manifest_v0199;
