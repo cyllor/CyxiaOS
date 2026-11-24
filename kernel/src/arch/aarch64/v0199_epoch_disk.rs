@@ -82,53 +82,14 @@ fn state(txid:u64)->SecurityStateStoreV2{
         security_min_generation:1,key_generation:1,isolated_service_bitmap:0,last_boot_epoch:(txid+1)/2,
         offline_config_generation:1,offline_config_hash:[0x5a;32],service_generations:generations}
 }
-fn root(space:usize)->u64{
-    phys(unsafe{core::ptr::addr_of!(ROOTS).cast::<Page>().add(space)} as u64)
-}
-fn run_client(space:usize)->user::Context{
-    let mut ctx=context(space);ctx.regs[2]=4;
-    for _ in 0..32{
-        execute(&mut ctx,space);
-        if ctx.kind==9{continue;}
-        assert_eq!(ctx.kind,8);assert_eq!(ctx.esr>>26,0x15);assert_eq!(ctx.esr&0xffff,4);
-        let data=unsafe{core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space)};
-        assert!(unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*data).0[1]))}>0);
-        return ctx;
-    }
-    panic!("native epoch fixture client never ran");
-}
-fn stop_client(space:usize,mut ctx:user::Context,boot:u64,generation:u64)
-    ->(StopEvidence,u64,u64,u64){
-    let fault=STACK-4096;
-    ctx.pc=fault;
-    let mut stopped=false;
-    for _ in 0..32{
-        execute(&mut ctx,space);
-        if ctx.kind==9{continue;}
-        assert_eq!(ctx.kind,8);assert_eq!(ctx.esr>>26,0x20);
-        assert_eq!(ctx.esr&0x3f,7);assert_eq!(ctx.far,fault);
-        stopped=true;break;
-    }
-    assert!(stopped);
-    let old_root=root(space);
-    // This fixture never grants a capability, DMA reference or a second
-    // thread to the client. Disconnect only this stopped root and complete
-    // inner-shareable TLBI before scrubbing its exclusively owned pages.
-    unsafe{
-        let table=core::ptr::addr_of_mut!(ROOTS).cast::<Page>().add(space);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*table).0[0]),0);
-        core::arch::asm!("dsb ishst","tlbi vmalle1is","dsb ish","isb",options(nostack));
-        assert_eq!(core::ptr::read_volatile(core::ptr::addr_of!((*table).0[0])),0);
-        for page in [core::ptr::addr_of_mut!(DATA_PAGES).cast::<Page>().add(space),
-            core::ptr::addr_of_mut!(USER_STACKS).cast::<Page>().add(space)]{
-            core::ptr::write_bytes(page.cast::<u8>(),0,4096);
-            assert!((*page).0.iter().all(|v|*v==0));
-        }
-    }
-    let mut h=Sha256::new();h.update(b"CYX/V0199/fixture-stop/v1");
-    for x in [boot,generation,old_root,ctx.esr,ctx.far]{h.update(x.to_le_bytes());}
+fn stop_security_package(boot:u64,generation:u64)
+    ->(StopEvidence,super::v0199_control_bringup::DiskSecurityRun){
+    let stopped=super::v0199_control_bringup::disk_security_run(generation,0,true);
+    let mut h=Sha256::new();h.update(b"CYX/V0199/role7-stop/v1");
+    h.update(stopped.image_sha256);
+    for x in [boot,generation,stopped.root,stopped.esr,stopped.far]{h.update(x.to_le_bytes());}
     let proof=StopEvidence{role:Role::Security,generation,digest:h.finalize().into()};
-    (proof,old_root,ctx.esr,ctx.far)
+    (proof,stopped)
 }
 fn append(disk:&mut Disk,scratch:&mut OneStateRedo,gate:&mut DurableEpochGate,sb:SuperblockV1,
     sb_raw:&[u8],txid:u64,change:Change,stop:Option<StopEvidence>)->Outcome{
@@ -181,22 +142,18 @@ pub(super) fn run(info:&BootInfo)->!{
         Outcome::Boot{epoch:boot});
     assert_eq!(gate.boot_epoch(),Some(boot));
     assert_eq!(gate.service_generation(Role::Security),Ok(old_generation));
-    // Two actual distinct, private native diagnostic contexts. The first
-    // runs, faults and is retired before durable service generation change.
-    // This does not claim a full Security AI service or production recovery.
+    // Execute the same independently linked ABI3 role7 package used in
+    // eight-role bringup, with the confirmed durable generation.
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
-    let old_space=C*2+1;let new_space=C*2+2;
-    assert!(new_space<PRIVATE_SPACES);
-    let ctx=run_client(old_space);
-    let (stop,old_root,esr,far)=stop_client(old_space,ctx,boot,old_generation);
-    report("V0199_EPOCH_CLIENT_STOPPED",old_generation,old_root,esr);
+    let (stop,old)=stop_security_package(boot,old_generation);
+    report("V0199_EPOCH_CLIENT_STOPPED",old_generation,old.root,old.esr);
     let new_generation=old_generation+1;
     assert_eq!(append(&mut disk,scratch,&mut gate,sb,&sb_raw,recovered+2,Change::Restart(stop),Some(stop)),
         Outcome::Service{role:Role::Security,generation:new_generation,isolated:false});
     assert_eq!(gate.service_generation(Role::Security),Ok(new_generation));
-    let new_root=root(new_space);assert_ne!(new_root,old_root);
-    let _=run_client(new_space);
-    report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new_root,boot);
+    let new=super::v0199_control_bringup::disk_security_run(new_generation,1,false);
+    assert_ne!(new.root,old.root);assert_eq!(old.image_sha256,new.image_sha256);
+    report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new.root,boot);
     assert_eq!((disk.writes,disk.flushes),(8,4));
     let final_txid=recovered+2;
     let final_state=scratch.verify(sb,2+4*(final_txid as u32-1),HOME,final_txid,3*final_txid).unwrap();
@@ -209,15 +166,22 @@ pub(super) fn run(info:&BootInfo)->!{
     QUIT.store(true,Ordering::Release);
     wait(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
-    let row=[MAGIC,2,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,3*final_txid,
+    let row=[MAGIC,3,0,prior_boot,boot,prior.state_generation,final_state.state_generation,final_txid,3*final_txid,
         u64::from(2+4*(final_txid as u32-1)),disk.flushes,disk.reads,disk.writes,u64::from(HOME)];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     for(i,b)in final_digest.chunks_exact(8).enumerate(){
         SMP_EVIDENCE.words[14+i].store(u64::from_le_bytes(b.try_into().unwrap()),Ordering::Relaxed);
     }
-    for (i,v) in [old_generation,new_generation,old_root,new_root,esr,far].into_iter().enumerate(){
+    for (i,v) in [old.generation,new.generation,old.root,new.root,old.esr,old.far,
+        old.stack,new.stack,32768,old.clocks,old.snapshots,new.clocks,new.snapshots,
+        old.score,old.severity,new.score,new.severity].into_iter().enumerate(){
         SMP_EVIDENCE.words[18+i].store(v,Ordering::Relaxed);
     }
+    for(i,part)in old.image_sha256.chunks_exact(8).enumerate(){
+        SMP_EVIDENCE.words[35+i].store(u64::from_le_bytes(part.try_into().unwrap()),Ordering::Relaxed);
+    }
+    report("V0199_EPOCH_ROLE7_OPERATOR",old_generation,old.score,old.severity);
+    report("V0199_EPOCH_ROLE7_OPERATOR",new_generation,new.score,new.severity);
     report("V0199_EPOCH_DISK_COMMITTED",prior_boot,boot,disk.flushes);
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EPOCH_DISK_FIXTURE_PASS production=false\n");
