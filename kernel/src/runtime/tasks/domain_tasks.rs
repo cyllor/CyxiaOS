@@ -1479,11 +1479,12 @@ pub fn control_owner_context(slot: usize) -> Result<(u64, u64), Error> {
         Ok((s.layout.generation, s.generation))
     })
 }
-/// Only the real C worker on this CPU may spend this credit. During a drain,
-/// cleanup may settle/abort its existing job before the stop acknowledgement.
+/// Only the dedicated CPU1 control worker may spend this credit. CPU0 is the
+/// deterministic broker; CPU2/3 are business-only, including during cleanup.
+/// Existing CPU1 work may settle during drain before the stop acknowledgement.
 pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCredit>, Error> {
     let slot = cpu::slot();
-    if !matches!(slot, 1 | 2) {
+    if slot != cyxia_kernel_core::control_plane::fixed::CONTROL_CPU {
         return Err(Error::Auth);
     }
     locked(|s| {
@@ -1503,7 +1504,7 @@ pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCr
 /// Reconstructed or already-settled credits cannot authorize replay CPU work.
 pub(crate) fn verify_control_credit(credit: &ControlCredit) -> Result<(), Error> {
     let slot = cpu::slot();
-    if !matches!(slot, 1 | 2) || usize::from(credit.cpu) != slot {
+    if slot != cyxia_kernel_core::control_plane::fixed::CONTROL_CPU || usize::from(credit.cpu) != slot {
         return Err(Error::Auth);
     }
     locked(|s| {
