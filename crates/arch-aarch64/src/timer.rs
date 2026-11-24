@@ -62,7 +62,12 @@ pub fn cpu_ns(delta: u64) -> u64 {
 
 /// Return actual execution time since `start` on the same vCPU.
 pub fn cpu_elapsed_ns(start: u64) -> u64 {
-    cpu_ns(cpu_ticks().saturating_sub(start))
+    // A regressed per-vCPU counter is not zero execution time. A poisoned
+    // accounting source cannot be used for another budget grant. Panic goes
+    // to the native containment handler; the selected lease remains owned.
+    let delta = crate::accounting::execution_delta(start, cpu_ticks())
+        .expect("AArch64 execution counter regressed");
+    cpu_ns(delta)
 }
 
 /// Enable the 64-bit execution counter for this CPU.
