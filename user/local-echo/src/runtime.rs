@@ -113,7 +113,11 @@ pub fn run()->!{
             continue;
         }
         if generation==0 || source==0 {broker::park();}
-        let ticket=gate.begin(source,now/1000,4).unwrap_or_else(|_|broker::park());
+        // The broker currently exposes monotonic milliseconds. Preserve that
+        // precision instead of truncating to whole seconds; full native ns
+        // clock/ABI migration remains a separate acceptance requirement.
+        let admission_ns=now.checked_mul(1_000_000).unwrap_or_else(||broker::park());
+        let ticket=gate.begin_ns(source,admission_ns,16).unwrap_or_else(|_|broker::park());
         // Reconstruct the key object from static provisioned DER only. No
         // private key or peer identity is ever taken from wire requests.
         let key=PrivatePkcs8KeyDer::from(

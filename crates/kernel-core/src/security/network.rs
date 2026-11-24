@@ -7,6 +7,8 @@ pub const MAX_SOURCES: usize = 32;
 pub const MAX_PENDING: u8 = 4;
 pub const MAX_ACTIVE: u8 = 16;
 pub const MAX_ECHO: usize = 4096;
+const TOKEN: u64 = 1_000_000_000;
+const BURST: u64 = 4 * TOKEN;
 pub const TLS13: u16 = 0x0304;
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 
@@ -63,16 +65,17 @@ pub fn parse_read_only_echo<'a>(
 #[derive(Clone, Copy, Debug)]
 struct Source {
     ip: u32,
-    tokens: u8,
-    last_second: u64,
+    tokens: u64,
+    last_ns: u64,
     last_request: u64,
     inflight: u8,
     active: u8, // successful sessions are still owned by this source
 }
 pub struct RateLimiter {
     sources: [Option<Source>; MAX_SOURCES],
-    global_tokens: u8,
-    global_second: u64,
+    global_tokens: u64,
+    global_ns: u64,
+    rate: u16,
     pending: u8,
     active: u8,
 }
@@ -80,41 +83,68 @@ impl Default for RateLimiter { fn default() -> Self { Self::new() } }
 impl RateLimiter {
     pub const fn new() -> Self {
         Self {
-            sources: [None; MAX_SOURCES], global_tokens: 4,
-            global_second: 0, pending: 0, active: 0,
+            sources: [None; MAX_SOURCES], global_tokens: BURST,
+            global_ns: 0, rate: 16, pending: 0, active: 0,
         }
     }
-    fn refill(tokens: u8, elapsed: u64, rate: u16) -> u8 {
-        (u64::from(tokens).saturating_add(elapsed.saturating_mul(rate as u64))).min(4) as u8
+    fn refill(tokens: u64, elapsed_ns: u64, rate: u16) -> u64 {
+        tokens.saturating_add(elapsed_ns.saturating_mul(u64::from(rate))).min(BURST)
     }
-    pub fn request_handshake(&mut self, ip: u32, second: u64, rate: u16) -> Result<(), Error> {
-        if ![4,8,16,32].contains(&rate) || second < self.global_second {
+    /// The caller supplies the protected configured rate, never a peer/model
+    /// field. Settle old rates before any change, without replenishing bursts.
+    fn settle(&mut self, now_ns: u64, rate: u16) -> Result<(), Error> {
+        if ![4, 8, 16, 32].contains(&rate) || now_ns < self.global_ns {
             return Err(Error::Invalid);
         }
-        if self.pending >= MAX_PENDING { return Err(Error::Capacity); }
-        let at = if let Some(index) = self.sources.iter().position(|r| r.is_some_and(|r| r.ip == ip)) {
-            index
+        self.global_tokens = Self::refill(self.global_tokens, now_ns - self.global_ns, self.rate);
+        self.global_ns = now_ns;
+        if rate != self.rate {
+            for entry in self.sources.iter_mut().flatten() {
+                entry.tokens = Self::refill(entry.tokens, now_ns - entry.last_ns, self.rate.min(8));
+                entry.last_ns = now_ns;
+            }
+            self.rate = rate;
+        }
+        Ok(())
+    }
+    fn can_evict(entry: Source, now_ns: u64, rate: u16) -> bool {
+        entry.inflight == 0 && entry.active == 0
+            && now_ns >= entry.last_ns
+            && Self::refill(entry.tokens, now_ns - entry.last_ns, rate.min(8)) == BURST
+    }
+    /// V0.19.9 protected post-cookie admission. All capacity/debt checks run
+    /// before either token is debited or a new source is published.
+    pub fn request_handshake_ns(&mut self, ip: u32, now_ns: u64, rate: u16) -> Result<(), Error> {
+        if ip == 0 { return Err(Error::Invalid); }
+        self.settle(now_ns, rate)?;
+        if self.pending >= MAX_PENDING || self.global_tokens < TOKEN {
+            return Err(Error::Capacity);
+        }
+        let (at, current) = if let Some(at) = self.sources.iter().position(|r| r.is_some_and(|r| r.ip == ip)) {
+            (at, self.sources[at].ok_or(Error::Stale)?)
         } else {
-            self.sources.iter().position(Option::is_none).ok_or(Error::Capacity)?
+            let at = self.sources.iter().position(Option::is_none)
+                .or_else(|| self.sources.iter().enumerate()
+                    .filter_map(|(at, row)| row.filter(|entry| Self::can_evict(*entry, now_ns, rate))
+                        .map(|entry| (at, entry.last_request)))
+                    .min_by_key(|&(at, last)| (last, at)).map(|(at, _)| at))
+                .ok_or(Error::Capacity)?;
+            (at, Source { ip, tokens: BURST, last_ns: now_ns, last_request: now_ns, inflight: 0, active: 0 })
         };
-        let current = self.sources[at].unwrap_or(Source {
-            ip, tokens: 4, last_second: second, last_request: second, inflight: 0, active: 0,
-        });
-        if second < current.last_second { return Err(Error::Invalid); }
-        let global = Self::refill(self.global_tokens, second - self.global_second, rate);
-        let per = Self::refill(current.tokens, second - current.last_second, rate.min(8));
-        self.global_tokens = global;
-        self.global_second = second;
+        if current.inflight != 0 { return Err(Error::Capacity); }
+        let per = Self::refill(current.tokens, now_ns - current.last_ns, rate.min(8));
+        if per < TOKEN { return Err(Error::Capacity); }
         self.sources[at] = Some(Source {
-            tokens: per, last_second: second, last_request: second, ..current
+            tokens: per - TOKEN, last_ns: now_ns, last_request: now_ns, inflight: 1, ..current
         });
-        if global == 0 || per == 0 { return Err(Error::Capacity); }
-        let source = self.sources[at].as_mut().ok_or(Error::Invalid)?;
-        source.tokens -= 1;
-        source.inflight = source.inflight.checked_add(1).ok_or(Error::Exhausted)?;
-        self.global_tokens -= 1;
+        self.global_tokens -= TOKEN;
         self.pending += 1;
         Ok(())
+    }
+    /// Compatibility for historical host fixtures taking integral seconds.
+    /// Native V0.19.9 adapters must use the monotonic nanosecond entry above.
+    pub fn request_handshake(&mut self, ip: u32, second: u64, rate: u16) -> Result<(), Error> {
+        self.request_handshake_ns(ip, second.checked_mul(TOKEN).ok_or(Error::Invalid)?, rate)
     }
     pub fn finish_handshake(&mut self, ip: u32, success: bool) -> Result<(), Error> {
         // Caller supplies the independently authenticated source from the
@@ -147,20 +177,20 @@ impl RateLimiter {
     }
     /// Source entries are never evicted while an allowance is owed or a
     /// handshake is still live. Eviction cannot reset an exhausted burst.
-    pub fn evict_idle(&mut self, ip: u32, second: u64) -> Result<(), Error> {
+    pub fn evict_idle_ns(&mut self, ip: u32, now_ns: u64) -> Result<(), Error> {
+        let rate = self.rate;
+        self.settle(now_ns, rate)?;
         let slot = self.sources.iter_mut().find(|r| r.is_some_and(|r| r.ip == ip))
             .ok_or(Error::Stale)?;
         let entry = slot.as_ref().ok_or(Error::Stale)?;
-        if second < entry.last_request.saturating_add(1)
-            || second < entry.last_second
-            || entry.inflight != 0
-            || entry.active != 0
-            || Self::refill(entry.tokens, second - entry.last_second, 8) != 4
-        {
+        if entry.active != 0 || !Self::can_evict(*entry, now_ns, rate) {
             return Err(Error::Busy);
         }
         *slot = None;
         Ok(())
+    }
+    pub fn evict_idle(&mut self, ip: u32, second: u64) -> Result<(), Error> {
+        self.evict_idle_ns(ip, second.checked_mul(TOKEN).ok_or(Error::Invalid)?)
     }
     pub const fn pending(&self) -> u8 { self.pending }
     pub const fn active(&self) -> u8 { self.active }
@@ -195,7 +225,7 @@ mod tests {
     }
     #[test] fn sec_n03_handshake_capacity_not_unbounded() {
         let mut limiter=RateLimiter::new();
-        for i in 0..4 { limiter.request_handshake(i,0,16).unwrap(); }
+        for i in 1..=4 { limiter.request_handshake(i,0,16).unwrap(); }
         assert_eq!(limiter.pending(),4);
         assert_eq!(limiter.request_handshake(5,0,16),Err(Error::Capacity));
     }
@@ -260,6 +290,46 @@ mod tests {
         limiter.close_active_from(7).unwrap();
         limiter.evict_idle(7, 10).unwrap();
         assert_eq!(limiter.active(), 0);
+    }
+    #[test] fn v0199_rejected_new_sources_never_occupy_table_and_refill_is_fractional() {
+        let mut limiter=RateLimiter::new();
+        for ip in 1..=4 {
+            limiter.request_handshake_ns(ip,0,16).unwrap();
+            limiter.finish_handshake(ip,false).unwrap();
+        }
+        for ip in 5..=40 {
+            assert_eq!(limiter.request_handshake_ns(ip,0,16),Err(Error::Capacity));
+        }
+        assert_eq!(limiter.sources.iter().flatten().count(),4);
+        assert_eq!(limiter.request_handshake_ns(41,62_499_999,16),Err(Error::Capacity));
+        limiter.request_handshake_ns(41,62_500_000,16).unwrap();
+        assert_eq!(limiter.pending(),1);
+        assert_eq!(limiter.request_handshake_ns(42,62_499_999,16),Err(Error::Invalid));
+    }
+    #[test] fn v0199_single_source_pending_and_rate_change_preserve_debt() {
+        let mut limiter=RateLimiter::new();
+        limiter.request_handshake_ns(1,0,4).unwrap();
+        assert_eq!(limiter.request_handshake_ns(1,0,4),Err(Error::Capacity));
+        limiter.finish_handshake(1,false).unwrap();
+        for ip in 2..=4 {
+            limiter.request_handshake_ns(ip,0,4).unwrap();
+            limiter.finish_handshake(ip,false).unwrap();
+        }
+        assert_eq!(limiter.request_handshake_ns(5,125_000_000,32),Err(Error::Capacity));
+        limiter.request_handshake_ns(5,140_625_000,32).unwrap();
+    }
+    #[test] fn v0199_lru_reuses_only_refilled_unreferenced_sources() {
+        let mut limiter=RateLimiter::new();
+        limiter.request_handshake(1,0,16).unwrap();
+        limiter.finish_handshake(1,true).unwrap();
+        for ip in 2..=32 {
+            limiter.request_handshake(ip,u64::from(ip),16).unwrap();
+            limiter.finish_handshake(ip,false).unwrap();
+        }
+        limiter.request_handshake(33,33,16).unwrap();
+        assert!(limiter.sources.iter().flatten().any(|s| s.ip==1));
+        assert!(!limiter.sources.iter().flatten().any(|s| s.ip==2));
+        assert_eq!(limiter.sources.iter().flatten().count(),32);
     }
     #[test] fn sec_n08_no_model_is_needed_for_rate_limit_and_echo() {
         let mut limiter = RateLimiter::new();
