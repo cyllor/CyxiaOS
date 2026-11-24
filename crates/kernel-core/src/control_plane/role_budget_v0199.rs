@@ -73,6 +73,15 @@ impl Cpu0BudgetLedger {
     pub fn reserve_role(&mut self,manifest:&NativeRoleManifest,actor:Identity,
         cpu:usize,class:Class,domain:u16,requested:u64,now:u64)->Result<Turn,Error>
     {
+        self.reserve_role_with_wall(manifest,actor,cpu,class,domain,requested,requested,now)
+    }
+    /// CPU execution quota and wall-clock deadline are separate clocks.
+    /// The native adapter must arm a conservative preemption timer and
+    /// debit actual per-CPU execution time before closing this turn.
+    pub fn reserve_role_with_wall(&mut self,manifest:&NativeRoleManifest,actor:Identity,
+        cpu:usize,class:Class,domain:u16,requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>
+    {
+        if wall_ns==0 || wall_ns>50_000_000{return Err(Error::Invalid);}
         manifest.validate()?;
         if cpu!=CONTROL_CPU{return Err(Error::Denied);}
         let (index,member)=manifest.members.iter().enumerate().find(|(_,m)|m.actor==actor).ok_or(Error::Denied)?;
@@ -83,7 +92,7 @@ impl Cpu0BudgetLedger {
             |(Role::Supervisor|Role::ModelManager,Class::Coordination)
             |(Role::Validator|Role::Learner,Class::Optional));
         if !allowed{return Err(Error::Denied);}
-        self.reserve(Some(actor),Some((index,member.control_ns_per_100ms)),class,domain,requested,now)
+        self.reserve(Some(actor),Some((index,member.control_ns_per_100ms)),class,domain,requested,wall_ns,now)
     }
     /// Separate trusted EL1 recovery/coordination entry. There is no user
     /// request field that can select this authority.
@@ -91,10 +100,10 @@ impl Cpu0BudgetLedger {
         if cpu!=CONTROL_CPU || !matches!(class,Class::Coordination|Class::Recovery){
             return Err(Error::Denied);
         }
-        self.reserve(None,None,class,0,requested,now)
+        self.reserve(None,None,class,0,requested,requested,now)
     }
     fn reserve(&mut self,actor:Option<Identity>,role:Option<(usize,u64)>,class:Class,domain:u16,
-        requested:u64,now:u64)->Result<Turn,Error>{
+        requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
         self.time(now)?;
         if self.active.is_some(){return Err(Error::Busy);}
         if self.ordinary_closed && class!=Class::Recovery{return Err(Error::Denied);}
@@ -128,7 +137,7 @@ impl Cpu0BudgetLedger {
             _=>if domain!=0{return Err(Error::Invalid);},
         }
         let serial=self.serial.checked_add(1).ok_or(Error::Exhausted)?;
-        let turn=Turn{serial,window:now/WINDOW_NS,class,actor,role_index:role.map(|(index,_)|index),domain,deadline_ns:end.min(now+requested),reserved_ns:requested};
+        let turn=Turn{serial,window:now/WINDOW_NS,class,actor,role_index:role.map(|(index,_)|index),domain,deadline_ns:end.min(now.checked_add(wall_ns).ok_or(Error::Clock)?),reserved_ns:requested};
         self.serial=serial;
         self.active=Some(turn);
         self.operations_seen|=bit;
@@ -219,6 +228,16 @@ mod tests{
             q.settle(0,t,2_000_000,22_000_000+i*2_000_000).unwrap();
         }
         assert_eq!(q.reserve_role(&m,sec,0,Class::Security,12,1,28_000_000),Err(Error::Exhausted));
+    }
+    #[test]
+    fn cpu_quota_and_wall_deadline_are_independently_enforced(){
+        let m=manifest();let mut q=Cpu0BudgetLedger::new();
+        let a=q.reserve_role_with_wall(&m,m.members[2].actor,0,Class::Decision,1,
+            250_000,50_000_000,0).unwrap();
+        assert_eq!(a.deadline_ns(),50_000_000);
+        assert!(!q.settle(0,a,200_000,10_000_000).unwrap().overrun);
+        assert_eq!(q.reserve_role_with_wall(&m,m.members[3].actor,0,Class::Decision,1,
+            300_001,50_000_000,10_000_000),Err(Error::Exhausted));
     }
     #[test]
     fn actual_overrun_and_late_copy_never_refill_ordinary_budget(){

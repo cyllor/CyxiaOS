@@ -77,7 +77,7 @@ pub fn build(){
             .arg("-C").arg(format!("link-arg=-T{}",script.display()))
             .arg("-o").arg(&target).status().expect("native role compiler");
         assert!(status.success(),"native role {role} build failed");
-        let bytes=fs::read(&target).unwrap();verify_no_relocations(&bytes);
+        let bytes=fs::read(&target).unwrap();assert!(bytes.len()<=128*1024);verify_no_relocations(&bytes);
         let hash=digest(&target);
         assert!(!hashes.contains(&hash),"independent role ELF package unexpectedly identical");
         hashes.push(hash);
