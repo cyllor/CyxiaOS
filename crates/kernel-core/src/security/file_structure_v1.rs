@@ -195,3 +195,72 @@ pub fn scan(
     verify_system(sb,system,&w.inodes)?;
     Ok(StructureEvidence{live_inodes:live,data_blocks:data,directory_entries:entries})
 }
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    fn put16(b:&mut[u8],i:usize,v:u16){b[i..i+2].copy_from_slice(&v.to_le_bytes());}
+    fn put32(b:&mut[u8],i:usize,v:u32){b[i..i+4].copy_from_slice(&v.to_le_bytes());}
+    fn put64(b:&mut[u8],i:usize,v:u64){b[i..i+8].copy_from_slice(&v.to_le_bytes());}
+    fn seal(b:&mut[u8],at:usize){let crc=crc32c_zeroed(b,at).unwrap();put32(b,at,crc);}
+    fn inode(b:&mut[u8],kind:u16,gen:u64,size:u64,physical:u32,blocks:u32){
+        b.fill(0);put32(b,0,0x4359494e);put16(b,4,kind);put64(b,8,gen);
+        if kind!=0{
+            put64(b,16,size);put64(b,40,1);
+            if blocks!=0{put16(b,32,1);put32(b,52,physical);put32(b,56,blocks);}
+        }
+        seal(b,252);
+    }
+    fn sys()->[SystemObject;4]{[
+        SystemObject{kind:SystemKind::BootEpoch,inode:2,generation:1,first_block:DATA_START+2},
+        SystemObject{kind:SystemKind::Receipts,inode:3,generation:1,first_block:DATA_START+3},
+        SystemObject{kind:SystemKind::Acl,inode:4,generation:1,first_block:DATA_START+10},
+        SystemObject{kind:SystemKind::Security,inode:5,generation:1,first_block:DATA_START+14},
+    ]}
+    fn fixture(block:u32,out:&mut[u8;BLOCK],fault:u8)->Result<(),Error>{
+        out.fill(0);
+        if (BITMAP_START..INODE_START).contains(&block){
+            let base=(block-BITMAP_START)*BLOCK as u32*8;
+            for b in base..base+BLOCK as u32*8{
+                if b<DATA_START+15&&!(fault==1&&b==DATA_START+1){
+                    let i=b-base;out[(i/8) as usize]|=1<<(i%8);
+                }
+            }
+        }else if (INODE_START..DATA_START).contains(&block){
+            for (i,slot) in out.chunks_exact_mut(256).enumerate(){
+                let id=(block-INODE_START)*16+i as u32;
+                match id{
+                    0=>inode(slot,2,1,128,DATA_START,1),
+                    1=>inode(slot,1,1,1,if fault==2{DATA_START}else{DATA_START+1},1),
+                    2..=5=>{
+                        let s=sys()[(id-2) as usize];
+                        inode(slot,1,1,u64::from(s.kind.blocks())*4096,s.first_block,s.kind.blocks());
+                    }
+                    _=>inode(slot,0,0,0,0,0),
+                }
+            }
+        }else if block==DATA_START{
+            let b=&mut out[..128];
+            if fault==3{put32(b,0,u32::MAX);}
+            else{
+                put32(b,0,if fault==4{2}else{1});put16(b,4,1);put64(b,8,1);
+                b[16]=if fault==5{0xc0}else{b'x'};
+            }
+            seal(b,124);
+        }
+        Ok(())
+    }
+    #[test]
+    fn all_256_inodes_bitmap_and_reachable_directory_entries_are_checked(){
+        let mut w=Workspace::new();let sb=SuperblockV1{fs_uuid:[1;16],generation:1,checkpoint_lsn:0,log_epoch:1};
+        let evidence=scan(sb,&sys(),&mut w,|block,out|fixture(block,out,0),|_,_,table|{
+            assert_eq!(table[1].size,1);assert_eq!(table[5].kind,1);Ok(())
+        }).unwrap();
+        assert_eq!(evidence,StructureEvidence{live_inodes:6,data_blocks:15,directory_entries:1});
+        for fault in 1..=5{
+            assert!(scan(sb,&sys(),&mut w,|block,out|fixture(block,out,fault),
+                |_,_,_|panic!("corrupt structural view cannot reach system admission")).is_err());
+        }
+        assert_eq!(scan(sb,&sys(),&mut w,|block,out|fixture(block,out,0),|_,_,_|Err(Error::Unauthorized)),Err(Error::Unauthorized));
+    }
+}
