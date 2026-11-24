@@ -163,6 +163,24 @@ pub fn validate_irq_route(
     }
     Ok(())
 }
+/// V0.19.9 ordinary SPI route admission. The legacy CPU1 gate remains
+/// isolated for archival fixtures; native CPU0 never receives ordinary SPI.
+pub fn validate_irq_route_v0199(
+    kind: IrqKind, target_cpu: u8, core_generation: u64,
+    healthy_business: u64, draining: u64, suspect: u64,
+    source_quiesced: bool,
+) -> Result<(), Error> {
+    if kind != IrqKind::VirtioSpi || !source_quiesced || core_generation == 0
+        || !crate::control_plane::cpu0_v0199::permits_business(
+            u16::from(target_cpu), crate::control_plane::cpu0_v0199::BUSINESS_MASK,
+            healthy_business, draining, suspect,
+        )
+        || healthy_business & !crate::control_plane::cpu0_v0199::BUSINESS_MASK != 0
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
 pub fn must_notify(queued: u8, batch: u8, age_ns: u64, isolated: bool) -> Result<bool, Error> {
     if ![1,2,4,8].contains(&batch) || queued > MAX_CHAINS as u8 {
         return Err(Error::Invalid);
@@ -228,6 +246,19 @@ mod tests {
         assert_eq!(validate_irq_route(IrqKind::VirtioSpi,1,1,0b10,0b10,0,true),Err(Error::Unauthorized));
         assert_eq!(validate_irq_route(IrqKind::VirtioSpi,1,1,0b10,0,0,true),Err(Error::Unauthorized));
         assert_eq!(validate_irq_route(IrqKind::VirtioSpi,2,1,0b100,0,0,true),Ok(()));
+    }
+    #[test] fn v0199_irq_route_is_only_to_fixed_business_cpu_after_quiescence() {
+        for cpu in 1..=3 {
+            assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,cpu,1,0b1110,0,0,true),Ok(()));
+            assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,cpu,1,0b1110,1<<cpu,0,true),Err(Error::Unauthorized));
+            assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,cpu,1,0b1110,0,1<<cpu,true),Err(Error::Unauthorized));
+        }
+        for cpu in [0,4,63,64] {
+            assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,cpu,1,0b1110,0,0,true),Err(Error::Unauthorized));
+        }
+        assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,1,1,0b1111,0,0,true),Err(Error::Unauthorized));
+        assert_eq!(validate_irq_route_v0199(IrqKind::VirtioSpi,1,1,0b1110,0,0,false),Err(Error::Unauthorized));
+        assert_eq!(validate_irq_route_v0199(IrqKind::Timer,1,1,0b1110,0,0,true),Err(Error::Unauthorized));
     }
     #[test] fn sec_d08_lonely_chain_reaches_notification_deadline() {
         assert_eq!(must_notify(1,8,49_999,false),Ok(false));

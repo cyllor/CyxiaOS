@@ -19,6 +19,7 @@ pub struct VerifiedSpawn {
     healthy: u64,
     draining: u64,
     suspect: u64,
+    native_cpu0: bool,
 }
 impl VerifiedSpawn {
     /// Only the privileged registry adapter may turn a capability and live
@@ -33,7 +34,16 @@ impl VerifiedSpawn {
         draining: u64,
         suspect: u64,
     ) -> Self {
-        Self { owner, group, package, business, healthy, draining, suspect }
+        Self { owner, group, package, business, healthy, draining, suspect, native_cpu0: false }
+    }
+    /// Only the V0.19.9 protected registry adapter may select this native
+    /// layout. Historical CPU1-control proofs retain their old interpretation.
+    #[allow(dead_code)]
+    pub(crate) const fn from_registry_v0199(
+        owner: u64, group: u8, package: [u8; 32], business: u64,
+        healthy: u64, draining: u64, suspect: u64,
+    ) -> Self {
+        Self { owner, group, package, business, healthy, draining, suspect, native_cpu0: true }
     }
     fn permits(&self, request: Request) -> bool {
         let cpu = 1u64.checked_shl(request.cpu as u32).unwrap_or(0);
@@ -45,8 +55,14 @@ impl VerifiedSpawn {
             // Standalone SEC-P ledger shares the same V0.19 native role
             // boundary as authorize_business_core: CPU0 mechanism broker and
             // CPU1 fixed advisory-control may not be ordinary business CPUs.
-            && request.cpu >= 2
-            && cpu & self.business & self.healthy & !self.draining & !self.suspect != 0
+            && (if self.native_cpu0 {
+                crate::control_plane::cpu0_v0199::permits_business(
+                    u16::from(request.cpu), self.business, self.healthy, self.draining, self.suspect,
+                )
+            } else {
+                request.cpu >= 2
+                    && cpu & self.business & self.healthy & !self.draining & !self.suspect != 0
+            })
     }
 }
 
@@ -68,6 +84,22 @@ pub fn authorize_business_core(
     let bit = 1u64.checked_shl(u32::from(cpu)).ok_or(Error::Invalid)?;
     if core_generation == 0
         || bit & business_mask & healthy_mask & !draining_mask & !quarantined_mask == 0
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+/// V0.19.9 native placement gate, deliberately distinct from the legacy
+/// CPU0-broker/CPU1-controller helper above. Recheck at publication.
+pub fn authorize_business_core_v0199(
+    cpu: u16, core_generation: u64, business_mask: u64, healthy_mask: u64,
+    draining_mask: u64, quarantined_mask: u64,
+) -> Result<(), Error> {
+    if core_generation == 0
+        || !crate::control_plane::cpu0_v0199::permits_business(
+            cpu, business_mask, healthy_mask, draining_mask, quarantined_mask,
+        )
     {
         return Err(Error::Unauthorized);
     }
@@ -253,6 +285,24 @@ mod tests {
         }
         assert_eq!(l.rows.iter().flatten().count(),0);
         assert!(l.admit(req(7),misclassified).is_ok());
+    }
+    #[test] fn v0199_business_placement_and_spawn_use_fixed_cpu0_boundary() {
+        let mut ledger=SpawnLedger::<3>::new();
+        let authority=VerifiedSpawn::from_registry_v0199(7,2,[5;32],0b1110,0b1111,0,0);
+        for cpu in 1..=3 {
+            let mut input=req(u64::from(cpu));
+            input.cpu=cpu;
+            let ticket=ledger.admit(input,authority).unwrap();
+            ledger.publish_runnable(ticket,authority).unwrap();
+        }
+        for cpu in [0,4,63,64,u16::MAX] {
+            assert_eq!(authorize_business_core_v0199(cpu,1,u64::MAX,u64::MAX,0,0),Err(Error::Unauthorized));
+        }
+        assert_eq!(authorize_business_core_v0199(1,1,0b1110,0b1111,0,0),Ok(()));
+        assert_eq!(authorize_business_core_v0199(1,0,0b1110,0b1111,0,0),Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core_v0199(1,1,0b1110,0b1111,2,0),Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core_v0199(1,1,0b1110,0b1111,0,2),Err(Error::Unauthorized));
+        assert_eq!(authorize_business_core_v0199(1,1,0b1111,0b1111,0,0),Err(Error::Unauthorized));
     }
     #[test] fn sec_p07_exiting_cannot_take_new_references() {
         let mut l = SpawnLedger::<1>::new();
