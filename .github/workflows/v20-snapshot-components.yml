@@ -1,0 +1,89 @@
+# Snapshot host gates only. Never reports production QEMU or native acceptance.
+name: V0.20 snapshot component verification (WIP)
+on:
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'crates/prototype/src/snapshot/**'
+      - 'crates/prototype/src/domains/filesystem/**'
+      - 'crates/prototype/tests/immutable_snapshots.rs'
+      - 'crates/kernel-core/src/security/file_*'
+      - 'tests/host/test_snapshot*'
+      - 'tools/test_snapshot_probe.py'
+      - '.github/workflows/v20-snapshot-components.yml'
+  push:
+    branches: ['work/v020-snapshot-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  historical-fs-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain and dependencies
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Record source and host-only evidence scope
+        run: |
+          mkdir -p artifacts/snapshot-host
+          git rev-parse HEAD > artifacts/snapshot-host/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/snapshot-host/tree.txt
+          rustc -vV > artifacts/snapshot-host/toolchain.txt
+          printf '%s\n' 'HOST_COMPONENT_ONLY; legacy v2; native G4 NOT_RUN' > artifacts/snapshot-host/scope.txt
+      - name: Manager and actual journal/COW integration on host block device
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p cyxia-prototype snapshot::tests 2>&1 | tee artifacts/snapshot-host/manager.log
+          cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots 2>&1 | tee artifacts/snapshot-host/filesystem.log
+      - name: Independent legacy format and protocol negative tests
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools:tests/host python3 -B -m unittest tests.host.test_v2_filesystem tests.host.test_snapshot_file_abi tests.host.test_snapshot_capability_custody tests.host.test_snapshot_probe_budget tools.test_snapshot_probe -v 2>&1 | tee artifacts/snapshot-host/python.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: snapshot-host-${{ github.sha }}
+          path: artifacts/snapshot-host/
+          retention-days: 7
+          if-no-files-found: error
+
+  new-media-component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain and dependencies
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Record source and verify bounded file security components
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/snapshot-media
+          git rev-parse HEAD > artifacts/snapshot-media/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/snapshot-media/tree.txt
+          rustc -vV > artifacts/snapshot-media/toolchain.txt
+          printf '%s\n' 'HOST_COMPONENT_ONLY; no mount or device FLUSH proof' > artifacts/snapshot-media/scope.txt
+          cargo test --locked --offline -p cyxia-kernel-core security::file_ 2>&1 | tee artifacts/snapshot-media/guard.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: snapshot-media-${{ github.sha }}
+          path: artifacts/snapshot-media/
+          retention-days: 7
+          if-no-files-found: error
