@@ -79,6 +79,7 @@ pub mod cpu0_v0199;
 pub mod security_finding;
 pub mod rule_profile_v2;
 pub mod image;
+pub mod pie_image_v0199;
 pub mod image_abi;
 pub mod service;
 
