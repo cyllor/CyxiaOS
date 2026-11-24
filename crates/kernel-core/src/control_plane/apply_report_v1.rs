@@ -93,6 +93,26 @@ impl<'a> ApplyReportV1<'a>{
         })
     }
 
+    /// Encode an actual native result into the same canonical wire consumed
+    /// by the independent terminal gate. Encoding alone is not proof.
+    pub fn encode(self,out:&mut [u8;MAX_APPLY_REPORT_BYTES])->Result<usize,Error>{
+        if self.action.is_empty()||self.action.len()>MAX_ACTION_BYTES{return Err(Error::Invalid);}
+        let n=APPLY_HEADER_BYTES+self.action.len();out.fill(0);
+        for(at,v)in [(0,self.key.boot_epoch),(8,self.key.controller_epoch),(16,self.key.plan_seq),
+            (32,self.target.id),(40,self.target.generation),(48,self.executor_generation),
+            (56,self.plan_version),(72,self.completed_ns)]{out[at..at+8].copy_from_slice(&v.to_le_bytes());}
+        let state:u16=match self.state{ActionStatus::Applied=>1,ActionStatus::Rejected=>2,
+            ActionStatus::Unknown=>3,ActionStatus::Cancelled=>4};
+        for(at,v)in [(24,self.action_index),(26,self.domain_id),(28,state)]{
+            out[at..at+2].copy_from_slice(&v.to_le_bytes());
+        }
+        out[64..68].copy_from_slice(&self.result.to_le_bytes());
+        out[68..72].copy_from_slice(&(self.action.len() as u32).to_le_bytes());
+        out[96..n].copy_from_slice(self.action);
+        if Self::decode(&out[..n])?!=self{return Err(Error::Invalid);}
+        Ok(n)
+    }
+
     /// A copied report must match a frozen accepted plan, trusted executor
     /// identity/generation and its original exact action bytes. The caller
     /// also must verify real capability rights at the 0x43 entry.
