@@ -123,12 +123,22 @@ impl EvidenceLedger{
     }
     /// Called by the protected decision registration gate ONLY after all
     /// independent rule, model, candidate, identity and sequence checks.
-    /// State 2 stays closed until an atomic reason7 fallback gate exists.
+    /// State 2 uses the separate atomic reason7 fallback registration gate.
     pub(super) fn finalize_registered_adoption(
         &mut self,actor:Identity,disposition:&[u8],decision:&[u8;DECISION_BYTES],now_ns:u64,
     )->Result<AdviceResult,Error>{
         if actor!=self.controller{return Err(Error::Denied);}
         if AdviceDispositionV1::decode(disposition)?.state!=1{return Err(Error::NotReady);}
+        self.finalize_inner(actor,disposition,Some(decision),now_ns)
+    }
+    /// Only the serialized registration gate may create a decision-bearing
+    /// rejection. It must first independently recompute the legal fallback,
+    /// rejection reason and all current rule/candidate bindings.
+    pub(super) fn finalize_registered_fallback(
+        &mut self,actor:Identity,disposition:&[u8],decision:&[u8;DECISION_BYTES],now_ns:u64,
+    )->Result<AdviceResult,Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        if AdviceDispositionV1::decode(disposition)?.state!=2{return Err(Error::Denied);}
         self.finalize_inner(actor,disposition,Some(decision),now_ns)
     }
     fn finalize_inner(
