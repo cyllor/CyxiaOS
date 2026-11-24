@@ -34,6 +34,11 @@ pub struct Settlement {
     pub overrun:bool,
     pub crossed_window:bool,
 }
+/// Half-open CPU interval with a separately observed native counter debit.
+/// Exact mode requires a real counter observation at EVERY aligned boundary.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MeasuredSegment{pub start_ns:u64,pub end_ns:u64,pub cpu_ns:u64}
+#[derive(Clone)]
 pub struct Cpu0BudgetLedger {
     window:Option<u64>,
     last_ns:u64,
@@ -105,6 +110,49 @@ impl Cpu0BudgetLedger {
         let overrun=early_overrun||late_overrun;
         if overrun{self.ordinary_closed=true;}
         Ok(Settlement{actual_ns:actual,overrun,crossed_window:crossed})
+    }
+    /// Exact coordination split when the trusted platform supplies actual
+    /// aligned boundary samples. Unlike account_coordination_gap, this
+    /// charges a segment ending at a boundary to its OLD window.
+    /// Missing/late boundary evidence must use the conservative path;
+    /// never interpolate PMU counts from wall time. The native verifier
+    /// authenticates the whole trace and its independent endpoint delta.
+    pub fn account_exact_coordination(&mut self,cpu:usize,segments:&[MeasuredSegment],
+        observed_total:u64,verify_native:impl FnOnce(&[MeasuredSegment],u64)->Result<(),Error>,
+    )->Result<Settlement,Error>{
+        if cpu!=CONTROL_CPU{return Err(Error::Denied);}
+        if self.active.is_some(){return Err(Error::Busy);}
+        if segments.is_empty()||segments.len()>64{return Err(Error::Invalid);}
+        let start=segments[0].start_ns;
+        if start<self.last_ns||self.window.is_some()&&start!=self.last_ns{return Err(Error::Clock);}
+        let mut cursor=start;let mut total=0u64;
+        for segment in segments{
+            if segment.start_ns!=cursor||segment.end_ns<=segment.start_ns
+                ||segment.start_ns/WINDOW_NS!=(segment.end_ns-1)/WINDOW_NS{
+                return Err(Error::Clock);
+            }
+            total=total.checked_add(segment.cpu_ns).ok_or(Error::Exhausted)?;
+            cursor=segment.end_ns;
+        }
+        if total!=observed_total{return Err(Error::Denied);}
+        verify_native(segments,total)?;
+        // Stage accounting to prevent invalid later rows from consuming
+        // a partial trace. The ledger is small and lives in protected EL1.
+        let mut next=self.clone();let idx=Class::Coordination.index();let mut overrun=false;
+        for segment in segments{
+            next.time(segment.start_ns)?;next.enter_window(segment.start_ns)?;
+            next.spent[idx]=next.spent[idx].checked_add(segment.cpu_ns).ok_or(Error::Exhausted)?;
+            next.kernel_coordination_spent=next.kernel_coordination_spent.checked_add(segment.cpu_ns).ok_or(Error::Exhausted)?;
+            next.lifetime_spent[idx]=next.lifetime_spent[idx].checked_add(segment.cpu_ns).ok_or(Error::Exhausted)?;
+            let sum=next.total_spent()?;
+            next.max_window_upper_ns=next.max_window_upper_ns.max(sum);
+            overrun|=sum>LIMIT_NS||next.spent[idx]>CLASS_LIMITS[idx]
+                ||next.kernel_coordination_spent>KERNEL_COORDINATION_LIMIT_NS;
+            next.time(segment.end_ns)?;
+        }
+        if overrun{next.ordinary_closed=true;}
+        *self=next;
+        Ok(Settlement{actual_ns:total,overrun,crossed_window:start/WINDOW_NS!=(cursor-1)/WINDOW_NS})
     }
     fn time(&mut self,now:u64)->Result<(),Error>{
         if now<self.last_ns{return Err(Error::Clock);}
@@ -266,6 +314,23 @@ mod tests{
                 caps:ROLES[i].allowed_caps(),control_ns_per_100ms:[30_000_000,8_000_000,4_000_000,3_500_000,4_000_000,3_000_000,4_500_000,3_000_000][i],
                 cpu_mask:1,thread_count:1,endpoint_id:i as u64+1}),
             other_protected_pool_bytes:5*1024*1024,other_control_ns_per_100ms:10_000_000}
+    }
+    #[test]
+    fn measured_boundary_split_conserves_debit_and_never_invents_credit(){
+        let mut q=Cpu0BudgetLedger::new();
+        let start=WINDOW_NS-2_000_000;
+        let segments=[MeasuredSegment{start_ns:start,end_ns:WINDOW_NS,cpu_ns:1_500_000},
+            MeasuredSegment{start_ns:WINDOW_NS,end_ns:WINDOW_NS+2_000_000,cpu_ns:1_500_000}];
+        assert_eq!(q.account_exact_coordination(0,&segments,2_999_999,|_,_|panic!()),Err(Error::Denied));
+        assert_eq!(q.account_exact_coordination(0,&segments,3_000_000,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(q.lifetime_total(),Ok(0));
+        let receipt=q.account_exact_coordination(0,&segments,3_000_000,|_,_|Ok(())).unwrap();
+        assert!(receipt.crossed_window&&!receipt.overrun);
+        assert_eq!(q.lifetime_total(),Ok(3_000_000));assert_eq!(q.kernel_coordination_spent(),1_500_000);
+        assert_eq!(q.max_window_upper_ns(),1_500_000);
+        let extra=[MeasuredSegment{start_ns:WINDOW_NS+2_000_000,end_ns:WINDOW_NS+3_000_000,cpu_ns:500_001}];
+        assert!(q.account_exact_coordination(0,&extra,500_001,|_,_|Ok(())).unwrap().overrun);
+        assert!(q.ordinary_closed());assert_eq!(q.lifetime_total(),Ok(3_500_001));
     }
     #[test]
     fn fixed_categories_share_single_cpu_and_recovery_cannot_be_borrowed(){
