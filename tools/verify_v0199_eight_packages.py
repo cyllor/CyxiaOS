@@ -112,7 +112,7 @@ class Bringup:
             require(starts[i]==(role,old,old_root) and faults[i]==(role,esr,far),
                     'restart start/fault UART and memory mismatch')
             mask,*deltas=words[400+i*9:409+i*9]
-            require(mask==255^(1<<i) and deltas[i]==0
+            require(mask==(255^(1<<i)) and deltas[i]==0
                     and all(delta>0 for j,delta in enumerate(deltas) if j!=i),
                     'a surviving EL0 role did not progress with faulted peer stopped')
             require(survivors[i]==(role,mask,sum(deltas)),
@@ -123,6 +123,15 @@ class Bringup:
                    f'V0199_PACKAGE_RELOAD a={role} b={old_root} c={new_root}']
             positions=[serial.index((line+'\n').encode('ascii')) for line in phase]
             require(positions==sorted(set(positions)),'restart phases out of order')
+        live_mask=words[472]
+        live_deltas=words[473:481]
+        require(live_mask==255 and all(delta>0 for delta in live_deltas),
+                'all eight replacement contexts did not progress in one live round')
+        require(rows('V0199_BOOTSTRAP_ALL_LIVE')==[(8,live_mask,sum(live_deltas))],
+                'all-live UART and memory mismatch')
+        last_reload=f'V0199_PACKAGE_RELOAD a={ROLES[-1]} b={reloads[-1][1]} c={reloads[-1][2]}\n'.encode('ascii')
+        require(serial.index(last_reload)<serial.index(b'V0199_BOOTSTRAP_ALL_LIVE '),
+                'all-live round preceded final reload')
         business=rows('V0199_BOOTSTRAP_BUSINESS')
         require(len(business)==3,'missing independent business progress')
         for slot in range(1,4):
@@ -136,6 +145,7 @@ class Bringup:
         return dict(guest_cpus=4,fixed_control_cpu=0,business_cpu_mask=14,
                     distinct_native_packages=8,private_stack_bytes=32768,
                     native_diagnostic_package_reloads=8,native_survivor_role_progress_pairs=56,
+                    post_restart_live_roles=8,
                     durable_role_restarts=False,
                     roles=details,production_g0=False,real_services_tested=False)
 
