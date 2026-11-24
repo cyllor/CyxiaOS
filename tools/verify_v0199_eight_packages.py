@@ -72,7 +72,7 @@ class Bringup:
         require=verify_smp.require
         require(cpu_count==4 and len(page)==4096,'wrong guest topology/evidence extent')
         words=struct.unpack('<512Q',page)
-        require(words[:10]==(MAGIC,8,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
+        require(words[:10]==(MAGIC,9,1,15,1,14,8,0,0,0),'wrong scope/unfinished bootstrap')
         require(serial.count(self.completion)==1 and b'SMP_ERROR' not in serial
                 and b'BOOTSTRAP_OVERRUN' not in serial and b'FAIL' not in serial,'guest fault')
         def rows(tag):
@@ -179,8 +179,9 @@ class Bringup:
                 'invalid aligned-window upper bound or sampled interval')
         loads=rows('V0199_INITIAL_LOAD')
         require(len(loads)==8 and [r[0] for r in loads]==list(ROLES)
-                and all(0<cost<=quota<=2_000_000 for _,cost,quota in loads)
-                and tuple(r[1] for r in loads)==words[32:40],
+                and all(0<largest<=min(cost,2_000_000) for _,cost,largest in loads)
+                and tuple(r[1] for r in loads)==words[32:40]
+                and all(0<slices and cost<=slices*largest for (_,cost,largest),slices in zip(loads,words[48:56])),
                 'initial role loading not fully prepaid/measured')
         prefix,prefix_accounted,prefix_upper=words[40:43]
         require(0<prefix==prefix_accounted<elapsed and 0<prefix_upper<=upper
@@ -209,7 +210,8 @@ class Bringup:
                     sampled_cpu0_ns=elapsed,accounted_cpu0_ns=accounted,
                     control_window_upper_bound_ns=upper,coordination_gap_crossings=crossings,
                     class_cpu_ns=classes,accounting_interval_ns=[start_ns,end_ns],
-                    initial_role_load_cpu_ns=list(words[32:40]),final_uart_tail_cpu_ns=elapsed-prefix,
+                    initial_role_load_cpu_ns=list(words[32:40]),initial_load_slices=list(words[48:56]),
+                    maximum_initial_load_slice_ns=max(r[2] for r in loads),final_uart_tail_cpu_ns=elapsed-prefix,
                     exact_per_window_split=False,complete_production_accounting=False,
                     durable_role_restarts=False,
                     roles=details,production_g0=False,real_services_tested=False)
