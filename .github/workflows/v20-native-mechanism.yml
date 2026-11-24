@@ -3,7 +3,7 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 
 on:
   push:
-    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
+    branches: [CyxiaOS-V0.20, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
       - 'kernel/**'
@@ -11,16 +11,27 @@ on:
       - 'crates/prototype/**'
       - 'crates/arch-aarch64/**'
       - 'crates/arch-x86_64/**'
+      - 'crates/driver-gicv2/**'
+      - 'crates/driver-virtio/**'
+      - 'crates/platform-virt/**'
       - 'tools/verify_smp.py'
+      - 'tools/verify_v0199_cpu0_roles.py'
       - 'tools/x86_64.py'
+  # The workflow change itself receives a real PR run; after integration
+  # relevant main-branch pushes automatically run on the merged source tree.
+  # Avoid rebuilding QEMU on every independent component-review branch.
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - '.github/workflows/v20-native-mechanism.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: v020-native-mechanism-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   qemu-pinned:
@@ -94,7 +105,14 @@ jobs:
           echo "$RUNNER_TEMP/qemu-bin" >> "$GITHUB_PATH"
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest
           mkdir -p artifacts/v020-arm-native
-          PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 tools/verify_smp.py             --elf target/aarch64-unknown-none-softfloat/debug/cyxia-kernel             --output artifacts/v020-arm-native/capture --timeout 30
+          git rev-parse HEAD > artifacts/v020-arm-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-arm-native/tree.txt
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-arm-native/kernel.elf
+          sha256sum artifacts/v020-arm-native/kernel.elf > artifacts/v020-arm-native/kernel.sha256
+          PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 tools/verify_smp.py \
+            --elf artifacts/v020-arm-native/kernel.elf \
+            --output artifacts/v020-arm-native/capture --timeout 30 \
+            2>&1 | tee artifacts/v020-arm-native/verify.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -129,6 +147,8 @@ jobs:
           (cd qemu-evidence && sha256sum -c archive.sha256)
           tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
           mkdir -p artifacts/v020-x86-native
+          git rev-parse HEAD > artifacts/v020-x86-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-x86-native/tree.txt
           python3 tools/x86_64.py build --output artifacts/v020-x86-native/build --mechanism smp
           CYXIA_PINNED_QEMU_FIRMWARE="$RUNNER_TEMP/qemu-bin/pc-bios" \
             PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 tools/x86_64.py run \
@@ -140,3 +160,52 @@ jobs:
           name: v020-x86-smp-fixture-${{ github.sha }}
           retention-days: 7
           path: artifacts/v020-x86-native/
+
+  cpu0-role-fixture:
+    # Share the pinned QEMU build, but use a distinct freshly built guest
+    # and evidence. This fixture is NOT the production eight-service OS.
+    needs: qemu-pinned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-pinned-qemu-${{ github.sha }}
+          path: qemu-evidence
+      - name: Install toolchain and QEMU runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Run real CPU0 eight-EL0-context mechanism fixture
+        run: |
+          set -euo pipefail
+          (cd qemu-evidence && sha256sum -c archive.sha256)
+          tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          mkdir -p artifacts/v020-cpu0-native
+          git rev-parse HEAD > artifacts/v020-cpu0-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-cpu0-native/tree.txt
+          printf '%s\n' 'MECHANISM_FIXTURE_ONLY; G0 BLOCKED; G4 NOT_RUN' > artifacts/v020-cpu0-native/scope.txt
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+            2>&1 | tee artifacts/v020-cpu0-native/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-cpu0-native/kernel.elf
+          sha256sum artifacts/v020-cpu0-native/kernel.elf > artifacts/v020-cpu0-native/kernel.sha256
+          PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 -B tools/verify_v0199_cpu0_roles.py \
+            --elf artifacts/v020-cpu0-native/kernel.elf \
+            --output artifacts/v020-cpu0-native/capture --timeout 45 \
+            2>&1 | tee artifacts/v020-cpu0-native/verification.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-cpu0-integrated-fixture-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: artifacts/v020-cpu0-native/
