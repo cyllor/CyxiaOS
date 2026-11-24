@@ -603,12 +603,16 @@ impl<'a> Session<'a> {
             self.fail();
             return Err(Error::Time);
         }
-        if self.output != 0 || self.received == PLAINTEXT_BUFFER {
+        if self.output != 0
+            || self.received == PLAINTEXT_BUFFER
+            || (self.received != 0 && self.application != ApplicationProtocol::LocalEcho)
+        {
             return Ok(());
         }
         // SEC-N05: preserve previously authenticated plaintext while
-        // receiving the continuation of a fragmented Echo frame. A TLS
-        // record is not an application-message boundary. No additional
+        // receiving the continuation of a fragmented Echo frame. Legacy
+        // cluster TLS intentionally retains its previous one-record-at-a-time
+        // backpressure contract. No additional
         // allocation is made: append only to the unused fixed buffer tail.
         let accepted = self.received;
         let incoming = &mut self.buffers.input[..self.input];
