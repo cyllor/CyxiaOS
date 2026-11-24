@@ -69,6 +69,12 @@ impl<const N:usize> DirectionalEndpoint<N>{
         if actor.id!=self.sender.id{return Err(Error::Auth);}
         if actor!=self.sender||generation!=self.identity.generation||self.closed{return Err(Error::Stale);}
         let message=Message::copied(actor,request,generation,payload)?;
+        // Retained pending messages and a DONE-but-unacknowledged
+        // receive are not evictable even after later sends succeed.
+        if let Some(old)=self.queue.iter().flatten().chain(self.reservation.as_ref().map(|r|&r.ticket.message))
+            .find(|m|m.request_id()==request){
+            return if *old==message{Ok(())}else{Err(Error::Conflict)};
+        }
         if request==self.send_hi{
             return if self.last_send==Some(message){Ok(())}else{Err(Error::Conflict)};
         }
@@ -78,6 +84,7 @@ impl<const N:usize> DirectionalEndpoint<N>{
         self.send_hi=request;self.last_send=Some(message);Ok(())
     }
     pub fn pending(&self)->usize{self.len}
+    pub fn endpoint(&self)->Endpoint{self.identity}
     /// The actual SVC adapter first validates the full user writable span.
     /// No waiting message: do not consume sequence, pin memory or credit.
     /// Credit callback reserves a real completion slot before reservation.
@@ -137,6 +144,15 @@ impl<const N:usize> DirectionalEndpoint<N>{
         verify(r.ticket,r.phase==Phase::Done)?;
         self.retired=r.ticket.seq;self.reservation=None;Ok(())
     }
+    /// After recovery has reconciled any retained receive, a closed
+    /// endpoint may transfer an exact queued head to the independent
+    /// custody owner. No other removal path drops pending payloads.
+    pub fn recover_head(&mut self,verify_custody:impl FnOnce(&Message)->Result<(),Error>)->Result<(),Error>{
+        if !self.closed||self.reservation.is_some(){return Err(Error::Busy);}
+        let message=self.queue[self.head].as_ref().ok_or(Error::Again)?;
+        verify_custody(message)?;
+        self.queue[self.head]=None;self.head=(self.head+1)%N;self.len-=1;Ok(())
+    }
     pub fn drained(&self)->bool{self.closed&&self.reservation.is_none()&&self.len==0}
 }
 #[cfg(test)]
@@ -148,6 +164,8 @@ mod tests{
         let mut q=DirectionalEndpoint::<2>::new(Endpoint{id:9,generation:4,receiver},sender).unwrap();
         assert_eq!(q.reserve_receive(receiver,4,1,552,true,0,1,||panic!()),Err(Error::Again));
         q.send(sender,4,1,b"first").unwrap();q.send(sender,4,2,b"second").unwrap();
+        assert_eq!(q.send(sender,4,1,b"first"),Ok(()));
+        assert_eq!(q.send(sender,4,1,b"changed"),Err(Error::Conflict));
         assert_eq!(q.send(sender,4,3,b"third"),Err(Error::Again));
         assert_eq!(q.reserve_receive(receiver,4,1,551,true,0,1,||panic!()),Err(Error::Fault));
         let t=q.reserve_receive(receiver,4,1,552,true,0,1,||Ok(())).unwrap();
@@ -167,5 +185,7 @@ mod tests{
         assert_eq!(q.recover_receive(|_,_|Err(Error::Io)),Err(Error::Io));
         q.recover_receive(|retained,done|{assert_eq!(retained,t);assert!(!done);Ok(())}).unwrap();
         assert_eq!(q.pending(),1);assert!(!q.drained());
+        assert_eq!(q.recover_head(|_|Err(Error::Io)),Err(Error::Io));
+        q.recover_head(|m|{assert_eq!(m.request_id(),2);Ok(())}).unwrap();assert!(q.drained());
     }
 }
