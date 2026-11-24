@@ -99,6 +99,38 @@ fn read_only_optional_projection_cannot_settle_debits_or_clear_overruns() {
     assert_eq!(b.status(key()).unwrap(), settled);
     assert_eq!(b.current_status(key(), WINDOW_NS + 7).unwrap(), projected);
 }
+
+#[test]
+fn optional_completion_settles_independent_cpu_counter_and_rejects_wall_reversal() {
+    let mut b=BackgroundBudgets::new();
+    b.register(key(),100,0,100).unwrap();
+    let debit=b.reserve(key(),10,100).unwrap();
+    assert_eq!(b.complete(debit,9,99),Err(Error::Range));
+    assert_eq!(b.status(key()).unwrap().reserved_ns,10);
+    b.complete(debit,9,101).unwrap();
+    assert_eq!(b.status(key()).unwrap().spent_ns,9);
+    assert_eq!(b.status(key()).unwrap().reserved_ns,0);
+    assert_eq!(b.reserve(key(),1,100),Err(Error::Range));
+    assert_eq!(b.peek_status(key(),100),Err(Error::Range));
+    let over=b.reserve(key(),5,102).unwrap();
+    assert_eq!(b.complete(over,6,103),Err(Error::Budget));
+    assert_eq!(b.status(key()).unwrap().reserved_ns,0);
+    assert!(b.status(key()).unwrap().overrun);
+}
+#[test]
+fn optional_late_receipt_carry_is_window_bound_and_order_independent() {
+    let mut b=BackgroundBudgets::new();
+    b.register(key(),100,0,0).unwrap();
+    let early=b.reserve(key(),1_000_000,0).unwrap();
+    let later=b.reserve(key(),2_000_000,1).unwrap();
+    b.complete(later,2_000_000,2*WINDOW_NS+1).unwrap();
+    b.complete(early,1_000_000,WINDOW_NS+1).unwrap();
+    assert_eq!(b.peek_status(key(),2*WINDOW_NS+1).unwrap().spent_ns,2_000_000);
+    assert_eq!(b.peek_status(key(),3*WINDOW_NS).unwrap().spent_ns,0);
+    assert_eq!(b.current_status(key(),3*WINDOW_NS).unwrap().spent_ns,0);
+    assert_eq!(b.reserve(key(),1,2*WINDOW_NS+1),Err(Error::Range));
+}
+
 #[derive(Default)]
 struct Service {
     starts: usize,
