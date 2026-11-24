@@ -70,7 +70,7 @@ impl CapRecordV3{
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Label{
     OperationsView,SecurityView,ControllerView,AdviceSend,FindingSend,
-    DecisionRegister,ControlAux,Publish,FindingReceive,
+    DecisionRegister,ControlAux,Publish,FindingReceive,AdviceReceive,DecisionSend,DecisionReceive,
 }
 impl Label{
     fn requirement(self,source_role:u32)->Result<(Role,u64,u16,u64),Error>{
@@ -80,6 +80,12 @@ impl Label{
             SecurityView=>(Role::Security,rm::SNAPSHOT,12,SNAPSHOT_READ),
             ControllerView=>(Role::DeterministicController,rm::SNAPSHOT,12,SNAPSHOT_READ),
             AdviceSend=>(Role::Operations,rm::SEND_ADVICE,4,IPC_SEND),
+            // These are the existing directional IPC flows in §2.0/6.1,
+            // not new privilege bits. The signed endpoint catalog must
+            // bind the exact receiver/sender object and generation.
+            AdviceReceive=>(Role::DeterministicController,rm::DECISION_REGISTER,4,IPC_RECV),
+            DecisionSend=>(Role::DeterministicController,rm::DECISION_REGISTER,4,IPC_SEND),
+            DecisionReceive=>(Role::Publisher,rm::READ_DECISIONS,4,IPC_RECV),
             FindingSend=>(Role::Security,rm::SEND_FINDING,4,IPC_SEND),
             DecisionRegister=>(Role::DeterministicController,rm::DECISION_REGISTER,8,CONTROL_DECISION),
             Publish=>(Role::Publisher,rm::PUBLISH_PLAN,7,PLAN_PUBLISH),
