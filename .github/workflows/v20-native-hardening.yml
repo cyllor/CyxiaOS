@@ -3,9 +3,9 @@ name: V0.20 fixed-control native hardening (WIP)
 
 on:
   push:
-    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps]
+    branches: [work/v020-native-control-safety, fix/v020-v0199-contract-gaps, 'work/v020-gap-*']
   pull_request:
-    branches: [CyxiaOS-V0.20]
+    branches: [CyxiaOS-V0.20, fix/v020-v0199-contract-gaps]
   workflow_dispatch:
 
 permissions:
