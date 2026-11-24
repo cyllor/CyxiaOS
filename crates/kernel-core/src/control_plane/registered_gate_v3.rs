@@ -544,6 +544,21 @@ impl RegisteredDecisionGate {
         Ok(summary)
     }
 
+    /// Read the exact retained registered DecisionRecord (ControlRPC op9).
+    /// The only authorized EL0 reader is the independently registered
+    /// publisher. No record reconstruction and no implicit publication.
+    pub fn read_decision(&self,actor:Identity,boot:u64,epoch:u64,seq:u64)
+        ->Result<[u8;DECISION_BYTES],Error>{
+        if actor!=self.publisher||!actor.valid(){return Err(Error::Denied);}
+        if boot!=self.boot_epoch||epoch!=self.controller_epoch||seq==0{return Err(Error::Stale);}
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        for raw in &pending.decision_bytes[..pending.count]{
+            let d=DecisionRecordV3::decode(raw)?;
+            if d.decision_seq==seq{return Ok(*raw);}
+        }
+        Err(Error::Stale)
+    }
+
     /// Query is limited to authenticated local roles; old terminal keys
     /// outside the 256-record retention window are stale, never re-executed.
     pub fn terminal_summary(
