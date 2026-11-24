@@ -174,6 +174,15 @@ mod tests {
         assert!(!f.requests_review(old));
     }
     #[test]
+    fn overflowing_finding_deadline_is_never_a_valid_review_request() {
+        let mut finding=SecurityFinding::decode(&wire()).unwrap();
+        finding.expires_ns=u64::MAX;
+        let mut trusted=observation();
+        trusted.sampled_ns=u64::MAX-100;
+        trusted.now_ns=u64::MAX-2;
+        assert!(!finding.requests_review(trusted));
+    }
+    #[test]
     fn corrupt_length_reserved_kind_score_and_legacy_format_fail_closed() {
         for (at, value) in [(0, 0), (4, 1), (6, 0), (64, 99), (66, 3), (67, 2), (70, 1), (171, 1)] {
             let mut b = wire(); b[at] = value;
