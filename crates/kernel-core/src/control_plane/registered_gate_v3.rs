@@ -177,7 +177,22 @@ impl RegisteredDecisionGate {
                 && records.iter().zip(pending.decision_bytes[..pending.count].iter())
                     .all(|(a,b)| a==b);
             return if same_bytes {
-                Ok(Registration::ExactRetry)
+                match pending.status {
+                    // No effects occurred yet: even an exact retry must not
+                    // bypass a revoked rule, changed ledger or expired scope.
+                    PendingStatus::Frozen => {
+                        self.validate_rule_only(
+                            plan_wire, &plan, records, rule_profile, actions, context
+                        )?;
+                        Ok(Registration::ExactRetry)
+                    }
+                    // A previously accepted plan is only queryable by its
+                    // immutable identity. It is never re-authorized or applied.
+                    PendingStatus::AdapterAccepted => Ok(Registration::ExactRetry),
+                    // Unknown real-device outcomes cannot be re-registered
+                    // as if they were safely awaiting a new submission.
+                    PendingStatus::AdapterUnknown => Err(Error::NotReady),
+                }
             } else if same_key {
                 Err(Error::Denied)
             } else {
@@ -753,6 +768,63 @@ mod tests {
         assert_eq!(gate.last_plan_seq,257);
         assert_eq!(gate.last_decision_seq,260);
     }
+    #[test]
+    fn exact_unpublished_retry_cannot_bypass_current_rule_or_expired_scope() {
+        let rule_bytes=profile_bytes();
+        let profile=Profile::parse(&rule_bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&rule_bytes)];
+        let frozen=frozen(&[2,4],&[2,0]);
+        let ctx=trusted(&rule_bytes);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx).unwrap();
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx),
+            Ok(Registration::ExactRetry)
+        );
+        // Caller-supplied idempotence cannot revive a stale EL1 snapshot.
+        let mut stale=ctx;
+        stale.now_ns=ctx.sampled_ns+100_000_000;
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,stale),
+            Err(Error::Stale)
+        );
+        // A newly frozen rule generation invalidates *unpublished* retries.
+        stale=ctx;
+        stale.rules_generation+=1;
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,stale),
+            Err(Error::Stale)
+        );
+        // Cross-role exact wire replay is not registration authority.
+        assert_eq!(
+            gate.register_rule_only(PUBLISHER,&plan,&records,&profile,&frozen,ctx),
+            Err(Error::Denied)
+        );
+    }
+
+    #[test]
+    fn once_native_adapter_unknown_retry_is_never_advertised_as_frozen() {
+        let rule_bytes=profile_bytes();
+        let profile=Profile::parse(&rule_bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&rule_bytes)];
+        let frozen=frozen(&[2,4],&[2,0]);
+        let ctx=trusted(&rule_bytes);
+        let mut gate=RegisteredDecisionGate::new(CONTROLLER,PUBLISHER,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx).unwrap();
+        assert_eq!(gate.publish_once(
+            PUBLISHER,&plan,&records,&profile,&frozen,ctx,
+            ||Err(Error::Busy)
+        ),Err(Error::Busy));
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&frozen,ctx),
+            Err(Error::NotReady)
+        );
+        // Neither EL1 timeout nor repeated SVC input releases the slot.
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+    }
+
     #[test]
     fn trial_and_advice_without_disposition_or_permit_are_not_authorized() {
         let rules=profile_bytes();
