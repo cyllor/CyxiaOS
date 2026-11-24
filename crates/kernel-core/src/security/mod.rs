@@ -50,3 +50,5 @@ pub mod file_structure_v1;
 pub mod recovery_v1;
 
 pub mod boot_epoch_v1;
+
+pub mod file_mount_v1;
