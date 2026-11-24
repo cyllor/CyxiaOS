@@ -8,6 +8,7 @@ use super::{
     Epochs, Error, Identity,
     advisory::{Advice, Controller, Source, TrustedScope},
     advice_envelope_v1::{AdviceEnvelopeV1, TrustedAdviceScope},
+    rule_profile_v2::{Candidates, Profile},
     security_finding::{FrozenObservation, SecurityFinding},
 };
 
@@ -151,6 +152,70 @@ impl Pair {
     /// A valid hint requests an independent RuleProfile review, not authorization.
     pub fn security_review_requested(&self, trusted: FrozenObservation) -> bool {
         self.security.finding.is_some_and(|finding| finding.requests_review(trusted))
+    }
+
+    /// Use a parsed, immutable RuleProfile v2 to bound the operations
+    /// nomination to the current authenticated candidate set. This returns a
+    /// read-only review; even an adopted choice is NOT DecisionRecord v3,
+    /// authority, a new capacity grant, or an APPLIED receipt.
+    ///
+    /// `assisted` must be derived from the protected offline authorization
+    /// (AI_DISABLED/SHADOW must pass false), never from the model message.
+    pub fn review_with_rule_profile(
+        &self,
+        profile: &Profile<'_>,
+        rules_generation: u64,
+        trusted: TrustedScope,
+        raw_fields: [Option<u64>; 7],
+        frozen_candidates: &[u16],
+        assisted: bool,
+    ) -> Result<Review, Error> {
+        if !trusted.epochs.valid() || !trusted.target.valid()
+            || trusted.domain == 0 || trusted.domain > 15
+        {
+            return Err(Error::Denied);
+        }
+        if profile.generation != rules_generation {
+            return Err(Error::Stale);
+        }
+        let frozen = profile.match_candidates(
+            trusted.domain as u16, trusted.target.id,
+            raw_fields,
+            Candidates { static_ordinals: frozen_candidates },
+        )?.ok_or(Error::Denied)?;
+        let mut chosen = usize::from(frozen.fallback_index);
+        let mut source = ChoiceSource::Baseline;
+        if assisted && frozen.choice_policy == 1
+            && !matches!(trusted.domain, 6 | 11 | 12 | 14)
+        {
+            if let Some(advice) = self.operations.advice {
+                let current = advice.domain == trusted.domain
+                    && advice.target == trusted.target
+                    && advice.epochs == trusted.epochs
+                    && advice.model_generation == trusted.epochs.model
+                    && advice.snapshot_ns <= trusted.now_ns
+                    && advice.expires_ns > trusted.now_ns
+                    && advice.expires_ns > advice.snapshot_ns
+                    && advice.expires_ns <= advice.snapshot_ns.saturating_add(100_000_000);
+                if current {
+                    if let Some(index) = frozen_candidates.iter()
+                        .position(|&value| value == advice.candidate)
+                    {
+                        if frozen.allowed_mask & (1u32 << index) != 0 {
+                            chosen = index;
+                            source = ChoiceSource::OperationsAdvice;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Review {
+            candidate: *frozen_candidates.get(chosen).ok_or(Error::Denied)?,
+            source,
+            epochs: trusted.epochs,
+            target: trusted.target,
+            domain: trusted.domain,
+        })
     }
 
     /// The operations brain may nominate an allowed candidate; the independent
@@ -308,6 +373,47 @@ mod tests {
         p.submit(Brain::Operations,Identity{id:10,generation:1},1,suggestion(1)).unwrap();
         assert_eq!(review(&p).candidate,1);
         assert!(p.security_review_requested(observation()));
+    }
+    #[test]
+    fn v2_rule_profile_nomination_respects_mode_and_current_fallback() {
+        let mut catalog = [0u8; 80];
+        catalog[0..4].copy_from_slice(&0x4359_5255u32.to_le_bytes());
+        catalog[4..6].copy_from_slice(&2u16.to_le_bytes());
+        catalog[6..8].copy_from_slice(&32u16.to_le_bytes());
+        catalog[8..16].copy_from_slice(&1u64.to_le_bytes());
+        catalog[16..20].copy_from_slice(&1u32.to_le_bytes());
+        catalog[20..24].copy_from_slice(&80u32.to_le_bytes());
+        catalog[32..36].copy_from_slice(&1u32.to_le_bytes());
+        catalog[36..38].copy_from_slice(&1u16.to_le_bytes());
+        catalog[38..40].copy_from_slice(&1u16.to_le_bytes());
+        catalog[40..48].copy_from_slice(&99u64.to_le_bytes());
+        catalog[48..50].copy_from_slice(&1u16.to_le_bytes());
+        catalog[52..54].copy_from_slice(&2u16.to_le_bytes());
+        catalog[56..60].copy_from_slice(&48u32.to_le_bytes());
+        catalog[64..66].copy_from_slice(&2u16.to_le_bytes());
+        catalog[66..68].copy_from_slice(&1u16.to_le_bytes());
+        catalog[72..74].copy_from_slice(&4u16.to_le_bytes());
+        let rules = Profile::parse(&catalog).unwrap();
+        let mut brain=pair();
+        let trusted=scope();
+        let candidates=[2u16,4u16];
+        let initial=brain.review_with_rule_profile(
+            &rules,1,trusted,[None;7],&candidates,true
+        ).unwrap();
+        assert_eq!(initial.candidate,4);
+        assert_eq!(initial.source,ChoiceSource::Baseline);
+        brain.submit(Brain::Operations,Identity{id:10,generation:1},1,suggestion(2)).unwrap();
+        assert_eq!(brain.review_with_rule_profile(
+            &rules,1,trusted,[None;7],&candidates,false
+        ).unwrap().candidate,4);
+        let adopted=brain.review_with_rule_profile(
+            &rules,1,trusted,[None;7],&candidates,true
+        ).unwrap();
+        assert_eq!(adopted.candidate,2);
+        assert_eq!(adopted.source,ChoiceSource::OperationsAdvice);
+        assert_eq!(brain.review_with_rule_profile(
+            &rules,2,trusted,[None;7],&candidates,true
+        ),Err(Error::Stale));
     }
     #[test] fn stale_epoch_illegal_choice_and_expired_advice_revert_to_baseline() {
         let mut p=pair();
