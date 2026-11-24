@@ -10,7 +10,7 @@ use cyxia_kernel_core::control_plane::{
     role_manifest_v0199::{NativeRoleManifest,NativeRole,Role,ROLES,ROLE_COUNT,PrivateRegion,
         SnapshotView,AuxOperation,CONTROL_MASK,REQUIRED_ONLINE_MASK},
     pie_image_v0199::{RolePackageSpec,RolePackageInput,VerifiedRolePackage,ROLE_STACK_BYTES},
-    role_budget_v0199::{Class,Cpu0BudgetLedger,WINDOW_NS},
+    role_budget_v0199::{Class,Cpu0BudgetLedger,Turn,Settlement,WINDOW_NS,KERNEL_COORDINATION_LIMIT_NS},
 };
 use cyxia_kernel_core::security::syscall::{Syscall,StableCopy};
 use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
@@ -80,6 +80,69 @@ fn now_ns()->u64{
 fn ticks_for(ns:u64)->u64{
     u64::try_from((u128::from(ns)*u128::from(timer::frequency())).div_ceil(1_000_000_000))
         .expect("timer ticks").max(1)
+}
+/// Continuous attribution from the first post-bootstrap PMU sample through
+/// the final diagnostic sample. Every interval is charged exactly once:
+/// admitted role/recovery work or the protected EL1 coordination envelope.
+/// Initial loading before PMU initialization and the final evidence writer
+/// remain outside this explicitly bounded diagnostic measurement.
+struct BudgetMeter {
+    ledger:Cpu0BudgetLedger,
+    initial_tick:u64,
+    initial_ns:u64,
+    cursor:u64,
+    wall:u64,
+    crossed_gaps:u64,
+}
+impl BudgetMeter {
+    fn new()->Self{
+        let wall=now_ns();let tick=timer::cpu_ticks();
+        Self{ledger:Cpu0BudgetLedger::new(),initial_tick:tick,initial_ns:wall,
+            cursor:tick,wall,crossed_gaps:0}
+    }
+    fn sample_gap(&mut self)->(u64,u64){
+        let wall=now_ns();let tick=timer::cpu_ticks();
+        let actual=timer::cpu_ns(tick.checked_sub(self.cursor).expect("PMU counter regressed"));
+        let receipt=self.ledger.account_coordination_gap(cpu::slot(),self.wall,wall,actual)
+            .expect("continuous EL1 coordination interval");
+        self.cursor=tick;self.wall=wall;
+        if receipt.crossed_window{self.crossed_gaps+=1;}
+        if receipt.overrun{
+            report("V0199_BOOTSTRAP_OVERRUN",0,self.ledger.kernel_coordination_spent(),KERNEL_COORDINATION_LIMIT_NS);
+            fatal(687);
+        }
+        (wall,tick)
+    }
+    fn settle(&mut self,token:Turn,began:u64)->Settlement{
+        assert_eq!(began,self.cursor);
+        let wall=now_ns();let tick=timer::cpu_ticks();
+        let actual=timer::cpu_ns(tick.checked_sub(began).expect("PMU counter regressed"));
+        let receipt=self.ledger.settle(cpu::slot(),token,actual,wall).expect("same CPU0 owner");
+        self.cursor=tick;self.wall=wall;receipt
+    }
+    /// No work was admitted. Use a real masked physical timer wakeup rather
+    /// than repeatedly burning CPU0's uncharged execution time in a busy loop.
+    /// The diagnostic profile keeps EL1 IRQs masked outside EL0 entry.
+    fn idle_retry(&mut self){
+        self.sample_gap();
+        let daif:u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif",out(reg)daif,options(nomem,nostack));
+            assert_ne!(daif&(1<<7),0);
+            timer::arm(timer::ticks().checked_add(ticks_for(1_000_000)).unwrap());
+            timer::idle();
+            cpu::disable_timer();
+        }
+        self.sample_gap();
+    }
+    fn wait_for(&mut self,mut ready:impl FnMut()->bool){
+        let until=now_ns().checked_add(5_000_000_000).unwrap();
+        while !ready(){
+            check_failures();
+            if now_ns()>=until{fatal(688);}
+            self.idle_retry();
+        }
+    }
 }
 fn cap_kind(role:Role)->CapKind{
     match role{
@@ -311,22 +374,22 @@ fn class(role:Role)->(Class,u16,u64){
         Role::Validator|Role::Learner=>(Class::Optional,0,500_000),
     }
 }
-fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetLedger,expect_fault:bool)->bool{
-    let now=now_ns();if now<r.wake_ns{return false;}
+fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut BudgetMeter,expect_fault:bool)->bool{
+    let (now,began)=budget.sample_gap();if now<r.wake_ns{return false;}
     let (class,domain,quota)=class(m.members[index].role);
-    let token=match budget.reserve_role_with_wall(m,m.members[index].actor,cpu::slot(),class,domain,quota,50_000_000,now){
+    let token=match budget.ledger.reserve_role_with_wall(m,m.members[index].actor,cpu::slot(),class,domain,quota,50_000_000,now){
         Ok(t)=>t,
         Err(Error::Exhausted|Error::Busy)=>return false,
         Err(e)=>panic!("native control budget refused: {e:?}"),
     };
-    let began=timer::cpu_ticks();
     let mut parked=false;
     // One prepaid role turn may traverse several real SVCs; the advisory
     // slot is not refilled per syscall or timer preemption.
     // The 0.25ms diagnostic decision slice may only service one trap;
     // additional work must be independently admitted under the same 0.5ms
     // combined decision/publication limit for this domain and window.
-    for _ in 0..if class==Class::Decision{1}else{32}{
+    let trap_limit=if class==Class::Decision{1}else{32};
+    for _ in 0..trap_limit{
         let actual=timer::cpu_elapsed_ns(began);
         let wall=now_ns();
         let cpu_left=quota.saturating_sub(actual);
@@ -357,15 +420,14 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
         parked=dispatch(index,m,r);
         if parked{break;}
     }
-    let actual=timer::cpu_elapsed_ns(began);
-    let receipt=budget.settle(cpu::slot(),token,actual,now_ns()).expect("same owned CPU0 turn");
+    let receipt=budget.settle(token,began);
     r.charges=r.charges.checked_add(receipt.actual_ns).unwrap();r.turns+=1;
     if receipt.overrun||receipt.crossed_window{
         report("V0199_BOOTSTRAP_OVERRUN",m.members[index].role.id() as u64,receipt.actual_ns,quota);
         fatal(620+index as u64);
     }
     // Actual accounting, not elapsed host wall or a model-provided scalar.
-    assert!(!budget.ordinary_closed());
+    assert!(!budget.ledger.ordinary_closed());
     parked
 }
 /// Quiescent CPU0 owner only. First revoke the selected context and all
@@ -399,7 +461,7 @@ fn retire_root(index:usize,bank:usize){
     assert!(bytes.iter().all(|&v|v==0));
 }
 fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT],
-    budget:&mut Cpu0BudgetLedger)
+    budget:&mut BudgetMeter)
 {
     use cyxia_kernel_core::control_plane::service_restart::{Lifecycle,RestartDecision};
     let until=now_ns().checked_add(15_000_000_000).unwrap();
@@ -419,8 +481,10 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         running[i].wake_ns=0;
         while running[i].fault_esr==0{
             if now_ns()>=until{fatal(680);}
-            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
+            let turns=running[i].turns;
             let _=turn(i,manifest,&mut running[i],budget,true);
+            if running[i].turns==turns{budget.idle_retry();}
         }
         let esr=running[i].fault_esr;let far=running[i].fault_far;
         report("V0199_RESTART_GUARD_FAULT",old.role.id() as u64,esr,far);
@@ -443,15 +507,18 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         let mut progressed=0u64;
         while progressed!=survivor_mask{
             if now_ns()>=until{fatal(685);}
+            let mut ran=false;
             for j in 0..ROLE_COUNT{
                 if j==i||progressed&(1u64<<j)!=0{continue;}
                 if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+                let turns=running[j].turns;
                 let _=turn(j,manifest,&mut running[j],budget,false);
+                ran|=running[j].turns!=turns;
                 if running[j].clocks>before[j].0&&running[j].role_calls>before[j].1{
                     progressed|=1u64<<j;
                 }
             }
-            core::hint::spin_loop();
+            if !ran{budget.idle_retry();}
         }
         let mut total_delta=0u64;
         SMP_EVIDENCE.words[400+i*9].store(progressed,Ordering::Relaxed);
@@ -461,16 +528,15 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             SMP_EVIDENCE.words[400+i*9+1+j].store(delta,Ordering::Relaxed);
         }
         report("V0199_RESTART_SURVIVORS",old.role.id() as u64,progressed,total_delta);
-        let credit=loop{
-            let now=now_ns();if now>=until{fatal(682);}
-            if now%WINDOW_NS>WINDOW_NS-10_000_000{continue;}
-            match budget.reserve_kernel_with_wall(0,Class::Recovery,8_000_000,50_000_000,now){
-                Ok(t)=>break t,
-                Err(Error::Exhausted|Error::Busy)=>continue,
+        let (credit,start)=loop{
+            let (now,start)=budget.sample_gap();if now>=until{fatal(682);}
+            if now%WINDOW_NS>WINDOW_NS-10_000_000{budget.idle_retry();continue;}
+            match budget.ledger.reserve_kernel_with_wall(0,Class::Recovery,8_000_000,50_000_000,now){
+                Ok(t)=>break (t,start),
+                Err(Error::Exhausted|Error::Busy)=>{budget.idle_retry();continue;},
                 Err(e)=>panic!("recovery reservation: {e:?}"),
             }
         };
-        let start=timer::cpu_ticks();
         retire_root(i,old_bank);
         let (member,new)=load(i,next,1);
         assert!(member.ttbr0_root!=old_root&&member.actor.generation==next);
@@ -478,8 +544,8 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
         manifest.members[i]=member;
         manifest.validate().unwrap();
-        let actual=timer::cpu_elapsed_ns(start);
-        let receipt=budget.settle(0,credit,actual,now_ns()).unwrap();
+        let receipt=budget.settle(credit,start);
+        let actual=receipt.actual_ns;
         if receipt.overrun||receipt.crossed_window{
             report("V0199_BOOTSTRAP_OVERRUN",old.role.id() as u64,receipt.actual_ns,8_000_000);
             fatal(683);
@@ -488,8 +554,10 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         running[i]=new;
         while running[i].clocks<2||running[i].role_calls<2{
             if now_ns()>=until{fatal(684);}
-            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{budget.idle_retry();continue;}
+            let turns=running[i].turns;
             let _=turn(i,manifest,&mut running[i],budget,false);
+            if running[i].turns==turns{budget.idle_retry();}
         }
         // READY here means only the actual diagnostic client reentered.
         // Formal service replay/READY is deliberately not advertised.
@@ -525,19 +593,22 @@ pub(super) fn run()->!{
     wait(||(1..REQUIRED).all(|slot|PROGRESS[slot*2].load(Ordering::Acquire)>=2));
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
     unsafe{timer::init_cpu_accounting();}
-    let mut budget=Cpu0BudgetLedger::new();
+    let mut budget=BudgetMeter::new();
     let until=now_ns().checked_add(5_000_000_000).unwrap();
     // Controller/publisher/supervisor before optional model/learning work.
     let order=[2usize,3,7,1,0,5,4,6];
     while !running.iter().all(|r|r.clocks>=2&&r.role_calls>=2){
         if now_ns()>=until{fatal(650);}
+        let mut ran=false;
         for i in order{
             if running[i].clocks>=2&&running[i].role_calls>=2{continue;}
             // Do not begin an evaluation in a near-expired 100ms window.
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            let turns=running[i].turns;
             let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            ran|=running[i].turns!=turns;
         }
-        core::hint::spin_loop();
+        if !ran{budget.idle_retry();}
     }
     report("V0199_BOOTSTRAP_INITIAL_ROLES",ROLE_COUNT as u64,0,0);
     restart_each(&mut manifest,&mut running,&mut budget);
@@ -550,15 +621,18 @@ pub(super) fn run()->!{
     let mut progressed=0u64;
     while progressed!=mask{
         if now_ns()>=until{fatal(686);}
+        let mut ran=false;
         for i in order{
             if progressed&(1u64<<i)!=0{continue;}
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            let turns=running[i].turns;
             let _=turn(i,&manifest,&mut running[i],&mut budget,false);
+            ran|=running[i].turns!=turns;
             if running[i].clocks>start[i].0&&running[i].role_calls>start[i].1{
                 progressed|=1u64<<i;
             }
         }
-        core::hint::spin_loop();
+        if !ran{budget.idle_retry();}
     }
     SMP_EVIDENCE.words[472].store(progressed,Ordering::Relaxed);
     let mut total_delta=0u64;
@@ -594,9 +668,9 @@ pub(super) fn run()->!{
         report("V0199_BOOTSTRAP_BUSINESS",slot as u64,PROGRESS[slot*2].load(Ordering::Acquire),0);
     }
     for gate in GATES.iter().take(REQUIRED).skip(1){close_gate(gate);}
-    wait(||(1..REQUIRED).all(|i|GATES[i].quiescent()));
+    budget.wait_for(||(1..REQUIRED).all(|i|GATES[i].quiescent()));
     QUIT.store(true,Ordering::Release);
-    wait(||STOPPED.load(Ordering::Acquire)==14);
+    budget.wait_for(||STOPPED.load(Ordering::Acquire)==14);
     check_failures();
     for slot in 1..REQUIRED{
         for (i,value) in [AFFINITIES[slot].load(Ordering::Acquire),
@@ -605,7 +679,19 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[16+slot*4+i].store(value,Ordering::Relaxed);
         }
     }
-    let summary=[MAGIC,4,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let (sample_end_ns,end)=budget.sample_gap();
+    let elapsed=timer::cpu_ns(end.checked_sub(budget.initial_tick).unwrap());
+    let accounted=budget.ledger.lifetime_total().unwrap();
+    let upper=budget.ledger.max_window_upper_ns();
+    assert_eq!(elapsed,accounted);
+    assert!(upper<=70_000_000&&!budget.ledger.ordinary_closed());
+    let ledger_row=[elapsed,accounted,upper,budget.crossed_gaps,budget.initial_ns,sample_end_ns,
+        budget.ledger.lifetime_spent(Class::Operations),budget.ledger.lifetime_spent(Class::Security),
+        budget.ledger.lifetime_spent(Class::Decision),budget.ledger.lifetime_spent(Class::Coordination),
+        budget.ledger.lifetime_spent(Class::Recovery),budget.ledger.lifetime_spent(Class::Optional)];
+    for(i,value)in ledger_row.into_iter().enumerate(){SMP_EVIDENCE.words[481+i].store(value,Ordering::Relaxed);}
+    report("V0199_BOOTSTRAP_ACCOUNTING",elapsed,accounted,upper);
+    let summary=[MAGIC,5,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
