@@ -11,12 +11,18 @@
 | F03 | 控制预算拆分 | `learning/governance.rs` 及 ARM `prototype_runtime/learning.rs`：61.5ms 必需 + 8.5ms 可选、总70ms/100ms；增加异常计费/临界预算测试 | 组件/构建；全负载 ARM QEMU 整窗未验收 |
 | F04 | 旧跨节点/动态核心原生拒绝 | `domains/types.rs` 添加本地动作准入门；ARM `domain_control.rs` 在 CHECK 及 PUBLISH 两次拒绝 `ControlSet`/`OfferCpu`/`Placement` | 本地动作门单元测试；旧历史解码保留供迁移/审计 |
 | F05 | RuleProfile v2 基础契约 | `control_plane/rule_profile_v2.rs`：≤64KiB、LE、递增 rule_id、1–15 域、敏感域拒 choice_policy1、谓词/静态档序/回退秩严格校验及只读候选求交 | 仅无分配组件；独立控制器/决策登记尚未接线 |
+| F06 | 敏感域 AI 采纳与建议时效 | `control_plane/advisory.rs`：D06/D11/D12/D14 在普通路径只选确定性基线；建议期限不得超过快照+100ms | 主机逻辑测试；原生 PUBLISH 侧仍待联调 |
+| F07 | 运营 AdviceEnvelope v1 | `control_plane/advice_envelope_v1.rs`：152B LE 封包、当前快照/模型/候选 hash、建议索引与实际候选值绑定；`fixed.rs` 接入独立运营 mailbox | 组件测试；受保护 EL0/EL1 真实 IPC 未接线 |
+| F08 | RuleProfile v2 普通裁决入口 | `fixed.rs::review_with_rule_profile` 只在受信模式与同代规则下采纳允许集合内运营建议；无合法候选 fail-closed；`RuleProfile` 的 trial 规则无真实许可不进入普通审查 | 规则/模式单元测试；不是独立决定登记或执行 |
+| F09 | DecisionRecord v3 | `control_plane/decision_record_v3.rs`：256B LE 解析、模式/来源/处置/理由/允许位图/候选索引约束、敏感域 AI_DENY | G1 只读规范组件；缺 role2 冻结登记与真实 AdviceDisposition |
+| F10 | Plan/Policy v2 | `control_plane/plan_wire_v2.rs`：64B+144B v2 小端、长短/域/目标/代际/模式/重复检查，交叉匹配 DecisionRecord v3 | 不产生发布授权；没有实际 SHA-256、受保护 sidecar 登记、发布者身份、原生 PREPARE/PUBLISH/执行回执 |
+
  
 ## 完成定义与保留阻断
  
 **P0：固定 CPU 编号冲突。** V0.19.9 唯一控制 C=CPU0、业务 B=CPU1–3；V0.20 仍是 C=CPU1、CPU0 EL1 broker、业务 CPU2–3。不得简单替换常量，必须重接异常/定时器、CPU0 EL0 控制调度、业务核亲和、IRQ/DMA 等并通过真正原生启动与 A01–A04、A15/E14。当前原生布局不符合规范，G0 **BLOCKED**。
  
-**P0：核心版本化封包。** `policy_wire.rs` 仍是 PlanHeader/PolicyEnvelope v1；没有完整原生 `DecisionRecord v3` 登记/唯一代理发布/RuleProfile v2 最终核验。新增 RuleProfile 只读校验器不构成这条链已完成，G1 **NOT_READY**。
+**P0：核心版本化封包。** 旧原生 `policy_wire.rs` 仍在处理 PlanHeader/PolicyEnvelope v1；本工作分支新增 V0.19.9 v2/v3 只读解析/绑定组件，但**尚未将原生发布执行切换到 v2、也没有 EL1 DecisionRecord v3 冻结登记/唯一代理 PUBLISH/RuleProfile v2 最终硬门核验**。旧 v1 不得被称为 v2。G1 **NOT_READY**。
  
 **P0：任务与存储 ABI。** Syscall x8/x0–x5 ABI v3、ET_DYN/PIE 安全装载、FileService v4/Reply v3、磁盘超级块 v1(80B)/data_start=4118、Receipt/Index v4 与安全状态持久对象尚未一致迁移。禁止尝试用旧格式数据直接改变版本号。当前数据磁盘不可视为符合规范。
  
