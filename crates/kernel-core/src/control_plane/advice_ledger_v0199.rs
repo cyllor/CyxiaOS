@@ -102,6 +102,15 @@ impl EvidenceLedger{
         self.last_ns=trusted.now_ns;
         Ok(AdviceResult::Recorded)
     }
+    /// Controller-side read of the exact admitted AdviceKey. It is not
+    /// a capability or a new inference. The decision gate independently
+    /// checks the current authority and commits the disposition only after
+    /// all registration checks pass.
+    pub(super) fn admitted_wire(&self,actor:Identity,key:AdviceKey)->Result<[u8;ADVICE_BYTES],Error>{
+        if actor!=self.controller{return Err(Error::Denied);}
+        self.rows.iter().flatten().find(|row|row.key==key)
+            .map(|row|row.advice_wire).ok_or(Error::Stale)
+    }
     pub fn finalize(
         &mut self,actor:Identity,disposition:&[u8],
         decision:Option<&[u8]>,

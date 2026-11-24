@@ -12,6 +12,9 @@ use super::{
     decision_record_v3::{DecisionRecordV3, DecisionSource, DECISION_BYTES},
     plan_wire_v2::{PlanV2, MAX_ACTIONS},
     rule_profile_v2::Profile,
+    advice_envelope_v1::{AdviceEnvelopeV1,TrustedAdviceScope,ADVICE_BYTES},
+    advice_disposition_v1::{AdviceDispositionV1,DISPOSITION_BYTES},
+    advice_ledger_v0199::{AdviceKey,EvidenceLedger},
     apply_report_v1::{self,ApplyReportV1,TrustedExecutor},
 };
 
@@ -85,6 +88,18 @@ pub struct FrozenAction<'a> {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingStatus { Frozen, AdapterAccepted, AdapterUnknown }
+#[derive(Clone,Copy)]
+struct AssistedProof {
+    advice:[u8;ADVICE_BYTES],
+    disposition_digest:[u8;32],
+}
+/// Supplied from the actual protected Active model, offline configuration
+/// and current rule mode. Neither boolean is read from a user/model frame.
+pub struct AssistedScope<'a>{
+    pub advice:&'a TrustedAdviceScope<'a>,
+    pub assisted_mode:bool,
+    pub offline_model_authorized:bool,
+}
 struct Pending {
     plan_seq: u64,
     plan_digest: [u8;32],
@@ -92,6 +107,7 @@ struct Pending {
     decision_bytes: [[u8;DECISION_BYTES];MAX_ACTIONS],
     status: PendingStatus,
     expires_ns: u64,
+    assisted:Option<AssistedProof>,
 }
 
 /// Fixed-memory guard. This can be owned by a protected, serialized EL1
@@ -171,6 +187,7 @@ impl RegisteredDecisionGate {
         if actor != self.controller {return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
         if let Some(pending)=&self.pending {
+            if pending.assisted.is_some(){return Err(Error::Busy);}
             let same_key=plan.header.plan_seq==pending.plan_seq;
             let same_bytes=same_key
                 && sha256(plan_wire)==pending.plan_digest
@@ -221,6 +238,7 @@ impl RegisteredDecisionGate {
             decision_bytes:copied,
             status:PendingStatus::Frozen,
             expires_ns:expires,
+            assisted:None,
         });
         self.last_plan_seq=plan.header.plan_seq;
         self.last_decision_seq=last;
@@ -312,6 +330,7 @@ impl RegisteredDecisionGate {
     ) -> Result<Publication,Error> {
         if actor!=self.publisher {return Err(Error::Denied);}
         let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        if pending.assisted.is_some(){return Err(Error::Denied);}
         let plan=PlanV2::decode(plan_wire)?;
         if plan.header.plan_seq!=pending.plan_seq
             || sha256(plan_wire)!=pending.plan_digest
@@ -338,6 +357,139 @@ impl RegisteredDecisionGate {
         } else {
             result.map(|_|Publication::AdapterAccepted)
         }
+    }
+
+    /// Narrow one-action assisted vertical slice. Unlike RULE_ONLY the
+    /// exact admitted advice and independently authorized model are required.
+    /// Sensitive domains, mixed plans, trials and rejected fallback with
+    /// causal evidence stay closed until their respective gates are wired.
+    fn validate_assisted_one(&self,plan_wire:&[u8],plan:&PlanV2<'_>,
+        record:&[u8;DECISION_BYTES],profile:&Profile<'_>,local:&FrozenAction<'_>,
+        context:TrustedRegistrationScope,scope:&AssistedScope<'_>,
+        advice_wire:&[u8;ADVICE_BYTES])->Result<(),Error>
+    {
+        self.check_identity_and_context(context)?;
+        let trusted=scope.advice;
+        if !scope.assisted_mode||!scope.offline_model_authorized
+            || plan.header.flags!=1||plan.header.action_count!=1
+            || rule_profile_mismatch(profile,context)
+            || plan.header.base_plan_version!=context.base_plan_version
+            || plan.ledger_generation!=context.ledger_generation
+            || plan.core_generation!=context.core_generation
+            || plan.header.controller_epoch!=context.controller_epoch
+            || plan.header.snapshot_seq!=context.snapshot_seq
+            || plan.header.active_model_generation!=trusted.epochs.model
+            || trusted.epochs.boot!=context.boot_epoch
+            || trusted.epochs.controller!=context.controller_epoch
+            || trusted.epochs.resources!=context.ledger_generation
+            || trusted.epochs.cores!=context.core_generation
+            || trusted.snapshot_seq!=context.snapshot_seq
+            || trusted.sampled_ns!=context.sampled_ns || trusted.now_ns!=context.now_ns
+            || trusted.domain!=local.domain_id || trusted.target!=local.target
+            || trusted.candidates!=local.static_ordinals
+            || trusted.candidate_set_hash!=local.candidate_set_hash
+        {return Err(Error::Denied);}
+        let advice=AdviceEnvelopeV1::decode(advice_wire)?;
+        advice.into_advice(trusted)?;
+        plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
+        let rec=DecisionRecordV3::decode(record)?;
+        let act=plan.action(0)?;
+        let end=context.sampled_ns.checked_add(100_000_000).ok_or(Error::Clock)?;
+        let installed=context.sampled_ns.checked_add(10_000_000_000).ok_or(Error::Clock)?;
+        if matches!(local.domain_id,6|11|12|14)||rec.source!=DecisionSource::AiAssisted
+            || rec.boot_epoch!=context.boot_epoch
+            || rec.rules_generation!=context.rules_generation || rec.rules_hash!=context.rules_hash
+            || rec.plan_digest!=sha256(plan_wire)
+            || rec.target_id!=local.target.id || rec.target_generation!=local.target.generation
+            || rec.domain_id!=local.domain_id||rec.candidate_set_hash!=local.candidate_set_hash
+            || act.candidate_set_hash!=local.candidate_set_hash||act.action_payload!=local.action_payload
+            || act.model_hash!=trusted.model_hash
+            || rec.advisor_epoch!=advice.advisor_epoch || rec.advice_seq!=advice.advice_seq
+            || rec.advice_model_generation!=advice.active_model_generation
+            || rec.recommended_index!=advice.recommended_index
+            || rec.selected_index!=advice.recommended_index
+            || act.expires_local_ns<=context.now_ns||act.expires_local_ns>end
+            || plan.header.active_until_local_ns!=installed
+        {return Err(Error::Denied);}
+        let rule=profile.match_candidates(local.domain_id,local.target.id,local.raw_fields,
+            super::rule_profile_v2::Candidates{static_ordinals:local.static_ordinals})?
+            .ok_or(Error::Denied)?;
+        if rule.choice_policy!=1||!rec.matches_rule(rule)
+            ||!rec.matches_candidate_count(local.static_ordinals.len())
+            ||rule.allowed_mask&(1u32<<rec.selected_index)==0
+        {return Err(Error::Denied);}
+        Ok(())
+    }
+
+    /// Atomically freeze one actual controller decision AND its admitted
+    /// advice disposition under the serialized EL1 owner. All registration
+    /// checks precede ledger.finalize; subsequent writes are infallible
+    /// local custody changes. Advice by itself never grants execution.
+    pub fn register_assisted_one(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],disposition:&[u8;DISPOSITION_BYTES],
+        profile:&Profile<'_>,local:&FrozenAction<'_>,context:TrustedRegistrationScope,
+        scope:&AssistedScope<'_>,ledger:&mut EvidenceLedger)->Result<Registration,Error>
+    {
+        if actor!=self.controller{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        if let Some(p)=&self.pending{
+            if plan.header.plan_seq!=p.plan_seq{return Err(Error::Busy);}
+            let proof=p.assisted.ok_or(Error::Denied)?;
+            if p.count!=1||sha256(plan_wire)!=p.plan_digest||p.decision_bytes[0]!=*record
+                ||sha256(disposition)!=proof.disposition_digest{return Err(Error::Denied);}
+            return match p.status{
+                PendingStatus::Frozen=>{
+                    self.validate_assisted_one(plan_wire,&plan,record,profile,local,context,scope,&proof.advice)?;
+                    Ok(Registration::ExactRetry)
+                }
+                PendingStatus::AdapterAccepted=>Ok(Registration::ExactRetry),
+                PendingStatus::AdapterUnknown=>Err(Error::NotReady),
+            };
+        }
+        let disp=AdviceDispositionV1::decode(disposition)?;
+        if disp.state!=1||disp.processed_ns!=context.now_ns{return Err(Error::Denied);}
+        let key=AdviceKey{boot_epoch:disp.boot_epoch,advisor_epoch:disp.advisor_epoch,advice_seq:disp.advice_seq};
+        let advice_wire=ledger.admitted_wire(actor,key)?;
+        self.validate_assisted_one(plan_wire,&plan,record,profile,local,context,scope,&advice_wire)?;
+        disp.matches_decision_pair(self.boot_epoch,&advice_wire,record)?;
+        let rec=DecisionRecordV3::decode(record)?;
+        if plan.header.plan_seq<=self.last_plan_seq||rec.decision_seq<=self.last_decision_seq{
+            return Err(Error::Stale);
+        }
+        let expiry=plan.action(0)?.expires_local_ns.min(AdviceEnvelopeV1::decode(&advice_wire)?.expires_ns);
+        let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
+        ledger.finalize(actor,disposition,Some(record),context.now_ns)?;
+        self.pending=Some(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
+            count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
+            assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)})});
+        self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
+        Ok(Registration::Frozen)
+    }
+
+    /// The distinct publisher presents the same frozen registered decision.
+    /// Current model/rule/resource/candidate authority is revalidated before
+    /// the actual native accept callback. UNKNOWN keeps the original slot.
+    pub fn publish_assisted_once(&mut self,actor:Identity,plan_wire:&[u8],
+        record:&[u8;DECISION_BYTES],profile:&Profile<'_>,local:&FrozenAction<'_>,
+        context:TrustedRegistrationScope,scope:&AssistedScope<'_>,
+        native_accept:impl FnOnce()->Result<(),Error>)->Result<Publication,Error>
+    {
+        if actor!=self.publisher{return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let p=self.pending.as_ref().ok_or(Error::Stale)?;
+        let proof=p.assisted.ok_or(Error::Denied)?;
+        if plan.header.plan_seq!=p.plan_seq||p.count!=1||sha256(plan_wire)!=p.plan_digest
+            ||p.decision_bytes[0]!=*record{return Err(Error::Denied);}
+        match p.status{
+            PendingStatus::AdapterAccepted=>return Ok(Publication::ReplayNoEffect),
+            PendingStatus::AdapterUnknown=>return Err(Error::NotReady),
+            PendingStatus::Frozen=>{},
+        }
+        self.validate_assisted_one(plan_wire,&plan,record,profile,local,context,scope,&proof.advice)?;
+        self.pending.as_mut().unwrap().status=PendingStatus::AdapterUnknown;
+        native_accept()?;
+        self.pending.as_mut().unwrap().status=PendingStatus::AdapterAccepted;
+        Ok(Publication::AdapterAccepted)
     }
 
     /// Release the single pending plan only after a distinct EL1 terminal
@@ -1024,6 +1176,77 @@ mod tests {
         let alias=Identity{id:CONTROLLER.id,generation:2};
         assert!(RegisteredDecisionGate::new(CONTROLLER,alias,1,2).is_err());
         assert!(RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,alias,1,2).is_err());
+    }
+
+    #[test]
+    fn assisted_advice_is_not_authority_and_exact_disposition_and_model_are_rechecked(){
+        use super::super::advice_ledger_v0199::{AdviceResult,AdviceKey};
+        use super::super::Epochs;
+        let mut rules=profile_bytes();
+        rules[48..50].copy_from_slice(&1u16.to_le_bytes()); // choice_policy=1, real RuleProfile
+        let profile=Profile::parse(&rules).unwrap();
+        let mut plan=plan_bytes();
+        plan[14..16].copy_from_slice(&1u16.to_le_bytes());
+        plan[32..40].copy_from_slice(&9u64.to_le_bytes());
+        plan[64+80..64+112].copy_from_slice(&[3;32]);
+        plan[208..210].copy_from_slice(&1u16.to_le_bytes());
+        plan[210..212].copy_from_slice(&[4,0]);
+        let mut rec=decision(&plan,&rules);
+        rec[98]=2;rec[99]=1;rec[100]=1;rec[101]=1;
+        rec[102..104].copy_from_slice(&1u16.to_le_bytes());
+        rec[104..106].copy_from_slice(&1u16.to_le_bytes());
+        rec[108..112].copy_from_slice(&8u32.to_le_bytes());
+        for (at,value) in [(112,1u64),(120,1),(128,9)]{rec[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        rec[158..160].copy_from_slice(&1u16.to_le_bytes());
+        let ctx=trusted(&rules);
+        let actions=frozen(&[2,4],&[4,0]);
+        let local=&actions[0];
+        let mut advice=[0u8;ADVICE_BYTES];
+        advice[0..4].copy_from_slice(&0x4359_4131u32.to_le_bytes());
+        advice[4..6].copy_from_slice(&1u16.to_le_bytes());
+        advice[6..8].copy_from_slice(&152u16.to_le_bytes());
+        for (at,value) in [(8,1u64),(16,1),(24,3),(32,17),(40,1),(48,5),(56,6),(64,200),(72,9)]{
+            advice[at..at+8].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at,value) in [(80,1u16),(82,1),(84,1),(86,2)]{advice[at..at+2].copy_from_slice(&value.to_le_bytes());}
+        advice[88..120].copy_from_slice(&[3;32]);advice[120..152].copy_from_slice(&[1;32]);
+        let mut disp=[0u8;DISPOSITION_BYTES];
+        disp[0..4].copy_from_slice(&0x4359_4144u32.to_le_bytes());
+        disp[4..6].copy_from_slice(&1u16.to_le_bytes());disp[6..8].copy_from_slice(&240u16.to_le_bytes());
+        for (at,value) in [(8,1u64),(16,1),(24,1),(32,3),(40,2),(48,4),
+            (56,17),(64,1),(72,9),(80,150)]{disp[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        for (at,value) in [(88,1u16),(90,1),(92,1),(94,0),(100,0),(102,1),(104,1),(106,1)]{
+            disp[at..at+2].copy_from_slice(&value.to_le_bytes());
+        }
+        disp[96..100].copy_from_slice(&3u32.to_le_bytes());
+        disp[112..144].copy_from_slice(&[1;32]);
+        disp[144..176].copy_from_slice(&sha256(&advice));disp[176..208].copy_from_slice(&sha256(&rec));
+        disp[208..240].copy_from_slice(&sha256(&rules));
+        let trusted=TrustedAdviceScope{epochs:Epochs{boot:1,controller:2,model:9,resources:5,cores:6},
+            advisor_epoch:1,snapshot_seq:3,domain:1,target:local.target,sampled_ns:100,now_ns:150,
+            action_kind:1,candidates:&[2,4],model_hash:[3;32],candidate_set_hash:[1;32]};
+        let allowed=AssistedScope{advice:&trusted,assisted_mode:true,offline_model_authorized:true};
+        let shadow=AssistedScope{advice:&trusted,assisted_mode:false,offline_model_authorized:true};
+        let ops=Identity{id:6,generation:1};
+        let mut ledger=EvidenceLedger::new(ops,CONTROLLER,SUPERVISOR,1,1).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Err(Error::Stale));
+        assert_eq!(ledger.record(ops,&advice,&trusted),Ok(AdviceResult::Recorded));
+        assert_eq!(gate.register_assisted_one(ops,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Err(Error::Denied));
+        assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&shadow,&mut ledger),Err(Error::Denied));
+        let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        assert_eq!(ledger.consume(SUPERVISOR,key),Err(Error::NotReady));
+        assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::Frozen));
+        assert_eq!(ledger.consume(SUPERVISOR,key).unwrap().state,1);
+        assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::ExactRetry));
+        assert_eq!(gate.publish_assisted_once(ops,&plan,&rec,&profile,local,ctx,&allowed,||panic!("AI cannot publish")),Err(Error::Denied));
+        assert_eq!(gate.publish_assisted_once(PUBLISHER,&plan,&rec,&profile,local,ctx,&shadow,||panic!("SHADOW cannot publish")),Err(Error::Denied));
+        let mut count=0;
+        assert_eq!(gate.publish_assisted_once(PUBLISHER,&plan,&rec,&profile,local,ctx,&allowed,||{count+=1;Ok(())}),Ok(Publication::AdapterAccepted));
+        assert_eq!(gate.publish_assisted_once(PUBLISHER,&plan,&rec,&profile,local,ctx,&allowed,||panic!("duplicate")),Ok(Publication::ReplayNoEffect));
+        assert_eq!(count,1);
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
+        assert_eq!(gate.expire_unpublished(CONTROLLER,10000),Err(Error::NotReady));
     }
 
 }

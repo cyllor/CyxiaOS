@@ -39,7 +39,8 @@ impl Tables{const ZERO:Self=Self{root:Page::ZERO,mid:Page::ZERO,leaf:Page::ZERO}
 #[repr(align(4096))]
 struct CopyBuffer([u8;COPY]);
 static mut BACKING:[Backing;ROLE_COUNT]=[const{Backing::ZERO};ROLE_COUNT];
-static mut TABLES:[Tables;ROLE_COUNT]=[const{Tables::ZERO};ROLE_COUNT];
+// A replacement uses a different physical root; the retired bank stays unmapped.
+static mut TABLES:[Tables;2*ROLE_COUNT]=[const{Tables::ZERO};2*ROLE_COUNT];
 static mut COPY_BUFFER:CopyBuffer=CopyBuffer([0;COPY]);
 const _:()=assert!(core::mem::size_of::<Backing>()==IMAGE+ROLE_STACK_BYTES);
 const _:()=assert!(core::mem::size_of::<Tables>()==3*PAGE);
@@ -52,6 +53,7 @@ struct Running {
     context:user::Context,
     cap:Cap,
     abi:u16,
+    bank:usize,
     entry:u64,
     wake_ns:u64,
     clocks:u64,
@@ -61,6 +63,8 @@ struct Running {
     turns:u64,
     last_status:i64,
     preemptions:u64,
+    fault_esr:u64,
+    fault_far:u64,
 }
 fn now_ns()->u64{
     let f=timer::frequency();
@@ -86,12 +90,12 @@ fn backing(index:usize)->*mut Backing{
     assert!(index<ROLE_COUNT);
     unsafe{core::ptr::addr_of_mut!(BACKING).cast::<Backing>().add(index)}
 }
-fn tables(index:usize)->*mut Tables{
-    assert!(index<ROLE_COUNT);
-    unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(index)}
+fn tables(index:usize,bank:usize)->*mut Tables{
+    assert!(index<ROLE_COUNT&&bank<2);
+    unsafe{core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(bank*ROLE_COUNT+index)}
 }
-fn root_pa(index:usize)->u64{
-    phys(tables(index) as u64)
+fn root_pa(index:usize,bank:usize)->u64{
+    phys(tables(index,bank) as u64)
 }
 /// The high half direct-map descriptor for a reserved RAM page. The original
 /// boot map uses normal EL1 RW-XN. Seal RO/RX image pages *before* publishing
@@ -103,9 +107,11 @@ fn high_leaf(pa:u64)->*mut u64{
     unsafe{((core::ptr::addr_of!(ram_l3) as u64+super::super::HIGH) as *mut u64).add(offset as usize)}
 }
 fn sync_code(addr:u64,bytes:usize){
-    // 4-byte conservative stride covers the actual A53 cache-line minimum
-    // without assuming that line sizes on other platforms are the same.
-    for off in (0..bytes).step_by(4){
+    let ctr:u64;
+    unsafe{core::arch::asm!("mrs {}, ctr_el0",out(reg)ctr,options(nomem,nostack));}
+    let line=4usize<<((ctr>>16)&15);
+    assert!(line.is_power_of_two() && line<=PAGE);
+    for off in (0..bytes).step_by(line){
         unsafe{core::arch::asm!("dc cvau, {}",in(reg)addr+off as u64,options(nostack));}
     }
     unsafe{core::arch::asm!("dsb ish","ic ialluis","dsb ish","isb",options(nostack));}
@@ -124,15 +130,15 @@ fn seal_page(pa:u64){
     unsafe{core::ptr::write_volatile(leaf,old|(1<<7));}
     tlbi();
 }
-fn load(index:usize)->(NativeRole,Running){
+fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
     let role=ROLES[index];let pkg=&CATALOG[index];
     assert_eq!(pkg.role_id,role.id());
     assert!(pkg.bytes.len()<=COPY);
-    let actor=Identity{id:u64::from(role.id()),generation:1}; // local diagnostic generation only
+    let actor=Identity{id:u64::from(role.id()),generation}; // local diagnostic generation only
     let endpoint=0xC000+index as u64;
     let kind=cap_kind(role);
-    let cap=Cap{selector:if kind==CapKind::None{0}else{0x1000+index as u64},holder:actor,endpoint,kind};
-    let b=backing(index);let t=tables(index);
+    let cap=Cap{selector:if kind==CapKind::None{0}else{0x1000+index as u64*0x100+generation},holder:actor,endpoint,kind};
+    let b=backing(index);let t=tables(index,bank);
     // SAFETY: CPU0 is the only loader and none of these contexts has been
     // published. The exclusive source scratch is scrubbed after each image.
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
@@ -145,6 +151,9 @@ fn load(index:usize)->(NativeRole,Running){
     assert!(verified.relro().is_none(),"bootstrap loader cannot silently skip RELRO");
     let image=unsafe{&mut *core::ptr::addr_of_mut!((*b).image)};
     let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
+    let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
+    stack.fill(0);
+    assert!(stack.iter().all(|&v|v==0));
     let mut map=[0u8;IMAGE/PAGE];
     for seg in verified.load_segments(){
         let start=seg.virtual_address as usize/PAGE;
@@ -175,7 +184,7 @@ fn load(index:usize)->(NativeRole,Running){
     // Guard and image holes have never had user mappings.
     assert_eq!(unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE-1]},0);
     tlbi();
-    let member=NativeRole{role,actor,ttbr0_root:root_pa(index),
+    let member=NativeRole{role,actor,ttbr0_root:root_pa(index,bank),
         // Charge the full physically reserved image, including its RX/RO
         // pages and holes, not only mapped RW bytes.
         private_rw:PrivateRegion{base:phys(b as u64),bytes:core::mem::size_of::<Backing>() as u64},
@@ -186,19 +195,19 @@ fn load(index:usize)->(NativeRole,Running){
     context.regs[0]=cap.selector;
     context.regs[1]=0; // no authorized target exists before persistent boot verification
     context.regs[2]=actor.generation;
-    (member,Running{context,cap,abi:spec.abi,entry,wake_ns:0,clocks:0,role_calls:0,yields:0,
-        charges:0,turns:0,last_status:0,preemptions:0})
+    (member,Running{context,cap,abi:spec.abi,bank,entry,wake_ns:0,clocks:0,role_calls:0,yields:0,
+        charges:0,turns:0,last_status:0,preemptions:0,fault_esr:0,fault_far:0})
 }
 
 /// The sole accepted pointer range in this initial native adapter is the
 /// current private stack. Walk and compare every actual leaf with the owned
 /// physical page. There is no concurrent thread in the role and the stopped
 /// context's static backing cannot be reclaimed. No mutable input is reread.
-fn stack_span(index:usize,va:u64,n:usize,write:bool)->Option<u64>{
+fn stack_span(index:usize,bank:usize,va:u64,n:usize,write:bool)->Option<u64>{
     if n==0{return None;}
     let end=va.checked_add(n as u64)?;
     if va<STACK_BASE||end>STACK_END{return None;}
-    let t=tables(index);let b=backing(index);
+    let t=tables(index,bank);let b=backing(index);
     let stack=unsafe{core::ptr::addr_of!((*b).stack) as u64};
     let root=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*t).root.0[0]))};
     let mid=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*t).mid.0[0]))};
@@ -215,8 +224,8 @@ fn stack_span(index:usize,va:u64,n:usize,write:bool)->Option<u64>{
     }
     Some(stack+va-STACK_BASE)
 }
-fn copied<const N:usize>(index:usize,va:u64)->Option<StableCopy<N>>{
-    let src=stack_span(index,va,N,false)?;
+fn copied<const N:usize>(index:usize,bank:usize,va:u64)->Option<StableCopy<N>>{
+    let src=stack_span(index,bank,va,N,false)?;
     let mut bytes=[0u8;N];
     for (i,byte) in bytes.iter_mut().enumerate(){
         *byte=unsafe{core::ptr::read_volatile((src+i as u64) as *const u8)};
@@ -260,15 +269,15 @@ fn dispatch(index:usize,m:&NativeRoleManifest,r:&mut Running)->bool{
                 _=>false,
             };
             if !authorized{E_AUTH}
-            else if usize::try_from(a[4]).ok().and_then(|len|stack_span(index,a[3],len,true)).is_none(){EFAULT}
+            else if usize::try_from(a[4]).ok().and_then(|len|stack_span(index,r.bank,a[3],len,true)).is_none(){EFAULT}
             else {r.role_calls+=1;EAGAIN} // no persistent boot identity or target registry yet
         }
         Syscall::ServiceCall=>{
             if r.cap.kind!=CapKind::Audit||a[0]!=r.cap.selector||a[3]!=0
                 ||m.check_aux(member.actor,r.cap.endpoint,cpu::slot(),AuxOperation::AuditRead).is_err(){E_AUTH}
             else if a[2]!=64||a[5]<192{E_FORMAT}
-            else if usize::try_from(a[5]).ok().and_then(|len|stack_span(index,a[4],len,true)).is_none(){EFAULT}
-            else if let Some(req)=copied::<64>(index,a[1]){
+            else if usize::try_from(a[5]).ok().and_then(|len|stack_span(index,r.bank,a[4],len,true)).is_none(){EFAULT}
+            else if let Some(req)=copied::<64>(index,r.bank,a[1]){
                 if !valid_audit_request(req.bytes(),member.actor,now){E_FORMAT}
                 else {r.role_calls+=1;EAGAIN} // no accepted audit request/ACK credit
             }else{EFAULT}
@@ -289,7 +298,7 @@ fn class(role:Role)->(Class,u16,u64){
         Role::Validator|Role::Learner=>(Class::Optional,0,500_000),
     }
 }
-fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetLedger)->bool{
+fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetLedger,expect_fault:bool)->bool{
     let now=now_ns();if now<r.wake_ns{return false;}
     let (class,domain,quota)=class(m.members[index].role);
     let token=match budget.reserve_role_with_wall(m,m.members[index].actor,cpu::slot(),class,domain,quota,50_000_000,now){
@@ -312,6 +321,13 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
             cpu::disable_timer();
         }
         if r.context.kind==9{r.preemptions+=1;continue;}
+        if expect_fault{
+            let guard=STACK_BASE-PAGE as u64;
+            if r.context.kind!=8||r.context.esr>>26!=0x20
+                ||r.context.esr&0x3f!=7||r.context.far!=guard{fatal(660+index as u64);}
+            r.fault_esr=r.context.esr;r.fault_far=r.context.far;
+            parked=true;break;
+        }
         if r.context.kind!=8 || r.context.esr>>26!=0x15{fatal(600+index as u64);}
         parked=dispatch(index,m,r);
         if parked{break;}
@@ -327,16 +343,122 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
     assert!(!budget.ordinary_closed());
     parked
 }
+/// Quiescent CPU0 owner only. First revoke the selected context and all
+/// its old low mappings. Only after the architectural TLBI completion can
+/// the old image be made writable again. These static frames are never
+/// attached to DMA or another address space in this diagnostic profile.
+fn retire_root(index:usize,bank:usize){
+    let t=tables(index,bank);
+    unsafe{core::ptr::write_volatile(core::ptr::addr_of_mut!((*t).root.0[0]),0);}
+    tlbi();
+    // Root disconnected and context returned; all former leaf entries are
+    // now inaccessible. This is not proof of a general production DMA join.
+    unsafe{
+        core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).mid.0).cast::<u8>(),0,PAGE);
+        core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).leaf.0).cast::<u8>(),0,PAGE);
+    }
+    let b=backing(index) as u64;
+    for offset in (0..IMAGE).step_by(PAGE){
+        let pa=phys(b+offset as u64);
+        let leaf=high_leaf(pa);
+        let rw=pa|0x0060_0000_0000_0703;
+        let old=unsafe{core::ptr::read_volatile(leaf)};
+        assert!(old==rw||old==rw|(1<<7));
+        if old!=rw{
+            unsafe{core::ptr::write_volatile(leaf,0);}tlbi();
+            unsafe{core::ptr::write_volatile(leaf,rw);}tlbi();
+        }
+    }
+    let bytes=unsafe{core::slice::from_raw_parts_mut(b as *mut u8,IMAGE+ROLE_STACK_BYTES)};
+    bytes.fill(0);
+    assert!(bytes.iter().all(|&v|v==0));
+}
+fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT],
+    budget:&mut Cpu0BudgetLedger)
+{
+    use cyxia_kernel_core::control_plane::service_restart::{Lifecycle,RestartDecision};
+    let until=now_ns().checked_add(15_000_000_000).unwrap();
+    for i in 0..ROLE_COUNT{
+        let old=manifest.members[i];
+        let old_cap=running[i].cap;
+        let old_root=old.ttbr0_root;
+        let old_bank=running[i].bank;
+        assert_eq!(old_bank,0);
+        let before:[(u64,u64,u64);ROLE_COUNT]=core::array::from_fn(|j|
+            (running[j].context.pc,running[j].clocks,manifest.members[j].actor.generation));
+        // An injected PC in the actual guard page produces a genuine EL0
+        // instruction abort. Never continue the faulted saved context.
+        running[i].context.pc=STACK_BASE-PAGE as u64;
+        running[i].wake_ns=0;
+        while running[i].fault_esr==0{
+            if now_ns()>=until{fatal(680);}
+            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            let _=turn(i,manifest,&mut running[i],budget,true);
+        }
+        let esr=running[i].fault_esr;let far=running[i].fault_far;
+        // These are *volatile* diagnostic generations. No durable epoch
+        // exists, so the production publication gate stays closed.
+        let mut life=Lifecycle::new(1,old.actor.generation).unwrap();
+        life.peer_ready(1,old.actor.generation).unwrap();
+        let next=match life.fault(1,old.actor.generation).unwrap(){
+            RestartDecision::Restart{generation}=>generation,
+            RestartDecision::Isolate=>fatal(681),
+        };
+        assert!(!life.accepts(1,old.actor.generation)&&!life.accepts(1,next));
+        // Close the old cap immediately, before reclaiming any pages.
+        running[i].cap.selector=0;running[i].cap.kind=CapKind::None;
+        let credit=loop{
+            let now=now_ns();if now>=until{fatal(682);}
+            if now%WINDOW_NS>WINDOW_NS-10_000_000{continue;}
+            match budget.reserve_kernel_with_wall(0,Class::Recovery,8_000_000,50_000_000,now){
+                Ok(t)=>break t,
+                Err(Error::Exhausted|Error::Busy)=>continue,
+                Err(e)=>panic!("recovery reservation: {e:?}"),
+            }
+        };
+        let start=timer::cpu_ticks();
+        retire_root(i,old_bank);
+        let (member,new)=load(i,next,1);
+        assert!(member.ttbr0_root!=old_root&&member.actor.generation==next);
+        assert_eq!(unsafe{(*tables(i,old_bank)).root.0[0]},0);
+        assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
+        manifest.members[i]=member;
+        manifest.validate().unwrap();
+        let actual=timer::cpu_elapsed_ns(start);
+        let receipt=budget.settle(0,credit,actual,now_ns()).unwrap();
+        if receipt.overrun||receipt.crossed_window{fatal(683);}
+        life.reset_complete(1,next).unwrap();
+        running[i]=new;
+        while running[i].clocks<2||running[i].role_calls<2{
+            if now_ns()>=until{fatal(684);}
+            if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+            let _=turn(i,manifest,&mut running[i],budget,false);
+        }
+        // READY here means only the actual diagnostic client reentered.
+        // Formal service replay/READY is deliberately not advertised.
+        life.peer_ready(1,next).unwrap();
+        assert!(life.accepts(1,next)&&!life.accepts(1,old.actor.generation));
+        for j in 0..ROLE_COUNT{
+            if j!=i{assert_eq!((running[j].context.pc,running[j].clocks,
+                manifest.members[j].actor.generation),before[j]);}
+        }
+        let row=[old.role.id() as u64,old.actor.generation,next,old_root,member.ttbr0_root,
+            old_cap.selector,running[i].cap.selector,esr,far,actual,
+            (IMAGE+ROLE_STACK_BYTES) as u64,u64::from(life.ready())];
+        for(j,value)in row.into_iter().enumerate(){SMP_EVIDENCE.words[304+i*12+j].store(value,Ordering::Relaxed);}
+        report("V0199_PACKAGE_RELOAD",old.role.id() as u64,old_root,member.ttbr0_root);
+    }
+}
 pub(super) fn run()->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
-    let pairs:[(NativeRole,Running);ROLE_COUNT]=core::array::from_fn(load);
+    let pairs:[(NativeRole,Running);ROLE_COUNT]=core::array::from_fn(|i|load(i,1,0));
     let members=core::array::from_fn(|i|pairs[i].0);
     let mut running=pairs.map(|(_,r)|r);
-    let manifest=NativeRoleManifest{
+    let mut manifest=NativeRoleManifest{
         online_mask:REQUIRED_ONLINE_MASK,members,
         // Full statically reserved pages, copy scratch and a conservative
         // one-MiB bootstrap metadata allowance inside the control pool.
-        other_protected_pool_bytes:core::mem::size_of::<[Tables;ROLE_COUNT]>()+COPY+1024*1024,
+        other_protected_pool_bytes:core::mem::size_of::<[Tables;2*ROLE_COUNT]>()+COPY+1024*1024,
         other_control_ns_per_100ms:OTHER_CPU_NS,
     };
     manifest.validate().expect("complete eight role physical inventory");
@@ -353,16 +475,17 @@ pub(super) fn run()->!{
             if running[i].clocks>=2&&running[i].role_calls>=2{continue;}
             // Do not begin an evaluation in a near-expired 100ms window.
             if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
-            let _=turn(i,&manifest,&mut running[i],&mut budget);
+            let _=turn(i,&manifest,&mut running[i],&mut budget,false);
         }
         core::hint::spin_loop();
     }
-    // All eight independent native clients have actually trapped through
-    // ABI3 and retained their contexts. No real service effect is claimed.
+    restart_each(&mut manifest,&mut running,&mut budget);
+    // All eight independently linked diagnostic clients have executed, faulted,
+    // reloaded under a new root and reentered. No real service effect is claimed.
     for (i,r) in running.iter().enumerate(){
         let m=manifest.members[i];
         let stack=phys(unsafe{core::ptr::addr_of!((*backing(i)).stack)} as u64);
-        let guard=unsafe{(*tables(i)).leaf.0[STACK_BASE as usize/PAGE-1]};
+        let guard=unsafe{(*tables(i,r.bank)).leaf.0[STACK_BASE as usize/PAGE-1]};
         let row=[u64::from(m.role.id()),m.ttbr0_root,m.private_rw.base,stack,
             r.entry,r.cap.selector,r.clocks,r.role_calls,r.yields,r.charges,r.turns,
             r.last_status as u64,guard,r.preemptions];
@@ -392,7 +515,7 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[16+slot*4+i].store(value,Ordering::Relaxed);
         }
     }
-    let summary=[MAGIC,1,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let summary=[MAGIC,2,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");

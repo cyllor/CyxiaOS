@@ -97,10 +97,14 @@ impl Cpu0BudgetLedger {
     /// Separate trusted EL1 recovery/coordination entry. There is no user
     /// request field that can select this authority.
     pub fn reserve_kernel(&mut self,cpu:usize,class:Class,requested:u64,now:u64)->Result<Turn,Error>{
+        self.reserve_kernel_with_wall(cpu,class,requested,requested,now)
+    }
+    pub fn reserve_kernel_with_wall(&mut self,cpu:usize,class:Class,requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
         if cpu!=CONTROL_CPU || !matches!(class,Class::Coordination|Class::Recovery){
             return Err(Error::Denied);
         }
-        self.reserve(None,None,class,0,requested,requested,now)
+        if wall_ns==0||wall_ns>50_000_000{return Err(Error::Invalid);}
+        self.reserve(None,None,class,0,requested,wall_ns,now)
     }
     fn reserve(&mut self,actor:Option<Identity>,role:Option<(usize,u64)>,class:Class,domain:u16,
         requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
