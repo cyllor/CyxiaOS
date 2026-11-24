@@ -404,12 +404,43 @@ def close_process(proc):
     return True
 
 
+def pinned_qemu_firmware():
+    """Pinned source-tree SeaBIOS root; never infer success from missing BIOS.
+
+    This is optional for normal installed QEMU, but a standalone copied QEMU
+    binary MUST receive an explicit -L path. The path and bios-256k.bin hash
+    are frozen into the capture request and rechecked by the validator.
+    """
+    value = os.environ.get('CYXIA_PINNED_QEMU_FIRMWARE')
+    if not value:
+        return None
+    root = Path(value).absolute()
+    require(root.is_dir() and not root.is_symlink(),
+            'pinned QEMU firmware root is unavailable or a symlink')
+    bios = root / 'bios-256k.bin'
+    require(bios.is_file() and not bios.is_symlink() and bios.stat().st_size == 256 * 1024,
+            'pinned SeaBIOS 256KiB image missing or malformed')
+    return root
+
+
+def qemu_identity(path):
+    identity = dict(path=path, sha256=sha(path), version=version(path))
+    firmware = pinned_qemu_firmware()
+    if firmware is not None:
+        identity['firmware'] = dict(
+            root=str(firmware), bios256_sha256=sha(firmware / 'bios-256k.bin'))
+    return identity
+
+
 def launch_argv(qemu, image, accel, mechanism='bsp'):
     mechanism_features(mechanism)
     cpus = 'cpus=4,sockets=1,cores=4,threads=1' if mechanism == 'smp' else '1'
-    return [str(qemu), '-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64', '-smp', cpus, '-m', '256M',
-            '-accel', accelerator(accel), '-display', 'none', '-monitor', 'none', '-serial', 'stdio',
-            '-nic', 'none', '-no-reboot', '-device', 'isa-debug-exit,iobase=0xf4,iosize=4', '-kernel', str(image)]
+    firmware = pinned_qemu_firmware()
+    return ([str(qemu)] + (['-L', str(firmware)] if firmware is not None else [])
+            + ['-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64', '-smp', cpus, '-m', '256M',
+               '-accel', accelerator(accel), '-display', 'none', '-monitor', 'none', '-serial', 'stdio',
+               '-nic', 'none', '-no-reboot', '-device', 'isa-debug-exit,iobase=0xf4,iosize=4',
+               '-kernel', str(image)])
 
 
 def inventory(directory):
@@ -435,7 +466,7 @@ def check(directory, *, qemu='qemu-system-x86_64', cargo='cargo'):
             and request.get('markers') == list(mechanism_markers(mechanism)), 'unsupported capture request')
     validate_timeout(request.get('timeout'))
     qemu = executable(qemu)
-    require(request.get('qemu') == dict(path=qemu, sha256=sha(qemu), version=version(qemu)), 'QEMU binary identity mismatch')
+    require(request.get('qemu') == qemu_identity(qemu), 'QEMU binary/firmware identity mismatch')
     require(request.get('argv') == launch_argv(qemu, directory / 'build' / 'boot.bin', request['accel'], mechanism), 'launch argv mismatch')
     require(request.get('build_manifest_sha256') == sha(directory / 'build' / 'build-manifest.json'), 'build receipt mismatch')
     require(process.get('error') is None and type(process.get('pid')) is int and process['pid'] > 0,
@@ -473,7 +504,7 @@ def run(build_dir, output, *, qemu='qemu-system-x86_64', cargo='cargo', accel='t
         argv = launch_argv(qemu, output / 'build' / 'boot.bin', accel, mechanism)
         request = dict(version=VERSION, argv=argv, accel=accel, timeout=timeout, mechanism=mechanism,
                        markers=list(mechanism_markers(mechanism)),
-                       qemu=dict(path=qemu, sha256=sha(qemu), version=version(qemu)),
+                       qemu=qemu_identity(qemu),
                        build_manifest_sha256=sha(output / 'build' / 'build-manifest.json'))
         write_json(output / 'request.json', request)
         raw = bytearray()
