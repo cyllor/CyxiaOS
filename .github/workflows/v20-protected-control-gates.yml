@@ -11,6 +11,8 @@ on:
       - '.github/workflows/v20-protected-control-gates.yml'
       - 'tools/verify_v0199_verdicts.py'
       - 'tools/test_verify_v0199_verdicts.py'
+      - 'tools/verify_v0199_epoch_disk.py'
+      - 'tools/test_v0199_mount_format.py'
       - 'tools/v0199-required-proof-inventory.json'
   workflow_dispatch:
 permissions:
@@ -37,6 +39,8 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core --lib control_plane 2>&1 | tee artifacts/control-gates/control-plane.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/control-gates/model.log
           cargo test --locked --offline -p cyxia-control-model reward_v2 2>&1 | tee artifacts/control-gates/reward-v2.log
+          cargo test --locked --offline -p cyxia-control-model sgd_v2 2>&1 | tee artifacts/control-gates/sgd-v2.log
+          (cd tools; python3 -B -m unittest -v test_v0199_mount_format) 2>&1 | tee artifacts/control-gates/mount-format.log
           cargo test --locked --offline -p cyxia-kernel-core --lib offline_config_v1 2>&1 | tee artifacts/control-gates/offline-config.log
           cargo test --locked --offline -p cyxia-kernel-core --lib cap_record_v3 2>&1 | tee artifacts/control-gates/cap-v3.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_media_v0199 2>&1 | tee artifacts/control-gates/media-v1.log
