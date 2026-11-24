@@ -299,8 +299,18 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
     checkpoint();
     let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
-    stack.fill(0);
-    assert!(stack.iter().all(|&v|v==0));
+    // Diagnostic startup payload is program-specific, not an added ABI
+    // field. The generic ABI3 contract supplies arg_va/args_len and SP.
+    let mut args=[0u8;24];
+    args[..8].copy_from_slice(&cap.selector.to_le_bytes());
+    args[8..16].copy_from_slice(&0u64.to_le_bytes()); // no live target
+    args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
+    let startup=cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack,STACK_BASE,&args)
+        .expect("private ABI3 startup arguments");
+    assert_eq!(startup.sp,STACK_END-32);
+    assert!(stack[..ROLE_STACK_BYTES-32].iter().all(|&v|v==0));
+    assert_eq!(&stack[ROLE_STACK_BYTES-32..ROLE_STACK_BYTES-8],&args);
+    assert!(stack[ROLE_STACK_BYTES-8..].iter().all(|&v|v==0));
     checkpoint();
     let mut map=[0u8;IMAGE/PAGE];
     for seg in verified.load_segments(){
@@ -352,10 +362,10 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
         caps:role.allowed_caps(),control_ns_per_100ms:ROLE_QUOTAS[index],
         cpu_mask:CONTROL_MASK,thread_count:1,endpoint_id:endpoint};
     let mut context=user::Context::empty();
-    context.pc=entry;context.sp=STACK_END;
-    context.regs[0]=cap.selector;
-    context.regs[1]=0; // no authorized target exists before persistent boot verification
-    context.regs[2]=actor.generation;
+    context.pc=entry;context.sp=startup.sp;
+    context.regs[0]=startup.x0;context.regs[1]=startup.x1;
+    assert!(context.regs[2..].iter().all(|&v|v==0));
+    assert!(context.simd.iter().flatten().all(|&v|v==0));
     (member,Running{context,cap,abi:spec.abi,bank,entry,wake_ns:0,clocks:0,role_calls:0,yields:0,
         charges:0,turns:0,last_status:0,preemptions:0,fault_esr:0,fault_far:0})
 }
