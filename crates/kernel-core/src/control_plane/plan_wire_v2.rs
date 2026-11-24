@@ -148,11 +148,11 @@ impl<'a> PlanV2<'a> {
                 || (flags == 1 && a.model_hash == [0;32])
                 || keys[..i].contains(&(a.domain_id,a.target_id,a.action_kind))
             { return Err(Error::Invalid); }
-            if let Some(gen)=first_ledger {
-                if a.ledger_generation != gen {return Err(Error::Invalid);}
+            if let Some(seen_generation)=first_ledger {
+                if a.ledger_generation != seen_generation {return Err(Error::Invalid);}
             } else { first_ledger=Some(a.ledger_generation); }
-            if let Some(gen)=first_core {
-                if a.core_generation != gen {return Err(Error::Invalid);}
+            if let Some(seen_generation)=first_core {
+                if a.core_generation != seen_generation {return Err(Error::Invalid);}
             } else { first_core=Some(a.core_generation); }
             if a.domain_id == 14 { found_d14=true; }
             keys[i]=(a.domain_id,a.target_id,a.action_kind);
