@@ -90,6 +90,16 @@ impl<'a> PieImage<'a> {
         bytes:&'a[u8],
         expected_manifest_sha256:[u8;32],
     )->Result<Self,Error>{
+        Self::parse_verified_checkpointed(bytes,expected_manifest_sha256,||{})
+    }
+
+    /// The immutable exclusive package remains borrowed for the entire
+    /// verification, including scheduler checkpoints. The callback can
+    /// yield/replenish the loader budget, never replace bytes or digest.
+    pub fn parse_verified_checkpointed(
+        bytes:&'a[u8],expected_manifest_sha256:[u8;32],
+        mut checkpoint:impl FnMut(),
+    )->Result<Self,Error>{
         if bytes.len()<64 || bytes.len()>MAX_IMAGE_BYTES
             || expected_manifest_sha256==[0;32]
             || bytes.get(0..4)!=Some(&b"\x7fELF"[..])
@@ -100,7 +110,8 @@ impl<'a> PieImage<'a> {
             || le16(bytes,52)?!=64
             || le16(bytes,54)?!=56
         {return Err(Error::Invalid);}
-        let mut h=Sha256::new();h.update(bytes);
+        let mut h=Sha256::new();
+        for chunk in bytes.chunks(4096){h.update(chunk);checkpoint();}
         let actual:[u8;32]=h.finalize().into();
         if actual!=expected_manifest_sha256{return Err(Error::Denied);}
         let ph_off=le64(bytes,32)?;
@@ -343,13 +354,17 @@ pub struct VerifiedRolePackage<'a>{
 }
 impl<'a> VerifiedRolePackage<'a>{
     pub fn verify(spec:RolePackageSpec,input:RolePackageInput<'a>)->Result<Self,Error>{
+        Self::verify_checkpointed(spec,input,||{})
+    }
+    pub fn verify_checkpointed(spec:RolePackageSpec,input:RolePackageInput<'a>,
+        checkpoint:impl FnMut())->Result<Self,Error>{
         if spec.package_id==0 || input.package_id!=spec.package_id
             || spec.abi!=crate::security::syscall_v3::ABI_VERSION
             || spec.stack_bytes!=ROLE_STACK_BYTES || spec.image_bytes!=input.bytes.len()
             || spec.relative_count!=input.relative.len()
             || spec.relative_sha256!=relative_sidecar_digest(input.relative)?
         {return Err(Error::Denied);}
-        let image=PieImage::parse_verified(input.bytes,spec.image_sha256)?;
+        let image=PieImage::parse_verified_checkpointed(input.bytes,spec.image_sha256,checkpoint)?;
         Ok(Self{spec,image,relative:input.relative})
     }
     pub fn role(&self)->Role{self.spec.role}
