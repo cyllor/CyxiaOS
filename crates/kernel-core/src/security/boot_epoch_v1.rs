@@ -146,6 +146,57 @@ impl BootPairCommit{
 mod tests{
     use super::*;
     #[test]
+    fn paired_gate_requires_both_exact_committed_homes_and_keeps_unknown(){
+        use super::super::durable_role_epoch_v0199::{DurableEpochGate,SlotBinding,Outcome};
+        use crate::control_plane::role_manifest_v0199::ROLES;
+        struct Disk{log:[[u8;BLOCK];6],writes:u32,flushes:u32,fail_second:bool}
+        impl EpochBlockIo for Disk{
+            fn read(&mut self,b:u32,out:&mut[u8;BLOCK])->Result<(),Error>{*out=self.log[(b-2) as usize];Ok(())}
+            fn write(&mut self,b:u32,data:&[u8;BLOCK])->Result<(),Error>{
+                self.log[(b-2) as usize]=*data;self.writes+=1;Ok(())
+            }
+            fn flush(&mut self)->Result<(),Error>{
+                self.flushes+=1;if self.fail_second&&self.flushes==2{return Err(Error::Unknown);}Ok(())
+            }
+        }
+        let state=SecurityStateStoreV2{fs_uuid:[1;16],state_generation:1,rule_min_generation:1,
+            security_min_generation:1,key_generation:1,isolated_service_bitmap:0,last_boot_epoch:0,
+            offline_config_generation:1,offline_config_hash:[2;32],service_generations:[1;16]}.encode().unwrap();
+        let boot=BootEpochStoreV1{fs_uuid:[1;16],boot_epoch:0}.encode().unwrap();
+        let wrong=BootEpochStoreV1{fs_uuid:[1;16],boot_epoch:1}.encode().unwrap();
+        let slots=core::array::from_fn(|i|SlotBinding{role:ROLES[i],slot:i as u8});
+        assert!(matches!(DurableEpochGate::recovered_pair(&state,&wrong,slots,|_|panic!()),Err(Error::Conflict)));
+        let mut gate=DurableEpochGate::recovered_pair(&state,&boot,slots,|_|Ok(())).unwrap();
+        let ticket=gate.prepare(Change::AllocateBoot,|_|panic!()).unwrap();
+        let image=gate.after_image(ticket).unwrap();
+        let mut pair=BootPairRedo::new();
+        let sb=SuperblockV1{fs_uuid:[1;16],generation:1,checkpoint_lsn:0,log_epoch:1};
+        let mut disk=Disk{log:[[0;BLOCK];6],writes:0,flushes:0,fail_second:true};
+        assert!(matches!(pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image),Err(Error::Unknown)));
+        assert_eq!(gate.boot_epoch(),None);assert_eq!((disk.writes,disk.flushes),(6,2));
+        assert!(matches!(pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image),Err(Error::Conflict)));
+        // Separate successful native-owner fixture. Do not retry the
+        // ambiguous transaction on another device under the old gate.
+        let mut gate=DurableEpochGate::recovered_pair(&state,&boot,slots,|_|Ok(())).unwrap();
+        let ticket=gate.prepare(Change::AllocateBoot,|_|panic!()).unwrap();
+        let image=gate.after_image(ticket).unwrap();
+        let mut disk=Disk{log:[[0;BLOCK];6],writes:0,flushes:0,fail_second:false};
+        let proof=pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image).unwrap();
+        let receipt=proof.receipt();
+        assert_eq!(gate.confirm(ticket,receipt,&image,|_,_|panic!()),Err(Error::Unauthorized));
+        let mut super_raw=[0;BLOCK];
+        p32(&mut super_raw,0,0x43594653);p16(&mut super_raw,4,1);p16(&mut super_raw,6,80);
+        p32(&mut super_raw,8,4096);p32(&mut super_raw,12,131072);super_raw[16..32].fill(1);
+        p64(&mut super_raw,32,1);p64(&mut super_raw,48,1);p32(&mut super_raw,56,4098);
+        p32(&mut super_raw,60,4102);p32(&mut super_raw,64,4118);p32(&mut super_raw,68,256);
+        let crc=crc32c_zeroed(&super_raw,76).unwrap();p32(&mut super_raw,76,crc);
+        assert_eq!(gate.confirm_boot_from_redo(ticket,receipt,pair.state_image(),&boot,&super_raw,2,7000,7002,
+            &pair.begin,&[&pair.state_redo,&pair.boot_redo],&pair.commit,|_,_,_|panic!()),Err(Error::Conflict));
+        assert_eq!(gate.confirm_boot_from_redo(ticket,receipt,pair.state_image(),pair.boot_image(),&super_raw,2,7000,7002,
+            &pair.begin,&[&pair.state_redo,&pair.boot_redo],&pair.commit,|t,r,b|proof.verifies(t,r,b)),Ok(Outcome::Boot{epoch:1}));
+        assert_eq!(gate.boot_epoch(),Some(1));
+    }
+    #[test]
     fn exact_boot_epoch_store_roundtrip_and_crc_reserved_rejection(){
         let s=BootEpochStoreV1{fs_uuid:[1;16],boot_epoch:42};let b=s.encode().unwrap();
         assert_eq!(BootEpochStoreV1::decode(&b),Ok(s));
