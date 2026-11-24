@@ -253,8 +253,13 @@ impl RegisteredDecisionGate {
             || !records.iter().zip(pending.decision_bytes[..pending.count].iter())
                 .all(|(a,b)| a==b)
         {return Err(Error::Denied);}
-        if pending.status!=PendingStatus::Frozen {
-            return Ok(Publication::ReplayNoEffect);
+        match pending.status {
+            PendingStatus::AdapterAccepted => return Ok(Publication::ReplayNoEffect),
+            // A failed adapter call may have committed a partial side
+            // effect. Never return success or invoke it again without an
+            // independent native reconciliation/terminal proof.
+            PendingStatus::AdapterUnknown => return Err(Error::NotReady),
+            PendingStatus::Frozen => {}
         }
         self.validate_rule_only(plan_wire,&plan,records,profile,actions,context)?;
         // Mark before the potentially side-effecting callback; failures
@@ -473,7 +478,7 @@ mod tests {
         assert_eq!(gate.publish_once(
             PUBLISHER,&plan,&records,&catalog,&frozen,ctx,
             ||{attempts+=1;Ok(())}
-        ),Ok(Publication::ReplayNoEffect));
+        ),Err(Error::NotReady));
         assert_eq!(attempts,1);
         assert_eq!(gate.expire_unpublished(CONTROLLER,200),Err(Error::NotReady));
     }
