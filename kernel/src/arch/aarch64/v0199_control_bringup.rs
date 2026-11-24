@@ -395,8 +395,9 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         let old_root=old.ttbr0_root;
         let old_bank=running[i].bank;
         assert_eq!(old_bank,0);
-        let before:[(u64,u64,u64);ROLE_COUNT]=core::array::from_fn(|j|
-            (running[j].context.pc,running[j].clocks,manifest.members[j].actor.generation));
+        let before:[(u64,u64,u64,u64);ROLE_COUNT]=core::array::from_fn(|j|
+            (running[j].clocks,running[j].role_calls,manifest.members[j].actor.generation,
+             manifest.members[j].ttbr0_root));
         // An injected PC in the actual guard page produces a genuine EL0
         // instruction abort. Never continue the faulted saved context.
         report("V0199_RESTART_BEGIN",old.role.id() as u64,old.actor.generation,old_root);
@@ -420,6 +421,32 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         assert!(!life.accepts(1,old.actor.generation)&&!life.accepts(1,next));
         // Close the old cap immediately, before reclaiming any pages.
         running[i].cap.selector=0;running[i].cap.kind=CapKind::None;
+        // The faulted diagnostic client remains stopped with its old cap
+        // revoked. Before any reload, require every other EL0 role to make
+        // a real clock AND role-specific SVC through the same CPU0 ledger.
+        // No recovery reservation is held while the survivors execute.
+        let survivor_mask=((1u64<<ROLE_COUNT)-1)&!(1u64<<i);
+        let mut progressed=0u64;
+        while progressed!=survivor_mask{
+            if now_ns()>=until{fatal(685);}
+            for j in 0..ROLE_COUNT{
+                if j==i||progressed&(1u64<<j)!=0{continue;}
+                if now_ns()%WINDOW_NS>WINDOW_NS-5_000_000{continue;}
+                let _=turn(j,manifest,&mut running[j],budget,false);
+                if running[j].clocks>before[j].0&&running[j].role_calls>before[j].1{
+                    progressed|=1u64<<j;
+                }
+            }
+            core::hint::spin_loop();
+        }
+        let mut total_delta=0u64;
+        SMP_EVIDENCE.words[400+i*9].store(progressed,Ordering::Relaxed);
+        for j in 0..ROLE_COUNT{
+            let delta=if j==i{0}else{running[j].role_calls.checked_sub(before[j].1).unwrap()};
+            total_delta=total_delta.checked_add(delta).unwrap();
+            SMP_EVIDENCE.words[400+i*9+1+j].store(delta,Ordering::Relaxed);
+        }
+        report("V0199_RESTART_SURVIVORS",old.role.id() as u64,progressed,total_delta);
         let credit=loop{
             let now=now_ns();if now>=until{fatal(682);}
             if now%WINDOW_NS>WINDOW_NS-10_000_000{continue;}
@@ -455,8 +482,11 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         life.peer_ready(1,next).unwrap();
         assert!(life.accepts(1,next)&&!life.accepts(1,old.actor.generation));
         for j in 0..ROLE_COUNT{
-            if j!=i{assert_eq!((running[j].context.pc,running[j].clocks,
-                manifest.members[j].actor.generation),before[j]);}
+            if j!=i{
+                assert!(running[j].clocks>before[j].0&&running[j].role_calls>before[j].1);
+                assert_eq!((manifest.members[j].actor.generation,manifest.members[j].ttbr0_root),
+                    (before[j].2,before[j].3));
+            }
         }
         let row=[old.role.id() as u64,old.actor.generation,next,old_root,member.ttbr0_root,
             old_cap.selector,running[i].cap.selector,esr,far,actual,
@@ -532,7 +562,7 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[16+slot*4+i].store(value,Ordering::Relaxed);
         }
     }
-    let summary=[MAGIC,2,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
+    let summary=[MAGIC,3,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
     for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
     super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
