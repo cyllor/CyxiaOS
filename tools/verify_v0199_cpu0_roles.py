@@ -129,6 +129,30 @@ class NativeRoles:
                 verify_smp.require((ipa,opa,value)==(0,0,0),"rejected copy wrote data")
             verify_smp.require(copy_rows[index]==(case,accepted,value),
                                "copy serial and memory evidence disagree")
+        # Per-role real EL0 fault probes, not synthetic ESR tuples.
+        fault_rows=rows("V0199_ROLE_FAULT")
+        restart_rows=rows("V0199_ROLE_RESTART")
+        verify_smp.require(len(fault_rows)==40 and len(restart_rows)==8,
+                           "missing per-role fault/restart mechanism evidence")
+        for index,role in enumerate(ROLE_IDS):
+            for case,(ec,fsc,address) in enumerate([
+                (0x24,0x0f,None),(0x24,0x07,0x40000),
+                (0x24,0x4f,0x10000),(0x20,0x0f,0x20000),
+                (0x24,0x47,0x2f000)]):
+                at=304+index*15+case*3
+                kind,esr,far=words[at:at+3]
+                verify_smp.require(kind==8 and esr>>26==ec and esr&0x7f==fsc
+                                   and (far>=1<<63 if address is None else far==address),
+                                   "wrong native fault syndrome or address")
+                verify_smp.require(fault_rows[index*5+case]==(role,case,esr),
+                                   "role fault UART and guest memory differ")
+            at=424+index*9
+            rid,old,new,cleared,kind,esr,count,root,ready=words[at:at+9]
+            verify_smp.require((rid,old,new,cleared,kind,count,ready)==(role,1,2,8192,8,16,1)
+                               and esr==0x56000004 and root==words[128+index*8+2],
+                               "static fixture did not scrub and reenter exact role")
+            verify_smp.require(restart_rows[index]==(role,new,count),
+                               "role restart UART and guest memory differ")
         serial_business=rows("V0199_CPU0_BUSINESS")
         verify_smp.require(len(serial_business)==3,"missing business progress")
         business_progress=0
@@ -147,6 +171,9 @@ class NativeRoles:
             "distinct_el0_role_address_spaces":8,
             "physical_svc64_register_preflight_cases":7,
             "physical_user_leaf_copy_cases":4,
+            "physical_role_permission_fault_cases":40,
+            "same_root_fixture_restarts":8,
+            "production_role_restart_verified":False,
             "role_ids":list(ROLE_IDS),
             "business_progress_turns":business_progress,
             "real_services_tested":False,
