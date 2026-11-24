@@ -80,6 +80,89 @@ impl SuperblockV1 {
         Ok(value)
     }
 }
+/// Read-only migration inventory. Neither classification authorizes a mount,
+/// reformat, write, or migration: the unified snapshot layout is still DRAFT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotMediaKind {
+    BaselineV1,
+    LegacySnapshotV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotMediaProbe {
+    pub kind: SnapshotMediaKind,
+    pub fs_uuid: [u8; 16],
+    pub generation: u64,
+    pub checkpoint_lsn: u64,
+    pub log_epoch: u64,
+}
+
+fn probe_snapshot_header(bytes: &[u8]) -> Result<SnapshotMediaProbe, Error> {
+    if bytes.len() != SUPER_BYTES || le32(bytes, 0)? != SUPER_MAGIC {
+        return Err(Error::Invalid);
+    }
+    let kind = match le16(bytes, 4)? {
+        1 => {
+            SuperblockV1::decode(bytes)?;
+            SnapshotMediaKind::BaselineV1
+        }
+        2 => {
+            // Historical storage.rs v2: FSControl at 4118, catalog at 4119,
+            // eight 15-block slots, system objects start at 4240.
+            if le16(bytes, 6)? != 112
+                || le32(bytes, 8)? != 4096 || le32(bytes, 12)? != BLOCK_COUNT
+                || le32(bytes, 56)? != BITMAP_START
+                || le32(bytes, 60)? != INODE_START
+                || le32(bytes, 64)? != 4240 || le32(bytes, 68)? != 256
+                || le32(bytes, 72)? != 0 || le32(bytes, 76)? != 4118
+                || le32(bytes, 80)? != 4119 || le32(bytes, 84)? != 4120
+                || le32(bytes, 88)? != 8 || le32(bytes, 92)? != 15
+                || le32(bytes, 96)? != 224 || le32(bytes, 100)? != 224
+                || le32(bytes, 104)? != 0
+                || le32(bytes, 108)? != crc32c_zeroed(bytes, 108)?
+                || bytes[112..].iter().any(|v| *v != 0)
+            {
+                return Err(Error::Invalid);
+            }
+            SnapshotMediaKind::LegacySnapshotV2
+        }
+        _ => return Err(Error::Invalid),
+    };
+    let result = SnapshotMediaProbe {
+        kind,
+        fs_uuid: uuid(bytes, 16)?,
+        generation: le64(bytes, 32)?,
+        checkpoint_lsn: le64(bytes, 40)?,
+        log_epoch: le64(bytes, 48)?,
+    };
+    if result.fs_uuid == [0; 16] || result.generation == 0 || result.log_epoch == 0 {
+        return Err(Error::Invalid);
+    }
+    Ok(result)
+}
+
+/// Strict offline preflight: both headers must be independently valid.
+/// Damaged, mixed-format, mismatched identity, and regressed checkpoint
+/// pairs require separate recovery evidence; never choose a format by version
+/// number or by which copy happened to parse. No writes are possible here.
+pub fn probe_snapshot_media_pair(
+    first: &[u8], second: &[u8],
+) -> Result<SnapshotMediaProbe, Error> {
+    let a = probe_snapshot_header(first)?;
+    let b = probe_snapshot_header(second)?;
+    if a.kind != b.kind || a.fs_uuid != b.fs_uuid {
+        return Err(Error::Conflict);
+    }
+    if a.generation == b.generation {
+        return if a == b { Ok(a) } else { Err(Error::Conflict) };
+    }
+    let (older, newer) = if a.generation < b.generation { (a, b) } else { (b, a) };
+    if newer.checkpoint_lsn < older.checkpoint_lsn || newer.log_epoch <= older.log_epoch {
+        return Err(Error::Conflict);
+    }
+    Ok(newer)
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct FileReceiptV4 {
     pub fs_uuid:[u8;16],
@@ -187,6 +270,43 @@ mod tests{
         let crc=crc32c_zeroed(&b,188).unwrap();
         b[188..192].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+    fn super_v2()->[u8;SUPER_BYTES] {
+        let mut b=super_v1();
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&112u16.to_le_bytes());
+        for (at,value) in [(64,4240u32),(76,4118),(80,4119),(84,4120),
+            (88,8),(92,15),(96,224),(100,224)] {
+            b[at..at+4].copy_from_slice(&value.to_le_bytes());
+        }
+        let crc=crc32c_zeroed(&b,108).unwrap();
+        b[108..112].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+    #[test]
+    fn snapshot_migration_preflight_rejects_mixed_corrupt_and_regressed_headers() {
+        let v1=super_v1();
+        let v2=super_v2();
+        assert_eq!(probe_snapshot_media_pair(&v1,&v1).unwrap().kind,SnapshotMediaKind::BaselineV1);
+        assert_eq!(probe_snapshot_media_pair(&v2,&v2).unwrap().kind,SnapshotMediaKind::LegacySnapshotV2);
+        assert_eq!(probe_snapshot_media_pair(&v1,&v2),Err(Error::Conflict));
+        assert!(probe_snapshot_media_pair(&v2,&[0;SUPER_BYTES]).is_err());
+        let mut other=v2;
+        other[16]=2;
+        let crc=crc32c_zeroed(&other,108).unwrap();
+        other[108..112].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(probe_snapshot_media_pair(&v2,&other),Err(Error::Conflict));
+        let mut next=v2;
+        next[32..40].copy_from_slice(&2u64.to_le_bytes());
+        next[40..48].copy_from_slice(&12u64.to_le_bytes());
+        next[48..56].copy_from_slice(&2u64.to_le_bytes());
+        let crc=crc32c_zeroed(&next,108).unwrap();
+        next[108..112].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(probe_snapshot_media_pair(&next,&v2).unwrap().generation,2);
+        next[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let crc=crc32c_zeroed(&next,108).unwrap();
+        next[108..112].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(probe_snapshot_media_pair(&v2,&next),Err(Error::Conflict));
     }
     #[test]
     fn v0199_superblock_golden_offsets_and_crc_fail_closed(){
