@@ -802,10 +802,11 @@ fn v019_two_brains_are_only_auxiliary_to_trusted_fixed_control_manager() {
     let no_ai=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
     assert_eq!(no_ai.source,ChoiceSource::Baseline);
     pair.submit(Brain::Operations,id(100),1,advice(4)).unwrap();
-    pair.submit(Brain::Security,id(200),1,advice(1)).unwrap();
-    let conflict=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
-    assert_eq!(conflict.source,ChoiceSource::ConflictFallback);
-    assert_eq!(conflict.candidate,2);
+    // Security findings do not have an Action-voting path.
+    assert_eq!(pair.submit(Brain::Security,id(200),1,advice(1)),Err(Error::Denied));
+    let reviewed=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
+    assert_eq!(reviewed.source,ChoiceSource::OperationsAdvice);
+    assert_eq!(reviewed.candidate,4);
     assert_eq!(m.snapshot().control,2);
     assert_eq!(m.epochs(),epochs());
 }
