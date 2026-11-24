@@ -97,7 +97,9 @@ pub struct NativeRole{
     pub actor:Identity,
     /// Actual, EL1-verified nonzero physical TTBR0 root, private per-role.
     pub ttbr0_root:u64,
-    /// EL1-owned and mapped private user writable pages (not shared).
+    /// EL1-owned contiguous PHYSICAL span backing private user writable pages.
+    /// Must not overlap any role's page-table root. Native registry still
+    /// proves the ownership of every lower-level table and all other pages.
     pub private_rw:PrivateRegion,
     pub caps:u64,
     /// Genuine protected per-role CPU budget debit, all on CPU0.
@@ -116,7 +118,7 @@ pub struct NativeRoleManifest {
 }
 impl NativeRoleManifest {
     pub fn validate(&self)->Result<(),Error>{
-        if self.online_mask & REQUIRED_ONLINE_MASK != REQUIRED_ONLINE_MASK
+        if self.online_mask != REQUIRED_ONLINE_MASK
             || self.other_control_ns_per_100ms>=CONTROL_NS_PER_100MS
             || self.other_protected_pool_bytes>=CONTROL_POOL_LIMIT
         {return Err(Error::Denied);}
@@ -126,6 +128,7 @@ impl NativeRoleManifest {
             if entry.role!=ROLES[index]
                 || !entry.actor.valid()
                 || entry.ttbr0_root==0 || entry.ttbr0_root%PAGE_SIZE!=0
+                || entry.ttbr0_root.checked_add(PAGE_SIZE).is_none()
                 || entry.cpu_mask!=CONTROL_MASK || entry.thread_count!=1
                 || entry.endpoint_id==0 || !entry.private_rw.valid()
                 || entry.caps != entry.role.allowed_caps()
@@ -135,16 +138,23 @@ impl NativeRoleManifest {
                 || (entry.role==Role::Security
                     && entry.control_ns_per_100ms>SECURITY_MAX_NS)
             {return Err(Error::Denied);}
+            let root=PrivateRegion {base:entry.ttbr0_root,bytes:PAGE_SIZE};
+            if root.overlaps(entry.private_rw) {return Err(Error::Denied);}
             charge_ns=charge_ns.checked_add(entry.control_ns_per_100ms)
                 .ok_or(Error::Exhausted)?;
             pool=pool.checked_add(
                 usize::try_from(entry.private_rw.bytes).map_err(|_|Error::Exhausted)?
             ).ok_or(Error::Exhausted)?;
             for prior in &self.members[..index]{
-                if prior.actor==entry.actor
+                let prior_root=PrivateRegion {base:prior.ttbr0_root,bytes:PAGE_SIZE};
+                // Two simultaneously live roles cannot be generations of the
+                // same registry identity, or map each other's TTBR root RW.
+                if prior.actor.id==entry.actor.id
                     || prior.ttbr0_root==entry.ttbr0_root
                     || prior.endpoint_id==entry.endpoint_id
                     || prior.private_rw.overlaps(entry.private_rw)
+                    || root.overlaps(prior.private_rw)
+                    || prior_root.overlaps(entry.private_rw)
                 {return Err(Error::Denied);}
             }
         }
@@ -227,6 +237,24 @@ mod tests{
         assert_eq!(bad.validate(),Err(Error::Denied));
         bad=m;bad.members[1].caps|=PUBLISH_PLAN;
         assert_eq!(bad.validate(),Err(Error::Denied));
+    }
+    #[test]
+    fn native_role_manifest_rejects_cross_generation_and_page_table_aliases(){
+        let m=manifest();
+        let mut bad=m;bad.online_mask=0b1_1111;
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        bad=m;bad.members[1].actor.id=m.members[0].actor.id;
+        bad.members[1].actor.generation=2;
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        bad=m;bad.members[0].ttbr0_root=m.members[0].private_rw.base;
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        bad=m;bad.members[0].ttbr0_root=m.members[1].private_rw.base;
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        bad=m;bad.members[1].ttbr0_root=m.members[0].private_rw.base+PAGE_SIZE;
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        bad=m;bad.members[0].ttbr0_root=u64::MAX-(PAGE_SIZE-1);
+        assert_eq!(bad.validate(),Err(Error::Denied));
+        assert!(m.validate().is_ok());
     }
     #[test]
     fn single_control_ledger_and_pool_fail_closed_on_overcommit(){
