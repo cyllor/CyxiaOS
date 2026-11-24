@@ -128,6 +128,19 @@ pub fn can_publish_fixed(
     }
     Ok(())
 }
+/// V0.19.9 CPU0 single-controller publication gate, independent from the
+/// legacy CPU1/Cpu0-broker path. A protected EL1 task identity is still
+/// required; neither a model packet nor a role number authorizes publishing.
+pub fn can_publish_cpu0_v0199(
+    caller:ProtectedRole,publisher:ProtectedRole,
+    executing_cpu:usize,control_mask:u64
+)->Result<(),Error>{
+    can_publish(caller,publisher)?;
+    if executing_cpu!=crate::control_plane::cpu0_v0199::CONTROL_CPU
+        || control_mask!=crate::control_plane::cpu0_v0199::CONTROL_MASK
+    {return Err(Error::Unauthorized);}
+    Ok(())
+}
 pub fn can_report_completion(
     caller:ProtectedRole,executor:ProtectedRole,
     reported_generation:u64,
@@ -219,6 +232,17 @@ mod tests {
         assert_eq!(can_publish_fixed(role(2),role(2),2,0b10),Err(Error::Unauthorized));
         assert_eq!(can_publish_fixed(role(2),role(2),1,0b110),Err(Error::Unauthorized));
         assert_eq!(can_publish_fixed(role(1),role(2),1,0b10),Err(Error::Unauthorized));
+    }
+    #[test]fn v0199_cpu0_publisher_rejects_all_business_cores(){
+        assert_eq!(can_publish_cpu0_v0199(role(8),role(8),0,1),Ok(()));
+        for cpu in 1..=3 {
+            assert_eq!(
+                can_publish_cpu0_v0199(role(8),role(8),cpu,1),
+                Err(Error::Unauthorized)
+            );
+        }
+        assert_eq!(can_publish_cpu0_v0199(role(8),role(8),0,0b11),Err(Error::Unauthorized));
+        assert_eq!(can_publish_cpu0_v0199(role(7),role(8),0,1),Err(Error::Unauthorized));
     }
     #[test]fn sec_s05_old_executor_generation_cannot_report(){
         assert_eq!(can_report_completion(role(2),role(2),2),Err(Error::Stale));
