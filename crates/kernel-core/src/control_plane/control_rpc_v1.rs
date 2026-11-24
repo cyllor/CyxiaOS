@@ -136,20 +136,22 @@ pub struct Ticket{caller:Caller,seq:u64,request_hash:[u8;32]}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Admission{Execute(Ticket),Replay(Frame),Acknowledged(Frame)}
 struct Entry{ticket:Ticket,request:[u8;FRAME_BYTES],len:u16,op:Op,reply:Frame}
-struct Slot{caller:Option<Caller>,closed:bool,retired:u64,entry:Option<Entry>}
-impl Slot{const fn empty()->Self{Self{caller:None,closed:false,retired:0,entry:None}}}
+struct Slot{caller:Option<Caller>,closed:bool,retired:u64,entry:Option<Entry>,rebind_ready:bool}
+impl Slot{const fn empty()->Self{Self{caller:None,closed:false,retired:0,entry:None,rebind_ready:false}}}
 /// Ten ordinary reservations and six independent recovery reservations.
 /// Per-holder flow is unique across ALL slots; one endpoint cannot gain
 /// another sequence stream by replacing its cap or opening a recovery slot.
-pub struct RpcTable{slots:[Slot;NORMAL_SLOTS+RECOVERY_SLOTS]}
+pub struct RpcTable{boot_epoch:u64,slots:[Slot;NORMAL_SLOTS+RECOVERY_SLOTS]}
 impl RpcTable{
-    pub const fn new()->Self{Self{slots:[const{Slot::empty()};NORMAL_SLOTS+RECOVERY_SLOTS]}}
+    pub const fn new()->Self{Self{boot_epoch:0,slots:[const{Slot::empty()};NORMAL_SLOTS+RECOVERY_SLOTS]}}
     pub fn bind(&mut self,caller:Caller,recovery:bool)->Result<(),Error>{
-        if !caller.valid()||self.slots.iter().filter_map(|s|s.caller).any(|c|
-            c.boot_epoch==caller.boot_epoch&&c.holder.id==caller.holder.id){return Err(Error::Auth);}
+        if !caller.valid()||(self.boot_epoch!=0&&self.boot_epoch!=caller.boot_epoch)
+            ||self.slots.iter().filter_map(|s|s.caller).any(|c|c.holder.id==caller.holder.id){
+            return Err(Error::Auth);
+        }
         let range=if recovery{NORMAL_SLOTS..NORMAL_SLOTS+RECOVERY_SLOTS}else{0..NORMAL_SLOTS};
         let i=range.into_iter().find(|&i|self.slots[i].caller.is_none()).ok_or(Error::Capacity)?;
-        self.slots[i].caller=Some(caller);Ok(())
+        self.boot_epoch=caller.boot_epoch;self.slots[i].caller=Some(caller);Ok(())
     }
     fn slot(&mut self,caller:Caller)->Result<&mut Slot,Error>{
         self.slots.iter_mut().find(|s|s.caller==Some(caller)).ok_or(Error::Auth)
@@ -231,7 +233,20 @@ impl RpcTable{
         if !slot.closed{return Err(Error::Busy);}
         if slot.entry.as_ref().is_some_and(|e|e.reply.state()!=State::Done){return Err(Error::Busy);}
         verify_stop_and_custody(slot.entry.as_ref().map(|e|(&e.request[..usize::from(e.len)],e.reply)))?;
-        *slot=Slot::empty();Ok(())
+        slot.entry=None;slot.rebind_ready=true;Ok(())
+    }
+    /// Keep the retired identity as a tombstone; it must not regain a
+    /// sequence stream via bind(). Native registry proves durable next
+    /// generation and new endpoint ownership before replacing this slot.
+    pub fn replace_closed(&mut self,old:Caller,new:Caller,
+        verify_replacement:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if !new.valid()||new.boot_epoch!=old.boot_epoch||new.role!=old.role
+            ||new.holder.id!=old.holder.id||old.holder.generation.checked_add(1)!=Some(new.holder.generation)
+            ||new.cap==old.cap{return Err(Error::Auth);}
+        let slot=self.slot(old)?;
+        if !slot.closed||!slot.rebind_ready||slot.entry.is_some(){return Err(Error::Busy);}
+        verify_replacement()?;
+        *slot=Slot::empty();slot.caller=Some(new);Ok(())
     }
 }
 const _:()=assert!(core::mem::size_of::<Slot>()<=2048);
@@ -276,7 +291,7 @@ mod tests{
         assert_eq!(t.admit(c,&next[..x],192,10,1000,7,|_|panic!()),Err(Error::Busy));
         assert_eq!(t.admit(c,&r[..n],192,2000,1000,7,|_|panic!()),Ok(Admission::Replay(unknown)));
         t.close(c).unwrap();
-        let replacement=Caller{holder:Identity{generation:8,..c.holder},..c};
+        let replacement=Caller{holder:Identity{generation:8,..c.holder},cap:10,..c};
         assert_eq!(t.bind(replacement,false),Err(Error::Auth));
         assert_eq!(t.admit(c,&r[..n],192,10,1000,7,|_|panic!()),Err(Error::Stale));
         assert_eq!(t.retire_closed(c,|_|panic!()),Err(Error::Busy));
@@ -284,7 +299,9 @@ mod tests{
         t.complete(k,State::Done,-16,7,&[],||Ok(())).unwrap();
         assert_eq!(t.retire_closed(c,|_|Err(Error::Io)),Err(Error::Io));
         t.retire_closed(c,|e|{assert!(e.is_some());Ok(())}).unwrap();
-        t.bind(replacement,false).unwrap();
+        assert_eq!(t.bind(c,false),Err(Error::Auth));
+        assert_eq!(t.replace_closed(c,replacement,||Err(Error::Io)),Err(Error::Io));
+        t.replace_closed(c,replacement,||Ok(())).unwrap();
         assert_eq!(t.admit(c,&r[..n],192,10,1000,7,|_|panic!()),Err(Error::Auth));
     }
     #[test]
