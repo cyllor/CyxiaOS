@@ -196,7 +196,8 @@ impl Pair {
                     && advice.snapshot_ns <= trusted.now_ns
                     && advice.expires_ns > trusted.now_ns
                     && advice.expires_ns > advice.snapshot_ns
-                    && advice.expires_ns <= advice.snapshot_ns.saturating_add(100_000_000);
+                    && advice.snapshot_ns.checked_add(100_000_000)
+                        .is_some_and(|end| advice.expires_ns <= end);
                 if current {
                     if let Some(index) = frozen_candidates.iter()
                         .position(|&value| value == advice.candidate)
