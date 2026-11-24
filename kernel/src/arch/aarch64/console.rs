@@ -77,6 +77,23 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
         }
     }
 }
+/// The current ordinary HAL owner accepts a complete transport frame
+/// before advancing the sole writer's sequence. Emergency log() stays
+/// independent. Call only from the serialized native console owner;
+/// no direct/emergency writer may interleave an admitted partial frame.
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn enqueue_v0199(owner:&mut cyxia_kernel_core::control_plane::d15_owner_v0199::Owner,
+    payload:&[u8],now:u64)->Result<usize,cyxia_kernel_core::control_plane::Error>{
+    use cyxia_kernel_core::control_plane::Error;
+    let seq=LOG_SEQUENCE.load(Ordering::Relaxed);
+    let next=seq.checked_add(1).ok_or(Error::Exhausted)?;
+    let mut frame=[0;128];
+    let n=cyxia_contracts::transport::encode(1,seq,payload,&mut frame).map_err(|_|Error::Invalid)?;
+    owner.enqueue(&frame[..n],now)?;
+    LOG_SEQUENCE.compare_exchange(seq,next,Ordering::Relaxed,Ordering::Relaxed)
+        .expect("serialized console writer");
+    Ok(n)
+}
 pub(crate) fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("msr daifset, #15", "wfe") }
