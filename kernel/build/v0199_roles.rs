@@ -86,7 +86,7 @@ fn extract_relative(b:&[u8])->Vec<(u64,u64,i64)>{
                 9=>assert!(ent.replace(value).is_none()),
                 0x6fff_fff9=>assert!(relacount.replace(value).is_none()),
                 4|5|6|10|11|21|0x6fff_fef5=>(),
-                30=>assert!(value&!8==0,"unsupported DT_FLAGS"),
+                30=>assert!(value&!(2|8)==0,"unsupported DT_FLAGS"),
                 0x6fff_fffb=>assert!(value&!(0x0800_0000|1)==0,"unsupported DT_FLAGS_1"),
                 _=>panic!("unsupported dynamic tag {tag:#x}"),
             }
