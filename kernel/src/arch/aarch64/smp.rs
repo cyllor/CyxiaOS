@@ -36,6 +36,9 @@ mod v0199_control_bringup;
 #[path = "v0199_ram_inventory.rs"]
 mod v0199_ram_inventory;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d15_fixture.rs"]
+mod v0199_d15_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
 #[cfg(all(feature = "v0199-control-bringup", feature = "v0199-epoch-disk-selftest"))]
