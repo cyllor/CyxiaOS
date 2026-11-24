@@ -73,6 +73,7 @@ pub mod wire;
 pub mod dispatch;
 pub mod exchange;
 pub mod fixed;
+pub mod cpu0_v0199;
 pub mod security_finding;
 pub mod rule_profile_v2;
 pub mod image;
