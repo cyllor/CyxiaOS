@@ -1,5 +1,12 @@
 #![no_std]
 #![no_main]
+#[cfg(all(
+    feature = "v0199-local-native",
+    any(feature = "unified-runtime", feature = "tcp-v13-selftest")
+))]
+compile_error!(
+    "V0.19.9 native single-device profile cannot link historical D16 cluster, peer billing or remote TLS entrypoints; use an explicitly isolated --no-default-features legacy diagnostic build instead"
+);
 #[cfg(all(feature = "full-os", not(target_arch = "x86_64")))]
 compile_error!("full-os is currently an explicit x86 runtime profile");
 // CPU selection and profile wiring are the only responsibilities of this root.
