@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod advisory;
+pub mod advice_envelope_v1;
 pub mod budget;
 pub mod cores;
 pub mod policy;
