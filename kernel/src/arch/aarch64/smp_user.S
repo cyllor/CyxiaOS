@@ -141,6 +141,8 @@ smp_v3_probe:
  b.eq smp_v3_overflow
  cmp x9, #6
  b.eq smp_v3_overlap
+ cmp x9, #7
+ b.hs smp_v3_copy
  b smp_v3_call
 smp_v3_reserved:
  mov x5, #1
@@ -166,6 +168,32 @@ smp_v3_overlap:
  mov x2, #256
  mov x4, #0x1000
  mov x5, #8
+ b smp_v3_call
+// Construct the input in actual EL0 private RW memory. The fixture adapter
+// must inspect the saved arguments and the real registered leaf descriptors.
+smp_v3_copy:
+ mov x10, #0x20000
+ mov x11, #0x1234
+ str x11, [x10, #64]
+ mov x8, #0x50
+ mov x0, #3
+ add x1, x10, #64
+ mov x2, #8
+ mov x4, #0x30000
+ add x4, x4, #64
+ mov x5, #8
+ cmp x9, #8
+ b.ne 1f
+ add x1, x10, #4092
+1:
+ cmp x9, #9
+ b.ne 2f
+ mov x4, #0x10000
+ add x4, x4, #64
+2:
+ cmp x9, #10
+ b.ne smp_v3_call
+ add x4, x10, #4096
 smp_v3_call:
  svc #0
  b .

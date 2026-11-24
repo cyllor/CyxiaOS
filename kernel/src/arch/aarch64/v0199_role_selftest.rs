@@ -17,6 +17,34 @@ use cyxia_kernel_core::control_plane::{
 
 const FIRST_ROLE_SPACE: usize = C * 2;
 
+// The fixture exclusively owns all three page-table levels and its data/
+// stack pages. This bounded adapter checks their actual descriptors before
+// constructing a high-half kernel address. It is NOT a production VA walker:
+// only the three statically registered fixture pages may be accessed.
+fn copy_address(space:usize,va:u64,bytes:usize,write:bool)->Option<(u64,u64)>{
+    if space>=PRIVATE_SPACES{return None;}
+    let page=va & !4095;
+    let offset=va & 4095;
+    let (root,mid,leaf,base)=unsafe{
+        let root=core::ptr::addr_of!(ROOTS).cast::<Page>().add(space);
+        let mid=core::ptr::addr_of!(MIDDLES).cast::<Page>().add(space);
+        let leaf=core::ptr::addr_of!(LEAVES).cast::<Page>().add(space);
+        let base=match page {
+            CODE=>core::ptr::addr_of!(smp_user_start) as u64,
+            DATA=>core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space) as u64,
+            STACK=>core::ptr::addr_of!(USER_STACKS).cast::<Page>().add(space) as u64,
+            _=>return None,
+        };
+        (root,mid,leaf,base)
+    };
+    let root_desc=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*root).0[0]))};
+    let mid_desc=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*mid).0[0]))};
+    if root_desc!=(phys(mid as u64)|3) || mid_desc!=(phys(leaf as u64)|3){return None;}
+    let desc=unsafe{core::ptr::read_volatile(core::ptr::addr_of!((*leaf).0[(page/4096) as usize]))};
+    let pa=mmu::checked_user_leaf_span(desc,PhysAddr(phys(base)),offset,bytes,write).ok()?;
+    Some((base.checked_add(offset)?,pa.0))
+}
+
 pub(super) fn run() -> ! {
     assert_eq!(cpu::slot(), 0, "only boot CPU0 can own control EL0 role turns");
     assert_eq!(PRIVATE_SPACES, FIRST_ROLE_SPACE + ROLE_COUNT);
@@ -183,6 +211,49 @@ pub(super) fn run() -> ! {
             SMP_EVIDENCE.words[offset+i].store(value,Ordering::Relaxed);
         }
         report("V0199_SVC_PREFLIGHT",case as u64,probe.esr,u64::from(accepted));
+    }
+
+    // Four real SVC64 copy cases. Register preflight succeeds in all four;
+    // only the actual writable/owned leaf proof permits the fixture echo.
+    // No production file endpoint or control capability is granted.
+    for case in 7..11usize{
+        let mut probe=context(FIRST_ROLE_SPACE);
+        probe.regs[2]=6;probe.regs[3]=case as u64;
+        let mut trapped=false;
+        for _ in 0..32{
+            execute(&mut probe,FIRST_ROLE_SPACE);
+            if probe.kind==9{continue;}
+            if probe.kind!=8 || probe.esr>>26!=0x15{fatal(210+case as u64);}
+            trapped=true;break;
+        }
+        if !trapped{fatal(220+case as u64);}
+        let call=decode_aarch64_svc_v3(3,probe.esr,&probe.regs).expect("fixture copy SVC preflight");
+        assert_eq!(call.operation,Syscall::ServiceCall);
+        let input=copy_address(FIRST_ROLE_SPACE,call.args[1],8,false);
+        let output=copy_address(FIRST_ROLE_SPACE,call.args[4],8,true);
+        let mut evidence=[case as u64,probe.esr,0,0,0,0];
+        if let (Some((src,ipa)),Some((dst,opa)))=(input,output){
+            assert!(ipa+8<=opa || opa+8<=ipa);
+            // Both mappings belong to this stopped context. Read and write
+            // exclusively through the verified high-half aliases.
+            let mut raw=[0u8;8];
+            for (i,byte) in raw.iter_mut().enumerate(){
+                *byte=unsafe{core::ptr::read_volatile((src+i as u64) as *const u8)};
+            }
+            let stable=cyxia_kernel_core::security::syscall::StableCopy::<8>::from_validated(&raw).unwrap();
+            assert_eq!(stable.bytes(),&0x1234u64.to_le_bytes());
+            for (i,&byte) in stable.bytes().iter().enumerate(){
+                unsafe{core::ptr::write_volatile((dst+i as u64) as *mut u8,byte);}
+            }
+            let actual=unsafe{core::ptr::read_volatile(dst as *const u64)};
+            assert_eq!(actual,0x1234);
+            evidence=[case as u64,probe.esr,1,ipa,opa,actual];
+        }
+        assert_eq!(evidence[2],u64::from(case==7));
+        for (at,value) in evidence.into_iter().enumerate(){
+            SMP_EVIDENCE.words[272+(case-7)*6+at].store(value,Ordering::Relaxed);
+        }
+        report("V0199_SVC_COPY",case as u64,evidence[2],evidence[5]);
     }
 
     // Prove all three business CPUs progressed while CPU0 owned the only

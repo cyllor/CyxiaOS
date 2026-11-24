@@ -114,6 +114,21 @@ class NativeRoles:
                 "wrong SVC64 exception or register preflight evidence")
             verify_smp.require(svc_rows[case]==(case,esr,accepted),
                                "SVC64 serial and guest memory disagree")
+        copy_rows=rows("V0199_SVC_COPY")
+        verify_smp.require(len(copy_rows)==4,"missing real user-leaf copy cases")
+        for index in range(4):
+            case,esr,accepted,ipa,opa,value=words[272+index*6:278+index*6]
+            verify_smp.require((case,esr,accepted)==(7+index,0x56000000,int(index==0)),
+                               "copy fixture accepted an unmapped or read-only range")
+            if index==0:
+                verify_smp.require(ipa==words[131]+64 and opa%4096==64
+                                   and opa//4096!=ipa//4096 and value==0x1234
+                                   and opa-64 not in roots and opa-64 not in private,
+                                   "copy evidence does not identify private physical input/output")
+            else:
+                verify_smp.require((ipa,opa,value)==(0,0,0),"rejected copy wrote data")
+            verify_smp.require(copy_rows[index]==(case,accepted,value),
+                               "copy serial and memory evidence disagree")
         serial_business=rows("V0199_CPU0_BUSINESS")
         verify_smp.require(len(serial_business)==3,"missing business progress")
         business_progress=0
@@ -131,6 +146,7 @@ class NativeRoles:
             "business_cpu_mask":14,
             "distinct_el0_role_address_spaces":8,
             "physical_svc64_register_preflight_cases":7,
+            "physical_user_leaf_copy_cases":4,
             "role_ids":list(ROLE_IDS),
             "business_progress_turns":business_progress,
             "real_services_tested":False,
