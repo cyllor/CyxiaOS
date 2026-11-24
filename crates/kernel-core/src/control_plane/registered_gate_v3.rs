@@ -1,7 +1,8 @@
 //! Bounded, no-alloc EL1 DecisionRecord v3 registration/publication guard.
 //!
-//! Narrow V0.19.9 G1 vertical slice: RULE_ONLY plans without an AI disposition
-//! or TrialPermit. Other sources FAIL CLOSED as NotReady. This is not an SVC
+//! Narrow V0.19.9 G1 vertical slice: RULE_ONLY without causal fallback and
+//! single-action AI_ASSISTED with an atomic admitted-advice disposition.
+//! Trials and causal fallback remain fail-closed as NotReady. This is not an SVC
 //! handler, credential loader or proof of a native driver APPLY. The only way
 //! to call the publication adapter is via an exact previously frozen plan.
 //! The adapter must be an EL1 native owner, and must report actual acceptance
@@ -458,7 +459,7 @@ impl RegisteredDecisionGate {
         }
         let expiry=plan.action(0)?.expires_local_ns.min(AdviceEnvelopeV1::decode(&advice_wire)?.expires_ns);
         let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
-        ledger.finalize(actor,disposition,Some(record),context.now_ns)?;
+        ledger.finalize_registered_adoption(actor,disposition,record,context.now_ns)?;
         self.pending=Some(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
             count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
             assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)})});
@@ -1235,8 +1236,12 @@ mod tests {
         assert_eq!(gate.register_assisted_one(ops,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Err(Error::Denied));
         assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&shadow,&mut ledger),Err(Error::Denied));
         let key=AdviceKey{boot_epoch:1,advisor_epoch:1,advice_seq:1};
+        // CONTROL_AUX must not create the audit fact ADOPTED merely from
+        // canonical paired bytes, even when the caller is the controller.
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,Some(&rec),150),Err(Error::Denied));
         assert_eq!(ledger.consume(SUPERVISOR,key),Err(Error::NotReady));
         assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::Frozen));
+        assert_eq!(ledger.admitted_wire(CONTROLLER,key),Err(Error::Stale));
         assert_eq!(ledger.consume(SUPERVISOR,key).unwrap().state,1);
         assert_eq!(gate.register_assisted_one(CONTROLLER,&plan,&rec,&disp,&profile,local,ctx,&allowed,&mut ledger),Ok(Registration::ExactRetry));
         assert_eq!(gate.publish_assisted_once(ops,&plan,&rec,&profile,local,ctx,&allowed,||panic!("AI cannot publish")),Err(Error::Denied));
