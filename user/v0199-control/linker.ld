@@ -13,6 +13,8 @@ SECTIONS {
   . = ALIGN(4096);
   .data : { BYTE(0); *(.data .data.*) *(.got .got.*) } :data
   .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) } :data
+  ASSERT(. <= 0xf000, "native role data overlaps diagnostic result page")
+  .role_probe 0xf000 : { KEEP(*(.role_probe)) BYTE(0); } :data
   /DISCARD/ : { *(.eh_frame*) *(.comment*) }
   ASSERT(. <= 0x10000, "native role exceeds its 64KiB image backing")
 }
