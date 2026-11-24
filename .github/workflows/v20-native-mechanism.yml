@@ -33,9 +33,6 @@ concurrency:
   group: v020-native-mechanism-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   qemu-pinned:
     runs-on: ubuntu-24.04
