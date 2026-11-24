@@ -86,6 +86,54 @@ pub fn read_registered_decision_rpc(
     }
 }
 
+/// D04 FILE_SERVICE fetch uses the same per-holder RPC sequence flow.
+/// The real EL1 file/plan owners supply binding and installed version,
+/// plus an atomic native admission check; successful fetch retains work
+/// before copyout. This is not the actual filesystem executor.
+pub fn executor_fetch_rpc(
+    gate:&mut RegisteredDecisionGate,
+    table:&mut super::control_rpc_v1::RpcTable,
+    caller:super::control_rpc_v1::Caller,
+    native:VerifiedNativeCaller,args:[u64;6],copied:&[u8],
+    plan_wire:&[u8],index:usize,binding:super::apply_report_v1::ExecutorBindingV1,
+    scope:super::apply_report_v1::TrustedApplyScope,parent_deadline:u64,
+    verify_and_accept:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>)->Result<(),Error>,
+)->Result<super::control_rpc_v1::Frame,super::control_rpc_v1::Error>{
+    use super::control_rpc_v1::{Admission,Error as RpcError,Op,Request,State};
+    use super::apply_report_v1::ReportOrigin;
+    decode_v3(native.package_abi,0x50,args).map_err(|_|RpcError::Format)?;
+    // File service may run on a business core: unlike the eight control
+    // EL0 roles it is not forced to CPU0. The protected owner authenticates
+    // its actual scheduling/affinity before this serialized adapter.
+    let origin=ReportOrigin::User{holder:native.identity,cap_id:native.endpoint_cap};
+    if native.cpu>=4||caller.role!=12||caller.boot_epoch!=scope.boot_epoch
+        ||caller.holder!=native.identity||caller.cap!=native.endpoint_cap||args[0]!=caller.cap
+        ||args[3]!=0||binding.domain!=4||!binding.permits(origin){return Err(RpcError::Auth);}
+    if args[2]!=copied.len() as u64{return Err(RpcError::Format);}
+    let r=Request::decode(copied)?;
+    if !matches!(r.op,Op::ExecutorFetch|Op::Ack){return Err(RpcError::Auth);}
+    let out_cap=usize::try_from(args[5]).map_err(|_|RpcError::Format)?;
+    match table.admit(caller,copied,out_cap,scope.now_ns,parent_deadline,binding.executor_generation,|r|{
+        let at=|i:usize|u64::from_le_bytes(r.payload[i..i+8].try_into().unwrap());
+        if at(8)!=binding.target.id||at(16)!=binding.target.generation{return Err(RpcError::Auth);}
+        Ok(())
+    })?{
+        Admission::Replay(reply)|Admission::Acknowledged(reply)=>Ok(reply),
+        Admission::Execute(ticket)=>{
+            let result=gate.claim_apply_work(plan_wire,index,scope,binding,origin,verify_and_accept);
+            match result{
+                Ok(frame)=>table.complete(ticket,State::Done,0,binding.executor_generation,frame.bytes(),||Ok(())),
+                Err(e)=>{
+                    let code=match e{Error::Denied=>RpcError::Auth,Error::Stale=>RpcError::Stale,
+                        Error::Busy=>RpcError::Busy,Error::NotReady=>RpcError::Again,
+                        Error::Expired=>RpcError::Expired,Error::Exhausted=>RpcError::Capacity,_=>RpcError::Format};
+                    table.complete(ticket,State::Done,code as i32,binding.executor_generation,&[],||Ok(()))
+                }
+            }
+        }
+    }
+}
+
 impl SvcV3Bridge<'_>{
     pub fn register_rule_only(
         &mut self,
@@ -362,6 +410,56 @@ mod tests{
         ),Ok(Publication::ReplayNoEffect));
         assert_eq!(invoked,1);
     }
+    #[test]
+    fn file_executor_fetch_registers_actual_work_once_before_lost_reply(){
+        use super::super::{control_rpc_v1::{Caller,RpcTable,State,Error as RpcError},
+            apply_report_v1::{ExecutorBindingV1,TrustedApplyScope},
+            apply_work_v1::ApplyWorkV1};
+        let mut rules_bytes=profile_bytes();rules_bytes[36..38].copy_from_slice(&4u16.to_le_bytes());
+        let rules=Profile::parse(&rules_bytes).unwrap();
+        let mut plan=[0u8;214];plan[..212].copy_from_slice(&plan_bytes());
+        plan[8..12].copy_from_slice(&214u32.to_le_bytes());
+        plan[72..74].copy_from_slice(&4u16.to_le_bytes());
+        plan[76..80].copy_from_slice(&6u32.to_le_bytes());
+        let payload=[2,0,8,0];plan[210..214].copy_from_slice(&payload);
+        let mut d=decision(&plan,&rules_bytes);d[94..96].copy_from_slice(&4u16.to_le_bytes());
+        let records=[d];let ordinals=[2,4];
+        let actions=[FrozenAction{domain_id:4,target:Identity{id:17,generation:1},candidate_set_hash:[1;32],
+            static_ordinals:&ordinals,raw_fields:[None;7],action_payload:&payload}];
+        let context=TrustedRegistrationScope{boot_epoch:1,controller_epoch:2,rules_generation:7,
+            rules_hash:sha(&rules_bytes),base_plan_version:0,ledger_generation:5,core_generation:6,
+            snapshot_seq:3,sampled_ns:100,now_ns:150};
+        let ctl=Identity{id:2,generation:1};let publisher=Identity{id:8,generation:1};
+        let mut gate=RegisteredDecisionGate::new(ctl,publisher,1,2).unwrap();
+        gate.register_rule_only(ctl,&plan,&records,&rules,&actions,context).unwrap();
+        gate.publish_once(publisher,&plan,&records,&rules,&actions,context,||Ok(())).unwrap();
+        let holder=Identity{id:12,generation:5};
+        let caller=Caller{boot_epoch:1,holder,role:12,endpoint:8,cap:99};
+        let native=VerifiedNativeCaller{identity:holder,package_abi:3,endpoint_cap:99,cpu:1};
+        let mut table=RpcTable::new();table.bind(caller,false).unwrap();
+        let binding=ExecutorBindingV1{domain:4,role:12,active:true,target:actions[0].target,
+            executor_generation:9,holder,endpoint_cap_id:99};
+        let scope=TrustedApplyScope{boot_epoch:1,plan_version:7,now_ns:170};
+        let mut request=[0u8;72];request[..4].copy_from_slice(&0x43594351u32.to_le_bytes());
+        request[4..6].copy_from_slice(&1u16.to_le_bytes());request[6..8].copy_from_slice(&48u16.to_le_bytes());
+        request[8..10].copy_from_slice(&11u16.to_le_bytes());request[12..16].copy_from_slice(&24u32.to_le_bytes());
+        for (at,v) in [(16,1u64),(32,9),(40,200),(56,17),(64,1)]{
+            request[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        request[48..50].copy_from_slice(&4u16.to_le_bytes());
+        let args=[99,4096,72,0,8192,384];
+        let wrong=VerifiedNativeCaller{endpoint_cap:100,..native};
+        assert_eq!(executor_fetch_rpc(&mut gate,&mut table,caller,wrong,args,&request,&plan,0,binding,scope,200,|_|panic!()),Err(RpcError::Auth));
+        let reply=executor_fetch_rpc(&mut gate,&mut table,caller,native,args,&request,&plan,0,binding,scope,200,|w|{
+            assert_eq!(w.target,binding.target);assert_eq!(w.payload,&payload);Ok(())
+        }).unwrap();
+        assert_eq!(reply.state(),State::Done);
+        let w=ApplyWorkV1::decode(&reply.bytes()[48..]).unwrap();
+        assert_eq!((w.domain,w.executor_generation,w.plan_version),(4,9,7));
+        assert_eq!(executor_fetch_rpc(&mut gate,&mut table,caller,native,args,&request,&plan,0,binding,
+            TrustedApplyScope{now_ns:201,..scope},200,|_|panic!("replay cannot execute")),Ok(reply));
+    }
+
     #[test]
     fn true_v3_x8_dispatch_is_required(){
         assert_eq!(ABI_VERSION,3);
