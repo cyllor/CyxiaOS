@@ -33,19 +33,39 @@ fn uuid(b:&[u8],off:usize)->Result<[u8;16],Error>{
     b.get(off..off+16).ok_or(Error::Invalid)?
         .try_into().map_err(|_|Error::Invalid)
 }
-/// Reflected CRC32C (Castagnoli); the stored crc32c field itself reads zero.
-pub fn crc32c_zeroed(bytes:&[u8],offset:usize)->Result<u32,Error>{
-    if offset.checked_add(4).is_none_or(|e|e>bytes.len()) {
-        return Err(Error::Invalid);
-    }
-    let mut crc=!0u32;
-    for (i,&value) in bytes.iter().enumerate(){
-        let byte=if (offset..offset+4).contains(&i){0}else{value};
-        crc^=u32::from(byte);
-        for _ in 0..8 {
-            crc=(crc>>1) ^ (if crc&1!=0{0x82f6_3b78}else{0});
+// Fixed 1 KiB read-only table, no heap, no mutable global state and no
+// architecture-specific instruction requirement. Match the historical
+// storage codec's CRC32C polynomial and initial/final XOR.
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut value = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = (value >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(value & 1));
+            bit += 1;
         }
+        table[i] = value;
+        i += 1;
     }
+    table
+}
+static CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+#[inline]
+fn crc32c_byte(crc: u32, byte: u8) -> u32 {
+    (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize]
+}
+
+/// Reflected CRC32C (Castagnoli); the stored crc32c field itself reads zero.
+/// Visit each byte exactly once, with no per-byte bit loop or copied page.
+pub fn crc32c_zeroed(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    let end = offset.checked_add(4).filter(|end| *end <= bytes.len()).ok_or(Error::Invalid)?;
+    let mut crc = u32::MAX;
+    for &byte in &bytes[..offset] { crc = crc32c_byte(crc, byte); }
+    for _ in 0..4 { crc = crc32c_byte(crc, 0); }
+    for &byte in &bytes[end..] { crc = crc32c_byte(crc, byte); }
     Ok(!crc)
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -184,6 +204,14 @@ pub struct FileReceiptV4 {
     pub request_id:u64,
     pub owner_principal_id:u64,
 }
+/// The local request identity is a deterministic projection of the full key,
+/// never a caller-chosen second identifier. This is format, not authority.
+pub const fn local_request_id(group_id:u32,stream_slot:u64,request_seq:u64)->Option<u64>{
+    if group_id>=16 || stream_slot>=8 || request_seq==0 || request_seq>MAX_REQUEST_SEQ {
+        return None;
+    }
+    Some(((group_id as u64+1)<<56)|(stream_slot<<53)|request_seq)
+}
 impl FileReceiptV4 {
     pub fn decode(bytes:&[u8])->Result<Self,Error>{
         if bytes.len()!=RECEIPT_BYTES
@@ -220,14 +248,20 @@ impl FileReceiptV4 {
             || value.stream_generation==0 || value.stream_generation>u32::MAX as u64
             || value.request_seq==0 || value.request_seq>MAX_REQUEST_SEQ
             || !(1..=6).contains(&value.status)
-            || value.request_id==0 || value.owner_principal_id==0
-            || (value.status==1
-                && (value.log_epoch!=0 || value.txid!=0
+            || local_request_id(value.group_id,value.stream_slot,value.request_seq)!=Some(value.request_id)
+            || value.owner_principal_id==0
+            // A transaction identity is either absent or complete.
+            || ((value.log_epoch==0 || value.txid==0 || value.commit_lsn==0)
+                && (value.log_epoch!=0 || value.txid!=0 || value.commit_lsn!=0))
+            // CANCEL_UNBOUND may retire a proven no-effect unbound ticket.
+            // Zero operation digest is legal only for ISSUED or that
+            // cancelled form, and all unbound operation fields stay zero.
+            || (value.operation_digest==[0;32]
+                && (!matches!(value.status,1|6) || value.log_epoch!=0 || value.txid!=0
                     || value.commit_lsn!=0 || value.write_seq!=0
                     || value.result!=0 || value.completed_prefix!=0
-                    || value.operation_digest!=[0;32]
                     || value.output_digest!=[0;32]))
-            || (value.status!=1 && value.operation_digest==[0;32])
+            || (value.status==1 && value.operation_digest!=[0;32])
         {return Err(Error::Invalid);}
         Ok(value)
     }
@@ -265,7 +299,7 @@ mod tests{
         b[48..56].copy_from_slice(&1u64.to_le_bytes());
         b[56..64].copy_from_slice(&1u64.to_le_bytes());
         b[96..98].copy_from_slice(&1u16.to_le_bytes());
-        b[172..180].copy_from_slice(&1u64.to_le_bytes());
+        b[172..180].copy_from_slice(&local_request_id(0,0,1).unwrap().to_le_bytes());
         b[180..188].copy_from_slice(&2u64.to_le_bytes());
         let crc=crc32c_zeroed(&b,188).unwrap();
         b[188..192].copy_from_slice(&crc.to_le_bytes());
@@ -283,6 +317,53 @@ mod tests{
         b[108..112].copy_from_slice(&crc.to_le_bytes());
         b
     }
+    #[test]
+    fn crc_matches_bitwise_reference_and_real_legacy_encoder() {
+        // Compare with the independent old bitwise calculation, including
+        // offset zero, unaligned fields, the last four bytes and overflow.
+        fn reference(b: &[u8], at: usize) -> u32 {
+            let mut crc=u32::MAX;
+            for (i, &byte) in b.iter().enumerate() {
+                crc ^= u32::from(if (at..at+4).contains(&i) {0} else {byte});
+                for _ in 0..8 {
+                    crc=(crc>>1) ^ (if crc&1!=0 {0x82f6_3b78} else {0});
+                }
+            }
+            !crc
+        }
+        let bytes: [u8;SUPER_BYTES] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        for (length,offset) in [(4,0),(9,1),(192,188),(4096,0),(4096,76),(4096,108),(4096,4092)] {
+            assert_eq!(crc32c_zeroed(&bytes[..length],offset),Ok(reference(&bytes[..length],offset)));
+            let mut zeroed=bytes;
+            zeroed[offset..offset+4].fill(0);
+            assert_eq!(crc32c_zeroed(&bytes[..length],offset),
+                Ok(cyxia_prototype::storage::crc32c(&zeroed[..length])));
+        }
+        assert_eq!(crc32c_zeroed(&bytes,usize::MAX),Err(Error::Invalid));
+        assert_eq!(crc32c_zeroed(&bytes,4093),Err(Error::Invalid));
+
+        // Generate the source volume using the *actual* historical encoder,
+        // not a duplicate table of layout offsets in the preflight test.
+        let old=cyxia_prototype::storage::Superblock {
+            fs_uuid:[1;16],generation:1,checkpoint_lsn:0,log_epoch:1
+        };
+        let mut a=[0u8;SUPER_BYTES];
+        old.encode(&mut a).unwrap();
+        assert_eq!(a,super_v2());
+        let next=cyxia_prototype::storage::Superblock {
+            generation:2, checkpoint_lsn:19, log_epoch:2, ..old
+        };
+        let mut b=[0u8;SUPER_BYTES];
+        next.encode(&mut b).unwrap();
+        let p=probe_snapshot_media_pair(&a,&b).unwrap();
+        assert_eq!(p.kind,SnapshotMediaKind::LegacySnapshotV2);
+        assert_eq!(p.fs_uuid,next.fs_uuid);
+        assert_eq!((p.generation,p.checkpoint_lsn,p.log_epoch),(2,19,2));
+        assert_eq!(probe_snapshot_media_pair(&super_v1(),&a),Err(Error::Conflict));
+        b[4095]^=1;
+        assert!(probe_snapshot_media_pair(&a,&b).is_err());
+    }
+
     #[test]
     fn snapshot_migration_preflight_rejects_mixed_corrupt_and_regressed_headers() {
         let v1=super_v1();
@@ -320,6 +401,31 @@ mod tests{
         b=super_v1();b[16]^=1;
         assert!(SuperblockV1::decode(&b).is_err());
         assert_eq!(crc32c_zeroed(&[0u8;2],0),Err(Error::Invalid));
+    }
+    #[test]
+    fn receipt_canonical_local_identity_and_unbound_cancel_shape() {
+        let mut b=receipt();
+        b[96..98].copy_from_slice(&6u16.to_le_bytes());
+        let reseal=|b:&mut [u8;RECEIPT_BYTES]| {
+            let crc=crc32c_zeroed(b,188).unwrap();
+            b[188..192].copy_from_slice(&crc.to_le_bytes());
+        };
+        reseal(&mut b);
+        assert_eq!(FileReceiptV4::decode(&b).unwrap().status,6);
+        let cancelled=b;
+        for at in [64usize,72,80,88,100,104,140,172] {
+            b=cancelled;b[at]^=1;reseal(&mut b);
+            assert!(FileReceiptV4::decode(&b).is_err(),"offset {at}");
+        }
+        b=cancelled;b[96..98].copy_from_slice(&2u16.to_le_bytes());
+        reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_err());
+        b[108]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_ok());
+        b[64]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_err());
+        b[72]=1;b[80]=1;reseal(&mut b);assert!(FileReceiptV4::decode(&b).is_ok());
+        assert_eq!(local_request_id(15,7,MAX_REQUEST_SEQ),Some((16u64<<56)|(7u64<<53)|MAX_REQUEST_SEQ));
+        assert_eq!(local_request_id(16,0,1),None);
+        assert_eq!(local_request_id(0,8,1),None);
+        assert_eq!(local_request_id(0,0,0),None);
     }
     #[test]
     fn v0199_receipt_v4_rejects_old_version_crc_and_unbound_forgery(){

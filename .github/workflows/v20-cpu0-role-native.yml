@@ -11,7 +11,13 @@ on:
       - 'tools/verify_v0199_cpu0_roles.py'
       - 'tools/verify_smp.py'
   pull_request:
-    branches: [fix/v020-v0199-contract-gaps]
+    branches: [fix/v020-v0199-contract-gaps, CyxiaOS-V0.20]
+    paths:
+      - '.github/workflows/v20-cpu0-role-native.yml'
+      - 'kernel/src/arch/aarch64/v0199_role_selftest.rs'
+      - 'kernel/src/arch/aarch64/smp_user.S'
+      - 'crates/kernel-core/src/security/syscall_v3.rs'
+      - 'tools/verify_v0199_cpu0_roles.py'
   workflow_dispatch:
 permissions:
   contents: read

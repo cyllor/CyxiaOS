@@ -976,3 +976,7 @@ impl<const B: usize> Ipc<B> {
         Ok((p as u16, b as u8))
     }
 }
+
+// Opt-in ABI-v3 queue owner. The legacy Ipc layout and callers are unchanged.
+mod receive_v3;
+pub use receive_v3::*;

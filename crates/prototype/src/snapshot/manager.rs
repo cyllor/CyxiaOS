@@ -823,26 +823,15 @@ impl Manager {
         self.age_anchor_ns = None;
         Ok(result)
     }
-    /// `has_refs` covers every root handle, descriptor/image dependency and I/O
-    /// obligation. The caller freezes new root opens until this method returns.
-    pub fn delete<D: BlockDevice>(
-        &mut self,
-        j: &mut Journal,
-        d: &mut D,
-        s: &mut Scratch,
-        tx: &mut Workspace,
+    /// Shared admission check for both the filesystem tree proof and the
+    /// manager's atomic root-drop commit. Does not change durable state.
+    fn delete_eligibility<E>(
+        &self,
         request: Request,
         key: SnapshotKey,
         has_refs: bool,
         automatic: bool,
-    ) -> Result<RequestRecord, Error<D::Error>> {
-        let mut payload = [0u8; 40];
-        key.encode(&mut payload)?;
-        let digest = request_digest(OP_DELETE, request, &payload)?;
-        let (index, wm) = match self.lookup(j, d, s, tx, request.key, Some(digest))? {
-            Lookup::Existing(_, r) => return Ok(r),
-            Lookup::New(i, w) => (i, w),
-        };
+    ) -> Result<Entry, Error<E>> {
         if request.expected_live_view_epoch != 0 {
             return Err(Status::Invalid.into());
         }
@@ -876,6 +865,74 @@ impl Manager {
                 < 2
             {
                 return Err(Status::Retention.into());
+            }
+        }
+        Ok(entry)
+    }
+
+    /// A new periodic root drop needs the owner's complete tree proof.
+    /// Exact retained requests bypass fresh proof; conflicting keys still fail
+    /// through the same canonical digest and lookup used by delete().
+    pub(crate) fn periodic_delete_requires_tree_proof<D: BlockDevice>(
+        &self,
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+        tx: &mut Workspace,
+        request: Request,
+        key: SnapshotKey,
+        has_refs: bool,
+        automatic: bool,
+    ) -> Result<bool, Error<D::Error>> {
+        let mut payload = [0u8; 40];
+        key.encode(&mut payload)?;
+        let digest = request_digest(OP_DELETE, request, &payload)?;
+        match self.lookup(j, d, s, tx, request.key, Some(digest))? {
+            Lookup::Existing(_, _) => Ok(false),
+            Lookup::New(_, _) => Ok(self.delete_eligibility::<D::Error>(
+                request, key, has_refs, automatic
+            )?.slot_class == SlotClass::Periodic),
+        }
+    }
+
+    /// `has_refs` covers every root handle, descriptor/image dependency and I/O
+    /// obligation. The caller freezes new root opens until this method returns.
+    pub fn delete<D: BlockDevice>(
+        &mut self,
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+        tx: &mut Workspace,
+        request: Request,
+        key: SnapshotKey,
+        has_refs: bool,
+        automatic: bool,
+    ) -> Result<RequestRecord, Error<D::Error>> {
+        let mut payload = [0u8; 40];
+        key.encode(&mut payload)?;
+        let digest = request_digest(OP_DELETE, request, &payload)?;
+        let (index, wm) = match self.lookup(j, d, s, tx, request.key, Some(digest))? {
+            Lookup::Existing(_, r) => return Ok(r),
+            Lookup::New(i, w) => (i, w),
+        };
+        let entry = self.delete_eligibility::<D::Error>(request, key, has_refs, automatic)?;
+        if entry.slot_class == SlotClass::Periodic {
+            // ACTIVE alone is not evidence of a still-readable protection
+            // point. Verify each survivor's descriptor and inode image before
+            // dropping a root, even if this manager is used without the tree
+            // layer. A corrupt survivor freezes cleanup rather than allowing
+            // the last verified root to be deleted.
+            let range = if key.slot < 3 { 0..3 } else { 3..6 };
+            for slot in range {
+                if slot == key.slot as usize || self.catalog.entries[slot].state != State::Active {
+                    continue;
+                }
+                if let Err(error) = self.validate_image(j, d, s, tx, slot) {
+                    if matches!(&error, Error::Format(_) | Error::Status(Status::Corrupt)) {
+                        self.fault_freeze(j, d, s, tx)?;
+                    }
+                    return Err(error);
+                }
             }
         }
         let mut catalog = self.catalog;
