@@ -112,8 +112,6 @@ class NativeRoles:
             verify_smp.require(serial_business[slot-1]==(slot,progress,control_turns),
                                "business serial/guest memory mismatch")
             business_progress+=progress
-        verify_smp.require(all(value==0 for value in words[8:20]
-            if False),"placeholder") if False else None
         return {
             "guest_cpus":4,
             "fixed_control_cpu":0,
