@@ -193,7 +193,10 @@ impl Admission {
         if tls.local_echo_proof() != Some(active.proof) {
             return Err(Error::Unauthenticated);
         }
-        let request=tls.accept_local_echo(tls.plaintext())
+        let bytes=tls.plaintext();
+        let length=crate::echo::next_frame_len(bytes)
+            .map_err(|_|Error::Invalid)?.ok_or(Error::Busy)?;
+        let request=tls.accept_local_echo(&bytes[..length])
             .map_err(|_|Error::Invalid)?;
         request.encode_reply(out).map_err(|_|Error::Invalid)
     }
@@ -215,8 +218,10 @@ impl Admission {
         }
         let mut response = [0u8; crate::echo::MAX_FRAME];
         let encoded = self.reply(key, tls, &mut response)?;
-        // Exact-frame validation above means these bytes are one request.
-        let consumed = tls.plaintext().len();
+        // A single authenticated TLS record may contain several Echo frames.
+        // Consume exactly the first checked frame, retaining trailing bytes.
+        let consumed=crate::echo::next_frame_len(tls.plaintext())
+            .map_err(|_| Error::Invalid)?.ok_or(Error::Busy)?;
         match tls.send_plaintext(&response[..encoded]) {
             Ok(()) => {
                 // The authenticated TLS-owned bytes are retained across any

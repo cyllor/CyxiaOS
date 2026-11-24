@@ -9,4 +9,6 @@ pub mod echo;
 #[cfg(feature = "tls")]
 pub mod admission;
 #[cfg(feature = "tls")]
+pub mod native_tcp;
+#[cfg(feature = "tls")]
 pub mod tls;

@@ -166,6 +166,30 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub fn can_publish_fixed(", syscall)
         self.assertIn("security::syscall::can_publish_fixed(", manager)
 
+    def test_sec_n_native_tcp_uses_strict_echo_stream_framing(self):
+        echo=source(ROOT / "crates/net-transport/src/echo.rs")
+        tls=source(ROOT / "crates/net-transport/src/tls.rs")
+        ingress=source(ROOT / "crates/net-transport/src/native_tcp.rs")
+        device=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        admission=source(ROOT / "crates/net-transport/src/admission.rs")
+        self.assertIn("pub(crate) fn next_frame_len(",echo)
+        self.assertIn("next_frame_len(tls.plaintext())",admission)
+        self.assertIn("let accepted = self.received;",tls)
+        self.assertIn("self.buffers.received[accepted..]",tls)
+        self.assertIn("tls.receive_tls(&scratch[..n])",ingress)
+        self.assertIn("tls.consume_tls(queued)",ingress)
+        self.assertIn("impl<P: Port> NativeSocket for Tcp<'_, P>",device)
+        self.assertNotIn("member_rpc(",ingress)
+        self.assertNotIn("remote_placement",device)
+
+    def test_sec_d_native_net_tx_receipts_retain_exact_generation_until_ack(self):
+        driver=source(ROOT / "crates/driver-virtio/src/net/batched.rs")
+        self.assertIn("pub fn poll_tx_receipt(",driver)
+        self.assertIn("pub fn acknowledge_tx(",driver)
+        self.assertIn("self.completed_tx != Some(receipt)",driver)
+        self.assertIn("self.tx.release(receipt.token)?",driver)
+        self.assertIn("v019_sec_d_tx_completion_retains_dma_until_exact_generation_ack",driver)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

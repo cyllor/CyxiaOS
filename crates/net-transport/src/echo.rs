@@ -36,6 +36,34 @@ impl<'a> Request<'a> {
         Ok(len)
     }
 }
+/// Inspect the first frame in a TLS byte stream. A TCP/TLS record may
+/// contain a prefix of a frame or several complete frames; neither is an
+/// invalid protocol message by itself. The exact-only public parse_request
+/// remains strict and is called on precisely the returned prefix.
+pub(crate) fn next_frame_len(input: &[u8]) -> Result<Option<usize>, Error> {
+    if input.len() < HEADER_BYTES {
+        return Ok(None);
+    }
+    let version = u16::from_le_bytes([input[0], input[1]]);
+    if version != VERSION {
+        return Err(Error::Version);
+    }
+    let opcode = u16::from_le_bytes([input[2], input[3]]);
+    if opcode != READONLY_ECHO {
+        return Err(Error::Opcode);
+    }
+    let payload_len = u32::from_le_bytes(
+        input[4..8].try_into().map_err(|_| Error::Length)?
+    ) as usize;
+    if payload_len > MAX_PAYLOAD {
+        return Err(Error::Length);
+    }
+    let frame_len = HEADER_BYTES.checked_add(payload_len).ok_or(Error::Length)?;
+    if input.len() < frame_len {
+        return Ok(None);
+    }
+    Ok(Some(frame_len))
+}
 pub fn parse_request(input: &[u8]) -> Result<Request<'_>, Error> {
     if input.len() < HEADER_BYTES || input.len() > MAX_FRAME {
         return Err(Error::Length);
@@ -77,6 +105,29 @@ mod tests {
         let mut out=[0u8;MAX_FRAME];
         assert_eq!(input.encode_reply(&mut out).unwrap(),20);
         assert_eq!(&out[..20],&packet);
+    }
+    #[test] fn v019_sec_n05_fragmented_and_coalesced_stream_requires_exact_prefix() {
+        let first=packet(&[1,2,3,4]);
+        let second=packet(&[5,6,7,8]);
+        for bytes in 0..first.len() {
+            assert_eq!(next_frame_len(&first[..bytes]),Ok(None));
+        }
+        assert_eq!(next_frame_len(&first),Ok(Some(20)));
+        let mut stream=[0u8;40];
+        stream[..20].copy_from_slice(&first);
+        stream[20..].copy_from_slice(&second);
+        assert_eq!(next_frame_len(&stream),Ok(Some(20)));
+        assert_eq!(parse_request(&stream),Err(Error::Length));
+        assert_eq!(parse_request(&stream[..20]).unwrap().payload(),&[1,2,3,4]);
+        assert_eq!(parse_request(&stream[20..]).unwrap().payload(),&[5,6,7,8]);
+    }
+    #[test] fn v019_sec_n05_invalid_header_is_rejected_before_waiting_for_body() {
+        let mut frame=packet(&[1,2,3,4]);
+        frame[2]=19;
+        assert_eq!(next_frame_len(&frame[..16]),Err(Error::Opcode));
+        frame[2]=1;
+        frame[4..8].copy_from_slice(&4097u32.to_le_bytes());
+        assert_eq!(next_frame_len(&frame[..16]),Err(Error::Length));
     }
     #[test] fn sec_n05_no_tail_or_truncation() {
         let packet=packet(&[1,2,3,4]);

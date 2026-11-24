@@ -7,5 +7,7 @@ pub mod device;
 pub mod discovery;
 pub mod tcp;
 #[cfg(feature = "tls")]
+pub mod local_echo_tcp;
+#[cfg(feature = "tls")]
 pub mod tls;
 pub mod wire;

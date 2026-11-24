@@ -603,22 +603,27 @@ impl<'a> Session<'a> {
             self.fail();
             return Err(Error::Time);
         }
-        if self.output != 0 || self.received != 0 {
+        if self.output != 0 || self.received == PLAINTEXT_BUFFER {
             return Ok(());
         }
+        // SEC-N05: preserve previously authenticated plaintext while
+        // receiving the continuation of a fragmented Echo frame. A TLS
+        // record is not an application-message boundary. No additional
+        // allocation is made: append only to the unused fixed buffer tail.
+        let accepted = self.received;
         let incoming = &mut self.buffers.input[..self.input];
         let result = match &mut self.connection {
             Connection::Client(c) => step(
                 c.process_tls_records(incoming),
                 &mut self.buffers.output[..],
-                &mut self.buffers.received[..],
+                &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
             ),
             Connection::Server(c) => step(
                 c.process_tls_records(incoming),
                 &mut self.buffers.output[..],
-                &mut self.buffers.received[..],
+                &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
             ),
@@ -655,7 +660,7 @@ impl<'a> Session<'a> {
             && progress.received == 0
             && !progress.sent;
         self.output = progress.output;
-        self.received = progress.received;
+        self.received = accepted.checked_add(progress.received).ok_or(Error::Buffer)?;
         if progress.sent {
             self.buffers.sending[..self.sending].fill(0);
             self.sending = 0;

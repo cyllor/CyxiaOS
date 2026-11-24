@@ -147,3 +147,17 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 新增一位有界 `tls_egress_pending` 账本。一次回复成功被 TLS 接纳后，直到 `confirm_tls_output_drained` 验证该会话没有待编码明文或尚未交出的 TLS 密文，才允许清除此债务。重新发送期间拒绝第二次调度或重复退账；`finish_drain` 不得绕开这项 TLS 排空债务。
 - 此处只判定 **TLS 内部输出缓冲已排空**，并不证明 TCP 对端 ACK、VirtIO TX 使用环、DMA pin 或 NIC 完成。这些仍必须由受保护原生网络/设备适配器对账；当前尚未完成实际原生服务接线，不能将 G2/G3/G4 记为通过。
 - 新增实际双向 TLS 会话的回声收发、非法写操作码、回复待发送与延迟排空测试；同时运行主机/源代码回归与 AArch64 EL0 TLS 交叉编译。
+
+### SEC-N 字节流边界与原生 smoltcp 适配（本轮）
+
+- `crates/net-transport/src/echo.rs::next_frame_len` 从 TLS 字节流只提取第一条完整只读 Echo，未完成报待更多数据，非法版本/opcode/超过 4096 字节长度立即拒绝；`parse_request` 仍严格拒绝尾字节，不扩大对外协议。
+- `tls::Session::pump` 在既有 16 KiB 受保护明文缓冲区中追加后续已认证记录，不覆盖此前未处理的明文。一个 TCP/TLS 记录含多条 Echo 时先处理首条，消费准确长度后保留剩余；分片不能死锁、尾字节不误吞。
+- 新增 `net-transport::native_tcp::turn`：每调用至多 1 次本机 TCP/VirtIO service、1 次 TLS 接收、1 次只读 Echo 分发和 2 次密文队列写入；所有写入按实际接收长度消费，不等待模型，不引入队列或额外堆缓冲。TCP 已入队不构成远端 ACK 或 DMA 完成证明。
+- `cluster-transport::local_echo_tcp` 仅重用当前原生 `smoltcp::Tcp` 驱动为 `NativeSocket`；不调用成员发现、集群 wire、远程任务或联合调度。这是可复用的 transport 代码接线，**原生单机 EL0 Echo 服务尚未部署到启动配置**。
+- 新增真实 TLS 片段、两帧合并以及模拟部分本机 TCP 收发的端到端测试；同一旧集群 transport 依赖保留兼容测试，未来须将 TCP 机制单独迁出集群包。
+
+### SEC-D 真实 VirtIO Net TX 代际回执（本轮）
+
+- 在 `driver-virtio::net::BatchedNet` 新增可选的 `poll_tx_receipt` / `acknowledge_tx`；收到经过驱动解析校验的 used-ring 完成后，原 token+generation+策略版本保持占用，必须匹配完整回执才能释放真实描述符；重复/伪造代际或在持回执期间重 poll 都拒绝。
+- 原 `poll_tx` 保持同一可信驱动调用回合内立即确认的兼容实现，避免破坏现有 smoltcp 进度，新的安全适配器可按真实 TX 回执延迟 ACK。新增主机模拟 used-ring 单测，明确区分 **设备链已完成、TCP 已入队、TLS 输出排空、远端 ACK** 四层，不推断彼此。
+- 本轮验证仍是主机测试和 AArch64 TLS 库编译，未执行 EL0 单机 Echo 部署、QEMU NIC/DMA 断电/断线注入、SEC-N08/SEC-D05 的原生设备验收，G2/G3/G4 状态不升级。
