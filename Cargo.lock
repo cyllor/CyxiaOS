@@ -185,6 +185,7 @@ dependencies = [
  "cyxia-contracts",
  "cyxia-control-model",
  "cyxia-prototype",
+ "ed25519-dalek",
  "sha2",
 ]
 
