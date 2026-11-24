@@ -40,8 +40,8 @@ pub struct FrozenNativePlan<'a> {
 }
 /// Exact ABI-v3 bridge. Caller/owner identities are additionally rechecked by
 /// the RegisteredDecisionGate. No role is inferred from the request bytes.
-pub struct SvcV3Bridge<'a> {
-    pub gate:&'a mut RegisteredDecisionGate,
+pub struct SvcV3Bridge<'a,'pool> {
+    pub gate:&'a mut RegisteredDecisionGate<'pool>,
     pub decision_endpoint_cap:u64,
     pub publisher_cap:u64,
 }
@@ -134,7 +134,7 @@ pub fn executor_fetch_rpc(
     }
 }
 
-impl SvcV3Bridge<'_>{
+impl SvcV3Bridge<'_,'_>{
     pub fn register_rule_only(
         &mut self,
         caller:VerifiedNativeCaller,
