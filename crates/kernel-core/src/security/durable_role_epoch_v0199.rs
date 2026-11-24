@@ -146,6 +146,10 @@ impl DurableEpochGate{
         verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
         ->Result<Outcome,Error>
     {
+        // The prior receipt is historical, not current startup authority.
+        // Never return its successful outcome while a newer transaction
+        // fences boot/service generation reads (even if bytes still match).
+        if self.pending.is_some_and(|p|p.ticket!=ticket){return Err(Error::Busy);}
         if let Some((old,r,outcome))=self.last{
             if old==ticket{
                 return if r==receipt && hash(readback)==old.after_digest{Ok(outcome)}
@@ -224,13 +228,22 @@ mod tests{
         assert_eq!(decoded.last_boot_epoch,10);
         assert_eq!(decoded.state_generation,9);
         assert_eq!(q.service_generation(Role::Security),Err(Error::Busy));
+        assert_eq!(q.boot_epoch(),None);
+        // A retry of the historical boot receipt cannot return a new success
+        // while the restart transaction is pending/UNKNOWN.
+        assert_eq!(q.confirm(boot,receipt(boot,1),&raw,|_,_|panic!("historical receipt")),Err(Error::Busy));
+        assert_eq!(q.after_image(t),Ok(after));
         assert_eq!(q.prepare(Change::Isolate(stop),|_|Ok(())),Err(Error::Busy));
         assert_eq!(q.confirm(t,receipt(t,2),&after,|_,_|Ok(())),
             Ok(Outcome::Service{role:Role::Security,generation:5,isolated:false}));
         assert_eq!(q.service_generation(Role::Security),Ok(5));
         let stop=StopEvidence{generation:5,..stop};
+        let restart_ticket=t;
+        let restart_image=after;
         let t=q.prepare(Change::Isolate(stop),|_|Ok(())).unwrap();
         let after=q.after_image(t).unwrap();
+        assert_eq!(q.confirm(restart_ticket,receipt(restart_ticket,2),&restart_image,|_,_|panic!("old service receipt")),Err(Error::Busy));
+        assert_eq!(q.service_generation(Role::Security),Err(Error::Busy));
         q.confirm(t,receipt(t,3),&after,|_,_|Ok(())).unwrap();
         assert_eq!(q.service_generation(Role::Security),Err(Error::Unauthorized));
         assert_eq!(q.prepare(Change::Restart(stop),|_|panic!("isolated")),Err(Error::Unauthorized));
