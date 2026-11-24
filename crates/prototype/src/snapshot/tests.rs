@@ -1198,7 +1198,7 @@ fn periodic_layers_rotate_without_changing_other_tier_schedule() {
 }
 
 #[test]
-fn automatic_delete_cannot_remove_either_tiers_last_readable_root() {
+fn neither_automatic_nor_manual_delete_can_remove_either_tiers_last_readable_root() {
     let mut h = Harness::new();
     let short = h.periodic(PeriodicLayer::Short);
     let long = h.periodic(PeriodicLayer::Long);
@@ -1221,10 +1221,26 @@ fn automatic_delete_cannot_remove_either_tiers_last_readable_root() {
         );
         assert_eq!(h.manager.active(key).unwrap().state, State::Active);
     }
-    // The minimum belongs to automatic maintenance; an explicitly authorized
-    // manual deletion is still subject to retention, references and freezing.
+    // The candidate contract also guards explicitly authorized root drops.
     let manual = h.request(0, 1, 0);
-    h.manager
+    for key in [short.snapshot_key, long.snapshot_key] {
+        assert_eq!(
+            h.manager.delete(
+                &mut h.journal,
+                &mut h.disk,
+                &mut h.scratch,
+                &mut h.tx,
+                manual,
+                key,
+                false,
+                false,
+            ),
+            Err(Error::Status(Status::Retention))
+        );
+        assert_eq!(h.manager.active(key).unwrap().state, State::Active);
+    }
+    let replacement = h.periodic(PeriodicLayer::Short);
+    let deleted = h.manager
         .delete(
             &mut h.journal,
             &mut h.disk,
@@ -1236,6 +1252,13 @@ fn automatic_delete_cannot_remove_either_tiers_last_readable_root() {
             false,
         )
         .unwrap();
+    assert_eq!(deleted.state, RequestState::Done);
+    assert_eq!(h.manager.catalog.entries[short.snapshot_key.slot as usize].state, State::Deleting);
+    assert!(h.manager.active(replacement.snapshot_key).is_ok());
+    assert!(h.manager.active(long.snapshot_key).is_ok());
+    h.disk.crash();
+    let h = Harness::mount(h.disk);
+    assert!(h.manager.active(replacement.snapshot_key).is_ok());
     assert!(h.manager.active(long.snapshot_key).is_ok());
 }
 
