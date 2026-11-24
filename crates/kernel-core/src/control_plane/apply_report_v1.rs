@@ -105,7 +105,6 @@ impl<'a> ApplyReportV1<'a>{
             || self.key.controller_epoch!=plan.header.controller_epoch
             || self.key.plan_seq!=plan.header.plan_seq
             || self.plan_version!=current.plan_version
-            || self.executor_generation!=current.actor.generation
             || self.executor_generation!=current.executor_generation
             || self.completed_ns>current.now_ns
         {return Err(Error::Denied);}
@@ -141,20 +140,24 @@ pub fn verified_terminal_mask(
         return Err(Error::Invalid);
     }
     let mut seen=0u16;
+    // Validate the ENTIRE independent report set before asking the native
+    // proof verifier to acknowledge even one terminal item.
     for frame in report_frames {
         let report=ApplyReportV1::decode(frame)?;
         let i=usize::from(report.action_index);
         let bit=1u16.checked_shl(i as u32).ok_or(Error::Invalid)?;
         if seen&bit!=0 {return Err(Error::Denied);}
         report.matches_frozen(plan,executor)?;
-        // Even if an UNKNOWN report carries a completed timestamp, it is
-        // explicitly nonterminal and may NOT refund credits or DMA pins.
+        // Even if UNKNOWN carries a completed timestamp, it is nonterminal.
         if report.state==ActionStatus::Unknown{return Err(Error::NotReady);}
-        verify_native(i,&report)?;
         seen|=bit;
     }
     let required=if count==16{u16::MAX}else{(1u16<<count)-1};
     if seen!=required{return Err(Error::Denied);}
+    for frame in report_frames {
+        let report=ApplyReportV1::decode(frame)?;
+        verify_native(usize::from(report.action_index),&report)?;
+    }
     Ok(seen)
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
