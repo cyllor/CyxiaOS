@@ -5,7 +5,7 @@
 //! controls are present. TCP queued bytes, remote ACKs and NIC DMA completion
 //! are separate; this bridge never uses a socket send as a completion proof.
 #![forbid(unsafe_code)]
-use crate::{admission::{ActiveTicket, Admission, Error as AdmissionError}, tls::{Error as TlsError, Session}};
+use crate::{admission::{ActiveTicket, Admission, Error as AdmissionError}, tls::Session};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketError { Again, Closed, Device }
 /// Implement only on a trusted native local TCP owner. The peer cannot
