@@ -5,6 +5,67 @@
 //! control service does not manufacture observations, models, plans or audit
 //! ACKs. Production work must arrive through a verified input/service path.
 use core::arch::asm;
+#[cfg(any(control_role="6",control_role="7"))]
+#[path="../../crates/control-model/src/native_v0199.rs"]
+mod brain;
+#[cfg(any(control_role="6",control_role="7"))]
+#[path="../../crates/prototype/src/learning/seed.rs"]
+mod probe_seed;
+
+// Only this explicitly diagnostic package build contains test seed bytes.
+// They are never admitted as a verified/trained Active model.
+#[cfg(control_role="6")]
+static PROBE_PARAMETERS:[u8;2772]=probe_seed::UNTRAINED_SEED0_BYTES;
+#[cfg(control_role="7")]
+static PROBE_PARAMETERS:[u8;2772]=probe_seed::untrained_seed_bytes(1);
+#[cfg(any(control_role="6",control_role="7"))]
+#[used]
+#[unsafe(link_section=".role_probe")]
+static mut PROBE_RESULT:[u64;4]=[0;4];
+
+#[cfg(any(control_role="6",control_role="7"))]
+fn model_probe(generation:u64){
+    // Internal operator/codec test vector, NOT a live snapshot or durable
+    // boot identity. Never submit it through Advice/Finding/Plan endpoints.
+    let snapshot=brain::SnapshotReplyV3{
+        snapshot_seq:2,boot_epoch:3,ledger_generation:4,core_generation:5,
+        target_id:6,target_generation:7,sampled_ns:100,domain:if ROLE==6{1}else{12},
+        fields:[Some(500),Some(1000),Some(32),Some(250),Some(750),None,Some(50000),None,
+            Some(32),Some(64),Some(1),Some(1)],
+    };
+    let wire=snapshot.encode().unwrap();
+    let snapshot=brain::SnapshotReplyV3::decode(core::hint::black_box(&wire)).unwrap();
+    let parameters=core::hint::black_box(&PROBE_PARAMETERS);
+    #[cfg(control_role="6")]
+    let (scores,selection)={
+        let a=brain::Candidate{a1:1,a2:None,cpu:[None;4]};
+        let out=brain::score_operations(&snapshot,&[a,brain::Candidate{a1:8,..a}],parameters).unwrap();
+        (u64::from(out.scores[0] as u16)|(u64::from(out.scores[1] as u16)<<16),
+            u64::from(out.recommended_index))
+    };
+    #[cfg(control_role="7")]
+    let (scores,selection)={
+        let (score,severity)=brain::score_security(&snapshot,1,0xf00,parameters).unwrap();
+        (u64::from(score as u16),u64::from(severity))
+    };
+    // The stopped role's actual RW page is observed by the native checker.
+    // No extra SVC or production ABI field is introduced by this probe.
+    let row=[0x4359_4d4c_5052_4f42,generation,scores,selection];
+    let p=core::ptr::addr_of_mut!(PROBE_RESULT).cast::<u64>();
+    for (i,v) in row.into_iter().enumerate(){unsafe{p.add(i).write_volatile(v)}}
+}
+#[cfg(any(control_role="6",control_role="7"))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn memcpy(dst:*mut u8,src:*const u8,n:usize)->*mut u8{
+    for i in 0..n{unsafe{dst.add(i).write_volatile(src.add(i).read_volatile())}}
+    dst
+}
+#[cfg(any(control_role="6",control_role="7"))]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn memset(dst:*mut u8,v:i32,n:usize)->*mut u8{
+    for i in 0..n{unsafe{dst.add(i).write_volatile(v as u8)}}
+    dst
+}
 #[cfg(control_role="6")] const ROLE:u16=6;
 #[cfg(control_role="7")] const ROLE:u16=7;
 #[cfg(control_role="2")] const ROLE:u16=2;
@@ -83,6 +144,8 @@ fn role_step(cap:u64,_target:u64,generation:u64,now:u64){
 #[unsafe(no_mangle)]
 #[unsafe(link_section=".text.entry")]
 extern "C" fn _start(cap:u64,target:u64,generation:u64)->!{
+    #[cfg(any(control_role="6",control_role="7"))]
+    model_probe(generation);
     loop{
         let now=clock();
         if now>=0 {role_step(cap,target,generation,now as u64);}
