@@ -121,10 +121,7 @@ fn scan_receipts_inner(
             let stream_at = group_at * STREAMS_PER_GROUP + record.stream_slot as usize;
             let group = &index.groups[group_at];
             let stream = &index.streams[stream_at];
-            let expected_id = ((u64::from(record.group_id) + 1) << 56)
-                | (record.stream_slot << 53) | record.request_seq;
-            if record.request_id != expected_id
-                || group.flags == 0 || stream.flags == 0
+            if group.flags == 0 || stream.flags == 0
                 || record.owner_principal_id != group.manifest_principal_id
                 || record.group_generation > group.generation
                 || record.issued_boot_epoch > group.boot_epoch
@@ -145,7 +142,7 @@ fn scan_receipts_inner(
             // terminal predecessor and cannot coexist with a second inflight
             // request in the same stream.
             if matches!(record.status, 1 | 2 | 5) {
-                if inflight[stream_at] { return Err(Error::Invalid); }
+                if inflight[stream_at] || record.request_seq != stream.issued_hi { return Err(Error::Invalid); }
                 inflight[stream_at] = true;
             }
         }
@@ -172,7 +169,7 @@ fn scan_receipts_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::file_media_v0199::crc32c_zeroed;
+    use super::super::file_media_v0199::{crc32c_zeroed,local_request_id};
 
     fn receipt(id:u64,seq:u64)->[u8;RECEIPT_BYTES]{
         let mut b=[0u8;RECEIPT_BYTES];
@@ -217,7 +214,7 @@ mod tests {
         assert_eq!(scan_receipts(&data,[1;16]).unwrap().occupied,0);
         for (index,seq) in [(21usize,1u64),(42,2),(85,3),(106,4)] {
             let at=index*RECEIPT_BYTES;
-            data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(seq,seq));
+            data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,seq).unwrap(),seq));
         }
         let result=scan_receipts(&data,[1;16]).unwrap();
         assert_eq!(result.occupied,4);
@@ -232,13 +229,13 @@ mod tests {
     #[test]
     fn conflicting_receipt_keys_and_short_staging_are_rejected(){
         let mut data=[0u8;RECEIPT_STORE_BYTES];
-        data[..RECEIPT_BYTES].copy_from_slice(&receipt(7,1));
+        data[..RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),1));
         let at=RECEIPT_BYTES;
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(7,2));
-        assert!(scan_receipts(&data,[1;16]).is_err()); // duplicate local ID
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(8,1));
-        assert!(scan_receipts(&data,[1;16]).is_err()); // duplicate full stream key
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(8,2));
+        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),2));
+        assert!(scan_receipts(&data,[1;16]).is_err()); // inconsistent local ID
+        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),1));
+        assert!(scan_receipts(&data,[1;16]).is_err()); // duplicate canonical full stream key
+        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,2).unwrap(),2));
         assert!(scan_receipts(&data,[1;16]).is_ok());
         assert!(scan_receipts(&data[..RECEIPT_STORE_BYTES-1],[1;16]).is_err());
     }
@@ -299,6 +296,12 @@ mod tests {
         data[108]=1;
         reseal(&mut data[..RECEIPT_BYTES]);
         assert_eq!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).unwrap().occupied,2);
+        data[96..98].copy_from_slice(&5u16.to_le_bytes());
+        reseal(&mut data[..RECEIPT_BYTES]);
+        data[at+96..at+98].copy_from_slice(&3u16.to_le_bytes());
+        data[at+108]=1;
+        reseal(&mut data[at..at+RECEIPT_BYTES]);
+        assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
     }
 
 }
