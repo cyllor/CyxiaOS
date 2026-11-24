@@ -135,6 +135,86 @@ impl SecurityFinding {
     }
 }
 
+/// Canonical FindingDisposition v2, generated only by the protected
+/// consumer. A REVIEWED disposition is an observation of an independent
+/// rule result, not an execution receipt or an authorization token.
+pub const FINDING_DISPOSITION_BYTES: usize = 128;
+pub const FINDING_DISPOSITION_MAGIC: u32 = 0x4359_4650;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FindingDisposition {
+    pub boot_epoch: u64,
+    pub security_epoch: u64,
+    pub finding_seq: u64,
+    pub snapshot_seq: u64,
+    pub processed_ns: u64,
+    pub state: u16,
+    pub reason_code: u16,
+    pub model_hash: [u8;32],
+    pub finding_digest: [u8;32],
+}
+impl FindingDisposition {
+    fn valid(&self)->bool {
+        self.boot_epoch!=0 && self.security_epoch!=0 && self.finding_seq!=0
+            && self.snapshot_seq!=0 && self.model_hash!=[0;32]
+            && self.finding_digest!=[0;32]
+            && matches!((self.state,self.reason_code),
+                (1,0)|(2,1|2)|(3,3)|(4,4..=6)|(5,7|8))
+    }
+    pub fn decode(b:&[u8])->Result<Self,Error>{
+        if b.len()!=FINDING_DISPOSITION_BYTES || u32_at(b,0)?!=FINDING_DISPOSITION_MAGIC
+            || u16_at(b,4)?!=2 || u16_at(b,6)?!=128
+            || u32_at(b,52)?!=0 || b[120..].iter().any(|v|*v!=0)
+        {return Err(Error::Invalid);}
+        let d=Self{boot_epoch:u64_at(b,8)?,security_epoch:u64_at(b,16)?,
+            finding_seq:u64_at(b,24)?,snapshot_seq:u64_at(b,32)?,processed_ns:u64_at(b,40)?,
+            state:u16_at(b,48)?,reason_code:u16_at(b,50)?,
+            model_hash:hash_at(b,56)?,finding_digest:hash_at(b,88)?};
+        if !d.valid(){return Err(Error::Invalid);}
+        Ok(d)
+    }
+    pub fn encode(self)->Result<[u8;FINDING_DISPOSITION_BYTES],Error>{
+        if !self.valid(){return Err(Error::Invalid);}
+        let mut b=[0;FINDING_DISPOSITION_BYTES];
+        b[..4].copy_from_slice(&FINDING_DISPOSITION_MAGIC.to_le_bytes());
+        b[4..6].copy_from_slice(&2u16.to_le_bytes());
+        b[6..8].copy_from_slice(&128u16.to_le_bytes());
+        for (at,v) in [(8,self.boot_epoch),(16,self.security_epoch),(24,self.finding_seq),
+            (32,self.snapshot_seq),(40,self.processed_ns)] {
+            b[at..at+8].copy_from_slice(&v.to_le_bytes());
+        }
+        b[48..50].copy_from_slice(&self.state.to_le_bytes());
+        b[50..52].copy_from_slice(&self.reason_code.to_le_bytes());
+        b[56..88].copy_from_slice(&self.model_hash);
+        b[88..120].copy_from_slice(&self.finding_digest);
+        Ok(b)
+    }
+}
+fn finding_sha256(b:&[u8])->[u8;32]{
+    use sha2::{Digest,Sha256};
+    Sha256::digest(b).into()
+}
+
+/// Trusted EL1 adapter supplies the independent consumer outcome, never a
+/// role7 message. The Reviewed variants require a separately authenticated
+/// controller observation; this ledger does not create that proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FindingResolution {
+    Recorded, IgnoredPolicy, IgnoredBackpressure, Expired, InvalidTarget,
+    IndependentRuleRejected, IndependentRuleEntered,
+}
+impl FindingResolution {
+    fn pair(self)->(u16,u16){
+        match self{
+            Self::Recorded=>(1,0),Self::IgnoredPolicy=>(2,1),
+            Self::IgnoredBackpressure=>(2,2),Self::Expired=>(3,3),
+            Self::InvalidTarget=>(4,6),Self::IndependentRuleRejected=>(5,7),
+            Self::IndependentRuleEntered=>(5,8)
+        }
+    }
+}
+#[derive(Clone,Copy)]
+struct DispositionStamp { processed_ns:u64, resolution:FindingResolution }
+
 /// Protected role7/role11 evaluation and review custody. The native EL1
 /// adapter supplies these scopes from an authorized 0x40 snapshot, binds
 /// both actor identities and the offline mode, and separately accounts CPU.
@@ -169,6 +249,10 @@ struct FindingRow {
     expires_ns: u64,
     finding: Option<SecurityFinding>,
     consumed: bool,
+    review_eligible: bool,
+    finding_digest: [u8;32],
+    terminal: Option<DispositionStamp>,
+    audit_acked: bool,
 }
 const _: () = assert!(core::mem::size_of::<Option<FindingRow>>() <= 512);
 
@@ -230,7 +314,8 @@ impl FindingCustody {
         if self.evaluations>=EVALUATIONS_PER_WINDOW{return Err(Error::Exhausted);}
         let at=self.rows.iter().position(Option::is_none).ok_or(Error::Exhausted)?;
         let expires_ns=observation.scope.sampled_ns.checked_add(MAX_FINDING_AGE_NS).ok_or(Error::Invalid)?;
-        self.rows[at]=Some(FindingRow{observation,mode,expires_ns,finding:None,consumed:false});
+        self.rows[at]=Some(FindingRow{observation,mode,expires_ns,finding:None,consumed:false,
+            review_eligible:false,finding_digest:[0;32],terminal:None,audit_acked:false});
         self.evaluations+=1;
         Ok(())
     }
@@ -246,7 +331,7 @@ impl FindingCustody {
                 && s.domain_id==domain
         })).ok_or(Error::Stale)?;
         let row=self.rows[at].as_mut().ok_or(Error::Stale)?;
-        if row.consumed{return Err(Error::Stale);}
+        if row.consumed || row.terminal.is_some(){return Err(Error::Stale);}
         let mut scope=row.observation.scope;
         scope.now_ns=now;
         if !finding.matches_scope(scope) || finding.evidence_count!=row.observation.evidence_count
@@ -257,6 +342,7 @@ impl FindingCustody {
         }
         if finding.finding_seq<=self.high_water{return Err(Error::Stale);}
         row.finding=Some(finding);
+        row.finding_digest=finding_sha256(wire);
         self.high_water=finding.finding_seq;
         Ok(())
     }
@@ -280,21 +366,82 @@ impl FindingCustody {
             return Err(Error::Denied);
         }
         row.consumed=true;
+        row.review_eligible=row.mode==FindingMode::Assisted && mode==FindingMode::Assisted
+            && offline_review_allowed && f.hint==1;
         // Retain the context tombstone until expiry so a reread of the same
         // snapshot cannot reserve another evaluation and reissue its finding.
         Ok(ReviewTarget{finding_seq,domain_id:current.scope.domain_id,target:f.target,
-            evidence_digest:f.evidence_digest,
-            request_review:row.mode==FindingMode::Assisted && mode==FindingMode::Assisted
-                && offline_review_allowed && f.hint==1})
+            evidence_digest:f.evidence_digest,request_review:row.review_eligible})
+    }
+    fn disposition(row:&FindingRow)->Result<FindingDisposition,Error>{
+        let f=row.finding.ok_or(Error::NotReady)?;
+        let stamp=row.terminal.ok_or(Error::NotReady)?;
+        let (state,reason_code)=stamp.resolution.pair();
+        Ok(FindingDisposition{boot_epoch:f.boot_epoch,security_epoch:f.security_epoch,
+            finding_seq:f.finding_seq,snapshot_seq:f.snapshot_seq,processed_ns:stamp.processed_ns,
+            state,reason_code,model_hash:f.model_hash,finding_digest:row.finding_digest})
+    }
+
+    /// Freeze exactly one disposition for an authenticated admitted finding.
+    /// The protected consumer must independently establish InvalidTarget or
+    /// either rule outcome. No score/hint can establish those facts.
+    pub fn finalize(&mut self,actor:Identity,finding_seq:u64,resolution:FindingResolution,now:u64)
+        ->Result<FindingDisposition,Error>
+    {
+        if actor!=self.supervisor{return Err(Error::Denied);}
+        self.time(now)?;
+        let row=self.rows.iter_mut().flatten().find(|r|r.finding.is_some_and(|f|f.finding_seq==finding_seq))
+            .ok_or(Error::Stale)?;
+        if let Some(old)=row.terminal {
+            return if old.resolution==resolution {Self::disposition(row)}else{Err(Error::Denied)};
+        }
+        let f=row.finding.ok_or(Error::NotReady)?;
+        use FindingResolution::*;
+        let valid=match resolution {
+            Expired=>now>=f.expires_ns,
+            InvalidTarget=>true, // trusted consumer's current target check
+            Recorded|IgnoredPolicy=>row.consumed && !row.review_eligible && now<f.expires_ns,
+            IgnoredBackpressure=>row.consumed && now<f.expires_ns,
+            IndependentRuleRejected|IndependentRuleEntered=>
+                row.consumed && row.review_eligible && now<f.expires_ns,
+        };
+        if !valid{return Err(Error::Denied);}
+        row.terminal=Some(DispositionStamp{processed_ns:now,resolution});
+        Self::disposition(row)
+    }
+    pub fn query_disposition(&self,actor:Identity,finding_seq:u64)->Result<FindingDisposition,Error>{
+        if actor!=self.supervisor{return Err(Error::Denied);}
+        let row=self.rows.iter().flatten().find(|r|r.finding.is_some_and(|f|f.finding_seq==finding_seq))
+            .ok_or(Error::Stale)?;
+        Self::disposition(row)
+    }
+    /// The EL1 audit owner must record the exact disposition before ACK.
+    /// ACK never grants review permission; the context remains a tombstone
+    /// until its evaluation lifetime expires.
+    pub fn acknowledge_disposition(&mut self,actor:Identity,finding_seq:u64,digest:[u8;32],now:u64)
+        ->Result<(),Error>
+    {
+        if actor!=self.supervisor{return Err(Error::Denied);}
+        self.time(now)?;
+        let row=self.rows.iter_mut().flatten().find(|r|r.finding.is_some_and(|f|f.finding_seq==finding_seq))
+            .ok_or(Error::Stale)?;
+        if finding_sha256(&Self::disposition(row)?.encode()?)!=digest{return Err(Error::Denied);}
+        row.audit_acked=true;
+        Ok(())
     }
     pub fn reap_expired(&mut self,actor:Identity,now:u64)->Result<usize,Error>{
         if actor!=self.supervisor{return Err(Error::Denied);}
         self.time(now)?;
         let mut count=0;
-        for row in &mut self.rows{
-            if row.is_some_and(|r|now>=r.expires_ns){
-                *row=None;count+=1;
+        for slot in &mut self.rows{
+            let Some(row)=slot.as_mut() else {continue;};
+            if let Some(f)=row.finding {
+                if row.terminal.is_none() && now>=f.expires_ns {
+                    row.terminal=Some(DispositionStamp{processed_ns:now,resolution:FindingResolution::Expired});
+                }
+                if !row.audit_acked {continue;}
             }
+            if now>=row.expires_ns {*slot=None;count+=1;}
         }
         Ok(count)
     }
@@ -390,6 +537,8 @@ mod tests {
         assert_eq!(q.consume(ROLE11,3,current,FindingMode::Assisted,true),Err(Error::Stale));
         assert_eq!(q.reserve(ROLE7,current,FindingMode::Assisted),Err(Error::Busy));
         assert_eq!(q.submit(ROLE7,&wire(),151),Err(Error::Stale));
+        let disp=q.finalize(ROLE11,3,FindingResolution::IndependentRuleRejected,152).unwrap();
+        q.acknowledge_disposition(ROLE11,3,finding_sha256(&disp.encode().unwrap()),153).unwrap();
         assert_eq!(q.reap_expired(ROLE11,100+MAX_FINDING_AGE_NS),Ok(1));
         assert_eq!(q.occupied(),0);
     }
@@ -429,6 +578,45 @@ mod tests {
         assert_eq!(q.reap_expired(ROLE7,o.scope.now_ns),Err(Error::Denied));
         assert_eq!(q.reap_expired(ROLE11,o.scope.now_ns),Ok(16));
         q.reserve(ROLE7,o,FindingMode::Shadow).unwrap();
+    }
+
+    #[test]
+    fn disposition_is_canonical_idempotent_and_retained_until_audit_ack(){
+        let mut q=FindingCustody::new(ROLE7,ROLE11,1,2).unwrap();
+        let o=registered();
+        q.reserve(ROLE7,o,FindingMode::Shadow).unwrap();
+        q.submit(ROLE7,&wire(),150).unwrap();
+        assert!(!q.consume(ROLE11,3,o,FindingMode::Assisted,true).unwrap().request_review);
+        assert_eq!(q.finalize(ROLE11,3,FindingResolution::IndependentRuleEntered,151),Err(Error::Denied));
+        assert_eq!(q.finalize(ROLE7,3,FindingResolution::Recorded,151),Err(Error::Denied));
+        let d=q.finalize(ROLE11,3,FindingResolution::Recorded,151).unwrap();
+        assert_eq!(d.finding_digest,finding_sha256(&wire()));
+        let bytes=d.encode().unwrap();
+        assert_eq!(FindingDisposition::decode(&bytes),Ok(d));
+        for (at,val) in [(4,1),(6,0),(48,5),(50,7),(52,1),(120,1)]{
+            let mut bad=bytes;bad[at]=val;
+            assert!(FindingDisposition::decode(&bad).is_err());
+        }
+        assert_eq!(q.finalize(ROLE11,3,FindingResolution::Recorded,152),Ok(d));
+        assert_eq!(q.finalize(ROLE11,3,FindingResolution::IgnoredPolicy,152),Err(Error::Denied));
+        assert_eq!(q.reap_expired(ROLE11,100+MAX_FINDING_AGE_NS),Ok(0));
+        assert_eq!(q.occupied(),1);
+        assert_eq!(q.acknowledge_disposition(ROLE11,3,[0;32],100+MAX_FINDING_AGE_NS),Err(Error::Denied));
+        q.acknowledge_disposition(ROLE11,3,finding_sha256(&bytes),100+MAX_FINDING_AGE_NS).unwrap();
+        assert_eq!(q.reap_expired(ROLE11,100+MAX_FINDING_AGE_NS),Ok(1));
+        assert_eq!(q.query_disposition(ROLE11,3),Err(Error::Stale));
+    }
+    #[test]
+    fn expired_admitted_finding_is_not_silently_erased(){
+        let mut q=FindingCustody::new(ROLE7,ROLE11,1,2).unwrap();
+        q.reserve(ROLE7,registered(),FindingMode::Assisted).unwrap();
+        q.submit(ROLE7,&wire(),150).unwrap();
+        assert_eq!(q.reap_expired(ROLE11,190),Ok(0));
+        let d=q.query_disposition(ROLE11,3).unwrap();
+        assert_eq!((d.state,d.reason_code,d.processed_ns),(3,3,190));
+        assert_eq!(q.reap_expired(ROLE11,100+MAX_FINDING_AGE_NS),Ok(0));
+        assert_eq!(q.finalize(ROLE11,3,FindingResolution::IndependentRuleEntered,100+MAX_FINDING_AGE_NS),Err(Error::Denied));
+        assert_eq!(q.occupied(),1);
     }
 
 }
