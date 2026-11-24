@@ -260,6 +260,25 @@ impl Queue {
             poisoned: false,
         })
     }
+    /// No device completion can exist when the single-chain queue is idle.
+    /// A stale used element must not be accepted as the next submission.
+    /// The physical DMA pool stays quarantined if a device violates this.
+    fn validate_idle_used(
+        &mut self,
+        transport: &mut Transport,
+        platform: &impl Platform,
+    ) -> Result<(), Error> {
+        unsafe { platform.sync(self.memory.used.address(), 4) };
+        platform.barrier();
+        if self.memory.used.get16(2) != self.used {
+            self.poisoned = true;
+            transport.fail();
+            platform.barrier();
+            return Err(Error::Queue);
+        }
+        Ok(())
+    }
+
     pub fn submit(
         &mut self,
         transport: &mut Transport,
@@ -277,6 +296,7 @@ impl Queue {
             return Err(Error::Address);
         }
         transport.check()?;
+        self.validate_idle_used(transport, platform)?;
         let m = &self.memory;
         let response_pa = platform.physical(m.response.address(), 4096)?;
         let request_pa = platform.physical(m.request.address(), 4096)?;
@@ -325,6 +345,7 @@ impl Queue {
             return Err(Error::Device);
         }
         if !self.pending {
+            self.validate_idle_used(transport, platform)?;
             return Ok(None);
         }
         if output.len() < self.writable as usize {
@@ -358,9 +379,7 @@ impl Queue {
             platform.sync(m.response.address(), 4096);
         }
         platform.barrier();
-        for (i, byte) in output[..length as usize].iter_mut().enumerate() {
-            *byte = unsafe { read_volatile((m.response.address() + i) as *const u8) };
-        }
+        m.response.copy_prefix_to(output, length as usize);
         transport.acknowledge_interrupt();
         self.used = index;
         self.pending = false;
@@ -592,6 +611,51 @@ mod tests {
         assert_eq!(&output[..4], &0x12345678u32.to_le_bytes());
         assert_eq!(q.poll(&mut t, &mut output, &Host), Ok(None));
     }
+    #[test]
+    fn single_chain_unsolicited_or_duplicate_completion_cannot_authorize_reuse() {
+        for prior_completion in [false, true] {
+            let (mut t, mut q) = fixture();
+            if prior_completion {
+                q.submit(&mut t, b"first", 8, &Host).unwrap();
+                q.memory.used.put32(4, 0);
+                q.memory.used.put32(8, 8);
+                q.memory.used.put16(2, 1);
+                assert_eq!(q.poll(&mut t, &mut [0;8], &Host),Ok(Some(8)));
+            }
+            let index=q.used;
+            let before=q.available;
+            let at=4+usize::from(index % q.size)*8;
+            q.memory.used.put32(at,0);
+            q.memory.used.put32(at+4,8);
+            q.memory.used.put16(2,index.wrapping_add(1));
+            assert_eq!(q.submit(&mut t,b"next",8,&Host),Err(Error::Queue));
+            assert_eq!(q.available,before);
+            assert_eq!(q.memory.avail.get16(2),before);
+            assert!(!q.pending);
+            assert_eq!(q.poll(&mut t,&mut [0;8],&Host),Err(Error::Device));
+        }
+    }
+    #[test]
+    fn idle_poll_quarantines_unsolicited_used_index() {
+        let (mut t,mut q)=fixture();
+        q.memory.used.put16(2,1);
+        assert_eq!(q.poll(&mut t,&mut [0;8],&Host),Err(Error::Queue));
+        assert_eq!(q.submit(&mut t,b"x",8,&Host),Err(Error::Device));
+    }
+    #[test]
+    fn single_chain_wide_copy_preserves_odd_length_and_output_tail() {
+        let (mut t,mut q)=fixture();
+        q.submit(&mut t,b"x",32,&Host).unwrap();
+        for i in 0..19 { q.memory.response.put8(i,(i as u8).wrapping_mul(13)); }
+        q.memory.used.put32(4,0);
+        q.memory.used.put32(8,19);
+        q.memory.used.put16(2,1);
+        let mut out=[0xcc;32];
+        assert_eq!(q.poll(&mut t,&mut out,&Host),Ok(Some(19)));
+        for (i,b) in out[..19].iter().enumerate() {assert_eq!(*b,(i as u8).wrapping_mul(13));}
+        assert!(out[19..].iter().all(|b|*b==0xcc));
+    }
+
     #[test]
     fn completion_metadata_is_resynchronized_after_index_acquire() {
         use core::cell::Cell;
@@ -833,6 +897,7 @@ mod failure_tests {
         let (mut t, mut q, c) = fixture();
         q.available = u16::MAX;
         q.used = u16::MAX;
+        q.memory.used.put16(2, u16::MAX); // device and driver agree before publication
         q.submit(&mut t, b"x", 8, &c).unwrap();
         q.memory.used.put32(4 + 7 * 8, 0);
         q.memory.used.put32(8 + 7 * 8, 8);
