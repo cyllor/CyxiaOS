@@ -12,6 +12,7 @@ use super::{
     decision_record_v3::{DecisionRecordV3, DecisionSource, DECISION_BYTES},
     plan_wire_v2::{PlanV2, MAX_ACTIONS},
     rule_profile_v2::Profile,
+    apply_report_v1::{self,ApplyReportV1,TrustedExecutor},
 };
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -395,6 +396,60 @@ impl RegisteredDecisionGate {
             .find(|item|item.plan_seq==plan_seq))
     }
 
+    /// Terminal integration from exact copied 0x43 ApplyReport v1 bytes.
+    ///
+    /// This method still requires a TRUE native EL1 evidence verifier:
+    /// signed/authenticated executor identity, device/redo completion,
+    /// accepted apply_id and pin/resource accounting. The report body itself
+    /// is only a claim and must not authorize APPLIED or reference release.
+    pub fn settle_verified_apply_reports(
+        &mut self,
+        supervisor:Identity,
+        plan_wire:&[u8],
+        report_frames:&[&[u8]],
+        executor:TrustedExecutor,
+        mut verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
+    )->Result<TerminalSummary,Error>{
+        // Validate the terminal owner before invoking any verifier callback.
+        if !supervisor.valid() || self.terminal_owner!=Some(supervisor){
+            return Err(Error::Denied);
+        }
+        let plan=PlanV2::decode(plan_wire)?;
+        let pending=self.pending.as_ref().ok_or(Error::Stale)?;
+        if pending.status==PendingStatus::Frozen {
+            return Err(Error::NotReady);
+        }
+        if plan.header.plan_seq!=pending.plan_seq
+            || sha256(plan_wire)!=pending.plan_digest
+            || plan.header.controller_epoch!=self.controller_epoch
+            || executor.boot_epoch!=self.boot_epoch
+        {return Err(Error::Denied);}
+        let terminal_mask=apply_report_v1::verified_terminal_mask(
+            &plan,report_frames,executor,|index,report|{
+                verify_native(index,report)
+            }
+        )?;
+        // Full copied-byte digest is a searchable audit link, not proof by
+        // itself; only the preceding independent native callback is proof.
+        let mut h=Sha256::new();
+        for frame in report_frames {
+            h.update((frame.len() as u32).to_le_bytes());
+            h.update(frame);
+        }
+        let evidence_digest:[u8;32]=h.finalize().into();
+        let proof=TrustedTerminal {
+            boot_epoch:self.boot_epoch,
+            controller_epoch:self.controller_epoch,
+            plan_seq:pending.plan_seq,
+            plan_digest:pending.plan_digest,
+            action_count:plan.header.action_count,
+            terminal_mask,
+            unknown_mask:0,
+            evidence_digest,
+        };
+        self.settle_with_native_proof(supervisor,proof,|_|Ok(()))
+    }
+
     /// Expired *unpublished* registration may be discarded by the controller;
     /// all high-water keys remain burned. In-flight/unknown work is never
     /// freed without an independent native terminal/recovery proof.
@@ -707,6 +762,84 @@ mod tests {
             SUPERVISOR,terminal_proof(&plan), |_|Ok(())
         ).unwrap().action_count,1);
         assert_eq!(invocations,1);
+    }
+
+    fn executor_report(state:u16)->[u8;98]{
+        let mut b=[0u8;98];
+        for (at,value) in [
+            (0,1u64),(8,2),(16,1),(32,17),(40,1),
+            (48,9),(56,7),(72,180),
+        ]{b[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        b[26..28].copy_from_slice(&1u16.to_le_bytes());
+        b[28..30].copy_from_slice(&state.to_le_bytes());
+        b[68..72].copy_from_slice(&2u32.to_le_bytes());
+        b[96..98].copy_from_slice(&[2u8,0]);
+        b
+    }
+    fn verified_executor()->TrustedExecutor{
+        TrustedExecutor{
+            actor:Identity{id:12,generation:9},
+            authorized_executor:Identity{id:12,generation:9},
+            executor_generation:9,boot_epoch:1,plan_version:7,now_ns:200,
+        }
+    }
+    #[test]
+    fn native_apply_reports_require_supervisor_and_real_completion_proof(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        let report=executor_report(1);
+        let mut verifications=0;
+        assert_eq!(gate.settle_verified_apply_reports(
+            PUBLISHER,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Ok(())}
+        ),Err(Error::Denied));
+        assert_eq!(verifications,0);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Err(Error::NotReady)}
+        ),Err(Error::NotReady));
+        assert_eq!(verifications,1);
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{verifications+=1;Ok(())}
+        ).unwrap().action_count,1);
+        assert_eq!(verifications,2);
+        assert!(gate.terminal_summary(SUPERVISOR,1).unwrap().is_some());
+        assert_eq!(gate.register_rule_only(
+            CONTROLLER,&plan,&records,&catalog,&frozen,ctx
+        ),Err(Error::Stale));
+    }
+    #[test]
+    fn unknown_apply_report_remains_owned_even_with_time_and_matching_bytes(){
+        let bytes=profile_bytes();
+        let catalog=Profile::parse(&bytes).unwrap();
+        let plan=plan_bytes();
+        let records=[decision(&plan,&bytes)];
+        let ctx=trusted(&bytes);
+        let frozen=frozen(&[2,4],&[2,0]);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,PUBLISHER,SUPERVISOR,1,2
+        ).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&frozen,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&frozen,ctx,||Ok(())).unwrap();
+        let report=executor_report(3);
+        let mut checked=0;
+        assert_eq!(gate.settle_verified_apply_reports(
+            SUPERVISOR,&plan,&[&report],verified_executor(),
+            |_,_|{checked+=1;Ok(())}
+        ),Err(Error::NotReady));
+        assert_eq!(checked,0);
+        assert_eq!(gate.expire_unpublished(CONTROLLER,u64::MAX),Err(Error::NotReady));
+        assert_eq!(gate.terminal_summary(SUPERVISOR,1),Ok(None));
     }
 
     #[test]
