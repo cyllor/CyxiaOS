@@ -22,8 +22,8 @@ pub use init::{GovernanceInit, InitComplete, InitPiece, InitValue};
 static NEXT_LEDGER: AtomicU64 = AtomicU64::new(1);
 
 pub const WINDOW_NS: u64 = 100_000_000;
-pub const EXTRA_NS: u64 = 9_000_000;
-pub const MANDATORY_NS: u64 = 61_000_000;
+pub const EXTRA_NS: u64 = 8_500_000;
+pub const MANDATORY_NS: u64 = 61_500_000;
 pub const CONTROL_NS: u64 = 70_000_000;
 pub const MAX_SUBMISSIONS: usize = 300;
 /// Final receipts/last-window verification after observation stops. This is
