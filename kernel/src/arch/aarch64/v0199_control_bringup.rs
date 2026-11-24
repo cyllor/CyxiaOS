@@ -24,6 +24,12 @@ const STACK_END:u64=STACK_BASE+ROLE_STACK_BYTES as u64;
 const ROLE_QUOTAS:[u64;8]=[30_000_000,8_000_000,4_000_000,3_500_000,
     4_000_000,3_000_000,4_500_000,3_000_000];
 const OTHER_CPU_NS:u64=10_000_000; // 8ms recovery + 2ms kernel coordination
+// Diagnostic timer margin, not a certified WCET. The prior 25us margin
+// failed with 271476ns charged against a 250000ns controller reservation.
+// Leave headroom for EL0 exit, SVC dispatch and accounting settlement;
+// never extend the reservation or discard any observed execution time.
+const TURN_EXIT_GUARD_NS:u64=100_000;
+const DECISION_SLICE_NS:u64=100_000;
 const E_AUTH:i64=-1;const E_FORMAT:i64=-2;const E_UNSUPPORTED:i64=-11;
 const EFAULT:i64=-12;const EAGAIN:i64=-13;
 const MAGIC:u64=0x4359_5838_424f_4f54;
@@ -313,14 +319,19 @@ fn turn(index:usize,m:&NativeRoleManifest,r:&mut Running,budget:&mut Cpu0BudgetL
     for _ in 0..32{
         let actual=timer::cpu_elapsed_ns(began);
         let wall=now_ns();
-        if actual>=quota.saturating_sub(25_000)||wall>=token.deadline_ns(){break;}
-        let interval=(quota-actual-25_000).min(token.deadline_ns()-wall);
+        let cpu_left=quota.saturating_sub(actual);
+        let wall_left=token.deadline_ns().saturating_sub(wall);
+        if cpu_left<=TURN_EXIT_GUARD_NS||wall_left<=TURN_EXIT_GUARD_NS{break;}
+        let mut interval=(cpu_left-TURN_EXIT_GUARD_NS).min(wall_left-TURN_EXIT_GUARD_NS);
+        if class==Class::Decision{interval=interval.min(DECISION_SLICE_NS);}
         unsafe{
             timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
             user::enter(&mut r.context,m.members[index].ttbr0_root);
             cpu::disable_timer();
         }
-        if r.context.kind==9{r.preemptions+=1;continue;}
+        // Settle immediately after a timer exit instead of re-entering in
+        // the same prepaid turn; all measured cost is retained by the ledger.
+        if r.context.kind==9{r.preemptions+=1;break;}
         if expect_fault{
             let guard=STACK_BASE-PAGE as u64;
             if r.context.kind!=8||r.context.esr>>26!=0x20
@@ -388,6 +399,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             (running[j].context.pc,running[j].clocks,manifest.members[j].actor.generation));
         // An injected PC in the actual guard page produces a genuine EL0
         // instruction abort. Never continue the faulted saved context.
+        report("V0199_RESTART_BEGIN",old.role.id() as u64,old.actor.generation,old_root);
         running[i].context.pc=STACK_BASE-PAGE as u64;
         running[i].wake_ns=0;
         while running[i].fault_esr==0{
@@ -396,6 +408,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             let _=turn(i,manifest,&mut running[i],budget,true);
         }
         let esr=running[i].fault_esr;let far=running[i].fault_far;
+        report("V0199_RESTART_GUARD_FAULT",old.role.id() as u64,esr,far);
         // These are *volatile* diagnostic generations. No durable epoch
         // exists, so the production publication gate stays closed.
         let mut life=Lifecycle::new(1,old.actor.generation).unwrap();
@@ -426,7 +439,10 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         manifest.validate().unwrap();
         let actual=timer::cpu_elapsed_ns(start);
         let receipt=budget.settle(0,credit,actual,now_ns()).unwrap();
-        if receipt.overrun||receipt.crossed_window{fatal(683);}
+        if receipt.overrun||receipt.crossed_window{
+            report("V0199_BOOTSTRAP_OVERRUN",old.role.id() as u64,receipt.actual_ns,8_000_000);
+            fatal(683);
+        }
         life.reset_complete(1,next).unwrap();
         running[i]=new;
         while running[i].clocks<2||running[i].role_calls<2{
@@ -479,6 +495,7 @@ pub(super) fn run()->!{
         }
         core::hint::spin_loop();
     }
+    report("V0199_BOOTSTRAP_INITIAL_ROLES",ROLE_COUNT as u64,0,0);
     restart_each(&mut manifest,&mut running,&mut budget);
     // All eight independently linked diagnostic clients have executed, faulted,
     // reloaded under a new root and reentered. No real service effect is claimed.
