@@ -405,8 +405,8 @@ fn valid_audit_request(b:&[u8],actor:Identity,now:u64)->bool{
 // Native model arithmetic evidence from an independently linked brain's
 // actual private RW page, captured while its EL0 context is stopped at CLOCK.
 // This fixture never converts the result to an authorized model or suggestion.
-fn capture_model_probe(index:usize,r:&Running,actor:Identity){
-    assert!(index<2&&matches!(actor.generation,1|2));
+fn model_probe_row(index:usize,r:&Running,actor:Identity)->[u64;4]{
+    assert!(index<2&&actor.generation!=0);
     const OFFSET:usize=0xf000;
     let address=backing(index) as u64+OFFSET as u64;
     let t=tables(index,r.bank);
@@ -415,6 +415,11 @@ fn capture_model_probe(index:usize,r:&Running,actor:Identity){
     let row:[u64;4]=core::array::from_fn(|i|unsafe{((address as *const u64).add(i)).read_volatile()});
     assert_eq!(row[0],0x4359_4d4c_5052_4f42);
     assert_eq!(row[1],actor.generation);
+    row
+}
+fn capture_model_probe(index:usize,r:&Running,actor:Identity){
+    assert!(matches!(actor.generation,1|2));
+    let row=model_probe_row(index,r,actor);
     let at=493+index*8+(actor.generation as usize-1)*4;
     assert_eq!(SMP_EVIDENCE.words[at].load(Ordering::Relaxed),0);
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[at+i].store(v,Ordering::Relaxed);}
@@ -682,6 +687,76 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         report("V0199_PACKAGE_RELOAD",old.role.id() as u64,old_root,member.ttbr0_root);
     }
 }
+/// Dedicated durable scratch-disk profile uses the actual role7 ELF and
+/// the same verified relocation/W^X/32KiB stack loader as eight-role boot.
+/// It does not grant an Active model or live snapshot: the diagnostic
+/// snapshot call must remain EAGAIN. Disk I/O is not covered by this probe.
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) struct DiskSecurityRun{
+    pub root:u64,pub stack:u64,pub generation:u64,pub clocks:u64,pub snapshots:u64,
+    pub score:u64,pub severity:u64,pub esr:u64,pub far:u64,pub image_sha256:[u8;32],
+}
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn disk_security_run(generation:u64,bank:usize,stop:bool)->DiskSecurityRun{
+    assert_eq!(cpu::slot(),0);
+    let i=1usize;
+    let (m,mut r)=load(i,generation,bank);
+    assert_eq!(m.role,Role::Security);assert_eq!(m.actor.generation,generation);
+    let enter=|r:&mut Running|{
+        unsafe{
+            timer::arm(timer::ticks().checked_add(ticks_for(1_000_000)).unwrap());
+            user::enter_pinned_until_retired(&mut r.context,m.ttbr0_root,role_asid(i,bank));
+            cpu::disable_timer();
+        }
+    };
+    let mut probe=None;let mut yielded=false;
+    for _ in 0..128{
+        enter(&mut r);
+        if r.context.kind==9{continue;}
+        assert_eq!(r.context.kind,8);
+        let call=decode_aarch64_svc_v3(r.abi,r.context.esr,&r.context.regs).expect("actual role7 ABI3");
+        let result=match call.operation{
+            Syscall::Clock=>{
+                if r.clocks==0{probe=Some(model_probe_row(i,&r,m.actor));}
+                r.clocks+=1;i64::try_from(now_ns()).unwrap()
+            }
+            Syscall::ReadSnapshot=>{
+                let a=call.args;
+                assert!(r.cap.holder==m.actor&&r.cap.kind==CapKind::Snapshot(SnapshotView::RedactedSecurity)
+                    &&a[0]==r.cap.selector&&a[1]==12&&a[2]==0&&a[4]==264);
+                assert!(stack_span(i,bank,a[3],264,true).is_some());
+                r.role_calls+=1;EAGAIN
+            }
+            Syscall::Yield=>{r.yields+=1;yielded=true;0}
+            _=>panic!("unexpected role7 diagnostic syscall"),
+        };
+        r.context.regs[0]=result as u64;
+        if yielded&&r.role_calls>0{break;}
+    }
+    assert!(yielded&&r.clocks>0&&r.role_calls>0);
+    let row=probe.expect("role7 actually executed integer probe");
+    let root=m.ttbr0_root;
+    let stack=phys(unsafe{core::ptr::addr_of!((*backing(i)).stack)} as u64);
+    let mut esr=0;let mut far=0;
+    if stop{
+        r.context.pc=STACK_BASE-PAGE as u64;
+        for _ in 0..128{
+            enter(&mut r);
+            if r.context.kind==9{continue;}
+            assert_eq!(r.context.kind,8);assert_eq!(r.context.esr>>26,0x20);
+            assert_eq!(r.context.esr&0x3f,7);assert_eq!(r.context.far,STACK_BASE-PAGE as u64);
+            esr=r.context.esr;far=r.context.far;break;
+        }
+        assert_ne!(esr,0);
+        // This stopped diagnostic instance has no DMA, accepted work or
+        // issued production caps. Do not publish another old context.
+        r.cap.selector=0;retire_root(i,bank);
+        assert_eq!(unsafe{(*tables(i,bank)).root.0[0]},0);
+    }
+    DiskSecurityRun{root,stack,generation,clocks:r.clocks,snapshots:r.role_calls,
+        score:row[2],severity:row[3],esr,far,image_sha256:CATALOG[i].image_sha256}
+}
+
 pub(super) fn run()->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
