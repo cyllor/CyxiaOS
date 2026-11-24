@@ -40,14 +40,16 @@ def superblock():
     put(b,76,'I',crc(b))
     return bytes(b)
 
-def state(epoch):
+def state(txid):
     b=bytearray(BLOCK)
     put(b,0,'IHH',0x43595353,2,248)
     b[8:24]=UUID
-    put(b,24,'QQQQQQ',epoch+1,1,1,1,0,epoch)
+    put(b,24,'QQQQQQ',txid+1,1,1,1,0,(txid+1)//2)
     put(b,80,'Q',1)
     b[88:120]=bytes([0x5a])*32
-    put(b,120,'16Q',*([1]*16))
+    generations=[1]*16
+    generations[1]=1+txid//2
+    put(b,120,'16Q',*generations)
     put(b,72,'I',crc(b))
     return bytes(b)
 
@@ -78,8 +80,8 @@ def check_disk(path,epoch,out):
     with path.open('rb') as f:
         original=f.read(2*BLOCK)
         require(original==superblock()*2,'superblocks unexpectedly modified')
-        log=f.read(8*BLOCK)
-        expected=b''.join(transaction(i) for i in range(1,epoch+1)).ljust(8*BLOCK,b'\0')
+        log=f.read(16*BLOCK)
+        expected=b''.join(transaction(i) for i in range(1,2*epoch+1)).ljust(16*BLOCK,b'\0')
         require(log==expected,'actual on-disk redo differs from independent reference')
         f.seek(HOME*BLOCK);home=f.read(2*BLOCK)
         require(home==state(0)+MARKER.ljust(BLOCK,b'\0'),'home/fixture marker changed')
@@ -111,14 +113,26 @@ class EpochFixture:
         require(cpu_count==4 and len(page)==4096,'wrong topology/evidence extent')
         w=struct.unpack('<512Q',page)
         e=self.epoch
-        require(w[:11]==(MAGIC,1,1,e-1,e,e,e+1,e,e*3,2+4*(e-1),2),'wrong durable fixture identity')
-        require(w[11]>=12 and w[12:14]==(4,HOME),'missing actual block I/O counts')
-        require(page[14*8:18*8]==hashlib.sha256(state(e)).digest(),'native afterimage digest mismatch')
-        require(all(v==0 for v in w[18:]),'nonzero reserved evidence')
-        expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c=2\n'.encode()
+        txid=2*e
+        require(w[:11]==(MAGIC,2,1,e-1,e,txid-1,txid+1,txid,txid*3,2+4*(txid-1),4),
+                'wrong durable boot/service transition identity')
+        require(w[11]>=32 and w[12:14]==(8,HOME),'missing actual block I/O counts')
+        require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
+        old,new,old_root,new_root,esr,far=w[18:24]
+        require((old,new)==(e,e+1) and old_root and new_root and old_root!=new_root
+                and old_root%4096==new_root%4096==0,'missing native replacement generation/root')
+        require(esr>>26==0x20 and esr&0x3f==7 and far==0x2f000,'not an actual guard instruction abort')
+        stopped=f'V0199_EPOCH_CLIENT_STOPPED a={old} b={old_root} c={esr}\n'.encode()
+        restarted=f'V0199_EPOCH_CLIENT_RELOADED a={new} b={new_root} c={e}\n'.encode()
+        require(serial.count(stopped)==1 and serial.count(restarted)==1
+                and serial.index(stopped)<serial.index(restarted),'native stop/reload evidence mismatch')
+        require(all(v==0 for v in w[24:]),'nonzero reserved evidence')
+        expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c=4\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
-        return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=e+1,txid=e,
-                    commit_lsn=e*3,actual_flush_completions=2,block_reads=w[11],block_writes=w[12])
+        return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
+                    commit_lsn=txid*3,actual_flush_completions=4,block_reads=w[11],block_writes=w[12],
+                    previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
+                    native_diagnostic_restart_verified=True,production_service_restart_verified=False)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -147,6 +161,7 @@ def main():
             verify_smp.require(summary.get('scratch_disk_after_sha256')==previous,'disk changed after capture')
         result['status']='PASS'
         result['cross_process_boot_epoch_fixture_verified']=True
+        result['cross_process_service_generation_fixture_verified']=True
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
