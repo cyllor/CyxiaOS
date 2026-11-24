@@ -1,0 +1,78 @@
+name: V0.20 local-only native dependency closure (G1 component)
+on:
+  push:
+    branches: [work/v020-gap-local-link-closure]
+  pull_request:
+    branches: [fix/v020-v0199-contract-gaps]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  native-graph:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-none-softfloat, x86_64-unknown-none]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install toolchain and target
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target ${{ matrix.target }}
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Resolve native release dependency graph and fail on retired cluster crates
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/local-link-${{ matrix.target }}
+          cargo tree --locked --offline --target ${{ matrix.target }} \
+            -p cyxia-kernel --prefix none --format '{p}' \
+            | tee artifacts/local-link-${{ matrix.target }}/resolved-tree.txt
+          python3 -B tools/verify_v0199_local_link_graph.py \
+            artifacts/local-link-${{ matrix.target }}/resolved-tree.txt \
+            --output artifacts/local-link-${{ matrix.target }}/verdict.json
+          sha256sum artifacts/local-link-${{ matrix.target }}/resolved-tree.txt \
+            > artifacts/local-link-${{ matrix.target }}/tree.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-local-link-${{ matrix.target }}-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/local-link-${{ matrix.target }}/
+
+  local-network:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Verify local transport remains independent of retired cluster features
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/local-network
+          python3 -B -m unittest tools.test_v0199_local_link_graph -v \
+            2>&1 | tee artifacts/local-network/guard-unit.log
+          cargo test --locked --offline -p cyxia-net-transport \
+            2>&1 | tee artifacts/local-network/transport-test.log
+          cargo check --locked --offline -p cyxia-net-transport --features tls \
+            2>&1 | tee artifacts/local-network/tls-build.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-local-network-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/local-network/
