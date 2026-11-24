@@ -81,11 +81,11 @@ fn ticks_for(ns:u64)->u64{
     u64::try_from((u128::from(ns)*u128::from(timer::frequency())).div_ceil(1_000_000_000))
         .expect("timer ticks").max(1)
 }
-/// Continuous attribution from the first post-bootstrap PMU sample through
-/// the final diagnostic sample. Every interval is charged exactly once:
-/// admitted role/recovery work or the protected EL1 coordination envelope.
-/// Initial loading before PMU initialization and the final evidence writer
-/// remain outside this explicitly bounded diagnostic measurement.
+/// Continuous attribution from BEFORE the first role package load through
+/// the final UART output. Every interval is charged exactly once: admitted
+/// role/recovery work or the protected EL1 coordination envelope.
+/// Earlier architecture/SMP initialization and the tiny final evidence seal
+/// remain outside this diagnostic interval; no full production claim.
 struct BudgetMeter {
     ledger:Cpu0BudgetLedger,
     initial_tick:u64,
@@ -143,6 +143,34 @@ impl BudgetMeter {
         let now=now_ns();
         let next=(now/WINDOW_NS).checked_add(1).and_then(|w|w.checked_mul(WINDOW_NS)).unwrap();
         self.idle_until(next);
+    }
+    // Startup has no admitted roles. Initial loader work uses the same
+    // fixed EL1 coordination sub-budget, not the protected recovery quota.
+    // No estimate is substituted for the actual PMU debit.
+    fn load_initial(&mut self,index:usize)->(NativeRole,Running){
+        let until=now_ns().checked_add(5_000_000_000).unwrap();
+        let (token,began)=loop{
+            let (now,began)=self.sample_gap();
+            if now>=until{fatal(689);}
+            let remaining=KERNEL_COORDINATION_LIMIT_NS.saturating_sub(self.ledger.kernel_coordination_spent());
+            if remaining<1_500_000 || now%WINDOW_NS>WINDOW_NS-5_000_000{
+                self.idle_retry();continue;
+            }
+            match self.ledger.reserve_kernel_with_wall(0,Class::Coordination,remaining,50_000_000,now){
+                Ok(t)=>break (t,began),
+                Err(Error::Exhausted|Error::Busy)=>{self.idle_retry();},
+                Err(e)=>panic!("initial role load budget: {e:?}"),
+            }
+        };
+        let pair=load(index,1,0);
+        let receipt=self.settle(token,began);
+        if receipt.overrun||receipt.crossed_window{
+            report("V0199_BOOTSTRAP_OVERRUN",0,receipt.actual_ns,token.reserved_ns());
+            fatal(690);
+        }
+        SMP_EVIDENCE.words[32+index].store(receipt.actual_ns,Ordering::Relaxed);
+        report("V0199_INITIAL_LOAD",u64::from(ROLES[index].id()),receipt.actual_ns,token.reserved_ns());
+        pair
     }
     fn wait_for(&mut self,mut ready:impl FnMut()->bool){
         let until=now_ns().checked_add(5_000_000_000).unwrap();
@@ -617,7 +645,10 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
 }
 pub(super) fn run()->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
-    let pairs:[(NativeRole,Running);ROLE_COUNT]=core::array::from_fn(|i|load(i,1,0));
+    gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
+    unsafe{timer::init_cpu_accounting();}
+    let mut budget=BudgetMeter::new();
+    let pairs:[(NativeRole,Running);ROLE_COUNT]=core::array::from_fn(|i|budget.load_initial(i));
     let members=core::array::from_fn(|i|pairs[i].0);
     let mut running=pairs.map(|(_,r)|r);
     let mut manifest=NativeRoleManifest{
@@ -628,10 +659,7 @@ pub(super) fn run()->!{
         other_control_ns_per_100ms:OTHER_CPU_NS,
     };
     manifest.validate().expect("complete eight role physical inventory");
-    wait(||(1..REQUIRED).all(|slot|PROGRESS[slot*2].load(Ordering::Acquire)>=2));
-    gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
-    unsafe{timer::init_cpu_accounting();}
-    let mut budget=BudgetMeter::new();
+    budget.wait_for(||(1..REQUIRED).all(|slot|PROGRESS[slot*2].load(Ordering::Acquire)>=2));
     let until=now_ns().checked_add(5_000_000_000).unwrap();
     // Controller/publisher/supervisor before optional model/learning work.
     let order=[2usize,3,7,1,0,5,4,6];
@@ -725,6 +753,21 @@ pub(super) fn run()->!{
             SMP_EVIDENCE.words[16+slot*4+i].store(value,Ordering::Relaxed);
         }
     }
+    // Record a prefix, output all UART evidence (including the completion
+    // marker), then take the terminal sample. The checker waits for the
+    // post-output memory seal, not merely the UART marker.
+    let (_,prefix_end)=budget.sample_gap();
+    let prefix=timer::cpu_ns(prefix_end.checked_sub(budget.initial_tick).unwrap());
+    let prefix_accounted=budget.ledger.lifetime_total().unwrap();
+    let prefix_upper=budget.ledger.max_window_upper_ns();
+    assert_eq!(prefix,prefix_accounted);
+    for (i,v) in [prefix,prefix_accounted,prefix_upper].into_iter().enumerate(){
+        SMP_EVIDENCE.words[40+i].store(v,Ordering::Relaxed);
+    }
+    report("V0199_BOOTSTRAP_ACCOUNTING",prefix,prefix_accounted,prefix_upper);
+    let summary=[MAGIC,8,0,15,1,14,8,0,0,0];
+    for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
+    super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
     let (sample_end_ns,end)=budget.sample_gap();
     let elapsed=timer::cpu_ns(end.checked_sub(budget.initial_tick).unwrap());
     let accounted=budget.ledger.lifetime_total().unwrap();
@@ -736,10 +779,6 @@ pub(super) fn run()->!{
         budget.ledger.lifetime_spent(Class::Decision),budget.ledger.lifetime_spent(Class::Coordination),
         budget.ledger.lifetime_spent(Class::Recovery),budget.ledger.lifetime_spent(Class::Optional)];
     for(i,value)in ledger_row.into_iter().enumerate(){SMP_EVIDENCE.words[481+i].store(value,Ordering::Relaxed);}
-    report("V0199_BOOTSTRAP_ACCOUNTING",elapsed,accounted,upper);
-    let summary=[MAGIC,7,0,15,1,14,8,0,0,0]; // durable BootEpoch / actual publish / G0 all false
-    for (i,v) in summary.into_iter().enumerate(){SMP_EVIDENCE.words[i].store(v,Ordering::Relaxed);}
     SMP_EVIDENCE.words[2].store(1,Ordering::Release);
-    super::super::log(b"V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n");
     super::super::halt()
 }
