@@ -62,7 +62,7 @@ const DISK_COPY_OFFSET:usize=DISK_TABLE_OFFSET+core::mem::size_of::<[Tables;2*RO
 const _:()=assert!(DISK_COPY_OFFSET+COPY<=8*1024*1024&&DISK_COPY_OFFSET%4096==0);
 #[cfg(feature="v0199-epoch-disk-selftest")]
 pub(super) fn install_disk_control_pool(va:u64){
-    assert!(va>=super::HIGH&&va%4096==0);
+    assert!(va>=super::super::HIGH&&va%4096==0);
     assert!(DISK_CONTROL_BASE.compare_exchange(0,va,Ordering::AcqRel,Ordering::Acquire).is_ok());
 }
 #[cfg(feature="v0199-epoch-disk-selftest")]
