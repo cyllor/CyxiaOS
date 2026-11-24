@@ -79,7 +79,10 @@ impl FileStreamIndexV4 {
         { return Err(Error::Invalid); }
         let fs_uuid = uuid_at(bytes, 8)?;
         if fs_uuid == [0; 16] { return Err(Error::Invalid); }
-        let groups = core::array::try_from_fn(|i| -> Result<GroupIndex, Error> {
+        let mut groups = [GroupIndex {
+            generation: 0, flags: 0, boot_epoch: 0, manifest_principal_id: 0,
+        }; GROUP_COUNT];
+        for i in 0..GROUP_COUNT {
             let at = INDEX_HEADER + i * 24;
             let group = GroupIndex {
                 generation: u32_at(bytes, at)?,
@@ -99,9 +102,12 @@ impl FileStreamIndexV4 {
                     == group.manifest_principal_id
                 { return Err(Error::Invalid); }
             }
-            Ok(group)
-        })?;
-        let streams = core::array::try_from_fn(|i| -> Result<StreamIndex, Error> {
+            groups[i] = group;
+        }
+        let mut streams = [StreamIndex {
+            generation: 0, flags: 0, issued_hi: 0, retired_through: 0,
+        }; STREAM_COUNT];
+        for i in 0..STREAM_COUNT {
             let at = STREAM_BASE + i * 24;
             let stream = StreamIndex {
                 generation: u32_at(bytes, at)?,
@@ -118,8 +124,8 @@ impl FileStreamIndexV4 {
                 ))
                 || (stream.flags != 0 && stream.generation == 0)
             { return Err(Error::Invalid); }
-            Ok(stream)
-        })?;
+            streams[i] = stream;
+        }
         Ok(Self {
             fs_uuid,
             global_request_id_hi: u64_at(bytes, 24)?,
@@ -187,9 +193,10 @@ impl SecurityStateStoreV2 {
             || u64_at(bytes, 80)? == 0
             || config_hash == [0; 32]
         { return Err(Error::Invalid); }
-        let service_generations = core::array::try_from_fn(|i| -> Result<u64, Error> {
-            u64_at(bytes, 120 + i * 8)
-        })?;
+        let mut service_generations = [0u64; 16];
+        for (i, generation) in service_generations.iter_mut().enumerate() {
+            *generation = u64_at(bytes, 120 + i * 8)?;
+        }
         Ok(Self {
             fs_uuid,
             state_generation: u64_at(bytes, 24)?,
@@ -277,7 +284,7 @@ mod tests {
     }
     #[test]
     fn index_rejects_duplicate_principal_bad_crc_reserved_and_impossible_streams() {
-        let mut bad=index();bad[80..88].copy_from_slice(&1u64.to_le_bytes());
+        let mut bad=index();bad[104..112].copy_from_slice(&1u64.to_le_bytes());
         finalize_crc(&mut bad, CRC_OFFSET);
         assert!(FileStreamIndexV4::decode(&bad).is_err());
         bad=index();bad[3520]=1;finalize_crc(&mut bad,CRC_OFFSET);
