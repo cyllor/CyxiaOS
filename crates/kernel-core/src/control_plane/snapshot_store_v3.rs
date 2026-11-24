@@ -61,9 +61,10 @@ impl SnapshotStore{
         let seq=self.sequence.checked_add(1).ok_or(Error::Exhausted)?;
         // Complete preflight before altering any prior snapshot; no
         // per-target partial new sequence on owner or bounds error.
+        let boot=self.boot;
         let make=|o:&DomainObservation|{
             let mut fields=[None;12];fields[..8].copy_from_slice(&common);fields[8..].copy_from_slice(&o.fields);
-            SnapshotReplyV3{snapshot_seq:seq,boot_epoch:self.boot,ledger_generation:ledger,
+            SnapshotReplyV3{snapshot_seq:seq,boot_epoch:boot,ledger_generation:ledger,
                 core_generation:cores,target_id:o.target.object.id,target_generation:o.target.object.generation,
                 sampled_ns,domain:o.target.domain,fields}
         };
