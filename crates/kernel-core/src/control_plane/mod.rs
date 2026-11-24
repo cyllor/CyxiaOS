@@ -14,6 +14,7 @@ pub mod advice_disposition_v1;
 pub mod advice_ledger_v0199;
 pub mod decision_record_v3;
 pub mod registered_gate_v3;
+pub mod svc_bridge_v3;
 pub mod plan_wire_v2;
 pub mod budget;
 pub mod cores;
