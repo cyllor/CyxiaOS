@@ -4,7 +4,11 @@
 //! A fault never reallocates the control role to a business core.
 //! The two advisory brains have separate bounded mailboxes; neither may
 //! publish policy, allocate a resource, revoke a capability, or execute work.
-use super::{Epochs, Error, Identity, advisory::{Advice, Controller, Source, TrustedScope}};
+use super::{
+    Epochs, Error, Identity,
+    advisory::{Advice, Controller, Source, TrustedScope},
+    security_finding::{FrozenObservation, SecurityFinding},
+};
 
 pub const CONTROL_CPU: usize = 1;
 pub const CONTROL_MASK: u64 = 1 << CONTROL_CPU;
@@ -33,9 +37,6 @@ pub enum Brain {
 pub enum ChoiceSource {
     Baseline,
     OperationsAdvice,
-    SecurityAdvice,
-    Agreement,
-    ConflictFallback,
 }
 /// Suggestions alone never grant execution. Consumers must still consult the
 /// authoritative deterministic native ledger, policy and capability guards.
@@ -71,21 +72,42 @@ impl Slot {
         Ok(())
     }
 }
-/// Memory-isolated by *separate bounded values*, not by a claim that EL0
-/// address-space separation has already been verified. The native caller
-/// must supply an authenticated actor (not a field copied from model output).
+#[derive(Clone, Copy, Debug)]
+struct FindingSlot {
+    identity: Identity,
+    sequence: u64,
+    finding: Option<SecurityFinding>,
+}
+impl FindingSlot {
+    fn new(identity: Identity) -> Self {
+        Self { identity, sequence: 0, finding: None }
+    }
+    fn submit(&mut self, actor: Identity, finding: SecurityFinding) -> Result<(), Error> {
+        if actor != self.identity || !actor.valid() { return Err(Error::Denied); }
+        if finding.finding_seq == 0 || finding.finding_seq <= self.sequence {
+            return Err(Error::Stale);
+        }
+        self.sequence = finding.finding_seq;
+        self.finding = Some(finding);
+        Ok(())
+    }
+}
+/// Separate bounded values/identities, not a claim that native EL0 page-table
+/// isolation has been proven. EL1 must authenticate sender and construct the
+/// frozen scope independently. Security findings cannot propose resource actions.
 pub struct Pair {
     operations: Slot,
-    security: Slot,
+    security: FindingSlot,
 }
 impl Pair {
     pub fn new(operations: Identity, security: Identity) -> Result<Self, Error> {
         if !operations.valid() || !security.valid() || operations == security {
             return Err(Error::Invalid);
         }
-        Ok(Self { operations: Slot::new(operations), security: Slot::new(security) })
+        Ok(Self { operations: Slot::new(operations), security: FindingSlot::new(security) })
     }
 
+    /// Legacy security-role Action advice is denied even if authenticated.
     pub fn submit(
         &mut self,
         brain: Brain,
@@ -95,33 +117,39 @@ impl Pair {
     ) -> Result<(), Error> {
         match brain {
             Brain::Operations => self.operations.submit(authenticated_actor, sequence, advice),
-            Brain::Security => self.security.submit(authenticated_actor, sequence, advice),
+            Brain::Security => Err(Error::Denied),
         }
     }
 
-    /// Deterministic arbitration: one well-scoped legal suggestion is usable,
-    /// agreement is usable, conflicting suggestions revert to the protected
-    /// baseline. No model is required; the business path does not wait.
+    /// Records an independently decoded v2 risk report; no policy/ledger effect.
+    pub fn submit_finding(
+        &mut self,
+        authenticated_actor: Identity,
+        finding: SecurityFinding,
+    ) -> Result<(), Error> {
+        self.security.submit(authenticated_actor, finding)
+    }
+
+    /// A valid hint requests an independent RuleProfile review, not authorization.
+    pub fn security_review_requested(&self, trusted: FrozenObservation) -> bool {
+        self.security.finding.is_some_and(|finding| finding.requests_review(trusted))
+    }
+
+    /// The operations brain may nominate an allowed candidate; the independent
+    /// deterministic controller and native execution guards retain final authority.
     pub fn review<const D: usize>(
         &self,
         rules: &Controller<D>,
         trusted: TrustedScope,
     ) -> Result<Review, Error> {
-        let baseline = rules.review(trusted, None)?;
-        let left = rules.review(trusted, self.operations.advice)?;
-        let right = rules.review(trusted, self.security.advice)?;
-        let ops = (left.source() == Source::AdoptedAdvice).then_some(left.choice());
-        let sec = (right.source() == Source::AdoptedAdvice).then_some(right.choice());
-        let (candidate, source) = match (ops, sec) {
-            (None, None) => (baseline.choice(), ChoiceSource::Baseline),
-            (Some(a), None) => (a, ChoiceSource::OperationsAdvice),
-            (None, Some(b)) => (b, ChoiceSource::SecurityAdvice),
-            (Some(a), Some(b)) if a == b => (a, ChoiceSource::Agreement),
-            (Some(_), Some(_)) => (baseline.choice(), ChoiceSource::ConflictFallback),
-        };
+        let chosen = rules.review(trusted, self.operations.advice)?;
         Ok(Review {
-            candidate,
-            source,
+            candidate: chosen.choice(),
+            source: if chosen.source() == Source::AdoptedAdvice {
+                ChoiceSource::OperationsAdvice
+            } else {
+                ChoiceSource::Baseline
+            },
             epochs: trusted.epochs,
             target: trusted.target,
             domain: trusted.domain,
@@ -166,40 +194,55 @@ mod tests {
         // Without CPU0, no deterministic broker can authorize control actions.
         assert!(!valid_layout(0b0110,0b0010));
     }
-    #[test] fn two_brains_require_distinct_authenticated_roles() {
+    fn finding() -> SecurityFinding {
+        SecurityFinding {
+            boot_epoch: 1, security_epoch: 1, finding_seq: 1, snapshot_seq: 1,
+            target: scope().target, expires_ns: 150, kind: 1, severity: 2,
+            hint: 1, evidence_count: 1,
+            evidence_digest: [1; 32], model_hash: [2; 32], config_hash: [3; 32],
+            score_q8_8: 256,
+        }
+    }
+    fn observation() -> FrozenObservation {
+        FrozenObservation {
+            boot_epoch: 1, security_epoch: 1, snapshot_seq: 1,
+            domain_id: 12, target: scope().target,
+            sampled_ns: 80, now_ns: 100,
+            model_hash: [2; 32], config_hash: [3; 32],
+        }
+    }
+    #[test] fn distinct_brains_have_no_cross_channel_write() {
         assert!(Pair::new(Identity {id:1,generation:1},Identity {id:1,generation:1}).is_err());
         let mut p=pair();
         assert_eq!(p.submit(Brain::Operations,Identity {id:20,generation:1},1,suggestion(4)),Err(Error::Denied));
-        assert_eq!(p.submit(Brain::Security,Identity {id:10,generation:1},1,suggestion(4)),Err(Error::Denied));
+        assert_eq!(p.submit(Brain::Security,Identity {id:20,generation:1},1,suggestion(4)),Err(Error::Denied));
+        assert_eq!(p.submit_finding(Identity {id:10,generation:1},finding()),Err(Error::Denied));
         assert_eq!(review(&p).source,ChoiceSource::Baseline);
+        assert!(!p.security_review_requested(observation()));
     }
-    #[test] fn distinct_mailboxes_do_not_overwrite_each_other() {
+    #[test] fn security_finding_may_request_review_but_never_choose_a_parameter() {
         let mut p=pair();
-        p.submit(Brain::Operations,Identity {id:10,generation:1},1,suggestion(4)).unwrap();
-        p.submit(Brain::Security,Identity {id:20,generation:1},1,suggestion(4)).unwrap();
-        assert_eq!(review(&p).source,ChoiceSource::Agreement);
-        assert_eq!(review(&p).candidate,4);
-    }
-    #[test] fn absent_ai_uses_complete_deterministic_baseline() {
-        let p=pair();
+        p.submit_finding(Identity {id:20,generation:1},finding()).unwrap();
+        assert!(p.security_review_requested(observation()));
         assert_eq!(review(&p).source,ChoiceSource::Baseline);
         assert_eq!(review(&p).candidate,2);
-    }
-    #[test] fn lone_operational_and_security_advice_are_only_recommendations() {
-        let mut p=pair();
         p.submit(Brain::Operations,Identity{id:10,generation:1},1,suggestion(4)).unwrap();
         assert_eq!(review(&p).source,ChoiceSource::OperationsAdvice);
-        let mut q=pair();
-        q.submit(Brain::Security,Identity{id:20,generation:1},1,suggestion(1)).unwrap();
-        assert_eq!(review(&q).source,ChoiceSource::SecurityAdvice);
-        assert_eq!(review(&q).candidate,1);
+        assert_eq!(review(&p).candidate,4);
+        assert_eq!(p.submit_finding(Identity {id:20,generation:1},finding()),Err(Error::Stale));
+        let mut stale=observation(); stale.security_epoch=2;
+        assert!(!p.security_review_requested(stale));
+        assert_eq!(review(&p).candidate,4);
     }
-    #[test] fn contradictory_ai_recommendations_fall_back_without_grant() {
+    #[test] fn risk_hint_and_score_cannot_override_operations_advice_or_rule_baseline() {
         let mut p=pair();
-        p.submit(Brain::Operations,Identity{id:10,generation:1},1,suggestion(4)).unwrap();
-        p.submit(Brain::Security,Identity{id:20,generation:1},1,suggestion(1)).unwrap();
-        assert_eq!(review(&p).source,ChoiceSource::ConflictFallback);
+        p.submit_finding(Identity{id:20,generation:1},finding()).unwrap();
+        let mut no_hint=observation(); no_hint.domain_id=1;
+        assert!(!p.security_review_requested(no_hint));
         assert_eq!(review(&p).candidate,2);
+        p.submit(Brain::Operations,Identity{id:10,generation:1},1,suggestion(1)).unwrap();
+        assert_eq!(review(&p).candidate,1);
+        assert!(p.security_review_requested(observation()));
     }
     #[test] fn stale_epoch_illegal_choice_and_expired_advice_revert_to_baseline() {
         let mut p=pair();
