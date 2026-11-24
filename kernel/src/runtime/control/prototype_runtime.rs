@@ -459,7 +459,8 @@ pub(super) fn step(worker: &mut Worker) {
         return;
     }
     if cpu::slot() == 2 {
-        secondary_control_step(worker);
+        // CPU2 is a business CPU in V0.20. Never enter the retired
+        // second control-worker path, including on stale mailbox wakeups.
         return;
     }
     assert_eq!(cpu::slot(), 1);
@@ -1297,6 +1298,7 @@ fn resume_action_tail() {
         .unwrap();
 }
 
+#[allow(dead_code)] // Historical diagnostic routine: unreachable in fixed CPU1 runtime.
 fn secondary_control_step(worker: &mut Worker) {
     assert_eq!(cpu::slot(), 2);
     if CONTROL_OVERRUNS.load(Ordering::Acquire) != 0 {

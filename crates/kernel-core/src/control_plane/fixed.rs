@@ -9,14 +9,18 @@ use super::{Epochs, Error, Identity, advisory::{Advice, Controller, Source, Trus
 pub const CONTROL_CPU: usize = 1;
 pub const CONTROL_MASK: u64 = 1 << CONTROL_CPU;
 pub const CONTROL_CORES: u32 = 1;
+/// CPU0 is the deterministic EL1 broker and must never count as a business CPU.
+pub const BROKER_CPU: usize = 0;
+pub const BROKER_MASK: u64 = 1 << BROKER_CPU;
 
 /// A trusted native topology snapshot must retain precisely one dedicated
 /// control CPU and at least one distinct business CPU. Offline/faulted CPU1 is
 /// NOT silently replaced by another CPU.
 pub const fn valid_layout(online: u64, control: u64) -> bool {
     online & CONTROL_MASK != 0
+        && online & BROKER_MASK != 0
         && control == CONTROL_MASK
-        && online & !CONTROL_MASK != 0
+        && online & !(CONTROL_MASK | BROKER_MASK) != 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +160,11 @@ mod tests {
         assert!(!valid_layout(0b1111,0b0100));
         assert!(!valid_layout(0b1101,0b0010));
         assert!(!valid_layout(0b0010,0b0010));
+        // CPU0 is not a business CPU, even when it is online beside CPU1.
+        assert!(!valid_layout(0b0011,0b0010));
+        assert!(valid_layout(0b0111,0b0010));
+        // Without CPU0, no deterministic broker can authorize control actions.
+        assert!(!valid_layout(0b0110,0b0010));
     }
     #[test] fn two_brains_require_distinct_authenticated_roles() {
         assert!(Pair::new(Identity {id:1,generation:1},Identity {id:1,generation:1}).is_err());

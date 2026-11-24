@@ -1,0 +1,135 @@
+# V0.20 working branch: evidence-only CI. NOT formal ARM/x86 acceptance.
+name: V0.20 fixed-control native hardening (WIP)
+
+on:
+  push:
+    branches: [work/v020-native-control-safety]
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # Allow the original, pinned V0.20 baseline tree to be archived.
+      - name: Archive exact checked-out source and provenance
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-source
+          git rev-parse HEAD > artifacts/v020-source/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-source/tree.txt
+          git archive --format=tar.gz --prefix=CyxiaOS-V0.20/ --output=artifacts/v020-source/source.tar.gz HEAD
+          # This immutable baseline is the requested V0.20 branch head at task start,
+          # not the working branch's WIP fixes. Exact tree identity must match.
+          base=0e832f6ed145d283bcbf08bd1ae680d04c1c1d4a
+          test "$(git rev-parse "$base^{tree}")" = 89ca1dd698979b1a9689f021d225843f73eaf7dd
+          git archive --format=tar.gz --prefix=CyxiaOS-V0.20-baseline/ --output=artifacts/v020-source/baseline.tar.gz "$base"
+          printf '%s\n' "$base" > artifacts/v020-source/baseline-commit.txt
+          (cd artifacts/v020-source && sha256sum source.tar.gz baseline.tar.gz > SHA256SUMS)
+          test "$(cat VERSION)" = 0.20.0-dev
+          git diff --check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-source-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: artifacts/v020-source/
+
+  security-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain and dependencies
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Test fixed roles, controller, six security contracts and budget
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-security
+          cargo test --locked --offline -p cyxia-kernel-core 2>&1 | tee artifacts/v020-security/kernel-core.log
+          cargo test --locked --offline -p cyxia-prototype --test control_extra_budget 2>&1 | tee artifacts/v020-security/control-extra-budget.log
+          # Explicit default-members gate: local network/Echo, no default cluster transport.
+          cargo test --locked --offline 2>&1 | tee artifacts/v020-security/workspace-default.log
+          python3 -B -m unittest tools.test_v19_native_security_source -v 2>&1 | tee artifacts/v020-security/security-source-guard.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-security-host-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v020-security/
+
+  arm-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin freestanding AArch64 compiler target
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Build native AArch64 SMP mechanism fixture (NOT a QEMU pass)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-arm
+          rustc -vV > artifacts/v020-arm/toolchain.txt
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest 2>&1 | tee artifacts/v020-arm/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-arm/kernel.elf
+          readelf -h artifacts/v020-arm/kernel.elf > artifacts/v020-arm/elf.txt
+          (cd artifacts/v020-arm && sha256sum kernel.elf > elf.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-arm-build-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v020-arm/
+
+  x86-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Pin x86-64 freestanding compiler target
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+      - name: Build native x86 platform fixture (NOT a QEMU boot pass)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-x86-build
+          rustc -vV > artifacts/v020-x86-build/toolchain.txt
+          python3 -B tools/build.py --output artifacts/v020-x86-build/image 2>&1 | tee artifacts/v020-x86-build/build.log
+          test -s artifacts/v020-x86-build/image/kernel.elf
+          readelf -h artifacts/v020-x86-build/image/kernel.elf > artifacts/v020-x86-build/elf.txt
+          sha256sum artifacts/v020-x86-build/image/kernel.elf > artifacts/v020-x86-build/kernel.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-x86-build-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/v020-x86-build/
