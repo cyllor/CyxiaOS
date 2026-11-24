@@ -16,7 +16,7 @@ use super::{
     advice_envelope_v1::{AdviceEnvelopeV1,TrustedAdviceScope,ADVICE_BYTES},
     advice_disposition_v1::{AdviceDispositionV1,DISPOSITION_BYTES},
     advice_ledger_v0199::{AdviceKey,EvidenceLedger},
-    apply_report_v1::{self,ApplyReportV1,TrustedExecutor},
+    apply_report_v1::{self,ApplyReportV1,BoundReport,ExecutorBindingV1,TrustedApplyScope},
 };
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -564,8 +564,9 @@ impl RegisteredDecisionGate {
         &mut self,
         supervisor:Identity,
         plan_wire:&[u8],
-        report_frames:&[&[u8]],
-        executor:TrustedExecutor,
+        report_frames:&[BoundReport<'_>],
+        bindings:&[ExecutorBindingV1],
+        scope:TrustedApplyScope,
         mut verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
     )->Result<TerminalSummary,Error>{
         // Validate the terminal owner before invoking any verifier callback.
@@ -580,10 +581,10 @@ impl RegisteredDecisionGate {
         if plan.header.plan_seq!=pending.plan_seq
             || sha256(plan_wire)!=pending.plan_digest
             || plan.header.controller_epoch!=self.controller_epoch
-            || executor.boot_epoch!=self.boot_epoch
+            || scope.boot_epoch!=self.boot_epoch
         {return Err(Error::Denied);}
-        let terminal_mask=apply_report_v1::verified_terminal_mask(
-            &plan,report_frames,executor,|index,report|{
+        let terminal_mask=apply_report_v1::verified_bound_terminal_mask(
+            &plan,report_frames,bindings,scope,|index,report|{
                 verify_native(index,report)
             }
         )?;
@@ -591,8 +592,8 @@ impl RegisteredDecisionGate {
         // itself; only the preceding independent native callback is proof.
         let mut h=Sha256::new();
         for frame in report_frames {
-            h.update((frame.len() as u32).to_le_bytes());
-            h.update(frame);
+            h.update((frame.bytes.len() as u32).to_le_bytes());
+            h.update(frame.bytes);
         }
         let evidence_digest:[u8;32]=h.finalize().into();
         let proof=TrustedTerminal {
@@ -934,12 +935,14 @@ mod tests {
         b[96..98].copy_from_slice(&[2u8,0]);
         b
     }
-    fn verified_executor()->TrustedExecutor{
-        TrustedExecutor{
-            actor:Identity{id:12,generation:9},
-            authorized_executor:Identity{id:12,generation:9},
-            executor_generation:9,boot_epoch:1,plan_version:7,now_ns:200,
+    fn verified_binding()->ExecutorBindingV1{
+        ExecutorBindingV1{
+            domain:1,role:1,active:true,target:Identity{id:17,generation:1},
+            executor_generation:9,holder:Identity{id:0,generation:0},endpoint_cap_id:0,
         }
+    }
+    fn verified_scope()->TrustedApplyScope{
+        TrustedApplyScope{boot_epoch:1,plan_version:7,now_ns:200}
     }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof(){
@@ -957,17 +960,17 @@ mod tests {
         let report=executor_report(1);
         let mut verifications=0;
         assert_eq!(gate.settle_verified_apply_reports(
-            PUBLISHER,&plan,&[&report],verified_executor(),
+            PUBLISHER,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{verifications+=1;Ok(())}
         ),Err(Error::Denied));
         assert_eq!(verifications,0);
         assert_eq!(gate.settle_verified_apply_reports(
-            SUPERVISOR,&plan,&[&report],verified_executor(),
+            SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{verifications+=1;Err(Error::NotReady)}
         ),Err(Error::NotReady));
         assert_eq!(verifications,1);
         assert_eq!(gate.settle_verified_apply_reports(
-            SUPERVISOR,&plan,&[&report],verified_executor(),
+            SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{verifications+=1;Ok(())}
         ).unwrap().action_count,1);
         assert_eq!(verifications,2);
@@ -992,7 +995,7 @@ mod tests {
         let report=executor_report(3);
         let mut checked=0;
         assert_eq!(gate.settle_verified_apply_reports(
-            SUPERVISOR,&plan,&[&report],verified_executor(),
+            SUPERVISOR,&plan,&[BoundReport{bytes:&report,origin:apply_report_v1::ReportOrigin::Kernel}],&[verified_binding()],verified_scope(),
             |_,_|{checked+=1;Ok(())}
         ),Err(Error::NotReady));
         assert_eq!(checked,0);
