@@ -161,3 +161,11 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 在 `driver-virtio::net::BatchedNet` 新增可选的 `poll_tx_receipt` / `acknowledge_tx`；收到经过驱动解析校验的 used-ring 完成后，原 token+generation+策略版本保持占用，必须匹配完整回执才能释放真实描述符；重复/伪造代际或在持回执期间重 poll 都拒绝。
 - 原 `poll_tx` 保持同一可信驱动调用回合内立即确认的兼容实现，避免破坏现有 smoltcp 进度，新的安全适配器可按真实 TX 回执延迟 ACK。新增主机模拟 used-ring 单测，明确区分 **设备链已完成、TCP 已入队、TLS 输出排空、远端 ACK** 四层，不推断彼此。
 - 本轮验证仍是主机测试和 AArch64 TLS 库编译，未执行 EL0 单机 Echo 部署、QEMU NIC/DMA 断电/断线注入、SEC-N08/SEC-D05 的原生设备验收，G2/G3/G4 状态不升级。
+
+### SEC-N ↔ SEC-D 单机网络退出安全栅栏（本轮）
+
+- `driver-virtio::net::Net` 与 `BatchedNet` 提供**只读** `tx_quiescent`：单链路仅当真实 used-ring 完成清除其唯一 TX pending，批量队列仅当所有 TX descriptor 完成并由原始 token+generation ACK 释放且无保留回执才返回真；设备 poison/fault/UNKNOWN 返回假。
+- `cluster-transport::device::VirtioPort` 将这份受保护设备状态传到现有 `smoltcp::Tcp`，而 `Tcp::terminal_tx_quiescent` 还要求 TCP 状态为 CLOSED、内核 TCP 发送队列为 0；未知端口默认假，拒绝靠普通 socket reset 模拟可靠设备完成。
+- `net-transport::native_tcp::finish_session` 是对外正常退役入口，同时检查本机 TCP 与 VirtIO TX 静默、实际相同 TLS 会话代际、待编码明文及 TLS 密文排空，再调用受限内部 `Admission::finish_drain` 归还活动连接额度。不接受模型建议、仅超时、端口宣称 Closed 或无关 TLS 会话作为资源结束证明。
+- 新增主机负向测试：TCP 未终止、TCP 已终止但 NIC 仍在途、不同 TLS 会话、重复信用释放，以及已有 TLS 回复尚未加密/发送时拒绝正常关闭；VirtIO 实测 used-ring + 匹配 ACK 前后 `tx_quiescent` 值不同。
+- **限制**：这是只有可信本机驱动执行后的正常退役门，仍未能证明 TCP 对端收到了消息；若 TLS 已 abort 且设备卡死，信用应保持隔离，必须由平台可靠设备复位/完成对账另行提供释放证明。单机 EL0 Echo 服务部署与原生 QEMU NIC/DMA 故障矩阵仍属 NOT_RUN。

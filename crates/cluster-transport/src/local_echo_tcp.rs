@@ -33,6 +33,8 @@ mod tests {
     #[test] fn v019_sec_n_native_smoltcp_implements_readonly_encrypted_socket_contract() {
         // Compile-time proof of the actual native TCP type-level adapter.
         requires_native_adapter::<Tcp<'static, DummyPort>>();
+        // Unsupported ports must not manufacture a TX quiescence witness.
+        assert!(!DummyPort.tx_quiescent());
     }
     struct DummyPort;
     impl Port for DummyPort {

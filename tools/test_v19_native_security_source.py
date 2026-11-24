@@ -190,6 +190,25 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("self.tx.release(receipt.token)?",driver)
         self.assertIn("v019_sec_d_tx_completion_retains_dma_until_exact_generation_ack",driver)
 
+    def test_sec_n_d_native_device_evidence_gates_connection_retirement(self):
+        driver=source(ROOT / "crates/driver-virtio/src/net/batched.rs")
+        single=source(ROOT / "crates/driver-virtio/src/net.rs")
+        port=source(ROOT / "crates/cluster-transport/src/device.rs")
+        tcp=source(ROOT / "crates/cluster-transport/src/tcp.rs")
+        adapter=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        native=source(ROOT / "crates/net-transport/src/native_tcp.rs")
+        ledger=source(ROOT / "crates/net-transport/src/admission.rs")
+        self.assertIn("self.completed_tx.is_none() && self.tx.is_quiescent()",driver)
+        self.assertIn("!self.failed && !self.tx.pending",single)
+        self.assertIn("fn tx_quiescent(&self) -> bool { false }",port)
+        self.assertIn("self.device.port().tx_quiescent()",tcp)
+        self.assertIn("impl<P: Port> NativeSocket for Tcp<'_, P>",adapter)
+        self.assertIn("fn terminal_tx_quiescent(&self) -> bool",native)
+        self.assertIn("pub fn finish_session<S: NativeSocket>",native)
+        self.assertIn("admission.verify_session(key,tls)",native)
+        self.assertIn("pub(crate) fn finish_drain(",ledger)
+        self.assertNotIn("pub fn finish_drain(",ledger)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

@@ -680,3 +680,95 @@ fn v019_sec_n_native_tcp_adapter_preserves_partial_socket_io_and_ciphertext() {
     gate.begin_drain(active).unwrap();
     gate.finish_drain(active).unwrap(); // mock-only, no physical TX/DMA proof
 }
+
+#[test]
+fn v019_sec_n_d_terminal_network_credit_requires_native_device_quiescence() {
+    use crate::admission::{Admission,Error as AdmissionError};
+    use crate::native_tcp::{self,NativeSocket,SocketError,Error as NativeError};
+    struct EvidenceSocket { closed:bool, nic_done:bool }
+    impl NativeSocket for EvidenceSocket {
+        fn terminal_tx_quiescent(&self)->bool { self.closed && self.nic_done }
+        fn poll_native(&mut self,_:u64)->Result<(),SocketError> {Ok(())}
+        fn read_ciphertext(&mut self,_:&mut [u8])->Result<usize,SocketError>{
+            Err(SocketError::Again)
+        }
+        fn queue_ciphertext(&mut self,_:&[u8])->Result<usize,SocketError>{
+            Err(SocketError::Again)
+        }
+    }
+    let pair=v019_local_pairings();
+    let mut client_buf=Buffers::new();
+    let mut server_buf=Buffers::new();
+    let mut client=pair[0].client(&mut client_buf,0).unwrap();
+    let mut server=pair[1].server(&mut server_buf,0).unwrap();
+    handshake(&mut client,&mut server);
+    let mut gate=Admission::new();
+    let pending=gate.begin(7,0,16).unwrap();
+    let active=gate.authenticate(pending,&server).unwrap();
+
+    let mut socket=EvidenceSocket{closed:false,nic_done:false};
+    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
+        Err(NativeError::Admission(AdmissionError::Busy)));
+    socket.closed=true;
+    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
+        Err(NativeError::Admission(AdmissionError::Busy)));
+    socket.nic_done=true;
+    let mut other_buf=Buffers::new();
+    let other=pair[1].server(&mut other_buf,0).unwrap();
+    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&other),
+        Err(NativeError::Admission(AdmissionError::Unauthenticated)));
+    assert_eq!(gate.active_count(),1);
+    native_tcp::finish_session(&socket,&mut gate,active,&server).unwrap();
+    assert_eq!(gate.active_count(),0);
+    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
+        Err(NativeError::Admission(AdmissionError::Stale)));
+}
+#[test]
+fn v019_sec_n_d_tls_pending_reply_prevents_even_quiescent_socket_retirement() {
+    use crate::admission::{Admission,Error as AdmissionError};
+    use crate::native_tcp::{self,NativeSocket,SocketError,Error as NativeError};
+    struct Terminal;
+    impl NativeSocket for Terminal {
+        fn terminal_tx_quiescent(&self)->bool { true }
+        fn poll_native(&mut self,_:u64)->Result<(),SocketError> {Ok(())}
+        fn read_ciphertext(&mut self,_:&mut [u8])->Result<usize,SocketError>{
+            Err(SocketError::Again)
+        }
+        fn queue_ciphertext(&mut self,_:&[u8])->Result<usize,SocketError>{
+            Err(SocketError::Again)
+        }
+    }
+    let pair=v019_local_pairings();
+    let mut client_buf=Buffers::new();
+    let mut server_buf=Buffers::new();
+    let mut client=pair[0].client(&mut client_buf,0).unwrap();
+    let mut server=pair[1].server(&mut server_buf,0).unwrap();
+    handshake(&mut client,&mut server);
+    let mut gate=Admission::new();
+    let pending=gate.begin(7,0,16).unwrap();
+    let key=gate.authenticate(pending,&server).unwrap();
+    let mut frame=[0u8;16];
+    frame[..2].copy_from_slice(&1u16.to_le_bytes());
+    frame[2..4].copy_from_slice(&1u16.to_le_bytes());
+    frame[8..16].copy_from_slice(&33u64.to_le_bytes());
+    client.send_plaintext(&frame).unwrap();
+    for now in 1..16 {
+        client.pump(now).unwrap();
+        transfer(&mut client,&mut server);
+        server.pump(now).unwrap();
+        if server.plaintext()==frame.as_slice() {break;}
+    }
+    assert_eq!(server.plaintext(),frame.as_slice());
+    gate.dispatch_echo(key,&mut server).unwrap();
+    assert_eq!(native_tcp::finish_session(&Terminal,&mut gate,key,&server),
+        Err(NativeError::Admission(AdmissionError::Busy)));
+    server.pump(16).unwrap();
+    assert!(!server.pending_tls().is_empty());
+    assert_eq!(native_tcp::finish_session(&Terminal,&mut gate,key,&server),
+        Err(NativeError::Admission(AdmissionError::Busy)));
+    server.consume_tls(server.pending_tls().len()).unwrap();
+    // On real native TCP this consumed ciphertext is still separately
+    // accounted; Terminal here simulates an independently verified device.
+    native_tcp::finish_session(&Terminal,&mut gate,key,&server).unwrap();
+    assert_eq!(gate.active_count(),0);
+}

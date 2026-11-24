@@ -258,6 +258,17 @@ impl Admission {
         Ok(())
     }
 
+    /// Verify the exact still-live session identity before any normal
+    /// network-credit retirement. Peer identity alone is not connection ID.
+    pub(crate) fn verify_session(
+        &self, key: ActiveTicket, tls: &Session<'_>
+    ) -> Result<(), Error> {
+        let row=self.active_entry(key)?;
+        if tls.local_echo_proof()!=Some(row.proof) {
+            return Err(Error::Unauthenticated);
+        }
+        Ok(())
+    }
     /// Stops admitting new work on this connection but retains active credit.
     pub fn begin_drain(&mut self, key: ActiveTicket) -> Result<(), Error> {
         let row=self.active.get_mut(key.slot as usize)
@@ -269,7 +280,9 @@ impl Admission {
     /// Caller must be the trusted native adapter AFTER actual TCP/TLS TX,
     /// NIC descriptor, DMA and completion references are reconciled. This
     /// method retires only logical credits; it proves no hardware drain.
-    pub fn finish_drain(&mut self, key: ActiveTicket) -> Result<(), Error> {
+    /// Internal final accounting only. External native users must call
+    /// native_tcp::finish_session after authoritative TLS/TCP/VirtIO checks.
+    pub(crate) fn finish_drain(&mut self, key: ActiveTicket) -> Result<(), Error> {
         let row=self.active_entry(key)?;
         if row.state!=State::Draining || row.tls_egress_pending {
             return Err(Error::Busy);

@@ -88,6 +88,12 @@ impl BatchedNet {
         self.tx.poison(&mut self.transport, p);
         self.report(p, false);
     }
+    /// Conservative device TX settle witness, only after every used-ring
+    /// completion was validated and every matching token acknowledged.
+    /// Pending/UNKNOWN TX or a held receipt forbids normal credit retirement.
+    pub fn tx_quiescent(&self) -> bool {
+        !self.failed && self.completed_tx.is_none() && self.tx.is_quiescent()
+    }
     pub fn mac(&self) -> [u8; 6] {
         self.mac
     }
@@ -506,6 +512,18 @@ mod tests {
         n.send(&[0x32;64],&p).unwrap();
         // Reusing a freed slot cannot make the old completion valid again.
         assert_eq!(n.acknowledge_tx(receipt,&p),Err(Error::Response));
+    }
+    #[test]
+    fn v019_sec_d_tx_quiescent_requires_used_ring_and_matching_ack() {
+        let (mut n,p,_,tx)=fixture();
+        assert!(n.tx_quiescent());
+        n.send(&[0x2d;64],&p).unwrap();
+        assert!(!n.tx_quiescent());
+        unsafe{used(tx,0,0)};
+        let receipt=n.poll_tx_receipt(&p).unwrap().unwrap();
+        assert!(!n.tx_quiescent());
+        n.acknowledge_tx(receipt,&p).unwrap();
+        assert!(n.tx_quiescent());
     }
     #[test]
     fn rx_short_consumer_holds_completed_buffer_until_consumption() {

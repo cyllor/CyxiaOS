@@ -292,6 +292,12 @@ impl Net {
         }
         result
     }
+    /// The single native TX DMA buffer is no longer in flight only after a
+    /// verified device used-ring completion. A poisoned driver cannot certify
+    /// quiescence by timeout or software reset.
+    pub fn tx_quiescent(&self) -> bool {
+        !self.failed && !self.tx.pending
+    }
     pub fn mac(&self) -> [u8; 6] {
         self.mac
     }

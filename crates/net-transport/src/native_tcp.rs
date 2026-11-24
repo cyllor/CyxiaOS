@@ -11,6 +11,8 @@ pub enum SocketError { Again, Closed, Device }
 /// Implement only on a trusted native local TCP owner. The peer cannot
 /// manufacture admission tickets, TLS proofs or privileged completion events.
 pub trait NativeSocket {
+    /// Only a real native socket/device owner may override fail-closed false.
+    fn terminal_tx_quiescent(&self) -> bool { false }
     /// One bounded smoltcp/VirtIO service turn, no blocking.
     fn poll_native(&mut self, now_ms: u64) -> Result<(), SocketError>;
     /// Return only actual TLS ciphertext from this socket, never application
@@ -43,6 +45,31 @@ fn send<S: NativeSocket>(
     progress.queued_ciphertext += queued;
     Ok(())
 }
+/// Normal termination gate: TCP CLOSED + zero TCP send backlog + verified
+/// VirtIO TX quiescence + cleared TLS egress debt. None of these conditions
+/// alone authorizes releasing the source's active credit. No model or timeout
+/// can substitute for a native device used-ring completion or reliable reset.
+///
+/// A failed TLS session with outstanding egress cannot retire normally;
+/// recovery retains the resource and must separately prove device reset.
+pub fn finish_session<S: NativeSocket>(
+    socket: &S, admission: &mut Admission, key: ActiveTicket,
+    tls: &Session<'_>,
+) -> Result<(), Error> {
+    if !socket.terminal_tx_quiescent()
+        || tls.has_pending_plaintext() || !tls.pending_tls().is_empty()
+    {
+        return Err(Error::Admission(AdmissionError::Busy));
+    }
+    admission.verify_session(key,tls).map_err(Error::Admission)?;
+    match admission.confirm_tls_output_drained(key,tls) {
+        Ok(()) | Err(AdmissionError::Stale) => {}
+        Err(e) => return Err(Error::Admission(e)),
+    }
+    admission.begin_drain(key).map_err(Error::Admission)?;
+    admission.finish_drain(key).map_err(Error::Admission)
+}
+
 /// Max one native device poll, one TLS receive, one Echo dispatch and two TLS
 /// queue attempts per call. Incomplete records/frames and output backpressure
 /// retain exact ownership for a later turn. Never waits or allocates.
