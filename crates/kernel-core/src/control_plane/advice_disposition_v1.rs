@@ -143,6 +143,28 @@ impl AdviceDispositionV1 {
         }
     }
 
+    /// Every disposition, including observation/expiry without a decision,
+    /// must describe the exact previously recorded advice. A digest alone
+    /// cannot authorize replacing its target, scope or recommended ordinal.
+    pub fn matches_advice(self, boot_epoch: u64, advice_wire: &[u8]) -> Result<(), Error> {
+        let advice = AdviceEnvelopeV1::decode(advice_wire)?;
+        if self.boot_epoch != boot_epoch
+            || self.advice_digest != sha256(advice_wire)
+            || self.advisor_epoch != advice.advisor_epoch
+            || self.advice_seq != advice.advice_seq
+            || self.snapshot_seq != advice.snapshot_seq
+            || self.target != advice.target
+            || self.model_generation != advice.active_model_generation
+            || self.domain_id != advice.domain
+            || self.action_kind != advice.action_kind
+            || self.recommended_index != advice.recommended_index
+            || self.candidate_set_hash != advice.candidate_set_hash
+        {
+            return Err(Error::Denied);
+        }
+        Ok(())
+    }
+
     /// A successful causal pair is *necessary*, never sufficient, to register
     /// an AI-assisted decision or an AI-rejection fallback. EL1 must still
     /// authenticate roles and the frozen snapshot and enforce key uniqueness.
@@ -152,19 +174,10 @@ impl AdviceDispositionV1 {
         if !matches!(self.state,1|2) || self.boot_epoch!=boot_epoch {
             return Err(Error::Denied);
         }
+        self.matches_advice(boot_epoch, advice_wire)?;
         let advice=AdviceEnvelopeV1::decode(advice_wire)?;
         let decision=DecisionRecordV3::decode(decision_wire)?;
-        if self.advice_digest!=sha256(advice_wire)
-            || self.decision_digest!=sha256(decision_wire)
-            || self.advisor_epoch!=advice.advisor_epoch
-            || self.advice_seq!=advice.advice_seq
-            || self.snapshot_seq!=advice.snapshot_seq
-            || self.target!=advice.target
-            || self.model_generation!=advice.active_model_generation
-            || self.domain_id!=advice.domain
-            || self.action_kind!=advice.action_kind
-            || self.recommended_index!=advice.recommended_index
-            || self.candidate_set_hash!=advice.candidate_set_hash
+        if self.decision_digest!=sha256(decision_wire)
             || self.controller_epoch!=decision.controller_epoch
             || self.decision_seq!=decision.decision_seq
             || self.boot_epoch!=decision.boot_epoch

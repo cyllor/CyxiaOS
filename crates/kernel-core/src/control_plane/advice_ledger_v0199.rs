@@ -115,8 +115,8 @@ impl EvidenceLedger{
         if disp.advice_digest!=row.advice_hash
             || disp.boot_epoch!=self.boot_epoch
             || disp.advisor_epoch!=self.advisor_epoch
-            || disp.snapshot_seq!=AdviceEnvelopeV1::decode(&row.advice_wire)?.snapshot_seq
         {return Err(Error::Denied);}
+        disp.matches_advice(self.boot_epoch, &row.advice_wire)?;
         if matches!(disp.state,1|2){
             let d=decision.ok_or(Error::NotReady)?;
             if d.len()!=DECISION_BYTES{return Err(Error::Invalid);}
@@ -202,6 +202,22 @@ mod tests {
         b[112..144].copy_from_slice(&[4u8;32]);
         b[144..176].copy_from_slice(&digest(a));
         b
+    }
+    #[test]
+    fn observation_cannot_relabel_original_advice_scope() {
+        let mut ledger=EvidenceLedger::new(OPERATIONS,CONTROLLER,SUPERVISOR,1,1).unwrap();
+        let frame=advice();
+        ledger.record(OPERATIONS,&frame,&trusted()).unwrap();
+        let disp=shadow_disposition(&frame);
+        for at in [56usize,64,72,88,102,112] {
+            let mut bad=disp;
+            // Change to another structurally valid target/domain/ordinal/hash
+            // while retaining the exact recorded advice digest.
+            bad[at]=if at==102 {1} else {bad[at].wrapping_add(1)};
+            assert!(AdviceDispositionV1::decode(&bad).is_ok(),"offset {at}");
+            assert_eq!(ledger.finalize(CONTROLLER,&bad,None),Err(Error::Denied),"offset {at}");
+        }
+        assert_eq!(ledger.finalize(CONTROLLER,&disp,None),Ok(AdviceResult::Finalized));
     }
     #[test]
     fn bounded_advice_slot_is_never_a_capability_or_replayable_after_ack(){
