@@ -101,12 +101,15 @@ impl<'a> ApplyReportV1<'a>{
         plan:&PlanV2<'_>,
         current:TrustedExecutor,
     )->Result<(),Error>{
-        if !current.actor.valid() || current.actor!=current.authorized_executor
-            || self.key.boot_epoch!=current.boot_epoch
+        if !current.actor.valid() || current.actor!=current.authorized_executor{return Err(Error::Denied);}
+        self.matches_plan(plan,TrustedApplyScope{boot_epoch:current.boot_epoch,plan_version:current.plan_version,now_ns:current.now_ns},current.executor_generation)
+    }
+    fn matches_plan(self,plan:&PlanV2<'_>,current:TrustedApplyScope,executor_generation:u64)->Result<(),Error>{
+        if self.key.boot_epoch!=current.boot_epoch
             || self.key.controller_epoch!=plan.header.controller_epoch
             || self.key.plan_seq!=plan.header.plan_seq
             || current.plan_version==0 || self.plan_version!=current.plan_version
-            || self.executor_generation!=current.executor_generation
+            || self.executor_generation!=executor_generation
             || self.completed_ns>current.now_ns
         {return Err(Error::Denied);}
         let action=plan.action(usize::from(self.action_index))?;
@@ -130,6 +133,7 @@ pub struct TrustedExecutor{
 /// Only authoritative verification of ALL per-action results may close an
 /// in-flight plan. This is an EL1 helper; a caller must supply real executor
 /// and persistent/device evidence in the independent callback.
+#[cfg(test)]
 pub fn verified_terminal_mask(
     plan:&PlanV2<'_>,
     report_frames:&[&[u8]],
@@ -161,6 +165,98 @@ pub fn verified_terminal_mask(
     }
     Ok(seen)
 }
+/// Frozen ExecutorBinding v1 (64B), normative §8.0. These records must
+/// originate from the protected work/target registry, not an EL0 report.
+pub const BINDING_BYTES:usize=64;
+pub const MAX_BINDINGS:usize=96;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ExecutorBindingV1{
+    pub domain:u16,
+    pub role:u16,
+    pub active:bool,
+    pub target:Identity,
+    pub executor_generation:u64,
+    pub holder:Identity,
+    pub endpoint_cap_id:u64,
+}
+impl ExecutorBindingV1{
+    pub fn decode(b:&[u8])->Result<Self,Error>{
+        if b.len()!=BINDING_BYTES||le32(b,4)?&!1!=0||le64(b,56)?!=0{
+            return Err(Error::Invalid);
+        }
+        let v=Self{domain:le16(b,0)?,role:le16(b,2)?,active:le32(b,4)?==1,
+            target:Identity{id:le64(b,8)?,generation:le64(b,16)?},
+            executor_generation:le64(b,24)?,
+            holder:Identity{id:le64(b,32)?,generation:le64(b,40)?},
+            endpoint_cap_id:le64(b,48)?};
+        if !v.valid(){return Err(Error::Denied);}
+        Ok(v)
+    }
+    fn valid(self)->bool{
+        (1..=15).contains(&self.domain)&&self.target.valid()&&self.executor_generation!=0
+            && if self.domain==4{
+                self.role==12&&self.holder.valid()&&self.endpoint_cap_id!=0
+            }else{
+                self.role==1&&self.holder.id==0&&self.holder.generation==0&&self.endpoint_cap_id==0
+            }
+    }
+    fn permits(self,origin:ReportOrigin)->bool{
+        self.valid()&&self.active&&match origin{
+            ReportOrigin::Kernel=>self.role==1,
+            ReportOrigin::User{holder,cap_id}=>self.role==12&&holder==self.holder
+                &&cap_id!=0&&cap_id==self.endpoint_cap_id,
+        }
+    }
+}
+/// Origin captured by EL1 at the actual internal executor or 0x43 entry,
+/// not decoded from a report frame. Only the D04 role12 endpoint uses EL0.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ReportOrigin{Kernel,User{holder:Identity,cap_id:u64}}
+#[derive(Clone,Copy)]
+pub struct BoundReport<'a>{pub bytes:&'a[u8],pub origin:ReportOrigin}
+#[derive(Clone,Copy,Debug)]
+pub struct TrustedApplyScope{pub boot_epoch:u64,pub plan_version:u64,pub now_ns:u64}
+
+/// Check every exact per-target binding and copied report before any effect
+/// verifier runs. An inactive or retired executor never opens new terminal
+/// admission; its outstanding work remains for independent native recovery.
+pub fn verified_bound_terminal_mask(
+    plan:&PlanV2<'_>,reports:&[BoundReport<'_>],bindings:&[ExecutorBindingV1],
+    scope:TrustedApplyScope,mut verify_native:impl FnMut(usize,&ApplyReportV1<'_>)->Result<(),Error>,
+)->Result<u16,Error>{
+    let count=usize::from(plan.header.action_count);
+    if count==0||count>MAX_ACTIONS||reports.len()!=count||bindings.len()>MAX_BINDINGS
+        ||scope.boot_epoch==0||scope.plan_version==0{return Err(Error::Invalid);}
+    for (i,b) in bindings.iter().enumerate(){
+        if !b.valid()||bindings[..i].iter().any(|old|old.domain==b.domain&&old.target==b.target){
+            return Err(Error::Denied);
+        }
+    }
+    let mut seen=0u16;
+    for copied in reports{
+        let r=ApplyReportV1::decode(copied.bytes)?;
+        let i=usize::from(r.action_index);
+        if i>=count{return Err(Error::Denied);}
+        let bit=1u16<<i;
+        if seen&bit!=0{return Err(Error::Denied);}
+        let binding=bindings.iter().find(|b|b.domain==r.domain_id&&b.target==r.target)
+            .ok_or(Error::Denied)?;
+        if !binding.permits(copied.origin){return Err(Error::Denied);}
+        r.matches_plan(plan,scope,binding.executor_generation)?;
+        if r.state==ActionStatus::Unknown{return Err(Error::NotReady);}
+        seen|=bit;
+    }
+    let required=if count==16{u16::MAX}else{(1u16<<count)-1};
+    if seen!=required{return Err(Error::Denied);}
+    // These callbacks independently read real effect evidence; they must not
+    // consume or release any obligation before ALL verifications succeed.
+    for copied in reports{
+        let r=ApplyReportV1::decode(copied.bytes)?;
+        verify_native(usize::from(r.action_index),&r)?;
+    }
+    Ok(seen)
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct PlanQueryReplyV3{
     pub key:PlanKey,
@@ -300,6 +396,51 @@ mod tests{
         forged.plan_version=0;
         let mut context=executor();context.plan_version=0;
         assert_eq!(forged.matches_frozen(&p,context),Err(Error::Denied));
+    }
+    #[test]
+    fn mixed_domain_reports_require_exact_protected_executor_binding(){
+        let first=plan();
+        let mut raw=[0u8;362];
+        raw[..212].copy_from_slice(&first);
+        raw[8..12].copy_from_slice(&362u32.to_le_bytes());
+        raw[12..14].copy_from_slice(&2u16.to_le_bytes());
+        let h=212;
+        raw[h..h+148].copy_from_slice(&first[64..]);
+        raw[h+8..h+10].copy_from_slice(&4u16.to_le_bytes());
+        raw[h+12..h+16].copy_from_slice(&6u32.to_le_bytes());
+        raw[h+24..h+32].copy_from_slice(&5u64.to_le_bytes());
+        raw[h+40..h+48].copy_from_slice(&18u64.to_le_bytes());
+        raw[h+146..h+150].copy_from_slice(&[2,0,8,0]);
+        let p=PlanV2::decode(&raw).unwrap();
+        let one=report();
+        let mut two=[0u8;100];two[..98].copy_from_slice(&one);
+        two[24..26].copy_from_slice(&1u16.to_le_bytes());
+        two[26..28].copy_from_slice(&4u16.to_le_bytes());
+        two[32..40].copy_from_slice(&18u64.to_le_bytes());
+        two[48..56].copy_from_slice(&10u64.to_le_bytes());
+        two[68..72].copy_from_slice(&4u32.to_le_bytes());
+        two[96..100].copy_from_slice(&[2,0,8,0]);
+        let holder=Identity{id:1200,generation:2};
+        let cap_id=99;
+        let kernel=ExecutorBindingV1{domain:1,role:1,active:true,target:Identity{id:17,generation:1},
+            executor_generation:9,holder:Identity{id:0,generation:0},endpoint_cap_id:0};
+        let file=ExecutorBindingV1{domain:4,role:12,active:true,target:Identity{id:18,generation:1},
+            executor_generation:10,holder,endpoint_cap_id:cap_id};
+        let scope=TrustedApplyScope{boot_epoch:1,plan_version:7,now_ns:1200};
+        let mut reports=[BoundReport{bytes:&two,origin:ReportOrigin::User{holder,cap_id}},
+            BoundReport{bytes:&one,origin:ReportOrigin::Kernel}];
+        let bindings=[kernel,file];
+        let mut checked=0;
+        assert_eq!(verified_bound_terminal_mask(&p,&reports,&bindings,scope,|_,_|{checked+=1;Ok(())}),Ok(3));
+        assert_eq!(checked,2);
+        reports[1].origin=ReportOrigin::User{holder,cap_id};
+        assert_eq!(verified_bound_terminal_mask(&p,&reports,&bindings,scope,|_,_|panic!("D01 has no user executor")),Err(Error::Denied));
+        reports[1].origin=ReportOrigin::Kernel;
+        reports[0].origin=ReportOrigin::User{holder:Identity{id:holder.id,generation:3},cap_id};
+        assert_eq!(verified_bound_terminal_mask(&p,&reports,&bindings,scope,|_,_|panic!("stale holder")),Err(Error::Denied));
+        reports[0].origin=ReportOrigin::User{holder,cap_id};
+        assert_eq!(verified_bound_terminal_mask(&p,&reports,&[kernel,ExecutorBindingV1{active:false,..file}],scope,|_,_|panic!("inactive")),Err(Error::Denied));
+        assert_eq!(verified_bound_terminal_mask(&p,&reports,&[kernel,file,file],scope,|_,_|panic!("duplicate")),Err(Error::Denied));
     }
     #[test]
     fn plan_query_is_not_an_apply_receipt(){
