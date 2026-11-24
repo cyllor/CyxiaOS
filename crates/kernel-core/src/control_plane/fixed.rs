@@ -375,7 +375,9 @@ mod tests {
         raw[64..66].copy_from_slice(&1u16.to_le_bytes());
         raw[66]=2;raw[67]=1;
         raw[68..70].copy_from_slice(&1u16.to_le_bytes());
-        raw[72]=1;raw[104]=2;raw[136]=3;
+        raw[72..104].copy_from_slice(&[1u8;32]);
+        raw[104..136].copy_from_slice(&[2u8;32]);
+        raw[136..168].copy_from_slice(&[3u8;32]);
         raw[168..170].copy_from_slice(&256i16.to_le_bytes());
         let mut p=pair();
         assert_eq!(p.submit_security_wire(
