@@ -190,7 +190,7 @@ class EpochFixture:
         txid=2*e
         replay=e-1
         flushes=6+replay
-        require(w[:11]==(MAGIC,6,1,e-1,e,txid-1,txid+1,txid,7*e,8,flushes),
+        require(w[:11]==(MAGIC,7,1,e-1,e,txid-1,txid+1,txid,7*e,8,flushes),
                 'wrong durable boot/service transition identity')
         require(w[11]>=4096 and w[12:14]==(11+12*replay,HOME),'missing actual full-log scan or block I/O counts')
         require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
@@ -240,7 +240,66 @@ class EpochFixture:
                 'redo buffers are not in the actual progress pool')
         require(serial.count(f'V0199_FRAME_LEDGER a=262144 b={permanent} c={free}\n'.encode())==1,
                 'frame ledger UART/memory mismatch')
-        require(all(v==0 for v in w[80:]),'nonzero reserved evidence')
+        magic,baseline,bc,bmax,bcpu,applied,ac,amax,acpu,limit,chars,before,after,version,start,finished,first_cpu,written,rlen,retained,sampled,accepted=w[80:102]
+        require(magic==0x4359443135465831 and w[102:104]==(0,0),'missing real D15 effect record')
+        base_payload=b'V0199_D15_BASELINE actual ordinary UART frame 0123456789abcdef\n'
+        applied_payload=b'V0199_D15_APPLIED actual ordinary UART frame 0123456789abcdef\n'
+        require(serial.count(base_payload)==serial.count(applied_payload)==1
+                and serial.index(base_payload)<serial.index(applied_payload),'actual queued UART frames lost, duplicated or reordered')
+        require((baseline,applied)==(28+len(base_payload),28+len(applied_payload))
+                and written==baseline+applied and 0<bmax<=8<amax<=32 and limit==32
+                and 0<chars<=limit and before-after==chars and before==applied
+                and version==1 and bc>=((baseline+7)//8) and ac>=((applied+31)//32)
+                and bcpu>0 and acpu>=first_cpu>0 and sampled<=accepted<=start<=finished
+                and retained==1 and rlen==98,'D15 actual hardware effect/cost conservation mismatch')
+        require(serial.count(f'V0199_D15_EFFECT a={bmax} b={amax} c=1\n'.encode())==1,
+                'D15 UART effect summary mismatch')
+        snapshot=page[104*8:137*8]
+        rules=page[137*8:148*8]
+        plan=page[148*8:148*8+212]
+        decision=page[175*8:207*8]
+        report=page[207*8:207*8+rlen]
+        require(page[148*8+212:175*8]==bytes(4) and page[207*8+rlen:220*8]==bytes(6),
+                'nonzero D15 evidence padding')
+        require(struct.unpack_from('<IHH',snapshot)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snapshot,8)==(1,e,1,1,15,1,sampled)
+                and struct.unpack_from('<HHI',snapshot,64)==(15,12,0),'wrong live D15 snapshot scope')
+        fields=[]
+        for i in range(12):
+            fid,present,value=struct.unpack_from('<HB5xQ',snapshot,72+i*16)
+            require(fid==16+i and present in (0,1) and (present or value==0),'noncanonical D15 snapshot')
+            require(snapshot[72+i*16+3:72+i*16+8]==bytes(5),'snapshot reserved bytes')
+            fields.append(value if present else None)
+        require(fields[:8]==[None]*8 and fields[8]==applied,'D15 real queue depth or absent fields changed')
+        expected_rules=bytearray(88)
+        put(expected_rules,0,'IHHQIIQ',0x43595255,2,32,1,1,88,0)
+        put(expected_rules,32,'IHHQHHHHII',1,15,1,15,0,1,1,0,56,0)
+        put(expected_rules,64,'HB5xQ',1,3,1)
+        put(expected_rules,80,'HHI',2,0,0)
+        require(rules==bytes(expected_rules),'frozen diagnostic rules differ')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D15-FIXTURE-ORDINALS/0=1,1=8,2=32,3=64').digest())
+        h.update(snapshot);h.update(bytes(1))
+        for v in fields[8:12]+[1,applied,1]:
+            h.update(bytes([v is not None]));h.update(struct.pack('<Q',0 if v is None else v))
+        h.update(struct.pack('<H',4))
+        for i,v in enumerate((1,8,32,64)):h.update(struct.pack('<HBH',i,2,v))
+        candidate_hash=h.digest()
+        require(plan[176:208]==candidate_hash and plan[208:212]==struct.pack('<HH',2,32)
+                and struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,1,0,0,1,1,sampled+10_000_000_000),
+                'D15 exact plan differs from approved rule/snapshot')
+        require(decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest()
+                and decision[224:256]==candidate_hash
+                and struct.unpack_from('<10Q',decision,8)==(e,1,1,1,1,15,1,1,1,1)
+                and struct.unpack_from('<HHH',decision,92)==(0,15,1)
+                and decision[98:102]==bytes(4)
+                and struct.unpack_from('<HH',decision,102)==(2,65535)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0),'D15 decision is not exact RULE_ONLY fallback')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(e,1,1,0,15,1,0,15,1,1,1,0,2,finished)
+                and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',32),
+                'D15 ApplyReport does not match actual retained effect')
+        require(all(v==0 for v in w[220:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -250,7 +309,9 @@ class EpochFixture:
                     formatted_v1_structure_verified=True,system_objects_verified=4,acl_slots_verified=256,
                     checkpoint_generation=e+1,checkpoint_log_epoch=e+1,checkpoint_lsn=7*replay,
                     native_checkpoint_flush_verified=True,
-                    frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
+                    native_d15_effect_fixture_verified=True,d15_baseline_max_chars=bmax,d15_approved_max_chars=amax,
+                    d15_baseline_pump_cpu_ns=bcpu,d15_approved_pump_cpu_ns=acpu,d15_feedback_records=retained,
+                    production_d15_el0_control_verified=False,frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
                     control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
                     permanent_frames=permanent,frame_meta_physical_dump_verified=False,
                     paired_boot_epoch_redo_verified=True,
@@ -326,6 +387,7 @@ def main():
         result['cross_process_merged_home_replay_fixture_verified']=True
         result['cross_process_paired_boot_epoch_fixture_verified']=True
         result['cross_process_formatted_mount_checkpoint_verified']=True
+        result['native_d15_actual_effect_fixture_verified']=True
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
