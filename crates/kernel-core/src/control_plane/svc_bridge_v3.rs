@@ -41,6 +41,7 @@ pub struct FrozenNativePlan<'a> {
 pub struct SvcV3Bridge<'a> {
     pub gate:&'a mut RegisteredDecisionGate,
     pub decision_endpoint_cap:u64,
+    pub publisher_cap:u64,
 }
 impl SvcV3Bridge<'_>{
     pub fn register_rule_only(
@@ -83,6 +84,7 @@ impl SvcV3Bridge<'_>{
     )->Result<Publication,Error>{
         decode_v3(caller.package_abi,0x41,args).map_err(|_|Error::Invalid)?;
         if caller.cpu!=0 || !caller.identity.valid()
+            || caller.endpoint_cap==0 || caller.endpoint_cap!=self.publisher_cap
             || copied_plan.len()>MAX_PLAN_BYTES
             || args[1]!=copied_plan.len() as u64
             || args[3]!=copied_sidecars.len() as u64
@@ -107,7 +109,7 @@ mod tests{
         let mut gate=RegisteredDecisionGate::new(
             Identity{id:2,generation:1},Identity{id:8,generation:1},1,2
         ).unwrap();
-        let mut bridge=SvcV3Bridge{gate:&mut gate,decision_endpoint_cap:77};
+        let mut bridge=SvcV3Bridge{gate:&mut gate,decision_endpoint_cap:77,publisher_cap:88};
         let mut bytes=[0u8;32];
         bytes[0..4].copy_from_slice(&0x43595255u32.to_le_bytes());
         bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
