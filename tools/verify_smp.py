@@ -133,7 +133,7 @@ def boot_ram_mib(elf: bytes) -> int:
     raise ValueError('boot profile not backed by loaded ELF bytes')
 
 
-def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256) -> dict:
+def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None) -> dict:
     require(1 <= timeout <= 60 and cpus in (1, 4) and ram_mib in (256, 1024),
             'invalid execution budget/configuration')
     elf = elf.resolve(strict=True)
@@ -177,6 +177,17 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                     '-display', 'none', '-monitor', 'none', '-nic', 'none',
                     '-chardev', 'ringbuf,id=cyxlog,size=1048576', '-serial', 'chardev:cyxlog',
                     '-qmp', f'unix:{path},server=on,wait=off', '-kernel', str(elf), '-no-reboot']
+            if scratch_disk is not None:
+                require(getattr(acceptance, 'scratch_epoch_disk', False) and ram_mib == 1024,
+                        'disk restricted to explicit native epoch scratch fixture')
+                require(not scratch_disk.is_symlink(), 'scratch disk must not be a symlink')
+                scratch_disk = scratch_disk.resolve(strict=True)
+                require(scratch_disk.is_file() and scratch_disk.stat().st_size == 512*1024*1024
+                        and ',' not in str(scratch_disk), 'invalid scratch image')
+                report['scratch_disk_before_sha256'] = sha(scratch_disk)
+                args += ['-global', 'virtio-mmio.force-legacy=false',
+                         '-drive', f'file={scratch_disk},if=none,id=epoch,format=raw,cache=none',
+                         '-device', 'virtio-blk-device,drive=epoch']
             report['argv'] = args
             proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
             end = started + timeout
@@ -218,6 +229,14 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                     report['observations'] = validator(bytes(decoded), (output / 'native-page.bin').read_bytes(), len(actual_cpus))
                     require(sha(elf) == report['elf_sha256'], 'ELF changed during guest run')
                     require(before == manifest(), 'source changed during guest run')
+                    if scratch_disk is not None:
+                        # Force a new QEMU process, not guest reset or graceful
+                        # device shutdown that could hide a missing guest FLUSH.
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        require(proc.returncode == -9, 'scratch VM not forcibly stopped')
+                        report['forced_process_stop'] = True
+                        report['scratch_disk_after_sha256'] = sha(scratch_disk)
                     report['status'] = 'PASS'
                     report['native_smp_mechanism_verified'] = True
                     if acceptance is not None:
