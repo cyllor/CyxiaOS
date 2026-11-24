@@ -15,14 +15,17 @@
 | F07 | 运营 AdviceEnvelope v1 | `control_plane/advice_envelope_v1.rs`：152B LE 封包、当前快照/模型/候选 hash、建议索引与实际候选值绑定；`fixed.rs` 接入独立运营 mailbox | 组件测试；受保护 EL0/EL1 真实 IPC 未接线 |
 | F08 | RuleProfile v2 普通裁决入口 | `fixed.rs::review_with_rule_profile` 只在受信模式与同代规则下采纳允许集合内运营建议；无合法候选 fail-closed；`RuleProfile` 的 trial 规则无真实许可不进入普通审查 | 规则/模式单元测试；不是独立决定登记或执行 |
 | F09 | DecisionRecord v3 | `control_plane/decision_record_v3.rs`：256B LE 解析、模式/来源/处置/理由/允许位图/候选索引约束、敏感域 AI_DENY | G1 只读规范组件；缺 role2 冻结登记与真实 AdviceDisposition |
-| F10 | Plan/Policy v2 | `control_plane/plan_wire_v2.rs`：64B+144B v2 小端、长短/域/目标/代际/模式/重复检查，交叉匹配 DecisionRecord v3 | 不产生发布授权；没有实际 SHA-256、受保护 sidecar 登记、发布者身份、原生 PREPARE/PUBLISH/执行回执 |
+| F10 | Plan/Policy v2 | `control_plane/plan_wire_v2.rs`：64B+144B v2 小端、长短/域/目标/代际/模式/重复检查、多动作共用模型 hash/严格递增决定序号，交叉匹配 DecisionRecord v3 | 受保护组件；当前原生发布执行器仍用旧路径 |
+| F11 | 冻结决定登记及单次提交门 | `control_plane/registered_gate_v3.rs`：锁定准确 Plan/RuleProfile SHA-256 与 256B 决定、唯一控制器/发布者身份、单未发布计划、序号高水位、精确重试和 UNKNOWN 不重放；新增测试 | `RULE_ONLY` 无 AdviceDisposition/TrialPermit 的受限纵向切片；已编译/主机测试，但尚未绑定 ARM SVC 0x50/0x41 及实际原生设备执行 |
+| F12 | 禁止未获独立证据的模型与试验授权 | v3 登记门仅允许符合本机受保护 RuleProfile 的普通确定性回退，拒绝 AI_ASSISTED、AUTHORIZED_TRIAL 和 source0/reason7 缺失 AdviceDisposition ；无模型代际仍走 RULE_ONLY | 受限功能，完整 AI 采纳与许可链尚未实现 |
+| F13 | 规范风险 IPC 及期限溢出 | `fixed::submit_security_wire` 用 192B `SecurityFinding v2` 检查角色/旧版本/保留位/重放；运营建议与风险建议的期限均用 checked_add；独立负向测试 | 组件级 IPC，真实 EL0 页表/能力/队列仍未接线 |
 
  
 ## 完成定义与保留阻断
  
 **P0：固定 CPU 编号冲突。** V0.19.9 唯一控制 C=CPU0、业务 B=CPU1–3；V0.20 仍是 C=CPU1、CPU0 EL1 broker、业务 CPU2–3。不得简单替换常量，必须重接异常/定时器、CPU0 EL0 控制调度、业务核亲和、IRQ/DMA 等并通过真正原生启动与 A01–A04、A15/E14。当前原生布局不符合规范，G0 **BLOCKED**。
  
-**P0：核心版本化封包。** 旧原生 `policy_wire.rs` 仍在处理 PlanHeader/PolicyEnvelope v1；本工作分支新增 V0.19.9 v2/v3 只读解析/绑定组件，但**尚未将原生发布执行切换到 v2、也没有 EL1 DecisionRecord v3 冻结登记/唯一代理 PUBLISH/RuleProfile v2 最终硬门核验**。旧 v1 不得被称为 v2。G1 **NOT_READY**。
+**P0：核心版本化封包。** 旧原生 `policy_wire.rs` 仍在处理 PlanHeader/PolicyEnvelope v1；本分支新增 v2/v3 解析与**固定内存的 RULE_ONLY 冻结登记/唯一发布者回调守门组件**（真实 SHA-256），但**尚未接线实际 AArch64 SVC 0x50 / 0x41、原生注册能力/EL0 角色/执行器与 ApplyReport，也未实现经核验的 AdviceDisposition v1 / TrialPermit 路径**。新增组件不是 G1 全量通过或原生 PUBLISH 已迁移。旧 v1 不得被称为 v2。G1 **NOT_READY**。
  
 **P0：任务与存储 ABI。** Syscall x8/x0–x5 ABI v3、ET_DYN/PIE 安全装载、FileService v4/Reply v3、磁盘超级块 v1(80B)/data_start=4118、Receipt/Index v4 与安全状态持久对象尚未一致迁移。禁止尝试用旧格式数据直接改变版本号。当前数据磁盘不可视为符合规范。
  
