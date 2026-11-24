@@ -111,7 +111,8 @@ impl<const D: usize> Controller<D> {
                 && value.expires_ns > value.snapshot_ns
                 // Max lifetime binds to the snapshot, not the time the
                 // untrusted message happens to reach the reviewer.
-                && value.expires_ns <= value.snapshot_ns.saturating_add(100_000_000)
+                && value.snapshot_ns.checked_add(100_000_000)
+                    .is_some_and(|end| value.expires_ns <= end)
                 && rule.options.contains(&value.candidate)
         });
         Ok(Reviewed {
