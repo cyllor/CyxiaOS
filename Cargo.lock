@@ -192,6 +192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyxia-local-echo"
+version = "0.1.0"
+dependencies = [
+ "cyxia-net-transport",
+ "getrandom",
+ "rustls",
+]
+
+[[package]]
 name = "cyxia-net-transport"
 version = "0.1.0"
 dependencies = [

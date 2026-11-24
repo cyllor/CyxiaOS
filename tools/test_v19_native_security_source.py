@@ -209,6 +209,24 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub(crate) fn finish_drain(",ledger)
         self.assertNotIn("pub fn finish_drain(",ledger)
 
+    def test_v019_local_echo_el0_guest_has_only_network_broker_rights(self):
+        manifest = source(ROOT / "user/local-echo/Cargo.toml")
+        surface = source(ROOT / "user/local-echo/src/lib.rs")
+        guest = source(ROOT / "user/local-echo/src/runtime.rs")
+        broker = source(ROOT / "user/local-echo/src/broker.rs")
+        build = source(ROOT / "user/local-echo/build.rs")
+        self.assertIn("cyxia-net-transport", manifest)
+        self.assertNotIn("cyxia-cluster-transport", manifest)
+        self.assertNotIn("cyxia-prototype-cluster", manifest)
+        self.assertIn("pub const DIRECT_TLS_CIPHERTEXT: u64 = 1", surface)
+        self.assertIn("match op {", surface)
+        self.assertIn("allowed::allowed(op,len,arg0)", broker)
+        self.assertIn("native_tcp::turn(", guest)
+        self.assertIn("gate.begin_restart();", guest)
+        self.assertIn("fn terminal_tx_quiescent(&self)->bool{false}", guest)
+        self.assertIn("CYXIA_LOCAL_ECHO_IDENTITY", build)
+        self.assertIn("cargo check --release --locked --offline -p cyxia-local-echo --features guest", source(ROOT / ".github/workflows/v19-advisory-smoke.yml"))
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

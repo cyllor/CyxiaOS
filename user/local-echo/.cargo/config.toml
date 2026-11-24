@@ -1,0 +1,5 @@
+[target.aarch64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
+[env]
+CC_aarch64_unknown_none = "clang"
+CFLAGS_aarch64_unknown_none = "--target=aarch64-none-elf -ffreestanding -fno-stack-protector -mno-outline-atomics -DRING_CORE_NOSTDLIBINC"

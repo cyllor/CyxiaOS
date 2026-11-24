@@ -169,3 +169,11 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - `net-transport::native_tcp::finish_session` 是对外正常退役入口，同时检查本机 TCP 与 VirtIO TX 静默、实际相同 TLS 会话代际、待编码明文及 TLS 密文排空，再调用受限内部 `Admission::finish_drain` 归还活动连接额度。不接受模型建议、仅超时、端口宣称 Closed 或无关 TLS 会话作为资源结束证明。
 - 新增主机负向测试：TCP 未终止、TCP 已终止但 NIC 仍在途、不同 TLS 会话、重复信用释放，以及已有 TLS 回复尚未加密/发送时拒绝正常关闭；VirtIO 实测 used-ring + 匹配 ACK 前后 `tx_quiescent` 值不同。
 - **限制**：这是只有可信本机驱动执行后的正常退役门，仍未能证明 TCP 对端收到了消息；若 TLS 已 abort 且设备卡死，信用应保持隔离，必须由平台可靠设备复位/完成对账另行提供释放证明。单机 EL0 Echo 服务部署与原生 QEMU NIC/DMA 故障矩阵仍属 NOT_RUN。
+
+### G2 原生单机 EL0 Echo 可执行程序候选（本轮）
+
+- 新增 `user/local-echo` 独立的 Rust `#![no_std]` AArch64 EL0 服务项目。它依赖 `cyxia-net-transport` TLS/Echo 和受保护的本机 Cyxia SVC 共享页，但**不依赖** `cyxia-cluster-transport`、集群任务引擎或成员发现服务。自身只读 broker allowlist 限定为随机数、时钟、状态轮询、TCP 密文读写、关闭与 yield；WRITE 固定采用受限的原生 TLS 密文通路，不允许文件写、远程任务、存储或策略修改操作。
+- 服务入口从外部 provisioned 本机证书、私钥和对端公钥 pin 构造原生 Rustls TLS 1.3；当前只作为被动 Echo 服务端。证书身份需匹配受保护内核共享页，`Admission` 的 32/4/16 信用、握手票据/实际 TLS 会话代际及 `native_tcp::turn` 均在客体中实际运行。本地 TLS 会话异常后进入 fail-closed，**不**以连接断开冒充 DMA 已停止。
+- 为不扩大应用权限，guest 重用了旧内核已有的 `SVC #0x43` 共享页**布局**，但这不是重新激活旧集群 RPC：可调用范围在新 guest broker 及测试中显式限死。真正的最小权限还必须由内核执行上下文的能力/操作白名单验证，不能仅依靠用户态检查。
+- 构建新增 `cyxia-local-echo` 工作区成员、独立 linker 和外部凭据提供门。CI 运行无客户身份的 broker allowlist 单元测试，并用临时测试证书仅作 `aarch64-unknown-none` 交叉类型检查，不生成部署镜像，也绝不发布测试私钥作为生产证书。
+- **尚未完成**：从旧 `unified-runtime` 内核启动链独立部署新 Echo guest，按本机网络配置关闭集群发现/远程任务分发；为此 guest 提供来自 EL1 的真实端口来源、TCP/VirtIO TX 静默证明及服务重启信用留存。guest 在缺少这些证明时保守停止，不默许重连，因此 G2/G3/G4 原生验收仍是 NOT_RUN。

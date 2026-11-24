@@ -51,14 +51,24 @@ jobs:
           cargo test --locked --offline -p cyxia-net-transport
           cargo test --locked --offline -p cyxia-net-transport --features tls
           cargo test --locked --offline -p cyxia-cluster-transport --features tls
-      - name: AArch64 EL0 TLS target compile (NOT QEMU evidence)
+      - name: Local-only EL0 Echo broker allowlist tests
+        run: cargo test --locked --offline -p cyxia-local-echo
+      - name: AArch64 EL0 TLS and native Echo guest target compile (NOT QEMU evidence)
         run: |
-          # Kernel remains aarch64-unknown-none-softfloat; EL0 TLS/ring is
-          # built for the existing aarch64-unknown-none FP/SIMD target.
+          # EL1 kernel remains softfloat; rustls/ring guest uses native FP/SIMD.
           rustup target add aarch64-unknown-none --toolchain 1.95.0
-          CC_aarch64_unknown_none=clang \
-          CFLAGS_aarch64_unknown_none="--target=aarch64-none-elf -ffreestanding -fno-stack-protector -mno-outline-atomics -DRING_CORE_NOSTDLIBINC" \
+          export CC_aarch64_unknown_none=clang
+          export CFLAGS_aarch64_unknown_none="--target=aarch64-none-elf -ffreestanding -fno-stack-protector -mno-outline-atomics -DRING_CORE_NOSTDLIBINC"
           cargo check --release --locked --offline -p cyxia-net-transport --features tls --target aarch64-unknown-none
+          # Test identity is ONLY for type checking; no executable is linked
+          # or installed, and the test certificate/key are never a release
+          # deployment identity.
+          mkdir -p /tmp/cyxia-v019-echo-ci-identity
+          cp crates/net-transport/tests/fixtures/a-test-cert.der /tmp/cyxia-v019-echo-ci-identity/cert.der
+          cp crates/net-transport/tests/fixtures/a-test-key.der /tmp/cyxia-v019-echo-ci-identity/key.der
+          head -c 32 /dev/zero > /tmp/cyxia-v019-echo-ci-identity/peer.pin
+          CYXIA_LOCAL_ECHO_IDENTITY=/tmp/cyxia-v019-echo-ci-identity \
+            cargo check --release --locked --offline -p cyxia-local-echo --features guest --target aarch64-unknown-none
       - name: Native source wiring regression (NOT a native pass)
         run: python3 -B -m unittest tools.test_v19_native_security_source -v
       - name: Archive exact branch commit (not a release)
