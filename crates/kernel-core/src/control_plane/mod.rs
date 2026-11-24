@@ -104,3 +104,5 @@ pub mod snapshot_store_v3;
 pub mod trial_permit_v1;
 
 pub mod d15_owner_v0199;
+
+pub mod candidate_registry_v0199;
