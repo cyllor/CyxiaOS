@@ -63,6 +63,50 @@ impl WorkFrame{
 mod tests{
     use super::*;
     #[test]
+    fn independent_complete_wire_vectors_cover_all_action_tiers(){
+        use super::super::apply_report_v1::{ActionStatus,MAX_APPLY_REPORT_BYTES};
+        fn decode_hex(raw:&str,out:&mut[u8])->usize{
+            fn digit(c:u8)->u8{match c{b'0'..=b'9'=>c-b'0',b'a'..=b'f'=>c-b'a'+10,_=>panic!("bad hex")}}
+            let bytes=raw.as_bytes();assert!(bytes.len()%2==0&&bytes.len()/2<=out.len());
+            for (i,p) in bytes.chunks_exact(2).enumerate(){out[i]=digit(p[0])*16+digit(p[1]);}
+            bytes.len()/2
+        }
+        let source=include_str!("../../../../tools/v0199-apply-wire-vectors.tsv");
+        let mut count=0;let mut expected=(1u16,0usize);
+        for line in source.lines().filter(|l|!l.starts_with('#')){
+            let mut cols=line.split('\t');
+            let domain=cols.next().unwrap().parse::<u16>().unwrap();
+            let tier=cols.next().unwrap().parse::<usize>().unwrap();
+            assert_eq!((domain,tier),expected);
+            let mut work=[0u8;MAX_BYTES];let mut report=[0u8;MAX_APPLY_REPORT_BYTES];
+            let wn=decode_hex(cols.next().unwrap(),&mut work);
+            let rn=decode_hex(cols.next().unwrap(),&mut report);
+            assert!(cols.next().is_none());
+            let w=ApplyWorkV1::decode(&work[..wn]).unwrap();
+            let r=ApplyReportV1::decode(&report[..rn]).unwrap();
+            assert_eq!((w.key.boot_epoch,w.key.controller_epoch,w.key.plan_seq),(1,2,3));
+            assert_eq!((w.domain,w.action_index as usize),(domain,tier));
+            assert_eq!(w.target,Identity{id:17,generation:5});
+            assert_eq!((w.executor_generation,w.plan_version),(6,7));
+            assert_eq!(ActionV2::decode(domain,1,w.payload),Ok(ActionV2::values(domain).unwrap()[tier]));
+            assert_eq!((r.state,r.result,r.completed_ns),(ActionStatus::Applied,0,1000));
+            assert!(w.matches_report(r));
+            let mut encoded=[0xff;MAX_APPLY_REPORT_BYTES];
+            assert_eq!(r.encode(&mut encoded),Ok(rn));assert_eq!(&encoded[..rn],&report[..rn]);
+            for i in [38usize,76]{
+                let mut bad=work;bad[i]=1;
+                assert!(ApplyWorkV1::decode(&bad[..wn]).is_err());
+            }
+            for i in [30usize,80]{
+                let mut bad=report;bad[i]=1;
+                assert!(ApplyReportV1::decode(&bad[..rn]).is_err());
+            }
+            count+=1;expected.1+=1;
+            if expected.1==ActionV2::values(domain).unwrap().len(){expected=(domain+1,0);}
+        }
+        assert_eq!((count,expected),(58,(16,0)));
+    }
+    #[test]
     fn work_and_report_bind_exact_identity_and_action(){
         let mut b=[0u8;82];
         put32(&mut b,0,0x43594157);put16(&mut b,4,1);put16(&mut b,6,80);
