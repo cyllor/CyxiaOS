@@ -11,7 +11,7 @@ const HOLD:u64=100_000_000;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct Batch{serial:u64,version:u64,limit:u8}
 #[derive(Clone,Copy)]
-struct Active{key:Batch,delivered:u8,inflight:Option<(u64,ReceiveTicket)>}
+struct Active{key:Batch,delivered:u8,inflight:Option<(u64,ReceiveTicket,u64)>}
 #[derive(Clone,Copy)]
 struct Work{key:PlanKey,index:u16,version:u64,budget:u16,batch:u8,until:u64,
     accepted:u64,effect:Option<(ActionStatus,u64)>}
@@ -105,10 +105,12 @@ impl Owner{
         reserve_credit:impl FnOnce()->Result<(),RpcError>)->Result<ReceiveTicket,Error>{
         self.ready(now)?;let a=self.active(key)?;
         if a.delivered>=key.limit&&a.inflight.is_none(){return Err(Error::Busy);}
-        if let Some((old,_))=a.inflight{if old!=seq{return Err(Error::Busy);}}
+        if let Some((old,_,_))=a.inflight{if old!=seq{return Err(Error::Busy);}}
+        else if key.version!=0&&now>=self.until{return Err(Error::Expired);}
         authorize()?;
         let t=self.queue.reserve_receive(receiver,self.target.generation,seq,FRAME_BYTES,true,0,now,reserve_credit).map_err(rpc)?;
-        self.active.as_mut().unwrap().inflight=Some((seq,t));self.last=now;Ok(t)
+        let reserved=a.inflight.map_or(now,|(_,_,ns)|ns);
+        self.active.as_mut().unwrap().inflight=Some((seq,t,reserved));self.last=now;Ok(t)
     }
     /// A real successful copyout consumes exactly one queue head. Recopy
     /// of a DONE ticket is not a second delivery or effect. A fault does
@@ -117,14 +119,15 @@ impl Owner{
         verify_copy:impl FnOnce(&Message)->Result<(),Error>)->Result<usize,Error>{
         self.ready(now)?;
         let a=self.active(key)?;
-        if !a.inflight.is_some_and(|(_,old)|old==t){return Err(Error::Stale);}
+        let (_,old,reserved)=a.inflight.ok_or(Error::Stale)?;
+        if old!=t{return Err(Error::Stale);}
         verify_copy(t.message())?;
         let before=self.pending();let bytes=self.queue.finish_copy(t,true).map_err(rpc)?;
         if self.pending()<before{
             let a=self.active.as_mut().unwrap();a.delivered+=1;
             assert!(a.delivered<=key.limit);
             if let Some(w)=self.work.as_mut(){
-                if w.effect.is_none()&&key.version==w.version&&now>=w.accepted&&now<w.until{
+                if w.effect.is_none()&&key.version==w.version&&reserved>=w.accepted&&reserved<w.until{
                     w.effect=Some((ActionStatus::Applied,now));
                 }
             }
@@ -135,7 +138,7 @@ impl Owner{
         authorize:impl FnOnce()->Result<(),Error>,
         release_credit:impl FnOnce()->Result<(),RpcError>)->Result<(),Error>{
         self.ready(now)?;let a=self.active(key)?;authorize()?;
-        if a.inflight.is_some_and(|(old,_)|old!=seq){return Err(Error::Stale);}
+        if a.inflight.is_some_and(|(old,_,_)|old!=seq){return Err(Error::Stale);}
         self.queue.ack(receiver,self.target.generation,seq,release_credit).map_err(rpc)?;
         self.active.as_mut().unwrap().inflight=None;self.last=now;Ok(())
     }
@@ -145,6 +148,12 @@ impl Owner{
         self.active=None;self.last=now;Ok(a.delivered)
     }
     pub fn fence(&mut self){self.fenced=true;self.queue.fence();}
+    pub fn recover_idle_batch(&mut self,verify_stopped:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if !self.fenced{return Err(Error::Busy);}
+        let a=self.active.ok_or(Error::Stale)?;
+        if a.inflight.is_some(){return Err(Error::Busy);}
+        verify_stopped()?;self.active=None;Ok(())
+    }
     pub fn recover_receive(&mut self,verify:impl FnOnce(ReceiveTicket,bool)->Result<(),RpcError>)->Result<(),Error>{
         self.queue.recover_receive(verify).map_err(rpc)?;
         if let Some(a)=self.active.as_mut(){a.inflight=None;}
