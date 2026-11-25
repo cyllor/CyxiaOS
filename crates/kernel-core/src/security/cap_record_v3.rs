@@ -108,11 +108,15 @@ impl Label{
 struct Entry{label:Label,record:CapRecordV3}
 /// Preallocated table. Retired records are tombstones until boot ends;
 /// no slot reuse or old-generation handle resurrection.
-pub struct StaticControlCaps<const N:usize>{boot:u64,rows:[Option<Entry>;N]}
+pub struct StaticControlCaps<const N:usize>{
+    boot:u64,rows:[Option<Entry>;N],
+    // Fixed role identities, independent of whether a root was ever issued.
+    fenced:[Option<Identity>;rm::ROLE_COUNT],
+}
 impl<const N:usize> StaticControlCaps<N>{
     pub fn new(epochs:&DurableEpochGate,config:&VerifiedOfflineConfig<'_>)->Result<Self,Error>{
         let boot=epochs.confirmed_config_boot(config)?;
-        Ok(Self{boot,rows:[None;N]})
+        Ok(Self{boot,rows:[None;N],fenced:[None;rm::ROLE_COUNT]})
     }
     fn issue_checked(&mut self,manifest:&NativeRoleManifest,label:Label,r:CapRecordV3,
         verify_catalog_and_object:impl FnOnce(Label,&CapRecordV3)->Result<(),Error>)->Result<u64,Error>{
@@ -120,6 +124,7 @@ impl<const N:usize> StaticControlCaps<N>{
         if !r.valid()||!r.target.valid()||r.state!=1||r.depth!=0||r.object_kind!=kind||r.rights!=rights
             ||r.source_role!=u32::from(role.id())||r.owner_group!=u32::MAX
             ||r.record_generation!=1
+            ||self.fenced.iter().flatten().any(|a|a.id==r.holder.id&&a.generation>=r.holder.generation)
             ||self.rows.iter().flatten().any(|e|e.record.cap_id==r.cap_id
                 // A fenced or retired holder generation may never gain
                 // a new root, even under a previously unused cap_id.
@@ -157,6 +162,23 @@ impl<const N:usize> StaticControlCaps<N>{
         if holder!=r.holder||handle>>32!=r.record_generation||r.state!=1||target!=r.target{return Err(Error::Stale);}
         if entry.label!=label{return Err(Error::Unauthorized);}
         verify_live(&r)?;Ok(r)
+    }
+    /// Fence the authenticated manifest holder even before its first root
+    /// issuance. No authority derives from an untrusted numeric role ID.
+    pub fn fence_registered(&mut self,manifest:&NativeRoleManifest,holder:Identity,
+        verify_close:impl FnOnce(Identity)->Result<(),Error>)->Result<(),Error>{
+        manifest.validate().map_err(|_|Error::Unauthorized)?;
+        let i=manifest.members.iter().position(|m|m.actor==holder).ok_or(Error::Stale)?;
+        if self.fenced[i].is_some_and(|old|old.id!=holder.id||old.generation>holder.generation){
+            return Err(Error::Stale);
+        }
+        if self.fenced[i]==Some(holder){return Ok(());}
+        verify_close(holder)?;
+        self.fenced[i]=Some(holder);
+        for e in self.rows.iter_mut().flatten(){if e.record.holder==holder&&e.record.state==1{
+            e.record.state=2;
+        }}
+        Ok(())
     }
     /// Seal new use before stopping/draining the role. Retirement requires
     /// independent native reference/DMA/IPC/accepted-work evidence.
@@ -198,13 +220,26 @@ mod tests{
             state:1,depth:0,source_role:8,owner_group:u32::MAX,record_generation:1}
     }
     #[test]
+    fn preissuance_fence_survives_empty_cap_table(){
+        let m=manifest();let r=publisher();
+        let mut table=StaticControlCaps::<2>{boot:1,rows:[None;2],fenced:[None;rm::ROLE_COUNT]};
+        assert_eq!(table.fence_registered(&m,r.holder,|_|Err(Error::Unknown)),Err(Error::Unknown));
+        table.fence_registered(&m,r.holder,|a|{assert_eq!(a,r.holder);Ok(())}).unwrap();
+        table.fence_registered(&m,r.holder,|_|panic!()).unwrap();
+        assert_eq!(table.issue_checked(&m,Label::Publish,r,|_,_|panic!()),Err(Error::Unauthorized));
+        let mut next=m;next.members[3].actor.generation=2;
+        let replacement=CapRecordV3{holder:next.members[3].actor,..r};
+        table.issue_checked(&next,Label::Publish,replacement,|_,_|Ok(())).unwrap();
+        assert_eq!(table.issue_checked(&m,Label::Publish,CapRecordV3{cap_id:18,..r},|_,_|panic!()),Err(Error::Unauthorized));
+    }
+    #[test]
     fn record_type_rights_and_exact_holder_cap_lookup(){
         let m=manifest();let r=publisher();let b=r.encode().unwrap();assert_eq!(CapRecordV3::decode(&b),Ok(r));
         let mut bad=b;bad[104]=1;assert_eq!(CapRecordV3::decode(&bad),Err(Error::Invalid));
         assert!(CapRecordV3{rights:PLAN_PUBLISH|SNAPSHOT_READ,..r}.encode().is_err());
         // Private helper exercises the table only; no test signature or
         // durable generation is issued as a real production credential.
-        let mut table=StaticControlCaps::<2>{boot:1,rows:[None;2]};
+        let mut table=StaticControlCaps::<2>{boot:1,rows:[None;2],fenced:[None;rm::ROLE_COUNT]};
         let wrong=CapRecordV3{holder:m.members[0].actor,source_role:6,..r};
         assert_eq!(table.issue_checked(&m,Label::Publish,wrong,|_,_|panic!()),Err(Error::Unauthorized));
         let h=table.issue_checked(&m,Label::Publish,r,|_,_|Ok(())).unwrap();
