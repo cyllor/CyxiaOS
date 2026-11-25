@@ -23,6 +23,8 @@ pub enum Change{
     AllocateBoot,
     Restart(StopEvidence),
     Isolate(StopEvidence),
+    /// Only prepare_offline_install may admit this signed transition.
+    InstallConfig{generation:u64,digest:[u8;32]},
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct PreparedEpoch{
@@ -40,7 +42,7 @@ pub struct CommitEvidence{
     pub after_digest:[u8;32],
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub enum Outcome{Boot{epoch:u64},Service{role:Role,generation:u64,isolated:bool}}
+pub enum Outcome{Boot{epoch:u64},Service{role:Role,generation:u64,isolated:bool},ConfigInstalled{generation:u64}}
 #[derive(Clone,Copy)]
 struct Pending{ticket:PreparedEpoch,after:SecurityStateStoreV2,outcome:Outcome}
 /// No public method turns a prepared or UNKNOWN update into a boot/service
@@ -123,6 +125,10 @@ impl DurableEpochGate{
     pub fn prepare(&mut self,change:Change,
         verify_stop:impl FnOnce(StopEvidence)->Result<(),Error>)->Result<PreparedEpoch,Error>
     {
+        // No generic runtime call may install offline configuration,
+        // and the old mount must be revalidated after such a commit.
+        if matches!(change,Change::InstallConfig{..}){return Err(Error::Unauthorized);}
+        if self.last.is_some_and(|(_,_,o)|matches!(o,Outcome::ConfigInstalled{..})){return Err(Error::Busy);}
         if let Some(p)=self.pending{
             return if p.ticket.change==change{Ok(p.ticket)}else{Err(Error::Busy)};
         }
@@ -136,6 +142,7 @@ impl DurableEpochGate{
                 after.last_boot_epoch=after.last_boot_epoch.checked_add(1).ok_or(Error::Exhausted)?;
                 Outcome::Boot{epoch:after.last_boot_epoch}
             }
+            Change::InstallConfig{..}=>return Err(Error::Unauthorized),
             Change::Restart(stop)|Change::Isolate(stop)=>{
                 if !self.boot_confirmed||stop.generation==0||stop.digest==[0;32]{
                     return Err(Error::Unauthorized);
@@ -160,6 +167,53 @@ impl DurableEpochGate{
             new_state_generation:after.state_generation,target_boot_epoch:after.last_boot_epoch,
             after_digest:hash(&raw)};
         self.pending=Some(Pending{ticket,after,outcome});
+        Ok(ticket)
+    }
+    /// Offline startup only. The caller must supply the actual verified
+    /// signed envelope and independently attest the full stopped/quiescent
+    /// old registry, signed service whitelist, principal/ACL compatibility,
+    /// current rules and each explicitly authorized clearance. No online
+    /// SVC, AI or higher generation alone authorizes an isolation clear.
+    /// This restricted state-block transition does not migrate ACLs,
+    /// change the media format or publish any cap; a successful commit
+    /// requires fresh complete signed-volume validation before boot.
+    pub fn prepare_offline_install(&mut self,config:&super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        clear:u64,service_generations:[u64;16],
+        verify_quiesced:impl FnOnce(&super::offline_config_v1::VerifiedOfflineConfig<'_>,
+            &SecurityStateStoreV2,&SecurityStateStoreV2)->Result<(),Error>,
+    )->Result<PreparedEpoch,Error>{
+        if !self.paired_store||self.boot_confirmed||self.paired_confirmed{return Err(Error::Unauthorized);}
+        if self.last.is_some_and(|(_,_,o)|matches!(o,Outcome::ConfigInstalled{..})){return Err(Error::Busy);}
+        let h=config.header();let old=self.committed;
+        if h.fs_uuid!=old.fs_uuid||h.generation<=old.offline_config_generation
+            ||h.rule_generation<old.rule_min_generation||h.security_generation<old.security_min_generation
+            ||h.key_generation<old.key_generation{return Err(Error::Stale);}
+        if clear&!h.clear_isolation_bitmap!=0||clear&!old.isolated_service_bitmap!=0{return Err(Error::Unauthorized);}
+        for(i,(&before,&after))in old.service_generations.iter().zip(&service_generations).enumerate(){
+            if after<before||after!=before&&before.checked_add(1)!=Some(after)
+                ||clear&(1u64<<i)!=0&&(after==0||before.checked_add(1)!=Some(after)){
+                return Err(Error::Conflict);
+            }
+        }
+        let mut after=old;
+        after.state_generation=old.state_generation.checked_add(1).ok_or(Error::Exhausted)?;
+        after.offline_config_generation=h.generation;after.offline_config_hash=config.digest();
+        after.rule_min_generation=h.rule_generation;after.security_min_generation=h.security_generation;
+        after.key_generation=h.key_generation;after.isolated_service_bitmap&=!clear;
+        after.service_generations=service_generations;
+        // The only monotonic exception is the explicitly signed clear.
+        let mut conservative=after;conservative.isolated_service_bitmap|=clear;
+        if !conservative.no_rollback_from(&old){return Err(Error::Conflict);}
+        let ticket=PreparedEpoch{change:Change::InstallConfig{generation:h.generation,digest:config.digest()},
+            fs_uuid:old.fs_uuid,old_state_generation:old.state_generation,new_state_generation:after.state_generation,
+            target_boot_epoch:old.last_boot_epoch,after_digest:hash(&after.encode()?)};
+        if let Some(p)=self.pending{
+            return if p.ticket==ticket&&p.after==after{Ok(ticket)}
+                else if p.ticket.change==ticket.change{Err(Error::Conflict)}else{Err(Error::Busy)};
+        }
+        verify_quiesced(config,&old,&after)?;
+        self.startup_verified=false;
+        self.pending=Some(Pending{ticket,after,outcome:Outcome::ConfigInstalled{generation:h.generation}});
         Ok(ticket)
     }
     pub fn after_image(&self,ticket:PreparedEpoch)->Result<[u8;BLOCK_BYTES],Error>{
@@ -188,7 +242,8 @@ impl DurableEpochGate{
         }
         verify_state_redo_v1(superblock,first_log_block,state_home,begin,redos,commit,
             readback,receipt.txid,receipt.commit_lsn)?;
-        self.confirm(ticket,receipt,readback,verify_native)
+        if matches!(ticket.change,Change::InstallConfig{..})&&redos.len()!=1{return Err(Error::Conflict);}
+        self.confirm_inner(ticket,receipt,readback,false,true,verify_native)
     }
     /// Atomic startup proof: both exact state and BootEpochStore images
     /// appear in the same complete committed transaction, and actual native
@@ -206,7 +261,7 @@ impl DurableEpochGate{
         let state=super::boot_epoch_v1::verify_boot_pair(sb,first_log_block,state_home,boot_home,
             begin,redos,commit,readback,boot_readback,receipt.txid,receipt.commit_lsn)?;
         if state.last_boot_epoch!=ticket.target_boot_epoch{return Err(Error::Conflict);}
-        let outcome=self.confirm_inner(ticket,receipt,readback,true,|t,r|verify_native(t,r,boot_readback))?;
+        let outcome=self.confirm_inner(ticket,receipt,readback,true,true,|t,r|verify_native(t,r,boot_readback))?;
         self.paired_confirmed=true;Ok(outcome)
     }
 
@@ -220,12 +275,13 @@ impl DurableEpochGate{
         verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
         ->Result<Outcome,Error>
     {
-        self.confirm_inner(ticket,receipt,readback,false,verify_commit)
+        self.confirm_inner(ticket,receipt,readback,false,false,verify_commit)
     }
     fn confirm_inner(&mut self,ticket:PreparedEpoch,receipt:CommitEvidence,readback:&[u8],
-        paired:bool,verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
+        paired:bool,redo_verified:bool,verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
         ->Result<Outcome,Error>{
         if self.paired_store&&ticket.change==Change::AllocateBoot&&!paired{return Err(Error::Unauthorized);}
+        if matches!(ticket.change,Change::InstallConfig{..})&&!redo_verified{return Err(Error::Unauthorized);}
         // The prior receipt is historical, not current startup authority.
         // Never return its successful outcome while a newer transaction
         // fences boot/service generation reads (even if bytes still match).
