@@ -33,14 +33,28 @@ pub struct Commit{
     pub view:View,pub request_hash:[u8;32],
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub enum Phase{Frozen,PreparingUnknown,Prepared,Unknown,RestoredFrozen,Open}
+pub enum Phase{Frozen,PreparingUnknown,Prepared,Unknown,RestoredFrozen,ReopeningUnknown,Open}
+/// Internal recovery projection of the complete authenticated journal and
+/// protection state, not an on-disk format or proof supplied by an EL0 actor.
+/// Prepared requires positive proof that no commit was issued. When that
+/// is not provable, recover Unknown instead. No variant opens writes.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum Recovered{
+    Frozen,
+    PreparingUnknown(Prepared),
+    PreparedNotSubmitted(Prepared),
+    CommitUnknown(Prepared),
+    RestoredFrozen(Prepared,Commit),
+    ReopeningUnknown(Prepared,Commit),
+}
 pub struct RestoreGate{
     recovery:Identity,reopen:Identity,view:View,phase:Phase,
     pending:Option<Prepared>,last:Option<(Prepared,Commit)>,
 }
 impl RestoreGate{
     /// Actual native file owner must already have closed new write
-    /// admission and proved the durable freeze/protection generation.
+    /// admission and proved the durable freeze/protection generation AND
+    /// absence of any previous pending or committed restore obligation.
     pub fn from_frozen(view:View,recovery:Identity,reopen:Identity,
         verify_durable_freeze:impl FnOnce(View)->Result<(),Error>)->Result<Self,Error>{
         // Independent reopen authority must not be the same registered
@@ -48,6 +62,59 @@ impl RestoreGate{
         if !view.valid()||!recovery.valid()||!reopen.valid()||recovery.id==reopen.id{return Err(Error::Invalid);}
         verify_durable_freeze(view)?;
         Ok(Self{recovery,reopen,view,phase:Phase::Frozen,pending:None,last:None})
+    }
+    /// Reconstruct exactly one retained restore obligation from a complete
+    /// native recovery scan. On a reboot, even a previously opened volume
+    /// is closed until the independent current protection owner verifies
+    /// the new boot's authority. This restricted candidate rejects any
+    /// concurrent system-state change; G1 must define a proven merge.
+    pub fn recover_frozen(view:View,recovery:Identity,reopen:Identity,state:Recovered,
+        index:&[u8],security:&[u8],
+        verify_complete_history:impl FnOnce(View,Recovered)->Result<(),Error>,
+    )->Result<Self,Error>{
+        if !view.valid()||!recovery.valid()||!reopen.valid()||recovery.id==reopen.id{
+            return Err(Error::Invalid);
+        }
+        validate_snapshot_restore_system_projection(view.fs_uuid,index,security,index,security)?;
+        let (phase,pending,last)=match state{
+            Recovered::Frozen=>(Phase::Frozen,None,None),
+            Recovered::PreparingUnknown(p)|Recovered::PreparedNotSubmitted(p)|Recovered::CommitUnknown(p)=>{
+                if p.prior!=view{return Err(Error::Conflict);}
+                Self::check_prepared(p,index,security)?;
+                (match state{Recovered::PreparingUnknown(_)=>Phase::PreparingUnknown,
+                    Recovered::PreparedNotSubmitted(_)=>Phase::Prepared,_=>Phase::Unknown},Some(p),None)
+            }
+            Recovered::RestoredFrozen(p,c)|Recovered::ReopeningUnknown(p,c)=>{
+                Self::check_prepared(p,index,security)?;
+                Self::check_commit(p,c)?;
+                if c.view!=view{return Err(Error::Conflict);}
+                (if matches!(state,Recovered::ReopeningUnknown(..)){Phase::ReopeningUnknown}
+                    else{Phase::RestoredFrozen},None,Some((p,c)))
+            }
+        };
+        // The verifier must establish the entire current durable history,
+        // exact retained keys, current root, closed write gate and native
+        // ownership. A bare projection is never sufficient.
+        verify_complete_history(view,state)?;
+        Ok(Self{recovery,reopen,view,phase,pending,last})
+    }
+    fn check_prepared(p:Prepared,index:&[u8],security:&[u8])->Result<(),Error>{
+        if !p.prior.valid()||!p.key.principal.valid()||p.key.request_seq==0
+            ||p.snapshot.fs_uuid!=p.prior.fs_uuid||p.snapshot.snapshot_id==0
+            ||p.snapshot.generation==0||p.snapshot.root_hash==[0;32]||p.request_hash==[0;32]
+            ||p.prior.live_epoch.checked_add(1)!=Some(p.next_live_epoch)
+            ||hash(index)!=p.system_index_hash||hash(security)!=p.security_hash{
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    fn check_commit(p:Prepared,c:Commit)->Result<(),Error>{
+        let v=c.view;
+        if c.key!=p.key||c.request_hash!=p.request_hash||c.txid==0||c.log_epoch==0
+            ||c.commit_lsn==0||!v.valid()||v.fs_uuid!=p.prior.fs_uuid||v.live_epoch!=p.next_live_epoch
+            ||v.root_hash!=p.snapshot.root_hash||v.protection_generation<p.prior.protection_generation
+            ||v.retention_watermark<p.prior.retention_watermark{return Err(Error::Conflict);}
+        Ok(())
     }
     pub fn phase(&self)->Phase{self.phase}
     pub fn view(&self)->View{self.view}
@@ -117,17 +184,10 @@ impl RestoreGate{
         }
         if self.phase!=Phase::Unknown||self.pending!=Some(ticket){return Err(Error::Busy);}
         let v=commit.view;
-        if commit.key!=ticket.key||commit.request_hash!=ticket.request_hash||commit.txid==0||commit.log_epoch==0
-            ||commit.commit_lsn==0||!v.valid()||v.fs_uuid!=ticket.prior.fs_uuid||v.live_epoch!=ticket.next_live_epoch
-            ||v.root_hash!=ticket.snapshot.root_hash||v.protection_generation<ticket.prior.protection_generation
-            ||v.retention_watermark<ticket.prior.retention_watermark{
-            return Err(Error::Conflict);
-        }
+        Self::check_prepared(ticket,current_index,current_security)?;
+        Self::check_commit(ticket,commit)?;
         // This restricted candidate rejects concurrent system-state
         // changes. G1 may later define a proven merge, never rollback.
-        if hash(current_index)!=ticket.system_index_hash||hash(current_security)!=ticket.security_hash{
-            return Err(Error::Conflict);
-        }
         validate_snapshot_restore_system_projection(v.fs_uuid,current_index,current_security,projected_index,projected_security)?;
         verify_commit(&ticket,&commit)?;
         self.view=v;self.last=Some((ticket,commit));self.pending=None;
@@ -140,7 +200,19 @@ impl RestoreGate{
         if actor!=self.reopen{return Err(Error::Unauthorized);}
         if self.phase!=Phase::RestoredFrozen||expected!=self.view||self.pending.is_some(){return Err(Error::Busy);}
         let (_,c)=self.last.ok_or(Error::Unknown)?;
+        // A durable open transition may have completed despite a lost
+        // response. Keep the software write gate closed; never repeat the
+        // side-effecting writer until an independent read-only proof.
+        self.phase=Phase::ReopeningUnknown;
         verify_open(expected,c)?;
+        self.phase=Phase::Open;Ok(())
+    }
+    pub fn reconcile_reopen(&mut self,actor:Identity,expected:View,
+        verify_current_open:impl FnOnce(View,Commit)->Result<(),Error>)->Result<(),Error>{
+        if actor!=self.reopen{return Err(Error::Unauthorized);}
+        if self.phase!=Phase::ReopeningUnknown||expected!=self.view||self.pending.is_some(){return Err(Error::Busy);}
+        let (_,c)=self.last.ok_or(Error::Unknown)?;
+        verify_current_open(expected,c)?;
         self.phase=Phase::Open;Ok(())
     }
 }
