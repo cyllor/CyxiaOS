@@ -22,10 +22,10 @@ pub struct DomainObservation{pub target:Target,pub fields:[Option<u64>;4]}
 // Same-ID replacement can reuse the slot, never the old generation.
 struct Row{target:Target,snapshot:Option<SnapshotReplyV3>,active:bool}
 pub struct SnapshotStore{
-    boot:u64,sequence:u64,last_sample_ns:u64,targets:[Option<Row>;TARGETS],grants:[Option<ViewGrant>;VIEWS],
+    boot:u64,sequence:u64,last_sample_ns:u64,last_ledger:u64,last_cores:u64,targets:[Option<Row>;TARGETS],grants:[Option<ViewGrant>;VIEWS],
 }
 impl SnapshotStore{
-    pub const fn empty()->Self{Self{boot:0,sequence:0,last_sample_ns:0,targets:[None;TARGETS],grants:[None;VIEWS]}}
+    pub const fn empty()->Self{Self{boot:0,sequence:0,last_sample_ns:0,last_ledger:0,last_cores:0,targets:[None;TARGETS],grants:[None;VIEWS]}}
     pub fn new(boot:u64)->Result<Self,Error>{
         let mut out=Self::empty();out.bind_boot(boot,||Ok(()))?;Ok(out)
     }
@@ -73,10 +73,13 @@ impl SnapshotStore{
         common:[Option<u64>;8],observations:&[DomainObservation],
         mut verify_source:impl FnMut(&DomainObservation)->Result<(),Error>)->Result<u64,Error>{
         if self.boot==0{return Err(Error::NotReady);}
-        if ledger==0||cores==0||sampled_ns<self.last_sample_ns||observations.is_empty()
+        if ledger==0||cores==0||sampled_ns==0||sampled_ns<self.last_sample_ns||observations.is_empty()
             ||observations.len()>TARGETS||common[6].is_some()||common[7].is_some(){
             return Err(Error::Invalid);
         }
+        // Ledger/core generations are native monotonic identities, not
+        // merely tags for a caller to reuse after a resource replacement.
+        if ledger<self.last_ledger||cores<self.last_cores{return Err(Error::Stale);}
         let seq=self.sequence.checked_add(1).ok_or(Error::Exhausted)?;
         // Complete preflight before altering any prior snapshot; no
         // per-target partial new sequence on owner or bounds error.
@@ -102,7 +105,7 @@ impl SnapshotStore{
             self.targets.iter_mut().flatten().find(|r|r.active&&r.target==o.target)
                 .expect("immutable capture preflight").snapshot=Some(make(o));
         }
-        self.sequence=seq;self.last_sample_ns=sampled_ns;Ok(seq)
+        self.sequence=seq;self.last_sample_ns=sampled_ns;self.last_ledger=ledger;self.last_cores=cores;Ok(seq)
     }
     /// EL1-only owner handoff of exact captured evidence for candidate
     /// registration. Unlike a redacted user read, preserves the original
@@ -165,6 +168,18 @@ mod tests{
                 actor:Identity{id:u64::from(ROLES[i].id()),generation:1},ttbr0_root:0x100000+i as u64*4096,
                 private_rw:PrivateRegion{base:0x200000+i as u64*4096,bytes:4096},caps:ROLES[i].allowed_caps(),
                 control_ns_per_100ms:1,cpu_mask:1,thread_count:1,endpoint_id:10+i as u64})}
+    }
+    #[test]
+    fn resource_generation_regression_does_not_replace_current_batch(){
+        let mut s=SnapshotStore::new(7).unwrap();
+        let target=Target{domain:2,object:Identity{id:2,generation:1},owner:Identity{id:1,generation:1}};
+        s.register_target(target,|_|Ok(())).unwrap();
+        let o=DomainObservation{target,fields:[None,Some(1),None,Some(2)]};
+        assert_eq!(s.capture(2,3,100,[None;8],&[o],|_|Ok(())),Ok(1));
+        assert_eq!(s.capture(1,4,101,[None;8],&[o],|_|panic!()),Err(Error::Stale));
+        assert_eq!(s.capture(3,2,101,[None;8],&[o],|_|panic!()),Err(Error::Stale));
+        assert_eq!(s.frozen_for_owner(target,2,3,101,|_|Ok(())).unwrap().snapshot_seq,1);
+        assert_eq!(s.capture(3,4,102,[None;8],&[o],|_|Ok(())),Ok(2));
     }
     #[test]
     fn native_frozen_snapshot_requires_bound_boot_and_exact_live_owner(){
