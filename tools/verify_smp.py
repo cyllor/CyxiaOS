@@ -61,6 +61,21 @@ def overrun_diagnostic(serial: bytes) -> dict:
         result.update(before_enter_ns=before, after_exit_ns=after,
                       after_dispatch_ns=dispatched, trap_kind=kind,
                       trap_esr=esr, syscall_x8=syscall)
+    recovery = b'V0199_RECOVERY_OVERRUN_PHASE'
+    if recovery in serial:
+        phase, checkpoint, charged = row(recovery)
+        stages = {1:"retire_asid",2:"retire_tables",3:"unseal_break",
+                  4:"unseal_make",5:"retire_scrub",10:"package_copy",
+                  11:"package_verify",12:"private_stage",13:"stack",
+                  14:"scratch_or_code_sync",15:"seal_break",16:"seal_make",
+                  17:"map_leaves",18:"publish_asid",19:"replacement_inventory"}
+        require(phase in stages and checkpoint > 0 and charged == actual
+                and reserved == 2_000_000 and role in (2,3,6,7,8,9,10,11)
+                and phases not in serial and trap not in serial
+                and serial.index(recovery) < serial.index(b'V0199_BOOTSTRAP_OVERRUN'),
+                'inconsistent recovery overrun checkpoint')
+        result.update(recovery_stage=stages[phase], recovery_checkpoint=checkpoint,
+                      recovery_phase_id=phase)
     return result
 
 
