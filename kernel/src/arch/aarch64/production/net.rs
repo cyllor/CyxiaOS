@@ -241,7 +241,12 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
         Ok(dev) => dev,
         Err(error) => {
             super::super::super::log(b"V020_W11_NET_ABSENT device=0 tcp_echo=0\n");
-            report("V020_W11_NET_INIT_ERROR", error as u64, info.virtio_count as u64, 0);
+            report(
+                "V020_W11_NET_INIT_ERROR",
+                error as u64,
+                info.virtio_count as u64,
+                0,
+            );
             return NetOutcome::default();
         }
     };
@@ -288,7 +293,12 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
         leases: sec_n_broker::inferred_leases(),
         relayed_bytes: sec_n_broker::relayed_bytes(),
     };
-    report("V020_W11_NET_RELAY", dispatched, outcome.leases, outcome.relayed_bytes);
+    report(
+        "V020_W11_NET_RELAY",
+        dispatched,
+        outcome.leases,
+        outcome.relayed_bytes,
+    );
     outcome
 }
 

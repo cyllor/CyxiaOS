@@ -47,8 +47,8 @@
 //! * SMP_EVIDENCE shared reference: a static of AtomicU64; atomic interior
 //!   mutability, completion seal stored last with Release.
 use super::sec_n_broker::{
-    self, FRAME_CAP, GUEST_ELF, IMAGE_BASE_VA, LOCAL_NODE, OP_CLOSE, OP_ENTROPY, OP_POLL,
-    OP_WRITE, OP_YIELD, op_count, reset_guest_data, run_until_park,
+    self, FRAME_CAP, GUEST_ELF, IMAGE_BASE_VA, LOCAL_NODE, OP_CLOSE, OP_ENTROPY, OP_POLL, OP_WRITE,
+    OP_YIELD, op_count, reset_guest_data, run_until_park,
 };
 use super::*;
 use cyxia_net_transport::device::{self, Port};
@@ -132,7 +132,10 @@ pub(super) fn run(info: &BootInfo) -> ! {
     stage([0u8; 32], true, 1); // wrong local node, valid page identity.
     sec_n_broker::set_stall_after_poll(0);
     let d1 = run_until_park(&layout, &mut port, 4096);
-    assert!(sec_n_broker::close_seen(), "identity mismatch must park (CLOSE)");
+    assert!(
+        sec_n_broker::close_seen(),
+        "identity mismatch must park (CLOSE)"
+    );
     assert_eq!(
         op_count(OP_POLL),
         0,
@@ -158,7 +161,10 @@ pub(super) fn run(info: &BootInfo) -> ! {
     stage(LOCAL_NODE, true, 1);
     sec_n_broker::set_stall_after_poll(0);
     let d2 = run_until_park(&layout, &mut port, 200_000);
-    assert!(sec_n_broker::close_seen(), "budget exhaustion must park (CLOSE)");
+    assert!(
+        sec_n_broker::close_seen(),
+        "budget exhaustion must park (CLOSE)"
+    );
     assert!(
         op_count(OP_POLL) >= 8192,
         "handshake must spend the bounded turn budget"
@@ -187,7 +193,10 @@ pub(super) fn run(info: &BootInfo) -> ! {
     stage(LOCAL_NODE, true, 1);
     sec_n_broker::set_stall_after_poll(200);
     let d3 = run_until_park(&layout, &mut port, 200_000);
-    assert!(sec_n_broker::close_seen(), "stale generation must park (CLOSE)");
+    assert!(
+        sec_n_broker::close_seen(),
+        "stale generation must park (CLOSE)"
+    );
     assert!(
         op_count(OP_POLL) < 8192,
         "stale generation must abort before the budget"

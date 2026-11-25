@@ -14,6 +14,7 @@
 //!   commit_lsn=4, paired BEGIN/REDO/COMMIT append with ordered FLUSH and
 //!   independent device readback, `confirm_boot_from_redo`.
 //! * Step 7: a second allocation in the same boot must be `Conflict`.
+//!
 //! The epoch is durable only on this throw-away scratch image; it is evidence
 //! that the path runs, not a production persistence claim.
 //!
@@ -151,7 +152,7 @@ pub(super) fn admission_flow(boot_epoch: u64) -> Result<(), SecurityError> {
     let mut issuer = AuthContextIssuerV1::new(boot_epoch)?;
     let mut ledger = AdmissionLedgerV1::new(boot_epoch)?;
     let forged = user_frame(0xdead_beef);
-    if run_admission_flow(&mut issuer, &mut ledger, &input(&forged)).is_ok() || ledger.len() != 0 {
+    if run_admission_flow(&mut issuer, &mut ledger, &input(&forged)).is_ok() || !ledger.is_empty() {
         return Err(SecurityError::Conflict);
     }
     let mut issuer = AuthContextIssuerV1::new(boot_epoch)?;

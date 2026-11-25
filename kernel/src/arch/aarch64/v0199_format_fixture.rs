@@ -129,7 +129,8 @@ impl EpochBlockIo for Disk {
     }
 }
 fn attach(info: &BootInfo) -> Disk {
-    let device = super::scratch_blk::attach(info).expect("one dedicated modern VirtIO FLUSH scratch device");
+    let device =
+        super::scratch_blk::attach(info).expect("one dedicated modern VirtIO FLUSH scratch device");
     Disk {
         device,
         reads: 0,

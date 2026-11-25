@@ -165,7 +165,7 @@ fn le64(b: &[u8], at: usize) -> u64 {
 
 // ---- boot direct-map helpers (mirror v0199_control_bringup) ----
 fn high_leaf(pa: u64) -> *mut u64 {
-    assert!(pa % PAGE as u64 == 0 && pa >= cyxia_platform_virt::RAM_BASE);
+    assert!(pa.is_multiple_of(PAGE as u64) && pa >= cyxia_platform_virt::RAM_BASE);
     let offset = (pa - cyxia_platform_virt::RAM_BASE) / PAGE as u64;
     assert!(offset < cyxia_platform_virt::RAM_MIB * 1024 * 1024 / PAGE as u64);
     unsafe {
@@ -271,7 +271,7 @@ pub(crate) fn load_guest() -> Layout {
         let va = le64(b, at + 16);
         let mem = le64(b, at + 40);
         let flags = le32(b, at + 4);
-        assert!(va >= IMAGE_BASE_VA && va % PAGE as u64 == 0 && mem > 0);
+        assert!(va >= IMAGE_BASE_VA && va.is_multiple_of(PAGE as u64) && mem > 0);
         let end = va.checked_add(mem).unwrap();
         max_end = max_end.max(end);
         let first = ((va - IMAGE_BASE_VA) / PAGE as u64) as usize;

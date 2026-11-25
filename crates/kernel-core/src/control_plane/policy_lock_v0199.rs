@@ -551,7 +551,10 @@ mod tests {
         let mut m = CriticalSectionMeter::new();
         m.begin(SectionKind::EffectiveWork, 0).unwrap();
         m.end(WORK_BUDGET_NS + 1).unwrap();
-        assert_eq!(m.begin(SectionKind::EffectiveWork, 99_999), Err(Error::Denied));
+        assert_eq!(
+            m.begin(SectionKind::EffectiveWork, 99_999),
+            Err(Error::Denied)
+        );
     }
 
     #[test]
