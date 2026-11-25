@@ -107,6 +107,7 @@ pub mod trial_permit_v1;
 pub mod d15_owner_v0199;
 pub mod d07_owner_v0199;
 pub mod d02_owner_v0199;
+pub mod d05_owner_v0199;
 
 pub mod candidate_registry_v0199;
 
