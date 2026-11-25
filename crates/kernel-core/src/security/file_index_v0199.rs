@@ -343,7 +343,23 @@ mod tests {
         let mut gate=RestoreGate::from_frozen(view,owner,reopen,|_|Ok(())).unwrap();
         let key=RestoreKey{principal:Identity{id:9,generation:1},request_seq:7};
         let snap=SnapshotKey{fs_uuid:[1;16],snapshot_id:4,slot:0,generation:1,root_hash:[8;32]};
-        let p=gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|Ok(())).unwrap();
+        // The preparation write may already be durable even though
+        // its response was lost. No second writer or different request.
+        assert!(matches!(RestoreGate::from_frozen(view,owner,
+            Identity{id:owner.id,generation:owner.generation+1},|_|panic!()),Err(Error::Invalid)));
+        assert_eq!(gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|Err(Error::Unknown)),Err(Error::Unknown));
+        assert_eq!(gate.phase(),Phase::PreparingUnknown);
+        assert!(!gate.may_write(view.live_epoch,view.protection_generation));
+        assert_eq!(gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|panic!()),Err(Error::Unknown));
+        assert_eq!(gate.prepare(owner,key,snap,[8;32],&idx,&sec,|_|panic!()),Err(Error::Conflict));
+        assert_eq!(gate.prepare(owner,RestoreKey{request_seq:8,..key},snap,[7;32],&idx,&sec,|_|panic!()),Err(Error::Busy));
+        assert_eq!(gate.reconcile_prepare(reopen,key,[7;32],|_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(gate.reconcile_prepare(owner,key,[7;32],|_|Err(Error::Unknown)),Err(Error::Unknown));
+        let p=gate.reconcile_prepare(owner,key,[7;32],|p|{
+            assert_eq!(p.snapshot,snap);assert_eq!(p.prior,view);Ok(())
+        }).unwrap();
+        assert_eq!(gate.phase(),Phase::Prepared);
+        assert_eq!(gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|panic!()),Ok(p));
         assert_eq!(gate.prepare(owner,key,snap,[7;32],&idx,&sec,|_|panic!()),Ok(p));
         assert_eq!(gate.submit(owner,p,||Err(Error::Unknown)),Err(Error::Unknown));
         assert_eq!(gate.phase(),Phase::Unknown);
