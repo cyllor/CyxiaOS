@@ -607,6 +607,30 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("media-staging", line)
         self.assertNotIn("prototype-memory", line)
 
+    def test_v020_wave11_verifier_lanes_pinned(self):
+        # Wave 11 (T7): the G-A lane boots a real modern virtio-net device, keeps
+        # the no-NIC negative control and the opt-in staging lane, and checks the
+        # W11 segment up to word 160 with honest labels.
+        verifier = source(ROOT / "tools/verify_v020_production.py")
+        self.assertIn('"virtio-net-device,netdev=n0"', verifier)
+        self.assertIn('"virtio-mmio.force-legacy=false"', verifier)
+        self.assertIn("W11_END = 160", verifier)
+        self.assertIn('words[W11_END:]', verifier)
+        self.assertIn('"tls_echo_turn_verified": False', verifier)
+        self.assertIn('"policy_lock_budget_verified": False', verifier)
+        self.assertIn('"golden_vector_pending": True', verifier)
+        self.assertIn("NET_ABSENT not in serial", verifier)
+        workflow = source(ROOT / ".github/workflows/v020-production.yml")
+        self.assertIn("s.build_guest()", workflow)
+        self.assertIn("--no-nic; then", workflow)
+        self.assertIn("--timeout 240 --media-staging", workflow)
+        self.assertIn("tools/test_verify_v020_production.py", workflow)
+        evidence = source(ROOT / "kernel/src/arch/aarch64/production/evidence.rs")
+        self.assertNotIn("allow(dead_code)", evidence)
+        self.assertIn("pub fn log_completion()", evidence)
+        prod = source(ROOT / "kernel/src/arch/aarch64/production.rs")
+        self.assertIn("evidence::log_completion();", prod)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

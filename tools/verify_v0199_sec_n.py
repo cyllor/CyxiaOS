@@ -231,10 +231,18 @@ def fixture_manifest() -> dict:
     return names
 
 
-def build() -> Path:
-    """Provision the fixed test identity and build the guest then the kernel feature."""
-    env = dict(os.environ)
+def cargo_prefix() -> str:
     cargo_env = Path.home() / ".cargo" / "env"
+    return f'. "{cargo_env}" && ' if cargo_env.is_file() else ""
+
+
+def build_guest() -> None:
+    """Provision the fixed test identity and build the release local-echo guest.
+
+    Shared with tools/verify_v020_production.py: the production kernel
+    include_bytes!-embeds this exact fixture-identity guest ELF.
+    """
+    env = dict(os.environ)
     ident = Path(tempfile.mkdtemp(prefix="cyx-sec-n-ident-"))
     shutil.copy(ROOT / "crates/net-transport/tests/fixtures/b-test-cert.der", ident / "cert.der")
     shutil.copy(ROOT / "crates/net-transport/tests/fixtures/b-test-key.der", ident / "key.der")
@@ -248,16 +256,20 @@ def build() -> Path:
         "RUSTFLAGS": "-C relocation-model=static -C code-model=large -C strip=debuginfo",
         "CYXIA_LOCAL_ECHO_IDENTITY": str(ident),
     })
-    prefix = f'. "{cargo_env}" && ' if cargo_env.is_file() else ""
     subprocess.run(
-        prefix + "cargo build --release --locked --offline -p cyxia-local-echo "
+        cargo_prefix() + "cargo build --release --locked --offline -p cyxia-local-echo "
         "--features guest --target aarch64-unknown-none",
         shell=True, cwd=ROOT, env=guest_env, check=True, executable="/bin/bash")
+
+
+def build() -> Path:
+    """Provision the fixed test identity and build the guest then the kernel feature."""
+    build_guest()
     # The kernel must NOT inherit the guest RUSTFLAGS (different target/ABI).
-    kernel_env = dict(env)
+    kernel_env = dict(os.environ)
     kernel_env.pop("RUSTFLAGS", None)
     subprocess.run(
-        prefix + "cargo build -p cyxia-kernel --target aarch64-unknown-none-softfloat "
+        cargo_prefix() + "cargo build -p cyxia-kernel --target aarch64-unknown-none-softfloat "
         "--features smp-selftest,v0199-sec-n-selftest",
         shell=True, cwd=ROOT, env=kernel_env, check=True, executable="/bin/bash")
     return ROOT / "target/aarch64-unknown-none-softfloat/debug/cyxia-kernel"

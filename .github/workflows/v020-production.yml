@@ -1,34 +1,42 @@
-# Wave-10 production-wiring SKELETON lane. Scope: production-skeleton only.
-# This is NOT G4 acceptance, NOT a production boot certification, and NOT a
-# claim that any production authority (mount, in-vector SVC dispatch, general
-# allocator, real device custody, recovery) is wired.
+# V0.20 production-wiring SKELETON lanes. Scope: production-skeleton only.
+# This is NOT G4 acceptance and NOT a production boot certification.
 #
-# Skeleton staging (T6 sync time, HEAD defeae7): T1's v020-production feature
-# and verifier have not landed yet. The scope job therefore records an honest
-# NOT_RUN skeleton state on every trigger; the build job activates itself once
-# the feature is declared in kernel/Cargo.toml, and the pinned-QEMU/run jobs
-# activate once the expected verifier tools/verify_v020_production.py exists.
-# The run step is a DOCUMENTED FAIL-CLOSED PLACEHOLDER: once the verifier
-# appears but its CLI contract is not yet wired here, the job refuses to report
-# success (NOT_RUN report + exit 1) instead of silently passing. Replace the
-# placeholder with the real invocation (mirror the verify_v0199_eight_packages
-# usage in v20-native-eight-role-bringup.yml) before claiming any run evidence.
-# If T1 lands the verifier under a different path, update the detection and
-# the paths filter here in the same change.
+# Wave 11: the G-A run boots v020-production with a REAL VirtIO-net device
+# (QEMU user-net + hostfwd) and a host peer sending one fixed 512-byte non-TLS
+# sample; the verifier checks evidence words 128..160 (FrameMeta statics,
+# RecoveryProof v2 accumulators, policy_lock accounting, TCP bytes relayed to
+# the EL0 local-echo guest). Honest labels: tls_echo_turn_verified=false,
+# policy_lock_budget_verified=false (TCG timing), admission leases inferred,
+# fixture entropy. A -nic none negative control must FAIL. The separate
+# media-staging job boots the opt-in v020-production-media-staging feature at
+# -m 1024M (prototype-memory) with a fresh all-zero scratch disk; it proves the
+# boot and fail-closed paths only (golden_vector_pending=true, signed_config=false).
+#
+# Build order: the production kernel include_bytes!-embeds the fixture-identity
+# local-echo guest, so the build job builds the guest first with the exact
+# helper tools/verify_v0199_sec_n.py uses (build_guest), then the kernels.
 name: V0.20 production-wiring skeleton (NOT G4 acceptance)
 on:
   push:
     branches: [CyxiaOS-V0.20]
     paths:
       - 'kernel/**'
+      - 'crates/**'
+      - 'user/local-echo/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
+      - 'tools/test_verify_v020_production.py'
+      - 'tools/verify_v0199_sec_n.py'
   pull_request:
     branches: [CyxiaOS-V0.20]
     paths:
       - 'kernel/**'
+      - 'crates/**'
+      - 'user/local-echo/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
+      - 'tools/test_verify_v020_production.py'
+      - 'tools/verify_v0199_sec_n.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -72,17 +80,19 @@ jobs:
               "verifier_present": os.environ["VERIFIER_PRESENT"] == "true",
               "build_status": "NOT_RUN",
               "run_status": "NOT_RUN",
-              "note": "Wave-10 skeleton: T1 v020-production feature/verifier not landed yet; no production authority is claimed.",
+              "note": "Wave-11 production skeleton lanes; no production authority, no TLS echo turn, no G4 claim.",
           }
           if scope["feature_present"]:
               scope["build_status"] = "delegated-to-arm-build-job"
           if scope["verifier_present"]:
-              scope["run_status"] = "delegated-to-fail-closed-placeholder"
+              scope["run_status"] = "delegated-to-native-run-and-media-staging-run-jobs"
           with open("artifacts/v020-production/scope.json", "w", encoding="utf-8") as handle:
               json.dump(scope, handle, indent=2, sort_keys=True)
               handle.write("\n")
           print(json.dumps(scope, indent=2, sort_keys=True))
           PY
+      - name: Verifier unit tests (synthetic pages only, not runtime evidence)
+        run: python3 -m unittest -v tools/test_verify_v020_production.py 2>&1 | tee artifacts/v020-production/unit-tests.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -100,20 +110,30 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Build v020-production profile (build evidence only, NOT a QEMU pass)
+      - name: Build guest + v020-production profiles (build evidence only, NOT a QEMU pass)
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang
           mkdir -p artifacts/v020-production
           git rev-parse HEAD > artifacts/v020-production/commit.txt
           git rev-parse HEAD^{tree} > artifacts/v020-production/tree.txt
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat --target aarch64-unknown-none
           rustup override set 1.95.0
           cargo fetch --locked
           rustc -vV > artifacts/v020-production/toolchain.txt
+          # The kernel include_bytes!-embeds the fixture-identity local-echo guest:
+          # build it first with the exact helper verify_v0199_sec_n.py uses.
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v020-production/build-guest.log
+          sha256sum target/aarch64-unknown-none/release/cyxia-local-echo > artifacts/v020-production/guest.sha256
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v020-production/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel.elf
+          # Opt-in staging profile (prototype-memory, RAM_MIB 1024).
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production-media-staging 2>&1 | tee artifacts/v020-production/build-staging.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-staging.elf
           readelf -h artifacts/v020-production/kernel.elf > artifacts/v020-production/elf.txt
-          (cd artifacts/v020-production && sha256sum kernel.elf > image.sha256)
+          readelf -h artifacts/v020-production/kernel-staging.elf > artifacts/v020-production/elf-staging.txt
+          (cd artifacts/v020-production && sha256sum kernel.elf kernel-staging.elf > image.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -200,9 +220,60 @@ jobs:
             --elf artifacts/v020-production/kernel.elf \
             --output artifacts/v020-production/run \
             --timeout 120
+          # Negative control: without a NIC the G-A lane must FAIL closed
+          # (V020_W11_NET_ABSENT). A pass here is a verifier defect.
+          if python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel.elf \
+            --output artifacts/v020-production/run-no-nic \
+            --timeout 120 --no-nic; then
+            echo "no-NIC negative control unexpectedly PASSED" >&2
+            exit 1
+          fi
+          grep -q '"negative_control"' artifacts/v020-production/run-no-nic/summary.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: v020-production-run-${{ github.sha }}
           path: artifacts/v020-production/
+          retention-days: 7
+  media-staging-run:
+    needs: [scope, arm-build, qemu-pinned]
+    if: needs.scope.outputs.verifier_present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-build-${{ github.sha }}
+          path: artifacts/v020-production
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-qemu-${{ github.sha }}
+          path: artifacts/v020-production-qemu
+      - name: Verify provenance, then run media-staging lane (opt-in, golden_vector_pending)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/v020-production; sha256sum -c image.sha256)
+          (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          # Staging lane: -m 1024M (prototype-memory) + fresh all-zero scratch
+          # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
+          # format golden vector, NOT signed config, NOT G4.
+          export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel-staging.elf \
+            --output artifacts/v020-production/run-media-staging \
+            --timeout 240 --media-staging
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-media-staging-run-${{ github.sha }}
+          path: artifacts/v020-production/run-media-staging/
           retention-days: 7

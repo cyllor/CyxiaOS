@@ -1889,6 +1889,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     super::super::log(
         b"V020_PROD_SCOPE production_skeleton=true full_authority=false real_models=false\n",
     );
+    evidence::log_completion();
     super::super::log(
         b"V020_PRODUCTION_SKELETON_PASS cpus=4 roles=8 chain=advice-disposition-plan-receipt\n",
     );
