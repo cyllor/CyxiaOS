@@ -140,19 +140,44 @@ impl<'a> Trainer<'a>{
             parent:self.parent,data:self.data.hash,schemas:self.data.schemas,learner:self.learner})
     }
 }
-/// Bounded consumed experiment groups. A failed validation consumes its
-/// holdout as well, so repeating until a model happens to pass is rejected.
-/// This volatile ledger must be restored by a trusted durable owner before
-/// production use across restart.
-pub struct Holdouts{used:[Option<ReplayGroup>;MAX_SAMPLES],len:usize}
+/// Bounded consumed experiment groups. The protected storage owner must
+/// authenticate the entire recovered history before validation opens.
+/// An ambiguous consume write blocks the ledger until independently restored.
+/// This is internal custody, NOT a new on-disk ABI or a FLUSH implementation.
+pub struct Holdouts{used:[Option<ReplayGroup>;MAX_SAMPLES],len:usize,blocked:bool}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct ValidationEvidence{pub candidate:[u8;32],pub parent:[u8;32],pub training:[u8;32],pub holdout:[u8;32]}
+pub struct HoldoutClaim<'a>{
+    pub binding:ValidationEvidence,
+    pub learner:Identity,
+    pub validator:Identity,
+    pub groups:&'a[Option<ReplayGroup>],
+}
 impl Holdouts{
-    pub const fn new()->Self{Self{used:[None;MAX_SAMPLES],len:0}}
+    /// Verify the complete append-only recovered group history, including
+    /// a legitimate empty genesis. Caller must authenticate recovery and
+    /// prove no consumed group was omitted; a bare empty slice is not proof.
+    pub fn restore(groups:&[ReplayGroup],verify_history:impl FnOnce(&[ReplayGroup])->Result<(),Error>)
+        ->Result<Self,Error>{
+        if groups.len()>MAX_SAMPLES{return Err(Error::Exhausted);}
+        for(i,g)in groups.iter().enumerate(){
+            if g.workload==[0;32]||g.initial_image==[0;32]||groups[..i].contains(g){
+                return Err(Error::Denied);
+            }
+        }
+        verify_history(groups)?;
+        let mut out=Self{used:[None;MAX_SAMPLES],len:groups.len(),blocked:false};
+        for(i,g)in groups.iter().enumerate(){out.used[i]=Some(*g);}
+        Ok(out)
+    }
+    #[cfg(test)]
+    fn new()->Self{Self::restore(&[],|_|Ok(())).unwrap()}
     pub fn validate(&mut self,validator:Identity,active:&[u8;MODEL_BYTES],model:&CandidateModel,
         training:&TrainingData<'_>,holdout:&[Sample],
+        commit_consumption:impl FnOnce(&HoldoutClaim<'_>)->Result<(),Error>,
         verify_native:impl FnOnce(Identity,&[u8;MODEL_BYTES],&CandidateModel,&[Sample])->Result<(),Error>)
         ->Result<ValidationEvidence,Error>{
+        if self.blocked{return Err(Error::NotReady);}
         // Independent validation must not be performed by the training
         // identity, including a restart with a new generation. The native
         // verifier still authenticates both registered role capabilities.
@@ -168,11 +193,21 @@ impl Holdouts{
             if !holdout[..i].iter().any(|t|t.group==s.group){n+=1;}
         }
         if n>MAX_SAMPLES-self.len{return Err(Error::Exhausted);}
+        let first=self.len;
+        let binding=ValidationEvidence{candidate:Sha256::digest(model.bytes).into(),parent:model.parent,
+            training:model.data,holdout:digest(holdout,training.schemas)};
         for (i,s) in holdout.iter().enumerate(){
             if !holdout[..i].iter().any(|t|t.group==s.group){
                 self.used[self.len]=Some(s.group);self.len+=1;
             }
         }
+        // Consume BEFORE exposing the holdout to evaluation. The native
+        // owner must commit the exact candidate/group binding and verify
+        // durable completion. Any error is conservatively ambiguous.
+        self.blocked=true;
+        commit_consumption(&HoldoutClaim{binding,learner:model.learner,validator,
+            groups:&self.used[first..self.len]})?;
+        self.blocked=false;
         verify_native(validator,active,model,holdout)?;
         sgd_v2::operator_selftest().map_err(|_|Error::Denied)?;
         let old=Model::parse(active).map_err(|_|Error::Invalid)?;
@@ -196,11 +231,9 @@ impl Holdouts{
             let bound=if i==15{a}else{a.add(tolerance).map_err(|_|Error::Invalid)?};
             if b.compare(bound).is_gt(){return Err(Error::Denied);}
         }
-        Ok(ValidationEvidence{candidate:Sha256::digest(model.bytes).into(),parent:model.parent,
-            training:model.data,holdout:digest(holdout,training.schemas)})
+        Ok(binding)
     }
 }
-impl Default for Holdouts{fn default()->Self{Self::new()}}
 
 #[cfg(test)]
 mod tests{
@@ -245,15 +278,29 @@ mod tests{
         // Deny self-validation before calling the native verifier or
         // consuming independent holdouts; a generation change is no bypass.
         for identity in [actor,Identity{id:actor.id,generation:actor.generation+1}]{
-            assert!(matches!(ledger.validate(identity,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+            assert!(matches!(ledger.validate(identity,&active,&model,&training,&holdout,|_|panic!(),|_,_,_,_|panic!()),Err(Error::Denied)));
         }
         assert_eq!(ledger.len,0);
         holdout[0].group=rows[0].group;
-        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_|panic!(),|_,_,_,_|panic!()),Err(Error::Denied)));
         holdout[0].group=group;
-        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady)));
-        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|claim|{assert_eq!(claim.groups.len(),60);Ok(())},|_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady)));
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_|panic!(),|_,_,_,_|panic!()),Err(Error::Denied)));
         let fresh:[Sample;60]=core::array::from_fn(|i|sample(i,4,2000));
-        assert!(ledger.validate(validator,&active,&model,&training,&fresh,|_,_,_,_|Ok(())).is_ok());
+        assert!(ledger.validate(validator,&active,&model,&training,&fresh,|_|Ok(()),|_,_,_,_|Ok(())).is_ok());
+        // Crash/ambiguous commit cannot open another holdout or run MSE.
+        let next:[Sample;60]=core::array::from_fn(|i|sample(i,4,3000));
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&next,|claim|{
+            assert_eq!(claim.learner,actor);assert_eq!(claim.validator,validator);
+            assert_eq!(claim.groups.len(),60);Err(Error::NotReady)
+        },|_,_,_,_|panic!()),Err(Error::NotReady)));
+        assert!(ledger.blocked);
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&next,|_|panic!(),|_,_,_,_|panic!()),Err(Error::NotReady)));
+        // Only authenticated recovery may reopen, preserving spent groups.
+        let recovered:[ReplayGroup;180]=core::array::from_fn(|i|ledger.used[i].unwrap());
+        assert!(matches!(Holdouts::restore(&recovered,|_|Err(Error::NotReady)),Err(Error::NotReady)));
+        let mut ledger=Holdouts::restore(&recovered,|g|{assert_eq!(g.len(),180);Ok(())}).unwrap();
+        assert!(matches!(ledger.validate(validator,&active,&model,&training,&next,|_|panic!(),|_,_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(Holdouts::restore(&[group,group],|_|panic!()),Err(Error::Denied)));
     }
 }
