@@ -82,6 +82,14 @@ impl Owner{
     pub fn query(&self,caller:Identity,id:u64)->Result<State,Error>{
         Ok(self.rows[self.row(caller,id)?].unwrap().state)
     }
+    /// Cancel only work that has never reached the native constructor.
+    /// Neither elapsed time nor the requester may release UNKNOWN credit.
+    pub fn cancel_queued(&mut self,caller:Identity,id:u64,now:u64,
+        verify_no_effect:impl FnOnce(&Request)->Result<(),Error>)->Result<(),Error>{
+        self.ready(now)?;let i=self.row(caller,id)?;let r=self.rows[i].as_mut().unwrap();
+        if r.state!=State::Queued||r.occupied||r.started!=0{return Err(Error::Busy);}
+        verify_no_effect(&r.req)?;r.state=State::Rejected;self.last=now;Ok(())
+    }
     fn limit(g:Group,now:u64)->u16{if now<g.until{g.limit}else{2}}
     pub fn version(&self,group:Identity)->Result<u64,Error>{Ok(self.groups[self.group(group)?].unwrap().version)}
     pub fn observation(&self,group:Identity,other_live:usize,now:u64)->Result<[Option<u64>;4],Error>{
@@ -255,6 +263,7 @@ mod tests{
         assert_eq!(o.service_one(102,62,|_|Ok(()),|_|Completion{outcome:Outcome::Unknown,completed_ns:102}),Ok(Some(State::Unknown)));
         assert_eq!(o.service_one(103,62,|_|panic!(),|_|panic!()),Ok(None));
         assert_eq!(o.submit(req(2),104,|_|Ok(())),Ok(State::Unknown));
+        assert_eq!(o.cancel_queued(CALLER,2,104,|_|panic!()),Err(Error::Busy));
         assert_eq!(o.submit(Request{digest:[2;32],..req(2)},104,|_|Ok(())),Err(Error::Denied));
         let w=ApplyWorkV1{key:PlanKey{boot_epoch:1,controller_epoch:1,plan_seq:1},action_index:0,domain:2,
             target:GROUP,executor_generation:1,plan_version:1,payload:&[4,0]};
