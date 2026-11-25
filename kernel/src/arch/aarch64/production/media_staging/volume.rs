@@ -58,10 +58,10 @@ const SYSTEM: [SystemObject; 4] = [
 ];
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-// Zero-initialised (BSS-only section): an all-zero FormatWorkspace is a valid
-// value (FormatOp discriminant 0 = ScanZero, len 0, byte buffers), and
-// `format` resets `len` before use. `FormatWorkspace::new()` is not all-zero.
-static mut FORMAT: MaybeUninit<FormatWorkspace> = MaybeUninit::zeroed();
+// Uninitialised storage in the BSS-only section (`FormatWorkspace::new()` is
+// not all-zero, so it cannot be a BSS initialiser). No validity is assumed
+// for these bytes: `format` writes `FormatWorkspace::new()` before any use.
+static mut FORMAT: MaybeUninit<FormatWorkspace> = MaybeUninit::uninit();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut MOUNT: MountWorkspace = MountWorkspace::new();
 
@@ -97,9 +97,10 @@ pub(super) fn format(disk: &mut Disk) -> Result<SuperblockV1, SecurityError> {
         principals: principals(),
         security: security(),
     };
-    // SAFETY: one-shot CPU0 call (module header); the borrow ends on return.
-    // All-zero bytes are a valid FormatWorkspace (see FORMAT).
-    let w = unsafe { (*core::ptr::addr_of_mut!(FORMAT)).assume_init_mut() };
+    // SAFETY: one-shot CPU0 call (module header); this is the only borrow of
+    // FORMAT and it ends on return. The value is initialised at runtime here.
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(FORMAT) };
+    let w = slot.write(FormatWorkspace::new());
     let e = file_format_v1::format(disk, BLOCK_COUNT, &manifest, w)?;
     let expected = SuperblockV1 {
         fs_uuid: UUID,
