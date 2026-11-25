@@ -157,8 +157,9 @@ struct BudgetMeter {
 impl BudgetMeter {
     fn new()->Self{
         let wall=now_ns();let tick=timer::cpu_ticks();
-        Self{ledger:Cpu0BudgetLedger::new(),initial_tick:tick,initial_ns:wall,
-            cursor:tick,wall,crossed_gaps:0}
+        let mut ledger=Cpu0BudgetLedger::new();
+        ledger.start_continuous(cpu::slot(),wall,||Ok(())).expect("native accounting origin");
+        Self{ledger,initial_tick:tick,initial_ns:wall,cursor:tick,wall,crossed_gaps:0}
     }
     fn sample_gap(&mut self)->(u64,u64){
         let wall=now_ns();let tick=timer::cpu_ticks();
