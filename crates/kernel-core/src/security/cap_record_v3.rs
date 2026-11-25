@@ -120,7 +120,13 @@ impl<const N:usize> StaticControlCaps<N>{
         if !r.valid()||!r.target.valid()||r.state!=1||r.depth!=0||r.object_kind!=kind||r.rights!=rights
             ||r.source_role!=u32::from(role.id())||r.owner_group!=u32::MAX
             ||r.record_generation!=1
-            ||self.rows.iter().flatten().any(|e|e.record.cap_id==r.cap_id){
+            ||self.rows.iter().flatten().any(|e|e.record.cap_id==r.cap_id
+                // A fenced or retired holder generation may never gain
+                // a new root, even under a previously unused cap_id.
+                ||e.record.holder==r.holder&&e.record.state!=1
+                // Also prevent an old generation being reintroduced
+                // after a replacement has obtained any root.
+                ||e.record.holder.id==r.holder.id&&e.record.holder.generation>r.holder.generation){
             return Err(Error::Unauthorized);
         }
         manifest.can_act(role,r.holder,authority,0).map_err(|_|Error::Unauthorized)?;
@@ -207,9 +213,18 @@ mod tests{
         assert_eq!(table.lookup(1,r.holder,1,h,Label::Publish,r.target,|_|panic!()),Err(Error::Unauthorized));
         assert_eq!(table.lookup(1,r.holder,0,h,Label::DecisionRegister,r.target,|_|panic!()),Err(Error::Unauthorized));
         table.fence_holder(r.holder).unwrap();
+        let fresh=CapRecordV3{cap_id:18,..r};
+        assert_eq!(table.issue_checked(&m,Label::Publish,fresh,|_,_|panic!()),Err(Error::Unauthorized));
         assert_eq!(table.lookup(1,r.holder,0,h,Label::Publish,r.target,|_|panic!()),Err(Error::Stale));
         assert_eq!(table.retire_holder(r.holder,|_|Err(Error::Unknown)),Err(Error::Unknown));
         table.retire_holder(r.holder,|_|Ok(())).unwrap();
         assert_eq!(table.issue_checked(&m,Label::Publish,r,|_,_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(table.issue_checked(&m,Label::Publish,fresh,|_,_|panic!()),Err(Error::Unauthorized));
+        let mut next=m;next.members[3].actor.generation=2;
+        let replacement=CapRecordV3{holder:next.members[3].actor,..fresh};
+        let new_handle=table.issue_checked(&next,Label::Publish,replacement,|_,_|Ok(())).unwrap();
+        assert_ne!(h,new_handle);
+        assert_eq!(table.lookup(1,r.holder,0,h,Label::Publish,r.target,|_|panic!()),Err(Error::Stale));
+        assert_eq!(table.lookup(1,replacement.holder,0,new_handle,Label::Publish,r.target,|_|Ok(())),Ok(replacement));
     }
 }
