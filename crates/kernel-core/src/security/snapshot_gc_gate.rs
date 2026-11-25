@@ -53,7 +53,7 @@ pub struct Commit{
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Phase{Prepared,Unknown,Committed}
-pub struct Gate{owner:Identity,supervisor:Identity,batch:Batch,phase:Phase,commit:Option<Commit>}
+pub struct Gate{owner:Identity,supervisor:Identity,batch:Batch,phase:Phase,commit:Option<Commit>,handed_off:u128}
 impl Gate{
     /// Select only explicitly enumerated, sorted candidate blocks. The
     /// media owner supplies the eligible business region/ownership proof;
@@ -75,7 +75,17 @@ impl Gate{
         verify_frozen_complete(census,maps,candidates)?;
         let mut blocks=[0;BATCH];blocks[..candidates.len()].copy_from_slice(candidates);
         Ok(Self{owner,supervisor,batch:Batch{census,blocks,len:candidates.len() as u16},
-            phase:Phase::Prepared,commit:None})
+            phase:Phase::Prepared,commit:None,handed_off:0})
+    }
+    /// Restore the prior exact candidate batch after a lost commit or
+    /// reboot, never as a fresh Prepared writer. The history verifier
+    /// authenticates the original preimage census, batch and durable
+    /// obligation; live allocator admission remains closed.
+    pub fn recover_unknown(owner:Identity,supervisor:Identity,census:Census,before:&Maps<'_>,
+        candidates:&[u32],verify_retained:impl FnOnce(Census,&Maps<'_>,&[u32])->Result<(),Error>,
+    )->Result<Self,Error>{
+        let mut g=Self::prepare(owner,supervisor,census,before,candidates,verify_retained)?;
+        g.phase=Phase::Unknown;Ok(g)
     }
     pub fn phase(&self)->Phase{self.phase}
     pub fn batch(&self)->Batch{self.batch}
@@ -130,8 +140,23 @@ impl Gate{
         verify_durable_and_quiet(&self.batch,receipt)?;
         self.commit=Some(receipt);self.phase=Phase::Committed;Ok(())
     }
+    /// Eligibility is not a new allocation grant. Transfer each block to
+    /// the actual allocator at most once after checking current bitmap
+    /// generation, allocator ownership and physical quiescence. The callback
+    /// is an atomic metadata handoff: Err must leave ownership unchanged.
     pub fn reusable(&self,block:u32)->bool{
-        self.phase==Phase::Committed&&self.batch.blocks().binary_search(&block).is_ok()
+        self.phase==Phase::Committed&&self.batch.blocks().binary_search(&block)
+            .is_ok_and(|i|self.handed_off&(1u128<<i)==0)
+    }
+    pub fn handoff_once(&mut self,actor:Identity,block:u32,
+        transfer_native:impl FnOnce(u32,Commit)->Result<(),Error>)->Result<(),Error>{
+        if actor!=self.supervisor{return Err(Error::Unauthorized);}
+        if self.phase!=Phase::Committed{return Err(Error::Busy);}
+        let i=self.batch.blocks().binary_search(&block).map_err(|_|Error::Invalid)?;
+        let bit=1u128<<i;
+        if self.handed_off&bit!=0{return Err(Error::Stale);}
+        transfer_native(block,self.commit.ok_or(Error::Unknown)?)?;
+        self.handed_off|=bit;Ok(())
     }
 }
 const _:()=assert!(core::mem::size_of::<Gate>()<2048);
@@ -167,6 +192,9 @@ mod tests{
         assert_eq!(g.submit(OWNER,batch,Census{catalog_generation:6,..c},&before,|_|panic!(),|_|panic!()),Err(Error::Conflict));
         assert_eq!(g.submit(OWNER,batch,c,&before,|_|Ok(()),|_|Err(Error::Unknown)),Err(Error::Unknown));
         assert_eq!(g.submit(OWNER,batch,c,&before,|_|panic!(),|_|panic!()),Err(Error::Busy));
+        // Crash recovery cannot reissue the lost GC transaction.
+        let mut g=Gate::recover_unknown(OWNER,SUP,c,&before,batch.blocks(),|_,_,_|Ok(())).unwrap();
+        assert_eq!(g.submit(OWNER,batch,c,&before,|_|panic!(),|_|panic!()),Err(Error::Busy));
         let mut next=allocated;clear(&mut next,7000);clear(&mut next,7003);
         let after=Maps{allocated:&next,reachable:&reachable,blocked:&blocked};
         let new=Census{bitmap_generation:7,..census(&after)};
@@ -181,5 +209,10 @@ mod tests{
         assert!(!g.reusable(7000));
         g.confirm(SUP,batch,commit,&before,&after,|b,r|{assert_eq!(b.blocks(),&[7000,7003]);assert_eq!(r,commit);Ok(())}).unwrap();
         assert!(g.reusable(7000)&&g.reusable(7003));assert!(!g.reusable(7001)&&!g.reusable(7004));
+        assert_eq!(g.handoff_once(SUP,7000,|_,_|Err(Error::Busy)),Err(Error::Busy));
+        assert!(g.reusable(7000));
+        g.handoff_once(SUP,7000,|b,r|{assert_eq!(b,7000);assert_eq!(r,commit);Ok(())}).unwrap();
+        assert!(!g.reusable(7000));assert_eq!(g.handoff_once(SUP,7000,|_,_|panic!()),Err(Error::Stale));
+        assert_eq!(g.handoff_once(OWNER,7003,|_,_|panic!()),Err(Error::Unauthorized));
     }
 }
