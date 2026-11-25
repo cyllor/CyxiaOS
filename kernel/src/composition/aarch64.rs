@@ -229,14 +229,16 @@ mod user_heap;
     feature = "tcp-v13-selftest",
     feature = "prototype-runtime",
     feature = "net-selftest",
+    feature = "v020-production",
+    feature = "v0199-sec-n-selftest",
     not(feature = "selftest")
 ))]
 #[path = "../platform/virt/virtio_platform.rs"]
 mod virtio_platform;
 // T4 SEC-N production VirtIO-net device init skeleton. Gated behind the existing
 // sec-n-native closure (real smoltcp device/tcp stack, soft-float EL1). The
-// production boot dispatch (T1) calls net_device::init; not yet wired by default.
+// production boot path (arch/aarch64/production/net.rs) calls net_device::init and
+// the TCP/Admission wiring; other sec-n-native profiles use it via their fixtures.
 #[cfg(feature = "sec-n-native")]
-#[allow(dead_code)]
 #[path = "../platform/virt/net_device.rs"]
 mod net_device;

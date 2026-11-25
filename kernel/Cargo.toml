@@ -63,7 +63,9 @@ v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
 # is staged (volatile), the executor is a bounded fixture target, no real model is
 # active, and the snapshot backend stays fail-closed (EAGAIN). See production.rs
 # scope markers (production_skeleton=true full_authority=false real_models=false).
-v020-production = ["smp-selftest", "dep:sha2"]
+v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]
+# Wave 11 opt-in media-staging lane; adds only the prototype-memory topology.
+v020-production-media-staging = ["v020-production", "prototype-memory"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.

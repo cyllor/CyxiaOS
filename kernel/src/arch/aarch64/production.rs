@@ -94,6 +94,9 @@ use cyxia_kernel_core::control_plane::{
 use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
 use sha2::{Digest, Sha256};
 
+#[path = "production/evidence.rs"]
+mod evidence;
+
 // The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
 // path; it must not be combined with another profile that also hijacks CPU0 or
 // rewrites dispatch/execute.
@@ -1825,6 +1828,10 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         );
         words.words[at + 5].store(SVC_OUT[i].load(Ordering::Relaxed), Ordering::Relaxed);
     }
+    // Wave 11 segment (words 128..160): magic + staged boot epoch; later wave-11
+    // tasks fill their own rows through evidence::put before this seal.
+    evidence::put(evidence::W11_BASE, evidence::W11_MAGIC);
+    evidence::put(evidence::W11_STAGED_BOOT_EPOCH, 1);
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the

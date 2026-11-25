@@ -524,7 +524,7 @@ class NativeSecurityWiring(unittest.TestCase):
         # production authority: the scope marker must keep full_authority=false
         # and real_models=false, and the default/fixture profiles stay intact.
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertIn('v020-production = ["smp-selftest", "dep:sha2"]', manifest)
+        self.assertIn('v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]', manifest)
         boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
         self.assertIn('feature = "v020-production"))]\n    smp::production::run(&info);', boot)
         exceptions = source(ROOT / "kernel/src/arch/aarch64/exceptions.rs")
@@ -551,6 +551,20 @@ class NativeSecurityWiring(unittest.TestCase):
         build = source(ROOT / "kernel/build/aarch64.rs")
         self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_some()', build)
         self.assertTrue((ROOT / "tools/verify_v020_production.py").is_file())
+
+    def test_v020_wave11_feature_gating(self):
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertRegex(manifest, r'(?m)^v020-production = \[[^\]]*"sec-n-native"[^\]]*\]')
+        self.assertRegex(
+            manifest,
+            r'(?m)^v020-production-media-staging = \[[^\]]*"v020-production"[^\]]*\]',
+        )
+        comp = source(ROOT / "kernel/src/composition/aarch64.rs")
+        gate = comp.split('mod virtio_platform;')[0].rsplit("#[cfg(any(", 1)[1]
+        self.assertIn('feature = "v020-production"', gate)
+        near = comp.split("mod net_device;")[0][-700:]
+        self.assertNotIn("allow(dead_code)", near)
+        self.assertNotIn("not yet wired by default", near)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
