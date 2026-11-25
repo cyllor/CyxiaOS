@@ -235,10 +235,12 @@ mod user_heap;
 ))]
 #[path = "../platform/virt/virtio_platform.rs"]
 mod virtio_platform;
-// T4 SEC-N production VirtIO-net device init skeleton. Gated behind the existing
-// sec-n-native closure (real smoltcp device/tcp stack, soft-float EL1). The
-// production boot path (arch/aarch64/production/net.rs) calls net_device::init and
-// the TCP/Admission wiring; other sec-n-native profiles use it via their fixtures.
-#[cfg(feature = "sec-n-native")]
+// SEC-N production VirtIO-net device init. Gated behind the existing
+// sec-n-native closure (real smoltcp device/tcp stack, soft-float EL1). Its only
+// caller is the production boot path (arch/aarch64/production/net.rs), which
+// calls net_device::init and the TCP/Admission wiring (registration of record:
+// net_device.rs header). v020-production implies sec-n-native; other
+// sec-n-native profiles do not compile it (it would be dead code there).
+#[cfg(feature = "v020-production")]
 #[path = "../platform/virt/net_device.rs"]
 mod net_device;

@@ -1,32 +1,31 @@
-//! SEC-N production VirtIO-net device init skeleton (T4 device wiring).
+//! SEC-N VirtIO-net device init for the V0.20 production boot.
 //!
-//! Provides a clean, CPU0-only init API that the production boot dispatch (T1)
-//! calls to bring up the REAL `driver-virtio::net::BatchedNet` device with pinned
-//! DMA pages. This is a skeleton: it owns no service, no boot/dispatch path and
-//! no execution grant, and it never fabricates a completion witness. The real
-//! MMIO/IRQ/DMA custody is exercised only in a native fixture; the protected
-//! EL1 dispatch that deploys the Echo service on top remains T1's open gate.
+//! CPU0-only, one-shot init that brings up the REAL
+//! `driver-virtio::net::BatchedNet` device on the pinned RX/TX DMA pools. Its
+//! caller of record is the `v020-production` boot: `production/net.rs`
+//! (`net::serve`, run() step after the advice chain) calls [`init`] once, wraps
+//! the returned [`NetDevice`] for the smoltcp `tcp::Tcp` listener and relays TCP
+//! bytes to the EL0 local-echo guest. This module itself owns no service and no
+//! execution grant, and it never fabricates a completion witness.
 //!
-//! # Integration contract T1 must supply (see net-transport::service docs)
-//!
-//! `init` returns a [`NetDevice`] owning the real driver. T1's production profile
-//! must enable the `sec-n-native` feature (or fold this module into the production
-//! feature set) and then:
-//!   1. Wrap the device as `cyxia_net_transport::device::VirtioPort` (legacy
-//!      same-turn ACK) or `cyxia_net_transport::virtio_custody::CustodyNet`
-//!      (explicit TX receipt custody) and drive it through `tcp::Tcp`.
-//!   2. Supply identity material, trusted clocks, source IPv4 + rate policy,
-//!      reset/restart authority and the EL0 execution substrate from protected
-//!      kernel state — never from a peer or wire frame.
-//!   3. Reconcile real used-ring TX receipts so `tx_quiescent` can become true;
-//!      retirement still requires TCP Closed + empty send queue + TLS drain +
-//!      generation match (`Service::finish`).
-//!
-//! UNSAFE BOUNDARY: CPU0-only. `CLAIMED` admits the boot CPU once; the static
-//! `RX`/`TX` BatchMemory pools are permanently pinned and never reclaimed,
-//! including on initialization failure (a FAILED device is not proof DMA stopped).
-//! Every `&mut` to the pools is created and consumed within this single synchronous
-//! CPU0 call; no IRQ handler or secondary CPU touches them.
+//! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
+//! * CLAIMED (atomic): admits CPU0 once; `init` is therefore one-shot per boot.
+//! * RX / TX (static mut BatchMemory): the device's DMA pools. Under
+//!   `v020-production` they live in the dedicated `.bss.sec_n` link section,
+//!   outside the wave-11 FrameMeta window, and are NOT FrameMeta-registered
+//!   (open item). `init` forms the only `&mut` to each and moves both borrows
+//!   into the driver: they are borrowed for the DEVICE'S LIFETIME, not for one
+//!   call. In production the `NetDevice` holding them lives across the whole of
+//!   `net::serve`, driven synchronously by CPU0 only (no IRQ handler or
+//!   secondary CPU touches the queues).
+//! * The pools are permanently pinned and never reclaimed, including on
+//!   initialization failure (a FAILED device is not proof DMA stopped).
+//! * The device is NEVER reset: dropping `NetDevice` at the end of
+//!   `net::serve` neither releases the pools nor quiesces the device. It stays
+//!   live and DMA-capable for the rest of the boot (including the opt-in media
+//!   staging run): the host may keep DMA-ing received frames into the RX pool
+//!   after `serve` returns. Nothing reads or writes RX/TX after that, so those
+//!   writes land only in pinned, otherwise unused memory.
 use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_contracts::BootInfo;
