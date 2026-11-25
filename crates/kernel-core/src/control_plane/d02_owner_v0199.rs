@@ -183,7 +183,18 @@ impl Owner{
     pub fn service_one(&mut self,now:u64,other_live:usize,
         authorize:impl FnOnce(&Request)->Result<(),Error>,
         create:impl FnOnce(&Request)->Completion)->Result<Option<State>,Error>{
-        let Some(t)=self.start_one(now,other_live,authorize)? else{return Ok(None);};
+        let mut rejected=false;
+        let start=self.start_one(now,other_live,|req|{
+            let decision=authorize(req);rejected=decision.is_err();decision
+        });
+        let t=match start{
+            Ok(Some(t))=>t,Ok(None)=>return Ok(None),
+            // Preserve the existing synchronous diagnostic semantics:
+            // reauthorization rejection is a retained terminal request,
+            // not a constructor or a consumed thread credit.
+            Err(_) if rejected=>return Ok(Some(State::Rejected)),
+            Err(e)=>return Err(e),
+        };
         let completion=create(&t.request);
         Ok(Some(self.complete_started(t,completion,completion.completed_ns,|_,_|Ok(()))?))
     }
@@ -259,6 +270,14 @@ mod tests{
     const GROUP:Identity=Identity{id:20,generation:1};
     const CALLER:Identity=Identity{id:21,generation:1};
     fn req(id:u64)->Request{Request{caller:CALLER,request_id:id,package:Identity{id:1,generation:1},group:GROUP,digest:[1;32]}}
+    #[test]
+    fn reauthorization_rejection_does_not_start_constructor(){
+        let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
+        o.submit(req(1),100,|_|Ok(())).unwrap();
+        assert_eq!(o.service_one(101,0,|_|Err(Error::Denied),|_|panic!()),Ok(Some(State::Rejected)));
+        assert_eq!(o.query(CALLER,1),Ok(State::Rejected));
+        assert_eq!(o.counts(),(0,0,0));
+    }
     #[test]
     fn asynchronous_constructor_ticket_keeps_credit_and_exact_completion(){
         let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
