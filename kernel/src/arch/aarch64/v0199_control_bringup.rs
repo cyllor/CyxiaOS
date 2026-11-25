@@ -236,7 +236,7 @@ impl BudgetMeter {
     fn load_initial(&mut self,index:usize)->(NativeRole,Running){
         let (mut token,mut began)=self.reserve_coordination();
         let mut total=0u64;let mut largest=0u64;let mut slices=0u64;
-        let pair=load_checkpointed(index,1,0,||{
+        let pair=load_checkpointed(index,1,0,|_|{
             // The verified copy and unpublished backing stay exclusively
             // owned by the loader across these cooperative boundaries.
             if timer::cpu_elapsed_ns(began)>=450_000
@@ -270,9 +270,10 @@ impl BudgetMeter {
             }
         }
     }
-    fn settle_recovery_slice(&mut self,role:Role,t:Turn,began:u64)->u64{
+    fn settle_recovery_slice(&mut self,role:Role,t:Turn,began:u64,phase:u64,part:u64)->u64{
         let receipt=self.settle(t,began);
         if receipt.overrun||receipt.crossed_window{
+            report("V0199_RECOVERY_OVERRUN_PHASE",phase,part,receipt.actual_ns);
             report("V0199_BOOTSTRAP_OVERRUN",role.id() as u64,receipt.actual_ns,t.reserved_ns());
             fatal(683);
         }
@@ -339,7 +340,7 @@ fn high_leaf(pa:u64)->*mut u64{
     assert!(offset<(cyxia_platform_virt::RAM_MIB*1024*1024/PAGE as u64));
     unsafe{((core::ptr::addr_of!(ram_l3) as u64+super::super::HIGH) as *mut u64).add(offset as usize)}
 }
-fn sync_code(addr:u64,bytes:usize){
+fn clean_code(addr:u64,bytes:usize){
     let ctr:u64;
     unsafe{core::arch::asm!("mrs {}, ctr_el0",out(reg)ctr,options(nomem,nostack));}
     let line=4usize<<((ctr>>16)&15);
@@ -347,6 +348,9 @@ fn sync_code(addr:u64,bytes:usize){
     for off in (0..bytes).step_by(line){
         unsafe{core::arch::asm!("dc cvau, {}",in(reg)addr+off as u64,options(nostack));}
     }
+    unsafe{core::arch::asm!("dsb ish",options(nostack));}
+}
+fn invalidate_code(){
     unsafe{core::arch::asm!("dsb ish","ic ialluis","dsb ish","isb",options(nostack));}
 }
 /// The high RAM direct map is a global 4KiB leaf mapping. Invalidate
@@ -373,7 +377,7 @@ fn invalidate_role_root(index:usize,bank:usize){
     unsafe{core::arch::asm!("dsb ishst","tlbi aside1is, {}","dsb ish","isb",
         in(reg)operand,options(nostack));}
 }
-fn seal_page(pa:u64){
+fn seal_page(pa:u64,mut checkpoint:impl FnMut(u64)){
     let leaf=high_leaf(pa);
     let old=unsafe{core::ptr::read_volatile(leaf)};
     assert_eq!(old,pa|0x0060_0000_0000_0703);
@@ -381,13 +385,17 @@ fn seal_page(pa:u64){
     // No user root is published while a page is being sealed.
     unsafe{core::ptr::write_volatile(leaf,0);}
     invalidate_high_page(pa);
+    // The unpublished page has no active user mapping or DMA. It is
+    // safe to pause here after completed break, before the new make.
+    checkpoint(15);
     unsafe{core::ptr::write_volatile(leaf,old|(1<<7));}
     invalidate_high_page(pa);
+    checkpoint(16);
 }
 fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
-    load_checkpointed(index,generation,bank,||{})
+    load_checkpointed(index,generation,bank,|_|{})
 }
-fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl FnMut())->(NativeRole,Running){
+fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl FnMut(u64))->(NativeRole,Running){
     let role=ROLES[index];let pkg=&CATALOG[index];
     assert_eq!(pkg.role_id,role.id());
     assert!(pkg.bytes.len()<=COPY);
@@ -402,18 +410,19 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     let scratch=unsafe{&mut *((disk_pool()+DISK_COPY_OFFSET as u64) as *mut [u8;COPY])};
     #[cfg(not(feature="v0199-epoch-disk-selftest"))]
     let scratch=unsafe{&mut *core::ptr::addr_of_mut!(COPY_BUFFER.0)};
-    scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
-    checkpoint();
+    for (dst,src) in scratch[..pkg.bytes.len()].chunks_mut(PAGE).zip(pkg.bytes.chunks(PAGE)){
+        dst.copy_from_slice(src);checkpoint(10);
+    }
     let spec=RolePackageSpec{role,package_id:u64::from(role.id()),abi:3,image_bytes:pkg.bytes.len(),
         image_sha256:pkg.image_sha256,relative_count:pkg.relative.len(),relative_sha256:pkg.relative_sha256,
         stack_bytes:ROLE_STACK_BYTES};
     let verified=VerifiedRolePackage::verify_checkpointed(spec,RolePackageInput{package_id:spec.package_id,
-        bytes:&scratch[..pkg.bytes.len()],relative:pkg.relative},&mut checkpoint).expect("trusted ABI3 role package");
+        bytes:&scratch[..pkg.bytes.len()],relative:pkg.relative},||checkpoint(11)).expect("trusted ABI3 role package");
     let relro=verified.relro();
-    checkpoint();
+    checkpoint(11);
     let image=unsafe{&mut *core::ptr::addr_of_mut!((*b).image)};
-    let entry=verified.stage(image,BASE,BASE,BASE+IMAGE as u64).expect("private PIE stage");
-    checkpoint();
+    let entry=verified.stage_checkpointed(image,BASE,BASE,BASE+IMAGE as u64,||checkpoint(12)).expect("private PIE stage");
+    checkpoint(12);
     let stack=unsafe{&mut *core::ptr::addr_of_mut!((*b).stack)};
     // Diagnostic startup payload is program-specific, not an added ABI
     // field. The generic ABI3 contract supplies arg_va/args_len and SP.
@@ -427,7 +436,7 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     assert!(stack[..ROLE_STACK_BYTES-32].iter().all(|&v|v==0));
     assert_eq!(&stack[ROLE_STACK_BYTES-32..ROLE_STACK_BYTES-8],&args);
     assert!(stack[ROLE_STACK_BYTES-8..].iter().all(|&v|v==0));
-    checkpoint();
+    checkpoint(13);
     let mut map=[0u8;IMAGE/PAGE];
     for seg in verified.load_segments(){
         let start=seg.virtual_address as usize/PAGE;
@@ -444,12 +453,14 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
             *page=4; // stage already applied verified relocations; seal now
         }
     }
-    scratch.fill(0);
-    checkpoint();
+    for chunk in scratch.chunks_mut(PAGE){chunk.fill(0);checkpoint(14);}
     let image_base=b as u64;
     for (i,flags) in map.iter().copied().enumerate(){
-        if flags&1!=0{sync_code(image_base+i as u64*PAGE as u64,PAGE);checkpoint();}
+        if flags&1!=0{clean_code(image_base+i as u64*PAGE as u64,PAGE);checkpoint(14);}
     }
+    // One complete broadcast I-cache invalidation after all D-cache
+    // cleans, before any executable low mapping is entered.
+    invalidate_code();checkpoint(14);
     unsafe{
         (*t).root.0[0]=phys(core::ptr::addr_of!((*t).mid) as u64)|3;
         (*t).mid.0[0]=phys(core::ptr::addr_of!((*t).leaf) as u64)|3;
@@ -458,7 +469,7 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
         if flags==0{continue;}
         let pa=phys(image_base+i as u64*PAGE as u64);
         let write=flags&2!=0;let execute=flags&1!=0;
-        if !write{seal_page(pa);checkpoint();}
+        if !write{seal_page(pa,&mut checkpoint);}
         let desc=mmu::encode_user_leaf(PhysAddr(pa),write,execute).unwrap();
         unsafe{(*t).leaf.0[BASE as usize/PAGE+i]=desc;}
     }
@@ -467,12 +478,13 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
         let pa=phys(stack_base+i as u64*PAGE as u64);
         unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE+i]=mmu::encode_user_leaf(PhysAddr(pa),true,false).unwrap();}
     }
-    checkpoint();
+    checkpoint(17);
     // Guard and image holes have never had user mappings.
     assert_eq!(unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE-1]},0);
     // No low global mapping is admitted by this loader.
     assert!(unsafe{(*t).leaf.0.iter().all(|&p|p==0||p&(1<<11)!=0)});
     invalidate_role_root(index,bank);
+    checkpoint(18);
     let member=NativeRole{role,actor,ttbr0_root:root_pa(index,bank),
         // Charge the full physically reserved image, including its RX/RO
         // pages and holes, not only mapped RW bytes.
@@ -698,21 +710,21 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
 /// the old image be made writable again. These static frames are never
 /// attached to DMA or another address space in this diagnostic profile.
 fn retire_root(index:usize,bank:usize){
-    retire_root_checkpointed(index,bank,||{});
+    retire_root_checkpointed(index,bank,|_|{});
 }
-fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut()){
+fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut(u64)){
     let t=tables(index,bank);
     assert!(unsafe{(*t).leaf.0.iter().all(|&p|p==0||p&(1<<11)!=0)});
     unsafe{core::ptr::write_volatile(core::ptr::addr_of_mut!((*t).root.0[0]),0);}
     invalidate_role_root(index,bank);
-    checkpoint();
+    checkpoint(1);
     // Root disconnected and context returned; all former leaf entries are
     // now inaccessible. This is not proof of a general production DMA join.
     unsafe{
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).mid.0).cast::<u8>(),0,PAGE);
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).leaf.0).cast::<u8>(),0,PAGE);
     }
-    checkpoint();
+    checkpoint(2);
     let b=backing(index) as u64;
     for offset in (0..IMAGE).step_by(PAGE){
         let pa=phys(b+offset as u64);
@@ -722,13 +734,15 @@ fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut()){
         assert!(old==rw||old==rw|(1<<7));
         if old!=rw{
             unsafe{core::ptr::write_volatile(leaf,0);}invalidate_high_page(pa);
+            checkpoint(3);
             unsafe{core::ptr::write_volatile(leaf,rw);}invalidate_high_page(pa);
+            checkpoint(4);
         }
-        checkpoint();
+        checkpoint(4);
     }
     let bytes=unsafe{core::slice::from_raw_parts_mut(b as *mut u8,IMAGE+ROLE_STACK_BYTES)};
     for page in bytes.chunks_exact_mut(PAGE){
-        page.fill(0);assert!(page.iter().all(|&v|v==0));checkpoint();
+        page.fill(0);assert!(page.iter().all(|&v|v==0));checkpoint(5);
     }
 }
 fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT],
@@ -802,10 +816,12 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         report("V0199_RESTART_SURVIVORS",old.role.id() as u64,progressed,total_delta);
         let (mut credit,mut start)=budget.reserve_recovery_slice(until);
         let mut actual=0u64;let mut slices=0u64;let mut largest=0u64;
-        let mut checkpoint=||{
+        let mut part=0u64;
+        let mut checkpoint=|phase:u64|{
+            part=part.checked_add(1).unwrap();
             if timer::cpu_elapsed_ns(start)>=450_000
                 || credit.deadline_ns().saturating_sub(now_ns())<2_000_000{
-                let cost=budget.settle_recovery_slice(old.role,credit,start);
+                let cost=budget.settle_recovery_slice(old.role,credit,start,phase,part);
                 actual=actual.checked_add(cost).unwrap();slices+=1;largest=largest.max(cost);
                 (credit,start)=budget.reserve_recovery_slice(until);
             }
@@ -820,7 +836,7 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
         assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
         manifest.members[i]=member;
         let checked=manifest.validated().expect("replacement inventory");
-        let cost=budget.settle_recovery_slice(old.role,credit,start);
+        let cost=budget.settle_recovery_slice(old.role,credit,start,19,part+1);
         actual=actual.checked_add(cost).unwrap();slices+=1;largest=largest.max(cost);
         SMP_EVIDENCE.words[56+i].store(slices,Ordering::Relaxed);
         SMP_EVIDENCE.words[64+i].store(largest,Ordering::Relaxed);
