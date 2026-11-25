@@ -3,7 +3,7 @@
 //! and device completion path. This is not a general filesystem mount.
 //! An error after the first write leaves an UNKNOWN obligation; do not retry
 //! at a different location or release the pending durable identity.
-use super::{Error,durable_role_epoch_v0199::{PreparedEpoch,CommitEvidence},
+use super::{Error,durable_role_epoch_v0199::{PreparedEpoch,CommitEvidence,DurableEpochGate,RedoPlacement},
     file_index_v0199::{SecurityStateStoreV2,BLOCK_BYTES},
     file_media_v0199::{SuperblockV1,crc32c_payload,crc32c_zeroed,verify_state_redo_v1,DATA_START,BLOCK_COUNT}};
 use sha2::{Digest,Sha256};
@@ -79,7 +79,16 @@ impl OneStateRedo{
     /// Before any write verify exact prepared identity and canonical afterimage.
     /// BEGIN/REDO -> FLUSH -> COMMIT -> FLUSH -> independent device readback.
     /// Home blocks remain untouched until the journal owner's checkpoint.
-    pub fn append(&mut self,io:&mut impl EpochBlockIo,sb:SuperblockV1,first:u32,home:u32,
+    pub fn append_once(&mut self,io:&mut impl EpochBlockIo,gate:&mut DurableEpochGate,
+        sb:SuperblockV1,first:u32,home:u32,txid:u64,commit_lsn:u64,ticket:PreparedEpoch,
+        verify_reserved_extent:impl FnOnce(&RedoPlacement)->Result<(),Error>,
+    )->Result<VerifiedStateCommit,Error>{
+        let image=gate.after_image(ticket)?;
+        gate.claim_redo_once(ticket,RedoPlacement{fs_uuid:sb.fs_uuid,log_epoch:sb.log_epoch,
+            first,state_home:home,boot_home:None,txid,commit_lsn},verify_reserved_extent)?;
+        self.append(io,sb,first,home,txid,commit_lsn,ticket,&image)
+    }
+    fn append(&mut self,io:&mut impl EpochBlockIo,sb:SuperblockV1,first:u32,home:u32,
         txid:u64,commit_lsn:u64,ticket:PreparedEpoch,image:&[u8;BLOCK_BYTES])
         ->Result<VerifiedStateCommit,Error>{
         let state=SecurityStateStoreV2::decode(image)?;
@@ -148,23 +157,36 @@ mod tests{
         let slots=core::array::from_fn(|i|SlotBinding{role:ROLES[i],slot:i as u8});
         let mut gate=DurableEpochGate::recovered(&raw,slots,|_|Ok(())).unwrap();
         let ticket=gate.prepare(Change::AllocateBoot,|_|panic!("not a stop")).unwrap();
-        let image=gate.after_image(ticket).unwrap();
         let sb=SuperblockV1{fs_uuid:[1;16],generation:1,checkpoint_lsn:0,log_epoch:1};
         let mut scratch=OneStateRedo::zeroed();
         let mut failing=disk(true);
-        assert!(matches!(scratch.append(&mut failing,sb,2,7000,1,3,ticket,&image),Err(Error::Unknown)));
+        assert!(matches!(scratch.append_once(&mut failing,&mut gate,sb,2,7000,1,3,ticket,|_|Ok(())),Err(Error::Unknown)));
         assert_eq!(failing.events[..6],[2,3,4,9,5,9]);assert_eq!(gate.boot_epoch(),None);
-        assert!(matches!(scratch.append(&mut failing,sb,2,7000,1,3,ticket,&image),Err(Error::Conflict)));
+        assert!(matches!(scratch.append_once(&mut failing,&mut gate,sb,2,7000,1,3,ticket,|_|panic!()),Err(Error::Busy)));
+        // Same ticket on a different empty extent/transaction is denied
+        // before any I/O, even if the first COMMIT FLUSH outcome was lost.
+        let mut empty=disk(false);
+        assert!(matches!(scratch.append_once(&mut empty,&mut gate,sb,6,7000,2,6,ticket,|_|panic!()),Err(Error::Conflict)));
+        assert_eq!(empty.count,0);assert_eq!(gate.boot_epoch(),None);
         // Separate successful scenario: never retry the unknown transaction
         // on another device or extent under the original gate.
         let mut gate=DurableEpochGate::recovered(&raw,slots,|_|Ok(())).unwrap();
         let ticket=gate.prepare(Change::AllocateBoot,|_|panic!("not a stop")).unwrap();
-        let image=gate.after_image(ticket).unwrap();
         let mut ok=disk(false);
-        let proof=scratch.append(&mut ok,sb,2,7000,1,3,ticket,&image).unwrap();
+        let proof=scratch.append_once(&mut ok,&mut gate,sb,2,7000,1,3,ticket,|_|Ok(())).unwrap();
         assert_eq!(ok.events[..6],[2,3,4,9,5,9]);
         let receipt=proof.receipt();
-        assert_eq!(gate.confirm(ticket,receipt,scratch.image(),|t,r|proof.verifies(t,r)),
+        assert_eq!(gate.confirm(ticket,receipt,scratch.image(),|_,_|panic!()),Err(Error::Unauthorized));
+        let mut sb_raw=[0;BLOCK_BYTES];
+        put32(&mut sb_raw,0,0x43594653);put16(&mut sb_raw,4,1);put16(&mut sb_raw,6,80);
+        put32(&mut sb_raw,8,4096);put32(&mut sb_raw,12,131072);sb_raw[16..32].fill(1);
+        put64(&mut sb_raw,32,1);put64(&mut sb_raw,48,1);put32(&mut sb_raw,56,4098);
+        put32(&mut sb_raw,60,4102);put32(&mut sb_raw,64,4118);put32(&mut sb_raw,68,256);
+        let c=crc32c_zeroed(&sb_raw,76).unwrap();put32(&mut sb_raw,76,c);
+        assert_eq!(gate.confirm_from_redo(ticket,receipt,scratch.image(),&sb_raw,6,7000,
+            &scratch.begin,&[&scratch.redo],&scratch.commit,|_,_|panic!()),Err(Error::Conflict));
+        assert_eq!(gate.confirm_from_redo(ticket,receipt,scratch.image(),&sb_raw,2,7000,
+            &scratch.begin,&[&scratch.redo],&scratch.commit,|t,r|proof.verifies(t,r)),
             Ok(crate::security::durable_role_epoch_v0199::Outcome::Boot{epoch:1}));
         assert_eq!(gate.boot_epoch(),Some(1));
     }
