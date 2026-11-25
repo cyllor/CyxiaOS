@@ -333,30 +333,8 @@ impl<'a> Ledger<'a> {
         {
             return Err(Error::Invalid);
         }
-        let mut fixed = [MemoryRegion::EMPTY; MAX_STATIC_REGIONS];
-        let mut classes = [StaticClass::Arena; MAX_STATIC_REGIONS];
-        let mut total = 0u32;
-        for (i, sr) in regions.iter().enumerate() {
-            let r = sr.region;
-            let end = r.end().map_err(|_| Error::Invalid)?;
-            if r.len == 0
-                || !r.start.0.is_multiple_of(PAGE)
-                || !r.len.is_multiple_of(PAGE)
-                || r.start.0 < base
-                || end > base + window
-                || r.kind != RegionKind::Reserved
-            {
-                return Err(Error::Invalid);
-            }
-            if fixed[..i].iter().any(|p| p.overlaps(r)) {
-                return Err(Error::Conflict);
-            }
-            fixed[i] = r;
-            classes[i] = sr.class;
-            total = total
-                .checked_add((r.len / PAGE) as u32)
-                .ok_or(Error::Capacity)?;
-        }
+        // base + window cannot overflow: checked above.
+        let (fixed, classes, total) = sparse_records(base, base + window, regions)?;
         if total as usize != rows.len() {
             return Err(Error::Invalid);
         }
