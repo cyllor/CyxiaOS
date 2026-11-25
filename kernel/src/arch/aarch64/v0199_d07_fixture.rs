@@ -12,6 +12,7 @@ use cyxia_kernel_core::control_plane::{
     registered_gate_v3::{RegisteredDecisionGate,Registration,Publication,TrustedRegistrationScope},
     rule_profile_v2::{Profile,Candidates},feedback_v0199::{FeedbackInbox,CausalLabel},
     snapshot_store_v3::{SnapshotStore,Target,DomainObservation},
+    desired_plan_v0199::DesiredBank,
 };
 use sha2::{Digest,Sha256};
 const CTL:Identity=Identity{id:2,generation:1};
@@ -70,7 +71,7 @@ fn retain_bytes(at:usize,bytes:&[u8]){
         SMP_EVIDENCE.words[at+i].store(u64::from_le_bytes(word),Ordering::Relaxed);
     }
 }
-pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut SnapshotStore,inbox:&mut FeedbackInbox){
+pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut SnapshotStore,inbox:&mut FeedbackInbox,desired:&mut DesiredBank){
     assert_eq!(cpu::slot(),0);
     let owner=unsafe{&mut *core::ptr::addr_of_mut!(OWNER)};
     owner.bind(boot,TARGET,1,||if cpu::slot()==0&&timer::frequency()!=0{Ok(())}else{Err(Error::Denied)}).unwrap();
@@ -124,17 +125,24 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
         snapshot_seq:2,sampled_ns:sample,now_ns:now()};
     let actions=[local];let records=[record];
     assert_eq!(gate.register_rule_only(CTL,&plan,&records,&profile,&actions,ctx),Ok(Registration::Frozen));
-    let mut desired=None;let pubctx=TrustedRegistrationScope{now_ns:now(),..ctx};
-    assert_eq!(gate.publish_once(PUB,&plan,&records,&profile,&actions,pubctx,||{
-        if !owner.legal(200,pubctx.now_ns){return Err(Error::Denied);}
-        desired=Some((sha(&plan),2u64));Ok(())
-    }),Ok(Publication::AdapterAccepted));
+    assert_eq!(desired.version(),ctx.base_plan_version);
     let binding=ExecutorBindingV1{domain:7,role:1,active:true,target:TARGET,executor_generation:1,
         holder:Identity{id:0,generation:0},endpoint_cap_id:0};
-    let scope=TrustedApplyScope{boot_epoch:boot,plan_version:2,now_ns:now()};
+    desired.register_target(binding,|b|if b.target==owner.target(){Ok(())}else{Err(Error::Denied)}).unwrap();
+    let pubctx=TrustedRegistrationScope{now_ns:now(),..ctx};
+    assert_eq!(gate.publish_once(PUB,&plan,&records,&profile,&actions,pubctx,||{
+        desired.publish_registered(PUB,cpu::slot(),&plan,pubctx,|stage|{
+            let a=stage[0].ok_or(Error::Denied)?;
+            if stage.len()==1&&a.value==ActionV2::SoftCoalesce(200)&&a.binding==binding
+                &&a.prior_target_version==owner.version()&&owner.legal(200,pubctx.now_ns){Ok(())}
+            else{Err(Error::Denied)}
+        }).map(|_|())
+    }),Ok(Publication::AdapterAccepted));
+    assert_eq!(desired.version(),2);
+    let scope=TrustedApplyScope{boot_epoch:boot,plan_version:desired.version(),now_ns:now()};
     gate.claim_apply_work(&plan,0,scope,binding,ReportOrigin::Kernel,|w|{
-        owner.accept(w,0,until,scope.now_ns,||
-            if desired==Some((sha(&plan),w.plan_version)){Ok(())}else{Err(Error::Denied)})
+        desired.accept(w,ReportOrigin::Kernel,scope.now_ns,|a|
+            owner.accept(w,a.prior_target_version,a.until_ns,scope.now_ns,||Ok(())))
     }).unwrap();
     let mut report_bytes=[0;MAX_APPLY_REPORT_BYTES];
     assert_eq!(owner.report(now(),&mut report_bytes),Err(Error::NotReady));
@@ -160,6 +168,9 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
     let feedback=inbox.read(LEARN,1).unwrap().unwrap();
     assert_eq!(feedback.report_bytes(),&report_bytes[..n]);assert_eq!(feedback.decision,record);
     assert_eq!(feedback.causal_label,CausalLabel::NoAdoption);
+    desired.finish(&r,ReportOrigin::Kernel,now(),|a|{
+        if a.key.plan_seq==summary.plan_seq&&inbox.len()==2{owner.verify_report(&r)}else{Err(Error::NotReady)}
+    }).unwrap();
     owner.retire(&r,||if summary.plan_seq==2&&inbox.len()==2{Ok(())}else{Err(Error::NotReady)}).unwrap();
     let row=[0x4359443037465831,timer::frequency(),requested,baseline.programmed_ns,base_cmp,base_wake,
         hard_req,hard,hard_cmp,hard_wake,soft_req,soft.programmed_ns,soft_cmp,soft_wake,
