@@ -23,12 +23,20 @@ pub struct SnapshotStore{
     boot:u64,sequence:u64,last_sample_ns:u64,targets:[Option<Row>;TARGETS],grants:[Option<ViewGrant>;VIEWS],
 }
 impl SnapshotStore{
+    pub const fn empty()->Self{Self{boot:0,sequence:0,last_sample_ns:0,targets:[None;TARGETS],grants:[None;VIEWS]}}
     pub fn new(boot:u64)->Result<Self,Error>{
+        let mut out=Self::empty();out.bind_boot(boot,||Ok(()))?;Ok(out)
+    }
+    /// Native static storage starts unbound. Bind once after independently
+    /// verified boot confirmation; cannot reset a live registry.
+    pub fn bind_boot(&mut self,boot:u64,verify_boot:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if self.boot!=0{return Err(Error::Busy);}
         if boot==0{return Err(Error::Invalid);}
-        Ok(Self{boot,sequence:0,last_sample_ns:0,targets:[None;TARGETS],grants:[None;VIEWS]})
+        verify_boot()?;self.boot=boot;Ok(())
     }
     pub fn register_target(&mut self,target:Target,
         verify_native_owner:impl FnOnce(Target)->Result<(),Error>)->Result<(),Error>{
+        if self.boot==0{return Err(Error::NotReady);}
         if !(1..=15).contains(&target.domain)||!target.object.valid()||!target.owner.valid()
             ||self.targets.iter().flatten().any(|r|r.target.domain==target.domain&&r.target.object.id==target.object.id){
             return Err(Error::Denied);
@@ -38,6 +46,7 @@ impl SnapshotStore{
     }
     pub fn register_view(&mut self,manifest:&NativeRoleManifest,g:ViewGrant,
         verify_actual_cap:impl FnOnce(ViewGrant)->Result<(),Error>)->Result<(),Error>{
+        if self.boot==0{return Err(Error::NotReady);}
         if g.cap==0||g.selector==0||g.allowed_fields==0||g.allowed_fields&!FIELD_MASK!=0
             ||!self.targets.iter().flatten().any(|r|r.target.domain==g.domain&&r.target.object==g.target)
             ||self.grants.iter().flatten().any(|v|v.cap==g.cap&&v.selector==g.selector){
@@ -54,6 +63,7 @@ impl SnapshotStore{
     pub fn capture(&mut self,ledger:u64,cores:u64,sampled_ns:u64,
         common:[Option<u64>;8],observations:&[DomainObservation],
         mut verify_source:impl FnMut(&DomainObservation)->Result<(),Error>)->Result<u64,Error>{
+        if self.boot==0{return Err(Error::NotReady);}
         if ledger==0||cores==0||sampled_ns<self.last_sample_ns||observations.is_empty()
             ||observations.len()>TARGETS||common[6].is_some()||common[7].is_some(){
             return Err(Error::Invalid);
@@ -85,9 +95,23 @@ impl SnapshotStore{
         }
         self.sequence=seq;self.last_sample_ns=sampled_ns;Ok(seq)
     }
+    /// EL1-only owner handoff of exact captured evidence for candidate
+    /// registration. Unlike a redacted user read, preserves the original
+    /// snapshot bytes (including absent age) and requires the registered
+    /// target/owner, current ledger/core generation and native owner check.
+    pub fn frozen_for_owner(&self,target:Target,ledger:u64,cores:u64,now_ns:u64,
+        verify_owner:impl FnOnce(Target)->Result<(),Error>)->Result<SnapshotReplyV3,Error>{
+        if self.boot==0{return Err(Error::NotReady);}
+        let r=self.targets.iter().flatten().find(|r|r.target==target).ok_or(Error::Stale)?;
+        let snap=r.snapshot.ok_or(Error::NotReady)?;
+        if snap.snapshot_seq!=self.sequence||snap.ledger_generation!=ledger||snap.core_generation!=cores
+            ||now_ns<snap.sampled_ns||now_ns-snap.sampled_ns>=MAX_AGE_NS{return Err(Error::Stale);}
+        verify_owner(target)?;Ok(snap)
+    }
     pub fn read(&self,manifest:&NativeRoleManifest,actor:Identity,cpu:usize,cap:u64,
         domain:u16,selector:u64,ledger:u64,cores:u64,now_ns:u64,
         verify_live_cap:impl FnOnce(ViewGrant)->Result<(),Error>)->Result<[u8;SNAPSHOT_BYTES],Error>{
+        if self.boot==0{return Err(Error::NotReady);}
         let grant=*self.grants.iter().flatten().find(|g|g.cap==cap&&g.holder==actor
             &&g.selector==selector&&g.domain==domain).ok_or(Error::Denied)?;
         manifest.check_snapshot_view(actor,grant.endpoint,cpu,grant.view)?;
@@ -132,6 +156,27 @@ mod tests{
                 actor:Identity{id:u64::from(ROLES[i].id()),generation:1},ttbr0_root:0x100000+i as u64*4096,
                 private_rw:PrivateRegion{base:0x200000+i as u64*4096,bytes:4096},caps:ROLES[i].allowed_caps(),
                 control_ns_per_100ms:1,cpu_mask:1,thread_count:1,endpoint_id:10+i as u64})}
+    }
+    #[test]
+    fn native_frozen_snapshot_requires_bound_boot_and_exact_live_owner(){
+        let mut s=SnapshotStore::empty();let target=Target{domain:15,object:Identity{id:15,generation:1},
+            owner:Identity{id:100,generation:1}};
+        assert_eq!(s.register_target(target,|_|panic!()),Err(Error::NotReady));
+        assert_eq!(s.bind_boot(1,||Err(Error::Denied)),Err(Error::Denied));
+        s.bind_boot(7,||Ok(())).unwrap();
+        assert_eq!(s.bind_boot(8,||panic!()),Err(Error::Busy));
+        s.register_target(target,|_|Ok(())).unwrap();
+        let o=DomainObservation{target,fields:[Some(17),None,None,None]};
+        s.capture(2,3,100,[None;8],&[o],|_|Ok(())).unwrap();
+        let v=s.frozen_for_owner(target,2,3,101,|_|Ok(())).unwrap();
+        assert_eq!(v.boot_epoch,7);assert_eq!(v.snapshot_seq,1);assert_eq!(v.fields[8],Some(17));
+        assert_eq!(v.fields[6],None);
+        let bad=Target{owner:Identity{generation:2,..target.owner},..target};
+        assert!(matches!(s.frozen_for_owner(bad,2,3,101,|_|panic!()),Err(Error::Stale)));
+        assert!(matches!(s.frozen_for_owner(target,3,3,101,|_|panic!()),Err(Error::Stale)));
+        assert!(matches!(s.frozen_for_owner(target,2,3,101,|_|Err(Error::Denied)),Err(Error::Denied)));
+        s.retire_target(target,|_|Ok(())).unwrap();
+        assert!(matches!(s.frozen_for_owner(target,2,3,101,|_|panic!()),Err(Error::Stale)));
     }
     #[test]
     fn snapshot_scope_redaction_age_and_retirement(){
