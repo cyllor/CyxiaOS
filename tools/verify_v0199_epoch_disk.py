@@ -361,7 +361,22 @@ class EpochFixture:
         require(struct.unpack_from('<QQQHHHHQQQQiIQ',ar)==(e,1,2,0,7,1,0,7,1,1,2,0,2,s_done)
                 and ar[80:96]==bytes(16) and ar[96:]==struct.pack('<H',200),
                 'D07 ApplyReport differs from actual retained comparator effect')
-        require(all(v==0 for v in w[360:]),'nonzero reserved evidence')
+        # Writable owner metadata is within the exact pre-reserved control
+        # pool, following the 8 role backings, 16 three-page table sets and
+        # 128KiB stable-copy scratch; no extra physical pool.
+        magic_pool,owners,owner_bytes,loader_end=w[360:364]
+        expected_loader_end=8*(65536+32768)+16*3*4096+131072
+        require(magic_pool==0x435944504f4f4c31 and loader_end==expected_loader_end
+                and owners==control+loader_end and owners%4096==0
+                and 0<owner_bytes<=1024*1024 and owner_bytes%4096==0
+                and owners+owner_bytes<=control+control_bytes,'invalid native effect metadata arena')
+        last=0
+        for i,cap in enumerate((65536,65536,65536,65536,98304)):
+            off,size=w[364+i*2:366+i*2]
+            require(off%8==0 and last<=off and 0<size<=cap and off+size<=owner_bytes,
+                    'overlapping or out-of-pool native owner table')
+            last=off+size
+        require(all(v==0 for v in w[374:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -379,6 +394,8 @@ class EpochFixture:
                     d07_feedback_records=s_retained,production_d07_business_scheduler_verified=False,
                     frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
                     control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
+                    effect_owner_pool_pa=owners,effect_owner_pool_bytes=owner_bytes,
+                    effect_owner_pool_bounds_verified=True,
                     permanent_frames=permanent,frame_meta_physical_dump_verified=False,
                     paired_boot_epoch_redo_verified=True,
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
@@ -418,8 +435,23 @@ class EpochFixture:
         sample=out/'reclaimed-frame.bin'
         qmp.execute('pmemsave',{'val':page_pa,'size':BLOCK,'filename':str(sample)})
         require(sample.read_bytes()==bytes(BLOCK),'secret page was not actually zero after reclaim')
+        # Read the actual stopped-guest owner arena. Independently match
+        # BOTH exact decision and ApplyReport byte strings inside its
+        # designated feedback table. No Rust struct ABI is inferred.
+        owners,owner_bytes=w[361:363]
+        off,size=w[372:374]
+        owner_path=out/'effect-owners.bin'
+        qmp.execute('pmemsave',{'val':owners,'size':owner_bytes,'filename':str(owner_path)})
+        owner_raw=owner_path.read_bytes()
+        require(len(owner_raw)==owner_bytes,'incomplete effect owner physical dump')
+        custody=owner_raw[off:off+size]
+        for d,r in ((page[175*8:207*8],page[207*8:207*8+w[99]]),
+                    (page[315*8:347*8],page[347*8:347*8+w[239]])):
+            require(len(d)==256 and len(r)==98 and custody.count(d)==1 and custody.count(r)==1,
+                    'actual feedback table missing or duplicating exact retained effect bytes')
         return dict(frame_meta_physical_dump_verified=True,frame_meta_sha256=hashlib.sha256(raw).hexdigest(),
-                    reclaimed_page_zero_verified=True)
+                    reclaimed_page_zero_verified=True,effect_owner_pool_dump_verified=True,
+                    effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest())
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
