@@ -89,6 +89,14 @@ mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
 #[path = "v0199_format_fixture.rs"]
 mod v0199_format_fixture;
+// Dedicated scratch VirtIO-blk plumbing, shared by the format fixture and the
+// v020 opt-in media-staging lane (production/media_staging.rs).
+#[cfg(any(
+    feature = "v0199-format-selftest",
+    feature = "v020-production-media-staging"
+))]
+#[path = "scratch_blk.rs"]
+mod scratch_blk;
 // SEC-N local-echo guest loader + SVC 0x43 broker, shared by the SEC-N fixture
 // and the v020-production boot (production/net.rs).
 #[cfg(any(feature = "v0199-sec-n-selftest", feature = "v020-production"))]

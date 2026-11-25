@@ -10,12 +10,7 @@
 //! an unsigned fixed test input, not a signed boot catalog; no production
 //! format path, production mount or ordinary file authority is established.
 use super::*;
-use crate::virtio_platform::Board;
-use cyxia_driver_virtio::{
-    Platform, Transport,
-    block::{BatchedBlock, Operation, SECTOR_BYTES},
-    queue::{BatchMemory, Token},
-};
+use cyxia_driver_virtio::block::BatchedBlock;
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     boot_epoch_v1::BootEpochStoreV1,
@@ -70,7 +65,6 @@ const SYSTEM: [SystemObject; 4] = [
         first_block: SECURITY_HOME,
     },
 ];
-static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 static mut FORMAT: FormatWorkspace = FormatWorkspace::new();
 static mut MOUNT: MountWorkspace = MountWorkspace::new();
 static mut TRACE: [u64; TRACE_CAP] = [0; TRACE_CAP];
@@ -94,98 +88,18 @@ struct Disk {
     flushes: u64,
 }
 impl Disk {
-    // One 4 KiB block is exactly eight 512-byte sector requests. The batch
-    // queue keeps all eight in flight under one bounded notify policy; every
-    // completion is individually validated and acknowledged before the block
-    // is reported complete. No buffered or inferred completion is accepted.
+    // Block plumbing (eight validated sector requests per block, isolated
+    // synchronous FLUSH) is shared with the V0.20 media-staging lane.
     fn sectors(
         &mut self,
         first: u64,
         write: Option<&[u8; BLOCK_BYTES]>,
         out: &mut [u8; BLOCK_BYTES],
     ) -> Result<(), SecurityError> {
-        let mut tokens: [Option<Token>; 8] = [None; 8];
-        for (i, slot) in tokens.iter_mut().enumerate() {
-            let operation = match write {
-                None => Operation::Read(first + i as u64),
-                Some(_) => Operation::Write(first + i as u64),
-            };
-            let input: &[u8; SECTOR_BYTES] = match write {
-                None => &[0; SECTOR_BYTES],
-                Some(data) => data[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES]
-                    .try_into()
-                    .unwrap(),
-            };
-            *slot = Some(
-                self.device
-                    .begin(operation, input, false, false, &Board)
-                    .map_err(|_| SecurityError::Unknown)?,
-            );
-        }
-        self.device
-            .drain(&Board)
-            .map_err(|_| SecurityError::Unknown)?;
-        let mut done = [false; 8];
-        let mut remaining = 8usize;
-        while remaining != 0 {
-            let mut bytes = [0; SECTOR_BYTES];
-            match self
-                .device
-                .poll(&mut bytes, &Board)
-                .map_err(|_| SecurityError::Unknown)?
-            {
-                Some(c) => {
-                    let i = tokens
-                        .iter()
-                        .position(|t| *t == Some(c.token))
-                        .ok_or(SecurityError::Unknown)?;
-                    let expected = match write {
-                        None => Operation::Read(first + i as u64),
-                        Some(_) => Operation::Write(first + i as u64),
-                    };
-                    if done[i] || c.operation != expected {
-                        return Err(SecurityError::Unknown);
-                    }
-                    if write.is_none() {
-                        out[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES].copy_from_slice(&bytes);
-                    }
-                    self.device
-                        .acknowledge(c.token)
-                        .map_err(|_| SecurityError::Unknown)?;
-                    done[i] = true;
-                    remaining -= 1;
-                }
-                None => core::hint::spin_loop(),
-            }
-        }
-        Ok(())
+        super::scratch_blk::sectors(&mut self.device, first, write, out)
     }
     fn flush_device(&mut self) -> Result<(), SecurityError> {
-        // Synchronous isolated FLUSH: only the actual device completion, not
-        // queue admission or a CPU barrier, may satisfy this call.
-        let token = self
-            .device
-            .begin(Operation::Flush, &[0; SECTOR_BYTES], true, true, &Board)
-            .map_err(|_| SecurityError::Unknown)?;
-        loop {
-            let mut bytes = [0; SECTOR_BYTES];
-            match self
-                .device
-                .poll(&mut bytes, &Board)
-                .map_err(|_| SecurityError::Unknown)?
-            {
-                Some(c) => {
-                    if c.token != token || c.operation != Operation::Flush {
-                        return Err(SecurityError::Unknown);
-                    }
-                    self.device
-                        .acknowledge(c.token)
-                        .map_err(|_| SecurityError::Unknown)?;
-                    return Ok(());
-                }
-                None => core::hint::spin_loop(),
-            }
-        }
+        super::scratch_blk::flush(&mut self.device)
     }
 }
 impl EpochBlockIo for Disk {
@@ -215,45 +129,7 @@ impl EpochBlockIo for Disk {
     }
 }
 fn attach(info: &BootInfo) -> Disk {
-    let mut selected = None;
-    for resource in &info.virtio[..info.virtio_count] {
-        if resource.base.0 < 0x0a000000
-            || resource
-                .base
-                .0
-                .checked_add(resource.len)
-                .is_none_or(|e| e > 0x0a200000)
-        {
-            continue;
-        }
-        let Ok(t) = (unsafe {
-            Transport::attach(
-                (crate::HIGH + resource.base.0) as usize,
-                resource.len as usize,
-            )
-        }) else {
-            continue;
-        };
-        if t.device_id() == 2 {
-            assert!(selected.is_none());
-            selected = Some(t);
-        }
-    }
-    let mut device = BatchedBlock::attach(
-        selected.expect("one dedicated scratch block device"),
-        unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) },
-        &Board,
-    )
-    .expect("modern VirtIO FLUSH device");
-    assert_eq!(device.sectors(), u64::from(BLOCK_COUNT) * 8);
-    assert!(!device.read_only());
-    // Bounded fixture notify policy: one doorbell per eight-sector block.
-    // FLUSH requests stay synchronous regardless of the batch policy.
-    let now = Board.now_ns();
-    device
-        .set_notify_policy(8, 1, now.saturating_add(120_000_000_000), now)
-        .expect("bounded batch notify policy");
-    device.set_completion_interrupts(false, &Board);
+    let device = super::scratch_blk::attach(info).expect("one dedicated modern VirtIO FLUSH scratch device");
     Disk {
         device,
         reads: 0,
