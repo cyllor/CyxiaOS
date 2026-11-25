@@ -114,8 +114,11 @@ impl<'a> TrainingData<'a>{
     }
 }
 pub struct Trainer<'a>{data:TrainingData<'a>,layer:LastLayer<'a>,parent:[u8;32],learner:Identity}
-pub struct CandidateModel{bytes:[u8;MODEL_BYTES],parent:[u8;32],data:[u8;32],schemas:SchemaBinding}
-impl CandidateModel{pub fn bytes(&self)->&[u8;MODEL_BYTES]{&self.bytes}}
+pub struct CandidateModel{bytes:[u8;MODEL_BYTES],parent:[u8;32],data:[u8;32],schemas:SchemaBinding,learner:Identity}
+impl CandidateModel{
+    pub fn bytes(&self)->&[u8;MODEL_BYTES]{&self.bytes}
+    pub fn learner(&self)->Identity{self.learner}
+}
 impl<'a> Trainer<'a>{
     pub fn start(data:TrainingData<'a>,active:&'a[u8;MODEL_BYTES],learner:Identity,
         verify_active:impl FnOnce(Identity,&[u8;MODEL_BYTES],SchemaBinding)->Result<(),Error>)->Result<Self,Error>{
@@ -134,7 +137,7 @@ impl<'a> Trainer<'a>{
     }
     pub fn finish(self)->Result<CandidateModel,Error>{
         Ok(CandidateModel{bytes:self.layer.finish().map_err(|_|Error::NotReady)?,
-            parent:self.parent,data:self.data.hash,schemas:self.data.schemas})
+            parent:self.parent,data:self.data.hash,schemas:self.data.schemas,learner:self.learner})
     }
 }
 /// Bounded consumed experiment groups. A failed validation consumes its
@@ -150,7 +153,11 @@ impl Holdouts{
         training:&TrainingData<'_>,holdout:&[Sample],
         verify_native:impl FnOnce(Identity,&[u8;MODEL_BYTES],&CandidateModel,&[Sample])->Result<(),Error>)
         ->Result<ValidationEvidence,Error>{
-        if !validator.valid()||model.schemas!=training.schemas||model.data!=training.hash
+        // Independent validation must not be performed by the training
+        // identity, including a restart with a new generation. The native
+        // verifier still authenticates both registered role capabilities.
+        if !validator.valid()||validator.id==model.learner.id
+            ||model.schemas!=training.schemas||model.data!=training.hash
             ||model.parent!=<[u8;32]>::from(Sha256::digest(active))
             ||!sgd_v2::frozen_equal(active,&model.bytes){return Err(Error::Denied);}
         split_ok(holdout,training.schemas,4)?;
@@ -234,6 +241,13 @@ mod tests{
         let model=trainer.finish().unwrap();
         let training=TrainingData::freeze(&rows,SCHEMAS).unwrap();
         let mut ledger=Holdouts::new();let group=holdout[0].group;
+        assert_eq!(model.learner(),actor);
+        // Deny self-validation before calling the native verifier or
+        // consuming independent holdouts; a generation change is no bypass.
+        for identity in [actor,Identity{id:actor.id,generation:actor.generation+1}]{
+            assert!(matches!(ledger.validate(identity,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
+        }
+        assert_eq!(ledger.len,0);
         holdout[0].group=rows[0].group;
         assert!(matches!(ledger.validate(validator,&active,&model,&training,&holdout,|_,_,_,_|panic!()),Err(Error::Denied)));
         holdout[0].group=group;
