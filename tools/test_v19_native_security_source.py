@@ -582,6 +582,31 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub(crate) fn run_until_park<P: Port>(", broker)
         self.assertIn('link_section = ".bss.sec_n', broker)
 
+    def test_v020_wave11_media_staging_is_opt_in(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        staging = 'feature = "v020-production-media-staging"'
+        prod = source(arm / "production.rs")
+        # The module is mounted only under the opt-in staging feature.
+        self.assertEqual(prod.count("mod media_staging;"), 1)
+        before = prod.split("mod media_staging;")[0].splitlines()[-2:]
+        self.assertEqual(before[0].strip(), f"#[cfg({staging})]")
+        self.assertEqual(before[1].strip(), '#[path = "production/media_staging.rs"]')
+        media = source(arm / "production/media_staging.rs")
+        self.assertIn("pub(super) fn stage(info: &BootInfo) -> StagingOutcome", media)
+        self.assertIn("golden_vector_pending=1", media)
+        # Outside staging the in-vector 0x40 branch still answers EAGAIN.
+        arm40 = prod.split("0x40 => {", 1)[1].split("0x50 if", 1)[0]
+        self.assertIn(f"#[cfg(not({staging}))]", arm40)
+        self.assertRegex(arm40, r"#\[cfg\(not\(" + staging.replace('"', '\\"').replace("(", r"\(")
+                         + r"\)\)\]\s*\{?\s*EAGAIN as u64")
+        self.assertIn(f"#[cfg({staging})]", arm40)
+        self.assertIn("media_staging::snapshot_0x40(", arm40)
+        # v020-production must not imply the staging feature.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        line = [l for l in manifest.splitlines() if l.startswith("v020-production = ")][0]
+        self.assertNotIn("media-staging", line)
+        self.assertNotIn("prototype-memory", line)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

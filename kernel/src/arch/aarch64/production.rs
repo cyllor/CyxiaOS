@@ -38,10 +38,13 @@
 //! handler, DMA or secondary CPU touches these statics or the advice spaces
 //! (index >= C*2). Secondary CPUs only run the smp business fixture; their EL0
 //! faults write only their own per-CPU recovery accumulator in recovery.rs
-//! (registered there), never any static listed here. The one DMA user is the
-//! SEC-N VirtIO-net device driven by net.rs after the business CPUs stopped;
-//! its pinned pools, stream buffers and guest pool are registered in
-//! net_device.rs / production/net.rs / sec_n_broker.rs, never listed here.
+//! (registered there), never any static listed here. The DMA users are the
+//! SEC-N VirtIO-net device driven by net.rs and, ONLY under the opt-in
+//! v020-production-media-staging feature, the scratch VirtIO-blk device driven
+//! by media_staging.rs, both synchronously on CPU0 after the business CPUs
+//! stopped; their pools/queues/workspaces are registered in net_device.rs /
+//! production/net.rs / sec_n_broker.rs / scratch_blk.rs /
+//! production/media_staging*.rs, never listed here.
 //! * LEDGER/GATE (static mut MaybeUninit) via ledger_ptr()/gate_ptr():
 //!   ptr::write-initialized once in init_control_guards() before any dispatch.
 //!   Every later &mut/&* is created and consumed within one synchronous CPU0
@@ -103,6 +106,9 @@ use sha2::{Digest, Sha256};
 mod evidence;
 #[path = "production/frames.rs"]
 mod frames;
+#[cfg(feature = "v020-production-media-staging")]
+#[path = "production/media_staging.rs"]
+mod media_staging;
 #[path = "production/meter.rs"]
 mod meter;
 #[path = "production/net.rs"]
@@ -924,7 +930,14 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
                 return EFAULT as u64;
             }
             PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
-            EAGAIN as u64
+            #[cfg(feature = "v020-production-media-staging")]
+            {
+                media_staging::snapshot_0x40()
+            }
+            #[cfg(not(feature = "v020-production-media-staging"))]
+            {
+                EAGAIN as u64
+            }
         }
         0x50 if args[2] == 64 => {
             // Supervisor AUDIT_READ op1: only the supervisor role, cap + span.
@@ -1745,6 +1758,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
 
     // SEC-N: real VirtIO-net + TCP relayed to the EL0 local-echo guest.
     let net_outcome = net::serve(info);
+    // Opt-in G-B media staging on a throw-away scratch VirtIO-blk disk.
+    #[cfg(feature = "v020-production-media-staging")]
+    let staging_outcome = media_staging::stage(info);
 
     // (11) QMP-readable evidence page.
     let words = unsafe { &*core::ptr::addr_of!(SMP_EVIDENCE) };
@@ -1864,6 +1880,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     recovery::publish();
     meter::publish();
     net::publish(&net_outcome);
+    #[cfg(feature = "v020-production-media-staging")]
+    media_staging::publish(&staging_outcome);
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the

@@ -1126,4 +1126,116 @@ mod tests {
         assert!(d.ops.is_empty());
         assert!(w.steps().is_empty());
     }
+    // Mirrors the V0.20 wave-11 opt-in media-staging lane (kernel
+    // production/media_staging): baseline objects on the ratified unified
+    // inode slots at the unified host canonical-map positions, root at the
+    // first canonical business block, so the image both mounts through the
+    // frozen v1 validator and bridges to the N=8 unified map. Then the boot
+    // epoch authority allocates epoch 1 on the formatted image exactly once.
+    // Fixture-derived host vector, NOT a golden vector.
+    #[test]
+    fn unified_slot_staging_manifest_formats_mounts_and_allocates_boot_epoch() {
+        use super::super::boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo};
+        use super::super::durable_role_epoch_v0199::SlotBinding;
+        use super::super::file_media_unified_v1::{
+            self as unified, CANONICAL_BUSINESS_START, UnifiedSystemKind, UnifiedSystemObject,
+        };
+        use crate::control_plane::role_manifest_v0199::ROLES;
+        let obj = |kind, inode, first_block| SystemObject {
+            kind,
+            inode,
+            generation: 1,
+            first_block,
+        };
+        let mut m = manifest();
+        m.root_block = CANONICAL_BUSINESS_START;
+        m.system = [
+            obj(SystemKind::BootEpoch, unified::BOOT_INODE, DATA_START),
+            obj(
+                SystemKind::Receipts,
+                unified::RECEIPTS_INODE,
+                DATA_START + 1,
+            ),
+            obj(SystemKind::Acl, unified::ACL_INODE, DATA_START + 8),
+            obj(
+                SystemKind::Security,
+                unified::SECURITY_INODE,
+                DATA_START + 12,
+            ),
+        ];
+        let mut d = Disk::blank();
+        let mut w = FormatWorkspace::new();
+        let e = format(&mut d, BLOCK_COUNT, &m, &mut w).unwrap();
+        let mut mw = MountWorkspace::new();
+        let v = file_mount_v1::validate(
+            &mut d,
+            e.superblock,
+            &m.system,
+            &m.principals,
+            &mut mw,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((v.system_blocks, v.structure.live_inodes), (13, 5));
+        let snap = |kind: UnifiedSystemKind| UnifiedSystemObject {
+            kind,
+            inode: kind.inode_slot(),
+            generation: 1,
+            first_block: kind.fixed_first_block().unwrap(),
+        };
+        let map = unified::unified_map_from_baseline(
+            &m.system,
+            &[
+                snap(UnifiedSystemKind::SnapshotCatalog),
+                snap(UnifiedSystemKind::SnapshotSlot),
+                snap(UnifiedSystemKind::SnapshotRequest),
+                snap(UnifiedSystemKind::SnapshotProtection),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            unified::validate_unified_system_map(&map)
+                .unwrap()
+                .system_blocks,
+            151
+        );
+        let (sb0, sb1) = (*d.blocks[&0], *d.blocks[&1]);
+        assert_eq!(
+            unified::unified_superblock_pair(&sb0, &sb1),
+            Ok(e.superblock)
+        );
+        // The baseline formatter never touches the new snapshot ranges.
+        assert!((4131..4269).all(|b| !d.blocks.contains_key(&b)));
+        let state = *d.blocks[&(DATA_START + 12)];
+        let boot = *d.blocks[&DATA_START];
+        let slots = core::array::from_fn(|i| SlotBinding {
+            role: ROLES[i],
+            slot: i as u8,
+        });
+        let mut auth = BootEpochAuthority::open(&state, &boot, slots, |s| {
+            if *s == v.security {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            }
+        })
+        .unwrap();
+        assert_eq!(auth.confirmed_epoch(), None);
+        let tx = BootEpochTx {
+            superblock_raw: &sb0,
+            first_log_block: 2,
+            state_home: DATA_START + 12,
+            boot_home: DATA_START,
+            txid: 1,
+            commit_lsn: 4,
+        };
+        let mut pair = BootPairRedo::new();
+        assert_eq!(auth.allocate(&mut d, &mut pair, tx).unwrap().epoch(), 1);
+        assert_eq!(auth.confirmed_epoch(), Some(1));
+        let mut again = BootPairRedo::new();
+        assert_eq!(
+            auth.allocate(&mut d, &mut again, tx).err(),
+            Some(Error::Conflict)
+        );
+    }
 }

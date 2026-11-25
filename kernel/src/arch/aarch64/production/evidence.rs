@@ -38,6 +38,14 @@ pub const W11_STAGED_BOOT_EPOCH: usize = 143;
 pub const W11_MEDIA_STAGING: usize = 144;
 /// First word of the media-staging segment (Task 6); G-A leaves it zero.
 pub const W11_STAGING_BASE: usize = 145;
+// Media-staging rows (Task 6; written only under v020-production-media-staging).
+pub const W11_STAGING_FORMATTED: usize = 145;
+pub const W11_STAGING_MOUNT_VALIDATED: usize = 146;
+pub const W11_STAGING_UNIFIED_MAP: usize = 147;
+pub const W11_STAGING_CONFIRMED_EPOCH: usize = 148;
+pub const W11_STAGING_ADMISSION_FLOW: usize = 149;
+pub const W11_STAGING_SNAPSHOT_FAIL_CLOSED: usize = 150;
+pub const W11_STAGING_GOLDEN_VECTOR_PENDING: usize = 151;
 
 /// Store `value` at evidence word `word`; only 128..160 is writable here.
 pub fn put(word: usize, value: u64) {
