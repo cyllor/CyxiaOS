@@ -83,19 +83,32 @@ impl Owner{
         Ok(self.rows[self.row(caller,id)?].unwrap().state)
     }
     fn limit(g:Group,now:u64)->u16{if now<g.until{g.limit}else{2}}
+    pub fn version(&self,group:Identity)->Result<u64,Error>{Ok(self.groups[self.group(group)?].unwrap().version)}
+    pub fn observation(&self,group:Identity,other_live:usize,now:u64)->Result<[Option<u64>;4],Error>{
+        self.ready(now)?;self.group(group)?;
+        let (pending,live,unknown)=self.counts();
+        let live=if unknown==0{Some(other_live.checked_add(live).ok_or(Error::Exhausted)? as u64)}else{None};
+        Ok([None,live,None,Some(pending as u64)])
+    }
+    pub fn legal(&self,group:Identity,limit:u16,now:u64)->bool{
+        if self.ready(now).is_err()||!ActionV2::SpawnTokens(limit).valid(){return false;}
+        let Ok(i)=self.group(group)else{return false;};let g=self.groups[i].unwrap();
+        if g.work.is_some(){return false;}
+        let changed=Self::limit(g,now)!=limit;
+        !changed||!(g.last_change!=0&&now-g.last_change<WINDOW
+            ||g.changes[..g.change_count].iter().filter(|&&t|now-t<1_000_000_000).count()>=4)
+    }
     pub fn accept(&mut self,w:&ApplyWorkV1<'_>,base:u64,until:u64,now:u64,
         verify_live:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
         self.ready(now)?;
         if w.domain!=2||!w.key.valid()||w.key.boot_epoch!=self.boot||w.executor_generation!=self.executor
             ||w.action_index>=16{return Err(Error::Denied);}
-        let i=self.group(w.target)?;let g=self.groups[i].as_mut().unwrap();
-        if g.version!=base||w.plan_version<=base{return Err(Error::Stale);}
-        if g.work.is_some(){return Err(Error::Busy);}
+        let i=self.group(w.target)?;
+        if self.groups[i].unwrap().version!=base||w.plan_version<=base{return Err(Error::Stale);}
         if until<=now||until-now>10_000_000_000{return Err(Error::Expired);}
         let ActionV2::SpawnTokens(limit)=ActionV2::decode(2,1,w.payload)? else{return Err(Error::Invalid);};
-        let changed=Self::limit(*g,now)!=limit;
-        if changed&&(g.last_change!=0&&now-g.last_change<WINDOW
-            ||g.changes[..g.change_count].iter().filter(|&&t|now-t<1_000_000_000).count()>=4){return Err(Error::Busy);}
+        if !self.legal(w.target,limit,now){return Err(Error::Busy);}
+        let g=self.groups[i].as_mut().unwrap();let changed=Self::limit(*g,now)!=limit;
         verify_live()?;
         if changed{
             if g.change_count<4{g.changes[g.change_count]=now;g.change_count+=1;}
@@ -196,9 +209,14 @@ impl Owner{
             plan_version:w.version,result:if state==ActionStatus::Applied{0}else{-7},completed_ns,
             action:&w.limit.to_le_bytes()}.encode(out)
     }
+    pub fn verify_report(&self,r:&ApplyReportV1<'_>)->Result<(),Error>{
+        let mut out=[0;MAX_APPLY_REPORT_BYTES];let n=self.report(r.target,&mut out)?;
+        if ApplyReportV1::decode(&out[..n])?!=*r{return Err(Error::Denied);}Ok(())
+    }
     pub fn retire(&mut self,group:Identity,wire:&[u8],verify_custody:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
-        let mut out=[0;MAX_APPLY_REPORT_BYTES];let n=self.report(group,&mut out)?;
-        if wire!=&out[..n]{return Err(Error::Denied);}
+        let r=ApplyReportV1::decode(wire)?;
+        if r.target!=group{return Err(Error::Denied);}
+        self.verify_report(&r)?;
         verify_custody()?;let i=self.group(group)?;self.groups[i].as_mut().unwrap().work=None;Ok(())
     }
 }
