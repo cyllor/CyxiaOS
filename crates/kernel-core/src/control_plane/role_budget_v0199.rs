@@ -54,14 +54,27 @@ pub struct Cpu0BudgetLedger {
     security_count:u8,
     decision_spent:[u64;15],
     ordinary_closed:bool,
+    continuous:bool,
 }
 impl Default for Cpu0BudgetLedger {fn default()->Self{Self::new()}}
 impl Cpu0BudgetLedger {
     pub const fn new()->Self{Self{
         window:None,last_ns:0,serial:0,active:None,active_start_ns:0,spent:[0;6],role_spent:[0;ROLE_COUNT],kernel_coordination_spent:0,lifetime_spent:[0;6],max_window_upper_ns:0,
         operations_seen:0,security_count:0,decision_spent:[0;15],
-        ordinary_closed:false,
+        ordinary_closed:false,continuous:false,
     }}
+    /// Native interval accounting starts at an authenticated observation
+    /// before any admitted turn. Subsequent debit and reservation boundaries
+    /// must be contiguous. A missing interval cannot be silently skipped by
+    /// waiting for a new window. No exact split is inferred from wall time.
+    pub fn start_continuous(&mut self,cpu:usize,initial_ns:u64,
+        verify_origin:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if cpu!=CONTROL_CPU{return Err(Error::Denied);}
+        if self.continuous||self.window.is_some()||self.active.is_some()||self.serial!=0||self.last_ns!=0{
+            return Err(Error::Busy);
+        }
+        verify_origin()?;self.last_ns=initial_ns;self.continuous=true;Ok(())
+    }
     pub fn spent(&self,class:Class)->u64{self.spent[class.index()]}
     pub fn ordinary_closed(&self)->bool{self.ordinary_closed}
     pub fn kernel_coordination_spent(&self)->u64{self.kernel_coordination_spent}
@@ -90,6 +103,9 @@ impl Cpu0BudgetLedger {
         if cpu!=CONTROL_CPU{return Err(Error::Denied);}
         if self.active.is_some(){return Err(Error::Busy);}
         if start_ns<self.last_ns||now_ns<start_ns{return Err(Error::Clock);}
+        if self.continuous&&start_ns!=self.last_ns{
+            self.ordinary_closed=true;return Err(Error::Clock);
+        }
         self.time(start_ns)?;
         self.enter_window(start_ns)?;
         let idx=Class::Coordination.index();
@@ -125,6 +141,7 @@ impl Cpu0BudgetLedger {
         if self.active.is_some(){return Err(Error::Busy);}
         if segments.is_empty()||segments.len()>64{return Err(Error::Invalid);}
         let start=segments[0].start_ns;
+        if self.continuous&&start!=self.last_ns{self.ordinary_closed=true;return Err(Error::Clock);}
         if start<self.last_ns||self.window.is_some()&&start!=self.last_ns{return Err(Error::Clock);}
         let mut cursor=start;let mut total=0u64;
         for segment in segments{
@@ -234,6 +251,7 @@ impl Cpu0BudgetLedger {
     fn reserve(&mut self,actor:Option<Identity>,role:Option<(usize,u64)>,class:Class,domain:u16,
         requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
         if self.active.is_some(){return Err(Error::Busy);}
+        if self.continuous&&now!=self.last_ns{self.ordinary_closed=true;return Err(Error::Clock);}
         self.time(now)?;
         if self.ordinary_closed && class!=Class::Recovery{return Err(Error::Denied);}
         let end=self.enter_window(now)?;
@@ -400,6 +418,21 @@ mod tests{
                 caps:ROLES[i].allowed_caps(),control_ns_per_100ms:[30_000_000,8_000_000,4_000_000,3_500_000,4_000_000,3_000_000,4_500_000,3_000_000][i],
                 cpu_mask:1,thread_count:1,endpoint_id:i as u64+1}),
             other_protected_pool_bytes:5*1024*1024,other_control_ns_per_100ms:10_000_000}
+    }
+    #[test]
+    fn continuous_accounting_cannot_skip_unsampled_interval_for_a_new_grant(){
+        let m=manifest();let mut q=Cpu0BudgetLedger::new();
+        q.start_continuous(0,100,||Ok(())).unwrap();
+        q.account_coordination_gap(0,100,110,5).unwrap();
+        assert_eq!(q.reserve_role_with_wall(&m,m.members[2].actor,0,Class::Decision,1,250_000,50_000_000,120),Err(Error::Clock));
+        assert!(q.ordinary_closed());
+        assert_eq!(q.lifetime_total(),Ok(5));
+        assert_eq!(q.account_coordination_gap(0,120,130,5),Err(Error::Clock));
+        q.account_coordination_gap(0,110,130,10).unwrap();
+        assert_eq!(q.reserve_role_with_wall(&m,m.members[2].actor,0,Class::Decision,1,250_000,50_000_000,130),Err(Error::Denied));
+        let t=q.reserve_kernel_with_wall(0,Class::Recovery,100,1000,130).unwrap();
+        q.settle(0,t,10,140).unwrap();
+        assert_eq!(q.lifetime_total(),Ok(25));
     }
     #[test]
     fn measured_role_turn_retains_exact_boundary_charge_and_closes_real_overrun(){
