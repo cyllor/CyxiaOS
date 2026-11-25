@@ -17,7 +17,18 @@ pub struct TimerArm{
     pub timer:Identity,pub serial:u64,pub requested_ns:u64,pub programmed_ns:u64,pub policy_version:u64,
 }
 #[derive(Clone,Copy)]
-struct Entry{timer:Identity,class:TimerClass,slack_ns:u64,active:Option<TimerArm>,pending:Option<TimerArm>}
+struct Entry{timer:Identity,class:TimerClass,slack_ns:u64,live:bool,active:Option<TimerArm>,pending:Option<PendingArm>}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+struct PendingArm{arm:TimerArm,started_ns:u64}
+/// An independent timer backend must prove either that the proposed
+/// compare was accepted at the recorded time, or that it had no effect
+/// and the retained prior arm is unchanged. Mere timeout is neither.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum ArmResolution{PriorUnchanged,Programmed{completed_ns:u64}}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct UncertainArm{
+    pub prior:Option<TimerArm>,pub proposed:TimerArm,pub started_ns:u64,
+}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct ArmEvidence{pub arm:TimerArm,pub started_ns:u64,pub completed_ns:u64}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -61,26 +72,34 @@ impl Owner{
         Ok(())
     }
     fn index(&self,id:Identity)->Result<usize,Error>{
-        self.entries.iter().position(|v|v.is_some_and(|e|e.timer==id)).ok_or(Error::Stale)
+        self.entries.iter().position(|v|v.is_some_and(|e|e.live&&e.timer==id)).ok_or(Error::Stale)
     }
     pub fn register(&mut self,id:Identity,class:TimerClass,slack_ns:u64,verify:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
         if self.boot==0||self.poisoned{return Err(Error::NotReady);}
         if !id.valid()||class!=TimerClass::Soft{return Err(Error::Denied);}
-        if self.entries.iter().flatten().any(|e|e.timer.id==id.id){return Err(Error::Busy);}
-        let slot=self.entries.iter_mut().find(|v|v.is_none()).ok_or(Error::Exhausted)?;
-        verify()?;*slot=Some(Entry{timer:id,class,slack_ns,active:None,pending:None});Ok(())
+        // Retain a bounded generation tombstone. Unrelated object IDs
+        // may not evict it and thereby resurrect stale timer tickets.
+        let old=self.entries.iter().position(|v|v.is_some_and(|e|e.timer.id==id.id));
+        let i=if let Some(i)=old{
+            let e=self.entries[i].unwrap();
+            if e.live||e.active.is_some()||e.pending.is_some(){return Err(Error::Busy);}
+            if id.generation<=e.timer.generation{return Err(Error::Stale);}
+            i
+        }else{self.entries.iter().position(Option::is_none).ok_or(Error::Exhausted)?};
+        verify()?;self.entries[i]=Some(Entry{timer:id,class,slack_ns,live:true,active:None,pending:None});Ok(())
     }
     pub fn unregister(&mut self,id:Identity,verify:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
+        if self.poisoned{return Err(Error::NotReady);}
         let i=self.index(id)?;let e=self.entries[i].unwrap();
         if e.active.is_some()||e.pending.is_some(){return Err(Error::Busy);}
-        verify()?;self.entries[i]=None;Ok(())
+        verify()?;self.entries[i].as_mut().unwrap().live=false;Ok(())
     }
     /// Only actual registered timers and minimum declared slack here.
     /// Rate and overrun windows are absent until separately measured.
     pub fn observe(&self,now:u64)->Result<[Option<u64>;4],Error>{
         self.ready(now)?;
         let mut n=0;let mut slack=None;
-        for e in self.entries.iter().flatten().filter(|e|e.class==TimerClass::Soft){
+        for e in self.entries.iter().flatten().filter(|e|e.live&&e.class==TimerClass::Soft){
             n+=1;let us=e.slack_ns/1000;slack=Some(slack.map_or(us,|old:u64|old.min(us)));
         }
         Ok([Some(n),None,slack,None])
@@ -134,7 +153,7 @@ impl Owner{
         let chosen=programmed_ns(e.class,e.slack_ns,deadline,now,if eligible{self.value}else{0})?;
         let serial=self.serial.checked_add(1).ok_or(Error::Exhausted)?;
         let arm=TimerArm{timer:id,serial,requested_ns:deadline,programmed_ns:chosen,policy_version:version};
-        self.serial=serial;self.entries[i].as_mut().unwrap().pending=Some(arm);
+        self.serial=serial;self.entries[i].as_mut().unwrap().pending=Some(PendingArm{arm,started_ns:now});
         let done=match program(arm){Ok(t) if t>=now&&t!=0=>t,Ok(_)=>{self.poison(now);return Err(Error::Clock);},
             Err(e)=>{self.poison(now);return Err(e);}};
         self.last_clock=done;
@@ -145,6 +164,41 @@ impl Owner{
             }
         }
         Ok(arm)
+    }
+    /// Independent read-only reconciliation of an uncertain arm. The
+    /// protected native supervisor must establish exact comparator/queue
+    /// state AND whether delivery already occurred; this API is restricted
+    /// to still-retained, undelivered arms. An already delivered effect
+    /// requires a separately reconciled native completion before release.
+    /// No old proposal is executed again, even after a no-effect proof.
+    pub fn reconcile_arm(&mut self,id:Identity,now:u64,resolution:ArmResolution,
+        verify_independent:impl FnOnce(UncertainArm,ArmResolution)->Result<(),Error>)->Result<(),Error>{
+        if !self.poisoned{return Err(Error::NotReady);}
+        if now==0||now<self.last_clock{return Err(Error::Clock);}
+        let i=self.index(id)?;let e=self.entries[i].unwrap();
+        let p=e.pending.ok_or(Error::Stale)?;
+        if let ArmResolution::Programmed{completed_ns}=resolution{
+            if completed_ns<p.started_ns||completed_ns>now{return Err(Error::Clock);}
+        }
+        verify_independent(UncertainArm{prior:e.active,proposed:p.arm,started_ns:p.started_ns},resolution)?;
+        let entry=self.entries[i].as_mut().unwrap();
+        if matches!(resolution,ArmResolution::Programmed{..}){entry.active=Some(p.arm);}
+        entry.pending=None;
+        // Faulted ordinary policy does not silently resume. Already accepted
+        // timer arms and the plan version remain owned; future arms use SAFE_EXEC.
+        self.until=0;
+        if let Some(w)=self.work.as_mut(){
+            if matches!(w.effect,Effect::Unknown(_)){
+                w.effect=match resolution{
+                    ArmResolution::Programmed{completed_ns} if p.arm.policy_version==w.version
+                        &&p.started_ns>=w.accepted_ns&&p.started_ns<w.until=>
+                        Effect::Applied(ArmEvidence{arm:p.arm,started_ns:p.started_ns,completed_ns}),
+                    _=>Effect::Cancelled(now),
+                };
+            }
+        }
+        self.poisoned=self.entries.iter().flatten().any(|e|e.pending.is_some());
+        self.last_clock=now;Ok(())
     }
     /// Record exact callback delivery from the actual timer owner. No
     /// delivery before the chosen deadline and no retry of unknown arms.
@@ -228,6 +282,23 @@ mod tests{
         o.complete(a,1_096_000,||Ok(())).unwrap();o.unregister(SOFT,||Ok(())).unwrap();
     }
     #[test]
+    fn unknown_programmed_arm_requires_exact_independent_proof_before_applied(){
+        let mut o=owner();o.accept(&work(),0,10_000_000,100,||Ok(())).unwrap();
+        assert_eq!(o.arm(SOFT,1_016_000,200,|_|Err(Error::NotReady)),Err(Error::NotReady));
+        let mut out=[0;MAX_APPLY_REPORT_BYTES];let n=o.report(300,&mut out).unwrap();
+        assert_eq!(ApplyReportV1::decode(&out[..n]).unwrap().state,ActionStatus::Unknown);
+        assert_eq!(o.reconcile_arm(SOFT,400,ArmResolution::Programmed{completed_ns:199},|_,_|panic!()),Err(Error::Clock));
+        o.reconcile_arm(SOFT,400,ArmResolution::Programmed{completed_ns:250},|e,_|{
+            assert_eq!(e.proposed.programmed_ns,1_096_000);assert_eq!(e.started_ns,200);Ok(())
+        }).unwrap();
+        let n=o.report(401,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
+        assert_eq!(r.state,ActionStatus::Applied);assert_eq!(r.completed_ns,250);
+        o.verify_report(&r).unwrap();o.retire(&r,||Ok(())).unwrap();
+        assert_eq!(o.current(401),0);assert_eq!(o.unregister(SOFT,||panic!()),Err(Error::Busy));
+        let armed=o.entries[o.index(SOFT).unwrap()].unwrap().active.unwrap();
+        o.complete(armed,armed.programmed_ns,||Ok(())).unwrap();
+    }
+    #[test]
     fn unknown_arm_retains_old_and_new_and_expiry_cannot_reopen(){
         let mut o=owner();let old=o.arm(SOFT,1000,100,|_|Ok(101)).unwrap();
         o.accept(&work(),0,10_000_000,200,||Ok(())).unwrap();
@@ -238,6 +309,21 @@ mod tests{
         let r=ApplyReportV1::decode(&out[..n]).unwrap();assert_eq!(r.state,ActionStatus::Unknown);
         assert_eq!(o.retire(&r,||panic!()),Err(Error::NotReady));
         assert_eq!(o.arm(SOFT,3000,500,|_|panic!()),Err(Error::NotReady));
+        assert_eq!(o.reconcile_arm(SOFT,399,ArmResolution::PriorUnchanged,|_,_|panic!()),Err(Error::Clock));
+        assert_eq!(o.reconcile_arm(SOFT,500,ArmResolution::PriorUnchanged,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert!(o.poisoned);
+        o.reconcile_arm(SOFT,500,ArmResolution::PriorUnchanged,|e,resolution|{
+            assert_eq!(e.prior,Some(old));assert_eq!(e.proposed.requested_ns,2000);
+            assert_eq!(resolution,ArmResolution::PriorUnchanged);Ok(())
+        }).unwrap();
+        let n=o.report(501,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
+        assert_eq!(r.state,ActionStatus::Cancelled);o.retire(&r,||Ok(())).unwrap();
+        assert_eq!(o.current(501),0);assert_eq!(o.version(),1);
+        o.complete(old,1000,||Ok(())).unwrap();o.unregister(SOFT,||Ok(())).unwrap();
+        assert_eq!(o.register(SOFT,TimerClass::Soft,80_000,||panic!()),Err(Error::Stale));
+        let next=Identity{generation:2,..SOFT};
+        o.register(next,TimerClass::Soft,80_000,||Ok(())).unwrap();
+        assert_eq!(o.arm(SOFT,3000,1001,|_|panic!()),Err(Error::Stale));
         let mut o=owner();o.accept(&work(),0,200,100,||Ok(())).unwrap();
         let n=o.report(200,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
         assert_eq!(r.state,ActionStatus::Cancelled);
